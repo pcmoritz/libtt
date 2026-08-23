@@ -1,0 +1,137 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+@@ -24,0 +25,6 @@
++static bool hasComplexElementType(Type type) {
++  auto tensorType = mlir::dyn_cast<RankedTensorType>(type);
++  return tensorType &&
++         mlir::isa<mlir::ComplexType>(tensorType.getElementType());
++}
++
+@@ -206,0 +213,103 @@
++// Rewrites stablehlo.convert when either its operand or result is complex.
++namespace {
++class ComplexConvertOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::ConvertOp> {
++  using OpConversionPattern<mlir::stablehlo::ConvertOp>::OpConversionPattern;
++
++public:
++  LogicalResult matchAndRewrite(
++      mlir::stablehlo::ConvertOp op,
++      OpConversionPattern<mlir::stablehlo::ConvertOp>::OpAdaptor adaptor,
++      ConversionPatternRewriter &rewriter) const override {
++    auto sourceType = mlir::cast<RankedTensorType>(op.getOperand().getType());
++    auto resultType = mlir::cast<RankedTensorType>(op.getType());
++    auto sourceComplex =
++        mlir::dyn_cast<mlir::ComplexType>(sourceType.getElementType());
++    auto resultComplex =
++        mlir::dyn_cast<mlir::ComplexType>(resultType.getElementType());
++    if (!sourceComplex && !resultComplex) {
++      return failure();
++    }
++
++    Location loc = op.getLoc();
++    Value real = adaptor.getOperand();
++    Value imag;
++    if (sourceComplex) {
++      auto components = unpackRealImag(loc, adaptor.getOperand(), rewriter);
++      real = components.first;
++      imag = components.second;
++    }
++
++    auto convertIfNeeded = [&](Value value, RankedTensorType type) -> Value {
++      if (value.getType() == type) {
++        return value;
++      }
++      return rewriter.create<mlir::stablehlo::ConvertOp>(loc, type, value);
++    };
++
++    if (!resultComplex) {
++      rewriter.replaceOp(op, convertIfNeeded(real, resultType));
++      return success();
++    }
++
++    auto componentType = RankedTensorType::get(
++        resultType.getShape(), resultComplex.getElementType());
++    real = convertIfNeeded(real, componentType);
++    if (sourceComplex) {
++      imag = convertIfNeeded(imag, componentType);
++    } else {
++      auto zeros = DenseElementsAttr::get(
++          componentType,
++          rewriter.getFloatAttr(resultComplex.getElementType(), 0.0));
++      imag = rewriter.create<mlir::stablehlo::ConstantOp>(loc, componentType,
++                                                          zeros);
++    }
++
++    rewriter.replaceOp(op, packRealImag(loc, real, imag, rewriter));
++    return success();
++  }
++};
++} // namespace
++
++// Decomposes complex equality into component comparisons. StableHLO only
++// permits EQ and NE comparisons for complex element types.
++namespace {
++class ComplexCompareOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::CompareOp> {
++  using OpConversionPattern<mlir::stablehlo::CompareOp>::OpConversionPattern;
++
++public:
++  LogicalResult matchAndRewrite(
++      mlir::stablehlo::CompareOp op,
++      OpConversionPattern<mlir::stablehlo::CompareOp>::OpAdaptor adaptor,
++      ConversionPatternRewriter &rewriter) const override {
++    auto direction = op.getComparisonDirection();
++    if (direction != mlir::stablehlo::ComparisonDirection::EQ &&
++        direction != mlir::stablehlo::ComparisonDirection::NE) {
++      return rewriter.notifyMatchFailure(op, "expected complex EQ or NE");
++    }
++
++    Location loc = op.getLoc();
++    auto [lhsReal, lhsImag] =
++        unpackRealImag(loc, adaptor.getLhs(), rewriter);
++    auto [rhsReal, rhsImag] =
++        unpackRealImag(loc, adaptor.getRhs(), rewriter);
++    Value realComparison = rewriter.create<mlir::stablehlo::CompareOp>(
++        loc, lhsReal, rhsReal, direction);
++    Value imagComparison = rewriter.create<mlir::stablehlo::CompareOp>(
++        loc, lhsImag, rhsImag, direction);
++
++    Value result;
++    if (direction == mlir::stablehlo::ComparisonDirection::EQ) {
++      result = rewriter.create<mlir::stablehlo::AndOp>(
++          loc, realComparison, imagComparison);
++    } else {
++      result = rewriter.create<mlir::stablehlo::OrOp>(
++          loc, realComparison, imagComparison);
++    }
++    rewriter.replaceOp(op, result);
++    return success();
++  }
++};
++} // namespace
++
+@@ -699,0 +809,10 @@
++    target.addDynamicallyLegalOp<mlir::stablehlo::ConvertOp>(
++        [](mlir::stablehlo::ConvertOp op) {
++          return !hasComplexElementType(op.getOperand().getType()) &&
++                 !hasComplexElementType(op.getType());
++        });
++    target.addDynamicallyLegalOp<mlir::stablehlo::CompareOp>(
++        [](mlir::stablehlo::CompareOp op) {
++          return !hasComplexElementType(op.getLhs().getType());
++        });
++
+@@ -735,8 +854,10 @@ struct StableHLOComplexDataTypeConversionPass
+     RewritePatternSet patterns(&getContext());
+     patterns.add<
+         ComplexBroadcastInDimOpConversionPattern,
+-        ComplexConstantOpConversionPattern, ComplexGatherOpConversionPattern,
++        ComplexCompareOpConversionPattern,
++        ComplexConstantOpConversionPattern, ComplexConvertOpConversionPattern,
++        ComplexGatherOpConversionPattern,
+         ComplexIotaOpConversionPattern,
+         ComplexMulOpConversionPattern,
+         ComplexSelectOpConversionPattern,
+         ComplexSliceOpConversionPattern,
