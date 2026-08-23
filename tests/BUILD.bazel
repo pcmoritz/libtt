@@ -41,6 +41,8 @@ py_test(
     name = "jax_smoke_tests",
     srcs = ["jax_test_suite.py"],
     args = JAX_TEST_ARGS + [
+        "tests/lax_test.py::FunctionAccuracyTest::testSuccessOnComplexPlane_square_complex64",
+        "tests/lax_test.py::LaxTest::test_constant_folding_complex_to_real_scan_regression",
         "tests/device_test.py",
         "tests/batching_test.py::BatchingTest::testDynamicUpdateSlice",
         "tests/lax_test.py::LazyConstantTest::testIotaConstant0",

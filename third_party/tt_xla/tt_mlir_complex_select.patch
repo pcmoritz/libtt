@@ -1,0 +1,55 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+@@ -279,0 +279,37 @@
++
++// Rewrites select(pred, complex_true, complex_false) for the trailing
++// real/imag representation. A non-scalar predicate must be broadcast over the
++// new component dimension before selecting between the converted branches.
++namespace {
++class ComplexSelectOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::SelectOp> {
++  using OpConversionPattern<mlir::stablehlo::SelectOp>::OpConversionPattern;
++
++public:
++  LogicalResult matchAndRewrite(
++      mlir::stablehlo::SelectOp op,
++      OpConversionPattern<mlir::stablehlo::SelectOp>::OpAdaptor adaptor,
++      ConversionPatternRewriter &rewriter) const override {
++    auto newResultType = mlir::cast<RankedTensorType>(
++        this->getTypeConverter()->convertType(op.getResult().getType()));
++    Value pred = adaptor.getPred();
++
++    auto predType = mlir::cast<RankedTensorType>(pred.getType());
++    if (predType.getRank() != 0) {
++      auto expandedPredType = RankedTensorType::get(
++          newResultType.getShape(), predType.getElementType());
++      SmallVector<int64_t> broadcastDims;
++      for (int64_t dim = 0; dim < predType.getRank(); ++dim) {
++        broadcastDims.push_back(dim);
++      }
++      pred = rewriter.create<mlir::stablehlo::BroadcastInDimOp>(
++          op.getLoc(), expandedPredType, pred,
++          rewriter.getDenseI64ArrayAttr(broadcastDims));
++    }
++
++    rewriter.replaceOpWithNewOp<mlir::stablehlo::SelectOp>(
++        op, newResultType, pred, adaptor.getOnTrue(), adaptor.getOnFalse());
++    return success();
++  }
++};
++} // namespace
+@@ -655,5 +692,6 @@ struct StableHLOComplexDataTypeConversionPass
+         mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
+         mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
+         mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp, mlir::stablehlo::MulOp,
+-        mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp>(
++        mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp,
++        mlir::stablehlo::SelectOp>(
+         isNotComplexType);
+@@ -699,4 +736,5 @@ struct StableHLOComplexDataTypeConversionPass
+         ComplexConstantOpConversionPattern, ComplexGatherOpConversionPattern,
+         ComplexIotaOpConversionPattern,
+         ComplexMulOpConversionPattern,
++        ComplexSelectOpConversionPattern,
+         ComplexSliceOpConversionPattern,

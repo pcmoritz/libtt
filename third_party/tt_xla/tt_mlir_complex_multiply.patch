@@ -1,0 +1,95 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+@@ -4,0 +5,2 @@
++
++#include <utility>
+@@ -130,0 +132,37 @@
++
++// Extracts the real and imaginary components from tensor<...x2xf32> after a
++// single transpose of the input.
++static std::pair<Value, Value> unpackRealImag(Location loc, Value input,
++                                              OpBuilder &builder) {
++  auto inputType = mlir::cast<RankedTensorType>(input.getType());
++  auto transposed = transposeTrailingToLeading(loc, input, builder);
++  auto transposedType = mlir::cast<RankedTensorType>(transposed.getType());
++  int64_t rank = transposedType.getRank();
++  auto transposedShape = transposedType.getShape();
++
++  SmallVector<int64_t> componentShape(inputType.getShape().begin(),
++                                      inputType.getShape().end() - 1);
++  auto componentType =
++      RankedTensorType::get(componentShape, inputType.getElementType());
++
++  auto unpackComponent = [&](int64_t component) -> Value {
++    SmallVector<int64_t> begins(rank, 0),
++        ends(transposedShape.begin(), transposedShape.end()), steps(rank, 1);
++    begins[0] = component;
++    ends[0] = component + 1;
++    SmallVector<int64_t> sliceShape(transposedShape.begin(),
++                                    transposedShape.end());
++    sliceShape[0] = 1;
++    auto slice = builder.create<mlir::stablehlo::SliceOp>(
++        loc, RankedTensorType::get(sliceShape, inputType.getElementType()),
++        transposed, builder.getDenseI64ArrayAttr(begins),
++        builder.getDenseI64ArrayAttr(ends),
++        builder.getDenseI64ArrayAttr(steps));
++    return builder
++        .create<mlir::stablehlo::ReshapeOp>(loc, componentType,
++                                            slice.getResult())
++        .getResult();
++  };
++
++  return {unpackComponent(0), unpackComponent(1)};
++}
+@@ -204,0 +243,36 @@
++
++// Decomposes (a + bi) * (c + di) into
++//   real = ac - bd
++//   imag = ad + bc
++namespace {
++class ComplexMulOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::MulOp> {
++  using OpConversionPattern<mlir::stablehlo::MulOp>::OpConversionPattern;
++
++public:
++  LogicalResult matchAndRewrite(
++      mlir::stablehlo::MulOp op,
++      OpConversionPattern<mlir::stablehlo::MulOp>::OpAdaptor adaptor,
++      ConversionPatternRewriter &rewriter) const override {
++    Location loc = op.getLoc();
++    auto [lhsReal, lhsImag] =
++        unpackRealImag(loc, adaptor.getLhs(), rewriter);
++    auto [rhsReal, rhsImag] =
++        unpackRealImag(loc, adaptor.getRhs(), rewriter);
++
++    Value ac =
++        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsReal, rhsReal);
++    Value bd =
++        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsImag, rhsImag);
++    Value ad =
++        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsReal, rhsImag);
++    Value bc =
++        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsImag, rhsReal);
++    Value real = rewriter.create<mlir::stablehlo::SubtractOp>(loc, ac, bd);
++    Value imag = rewriter.create<mlir::stablehlo::AddOp>(loc, ad, bc);
++
++    rewriter.replaceOp(op, packRealImag(loc, real, imag, rewriter));
++    return success();
++  }
++};
++} // namespace
+@@ -581,5 +656,5 @@ struct StableHLOComplexDataTypeConversionPass
+         mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
+         mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
+-        mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp,
++        mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp, mlir::stablehlo::MulOp,
+         mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp>(
+         isNotComplexType);
+@@ -624,5 +699,6 @@ struct StableHLOComplexDataTypeConversionPass
+         ComplexBroadcastInDimOpConversionPattern,
+         ComplexConstantOpConversionPattern, ComplexGatherOpConversionPattern,
+         ComplexIotaOpConversionPattern,
++        ComplexMulOpConversionPattern,
+         ComplexSliceOpConversionPattern,
+         ComplexTypeDefaultConversionPattern<mlir::stablehlo::AddOp>,

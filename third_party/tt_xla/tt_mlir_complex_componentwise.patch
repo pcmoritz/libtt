@@ -1,0 +1,18 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+@@ -582,3 +582,4 @@ struct StableHLOComplexDataTypeConversionPass
+         mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
+-        mlir::stablehlo::IotaOp>(
++        mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp,
++        mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp>(
+         isNotComplexType);
+@@ -625,5 +626,8 @@ struct StableHLOComplexDataTypeConversionPass
+         ComplexIotaOpConversionPattern,
+         ComplexSliceOpConversionPattern,
++        ComplexTypeDefaultConversionPattern<mlir::stablehlo::AddOp>,
+         ComplexTypeDefaultConversionPattern<mlir::stablehlo::ConcatenateOp>,
++        ComplexTypeDefaultConversionPattern<mlir::stablehlo::NegOp>,
+         ComplexTypeDefaultConversionPattern<mlir::stablehlo::ReshapeOp>,
++        ComplexTypeDefaultConversionPattern<mlir::stablehlo::SubtractOp>,
+         ComplexPassthroughConversionPattern<mlir::stablehlo::AllToAllOp>,
