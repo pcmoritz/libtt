@@ -1,145 +1,187 @@
 diff --git tt_metal/api/tt-metalium/allocator.hpp tt_metal/api/tt-metalium/allocator.hpp
-index bdc7afe..3a734bc 100644
+index bdc7afe..9cb793b 100644
 --- tt_metal/api/tt-metalium/allocator.hpp
 +++ tt_metal/api/tt-metalium/allocator.hpp
-@@ -36,6 +36,11 @@ public:
+@@ -5,6 +5,7 @@
+ #pragma once
+
+ #include <cstdint>
++#include <tuple>
+ #include <vector>
+ #include <unordered_set>
+
+@@ -27,6 +28,13 @@ class AllocatorState;
+ // This is the internal representation for Allocator, not exposed for general usage.
+ class AllocatorImpl;
+
++// Canonical occupied address intervals. The first two fields identify the
++// buffer type and the BankManager allocator id; the last two are the half-open
++// address range [begin, end). Buffer identity is deliberately absent because
++// traces embed addresses, not Buffer object ids.
++using LiveBufferAllocationRegion = std::tuple<uint32_t, uint32_t, DeviceAddr, DeviceAddr>;
++using LiveBufferAllocationLayout = std::vector<LiveBufferAllocationRegion>;
++
+ // Looking at the member functions, there is a way better name we can give to this struct.
+ // Currently kept as "Allocator" to avoid breaking anyone.
+ class Allocator {
+@@ -36,6 +44,9 @@ public:
      explicit Allocator(AllocatorImpl* _impl);
 
      void deallocate_buffers();
-+    // Greatest unique id among live non-trace buffers, or zero when none are
-+    // live. Buffer ids increase monotonically for the lifetime of the process.
-+    // Trace buffers live in a disjoint allocator region and are deliberately
-+    // excluded: replacing one trace buffer must not invalidate sibling traces.
-+    size_t get_live_buffer_allocation_watermark() const;
++    // Sorted, coalesced occupied address ranges for live non-trace buffers.
++    // Replacing a buffer at the same address leaves this layout unchanged.
++    LiveBufferAllocationLayout get_live_buffer_allocation_layout() const;
      std::unordered_set<Buffer*> get_allocated_buffers() const;
      uint32_t get_num_banks(const BufferType& buffer_type) const;
      DeviceAddr get_bank_size(const BufferType& buffer_type) const;
+diff --git tt_metal/api/tt-metalium/buffer.hpp tt_metal/api/tt-metalium/buffer.hpp
+index c851bdd..3d7bb23 100644
+--- tt_metal/api/tt-metalium/buffer.hpp
++++ tt_metal/api/tt-metalium/buffer.hpp
+@@ -248,6 +248,8 @@ public:
+     bool is_l1() const;
+     bool is_dram() const;
+     bool is_trace() const;
++    bool is_trace_command_buffer() const { return is_trace_command_buffer_; }
++    void mark_as_trace_command_buffer() { is_trace_command_buffer_ = true; }
+
+     bool is_valid_region(const BufferRegion& region) const;
+     bool is_valid_partial_region(const BufferRegion& region) const;
+@@ -331,6 +333,7 @@ private:
+
+     AllocationStatus allocation_status_ = AllocationStatus::ALLOCATION_REQUESTED;
+     bool hooked_allocation_ = false;
++    bool is_trace_command_buffer_ = false;
+     DeviceAddr address_ = 0;
+
+     // These members must be only accessed on the device worker thread
+diff --git tt_metal/api/tt-metalium/mesh_buffer.hpp tt_metal/api/tt-metalium/mesh_buffer.hpp
+index 7c3bede..ca4db77 100644
+--- tt_metal/api/tt-metalium/mesh_buffer.hpp
++++ tt_metal/api/tt-metalium/mesh_buffer.hpp
+@@ -138,6 +138,9 @@ public:
+     // into the creation API.
+     Buffer* get_backing_buffer() const;
+
++    // Marks the backing and device-local buffers as internal trace command storage.
++    void mark_as_trace_command_buffer();
++
+     uint32_t datum_size_bytes() const;
+     Shape2D physical_shard_shape() const;
+     std::pair<bool, bool> replicated_dims() const;
+diff --git tt_metal/distributed/mesh_buffer.cpp tt_metal/distributed/mesh_buffer.cpp
+index 23acd83..b77f913 100644
+--- tt_metal/distributed/mesh_buffer.cpp
++++ tt_metal/distributed/mesh_buffer.cpp
+@@ -332,6 +332,17 @@ Buffer* MeshBuffer::get_backing_buffer() const {
+     return nullptr;
+ }
+
++void MeshBuffer::mark_as_trace_command_buffer() {
++    if (Buffer* backing_buffer = get_backing_buffer(); backing_buffer != nullptr) {
++        backing_buffer->mark_as_trace_command_buffer();
++    }
++    for (const auto& buffer : buffers_.values()) {
++        if (buffer.is_local()) {
++            buffer.value()->mark_as_trace_command_buffer();
++        }
++    }
++}
++
+ DeviceAddr MeshBuffer::size() const {
+     return std::visit(
+         ttsl::overloaded{
+diff --git tt_metal/distributed/mesh_trace.cpp tt_metal/distributed/mesh_trace.cpp
+index 30d3511..716d014 100644
+--- tt_metal/distributed/mesh_trace.cpp
++++ tt_metal/distributed/mesh_trace.cpp
+@@ -92,6 +92,7 @@ void MeshTrace::populate_mesh_buffer(
+
+     trace_buffer->mesh_buffer =
+         MeshBuffer::create(global_trace_buf_config, device_local_trace_buf_config, mesh_cq.device());
++    trace_buffer->mesh_buffer->mark_as_trace_command_buffer();
+
+     // In dynamic allocation mode, validate that trace buffer doesn't overlap with allocations during trace
+     DeviceAddr dram_high_water_mark = std::max(dram_allocation_high_water_mark, dram_deletion_high_water_mark);
 diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocator.cpp
-index d2b3aa0..3a09950 100644
+index d2b3aa0..e55eae5 100644
 --- tt_metal/impl/allocator/allocator.cpp
 +++ tt_metal/impl/allocator/allocator.cpp
-@@ -159,7 +159,10 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
-                 alloc_size, page_size, bottom_up, config_->compute_grid, /*num_shards=*/1, AllocatorID{bank_id + 1});
-         }
-         buffer->set_per_core_addresses(std::move(addrs));
--        allocated_buffers_.insert(buffer);
-+        const bool inserted = allocated_buffers_.insert(buffer).second;
-+        TT_ASSERT(inserted);
-+        const bool id_inserted = live_buffer_ids_.insert(buffer->unique_id()).second;
-+        TT_ASSERT(id_inserted);
-         return buffer->per_core_addresses_.at(cores[0]);
-     }
+@@ -2,6 +2,7 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
 
-@@ -203,7 +206,12 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
-             TT_THROW("Unsupported buffer type!");
-         }
-     }
--    allocated_buffers_.insert(buffer);
-+    const bool inserted = allocated_buffers_.insert(buffer).second;
-+    TT_ASSERT(inserted);
-+    if (buffer_type != BufferType::TRACE) {
-+        const bool id_inserted = live_buffer_ids_.insert(buffer->unique_id()).second;
-+        TT_ASSERT(id_inserted);
-+    }
-
-     return address;
- }
-@@ -222,6 +230,8 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
-             l1_manager_->deallocate_buffer(addr, AllocatorID{bank_id + 1});
-         }
-         allocated_buffers_.erase(buffer);
-+        const size_t ids_erased = live_buffer_ids_.erase(buffer->unique_id());
-+        TT_ASSERT(ids_erased == 1);
-         return;
-     }
-
-@@ -235,6 +245,10 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
-         }
-     }
-     allocated_buffers_.erase(buffer);
-+    if (buffer_type != BufferType::TRACE) {
-+        const size_t ids_erased = live_buffer_ids_.erase(buffer->unique_id());
-+        TT_ASSERT(ids_erased == 1);
-+    }
- }
-
- void AllocatorImpl::deallocate_buffers() {
-@@ -243,6 +257,7 @@ void AllocatorImpl::deallocate_buffers() {
-     l1_manager_->deallocate_all();
-     l1_small_manager_->deallocate_all();
-     trace_buffer_manager_->deallocate_all();
-+    live_buffer_ids_.clear();
- }
-
- void AllocatorImpl::set_hybrid_device_allocators(const std::vector<AllocatorImpl*>& device_allocators) {
-@@ -274,6 +289,11 @@ void AllocatorImpl::unmirror_lockstep_allocation(DeviceAddr address) {
++#include <algorithm>
+ #include <memory>
+ #include <tt-metalium/allocator.hpp>
+ #include <tt-metalium/experimental/allocator.hpp>
+@@ -274,6 +275,46 @@ void AllocatorImpl::unmirror_lockstep_allocation(DeviceAddr address) {
      l1_manager_->mark_deallocated(AllocatorID{0}, address);
  }
 
-+size_t AllocatorImpl::get_live_buffer_allocation_watermark() const {
++LiveBufferAllocationLayout AllocatorImpl::get_live_buffer_allocation_layout() const {
 +    std::lock_guard<std::mutex> lock(mutex_);
-+    return live_buffer_ids_.empty() ? 0 : *live_buffer_ids_.rbegin();
++    LiveBufferAllocationLayout layout;
++    layout.reserve(allocated_buffers_.size());
++
++    for (const Buffer* buffer : allocated_buffers_) {
++        const BufferType buffer_type = buffer->buffer_type();
++        if (buffer_type == BufferType::TRACE || buffer->is_trace_command_buffer()) {
++            continue;
++        }
++
++        const DeviceAddr allocation_size = buffer->aligned_size_per_bank();
++        if (buffer->per_core_allocation_) {
++            TT_ASSERT(buffer_type == BufferType::L1);
++            for (const auto& [core, address] : buffer->per_core_addresses_) {
++                const uint32_t bank_id = logical_core_to_bank_ids_.at(BufferType::L1).at(core).at(0);
++                layout.emplace_back(
++                    static_cast<uint32_t>(buffer_type), bank_id + 1, address, address + allocation_size);
++            }
++        } else {
++            const DeviceAddr address = buffer->address();
++            layout.emplace_back(static_cast<uint32_t>(buffer_type), 0, address, address + allocation_size);
++        }
++    }
++
++    std::sort(layout.begin(), layout.end());
++    LiveBufferAllocationLayout coalesced;
++    coalesced.reserve(layout.size());
++    for (const auto& region : layout) {
++        if (!coalesced.empty() && std::get<0>(coalesced.back()) == std::get<0>(region) &&
++            std::get<1>(coalesced.back()) == std::get<1>(region) &&
++            std::get<2>(region) <= std::get<3>(coalesced.back())) {
++            std::get<3>(coalesced.back()) = std::max(std::get<3>(coalesced.back()), std::get<3>(region));
++        } else {
++            coalesced.push_back(region);
++        }
++    }
++    return coalesced;
 +}
 +
  std::unordered_set<Buffer*> AllocatorImpl::get_allocated_buffers() const {
      std::lock_guard<std::mutex> lock(mutex_);
      return allocated_buffers_;
-@@ -505,6 +525,7 @@ void AllocatorImpl::clear() {
-     l1_manager_->clear();
-     l1_small_manager_->clear();
-     trace_buffer_manager_->clear();
-+    live_buffer_ids_.clear();
- }
+@@ -616,6 +657,10 @@ Allocator::Allocator(AllocatorImpl* _impl) : impl(_impl) {}
 
- void AllocatorConfig::reset() {
-@@ -575,6 +596,7 @@ void AllocatorImpl::override_state(const AllocatorState& state) {
-     l1_small_manager_->deallocate_all();
-     trace_buffer_manager_->deallocate_all();
-     allocated_buffers_.clear();
-+    live_buffer_ids_.clear();
+ void Allocator::deallocate_buffers() { impl->deallocate_buffers(); }
 
-     // Apply state for each buffer type
-     for (const auto& [buffer_type, type_state] : state.get_states_per_buffer_type()) {
-@@ -618,6 +640,10 @@ void Allocator::deallocate_buffers() { impl->deallocate_buffers(); }
-
- std::unordered_set<Buffer*> Allocator::get_allocated_buffers() const { return impl->get_allocated_buffers(); }
-
-+size_t Allocator::get_live_buffer_allocation_watermark() const {
-+    return impl->get_live_buffer_allocation_watermark();
++LiveBufferAllocationLayout Allocator::get_live_buffer_allocation_layout() const {
++    return impl->get_live_buffer_allocation_layout();
 +}
 +
- uint32_t Allocator::get_num_banks(const BufferType& buffer_type) const { return impl->get_num_banks(buffer_type); }
+ std::unordered_set<Buffer*> Allocator::get_allocated_buffers() const { return impl->get_allocated_buffers(); }
 
- DeviceAddr Allocator::get_bank_size(const BufferType& buffer_type) const { return impl->get_bank_size(buffer_type); }
+ uint32_t Allocator::get_num_banks(const BufferType& buffer_type) const { return impl->get_num_banks(buffer_type); }
 diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocator.hpp
-index 8a116d7..3d3dac6 100644
+index 8a116d7..1c59dd6 100644
 --- tt_metal/impl/allocator/allocator.hpp
 +++ tt_metal/impl/allocator/allocator.hpp
-@@ -4,6 +4,8 @@
-
- #pragma once
-
-+#include <set>
-+
- #include <tt-metalium/allocator.hpp>
- #include <tt-metalium/device.hpp>
-
-@@ -41,6 +43,7 @@ public:
+@@ -41,5 +41,7 @@ public:
      void deallocate_buffer(Buffer* buffer);
      void deallocate_buffers();
 
-+    size_t get_live_buffer_allocation_watermark() const;
++    LiveBufferAllocationLayout get_live_buffer_allocation_layout() const;
++
      std::unordered_set<Buffer*> get_allocated_buffers() const;
      size_t get_num_allocated_buffers() const;
-
-@@ -124,6 +127,10 @@ private:
-     void verify_safe_allocation() const;
-
-     mutable std::mutex mutex_;
-+    // Ordered for a constant-time read of the greatest live non-trace buffer
-+    // id. Insert/erase cost is paid only when allocator state changes; trace
-+    // replay reads the watermark in constant time.
-+    std::set<size_t> live_buffer_ids_;
-
-     // Set to true if allocating a buffer is unsafe. This happens when a live trace on device can corrupt
-     // memory allocated by the user (memory used by trace is not tracked in the allocator once the trace is captured).
