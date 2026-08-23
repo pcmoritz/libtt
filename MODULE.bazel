@@ -1,6 +1,7 @@
 module(name = "libtt", version = "0.1.0")
 
 bazel_dep(name = "bazel_skylib", version = "1.8.2")
+bazel_dep(name = "numactl", version = "2.0.19.bcr.1")
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "protobuf", version = "33.4", repo_name = "com_google_protobuf")
 bazel_dep(name = "rules_cc", version = "0.2.17")
@@ -22,6 +23,16 @@ pip.parse(
     requirements_lock = "//:requirements-jax-tests.txt",
 )
 use_repo(pip, "jax_test_pip")
+
+http_archive(
+    name = "hwloc",
+    build_file = "//third_party/hwloc:BUILD.overlay.bazel",
+    sha256 = "c7fd8a1404a9719c76aadc642864b9f77aed1dc1fc8882d6af861a9260ba240d",
+    strip_prefix = "hwloc-2.10.0",
+    urls = [
+        "https://github.com/open-mpi/hwloc/releases/download/hwloc-2.10.0/hwloc-2.10.0.tar.gz",
+    ],
+)
 
 http_archive(
     name = "libarchive",
@@ -211,6 +222,7 @@ http_archive(
     patches = [
         "//third_party/tt_metal:wormhole_build_empty_sources.patch",
         "//third_party/tt_metal:reduce_static_tls.patch",
+        "//third_party/tt_metal:remove_boost_dependencies.patch",
         "//third_party/tt_metal:disable_fabric_host_tensor_runtime.patch",
         "//third_party/tt_metal:disable_fabric_host_buffer.patch",
         "//third_party/tt_metal:disable_fabric_mesh_device.patch",

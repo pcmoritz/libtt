@@ -1,0 +1,42 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Mirrors hwloc/Makefile.am for Linux/x86-64 with optional I/O and graphics
+# components disabled.
+cc_library(
+    name = "hwloc",
+    srcs = [
+        "hwloc/base64.c",
+        "hwloc/bind.c",
+        "hwloc/bitmap.c",
+        "hwloc/components.c",
+        "hwloc/cpukinds.c",
+        "hwloc/diff.c",
+        "hwloc/distances.c",
+        "hwloc/memattrs.c",
+        "hwloc/misc.c",
+        "hwloc/pci-common.c",
+        "hwloc/shmem.c",
+        "hwloc/topology-hardwired.c",
+        "hwloc/topology-linux.c",
+        "hwloc/topology-noos.c",
+        "hwloc/topology-synthetic.c",
+        "hwloc/topology-x86.c",
+        "hwloc/topology-xml-nolibxml.c",
+        "hwloc/topology-xml.c",
+        "hwloc/topology.c",
+        "hwloc/traversal.c",
+    ],
+    hdrs = glob(["include/**/*.h"]),
+    copts = ["-fvisibility=hidden"],
+    includes = ["include"],
+    linkstatic = True,
+    linkopts = ["-lm"],
+    local_defines = [
+        "HWLOC_INSIDE_LIBHWLOC",
+        "HWLOC_PLUGINS_PATH=\\\"\\\"",
+        "RUNSTATEDIR=\\\"/run\\\"",
+    ],
+    deps = ["@libtt//third_party/hwloc:linux_x86_64_config"],
+)

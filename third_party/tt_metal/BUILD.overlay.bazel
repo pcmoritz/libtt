@@ -1099,9 +1099,7 @@ cc_library(
         ":tt_metal_hal_quasar_upstream",
         ":tt_metal_hal_wormhole_upstream",
         ":tt_metal_host_tensor_upstream",
-    ],
-    linkopts = [
-        "-lnuma",
+        "@numactl//:numa",
     ],
     alwayslink = True,
     linkstatic = True,

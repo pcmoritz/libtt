@@ -67,11 +67,11 @@ cc_library(
         "src/firmware/riscv",
     ],
     linkopts = [
-        "-lhwloc",
         "-lrt",
     ],
     deps = [
         "@fmt//:fmt-header-only",
+        "@hwloc//:hwloc",
         "@spdlog//:spdlog",
         "@tt_logger//:tt-logger",
         "@yaml_cpp//:yaml-cpp",

@@ -1,0 +1,20 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["BUILD.overlay.bazel"])
+
+# hwloc requires configure-generated headers. Check in the Linux/x86-64
+# configuration so the external archive can be built entirely by native Bazel.
+cc_library(
+    name = "linux_x86_64_config",
+    hdrs = [
+        "static-components.h",
+        "include/hwloc/autogen/config.h",
+        "include/private/autogen/config.h",
+    ],
+    includes = [
+        ".",
+        "include",
+    ],
+)
