@@ -1,0 +1,20 @@
+diff --git a/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h b/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
+--- a/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
++++ b/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
+@@ -585,11 +585,12 @@ struct TTIRToTTNNCommonPipelineOptions
+     if (memoryLayoutAnalysisEnabled.getNumOccurrences() == 0) {
+       memoryLayoutAnalysisEnabled = (optimizationLevel >= 2);
+     }
+-    if (computeCfgMathFidelity.getNumOccurrences() == 0 &&
+-        optimizationLevel > 0) {
++    // Unlike getNumOccurrences(), hasValue() also recognizes typed C++
++    // assignments made by programmatic frontends. The cl::init defaults do not
++    // count as assigned, so O1+ still defers unspecified settings to TTNN.
++    if (!computeCfgMathFidelity.hasValue() && optimizationLevel > 0) {
+       computeCfgMathFidelity = OptionalMathFidelity::Undefined;
+     }
+-    if (computeCfgFp32DestAccEn.getNumOccurrences() == 0 &&
+-        optimizationLevel > 0) {
++    if (!computeCfgFp32DestAccEn.hasValue() && optimizationLevel > 0) {
+       computeCfgFp32DestAccEn = std::optional<bool>(std::nullopt);
+     }
