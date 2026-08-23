@@ -1,0 +1,140 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+@@ -87,6 +87,42 @@ static Value transposeLeadingToTrailing(Location loc, Value input,
+       .getResult();
+ }
+ 
++// Packs separate real and imaginary tensors into the trailing-dimension
++// representation used for complex values:
++//
++//   (tensor<d0x...xdNxf32>, tensor<d0x...xdNxf32>)
++//                         --> tensor<d0x...xdNx2xf32>
++static Value packRealImag(Location loc, Value real, Value imag,
++                          OpBuilder &builder) {
++  auto componentType = mlir::cast<RankedTensorType>(real.getType());
++
++  SmallVector<int64_t> unsqueezedShape;
++  unsqueezedShape.push_back(1);
++  for (auto d : componentType.getShape()) {
++    unsqueezedShape.push_back(d);
++  }
++  auto unsqueezedType =
++      RankedTensorType::get(unsqueezedShape, componentType.getElementType());
++  auto reshapedReal = builder.create<mlir::stablehlo::ReshapeOp>(
++      loc, unsqueezedType, real);
++  auto reshapedImag = builder.create<mlir::stablehlo::ReshapeOp>(
++      loc, unsqueezedType, imag);
++
++  SmallVector<int64_t> concatShape;
++  concatShape.push_back(2);
++  for (auto d : componentType.getShape()) {
++    concatShape.push_back(d);
++  }
++  auto concatType =
++      RankedTensorType::get(concatShape, componentType.getElementType());
++  auto concat = builder.create<mlir::stablehlo::ConcatenateOp>(
++      loc, concatType,
++      ValueRange{reshapedReal.getResult(), reshapedImag.getResult()},
++      /*dimension=*/0);
++
++  return transposeLeadingToTrailing(loc, concat.getResult(), builder);
++}
++
+ // ---------------------------------------------------------------------------
+ // Conversion patterns
+ // ---------------------------------------------------------------------------
+@@ -118,34 +154,44 @@ public:
+                   ConversionPatternRewriter &rewriter) const override {
+     Location loc = op.getLoc();
+-    auto lhsType = mlir::cast<RankedTensorType>(adaptor.getLhs().getType());
+-
+-    SmallVector<int64_t> unsqueezedShape;
+-    unsqueezedShape.push_back(1);
+-    for (auto d : lhsType.getShape()) {
+-      unsqueezedShape.push_back(d);
+-    }
+-    auto unsqueezedType =
+-        RankedTensorType::get(unsqueezedShape, lhsType.getElementType());
+-    auto reshapedLhs = rewriter.create<mlir::stablehlo::ReshapeOp>(
+-        loc, unsqueezedType, adaptor.getLhs());
+-    auto reshapedRhs = rewriter.create<mlir::stablehlo::ReshapeOp>(
+-        loc, unsqueezedType, adaptor.getRhs());
+-
+-    SmallVector<int64_t> concatShape;
+-    concatShape.push_back(2);
+-    for (auto d : lhsType.getShape()) {
+-      concatShape.push_back(d);
+-    }
+-    auto concatType =
+-        RankedTensorType::get(concatShape, lhsType.getElementType());
+-    auto concatOp = rewriter.create<mlir::stablehlo::ConcatenateOp>(
+-        loc, concatType,
+-        ValueRange{reshapedLhs.getResult(), reshapedRhs.getResult()},
+-        /*dimension=*/0);
+-
+-    auto transposed =
+-        transposeLeadingToTrailing(loc, concatOp.getResult(), rewriter);
+-    rewriter.replaceOp(op, transposed);
++    rewriter.replaceOp(op, packRealImag(loc, adaptor.getLhs(),
++                                        adaptor.getRhs(), rewriter));
++    return success();
++  }
++};
++} // namespace
++
++// Rewrites a complex stablehlo.iota as a real iota paired with an all-zero
++// imaginary tensor. Merely changing the iota result to tensor<...x2xf32>
++// would incorrectly generate the iota value in both component lanes.
++namespace {
++class ComplexIotaOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::IotaOp> {
++  using OpConversionPattern<mlir::stablehlo::IotaOp>::OpConversionPattern;
++
++public:
++  LogicalResult matchAndRewrite(
++      mlir::stablehlo::IotaOp op,
++      OpConversionPattern<mlir::stablehlo::IotaOp>::OpAdaptor adaptor,
++      ConversionPatternRewriter &rewriter) const override {
++    auto originalType = mlir::cast<RankedTensorType>(op.getType());
++    auto complexType =
++        mlir::dyn_cast<mlir::ComplexType>(originalType.getElementType());
++    if (!complexType) {
++      return failure();
++    }
++
++    auto componentType = RankedTensorType::get(
++        originalType.getShape(), complexType.getElementType());
++    Value real = rewriter.create<mlir::stablehlo::IotaOp>(
++        op.getLoc(), componentType, op.getIotaDimension());
++    auto zeros = DenseElementsAttr::get(
++        componentType,
++        rewriter.getFloatAttr(complexType.getElementType(), 0.0));
++    Value imag = rewriter.create<mlir::stablehlo::ConstantOp>(
++        op.getLoc(), componentType, zeros);
++
++    rewriter.replaceOp(
++        op, packRealImag(op.getLoc(), real, imag, rewriter));
+     return success();
+   }
+ };
+@@ -533,7 +579,8 @@ struct StableHLOComplexDataTypeConversionPass
+         mlir::stablehlo::ConstantOp, mlir::stablehlo::ReshapeOp,
+         mlir::stablehlo::SliceOp, mlir::stablehlo::GatherOp,
+         mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
+-        mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp>(
++        mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
++        mlir::stablehlo::IotaOp>(
+         isNotComplexType);
+ 
+     target.addIllegalOp<mlir::stablehlo::ComplexOp, mlir::stablehlo::RealOp,
+@@ -568,7 +615,8 @@ struct StableHLOComplexDataTypeConversionPass
+     RewritePatternSet patterns(&getContext());
+     patterns.add<
+         ComplexBroadcastInDimOpConversionPattern,
+-        ComplexConstantOpConversionPattern, ComplexGatherOpConversionPattern,
++        ComplexConstantOpConversionPattern, ComplexGatherOpConversionPattern,
++        ComplexIotaOpConversionPattern,
+         ComplexSliceOpConversionPattern,
+         ComplexTypeDefaultConversionPattern<mlir::stablehlo::ConcatenateOp>,
+         ComplexTypeDefaultConversionPattern<mlir::stablehlo::ReshapeOp>,
