@@ -9,7 +9,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
  #include "mlir/IR/PatternMatch.h"
  #include "mlir/Support/LogicalResult.h"
  #include "mlir/Transforms/DialectConversion.h"
-@@ -324,6 +325,305 @@ public:
+@@ -324,6 +325,311 @@ public:
  };
  } // namespace
  
@@ -38,6 +38,12 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +           returnOp.getOperand(0) == binary.getResult();
 +  }
 +
++  // Matches the lexicographic reducer emitted by JAX for complex max/min:
++  //
++  //   (real(lhs) == real(rhs) ? imag(lhs) cmp imag(rhs)
++  //                           : real(lhs) cmp real(rhs)) ? lhs : rhs
++  //
++  // where cmp is GT for max and LT for min.
 +  static std::optional<ReducerKind>
 +  matchLexicographicReducer(Block &body) {
 +    using namespace mlir::matchers;
