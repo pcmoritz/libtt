@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 --- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
-@@ -324,6 +324,218 @@ public:
+@@ -324,6 +324,216 @@ public:
  };
  } // namespace
  
@@ -109,11 +109,13 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +                                         "unsupported complex reducer body");
 +    }
 +
++    bool isEmpty = false;
 +    for (int64_t dimension : op.getDimensions()) {
 +      if (inputType.isDynamicDim(dimension)) {
 +        return rewriter.notifyMatchFailure(
 +            op, "complex reduction requires static dimensions");
 +      }
++      isEmpty |= inputType.getDimSize(dimension) == 0;
 +    }
 +
 +    Location loc = op.getLoc();
@@ -160,13 +162,9 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +          loc, resultType, ValueRange{lhs, rhs}, dimension);
 +    };
 +
-+    bool isEmpty = llvm::any_of(op.getDimensions(), [&](int64_t dimension) {
-+      return inputType.getDimSize(dimension) == 0;
-+    });
 +    if (!isEmpty) {
 +      for (int64_t dimension : op.getDimensions()) {
-+        int64_t size = mlir::cast<RankedTensorType>(current.first.getType())
-+                           .getDimSize(dimension);
++        int64_t size = inputType.getDimSize(dimension);
 +        while (size > 1) {
 +          int64_t pairedSize = size / 2;
 +          ComplexParts even =
@@ -220,19 +218,15 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
  
  // Rewrites a complex stablehlo.iota as a real iota paired with an all-zero
  // imaginary tensor. Merely changing the iota result to tensor<...x2xf32>
-@@ -827,5 +1039,11 @@ struct StableHLOComplexDataTypeConversionPass
-       });
-     };
-+    target.addDynamicallyLegalOp<mlir::stablehlo::ReduceOp>(
-+        [hasComplexType](mlir::stablehlo::ReduceOp op) {
-+          return !hasComplexType(op.getOperandTypes()) &&
-+                 !hasComplexType(op.getResultTypes()) &&
-+                 !hasComplexType(op.getBody().front().getArgumentTypes());
-+        });
-     target.addDynamicallyLegalOp<mlir::sdy::ManualComputationOp>(
-         [hasComplexType](mlir::sdy::ManualComputationOp op) {
-           return !hasComplexType(op.getOperandTypes()) &&
-@@ -859,6 +1077,7 @@ struct StableHLOComplexDataTypeConversionPass
+@@ -801,6 +1011,7 @@ struct StableHLOComplexDataTypeConversionPass
+         mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
+         mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp, mlir::stablehlo::MulOp,
+         mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp,
++        mlir::stablehlo::ReduceOp,
+         mlir::stablehlo::SelectOp>(
+         isNotComplexType);
+     target.addDynamicallyLegalOp<mlir::stablehlo::ConvertOp>(
+@@ -859,6 +1070,7 @@ struct StableHLOComplexDataTypeConversionPass
          ComplexGatherOpConversionPattern,
          ComplexIotaOpConversionPattern,
          ComplexMulOpConversionPattern,
