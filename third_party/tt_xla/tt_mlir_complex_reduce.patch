@@ -9,7 +9,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
  #include "mlir/IR/PatternMatch.h"
  #include "mlir/Support/LogicalResult.h"
  #include "mlir/Transforms/DialectConversion.h"
-@@ -324,6 +325,311 @@ public:
+@@ -324,6 +325,302 @@ public:
  };
  } // namespace
  
@@ -169,10 +169,16 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +      return rewriter.notifyMatchFailure(op,
 +                                         "unsupported complex reducer body");
 +    }
++    if (*kind != ReducerKind::Add) {
++      for (int64_t dimension : op.getDimensions()) {
++        if (inputType.isDynamicDim(dimension)) {
++          return rewriter.notifyMatchFailure(
++              op, "complex reduction requires static dimensions");
++        }
++      }
++    }
 +
 +    Location loc = op.getLoc();
-+    ComplexParts current =
-+        unpackRealImag(loc, adaptor.getInputs().front(), rewriter);
 +    ComplexParts init =
 +        unpackRealImag(loc, adaptor.getInitValues().front(), rewriter);
 +    auto originalResultType =
@@ -184,58 +190,54 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +      return rewriter.create<mlir::stablehlo::BroadcastInDimOp>(
 +          loc, resultType, value, rewriter.getDenseI64ArrayAttr({}));
 +    };
++    ComplexParts result{broadcastInit(init.first), broadcastInit(init.second)};
++    auto replaceWith = [&](ComplexParts value) {
++      rewriter.replaceOp(
++          op, packRealImag(loc, value.first, value.second, rewriter));
++      return success();
++    };
 +
 +    bool isEmpty = llvm::any_of(op.getDimensions(), [&](int64_t dimension) {
 +      return !inputType.isDynamicDim(dimension) &&
 +             inputType.getDimSize(dimension) == 0;
 +    });
++    if (isEmpty) {
++      return replaceWith(result);
++    }
++
++    ComplexParts current =
++        unpackRealImag(loc, adaptor.getInputs().front(), rewriter);
 +
 +    if (*kind == ReducerKind::Add) {
-+      ComplexParts result{broadcastInit(init.first),
-+                          broadcastInit(init.second)};
-+      if (!isEmpty) {
-+        auto scalarType =
-+            RankedTensorType::get({}, complexType.getElementType());
-+        auto zeroAttr = DenseElementsAttr::get(
-+            scalarType,
-+            rewriter.getFloatAttr(complexType.getElementType(), 0.0));
-+        Value zero = rewriter.create<mlir::stablehlo::ConstantOp>(
-+            loc, scalarType, zeroAttr);
-+        auto reduceSum = [&](Value value) -> Value {
-+          if (op.getDimensions().empty()) {
-+            return value;
-+          }
-+          auto reduce = rewriter.create<mlir::stablehlo::ReduceOp>(
-+              loc, resultType, value, zero, op.getDimensions());
-+          Block &body = reduce.getBody().emplaceBlock();
-+          body.addArgument(scalarType, loc);
-+          body.addArgument(scalarType, loc);
-+          OpBuilder::InsertionGuard guard(rewriter);
-+          rewriter.setInsertionPointToStart(&body);
-+          Value sum = rewriter.create<mlir::stablehlo::AddOp>(
-+              loc, body.getArgument(0), body.getArgument(1));
-+          rewriter.create<mlir::stablehlo::ReturnOp>(loc, sum);
-+          return reduce.getResult(0);
-+        };
-+        result = {rewriter.create<mlir::stablehlo::AddOp>(
-+                      loc, reduceSum(current.first), result.first),
-+                  rewriter.create<mlir::stablehlo::AddOp>(
-+                      loc, reduceSum(current.second), result.second)};
-+      }
-+      rewriter.replaceOp(
-+          op, packRealImag(loc, result.first, result.second, rewriter));
-+      return success();
++      auto scalarType =
++          RankedTensorType::get({}, complexType.getElementType());
++      auto zeroAttr = DenseElementsAttr::get(
++          scalarType,
++          rewriter.getFloatAttr(complexType.getElementType(), 0.0));
++      Value zero = rewriter.create<mlir::stablehlo::ConstantOp>(
++          loc, scalarType, zeroAttr);
++      auto reduceSum = [&](Value value) -> Value {
++        if (op.getDimensions().empty()) {
++          return value;
++        }
++        auto reduce = rewriter.create<mlir::stablehlo::ReduceOp>(
++            loc, resultType, value, zero, op.getDimensions());
++        Block &body = reduce.getBody().emplaceBlock();
++        body.addArgument(scalarType, loc);
++        body.addArgument(scalarType, loc);
++        OpBuilder::InsertionGuard guard(rewriter);
++        rewriter.setInsertionPointToStart(&body);
++        Value sum = rewriter.create<mlir::stablehlo::AddOp>(
++            loc, body.getArgument(0), body.getArgument(1));
++        rewriter.create<mlir::stablehlo::ReturnOp>(loc, sum);
++        return reduce.getResult(0);
++      };
++      ComplexParts sum{reduceSum(current.first), reduceSum(current.second)};
++      return replaceWith(combine(loc, sum, result, *kind, rewriter));
 +    }
 +
 +    // TODO: Replace this explicit tree for complex multiply/min/max with
 +    // first-class complex reduction ops once TTIR/TTNN supports them.
-+    for (int64_t dimension : op.getDimensions()) {
-+      if (inputType.isDynamicDim(dimension)) {
-+        return rewriter.notifyMatchFailure(
-+            op, "complex reduction requires static dimensions");
-+      }
-+    }
-+
 +    auto slice = [&](Value value, int64_t dimension, int64_t begin,
 +                     int64_t limit, int64_t stride) -> Value {
 +      auto type = mlir::cast<RankedTensorType>(value.getType());
@@ -274,46 +276,35 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +          loc, resultType, ValueRange{lhs, rhs}, dimension);
 +    };
 +
-+    if (!isEmpty) {
-+      for (int64_t dimension : op.getDimensions()) {
-+        int64_t size = inputType.getDimSize(dimension);
-+        while (size > 1) {
-+          int64_t pairedSize = size / 2;
-+          ComplexParts even =
-+              sliceParts(current, dimension, 0, pairedSize * 2, 2);
-+          ComplexParts odd =
-+              sliceParts(current, dimension, 1, pairedSize * 2, 2);
-+          std::optional<ComplexParts> tail;
-+          if (size % 2 != 0) {
-+            tail = sliceParts(current, dimension, size - 1, size, 1);
-+          }
-+          current = combine(loc, even, odd, *kind, rewriter);
-+          if (tail) {
-+            current = {
-+                concatenate(current.first, tail->first, dimension),
-+                concatenate(current.second, tail->second, dimension)};
-+          }
-+          size = pairedSize + size % 2;
++    for (int64_t dimension : op.getDimensions()) {
++      int64_t size = inputType.getDimSize(dimension);
++      while (size > 1) {
++        int64_t pairedSize = size / 2;
++        ComplexParts even =
++            sliceParts(current, dimension, 0, pairedSize * 2, 2);
++        ComplexParts odd =
++            sliceParts(current, dimension, 1, pairedSize * 2, 2);
++        ComplexParts next = combine(loc, even, odd, *kind, rewriter);
++        if (size % 2 != 0) {
++          ComplexParts tail =
++              sliceParts(current, dimension, size - 1, size, 1);
++          next = {concatenate(next.first, tail.first, dimension),
++                  concatenate(next.second, tail.second, dimension)};
 +        }
++        current = next;
++        size = pairedSize + size % 2;
 +      }
 +    }
 +
-+    ComplexParts result{broadcastInit(init.first), broadcastInit(init.second)};
-+    if (!isEmpty) {
-+      auto reshape = [&](Value value) -> Value {
-+        if (value.getType() == resultType) {
-+          return value;
-+        }
-+        return rewriter.create<mlir::stablehlo::ReshapeOp>(loc, resultType,
-+                                                           value);
-+      };
-+      current = {reshape(current.first), reshape(current.second)};
-+      result = combine(loc, current, result, *kind, rewriter);
-+    }
-+
-+    rewriter.replaceOp(op,
-+                       packRealImag(loc, result.first, result.second, rewriter));
-+    return success();
++    auto reshape = [&](Value value) -> Value {
++      if (value.getType() == resultType) {
++        return value;
++      }
++      return rewriter.create<mlir::stablehlo::ReshapeOp>(loc, resultType,
++                                                         value);
++    };
++    current = {reshape(current.first), reshape(current.second)};
++    return replaceWith(combine(loc, current, result, *kind, rewriter));
 +  }
 +};
 +} // namespace
@@ -321,7 +312,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
  
  // Rewrites a complex stablehlo.iota as a real iota paired with an all-zero
  // imaginary tensor. Merely changing the iota result to tensor<...x2xf32>
-@@ -801,6 +1011,7 @@ struct StableHLOComplexDataTypeConversionPass
+@@ -801,6 +1098,7 @@ struct StableHLOComplexDataTypeConversionPass
          mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
          mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp, mlir::stablehlo::MulOp,
          mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp,
@@ -329,7 +320,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
          mlir::stablehlo::SelectOp>(
          isNotComplexType);
      target.addDynamicallyLegalOp<mlir::stablehlo::ConvertOp>(
-@@ -859,6 +1070,7 @@ struct StableHLOComplexDataTypeConversionPass
+@@ -859,6 +1157,7 @@ struct StableHLOComplexDataTypeConversionPass
          ComplexGatherOpConversionPattern,
          ComplexIotaOpConversionPattern,
          ComplexMulOpConversionPattern,
