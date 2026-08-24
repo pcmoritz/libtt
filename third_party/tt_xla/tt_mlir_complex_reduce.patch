@@ -1,0 +1,330 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+@@ -10,6 +10,7 @@
+ #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
+ #include "mlir/IR/BuiltinDialect.h"
+ #include "mlir/IR/BuiltinTypes.h"
++#include "mlir/IR/Matchers.h"
+ #include "mlir/IR/PatternMatch.h"
+ #include "mlir/Support/LogicalResult.h"
+ #include "mlir/Transforms/DialectConversion.h"
+@@ -324,6 +325,302 @@ public:
+ };
+ } // namespace
+ 
++// Complex addition is separable, so lower it to ordinary reductions of the
++// real and imaginary components. Cross-component reducers such as complex
++// multiplication use a balanced tree of data movement and elementwise ops.
++namespace {
++class ComplexReduceOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::ReduceOp> {
++  using OpConversionPattern<mlir::stablehlo::ReduceOp>::OpConversionPattern;
++  using ComplexParts = std::pair<Value, Value>;
++
++  enum class ReducerKind { Add, Multiply, Maximum, Minimum };
++
++  template <typename BinaryOp>
++  static bool matchesBinaryReducer(Block &body) {
++    if (body.getNumArguments() != 2 || body.getOperations().size() != 2) {
++      return false;
++    }
++    auto binary = mlir::dyn_cast<BinaryOp>(body.front());
++    auto returnOp =
++        mlir::dyn_cast<mlir::stablehlo::ReturnOp>(body.getTerminator());
++    return binary && returnOp && returnOp.getNumOperands() == 1 &&
++           binary.getLhs() == body.getArgument(0) &&
++           binary.getRhs() == body.getArgument(1) &&
++           returnOp.getOperand(0) == binary.getResult();
++  }
++
++  // Matches the lexicographic reducer emitted by JAX for complex max/min:
++  //
++  //   (real(lhs) == real(rhs) ? imag(lhs) cmp imag(rhs)
++  //                           : real(lhs) cmp real(rhs)) ? lhs : rhs
++  //
++  // where cmp is GT for max and LT for min.
++  static std::optional<ReducerKind>
++  matchLexicographicReducer(Block &body) {
++    using namespace mlir::matchers;
++    using namespace mlir::stablehlo;
++    if (body.getNumArguments() != 2 || body.getOperations().size() != 10) {
++      return std::nullopt;
++    }
++
++    auto returnOp = mlir::dyn_cast<ReturnOp>(body.getTerminator());
++    if (!returnOp || returnOp.getNumOperands() != 1) {
++      return std::nullopt;
++    }
++
++    Value lhs = body.getArgument(0);
++    Value rhs = body.getArgument(1);
++    auto real = [](Value value) { return m_Op<RealOp>(m_Val(value)); };
++    auto imag = [](Value value) { return m_Op<ImagOp>(m_Val(value)); };
++    if (!matchPattern(
++            returnOp.getOperand(0),
++            m_Op<SelectOp>(
++                m_Op<SelectOp>(
++                    m_Op<CompareOp>(real(lhs), real(rhs)),
++                    m_Op<CompareOp>(imag(lhs), imag(rhs)),
++                    m_Op<CompareOp>(real(lhs), real(rhs))),
++                m_Val(lhs), m_Val(rhs)))) {
++      return std::nullopt;
++    }
++
++    // Ten operations means both real comparisons share their projection ops
++    // and the body contains nothing outside this matched value graph.
++    auto selected = returnOp.getOperand(0).getDefiningOp<SelectOp>();
++    auto predicate = selected.getPred().getDefiningOp<SelectOp>();
++    auto realEqualOp = predicate.getPred().getDefiningOp<CompareOp>();
++    auto imagOrderedOp = predicate.getOnTrue().getDefiningOp<CompareOp>();
++    auto realOrderedOp = predicate.getOnFalse().getDefiningOp<CompareOp>();
++    auto direction = realOrderedOp.getComparisonDirection();
++    if ((direction != ComparisonDirection::GT &&
++         direction != ComparisonDirection::LT) ||
++        imagOrderedOp.getComparisonDirection() != direction ||
++        realEqualOp.getComparisonDirection() !=
++            ComparisonDirection::EQ ||
++        realEqualOp.getCompareType() != ComparisonType::FLOAT ||
++        realOrderedOp.getCompareType() != ComparisonType::FLOAT ||
++        imagOrderedOp.getCompareType() != ComparisonType::FLOAT) {
++      return std::nullopt;
++    }
++
++    return direction == ComparisonDirection::GT
++               ? ReducerKind::Maximum
++               : ReducerKind::Minimum;
++  }
++
++  static std::optional<ReducerKind> getReducerKind(Block &body) {
++    if (matchesBinaryReducer<mlir::stablehlo::AddOp>(body)) {
++      return ReducerKind::Add;
++    }
++    if (matchesBinaryReducer<mlir::stablehlo::MulOp>(body)) {
++      return ReducerKind::Multiply;
++    }
++    return matchLexicographicReducer(body);
++  }
++
++  static ComplexParts combine(Location loc, ComplexParts lhs,
++                              ComplexParts rhs, ReducerKind kind,
++                              OpBuilder &builder) {
++    if (kind == ReducerKind::Add) {
++      return {builder.create<mlir::stablehlo::AddOp>(loc, lhs.first,
++                                                      rhs.first),
++              builder.create<mlir::stablehlo::AddOp>(loc, lhs.second,
++                                                      rhs.second)};
++    }
++    if (kind == ReducerKind::Multiply) {
++      Value ac = builder.create<mlir::stablehlo::MulOp>(loc, lhs.first,
++                                                        rhs.first);
++      Value bd = builder.create<mlir::stablehlo::MulOp>(loc, lhs.second,
++                                                        rhs.second);
++      Value ad = builder.create<mlir::stablehlo::MulOp>(loc, lhs.first,
++                                                        rhs.second);
++      Value bc = builder.create<mlir::stablehlo::MulOp>(loc, lhs.second,
++                                                        rhs.first);
++      return {builder.create<mlir::stablehlo::SubtractOp>(loc, ac, bd),
++              builder.create<mlir::stablehlo::AddOp>(loc, ad, bc)};
++    }
++
++    auto direction = kind == ReducerKind::Maximum
++                         ? mlir::stablehlo::ComparisonDirection::GT
++                         : mlir::stablehlo::ComparisonDirection::LT;
++    Value realEqual = builder.create<mlir::stablehlo::CompareOp>(
++        loc, lhs.first, rhs.first,
++        mlir::stablehlo::ComparisonDirection::EQ);
++    Value realOrdered = builder.create<mlir::stablehlo::CompareOp>(
++        loc, lhs.first, rhs.first, direction);
++    Value imagOrdered = builder.create<mlir::stablehlo::CompareOp>(
++        loc, lhs.second, rhs.second, direction);
++    Value predicate = builder.create<mlir::stablehlo::SelectOp>(
++        loc, realEqual, imagOrdered, realOrdered);
++    return {builder.create<mlir::stablehlo::SelectOp>(
++                loc, predicate, lhs.first, rhs.first),
++            builder.create<mlir::stablehlo::SelectOp>(
++                loc, predicate, lhs.second, rhs.second)};
++  }
++
++public:
++  LogicalResult matchAndRewrite(
++      mlir::stablehlo::ReduceOp op,
++      OpConversionPattern<mlir::stablehlo::ReduceOp>::OpAdaptor adaptor,
++      ConversionPatternRewriter &rewriter) const override {
++    if (op.getInputs().size() != 1 || op.getInitValues().size() != 1 ||
++        op.getNumResults() != 1 || !op.getBody().hasOneBlock()) {
++      return rewriter.notifyMatchFailure(
++          op, "expected a single-input complex reduction");
++    }
++
++    auto inputType =
++        mlir::cast<RankedTensorType>(op.getInputs().front().getType());
++    auto complexType =
++        mlir::dyn_cast<mlir::ComplexType>(inputType.getElementType());
++    if (!complexType) {
++      return failure();
++    }
++    auto kind = getReducerKind(op.getBody().front());
++    if (!kind) {
++      return rewriter.notifyMatchFailure(op,
++                                         "unsupported complex reducer body");
++    }
++    if (*kind != ReducerKind::Add) {
++      for (int64_t dimension : op.getDimensions()) {
++        if (inputType.isDynamicDim(dimension)) {
++          return rewriter.notifyMatchFailure(
++              op, "complex reduction requires static dimensions");
++        }
++      }
++    }
++
++    Location loc = op.getLoc();
++    ComplexParts init =
++        unpackRealImag(loc, adaptor.getInitValues().front(), rewriter);
++    auto originalResultType =
++        mlir::cast<RankedTensorType>(op.getResult(0).getType());
++    auto resultType = RankedTensorType::get(
++        originalResultType.getShape(), complexType.getElementType(),
++        originalResultType.getEncoding());
++    auto broadcastInit = [&](Value value) -> Value {
++      return rewriter.create<mlir::stablehlo::BroadcastInDimOp>(
++          loc, resultType, value, rewriter.getDenseI64ArrayAttr({}));
++    };
++    ComplexParts result{broadcastInit(init.first), broadcastInit(init.second)};
++    auto replaceWith = [&](ComplexParts value) {
++      rewriter.replaceOp(
++          op, packRealImag(loc, value.first, value.second, rewriter));
++      return success();
++    };
++
++    bool isEmpty = llvm::any_of(op.getDimensions(), [&](int64_t dimension) {
++      return !inputType.isDynamicDim(dimension) &&
++             inputType.getDimSize(dimension) == 0;
++    });
++    if (isEmpty) {
++      return replaceWith(result);
++    }
++
++    ComplexParts current =
++        unpackRealImag(loc, adaptor.getInputs().front(), rewriter);
++
++    if (*kind == ReducerKind::Add) {
++      auto scalarType =
++          RankedTensorType::get({}, complexType.getElementType());
++      auto zeroAttr = DenseElementsAttr::get(
++          scalarType,
++          rewriter.getFloatAttr(complexType.getElementType(), 0.0));
++      Value zero = rewriter.create<mlir::stablehlo::ConstantOp>(
++          loc, scalarType, zeroAttr);
++      auto reduceSum = [&](Value value) -> Value {
++        if (op.getDimensions().empty()) {
++          return value;
++        }
++        auto reduce = rewriter.create<mlir::stablehlo::ReduceOp>(
++            loc, resultType, value, zero, op.getDimensions());
++        Block &body = reduce.getBody().emplaceBlock();
++        body.addArgument(scalarType, loc);
++        body.addArgument(scalarType, loc);
++        OpBuilder::InsertionGuard guard(rewriter);
++        rewriter.setInsertionPointToStart(&body);
++        Value sum = rewriter.create<mlir::stablehlo::AddOp>(
++            loc, body.getArgument(0), body.getArgument(1));
++        rewriter.create<mlir::stablehlo::ReturnOp>(loc, sum);
++        return reduce.getResult(0);
++      };
++      ComplexParts sum{reduceSum(current.first), reduceSum(current.second)};
++      return replaceWith(combine(loc, sum, result, *kind, rewriter));
++    }
++
++    // TODO: Replace this explicit tree for complex multiply/min/max with
++    // first-class complex reduction ops once TTIR/TTNN supports them.
++    auto slice = [&](Value value, int64_t dimension, int64_t begin,
++                     int64_t limit, int64_t stride) -> Value {
++      auto type = mlir::cast<RankedTensorType>(value.getType());
++      int64_t rank = type.getRank();
++      SmallVector<int64_t> begins(rank, 0),
++          limits(type.getShape().begin(), type.getShape().end()),
++          strides(rank, 1), shape(type.getShape().begin(),
++                                  type.getShape().end());
++      begins[dimension] = begin;
++      limits[dimension] = limit;
++      strides[dimension] = stride;
++      shape[dimension] = (limit - begin + stride - 1) / stride;
++      auto resultType = RankedTensorType::get(
++          shape, type.getElementType(), type.getEncoding());
++      return rewriter.create<mlir::stablehlo::SliceOp>(
++          loc, resultType, value, rewriter.getDenseI64ArrayAttr(begins),
++          rewriter.getDenseI64ArrayAttr(limits),
++          rewriter.getDenseI64ArrayAttr(strides));
++    };
++    auto sliceParts = [&](ComplexParts parts, int64_t dimension,
++                          int64_t begin, int64_t limit,
++                          int64_t stride) -> ComplexParts {
++      return {slice(parts.first, dimension, begin, limit, stride),
++              slice(parts.second, dimension, begin, limit, stride)};
++    };
++    auto concatenate = [&](Value lhs, Value rhs,
++                           int64_t dimension) -> Value {
++      auto lhsType = mlir::cast<RankedTensorType>(lhs.getType());
++      auto rhsType = mlir::cast<RankedTensorType>(rhs.getType());
++      SmallVector<int64_t> shape(lhsType.getShape().begin(),
++                                 lhsType.getShape().end());
++      shape[dimension] += rhsType.getDimSize(dimension);
++      auto resultType = RankedTensorType::get(
++          shape, lhsType.getElementType(), lhsType.getEncoding());
++      return rewriter.create<mlir::stablehlo::ConcatenateOp>(
++          loc, resultType, ValueRange{lhs, rhs}, dimension);
++    };
++
++    for (int64_t dimension : op.getDimensions()) {
++      int64_t size = inputType.getDimSize(dimension);
++      while (size > 1) {
++        int64_t pairedSize = size / 2;
++        ComplexParts even =
++            sliceParts(current, dimension, 0, pairedSize * 2, 2);
++        ComplexParts odd =
++            sliceParts(current, dimension, 1, pairedSize * 2, 2);
++        ComplexParts next = combine(loc, even, odd, *kind, rewriter);
++        if (size % 2 != 0) {
++          ComplexParts tail =
++              sliceParts(current, dimension, size - 1, size, 1);
++          next = {concatenate(next.first, tail.first, dimension),
++                  concatenate(next.second, tail.second, dimension)};
++        }
++        current = next;
++        size = pairedSize + size % 2;
++      }
++    }
++
++    auto reshape = [&](Value value) -> Value {
++      if (value.getType() == resultType) {
++        return value;
++      }
++      return rewriter.create<mlir::stablehlo::ReshapeOp>(loc, resultType,
++                                                         value);
++    };
++    current = {reshape(current.first), reshape(current.second)};
++    return replaceWith(combine(loc, current, result, *kind, rewriter));
++  }
++};
++} // namespace
++
+ 
+ // Rewrites a complex stablehlo.iota as a real iota paired with an all-zero
+ // imaginary tensor. Merely changing the iota result to tensor<...x2xf32>
+@@ -801,6 +1098,7 @@ struct StableHLOComplexDataTypeConversionPass
+         mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
+         mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp, mlir::stablehlo::MulOp,
+         mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp,
++        mlir::stablehlo::ReduceOp,
+         mlir::stablehlo::SelectOp>(
+         isNotComplexType);
+     target.addDynamicallyLegalOp<mlir::stablehlo::ConvertOp>(
+@@ -859,6 +1157,7 @@ struct StableHLOComplexDataTypeConversionPass
+         ComplexGatherOpConversionPattern,
+         ComplexIotaOpConversionPattern,
+         ComplexMulOpConversionPattern,
++        ComplexReduceOpConversionPattern,
+         ComplexSelectOpConversionPattern,
+         ComplexSliceOpConversionPattern,
+         ComplexTypeDefaultConversionPattern<mlir::stablehlo::AddOp>,
