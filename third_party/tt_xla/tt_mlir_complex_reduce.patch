@@ -1,7 +1,15 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 --- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
-@@ -324,6 +324,315 @@ public:
+@@ -10,6 +10,7 @@
+ #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
+ #include "mlir/IR/BuiltinDialect.h"
+ #include "mlir/IR/BuiltinTypes.h"
++#include "mlir/IR/Matchers.h"
+ #include "mlir/IR/PatternMatch.h"
+ #include "mlir/Support/LogicalResult.h"
+ #include "mlir/Transforms/DialectConversion.h"
+@@ -324,6 +325,305 @@ public:
  };
  } // namespace
  
@@ -32,62 +40,52 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +
 +  static std::optional<ReducerKind>
 +  matchLexicographicReducer(Block &body) {
++    using namespace mlir::matchers;
++    using namespace mlir::stablehlo;
 +    if (body.getNumArguments() != 2 || body.getOperations().size() != 10) {
 +      return std::nullopt;
 +    }
 +
-+    auto it = body.begin();
-+    auto lhsReal = mlir::dyn_cast<mlir::stablehlo::RealOp>(*it++);
-+    auto rhsReal = mlir::dyn_cast<mlir::stablehlo::RealOp>(*it++);
-+    auto realEqual = mlir::dyn_cast<mlir::stablehlo::CompareOp>(*it++);
-+    auto realOrdered = mlir::dyn_cast<mlir::stablehlo::CompareOp>(*it++);
-+    auto lhsImag = mlir::dyn_cast<mlir::stablehlo::ImagOp>(*it++);
-+    auto rhsImag = mlir::dyn_cast<mlir::stablehlo::ImagOp>(*it++);
-+    auto imagOrdered = mlir::dyn_cast<mlir::stablehlo::CompareOp>(*it++);
-+    auto predicate = mlir::dyn_cast<mlir::stablehlo::SelectOp>(*it++);
-+    auto selected = mlir::dyn_cast<mlir::stablehlo::SelectOp>(*it++);
-+    auto returnOp = mlir::dyn_cast<mlir::stablehlo::ReturnOp>(*it);
-+    if (!lhsReal || !rhsReal || !realEqual || !realOrdered || !lhsImag ||
-+        !rhsImag || !imagOrdered || !predicate || !selected || !returnOp) {
-+      return std::nullopt;
-+    }
-+
-+    auto direction = realOrdered.getComparisonDirection();
-+    if ((direction != mlir::stablehlo::ComparisonDirection::GT &&
-+         direction != mlir::stablehlo::ComparisonDirection::LT) ||
-+        imagOrdered.getComparisonDirection() != direction ||
-+        realEqual.getComparisonDirection() !=
-+            mlir::stablehlo::ComparisonDirection::EQ ||
-+        realEqual.getCompareType() !=
-+            mlir::stablehlo::ComparisonType::FLOAT ||
-+        realOrdered.getCompareType() !=
-+            mlir::stablehlo::ComparisonType::FLOAT ||
-+        imagOrdered.getCompareType() !=
-+            mlir::stablehlo::ComparisonType::FLOAT) {
++    auto returnOp = mlir::dyn_cast<ReturnOp>(body.getTerminator());
++    if (!returnOp || returnOp.getNumOperands() != 1) {
 +      return std::nullopt;
 +    }
 +
 +    Value lhs = body.getArgument(0);
 +    Value rhs = body.getArgument(1);
-+    if (lhsReal.getOperand() != lhs || rhsReal.getOperand() != rhs ||
-+        lhsImag.getOperand() != lhs || rhsImag.getOperand() != rhs ||
-+        realEqual.getLhs() != lhsReal.getResult() ||
-+        realEqual.getRhs() != rhsReal.getResult() ||
-+        realOrdered.getLhs() != lhsReal.getResult() ||
-+        realOrdered.getRhs() != rhsReal.getResult() ||
-+        imagOrdered.getLhs() != lhsImag.getResult() ||
-+        imagOrdered.getRhs() != rhsImag.getResult() ||
-+        predicate.getPred() != realEqual.getResult() ||
-+        predicate.getOnTrue() != imagOrdered.getResult() ||
-+        predicate.getOnFalse() != realOrdered.getResult() ||
-+        selected.getPred() != predicate.getResult() ||
-+        selected.getOnTrue() != lhs ||
-+        selected.getOnFalse() != rhs || returnOp.getNumOperands() != 1 ||
-+        returnOp.getOperand(0) != selected.getResult()) {
++    auto real = [](Value value) { return m_Op<RealOp>(m_Val(value)); };
++    auto imag = [](Value value) { return m_Op<ImagOp>(m_Val(value)); };
++    if (!matchPattern(
++            returnOp.getOperand(0),
++            m_Op<SelectOp>(
++                m_Op<SelectOp>(
++                    m_Op<CompareOp>(real(lhs), real(rhs)),
++                    m_Op<CompareOp>(imag(lhs), imag(rhs)),
++                    m_Op<CompareOp>(real(lhs), real(rhs))),
++                m_Val(lhs), m_Val(rhs)))) {
 +      return std::nullopt;
 +    }
 +
-+    return direction == mlir::stablehlo::ComparisonDirection::GT
++    // Ten operations means both real comparisons share their projection ops
++    // and the body contains nothing outside this matched value graph.
++    auto selected = returnOp.getOperand(0).getDefiningOp<SelectOp>();
++    auto predicate = selected.getPred().getDefiningOp<SelectOp>();
++    auto realEqualOp = predicate.getPred().getDefiningOp<CompareOp>();
++    auto imagOrderedOp = predicate.getOnTrue().getDefiningOp<CompareOp>();
++    auto realOrderedOp = predicate.getOnFalse().getDefiningOp<CompareOp>();
++    auto direction = realOrderedOp.getComparisonDirection();
++    if ((direction != ComparisonDirection::GT &&
++         direction != ComparisonDirection::LT) ||
++        imagOrderedOp.getComparisonDirection() != direction ||
++        realEqualOp.getComparisonDirection() !=
++            ComparisonDirection::EQ ||
++        realEqualOp.getCompareType() != ComparisonType::FLOAT ||
++        realOrderedOp.getCompareType() != ComparisonType::FLOAT ||
++        imagOrderedOp.getCompareType() != ComparisonType::FLOAT) {
++      return std::nullopt;
++    }
++
++    return direction == ComparisonDirection::GT
 +               ? ReducerKind::Maximum
 +               : ReducerKind::Minimum;
 +  }
