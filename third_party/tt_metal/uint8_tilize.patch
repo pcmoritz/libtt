@@ -1,0 +1,31 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
+@@ -91,5 +91,6 @@ ProgramDescriptor TilizeWithValPaddingMultiCoreBlockInterleavedFactory::create_d
+ 
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+-                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B;
++                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B ||
++                        a.dtype() == DataType::UINT8;
+ 
+     IDevice* device = a.device();
+@@ -234,5 +235,5 @@ ProgramDescriptor TilizeWithValPaddingMultiCoreBlockInterleavedFactory::create_d
+
+     std::vector<UnpackToDestMode> unpack_to_dest_mode(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
+-    if (fp32_llk_acc) {
++    if (fp32_llk_acc && a.dtype() != DataType::UINT8) {
+         unpack_to_dest_mode[tt::CBIndex::c_0] = UnpackToDestMode::UnpackToDestFp32;
+     }
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
+@@ -47,6 +47,9 @@ TilizeWithValPaddingDeviceOperation::program_factory_t TilizeWithValPaddingDevic
+         }
+         return TilizeWithValPaddingMultiCoreDefaultFactory{};
+     }
++    if (input_tensor.device()->arch() == tt::ARCH::BLACKHOLE && input_tensor.dtype() == DataType::UINT8) {
++        return TilizeWithValPaddingMultiCoreBlockInterleavedFactory{};
++    }
+     if (!operation_attributes.enough_space_height) {
+         return TilizeWithValPaddingMultiCoreBlockInterleavedFactory{};
+     }

@@ -258,6 +258,8 @@ http_archive(
         "//third_party/tt_metal:float16_min_max.patch",
         "//third_party/tt_metal:float16_accumulation.patch",
         "//third_party/tt_metal:uint8_data_movement.patch",
+        "//third_party/tt_metal:uint8_pad_permute_dst_acc.patch",
+        "//third_party/tt_metal:uint8_tilize.patch",
         "//third_party/tt_metal:stable_sort.patch",
         "//third_party/tt_metal:typecast_uint32_to_uint16_truncate.patch",
         "//third_party/tt_metal:argmax_float16.patch",
