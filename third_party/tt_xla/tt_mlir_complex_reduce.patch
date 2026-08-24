@@ -1,15 +1,13 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 --- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
-@@ -324,6 +324,216 @@ public:
+@@ -324,6 +324,256 @@ public:
  };
  } // namespace
  
-+// A StableHLO reducer combines scalar elements, so appending a component
-+// dimension to a complex input would reduce the real and imaginary lanes
-+// independently. Reduce the unpacked components with a balanced tree instead.
-+// This preserves cross-component reducers such as complex multiplication while
-+// using only data movement and elementwise operations supported by TTIR.
++// Complex addition is separable, so lower it to ordinary reductions of the
++// real and imaginary components. Cross-component reducers such as complex
++// multiplication use a balanced tree of data movement and elementwise ops.
 +namespace {
 +class ComplexReduceOpConversionPattern
 +    : public OpConversionPattern<mlir::stablehlo::ReduceOp> {
@@ -109,20 +107,71 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +                                         "unsupported complex reducer body");
 +    }
 +
-+    bool isEmpty = false;
-+    for (int64_t dimension : op.getDimensions()) {
-+      if (inputType.isDynamicDim(dimension)) {
-+        return rewriter.notifyMatchFailure(
-+            op, "complex reduction requires static dimensions");
-+      }
-+      isEmpty |= inputType.getDimSize(dimension) == 0;
-+    }
-+
 +    Location loc = op.getLoc();
 +    ComplexParts current =
 +        unpackRealImag(loc, adaptor.getInputs().front(), rewriter);
 +    ComplexParts init =
 +        unpackRealImag(loc, adaptor.getInitValues().front(), rewriter);
++    auto originalResultType =
++        mlir::cast<RankedTensorType>(op.getResult(0).getType());
++    auto resultType = RankedTensorType::get(
++        originalResultType.getShape(), complexType.getElementType(),
++        originalResultType.getEncoding());
++    auto broadcastInit = [&](Value value) -> Value {
++      return rewriter.create<mlir::stablehlo::BroadcastInDimOp>(
++          loc, resultType, value, rewriter.getDenseI64ArrayAttr({}));
++    };
++
++    bool isEmpty = llvm::any_of(op.getDimensions(), [&](int64_t dimension) {
++      return !inputType.isDynamicDim(dimension) &&
++             inputType.getDimSize(dimension) == 0;
++    });
++
++    if (*kind == ReducerKind::Add) {
++      ComplexParts result{broadcastInit(init.first),
++                          broadcastInit(init.second)};
++      if (!isEmpty) {
++        auto scalarType =
++            RankedTensorType::get({}, complexType.getElementType());
++        auto zeroAttr = DenseElementsAttr::get(
++            scalarType,
++            rewriter.getFloatAttr(complexType.getElementType(), 0.0));
++        Value zero = rewriter.create<mlir::stablehlo::ConstantOp>(
++            loc, scalarType, zeroAttr);
++        auto reduceSum = [&](Value value) -> Value {
++          if (op.getDimensions().empty()) {
++            return value;
++          }
++          auto reduce = rewriter.create<mlir::stablehlo::ReduceOp>(
++              loc, resultType, value, zero, op.getDimensions());
++          Block &body = reduce.getBody().emplaceBlock();
++          body.addArgument(scalarType, loc);
++          body.addArgument(scalarType, loc);
++          OpBuilder::InsertionGuard guard(rewriter);
++          rewriter.setInsertionPointToStart(&body);
++          Value sum = rewriter.create<mlir::stablehlo::AddOp>(
++              loc, body.getArgument(0), body.getArgument(1));
++          rewriter.create<mlir::stablehlo::ReturnOp>(loc, sum);
++          return reduce.getResult(0);
++        };
++        result = {rewriter.create<mlir::stablehlo::AddOp>(
++                      loc, reduceSum(current.first), result.first),
++                  rewriter.create<mlir::stablehlo::AddOp>(
++                      loc, reduceSum(current.second), result.second)};
++      }
++      rewriter.replaceOp(
++          op, packRealImag(loc, result.first, result.second, rewriter));
++      return success();
++    }
++
++    // TODO: Replace this explicit tree for complex multiply/min/max with
++    // first-class complex reduction ops once TTIR/TTNN supports them.
++    for (int64_t dimension : op.getDimensions()) {
++      if (inputType.isDynamicDim(dimension)) {
++        return rewriter.notifyMatchFailure(
++            op, "complex reduction requires static dimensions");
++      }
++    }
 +
 +    auto slice = [&](Value value, int64_t dimension, int64_t begin,
 +                     int64_t limit, int64_t stride) -> Value {
@@ -186,15 +235,6 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +      }
 +    }
 +
-+    auto originalResultType =
-+        mlir::cast<RankedTensorType>(op.getResult(0).getType());
-+    auto resultType = RankedTensorType::get(
-+        originalResultType.getShape(), complexType.getElementType(),
-+        originalResultType.getEncoding());
-+    auto broadcastInit = [&](Value value) -> Value {
-+      return rewriter.create<mlir::stablehlo::BroadcastInDimOp>(
-+          loc, resultType, value, rewriter.getDenseI64ArrayAttr({}));
-+    };
 +    ComplexParts result{broadcastInit(init.first), broadcastInit(init.second)};
 +    if (!isEmpty) {
 +      auto reshape = [&](Value value) -> Value {
