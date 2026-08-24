@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 --- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
-@@ -324,6 +324,256 @@ public:
+@@ -324,6 +324,315 @@ public:
  };
  } // namespace
  
@@ -16,31 +16,90 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +
 +  enum class ReducerKind { Add, Multiply, Maximum, Minimum };
 +
-+  static std::optional<ReducerKind> getReducerKind(Block &body) {
-+    if (body.empty()) {
++  template <typename BinaryOp>
++  static bool matchesBinaryReducer(Block &body) {
++    if (body.getNumArguments() != 2 || body.getOperations().size() != 2) {
++      return false;
++    }
++    auto binary = mlir::dyn_cast<BinaryOp>(body.front());
++    auto returnOp =
++        mlir::dyn_cast<mlir::stablehlo::ReturnOp>(body.getTerminator());
++    return binary && returnOp && returnOp.getNumOperands() == 1 &&
++           binary.getLhs() == body.getArgument(0) &&
++           binary.getRhs() == body.getArgument(1) &&
++           returnOp.getOperand(0) == binary.getResult();
++  }
++
++  static std::optional<ReducerKind>
++  matchLexicographicReducer(Block &body) {
++    if (body.getNumArguments() != 2 || body.getOperations().size() != 10) {
 +      return std::nullopt;
 +    }
-+    if (mlir::isa<mlir::stablehlo::AddOp>(body.front())) {
-+      return ReducerKind::Add;
-+    }
-+    if (mlir::isa<mlir::stablehlo::MulOp>(body.front())) {
-+      return ReducerKind::Multiply;
++
++    auto it = body.begin();
++    auto lhsReal = mlir::dyn_cast<mlir::stablehlo::RealOp>(*it++);
++    auto rhsReal = mlir::dyn_cast<mlir::stablehlo::RealOp>(*it++);
++    auto realEqual = mlir::dyn_cast<mlir::stablehlo::CompareOp>(*it++);
++    auto realOrdered = mlir::dyn_cast<mlir::stablehlo::CompareOp>(*it++);
++    auto lhsImag = mlir::dyn_cast<mlir::stablehlo::ImagOp>(*it++);
++    auto rhsImag = mlir::dyn_cast<mlir::stablehlo::ImagOp>(*it++);
++    auto imagOrdered = mlir::dyn_cast<mlir::stablehlo::CompareOp>(*it++);
++    auto predicate = mlir::dyn_cast<mlir::stablehlo::SelectOp>(*it++);
++    auto selected = mlir::dyn_cast<mlir::stablehlo::SelectOp>(*it++);
++    auto returnOp = mlir::dyn_cast<mlir::stablehlo::ReturnOp>(*it);
++    if (!lhsReal || !rhsReal || !realEqual || !realOrdered || !lhsImag ||
++        !rhsImag || !imagOrdered || !predicate || !selected || !returnOp) {
++      return std::nullopt;
 +    }
 +
-+    // JAX orders complex values lexicographically: compare real components,
-+    // then compare imaginary components when they are equal. The only ordered
-+    // comparison direction in that reducer distinguishes max from min.
-+    for (auto compare : body.getOps<mlir::stablehlo::CompareOp>()) {
-+      if (compare.getComparisonDirection() ==
-+          mlir::stablehlo::ComparisonDirection::GT) {
-+        return ReducerKind::Maximum;
-+      }
-+      if (compare.getComparisonDirection() ==
-+          mlir::stablehlo::ComparisonDirection::LT) {
-+        return ReducerKind::Minimum;
-+      }
++    auto direction = realOrdered.getComparisonDirection();
++    if ((direction != mlir::stablehlo::ComparisonDirection::GT &&
++         direction != mlir::stablehlo::ComparisonDirection::LT) ||
++        imagOrdered.getComparisonDirection() != direction ||
++        realEqual.getComparisonDirection() !=
++            mlir::stablehlo::ComparisonDirection::EQ ||
++        realEqual.getCompareType() !=
++            mlir::stablehlo::ComparisonType::FLOAT ||
++        realOrdered.getCompareType() !=
++            mlir::stablehlo::ComparisonType::FLOAT ||
++        imagOrdered.getCompareType() !=
++            mlir::stablehlo::ComparisonType::FLOAT) {
++      return std::nullopt;
 +    }
-+    return std::nullopt;
++
++    Value lhs = body.getArgument(0);
++    Value rhs = body.getArgument(1);
++    if (lhsReal.getOperand() != lhs || rhsReal.getOperand() != rhs ||
++        lhsImag.getOperand() != lhs || rhsImag.getOperand() != rhs ||
++        realEqual.getLhs() != lhsReal.getResult() ||
++        realEqual.getRhs() != rhsReal.getResult() ||
++        realOrdered.getLhs() != lhsReal.getResult() ||
++        realOrdered.getRhs() != rhsReal.getResult() ||
++        imagOrdered.getLhs() != lhsImag.getResult() ||
++        imagOrdered.getRhs() != rhsImag.getResult() ||
++        predicate.getPred() != realEqual.getResult() ||
++        predicate.getOnTrue() != imagOrdered.getResult() ||
++        predicate.getOnFalse() != realOrdered.getResult() ||
++        selected.getPred() != predicate.getResult() ||
++        selected.getOnTrue() != lhs ||
++        selected.getOnFalse() != rhs || returnOp.getNumOperands() != 1 ||
++        returnOp.getOperand(0) != selected.getResult()) {
++      return std::nullopt;
++    }
++
++    return direction == mlir::stablehlo::ComparisonDirection::GT
++               ? ReducerKind::Maximum
++               : ReducerKind::Minimum;
++  }
++
++  static std::optional<ReducerKind> getReducerKind(Block &body) {
++    if (matchesBinaryReducer<mlir::stablehlo::AddOp>(body)) {
++      return ReducerKind::Add;
++    }
++    if (matchesBinaryReducer<mlir::stablehlo::MulOp>(body)) {
++      return ReducerKind::Multiply;
++    }
++    return matchLexicographicReducer(body);
 +  }
 +
 +  static ComplexParts combine(Location loc, ComplexParts lhs,
