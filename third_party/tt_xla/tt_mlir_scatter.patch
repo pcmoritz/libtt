@@ -3,53 +3,140 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 index 2701ea4..487c93d 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -4617,6 +4617,59 @@ getReduceTypeFromRegion(Region &region) {
+@@ -4617,6 +4617,146 @@ getReduceTypeFromRegion(Region &region) {
        std::make_error_code(std::errc::operation_not_supported));
  }
  
++template <typename BinaryOp>
++static bool matchesBinaryScatterReducer(Block &block) {
++  if (block.getNumArguments() != 2 || block.getOperations().size() != 2) {
++    return false;
++  }
++  auto binary = mlir::dyn_cast<BinaryOp>(block.front());
++  auto returnOp =
++      mlir::dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
++  return binary && returnOp && returnOp.getNumOperands() == 1 &&
++         binary.getLhs() == block.getArgument(0) &&
++         binary.getRhs() == block.getArgument(1) &&
++         returnOp.getOperand(0) == binary.getResult();
++}
++
++static std::optional<ttcore::ReduceType>
++getBinaryScatterReduceType(Region &region) {
++  if (!region.hasOneBlock()) {
++    return std::nullopt;
++  }
++  Block &block = region.front();
++  if (matchesBinaryScatterReducer<mlir::stablehlo::AddOp>(block)) {
++    return ttcore::ReduceType::Sum;
++  }
++  if (matchesBinaryScatterReducer<mlir::stablehlo::MulOp>(block)) {
++    return ttcore::ReduceType::Prod;
++  }
++  if (matchesBinaryScatterReducer<mlir::stablehlo::MaxOp>(block)) {
++    return ttcore::ReduceType::Max;
++  }
++  if (matchesBinaryScatterReducer<mlir::stablehlo::MinOp>(block)) {
++    return ttcore::ReduceType::Min;
++  }
++  return std::nullopt;
++}
++
 +static bool isSubtractReduction(Region &region) {
 +  if (!region.hasOneBlock()) {
 +    return false;
 +  }
 +  Block &block = region.front();
-+  Operation *terminator = block.getTerminator();
-+  if (block.getNumArguments() != 2 || terminator->getNumOperands() != 1) {
++  if (block.getNumArguments() != 2 || block.getOperations().size() != 2) {
 +    return false;
 +  }
-+  auto subtract = mlir::dyn_cast_or_null<mlir::stablehlo::SubtractOp>(
-+      terminator->getOperand(0).getDefiningOp());
-+  return subtract &&
-+         subtract->getOperand(0) == block.getArgument(0) &&
-+         subtract->getOperand(1) == block.getArgument(1);
++  auto subtract = mlir::dyn_cast<mlir::stablehlo::SubtractOp>(block.front());
++  auto returnOp =
++      mlir::dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
++  return subtract && returnOp && returnOp.getNumOperands() == 1 &&
++         subtract.getLhs() == block.getArgument(0) &&
++         subtract.getRhs() == block.getArgument(1) &&
++         returnOp.getOperand(0) == subtract.getResult();
 +}
 +
-+enum class UnaryScatterApplyKind { None, Sine, SubtractOne };
++enum class UnaryScatterApplyKind {
++  None,
++  Negate,
++  Sine,
++  Cosine,
++  Square,
++  Sqrt,
++  Log,
++  Exponential,
++  SubtractOne,
++};
++
++template <typename UnaryOp>
++static bool matchesUnaryScatterApply(Block &block) {
++  if (block.getNumArguments() != 2 || block.getOperations().size() != 2) {
++    return false;
++  }
++  auto unary = mlir::dyn_cast<UnaryOp>(block.front());
++  auto returnOp =
++      mlir::dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
++  return unary && returnOp && returnOp.getNumOperands() == 1 &&
++         unary.getOperand() == block.getArgument(0) &&
++         returnOp.getOperand(0) == unary.getResult();
++}
 +
 +static UnaryScatterApplyKind getUnaryScatterApplyKind(Region &region) {
 +  if (!region.hasOneBlock()) {
 +    return UnaryScatterApplyKind::None;
 +  }
 +  Block &block = region.front();
-+  auto returnOp =
-+      mlir::dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
-+  if (!returnOp || block.getNumArguments() != 2 ||
-+      returnOp.getNumOperands() != 1) {
++  if (block.getNumArguments() != 2) {
 +    return UnaryScatterApplyKind::None;
 +  }
-+
-+  Operation *result = returnOp.getOperand(0).getDefiningOp();
-+  if (auto sine = mlir::dyn_cast_or_null<mlir::stablehlo::SineOp>(result);
-+      sine && sine.getOperand() == block.getArgument(0)) {
++  if (matchesUnaryScatterApply<mlir::stablehlo::NegOp>(block)) {
++    return UnaryScatterApplyKind::Negate;
++  }
++  if (matchesUnaryScatterApply<mlir::stablehlo::SineOp>(block)) {
 +    return UnaryScatterApplyKind::Sine;
++  }
++  if (matchesUnaryScatterApply<mlir::stablehlo::CosineOp>(block)) {
++    return UnaryScatterApplyKind::Cosine;
++  }
++  if (matchesUnaryScatterApply<mlir::stablehlo::SqrtOp>(block)) {
++    return UnaryScatterApplyKind::Sqrt;
++  }
++  if (matchesUnaryScatterApply<mlir::stablehlo::LogOp>(block)) {
++    return UnaryScatterApplyKind::Log;
++  }
++  if (matchesUnaryScatterApply<mlir::stablehlo::ExpOp>(block)) {
++    return UnaryScatterApplyKind::Exponential;
++  }
++
++  auto returnOp =
++      mlir::dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
++  if (!returnOp || returnOp.getNumOperands() != 1) {
++    return UnaryScatterApplyKind::None;
++  }
++  Operation *result = returnOp.getOperand(0).getDefiningOp();
++  if (block.getOperations().size() == 2) {
++    auto multiply = mlir::dyn_cast_or_null<mlir::stablehlo::MulOp>(result);
++    if (multiply && multiply.getLhs() == block.getArgument(0) &&
++        multiply.getRhs() == block.getArgument(0)) {
++      return UnaryScatterApplyKind::Square;
++    }
 +  }
 +
 +  auto subtract =
 +      mlir::dyn_cast_or_null<mlir::stablehlo::SubtractOp>(result);
-+  if (!subtract || subtract->getOperand(0) != block.getArgument(0)) {
++  if (!subtract || subtract.getLhs() != block.getArgument(0)) {
 +    return UnaryScatterApplyKind::None;
 +  }
-+  auto constant = subtract->getOperand(1)
-+                      .getDefiningOp<mlir::stablehlo::ConstantOp>();
++  auto constant =
++      subtract.getRhs().getDefiningOp<mlir::stablehlo::ConstantOp>();
++  bool constantInBlock = constant && constant->getBlock() == &block;
++  size_t expectedOperations = constantInBlock ? 3 : 2;
++  if (block.getOperations().size() != expectedOperations) {
++    return UnaryScatterApplyKind::None;
++  }
 +  DenseIntElementsAttr value;
 +  if (constant) {
 +    value = mlir::dyn_cast<DenseIntElementsAttr>(constant.getValue());
@@ -63,31 +150,36 @@ index 2701ea4..487c93d 100644
  static llvm::ErrorOr<ttcore::ReduceType> getReduceType(Operation *op) {
    if (!llvm::isa<mlir::stablehlo::AllReduceOp, mlir::stablehlo::ReduceScatterOp,
                   mlir::stablehlo::ScatterOp>(op)) {
-@@ -7860,7 +7913,12 @@ public:
+@@ -7860,8 +8000,12 @@ public:
      }
  
      // Convert reduceType stablehlo attribute into ttir attribute.
 -    llvm::ErrorOr<ttcore::ReduceType> scatterReduceType = getReduceType(srcOp);
-+    bool subtractReduction =
-+        isSubtractReduction(srcOp.getUpdateComputation());
+-    if (!scatterReduceType) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "ScatterOp cannot specify reduce type.");
+-    }
++    Region &updateComputation = srcOp.getUpdateComputation();
++    bool subtractReduction = isSubtractReduction(updateComputation);
++    auto binaryReduction = getBinaryScatterReduceType(updateComputation);
 +    UnaryScatterApplyKind unaryApply =
-+        getUnaryScatterApplyKind(srcOp.getUpdateComputation());
-+    llvm::ErrorOr<ttcore::ReduceType> scatterReduceType =
-+        subtractReduction ? ttcore::ReduceType::Sum : getReduceType(srcOp);
-     if (!scatterReduceType) {
-       return rewriter.notifyMatchFailure(
-           srcOp, "ScatterOp cannot specify reduce type.");
-@@ -7872,7 +7930,8 @@ public:
++        getUnaryScatterApplyKind(updateComputation);
++    ttcore::ReduceType scatterReduceType =
++        subtractReduction
++            ? ttcore::ReduceType::Sum
++            : binaryReduction.value_or(ttcore::ReduceType::Invalid);
+@@ -7872,7 +8016,8 @@ public:
      // below assumes, but `(operand, update) -> operand` keeps the original
      // value and would be silently turned into an overwrite.
-     if (*scatterReduceType == ttcore::ReduceType::Invalid &&
+-    if (*scatterReduceType == ttcore::ReduceType::Invalid &&
++    if (scatterReduceType == ttcore::ReduceType::Invalid &&
 -        !returnsUpdateValue(srcOp.getUpdateComputation())) {
 +        !returnsUpdateValue(srcOp.getUpdateComputation()) &&
 +        unaryApply == UnaryScatterApplyKind::None) {
        return rewriter.notifyMatchFailure(
            srcOp, "the scatter's update computation neither combines its "
                   "arguments nor returns the update value");
-@@ -7880,13 +7939,51 @@ public:
+@@ -7880,13 +8025,51 @@ public:
  
      RankedTensorType outputType = mlir::cast<RankedTensorType>(
          this->getTypeConverter()->convertType(srcOp.getResults()[0].getType()));
@@ -137,10 +229,11 @@ index 2701ea4..487c93d 100644
 +                                inputType.getRank() == updateType.getRank();
 +    if (!subtractReduction && scatterDimsToOperandDims.size() <= 1 &&
 +        !inputType.getElementType().isF32() && canUseAlignedScatter) {
-       return convertToSingleDimScatter(srcOp, adaptor, *scatterReduceType,
+-      return convertToSingleDimScatter(srcOp, adaptor, *scatterReduceType,
++      return convertToSingleDimScatter(srcOp, adaptor, scatterReduceType,
                                         outputType, rewriter);
      }
-@@ -7894,15 +7991,31 @@ public:
+@@ -7894,15 +8077,31 @@ public:
      // Multi-dimensional scatter: flatten everything to 1D and scatter scalars
      // along dimension 0.
      constexpr int32_t SCATTER_DIMENSION = 0;
@@ -176,7 +269,14 @@ index 2701ea4..487c93d 100644
      Value flattenedInput = ttir::utils::flattenTensor(
          rewriter, srcOp.getLoc(), inputTensor, "_input_flatten");
      Value flattenedUpdate = ttir::utils::flattenTensor(
-@@ -7920,6 +8033,10 @@ public:
+@@ -7911,5 +8110,5 @@ public:
+     Value scatterResult = rewriter.create<ttir::ScatterOp>(
+         srcOp.getLoc(), mlir::cast<RankedTensorType>(flattenedInput.getType()),
+         flattenedInput, flattenedIndices, flattenedUpdate,
+         rewriter.getI32IntegerAttr(SCATTER_DIMENSION),
+-        ttcore::ReduceTypeAttr::get(rewriter.getContext(), *scatterReduceType));
++        ttcore::ReduceTypeAttr::get(rewriter.getContext(), scatterReduceType));
+@@ -7920,6 +8119,10 @@ public:
          ttmlir::utils::appendLocationSuffix(srcOp.getLoc(), "_result_reshape"),
          scatterResult, inputShape);
  
@@ -187,7 +287,7 @@ index 2701ea4..487c93d 100644
      rewriter.replaceOp(srcOp, reshapedResult);
      return success();
    }
-@@ -7927,5 +8044,68 @@ private:
+@@ -7927,5 +8130,87 @@ private:
  private:
 +  LogicalResult convertUnaryScatterApply(
 +      mlir::stablehlo::ScatterOp srcOp, Value inputTensor,
@@ -222,8 +322,27 @@ index 2701ea4..487c93d 100644
 +          loc, scalarType, result, gatherIndex, dim);
 +
 +      switch (kind) {
++      case UnaryScatterApplyKind::Negate:
++        value = rewriter.create<ttir::NegOp>(loc, scalarType, value);
++        break;
 +      case UnaryScatterApplyKind::Sine:
 +        value = rewriter.create<ttir::SinOp>(loc, scalarType, value);
++        break;
++      case UnaryScatterApplyKind::Cosine:
++        value = rewriter.create<ttir::CosOp>(loc, scalarType, value);
++        break;
++      case UnaryScatterApplyKind::Square:
++        value = rewriter.create<ttir::MultiplyOp>(loc, scalarType, value,
++                                                   value);
++        break;
++      case UnaryScatterApplyKind::Sqrt:
++        value = rewriter.create<ttir::SqrtOp>(loc, scalarType, value);
++        break;
++      case UnaryScatterApplyKind::Log:
++        value = rewriter.create<ttir::LogOp>(loc, scalarType, value);
++        break;
++      case UnaryScatterApplyKind::Exponential:
++        value = rewriter.create<ttir::ExpOp>(loc, scalarType, value);
 +        break;
 +      case UnaryScatterApplyKind::SubtractOne: {
 +        Attribute one = rewriter.getOneAttr(scalarType.getElementType());
@@ -256,7 +375,7 @@ index 2701ea4..487c93d 100644
    // from: how a StableHLO scatter lines up with the operand's dimensions.
    struct OperandDimSources {
      static constexpr int64_t kNone = -1;
-@@ -8322,11 +8502,13 @@ private:
+@@ -8322,11 +8607,13 @@ private:
      auto dimensionNumbers = adaptor.getScatterDimensionNumbers();
      ArrayRef<int64_t> scatterDimsToOperandDims =
          dimensionNumbers.getScatterDimsToOperandDims();
@@ -273,7 +392,7 @@ index 2701ea4..487c93d 100644
  
      // Scatters along at most one operand dimension are checked by
      // computeOperandAlignedLayout instead, which has to work the mapping out in
-@@ -8335,14 +8517,8 @@ private:
+@@ -8335,14 +8622,8 @@ private:
        return success();
      }
  
@@ -290,7 +409,7 @@ index 2701ea4..487c93d 100644
  
      int64_t indexRank = op.getScatterIndices().getType().getRank();
      if (dimensionNumbers.getIndexVectorDim() != indexRank - 1) {
-@@ -8430,6 +8606,23 @@ private:
+@@ -8430,6 +8711,23 @@ private:
      return flatIndices;
    }
  
@@ -314,7 +433,7 @@ index 2701ea4..487c93d 100644
    /// Computes flattened 1D indices for multi-dimensional scatter.
    ///
    /// Handles both cases:
-@@ -8467,6 +8660,10 @@ private:
+@@ -8467,6 +8765,10 @@ private:
          scatterDimNumbers.getUpdateWindowDims();
      ArrayRef<int64_t> scatterDimsToOperandDims =
          scatterDimNumbers.getScatterDimsToOperandDims();
@@ -325,7 +444,7 @@ index 2701ea4..487c93d 100644
      int64_t indexVectorDim = scatterDimNumbers.getIndexVectorDim();
      int64_t operandRank = operandShape.size();
      Location loc = op.getLoc();
-@@ -8474,6 +8671,8 @@ private:
+@@ -8474,6 +8776,8 @@ private:
      // Build set of inserted window dims for fast lookup.
      llvm::DenseSet<int64_t> insertedDimsSet(insertedWindowDims.begin(),
                                              insertedWindowDims.end());
@@ -334,7 +453,7 @@ index 2701ea4..487c93d 100644
  
      // Build reverse map: operand dim -> index position in scatter indices.
      llvm::DenseMap<int64_t, int64_t> scatterDimToIdxPos;
-@@ -8506,6 +8705,54 @@ private:
+@@ -8506,6 +8810,54 @@ private:
      // Total number of expanded indices (one per one scalar update).
      int64_t expandedNumIndices = numScatterPositions * windowSize;
  
@@ -389,7 +508,7 @@ index 2701ea4..487c93d 100644
      // First, reshape the original indices to shape
      // [numScatterPositions, originalIndexSize].
      int64_t originalIndexSize = indicesShape[indexVectorDim];
-@@ -8602,31 +8849,42 @@ private:
+@@ -8602,31 +8954,42 @@ private:
      // b) window-only: use window offset only
      // c) both scatter-indexed and window: add scatter index + window offset
      llvm::SmallVector<Value> indexSlices;
@@ -450,7 +569,7 @@ index 2701ea4..487c93d 100644
        }
  
        if (isWindowDim) {
-@@ -8648,11 +8906,23 @@ private:
+@@ -8648,11 +9011,23 @@ private:
          }
        }
  
@@ -474,7 +593,7 @@ index 2701ea4..487c93d 100644
  
      // Flatten the computed indices to 1D.
      return ttir::utils::flattenTensor(rewriter, loc, flatIndices,
-@@ -11090,6 +11360,7 @@ public:
+@@ -11090,6 +11465,7 @@ public:
      return success();
    }
  };
@@ -482,7 +601,7 @@ index 2701ea4..487c93d 100644
  } // namespace
  
  namespace {
-@@ -11144,7 +11415,6 @@ public:
+@@ -11144,7 +11520,6 @@ public:
      return success();
    }
  };
@@ -490,7 +609,7 @@ index 2701ea4..487c93d 100644
  } // namespace
  
  namespace {
-@@ -11204,6 +11474,94 @@ public:
+@@ -11204,6 +11579,94 @@ public:
      return success();
    }
  };
@@ -585,7 +704,7 @@ index 2701ea4..487c93d 100644
  } // namespace
  
  namespace {
-@@ -11295,94 +11653,6 @@ public:
+@@ -11295,94 +11758,6 @@ public:
      return success();
    }
  };
