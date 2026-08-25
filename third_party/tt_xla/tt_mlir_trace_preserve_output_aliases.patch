@@ -1,0 +1,213 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -17,6 +17,7 @@
+ #include "llvm/ADT/Sequence.h"
+ #include <algorithm>
+ #include <atomic>
++#include <optional>
+ 
+ namespace mlir::tt::ttnn {
+ #define GEN_PASS_DEF_TTNNTRACEHOISTTRANSFORM
+@@ -300,6 +301,10 @@
+     llvm::SmallVector<mlir::DictionaryAttr> inputArgAttrs;
+     // Types of the output slot arguments (also the trace op's result types).
+     llvm::SmallVector<mlir::Type> outputSlotTypes;
++    // For each output, the input slot it aliases when the parent function
++    // declares donation through tf.aliasing_output. Aliased outputs reuse that
++    // slot instead of allocating and copying through a second device buffer.
++    llvm::SmallVector<std::optional<size_t>> outputAliasInputIndices;
+     // Types of the trailing semaphore arguments.
+     llvm::SmallVector<mlir::Type> semaphoreTypes;
+ 
+@@ -368,6 +373,40 @@
+ 
+     llvm::SmallVector<mlir::DictionaryAttr> inputAttrs =
+         getInputAttrs(context, inputs);
++    llvm::SmallVector<std::optional<size_t>> outputAliasInputIndices(
++        outputs.size());
++    auto returnOp = mlir::dyn_cast<func::ReturnOp>(
++        funcOp.getBody().front().getTerminator());
++    if (returnOp) {
++      for (auto [outputIndex, output] : llvm::enumerate(outputs)) {
++        std::optional<size_t> functionResultIndex;
++        for (auto [resultIndex, returnedValue] :
++             llvm::enumerate(returnOp.getOperands())) {
++          if (returnedValue == output) {
++            functionResultIndex = resultIndex;
++            break;
++          }
++        }
++        if (!functionResultIndex) {
++          continue;
++        }
++        for (size_t inputIndex = 0; inputIndex < numTensorInputs;
++             ++inputIndex) {
++          auto aliasAttr = inputAttrs[inputIndex].getAs<mlir::IntegerAttr>(
++              "tf.aliasing_output");
++          if (!aliasAttr ||
++              aliasAttr.getInt() != static_cast<int64_t>(*functionResultIndex)) {
++            continue;
++          }
++          if (inputs[inputIndex].getType() != output.getType()) {
++            return funcOp.emitError(
++                "Aliased trace input and output must have identical types");
++          }
++          outputAliasInputIndices[outputIndex] = inputIndex;
++          break;
++        }
++      }
++    }
+     // Types and attributes for all arguments of the new trace main function,
+     // in signature order: [input tensors][output slots][semaphores].
+     llvm::SmallVector<mlir::Type> argTypes;
+@@ -398,6 +437,12 @@
+                                    ttmlir::utils::FunctionType::TraceMain);
+ 
+     traceFuncOp.setAllArgAttrs(newArgAttrs);
++    for (std::optional<size_t> inputIndex : outputAliasInputIndices) {
++      if (inputIndex) {
++        traceFuncOp.setArgAttr(*inputIndex, "tt.trace_persistent_slot",
++                               builder.getUnitAttr());
++      }
++    }
+     traceFuncOp.setPrivate();
+ 
+     // Build the body of the new function
+@@ -416,6 +461,18 @@
+     }
+ 
+     for (Operation *op : opsToHoist) {
++      // A donated result aliases a persistent trace input slot. Do not clone
++      // its original deallocation into trace-main: it would release the
++      // captured input buffer immediately after the in-place update. The
++      // capture wrapper owns and deallocates its separate warmup state, while
++      // the persistent slot remains owned by the runtime trace cache.
++      if (auto deallocateOp = mlir::dyn_cast<ttnn::DeallocateOp>(op)) {
++        auto outputIt = llvm::find(outputs, deallocateOp.getInput());
++        if (outputIt != outputs.end() &&
++            outputAliasInputIndices[outputIt - outputs.begin()]) {
++          continue;
++        }
++      }
+       // clone the operation into the trace function
+       Operation *clonedOp = builder.clone(*op);
+ 
+@@ -439,9 +496,23 @@
+         return funcOp.emitError("Could not map operand in hoisted function");
+       }
+ 
+-      // Update the op's results with trace function op output result
++      // Update the op's results with trace function op output result. Mark
++      // results that alias persistent input slots so the later deallocation
++      // pass does not release buffers owned by the runtime trace cache.
++      llvm::SmallVector<int32_t> persistentResultIndices;
+       for (size_t i = 0; i < op->getNumResults(); i++) {
+-        valueMap[op->getResult(i)] = clonedOp->getResult(i);
++        mlir::Value originalResult = op->getResult(i);
++        valueMap[originalResult] = clonedOp->getResult(i);
++        auto outputIt = llvm::find(outputs, originalResult);
++        if (outputIt != outputs.end() &&
++            outputAliasInputIndices[outputIt - outputs.begin()]) {
++          persistentResultIndices.push_back(static_cast<int32_t>(i));
++        }
++      }
++      if (!persistentResultIndices.empty()) {
++        clonedOp->setAttr("tt.trace_persistent_results",
++                          builder.getDenseI32ArrayAttr(
++                              persistentResultIndices));
+       }
+     }
+ 
+@@ -449,6 +520,9 @@
+     // of the traced computation, so replaying the trace lands results in the
+     // slots, and the capture function's uncaptured call compiles them.
+     for (auto [i, output] : llvm::enumerate(outputs)) {
++      if (outputAliasInputIndices[i]) {
++        continue;
++      }
+       auto it = valueMap.find(output);
+       if (it == valueMap.end()) {
+         return funcOp.emitError(
+@@ -479,6 +553,7 @@
+       info.semaphoreTypes.push_back(inputs[i].getType());
+     }
+     info.outputSlotTypes = std::move(outputTypes);
++    info.outputAliasInputIndices = std::move(outputAliasInputIndices);
+     info.boundaryInputs = std::move(inputs);
+     info.boundaryOutputs = std::move(outputs);
+     return info;
+@@ -533,7 +608,13 @@
+       slots.push_back(createSlot(builder, allocateSlotsFunc.getLoc(), deviceOp,
+                                  mlir::cast<RankedTensorType>(slotType)));
+     }
+-    for (mlir::Type outputSlotType : info.outputSlotTypes) {
++    for (auto [outputIndex, outputSlotType] :
++         llvm::enumerate(info.outputSlotTypes)) {
++      if (std::optional<size_t> inputIndex =
++              info.outputAliasInputIndices[outputIndex]) {
++        slots.push_back(slots[*inputIndex]);
++        continue;
++      }
+       slots.push_back(createSlot(builder, allocateSlotsFunc.getLoc(), deviceOp,
+                                  mlir::cast<RankedTensorType>(outputSlotType)));
+     }
+diff --git a/lib/Dialect/TTNN/Transforms/Passes.cpp b/lib/Dialect/TTNN/Transforms/Passes.cpp
+--- a/lib/Dialect/TTNN/Transforms/Passes.cpp
++++ b/lib/Dialect/TTNN/Transforms/Passes.cpp
+@@ -26,6 +26,7 @@
+ #include "mlir/IR/TypeRange.h"
+ #include "mlir/IR/ValueRange.h"
+ #include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/StringRef.h"
+ #include "llvm/ADT/TypeSwitch.h"
+ #include "llvm/Support/Casting.h"
+@@ -225,6 +226,47 @@
+             continue;
+           }
+ 
++          // Trace-main does not own results that alias persistent input
++          // slots. Trace hoisting marks those exact result numbers.
++          auto persistentResults = op->getAttrOfType<DenseI32ArrayAttr>(
++              "tt.trace_persistent_results");
++          if (persistentResults &&
++              llvm::is_contained(persistentResults.asArrayRef(),
++                                 static_cast<int32_t>(
++                                     result.getResultNumber()))) {
++            continue;
++          }
++
++          // Layout decomposition may replace a marked operation. The
++          // persistent input argument itself survives those rewrites, so use
++          // its operand-specific write effect to recognize the aliased result.
++          if (ttmlir::utils::isTraceFunc(func)) {
++            auto memoryEffectOp = dyn_cast<MemoryEffectOpInterface>(op);
++            if (memoryEffectOp) {
++              SmallVector<MemoryEffects::EffectInstance> effects;
++              memoryEffectOp.getEffects(effects);
++              bool aliasesPersistentInput =
++                  llvm::any_of(effects, [&](const auto &effect) {
++                    if (!isa<MemoryEffects::Write>(effect.getEffect())) {
++                      return false;
++                    }
++                    Value effectValue = effect.getValue();
++                    if (!effectValue) {
++                      return false;
++                    }
++                    auto blockArg = dyn_cast<BlockArgument>(effectValue);
++                    return blockArg &&
++                           blockArg.getOwner() == &func.getBody().front() &&
++                           func.getArgAttr(blockArg.getArgNumber(),
++                                           "tt.trace_persistent_slot") &&
++                           blockArg.getType() == result.getType();
++                  });
++              if (aliasesPersistentInput) {
++                continue;
++              }
++            }
++          }
++
+           // A ttnn.moe_compute optional_output_tensor aliases its
+           // combine_output result (tt-metal returns the caller buffer). Skip it
+           // here; the result carries the correct, later deallocation.

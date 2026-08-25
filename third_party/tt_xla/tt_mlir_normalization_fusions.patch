@@ -1,0 +1,328 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+index 839b807..f2f705c 100644
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -536,6 +536,7 @@ public:
+ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+   using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
+ 
++public:
+   static mlir::Value lookThroughSplatConstantViewOps(mlir::Value value) {
+     while (Operation *op = value.getDefiningOp()) {
+       if (auto typecastOp = mlir::dyn_cast<TypecastOp>(op)) {
+@@ -589,7 +590,6 @@ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+                  : mlir::Value();
+   }
+ 
+-public:
+   mlir::LogicalResult
+   matchAndRewrite(MultiplyOp multiplyOp,
+                   mlir::PatternRewriter &rewriter) const final {
+@@ -635,6 +635,38 @@ public:
+   }
+ };
+ 
++// Frontends commonly expand sigmoid(x) as 1 / (1 + exp(-x)). Lower the
++// expansion back to the native sigmoid op even when it is not part of SiLU.
++// Besides reducing the number of device programs, this also lets subsequent
++// fusion patterns reason about sigmoid semantically instead of structurally.
++class ExpandedSigmoidFusionPattern : public mlir::OpRewritePattern<DivOp> {
++  using mlir::OpRewritePattern<DivOp>::OpRewritePattern;
++
++public:
++  mlir::LogicalResult
++  matchAndRewrite(DivOp divOp,
++                  mlir::PatternRewriter &rewriter) const final {
++    if (utils::isInsideCompositeDecomposition(divOp)) {
++      return mlir::failure();
++    }
++
++    mlir::Value input =
++        SiluFusionPattern::matchExpandedSigmoidInput(divOp.getResult());
++    if (!input) {
++      return mlir::failure();
++    }
++
++    mlir::Type outputType = divOp.getResult().getType();
++    mlir::Value result = rewriter.create<SigmoidOp>(
++        divOp.getLoc(), input.getType(), input);
++    if (result.getType() != outputType) {
++      result = rewriter.create<TypecastOp>(divOp.getLoc(), outputType, result);
++    }
++    rewriter.replaceOp(divOp, result);
++    return mlir::success();
++  }
++};
++
+ std::optional<mlir::Value> matchNumericallyStableSoftplus(mlir::Value op) {
+   // common utility to match the numerically stable softplus
+   // NumericallyStableSoftplus = where[cond, x, ln(1 + e^x)]
+@@ -2926,6 +2958,10 @@ private:
+ 
+ namespace {
+ 
++// Reads a splat scalar through shape-only layout operations. The definition is
++// shared with the normalize-style matcher below.
++static std::optional<double> getSplatConstantValue(mlir::Value value);
++
+ // Fuses: (x * rsqrt(mean(x^2) + epsilon)) * gamma -> RMSNormOp
+ class RMSNormFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+   using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
+@@ -2969,9 +3005,9 @@ public:
+     auto dropSubtractZero = [&](mlir::Value value) {
+       value = lookThroughSafeOps(value);
+       auto subtract = value.getDefiningOp<SubtractOp>();
+-      return subtract &&
+-                     isFullOpWithValue(lookThroughSafeOps(subtract.getRhs()),
+-                                       0.0f)
++      auto rhs = subtract ? getSplatConstantValue(subtract.getRhs())
++                          : std::nullopt;
++      return subtract && rhs && *rhs == 0.0
+                  ? lookThroughSafeOps(subtract.getLhs())
+                  : value;
+     };
+@@ -3022,11 +3058,11 @@ public:
+       auto sumOp = lookThroughSafeOps(divOp.getLhs()).getDefiningOp<SumOp>();
+       if (!sumOp) return std::nullopt;
+       auto sumInputType = mlir::cast<RankedTensorType>(sumOp.getInput().getType());
+-      return sumInputType.getRank() != 0 &&
+-                     isFullOpWithValue(
+-                         lookThroughSafeOps(divOp.getRhs()),
+-                         static_cast<float>(sumInputType.getShape().back()),
+-                         1e-3f)
++      auto divisor = getSplatConstantValue(divOp.getRhs());
++      return sumInputType.getRank() != 0 && divisor &&
++                     std::abs(*divisor - sumInputType.getShape().back()) <=
++                         1e-3 * std::max<double>(
++                                    1.0, sumInputType.getShape().back())
+                  ? checkReduction(sumOp)
+                  : std::nullopt;
+     };
+@@ -3041,6 +3077,7 @@ public:
+     // Match x^2 as mul(x,x) or pow(x,2).
+     mlir::Value meanInput = *reductionInput;
+     mlir::Value squareInput = nullptr;
++    mlir::Value xComputeRaw = xRaw;
+     mlir::Value x = dropSubtractZero(xRaw);
+ 
+     if (auto sq = meanInput.getDefiningOp<MultiplyOp>()) {
+@@ -3054,20 +3091,18 @@ public:
+     }
+ 
+     if (!squareInput || squareInput != x) {
++      mlir::Value swappedRaw = gammaRaw;
+       mlir::Value swappedX = dropSubtractZero(gammaRaw);
+       if (squareInput != swappedX) {
+         return mlir::failure();
+       }
+       x = swappedX;
++      xComputeRaw = swappedRaw;
+       gammaRaw = xRaw;
+     }
+ 
+-    auto epsFull = epsilon.getDefiningOp<FullOp>();
+-    if (!epsFull) {
+-      return mlir::failure();
+-    }
+-    auto epsAttr = mlir::dyn_cast<FloatAttr>(epsFull.getFillValue());
+-    if (!epsAttr) {
++    auto epsValue = getSplatConstantValue(epsilon);
++    if (!epsValue) {
+       return mlir::failure();
+     }
+ 
+@@ -3105,7 +3140,17 @@ public:
+     // the indication that the matching is not correct.
+     auto inputType = mlir::cast<RankedTensorType>(x.getType());
+     if (inputType.getElementType() != gammaType.getElementType()) {
+-      if (mlir::Operation *xOp = x.getDefiningOp()) {
++      // The decomposition may explicitly promote x before doing the RMS
++      // calculation (for example bf16 -> f32). Prefer that computation value
++      // when it has gamma's dtype and canonicalizes back to the matched x.
++      auto computeType =
++          mlir::dyn_cast<RankedTensorType>(xComputeRaw.getType());
++      if (computeType &&
++          computeType.getElementType() == gammaType.getElementType() &&
++          dropSubtractZero(xComputeRaw) == x) {
++        x = xComputeRaw;
++        inputType = computeType;
++      } else if (mlir::Operation *xOp = x.getDefiningOp()) {
+         x = utils::revertTypecastFolding(rewriter, xOp, x);
+         inputType = mlir::cast<RankedTensorType>(x.getType());
+       }
+@@ -3121,7 +3166,7 @@ public:
+     auto rmsNorm = rewriter.create<RMSNormOp>(
+         outerMul.getLoc(), rmsNormOutputType, x, gamma,
+         /*bias=*/nullptr, rewriter.getDenseI64ArrayAttr(normalizedShape),
+-        rewriter.getF32FloatAttr(epsAttr.getValue().convertToFloat()));
++        rewriter.getF32FloatAttr(static_cast<float>(*epsValue)));
+ 
+     mlir::Value result = rmsNorm;
+ 
+@@ -3437,6 +3482,153 @@ public:
+   }
+ };
+ 
++// Fuses an L2 normalization over the trailing dimension into rms_norm:
++//
++//   y = x / sqrt(sum(x * x, dim=-1) + epsilon) * scale
++//
++// rms_norm computes x / sqrt(mean(x * x) + rms_epsilon) * weight.  For a
++// reduction of size D the two expressions are equivalent when
++//
++//   rms_epsilon = epsilon / D
++//   weight      = scale / sqrt(D)
++//
++// `scale` is optional and must be a splat constant.  This form is emitted by
++// several frontends for query/key L2 normalization, and replacing it with a
++// single rms_norm avoids materializing the reduction and denominator tensors.
++class L2NormRMSNormFusionPattern : public mlir::OpRewritePattern<DivOp> {
++  using mlir::OpRewritePattern<DivOp>::OpRewritePattern;
++
++public:
++  mlir::LogicalResult
++  matchAndRewrite(DivOp divOp,
++                  mlir::PatternRewriter &rewriter) const final {
++    if (utils::isInsideCompositeDecomposition(divOp)) {
++      return mlir::failure();
++    }
++
++    // Keep the exact value being normalized. Looking through its reshape and
++    // broadcast chain would change both the rank and the reduction dimension.
++    mlir::Value x = divOp.getLhs();
++    auto xType = mlir::dyn_cast<mlir::RankedTensorType>(x.getType());
++    if (!xType || xType.getRank() == 0) {
++      return mlir::failure();
++    }
++
++    // Match sqrt(sum(x^2) + epsilon), looking through reshapes and broadcasts.
++    auto sqrtOp = utils::findOpThroughLayoutOps<SqrtOp>(divOp.getRhs());
++    if (!sqrtOp) {
++      return mlir::failure();
++    }
++    auto addOp = utils::findOpThroughLayoutOps<AddOp>(sqrtOp.getInput());
++    if (!addOp) {
++      return mlir::failure();
++    }
++
++    SumOp sumOp = utils::findOpThroughLayoutOps<SumOp>(addOp.getLhs());
++    mlir::Value epsilonValue = addOp.getRhs();
++    if (!sumOp) {
++      sumOp = utils::findOpThroughLayoutOps<SumOp>(addOp.getRhs());
++      epsilonValue = addOp.getLhs();
++    }
++    std::optional<double> epsilon = getSplatConstantValue(epsilonValue);
++    if (!sumOp || !epsilon || !std::isfinite(*epsilon) || *epsilon < 0.0) {
++      return mlir::failure();
++    }
++
++    std::optional<mlir::ArrayAttr> dimArg = sumOp.getDimArg();
++    if (!dimArg || dimArg->size() != 1) {
++      return mlir::failure();
++    }
++    int64_t reduceDim =
++        mlir::cast<mlir::IntegerAttr>((*dimArg)[0]).getInt();
++    if (reduceDim < 0) {
++      reduceDim += xType.getRank();
++    }
++    // TTNN rms_norm operates on the trailing dimension.  Restricting the
++    // rewrite avoids introducing permutations for a normalization that is
++    // normally on the model's head dimension anyway.
++    if (reduceDim != xType.getRank() - 1) {
++      return mlir::failure();
++    }
++    int64_t reduceDimSize = xType.getShape()[reduceDim];
++    if (reduceDimSize <= 1) {
++      return mlir::failure();
++    }
++
++    mlir::Value squareBase;
++    if (auto mulOp =
++            utils::findOpThroughLayoutOps<MultiplyOp>(sumOp.getInput())) {
++      if (utils::lookThroughLayoutOps(mulOp.getLhs()) !=
++          utils::lookThroughLayoutOps(mulOp.getRhs())) {
++        return mlir::failure();
++      }
++      squareBase = mulOp.getLhs();
++    } else if (auto powOp =
++                   utils::findOpThroughLayoutOps<PowOp>(sumOp.getInput())) {
++      if (!isApproxScalarConstant(powOp.getRhs(), 2.0, 1e-3)) {
++        return mlir::failure();
++      }
++      squareBase = powOp.getLhs();
++    } else {
++      return mlir::failure();
++    }
++    if (squareBase != x) {
++      return mlir::failure();
++    }
++
++    // Fold a following splat scale into rms_norm's weight when possible.
++    double scale = 1.0;
++    mlir::Operation *replaceTarget = divOp.getOperation();
++    if (divOp->hasOneUse()) {
++      if (auto scaleMul =
++              mlir::dyn_cast<MultiplyOp>(*divOp->getUsers().begin())) {
++        mlir::Value other = scaleMul.getLhs() == divOp.getResult()
++                                ? scaleMul.getRhs()
++                                : scaleMul.getLhs();
++        if (std::optional<double> scaleValue =
++                getSplatConstantValue(other)) {
++          if (!std::isfinite(*scaleValue)) {
++            return mlir::failure();
++          }
++          scale = *scaleValue;
++          replaceTarget = scaleMul.getOperation();
++        }
++      }
++    }
++
++    auto targetType = mlir::dyn_cast<mlir::RankedTensorType>(
++        replaceTarget->getResult(0).getType());
++    if (!targetType) {
++      return mlir::failure();
++    }
++
++    rewriter.setInsertionPoint(replaceTarget);
++    mlir::Location loc = divOp.getLoc();
++    llvm::SmallVector<int64_t> normalizedShape{reduceDimSize};
++    auto weightType = mlir::RankedTensorType::get(
++        normalizedShape, xType.getElementType(), xType.getEncoding());
++    float weightValue = static_cast<float>(
++        scale / std::sqrt(static_cast<double>(reduceDimSize)));
++    mlir::Value weight = rewriter.create<FullOp>(
++        loc, weightType, rewriter.getF32FloatAttr(weightValue));
++    float rmsEpsilon = static_cast<float>(
++        *epsilon / static_cast<double>(reduceDimSize));
++    mlir::Value rmsResult =
++        rewriter
++            .create<RMSNormOp>(
++                loc, xType, x, weight,
++                /*bias=*/mlir::Value(),
++                rewriter.getDenseI64ArrayAttr(normalizedShape),
++                rewriter.getF32FloatAttr(rmsEpsilon))
++            .getResult();
++
++    mlir::Value result =
++        utils::reshapeAndCastToType(rewriter, loc, rmsResult, targetType);
++    rewriter.replaceOp(replaceTarget, result);
++    return mlir::success();
++  }
++};
++
+ // If value is defined by PermuteOp with permute dimensions
+ // (..., rank - 2, rank - 1), return the input of the PermuteOp, otherwise
+ // return std::nullopt. This is used for fusing permute into MatmulOp and
+@@ -3778,10 +3970,12 @@ public:
+       }
+       patterns.add<RMSNormFusionPattern>(&getContext());
+       patterns.add<NormalizeRMSNormFusionPattern>(&getContext());
++      patterns.add<L2NormRMSNormFusionPattern>(&getContext());
+ 
+       patterns.add<GeluFusionPattern>(&getContext());
+       patterns.add<Relu6FusionPattern>(&getContext());
+       patterns.add<SiluFusionPattern>(&getContext());
++      patterns.add<ExpandedSigmoidFusionPattern>(&getContext());
+       patterns.add<HardsigmoidFusionPattern>(&getContext());
+       patterns.add<MishFusingPattern>(&getContext());
+       patterns.add<ReshapeBroadcastReshapeToRepeatPattern>(&getContext());

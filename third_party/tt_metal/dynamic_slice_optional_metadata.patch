@@ -1,0 +1,36 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
+@@ -451,6 +451,13 @@ Tensor SliceOperation::invoke(
+         }
+     }
+ 
++    // The device-only path is an optimized distributed slice and needs
++    // partition metadata that general dynamic-slice callers do not have.
++    // Fall back to the ordinary path when that optional metadata is absent.
++    if (!slice_dim.has_value() || !num_devices.has_value()) {
++        use_device_only_path = false;
++    }
++
+     // Validate tensors are on device for both paths
+     TT_FATAL(
+         input_tensor.storage_type() == StorageType::DEVICE, "Input tensor must be on device for tensor args slice");
+@@ -562,6 +569,18 @@ template ttnn::Tensor slice<uint32_t, 4>(
+     const std::optional<float>& pad_value,
+     const std::optional<CoreRangeSet>& sub_core_grids);
+ 
+ // Template instantiations for Tensor version
++template ttnn::Tensor slice<int32_t>(
++    const ttnn::Tensor& input_tensor,
++    const ttnn::Tensor& output_tensor_start,
++    const ttnn::Tensor& output_tensor_end,
++    const std::optional<ttsl::SmallVector<int32_t>>& step,
++    const std::optional<MemoryConfig>& memory_config_arg,
++    const std::optional<Tensor>& optional_output_tensor,
++    const std::optional<float>& pad_value,
++    const std::optional<uint32_t>& slice_dim,
++    const std::optional<uint32_t>& num_devices,
++    const std::optional<CoreRangeSet>& sub_core_grids);
++
+ template ttnn::Tensor slice<uint32_t>(
+     const ttnn::Tensor& input_tensor,

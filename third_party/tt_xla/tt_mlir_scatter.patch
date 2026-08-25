@@ -256,17 +256,15 @@ index 2701ea4..487c93d 100644
    // from: how a StableHLO scatter lines up with the operand's dimensions.
    struct OperandDimSources {
      static constexpr int64_t kNone = -1;
-@@ -8322,11 +8502,13 @@ private:
+@@ -8322,11 +8502,9 @@ private:
      auto dimensionNumbers = adaptor.getScatterDimensionNumbers();
      ArrayRef<int64_t> scatterDimsToOperandDims =
          dimensionNumbers.getScatterDimsToOperandDims();
 -    if (!llvm::is_sorted(scatterDimsToOperandDims)) {
-+    if (scatterDimsToOperandDims.empty()) {
-       return rewriter.notifyMatchFailure(
+-      return rewriter.notifyMatchFailure(
 -          op,
 -          "scatter_dims_to_operand_dims must be in strictly increasing order.");
-+          op, "scatter_dims_to_operand_dims must not be empty");
-     }
+-    }
 +    // Index-vector columns map positionally to operand dimensions. Preserve
 +    // their StableHLO-specified order: JAX legitimately emits non-monotonic
 +    // mappings for mixed advanced indexing.
