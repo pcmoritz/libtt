@@ -1,0 +1,76 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+@@ -684,6 +684,54 @@ class ComplexMulOpConversionPattern
+ };
+ } // namespace
+ 
++// Decomposes (a + bi) / (c + di) into
++//   real = (ac + bd) / (c*c + d*d)
++//   imag = (bc - ad) / (c*c + d*d)
++namespace {
++class ComplexDivOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::DivOp> {
++  using OpConversionPattern<mlir::stablehlo::DivOp>::OpConversionPattern;
++
++public:
++  LogicalResult matchAndRewrite(
++      mlir::stablehlo::DivOp op,
++      OpConversionPattern<mlir::stablehlo::DivOp>::OpAdaptor adaptor,
++      ConversionPatternRewriter &rewriter) const override {
++    Location loc = op.getLoc();
++    auto [lhsReal, lhsImag] =
++        unpackRealImag(loc, adaptor.getLhs(), rewriter);
++    auto [rhsReal, rhsImag] =
++        unpackRealImag(loc, adaptor.getRhs(), rewriter);
++
++    Value ac =
++        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsReal, rhsReal);
++    Value bd =
++        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsImag, rhsImag);
++    Value bc =
++        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsImag, rhsReal);
++    Value ad =
++        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsReal, rhsImag);
++    Value cc =
++        rewriter.create<mlir::stablehlo::MulOp>(loc, rhsReal, rhsReal);
++    Value dd =
++        rewriter.create<mlir::stablehlo::MulOp>(loc, rhsImag, rhsImag);
++    Value denominator =
++        rewriter.create<mlir::stablehlo::AddOp>(loc, cc, dd);
++    Value realNumerator =
++        rewriter.create<mlir::stablehlo::AddOp>(loc, ac, bd);
++    Value imagNumerator =
++        rewriter.create<mlir::stablehlo::SubtractOp>(loc, bc, ad);
++    Value real = rewriter.create<mlir::stablehlo::DivOp>(
++        loc, realNumerator, denominator);
++    Value imag = rewriter.create<mlir::stablehlo::DivOp>(
++        loc, imagNumerator, denominator);
++
++    rewriter.replaceOp(op, packRealImag(loc, real, imag, rewriter));
++    return success();
++  }
++};
++} // namespace
++
+ // Rewrites select(pred, complex_true, complex_false) for the trailing
+ // real/imag representation. A non-scalar predicate must be broadcast over the
+ // new component dimension before selecting between the converted branches.
+@@ -1098,7 +1146,8 @@ struct StableHLOComplexDataTypeConversionPass
+         mlir::stablehlo::SliceOp, mlir::stablehlo::GatherOp,
+         mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
+         mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
+-        mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp, mlir::stablehlo::MulOp,
++        mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp, mlir::stablehlo::DivOp,
++        mlir::stablehlo::MulOp,
+         mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp,
+         mlir::stablehlo::ReduceOp,
+         mlir::stablehlo::SelectOp>(
+@@ -1156,6 +1205,7 @@ struct StableHLOComplexDataTypeConversionPass
+         ComplexConstantOpConversionPattern, ComplexConvertOpConversionPattern,
+         ComplexGatherOpConversionPattern,
+         ComplexIotaOpConversionPattern,
++        ComplexDivOpConversionPattern,
+         ComplexMulOpConversionPattern,
+         ComplexReduceOpConversionPattern,
+         ComplexSelectOpConversionPattern,
