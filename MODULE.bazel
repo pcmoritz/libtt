@@ -339,6 +339,7 @@ git_repository(
     commit = "1c9f93e45db98d81814e850a748f35a53db2a0ab",
     patch_args = ["-p1"],
     patches = [
+        "//third_party/tt_xla:tt_xla_isolate_assert_namespace.patch",
         "//third_party/tt_xla:tt_xla_protobuf_string_view.patch",
         "//third_party/tt_xla:tt_xla_disable_cpu_const_eval.patch",
         "//third_party/tt_xla:tt_xla_disable_trace_global_fp32_acc.patch",

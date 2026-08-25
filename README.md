@@ -94,12 +94,17 @@ git fetch origin pull/1527/head:pr-1527
 git switch pr-1527
 ```
 
-Install or activate the Python environment for that checkout, install the
+Create a Python environment for that checkout, install SGLang-JAX and the
 plugin wheel, then start a Qwen3-8B server with the TT backend:
 
 ```bash
 cd "$SGLANG_JAX_DIR"
-.venv/bin/python -m pip install "$LIBTT_WHEEL"
+uv venv --python 3.12
+uv pip install --python .venv/bin/python \
+  -e python \
+  jax==0.8.1 \
+  jaxlib==0.8.1 \
+  "$LIBTT_WHEEL"
 
 env -u TT_METAL_RUNTIME_ROOT \
   PYTHONPATH="$SGLANG_JAX_DIR/python" \
@@ -144,3 +149,32 @@ curl -sS http://127.0.0.1:31000/generate \
 
 On a P150, generation should be about 30 tokens per second after the compile
 and trace-capture warmups.
+
+### Run MMLU
+
+Leave the server running and use the evaluator included in the PR checkout.
+Start with ten examples to verify the setup:
+
+```bash
+cd "$SGLANG_JAX_DIR"
+PYTHONPATH="$SGLANG_JAX_DIR/python" \
+  .venv/bin/python test/srt/run_eval.py \
+    --host 127.0.0.1 \
+    --port 31000 \
+    --model Qwen/Qwen3-8B \
+    --eval-name mmlu \
+    --num-examples 10 \
+    --num-threads 2 \
+    --max-tokens 1024
+```
+
+The evaluator downloads the MMLU data on first use. It samples examples with a
+fixed seed and writes the score, per-category metrics, and reports to
+`/tmp/mmlu_Qwen_Qwen3-8B.{json,html}`. Use `--num-examples 200` for the
+CI-sized accuracy check, or remove `--num-examples` to evaluate the complete
+dataset. Keep `--num-threads` no larger than the server's
+`--max-running-requests` value.
+
+The first run may compile and capture additional prompt-length buckets. Reuse
+the same server and compilation cache for subsequent accuracy or performance
+runs.
