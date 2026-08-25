@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 --- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
-@@ -684,6 +684,54 @@ class ComplexMulOpConversionPattern
+@@ -684,6 +684,57 @@ class ComplexMulOpConversionPattern
  };
  } // namespace
  
@@ -32,6 +32,9 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsImag, rhsReal);
 +    Value ad =
 +        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsReal, rhsImag);
++    // TODO: Use Smith's algorithm for better numerical stability. Computing
++    // c*c + d*d directly can overflow or underflow even when the quotient is
++    // representable.
 +    Value cc =
 +        rewriter.create<mlir::stablehlo::MulOp>(loc, rhsReal, rhsReal);
 +    Value dd =
@@ -56,7 +59,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
  // Rewrites select(pred, complex_true, complex_false) for the trailing
  // real/imag representation. A non-scalar predicate must be broadcast over the
  // new component dimension before selecting between the converted branches.
-@@ -1098,7 +1146,8 @@ struct StableHLOComplexDataTypeConversionPass
+@@ -1098,7 +1149,8 @@ struct StableHLOComplexDataTypeConversionPass
          mlir::stablehlo::SliceOp, mlir::stablehlo::GatherOp,
          mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
          mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
@@ -66,7 +69,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
          mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp,
          mlir::stablehlo::ReduceOp,
          mlir::stablehlo::SelectOp>(
-@@ -1156,6 +1205,7 @@ struct StableHLOComplexDataTypeConversionPass
+@@ -1156,6 +1208,7 @@ struct StableHLOComplexDataTypeConversionPass
          ComplexConstantOpConversionPattern, ComplexConvertOpConversionPattern,
          ComplexGatherOpConversionPattern,
          ComplexIotaOpConversionPattern,
