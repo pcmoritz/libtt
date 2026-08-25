@@ -1,0 +1,639 @@
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
+index ad9049484b..c306d72f39 100644
+--- ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
+@@ -53,8 +53,6 @@ void kernel_main() {
+     const uint32_t a_log_address = get_arg_val<uint32_t>(6);
+     const uint32_t dt_bias_address = get_arg_val<uint32_t>(7);
+     const uint32_t state_address = get_arg_val<uint32_t>(8);
+-    const uint32_t state_indices_address = get_arg_val<uint32_t>(9);
+-    const uint32_t has_initial_state_address = get_arg_val<uint32_t>(10);
+ 
+     constexpr auto query_args = TensorAccessorArgs<6>();
+     constexpr auto key_args = TensorAccessorArgs<query_args.next_compile_time_args_offset()>();
+@@ -64,9 +62,6 @@ void kernel_main() {
+     constexpr auto a_log_args = TensorAccessorArgs<delta_time_args.next_compile_time_args_offset()>();
+     constexpr auto dt_bias_args = TensorAccessorArgs<a_log_args.next_compile_time_args_offset()>();
+     constexpr auto state_args = TensorAccessorArgs<dt_bias_args.next_compile_time_args_offset()>();
+-    constexpr auto state_indices_args = TensorAccessorArgs<state_args.next_compile_time_args_offset()>();
+-    constexpr auto has_initial_state_args =
+-        TensorAccessorArgs<state_indices_args.next_compile_time_args_offset()>();
+     const auto query = TensorAccessor(query_args, query_address, tile_bytes);
+     const auto key = TensorAccessor(key_args, key_address, tile_bytes);
+     const auto value = TensorAccessor(value_args, value_address, tile_bytes);
+@@ -75,12 +70,6 @@ void kernel_main() {
+     const auto a_log = TensorAccessor(a_log_args, a_log_address, tile_bytes);
+     const auto dt_bias = TensorAccessor(dt_bias_args, dt_bias_address, tile_bytes);
+     const auto state = TensorAccessor(state_args, state_address, tile_bytes);
+-    constexpr uint32_t index_tile_bytes = 4096;
+-    constexpr uint32_t flag_tile_bytes = 2048;
+-    const auto state_indices =
+-        TensorAccessor(state_indices_args, state_indices_address, index_tile_bytes);
+-    const auto has_initial_state =
+-        TensorAccessor(has_initial_state_args, has_initial_state_address, flag_tile_bytes);
+ 
+     CircularBuffer state_cb(tt::CBIndex::c_0);
+     CircularBuffer query_cb(tt::CBIndex::c_1);
+@@ -91,45 +80,25 @@ void kernel_main() {
+     CircularBuffer key_transposed_cb(tt::CBIndex::c_9);
+     CircularBuffer a_log_cb(tt::CBIndex::c_13);
+     CircularBuffer dt_bias_cb(tt::CBIndex::c_14);
+-    CircularBuffer state_indices_cb(tt::CBIndex::c_15);
+-    CircularBuffer has_initial_state_cb(tt::CBIndex::c_17);
+     Noc noc;
+ 
+-    // Metadata is shared by every head handled by this core.
+-    state_indices_cb.reserve_back(1);
+-    has_initial_state_cb.reserve_back(1);
+-    noc.async_read(state_indices, state_indices_cb, index_tile_bytes,
+-                   {.page_id = 0}, {.offset_bytes = 0});
+-    noc.async_read(has_initial_state, has_initial_state_cb, flag_tile_bytes,
+-                   {.page_id = 0}, {.offset_bytes = 0});
+-    noc.async_read_barrier();
+-    state_indices_cb.push_back(1);
+-    has_initial_state_cb.push_back(1);
+-
+     for (uint32_t work = worker; work < batch_size * num_heads * workers_per_head; work += num_workers) {
+     const uint32_t head_work = work / workers_per_head;
+     const uint32_t column_start = (work % workers_per_head) * vt;
+     const uint32_t batch = head_work / num_heads;
+     const uint32_t head = head_work % num_heads;
+ 
+-    const uint32_t state_slot =
+-        read_index(state_indices_cb.get_read_ptr(), batch);
+-    const bool has_state =
+-        read_flag(has_initial_state_cb.get_read_ptr(), batch);
+-
+-    const uint32_t state_base = (state_slot * num_heads + head) * kt * full_vt;
++    const uint32_t state_base = (batch * num_heads + head) * kt * full_vt;
+     state_cb.reserve_back(state_tiles);
+-    if (has_state) {
+-        for (uint32_t row = 0; row < kt; ++row) {
+-            for (uint32_t column = 0; column < vt; ++column) {
+-                const uint32_t local_tile = row * vt + column;
+-                noc.async_read(
+-                    state,
+-                    state_cb,
+-                    tile_bytes,
+-                    {.page_id = state_base + row * full_vt + column_start + column},
+-                    {.offset_bytes = local_tile * tile_bytes});
+-            }
++    for (uint32_t row = 0; row < kt; ++row) {
++        for (uint32_t column = 0; column < vt; ++column) {
++            const uint32_t local_tile = row * vt + column;
++            noc.async_read(
++                state,
++                state_cb,
++                tile_bytes,
++                {.page_id = state_base + row * full_vt + column_start + column},
++                {.offset_bytes = local_tile * tile_bytes});
+         }
+     }
+ 
+@@ -180,9 +149,6 @@ void kernel_main() {
+     noc.async_read(dt_bias, dt_bias_cb, tile_bytes, {.page_id = head / 32}, {.offset_bytes = 0});
+     noc.async_read_barrier();
+ 
+-    if (!has_state) {
+-        zero_tiles<uint32_t>(state_cb.get_write_ptr(), state_tiles);
+-    }
+     state_cb.push_back(state_tiles);
+     query_cb.push_back(kt);
+     for (uint32_t tile = 0; tile < kt; ++tile) {
+@@ -202,6 +168,4 @@ void kernel_main() {
+     make_scalar_tile(dt_bias_cb.get_write_ptr(), 0, scalar_column);
+     dt_bias_cb.push_back(1);
+     }
+-    state_indices_cb.pop_front(1);
+-    has_initial_state_cb.pop_front(1);
+ }
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_gather.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_gather.cpp
+new file mode 100644
+index 0000000000..d5d02675f2
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_gather.cpp
+@@ -0,0 +1,65 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#include <stdint.h>
++
++#include "api/dataflow/circular_buffer.h"
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++#include "recurrent_utils.hpp"
++
++void kernel_main() {
++    constexpr uint32_t batch_size = get_compile_time_arg_val(0);
++    constexpr uint32_t pages_per_slice = get_compile_time_arg_val(1);
++    constexpr uint32_t num_workers = get_compile_time_arg_val(2);
++    constexpr uint32_t tile_bytes = get_compile_time_arg_val(3);
++
++    const uint32_t worker = get_arg_val<uint32_t>(0);
++    const uint32_t state_pool_address = get_arg_val<uint32_t>(1);
++    const uint32_t state_indices_address = get_arg_val<uint32_t>(2);
++    const uint32_t output_address = get_arg_val<uint32_t>(3);
++
++    constexpr auto state_pool_args = TensorAccessorArgs<4>();
++    constexpr auto state_indices_args =
++        TensorAccessorArgs<state_pool_args.next_compile_time_args_offset()>();
++    constexpr auto output_args =
++        TensorAccessorArgs<state_indices_args.next_compile_time_args_offset()>();
++    const auto state_pool =
++        TensorAccessor(state_pool_args, state_pool_address, tile_bytes);
++    const auto state_indices =
++        TensorAccessor(state_indices_args, state_indices_address, 4096);
++    const auto output = TensorAccessor(output_args, output_address, tile_bytes);
++
++    CircularBuffer data_cb(tt::CBIndex::c_0);
++    CircularBuffer indices_cb(tt::CBIndex::c_1);
++    Noc noc;
++
++    indices_cb.reserve_back(1);
++    noc.async_read(
++        state_indices, indices_cb, 4096,
++        {.page_id = 0}, {.offset_bytes = 0});
++    noc.async_read_barrier();
++    indices_cb.push_back(1);
++    indices_cb.wait_front(1);
++    const uint32_t total_pages = batch_size * pages_per_slice;
++    for (uint32_t work = worker; work < total_pages; work += num_workers) {
++        const uint32_t batch = work / pages_per_slice;
++        const uint32_t page = work % pages_per_slice;
++        const uint32_t slot = read_index(indices_cb.get_read_ptr(), batch);
++        data_cb.reserve_back(1);
++        noc.async_read(
++            state_pool, data_cb, tile_bytes,
++            {.page_id = slot * pages_per_slice + page},
++            {.offset_bytes = 0});
++        noc.async_read_barrier();
++        data_cb.push_back(1);
++        data_cb.wait_front(1);
++        noc.async_write(
++            data_cb, output, tile_bytes,
++            {.offset_bytes = 0},
++            {.page_id = batch * pages_per_slice + page});
++        noc.async_write_barrier();
++        data_cb.pop_front(1);
++    }
++    indices_cb.pop_front(1);
++}
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp
+index d076e6588e..736774500d 100644
+--- ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp
+@@ -22,21 +22,15 @@ void kernel_main() {
+     const uint32_t worker = get_arg_val<uint32_t>(0);
+     const uint32_t output_address = get_arg_val<uint32_t>(1);
+     const uint32_t state_address = get_arg_val<uint32_t>(2);
+-    const uint32_t state_indices_address = get_arg_val<uint32_t>(3);
+ 
+     constexpr auto output_args = TensorAccessorArgs<6>();
+     constexpr auto state_args =
+         TensorAccessorArgs<output_args.next_compile_time_args_offset()>();
+-    constexpr auto state_indices_args =
+-        TensorAccessorArgs<state_args.next_compile_time_args_offset()>();
+     const auto output = TensorAccessor(output_args, output_address, output_tile_bytes);
+     const auto state = TensorAccessor(state_args, state_address, state_tile_bytes);
+-    const auto state_indices =
+-        TensorAccessor(state_indices_args, state_indices_address, 4096);
+ 
+     CircularBuffer output_cb(tt::CBIndex::c_12);
+     CircularBuffer state_cb(tt::CBIndex::c_11);
+-    CircularBuffer state_indices_cb(tt::CBIndex::c_29);
+     Noc noc;
+ 
+     for (uint32_t work = worker; work < batch_size * num_heads * workers_per_head; work += num_workers) {
+@@ -47,22 +41,8 @@ void kernel_main() {
+         const uint32_t vector_base =
+             (batch * num_heads + head) * full_vt + column_start;
+ 
+-        state_indices_cb.reserve_back(1);
+-        noc.async_read(
+-            state_indices, state_indices_cb, 4096,
+-            {.page_id = 0}, {.offset_bytes = 0});
+-        noc.async_read_barrier();
+-        const volatile tt_l1_ptr uint32_t* index_tile =
+-            reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(
+-                state_indices_cb.get_write_ptr());
+-        const uint32_t index_offset =
+-            (batch / 16) * 256 + batch % 16;
+-        const uint32_t state_slot = index_tile[index_offset];
+-        state_indices_cb.push_back(1);
+-        state_indices_cb.pop_front(1);
+-
+         const uint32_t state_base =
+-            (state_slot * num_heads + head) * kt * full_vt;
++            (batch * num_heads + head) * kt * full_vt;
+ 
+         output_cb.wait_front(vt);
+         state_cb.wait_front(state_tiles);
+@@ -72,7 +52,7 @@ void kernel_main() {
+                 {.offset_bytes = tile * output_tile_bytes},
+                 {.page_id = vector_base + tile});
+         }
+-        for (uint32_t row = 0; state_slot != 0 && row < kt; ++row) {
++        for (uint32_t row = 0; row < kt; ++row) {
+             for (uint32_t column = 0; column < vt; ++column) {
+                 const uint32_t local_tile = row * vt + column;
+                 noc.async_write(
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
+index a66c6e2fc8..433d3a070e 100644
+--- ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
+@@ -32,8 +32,6 @@ struct DecodeInputs {
+     Tensor dt_bias;
+     Tensor state;
+     Tensor output;
+-    Tensor state_indices;
+-    Tensor has_initial_state;
+ };
+ 
+ struct DecodeSharedVariables {
+@@ -97,8 +95,6 @@ void DecodeOperation::validate_on_program_cache_miss(const operation_attributes_
+     validate_tensor(in.dt_bias, DataType::FLOAT32, "delta-time bias");
+     validate_tensor(in.state, DataType::FLOAT32, "state");
+     validate_tensor(in.output, DataType::FLOAT32, "output");
+-    validate_tensor(in.state_indices, DataType::INT32, "state indices");
+-    validate_tensor(in.has_initial_state, DataType::BFLOAT16, "initial-state mask");
+ 
+     constexpr uint32_t dim = 128;
+     check_shape(in.query, {batch_size, num_heads, 1, dim}, "query");
+@@ -108,15 +104,8 @@ void DecodeOperation::validate_on_program_cache_miss(const operation_attributes_
+     check_shape(in.delta_time, {batch_size, num_heads}, "delta time");
+     check_shape(in.a_log, {num_heads}, "A log");
+     check_shape(in.dt_bias, {num_heads}, "delta-time bias");
+-    const auto& state_shape = in.state.logical_shape();
+-    TT_FATAL(
+-        state_shape.rank() == 4 && state_shape[0] >= 2 &&
+-            state_shape[1] == num_heads && state_shape[2] == dim &&
+-            state_shape[3] == dim,
+-        "state shape mismatch");
++    check_shape(in.state, {batch_size, num_heads, dim, dim}, "state");
+     check_shape(in.output, {batch_size, num_heads, 1, dim}, "output");
+-    check_shape(in.state_indices, {batch_size}, "state indices");
+-    check_shape(in.has_initial_state, {batch_size}, "initial-state mask");
+ }
+ 
+ DecodeOperation::spec_return_value_t DecodeOperation::compute_output_specs(
+@@ -133,8 +122,7 @@ ttsl::hash::hash_t DecodeOperation::compute_program_hash(
+     const operation_attributes_t&, const tensor_args_t& in) {
+     return operation::hash_operation<DecodeOperation>(
+         in.query, in.key, in.value, in.beta_logits, in.delta_time, in.a_log,
+-        in.dt_bias, in.state, in.output, in.state_indices,
+-        in.has_initial_state);
++        in.dt_bias, in.state, in.output);
+ }
+ 
+ DecodeProgramFactory::cached_program_t DecodeProgramFactory::create(
+@@ -177,13 +165,10 @@ DecodeProgramFactory::cached_program_t DecodeProgramFactory::create(
+     make_cb(12, worker_vt);   // output
+     make_cb(13, 1);           // A log
+     make_cb(14, 1);           // delta-time bias
+-    make_cb(15, 1, tt::DataFormat::Int32);      // state index (reader)
+     make_cb(16, 1);           // beta
+-    make_cb(17, 1, tt::DataFormat::Float16_b);  // has-initial-state flag
+     make_cb(18, 1);           // -exp(A log)
+     make_cb(19, 1);           // softplus(delta time + bias)
+     make_cb(20, 1);           // decay
+-    make_cb(29, 1, tt::DataFormat::Int32);      // state index (writer)
+ 
+     std::vector<uint32_t> reader_args = {
+         kt, vt, batch_size, num_heads, workers_per_head, num_workers};
+@@ -195,14 +180,11 @@ DecodeProgramFactory::cached_program_t DecodeProgramFactory::create(
+     TensorAccessorArgs(in.a_log.buffer()).append_to(reader_args);
+     TensorAccessorArgs(in.dt_bias.buffer()).append_to(reader_args);
+     TensorAccessorArgs(in.state.buffer()).append_to(reader_args);
+-    TensorAccessorArgs(in.state_indices.buffer()).append_to(reader_args);
+-    TensorAccessorArgs(in.has_initial_state.buffer()).append_to(reader_args);
+ 
+     std::vector<uint32_t> writer_args = {
+         kt, vt, batch_size, num_heads, workers_per_head, num_workers};
+     TensorAccessorArgs(output.buffer()).append_to(writer_args);
+     TensorAccessorArgs(in.state.buffer()).append_to(writer_args);
+-    TensorAccessorArgs(in.state_indices.buffer()).append_to(writer_args);
+ 
+     const std::string kernel_dir =
+         "ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/";
+@@ -248,15 +230,12 @@ DecodeProgramFactory::cached_program_t DecodeProgramFactory::create(
+              in.delta_time.buffer()->address(),
+              in.a_log.buffer()->address(),
+              in.dt_bias.buffer()->address(),
+-             in.state.buffer()->address(),
+-             in.state_indices.buffer()->address(),
+-             in.has_initial_state.buffer()->address()});
++             in.state.buffer()->address()});
+         SetRuntimeArgs(
+             program,
+             writer,
+             core,
+-            {worker, output.buffer()->address(), in.state.buffer()->address(),
+-             in.state_indices.buffer()->address()});
++            {worker, output.buffer()->address(), in.state.buffer()->address()});
+         SetRuntimeArgs(program, compute, core, {worker});
+     }
+ 
+@@ -284,12 +263,9 @@ void DecodeProgramFactory::override_runtime_arguments(
+         reader_args[6] = in.a_log.buffer()->address();
+         reader_args[7] = in.dt_bias.buffer()->address();
+         reader_args[8] = in.state.buffer()->address();
+-        reader_args[9] = in.state_indices.buffer()->address();
+-        reader_args[10] = in.has_initial_state.buffer()->address();
+         auto& writer_args = GetRuntimeArgs(cached.program, cached.shared_variables.writer_kernel_id, core);
+         writer_args[1] = output.buffer()->address();
+         writer_args[2] = in.state.buffer()->address();
+-        writer_args[3] = in.state_indices.buffer()->address();
+     }
+ }
+ 
+@@ -307,9 +283,7 @@ Tensor gated_delta_decode(
+     const Tensor& a_log,
+     const Tensor& dt_bias,
+     const Tensor& state,
+-    const Tensor& output,
+-    const Tensor& state_indices,
+-    const Tensor& has_initial_state) {
++    const Tensor& output) {
+     using Op = prim::DecodeOperation;
+     return device_operation::launch<Op>(
+         {},
+@@ -321,9 +295,7 @@ Tensor gated_delta_decode(
+          .a_log = a_log,
+          .dt_bias = dt_bias,
+          .state = state,
+-         .output = output,
+-         .state_indices = state_indices,
+-         .has_initial_state = has_initial_state});
++         .output = output});
+ }
+ 
+ }  // namespace ttnn::transformer
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp
+index d2af50f6cb..5b3004e9fe 100644
+--- ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp
+@@ -14,6 +14,8 @@ namespace ttnn::transformer {
+ // state_mid = decay * state
+ // state' = state_mid + k^T * (beta * (v - k * state_mid))
+ // output = q * state'
++// State is a direct [B, H, 128, 128] tensor and is updated in place.
++// Request-slot pool gather/scatter is intentionally outside this operation.
+ Tensor gated_delta_decode(
+     const Tensor& query,
+     const Tensor& key,
+@@ -23,8 +25,6 @@ Tensor gated_delta_decode(
+     const Tensor& a_log,
+     const Tensor& dt_bias,
+     const Tensor& state,
+-    const Tensor& output,
+-    const Tensor& state_indices,
+-    const Tensor& has_initial_state);
++    const Tensor& output);
+ 
+ }  // namespace ttnn::transformer
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_gather.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_gather.cpp
+new file mode 100644
+index 0000000000..62ef7237bf
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_gather.cpp
+@@ -0,0 +1,219 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#include "ttnn/operations/transformer/gated_delta_attn/state_pool_gather.hpp"
++
++#include <algorithm>
++#include <variant>
++
++#include <tt-metalium/host_api.hpp>
++#include <tt-metalium/tensor_accessor_args.hpp>
++#include <tt-metalium/work_split.hpp>
++#include "ttnn/device.hpp"
++#include "ttnn/device_operation.hpp"
++#include "ttnn/operation.hpp"
++
++using namespace tt::tt_metal;
++
++namespace ttnn::prim {
++namespace {
++
++struct StatePoolGatherParams {};
++
++struct StatePoolGatherInputs {
++    Tensor state_pool;
++    Tensor state_indices;
++    Tensor output;
++};
++
++struct StatePoolGatherSharedVariables {
++    KernelHandle kernel_id;
++    uint32_t grid_y;
++    uint32_t num_workers;
++};
++
++struct StatePoolGatherProgramFactory {
++    using shared_variables_t = StatePoolGatherSharedVariables;
++    using cached_program_t = device_operation::CachedProgram<shared_variables_t>;
++    using operation_attributes_t = StatePoolGatherParams;
++    using tensor_args_t = StatePoolGatherInputs;
++    using tensor_return_value_t = Tensor;
++
++    static cached_program_t create(
++        const operation_attributes_t&, const tensor_args_t&,
++        tensor_return_value_t&);
++    static void override_runtime_arguments(
++        cached_program_t&, const operation_attributes_t&, const tensor_args_t&,
++        tensor_return_value_t&);
++};
++
++struct StatePoolGatherOperation {
++    using operation_attributes_t = StatePoolGatherParams;
++    using tensor_args_t = StatePoolGatherInputs;
++    using spec_return_value_t = TensorSpec;
++    using tensor_return_value_t = Tensor;
++    using program_factory_t = std::variant<StatePoolGatherProgramFactory>;
++
++    static void validate_on_program_cache_miss(
++        const operation_attributes_t&, const tensor_args_t&);
++    static void validate_on_program_cache_hit(
++        const operation_attributes_t& attrs, const tensor_args_t& inputs) {
++        validate_on_program_cache_miss(attrs, inputs);
++    }
++    static spec_return_value_t compute_output_specs(
++        const operation_attributes_t&, const tensor_args_t& inputs) {
++        return inputs.output.tensor_spec();
++    }
++    static tensor_return_value_t create_output_tensors(
++        const operation_attributes_t&, const tensor_args_t& inputs) {
++        return inputs.output;
++    }
++    static ttsl::hash::hash_t compute_program_hash(
++        const operation_attributes_t&, const tensor_args_t&);
++};
++
++void validate_tensor(const Tensor& tensor, const char* name) {
++    TT_FATAL(tensor.storage_type() == StorageType::DEVICE, "{} must be on device", name);
++    TT_FATAL(tensor.buffer() != nullptr, "{} must be allocated", name);
++    TT_FATAL(tensor.layout() == Layout::TILE, "{} must be tiled", name);
++    TT_FATAL(!tensor.is_sharded(), "{} must be interleaved", name);
++}
++
++void check_shape(const Tensor& tensor, std::initializer_list<uint32_t> expected, const char* name) {
++    TT_FATAL(tensor.logical_shape() == Shape(expected), "{} shape mismatch", name);
++}
++
++void StatePoolGatherOperation::validate_on_program_cache_miss(
++    const operation_attributes_t&, const tensor_args_t& inputs) {
++    validate_tensor(inputs.state_pool, "state pool");
++    validate_tensor(inputs.state_indices, "state indices");
++    validate_tensor(inputs.output, "output");
++    TT_FATAL(
++        inputs.state_indices.dtype() == DataType::INT32,
++        "state indices must be int32");
++    TT_FATAL(
++        inputs.state_pool.dtype() == inputs.output.dtype(),
++        "state pool and output must have the same dtype");
++
++    const auto& pool_shape = inputs.state_pool.logical_shape();
++    const auto& update_shape = inputs.output.logical_shape();
++    TT_FATAL(
++        pool_shape.rank() >= 2 && pool_shape.rank() == update_shape.rank(),
++        "state pool and output must have the same rank of at least two");
++    TT_FATAL(
++        update_shape[0] > 0 && update_shape[0] <= 32,
++        "output batch must fit in one non-empty tile row");
++    check_shape(inputs.state_indices, {update_shape[0]}, "state indices");
++    for (uint32_t dim = 1; dim < pool_shape.rank(); ++dim) {
++        TT_FATAL(
++            pool_shape[dim] == update_shape[dim],
++            "state pool and update slices must match");
++    }
++    TT_FATAL(
++        inputs.state_pool.buffer()->num_pages() % pool_shape[0] == 0 &&
++            inputs.output.buffer()->num_pages() % update_shape[0] == 0 &&
++            inputs.state_pool.buffer()->num_pages() / pool_shape[0] ==
++                inputs.output.buffer()->num_pages() / update_shape[0],
++        "state pool and update slices must have the same page count");
++}
++
++ttsl::hash::hash_t StatePoolGatherOperation::compute_program_hash(
++    const operation_attributes_t&, const tensor_args_t& inputs) {
++    return operation::hash_operation<StatePoolGatherOperation>(
++        inputs.state_pool, inputs.state_indices, inputs.output);
++}
++
++StatePoolGatherProgramFactory::cached_program_t
++StatePoolGatherProgramFactory::create(
++    const operation_attributes_t&, const tensor_args_t& inputs,
++    tensor_return_value_t&) {
++    const uint32_t batch_size = inputs.output.logical_shape()[0];
++    const uint32_t pages_per_slice =
++        inputs.output.buffer()->num_pages() / batch_size;
++    const uint32_t total_pages = batch_size * pages_per_slice;
++    const uint32_t tile_bytes = inputs.output.buffer()->page_size();
++
++    Program program;
++    auto* device = inputs.state_pool.device();
++    const CoreCoord grid = device->compute_with_storage_grid_size();
++    const uint32_t num_workers = std::min(
++        total_pages, static_cast<uint32_t>(grid.x * grid.y));
++    CoreRangeSet cores = num_cores_to_corerangeset(num_workers, grid);
++
++    CircularBufferConfig data_config(
++        tile_bytes,
++        {{tt::CBIndex::c_0,
++          datatype_to_dataformat_converter(inputs.output.dtype())}});
++    data_config.set_page_size(tt::CBIndex::c_0, tile_bytes);
++    CreateCircularBuffer(program, cores, data_config);
++    CircularBufferConfig indices_config(
++        4096, {{tt::CBIndex::c_1, tt::DataFormat::Int32}});
++    indices_config.set_page_size(tt::CBIndex::c_1, 4096);
++    CreateCircularBuffer(program, cores, indices_config);
++
++    std::vector<uint32_t> compile_args = {
++        batch_size, pages_per_slice, num_workers, tile_bytes};
++    TensorAccessorArgs(inputs.state_pool.buffer()).append_to(compile_args);
++    TensorAccessorArgs(inputs.state_indices.buffer()).append_to(compile_args);
++    TensorAccessorArgs(inputs.output.buffer()).append_to(compile_args);
++
++    auto kernel = CreateKernel(
++        program,
++        "ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/"
++        "kernels/dataflow/state_pool_gather.cpp",
++        cores,
++        DataMovementConfig{
++            .processor = DataMovementProcessor::RISCV_0,
++            .noc = NOC::RISCV_0_default,
++            .compile_args = compile_args});
++
++    for (uint32_t worker = 0; worker < num_workers; ++worker) {
++        const CoreCoord core{worker / grid.y, worker % grid.y};
++        SetRuntimeArgs(
++            program, kernel, core,
++            {worker, inputs.state_pool.buffer()->address(),
++             inputs.state_indices.buffer()->address(),
++             inputs.output.buffer()->address()});
++    }
++
++    return cached_program_t{
++        std::move(program),
++        {.kernel_id = kernel,
++         .grid_y = static_cast<uint32_t>(grid.y),
++         .num_workers = num_workers}};
++}
++
++void StatePoolGatherProgramFactory::override_runtime_arguments(
++    cached_program_t& cached, const operation_attributes_t&,
++    const tensor_args_t& inputs, tensor_return_value_t&) {
++    for (uint32_t worker = 0; worker < cached.shared_variables.num_workers;
++         ++worker) {
++        CoreCoord core{
++            worker / cached.shared_variables.grid_y,
++            worker % cached.shared_variables.grid_y};
++        auto& args = GetRuntimeArgs(
++            cached.program, cached.shared_variables.kernel_id, core);
++        args[1] = inputs.state_pool.buffer()->address();
++        args[2] = inputs.state_indices.buffer()->address();
++        args[3] = inputs.output.buffer()->address();
++    }
++}
++
++}  // namespace
++}  // namespace ttnn::prim
++
++namespace ttnn::transformer {
++
++Tensor state_pool_gather(
++    const Tensor& state_pool,
++    const Tensor& state_indices,
++    const Tensor& output) {
++    using Op = prim::StatePoolGatherOperation;
++    return device_operation::launch<Op>(
++        {},
++        {.state_pool = state_pool,
++         .state_indices = state_indices,
++         .output = output});
++}
++
++}  // namespace ttnn::transformer
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_gather.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_gather.hpp
+new file mode 100644
+index 0000000000..c8672a6a47
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_gather.hpp
+@@ -0,0 +1,15 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include "ttnn/tensor/tensor.hpp"
++
++namespace ttnn::transformer {
++
++Tensor state_pool_gather(
++    const Tensor& state_pool,
++    const Tensor& state_indices,
++    const Tensor& output);
++
++}  // namespace ttnn::transformer

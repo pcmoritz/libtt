@@ -279,6 +279,7 @@ http_archive(
         "//third_party/tt_metal:causal_conv1d_update.patch",
         "//third_party/tt_metal:state_pool_update.patch",
         "//third_party/tt_metal:gated_delta_decode_raw_gating.patch",
+        "//third_party/tt_metal:gated_delta_decode_direct_state.patch",
     ],
     sha256 = "a222d1f6fe7f6aec62f69e22199a3537a31a58aa5ead52e4ab470b7d87472ecb",
     strip_prefix = "tt-metal-5beed318d0f0d1c6212e605947fb0be80c9e0a1d",
@@ -456,6 +457,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_paged_update_cache_row_major.patch",
         "//third_party/tt_xla:tt_mlir_trace_preserve_output_aliases.patch",
         "//third_party/tt_xla:tt_mlir_raw_gating_fusion.patch",
+        "//third_party/tt_xla:tt_mlir_gated_delta_decode_direct_state.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

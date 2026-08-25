@@ -2,7 +2,28 @@
 
 Updated: 2026-08-25 (America/Los_Angeles)
 
-## Current outcome
+## Experimental branch notice
+
+This branch intentionally overlays a TTNN-like direct-state implementation on
+top of the validated indexed implementation. The fused TTNN operation receives
+a batch-sized recurrent state tensor directly and mutates it in place; TT-MLIR
+handles the state-pool gather and update around that operation. No additional
+SGLang-JAX model changes are required.
+
+This variant is published for comparison and follow-up, not as the correctness
+candidate. Its focused three-step hardware numerical probe passed, and its
+steady real-weight decode rate was `13.35` to `13.48` token/s. The
+exported overlays rebuilt from the branch in `767.182 s` (`931` actions); the
+immediate incremental rebuild took `0.313 s`. However, the
+four-token real-weight oracle returned `[11751, 13, 198, 32]` (`" Paris.\nA"`)
+instead of `[11751, 13, 198, 760]` (`" Paris.\nThe"`). The TT-Metal compute
+kernel was identical to the indexed version, isolating the unresolved issue to
+direct-state plumbing or trace lifetime. Use
+`agent/qwen35-9b-upstream-decode-op` for correct output. All remaining
+correctness and benchmark results below describe that validated parent unless
+explicitly labeled as direct-state results.
+
+## Validated parent outcome
 
 Qwen3.5-9B now decodes correctly and quickly on the P150. The default compiler
 path uses the repaired `ttnn.gated_delta_decode` fusion for all 24 recurrent
@@ -36,7 +57,7 @@ seconds.
 ## Repository state
 
 - Workspace: `/home/pcmoritz/libtt`
-- Branch: `agent/qwen35-9b-upstream-decode-op`
+- Branch: `agent/qwen35-9b-ttnn-direct-state-experimental`
 - Base: `origin/main` at `0ff8ad0`
 - Keep commits on this branch focused on the validated Qwen3.5 implementation.
 - Preserve unrelated and user-owned dirty or untracked files.
@@ -242,7 +263,7 @@ token four (`32`, `"A"`) instead of the oracle (`760`, `"The"`). The
 failure was isolated to the state plumbing/lifetime path rather than the
 compute math, although the exact direct-state root cause was not proven.
 
-The current branch therefore keeps the indexed fused operation: recurrent
+The production branch therefore keeps the indexed fused operation: recurrent
 state indices are inputs to the kernel, the state pool is updated in place, and
 SGLang-JAX only needs the small compatibility/test-harness patch. This path is
 exact on real weights and sustains about 14 token/s. Adopting direct state later
