@@ -1,0 +1,21 @@
+diff --git a/pjrt_implementation/inc/utils/assert.h b/pjrt_implementation/inc/utils/assert.h
+--- a/pjrt_implementation/inc/utils/assert.h
++++ b/pjrt_implementation/inc/utils/assert.h
+@@ -40 +40 @@
+-namespace tt::assert {
++namespace tt::pjrt::assert {
+@@ -128 +128 @@ tt_throw_impl(const char *file, int line, const char *assert_type,
+-    trace_message_ss << tt::assert::backtrace_to_string(100, 3, " --- ");
++    trace_message_ss << tt::pjrt::assert::backtrace_to_string(100, 3, " --- ");
+@@ -165 +165 @@ inline void tt_assert(char const *file, int line, char const *assert_type,
+-} // namespace tt::assert
++} // namespace tt::pjrt::assert
+@@ -175 +175 @@ inline void tt_assert(char const *file, int line, char const *assert_type,
+-      tt::assert::detail::tt_assert(__FILE__, __LINE__, "TT_ASSERT",           \
++      tt::pjrt::assert::detail::tt_assert(__FILE__, __LINE__, "TT_ASSERT",     \
+@@ -189 +189 @@ inline void tt_assert(char const *file, int line, char const *assert_type,
+-  tt::assert::detail::tt_throw(__FILE__, __LINE__, "TT_THROW",                 \
++  tt::pjrt::assert::detail::tt_throw(__FILE__, __LINE__, "TT_THROW",           \
+@@ -197 +197 @@ inline void tt_assert(char const *file, int line, char const *assert_type,
+-      tt::assert::detail::tt_throw(__FILE__, __LINE__, "TT_FATAL", #condition, \
++      tt::pjrt::assert::detail::tt_throw(__FILE__, __LINE__, "TT_FATAL", #condition, \
