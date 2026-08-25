@@ -1,0 +1,42 @@
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedUpdateCacheOpRewritePattern.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedUpdateCacheOpRewritePattern.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedUpdateCacheOpRewritePattern.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedUpdateCacheOpRewritePattern.cpp
+@@ -59,11 +59,35 @@ LogicalResult PagedUpdateCacheOpRewritePattern::matchAndRewrite(
+   auto toTensorSpecOp = rewriter.create<ttnn::ToTensorSpecOp>(
+       op.getLoc(), memoryConfigedInputType, op.getInput());
+ 
++  // The device kernel also requires both integer lookup tensors in row-major
++  // layout. Materialize those conversions here: optimizer sibling-layout
++  // propagation can otherwise leave a block-argument page table tiled.
++  auto forceRowMajor = [&](Value value) -> Value {
++    RankedTensorType valueType = cast<RankedTensorType>(value.getType());
++    auto valueLayout = dyn_cast_or_null<ttnn::TTNNLayoutAttr>(
++        valueType.getEncoding());
++    if (!valueLayout || valueLayout.getLayout() == ttnn::Layout::RowMajor) {
++      return value;
++    }
++    auto rowMajorLayout =
++        ttnn::TTNNLayoutAttr::Builder(valueLayout, valueType.getShape())
++            .setLayout(ttnn::Layout::RowMajor);
++    auto rowMajorType = valueType.cloneWithEncoding(rowMajorLayout);
++    return rewriter
++        .create<ttnn::ToTensorSpecOp>(op.getLoc(), rowMajorType, value)
++        .getResult();
++  };
++
++  Value updateIndex = forceRowMajor(op.getUpdateIndex());
++  Value pageTable = op.getPageTable()
++                        ? forceRowMajor(op.getPageTable())
++                        : Value();
++
+   // Replace the original PagedUpdateCacheOp with one which takes our properly
+-  // configured input tensor.
++  // configured input and lookup tensors.
+   auto pagedUpdateCacheOp = rewriter.create<ttnn::PagedUpdateCacheOp>(
+-      op.getLoc(), op.getCache(), toTensorSpecOp.getResult(),
+-      op.getUpdateIndex(), op.getShareCache(), op.getPageTable());
++      op.getLoc(), op.getCache(), toTensorSpecOp.getResult(), updateIndex,
++      op.getShareCache(), pageTable);
+ 
+   rewriter.replaceOp(op, pagedUpdateCacheOp);
+   return success();

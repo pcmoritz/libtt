@@ -1,0 +1,663 @@
+diff --git a/python/sgl_jax/srt/kernels/gdn/gated_delta.py b/python/sgl_jax/srt/kernels/gdn/gated_delta.py
+index b99955f..f6a9ac3 100644
+--- a/python/sgl_jax/srt/kernels/gdn/gated_delta.py
++++ b/python/sgl_jax/srt/kernels/gdn/gated_delta.py
+@@ -80,7 +80,12 @@ def _gated_delta_step(
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def _scatter_idx0_safe(buf: jax.Array, state_indices: jax.Array, val: jax.Array) -> jax.Array:
++def _scatter_idx0_safe(
++    buf: jax.Array,
++    state_indices: jax.Array,
++    val: jax.Array,
++    gather_out_sharding=None,
++) -> jax.Array:
+     """``buf.at[state_indices].set(val)`` with an ``idx == 0`` no-op guard.
+ 
+     Padded requests carry ``state_indices == 0`` (the per-DP-rank dummy
+@@ -90,7 +95,11 @@ def _scatter_idx0_safe(buf: jax.Array, state_indices: jax.Array, val: jax.Array)
+     """
+     val = val.astype(buf.dtype)
+     keep = (state_indices == 0).reshape((-1,) + (1,) * (buf.ndim - 1))
+-    safe_val = jnp.where(keep, buf[state_indices], val)
++    safe_val = jnp.where(
++        keep,
++        _gather_state(buf, state_indices, gather_out_sharding),
++        val,
++    )
+     return buf.at[state_indices].set(safe_val)
+ 
+ 
+@@ -99,6 +108,7 @@ def _scatter_track(
+     track_indices: jax.Array,
+     track_mask: jax.Array,
+     val: jax.Array,
++    gather_out_sharding=None,
+ ) -> jax.Array:
+     """Scatter ``val`` into the request track slots (extra-buffer path).
+ 
+@@ -110,11 +120,26 @@ def _scatter_track(
+     """
+     val = val.astype(buf.dtype)
+     keep = ((track_indices == 0) | (track_mask == 0)).reshape((-1,) + (1,) * (buf.ndim - 1))
+-    safe_val = jnp.where(keep, buf[track_indices], val)
++    safe_val = jnp.where(
++        keep,
++        _gather_state(buf, track_indices, gather_out_sharding),
++        val,
++    )
+     new_buf = buf.at[track_indices].set(safe_val)
+     return jax.lax.optimization_barrier(new_buf)
+ 
+ 
++def _gather_state(
++    table: jax.Array,
++    state_indices: jax.Array,
++    out_sharding=None,
++) -> jax.Array:
++    """Gather request state with an optional shard-map-local output layout."""
++    if out_sharding is None:
++        return table[state_indices]
++    return table.at[state_indices].get(out_sharding=out_sharding)
++
++
+ def jax_causal_conv1d_prefill(
+     x: jax.Array,  # [D, T]  packed activations
+     weight: jax.Array,  # [D, kernel_size]  depthwise weight
+@@ -126,6 +151,7 @@ def jax_causal_conv1d_prefill(
+     activation: str | None = None,
+     track_indices: jax.Array | None = None,  # [B] req → track slot (None = OFF)
+     track_mask: jax.Array | None = None,  # [B] bool boundary mask
++    state_out_sharding=None,
+ ) -> tuple[jax.Array, jax.Array]:
+     """Depthwise causal conv1d over a ragged-batched packed sequence.
+ 
+@@ -181,7 +207,7 @@ def jax_causal_conv1d_prefill(
+         conv_state = jax.lax.optimization_barrier(conv_state)
+         # Gather per-seq prior state once up front; later lookups index by
+         # local seq id rather than walking the full table per token.
+-        state = conv_state[state_indices]  # [B, D, K-1]
++        state = _gather_state(conv_state, state_indices, state_out_sharding)  # [B, D, K-1]
+         # Brand-new prefills (has_initial_state=False) must not read stale
+         # slot contents — the slot was previously owned by another request
+         # before allocation. Zero them out so both the per-token lookback
+@@ -204,7 +230,10 @@ def jax_causal_conv1d_prefill(
+ 
+     # Map each packed token index to its request id and intra-request position.
+     t_idx = jnp.arange(T)
+-    seq_idx = jnp.searchsorted(cu_seqlens, t_idx, side="right") - 1  # [T]
++    if B == 1:
++        seq_idx = jnp.zeros((T,), dtype=jnp.int32)
++    else:
++        seq_idx = jnp.searchsorted(cu_seqlens, t_idx, side="right") - 1  # [T]
+     pos = t_idx - starts[seq_idx]  # [T]
+ 
+     # Build the depthwise window. For each lookback o in [0, K-1] the source
+@@ -271,9 +300,11 @@ def jax_causal_conv1d_prefill(
+     # The fixture-only `conv_state is None` path returns the per-request
+     # slice as-is for tests that don't construct a pool.
+     if conv_state is not None:
+-        new_conv_state = _scatter_idx0_safe(conv_state, state_indices, final_state)
++        new_conv_state = _scatter_idx0_safe(conv_state, state_indices, final_state, state_out_sharding)
+         if track_indices is not None:
+-            new_conv_state = _scatter_track(new_conv_state, track_indices, track_mask, final_state)
++            new_conv_state = _scatter_track(
++                new_conv_state, track_indices, track_mask, final_state, state_out_sharding
++            )
+     else:
+         new_conv_state = final_state
+     return y, new_conv_state
+@@ -289,6 +320,7 @@ def jax_causal_conv1d_update(
+     has_initial_state: jax.Array | None = None,  # [B] bool
+     track_indices: jax.Array | None = None,  # [B] req → track slot (None = OFF)
+     track_mask: jax.Array | None = None,  # [B] bool boundary mask
++    state_out_sharding=None,
+ ) -> tuple[jax.Array, jax.Array]:
+     """Single-token causal conv1d update.
+ 
+@@ -322,7 +354,7 @@ def jax_causal_conv1d_update(
+     # SPMD the scatter below can race this gather and corrupt reused slots
+     # (decode NaN). optimization_barrier is value-preserving -- do not remove.
+     conv_state = jax.lax.optimization_barrier(conv_state)
+-    state = conv_state[state_indices]  # [B, D, K-1]
++    state = _gather_state(conv_state, state_indices, state_out_sharding)  # [B, D, K-1]
+     if has_initial_state is not None and kernel > 1:
+         assert has_initial_state.shape == (
+             B,
+@@ -342,9 +374,11 @@ def jax_causal_conv1d_update(
+     new_state = window[..., 1:]  # drop oldest
+ 
+     # Scatter the per-request new state back into the full pool table.
+-    new_conv_state = _scatter_idx0_safe(conv_state, state_indices, new_state)
++    new_conv_state = _scatter_idx0_safe(conv_state, state_indices, new_state, state_out_sharding)
+     if track_indices is not None:
+-        new_conv_state = _scatter_track(new_conv_state, track_indices, track_mask, new_state)
++        new_conv_state = _scatter_track(
++            new_conv_state, track_indices, track_mask, new_state, state_out_sharding
++        )
+     # Pin the scatter result across the aliasing boundary (see entry barrier).
+     new_conv_state, y = jax.lax.optimization_barrier((new_conv_state, y))
+     return y, new_conv_state
+@@ -526,17 +560,23 @@ def _align_seqs_gdn(
+     padded_cu = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(padded_lens)])  # [B + 1]
+     T_new = ((T_old + B * (align - 1) + align - 1) // align) * align
+ 
+-    def _build_gather(i, gather_idx):
+-        old_start = cu_seqlens[i]
+-        new_start = padded_cu[i]
+-        sl = seg_lens[i]
++    if B == 1:
+         j = jnp.arange(T_new)
+-        in_seg = (j >= new_start) & (j < new_start + sl)
+-        src = old_start + (j - new_start)
+-        return jnp.where(in_seg, src, gather_idx)
+-
+-    gather_idx = jnp.full(T_new, T_old, dtype=jnp.int32)
+-    gather_idx = jax.lax.fori_loop(0, B, _build_gather, gather_idx)
++        src = cu_seqlens[0] + j
++        in_seg = j < seg_lens[0]
++        gather_idx = jnp.where(in_seg, src, T_old).astype(jnp.int32)
++    else:
++        def _build_gather(i, gather_idx):
++            old_start = cu_seqlens[i]
++            new_start = padded_cu[i]
++            sl = seg_lens[i]
++            j = jnp.arange(T_new)
++            in_seg = (j >= new_start) & (j < new_start + sl)
++            src = old_start + (j - new_start)
++            return jnp.where(in_seg, src, gather_idx)
++
++        gather_idx = jnp.full(T_new, T_old, dtype=jnp.int32)
++        gather_idx = jax.lax.fori_loop(0, B, _build_gather, gather_idx)
+ 
+     pad_t = lambda t: jnp.pad(t, ((0, 1),) + ((0, 0),) * (t.ndim - 1))
+     q_pad = pad_t(q)
+@@ -573,17 +613,22 @@ def _unalign_output_gdn(
+     B = int(orig_cu_seqlens.shape[0]) - 1
+     orig_seg_lens = orig_cu_seqlens[1:] - orig_cu_seqlens[:-1]
+ 
+-    def _build_gather(i, gather_idx):
+-        orig_start = orig_cu_seqlens[i]
+-        aligned_start = aligned_cu_seqlens[i]
+-        sl = orig_seg_lens[i]
++    if B == 1:
+         j = jnp.arange(T_out)
+-        in_seg = (j >= orig_start) & (j < orig_start + sl)
+-        src = aligned_start + (j - orig_start)
+-        return jnp.where(in_seg, src, gather_idx)
+-
+-    gather_idx = jnp.zeros(T_out, dtype=jnp.int32)
+-    gather_idx = jax.lax.fori_loop(0, B, _build_gather, gather_idx)
++        gather_idx = aligned_cu_seqlens[0] + (j - orig_cu_seqlens[0])
++        gather_idx = jnp.clip(gather_idx, 0, o_aligned.shape[0] - 1)
++    else:
++        def _build_gather(i, gather_idx):
++            orig_start = orig_cu_seqlens[i]
++            aligned_start = aligned_cu_seqlens[i]
++            sl = orig_seg_lens[i]
++            j = jnp.arange(T_out)
++            in_seg = (j >= orig_start) & (j < orig_start + sl)
++            src = aligned_start + (j - orig_start)
++            return jnp.where(in_seg, src, gather_idx)
++
++        gather_idx = jnp.zeros(T_out, dtype=jnp.int32)
++        gather_idx = jax.lax.fori_loop(0, B, _build_gather, gather_idx)
+     o_unaligned = o_aligned[gather_idx]
+ 
+     valid_out = jnp.arange(T_out) < orig_cu_seqlens[-1]
+@@ -608,6 +653,8 @@ def chunked_gated_delta_rule_jax(
+     chunk_size: int = 64,
+     track_indices: jax.Array | None = None,
+     track_mask: jax.Array | None = None,
++    use_fused_reference_graph: bool = False,
++    state_out_sharding=None,
+ ) -> tuple[jax.Array, jax.Array]:
+     """Chunked Gated Delta-Rule forward (extend / prefill) in pure JAX.
+ 
+@@ -667,7 +714,9 @@ def chunked_gated_delta_rule_jax(
+ 
+     # Gather per-seq initial state
+     recurrent_state = jax.lax.optimization_barrier(recurrent_state)
+-    init_state = recurrent_state[state_indices].astype(jnp.float32)
++    init_state = _gather_state(recurrent_state, state_indices, state_out_sharding).astype(
++        jnp.float32
++    )
+     init_state = jnp.where(
+         has_initial_state[:, None, None, None],
+         init_state,
+@@ -686,43 +735,57 @@ def chunked_gated_delta_rule_jax(
+     ) = _align_seqs_gdn(query, key, value, beta, g, cu_seqlens, BT)
+ 
+     T_new = q_al.shape[0]
+-    NC = T_new // BT
+-
+-    # Reshape to [NC, n_v, BT, ...]
+-    q_c = jnp.transpose(q_al.reshape(NC, BT, n_v, d_k), (0, 2, 1, 3))
+-    k_c = jnp.transpose(k_al.reshape(NC, BT, n_v, d_k), (0, 2, 1, 3))
+-    v_c = jnp.transpose(v_al.reshape(NC, BT, n_v, d_v), (0, 2, 1, 3))
+-    b_c = jnp.transpose(b_al.reshape(NC, BT, n_v), (0, 2, 1))
+-    g_c = jnp.transpose(g_al.reshape(NC, BT, n_v), (0, 2, 1))
+-
+-    # Stage 1: Intra-chunk solve in parallel across NC and n_v
+-    u, w, k_g, q_g, A_qk, gamma_end = jax.vmap(
+-        jax.vmap(_chunk_gdn_intra_fn, in_axes=(0, 0, 0, 0, 0)),
+-        in_axes=(0, 0, 0, 0, 0),
+-    )(q_c, k_c, v_c, b_c, g_c)
+-
+-    # Stage 2: Inter-chunk recurrence scan across NC steps
+-    chunk_starts = jnp.arange(NC, dtype=jnp.int32) * BT
+-    seq_id = jnp.minimum(jnp.searchsorted(padded_cu[1:], chunk_starts, side="right"), B - 1)
+-    is_first_chunk = chunk_starts == padded_cu[seq_id]
+-
+-    final_states, state_in_all, v_new_all = _chunk_gdn_inter_scan(
+-        u, w, k_g, gamma_end, init_state, seq_id, is_first_chunk
+-    )
++    if use_fused_reference_graph:
++        if B != 1:
++            raise ValueError("TT fused GDN prefill requires one sequence per shard")
+ 
+-    # Stage 3: Parallel output computation
+-    o_c = _chunk_gdn_output_fwd(q_g, state_in_all, A_qk, v_new_all)
+-    o_al = jnp.transpose(o_c, (0, 2, 1, 3)).reshape(T_new, n_v, d_v)
++        def _scan_step(state, xs):
++            return _gated_delta_step(state, *xs)
++
++        final_state, o_al = jax.lax.scan(
++            _scan_step, init_state[0], (q_al, k_al, v_al, g_al, b_al)
++        )
++        final_states = final_state[None, ...]
++    else:
++        NC = T_new // BT
++
++        # Reshape to [NC, n_v, BT, ...]
++        q_c = jnp.transpose(q_al.reshape(NC, BT, n_v, d_k), (0, 2, 1, 3))
++        k_c = jnp.transpose(k_al.reshape(NC, BT, n_v, d_k), (0, 2, 1, 3))
++        v_c = jnp.transpose(v_al.reshape(NC, BT, n_v, d_v), (0, 2, 1, 3))
++        b_c = jnp.transpose(b_al.reshape(NC, BT, n_v), (0, 2, 1))
++        g_c = jnp.transpose(g_al.reshape(NC, BT, n_v), (0, 2, 1))
++
++        # Stage 1: Intra-chunk solve in parallel across NC and n_v
++        u, w, k_g, q_g, A_qk, gamma_end = jax.vmap(
++            jax.vmap(_chunk_gdn_intra_fn, in_axes=(0, 0, 0, 0, 0)),
++            in_axes=(0, 0, 0, 0, 0),
++        )(q_c, k_c, v_c, b_c, g_c)
++
++        # Stage 2: Inter-chunk recurrence scan across NC steps
++        chunk_starts = jnp.arange(NC, dtype=jnp.int32) * BT
++        seq_id = jnp.minimum(
++            jnp.searchsorted(padded_cu[1:], chunk_starts, side="right"), B - 1
++        )
++        is_first_chunk = chunk_starts == padded_cu[seq_id]
++
++        final_states, state_in_all, v_new_all = _chunk_gdn_inter_scan(
++            u, w, k_g, gamma_end, init_state, seq_id, is_first_chunk
++        )
++
++        # Stage 3: Parallel output computation
++        o_c = _chunk_gdn_output_fwd(q_g, state_in_all, A_qk, v_new_all)
++        o_al = jnp.transpose(o_c, (0, 2, 1, 3)).reshape(T_new, n_v, d_v)
+ 
+     # Unalign output to original packed layout
+     output = _unalign_output_gdn(o_al, cu_seqlens, padded_cu, num_tokens)
+     output = output.astype(mixed_qkv.dtype)
+ 
+     # Scatter final states back into full pool table
+-    new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, final_states)
++    new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, final_states, state_out_sharding)
+     if track_indices is not None:
+         new_recurrent_state = _scatter_track(
+-            new_recurrent_state, track_indices, track_mask, final_states
++            new_recurrent_state, track_indices, track_mask, final_states, state_out_sharding
+         )
+     return new_recurrent_state, output
+ 
+@@ -749,6 +812,7 @@ def ragged_gated_delta_rule_ref(
+     d_v: int,
+     track_indices: jax.Array | None = None,
+     track_mask: jax.Array | None = None,
++    state_out_sharding=None,
+ ) -> tuple[jax.Array, jax.Array]:
+     """Ragged gated delta-rule forward (extend / chunked-prefill).
+ 
+@@ -834,7 +898,9 @@ def ragged_gated_delta_rule_ref(
+     # zero. Mirrors GPU's `initial_state[~has_initial_state, ...] = 0`.
+     # Donated-buffer aliasing barrier (see jax_causal_conv1d_prefill). Do not remove.
+     recurrent_state = jax.lax.optimization_barrier(recurrent_state)
+-    init_state = recurrent_state[state_indices].astype(jnp.float32)
++    init_state = _gather_state(recurrent_state, state_indices, state_out_sharding).astype(
++        jnp.float32
++    )
+     init_state = jnp.where(
+         has_initial_state[:, None, None, None],
+         init_state,
+@@ -882,10 +948,10 @@ def ragged_gated_delta_rule_ref(
+     # ``[num_blocks, ...]`` table. Cast to the pool's dtype (the scan
+     # carries fp32; the pool is typically fp32 too, but
+     # ``SGLANG_JAX_RECURRENT_STATE_DTYPE=bfloat16`` can override).
+-    new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, new_state_buf)
++    new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, new_state_buf, state_out_sharding)
+     if track_indices is not None:
+         new_recurrent_state = _scatter_track(
+-            new_recurrent_state, track_indices, track_mask, new_state_buf
++            new_recurrent_state, track_indices, track_mask, new_state_buf, state_out_sharding
+         )
+     return new_recurrent_state, output
+ 
+@@ -906,6 +972,7 @@ def decode_gated_delta_rule_ref(
+     has_initial_state: jax.Array | None = None,
+     track_indices: jax.Array | None = None,
+     track_mask: jax.Array | None = None,
++    state_out_sharding=None,
+ ) -> tuple[jax.Array, jax.Array]:
+     """Decode-only gated delta-rule (parallel single-step across the batch).
+ 
+@@ -966,7 +1033,7 @@ def decode_gated_delta_rule_ref(
+     # Donated-pool aliasing barrier (see jax_causal_conv1d_update): without it the
+     # scatter below races this gather under multi-host SPMD -> recurrent-state NaN.
+     recurrent_state = jax.lax.optimization_barrier(recurrent_state)
+-    state = recurrent_state[state_indices].astype(jnp.float32)
++    state = _gather_state(recurrent_state, state_indices, state_out_sharding).astype(jnp.float32)
+     if has_initial_state is not None:
+         B = state.shape[0]
+         assert has_initial_state.shape == (
+@@ -976,10 +1043,10 @@ def decode_gated_delta_rule_ref(
+     new_state, out = _gated_delta_step(state, q_h, k_h, v_h, g, beta)
+ 
+     # Scatter the per-request new state back into the full pool table.
+-    new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, new_state)
++    new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, new_state, state_out_sharding)
+     if track_indices is not None:
+         new_recurrent_state = _scatter_track(
+-            new_recurrent_state, track_indices, track_mask, new_state
++            new_recurrent_state, track_indices, track_mask, new_state, state_out_sharding
+         )
+     # Pin the scatter result across the aliasing boundary (see entry barrier).
+     new_recurrent_state, out = jax.lax.optimization_barrier((new_recurrent_state, out))
+diff --git a/python/sgl_jax/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sgl_jax/srt/layers/attention/hybrid_linear_attn_backend.py
+index 25eae05..75a0330 100644
+--- a/python/sgl_jax/srt/layers/attention/hybrid_linear_attn_backend.py
++++ b/python/sgl_jax/srt/layers/attention/hybrid_linear_attn_backend.py
+@@ -196,6 +196,51 @@ class HybridLinearAttnBackend(AttentionBackend):
+             linear_attn_metadata=self.linear_attn_backend.get_forward_metadata(batch),
+         )
+ 
++    @property
++    def token_to_kv_pool_class(self):
++        return self.full_attn_backend.token_to_kv_pool_class
++
++    @property
++    def compiler_options(self):
++        options = getattr(self.full_attn_backend, "compiler_options", None)
++        if not options or "enable_trace" not in options:
++            return options
++        # Full-model prefill tracing is prohibitively expensive. Hybrid
++        # recurrent dynamics also require BF16 model weights; the default
++        # global BF8 lowering changes greedy decode tokens.
++        return {
++            key: value
++            for key, value in {**options, "enable_trace": "false"}.items()
++            if key != "experimental_weight_dtype"
++        }
++
++    @property
++    def decode_compiler_options(self):
++        options = getattr(self.full_attn_backend, "compiler_options", None)
++        if not options:
++            return options
++        # The one-token specialization uses the validated fused recurrent
++        # kernel and persistent trace-slot aliasing, so it can be captured
++        # without forcing the much larger prefill graph through tracing.
++        return {
++            key: value
++            for key, value in {**options, "enable_trace": "true"}.items()
++            if key != "experimental_weight_dtype"
++        }
++
++    @property
++    def use_fast_greedy_sampler(self):
++        return getattr(self.full_attn_backend, "use_fast_greedy_sampler", False)
++
++    def prepare_model_state(self, leaves):
++        prepare_with_dtype = getattr(
++            self.full_attn_backend, "prepare_model_state_with_dtype", None
++        )
++        if prepare_with_dtype is not None:
++            return prepare_with_dtype(leaves, "bf16")
++        prepare = getattr(self.full_attn_backend, "prepare_model_state", None)
++        return prepare(leaves) if prepare is not None else leaves
++
+     @property
+     def forward_metadata(self):
+         return self._forward_metadata
+diff --git a/python/sgl_jax/srt/layers/attention/linear/gdn_backend.py b/python/sgl_jax/srt/layers/attention/linear/gdn_backend.py
+index 9ef41c6..770bc2d 100644
+--- a/python/sgl_jax/srt/layers/attention/linear/gdn_backend.py
++++ b/python/sgl_jax/srt/layers/attention/linear/gdn_backend.py
+@@ -127,6 +127,9 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
+         self.prefill_impl = prefill_impl
+         if self.prefill_impl not in {"chunked_jax", "fused_chunk_parallel"}:
+             raise ValueError("gdn_prefill_impl must be 'chunked_jax' or 'fused_chunk_parallel'.")
++        self._use_tt_fused_prefill_graph = (
++            getattr(mesh.devices.flat[0], "platform", "") == "tt"
++        )
+         self._decode_callable: Callable[..., tuple[jax.Array, jax.Array]] = (
+             decode_gated_delta_rule_ref
+         )
+@@ -273,6 +276,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
+                 has_initial_state=has_initial_state_l,
+                 track_indices=track_indices_l,
+                 track_mask=track_mask_l,
++                state_out_sharding=P(None, None, None),
+             )
+             new_rec, out = self._decode_callable(
+                 conv_out,
+@@ -289,6 +293,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
+                 has_initial_state=has_initial_state_l,
+                 track_indices=track_indices_l,
+                 track_mask=track_mask_l,
++                state_out_sharding=P(None, None, None, None),
+             )
+             return out, new_conv, new_rec
+ 
+@@ -421,6 +426,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
+                 activation="silu",
+                 track_indices=track_indices_l,
+                 track_mask=track_mask_l,
++                state_out_sharding=P(None, None, None),
+             )
+             conv_out = conv_out_dt.T  # [T, D]
+             new_rec, out = chunked_gated_delta_rule_jax(
+@@ -439,6 +445,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
+                 d_v=d_v,
+                 track_indices=track_indices_l,
+                 track_mask=track_mask_l,
++                use_fused_reference_graph=self._use_tt_fused_prefill_graph,
++                state_out_sharding=P(None, None, None, None),
+             )
+             return out, new_conv, new_rec
+ 
+diff --git a/python/sgl_jax/srt/layers/attention/tt_backend.py b/python/sgl_jax/srt/layers/attention/tt_backend.py
+index 9626404..9ca2418 100644
+--- a/python/sgl_jax/srt/layers/attention/tt_backend.py
++++ b/python/sgl_jax/srt/layers/attention/tt_backend.py
+@@ -27,8 +27,8 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def prepare_weight(tensor):
+-    dtype = "bf16" if tensor.ndim == 1 else "bfp_bf8"
++def prepare_weight(tensor, matrix_dtype="bfp_bf8"):
++    dtype = "bf16" if tensor.ndim == 1 else matrix_dtype
+     return tt_ops.annotate_weight_dtype(tensor, dtype)
+ 
+ 
+@@ -39,7 +39,10 @@ class TTTokenToKVPool(MHATokenToKVPool):
+     def _create_buffers(self):
+         self.kv_sharding = NamedSharding(self.mesh, P("data", "tensor", None, None))
+         shape = (
+-            (self.size + self.page_size * self.dp_size) // self.page_size,
++            max(
++                16,
++                (self.size + self.page_size * self.dp_size) // self.page_size,
++            ),
+             self.head_num,
+             self.page_size,
+             self.head_dim,
+@@ -179,15 +182,18 @@ class TTAttention(AttentionBackend):
+         backend.forward_metadata = children[0]
+         return backend
+ 
+-    def prepare_model_state(self, leaves):
++    def prepare_model_state_with_dtype(self, leaves, matrix_dtype):
+         return tuple(
+-            prepare_weight(leaf)
++            prepare_weight(leaf, matrix_dtype)
+             if getattr(leaf, "ndim", 0) > 0
+             and getattr(leaf, "dtype", None) in (jnp.bfloat16, jnp.float32)
+             else leaf
+             for leaf in leaves
+         )
+ 
++    def prepare_model_state(self, leaves):
++        return self.prepare_model_state_with_dtype(leaves, "bfp_bf8")
++
+     def get_forward_metadata(self, batch: ModelWorkerBatch):
+         if batch.forward_mode == ForwardMode.EXTEND:
+             return self._prefill_metadata(batch)
+diff --git a/python/sgl_jax/srt/managers/scheduler.py b/python/sgl_jax/srt/managers/scheduler.py
+index 5b67387..752083b 100644
+--- a/python/sgl_jax/srt/managers/scheduler.py
++++ b/python/sgl_jax/srt/managers/scheduler.py
+@@ -2612,6 +2612,11 @@ class Scheduler(
+         elif batch.forward_mode.is_dummy_first():
+             self.set_next_batch_sampling_info_done(batch)
+ 
++        # Result processing has consumed or materialized every requested field.
++        # Drop the full vocabulary logits before the next scheduler tick so a
++        # traced backend can safely reuse its transient device-buffer addresses.
++        result.logits_output = None
++
+     def set_next_batch_sampling_info_done(self, batch: ScheduleBatch):
+         if batch.next_batch_sampling_info:
+             # Update grammar vocab masks for next batch in overlap mode
+diff --git a/python/sgl_jax/srt/mem_cache/memory_pool.py b/python/sgl_jax/srt/mem_cache/memory_pool.py
+index c859b4b..e212134 100644
+--- a/python/sgl_jax/srt/mem_cache/memory_pool.py
++++ b/python/sgl_jax/srt/mem_cache/memory_pool.py
+@@ -1550,6 +1550,17 @@ class HybridLinearKVPool(KVCache):
+             self._to_physical(layer_id), loc, cache_k, cache_v, is_decode
+         )
+ 
++    def set_kv_buffer_legacy(
++        self,
++        layer_id: int,
++        loc: jax.Array,
++        cache_k: jax.Array,
++        cache_v: jax.Array,
++    ) -> jax.Array:
++        return self.full_kv_pool.set_kv_buffer_legacy(
++            self._to_physical(layer_id), loc, cache_k, cache_v
++        )
++
+     def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
+         """Accept COMPACTED list (length L_full, in full_attention_layer_ids order).
+ 
+diff --git a/python/sgl_jax/srt/model_executor/model_runner.py b/python/sgl_jax/srt/model_executor/model_runner.py
+index 95820ad..e687680 100644
+--- a/python/sgl_jax/srt/model_executor/model_runner.py
++++ b/python/sgl_jax/srt/model_executor/model_runner.py
+@@ -254,20 +254,26 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
+                 "Enabling TPU log recorder for JIT compilation "
+                 "(compiler_options: xla_tpu_enable_log_recorder=true)."
+             )
++        base_jit_compiler_options = jit_compiler_options
+         backend_compiler_options = getattr(self.attn_backend, "compiler_options", None)
+         if backend_compiler_options:
+             jit_compiler_options = {
+                 **backend_compiler_options,
+-                **(jit_compiler_options or {}),
++                **(base_jit_compiler_options or {}),
+             }
+-
+-        @partial(
+-            jax.jit,
+-            donate_argnames=["memory_pools"],
+-            static_argnames=["model_state_def"],
+-            compiler_options=jit_compiler_options,
++        decode_backend_compiler_options = getattr(
++            self.attn_backend, "decode_compiler_options", None
++        )
++        decode_jit_compiler_options = (
++            {
++                **decode_backend_compiler_options,
++                **(base_jit_compiler_options or {}),
++            }
++            if decode_backend_compiler_options
++            else jit_compiler_options
+         )
+-        def jitted_run_model(
++
++        def run_model_impl(
+             model_def,
+             model_state_def,
+             model_state_leaves,
+@@ -286,6 +292,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
+             with LoraBatchContext.set_batch(forward_batch):
+                 return model(forward_batch, memory_pools, logits_metadata)
+ 
++        def make_jitted_run_model(compiler_options):
++            return partial(
++                jax.jit,
++                donate_argnames=["memory_pools"],
++                static_argnames=["model_state_def"],
++                compiler_options=compiler_options,
++            )(run_model_impl)
++
++        jitted_run_model = make_jitted_run_model(jit_compiler_options)
++        jitted_run_model_decode = make_jitted_run_model(decode_jit_compiler_options)
++
+         # Capture base RNG key as a constant in the JIT closure.
+         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
+         # the eager jax.random.split that would serialize the host-device pipeline.
+@@ -332,6 +349,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
+                 "enabled; falling back to the stock pjit dispatch path."
+             )
+             use_aot_dispatch = False
++        if use_aot_dispatch and decode_backend_compiler_options:
++            logger.warning(
++                "Decode-specific compiler options are incompatible with the "
++                "single AOT dispatcher; falling back to the stock JIT path."
++            )
++            use_aot_dispatch = False
+ 
+         if use_aot_dispatch:
+             self._run_model_dispatcher = AotDispatcher(
+@@ -373,7 +396,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
+         else:
+ 
+             def run_model_wrapper(forward_batch, logits_metadata):
+-                return jitted_run_model(
++                run_model = (
++                    jitted_run_model_decode
++                    if forward_batch.forward_mode.is_decode()
++                    else jitted_run_model
++                )
++                return run_model(
+                     model_def,
+                     model_state_def,
+                     self.model_state_leaves,
+diff --git a/python/sgl_jax/srt/models/qwen3_5.py b/python/sgl_jax/srt/models/qwen3_5.py
+index 04a95ad..37300b0 100644
+--- a/python/sgl_jax/srt/models/qwen3_5.py
++++ b/python/sgl_jax/srt/models/qwen3_5.py
+@@ -743,6 +743,9 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
+         loader = WeightLoader(self, model_config, self.mesh, dtype=self.dtype)
+         loader.load_weights_from_safetensors(simple)
+ 
++        if getattr(model_config, "_dummy_mode", False):
++            return
++
+         weight_info = loader._scan_weight_info()
+         tp = self.mesh.shape.get("tensor", 1)
+         with SequentialSafetensorManager() as fm:

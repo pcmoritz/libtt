@@ -33,7 +33,7 @@ index 2d5e7973486f4dc84bb4d4bbda417997ca939812..3ce51a2396becd0c530e37cf5f0f6157
  };
 
  /// Cache for storing captured traces.
-@@ -29,16 +34,6 @@ struct TraceData {
+@@ -29,16 +34,6 @@
  /// - the second level key identifies the capture and execute program IDs for
  /// the trace.
  ///
@@ -50,7 +50,7 @@ index 2d5e7973486f4dc84bb4d4bbda417997ca939812..3ce51a2396becd0c530e37cf5f0f6157
  class TraceCache {
  public:
    TraceCache(std::shared_ptr<::ttnn::MeshDevice> meshDevice)
-@@ -61,24 +56,11 @@ public:
+@@ -61,24 +56,11 @@
    /// traces.
    void erase(const MainProgramKey &key);
 
@@ -88,7 +88,7 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..99dd4ecac5d58b270ceb558f40fb9854
  #include "operations/trace/capture_or_execute_trace.h"
  #include "tt/runtime/detail/common/logger.h"
  #include "tt/runtime/detail/ttnn/operations/utils.h"
-@@ -165,24 +167,23 @@ publishTraceOutputs(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -165,24 +167,23 @@
    }
  }
 
@@ -122,7 +122,7 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..99dd4ecac5d58b270ceb558f40fb9854
    // Program inputs are, in order: the host-staged inputs, the trace input
    // slots, then the trace output slots - matching the capture function's
    // signature. ProgramExecutor holds pointers into this vector, so it must
-@@ -220,32 +221,28 @@ static TraceData captureTrace(
+@@ -220,32 +221,28 @@
    LOG_ASSERT(traceIdTensor.dtype() == ::ttnn::DataType::UINT32,
               "Trace ID must be UINT32");
 
@@ -162,7 +162,7 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..99dd4ecac5d58b270ceb558f40fb9854
 
    std::vector<::tt::runtime::Tensor> inputTensors = {
        ::tt::runtime::ttnn::utils::createRuntimeTensorFromTTNN(traceIdTensor)};
-@@ -281,7 +278,6 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -281,7 +278,6 @@
 
    if (!traceCache->contains(mainProgramKey, captureExecuteKey)) {
      LOG_DEBUG("Trace cache miss, allocating slots and capturing trace");
@@ -170,7 +170,7 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..99dd4ecac5d58b270ceb558f40fb9854
 
      // Allocate the persistent slots once, then capture against them.
      std::vector<::tt::runtime::Tensor> slots = allocateTraceSlots(op, context);
-@@ -299,9 +295,10 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -299,9 +295,12 @@
      // the execute path establish the slots identically.
      updateTraceInputSlots(op, context, inputSlots,
                            /*deviceResidentOnly=*/true);
@@ -179,12 +179,14 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..99dd4ecac5d58b270ceb558f40fb9854
 -                     traceCache->getGenerationId());
 +    TraceData traceData{.inputTensors = std::move(inputSlots),
 +                        .outputTensors = std::move(outputSlots)};
-+    traceData.variants.push_back(captureTrace(
-+        op, context, traceData.inputTensors, traceData.outputTensors));
++    TraceVariant variant = captureTrace(
++        op, context, traceData.inputTensors, traceData.outputTensors);
++    meshDevice.snapshot_mesh_trace_replay_state(variant.traceId);
++    traceData.variants.push_back(std::move(variant));
      traceCache->insert(mainProgramKey, captureExecuteKey, std::move(traceData));
 
      debug::Stats::get().incrementStat("TraceCacheMiss");
-@@ -312,46 +309,42 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -312,46 +311,41 @@
    TraceData *traceData = traceCache->get(mainProgramKey, captureExecuteKey);
    LOG_ASSERT(traceData, "TraceData must be populated in TraceCache");
 
@@ -243,22 +245,21 @@ index abcc929cf57f787c0d37b5bdade68a9b7923e7b9..99dd4ecac5d58b270ceb558f40fb9854
 -  executeTrace(op, context, *traceData);
 -  debug::Stats::get().incrementStat("ExecutedTrace");
 +  // No cached trace has a footprint disjoint from the current live buffers.
-+  // Capture against the existing persistent slots and keep prior variants so
-+  // recurring allocation patterns do not ping-pong through a recapture.
-+  LOG_DEBUG("No trace variant is safe for the current allocations; capturing ",
-+            "a new variant (cached variants: ", traceData->variants.size(),
-+            ")");
-+  constexpr size_t kMaxTraceVariants = 8;
-+  if (traceData->variants.size() == kMaxTraceVariants) {
-+    ::ttnn::operations::trace::release_trace(
-+        &meshDevice, traceData->variants.front().traceId);
-+    traceData->variants.erase(traceData->variants.begin());
++  // Release obsolete device-side variants before recapturing; retaining the
++  // persistent slots keeps sibling trace allocation addresses stable.
++  LOG_DEBUG("No trace variant is safe for the current allocations; releasing ",
++           traceData->variants.size(), " obsolete variant(s) and recapturing");
++  for (const TraceVariant &variant : traceData->variants) {
++    ::ttnn::operations::trace::release_trace(&meshDevice, variant.traceId);
 +  }
++  traceData->variants.clear();
 +
 +  updateTraceInputSlots(op, context, traceData->inputTensors,
 +                        /*deviceResidentOnly=*/true);
-+  traceData->variants.push_back(captureTrace(
-+      op, context, traceData->inputTensors, traceData->outputTensors));
++  TraceVariant variant = captureTrace(
++      op, context, traceData->inputTensors, traceData->outputTensors);
++  meshDevice.snapshot_mesh_trace_replay_state(variant.traceId);
++  traceData->variants.push_back(std::move(variant));
 +
 +  debug::Stats::get().incrementStat("TraceStaleRecapture");
  }
@@ -268,7 +269,7 @@ diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/tra
 index 72abea60e92480052af8b7302f5c600de65b7d06..66fefc11875ac3da67a88f4c14628df8636e38cc 100644
 --- a/runtime/lib/ttnn/types/trace_cache.cpp
 +++ b/runtime/lib/ttnn/types/trace_cache.cpp
-@@ -47,26 +47,14 @@ void TraceCache::erase(const MainProgramKey &key) {
+@@ -47,26 +47,14 @@
    std::shared_ptr<::ttnn::MeshDevice> lockedDevice = meshDevice.lock();
    if (lockedDevice && lockedDevice->is_initialized()) {
      for (const auto &[_, traceData] : outerIt->second) {

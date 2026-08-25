@@ -1,0 +1,321 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+index 822ae76..ddd87fa 100644
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -6479,13 +6479,15 @@ def TTIR_GatedDeltaRuleOp : TTIR_NamedOp<"gated_delta_rule"> {
+ }
+ 
+ def TTIR_GatedDeltaDecodeOp : TTIR_NamedOp<"gated_delta_decode"> {
+-  let summary = "One preprocessed gated delta rule decode step.";
++  let summary = "One fused gated delta rule decode step.";
+ 
+   let arguments = (ins AnyRankedTensor:$query,
+                        AnyRankedTensor:$key,
+                        AnyRankedTensor:$value,
+-                       AnyRankedTensor:$beta,
+-                       AnyRankedTensor:$decay,
++                       AnyRankedTensor:$beta_logits,
++                       AnyRankedTensor:$delta_time,
++                       AnyRankedTensor:$a_log,
++                       AnyRankedTensor:$dt_bias,
+                        AnyRankedTensor:$state_pool,
+                        AnyRankedTensor:$state_indices,
+                        AnyRankedTensor:$has_initial_state);
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+index 62c487a..7a7d2c2 100644
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -4305,13 +4305,15 @@ def TTNN_GatedDeltaRuleOp : TTNN_Op<"gated_delta_rule", [OpModelExempt]> {
+ }
+ 
+ def TTNN_GatedDeltaDecodeOp : TTNN_Op<"gated_delta_decode", [OpModelExempt]> {
+-    let summary = "One preprocessed gated delta rule decode step.";
++    let summary = "One fused gated delta rule decode step.";
+ 
+     let arguments = (ins AnyRankedTensor:$query,
+                          AnyRankedTensor:$key,
+                          AnyRankedTensor:$value,
+-                         AnyRankedTensor:$beta,
+-                         AnyRankedTensor:$decay,
++                         AnyRankedTensor:$beta_logits,
++                         AnyRankedTensor:$delta_time,
++                         AnyRankedTensor:$a_log,
++                         AnyRankedTensor:$dt_bias,
+                          Arg<AnyRankedTensor, "state pool", [MemWrite]>:$state_pool,
+                          AnyRankedTensor:$state_indices,
+                          AnyRankedTensor:$has_initial_state);
+diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
+index 1f1bfe0..94768d9 100644
+--- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
++++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
+@@ -100,8 +100,10 @@ table GatedDeltaDecodeOp {
+   query: tt.target.ttnn.TensorRef;
+   key: tt.target.ttnn.TensorRef;
+   value: tt.target.ttnn.TensorRef;
+-  beta: tt.target.ttnn.TensorRef;
+-  decay: tt.target.ttnn.TensorRef;
++  beta_logits: tt.target.ttnn.TensorRef;
++  delta_time: tt.target.ttnn.TensorRef;
++  a_log: tt.target.ttnn.TensorRef;
++  dt_bias: tt.target.ttnn.TensorRef;
+   state_pool: tt.target.ttnn.TensorRef;
+   state_indices: tt.target.ttnn.TensorRef;
+   has_initial_state: tt.target.ttnn.TensorRef;
+diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+index 67f890a..9f61916 100644
+--- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
++++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+@@ -316,8 +316,10 @@ struct QwenGatedDeltaDecodeMatch {
+   Value query;
+   Value key;
+   Value value;
+-  Value beta;
+-  Value decay;
++  Value betaLogits;
++  Value deltaTime;
++  Value aLog;
++  Value dtBias;
+   Value statePool;
+   Value stateIndices;
+   Value hasInitialState;
+@@ -466,6 +468,127 @@ bool isOneLike(Value value) {
+   return matchPattern(stripRecurrentViews(value), m_OneFloat());
+ }
+ 
++bool isZeroLike(Value value) {
++  return matchPattern(stripRecurrentViews(value), m_AnyZeroFloat());
++}
++
++Value matchExpandedSigmoidInput(Value value) {
++  auto divide = stripRecurrentViews(value)
++                    .getDefiningOp<::mlir::stablehlo::DivOp>();
++  if (!divide || !isOneLike(divide.getLhs())) {
++    return {};
++  }
++  auto add = divide.getRhs().getDefiningOp<::mlir::stablehlo::AddOp>();
++  if (!add) {
++    return {};
++  }
++  for (auto [one, exponentialValue] :
++       {std::pair{add.getLhs(), add.getRhs()},
++        std::pair{add.getRhs(), add.getLhs()}}) {
++    auto exponential =
++        exponentialValue.getDefiningOp<::mlir::stablehlo::ExpOp>();
++    if (!isOneLike(one) || !exponential) {
++      continue;
++    }
++    auto negate = exponential.getOperand()
++                      .getDefiningOp<::mlir::stablehlo::NegOp>();
++    if (negate) {
++      return negate.getOperand();
++    }
++  }
++  return {};
++}
++
++Value matchStableSoftplusInput(Value value) {
++  auto select = stripRecurrentViews(value)
++                    .getDefiningOp<::mlir::stablehlo::SelectOp>();
++  auto compare = select ? select.getPred()
++                              .getDefiningOp<::mlir::stablehlo::CompareOp>()
++                        : ::mlir::stablehlo::CompareOp();
++  auto nanAdd = select ? select.getOnTrue()
++                             .getDefiningOp<::mlir::stablehlo::AddOp>()
++                       : ::mlir::stablehlo::AddOp();
++  if (!compare || compare.getLhs() != compare.getRhs() || !nanAdd) {
++    return {};
++  }
++  for (auto [input, zero] :
++       {std::pair{nanAdd.getLhs(), nanAdd.getRhs()},
++        std::pair{nanAdd.getRhs(), nanAdd.getLhs()}}) {
++    if (!isZeroLike(zero)) {
++      continue;
++    }
++    auto finiteAdd = select.getOnFalse()
++                         .getDefiningOp<::mlir::stablehlo::AddOp>();
++    if (!finiteAdd) {
++      continue;
++    }
++    for (Value operand : finiteAdd->getOperands()) {
++      auto maximum =
++          operand.getDefiningOp<::mlir::stablehlo::MaxOp>();
++      if (maximum &&
++          ((maximum.getLhs() == input && isZeroLike(maximum.getRhs())) ||
++           (maximum.getRhs() == input && isZeroLike(maximum.getLhs())))) {
++        return input;
++      }
++    }
++  }
++  return {};
++}
++
++struct QwenDecodeGatingMatch {
++  Value betaLogits;
++  Value deltaTime;
++  Value aLog;
++  Value dtBias;
++};
++
++std::optional<QwenDecodeGatingMatch>
++matchDecodeGating(Value beta, Value decay, int64_t batch,
++                  int64_t numHeads) {
++  SmallVector<int64_t> scalarShape = {batch, numHeads};
++  Value betaLogits = matchExpandedSigmoidInput(beta);
++  if (!hasShape(betaLogits, scalarShape)) {
++    return std::nullopt;
++  }
++
++  auto finalExp = stripRecurrentViews(decay)
++                      .getDefiningOp<::mlir::stablehlo::ExpOp>();
++  auto multiply = finalExp ? finalExp.getOperand()
++                                 .getDefiningOp<::mlir::stablehlo::MulOp>()
++                           : ::mlir::stablehlo::MulOp();
++  if (!multiply) {
++    return std::nullopt;
++  }
++  for (auto [aValue, softplusValue] :
++       {std::pair{multiply.getLhs(), multiply.getRhs()},
++        std::pair{multiply.getRhs(), multiply.getLhs()}}) {
++    auto negate = stripRecurrentViews(aValue)
++                      .getDefiningOp<::mlir::stablehlo::NegOp>();
++    auto aExp = negate ? negate.getOperand()
++                            .getDefiningOp<::mlir::stablehlo::ExpOp>()
++                      : ::mlir::stablehlo::ExpOp();
++    Value softplusInput = matchStableSoftplusInput(softplusValue);
++    auto biasAdd = softplusInput
++                       ? softplusInput.getDefiningOp<
++                             ::mlir::stablehlo::AddOp>()
++                       : ::mlir::stablehlo::AddOp();
++    if (!aExp || !biasAdd || !hasShape(aExp.getOperand(), {numHeads})) {
++      continue;
++    }
++    for (auto [deltaTime, biasValue] :
++         {std::pair{biasAdd.getLhs(), biasAdd.getRhs()},
++          std::pair{biasAdd.getRhs(), biasAdd.getLhs()}}) {
++      Value dtBias = stripRecurrentViews(biasValue);
++      if (hasShape(deltaTime, scalarShape) &&
++          hasShape(dtBias, {numHeads})) {
++        return QwenDecodeGatingMatch{betaLogits, deltaTime,
++                                     aExp.getOperand(), dtBias};
++      }
++    }
++  }
++  return std::nullopt;
++}
++
+ Value matchExpandedSilu(Value input) {
+   for (Operation *user : input.getUsers()) {
+     auto multiply = dyn_cast<::mlir::stablehlo::MulOp>(user);
+@@ -712,6 +835,11 @@ matchQwenGatedDeltaDecode(StatePoolUpdateOp stateUpdate) {
+       auto deltaMatch = matchDecodeScaledDelta(
+           scaledDelta, stateMid, key, vectorShape, scalarShape);
+       if (deltaMatch) {
++        auto gatingMatch = matchDecodeGating(
++            deltaMatch->second, stateMatch->second, batch, numHeads);
++        if (!gatingMatch) {
++          continue;
++        }
+         Value statePool = stateUpdate.getStatePool();
+         Value hasInitialState =
+             matchStatePoolRead(stateMatch->first, statePool, batch);
+@@ -719,8 +847,9 @@ matchQwenGatedDeltaDecode(StatePoolUpdateOp stateUpdate) {
+           continue;
+         }
+         return QwenGatedDeltaDecodeMatch{
+-            query, key, deltaMatch->first, deltaMatch->second,
+-            stateMatch->second, statePool, stateUpdate.getStateIndices(),
++            query, key, deltaMatch->first, gatingMatch->betaLogits,
++            gatingMatch->deltaTime, gatingMatch->aLog,
++            gatingMatch->dtBias, statePool, stateUpdate.getStateIndices(),
+             hasInitialState, outputDot.getResult()};
+       }
+     }
+@@ -750,8 +879,9 @@ LogicalResult fuseQwenGatedDeltaDecode(StatePoolUpdateOp stateUpdate) {
+   SmallVector<Type> resultTypes = {barrier->getResult(0).getType(),
+                                    barrier->getResult(1).getType()};
+   SmallVector<Value> operands = {
+-      match->query, match->key, match->value, match->beta, match->decay,
+-      match->statePool, match->stateIndices, match->hasInitialState};
++      match->query, match->key, match->value, match->betaLogits,
++      match->deltaTime, match->aLog, match->dtBias, match->statePool,
++      match->stateIndices, match->hasInitialState};
+   auto fused = builder.create<GatedDeltaDecodeOp>(
+       stateUpdate.getLoc(), resultTypes, operands);
+   barrier->setOperand(0, fused.getFinalStatePool());
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+index a2e0e22..5839229 100644
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -3674,7 +3674,9 @@ createOp(FlatbufferObjectCache &cache, GatedDeltaDecodeOp op) {
+ 
+   return ::tt::target::ttnn::CreateGatedDeltaDecodeOp(
+       *cache.fbb, tensor(op.getQuery()), tensor(op.getKey()),
+-      tensor(op.getValue()), tensor(op.getBeta()), tensor(op.getDecay()),
++      tensor(op.getValue()), tensor(op.getBetaLogits()),
++      tensor(op.getDeltaTime()), tensor(op.getALog()),
++      tensor(op.getDtBias()),
+       tensor(op.getStatePool()), tensor(op.getStateIndices()),
+       tensor(op.getHasInitialState()), finalStatePool, output);
+ }
+diff --git a/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp b/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp
+index 05d7e9b..afe71e0 100644
+--- a/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp
++++ b/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp
+@@ -264,10 +264,14 @@ void run(const ::tt::target::ttnn::GatedDeltaDecodeOp *op,
+       tensorPool.getTTNNTensorAndValidate(op->key());
+   const ::ttnn::Tensor &value =
+       tensorPool.getTTNNTensorAndValidate(op->value());
+-  const ::ttnn::Tensor &beta =
+-      tensorPool.getTTNNTensorAndValidate(op->beta());
+-  const ::ttnn::Tensor &decay =
+-      tensorPool.getTTNNTensorAndValidate(op->decay());
++  const ::ttnn::Tensor &betaLogits =
++      tensorPool.getTTNNTensorAndValidate(op->beta_logits());
++  const ::ttnn::Tensor &deltaTime =
++      tensorPool.getTTNNTensorAndValidate(op->delta_time());
++  const ::ttnn::Tensor &aLog =
++      tensorPool.getTTNNTensorAndValidate(op->a_log());
++  const ::ttnn::Tensor &dtBias =
++      tensorPool.getTTNNTensorAndValidate(op->dt_bias());
+   const ::ttnn::Tensor &statePool =
+       tensorPool.getTTNNTensorAndValidate(op->state_pool());
+   const ::ttnn::Tensor &stateIndices =
+@@ -289,8 +293,10 @@ void run(const ::tt::target::ttnn::GatedDeltaDecodeOp *op,
+   ::ttnn::Tensor queryActive = active4d(query);
+   ::ttnn::Tensor keyActive = active4d(key);
+   ::ttnn::Tensor valueActive = active4d(value);
+-  ::ttnn::Tensor betaActive = toF32TileDram(beta);
+-  ::ttnn::Tensor decayActive = toF32TileDram(decay);
++  ::ttnn::Tensor betaLogitsActive = toF32TileDram(betaLogits);
++  ::ttnn::Tensor deltaTimeActive = toF32TileDram(deltaTime);
++  ::ttnn::Tensor aLogActive = toF32TileDram(aLog);
++  ::ttnn::Tensor dtBiasActive = toF32TileDram(dtBias);
+   const ::ttnn::Tensor &activeIndices = stateIndices;
+   ::ttnn::Tensor activeStateFlag = ::ttnn::to_layout(
+       hasInitialState, ::ttnn::Layout::TILE, ::ttnn::DataType::BFLOAT16,
+@@ -301,7 +307,8 @@ void run(const ::tt::target::ttnn::GatedDeltaDecodeOp *op,
+       ::ttnn::DataType::FLOAT32, ::ttnn::Layout::TILE, query.device(), kDram);
+   ::ttnn::Tensor activeOutput =
+       ::ttnn::transformer::gated_delta_decode(
+-          queryActive, keyActive, valueActive, betaActive, decayActive,
++          queryActive, keyActive, valueActive, betaLogitsActive,
++          deltaTimeActive, aLogActive, dtBiasActive,
+           tiledStatePool, outputBuffer, activeIndices, activeStateFlag);
+   ::ttnn::Tensor updatedStatePool = ::ttnn::to_layout(
+       tiledStatePool, statePool.layout(), statePool.dtype(), kDram);
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+index 130db8c..6813d03 100644
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -2363,8 +2363,9 @@ std::vector<tt::runtime::TensorRef> getOpInputRefs(OpContext opContextHandle) {
+   }
+   case ::tt::target::ttnn::OpType::GatedDeltaDecodeOp: {
+     auto *op = opContext.type_as_GatedDeltaDecodeOp();
+-    tensorRefs = {op->query(), op->key(), op->value(), op->beta(),
+-                  op->decay(), op->state_pool(), op->state_indices(),
++    tensorRefs = {op->query(), op->key(), op->value(), op->beta_logits(),
++                  op->delta_time(), op->a_log(), op->dt_bias(),
++                  op->state_pool(), op->state_indices(),
+                   op->has_initial_state()};
+     break;
+   }
