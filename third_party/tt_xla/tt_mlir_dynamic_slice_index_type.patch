@@ -1,0 +1,20 @@
+diff --git a/runtime/lib/ttnn/operations/data_movement/slice.cpp b/runtime/lib/ttnn/operations/data_movement/slice.cpp
+--- a/runtime/lib/ttnn/operations/data_movement/slice.cpp
++++ b/runtime/lib/ttnn/operations/data_movement/slice.cpp
+@@ -45,14 +45,11 @@ static void runSliceDynamicOp(const ::tt::target::ttnn::SliceOp *op,
+   const ::ttnn::Tensor &begins = tensorPool.getTTNNTensorAndValidate(
+       op->params_as<target::ttnn::SliceDynamicOpParams>()->begins());
+   const ::ttnn::Tensor &ends = tensorPool.getTTNNTensorAndValidate(
+       op->params_as<target::ttnn::SliceDynamicOpParams>()->ends());
+ 
+-  std::optional<::ttsl::SmallVector<uint32_t>> step;
++  std::optional<::ttsl::SmallVector<int32_t>> step;
+   if (op->step() && op->step()->size() > 0) {
+-    step = ::ttsl::SmallVector<uint32_t>();
+-    step->resize(op->step()->size());
+-    std::transform(op->step()->begin(), op->step()->end(), step->begin(),
+-                   [](int32_t v) { return static_cast<uint32_t>(v); });
++    step = ::ttsl::SmallVector<int32_t>(op->step()->begin(), op->step()->end());
+   }
+ 
+   std::optional<::ttnn::MemoryConfig> memoryConfig =

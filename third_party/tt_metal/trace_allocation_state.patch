@@ -1,17 +1,18 @@
 diff --git tt_metal/api/tt-metalium/mesh_device.hpp tt_metal/api/tt-metalium/mesh_device.hpp
-index cee0107fcff1b40eef825e2179c65906d956395f..52c362b26cee61ac2d95e1bbac1cdc7ebb342fad 100644
+index cee0107fcf..6b15367c9d 100644
 --- tt_metal/api/tt-metalium/mesh_device.hpp
 +++ tt_metal/api/tt-metalium/mesh_device.hpp
-@@ -171,6 +171,7 @@ public:
+@@ -171,6 +171,8 @@ public:
      void replay_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id, bool blocking);
      void release_mesh_trace(const MeshTraceId& trace_id);
      std::shared_ptr<MeshTraceBuffer> get_mesh_trace(const MeshTraceId& trace_id);
++    void snapshot_mesh_trace_replay_state(const MeshTraceId& trace_id);
 +    bool is_mesh_trace_replay_safe(const MeshTraceId& trace_id);
      uint32_t get_trace_buffers_size() const override;
      void set_trace_buffers_size(uint32_t size) override;
-
+ 
 diff --git tt_metal/distributed/mesh_device.cpp tt_metal/distributed/mesh_device.cpp
-index b0293ea99af7a10a44abe90bac9a6eb03550020b..210c1751e4017e2a3ea39c0b8bcf71bae453062f 100644
+index 1a43f8f37a..cebe45804b 100644
 --- tt_metal/distributed/mesh_device.cpp
 +++ tt_metal/distributed/mesh_device.cpp
 @@ -26,6 +26,7 @@
@@ -20,12 +21,12 @@ index b0293ea99af7a10a44abe90bac9a6eb03550020b..210c1751e4017e2a3ea39c0b8bcf71ba
  #include <source_location>
 +#include <unordered_set>
  #include <utility>
-
+ 
  #include "impl/allocator/allocator.hpp"
 @@ -272,6 +273,25 @@ void MeshDeviceImpl::mark_allocations_unsafe() { this->allocator_impl()->mark_al
  // NOLINTNEXTLINE(readability-make-member-function-const)
  void MeshDeviceImpl::mark_allocations_safe() { this->allocator_impl()->mark_allocations_safe(); }
-
+ 
 +std::vector<AllocatorImpl*> MeshDeviceImpl::get_trace_allocators() const {
 +    std::vector<AllocatorImpl*> allocators;
 +    std::unordered_set<AllocatorImpl*> seen;
@@ -48,10 +49,18 @@ index b0293ea99af7a10a44abe90bac9a6eb03550020b..210c1751e4017e2a3ea39c0b8bcf71ba
  MeshDeviceImpl::MeshDeviceImpl(
      std::shared_ptr<ScopedDevices> mesh_handle,
      std::unique_ptr<MeshDeviceView> mesh_device_view,
-@@ -1291,6 +1311,18 @@ std::shared_ptr<MeshTraceBuffer> MeshDeviceImpl::get_mesh_trace(const MeshTraceI
+@@ -1316,6 +1336,26 @@ std::shared_ptr<MeshTraceBuffer> MeshDeviceImpl::get_mesh_trace(const MeshTraceI
      return sub_device_manager_tracker_->get_active_sub_device_manager()->get_trace(trace_id);
  }
-
+ 
++void MeshDeviceImpl::snapshot_mesh_trace_replay_state(const MeshTraceId& trace_id) {
++    const std::shared_ptr<MeshTraceBuffer> trace_buffer = this->get_mesh_trace(trace_id);
++    TT_FATAL(trace_buffer != nullptr, "Trace instance {} does not exist", *trace_id);
++    for (auto& [allocator, footprint] : trace_buffer->allocation_footprints) {
++        allocator->snapshot_trace_live_allocations(footprint);
++    }
++}
++
 +bool MeshDeviceImpl::is_mesh_trace_replay_safe(const MeshTraceId& trace_id) {
 +    const std::shared_ptr<MeshTraceBuffer> trace_buffer = this->get_mesh_trace(trace_id);
 +    TT_FATAL(trace_buffer != nullptr, "Trace instance {} does not exist", *trace_id);
@@ -60,17 +69,17 @@ index b0293ea99af7a10a44abe90bac9a6eb03550020b..210c1751e4017e2a3ea39c0b8bcf71ba
 +        trace_buffer->allocation_footprints.end(),
 +        [](const auto& allocator_footprint) {
 +            const auto& [allocator, footprint] = allocator_footprint;
-+            return allocator->has_live_allocation_overlap(footprint);
++            return !allocator->is_trace_replay_safe(footprint);
 +        });
 +}
 +
  MeshTraceId MeshDeviceImpl::begin_mesh_trace(uint8_t cq_id) {
      auto trace_id = MeshTrace::next_id();
      this->begin_mesh_trace(cq_id, trace_id);
-@@ -1306,12 +1338,6 @@ void MeshDeviceImpl::begin_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id
+@@ -1331,12 +1371,6 @@ void MeshDeviceImpl::begin_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id
          *trace_id);
      this->mark_allocations_safe();
-
+ 
 -    // Start tracking DRAM high water mark if trace_region_size is 0 (dynamic allocation mode)
 -    auto trace_region_size = this->allocator_impl()->get_config().trace_region_size;
 -    if (trace_region_size == 0) {
@@ -80,7 +89,7 @@ index b0293ea99af7a10a44abe90bac9a6eb03550020b..210c1751e4017e2a3ea39c0b8bcf71ba
      // Create an empty trace buffer here. This will get initialized in end_trace
      auto* active_sub_device_manager = sub_device_manager_tracker_->get_active_sub_device_manager();
      TT_FATAL(
-@@ -1321,6 +1347,10 @@ void MeshDeviceImpl::begin_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id
+@@ -1346,6 +1380,10 @@ void MeshDeviceImpl::begin_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id
          this->mesh_id_,
          active_sub_device_manager->id());
      auto& trace_buffer = active_sub_device_manager->create_trace(trace_id);
@@ -90,11 +99,11 @@ index b0293ea99af7a10a44abe90bac9a6eb03550020b..210c1751e4017e2a3ea39c0b8bcf71ba
 +    }
      this->mesh_command_queues_[cq_id]->record_begin(trace_id, trace_buffer->desc);
  }
-
-@@ -1341,15 +1371,19 @@ void MeshDeviceImpl::end_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id)
+ 
+@@ -1366,15 +1404,18 @@ void MeshDeviceImpl::end_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id)
          active_sub_device_manager->id());
      this->mesh_command_queues_[cq_id]->record_end();
-
+ 
 -    // End DRAM high water mark tracking if trace_region_size is 0 (dynamic allocation mode)
 -    auto trace_region_size = this->allocator_impl()->get_config().trace_region_size;
      DeviceAddr dram_allocation_high_water_mark = 0;
@@ -103,24 +112,26 @@ index b0293ea99af7a10a44abe90bac9a6eb03550020b..210c1751e4017e2a3ea39c0b8bcf71ba
 -        this->allocator_impl()->end_dram_high_water_mark_tracking();
 -        dram_allocation_high_water_mark = this->allocator_impl()->get_dram_allocation_high_water_mark();
 -        dram_deletion_high_water_mark = this->allocator_impl()->get_dram_deletion_high_water_mark();
-+    AllocatorImpl* mesh_allocator = this->allocator_impl().get();
 +    for (auto& [allocator, footprint] : trace_buffer->allocation_footprints) {
 +        footprint = allocator->end_trace_allocation_tracking();
-+        if (allocator == mesh_allocator) {
-+            dram_allocation_high_water_mark = allocator->get_dram_allocation_high_water_mark();
-+            dram_deletion_high_water_mark = allocator->get_dram_deletion_high_water_mark();
-+        }
++        dram_allocation_high_water_mark =
++            std::max(dram_allocation_high_water_mark, allocator->get_dram_allocation_high_water_mark());
++        dram_deletion_high_water_mark =
++            std::max(dram_deletion_high_water_mark, allocator->get_dram_deletion_high_water_mark());
      }
 +    std::erase_if(
 +        trace_buffer->allocation_footprints,
 +        [](const auto& allocator_footprint) { return allocator_footprint.second.empty(); });
-
+ 
      MeshTrace::populate_mesh_buffer(
          *(mesh_command_queues_[cq_id]), trace_buffer, dram_allocation_high_water_mark, dram_deletion_high_water_mark);
-@@ -1812,6 +1846,9 @@ void MeshDevice::release_mesh_trace(const MeshTraceId& trace_id) { pimpl_->relea
+@@ -1837,6 +1878,12 @@ void MeshDevice::release_mesh_trace(const MeshTraceId& trace_id) { pimpl_->relea
  std::shared_ptr<MeshTraceBuffer> MeshDevice::get_mesh_trace(const MeshTraceId& trace_id) {
      return pimpl_->get_mesh_trace(trace_id);
  }
++void MeshDevice::snapshot_mesh_trace_replay_state(const MeshTraceId& trace_id) {
++    pimpl_->snapshot_mesh_trace_replay_state(trace_id);
++}
 +bool MeshDevice::is_mesh_trace_replay_safe(const MeshTraceId& trace_id) {
 +    return pimpl_->is_mesh_trace_replay_safe(trace_id);
 +}
@@ -128,37 +139,52 @@ index b0293ea99af7a10a44abe90bac9a6eb03550020b..210c1751e4017e2a3ea39c0b8bcf71ba
  void MeshDevice::set_trace_buffers_size(uint32_t size) { pimpl_->set_trace_buffers_size(size); }
  bool MeshDevice::initialize(
 diff --git tt_metal/distributed/mesh_device_impl.hpp tt_metal/distributed/mesh_device_impl.hpp
-index 7fb5dad89336028341e383b64427e6f482a415e1..24e336d1c9290161417a461b680a73c7e98d4e78 100644
+index 7fb5dad893..718c12962e 100644
 --- tt_metal/distributed/mesh_device_impl.hpp
 +++ tt_metal/distributed/mesh_device_impl.hpp
 @@ -186,6 +186,8 @@ private:
      // NOLINTNEXTLINE(readability-make-member-function-const)
      void mark_allocations_safe();
-
+ 
 +    std::vector<AllocatorImpl*> get_trace_allocators() const;
 +
      std::shared_ptr<MeshTraceBuffer>& create_mesh_trace(const MeshTraceId& trace_id);
-
+ 
      std::lock_guard<std::mutex> lock_api() { return std::lock_guard<std::mutex>(api_mutex_); }
-@@ -284,6 +286,7 @@ public:
+@@ -284,6 +286,8 @@ public:
      void replay_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id, bool blocking);
      void release_mesh_trace(const MeshTraceId& trace_id);
      std::shared_ptr<MeshTraceBuffer> get_mesh_trace(const MeshTraceId& trace_id);
++    void snapshot_mesh_trace_replay_state(const MeshTraceId& trace_id);
 +    bool is_mesh_trace_replay_safe(const MeshTraceId& trace_id);
      uint32_t get_trace_buffers_size() const override;
      void set_trace_buffers_size(uint32_t size) override;
-
+ 
+diff --git tt_metal/distributed/mesh_trace.cpp tt_metal/distributed/mesh_trace.cpp
+index 30d35118a4..ca814bc976 100644
+--- tt_metal/distributed/mesh_trace.cpp
++++ tt_metal/distributed/mesh_trace.cpp
+@@ -155,6 +155,9 @@ void MeshTrace::populate_mesh_buffer(
+ }
+ 
+ MeshTraceBuffer::~MeshTraceBuffer() {
++    for (const auto& [allocator, footprint] : this->allocation_footprints) {
++        allocator->release_trace_reservations(footprint);
++    }
+     if (this->mesh_buffer && this->mesh_buffer->is_allocated() && this->mesh_buffer->device()) {
+         auto current_trace_buffers_size = this->mesh_buffer->device()->get_trace_buffers_size();
+         this->mesh_buffer->device()->set_trace_buffers_size(current_trace_buffers_size - this->mesh_buffer->size());
 diff --git tt_metal/distributed/mesh_trace.hpp tt_metal/distributed/mesh_trace.hpp
-index 1badcf928870540d92de0f7c84c7487fbd46340e..67014ffaf6e93defda07c5ab6295250dbe3b6b08 100644
+index 1badcf9288..67014ffaf6 100644
 --- tt_metal/distributed/mesh_trace.hpp
 +++ tt_metal/distributed/mesh_trace.hpp
 @@ -6,6 +6,7 @@
-
+ 
  #include <tt-metalium/mesh_buffer.hpp>
  #include <tt-metalium/mesh_trace_id.hpp>
 +#include "impl/allocator/allocator.hpp"
  #include "trace/trace_buffer.hpp"
-
+ 
  namespace tt::tt_metal::distributed {
 @@ -45,6 +46,8 @@ struct MeshTraceBuffer {
      // The MeshBuffer this trace will be serialized to, before being run on a
@@ -166,17 +192,17 @@ index 1badcf928870540d92de0f7c84c7487fbd46340e..67014ffaf6e93defda07c5ab6295250d
      std::shared_ptr<MeshBuffer> mesh_buffer = nullptr;
 +    // Allocator regions used by transient buffers while this trace was captured.
 +    std::vector<std::pair<AllocatorImpl*, TraceAllocationFootprint>> allocation_footprints;
-
+ 
      ~MeshTraceBuffer();
  };
 diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocator.cpp
-index d2b3aa0d6114dc32ec4efaf31c73c83df737107e..8d8df2335a8e8ec0409b8c080aa1d2ea26a3fee5 100644
+index d2b3aa0d61..20320cfae2 100644
 --- tt_metal/impl/allocator/allocator.cpp
 +++ tt_metal/impl/allocator/allocator.cpp
-@@ -499,6 +499,32 @@ DeviceAddr AllocatorImpl::get_dram_deletion_high_water_mark() const {
+@@ -499,6 +499,49 @@ DeviceAddr AllocatorImpl::get_dram_deletion_high_water_mark() const {
      return dram_manager_->get_deletion_high_water_mark();
  }
-
+ 
 +void AllocatorImpl::begin_trace_allocation_tracking() {
 +    std::lock_guard<std::mutex> lock(mutex_);
 +    dram_manager_->begin_high_water_mark_tracking();
@@ -196,28 +222,51 @@ index d2b3aa0d6114dc32ec4efaf31c73c83df737107e..8d8df2335a8e8ec0409b8c080aa1d2ea
 +    };
 +}
 +
-+bool AllocatorImpl::has_live_allocation_overlap(const TraceAllocationFootprint& footprint) const {
++void AllocatorImpl::snapshot_trace_live_allocations(TraceAllocationFootprint& footprint) {
 +    std::lock_guard<std::mutex> lock(mutex_);
-+    return dram_manager_->has_live_allocation_overlap(footprint.dram) ||
-+           l1_manager_->has_live_allocation_overlap(footprint.l1) ||
-+           l1_small_manager_->has_live_allocation_overlap(footprint.l1_small);
++    footprint.dram_reserved = dram_manager_->reserve_trace_footprint(footprint.dram);
++    footprint.l1_reserved = l1_manager_->reserve_trace_footprint(footprint.l1);
++    footprint.l1_small_reserved = l1_small_manager_->reserve_trace_footprint(footprint.l1_small);
++    footprint.dram_live = dram_manager_->get_live_allocation_overlaps(footprint.dram);
++    footprint.l1_live = l1_manager_->get_live_allocation_overlaps(footprint.l1);
++    footprint.l1_small_live = l1_small_manager_->get_live_allocation_overlaps(footprint.l1_small);
++}
++
++void AllocatorImpl::release_trace_reservations(const TraceAllocationFootprint& footprint) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    l1_small_manager_->release_trace_reservations(footprint.l1_small_reserved);
++    l1_manager_->release_trace_reservations(footprint.l1_reserved);
++    dram_manager_->release_trace_reservations(footprint.dram_reserved);
++}
++
++bool AllocatorImpl::is_trace_replay_safe(const TraceAllocationFootprint& footprint) const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return dram_manager_->is_trace_replay_safe(footprint.dram, footprint.dram_live) &&
++           l1_manager_->is_trace_replay_safe(footprint.l1, footprint.l1_live) &&
++           l1_small_manager_->is_trace_replay_safe(footprint.l1_small, footprint.l1_small_live);
 +}
 +
  void AllocatorImpl::clear() {
      std::lock_guard<std::mutex> lock(mutex_);
      dram_manager_->clear();
 diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocator.hpp
-index 8a116d7d6d2db7339c49b480c2e1c7a5d5ddf583..e1c753f84e112d72dda86796315f20cd9cb1c915 100644
+index 8a116d7d6d..eb805336be 100644
 --- tt_metal/impl/allocator/allocator.hpp
 +++ tt_metal/impl/allocator/allocator.hpp
-@@ -12,6 +12,14 @@
-
+@@ -12,6 +12,20 @@
+ 
  namespace tt::tt_metal {
-
+ 
 +struct TraceAllocationFootprint {
 +    BankManager::AllocationFootprint dram;
 +    BankManager::AllocationFootprint l1;
 +    BankManager::AllocationFootprint l1_small;
++    BankManager::AllocationFootprint dram_live;
++    BankManager::AllocationFootprint l1_live;
++    BankManager::AllocationFootprint l1_small_live;
++    BankManager::AllocationFootprint dram_reserved;
++    BankManager::AllocationFootprint l1_reserved;
++    BankManager::AllocationFootprint l1_small_reserved;
 +
 +    bool empty() const { return dram.empty() && l1.empty() && l1_small.empty(); }
 +};
@@ -225,20 +274,23 @@ index 8a116d7d6d2db7339c49b480c2e1c7a5d5ddf583..e1c753f84e112d72dda86796315f20cd
  // THREAD SAFETY: Allocator is thread safe.
  class AllocatorImpl {
  public:
-@@ -88,6 +96,11 @@ public:
+@@ -88,6 +102,14 @@ public:
      DeviceAddr get_dram_allocation_high_water_mark() const;
      DeviceAddr get_dram_deletion_high_water_mark() const;
-
-+    // Records the exact allocator regions touched while a trace is captured.
+ 
++    // Records the exact allocator regions touched while a trace is captured,
++    // then snapshots the live subset once capture-local objects are destroyed.
 +    void begin_trace_allocation_tracking();
 +    TraceAllocationFootprint end_trace_allocation_tracking();
-+    bool has_live_allocation_overlap(const TraceAllocationFootprint& footprint) const;
++    void snapshot_trace_live_allocations(TraceAllocationFootprint& footprint);
++    void release_trace_reservations(const TraceAllocationFootprint& footprint);
++    bool is_trace_replay_safe(const TraceAllocationFootprint& footprint) const;
 +
      // what does clear even mean on an allocator???
      void clear();
-
+ 
 diff --git tt_metal/impl/allocator/bank_manager.cpp tt_metal/impl/allocator/bank_manager.cpp
-index f2a7335a38be698ccf4192bfaa942312083a4b22..3749f95bc08d6ae5175d0dd75bb4babca6a2579c 100644
+index f2a7335a38..af7d8e62ab 100644
 --- tt_metal/impl/allocator/bank_manager.cpp
 +++ tt_metal/impl/allocator/bank_manager.cpp
 @@ -9,6 +9,7 @@
@@ -248,13 +300,13 @@ index f2a7335a38be698ccf4192bfaa942312083a4b22..3749f95bc08d6ae5175d0dd75bb4babc
 +#include <tuple>
  #include <utility>
  #include <algorithm>
-
+ 
 @@ -471,6 +472,7 @@ uint64_t BankManager::allocate_buffer(
              DeviceAddr end_address = address.value() + size_per_bank;
              allocation_high_water_mark_ = std::max(allocation_high_water_mark_, end_address);
          }
 +        record_allocation_region(allocator_id, address.value(), size_per_bank);
-
+ 
          // No neighbors, nothing to invalidate
          return address.value();
 @@ -536,6 +538,7 @@ uint64_t BankManager::allocate_buffer(
@@ -262,7 +314,7 @@ index f2a7335a38be698ccf4192bfaa942312083a4b22..3749f95bc08d6ae5175d0dd75bb4babc
          allocation_high_water_mark_ = std::max(allocation_high_water_mark_, end_address);
      }
 +    record_allocation_region(allocator_id, address.value(), size_per_bank);
-
+ 
      // Allocation in this allocator invalidates caches in allocators that depend on this allocator
      this->invalidate_allocated_ranges_cache_for_dependent_allocators(allocator_id);
 @@ -553,6 +556,7 @@ void BankManager::deallocate_buffer(DeviceAddr address, BankManager::AllocatorDe
@@ -272,7 +324,7 @@ index f2a7335a38be698ccf4192bfaa942312083a4b22..3749f95bc08d6ae5175d0dd75bb4babc
 +            record_allocation_region(allocator_id, address, size_opt.value());
          }
      }
-
+ 
 @@ -567,6 +571,9 @@ void BankManager::deallocate_all() {
          auto* alloc = this->get_allocator_from_id(allocator_id);
          TT_FATAL(alloc, "Allocator not initialized!");
@@ -293,14 +345,14 @@ index f2a7335a38be698ccf4192bfaa942312083a4b22..3749f95bc08d6ae5175d0dd75bb4babc
 +    allocation_footprint_ = std::move(that.allocation_footprint_);
      return *this;
  }
-
+ 
 @@ -619,10 +630,28 @@ void BankManager::begin_high_water_mark_tracking() {
      tracking_high_water_mark_ = true;
      allocation_high_water_mark_ = 0;
      deletion_high_water_mark_ = 0;
 +    allocation_footprint_.clear();
  }
-
+ 
  DeviceAddr BankManager::end_high_water_mark_tracking() {
      tracking_high_water_mark_ = false;
 +    std::sort(
@@ -322,38 +374,120 @@ index f2a7335a38be698ccf4192bfaa942312083a4b22..3749f95bc08d6ae5175d0dd75bb4babc
 +    allocation_footprint_ = std::move(coalesced);
      return std::max(allocation_high_water_mark_, deletion_high_water_mark_);
  }
-
-@@ -634,6 +663,48 @@ DeviceAddr BankManager::get_allocation_high_water_mark() const { return allocati
-
+ 
+@@ -634,6 +663,130 @@ DeviceAddr BankManager::get_allocation_high_water_mark() const { return allocati
+ 
  DeviceAddr BankManager::get_deletion_high_water_mark() const { return deletion_high_water_mark_; }
-
+ 
 +BankManager::AllocationFootprint BankManager::take_allocation_footprint() {
 +    return std::move(allocation_footprint_);
 +}
 +
-+bool BankManager::has_live_allocation_overlap(const AllocationFootprint& footprint) const {
-+    auto allocator_overlaps = [&](uint32_t allocator_id, const AllocationRegion& region) {
++BankManager::AllocationFootprint BankManager::get_live_allocation_overlaps(
++    const AllocationFootprint& footprint) const {
++    AllocationFootprint live_allocations;
++    auto collect_overlaps = [&](uint32_t allocator_id, const AllocationRegion& region) {
 +        const auto* alloc = this->get_allocator_from_id(AllocatorDependencies::AllocatorID{allocator_id});
 +        TT_FATAL(alloc, "Allocator not initialized for ID {}", allocator_id);
 +        for (DeviceAddr address : allocated_buffers_[allocator_id]) {
 +            const auto size = alloc->get_allocation_size(address);
 +            TT_FATAL(size.has_value(), "Missing allocation size for address {}", address);
 +            if (region.begin < address + *size && address < region.end) {
-+                return true;
++                live_allocations.push_back({allocator_id, address, address + *size});
 +            }
 +        }
-+        return false;
 +    };
 +
 +    for (const AllocationRegion& region : footprint) {
-+        if (allocator_overlaps(region.allocator_id, region)) {
-+            return true;
-+        }
++        collect_overlaps(region.allocator_id, region);
 +        for (const auto dependent_id : allocator_dependencies_.dependencies[region.allocator_id]) {
-+            if (allocator_overlaps(dependent_id.get(), region)) {
-+                return true;
++            collect_overlaps(dependent_id.get(), region);
++        }
++    }
++    std::sort(
++        live_allocations.begin(),
++        live_allocations.end(),
++        [](const AllocationRegion& lhs, const AllocationRegion& rhs) {
++            return std::tie(lhs.allocator_id, lhs.begin, lhs.end) <
++                   std::tie(rhs.allocator_id, rhs.begin, rhs.end);
++        });
++    live_allocations.erase(
++        std::unique(live_allocations.begin(), live_allocations.end()), live_allocations.end());
++    return live_allocations;
++}
++
++BankManager::AllocationFootprint BankManager::reserve_trace_footprint(
++    const AllocationFootprint& footprint) {
++    AllocationFootprint reservations;
++    for (const AllocationRegion& region : footprint) {
++        const AllocationFootprint live_allocations =
++            get_live_allocation_overlaps(AllocationFootprint{region});
++        std::vector<std::pair<DeviceAddr, DeviceAddr>> occupied;
++        occupied.reserve(live_allocations.size());
++        for (const AllocationRegion& live : live_allocations) {
++            const DeviceAddr begin = std::max(region.begin, live.begin);
++            const DeviceAddr end = std::min(region.end, live.end);
++            if (begin < end) {
++                occupied.emplace_back(begin, end);
 +            }
 +        }
++        std::sort(occupied.begin(), occupied.end());
++
++        DeviceAddr cursor = region.begin;
++        const auto reserve = [&](DeviceAddr begin, DeviceAddr end) {
++            if (begin >= end) {
++                return;
++            }
++            const auto allocator_id = AllocatorDependencies::AllocatorID{region.allocator_id};
++            mark_allocated(allocator_id, begin, end - begin);
++            reservations.push_back({region.allocator_id, begin, end});
++        };
++        for (const auto& [begin, end] : occupied) {
++            if (begin > cursor) {
++                reserve(cursor, begin);
++            }
++            cursor = std::max(cursor, end);
++            if (cursor >= region.end) {
++                break;
++            }
++        }
++        reserve(cursor, region.end);
++    }
++    return reservations;
++}
++
++void BankManager::release_trace_reservations(const AllocationFootprint& reservations) {
++    for (auto it = reservations.rbegin(); it != reservations.rend(); ++it) {
++        mark_deallocated(AllocatorDependencies::AllocatorID{it->allocator_id}, it->begin);
++    }
++}
++
++bool BankManager::is_trace_replay_safe(
++    const AllocationFootprint& footprint, const AllocationFootprint& expected_live_allocations) const {
++    const AllocationFootprint live_allocations = get_live_allocation_overlaps(footprint);
++    if (live_allocations == expected_live_allocations) {
++        return true;
++    }
++    log_debug(
++        tt::LogAlways,
++        "Trace replay allocation state changed: expected {} live overlap(s), found {}",
++        expected_live_allocations.size(),
++        live_allocations.size());
++    for (const AllocationRegion& region : expected_live_allocations) {
++        log_debug(
++            tt::LogAlways,
++            "  expected allocator {} [0x{:x}, 0x{:x})",
++            region.allocator_id,
++            region.begin,
++            region.end);
++    }
++    for (const AllocationRegion& region : live_allocations) {
++        log_debug(
++            tt::LogAlways,
++            "  current allocator {} [0x{:x}, 0x{:x})",
++            region.allocator_id,
++            region.begin,
++            region.end);
 +    }
 +    return false;
 +}
@@ -372,15 +506,15 @@ index f2a7335a38be698ccf4192bfaa942312083a4b22..3749f95bc08d6ae5175d0dd75bb4babc
  void BankManager::dump_blocks(std::ostream& out, BankManager::AllocatorDependencies::AllocatorID allocator_id) const {
      const auto* alloc = this->get_allocator_from_id(allocator_id);
      if (alloc) {
-@@ -745,6 +816,7 @@ void BankManager::mark_allocated(AllocatorDependencies::AllocatorID allocator_id
+@@ -745,6 +898,7 @@ void BankManager::mark_allocated(AllocatorDependencies::AllocatorID allocator_id
          stats.total_free_bytes,
          stats.largest_free_block_bytes);
      allocated_buffers_[allocator_id.get()].insert(address);
 +    record_allocation_region(allocator_id, address, size);
      invalidate_allocated_ranges_cache_for_dependent_allocators(allocator_id);
  }
-
-@@ -755,6 +827,9 @@ void BankManager::mark_deallocated(AllocatorDependencies::AllocatorID allocator_
+ 
+@@ -755,6 +909,9 @@ void BankManager::mark_deallocated(AllocatorDependencies::AllocatorID allocator_
      if (!allocated_buffers_[allocator_id.get()].contains(address)) {
          return;
      }
@@ -391,38 +525,44 @@ index f2a7335a38be698ccf4192bfaa942312083a4b22..3749f95bc08d6ae5175d0dd75bb4babc
      allocated_buffers_[allocator_id.get()].erase(address);
      invalidate_allocated_ranges_cache_for_dependent_allocators(allocator_id);
 diff --git tt_metal/impl/allocator/bank_manager.hpp tt_metal/impl/allocator/bank_manager.hpp
-index 68ed8dbdb4cb9172a3c3a1d1cf560c435f5855e5..69d46cf5c2e484d2cad63faff031cb9c0d415b12 100644
+index 68ed8dbdb4..ebd40cd19f 100644
 --- tt_metal/impl/allocator/bank_manager.hpp
 +++ tt_metal/impl/allocator/bank_manager.hpp
-@@ -30,6 +30,13 @@ class Algorithm;
-
+@@ -30,6 +30,15 @@ class Algorithm;
+ 
  class BankManager {
  public:
 +    struct AllocationRegion {
 +        uint32_t allocator_id;
 +        DeviceAddr begin;
 +        DeviceAddr end;
++
++        bool operator==(const AllocationRegion&) const = default;
 +    };
 +    using AllocationFootprint = std::vector<AllocationRegion>;
 +
      BankManager() = default;
-
+ 
      /**
-@@ -136,6 +143,8 @@ public:
+@@ -136,6 +145,12 @@ public:
      DeviceAddr get_high_water_mark() const;
      DeviceAddr get_allocation_high_water_mark() const;
      DeviceAddr get_deletion_high_water_mark() const;
 +    AllocationFootprint take_allocation_footprint();
-+    bool has_live_allocation_overlap(const AllocationFootprint& footprint) const;
-
++    AllocationFootprint get_live_allocation_overlaps(const AllocationFootprint& footprint) const;
++    AllocationFootprint reserve_trace_footprint(const AllocationFootprint& footprint);
++    void release_trace_reservations(const AllocationFootprint& reservations);
++    bool is_trace_replay_safe(
++        const AllocationFootprint& footprint, const AllocationFootprint& expected_live_allocations) const;
+ 
      // Cross-allocator mirroring: mark a region as allocated/deallocated in a specific sub-allocator.
      // Used to mirror lockstep allocations from the mesh-level allocator into per-device allocators.
-@@ -189,12 +198,15 @@ private:
+@@ -189,12 +204,15 @@ private:
      bool tracking_high_water_mark_ = false;
      DeviceAddr allocation_high_water_mark_ = 0;
      DeviceAddr deletion_high_water_mark_ = 0;
 +    AllocationFootprint allocation_footprint_;
-
+ 
      /*********************************
       * Allocator-independent methods *
       *********************************/
@@ -430,6 +570,6 @@ index 68ed8dbdb4cb9172a3c3a1d1cf560c435f5855e5..69d46cf5c2e484d2cad63faff031cb9c
      void init_allocators(DeviceAddr size_bytes, uint32_t alignment_bytes, DeviceAddr offset);
 +    void record_allocation_region(
 +        AllocatorDependencies::AllocatorID allocator_id, DeviceAddr address, DeviceAddr size);
-
+ 
      /*******************************
       * Allocator-dependent methods *

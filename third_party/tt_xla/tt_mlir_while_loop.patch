@@ -200,3 +200,38 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    case ::tt::target::ttnn::OpType::WriteTensorOp: {
      tensorRefs = {opContext.type_as_WriteTensorOp()->host_tensor(),
                    opContext.type_as_WriteTensorOp()->device_tensor()};
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+@@ -324,4 +324,17 @@ private:
+   llvm::Expected<TTNNLayoutAttr>
+   opStopsRowMajorPropagation(Operation *op, unsigned operandIdx) {
++    // Region/control-flow operations belong to TTCore and do not have TTNN
++    // backend constraint models. Treat any non-TTNN operation as a layout
++    // boundary; the dedicated control-flow layout patterns reconcile its
++    // operand and result types later in the pipeline.
++    if (op->getName().getDialectNamespace() !=
++        TTNNDialect::getDialectNamespace()) {
++      TTMLIR_DEBUG(ttmlir::LogComponent::RMPropagation,
++                   "Stopping RM propagation at non-TTNN op {}", op->getName());
++      return llvm::make_error<llvm::StringError>(
++          "Stopping RM propagation at non-TTNN op",
++          llvm::inconvertibleErrorCode());
++    }
++
+     if (auto toTensorSpecOp = mlir::dyn_cast<ttnn::ToTensorSpecOp>(op)) {
+       TTMLIR_DEBUG(ttmlir::LogComponent::RMPropagation,
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -967,5 +967,8 @@ private:
+   mlir::LogicalResult processFuncOp(func::FuncOp funcOp) {
+-    // Skip non-forward functions.
+-    if (!ttmlir::utils::isForwardDeviceFunc(funcOp)) {
++    // Private forward functions are outlined control-flow helpers. Their
++    // device-resident arguments cannot satisfy an independently nested trace's
++    // host-staging contract, and the public caller trace captures their device
++    // commands already.
++    if (!ttmlir::utils::isForwardDeviceFunc(funcOp) || funcOp.isPrivate()) {
+       return mlir::success();
+     }

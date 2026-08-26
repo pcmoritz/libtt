@@ -1,0 +1,18 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -212,6 +212,14 @@
+       return failure();
+     }
+ 
++    // The fused runtime kernel only supports BFP8 weights. Require an explicit
++    // per-weight annotation so BF16 graphs retain their unfused SwiGLU path.
++    auto weightDtype = matmulOp->getAttrOfType<mlir::StringAttr>(
++        "ttcore.weight_dtype");
++    if (!weightDtype || weightDtype.getValue() != "bfp_bf8") {
++      return failure();
++    }
++
+     auto inputType = matmulOp.getType();
+     auto outputType = multiplyOp.getType();
+     ArrayRef<int64_t> inputShape = inputType.getShape();
