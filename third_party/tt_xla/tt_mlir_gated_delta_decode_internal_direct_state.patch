@@ -1,0 +1,36 @@
+diff --git a/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp b/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp
+index afe71e0..a235047 100644
+--- a/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp
++++ b/runtime/lib/ttnn/operations/transformer/gated_delta_rule.cpp
+@@ -13,6 +13,7 @@
+ #include "ttnn/operations/transformer/chunk_gated_delta_rule/chunk_gated_delta_rule.hpp"
+ #include "ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp"
+ #include "ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp"
++#include "ttnn/operations/transformer/gated_delta_attn/state_pool_gather.hpp"
+ #include "ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp"
+ 
+ namespace tt::runtime::ttnn::operations::transformer {
+@@ -302,14 +303,21 @@ void run(const ::tt::target::ttnn::GatedDeltaDecodeOp *op,
+       hasInitialState, ::ttnn::Layout::TILE, ::ttnn::DataType::BFLOAT16,
+       kDram);
+   ::ttnn::Tensor tiledStatePool = toF32TileDram(statePool);
++  ::ttnn::Tensor directState = ::ttnn::empty(
++      ::ttnn::Shape{batchSize, numHeads, kHeadSize, kHeadSize},
++      ::ttnn::DataType::FLOAT32, ::ttnn::Layout::TILE, query.device(), kDram);
++  (void)::ttnn::transformer::state_pool_gather(
++      tiledStatePool, activeIndices, activeStateFlag, directState);
+   ::ttnn::Tensor outputBuffer = ::ttnn::empty(
+       ::ttnn::Shape{1, numHeads, 1, kHeadSize},
+       ::ttnn::DataType::FLOAT32, ::ttnn::Layout::TILE, query.device(), kDram);
+   ::ttnn::Tensor activeOutput =
+       ::ttnn::transformer::gated_delta_decode(
+           queryActive, keyActive, valueActive, betaLogitsActive,
+-          deltaTimeActive, aLogActive, dtBiasActive,
+-          tiledStatePool, outputBuffer, activeIndices, activeStateFlag);
++          deltaTimeActive, aLogActive, dtBiasActive, directState,
++          outputBuffer);
++  (void)::ttnn::transformer::state_pool_update(
++      tiledStatePool, activeIndices, directState);
+   ::ttnn::Tensor updatedStatePool = ::ttnn::to_layout(
+       tiledStatePool, statePool.layout(), statePool.dtype(), kDram);
+ 

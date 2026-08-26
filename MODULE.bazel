@@ -457,7 +457,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_paged_update_cache_row_major.patch",
         "//third_party/tt_xla:tt_mlir_trace_preserve_output_aliases.patch",
         "//third_party/tt_xla:tt_mlir_raw_gating_fusion.patch",
-        "//third_party/tt_xla:tt_mlir_gated_delta_decode_direct_state.patch",
+        "//third_party/tt_xla:tt_mlir_gated_delta_decode_internal_direct_state.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

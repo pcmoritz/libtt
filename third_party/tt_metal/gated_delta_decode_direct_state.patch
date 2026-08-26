@@ -109,10 +109,10 @@ index ad9049484b..c306d72f39 100644
  }
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_gather.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_gather.cpp
 new file mode 100644
-index 0000000000..d5d02675f2
+index 0000000000..2269265d16
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_gather.cpp
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,83 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -132,41 +132,58 @@ index 0000000000..d5d02675f2
 +    const uint32_t worker = get_arg_val<uint32_t>(0);
 +    const uint32_t state_pool_address = get_arg_val<uint32_t>(1);
 +    const uint32_t state_indices_address = get_arg_val<uint32_t>(2);
-+    const uint32_t output_address = get_arg_val<uint32_t>(3);
++    const uint32_t has_initial_state_address = get_arg_val<uint32_t>(3);
++    const uint32_t output_address = get_arg_val<uint32_t>(4);
 +
 +    constexpr auto state_pool_args = TensorAccessorArgs<4>();
 +    constexpr auto state_indices_args =
 +        TensorAccessorArgs<state_pool_args.next_compile_time_args_offset()>();
-+    constexpr auto output_args =
++    constexpr auto has_initial_state_args =
 +        TensorAccessorArgs<state_indices_args.next_compile_time_args_offset()>();
++    constexpr auto output_args =
++        TensorAccessorArgs<has_initial_state_args.next_compile_time_args_offset()>();
 +    const auto state_pool =
 +        TensorAccessor(state_pool_args, state_pool_address, tile_bytes);
 +    const auto state_indices =
 +        TensorAccessor(state_indices_args, state_indices_address, 4096);
++    const auto has_initial_state =
++        TensorAccessor(has_initial_state_args, has_initial_state_address, 2048);
 +    const auto output = TensorAccessor(output_args, output_address, tile_bytes);
 +
 +    CircularBuffer data_cb(tt::CBIndex::c_0);
 +    CircularBuffer indices_cb(tt::CBIndex::c_1);
++    CircularBuffer flags_cb(tt::CBIndex::c_2);
 +    Noc noc;
 +
 +    indices_cb.reserve_back(1);
++    flags_cb.reserve_back(1);
 +    noc.async_read(
 +        state_indices, indices_cb, 4096,
 +        {.page_id = 0}, {.offset_bytes = 0});
++    noc.async_read(
++        has_initial_state, flags_cb, 2048,
++        {.page_id = 0}, {.offset_bytes = 0});
 +    noc.async_read_barrier();
 +    indices_cb.push_back(1);
++    flags_cb.push_back(1);
 +    indices_cb.wait_front(1);
++    flags_cb.wait_front(1);
 +    const uint32_t total_pages = batch_size * pages_per_slice;
 +    for (uint32_t work = worker; work < total_pages; work += num_workers) {
 +        const uint32_t batch = work / pages_per_slice;
 +        const uint32_t page = work % pages_per_slice;
 +        const uint32_t slot = read_index(indices_cb.get_read_ptr(), batch);
++        const bool has_state = read_flag(flags_cb.get_read_ptr(), batch);
 +        data_cb.reserve_back(1);
-+        noc.async_read(
-+            state_pool, data_cb, tile_bytes,
-+            {.page_id = slot * pages_per_slice + page},
-+            {.offset_bytes = 0});
-+        noc.async_read_barrier();
++        if (has_state) {
++            noc.async_read(
++                state_pool, data_cb, tile_bytes,
++                {.page_id = slot * pages_per_slice + page},
++                {.offset_bytes = 0});
++            noc.async_read_barrier();
++        } else {
++            zero_tiles<uint32_t>(data_cb.get_write_ptr(), 1);
++        }
 +        data_cb.push_back(1);
 +        data_cb.wait_front(1);
 +        noc.async_write(
@@ -177,6 +194,7 @@ index 0000000000..d5d02675f2
 +        data_cb.pop_front(1);
 +    }
 +    indices_cb.pop_front(1);
++    flags_cb.pop_front(1);
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp
 index d076e6588e..736774500d 100644
@@ -393,10 +411,10 @@ index d2af50f6cb..5b3004e9fe 100644
  }  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_gather.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_gather.cpp
 new file mode 100644
-index 0000000000..62ef7237bf
+index 0000000000..4ea41da1ab
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_gather.cpp
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,238 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -422,6 +440,7 @@ index 0000000000..62ef7237bf
 +struct StatePoolGatherInputs {
 +    Tensor state_pool;
 +    Tensor state_indices;
++    Tensor has_initial_state;
 +    Tensor output;
 +};
 +
@@ -486,10 +505,17 @@ index 0000000000..62ef7237bf
 +    const operation_attributes_t&, const tensor_args_t& inputs) {
 +    validate_tensor(inputs.state_pool, "state pool");
 +    validate_tensor(inputs.state_indices, "state indices");
++    validate_tensor(inputs.has_initial_state, "initial-state mask");
 +    validate_tensor(inputs.output, "output");
 +    TT_FATAL(
 +        inputs.state_indices.dtype() == DataType::INT32,
 +        "state indices must be int32");
++    TT_FATAL(
++        inputs.has_initial_state.dtype() == DataType::BFLOAT16,
++        "initial-state mask must be bfloat16");
++    TT_FATAL(
++        inputs.state_pool.dtype() == DataType::FLOAT32,
++        "state pool must be float32");
 +    TT_FATAL(
 +        inputs.state_pool.dtype() == inputs.output.dtype(),
 +        "state pool and output must have the same dtype");
@@ -503,6 +529,7 @@ index 0000000000..62ef7237bf
 +        update_shape[0] > 0 && update_shape[0] <= 32,
 +        "output batch must fit in one non-empty tile row");
 +    check_shape(inputs.state_indices, {update_shape[0]}, "state indices");
++    check_shape(inputs.has_initial_state, {update_shape[0]}, "initial-state mask");
 +    for (uint32_t dim = 1; dim < pool_shape.rank(); ++dim) {
 +        TT_FATAL(
 +            pool_shape[dim] == update_shape[dim],
@@ -519,7 +546,8 @@ index 0000000000..62ef7237bf
 +ttsl::hash::hash_t StatePoolGatherOperation::compute_program_hash(
 +    const operation_attributes_t&, const tensor_args_t& inputs) {
 +    return operation::hash_operation<StatePoolGatherOperation>(
-+        inputs.state_pool, inputs.state_indices, inputs.output);
++        inputs.state_pool, inputs.state_indices, inputs.has_initial_state,
++        inputs.output);
 +}
 +
 +StatePoolGatherProgramFactory::cached_program_t
@@ -549,11 +577,16 @@ index 0000000000..62ef7237bf
 +        4096, {{tt::CBIndex::c_1, tt::DataFormat::Int32}});
 +    indices_config.set_page_size(tt::CBIndex::c_1, 4096);
 +    CreateCircularBuffer(program, cores, indices_config);
++    CircularBufferConfig flags_config(
++        2048, {{tt::CBIndex::c_2, tt::DataFormat::Float16_b}});
++    flags_config.set_page_size(tt::CBIndex::c_2, 2048);
++    CreateCircularBuffer(program, cores, flags_config);
 +
 +    std::vector<uint32_t> compile_args = {
 +        batch_size, pages_per_slice, num_workers, tile_bytes};
 +    TensorAccessorArgs(inputs.state_pool.buffer()).append_to(compile_args);
 +    TensorAccessorArgs(inputs.state_indices.buffer()).append_to(compile_args);
++    TensorAccessorArgs(inputs.has_initial_state.buffer()).append_to(compile_args);
 +    TensorAccessorArgs(inputs.output.buffer()).append_to(compile_args);
 +
 +    auto kernel = CreateKernel(
@@ -572,6 +605,7 @@ index 0000000000..62ef7237bf
 +            program, kernel, core,
 +            {worker, inputs.state_pool.buffer()->address(),
 +             inputs.state_indices.buffer()->address(),
++             inputs.has_initial_state.buffer()->address(),
 +             inputs.output.buffer()->address()});
 +    }
 +
@@ -594,7 +628,8 @@ index 0000000000..62ef7237bf
 +            cached.program, cached.shared_variables.kernel_id, core);
 +        args[1] = inputs.state_pool.buffer()->address();
 +        args[2] = inputs.state_indices.buffer()->address();
-+        args[3] = inputs.output.buffer()->address();
++        args[3] = inputs.has_initial_state.buffer()->address();
++        args[4] = inputs.output.buffer()->address();
 +    }
 +}
 +
@@ -606,22 +641,24 @@ index 0000000000..62ef7237bf
 +Tensor state_pool_gather(
 +    const Tensor& state_pool,
 +    const Tensor& state_indices,
++    const Tensor& has_initial_state,
 +    const Tensor& output) {
 +    using Op = prim::StatePoolGatherOperation;
 +    return device_operation::launch<Op>(
 +        {},
 +        {.state_pool = state_pool,
 +         .state_indices = state_indices,
++         .has_initial_state = has_initial_state,
 +         .output = output});
 +}
 +
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_gather.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_gather.hpp
 new file mode 100644
-index 0000000000..c8672a6a47
+index 0000000000..621fb4e152
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_gather.hpp
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,16 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -634,6 +671,7 @@ index 0000000000..c8672a6a47
 +Tensor state_pool_gather(
 +    const Tensor& state_pool,
 +    const Tensor& state_indices,
++    const Tensor& has_initial_state,
 +    const Tensor& output);
 +
 +}  // namespace ttnn::transformer

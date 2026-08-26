@@ -2,28 +2,50 @@
 
 Updated: 2026-08-25 (America/Los_Angeles)
 
-## Experimental branch notice
+## Final direct-state outcome
 
-This branch intentionally overlays a TTNN-like direct-state implementation on
-top of the validated indexed implementation. The fused TTNN operation receives
-a batch-sized recurrent state tensor directly and mutates it in place; TT-MLIR
-handles the state-pool gather and update around that operation. No additional
-SGLang-JAX model changes are required.
+The real-weight divergence is fixed on this branch. The final design keeps the
+known-correct indexed state-pool contract at the JAX and TT-MLIR boundary, but
+uses a TTNN-style direct state internally to the runtime operation:
 
-This variant is published for comparison and follow-up, not as the correctness
-candidate. Its focused three-step hardware numerical probe passed, and its
-steady real-weight decode rate was `13.35` to `13.48` token/s. The
-exported overlays rebuilt from the branch in `767.182 s` (`931` actions); the
-immediate incremental rebuild took `0.313 s`. However, the
-four-token real-weight oracle returned `[11751, 13, 198, 32]` (`" Paris.\nA"`)
-instead of `[11751, 13, 198, 760]` (`" Paris.\nThe"`). The TT-Metal compute
-kernel was identical to the indexed version, isolating the unresolved issue to
-direct-state plumbing or trace lifetime. Use
-`agent/qwen35-9b-upstream-decode-op` for correct output. All remaining
-correctness and benchmark results below describe that validated parent unless
-explicitly labeled as direct-state results.
+1. gather the selected recurrent-state slot into a batch-sized FP32 tensor;
+2. run the direct-state gated-delta kernel, mutating that tensor in place;
+3. scatter the updated tensor back into the state pool.
 
-## Validated parent outcome
+The direct alias never escapes the runtime operation into MLIR SSA or trace
+outputs. This is the key difference from the earlier experimental version. Its
+recorded trace retained an unsafe external direct-state lifetime: small focused
+programs could pass, while full-model capture/replay corrupted recurrent state
+and diverged after a few tokens. Keeping the proven state-pool interface makes
+the persistent trace boundary explicit while preserving the smaller TTNN
+kernel. No additional SGLang-JAX changes are required.
+
+The gather kernel also consumes `has_initial_state`. A false mask zeros the
+direct state instead of reading a stale pool slot; a true mask gathers the
+indexed continuing state.
+
+Final real-weight validation at revision
+`c202236235762e1c871ad0ccb60c8ee5ba337b9a`:
+
+- cold oracle token IDs: `[11751, 13, 198, 760]`; text: `" Paris.\nThe"`
+- cached replay token IDs: `[11751, 13, 198, 760]`; identical text
+- cached four-token request: `2.4816 s` end to end
+- warm 32-token request: `4.2523 s` end to end, including prefill
+- steady decode intervals: `13.83` to `13.86` token/s
+- final cold request, including compilation: `342.0885 s`
+
+Focused hardware validation:
+
+- 24-layer traced versus untraced chain: bit-exact outputs and recurrent states
+  for three consecutive advances
+- fresh-state mask versus NumPy: recurrent max error `1.65e-4`, output max
+  error `3.81e-6`, output correlation `0.999983`
+- final plugin build: passed in `91.150 s` with `1,417` action-cache hits
+
+The indexed parent remains a useful correctness baseline and is summarized
+below.
+
+## Validated indexed parent outcome (historical baseline)
 
 Qwen3.5-9B now decodes correctly and quickly on the P150. The default compiler
 path uses the repaired `ttnn.gated_delta_decode` fusion for all 24 recurrent
@@ -77,6 +99,7 @@ New implementation patches:
 - `third_party/tt_metal/gated_delta_decode_raw_gating.patch`
 - `third_party/tt_metal/causal_conv1d_update.patch`
 - `third_party/tt_metal/state_pool_update.patch`
+- `third_party/tt_metal/gated_delta_decode_direct_state.patch`
 - `third_party/tt_xla/tt_mlir_dynamic_slice_index_type.patch`
 - `third_party/tt_xla/tt_mlir_fuse_gated_delta_rule.patch`
 - `third_party/tt_xla/tt_mlir_normalization_fusions.patch`
@@ -84,6 +107,7 @@ New implementation patches:
 - `third_party/tt_xla/tt_mlir_trace_preserve_output_aliases.patch`
 - `third_party/tt_xla/tt_mlir_fuse_matmul_swiglu_dtype_guard.patch`
 - `third_party/tt_xla/tt_mlir_paged_update_cache_row_major.patch`
+- `third_party/tt_xla/tt_mlir_gated_delta_decode_internal_direct_state.patch`
 
 A local untracked `tt_mlir_safe_gdn_decode_fusion_default.patch` may exist as a
 historical artifact, but it is intentionally excluded from this branch and
@@ -251,24 +275,34 @@ curl http://127.0.0.1:32000/generate \
 The first request incurs compilation. Measure warm throughput with repeated
 requests of the same padded shape and `ignore_eos=true`.
 
-## Current-main implementation decision
+## Direct-state implementation decision
 
-A TTNN-upstream-style direct-state variant was implemented and tested before
-finalizing this branch. It removed the explicit recurrent-state gather/update
-from the fused operation and mutated a gathered state tensor in place. The
-direct kernel compute program was instruction-for-instruction identical to the
-indexed kernel; only state reader/writer plumbing differed. Its focused
-three-step numerical probe passed, but real-weight greedy decoding diverged on
-token four (`32`, `"A"`) instead of the oracle (`760`, `"The"`). The
-failure was isolated to the state plumbing/lifetime path rather than the
-compute math, although the exact direct-state root cause was not proven.
+The first TTNN-upstream-style attempt exposed the batch-sized direct state as a
+public fused-op operand and mutated it across trace capture and replay. The
+compute kernel itself was identical to the indexed kernel, and isolated
+three-step probes passed, but full real-weight decoding returned token `32`
+instead of `760`. Explicitly returning the state alias and several capture,
+restore, and warm-replay variants changed the wrong tokens without restoring
+correctness. A second fresh request also failed on its first token, proving that
+the recorded external direct-state graph itself was unsafe.
 
-The production branch therefore keeps the indexed fused operation: recurrent
-state indices are inputs to the kernel, the state pool is updated in place, and
-SGLang-JAX only needs the small compatibility/test-harness patch. This path is
-exact on real weights and sustains about 14 token/s. Adopting direct state later
-should wait for an upstream state-cache/lifetime contract that makes the large
-recurrent buffers persistent across trace capture and replay.
+The final composite removes that unsafe contract. Public MLIR remains indexed;
+TTNN performs gather, direct mutation, and scatter entirely inside one runtime
+operation. This is both smaller and safer than teaching JAX, SGLang-JAX, MLIR
+alias analysis, and trace ownership about a new persistent direct-state value.
+It also retains essentially all performance: `13.83` to `13.86` token/s versus
+about `14` token/s for the indexed baseline.
+
+The active overlays are:
+
+- `third_party/tt_metal/gated_delta_decode_direct_state.patch`
+- `third_party/tt_xla/tt_mlir_gated_delta_decode_internal_direct_state.patch`
+- the existing allocation-state and output-alias trace repairs
+
+The superseded public direct-SSA and scratch trace overlays are intentionally
+not registered in `MODULE.bazel` and were removed from the branch. Recoverable
+copies from this session are in
+`/tmp/libtt-superseded-direct-overlays-20260825`.
 
 ## Remaining optional work
 
