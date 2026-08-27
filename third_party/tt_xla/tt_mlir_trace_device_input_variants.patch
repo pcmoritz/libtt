@@ -1,0 +1,231 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+index 3ce51a23..cd2f8a4b 100644
+--- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+@@ -15,13 +15,15 @@ namespace tt::runtime::ttnn {
+
+ struct TraceVariant {
+   ::ttnn::MeshTraceId traceId;
++  /// Persistent input slots this trace was captured against. Device-resident
++  /// inputs are the caller's buffers, so they also identify which invocations
++  /// can replay this variant.
++  std::vector<::tt::runtime::Tensor> inputTensors;
++  /// Persistent output slots this trace was captured against.
++  std::vector<::tt::runtime::Tensor> outputTensors;
+ };
+
+ struct TraceData {
+-  /// Input tensor buffers shared by every replay-safe variant.
+-  std::vector<::tt::runtime::Tensor> inputTensors;
+-  /// Output tensor buffers shared by every replay-safe variant.
+-  std::vector<::tt::runtime::Tensor> outputTensors;
+   /// Traces with distinct capture-time allocation footprints.
+   std::vector<TraceVariant> variants;
+ };
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+index 99dd4eca..21be10f6 100644
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -224,7 +224,9 @@ static TraceVariant captureTrace(
+   TraceVariant variant{
+       .traceId = ::ttnn::MeshTraceId(
+           ::tt::runtime::ttnn::utils::getScalarFromTensor<uint32_t>(
+-              traceIdTensor))};
++              traceIdTensor)),
++      .inputTensors = inputSlots,
++      .outputTensors = outputSlots};
+
+   // The capture program replays the trace once, so the output slots already
+   // hold this invocation's results.
+@@ -234,11 +236,11 @@ static TraceVariant captureTrace(
+ }
+
+ static void executeTrace(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+-                         ProgramContext &context, TraceData &traceData,
+-                         const TraceVariant &variant) {
++                         ProgramContext &context,
++                         TraceVariant &variant) {
+   ::tt::runtime::Device deviceHandle = context.getDeviceHandle();
+
+-  updateTraceInputSlots(op, context, traceData.inputTensors);
++  updateTraceInputSlots(op, context, variant.inputTensors);
+
+   ::ttnn::Tensor traceIdTensor =
+       ::tt::runtime::ttnn::utils::createTTNNTensor<uint32_t>(
+@@ -257,7 +259,37 @@ static void executeTrace(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+                            /*programSemaphoreInputs=*/{});
+   executor.execute();
+
+-  publishTraceOutputs(op, context, traceData.outputTensors);
++  publishTraceOutputs(op, context, variant.outputTensors);
++}
++
++// A device-resident trace input is captured by address, unlike a host input
++// whose current value is copied into a persistent slot before replay. A trace
++// variant can therefore only be reused when each device input is the same
++// runtime tensor it was captured with. In particular, donated KV-cache calls
++// may use the same executable with different cache buffers; replaying the old
++// trace would mutate the old buffer while the enclosing program returns the
++// new one.
++static bool deviceInputsMatch(
++    const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
++    ProgramContext &context, const TraceVariant &variant) {
++  LOG_ASSERT(op->inputs()->size() == variant.inputTensors.size(),
++             "Mismatched number of trace inputs");
++  for (size_t i = 0; i < op->inputs()->size(); ++i) {
++    const ::tt::target::ttnn::TensorRef *input = op->inputs()->Get(i);
++    if (!::tt::runtime::ttnn::utils::inDeviceMemory(input)) {
++      continue;
++    }
++    const ::ttnn::Tensor &current =
++        context.getTensorPool().getTTNNTensorAndValidate(input);
++    const ::ttnn::Tensor &captured =
++        variant.inputTensors[i]
++            .as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN)
++            .getTensor();
++    if (current.mesh_buffer().address() != captured.mesh_buffer().address()) {
++      return false;
++    }
++  }
++  return true;
+ }
+
+ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -295,10 +323,9 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+     // the execute path establish the slots identically.
+     updateTraceInputSlots(op, context, inputSlots,
+                           /*deviceResidentOnly=*/true);
+-    TraceData traceData{.inputTensors = std::move(inputSlots),
+-                        .outputTensors = std::move(outputSlots)};
+-    traceData.variants.push_back(captureTrace(
+-        op, context, traceData.inputTensors, traceData.outputTensors));
++    TraceData traceData;
++    traceData.variants.push_back(
++        captureTrace(op, context, inputSlots, outputSlots));
+     traceCache->insert(mainProgramKey, captureExecuteKey, std::move(traceData));
+
+     debug::Stats::get().incrementStat("TraceCacheMiss");
+@@ -312,12 +339,13 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+   auto variantIt = std::find_if(
+       traceData->variants.rbegin(), traceData->variants.rend(),
+       [&](const TraceVariant &variant) {
+-        return meshDevice.is_mesh_trace_replay_safe(variant.traceId);
++        return deviceInputsMatch(op, context, variant) &&
++               meshDevice.is_mesh_trace_replay_safe(variant.traceId);
+       });
+
+   if (variantIt != traceData->variants.rend()) {
+     LOG_DEBUG("Trace variant cache hit, executing trace directly");
+-    executeTrace(op, context, *traceData, *variantIt);
++    executeTrace(op, context, *variantIt);
+     // Keep variants ordered from least- to most-recently used so front
+     // eviction removes the coldest trace.
+     std::rotate(variantIt.base() - 1, variantIt.base(),
+@@ -326,12 +354,28 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+     return;
+   }
+
+-  // No cached trace has a footprint disjoint from the current live buffers.
+-  // Capture against the existing persistent slots and keep prior variants so
+-  // recurring allocation patterns do not ping-pong through a recapture.
+-  LOG_DEBUG("No trace variant is safe for the current allocations; capturing ",
+-            "a new variant (cached variants: ", traceData->variants.size(),
+-            ")");
++  // No cached trace both targets the current device-resident buffers and has
++  // a safe allocation footprint. Reuse slots from a matching, stale variant;
++  // otherwise allocate a slot set bound to the current device inputs.
++  LOG_DEBUG("No matching trace variant is safe; capturing a new variant ",
++            "(cached variants: ", traceData->variants.size(), ")");
++  auto matchingIt = std::find_if(
++      traceData->variants.rbegin(), traceData->variants.rend(),
++      [&](const TraceVariant &variant) {
++        return deviceInputsMatch(op, context, variant);
++      });
++  std::vector<::tt::runtime::Tensor> inputSlots;
++  std::vector<::tt::runtime::Tensor> outputSlots;
++  if (matchingIt != traceData->variants.rend()) {
++    inputSlots = matchingIt->inputTensors;
++    outputSlots = matchingIt->outputTensors;
++  } else {
++    std::vector<::tt::runtime::Tensor> slots = allocateTraceSlots(op, context);
++    size_t numInputSlots = op->inputs()->size();
++    inputSlots.assign(slots.begin(), slots.begin() + numInputSlots);
++    outputSlots.assign(slots.begin() + numInputSlots, slots.end());
++  }
++
+   constexpr size_t kMaxTraceVariants = 8;
+   if (traceData->variants.size() == kMaxTraceVariants) {
+     ::ttnn::operations::trace::release_trace(
+@@ -339,10 +383,10 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+     traceData->variants.erase(traceData->variants.begin());
+   }
+
+-  updateTraceInputSlots(op, context, traceData->inputTensors,
++  updateTraceInputSlots(op, context, inputSlots,
+                         /*deviceResidentOnly=*/true);
+-  traceData->variants.push_back(captureTrace(
+-      op, context, traceData->inputTensors, traceData->outputTensors));
++  traceData->variants.push_back(
++      captureTrace(op, context, inputSlots, outputSlots));
+
+   debug::Stats::get().incrementStat("TraceStaleRecapture");
+ }
+diff --git a/runtime/test/ttnn/python/n150/test_trace.py b/runtime/test/ttnn/python/n150/test_trace.py
+--- a/runtime/test/ttnn/python/n150/test_trace.py
++++ b/runtime/test/ttnn/python/n150/test_trace.py
+@@ -199,6 +199,53 @@ def test_trace_matmul_multiply_no_consteval(
+
+     ttrt.runtime.DebugStats.get().clear()
+     helper.teardown()
+
+
++@pytest.mark.parametrize("trace_region_size", [0, 80000])
++def test_trace_device_input_buffer_variants(helper: Helper, request, trace_region_size):
++    """A trace is only reusable with the device buffers it captured."""
++    binary_path = os.path.join(
++        FLATBUFFER_BASE_PATH, "matmul_multiply_no_consteval.mlir.tmp.ttnn"
++    )
++    assert os.path.exists(binary_path), f"Binary file not found: {binary_path}"
++    helper.initialize(request.node.name, binary_path)
++    helper.check_constraints()
++
++    config = ProgramTestConfig(
++        name="matmul_multiply",
++        expected_num_inputs=3,
++        compute_golden=lambda inputs: ((inputs[0] @ inputs[1]) * inputs[2]),
++        description="Traced graph invoked with distinct device input buffers",
++    )
++    runner = ProgramTestRunner(config, helper.binary, 0)
++    debug_stats = ttrt.runtime.DebugStats.get()
++    debug_stats.clear()
++
++    with DeviceContext(
++        mesh_shape=[1, 1],
++        enable_program_cache=True,
++        trace_region_size=trace_region_size,
++    ) as device:
++        first_inputs, first_golden, _first_inputs_torch = (
++            runner.get_inputs_and_golden(device)
++        )
++        second_inputs, second_golden, _second_inputs_torch = (
++            runner.get_inputs_and_golden(device)
++        )
++
++        runner.run_program_and_compare_golden(device, first_inputs, first_golden)
++        assert debug_stats.get_stat("TraceCacheMiss") == 1
++
++        # The executable and trace-cache key are unchanged, but its parameter
++        # buffers are not. Replaying the first trace would read and write the
++        # first invocation's addresses, so capture a variant for the second
++        # buffer set instead.
++        runner.run_program_and_compare_golden(device, second_inputs, second_golden)
++        assert debug_stats.get_stat("TraceStaleRecapture") == 1
++        assert debug_stats.get_stat("ExecutedTrace") == 0
++
++    debug_stats.clear()
++    helper.teardown()
++
++
+ @pytest.mark.parametrize("trace_region_size", [0, 80000])
+ def test_trace_memory_overwrite_multi_graph(helper: Helper, request, trace_region_size):
+     """

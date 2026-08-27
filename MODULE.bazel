@@ -441,6 +441,7 @@ git_repository(
         # Keep all StableHLO scatter conversion changes in one patch.
         "//third_party/tt_xla:tt_mlir_scatter.patch",
         "//third_party/tt_xla:tt_mlir_validate_trace_allocation_state.patch",
+        "//third_party/tt_xla:tt_mlir_trace_device_input_variants.patch",
         "//third_party/tt_xla:tt_mlir_emitc_incomplete_type.patch",
         "//third_party/tt_xla:tt_mlir_row_major_stop_fixup.patch",
         "//third_party/tt_xla:tt_mlir_preserve_explicit_compute_config.patch",
