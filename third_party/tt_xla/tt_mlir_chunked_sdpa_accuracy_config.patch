@@ -1,0 +1,34 @@
+diff --git a/runtime/lib/ttnn/operations/transformer/chunked_scaled_dot_product_attention.cpp b/runtime/lib/ttnn/operations/transformer/chunked_scaled_dot_product_attention.cpp
+--- a/runtime/lib/ttnn/operations/transformer/chunked_scaled_dot_product_attention.cpp
++++ b/runtime/lib/ttnn/operations/transformer/chunked_scaled_dot_product_attention.cpp
+@@ -42,8 +42,29 @@ static void runChunkedScaledDotProductAttentionOp(
++  // TTNN otherwise defaults to approximate exponentiation. Use the fixed
++  // page-aligned program configuration used by upstream flexible chunked SDPA.
++  if (!programConfig) {
++    const std::size_t pageSize = key.logical_shape()[2];
++    const std::size_t chunkSize = pageSize < 128 ? pageSize : 128;
++    programConfig =
++        ::ttnn::operations::transformer::SDPAProgramConfig{
++            .compute_with_storage_grid_size =
++                query.device()->compute_with_storage_grid_size(),
++            .sub_core_grids = std::nullopt,
++            .q_chunk_size = chunkSize,
++            .k_chunk_size = chunkSize,
++            .exp_approx_mode = false};
++  }
++
++  auto computeKernelConfig = ::ttnn::init_device_compute_kernel_config(
++      query.device()->arch(), std::nullopt,
++      ::tt::tt_metal::MathFidelity::HiFi4,
++      /*default_approx_mode=*/false, /*default_fp32_acc=*/true,
++      /*default_l1_acc=*/true);
++
+   ::ttnn::Tensor out =
+       ::ttnn::transformer::chunked_scaled_dot_product_attention(
+           query, key, value, pageTable, chunkStartIdx, scale,
+           outputMemoryConfig,
+           /*program_config=*/programConfig,
+-          /*compute_kernel_config=*/std::nullopt);
++          /*compute_kernel_config=*/computeKernelConfig);
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }

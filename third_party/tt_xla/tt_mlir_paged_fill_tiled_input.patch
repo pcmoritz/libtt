@@ -1,0 +1,19 @@
+diff --git a/runtime/lib/ttnn/operations/kv_cache/paged_fill_cache.cpp b/runtime/lib/ttnn/operations/kv_cache/paged_fill_cache.cpp
+--- a/runtime/lib/ttnn/operations/kv_cache/paged_fill_cache.cpp
++++ b/runtime/lib/ttnn/operations/kv_cache/paged_fill_cache.cpp
+@@ -10,3 +10,4 @@
+ #include "tt/runtime/workarounds.h"
+ #include "ttnn/distributed/api.hpp"
+ #include "ttnn/distributed/distributed_tensor.hpp"
++#include "ttnn/operations/core/to_layout/to_layout_op.hpp"
+@@ -18,4 +19,9 @@ void run(const ::tt::target::ttnn::PagedFillCacheOp *op,
+   const ::ttnn::Tensor &cacheTensor =
+       context.getTensorPool().getTTNNTensorAndValidate(op->cache());
+-  const ::ttnn::Tensor &inputTensor =
++  const ::ttnn::Tensor &serializedInputTensor =
+       context.getTensorPool().getTTNNTensorAndValidate(op->input());
++  // TT-Metal's paged-fill reader consumes tiled input. Layout propagation may
++  // choose row-major for this no-result sink op, so enforce the operation's
++  // runtime precondition here rather than exposing it to callers.
++  const ::ttnn::Tensor inputTensor = ::ttnn::to_layout(
++      serializedInputTensor, ::ttnn::Layout::TILE);
