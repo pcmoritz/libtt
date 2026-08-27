@@ -1,0 +1,15 @@
+diff --git a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
+--- a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
++++ b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
+@@ -16,6 +16,11 @@ void run(const ::tt::target::ttnn::BeginTraceCaptureOp *op,
+   LOG_ASSERT(meshDevice.get_program_cache().is_enabled(),
+              "Program cache must be enabled");
+ 
++  // The capture program first executes the workload uncaptured to populate the
++  // program cache. Drain that work before switching the command queue into
++  // bypass mode; otherwise outstanding commands can race trace capture.
++  meshDevice.mesh_command_queue(op->cq_id()).finish();
++
+   ::ttnn::MeshTraceId traceId =
+       ::ttnn::operations::trace::begin_trace_capture(&meshDevice, ttnnCqId);
+   ::ttnn::Tensor traceIdTensor =

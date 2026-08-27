@@ -1,0 +1,72 @@
+diff --git a/runtime/lib/ttnn/types/layout_converter.cpp b/runtime/lib/ttnn/types/layout_converter.cpp
+--- a/runtime/lib/ttnn/types/layout_converter.cpp
++++ b/runtime/lib/ttnn/types/layout_converter.cpp
+@@ -8,1 +8,7 @@
+ #include "tt/runtime/detail/ttnn/utils.h"
++
++#include <tt-metalium/constants.hpp>
++
++#include <algorithm>
++#include <cstdint>
++#include <limits>
+@@ -10,4 +16,42 @@
+ namespace tt::runtime::ttnn {
++namespace {
++
++bool shouldInitializeZeroOnDevice(const ::ttnn::Tensor &input) {
++  const auto &spec = input.tensor_spec();
++  const size_t pageSize = spec.compute_page_size_bytes();
++  if (pageSize == 0) {
++    return false;
++  }
++
++  const size_t rowMajorPages =
++      spec.compute_packed_buffer_size_bytes() / pageSize;
++  const auto &shape = spec.physical_shape();
++  constexpr size_t tileHeight = tt::constants::TILE_HEIGHT;
++  constexpr size_t tileWidth = tt::constants::TILE_WIDTH;
++  const size_t tilePages = ((shape.height() + tileHeight - 1) / tileHeight) *
++                           ((shape.width() + tileWidth - 1) / tileWidth);
++
++  // H2D commands use a 16-bit page index. Avoid scanning ordinary tensors;
++  // only transfers that exceed that range and become smaller when tiled can
++  // benefit from direct device initialization.
++  constexpr size_t maxTransferPageIndex =
++      std::numeric_limits<std::uint16_t>::max();
++  if (rowMajorPages <= maxTransferPageIndex || tilePages >= rowMajorPages) {
++    return false;
++  }
++
++  bool allZero = true;
++  input.host_tensor().buffer().apply([&](const auto &shard) {
++    const auto bytes = shard.view_bytes();
++    allZero = allZero &&
++              std::all_of(bytes.begin(), bytes.end(), [](std::byte value) {
++                return value == std::byte{0};
++              });
++  });
++  return allZero;
++}
++
++} // namespace
+ 
+ LayoutConverter::LayoutConverter(const LayoutDesc &inputDesc,
+                                  const LayoutDesc &outputDesc)
+@@ -122,5 +166,17 @@
+     return out;
+   }
+ 
++  if (shouldTilize && outputDesc.memoryConfig.has_value() &&
++      (outputDesc.dataType == ::ttnn::DataType::BFLOAT16 ||
++       outputDesc.dataType == ::ttnn::DataType::FLOAT32 ||
++       outputDesc.dataType == ::ttnn::DataType::BFLOAT8_B) &&
++      shouldInitializeZeroOnDevice(input)) {
++    LOG_ASSERT(targetDevice.has_value());
++    ::ttnn::Tensor out = ::ttnn::empty(
++        input.logical_shape(), outputDesc.dataType, ::ttnn::Layout::TILE,
++        &(targetDevice.value().get()), outputDesc.memoryConfig.value());
++    return ::ttnn::fill(out, 0.0f, outputDesc.memoryConfig);
++  }
++
+   if (shouldTilize &&
+       utils::canTilizeOnDevice(outputDesc.dataType, outputDesc.memoryConfig)) {

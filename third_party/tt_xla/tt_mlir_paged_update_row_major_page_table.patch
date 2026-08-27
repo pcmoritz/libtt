@@ -1,0 +1,82 @@
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedUpdateCacheOpRewritePattern.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedUpdateCacheOpRewritePattern.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedUpdateCacheOpRewritePattern.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedUpdateCacheOpRewritePattern.cpp
+@@ -16,9 +16,11 @@
+ 
+ // This rewrite pattern applies a specific memory config to the input tensor
+ // (fill value) of the ttnn.paged_update_cache op. The input must be height
+-// sharded, and must fit onto an exact number of rows in the physical grid.
++// sharded, and must fit onto an exact number of rows in the physical grid. The
++// update index and page table must be row major for the TTNN kernel.
+ LogicalResult PagedUpdateCacheOpRewritePattern::matchAndRewrite(
+     ttnn::PagedUpdateCacheOp op, PatternRewriter &rewriter) const {
++  bool modified = false;
+ 
+   RankedTensorType inputType =
+       mlir::cast<RankedTensorType>(op.getInput().getType());
+@@ -48,22 +50,53 @@
+   ttnn::TTNNLayoutAttr currentInputLayout =
+       mlir::dyn_cast_or_null<ttnn::TTNNLayoutAttr>(
+           op.getInput().getType().getEncoding());
+-  // No-op if input already has the desired layout (e.g. optimizer set it).
+-  if (currentInputLayout == desiredInputLayout) {
+-    return failure();
+-  }
+ 
+   // Apply ToTensorSpecOp to convert the input tensor to the desired layout.
+-  RankedTensorType memoryConfigedInputType =
+-      inputType.cloneWithEncoding(desiredInputLayout);
+-  auto toTensorSpecOp = rewriter.create<ttnn::ToTensorSpecOp>(
+-      op.getLoc(), memoryConfigedInputType, op.getInput());
++  Value input = op.getInput();
++  if (currentInputLayout != desiredInputLayout) {
++    RankedTensorType memoryConfigedInputType =
++        inputType.cloneWithEncoding(desiredInputLayout);
++    input = rewriter
++                .create<ttnn::ToTensorSpecOp>(op.getLoc(),
++                                              memoryConfigedInputType, input)
++                .getResult();
++    modified = true;
++  }
++
++  auto convertToRowMajor = [&](Value value,
++                               llvm::StringRef locSuffix) -> Value {
++    auto typedValue = mlir::cast<mlir::TypedValue<RankedTensorType>>(value);
++    ttnn::TTNNLayoutAttr layout =
++        ttnn::utils::getLayoutAttrFromTensor(typedValue.getType());
++    if (layout.getLayout() == Layout::RowMajor) {
++      return value;
++    }
++
++    modified = true;
++    return ttnn::utils::createToTensorSpecOp(
++               op.getOperation(), typedValue, rewriter, Layout::RowMajor,
++               layout.getBufferType(), layout.getMemLayout(),
++               layout.getDataType(), locSuffix)
++        .getResult();
++  };
++
++  Value updateIndex =
++      convertToRowMajor(op.getUpdateIndex(), "_update_index_row_major");
++  Value pageTable = op.getPageTable();
++  if (pageTable) {
++    pageTable = convertToRowMajor(pageTable, "_page_table_row_major");
++  }
++
++  // No-op if the optimizer already chose all required layouts.
++  if (!modified) {
++    return failure();
++  }
+ 
+-  // Replace the original PagedUpdateCacheOp with one which takes our properly
+-  // configured input tensor.
++  // Replace the original PagedUpdateCacheOp with one which takes operands in
++  // the layouts required by the TTNN kernel.
+   auto pagedUpdateCacheOp = rewriter.create<ttnn::PagedUpdateCacheOp>(
+-      op.getLoc(), op.getCache(), toTensorSpecOp.getResult(),
+-      op.getUpdateIndex(), op.getShareCache(), op.getPageTable());
++      op.getLoc(), op.getCache(), input, updateIndex, op.getShareCache(),
++      pageTable);
+ 
+   rewriter.replaceOp(op, pagedUpdateCacheOp);
+   return success();
