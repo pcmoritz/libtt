@@ -1,0 +1,578 @@
+diff --git a/pjrt_implementation/inc/api/buffer_instance.h b/pjrt_implementation/inc/api/buffer_instance.h
+--- a/pjrt_implementation/inc/api/buffer_instance.h
++++ b/pjrt_implementation/inc/api/buffer_instance.h
+@@ -158,6 +158,14 @@
+                                     MemoryInstance *dst_memory,
+                                     BufferInstance **dst_buffer);
+
++  // Copies this buffer into a new shape, optionally permuting its dimensions.
++  tt_pjrt_status copyToDeviceMemory(
++      DeviceInstance *dst_device, MemoryInstance *dst_memory,
++      const std::int64_t *dst_dimensions, size_t dst_num_dimensions,
++      const std::int64_t *dimension_permutation,
++      size_t permutation_size,
++      BufferInstance **dst_buffer);
++
+   // Sets that buffer data is ready (transferred from host or computed on
+   // device) and marks data ready event as ready (if it is already created).
+   void markAsDataReady();
+@@ -196,10 +204,10 @@
+                  PJRT_Buffer_Type data_type,
+                  std::optional<uint32_t> device_id = std::nullopt);
+
+-  // Copies the tensor inside the src_buffer to the tensor of this buffer.
+-  // Currently only used for device to device transfer in copy construction
+-  // of new buffer instance.
+-  void copyFromBuffer(BufferInstance *src_buffer);
++  // Copies src_buffer into this buffer's independent host backing store.
++  void copyFromBuffer(BufferInstance *src_buffer,
++                      const std::int64_t *dimension_permutation = nullptr,
++                      size_t permutation_size = 0);
+
+   // Calculates required tensor shape.
+   static std::vector<std::uint32_t> calculateShape(const std::int64_t *dims,
+@@ -262,13 +270,12 @@
+   // Mutex guarding buffer data deletion.
+   std::mutex m_data_deleted_mutex;
+
+-  // Thread for copying data to host.
+-  std::thread m_copy_to_host_thread;
++  // Worker for asynchronous buffer materialization or host copies.
++  std::thread m_data_thread;
+
+-  // Mutex guarding thread spawning for copying data to host.
+-  // Prevents multiple threads from concurrently copying into the same
+-  // BufferInstance.
+-  std::mutex m_copy_to_host_thread_mutex;
++  // Serializes access to m_data_thread and joins it before data is consumed or
++  // destroyed.
++  std::mutex m_data_thread_mutex;
+
+   // Mutex guarding internal copy to host operation on the same mesh device
+   // Metal+Program Cache is not thread safe when untilizing on device, so
+diff --git a/pjrt_implementation/inc/api/executable_image.h b/pjrt_implementation/inc/api/executable_image.h
+--- a/pjrt_implementation/inc/api/executable_image.h
++++ b/pjrt_implementation/inc/api/executable_image.h
+@@ -14,6 +14,7 @@
+ // c++ standard library includes
+ #include <cstddef>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <vector>
+
+@@ -31,6 +32,13 @@
+
+ namespace tt::pjrt {
+
++// Describes an output that PJRT can materialize directly from a host-resident
++// input. An empty permutation is an ordinary shape-preserving copy.
++struct HostCopyOutput {
++  size_t input_index;
++  std::vector<std::int64_t> dimension_permutation;
++};
++
+ // Represents compiled image containing all the required information for its
+ // execution.
+ class ExecutableImage {
+@@ -81,6 +89,16 @@
+     m_donatable_input_indices = std::move(indices);
+   }
+
++  // Returns the host-side copy operation for each output, when the whole graph
++  // can bypass device execution.
++  const std::optional<std::vector<HostCopyOutput>> &getHostCopyOutputs() const {
++    return m_host_copy_outputs;
++  }
++
++  void setHostCopyOutputs(std::vector<HostCopyOutput> &&outputs) {
++    m_host_copy_outputs = std::move(outputs);
++  }
++
+   // Returns the vector of output data types.
+   std::vector<PJRT_Buffer_Type> &getOutputTypes() { return m_output_types; }
+
+@@ -212,6 +230,9 @@
+   // Input indices carrying JAX's tf.aliasing_output attribute.
+   std::vector<size_t> m_donatable_input_indices;
+
++  // Host-side operations for graphs that need no device execution.
++  std::optional<std::vector<HostCopyOutput>> m_host_copy_outputs;
++
+   // Holds data type for each output buffer.
+   std::vector<PJRT_Buffer_Type> m_output_types;
+
+diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
+--- a/pjrt_implementation/src/api/buffer_instance.cc
++++ b/pjrt_implementation/src/api/buffer_instance.cc
+@@ -145,9 +145,9 @@
+   }
+
+   {
+-    const std::lock_guard<std::mutex> copy_lock(m_copy_to_host_thread_mutex);
+-    if (m_copy_to_host_thread.joinable())
+-      m_copy_to_host_thread.join();
++    const std::lock_guard<std::mutex> data_lock(m_data_thread_mutex);
++    if (m_data_thread.joinable())
++      m_data_thread.join();
+   }
+
+   m_data_deleted = true;
+@@ -342,31 +342,78 @@
+   *out_done_with_host_buffer_event = done_with_host_buffer_event.release();
+ }
+
+-void BufferInstance::copyFromBuffer(BufferInstance *src_buffer) {
++void BufferInstance::copyFromBuffer(
++    BufferInstance *src_buffer, const std::int64_t *dimension_permutation,
++    size_t permutation_size) {
+   DLOG_F(LOG_DEBUG, "BufferInstance::copyFromBuffer");
+   TT_FATAL(src_buffer->getPjrtTensor(), "Source buffer has no data.");
++  TT_FATAL(m_data_type == src_buffer->m_data_type,
++           "Source and destination buffer types must match");
++  TT_FATAL(logicalTensorSize() == src_buffer->logicalTensorSize(),
++           "Source and destination buffer sizes must match");
+
+   ::tt::target::DataType runtime_data_type =
+-      tt::pjrt::data_type_utils::convertPJRTToRuntimeDataType(
+-          src_buffer->m_data_type);
++      tt::pjrt::data_type_utils::convertPJRTToRuntimeDataType(m_data_type);
+
+   std::uint32_t element_size =
+       tt::runtime::utils::dataTypeElementSize(runtime_data_type);
+   std::vector<std::uint32_t> shape = calculateShape(
+-      src_buffer->getDimensionsRaw(), src_buffer->getNumberOfDimensions(),
+-      src_buffer->getDataType());
+-  std::vector<std::int64_t> strides = calculateStrides(
+-      src_buffer->getNumberOfDimensions(), nullptr, 0, element_size);
+-
+-  tt::runtime::Tensor runtime_tensor = tt::runtime::createOwnedHostTensor(
+-      /* data= */ nullptr, shape, strides, element_size, runtime_data_type);
+-
++      getDimensionsRaw(), getNumberOfDimensions(), getDataType());
+   src_buffer->getPjrtTensor()->move_to_host();
+-  tt::runtime::memcpy(runtime_tensor, src_buffer->runtimeTensor());
+
+-  PjrtTensor::from_runtime_tensor({this}, std::move(runtime_tensor));
++  if (permutation_size == 0) {
++    std::vector<std::int64_t> strides = calculateStrides(
++        getNumberOfDimensions(), nullptr, 0, element_size);
++    tt::runtime::Tensor runtime_tensor = tt::runtime::createOwnedHostTensor(
++        /*data=*/nullptr, shape, strides, element_size, runtime_data_type);
++    tt::runtime::memcpy(runtime_tensor, src_buffer->runtimeTensor());
++    PjrtTensor::from_runtime_tensor({this}, std::move(runtime_tensor));
++    markAsDataReady();
++    return;
++  }
+
+-  markAsDataReady();
++  TT_FATAL(dimension_permutation != nullptr, "Missing dimension permutation");
++  TT_FATAL(permutation_size == getNumberOfDimensions() &&
++               permutation_size == src_buffer->getNumberOfDimensions(),
++           "Transpose rank mismatch");
++
++  std::vector<std::int64_t> input_strides(permutation_size);
++  std::vector<std::int64_t> transposed_strides(permutation_size);
++  std::vector<bool> seen(permutation_size, false);
++  std::int64_t stride = 1;
++  for (size_t i = permutation_size; i-- > 0;) {
++    input_strides[i] = stride;
++    stride *= src_buffer->getDimensionsRaw()[i];
++  }
++  for (size_t i = 0; i < permutation_size; ++i) {
++    std::int64_t source_dimension = dimension_permutation[i];
++    TT_FATAL(source_dimension >= 0 &&
++                 static_cast<size_t>(source_dimension) < permutation_size &&
++                 !seen[source_dimension],
++             "Invalid dimension permutation");
++    seen[source_dimension] = true;
++    TT_FATAL(getDimensionsRaw()[i] ==
++                 src_buffer->getDimensionsRaw()[source_dimension],
++             "Transpose dimensions do not match permutation");
++    transposed_strides[i] = input_strides[source_dimension];
++  }
++
++  std::vector<std::byte> input_data =
++      tt::runtime::getTensorDataBuffer(src_buffer->runtimeTensor());
++
++  const std::lock_guard<std::mutex> data_lock(m_data_thread_mutex);
++  TT_FATAL(!m_data_thread.joinable(), "Buffer data thread already exists");
++  m_data_thread = std::thread(
++      [this, input_data = std::move(input_data), shape = std::move(shape),
++       transposed_strides = std::move(transposed_strides), element_size,
++       runtime_data_type]() mutable {
++        tt::runtime::Tensor runtime_tensor =
++            tt::runtime::createOwnedHostTensor(
++                input_data.data(), shape, transposed_strides, element_size,
++                runtime_data_type);
++        PjrtTensor::from_runtime_tensor({this}, std::move(runtime_tensor));
++        markAsDataReady();
++      });
+ }
+
+ void BufferInstance::allocateUninitialized(const std::int64_t *byte_strides,
+@@ -438,6 +485,13 @@
+                                           EventInstance **out_copy_done_event) {
+   ZoneScoped;
+
++  // Buffer materialization may itself be asynchronous. Join it before
++  // inspecting or copying the tensor, and retain the lock while installing the
++  // copy worker so concurrent host copies remain serialized.
++  const std::lock_guard<std::mutex> data_lock(m_data_thread_mutex);
++  if (m_data_thread.joinable())
++    m_data_thread.join();
++
+   // In compile-only mode, output buffers have no associated tensor (no
+   // hardware to compute on). Zero-fill the host buffer and signal success.
+   if (!m_pjrt_tensor) {
+@@ -461,11 +515,7 @@
+   // create new thread for each shard, because tensors are moved once from
+   // device when onHost is called on a first shard. Also, creating std::thread
+   // for memcpy might be overhead with performance loss. We should measure.
+-  const std::lock_guard<std::mutex> copy_lock(m_copy_to_host_thread_mutex);
+-  if (m_copy_to_host_thread.joinable())
+-    m_copy_to_host_thread.join();
+-
+-  m_copy_to_host_thread = std::thread([=, this, e = event.get()] {
++  m_data_thread = std::thread([=, this, e = event.get()] {
+     try {
+       ZoneScopedN("CopyToHostThread");
+       const std::lock_guard<std::mutex> lock(s_copy_to_host_internal_mutex);
+@@ -512,12 +562,23 @@
+ tt_pjrt_status BufferInstance::copyToDeviceMemory(DeviceInstance *dst_device,
+                                                   MemoryInstance *dst_memory,
+                                                   BufferInstance **dst_buffer) {
++  return copyToDeviceMemory(
++      dst_device, dst_memory, getDimensionsRaw(), getNumberOfDimensions(),
++      /*dimension_permutation=*/nullptr, /*permutation_size=*/0, dst_buffer);
++}
++
++tt_pjrt_status BufferInstance::copyToDeviceMemory(
++    DeviceInstance *dst_device, MemoryInstance *dst_memory,
++    const std::int64_t *dst_dimensions, size_t dst_num_dimensions,
++    const std::int64_t *dimension_permutation, size_t permutation_size,
++    BufferInstance **dst_buffer) {
+   std::unique_ptr<BufferInstance> dst_buffer_instance =
+       BufferInstance::createInputBufferInstance(
+-          getDataType(), getDimensionsRaw(), getNumberOfDimensions(),
+-          dst_device, dst_memory);
++          getDataType(), dst_dimensions, dst_num_dimensions, dst_device,
++          dst_memory);
+
+-  dst_buffer_instance->copyFromBuffer(this);
++  dst_buffer_instance->copyFromBuffer(this, dimension_permutation,
++                                      permutation_size);
+
+   *dst_buffer = dst_buffer_instance.release();
+
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -185,37 +185,85 @@
+     return status;
+   }
+
+-  std::optional<tt::runtime::Device> runtime_device =
+-      getOrCreateMeshDevice(args->argument_lists, args->num_args,
+-                            args->num_devices, args->execute_device);
+-
+-  if (!runtime_device) {
+-    // Logging is done inside `getOrCreateMeshDevice`.
+-    return tt_pjrt_status::kInternal;
+-  }
+-
+-  // Assuming only one program per flatbuffer for now.
+-  std::uint32_t program_index = 0;
+-
+-  std::vector<tt::runtime::Tensor> input_tensors;
+-  input_tensors.reserve(args->num_args);
+-  status = getInputRuntimeTensors(
+-      args->argument_lists, args->num_args, args->num_devices, *runtime_device,
+-      program_index, input_tensors);
+-  if (!tt_pjrt_status_is_ok(status)) {
+-    return status;
+-  }
+-
+-  if (m_executable_image->getCompileOptions().export_tensors) {
+-    dumpInputs(input_tensors);
+-  }
+-
+   if (m_executable_image->getCompileOptions().dry_run) {
+     status = createDefaultOutputBuffers(args->output_lists, args->num_devices);
+     if (!tt_pjrt_status_is_ok(status)) {
+       return status;
+     }
++  } else if (const auto &host_copy_outputs =
++                 m_executable_image->getHostCopyOutputs()) {
++    // Preserve PJRT's independent output ownership while materializing simple
++    // host-buffer transformations without TTNN setup or runtime submission.
++    if (host_copy_outputs->size() != m_executable_image->getNumOutputs()) {
++      LOG_F(ERROR, "Invalid host-copy output mapping");
++      return tt_pjrt_status::kInternal;
++    }
++    std::vector<std::unique_ptr<BufferInstance>> outputs;
++    outputs.reserve(args->num_devices * host_copy_outputs->size());
++    for (size_t device_index = 0; device_index < args->num_devices;
++         ++device_index) {
++      for (size_t output_index = 0; output_index < host_copy_outputs->size();
++           ++output_index) {
++        const HostCopyOutput &host_copy = (*host_copy_outputs)[output_index];
++        BufferInstance *input = BufferInstance::unwrap(
++            args->argument_lists[device_index][host_copy.input_index]);
++        std::optional<std::vector<std::uint32_t>> output_shape =
++            getOutputShape(output_index);
++        if (!output_shape) {
++          return tt_pjrt_status::kInternal;
++        }
++        std::vector<std::int64_t> output_dimensions(output_shape->begin(),
++                                                     output_shape->end());
++        BufferInstance *output = nullptr;
++        status = input->copyToDeviceMemory(input->getDevice(),
++                                           input->getMemory(),
++                                           output_dimensions.data(),
++                                           output_dimensions.size(),
++                                           host_copy.dimension_permutation.data(),
++                                           host_copy.dimension_permutation.size(),
++                                           &output);
++        if (!tt_pjrt_status_is_ok(status)) {
++          return status;
++        }
++        outputs.emplace_back(output);
++      }
++    }
++
++    size_t output_buffer_index = 0;
++    for (size_t device_index = 0; device_index < args->num_devices;
++         ++device_index) {
++      for (size_t output_index = 0; output_index < host_copy_outputs->size();
++           ++output_index) {
++        args->output_lists[device_index][output_index] =
++            *outputs[output_buffer_index++].release();
++      }
++    }
+   } else {
++    std::optional<tt::runtime::Device> runtime_device =
++        getOrCreateMeshDevice(args->argument_lists, args->num_args,
++                              args->num_devices, args->execute_device);
++
++    if (!runtime_device) {
++      // Logging is done inside `getOrCreateMeshDevice`.
++      return tt_pjrt_status::kInternal;
++    }
++
++    // Assuming only one program per flatbuffer for now.
++    std::uint32_t program_index = 0;
++
++    std::vector<tt::runtime::Tensor> input_tensors;
++    input_tensors.reserve(args->num_args);
++    status = getInputRuntimeTensors(args->argument_lists, args->num_args,
++                                    args->num_devices, *runtime_device,
++                                    program_index, input_tensors);
++    if (!tt_pjrt_status_is_ok(status)) {
++      return status;
++    }
++
++    if (m_executable_image->getCompileOptions().export_tensors) {
++      dumpInputs(input_tensors);
++    }
++
+     FlatbufferExecutableImage *executable_image =
+         static_cast<FlatbufferExecutableImage *>(m_executable_image.get());
+
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -143,6 +143,173 @@
+   return indices;
+ }
+
++// Matches values that can be materialized by copying a host-resident input.
++// Most matches preserve byte order; transpose carries the permutation needed
++// to gather the input into a dense output buffer.
++static std::optional<HostCopyOutput> matchHostCopyValue(
++    mlir::Value value, mlir::Type result_type, mlir::Block &entry,
++    std::vector<mlir::Operation *> &allowed_operations) {
++  if (value.getType() != result_type) {
++    return std::nullopt;
++  }
++
++  // Explicit JAX shardings wrap otherwise ordinary values in metadata-only
++  // custom calls. They do not change the local shard that PJRT copies.
++  while (auto sharding = value.getDefiningOp<mlir::stablehlo::CustomCallOp>()) {
++    llvm::StringRef target = sharding.getCallTargetName();
++    if ((target != mlir::tt::sharding_utils::kTTShardingConstraintTargetName &&
++         target != mlir::tt::gspmd_utils::kShardingCustomCallTargetName) ||
++        sharding.getInputs().size() != 1 || sharding.getNumResults() != 1 ||
++        sharding.getInputs().front().getType() != value.getType()) {
++      return std::nullopt;
++    }
++    allowed_operations.push_back(sharding);
++    value = sharding.getInputs().front();
++  }
++
++  if (auto argument = llvm::dyn_cast<mlir::BlockArgument>(value)) {
++    if (argument.getOwner() != &entry) {
++      return std::nullopt;
++    }
++    return HostCopyOutput{argument.getArgNumber(), {}};
++  }
++
++  if (auto transpose = value.getDefiningOp<mlir::stablehlo::TransposeOp>()) {
++    auto argument = llvm::dyn_cast<mlir::BlockArgument>(transpose.getOperand());
++    auto input_type =
++        llvm::dyn_cast<mlir::RankedTensorType>(transpose.getOperand().getType());
++    auto output_type = llvm::dyn_cast<mlir::RankedTensorType>(result_type);
++    llvm::ArrayRef<int64_t> permutation = transpose.getPermutation();
++    if (!argument || argument.getOwner() != &entry || !input_type ||
++        !output_type || !input_type.hasStaticShape() ||
++        !output_type.hasStaticShape() ||
++        mlir::isa<mlir::ComplexType>(input_type.getElementType()) ||
++        input_type.getElementType() != output_type.getElementType() ||
++        permutation.size() != static_cast<size_t>(input_type.getRank()) ||
++        permutation.size() != static_cast<size_t>(output_type.getRank())) {
++      return std::nullopt;
++    }
++    for (size_t i = 0; i < permutation.size(); ++i) {
++      if (permutation[i] < 0 || permutation[i] >= input_type.getRank() ||
++          output_type.getDimSize(i) !=
++              input_type.getDimSize(permutation[i])) {
++        return std::nullopt;
++      }
++    }
++    allowed_operations.push_back(transpose);
++    return HostCopyOutput{argument.getArgNumber(),
++                          {permutation.begin(), permutation.end()}};
++  }
++
++  auto reduce = value.getDefiningOp<mlir::stablehlo::ReduceOp>();
++  if (!reduce || reduce.getNumResults() != 1 || reduce.getInputs().size() != 1 ||
++      reduce.getInitValues().size() != 1 || !reduce.getBody().hasOneBlock()) {
++    return std::nullopt;
++  }
++
++  auto argument =
++      llvm::dyn_cast<mlir::BlockArgument>(reduce.getInputs().front());
++  auto input_type =
++      llvm::dyn_cast<mlir::RankedTensorType>(reduce.getInputs().front().getType());
++  auto output_type = llvm::dyn_cast<mlir::RankedTensorType>(result_type);
++  if (!argument || argument.getOwner() != &entry || !input_type ||
++      !output_type || !input_type.hasStaticShape() ||
++      !output_type.hasStaticShape() ||
++      input_type.getElementType() != output_type.getElementType() ||
++      input_type.getNumElements() != output_type.getNumElements()) {
++    return std::nullopt;
++  }
++  for (int64_t dimension : reduce.getDimensions()) {
++    if (input_type.getDimSize(dimension) != 1) {
++      return std::nullopt;
++    }
++  }
++
++  auto constant = reduce.getInitValues().front()
++                      .getDefiningOp<mlir::stablehlo::ConstantOp>();
++  auto identity = constant ? llvm::dyn_cast<mlir::DenseFPElementsAttr>(
++                                 constant.getValue())
++                           : nullptr;
++  if (!identity || !identity.isSplat()) {
++    return std::nullopt;
++  }
++  const llvm::APFloat &identity_value =
++      *identity.getValues<llvm::APFloat>().begin();
++  if (!identity_value.isInfinity() || identity_value.isNegative()) {
++    return std::nullopt;
++  }
++
++  mlir::Block &body = reduce.getBody().front();
++  auto minimum = llvm::dyn_cast<mlir::stablehlo::MinOp>(body.front());
++  auto return_op =
++      llvm::dyn_cast<mlir::stablehlo::ReturnOp>(body.getTerminator());
++  if (body.getOperations().size() != 2 || body.getNumArguments() != 2 ||
++      !minimum || !return_op || return_op.getNumOperands() != 1 ||
++      return_op.getOperand(0) != minimum.getResult() ||
++      !((minimum.getOperand(0) == body.getArgument(0) &&
++         minimum.getOperand(1) == body.getArgument(1)) ||
++        (minimum.getOperand(0) == body.getArgument(1) &&
++         minimum.getOperand(1) == body.getArgument(0)))) {
++    return std::nullopt;
++  }
++
++  allowed_operations.push_back(constant);
++  allowed_operations.push_back(reduce);
++  return HostCopyOutput{argument.getArgNumber(), {}};
++}
++
++static std::optional<std::vector<HostCopyOutput>>
++collectAndLowerHostCopyOutputs(
++    mlir::OwningOpRef<mlir::ModuleOp> &module) {
++  auto main = (*module).lookupSymbol<mlir::func::FuncOp>("main");
++  if (!main || !main.getBody().hasOneBlock()) {
++    return std::nullopt;
++  }
++
++  mlir::Block &entry = main.getBody().front();
++  auto return_op =
++      llvm::dyn_cast<mlir::func::ReturnOp>(entry.getTerminator());
++  if (!return_op || return_op.getNumOperands() != main.getNumResults()) {
++    return std::nullopt;
++  }
++
++  std::vector<mlir::Operation *> allowed_operations{entry.getTerminator()};
++  std::vector<HostCopyOutput> outputs;
++  outputs.reserve(return_op.getNumOperands());
++  for (size_t output_index = 0; output_index < return_op.getNumOperands();
++       ++output_index) {
++    auto output = matchHostCopyValue(
++        return_op.getOperand(output_index),
++        main.getResultTypes()[output_index], entry, allowed_operations);
++    if (!output) {
++      return std::nullopt;
++    }
++    outputs.push_back(std::move(*output));
++  }
++
++  for (mlir::Operation &operation : entry) {
++    if (std::find(allowed_operations.begin(), allowed_operations.end(),
++                  &operation) == allowed_operations.end()) {
++      return std::nullopt;
++    }
++  }
++  // The compiled image is used only for metadata when PJRT executes this host
++  // copy plan. Replace transposes with cheap reshapes so the ordinary compiler
++  // path can still produce that metadata without lowering a device permute.
++  for (mlir::Operation *operation : allowed_operations) {
++    auto transpose = llvm::dyn_cast<mlir::stablehlo::TransposeOp>(operation);
++    if (!transpose) {
++      continue;
++    }
++    mlir::OpBuilder builder(transpose);
++    auto reshape = builder.create<mlir::stablehlo::ReshapeOp>(
++        transpose.getLoc(), transpose.getType(), transpose.getOperand());
++    transpose.getResult().replaceAllUsesWith(reshape.getResult());
++    transpose.erase();
++  }
++  return outputs;
++}
++
+ // Returns true if any sharding genuinely partitions a tensor across devices
+ // (`MeshShardType::Devices`). Replicate / presharded-replicate shardings do not
+ // count, since they do not require a multi-device mesh.
+@@ -416,6 +583,9 @@
+   std::vector<size_t> donatable_input_indices =
+       collectDonatableInputIndices(mlir_module);
+
++  std::optional<std::vector<HostCopyOutput>> host_copy_outputs =
++      collectAndLowerHostCopyOutputs(mlir_module);
++
+   status = runFrontendSHLOPipeline(mlir_module, compile_options.export_path,
+                                    compile_options.export_model_name);
+   if (!tt_pjrt_status_is_ok(status)) {
+@@ -583,6 +753,9 @@
+   if (std::get<1>(result)) {
+     std::get<1>(result)->setDonatableInputIndices(
+         std::move(donatable_input_indices));
++    if (host_copy_outputs) {
++      std::get<1>(result)->setHostCopyOutputs(std::move(*host_copy_outputs));
++    }
+   }
+   return result;
+ }
