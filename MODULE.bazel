@@ -448,6 +448,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_row_major_stop_fixup.patch",
         "//third_party/tt_xla:tt_mlir_preserve_explicit_compute_config.patch",
         "//third_party/tt_xla:tt_mlir_chunked_sdpa_accuracy_config.patch",
+        "//third_party/tt_xla:tt_mlir_chunked_sdpa_per_user_offsets.patch",
         "//third_party/tt_xla:tt_mlir_paged_fill_tiled_input.patch",
         "//third_party/tt_xla:tt_mlir_paged_update_row_major_page_table.patch",
         "//third_party/tt_xla:tt_mlir_large_zero_tensor_initialization.patch",
