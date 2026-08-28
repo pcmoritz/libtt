@@ -1,0 +1,78 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -6,6 +6,7 @@
+ #include "mlir/IR/BuiltinTypes.h"
+ #include "mlir/Support/LLVM.h"
++#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+ #include "ttmlir/Dialect/TTCore/IR/Utils.h"
+ #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+@@ -115,9 +116,13 @@ private:
+   // Collect all inputs and outputs outside the operation set to hoist.
+   // Tensor inputs come first, followed by semaphore inputs.
++  // Optimization-barrier results that pass a boundary input through are
++  // recorded separately: they preserve ordering inside the trace but do not
++  // need a persistent output slot or a device copy.
+   void collectFunctionBoundary(llvm::ArrayRef<Operation *> opsToHoist,
+                                llvm::SmallVector<mlir::Value> &inputs,
+-                               llvm::SmallVector<mlir::Value> &outputs) {
++                               llvm::SmallVector<mlir::Value> &outputs,
++                               llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> &passthroughOutputs) {
+ 
+     // Create set for quick lookup
+     llvm::SmallPtrSet<Operation *, 16> opSet(opsToHoist.begin(),
+@@ -178,6 +183,20 @@ private:
+         for (auto &use : result.getUses()) {
+           Operation *user = use.getOwner();
+           if (!opSet.contains(user)) {
++            if (auto barrier =
++                    mlir::dyn_cast<ttcore::OptimizationBarrierOp>(op)) {
++              mlir::Value input = barrier.getInputs()[
++                  mlir::cast<OpResult>(result).getResultNumber()];
++              Operation *definingOp = input.getDefiningOp();
++              if (!definingOp || !opSet.contains(definingOp)) {
++                passthroughOutputs.emplace_back(result, input);
++                break;
++              }
++            }
+             outputs.push_back(result);
+             break;
+           }
+@@ -260,6 +279,10 @@ private:
+     llvm::SmallVector<mlir::Value> boundaryInputs;
+     // Values of the original function that the trace produces.
+     llvm::SmallVector<mlir::Value> boundaryOutputs;
++    // (result, input) pairs for optimization barriers that return an existing
++    // trace input. The barrier remains in the trace for ordering, while users
++    // outside the trace receive the original input directly.
++    llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> passthroughOutputs;
+     // Number of leading tensor input arguments.
+     size_t numTensorInputs = 0;
+@@ -328,9 +351,12 @@ private:
+     llvm::SmallVector<mlir::Value> inputs;
+     llvm::SmallVector<mlir::Value> outputs;
+     llvm::SmallVector<mlir::Type> outputTypes;
++    llvm::SmallVector<std::pair<mlir::Value, mlir::Value>>
++        passthroughOutputs;
+ 
+-    collectFunctionBoundary(opsToHoist, inputs, outputs);
++    collectFunctionBoundary(opsToHoist, inputs, outputs, passthroughOutputs);
+@@ -465,6 +491,7 @@ private:
+     info.outputSlotTypes = std::move(outputTypes);
+     info.boundaryInputs = std::move(inputs);
+     info.boundaryOutputs = std::move(outputs);
++    info.passthroughOutputs = std::move(passthroughOutputs);
+     return info;
+   }
+@@ -918,6 +945,10 @@ private:
+       output.replaceAllUsesWith(traceOp->getResult(i));
+     }
+ 
++    for (auto [output, input] : info.passthroughOutputs) {
++      output.replaceAllUsesWith(input);
++    }
++
+     // Remove the original ops in reverse order (to avoid dependency issues)
+     for (auto it = opsToHoist.rbegin(); it != opsToHoist.rend(); it++) {
+       rewriter.eraseOp(*it);

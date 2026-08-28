@@ -441,9 +441,16 @@ git_repository(
         # Keep all StableHLO scatter conversion changes in one patch.
         "//third_party/tt_xla:tt_mlir_scatter.patch",
         "//third_party/tt_xla:tt_mlir_validate_trace_allocation_state.patch",
+        "//third_party/tt_xla:tt_mlir_trace_device_input_variants.patch",
+        "//third_party/tt_xla:tt_mlir_trace_passthrough_outputs.patch",
+        "//third_party/tt_xla:tt_mlir_synchronize_trace_capture.patch",
         "//third_party/tt_xla:tt_mlir_emitc_incomplete_type.patch",
         "//third_party/tt_xla:tt_mlir_row_major_stop_fixup.patch",
         "//third_party/tt_xla:tt_mlir_preserve_explicit_compute_config.patch",
+        "//third_party/tt_xla:tt_mlir_chunked_sdpa_accuracy_config.patch",
+        "//third_party/tt_xla:tt_mlir_paged_fill_tiled_input.patch",
+        "//third_party/tt_xla:tt_mlir_paged_update_row_major_page_table.patch",
+        "//third_party/tt_xla:tt_mlir_large_zero_tensor_initialization.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

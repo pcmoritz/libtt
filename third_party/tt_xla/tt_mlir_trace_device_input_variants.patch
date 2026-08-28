@@ -1,0 +1,440 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+index 3ce51a2..ff7837b 100644
+--- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+@@ -15,13 +15,18 @@ namespace tt::runtime::ttnn {
+
+ struct TraceVariant {
+   ::ttnn::MeshTraceId traceId;
++  /// Persistent input slots this trace was captured against. Device-resident
++  /// inputs are the caller's buffers, so they also identify which invocations
++  /// can replay this variant.
++  std::vector<::tt::runtime::Tensor> inputTensors;
++  /// Persistent output slots this trace was captured against.
++  std::vector<::tt::runtime::Tensor> outputTensors;
++  /// Slots allocated exclusively for this trace. Caller-owned device inputs
++  /// are intentionally excluded.
++  std::vector<::tt::runtime::Tensor> ownedTensors;
+ };
+
+ struct TraceData {
+-  /// Input tensor buffers shared by every replay-safe variant.
+-  std::vector<::tt::runtime::Tensor> inputTensors;
+-  /// Output tensor buffers shared by every replay-safe variant.
+-  std::vector<::tt::runtime::Tensor> outputTensors;
+   /// Traces with distinct capture-time allocation footprints.
+   std::vector<TraceVariant> variants;
+ };
+@@ -49,18 +54,34 @@ public:
+                 const CaptureExecuteProgramKey &captureExecuteKey) const;
+   TraceData *get(const MainProgramKey &key,
+                  const CaptureExecuteProgramKey &captureExecuteKey);
++  /// Evicts an entry, if needed, before allocating slots for a new one.
++  void prepareForInsert(const MainProgramKey &key,
++                        const CaptureExecuteProgramKey &captureExecuteKey);
+   void insert(const MainProgramKey &key,
+               const CaptureExecuteProgramKey &captureExecuteKey,
+               TraceData traceData);
++  /// Releases and removes the least-recently-used variant. Tensors referenced
++  /// by the replacement capture are preserved when it reuses the old slots.
++  void evictOldestVariant(
++      TraceData &traceData,
++      const std::vector<::tt::runtime::Tensor> &replacementTensors);
+   /// Removes all entries for the given key, releasing their device-side
+   /// traces.
+   void erase(const MainProgramKey &key);
+
+ private:
++  using EntryKey = std::pair<MainProgramKey, CaptureExecuteProgramKey>;
++  static constexpr size_t kMaxEntries = 4;
++
++  void touch(const MainProgramKey &key,
++             const CaptureExecuteProgramKey &captureExecuteKey);
++  void evictLeastRecentlyUsed();
++
+   std::weak_ptr<::ttnn::MeshDevice> meshDevice;
+   std::unordered_map<MainProgramKey,
+                      std::unordered_map<CaptureExecuteProgramKey, TraceData>>
+       cache;
++  std::vector<EntryKey> leastToMostRecentlyUsed;
+ };
+ } // namespace tt::runtime::ttnn
+
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+index 99dd4ec..68397c1 100644
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -77,10 +77,19 @@ allocateTraceSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+              " got: ", slots.size());
+
+   // The slots outlive every program that touches them; the trace cache owns
+-  // them from here on.
+-  for (::tt::runtime::Tensor &slot : slots) {
+-    slot.as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN)
+-        .setRetain(true);
++  // them from here on. Device-resident inputs are the exception: their slots
++  // alias caller-owned buffers. Retaining those buffers prevents donated
++  // inputs (notably KV caches) from being reclaimed after they rotate out of
++  // the trace cache.
++  for (size_t i = 0; i < slots.size(); ++i) {
++    const bool callerOwnedDeviceInput =
++        i < op->inputs()->size() &&
++        ::tt::runtime::ttnn::utils::inDeviceMemory(op->inputs()->Get(i));
++    if (!callerOwnedDeviceInput) {
++      slots[i]
++          .as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN)
++          .setRetain(true);
++    }
+   }
+
+   return slots;
+@@ -221,10 +230,22 @@ static TraceVariant captureTrace(
+   LOG_ASSERT(traceIdTensor.dtype() == ::ttnn::DataType::UINT32,
+              "Trace ID must be UINT32");
+
++  std::vector<::tt::runtime::Tensor> ownedTensors;
++  for (size_t i = 0; i < op->inputs()->size(); ++i) {
++    if (!::tt::runtime::ttnn::utils::inDeviceMemory(op->inputs()->Get(i))) {
++      ownedTensors.push_back(inputSlots[i]);
++    }
++  }
++  ownedTensors.insert(ownedTensors.end(), outputSlots.begin(),
++                      outputSlots.end());
++
+   TraceVariant variant{
+       .traceId = ::ttnn::MeshTraceId(
+           ::tt::runtime::ttnn::utils::getScalarFromTensor<uint32_t>(
+-              traceIdTensor))};
++              traceIdTensor)),
++      .inputTensors = inputSlots,
++      .outputTensors = outputSlots,
++      .ownedTensors = std::move(ownedTensors)};
+
+   // The capture program replays the trace once, so the output slots already
+   // hold this invocation's results.
+@@ -234,11 +255,11 @@ static TraceVariant captureTrace(
+ }
+
+ static void executeTrace(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+-                         ProgramContext &context, TraceData &traceData,
+-                         const TraceVariant &variant) {
++                         ProgramContext &context,
++                         TraceVariant &variant) {
+   ::tt::runtime::Device deviceHandle = context.getDeviceHandle();
+
+-  updateTraceInputSlots(op, context, traceData.inputTensors);
++  updateTraceInputSlots(op, context, variant.inputTensors);
+
+   ::ttnn::Tensor traceIdTensor =
+       ::tt::runtime::ttnn::utils::createTTNNTensor<uint32_t>(
+@@ -257,7 +278,40 @@ static void executeTrace(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+                            /*programSemaphoreInputs=*/{});
+   executor.execute();
+
+-  publishTraceOutputs(op, context, traceData.outputTensors);
++  publishTraceOutputs(op, context, variant.outputTensors);
++}
++
++// A device-resident trace input is captured by address, unlike a host input
++// whose current value is copied into a persistent slot before replay. A trace
++// variant can therefore only be reused when each device input is the same
++// runtime tensor it was captured with. In particular, donated KV-cache calls
++// may use the same executable with different cache buffers; replaying the old
++// trace would mutate the old buffer while the enclosing program returns the
++// new one.
++static bool deviceInputsMatch(
++    const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
++    ProgramContext &context, const TraceVariant &variant) {
++  LOG_ASSERT(op->inputs()->size() == variant.inputTensors.size(),
++             "Mismatched number of trace inputs");
++  for (size_t i = 0; i < op->inputs()->size(); ++i) {
++    const ::tt::target::ttnn::TensorRef *input = op->inputs()->Get(i);
++    if (!::tt::runtime::ttnn::utils::inDeviceMemory(input)) {
++      continue;
++    }
++    const ::ttnn::Tensor &current =
++        context.getTensorPool().getTTNNTensorAndValidate(input);
++    const ::ttnn::Tensor &captured =
++        variant.inputTensors[i]
++            .as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN)
++            .getTensor();
++    if (!captured.is_allocated()) {
++      return false;
++    }
++    if (current.mesh_buffer().address() != captured.mesh_buffer().address()) {
++      return false;
++    }
++  }
++  return true;
+ }
+
+ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -279,6 +333,10 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+   if (!traceCache->contains(mainProgramKey, captureExecuteKey)) {
+     LOG_DEBUG("Trace cache miss, allocating slots and capturing trace");
+
++    // Make room before allocating persistent slots; temporarily exceeding the
++    // entry bound can OOM even though insertion would immediately evict.
++    traceCache->prepareForInsert(mainProgramKey, captureExecuteKey);
++
+     // Allocate the persistent slots once, then capture against them.
+     std::vector<::tt::runtime::Tensor> slots = allocateTraceSlots(op, context);
+     size_t numInputSlots = op->inputs()->size();
+@@ -295,10 +353,9 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+     // the execute path establish the slots identically.
+     updateTraceInputSlots(op, context, inputSlots,
+                           /*deviceResidentOnly=*/true);
+-    TraceData traceData{.inputTensors = std::move(inputSlots),
+-                        .outputTensors = std::move(outputSlots)};
+-    traceData.variants.push_back(captureTrace(
+-        op, context, traceData.inputTensors, traceData.outputTensors));
++    TraceData traceData;
++    traceData.variants.push_back(
++        captureTrace(op, context, inputSlots, outputSlots));
+     traceCache->insert(mainProgramKey, captureExecuteKey, std::move(traceData));
+
+     debug::Stats::get().incrementStat("TraceCacheMiss");
+@@ -312,12 +369,13 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+   auto variantIt = std::find_if(
+       traceData->variants.rbegin(), traceData->variants.rend(),
+       [&](const TraceVariant &variant) {
+-        return meshDevice.is_mesh_trace_replay_safe(variant.traceId);
++        return deviceInputsMatch(op, context, variant) &&
++               meshDevice.is_mesh_trace_replay_safe(variant.traceId);
+       });
+
+   if (variantIt != traceData->variants.rend()) {
+     LOG_DEBUG("Trace variant cache hit, executing trace directly");
+-    executeTrace(op, context, *traceData, *variantIt);
++    executeTrace(op, context, *variantIt);
+     // Keep variants ordered from least- to most-recently used so front
+     // eviction removes the coldest trace.
+     std::rotate(variantIt.base() - 1, variantIt.base(),
+@@ -326,23 +384,46 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+     return;
+   }
+
+-  // No cached trace has a footprint disjoint from the current live buffers.
+-  // Capture against the existing persistent slots and keep prior variants so
+-  // recurring allocation patterns do not ping-pong through a recapture.
+-  LOG_DEBUG("No trace variant is safe for the current allocations; capturing ",
+-            "a new variant (cached variants: ", traceData->variants.size(),
+-            ")");
++  // No cached trace both targets the current device-resident buffers and has
++  // a safe allocation footprint. Reuse slots from a matching, stale variant;
++  // otherwise allocate a slot set bound to the current device inputs.
++  LOG_DEBUG("No matching trace variant is safe; capturing a new variant ",
++            "(cached variants: ", traceData->variants.size(), ")");
++  auto matchingIt = std::find_if(
++      traceData->variants.rbegin(), traceData->variants.rend(),
++      [&](const TraceVariant &variant) {
++        return deviceInputsMatch(op, context, variant);
++      });
++  const bool reuseTraceSlots = matchingIt != traceData->variants.rend();
++  std::vector<::tt::runtime::Tensor> inputSlots;
++  std::vector<::tt::runtime::Tensor> outputSlots;
++  if (reuseTraceSlots) {
++    inputSlots = matchingIt->inputTensors;
++    outputSlots = matchingIt->outputTensors;
++  }
++
+   constexpr size_t kMaxTraceVariants = 8;
+   if (traceData->variants.size() == kMaxTraceVariants) {
+-    ::ttnn::operations::trace::release_trace(
+-        &meshDevice, traceData->variants.front().traceId);
+-    traceData->variants.erase(traceData->variants.begin());
++    // Evict before allocating replacement slots. Allocating first temporarily
++    // requires a ninth persistent slot set and can OOM even though the cache
++    // is nominally bounded.
++    std::vector<::tt::runtime::Tensor> replacementTensors = inputSlots;
++    replacementTensors.insert(replacementTensors.end(), outputSlots.begin(),
++                              outputSlots.end());
++    traceCache->evictOldestVariant(*traceData, replacementTensors);
++  }
++
++  if (!reuseTraceSlots) {
++    std::vector<::tt::runtime::Tensor> slots = allocateTraceSlots(op, context);
++    size_t numInputSlots = op->inputs()->size();
++    inputSlots.assign(slots.begin(), slots.begin() + numInputSlots);
++    outputSlots.assign(slots.begin() + numInputSlots, slots.end());
+   }
+
+-  updateTraceInputSlots(op, context, traceData->inputTensors,
++  updateTraceInputSlots(op, context, inputSlots,
+                         /*deviceResidentOnly=*/true);
+-  traceData->variants.push_back(captureTrace(
+-      op, context, traceData->inputTensors, traceData->outputTensors));
++  traceData->variants.push_back(
++      captureTrace(op, context, inputSlots, outputSlots));
+
+   debug::Stats::get().incrementStat("TraceStaleRecapture");
+ }
+diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/trace_cache.cpp
+index 66fefc1..eb1bafd 100644
+--- a/runtime/lib/ttnn/types/trace_cache.cpp
++++ b/runtime/lib/ttnn/types/trace_cache.cpp
+@@ -3,9 +3,129 @@
+ // SPDX-License-Identifier: Apache-2.0
+
+ #include "tt/runtime/detail/ttnn/types/trace_cache.h"
++#include "tt/runtime/detail/ttnn/types/types.h"
++
++#include <algorithm>
++#include <unordered_set>
+
+ namespace tt::runtime::ttnn {
+
++static void releaseOwnedTensors(
++    std::vector<::tt::runtime::Tensor> &tensors,
++    const std::unordered_set<void *> &liveTensorHandles,
++    std::unordered_set<void *> &releasedTensorHandles) {
++  for (::tt::runtime::Tensor &tensor : tensors) {
++    if (liveTensorHandles.contains(tensor.handle.get()) ||
++        !releasedTensorHandles.insert(tensor.handle.get()).second) {
++      continue;
++    }
++    // The runtime tensor handle is shared with any output still visible to
++    // the caller. Removing retain lets normal wrapper destruction reclaim the
++    // buffer after the final reference is gone; force-deallocation here would
++    // invalidate all outstanding aliases.
++    tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).setRetain(false);
++  }
++}
++
++static void releaseTraceData(::ttnn::MeshDevice *meshDevice,
++                             TraceData &traceData) {
++  // Generated traces execute asynchronously on CQ 0. Drain outstanding
++  // replays before releasing their command buffers or persistent slots.
++  meshDevice->mesh_command_queue(0).finish();
++  for (TraceVariant &variant : traceData.variants) {
++    ::ttnn::operations::trace::release_trace(meshDevice, variant.traceId);
++  }
++
++  const std::unordered_set<void *> noLiveTensors;
++  std::unordered_set<void *> releasedTensorHandles;
++  for (TraceVariant &variant : traceData.variants) {
++    releaseOwnedTensors(variant.ownedTensors, noLiveTensors,
++                        releasedTensorHandles);
++  }
++}
++
++void TraceCache::touch(
++    const MainProgramKey &key,
++    const CaptureExecuteProgramKey &captureExecuteKey) {
++  auto it = std::find_if(
++      leastToMostRecentlyUsed.begin(), leastToMostRecentlyUsed.end(),
++      [&](const EntryKey &entry) {
++        return entry.first == key && entry.second == captureExecuteKey;
++      });
++  if (it != leastToMostRecentlyUsed.end()) {
++    leastToMostRecentlyUsed.erase(it);
++  }
++  leastToMostRecentlyUsed.emplace_back(key, captureExecuteKey);
++}
++
++void TraceCache::evictLeastRecentlyUsed() {
++  if (leastToMostRecentlyUsed.empty()) {
++    return;
++  }
++
++  EntryKey entry = leastToMostRecentlyUsed.front();
++  leastToMostRecentlyUsed.erase(leastToMostRecentlyUsed.begin());
++  auto outerIt = cache.find(entry.first);
++  if (outerIt == cache.end()) {
++    return;
++  }
++  auto innerIt = outerIt->second.find(entry.second);
++  if (innerIt == outerIt->second.end()) {
++    return;
++  }
++
++  std::shared_ptr<::ttnn::MeshDevice> lockedDevice = meshDevice.lock();
++  if (lockedDevice && lockedDevice->is_initialized()) {
++    releaseTraceData(lockedDevice.get(), innerIt->second);
++  }
++  outerIt->second.erase(innerIt);
++  if (outerIt->second.empty()) {
++    cache.erase(outerIt);
++  }
++}
++
++void TraceCache::prepareForInsert(
++    const MainProgramKey &key,
++    const CaptureExecuteProgramKey &captureExecuteKey) {
++  if (contains(key, captureExecuteKey)) {
++    return;
++  }
++  while (leastToMostRecentlyUsed.size() >= kMaxEntries) {
++    evictLeastRecentlyUsed();
++  }
++}
++
++void TraceCache::evictOldestVariant(
++    TraceData &traceData,
++    const std::vector<::tt::runtime::Tensor> &replacementTensors) {
++  LOG_ASSERT(!traceData.variants.empty(), "Cannot evict an empty trace cache");
++
++  TraceVariant evictedVariant = std::move(traceData.variants.front());
++  traceData.variants.erase(traceData.variants.begin());
++
++  std::shared_ptr<::ttnn::MeshDevice> lockedDevice = meshDevice.lock();
++  if (!lockedDevice || !lockedDevice->is_initialized()) {
++    return;
++  }
++  lockedDevice->mesh_command_queue(0).finish();
++  ::ttnn::operations::trace::release_trace(lockedDevice.get(),
++                                            evictedVariant.traceId);
++
++  std::unordered_set<void *> liveTensorHandles;
++  for (const ::tt::runtime::Tensor &tensor : replacementTensors) {
++    liveTensorHandles.insert(tensor.handle.get());
++  }
++  for (const TraceVariant &variant : traceData.variants) {
++    for (const ::tt::runtime::Tensor &tensor : variant.ownedTensors) {
++      liveTensorHandles.insert(tensor.handle.get());
++    }
++  }
++
++  std::unordered_set<void *> releasedTensorHandles;
++  releaseOwnedTensors(evictedVariant.ownedTensors, liveTensorHandles,
++                      releasedTensorHandles);
++}
++
+ bool TraceCache::contains(
+     const MainProgramKey &key,
+     const CaptureExecuteProgramKey &captureExecuteKey) const {
+@@ -29,13 +146,16 @@ TraceData *TraceCache::get(const MainProgramKey &key,
+     return nullptr;
+   }
+
++  touch(key, captureExecuteKey);
+   return &innerIt->second;
+ }
+
+ void TraceCache::insert(const MainProgramKey &key,
+                         const CaptureExecuteProgramKey &captureExecuteKey,
+                         TraceData traceData) {
++  prepareForInsert(key, captureExecuteKey);
+   cache[key][captureExecuteKey] = std::move(traceData);
++  touch(key, captureExecuteKey);
+ }
+
+ void TraceCache::erase(const MainProgramKey &key) {
+@@ -46,14 +166,13 @@ void TraceCache::erase(const MainProgramKey &key) {
+
+   std::shared_ptr<::ttnn::MeshDevice> lockedDevice = meshDevice.lock();
+   if (lockedDevice && lockedDevice->is_initialized()) {
+-    for (const auto &[_, traceData] : outerIt->second) {
+-      for (const TraceVariant &variant : traceData.variants) {
+-        ::ttnn::operations::trace::release_trace(lockedDevice.get(),
+-                                                 variant.traceId);
+-      }
++    for (auto &[_, traceData] : outerIt->second) {
++      releaseTraceData(lockedDevice.get(), traceData);
+     }
+   }
+
++  std::erase_if(leastToMostRecentlyUsed,
++                [&](const EntryKey &entry) { return entry.first == key; });
+   cache.erase(outerIt);
+ }
