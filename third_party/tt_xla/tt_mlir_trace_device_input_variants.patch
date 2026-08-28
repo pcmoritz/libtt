@@ -420,7 +420,7 @@ index 66fefc1..eb1bafd 100644
  }
 
  void TraceCache::erase(const MainProgramKey &key) {
-@@ -46,14 +166,13 @@ void TraceCache::erase(const MainProgramKey &key) {
+@@ -46,13 +166,12 @@ void TraceCache::erase(const MainProgramKey &key) {
 
    std::shared_ptr<::ttnn::MeshDevice> lockedDevice = meshDevice.lock();
    if (lockedDevice && lockedDevice->is_initialized()) {
