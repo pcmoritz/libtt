@@ -273,7 +273,7 @@ diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/tra
 index 66fefc1..eb1bafd 100644
 --- a/runtime/lib/ttnn/types/trace_cache.cpp
 +++ b/runtime/lib/ttnn/types/trace_cache.cpp
-@@ -3,9 +3,126 @@
+@@ -3,9 +3,129 @@
  // SPDX-License-Identifier: Apache-2.0
 
  #include "tt/runtime/detail/ttnn/types/trace_cache.h"
@@ -284,35 +284,37 @@ index 66fefc1..eb1bafd 100644
 
  namespace tt::runtime::ttnn {
 
-+static void deallocateOwnedTensors(
++static void releaseOwnedTensors(
 +    std::vector<::tt::runtime::Tensor> &tensors,
 +    const std::unordered_set<void *> &liveTensorHandles,
-+    std::unordered_set<void *> &deallocatedTensorHandles) {
++    std::unordered_set<void *> &releasedTensorHandles) {
 +  for (::tt::runtime::Tensor &tensor : tensors) {
 +    if (liveTensorHandles.contains(tensor.handle.get()) ||
-+        !deallocatedTensorHandles.insert(tensor.handle.get()).second) {
++        !releasedTensorHandles.insert(tensor.handle.get()).second) {
 +      continue;
 +    }
-+    TTNNTensorWrapper &wrapper =
-+        tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN);
-+    wrapper.setRetain(false);
-+    if (wrapper.getTensor().is_allocated()) {
-+      deallocateTensor(tensor, /*force=*/true);
-+    }
++    // The runtime tensor handle is shared with any output still visible to
++    // the caller. Removing retain lets normal wrapper destruction reclaim the
++    // buffer after the final reference is gone; force-deallocation here would
++    // invalidate all outstanding aliases.
++    tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).setRetain(false);
 +  }
 +}
 +
 +static void releaseTraceData(::ttnn::MeshDevice *meshDevice,
 +                             TraceData &traceData) {
++  // Generated traces execute asynchronously on CQ 0. Drain outstanding
++  // replays before releasing their command buffers or persistent slots.
++  meshDevice->mesh_command_queue(0).finish();
 +  for (TraceVariant &variant : traceData.variants) {
 +    ::ttnn::operations::trace::release_trace(meshDevice, variant.traceId);
 +  }
 +
 +  const std::unordered_set<void *> noLiveTensors;
-+  std::unordered_set<void *> deallocatedTensorHandles;
++  std::unordered_set<void *> releasedTensorHandles;
 +  for (TraceVariant &variant : traceData.variants) {
-+    deallocateOwnedTensors(variant.ownedTensors, noLiveTensors,
-+                           deallocatedTensorHandles);
++    releaseOwnedTensors(variant.ownedTensors, noLiveTensors,
++                        releasedTensorHandles);
 +  }
 +}
 +
@@ -379,6 +381,7 @@ index 66fefc1..eb1bafd 100644
 +  if (!lockedDevice || !lockedDevice->is_initialized()) {
 +    return;
 +  }
++  lockedDevice->mesh_command_queue(0).finish();
 +  ::ttnn::operations::trace::release_trace(lockedDevice.get(),
 +                                            evictedVariant.traceId);
 +
@@ -392,9 +395,9 @@ index 66fefc1..eb1bafd 100644
 +    }
 +  }
 +
-+  std::unordered_set<void *> deallocatedTensorHandles;
-+  deallocateOwnedTensors(evictedVariant.ownedTensors, liveTensorHandles,
-+                         deallocatedTensorHandles);
++  std::unordered_set<void *> releasedTensorHandles;
++  releaseOwnedTensors(evictedVariant.ownedTensors, liveTensorHandles,
++                      releasedTensorHandles);
 +}
 +
  bool TraceCache::contains(
