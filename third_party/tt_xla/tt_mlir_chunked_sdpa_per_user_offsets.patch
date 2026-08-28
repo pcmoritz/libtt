@@ -1,0 +1,180 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+index fe9b289..9117955 100644
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -6343,15 +6343,16 @@ def TTIR_ChunkedScaledDotProductAttentionOp : TTIR_NamedOp<"chunked_scaled_dot_p
+     Chunked-prefill attention. A prefill chunk of `query` attends
+     causally over the prefix tokens `[0, chunk_start_idx + chunk_len)` that are
+     resident in the paged K/V cache, read on device via `page_table`. The prefix
+-    offset is supplied by the device tensor `chunk_start_idx` (`[1]` int32). Causal
+-    masking is handled internally; no host attention mask.
++    offset is supplied by the device tensor `chunk_start_idx`: `[1]` for an
++    offset shared by all users, or `[B]` for per-user offsets. Causal masking is
++    handled internally; no host attention mask.
+ 
+     Args:
+         query (AnyRankedTensor): `[B x Hq x chunk_len x D]`.
+         key (AnyRankedTensor): paged K cache `[num_blocks x Hkv x block_size x D]`.
+         value (AnyRankedTensor): paged V cache, same layout as `key`.
+         page_table (AnyRankedTensor): `[B x num_blocks_per_user]` int32.
+-        chunk_start_idx (AnyRankedTensor): `[1]` int32 prefix offset.
++        chunk_start_idx (AnyRankedTensor): `[1]` or `[B]` int32 prefix offsets.
+         scale (float, optional): Softmax scale. Defaults to `1 / sqrt(D)`.
+ 
+     Returns:
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+index b5a4fb5..30a68ae 100644
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -3402,12 +3402,75 @@ public:
+   matchAndRewrite(ttir::ChunkedScaledDotProductAttentionOp op,
+                   OpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+-    rewriter.replaceOpWithNewOp<ttnn::ChunkedScaledDotProductAttentionOp>(
+-        op, this->getTypeConverter()->convertType(op.getType()),
+-        adaptor.getQuery(), adaptor.getKey(), adaptor.getValue(),
+-        adaptor.getPageTable(), adaptor.getChunkStartIdx(),
+-        adaptor.getScaleAttr(),
+-        /*program_config=*/nullptr);
++    auto chunkStartIdxType =
++        cast<RankedTensorType>(adaptor.getChunkStartIdx().getType());
++    if (chunkStartIdxType.getDimSize(0) == 1) {
++      rewriter.replaceOpWithNewOp<ttnn::ChunkedScaledDotProductAttentionOp>(
++          op, this->getTypeConverter()->convertType(op.getType()),
++          adaptor.getQuery(), adaptor.getKey(), adaptor.getValue(),
++          adaptor.getPageTable(), adaptor.getChunkStartIdx(),
++          adaptor.getScaleAttr(),
++          /*program_config=*/nullptr);
++      return success();
++    }
++
++    // TTNN accepts one prefix offset and one page-table row per invocation.
++    // Keep the TTIR operation batched and statically expand its users here so
++    // frontends do not need to model the backend execution strategy.
++    Location loc = op.getLoc();
++    auto outputType = cast<RankedTensorType>(
++        this->getTypeConverter()->convertType(op.getType()));
++    auto queryType = cast<RankedTensorType>(adaptor.getQuery().getType());
++    auto pageTableType =
++        cast<RankedTensorType>(adaptor.getPageTable().getType());
++
++    auto sliceUser = [&](Value input, RankedTensorType inputType,
++                         int64_t user) -> Value {
++      SmallVector<int32_t> begins(inputType.getRank(), 0);
++      SmallVector<int32_t> ends(inputType.getShape().begin(),
++                                inputType.getShape().end());
++      SmallVector<int32_t> steps(inputType.getRank(), 1);
++      begins[0] = static_cast<int32_t>(user);
++      ends[0] = static_cast<int32_t>(user + 1);
++
++      SmallVector<int64_t> sliceShape(inputType.getShape());
++      sliceShape[0] = 1;
++      auto sliceType =
++          ttnn::utils::RankedTensorTypeFactory::create(inputType, sliceShape);
++      return rewriter
++          .create<ttnn::SliceStaticOp>(
++              loc, sliceType, input, rewriter.getI32ArrayAttr(begins),
++              rewriter.getI32ArrayAttr(ends),
++              rewriter.getI32ArrayAttr(steps))
++          .getResult();
++    };
++
++    int64_t numUsers = queryType.getDimSize(0);
++    SmallVector<Value> userOutputs;
++    userOutputs.reserve(numUsers);
++    for (int64_t user = 0; user < numUsers; ++user) {
++      Value query = sliceUser(adaptor.getQuery(), queryType, user);
++      Value pageTable =
++          sliceUser(adaptor.getPageTable(), pageTableType, user);
++      Value chunkStartIdx =
++          sliceUser(adaptor.getChunkStartIdx(), chunkStartIdxType, user);
++
++      SmallVector<int64_t> userOutputShape(outputType.getShape());
++      userOutputShape[0] = 1;
++      auto userOutputType = ttnn::utils::RankedTensorTypeFactory::create(
++          outputType, userOutputShape);
++      userOutputs.push_back(
++          rewriter
++              .create<ttnn::ChunkedScaledDotProductAttentionOp>(
++                  loc, userOutputType, query, adaptor.getKey(),
++                  adaptor.getValue(), pageTable, chunkStartIdx,
++                  adaptor.getScaleAttr(),
++                  /*program_config=*/nullptr)
++              .getResult());
++    }
++
++    rewriter.replaceOpWithNewOp<ttnn::ConcatOp>(op, outputType, userOutputs,
++                                                 /*dim=*/0);
+     return success();
+   }
+ };
+diff --git a/lib/Dialect/StableHLO/Transforms/RegisterCustomShardingRule.cpp b/lib/Dialect/StableHLO/Transforms/RegisterCustomShardingRule.cpp
+index 2e36125..604b3ab 100644
+--- a/lib/Dialect/StableHLO/Transforms/RegisterCustomShardingRule.cpp
++++ b/lib/Dialect/StableHLO/Transforms/RegisterCustomShardingRule.cpp
+@@ -690,7 +690,7 @@ getChunkedSdpaShardingRule(mlir::stablehlo::CustomCallOp op) {
+   //  1: key             [num_blocks_total, num_kv_heads, block_size, head_size]
+   //  2: value           [num_blocks_total, num_kv_heads, block_size, head_size]
+   //  3: page_table      [num_users, max_blocks_per_seq]
+-  //  4: chunk_start_idx [1] (null-shardable)
++  //  4: chunk_start_idx [1] shared or [num_users] per-user offsets
+   //
+   // Sharding propagates along two dims: the head dim, carried by query, key,
+   // value and output, and the users/batch dim, carried by query, page_table
+@@ -706,6 +706,8 @@ getChunkedSdpaShardingRule(mlir::stablehlo::CustomCallOp op) {
+   auto queryType = llvm::cast<RankedTensorType>(op.getOperand(0).getType());
+   auto keyType = llvm::cast<RankedTensorType>(op.getOperand(1).getType());
+   auto valueType = llvm::cast<RankedTensorType>(op.getOperand(2).getType());
++  auto chunkStartIdxType =
++      llvm::cast<RankedTensorType>(op.getOperand(4).getType());
+   auto outputType = llvm::cast<RankedTensorType>(op.getResult(0).getType());
+ 
+   if (queryType.getShape() != outputType.getShape()) {
+@@ -747,7 +749,8 @@ getChunkedSdpaShardingRule(mlir::stablehlo::CustomCallOp op) {
+ 
+   // 2. Users/batch dim sharding. Query, page_table and output carry the users
+   //    dim at index 0. K/V dim 0 is num_blocks_total rather than users, so the
+-  //    paged cache stays replicated, and chunk_start_idx has no users dim.
++  //    paged cache stays replicated. A per-user chunk_start_idx carries the
++  //    users dim too; a shared [1] offset stays replicated.
+   const int64_t usersDim = 0;
+   int64_t numUsers = queryType.getShape()[usersDim];
+ 
+@@ -757,6 +760,10 @@ getChunkedSdpaShardingRule(mlir::stablehlo::CustomCallOp op) {
+ 
+   operandUsersDims[0] = usersDim; // query
+   operandUsersDims[3] = usersDim; // page_table
++  if (chunkStartIdxType.getRank() == 1 &&
++      chunkStartIdxType.getDimSize(0) == numUsers && numUsers != 1) {
++    operandUsersDims[4] = usersDim; // per-user chunk_start_idx
++  }
+   resultUsersDims[0] = usersDim;  // output
+ 
+   builder.addFactor(operandUsersDims, resultUsersDims, numUsers,
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+index 90468ba..693db64 100644
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -7929,10 +7929,6 @@ mlir::tt::ttir::ChunkedScaledDotProductAttentionOp::verify() {
+   if (chunkStartIdxType.getRank() != 1) {
+     return emitOpError("Chunk start index must be a 1D tensor.");
+   }
+-  if (chunkStartIdxType.getDimSize(0) != 1) {
+-    return emitOpError("Chunk start index must have shape [1] (a single prefix "
+-                       "offset shared by all users).");
+-  }
+ 
+   // Verify element types. The BFP8/BFP4 KV cache typecast happens later in the
+   // TTNN pipeline, so at TTIR query/key/value share one float element type.
+@@ -7966,6 +7962,11 @@ mlir::tt::ttir::ChunkedScaledDotProductAttentionOp::verify() {
+   int64_t keyHeadSize = keyShape[3];
+ 
+   // Verify shapes.
++  int64_t numChunkStarts = chunkStartIdxType.getDimSize(0);
++  if (numChunkStarts != 1 && numChunkStarts != numUsers) {
++    return emitOpError(
++        "Chunk start index must have shape [1] or [num_users].");
++  }
+   if (queryHeadSize != keyHeadSize) {
+     return emitOpError("Query head size must match key/value head size.");
+   }
