@@ -179,7 +179,7 @@ index 90468ba..693db64 100644
      return emitOpError("Query head size must match key/value head size.");
    }
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-index 5ae4641..230c1c4 100644
+index 5ae4641..fb57871 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 @@ -229,0 +230,10 @@ parseFloatFromStringAttr(const mlir::StringAttr &stringAttr, float &result) {
@@ -193,16 +193,18 @@ index 5ae4641..230c1c4 100644
 +      op->getDiscardableAttr("mhlo.backend_config"));
 +}
 +
-@@ -10276,71 +10286 @@ public:
+@@ -10276,4 +10286,2 @@ public:
 -    mlir::DictionaryAttr frontendAttributes =
 -        mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
 -            srcOp->getDiscardableAttr("mhlo.frontend_attributes"));
 -    if (!frontendAttributes) {
--      return rewriter.notifyMatchFailure(
++    auto backendConfig = getFfiBackendConfig(srcOp);
++    if (!backendConfig) {
+@@ -10281,2 +10289 @@ public:
 -          srcOp, "PagedScaledDotProductAttentionDecode op must have "
 -                 "mhlo.frontend_attributes attribute.");
--    }
--
++          srcOp, "Paged decode requires typed FFI backend_config.");
+@@ -10285,13 +10292,5 @@ public:
 -    auto isCausalStringAttr =
 -        frontendAttributes.getAs<mlir::StringAttr>("is_causal");
 -    bool isCausal = true;
@@ -216,34 +218,66 @@ index 5ae4641..230c1c4 100644
 -        return rewriter.notifyMatchFailure(
 -            srcOp, "is_causal attribute must be true or false. Received \"" +
 -                       isCausalStringAttr.getValue() + "\".");
--      }
++    auto readBool = [&](StringRef name,
++                        bool defaultValue) -> FailureOr<bool> {
++      Attribute attr = backendConfig.get(name);
++      if (!attr) {
++        return defaultValue;
+@@ -10299 +10298,6 @@ public:
 -    }
--
++      auto boolAttr = dyn_cast<BoolAttr>(attr);
++      if (!boolAttr) {
++        return failure();
++      }
++      return boolAttr.getValue();
++    };
+@@ -10301 +10305,12 @@ public:
 -    BoolAttr isCausalAttr = rewriter.getBoolAttr(isCausal);
--
++    FailureOr<bool> isCausal = readBool("is_causal", true);
++    FailureOr<bool> hasAttentionMask =
++        readBool("has_attention_mask", false);
++    FailureOr<bool> hasCurPosTensor =
++        readBool("has_cur_pos_tensor", true);
++    FailureOr<bool> hasAttentionSink =
++        readBool("has_attention_sink", false);
++    if (failed(isCausal) || failed(hasAttentionMask) ||
++        failed(hasCurPosTensor) || failed(hasAttentionSink)) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "Paged decode boolean backend_config attributes must be i1.");
++    }
+@@ -10303 +10317,0 @@ public:
 -    auto scaleStringAttr = frontendAttributes.getAs<mlir::StringAttr>("scale");
--    FloatAttr scaleAttr = nullptr;
+@@ -10305,5 +10319,5 @@ public:
 -    if (scaleStringAttr) {
 -      float scale;
 -      if (failed(parseFloatFromStringAttr(scaleStringAttr, scale))) {
 -        return rewriter.notifyMatchFailure(srcOp,
 -                                           "Failed to parse scale attribute.");
--      }
++    if (Attribute attr = backendConfig.get("scale")) {
++      auto inputAttr = dyn_cast<FloatAttr>(attr);
++      if (!inputAttr) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "Paged decode scale attribute must be floating-point.");
+@@ -10311 +10325 @@ public:
 -      scaleAttr = rewriter.getF32FloatAttr(scale);
--    }
--
++      scaleAttr = rewriter.getF32FloatAttr(inputAttr.getValueAsDouble());
+@@ -10314,2 +10327,0 @@ public:
 -    auto slidingWindowSizeStringAttr =
 -        frontendAttributes.getAs<mlir::StringAttr>("sliding_window_size");
--    IntegerAttr slidingWindowSizeAttr = nullptr;
+@@ -10317,4 +10329,3 @@ public:
 -    if (slidingWindowSizeStringAttr) {
 -      uint32_t slidingWindowSize;
 -      if (!llvm::to_integer(slidingWindowSizeStringAttr.getValue(),
 -                            slidingWindowSize)) {
--        return rewriter.notifyMatchFailure(
++    if (Attribute attr = backendConfig.get("sliding_window_size")) {
++      auto inputAttr = dyn_cast<IntegerAttr>(attr);
++      if (!inputAttr) {
+@@ -10322,3 +10333 @@ public:
 -            srcOp, "sliding_window_size attribute string must be convertible "
 -                   "to non-negative integer. Received \"" +
 -                       slidingWindowSizeStringAttr.getValue() + "\".");
--      }
++            srcOp, "Paged decode sliding_window_size must be an integer.");
+@@ -10326,37 +10335,10 @@ public:
 -      slidingWindowSizeAttr = rewriter.getUI32IntegerAttr(slidingWindowSize);
 -    }
 -
@@ -265,16 +299,13 @@ index 5ae4641..230c1c4 100644
 -        frontendAttributes.getAs<mlir::StringAttr>("has_cur_pos_tensor");
 -    bool hasCurPosTensor = false;
 -    if (!hasCurPosTensorStringAttr) {
-+    if (!getFfiBackendConfig(srcOp)) {
-@@ -10348 +10288 @@ public:
+-      return rewriter.notifyMatchFailure(
 -          srcOp, "has_cur_pos_tensor attribute must be present.");
-+          srcOp, "Paged decode requires typed FFI backend_config.");
-@@ -10350,3 +10290 @@ public:
+-    }
 -
 -    if (failed(parseBoolFromStringAttr(hasCurPosTensorStringAttr,
 -                                       hasCurPosTensor))) {
-+    if (adaptor.getOperands().size() != 5) {
-@@ -10354,36 +10292,2 @@ public:
+-      return rewriter.notifyMatchFailure(
 -          srcOp, "Failed to parse has_cur_pos_tensor attribute.");
 -    }
 -
@@ -284,14 +315,26 @@ index 5ae4641..230c1c4 100644
 -    if (!hasAttentionSinkStringAttr) {
 -      return rewriter.notifyMatchFailure(
 -          srcOp, "has_attention_sink attribute must be present.");
--    }
--
++      const APInt &value = inputAttr.getValue();
++      auto inputType = cast<IntegerType>(inputAttr.getType());
++      bool isNegative =
++          !inputType.isUnsigned() && value.isNegative();
++      if (isNegative || value.getActiveBits() > 32) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "Paged decode sliding_window_size must fit in uint32.");
++      }
++      slidingWindowSizeAttr =
++          rewriter.getUI32IntegerAttr(value.getZExtValue());
+@@ -10365,2 +10347,3 @@ public:
 -    if (failed(parseBoolFromStringAttr(hasAttentionSinkStringAttr,
 -                                       hasAttentionSink))) {
--      return rewriter.notifyMatchFailure(
++    size_t expectedOperands =
++        4 + *hasAttentionMask + *hasCurPosTensor + *hasAttentionSink;
++    if (adaptor.getOperands().size() != expectedOperands) {
+@@ -10368 +10351 @@ public:
 -          srcOp, "Failed to parse has_attention_sink attribute.");
--    }
--
++          srcOp, "Paged decode operand count does not match backend_config.");
+@@ -10371,20 +10354,7 @@ public:
 -    Value query = adaptor.getOperands()[0];
 -    Value key = adaptor.getOperands()[1];
 -    Value value = adaptor.getOperands()[2];
@@ -311,29 +354,36 @@ index 5ae4641..230c1c4 100644
 -    if (hasAttentionSink) {
 -      attentionSink = adaptor.getOperands()[operandIndex];
 -      operandIndex++;
-+          srcOp, "Paged decode must have query, key, value, page table, and "
-+                 "current-position operands.");
-@@ -10396 +10299,0 @@ public:
+-    }
++    size_t operandIndex = 4;
++    Value attentionMask =
++        *hasAttentionMask ? adaptor.getOperands()[operandIndex++] : Value();
++    Value curPosTensor =
++        *hasCurPosTensor ? adaptor.getOperands()[operandIndex++] : Value();
++    Value attentionSink =
++        *hasAttentionSink ? adaptor.getOperands()[operandIndex++] : Value();
+@@ -10396 +10365,0 @@ public:
 -
-@@ -10399,6 +10302,8 @@ public:
+@@ -10399,4 +10368,3 @@ public:
 -        srcOp,
 -        cast<RankedTensorType>(
 -            getTypeConverter()->convertType(srcOp.getResult(0).getType())),
 -        query, key, value, pageTable, outputTensor, isCausalAttr, attentionMask,
--        curPosTensor, attentionSink, scaleAttr, slidingWindowSizeAttr);
--
 +        srcOp, outputType, adaptor.getOperands()[0], adaptor.getOperands()[1],
 +        adaptor.getOperands()[2], adaptor.getOperands()[3], outputTensor,
-+        /*is_causal=*/rewriter.getBoolAttr(true),
-+        /*attention_mask=*/nullptr,
-+        /*cur_pos_tensor=*/adaptor.getOperands()[4],
-+        /*attention_sink=*/nullptr,
-+        /*scale=*/nullptr,
-+        /*sliding_window_size=*/nullptr);
-@@ -10425,17 +10330,9 @@ public:
++        /*is_causal=*/rewriter.getBoolAttr(*isCausal), attentionMask,
+@@ -10404 +10371,0 @@ public:
+-
+@@ -10425,2 +10392,6 @@ public:
 -    // scale is the only (optional) frontend attribute; causal masking is
 -    // internal and there are no optional operands.
--    FloatAttr scaleAttr = nullptr;
++    auto backendConfig = getFfiBackendConfig(srcOp);
++    if (!backendConfig) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "Chunked attention requires typed FFI backend_config.");
++    }
++
+@@ -10428,13 +10399,5 @@ public:
 -    mlir::DictionaryAttr frontendAttributes =
 -        mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
 -            srcOp->getDiscardableAttr("mhlo.frontend_attributes"));
@@ -347,13 +397,10 @@ index 5ae4641..230c1c4 100644
 -              srcOp, "Failed to parse scale attribute.");
 -        }
 -        scaleAttr = rewriter.getF32FloatAttr(scale);
--      }
-+    auto backendConfig = getFfiBackendConfig(srcOp);
-+    if (!backendConfig) {
-+      return rewriter.notifyMatchFailure(
-+          srcOp, "Chunked attention requires typed FFI backend_config.");
-+    }
-+
-+    FloatAttr scaleAttr = backendConfig.getAs<FloatAttr>("scale");
-+    if (scaleAttr && !scaleAttr.getType().isF32()) {
-+      return rewriter.notifyMatchFailure(srcOp, "scale attribute must be f32.");
++    if (Attribute attr = backendConfig.get("scale")) {
++      auto inputAttr = dyn_cast<FloatAttr>(attr);
++      if (!inputAttr) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "Chunked attention scale attribute must be floating-point.");
+@@ -10441,0 +10405 @@ public:
++      scaleAttr = rewriter.getF32FloatAttr(inputAttr.getValueAsDouble());
