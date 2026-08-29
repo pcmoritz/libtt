@@ -1,12 +1,36 @@
 diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
-index dd9123d..557a458 100644
+index cfd2f94..f8ae7ea 100644
 --- a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
 +++ b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
-@@ -355,2 +355,7 @@ struct PopulateWeightDtypeFromCustomCall final
-       funcOp.setArgAttr(argIndex, c_weight_dtype_attr_name, weightDtypeStrAttr);
+@@ -321,7 +321,7 @@ struct PopulateWeightDtypeFromCustomCall final
+-    // Extract frontend_attributes from the custom call.
+-    mlir::DictionaryAttr frontendAttrs;
+-    if (mlir::Attribute frontendAttrs_ =
+-            op->getDiscardableAttr("mhlo.frontend_attributes")) {
+-      frontendAttrs = mlir::cast<mlir::DictionaryAttr>(frontendAttrs_);
+-    } else {
+-      return mlir::failure();
++    // API-v4 FFI attributes live in backend_config. JAX 0.8.1 represents the
++    // dictionary as a discardable attribute for StableHLO compatibility.
++    auto attributes = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
++        op.getBackendConfigAttr());
++    if (!attributes) {
++      attributes = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
++          op->getDiscardableAttr("mhlo.backend_config"));
+@@ -329,4 +329 @@ struct PopulateWeightDtypeFromCustomCall final
+-
+-    // Extract the weight dtype string attribute.
+-    auto weightDtypeAttr = frontendAttrs.get(c_weight_dtype_attr_name);
+-    if (!weightDtypeAttr) {
++    if (!attributes) {
+@@ -335,0 +333 @@ struct PopulateWeightDtypeFromCustomCall final
++    // Extract the weight dtype string attribute.
+@@ -337 +335 @@ struct PopulateWeightDtypeFromCustomCall final
+-        mlir::dyn_cast<mlir::StringAttr>(weightDtypeAttr);
++        attributes.getAs<mlir::StringAttr>(c_weight_dtype_attr_name);
+@@ -354,0 +353,5 @@ struct PopulateWeightDtypeFromCustomCall final
 +      funcOp.setArgAttr(
 +          argIndex, mlir::tt::ttcore::ArgumentTypeAttr::name,
 +          mlir::tt::ttcore::ArgumentTypeAttr::get(
 +              funcOp.getContext(),
 +              mlir::tt::ttcore::ArgumentType::Parameter));
-     }
