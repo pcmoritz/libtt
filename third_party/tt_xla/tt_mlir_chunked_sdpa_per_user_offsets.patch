@@ -182,7 +182,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 index 5ae4641..fb57871 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -229,0 +230,10 @@ parseFloatFromStringAttr(const mlir::StringAttr &stringAttr, float &result) {
+@@ -229,0 +230,29 @@ parseFloatFromStringAttr(const mlir::StringAttr &stringAttr, float &result) {
 +static mlir::DictionaryAttr
 +getFfiBackendConfig(mlir::stablehlo::CustomCallOp op) {
 +  if (auto config = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
@@ -193,6 +193,33 @@ index 5ae4641..fb57871 100644
 +      op->getDiscardableAttr("mhlo.backend_config"));
 +}
 +
++static mlir::LogicalResult
++requireCacheResultAlias(mlir::stablehlo::CustomCallOp op) {
++  auto aliases = op.getOutputOperandAliases();
++  if (aliases.size() != 1) {
++    op.emitOpError("requires exactly one output/input alias");
++    return mlir::failure();
++  }
++
++  auto alias =
++      mlir::cast<mlir::stablehlo::OutputOperandAliasAttr>(aliases[0]);
++  if (alias.getOperandIndex() != 0 ||
++      !alias.getOutputTupleIndices().empty() ||
++      !alias.getOperandTupleIndices().empty()) {
++    op.emitOpError("requires output 0 to alias cache operand 0");
++    return mlir::failure();
++  }
++
++  return mlir::success();
++}
+@@ -9931,0 +9961,3 @@ public:
++    if (mlir::failed(requireCacheResultAlias(srcOp))) {
++      return mlir::failure();
++    }
+@@ -10050,0 +10083,3 @@ public:
++    if (mlir::failed(requireCacheResultAlias(srcOp))) {
++      return mlir::failure();
++    }
 @@ -10276,4 +10286,2 @@ public:
 -    mlir::DictionaryAttr frontendAttributes =
 -        mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
