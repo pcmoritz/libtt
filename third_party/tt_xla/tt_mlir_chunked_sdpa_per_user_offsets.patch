@@ -331,7 +331,7 @@ index 5ae4641..60cef1a 100644
 +    FloatAttr scaleAttr;
 +    if (auto scale = backendConfig.getAs<FloatAttr>("scale")) {
 +      scaleAttr = rewriter.getF32FloatAttr(scale.getValueAsDouble());
-@@ -10357,6 +10350,5 @@ public:
+@@ -10357,6 +10350,11 @@ public:
 -    auto hasAttentionSinkStringAttr =
 -        frontendAttributes.getAs<mlir::StringAttr>("has_attention_sink");
 -    bool hasAttentionSink = false;
@@ -341,18 +341,24 @@ index 5ae4641..60cef1a 100644
 +    IntegerAttr slidingWindowSizeAttr;
 +    if (auto slidingWindowSize =
 +            backendConfig.getAs<IntegerAttr>("sliding_window_size")) {
++      int64_t value = slidingWindowSize.getInt();
++      if (value < 0 ||
++          value > std::numeric_limits<uint32_t>::max()) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "sliding_window_size must fit in uint32");
++      }
 +      slidingWindowSizeAttr =
-+          rewriter.getUI32IntegerAttr(slidingWindowSize.getInt());
-@@ -10365,2 +10357,3 @@ public:
++          rewriter.getUI32IntegerAttr(static_cast<uint32_t>(value));
+@@ -10365,2 +10363,3 @@ public:
 -    if (failed(parseBoolFromStringAttr(hasAttentionSinkStringAttr,
 -                                       hasAttentionSink))) {
 +    size_t expectedOperands =
 +        4 + hasAttentionMask + hasCurPosTensor + hasAttentionSink;
 +    if (adaptor.getOperands().size() != expectedOperands) {
-@@ -10368 +10361 @@ public:
+@@ -10368 +10367 @@ public:
 -          srcOp, "Failed to parse has_attention_sink attribute.");
 +          srcOp, "Paged decode operand count does not match backend_config.");
-@@ -10371,20 +10364,7 @@ public:
+@@ -10371,20 +10370,7 @@ public:
 -    Value query = adaptor.getOperands()[0];
 -    Value key = adaptor.getOperands()[1];
 -    Value value = adaptor.getOperands()[2];
@@ -380,9 +386,9 @@ index 5ae4641..60cef1a 100644
 +        hasCurPosTensor ? adaptor.getOperands()[operandIndex++] : Value();
 +    Value attentionSink =
 +        hasAttentionSink ? adaptor.getOperands()[operandIndex++] : Value();
-@@ -10396 +10375,0 @@ public:
+@@ -10396 +10381,0 @@ public:
 -
-@@ -10399,6 +10378,4 @@ public:
+@@ -10399,6 +10384,4 @@ public:
 -        srcOp,
 -        cast<RankedTensorType>(
 -            getTypeConverter()->convertType(srcOp.getResult(0).getType())),
@@ -393,7 +399,7 @@ index 5ae4641..60cef1a 100644
 +        adaptor.getOperands()[2], adaptor.getOperands()[3], outputTensor,
 +        isCausalAttr, attentionMask, curPosTensor, attentionSink, scaleAttr,
 +        slidingWindowSizeAttr);
-@@ -10425,17 +10402,9 @@ public:
+@@ -10425,17 +10408,9 @@ public:
 -    // scale is the only (optional) frontend attribute; causal masking is
 -    // internal and there are no optional operands.
 -    FloatAttr scaleAttr = nullptr;
