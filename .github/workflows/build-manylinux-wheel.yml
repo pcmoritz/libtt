@@ -12,10 +12,10 @@ permissions:
 
 jobs:
   build-manylinux-wheel:
-    name: Build manylinux_2_28 x86-64 wheel
+    name: Build manylinux_2_34 x86-64 wheel
     runs-on: ubuntu-24.04
     container:
-      image: quay.io/pypa/manylinux_2_28_x86_64
+      image: quay.io/pypa/manylinux_2_34_x86_64
 
     steps:
       - name: Check out repository
@@ -35,7 +35,7 @@ jobs:
       - name: Repair and verify manylinux wheel
         run: |
           auditwheel repair \
-            --plat manylinux_2_28_x86_64 \
+            --plat manylinux_2_34_x86_64 \
             --wheel-dir wheelhouse \
             bazel-bin/jax_tt_plugin-*.whl
           auditwheel show wheelhouse/*.whl
