@@ -242,6 +242,10 @@ cc_binary(
     name = "libtt_zstd_compressor",
     srcs = ["@//third_party/tt_metal:libtt_zstd_compressor.cc"],
     copts = ["-std=c++17"],
+    linkopts = select({
+        "@platforms//os:linux": ["-pthread"],
+        "//conditions:default": [],
+    }),
     deps = ["@llvm_zstd//:zstd"],
 )
 
