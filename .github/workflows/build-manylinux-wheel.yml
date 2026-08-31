@@ -30,7 +30,11 @@ jobs:
           cache-save: ${{ github.event_name != 'pull_request' }}
 
       - name: Build wheel
-        run: bazel build --verbose_failures //:jax_tt_plugin_wheel
+        run: |
+          bazel build \
+            --action_env=PATH="/opt/python/cp313-cp313/bin:$PATH" \
+            --verbose_failures \
+            //:jax_tt_plugin_wheel
 
       - name: Repair and verify manylinux wheel
         run: |
