@@ -178,3 +178,274 @@ index 90468ba..693db64 100644
    if (queryHeadSize != keyHeadSize) {
      return emitOpError("Query head size must match key/value head size.");
    }
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+index 5ae4641..60cef1a 100644
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -229,0 +230,33 @@ parseFloatFromStringAttr(const mlir::StringAttr &stringAttr, float &result) {
++static mlir::DictionaryAttr
++getFfiBackendConfig(mlir::stablehlo::CustomCallOp op) {
++  if (auto config = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
++          op.getBackendConfigAttr())) {
++    return config;
++  }
++  return mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
++      op->getDiscardableAttr("mhlo.backend_config"));
++}
++
++static mlir::LogicalResult
++requireOutputOperandAlias(mlir::stablehlo::CustomCallOp op,
++                          unsigned resultIndex, unsigned operandIndex) {
++  for (mlir::Attribute attr : op.getOutputOperandAliases()) {
++    auto alias =
++        mlir::cast<mlir::stablehlo::OutputOperandAliasAttr>(attr);
++    if (alias.getOperandIndex() != operandIndex ||
++        !alias.getOperandTupleIndices().empty()) {
++      continue;
++    }
++
++    auto outputIndices = alias.getOutputTupleIndices();
++    if ((op.getNumResults() == 1 && resultIndex == 0 &&
++         outputIndices.empty()) ||
++        (outputIndices.size() == 1 && outputIndices[0] == resultIndex)) {
++      return mlir::success();
++    }
++  }
++
++  op.emitOpError() << "requires result " << resultIndex << " to alias operand "
++                   << operandIndex;
++  return mlir::failure();
++}
+@@ -9788,0 +9822,3 @@ public:
++    if (mlir::failed(requireOutputOperandAlias(srcOp, 0, 0))) {
++      return mlir::failure();
++    }
+@@ -9859,0 +9896,3 @@ public:
++    if (mlir::failed(requireOutputOperandAlias(srcOp, 0, 0))) {
++      return mlir::failure();
++    }
+@@ -9931,0 +9971,3 @@ public:
++    if (mlir::failed(requireOutputOperandAlias(srcOp, 0, 0))) {
++      return mlir::failure();
++    }
+@@ -10050,0 +10093,3 @@ public:
++    if (mlir::failed(requireOutputOperandAlias(srcOp, 0, 0))) {
++      return mlir::failure();
++    }
+@@ -10276,57 +10321,2 @@ public:
+-    mlir::DictionaryAttr frontendAttributes =
+-        mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
+-            srcOp->getDiscardableAttr("mhlo.frontend_attributes"));
+-    if (!frontendAttributes) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "PagedScaledDotProductAttentionDecode op must have "
+-                 "mhlo.frontend_attributes attribute.");
+-    }
+-
+-    auto isCausalStringAttr =
+-        frontendAttributes.getAs<mlir::StringAttr>("is_causal");
+-    bool isCausal = true;
+-    if (isCausalStringAttr) {
+-
+-      if (isCausalStringAttr.getValue().lower() == "true") {
+-        isCausal = true;
+-      } else if (isCausalStringAttr.getValue().lower() == "false") {
+-        isCausal = false;
+-      } else {
+-        return rewriter.notifyMatchFailure(
+-            srcOp, "is_causal attribute must be true or false. Received \"" +
+-                       isCausalStringAttr.getValue() + "\".");
+-      }
+-    }
+-
+-    BoolAttr isCausalAttr = rewriter.getBoolAttr(isCausal);
+-
+-    auto scaleStringAttr = frontendAttributes.getAs<mlir::StringAttr>("scale");
+-    FloatAttr scaleAttr = nullptr;
+-    if (scaleStringAttr) {
+-      float scale;
+-      if (failed(parseFloatFromStringAttr(scaleStringAttr, scale))) {
+-        return rewriter.notifyMatchFailure(srcOp,
+-                                           "Failed to parse scale attribute.");
+-      }
+-      scaleAttr = rewriter.getF32FloatAttr(scale);
+-    }
+-
+-    auto slidingWindowSizeStringAttr =
+-        frontendAttributes.getAs<mlir::StringAttr>("sliding_window_size");
+-    IntegerAttr slidingWindowSizeAttr = nullptr;
+-    if (slidingWindowSizeStringAttr) {
+-      uint32_t slidingWindowSize;
+-      if (!llvm::to_integer(slidingWindowSizeStringAttr.getValue(),
+-                            slidingWindowSize)) {
+-        return rewriter.notifyMatchFailure(
+-            srcOp, "sliding_window_size attribute string must be convertible "
+-                   "to non-negative integer. Received \"" +
+-                       slidingWindowSizeStringAttr.getValue() + "\".");
+-      }
+-      slidingWindowSizeAttr = rewriter.getUI32IntegerAttr(slidingWindowSize);
+-    }
+-
+-    auto hasAttentionMaskStringAttr =
+-        frontendAttributes.getAs<mlir::StringAttr>("has_attention_mask");
+-    bool hasAttentionMask = false;
+-    if (!hasAttentionMaskStringAttr) {
++    auto backendConfig = getFfiBackendConfig(srcOp);
++    if (!backendConfig) {
+@@ -10334 +10324 @@ public:
+-          srcOp, "has_attention_mask attribute must be present.");
++          srcOp, "Paged decode requires typed FFI backend_config.");
+@@ -10337,4 +10327,9 @@ public:
+-    if (failed(parseBoolFromStringAttr(hasAttentionMaskStringAttr,
+-                                       hasAttentionMask))) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "Failed to parse has_attention_mask attribute.");
++    BoolAttr isCausalAttr;
++    if (mlir::Attribute attr = backendConfig.get("is_causal")) {
++      isCausalAttr = mlir::dyn_cast<BoolAttr>(attr);
++      if (!isCausalAttr) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "is_causal must be a boolean attribute");
++      }
++    } else {
++      isCausalAttr = rewriter.getBoolAttr(true);
+@@ -10343,7 +10338,15 @@ public:
+-    auto hasCurPosTensorStringAttr =
+-        frontendAttributes.getAs<mlir::StringAttr>("has_cur_pos_tensor");
+-    bool hasCurPosTensor = false;
+-    if (!hasCurPosTensorStringAttr) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "has_cur_pos_tensor attribute must be present.");
+-    }
++    BoolAttr hasAttentionMaskAttr =
++        backendConfig.getAs<BoolAttr>("has_attention_mask");
++    BoolAttr hasCurPosTensorAttr =
++        backendConfig.getAs<BoolAttr>("has_cur_pos_tensor");
++    BoolAttr hasAttentionSinkAttr =
++        backendConfig.getAs<BoolAttr>("has_attention_sink");
++    if (!hasAttentionMaskAttr || !hasCurPosTensorAttr ||
++        !hasAttentionSinkAttr) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "Paged decode requires has_attention_mask, "
++                 "has_cur_pos_tensor, and has_attention_sink");
++    }
++    bool hasAttentionMask = hasAttentionMaskAttr.getValue();
++    bool hasCurPosTensor = hasCurPosTensorAttr.getValue();
++    bool hasAttentionSink = hasAttentionSinkAttr.getValue();
+@@ -10351,4 +10354,8 @@ public:
+-    if (failed(parseBoolFromStringAttr(hasCurPosTensorStringAttr,
+-                                       hasCurPosTensor))) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "Failed to parse has_cur_pos_tensor attribute.");
++    FloatAttr scaleAttr;
++    if (mlir::Attribute attr = backendConfig.get("scale")) {
++      auto scale = mlir::dyn_cast<FloatAttr>(attr);
++      if (!scale) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "scale must be a floating-point attribute");
++      }
++      scaleAttr = rewriter.getF32FloatAttr(scale.getValueAsDouble());
+@@ -10357,6 +10364,15 @@ public:
+-    auto hasAttentionSinkStringAttr =
+-        frontendAttributes.getAs<mlir::StringAttr>("has_attention_sink");
+-    bool hasAttentionSink = false;
+-    if (!hasAttentionSinkStringAttr) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "has_attention_sink attribute must be present.");
++    IntegerAttr slidingWindowSizeAttr;
++    if (mlir::Attribute attr = backendConfig.get("sliding_window_size")) {
++      auto slidingWindowSize = mlir::dyn_cast<IntegerAttr>(attr);
++      if (!slidingWindowSize) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "sliding_window_size must be an integer attribute");
++      }
++      int64_t value = slidingWindowSize.getInt();
++      if (value < 0 ||
++          value > std::numeric_limits<uint32_t>::max()) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "sliding_window_size must fit in uint32");
++      }
++      slidingWindowSizeAttr =
++          rewriter.getUI32IntegerAttr(static_cast<uint32_t>(value));
+@@ -10365,2 +10381,3 @@ public:
+-    if (failed(parseBoolFromStringAttr(hasAttentionSinkStringAttr,
+-                                       hasAttentionSink))) {
++    size_t expectedOperands =
++        4 + hasAttentionMask + hasCurPosTensor + hasAttentionSink;
++    if (adaptor.getOperands().size() != expectedOperands) {
+@@ -10368 +10385 @@ public:
+-          srcOp, "Failed to parse has_attention_sink attribute.");
++          srcOp, "Paged decode operand count does not match backend_config.");
+@@ -10371,20 +10388,7 @@ public:
+-    Value query = adaptor.getOperands()[0];
+-    Value key = adaptor.getOperands()[1];
+-    Value value = adaptor.getOperands()[2];
+-    Value pageTable = adaptor.getOperands()[3];
+-    Value attentionMask = nullptr;
+-    Value curPosTensor = nullptr;
+-    Value attentionSink = nullptr;
+-    int64_t operandIndex = 4;
+-    if (hasAttentionMask) {
+-      attentionMask = adaptor.getOperands()[operandIndex];
+-      operandIndex++;
+-    }
+-    if (hasCurPosTensor) {
+-      curPosTensor = adaptor.getOperands()[operandIndex];
+-      operandIndex++;
+-    }
+-    if (hasAttentionSink) {
+-      attentionSink = adaptor.getOperands()[operandIndex];
+-      operandIndex++;
+-    }
++    size_t operandIndex = 4;
++    Value attentionMask =
++        hasAttentionMask ? adaptor.getOperands()[operandIndex++] : Value();
++    Value curPosTensor =
++        hasCurPosTensor ? adaptor.getOperands()[operandIndex++] : Value();
++    Value attentionSink =
++        hasAttentionSink ? adaptor.getOperands()[operandIndex++] : Value();
+@@ -10396 +10399,0 @@ public:
+-
+@@ -10399,6 +10402,4 @@ public:
+-        srcOp,
+-        cast<RankedTensorType>(
+-            getTypeConverter()->convertType(srcOp.getResult(0).getType())),
+-        query, key, value, pageTable, outputTensor, isCausalAttr, attentionMask,
+-        curPosTensor, attentionSink, scaleAttr, slidingWindowSizeAttr);
+-
++        srcOp, outputType, adaptor.getOperands()[0], adaptor.getOperands()[1],
++        adaptor.getOperands()[2], adaptor.getOperands()[3], outputTensor,
++        isCausalAttr, attentionMask, curPosTensor, attentionSink, scaleAttr,
++        slidingWindowSizeAttr);
+@@ -10425,17 +10426,14 @@ public:
+-    // scale is the only (optional) frontend attribute; causal masking is
+-    // internal and there are no optional operands.
+-    FloatAttr scaleAttr = nullptr;
+-    mlir::DictionaryAttr frontendAttributes =
+-        mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
+-            srcOp->getDiscardableAttr("mhlo.frontend_attributes"));
+-    if (frontendAttributes) {
+-      auto scaleStringAttr =
+-          frontendAttributes.getAs<mlir::StringAttr>("scale");
+-      if (scaleStringAttr) {
+-        float scale;
+-        if (failed(parseFloatFromStringAttr(scaleStringAttr, scale))) {
+-          return rewriter.notifyMatchFailure(
+-              srcOp, "Failed to parse scale attribute.");
+-        }
+-        scaleAttr = rewriter.getF32FloatAttr(scale);
+-      }
++    auto backendConfig = getFfiBackendConfig(srcOp);
++    if (!backendConfig) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "Chunked attention requires typed FFI backend_config.");
++    }
++
++    FloatAttr scaleAttr;
++    if (mlir::Attribute attr = backendConfig.get("scale")) {
++      auto scale = mlir::dyn_cast<FloatAttr>(attr);
++      if (!scale) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "scale must be a floating-point attribute");
++      }
++      scaleAttr = rewriter.getF32FloatAttr(scale.getValueAsDouble());
