@@ -3,6 +3,11 @@ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load("@//:bazel/cc_embed_data.bzl", "cc_embed_data")
 load("@//third_party/sfpi:sfpi_cc_objects.bzl", "sfpi_cc_objects")
 
+config_setting(
+    name = "release_compression",
+    define_values = {"libtt_release_compression": "true"},
+)
+
 package(default_visibility = ["//visibility:public"])
 
 genrule(
@@ -267,7 +272,10 @@ pkg_tar(
         ":tt_metal_runtime_sources",
     ],
     compressor = ":libtt_zstd_compressor",
-    compressor_args = "19",
+    compressor_args = select({
+        ":release_compression": "19",
+        "//conditions:default": "9",
+    }),
     extension = "tar.zst",
     owner = "0.0",
     ownername = ".",
