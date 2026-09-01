@@ -21,6 +21,39 @@ filegroup(
 )
 
 filegroup(
+    name = "runtime_files",
+    srcs = glob(
+        [
+            "compiler/**",
+            "include/**",
+        ],
+        exclude = [
+            "compiler/bin/riscv-tt-elf-gcov*",
+            "compiler/bin/riscv-tt-elf-gdb*",
+            "compiler/bin/riscv-tt-elf-gprof",
+            "compiler/bin/riscv-tt-elf-gstack",
+            "compiler/bin/riscv-tt-elf-lto-dump",
+            "compiler/bin/riscv-tt-elf-run",
+            "compiler/include/gdb/**",
+            "compiler/include/sim/**",
+            "compiler/lib/gcc/riscv-tt-elf/15.1.0/install-tools/**",
+            "compiler/lib/gcc/riscv-tt-elf/15.1.0/qsr32-ilp32/**",
+            "compiler/lib/gcc/riscv-tt-elf/15.1.0/qsr64-lp64/**",
+            "compiler/lib/gcc/riscv-tt-elf/15.1.0/wh-ilp32/**",
+            "compiler/lib/libriscv-tt-elf-sim.a",
+            "compiler/libexec/gcc/riscv-tt-elf/15.1.0/install-tools/**",
+            "compiler/riscv-tt-elf/include/c++/15.1.0/riscv-tt-elf/qsr32-ilp32/**",
+            "compiler/riscv-tt-elf/include/c++/15.1.0/riscv-tt-elf/qsr64-lp64/**",
+            "compiler/riscv-tt-elf/include/c++/15.1.0/riscv-tt-elf/wh-ilp32/**",
+            "compiler/riscv-tt-elf/lib/qsr32-ilp32/**",
+            "compiler/riscv-tt-elf/lib/qsr64-lp64/**",
+            "compiler/riscv-tt-elf/lib/wh-ilp32/**",
+            "compiler/share/**",
+        ],
+    ),
+)
+
+filegroup(
     name = "empty",
     srcs = [],
 )

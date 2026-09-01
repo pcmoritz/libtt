@@ -1,0 +1,56 @@
+name: Build manylinux wheel
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-manylinux-wheel:
+    name: Build manylinux_2_34 x86-64 wheel
+    runs-on: ubuntu-24.04
+    container:
+      image: quay.io/pypa/manylinux_2_34_x86_64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-version: 1.x
+          bazelisk-cache: true
+          repository-cache: true
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Build wheel
+        run: |
+          bazel build \
+            --action_env=PATH="/opt/python/cp313-cp313/bin:$PATH" \
+            --compilation_mode=opt \
+            --define=libtt_release_compression=true \
+            --linkopt=-Wl,--strip-all \
+            --verbose_failures \
+            //:jax_tt_plugin_wheel
+
+      - name: Repair and verify manylinux wheel
+        run: |
+          auditwheel repair \
+            --plat manylinux_2_34_x86_64 \
+            --wheel-dir wheelhouse \
+            bazel-bin/jax_tt_plugin-*.whl
+          auditwheel show wheelhouse/*.whl
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: jax-tt-plugin-manylinux-x86_64
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          compression-level: 0
