@@ -33,6 +33,8 @@ jobs:
         run: |
           bazel build \
             --action_env=PATH="/opt/python/cp313-cp313/bin:$PATH" \
+            --compilation_mode=opt \
+            --linkopt=-Wl,--strip-all \
             --verbose_failures \
             //:jax_tt_plugin_wheel
 
