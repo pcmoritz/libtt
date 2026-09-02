@@ -39,15 +39,29 @@ bool isScalarInteger(Value value) {
          integerType.getWidth() <= 32;
 }
 
+bool isScalarI1(Value value) {
+  auto type = value ? dyn_cast<RankedTensorType>(value.getType())
+                    : RankedTensorType();
+  return type && type.getNumElements() == 1 &&
+         type.getElementType().isInteger(1);
+}
+
 FailureOr<int64_t> getScalarInteger(Value value) {
   if (!isScalarInteger(value)) {
     return failure();
   }
-  auto constant = value.getDefiningOp<stablehlo::ConstantOp>();
-  if (!constant || constant.getValue().getNumElements() != 1) {
+  DenseElementsAttr constantValue;
+  if (auto constant = value.getDefiningOp<stablehlo::ConstantOp>()) {
+    constantValue = dyn_cast<DenseElementsAttr>(constant.getValue());
+  } else if (auto constant = value.getDefiningOp<ttir::ConstantOp>()) {
+    constantValue = dyn_cast<DenseElementsAttr>(constant.getValue());
+  } else {
     return failure();
   }
-  return (*constant.getValue().value_begin<llvm::APInt>()).getSExtValue();
+  if (!constantValue || constantValue.getNumElements() != 1) {
+    return failure();
+  }
+  return (*constantValue.value_begin<llvm::APInt>()).getSExtValue();
 }
 
 struct LoopBound {
@@ -379,9 +393,32 @@ public:
           rewriter.getContext(), branchFunction.getSymName()));
     }
 
+    Value branchIndex = adaptor.getIndex();
+    if (caseOp.getBranches().size() == 2) {
+      if (auto convert =
+              caseOp.getIndex().getDefiningOp<stablehlo::ConvertOp>();
+          convert && isScalarI1(convert.getOperand())) {
+        if (Value predicate =
+                rewriter.getRemappedValue(convert.getOperand())) {
+          branchIndex = predicate;
+        }
+      }
+    }
+
+    if (caseOp.getBranches().size() == 2) {
+      if (auto where = branchIndex.getDefiningOp<ttir::WhereOp>()) {
+        FailureOr<int64_t> trueIndex = getScalarInteger(where.getSecond());
+        FailureOr<int64_t> falseIndex = getScalarInteger(where.getThird());
+        if (isScalarI1(where.getFirst()) && succeeded(trueIndex) &&
+            *trueIndex == 1 && succeeded(falseIndex) && *falseIndex == 0) {
+          branchIndex = where.getFirst();
+        }
+      }
+    }
+
     rewriter.replaceOpWithNewOp<ttcore::CaseOp>(
         caseOp, resultTypes, rewriter.getArrayAttr(branchPrograms),
-        adaptor.getIndex(), convertedCaptures);
+        branchIndex, convertedCaptures);
     return success();
   }
 };
