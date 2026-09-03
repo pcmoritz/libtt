@@ -159,3 +159,17 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    case ::tt::target::ttnn::OpType::WhileLoopOp: {
      for (const auto *input : *opContext.type_as_WhileLoopOp()->inputs()) {
        tensorRefs.push_back(input);
+
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+@@ -704,5 +704,9 @@ private:
+     for (Operation *user : arg.getUsers()) {
+       if (mlir::isa<ttir::MeshShardOp>(user)) {
+         return true;
+       }
++      if (auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(user);
++          caseOp && caseOp.getIndex() == arg) {
++        return true;
++      }
+     }

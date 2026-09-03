@@ -1283,6 +1283,13 @@ cc_library(
         "ttnn/cpp/ttnn/operations/matmul/device/sparse/sparse_matmul_device_operation.cpp",
         "ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.cpp",
         "ttnn/cpp/ttnn/operations/moreh/moreh_helper_functions.cpp",
+    ] + glob(
+        ["ttnn/cpp/ttnn/operations/moreh/moreh_softmax/**/*.cpp"],
+        exclude = [
+            "ttnn/cpp/ttnn/operations/moreh/moreh_softmax/**/*nanobind*.cpp",
+            "ttnn/cpp/ttnn/operations/moreh/moreh_softmax/**/kernels/**",
+        ],
+    ) + [
         "@//third_party/tt_xla:tt_metal_cold_stubs.cc",
     ] + glob(
         ["ttnn/cpp/ttnn/operations/**/*.cpp"],

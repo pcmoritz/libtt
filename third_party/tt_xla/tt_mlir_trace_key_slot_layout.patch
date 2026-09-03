@@ -1,0 +1,34 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+index a7632db..831df9c 100644
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -519,5 +519,14 @@ private:
+       if (i < numDeviceResident) {
+         info.inputSlotTypes.push_back(tensorType);
++      } else if (info.isTraceKeyInput(i)) {
++        // The key's ordinary slot is only a positional placeholder. Use a
++        // supported device dtype; Boolean tensors cannot be device-resident.
++        auto slotElementType = builder.getI32Type();
++        auto slotEncoding = ttnn::TTNNLayoutAttr::Builder(
++                                context, tensorType.getShape(), slotElementType)
++                                .build();
++        info.inputSlotTypes.push_back(RankedTensorType::get(
++            tensorType.getShape(), slotElementType, slotEncoding));
+       } else {
+         info.inputSlotTypes.push_back(utils::RankedTensorTypeFactory::create(
+             tensorType, BufferType::DRAM));
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+index 4ca3c8f..f8bc71e 100644
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -43,6 +43,10 @@ static std::int64_t readTraceKeyScalar(const ::ttnn::Tensor &tensor) {
+     return ::tt::runtime::ttnn::utils::getScalarFromTensor<uint16_t>(tensor);
+   case ::ttnn::DataType::UINT8:
+     return ::tt::runtime::ttnn::utils::getScalarFromTensor<uint8_t>(tensor);
++  case ::ttnn::DataType::BFLOAT16:
++    return static_cast<float>(
++               ::tt::runtime::ttnn::utils::getScalarFromTensor<bfloat16>(tensor)) !=
++           0;
+   default:
+     LOG_FATAL("Unsupported integer trace-key scalar data type");
+   }

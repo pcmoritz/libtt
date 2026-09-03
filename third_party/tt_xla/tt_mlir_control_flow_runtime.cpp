@@ -222,7 +222,9 @@ void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context) {
 
   ::tt::runtime::Tensor index =
       context.getTensorPool().getRuntimeTensorAndValidate(op->index());
-  int64_t branchIndex = readIntegerScalar(index);
+  int64_t branchIndex = op->branch_program_ids()->size() == 2
+                            ? static_cast<int64_t>(readConditionScalar(index))
+                            : readIntegerScalar(index);
   // StableHLO selects the last branch for any out-of-range index, including a
   // negative index.
   size_t selectedBranch = op->branch_program_ids()->size() - 1;
