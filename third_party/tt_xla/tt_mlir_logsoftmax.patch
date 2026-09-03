@@ -1,0 +1,369 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+index 9117955..42e18a9 100644
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -3436,7 +3436,8 @@ def TTIR_SoftmaxOp : TTIR_NamedOp<"softmax"> {
+ 
+     let arguments = (ins AnyRankedTensor:$input,
+                          SI32Attr:$dimension,
+-                         DefaultValuedAttr<BoolAttr, "false">:$numericStable);
++                         DefaultValuedAttr<BoolAttr, "false">:$numericStable,
++                         DefaultValuedAttr<BoolAttr, "false">:$logOutput);
+ 
+     let results = (outs AnyRankedTensor:$result);
+ 
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+index 2cde09e..7d642e0 100644
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1297,21 +1297,31 @@ def TTNN_SoftmaxOp : TTNN_Op<"softmax", [TTNN_ComputeKernelConfigOpInterface]> {
+     let arguments = (ins AnyRankedTensor:$input,
+                          SI32Attr: $dimension,
+                          DefaultValuedAttr<BoolAttr, "false">:$numericStable,
++                         DefaultValuedAttr<BoolAttr, "false">:$logOutput,
+                          OptionalAttr<TTNN_DeviceComputeKernelConfig>:$compute_config);
+ 
+     let results = (outs AnyRankedTensor:$result);
+ 
+     let builders = [
++      OpBuilder<(ins "Type":$result, "Value":$input,
++                     "int32_t":$dimension, "bool":$numericStable,
++                     "bool":$logOutput),
++      [{
++        build($_builder, $_state, result, input, dimension, numericStable,
++              logOutput, /*compute_config=*/nullptr);
++      }]>,
+       OpBuilder<(ins "Type":$result, "Value":$input,
+                      "int32_t":$dimension, "bool":$numericStable),
+       [{
+         build($_builder, $_state, result, input, dimension, numericStable,
++              /*logOutput=*/false,
+               /*compute_config=*/nullptr);
+       }]>,
+       OpBuilder<(ins "Type":$result, "Value":$input,
+                      "int32_t":$dimension),
+       [{
+         build($_builder, $_state, result, input, dimension, /*numericStable=*/false,
++              /*logOutput=*/false,
+               /*compute_config=*/nullptr);
+       }]>
+     ];
+diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/ttmlir/Target/TTNN/operations/normalization.fbs
+index 6d16d74..97ef329 100644
+--- a/include/ttmlir/Target/TTNN/operations/normalization.fbs
++++ b/include/ttmlir/Target/TTNN/operations/normalization.fbs
+@@ -9,6 +9,7 @@ table SoftmaxOp {
+   out: tt.target.ttnn.TensorRef;
+   dimension: int32;
+   numeric_stable: bool = false;
++  log_output: bool = false;
+   compute_config: tt.target.ttnn.DeviceComputeKernelConfig;
+ }
+ 
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+index 3694993..2e31731 100644
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10930,7 +10930,8 @@ static Value buildFlashMlaPrefillDecompositionBody(
+       builder
+           .create<ttir::SoftmaxOp>(loc, fullScoresType, attnInput,
+                                    builder.getSI32IntegerAttr(softmaxDim),
+-                                   builder.getBoolAttr(true))
++                                   builder.getBoolAttr(true),
++                                   builder.getBoolAttr(false))
+           .getResult();
+   if (isGQA) {
+     probsVal =
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+index 30a68ae..d55e6af 100644
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -526,7 +526,8 @@ public:
+                   ConversionPatternRewriter &rewriter) const override {
+     rewriter.replaceOpWithNewOp<ttnn::SoftmaxOp>(
+         op, this->getTypeConverter()->convertType(op.getType()),
+-        adaptor.getInput(), adaptor.getDimension(), adaptor.getNumericStable());
++        adaptor.getInput(), adaptor.getDimension(), adaptor.getNumericStable(),
++        adaptor.getLogOutput());
+     return success();
+   }
+ };
+diff --git a/lib/Dialect/TTIR/Transforms/DecomposeComposites.cpp b/lib/Dialect/TTIR/Transforms/DecomposeComposites.cpp
+index 64a67d7..c9fb909 100644
+--- a/lib/Dialect/TTIR/Transforms/DecomposeComposites.cpp
++++ b/lib/Dialect/TTIR/Transforms/DecomposeComposites.cpp
+@@ -363,7 +363,7 @@ struct DecomposeSDPAPattern
+     int32_t softmaxDim = static_cast<int32_t>(fullScoresType.getRank() - 1);
+     auto probs = rewriter.create<SoftmaxOp>(
+         loc, fullScoresType, attnInput, rewriter.getSI32IntegerAttr(softmaxDim),
+-        rewriter.getBoolAttr(true));
++        rewriter.getBoolAttr(true), rewriter.getBoolAttr(false));
+ 
+     // For GQA, reshape probs back to grouped form for V matmul:
+     //   [B, NH, Sq, Sk] -> [B, NKV, groups*Sq, Sk]
+diff --git a/lib/Dialect/TTIR/Transforms/EraseInverseOps/SoftmaxCommutePatterns.cpp b/lib/Dialect/TTIR/Transforms/EraseInverseOps/SoftmaxCommutePatterns.cpp
+index f72dc7b..faa3294 100644
+--- a/lib/Dialect/TTIR/Transforms/EraseInverseOps/SoftmaxCommutePatterns.cpp
++++ b/lib/Dialect/TTIR/Transforms/EraseInverseOps/SoftmaxCommutePatterns.cpp
+@@ -64,7 +64,7 @@ public:
+     // Create a new Softmax Op with updated dimension attribute
+     auto newSoftmaxOp = rewriter.create<SoftmaxOp>(
+         op->getLoc(), outputReshapeType, newInputReshape.getResult(),
+-        newSoftmaxDimAttr, op.getNumericStableAttr());
++        newSoftmaxDimAttr, op.getNumericStableAttr(), op.getLogOutputAttr());
+ 
+     // All users must be identical TMs.
+     SmallVector<Operation *> users(op->getUsers());
+@@ -115,7 +115,7 @@ public:
+     // Create new Softmax Op with updated dimension attribute
+     auto newSoftmaxOp = rewriter.create<SoftmaxOp>(
+         op->getLoc(), newSoftmaxInputType, reshapeOperand.getInput(),
+-        newSoftmaxDimAttr, op.getNumericStableAttr());
++        newSoftmaxDimAttr, op.getNumericStableAttr(), op.getLogOutputAttr());
+ 
+     // Create new reshape Op
+     auto originalSoftmaxOpType =
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+index 839b807..5d3d534 100644
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -283,20 +283,122 @@ public:
+     // Replace div op with new softmax op.
+     rewriter.replaceOpWithNewOp<SoftmaxOp>(divOp, divOp.getType(),
+                                            expOp.getInput(), reduceDim,
+-                                           /*numericStable=*/false);
++                                           /*numericStable=*/false,
++                                           /*logOutput=*/false);
+ 
+     return mlir::success();
+   }
+ };
+ 
++// Strip shape- and precision-only operations used around JAX reductions.
++static mlir::Value lookThroughLogSoftmaxPassthroughOps(mlir::Value value) {
++  while (mlir::Operation *definingOp = value.getDefiningOp()) {
++    if (auto broadcastOp = mlir::dyn_cast<BroadcastOp>(definingOp)) {
++      value = broadcastOp.getInput();
++      continue;
++    }
++    if (auto reshapeOp = mlir::dyn_cast<ReshapeOp>(definingOp)) {
++      value = reshapeOp.getInput();
++      continue;
++    }
++    if (auto typecastOp = mlir::dyn_cast<TypecastOp>(definingOp)) {
++      value = typecastOp.getInput();
++      continue;
++    }
++    break;
++  }
++  return value;
++}
++
++static std::optional<double>
++getLogSoftmaxSplatConstantValue(mlir::Value value) {
++  value = lookThroughLogSoftmaxPassthroughOps(value);
++  mlir::Operation *op = value.getDefiningOp();
++  if (!op) {
++    return std::nullopt;
++  }
++
++  if (auto fullOp = mlir::dyn_cast<FullOp>(op)) {
++    if (auto floatAttr =
++            mlir::dyn_cast<mlir::FloatAttr>(fullOp.getFillValue())) {
++      return floatAttr.getValue().convertToDouble();
++    }
++    return std::nullopt;
++  }
++
++  if (auto constantOp = mlir::dyn_cast<ConstantOp>(op)) {
++    auto elements =
++        mlir::dyn_cast<mlir::ElementsAttr>(constantOp.getValue());
++    if (elements && elements.isSplat() &&
++        mlir::isa<mlir::FloatType>(elements.getElementType())) {
++      return elements.getSplatValue<mlir::APFloat>().convertToDouble();
++    }
++  }
++
++  return std::nullopt;
++}
++
++static bool isNegativeInfinityValue(mlir::Value value) {
++  auto scalar = getLogSoftmaxSplatConstantValue(value);
++  return scalar && std::isinf(*scalar) && *scalar < 0.0;
++}
++
++// Fuse the canonical log-softmax tail emitted by JAX:
++// x - log(sum(exp(x), dim)) -> softmax(x, dim, log_output=true).
++//
++// A preceding x = input - max(input, dim) is folded independently by
++// NumericStableSoftmaxFusionPattern below.
++class LogSoftmaxFusionPattern : public mlir::OpRewritePattern<SubtractOp> {
++  using mlir::OpRewritePattern<SubtractOp>::OpRewritePattern;
++
++public:
++  mlir::LogicalResult
++  matchAndRewrite(SubtractOp subtractOp,
++                  mlir::PatternRewriter &rewriter) const final {
++    mlir::Value logValue =
++        lookThroughLogSoftmaxPassthroughOps(subtractOp.getRhs());
++    auto logOp = logValue.getDefiningOp<LogOp>();
++    if (!logOp) {
++      return mlir::failure();
++    }
++
++    mlir::Value sumValue =
++        lookThroughLogSoftmaxPassthroughOps(logOp.getInput());
++    auto sumOp = sumValue.getDefiningOp<SumOp>();
++    if (!sumOp || !sumOp.getDimArg()) {
++      return mlir::failure();
++    }
++
++    mlir::ArrayAttr reduceDims = *sumOp.getDimArg();
++    if (reduceDims.size() != 1) {
++      return mlir::failure();
++    }
++
++    mlir::Value expValue =
++        lookThroughLogSoftmaxPassthroughOps(sumOp.getInput());
++    auto expOp = expValue.getDefiningOp<ExpOp>();
++    if (!expOp || expOp.getInput() != subtractOp.getLhs()) {
++      return mlir::failure();
++    }
++
++    int64_t reduceDim =
++        mlir::cast<mlir::IntegerAttr>(reduceDims[0]).getInt();
++    rewriter.replaceOpWithNewOp<SoftmaxOp>(
++        subtractOp, subtractOp.getType(), expOp.getInput(), reduceDim,
++        /*numericStable=*/false, /*logOutput=*/true);
++    return mlir::success();
++  }
++};
++
+ // This pattern detects and fuses numerically stable softmax operations:
+ // softmax(x - max(x)) -> softmax(x, numericStable=true).
+ //
+ // The pattern matches the following sequence:
+-// 1. max(x) along a dimension with keep_dim=true
+-// 2. (optional) broadcast the max value
+-// 3. subtract: x - (broadcasted) max
+-// 4. softmax(x - (broadcasted) max)
++// 1. max(x) along the softmax dimension
++// 2. (optional) maximum(-inf, max(x)), as emitted by JAX
++// 3. (optional) broadcast the max value
++// 4. subtract: x - (broadcasted) max
++// 5. softmax(x - (broadcasted) max)
+ class NumericStableSoftmaxFusionPattern
+     : public mlir::OpRewritePattern<SoftmaxOp> {
+   using mlir::OpRewritePattern<SoftmaxOp>::OpRewritePattern;
+@@ -319,12 +421,23 @@ public:
+     mlir::Value originalInput = subOp.getLhs();
+     mlir::Value subtractedValue = subOp.getRhs();
+ 
+-    // Check if the subtracted value is a broadcast operation or directly a max.
+-    // If broadcast folding has occurred, the broadcast may be eliminated.
++    // Look through broadcasts and JAX's redundant maximum(-inf, max(x)) guard.
+     BroadcastOp broadcastOp = subtractedValue.getDefiningOp<BroadcastOp>();
+-    // Check if we have a max operation.
+-    auto maxOp =
+-        ttmlir::utils::findOpThrough<MaxOp, BroadcastOp>(subtractedValue);
++    mlir::Value maxValue =
++        lookThroughLogSoftmaxPassthroughOps(subtractedValue);
++    if (auto maximumOp = maxValue.getDefiningOp<MaximumOp>()) {
++      if (isNegativeInfinityValue(maximumOp.getLhs())) {
++        maxValue = maximumOp.getRhs();
++      } else if (isNegativeInfinityValue(maximumOp.getRhs())) {
++        maxValue = maximumOp.getLhs();
++      } else {
++        return mlir::failure();
++      }
++      maxValue = lookThroughLogSoftmaxPassthroughOps(maxValue);
++    }
++
++    auto maxOp = maxValue.getDefiningOp<MaxOp>();
++
+     if (!maxOp) {
+       return mlir::failure();
+     }
+@@ -335,8 +448,7 @@ public:
+     }
+ 
+     // Verify that max reduces along the same dimension as softmax
+-    // and has keep_dim=true for proper broadcasting.
+-    if (!maxOp.getDimArg() || !maxOp.getKeepDim()) {
++    if (!maxOp.getDimArg()) {
+       return mlir::failure();
+     }
+ 
+@@ -363,7 +475,7 @@ public:
+     rewriter.replaceOpWithNewOp<SoftmaxOp>(
+         softmaxOp, softmaxOp.getResult().getType(), originalInput,
+         softmaxOp.getDimension(),
+-        /*numericStable=*/true);
++        /*numericStable=*/true, softmaxOp.getLogOutput());
+ 
+     return mlir::success();
+   }
+@@ -3754,6 +3866,7 @@ public:
+       patterns.add<ReductionWithReshapePattern<ArgMaxOp>>(&getContext());
+ 
+       patterns.add<SoftmaxFusionPattern>(&getContext());
++      patterns.add<LogSoftmaxFusionPattern>(&getContext());
+       patterns.add<NumericStableSoftmaxFusionPattern>(&getContext());
+ 
+       patterns.add<ReluFusionPattern>(&getContext());
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+index bfd4e8f..5544030 100644
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -3183,12 +3183,14 @@ createSoftmaxOp(FlatbufferObjectCache &cache, SoftmaxOp op) {
+                                   /*local_shape*/ std::nullopt);
+   int32_t dimension = op.getDimension();
+   bool numericStable = op.getNumericStable();
++  bool logOutput = op.getLogOutput();
+   std::optional<
+       ::flatbuffers::Offset<::tt::target::ttnn::DeviceComputeKernelConfig>>
+       computeConfig = toFlatbuffer(cache, op.getComputeConfig());
+ 
+   return ::tt::target::ttnn::CreateSoftmaxOp(
+-      *cache.fbb, in, out, dimension, numericStable, computeConfig.value_or(0));
++      *cache.fbb, in, out, dimension, numericStable, logOutput,
++      computeConfig.value_or(0));
+ }
+ 
+ ::flatbuffers::Offset<::tt::target::ttnn::DeallocateOp>
+diff --git a/runtime/lib/ttnn/operations/normalization/softmax.cpp b/runtime/lib/ttnn/operations/normalization/softmax.cpp
+index 49ff4a2..77d2fbe 100644
+--- a/runtime/lib/ttnn/operations/normalization/softmax.cpp
++++ b/runtime/lib/ttnn/operations/normalization/softmax.cpp
+@@ -6,6 +6,7 @@
+ #include "tt/runtime/detail/common/logger.h"
+ #include "tt/runtime/detail/ttnn/ttnn.h"
+ 
++#include "ttnn/operations/moreh/moreh_softmax/moreh_softmax.hpp"
+ #include "tt/runtime/detail/ttnn/operations/utils.h"
+ #include "tt/runtime/detail/ttnn/utils.h"
+ 
+@@ -29,8 +30,21 @@ void run(const ::tt::target::ttnn::SoftmaxOp *op, ProgramContext &context) {
+         utils::createDeviceComputeKernelConfig(op->compute_config());
+   }
+ 
+-  ::ttnn::Tensor out = ::ttnn::softmax(in, dimension, outputMemoryConfig,
+-                                       computeConfig, numericStable);
++  ::ttnn::Tensor out;
++  if (op->log_output()) {
++    int32_t rank = static_cast<int32_t>(in.logical_shape().rank());
++    uint32_t normalizedDimension =
++        static_cast<uint32_t>(dimension < 0 ? dimension + rank : dimension);
++    out = ::ttnn::moreh_logsoftmax(
++        in, normalizedDimension, std::nullopt,
++        ::ttnn::operations::moreh::moreh_softmax::MorehSoftmaxOp::LOGSOFTMAX,
++        ::ttnn::operations::moreh::moreh_softmax::
++            MorehSoftmaxOpParallelizationStrategy::NONE,
++        outputMemoryConfig, computeConfig);
++  } else {
++    out = ::ttnn::softmax(in, dimension, outputMemoryConfig, computeConfig,
++                          numericStable);
++  }
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
