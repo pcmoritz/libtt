@@ -1,0 +1,669 @@
+diff --git ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/kernels/moreh_logsoftmax_w_parallel.cpp ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/kernels/moreh_logsoftmax_w_parallel.cpp
+new file mode 100644
+index 0000000..59c2220
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/kernels/moreh_logsoftmax_w_parallel.cpp
+@@ -0,0 +1,113 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#include <cstdint>
++
++#include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.hpp"
++#include "ttnn/kernel/compute/moreh_common.hpp"
++#include "api/dataflow/dataflow_buffer.h"
++
++void kernel_main() {
++    constexpr auto cb_in0 = tt::CBIndex::c_0;
++    constexpr auto cb_mask = tt::CBIndex::c_1;
++    constexpr auto cb_max_scaler = tt::CBIndex::c_2;
++    constexpr auto cb_sum_scaler = tt::CBIndex::c_3;
++    constexpr auto cb_out0 = tt::CBIndex::c_16;
++    constexpr auto cb_exps = tt::CBIndex::c_24;
++    constexpr auto cb_partial_max = tt::CBIndex::c_25;
++    constexpr auto cb_partial_sum = tt::CBIndex::c_26;
++    constexpr auto cb_global_max = tt::CBIndex::c_27;
++    constexpr auto cb_global_logsum = tt::CBIndex::c_28;
++    constexpr auto cb_aggregate = tt::CBIndex::c_29;
++    constexpr auto cb_root_max = tt::CBIndex::c_30;
++    constexpr auto cb_root_logsum = tt::CBIndex::c_31;
++    constexpr auto cb_add = tt::CBIndex::c_20;
++    constexpr auto cb_tmp = tt::CBIndex::c_21;
++
++    DataflowBuffer input(cb_in0);
++    DataflowBuffer mask(cb_mask);
++    DataflowBuffer output(cb_out0);
++    DataflowBuffer exps(cb_exps);
++    DataflowBuffer partial_max(cb_partial_max);
++    DataflowBuffer partial_sum(cb_partial_sum);
++    DataflowBuffer global_max(cb_global_max);
++    DataflowBuffer global_logsum(cb_global_logsum);
++    DataflowBuffer aggregate(cb_aggregate);
++    DataflowBuffer root_max(cb_root_max);
++    DataflowBuffer root_logsum(cb_root_logsum);
++    DataflowBuffer add(cb_add);
++    DataflowBuffer tmp(cb_tmp);
++
++    constexpr uint32_t local_wt = get_compile_time_arg_val(0);
++    constexpr bool is_root = get_compile_time_arg_val(1) == 1;
++    constexpr uint32_t num_cores = get_compile_time_arg_val(2);
++
++    binary_op_init_common(cb_in0, cb_max_scaler, cb_out0);
++
++    // Each core reduces one contiguous width shard to a partial maximum.
++    if constexpr (local_wt == 1) {
++        mask_tile_to_cb(input, mask, tmp, 0, 0, /*pop0=*/1, /*popm=*/0);
++        compute_kernel_lib::reduce<PoolType::MAX, ReduceDim::REDUCE_ROW, cb_tmp, cb_max_scaler, cb_partial_max>(
++            compute_kernel_lib::ReduceInputBlockShape::single());
++    } else {
++        compute_kernel_lib::reduce<PoolType::MAX, ReduceDim::REDUCE_ROW, cb_in0, cb_max_scaler, cb_partial_max>(
++            compute_kernel_lib::ReduceInputBlockShape::row(local_wt - 1));
++        mask_tile_to_cb(input, mask, tmp, 0, 0, /*pop0=*/1, /*popm=*/0);
++        compute_kernel_lib::reduce<PoolType::MAX, ReduceDim::REDUCE_ROW, cb_tmp, cb_max_scaler, cb_partial_max>(
++            compute_kernel_lib::ReduceInputBlockShape::single(),
++            compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
++            compute_kernel_lib::Accumulate::at(cb_partial_max, /*iteration=*/1));
++    }
++
++    // Core 0 combines all partial maxima. The reader broadcasts the result.
++    if constexpr (is_root) {
++        compute_kernel_lib::reduce<PoolType::MAX, ReduceDim::REDUCE_ROW, cb_aggregate, cb_max_scaler, cb_root_max>(
++            compute_kernel_lib::ReduceInputBlockShape::row(num_cores));
++    }
++
++    global_max.wait_front(1);
++
++    // Compute a partial sum(exp(x - global_max)) for this width shard.
++    for (uint32_t w = 0; w < local_wt; ++w) {
++        sub_tiles_bcast_cols_to_cb(input, global_max, tmp, 0, 0, /*pop0=*/1, /*pop1=*/0);
++        exp_tile_to_cb(tmp, exps);
++        if (w == 0) {
++            copy_tile_to_cb(exps, add);
++        } else {
++            add_tiles_to_cb(add, exps, add);
++        }
++    }
++
++    compute_kernel_lib::reduce<PoolType::SUM, ReduceDim::REDUCE_ROW, cb_add, cb_sum_scaler, cb_partial_sum>(
++        compute_kernel_lib::ReduceInputBlockShape::single());
++
++    // Core 0 combines the partial sums and computes log(sum).
++    if constexpr (is_root) {
++        compute_kernel_lib::reduce<
++            PoolType::SUM,
++            ReduceDim::REDUCE_ROW,
++            cb_aggregate,
++            cb_sum_scaler,
++            cb_root_logsum,
++            compute_kernel_lib::ReduceInputPolicy::BulkWaitBulkPop>(
++            compute_kernel_lib::ReduceInputBlockShape::row(num_cores),
++            compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
++            compute_kernel_lib::NoAccumulation{},
++            [](uint32_t dst_idx) {
++                log_tile_init();
++                log_tile(dst_idx);
++            });
++    }
++
++    global_logsum.wait_front(1);
++
++    // Produce x - global_max - log(global_sum) for this core's width shard.
++    for (uint32_t w = 0; w < local_wt; ++w) {
++        sub_tiles_bcast_cols_to_cb(input, global_max, tmp, 0, 0, /*pop0=*/1, /*pop1=*/0);
++        sub_tiles_bcast_cols_to_cb(tmp, global_logsum, output, 0, 0, /*pop0=*/1, /*pop1=*/0);
++    }
++
++    global_logsum.pop_front(1);
++    global_max.pop_front(1);
++}
+diff --git ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/kernels/reader_moreh_logsoftmax_w_parallel.cpp ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/kernels/reader_moreh_logsoftmax_w_parallel.cpp
+new file mode 100644
+index 0000000..264d91f
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/kernels/reader_moreh_logsoftmax_w_parallel.cpp
+@@ -0,0 +1,213 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#include <cstdint>
++
++#include "ttnn/kernel/dataflow/moreh_common.hpp"
++#include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_dataflow.hpp"
++#include "api/dataflow/dataflow_buffer.h"
++#include "api/dataflow/endpoints.h"
++#include "api/dataflow/noc.h"
++#include "api/dataflow/noc_semaphore.h"
++#include "api/tensor/noc_traits.h"
++
++namespace {
++template <typename Accessor>
++inline __attribute__((always_inline)) void read_width_shard(
++    Noc& noc,
++    const Accessor& src,
++    DataflowBuffer& input,
++    uint32_t start_tile,
++    uint32_t local_wt,
++    uint32_t tile_bytes) {
++    for (uint32_t w = 0; w < local_wt; ++w) {
++        input.reserve_back(1);
++        noc.async_read(src, input, tile_bytes, {.page_id = start_tile + w}, {.offset_bytes = 0});
++        noc.async_read_barrier();
++        input.push_back(1);
++    }
++}
++
++inline __attribute__((always_inline)) void send_partial(
++    Noc& noc,
++    Semaphore<>& partial_done_sem,
++    DataflowBuffer& partial,
++    uint32_t aggregate_base,
++    uint32_t aggregate_tile_offset,
++    uint32_t core_index,
++    uint32_t root_x,
++    uint32_t root_y) {
++    partial.wait_front(1);
++
++    const uint32_t tile_bytes = partial.get_entry_size();
++    noc.async_write(
++        partial,
++        UnicastEndpoint{},
++        tile_bytes,
++        {.offset_bytes = 0},
++        {.noc_x = root_x,
++         .noc_y = root_y,
++         .addr = aggregate_base + (aggregate_tile_offset + core_index) * tile_bytes});
++    noc.async_write_barrier();
++    partial.pop_front(1);
++
++    partial_done_sem.up(noc, root_x, root_y, 1);
++    noc.async_atomic_barrier();
++}
++
++inline __attribute__((always_inline)) void broadcast_scalar(
++    Noc& noc,
++    Semaphore<>& broadcast_sem,
++    DataflowBuffer& source,
++    DataflowBuffer& destination,
++    uint32_t round,
++    uint32_t num_cores,
++    uint32_t mcast_x_start,
++    uint32_t mcast_y_start,
++    uint32_t mcast_x_end,
++    uint32_t mcast_y_end) {
++    source.wait_front(1);
++    const uint32_t tile_bytes = source.get_entry_size();
++
++    noc.async_write_multicast<NocOptions::MCAST_INCL_SRC>(
++        source,
++        MulticastEndpoint{},
++        tile_bytes,
++        num_cores,
++        {.offset_bytes = 0},
++        {.noc_x_start = mcast_x_start,
++         .noc_y_start = mcast_y_start,
++         .noc_x_end = mcast_x_end,
++         .noc_y_end = mcast_y_end,
++         .addr = destination.get_write_ptr()},
++        false);
++    noc.async_write_barrier();
++
++    broadcast_sem.set(round);
++    broadcast_sem.set_multicast(
++        noc, mcast_x_start, mcast_y_start, mcast_x_end, mcast_y_end, num_cores - 1);
++    noc.async_write_barrier();
++    source.pop_front(1);
++}
++}  // namespace
++
++void kernel_main() {
++    const uint32_t src_addr = get_arg_val<uint32_t>(0);
++    const uint32_t start_tile = get_arg_val<uint32_t>(1);
++    const uint32_t local_wt = get_arg_val<uint32_t>(2);
++    const uint32_t mask_w = get_arg_val<uint32_t>(3);
++    const bool is_root = get_arg_val<uint32_t>(4) == 1;
++    const uint32_t num_cores = get_arg_val<uint32_t>(5);
++    const uint32_t core_index = get_arg_val<uint32_t>(6);
++    const uint32_t root_x = get_arg_val<uint32_t>(7);
++    const uint32_t root_y = get_arg_val<uint32_t>(8);
++    const uint32_t mcast_x_start = get_arg_val<uint32_t>(9);
++    const uint32_t mcast_y_start = get_arg_val<uint32_t>(10);
++    const uint32_t mcast_x_end = get_arg_val<uint32_t>(11);
++    const uint32_t mcast_y_end = get_arg_val<uint32_t>(12);
++
++    constexpr bool is_fp32 = get_compile_time_arg_val(0) == 1;
++    constexpr auto in_args = TensorAccessorArgs<1>();
++    const auto src = TensorAccessor(in_args, src_addr);
++
++    constexpr auto cb_in = tt::CBIndex::c_0;
++    constexpr auto cb_mask = tt::CBIndex::c_1;
++    constexpr auto cb_max_scaler = tt::CBIndex::c_2;
++    constexpr auto cb_sum_scaler = tt::CBIndex::c_3;
++    constexpr auto cb_global_max = tt::CBIndex::c_27;
++    constexpr auto cb_partial_max = tt::CBIndex::c_25;
++    constexpr auto cb_partial_sum = tt::CBIndex::c_26;
++    constexpr auto cb_global_logsum = tt::CBIndex::c_28;
++    constexpr auto cb_aggregate = tt::CBIndex::c_29;
++
++    constexpr auto cb_root_max = tt::CBIndex::c_30;
++    constexpr auto cb_root_logsum = tt::CBIndex::c_31;
++    DataflowBuffer input(cb_in);
++    DataflowBuffer mask(cb_mask);
++    DataflowBuffer global_max(cb_global_max);
++    DataflowBuffer partial_max(cb_partial_max);
++    DataflowBuffer partial_sum(cb_partial_sum);
++    DataflowBuffer global_logsum(cb_global_logsum);
++    DataflowBuffer aggregate(cb_aggregate);
++    Noc noc;
++
++    DataflowBuffer root_max(cb_root_max);
++    DataflowBuffer root_logsum(cb_root_logsum);
++    Semaphore<> partial_done_sem(0);
++    Semaphore<> broadcast_sem(1);
++
++    dataflow_kernel_lib::
++        calculate_and_prepare_reduce_scaler<cb_max_scaler, ckernel::PoolType::MAX, ckernel::ReduceDim::REDUCE_ROW>();
++    dataflow_kernel_lib::
++        calculate_and_prepare_reduce_scaler<cb_sum_scaler, ckernel::PoolType::SUM, ckernel::ReduceDim::REDUCE_ROW>();
++
++    if constexpr (is_fp32) {
++        generate_mask_w<uint32_t>(mask, mask_w);
++    } else {
++        generate_mask_w<uint16_t>(mask, mask_w);
++    }
++
++    const uint32_t tile_bytes = input.get_entry_size();
++    const uint32_t aggregate_base = aggregate.get_write_ptr();
++
++    // Keep all collective traffic on this RISC. The root owns two fixed banks
++    // in the aggregate CB, one for each reduction.
++    global_max.reserve_back(1);
++    if (is_root) {
++        aggregate.reserve_back(num_cores);
++        partial_done_sem.set(0);
++    }
++
++    read_width_shard(noc, src, input, start_tile, local_wt, tile_bytes);
++    send_partial(
++        noc, partial_done_sem, partial_max, aggregate_base, 0, core_index, root_x, root_y);
++
++    if (is_root) {
++        partial_done_sem.wait(num_cores);
++        aggregate.push_back(num_cores);
++        aggregate.reserve_back(num_cores);
++        broadcast_scalar(
++            noc,
++            broadcast_sem,
++            root_max,
++            global_max,
++            1,
++            num_cores,
++            mcast_x_start,
++            mcast_y_start,
++            mcast_x_end,
++            mcast_y_end);
++    }
++
++    broadcast_sem.wait(1);
++    global_max.push_back(1);
++
++    // Stream the same shard again for the partial exponential sum.
++    read_width_shard(noc, src, input, start_tile, local_wt, tile_bytes);
++    global_logsum.reserve_back(1);
++    send_partial(
++        noc, partial_done_sem, partial_sum, aggregate_base, num_cores, core_index, root_x, root_y);
++
++    if (is_root) {
++        partial_done_sem.wait(2 * num_cores);
++        aggregate.push_back(num_cores);
++        broadcast_scalar(
++            noc,
++            broadcast_sem,
++            root_logsum,
++            global_logsum,
++            2,
++            num_cores,
++            mcast_x_start,
++            mcast_y_start,
++            mcast_x_end,
++            mcast_y_end);
++    }
++
++    broadcast_sem.wait(2);
++    global_logsum.push_back(1);
++
++    // Third and final read feeds the output stage.
++    read_width_shard(noc, src, input, start_tile, local_wt, tile_bytes);
++}
+diff --git ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/kernels/writer_moreh_logsoftmax_w_parallel.cpp ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/kernels/writer_moreh_logsoftmax_w_parallel.cpp
+new file mode 100644
+index 0000000..4533432
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/kernels/writer_moreh_logsoftmax_w_parallel.cpp
+@@ -0,0 +1,36 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#include <cstdint>
++
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/dataflow_buffer.h"
++#include "api/dataflow/noc.h"
++#include "api/tensor/noc_traits.h"
++
++
++void kernel_main() {
++    const uint32_t dst_addr = get_arg_val<uint32_t>(0);
++    const uint32_t start_tile = get_arg_val<uint32_t>(1);
++    const uint32_t local_wt = get_arg_val<uint32_t>(2);
++
++    constexpr auto out_args = TensorAccessorArgs<0>();
++    const auto dst = TensorAccessor(out_args, dst_addr);
++
++    constexpr auto cb_out = tt::CBIndex::c_16;
++
++    DataflowBuffer output(cb_out);
++
++    const uint32_t tile_bytes = output.get_entry_size();
++    Noc noc;
++    for (uint32_t w = 0; w < local_wt; ++w) {
++        output.wait_front(1);
++        noc.async_write(
++            output, dst, tile_bytes, {.offset_bytes = 0}, {.page_id = start_tile + w});
++        noc.async_write_barrier();
++        output.pop_front(1);
++    }
++
++    noc.async_atomic_barrier();
++}
+diff --git ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/moreh_softmax_device_operation.cpp ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/moreh_softmax_device_operation.cpp
+index 230349a..0560041 100644
+--- ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/moreh_softmax_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/moreh_softmax_device_operation.cpp
+@@ -78,6 +78,7 @@ MorehSoftmaxOperation::program_factory_t MorehSoftmaxOperation::select_program_f
+ 
+     switch (strategy) {
+         case MorehSoftmaxOpParallelizationStrategy::SMALL_W: return MorehSoftmaxWSmallFactory{};
++        case MorehSoftmaxOpParallelizationStrategy::PARALLEL_W: return MorehSoftmaxWParallelFactory{};
+         case MorehSoftmaxOpParallelizationStrategy::SMALL_H: return MorehSoftmaxHSmallFactory{};
+         case MorehSoftmaxOpParallelizationStrategy::LARGE_W: return MorehSoftmaxWLargeFactory{};
+         case MorehSoftmaxOpParallelizationStrategy::LARGE_C: return MorehSoftmaxCLargeFactory{};
+@@ -138,6 +139,16 @@ MorehSoftmaxOpParallelizationStrategy MorehSoftmaxOperation::get_parallelization
+     auto rank = input.logical_shape().rank();
+     if (strategy == MorehSoftmaxOpParallelizationStrategy::NONE) {
+         if (rank - 1 == dim) {
++            const auto shape = input.padded_shape();
++            const auto h = shape[-2];
++            const auto w = shape[-1];
++            const auto num_kernel_rows =
++                input.physical_volume() / h / w * h / tt::constants::TILE_HEIGHT;
++            const auto wt = w / tt::constants::TILE_WIDTH;
++            if (operation_attributes.op == MorehSoftmaxOp::LOGSOFTMAX &&
++                input.dtype() == DataType::BFLOAT16 && num_kernel_rows == 1 && wt >= 256) {
++                return MorehSoftmaxOpParallelizationStrategy::PARALLEL_W;
++            }
+             if (is_moreh_softmax_w_small_available(input, compute_kernel_config)) {
+                 return MorehSoftmaxOpParallelizationStrategy::SMALL_W;
+             }
+@@ -168,7 +179,8 @@ MorehSoftmaxOpParallelizationStrategy MorehSoftmaxOperation::get_parallelization
+     } else if (rank - 1 == dim) {
+         TT_FATAL(
+             strategy == MorehSoftmaxOpParallelizationStrategy::SMALL_W ||
+-                strategy == MorehSoftmaxOpParallelizationStrategy::LARGE_W,
++                strategy == MorehSoftmaxOpParallelizationStrategy::LARGE_W ||
++                strategy == MorehSoftmaxOpParallelizationStrategy::PARALLEL_W,
+             "Invalid parallelization strategy. {} is not for dim W",
+             strategy);
+ 
+diff --git ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/moreh_softmax_device_operation.hpp ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/moreh_softmax_device_operation.hpp
+index 8e9f4a5..159eec6 100644
+--- ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/moreh_softmax_device_operation.hpp
++++ ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/moreh_softmax_device_operation.hpp
+@@ -14,6 +14,7 @@ namespace ttnn::operations::moreh::moreh_softmax {
+ enum class MorehSoftmaxOpParallelizationStrategy {
+     NONE,
+     SMALL_W,
++    PARALLEL_W,
+     SMALL_H,
+     LARGE_W,
+     LARGE_H,
+@@ -58,6 +59,7 @@ struct MorehSoftmaxOperation {
+     DEFINE_SOFTMAX_FACTORY(MorehSoftmaxHLargeFactory)
+     DEFINE_SOFTMAX_FACTORY(MorehSoftmaxHSmallFactory)
+     DEFINE_SOFTMAX_FACTORY(MorehSoftmaxWLargeFactory)
++    DEFINE_SOFTMAX_FACTORY(MorehSoftmaxWParallelFactory)
+     DEFINE_SOFTMAX_FACTORY(MorehSoftmaxWSmallFactory)
+ #undef DEFINE_SOFTMAX_FACTORY
+ 
+@@ -65,6 +67,7 @@ struct MorehSoftmaxOperation {
+         MorehSoftmaxCLargeFactory,
+         MorehSoftmaxHLargeFactory,
+         MorehSoftmaxWLargeFactory,
++        MorehSoftmaxWParallelFactory,
+         MorehSoftmaxHSmallFactory,
+         MorehSoftmaxWSmallFactory>;
+ 
+diff --git ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/softmax_w_parallel/softmax_w_parallel.cpp ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/softmax_w_parallel/softmax_w_parallel.cpp
+new file mode 100644
+index 0000000..9926157
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/softmax_w_parallel/softmax_w_parallel.cpp
+@@ -0,0 +1,216 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#include "ttnn/operations/moreh/moreh_softmax/device/moreh_softmax_device_operation.hpp"
++
++#include <tt-metalium/tensor_accessor_args.hpp>
++
++#include "ttnn/operations/moreh/moreh_helper_functions.hpp"
++
++#include <cstdint>
++#include <map>
++#include <string>
++#include <vector>
++
++namespace ttnn::operations::moreh::moreh_softmax {
++
++tt::tt_metal::ProgramDescriptor MorehSoftmaxOperation::MorehSoftmaxWParallelFactory::create_descriptor(
++    const operation_attributes_t& operation_attributes,
++    const tensor_args_t& tensor_args,
++    tensor_return_value_t& output) {
++    using namespace tt;
++    using namespace tt::tt_metal;
++
++    const auto& input = tensor_args.input;
++    const auto& compute_kernel_config = operation_attributes.compute_kernel_config;
++    TT_FATAL(operation_attributes.op == MorehSoftmaxOp::LOGSOFTMAX, "Parallel W prototype only supports log-softmax");
++    TT_FATAL(input.dtype() == DataType::BFLOAT16, "Parallel W prototype only supports bfloat16");
++
++    auto* device = input.device();
++    const auto grid = device->compute_with_storage_grid_size();
++    TT_FATAL(grid.x >= 8 && grid.y >= 4, "Parallel W prototype requires at least an 8x4 worker grid");
++    const CoreRange core_range({0, 0}, {7, 3});
++
++    const auto shape = input.padded_shape();
++    const uint32_t h = shape[-2];
++    const uint32_t w = shape[-1];
++    const uint32_t ht = h / constants::TILE_HEIGHT;
++    const uint32_t wt = w / constants::TILE_WIDTH;
++    const uint32_t num_kernel_rows = input.physical_volume() / h / w * ht;
++    TT_FATAL(num_kernel_rows == 1, "Parallel W prototype requires exactly one tile row");
++
++    auto [num_cores, all_cores, core_group_1, core_group_2, wt_group_1, wt_group_2] =
++        split_work_to_cores_wt_core_range(core_range, wt);
++
++    const CoreCoord root_core = core_range.start_coord;
++    const CoreRangeSet root_range{CoreRange(root_core)};
++    const CoreRangeSet nonroot_group_1 = core_group_1.subtract(root_range);
++    const CoreRangeSet nonroot_group_2 = core_group_2.subtract(root_range);
++    const uint32_t root_wt = core_group_1.contains(root_core) ? wt_group_1 : wt_group_2;
++
++    const CoreCoord root_physical = device->worker_core_from_logical_core(root_core);
++    const CoreCoord mcast_start = device->worker_core_from_logical_core(core_range.start_coord);
++    const CoreCoord mcast_end = device->worker_core_from_logical_core(core_range.end_coord);
++    const uint32_t root_x = static_cast<uint32_t>(root_physical.x);
++    const uint32_t root_y = static_cast<uint32_t>(root_physical.y);
++    const uint32_t mcast_x_start = static_cast<uint32_t>(mcast_start.x);
++    const uint32_t mcast_y_start = static_cast<uint32_t>(mcast_start.y);
++    const uint32_t mcast_x_end = static_cast<uint32_t>(mcast_end.x);
++    const uint32_t mcast_y_end = static_cast<uint32_t>(mcast_end.y);
++
++    const auto arch = device->arch();
++    auto [math_fidelity, math_approx_mode, fp32_dest_acc_en, packer_l1_acc, dst_full_sync_en] =
++        get_compute_kernel_config_args(arch, compute_kernel_config);
++
++    // Keep the prototype's partial reductions and broadcasts in the input
++    // format. Mixing FP32 aggregate tiles with BF16 output currently leaves
++    // the packer in FP32 mode after the root reduction.
++    fp32_dest_acc_en = false;
++
++    const auto data_format = datatype_to_dataformat_converter(input.dtype());
++    const auto intermed_format = fp32_dest_acc_en ? DataFormat::Float32 : data_format;
++    const uint32_t data_tile_bytes = tile_size(data_format);
++    const uint32_t intermed_tile_bytes = tile_size(intermed_format);
++
++    ProgramDescriptor desc;
++    auto add_cb = [&](uint8_t index, uint32_t tiles, DataFormat format, uint32_t tile_bytes) {
++        desc.cbs.push_back(CBDescriptor{
++            .total_size = tiles * tile_bytes,
++            .core_ranges = all_cores,
++            .format_descriptors = {{CBFormatDescriptor{
++                .buffer_index = index,
++                .data_format = format,
++                .page_size = tile_bytes,
++            }}},
++        });
++    };
++
++    add_cb(static_cast<uint8_t>(CBIndex::c_0), 2, data_format, data_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_1), 1, data_format, data_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_2), 1, data_format, data_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_3), 1, data_format, data_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_16), 2, data_format, data_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_20), 1, intermed_format, intermed_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_21), 1, intermed_format, intermed_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_24), 1, intermed_format, intermed_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_25), 1, intermed_format, intermed_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_26), 1, intermed_format, intermed_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_27), 1, intermed_format, intermed_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_28), 1, intermed_format, intermed_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_29), 2 * num_cores, intermed_format, intermed_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_30), 1, intermed_format, intermed_tile_bytes);
++    add_cb(static_cast<uint8_t>(CBIndex::c_31), 1, intermed_format, intermed_tile_bytes);
++
++    for (uint32_t semaphore_id = 0; semaphore_id < 2; ++semaphore_id) {
++        desc.semaphores.push_back(SemaphoreDescriptor{
++            .id = semaphore_id,
++            .core_type = CoreType::WORKER,
++            .core_ranges = all_cores,
++            .initial_value = 0,
++        });
++    }
++
++    KernelDescriptor::CompileTimeArgs reader_ct_args = {
++        static_cast<uint32_t>(input.dtype() == DataType::FLOAT32)};
++    TensorAccessorArgs(*input.buffer()).append_to(reader_ct_args);
++
++    KernelDescriptor reader;
++    reader.kernel_source =
++        "ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/kernels/reader_moreh_logsoftmax_w_parallel.cpp";
++    reader.source_type = KernelDescriptor::SourceType::FILE_PATH;
++    reader.core_ranges = all_cores;
++    reader.compile_time_args = std::move(reader_ct_args);
++    reader.config = ReaderConfigDescriptor{};
++
++    KernelDescriptor::CompileTimeArgs writer_ct_args;
++    TensorAccessorArgs(*output.buffer()).append_to(writer_ct_args);
++
++    KernelDescriptor writer;
++    writer.kernel_source =
++        "ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/kernels/writer_moreh_logsoftmax_w_parallel.cpp";
++    writer.source_type = KernelDescriptor::SourceType::FILE_PATH;
++    writer.core_ranges = all_cores;
++    writer.compile_time_args = std::move(writer_ct_args);
++    writer.config = WriterConfigDescriptor{};
++
++    std::vector<UnpackToDestMode> unpack_to_dest_mode(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
++    auto add_compute_kernel = [&](const CoreRangeSet& cores, uint32_t local_wt, bool is_root) {
++        if (cores.ranges().empty()) {
++            return;
++        }
++        KernelDescriptor compute;
++        compute.kernel_source =
++            "ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/kernels/moreh_logsoftmax_w_parallel.cpp";
++        compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
++        compute.core_ranges = cores;
++        compute.compile_time_args = {local_wt, static_cast<uint32_t>(is_root), num_cores};
++        compute.config = ComputeConfigDescriptor{
++            .math_fidelity = math_fidelity,
++            .fp32_dest_acc_en = fp32_dest_acc_en,
++            .dst_full_sync_en = dst_full_sync_en,
++            .unpack_to_dest_mode = unpack_to_dest_mode,
++            .math_approx_mode = math_approx_mode,
++        };
++        desc.kernels.push_back(std::move(compute));
++    };
++
++    const uint32_t core_h = core_range.end_coord.y - core_range.start_coord.y + 1;
++    for (uint32_t i = 0, start_tile = 0; i < num_cores; ++i) {
++        const CoreCoord core = {
++            (i / core_h) + core_range.start_coord.x,
++            (i % core_h) + core_range.start_coord.y};
++
++        uint32_t local_wt = 0;
++        if (core_group_1.contains(core)) {
++            local_wt = wt_group_1;
++        } else if (core_group_2.contains(core)) {
++            local_wt = wt_group_2;
++        } else {
++            TT_THROW("Core not in row-parallel softmax core ranges");
++        }
++
++        uint32_t mask_w = constants::TILE_WIDTH;
++        if (start_tile + local_wt == wt) {
++            mask_w = input.logical_shape()[-1] % constants::TILE_WIDTH;
++            if (mask_w == 0) {
++                mask_w = constants::TILE_WIDTH;
++            }
++        }
++
++        const bool is_root = core == root_core;
++        reader.emplace_runtime_args(
++            core,
++            {input.buffer(),
++             start_tile,
++             local_wt,
++             mask_w,
++             static_cast<uint32_t>(is_root),
++             num_cores,
++             i,
++             root_x,
++             root_y,
++             mcast_x_start,
++             mcast_y_start,
++             mcast_x_end,
++             mcast_y_end});
++
++        writer.emplace_runtime_args(
++            core,
++            {output.buffer(),
++             start_tile,
++             local_wt});
++
++        start_tile += local_wt;
++    }
++
++    desc.kernels.push_back(std::move(reader));
++    desc.kernels.push_back(std::move(writer));
++    add_compute_kernel(root_range, root_wt, true);
++    add_compute_kernel(nonroot_group_1, wt_group_1, false);
++    add_compute_kernel(nonroot_group_2, wt_group_2, false);
++
++    return desc;
++}
++
++}  // namespace ttnn::operations::moreh::moreh_softmax
