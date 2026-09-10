@@ -94,8 +94,20 @@ index ca6f81c..84d8ace 100644
                  emitOpError()
                      << "All input tensors of trace function must be on device."
                      << operand << " is not on device.";
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+@@ -704,5 +704,9 @@ private:
+     for (Operation *user : arg.getUsers()) {
+       if (mlir::isa<ttir::MeshShardOp>(user)) {
+         return true;
+       }
++      if (auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(user);
++          caseOp && caseOp.getIndex() == arg) {
++        return true;
++      }
+     }
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-index 29b5318..a7632db 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 @@ -316,6 +316,9 @@ private:
@@ -153,7 +165,7 @@ index 29b5318..a7632db 100644
      for (mlir::Value output : outputs) {
        outputTypes.push_back(output.getType());
      }
-@@ -480,6 +514,7 @@ private:
+@@ -480,14 +514,24 @@ private:
      info.traceFunc = traceFuncOp;
      info.numTensorInputs = numTensorInputs;
      info.numDeviceResident = numDeviceResident;
@@ -161,7 +173,24 @@ index 29b5318..a7632db 100644
      for (size_t i = 0; i < numTensorInputs; i++) {
        auto tensorType = mlir::cast<RankedTensorType>(inputs[i].getType());
        info.inputArgAttrs.push_back(
-@@ -657,14 +692,22 @@ private:
+           inputAttrs[i] ? inputAttrs[i] : mlir::DictionaryAttr::get(context));
+       if (i < numDeviceResident) {
+         info.inputSlotTypes.push_back(tensorType);
++      } else if (info.isTraceKeyInput(i)) {
++        // The key's ordinary slot is only a positional placeholder. Use a
++        // supported device dtype; Boolean tensors cannot be device-resident.
++        auto slotElementType = builder.getI32Type();
++        auto slotEncoding = ttnn::TTNNLayoutAttr::Builder(
++                                context, tensorType.getShape(), slotElementType)
++                                .build();
++        info.inputSlotTypes.push_back(RankedTensorType::get(
++            tensorType.getShape(), slotElementType, slotEncoding));
+       } else {
+         info.inputSlotTypes.push_back(utils::RankedTensorTypeFactory::create(
+             tensorType, BufferType::DRAM));
+       }
+     }
+@@ -657,14 +701,22 @@ private:
      // happen before the capture window opens: tt-metal rejects host writes
      // while a capture is active.
      for (auto [h, argIndex] : llvm::enumerate(info.hostStagedIndices())) {
@@ -185,7 +214,7 @@ index 29b5318..a7632db 100644
      llvm::append_range(traceCallArgs, traceOutputSlots);
      for (size_t i = 0; i < info.semaphoreTypes.size(); i++) {
        traceCallArgs.push_back(captureFunc.getArgument(semaphoreBase + i));
-@@ -934,7 +977,9 @@ private:
+@@ -934,7 +986,9 @@ private:
      auto traceOp = builder.create<ttnn::CaptureOrExecuteTraceOp>(
          funcOp.getLoc(), info.outputSlotTypes, device,
          allocateSlotsTraceSymbolAttr, captureTraceSymbolAttr,
@@ -196,7 +225,7 @@ index 29b5318..a7632db 100644
  
      // Replace uses of original outputs with the output of the trace op function
      for (size_t i = 0; i < info.boundaryOutputs.size(); i++) {
-@@ -992,8 +1037,8 @@ private:
+@@ -992,8 +1046,8 @@ private:
    }
  
    mlir::LogicalResult processFuncOp(func::FuncOp funcOp) {
@@ -255,7 +284,6 @@ index ff7837b..12aec8a 100644
    /// inputs are the caller's buffers, so they also identify which invocations
    /// can replay this variant.
 diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
-index 68397c1..cc4c488 100644
 --- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 +++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 @@ -3,6 +3,7 @@
@@ -266,7 +294,7 @@ index 68397c1..cc4c488 100644
  
  #include "operations/trace/capture_or_execute_trace.h"
  #include "tt/runtime/detail/common/logger.h"
-@@ -24,6 +25,51 @@ getTraceCacheKeys(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -24,6 +25,55 @@ getTraceCacheKeys(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
                                     op->execute_program_id())};
  }
  
@@ -290,6 +318,10 @@ index 68397c1..cc4c488 100644
 +    return ::tt::runtime::ttnn::utils::getScalarFromTensor<uint16_t>(tensor);
 +  case ::ttnn::DataType::UINT8:
 +    return ::tt::runtime::ttnn::utils::getScalarFromTensor<uint8_t>(tensor);
++  case ::ttnn::DataType::BFLOAT16:
++    return static_cast<float>(
++               ::tt::runtime::ttnn::utils::getScalarFromTensor<bfloat16>(tensor)) !=
++           0;
 +  default:
 +    LOG_FATAL("Unsupported integer trace-key scalar data type");
 +  }
@@ -318,7 +350,7 @@ index 68397c1..cc4c488 100644
  static void copyTensorFromHostToDevice(const ::ttnn::Tensor &srcTensor,
                                         ::ttnn::Tensor &dstTensor) {
  
-@@ -115,6 +161,9 @@ updateTraceInputSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -115,6 +165,9 @@ updateTraceInputSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
               " got: ", inputSlots.size());
  
    for (size_t i = 0; i < op->inputs()->size(); i++) {
@@ -328,7 +360,7 @@ index 68397c1..cc4c488 100644
      const ::tt::target::ttnn::TensorRef *input = op->inputs()->Get(i);
      const bool deviceResident =
          ::tt::runtime::ttnn::utils::inDeviceMemory(input);
-@@ -190,7 +239,8 @@ static TraceVariant captureTrace(
+@@ -190,7 +243,8 @@ static TraceVariant captureTrace(
      const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
      ProgramContext &context,
      std::vector<::tt::runtime::Tensor> &inputSlots,
@@ -338,7 +370,7 @@ index 68397c1..cc4c488 100644
    ProgramTensorPool &tensorPool = context.getTensorPool();
    ::tt::runtime::Device deviceHandle = context.getDeviceHandle();
    // Program inputs are, in order: the host-staged inputs, the trace input
-@@ -243,6 +293,7 @@ static TraceVariant captureTrace(
+@@ -243,6 +297,7 @@ static TraceVariant captureTrace(
        .traceId = ::ttnn::MeshTraceId(
            ::tt::runtime::ttnn::utils::getScalarFromTensor<uint32_t>(
                traceIdTensor)),
@@ -346,7 +378,7 @@ index 68397c1..cc4c488 100644
        .inputTensors = inputSlots,
        .outputTensors = outputSlots,
        .ownedTensors = std::move(ownedTensors)};
-@@ -328,6 +379,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -328,6 +383,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
            ->asSharedPtr<::tt::runtime::ttnn::TraceCache>(DeviceRuntime::TTNN);
    LOG_ASSERT(traceCache, "TraceCache must be initialized in DeviceHandle");
  
@@ -354,7 +386,7 @@ index 68397c1..cc4c488 100644
    auto [mainProgramKey, captureExecuteKey] = getTraceCacheKeys(op, context);
  
    if (!traceCache->contains(mainProgramKey, captureExecuteKey)) {
-@@ -355,7 +407,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -355,7 +411,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
                            /*deviceResidentOnly=*/true);
      TraceData traceData;
      traceData.variants.push_back(
@@ -363,7 +395,7 @@ index 68397c1..cc4c488 100644
      traceCache->insert(mainProgramKey, captureExecuteKey, std::move(traceData));
  
      debug::Stats::get().incrementStat("TraceCacheMiss");
-@@ -369,7 +421,8 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -369,7 +425,8 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
    auto variantIt = std::find_if(
        traceData->variants.rbegin(), traceData->variants.rend(),
        [&](const TraceVariant &variant) {
@@ -373,7 +405,7 @@ index 68397c1..cc4c488 100644
                 meshDevice.is_mesh_trace_replay_safe(variant.traceId);
        });
  
-@@ -423,7 +476,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -423,7 +480,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
    updateTraceInputSlots(op, context, inputSlots,
                          /*deviceResidentOnly=*/true);
    traceData->variants.push_back(
