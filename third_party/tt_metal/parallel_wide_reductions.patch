@@ -1,25 +1,43 @@
 --- ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
-@@ -13,6 +13,9 @@
+@@ -9,2 +9,5 @@
++#include <algorithm>
++#include <cmath>
+ #include <optional>
+ #include <string>
++#include <tt-metalium/work_split.hpp>
+@@ -13,9 +16,23 @@
  #include "ttnn/operations/eltwise/unary_backward/unary_backward.hpp"
  #include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
  #include "ttnn/operations/data_movement/common/common.hpp"
-+#include "ttnn/operations/copy/typecast/typecast.hpp"
-+#include "ttnn/operations/reduction/generic/generic_reductions.hpp"
++#include "ttnn/operations/data_movement/transpose/transpose.hpp"
 +#include "ttnn/tensor/tensor_ops.hpp"
  
  namespace reduce_op_utils {
  
-@@ -134,6 +137,49 @@
++// The W kernel assigns tile rows to cores. Split only into otherwise idle cores,
++// balancing W / chunks tiles of partial work against chunks partial results.
++static uint32_t get_width_chunks(uint32_t tile_rows, uint32_t width_tiles, uint32_t cores) {
++    if (tile_rows == 0 || tile_rows >= cores || width_tiles == 0) {
++        return 1;
++    }
++    const uint32_t limit = std::min(cores / tile_rows, static_cast<uint32_t>(std::sqrt(width_tiles)));
++    const auto [chunks, tiles_per_chunk] =
++        tt::tt_metal::get_max_cores_divisible_by_tiles_per_core_tiles(width_tiles, limit);
++    return tiles_per_chunk + chunks < width_tiles ? chunks : 1;
++}
++
+ std::map<std::string, std::string> get_defines(
+     tt::tt_metal::ReduceOpMath reduce_op, tt::tt_metal::ReduceOpDim reduce_dim) {
+     std::map<std::string, std::string> defines;
+@@ -134,6 +151,46 @@
      const bool both_interleaved =
          input_tensor.memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED &&
          output_mem_config.memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED;
 +
-+    // The W kernel distributes tile rows, leaving a single wide tile row on one core.
-+    // Reinterpret contiguous groups of width tiles as batches, reduce each group using
-+    // the existing W kernel, then combine the partials along the batch dimension.
-+    // Views do not move data: every tile retains its independent rows. Leave explicit
-+    // core subsets on the existing path, since the NC reduction also uses permutes.
++    // Split contiguous width tiles into batches without moving data. Tile rows
++    // remain independent, including padding rows, which the final view hides again.
++    // Transpose does not support core subsets, so leave those on the regular path.
 +    const auto& shape = input_tensor.logical_shape();
 +    const auto& padded_shape = input_tensor.padded_shape();
 +    const auto tile = input_tensor.tensor_spec().tile();
@@ -27,21 +45,15 @@
 +        (reduce_math == tt::tt_metal::ReduceOpMath::SUM || reduce_math == tt::tt_metal::ReduceOpMath::MAX) &&
 +        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT32) &&
 +        !sub_core_grids && config.fp32_dest_acc_en && both_interleaved && input_tensor.layout() == Layout::TILE &&
-+        shape.rank() == 4 && shape[0] == 1 && shape[1] == 1 && shape[2] > 0 &&
-+        padded_shape[2] == tile.get_height() && shape[3] == padded_shape[3]) {
-+        const uint32_t width_tiles = shape[3] / tile.get_width();
++        shape.rank() == 4 && input_tensor.logical_volume() > 0 && shape[3] == padded_shape[3]) {
++        const uint32_t tile_rows = padded_shape[0] * padded_shape[1] * (padded_shape[2] / tile.get_height());
 +        const auto grid = input_tensor.device()->compute_with_storage_grid_size();
-+        const uint32_t cores = grid.x * grid.y;
-+        // Amortize the second reduction only when there is more than one tile per core.
-+        uint32_t chunks = width_tiles >= 2 * cores ? cores : 1;
-+        while (chunks > 1 && width_tiles % chunks != 0) {
-+            --chunks;
-+        }
++        const auto chunks = reduce_op_utils::get_width_chunks(tile_rows, shape[3] / tile.get_width(), grid.x * grid.y);
 +        if (chunks > 1) {
 +            auto split = tt::tt_metal::view(
-+                input_tensor, Shape{1, chunks, shape[2], shape[3] / chunks},
-+                Shape{1, chunks, tile.get_height(), shape[3] / chunks});
-+            // Keep SUM partials in FP32 so splitting does not add a BF16 rounding step.
++                input_tensor, Shape{tile_rows, chunks, std::min(shape[2], tile.get_height()), shape[3] / chunks},
++                Shape{tile_rows, chunks, tile.get_height(), shape[3] / chunks});
++            // Keep SUM partials in FP32; only the final reduction packs to the output dtype.
 +            const auto partial_dtype = reduce_math == tt::tt_metal::ReduceOpMath::SUM
 +                                           ? DataType::FLOAT32
 +                                           : input_tensor.dtype();
@@ -50,10 +62,15 @@
 +                partial_dtype, config, sub_core_grids, /*negate=*/false, /*post_mul_scaler=*/1.0f,
 +                /*row_major_w_dense_path=*/false, /*row_major_h_dense_path=*/false,
 +                /*use_sfpu_reduce=*/use_sfpu_fp32_reduce);
-+            auto combine = reduce_math == tt::tt_metal::ReduceOpMath::SUM ? ttnn::sum : ttnn::max;
-+            auto result = combine(partials, 1, true, output_mem_config, config, 1.0f, true, sub_core_grids);
-+            const auto result_dtype = output_dtype.value_or(input_tensor.dtype());
-+            return result.dtype() == result_dtype ? result : ttnn::typecast(result, result_dtype, output_mem_config);
++            // Make the chunk axis a height axis for the existing H reduction kernel.
++            partials = ttnn::transpose(partials, 1, 2, output_mem_config, pad_value);
++            auto result = detail::reduce(
++                partials, reduce_math, tt::tt_metal::ReduceOpDim::H, 1.0f, output_mem_config,
++                output_dtype.value_or(input_tensor.dtype()), config, sub_core_grids);
++            result = ttnn::transpose(result, 1, 2, output_mem_config, pad_value);
++            return tt::tt_metal::view(
++                result, Shape{shape[0], shape[1], shape[2], 1},
++                Shape{padded_shape[0], padded_shape[1], padded_shape[2], tile.get_width()});
 +        }
 +    }
 +
