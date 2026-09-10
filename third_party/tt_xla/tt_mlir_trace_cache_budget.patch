@@ -1,0 +1,227 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+index 12aec8a..599a13a 100644
+--- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+@@ -57,9 +57,14 @@ public:
+                 const CaptureExecuteProgramKey &captureExecuteKey) const;
+   TraceData *get(const MainProgramKey &key,
+                  const CaptureExecuteProgramKey &captureExecuteKey);
+-  /// Evicts an entry, if needed, before allocating slots for a new one.
++  /// Evicts LRU entries before allocating new slots. An existing entry is
++  /// protected while adding a variant; its tensors must remain live.
+   void prepareForInsert(const MainProgramKey &key,
+-                        const CaptureExecuteProgramKey &captureExecuteKey);
++                        const CaptureExecuteProgramKey &captureExecuteKey,
++                        size_t pendingSlotBytes = 0);
++  /// Apply the memory budget after a capture reveals its command-buffer size.
++  void trim(const MainProgramKey &key,
++            const CaptureExecuteProgramKey &captureExecuteKey);
+   void insert(const MainProgramKey &key,
+               const CaptureExecuteProgramKey &captureExecuteKey,
+               TraceData traceData);
+@@ -74,7 +79,8 @@ public:
+ 
+ private:
+   using EntryKey = std::pair<MainProgramKey, CaptureExecuteProgramKey>;
+-  static constexpr size_t kMaxEntries = 4;
++  size_t memoryUsageBytes() const;
++  size_t memoryBudgetBytes() const;
+ 
+   void touch(const MainProgramKey &key,
+              const CaptureExecuteProgramKey &captureExecuteKey);
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+index 6d95d4c..51109c1 100644
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <unordered_set>
+ 
+ #include "operations/trace/capture_or_execute_trace.h"
+ #include "tt/runtime/detail/common/logger.h"
+@@ -92,6 +93,37 @@ static void copyTensorFromDeviceToDevice(const ::ttnn::Tensor &srcTensor,
+   ::ttnn::copy_to_device(hostSrcTensor, dstTensor);
+ }
+ 
++// Estimate new storage from the allocation program's device layouts, excluding
++// the aliased caller-owned inputs. Admission must happen before allocation.
++static size_t estimateTraceSlotBytes(
++    const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
++    ProgramContext &context) {
++  const auto *program = ::tt::runtime::ttnn::utils::getProgram(
++      context.getExecutableHandle(), op->allocate_slots_program_id());
++  size_t bytes = 0;
++  std::unordered_set<uint32_t> seen;
++  for (size_t i = 0; i < program->outputs()->size(); ++i) {
++    const auto *slot = program->outputs()->Get(i);
++    if ((i < op->inputs()->size() &&
++         ::tt::runtime::ttnn::utils::inDeviceMemory(op->inputs()->Get(i))) ||
++        !::tt::runtime::ttnn::utils::inDeviceMemory(slot) ||
++        !seen.insert(slot->global_id()).second) {
++      continue;
++    }
++    const auto *desc = slot->desc()->layout()->memory_desc();
++    auto memoryConfig = ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(
++        desc->memory_config());
++    LOG_ASSERT(memoryConfig, "Device trace slots require memory config");
++    auto spec = ::tt::runtime::ttnn::utils::createTensorSpec(
++        ::tt::runtime::ttnn::operations::utils::toTTNNShape(*slot->desc()->shape()),
++        ::tt::runtime::ttnn::utils::toTTNNDataType(desc->data_type()),
++        ::tt::runtime::ttnn::utils::inferLayoutFromTileShape(slot),
++        *memoryConfig);
++    bytes += spec.compute_packed_buffer_size_bytes();
++  }
++  return bytes;
++}
++
+ // Runs the slot allocation program, which allocates the persistent device
+ // buffers this trace will read from and write to. Runs exactly once per trace.
+ //
+@@ -374,9 +406,9 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+   if (!traceCache->contains(mainProgramKey, captureExecuteKey)) {
+     LOG_DEBUG("Trace cache miss, allocating slots and capturing trace");
+ 
+-    // Make room before allocating persistent slots; temporarily exceeding the
+-    // entry bound can OOM even though insertion would immediately evict.
+-    traceCache->prepareForInsert(mainProgramKey, captureExecuteKey);
++    // Make room before allocating persistent slots, not only after insertion.
++    traceCache->prepareForInsert(mainProgramKey, captureExecuteKey,
++                                estimateTraceSlotBytes(op, context));
+ 
+     // Allocate the persistent slots once, then capture against them.
+     std::vector<::tt::runtime::Tensor> slots = allocateTraceSlots(op, context);
+@@ -456,6 +488,8 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+   }
+ 
+   if (!reuseTraceSlots) {
++    traceCache->prepareForInsert(mainProgramKey, captureExecuteKey,
++                                estimateTraceSlotBytes(op, context));
+     std::vector<::tt::runtime::Tensor> slots = allocateTraceSlots(op, context);
+     size_t numInputSlots = op->inputs()->size();
+     inputSlots.assign(slots.begin(), slots.begin() + numInputSlots);
+@@ -468,6 +502,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+       captureTrace(op, context, inputSlots, outputSlots, traceKey));
+ 
+   debug::Stats::get().incrementStat("TraceStaleRecapture");
++  traceCache->trim(mainProgramKey, captureExecuteKey);
+ }
+ 
+ } // namespace tt::runtime::ttnn::operations::trace
+diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/trace_cache.cpp
+index 4fa3884..7d4882d 100644
+--- a/runtime/lib/ttnn/types/trace_cache.cpp
++++ b/runtime/lib/ttnn/types/trace_cache.cpp
+@@ -6,8 +6,13 @@
+ #include "tt/runtime/detail/ttnn/types/types.h"
+ 
+ #include <algorithm>
++#include <charconv>
++#include <cstdlib>
++#include <string_view>
+ #include <unordered_set>
+ 
++#include "tt_metal/distributed/mesh_trace.hpp"
++
+ namespace tt::runtime::ttnn {
+ 
+ static void releaseOwnedTensors(
+@@ -84,15 +89,85 @@ void TraceCache::evictLeastRecentlyUsed() {
+   }
+ }
+ 
++size_t TraceCache::memoryBudgetBytes() const {
++  // Budget additional cache storage, not caller-owned weights/KV caches.
++  // Scale with the device's DRAM capacity instead of the number of graphs.
++  if (const char *setting = std::getenv("TT_RUNTIME_TRACE_CACHE_BYTES")) {
++    std::string_view value(setting);
++    size_t bytes = 0;
++    auto [end, error] =
++        std::from_chars(value.data(), value.data() + value.size(), bytes);
++    LOG_ASSERT(error == std::errc{} && end == value.data() + value.size(),
++               "TT_RUNTIME_TRACE_CACHE_BYTES must be a nonnegative integer");
++    return bytes;
++  }
++  auto device = meshDevice.lock();
++  LOG_ASSERT(device, "Trace cache device must be alive");
++  const auto &allocator = device->allocator();
++  return allocator->get_bank_size(::ttnn::BufferType::DRAM) *
++         allocator->get_num_banks(::ttnn::BufferType::DRAM) / 64;
++}
++
++size_t TraceCache::memoryUsageBytes() const {
++  auto device = meshDevice.lock();
++  LOG_ASSERT(device, "Trace cache device must be alive");
++  size_t bytes = 0;
++  std::unordered_set<const void *> buffers;
++  for (const auto &[mainKey, programs] : cache) {
++    for (const auto &[programKey, data] : programs) {
++      for (const TraceVariant &variant : data.variants) {
++        // Variants commonly share a slot set; charge each allocation once.
++        for (const auto &tensor : variant.ownedTensors) {
++          const auto &ttnnTensor =
++              tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
++          if (ttnnTensor.storage_type() == ::ttnn::StorageType::DEVICE &&
++              ttnnTensor.is_allocated() &&
++              buffers.insert(&ttnnTensor.mesh_buffer()).second) {
++            bytes += ttnnTensor.mesh_buffer().device_local_size();
++          }
++        }
++        const auto trace = device->get_mesh_trace(variant.traceId);
++        if (trace && trace->mesh_buffer &&
++            buffers.insert(trace->mesh_buffer.get()).second) {
++          bytes += trace->mesh_buffer->device_local_size();
++        }
++      }
++    }
++  }
++  return bytes;
++}
++
+ void TraceCache::prepareForInsert(
+     const MainProgramKey &key,
+-    const CaptureExecuteProgramKey &captureExecuteKey) {
+-  if (contains(key, captureExecuteKey)) {
+-    return;
++    const CaptureExecuteProgramKey &captureExecuteKey, size_t pendingSlotBytes) {
++  const bool protectCurrent = contains(key, captureExecuteKey);
++  if (protectCurrent) {
++    touch(key, captureExecuteKey);
+   }
+-  while (leastToMostRecentlyUsed.size() >= kMaxEntries) {
++  const size_t budget = memoryBudgetBytes();
++  // Subtraction avoids overflow for a user-specified or oversized request.
++  const size_t available = budget - std::min(budget, pendingSlotBytes);
++  while (leastToMostRecentlyUsed.size() > (protectCurrent ? 1u : 0u) &&
++         (pendingSlotBytes > budget || memoryUsageBytes() > available)) {
+     evictLeastRecentlyUsed();
+   }
++  if (protectCurrent) {
++    TraceData *data = get(key, captureExecuteKey);
++    while (data->variants.size() > 1 &&
++           (pendingSlotBytes > budget || memoryUsageBytes() > available)) {
++      // Keep the newest/active variant. Remaining variants retain shared
++      // slots, so removing an older variant cannot invalidate its replacement.
++      evictOldestVariant(*data, {});
++    }
++  }
++}
++
++void TraceCache::trim(
++    const MainProgramKey &key,
++    const CaptureExecuteProgramKey &captureExecuteKey) {
++  // One invocation may itself exceed the budget. Keep its active variant and
++  // evict all others; never invalidate a capture or the outputs just returned.
++  prepareForInsert(key, captureExecuteKey);
+ }
+ 
+ void TraceCache::evictOldestVariant(
+@@ -159,6 +234,7 @@ void TraceCache::insert(const MainProgramKey &key,
+   prepareForInsert(key, captureExecuteKey);
+   cache[key][captureExecuteKey] = std::move(traceData);
+   touch(key, captureExecuteKey);
++  trim(key, captureExecuteKey);
+ }
+ 
+ void TraceCache::erase(const MainProgramKey &key) {

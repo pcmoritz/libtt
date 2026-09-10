@@ -134,6 +134,16 @@ The TT backend records and replays the fixed-shape prefill and decode graphs.
 This avoids dispatching the model's prefill operations individually from the
 host.
 
+The trace cache uses a memory budget instead of a fixed number of graphs, so
+prefill, decode, and sampler traces can remain resident together. The default
+budget is 1/64 of usable device DRAM (about 512 MiB on a 32 GiB card), including
+trace command buffers and unique cache-owned slots; borrowed weights and KV
+caches are not charged again. Set `TT_RUNTIME_TRACE_CACHE_BYTES` to override it.
+Least-recently-used entries and then older variants are evicted under pressure;
+one active variant may exceed the budget if a single invocation needs more.
+Eviction preserves live outputs, and replay still checks input addresses,
+branch selectors, and allocation safety.
+
 Because the example disables precompilation and server warmup, the first two
 requests can spend substantial time compiling programs and capturing traces.
 Warm each input bucket before measuring it. With the five-token prompt below,
