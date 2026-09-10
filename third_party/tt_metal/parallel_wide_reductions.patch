@@ -4,7 +4,7 @@
 +#include <algorithm>
  #include <optional>
  #include <string>
-@@ -13,9 +14,36 @@
+@@ -13,9 +14,39 @@
  #include "ttnn/operations/eltwise/unary_backward/unary_backward.hpp"
  #include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
  #include "ttnn/operations/data_movement/common/common.hpp"
@@ -17,7 +17,10 @@
 +// balancing W / chunks tiles of partial work against chunks partial results.
 +static uint32_t get_width_chunks(
 +    uint32_t tile_rows, uint32_t width_tiles, uint32_t cores) {
-+    if (tile_rows == 0) {
++    // Amortize the extra launches and tile-padded transposes. This conservative
++    // aspect-ratio cutoff was measured for BF16/FP32 SUM/MAX on Blackhole P150.
++    constexpr uint32_t min_width_tiles_per_row = 128;
++    if (tile_rows == 0 || width_tiles / tile_rows < min_width_tiles_per_row) {
 +        return 1;
 +    }
 +
@@ -41,7 +44,7 @@
  std::map<std::string, std::string> get_defines(
      tt::tt_metal::ReduceOpMath reduce_op, tt::tt_metal::ReduceOpDim reduce_dim) {
      std::map<std::string, std::string> defines;
-@@ -134,6 +162,46 @@
+@@ -134,6 +165,46 @@
      const bool both_interleaved =
          input_tensor.memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED &&
          output_mem_config.memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED;

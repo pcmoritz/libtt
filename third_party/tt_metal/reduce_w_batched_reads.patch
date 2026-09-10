@@ -1,0 +1,66 @@
+Backport the W-reader batching from tenstorrent/tt-metal#53564:
+https://github.com/tenstorrent/tt-metal/pull/53564
+Use a compile define on the pinned API so other shared-reader callers stay unbatched.
+
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op_multi_core_w_program_factory.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op_multi_core_w_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op_multi_core_w_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op_multi_core_w_program_factory.cpp
+@@ -136,2 +136,13 @@
++    const bool is_sfpu_reduce =
++        use_sfpu_reduce_path(a.dtype(), operation_attributes.math_op, operation_attributes.use_sfpu_reduce);
++    const bool use_fpu_negate = operation_attributes.negate && !is_sfpu_reduce;
++    const uint32_t min_rows_per_core = num_rows_per_core_group_2 == 0
++                                          ? num_rows_per_core_group_1
++                                          : std::min(num_rows_per_core_group_1, num_rows_per_core_group_2);
++    // Upstream uses four reads per barrier, except for tiny work units and
++    // fused-negate with one row per core, where batching measured slower.
++    const bool batch_reads = !rm_path && !(use_fpu_negate && min_rows_per_core < 2);
++    const uint32_t reader_tiles_per_batch = batch_reads && min_rows_per_core * Wt >= 4 ? 4 : 1;
++
+     uint32_t src0_cb_index = 0;
+-    uint32_t num_input_tiles = 2;
++    uint32_t num_input_tiles = 2 * reader_tiles_per_batch;
+@@ -179,5 +190,0 @@
+-    // Int32 max/min/sum use the SFPU reduce path; fp32 SUM only for the accurate mean opt-in.
+-    const bool is_sfpu_reduce =
+-        use_sfpu_reduce_path(a.dtype(), operation_attributes.math_op, operation_attributes.use_sfpu_reduce);
+-    const bool use_fpu_negate = operation_attributes.negate && !is_sfpu_reduce;
+-
+@@ -249,2 +255,4 @@
+     reader_desc.defines = {reduce_defines.begin(), reduce_defines.end()};
++    reader_desc.defines.push_back(
++        {"REDUCE_READER_TILES_PER_BATCH", std::to_string(reader_tiles_per_batch)});
+     reader_desc.config = ReaderConfigDescriptor{};
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_reduce_universal_start_id.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_reduce_universal_start_id.cpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_reduce_universal_start_id.cpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_reduce_universal_start_id.cpp
+@@ -12,2 +12,6 @@
++#ifndef REDUCE_READER_TILES_PER_BATCH
++#define REDUCE_READER_TILES_PER_BATCH 1
++#endif
++
+ void kernel_main() {
+     uint32_t src_addr = get_arg_val<uint32_t>(0);
+@@ -25,2 +29,2 @@
+-    constexpr uint32_t onetile = 1;
++    constexpr uint32_t tiles_per_batch = REDUCE_READER_TILES_PER_BATCH;
+     uint32_t tile_bytes = get_tile_size(dfb_id_in0);
+@@ -33,8 +37,13 @@
+-    // read a ublock of tiles from src to CB, and then push the ublock to unpacker
+-    for (uint32_t i = start_id; i < start_id + num_tiles; i++) {
+-        dfb_in0.reserve_back(onetile);
+-        noc.async_read(tensor_accessor, dfb_in0, tile_bytes, {.page_id = i}, {.offset_bytes = 0});
++    // One barrier per batch; a short final batch uses the same path.
++    const uint32_t end_id = start_id + num_tiles;
++    for (uint32_t i = start_id; i < end_id;) {
++        const uint32_t batch = std::min(tiles_per_batch, end_id - i);
++        dfb_in0.reserve_back(batch);
++        for (uint32_t k = 0; k < batch; ++k) {
++            noc.async_read(tensor_accessor, dfb_in0, tile_bytes, {.page_id = i + k}, {.offset_bytes = k * tile_bytes});
++        }
+         noc.async_read_barrier();
+-        dfb_in0.push_back(onetile);
++        dfb_in0.push_back(batch);
++        i += batch;
+     }
+ }
