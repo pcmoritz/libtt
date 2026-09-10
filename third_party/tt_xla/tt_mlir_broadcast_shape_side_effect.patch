@@ -1,0 +1,18 @@
+diff --git a/lib/Dialect/TTIR/Transforms/Broadcast.cpp b/lib/Dialect/TTIR/Transforms/Broadcast.cpp
+--- a/lib/Dialect/TTIR/Transforms/Broadcast.cpp
++++ b/lib/Dialect/TTIR/Transforms/Broadcast.cpp
+@@ -26,9 +26,11 @@ static bool addOutputBroadcastIfNeeded(Operation *op,
+   for (Value operand : op->getOperands()) {
+     auto shape = mlir::cast<RankedTensorType>(operand.getType()).getShape();
+     llvm::SmallVector<int64_t> prev = implicitShape;
+-    assert(
+-        mlir::OpTrait::util::getBroadcastedShape(prev, shape, implicitShape) &&
+-        "Operands must be broadcast-compatible");
++    bool broadcastCompatible = mlir::OpTrait::util::getBroadcastedShape(
++        prev, shape, implicitShape);
++    assert(broadcastCompatible && "Operands must be broadcast-compatible");
++    // The shape computation above is required in builds where assert is off.
++    (void)broadcastCompatible;
+   }
+ 
+   auto resultType = mlir::cast<RankedTensorType>(op->getResult(0).getType());

@@ -3,6 +3,11 @@ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load("@//:bazel/cc_embed_data.bzl", "cc_embed_data")
 load("@//third_party/sfpi:sfpi_cc_objects.bzl", "sfpi_cc_objects")
 
+config_setting(
+    name = "release_compression",
+    define_values = {"libtt_release_compression": "true"},
+)
+
 package(default_visibility = ["//visibility:public"])
 
 genrule(
@@ -242,6 +247,10 @@ cc_binary(
     name = "libtt_zstd_compressor",
     srcs = ["@//third_party/tt_metal:libtt_zstd_compressor.cc"],
     copts = ["-std=c++17"],
+    linkopts = select({
+        "@platforms//os:linux": ["-pthread"],
+        "//conditions:default": [],
+    }),
     deps = ["@llvm_zstd//:zstd"],
 )
 
@@ -257,13 +266,16 @@ pkg_tar(
     name = "tt_metal_runtime_archive",
     deps = [":blackhole_runtime_obj_tar"],
     srcs = [
-        "@sfpi//:all_files",
+        "@sfpi//:runtime_files",
         "@tt_umd//:cluster_descriptor_examples",
         ":tt_metal_blackhole_runtime_hw_assets",
         ":tt_metal_runtime_sources",
     ],
     compressor = ":libtt_zstd_compressor",
-    compressor_args = "9",
+    compressor_args = select({
+        ":release_compression": "19",
+        "//conditions:default": "9",
+    }),
     extension = "tar.zst",
     owner = "0.0",
     ownername = ".",
