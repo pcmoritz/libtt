@@ -94,18 +94,6 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +               : value.isMinSignedValue();
    }
  
-@@ -302,5 +308,11 @@ private:
-                           mlir::stablehlo::ReduceOp::Adaptor adaptor,
-                           ConversionPatternRewriter &rewriter) const {
-+    if (srcOp.getInputs().size() != 1 &&
-+        !isArgMax(srcOp, adaptor, rewriter)) {
-+      return rewriter.notifyMatchFailure(
-+          srcOp, "variadic stablehlo.reduce is not supported");
-+    }
-+
-     if (!srcOp.getBody().hasOneBlock()) {
-       return rewriter.notifyMatchFailure(
-           srcOp,
 @@ -736,4 +718,11 @@ public:
                    mlir::stablehlo::DotGeneralOp::Adaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
@@ -132,26 +120,6 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -    if (inputRank > 5) {
 +    if (inputRank == 0 || inputRank > 5) {
        return rewriter.notifyMatchFailure(srcOp, "Invalid input tensor rank.");
-@@ -2740,4 +2765,9 @@ public:
-       if (dimension) {
-+        if (firstInputType.getElementType().isInteger(8)) {
-+          return rewriter.notifyMatchFailure(
-+              srcOp, "8-bit cumulative reductions are not supported");
-+        }
-+
-         mlir::RankedTensorType resultType = cast<RankedTensorType>(
-             getTypeConverter()->convertType(srcOp.getResult(0).getType()));
-         rewriter.replaceOpWithNewOp<ttir::CumSumOp>(
-@@ -2752,4 +2782,9 @@ public:
-       if (cumprodDimension) {
-+        if (firstInputType.getElementType().isInteger(8)) {
-+          return rewriter.notifyMatchFailure(
-+              srcOp, "8-bit cumulative reductions are not supported");
-+        }
-+
-         mlir::RankedTensorType resultType = cast<RankedTensorType>(
-             getTypeConverter()->convertType(srcOp.getResult(0).getType()));
-         rewriter.replaceOpWithNewOp<ttir::CumProdOp>(
 @@ -4272,5 +4276,6 @@ public:
      // (H, W)
      auto spatialDims = getIndicesofElementsLargerThanOne(windowDims);

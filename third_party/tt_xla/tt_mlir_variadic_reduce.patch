@@ -33,20 +33,6 @@
      return failure();
    }
  
-@@ -309,13 +312,6 @@
-   checkConversionLegality(mlir::stablehlo::ReduceOp &srcOp,
-                           mlir::stablehlo::ReduceOp::Adaptor adaptor,
-                           ConversionPatternRewriter &rewriter) const {
--    if (srcOp.getInputs().size() != 1 &&
--        !isArgMax(srcOp, adaptor, rewriter) &&
--        !isArgMin(srcOp, adaptor, rewriter)) {
--      return rewriter.notifyMatchFailure(
--          srcOp, "variadic stablehlo.reduce is not supported");
--    }
--
-     if (!srcOp.getBody().hasOneBlock()) {
-       return rewriter.notifyMatchFailure(
-           srcOp,
 @@ -371,6 +367,79 @@
      return success();
    }
