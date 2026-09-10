@@ -1,0 +1,62 @@
+--- ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
+@@ -13,6 +13,9 @@
+ #include "ttnn/operations/eltwise/unary_backward/unary_backward.hpp"
+ #include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
++#include "ttnn/operations/copy/typecast/typecast.hpp"
++#include "ttnn/operations/reduction/generic/generic_reductions.hpp"
++#include "ttnn/tensor/tensor_ops.hpp"
+ 
+ namespace reduce_op_utils {
+ 
+@@ -134,6 +137,49 @@
+     const bool both_interleaved =
+         input_tensor.memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED &&
+         output_mem_config.memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED;
++
++    // The W kernel distributes tile rows, leaving a single wide tile row on one core.
++    // Reinterpret contiguous groups of width tiles as batches, reduce each group using
++    // the existing W kernel, then combine the partials along the batch dimension.
++    // Views do not move data: every tile retains its independent rows. Leave explicit
++    // core subsets on the existing path, since the NC reduction also uses permutes.
++    const auto& shape = input_tensor.logical_shape();
++    const auto& padded_shape = input_tensor.padded_shape();
++    const auto tile = input_tensor.tensor_spec().tile();
++    if (reduce_dim == tt::tt_metal::ReduceOpDim::W && !negate && scaler == 1.0f &&
++        (reduce_math == tt::tt_metal::ReduceOpMath::SUM || reduce_math == tt::tt_metal::ReduceOpMath::MAX) &&
++        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT32) &&
++        !sub_core_grids && config.fp32_dest_acc_en && both_interleaved && input_tensor.layout() == Layout::TILE &&
++        shape.rank() == 4 && shape[0] == 1 && shape[1] == 1 && shape[2] > 0 &&
++        padded_shape[2] == tile.get_height() && shape[3] == padded_shape[3]) {
++        const uint32_t width_tiles = shape[3] / tile.get_width();
++        const auto grid = input_tensor.device()->compute_with_storage_grid_size();
++        const uint32_t cores = grid.x * grid.y;
++        // Amortize the second reduction only when there is more than one tile per core.
++        uint32_t chunks = width_tiles >= 2 * cores ? cores : 1;
++        while (chunks > 1 && width_tiles % chunks != 0) {
++            --chunks;
++        }
++        if (chunks > 1) {
++            auto split = tt::tt_metal::view(
++                input_tensor, Shape{1, chunks, shape[2], shape[3] / chunks},
++                Shape{1, chunks, tile.get_height(), shape[3] / chunks});
++            // Keep SUM partials in FP32 so splitting does not add a BF16 rounding step.
++            const auto partial_dtype = reduce_math == tt::tt_metal::ReduceOpMath::SUM
++                                           ? DataType::FLOAT32
++                                           : input_tensor.dtype();
++            auto partials = ttnn::prim::reduce(
++                split, reduce_math, tt::tt_metal::ReduceOpDim::W, 1.0f, output_mem_config,
++                partial_dtype, config, sub_core_grids, /*negate=*/false, /*post_mul_scaler=*/1.0f,
++                /*row_major_w_dense_path=*/false, /*row_major_h_dense_path=*/false,
++                /*use_sfpu_reduce=*/use_sfpu_fp32_reduce);
++            auto combine = reduce_math == tt::tt_metal::ReduceOpMath::SUM ? ttnn::sum : ttnn::max;
++            auto result = combine(partials, 1, true, output_mem_config, config, 1.0f, true, sub_core_grids);
++            const auto result_dtype = output_dtype.value_or(input_tensor.dtype());
++            return result.dtype() == result_dtype ? result : ttnn::typecast(result, result_dtype, output_mem_config);
++        }
++    }
++
+     const bool rm_base_eligible =
+         use_row_major_support && input_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR &&
+         input_tensor.logical_shape().rank() == 4 && both_interleaved &&
