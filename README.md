@@ -148,7 +148,17 @@ curl -sS http://127.0.0.1:31000/generate \
 ```
 
 On a P150, generation should be about 30 tokens per second after the compile
-and trace-capture warmups.
+and trace-capture warmups. Actual throughput also depends on the host CPU's
+power profile and core placement.
+
+### Host CPU power profile
+
+On Linux with `power-profiles-daemon` and a supported `performance` profile,
+prepend `powerprofilesctl launch --profile performance` to the server command
+above (before `env`). The profile hold ends when the server exits.
+
+This affects the whole system and can increase heat and power use; it does
+not lock CPU frequency or prevent thermal throttling.
 
 ### Run MMLU
 
