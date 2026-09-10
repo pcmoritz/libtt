@@ -1,12 +1,10 @@
 --- ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
-@@ -9,2 +9,5 @@
+@@ -9,2 +9,3 @@
 +#include <algorithm>
-+#include <cmath>
  #include <optional>
  #include <string>
-+#include <tt-metalium/work_split.hpp>
-@@ -13,9 +16,23 @@
+@@ -13,9 +14,36 @@
  #include "ttnn/operations/eltwise/unary_backward/unary_backward.hpp"
  #include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
  #include "ttnn/operations/data_movement/common/common.hpp"
@@ -17,20 +15,33 @@
  
 +// The W kernel assigns tile rows to cores. Split only into otherwise idle cores,
 +// balancing W / chunks tiles of partial work against chunks partial results.
-+static uint32_t get_width_chunks(uint32_t tile_rows, uint32_t width_tiles, uint32_t cores) {
-+    if (tile_rows == 0 || tile_rows >= cores || width_tiles == 0) {
++static uint32_t get_width_chunks(
++    uint32_t tile_rows, uint32_t width_tiles, uint32_t cores) {
++    if (tile_rows == 0) {
 +        return 1;
 +    }
-+    const uint32_t limit = std::min(cores / tile_rows, static_cast<uint32_t>(std::sqrt(width_tiles)));
-+    const auto [chunks, tiles_per_chunk] =
-+        tt::tt_metal::get_max_cores_divisible_by_tiles_per_core_tiles(width_tiles, limit);
-+    return tiles_per_chunk + chunks < width_tiles ? chunks : 1;
++
++    uint32_t best_chunks = 1;
++    uint32_t best_cost = width_tiles;  // Unsplit: no combining stage.
++
++    for (uint32_t chunks = 2; chunks <= cores / tile_rows; ++chunks) {
++        if (width_tiles % chunks != 0) {
++            continue;
++        }
++
++        const uint32_t cost = width_tiles / chunks + chunks;
++        if (cost < best_cost) {
++            best_chunks = chunks;
++            best_cost = cost;
++        }
++    }
++    return best_chunks;
 +}
 +
  std::map<std::string, std::string> get_defines(
      tt::tt_metal::ReduceOpMath reduce_op, tt::tt_metal::ReduceOpDim reduce_dim) {
      std::map<std::string, std::string> defines;
-@@ -134,6 +151,46 @@
+@@ -134,6 +162,46 @@
      const bool both_interleaved =
          input_tensor.memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED &&
          output_mem_config.memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED;
