@@ -13,6 +13,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/RegionUtils.h"
@@ -50,18 +51,11 @@ FailureOr<int64_t> getScalarInteger(Value value) {
   if (!isScalarInteger(value)) {
     return failure();
   }
-  DenseElementsAttr constantValue;
-  if (auto constant = value.getDefiningOp<stablehlo::ConstantOp>()) {
-    constantValue = dyn_cast<DenseElementsAttr>(constant.getValue());
-  } else if (auto constant = value.getDefiningOp<ttir::ConstantOp>()) {
-    constantValue = dyn_cast<DenseElementsAttr>(constant.getValue());
-  } else {
+  auto constant = value.getDefiningOp<stablehlo::ConstantOp>();
+  if (!constant || constant.getValue().getNumElements() != 1) {
     return failure();
   }
-  if (!constantValue || constantValue.getNumElements() != 1) {
-    return failure();
-  }
-  return (*constantValue.value_begin<llvm::APInt>()).getSExtValue();
+  return (*constant.getValue().value_begin<llvm::APInt>()).getSExtValue();
 }
 
 struct LoopBound {
@@ -395,6 +389,8 @@ public:
 
     Value branchIndex = adaptor.getIndex();
     if (caseOp.getBranches().size() == 2) {
+      // Recover the Boolean selector before or after its integer conversion
+      // has been lowered to ttir.where(predicate, 1, 0).
       if (auto convert =
               caseOp.getIndex().getDefiningOp<stablehlo::ConvertOp>();
           convert && isScalarI1(convert.getOperand())) {
@@ -403,16 +399,11 @@ public:
           branchIndex = predicate;
         }
       }
-    }
-
-    if (caseOp.getBranches().size() == 2) {
-      if (auto where = branchIndex.getDefiningOp<ttir::WhereOp>()) {
-        FailureOr<int64_t> trueIndex = getScalarInteger(where.getSecond());
-        FailureOr<int64_t> falseIndex = getScalarInteger(where.getThird());
-        if (isScalarI1(where.getFirst()) && succeeded(trueIndex) &&
-            *trueIndex == 1 && succeeded(falseIndex) && *falseIndex == 0) {
-          branchIndex = where.getFirst();
-        }
+      if (auto where = branchIndex.getDefiningOp<ttir::WhereOp>();
+          where && isScalarI1(where.getFirst()) &&
+          matchPattern(where.getSecond(), m_One()) &&
+          matchPattern(where.getThird(), m_Zero())) {
+        branchIndex = where.getFirst();
       }
     }
 
