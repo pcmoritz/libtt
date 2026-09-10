@@ -1,11 +1,19 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -11109,2 +11109,3 @@ public:
+@@ -11031,6 +11031,7 @@
+     rewriter.replaceOpWithNewOp<ttir::TopKOp>(srcOp, resultTypes, input, kAttr,
+                                               dimAttr, largestAttr, sortedAttr);
+     return success();
+   }
  };
 +
  } // namespace
-@@ -11222,2 +11223,90 @@ public:
+@@ -11144,6 +11145,94 @@
+     rewriter.replaceOpWithNewOp<ttir::WhereOp>(
+         srcOp, resultType, adjust, roundedDown, rounded);
+     return success();
+   }
  };
 +
 +class StableHLOApproxTopKOpConversionPattern
@@ -96,11 +104,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  }
 +};
  } // namespace
-@@ -11149,6 +11237,7 @@
+@@ -11481,6 +11570,7 @@
+ static void addReduceOpsConversionPatterns(MLIRContext *ctx,
+                                            RewritePatternSet &patterns,
                                             TypeConverter &typeConverter) {
    patterns.add<StableHLOToTTIRReduceOpConversionPattern>(typeConverter, ctx);
    patterns.add<StableHLOTopKOpMHLOConversionPattern>(typeConverter, ctx);
 +  patterns.add<StableHLOApproxTopKOpConversionPattern>(typeConverter, ctx);
  }
- 
- static void

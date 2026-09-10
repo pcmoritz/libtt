@@ -54,16 +54,6 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
  
      return failure();
-@@ -294,7 +310,8 @@
-                           mlir::stablehlo::ReduceOp::Adaptor adaptor,
-                           ConversionPatternRewriter &rewriter) const {
-     if (srcOp.getInputs().size() != 1 &&
--        !isArgMax(srcOp, adaptor, rewriter)) {
-+        !isArgMax(srcOp, adaptor, rewriter) &&
-+        !isArgMin(srcOp, adaptor, rewriter)) {
-       return rewriter.notifyMatchFailure(
-           srcOp, "variadic stablehlo.reduce is not supported");
-     }
 @@ -355,15 +372,18 @@
    }
  

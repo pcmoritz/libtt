@@ -15,7 +15,7 @@ index e60e4f91..fdce54b5 100644
  public:
    LogicalResult
    matchAndRewrite(mlir::stablehlo::ReduceWindowOp srcOp,
-@@ -2925,38 +2930,21 @@ public:
+@@ -2925,28 +2930,21 @@ public:
      }
  
      // Handle the special case of lowering to CumSumOp.
@@ -23,11 +23,6 @@ index e60e4f91..fdce54b5 100644
 -      std::optional<int64_t> dimension =
 -          isCumSum(srcOp, adaptor, (*initValues)[0], reductionOps[0], padding);
 -      if (dimension) {
--        if (firstInputType.getElementType().isInteger(8)) {
--          return rewriter.notifyMatchFailure(
--              srcOp, "8-bit cumulative reductions are not supported");
--        }
--
 -        mlir::RankedTensorType resultType = cast<RankedTensorType>(
 -            getTypeConverter()->convertType(srcOp.getResult(0).getType()));
 -        rewriter.replaceOpWithNewOp<ttir::CumSumOp>(
@@ -45,11 +40,6 @@ index e60e4f91..fdce54b5 100644
 -      std::optional<int64_t> cumprodDimension =
 -          isCumProd(srcOp, adaptor, (*initValues)[0], reductionOps[0], padding);
 -      if (cumprodDimension) {
--        if (firstInputType.getElementType().isInteger(8)) {
--          return rewriter.notifyMatchFailure(
--              srcOp, "8-bit cumulative reductions are not supported");
--        }
--
 -        mlir::RankedTensorType resultType = cast<RankedTensorType>(
 -            getTypeConverter()->convertType(srcOp.getResult(0).getType()));
 -        rewriter.replaceOpWithNewOp<ttir::CumProdOp>(
