@@ -245,6 +245,8 @@ http_archive(
         "//third_party/tt_metal:scatter_min_max.patch",
         "//third_party/tt_metal:scatter_metal2_shape_args.patch",
         "//third_party/tt_metal:accurate_fp32_reductions.patch",
+        "//third_party/tt_metal:reduce_w_batched_reads.patch",
+        "//third_party/tt_metal:parallel_wide_reductions.patch",
         "//third_party/tt_metal:embedding_float32.patch",
         "//third_party/tt_metal:permute_float32.patch",
         "//third_party/tt_metal:layout_zero_volume.patch",
