@@ -1,0 +1,34 @@
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+index 156ab6f..4ca3c8f 100644
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -353,26 +353,12 @@ static TraceVariant captureTrace(
+ static void executeTrace(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+                          ProgramContext &context,
+                          TraceVariant &variant) {
+-  ::tt::runtime::Device deviceHandle = context.getDeviceHandle();
++  ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();
+ 
+   updateTraceInputSlots(op, context, variant.inputTensors);
+ 
+-  ::ttnn::Tensor traceIdTensor =
+-      ::tt::runtime::ttnn::utils::createTTNNTensor<uint32_t>(
+-          &variant.traceId.get(), ::ttnn::Shape(), ::ttnn::DataType::UINT32);
+-
+-  std::vector<::tt::runtime::Tensor> inputTensors = {
+-      ::tt::runtime::ttnn::utils::createRuntimeTensorFromTTNN(traceIdTensor)};
+-
+-  // The execute trace program only invokes ttnn.execute_trace(traceId); the
+-  // semaphores were baked into the captured trace at capture time and are not
+-  // arguments of the execute program. Passing them here would mismatch
+-  // program->semaphore_inputs() (which is empty for the execute program).
+-  ProgramExecutor executor(deviceHandle, context.getExecutableHandle(),
+-                           op->execute_program_id(), inputTensors,
+-                           /*constEvalProgram=*/false,
+-                           /*programSemaphoreInputs=*/{});
+-  executor.execute();
++  ::ttnn::operations::trace::execute_trace(
++      &meshDevice, variant.traceId, ::ttnn::QueueId(0), /*blocking=*/false);
+ 
+   publishTraceOutputs(op, context, variant.outputTensors);
+ }

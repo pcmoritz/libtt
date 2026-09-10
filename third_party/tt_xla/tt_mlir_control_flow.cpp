@@ -13,6 +13,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/RegionUtils.h"
@@ -37,6 +38,13 @@ bool isScalarInteger(Value value) {
       type ? dyn_cast<IntegerType>(type.getElementType()) : IntegerType();
   return integerType && type.getNumElements() == 1 &&
          integerType.getWidth() <= 32;
+}
+
+bool isScalarI1(Value value) {
+  auto type = value ? dyn_cast<RankedTensorType>(value.getType())
+                    : RankedTensorType();
+  return type && type.getNumElements() == 1 &&
+         type.getElementType().isInteger(1);
 }
 
 FailureOr<int64_t> getScalarInteger(Value value) {
@@ -379,9 +387,29 @@ public:
           rewriter.getContext(), branchFunction.getSymName()));
     }
 
+    Value branchIndex = adaptor.getIndex();
+    if (caseOp.getBranches().size() == 2) {
+      // Recover the Boolean selector before or after its integer conversion
+      // has been lowered to ttir.where(predicate, 1, 0).
+      if (auto convert =
+              caseOp.getIndex().getDefiningOp<stablehlo::ConvertOp>();
+          convert && isScalarI1(convert.getOperand())) {
+        if (Value predicate =
+                rewriter.getRemappedValue(convert.getOperand())) {
+          branchIndex = predicate;
+        }
+      }
+      if (auto where = branchIndex.getDefiningOp<ttir::WhereOp>();
+          where && isScalarI1(where.getFirst()) &&
+          matchPattern(where.getSecond(), m_One()) &&
+          matchPattern(where.getThird(), m_Zero())) {
+        branchIndex = where.getFirst();
+      }
+    }
+
     rewriter.replaceOpWithNewOp<ttcore::CaseOp>(
         caseOp, resultTypes, rewriter.getArrayAttr(branchPrograms),
-        adaptor.getIndex(), convertedCaptures);
+        branchIndex, convertedCaptures);
     return success();
   }
 };
