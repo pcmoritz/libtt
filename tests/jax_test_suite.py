@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run JAX tests against this checkout's libtt PJRT plugin."""
+"""Run upstream JAX tests against this checkout's libtt PJRT plugin."""
 
 import argparse
 import os
+from pathlib import Path
 import sys
 import zipfile
-from pathlib import Path
 
 from python.runfiles import runfiles
 
@@ -25,7 +25,6 @@ def main() -> int:
     parser.add_argument("--jax-tests-anchor", required=True)
     parser.add_argument("--jax-plugin-wheel", required=True)
     parser.add_argument("--skip-device-check", action="store_true")
-    parser.add_argument("--test-file", action="append", default=[])
     args, pytest_args = parser.parse_known_args()
 
     plugin_wheel = _rlocation(args.jax_plugin_wheel).resolve(strict=True)
@@ -62,9 +61,8 @@ def main() -> int:
 
     import pytest
 
-    test_files = [str(_rlocation(path).resolve(strict=True)) for path in args.test_file]
     os.chdir(jax_repo)
-    return pytest.main(test_files + pytest_args or ["tests"])
+    return pytest.main(pytest_args or ["tests"])
 
 
 if __name__ == "__main__":

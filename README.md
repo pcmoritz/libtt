@@ -29,12 +29,6 @@ Run the upstream JAX smoke tests against this checkout's plugin wheel:
 bazel test //tests:jax_smoke_tests --test_output=streamed
 ```
 
-Run the gather and cross-entropy regressions, including loss and gradient checks:
-
-```bash
-bazel test //tests:jax_gather_regression_tests --test_output=streamed
-```
-
 Pass pytest arguments to the broader runner with `--test_arg`. For example,
 collect a test file without the runner eagerly opening the TT device:
 

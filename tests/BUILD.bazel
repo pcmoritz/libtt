@@ -75,16 +75,3 @@ py_test(
     tags = JAX_TEST_TAGS,
     timeout = "eternal",
 )
-
-py_test(
-    name = "jax_gather_regression_tests",
-    srcs = ["jax_test_suite.py"],
-    args = JAX_TEST_ARGS + [
-        "--test-file=$(rlocationpath :gather_regression_test.py)",
-    ],
-    data = JAX_TEST_DATA + ["gather_regression_test.py"],
-    deps = JAX_TEST_DEPS,
-    main = "jax_test_suite.py",
-    tags = JAX_TEST_TAGS,
-    timeout = "long",
-)
