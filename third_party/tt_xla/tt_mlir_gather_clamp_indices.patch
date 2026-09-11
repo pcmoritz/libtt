@@ -1,0 +1,46 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -5598,6 +5598,42 @@ public:
+         adaptor.getOperands()[1]);
+     auto indexVectorDim = dimensionNumbers.getIndexVectorDim();
+ 
++    // StableHLO clamps each start-index component to the largest start that
++    // keeps its slice in bounds. Do this before flattening multiple components
++    // so an out-of-bounds coordinate cannot spill into an adjacent dimension.
++    auto clampIndex = [&](Value index, int64_t operandDim) -> Value {
++      auto type = mlir::cast<RankedTensorType>(index.getType());
++      return rewriter.create<ttir::ClampScalarOp>(
++          ttmlir::utils::appendLocationSuffix(srcOp->getLoc(),
++                                              "_clampStartIndex"),
++          type, index, rewriter.getI32IntegerAttr(0),
++          rewriter.getI32IntegerAttr(inputShape[operandDim] -
++                                     sliceSizes[operandDim]));
++    };
++
++    if (originalStartIndexMap.size() == 1) {
++      startIndices = mlir::cast<mlir::TypedValue<mlir::RankedTensorType>>(
++          clampIndex(startIndices, originalStartIndexMap.front()));
++    } else {
++      SmallVector<Value> components;
++      components.reserve(originalStartIndexMap.size());
++      for (auto [component, operandDim] :
++           llvm::enumerate(originalStartIndexMap)) {
++        Value index = sliceStartIndices(
++            rewriter,
++            ttmlir::utils::appendLocationSuffix(
++                srcOp->getLoc(),
++                "_sliceStartIndex" + std::to_string(component)),
++            startIndices, indexVectorDim, component);
++        components.push_back(clampIndex(index, operandDim));
++      }
++      startIndices = rewriter.create<ttir::ConcatOp>(
++          ttmlir::utils::appendLocationSuffix(srcOp->getLoc(),
++                                              "_clampStartIndices"),
++          startIndices.getType(), components,
++          rewriter.getSI32IntegerAttr(indexVectorDim));
++    }
++
+     if (numIndexingDims > 1) {
+       srcOp->emitWarning("End results might be incorrect when indexing "
+                          "multiple dimensions of input because of typecast "
