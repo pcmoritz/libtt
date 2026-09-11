@@ -1,0 +1,594 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -6456,6 +6456,53 @@
+   let hasVerifier = 1;
+ }
+ 
++def TTIR_GatedDeltaRuleOp : TTIR_NamedOp<"gated_delta_rule"> {
++  let summary = "gated delta rule.";
++  let arguments = (ins AnyRankedTensor:$query,
++                       AnyRankedTensor:$key,
++                       AnyRankedTensor:$value,
++                       AnyRankedTensor:$gate,
++                       AnyRankedTensor:$beta,
++                       AnyRankedTensor:$initial_state,
++                       AnyRankedTensor:$eye,
++                       AnyRankedTensor:$tril,
++                       AnyRankedTensor:$ones,
++                       AnyRankedTensor:$masks);
++  let results = (outs AnyRankedTensor:$final_state, AnyRankedTensor:$output);
++}
++
++def TTIR_GatedDeltaDecodeOp : TTIR_InplaceOp<"gated_delta_decode", [TTIR_CacheOpInterface]> {
++  let summary = "gated delta decode.";
++  let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
++                       AnyRankedTensor:$query,
++                       AnyRankedTensor:$key,
++                       AnyRankedTensor:$value,
++                       AnyRankedTensor:$beta_logits,
++                       AnyRankedTensor:$delta_time,
++                       AnyRankedTensor:$a_log,
++                       AnyRankedTensor:$dt_bias,
++                       AnyRankedTensor:$state_indices,
++                       AnyRankedTensor:$has_initial_state);
++  let results = (outs AnyRankedTensor:$output);
++}
++
++def TTIR_CausalConv1dUpdateOp : TTIR_InplaceOp<"causal_conv1d_update", [TTIR_CacheOpInterface]> {
++  let summary = "causal conv1d update.";
++  let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
++                       AnyRankedTensor:$input,
++                       AnyRankedTensor:$weight,
++                       AnyRankedTensor:$state_indices,
++                       AnyRankedTensor:$has_initial_state);
++  let results = (outs AnyRankedTensor:$output);
++}
++
++def TTIR_StatePoolUpdateOp : TTIR_InplaceOp<"state_pool_update", [TTIR_CacheOpInterface]> {
++  let summary = "state pool update.";
++  let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
++                       AnyRankedTensor:$state_indices,
++                       AnyRankedTensor:$updates);
++}
++
+ def TTIR_GlobalAvgPool2dOp: TTIR_NamedOp<"global_avg_pool2d">{
+   let summary = "A global average pooling 2d operation";
+   let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -4284,6 +4284,53 @@
+     let hasVerifier = 1;
+ }
+ 
++def TTNN_GatedDeltaRuleOp : TTNN_Op<"gated_delta_rule", [OpModelExempt]> {
++  let summary = "gated delta rule.";
++  let arguments = (ins AnyRankedTensor:$query,
++                       AnyRankedTensor:$key,
++                       AnyRankedTensor:$value,
++                       AnyRankedTensor:$gate,
++                       AnyRankedTensor:$beta,
++                       AnyRankedTensor:$initial_state,
++                       AnyRankedTensor:$eye,
++                       AnyRankedTensor:$tril,
++                       AnyRankedTensor:$ones,
++                       AnyRankedTensor:$masks);
++  let results = (outs AnyRankedTensor:$final_state, AnyRankedTensor:$output);
++}
++
++def TTNN_GatedDeltaDecodeOp : TTNN_InplaceOp<"gated_delta_decode", [OpModelExempt]> {
++  let summary = "gated delta decode.";
++  let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
++                       AnyRankedTensor:$query,
++                       AnyRankedTensor:$key,
++                       AnyRankedTensor:$value,
++                       AnyRankedTensor:$beta_logits,
++                       AnyRankedTensor:$delta_time,
++                       AnyRankedTensor:$a_log,
++                       AnyRankedTensor:$dt_bias,
++                       AnyRankedTensor:$state_indices,
++                       AnyRankedTensor:$has_initial_state);
++  let results = (outs AnyRankedTensor:$output);
++}
++
++def TTNN_CausalConv1dUpdateOp : TTNN_InplaceOp<"causal_conv1d_update", [OpModelExempt]> {
++  let summary = "causal conv1d update.";
++  let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
++                       AnyRankedTensor:$input,
++                       AnyRankedTensor:$weight,
++                       AnyRankedTensor:$state_indices,
++                       AnyRankedTensor:$has_initial_state);
++  let results = (outs AnyRankedTensor:$output);
++}
++
++def TTNN_StatePoolUpdateOp : TTNN_InplaceOp<"state_pool_update", [OpModelExempt]> {
++  let summary = "state pool update.";
++  let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
++                       AnyRankedTensor:$state_indices,
++                       AnyRankedTensor:$updates);
++}
++
+ def TTNN_FlashMlaPrefillOp : TTNN_Op<"flash_mla_prefill", [AttrSizedOperandSegments]> {
+     let summary = "Flash Multi-head Latent Attention prefill operation.";
+     let description = [{
+diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
+--- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
++++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
+@@ -79,6 +79,50 @@
+   attention_sink: tt.target.ttnn.TensorRef;
+   out: tt.target.ttnn.TensorRef;
+   memcfg: tt.target.ttnn.MemoryConfig;
++}
++
++table GatedDeltaRuleOp {
++  query: tt.target.ttnn.TensorRef;
++  key: tt.target.ttnn.TensorRef;
++  value: tt.target.ttnn.TensorRef;
++  gate: tt.target.ttnn.TensorRef;
++  beta: tt.target.ttnn.TensorRef;
++  initial_state: tt.target.ttnn.TensorRef;
++  eye: tt.target.ttnn.TensorRef;
++  tril: tt.target.ttnn.TensorRef;
++  ones: tt.target.ttnn.TensorRef;
++  masks: tt.target.ttnn.TensorRef;
++  final_state: tt.target.ttnn.TensorRef;
++  output: tt.target.ttnn.TensorRef;
++}
++
++table GatedDeltaDecodeOp {
++  cache: tt.target.ttnn.TensorRef;
++  query: tt.target.ttnn.TensorRef;
++  key: tt.target.ttnn.TensorRef;
++  value: tt.target.ttnn.TensorRef;
++  beta_logits: tt.target.ttnn.TensorRef;
++  delta_time: tt.target.ttnn.TensorRef;
++  a_log: tt.target.ttnn.TensorRef;
++  dt_bias: tt.target.ttnn.TensorRef;
++  state_indices: tt.target.ttnn.TensorRef;
++  has_initial_state: tt.target.ttnn.TensorRef;
++  output: tt.target.ttnn.TensorRef;
++}
++
++table CausalConv1dUpdateOp {
++  cache: tt.target.ttnn.TensorRef;
++  input: tt.target.ttnn.TensorRef;
++  weight: tt.target.ttnn.TensorRef;
++  state_indices: tt.target.ttnn.TensorRef;
++  has_initial_state: tt.target.ttnn.TensorRef;
++  output: tt.target.ttnn.TensorRef;
++}
++
++table StatePoolUpdateOp {
++  cache: tt.target.ttnn.TensorRef;
++  state_indices: tt.target.ttnn.TensorRef;
++  updates: tt.target.ttnn.TensorRef;
+ }
+ 
+ table FlashMlaPrefillOp {
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -87,6 +87,10 @@
+   FuncCallOp,
+   GatherOp,
+   GenericOp,
++  GatedDeltaRuleOp,
++  GatedDeltaDecodeOp,
++  CausalConv1dUpdateOp,
++  StatePoolUpdateOp,
+   GetDeviceOp,
+   GlobalAvgPool2dOp,
+   GroupNormOp,
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10064,6 +10064,72 @@
+ } // namespace
+ 
+ namespace {
++// Explicit recurrent calls use the same in-place cache contract as paged KV
++// ops. The FFI returns an alias for functional JAX; the dialect retains the
++// cache operand.
++class StableHLORecurrentOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
++public:
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::CustomCallOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto name = op.getCallTargetName();
++    if (name == "tt.gated_delta_rule") {
++      if (op.getNumOperands() != 10 || op.getNumResults() != 2) {
++        return op.emitOpError("invalid recurrent call arity");
++      }
++      SmallVector<Type> types;
++      if (failed(
++              getTypeConverter()->convertTypes(op.getResultTypes(), types))) {
++        return failure();
++      }
++      rewriter.replaceOpWithNewOp<ttir::GatedDeltaRuleOp>(
++          op, types, adaptor.getOperands());
++      return success();
++    }
++    if (name == "tt.gated_delta_decode") {
++      if (op.getNumOperands() != 10 || op.getNumResults() != 2) {
++        return op.emitOpError("invalid recurrent call arity");
++      }
++      if (failed(requireOutputOperandAlias(op, 0, 0))) {
++        return failure();
++      }
++      auto type = getTypeConverter()->convertType(op.getResult(1).getType());
++      auto result = rewriter.create<ttir::GatedDeltaDecodeOp>(
++          op.getLoc(), type, adaptor.getOperands());
++      rewriter.replaceOp(op, {adaptor.getOperands()[0], result.getResult()});
++      return success();
++    }
++    if (name == "tt.causal_conv1d_update") {
++      if (op.getNumOperands() != 5 || op.getNumResults() != 2) {
++        return op.emitOpError("invalid recurrent call arity");
++      }
++      if (failed(requireOutputOperandAlias(op, 0, 0))) {
++        return failure();
++      }
++      auto type = getTypeConverter()->convertType(op.getResult(1).getType());
++      auto result = rewriter.create<ttir::CausalConv1dUpdateOp>(
++          op.getLoc(), type, adaptor.getOperands());
++      rewriter.replaceOp(op, {adaptor.getOperands()[0], result.getResult()});
++      return success();
++    }
++    if (name == "tt.state_pool_update") {
++      if (op.getNumOperands() != 3 || op.getNumResults() != 1) {
++        return op.emitOpError("invalid recurrent call arity");
++      }
++      if (failed(requireOutputOperandAlias(op, 0, 0))) {
++        return failure();
++      }
++      rewriter.create<ttir::StatePoolUpdateOp>(op.getLoc(), TypeRange{},
++                                               adaptor.getOperands());
++      rewriter.replaceOp(op, adaptor.getOperands()[0]);
++      return success();
++    }
++    return failure();
++  }
++};
++
+ class StableHLOPagedFillCacheConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
+   using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
+@@ -12106,6 +12172,8 @@
+                                                                 ctx);
+   patterns.add<StableHLOToTTIRCollectivePermuteOpConversionPattern>(
+       typeConverter, ctx);
++  patterns.add<StableHLORecurrentOpConversionPattern>(typeConverter,
++                                                      patterns.getContext());
+   patterns.add<StableHLOToTTIRCustomCallOpConversionPattern>(typeConverter,
+                                                              ctx);
+   patterns.add<StableHLOToTTIRAllToAllOpConversionPattern>(typeConverter, ctx);
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -3477,6 +3477,35 @@
+ } // namespace
+ 
+ namespace {
++template <typename SrcOp, typename DstOp>
++class RecurrentOpConversionPattern : public OpConversionPattern<SrcOp> {
++public:
++  using OpConversionPattern<SrcOp>::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(SrcOp op, typename SrcOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    SmallVector<Type> types;
++    if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
++                                                      types))) {
++      return failure();
++    }
++    rewriter.replaceOpWithNewOp<DstOp>(op, types, adaptor.getOperands());
++    return success();
++  }
++};
++using GatedDeltaRuleOpConversionPattern =
++    RecurrentOpConversionPattern<ttir::GatedDeltaRuleOp,
++                                 ttnn::GatedDeltaRuleOp>;
++using GatedDeltaDecodeOpConversionPattern =
++    RecurrentOpConversionPattern<ttir::GatedDeltaDecodeOp,
++                                 ttnn::GatedDeltaDecodeOp>;
++using CausalConv1dUpdateOpConversionPattern =
++    RecurrentOpConversionPattern<ttir::CausalConv1dUpdateOp,
++                                 ttnn::CausalConv1dUpdateOp>;
++using StatePoolUpdateOpConversionPattern =
++    RecurrentOpConversionPattern<ttir::StatePoolUpdateOp,
++                                 ttnn::StatePoolUpdateOp>;
++
+ class PagedFlashMultiLatentAttentionDecodeOpConversionPattern
+     : public OpConversionPattern<ttir::PagedFlashMultiLatentAttentionDecodeOp> {
+ public:
+@@ -3995,6 +4024,10 @@
+            ScaledDotProductAttentionDecodeOpConversionPattern,
+            PagedScaledDotProductAttentionDecodeOpConversionPattern,
+            ChunkedScaledDotProductAttentionOpConversionPattern,
++           GatedDeltaRuleOpConversionPattern,
++           GatedDeltaDecodeOpConversionPattern,
++           CausalConv1dUpdateOpConversionPattern,
++           StatePoolUpdateOpConversionPattern,
+            PagedFlashMultiLatentAttentionDecodeOpConversionPattern,
+            SplitQueryKeyValueAndSplitHeadsOpConversionPattern,
+            GeluBackwardOpConversionPattern,
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -3645,6 +3645,63 @@
+       slidingWindowSize, attentionSink, out, memoryConfig);
+ }
+ 
++::flatbuffers::Offset<::tt::target::ttnn::GatedDeltaRuleOp>
++createOp(FlatbufferObjectCache &cache, GatedDeltaRuleOp op) {
++  auto tensor = [&](Value value) {
++    return cache.at<::tt::target::ttnn::TensorRef>(
++        getOperandThroughDPSOps(value));
++  };
++  return ::tt::target::ttnn::CreateGatedDeltaRuleOp(
++      *cache.fbb, tensor(op.getQuery()), tensor(op.getKey()),
++      tensor(op.getValue()), tensor(op.getGate()), tensor(op.getBeta()),
++      tensor(op.getInitialState()), tensor(op.getEye()), tensor(op.getTril()),
++      tensor(op.getOnes()), tensor(op.getMasks()),
++      cache.getOrCreateNoSharding(op.getFinalState(), tensorValueToFlatbuffer,
++                                  std::nullopt),
++      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
++                                  std::nullopt));
++}
++
++::flatbuffers::Offset<::tt::target::ttnn::GatedDeltaDecodeOp>
++createOp(FlatbufferObjectCache &cache, GatedDeltaDecodeOp op) {
++  auto tensor = [&](Value value) {
++    return cache.at<::tt::target::ttnn::TensorRef>(
++        getOperandThroughDPSOps(value));
++  };
++  return ::tt::target::ttnn::CreateGatedDeltaDecodeOp(
++      *cache.fbb, tensor(op.getCache()), tensor(op.getQuery()),
++      tensor(op.getKey()), tensor(op.getValue()), tensor(op.getBetaLogits()),
++      tensor(op.getDeltaTime()), tensor(op.getALog()), tensor(op.getDtBias()),
++      tensor(op.getStateIndices()), tensor(op.getHasInitialState()),
++      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
++                                  std::nullopt));
++}
++
++::flatbuffers::Offset<::tt::target::ttnn::CausalConv1dUpdateOp>
++createOp(FlatbufferObjectCache &cache, CausalConv1dUpdateOp op) {
++  auto tensor = [&](Value value) {
++    return cache.at<::tt::target::ttnn::TensorRef>(
++        getOperandThroughDPSOps(value));
++  };
++  return ::tt::target::ttnn::CreateCausalConv1dUpdateOp(
++      *cache.fbb, tensor(op.getCache()), tensor(op.getInput()),
++      tensor(op.getWeight()), tensor(op.getStateIndices()),
++      tensor(op.getHasInitialState()),
++      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
++                                  std::nullopt));
++}
++
++::flatbuffers::Offset<::tt::target::ttnn::StatePoolUpdateOp>
++createOp(FlatbufferObjectCache &cache, StatePoolUpdateOp op) {
++  auto tensor = [&](Value value) {
++    return cache.at<::tt::target::ttnn::TensorRef>(
++        getOperandThroughDPSOps(value));
++  };
++  return ::tt::target::ttnn::CreateStatePoolUpdateOp(
++      *cache.fbb, tensor(op.getCache()), tensor(op.getStateIndices()),
++      tensor(op.getUpdates()));
++}
++
+ ::flatbuffers::Offset<::tt::target::ttnn::FlashMlaPrefillOp>
+ createOp(FlatbufferObjectCache &cache, FlashMlaPrefillOp op) {
+   auto query = cache.at<::tt::target::ttnn::TensorRef>(
+@@ -5200,6 +5257,22 @@
+     return createOperation(cache, createOp(cache, scaledDotProductAttentionOp),
+                            debugString, locInfo);
+   }
++  if (auto recurrentOp = dyn_cast<GatedDeltaRuleOp>(op)) {
++    return createOperation(cache, createOp(cache, recurrentOp), debugString,
++                           locInfo);
++  }
++  if (auto recurrentOp = dyn_cast<GatedDeltaDecodeOp>(op)) {
++    return createOperation(cache, createOp(cache, recurrentOp), debugString,
++                           locInfo);
++  }
++  if (auto recurrentOp = dyn_cast<CausalConv1dUpdateOp>(op)) {
++    return createOperation(cache, createOp(cache, recurrentOp), debugString,
++                           locInfo);
++  }
++  if (auto recurrentOp = dyn_cast<StatePoolUpdateOp>(op)) {
++    return createOperation(cache, createOp(cache, recurrentOp), debugString,
++                           locInfo);
++  }
+   if (auto flashMlaPrefillOp = dyn_cast<FlashMlaPrefillOp>(op);
+       flashMlaPrefillOp) {
+     return createOperation(cache, createOp(cache, flashMlaPrefillOp),
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -717,10 +717,25 @@
+       traceCallArgs.push_back(captureFunc.getArgument(semaphoreBase + i));
+     }
+ 
++    // Warmup must not advance caller-owned recurrent state. Compile against
++    // temporary cache copies; capture and replay use the original slots.
++    // The deallocation pass releases these copies after the warmup call.
++    llvm::SmallVector<mlir::Value> warmupArgs(traceCallArgs);
++    for (size_t i : info.deviceResidentIndices()) {
++      if (!info.inputArgAttrs[i].contains(ttcore::g_kvCacheAttrName)) {
++        continue;
++      }
++      auto scratch =
++          createSlot(builder, captureFunc.getLoc(), deviceOp,
++                     mlir::cast<RankedTensorType>(inputSlots[i].getType()));
++      builder.create<ttnn::CopyOp>(captureFunc.getLoc(), inputSlots[i],
++                                   scratch);
++      warmupArgs[i] = scratch;
++    }
++
+     // Execute the trace function once without capture to compile programs and
+     // populate program cache.
+-    builder.create<func::CallOp>(captureFunc.getLoc(), traceFunc,
+-                                 traceCallArgs);
++    builder.create<func::CallOp>(captureFunc.getLoc(), traceFunc, warmupArgs);
+ 
+     auto beginTraceCaptureOp = builder.create<ttnn::BeginTraceCaptureOp>(
+         captureFunc.getLoc(), utils::getTraceIdType(context), deviceOp,
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -120,6 +120,7 @@
+ #include "operations/transformer/nlp_create_qkv_heads_decode.h"
+ #include "operations/transformer/paged_flash_multi_latent_attention_decode.h"
+ #include "operations/transformer/paged_scaled_dot_product_attention_decode.h"
++#include "operations/transformer/recurrent.h"
+ #include "operations/transformer/rotary_embedding.h"
+ #include "operations/transformer/rotary_embedding_llama.h"
+ #include "operations/transformer/scaled_dot_product_attention.h"
+@@ -699,6 +700,18 @@
+     return operations::transformer::run(
+         op->type_as_ScaledDotProductAttentionOp(), getContext());
+   }
++  case ::tt::target::ttnn::OpType::GatedDeltaRuleOp:
++    return operations::transformer::run(op->type_as_GatedDeltaRuleOp(),
++                                        getContext());
++  case ::tt::target::ttnn::OpType::GatedDeltaDecodeOp:
++    return operations::transformer::run(op->type_as_GatedDeltaDecodeOp(),
++                                        getContext());
++  case ::tt::target::ttnn::OpType::CausalConv1dUpdateOp:
++    return operations::transformer::run(op->type_as_CausalConv1dUpdateOp(),
++                                        getContext());
++  case ::tt::target::ttnn::OpType::StatePoolUpdateOp:
++    return operations::transformer::run(op->type_as_StatePoolUpdateOp(),
++                                        getContext());
+   case ::tt::target::ttnn::OpType::FlashMlaPrefillOp: {
+     return operations::transformer::run(op->type_as_FlashMlaPrefillOp(),
+                                         getContext());
+diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.h b/runtime/lib/ttnn/operations/transformer/recurrent.h
+--- /dev/null
++++ b/runtime/lib/ttnn/operations/transformer/recurrent.h
+@@ -0,0 +1,14 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "tt/runtime/detail/ttnn/types/types.h"
++namespace tt::runtime::ttnn::operations::transformer {
++void run(const ::tt::target::ttnn::GatedDeltaRuleOp *op,
++         ProgramContext &context);
++void run(const ::tt::target::ttnn::GatedDeltaDecodeOp *op,
++         ProgramContext &context);
++void run(const ::tt::target::ttnn::CausalConv1dUpdateOp *op,
++         ProgramContext &context);
++void run(const ::tt::target::ttnn::StatePoolUpdateOp *op,
++         ProgramContext &context);
++} // namespace tt::runtime::ttnn::operations::transformer
+diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
+--- /dev/null
++++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
+@@ -0,0 +1,104 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++#include "operations/transformer/recurrent.h"
++#include "tt/runtime/detail/ttnn/operations/utils.h"
++#include "tt/runtime/detail/ttnn/ttnn.h"
++#include "tt/runtime/detail/ttnn/utils.h"
++#include "ttnn/operations/transformer/chunk_gated_delta_rule/chunk_gated_delta_rule.hpp"
++#include "ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp"
++#include "ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp"
++#include "ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp"
++
++namespace tt::runtime::ttnn::operations::transformer {
++namespace {
++::ttnn::Tensor
++tiled(const ::ttnn::Tensor &input, ::ttnn::DataType dtype,
++      const ::ttnn::MemoryConfig &config = ::ttnn::DRAM_MEMORY_CONFIG) {
++  auto result = input;
++  if (result.layout() != ::ttnn::Layout::TILE) {
++    result = ::ttnn::to_layout(result, ::ttnn::Layout::TILE, dtype, config);
++  } else if (result.dtype() != dtype) {
++    result = ::ttnn::typecast(result, dtype, config);
++  }
++  return result.memory_config() == config
++             ? result
++             : ::ttnn::to_memory_config(result, config);
++}
++void put(ProgramTensorPool &pool, const ::tt::target::ttnn::TensorRef *ref,
++         const ::ttnn::Tensor &tensor) {
++  auto config = ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(
++      ::tt::runtime::ttnn::utils::getTensorRefMemoryConfig(ref));
++  pool.insertTTNNTensorAndValidate(
++      ref, tiled(tensor, utils::getDataType(ref),
++                 config.value_or(::ttnn::DRAM_MEMORY_CONFIG)));
++}
++} // namespace
++
++void run(const ::tt::target::ttnn::GatedDeltaRuleOp *op,
++         ProgramContext &context) {
++  auto &pool = context.getTensorPool();
++  auto get = [&](const auto *ref) -> const ::ttnn::Tensor & {
++    return pool.getTTNNTensorAndValidate(ref);
++  };
++  auto [output, state] = ::ttnn::transformer::chunk_gated_delta_rule(
++      get(op->query()), get(op->key()), get(op->value()), get(op->gate()),
++      get(op->beta()), 1.0f, get(op->initial_state()), true, 32, false, false,
++      ::ttnn::DRAM_MEMORY_CONFIG, std::nullopt, get(op->eye()), get(op->tril()),
++      get(op->ones()), get(op->masks()));
++  put(pool, op->final_state(), state.value());
++  put(pool, op->output(), output);
++}
++
++void run(const ::tt::target::ttnn::GatedDeltaDecodeOp *op,
++         ProgramContext &context) {
++  auto &pool = context.getTensorPool();
++  auto get = [&](const auto *ref) -> const ::ttnn::Tensor & {
++    return pool.getTTNNTensorAndValidate(ref);
++  };
++  const auto &query = get(op->query());
++  const auto &shape = query.logical_shape();
++  const uint32_t batch = shape[0], heads = shape[1], dim = shape[2];
++  auto vector = [&](const auto *ref) {
++    return ::ttnn::reshape(tiled(get(ref), ::ttnn::DataType::FLOAT32),
++                           ::ttnn::Shape{batch, heads, 1, dim});
++  };
++  auto output = ::ttnn::empty(::ttnn::Shape{batch, heads, 1, dim},
++                              ::ttnn::DataType::FLOAT32, ::ttnn::Layout::TILE,
++                              query.device(), ::ttnn::DRAM_MEMORY_CONFIG);
++  ::ttnn::transformer::gated_delta_decode(
++      vector(op->query()), vector(op->key()), vector(op->value()),
++      tiled(get(op->beta_logits()), ::ttnn::DataType::FLOAT32),
++      tiled(get(op->delta_time()), ::ttnn::DataType::FLOAT32),
++      tiled(get(op->a_log()), ::ttnn::DataType::FLOAT32),
++      tiled(get(op->dt_bias()), ::ttnn::DataType::FLOAT32), get(op->cache()),
++      output, tiled(get(op->state_indices()), ::ttnn::DataType::INT32),
++      tiled(get(op->has_initial_state()), ::ttnn::DataType::BFLOAT16));
++  put(pool, op->output(),
++      ::ttnn::reshape(output, ::ttnn::Shape{batch, heads, dim}));
++}
++
++void run(const ::tt::target::ttnn::CausalConv1dUpdateOp *op,
++         ProgramContext &context) {
++  auto &pool = context.getTensorPool();
++  auto get = [&](const auto *ref) -> const ::ttnn::Tensor & {
++    return pool.getTTNNTensorAndValidate(ref);
++  };
++  auto output = ::ttnn::transformer::causal_conv1d_update(
++      tiled(get(op->input()), ::ttnn::DataType::BFLOAT16), get(op->cache()),
++      tiled(get(op->weight()), ::ttnn::DataType::BFLOAT16),
++      tiled(get(op->state_indices()), ::ttnn::DataType::INT32),
++      tiled(get(op->has_initial_state()), ::ttnn::DataType::BFLOAT16));
++  put(pool, op->output(), output);
++}
++
++void run(const ::tt::target::ttnn::StatePoolUpdateOp *op,
++         ProgramContext &context) {
++  auto &pool = context.getTensorPool();
++  const auto &cache = pool.getTTNNTensorAndValidate(op->cache());
++  ::ttnn::transformer::state_pool_update(
++      cache,
++      tiled(pool.getTTNNTensorAndValidate(op->state_indices()),
++            ::ttnn::DataType::INT32),
++      tiled(pool.getTTNNTensorAndValidate(op->updates()), cache.dtype()));
++}
++} // namespace tt::runtime::ttnn::operations::transformer

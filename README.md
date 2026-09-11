@@ -160,6 +160,40 @@ above (before `env`). The profile hold ends when the server exits.
 This affects the whole system and can increase heat and power use; it does
 not lock CPU frequency or prevent thermal throttling.
 
+### Qwen3.5-9B
+
+This requires the Qwen3.5 model and TT GDN backend in SGLang-JAX (the older
+PR #1527 checkout above does not include them). With that checkout and this
+plugin wheel, use the same setup and server command, changing these options:
+
+```bash
+--model-path Qwen/Qwen3.5-9B \
+--max-running-requests 1 \
+--max-prefill-tokens 32 \
+--chunked-prefill-size 32 \
+--max-recurrent-state-size 1
+```
+
+This path supports text generation on one device with one active request.
+Keep `--dtype bfloat16`, `--disable-radix-cache`, and
+`--disable-overlap-schedule`. Recurrent state stays FP32; do not override
+`SGLANG_JAX_RECURRENT_STATE_DTYPE` or `SGLANG_JAX_CONV_STATE_DTYPE`.
+
+The adapter calls TTNN's chunked Gated DeltaNet kernel for prefill and fused
+causal-convolution/recurrent-update kernels for decode. State slots belong to
+SGLang-JAX's scheduler and use the same in-place cache interface as paged
+attention. Fresh requests read the pool's reserved zero slot; existing requests
+continue from their saved state. Weights stay BF16 rather than Qwen3's BF8
+default. Warm up each prompt-length bucket before measuring performance, as
+for Qwen3 above.
+
+On a P150 with firmware 19.13.1, the five-token prompt above and 128 generated
+tokens measured 12.2–12.3 decode tokens/s, 2.9 s to first token, and 13.3 s
+end-to-end after two warmup requests (BF16, one request, 32-token prefill chunks).
+This is a serving smoke test, not an MMLU accuracy result. Multimodal input,
+multiple active requests, and recurrent prefix-cache snapshots are not supported
+by this backend yet.
+
 ### Run MMLU
 
 Leave the server running and use the evaluator included in the PR checkout.

@@ -40,7 +40,7 @@ index ac04b7e..3343a62 100644
  
  #ifdef TTMLIR_ENABLE_OPMODEL
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
-@@ -174,6 +175,87 @@ private:
+@@ -174,6 +175,94 @@ private:
    }
  };
  
@@ -80,6 +80,13 @@ index ac04b7e..3343a62 100644
 +    }
 +
 +    auto inputType = matmulOp.getType();
++    // The fused runtime only supports BFP8 weights.
++    auto weightDtype = matmulOp->getAttrOfType<mlir::StringAttr>(
++        "ttcore.weight_dtype");
++    if (!weightDtype || weightDtype.getValue() != "bfp_bf8") {
++      return failure();
++    }
++
 +    auto outputType = multiplyOp.getType();
 +    ArrayRef<int64_t> inputShape = inputType.getShape();
 +    ArrayRef<int64_t> outputShape = outputType.getShape();
