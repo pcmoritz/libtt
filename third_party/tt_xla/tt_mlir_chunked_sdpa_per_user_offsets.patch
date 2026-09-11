@@ -216,22 +216,46 @@ index 5ae4641..60cef1a 100644
 +                   << operandIndex;
 +  return mlir::failure();
 +}
-@@ -9788,0 +9822,3 @@ public:
+@@ -9755,6 +9788,9 @@
+               " operands "
+               "and " +
+               std::to_string(srcOp.getResults().size()) + " results.");
 +    if (mlir::failed(requireOutputOperandAlias(srcOp, 0, 0))) {
 +      return mlir::failure();
 +    }
-@@ -9859,0 +9896,3 @@ public:
+     }
+ 
+     mlir::DictionaryAttr frontendAttributes =
+@@ -9826,6 +9862,9 @@
+                      " operands "
+                      "and " +
+                      std::to_string(srcOp.getResults().size()) + " results.");
 +    if (mlir::failed(requireOutputOperandAlias(srcOp, 0, 0))) {
 +      return mlir::failure();
 +    }
-@@ -9931,0 +9971,3 @@ public:
+     }
+ 
+     mlir::DictionaryAttr frontendAttributes =
+@@ -9897,6 +9936,9 @@
+                      " operands "
+                      "and " +
+                      std::to_string(srcOp.getResults().size()) + " results.");
++    }
 +    if (mlir::failed(requireOutputOperandAlias(srcOp, 0, 0))) {
 +      return mlir::failure();
+     }
+ 
+     Value cache = adaptor.getOperands()[0];
+@@ -10016,6 +10058,9 @@
+                      " operands "
+                      "and " +
+                      std::to_string(srcOp.getResults().size()) + " results.");
 +    }
-@@ -10050,0 +10093,3 @@ public:
 +    if (mlir::failed(requireOutputOperandAlias(srcOp, 0, 0))) {
 +      return mlir::failure();
-+    }
+     }
+ 
+     Value cache = adaptor.getOperands()[0];
 @@ -10276,57 +10321,2 @@ public:
 -    mlir::DictionaryAttr frontendAttributes =
 -        mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
@@ -404,8 +428,12 @@ index 5ae4641..60cef1a 100644
 +        hasCurPosTensor ? adaptor.getOperands()[operandIndex++] : Value();
 +    Value attentionSink =
 +        hasAttentionSink ? adaptor.getOperands()[operandIndex++] : Value();
-@@ -10396 +10399,0 @@ public:
+@@ -10364,5 +10368,4 @@ public:
+     ttir::EmptyOp outputTensor = rewriter.create<ttir::EmptyOp>(
+         srcOp.getLoc(), outputType.getShape(), outputType.getElementType());
 -
+     rewriter.replaceOpWithNewOp<
+         mlir::tt::ttir::PagedScaledDotProductAttentionDecodeOp>(
 @@ -10399,6 +10402,4 @@ public:
 -        srcOp,
 -        cast<RankedTensorType>(
