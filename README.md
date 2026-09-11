@@ -23,7 +23,8 @@ The wheel contains `libtt.so` and libtt's JAX initialization hook.
 
 ## JAX tests
 
-Run the upstream JAX smoke tests against this checkout's plugin wheel:
+Run the JAX smoke tests and local regression tests against this checkout's plugin
+wheel:
 
 ```bash
 bazel test //tests:jax_smoke_tests --test_output=streamed

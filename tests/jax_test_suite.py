@@ -25,7 +25,11 @@ def main() -> int:
     parser.add_argument("--jax-tests-anchor", required=True)
     parser.add_argument("--jax-plugin-wheel", required=True)
     parser.add_argument("--skip-device-check", action="store_true")
+    parser.add_argument("--test-file", action="append", default=[])
     args, pytest_args = parser.parse_known_args()
+    pytest_args.extend(
+        str(_rlocation(path).resolve(strict=True)) for path in args.test_file
+    )
 
     plugin_wheel = _rlocation(args.jax_plugin_wheel).resolve(strict=True)
     jax_repo = _rlocation(args.jax_tests_anchor).resolve(strict=True).parent.parent
