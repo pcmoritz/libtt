@@ -183,16 +183,29 @@ The adapter calls TTNN's chunked Gated DeltaNet kernel for prefill and fused
 causal-convolution/recurrent-update kernels for decode. State slots belong to
 SGLang-JAX's scheduler and use the same in-place cache interface as paged
 attention. Fresh requests read the pool's reserved zero slot; existing requests
-continue from their saved state. Weights stay BF16 rather than Qwen3's BF8
-default. Warm up each prompt-length bucket before measuring performance, as
-for Qwen3 above.
+continue from their saved state. Decode normalizes Q/K together and reads packed
+head vectors directly, avoiding per-head padding conversions. Only matrix weights
+use BF8 (`bfp_bf8`); activations remain BF16, while recurrent
+state and recurrent Q/K normalization stay FP32. Constant weight transposes are prepared
+once, and the compiler recognizes Gemma-style RMS normalization in ordinary JAX
+and uses TTNN's fused kernel with FP32 accumulation. Warm up each prompt-length
+bucket before measuring performance, as for Qwen3 above.
 
 On a P150 with firmware 19.13.1, the five-token prompt above and 128 generated
-tokens measured 12.2–12.3 decode tokens/s, 2.9 s to first token, and 13.3 s
-end-to-end after two warmup requests (BF16, one request, 32-token prefill chunks).
-This is a serving smoke test, not an MMLU accuracy result. Multimodal input,
-multiple active requests, and recurrent prefix-cache snapshots are not supported
-by this backend yet.
+tokens measured 21.4–21.5 decode tokens/s, 2.32 s to first token, and 8.2 s
+end-to-end after two warmup requests (BF8 weights, one request, 1024-token cache,
+32-token prefill chunks). The decode rate includes the first decode step;
+subsequent steps averaged about 24.4 tokens/s. Multimodal input, multiple active
+requests, and recurrent prefix-cache snapshots are not supported by this backend
+yet.
+
+A fixed 200-question, five-shot `sglang_mmlu` sample scored 58% with BF16
+weights, 61% with BF8 weights alone, and 59.5% with BF8 plus native normalization.
+This used greedy raw completion (one answer token, no chat/thinking template)
+and a 4096-token cache. Native normalization changed five answers relative to
+BF8 alone: four regressions and one improvement. This is a limited regression
+check, not a full MMLU result or proof of accuracy parity; a larger accuracy
+evaluation is warranted before relying on the normalization speedup.
 
 ### Run MMLU
 

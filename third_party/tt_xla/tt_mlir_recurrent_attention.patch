@@ -487,7 +487,7 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.h b/runtime/lib/t
 diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,105 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +#include "operations/transformer/recurrent.h"
@@ -532,7 +532,9 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +  };
 +  auto [output, state] = ::ttnn::transformer::chunk_gated_delta_rule(
 +      get(op->query()), get(op->key()), get(op->value()), get(op->gate()),
-+      get(op->beta()), 1.0f, get(op->initial_state()), true, 32, false, false,
++      get(op->beta()), 1.0f,
++      tiled(get(op->initial_state()), ::ttnn::DataType::FLOAT32), true, 32,
++      false, false,
 +      ::ttnn::DRAM_MEMORY_CONFIG, std::nullopt, get(op->eye()), get(op->tril()),
 +      get(op->ones()), get(op->masks()));
 +  put(pool, op->final_state(), state.value());
@@ -549,8 +551,7 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +  const auto &shape = query.logical_shape();
 +  const uint32_t batch = shape[0], heads = shape[1], dim = shape[2];
 +  auto vector = [&](const auto *ref) {
-+    return ::ttnn::reshape(tiled(get(ref), ::ttnn::DataType::FLOAT32),
-+                           ::ttnn::Shape{batch, heads, 1, dim});
++    return tiled(get(ref), ::ttnn::DataType::FLOAT32);
 +  };
 +  auto output = ::ttnn::empty(::ttnn::Shape{batch, heads, 1, dim},
 +                              ::ttnn::DataType::FLOAT32, ::ttnn::Layout::TILE,
