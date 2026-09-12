@@ -22,20 +22,17 @@ def _rlocation(path: str) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    suite = parser.add_mutually_exclusive_group(required=True)
-    suite.add_argument("--jax-tests-anchor")
-    suite.add_argument("--libtt-tests-anchor")
+    parser.add_argument(
+        "--tests-anchor",
+        required=True,
+        help="Runfile in the working directory for pytest.",
+    )
     parser.add_argument("--jax-plugin-wheel", required=True)
     parser.add_argument("--skip-device-check", action="store_true")
     args, pytest_args = parser.parse_known_args()
 
     plugin_wheel = _rlocation(args.jax_plugin_wheel).resolve(strict=True)
-    if args.jax_tests_anchor:
-        test_root = _rlocation(args.jax_tests_anchor).resolve(strict=True).parent.parent
-        default_tests = ["tests"]
-    else:
-        test_root = _rlocation(args.libtt_tests_anchor).resolve(strict=True).parent
-        default_tests = ["."]
+    test_root = _rlocation(args.tests_anchor).resolve(strict=True).parent
 
     # A wheel is a zip archive, but libtt.so must be a real file for dlopen.
     # Extracting it also exercises the exact artifact users install.
@@ -69,7 +66,7 @@ def main() -> int:
     import pytest
 
     os.chdir(test_root)
-    return pytest.main(pytest_args or default_tests)
+    return pytest.main(pytest_args)
 
 
 if __name__ == "__main__":

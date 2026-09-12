@@ -16,7 +16,8 @@ PLUGIN_TEST_DEPS = [
 ]
 
 JAX_TEST_ARGS = PLUGIN_TEST_ARGS + [
-    "--jax-tests-anchor=$(rlocationpath @jax_src//:jax_tests_anchor)",
+    "--tests-anchor=$(rlocationpath @jax_src//:jax_tests_anchor)",
+    "--override-ini=testpaths=tests",
 ]
 
 JAX_TEST_DATA = PLUGIN_TEST_DATA + [
@@ -48,7 +49,7 @@ py_test(
     name = "libtt_test_suite",
     srcs = ["pytest_runner.py"],
     args = PLUGIN_TEST_ARGS + [
-        "--libtt-tests-anchor=$(rlocationpath :libtt/pytest.ini)",
+        "--tests-anchor=$(rlocationpath :libtt/pytest.ini)",
     ],
     data = PLUGIN_TEST_DATA + glob(["libtt/**/*.py"]) + ["libtt/pytest.ini"],
     deps = PLUGIN_TEST_DEPS,
