@@ -21,10 +21,24 @@ python -m pip install bazel-bin/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl
 
 The wheel contains `libtt.so` and libtt's JAX initialization hook.
 
+## libtt tests
+
+Run libtt's regression tests against this checkout's plugin wheel:
+
+```bash
+bazel test //tests:libtt_test_suite --test_output=streamed
+```
+
+Tests live in `tests/libtt/`. New `*_test.py` files are discovered automatically.
+Pass pytest arguments with `--test_arg`, for example to run only integer-sum tests:
+
+```bash
+bazel test //tests:libtt_test_suite --test_arg=-k --test_arg=int32_sum
+```
+
 ## JAX tests
 
-Run the JAX smoke tests and local regression tests against this checkout's plugin
-wheel:
+Run the upstream JAX smoke tests against this checkout's plugin wheel:
 
 ```bash
 bazel test //tests:jax_smoke_tests --test_output=streamed

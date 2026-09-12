@@ -1,36 +1,43 @@
 load("@jax_test_pip//:requirements.bzl", "requirement")
 load("@rules_python//python:defs.bzl", "py_test")
 
-JAX_TEST_ARGS = [
-    "--jax-tests-anchor=$(rlocationpath @jax_src//:jax_tests_anchor)",
+PLUGIN_TEST_ARGS = [
     "--jax-plugin-wheel=$(rlocationpath //:jax_tt_plugin_wheel)",
 ]
 
-JAX_TEST_DATA = [
-    "//:jax_tt_plugin_wheel",
+PLUGIN_TEST_DATA = ["//:jax_tt_plugin_wheel"]
+
+PLUGIN_TEST_DEPS = [
+    requirement("jax"),
+    requirement("jaxlib"),
+    requirement("numpy"),
+    requirement("pytest"),
+    "@rules_python//python/runfiles",
+]
+
+JAX_TEST_ARGS = PLUGIN_TEST_ARGS + [
+    "--jax-tests-anchor=$(rlocationpath @jax_src//:jax_tests_anchor)",
+]
+
+JAX_TEST_DATA = PLUGIN_TEST_DATA + [
     "@jax_src//:jax_tests",
     "@jax_src//:jax_tests_anchor",
 ]
 
-JAX_TEST_DEPS = [
+JAX_TEST_DEPS = PLUGIN_TEST_DEPS + [
     requirement("absl-py"),
     requirement("cloudpickle"),
     requirement("filelock"),
     requirement("flatbuffers"),
     requirement("hypothesis"),
-    requirement("jax"),
-    requirement("jaxlib"),
     requirement("matplotlib"),
     requirement("mpmath"),
-    requirement("numpy"),
     requirement("pillow"),
     requirement("portpicker"),
-    requirement("pytest"),
     requirement("scipy"),
-    "@rules_python//python/runfiles",
 ]
 
-JAX_TEST_TAGS = [
+DEVICE_TEST_TAGS = [
     "exclusive",
     "manual",
     "no-sandbox",
@@ -38,11 +45,22 @@ JAX_TEST_TAGS = [
 ]
 
 py_test(
+    name = "libtt_test_suite",
+    srcs = ["pytest_runner.py"],
+    args = PLUGIN_TEST_ARGS + [
+        "--libtt-tests-anchor=$(rlocationpath :libtt/pytest.ini)",
+    ],
+    data = PLUGIN_TEST_DATA + glob(["libtt/**/*.py"]) + ["libtt/pytest.ini"],
+    deps = PLUGIN_TEST_DEPS,
+    main = "pytest_runner.py",
+    tags = DEVICE_TEST_TAGS,
+    timeout = "long",
+)
+
+py_test(
     name = "jax_smoke_tests",
-    srcs = ["jax_test_suite.py"],
+    srcs = ["pytest_runner.py"],
     args = JAX_TEST_ARGS + [
-        "--test-file=$(rlocationpath :gather_regression_test.py)",
-        "--test-file=$(rlocationpath :integer_sum_regression_test.py)",
         "tests/lax_test.py::FunctionAccuracyTest::testSuccessOnComplexPlane_square_complex64",
         "tests/lax_test.py::LaxTest::test_constant_folding_complex_to_real_scan_regression",
         "tests/device_test.py",
@@ -60,23 +78,20 @@ py_test(
         "tests/lax_numpy_test.py::LaxBackedNumpyTests::testPackbits2",
         "tests/lax_numpy_test.py::LaxBackedNumpyTests::testUnpackbits6",
     ],
-    data = JAX_TEST_DATA + [
-        "gather_regression_test.py",
-        "integer_sum_regression_test.py",
-    ],
+    data = JAX_TEST_DATA,
     deps = JAX_TEST_DEPS,
-    main = "jax_test_suite.py",
-    tags = JAX_TEST_TAGS,
+    main = "pytest_runner.py",
+    tags = DEVICE_TEST_TAGS,
     timeout = "long",
 )
 
 py_test(
     name = "jax_test_suite",
-    srcs = ["jax_test_suite.py"],
+    srcs = ["pytest_runner.py"],
     args = JAX_TEST_ARGS,
     data = JAX_TEST_DATA,
     deps = JAX_TEST_DEPS,
-    main = "jax_test_suite.py",
-    tags = JAX_TEST_TAGS,
+    main = "pytest_runner.py",
+    tags = DEVICE_TEST_TAGS,
     timeout = "eternal",
 )
