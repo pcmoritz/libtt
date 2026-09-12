@@ -7,5 +7,5 @@ filegroup(
 
 filegroup(
     name = "jax_tests_anchor",
-    srcs = ["tests/lax_numpy_test.py"],
+    srcs = ["pyproject.toml"],
 )

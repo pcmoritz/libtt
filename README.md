@@ -73,6 +73,21 @@ bazel test //tests:jax_test_suite \
 
 Current baseline (August 2026): **2800 failed, 22837 passed, 6531 skipped.**
 
+## libtt tests
+
+Run libtt's regression tests against this checkout's plugin wheel:
+
+```bash
+bazel test //tests:libtt_test_suite --test_output=streamed
+```
+
+Tests live in `tests/libtt/`. New `*_test.py` files are discovered automatically.
+Pass pytest arguments with `--test_arg`, for example to run only integer-sum tests:
+
+```bash
+bazel test //tests:libtt_test_suite --test_arg=-k --test_arg=int32_sum
+```
+
 ## Qwen3 With SGLang-JAX
 
 Build the plugin wheel first:
