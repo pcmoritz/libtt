@@ -20,7 +20,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      } else if (originalStartIndexMap.size() != numIndexingDims) {
        startIndices =
            sliceStartIndices(rewriter,
-@@ -6261,75 +6253,56 @@
+@@ -6261,75 +6253,88 @@
      return ttir::utils::createReshapeOp(rewriter, loc, input, newInputShape);
    }
  
@@ -34,7 +34,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -  // Example: indexingDimsSizes = [3, 5], startIndices[...] = (i, j) ->
 -  // startIndices[...] = 5 * i + j (because reshaped indexingDimSize is 15)
 -  static ttir::MatmulOp
-+  // Flatten multiple index components with integer multiply/add. A floating
++  // Flatten multiple index components with integer arithmetic. A floating
 +  // matmul can round offsets even when its result type is f32, selecting the
 +  // wrong element (for example in cross-entropy after a model matmul).
 +  // inputShape has already been permuted to put the indexed dimensions first.
@@ -112,35 +112,67 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +                              startIndicesType.getEncoding()),
 +        startIndices, permutation);
 +
-+    int64_t componentDim = permutedShape.size() - 1;
-+    auto component = [&](size_t dim) {
-+      return sliceStartIndices(
-+          rewriter,
-+          ttmlir::utils::appendLocationSuffix(loc, "_indexComponent" +
-+                                                       std::to_string(dim)),
-+          permuted.getResult(), componentDim, dim);
-+    };
-+    Value flattened = component(0);
-+    auto resultType = cast<RankedTensorType>(flattened.getType());
-+    auto scalarType =
-+        RankedTensorType::get(SmallVector<int64_t>(resultType.getRank(), 1),
-+                              resultType.getElementType());
-+    for (size_t dim = 1; dim < numIndexingDims; ++dim) {
-+      auto stride = rewriter.create<ttir::ConstantOp>(
-+          loc, scalarType,
-+          DenseElementsAttr::get(
-+              scalarType, rewriter.getIntegerAttr(resultType.getElementType(),
-+                                                  inputShape[dim])));
-+      flattened =
-+          rewriter.create<ttir::MultiplyOp>(loc, resultType, flattened, stride);
-+      flattened = rewriter.create<ttir::AddOp>(loc, resultType, flattened,
-+                                               component(dim));
++    auto elementType = startIndicesType.getElementType();
++    auto concat = startIndices.getDefiningOp<ttir::ConcatOp>();
++    // Separate components (for example after per-dimension clamping) let
++    // slices fold away. Summing would materialize an unnecessary concat.
++    // Other integer types still need multiply/add to avoid float reductions.
++    if ((concat && concat.getDim() == indexVectorDim) ||
++        !elementType.isInteger(32) || elementType.isUnsignedInteger()) {
++      int64_t componentDim = permutedShape.size() - 1;
++      auto component = [&](size_t dim) {
++        return sliceStartIndices(
++            rewriter,
++            ttmlir::utils::appendLocationSuffix(loc, "_indexComponent" +
++                                                         std::to_string(dim)),
++            permuted.getResult(), componentDim, dim);
++      };
++      Value flattened = component(0);
++      auto resultType = cast<RankedTensorType>(flattened.getType());
++      auto scalarType =
++          RankedTensorType::get(SmallVector<int64_t>(resultType.getRank(), 1),
++                                resultType.getElementType());
++      for (size_t dim = 1; dim < numIndexingDims; ++dim) {
++        auto stride = rewriter.create<ttir::ConstantOp>(
++            loc, scalarType,
++            DenseElementsAttr::get(
++                scalarType, rewriter.getIntegerAttr(resultType.getElementType(),
++                                                    inputShape[dim])));
++        flattened = rewriter.create<ttir::MultiplyOp>(loc, resultType,
++                                                      flattened, stride);
++        flattened = rewriter.create<ttir::AddOp>(loc, resultType, flattened,
++                                                 component(dim));
++      }
++      return cast<mlir::TypedValue<RankedTensorType>>(flattened);
 +    }
-+    return cast<mlir::TypedValue<RankedTensorType>>(flattened);
++
++    // Packed index vectors need just one multiply and an exact integer sum.
++    SmallVector<Attribute> strides(numIndexingDims);
++    int64_t stride = 1;
++    for (size_t dim = numIndexingDims; dim-- > 0;) {
++      strides[dim] = rewriter.getIntegerAttr(elementType, stride);
++      stride *= inputShape[dim];
++    }
++    SmallVector<int64_t> strideShape(permutedShape.size(), 1);
++    strideShape.back() = numIndexingDims;
++    auto strideType = RankedTensorType::get(strideShape, elementType);
++    auto strideConstant = rewriter.create<ttir::ConstantOp>(
++        loc, strideType, DenseElementsAttr::get(strideType, strides));
++    auto products = rewriter.create<ttir::MultiplyOp>(loc, permuted.getType(),
++                                                      permuted, strideConstant);
++
++    SmallVector<int64_t> resultShape(permutedShape);
++    resultShape.back() = 1;
++    auto resultType = RankedTensorType::get(resultShape, elementType,
++                                            startIndicesType.getEncoding());
++    return rewriter.create<ttir::SumOp>(
++        loc, resultType, products, /*keepDim=*/true,
++        rewriter.getI32ArrayAttr(
++            {static_cast<int32_t>(permutedShape.size() - 1)}));
    }
  
    // If startIndicesShape[indexVectorDim] > 1, but we are actually slicing only
-@@ -6547,12 +6520,10 @@
+@@ -6547,12 +6552,10 @@
                                                startIndicesType.getEncoding());
  
      // Build offset matrix [totalWindow, M]: row r has all elements =
@@ -156,7 +188,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        for (int64_t col = 0; col < M; ++col) {
          matrixData[row * M + col] = v;
        }
-@@ -7503,8 +7474,7 @@
+@@ -7503,8 +7506,7 @@
          StableHLOGatherToEmbeddingPattern::reshapeStartIndices(
              rewriter,
              ttmlir::utils::appendLocationSuffix(loc, "_reshapeStartIndices"),

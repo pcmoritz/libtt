@@ -18,17 +18,20 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 index 1111111..2222222 100644
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -922,5 +922,8 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
-+  // Float32 cannot represent the INT32_MAX identity used by min.
+@@ -922,5 +922,11 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
++  // Keep supported integer reductions exact: Float32 rounds values above
++  // 2^24 and cannot represent the INT32_MAX identity used by min.
 +  bool supportsInt32 =
-+      inputType.isInteger(32) && mlir::isa<ttnn::MinOp>(op);
++      inputType.isInteger(32) &&
++      (mlir::isa<ttnn::MinOp>(op) ||
++       (mlir::isa<ttnn::SumOp>(op) && !inputType.isUnsignedInteger()));
    TTNNOperandWorkarounds operandWorkaround;
 -  if (!inputType.isF32() && !inputType.isBF16()) {
 +  if (!inputType.isF32() && !inputType.isBF16() && !supportsInt32) {
      operandWorkaround.tensorDataTypeWorkaround =
          mlir::tt::ttcore::DataType::Float32;
    }
-@@ -935,11 +938,6 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
+@@ -935,11 +941,6 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
  // Factory method to create a set of workarounds for reduce product op operands.
 -// tt-metal only supports full product reduction for bfloat16 data type.
  TTNNOperandsWorkarounds
