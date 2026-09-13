@@ -1,0 +1,111 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
+@@ -14,6 +14,46 @@
+ namespace ttnn::prim {
+ 
+ using namespace tt::tt_metal;
++
++// Partition output rows into bounded pieces instead of assigning whole rows.
++// This also permits rows larger than L1 and uses more cores for wide tensors.
++static ProgramDescriptor chunked_reshape(
++    const Tensor& input, const Tensor& output, const CoreRangeSet& cores,
++    uint32_t source_row_bytes, uint32_t dest_row_bytes) {
++    constexpr uint32_t chunk_bytes = 2048;
++    const uint32_t chunks_per_row = (dest_row_bytes + chunk_bytes - 1) / chunk_bytes;
++    const uint32_t chunks = (output.logical_volume() / output.logical_shape()[-1]) * chunks_per_row;
++    ProgramDescriptor desc;
++    for (uint32_t cb = 0; cb < 2; ++cb) {
++        const uint32_t bytes = chunk_bytes + (cb == 1 ? 64 : 0);
++        desc.cbs.push_back(CBDescriptor{
++            .total_size = bytes,
++            .core_ranges = cores,
++            .format_descriptors = {{CBFormatDescriptor{
++                .buffer_index = cb,
++                .data_format = datatype_to_dataformat_converter(input.dtype()),
++                .page_size = bytes,
++            }}},
++        });
++    }
++    KernelDescriptor kernel;
++    kernel.kernel_source =
++        "ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_chunked.cpp";
++    kernel.source_type = KernelDescriptor::SourceType::FILE_PATH;
++    kernel.core_ranges = cores;
++    kernel.compile_time_args = {source_row_bytes, dest_row_bytes, chunk_bytes, chunks_per_row};
++    TensorAccessorArgs(*input.buffer()).append_to(kernel.compile_time_args);
++    TensorAccessorArgs(*output.buffer()).append_to(kernel.compile_time_args);
++    kernel.config = ReaderConfigDescriptor{};
++    uint32_t i = 0;
++    for (auto core : corerange_to_cores(cores, std::nullopt)) {
++        const uint32_t start = uint64_t(chunks) * i / cores.num_cores();
++        const uint32_t end = uint64_t(chunks) * ++i / cores.num_cores();
++        kernel.emplace_runtime_args(core, {input.buffer(), output.buffer(), start, end});
++    }
++    desc.kernels.push_back(std::move(kernel));
++    return desc;
++}
+ 
+ ProgramDescriptor ReshapeViewRMProgramFactory::create_descriptor(
+     const ReshapeViewParams& operation_attributes, const ReshapeViewInputs& tensor_args, Tensor& tensor_return_value) {
+@@ -43,6 +83,11 @@
+ 
+     uint32_t source_page_size_bytes = input_log_shape[-1] * data_size;
+     uint32_t dest_page_size_bytes = output_log_shape[-1] * data_size;
++    if (!input.is_sharded() && !output.is_sharded() &&
++        input.buffer()->buffer_type() == BufferType::DRAM && output.buffer()->buffer_type() == BufferType::DRAM &&
++        input.logical_shape() == input.padded_shape() && output.logical_shape() == output.padded_shape()) {
++        return chunked_reshape(input, output, total_cores, source_page_size_bytes, dest_page_size_bytes);
++    }
+     uint32_t source_read_size_bytes = ((source_page_size_bytes - 1) & MASK_64) + 128;
+     uint32_t read_start_page = 0;
+     uint32_t write_start_page = 0;
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_chunked.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_chunked.cpp
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_chunked.cpp
+@@ -0,0 +1,45 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++#include "api/dataflow/dataflow_api.h"
++#include "ttnn/operations/data_movement/common/kernels/common.hpp"
++
++void kernel_main() {
++    constexpr uint32_t source_row_bytes = get_compile_time_arg_val(0);
++    constexpr uint32_t dest_row_bytes = get_compile_time_arg_val(1);
++    constexpr uint32_t chunk_bytes = get_compile_time_arg_val(2);
++    constexpr uint32_t chunks_per_row = get_compile_time_arg_val(3);
++    constexpr auto source_args = TensorAccessorArgs<4>();
++    constexpr auto dest_args = TensorAccessorArgs<source_args.next_compile_time_args_offset()>();
++    const auto source = TensorAccessor(source_args, get_arg_val<uint32_t>(0));
++    const auto dest = TensorAccessor(dest_args, get_arg_val<uint32_t>(1));
++    const uint32_t start = get_arg_val<uint32_t>(2), end = get_arg_val<uint32_t>(3);
++    cb_reserve_back(0, 1);
++    cb_reserve_back(1, 1);
++    const uint32_t output = get_write_ptr(0), scratch = get_write_ptr(1);
++    for (uint32_t chunk = start; chunk < end; ++chunk) {
++        const uint32_t row = chunk / chunks_per_row;
++        const uint32_t offset = (chunk % chunks_per_row) * chunk_bytes;
++        const uint32_t bytes = std::min(chunk_bytes, dest_row_bytes - offset);
++        uint64_t position = uint64_t(row) * dest_row_bytes + offset;
++        uint32_t copied = 0;
++        while (copied < bytes) {
++            const uint32_t source_row = position / source_row_bytes;
++            const uint32_t source_offset = position % source_row_bytes;
++            const uint32_t count = std::min(bytes - copied, source_row_bytes - source_offset);
++            const uint64_t address = source.get_noc_addr(source_row) + source_offset;
++            if ((address & 63) == 0 && (copied & 63) == 0) {
++                noc_async_read(address, output + copied, count);
++            } else {
++                const uint32_t alignment = address & 63;
++                noc_async_read(address - alignment, scratch, (alignment + count + 63) & ~uint32_t(63));
++                noc_async_read_barrier();
++                tt::data_movement::common::copy_via_memmove<false>(output + copied, scratch + alignment, count);
++            }
++            position += count;
++            copied += count;
++        }
++        noc_async_read_barrier();
++        noc_async_write(output, dest.get_noc_addr(row) + offset, bytes);
++        noc_async_write_barrier();
++    }
++}

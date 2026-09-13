@@ -1,5 +1,6 @@
 load("@jax_test_pip//:requirements.bzl", "requirement")
 load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_cc//cc:defs.bzl", "cc_test")
 
 JAX_TEST_ARGS = [
     "--jax-tests-anchor=$(rlocationpath @jax_src//:jax_tests_anchor)",
@@ -74,4 +75,17 @@ py_test(
     main = "jax_test_suite.py",
     tags = JAX_TEST_TAGS,
     timeout = "eternal",
+)
+
+cc_test(
+    name = "reshape_row_major_test",
+    srcs = ["reshape_row_major_test.cc"],
+    linkstatic = True,
+    copts = ["-std=c++20"],
+    deps = [
+        "//:tt_metal_runtime_auto_setup",
+        "@tt_metal//:ttnn_tensor_upstream",
+    ],
+    tags = JAX_TEST_TAGS,
+    timeout = "long",
 )
