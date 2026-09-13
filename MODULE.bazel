@@ -395,6 +395,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_dynamic_update_slice_device.patch",
         "//third_party/tt_xla:tt_mlir_segment_reductions.patch",
         "//third_party/tt_xla:tt_mlir_embedding_float32.patch",
+        "//third_party/tt_xla:tt_mlir_gather_reshape_layout.patch",
         "//third_party/tt_xla:tt_mlir_mixed_advanced_gather.patch",
         "//third_party/tt_xla:tt_mlir_gather_clamp_indices.patch",
         "//third_party/tt_xla:tt_mlir_preserve_narrowing_typecasts.patch",

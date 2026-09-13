@@ -1,0 +1,169 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -78,6 +78,7 @@
+     let results = (outs AnyRankedTensor:$result);
+ 
+     let hasFolder = 1;
++    let hasCanonicalizer = 1;
+     let hasVerifier = 1;
+ 
+     let extraClassDeclaration = [{
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -2352,6 +2352,53 @@
+   return nullptr;
+ }
+ 
++// A gather can flatten a tile-aligned state into a few very wide rows.
++// Keep the reshape in row-major layout when tilizing the flat shape would
++// introduce padding. Only widen rows: narrowing can turn a copy into millions
++// of tiny row transfers (for example, a gather from flattened log-probabilities).
++static bool addsTilePadding(RankedTensorType compact, RankedTensorType padded) {
++  auto compactLayout = dyn_cast_if_present<TTNNLayoutAttr>(compact.getEncoding());
++  auto paddedLayout = dyn_cast_if_present<TTNNLayoutAttr>(padded.getEncoding());
++  if (!compactLayout || !paddedLayout || !compact.hasStaticShape() ||
++      compact.getRank() < 2 || padded.getRank() < 2 ||
++      padded.getShape().back() <= compact.getShape().back() ||
++      compact.getNumElements() == 0 ||
++      !(compact.getElementType().isBF16() || compact.getElementType().isF32()) ||
++      !compactLayout.hasInterleavedDRAMTensorMemoryLayout() ||
++      !paddedLayout.hasInterleavedDRAMTensorMemoryLayout() ||
++      !compactLayout.isTiled() || !paddedLayout.isTiled()) {
++    return false;
++  }
++  uint64_t bytes = compact.getNumElements() *
++                   (compact.getElementTypeBitWidth() / 8);
++  return compactLayout.getShardSizeInBytes() == bytes &&
++         paddedLayout.getShardSizeInBytes() > bytes;
++}
++
++void ToLayoutOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
++                                            MLIRContext *) {
++  patterns.add(+[](ToLayoutOp op, PatternRewriter &rewriter) -> LogicalResult {
++    auto reshape = op.getInput().getDefiningOp<ReshapeOp>();
++    auto layout = dyn_cast_if_present<TTNNLayoutAttr>(op.getType().getEncoding());
++    if (!reshape || !reshape->hasOneUse() || !op->hasOneUse() ||
++        op.hasDtypeChange() || !layout ||
++        layout.isTiled() || !layout.hasInterleavedDRAMTensorMemoryLayout() ||
++        !addsTilePadding(reshape.getInput().getType(), reshape.getType())) {
++      return failure();
++    }
++    auto embedding = dyn_cast<EmbeddingOp>(*op->getUsers().begin());
++    if (!embedding || embedding.getWeight() != op.getResult()) {
++      return failure();
++    }
++    auto rowType = utils::RankedTensorTypeFactory::create(
++        reshape.getInput().getType(), Layout::RowMajor);
++    auto row = rewriter.create<ToLayoutOp>(op.getLoc(), rowType, reshape.getInput());
++    rewriter.replaceOpWithNewOp<ReshapeOp>(op, op.getType(), row,
++                                         reshape.getShapeAttr());
++    return success();
++  });
++}
++
+ //===----------------------------------------------------------------------===//
+ // ToTensorSpecOp
+ //===----------------------------------------------------------------------===//
+diff --git a/test/ttmlir/Dialect/TTNN/Canonicalizer/gather_reshape_layout.mlir b/test/ttmlir/Dialect/TTNN/Canonicalizer/gather_reshape_layout.mlir
+--- /dev/null
++++ b/test/ttmlir/Dialect/TTNN/Canonicalizer/gather_reshape_layout.mlir
+@@ -0,0 +1,97 @@
++// RUN: ttmlir-opt --canonicalize %s | FileCheck %s
++#dram = #ttnn.buffer_type<dram>
++#l0 = #ttnn.ttnn_layout<(d0, d1) -> (d0, d1), <1x1>, memref<1x1xui32, #dram>, <interleaved>>
++#l1 = #ttnn.ttnn_layout<(d0, d1, d2) -> (d0 * 32 + d1, d2), <1x1>, memref<2x2x!ttcore.tile<32x32, f32>, #dram>, <interleaved>>
++#l2 = #ttnn.ttnn_layout<(d0, d1) -> (d0, d1), <1x1>, memref<1x64x!ttcore.tile<32x32, f32>, #dram>, <interleaved>>
++#l3 = #ttnn.ttnn_layout<(d0, d1) -> (d0, d1), <1x1>, memref<2x2048xf32, #dram>, <interleaved>>
++#l4 = #ttnn.ttnn_layout<(d0, d1, d2) -> (d0 + d1, d2), <1x1>, memref<1x2048xf32, #dram>, <interleaved>>
++#l5 = #ttnn.ttnn_layout<(d0, d1) -> (d0, d1), <1x1>, memref<2x2048xbf16, #dram>, <interleaved>>
++#l6 = #ttnn.ttnn_layout<(d0, d1, d2) -> (d0 + d1, d2), <1x1>, memref<1x2048xbf16, #dram>, <interleaved>>
++#l7 = #ttnn.ttnn_layout<(d0, d1, d2) -> (d0 * 32 + d1, d2), <1x1>, memref<2x1x!ttcore.tile<32x32, f32>, #dram>, <interleaved>>
++#l8 = #ttnn.ttnn_layout<(d0, d1) -> (d0, d1), <1x1>, memref<1x3x!ttcore.tile<32x32, f32>, #dram>, <interleaved>>
++#l9 = #ttnn.ttnn_layout<(d0, d1) -> (d0, d1), <1x1>, memref<2x96xf32, #dram>, <interleaved>>
++#l10 = #ttnn.ttnn_layout<(d0, d1, d2) -> (d0 + d1, d2), <1x1>, memref<1x96xf32, #dram>, <interleaved>>
++#l11 = #ttnn.ttnn_layout<(d0, d1) -> (d0, d1), <1x1>, memref<1x2x!ttcore.tile<32x32, f32>, #dram>, <interleaved>>
++#l12 = #ttnn.ttnn_layout<(d0, d1) -> (d0, d1), <1x1>, memref<64x1x!ttcore.tile<32x32, f32>, #dram>, <interleaved>>
++#l13 = #ttnn.ttnn_layout<(d0, d1) -> (d0, d1), <1x1>, memref<2048x1xf32, #dram>, <interleaved>>
++#l14 = #ttnn.ttnn_layout<(d0, d1, d2) -> (d0 + d1, d2), <1x1>, memref<1x1xf32, #dram>, <interleaved>>
++#l15 = #ttnn.ttnn_layout<(d0, d1) -> (d0, d1), <1x1>, memref<2x2x!ttcore.tile<32x32, f32>, #dram>, <interleaved>>
++#l16 = #ttnn.ttnn_layout<(d0, d1) -> (d0, d1), <1x1>, memref<64x64xf32, #dram>, <interleaved>>
++#l17 = #ttnn.ttnn_layout<(d0, d1, d2) -> (d0 + d1, d2), <1x1>, memref<1x64xf32, #dram>, <interleaved>>
++module {
++  // CHECK-LABEL: func.func @gather_flatten
++  func.func @gather_flatten(%arg0: tensor<2x32x64xf32, #l1>, %arg1: tensor<1x1xui32, #l0>) -> tensor<1x1x2048xf32, #l4> {
++    // CHECK: %[[A:.*]] = "ttnn.to_layout"(%arg0)
++    // CHECK-NEXT: %[[B:.*]] = "ttnn.reshape"(%[[A]])
++    // CHECK-NEXT: %[[C:.*]] = "ttnn.embedding"(%arg1, %[[B]])
++    // CHECK-NEXT: return %[[C]]
++    %flat = "ttnn.reshape"(%arg0) <{shape = [2 : i32, 2048 : i32]}> : (tensor<2x32x64xf32, #l1>) -> tensor<2x2048xf32, #l2>
++    %row = "ttnn.to_layout"(%flat) : (tensor<2x2048xf32, #l2>) -> tensor<2x2048xf32, #l3>
++    %picked = "ttnn.embedding"(%arg1, %row) : (tensor<1x1xui32, #l0>, tensor<2x2048xf32, #l3>) -> tensor<1x1x2048xf32, #l4>
++    return %picked : tensor<1x1x2048xf32, #l4>
++  }
++  // CHECK-LABEL: func.func @keep_flatten_dtype_change
++  func.func @keep_flatten_dtype_change(%arg0: tensor<2x32x64xf32, #l1>, %arg1: tensor<1x1xui32, #l0>) -> tensor<1x1x2048xbf16, #l6> {
++    // CHECK: %[[A:.*]] = "ttnn.reshape"(%arg0)
++    // CHECK-NEXT: %[[B:.*]] = "ttnn.to_layout"(%[[A]])
++    // CHECK-NEXT: %[[C:.*]] = "ttnn.embedding"(%arg1, %[[B]])
++    // CHECK-NEXT: return %[[C]]
++    %flat = "ttnn.reshape"(%arg0) <{shape = [2 : i32, 2048 : i32]}> : (tensor<2x32x64xf32, #l1>) -> tensor<2x2048xf32, #l2>
++    %row = "ttnn.to_layout"(%flat) : (tensor<2x2048xf32, #l2>) -> tensor<2x2048xbf16, #l5>
++    %picked = "ttnn.embedding"(%arg1, %row) : (tensor<1x1xui32, #l0>, tensor<2x2048xbf16, #l5>) -> tensor<1x1x2048xbf16, #l6>
++    return %picked : tensor<1x1x2048xbf16, #l6>
++  }
++  // CHECK-LABEL: func.func @keep_padded_flatten
++  func.func @keep_padded_flatten(%arg0: tensor<2x32x3xf32, #l7>, %arg1: tensor<1x1xui32, #l0>) -> tensor<1x1x96xf32, #l10> {
++    // CHECK: %[[A:.*]] = "ttnn.reshape"(%arg0)
++    // CHECK-NEXT: %[[B:.*]] = "ttnn.to_layout"(%[[A]])
++    // CHECK-NEXT: %[[C:.*]] = "ttnn.embedding"(%arg1, %[[B]])
++    // CHECK-NEXT: return %[[C]]
++    %flat = "ttnn.reshape"(%arg0) <{shape = [2 : i32, 96 : i32]}> : (tensor<2x32x3xf32, #l7>) -> tensor<2x96xf32, #l8>
++    %row = "ttnn.to_layout"(%flat) : (tensor<2x96xf32, #l8>) -> tensor<2x96xf32, #l9>
++    %picked = "ttnn.embedding"(%arg1, %row) : (tensor<1x1xui32, #l0>, tensor<2x96xf32, #l9>) -> tensor<1x1x96xf32, #l10>
++    return %picked : tensor<1x1x96xf32, #l10>
++  }
++  // CHECK-LABEL: func.func @keep_shared_flatten
++  func.func @keep_shared_flatten(%arg0: tensor<2x32x64xf32, #l1>, %arg1: tensor<1x1xui32, #l0>) -> (tensor<1x1x2048xf32, #l4>, tensor<2x2048xf32, #l2>) {
++    // CHECK: %[[A:.*]] = "ttnn.reshape"(%arg0)
++    // CHECK-NEXT: %[[B:.*]] = "ttnn.to_layout"(%[[A]])
++    // CHECK-NEXT: %[[C:.*]] = "ttnn.embedding"(%arg1, %[[B]])
++    // CHECK-NEXT: return %[[C]], %[[A]]
++    %flat = "ttnn.reshape"(%arg0) <{shape = [2 : i32, 2048 : i32]}> : (tensor<2x32x64xf32, #l1>) -> tensor<2x2048xf32, #l2>
++    %row = "ttnn.to_layout"(%flat) : (tensor<2x2048xf32, #l2>) -> tensor<2x2048xf32, #l3>
++    %picked = "ttnn.embedding"(%arg1, %row) : (tensor<1x1xui32, #l0>, tensor<2x2048xf32, #l3>) -> tensor<1x1x2048xf32, #l4>
++    return %picked, %flat : tensor<1x1x2048xf32, #l4>, tensor<2x2048xf32, #l2>
++  }
++  // CHECK-LABEL: func.func @keep_non_gather_flatten
++  func.func @keep_non_gather_flatten(%arg0: tensor<2x32x64xf32, #l1>, %arg1: tensor<1x1xui32, #l0>) -> tensor<2x2048xf32, #l3> {
++    // CHECK: %[[A:.*]] = "ttnn.reshape"(%arg0)
++    // CHECK-NEXT: %[[B:.*]] = "ttnn.to_layout"(%[[A]])
++    // CHECK-NEXT: return %[[B]]
++    %flat = "ttnn.reshape"(%arg0) <{shape = [2 : i32, 2048 : i32]}> : (tensor<2x32x64xf32, #l1>) -> tensor<2x2048xf32, #l2>
++    %row = "ttnn.to_layout"(%flat) : (tensor<2x2048xf32, #l2>) -> tensor<2x2048xf32, #l3>
++    return %row : tensor<2x2048xf32, #l3>
++  }
++  // CHECK-LABEL: func.func @keep_narrow_destination
++  func.func @keep_narrow_destination(%arg0: tensor<32x64xf32, #l11>, %arg1: tensor<1x1xui32, #l0>) -> tensor<1x1x1xf32, #l14> {
++    // CHECK: %[[A:.*]] = "ttnn.reshape"(%arg0)
++    // CHECK-NEXT: %[[B:.*]] = "ttnn.to_layout"(%[[A]])
++    // CHECK-NEXT: %[[C:.*]] = "ttnn.embedding"(%arg1, %[[B]])
++    // CHECK-NEXT: return %[[C]]
++    %flat = "ttnn.reshape"(%arg0) <{shape = [2048 : i32, 1 : i32]}> : (tensor<32x64xf32, #l11>) -> tensor<2048x1xf32, #l12>
++    %row = "ttnn.to_layout"(%flat) : (tensor<2048x1xf32, #l12>) -> tensor<2048x1xf32, #l13>
++    %picked = "ttnn.embedding"(%arg1, %row) : (tensor<1x1xui32, #l0>, tensor<2048x1xf32, #l13>) -> tensor<1x1x1xf32, #l14>
++    return %picked : tensor<1x1x1xf32, #l14>
++  }
++  // CHECK-LABEL: func.func @keep_metadata_reshape
++  func.func @keep_metadata_reshape(%arg0: tensor<2x32x64xf32, #l1>, %arg1: tensor<1x1xui32, #l0>) -> tensor<1x1x64xf32, #l17> {
++    // CHECK: %[[A:.*]] = "ttnn.reshape"(%arg0)
++    // CHECK-NEXT: %[[B:.*]] = "ttnn.to_layout"(%[[A]])
++    // CHECK-NEXT: %[[C:.*]] = "ttnn.embedding"(%arg1, %[[B]])
++    // CHECK-NEXT: return %[[C]]
++    %flat = "ttnn.reshape"(%arg0) <{shape = [64 : i32, 64 : i32]}> : (tensor<2x32x64xf32, #l1>) -> tensor<64x64xf32, #l15>
++    %row = "ttnn.to_layout"(%flat) : (tensor<64x64xf32, #l15>) -> tensor<64x64xf32, #l16>
++    %picked = "ttnn.embedding"(%arg1, %row) : (tensor<1x1xui32, #l0>, tensor<64x64xf32, #l16>) -> tensor<1x1x64xf32, #l17>
++    return %picked : tensor<1x1x64xf32, #l17>
++  }
++}
