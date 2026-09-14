@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -6456,6 +6456,53 @@
+@@ -6456,6 +6456,59 @@
    let hasVerifier = 1;
  }
  
@@ -35,6 +35,12 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +  let results = (outs AnyRankedTensor:$output);
 +}
 +
++def TTIR_CausalConv1dPrefillOp : TTIR_NamedOp<"causal_conv1d_prefill"> {
++  let summary = "Four-tap causal prefill convolution and SiLU in FP32.";
++  let arguments = (ins AnyRankedTensor:$history, AnyRankedTensor:$weight);
++  let results = (outs AnyRankedTensor:$output);
++}
++
 +def TTIR_CausalConv1dUpdateOp : TTIR_InplaceOp<"causal_conv1d_update", [TTIR_CacheOpInterface]> {
 +  let summary = "causal conv1d update.";
 +  let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
@@ -58,7 +64,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4284,6 +4284,53 @@
+@@ -4285,6 +4285,59 @@
      let hasVerifier = 1;
  }
  
@@ -92,6 +98,12 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +  let results = (outs AnyRankedTensor:$output);
 +}
 +
++def TTNN_CausalConv1dPrefillOp : TTNN_Op<"causal_conv1d_prefill", [OpModelExempt]> {
++  let summary = "Four-tap causal prefill convolution and SiLU in FP32.";
++  let arguments = (ins AnyRankedTensor:$history, AnyRankedTensor:$weight);
++  let results = (outs AnyRankedTensor:$output);
++}
++
 +def TTNN_CausalConv1dUpdateOp : TTNN_InplaceOp<"causal_conv1d_update", [OpModelExempt]> {
 +  let summary = "causal conv1d update.";
 +  let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
@@ -115,7 +127,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
 --- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
-@@ -79,6 +79,50 @@
+@@ -79,6 +79,56 @@
    attention_sink: tt.target.ttnn.TensorRef;
    out: tt.target.ttnn.TensorRef;
    memcfg: tt.target.ttnn.MemoryConfig;
@@ -150,6 +162,12 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 +  output: tt.target.ttnn.TensorRef;
 +}
 +
++table CausalConv1dPrefillOp {
++  history: tt.target.ttnn.TensorRef;
++  weight: tt.target.ttnn.TensorRef;
++  output: tt.target.ttnn.TensorRef;
++}
++
 +table CausalConv1dUpdateOp {
 +  cache: tt.target.ttnn.TensorRef;
 +  input: tt.target.ttnn.TensorRef;
@@ -169,13 +187,14 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
 --- a/include/ttmlir/Target/TTNN/program.fbs
 +++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -87,6 +87,10 @@
+@@ -87,6 +87,11 @@
    FuncCallOp,
    GatherOp,
    GenericOp,
 +  GatedDeltaRuleOp,
 +  GatedDeltaDecodeOp,
 +  CausalConv1dUpdateOp,
++  CausalConv1dPrefillOp,
 +  StatePoolUpdateOp,
    GetDeviceOp,
    GlobalAvgPool2dOp,
@@ -268,7 +287,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -3477,6 +3477,35 @@
+@@ -3477,6 +3477,38 @@
  } // namespace
  
  namespace {
@@ -294,6 +313,9 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +using GatedDeltaDecodeOpConversionPattern =
 +    RecurrentOpConversionPattern<ttir::GatedDeltaDecodeOp,
 +                                 ttnn::GatedDeltaDecodeOp>;
++using CausalConv1dPrefillOpConversionPattern =
++    RecurrentOpConversionPattern<ttir::CausalConv1dPrefillOp,
++                                 ttnn::CausalConv1dPrefillOp>;
 +using CausalConv1dUpdateOpConversionPattern =
 +    RecurrentOpConversionPattern<ttir::CausalConv1dUpdateOp,
 +                                 ttnn::CausalConv1dUpdateOp>;
@@ -304,13 +326,14 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  class PagedFlashMultiLatentAttentionDecodeOpConversionPattern
      : public OpConversionPattern<ttir::PagedFlashMultiLatentAttentionDecodeOp> {
  public:
-@@ -3995,6 +4024,10 @@
+@@ -3995,6 +4027,11 @@
             ScaledDotProductAttentionDecodeOpConversionPattern,
             PagedScaledDotProductAttentionDecodeOpConversionPattern,
             ChunkedScaledDotProductAttentionOpConversionPattern,
 +           GatedDeltaRuleOpConversionPattern,
 +           GatedDeltaDecodeOpConversionPattern,
 +           CausalConv1dUpdateOpConversionPattern,
++           CausalConv1dPrefillOpConversionPattern,
 +           StatePoolUpdateOpConversionPattern,
             PagedFlashMultiLatentAttentionDecodeOpConversionPattern,
             SplitQueryKeyValueAndSplitHeadsOpConversionPattern,
@@ -318,7 +341,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -3645,6 +3645,63 @@
+@@ -3645,6 +3645,74 @@
        slidingWindowSize, attentionSink, out, memoryConfig);
  }
  
@@ -354,6 +377,17 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +                                  std::nullopt));
 +}
 +
++::flatbuffers::Offset<::tt::target::ttnn::CausalConv1dPrefillOp>
++createOp(FlatbufferObjectCache &cache, CausalConv1dPrefillOp op) {
++  auto tensor = [&](Value value) {
++    return cache.at<::tt::target::ttnn::TensorRef>(getOperandThroughDPSOps(value));
++  };
++  return ::tt::target::ttnn::CreateCausalConv1dPrefillOp(
++      *cache.fbb, tensor(op.getHistory()), tensor(op.getWeight()),
++      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
++                                 std::nullopt));
++}
++
 +::flatbuffers::Offset<::tt::target::ttnn::CausalConv1dUpdateOp>
 +createOp(FlatbufferObjectCache &cache, CausalConv1dUpdateOp op) {
 +  auto tensor = [&](Value value) {
@@ -382,7 +416,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
  ::flatbuffers::Offset<::tt::target::ttnn::FlashMlaPrefillOp>
  createOp(FlatbufferObjectCache &cache, FlashMlaPrefillOp op) {
    auto query = cache.at<::tt::target::ttnn::TensorRef>(
-@@ -5200,6 +5257,22 @@
+@@ -5200,6 +5268,26 @@
      return createOperation(cache, createOp(cache, scaledDotProductAttentionOp),
                             debugString, locInfo);
    }
@@ -391,6 +425,10 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +                           locInfo);
 +  }
 +  if (auto recurrentOp = dyn_cast<GatedDeltaDecodeOp>(op)) {
++    return createOperation(cache, createOp(cache, recurrentOp), debugString,
++                           locInfo);
++  }
++  if (auto recurrentOp = dyn_cast<CausalConv1dPrefillOp>(op)) {
 +    return createOperation(cache, createOp(cache, recurrentOp), debugString,
 +                           locInfo);
 +  }
@@ -447,7 +485,7 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
  #include "operations/transformer/rotary_embedding.h"
  #include "operations/transformer/rotary_embedding_llama.h"
  #include "operations/transformer/scaled_dot_product_attention.h"
-@@ -699,6 +700,18 @@
+@@ -699,6 +700,21 @@
      return operations::transformer::run(
          op->type_as_ScaledDotProductAttentionOp(), getContext());
    }
@@ -457,6 +495,9 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
 +  case ::tt::target::ttnn::OpType::GatedDeltaDecodeOp:
 +    return operations::transformer::run(op->type_as_GatedDeltaDecodeOp(),
 +                                        getContext());
++  case ::tt::target::ttnn::OpType::CausalConv1dPrefillOp:
++    return operations::transformer::run(op->type_as_CausalConv1dPrefillOp(),
++                                       getContext());
 +  case ::tt::target::ttnn::OpType::CausalConv1dUpdateOp:
 +    return operations::transformer::run(op->type_as_CausalConv1dUpdateOp(),
 +                                        getContext());
@@ -469,7 +510,7 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
 diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.h b/runtime/lib/ttnn/operations/transformer/recurrent.h
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.h
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,16 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +#pragma once
@@ -479,6 +520,8 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.h b/runtime/lib/t
 +         ProgramContext &context);
 +void run(const ::tt::target::ttnn::GatedDeltaDecodeOp *op,
 +         ProgramContext &context);
++void run(const ::tt::target::ttnn::CausalConv1dPrefillOp *op,
++         ProgramContext &context);
 +void run(const ::tt::target::ttnn::CausalConv1dUpdateOp *op,
 +         ProgramContext &context);
 +void run(const ::tt::target::ttnn::StatePoolUpdateOp *op,
@@ -487,7 +530,7 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.h b/runtime/lib/t
 diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,115 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +#include "operations/transformer/recurrent.h"
@@ -496,6 +539,7 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +#include "tt/runtime/detail/ttnn/utils.h"
 +#include "ttnn/operations/transformer/chunk_gated_delta_rule/chunk_gated_delta_rule.hpp"
 +#include "ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp"
++#include "ttnn/operations/transformer/gated_delta_attn/causal_conv1d_prefill.hpp"
 +#include "ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp"
 +#include "ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp"
 +
@@ -568,6 +612,15 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +      ::ttnn::reshape(output, ::ttnn::Shape{batch, heads, dim}));
 +}
 +
++void run(const ::tt::target::ttnn::CausalConv1dPrefillOp *op,
++         ProgramContext &context) {
++  auto &pool = context.getTensorPool();
++  auto output = ::ttnn::transformer::causal_conv1d_prefill(
++      tiled(pool.getTTNNTensorAndValidate(op->history()), ::ttnn::DataType::BFLOAT16),
++      tiled(pool.getTTNNTensorAndValidate(op->weight()), ::ttnn::DataType::BFLOAT16));
++  put(pool, op->output(), output);
++}
++
 +void run(const ::tt::target::ttnn::CausalConv1dUpdateOp *op,
 +         ProgramContext &context) {
 +  auto &pool = context.getTensorPool();
@@ -593,3 +646,439 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +      tiled(pool.getTTNNTensorAndValidate(op->updates()), cache.dtype()));
 +}
 +} // namespace tt::runtime::ttnn::operations::transformer
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -533,5 +533,134 @@
+ //
+ // When multiply inputs and output are typecasted, the typecasts are ignored and
+ // silu op is done in the type of the sigmoid input.
++// Fuse the four FP32 products and ordered sum feeding SiLU. The FP32 result
++// keeps the existing final typecast, including its rounding behavior.
++class CausalConv1dPrefillFusion : public OpRewritePattern<SiluOp> {
++  using OpRewritePattern<SiluOp>::OpRewritePattern;
++
++  static Value stripViews(Value value) {
++    while (true) {
++      if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
++        value = reshape.getInput();
++      } else if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
++        value = broadcast.getInput();
++      } else {
++        return value;
++      }
++    }
++  }
++
++  static bool shapeIs(Value value, ArrayRef<int64_t> shape, bool fp32 = false) {
++    auto type = dyn_cast<RankedTensorType>(value.getType());
++    return type && type.getShape() == shape &&
++           (fp32 ? type.getElementType().isF32()
++                 : type.getElementType().isBF16());
++  }
++
++  static bool isSlice(SliceStaticOp slice, ArrayRef<int32_t> begins,
++                      ArrayRef<int32_t> ends) {
++    auto matches = [](ArrayAttr attr, ArrayRef<int32_t> values) {
++      return attr.size() == values.size() &&
++             llvm::equal(attr, values, [](Attribute a, int32_t v) {
++               return cast<IntegerAttr>(a).getInt() == v;
++             });
++    };
++    return slice && matches(slice.getBegins(), begins) &&
++           matches(slice.getEnds(), ends) && matches(slice.getStep(), {1, 1});
++  }
++
++  static Value matchWeight(Value value, int32_t channels, int32_t tap) {
++    auto broadcast = value.getDefiningOp<BroadcastOp>();
++    if (!broadcast || !shapeIs(broadcast.getInput(), {1, channels}, true))
++      return {};
++    auto castOp = stripViews(broadcast.getInput()).getDefiningOp<TypecastOp>();
++    if (!castOp || !castOp.getType().getElementType().isF32())
++      return {};
++    auto slice = stripViews(castOp.getInput()).getDefiningOp<SliceStaticOp>();
++    if (!isSlice(slice, {0, tap}, {channels, tap + 1}) ||
++        !shapeIs(slice.getInput(), {channels, 4}))
++      return {};
++    return slice.getInput();
++  }
++
++public:
++  LogicalResult matchAndRewrite(SiluOp silu,
++                                PatternRewriter &rewriter) const final {
++    auto type = silu.getType();
++    if (!type.hasStaticShape() || type.getRank() != 2 ||
++        !type.getElementType().isF32() || type.getDimSize(0) <= 0 ||
++        type.getDimSize(1) <= 0 || type.getDimSize(0) % 32 ||
++        type.getDimSize(1) % 32)
++      return rewriter.notifyMatchFailure(
++          silu, "requires static tile-aligned FP32 output");
++    if (!silu->hasOneUse())
++      return rewriter.notifyMatchFailure(silu,
++                                         "SiLU must feed only a BF16 cast");
++    auto outputCast = dyn_cast<TypecastOp>(*silu->getUsers().begin());
++    if (!outputCast || !outputCast.getType().getElementType().isBF16())
++      return rewriter.notifyMatchFailure(silu, "SiLU must feed a BF16 cast");
++    const int32_t rows = type.getDimSize(0), channels = type.getDimSize(1);
++    Value sum = silu.getInput();
++    SmallVector<Value> products(4);
++    for (int tap = 3; tap >= 0; --tap) {
++      auto add = sum.getDefiningOp<AddOp>();
++      if (!add || !add->hasOneUse() || add.getType() != type)
++        return rewriter.notifyMatchFailure(
++            silu, "requires four ordered, unshared additions");
++      products[tap] = add.getRhs();
++      sum = add.getLhs();
++    }
++    auto zero = stripViews(sum);
++    auto full = zero.getDefiningOp<FullOp>();
++    auto fill = full ? dyn_cast<FloatAttr>(full.getFillValue()) : FloatAttr();
++    if (!matchPattern(zero, m_PosZeroFloat()) &&
++        !(fill && fill.getValue().isPosZero()))
++      return rewriter.notifyMatchFailure(silu, "requires a zero initial sum");
++
++    Value history, weight;
++    for (int32_t tap = 0; tap < 4; ++tap) {
++      auto mul = products[tap].getDefiningOp<MultiplyOp>();
++      if (!mul || !mul->hasOneUse() || mul.getType() != type)
++        return rewriter.notifyMatchFailure(silu,
++                                           "requires unshared FP32 products");
++      Value tapWeight = matchWeight(mul.getRhs(), channels, tap);
++      Value window = mul.getLhs();
++      if (!tapWeight) {
++        tapWeight = matchWeight(mul.getLhs(), channels, tap);
++        window = mul.getRhs();
++      }
++      if (!tapWeight || (weight && weight != tapWeight))
++        return rewriter.notifyMatchFailure(
++            silu, "requires four taps from the same BF16 weight");
++      weight = tapWeight;
++      auto castOp = window.getDefiningOp<TypecastOp>();
++      if (!castOp || castOp.getType() != type ||
++          !shapeIs(castOp.getInput(), {rows, channels}))
++        return rewriter.notifyMatchFailure(
++            silu, "requires BF16 input windows cast to FP32");
++      window = castOp.getInput();
++      auto slice = window.getDefiningOp<SliceStaticOp>();
++      if (isSlice(slice, {tap, 0}, {tap + rows, channels})) {
++        if (!shapeIs(slice.getInput(), {rows + 3, channels}) ||
++            (history && history != slice.getInput()))
++          return rewriter.notifyMatchFailure(
++              silu, "requires four windows from the same history");
++        history = slice.getInput();
++      } else {
++        // Canonicalization can replace the last window with concat's input.
++        auto concat = history ? history.getDefiningOp<ConcatOp>() : ConcatOp();
++        if (tap != 3 || !concat || concat.getDim() != 0 ||
++            concat.getInputs().size() != 2 ||
++            !shapeIs(concat.getInputs()[0], {3, channels}) ||
++            concat.getInputs()[1] != window)
++          return rewriter.notifyMatchFailure(
++              silu, "requires the final window from the history concat");
++      }
++    }
++    rewriter.replaceOpWithNewOp<CausalConv1dPrefillOp>(silu, type, history,
++                                                       weight);
++    return success();
++  }
++};
+ class SiluFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
+   using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
+@@ -3794,6 +3923,7 @@
+       patterns.add<GeluFusionPattern>(&getContext());
+       patterns.add<Relu6FusionPattern>(&getContext());
+       patterns.add<SiluFusionPattern>(&getContext());
++      patterns.add<CausalConv1dPrefillFusion>(&getContext());
+       patterns.add<HardsigmoidFusionPattern>(&getContext());
+       patterns.add<MishFusingPattern>(&getContext());
+       patterns.add<ReshapeBroadcastReshapeToRepeatPattern>(&getContext());
+diff --git a/test/ttmlir/Dialect/TTIR/Transforms/causal_conv1d_prefill.mlir b/test/ttmlir/Dialect/TTIR/Transforms/causal_conv1d_prefill.mlir
+--- /dev/null
++++ b/test/ttmlir/Dialect/TTIR/Transforms/causal_conv1d_prefill.mlir
+@@ -0,0 +1,286 @@
++// RUN: ttmlir-opt --ttir-fusing --canonicalize %s | FileCheck %s
++module {
++  // CHECK-LABEL: @prefill
++  // CHECK: "ttir.causal_conv1d_prefill"
++  // CHECK: "ttir.typecast"
++  func.func @prefill(%h: tensor<259x8192xbf16>, %w: tensor<8192x4xbf16>) -> tensor<256x8192xbf16> {
++    %zero = "ttir.constant"() <{value = dense<0.0> : tensor<256x8192xf32>}> : () -> tensor<256x8192xf32>
++    %x0 = "ttir.slice_static"(%h) <{begins = [ 0 : i32, 0 : i32 ], ends = [ 256 : i32, 8192 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<259x8192xbf16>) -> tensor<256x8192xbf16>
++    %xf0 = "ttir.typecast"(%x0) : (tensor<256x8192xbf16>) -> tensor<256x8192xf32>
++    %ws0 = "ttir.slice_static"(%w) <{begins = [0 : i32, 0 : i32], ends = [8192 : i32, 1 : i32], step = [1 : i32, 1 : i32]}> : (tensor<8192x4xbf16>) -> tensor<8192x1xbf16>
++    %wr0 = "ttir.reshape"(%ws0) <{shape = [1 : i32, 8192 : i32]}> : (tensor<8192x1xbf16>) -> tensor<1x8192xbf16>
++    %wf0 = "ttir.typecast"(%wr0) : (tensor<1x8192xbf16>) -> tensor<1x8192xf32>
++    %wb0 = "ttir.broadcast"(%wf0) <{broadcast_dimensions = array<i64: 256, 1>}> : (tensor<1x8192xf32>) -> tensor<256x8192xf32>
++    %p0 = "ttir.multiply"(%xf0, %wb0) : (tensor<256x8192xf32>, tensor<256x8192xf32>) -> tensor<256x8192xf32>
++    %s0 = "ttir.add"(%zero, %p0) : (tensor<256x8192xf32>, tensor<256x8192xf32>) -> tensor<256x8192xf32>
++    %x1 = "ttir.slice_static"(%h) <{begins = [ 1 : i32, 0 : i32 ], ends = [ 257 : i32, 8192 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<259x8192xbf16>) -> tensor<256x8192xbf16>
++    %xf1 = "ttir.typecast"(%x1) : (tensor<256x8192xbf16>) -> tensor<256x8192xf32>
++    %ws1 = "ttir.slice_static"(%w) <{begins = [0 : i32, 1 : i32], ends = [8192 : i32, 2 : i32], step = [1 : i32, 1 : i32]}> : (tensor<8192x4xbf16>) -> tensor<8192x1xbf16>
++    %wr1 = "ttir.reshape"(%ws1) <{shape = [1 : i32, 8192 : i32]}> : (tensor<8192x1xbf16>) -> tensor<1x8192xbf16>
++    %wf1 = "ttir.typecast"(%wr1) : (tensor<1x8192xbf16>) -> tensor<1x8192xf32>
++    %wb1 = "ttir.broadcast"(%wf1) <{broadcast_dimensions = array<i64: 256, 1>}> : (tensor<1x8192xf32>) -> tensor<256x8192xf32>
++    %p1 = "ttir.multiply"(%xf1, %wb1) : (tensor<256x8192xf32>, tensor<256x8192xf32>) -> tensor<256x8192xf32>
++    %s1 = "ttir.add"(%s0, %p1) : (tensor<256x8192xf32>, tensor<256x8192xf32>) -> tensor<256x8192xf32>
++    %x2 = "ttir.slice_static"(%h) <{begins = [ 2 : i32, 0 : i32 ], ends = [ 258 : i32, 8192 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<259x8192xbf16>) -> tensor<256x8192xbf16>
++    %xf2 = "ttir.typecast"(%x2) : (tensor<256x8192xbf16>) -> tensor<256x8192xf32>
++    %ws2 = "ttir.slice_static"(%w) <{begins = [0 : i32, 2 : i32], ends = [8192 : i32, 3 : i32], step = [1 : i32, 1 : i32]}> : (tensor<8192x4xbf16>) -> tensor<8192x1xbf16>
++    %wr2 = "ttir.reshape"(%ws2) <{shape = [1 : i32, 8192 : i32]}> : (tensor<8192x1xbf16>) -> tensor<1x8192xbf16>
++    %wf2 = "ttir.typecast"(%wr2) : (tensor<1x8192xbf16>) -> tensor<1x8192xf32>
++    %wb2 = "ttir.broadcast"(%wf2) <{broadcast_dimensions = array<i64: 256, 1>}> : (tensor<1x8192xf32>) -> tensor<256x8192xf32>
++    %p2 = "ttir.multiply"(%xf2, %wb2) : (tensor<256x8192xf32>, tensor<256x8192xf32>) -> tensor<256x8192xf32>
++    %s2 = "ttir.add"(%s1, %p2) : (tensor<256x8192xf32>, tensor<256x8192xf32>) -> tensor<256x8192xf32>
++    %x3 = "ttir.slice_static"(%h) <{begins = [ 3 : i32, 0 : i32 ], ends = [ 259 : i32, 8192 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<259x8192xbf16>) -> tensor<256x8192xbf16>
++    %xf3 = "ttir.typecast"(%x3) : (tensor<256x8192xbf16>) -> tensor<256x8192xf32>
++    %ws3 = "ttir.slice_static"(%w) <{begins = [0 : i32, 3 : i32], ends = [8192 : i32, 4 : i32], step = [1 : i32, 1 : i32]}> : (tensor<8192x4xbf16>) -> tensor<8192x1xbf16>
++    %wr3 = "ttir.reshape"(%ws3) <{shape = [1 : i32, 8192 : i32]}> : (tensor<8192x1xbf16>) -> tensor<1x8192xbf16>
++    %wf3 = "ttir.typecast"(%wr3) : (tensor<1x8192xbf16>) -> tensor<1x8192xf32>
++    %wb3 = "ttir.broadcast"(%wf3) <{broadcast_dimensions = array<i64: 256, 1>}> : (tensor<1x8192xf32>) -> tensor<256x8192xf32>
++    %p3 = "ttir.multiply"(%xf3, %wb3) : (tensor<256x8192xf32>, tensor<256x8192xf32>) -> tensor<256x8192xf32>
++    %s3 = "ttir.add"(%s2, %p3) : (tensor<256x8192xf32>, tensor<256x8192xf32>) -> tensor<256x8192xf32>
++    %activated = "ttir.silu"(%s3) : (tensor<256x8192xf32>) -> tensor<256x8192xf32>
++    %out = "ttir.typecast"(%activated) : (tensor<256x8192xf32>) -> tensor<256x8192xbf16>
++    return %out : tensor<256x8192xbf16>
++  }
++  // CHECK-LABEL: @folded_last_window
++  // CHECK: "ttir.causal_conv1d_prefill"
++  // CHECK: "ttir.typecast"
++  func.func @folded_last_window(%saved: tensor<3x32xbf16>, %x: tensor<32x32xbf16>, %w: tensor<32x4xbf16>) -> tensor<32x32xbf16> {
++    %h = "ttir.concat"(%saved, %x) <{dim = 0 : si32}> : (tensor<3x32xbf16>, tensor<32x32xbf16>) -> tensor<35x32xbf16>
++    %zero = "ttir.constant"() <{value = dense<0.0> : tensor<32x32xf32>}> : () -> tensor<32x32xf32>
++    %x0 = "ttir.slice_static"(%h) <{begins = [ 0 : i32, 0 : i32 ], ends = [ 32 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf0 = "ttir.typecast"(%x0) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws0 = "ttir.slice_static"(%w) <{begins = [0 : i32, 0 : i32], ends = [32 : i32, 1 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr0 = "ttir.reshape"(%ws0) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf0 = "ttir.typecast"(%wr0) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb0 = "ttir.broadcast"(%wf0) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p0 = "ttir.multiply"(%xf0, %wb0) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s0 = "ttir.add"(%zero, %p0) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x1 = "ttir.slice_static"(%h) <{begins = [ 1 : i32, 0 : i32 ], ends = [ 33 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf1 = "ttir.typecast"(%x1) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws1 = "ttir.slice_static"(%w) <{begins = [0 : i32, 1 : i32], ends = [32 : i32, 2 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr1 = "ttir.reshape"(%ws1) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf1 = "ttir.typecast"(%wr1) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb1 = "ttir.broadcast"(%wf1) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p1 = "ttir.multiply"(%xf1, %wb1) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s1 = "ttir.add"(%s0, %p1) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x2 = "ttir.slice_static"(%h) <{begins = [ 2 : i32, 0 : i32 ], ends = [ 34 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf2 = "ttir.typecast"(%x2) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws2 = "ttir.slice_static"(%w) <{begins = [0 : i32, 2 : i32], ends = [32 : i32, 3 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr2 = "ttir.reshape"(%ws2) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf2 = "ttir.typecast"(%wr2) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb2 = "ttir.broadcast"(%wf2) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p2 = "ttir.multiply"(%xf2, %wb2) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s2 = "ttir.add"(%s1, %p2) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %xf3 = "ttir.typecast"(%x) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws3 = "ttir.slice_static"(%w) <{begins = [0 : i32, 3 : i32], ends = [32 : i32, 4 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr3 = "ttir.reshape"(%ws3) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf3 = "ttir.typecast"(%wr3) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb3 = "ttir.broadcast"(%wf3) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p3 = "ttir.multiply"(%xf3, %wb3) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s3 = "ttir.add"(%s2, %p3) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %activated = "ttir.silu"(%s3) : (tensor<32x32xf32>) -> tensor<32x32xf32>
++    %out = "ttir.typecast"(%activated) : (tensor<32x32xf32>) -> tensor<32x32xbf16>
++    return %out : tensor<32x32xbf16>
++  }
++  // CHECK-LABEL: @keep_shared_product
++  // CHECK-NOT: "ttir.causal_conv1d_prefill"
++  // CHECK: "ttir.silu"
++  func.func @keep_shared_product(%h: tensor<35x32xbf16>, %w: tensor<32x4xbf16>) -> (tensor<32x32xbf16>, tensor<32x32xf32>) {
++    %zero = "ttir.constant"() <{value = dense<0.0> : tensor<32x32xf32>}> : () -> tensor<32x32xf32>
++    %x0 = "ttir.slice_static"(%h) <{begins = [ 0 : i32, 0 : i32 ], ends = [ 32 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf0 = "ttir.typecast"(%x0) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws0 = "ttir.slice_static"(%w) <{begins = [0 : i32, 0 : i32], ends = [32 : i32, 1 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr0 = "ttir.reshape"(%ws0) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf0 = "ttir.typecast"(%wr0) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb0 = "ttir.broadcast"(%wf0) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p0 = "ttir.multiply"(%xf0, %wb0) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s0 = "ttir.add"(%zero, %p0) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x1 = "ttir.slice_static"(%h) <{begins = [ 1 : i32, 0 : i32 ], ends = [ 33 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf1 = "ttir.typecast"(%x1) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws1 = "ttir.slice_static"(%w) <{begins = [0 : i32, 1 : i32], ends = [32 : i32, 2 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr1 = "ttir.reshape"(%ws1) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf1 = "ttir.typecast"(%wr1) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb1 = "ttir.broadcast"(%wf1) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p1 = "ttir.multiply"(%xf1, %wb1) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s1 = "ttir.add"(%s0, %p1) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x2 = "ttir.slice_static"(%h) <{begins = [ 2 : i32, 0 : i32 ], ends = [ 34 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf2 = "ttir.typecast"(%x2) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws2 = "ttir.slice_static"(%w) <{begins = [0 : i32, 2 : i32], ends = [32 : i32, 3 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr2 = "ttir.reshape"(%ws2) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf2 = "ttir.typecast"(%wr2) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb2 = "ttir.broadcast"(%wf2) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p2 = "ttir.multiply"(%xf2, %wb2) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s2 = "ttir.add"(%s1, %p2) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x3 = "ttir.slice_static"(%h) <{begins = [ 3 : i32, 0 : i32 ], ends = [ 35 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf3 = "ttir.typecast"(%x3) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws3 = "ttir.slice_static"(%w) <{begins = [0 : i32, 3 : i32], ends = [32 : i32, 4 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr3 = "ttir.reshape"(%ws3) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf3 = "ttir.typecast"(%wr3) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb3 = "ttir.broadcast"(%wf3) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p3 = "ttir.multiply"(%xf3, %wb3) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s3 = "ttir.add"(%s2, %p3) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %activated = "ttir.silu"(%s3) : (tensor<32x32xf32>) -> tensor<32x32xf32>
++    %out = "ttir.typecast"(%activated) : (tensor<32x32xf32>) -> tensor<32x32xbf16>
++    return %out, %p0 : tensor<32x32xbf16>, tensor<32x32xf32>
++  }
++  // CHECK-LABEL: @keep_wrong_window
++  // CHECK-NOT: "ttir.causal_conv1d_prefill"
++  // CHECK: "ttir.silu"
++  func.func @keep_wrong_window(%h: tensor<35x32xbf16>, %w: tensor<32x4xbf16>) -> tensor<32x32xbf16> {
++    %zero = "ttir.constant"() <{value = dense<0.0> : tensor<32x32xf32>}> : () -> tensor<32x32xf32>
++    %x0 = "ttir.slice_static"(%h) <{begins = [ 0 : i32, 0 : i32 ], ends = [ 32 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf0 = "ttir.typecast"(%x0) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws0 = "ttir.slice_static"(%w) <{begins = [0 : i32, 0 : i32], ends = [32 : i32, 1 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr0 = "ttir.reshape"(%ws0) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf0 = "ttir.typecast"(%wr0) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb0 = "ttir.broadcast"(%wf0) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p0 = "ttir.multiply"(%xf0, %wb0) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s0 = "ttir.add"(%zero, %p0) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x1 = "ttir.slice_static"(%h) <{begins = [ 1 : i32, 0 : i32 ], ends = [ 33 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf1 = "ttir.typecast"(%x1) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws1 = "ttir.slice_static"(%w) <{begins = [0 : i32, 1 : i32], ends = [32 : i32, 2 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr1 = "ttir.reshape"(%ws1) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf1 = "ttir.typecast"(%wr1) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb1 = "ttir.broadcast"(%wf1) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p1 = "ttir.multiply"(%xf1, %wb1) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s1 = "ttir.add"(%s0, %p1) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x2 = "ttir.slice_static"(%h) <{begins = [ 1 : i32, 0 : i32 ], ends = [ 33 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf2 = "ttir.typecast"(%x2) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws2 = "ttir.slice_static"(%w) <{begins = [0 : i32, 2 : i32], ends = [32 : i32, 3 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr2 = "ttir.reshape"(%ws2) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf2 = "ttir.typecast"(%wr2) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb2 = "ttir.broadcast"(%wf2) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p2 = "ttir.multiply"(%xf2, %wb2) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s2 = "ttir.add"(%s1, %p2) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x3 = "ttir.slice_static"(%h) <{begins = [ 3 : i32, 0 : i32 ], ends = [ 35 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf3 = "ttir.typecast"(%x3) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws3 = "ttir.slice_static"(%w) <{begins = [0 : i32, 3 : i32], ends = [32 : i32, 4 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr3 = "ttir.reshape"(%ws3) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf3 = "ttir.typecast"(%wr3) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb3 = "ttir.broadcast"(%wf3) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p3 = "ttir.multiply"(%xf3, %wb3) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s3 = "ttir.add"(%s2, %p3) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %activated = "ttir.silu"(%s3) : (tensor<32x32xf32>) -> tensor<32x32xf32>
++    %out = "ttir.typecast"(%activated) : (tensor<32x32xf32>) -> tensor<32x32xbf16>
++    return %out : tensor<32x32xbf16>
++  }
++  // CHECK-LABEL: @keep_wrong_broadcast
++  // CHECK-NOT: "ttir.causal_conv1d_prefill"
++  // CHECK: "ttir.silu"
++  func.func @keep_wrong_broadcast(%h: tensor<35x32xbf16>, %w: tensor<32x4xbf16>) -> tensor<32x32xbf16> {
++    %zero = "ttir.constant"() <{value = dense<0.0> : tensor<32x32xf32>}> : () -> tensor<32x32xf32>
++    %x0 = "ttir.slice_static"(%h) <{begins = [ 0 : i32, 0 : i32 ], ends = [ 32 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf0 = "ttir.typecast"(%x0) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws0 = "ttir.slice_static"(%w) <{begins = [0 : i32, 0 : i32], ends = [32 : i32, 1 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wf0 = "ttir.typecast"(%ws0) : (tensor<32x1xbf16>) -> tensor<32x1xf32>
++    %wb0 = "ttir.broadcast"(%wf0) <{broadcast_dimensions = array<i64: 1, 32>}> : (tensor<32x1xf32>) -> tensor<32x32xf32>
++    %p0 = "ttir.multiply"(%xf0, %wb0) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s0 = "ttir.add"(%zero, %p0) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x1 = "ttir.slice_static"(%h) <{begins = [ 1 : i32, 0 : i32 ], ends = [ 33 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf1 = "ttir.typecast"(%x1) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws1 = "ttir.slice_static"(%w) <{begins = [0 : i32, 1 : i32], ends = [32 : i32, 2 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wf1 = "ttir.typecast"(%ws1) : (tensor<32x1xbf16>) -> tensor<32x1xf32>
++    %wb1 = "ttir.broadcast"(%wf1) <{broadcast_dimensions = array<i64: 1, 32>}> : (tensor<32x1xf32>) -> tensor<32x32xf32>
++    %p1 = "ttir.multiply"(%xf1, %wb1) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s1 = "ttir.add"(%s0, %p1) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x2 = "ttir.slice_static"(%h) <{begins = [ 2 : i32, 0 : i32 ], ends = [ 34 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf2 = "ttir.typecast"(%x2) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws2 = "ttir.slice_static"(%w) <{begins = [0 : i32, 2 : i32], ends = [32 : i32, 3 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wf2 = "ttir.typecast"(%ws2) : (tensor<32x1xbf16>) -> tensor<32x1xf32>
++    %wb2 = "ttir.broadcast"(%wf2) <{broadcast_dimensions = array<i64: 1, 32>}> : (tensor<32x1xf32>) -> tensor<32x32xf32>
++    %p2 = "ttir.multiply"(%xf2, %wb2) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s2 = "ttir.add"(%s1, %p2) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x3 = "ttir.slice_static"(%h) <{begins = [ 3 : i32, 0 : i32 ], ends = [ 35 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf3 = "ttir.typecast"(%x3) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws3 = "ttir.slice_static"(%w) <{begins = [0 : i32, 3 : i32], ends = [32 : i32, 4 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wf3 = "ttir.typecast"(%ws3) : (tensor<32x1xbf16>) -> tensor<32x1xf32>
++    %wb3 = "ttir.broadcast"(%wf3) <{broadcast_dimensions = array<i64: 1, 32>}> : (tensor<32x1xf32>) -> tensor<32x32xf32>
++    %p3 = "ttir.multiply"(%xf3, %wb3) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s3 = "ttir.add"(%s2, %p3) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %activated = "ttir.silu"(%s3) : (tensor<32x32xf32>) -> tensor<32x32xf32>
++    %out = "ttir.typecast"(%activated) : (tensor<32x32xf32>) -> tensor<32x32xbf16>
++    return %out : tensor<32x32xbf16>
++  }
++  // CHECK-LABEL: @keep_partial_tile
++  // CHECK-NOT: "ttir.causal_conv1d_prefill"
++  // CHECK: "ttir.silu"
++  func.func @keep_partial_tile(%h: tensor<36x32xbf16>, %w: tensor<32x4xbf16>) -> tensor<33x32xbf16> {
++    %zero = "ttir.constant"() <{value = dense<0.0> : tensor<33x32xf32>}> : () -> tensor<33x32xf32>
++    %x0 = "ttir.slice_static"(%h) <{begins = [ 0 : i32, 0 : i32 ], ends = [ 33 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<36x32xbf16>) -> tensor<33x32xbf16>
++    %xf0 = "ttir.typecast"(%x0) : (tensor<33x32xbf16>) -> tensor<33x32xf32>
++    %ws0 = "ttir.slice_static"(%w) <{begins = [0 : i32, 0 : i32], ends = [32 : i32, 1 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr0 = "ttir.reshape"(%ws0) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf0 = "ttir.typecast"(%wr0) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb0 = "ttir.broadcast"(%wf0) <{broadcast_dimensions = array<i64: 33, 1>}> : (tensor<1x32xf32>) -> tensor<33x32xf32>
++    %p0 = "ttir.multiply"(%xf0, %wb0) : (tensor<33x32xf32>, tensor<33x32xf32>) -> tensor<33x32xf32>
++    %s0 = "ttir.add"(%zero, %p0) : (tensor<33x32xf32>, tensor<33x32xf32>) -> tensor<33x32xf32>
++    %x1 = "ttir.slice_static"(%h) <{begins = [ 1 : i32, 0 : i32 ], ends = [ 34 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<36x32xbf16>) -> tensor<33x32xbf16>
++    %xf1 = "ttir.typecast"(%x1) : (tensor<33x32xbf16>) -> tensor<33x32xf32>
++    %ws1 = "ttir.slice_static"(%w) <{begins = [0 : i32, 1 : i32], ends = [32 : i32, 2 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr1 = "ttir.reshape"(%ws1) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf1 = "ttir.typecast"(%wr1) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb1 = "ttir.broadcast"(%wf1) <{broadcast_dimensions = array<i64: 33, 1>}> : (tensor<1x32xf32>) -> tensor<33x32xf32>
++    %p1 = "ttir.multiply"(%xf1, %wb1) : (tensor<33x32xf32>, tensor<33x32xf32>) -> tensor<33x32xf32>
++    %s1 = "ttir.add"(%s0, %p1) : (tensor<33x32xf32>, tensor<33x32xf32>) -> tensor<33x32xf32>
++    %x2 = "ttir.slice_static"(%h) <{begins = [ 2 : i32, 0 : i32 ], ends = [ 35 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<36x32xbf16>) -> tensor<33x32xbf16>
++    %xf2 = "ttir.typecast"(%x2) : (tensor<33x32xbf16>) -> tensor<33x32xf32>
++    %ws2 = "ttir.slice_static"(%w) <{begins = [0 : i32, 2 : i32], ends = [32 : i32, 3 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr2 = "ttir.reshape"(%ws2) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf2 = "ttir.typecast"(%wr2) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb2 = "ttir.broadcast"(%wf2) <{broadcast_dimensions = array<i64: 33, 1>}> : (tensor<1x32xf32>) -> tensor<33x32xf32>
++    %p2 = "ttir.multiply"(%xf2, %wb2) : (tensor<33x32xf32>, tensor<33x32xf32>) -> tensor<33x32xf32>
++    %s2 = "ttir.add"(%s1, %p2) : (tensor<33x32xf32>, tensor<33x32xf32>) -> tensor<33x32xf32>
++    %x3 = "ttir.slice_static"(%h) <{begins = [ 3 : i32, 0 : i32 ], ends = [ 36 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<36x32xbf16>) -> tensor<33x32xbf16>
++    %xf3 = "ttir.typecast"(%x3) : (tensor<33x32xbf16>) -> tensor<33x32xf32>
++    %ws3 = "ttir.slice_static"(%w) <{begins = [0 : i32, 3 : i32], ends = [32 : i32, 4 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr3 = "ttir.reshape"(%ws3) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf3 = "ttir.typecast"(%wr3) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb3 = "ttir.broadcast"(%wf3) <{broadcast_dimensions = array<i64: 33, 1>}> : (tensor<1x32xf32>) -> tensor<33x32xf32>
++    %p3 = "ttir.multiply"(%xf3, %wb3) : (tensor<33x32xf32>, tensor<33x32xf32>) -> tensor<33x32xf32>
++    %s3 = "ttir.add"(%s2, %p3) : (tensor<33x32xf32>, tensor<33x32xf32>) -> tensor<33x32xf32>
++    %activated = "ttir.silu"(%s3) : (tensor<33x32xf32>) -> tensor<33x32xf32>
++    %out = "ttir.typecast"(%activated) : (tensor<33x32xf32>) -> tensor<33x32xbf16>
++    return %out : tensor<33x32xbf16>
++  }
++  // CHECK-LABEL: @keep_fp32_output
++  // CHECK-NOT: "ttir.causal_conv1d_prefill"
++  // CHECK: "ttir.silu"
++  func.func @keep_fp32_output(%h: tensor<35x32xbf16>, %w: tensor<32x4xbf16>) -> (tensor<32x32xbf16>, tensor<32x32xf32>) {
++    %zero = "ttir.constant"() <{value = dense<0.0> : tensor<32x32xf32>}> : () -> tensor<32x32xf32>
++    %x0 = "ttir.slice_static"(%h) <{begins = [ 0 : i32, 0 : i32 ], ends = [ 32 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf0 = "ttir.typecast"(%x0) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws0 = "ttir.slice_static"(%w) <{begins = [0 : i32, 0 : i32], ends = [32 : i32, 1 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr0 = "ttir.reshape"(%ws0) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf0 = "ttir.typecast"(%wr0) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb0 = "ttir.broadcast"(%wf0) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p0 = "ttir.multiply"(%xf0, %wb0) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s0 = "ttir.add"(%zero, %p0) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x1 = "ttir.slice_static"(%h) <{begins = [ 1 : i32, 0 : i32 ], ends = [ 33 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf1 = "ttir.typecast"(%x1) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws1 = "ttir.slice_static"(%w) <{begins = [0 : i32, 1 : i32], ends = [32 : i32, 2 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr1 = "ttir.reshape"(%ws1) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf1 = "ttir.typecast"(%wr1) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb1 = "ttir.broadcast"(%wf1) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p1 = "ttir.multiply"(%xf1, %wb1) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s1 = "ttir.add"(%s0, %p1) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x2 = "ttir.slice_static"(%h) <{begins = [ 2 : i32, 0 : i32 ], ends = [ 34 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf2 = "ttir.typecast"(%x2) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws2 = "ttir.slice_static"(%w) <{begins = [0 : i32, 2 : i32], ends = [32 : i32, 3 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr2 = "ttir.reshape"(%ws2) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf2 = "ttir.typecast"(%wr2) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb2 = "ttir.broadcast"(%wf2) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p2 = "ttir.multiply"(%xf2, %wb2) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s2 = "ttir.add"(%s1, %p2) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %x3 = "ttir.slice_static"(%h) <{begins = [ 3 : i32, 0 : i32 ], ends = [ 35 : i32, 32 : i32 ], step = [1 : i32, 1 : i32]}> : (tensor<35x32xbf16>) -> tensor<32x32xbf16>
++    %xf3 = "ttir.typecast"(%x3) : (tensor<32x32xbf16>) -> tensor<32x32xf32>
++    %ws3 = "ttir.slice_static"(%w) <{begins = [0 : i32, 3 : i32], ends = [32 : i32, 4 : i32], step = [1 : i32, 1 : i32]}> : (tensor<32x4xbf16>) -> tensor<32x1xbf16>
++    %wr3 = "ttir.reshape"(%ws3) <{shape = [1 : i32, 32 : i32]}> : (tensor<32x1xbf16>) -> tensor<1x32xbf16>
++    %wf3 = "ttir.typecast"(%wr3) : (tensor<1x32xbf16>) -> tensor<1x32xf32>
++    %wb3 = "ttir.broadcast"(%wf3) <{broadcast_dimensions = array<i64: 32, 1>}> : (tensor<1x32xf32>) -> tensor<32x32xf32>
++    %p3 = "ttir.multiply"(%xf3, %wb3) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %s3 = "ttir.add"(%s2, %p3) : (tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
++    %activated = "ttir.silu"(%s3) : (tensor<32x32xf32>) -> tensor<32x32xf32>
++    %out = "ttir.typecast"(%activated) : (tensor<32x32xf32>) -> tensor<32x32xbf16>
++    return %out, %activated : tensor<32x32xbf16>, tensor<32x32xf32>
++  }
++}

@@ -1848,3 +1848,305 @@ index 0000000..d2af50f
 +    const Tensor& has_initial_state);
 +
 +}  // namespace ttnn::transformer
+diff --git a/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_prefill.cpp b/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_prefill.cpp
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_prefill.cpp
+@@ -0,0 +1,144 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#include "ttnn/operations/transformer/gated_delta_attn/causal_conv1d_prefill.hpp"
++#include <algorithm>
++#include <variant>
++#include <tt-metalium/buffer.hpp>
++#include <tt-metalium/host_api.hpp>
++#include <tt-metalium/tensor_accessor_args.hpp>
++#include <tt-metalium/work_split.hpp>
++#include "ttnn/device.hpp"
++#include "ttnn/device_operation.hpp"
++#include "ttnn/operation.hpp"
++#include "ttnn/tensor/tensor_ops.hpp"
++using namespace tt::tt_metal;
++namespace ttnn::prim {
++namespace {
++struct PrefillParams {};
++struct PrefillInputs {
++    Tensor history;
++    Tensor weight;
++};
++struct PrefillShared {
++    KernelHandle reader;
++    KernelHandle writer;
++    uint32_t grid_y;
++    uint32_t workers;
++};
++struct PrefillFactory {
++    using shared_variables_t = PrefillShared;
++    using cached_program_t = device_operation::CachedProgram<shared_variables_t>;
++    using operation_attributes_t = PrefillParams;
++    using tensor_args_t = PrefillInputs;
++    using tensor_return_value_t = Tensor;
++    static cached_program_t create(const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
++    static void override_runtime_arguments(
++        cached_program_t&, const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
++};
++struct PrefillOperation {
++    using operation_attributes_t = PrefillParams;
++    using tensor_args_t = PrefillInputs;
++    using spec_return_value_t = TensorSpec;
++    using tensor_return_value_t = Tensor;
++    using program_factory_t = std::variant<PrefillFactory>;
++    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t& in) {
++        for (const auto* t : {&in.history, &in.weight}) {
++            TT_FATAL(t->storage_type() == StorageType::DEVICE && t->buffer(), "Input must be on device");
++            TT_FATAL(t->layout() == Layout::TILE && t->dtype() == DataType::BFLOAT16, "Input must be tiled BF16");
++            TT_FATAL(t->memory_config() == ttnn::DRAM_MEMORY_CONFIG, "Input must be interleaved DRAM");
++        }
++        TT_FATAL(in.history.device() == in.weight.device(), "Inputs must share a device");
++        const auto& s = in.history.logical_shape();
++        TT_FATAL(
++            s.rank() == 2 && s[0] > 3 && (s[0] - 3) % 32 == 0 && s[1] > 0 && s[1] % 32 == 0,
++            "History must have shape [tile-aligned tokens + 3, tile-aligned channels]");
++        TT_FATAL(in.weight.logical_shape() == Shape({s[1], 4}), "Weight must have shape [channels, 4]");
++    }
++    static void validate_on_program_cache_hit(const operation_attributes_t& a, const tensor_args_t& in) {
++        validate_on_program_cache_miss(a, in);
++    }
++    static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t& in) {
++        const auto& s = in.history.logical_shape();
++        return TensorSpec(
++            Shape({s[0] - 3, s[1]}),
++            TensorLayout(DataType::FLOAT32, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
++    }
++    static tensor_return_value_t create_output_tensors(const operation_attributes_t& a, const tensor_args_t& in) {
++        return create_device_tensor(compute_output_specs(a, in), in.history.device());
++    }
++    static ttsl::hash::hash_t compute_program_hash(const operation_attributes_t&, const tensor_args_t& in) {
++        return operation::hash_operation<PrefillOperation>(in.history, in.weight);
++    }
++};
++PrefillFactory::cached_program_t PrefillFactory::create(
++    const operation_attributes_t&, const tensor_args_t& in, tensor_return_value_t& out) {
++    const uint32_t channels = in.history.logical_shape()[1] / 32;
++    const uint32_t rows = (in.history.logical_shape()[0] - 3) / 32;
++    const auto grid = in.history.device()->compute_with_storage_grid_size();
++    const uint32_t workers = std::min(channels, uint32_t(grid.x * grid.y));
++    const auto cores = num_cores_to_corerangeset(workers, grid);
++    Program program;
++    auto cb = [&](uint32_t index, uint32_t tiles) {
++        const uint32_t bytes = index == 3 ? 4096 : 2048;
++        const auto format = index == 3 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b;
++        CircularBufferConfig config(tiles * bytes, {{index, format}});
++        config.set_page_size(index, bytes);
++        CreateCircularBuffer(program, cores, config);
++    };
++    cb(0, 8);  // Four shifted input tiles, double buffered.
++    cb(1, 8);  // Four broadcast weight tiles per channel block.
++    cb(2, 3);  // Two history tiles and one weight tile, local scratch.
++    cb(3, 2);  // Output, double buffered.
++    std::vector<uint32_t> reader_args{channels, rows, workers};
++    TensorAccessorArgs(in.history.buffer()).append_to(reader_args);
++    TensorAccessorArgs(in.weight.buffer()).append_to(reader_args);
++    std::vector<uint32_t> writer_args{channels, rows, workers};
++    TensorAccessorArgs(out.buffer()).append_to(writer_args);
++    const std::string dir = "ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/";
++    auto reader = CreateKernel(
++        program,
++        dir + "dataflow/reader_causal_conv1d_prefill.cpp",
++        cores,
++        DataMovementConfig{
++            .processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default, .compile_args = reader_args});
++    auto writer = CreateKernel(
++        program,
++        dir + "dataflow/writer_causal_conv1d_prefill.cpp",
++        cores,
++        DataMovementConfig{
++            .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = writer_args});
++    auto compute = CreateKernel(
++        program,
++        dir + "compute/causal_conv1d_prefill.cpp",
++        cores,
++        ComputeConfig{
++            .math_fidelity = MathFidelity::HiFi4,
++            .fp32_dest_acc_en = true,
++            .math_approx_mode = false,
++            .compile_args = {channels, rows, workers}});
++    for (uint32_t w = 0; w < workers; ++w) {
++        const CoreCoord core{w / grid.y, w % grid.y};
++        SetRuntimeArgs(program, reader, core, {w, in.history.buffer()->address(), in.weight.buffer()->address()});
++        SetRuntimeArgs(program, writer, core, {w, out.buffer()->address()});
++        SetRuntimeArgs(program, compute, core, {w});
++    }
++    return {std::move(program), {reader, writer, uint32_t(grid.y), workers}};
++}
++void PrefillFactory::override_runtime_arguments(
++    cached_program_t& cached, const operation_attributes_t&, const tensor_args_t& in, tensor_return_value_t& out) {
++    for (uint32_t w = 0; w < cached.shared_variables.workers; ++w) {
++        CoreCoord core{w / cached.shared_variables.grid_y, w % cached.shared_variables.grid_y};
++        auto& r = GetRuntimeArgs(cached.program, cached.shared_variables.reader, core);
++        r[1] = in.history.buffer()->address();
++        r[2] = in.weight.buffer()->address();
++        GetRuntimeArgs(cached.program, cached.shared_variables.writer, core)[1] = out.buffer()->address();
++    }
++}
++}  // namespace
++}  // namespace ttnn::prim
++namespace ttnn::transformer {
++Tensor causal_conv1d_prefill(const Tensor& history, const Tensor& weight) {
++    return device_operation::launch<prim::PrefillOperation>({}, {.history = history, .weight = weight});
++}
++}  // namespace ttnn::transformer
+diff --git a/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_prefill.hpp b/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_prefill.hpp
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_prefill.hpp
+@@ -0,0 +1,9 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++#include "ttnn/tensor/tensor.hpp"
++namespace ttnn::transformer {
++// The first three history rows precede the live chunk. Returns FP32 SiLU.
++Tensor causal_conv1d_prefill(const Tensor& history, const Tensor& weight);
++}
+diff --git a/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_prefill.cpp b/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_prefill.cpp
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_prefill.cpp
+@@ -0,0 +1,56 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#include <stdint.h>
++#include "api/dataflow/circular_buffer.h"
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++constexpr uint32_t offset(uint32_t row, uint32_t column) {
++    return ((row / 16) * 2 + column / 16) * 256 + (row % 16) * 16 + column % 16;
++}
++void kernel_main() {
++    constexpr uint32_t channels = get_compile_time_arg_val(0);
++    constexpr uint32_t rows = get_compile_time_arg_val(1);
++    constexpr uint32_t workers = get_compile_time_arg_val(2);
++    const uint32_t worker = get_arg_val<uint32_t>(0);
++    constexpr auto ha = TensorAccessorArgs<3>();
++    constexpr auto wa = TensorAccessorArgs<ha.next_compile_time_args_offset()>();
++    const auto history = TensorAccessor(ha, get_arg_val<uint32_t>(1), 2048);
++    const auto weight = TensorAccessor(wa, get_arg_val<uint32_t>(2), 2048);
++    CircularBuffer inputs(tt::CBIndex::c_0), weights(tt::CBIndex::c_1), scratch(tt::CBIndex::c_2);
++    scratch.reserve_back(3);
++    const uint32_t local = scratch.get_write_ptr();
++    for (uint32_t channel = worker; channel < channels; channel += workers) {
++        noc_async_read_tile(channel, weight, local + 4096);
++        noc_async_read_barrier();
++        weights.reserve_back(4);
++        auto* w = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(weights.get_write_ptr());
++        const auto* srcw = reinterpret_cast<const volatile tt_l1_ptr uint16_t*>(local + 4096);
++        for (uint32_t tap = 0; tap < 4; ++tap) {
++            for (uint32_t row = 0; row < 32; ++row) {
++                for (uint32_t column = 0; column < 32; ++column) {
++                    w[tap * 1024 + offset(row, column)] = srcw[offset(column, tap)];
++                }
++            }
++        }
++        weights.push_back(4);
++        for (uint32_t row_tile = 0; row_tile < rows; ++row_tile) {
++            noc_async_read_tile(row_tile * channels + channel, history, local);
++            noc_async_read_tile((row_tile + 1) * channels + channel, history, local + 2048);
++            noc_async_read_barrier();
++            inputs.reserve_back(4);
++            auto* dst = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(inputs.get_write_ptr());
++            const auto* src = reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(local);
++            for (uint32_t tap = 0; tap < 4; ++tap) {
++                for (uint32_t row = 0; row < 32; ++row) {
++                    const uint32_t source_row = row + tap;
++                    for (uint32_t column = 0; column < 32; column += 2) {
++                        dst[(tap * 1024 + offset(row, column)) / 2] =
++                            src[((source_row / 32) * 1024 + offset(source_row % 32, column)) / 2];
++                    }
++                }
++            }
++            inputs.push_back(4);
++        }
++    }
++}
+diff --git a/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_prefill.cpp b/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_prefill.cpp
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_prefill.cpp
+@@ -0,0 +1,24 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#include <stdint.h>
++#include "api/dataflow/circular_buffer.h"
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++void kernel_main() {
++    constexpr uint32_t channels = get_compile_time_arg_val(0);
++    constexpr uint32_t rows = get_compile_time_arg_val(1);
++    constexpr uint32_t workers = get_compile_time_arg_val(2);
++    const uint32_t worker = get_arg_val<uint32_t>(0);
++    constexpr auto args = TensorAccessorArgs<3>();
++    const auto out = TensorAccessor(args, get_arg_val<uint32_t>(1), 4096);
++    CircularBuffer output(tt::CBIndex::c_3);
++    for (uint32_t channel = worker; channel < channels; channel += workers) {
++        for (uint32_t row = 0; row < rows; ++row) {
++            output.wait_front(1);
++            noc_async_write_tile(row * channels + channel, out, output.get_read_ptr());
++            noc_async_write_barrier();
++            output.pop_front(1);
++        }
++    }
++}
+diff --git a/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_prefill.cpp b/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_prefill.cpp
+--- /dev/null
++++ b/ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_prefill.cpp
+@@ -0,0 +1,49 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#include <stdint.h>
++#include "api/compute/common.h"
++#include "api/compute/compute_kernel_api.h"
++#include "api/compute/eltwise_binary_sfpu.h"
++#include "api/compute/eltwise_unary/eltwise_unary.h"
++#include "api/compute/eltwise_unary/fill.h"
++#include "api/compute/tile_move_copy.h"
++#include "api/dataflow/circular_buffer.h"
++void kernel_main() {
++    constexpr uint32_t channels = get_compile_time_arg_val(0);
++    constexpr uint32_t rows = get_compile_time_arg_val(1);
++    constexpr uint32_t workers = get_compile_time_arg_val(2);
++    const uint32_t worker = get_arg_val<uint32_t>(0);
++    constexpr uint32_t input = tt::CBIndex::c_0, weight = tt::CBIndex::c_1, output = tt::CBIndex::c_3;
++    CircularBuffer inputs(input), weights(weight), outputs(output);
++    init_sfpu(input, output);
++    for (uint32_t channel = worker; channel < channels; channel += workers) {
++        weights.wait_front(4);
++        for (uint32_t row = 0; row < rows; ++row) {
++            inputs.wait_front(4);
++            outputs.reserve_back(1);
++            tile_regs_acquire();
++            fill_tile_init();
++            fill_tile(0, 0.0f);
++            for (uint32_t tap = 0; tap < 4; ++tap) {
++                copy_tile_to_dst_init_short(input);
++                copy_tile(input, tap, 1);
++                copy_tile_to_dst_init_short(weight);
++                copy_tile(weight, tap, 2);
++                mul_binary_tile_init();
++                mul_binary_tile(1, 2, 1);
++                add_binary_tile_init();
++                add_binary_tile(0, 1, 0);
++            }
++            silu_tile_init();
++            silu_tile(0);
++            tile_regs_commit();
++            tile_regs_wait();
++            pack_tile(0, output);
++            tile_regs_release();
++            inputs.pop_front(4);
++            outputs.push_back(1);
++        }
++        weights.pop_front(4);
++    }
++}
