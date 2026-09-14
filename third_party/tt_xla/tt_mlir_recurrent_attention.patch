@@ -417,7 +417,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +    // The deallocation pass releases these copies after the warmup call.
 +    llvm::SmallVector<mlir::Value> warmupArgs(traceCallArgs);
 +    for (size_t i : info.deviceResidentIndices()) {
-+      if (!info.inputArgAttrs[i].contains(ttcore::g_kvCacheAttrName)) {
++      if (!info.inputArgAttrs[i].contains(ttcore::g_recurrentCacheAttrName)) {
 +        continue;
 +      }
 +      auto scratch =
@@ -593,3 +593,162 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +      tiled(pool.getTTNNTensorAndValidate(op->updates()), cache.dtype()));
 +}
 +} // namespace tt::runtime::ttnn::operations::transformer
+diff --git a/include/ttmlir/Dialect/TTCore/IR/Utils.h b/include/ttmlir/Dialect/TTCore/IR/Utils.h
+--- a/include/ttmlir/Dialect/TTCore/IR/Utils.h
++++ b/include/ttmlir/Dialect/TTCore/IR/Utils.h
+@@ -18,6 +18,8 @@
+ namespace mlir::tt::ttcore {
+
+ constexpr inline llvm::StringLiteral g_kvCacheAttrName = "ttcore.kv_cache";
++constexpr inline llvm::StringLiteral g_recurrentCacheAttrName =
++    "ttcore.recurrent_cache";
+
+ constexpr inline llvm::StringLiteral g_originalActivationNamesAttrName =
+     "ttcore.original_activation_names";
+diff --git a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp b/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
+--- a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
++++ b/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
+@@ -8,7 +8,7 @@
+ #include "ttmlir/Dialect/TTIR/Transforms/Passes.h"
+
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+-#include "llvm/ADT/DenseSet.h"
++#include "llvm/ADT/DenseMap.h"
+
+ namespace mlir::tt::ttir {
+ #define GEN_PASS_DEF_TTIRINFERKVCACHEARGUMENTTYPES
+@@ -26,15 +26,18 @@
+     MLIRContext *context = moduleOp.getContext();
+
+     moduleOp.walk([&](func::FuncOp funcOp) {
+-      llvm::DenseSet<BlockArgument> cacheArgs;
++      llvm::DenseMap<BlockArgument, bool> cacheArgs;
+
+       funcOp.walk([&](CacheOpInterface cacheOp) {
+         mlir::Value cacheValue = cacheOp.getCache();
++        bool isRecurrent =
++            mlir::isa<GatedDeltaDecodeOp, CausalConv1dUpdateOp, StatePoolUpdateOp>(
++                cacheOp.getOperation());
+
+         // Direct BlockArgument → CacheOp connection.
+         if (auto blockArg = llvm::dyn_cast<BlockArgument>(cacheValue)) {
+           if (blockArg.getOwner()->getParentOp() == funcOp) {
+-            cacheArgs.insert(blockArg);
++            cacheArgs[blockArg] |= isRecurrent;
+           }
+           return;
+         }
+@@ -47,16 +50,23 @@
+             if (auto blockArg =
+                     llvm::dyn_cast<BlockArgument>(meshShardOp.getInput())) {
+               if (blockArg.getOwner()->getParentOp() == funcOp) {
+-                cacheArgs.insert(blockArg);
++                cacheArgs[blockArg] |= isRecurrent;
+               }
+             }
+           }
+         }
+       });
+
+-      for (auto blockArg : cacheArgs) {
++      for (auto [blockArg, isRecurrent] : cacheArgs) {
+         funcOp.setArgAttr(blockArg.getArgNumber(), ttcore::g_kvCacheAttrName,
+                           mlir::UnitAttr::get(context));
++        // Recurrent updates read the previous state, so trace warmup must use
++        // a private copy. Ordinary attention KV writes need no such copy.
++        if (isRecurrent) {
++          funcOp.setArgAttr(blockArg.getArgNumber(),
++                            ttcore::g_recurrentCacheAttrName,
++                            mlir::UnitAttr::get(context));
++        }
+       }
+     });
+   }
+diff --git a/test/ttmlir/Dialect/TTNN/trace/scenarios/recurrent_cache_warmup.mlir b/test/ttmlir/Dialect/TTNN/trace/scenarios/recurrent_cache_warmup.mlir
+new file mode 100644
+--- /dev/null
++++ b/test/ttmlir/Dialect/TTNN/trace/scenarios/recurrent_cache_warmup.mlir
+@@ -0,0 +1,63 @@
++// RUN: ttmlir-opt --ttir-infer-kv-cache-argument-types %s | FileCheck %s --check-prefix=INFER
++// RUN: ttmlir-opt --ttir-to-ttnn-runtime-pipeline="enable-trace=true" %s | FileCheck %s --check-prefix=TRACE
++
++// Attention caches stay in place during warmup; only mutable recurrent state
++// needs a copy. A pool used by two recurrent ops must still be copied once.
++module {
++  // INFER-LABEL: func.func @mixed(
++  // INFER-SAME: tensor<1x4x64x128xbf16> {ttcore.kv_cache},
++  // INFER-SAME: tensor<4x4x128x128xf32> {ttcore.kv_cache, ttcore.recurrent_cache},
++  // INFER-SAME: tensor<4x3x512xbf16> {ttcore.kv_cache, ttcore.recurrent_cache},
++  // INFER-SAME: tensor<4x4x128x128xf32> {ttcore.kv_cache, ttcore.recurrent_cache},
++  // INFER-SAME: tensor<1x4x1x128xbf16>,
++  // INFER-SAME: tensor<1x1x512xbf16>,
++  // INFER-SAME: tensor<3x512xbf16>,
++  // INFER-SAME: tensor<1x4xbf16>,
++  // INFER-SAME: tensor<4xf32>,
++  // INFER-SAME: tensor<1xi32>,
++  // INFER-SAME: tensor<1xi32>,
++  // INFER-SAME: tensor<1x4x128x128xf32>)
++
++  // TRACE-LABEL: func.func private @run_and_capture_trace_0_mixed(
++  // TRACE-SAME: %[[KV:[^:]+]]: tensor<1x4x64x128xbf16,
++  // TRACE-SAME: %[[GDN:[^:]+]]: tensor<4x4x128x128xf32,
++  // TRACE-SAME: %[[CONV:[^:]+]]: tensor<4x3x512xbf16,
++  // TRACE-SAME: %[[POOL:[^:]+]]: tensor<4x4x128x128xf32,
++  // TRACE-NOT: "ttnn.copy"
++  // TRACE-NOT: "ttnn.empty"
++  // TRACE: %[[GDN_COPY:[^ ]+]] = "ttnn.empty"
++  // TRACE-NEXT: "ttnn.copy"(%[[GDN]], %[[GDN_COPY]])
++  // TRACE-NEXT: %[[CONV_COPY:[^ ]+]] = "ttnn.empty"
++  // TRACE-NEXT: "ttnn.copy"(%[[CONV]], %[[CONV_COPY]])
++  // TRACE-NEXT: %[[POOL_COPY:[^ ]+]] = "ttnn.empty"
++  // TRACE-NEXT: "ttnn.copy"(%[[POOL]], %[[POOL_COPY]])
++  // TRACE-NEXT: call @trace_0_mixed(%[[KV]], %[[GDN_COPY]], %[[CONV_COPY]], %[[POOL_COPY]],
++  // TRACE-NEXT: "ttnn.deallocate"(%[[POOL_COPY]])
++  // TRACE-NEXT: "ttnn.deallocate"(%[[CONV_COPY]])
++  // TRACE-NEXT: "ttnn.deallocate"(%[[GDN_COPY]])
++  // TRACE-NEXT: %[[TRACE:[^ ]+]] = "ttnn.begin_trace_capture"
++  // TRACE-NEXT: call @trace_0_mixed(%[[KV]], %[[GDN]], %[[CONV]], %[[POOL]],
++  // TRACE-NEXT: "ttnn.end_trace_capture"({{.*}}, %[[TRACE]])
++  // TRACE-NEXT: "ttnn.execute_trace"({{.*}}, %[[TRACE]])
++  func.func @mixed(
++      %kv: tensor<1x4x64x128xbf16>,
++      %gdn: tensor<4x4x128x128xf32>,
++      %conv: tensor<4x3x512xbf16>,
++      %pool: tensor<4x4x128x128xf32>,
++      %q: tensor<1x4x1x128xbf16>,
++      %x: tensor<1x1x512xbf16>,
++      %weight: tensor<3x512xbf16>,
++      %logits: tensor<1x4xbf16>,
++      %head_param: tensor<4xf32>,
++      %indices: tensor<1xi32>,
++      %has_state: tensor<1xi32>,
++      %updates: tensor<1x4x128x128xf32>
++  ) -> (tensor<1x4x1x128xbf16>, tensor<1x1x512xbf16>) {
++    "ttir.update_cache"(%kv, %q, %indices) <{batch_offset = 0 : i32}> : (tensor<1x4x64x128xbf16>, tensor<1x4x1x128xbf16>, tensor<1xi32>) -> ()
++    %out = "ttir.gated_delta_decode"(%gdn, %q, %q, %q, %logits, %logits, %head_param, %head_param, %indices, %has_state) : (tensor<4x4x128x128xf32>, tensor<1x4x1x128xbf16>, tensor<1x4x1x128xbf16>, tensor<1x4x1x128xbf16>, tensor<1x4xbf16>, tensor<1x4xbf16>, tensor<4xf32>, tensor<4xf32>, tensor<1xi32>, tensor<1xi32>) -> tensor<1x4x1x128xbf16>
++    %conv_out = "ttir.causal_conv1d_update"(%conv, %x, %weight, %indices, %has_state) : (tensor<4x3x512xbf16>, tensor<1x1x512xbf16>, tensor<3x512xbf16>, tensor<1xi32>, tensor<1xi32>) -> tensor<1x1x512xbf16>
++    "ttir.state_pool_update"(%pool, %indices, %updates) : (tensor<4x4x128x128xf32>, tensor<1xi32>, tensor<1x4x128x128xf32>) -> ()
++    "ttir.state_pool_update"(%gdn, %indices, %updates) : (tensor<4x4x128x128xf32>, tensor<1xi32>, tensor<1x4x128x128xf32>) -> ()
++    return %out, %conv_out : tensor<1x4x1x128xbf16>, tensor<1x1x512xbf16>
++  }
++}
+diff --git a/test/ttmlir/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes/infer_recurrent_cache_argument_types.mlir b/test/ttmlir/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes/infer_recurrent_cache_argument_types.mlir
+new file mode 100644
+--- /dev/null
++++ b/test/ttmlir/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes/infer_recurrent_cache_argument_types.mlir
+@@ -0,0 +1,15 @@
++// RUN: ttmlir-opt --ttir-infer-kv-cache-argument-types %s | FileCheck %s
++
++// Preserve recurrent-cache identification through the same mesh_shard path as
++// ordinary KV caches. Only the mutable pool argument receives the attributes.
++module {
++  // CHECK-LABEL: func.func @sharded_pool(
++  // CHECK-SAME: tensor<8x4x128x128xf32> {ttcore.kv_cache, ttcore.recurrent_cache},
++  // CHECK-SAME: tensor<1xi32>,
++  // CHECK-SAME: tensor<1x4x128x128xf32>)
++  func.func @sharded_pool(%pool: tensor<8x4x128x128xf32>, %indices: tensor<1xi32>, %updates: tensor<1x4x128x128xf32>) {
++    %sharded = "ttir.mesh_shard"(%pool) <{shard_dims = array<i64: -1, 0>, shard_direction = #ttcore.shard_direction<full_to_shard>, shard_shape = array<i64: 2, 1, 1, 1>, shard_type = #ttcore.shard_type<devices>}> : (tensor<8x4x128x128xf32>) -> tensor<4x4x128x128xf32>
++    "ttir.state_pool_update"(%sharded, %indices, %updates) : (tensor<4x4x128x128xf32>, tensor<1xi32>, tensor<1x4x128x128xf32>) -> ()
++    return
++  }
++}
