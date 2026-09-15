@@ -1340,10 +1340,10 @@ index 0000000..ea01b86
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..c453a98d6b2e34121c567fbd7cbdbc9ce2677210
+index 0000000000000000000000000000000000000000..d8d461218ae588c229e8040b2c144d50c086ebf5
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,267 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1410,6 +1410,8 @@ index 0000000000000000000000000000000000000000..c453a98d6b2e34121c567fbd7cbdbc9c
 +    TT_FATAL(query_shape.rank() == 3, "query must have rank 3");
 +    const uint32_t batch_size = query_shape[0];
 +    const uint32_t num_heads = query_shape[1];
++    TT_FATAL(batch_size > 0 && batch_size <= 32, "batch size must be in [1, 32]");
++    TT_FATAL(num_heads > 0, "number of heads must be positive");
 +    validate_tensor(in.query, DataType::FLOAT32, "query");
 +    validate_tensor(in.key, DataType::FLOAT32, "key");
 +    validate_tensor(in.value, DataType::FLOAT32, "value");
