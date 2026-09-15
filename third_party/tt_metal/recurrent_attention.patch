@@ -110,10 +110,10 @@ index 0000000000000000000000000000000000000000..319385ff2c493681ca4984cc19b05cc1
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
 new file mode 100644
-index 0000000..083e87e
+index 0000000..515594e
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,145 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -235,7 +235,7 @@ index 0000000..083e87e
 +        }
 +        noc.async_read_barrier();
 +
-+        // Gather the old state rows before updating the state in place.
++        // Gather each slot's old history before updating its scratch tile and DRAM.
 +        for (uint32_t batch = 0; batch < batch_size; ++batch) {
 +            const uint32_t slot = read_index(indices_scratch.get_write_ptr(), batch);
 +            if (slot == 0) {
@@ -248,24 +248,14 @@ index 0000000..083e87e
 +                    state_address, tap,
 +                    operands_address + 2 * tap * tile_bytes, batch);
 +            }
-+        }
-+        operands_cb.push_back(8);
-+
-+        // All old state values are now in the operands CB, so this core can
-+        // safely update its disjoint channel tile in DRAM.
-+        for (uint32_t batch = 0; batch < batch_size; ++batch) {
-+            const uint32_t slot = read_index(indices_scratch.get_write_ptr(), batch);
-+            if (slot == 0) {
-+                continue;
-+            }
-+            uint32_t state_tile = state_scratch.get_write_ptr() + batch * tile_bytes;
 +            update_state_tile(
-+                state_tile, operands_address + 6 * tile_bytes, batch,
++                state_address, operands_address + 6 * tile_bytes, batch,
 +                read_flag(flags_scratch.get_write_ptr(), batch));
 +            noc.async_write(
-+                CoreLocalMem<uint32_t>(state_tile), state, tile_bytes, {},
++                CoreLocalMem<uint32_t>(state_address), state, tile_bytes, {},
 +                {.page_id = slot * channel_tiles + channel_tile});
 +        }
++        operands_cb.push_back(8);
 +        noc.async_write_barrier();
 +    }
 +}
