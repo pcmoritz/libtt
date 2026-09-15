@@ -661,3 +661,36 @@ diff --git a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp b/lib/Dia
        }
      });
    }
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
+@@ -65,10 +65,12 @@
+
+   // Returns true if the chain from `value` back through allowed ops terminates
+-  // at a kv_cache-labeled block argument. Does not modify any types.
++  // at a non-recurrent kv_cache argument. Does not modify any types.
+   static bool canPropagateDtype(func::FuncOp funcOp, Value value) {
+     llvm::SmallVector<Value> chain;
+     BlockArgument blockArg = collectChainToRoot(value, chain);
+-    return blockArg && funcOp.getArgAttr(blockArg.getArgNumber(),
+-                                         ttcore::g_kvCacheAttrName);
++    return blockArg &&
++           funcOp.getArgAttr(blockArg.getArgNumber(), ttcore::g_kvCacheAttrName) &&
++           !funcOp.getArgAttr(blockArg.getArgNumber(),
++                             ttcore::g_recurrentCacheAttrName);
+   }
+
+@@ -93,5 +95,5 @@
+   }
+
+-  // Updates all kv_cache block arg types and the function signature to
++  // Updates eligible kv_cache block arg types and the function signature to
+   // targetDtype. Only call this after all cache op paths have been validated.
+   static void convertCacheArgTypes(func::FuncOp funcOp,
+@@ -104,5 +106,5 @@
+     for (auto &arg : funcOp.getBody().getArguments()) {
+       unsigned idx = arg.getArgNumber();
+-      if (!funcOp.getArgAttr(idx, ttcore::g_kvCacheAttrName)) {
++      if (!canPropagateDtype(funcOp, arg)) {
+         continue;
+       }
