@@ -175,64 +175,6 @@ above (before `env`). The profile hold ends when the server exits.
 This affects the whole system and can increase heat and power use; it does
 not lock CPU frequency or prevent thermal throttling.
 
-### Qwen3.5-9B
-
-This requires the Qwen3.5 model and TT GDN backend in SGLang-JAX (the older
-PR #1527 checkout above does not include them). With that checkout and this
-plugin wheel, use the same setup and server command, changing these options:
-
-```bash
---model-path Qwen/Qwen3.5-9B \
---max-running-requests 4 \
---max-prefill-tokens 256 \
---chunked-prefill-size 256 \
---max-recurrent-state-size 4
-```
-
-This path supports text generation on one device, tested with up to four active
-requests. Prefill processes one request at a time; decoding batches active requests.
-Keep mixed prefill/decode disabled (do not pass `--enable-mixed-chunk`).
-Keep `--dtype bfloat16`, `--disable-radix-cache`, and
-`--disable-overlap-schedule`. Recurrent state stays FP32; do not override
-`SGLANG_JAX_RECURRENT_STATE_DTYPE` or `SGLANG_JAX_CONV_STATE_DTYPE`.
-
-The adapter calls TTNN's chunked Gated DeltaNet kernel for prefill and fused
-causal-convolution/recurrent-update kernels for decode. State slots belong to
-SGLang-JAX's scheduler and use the same in-place cache interface as paged
-attention. Fresh requests read the pool's reserved zero slot; existing requests
-continue from their saved state. Decode normalizes Q/K together and reads packed
-head vectors directly, avoiding per-head padding conversions. Only matrix weights
-use BF8 (`bfp_bf8`); activations remain BF16, while recurrent
-state and recurrent Q/K normalization stay FP32. Constant weight transposes are prepared
-once, and the compiler recognizes Gemma-style RMS normalization in ordinary JAX
-and uses TTNN's fused kernel with FP32 accumulation. Warm up each prompt-length
-bucket before measuring performance, as for Qwen3 above.
-
-On a P150 with firmware 19.13.1, the five-token prompt above and 128 generated
-tokens measured the following after two warmup rounds (BF8 weights, 1024-token
-cache, 256-token prefill chunks, greedy sampling with `ignore_eos=true`):
-
-| Concurrent requests | Aggregate decode tokens/s | Time to first token (s) | Request latency (s) |
-| --- | ---: | ---: | ---: |
-| 1 | 26.33 | 0.698 | 5.53 |
-| 4 | 90.49 | 1.020 | 6.96 |
-
-Values are medians over eight single-request rounds and five four-request rounds,
-using the same server with four state slots. Aggregate decode throughput counts
-tokens after all requests have received their first token. Including prefill,
-output throughput was 23.2 and 73.5 tokens/s, respectively.
-
-Multimodal input and recurrent prefix-cache snapshots are not supported by this
-backend yet.
-
-A fixed 200-question, five-shot `sglang_mmlu` sample scored 58% with BF16
-weights, 61% with BF8 weights alone, and 59.5% with BF8 plus native normalization.
-This used greedy raw completion (one answer token, no chat/thinking template)
-and a 4096-token cache. Native normalization changed five answers relative to
-BF8 alone: four regressions and one improvement. This is a limited regression
-check, not a full MMLU result or proof of accuracy parity; a larger accuracy
-evaluation is warranted before relying on the normalization speedup.
-
 ### Run MMLU
 
 Leave the server running and use the evaluator included in the PR checkout.
