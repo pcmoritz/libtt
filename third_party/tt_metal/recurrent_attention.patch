@@ -110,10 +110,10 @@ index 0000000000000000000000000000000000000000..319385ff2c493681ca4984cc19b05cc1
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
 new file mode 100644
-index 0000000..515594e
+index 0000000..ddbdb90
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,143 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -141,8 +141,7 @@ index 0000000..515594e
 +}
 +
 +FORCE_INLINE void update_state_tile(
-+    uint32_t state_address, uint32_t input_address, uint32_t batch,
-+    bool has_initial_state) {
++    uint32_t state_address, uint32_t input_address, uint32_t batch) {
 +    volatile tt_l1_ptr uint16_t* state =
 +        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(state_address);
 +    const volatile tt_l1_ptr uint16_t* input =
@@ -150,8 +149,8 @@ index 0000000..515594e
 +    for (uint32_t channel = 0; channel < 32; ++channel) {
 +        const uint32_t old1 = tile_offset(channel, 1);
 +        const uint32_t old2 = tile_offset(channel, 2);
-+        state[tile_offset(channel, 0)] = has_initial_state ? state[old1] : 0;
-+        state[tile_offset(channel, 1)] = has_initial_state ? state[old2] : 0;
++        state[tile_offset(channel, 0)] = state[old1];
++        state[tile_offset(channel, 1)] = state[old2];
 +        state[tile_offset(channel, 2)] = input[tile_offset(batch, channel)];
 +    }
 +}
@@ -249,8 +248,7 @@ index 0000000..515594e
 +                    operands_address + 2 * tap * tile_bytes, batch);
 +            }
 +            update_state_tile(
-+                state_address, operands_address + 6 * tile_bytes, batch,
-+                read_flag(flags_scratch.get_write_ptr(), batch));
++                state_address, operands_address + 6 * tile_bytes, batch);
 +            noc.async_write(
 +                CoreLocalMem<uint32_t>(state_address), state, tile_bytes, {},
 +                {.page_id = slot * channel_tiles + channel_tile});
@@ -1340,10 +1338,10 @@ index 0000000..ea01b86
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..d8d461218ae588c229e8040b2c144d50c086ebf5
+index 0000000000000000000000000000000000000000..e238c85cdffca0d375748ff8664f707e3da07505
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,262 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1376,7 +1374,6 @@ index 0000000000000000000000000000000000000000..d8d461218ae588c229e8040b2c144d50
 +    Tensor a_log;
 +    Tensor dt_bias;
 +    Tensor state;
-+    Tensor output;
 +    Tensor state_indices;
 +    Tensor has_initial_state;
 +};
@@ -1420,7 +1417,6 @@ index 0000000000000000000000000000000000000000..d8d461218ae588c229e8040b2c144d50
 +    validate_tensor(in.a_log, DataType::FLOAT32, "A log");
 +    validate_tensor(in.dt_bias, DataType::FLOAT32, "delta-time bias");
 +    validate_tensor(in.state, DataType::FLOAT32, "state");
-+    validate_tensor(in.output, DataType::FLOAT32, "output");
 +    validate_tensor(in.state_indices, DataType::INT32, "state indices");
 +    validate_tensor(in.has_initial_state, DataType::BFLOAT16, "initial-state mask");
 +
@@ -1438,19 +1434,18 @@ index 0000000000000000000000000000000000000000..d8d461218ae588c229e8040b2c144d50
 +            state_shape[1] == num_heads && state_shape[2] == dim &&
 +            state_shape[3] == dim,
 +        "state shape mismatch");
-+    check_shape(in.output, {batch_size, num_heads, dim}, "output");
 +    check_shape(in.state_indices, {batch_size}, "state indices");
 +    check_shape(in.has_initial_state, {batch_size}, "initial-state mask");
 +}
 +
 +DecodeOperation::spec_return_value_t DecodeOperation::compute_output_specs(
 +    const operation_attributes_t&, const tensor_args_t& in) {
-+    return in.output.tensor_spec();
++    return in.query.tensor_spec();
 +}
 +
 +DecodeOperation::tensor_return_value_t DecodeOperation::create_output_tensors(
 +    const operation_attributes_t&, const tensor_args_t& in) {
-+    return in.output;
++    return create_device_tensor(in.query.tensor_spec(), in.query.device());
 +}
 +
 +ProgramDescriptor DecodeOperation::create_descriptor(
@@ -1591,7 +1586,6 @@ index 0000000000000000000000000000000000000000..d8d461218ae588c229e8040b2c144d50
 +    const Tensor& a_log,
 +    const Tensor& dt_bias,
 +    const Tensor& state,
-+    const Tensor& output,
 +    const Tensor& state_indices,
 +    const Tensor& has_initial_state) {
 +    using Op = prim::DecodeOperation;
@@ -1605,7 +1599,6 @@ index 0000000000000000000000000000000000000000..d8d461218ae588c229e8040b2c144d50
 +         .a_log = a_log,
 +         .dt_bias = dt_bias,
 +         .state = state,
-+         .output = output,
 +         .state_indices = state_indices,
 +         .has_initial_state = has_initial_state});
 +}
@@ -1613,10 +1606,10 @@ index 0000000000000000000000000000000000000000..d8d461218ae588c229e8040b2c144d50
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp
 new file mode 100644
-index 0000000..b3ec3b5
+index 0000000..b14e1cd
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,29 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1642,7 +1635,6 @@ index 0000000..b3ec3b5
 +    const Tensor& a_log,
 +    const Tensor& dt_bias,
 +    const Tensor& state,
-+    const Tensor& output,
 +    const Tensor& state_indices,
 +    const Tensor& has_initial_state);
 +
