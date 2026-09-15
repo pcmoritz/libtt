@@ -336,7 +336,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..1339b00e5302452c98f5f9fafdbd8929423f5ee4
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,244 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -351,7 +351,6 @@ index 0000000000000000000000000000000000000000..1339b00e5302452c98f5f9fafdbd8929
 +#include <tt-metalium/work_split.hpp>
 +#include "ttnn/device.hpp"
 +#include "ttnn/device_operation.hpp"
-+#include "ttnn/operation.hpp"
 +#include "ttnn/tensor/tensor_ops.hpp"
 +
 +using namespace tt::tt_metal;
@@ -399,15 +398,9 @@ index 0000000000000000000000000000000000000000..1339b00e5302452c98f5f9fafdbd8929
 +
 +    static void validate_on_program_cache_miss(
 +        const operation_attributes_t&, const tensor_args_t&);
-+    static void validate_on_program_cache_hit(
-+        const operation_attributes_t& attrs, const tensor_args_t& inputs) {
-+        validate_on_program_cache_miss(attrs, inputs);
-+    }
 +    static spec_return_value_t compute_output_specs(
 +        const operation_attributes_t&, const tensor_args_t&);
 +    static tensor_return_value_t create_output_tensors(
-+        const operation_attributes_t&, const tensor_args_t&);
-+    static ttsl::hash::hash_t compute_program_hash(
 +        const operation_attributes_t&, const tensor_args_t&);
 +};
 +
@@ -458,13 +451,6 @@ index 0000000000000000000000000000000000000000..1339b00e5302452c98f5f9fafdbd8929
 +ConvOperation::tensor_return_value_t ConvOperation::create_output_tensors(
 +    const operation_attributes_t&, const tensor_args_t& in) {
 +    return create_device_tensor(in.input.tensor_spec(), in.input.device());
-+}
-+
-+ttsl::hash::hash_t ConvOperation::compute_program_hash(
-+    const operation_attributes_t&, const tensor_args_t& in) {
-+    return operation::hash_operation<ConvOperation>(
-+        in.input, in.state, in.weight, in.state_indices,
-+        in.has_initial_state);
 +}
 +
 +ConvProgramFactory::cached_program_t ConvProgramFactory::create(
@@ -696,7 +682,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..ae8948e4a9be12a90db81cb3d9f746c68be6f167
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,204 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -710,7 +696,6 @@ index 0000000000000000000000000000000000000000..ae8948e4a9be12a90db81cb3d9f746c6
 +#include <tt-metalium/work_split.hpp>
 +#include "ttnn/device.hpp"
 +#include "ttnn/device_operation.hpp"
-+#include "ttnn/operation.hpp"
 +
 +using namespace tt::tt_metal;
 +
@@ -755,10 +740,6 @@ index 0000000000000000000000000000000000000000..ae8948e4a9be12a90db81cb3d9f746c6
 +
 +    static void validate_on_program_cache_miss(
 +        const operation_attributes_t&, const tensor_args_t&);
-+    static void validate_on_program_cache_hit(
-+        const operation_attributes_t& attrs, const tensor_args_t& inputs) {
-+        validate_on_program_cache_miss(attrs, inputs);
-+    }
 +    static spec_return_value_t compute_output_specs(
 +        const operation_attributes_t&, const tensor_args_t& inputs) {
 +        return inputs.state_pool.tensor_spec();
@@ -767,8 +748,6 @@ index 0000000000000000000000000000000000000000..ae8948e4a9be12a90db81cb3d9f746c6
 +        const operation_attributes_t&, const tensor_args_t& inputs) {
 +        return inputs.state_pool;
 +    }
-+    static ttsl::hash::hash_t compute_program_hash(
-+        const operation_attributes_t&, const tensor_args_t&);
 +};
 +
 +void validate_tensor(const Tensor& tensor, const char* name) {
@@ -812,12 +791,6 @@ index 0000000000000000000000000000000000000000..ae8948e4a9be12a90db81cb3d9f746c6
 +            inputs.state_pool.buffer()->num_pages() / pool_shape[0] ==
 +                inputs.updates.buffer()->num_pages() / update_shape[0],
 +        "state pool and update slices must have the same page count");
-+}
-+
-+ttsl::hash::hash_t StatePoolUpdateOperation::compute_program_hash(
-+    const operation_attributes_t&, const tensor_args_t& inputs) {
-+    return operation::hash_operation<StatePoolUpdateOperation>(
-+        inputs.state_pool, inputs.state_indices, inputs.updates);
 +}
 +
 +StatePoolUpdateProgramFactory::cached_program_t
@@ -1464,7 +1437,7 @@ new file mode 100644
 index 0000000..a66c6e2
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,316 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1479,7 +1452,6 @@ index 0000000..a66c6e2
 +#include <tt-metalium/work_split.hpp>
 +#include "ttnn/device.hpp"
 +#include "ttnn/device_operation.hpp"
-+#include "ttnn/operation.hpp"
 +#include "ttnn/tensor/tensor_ops.hpp"
 +
 +using namespace tt::tt_metal;
@@ -1531,12 +1503,8 @@ index 0000000..a66c6e2
 +    using program_factory_t = std::variant<DecodeProgramFactory>;
 +
 +    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
-+    static void validate_on_program_cache_hit(const operation_attributes_t& attrs, const tensor_args_t& inputs) {
-+        validate_on_program_cache_miss(attrs, inputs);
-+    }
 +    static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
 +    static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
-+    static ttsl::hash::hash_t compute_program_hash(const operation_attributes_t&, const tensor_args_t&);
 +};
 +
 +void validate_tensor(const Tensor& tensor, DataType dtype, const char* name) {
@@ -1594,14 +1562,6 @@ index 0000000..a66c6e2
 +DecodeOperation::tensor_return_value_t DecodeOperation::create_output_tensors(
 +    const operation_attributes_t&, const tensor_args_t& in) {
 +    return in.output;
-+}
-+
-+ttsl::hash::hash_t DecodeOperation::compute_program_hash(
-+    const operation_attributes_t&, const tensor_args_t& in) {
-+    return operation::hash_operation<DecodeOperation>(
-+        in.query, in.key, in.value, in.beta_logits, in.delta_time, in.a_log,
-+        in.dt_bias, in.state, in.output, in.state_indices,
-+        in.has_initial_state);
 +}
 +
 +DecodeProgramFactory::cached_program_t DecodeProgramFactory::create(
