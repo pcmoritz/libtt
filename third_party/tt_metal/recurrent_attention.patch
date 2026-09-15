@@ -1,9 +1,9 @@
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp
 new file mode 100644
-index 0000000..b2f3a19
+index 0000000..febb3dd
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,34 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -12,8 +12,6 @@ index 0000000..b2f3a19
 +#include <stdint.h>
 +
 +#include "api/dataflow/dataflow_api.h"
-+
-+constexpr uint32_t tile_elements = 1024;
 +
 +FORCE_INLINE uint32_t tile_offset(uint32_t row, uint32_t column) {
 +    const uint32_t face = (row / 16) * 2 + column / 16;
@@ -40,13 +38,6 @@ index 0000000..b2f3a19
 +    return read_bfloat16_tile(address, 0, batch);
 +}
 +
-+template <typename T>
-+FORCE_INLINE void zero_tiles(uint32_t address, uint32_t tiles) {
-+    volatile tt_l1_ptr T* data = reinterpret_cast<volatile tt_l1_ptr T*>(address);
-+    for (uint32_t i = 0; i < tiles * tile_elements; ++i) {
-+        data[i] = 0;
-+    }
-+}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..319385ff2c493681ca4984cc19b05cc1f978d069
@@ -110,10 +101,10 @@ index 0000000000000000000000000000000000000000..319385ff2c493681ca4984cc19b05cc1
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
 new file mode 100644
-index 0000000..ddbdb90
+index 0000000..41607f4
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,145 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -199,7 +190,8 @@ index 0000000..ddbdb90
 +         channel_tile += num_workers) {
 +        operands_cb.reserve_back(8);
 +        const uint32_t operands_address = operands_cb.get_write_ptr();
-+        zero_tiles<uint16_t>(operands_address, 8);
++        noc.async_write_zeros(operands_cb, 8 * tile_bytes);
++        noc.write_zeros_l1_barrier();
 +
 +        // x already has the desired [batch, channel] tile orientation.
 +        noc.async_read(
@@ -228,11 +220,12 @@ index 0000000..ddbdb90
 +                    {.page_id = slot * channel_tiles + channel_tile},
 +                    {.offset_bytes = batch * tile_bytes});
 +            } else {
-+                zero_tiles<uint16_t>(
-+                    state_scratch.get_write_ptr() + batch * tile_bytes, 1);
++                noc.async_write_zeros(
++                    state_scratch, tile_bytes, {.offset_bytes = batch * tile_bytes});
 +            }
 +        }
 +        noc.async_read_barrier();
++        noc.write_zeros_l1_barrier();
 +
 +        // Gather each slot's old history before updating its scratch tile and DRAM.
 +        for (uint32_t batch = 0; batch < batch_size; ++batch) {
@@ -1012,10 +1005,10 @@ index 0000000..04e8ee4
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
 new file mode 100644
-index 0000000..d8111bf
+index 0000000..6440e3d
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,201 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1035,7 +1028,8 @@ index 0000000..d8111bf
 +    Noc& noc, const Accessor& input, CircularBuffer& cb,
 +    uint32_t page, uint32_t row, uint32_t tiles) {
 +    cb.reserve_back(tiles);
-+    zero_tiles<uint32_t>(cb.get_write_ptr(), tiles);
++    noc.async_write_zeros(cb, tiles * 4096);
++    noc.write_zeros_l1_barrier();
 +    for (uint32_t tile = 0; tile < tiles; ++tile) {
 +        for (uint32_t face = 0; face < 2; ++face) {
 +            noc.async_read(
@@ -1047,10 +1041,13 @@ index 0000000..d8111bf
 +    }
 +}
 +
-+FORCE_INLINE void make_scalar_tile(uint32_t address, uint32_t row, uint32_t column) {
++FORCE_INLINE void make_scalar_tile(
++    Noc& noc, CircularBuffer& cb, uint32_t row, uint32_t column) {
++    const uint32_t address = cb.get_write_ptr();
 +    volatile tt_l1_ptr uint32_t* tile = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(address);
 +    const uint32_t element = read_int32_tile(address, row, column);
-+    zero_tiles<uint32_t>(address, 1);
++    noc.async_write_zeros(cb, 4096);
++    noc.write_zeros_l1_barrier();
 +    tile[0] = element;
 +    tile[256] = element;
 +    tile[512] = element;
@@ -1061,7 +1058,6 @@ index 0000000..d8111bf
 +    volatile tt_l1_ptr uint32_t* source = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(source_address);
 +    volatile tt_l1_ptr uint32_t* destination =
 +        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(destination_address);
-+    zero_tiles<uint32_t>(destination_address, 1);
 +    for (uint32_t i = 0; i < 16; ++i) {
 +        destination[i * 16] = source[i];
 +        destination[512 + i * 16] = source[256 + i];
@@ -1166,6 +1162,8 @@ index 0000000..d8111bf
 +                    {.offset_bytes = local_tile * tile_bytes});
 +            }
 +        }
++    } else {
++        noc.async_write_zeros(state_cb, state_tiles * tile_bytes);
 +    }
 +
 +    const uint32_t head_tile = batch * ((num_heads + 31) / 32) + head / 32;
@@ -1189,11 +1187,9 @@ index 0000000..d8111bf
 +    noc.async_read(a_log, a_log_cb, tile_bytes, {.page_id = head / 32}, {.offset_bytes = 0});
 +    dt_bias_cb.reserve_back(1);
 +    noc.async_read(dt_bias, dt_bias_cb, tile_bytes, {.page_id = head / 32}, {.offset_bytes = 0});
++    noc.async_write_zeros(key_transposed_cb, kt * tile_bytes);
 +    noc.async_read_barrier();
-+
-+    if (!has_state) {
-+        zero_tiles<uint32_t>(state_cb.get_write_ptr(), state_tiles);
-+    }
++    noc.write_zeros_l1_barrier();
 +    state_cb.push_back(state_tiles);
 +    query_cb.push_back(kt);
 +    for (uint32_t tile = 0; tile < kt; ++tile) {
@@ -1204,13 +1200,13 @@ index 0000000..d8111bf
 +    key_cb.push_back(kt);
 +    key_transposed_cb.push_back(kt);
 +    value_cb.push_back(vt);
-+    make_scalar_tile(beta_logits_cb.get_write_ptr(), scalar_row, scalar_column);
++    make_scalar_tile(noc, beta_logits_cb, scalar_row, scalar_column);
 +    beta_logits_cb.push_back(1);
-+    make_scalar_tile(delta_time_cb.get_write_ptr(), scalar_row, scalar_column);
++    make_scalar_tile(noc, delta_time_cb, scalar_row, scalar_column);
 +    delta_time_cb.push_back(1);
-+    make_scalar_tile(a_log_cb.get_write_ptr(), 0, scalar_column);
++    make_scalar_tile(noc, a_log_cb, 0, scalar_column);
 +    a_log_cb.push_back(1);
-+    make_scalar_tile(dt_bias_cb.get_write_ptr(), 0, scalar_column);
++    make_scalar_tile(noc, dt_bias_cb, 0, scalar_column);
 +    dt_bias_cb.push_back(1);
 +    }
 +}
