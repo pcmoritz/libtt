@@ -1050,10 +1050,10 @@ index 0000000..cb96300
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
 new file mode 100644
-index 0000000..7edaa47
+index 0000000..d8111bf
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,198 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1178,8 +1178,6 @@ index 0000000..7edaa47
 +    noc.async_read(has_initial_state, has_initial_state_cb, flag_tile_bytes,
 +                   {.page_id = 0}, {.offset_bytes = 0});
 +    noc.async_read_barrier();
-+    state_indices_cb.push_back(1);
-+    has_initial_state_cb.push_back(1);
 +
 +    for (uint32_t work = worker; work < batch_size * num_heads * workers_per_head; work += num_workers) {
 +    const uint32_t head_work = work / workers_per_head;
@@ -1188,9 +1186,9 @@ index 0000000..7edaa47
 +    const uint32_t head = head_work % num_heads;
 +
 +    const uint32_t state_slot =
-+        read_index(state_indices_cb.get_read_ptr(), batch);
++        read_index(state_indices_cb.get_write_ptr(), batch);
 +    const bool has_state =
-+        read_flag(has_initial_state_cb.get_read_ptr(), batch);
++        read_flag(has_initial_state_cb.get_write_ptr(), batch);
 +
 +    const uint32_t state_base = (state_slot * num_heads + head) * kt * full_vt;
 +    state_cb.reserve_back(state_tiles);
@@ -1253,15 +1251,13 @@ index 0000000..7edaa47
 +    make_scalar_tile(dt_bias_cb.get_write_ptr(), 0, scalar_column);
 +    dt_bias_cb.push_back(1);
 +    }
-+    state_indices_cb.pop_front(1);
-+    has_initial_state_cb.pop_front(1);
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp
 new file mode 100644
-index 0000000..bbf9697
+index 0000000..1bda2ea
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,85 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1270,6 +1266,7 @@ index 0000000..bbf9697
 +#include "api/dataflow/circular_buffer.h"
 +#include "api/dataflow/dataflow_api.h"
 +#include "api/dataflow/noc.h"
++#include "recurrent_utils.hpp"
 +
 +void kernel_main() {
 +    constexpr uint32_t kt = get_compile_time_arg_val(0);
@@ -1303,6 +1300,13 @@ index 0000000..bbf9697
 +    CircularBuffer state_indices_cb(tt::CBIndex::c_29);
 +    Noc noc;
 +
++    // Metadata is shared by every head handled by this core.
++    state_indices_cb.reserve_back(1);
++    noc.async_read(
++        state_indices, state_indices_cb, 4096,
++        {.page_id = 0}, {.offset_bytes = 0});
++    noc.async_read_barrier();
++
 +    for (uint32_t work = worker; work < batch_size * num_heads * workers_per_head; work += num_workers) {
 +        const uint32_t head_work = work / workers_per_head;
 +        const uint32_t column_start = (work % workers_per_head) * vt;
@@ -1311,19 +1315,8 @@ index 0000000..bbf9697
 +        const uint32_t vector_base =
 +            (batch * num_heads + head) * full_vt + column_start;
 +
-+        state_indices_cb.reserve_back(1);
-+        noc.async_read(
-+            state_indices, state_indices_cb, 4096,
-+            {.page_id = 0}, {.offset_bytes = 0});
-+        noc.async_read_barrier();
-+        const volatile tt_l1_ptr uint32_t* index_tile =
-+            reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(
-+                state_indices_cb.get_write_ptr());
-+        const uint32_t index_offset =
-+            (batch / 16) * 256 + batch % 16;
-+        const uint32_t state_slot = index_tile[index_offset];
-+        state_indices_cb.push_back(1);
-+        state_indices_cb.pop_front(1);
++        const uint32_t state_slot =
++            read_index(state_indices_cb.get_write_ptr(), batch);
 +
 +        const uint32_t state_base =
 +            (state_slot * num_heads + head) * kt * full_vt;
