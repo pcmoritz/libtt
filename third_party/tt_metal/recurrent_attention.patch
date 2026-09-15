@@ -1005,10 +1005,10 @@ index 0000000..04e8ee4
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
 new file mode 100644
-index 0000000..6440e3d
+index 0000000..50ac022
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,209 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1039,6 +1039,18 @@ index 0000000..6440e3d
 +                {.offset_bytes = tile * 4096 + face * 1024});
 +        }
 +    }
++}
++
++// Read the aligned half-row containing the scalar, preserving its tile offset.
++template <typename Accessor>
++FORCE_INLINE void read_scalar(
++    Noc& noc, const Accessor& input, CircularBuffer& cb,
++    uint32_t page, uint32_t row, uint32_t column) {
++    const uint32_t offset = tile_offset(row, (column / 16) * 16) * sizeof(uint32_t);
++    cb.reserve_back(1);
++    noc.async_read(
++        input, cb, 16 * sizeof(uint32_t),
++        {.page_id = page, .offset_bytes = offset}, {.offset_bytes = offset});
 +}
 +
 +FORCE_INLINE void make_scalar_tile(
@@ -1179,14 +1191,10 @@ index 0000000..6440e3d
 +        (batch / 32) * ((num_heads + 31) / 32) + head / 32;
 +    const uint32_t scalar_row = batch % 32;
 +    const uint32_t scalar_column = head % 32;
-+    beta_logits_cb.reserve_back(1);
-+    noc.async_read(beta_logits, beta_logits_cb, tile_bytes, {.page_id = scalar_page}, {.offset_bytes = 0});
-+    delta_time_cb.reserve_back(1);
-+    noc.async_read(delta_time, delta_time_cb, tile_bytes, {.page_id = scalar_page}, {.offset_bytes = 0});
-+    a_log_cb.reserve_back(1);
-+    noc.async_read(a_log, a_log_cb, tile_bytes, {.page_id = head / 32}, {.offset_bytes = 0});
-+    dt_bias_cb.reserve_back(1);
-+    noc.async_read(dt_bias, dt_bias_cb, tile_bytes, {.page_id = head / 32}, {.offset_bytes = 0});
++    read_scalar(noc, beta_logits, beta_logits_cb, scalar_page, scalar_row, scalar_column);
++    read_scalar(noc, delta_time, delta_time_cb, scalar_page, scalar_row, scalar_column);
++    read_scalar(noc, a_log, a_log_cb, head / 32, 0, scalar_column);
++    read_scalar(noc, dt_bias, dt_bias_cb, head / 32, 0, scalar_column);
 +    noc.async_write_zeros(key_transposed_cb, kt * tile_bytes);
 +    noc.async_read_barrier();
 +    noc.write_zeros_l1_barrier();
