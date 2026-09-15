@@ -333,20 +333,20 @@ index 0000000000000000000000000000000000000000..fdc2b2c7240e8faf4275793f5f8f55c8
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..1339b00e5302452c98f5f9fafdbd8929423f5ee4
+index 0000000000000000000000000000000000000000..bd5a7a3a140089f7538718670adf89e2398801a1
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,203 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#include "ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp"
 +
 +#include <algorithm>
-+#include <variant>
++#include <utility>
 +
 +#include <tt-metalium/buffer.hpp>
-+#include <tt-metalium/host_api.hpp>
++#include <tt-metalium/program_descriptors.hpp>
 +#include <tt-metalium/tensor_accessor_args.hpp>
 +#include <tt-metalium/work_split.hpp>
 +#include "ttnn/device.hpp"
@@ -368,34 +368,14 @@ index 0000000000000000000000000000000000000000..1339b00e5302452c98f5f9fafdbd8929
 +    Tensor has_initial_state;
 +};
 +
-+struct ConvSharedVariables {
-+    KernelHandle reader_kernel_id;
-+    KernelHandle writer_kernel_id;
-+    uint32_t grid_y;
-+    uint32_t num_workers;
-+};
-+
-+struct ConvProgramFactory {
-+    using shared_variables_t = ConvSharedVariables;
-+    using cached_program_t = device_operation::CachedProgram<shared_variables_t>;
-+    using operation_attributes_t = ConvParams;
-+    using tensor_args_t = ConvInputs;
-+    using tensor_return_value_t = Tensor;
-+
-+    static cached_program_t create(
-+        const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
-+    static void override_runtime_arguments(
-+        cached_program_t&, const operation_attributes_t&, const tensor_args_t&,
-+        tensor_return_value_t&);
-+};
-+
 +struct ConvOperation {
 +    using operation_attributes_t = ConvParams;
 +    using tensor_args_t = ConvInputs;
 +    using spec_return_value_t = TensorSpec;
 +    using tensor_return_value_t = Tensor;
-+    using program_factory_t = std::variant<ConvProgramFactory>;
 +
++    static ProgramDescriptor create_descriptor(
++        const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
 +    static void validate_on_program_cache_miss(
 +        const operation_attributes_t&, const tensor_args_t&);
 +    static spec_return_value_t compute_output_specs(
@@ -453,13 +433,13 @@ index 0000000000000000000000000000000000000000..1339b00e5302452c98f5f9fafdbd8929
 +    return create_device_tensor(in.input.tensor_spec(), in.input.device());
 +}
 +
-+ConvProgramFactory::cached_program_t ConvProgramFactory::create(
++ProgramDescriptor ConvOperation::create_descriptor(
 +    const operation_attributes_t&, const tensor_args_t& in,
 +    tensor_return_value_t& outputs) {
 +    const uint32_t batch_size = in.input.logical_shape()[0];
 +    const uint32_t channels = in.input.logical_shape()[1];
 +    const uint32_t channel_tiles = channels / 32;
-+    Program program;
++    ProgramDescriptor program;
 +
 +    auto* device = in.input.device();
 +    const CoreCoord grid = device->compute_with_storage_grid_size();
@@ -469,9 +449,12 @@ index 0000000000000000000000000000000000000000..1339b00e5302452c98f5f9fafdbd8929
 +
 +    auto make_cb = [&](uint32_t index, uint32_t tiles, tt::DataFormat format) {
 +        const uint32_t page_size = tt::tile_size(format);
-+        CircularBufferConfig config(tiles * page_size, {{index, format}});
-+        config.set_page_size(index, page_size);
-+        CreateCircularBuffer(program, cores, config);
++        program.cbs.push_back(CBDescriptor{
++            .total_size = tiles * page_size,
++            .core_ranges = cores,
++            .format_descriptors = {{
++                .buffer_index = static_cast<uint8_t>(index),
++                .data_format = format, .page_size = page_size}}});
 +    };
 +    make_cb(0, 8, tt::DataFormat::Float16_b);  // compute operands
 +    make_cb(1, batch_size, tt::DataFormat::Float16_b);  // reader state scratch
@@ -495,68 +478,44 @@ index 0000000000000000000000000000000000000000..1339b00e5302452c98f5f9fafdbd8929
 +
 +    const std::string kernel_dir =
 +        "ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/";
-+    auto reader = CreateKernel(
-+        program, kernel_dir + "dataflow/reader_causal_conv1d_update.cpp",
-+        cores,
-+        DataMovementConfig{
++    KernelDescriptor reader{
++        .kernel_source = kernel_dir + "dataflow/reader_causal_conv1d_update.cpp",
++        .core_ranges = cores,
++        .compile_time_args = reader_args,
++        .config = DataMovementConfigDescriptor{
 +            .processor = DataMovementProcessor::RISCV_1,
-+            .noc = NOC::RISCV_1_default,
-+            .compile_args = reader_args});
-+    auto writer = CreateKernel(
-+        program, kernel_dir + "dataflow/writer_causal_conv1d_update.cpp",
-+        cores,
-+        DataMovementConfig{
++            .noc = NOC::RISCV_1_default}};
++    KernelDescriptor writer{
++        .kernel_source = kernel_dir + "dataflow/writer_causal_conv1d_update.cpp",
++        .core_ranges = cores,
++        .compile_time_args = writer_args,
++        .config = DataMovementConfigDescriptor{
 +            .processor = DataMovementProcessor::RISCV_0,
-+            .noc = NOC::RISCV_0_default,
-+            .compile_args = writer_args});
-+    auto compute = CreateKernel(
-+        program, kernel_dir + "compute/causal_conv1d_update.cpp", cores,
-+        ComputeConfig{
++            .noc = NOC::RISCV_0_default}};
++    KernelDescriptor compute{
++        .kernel_source = kernel_dir + "compute/causal_conv1d_update.cpp",
++        .core_ranges = cores,
++        .compile_time_args = {channel_tiles, num_workers},
++        .config = ComputeConfigDescriptor{
 +            .math_fidelity = tt::tt_metal::MathFidelity::HiFi2,
 +            .fp32_dest_acc_en = false,
-+            .math_approx_mode = false,
-+            .compile_args = {channel_tiles, num_workers}});
++            .math_approx_mode = false}};
 +
 +    for (uint32_t worker = 0; worker < num_workers; ++worker) {
 +        const CoreCoord core{worker / grid.y, worker % grid.y};
-+        SetRuntimeArgs(
-+            program, reader, core,
-+            {worker, in.input.buffer()->address(), in.state.buffer()->address(),
-+             in.weight.buffer()->address(), in.state_indices.buffer()->address(),
-+             in.has_initial_state.buffer()->address()});
-+        SetRuntimeArgs(
-+            program, writer, core,
-+            {worker, outputs.buffer()->address()});
-+        SetRuntimeArgs(program, compute, core, {worker});
++        reader.emplace_runtime_args(
++            core,
++            {worker, in.input.buffer(), in.state.buffer(),
++             in.weight.buffer(), in.state_indices.buffer(),
++             in.has_initial_state.buffer()});
++        writer.emplace_runtime_args(core, {worker, outputs.buffer()});
++        compute.emplace_runtime_args(core, {worker});
 +    }
 +
-+    return cached_program_t{
-+        std::move(program),
-+        {.reader_kernel_id = reader,
-+         .writer_kernel_id = writer,
-+         .grid_y = static_cast<uint32_t>(grid.y),
-+         .num_workers = num_workers}};
-+}
-+
-+void ConvProgramFactory::override_runtime_arguments(
-+    cached_program_t& cached, const operation_attributes_t&,
-+    const tensor_args_t& in, tensor_return_value_t& outputs) {
-+    for (uint32_t worker = 0; worker < cached.shared_variables.num_workers;
-+         ++worker) {
-+        CoreCoord core{
-+            worker / cached.shared_variables.grid_y,
-+            worker % cached.shared_variables.grid_y};
-+        auto& reader_args = GetRuntimeArgs(
-+            cached.program, cached.shared_variables.reader_kernel_id, core);
-+        reader_args[1] = in.input.buffer()->address();
-+        reader_args[2] = in.state.buffer()->address();
-+        reader_args[3] = in.weight.buffer()->address();
-+        reader_args[4] = in.state_indices.buffer()->address();
-+        reader_args[5] = in.has_initial_state.buffer()->address();
-+        auto& writer_args = GetRuntimeArgs(
-+            cached.program, cached.shared_variables.writer_kernel_id, core);
-+        writer_args[1] = outputs.buffer()->address();
-+    }
++    program.kernels.push_back(std::move(reader));
++    program.kernels.push_back(std::move(writer));
++    program.kernels.push_back(std::move(compute));
++    return program;
 +}
 +
 +}  // namespace
@@ -583,15 +542,16 @@ index 0000000000000000000000000000000000000000..1339b00e5302452c98f5f9fafdbd8929
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
 new file mode 100644
-index 0000000..60dc75b
+index 0000000000000000000000000000000000000000..2edf619f538f0ec0030270d1f9d244e400f3259b
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,65 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#include <stdint.h>
 +
++#include "api/core_local_mem.h"
 +#include "api/dataflow/circular_buffer.h"
 +#include "api/dataflow/dataflow_api.h"
 +#include "api/dataflow/noc.h"
@@ -623,38 +583,33 @@ index 0000000..60dc75b
 +    CircularBuffer indices_cb(tt::CBIndex::c_1);
 +    Noc noc;
 +
++    // This kernel owns both buffers; reuse them as scratch without queueing tiles.
++    data_cb.reserve_back(1);
 +    indices_cb.reserve_back(1);
 +    noc.async_read(
 +        state_indices, indices_cb, 4096,
 +        {.page_id = 0}, {.offset_bytes = 0});
 +    noc.async_read_barrier();
-+    indices_cb.push_back(1);
-+    indices_cb.wait_front(1);
 +    const uint32_t total_pages = batch_size * pages_per_slice;
 +    for (uint32_t work = worker; work < total_pages; work += num_workers) {
 +        const uint32_t batch = work / pages_per_slice;
 +        const uint32_t page = work % pages_per_slice;
-+        const uint32_t slot = read_index(indices_cb.get_read_ptr(), batch);
++        const uint32_t slot = read_index(indices_cb.get_write_ptr(), batch);
 +        if (slot == 0) {
 +            continue;
 +        }
 +
-+        data_cb.reserve_back(1);
 +        noc.async_read(
 +            updates, data_cb, tile_bytes,
 +            {.page_id = batch * pages_per_slice + page},
 +            {.offset_bytes = 0});
 +        noc.async_read_barrier();
-+        data_cb.push_back(1);
-+        data_cb.wait_front(1);
 +        noc.async_write(
-+            data_cb, state_pool, tile_bytes,
++            CoreLocalMem<uint32_t>(data_cb.get_write_ptr()), state_pool, tile_bytes,
 +            {.offset_bytes = 0},
 +            {.page_id = slot * pages_per_slice + page});
 +        noc.async_write_barrier();
-+        data_cb.pop_front(1);
 +    }
-+    indices_cb.pop_front(1);
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp
 new file mode 100644
@@ -679,19 +634,19 @@ index 0000000000000000000000000000000000000000..dafb9778090fcb155b09a491ac46185e
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..ae8948e4a9be12a90db81cb3d9f746c68be6f167
+index 0000000000000000000000000000000000000000..56a7196bd2bd068667dc37fae1690a3a1f99c8e3
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,167 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#include "ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp"
 +
 +#include <algorithm>
-+#include <variant>
++#include <utility>
 +
-+#include <tt-metalium/host_api.hpp>
++#include <tt-metalium/program_descriptors.hpp>
 +#include <tt-metalium/tensor_accessor_args.hpp>
 +#include <tt-metalium/work_split.hpp>
 +#include "ttnn/device.hpp"
@@ -710,34 +665,14 @@ index 0000000000000000000000000000000000000000..ae8948e4a9be12a90db81cb3d9f746c6
 +    Tensor updates;
 +};
 +
-+struct StatePoolUpdateSharedVariables {
-+    KernelHandle kernel_id;
-+    uint32_t grid_y;
-+    uint32_t num_workers;
-+};
-+
-+struct StatePoolUpdateProgramFactory {
-+    using shared_variables_t = StatePoolUpdateSharedVariables;
-+    using cached_program_t = device_operation::CachedProgram<shared_variables_t>;
-+    using operation_attributes_t = StatePoolUpdateParams;
-+    using tensor_args_t = StatePoolUpdateInputs;
-+    using tensor_return_value_t = Tensor;
-+
-+    static cached_program_t create(
-+        const operation_attributes_t&, const tensor_args_t&,
-+        tensor_return_value_t&);
-+    static void override_runtime_arguments(
-+        cached_program_t&, const operation_attributes_t&, const tensor_args_t&,
-+        tensor_return_value_t&);
-+};
-+
 +struct StatePoolUpdateOperation {
 +    using operation_attributes_t = StatePoolUpdateParams;
 +    using tensor_args_t = StatePoolUpdateInputs;
 +    using spec_return_value_t = TensorSpec;
 +    using tensor_return_value_t = Tensor;
-+    using program_factory_t = std::variant<StatePoolUpdateProgramFactory>;
 +
++    static ProgramDescriptor create_descriptor(
++        const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
 +    static void validate_on_program_cache_miss(
 +        const operation_attributes_t&, const tensor_args_t&);
 +    static spec_return_value_t compute_output_specs(
@@ -793,8 +728,7 @@ index 0000000000000000000000000000000000000000..ae8948e4a9be12a90db81cb3d9f746c6
 +        "state pool and update slices must have the same page count");
 +}
 +
-+StatePoolUpdateProgramFactory::cached_program_t
-+StatePoolUpdateProgramFactory::create(
++ProgramDescriptor StatePoolUpdateOperation::create_descriptor(
 +    const operation_attributes_t&, const tensor_args_t& inputs,
 +    tensor_return_value_t&) {
 +    const uint32_t batch_size = inputs.updates.logical_shape()[0];
@@ -803,23 +737,27 @@ index 0000000000000000000000000000000000000000..ae8948e4a9be12a90db81cb3d9f746c6
 +    const uint32_t total_pages = batch_size * pages_per_slice;
 +    const uint32_t tile_bytes = inputs.updates.buffer()->page_size();
 +
-+    Program program;
++    ProgramDescriptor program;
 +    auto* device = inputs.state_pool.device();
 +    const CoreCoord grid = device->compute_with_storage_grid_size();
 +    const uint32_t num_workers = std::min(
 +        total_pages, static_cast<uint32_t>(grid.x * grid.y));
 +    CoreRangeSet cores = num_cores_to_corerangeset(num_workers, grid);
 +
-+    CircularBufferConfig data_config(
-+        tile_bytes,
-+        {{tt::CBIndex::c_0,
-+          datatype_to_dataformat_converter(inputs.updates.dtype())}});
-+    data_config.set_page_size(tt::CBIndex::c_0, tile_bytes);
-+    CreateCircularBuffer(program, cores, data_config);
-+    CircularBufferConfig indices_config(
-+        4096, {{tt::CBIndex::c_1, tt::DataFormat::Int32}});
-+    indices_config.set_page_size(tt::CBIndex::c_1, 4096);
-+    CreateCircularBuffer(program, cores, indices_config);
++    program.cbs = {
++        CBDescriptor{
++            .total_size = tile_bytes,
++            .core_ranges = cores,
++            .format_descriptors = {{
++                .buffer_index = tt::CBIndex::c_0,
++                .data_format = datatype_to_dataformat_converter(inputs.updates.dtype()),
++                .page_size = tile_bytes}}},
++        CBDescriptor{
++            .total_size = 4096,
++            .core_ranges = cores,
++            .format_descriptors = {{
++                .buffer_index = tt::CBIndex::c_1,
++                .data_format = tt::DataFormat::Int32, .page_size = 4096}}}};
 +
 +    std::vector<uint32_t> compile_args = {
 +        batch_size, pages_per_slice, num_workers, tile_bytes};
@@ -827,46 +765,26 @@ index 0000000000000000000000000000000000000000..ae8948e4a9be12a90db81cb3d9f746c6
 +    TensorAccessorArgs(inputs.state_indices.buffer()).append_to(compile_args);
 +    TensorAccessorArgs(inputs.updates.buffer()).append_to(compile_args);
 +
-+    auto kernel = CreateKernel(
-+        program,
-+        "ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/"
++    KernelDescriptor kernel{
++        .kernel_source = "ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/"
 +        "kernels/dataflow/state_pool_update.cpp",
-+        cores,
-+        DataMovementConfig{
++        .core_ranges = cores,
++        .compile_time_args = compile_args,
++        .config = DataMovementConfigDescriptor{
 +            .processor = DataMovementProcessor::RISCV_0,
-+            .noc = NOC::RISCV_0_default,
-+            .compile_args = compile_args});
++            .noc = NOC::RISCV_0_default}};
 +
 +    for (uint32_t worker = 0; worker < num_workers; ++worker) {
 +        const CoreCoord core{worker / grid.y, worker % grid.y};
-+        SetRuntimeArgs(
-+            program, kernel, core,
-+            {worker, inputs.state_pool.buffer()->address(),
-+             inputs.state_indices.buffer()->address(),
-+             inputs.updates.buffer()->address()});
++        kernel.emplace_runtime_args(
++            core,
++            {worker, inputs.state_pool.buffer(),
++             inputs.state_indices.buffer(),
++             inputs.updates.buffer()});
 +    }
 +
-+    return cached_program_t{
-+        std::move(program),
-+        {.kernel_id = kernel,
-+         .grid_y = static_cast<uint32_t>(grid.y),
-+         .num_workers = num_workers}};
-+}
-+
-+void StatePoolUpdateProgramFactory::override_runtime_arguments(
-+    cached_program_t& cached, const operation_attributes_t&,
-+    const tensor_args_t& inputs, tensor_return_value_t&) {
-+    for (uint32_t worker = 0; worker < cached.shared_variables.num_workers;
-+         ++worker) {
-+        CoreCoord core{
-+            worker / cached.shared_variables.grid_y,
-+            worker % cached.shared_variables.grid_y};
-+        auto& args = GetRuntimeArgs(
-+            cached.program, cached.shared_variables.kernel_id, core);
-+        args[1] = inputs.state_pool.buffer()->address();
-+        args[2] = inputs.state_indices.buffer()->address();
-+        args[3] = inputs.updates.buffer()->address();
-+    }
++    program.kernels.push_back(std::move(kernel));
++    return program;
 +}
 +
 +}  // namespace
@@ -1434,20 +1352,20 @@ index 0000000..bbf9697
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
 new file mode 100644
-index 0000000..a66c6e2
+index 0000000000000000000000000000000000000000..a97b51d6f3f88450dd0591c8f749633176a4bc4a
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,265 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#include "ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp"
 +
 +#include <algorithm>
-+#include <variant>
++#include <utility>
 +
 +#include <tt-metalium/buffer.hpp>
-+#include <tt-metalium/host_api.hpp>
++#include <tt-metalium/program_descriptors.hpp>
 +#include <tt-metalium/tensor_accessor_args.hpp>
 +#include <tt-metalium/work_split.hpp>
 +#include "ttnn/device.hpp"
@@ -1475,33 +1393,14 @@ index 0000000..a66c6e2
 +    Tensor has_initial_state;
 +};
 +
-+struct DecodeSharedVariables {
-+    KernelHandle reader_kernel_id;
-+    KernelHandle writer_kernel_id;
-+    uint32_t grid_y;
-+    uint32_t num_workers;
-+};
-+
-+struct DecodeProgramFactory {
-+    using shared_variables_t = DecodeSharedVariables;
-+    using cached_program_t = device_operation::CachedProgram<shared_variables_t>;
-+    using operation_attributes_t = DecodeParams;
-+    using tensor_args_t = DecodeInputs;
-+    using tensor_return_value_t = Tensor;
-+
-+    static cached_program_t create(
-+        const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
-+    static void override_runtime_arguments(
-+        cached_program_t&, const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
-+};
-+
 +struct DecodeOperation {
 +    using operation_attributes_t = DecodeParams;
 +    using tensor_args_t = DecodeInputs;
 +    using spec_return_value_t = TensorSpec;
 +    using tensor_return_value_t = Tensor;
-+    using program_factory_t = std::variant<DecodeProgramFactory>;
 +
++    static ProgramDescriptor create_descriptor(
++        const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
 +    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
 +    static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
 +    static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
@@ -1564,7 +1463,7 @@ index 0000000..a66c6e2
 +    return in.output;
 +}
 +
-+DecodeProgramFactory::cached_program_t DecodeProgramFactory::create(
++ProgramDescriptor DecodeOperation::create_descriptor(
 +    const operation_attributes_t&, const tensor_args_t& in, tensor_return_value_t& output) {
 +    constexpr uint32_t kt = 4;
 +    constexpr uint32_t vt = 4;
@@ -1573,7 +1472,7 @@ index 0000000..a66c6e2
 +    constexpr uint32_t state_tiles = kt * worker_vt;
 +    const uint32_t batch_size = in.query.logical_shape()[0];
 +    const uint32_t num_heads = in.query.logical_shape()[1];
-+    Program program;
++    ProgramDescriptor program;
 +
 +    auto* device = in.query.device();
 +    const CoreCoord grid = device->compute_with_storage_grid_size();
@@ -1585,9 +1484,12 @@ index 0000000..a66c6e2
 +    auto make_cb = [&](uint32_t index, uint32_t tiles,
 +                       tt::DataFormat format = tt::DataFormat::Float32) {
 +        const uint32_t page_size = tt::tile_size(format);
-+        CircularBufferConfig config(tiles * page_size, {{index, format}});
-+        config.set_page_size(index, page_size);
-+        CreateCircularBuffer(program, cores, config);
++        program.cbs.push_back(CBDescriptor{
++            .total_size = tiles * page_size,
++            .core_ranges = cores,
++            .format_descriptors = {{
++                .buffer_index = static_cast<uint8_t>(index),
++                .data_format = format, .page_size = page_size}}});
 +    };
 +    make_cb(0, state_tiles);  // state
 +    make_cb(1, kt);           // query
@@ -1633,91 +1535,56 @@ index 0000000..a66c6e2
 +
 +    const std::string kernel_dir =
 +        "ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/";
-+    auto reader = CreateKernel(
-+        program,
-+        kernel_dir + "dataflow/reader_gated_delta_decode.cpp",
-+        cores,
-+        DataMovementConfig{
++    KernelDescriptor reader{
++        .kernel_source = kernel_dir + "dataflow/reader_gated_delta_decode.cpp",
++        .core_ranges = cores,
++        .compile_time_args = reader_args,
++        .config = DataMovementConfigDescriptor{
 +            .processor = DataMovementProcessor::RISCV_1,
-+            .noc = NOC::RISCV_1_default,
-+            .compile_args = reader_args});
-+    auto writer = CreateKernel(
-+        program,
-+        kernel_dir + "dataflow/writer_gated_delta_decode.cpp",
-+        cores,
-+        DataMovementConfig{
++            .noc = NOC::RISCV_1_default}};
++    KernelDescriptor writer{
++        .kernel_source = kernel_dir + "dataflow/writer_gated_delta_decode.cpp",
++        .core_ranges = cores,
++        .compile_time_args = writer_args,
++        .config = DataMovementConfigDescriptor{
 +            .processor = DataMovementProcessor::RISCV_0,
-+            .noc = NOC::RISCV_0_default,
-+            .compile_args = writer_args});
-+    auto compute = CreateKernel(
-+        program,
-+        kernel_dir + "compute/gated_delta_decode.cpp",
-+        cores,
-+        ComputeConfig{
++            .noc = NOC::RISCV_0_default}};
++    KernelDescriptor compute{
++        .kernel_source = kernel_dir + "compute/gated_delta_decode.cpp",
++        .core_ranges = cores,
++        .compile_time_args = {
++            kt, worker_vt, batch_size, num_heads, workers_per_head, num_workers},
++        .config = ComputeConfigDescriptor{
 +            .math_fidelity = tt::tt_metal::MathFidelity::HiFi2,
 +            .fp32_dest_acc_en = true,
-+            .math_approx_mode = false,
-+            .compile_args = {
-+                kt, worker_vt, batch_size, num_heads, workers_per_head,
-+                num_workers}});
++            .math_approx_mode = false}};
 +
 +    for (uint32_t worker = 0; worker < num_workers; ++worker) {
 +        const CoreCoord core{worker / grid.y, worker % grid.y};
-+        SetRuntimeArgs(
-+            program,
-+            reader,
++        reader.emplace_runtime_args(
 +            core,
 +            {worker,
-+             in.query.buffer()->address(),
-+             in.key.buffer()->address(),
-+             in.value.buffer()->address(),
-+             in.beta_logits.buffer()->address(),
-+             in.delta_time.buffer()->address(),
-+             in.a_log.buffer()->address(),
-+             in.dt_bias.buffer()->address(),
-+             in.state.buffer()->address(),
-+             in.state_indices.buffer()->address(),
-+             in.has_initial_state.buffer()->address()});
-+        SetRuntimeArgs(
-+            program,
-+            writer,
++             in.query.buffer(),
++             in.key.buffer(),
++             in.value.buffer(),
++             in.beta_logits.buffer(),
++             in.delta_time.buffer(),
++             in.a_log.buffer(),
++             in.dt_bias.buffer(),
++             in.state.buffer(),
++             in.state_indices.buffer(),
++             in.has_initial_state.buffer()});
++        writer.emplace_runtime_args(
 +            core,
-+            {worker, output.buffer()->address(), in.state.buffer()->address(),
-+             in.state_indices.buffer()->address()});
-+        SetRuntimeArgs(program, compute, core, {worker});
++            {worker, output.buffer(), in.state.buffer(),
++             in.state_indices.buffer()});
++        compute.emplace_runtime_args(core, {worker});
 +    }
 +
-+    return cached_program_t{
-+        std::move(program),
-+        {.reader_kernel_id = reader,
-+         .writer_kernel_id = writer,
-+         .grid_y = static_cast<uint32_t>(grid.y),
-+         .num_workers = num_workers}};
-+}
-+
-+void DecodeProgramFactory::override_runtime_arguments(
-+    cached_program_t& cached,
-+    const operation_attributes_t&,
-+    const tensor_args_t& in,
-+    tensor_return_value_t& output) {
-+    for (uint32_t worker = 0; worker < cached.shared_variables.num_workers; ++worker) {
-+        CoreCoord core{worker / cached.shared_variables.grid_y, worker % cached.shared_variables.grid_y};
-+        auto& reader_args = GetRuntimeArgs(cached.program, cached.shared_variables.reader_kernel_id, core);
-+        reader_args[1] = in.query.buffer()->address();
-+        reader_args[2] = in.key.buffer()->address();
-+        reader_args[3] = in.value.buffer()->address();
-+        reader_args[4] = in.beta_logits.buffer()->address();
-+        reader_args[5] = in.delta_time.buffer()->address();
-+        reader_args[6] = in.a_log.buffer()->address();
-+        reader_args[7] = in.dt_bias.buffer()->address();
-+        reader_args[8] = in.state.buffer()->address();
-+        reader_args[9] = in.state_indices.buffer()->address();
-+        reader_args[10] = in.has_initial_state.buffer()->address();
-+        auto& writer_args = GetRuntimeArgs(cached.program, cached.shared_variables.writer_kernel_id, core);
-+        writer_args[1] = output.buffer()->address();
-+        writer_args[2] = in.state.buffer()->address();
-+        writer_args[3] = in.state_indices.buffer()->address();
-+    }
++    program.kernels.push_back(std::move(reader));
++    program.kernels.push_back(std::move(writer));
++    program.kernels.push_back(std::move(compute));
++    return program;
 +}
 +
 +}  // namespace
