@@ -795,10 +795,10 @@ index 0000000000000000000000000000000000000000..56a7196bd2bd068667dc37fae1690a3a
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
 new file mode 100644
-index 0000000..cb96300
+index 0000000..04e8ee4
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,211 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -808,6 +808,7 @@ index 0000000..cb96300
 +#include "api/compute/compute_kernel_api.h"
 +#include "api/compute/compute_kernel_hw_startup.h"
 +#include "api/compute/eltwise_binary.h"
++#include "api/compute/eltwise_binary_sfpu.h"
 +#include "api/compute/eltwise_unary/exp.h"
 +#include "api/compute/eltwise_unary/negative.h"
 +#include "api/compute/eltwise_unary/softplus.h"
@@ -840,8 +841,6 @@ index 0000000..cb96300
 +    constexpr uint32_t a_log = tt::CBIndex::c_13;
 +    constexpr uint32_t dt_bias = tt::CBIndex::c_14;
 +    constexpr uint32_t beta = tt::CBIndex::c_16;
-+    constexpr uint32_t a_scale = tt::CBIndex::c_18;
-+    constexpr uint32_t softplus = tt::CBIndex::c_19;
 +    constexpr uint32_t decay = tt::CBIndex::c_20;
 +
 +    // Configure the FP32 unpack/pack paths before the first compute API call.
@@ -864,52 +863,26 @@ index 0000000..cb96300
 +    cb_push_back(beta, 1);
 +    cb_pop_front(beta_logits, 1);
 +
-+    // a_scale = -exp(a_log)
++    // decay = exp(-exp(a_log) * softplus(delta_time + dt_bias))
 +    cb_wait_front(a_log, 1);
-+    cb_reserve_back(a_scale, 1);
-+    copy_tile_to_dst_init_short(a_log);
-+    exp_tile_init();
-+    tile_regs_acquire();
-+    copy_tile(a_log, 0, 0);
-+    exp_tile(0);
-+    negative_tile_init();
-+    negative_tile(0);
-+    tile_regs_commit();
-+    tile_regs_wait();
-+    pack_reconfig_data_format(a_scale);
-+    pack_tile(0, a_scale, 0);
-+    tile_regs_release();
-+    cb_push_back(a_scale, 1);
-+    cb_pop_front(a_log, 1);
-+
-+    // softplus = softplus(delta_time + dt_bias)
 +    cb_wait_front(delta_time, 1);
 +    cb_wait_front(dt_bias, 1);
-+    cb_reserve_back(softplus, 1);
-+    binary_op_init_common(delta_time, dt_bias, softplus);
++    cb_reserve_back(decay, 1);
++    binary_op_init_common(delta_time, dt_bias, decay);
 +    add_tiles_init(delta_time, dt_bias);
-+    softplus_tile_init();
 +    tile_regs_acquire();
 +    add_tiles(delta_time, dt_bias, 0, 0, 0);
++    softplus_tile_init();
 +    softplus_tile(0, 0x3F800000u, 0x3F800000u, 0x41A00000u);
-+    tile_regs_commit();
-+    tile_regs_wait();
-+    pack_reconfig_data_format(softplus);
-+    pack_tile(0, softplus, 0);
-+    tile_regs_release();
-+    cb_push_back(softplus, 1);
-+    cb_pop_front(delta_time, 1);
-+    cb_pop_front(dt_bias, 1);
-+
-+    // decay = exp(a_scale * softplus)
-+    cb_wait_front(a_scale, 1);
-+    cb_wait_front(softplus, 1);
-+    cb_reserve_back(decay, 1);
-+    binary_op_init_common(a_scale, softplus, decay);
-+    mul_tiles_init(a_scale, softplus);
++    copy_tile_to_dst_init_short(a_log);
++    copy_tile(a_log, 0, 1);
 +    exp_tile_init();
-+    tile_regs_acquire();
-+    mul_tiles(a_scale, softplus, 0, 0, 0);
++    exp_tile(1);
++    negative_tile_init();
++    negative_tile(1);
++    mul_binary_tile_init();
++    mul_binary_tile(0, 1, 0);
++    exp_tile_init();
 +    exp_tile(0);
 +    tile_regs_commit();
 +    tile_regs_wait();
@@ -917,8 +890,9 @@ index 0000000..cb96300
 +    pack_tile(0, decay, 0);
 +    tile_regs_release();
 +    cb_push_back(decay, 1);
-+    cb_pop_front(a_scale, 1);
-+    cb_pop_front(softplus, 1);
++    cb_pop_front(a_log, 1);
++    cb_pop_front(delta_time, 1);
++    cb_pop_front(dt_bias, 1);
 +
 +    // state_mid = decay * state
 +    mul_tiles_bcast_scalar_init_short(state, decay);
@@ -1338,10 +1312,10 @@ index 0000000..ea01b86
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..e238c85cdffca0d375748ff8664f707e3da07505
+index 0000000000000000000000000000000000000000..1c07c7b9493ad1cae1bd129599605fdb7307601c
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,260 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1494,8 +1468,6 @@ index 0000000000000000000000000000000000000000..e238c85cdffca0d375748ff8664f707e
 +    make_cb(15, 1, tt::DataFormat::Int32);      // state index (reader)
 +    make_cb(16, 1);           // beta
 +    make_cb(17, 1, tt::DataFormat::Float16_b);  // has-initial-state flag
-+    make_cb(18, 1);           // -exp(A log)
-+    make_cb(19, 1);           // softplus(delta time + bias)
 +    make_cb(20, 1);           // decay
 +    make_cb(29, 1, tt::DataFormat::Int32);      // state index (writer)
 +
