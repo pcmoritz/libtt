@@ -183,13 +183,15 @@ plugin wheel, use the same setup and server command, changing these options:
 
 ```bash
 --model-path Qwen/Qwen3.5-9B \
---max-running-requests 1 \
---max-prefill-tokens 32 \
---chunked-prefill-size 32 \
---max-recurrent-state-size 1
+--max-running-requests 4 \
+--max-prefill-tokens 256 \
+--chunked-prefill-size 256 \
+--max-recurrent-state-size 4
 ```
 
-This path supports text generation on one device with one active request.
+This path supports text generation on one device, tested with up to four active
+requests. Prefill processes one request at a time; decoding batches active requests.
+Keep mixed prefill/decode disabled (do not pass `--enable-mixed-chunk`).
 Keep `--dtype bfloat16`, `--disable-radix-cache`, and
 `--disable-overlap-schedule`. Recurrent state stays FP32; do not override
 `SGLANG_JAX_RECURRENT_STATE_DTYPE` or `SGLANG_JAX_CONV_STATE_DTYPE`.
@@ -207,12 +209,21 @@ and uses TTNN's fused kernel with FP32 accumulation. Warm up each prompt-length
 bucket before measuring performance, as for Qwen3 above.
 
 On a P150 with firmware 19.13.1, the five-token prompt above and 128 generated
-tokens measured 21.4–21.5 decode tokens/s, 2.32 s to first token, and 8.2 s
-end-to-end after two warmup requests (BF8 weights, one request, 1024-token cache,
-32-token prefill chunks). The decode rate includes the first decode step;
-subsequent steps averaged about 24.4 tokens/s. Multimodal input, multiple active
-requests, and recurrent prefix-cache snapshots are not supported by this backend
-yet.
+tokens measured the following after two warmup rounds (BF8 weights, 1024-token
+cache, 256-token prefill chunks, greedy sampling with `ignore_eos=true`):
+
+| Concurrent requests | Aggregate decode tokens/s | Time to first token (s) | Request latency (s) |
+| --- | ---: | ---: | ---: |
+| 1 | 26.33 | 0.698 | 5.53 |
+| 4 | 90.49 | 1.020 | 6.96 |
+
+Values are medians over eight single-request rounds and five four-request rounds,
+using the same server with four state slots. Aggregate decode throughput counts
+tokens after all requests have received their first token. Including prefill,
+output throughput was 23.2 and 73.5 tokens/s, respectively.
+
+Multimodal input and recurrent prefix-cache snapshots are not supported by this
+backend yet.
 
 A fixed 200-question, five-shot `sglang_mmlu` sample scored 58% with BF16
 weights, 61% with BF8 weights alone, and 59.5% with BF8 plus native normalization.
