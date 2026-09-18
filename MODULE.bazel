@@ -247,6 +247,7 @@ http_archive(
         "//third_party/tt_metal:accurate_fp32_reductions.patch",
         "//third_party/tt_metal:reduce_w_batched_reads.patch",
         "//third_party/tt_metal:parallel_wide_reductions.patch",
+        "//third_party/tt_metal:reshape_row_major_parallel.patch",
         "//third_party/tt_metal:embedding_float32.patch",
         "//third_party/tt_metal:permute_float32.patch",
         "//third_party/tt_metal:layout_zero_volume.patch",
