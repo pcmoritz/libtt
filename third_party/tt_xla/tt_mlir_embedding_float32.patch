@@ -58,3 +58,47 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
    return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds(0, 0)
        .addInputOperandWorkaround(inputRowMajorInt32Workaround)
        .addInputOperandWorkaround(weightRowMajorBf16Workaround)
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -5049,6 +5049,40 @@
+     // checkBasicLegality and handled by StableHLOGatherIntToGatherPattern.
+     GatherOperands ops = buildGatherOperands(srcOp, adaptor, rewriter);
+ 
++    // Keep the innermost rows of large gathered slices separate. Flattening
++    // an entire state into one embedding row adds tile padding and can exceed
++    // the embedding kernel's local-memory budget, especially for FP32.
++    int64_t rowWidth = srcOp.getOperand().getType().getShape().back();
++    auto weightType = ops.reshapedInput.getType();
++    int64_t width = weightType.getDimSize(1);
++    if (srcOp.getOperand().getType().getRank() > 2 && rowWidth >= 32 &&
++        rowWidth % 32 == 0 && width > rowWidth && width % rowWidth == 0) {
++      auto loc = srcOp.getLoc();
++      int64_t rows = width / rowWidth;
++      int64_t count = ops.startIndices.getType().getNumElements();
++      auto indices = ttir::utils::createReshapeOp(
++          rewriter, loc, ops.startIndices, {count, 1});
++      auto indexType = indices.getType();
++      auto scalarType = indexType.clone({1, 1});
++      auto stride = rewriter.create<ttir::ConstantOp>(
++          loc, scalarType,
++          DenseElementsAttr::get(scalarType,
++              rewriter.getIntegerAttr(indexType.getElementType(), rows)));
++      Value starts = rewriter.create<ttir::MultiplyOp>(
++          loc, indexType, indices, stride);
++      auto expandedType = indexType.clone({count, rows});
++      starts = rewriter.create<ttir::BroadcastOp>(
++          loc, expandedType, starts, rewriter.getDenseI64ArrayAttr({1, rows}));
++      Value offsets = rewriter.create<ttir::ArangeOp>(
++          loc, expandedType, 0, rows, 1, 1);
++      ops.startIndices = rewriter.create<ttir::AddOp>(
++          loc, expandedType, starts, offsets);
++      ops.reshapedInput = ttir::utils::createReshapeOp(
++          rewriter, loc, ops.reshapedInput,
++          {weightType.getDimSize(0) * rows, rowWidth});
++      ops.newOutputShape = {count, rows, rowWidth};
++    }
++
+     auto embeddingOutputType = mlir::RankedTensorType::get(
+         ops.newOutputShape, ops.reshapedInput.getType().getElementType(),
+         ops.reshapedInput.getType().getEncoding());

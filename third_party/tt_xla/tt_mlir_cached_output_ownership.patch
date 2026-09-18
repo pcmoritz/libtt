@@ -1,0 +1,61 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/include/tt/runtime/detail/ttnn/types/types.h
+--- a/runtime/include/tt/runtime/detail/ttnn/types/types.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/types.h
+@@ -72,6 +72,13 @@
+   bool shouldRetain() const { return retain.load(std::memory_order_relaxed); }
+   void setRetain(bool val) { retain.store(val, std::memory_order_relaxed); }
+ 
++  bool isConstEvalOutput() const {
++    return constEvalOutput.load(std::memory_order_relaxed);
++  }
++  void markConstEvalOutput() {
++    constEvalOutput.store(true, std::memory_order_relaxed);
++  }
++
+   uint64_t getVersion() const {
+     return version.load(std::memory_order_relaxed);
+   }
+@@ -99,6 +106,9 @@
+   // the program from deallocating the tensor
+   std::atomic<bool> retain;
+   std::atomic<uint64_t> version;
++
++  // Constant-cache storage must be copied before returning it to the caller.
++  std::atomic<bool> constEvalOutput{false};
+ 
+   static uint64_t getLatestVersion();
+ 
+diff --git a/runtime/lib/ttnn/operations/cache/load_cached.cpp b/runtime/lib/ttnn/operations/cache/load_cached.cpp
+--- a/runtime/lib/ttnn/operations/cache/load_cached.cpp
++++ b/runtime/lib/ttnn/operations/cache/load_cached.cpp
+@@ -78,6 +78,7 @@
+     ::tt::runtime::ttnn::TTNNTensorWrapper &outputWrapper =
+         output.as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN);
+     outputWrapper.setRetain(true);
++    outputWrapper.markConstEvalOutput();
+   }
+ 
+   cache.store(cacheKey, inputs, outputs);
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -2495,6 +2495,19 @@
+       executor->gatherOutputTensors();
+   executor.reset();
+ 
++  // Cached constants remain shared inside programs. Give each returned device
++  // output its own storage so later in-place updates cannot mutate the cache
++  // or another output, including repeated results from this same invocation.
++  for (auto &output : outputTensors) {
++    const auto &wrapper = output.as<TTNNTensorWrapper>(DeviceRuntime::TTNN);
++    const auto &tensor = wrapper.getTensor();
++    if (wrapper.isConstEvalOutput() &&
++        tensor.storage_type() == ::ttnn::StorageType::DEVICE) {
++      output = utils::createRuntimeTensorFromTTNN(
++          ::ttnn::clone(tensor, std::nullopt, std::nullopt, std::nullopt));
++    }
++  }
++
+ #if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+   ::tt::runtime::utils::logMemoryStateIfNeeded(
+       ::tt::runtime::ttnn::utils::getMemoryView, deviceHandle,
