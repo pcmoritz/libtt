@@ -46,7 +46,7 @@ index 3ce51a2..ff7837b 100644
 
  private:
 +  using EntryKey = std::pair<MainProgramKey, CaptureExecuteProgramKey>;
-+  static constexpr size_t kMaxEntries = 4;
++  static constexpr size_t kMaxEntries = 16;
 +
 +  void touch(const MainProgramKey &key,
 +             const CaptureExecuteProgramKey &captureExecuteKey);

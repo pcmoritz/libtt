@@ -96,3 +96,17 @@ diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
            workarounds::decomposition::GatherOpRank1RewritePattern,
            workarounds::decomposition::SamplingOpRank2RewritePattern,
            workarounds::decomposition::TTNNCollectiveReshapeWorkaround<
+diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+--- a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
++++ b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+@@ -1576,5 +1576,10 @@ llvm::Expected<op_model::OpConstraints> WhereOp::getOpConstraints(
+     const std::vector<TTNNLayoutAttr> &inputs, const OpConfig &opConfig,
+     std::optional<llvm::ArrayRef<op_model::OpModelAllocationRecord>>
+         liveRecords) {
++  // The where kernels read every operand as tiles, including both payloads.
++  if (llvm::any_of(inputs, [](TTNNLayoutAttr layout) { return !layout.isTiled(); })) {
++    return llvm::createStringError(llvm::inconvertibleErrorCode(),
++                                   "Where requires tiled inputs");
++  }
+   return detail::getTernaryOpConstraints(*this, inputs, opConfig, liveRecords);
+ }

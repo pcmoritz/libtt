@@ -200,3 +200,28 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    case ::tt::target::ttnn::OpType::WriteTensorOp: {
      tensorRefs = {opContext.type_as_WriteTensorOp()->host_tensor(),
                    opContext.type_as_WriteTensorOp()->device_tensor()};
+diff --git a/lib/Dialect/TTNN/Validation/OpConstraintValidation.cpp b/lib/Dialect/TTNN/Validation/OpConstraintValidation.cpp
+--- a/lib/Dialect/TTNN/Validation/OpConstraintValidation.cpp
++++ b/lib/Dialect/TTNN/Validation/OpConstraintValidation.cpp
+@@ -4,6 +4,7 @@
+
+ #include "ttmlir/Dialect/TTNN/Validation/OpConstraintValidation.h"
+
++#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+ #include "ttmlir/Dialect/TTCore/IR/Utils.h"
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+@@ -219,10 +220,11 @@
+     // ops without a metal-side definition). The optimizer relies on observing
+     // a NotImplemented result for such ops so it can fall back gracefully
+     // (e.g. evict L1 state) instead of treating the op as analyzable.
+-    if (op->hasTrait<OpModelExempt>()) {
++    // Outlined loops invoke separately optimized programs, not a metal kernel.
++    if (op->hasTrait<OpModelExempt>() || isa<ttcore::WhileLoopOp>(op)) {
+       return ValidationResult::notImplemented(
+           (llvm::Twine("OpModel interface not implemented for op ") +
+-           op->getName().getStringRef() + " (OpModelExempt)")
++           op->getName().getStringRef())
+               .str());
+     }
+     llvm::reportFatalInternalError(llvm::Twine("Backend constraints are not "
