@@ -1,0 +1,103 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNConstEvalInputsToSystemMemory.cpp b/lib/Dialect/TTNN/Transforms/TTNNConstEvalInputsToSystemMemory.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNConstEvalInputsToSystemMemory.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNConstEvalInputsToSystemMemory.cpp
+@@ -5,6 +5,7 @@
+ #include "ttmlir/Asserts.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
++#include "ttmlir/Dialect/TTCore/IR/Utils.h"
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
+@@ -77,11 +78,9 @@
+              .getValue() != BufferType::SystemMemory;
+ }
+ 
+-// Converts the arguments of the forward function which are const-eval inputs
+-// to system memory. Returns the list of converted arguments.
+-//
+-// An argument is considered to be a const-eval input if it is
+-// consumed only by LoadCachedOps.
++// Moves const-eval inputs and directly used parameters to system memory.
++// Keeping the same host layout across graphs preserves their versions and the
++// cached device conversions. Returns the list of converted arguments.
+ //
+ static SmallVector<BlockArgument> moveConstEvalArgsToHost(func::FuncOp funcOp) {
+   SmallVector<Type> argumentTypes;
+@@ -107,13 +106,27 @@
+       continue;
+     }
+ 
+-    // If the block argument has a user which is not a LoadCachedOp, skip it.
++    // Direct parameter uses need a cacheable device conversion as well.
+     //
+     if (llvm::any_of(blockArgument.getUsers(), [](Operation *userOp) {
+           return !mlir::isa<ttcore::LoadCachedOp>(userOp);
+         })) {
+-      argumentTypes.push_back(tensorType);
+-      continue;
++      if (!ttcore::isConstantOrParameterArgumentType(
++              funcOp, blockArgument.getArgNumber()) ||
++          ttcore::isKVCacheArgument(funcOp, blockArgument.getArgNumber())) {
++        argumentTypes.push_back(tensorType);
++        continue;
++      }
++      // Keep parameters on the host in every graph. Cache their device-layout
++      // conversions instead of moving the caller's tensor between layouts.
++      OpBuilder builder(funcOp.getContext());
++      builder.setInsertionPointToStart(&funcOp.getBody().front());
++      auto toDevice = builder.create<ttnn::ToTensorSpecOp>(
++          blockArgument.getLoc(), tensorType, blockArgument);
++      blockArgument.replaceUsesWithIf(toDevice.getResult(), [&](OpOperand &use) {
++        return use.getOwner() != toDevice.getOperation() &&
++               !mlir::isa<ttcore::LoadCachedOp>(use.getOwner());
++      });
+     }
+ 
+     // Convert the argument to system memory type.
+@@ -224,9 +237,9 @@
+         //
+         llvm::SmallVector<ttcore::LoadCachedOp> loadCachedOps;
+         for (auto *userOp : convertedArgument.getUsers()) {
+-          TT_assertv(mlir::isa<ttcore::LoadCachedOp>(userOp),
+-                     "Expected load cached op");
+-          loadCachedOps.push_back(mlir::cast<ttcore::LoadCachedOp>(userOp));
++          if (auto loadCachedOp = mlir::dyn_cast<ttcore::LoadCachedOp>(userOp)) {
++            loadCachedOps.push_back(loadCachedOp);
++          }
+         }
+ 
+         for (auto loadCachedOp : loadCachedOps) {
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -485,10 +485,11 @@
+     if (options.enableConstEval) {
+       devicePm.addPass(transforms::createConstEvalHoistTransform());
+ 
+-      // Now that all const-eval passes have run, we can force the const-eval
+-      // function inputs to system memory.
++      // Keep parameter inputs on the host across graphs, then cache any
++      // device conversions introduced for directly used parameters.
+       if (options.enableConstEvalInputsToSystemMemory) {
+         devicePm.addPass(createTTNNConstEvalInputsToSystemMemory());
++        devicePm.addPass(transforms::createConstEvalHoistTransform());
+ 
+         // Clean up any redundant to_layout ops that may have been introduced
+         // previously.
+diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+--- a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
++++ b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+@@ -586,8 +586,10 @@
+     This pass also modifies the forward functions' arguments that correspond to const-eval
+     function inputs, forcing them to system memory as well.
+ 
+-    Note: only the arguments whose sole user is the ttcore.load_cached op are forced to system memory,
+-    in order to avoid unnecessary to_device transfers for other users.
++    Constant and parameter arguments with direct device users are also moved to system
++    memory. Their device conversions must be hoisted by a following const-eval pass,
++    so different graphs reuse the same host inputs and cached device layouts.
++    This extension does not move KV-cache arguments off device.
+   }];
+ }
+ 

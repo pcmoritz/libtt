@@ -1,6 +1,8 @@
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -2659,2 +2659,11 @@ public:
+@@ -2966,6 +2966,15 @@
+           });
+     };
 
 +    auto dropSubtractZero = [&](mlir::Value value) {
 +      value = lookThroughSafeOps(value);
@@ -12,42 +14,51 @@
 +                 : value;
 +    };
      MultiplyOp innerMul =
-@@ -2689,28 +2690,41 @@ public:
+         ttmlir::utils::findOpThrough<MultiplyOp, TypecastOp>(outerMul.getLhs());
+     mlir::Value gammaRaw = outerMul.getRhs();
+@@ -2994,32 +3003,51 @@
+       return mlir::failure();
+     }
 
 -    MeanOp meanOp = addOp.getLhs().getDefiningOp<MeanOp>();
-+    auto getLastDimReductionInput = [&](mlir::Value value) -> std::optional<mlir::Value> {
-+      auto checkReduction = [&](auto reductionOp) -> std::optional<mlir::Value> {
++    auto getLastDimReductionInput = [&](mlir::Value value) -> mlir::Value {
++      auto checkReduction = [](auto reductionOp) -> mlir::Value {
 +        auto dimArg = reductionOp.getDimArg();
-+        if (!dimArg || dimArg->size() != 1) return std::nullopt;
-+        auto inputType =
-+            mlir::cast<RankedTensorType>(reductionOp.getInput().getType());
++        if (!dimArg || dimArg->size() != 1) {
++          return {};
++        }
++        int64_t rank = reductionOp.getInput().getType().getRank();
 +        int64_t dim = mlir::cast<mlir::IntegerAttr>((*dimArg)[0]).getInt();
-+        return (dim < 0 ? inputType.getRank() + dim : dim) ==
-+                       inputType.getRank() - 1
-+                   ? std::optional<mlir::Value>(reductionOp.getInput())
-+                   : std::nullopt;
++        return dim == -1 || dim == rank - 1 ? reductionOp.getInput()
++                                            : mlir::Value{};
 +      };
 +      value = lookThroughSafeOps(value);
-+      if (auto meanOp = value.getDefiningOp<MeanOp>()) return checkReduction(meanOp);
++      if (auto meanOp = value.getDefiningOp<MeanOp>()) {
++        return checkReduction(meanOp);
++      }
 +      auto divOp = value.getDefiningOp<DivOp>();
-+      if (!divOp) return std::nullopt;
++      if (!divOp) {
++        return {};
++      }
 +      auto sumOp = lookThroughSafeOps(divOp.getLhs()).getDefiningOp<SumOp>();
-+      if (!sumOp) return std::nullopt;
-+      auto sumInputType = mlir::cast<RankedTensorType>(sumOp.getInput().getType());
++      if (!sumOp) {
++        return {};
++      }
++      auto sumInputType = sumOp.getInput().getType();
 +      return sumInputType.getRank() != 0 &&
 +                     isFullOpWithValue(
 +                         lookThroughSafeOps(divOp.getRhs()),
 +                         static_cast<float>(sumInputType.getShape().back()),
 +                         1e-3f)
 +                 ? checkReduction(sumOp)
-+                 : std::nullopt;
++                 : mlir::Value{};
 +    };
-+    std::optional<mlir::Value> reductionInput = getLastDimReductionInput(addOp.getLhs());
++    mlir::Value meanInput = getLastDimReductionInput(addOp.getLhs());
      mlir::Value epsilon = addOp.getRhs();
 -    if (!meanOp) {
 -      meanOp = addOp.getRhs().getDefiningOp<MeanOp>();
-+    if (!reductionInput) {
-+      reductionInput = getLastDimReductionInput(addOp.getRhs());
++    if (!meanInput) {
++      meanInput = getLastDimReductionInput(addOp.getRhs());
        epsilon = addOp.getLhs();
      }
 -    if (!meanOp) {
@@ -63,18 +74,21 @@
 -    int64_t dim = mlir::cast<mlir::IntegerAttr>((*dimArg)[0]).getInt();
 -    int64_t actualDim = dim < 0 ? meanInputType.getRank() + dim : dim;
 -    if (actualDim != meanInputType.getRank() - 1) {
--      return mlir::failure();
--    }
-+    if (!reductionInput) return mlir::failure();
++    if (!meanInput) {
+       return mlir::failure();
+     }
 
      // Match x^2 as mul(x,x) or pow(x,2).
 -    mlir::Value meanInput = meanOp.getInput();
-+    mlir::Value meanInput = *reductionInput;
      mlir::Value squareInput = nullptr;
 -    mlir::Value x = lookThroughSafeOps(xRaw);
 +    mlir::Value x = dropSubtractZero(xRaw);
 
-@@ -2728,3 +2732,8 @@ public:
+     if (auto sq = meanInput.getDefiningOp<MultiplyOp>()) {
+       if (sq.getLhs() == sq.getRhs()) {
+@@ -3032,7 +3060,12 @@
+     }
+
      if (!squareInput || squareInput != x) {
 -      return mlir::failure();
 +      mlir::Value swappedX = dropSubtractZero(gammaRaw);
@@ -84,12 +98,96 @@
 +      x = swappedX;
 +      gammaRaw = xRaw;
      }
-@@ -2967,2 +2994,4 @@ public:
- 
-+    rewriter.setInsertionPoint(outerMul);
+
+     auto epsFull = epsilon.getDefiningOp<FullOp>();
+@@ -3047,35 +3080,37 @@
+     mlir::Value gamma = lookThroughSafeOps(gammaRaw);
+     llvm::SmallVector<int64_t> normalizedShape{normalizedDimSize};
+
+-    // Reshape gamma to match normalized_shape if needed.
+-    // Gamma may have extra dimensions (e.g., [1, 1, 2048] instead of [2048]).
++    auto inputType = mlir::cast<RankedTensorType>(x.getType());
+     auto gammaType = mlir::cast<RankedTensorType>(gamma.getType());
+-    if (gammaType.getShape() != llvm::ArrayRef(normalizedShape)) {
+-      // Check if gamma can be squeezed to normalized_shape.
+-      // All dimensions except the last must be 1.
+-      for (int64_t i = 0; i < gammaType.getRank() - 1; ++i) {
+-        if (gammaType.getShape()[i] != 1) {
+-          return mlir::failure();
+-        }
++    // Gamma must be [D] or [1, ..., 1, D]. Validate before creating any ops.
++    auto gammaShape = gammaType.getShape();
++    if (gammaShape.empty() || gammaShape.back() != normalizedDimSize ||
++        !llvm::all_of(gammaShape.drop_back(),
++                      [](int64_t dim) { return dim == 1; })) {
++      return mlir::failure();
++    }
 +
-     // Reshape gamma to match normalized_shape if needed.
-@@ -3006,3 +3017 @@ public:
--    rewriter.setInsertionPoint(outerMul);
--
-     // Create RMSNormOp with output shape and dtype matching input.
++    // Gemma applies FP32 gamma before casting the normalized result back to
++    // BF16. Only absorb that cast when no other user needs the FP32 result.
++    mlir::Operation *root = outerMul;
++    if (inputType.getElementType().isBF16() &&
++        gammaType.getElementType().isF32()) {
++      if (!outerMul->hasOneUse()) {
++        return mlir::failure();
+       }
+-      // Check if the last dimension matches.
+-      if (gammaType.getShape().back() != normalizedShape[0]) {
++      auto outputCast =
++          mlir::dyn_cast<TypecastOp>(*outerMul->getUsers().begin());
++      if (!outputCast || !outputCast.getType().getElementType().isBF16()) {
+         return mlir::failure();
+       }
+-      // Reshape gamma to normalized_shape.
+-      auto reshapedGammaType = RankedTensorType::get(
+-          normalizedShape, gammaType.getElementType(), gammaType.getEncoding());
+-      llvm::SmallVector<int32_t> targetShape(normalizedShape.begin(),
+-                                             normalizedShape.end());
+-      gamma = rewriter.create<ReshapeOp>(outerMul.getLoc(), reshapedGammaType,
+-                                         gamma,
+-                                         rewriter.getI32ArrayAttr(targetShape));
++      root = outputCast;
++      outputType = outputCast.getType();
+     }
+
+     // Although the op can work with different dtypes, this is
+     // the indication that the matching is not correct.
+-    auto inputType = mlir::cast<RankedTensorType>(x.getType());
+-    if (inputType.getElementType() != gammaType.getElementType()) {
++    if (root == outerMul &&
++        inputType.getElementType() != gammaType.getElementType()) {
+       if (mlir::Operation *xOp = x.getDefiningOp()) {
+         x = utils::revertTypecastFolding(rewriter, xOp, x);
+         inputType = mlir::cast<RankedTensorType>(x.getType());
+@@ -3086,13 +3121,14 @@
+     }
+
+     rewriter.setInsertionPoint(outerMul);
++    if (gammaShape != llvm::ArrayRef(normalizedShape)) {
++      gamma = utils::createReshapeOp(rewriter, outerMul.getLoc(), gamma,
++                                     normalizedShape);
++    }
+
+-    // Create RMSNormOp with output shape and dtype matching input.
+-    auto rmsNormOutputType =
+-        RankedTensorType::get(inputType.getShape(), inputType.getElementType(),
+-                              inputType.getEncoding());
++    // RMSNorm preserves the input shape and dtype.
+     auto rmsNorm = rewriter.create<RMSNormOp>(
+-        outerMul.getLoc(), rmsNormOutputType, x, gamma,
++        outerMul.getLoc(), inputType, x, gamma,
+         /*bias=*/nullptr, rewriter.getDenseI64ArrayAttr(normalizedShape),
+         rewriter.getF32FloatAttr(epsAttr.getValue().convertToFloat()));
+
+@@ -3102,7 +3138,10 @@
+     result = utils::reshapeAndCastToType(rewriter, outerMul.getLoc(), result,
+                                          outputType);
+
+-    rewriter.replaceOp(outerMul, result);
++    rewriter.replaceOp(root, result);
++    if (root != outerMul) {
++      rewriter.eraseOp(outerMul);
++    }
+     return mlir::success();
+   }
+ };

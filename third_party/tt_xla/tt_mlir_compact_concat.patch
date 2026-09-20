@@ -1,0 +1,36 @@
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -2830,6 +2830,32 @@
+ //
+ void mlir::tt::ttir::ReshapeOp::getCanonicalizationPatterns(
+     mlir::RewritePatternSet &patterns, mlir::MLIRContext *context) {
++  // Fold matrix expansion/concat/collapse into a direct matrix concat, avoiding
++  // padding the inserted unit dimension to 32 rows in tiled storage.
++  patterns.add(+[](ReshapeOp reshape, PatternRewriter &rewriter) -> LogicalResult {
++    auto concat = reshape.getInput().getDefiningOp<ConcatOp>();
++    auto shape = reshape.getType().getShape();
++    if (!concat || !concat->hasOneUse() || shape.size() != 2 ||
++        concat.getType().getShape() !=
++            ArrayRef<int64_t>{shape[0], 1, shape[1]} ||
++        (concat.getDim() != 2 && concat.getDim() != -1)) {
++      return failure();
++    }
++    SmallVector<Value> inputs;
++    for (Value input : concat.getInputs()) {
++      auto expanded = input.getDefiningOp<ReshapeOp>();
++      if (!expanded ||
++          expanded.getInput().getType().getShape() !=
++              ArrayRef<int64_t>{shape[0], expanded.getType().getDimSize(2)}) {
++        return failure();
++      }
++      inputs.push_back(expanded.getInput());
++    }
++    auto replacement = rewriter.replaceOpWithNewOp<ConcatOp>(
++        reshape, reshape.getType(), inputs, 1);
++    replacement->setDiscardableAttrs(concat->getDiscardableAttrDictionary());
++    return success();
++  });
+   patterns.add(+[](mlir::tt::ttir::ReshapeOp trailingReshape,
+                    mlir::PatternRewriter &rewriter) -> LogicalResult {
+     auto permuteOp =

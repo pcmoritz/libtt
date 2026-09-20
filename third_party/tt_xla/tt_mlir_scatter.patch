@@ -179,10 +179,22 @@ index 2701ea4..487c93d 100644
        return rewriter.notifyMatchFailure(
            srcOp, "the scatter's update computation neither combines its "
                   "arguments nor returns the update value");
-@@ -7880,13 +8025,51 @@ public:
+@@ -7880,13 +8025,61 @@ public:
  
      RankedTensorType outputType = mlir::cast<RankedTensorType>(
          this->getTypeConverter()->convertType(srcOp.getResults()[0].getType()));
++    ArrayRef<int64_t> scatterDimsToOperandDims =
++        adaptor.getScatterDimensionNumbers().getScatterDimsToOperandDims();
++    // An overwrite of the entire operand needs no scatter at all.
++    if (unaryApply == UnaryScatterApplyKind::None &&
++        succeeded(foldFullOverwrite(srcOp, adaptor, scatterReduceType,
++                                    outputType, rewriter))) {
++      return success();
++    }
++    if (scatterDimsToOperandDims.empty()) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "scatter_dims_to_operand_dims must not be empty");
++    }
 +    Value inputTensor = srcOp.getInputs()[0];
 +    auto inputType = mlir::cast<RankedTensorType>(inputTensor.getType());
 +    ArrayRef<int64_t> inputShape = inputType.getShape();
@@ -213,8 +225,8 @@ index 2701ea4..487c93d 100644
      // A scatter that writes along at most one operand dimension is exactly what
      // ttir.scatter expresses, including the degenerate case of writing along
      // none of them.
-     ArrayRef<int64_t> scatterDimsToOperandDims =
-         adaptor.getScatterDimensionNumbers().getScatterDimsToOperandDims();
+-    ArrayRef<int64_t> scatterDimsToOperandDims =
+-        adaptor.getScatterDimensionNumbers().getScatterDimsToOperandDims();
 -    if (scatterDimsToOperandDims.size() <= 1) {
 +    ArrayRef<int64_t> insertedWindowDims =
 +        adaptor.getScatterDimensionNumbers().getInsertedWindowDims();
@@ -233,7 +245,7 @@ index 2701ea4..487c93d 100644
 +      return convertToSingleDimScatter(srcOp, adaptor, scatterReduceType,
                                         outputType, rewriter);
      }
-@@ -7894,15 +8077,31 @@ public:
+@@ -7894,15 +8087,31 @@ public:
      // Multi-dimensional scatter: flatten everything to 1D and scatter scalars
      // along dimension 0.
      constexpr int32_t SCATTER_DIMENSION = 0;
@@ -269,14 +281,14 @@ index 2701ea4..487c93d 100644
      Value flattenedInput = ttir::utils::flattenTensor(
          rewriter, srcOp.getLoc(), inputTensor, "_input_flatten");
      Value flattenedUpdate = ttir::utils::flattenTensor(
-@@ -7911,5 +8110,5 @@ public:
+@@ -7911,5 +8120,5 @@ public:
      Value scatterResult = rewriter.create<ttir::ScatterOp>(
          srcOp.getLoc(), mlir::cast<RankedTensorType>(flattenedInput.getType()),
          flattenedInput, flattenedIndices, flattenedUpdate,
          rewriter.getI32IntegerAttr(SCATTER_DIMENSION),
 -        ttcore::ReduceTypeAttr::get(rewriter.getContext(), *scatterReduceType));
 +        ttcore::ReduceTypeAttr::get(rewriter.getContext(), scatterReduceType));
-@@ -7920,6 +8119,10 @@ public:
+@@ -7920,6 +8129,10 @@ public:
          ttmlir::utils::appendLocationSuffix(srcOp.getLoc(), "_result_reshape"),
          scatterResult, inputShape);
  
@@ -287,7 +299,7 @@ index 2701ea4..487c93d 100644
      rewriter.replaceOp(srcOp, reshapedResult);
      return success();
    }
-@@ -7927,5 +8130,87 @@ private:
+@@ -7927,5 +8140,87 @@ private:
  private:
 +  LogicalResult convertUnaryScatterApply(
 +      mlir::stablehlo::ScatterOp srcOp, Value inputTensor,
@@ -375,17 +387,26 @@ index 2701ea4..487c93d 100644
    // from: how a StableHLO scatter lines up with the operand's dimensions.
    struct OperandDimSources {
      static constexpr int64_t kNone = -1;
-@@ -8322,11 +8607,13 @@ private:
+@@ -7996,10 +8291,4 @@
+                             RankedTensorType outputType,
+                             ConversionPatternRewriter &rewriter) const {
+-    // An overwrite of the entire operand needs no scatter at all.
+-    if (succeeded(foldFullOverwrite(srcOp, adaptor, reduceType, outputType,
+-                                    rewriter))) {
+-      return success();
+-    }
+-
+     OperandDimSources sources = computeOperandDimSources(srcOp);
+     if (failed(checkAlignedScatterLegality(srcOp, sources, rewriter))) {
+@@ -8322,11 +8611,9 @@ private:
      auto dimensionNumbers = adaptor.getScatterDimensionNumbers();
      ArrayRef<int64_t> scatterDimsToOperandDims =
          dimensionNumbers.getScatterDimsToOperandDims();
 -    if (!llvm::is_sorted(scatterDimsToOperandDims)) {
-+    if (scatterDimsToOperandDims.empty()) {
-       return rewriter.notifyMatchFailure(
+-      return rewriter.notifyMatchFailure(
 -          op,
 -          "scatter_dims_to_operand_dims must be in strictly increasing order.");
-+          op, "scatter_dims_to_operand_dims must not be empty");
-     }
+-    }
 +    // Index-vector columns map positionally to operand dimensions. Preserve
 +    // their StableHLO-specified order: JAX legitimately emits non-monotonic
 +    // mappings for mixed advanced indexing.
