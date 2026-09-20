@@ -1,9 +1,9 @@
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp
 new file mode 100644
-index 0000000..febb3dd
+index 0000000..b63b736
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,26 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -18,24 +18,16 @@ index 0000000..febb3dd
 +    return face * 256 + (row % 16) * 16 + column % 16;
 +}
 +
-+FORCE_INLINE uint32_t read_int32_tile(uint32_t address, uint32_t row, uint32_t column) {
++FORCE_INLINE uint32_t read_index(uint32_t address, uint32_t batch) {
 +    const volatile tt_l1_ptr uint32_t* tile =
 +        reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(address);
-+    return tile[tile_offset(row, column)];
-+}
-+
-+FORCE_INLINE bool read_bfloat16_tile(uint32_t address, uint32_t row, uint32_t column) {
-+    const volatile tt_l1_ptr uint16_t* tile =
-+        reinterpret_cast<const volatile tt_l1_ptr uint16_t*>(address);
-+    return tile[tile_offset(row, column)] != 0;
-+}
-+
-+FORCE_INLINE uint32_t read_index(uint32_t address, uint32_t batch) {
-+    return read_int32_tile(address, 0, batch);
++    return tile[tile_offset(0, batch)];
 +}
 +
 +FORCE_INLINE bool read_flag(uint32_t address, uint32_t batch) {
-+    return read_bfloat16_tile(address, 0, batch);
++    const volatile tt_l1_ptr uint16_t* tile =
++        reinterpret_cast<const volatile tt_l1_ptr uint16_t*>(address);
++    return tile[tile_offset(0, batch)] != 0;
 +}
 +
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
@@ -980,7 +972,7 @@ index 0000000..2df32b1
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
 new file mode 100644
-index 0000000..50ac022
+index 0000000..e981660
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
 @@ -0,0 +1,209 @@
@@ -1032,7 +1024,7 @@ index 0000000..50ac022
 +    Noc& noc, CircularBuffer& cb, uint32_t row, uint32_t column) {
 +    const uint32_t address = cb.get_write_ptr();
 +    volatile tt_l1_ptr uint32_t* tile = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(address);
-+    const uint32_t element = read_int32_tile(address, row, column);
++    const uint32_t element = tile[tile_offset(row, column)];
 +    noc.async_write_zeros(cb, 4096);
 +    noc.write_zeros_l1_barrier();
 +    tile[0] = element;
