@@ -101,10 +101,10 @@ index 0000000000000000000000000000000000000000..319385ff2c493681ca4984cc19b05cc1
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
 new file mode 100644
-index 0000000..41607f4
+index 0000000..70b15c7
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,144 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -131,18 +131,23 @@ index 0000000..41607f4
 +    }
 +}
 +
-+FORCE_INLINE void update_state_tile(
-+    uint32_t state_address, uint32_t input_address, uint32_t batch) {
++FORCE_INLINE void gather_and_update_state_tile(
++    uint32_t state_address, uint32_t operands_address, uint32_t batch) {
 +    volatile tt_l1_ptr uint16_t* state =
 +        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(state_address);
-+    const volatile tt_l1_ptr uint16_t* input =
-+        reinterpret_cast<const volatile tt_l1_ptr uint16_t*>(input_address);
++    volatile tt_l1_ptr uint16_t* operands =
++        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(operands_address);
 +    for (uint32_t channel = 0; channel < 32; ++channel) {
-+        const uint32_t old1 = tile_offset(channel, 1);
-+        const uint32_t old2 = tile_offset(channel, 2);
-+        state[tile_offset(channel, 0)] = state[old1];
-+        state[tile_offset(channel, 1)] = state[old2];
-+        state[tile_offset(channel, 2)] = input[tile_offset(batch, channel)];
++        const uint32_t source = tile_offset(channel, 0);
++        const uint32_t row = tile_offset(batch, channel);
++        const uint16_t old1 = state[source + 1];
++        const uint16_t old2 = state[source + 2];
++        operands[row] = state[source];
++        operands[2 * 1024 + row] = old1;
++        operands[4 * 1024 + row] = old2;
++        state[source] = old1;
++        state[source + 1] = old2;
++        state[source + 2] = operands[6 * 1024 + row];
 +    }
 +}
 +
@@ -235,13 +240,7 @@ index 0000000..41607f4
 +            }
 +            const uint32_t state_address =
 +                state_scratch.get_write_ptr() + batch * tile_bytes;
-+            for (uint32_t tap = 0; tap < 3; ++tap) {
-+                copy_channel_to_row(
-+                    state_address, tap,
-+                    operands_address + 2 * tap * tile_bytes, batch);
-+            }
-+            update_state_tile(
-+                state_address, operands_address + 6 * tile_bytes, batch);
++            gather_and_update_state_tile(state_address, operands_address, batch);
 +            noc.async_write(
 +                CoreLocalMem<uint32_t>(state_address), state, tile_bytes, {},
 +                {.page_id = slot * channel_tiles + channel_tile});
@@ -788,10 +787,10 @@ index 0000000000000000000000000000000000000000..56a7196bd2bd068667dc37fae1690a3a
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
 new file mode 100644
-index 0000000..7bf7855
+index 0000000..2df32b1
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,187 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -825,7 +824,6 @@ index 0000000..7bf7855
 +    constexpr uint32_t delta_time = tt::CBIndex::c_4;
 +    constexpr uint32_t beta_logits = tt::CBIndex::c_5;
 +    constexpr uint32_t state_mid = tt::CBIndex::c_6;
-+    constexpr uint32_t delta = tt::CBIndex::c_8;
 +    constexpr uint32_t key_transposed = tt::CBIndex::c_9;
 +    constexpr uint32_t scaled_delta = tt::CBIndex::c_10;
 +    constexpr uint32_t state_new = tt::CBIndex::c_11;
@@ -836,16 +834,16 @@ index 0000000..7bf7855
 +    constexpr uint32_t decay = tt::CBIndex::c_20;
 +
 +    // Configure the FP32 unpack/pack paths before the first compute API call.
-+    compute_kernel_hw_startup<SrcOrder::Reverse>(key, state, delta);
++    compute_kernel_hw_startup<SrcOrder::Reverse>(key, state, scaled_delta);
 +    matmul_init(key, state);
 +    for (uint32_t work = worker; work < batch_size * num_heads * workers_per_head; work += num_workers) {
 +    // beta = sigmoid(beta_logits)
 +    cb_wait_front(beta_logits, 1);
 +    cb_reserve_back(beta, 1);
-+    copy_tile_to_dst_init_short(beta_logits);
++    unary_bcast_init<BroadcastType::SCALAR>(beta_logits, beta);
 +    sigmoid_tile_init();
 +    tile_regs_acquire();
-+    copy_tile(beta_logits, 0, 0);
++    unary_bcast<BroadcastType::SCALAR>(beta_logits, 0, 0);
 +    sigmoid_tile(0);
 +    tile_regs_commit();
 +    tile_regs_wait();
@@ -902,12 +900,13 @@ index 0000000..7bf7855
 +    cb_push_back(state_mid, state_tiles);
 +    cb_pop_front(state, state_tiles);
 +
-+    // delta = value - key * state_mid; subtract before packing the matmul result.
-+    pack_reconfig_data_format(delta);
++    // scaled_delta = beta * (value - key * state_mid), all before packing.
++    pack_reconfig_data_format(scaled_delta);
 +    cb_wait_front(key, kt);
 +    cb_wait_front(state_mid, state_tiles);
 +    cb_wait_front(value, vt);
-+    cb_reserve_back(delta, vt);
++    cb_wait_front(beta, 1);
++    cb_reserve_back(scaled_delta, vt);
 +    for (uint32_t column = 0; column < vt; ++column) {
 +        reconfig_data_format<SrcOrder::Reverse>(key, state_mid);
 +        matmul_init(key, state_mid);
@@ -919,28 +918,16 @@ index 0000000..7bf7855
 +            EltwiseBinaryType::ELWSUB, EltwiseBinaryReuseDestType::DEST_TO_SRCB>(value);
 +        binary_dest_reuse_tiles<
 +            EltwiseBinaryType::ELWSUB, EltwiseBinaryReuseDestType::DEST_TO_SRCB>(value, column, 0);
++        binary_dest_reuse_tiles_init<
++            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(beta);
++        binary_dest_reuse_tiles<
++            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(beta, 0, 0);
 +        tile_regs_commit();
 +        tile_regs_wait();
-+        pack_tile(0, delta, column);
-+        tile_regs_release();
-+    }
-+    cb_push_back(delta, vt);
-+
-+    // scaled_delta = beta * delta
-+    mul_tiles_bcast_scalar_init_short(delta, beta);
-+    cb_wait_front(delta, vt);
-+    cb_wait_front(beta, 1);
-+    cb_reserve_back(scaled_delta, vt);
-+    for (uint32_t tile = 0; tile < vt; ++tile) {
-+        tile_regs_acquire();
-+        mul_tiles_bcast_scalar(delta, beta, tile, 0, 0);
-+        tile_regs_commit();
-+        tile_regs_wait();
-+        pack_tile(0, scaled_delta, tile);
++        pack_tile(0, scaled_delta, column);
 +        tile_regs_release();
 +    }
 +    cb_push_back(scaled_delta, vt);
-+    cb_pop_front(delta, vt);
 +
 +    // state_new = state_mid + key^T * scaled_delta
 +    cb_wait_front(key_transposed, kt);
@@ -1304,10 +1291,10 @@ index 0000000..ea01b86
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
 new file mode 100644
-index 0000000..4483a9d
+index 0000000..b7ced7a
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,258 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1449,7 +1436,6 @@ index 0000000..4483a9d
 +    make_cb(4, 1);            // delta time
 +    make_cb(5, 1);            // beta logits
 +    make_cb(6, state_tiles);  // decayed state
-+    make_cb(8, worker_vt);    // delta
 +    make_cb(9, kt);           // transposed key
 +    make_cb(10, worker_vt);   // scaled delta
 +    make_cb(11, state_tiles); // updated state
