@@ -534,7 +534,7 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.h b/runtime/lib/t
 diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,97 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +#include "operations/transformer/recurrent.h"
@@ -594,11 +594,10 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +  auto get = [&](const auto *ref) -> const ::ttnn::Tensor & {
 +    return pool.getTTNNTensorAndValidate(ref);
 +  };
-+  auto vector = [&](const auto *ref) {
-+    return tiled(get(ref), ::ttnn::DataType::FLOAT32);
-+  };
 +  auto output = ::ttnn::transformer::gated_delta_decode(
-+      vector(op->query()), vector(op->key()), vector(op->value()),
++      tiled(get(op->query()), ::ttnn::DataType::FLOAT32),
++      tiled(get(op->key()), ::ttnn::DataType::FLOAT32),
++      tiled(get(op->value()), ::ttnn::DataType::FLOAT32),
 +      tiled(get(op->beta_logits()), ::ttnn::DataType::FLOAT32),
 +      tiled(get(op->delta_time()), ::ttnn::DataType::FLOAT32),
 +      tiled(get(op->a_log()), ::ttnn::DataType::FLOAT32),
