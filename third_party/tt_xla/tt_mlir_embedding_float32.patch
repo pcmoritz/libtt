@@ -61,7 +61,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5049,6 +5049,40 @@
+@@ -5049,6 +5049,77 @@
      // checkBasicLegality and handled by StableHLOGatherIntToGatherPattern.
      GatherOperands ops = buildGatherOperands(srcOp, adaptor, rewriter);
  
@@ -71,11 +71,48 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    int64_t rowWidth = srcOp.getOperand().getType().getShape().back();
 +    auto weightType = ops.reshapedInput.getType();
 +    int64_t width = weightType.getDimSize(1);
++    int64_t count = ops.startIndices.getType().getNumElements();
++    // Gather scalar values from tile-wide rows instead of a padded [N, 1]
++    // embedding table. Only the selected rows need the final column gather.
++    if (width == 1 && weightType.getDimSize(0) % 32 == 0 &&
++        count <= weightType.getDimSize(0) / 32 &&
++        (weightType.getElementType().isBF16() ||
++         weightType.getElementType().isF32())) {
++      auto loc = srcOp.getLoc();
++      auto indices = ttir::utils::createReshapeOp(
++          rewriter, loc, ops.startIndices, {count, 1});
++      auto indexType = indices.getType();
++      auto constant = [&](int64_t value) {
++        auto type = indexType.clone({1, 1});
++        return rewriter.create<ttir::ConstantOp>(
++            loc, type, DenseElementsAttr::get(
++                           type, rewriter.getIntegerAttr(type.getElementType(), value)));
++      };
++      Value rows = rewriter.create<ttir::RightShiftOp>(
++          loc, indexType, indices, constant(5));
++      Value columns = rewriter.create<ttir::BitwiseAndOp>(
++          loc, indexType, indices, constant(31));
++      auto weights = ttir::utils::createReshapeOp(
++          rewriter, loc, ops.reshapedInput, {weightType.getDimSize(0) / 32, 32});
++      auto selected = rewriter.create<ttir::EmbeddingOp>(
++          loc, weightType.clone({count, 1, 32}), rows, weights);
++      auto selectedRows = ttir::utils::createReshapeOp(
++          rewriter, loc, selected.getResult(), {count, 32});
++      auto values = rewriter.create<ttir::GatherOp>(
++          loc, weightType.clone({count, 1}), selectedRows, columns,
++          rewriter.getI32IntegerAttr(1));
++      auto result = ttir::utils::createReshapeOp(
++          rewriter, loc, values.getResult(), ops.newOutputShape);
++      auto outputType = mlir::cast<RankedTensorType>(
++          getTypeConverter()->convertType(srcOp.getType()));
++      rewriter.replaceOp(srcOp, reshapeAndPermuteOutput(
++          rewriter, result.getResult(), ops.indexedDim, srcOp, outputType));
++      return success();
++    }
 +    if (srcOp.getOperand().getType().getRank() > 2 && rowWidth >= 32 &&
 +        rowWidth % 32 == 0 && width > rowWidth && width % rowWidth == 0) {
 +      auto loc = srcOp.getLoc();
 +      int64_t rows = width / rowWidth;
-+      int64_t count = ops.startIndices.getType().getNumElements();
 +      auto indices = ttir::utils::createReshapeOp(
 +          rewriter, loc, ops.startIndices, {count, 1});
 +      auto indexType = indices.getType();

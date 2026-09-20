@@ -40,3 +40,39 @@ def test_large_fp32_gather(trace, shape, axis):
         indices = np.array(indices, np.int32)
         result = run(jax.device_put(values, device), jax.device_put(indices, device))
         np.testing.assert_array_equal(np.asarray(result), np.take(values, indices, axis=axis))
+
+
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("shape", [(2, 16), (32, 129), (3, 5, 32)])
+def test_scalar_gather(trace, dtype, shape):
+    """Scalar indexing preserves tile boundaries, clipping and index shape."""
+    device = jax.devices("tt")[0]
+
+    def select(x, indices):
+        values = x * x
+        return values, values.at[indices].get(mode="clip")
+
+    run = jax.jit(
+        select,
+        compiler_options={
+            "optimization_level": "1",
+            "enable_trace": str(trace).lower(),
+        },
+    )
+    rng = np.random.default_rng(35)
+    for _ in range(3):
+        values = rng.normal(size=shape).astype(dtype)
+        indices = tuple(
+            rng.integers(-2 * size, 2 * size, size=(3, 4), dtype=np.int32)
+            for size in shape
+        )
+        clipped = tuple(
+            np.clip(np.where(index < 0, index + size, index), 0, size - 1)
+            for index, size in zip(indices, shape)
+        )
+        actual, selected = run(
+            jax.device_put(values, device),
+            tuple(jax.device_put(index, device) for index in indices),
+        )
+        np.testing.assert_array_equal(np.asarray(selected), np.asarray(actual)[clipped])
