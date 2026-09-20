@@ -91,3 +91,26 @@
      const bool rm_base_eligible =
          use_row_major_support && input_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR &&
          input_tensor.logical_shape().rank() == 4 && both_interleaved &&
+diff --git ttnn/cpp/ttnn/operations/reduction/argmax/argmax.cpp ttnn/cpp/ttnn/operations/reduction/argmax/argmax.cpp
+--- ttnn/cpp/ttnn/operations/reduction/argmax/argmax.cpp
++++ ttnn/cpp/ttnn/operations/reduction/argmax/argmax.cpp
+@@ -263,5 +263,18 @@
++    // The tiled W implementation scans on one core. For wide, short inputs,
++    // untilizing lets the existing row-major implementation share the work.
++    Tensor input = input_tensor;
++    if (input.layout() == Layout::TILE && dim.has_value() &&
++        (dim.value() == -1 || dim.value() == static_cast<int>(rank) - 1) &&
++        input_shape[-1] >= 4096 && input.logical_volume() / input_shape[-1] <= 32 &&
++        input.dtype() == DataType::BFLOAT16 &&
++        input.memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED &&
++        output_memory_config.memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED &&
++        !sub_core_grids.has_value()) {
++        input = ttnn::to_layout(input, Layout::ROW_MAJOR);
++    }
++
+     return prim::argmax(
+-        input_tensor,
++        input,
+         tt::tt_metal::DataType::UINT32,
+         dim,
+         keepdim,
