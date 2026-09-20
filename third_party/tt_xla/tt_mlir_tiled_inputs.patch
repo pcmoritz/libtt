@@ -1,0 +1,57 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+@@ -616,10 +616,6 @@
+         newType = toSystemMemoryType(funcOp.getContext(), currentType);
+       } else {
+         newType = currentType;
+-      }
+-
+-      if (shouldForceInputRowMajor(arg)) {
+-        newType = toRowMajorType(funcOp.getContext(), newType);
+       }
+
+       inputTypes.push_back(newType);
+@@ -717,42 +713,6 @@
+     }
+
+     return false;
+-  }
+-
+-  bool shouldForceInputRowMajor(BlockArgument arg) const {
+-    func::FuncOp owningFunc = cast<func::FuncOp>(arg.getOwner()->getParentOp());
+-
+-    // KV cache arguments should not be forced to row major.
+-    if (owningFunc.getArgAttr(arg.getArgNumber(), ttcore::g_kvCacheAttrName)) {
+-      return false;
+-    }
+-
+-    for (Operation *user : arg.getUsers()) {
+-      // MeshShardOp inputs should be tiled.
+-      if (mlir::isa<ttir::MeshShardOp, ttir::TTLangOp>(user)) {
+-        return false;
+-      }
+-    }
+-
+-    if (auto typeAttr = owningFunc.getArgAttrOfType<ttcore::ArgumentTypeAttr>(
+-            arg.getArgNumber(), ttcore::ArgumentTypeAttr::name)) {
+-      return typeAttr.getValue() == ttcore::ArgumentType::Input;
+-    }
+-    return false;
+-  }
+-
+-  RankedTensorType toRowMajorType(MLIRContext *ctx, RankedTensorType ty) const {
+-    BufferType bufferType = g_defaultMemorySpaceDevice;
+-
+-    // Preserve existing buffer type if encoding exists
+-    if (auto currentLayout =
+-            mlir::dyn_cast_if_present<TTNNLayoutAttr>(ty.getEncoding())) {
+-      bufferType = currentLayout.getBufferType();
+-    }
+-
+-    TTNNLayoutAttr rmLayout =
+-        createLayoutAttr(ctx, ty, bufferType, /*isTiled=*/false);
+-    return RankedTensorType::get(ty.getShape(), ty.getElementType(), rmLayout);
+   }
+ };
+ } // namespace

@@ -1057,3 +1057,36 @@ diff --git ttnn/cpp/ttnn/operations/sliding_window/halo/device/untilize_with_hal
              get_compute_kernel_config_args(input_tensor.device()->arch(), operation_attributes.compute_kernel_config);
 +        fp32_dest_acc_en &= input_tensor.dtype() != DataType::FLOAT16;
  
+diff --git ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.cpp
+@@ -79,15 +79,17 @@
+
+     const Tensor& input_tensor_a = tensor_args.input;
+     TT_FATAL(
+-        input_tensor_a.dtype() == DataType::BFLOAT16 or input_tensor_a.dtype() == DataType::BFLOAT8_B or
++        input_tensor_a.dtype() == DataType::FLOAT16 or input_tensor_a.dtype() == DataType::BFLOAT16 or
++            input_tensor_a.dtype() == DataType::BFLOAT8_B or
+             input_tensor_a.dtype() == DataType::FLOAT32 or input_tensor_a.dtype() == DataType::BFLOAT4_B or
+             input_tensor_a.dtype() == DataType::UINT32 or input_tensor_a.dtype() == DataType::INT32 or
+             input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::UINT8 or
+             input_tensor_a.dtype() == DataType::FP8_E4M3,
+-        "ttnn.copy only supports float, bfloat, fp8_e4m3, int32, uint32, uint16 and uint8 inputs but got {}",
++        "ttnn.copy only supports float16, float32, bfloat, fp8_e4m3, int32, uint32, uint16 and uint8 inputs but got {}",
+         input_tensor_a.dtype());
+     TT_FATAL(
+-        operation_attributes.output_dtype == DataType::BFLOAT16 or
++        operation_attributes.output_dtype == DataType::FLOAT16 or
++            operation_attributes.output_dtype == DataType::BFLOAT16 or
+             operation_attributes.output_dtype == DataType::BFLOAT8_B or
+             operation_attributes.output_dtype == DataType::FLOAT32 or
+             operation_attributes.output_dtype == DataType::BFLOAT4_B or
+@@ -96,7 +98,7 @@
+             operation_attributes.output_dtype == DataType::UINT16 or
+             operation_attributes.output_dtype == DataType::UINT8 or
+             operation_attributes.output_dtype == DataType::FP8_E4M3,
+-        "ttnn.copy only supports float, bfloat, fp8_e4m3, int32, uint32, uint16 and uint8 output tensors but got {}",
++        "ttnn.copy only supports float16, float32, bfloat, fp8_e4m3, int32, uint32, uint16 and uint8 output tensors but got {}",
+         operation_attributes.output_dtype);
+     TT_FATAL(input_tensor_a.storage_type() == StorageType::DEVICE, "Operands to copy need to be on device!");
+     TT_FATAL(input_tensor_a.buffer() != nullptr, "Operands to copy need to be allocated in buffers on device!");

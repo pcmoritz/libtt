@@ -1,16 +1,228 @@
 diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
-index 156ab6f..4ca3c8f 100644
 --- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 +++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
-@@ -353,26 +353,12 @@ static TraceVariant captureTrace(
+@@ -12,8 +12,9 @@
+ #include "tt/runtime/detail/ttnn/types/trace_cache.h"
+ #include "tt/runtime/detail/ttnn/types/types.h"
+ #include "tt/runtime/detail/ttnn/utils.h"
+ #include "tt/runtime/types.h"
++#include "ttnn/operations/data_movement/copy/copy.hpp"
+
+ namespace tt::runtime::ttnn::operations::trace {
+
+ static std::pair<MainProgramKey, CaptureExecuteProgramKey>
+@@ -72,45 +73,27 @@
+   }
+   return key;
+ }
+
+-static void copyTensorFromHostToDevice(const ::ttnn::Tensor &srcTensor,
+-                                       ::ttnn::Tensor &dstTensor) {
+-
+-  LOG_ASSERT(srcTensor.storage_type() == ::ttnn::StorageType::HOST &&
+-                 dstTensor.storage_type() == ::ttnn::StorageType::DEVICE,
+-             "srcTensor must be on host and dstTensor must be on device");
+-
+-  ::ttnn::copy_to_device(srcTensor, dstTensor);
+-}
+-
+-static void copyTensorFromDeviceToDevice(const ::ttnn::Tensor &srcTensor,
+-                                         ::ttnn::Tensor &dstTensor) {
+-  LOG_ASSERT(srcTensor.storage_type() == ::ttnn::StorageType::DEVICE &&
+-                 dstTensor.storage_type() == ::ttnn::StorageType::DEVICE,
+-             "srcTensor must be on device and dstTensor must be on device");
+-  ::ttnn::Tensor hostSrcTensor = ::ttnn::from_device(srcTensor);
+-  ::ttnn::copy_to_device(hostSrcTensor, dstTensor);
+-}
+-
+-// Runs the slot allocation program, which allocates the persistent device
+-// buffers this trace will read from and write to. Runs exactly once per trace.
+-//
+-// Its program inputs are the device-resident subset of the op's inputs (they
+-// act as their own slots); it returns the trace input slots followed by the
+-// trace output slots.
++static size_t numAliasedInputs(
++    const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
++    ProgramContext &context) {
++  return context.getExecutableHandle().getNumProgramInputs(
++      op->allocate_slots_program_id());
++}
++
++// Allocate private input/output slots, reusing the leading aliased inputs.
+ static std::vector<::tt::runtime::Tensor>
+ allocateTraceSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+                    ProgramContext &context) {
+   ProgramTensorPool &tensorPool = context.getTensorPool();
+   ::tt::runtime::Device deviceHandle = context.getDeviceHandle();
+
+   std::vector<::tt::runtime::Tensor> deviceResidentInputs;
+-  for (const ::tt::target::ttnn::TensorRef *input : *op->inputs()) {
+-    if (::tt::runtime::ttnn::utils::inDeviceMemory(input)) {
+-      deviceResidentInputs.push_back(
+-          tensorPool.getRuntimeTensorAndValidate(input));
+-    }
++  const size_t numAliased = numAliasedInputs(op, context);
++  for (size_t i = 0; i < numAliased; ++i) {
++    deviceResidentInputs.push_back(
++        tensorPool.getRuntimeTensorAndValidate(op->inputs()->Get(i)));
+   }
+
+   ProgramExecutor executor(deviceHandle, context.getExecutableHandle(),
+                            op->allocate_slots_program_id(),
+@@ -130,11 +113,9 @@
+   // alias caller-owned buffers. Retaining those buffers prevents donated
+   // inputs (notably KV caches) from being reclaimed after they rotate out of
+   // the trace cache.
+   for (size_t i = 0; i < slots.size(); ++i) {
+-    const bool callerOwnedDeviceInput =
+-        i < op->inputs()->size() &&
+-        ::tt::runtime::ttnn::utils::inDeviceMemory(op->inputs()->Get(i));
++    const bool callerOwnedDeviceInput = i < numAliased;
+     if (!callerOwnedDeviceInput) {
+       slots[i]
+           .as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN)
+           .setRetain(true);
+@@ -143,74 +124,31 @@
+
+   return slots;
+ }
+
+-// Copies the current values of the op's inputs into the persistent trace input
+-// slots.
+-//
+-// When deviceResidentOnly is set, only tensors that are on the device
+-// will be updated. This is used before trace capture, since the capture
+-// program will copy the host inputs into the slots itself.
+-//
+-// TODO(pilkic): we could align `executeTrace` to have the same logic for
+-// handling host inputs as `captureTrace`. That would simplify the contract,
+-// such that runtime is only responsible for updating device-resident inputs.
++// Refresh private slots before every replay. Trace output buffers can change
++// in place without changing their wrapper version. Aliased inputs already point
++// to the caller's buffers, as verified by deviceInputsMatch().
+ static void
+ updateTraceInputSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+-                      ProgramContext &context,
+-                      std::vector<::tt::runtime::Tensor> &inputSlots,
+-                      bool deviceResidentOnly = false) {
++                     ProgramContext &context,
++                     std::vector<::tt::runtime::Tensor> &inputSlots) {
+   LOG_ASSERT(op->inputs()->size() == inputSlots.size(),
+-             "Mismatched number of inputs, expected: ", op->inputs()->size(),
+-             " got: ", inputSlots.size());
+-
+-  for (size_t i = 0; i < op->inputs()->size(); i++) {
++             "Mismatched number of trace inputs");
++  for (size_t i = numAliasedInputs(op, context); i < inputSlots.size(); ++i) {
+     if (isTraceKeyInput(op, i)) {
+       continue;
+     }
+-    const ::tt::target::ttnn::TensorRef *input = op->inputs()->Get(i);
+-    const bool deviceResident =
+-        ::tt::runtime::ttnn::utils::inDeviceMemory(input);
+-    if (deviceResidentOnly && !deviceResident) {
+-      continue;
+-    }
+-
+-    const ::tt::runtime::ttnn::TTNNTensorWrapper &inputTensorWrapper =
+-        context.getTensorPool().getTTNNTensorWrapperAndValidate(input);
+-
+-    ::tt::runtime::ttnn::TTNNTensorWrapper &inputSlotWrapper =
+-        inputSlots[i].as<::tt::runtime::ttnn::TTNNTensorWrapper>(
+-            DeviceRuntime::TTNN);
+-
+-    // Constants/parameters and KV cache tensors live on device and persist
+-    // across trace executions, so their versions are expected to match.
+-    // Regular inputs live on host and change between executions, so a version
+-    // mismatch is the expected case — we copy them from host to device below.
+-    if (inputTensorWrapper.getVersion() == inputSlotWrapper.getVersion()) {
+-      continue;
+-    }
+-
+-    if (deviceResident) {
+-      // Device-resident tensors (constants/parameters/KV cache) can be
+-      // legitimately updated by the user (e.g. weight updates during
+-      // training). This is handled by copying the new device tensor into the
+-      // trace input slot on device.
+-      LOG_DEBUG("Device-resident tensor version changed "
+-                "(constant/parameter or KV cache). Input index: ",
+-                i, ", expected version: ", inputSlotWrapper.getVersion());
+-      copyTensorFromDeviceToDevice(inputTensorWrapper.getTensor(),
+-                                   inputSlotWrapper.getTensor());
++    const auto *input = op->inputs()->Get(i);
++    const auto &source =
++        context.getTensorPool().getTTNNTensorAndValidate(input);
++    auto &destination =
++        inputSlots[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
++    if (::tt::runtime::ttnn::utils::inDeviceMemory(input)) {
++      ::ttnn::copy(source, destination);
+     } else {
+-      // Regular inputs reside on host and are copied into their trace input
+-      // slots on device. A version mismatch is expected here since the host
+-      // tensor can change.
+-      copyTensorFromHostToDevice(inputTensorWrapper.getTensor(),
+-                                 inputSlotWrapper.getTensor());
+-    }
+-
+-    // Input slot will now contain identical data as the input tensor
+-    // Thus we can synchronize their versions
+-    inputSlotWrapper.syncVersion(inputTensorWrapper);
++      ::ttnn::copy_to_device(source, destination);
++    }
+   }
+ }
+
+ // Publishes the persistent output slots as the op's outputs.
+@@ -245,19 +183,19 @@
+     std::vector<::tt::runtime::Tensor> &outputSlots,
+     const std::vector<std::int64_t> &traceKey) {
+   ProgramTensorPool &tensorPool = context.getTensorPool();
+   ::tt::runtime::Device deviceHandle = context.getDeviceHandle();
+-  // Program inputs are, in order: the host-staged inputs, the trace input
++  // Program inputs are, in order: the staged inputs, the trace input
+   // slots, then the trace output slots - matching the capture function's
+   // signature. ProgramExecutor holds pointers into this vector, so it must
+   // outlive the executor.
+   std::vector<::tt::runtime::Tensor> captureInputs;
+   captureInputs.reserve(op->inputs()->size() + inputSlots.size() +
+                         outputSlots.size());
+-  for (const ::tt::target::ttnn::TensorRef *input : *op->inputs()) {
+-    if (!::tt::runtime::ttnn::utils::inDeviceMemory(input)) {
+-      captureInputs.push_back(tensorPool.getRuntimeTensorAndValidate(input));
+-    }
++  const size_t numAliased = numAliasedInputs(op, context);
++  for (size_t i = numAliased; i < op->inputs()->size(); ++i) {
++    captureInputs.push_back(
++        tensorPool.getRuntimeTensorAndValidate(op->inputs()->Get(i)));
+   }
+   captureInputs.insert(captureInputs.end(), inputSlots.begin(),
+                        inputSlots.end());
+   captureInputs.insert(captureInputs.end(), outputSlots.begin(),
+@@ -283,12 +221,10 @@
+   LOG_ASSERT(traceIdTensor.dtype() == ::ttnn::DataType::UINT32,
+              "Trace ID must be UINT32");
+
+   std::vector<::tt::runtime::Tensor> ownedTensors;
+-  for (size_t i = 0; i < op->inputs()->size(); ++i) {
+-    if (!::tt::runtime::ttnn::utils::inDeviceMemory(op->inputs()->Get(i))) {
+-      ownedTensors.push_back(inputSlots[i]);
+-    }
++  for (size_t i = numAliased; i < inputSlots.size(); ++i) {
++    ownedTensors.push_back(inputSlots[i]);
+   }
+   ownedTensors.insert(ownedTensors.end(), outputSlots.begin(),
+                       outputSlots.end());
+
+@@ -310,35 +246,21 @@
+
  static void executeTrace(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
                           ProgramContext &context,
                           TraceVariant &variant) {
 -  ::tt::runtime::Device deviceHandle = context.getDeviceHandle();
 +  ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();
- 
+
    updateTraceInputSlots(op, context, variant.inputTensors);
- 
+
 -  ::ttnn::Tensor traceIdTensor =
 -      ::tt::runtime::ttnn::utils::createTTNNTensor<uint32_t>(
 -          &variant.traceId.get(), ::ttnn::Shape(), ::ttnn::DataType::UINT32);
@@ -29,6 +241,61 @@ index 156ab6f..4ca3c8f 100644
 -  executor.execute();
 +  ::ttnn::operations::trace::execute_trace(
 +      &meshDevice, variant.traceId, ::ttnn::QueueId(0), /*blocking=*/false);
- 
+
    publishTraceOutputs(op, context, variant.outputTensors);
  }
+
+-// A device-resident trace input is captured by address, unlike a host input
+-// whose current value is copied into a persistent slot before replay. A trace
+-// variant can therefore only be reused when each device input is the same
++// An aliased trace input is captured by address, while ordinary inputs are
++// copied into private slots before replay. A trace variant can therefore only
++// be reused when each aliased input is the same
+ // runtime tensor it was captured with. In particular, donated KV-cache calls
+ // may use the same executable with different cache buffers; replaying the old
+ // trace would mutate the old buffer while the enclosing program returns the
+ // new one.
+@@ -346,13 +268,11 @@
+     const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+     ProgramContext &context, const TraceVariant &variant) {
+   LOG_ASSERT(op->inputs()->size() == variant.inputTensors.size(),
+              "Mismatched number of trace inputs");
+-  for (size_t i = 0; i < op->inputs()->size(); ++i) {
++  const size_t numAliased = numAliasedInputs(op, context);
++  for (size_t i = 0; i < numAliased; ++i) {
+     const ::tt::target::ttnn::TensorRef *input = op->inputs()->Get(i);
+-    if (!::tt::runtime::ttnn::utils::inDeviceMemory(input)) {
+-      continue;
+-    }
+     const ::ttnn::Tensor &current =
+         context.getTensorPool().getTTNNTensorAndValidate(input);
+     const ::ttnn::Tensor &captured =
+         variant.inputTensors[i]
+@@ -399,16 +319,8 @@
+         slots.begin(), slots.begin() + numInputSlots);
+     std::vector<::tt::runtime::Tensor> outputSlots(
+         slots.begin() + numInputSlots, slots.end());
+
+-    // Fill the input slots before capturing; writes are rejected once the
+-    // capture window is open. The capture program does this itself for the
+-    // host-staged inputs it receives, so this only has to cover the
+-    // device-resident slots, which alias their inputs and are therefore
+-    // version-matched no-ops. Keeping the call here means the capture path and
+-    // the execute path establish the slots identically.
+-    updateTraceInputSlots(op, context, inputSlots,
+-                          /*deviceResidentOnly=*/true);
+     TraceData traceData;
+     traceData.variants.push_back(
+         captureTrace(op, context, inputSlots, outputSlots, traceKey));
+     traceCache->insert(mainProgramKey, captureExecuteKey, std::move(traceData));
+@@ -475,10 +387,8 @@
+     inputSlots.assign(slots.begin(), slots.begin() + numInputSlots);
+     outputSlots.assign(slots.begin() + numInputSlots, slots.end());
+   }
+
+-  updateTraceInputSlots(op, context, inputSlots,
+-                        /*deviceResidentOnly=*/true);
+   traceData->variants.push_back(
+       captureTrace(op, context, inputSlots, outputSlots, traceKey));
+
+   debug::Stats::get().incrementStat("TraceStaleRecapture");

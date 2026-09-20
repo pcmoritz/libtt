@@ -451,6 +451,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_trace_passthrough_outputs.patch",
         "//third_party/tt_xla:tt_mlir_synchronize_trace_capture.patch",
         "//third_party/tt_xla:tt_mlir_cond_trace.patch",
+        "//third_party/tt_xla:tt_mlir_tiled_inputs.patch",
         "//third_party/tt_xla:tt_mlir_trace_hot_path.patch",
         "//third_party/tt_xla:tt_mlir_emitc_incomplete_type.patch",
         "//third_party/tt_xla:tt_mlir_row_major_stop_fixup.patch",
@@ -463,6 +464,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_cached_output_ownership.patch",
         "//third_party/tt_xla:tt_mlir_recurrent_attention.patch",
         "//third_party/tt_xla:tt_mlir_integer_gather_offsets.patch",
+        "//third_party/tt_xla:tt_mlir_trace_device_inputs.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

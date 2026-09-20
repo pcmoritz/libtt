@@ -1,0 +1,230 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -3854,12 +3854,11 @@
+
+   let results = (outs Variadic<AnyRankedTensor>:$results);
+
+   let extraClassDeclaration = [{
+-    // Partitions the trace input indices into device-resident inputs (already
+-    // in device memory, acting as their own persistent slots) and host-staged
+-    // inputs. The runtime makes the same split from the storage type recorded
+-    // in the flatbuffer, so the two must agree.
++    // The first N inputs alias caller-owned slots, where N is the argument
++    // count of allocate_slots_callee. Remaining inputs are copied into private
++    // slots from their current memory space. The runtime uses the same split.
+     std::pair<llvm::SmallVector<size_t>, llvm::SmallVector<size_t>>
+     partitionInputIndices();
+   }];
+
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -5597,11 +5597,13 @@
+ std::pair<llvm::SmallVector<size_t>, llvm::SmallVector<size_t>>
+ CaptureOrExecuteTraceOp::partitionInputIndices() {
+   llvm::SmallVector<size_t> deviceResidentIndices;
+   llvm::SmallVector<size_t> hostStagedIndices;
+-  for (auto [i, input] : llvm::enumerate(getInputs())) {
+-    auto tensorType = mlir::cast<RankedTensorType>(input.getType());
+-    if (utils::isTensorOnDevice(tensorType)) {
++  auto allocateFunc = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
++      *this, getAllocateSlotsCalleeAttr());
++  size_t numAliased = allocateFunc ? allocateFunc.getNumArguments() : 0;
++  for (size_t i = 0; i < getInputs().size(); ++i) {
++    if (i < numAliased) {
+       deviceResidentIndices.push_back(i);
+     } else {
+       hostStagedIndices.push_back(i);
+     }
+@@ -5629,11 +5631,10 @@
+                            << " must reside in system memory";
+     }
+   }
+
+-  // An input already on device acts as its own persistent slot and is handed
+-  // to the allocation program, while an input in system memory is staged into
+-  // a freshly allocated slot by the capture program.
++  // The allocation program accepts the leading aliased inputs. All remaining
++  // inputs are copied into private slots, from either host or device memory.
+   auto [deviceResidentIndices, hostStagedIndices] = partitionInputIndices();
+   llvm::SmallVector<mlir::Type> deviceResidentInputTypes;
+   llvm::SmallVector<mlir::Type> hostStagedInputTypes;
+   for (size_t i : deviceResidentIndices) {
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -121,9 +121,9 @@
+   // 1. Direct BlockArgument → checks shouldKeepArgOnDevice
+   // 2. LoadCachedOp result → always device-resident (consteval)
+   // 3. ttnn.empty / ttnn.alloc result → prelude-allocated device scratch
+   //    buffer (e.g. stats scratch for distributed_rms_norm) that must be
+-  //    passed through, not host-staged.
++  //    passed through, not staged.
+   bool isDeviceResidentValue(mlir::Value value) {
+     if (auto blockArg = mlir::dyn_cast<BlockArgument>(value)) {
+       auto funcOp =
+           mlir::dyn_cast<func::FuncOp>(blockArg.getOwner()->getParentOp());
+@@ -269,20 +269,20 @@
+     return inputAttrs;
+   }
+
+   // Describes the trace-main function: the hoisted computation's boundary
+-  // values, the device-resident/host-staged partition of its tensor inputs,
++  // values, the aliased/staged partition of its tensor inputs,
+   // and the persistent slot types derived from them. Computed once when the
+   // trace-main function is created; the slot allocation, capture, and execute
+   // functions - and the trace op itself - all derive their signatures from
+   // it, which is what keeps them mutually consistent. All indices refer to
+   // trace-main's [tensor inputs][output slots][semaphores] argument order,
+-  // with device-resident tensors grouped before host-staged ones.
++  // with device-resident tensors grouped before staged ones.
+   struct TraceMainFuncInfo {
+     // The trace-main function itself.
+     func::FuncOp traceFunc;
+     // Values of the original function feeding the trace, device-resident
+-    // tensors first, then host-staged tensors, then semaphores.
++    // tensors first, then staged tensors, then semaphores.
+     llvm::SmallVector<mlir::Value> boundaryInputs;
+     // Values of the original function that the trace produces.
+     llvm::SmallVector<mlir::Value> boundaryOutputs;
+     // (result, input) pairs for optimization barriers that return an existing
+@@ -290,27 +290,21 @@
+     // outside the trace receive the original input directly.
+     llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> passthroughOutputs;
+     // Number of leading tensor input arguments.
+     size_t numTensorInputs = 0;
+-    // Split point of the tensor input indices [0, numTensorInputs):
+-    // [0, numDeviceResident) is device-resident, the rest is host-staged. A
+-    // device-resident input (constant/parameter/KV cache, or a
+-    // prelude-allocated scratch buffer) needs no host staging and acts as its
+-    // own persistent input slot; everything else is staged from host into a
+-    // freshly allocated slot. This partition is the compile-time twin of the
+-    // runtime's storage-type test on the trace op's inputs:
+-    // insertCaptureOrExecuteTraceOp forwards device-resident inputs on device
+-    // and converts the rest to system memory, and the runtime uses the
+-    // resulting storage type to decide which inputs to pass to which program.
++    // Leading device inputs (parameters, caches and persistent scratch) alias
++    // their slots. The remaining inputs are copied into private slots from
++    // either host or device memory. The allocation function takes only aliased
++    // inputs, so its argument count defines the same partition at runtime.
+     size_t numDeviceResident = 0;
+     // Persistent slot type per tensor input argument: a device-resident
+-    // argument is its own slot and keeps its type; a host-staged argument
++    // argument is its own slot and keeps its type; a staged argument
+     // gets a DRAM slot to be written into.
+     llvm::SmallVector<mlir::Type> inputSlotTypes;
+     // Original arg attrs per tensor input argument, as set on trace-main's
+     // arguments. Never null: missing attrs are normalized to empty dicts.
+     // Slot arguments derived from these follow one rule: a device-resident
+-    // slot is the original argument and keeps its attrs; a host-staged slot
++    // slot is the original argument and keeps its attrs; a staged slot
+     // is a fresh buffer and gets none.
+     llvm::SmallVector<mlir::DictionaryAttr> inputArgAttrs;
+     // Types of the output slot arguments (also the trace op's result types).
+     llvm::SmallVector<mlir::Type> outputSlotTypes;
+@@ -374,9 +368,9 @@
+            !isSemaphoreValue(inputs[numTensorInputs])) {
+       numTensorInputs++;
+     }
+
+-    // Group device-resident tensor inputs ahead of host-staged ones, so each
++    // Group device-resident tensor inputs ahead of staged ones, so each
+     // partition is a contiguous range and the downstream builders can slice
+     // rather than gather.
+     size_t numDeviceResident =
+         std::stable_partition(
+@@ -556,9 +550,9 @@
+   // cached traces have baked into their command streams.
+   //
+   // Signature: (device-resident tensor args) -> (input slots..., output
+   // slots...) Device-resident arguments are passed through as their own slots;
+-  // host-staged inputs and all outputs get freshly allocated DRAM slots.
++  // staged inputs and all outputs get freshly allocated DRAM slots.
+   mlir::LogicalResult
+   createAllocateSlotsTraceFunction(func::FuncOp funcOp, uint64_t traceFuncIndex,
+                                    const TraceMainFuncInfo &info) {
+     mlir::MLIRContext *context = &this->getContext();
+@@ -623,9 +617,9 @@
+   // very same slots, to recapture a stale trace. Because it allocates no
+   // persistent buffer of its own, a recapture leaves the allocator untouched.
+   //
+   // Signature:
+-  //   (host-staged inputs..., input slots..., output slots..., semaphores...)
++  //   (staged inputs..., input slots..., output slots..., semaphores...)
+   //     -> trace id
+   mlir::LogicalResult
+   createRunAndCaptureTraceFunction(func::FuncOp funcOp, uint64_t traceFuncIndex,
+                                    const TraceMainFuncInfo &info) {
+@@ -636,18 +630,15 @@
+     func::FuncOp traceFunc = info.traceFunc;
+     llvm::SmallVector<mlir::Type> argTypes;
+     llvm::SmallVector<mlir::DictionaryAttr> argAttrs;
+
+-    // Host-staged inputs, in system memory, to be written into their slots.
++    // Staged inputs retain their memory space and are copied into private slots.
+     for (size_t argIndex : info.hostStagedIndices()) {
+-      auto originalType =
+-          mlir::cast<RankedTensorType>(info.boundaryInputs[argIndex].getType());
+-      argTypes.push_back(utils::RankedTensorTypeFactory::create(
+-          originalType, BufferType::SystemMemory));
++      argTypes.push_back(info.boundaryInputs[argIndex].getType());
+       argAttrs.push_back(info.inputArgAttrs[argIndex]);
+     }
+     // Input slots, then output slots, then semaphores. A device-resident slot
+-    // is the original argument and keeps its attrs; a host-staged slot is a
++    // is the original argument and keeps its attrs; a staged slot is a
+     // fresh buffer and gets none.
+     for (size_t argIndex : info.deviceResidentIndices()) {
+       argTypes.push_back(info.inputSlotTypes[argIndex]);
+       argAttrs.push_back(info.inputArgAttrs[argIndex]);
+@@ -705,11 +696,17 @@
+       if (info.isTraceKeyInput(argIndex)) {
+         traceCallArgs[argIndex] = captureFunc.getArgument(h);
+         continue;
+       }
+-      builder.create<ttnn::WriteTensorOp>(
+-          captureFunc.getLoc(), captureFunc.getArgument(h),
+-          inputSlots[argIndex], /*blocking=*/false, /*cq_id=*/0);
++      auto input = captureFunc.getArgument(h);
++      if (utils::isTensorOnDevice(mlir::cast<RankedTensorType>(input.getType()))) {
++        builder.create<ttnn::CopyOp>(captureFunc.getLoc(), input,
++                                     inputSlots[argIndex]);
++      } else {
++        builder.create<ttnn::WriteTensorOp>(
++            captureFunc.getLoc(), input, inputSlots[argIndex],
++            /*blocking=*/false, /*cq_id=*/0);
++      }
+     }
+
+     // Append output slots and semaphores in trace function argument order.
+     llvm::append_range(traceCallArgs, traceOutputSlots);
+@@ -972,26 +969,11 @@
+             "system memory");
+       }
+       tensorInputs[argIndex] = input;
+     }
+-    // Host-staged inputs are converted to system memory if needed.
++    // Ordinary inputs have private slots, even when already on device.
+     for (size_t argIndex : info.hostStagedIndices()) {
+-      mlir::Value input = info.boundaryInputs[argIndex];
+-      auto tensorType = mlir::cast<RankedTensorType>(input.getType());
+-      auto layout = mlir::cast<ttnn::TTNNLayoutAttr>(tensorType.getEncoding());
+-      if (layout.getBufferType() != ttnn::BufferType::SystemMemory) {
+-        // Convert to system memory using ToTensorSpecOp
+-        RankedTensorType systemMemoryTileType =
+-            utils::RankedTensorTypeFactory::create(
+-                tensorType, ttnn::BufferType::SystemMemory);
+-
+-        auto toTensorSpecOp = builder.create<ttnn::ToTensorSpecOp>(
+-            funcOp.getLoc(), systemMemoryTileType, input);
+-        tensorInputs[argIndex] = toTensorSpecOp.getResult();
+-      } else {
+-        // Already on system memory
+-        tensorInputs[argIndex] = input;
+-      }
++      tensorInputs[argIndex] = info.boundaryInputs[argIndex];
+     }
+
+     auto traceOp = builder.create<ttnn::CaptureOrExecuteTraceOp>(
+         funcOp.getLoc(), info.outputSlotTypes, device,
