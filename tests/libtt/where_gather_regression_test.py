@@ -17,7 +17,7 @@ def test_where_after_gather(trace, dtype):
 
     compiled = jax.jit(
         select,
-        compiler_options={"optimization_level": "1", "enable_trace": str(trace).lower()},
+        compiler_options={"optimization_level": "O1", "enable_trace": str(trace).lower()},
     )
     indices = np.array([4, 2, 0, 1], dtype=np.int32)
     # Changing shapes exposed an invalid row-major where payload in optimized

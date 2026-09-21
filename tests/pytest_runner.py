@@ -52,6 +52,13 @@ def main() -> int:
         str(Path(os.environ.get("TEST_TMPDIR", "/tmp")) / "jax_compilation_cache"),
     )
 
+    # Newer JAX wheels omit this helper required by the upstream tests.
+    source_helpers = test_root / "jax" / "_src"
+    if source_helpers.is_dir():
+        import jax._src
+
+        jax._src.__path__.append(str(source_helpers))
+
     if not args.skip_device_check:
         import jax
 

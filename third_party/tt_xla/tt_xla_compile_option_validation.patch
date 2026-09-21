@@ -153,7 +153,7 @@ diff --git a/pjrt_implementation/src/api/error_instance.cc b/pjrt_implementation
  ErrorInstance::ErrorInstance(tt_pjrt_status status)
      : m_status(status),
        m_message(
-@@ -34,6 +51,9 @@ ErrorInstance::ErrorInstance(tt_pjrt_status status)
+@@ -34,8 +51,14 @@ ErrorInstance::ErrorInstance(tt_pjrt_status status)
                ? "OK"
                : ("Error code: " + std::to_string(static_cast<int>(status)))) {}
 
@@ -163,3 +163,8 @@ diff --git a/pjrt_implementation/src/api/error_instance.cc b/pjrt_implementation
  void ErrorInstance::bindApi(PJRT_Api *api) {
    api->PJRT_Error_Destroy = internal::onErrorDestroy;
    api->PJRT_Error_Message = internal::onErrorMessage;
+   api->PJRT_Error_GetCode = internal::onErrorGetCode;
++  // Errors contain only a code and message, with no auxiliary payloads.
++  api->PJRT_Error_ForEachPayload =
++      [](PJRT_Error_ForEachPayload_Args *) -> PJRT_Error * { return nullptr; };
+ }

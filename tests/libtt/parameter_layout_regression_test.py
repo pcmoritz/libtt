@@ -9,7 +9,7 @@ import pytest
 @pytest.mark.parametrize("trace", [False, True])
 def test_parameter_layouts(trace):
     device = jax.devices("tt")[0]
-    options = {"optimization_level": "1", "enable_trace": str(trace).lower()}
+    options = {"optimization_level": "O1", "enable_trace": str(trace).lower()}
 
     def forward(x, weight, cast):
         weight = jax.ffi.ffi_call(

@@ -24,7 +24,7 @@ def test_reshape_rows(trace, dtype, shape, width):
     run = jax.jit(
         lambda x: x.reshape(-1, width),
         compiler_options={
-            "optimization_level": "1",
+            "optimization_level": "O1",
             "enable_trace": str(trace).lower(),
         },
     )

@@ -1,0 +1,16 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -637,6 +637,12 @@
+     }
+
+     mlir::Value val = inputs.back();
++    // An iota with one element is folded to a zero constant before conversion.
++    if (auto constant = val.getDefiningOp<mlir::stablehlo::ConstantOp>()) {
++      auto indices = mlir::dyn_cast<DenseIntElementsAttr>(constant.getValue());
++      return indices && indices.getNumElements() == 1 &&
++             indices.getSplatValue<APInt>().isZero();
++    }
+     auto *op = val.getDefiningOp();
+
+     // IotaOp can be preceded by either a BroadcastInDim or a Reshape.

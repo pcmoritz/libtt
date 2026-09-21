@@ -12,7 +12,7 @@ def test_searchsorted_optimized(trace, side):
     device = jax.devices("tt")[0]
     search = jax.jit(
         lambda boundaries, values: jnp.searchsorted(boundaries, values, side=side),
-        compiler_options={"optimization_level": "1", "enable_trace": str(trace).lower()},
+        compiler_options={"optimization_level": "O1", "enable_trace": str(trace).lower()},
     )
     # Duplicate boundaries represent empty/padded requests in ragged prefill.
     # Change both arguments after warmup so replay must use current inputs.

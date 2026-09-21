@@ -31,10 +31,13 @@ index 6dd09d5..f2b67d7 100644
  };
  
  namespace internal {
-@@ -131,6 +138,12 @@ onDeviceAddressableMemories(PJRT_Device_AddressableMemories_Args *args);
+@@ -131,6 +138,15 @@ onDeviceAddressableMemories(PJRT_Device_AddressableMemories_Args *args);
  // Implements PJRT_Device_DefaultMemory API function.
  PJRT_Error *onDeviceDefaultMemory(PJRT_Device_DefaultMemory_Args *args);
  
++// Implements PJRT_Device_GetAttributes API function.
++PJRT_Error *onDeviceGetAttributes(PJRT_Device_GetAttributes_Args *args);
++
 +// Implements PJRT_Device_MemoryStats API function.
 +PJRT_Error *onDeviceMemoryStats(PJRT_Device_MemoryStats_Args *args);
 +
@@ -48,19 +51,34 @@ diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementatio
 index 7766535..0bf19b5 100644
 --- a/pjrt_implementation/src/api/device_instance.cc
 +++ b/pjrt_implementation/src/api/device_instance.cc
-@@ -43,6 +43,8 @@ void DeviceInstance::bindApi(PJRT_Api *api) {
+@@ -43,6 +43,9 @@ void DeviceInstance::bindApi(PJRT_Api *api) {
    api->PJRT_Device_LocalHardwareId = internal::onDeviceLocalHardwareId;
    api->PJRT_Device_AddressableMemories = internal::onDeviceAddressableMemories;
    api->PJRT_Device_DefaultMemory = internal::onDeviceDefaultMemory;
++  api->PJRT_Device_GetAttributes = internal::onDeviceGetAttributes;
 +  api->PJRT_Device_MemoryStats = internal::onDeviceMemoryStats;
 +  api->PJRT_Device_ClearMemoryStats = internal::onDeviceClearMemoryStats;
  }
  
  namespace internal {
-@@ -98,6 +100,44 @@ PJRT_Error *onDeviceDefaultMemory(PJRT_Device_DefaultMemory_Args *args) {
+@@ -98,6 +101,58 @@ PJRT_Error *onDeviceDefaultMemory(PJRT_Device_DefaultMemory_Args *args) {
    return nullptr;
  };
  
++PJRT_Error *onDeviceGetAttributes(PJRT_Device_GetAttributes_Args *args) {
++  ZoneScoped;
++  DLOG_F(LOG_DEBUG, "DeviceInstance::PJRT_Device_GetAttributes");
++
++  const auto &attributes =
++      DeviceInstance::unwrap(args->device)->getDeviceDescription().getAttributes();
++  args->attributes = attributes.data();
++  args->num_attributes = attributes.size();
++  // The device description owns these attributes for the client's lifetime.
++  args->device_attributes = nullptr;
++  args->attributes_deleter = [](PJRT_Device_Attributes *) {};
++  return nullptr;
++}
++
 +PJRT_Error *onDeviceMemoryStats(PJRT_Device_MemoryStats_Args *args) {
 +  ZoneScoped;
 +  DLOG_F(LOG_DEBUG, "DeviceInstance::PJRT_Device_MemoryStats");
@@ -102,3 +120,14 @@ index 7766535..0bf19b5 100644
  } // namespace internal
  
  } // namespace tt::pjrt
+diff --git a/pjrt_implementation/inc/api/memory_instance.h b/pjrt_implementation/inc/api/memory_instance.h
+--- a/pjrt_implementation/inc/api/memory_instance.h
++++ b/pjrt_implementation/inc/api/memory_instance.h
+@@ -81,4 +81,7 @@ private:
+                  size_t id, bool is_host_memory);
+
++  // PJRT_Memory's optional function table must be the first field.
++  const PJRT_Memory_FunctionTable *m_vtable = nullptr;
++
+   // List of devices that can access this memory.
+   std::vector<DeviceInstance *> m_addressable_by_devices;
