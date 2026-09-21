@@ -1,0 +1,690 @@
+diff --git a/include/ttmlir/Dialect/TTIR/Transforms/Passes.td b/include/ttmlir/Dialect/TTIR/Transforms/Passes.td
+index 7ade81082..9a9aa659e 100644
+--- a/include/ttmlir/Dialect/TTIR/Transforms/Passes.td
++++ b/include/ttmlir/Dialect/TTIR/Transforms/Passes.td
+@@ -316,6 +316,10 @@ def TTIRFusing: Pass<"ttir-fusing", "::mlir::ModuleOp">
+              "enable-permute-slice-after-matmul-fusion",
+              "bool", /*default=*/"true",
+              "Push a matmul/linear output slice into the operand producing the sliced dim">,
++      Option<"ropeFusionEnabled",
++             "enable-rope-fusion",
++             "bool", /*default=*/"true",
++             "Fuse primitive rotary embedding graphs into a named composite">,
+   ];
+ }
+ 
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+index ed768f2a2..880bc5eeb 100644
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -3864,7 +3864,7 @@ def TTNN_CaptureOrExecuteTraceOp : TTNN_MemoryEffectOp<"capture_or_execute_trace
+   let hasVerifier = 1;
+ }
+ 
+-def TTNN_GenericOp : TTNN_Op<"generic", [AttrSizedOperandSegments, MemoryEffects<[MemRead, MemWrite]>, TTCore_NonCacheableTrait, OpModelExempt]> {
++def TTNN_GenericOp : TTNN_InplaceOp<"generic", [AttrSizedOperandSegments, TTCore_NonCacheableTrait, OpModelExempt]> {
+     let summary = "Generic operation.";
+     let description = [{
+       Generic operation capable of running a program with custom kernels. Each kernel is described with a
+diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
+index 7b46dae00..61f8dd9e4 100644
+--- a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
++++ b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
+@@ -324,9 +324,21 @@ protected:
+     bool isTTNN = isTTNNTensor(value.getType());
+     if (isTTNN) {
+       assert(ttnnMode && "Unexpected TTNN tensor as op operand");
++      auto ttnnTensorType =
++          mlir::cast<mlir::RankedTensorType>(value.getType());
+       auto metalTensorType = getMetalTensorFromTTNNTensor(rewriter, value);
+-      auto metalCastOp = rewriter.create<ttir::TTNNMetalLayoutCastOp>(
+-          value.getLoc(), metalTensorType, value);
++      auto metalCastOp =
++          value.getDefiningOp<ttir::TTNNMetalLayoutCastOp>();
++      Value metalValue;
++      if (metalCastOp) {
++        metalValue = metalCastOp.getInput();
++        metalTensorType =
++            mlir::cast<RankedTensorType>(metalValue.getType());
++      } else {
++        metalCastOp = rewriter.create<ttir::TTNNMetalLayoutCastOp>(
++            value.getLoc(), metalTensorType, value);
++        metalValue = metalCastOp;
++      }
+ 
+       // Propagate both VGM maps for height/width sharded TTNN layouts
+       // so that downstream passes (GenericOp::build, getMemoryMap, etc.)
+@@ -372,12 +384,23 @@ protected:
+             newTensorShape, metalTensorType.getElementType(),
+             metalTensorType.getEncoding());
+         auto unitReblockingView = rewriter.create<d2m::ViewLayoutOp>(
+-            value.getLoc(), unitGridType, metalCastOp->getResult(0), reblockMap,
++            value.getLoc(), unitGridType, metalValue, reblockMap,
+             /*reinterpretLayout=*/false);
+-        return unitReblockingView.getResult();
++        metalValue = unitReblockingView.getResult();
++      }
++      bool hasRequestedTiling =
++          tiled == mlir::isa<ttcore::TileType>(metalTensorType.getElementType());
++      bool hasRequestedRank =
++          !noCollapse ||
++          metalTensorType.getRank() == 2 * ttnnTensorType.getRank();
++      if (metalTensorMemSpace == memSpace && hasRequestedTiling &&
++          hasRequestedRank) {
++        return metalValue;
+       }
+-      // For DRAM operands, we can return the metal cast result directly.
+-      return metalCastOp->getResult(0);
++
++      // Stage TTNN operands in the requested memory space before computation.
++      logicalType = ttnnTensorType;
++      value = metalValue;
+     }
+ 
+     auto tensorType = mlir::cast<mlir::RankedTensorType>(value.getType());
+@@ -1238,7 +1261,8 @@ private:
+ 
+     auto [inputs, outputs] =
+         toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
+-                                   /*tiled*/ true, isImplicitBcast);
++                                   /*tiled=*/true,
++                                   /*noCollapse=*/false);
+     const std::size_t numInputs = inputs.size();
+     const std::size_t numOutputs = outputs.size();
+     const std::size_t numOperands = (numInputs + numOutputs);
+@@ -1614,7 +1638,7 @@ private:
+ 
+     auto [inputs, outputs] =
+         toLayoutOperandsAndResults(rewriter, {origInputs, origOutputs},
+-                                   /*tiled=*/true, /*noCollapse=*/true);
++                                   /*tiled=*/true, /*noCollapse=*/false);
+     assert(inputs.size() == 1);
+     assert(outputs.size() == 1);
+ 
+@@ -2932,6 +2956,121 @@ private:
+ } // namespace
+ 
+ namespace {
++template <typename Op>
++class D2MCollapsedOpRewriter : public OpConversionPattern<Op>,
++                               protected D2MNamedRewriterCommon {
++public:
++  D2MCollapsedOpRewriter(const TypeConverter &typeConverter,
++                         mlir::MLIRContext *ctx,
++                         ttcore::MemorySpace defaultInputMemSpace,
++                         ttcore::MemorySpace defaultOutputMemSpace,
++                         bool enableMulticastInference)
++      : OpConversionPattern<Op>(typeConverter, ctx, PatternBenefit(2)),
++        D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
++                               /*ttnnMode=*/true, /*collapseTensors=*/false,
++                               enableMulticastInference) {}
++};
++
++class D2MCollapsedConcatRewriter final
++    : public D2MCollapsedOpRewriter<ttir::ConcatOp> {
++public:
++  using D2MCollapsedOpRewriter<ttir::ConcatOp>::D2MCollapsedOpRewriter;
++
++  LogicalResult
++  matchAndRewrite(ttir::ConcatOp op, ttir::ConcatOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const final {
++    auto outType = mlir::cast<RankedTensorType>(op.getResult().getType());
++    const int64_t rank = outType.getRank();
++    int32_t dim = op.getDim();
++    if (dim < 0) {
++      dim += rank;
++    }
++
++    if (adaptor.getOperands().size() <= 1 || dim != rank - 1) {
++      return rewriter.notifyMatchFailure(op,
++                                         "not a collapsed width concat");
++    }
++    constexpr auto tileShape = ttcore::TileType::getDefaultShape();
++    for (Value input : op.getInputs().drop_back()) {
++      auto inputType = mlir::cast<RankedTensorType>(input.getType());
++      if (inputType.getShape()[dim] % tileShape[1] != 0) {
++        return rewriter.notifyMatchFailure(op,
++                                           "requires row-major concat");
++      }
++    }
++
++    SmallVector<d2m::GenericOp> producers;
++    producers.reserve(adaptor.getOperands().size());
++    for (Value input : adaptor.getOperands()) {
++      auto cast = input.getDefiningOp<ttir::TTNNMetalLayoutCastOp>();
++      auto inputType =
++          cast ? mlir::dyn_cast<RankedTensorType>(cast.getInput().getType())
++               : nullptr;
++      auto layout =
++          inputType ? mlir::dyn_cast_if_present<ttcore::MetalLayoutAttr>(
++                          inputType.getEncoding())
++                    : nullptr;
++      auto producer =
++          cast ? cast.getInput().getDefiningOp<d2m::GenericOp>() : nullptr;
++      if (!producer || producer.getOutputs().size() != 1 ||
++          producer->getBlock() != op->getBlock() || !layout ||
++          layout.getMemorySpace() != memorySpaces[0] ||
++          !mlir::isa<ttcore::TileType>(inputType.getElementType())) {
++        return rewriter.notifyMatchFailure(op,
++                                           "inputs cannot write concat output");
++      }
++      if (llvm::is_contained(producers, producer)) {
++        return rewriter.notifyMatchFailure(op,
++                                           "requires distinct producers");
++      }
++      producers.push_back(producer);
++    }
++
++    auto loc = op.getLoc();
++    auto origOutputs = createDpsOutputs(loc, rewriter, {outType});
++    auto [inputs, outputs] = toLayoutOperandsAndResults(
++        rewriter, {adaptor.getOperands(), origOutputs},
++        /*tiled=*/true, /*noCollapse=*/false);
++
++    auto outputCast = mlir::cast<ttir::TTNNMetalLayoutCastOp>(
++        outputs[0].getDefiningOp());
++    Operation *outputEmpty = outputCast.getInput().getDefiningOp();
++    TT_assert((mlir::isa<ttir::EmptyOp, d2m::EmptyOp>(outputEmpty)));
++
++    Operation *insertBefore =
++        *llvm::min_element(producers, [](d2m::GenericOp lhs,
++                                        d2m::GenericOp rhs) {
++          return lhs->isBeforeInBlock(rhs);
++        });
++    outputEmpty->moveBefore(insertBefore);
++    outputCast->moveBefore(insertBefore);
++
++    rewriter.setInsertionPoint(insertBefore);
++    int64_t offset = 0;
++    for (auto [input, producer] : llvm::zip_equal(inputs, producers)) {
++      auto inputType = mlir::cast<RankedTensorType>(input.getType());
++      auto remapping = ttmlir::utils::applyOffsetsToAffineMapResults(
++          rewriter.getMultiDimIdentityMap(inputType.getRank()), {offset},
++          inputType.getRank() - 1);
++      auto view = rewriter.create<d2m::ViewLayoutOp>(
++          loc, inputType, outputs[0], remapping,
++          /*reinterpretLayout=*/false);
++
++      Value oldOutput = producer.getOutputs().front();
++      producer.getOutputsMutable().assign(view.getResult());
++      oldOutput.replaceUsesWithIf(view.getResult(), [&](OpOperand &use) {
++        return producer->isProperAncestor(use.getOwner());
++      });
++      offset += inputType.getShape().back();
++    }
++
++    rewriter.setInsertionPoint(op);
++    Value result = unLayoutResult(rewriter, outputs[0], outType)->getResult(0);
++    rewriter.replaceOp(op, result);
++    return success();
++  }
++};
++
+ class D2MConcatRewriter final
+     : public mlir::OpConversionPattern<ttir::ConcatOp>,
+       D2MNamedRewriterCommon {
+@@ -4422,6 +4561,76 @@ public:
+                           builder.getContext());
+   }
+ };
++
++template <typename TensorManipulationOp>
++class D2MCollapsedViewRewriter
++    : public D2MCollapsedOpRewriter<TensorManipulationOp> {
++public:
++  using D2MCollapsedOpRewriter<
++      TensorManipulationOp>::D2MCollapsedOpRewriter;
++
++  LogicalResult
++  matchAndRewrite(TensorManipulationOp op,
++                  typename TensorManipulationOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    if constexpr (std::is_same_v<TensorManipulationOp, ttir::ReshapeOp>) {
++      auto inputType = mlir::cast<RankedTensorType>(op.getInput().getType());
++      auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
++      if (inputType.getRank() < 2 || resultType.getRank() < 2 ||
++          inputType.getShape().take_back(2) !=
++              resultType.getShape().take_back(2)) {
++        return rewriter.notifyMatchFailure(op,
++                                           "not a supported collapsed view");
++      }
++    } else {
++      auto begins = extractFromIntegerArrayAttr<int32_t>(op.getBegins());
++      auto ends = extractFromIntegerArrayAttr<int32_t>(op.getEnds());
++      auto steps = extractFromIntegerArrayAttr<int32_t>(op.getStep());
++      auto inputType = mlir::cast<RankedTensorType>(op.getInput().getType());
++      const size_t rank = inputType.getRank();
++      constexpr auto tileShape = ttcore::TileType::getDefaultShape();
++      bool onlySlicesWidth =
++          rank >= 2 && steps.back() == 1 &&
++          begins.back() % tileShape[1] == 0 &&
++          ends.back() % tileShape[1] == 0;
++      for (size_t dim = 0; dim + 1 < rank; ++dim) {
++        onlySlicesWidth &= begins[dim] == 0 && steps[dim] == 1 &&
++                           ends[dim] == inputType.getShape()[dim];
++      }
++      if (!onlySlicesWidth) {
++        return rewriter.notifyMatchFailure(op,
++                                           "not a supported collapsed view");
++      }
++    }
++
++    Value input = this->createOptimalLayoutOp(
++        adaptor.getInput(), this->memorySpaces[0], /*tiled=*/true,
++        /*noCollapse=*/false, rewriter);
++    auto inputType = mlir::cast<RankedTensorType>(input.getType());
++    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
++    auto resultMetalType =
++        this->getMetalTensorFromTTNNTensor(rewriter, op.getResult());
++    AffineMap remapping;
++    if constexpr (std::is_same_v<TensorManipulationOp, ttir::ReshapeOp>) {
++      remapping = ttmlir::utils::calculateReblockMap(
++          inputType.getShape(), resultMetalType.getShape(),
++          rewriter.getContext());
++    } else {
++      TT_assert(inputType.getRank() == resultMetalType.getRank());
++      auto begins = extractFromIntegerArrayAttr<int32_t>(op.getBegins());
++      constexpr auto tileShape = ttcore::TileType::getDefaultShape();
++      remapping = ttmlir::utils::applyOffsetsToAffineMapResults(
++          rewriter.getMultiDimIdentityMap(resultMetalType.getRank()),
++          {begins.back() / tileShape[1]}, resultMetalType.getRank() - 1);
++    }
++    auto view = rewriter.create<d2m::ViewLayoutOp>(
++        op.getLoc(), resultMetalType, input, remapping,
++        /*reinterpretLayout=*/false);
++    rewriter.replaceOp(
++        op, this->unLayoutResult(rewriter, view.getResult(), resultType));
++    return success();
++  }
++};
+ } // namespace
+ 
+ static TensorManipulationInfo rearrangeLogicalInfo(ttir::RearrangeOp op) {
+@@ -5446,6 +5655,14 @@ void populateTTIRToD2MPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+     D2MAllGatherRewriter
+   >(typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace, ttnnMode, collapseTensors, enableMulticastInference);
+ 
++  if (ttnnMode && collapseTensors) {
++    patterns.add<
++      D2MCollapsedConcatRewriter,
++      D2MCollapsedViewRewriter<ttir::ReshapeOp>,
++      D2MCollapsedViewRewriter<ttir::SliceStaticOp>
++    >(typeConverter, ctx, defaultInputMemSpace, defaultOutputMemSpace, enableMulticastInference);
++  }
++
+   // Handle SliceStatic cases that need a transpose-based rewrite to satisfy
+   // NoC alignment before the generic SliceStatic lowering consumes them.
+   patterns.add<D2MSliceStaticOpNoCConstraintsRewriter>(typeConverter, ctx);
+diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
+index 8eb1e4cde..e9ffd1387 100644
+--- a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
++++ b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
+@@ -31,8 +31,9 @@ public:
+     auto outputType = mlir::cast<mlir::RankedTensorType>(
+         this->getTypeConverter()->convertType(srcOp.getResult().getType()));
+ 
+-    rewriter.replaceOpWithNewOp<DestOp>(srcOp, outputType,
+-                                        adaptor.getOperands());
++    rewriter.replaceOpWithNewOp<DestOp>(
++        srcOp, mlir::TypeRange{outputType}, adaptor.getOperands(),
++        srcOp->getAttrs());
+ 
+     return mlir::success();
+   }
+@@ -437,6 +438,14 @@ void populateTTNNToTTIRPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+   patterns.add<TTNNToLayoutToTTIRToLayoutConversionPattern>(typeConverter, ctx);
+   patterns.add<TTNNToTensorSpecToTTIRToLayoutConversionPattern>(typeConverter,
+                                                                 ctx);
++  patterns.add<
++      TTNNToTTIROpConversionPattern<mlir::tt::ttnn::ConcatOp,
++                                    mlir::tt::ttir::ConcatOp>,
++      TTNNToTTIROpConversionPattern<mlir::tt::ttnn::ReshapeOp,
++                                    mlir::tt::ttir::ReshapeOp>,
++      TTNNToTTIROpConversionPattern<mlir::tt::ttnn::SliceStaticOp,
++                                    mlir::tt::ttir::SliceStaticOp>>(
++      typeConverter, ctx);
+ }
+ 
+ } // namespace mlir::tt
+diff --git a/lib/Dialect/D2M/IR/D2MOps.cpp b/lib/Dialect/D2M/IR/D2MOps.cpp
+index e0880fa86..f02b4688a 100644
+--- a/lib/Dialect/D2M/IR/D2MOps.cpp
++++ b/lib/Dialect/D2M/IR/D2MOps.cpp
+@@ -121,6 +121,13 @@ void d2m::GenericOp::getEffects(
+     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+         &effects) {
+   d2m::getDpsEffects(*this, effects);
++  for (OpOperand &output : getOutputsMutable()) {
++    if (mlir::isa<RankedTensorType>(output.get().getType())) {
++      effects.emplace_back(MemoryEffects::Write::get(), &output, /*stage=*/0,
++                           /*effectOnFullRegion=*/true,
++                           SideEffects::DefaultResource::get());
++    }
++  }
+ }
+ 
+ mlir::tt::ttcore::DeviceAttr d2m::GenericOp::getDevice() {
+diff --git a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
+index 6adb0d30d..acccdd690 100644
+--- a/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
++++ b/lib/Dialect/D2M/Pipelines/D2MPipelines.cpp
+@@ -130,6 +130,7 @@ void createD2MFrontendPipeline(OpPassManager &pm,
+     fusionOptions.enableEltwiseReductionFusion =
+         options.enableEltwiseReductionFusion;
+     pm.addPass(d2m::createD2MGenericFusion(fusionOptions));
++    pm.addPass(d2m::createD2MGridSelection(gridOptOptions));
+   }
+   pm.addPass(mlir::createCanonicalizerPass());
+   createTTIRBufferizationPipeline(pm, options);
+diff --git a/lib/Dialect/D2M/Transforms/GridSelection.cpp b/lib/Dialect/D2M/Transforms/GridSelection.cpp
+index c4352c0d5..d96ba6e3c 100644
+--- a/lib/Dialect/D2M/Transforms/GridSelection.cpp
++++ b/lib/Dialect/D2M/Transforms/GridSelection.cpp
+@@ -432,6 +432,10 @@ static void applyTTNNTensorUpdate(const OperandGridInfo &info,
+   auto metalLayout =
+       mlir::cast<ttcore::MetalLayoutAttr>(metalTensor.getEncoding());
+   if (metalLayout.getMemorySpace() == ttcore::MemorySpace::DeviceDRAM) {
++    if (metalLayout.getMemoryLayout() ==
++        ttcore::TensorMemoryLayout::Interleaved) {
++      return;
++    }
+     insertViewForTTNNDRAMTensor(ttnnOperand, info.selectedGrid, builder);
+   } else if (auto castOp =
+                  ttnnOperand.getDefiningOp<ttir::TTNNMetalLayoutCastOp>()) {
+diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
+index 8a19462fc..8d6a10389 100644
+--- a/lib/Dialect/D2M/Utils/Utils.cpp
++++ b/lib/Dialect/D2M/Utils/Utils.cpp
+@@ -910,9 +910,9 @@ SmallVector<Value> applyMap(Builder &builder, Location loc, AffineMap map,
+     // Break the map into respective gridY, gridX, offset "single result"
+     // parts. AffineApply only supports single result affine maps.
+     map = map.dropResults(0); // Drop the device index.
+-    auto gridY = map.dropResults({1, 2});
+-    auto gridX = map.dropResults({0, 2});
+-    auto offset = map.dropResults({0, 1});
++    auto gridY = map.dropResults(llvm::ArrayRef<int64_t>{1, 2});
++    auto gridX = map.dropResults(llvm::ArrayRef<int64_t>{0, 2});
++    auto offset = map.dropResults(llvm::ArrayRef<int64_t>{0, 1});
+     return {affineApply(gridY, index), affineApply(gridX, index),
+             affineApply(offset, index)};
+   }
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+index 193f05039..95f2d63c3 100644
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -3756,9 +3756,11 @@ public:
+       patterns.add<HardsigmoidFusionPattern>(&getContext());
+       patterns.add<MishFusingPattern>(&getContext());
+       patterns.add<ReshapeBroadcastReshapeToRepeatPattern>(&getContext());
+-      patterns.add<fusing::RoPERotateHalfFusingPattern>(&getContext());
+-      patterns.add<fusing::RoPEComplexRotationFusingPattern>(&getContext());
+-      patterns.add<fusing::RoPEInterleavedPairFusingPattern>(&getContext());
++      if (ropeFusionEnabled) {
++        patterns.add<fusing::RoPERotateHalfFusingPattern>(&getContext());
++        patterns.add<fusing::RoPEComplexRotationFusingPattern>(&getContext());
++        patterns.add<fusing::RoPEInterleavedPairFusingPattern>(&getContext());
++      }
+       patterns.add<fusing::SDPAFusingPattern>(&getContext());
+       patterns.add<fusing::TopKFusingPattern>(&getContext());
+ 
+diff --git a/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h b/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
+index 289713c66..f220d1844 100644
+--- a/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
++++ b/include/ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h
+@@ -323,6 +323,12 @@ struct TTIRToTTNNCommonPipelineOptions
+       llvm::cl::desc("Enable TTNN create D2M subgraphs pass."),
+       llvm::cl::init(false)};
+-
++
++  Option<unsigned> minD2MFusionGroupSize{
++      *this, "d2m-min-fusion-group-size",
++      llvm::cl::desc(
++          "Minimum number of elementwise ops in a D2M fusion group."),
++      llvm::cl::init(4)};
++
+   // Enable the d2m elementwise fusion pass when enable-create-d2m-subgraphs is
+   // on. See resolveCreateD2MSubgraphsOptions for more details.
+   mutable Option<bool> enableD2MElementwiseFusion{
+diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+index 5e6f6a33e..dc00c0619 100644
+--- a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
++++ b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+@@ -379,6 +379,13 @@ def TTNNCreateD2MSubgraphs: Pass<"ttnn-create-d2m-subgraphs", "::mlir::ModuleOp"
+-
++
+     Right now, this is limited to eltwise chains.
+   }];
++  let options = [
++    Option<"minFusionGroupSize",
++           "min-fusion-group-size",
++           "unsigned", /*default=*/"2",
++           "Minimum number of elementwise operations required to outline a "
++           "D2M fusion group.">
++  ];
+ }
+-
++
+ def TTNNTraceHoistTransform : Pass<"ttnn-trace-hoist-transform", "::mlir::ModuleOp"> {
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+index 17c4fc8f1..66e26cd3e 100644
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -48,7 +48,8 @@ void createTTNNPipelineTTIRPasses(
+   ttir::TTIRFusingOptions fusingOptions{
+       options.enableFusingConv2dWithMultiplyPattern,
+       options.enablePermuteMatmulFusion,
+-      options.enablePermuteSliceAfterMatmulFusion};
++      options.enablePermuteSliceAfterMatmulFusion,
++      !options.enableCreateD2MSubgraphs};
+   if (options.enableFusing) {
+     pm.addPass(mlir::tt::ttir::createTTIRFusing(fusingOptions));
+   }
+@@ -451,7 +452,11 @@ void createTTNNPipelineTTIRPasses(
+                "enabled. Automatically enabling Optimizer as a dependency.\n";
+       }
+       options.optimizerPassEnabled = true;
+-      devicePm.addPass(tt::ttnn::createTTNNCreateD2MSubgraphs());
++      TTNNCreateD2MSubgraphsOptions createD2MSubgraphsOptions;
++      createD2MSubgraphsOptions.minFusionGroupSize =
++          options.minD2MFusionGroupSize.getValue();
++      devicePm.addPass(
++          tt::ttnn::createTTNNCreateD2MSubgraphs(createD2MSubgraphsOptions));
+     }
+@@ -718,6 +723,8 @@ void createTTNNPipelineD2MPass(OpPassManager &pm,
+   // only works on top-level modules (doesn't run module has a parent op).
+   ttmetal::D2MPipelineOptions ttmetalOptions;
+   ttmetalOptions.ttnnMode = true;
++  ttmetalOptions.defaultInputMemSpace = ttcore::MemorySpace::DeviceDRAM;
++  ttmetalOptions.defaultOutputMemSpace = ttcore::MemorySpace::DeviceDRAM;
+   ttmetalOptions.enableElementwiseFusion = options.enableElementwiseFusion;
+   ttmetal::createD2MFrontendPipeline(pm, ttmetalOptions);
+   ttmetal::createD2MBackendPipeline(pm, ttmetalOptions);
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
+index 4a4753e50..e6c445141 100644
+--- a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
+@@ -36,6 +36,9 @@ public:
+ public:
+   using FusionGroup = llvm::SmallVector<Operation *>;
+-
+-  explicit ElementwiseFusionAnalysis(Operation *rootOp) { analyze(rootOp); }
+-
++
++  ElementwiseFusionAnalysis(Operation *rootOp, size_t minFusionGroupSize)
++      : minFusionGroupSize(minFusionGroupSize) {
++    analyze(rootOp);
++  }
++
+   llvm::ArrayRef<FusionGroup> getFusionGroups() const { return fusionGroups; }
+@@ -70,6 +73,9 @@ private:
+   static bool isFusionGroupExit(Operation *op) {
++    if (mlir::isa<ConcatOp>(op)) {
++      return true;
++    }
+     if (!isAllowedToBeFused(op)) {
+       return false;
+     }
+@@ -124,6 +130,7 @@ private:
+   FusionGroup buildFusionGroup(Operation *exitOp) {
+     llvm::DenseSet<Operation *> fusionSet;
+     llvm::SmallVector<Operation *> stack;
++    const bool allowViews = mlir::isa<ConcatOp>(exitOp);
+
+     fusionSet.insert(exitOp);
+     stack.push_back(exitOp);
+@@ -133,7 +140,9 @@ private:
+
+       for (Value operand : cur->getOperands()) {
+         Operation *producer = operand.getDefiningOp();
+-        if (!producer || !isAllowedToBeFused(producer) ||
++        if (!producer ||
++            (!isAllowedToBeFused(producer) &&
++             !(allowViews && mlir::isa<ReshapeOp, SliceStaticOp>(producer))) ||
+             visitedOps.contains(producer) || fusionSet.contains(producer)) {
+           continue;
+         }
+@@ -99,5 +102,5 @@ private:
+       FusionGroup group = buildFusionGroup(exitOp);
+-
+-      if (group.size() >= 2) {
++
++      if (group.size() >= minFusionGroupSize) {
+         for (Operation *op : group) {
+           visitedOps.insert(op);
+@@ -162,6 +165,7 @@ private:
+     return fusionGroup;
+   }
+-
++
++  const size_t minFusionGroupSize;
+   llvm::DenseSet<Operation *> visitedOps;
+   llvm::SmallVector<FusionGroup> fusionGroups;
+ };
+@@ -179,7 +183,7 @@ private:
+   void runOnOperation() final {
+     ModuleOp moduleOp = getOperation();
+-
+-    ElementwiseFusionAnalysis analysis(moduleOp);
++
++    ElementwiseFusionAnalysis analysis(moduleOp, minFusionGroupSize);
+     auto fusionGroups = analysis.getFusionGroups();
+     if (fusionGroups.empty()) {
+       return;
+diff --git a/test/python/golden/d2m/test_fusion_with_optimizer.py b/test/python/golden/d2m/test_fusion_with_optimizer.py
+index 28a488faa..2a8b9a641 100644
+--- a/test/python/golden/d2m/test_fusion_with_optimizer.py
++++ b/test/python/golden/d2m/test_fusion_with_optimizer.py
+@@ -79,6 +79,7 @@ def test_d2m_fusion_with_optimizer(request, target, snippet):
+         pipeline_options=[
+             "optimization-level=1",
+             "enable-create-d2m-subgraphs=true",
++            "d2m-min-fusion-group-size=2",
+         ],
+     )
+     # Open device only after compile so the pipeline can use mock context for opmodel.
+diff --git a/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_fork_join.mlir b/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_fork_join.mlir
+index ce5d8f099..783cae88c 100644
+--- a/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_fork_join.mlir
++++ b/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_fork_join.mlir
+@@ -1,5 +1,5 @@
+ // REQUIRES: opmodel
+-// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=2 enable-create-d2m-subgraphs=true" --mlir-print-local-scope -o %t %s
++// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=2 enable-create-d2m-subgraphs=true d2m-min-fusion-group-size=2" --mlir-print-local-scope -o %t %s
+ // RUN: FileCheck %s --input-file=%t
+-
++
+ // Verify that the full TTIR-to-TTNN backend pipeline with the greedy optimizer
+diff --git a/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_linear_chain.mlir b/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_linear_chain.mlir
+index 154a0e1bf..fc6a9358e 100644
+--- a/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_linear_chain.mlir
++++ b/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_linear_chain.mlir
+@@ -1,5 +1,5 @@
+ // REQUIRES: opmodel
+-// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=2 enable-create-d2m-subgraphs=true" --mlir-print-local-scope -o %t %s
++// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=2 enable-create-d2m-subgraphs=true d2m-min-fusion-group-size=2" --mlir-print-local-scope -o %t %s
+ // RUN: FileCheck %s --input-file=%t
+-
++
+ // Verify that the full TTIR-to-TTNN backend pipeline with the greedy optimizer
+diff --git a/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_nd_bcast.mlir b/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_nd_bcast.mlir
+index 197e77ffc..66de7269e 100644
+--- a/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_nd_bcast.mlir
++++ b/test/ttmlir/Dialect/TTNN/optimizer/d2m_greedy_optimizer_nd_bcast.mlir
+@@ -1,5 +1,5 @@
+ // REQUIRES: opmodel
+-// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=2 enable-create-d2m-subgraphs=true" --mlir-print-local-scope -o %t %s
++// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=2 enable-create-d2m-subgraphs=true d2m-min-fusion-group-size=2" --mlir-print-local-scope -o %t %s
+ // RUN: FileCheck %s --input-file=%t
+-
++
+ // End-to-end regression: a TTIR graph with implicit ND broadcasts in an
+diff --git a/test/ttmlir/Dialect/TTNN/optimizer/d2m_optimizer_two_d2m_subgraphs.mlir b/test/ttmlir/Dialect/TTNN/optimizer/d2m_optimizer_two_d2m_subgraphs.mlir
+index 75a40dc64..e02ab40ce 100644
+--- a/test/ttmlir/Dialect/TTNN/optimizer/d2m_optimizer_two_d2m_subgraphs.mlir
++++ b/test/ttmlir/Dialect/TTNN/optimizer/d2m_optimizer_two_d2m_subgraphs.mlir
+@@ -1,5 +1,5 @@
+ // REQUIRES: opmodel
+-// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=1 enable-create-d2m-subgraphs=true" --mlir-print-local-scope -o %t %s
++// RUN: ttmlir-opt --ttir-to-ttnn-backend-pipeline="optimization-level=1 enable-create-d2m-subgraphs=true d2m-min-fusion-group-size=2" --mlir-print-local-scope -o %t %s
+ // RUN: FileCheck %s --input-file=%t
+-
++
+ // Verify that the full TTIR-to-TTNN backend pipeline with D2M fusion can
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+index 1b2921caf..6ee5366f6 100644
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -60,7 +60,8 @@ private:
+     shouldHoist &= !::mlir::isa<mlir::tt::ttnn::CaptureOrExecuteTraceOp>(op);
+     shouldHoist &= !::mlir::isa<mlir::tt::ttnn::GetDeviceOp>(op);
+     shouldHoist &=
+-        !(op->hasTrait<mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>());
++        ::mlir::isa<ttnn::EmptyOp, ttnn::AllocOp>(op) ||
++        !op->hasTrait<mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>();
+     return shouldHoist;
+   }
+
+@@ -1012,19 +1012,20 @@ private:
+       }
+ 
+       // Collect all hoistable ops between first and last. Creation ops (e.g.
+-      // ttnn.constant / ttnn.full materialized mid-graph by op decompositions
+-      // such as SDPA) are not hoistable, but they only depend on the device
+-      // (no data dependency on surrounding compute). Rather than failing, sink
+-      // them above the trace region so they are treated as regular trace inputs
+-      // (recreated per execution), matching how leading creation ops are
+-      // handled when const-eval is disabled.
++      // ttnn.constant / ttnn.full) and their operand-free ttnn.get_device ops
++      // can be materialized mid-graph by op decompositions and D2M fusion.
++      // They have no data dependency on surrounding compute. Rather than
++      // failing, sink them above the trace region so creation results are
++      // treated as regular trace inputs (recreated per execution), matching
++      // how leading creation ops are handled when const-eval is disabled.
+       llvm::SmallVector<Operation *> creationOpsToSink;
+       for (size_t i = firstHoistable; i <= lastHoistable; i++) {
+         if (shouldHoistOp(allOps[i])) {
+           opsToHoist.push_back(allOps[i]);
+-        } else if (allOps[i]
+-                       ->hasTrait<
+-                           mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>()) {
++        } else if (
++            allOps[i]->hasTrait<
++                mlir::tt::ttcore::Trait::TTCoreCreationOpTrait>() ||
++            ::mlir::isa<mlir::tt::ttnn::GetDeviceOp>(allOps[i])) {
+           creationOpsToSink.push_back(allOps[i]);
+         } else {
+           // We found a non-hoistable op in the middle - this is an error
+diff --git a/test/ttmlir/Dialect/TTNN/trace/midgraph_creation_op.mlir b/test/ttmlir/Dialect/TTNN/trace/midgraph_creation_op.mlir
+index 08443a304..231332cf4 100644
+--- a/test/ttmlir/Dialect/TTNN/trace/midgraph_creation_op.mlir
++++ b/test/ttmlir/Dialect/TTNN/trace/midgraph_creation_op.mlir
+@@ -42,8 +42,8 @@ module {
+         // CHECK: %[[FULL:.+]] = "ttnn.full"
+         // CHECK: %[[FULL_HOST:.+]] = "ttnn.to_tensor_spec"(%[[FULL]])
+         // CHECK: "ttnn.capture_or_execute_trace"({{.*}}%[[FULL_HOST]])
+-        %dev = "ttnn.get_device"() <{mesh_offset = #ttnn<mesh_offset 0x0>, mesh_shape = #ttnn<mesh_shape 1x1>}> : () -> !ttnn.device
+         %add = "ttnn.add"(%arg0, %arg1) : (tensor<1x12x32x64xbf16, #ttnn_layout>, tensor<1x12x32x64xbf16, #ttnn_layout>) -> tensor<1x12x32x64xbf16, #ttnn_layout>
++        %dev = "ttnn.get_device"() <{mesh_offset = #ttnn<mesh_offset 0x0>, mesh_shape = #ttnn<mesh_shape 1x1>}> : () -> !ttnn.device
+         %full = "ttnn.full"(%dev) <{fill_value = 1.250000e-01 : f32, layout = #ttnn.layout<tile>, shape = #ttnn.shape<1x12x32x64>}> : (!ttnn.device) -> tensor<1x12x32x64xbf16, #ttnn_layout>
+         %mul = "ttnn.multiply"(%add, %full) : (tensor<1x12x32x64xbf16, #ttnn_layout>, tensor<1x12x32x64xbf16, #ttnn_layout>) -> tensor<1x12x32x64xbf16, #ttnn_layout>
+         return %mul : tensor<1x12x32x64xbf16, #ttnn_layout>
