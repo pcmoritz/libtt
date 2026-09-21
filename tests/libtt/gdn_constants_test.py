@@ -20,7 +20,7 @@ def test_gdn_prefill_without_kernel_constants(trace, batch, heads):
     device = jax.devices("tt")[0]
     run = jax.jit(
         gated_delta_rule,
-        compiler_options={"optimization_level": "1", "enable_trace": str(trace).lower()},
+        compiler_options={"optimization_level": "O1", "enable_trace": str(trace).lower()},
     )
     rng = np.random.default_rng(35)
     shape = (batch, 64, heads, 128)

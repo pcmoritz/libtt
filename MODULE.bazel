@@ -49,11 +49,11 @@ http_archive(
 http_archive(
     name = "jax_src",
     build_file = "//third_party/jax:BUILD.overlay.bazel",
-    patch_cmds = ["find tests -name BUILD -delete"],
-    sha256 = "8b866b775106c712a0c5532775a00941d293a4807cffae8dbcca1e03f54ce1ff",
-    strip_prefix = "jax-jax-v0.7.1",
+    patch_cmds = ["find tests jax -name BUILD -delete"],
+    sha256 = "12dd77d86ec5a316be6038c9a597a1479bce13c828722a249b022e774b2eff75",
+    strip_prefix = "jax-jax-v0.11.2",
     urls = [
-        "https://github.com/jax-ml/jax/archive/refs/tags/jax-v0.7.1.tar.gz",
+        "https://github.com/jax-ml/jax/archive/refs/tags/jax-v0.11.2.tar.gz",
     ],
 )
 
@@ -387,6 +387,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_complex_convert_compare.patch",
         "//third_party/tt_xla:tt_mlir_complex_reduce.patch",
         "//third_party/tt_xla:tt_mlir_complex_divide.patch",
+        "//third_party/tt_xla:tt_mlir_complex_abs.patch",
         "//third_party/tt_xla:tt_mlir_empty_convolution.patch",
         "//third_party/tt_xla:tt_mlir_convolution.patch",
         "//third_party/tt_xla:tt_mlir_convolution_negative_padding.patch",
@@ -402,6 +403,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_preserve_narrowing_typecasts.patch",
         "//third_party/tt_xla:tt_mlir_gelu_precision.patch",
         "//third_party/tt_xla:tt_mlir_convert_normalized_float_constants.patch",
+        "//third_party/tt_xla:tt_mlir_reject_unsupported_element_types.patch",
         "//third_party/tt_xla:tt_mlir_zero_sized_buffer_cast.patch",
         "//third_party/tt_xla:tt_mlir_uint8_device_untilize.patch",
         "//third_party/tt_xla:tt_mlir_signed_integer_alias.patch",
@@ -423,6 +425,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_scalar_reduce_window.patch",
         "//third_party/tt_xla:tt_mlir_remove_bitwise_not_workaround.patch",
         "//third_party/tt_xla:tt_mlir_lower_jax_argmin.patch",
+        "//third_party/tt_xla:tt_mlir_argmax_singleton_index.patch",
         "//third_party/tt_xla:tt_mlir_arithmetic_right_shift.patch",
         "//third_party/tt_xla:tt_mlir_mock_device_include.patch",
         "//third_party/tt_xla:tt_mlir_disable_ttlang_python_resolver.patch",
@@ -465,6 +468,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_cached_output_ownership.patch",
         "//third_party/tt_xla:tt_mlir_recurrent_attention.patch",
         "//third_party/tt_xla:tt_mlir_integer_gather_offsets.patch",
+        "//third_party/tt_xla:tt_mlir_dynamic_slice_index_dtype.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

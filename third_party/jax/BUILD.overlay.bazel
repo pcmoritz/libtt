@@ -2,7 +2,7 @@ package(default_visibility = ["//visibility:public"])
 
 filegroup(
     name = "jax_tests",
-    srcs = glob(["tests/**"]),
+    srcs = glob(["tests/**"]) + ["jax/_src/hypothesis_test_util.py"],
 )
 
 filegroup(

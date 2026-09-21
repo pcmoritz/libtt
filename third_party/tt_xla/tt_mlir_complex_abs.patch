@@ -1,0 +1,105 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+@@ -2,6 +2,7 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
+
++#include <limits>
+ #include <utility>
+
+ #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h"
+@@ -738,6 +739,74 @@
+ };
+ } // namespace
+
++// Computes hypot(real, imag) with scaling to avoid squaring large components.
++namespace {
++class ComplexAbsOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::AbsOp> {
++  using OpConversionPattern::OpConversionPattern;
++
++public:
++  LogicalResult matchAndRewrite(
++      mlir::stablehlo::AbsOp op,
++      mlir::stablehlo::AbsOp::Adaptor adaptor,
++      ConversionPatternRewriter &rewriter) const override {
++    if (!hasComplexElementType(op.getOperand().getType())) {
++      return failure();
++    }
++
++    Location loc = op.getLoc();
++    auto type = mlir::cast<RankedTensorType>(op.getType());
++    auto constant = [&](double value) -> Value {
++      return rewriter.create<mlir::stablehlo::ConstantOp>(
++          loc, type,
++          DenseElementsAttr::get(
++              type, rewriter.getFloatAttr(type.getElementType(), value)));
++    };
++    auto [real, imag] = unpackRealImag(loc, adaptor.getOperand(), rewriter);
++    Value x = rewriter.create<mlir::stablehlo::AbsOp>(loc, real);
++    Value y = rewriter.create<mlir::stablehlo::AbsOp>(loc, imag);
++    Value hi = rewriter.create<mlir::stablehlo::MaxOp>(loc, x, y);
++    Value lo = rewriter.create<mlir::stablehlo::MinOp>(loc, x, y);
++    // Keep the reciprocal used by TT division in the normal FP32 range.
++    Value large = rewriter.create<mlir::stablehlo::CompareOp>(
++        loc, hi, constant(0x1p64), mlir::stablehlo::ComparisonDirection::GT);
++    Value scale = rewriter.create<mlir::stablehlo::SelectOp>(
++        loc, large, constant(0x1p-64), constant(1.0));
++    Value scaledHi = rewriter.create<mlir::stablehlo::MulOp>(loc, hi, scale);
++    Value scaledLo = rewriter.create<mlir::stablehlo::MulOp>(loc, lo, scale);
++    Value ratio =
++        rewriter.create<mlir::stablehlo::DivOp>(loc, scaledLo, scaledHi);
++    Value squared = rewriter.create<mlir::stablehlo::MulOp>(loc, ratio, ratio);
++    Value sum = rewriter.create<mlir::stablehlo::AddOp>(loc, constant(1.0), squared);
++    Value root = rewriter.create<mlir::stablehlo::SqrtOp>(loc, sum);
++    Value norm = rewriter.create<mlir::stablehlo::MulOp>(loc, hi, root);
++
++    // Handle 0/0 and inf/inf, and preserve abs(inf + nan*i) == inf.
++    Value zero = constant(0.0);
++    Value inf = constant(std::numeric_limits<double>::infinity());
++    auto eq = [&](Value lhs, Value rhs) -> Value {
++      return rewriter.create<mlir::stablehlo::CompareOp>(
++          loc, lhs, rhs, mlir::stablehlo::ComparisonDirection::EQ);
++    };
++    Value isInf =
++        rewriter.create<mlir::stablehlo::OrOp>(loc, eq(x, inf), eq(y, inf));
++    // TT multiplication saturates on overflow, so detect it before multiplying.
++    double largest = llvm::APFloat::getLargest(
++                         mlir::cast<FloatType>(type.getElementType())
++                             .getFloatSemantics())
++                         .convertToDouble();
++    Value threshold =
++        rewriter.create<mlir::stablehlo::DivOp>(loc, constant(largest), root);
++    Value overflow = rewriter.create<mlir::stablehlo::CompareOp>(
++        loc, hi, threshold, mlir::stablehlo::ComparisonDirection::GT);
++    isInf = rewriter.create<mlir::stablehlo::OrOp>(loc, isInf, overflow);
++    norm = rewriter.create<mlir::stablehlo::SelectOp>(loc, eq(hi, zero), zero, norm);
++    rewriter.replaceOpWithNewOp<mlir::stablehlo::SelectOp>(op, isInf, inf, norm);
++    return success();
++  }
++};
++} // namespace
++
+ // Rewrites select(pred, complex_true, complex_false) for the trailing
+ // real/imag representation. A non-scalar predicate must be broadcast over the
+ // new component dimension before selecting between the converted branches.
+@@ -1164,6 +1233,10 @@
+           return !hasComplexElementType(op.getOperand().getType()) &&
+                  !hasComplexElementType(op.getType());
+         });
++    target.addDynamicallyLegalOp<mlir::stablehlo::AbsOp>(
++        [](mlir::stablehlo::AbsOp op) {
++          return !hasComplexElementType(op.getOperand().getType());
++        });
+     target.addDynamicallyLegalOp<mlir::stablehlo::CompareOp>(
+         [](mlir::stablehlo::CompareOp op) {
+           return !hasComplexElementType(op.getLhs().getType());
+@@ -1207,6 +1280,7 @@
+
+     RewritePatternSet patterns(&getContext());
+     patterns.add<
++        ComplexAbsOpConversionPattern,
+         ComplexBroadcastInDimOpConversionPattern,
+         ComplexCompareOpConversionPattern,
+         ComplexConstantOpConversionPattern, ComplexConvertOpConversionPattern,

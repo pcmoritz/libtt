@@ -19,7 +19,7 @@ def test_row_broadcast(trace, dtype, shape):
     run = jax.jit(
         forward,
         compiler_options={
-            "optimization_level": "1",
+            "optimization_level": "O1",
             "enable_trace": str(trace).lower(),
         },
     )

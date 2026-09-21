@@ -32,7 +32,7 @@ def test_large_fp32_gather(trace, shape, axis):
     device = jax.devices("tt")[0]
     run = jax.jit(
         lambda x, i: jnp.take(x, i, axis=axis, mode="clip"),
-        compiler_options={"optimization_level": "1", "enable_trace": str(trace).lower()},
+        compiler_options={"optimization_level": "O1", "enable_trace": str(trace).lower()},
     )
     rng = np.random.default_rng(35)
     for indices in ([3], [1], [4]):

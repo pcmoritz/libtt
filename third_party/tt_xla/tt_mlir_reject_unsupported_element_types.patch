@@ -1,0 +1,13 @@
+diff --git a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
+--- a/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
++++ b/lib/Dialect/TTIR/Transforms/ElementTypeNormalization.cpp
+@@ -38,7 +38,8 @@
+           elementType =
+               mlir::tt::ttcore::toTTMLIRSupportedDataType(elementType);
+           if (!elementType) {
+-            return {};
++            // A nullopt would fall through to the identity conversion.
++            return RankedTensorType{};
+           }
+
+           return mlir::RankedTensorType::get(type.getShape(), elementType,
