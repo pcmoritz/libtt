@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10607,6 +10607,49 @@
+@@ -10607,6 +10607,53 @@
  };
  } // namespace
 
@@ -25,7 +25,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        dyn_cast<IntegerType>(resultType.getElementType());
 +    if (!inputIntegerType || inputIntegerType.getWidth() != 1 ||
 +        (resultIntegerType && resultIntegerType.getWidth() == 1)) {
-+      return failure();
++      // Explicit StableHLO conversions must retain intermediate rounding and
++      // truncation, including float -> integer -> float.
++      rewriter.replaceOpWithNewOp<ttir::TypecastOp>(
++          srcOp, resultType, adaptor.getOperand(), true);
++      return success();
 +    }
 +
 +    auto zeroValue = rewriter.getZeroAttr(resultType.getElementType());
@@ -51,8 +55,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  static void
  addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
                                           RewritePatternSet &patterns,
-@@ -11026,2 +11069,4 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+@@ -11026,4 +11073,2 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
        mlir::stablehlo::CbrtOp, mlir::tt::ttir::CbrtOp>>(typeConverter, ctx);
-+  patterns.add<StableHLOToTTIRConvertOpConversionPattern>(
-+      typeConverter, ctx, PatternBenefit(2));
-   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+-  patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+-      mlir::stablehlo::ConvertOp, mlir::tt::ttir::TypecastOp>>(typeConverter,
+-                                                               ctx);
++  patterns.add<StableHLOToTTIRConvertOpConversionPattern>(typeConverter, ctx);

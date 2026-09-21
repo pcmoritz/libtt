@@ -416,7 +416,7 @@ index 13987fe..a33bad9 100644
 +        uses_raw_16bit_sfpu_path(input.dtype()) && ops_chain[0].type() != UnaryOpType::TYPECAST &&
 +        ops_chain[0].type() != UnaryOpType::BITCAST &&
 +        (input.dtype() == DataType::FLOAT16 || ops_chain[0].type() == UnaryOpType::NEG ||
-+         ops_chain[0].type() == UnaryOpType::LOG1P) &&
++         ops_chain[0].type() == UnaryOpType::ABS || ops_chain[0].type() == UnaryOpType::LOG1P) &&
 +        get_compute_kernel_path(ops_chain[0].type(), input.dtype()) == "eltwise_sfpu.cpp";
 +    const auto op_type = ops_chain[0].type();
 +    const bool use_native_fp16_pack =
@@ -457,3 +457,56 @@ index 13987fe..a33bad9 100644
      if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
          cb_data_format_output = DataFormat::UInt16;
      }
+diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+--- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
++++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+@@ -7,6 +7,8 @@
+ #include <bit>
+ #include <limits>
+ #include <string_view>
++
++#include <tt-metalium/experimental/distributed_tensor/distributed_tensor_apis.hpp>
+ 
+ #include "ttnn/distributed/types.hpp"
+ #include "ttnn/operations/data_movement/pad/pad.hpp"
+@@ -21,6 +23,22 @@
+ 
+ namespace ttnn::operations::core::CMAKE_UNIQUE_NAMESPACE {
+ namespace {
++
++// BF16 and UInt16 have identical storage. Keep the owning storage alive while
++// viewing the same allocation with a format that does not canonicalize floats.
++Tensor view_bfloat16_bits(const Tensor& input, DataType dtype) {
++    const auto& spec = input.tensor_spec();
++    tt::tt_metal::TensorSpec view_spec(
++        spec.logical_shape(),
++        tt::tt_metal::TensorLayout(
++            dtype, spec.page_config(), spec.memory_config(), spec.tensor_layout().get_alignment()));
++    const auto& buffer = input.device_storage().get_mesh_buffer();
++    auto view_buffer = tt::tt_metal::distributed::MeshBuffer::create(
++        buffer.global_config(), buffer.device_local_config(), buffer.device(), buffer.address());
++    auto view_tensor = tt::tt_metal::mesh_tensor_from_buffer_with_topology(
++        std::move(*view_buffer), view_spec, input.tensor_topology());
++    return Tensor(DeviceStorage(input.device_storage(), std::move(view_tensor)));
++}
+ 
+ bool requires_padding_change(const ttnn::Tensor& tensor, ttnn::Layout layout) {
+     if (layout == Layout::ROW_MAJOR) {
+@@ -75,6 +93,17 @@
+                 "the memory_config won't be changed!");
+         }
+         return tensor_arg;
++    }
++
++    // Layout conversion must preserve every bit, including NaNs and -0.
++    // Reuse the integer data-movement kernels without copying the payload.
++    if (tensor_arg.storage_type() == StorageType::DEVICE && tensor_arg.dtype() == DataType::BFLOAT16 &&
++        dtype.value_or(DataType::BFLOAT16) == DataType::BFLOAT16) {
++        auto raw = view_bfloat16_bits(tensor_arg, DataType::UINT16);
++        auto converted = to_layout_impl(
++            raw, layout, DataType::UINT16, memory_config, sub_core_grids,
++            static_cast<float>(std::bit_cast<uint16_t>(bfloat16(pad_value))));
++        return view_bfloat16_bits(converted, DataType::BFLOAT16);
+     }
+ 
+     const std::set<ttnn::Layout> supported_layouts = {
