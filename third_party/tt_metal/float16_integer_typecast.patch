@@ -107,6 +107,24 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+@@ -42,5 +42,17 @@ inline Tensor typecast_impl(
+     }
+ 
++    // Float16 has an exact conversion to Float32, but no direct integer
++    // conversion. Reuse the Float32 paths rather than packing float bits as
++    // integers.
++    if (input_tensor.dtype() == DataType::FLOAT16 &&
++        (output_dtype == DataType::INT32 || output_dtype == DataType::UINT32 ||
++         output_dtype == DataType::UINT16 || output_dtype == DataType::UINT8)) {
++        auto promoted = typecast_impl(
++            input_tensor, DataType::FLOAT32, std::nullopt, std::nullopt, sub_core_grids);
++        return typecast_impl(
++            promoted, output_dtype, memory_config, optional_output_tensor, sub_core_grids);
++    }
++
+     // Device tensor path
+     DataType input_dtype = input_tensor.dtype();
+     bool preserve_fp32_precision =
 @@ -49,6 +49,7 @@ inline Tensor typecast_impl(
          (input_dtype == DataType::UINT16 and output_dtype == DataType::UINT8) or (input_dtype == DataType::UINT8);
      bool fp32_dest_acc_en = preserve_fp32_precision or output_dtype == DataType::UINT32 or
