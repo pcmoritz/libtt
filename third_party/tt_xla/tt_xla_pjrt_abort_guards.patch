@@ -92,7 +92,7 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
      DLOG_F(ERROR,
             "PJRT_ExecuteOptions::use_major_to_minor_data_layout_for_callbacks "
             "is not supported by the tt-xla plugin.");
-@@ -501,6 +505,9 @@
+@@ -501,6 +505,12 @@
      return nullptr;
    }
 
@@ -100,7 +100,11 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
 +  const std::lock_guard<std::mutex> lock(execution_mutex);
 +
    tt_pjrt_status status = instance->execute(args);
-   return *ErrorInstance::makeError(status).release();
+-  return *ErrorInstance::makeError(status).release();
++  if (auto error = ErrorInstance::makeError(status)) {
++    return *error.release();
++  }
++  return nullptr;
  }
 diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
