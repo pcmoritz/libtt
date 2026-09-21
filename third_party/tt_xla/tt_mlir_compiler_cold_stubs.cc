@@ -1,8 +1,6 @@
 #include "ttmlir/Conversion/TTIRToEmitPy/TTIRToEmitPy.h"
 #include "ttmlir/Conversion/TTNNToEmitPy/TTNNToEmitPy.h"
-#include "ttmlir/Dialect/D2M/Pipelines/D2MPipelines.h"
 #include "ttmlir/Target/LLVM/LLVMToDynamicLib.h"
-#include "ttmlir/Target/TTKernel/TTKernelToCpp.h"
 
 #include "llvm/Support/ErrorHandling.h"
 
@@ -50,35 +48,6 @@ std::unique_ptr<OperationPass<ModuleOp>> createEmitPyAddImportsPass() {
 }
 
 } // namespace mlir::tt
-
-namespace mlir::tt::ttmetal {
-
-void createD2MFrontendPipeline(OpPassManager &, const D2MPipelineOptions &) {
-  unsupported("D2M frontend pipeline is not linked in this libtt build");
-}
-
-void createD2MBackendPipeline(OpPassManager &, const D2MPipelineOptions &) {
-  unsupported("D2M backend pipeline is not linked in this libtt build");
-}
-
-void createD2MToTTKernelPipeline(OpPassManager &, const D2MPipelineOptions &) {
-  unsupported("D2M to TTKernel pipeline is not linked in this libtt build");
-}
-
-void createD2MToTTNNPipeline(OpPassManager &, const D2MPipelineOptions &) {
-  unsupported("D2M to TTNN pipeline is not linked in this libtt build");
-}
-
-} // namespace mlir::tt::ttmetal
-
-namespace mlir::tt::ttkernel {
-
-LogicalResult translateTopLevelKernelToCpp(ModuleOp, llvm::raw_ostream &,
-                                           StringRef) {
-  return failure();
-}
-
-} // namespace mlir::tt::ttkernel
 
 namespace mlir::tt::llvm_to_cpu {
 
