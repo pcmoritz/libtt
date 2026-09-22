@@ -1,0 +1,21 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "cadical",
+    srcs = glob(["src/*.cpp"], exclude = ["src/cadical.cpp", "src/mobical.cpp"]),
+    hdrs = glob(["src/*.hpp", "src/*.h"]),
+    # Match tt-metal's vivify.hpp fix without maintaining another source patch.
+    copts = ["-std=c++17", "-include", "tuple"],
+    local_defines = ["NBUILD"],
+    includes = ["src"],
+    deps = [":kitten"],
+)
+
+cc_library(
+    name = "kitten",
+    srcs = glob(["src/*.c"]),
+    hdrs = glob(["src/*.h"]),
+    includes = ["src"],
+)
