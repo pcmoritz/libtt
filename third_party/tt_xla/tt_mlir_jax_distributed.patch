@@ -1,0 +1,22 @@
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -1173,9 +1173,15 @@ std::vector<::tt::runtime::Tensor> toHost(::tt::runtime::Tensor tensor,
+       ::tt::runtime::ttnn::toHostSingleTensor(tensorWrapper, untilize,
+                                               blocking);
+ 
+-  std::vector<::ttnn::Tensor> singleTensors =
+-      ::ttnn::distributed::get_device_tensors(
+-          utils::getTTNNTensorFromRuntimeTensor(multiDeviceHostTensor));
++  // PJRT copies only addressable shards. get_device_tensors() performs a
++  // host all-gather, which would also return shards owned by other processes.
++  const ::ttnn::Tensor &hostTensor =
++      utils::getTTNNTensorFromRuntimeTensor(multiDeviceHostTensor);
++  std::vector<::ttnn::Tensor> singleTensors;
++  hostTensor.host_storage().buffer().apply(
++      [&](const ::tt::tt_metal::HostBuffer &buffer) {
++        singleTensors.emplace_back(buffer, hostTensor.tensor_spec());
++      });
+ 
+   const std::optional<::ttnn::MeshEvent> &meshEvent =
+       tensorWrapper.getMeshEvent();
