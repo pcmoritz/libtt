@@ -235,6 +235,7 @@ http_archive(
         "//third_party/tt_metal:matmul_swiglu_epilogue.patch",
         "//third_party/tt_metal:matmul_balanced_1d_planner.patch",
         "//third_party/tt_metal:sdpa_decode_allow_l1_interleaved_q.patch",
+        "//third_party/tt_metal:paged_shared_cache.patch",
         "//third_party/tt_metal:layernorm_allow_single_core_height_sharded.patch",
         "//third_party/tt_metal:topk_float32.patch",
         "//third_party/tt_metal:topk_stable_llk.patch",
@@ -469,6 +470,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_recurrent_attention.patch",
         "//third_party/tt_xla:tt_mlir_integer_gather_offsets.patch",
         "//third_party/tt_xla:tt_mlir_dynamic_slice_index_dtype.patch",
+        "//third_party/tt_xla:tt_mlir_paged_update_shared_cache.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

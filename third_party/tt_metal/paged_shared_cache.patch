@@ -1,0 +1,12 @@
+--- ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp
+@@ -145,7 +145,8 @@
+                 "Expect batch in input tensor match the batch in cache tensor");
+         }
+     } else {
+-        TT_FATAL(!operation_attributes.share_cache, "share_cache not supported with paged cache");
++        // The shared-cache semaphore also serializes read/modify/write updates
++        // to overlapping physical pages. Each input retains its own page table.
+         TT_FATAL(update_idxs_tensor.has_value(), "Paged cache requires update_idxs tensor");
+
+         auto page_table_val = page_table.value();
