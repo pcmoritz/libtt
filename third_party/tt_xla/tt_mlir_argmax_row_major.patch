@@ -1,0 +1,13 @@
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+@@ -620,6 +620,7 @@
+         ttnn::MoeExpertTokenRemapOp::getOperationName(),
+         ttnn::SparseMatmulOp::getOperationName(),
+-        // ArgMax is intentionally absent: at opt-level >= 1 ArgMaxRuleBook's
+-        // RowMajor input siblings supply its ROW_MAJOR input (tt-metal #46340).
++        // Preserve ArgMax's row-major requirement at every optimization level.
++        // Tiled inputs select tt-metal's single-core implementation.
++        ttnn::ArgMaxOp::getOperationName(),
+ };
+ } // namespace mlir::tt::ttnn
