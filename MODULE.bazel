@@ -48,6 +48,22 @@ http_archive(
 )
 
 http_archive(
+    name = "xtl",
+    build_file = "//third_party/xtl:BUILD.overlay.bazel",
+    sha256 = "ee38153b7dd0ec84cee3361f5488a4e7e6ddd26392612ac8821cbc76e740273a",
+    strip_prefix = "xtl-0.8.0",
+    urls = ["https://github.com/xtensor-stack/xtl/archive/refs/tags/0.8.0.tar.gz"],
+)
+
+http_archive(
+    name = "xtensor",
+    build_file = "//third_party/xtensor:BUILD.overlay.bazel",
+    sha256 = "f5f42267d850f781d71097b50567a480a82cd6875a5ec3e6238555e0ef987dc6",
+    strip_prefix = "xtensor-0.26.0",
+    urls = ["https://github.com/xtensor-stack/xtensor/archive/refs/tags/0.26.0.tar.gz"],
+)
+
+http_archive(
     name = "jax_src",
     build_file = "//third_party/jax:BUILD.overlay.bazel",
     patch_cmds = ["find tests jax -name BUILD -delete"],
@@ -366,6 +382,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_fresh_mlir_context.patch",
         "//third_party/tt_xla:tt_xla_main_entry_function.patch",
         "//third_party/tt_xla:tt_xla_donation.patch",
+        "//third_party/tt_xla:tt_xla_jax_distributed.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -473,6 +490,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_recurrent_attention.patch",
         "//third_party/tt_xla:tt_mlir_integer_gather_offsets.patch",
         "//third_party/tt_xla:tt_mlir_dynamic_slice_index_dtype.patch",
+        "//third_party/tt_xla:tt_mlir_jax_distributed.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

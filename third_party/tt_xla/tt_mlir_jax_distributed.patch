@@ -1,0 +1,43 @@
+diff --git a/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp b/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp
+--- a/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp
++++ b/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "ttmlir/Dialect/StableHLO/Pipelines/StableHLOPipelines.h"
++#include "shardy/dialect/sdy/transforms/import/passes.h"
+ #include "shardy/dialect/sdy/transforms/propagation/aggressive_propagation.h"
+ #include "shardy/dialect/sdy/transforms/propagation/user_priority_propagation.h"
+ 
+@@ -25,6 +26,9 @@
+ 
+   // Convert any xla.sdy ops to sdy ops.
+   pm.addPass(createConvertXlaSdyToSdyPass());
++
++  // JAX collectives can introduce identical meshes with different symbols.
++  pm.addPass(mlir::sdy::createLiftInlinedMeshesPass());
+ 
+   // Optionally run aggressive StableHLO simplification if enabled.
+   if (options.enableAggressiveSimplification) {
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -880,9 +880,15 @@
+       ::tt::runtime::ttnn::toHostSingleTensor(tensorWrapper, untilize,
+                                               blocking);
+ 
+-  std::vector<::ttnn::Tensor> singleTensors =
+-      ::ttnn::distributed::get_device_tensors(
+-          utils::getTTNNTensorFromRuntimeTensor(multiDeviceHostTensor));
++  // PJRT copies only addressable shards. get_device_tensors() performs a
++  // host all-gather, which would also return shards owned by other processes.
++  const ::ttnn::Tensor &hostTensor =
++      utils::getTTNNTensorFromRuntimeTensor(multiDeviceHostTensor);
++  std::vector<::ttnn::Tensor> singleTensors;
++  hostTensor.host_storage().buffer().apply(
++      [&](const ::tt::tt_metal::HostBuffer &buffer) {
++        singleTensors.emplace_back(buffer, hostTensor.tensor_spec());
++      });
+ 
+   const std::optional<::ttnn::MeshEvent> &meshEvent =
+       tensorWrapper.getMeshEvent();

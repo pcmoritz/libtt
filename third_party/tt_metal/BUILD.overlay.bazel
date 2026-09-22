@@ -771,6 +771,24 @@ TTNN_OPERATION_SRC_EXCLUDES = [
     "ttnn/cpp/ttnn/operations/**/tests/**",
 ]
 
+TTNN_CCL_OPERATION_SRCS = [
+    "ttnn/cpp/ttnn/operations/ccl/all_broadcast/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/all_gather/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/all_reduce/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/reduce_scatter/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/common/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/all_gather_async/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/moreh/moreh_sum/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/ccl_common.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/ccl_host_datastructures.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/ccl_op_fusion.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/llama_common.cpp",
+]
+
 TTNN_EXPERIMENTAL_OPERATION_SRCS = [
     "ttnn/cpp/ttnn/operations/experimental/dropout/**/*.cpp",
     "ttnn/cpp/ttnn/operations/experimental/indexer_score/**/*.cpp",
@@ -1405,12 +1423,34 @@ cc_library(
     ) + glob(
         TTNN_EXPERIMENTAL_OPERATION_SRCS,
         exclude = TTNN_OPERATION_SRC_EXCLUDES,
+    ) + glob(
+        TTNN_CCL_OPERATION_SRCS,
+        exclude = [p for p in TTNN_OPERATION_SRC_EXCLUDES if p not in [
+            "ttnn/cpp/ttnn/operations/ccl/**",
+            "ttnn/cpp/ttnn/operations/moreh/**",
+        ]],
     )).to_list(),
     hdrs = TTNN_RUNTIME_HDRS,
     copts = TT_METAL_RUNTIME_COPTS,
     includes = TTNN_RUNTIME_INCLUDE_DIRS,
     deps = [
         ":tt_metal_device_tensor_upstream",
+    ],
+    linkstatic = True,
+)
+
+cc_library(
+    name = "ttnn_distributed_tensor_upstream",
+    srcs = [
+        "ttnn/core/distributed/distributed_tensor.cpp",
+        "ttnn/core/distributed/distribution_mode.cpp",
+        "ttnn/core/tensor/xtensor/partition.cpp",
+    ],
+    copts = TT_METAL_RUNTIME_COPTS,
+    includes = TTNN_RUNTIME_INCLUDE_DIRS,
+    deps = [
+        ":ttnn_tensor_upstream",
+        "@xtensor//:xtensor",
     ],
     linkstatic = True,
 )

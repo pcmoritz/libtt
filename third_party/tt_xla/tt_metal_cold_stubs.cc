@@ -115,64 +115,6 @@ Tensor quantize_weights_via_host(const Tensor &, DataType,
 
 } // namespace ttnn::experimental
 
-namespace ttnn::experimental::ccl {
-
-void AllGatherFusedOpSignaler::init_fused_op(
-    const std::vector<CoreCoord> &receiver_cores,
-    const std::vector<uint32_t> &receiver_signal_semaphores,
-    FusedOpSignalerMode mode) {
-  num_fused_op_cores_to_signal = receiver_cores.size();
-  fused_op_receiver_cores_noc = receiver_cores;
-  fused_op_receiver_signal_semaphores = receiver_signal_semaphores;
-  fused_op_signaler_mode = mode;
-  initialized_fused_op = true;
-}
-
-void MatmulFusedOpSignaler::init_fused_op(
-    tt::tt_metal::Program &, const tt::tt_metal::IDevice *,
-    const CoreRange &, const std::vector<CoreCoord> &) {
-  unsupported("ttnn::MatmulFusedOpSignaler::init_fused_op");
-}
-
-void MatmulFusedOpSignaler::init_fused_op(
-    tt::tt_metal::Program &, const tt::tt_metal::IDevice *,
-    const std::variant<CoreRange, CoreRangeSet> &, FusedOpSignalerMode) {
-  unsupported("ttnn::MatmulFusedOpSignaler::init_fused_op");
-}
-
-void MatmulFusedOpSignaler::init_llama_rs_cores_mm(
-    const CoreRangeSet &, tt::tt_metal::Program &,
-    const tt::tt_metal::IDevice *, int) {
-  unsupported("ttnn::MatmulFusedOpSignaler::init_llama_rs_cores_mm");
-}
-
-void MatmulFusedOpSignaler::push_matmul_fused_op_rt_args(
-    std::vector<uint32_t> &, bool) {
-  unsupported("ttnn::MatmulFusedOpSignaler::push_matmul_fused_op_rt_args");
-}
-
-void MatmulFusedOpSignaler::push_matmul_fused_op_rt_args(
-    std::vector<uint32_t> &, uint32_t, uint32_t) {
-  unsupported("ttnn::MatmulFusedOpSignaler::push_matmul_fused_op_rt_args");
-}
-
-void MatmulFusedOpSignaler::push_llama_rs_rt_args_for_mm(
-    std::vector<uint32_t> &, CoreCoord, tt::tt_metal::NOC,
-    const tt::tt_metal::IDevice *) const {
-  unsupported("ttnn::MatmulFusedOpSignaler::push_llama_rs_rt_args_for_mm");
-}
-
-bool MatmulFusedOpSignaler::is_all_gather() const {
-  return fused_op_type == MatmulFusedOpSignalerType::ALL_GATHER ||
-         fused_op_type == MatmulFusedOpSignalerType::LLAMA_ALL_GATHER;
-}
-
-bool MatmulFusedOpSignaler::is_reduce_scatter() const {
-  return fused_op_type == MatmulFusedOpSignalerType::REDUCE_SCATTER ||
-         fused_op_type == MatmulFusedOpSignalerType::LLAMA_REDUCE_SCATTER;
-}
-
-} // namespace ttnn::experimental::ccl
 
 namespace ttnn {
 
@@ -187,28 +129,3 @@ Tensor load_tensor_flatbuffer(
 }
 
 } // namespace ttnn
-
-namespace ttnn::ccl {
-
-tt::tt_fabric::Topology
-convert_2d_to_1d_topology(tt::tt_fabric::Topology topology) {
-  return topology;
-}
-
-std::tuple<size_t, size_t, bool>
-get_forward_backward_configuration(size_t, size_t, Topology) {
-  return {0, 0, false};
-}
-
-uint32_t get_linearized_index_from_physical_coord(
-    const Tensor &, const MeshCoordinate &, const std::optional<uint32_t> &) {
-  return 0;
-}
-
-std::optional<MeshCoordinate> get_physical_neighbor_from_physical_coord(
-    const Tensor &, const MeshCoordinate &, int, Topology,
-    const std::optional<uint32_t> &) {
-  return std::nullopt;
-}
-
-} // namespace ttnn::ccl
