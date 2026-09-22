@@ -505,6 +505,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_tpu_compat_platform.patch",
         "//third_party/tt_xla:tt_xla_device_buffers.patch",
         "//third_party/tt_xla:tt_xla_client_topology.patch",
+        "//third_party/tt_xla:tt_xla_jax_distributed.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -695,6 +696,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_tiled_inputs.patch",
         "//third_party/tt_xla:tt_mlir_stageable_trace_inputs.patch",
         "//third_party/tt_xla:tt_mlir_device_layout.patch",
+        "//third_party/tt_xla:tt_mlir_jax_distributed.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
