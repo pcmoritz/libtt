@@ -1,0 +1,27 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+
+cc_binary(
+    name = "fabric_probe.so",
+    testonly = True,
+    srcs = ["fabric_probe.cc"],
+    copts = ["-std=c++20"],
+    linkshared = True,
+    linkstatic = True,
+    additional_linker_inputs = ["fabric_probe.lds"],
+    linkopts = [
+        "-Wl,--exclude-libs,ALL",
+        "-Wl,-z,defs",
+        "-Wl,--version-script,$(location fabric_probe.lds)",
+    ],
+    deps = ["//:key_value_context", "//:tt_metal_runtime_root", ":mesh_socket_test"],
+    tags = ["manual"],
+)
+
+cc_library(
+    name = "mesh_socket_test",
+    testonly = True,
+    srcs = ["@tt_metal//:mesh_socket_test_sources"],
+    hdrs = ["@tt_metal//:mesh_socket_test_headers"],
+    copts = ["-std=c++20"],
+    deps = ["@tt_metal//:tt_metal_device_tensor_upstream", "@googletest//:gtest"],
+)
