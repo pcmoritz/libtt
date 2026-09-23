@@ -72,7 +72,9 @@ ownership. The full test checks independent local JIT execution, a sharded
 pointwise operation, `psum`, `all_gather`, and `psum_scatter` against NumPy. It
 uses distinct inputs on each process, checks inferred input sharding, passes
 device arrays between local and distributed computations, and runs three
-iterations to exercise cached execution.
+iterations to exercise cached execution. Additional cases cover on-device weight
+partitioning, captured control flow, vocabulary-sharded embedding lookup, and
+all-gathers exceeding 65,535 input tiles (the previous slice-arithmetic overflow).
 
 The full test passes on two hosts with one P150a each, JAX 0.11.2, and firmware
 19.13.1, including clean shutdown with release and watcher builds. Upstream JAX
