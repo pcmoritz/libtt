@@ -68,12 +68,17 @@ python "$TEST_DIR/jax_distributed.py" \
 ```
 
 Use `--enumeration-only` to stop after checking global device IDs and local
-ownership. The full test checks a sharded pointwise operation, `psum`,
-`all_gather`, and `psum_scatter` against NumPy, with distinct inputs on each
-process and three iterations to exercise cached execution.
+ownership. The full test checks independent local JIT execution, a sharded
+pointwise operation, `psum`, `all_gather`, and `psum_scatter` against NumPy. It
+uses distinct inputs on each process, checks inferred input sharding, passes
+device arrays between local and distributed computations, and runs three
+iterations to exercise cached execution.
 
 The full test passes on two hosts with one P150a each, JAX 0.11.2, and firmware
-19.13.1. It uses TTNN device collectives over the cards' Ethernet connection;
-the JAX coordinator carries host metadata. This remains experimental: more
-than one local card, other topologies, process restarts, and explicit coordinator
-shutdown before backend teardown are not validated.
+19.13.1, including clean shutdown with release and watcher builds. Upstream JAX
+all-gather tests also pass for int32, float32, float16, and bfloat16. It uses TTNN
+device collectives over the cards' Ethernet connection; the JAX coordinator
+carries host metadata. Ethernet link training and fabric startup have required
+card resets. This remains experimental: more than one local card, other
+topologies, and explicit coordinator shutdown before backend teardown are not
+validated.
