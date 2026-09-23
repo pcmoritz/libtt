@@ -250,7 +250,9 @@ http_archive(
         "//third_party/tt_metal:remove_boost_dependencies.patch",
         "//third_party/tt_metal:fabric_build.patch",
         "//third_party/tt_metal:all_gather_packet_headers.patch",
+        "//third_party/tt_metal:all_gather_slice_overflow.patch",
         "//third_party/tt_metal:fabric_router_teardown.patch",
+        "//third_party/tt_metal:fabric_packet_size.patch",
         "//third_party/tt_metal:disable_inspector_runtime.patch",
         "//third_party/tt_metal:noc_debugging_use_public_umd_include.patch",
         "//third_party/tt_metal:fast_bfloat16_bfp8_pack.patch",
@@ -301,6 +303,7 @@ http_archive(
         "//third_party/tt_metal:pad_rank1_growth.patch",
         "//third_party/tt_metal:trace_allocation_state.patch",
         "//third_party/tt_metal:recurrent_attention.patch",
+        "//third_party/tt_metal:rotary_logical_heads.patch",
     ],
     sha256 = "a222d1f6fe7f6aec62f69e22199a3537a31a58aa5ead52e4ab470b7d87472ecb",
     strip_prefix = "tt-metal-5beed318d0f0d1c6212e605947fb0be80c9e0a1d",
@@ -493,6 +496,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_integer_gather_offsets.patch",
         "//third_party/tt_xla:tt_mlir_dynamic_slice_index_dtype.patch",
         "//third_party/tt_xla:tt_mlir_jax_distributed.patch",
+        "//third_party/tt_xla:tt_mlir_row_major_all_gather.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
@@ -504,6 +508,7 @@ git_repository(
     patches = [
         "//third_party/tt_xla:shardy_bazel8.patch",
         "//third_party/tt_xla:shardy_td_includes.patch",
+        "//third_party/tt_xla:shardy_gather_replication.patch",
     ],
     remote = "https://github.com/openxla/shardy.git",
 )

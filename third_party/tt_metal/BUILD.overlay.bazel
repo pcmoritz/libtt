@@ -775,6 +775,7 @@ TTNN_CCL_OPERATION_SRCS = [
     "ttnn/cpp/ttnn/operations/ccl/all_broadcast/**/*.cpp",
     "ttnn/cpp/ttnn/operations/ccl/all_gather/**/*.cpp",
     "ttnn/cpp/ttnn/operations/ccl/all_reduce/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/mesh_partition/**/*.cpp",
     "ttnn/cpp/ttnn/operations/ccl/reduce_scatter/**/*.cpp",
     "ttnn/cpp/ttnn/operations/ccl/common/**/*.cpp",
     "ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/**/*.cpp",

@@ -1,0 +1,80 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+@@ -210,6 +210,33 @@
+       ->getResult(0);
+ }
+ 
++// All-gather can copy aligned row-major pages directly. Limit this to returned
++// results: tilizing a gathered tensor for a compute consumer would move more
++// data than tilizing the input. Rows must fill at least one tile's payload to
++// avoid underfilling the CCL kernel's four-page packets, and fit in the default
++// fabric packet. Function inputs have their layouts set before this pass walks
++// the operations, so the return signature and operation layouts agree.
++static bool keepAllGatherRowMajor(Operation *op) {
++  auto gather = mlir::dyn_cast_if_present<ttir::AllGatherOp>(op);
++  if (!gather || !isa<BlockArgument>(gather.getInput()) ||
++      !llvm::all_of(gather->getUsers(), [](Operation *user) {
++        return isa<func::ReturnOp>(user);
++      })) {
++    return false;
++  }
++  auto type = gather.getInput().getType();
++  auto layout = mlir::dyn_cast_if_present<TTNNLayoutAttr>(type.getEncoding());
++  if (!layout || layout.isTiled() ||
++      !layout.hasInterleavedDRAMTensorMemoryLayout() || type.getRank() < 2) {
++    return false;
++  }
++  int64_t rowBytes =
++      type.getShape().back() * type.getElementTypeBitWidth() / 8;
++  auto tile = ttcore::TileType::get(type.getElementType());
++  return rowBytes >= tile.getSizeBytes() && rowBytes <= 4096 &&
++         rowBytes % 64 == 0;
++}
++
+ // Updates the layout of the operands of a TTIR ops which have DPS operands.
+ // This function rewrites the operands and result to have the correct layout
+ // with respect to operand constraints.
+@@ -244,7 +271,7 @@
+       // Given the operand constraint, create the desired layout for the operand
+       std::optional<Value> desiredLayout = createToLayoutOp(
+           rewriter, newLoc, operand.get(), g_defaultMemorySpaceDevice,
+-          /*tiled=*/true);
++          /*tiled=*/!keepAllGatherRowMajor(op));
+ 
+       // If layout changed update the operand
+       if (desiredLayout) {
+@@ -273,6 +300,9 @@
+ 
+ private:
+   bool shouldTilizeResult(Operation *op) const {
++    if (keepAllGatherRowMajor(op)) {
++      return false;
++    }
+ 
+     // TTNN Reshape does not support implicit tilization/untilization
+     // Therefore input output layouts should be the same
+@@ -651,6 +681,13 @@
+     funcOp.walk([&](mlir::func::ReturnOp returnOp) {
+       for (auto [type, operand] :
+            llvm::zip_equal(funcOp.getResultTypes(), returnOp->getOperands())) {
++        if (keepAllGatherRowMajor(operand.getDefiningOp())) {
++          auto newType = toRowMajorType(funcOp.getContext(),
++                                       mlir::cast<RankedTensorType>(type));
++          outputTypes.push_back(newType);
++          modified |= type != newType;
++          continue;
++        }
+         if (!mlir::isa<RankedTensorType>(type) ||
+             !mlir::isa_and_present<ttir::MeshShardOp>(
+                 operand.getDefiningOp())) {
+@@ -777,7 +814,8 @@
+       BufferType desiredBufferType =
+           forceHost ? BufferType::SystemMemory : g_defaultMemorySpaceDevice;
+ 
+-      bool isTiled = !forceHost;
++      bool isTiled =
++          !forceHost && !keepAllGatherRowMajor(operand.get().getDefiningOp());
+ 
+       Location newLoc =
+           appendInputSuffix(op.getLoc(), operand.getOperandNumber());

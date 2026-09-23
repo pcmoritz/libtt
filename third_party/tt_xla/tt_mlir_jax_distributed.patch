@@ -125,6 +125,13 @@ diff --git a/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp b/lib/Dialec
  
    // Optionally run aggressive StableHLO simplification if enabled.
    if (options.enableAggressiveSimplification) {
+@@ -50,3 +54,6 @@
+   analyzeMeshOptions.meshShape = llvm::to_vector(options.meshShape);
+   analyzeMeshOptions.automaticArgAnalysis = options.automaticArgAnalysis;
+   pm.addPass(createAnalyzeMeshPass(analyzeMeshOptions));
++
++  // Size-one axes must not create conflicts or reductions during propagation.
++  pm.addPass(mlir::sdy::createRemoveSizeOneAxesPass());
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
@@ -147,3 +154,48 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  
    const std::optional<::ttnn::MeshEvent> &meshEvent =
        tensorWrapper.getMeshEvent();
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
+@@ -52,8 +52,11 @@
++    // Refresh the descriptor before attaching an external device: a prior
++    // compilation's MLIR context may already have been destroyed.
++    op_model::SingletonDeviceContext::setSystemDesc(
++        ttcore::getCurrentScopeSystemDesc(getOperation()));
++
+     // Open device if not externally provided.
+     if (externalDevice) {
+       op_model::SingletonDeviceContext::setExternalDevice(externalDevice);
+     } else {
+-      op_model::SingletonDeviceContext::setSystemDesc(
+-          ttcore::getCurrentScopeSystemDesc(getOperation()));
+       op_model::SingletonDeviceContext::getInstance().openMockDevice();
+     }
+diff --git a/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp b/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
+--- a/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
++++ b/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
+@@ -1435,10 +1435,24 @@
+   // insert a reconciling cast right after the op it is configuring.
+   SmallVector<Operation *> configuredOps;
++  SmallVector<std::pair<OpOperand *, TTNNLayoutAttr>> exemptInputs;
+   func->walk([&](Operation *op) {
+     if (getChosenCandidate(op)) {
+       configuredOps.push_back(op);
++    } else if (op->hasTrait<OpModelExempt>()) {
++      // Unmodeled consumers cannot validate a producer's new layout.
++      // Preserve the input layouts they were lowered with.
++      for (OpOperand &operand : op->getOpOperands()) {
++        if (auto type = dyn_cast<RankedTensorType>(operand.get().getType())) {
++          if (auto layout = dyn_cast_or_null<TTNNLayoutAttr>(type.getEncoding())) {
++            exemptInputs.emplace_back(&operand, layout);
++          }
++        }
++      }
+     }
+   });
+   for (Operation *op : configuredOps) {
+     applyOpConfig(op, *getChosenCandidate(op));
++  }
++  for (auto [operand, layout] : exemptInputs) {
++    insertReshardOp(operand->getOwner(), operand->getOperandNumber(), layout);
+   }

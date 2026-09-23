@@ -1,6 +1,5 @@
 #include "ttnn/operations/ccl/ccl_common.hpp"
 #include "ttnn/operations/ccl/ccl_op_fusion.hpp"
-#include "ttnn/operations/ccl/mesh_partition/mesh_partition.hpp"
 #include "ttnn/operations/experimental/ccl/ring_attention_all_gather_async/device/ring_attention_all_gather_async_device_operation.hpp"
 #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp"
 #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.hpp"
@@ -22,12 +21,6 @@ namespace {
 } // namespace
 
 namespace ttnn {
-
-ttnn::Tensor mesh_partition(
-    const ttnn::Tensor &, int32_t, std::optional<uint32_t>,
-    const std::optional<tt::tt_metal::MemoryConfig> &) {
-  unsupported("ttnn::mesh_partition");
-}
 
 void ring_attention_all_gather_async_multi_core_with_workers_helper(
     tt::tt_metal::ProgramDescriptor &, const std::vector<Tensor> &,

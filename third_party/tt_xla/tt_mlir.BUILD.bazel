@@ -1324,6 +1324,7 @@ cc_library(
         "runtime/lib/ttnn/operations/ccl/all_reduce.cpp",
         "runtime/lib/ttnn/operations/ccl/all_reduce_async.cpp",
         "runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp",
+        "runtime/lib/ttnn/operations/ccl/mesh_partition.cpp",
         "runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp",
         "runtime/lib/ttnn/operations/conv/conv1d.cpp",
         "runtime/lib/ttnn/operations/conv/conv2d.cpp",

@@ -5,7 +5,6 @@
 #include "operations/ccl/all_to_all_combine.h"
 #include "operations/ccl/all_to_all_dispatch.h"
 #include "operations/ccl/all_to_all_dispatch_metadata.h"
-#include "operations/ccl/mesh_partition.h"
 #include "operations/ccl/moe_expert_token_remap.h"
 #include "operations/ccl/moe_compute.h"
 #include "operations/ccl/moe_gpt.h"
@@ -60,10 +59,6 @@ void run(const ::tt::target::ttnn::AllToAllDispatchOp *, ProgramContext &) {
 void run(const ::tt::target::ttnn::AllToAllDispatchMetadataOp *,
          ProgramContext &) {
   unsupported("ttnn.all_to_all_dispatch_metadata");
-}
-
-void run(const ::tt::target::ttnn::MeshPartitionOp *, ProgramContext &) {
-  unsupported("ttnn.mesh_partition");
 }
 
 void run(const ::tt::target::ttnn::MoeExpertTokenRemapOp *, ProgramContext &) {

@@ -80,7 +80,7 @@ index ac04b7e..3343a62 100644
 +    }
 +
 +    auto inputType = matmulOp.getType();
-+    // The fused runtime only supports BFP8 weights.
++    // The fused runtime uses BFP8 weights and four output tiles on 96 cores.
 +    auto weightDtype = matmulOp->getAttrOfType<mlir::StringAttr>(
 +        "ttcore.weight_dtype");
 +    if (!weightDtype || weightDtype.getValue() != "bfp_bf8") {
@@ -94,7 +94,7 @@ index ac04b7e..3343a62 100644
 +        inputShape[0] < 1 || inputShape[0] > 32 ||
 +        outputShape[0] != inputShape[0] ||
 +        inputShape[1] != 2 * outputShape[1] ||
-+        outputShape[1] % 32 != 0) {
++        outputShape[1] != 96 * 4 * 32) {
 +      return failure();
 +    }
 +

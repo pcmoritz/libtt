@@ -627,6 +627,14 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
  
    const std::optional<tt::runtime::Device> &parent_mesh =
        client_instance->parentMesh();
+@@ -1079,1 +1102,7 @@
++  // Reuse the live mesh: a mock device cannot bind the multi-host topology.
++  if (client_instance->isMultiProcess()) {
++    options.devicePtr = client_instance->parentMesh()->asSharedPtr<
++        tt::tt_metal::distributed::MeshDevice>(tt::runtime::DeviceRuntime::TTNN);
++  }
++
+   options.optimizationLevel = compile_options.optimization_level;
 diff --git a/pjrt_implementation/src/dylib_entry_point.cc b/pjrt_implementation/src/dylib_entry_point.cc
 --- a/pjrt_implementation/src/dylib_entry_point.cc
 +++ b/pjrt_implementation/src/dylib_entry_point.cc
