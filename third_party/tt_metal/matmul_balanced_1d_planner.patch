@@ -38,7 +38,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
      }
 -    uint32_t in0_block_w = K / in0_tile.get_width() % 2 == 0 ? 2 : 1;
 +    const uint32_t k_tiles = K / in0_tile.get_width();
-+    uint32_t in0_block_w = balance_per_core_N ? 4 : (decode_matmul ? 8 : 2);
++    uint32_t in0_block_w = decode_matmul ? 8 : 2;
 +    while (k_tiles % in0_block_w != 0) {
 +        in0_block_w /= 2;
 +    }
