@@ -9,6 +9,27 @@ diff --git a/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h b/include/tt
        {2, 2},
        {2, 4},
        {2, 8},
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
+@@ -51,12 +51,15 @@ public:
+     // Disable tt-metal backtrace generation.
+     setenv("TT_METAL_DISABLE_BACKTRACE", "1", 1);
+ 
++    // Refresh the descriptor before attaching an external device: a prior
++    // compilation's MLIR context may already have been destroyed.
++    op_model::SingletonDeviceContext::setSystemDesc(
++        ttcore::getCurrentScopeSystemDesc(getOperation()));
++
+     // Open device if not externally provided.
+     if (externalDevice) {
+       op_model::SingletonDeviceContext::setExternalDevice(externalDevice);
+     } else {
+-      op_model::SingletonDeviceContext::setSystemDesc(
+-          ttcore::getCurrentScopeSystemDesc(getOperation()));
+       op_model::SingletonDeviceContext::getInstance().openMockDevice();
+     }
+ 
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp

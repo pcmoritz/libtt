@@ -546,6 +546,19 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 +  if (client_instance->isMultiProcess() || target_num_devices > 1) {
      // PJRT returns local shards even when Shardy infers output partitioning.
      // Do not aggregate them into a global host tensor at the graph boundary.
+@@ -1125,6 +1125,12 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+     return tt_pjrt_status::kInternal;
+   }
+ 
++  // Reuse the live mesh: a mock device cannot bind the multi-host topology.
++  if (client_instance->isMultiProcess()) {
++    options.devicePtr = client_instance->parentMesh()->asSharedPtr<
++        tt::tt_metal::distributed::MeshDevice>(tt::runtime::DeviceRuntime::TTNN);
++  }
++
+   options.optimizationLevel = compile_options.optimization_level;
+   options.eraseInverseOpsEnabled = false;
+   // Map user-facing dtype names to BFPDtype enum values.
 diff --git a/pjrt_implementation/src/dylib_entry_point.cc b/pjrt_implementation/src/dylib_entry_point.cc
 --- a/pjrt_implementation/src/dylib_entry_point.cc
 +++ b/pjrt_implementation/src/dylib_entry_point.cc
