@@ -1,3 +1,14 @@
+diff --git a/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h b/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
+--- a/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
++++ b/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
+@@ -31,6 +31,7 @@ inline const llvm::SmallVector<llvm::SmallVector<int64_t, 2>> SupportedMeshes =
+       {1, 16},
+       {1, 32},
+       {1, 64},
++      {2, 1},
+       {2, 2},
+       {2, 4},
+       {2, 8},
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
