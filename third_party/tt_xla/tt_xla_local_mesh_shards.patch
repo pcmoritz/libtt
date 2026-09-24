@@ -1,0 +1,20 @@
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -439,7 +439,7 @@
+     }
+   }
+ 
+-  if (client_instance->isMultiProcess()) {
++  if (client_instance->isMultiProcess() || target_num_devices > 1) {
+     // JAX shards inferred inputs before execution too. Expose direct shard_map
+     // boundary annotations so the compiler does not shard those inputs twice.
+     auto main = (*mlir_module).lookupSymbol<mlir::func::FuncOp>("main");
+@@ -482,7 +482,7 @@
+   }
+ 
+   std::vector<int64_t> result_presharded = collectResultPresharded(mlir_module);
+-  if (client_instance->isMultiProcess()) {
++  if (client_instance->isMultiProcess() || target_num_devices > 1) {
+     // PJRT returns local shards even when Shardy infers output partitioning.
+     // Do not aggregate them into a global host tensor at the graph boundary.
+     std::fill(result_presharded.begin(), result_presharded.end(), 1);

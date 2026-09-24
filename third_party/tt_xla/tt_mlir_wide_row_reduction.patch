@@ -1,0 +1,78 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -32,6 +32,60 @@
+ #include "ttmlir/Dialect/TTIR/Transforms/Passes.h.inc"
+ 
+ namespace {
++
++// Split very wide rows into short rows to expose reduction parallelism and
++// avoid streaming thousands of mostly padded tiles through one worker.
++template <typename OpTy>
++struct WideRowReductionPattern : public OpRewritePattern<OpTy> {
++  using OpRewritePattern<OpTy>::OpRewritePattern;
++
++  LogicalResult matchAndRewrite(OpTy op,
++                                PatternRewriter &rewriter) const override {
++    auto type = cast<RankedTensorType>(op.getInput().getType());
++    auto dims = op.getDimArg();
++    // BF16 max is exact. BF16 sums must not round intermediate partial sums.
++    bool supportedType = type.getElementType().isF32() ||
++                         (std::is_same_v<OpTy, MaxOp> &&
++                          type.getElementType().isBF16());
++    // Restrict this to short batches of wide, tile-aligned rows. Smaller
++    // reductions do not amortize the reshapes and second reduction.
++    if (type.getRank() != 2 || !type.hasStaticShape() || !supportedType ||
++        type.getDimSize(0) < 1 || type.getDimSize(0) > 2 ||
++        type.getDimSize(1) < 32768 || type.getDimSize(1) % 128 || !dims ||
++        dims->size() != 1) {
++      return failure();
++    }
++    auto dim = cast<IntegerAttr>((*dims)[0]).getInt();
++    if (dim != 1 && dim != -1) {
++      return failure();
++    }
++    auto loc = op.getLoc();
++    int64_t batch = type.getDimSize(0), chunks = type.getDimSize(1) / 128;
++    auto splitType = RankedTensorType::get(
++        {batch, chunks, 128}, type.getElementType(), type.getEncoding());
++    Value split = rewriter.create<ReshapeOp>(
++        loc, splitType, op.getInput(),
++        rewriter.getI32ArrayAttr({static_cast<int32_t>(batch),
++                                 static_cast<int32_t>(chunks), 128}));
++    auto partialType = RankedTensorType::get(
++        {batch, chunks, 1}, type.getElementType(), type.getEncoding());
++    Value partial = rewriter.create<OpTy>(loc, partialType, split,
++                                        rewriter.getBoolAttr(true),
++                                        rewriter.getI32ArrayAttr({2}));
++    auto finalType = RankedTensorType::get(
++        {batch, 1, 1}, type.getElementType(), type.getEncoding());
++    Value result = rewriter.create<OpTy>(loc, finalType, partial,
++                                       rewriter.getBoolAttr(true),
++                                       rewriter.getI32ArrayAttr({1}));
++    SmallVector<int32_t> shape;
++    for (int64_t size : op.getType().getShape()) {
++      shape.push_back(size);
++    }
++    rewriter.replaceOpWithNewOp<ReshapeOp>(op, op.getType(), result,
++                                         rewriter.getI32ArrayAttr(shape));
++    return success();
++  }
++};
+ 
+ // Check if we can fuse conv followed by add into conv with bias.
+ // This pattern supports both:
+@@ -3807,6 +3861,13 @@
+       config.setUseTopDownTraversal(true);
+       (void)applyPatternsGreedily(getOperation(), std::move(patterns), config);
+     }
++    // Preserve opportunities for softmax and normalization fusion first.
++    RewritePatternSet wideReductions(&getContext());
++    wideReductions.add<WideRowReductionPattern<MaxOp>,
++                       WideRowReductionPattern<SumOp>>(&getContext());
++    if (failed(applyPatternsGreedily(getOperation(), std::move(wideReductions)))) {
++      signalPassFailure();
++    }
+   }
+ };
+ } // namespace

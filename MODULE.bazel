@@ -250,6 +250,7 @@ http_archive(
         "//third_party/tt_metal:remove_boost_dependencies.patch",
         "//third_party/tt_metal:fabric_build.patch",
         "//third_party/tt_metal:all_gather_packet_headers.patch",
+        "//third_party/tt_metal:reshaped_mesh_link_discovery.patch",
         "//third_party/tt_metal:all_gather_slice_overflow.patch",
         "//third_party/tt_metal:fabric_router_teardown.patch",
         "//third_party/tt_metal:fabric_packet_size.patch",
@@ -388,6 +389,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_main_entry_function.patch",
         "//third_party/tt_xla:tt_xla_donation.patch",
         "//third_party/tt_xla:tt_xla_jax_distributed.patch",
+        "//third_party/tt_xla:tt_xla_local_mesh_shards.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -496,7 +498,9 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_integer_gather_offsets.patch",
         "//third_party/tt_xla:tt_mlir_dynamic_slice_index_dtype.patch",
         "//third_party/tt_xla:tt_mlir_jax_distributed.patch",
+        "//third_party/tt_xla:tt_mlir_local_mesh_scalar.patch",
         "//third_party/tt_xla:tt_mlir_row_major_all_gather.patch",
+        "//third_party/tt_xla:tt_mlir_wide_row_reduction.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
