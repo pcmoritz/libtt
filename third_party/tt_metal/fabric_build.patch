@@ -1,0 +1,36 @@
+diff --git tt_metal/fabric/compute_mesh_router_builder.cpp tt_metal/fabric/compute_mesh_router_builder.cpp
+--- tt_metal/fabric/compute_mesh_router_builder.cpp
++++ tt_metal/fabric/compute_mesh_router_builder.cpp
+@@ -14,7 +14,7 @@
+ #include "impl/context/metal_context.hpp"
+ #include "impl/kernels/kernel.hpp"
+ #include <tt-metalium/experimental/fabric/control_plane.hpp>
+-#include "tt_metal/third_party/umd/device/api/umd/device/types/core_coordinates.hpp"
++#include "umd/device/types/core_coordinates.hpp"
+ #include "llrt/metal_soc_descriptor.hpp"
+ #include "tt_metal.hpp"
+ #include <tt_stl/assert.hpp>
+diff --git tt_metal/fabric/control_plane.cpp tt_metal/fabric/control_plane.cpp
+--- tt_metal/fabric/control_plane.cpp
++++ tt_metal/fabric/control_plane.cpp
+@@ -38,7 +38,7 @@
+ #include "hostdevcommon/fabric_common.h"
+ #include "fabric_host_utils.hpp"
+ #include <tt-metalium/experimental/fabric/fabric_telemetry.hpp>
+-#include "tt_metal/llrt/hal/generated/fabric_telemetry.hpp"
++#include "hal/generated/fabric_telemetry.hpp"
+ #include "distributed_context.hpp"
+ #include <tt-metalium/experimental/fabric/fabric_types.hpp>
+ #include "hal_types.hpp"
+diff --git tt_metal/fabric/fabric_telemetry_reader.cpp tt_metal/fabric/fabric_telemetry_reader.cpp
+--- tt_metal/fabric/fabric_telemetry_reader.cpp
++++ tt_metal/fabric/fabric_telemetry_reader.cpp
+@@ -13,7 +13,7 @@
+ #include "tt_metal/api/tt-metalium/experimental/fabric/control_plane.hpp"
+ #include "tt_metal/impl/context/metal_context.hpp"
+ #include "tt_metal/llrt/hal.hpp"
+-#include "tt_metal/llrt/hal/generated/fabric_telemetry.hpp"
++#include "hal/generated/fabric_telemetry.hpp"
+ #include "tt_metal/llrt/tt_cluster.hpp"
+ #include "tt_stl/assert.hpp"
+ #include "umd/device/types/core_coordinates.hpp"

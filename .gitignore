@@ -2,3 +2,8 @@
 /tt-metal-deps
 /bazel-*
 /MODULE.bazel.lock
+
+# Local test and runtime outputs.
+/generated/
+/tests/libtt/generated/
+__pycache__/

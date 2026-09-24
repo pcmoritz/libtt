@@ -1,0 +1,130 @@
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -416,7 +416,8 @@
+   m_addressable_devices_raw.reserve(devices_count);
+ 
+   for (size_t i = 0; i < devices_count; ++i) {
+-    int global_device_id = m_system_descriptor->chip_desc_indices()->Get(i);
++    // Descriptor indices can repeat when devices have the same chip type.
++    int global_device_id = i;
+     int local_device_id = i;
+ 
+     // For now, just make all devices addressable.
+@@ -901,11 +902,17 @@
+   ZoneScoped;
+   DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_Client_DefaultDeviceAssignment");
+ 
+-  // TODO(mrakita): Revisit this implementation.
+-  for (size_t i = 0; i < args->default_assignment_size; ++i) {
+-    args->default_assignment[i] = 0;
+-  }
+-
++  const auto &devices = ClientInstance::unwrap(args->client)->getDevicesRaw();
++  const int64_t count =
++      static_cast<int64_t>(args->num_replicas) * args->num_partitions;
++  if (args->num_replicas < 1 || args->num_partitions < 1 ||
++      count > devices.size() || count > args->default_assignment_size)
++    return *ErrorInstance::makeError(
++                tt_pjrt_status::kInvalidArgument,
++                "Device assignment exceeds available TT devices")
++                .release();
++  for (int64_t i = 0; i < count; ++i)
++    args->default_assignment[i] = devices[i]->getGlobalDeviceId();
+   return nullptr;
+ }
+ 
+diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc
+--- a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc
++++ b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc
+@@ -409,6 +409,31 @@
+     auto meshOp = meshOps.front();
+ 
+     auto manualComputationOp = manualComputationOps.front();
++    // JAX queries parameter shardings from the module metadata, not the
++    // parameter instructions. Preserve them before removing the function body.
++    auto main = module.lookupSymbol<mlir::func::FuncOp>("main");
++    llvm::SmallVector<mlir::Attribute> inputShardings(main.getNumArguments());
++    for (auto [operand, sharding] :
++         llvm::zip(manualComputationOp.getOperands(),
++                   manualComputationOp.getInShardings().getShardings())) {
++      auto argument = mlir::dyn_cast<mlir::BlockArgument>(operand);
++      if (argument && argument.getOwner() == &main.getBody().front()) {
++        auto index = argument.getArgNumber();
++        auto declared = main.getArgAttrOfType<mlir::sdy::TensorShardingAttr>(
++            index, mlir::sdy::TensorShardingAttr::name);
++        inputShardings[index] = mlir::StringAttr::get(
++            module.getContext(), internal::extractHloShardingString(
++                                     declared ? declared : sharding,
++                                     meshOp.getMeshAttr()));
++      }
++    }
++    if (llvm::all_of(inputShardings,
++                     [](mlir::Attribute attr) { return bool(attr); })) {
++      module->setAttr(
++          "mhlo.spmd_parameters_shardings",
++          mlir::ArrayAttr::get(module.getContext(), inputShardings));
++    }
++
+     auto outShardingResult = internal::extractSdyManualComputationOutSharding(
+         manualComputationOp, meshOp.getMeshAttr());
+ 
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -439,6 +439,24 @@
+     }
+   }
+ 
++  if (target_num_devices > 1) {
++    // JAX shards inferred inputs before execution too. Expose direct shard_map
++    // boundary annotations so the compiler does not shard those inputs twice.
++    auto main = (*mlir_module).lookupSymbol<mlir::func::FuncOp>("main");
++    main.walk([&](mlir::sdy::ManualComputationOp op) {
++      for (auto [operand, sharding] :
++           llvm::zip(op.getOperands(), op.getInShardings().getShardings())) {
++        auto arg = mlir::dyn_cast<mlir::BlockArgument>(operand);
++        if (arg && arg.getOwner() == &main.getBody().front() &&
++            !main.getArgAttr(arg.getArgNumber(),
++                             mlir::sdy::TensorShardingAttr::name)) {
++          main.setArgAttr(arg.getArgNumber(),
++                          mlir::sdy::TensorShardingAttr::name, sharding);
++        }
++      }
++    });
++  }
++
+   std::vector<mlir::tt::sharding_utils::MeshSharding> input_shardings;
+   status = collectInputShardings(mlir_module, input_shardings);
+   if (!tt_pjrt_status_is_ok(status)) {
+@@ -464,6 +482,11 @@
+   }
+ 
+   std::vector<int64_t> result_presharded = collectResultPresharded(mlir_module);
++  if (target_num_devices > 1) {
++    // PJRT returns local shards even when Shardy infers output partitioning.
++    // Do not aggregate them into a global host tensor at the graph boundary.
++    std::fill(result_presharded.begin(), result_presharded.end(), 1);
++  }
+ 
+   const std::optional<tt::runtime::Device> &parent_mesh =
+       client_instance->parentMesh();
+@@ -471,10 +494,17 @@
+       parent_mesh ? std::make_optional(tt::runtime::getMeshShape(*parent_mesh))
+                   : std::nullopt;
+ 
++  // A single-device executable must not inherit a previously opened TP mesh.
++  // Keep the live shape separately so it can still be resized after compilation.
++  auto compiler_mesh_shape = current_mesh_shape;
++  if (target_num_devices == 1) {
++    compiler_mesh_shape = std::vector<uint32_t>{1, 1};
++  }
++
+   status = runCompilerStableHLOPipeline(
+       mlir_module, result_presharded, output_shardings,
+       compile_options.export_path, compile_options.export_model_name,
+-      current_mesh_shape, target_num_devices);
++      compiler_mesh_shape, target_num_devices);
+   if (!tt_pjrt_status_is_ok(status)) {
+     return {status, nullptr};
+   }

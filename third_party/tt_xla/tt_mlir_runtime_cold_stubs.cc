@@ -1,4 +1,3 @@
-#include "operations/ccl/aggregate_tensor.h"
 #include "operations/ccl/allocate_moe_compute_semaphore.h"
 #include "operations/ccl/all_gather.h"
 #include "operations/ccl/all_reduce.h"
@@ -6,8 +5,6 @@
 #include "operations/ccl/all_to_all_combine.h"
 #include "operations/ccl/all_to_all_dispatch.h"
 #include "operations/ccl/all_to_all_dispatch_metadata.h"
-#include "operations/ccl/distribute_tensor.h"
-#include "operations/ccl/mesh_partition.h"
 #include "operations/ccl/moe_expert_token_remap.h"
 #include "operations/ccl/moe_compute.h"
 #include "operations/ccl/moe_gpt.h"
@@ -51,22 +48,6 @@ void run(const ::tt::target::ttnn::AllocateMoeComputeSemaphoreOp *,
   unsupported("ttnn.allocate_moe_compute_semaphore");
 }
 
-void run(const ::tt::target::ttnn::AggregateTensorOp *, ProgramContext &) {
-  unsupported("ttnn.aggregate_tensor");
-}
-
-void run(const ::tt::target::ttnn::AllGatherOp *, ProgramContext &) {
-  unsupported("ttnn.all_gather");
-}
-
-void run(const ::tt::target::ttnn::AllReduceOp *, ProgramContext &) {
-  unsupported("ttnn.all_reduce");
-}
-
-void run(const ::tt::target::ttnn::AllReduceAsyncOp *, ProgramContext &) {
-  unsupported("ttnn.all_reduce_async");
-}
-
 void run(const ::tt::target::ttnn::AllToAllCombineOp *, ProgramContext &) {
   unsupported("ttnn.all_to_all_combine");
 }
@@ -78,14 +59,6 @@ void run(const ::tt::target::ttnn::AllToAllDispatchOp *, ProgramContext &) {
 void run(const ::tt::target::ttnn::AllToAllDispatchMetadataOp *,
          ProgramContext &) {
   unsupported("ttnn.all_to_all_dispatch_metadata");
-}
-
-void run(const ::tt::target::ttnn::DistributeTensorOp *, ProgramContext &) {
-  unsupported("ttnn.distribute_tensor");
-}
-
-void run(const ::tt::target::ttnn::MeshPartitionOp *, ProgramContext &) {
-  unsupported("ttnn.mesh_partition");
 }
 
 void run(const ::tt::target::ttnn::MoeExpertTokenRemapOp *, ProgramContext &) {
@@ -112,10 +85,6 @@ void run(const ::tt::target::ttnn::PrepareMoEComputeW0W1WeightsOp *,
 void run(const ::tt::target::ttnn::PrepareMoEComputeW2WeightsOp *,
          ProgramContext &) {
   unsupported("ttnn.prepare_moe_compute_w2_weights");
-}
-
-void run(const ::tt::target::ttnn::ReduceScatterOp *, ProgramContext &) {
-  unsupported("ttnn.reduce_scatter");
 }
 
 void run(const ::tt::target::ttnn::SelectiveReduceCombineOp *,
