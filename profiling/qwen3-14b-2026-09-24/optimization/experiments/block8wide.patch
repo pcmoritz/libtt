@@ -1,0 +1,30 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp 
+--- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
+@@ -254,12 +254,12 @@
+     constexpr uint32_t num_cores = 96;
+     constexpr uint32_t group0_y = 8;
+     constexpr uint32_t group1_x = 8;
+-    constexpr uint32_t in0_block_w = 2;
+-    constexpr uint32_t in0_mcast_w = 2;
+ 
+     const uint32_t Kt = a.padded_shape()[-1] / TILE_WIDTH;
+     const uint32_t fused_Nt = b.padded_shape()[-1] / TILE_WIDTH;
+     const uint32_t half_Nt = fused_Nt / 2;
++    const uint32_t in0_block_w = half_Nt % num_cores != 0 && Kt % 8 == 0 ? 8 : 2;
++    const uint32_t in0_mcast_w = in0_block_w;
+     const uint32_t per_core_N = (half_Nt + num_cores - 1) / num_cores;
+     const uint32_t combined_per_core_N = 2 * per_core_N;
+     const uint32_t num_blocks = Kt / in0_block_w;
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
+@@ -18,7 +18,7 @@
+     constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
+     constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
+     constexpr uint32_t combined_per_core_N = 2 * per_core_N;
+-    constexpr uint32_t out_subblock_w = 2;
++    constexpr uint32_t out_subblock_w = per_core_N == 3 ? 6 : 2;
+     static_assert(combined_per_core_N > 0 && combined_per_core_N <= 8, "gate and up must fit in DST");
+ 
+     compute_kernel_hw_startup<SrcOrder::Reverse>(cb_in0, cb_weights, cb_out);

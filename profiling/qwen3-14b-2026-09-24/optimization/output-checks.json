@@ -1,0 +1,22 @@
+{
+  "tp1-short": {
+    "exact_baseline_match": true,
+    "first_differing_token_zero_based": null,
+    "distinct_optimized_measured_outputs": 1
+  },
+  "tp1-long": {
+    "exact_baseline_match": true,
+    "first_differing_token_zero_based": null,
+    "distinct_optimized_measured_outputs": 1
+  },
+  "tp2-short": {
+    "exact_baseline_match": false,
+    "first_differing_token_zero_based": 38,
+    "distinct_optimized_measured_outputs": 1
+  },
+  "tp2-long": {
+    "exact_baseline_match": false,
+    "first_differing_token_zero_based": 53,
+    "distinct_optimized_measured_outputs": 1
+  }
+}

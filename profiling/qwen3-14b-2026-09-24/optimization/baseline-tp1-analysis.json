@@ -1,0 +1,58 @@
+{
+  "0": {
+    "complete_decode_iterations": 9,
+    "window_ms": 500,
+    "median_lm_head_to_lm_head_ms": 48.42740518518518,
+    "median_program_covered_ms": 46.578422222222216,
+    "program_category_ms_per_token": {
+      "matmul": 39.902057777777785,
+      "experimental/transformer/nlp_create_qkv_heads_decode": 1.5752733333333329,
+      "normalization/layernorm": 0.9713037037037034,
+      "experimental/paged_cache": 0.673947407407407,
+      "data_movement/slice": 0.5208577777777778,
+      "eltwise/binary_ng": 0.4904451851851851,
+      "experimental/transformer/rotary_embedding": 0.4423148148148149,
+      "transformer/sdpa_decode": 0.38891629629629626,
+      "eltwise/unary": 0.3652829629629631,
+      "data_movement/reshape_view": 0.31082296296296297,
+      "data_movement/sharded": 0.290902962962963,
+      "data_movement/tilize": 0.2760585185185185,
+      "data_movement/copy": 0.10034888888888888,
+      "copy/typecast": 0.09156444444444445,
+      "data_movement/untilize": 0.06282740740740742,
+      "reduction/generic": 0.04338518518518518,
+      "data_movement/fill_pad": 0.031574074074074074,
+      "reduction/argmax": 0.0312837037037037,
+      "eltwise/ternary": 0.002355555555555555,
+      "embedding": 0.0018814814814814814
+    },
+    "max_reported_dropped": 0,
+    "projections": {
+      "qkv": {
+        "median_kernel_us": 105.646,
+        "median_total_ms_per_token": 4.225724999999999,
+        "sample_count": 360
+      },
+      "attention_output": {
+        "median_kernel_us": 76.41925,
+        "median_total_ms_per_token": 3.0572592000000007,
+        "sample_count": 360
+      },
+      "up_gate": {
+        "median_kernel_us": 495.1225,
+        "median_total_ms_per_token": 19.781041,
+        "sample_count": 360
+      },
+      "down": {
+        "median_kernel_us": 249.24200000000002,
+        "median_total_ms_per_token": 9.973365,
+        "sample_count": 360
+      },
+      "lm_head": {
+        "median_kernel_us": 2858.31,
+        "median_total_ms_per_token": 2.85831,
+        "sample_count": 9
+      }
+    }
+  }
+}

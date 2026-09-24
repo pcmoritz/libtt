@@ -1,0 +1,29 @@
+Using Python 3.12.3 environment at: /tmp/libtt-profile/multinode-venv
+Resolved 1 package in 0.82ms
+Prepared 1 package in 180ms
+Uninstalled 1 package in 0.22ms
+Installed 1 package in 0.32ms
+ - jax-tt-plugin==0.1.0 (from file:///home/ttuser/libtt/bazel-bin/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl)
+ + jax-tt-plugin==0.1.0 (from file:///tmp/libtt-profile/14b-opt/wheels/baseline/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl)
+START TP1
+READY TP1
+DONE TP1
+START TP2
+READY TP2
+DONE TP2
+Using Python 3.12.3 environment at: /tmp/libtt-profile/multinode-venv
+Resolved 1 package in 0.76ms
+Prepared 1 package in 181ms
+Uninstalled 1 package in 0.29ms
+Installed 1 package in 0.30ms
+ - jax-tt-plugin==0.1.0 (from file:///tmp/libtt-profile/14b-opt/wheels/baseline/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl)
+ + jax-tt-plugin==0.1.0 (from file:///tmp/libtt-profile/14b-opt/wheels/final/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl)
+START TP2
+READY TP2
+DONE TP2
+Using Python 3.12.3 environment at: /tmp/libtt-profile/multinode-venv
+Resolved 1 package in 0.82ms
+Prepared 1 package in 0.08ms
+Uninstalled 1 package in 0.20ms
+Installed 1 package in 0.88ms
+ ~ jax-tt-plugin==0.1.0 (from file:///tmp/libtt-profile/14b-opt/wheels/final/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl)

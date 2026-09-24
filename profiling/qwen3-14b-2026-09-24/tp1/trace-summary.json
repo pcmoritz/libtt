@@ -1,0 +1,428 @@
+[
+  {
+    "trace": "/tmp/libtt-profile/qwen3-14b/tp1/trace/plugins/profile/2026_09_24_05_49_09/tt-quietbox.trace.json.gz",
+    "note": "Inclusive host/Python durations overlap; do not sum across names. Device kernel times are unavailable.",
+    "top_events": [
+      {
+        "name": "$threading.py:323 wait",
+        "calls": 35,
+        "inclusive_total_ms": 3439.3971970000002,
+        "mean_ms": 98.26849134285715,
+        "max_ms": 1722.5818179999999
+      },
+      {
+        "name": "PjitFunction(jitted_sampler)",
+        "calls": 64,
+        "inclusive_total_ms": 3101.2657689999996,
+        "mean_ms": 48.457277640624994,
+        "max_ms": 110.97399300000001
+      },
+      {
+        "name": "$threading.py:637 wait",
+        "calls": 2,
+        "inclusive_total_ms": 1723.7254679999999,
+        "mean_ms": 861.8627339999999,
+        "max_ms": 1722.5826499999998
+      },
+      {
+        "name": "$queue.py:154 get",
+        "calls": 33,
+        "inclusive_total_ms": 1715.914396,
+        "mean_ms": 51.997405939393936,
+        "max_ms": 182.366963
+      },
+      {
+        "name": "$scheduler.py:2409 run_batch",
+        "calls": 32,
+        "inclusive_total_ms": 1698.649705,
+        "mean_ms": 53.08280328125,
+        "max_ms": 118.886369
+      },
+      {
+        "name": "$tp_worker.py:473 forward_batch_generation",
+        "calls": 32,
+        "inclusive_total_ms": 1664.112419,
+        "mean_ms": 52.00351309375,
+        "max_ms": 117.805461
+      },
+      {
+        "name": "$<unknown> acquire",
+        "calls": 200,
+        "inclusive_total_ms": 1656.3273370000002,
+        "mean_ms": 8.281636684999999,
+        "max_ms": 182.346614
+      },
+      {
+        "name": "PjRtCApiLoadedExecutable::Execute",
+        "calls": 64,
+        "inclusive_total_ms": 1635.31717,
+        "mean_ms": 25.55183078125,
+        "max_ms": 110.95294100000001
+      },
+      {
+        "name": "$model_runner.py:998 sample",
+        "calls": 32,
+        "inclusive_total_ms": 1550.795697,
+        "mean_ms": 48.46236553125,
+        "max_ms": 110.97779
+      },
+      {
+        "name": "PjitFunction(jitted_run_model)",
+        "calls": 64,
+        "inclusive_total_ms": 181.196046,
+        "mean_ms": 2.83118821875,
+        "max_ms": 68.815932
+      },
+      {
+        "name": "$model_runner.py:949 forward",
+        "calls": 32,
+        "inclusive_total_ms": 92.332756,
+        "mean_ms": 2.885398625,
+        "max_ms": 68.97904700000001
+      },
+      {
+        "name": "_forward_raw",
+        "calls": 32,
+        "inclusive_total_ms": 92.21221000000001,
+        "mean_ms": 2.8816315625000004,
+        "max_ms": 68.974478
+      },
+      {
+        "name": "$model_runner.py:974 _forward_raw",
+        "calls": 32,
+        "inclusive_total_ms": 92.17585,
+        "mean_ms": 2.8804953125,
+        "max_ms": 68.971362
+      },
+      {
+        "name": "$model_runner.py:883 _forward",
+        "calls": 32,
+        "inclusive_total_ms": 91.91214000000001,
+        "mean_ms": 2.8722543750000002,
+        "max_ms": 68.95801700000001
+      },
+      {
+        "name": "$model_runner.py:441 run_model_wrapper",
+        "calls": 32,
+        "inclusive_total_ms": 90.619276,
+        "mean_ms": 2.831852375,
+        "max_ms": 68.817075
+      },
+      {
+        "name": "$tree_util.py:388 tree_map",
+        "calls": 160,
+        "inclusive_total_ms": 38.709857,
+        "mean_ms": 0.24193660625,
+        "max_ms": 1.005793
+      },
+      {
+        "name": "$tree_util.py:400 <genexpr>",
+        "calls": 615,
+        "inclusive_total_ms": 38.089596,
+        "mean_ms": 0.06193430243902438,
+        "max_ms": 1.001274
+      },
+      {
+        "name": "$api.py:2549 device_get",
+        "calls": 32,
+        "inclusive_total_ms": 29.615375,
+        "mean_ms": 0.92548046875,
+        "max_ms": 1.07652
+      },
+      {
+        "name": "$profiler.py:417 wrapper",
+        "calls": 64,
+        "inclusive_total_ms": 28.698029,
+        "mean_ms": 0.448406703125,
+        "max_ms": 0.991816
+      },
+      {
+        "name": "$api.py:2532 _device_get",
+        "calls": 32,
+        "inclusive_total_ms": 26.924966,
+        "mean_ms": 0.8414051875,
+        "max_ms": 1.000022
+      },
+      {
+        "name": "$array.py:409 __array__",
+        "calls": 32,
+        "inclusive_total_ms": 26.716654,
+        "mean_ms": 0.8348954375,
+        "max_ms": 0.994151
+      },
+      {
+        "name": "np.asarray(jax.Array)",
+        "calls": 32,
+        "inclusive_total_ms": 26.608766,
+        "mean_ms": 0.8315239375,
+        "max_ms": 0.9907440000000001
+      },
+      {
+        "name": "$array.py:634 _value",
+        "calls": 32,
+        "inclusive_total_ms": 26.562994,
+        "mean_ms": 0.8300935625,
+        "max_ms": 0.9884299999999999
+      },
+      {
+        "name": "$jax_utils.py:249 device_array",
+        "calls": 128,
+        "inclusive_total_ms": 12.029644000000001,
+        "mean_ms": 0.09398159375000001,
+        "max_ms": 0.298406
+      },
+      {
+        "name": "$tree.py:116 map",
+        "calls": 128,
+        "inclusive_total_ms": 11.731395000000001,
+        "mean_ms": 0.09165152343750001,
+        "max_ms": 0.28840699999999997
+      },
+      {
+        "name": "$jax_utils.py:255 _to_device",
+        "calls": 423,
+        "inclusive_total_ms": 10.976158999999999,
+        "mean_ms": 0.025948366430260047,
+        "max_ms": 0.157334
+      },
+      {
+        "name": "$array.py:708 make_array_from_callback",
+        "calls": 423,
+        "inclusive_total_ms": 10.589457,
+        "mean_ms": 0.02503417730496454,
+        "max_ms": 0.151784
+      },
+      {
+        "name": "$scheduler.py:1165 process_input_requests",
+        "calls": 428,
+        "inclusive_total_ms": 8.675838,
+        "mean_ms": 0.02027064953271028,
+        "max_ms": 8.547304
+      },
+      {
+        "name": "$utils.py:18 __call__",
+        "calls": 3,
+        "inclusive_total_ms": 8.624703000000002,
+        "mean_ms": 2.8749010000000004,
+        "max_ms": 8.545861
+      },
+      {
+        "name": "$scheduler_profiler_mixing.py:343 profile",
+        "calls": 2,
+        "inclusive_total_ms": 8.590727000000001,
+        "mean_ms": 4.295363500000001,
+        "max_ms": 8.542625
+      },
+      {
+        "name": "$scheduler_profiler_mixing.py:288 stop_profile",
+        "calls": 1,
+        "inclusive_total_ms": 8.537795000000001,
+        "mean_ms": 8.537795000000001,
+        "max_ms": 8.537795000000001
+      },
+      {
+        "name": "$profiler.py:271 stop_trace",
+        "calls": 1,
+        "inclusive_total_ms": 8.44165,
+        "mean_ms": 8.44165,
+        "max_ms": 8.44165
+      },
+      {
+        "name": "$forward_batch_info.py:355 init_new",
+        "calls": 32,
+        "inclusive_total_ms": 7.709594,
+        "mean_ms": 0.2409248125,
+        "max_ms": 0.336671
+      },
+      {
+        "name": "$tt_backend.py:157 get_forward_metadata",
+        "calls": 32,
+        "inclusive_total_ms": 5.6660569999999995,
+        "mean_ms": 0.17706428124999998,
+        "max_ms": 0.288677
+      },
+      {
+        "name": "$scheduler.py:1140 recv_requests",
+        "calls": 427,
+        "inclusive_total_ms": 5.608044,
+        "mean_ms": 0.0131335925058548,
+        "max_ms": 0.07627800000000001
+      },
+      {
+        "name": "$tt_backend.py:164 _decode_metadata",
+        "calls": 31,
+        "inclusive_total_ms": 5.349883,
+        "mean_ms": 0.17257687096774194,
+        "max_ms": 0.22105699999999998
+      },
+      {
+        "name": "$socket.py:961 recv_pyobj",
+        "calls": 856,
+        "inclusive_total_ms": 5.140358,
+        "mean_ms": 0.0060050911214953265,
+        "max_ms": 0.066569
+      },
+      {
+        "name": "$scheduler.py:1890 get_next_batch_to_run",
+        "calls": 427,
+        "inclusive_total_ms": 5.077212,
+        "mean_ms": 0.011890426229508196,
+        "max_ms": 0.303877
+      },
+      {
+        "name": "$pxla.py:246 batched_device_put",
+        "calls": 423,
+        "inclusive_total_ms": 4.811332,
+        "mean_ms": 0.011374307328605202,
+        "max_ms": 0.075015
+      },
+      {
+        "name": "$schedule_batch.py:3067 get_model_worker_batch",
+        "calls": 32,
+        "inclusive_total_ms": 3.591989,
+        "mean_ms": 0.11224965625,
+        "max_ms": 0.17627099999999998
+      },
+      {
+        "name": "$sampling_batch_info.py:130 from_model_worker_batch",
+        "calls": 32,
+        "inclusive_total_ms": 3.416238,
+        "mean_ms": 0.1067574375,
+        "max_ms": 0.12411
+      },
+      {
+        "name": "$scheduler.py:2310 update_running_batch",
+        "calls": 32,
+        "inclusive_total_ms": 2.824065,
+        "mean_ms": 0.08825203125,
+        "max_ms": 0.16708199999999998
+      },
+      {
+        "name": "DevicePutWithSharding",
+        "calls": 423,
+        "inclusive_total_ms": 2.659501,
+        "mean_ms": 0.0062872364066193865,
+        "max_ms": 0.04643
+      },
+      {
+        "name": "$pytreelib.py:649 __setattr__",
+        "calls": 32,
+        "inclusive_total_ms": 2.550719,
+        "mean_ms": 0.07970996875,
+        "max_ms": 0.128108
+      },
+      {
+        "name": "$pytreelib.py:652 _setattr",
+        "calls": 32,
+        "inclusive_total_ms": 2.5339169999999998,
+        "mean_ms": 0.07918490624999999,
+        "max_ms": 0.126755
+      },
+      {
+        "name": "$builtins isinstance",
+        "calls": 13088,
+        "inclusive_total_ms": 2.351016,
+        "mean_ms": 0.00017963141809290952,
+        "max_ms": 0.009138
+      },
+      {
+        "name": "$scheduler.py:2537 process_batch_result",
+        "calls": 32,
+        "inclusive_total_ms": 2.325363,
+        "mean_ms": 0.07266759375,
+        "max_ms": 0.196199
+      },
+      {
+        "name": "$scheduler_output_processor_mixin.py:398 process_batch_result_decode",
+        "calls": 31,
+        "inclusive_total_ms": 2.172264,
+        "mean_ms": 0.07007303225806452,
+        "max_ms": 0.19509700000000002
+      },
+      {
+        "name": "$_arraypad_impl.py:545 pad",
+        "calls": 63,
+        "inclusive_total_ms": 2.005305,
+        "mean_ms": 0.0318302380952381,
+        "max_ms": 0.062270000000000006
+      },
+      {
+        "name": "ArrayImpl.copy_to_host_async",
+        "calls": 32,
+        "inclusive_total_ms": 2.0028989999999998,
+        "mean_ms": 0.06259059374999999,
+        "max_ms": 0.133888
+      },
+      {
+        "name": "$array.py:624 copy_to_host_async",
+        "calls": 32,
+        "inclusive_total_ms": 1.949622,
+        "mean_ms": 0.0609256875,
+        "max_ms": 0.131163
+      },
+      {
+        "name": "$schedule_batch.py:1696 prepare_for_decode",
+        "calls": 31,
+        "inclusive_total_ms": 1.941419,
+        "mean_ms": 0.06262641935483872,
+        "max_ms": 0.129129
+      },
+      {
+        "name": "$error.py:120 __init__",
+        "calls": 854,
+        "inclusive_total_ms": 1.858902,
+        "mean_ms": 0.0021767002341920375,
+        "max_ms": 0.017584
+      },
+      {
+        "name": "$scheduler.py:1543 on_idle",
+        "calls": 395,
+        "inclusive_total_ms": 1.696385,
+        "mean_ms": 0.0042946455696202535,
+        "max_ms": 0.014829
+      },
+      {
+        "name": "$tt_backend.py:71 _pad_page_table",
+        "calls": 32,
+        "inclusive_total_ms": 1.607254,
+        "mean_ms": 0.0502266875,
+        "max_ms": 0.068372
+      },
+      {
+        "name": "$pytreelib.py:680 _check_value",
+        "calls": 32,
+        "inclusive_total_ms": 1.496572,
+        "mean_ms": 0.046767875,
+        "max_ms": 0.058122
+      },
+      {
+        "name": "$scheduler_output_processor_mixin.py:768 stream_output",
+        "calls": 32,
+        "inclusive_total_ms": 1.372198,
+        "mean_ms": 0.0428811875,
+        "max_ms": 0.081327
+      },
+      {
+        "name": "$schedule_batch.py:2391 _merge_cache_loc",
+        "calls": 32,
+        "inclusive_total_ms": 1.371773,
+        "mean_ms": 0.04286790625,
+        "max_ms": 0.06381300000000001
+      },
+      {
+        "name": "ParseArguments",
+        "calls": 64,
+        "inclusive_total_ms": 1.345754,
+        "mean_ms": 0.02102740625,
+        "max_ms": 0.065547
+      },
+      {
+        "name": "$pytreelib.py:156 is_data",
+        "calls": 323,
+        "inclusive_total_ms": 1.345173,
+        "mean_ms": 0.004164622291021672,
+        "max_ms": 0.022433
+      }
+    ]
+  }
+]

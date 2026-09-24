@@ -1,0 +1,104 @@
+{
+  "tp1": {
+    "baseline": {
+      "short": {
+        "prompt_tokens": 5,
+        "completion_tokens": 128,
+        "ttft_s": 0.11591128600412048,
+        "e2e_s": 6.322218371999043,
+        "decode_tokens_per_s": 20.463272113265525,
+        "tpot_ms": 48.8680399920861
+      },
+      "long": {
+        "prompt_tokens": 199,
+        "completion_tokens": 128,
+        "ttft_s": 0.1614168050000444,
+        "e2e_s": 6.557261474998086,
+        "decode_tokens_per_s": 19.85684803925106,
+        "tpot_ms": 50.36045992915385
+      }
+    },
+    "optimized": {
+      "short": {
+        "prompt_tokens": 5,
+        "completion_tokens": 128,
+        "ttft_s": 0.11603457200544653,
+        "e2e_s": 6.352948802006722,
+        "decode_tokens_per_s": 20.362835403907958,
+        "tpot_ms": 49.109074456697904
+      },
+      "long": {
+        "prompt_tokens": 199,
+        "completion_tokens": 128,
+        "ttft_s": 0.1615133609957411,
+        "e2e_s": 6.5592692399950465,
+        "decode_tokens_per_s": 19.850247165806568,
+        "tpot_ms": 50.37720647239948
+      }
+    },
+    "speedup": {
+      "short": 0.9950918548704409,
+      "long": 0.9996675769774013
+    },
+    "concurrent": {
+      "baseline": 36.59429987817881,
+      "optimized": 36.483512266156836
+    }
+  },
+  "tp2": {
+    "baseline": {
+      "short": {
+        "prompt_tokens": 5,
+        "completion_tokens": 128,
+        "ttft_s": 0.07611179500236176,
+        "e2e_s": 3.9244024549989263,
+        "decode_tokens_per_s": 32.99874550673011,
+        "tpot_ms": 30.304182314932234
+      },
+      "long": {
+        "prompt_tokens": 199,
+        "completion_tokens": 128,
+        "ttft_s": 0.1059881549954298,
+        "e2e_s": 4.062835158998496,
+        "decode_tokens_per_s": 32.09916333566649,
+        "tpot_ms": 31.1534599684991
+      }
+    },
+    "optimized": {
+      "short": {
+        "prompt_tokens": 5,
+        "completion_tokens": 128,
+        "ttft_s": 0.07603901899710763,
+        "e2e_s": 3.8555011469943565,
+        "decode_tokens_per_s": 33.6239707645073,
+        "tpot_ms": 29.740687291328996
+      },
+      "long": {
+        "prompt_tokens": 199,
+        "completion_tokens": 128,
+        "ttft_s": 0.10595084100350505,
+        "e2e_s": 3.991265728000144,
+        "decode_tokens_per_s": 32.687775438220775,
+        "tpot_ms": 30.592476440924514
+      }
+    },
+    "speedup": {
+      "short": 1.0189469401995803,
+      "long": 1.018337303573899
+    },
+    "concurrent": {
+      "baseline": 56.253029260042005,
+      "optimized": 57.191216708056004
+    }
+  },
+  "scaling": {
+    "baseline": {
+      "short": 1.6125840151115587,
+      "long": 1.6165286289251963
+    },
+    "optimized": {
+      "short": 1.6512420838040223,
+      "long": 1.6467188123746763
+    }
+  }
+}

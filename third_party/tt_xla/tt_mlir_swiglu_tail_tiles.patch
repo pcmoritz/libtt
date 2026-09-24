@@ -1,0 +1,11 @@
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -235,7 +235,7 @@
+         outputShape[0] != inputShape[0] ||
+         inputShape[1] != 2 * outputShape[1] ||
+         outputShape[1] < 96 * 32 || outputShape[1] > 96 * 4 * 32 ||
+-        outputShape[1] % (96 * 32) != 0) {
++        outputShape[1] % 32 != 0) {
+       return failure();
+     }
+ 

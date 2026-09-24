@@ -1,0 +1,118 @@
+{
+  "0": {
+    "complete_decode_iterations": 16,
+    "window_ms": 500,
+    "median_lm_head_to_lm_head_ms": 28.635687407407406,
+    "median_program_covered_ms": 25.811949999999996,
+    "program_category_ms_per_token": {
+      "matmul": 20.259917777777776,
+      "experimental/ccl/all_reduce_async": 1.0951418518518516,
+      "normalization/layernorm": 0.9028274074074074,
+      "experimental/transformer/nlp_create_qkv_heads_decode": 0.7983881481481483,
+      "eltwise/binary_ng": 0.4320955555555557,
+      "experimental/paged_cache": 0.4291759259259259,
+      "experimental/transformer/rotary_embedding": 0.37204592592592595,
+      "transformer/sdpa_decode": 0.3006037037037037,
+      "data_movement/sharded": 0.289874074074074,
+      "data_movement/reshape_view": 0.21830370370370372,
+      "data_movement/tilize": 0.19340148148148148,
+      "ccl/all_gather": 0.09292222222222221,
+      "copy/typecast": 0.09255925925925926,
+      "eltwise/unary": 0.08491222222222222,
+      "data_movement/untilize": 0.07763148148148147,
+      "data_movement/copy": 0.05284666666666667,
+      "reduction/generic": 0.04334518518518518,
+      "reduction/argmax": 0.0317911111111111,
+      "data_movement/fill_pad": 0.03157555555555555,
+      "data_movement/slice": 0.005907407407407406,
+      "eltwise/ternary": 0.002357037037037037,
+      "embedding": 0.0018755555555555554
+    },
+    "max_reported_dropped": 0,
+    "projections": {
+      "qkv": {
+        "median_kernel_us": 53.50595,
+        "median_total_ms_per_token": 2.1338485,
+        "sample_count": 640
+      },
+      "attention_output": {
+        "median_kernel_us": 39.7685,
+        "median_total_ms_per_token": 1.5924697499999998,
+        "sample_count": 640
+      },
+      "up_gate": {
+        "median_kernel_us": 253.3175,
+        "median_total_ms_per_token": 10.1327925,
+        "sample_count": 640
+      },
+      "down": {
+        "median_kernel_us": 126.34299999999999,
+        "median_total_ms_per_token": 5.053293999999999,
+        "sample_count": 640
+      },
+      "lm_head": {
+        "median_kernel_us": 1344.48,
+        "median_total_ms_per_token": 1.34448,
+        "sample_count": 16
+      }
+    }
+  },
+  "1": {
+    "complete_decode_iterations": 16,
+    "window_ms": 500,
+    "median_lm_head_to_lm_head_ms": 28.658367407407404,
+    "median_program_covered_ms": 25.79051888888889,
+    "program_category_ms_per_token": {
+      "matmul": 19.838940370370366,
+      "experimental/ccl/all_reduce_async": 1.509668888888889,
+      "normalization/layernorm": 0.9020585185185188,
+      "experimental/transformer/nlp_create_qkv_heads_decode": 0.798261111111111,
+      "eltwise/binary_ng": 0.4333325925925925,
+      "experimental/paged_cache": 0.4284751851851851,
+      "experimental/transformer/rotary_embedding": 0.3732337037037038,
+      "transformer/sdpa_decode": 0.3006729629629629,
+      "data_movement/sharded": 0.28348962962962954,
+      "data_movement/reshape_view": 0.21566962962962966,
+      "data_movement/tilize": 0.19308740740740743,
+      "copy/typecast": 0.0919611111111111,
+      "ccl/all_gather": 0.08658037037037036,
+      "eltwise/unary": 0.08448407407407407,
+      "data_movement/untilize": 0.07788888888888888,
+      "data_movement/copy": 0.05321555555555555,
+      "reduction/generic": 0.04322444444444444,
+      "reduction/argmax": 0.031594074074074066,
+      "data_movement/fill_pad": 0.031575925925925924,
+      "data_movement/slice": 0.0058770370370370365,
+      "eltwise/ternary": 0.002346666666666666,
+      "embedding": 0.0018696296296296295
+    },
+    "max_reported_dropped": 0,
+    "projections": {
+      "qkv": {
+        "median_kernel_us": 52.0863,
+        "median_total_ms_per_token": 2.0850081499999997,
+        "sample_count": 640
+      },
+      "attention_output": {
+        "median_kernel_us": 38.3048,
+        "median_total_ms_per_token": 1.5360670499999998,
+        "sample_count": 640
+      },
+      "up_gate": {
+        "median_kernel_us": 250.6165,
+        "median_total_ms_per_token": 10.014150499999998,
+        "sample_count": 640
+      },
+      "down": {
+        "median_kernel_us": 121.69149999999999,
+        "median_total_ms_per_token": 4.8704480000000006,
+        "sample_count": 640
+      },
+      "lm_head": {
+        "median_kernel_us": 1329.245,
+        "median_total_ms_per_token": 1.329245,
+        "sample_count": 16
+      }
+    }
+  }
+}
