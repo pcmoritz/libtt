@@ -1,0 +1,960 @@
+[2026-09-23 23:51:45] server_args=ServerArgs(model_path='Qwen/Qwen3-8B', tokenizer_path='Qwen/Qwen3-8B', tokenizer_mode='auto', tokenizer_backend='huggingface', skip_tokenizer_init=False, load_format='auto', model_loader_extra_config='{}', trust_remote_code=False, context_length=None, is_embedding=False, revision=None, model_impl='auto', model_layer_nums=None, host='127.0.0.1', port=31000, skip_server_warmup=True, warmups=None, dtype='bfloat16', quantization=None, quantization_param_path=None, quantization_config_path=None, kv_cache_dtype='auto', dtype_config=None, mem_fraction_static=0.88, max_running_requests=2, max_total_tokens=1024, max_prefill_tokens=256, chunked_prefill_size=256, enable_mixed_chunk=False, schedule_policy='fcfs', schedule_conservativeness=1.0, page_size=32, swa_full_tokens_ratio=0.8, recurrent_state_memory_ratio=0.9, max_recurrent_state_size=None, recurrent_track_interval=None, disable_hybrid_swa_memory=False, device='tt', device_indexes=None, pd_disaggregation='', pd_prefill_mem_fraction=0.85, pd_decode_mem_fraction=0.85, pd_prefill_max_tokens=20480, pd_decode_max_tokens=25600, pd_num_prefill=1, pd_num_decode=1, pd_prefill_tp_size=0, pd_prefill_ep_size=0, tp_size=2, ep_size=1, ep_num_redundant_experts=0, ep_dispatch_algorithm=None, enable_sequence_parallel=False, stream_interval=1, stream_output=False, random_seed=42, constrained_json_whitespace_pattern=None, constrained_json_disable_any_whitespace=False, watchdog_timeout=1200.0, dist_timeout=None, download_dir=None, sleep_on_idle=False, dp_size=1, moe_dp_size=1, dp_schedule_policy='min_running_queue', log_level='info', log_level_http=None, log_requests=False, log_requests_level=0, crash_dump_folder=None, show_time_cost=False, enable_metrics=False, bucket_time_to_first_token=None, bucket_inter_token_latency=None, bucket_e2e_request_latency=None, decode_log_interval=40, enable_request_time_stats_logging=False, kv_events_config=None, api_key=None, served_model_name='Qwen/Qwen3-8B', file_storage_path='sglang_storage', enable_cache_report=False, reasoning_parser=None, tool_call_parser=None, dist_init_addr=None, nnodes=1, node_rank=0, json_model_override_args='{}', preferred_sampling_params=None, disable_radix_cache=True, enable_unified_radix_tree=False, hicache_storage='disable', hicache_ratio=2.0, hicache_write_through_threshold=1, hicache_write_policy='write_through', enable_recurrent_extra_buffer=False, allow_auto_truncate=False, enable_tokenizer_batch_encode=False, disable_overlap_schedule=True, enable_precision_tracer=False, attention_backend='tt', gdn_prefill_impl='fused_chunk_parallel', dsa_use_pallas=True, moe_backend='epmoe', disable_jax_allreduce_metadata=False, enable_topk_kernel=True, grammar_backend='llguidance', max_seq_len=4096, precompile_token_paddings=None, precompile_bs_paddings=None, precompile_vision_patch_paddings=None, vision_encoder_parallel='dp', disable_precompile=True, speculative_algorithm=None, speculative_draft_model_path=None, speculative_draft_model_revision=None, speculative_num_steps=4, speculative_eagle_topk=5, speculative_num_draft_tokens=4, speculative_sample_from_anchor=False, speculative_accept_threshold_single=1.0, speculative_accept_threshold_acc=1.0, enable_deterministic_sampling=False, enable_single_process=False, enable_nan_detection=False, enable_lora=False, max_lora_rank=None, lora_target_modules=None, lora_paths=None, max_loaded_loras=None, max_loras_per_batch=8, lora_eviction_policy='lru', enable_static_lora=False, lora_scaling=None, enable_engine_loop_run_forever_daemon=False, multimodal=False, limit_mm_data_per_request=None, mm_processor_worker_num=0, enable_return_routed_experts=False, enable_expert_balance_debug=False, expert_balance_segment_counter=100, expert_balance_output_file=None, init_expert_location='trivial', enable_expert_distribution_recorder=False, expert_distribution_recorder_buffer_size=100, expert_distribution_recorder_output_file=None, disaggregation_mode='null', disaggregation_bootstrap_url=None, disaggregation_bootstrap_port=8998, disaggregation_transfer_port=30001, disaggregation_enable_d2h=False, disaggregation_use_raiden=False, disaggregation_enable_chunk_prefill_transfer=False, disaggregation_side_channel_port=9600, disaggregation_d2h_pool_size=64, disaggregation_d2h_max_tokens=None, disaggregation_channel_number=4, disaggregation_host_ip=None, disaggregation_bootstrap_timeout_seconds=5.0, disaggregation_pull_timeout_seconds=30.0, disaggregation_ack_timeout_seconds=60.0, disaggregation_orphan_reaper_interval_seconds=5.0, disaggregation_shared_secret=None, disaggregation_decode_watchdog_seconds=0.0, disaggregation_num_reserved_decode_tokens=512, disaggregation_max_inflight_transfers=8)
+[2026-09-23 23:51:45] No quantization config found in HF config or user config
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 2139.22it/s]
+[2026-09-23 23:51:46] XLA persistent compilation cache: enabled, dir=/tmp/libtt-profile/optimization-jax-cache-final-tp2, min_compile_time=0s
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 5732.53it/s]
+[2026-09-23 23:51:46] No quantization config found in HF config or user config
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 6553.60it/s]
+[2026-09-23 23:51:48] Initialized GuidanceBackend with whitespace_pattern=None
+[2026-09-23 23:51:48] Platform 'tt' is experimental and not all JAX functionality may be correctly supported!
+2026-09-23 23:51:48.662 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:51:48.662 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:51:48.662 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:95)
+2026-09-23 23:51:48.662 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:114)
+2026-09-23 23:51:48.669 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:574)
+2026-09-23 23:51:48.669 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:118)
+2026-09-23 23:51:48.669 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:51:48.669 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:51:48.709 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1}/[0, 3] and remote chip ids {} (cluster.cpp:162)
+2026-09-23 23:51:48.709 | info     |             UMD | IOMMU: enabled (cluster.cpp:142)
+2026-09-23 23:51:48.709 | info     |             UMD | KMD version: 2.10.0 (cluster.cpp:145)
+2026-09-23 23:51:48.709 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:51:48.710 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:51:48.901 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:51:48.950 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:51:48.950 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:51:48.950 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:51:48.950 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:51:48.950 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:51:48.950 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:51:48.950 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:51:48.950 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:51:51.706 | info     |           Metal | [Real-time profiler] Device 0 sync complete: 100 samples, frequency=1.350110 GHz, device_time_at_sync=2780996520117 cycles (realtime_profiler_manager.cpp:1390)
+2026-09-23 23:51:51.707 | info     |           Metal | [Real-time profiler] Device 1 sync complete: 100 samples, frequency=1.350111 GHz, device_time_at_sync=2102902670256 cycles (realtime_profiler_manager.cpp:1390)
+2026-09-23 23:51:51.717 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-9 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 23:51:51.717 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-8 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 23:51:51.718 | critical |          Always | TT_FATAL: Chip 1 logical eth core 0-3 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 23:51:51.718 | critical |          Always | TT_FATAL: Chip 1 logical eth core 0-2 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 23:51:51.833 | info     |           Metal | Fabric config changed from FabricConfig::DISABLED to FabricConfig::FABRIC_1D, reinitializing control plane (metal_env.cpp:333)
+2026-09-23 23:51:51.833 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:51:51.833 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:51:51.833 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:51:51.833 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:51:51.833 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:51:51.833 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:51:51.833 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:51:51.833 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:51:51.860 | info     |           Metal | Initializing Fabric (fabric_firmware_initializer.cpp:296)
+2026-09-23 23:51:52.781 | info     |           Metal | Fabric initialized on Device 0 (device.cpp:550)
+2026-09-23 23:51:52.801 | info     |           Metal | Fabric initialized on Device 1 (device.cpp:550)
+2026-09-23 23:51:52.801 | info     |           Metal | Fabric initialized on 2 devices (fabric_firmware_initializer.cpp:444)
+2026-09-23 23:51:52.801 | info     |           Metal | Fabric Initialized with config FabricConfig::FABRIC_1D (fabric_firmware_initializer.cpp:313)
+2026-09-23 23:51:54.383 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:1081)
+[2026-09-23 23:51:54] No quantization config found in HF config or user config
+2026-09-23 23:51:54.544 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:51:54.592 | info     |           Metal | Enabling program cache on MeshDevice 2 (mesh_device.cpp:1081)
+[2026-09-23 23:51:56] Precision tracer globally disabled
+[2026-09-23 23:51:57] KV heads distribution for GQA model: original_kv_heads=8, tp_size=2, each device gets 4 head(s), no replication needed, padding_strategy=replicate
+Fetching 15 files:   0%|          | 0/15 [00:00<?, ?it/s]Fetching 15 files: 100%|██████████| 15/15 [00:00<00:00, 9959.56it/s]
+[2026-09-23 23:51:58] model_path on ext4 mount, skipping GCSFuse warm-up
+[2026-09-23 23:51:58] QWen3ForCausalLMModel config dtype: <class 'jax.numpy.bfloat16'>
+[2026-09-23 23:51:58] No quantization config found. Skipping quantization.
+[2026-09-23 23:51:58] Scanning metadata for 5 model files (single host only)...
+Scanning Metadata:   0%|          | 0/5 [00:00<?, ?file/s]Scanning Metadata: 100%|██████████| 5/5 [00:00<00:00, 13131.82file/s]
+[2026-09-23 23:51:58] Starting parallel weight loading via JAX Lazy Loader...
+Loading Regular Weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading Regular Weights:   0%|          | 1/399 [00:00<01:54,  3.47it/s]Loading Regular Weights:   1%|          | 3/399 [00:00<01:11,  5.56it/s]2026-09-23 23:51:58.887 | info     |           Metal | Fabric config changed from FabricConfig::FABRIC_1D to FabricConfig::FABRIC_1D, reinitializing control plane (metal_env.cpp:333)
+2026-09-23 23:51:58.887 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:51:58.887 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:51:58.888 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:51:58.888 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:51:58.888 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:51:58.888 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:51:58.888 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:51:58.888 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:51:58.915 | info     |           Metal | Initializing Fabric (fabric_firmware_initializer.cpp:296)
+2026-09-23 23:51:58.920 | info     |           Metal | Fabric initialized on Device 0 (device.cpp:550)
+2026-09-23 23:51:58.921 | info     |           Metal | Fabric initialized on Device 1 (device.cpp:550)
+2026-09-23 23:51:58.921 | info     |           Metal | Fabric initialized on 2 devices (fabric_firmware_initializer.cpp:444)
+2026-09-23 23:51:58.921 | info     |           Metal | Fabric Initialized with config FabricConfig::FABRIC_1D (fabric_firmware_initializer.cpp:313)
+2026-09-23 23:51:58.971 | info     |           Metal | Enabling program cache on MeshDevice 3 (mesh_device.cpp:1081)
+Loading Regular Weights:   2%|▏         | 6/399 [00:01<01:53,  3.46it/s]Loading Regular Weights:   2%|▏         | 7/399 [00:02<02:22,  2.74it/s]Loading Regular Weights:   2%|▏         | 9/399 [00:02<02:10,  2.99it/s]Loading Regular Weights:   3%|▎         | 12/399 [00:03<01:29,  4.33it/s]Loading Regular Weights:   4%|▎         | 14/399 [00:03<01:24,  4.54it/s]Loading Regular Weights:   6%|▌         | 24/399 [00:03<00:29, 12.76it/s]Loading Regular Weights:   9%|▊         | 34/399 [00:03<00:16, 21.88it/s]Loading Regular Weights:  10%|█         | 41/399 [00:03<00:12, 27.78it/s]Loading Regular Weights:  12%|█▏        | 47/399 [00:04<00:10, 32.07it/s]Loading Regular Weights:  14%|█▍        | 57/399 [00:04<00:08, 42.54it/s]Loading Regular Weights:  17%|█▋        | 67/399 [00:04<00:06, 51.29it/s]Loading Regular Weights:  19%|█▊        | 74/399 [00:04<00:06, 53.68it/s]Loading Regular Weights:  20%|██        | 81/399 [00:04<00:05, 55.31it/s]Loading Regular Weights:  23%|██▎       | 90/399 [00:04<00:05, 60.63it/s]Loading Regular Weights:  25%|██▌       | 100/399 [00:04<00:04, 66.24it/s]Loading Regular Weights:  27%|██▋       | 108/399 [00:04<00:04, 66.03it/s]Loading Regular Weights:  29%|██▉       | 115/399 [00:04<00:04, 65.31it/s]Loading Regular Weights:  31%|███       | 123/399 [00:05<00:04, 65.79it/s]Loading Regular Weights:  33%|███▎      | 133/399 [00:05<00:03, 70.34it/s]Loading Regular Weights:  35%|███▌      | 141/399 [00:05<00:03, 68.56it/s]Loading Regular Weights:  37%|███▋      | 148/399 [00:05<00:03, 67.91it/s]Loading Regular Weights:  39%|███▉      | 156/399 [00:05<00:03, 67.67it/s]Loading Regular Weights:  42%|████▏     | 166/399 [00:05<00:03, 71.99it/s]Loading Regular Weights:  44%|████▎     | 174/399 [00:05<00:03, 69.58it/s]Loading Regular Weights:  45%|████▌     | 181/399 [00:05<00:03, 68.18it/s]Loading Regular Weights:  47%|████▋     | 189/399 [00:06<00:03, 67.86it/s]Loading Regular Weights:  50%|████▉     | 199/399 [00:06<00:02, 72.00it/s]Loading Regular Weights:  52%|█████▏    | 207/399 [00:06<00:02, 70.20it/s]Loading Regular Weights:  54%|█████▍    | 215/399 [00:06<00:02, 70.19it/s]Loading Regular Weights:  56%|█████▌    | 223/399 [00:06<00:02, 63.79it/s]Loading Regular Weights:  58%|█████▊    | 233/399 [00:06<00:02, 69.44it/s]Loading Regular Weights:  61%|██████    | 243/399 [00:06<00:02, 72.62it/s]Loading Regular Weights:  63%|██████▎   | 251/399 [00:06<00:02, 70.28it/s]Loading Regular Weights:  65%|██████▍   | 259/399 [00:07<00:01, 70.43it/s]Loading Regular Weights:  67%|██████▋   | 267/399 [00:07<00:02, 64.85it/s]Loading Regular Weights:  69%|██████▉   | 277/399 [00:07<00:01, 69.70it/s]Loading Regular Weights:  72%|███████▏  | 287/399 [00:07<00:01, 73.28it/s]Loading Regular Weights:  74%|███████▍  | 295/399 [00:07<00:01, 70.95it/s]Loading Regular Weights:  76%|███████▌  | 303/399 [00:07<00:01, 70.64it/s]Loading Regular Weights:  78%|███████▊  | 311/399 [00:07<00:01, 65.03it/s]Loading Regular Weights:  80%|████████  | 321/399 [00:07<00:01, 70.04it/s]Loading Regular Weights:  83%|████████▎ | 331/399 [00:08<00:00, 73.12it/s]Loading Regular Weights:  85%|████████▍ | 339/399 [00:08<00:00, 70.85it/s]Loading Regular Weights:  87%|████████▋ | 347/399 [00:08<00:00, 70.95it/s]Loading Regular Weights:  89%|████████▉ | 355/399 [00:08<00:00, 64.54it/s]Loading Regular Weights:  91%|█████████▏| 365/399 [00:08<00:00, 69.57it/s]Loading Regular Weights:  94%|█████████▍| 375/399 [00:08<00:00, 73.09it/s]Loading Regular Weights:  96%|█████████▌| 383/399 [00:08<00:00, 70.33it/s]Loading Regular Weights:  98%|█████████▊| 391/399 [00:08<00:00, 70.12it/s]Loading Regular Weights: 100%|██████████| 399/399 [00:09<00:00, 64.19it/s]Loading Regular Weights: 100%|██████████| 399/399 [00:09<00:00, 43.84it/s]
+Loading MoE Weights: 0it [00:00, ?it/s]Loading MoE Weights: 0it [00:00, ?it/s]
+[2026-09-23 23:52:07] All weights loaded successfully.
+[2026-09-23 23:52:07] Qwen3 weights loaded successfully!
+2026-09-23 23:52:13.405 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:52:13.453 | info     |           Metal | Enabling program cache on MeshDevice 4 (mesh_device.cpp:1081)
+[2026-09-23 23:52:13] ModelRunner kv_cache_dtype: <class 'jax.numpy.bfloat16'>
+[2026-09-23 23:52:13] TPU Memory profiling: available_kv_cache=28.0GB, max_tokens=408507, cell_size=73728 bytes
+[2026-09-23 23:52:13] ModelRunner per dp max_total_num_tokens after dp_size 1: 1024
+[2026-09-23 23:52:13] ModelRunner final max_total_num_tokens: 1024
+[2026-09-23 23:52:13] Created TT KV buffers in 0.19 seconds
+[2026-09-23 23:52:13] JAX Fused KV Cache allocated. #tokens: 1024, Fused KV size: 0.15 GB
+[2026-09-23 23:52:13] Max running requests constraints:
+[2026-09-23 23:52:13]   - Server limit: 2 (configured)
+[2026-09-23 23:52:13]   - Token pool size: 2
+[2026-09-23 23:52:13]   - Attention backend: 102 (context_len=40960, page_size=32)
+[2026-09-23 23:52:13]   → Final max_running_requests: 2
+[2026-09-23 23:52:13] Tree cache initialized: impl=ChunkCache hybrid_swa=False hybrid_recurrent=False
+[2026-09-23 23:52:13] INFO:     Started server process [154781]
+[2026-09-23 23:52:13] INFO:     Waiting for application startup.
+[2026-09-23 23:52:13] The server is fired up and ready to roll!
+[2026-09-23 23:52:13] INFO:     Application startup complete.
+[2026-09-23 23:52:13] INFO:     Uvicorn running on http://127.0.0.1:31000 (Press CTRL+C to quit)
+[2026-09-23 23:52:14] INFO:     127.0.0.1:50678 - "GET /health HTTP/1.1" 200 OK
+[2026-09-23 23:52:14] INFO:     127.0.0.1:50684 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:52:14] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+2026-09-23 23:52:15.425 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:95)
+2026-09-23 23:52:15.425 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:114)
+2026-09-23 23:52:15.428 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:574)
+2026-09-23 23:52:15.428 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:118)
+2026-09-23 23:52:15.428 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.428 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.429 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:52:15.430 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.430 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.430 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:52:15.430 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.430 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.430 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:52:15.430 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.430 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.430 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:52:15.431 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:52:15.432 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:52:15.432 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:52:15.432 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.432 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.432 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.432 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.432 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:52:15.432 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:52:15.432 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:52:15.432 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:52:15.436 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:52:15.436 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:52:15.436 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:52:15.436 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:52:15.436 | info     |           Metal | Disabling and clearing program cache on MeshDevice 5 (mesh_device.cpp:1091)
+2026-09-23 23:52:15.437 | info     |           Metal | Disabling and clearing program cache on MeshDevice 5 (mesh_device.cpp:1091)
+2026-09-23 23:52:15.437 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:52:15.437 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:52:15.438 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:52:15.438 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:52:15.438 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:52:15.438 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:52:15.442 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:52:15.442 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.442 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.442 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:52:15.443 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.443 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.443 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:52:15.443 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.443 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.443 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:52:15.444 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:52:15.444 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:52:15.444 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:52:15.445 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.445 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.445 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.445 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.445 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:52:15.445 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:52:15.445 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:52:15.445 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:52:15.448 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:52:15.448 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:52:15.448 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:52:15.448 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:52:15.448 | info     |           Metal | Disabling and clearing program cache on MeshDevice 6 (mesh_device.cpp:1091)
+2026-09-23 23:52:15.450 | info     |           Metal | Disabling and clearing program cache on MeshDevice 6 (mesh_device.cpp:1091)
+2026-09-23 23:52:15.450 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:52:15.450 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:52:15.450 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:52:15.450 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:52:15.450 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:52:15.450 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:52:15.451 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:52:15.451 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.451 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.451 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:52:15.451 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.451 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.451 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:52:15.451 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.451 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.451 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:52:15.452 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:52:15.453 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:52:15.453 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:52:15.453 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.453 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.454 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.454 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.454 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:52:15.454 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:52:15.454 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:52:15.454 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:52:15.456 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:52:15.456 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:52:15.457 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:52:15.457 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:52:15.457 | info     |           Metal | Disabling and clearing program cache on MeshDevice 7 (mesh_device.cpp:1091)
+2026-09-23 23:52:15.460 | info     |           Metal | Disabling and clearing program cache on MeshDevice 7 (mesh_device.cpp:1091)
+2026-09-23 23:52:15.460 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:52:15.460 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:52:15.460 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:52:15.460 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:52:15.460 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:52:15.460 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:52:15.479 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:52:15.480 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.480 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.480 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:52:15.480 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.480 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.480 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:52:15.480 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.480 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.480 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:52:15.481 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:52:15.482 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:52:15.482 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:52:15.482 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.482 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.482 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.482 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:15.482 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:52:15.482 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:52:15.482 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:52:15.482 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:52:15.485 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:52:15.485 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:52:15.485 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:52:15.485 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:52:15.485 | info     |           Metal | Disabling and clearing program cache on MeshDevice 8 (mesh_device.cpp:1091)
+2026-09-23 23:52:17.836 | info     |           Metal | Disabling and clearing program cache on MeshDevice 8 (mesh_device.cpp:1091)
+2026-09-23 23:52:17.836 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:52:17.836 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:52:17.836 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:52:17.836 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:52:17.836 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:52:17.836 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:52:18.006 | info     |           Metal | Fabric config changed from FabricConfig::FABRIC_1D to FabricConfig::FABRIC_1D, reinitializing control plane (metal_env.cpp:333)
+2026-09-23 23:52:18.006 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:52:18.006 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:52:18.006 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:52:18.006 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:52:18.006 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:52:18.006 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:52:18.006 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:52:18.006 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:52:18.033 | info     |           Metal | Initializing Fabric (fabric_firmware_initializer.cpp:296)
+2026-09-23 23:52:18.039 | info     |           Metal | Fabric initialized on Device 0 (device.cpp:550)
+2026-09-23 23:52:18.039 | info     |           Metal | Fabric initialized on Device 1 (device.cpp:550)
+2026-09-23 23:52:18.039 | info     |           Metal | Fabric initialized on 2 devices (fabric_firmware_initializer.cpp:444)
+2026-09-23 23:52:18.039 | info     |           Metal | Fabric Initialized with config FabricConfig::FABRIC_1D (fabric_firmware_initializer.cpp:313)
+2026-09-23 23:52:18.095 | info     |           Metal | Enabling program cache on MeshDevice 9 (mesh_device.cpp:1081)
+2026-09-23 23:52:26.893 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+2026-09-23 23:52:26.902 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+2026-09-23 23:52:26.903 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+2026-09-23 23:52:45.122 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+2026-09-23 23:52:45.122 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+2026-09-23 23:52:49.411 | warning  |           Metal | Allocating device buffers is unsafe due to the existence of an active trace. These buffers may be corrupted once a trace is executed. (allocator.cpp:120)
+2026-09-23 23:52:51.400 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+2026-09-23 23:52:51.400 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+2026-09-23 23:52:51.401 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+2026-09-23 23:52:58.168 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+[2026-09-23 23:52:58] Prefill batch. #bid: 2, #cache_miss: 2
+2026-09-23 23:52:59.135 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:52:59.136 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.136 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.136 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:52:59.136 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.136 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.136 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:52:59.136 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.136 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.136 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:52:59.137 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:52:59.138 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:52:59.138 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:52:59.138 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.138 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.138 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.138 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.138 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:52:59.138 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:52:59.138 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:52:59.138 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:52:59.142 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:52:59.142 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:52:59.142 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:52:59.142 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:52:59.142 | info     |           Metal | Disabling and clearing program cache on MeshDevice 10 (mesh_device.cpp:1091)
+2026-09-23 23:52:59.178 | info     |           Metal | Disabling and clearing program cache on MeshDevice 10 (mesh_device.cpp:1091)
+2026-09-23 23:52:59.178 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:52:59.178 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:52:59.178 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:52:59.178 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:52:59.178 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:52:59.178 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:52:59.181 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:52:59.182 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.182 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.182 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:52:59.182 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.182 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.182 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:52:59.182 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.182 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.182 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:52:59.183 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:52:59.184 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:52:59.184 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:52:59.184 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.184 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.184 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.184 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.184 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:52:59.184 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:52:59.184 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:52:59.184 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:52:59.187 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:52:59.187 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:52:59.187 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:52:59.187 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:52:59.187 | info     |           Metal | Disabling and clearing program cache on MeshDevice 11 (mesh_device.cpp:1091)
+2026-09-23 23:52:59.190 | info     |           Metal | Disabling and clearing program cache on MeshDevice 11 (mesh_device.cpp:1091)
+2026-09-23 23:52:59.190 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:52:59.190 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:52:59.190 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:52:59.190 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:52:59.191 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:52:59.191 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:52:59.191 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:52:59.191 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.191 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.191 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:52:59.191 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.191 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.191 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:52:59.192 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.192 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.192 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:52:59.193 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:52:59.193 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:52:59.193 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:52:59.193 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.193 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.194 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.194 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.194 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:52:59.194 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:52:59.194 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:52:59.194 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:52:59.196 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:52:59.196 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:52:59.197 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:52:59.197 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:52:59.197 | info     |           Metal | Disabling and clearing program cache on MeshDevice 12 (mesh_device.cpp:1091)
+2026-09-23 23:52:59.197 | info     |           Metal | Disabling and clearing program cache on MeshDevice 12 (mesh_device.cpp:1091)
+2026-09-23 23:52:59.197 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:52:59.198 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:52:59.198 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:52:59.198 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:52:59.198 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:52:59.198 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:52:59.209 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:52:59.209 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.209 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.209 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:52:59.209 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.209 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.209 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:52:59.209 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.209 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.209 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:52:59.210 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:52:59.211 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:52:59.211 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:52:59.211 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.211 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.212 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.212 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:52:59.212 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:52:59.212 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:52:59.212 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:52:59.212 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:52:59.214 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:52:59.214 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:52:59.214 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:52:59.214 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:52:59.214 | info     |           Metal | Disabling and clearing program cache on MeshDevice 13 (mesh_device.cpp:1091)
+2026-09-23 23:53:02.552 | info     |           Metal | Disabling and clearing program cache on MeshDevice 13 (mesh_device.cpp:1091)
+2026-09-23 23:53:02.552 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:53:02.552 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:53:02.552 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:53:02.552 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:53:02.552 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:53:02.552 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:53:08.234 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+2026-09-23 23:53:08.234 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+Building ncrisc, compile step:
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/runtime/sfpi/compiler/bin/riscv-tt-elf-g++ -O2 -std=c++17 -ftt-nttp -ftt-constinit -ftt-consteval -ftt-no-dyninit -flto=auto -ffast-math -fno-exceptions -fno-rtti -fno-use-cxa-atexit -g -MMD -Wall -Werror -Wno-error=deprecated-declarations -Wno-error=multistatement-macros -Wno-error=parentheses -Wno-error=unused-but-set-variable -Wno-unused-variable -Wno-unused-function -mcpu=tt-bh -fno-tree-loop-distribute-patterns -I. -I.. -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn/cpp -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/tt-llk/common -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hostdevcommon/api -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/api/ -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/ckernels/blackhole/metal/common -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/ckernels/blackhole/metal/llk_io -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/tt-1xx -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/tt-1xx/blackhole -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/tt-1xx/blackhole/blackhole_defines -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/tt-1xx/blackhole/noc -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/tt-llk/tt_llk_blackhole/common/inc -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/tt-llk/tt_llk_blackhole/llk_lib -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/firmware/src/tt-1xx -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow -DIS_NOT_POW2_NUM_L1_BANKS=1 -DLOG_BASE_2_OF_NUM_DRAM_BANKS=3 -DNUM_DRAM_BANKS=8 -DNUM_L1_BANKS=110 -DPCIE_NOC_X=19 -DPCIE_NOC_Y=24 -DTENSIX_FIRMWARE -DLOCAL_MEM_EN=0 -DPROCESSOR_INDEX=1 -DCOMPILE_FOR_NCRISC -DPROGRAMMABLE_CORE_TYPE=0 -DARCH_BLACKHOLE -DDISPATCH_MESSAGE_ADDR=4290184248 -DKERNEL_BUILD -DFABRIC_1D_PKT_HDR_EXTENSION_WORDS=0 -DROUTING_MODE=137 -DNOC_INDEX=1 -DNOC_MODE=0 -DFULL_KERNEL_NAME="reader_matmul_swiglu_in0_sender/15161069272695756319/" -DKERNEL_COMPILE_TIME_ARGS=2,2048 -DKERNEL_COMPILE_TIME_ARG_MAP={"sender_sem",0},{"num_dests",7},{"in0_mcast_w",2},{"Kt",128},{"receiver_sem",1},{"cb_in0",0}, -c -o /home/ttuser/.cache/tt-metal-cache/16414317283541638540/kernels/reader_matmul_swiglu_in0_sender/15161069272695756319/ncrisc/ncrisck.14316230390767042156.o /tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/firmware/src/tt-1xx/ncrisck.cc -MF /home/ttuser/.cache/tt-metal-cache/16414317283541638540/kernels/reader_matmul_swiglu_in0_sender/15161069272695756319/ncrisc/ncrisck.14316230390767042156.d
+In file included from ../kernel_includes.hpp:2,
+                 from /tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/firmware/src/tt-1xx/ncrisck.cc:22:
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp: In function 'void kernel_main()':
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp:39:32: warning: 'void noc_async_read_tile(uint32_t, const TensorAccessor<DSpec>&, uint32_t, uint32_t, uint8_t) [with DSpec = tensor_accessor::DistributionSpec<0, 0, tensor_accessor::ArrayStaticWrapper<long unsigned int>, tensor_accessor::ArrayStaticWrapper<long unsigned int>, tensor_accessor::ArrayStaticWrapper<short unsigned int>, true, true, false>; uint32_t = long unsigned int; uint8_t = unsigned char]' is deprecated: Use <typename AddrGen> noc_async_read_page instead. [-Wdeprecated-declarations]
+   39 |             noc_async_read_tile(k0 + k, input, write_ptr + k * get_tile_size(cb_in0_id));
+      |             ~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/firmware_common.h:24,
+                 from /tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/firmware/src/tt-1xx/ncrisck.cc:17:
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/api/dataflow/dataflow_api.h:1111:19: note: declared here
+ 1111 | FORCE_INLINE void noc_async_read_tile(
+      |                   ^~~~~~~~~~~~~~~~~~~
+Building brisc, compile step:
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/runtime/sfpi/compiler/bin/riscv-tt-elf-g++ -O2 -std=c++17 -ftt-nttp -ftt-constinit -ftt-consteval -ftt-no-dyninit -flto=auto -ffast-math -fno-exceptions -fno-rtti -fno-use-cxa-atexit -g -MMD -Wall -Werror -Wno-error=deprecated-declarations -Wno-error=multistatement-macros -Wno-error=parentheses -Wno-error=unused-but-set-variable -Wno-unused-variable -Wno-unused-function -mcpu=tt-bh -fno-tree-loop-distribute-patterns -I. -I.. -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn/cpp -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/tt-llk/common -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hostdevcommon/api -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/api/ -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/ckernels/blackhole/metal/common -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/ckernels/blackhole/metal/llk_io -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/tt-1xx -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/tt-1xx/blackhole -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/tt-1xx/blackhole/blackhole_defines -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/tt-1xx/blackhole/noc -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/tt-llk/tt_llk_blackhole/common/inc -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/tt-llk/tt_llk_blackhole/llk_lib -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/firmware/src/tt-1xx -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow -DIS_NOT_POW2_NUM_L1_BANKS=1 -DLOG_BASE_2_OF_NUM_DRAM_BANKS=3 -DNUM_DRAM_BANKS=8 -DNUM_L1_BANKS=110 -DPCIE_NOC_X=19 -DPCIE_NOC_Y=24 -DTENSIX_FIRMWARE -DLOCAL_MEM_EN=0 -DPROCESSOR_INDEX=0 -DCOMPILE_FOR_BRISC -DPROGRAMMABLE_CORE_TYPE=0 -DARCH_BLACKHOLE -DDISPATCH_MESSAGE_ADDR=4290184248 -DKERNEL_BUILD -DFABRIC_1D_PKT_HDR_EXTENSION_WORDS=0 -DROUTING_MODE=137 -DNOC_INDEX=0 -DNOC_MODE=0 -DFULL_KERNEL_NAME="reader_matmul_swiglu/13365951476237506898/" -DKERNEL_COMPILE_TIME_ARGS=2,1088,2,2048 -DKERNEL_COMPILE_TIME_ARG_MAP={"in0_block_w",2},{"per_core_N",2},{"half_Nt",192},{"Kt",128},{"cb_out",16},{"cb_weights",1}, -c -o /home/ttuser/.cache/tt-metal-cache/16414317283541638540/kernels/reader_matmul_swiglu/13365951476237506898/brisc/brisck.14316230390767042156.o /tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/firmware/src/tt-1xx/brisck.cc -MF /home/ttuser/.cache/tt-metal-cache/16414317283541638540/kernels/reader_matmul_swiglu/13365951476237506898/brisc/brisck.14316230390767042156.d
+In file included from ../kernel_includes.hpp:2,
+                 from /tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/firmware/src/tt-1xx/brisck.cc:21:
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp: In function 'void kernel_main()':
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp:41:36: warning: 'void noc_async_read_tile(uint32_t, const TensorAccessor<DSpec>&, uint32_t, uint32_t, uint8_t) [with DSpec = tensor_accessor::DistributionSpec<0, 0, tensor_accessor::ArrayStaticWrapper<long unsigned int>, tensor_accessor::ArrayStaticWrapper<long unsigned int>, tensor_accessor::ArrayStaticWrapper<short unsigned int>, true, true, false>; uint32_t = long unsigned int; uint8_t = unsigned char]' is deprecated: Use <typename AddrGen> noc_async_read_page instead. [-Wdeprecated-declarations]
+   41 |                 noc_async_read_tile(gate_row + n, weight, weights_ptr + gate_local);
+      |                 ~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/firmware_common.h:24,
+                 from /tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/firmware/src/tt-1xx/brisck.cc:17:
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/api/dataflow/dataflow_api.h:1111:19: note: declared here
+ 1111 | FORCE_INLINE void noc_async_read_tile(
+      |                   ^~~~~~~~~~~~~~~~~~~
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp:42:36: warning: 'void noc_async_read_tile(uint32_t, const TensorAccessor<DSpec>&, uint32_t, uint32_t, uint8_t) [with DSpec = tensor_accessor::DistributionSpec<0, 0, tensor_accessor::ArrayStaticWrapper<long unsigned int>, tensor_accessor::ArrayStaticWrapper<long unsigned int>, tensor_accessor::ArrayStaticWrapper<short unsigned int>, true, true, false>; uint32_t = long unsigned int; uint8_t = unsigned char]' is deprecated: Use <typename AddrGen> noc_async_read_page instead. [-Wdeprecated-declarations]
+   42 |                 noc_async_read_tile(up_row + n, weight, weights_ptr + up_local);
+      |                 ~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/api/dataflow/dataflow_api.h:1111:19: note: declared here
+ 1111 | FORCE_INLINE void noc_async_read_tile(
+      |                   ^~~~~~~~~~~~~~~~~~~
+Building ncrisc, compile step:
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/runtime/sfpi/compiler/bin/riscv-tt-elf-g++ -O2 -std=c++17 -ftt-nttp -ftt-constinit -ftt-consteval -ftt-no-dyninit -flto=auto -ffast-math -fno-exceptions -fno-rtti -fno-use-cxa-atexit -g -MMD -Wall -Werror -Wno-error=deprecated-declarations -Wno-error=multistatement-macros -Wno-error=parentheses -Wno-error=unused-but-set-variable -Wno-unused-variable -Wno-unused-function -mcpu=tt-bh -fno-tree-loop-distribute-patterns -I. -I.. -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn/cpp -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/tt-llk/common -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hostdevcommon/api -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/api/ -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/ckernels/blackhole/metal/common -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/ckernels/blackhole/metal/llk_io -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/tt-1xx -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/tt-1xx/blackhole -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/tt-1xx/blackhole/blackhole_defines -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/tt-1xx/blackhole/noc -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/tt-llk/tt_llk_blackhole/common/inc -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/tt-llk/tt_llk_blackhole/llk_lib -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/firmware/src/tt-1xx -I/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow -DIS_NOT_POW2_NUM_L1_BANKS=1 -DLOG_BASE_2_OF_NUM_DRAM_BANKS=3 -DNUM_DRAM_BANKS=8 -DNUM_L1_BANKS=110 -DPCIE_NOC_X=19 -DPCIE_NOC_Y=24 -DTENSIX_FIRMWARE -DLOCAL_MEM_EN=0 -DPROCESSOR_INDEX=1 -DCOMPILE_FOR_NCRISC -DPROGRAMMABLE_CORE_TYPE=0 -DARCH_BLACKHOLE -DDISPATCH_MESSAGE_ADDR=4290184248 -DKERNEL_BUILD -DFABRIC_1D_PKT_HDR_EXTENSION_WORDS=0 -DROUTING_MODE=137 -DNOC_INDEX=1 -DNOC_MODE=0 -DFULL_KERNEL_NAME="reader_matmul_swiglu_in0_sender/40779979100515083/" -DKERNEL_COMPILE_TIME_ARGS=2,2048 -DKERNEL_COMPILE_TIME_ARG_MAP={"sender_sem",0},{"num_dests",87},{"in0_mcast_w",2},{"Kt",128},{"receiver_sem",1},{"cb_in0",0}, -c -o /home/ttuser/.cache/tt-metal-cache/16414317283541638540/kernels/reader_matmul_swiglu_in0_sender/40779979100515083/ncrisc/ncrisck.14316230390767042156.o /tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/firmware/src/tt-1xx/ncrisck.cc -MF /home/ttuser/.cache/tt-metal-cache/16414317283541638540/kernels/reader_matmul_swiglu_in0_sender/40779979100515083/ncrisc/ncrisck.14316230390767042156.d
+In file included from ../kernel_includes.hpp:2,
+                 from /tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/firmware/src/tt-1xx/ncrisck.cc:22:
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp: In function 'void kernel_main()':
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp:39:32: warning: 'void noc_async_read_tile(uint32_t, const TensorAccessor<DSpec>&, uint32_t, uint32_t, uint8_t) [with DSpec = tensor_accessor::DistributionSpec<0, 0, tensor_accessor::ArrayStaticWrapper<long unsigned int>, tensor_accessor::ArrayStaticWrapper<long unsigned int>, tensor_accessor::ArrayStaticWrapper<short unsigned int>, true, true, false>; uint32_t = long unsigned int; uint8_t = unsigned char]' is deprecated: Use <typename AddrGen> noc_async_read_page instead. [-Wdeprecated-declarations]
+   39 |             noc_async_read_tile(k0 + k, input, write_ptr + k * get_tile_size(cb_in0_id));
+      |             ~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/internal/firmware_common.h:24,
+                 from /tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/firmware/src/tt-1xx/ncrisck.cc:17:
+/tmp/libtt-tt-metal-runtime-assets-8700bef4896d148c22567ac15dcce15cffb1b070dfc4dbf9eef169f333aba736/tt_metal/hw/inc/api/dataflow/dataflow_api.h:1111:19: note: declared here
+ 1111 | FORCE_INLINE void noc_async_read_tile(
+      |                   ^~~~~~~~~~~~~~~~~~~
+2026-09-23 23:53:10.389 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+2026-09-23 23:53:10.390 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+2026-09-23 23:53:10.390 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+2026-09-23 23:53:12.915 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+[2026-09-23 23:53:12] Decode batch. #running-req: 1, #token: 32, token usage: 0.03, gen throughput (token/s): 0.02, #queue-req: 0, #cache_miss: 2
+[2026-09-23 23:53:13] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 47.31, #queue-req: 0, 
+[2026-09-23 23:53:14] Decode batch. #running-req: 1, #token: 96, token usage: 0.09, gen throughput (token/s): 51.02, #queue-req: 0, 
+[2026-09-23 23:53:15] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 50.55, #queue-req: 0, 
+[2026-09-23 23:53:15] INFO:     127.0.0.1:34932 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:53:15] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+2026-09-23 23:53:15.715 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+2026-09-23 23:53:15.716 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+[2026-09-23 23:53:16] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 38.20, #queue-req: 0, 
+[2026-09-23 23:53:17] Decode batch. #running-req: 1, #token: 96, token usage: 0.09, gen throughput (token/s): 51.11, #queue-req: 0, 
+[2026-09-23 23:53:17] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 50.74, #queue-req: 0, 
+[2026-09-23 23:53:18] INFO:     127.0.0.1:34944 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:53:18] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:53:18] Decode batch. #running-req: 1, #token: 32, token usage: 0.03, gen throughput (token/s): 47.14, #queue-req: 0, 
+[2026-09-23 23:53:19] Decode batch. #running-req: 1, #token: 96, token usage: 0.09, gen throughput (token/s): 51.34, #queue-req: 0, 
+[2026-09-23 23:53:20] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 50.92, #queue-req: 0, 
+[2026-09-23 23:53:20] INFO:     127.0.0.1:34948 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:53:20] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:53:21] Decode batch. #running-req: 1, #token: 32, token usage: 0.03, gen throughput (token/s): 47.17, #queue-req: 0, 
+[2026-09-23 23:53:21] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 51.23, #queue-req: 0, 
+[2026-09-23 23:53:22] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 50.66, #queue-req: 0, 
+[2026-09-23 23:53:23] INFO:     127.0.0.1:34954 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:53:23] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:53:23] Decode batch. #running-req: 1, #token: 32, token usage: 0.03, gen throughput (token/s): 47.06, #queue-req: 0, 
+[2026-09-23 23:53:24] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 51.08, #queue-req: 0, 
+[2026-09-23 23:53:25] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 51.24, #queue-req: 0, 
+[2026-09-23 23:53:25] INFO:     127.0.0.1:33904 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:53:25] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:53:26] Decode batch. #running-req: 1, #token: 32, token usage: 0.03, gen throughput (token/s): 46.88, #queue-req: 0, 
+[2026-09-23 23:53:26] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 51.25, #queue-req: 0, 
+[2026-09-23 23:53:27] Decode batch. #running-req: 1, #token: 96, token usage: 0.09, gen throughput (token/s): 51.17, #queue-req: 0, 
+[2026-09-23 23:53:28] Decode batch. #running-req: 1, #token: 160, token usage: 0.16, gen throughput (token/s): 50.44, #queue-req: 0, 
+[2026-09-23 23:53:28] INFO:     127.0.0.1:33920 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:53:28] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:53:29] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 47.41, #queue-req: 0, 
+[2026-09-23 23:53:30] Decode batch. #running-req: 1, #token: 96, token usage: 0.09, gen throughput (token/s): 50.99, #queue-req: 0, 
+[2026-09-23 23:53:30] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 50.63, #queue-req: 0, 
+[2026-09-23 23:53:30] INFO:     127.0.0.1:33934 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:53:30] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:53:31] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 47.27, #queue-req: 0, 
+[2026-09-23 23:53:32] Decode batch. #running-req: 1, #token: 96, token usage: 0.09, gen throughput (token/s): 51.08, #queue-req: 0, 
+[2026-09-23 23:53:33] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 50.40, #queue-req: 0, 
+[2026-09-23 23:53:33] INFO:     127.0.0.1:33942 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:53:33] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+2026-09-23 23:53:34.503 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:53:34.503 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.503 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.503 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:53:34.503 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.503 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.503 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:53:34.503 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.503 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.503 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:53:34.504 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:53:34.505 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:53:34.505 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:53:34.505 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.505 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.505 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.506 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.506 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:53:34.506 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:53:34.506 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:53:34.506 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:53:34.509 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:53:34.509 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:53:34.509 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:53:34.509 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:53:34.509 | info     |           Metal | Disabling and clearing program cache on MeshDevice 14 (mesh_device.cpp:1091)
+2026-09-23 23:53:34.510 | info     |           Metal | Disabling and clearing program cache on MeshDevice 14 (mesh_device.cpp:1091)
+2026-09-23 23:53:34.510 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:53:34.510 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:53:34.510 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:53:34.510 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:53:34.510 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:53:34.510 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:53:34.515 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:53:34.515 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.515 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.515 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:53:34.515 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.515 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.515 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:53:34.515 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.515 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.515 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:53:34.516 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:53:34.517 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:53:34.517 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:53:34.517 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.517 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.517 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.517 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.517 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:53:34.517 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:53:34.518 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:53:34.518 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:53:34.520 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:53:34.520 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:53:34.520 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:53:34.520 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:53:34.520 | info     |           Metal | Disabling and clearing program cache on MeshDevice 15 (mesh_device.cpp:1091)
+2026-09-23 23:53:34.522 | info     |           Metal | Disabling and clearing program cache on MeshDevice 15 (mesh_device.cpp:1091)
+2026-09-23 23:53:34.522 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:53:34.522 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:53:34.522 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:53:34.522 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:53:34.522 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:53:34.522 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:53:34.523 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:53:34.523 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.523 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.523 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:53:34.523 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.523 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.523 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:53:34.524 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.524 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.524 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:53:34.524 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:53:34.525 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:53:34.525 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:53:34.525 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.525 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.526 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.526 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.526 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:53:34.526 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:53:34.526 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:53:34.526 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:53:34.528 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:53:34.528 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:53:34.528 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:53:34.528 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:53:34.528 | info     |           Metal | Disabling and clearing program cache on MeshDevice 16 (mesh_device.cpp:1091)
+2026-09-23 23:53:34.531 | info     |           Metal | Disabling and clearing program cache on MeshDevice 16 (mesh_device.cpp:1091)
+2026-09-23 23:53:34.531 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:53:34.531 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:53:34.531 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:53:34.531 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:53:34.531 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:53:34.531 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:53:34.551 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:53:34.551 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.551 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.551 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:53:34.552 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.552 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.552 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:53:34.552 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.552 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.552 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:53:34.553 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:53:34.553 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:53:34.553 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:53:34.554 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.554 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.554 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.554 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:53:34.554 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:53:34.554 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:53:34.554 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:53:34.554 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:53:34.556 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:53:34.556 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:53:34.556 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:53:34.556 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:53:34.556 | info     |           Metal | Disabling and clearing program cache on MeshDevice 17 (mesh_device.cpp:1091)
+2026-09-23 23:53:38.198 | info     |           Metal | Disabling and clearing program cache on MeshDevice 17 (mesh_device.cpp:1091)
+2026-09-23 23:53:38.198 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:53:38.199 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:53:38.199 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:53:38.199 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:53:38.199 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:53:38.199 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:53:43.072 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+2026-09-23 23:53:43.072 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+2026-09-23 23:53:45.473 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+2026-09-23 23:53:45.474 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+[2026-09-23 23:53:45] Prefill batch. #bid: 1034, #cache_miss: 1
+2026-09-23 23:53:45.558 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+2026-09-23 23:53:45.560 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+[2026-09-23 23:53:46] Decode batch. #running-req: 1, #token: 224, token usage: 0.22, gen throughput (token/s): 3.13, #queue-req: 0, 
+[2026-09-23 23:53:46] Decode batch. #running-req: 1, #token: 288, token usage: 0.28, gen throughput (token/s): 49.13, #queue-req: 0, 
+[2026-09-23 23:53:47] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 49.07, #queue-req: 0, 
+[2026-09-23 23:53:48] INFO:     127.0.0.1:33636 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:53:48] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:53:48] Decode batch. #running-req: 1, #token: 224, token usage: 0.22, gen throughput (token/s): 44.42, #queue-req: 0, 
+[2026-09-23 23:53:49] Decode batch. #running-req: 1, #token: 256, token usage: 0.25, gen throughput (token/s): 49.12, #queue-req: 0, 
+[2026-09-23 23:53:50] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 48.88, #queue-req: 0, 
+[2026-09-23 23:53:50] INFO:     127.0.0.1:33642 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:53:50] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:53:51] Decode batch. #running-req: 1, #token: 224, token usage: 0.22, gen throughput (token/s): 44.54, #queue-req: 0, 
+[2026-09-23 23:53:51] Decode batch. #running-req: 1, #token: 256, token usage: 0.25, gen throughput (token/s): 49.35, #queue-req: 0, 
+[2026-09-23 23:53:52] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 49.19, #queue-req: 0, 
+[2026-09-23 23:53:53] INFO:     127.0.0.1:33648 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:53:53] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:53:53] Decode batch. #running-req: 1, #token: 224, token usage: 0.22, gen throughput (token/s): 44.14, #queue-req: 0, 
+[2026-09-23 23:53:54] Decode batch. #running-req: 1, #token: 256, token usage: 0.25, gen throughput (token/s): 49.39, #queue-req: 0, 
+[2026-09-23 23:53:55] Decode batch. #running-req: 1, #token: 288, token usage: 0.28, gen throughput (token/s): 48.98, #queue-req: 0, 
+[2026-09-23 23:53:56] Decode batch. #running-req: 1, #token: 352, token usage: 0.34, gen throughput (token/s): 48.88, #queue-req: 0, 
+[2026-09-23 23:53:56] INFO:     127.0.0.1:51796 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:53:56] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:53:56] Decode batch. #running-req: 1, #token: 256, token usage: 0.25, gen throughput (token/s): 44.64, #queue-req: 0, 
+[2026-09-23 23:53:57] Decode batch. #running-req: 1, #token: 288, token usage: 0.28, gen throughput (token/s): 49.25, #queue-req: 0, 
+[2026-09-23 23:53:58] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 49.00, #queue-req: 0, 
+[2026-09-23 23:53:58] INFO:     127.0.0.1:51802 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:53:58] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:53:59] Decode batch. #running-req: 1, #token: 256, token usage: 0.25, gen throughput (token/s): 44.57, #queue-req: 0, 
+[2026-09-23 23:54:00] Decode batch. #running-req: 1, #token: 288, token usage: 0.28, gen throughput (token/s): 49.04, #queue-req: 0, 
+[2026-09-23 23:54:01] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 48.55, #queue-req: 0, 
+[2026-09-23 23:54:01] INFO:     127.0.0.1:51810 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:54:01] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:54:02] Decode batch. #running-req: 1, #token: 224, token usage: 0.22, gen throughput (token/s): 44.51, #queue-req: 0, 
+[2026-09-23 23:54:02] Decode batch. #running-req: 1, #token: 288, token usage: 0.28, gen throughput (token/s): 49.34, #queue-req: 0, 
+[2026-09-23 23:54:03] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 49.05, #queue-req: 0, 
+[2026-09-23 23:54:04] INFO:     127.0.0.1:51820 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:54:04] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:54:04] Decode batch. #running-req: 1, #token: 224, token usage: 0.22, gen throughput (token/s): 44.09, #queue-req: 0, 
+[2026-09-23 23:54:05] Decode batch. #running-req: 1, #token: 256, token usage: 0.25, gen throughput (token/s): 49.19, #queue-req: 0, 
+[2026-09-23 23:54:06] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 49.14, #queue-req: 0, 
+[2026-09-23 23:54:06] INFO:     127.0.0.1:43298 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:54:06] INFO:     127.0.0.1:43310 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:54:06] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:54:07] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.03, #running-req: 1, #queue-req: 0, 
+2026-09-23 23:54:08.163 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:54:08.163 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.163 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.163 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:54:08.163 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.163 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.163 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:54:08.163 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.163 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.163 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:54:08.164 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:54:08.165 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:54:08.165 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:54:08.165 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.165 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.165 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.165 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.165 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:54:08.166 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:54:08.166 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:54:08.166 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:54:08.169 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:54:08.169 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:54:08.169 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:54:08.169 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:54:08.169 | info     |           Metal | Disabling and clearing program cache on MeshDevice 18 (mesh_device.cpp:1091)
+2026-09-23 23:54:08.170 | info     |           Metal | Disabling and clearing program cache on MeshDevice 18 (mesh_device.cpp:1091)
+2026-09-23 23:54:08.170 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:54:08.170 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:54:08.170 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:54:08.170 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:54:08.170 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:54:08.170 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:54:08.174 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:54:08.174 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.174 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.174 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:54:08.174 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.174 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.174 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:54:08.174 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.174 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.175 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:54:08.175 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:54:08.176 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:54:08.176 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:54:08.176 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.176 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.177 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.177 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.177 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:54:08.177 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:54:08.177 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:54:08.177 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:54:08.179 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:54:08.179 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:54:08.179 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:54:08.179 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:54:08.179 | info     |           Metal | Disabling and clearing program cache on MeshDevice 19 (mesh_device.cpp:1091)
+2026-09-23 23:54:08.181 | info     |           Metal | Disabling and clearing program cache on MeshDevice 19 (mesh_device.cpp:1091)
+2026-09-23 23:54:08.181 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:54:08.181 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:54:08.181 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:54:08.181 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:54:08.181 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:54:08.181 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:54:08.182 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:54:08.182 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.182 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.182 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:54:08.183 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.183 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.183 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:54:08.183 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.183 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.183 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:54:08.184 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:54:08.184 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:54:08.184 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:54:08.185 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.185 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.185 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.185 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.185 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:54:08.185 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:54:08.185 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:54:08.185 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:54:08.187 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:54:08.187 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:54:08.187 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:54:08.187 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:54:08.187 | info     |           Metal | Disabling and clearing program cache on MeshDevice 20 (mesh_device.cpp:1091)
+2026-09-23 23:54:08.189 | info     |           Metal | Disabling and clearing program cache on MeshDevice 20 (mesh_device.cpp:1091)
+2026-09-23 23:54:08.189 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:54:08.189 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:54:08.189 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:54:08.189 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:54:08.189 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:54:08.189 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:54:08.205 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_WYiAo3/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-23 23:54:08.205 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.205 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.205 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:54:08.205 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.205 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.205 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-23 23:54:08.205 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.205 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.205 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:54:08.206 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:54:08.207 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:54:08.207 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:54:08.207 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.207 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.207 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.207 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:54:08.207 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:54:08.207 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:54:08.207 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:54:08.207 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:54:08.209 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 23:54:08.210 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-23 23:54:08.210 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-23 23:54:08.210 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-23 23:54:08.210 | info     |           Metal | Disabling and clearing program cache on MeshDevice 21 (mesh_device.cpp:1091)
+2026-09-23 23:54:11.625 | info     |           Metal | Disabling and clearing program cache on MeshDevice 21 (mesh_device.cpp:1091)
+2026-09-23 23:54:11.625 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-23 23:54:11.626 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:54:11.626 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:54:11.626 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:54:11.626 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:54:11.626 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-23 23:54:12.960 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+2026-09-23 23:54:12.960 | warning  |              Op | Fabric packet size 12288 B is suboptimal for transporting 2048 B pages. Configure 8192 B packet size to maximize throughput. (ccl_common.cpp:64)
+2026-09-23 23:54:13.092 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+2026-09-23 23:54:13.094 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+[2026-09-23 23:54:13] Decode batch. #running-req: 2, #token: 64, token usage: 0.06, gen throughput (token/s): 4.92, #queue-req: 0, #cache_miss: 1
+[2026-09-23 23:54:13] Decode batch. #running-req: 2, #token: 64, token usage: 0.06, gen throughput (token/s): 90.90, #queue-req: 0, 
+[2026-09-23 23:54:14] Decode batch. #running-req: 2, #token: 128, token usage: 0.12, gen throughput (token/s): 91.98, #queue-req: 0, 
+[2026-09-23 23:54:14] Decode batch. #running-req: 2, #token: 192, token usage: 0.19, gen throughput (token/s): 91.98, #queue-req: 0, 
+[2026-09-23 23:54:15] INFO:     127.0.0.1:38470 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:54:15] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:54:15] INFO:     127.0.0.1:38484 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:54:16] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.03, #running-req: 1, #queue-req: 0, 
+[2026-09-23 23:54:16] Decode batch. #running-req: 2, #token: 64, token usage: 0.06, gen throughput (token/s): 66.83, #queue-req: 0, 
+[2026-09-23 23:54:17] Decode batch. #running-req: 2, #token: 128, token usage: 0.12, gen throughput (token/s): 92.28, #queue-req: 0, 
+[2026-09-23 23:54:17] Decode batch. #running-req: 2, #token: 192, token usage: 0.19, gen throughput (token/s): 91.94, #queue-req: 0, 
+[2026-09-23 23:54:18] Decode batch. #running-req: 2, #token: 256, token usage: 0.25, gen throughput (token/s): 91.39, #queue-req: 0, 
+[2026-09-23 23:54:18] Profiling starts. Traces will be saved to: /tmp/libtt-profile/optimization-results/final-tp2/trace (with profile id: 1790207658.9409275)
+[2026-09-23 23:54:18] INFO:     127.0.0.1:38494 - "POST /start_profile HTTP/1.1" 200 OK
+[2026-09-23 23:54:18] INFO:     127.0.0.1:38502 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:54:18] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+2026-09-23 23:54:19.080 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+2026-09-23 23:54:19.081 | warning  |              Op | The following ttnn.all_gather args are deprecated and will be removed in September-2026: num_links, topology, chunks_per_sync, num_workers_per_link, num_buffers_per_channel, use_l1_small_for_semaphores. (all_gather.cpp:119)
+[2026-09-23 23:54:19] Stop profiling...
+[2026-09-23 23:54:19] Profiling done. Traces are saved to: /tmp/libtt-profile/optimization-results/final-tp2/trace
+[2026-09-23 23:54:19] INFO:     127.0.0.1:38504 - "POST /stop_profile HTTP/1.1" 200 OK
+[2026-09-23 23:54:32] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:54:32] INFO:     127.0.0.1:58656 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:54:32] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:54:32] INFO:     127.0.0.1:58672 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:54:32] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:54:32] Decode batch. #running-req: 1, #token: 32, token usage: 0.03, gen throughput (token/s): 3.29, #queue-req: 0, 
+[2026-09-23 23:54:32] INFO:     127.0.0.1:58688 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:54:55] SIGTERM received. signum=None frame=None. Draining requests and shutting down...
+[2026-09-23 23:54:59] INFO:     127.0.0.1:45952 - "GET /health HTTP/1.1" 200 OK
+[2026-09-23 23:54:59] INFO:     127.0.0.1:45958 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:54:59] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:54:59] Gracefully exiting... remaining number of requests 1
+[2026-09-23 23:55:00] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 1.45, #queue-req: 0, 
+[2026-09-23 23:55:01] Decode batch. #running-req: 1, #token: 96, token usage: 0.09, gen throughput (token/s): 50.57, #queue-req: 0, 
+[2026-09-23 23:55:01] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 50.43, #queue-req: 0, 
+[2026-09-23 23:55:02] INFO:     127.0.0.1:45974 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:02] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:02] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 47.33, #queue-req: 0, 
+[2026-09-23 23:55:03] Decode batch. #running-req: 1, #token: 96, token usage: 0.09, gen throughput (token/s): 51.18, #queue-req: 0, 
+[2026-09-23 23:55:04] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 50.67, #queue-req: 0, 
+[2026-09-23 23:55:04] Gracefully exiting... remaining number of requests 1
+[2026-09-23 23:55:04] INFO:     127.0.0.1:45990 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:04] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:05] Decode batch. #running-req: 1, #token: 32, token usage: 0.03, gen throughput (token/s): 47.23, #queue-req: 0, 
+[2026-09-23 23:55:05] Decode batch. #running-req: 1, #token: 96, token usage: 0.09, gen throughput (token/s): 51.16, #queue-req: 0, 
+[2026-09-23 23:55:06] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 50.86, #queue-req: 0, 
+[2026-09-23 23:55:07] INFO:     127.0.0.1:42864 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:07] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:07] Decode batch. #running-req: 1, #token: 32, token usage: 0.03, gen throughput (token/s): 47.09, #queue-req: 0, 
+[2026-09-23 23:55:08] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 51.18, #queue-req: 0, 
+[2026-09-23 23:55:09] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 50.80, #queue-req: 0, 
+[2026-09-23 23:55:09] Gracefully exiting... remaining number of requests 1
+[2026-09-23 23:55:09] INFO:     127.0.0.1:42866 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:09] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:09] Decode batch. #running-req: 1, #token: 32, token usage: 0.03, gen throughput (token/s): 46.78, #queue-req: 0, 
+[2026-09-23 23:55:10] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 50.98, #queue-req: 0, 
+[2026-09-23 23:55:11] Decode batch. #running-req: 1, #token: 96, token usage: 0.09, gen throughput (token/s): 50.60, #queue-req: 0, 
+[2026-09-23 23:55:12] INFO:     127.0.0.1:42880 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:12] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:12] Decode batch. #running-req: 1, #token: 32, token usage: 0.03, gen throughput (token/s): 46.71, #queue-req: 0, 
+[2026-09-23 23:55:13] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 51.21, #queue-req: 0, 
+[2026-09-23 23:55:13] Decode batch. #running-req: 1, #token: 96, token usage: 0.09, gen throughput (token/s): 51.05, #queue-req: 0, 
+[2026-09-23 23:55:14] Gracefully exiting... remaining number of requests 1
+[2026-09-23 23:55:14] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 50.28, #queue-req: 0, 
+[2026-09-23 23:55:14] INFO:     127.0.0.1:51654 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:14] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:15] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 47.14, #queue-req: 0, 
+[2026-09-23 23:55:16] Decode batch. #running-req: 1, #token: 96, token usage: 0.09, gen throughput (token/s): 51.07, #queue-req: 0, 
+[2026-09-23 23:55:17] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 50.56, #queue-req: 0, 
+[2026-09-23 23:55:17] INFO:     127.0.0.1:51666 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:17] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:18] Decode batch. #running-req: 1, #token: 64, token usage: 0.06, gen throughput (token/s): 47.21, #queue-req: 0, 
+[2026-09-23 23:55:18] Decode batch. #running-req: 1, #token: 96, token usage: 0.09, gen throughput (token/s): 50.98, #queue-req: 0, 
+[2026-09-23 23:55:19] Gracefully exiting... remaining number of requests 1
+[2026-09-23 23:55:19] Decode batch. #running-req: 1, #token: 128, token usage: 0.12, gen throughput (token/s): 50.67, #queue-req: 0, 
+[2026-09-23 23:55:19] INFO:     127.0.0.1:51672 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:19] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:20] Decode batch. #running-req: 1, #token: 224, token usage: 0.22, gen throughput (token/s): 36.50, #queue-req: 0, 
+[2026-09-23 23:55:21] Decode batch. #running-req: 1, #token: 288, token usage: 0.28, gen throughput (token/s): 49.27, #queue-req: 0, 
+[2026-09-23 23:55:22] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 48.72, #queue-req: 0, 
+[2026-09-23 23:55:22] INFO:     127.0.0.1:51676 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:22] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:23] Decode batch. #running-req: 1, #token: 224, token usage: 0.22, gen throughput (token/s): 44.36, #queue-req: 0, 
+[2026-09-23 23:55:24] Decode batch. #running-req: 1, #token: 256, token usage: 0.25, gen throughput (token/s): 49.23, #queue-req: 0, 
+[2026-09-23 23:55:24] Gracefully exiting... remaining number of requests 1
+[2026-09-23 23:55:24] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 48.77, #queue-req: 0, 
+[2026-09-23 23:55:25] INFO:     127.0.0.1:58904 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:25] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:25] Decode batch. #running-req: 1, #token: 224, token usage: 0.22, gen throughput (token/s): 43.99, #queue-req: 0, 
+[2026-09-23 23:55:26] Decode batch. #running-req: 1, #token: 256, token usage: 0.25, gen throughput (token/s): 48.74, #queue-req: 0, 
+[2026-09-23 23:55:27] Decode batch. #running-req: 1, #token: 288, token usage: 0.28, gen throughput (token/s): 49.14, #queue-req: 0, 
+[2026-09-23 23:55:28] INFO:     127.0.0.1:58906 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:28] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:28] Decode batch. #running-req: 1, #token: 224, token usage: 0.22, gen throughput (token/s): 44.19, #queue-req: 0, 
+[2026-09-23 23:55:29] Decode batch. #running-req: 1, #token: 256, token usage: 0.25, gen throughput (token/s): 49.29, #queue-req: 0, 
+[2026-09-23 23:55:29] Gracefully exiting... remaining number of requests 1
+[2026-09-23 23:55:29] Decode batch. #running-req: 1, #token: 288, token usage: 0.28, gen throughput (token/s): 49.12, #queue-req: 0, 
+[2026-09-23 23:55:30] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 48.86, #queue-req: 0, 
+[2026-09-23 23:55:30] INFO:     127.0.0.1:58920 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:30] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:31] Decode batch. #running-req: 1, #token: 256, token usage: 0.25, gen throughput (token/s): 44.60, #queue-req: 0, 
+[2026-09-23 23:55:32] Decode batch. #running-req: 1, #token: 288, token usage: 0.28, gen throughput (token/s): 48.97, #queue-req: 0, 
+[2026-09-23 23:55:33] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 48.57, #queue-req: 0, 
+[2026-09-23 23:55:33] INFO:     127.0.0.1:58936 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:33] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:34] Decode batch. #running-req: 1, #token: 256, token usage: 0.25, gen throughput (token/s): 44.35, #queue-req: 0, 
+[2026-09-23 23:55:34] Gracefully exiting... remaining number of requests 1
+[2026-09-23 23:55:35] Decode batch. #running-req: 1, #token: 288, token usage: 0.28, gen throughput (token/s): 49.14, #queue-req: 0, 
+[2026-09-23 23:55:35] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 48.90, #queue-req: 0, 
+[2026-09-23 23:55:36] INFO:     127.0.0.1:58694 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:36] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:36] Decode batch. #running-req: 1, #token: 224, token usage: 0.22, gen throughput (token/s): 44.42, #queue-req: 0, 
+[2026-09-23 23:55:37] Decode batch. #running-req: 1, #token: 288, token usage: 0.28, gen throughput (token/s): 49.22, #queue-req: 0, 
+[2026-09-23 23:55:38] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 48.91, #queue-req: 0, 
+[2026-09-23 23:55:38] INFO:     127.0.0.1:58704 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:38] Prefill batch. #new-seq: 1, #new-token: 224, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:39] Decode batch. #running-req: 1, #token: 224, token usage: 0.22, gen throughput (token/s): 44.40, #queue-req: 0, 
+[2026-09-23 23:55:39] Gracefully exiting... remaining number of requests 1
+[2026-09-23 23:55:40] Decode batch. #running-req: 1, #token: 256, token usage: 0.25, gen throughput (token/s): 49.30, #queue-req: 0, 
+[2026-09-23 23:55:40] Decode batch. #running-req: 1, #token: 320, token usage: 0.31, gen throughput (token/s): 49.22, #queue-req: 0, 
+[2026-09-23 23:55:41] INFO:     127.0.0.1:58714 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:41] INFO:     127.0.0.1:58712 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:41] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:41] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.03, #running-req: 1, #queue-req: 0, 
+[2026-09-23 23:55:41] Decode batch. #running-req: 2, #token: 64, token usage: 0.06, gen throughput (token/s): 48.57, #queue-req: 0, 
+[2026-09-23 23:55:42] Decode batch. #running-req: 2, #token: 128, token usage: 0.12, gen throughput (token/s): 92.15, #queue-req: 0, 
+[2026-09-23 23:55:43] Decode batch. #running-req: 2, #token: 192, token usage: 0.19, gen throughput (token/s): 92.02, #queue-req: 0, 
+[2026-09-23 23:55:44] Gracefully exiting... remaining number of requests 2
+[2026-09-23 23:55:44] Decode batch. #running-req: 2, #token: 320, token usage: 0.31, gen throughput (token/s): 91.48, #queue-req: 0, 
+[2026-09-23 23:55:44] INFO:     127.0.0.1:58718 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:44] INFO:     127.0.0.1:58728 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:44] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:44] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.03, #running-req: 1, #queue-req: 0, 
+[2026-09-23 23:55:45] Decode batch. #running-req: 2, #token: 128, token usage: 0.12, gen throughput (token/s): 80.77, #queue-req: 0, 
+[2026-09-23 23:55:46] Decode batch. #running-req: 2, #token: 192, token usage: 0.19, gen throughput (token/s): 92.01, #queue-req: 0, 
+[2026-09-23 23:55:47] Decode batch. #running-req: 2, #token: 256, token usage: 0.25, gen throughput (token/s): 90.61, #queue-req: 0, 
+[2026-09-23 23:55:47] Profiling starts. Traces will be saved to: /tmp/libtt-profile/optimization-results/final-tp1/trace (with profile id: 1790207747.3860896)
+[2026-09-23 23:55:47] INFO:     127.0.0.1:45056 - "POST /start_profile HTTP/1.1" 200 OK
+[2026-09-23 23:55:47] INFO:     127.0.0.1:45064 - "POST /generate HTTP/1.1" 200 OK
+[2026-09-23 23:55:47] Prefill batch. #new-seq: 1, #new-token: 32, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, 
+[2026-09-23 23:55:48] Stop profiling...
+[2026-09-23 23:55:48] Profiling done. Traces are saved to: /tmp/libtt-profile/optimization-results/final-tp1/trace
+[2026-09-23 23:55:48] INFO:     127.0.0.1:45070 - "POST /stop_profile HTTP/1.1" 200 OK
+[2026-09-23 23:55:49] Gracefully exiting... remaining number of requests 0
+[2026-09-23 23:55:49] Dumping requests before crash. crash_dump_folder=None

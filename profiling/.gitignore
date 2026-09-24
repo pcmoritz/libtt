@@ -1,0 +1,5 @@
+# Keep reproducible reports and compressed traces; omit duplicate raw traces
+# and verbose build transcripts.
+*.xplane.pb
+build.log
+rebuild.log

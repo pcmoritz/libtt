@@ -1,0 +1,66 @@
+Another command (pid=276598) is running. Waiting for it to complete on the server (server_pid=9649)...
+Computing main repo mapping: 
+Loading: 
+Loading: 0 packages loaded
+Analyzing: target //tests:libtt_test_suite (0 packages loaded, 0 targets configured)
+Analyzing: target //tests:libtt_test_suite (0 packages loaded, 0 targets configured)
+
+Analyzing: target //tests:libtt_test_suite (0 packages loaded, 0 targets configured)
+
+INFO: Analyzed target //tests:libtt_test_suite (2 packages loaded, 7902 targets configured, 24 aspect applications).
+[1,320 / 1,328] Writing: bazel-out/k8-opt/bin/external/+http_archive+tt_metal/tt_metal_runtime_archive.tar.zst; 1s processwrapper-sandbox ... (2 actions running)
+[1,321 / 1,328] Compiling ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp; 6s processwrapper-sandbox ... (2 actions, 1 running)
+INFO: From Compiling ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp:
+In file included from external/+http_archive+spdlog/include/spdlog/details/file_helper.h:6,
+                 from external/+http_archive+spdlog/include/spdlog/sinks/basic_file_sink.h:6,
+                 from external/+http_archive+tt_logger/include/tt-logger/tt-logger.hpp:7,
+                 from external/+http_archive+tt_metal/ttnn/api/ttnn/device_operation.hpp:10,
+                 from external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp:7,
+                 from external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp:5:
+external/+http_archive+spdlog/include/spdlog/common.h:46: warning: "SPDLOG_HEADER_ONLY" redefined
+   46 |     #define SPDLOG_HEADER_ONLY
+      | 
+<command-line>: note: this is the location of the previous definition
+In file included from external/+http_archive+tt_metal/tt_metal/api/tt-metalium/experimental/tensor/tensor_types.hpp:17,
+                 from external/+http_archive+tt_metal/tt_metal/api/tt-metalium/experimental/tensor/mesh_tensor.hpp:9,
+                 from external/+http_archive+tt_metal/ttnn/api/ttnn/tensor/tensor.hpp:15,
+                 from external/+http_archive+tt_metal/ttnn/api/ttnn/device_operation.hpp:12:
+external/+http_archive+tt_metal/tt_metal/api/tt-metalium/core_coord.hpp:250:100: warning: 'using CoreRange = class tt::tt_metal::CoreRange' is deprecated: Use tt::tt_metal::CoreRange [-Wdeprecated-declarations]
+  250 | [[deprecated("Use tt::tt_metal::select_contiguous_range_from_corerangeset")]] inline std::optional<CoreRange>
+      |                                                                                                    ^~~~~~~~~
+external/+http_archive+tt_metal/tt_metal/api/tt-metalium/core_coord.hpp:213:7: note: declared here
+  213 | using CoreRange [[deprecated("Use tt::tt_metal::CoreRange")]] = tt::tt_metal::CoreRange;
+      |       ^~~~~~~~~
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp: In static member function 'static tt::tt_metal::ProgramDescriptor ttnn::prim::MatmulMultiCoreProgramFactory::create_descriptor(const ttnn::prim::MatmulParams&, const ttnn::prim::MatmulInputs&, std::vector<ttnn::Tensor>&, const std::optional<tt::tt_metal::CoreRangeSet>&)':
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp:127:29: warning: narrowing conversion of 'output_cb_index' from 'uint32_t' {aka 'unsigned int'} to 'uint8_t' {aka 'unsigned char'} [-Wnarrowing]
+  127 |             .buffer_index = output_cb_index,
+      |                             ^~~~~~~~~~~~~~~
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp: In lambda function:
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp:290:33: warning: narrowing conversion of 'index' from 'uint32_t' {aka 'unsigned int'} to 'uint8_t' {aka 'unsigned char'} [-Wnarrowing]
+  290 |                 .buffer_index = index,
+      |                                 ^~~~~
+[1,324 / 1,328] Linking libtt.so; 1s processwrapper-sandbox
+INFO: From Linking libtt.so:
+/usr/bin/ld.gold: warning: wildcard match appears in both version '' and 'libnuma_1.1' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.1' and 'libnuma_1.2' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.2' and 'libnuma_1.3' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.3' and 'libnuma_1.4' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.4' and 'libnuma_1.5' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.5' and 'libnuma_1.6' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.6' and 'libnuma_1.7' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.7' and 'libnuma_2.1' in script
+[1,325 / 1,328] [Prepa] Creating symlink python/jax_plugins/libtt/libtt.so
+[1,326 / 1,328] Building wheel @@//:jax_tt_plugin_wheel; 1s processwrapper-sandbox
+[1,327 / 1,328] [Prepa] runfiles for //tests:libtt_test_suite
+[1,328 / 1,329] Testing //tests:libtt_test_suite; 1s local
+[1,328 / 1,329] Testing //tests:libtt_test_suite; 18s local
+INFO: Found 1 test target...
+Target //tests:libtt_test_suite up-to-date:
+  bazel-bin/tests/libtt_test_suite
+INFO: Elapsed time: 56.445s, Critical Path: 34.88s
+INFO: 10 processes: 1319 action cache hit, 3 internal, 2 local, 6 processwrapper-sandbox.
+INFO: Build completed successfully, 10 total actions
+//tests:libtt_test_suite                                                 PASSED in 18.4s
+
+Executed 1 out of 1 test: 1 test passes.
+There were tests whose specified size is too big. Use the --test_verbose_timeout_warnings command line option to see which ones these are.

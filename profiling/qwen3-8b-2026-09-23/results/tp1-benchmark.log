@@ -1,0 +1,24 @@
+Traceback (most recent call last):
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/requests/models.py", line 820, in generate
+    yield from self.raw.stream(chunk_size, decode_content=True)
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/urllib3/response.py", line 1284, in stream
+    yield from self.read_chunked(amt, decode_content=decode_content)
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/urllib3/response.py", line 1459, in read_chunked
+    self._update_chunk_length()
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/urllib3/response.py", line 1383, in _update_chunk_length
+    raise ProtocolError("Response ended prematurely") from None
+urllib3.exceptions.ProtocolError: Response ended prematurely
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/tmp/libtt-profile/benchmark.py", line 55, in <module>
+    rows.append(request(name, 'warmup', i)); save()
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/benchmark.py", line 22, in request
+    for line in r.iter_lines(chunk_size=1):
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/requests/models.py", line 869, in iter_lines
+    for chunk in self.iter_content(
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/requests/models.py", line 822, in generate
+    raise ChunkedEncodingError(e)
+requests.exceptions.ChunkedEncodingError: Response ended prematurely

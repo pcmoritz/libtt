@@ -1,0 +1,26 @@
+{
+  "text": " Paris. The capital of Italy is Rome",
+  "output_ids": [
+    12095,
+    13,
+    576,
+    6722,
+    315,
+    15344,
+    374,
+    21718
+  ],
+  "meta_info": {
+    "id": "f1c91d3b45644b41abcbfce855004171",
+    "finish_reason": {
+      "type": "length",
+      "length": 8
+    },
+    "prompt_tokens": 5,
+    "completion_tokens": 8,
+    "cached_tokens": 0,
+    "routed_experts": null,
+    "cache_miss_count": 0,
+    "e2e_latency": 26.65589475631714
+  }
+}

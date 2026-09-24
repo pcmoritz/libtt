@@ -1,0 +1,160 @@
+{
+  "window_ms": 500,
+  "chip_id": 0,
+  "estimated_frequency_ghz": 1.35,
+  "max_reported_dropped": 0,
+  "unique_records": 24704,
+  "variant": "route-aware link discovery + 8 KiB packets; diagnostic build",
+  "groups": {
+    "matmul": {
+      "count": 3725,
+      "total_ms": 281.2721217,
+      "median_us": 69.2
+    },
+    "all_gather": {
+      "count": 1876,
+      "total_ms": 21.1932297,
+      "median_us": 10.1748
+    },
+    "rmsnorm": {
+      "count": 3723,
+      "total_ms": 19.69996745,
+      "median_us": 6.5733299999999995
+    },
+    "reduce_scatter": {
+      "count": 1850,
+      "total_ms": 19.558431,
+      "median_us": 10.4111
+    },
+    "ttnn/cpp/ttnn/operations/experimental/transformer/nlp_create_qkv_heads_decode/device/kernels/reader_interleaved_tm_tile_layout_nlp_create_qkv_heads_decode.cpp": {
+      "count": 924,
+      "total_ms": 15.7701476,
+      "median_us": 17.051099999999998
+    },
+    "ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce.cpp": {
+      "count": 104,
+      "total_ms": 11.18259244,
+      "median_us": 81.15350000000001
+    },
+    "ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/compute/update_cache.cpp": {
+      "count": 1848,
+      "total_ms": 9.86342755,
+      "median_us": 5.34963
+    },
+    "ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/compute/rotary_embedding.cpp": {
+      "count": 1848,
+      "total_ms": 8.5617147,
+      "median_us": 4.6340699999999995
+    },
+    "sdpa": {
+      "count": 925,
+      "total_ms": 6.92950895,
+      "median_us": 6.923699999999999
+    },
+    "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_no_bcast.cpp": {
+      "count": 1850,
+      "total_ms": 5.71063554,
+      "median_us": 3.0666700000000002
+    },
+    "ttnn/cpp/ttnn/operations/data_movement/tilize/device/kernels/compute/tilize_wh.cpp": {
+      "count": 154,
+      "total_ms": 5.01375522,
+      "median_us": 43.414049999999996
+    },
+    "ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/kernels/compute/fill_pad_compute.cpp": {
+      "count": 52,
+      "total_ms": 3.9669871,
+      "median_us": 75.49369999999999
+    },
+    "ttnn/cpp/ttnn/operations/data_movement/sharded/device/kernels/dataflow/writer_unary_sharded_blocks_interleaved_start_id.cpp": {
+      "count": 1875,
+      "total_ms": 3.65444001,
+      "median_us": 1.95111
+    },
+    "ttnn/cpp/ttnn/operations/data_movement/sharded/device/kernels/dataflow/writer_unary_sharded.cpp": {
+      "count": 1875,
+      "total_ms": 3.09069856,
+      "median_us": 1.6311099999999998
+    },
+    "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_scalar_bcast.cpp": {
+      "count": 52,
+      "total_ms": 2.7743873,
+      "median_us": 53.26145
+    },
+    "ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/eltwise_typecast.cpp": {
+      "count": 203,
+      "total_ms": 2.39130362,
+      "median_us": 1.71481
+    },
+    "ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/writer_reshape_tiled.cpp": {
+      "count": 925,
+      "total_ms": 2.09086372,
+      "median_us": 2.25333
+    },
+    "ttnn/cpp/ttnn/operations/data_movement/untilize/device/kernels/compute/untilize_wh.cpp": {
+      "count": 78,
+      "total_ms": 1.9355161,
+      "median_us": 29.84
+    },
+    "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/compute/eltwise_sfpu.cpp": {
+      "count": 127,
+      "total_ms": 1.58545248,
+      "median_us": 2.18593
+    },
+    "ttnn/cpp/ttnn/operations/data_movement/copy/device/kernels/writer_unary_start_id.cpp": {
+      "count": 104,
+      "total_ms": 1.38694221,
+      "median_us": 12.855570000000002
+    },
+    "ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp": {
+      "count": 26,
+      "total_ms": 0.8376408,
+      "median_us": 31.017400000000002
+    },
+    "ttnn/cpp/ttnn/kernel/compute/tilize.cpp": {
+      "count": 152,
+      "total_ms": 0.53246218,
+      "median_us": 3.50296
+    },
+    "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_no_bcast.cpp": {
+      "count": 102,
+      "total_ms": 0.21993042000000002,
+      "median_us": 2.160745
+    },
+    "ttnn/cpp/ttnn/operations/data_movement/transpose/device/kernels/dataflow/writer_unary_transpose_hc_interleaved_tiled_padding_aware.cpp": {
+      "count": 104,
+      "total_ms": 0.19448888,
+      "median_us": 1.89259
+    },
+    "ttnn/cpp/ttnn/operations/data_movement/slice/device/kernels/dataflow/slice_writer_unary_stick_layout_interleaved_start_id.cpp": {
+      "count": 26,
+      "total_ms": 0.15307927,
+      "median_us": 5.87926
+    },
+    "ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu.cpp": {
+      "count": 25,
+      "total_ms": 0.12076813,
+      "median_us": 4.821479999999999
+    },
+    "ttnn/cpp/ttnn/operations/data_movement/untilize/device/kernels/compute/untilize.cpp": {
+      "count": 51,
+      "total_ms": 0.08176668,
+      "median_us": 1.59556
+    },
+    "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp": {
+      "count": 50,
+      "total_ms": 0.06445409,
+      "median_us": 1.2881500000000001
+    },
+    "ttnn/cpp/ttnn/operations/eltwise/ternary/device/kernels/compute/ternary_sfpu_no_bcast_ttt.cpp": {
+      "count": 25,
+      "total_ms": 0.059860739999999996,
+      "median_us": 2.3977800000000005
+    },
+    "ttnn/cpp/ttnn/kernel/dataflow/writer_unary_stick_layout_interleaved_start_id.cpp": {
+      "count": 25,
+      "total_ms": 0.04548223,
+      "median_us": 1.81852
+    }
+  }
+}

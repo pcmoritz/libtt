@@ -1,0 +1,26 @@
+{
+  "text": " Paris. The capital of Germany is Berlin",
+  "output_ids": [
+    12095,
+    13,
+    576,
+    6722,
+    315,
+    9856,
+    374,
+    19846
+  ],
+  "meta_info": {
+    "id": "03c8f24c5429414f87e653e4d080fc4a",
+    "finish_reason": {
+      "type": "length",
+      "length": 8
+    },
+    "prompt_tokens": 5,
+    "completion_tokens": 8,
+    "cached_tokens": 0,
+    "routed_experts": null,
+    "cache_miss_count": 0,
+    "e2e_latency": 0.391202449798584
+  }
+}

@@ -1,0 +1,149 @@
+Computing main repo mapping: 
+Loading: 
+Loading: 0 packages loaded
+Analyzing: target //:jax_tt_plugin_wheel (0 packages loaded, 0 targets configured)
+Analyzing: target //:jax_tt_plugin_wheel (0 packages loaded, 0 targets configured)
+
+INFO: Analyzed target //:jax_tt_plugin_wheel (0 packages loaded, 0 targets configured).
+[1 / 5] Compiling third_party/tt_xla/tt_mlir_control_flow_runtime.cpp; 1s processwrapper-sandbox
+INFO: From Compiling third_party/tt_xla/tt_mlir_control_flow_runtime.cpp:
+In file included from external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/detail/common/dylib.h:10,
+                 from external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/detail/ttnn/types/types.h:8,
+                 from external/+git_repository+tt_mlir_src/runtime/lib/ttnn/operations/mlir_native/func_call.h:8,
+                 from third_party/tt_xla/tt_mlir_control_flow_runtime.cpp:5:
+external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/types.h:19: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+   19 | #pragma clang diagnostic push
+      | 
+external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/types.h:20: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+   20 | #pragma clang diagnostic ignored "-Wcovered-switch-default"
+      | 
+external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/types.h:24: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+   24 | #pragma clang diagnostic pop
+      | 
+In file included from external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/types.h:26:
+external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/flatbuffer/flatbuffer.h:8: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+    8 | #pragma clang diagnostic push
+      | 
+external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/flatbuffer/flatbuffer.h:9: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+    9 | #pragma clang diagnostic ignored "-Wcovered-switch-default"
+      | 
+external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/flatbuffer/flatbuffer.h:11: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+   11 | #pragma clang diagnostic pop
+      | 
+In file included from external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/detail/common/dylib.h:11:
+external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/utils.h:13: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+   13 | #pragma clang diagnostic push
+      | 
+external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/utils.h:14: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+   14 | #pragma clang diagnostic ignored "-Wcovered-switch-default"
+      | 
+external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/utils.h:16: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+   16 | #pragma clang diagnostic pop
+      | 
+In file included from external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/detail/ttnn/types/types.h:9:
+external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/detail/common/logger.h:324: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+  324 | #pragma clang diagnostic push
+      | 
+external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/detail/common/logger.h:325: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+  325 | #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
+      | 
+external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/detail/common/logger.h:417: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+  417 | #pragma clang diagnostic pop
+      | 
+In file included from external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/detail/ttnn/types/types.h:10:
+external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/detail/ttnn/ttnn.h:8: warning: "FMT_HEADER_ONLY" redefined
+    8 | #define FMT_HEADER_ONLY
+      | 
+<command-line>: note: this is the location of the previous definition
+In file included from external/+http_archive+spdlog/include/spdlog/details/file_helper.h:6,
+                 from external/+http_archive+spdlog/include/spdlog/sinks/basic_file_sink.h:6,
+                 from external/+http_archive+tt_logger/include/tt-logger/tt-logger.hpp:7,
+                 from external/+http_archive+tt_metal/tt_stl/tt_stl/assert.hpp:20,
+                 from external/+http_archive+tt_metal/tt_metal/api/tt-metalium/runtime_args_data.hpp:15,
+                 from external/+http_archive+tt_metal/tt_metal/api/tt-metalium/host_api.hpp:15,
+                 from external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/detail/ttnn/ttnn.h:11:
+external/+http_archive+spdlog/include/spdlog/common.h:46: warning: "SPDLOG_HEADER_ONLY" redefined
+   46 |     #define SPDLOG_HEADER_ONLY
+      | 
+<command-line>: note: this is the location of the previous definition
+In file included from external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/detail/ttnn/ttnn.h:81:
+external/+git_repository+tt_mlir_src/include/ttmlir/Target/TTNN/Target.h:8: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+    8 | #pragma clang diagnostic push
+      | 
+external/+git_repository+tt_mlir_src/include/ttmlir/Target/TTNN/Target.h:9: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+    9 | #pragma clang diagnostic ignored "-Wcovered-switch-default"
+      | 
+In file included from external/+git_repository+tt_mlir_src/include/ttmlir/Target/TTNN/Target.h:11:
+external/+git_repository+tt_mlir_src/include/ttmlir/Target/Common/Target.h:8: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+    8 | #pragma clang diagnostic push
+      | 
+external/+git_repository+tt_mlir_src/include/ttmlir/Target/Common/Target.h:9: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+    9 | #pragma clang diagnostic ignored "-Wcovered-switch-default"
+      | 
+external/+git_repository+tt_mlir_src/include/ttmlir/Target/Common/Target.h:17: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+   17 | #pragma clang diagnostic pop
+      | 
+external/+git_repository+tt_mlir_src/include/ttmlir/Target/TTNN/Target.h:14: warning: ignoring '#pragma clang diagnostic' [-Wunknown-pragmas]
+   14 | #pragma clang diagnostic pop
+      | 
+In file included from external/+http_archive+tt_metal/tt_metal/api/tt-metalium/buffer_distribution_spec.hpp:8,
+                 from external/+http_archive+tt_metal/tt_metal/api/tt-metalium/buffer.hpp:26,
+                 from external/+http_archive+tt_metal/tt_metal/api/tt-metalium/host_api.hpp:12:
+external/+http_archive+tt_metal/tt_metal/api/tt-metalium/core_coord.hpp:250:100: warning: 'using CoreRange = class tt::tt_metal::CoreRange' is deprecated: Use tt::tt_metal::CoreRange [-Wdeprecated-declarations]
+  250 | [[deprecated("Use tt::tt_metal::select_contiguous_range_from_corerangeset")]] inline std::optional<CoreRange>
+      |                                                                                                    ^~~~~~~~~
+external/+http_archive+tt_metal/tt_metal/api/tt-metalium/core_coord.hpp:213:7: note: declared here
+  213 | using CoreRange [[deprecated("Use tt::tt_metal::CoreRange")]] = tt::tt_metal::CoreRange;
+      |       ^~~~~~~~~
+In file included from external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/ccl/ccl_common.hpp:12,
+                 from external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/transformer/sdpa/sdpa.hpp:10,
+                 from external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/detail/ttnn/ttnn.h:71:
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/ccl/ccl_host_datastructures.hpp: In member function 'std::vector<unsigned int> ttnn::ccl::EriscDatamoverBuilder::get_compile_time_args(uint32_t) const':
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/ccl/ccl_host_datastructures.hpp:261:19: warning: narrowing conversion of '(std::size_t)((const ttnn::ccl::EriscDatamoverBuilder*)this)->ttnn::ccl::EriscDatamoverBuilder::num_buffers_per_channel' from 'std::size_t' {aka 'long unsigned int'} to 'unsigned int' [-Wnarrowing]
+  261 |             this->num_buffers_per_channel,
+      |             ~~~~~~^~~~~~~~~~~~~~~~~~~~~~~
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/ccl/ccl_host_datastructures.hpp:261:19: warning: narrowing conversion of '((const ttnn::ccl::EriscDatamoverBuilder*)this)->ttnn::ccl::EriscDatamoverBuilder::num_buffers_per_channel' from 'const std::size_t' {aka 'const long unsigned int'} to 'unsigned int' [-Wnarrowing]
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/ccl/ccl_host_datastructures.hpp:262:13: warning: narrowing conversion of '(tt::ChipId)((const ttnn::ccl::EriscDatamoverBuilder*)this)->ttnn::ccl::EriscDatamoverBuilder::chip_id' from 'tt::ChipId' {aka 'int'} to 'unsigned int' [-Wnarrowing]
+  262 |             chip_id};
+      |             ^~~~~~~
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/ccl/ccl_host_datastructures.hpp:262:13: warning: narrowing conversion of '((const ttnn::ccl::EriscDatamoverBuilder*)this)->ttnn::ccl::EriscDatamoverBuilder::chip_id' from 'const tt::ChipId' {aka 'const int'} to 'unsigned int' [-Wnarrowing]
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/ccl/ccl_common.hpp: In constructor 'ttnn::ccl::InterleavedRingAllGatherTensorSlicer::InterleavedRingAllGatherTensorSlicer(const ttnn::Tensor&, const ttnn::Tensor&, int, uint32_t)':
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/ccl/ccl_common.hpp:549:75: warning: comparison of integer expressions of different signedness: 'size_t' {aka 'long unsigned int'} and 'int' [-Wsign-compare]
+  549 |         this->slice_dim_is_width = input_tensor.padded_shape().rank() - 1 == slice_dim;
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~
+In file included from external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/creation/creation.hpp:15,
+                 from external/+git_repository+tt_mlir_src/runtime/include/tt/runtime/detail/ttnn/ttnn.h:23:
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/functions.hpp: In instantiation of 'ttnn::Tensor ttnn::random::uniform(T, T, const tt::tt_metal::Shape&, tt::tt_metal::Layout) [with T = unsigned int]':
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/functions.hpp:504:46:   required from here
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/functions.hpp:480:36: warning: comparison of integer expressions of different signedness: 'int' and 'std::vector<unsigned int>::size_type' {aka 'long unsigned int'} [-Wsign-compare]
+  480 |         for (auto index = 0; index < output_buffer.size(); index++) {
+      |                              ~~~~~~^~~~~~~~~~~~~~~~~~~~~~
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/functions.hpp: In instantiation of 'ttnn::Tensor ttnn::random::uniform(T, T, const tt::tt_metal::Shape&, tt::tt_metal::Layout) [with T = float]':
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/functions.hpp:505:47:   required from here
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/functions.hpp:485:36: warning: comparison of integer expressions of different signedness: 'int' and 'std::vector<float>::size_type' {aka 'long unsigned int'} [-Wsign-compare]
+  485 |         for (auto index = 0; index < output_buffer.size(); index++) {
+      |                              ~~~~~~^~~~~~~~~~~~~~~~~~~~~~
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/functions.hpp: In instantiation of 'ttnn::Tensor ttnn::random::uniform(T, T, const tt::tt_metal::Shape&, tt::tt_metal::Layout) [with T = bfloat16]':
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/functions.hpp:506:48:   required from here
+external/+http_archive+tt_metal/ttnn/cpp/ttnn/operations/functions.hpp:491:36: warning: comparison of integer expressions of different signedness: 'int' and 'std::vector<bfloat16>::size_type' {aka 'long unsigned int'} [-Wsign-compare]
+  491 |         for (auto index = 0; index < output_buffer.size(); index++) {
+      |                              ~~~~~~^~~~~~~~~~~~~~~~~~~~~~
+[2 / 5] [Prepa] Linking libtt.so
+[2 / 5] Linking libtt.so; 1s processwrapper-sandbox
+INFO: From Linking libtt.so:
+/usr/bin/ld.gold: warning: wildcard match appears in both version '' and 'libnuma_1.1' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.1' and 'libnuma_1.2' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.2' and 'libnuma_1.3' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.3' and 'libnuma_1.4' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.4' and 'libnuma_1.5' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.5' and 'libnuma_1.6' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.6' and 'libnuma_1.7' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.7' and 'libnuma_2.1' in script
+[3 / 5] [Prepa] Creating symlink python/jax_plugins/libtt/libtt.so
+[4 / 5] Building wheel @@//:jax_tt_plugin_wheel; 1s processwrapper-sandbox
+INFO: Found 1 target...
+Target //:jax_tt_plugin_wheel up-to-date:
+  bazel-bin/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl
+INFO: Elapsed time: 19.370s, Critical Path: 19.11s
+INFO: 5 processes: 2 internal, 3 processwrapper-sandbox.
+INFO: Build completed successfully, 5 total actions

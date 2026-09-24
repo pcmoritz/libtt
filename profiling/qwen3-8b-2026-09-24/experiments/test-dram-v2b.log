@@ -1,0 +1,81 @@
+Computing main repo mapping: 
+Loading: 
+Loading: 0 packages loaded
+Analyzing: target //tests:libtt_test_suite (0 packages loaded, 0 targets configured)
+Analyzing: target //tests:libtt_test_suite (0 packages loaded, 0 targets configured)
+
+Analyzing: target //tests:libtt_test_suite (0 packages loaded, 0 targets configured)
+
+Analyzing: target //tests:libtt_test_suite (0 packages loaded, 0 targets configured)
+
+INFO: Analyzed target //tests:libtt_test_suite (1 packages loaded, 1307 targets configured, 64 aspect applications).
+[661 / 667] Compiling lib/Dialect/TTNN/Transforms/TTNNDecodeDRAMMatmul.cpp; 1s processwrapper-sandbox ... (2 actions running)
+INFO: From Compiling lib/Dialect/TTNN/Transforms/TTNNDecodeDRAMMatmul.cpp:
+In file included from external/+llvm_configure+llvm-project/mlir/include/mlir/IR/OperationSupport.h:23,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/IR/Dialect.h:17,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/Bytecode/BytecodeImplementation.h:19,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/Bytecode/BytecodeOpInterface.h:17,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/IR/BuiltinOps.h:16,
+                 from external/+git_repository+tt_mlir_src/include/ttmlir/Dialect/TTNN/Transforms/Passes.h:8,
+                 from external/+git_repository+tt_mlir_src/lib/Dialect/TTNN/Transforms/TTNNDecodeDRAMMatmul.cpp:2:
+external/+llvm_configure+llvm-project/mlir/include/mlir/IR/TypeRange.h: In static member function 'static bool llvm::DenseMapInfo<mlir::TypeRange>::isEqual(mlir::TypeRange, mlir::TypeRange)':
+external/+llvm_configure+llvm-project/mlir/include/mlir/IR/TypeRange.h:211:19: warning: C++20 says that these are ambiguous, even though the second is reversed:
+  211 |     return lhs == rhs;
+      |                   ^~~
+In file included from external/+llvm_configure+llvm-project/mlir/include/mlir/Support/TypeID.h:20,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/IR/MLIRContext.h:13,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/IR/AttributeSupport.h:16,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/IR/Attributes.h:12,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/Bytecode/BytecodeImplementation.h:17:
+external/+llvm_configure+llvm-project/llvm/include/llvm/ADT/STLExtras.h:1327:6: note: candidate 1: 'bool llvm::detail::operator==(const indexed_accessor_range_base<DerivedT, BaseT, T, PointerT, ReferenceT>&, const OtherT&) [with OtherT = mlir::TypeRange; DerivedT = mlir::TypeRange; BaseT = llvm::PointerUnion<const mlir::Value*, const mlir::Type*, mlir::OpOperand*, mlir::detail::OpResultImpl*>; T = mlir::Type; PointerT = mlir::Type; ReferenceT = mlir::Type]'
+ 1327 | bool operator==(const indexed_accessor_range_base<DerivedT, BaseT, T, PointerT,
+      |      ^~~~~~~~
+external/+llvm_configure+llvm-project/llvm/include/llvm/ADT/STLExtras.h:1327:6: note: candidate 2: 'bool llvm::detail::operator==(const indexed_accessor_range_base<DerivedT, BaseT, T, PointerT, ReferenceT>&, const OtherT&) [with OtherT = mlir::TypeRange; DerivedT = mlir::TypeRange; BaseT = llvm::PointerUnion<const mlir::Value*, const mlir::Type*, mlir::OpOperand*, mlir::detail::OpResultImpl*>; T = mlir::Type; PointerT = mlir::Type; ReferenceT = mlir::Type]' (reversed)
+[662 / 667] Compiling lib/Dialect/TTNN/Transforms/TTNNFusing.cpp; 5s processwrapper-sandbox
+INFO: From Compiling lib/Dialect/TTNN/Transforms/TTNNFusing.cpp:
+In file included from external/+llvm_configure+llvm-project/mlir/include/mlir/IR/OperationSupport.h:23,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/IR/Dialect.h:17,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/IR/OpDefinition.h:22,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/IR/Builders.h:12,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/Dialect/Quant/IR/QuantTypes.h:13,
+                 from external/+git_repository+tt_mlir_src/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h:8,
+                 from external/+git_repository+tt_mlir_src/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.h:8,
+                 from external/+git_repository+tt_mlir_src/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp:5:
+external/+llvm_configure+llvm-project/mlir/include/mlir/IR/TypeRange.h: In static member function 'static bool llvm::DenseMapInfo<mlir::TypeRange>::isEqual(mlir::TypeRange, mlir::TypeRange)':
+external/+llvm_configure+llvm-project/mlir/include/mlir/IR/TypeRange.h:211:19: warning: C++20 says that these are ambiguous, even though the second is reversed:
+  211 |     return lhs == rhs;
+      |                   ^~~
+In file included from external/+llvm_configure+llvm-project/mlir/include/mlir/Support/TypeID.h:20,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/IR/MLIRContext.h:13,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/IR/AttributeSupport.h:16,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/IR/Attributes.h:12,
+                 from external/+llvm_configure+llvm-project/mlir/include/mlir/Dialect/Quant/IR/QuantTypes.h:12:
+external/+llvm_configure+llvm-project/llvm/include/llvm/ADT/STLExtras.h:1327:6: note: candidate 1: 'bool llvm::detail::operator==(const indexed_accessor_range_base<DerivedT, BaseT, T, PointerT, ReferenceT>&, const OtherT&) [with OtherT = mlir::TypeRange; DerivedT = mlir::TypeRange; BaseT = llvm::PointerUnion<const mlir::Value*, const mlir::Type*, mlir::OpOperand*, mlir::detail::OpResultImpl*>; T = mlir::Type; PointerT = mlir::Type; ReferenceT = mlir::Type]'
+ 1327 | bool operator==(const indexed_accessor_range_base<DerivedT, BaseT, T, PointerT,
+      |      ^~~~~~~~
+external/+llvm_configure+llvm-project/llvm/include/llvm/ADT/STLExtras.h:1327:6: note: candidate 2: 'bool llvm::detail::operator==(const indexed_accessor_range_base<DerivedT, BaseT, T, PointerT, ReferenceT>&, const OtherT&) [with OtherT = mlir::TypeRange; DerivedT = mlir::TypeRange; BaseT = llvm::PointerUnion<const mlir::Value*, const mlir::Type*, mlir::OpOperand*, mlir::detail::OpResultImpl*>; T = mlir::Type; PointerT = mlir::Type; ReferenceT = mlir::Type]' (reversed)
+[663 / 667] Linking libtt.so; 1s processwrapper-sandbox
+INFO: From Linking libtt.so:
+/usr/bin/ld.gold: warning: wildcard match appears in both version '' and 'libnuma_1.1' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.1' and 'libnuma_1.2' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.2' and 'libnuma_1.3' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.3' and 'libnuma_1.4' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.4' and 'libnuma_1.5' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.5' and 'libnuma_1.6' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.6' and 'libnuma_1.7' in script
+/usr/bin/ld.gold: warning: wildcard match appears in both version 'libnuma_1.7' and 'libnuma_2.1' in script
+[664 / 667] [Prepa] Creating symlink python/jax_plugins/libtt/libtt.so
+[665 / 667] Building wheel @@//:jax_tt_plugin_wheel; 1s processwrapper-sandbox
+[666 / 667] [Prepa] runfiles for //tests:libtt_test_suite
+[667 / 668] Testing //tests:libtt_test_suite; 1s local
+[667 / 668] Testing //tests:libtt_test_suite; 25s local
+INFO: Found 1 test target...
+Target //tests:libtt_test_suite up-to-date:
+  bazel-bin/tests/libtt_test_suite
+INFO: Elapsed time: 46.429s, Critical Path: 41.58s
+INFO: 8 processes: 660 action cache hit, 3 internal, 2 local, 4 processwrapper-sandbox.
+INFO: Build completed successfully, 8 total actions
+//tests:libtt_test_suite                                                 PASSED in 25.9s
+
+Executed 1 out of 1 test: 1 test passes.
+There were tests whose specified size is too big. Use the --test_verbose_timeout_warnings command line option to see which ones these are.

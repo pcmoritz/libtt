@@ -1,0 +1,18 @@
+Using Python 3.12.3 environment at: /tmp/libtt-profile/multinode-venv
+Resolved 40 packages in 540ms
+Prepared 11 packages in 148ms
+Uninstalled 2 packages in 1ms
+Installed 11 packages in 1ms
+ + chex==0.1.90
+ + dataclasses-json==0.6.7
+ - flax==0.12.9
+ + flax==0.12.5
+ + jaxtyping==0.3.11
+ + marshmallow==3.26.2
+ + mypy-extensions==1.1.0
+ - optax==0.2.8
+ + optax==0.2.6
+ + orbax-export==0.0.8
+ + toolz==1.1.0
+ + typing-inspect==0.9.0
+ + wadler-lindig==0.1.7

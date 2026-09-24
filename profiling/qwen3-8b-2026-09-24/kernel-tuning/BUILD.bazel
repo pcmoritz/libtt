@@ -1,0 +1,7 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+cc_binary(
+    name = "matmul_bench",
+    srcs = ["matmul_bench.cc"],
+    copts = ["-std=c++20"],
+    deps = ["//:tt_metal_runtime_root", "@tt_metal//:ttnn_tensor_upstream"],
+)

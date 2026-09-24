@@ -1,0 +1,37 @@
+{"tp": 2, "prompt": "short", "phase": "warmup", "repeat": 0, "prompt_tokens": 5, "completion_tokens": 128, "ttft_s": 12.409422042997903, "e2e_s": 27.896973489994707, "decode_tokens_per_s": 8.200190401126738, "tpot_ms": 121.94838791335823}
+{"tp": 2, "prompt": "short", "phase": "warmup", "repeat": 1, "prompt_tokens": 5, "completion_tokens": 128, "ttft_s": 0.25743084799614735, "e2e_s": 10.984101665999333, "decode_tokens_per_s": 11.839753314195962, "tpot_ms": 84.46121920471026}
+{"tp": 2, "prompt": "short", "phase": "warmup", "repeat": 2, "prompt_tokens": 5, "completion_tokens": 128, "ttft_s": 0.25383634000172606, "e2e_s": 10.981811799996649, "decode_tokens_per_s": 11.838307482481289, "tpot_ms": 84.47153459055126}
+{"tp": 2, "prompt": "short", "phase": "measured", "repeat": 0, "prompt_tokens": 5, "completion_tokens": 128, "ttft_s": 0.25462102200253867, "e2e_s": 10.99659994400281, "decode_tokens_per_s": 11.82285833769156, "tpot_ms": 84.58191508663988}
+{"tp": 2, "prompt": "short", "phase": "measured", "repeat": 1, "prompt_tokens": 5, "completion_tokens": 128, "ttft_s": 0.2555853180019767, "e2e_s": 10.998471291000897, "decode_tokens_per_s": 11.82187969030402, "tpot_ms": 84.58891700785726}
+{"tp": 2, "prompt": "short", "phase": "measured", "repeat": 2, "prompt_tokens": 5, "completion_tokens": 128, "ttft_s": 0.2556814679992385, "e2e_s": 10.982449317998544, "decode_tokens_per_s": 11.839636599691305, "tpot_ms": 84.46205181889391}
+{"tp": 2, "prompt": "short", "phase": "measured", "repeat": 3, "prompt_tokens": 5, "completion_tokens": 128, "ttft_s": 0.2558987660013372, "e2e_s": 11.003742544002307, "decode_tokens_per_s": 11.816418171167498, "tpot_ms": 84.6280137952495}
+Traceback (most recent call last):
+  File "/tmp/libtt-profile/multinode-venv/lib/python3.12/site-packages/requests/models.py", line 820, in generate
+    yield from self.raw.stream(chunk_size, decode_content=True)
+  File "/tmp/libtt-profile/multinode-venv/lib/python3.12/site-packages/urllib3/response.py", line 1284, in stream
+    yield from self.read_chunked(amt, decode_content=decode_content)
+  File "/tmp/libtt-profile/multinode-venv/lib/python3.12/site-packages/urllib3/response.py", line 1459, in read_chunked
+    self._update_chunk_length()
+  File "/tmp/libtt-profile/multinode-venv/lib/python3.12/site-packages/urllib3/response.py", line 1383, in _update_chunk_length
+    raise ProtocolError("Response ended prematurely") from None
+urllib3.exceptions.ProtocolError: Response ended prematurely
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/tmp/libtt-profile/quick_bench.py", line 56, in <module>
+    rows.append(request('short', 'measured', i)); save()
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/quick_bench.py", line 22, in request
+    for line in r.iter_lines(chunk_size=1):
+  File "/tmp/libtt-profile/multinode-venv/lib/python3.12/site-packages/requests/models.py", line 869, in iter_lines
+    for chunk in self.iter_content(
+  File "/tmp/libtt-profile/multinode-venv/lib/python3.12/site-packages/requests/models.py", line 822, in generate
+    raise ChunkedEncodingError(e)
+requests.exceptions.ChunkedEncodingError: Response ended prematurely
+Traceback (most recent call last):
+  File "/tmp/libtt-profile/round2/run_bench.py", line 11, in <module>
+    subprocess.run([sys.executable,'/tmp/libtt-profile/benchmark.py' if a.full else '/tmp/libtt-profile/quick_bench.py','--tp',str(a.tp),'--output',a.output],check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['/tmp/libtt-profile/multinode-venv/bin/python', '/tmp/libtt-profile/quick_bench.py', '--tp', '2', '--output', '/tmp/libtt-profile/round3/activation-tp2']' returned non-zero exit status 1.

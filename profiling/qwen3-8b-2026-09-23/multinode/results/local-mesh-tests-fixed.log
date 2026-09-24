@@ -1,0 +1,21 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/libtt-profile/multinode-venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/ttuser/libtt/tests/libtt
+configfile: pytest.ini
+plugins: jaxtyping-0.3.11, anyio-4.14.2
+collecting ... collected 4 items
+
+tests/libtt/local_mesh_regression_test.py::test_local_mesh_outputs_remain_shard_local[False] PASSED [ 25%]
+tests/libtt/local_mesh_regression_test.py::test_local_mesh_outputs_remain_shard_local[True] PASSED [ 50%]
+tests/libtt/local_mesh_regression_test.py::test_local_mesh_replicated_conditional[False] PASSED [ 75%]
+tests/libtt/local_mesh_regression_test.py::test_local_mesh_replicated_conditional[True] PASSED [100%]
+
+============================== 4 passed in 2.36s ===============================
+2026-09-23 23:14:49.909 | info     |    BuildKernels | JIT cache stats: 42/47 hits (89.4%) [42 cached, 34 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:197)
+2026-09-23 23:14:49.909 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-09-23 23:14:49.915 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 23:14:49.915 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 23:14:50.135 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 23:14:50.135 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 23:14:50.135 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)

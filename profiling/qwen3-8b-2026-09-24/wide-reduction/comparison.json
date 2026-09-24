@@ -1,0 +1,96 @@
+{
+  "1": {
+    "short": {
+      "baseline": {
+        "prompt_tokens": 5,
+        "completion_tokens": 128,
+        "ttft_s": 0.07895774500502739,
+        "e2e_s": 3.742021190999367,
+        "decode_tokens_per_s": 34.67048143879361,
+        "tpot_ms": 28.842979921273223
+      },
+      "optimized": {
+        "prompt_tokens": 5,
+        "completion_tokens": 128,
+        "ttft_s": 0.0785643270064611,
+        "e2e_s": 3.7043039269992732,
+        "decode_tokens_per_s": 35.02798946808091,
+        "tpot_ms": 28.5485982834169
+      },
+      "throughput_gain_percent": 1.0311596910427712,
+      "tpot_saved_ms": 0.294381637856322
+    },
+    "long": {
+      "baseline": {
+        "prompt_tokens": 199,
+        "completion_tokens": 128,
+        "ttft_s": 0.10799271600262728,
+        "e2e_s": 3.8859699870008626,
+        "decode_tokens_per_s": 33.6164734988092,
+        "tpot_ms": 29.747320165377346
+      },
+      "optimized": {
+        "prompt_tokens": 199,
+        "completion_tokens": 128,
+        "ttft_s": 0.10767893400043249,
+        "e2e_s": 3.818428375001531,
+        "decode_tokens_per_s": 34.22551985506557,
+        "tpot_ms": 29.21796379528168
+      },
+      "throughput_gain_percent": 1.8117496955114776,
+      "tpot_saved_ms": 0.529356370095666
+    }
+  },
+  "2": {
+    "short": {
+      "baseline": {
+        "prompt_tokens": 5,
+        "completion_tokens": 128,
+        "ttft_s": 0.05821216200274648,
+        "e2e_s": 2.549555789999431,
+        "decode_tokens_per_s": 50.982758894956135,
+        "tpot_ms": 19.614474023667103
+      },
+      "optimized": {
+        "prompt_tokens": 5,
+        "completion_tokens": 128,
+        "ttft_s": 0.05803920100152027,
+        "e2e_s": 2.5043708459998015,
+        "decode_tokens_per_s": 51.91461424356936,
+        "tpot_ms": 19.262398740136447
+      },
+      "throughput_gain_percent": 1.8277852529189342,
+      "tpot_saved_ms": 0.352075283530656
+    },
+    "long": {
+      "baseline": {
+        "prompt_tokens": 199,
+        "completion_tokens": 128,
+        "ttft_s": 0.07839854699705029,
+        "e2e_s": 2.668058071001724,
+        "decode_tokens_per_s": 49.04784361588916,
+        "tpot_ms": 20.38825616537498
+      },
+      "optimized": {
+        "prompt_tokens": 199,
+        "completion_tokens": 128,
+        "ttft_s": 0.07798457000171766,
+        "e2e_s": 2.621462823000911,
+        "decode_tokens_per_s": 49.938382661501244,
+        "tpot_ms": 20.02467734644769
+      },
+      "throughput_gain_percent": 1.815653818720775,
+      "tpot_saved_ms": 0.3635788189272908
+    }
+  },
+  "speedup": {
+    "short": {
+      "baseline": 1.4704946911383336,
+      "optimized": 1.482089467078215
+    },
+    "long": {
+      "baseline": 1.459041907463214,
+      "optimized": 1.4590978565986654
+    }
+  }
+}

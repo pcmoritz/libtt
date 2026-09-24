@@ -1,0 +1,34 @@
+{
+  "text": " Berlin. The capital of France is Paris. The capital of Italy is Rome.",
+  "output_ids": [
+    19846,
+    13,
+    576,
+    6722,
+    315,
+    9625,
+    374,
+    12095,
+    13,
+    576,
+    6722,
+    315,
+    15344,
+    374,
+    21718,
+    13
+  ],
+  "meta_info": {
+    "id": "0cea8c534ff84da4b4cccbaae9209ad9",
+    "finish_reason": {
+      "type": "length",
+      "length": 16
+    },
+    "prompt_tokens": 5,
+    "completion_tokens": 16,
+    "cached_tokens": 0,
+    "routed_experts": null,
+    "cache_miss_count": 0,
+    "e2e_latency": 5.096602916717529
+  }
+}

@@ -1,0 +1,202 @@
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[2026-09-23 22:56:06] server_args=ServerArgs(model_path='Qwen/Qwen3-8B', tokenizer_path='Qwen/Qwen3-8B', tokenizer_mode='auto', tokenizer_backend='huggingface', skip_tokenizer_init=False, load_format='auto', model_loader_extra_config='{}', trust_remote_code=False, context_length=None, is_embedding=False, revision=None, model_impl='auto', model_layer_nums=None, host='127.0.0.1', port=31000, skip_server_warmup=True, warmups=None, dtype='bfloat16', quantization=None, quantization_param_path=None, quantization_config_path=None, kv_cache_dtype='auto', dtype_config=None, mem_fraction_static=0.88, max_running_requests=2, max_total_tokens=1024, max_prefill_tokens=256, chunked_prefill_size=256, enable_mixed_chunk=False, schedule_policy='fcfs', schedule_conservativeness=1.0, page_size=32, swa_full_tokens_ratio=0.8, recurrent_state_memory_ratio=0.9, max_recurrent_state_size=None, recurrent_track_interval=None, disable_hybrid_swa_memory=False, device='tt', device_indexes=None, pd_disaggregation='', pd_prefill_mem_fraction=0.85, pd_decode_mem_fraction=0.85, pd_prefill_max_tokens=20480, pd_decode_max_tokens=25600, pd_num_prefill=1, pd_num_decode=1, pd_prefill_tp_size=0, pd_prefill_ep_size=0, tp_size=2, ep_size=1, ep_num_redundant_experts=0, ep_dispatch_algorithm=None, enable_sequence_parallel=False, stream_interval=1, stream_output=False, random_seed=42, constrained_json_whitespace_pattern=None, constrained_json_disable_any_whitespace=False, watchdog_timeout=1200.0, dist_timeout=None, download_dir=None, sleep_on_idle=False, dp_size=1, enable_dp_lm_head=False, moe_dp_size=1, dp_schedule_policy='min_running_queue', log_level='info', log_level_http=None, log_requests=False, log_requests_level=0, crash_dump_folder=None, show_time_cost=False, enable_metrics=False, bucket_time_to_first_token=None, bucket_inter_token_latency=None, bucket_e2e_request_latency=None, decode_log_interval=40, enable_request_time_stats_logging=False, kv_events_config=None, api_key=None, served_model_name='Qwen/Qwen3-8B', file_storage_path='sglang_storage', enable_cache_report=False, reasoning_parser=None, tool_call_parser=None, dist_init_addr=None, nnodes=1, node_rank=0, json_model_override_args='{}', preferred_sampling_params=None, disable_radix_cache=True, enable_unified_radix_tree=False, hicache_storage='disable', hicache_ratio=2.0, hicache_write_through_threshold=1, hicache_write_policy='write_through', enable_recurrent_extra_buffer=False, allow_auto_truncate=False, enable_tokenizer_batch_encode=False, disable_overlap_schedule=True, enable_precision_tracer=False, attention_backend='tt', gdn_prefill_impl='fused_chunk_parallel', dsa_use_pallas=True, moe_backend='epmoe', disable_jax_allreduce_metadata=False, enable_topk_kernel=True, grammar_backend='llguidance', max_seq_len=4096, precompile_token_paddings=None, precompile_bs_paddings=None, precompile_vision_patch_paddings=None, vision_encoder_parallel='dp', disable_precompile=True, speculative_algorithm=None, speculative_draft_model_path=None, speculative_draft_model_revision=None, speculative_num_steps=4, speculative_eagle_topk=5, speculative_num_draft_tokens=4, speculative_sample_from_anchor=False, speculative_accept_threshold_single=1.0, speculative_accept_threshold_acc=1.0, enable_deterministic_sampling=False, enable_single_process=False, enable_nan_detection=False, enable_lora=False, max_lora_rank=None, lora_target_modules=None, lora_paths=None, max_loaded_loras=None, max_loras_per_batch=8, lora_eviction_policy='lru', enable_static_lora=False, lora_scaling=None, enable_engine_loop_run_forever_daemon=False, multimodal=False, limit_mm_data_per_request=None, mm_processor_worker_num=0, enable_return_routed_experts=False, enable_expert_balance_debug=False, expert_balance_segment_counter=100, expert_balance_output_file=None, init_expert_location='trivial', enable_expert_distribution_recorder=False, expert_distribution_recorder_buffer_size=100, expert_distribution_recorder_output_file=None, disaggregation_mode='null', disaggregation_bootstrap_url=None, disaggregation_bootstrap_port=8998, disaggregation_transfer_port=30001, disaggregation_enable_d2h=False, disaggregation_use_raiden=False, disaggregation_enable_overlap_schedule=False, disaggregation_enable_chunk_prefill_transfer=False, disaggregation_side_channel_port=9600, disaggregation_d2h_pool_size=64, disaggregation_d2h_max_tokens=None, disaggregation_channel_number=4, disaggregation_host_ip=None, disaggregation_bootstrap_timeout_seconds=5.0, disaggregation_pull_timeout_seconds=30.0, disaggregation_ack_timeout_seconds=60.0, disaggregation_orphan_reaper_interval_seconds=5.0, disaggregation_shared_secret=None, disaggregation_decode_watchdog_seconds=0.0, disaggregation_num_reserved_decode_tokens=512, disaggregation_max_inflight_transfers=8)
+[2026-09-23 22:56:07] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-8B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+[2026-09-23 22:56:07] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-8B/b968826d9c46dd6066d109eabc6255188de91218/config.json?%2FQwen%2FQwen3-8B%2Fresolve%2Fmain%2Fconfig.json=&etag=%22d46195ac87f837ad233d02b2f80f148bf7c005e0%22 "HTTP/1.1 200 OK"
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[2026-09-23 22:56:07] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-8B/resolve/main/generation_config.json "HTTP/1.1 307 Temporary Redirect"
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[2026-09-23 22:56:07] Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[2026-09-23 22:56:07] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-8B/b968826d9c46dd6066d109eabc6255188de91218/generation_config.json?%2FQwen%2FQwen3-8B%2Fresolve%2Fmain%2Fgeneration_config.json=&etag=%2220a8a9156fc8c3f25295ca067f61fdf120d517c5%22 "HTTP/1.1 200 OK"
+[2026-09-23 22:56:07] No quantization config found in HF config or user config
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[2026-09-23 22:56:07] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-8B/revision/main "HTTP/1.1 200 OK"
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 4443.12it/s]
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[2026-09-23 22:56:08] XLA persistent compilation cache: enabled, dir=/tmp/libtt-profile/jax-cache-tp2, min_compile_time=0s
+[2026-09-23 22:56:08] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-8B/revision/main "HTTP/1.1 200 OK"
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 4310.69it/s]
+[2026-09-23 22:56:09] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-8B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+[2026-09-23 22:56:09] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-8B/b968826d9c46dd6066d109eabc6255188de91218/config.json?%2FQwen%2FQwen3-8B%2Fresolve%2Fmain%2Fconfig.json=&etag=%22d46195ac87f837ad233d02b2f80f148bf7c005e0%22 "HTTP/1.1 200 OK"
+[2026-09-23 22:56:09] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-8B/resolve/main/generation_config.json "HTTP/1.1 307 Temporary Redirect"
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[2026-09-23 22:56:09] Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[2026-09-23 22:56:09] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-8B/b968826d9c46dd6066d109eabc6255188de91218/generation_config.json?%2FQwen%2FQwen3-8B%2Fresolve%2Fmain%2Fgeneration_config.json=&etag=%2220a8a9156fc8c3f25295ca067f61fdf120d517c5%22 "HTTP/1.1 200 OK"
+[2026-09-23 22:56:09] No quantization config found in HF config or user config
+[2026-09-23 22:56:09] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-8B/revision/main "HTTP/1.1 200 OK"
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 4747.37it/s]
+[2026-09-23 22:56:10] Initialized GuidanceBackend with whitespace_pattern=None
+[2026-09-23 22:56:11] Platform 'tt' is experimental and not all JAX functionality may be correctly supported!
+2026-09-23 22:56:11.117 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 22:56:11.117 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 22:56:11.117 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:95)
+2026-09-23 22:56:11.117 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:114)
+2026-09-23 22:56:11.124 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:574)
+2026-09-23 22:56:11.125 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:118)
+2026-09-23 22:56:11.125 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 22:56:11.125 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 22:56:11.164 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1}/[0, 3] and remote chip ids {} (cluster.cpp:162)
+2026-09-23 22:56:11.164 | info     |             UMD | IOMMU: enabled (cluster.cpp:142)
+2026-09-23 22:56:11.164 | info     |             UMD | KMD version: 2.10.0 (cluster.cpp:145)
+2026-09-23 22:56:11.164 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 22:56:11.165 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 22:56:11.221 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 22:56:11.266 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 22:56:11.266 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 22:56:11.266 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:56:11.266 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:56:11.266 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:56:11.266 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:56:11.266 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 22:56:11.266 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 22:56:11.924 | info     |           Metal | [Real-time profiler] Device 1 sync complete: 100 samples, frequency=1.350017 GHz, device_time_at_sync=49137673543 cycles (realtime_profiler_manager.cpp:1390)
+2026-09-23 22:56:11.924 | info     |           Metal | [Real-time profiler] Device 0 sync complete: 100 samples, frequency=1.350012 GHz, device_time_at_sync=457742170072 cycles (realtime_profiler_manager.cpp:1390)
+2026-09-23 22:56:11.935 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-9 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 22:56:11.935 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-8 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 22:56:11.935 | critical |          Always | TT_FATAL: Chip 1 logical eth core 0-3 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 22:56:11.936 | critical |          Always | TT_FATAL: Chip 1 logical eth core 0-2 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 22:56:12.052 | info     |           Metal | Fabric config changed from FabricConfig::DISABLED to FabricConfig::FABRIC_1D, reinitializing control plane (metal_env.cpp:333)
+2026-09-23 22:56:12.052 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 22:56:12.052 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 22:56:12.052 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:56:12.052 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:56:12.052 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:56:12.052 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:56:12.052 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 22:56:12.052 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 22:56:12.079 | info     |           Metal | Initializing Fabric (fabric_firmware_initializer.cpp:296)
+2026-09-23 22:56:12.088 | info     |           Metal | Fabric initialized on Device 0 (device.cpp:550)
+2026-09-23 22:56:12.089 | info     |           Metal | Fabric initialized on Device 1 (device.cpp:550)
+2026-09-23 22:56:12.089 | info     |           Metal | Fabric initialized on 2 devices (fabric_firmware_initializer.cpp:444)
+2026-09-23 22:56:12.089 | info     |           Metal | Fabric Initialized with config FabricConfig::FABRIC_1D (fabric_firmware_initializer.cpp:313)
+2026-09-23 22:56:12.141 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:1081)
+[2026-09-23 22:56:12] No quantization config found in HF config or user config
+2026-09-23 22:56:12.299 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:258)
+2026-09-23 22:56:12.348 | info     |           Metal | Enabling program cache on MeshDevice 2 (mesh_device.cpp:1081)
+[2026-09-23 22:56:12] Precision tracer globally disabled
+[2026-09-23 22:56:12] KV heads distribution for GQA model: original_kv_heads=8, tp_size=2, each device gets 4 head(s), no replication needed, padding_strategy=replicate
+[2026-09-23 22:56:13] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-8B/revision/main "HTTP/1.1 200 OK"
+Fetching 15 files:   0%|          | 0/15 [00:00<?, ?it/s]Fetching 15 files: 100%|██████████| 15/15 [00:00<00:00, 5377.31it/s]
+[2026-09-23 22:56:13] model_path on ext4 mount, skipping GCSFuse warm-up
+[2026-09-23 22:56:13] QWen3ForCausalLMModel config dtype: <class 'jax.numpy.bfloat16'>
+[2026-09-23 22:56:13] No quantization config found. Skipping quantization.
+[2026-09-23 22:56:13] Scanning metadata for 5 model files (single host only)...
+Scanning Metadata:   0%|          | 0/5 [00:00<?, ?file/s]Scanning Metadata: 100%|██████████| 5/5 [00:00<00:00, 13298.36file/s]
+[2026-09-23 22:56:13] Starting parallel weight loading via JAX Lazy Loader...
+Loading Regular Weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading Regular Weights:   0%|          | 1/399 [00:00<01:55,  3.45it/s]Loading Regular Weights:   1%|          | 3/399 [00:00<01:11,  5.51it/s]error: GSPMD presharded argument missing @Sharding custom call.
+error: Failed to annotate local shapes for arguments.
+error: GSPMD presharded result missing @SPMDShardToFullShape custom call.
+error: Failed to annotate local shapes for results.
+2026-09-23 22:56:13.784 (   2.669s) [        781D3080]      module_builder.cc:945    ERR| Failed to run stablehlo pipeline
+[2026-09-23 22:56:13] Fast load failed for model.layers.0.self_attn.q_proj.weight, falling back to slow path. Error: INTERNAL: Error code: 13
+2026-09-23 22:56:13.816 | critical |          Always | TT_FATAL: Number of tensor shards must match mesh size (assert.hpp:104)
+Loading Regular Weights:   1%|▏         | 5/399 [00:00<00:48,  8.05it/s]
+[2026-09-23 22:56:13] Scheduler hit an exception: Traceback (most recent call last):
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/managers/scheduler.py", line 2976, in run_scheduler_process
+    scheduler = Scheduler(server_args, port_args)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/managers/scheduler.py", line 403, in __init__
+    self.tp_worker = TpWorkerClass(
+                     ^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/managers/tp_worker.py", line 128, in __init__
+    self.model_runner = ModelRunner(
+                        ^^^^^^^^^^^^
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/model_executor/model_runner.py", line 163, in __init__
+    self.initialize()
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/model_executor/model_runner.py", line 182, in initialize
+    self.load_model()
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/model_executor/model_runner.py", line 592, in load_model
+    self.model = self.model_loader.load_model(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/model_loader/loader.py", line 259, in load_model
+    jit_model = self._get_model(model, model_config)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/model_loader/loader.py", line 313, in _get_model
+    model.load_weights(model_config)
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/models/qwen3.py", line 439, in load_weights
+    loader.load_weights_from_safetensors(weight_mappings)
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/utils/weight_utils.py", line 2155, in load_weights_from_safetensors
+    self._process_and_assign_weight(params, hf_key, lazy_weight, mapping)
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/utils/weight_utils.py", line 2583, in _process_and_assign_weight
+    processed_weight = jnp.transpose(processed_weight, (1, 0))
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/numpy/lax_numpy.py", line 1164, in transpose
+    return lax.transpose(a, axes_)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/lax/lax.py", line 3176, in transpose
+    return transpose_p.bind(operand, permutation=permutation)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/core.py", line 724, in bind
+    return self.bind_with_trace(prev_trace, args, avals, params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/core.py", line 732, in bind_with_trace
+    return trace.process_primitive(self, args, params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/core.py", line 1306, in process_primitive
+    return primitive.impl(*args, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/dispatch.py", line 88, in apply_primitive
+    outs = fun(*args)
+           ^^^^^^^^^^
+RuntimeError: TT_FATAL @ external/+http_archive+tt_metal/ttnn/core/distributed/api.cpp:90: tensor_shards.size() == mesh_shape.mesh_size()
+info:
+Number of tensor shards must match mesh size
+backtrace:
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x36a6362) [0x775f4caa6362]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x15089b9) [0x775f4a9089b9]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x14bfe72) [0x775f4a8bfe72]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x8d434c) [0x775f49cd434c]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x8d4f95) [0x775f49cd4f95]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x923e79) [0x775f49d23e79]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x914f56) [0x775f49d14f56]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x922024) [0x775f49d22024]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x916aa0) [0x775f49d16aa0]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x3b0ea3d) [0x77606bd26a3d]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x3dba0a8) [0x77606bfd20a8]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x3a67235) [0x77606bc7f235]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x3a6ea7b) [0x77606bc86a7b]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x3a6e8ef) [0x77606bc868ef]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x3c73dce) [0x77606be8bdce]
+ --- sglang::scheduler(PyObject_Vectorcall+0x35) [0x5499b5]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0xadf) [0x5d710f]
+ --- sglang::scheduler(_PyObject_Call_Prepend+0xc2) [0x54a802]
+ --- sglang::scheduler() [0x5a3778]
+ --- sglang::scheduler(PyObject_Call+0x6c) [0x54b12c]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0x4cbe) [0x5db2ee]
+ --- sglang::scheduler(PyObject_Vectorcall+0x35) [0x5499b5]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x7bc24f9) [0x77606fdda4f9]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x7bc0a4f) [0x77606fdd8a4f]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0x4cbe) [0x5db2ee]
+ --- sglang::scheduler() [0x6fa365]
+ --- sglang::scheduler() [0x64f6fd]
+ --- sglang::scheduler(PyObject_Call+0x115) [0x54b1d5]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0x4cbe) [0x5db2ee]
+ --- sglang::scheduler(_PyObject_Call_Prepend+0x18a) [0x54a8ca]
+ --- sglang::scheduler() [0x59e0ff]
+ --- sglang::scheduler() [0x599bd3]
+ --- sglang::scheduler(_PyObject_MakeTpCall+0x13e) [0x54907e]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0xadf) [0x5d710f]
+ --- sglang::scheduler(_PyObject_Call_Prepend+0x18a) [0x54a8ca]
+ --- sglang::scheduler() [0x59e0ff]
+ --- sglang::scheduler() [0x599bd3]
+ --- sglang::scheduler(_PyObject_MakeTpCall+0x13e) [0x54907e]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0xadf) [0x5d710f]
+ --- sglang::scheduler(_PyObject_Call_Prepend+0xc2) [0x54a802]
+ --- sglang::scheduler() [0x59e0ff]
+ --- sglang::scheduler() [0x599bd3]
+ --- sglang::scheduler(_PyObject_MakeTpCall+0x75) [0x548fb5]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0xadf) [0x5d710f]
+ --- sglang::scheduler(PyEval_EvalCode+0x15b) [0x5d55eb]
+ --- sglang::scheduler(PyRun_StringFlags+0xd3) [0x608733]
+ --- sglang::scheduler(PyRun_SimpleStringFlags+0x3e) [0x6b40de]
+ --- sglang::scheduler(Py_RunMain+0x481) [0x6bcda1]
+ --- sglang::scheduler(Py_BytesMain+0x2d) [0x6bc7bd]
+ --- /lib/x86_64-linux-gnu/libc.so.6(+0x2a1ca) [0x776077e2a1ca]
+ --- /lib/x86_64-linux-gnu/libc.so.6(__libc_start_main+0x8b) [0x776077e2a28b]
+ --- sglang::scheduler(_start+0x25) [0x657a05]
+
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+
+[2026-09-23 22:56:13] Received sigquit from a child process. It usually means the child failed.

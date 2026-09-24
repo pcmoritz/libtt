@@ -1,0 +1,52 @@
+{
+  "sequential": {
+    "short": {
+      "tp1": {
+        "prompt_tokens": 5,
+        "completion_tokens": 128,
+        "ttft_s": 0.0789198549973662,
+        "e2e_s": 3.7251368630022625,
+        "decode_tokens_per_s": 34.83275952191444,
+        "tpot_ms": 28.70860688975466
+      },
+      "tp2": {
+        "prompt_tokens": 5,
+        "completion_tokens": 128,
+        "ttft_s": 0.05841272600082448,
+        "e2e_s": 2.554580526000791,
+        "decode_tokens_per_s": 50.8793937527669,
+        "tpot_ms": 19.65432223621215
+      },
+      "speedup": 1.460676514037224,
+      "tp2_improvement": 0.0370393052583986
+    },
+    "long": {
+      "tp1": {
+        "prompt_tokens": 199,
+        "completion_tokens": 128,
+        "ttft_s": 0.10818269599985797,
+        "e2e_s": 3.869205253002292,
+        "decode_tokens_per_s": 33.767938965308545,
+        "tpot_ms": 29.61388911024001
+      },
+      "tp2": {
+        "prompt_tokens": 199,
+        "completion_tokens": 128,
+        "ttft_s": 0.07850066899845842,
+        "e2e_s": 2.66847626299932,
+        "decode_tokens_per_s": 49.03408584400775,
+        "tpot_ms": 20.393976614172075
+      },
+      "speedup": 1.452089980806435,
+      "tp2_improvement": 0.0338126121794502
+    }
+  },
+  "concurrent": {
+    "1": 59.72977629970813,
+    "2": 83.11527084253656
+  },
+  "outputs_unchanged": {
+    "1": true,
+    "2": true
+  }
+}

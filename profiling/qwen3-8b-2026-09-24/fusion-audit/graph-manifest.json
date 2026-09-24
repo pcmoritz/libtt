@@ -1,0 +1,44 @@
+[
+  {
+    "tp": "tp1",
+    "phase": "prefill",
+    "source": "/tmp/libtt-profile/fusion-audit/tp1/irs/ttnn_1790222570687.mlir",
+    "saved": "graphs/tp1/irs/ttnn_prefill.mlir.gz",
+    "uncompressed_sha256": "aa0a244234f69f4c8a81d461d677bc3cf6e19f3edfbfa25d54e08dde2ae65aad"
+  },
+  {
+    "tp": "tp1",
+    "phase": "decode_b1",
+    "source": "/tmp/libtt-profile/fusion-audit/tp1/irs/ttnn_1790222593052.mlir",
+    "saved": "graphs/tp1/irs/ttnn_decode_b1.mlir.gz",
+    "uncompressed_sha256": "62d0dfd7d55a18e76175b36c6c4b34ae0df8075714534eec5a7528a191552fed"
+  },
+  {
+    "tp": "tp1",
+    "phase": "decode_b2",
+    "source": "/tmp/libtt-profile/fusion-audit/tp1/irs/ttnn_1790222910914.mlir",
+    "saved": "graphs/tp1/irs/ttnn_decode_b2.mlir.gz",
+    "uncompressed_sha256": "3c90e6f3d0c844f0250d204072823ecfddd52ead4ce5a9fa228ae1b6e535aeb8"
+  },
+  {
+    "tp": "tp2",
+    "phase": "prefill",
+    "source": "/tmp/libtt-profile/fusion-audit/tp2/irs/ttnn_1790222672261.mlir",
+    "saved": "graphs/tp2/irs/ttnn_prefill.mlir.gz",
+    "uncompressed_sha256": "f773ebc6d810cb9ca2cf0d8daa0b964e0fc56f0a6f4eee533bb3b9644b5927bc"
+  },
+  {
+    "tp": "tp2",
+    "phase": "decode_b1",
+    "source": "/tmp/libtt-profile/fusion-audit/tp2/irs/ttnn_1790222685211.mlir",
+    "saved": "graphs/tp2/irs/ttnn_decode_b1.mlir.gz",
+    "uncompressed_sha256": "e3bafa52e6688ba5d96b051e57bae143c4a7809ef0ecd15dea118b2abec21ca6"
+  },
+  {
+    "tp": "tp2",
+    "phase": "decode_b2",
+    "source": "/tmp/libtt-profile/fusion-audit/tp2/irs/ttnn_1790222783540.mlir",
+    "saved": "graphs/tp2/irs/ttnn_decode_b2.mlir.gz",
+    "uncompressed_sha256": "76c0a16826d2fd7cbc5fd775f10a84fb297f0ec1b1050c3691635bda4c9ce6f9"
+  }
+]
