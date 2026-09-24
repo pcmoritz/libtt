@@ -1,0 +1,51 @@
+"""Check fused SwiGLU projections and unsupported-shape fallbacks."""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+
+@pytest.mark.parametrize(
+    "rows,inner_size,width",
+    [
+        (1, 64, n)
+        for n in (3072, 3104, 4096, 6144, 6176, 8704, 9216, 12256, 12288, 12320)
+    ]
+    + [
+        (1, 32, 6144),
+        (1, 96, 6144),
+        (1, 4096, 6144),
+        (1, 4096, 12288),
+        (1, 5120, 8704),
+        (2, 512, 8704),
+        (32, 512, 6144),
+    ],
+)
+def test_swiglu_projection_width(rows, inner_size, width):
+    def swiglu(x, weights):
+        weights = weights[None]
+        weights = jax.ffi.ffi_call(
+            "tt.weight_dtype_override",
+            jax.ShapeDtypeStruct(weights.shape, weights.dtype),
+            vmap_method="sequential",
+        )(weights, **{"ttcore.weight_dtype": "bfp_bf8"})[0]
+        up, gate = jnp.split(x @ weights, 2, axis=-1)
+        return up * jax.nn.silu(gate)
+
+    run = jax.jit(
+        swiglu,
+        compiler_options={"optimization_level": "O1", "enable_trace": "true"},
+    )
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(6)
+    for _ in range(3):
+        # Exactly representable BFP8 weights keep this focused on the fusion.
+        x = (rng.integers(-4, 5, (rows, inner_size)) / 16).astype(jnp.bfloat16)
+        weights = (rng.integers(-4, 5, (inner_size, 2 * width)) / 16).astype(jnp.bfloat16)
+        actual = run(jax.device_put(x, device), jax.device_put(weights, device))
+        up, gate = np.split(x.astype(np.float32) @ weights.astype(np.float32), 2, axis=-1)
+        expected = up * gate / (1 + np.exp(-gate))
+        np.testing.assert_allclose(
+            np.asarray(actual).astype(np.float32), expected, atol=0.01, rtol=0.04
+        )

@@ -1,0 +1,785 @@
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+usage: launch_server.py [-h] --model-path MODEL_PATH
+                        [--tokenizer-path TOKENIZER_PATH]
+                        [--tokenizer-mode {auto,slow}]
+                        [--tokenizer-backend {huggingface,fastokens}]
+                        [--skip-tokenizer-init]
+                        [--load-format {auto,pt,safetensors,npcache,dummy,sharded_state,gguf,bitsandbytes,layered,remote}]
+                        [--model-loader-extra-config MODEL_LOADER_EXTRA_CONFIG]
+                        [--trust-remote-code]
+                        [--context-length CONTEXT_LENGTH] [--is-embedding]
+                        [--revision REVISION] [--model-impl MODEL_IMPL]
+                        [--model-layer-nums MODEL_LAYER_NUMS]
+                        [--grammar-backend {llguidance,none}] [--host HOST]
+                        [--port PORT] [--skip-server-warmup]
+                        [--warmups WARMUPS]
+                        [--dtype {auto,half,float16,bfloat16,float,float32}]
+                        [--dtype-config DTYPE_CONFIG]
+                        [--quantization {awq,fp8,gptq,marlin,gptq_marlin,awq_marlin,bitsandbytes,gguf,modelopt,modelopt_fp4,petit_nvfp4,w8a8_int8,w8a8_fp8,moe_wna16,qoq,w4afp8}]
+                        [--quantization-param-path QUANTIZATION_PARAM_PATH]
+                        [--quantization-config-path QUANTIZATION_CONFIG_PATH]
+                        [--kv-cache-dtype {auto,fp8_e5m2,fp8_e4m3,bf16}]
+                        [--mem-fraction-static MEM_FRACTION_STATIC]
+                        [--max-running-requests MAX_RUNNING_REQUESTS]
+                        [--max-total-tokens MAX_TOTAL_TOKENS]
+                        [--chunked-prefill-size CHUNKED_PREFILL_SIZE]
+                        [--enable-mixed-chunk]
+                        [--max-prefill-tokens MAX_PREFILL_TOKENS]
+                        [--disable-overlap-schedule]
+                        [--schedule-policy {lpm,random,fcfs,dfs-weight}]
+                        [--schedule-conservativeness SCHEDULE_CONSERVATIVENESS]
+                        [--page-size PAGE_SIZE]
+                        [--swa-full-tokens-ratio SWA_FULL_TOKENS_RATIO]
+                        [--recurrent-state-memory-ratio RECURRENT_STATE_MEMORY_RATIO]
+                        [--max-recurrent-state-size MAX_RECURRENT_STATE_SIZE]
+                        [--recurrent-track-interval RECURRENT_TRACK_INTERVAL]
+                        [--disable-hybrid-swa-memory] [--device DEVICE]
+                        [--device-indexes DEVICE_INDEXES [DEVICE_INDEXES ...]]
+                        [--pd-disaggregation [{,pathways}]]
+                        [--pd-prefill-mem-fraction PD_PREFILL_MEM_FRACTION]
+                        [--pd-decode-mem-fraction PD_DECODE_MEM_FRACTION]
+                        [--pd-prefill-max-tokens PD_PREFILL_MAX_TOKENS]
+                        [--pd-decode-max-tokens PD_DECODE_MAX_TOKENS]
+                        [--pd-num-prefill PD_NUM_PREFILL]
+                        [--pd-num-decode PD_NUM_DECODE]
+                        [--pd-prefill-tp-size PD_PREFILL_TP_SIZE]
+                        [--pd-prefill-ep-size PD_PREFILL_EP_SIZE]
+                        [--tensor-parallel-size TENSOR_PARALLEL_SIZE]
+                        [--ep-size EP_SIZE]
+                        [--ep-num-redundant-experts EP_NUM_REDUNDANT_EXPERTS]
+                        [--ep-dispatch-algorithm {static,dynamic,fake}]
+                        [--enable-sequence-parallel]
+                        [--stream-interval STREAM_INTERVAL] [--stream-output]
+                        [--random-seed RANDOM_SEED]
+                        [--constrained-json-whitespace-pattern CONSTRAINED_JSON_WHITESPACE_PATTERN]
+                        [--constrained-json-disable-any-whitespace]
+                        [--watchdog-timeout WATCHDOG_TIMEOUT]
+                        [--dist-timeout DIST_TIMEOUT]
+                        [--download-dir DOWNLOAD_DIR] [--sleep-on-idle]
+                        [--log-level LOG_LEVEL]
+                        [--log-level-http LOG_LEVEL_HTTP] [--log-requests]
+                        [--log-requests-level {0,1,2,3}]
+                        [--crash-dump-folder CRASH_DUMP_FOLDER]
+                        [--show-time-cost] [--enable-metrics]
+                        [--enable-metrics-for-all-schedulers]
+                        [--bucket-time-to-first-token BUCKET_TIME_TO_FIRST_TOKEN [BUCKET_TIME_TO_FIRST_TOKEN ...]]
+                        [--bucket-inter-token-latency BUCKET_INTER_TOKEN_LATENCY [BUCKET_INTER_TOKEN_LATENCY ...]]
+                        [--bucket-e2e-request-latency BUCKET_E2E_REQUEST_LATENCY [BUCKET_E2E_REQUEST_LATENCY ...]]
+                        [--decode-log-interval DECODE_LOG_INTERVAL]
+                        [--enable-request-time-stats-logging]
+                        [--kv-events-config KV_EVENTS_CONFIG]
+                        [--api-key API_KEY]
+                        [--served-model-name SERVED_MODEL_NAME]
+                        [--file-storage-path FILE_STORAGE_PATH]
+                        [--enable-cache-report]
+                        [--reasoning-parser {deepseek-r1,qwen3,mimo,kimi,glm45,gemma4,ling3}]
+                        [--tool-call-parser {qwen25,qwen3_coder,mimo,glm47,glm45,ling3}]
+                        [--enable-dp-lm-head]
+                        [--data-parallel-size DATA_PARALLEL_SIZE]
+                        [--moe-data-parallel-size MOE_DP_SIZE]
+                        [--dp-schedule-policy {round_robin,min_running_queue,cache_aware,force_cache_aware,shape_aware}]
+                        [--dist-init-addr DIST_INIT_ADDR] [--nnodes NNODES]
+                        [--node-rank NODE_RANK]
+                        [--json-model-override-args JSON_MODEL_OVERRIDE_ARGS]
+                        [--preferred-sampling-params PREFERRED_SAMPLING_PARAMS]
+                        [--disable-radix-cache] [--enable-unified-radix-tree]
+                        [--hicache-storage {disable,none,file}]
+                        [--hicache-ratio HICACHE_RATIO]
+                        [--hicache-write-through-threshold HICACHE_WRITE_THROUGH_THRESHOLD]
+                        [--hicache-write-policy {write_through,write_through_selective,write_back}]
+                        [--enable-recurrent-extra-buffer]
+                        [--allow-auto-truncate]
+                        [--enable-tokenizer-batch-encode]
+                        [--enable-precision-tracer]
+                        [--enable-expert-balance-debug]
+                        [--expert-balance-segment-counter EXPERT_BALANCE_SEGMENT_COUNTER]
+                        [--expert-balance-output-file EXPERT_BALANCE_OUTPUT_FILE]
+                        [--init-expert-location INIT_EXPERT_LOCATION]
+                        [--enable-expert-distribution-recorder]
+                        [--expert-distribution-recorder-buffer-size EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE]
+                        [--expert-distribution-recorder-output-file EXPERT_DISTRIBUTION_RECORDER_OUTPUT_FILE]
+                        [--max-seq-len MAX_SEQ_LEN]
+                        [--precompile-token-paddings PRECOMPILE_TOKEN_PADDINGS [PRECOMPILE_TOKEN_PADDINGS ...]]
+                        [--precompile-bs-paddings PRECOMPILE_BS_PADDINGS [PRECOMPILE_BS_PADDINGS ...]]
+                        [--precompile-vision-patch-paddings PRECOMPILE_VISION_PATCH_PADDINGS [PRECOMPILE_VISION_PATCH_PADDINGS ...]]
+                        [--vision-encoder-parallel {dp,tp}]
+                        [--disable-precompile]
+                        [--attention-backend {native,fa,fa_mha,dsa_sparse,tt}]
+                        [--gdn-prefill-impl {chunked_jax,fused_chunk_parallel}]
+                        [--dsa-use-pallas]
+                        [--moe-backend {epmoe,fused,fused_v2,auto}]
+                        [--disable-jax-allreduce-metadata]
+                        [--disable-topk-kernel] [--enable-nan-detection]
+                        [--speculative-algorithm {EAGLE,EAGLE3,NEXTN,STANDALONE,DFLASH,DSPARK}]
+                        [--speculative-draft-model-path SPECULATIVE_DRAFT_MODEL_PATH]
+                        [--speculative-draft-model-revision SPECULATIVE_DRAFT_MODEL_REVISION]
+                        [--speculative-num-steps SPECULATIVE_NUM_STEPS]
+                        [--speculative-eagle-topk SPECULATIVE_EAGLE_TOPK]
+                        [--speculative-num-draft-tokens SPECULATIVE_NUM_DRAFT_TOKENS]
+                        [--speculative-sample-from-anchor]
+                        [--speculative-accept-threshold-single SPECULATIVE_ACCEPT_THRESHOLD_SINGLE]
+                        [--speculative-accept-threshold-acc SPECULATIVE_ACCEPT_THRESHOLD_ACC]
+                        [--enable-deterministic-sampling]
+                        [--enable-single-process] [--multimodal]
+                        [--limit-mm-data-per-request LIMIT_MM_DATA_PER_REQUEST]
+                        [--mm-processor-worker-num MM_PROCESSOR_WORKER_NUM]
+                        [--enable-lora] [--lora-paths [LORA_PATHS ...]]
+                        [--max-loras-per-batch MAX_LORAS_PER_BATCH]
+                        [--max-lora-rank MAX_LORA_RANK]
+                        [--max-loaded-loras MAX_LOADED_LORAS]
+                        [--lora-target-modules [{q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,all} ...]]
+                        [--lora-eviction-policy {lru}] [--enable-static-lora]
+                        [--lora-scaling LORA_SCALING]
+                        [--enable-engine-loop-run-forever-daemon]
+                        [--enable-return-routed-experts]
+                        [--disaggregation-enable-d2h | --no-disaggregation-enable-d2h]
+                        [--disaggregation-use-raiden | --no-disaggregation-use-raiden]
+                        [--disaggregation-enable-overlap-schedule | --no-disaggregation-enable-overlap-schedule]
+                        [--disaggregation-enable-chunk-prefill-transfer | --no-disaggregation-enable-chunk-prefill-transfer]
+                        [--disaggregation-side-channel-port DISAGGREGATION_SIDE_CHANNEL_PORT]
+                        [--disaggregation-mode {null,prefill,decode}]
+                        [--disaggregation-bootstrap-url DISAGGREGATION_BOOTSTRAP_URL]
+                        [--disaggregation-bootstrap-port DISAGGREGATION_BOOTSTRAP_PORT]
+                        [--disaggregation-transfer-port DISAGGREGATION_TRANSFER_PORT]
+                        [--disaggregation-d2h-pool-size DISAGGREGATION_D2H_POOL_SIZE]
+                        [--disaggregation-d2h-max-tokens DISAGGREGATION_D2H_MAX_TOKENS]
+                        [--disaggregation-host-ip DISAGGREGATION_HOST_IP]
+                        [--disaggregation-bootstrap-timeout-seconds DISAGGREGATION_BOOTSTRAP_TIMEOUT_SECONDS]
+                        [--disaggregation-pull-timeout-seconds DISAGGREGATION_PULL_TIMEOUT_SECONDS]
+                        [--disaggregation-ack-timeout-seconds DISAGGREGATION_ACK_TIMEOUT_SECONDS]
+                        [--disaggregation-orphan-reaper-interval-seconds DISAGGREGATION_ORPHAN_REAPER_INTERVAL_SECONDS]
+                        [--disaggregation-decode-watchdog-seconds DISAGGREGATION_DECODE_WATCHDOG_SECONDS]
+                        [--disaggregation-num-reserved-decode-tokens DISAGGREGATION_NUM_RESERVED_DECODE_TOKENS]
+                        [--disaggregation-max-inflight-transfers DISAGGREGATION_MAX_INFLIGHT_TRANSFERS]
+                        [--disaggregation-shared-secret DISAGGREGATION_SHARED_SECRET]
+                        [--disaggregation-channel-number DISAGGREGATION_CHANNEL_NUMBER]
+                        [--embedded-cfg-scale EMBEDDED_CFG_SCALE]
+                        [--flow-shift FLOW_SHIFT]
+                        [--dit-precision {fp32,fp16,bf16}]
+                        [--vae-precision {fp32,fp16,bf16}] [--vae-tiling]
+                        [--vae-sp]
+                        [--text-encoder-precisions {fp32,fp16,bf16} [{fp32,fp16,bf16} ...]]
+                        [--image-encoder-precision {fp32,fp16,bf16}]
+                        [--precompile-width-heights PRECOMPILE_WIDTH_HEIGHTS [PRECOMPILE_WIDTH_HEIGHTS ...]]
+                        [--precompile-frame-paddings PRECOMPILE_FRAME_PADDINGS [PRECOMPILE_FRAME_PADDINGS ...]]
+
+options:
+  -h, --help            show this help message and exit
+  --model-path MODEL_PATH, --model MODEL_PATH
+                        The path of the model weights. This can be a local
+                        folder or a Hugging Face repo ID.
+  --tokenizer-path TOKENIZER_PATH
+                        The path of the tokenizer.
+  --tokenizer-mode {auto,slow}
+                        Tokenizer mode. 'auto' will use the fast tokenizer if
+                        available, and 'slow' will always use the slow
+                        tokenizer.
+  --tokenizer-backend {huggingface,fastokens}
+                        Tokenizer backend. 'huggingface' uses the default
+                        HuggingFace tokenizers library, and 'fastokens' uses
+                        the fastokens library for faster tokenization. The
+                        fastokens patch is process-wide after it is enabled.
+                        Requires the fastokens package to be installed: pip
+                        install 'sglang-jax[fastokens]'.
+  --skip-tokenizer-init
+                        If set, skip init tokenizer and pass input_ids in
+                        generate request.
+  --load-format {auto,pt,safetensors,npcache,dummy,sharded_state,gguf,bitsandbytes,layered,remote}
+                        The format of the model weights to load. "auto" will
+                        try to load the weights in the safetensors format and
+                        fall back to the jax format if safetensors format is
+                        not available. "jax" will load the weights in the jax
+                        format. "safetensors" will load the weights in the
+                        safetensors format. "npcache" will load the weights in
+                        jax format and store a numpy cache to speed up the
+                        loading. "dummy" will initialize the weights with
+                        random values, which is mainly for profiling."gguf"
+                        will load the weights in the gguf format.
+                        "bitsandbytes" will load the weights using
+                        bitsandbytes quantization."layered" loads weights
+                        layer by layer so that one can quantize a layer before
+                        loading another to make the peak memory envelope
+                        smaller.
+  --model-loader-extra-config MODEL_LOADER_EXTRA_CONFIG
+                        Extra config for model loader. This will be passed to
+                        the model loader corresponding to the chosen
+                        load_format.
+  --trust-remote-code   Whether or not to allow for custom models defined on
+                        the Hub in their own modeling files.
+  --context-length CONTEXT_LENGTH
+                        The model's maximum context length. Defaults to None
+                        (will use the value from the model's config.json
+                        instead).
+  --is-embedding        Whether to use a CausalLM as an embedding model.
+  --revision REVISION   The specific model version to use. It can be a branch
+                        name, a tag name, or a commit id. If unspecified, will
+                        use the default version.
+  --model-impl MODEL_IMPL
+                        Which implementation of the model to use. * "auto"
+                        will try to use the SGLang implementation if it exists
+                        and fall back to the Transformers implementation if no
+                        SGLang implementation is available. * "sglang" will
+                        use the SGLang model implementation. * "transformers"
+                        will use the Transformers model implementation.
+  --model-layer-nums MODEL_LAYER_NUMS
+                        Number of model layers to load and use for inference.
+                        If not specified, uses the value from model config.
+  --grammar-backend {llguidance,none}
+                        Choose the backend for grammar-guided decoding.
+  --host HOST           The host of the HTTP server.
+  --port PORT           The port of the HTTP server.
+  --skip-server-warmup  If set, skip warmup.
+  --warmups WARMUPS     Specify custom warmup functions (csv) to run before
+                        server starts eg. --warmups=warmup_name1,warmup_name2
+                        will run the functions `warmup_name1` and
+                        `warmup_name2` specified in warmup.py before the
+                        server starts listening for requests
+  --dtype {auto,half,float16,bfloat16,float,float32}
+                        Data type for model weights and activations. * "auto"
+                        will use FP16 precision for FP32 and FP16 models, and
+                        BF16 precision for BF16 models. * "half" for FP16.
+                        Recommended for AWQ quantization. * "float16" is the
+                        same as "half". * "bfloat16" for a balance between
+                        precision and range. * "float" is shorthand for FP32
+                        precision. * "float32" for FP32 precision.
+  --dtype-config DTYPE_CONFIG
+                        Config in JSON format (or path to a JSON file) to set
+                        specific dtypes for different submodules.
+  --quantization {awq,fp8,gptq,marlin,gptq_marlin,awq_marlin,bitsandbytes,gguf,modelopt,modelopt_fp4,petit_nvfp4,w8a8_int8,w8a8_fp8,moe_wna16,qoq,w4afp8}
+                        The quantization method.
+  --quantization-param-path QUANTIZATION_PARAM_PATH
+                        Path to the JSON file containing the KV cache scaling
+                        factors. This should generally be supplied, when KV
+                        cache dtype is FP8. Otherwise, KV cache scaling
+                        factors default to 1.0, which may cause accuracy
+                        issues.
+  --quantization-config-path QUANTIZATION_CONFIG_PATH
+                        Path to quantization config YAML file. Can be an
+                        absolute path, relative path, or just a filename (will
+                        look up in built-in configs). Built-in configs:
+                        int8.yaml, fp8.yaml, fp8_w8a8.yaml
+  --kv-cache-dtype {auto,fp8_e5m2,fp8_e4m3,bf16}
+                        Data type for kv cache storage. "auto" will use model
+                        data type. "fp8_e5m2" and "fp8_e4m3" is supported for
+                        CUDA 11.8+.
+  --mem-fraction-static MEM_FRACTION_STATIC
+                        The fraction of the memory used for static allocation
+                        (model weights and KV cache memory pool). Use a
+                        smaller value if you see out-of-memory errors.
+  --max-running-requests MAX_RUNNING_REQUESTS
+                        The maximum number of running requests.
+  --max-total-tokens MAX_TOTAL_TOKENS
+                        The maximum number of tokens in the memory pool. If
+                        not specified, it will be automatically calculated
+                        based on the memory usage fraction. This option is
+                        typically used for development and debugging purposes.
+  --chunked-prefill-size CHUNKED_PREFILL_SIZE
+                        The maximum number of tokens in a chunk for the
+                        chunked prefill. Setting this to -1 means disabling
+                        chunked prefill.
+  --enable-mixed-chunk  Enabling mixing prefill and decode in a batch when
+                        using chunked prefill.
+  --max-prefill-tokens MAX_PREFILL_TOKENS
+                        The maximum number of tokens in a prefill batch. The
+                        real bound will be the maximum of this value and the
+                        model's maximum context length.
+  --disable-overlap-schedule
+                        Disable the overlap scheduler, which overlaps the CPU
+                        scheduler with GPU model worker.
+  --schedule-policy {lpm,random,fcfs,dfs-weight}
+                        The scheduling policy of the requests.
+  --schedule-conservativeness SCHEDULE_CONSERVATIVENESS
+                        How conservative the schedule policy is. A larger
+                        value means more conservative scheduling. Use a larger
+                        value if you see requests being retracted frequently.
+  --page-size PAGE_SIZE
+                        The number of tokens in a page.
+  --swa-full-tokens-ratio SWA_FULL_TOKENS_RATIO
+                        The ratio of SWA layer KV tokens / full layer KV
+                        tokens, regardless of the number of swa:full layers.
+                        It should be between 0 and 1. E.g. 0.5 means if each
+                        swa layer has 50 tokens, then each full layer has 100
+                        tokens.
+  --recurrent-state-memory-ratio RECURRENT_STATE_MEMORY_RATIO
+                        Ratio of recurrent state memory to KV cache memory for
+                        hybrid recurrent models (e.g. Kimi-Linear).
+                        state_budget = available * ratio / (1 + ratio). Used
+                        only when --max-recurrent-state-size is unset and
+                        either radix cache is enabled or --max-running-
+                        requests is unset. Default 0.9.
+  --max-recurrent-state-size MAX_RECURRENT_STATE_SIZE
+                        Total recurrent state slots across all DP ranks for
+                        hybrid models. Resolution priority: (1) this flag, (2)
+                        --max-running-requests when --disable-radix-cache, (3)
+                        derived from --recurrent-state-memory-ratio and
+                        available HBM. Must be divisible by dp_size when set
+                        explicitly.
+  --recurrent-track-interval RECURRENT_TRACK_INTERVAL
+                        Recurrent radix cache: page-boundary interval at which
+                        a recurrent track state is committed. Requires
+                        --enable-recurrent-extra-buffer and must be a positive
+                        multiple of --page-size. Defaults to --chunked-
+                        prefill-size when extra-buffer is enabled (falls back
+                        to --page-size if chunked prefill is off).
+  --disable-hybrid-swa-memory
+                        Disable the hybrid SWA memory.
+  --device DEVICE       The device to use ('cuda', 'xpu', 'hpu', 'npu',
+                        'cpu'). Defaults to auto-detection if not specified.
+  --device-indexes DEVICE_INDEXES [DEVICE_INDEXES ...]
+                        The device indexes to use build mesh. Defaults is all
+                        if not specified.
+  --pd-disaggregation [{,pathways}]
+                        In-process P/D split: 'pathways' = single-controller
+                        cross-slice IFRT device_put (requires Pathways proxy
+                        backend + >=2 slices).
+  --pd-prefill-mem-fraction PD_PREFILL_MEM_FRACTION
+  --pd-decode-mem-fraction PD_DECODE_MEM_FRACTION
+  --pd-prefill-max-tokens PD_PREFILL_MAX_TOKENS
+  --pd-decode-max-tokens PD_DECODE_MAX_TOKENS
+  --pd-num-prefill PD_NUM_PREFILL
+                        Number of prefill slices for pathways PD (Stage 6
+                        multi-P).
+  --pd-num-decode PD_NUM_DECODE
+                        Number of decode slices for pathways PD (1P-ND fan-
+                        out).
+  --pd-prefill-tp-size PD_PREFILL_TP_SIZE
+                        Prefill-side tp_size for pathways PD hetero-TP (Stage
+                        6 P-D-different-tp). 0 = same as --tp-size (D side).
+  --pd-prefill-ep-size PD_PREFILL_EP_SIZE
+                        Prefill-side ep_size for pathways PD hetero-TP. 0 =
+                        scale ep_size by tp_p/tp_d.
+  --tensor-parallel-size TENSOR_PARALLEL_SIZE, --tp-size TENSOR_PARALLEL_SIZE
+                        The tensor parallelism size.
+  --ep-size EP_SIZE     The expert parallelism size
+  --ep-num-redundant-experts EP_NUM_REDUNDANT_EXPERTS
+                        Number of redundant experts for EP load balancing.
+                        Total physical experts = num_logical + this value.
+  --ep-dispatch-algorithm {static,dynamic,fake}
+                        Expert parallel dispatch algorithm.
+  --enable-sequence-parallel
+                        Enable sequence parallelism.
+  --stream-interval STREAM_INTERVAL
+                        The interval (or buffer size) for streaming in terms
+                        of the token length. A smaller value makes streaming
+                        smoother, while a larger value makes the throughput
+                        higher
+  --stream-output       Whether to output as a sequence of disjoint segments.
+  --random-seed RANDOM_SEED
+                        The random seed.
+  --constrained-json-whitespace-pattern CONSTRAINED_JSON_WHITESPACE_PATTERN
+                        (llguidance backends only) Regex pattern for syntactic
+                        whitespaces allowed in JSON constrained output. For
+                        example, to allow the model generate consecutive
+                        whitespaces, set the pattern to [ ]*
+  --constrained-json-disable-any-whitespace
+                        (llguidance backends only) Enforce compact
+                        representation in JSON constrained output.
+  --watchdog-timeout WATCHDOG_TIMEOUT
+                        Set watchdog timeout in seconds. If a forward batch
+                        takes longer than this, the server will crash to
+                        prevent hanging.
+  --dist-timeout DIST_TIMEOUT
+                        Set timeout for jax.distributed initialization.
+  --download-dir DOWNLOAD_DIR
+                        Model download directory for huggingface.
+  --sleep-on-idle       Reduce CPU usage when sglang is idle.
+  --log-level LOG_LEVEL
+                        The logging level of all loggers.
+  --log-level-http LOG_LEVEL_HTTP
+                        The logging level of HTTP server. If not set, reuse
+                        --log-level by default.
+  --log-requests        Log metadata, inputs, outputs of all requests. The
+                        verbosity is decided by --log-requests-level
+  --log-requests-level {0,1,2,3}
+                        0: Log metadata (no sampling parameters). 1: Log
+                        metadata and sampling parameters. 2: Log metadata,
+                        sampling parameters and partial input/output. 3: Log
+                        every input/output.
+  --crash-dump-folder CRASH_DUMP_FOLDER
+                        Folder path to dump requests from the last 5 min
+                        before a crash (if any). If not specified, crash
+                        dumping is disabled.
+  --show-time-cost      Show time cost of custom marks.
+  --enable-metrics      Enable log prometheus metrics.
+  --enable-metrics-for-all-schedulers
+                        Enable --enable-metrics-for-all-schedulers when you
+                        want schedulers on all TP ranks (not just TP 0) to
+                        record request metrics separately. This is especially
+                        useful when dp_attention is enabled, as otherwise all
+                        metrics appear to come from TP 0.
+  --bucket-time-to-first-token BUCKET_TIME_TO_FIRST_TOKEN [BUCKET_TIME_TO_FIRST_TOKEN ...]
+                        The buckets of time to first token, specified as a
+                        list of floats.
+  --bucket-inter-token-latency BUCKET_INTER_TOKEN_LATENCY [BUCKET_INTER_TOKEN_LATENCY ...]
+                        The buckets of inter-token latency, specified as a
+                        list of floats.
+  --bucket-e2e-request-latency BUCKET_E2E_REQUEST_LATENCY [BUCKET_E2E_REQUEST_LATENCY ...]
+                        The buckets of end-to-end request latency, specified
+                        as a list of floats.
+  --decode-log-interval DECODE_LOG_INTERVAL
+                        The log interval of decode batch.
+  --enable-request-time-stats-logging
+                        Enable per request time stats logging
+  --kv-events-config KV_EVENTS_CONFIG
+                        Config in json format for NVIDIA dynamo KV event
+                        publishing. Publishing will be enabled if this flag is
+                        used.
+  --api-key API_KEY     Set API key of the server. It is also used in the
+                        OpenAI API compatible server.
+  --served-model-name SERVED_MODEL_NAME
+                        Override the model name returned by the v1/models
+                        endpoint in OpenAI API server.
+  --file-storage-path FILE_STORAGE_PATH
+                        The path of the file storage in backend.
+  --enable-cache-report
+                        Return number of cached tokens in
+                        usage.prompt_tokens_details for each openai request.
+  --reasoning-parser {deepseek-r1,qwen3,mimo,kimi,glm45,gemma4,ling3}
+                        Specify the parser for reasoning models, supported
+                        parsers are: ['deepseek-r1', 'qwen3', 'mimo', 'kimi',
+                        'glm45', 'gemma4', 'ling3'].
+  --tool-call-parser {qwen25,qwen3_coder,mimo,glm47,glm45,ling3}
+                        Specify the parser for handling tool-call
+                        interactions. Options include: ['qwen25',
+                        'qwen3_coder', 'mimo', 'glm47', 'glm45', 'ling3'].
+  --enable-dp-lm-head   Run the LM head within each data-parallel group
+                        (TP/DP). By default the LM head shards vocabulary over
+                        the full TP group.
+  --data-parallel-size DATA_PARALLEL_SIZE, --dp-size DATA_PARALLEL_SIZE
+                        The data parallelism size.
+  --moe-data-parallel-size MOE_DP_SIZE, --moe-dp-size MOE_DP_SIZE
+                        The MoE data parallelism size. The default (1)
+                        preserves the existing EP/TP layout. Replicated MoE
+                        currently requires this to equal --dp-size with --ep-
+                        size 1.
+  --dp-schedule-policy {round_robin,min_running_queue,cache_aware,force_cache_aware,shape_aware}
+                        DP scheduling policy for assigning dp_rank to new
+                        requests. Load-based routing defers unassigned
+                        requests when no rank has room; prefill admission also
+                        checks execution and memory capacity. When unset,
+                        defaults to 'cache_aware' with radix cache enabled and
+                        'min_running_queue' with radix cache disabled or
+                        Pathways PD. 'cache_aware' routes by cache affinity
+                        with soft load balancing: it balances on large load
+                        skew, else picks the least-loaded rank among those
+                        holding a substantial cached prefix, so a hot prefix
+                        spreads across its holders. Improves prefix reuse
+                        under DP. 'force_cache_aware' always chooses the
+                        longest eligible cached prefix, breaking equal-prefix
+                        ties by load, and falls back to shape-aware scheduling
+                        only on a full cache miss. 'shape_aware' balances
+                        input (prefill) and output (decode) token load
+                        jointly, routing to the replica whose bottleneck
+                        dimension stays smallest: score = max(sum_input,
+                        sum_output).
+  --dist-init-addr DIST_INIT_ADDR
+                        The host address for initializing distributed backend
+                        (e.g., `192.168.0.2:25000`).
+  --nnodes NNODES       The number of nodes.
+  --node-rank NODE_RANK
+                        The node rank.
+  --json-model-override-args JSON_MODEL_OVERRIDE_ARGS
+                        A dictionary in JSON string format used to override
+                        default model configurations.
+  --preferred-sampling-params PREFERRED_SAMPLING_PARAMS
+                        json-formatted sampling settings that will be returned
+                        in /get_model_info
+  --disable-radix-cache
+                        Disable RadixAttention for prefix caching.
+  --enable-unified-radix-tree
+                        Route non-hybrid (full-attention) models to
+                        UnifiedRadixCache (component-agnostic prefix cache).
+                        Default off. Also required to route hybrid recurrent
+                        models (e.g. Kimi-Linear) into UnifiedRadixCache.
+  --hicache-storage {disable,none,file}
+                        HiCache KV offloading: 'disable' off, 'none' enables
+                        L1+L2 (host pinned pool), 'file' reserved for L3(not
+                        support yet). Unsupported for linear-recurrent models
+                        under the unified radix tree (rejected at init).
+  --hicache-ratio HICACHE_RATIO
+                        Host (L2) pool size as a multiple of the device KV
+                        pool size.
+  --hicache-write-through-threshold HICACHE_WRITE_THROUGH_THRESHOLD
+                        Min prefix hit_count before a node is backed up (D2H)
+                        to host.
+  --hicache-write-policy {write_through,write_through_selective,write_back}
+                        HiCache D2H backup policy: 'write_through' backs up on
+                        hit (>= threshold); 'write_through_selective' is the
+                        same path with a higher threshold; 'write_back' skips
+                        hit-time backup and only backs up a node when its
+                        device KV is evicted (fewest D2H)
+  --enable-recurrent-extra-buffer
+                        Recurrent radix cache: use the page-aligned ping-pong
+                        track buffer for page_size>=128. Off by default; the
+                        base path supports page_size=1 only.
+  --allow-auto-truncate
+                        Allow automatically truncating requests that exceed
+                        the maximum input length instead of returning an
+                        error.
+  --enable-tokenizer-batch-encode
+                        Enable batch tokenization for improved performance
+                        when processing multiple text inputs. Do not use with
+                        image inputs, pre-tokenized input_ids, or
+                        input_embeds.
+  --enable-precision-tracer
+                        Enable precision tracer for debugging tensor values.
+                        May have performance impact.
+  --enable-expert-balance-debug
+                        Enable expert balance debug stats output (segment-
+                        based).
+  --expert-balance-segment-counter EXPERT_BALANCE_SEGMENT_COUNTER
+                        Segment size for expert balance stats (tokens or
+                        decode steps).
+  --expert-balance-output-file EXPERT_BALANCE_OUTPUT_FILE
+                        CSV output file path for expert balance stats.
+  --init-expert-location INIT_EXPERT_LOCATION
+                        Initial expert location mapping ('trivial' or file
+                        path).
+  --enable-expert-distribution-recorder
+                        Enable expert distribution recorder for EPLB.
+  --expert-distribution-recorder-buffer-size EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE
+                        Number of steps to buffer before dumping expert
+                        distribution.
+  --expert-distribution-recorder-output-file EXPERT_DISTRIBUTION_RECORDER_OUTPUT_FILE
+                        Output file path for expert distribution recorder
+                        (.npy).
+  --max-seq-len MAX_SEQ_LEN
+                        maximum sequence length
+  --precompile-token-paddings PRECOMPILE_TOKEN_PADDINGS [PRECOMPILE_TOKEN_PADDINGS ...]
+                        Set the list of token buckets for jax jit
+  --precompile-bs-paddings PRECOMPILE_BS_PADDINGS [PRECOMPILE_BS_PADDINGS ...]
+                        Set the list of batch sizes buckets for jax jit
+  --precompile-vision-patch-paddings PRECOMPILE_VISION_PATCH_PADDINGS [PRECOMPILE_VISION_PATCH_PADDINGS ...]
+                        JIT buckets for the vision encoder patch dimension.
+  --vision-encoder-parallel {dp,tp}
+                        'dp' (default) load-balances images over all mesh
+                        devices; 'tp' shards ViT weights over the tensor axis
+                        and load-balances images over data-parallel groups
+                        (requires tp_size > 1).
+  --disable-precompile  whether disable precompile
+  --attention-backend {native,fa,fa_mha,dsa_sparse,tt}
+                        Choose the kernels for attention layers. 'fa' =
+                        FlashAttention for MHA models, MLA Pallas kernel
+                        (absorbed) for MLA models. 'fa_mha' = force the MHA
+                        FlashAttention path for MLA models too (decompress
+                        latent KV per-forward via kv_b_proj; ~70x more KV
+                        cache than 'fa', intended for kernel A/B on short
+                        contexts). 'dsa_sparse' = DeepSeek Sparse Attention
+                        (lightning-indexer top-k + sparse MLA) with IndexShare
+                        cross-layer reuse; MLA models with index_* config
+                        only. 'tt' = TTNN prefill and paged decode.
+  --gdn-prefill-impl {chunked_jax,fused_chunk_parallel}
+                        Choose the Qwen3.5 GDN prefill implementation.
+                        'chunked_jax' uses the native JAX recurrence;
+                        'fused_chunk_parallel' uses the Pallas fused
+                        Conv1D+GDN kernel. Decode uses the base JAX
+                        implementation for both choices.
+  --dsa-use-pallas      Use Pallas kernels for the dsa_sparse backend
+                        (default: jnp reference).
+  --moe-backend {epmoe,fused,fused_v2,auto}
+                        The backend to use for MoE models.
+  --disable-jax-allreduce-metadata
+                        Disable the pure JAX allreduce metadata path for fused
+                        EP-MoE; fall back to the Pallas DMA-based allgather.
+                        Default uses JAX path (recommended).
+  --disable-topk-kernel
+                        Disable Pallas kernels for top-k routing, including
+                        grouped, biased, and plain paths (TPU only), and use
+                        pure JAX instead. The kernels are enabled by default.
+  --enable-nan-detection
+                        Enable the NaN detection for debugging purposes.
+  --speculative-algorithm {EAGLE,EAGLE3,NEXTN,STANDALONE,DFLASH,DSPARK}
+                        Speculative algorithm.
+  --speculative-draft-model-path SPECULATIVE_DRAFT_MODEL_PATH, --speculative-draft-model SPECULATIVE_DRAFT_MODEL_PATH
+                        The path of the draft model weights. This can be a
+                        local folder or a Hugging Face repo ID.
+  --speculative-draft-model-revision SPECULATIVE_DRAFT_MODEL_REVISION
+                        The specific draft model version to use. It can be a
+                        branch name, a tag name, or a commit id. If
+                        unspecified, will use the default version.
+  --speculative-num-steps SPECULATIVE_NUM_STEPS
+                        The number of steps sampled from draft model in
+                        Speculative Decoding.
+  --speculative-eagle-topk SPECULATIVE_EAGLE_TOPK
+                        The number of tokens sampled from the draft model in
+                        eagle2 each step.
+  --speculative-num-draft-tokens SPECULATIVE_NUM_DRAFT_TOKENS
+                        The number of tokens sampled from the draft model in
+                        Speculative Decoding.
+  --speculative-sample-from-anchor
+                        Sample draft candidates starting at the anchor output
+                        position (DFLASH or DSPARK). Draft query length is
+                        --speculative-num-draft-tokens minus one; the latter
+                        remains the target verify length including the seed.
+  --speculative-accept-threshold-single SPECULATIVE_ACCEPT_THRESHOLD_SINGLE
+                        Accept a draft token if its probability in the target
+                        model is greater than this threshold.
+  --speculative-accept-threshold-acc SPECULATIVE_ACCEPT_THRESHOLD_ACC
+                        The accept probability of a draft token is raised from
+                        its target probability p to min(1, p / threshold_acc).
+  --enable-deterministic-sampling
+                        Enable deterministic sampling
+  --enable-single-process
+                        Enable run the engine with single process.
+  --multimodal          Enable the standalone multi-stage multimodal HTTP
+                        server. This flag is not required for multimodal
+                        models using the regular SRT runtime.
+  --limit-mm-data-per-request LIMIT_MM_DATA_PER_REQUEST
+                        JSON object that limits the number of multimodal items
+                        per request, e.g. '{"image": 16}'.
+  --mm-processor-worker-num MM_PROCESSOR_WORKER_NUM
+                        Number of multimodal processor workers. 0 uses the
+                        model default.
+  --enable-lora         Enable LoRA support. LoRA (Low-Rank Adaptation) allows
+                        serving multiple fine-tuned models with minimal
+                        overhead.
+  --lora-paths [LORA_PATHS ...]
+                        List of LoRA adapters to preload. Can be local paths
+                        or HuggingFace repo IDs. Format: 'adapter_name=path'
+                        or just 'path' (will use basename as name).
+  --max-loras-per-batch MAX_LORAS_PER_BATCH
+                        Maximum number of different LoRA adapters that can be
+                        used in a single batch.
+  --max-lora-rank MAX_LORA_RANK
+                        Maximum LoRA rank to support. If not specified, will
+                        be determined from loaded adapters.
+  --max-loaded-loras MAX_LOADED_LORAS
+                        Maximum number of LoRA adapters to keep loaded in
+                        memory.
+  --lora-target-modules [{q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,all} ...]
+                        List of module names to apply LoRA to. If not
+                        specified, will be determined from adapters. If not
+                        specified, it will be automatically inferred from the
+                        adapters provided in --lora-paths. If 'all' is
+                        specified, all supported modules will be targeted.
+  --lora-eviction-policy {lru}
+                        Policy for evicting LoRA adapters when
+                        max_loaded_loras is reached.
+  --enable-static-lora  Enable static LoRA support for RL, and it is different
+                        from the combination of enable-lora and max-loras-per-
+                        batch = 1
+  --lora-scaling LORA_SCALING
+                        Lora scaling is required for static LoRA, scaling =
+                        alpha/rank
+  --enable-engine-loop-run-forever-daemon
+                        Run engine loop forever when engine.async_generate is
+                        called in other threads, this is used in Tunix
+  --enable-return-routed-experts
+                        Enable returning routed experts of each layer with
+                        responses.
+  --disaggregation-enable-d2h, --no-disaggregation-enable-d2h
+                        Enable D2H staging on the prefill side: KV is copied
+                        into an unpinned host-memory buffer before remote
+                        pull, bounding prefill HBM pressure via the host pool.
+                        Default OFF.
+  --disaggregation-use-raiden, --no-disaggregation-use-raiden
+                        Use tpu-raiden for direct block transfer into decode
+                        KV pages.
+  --disaggregation-enable-overlap-schedule, --no-disaggregation-enable-overlap-schedule
+                        Enable experimental scheduler overlap on this Raiden
+                        PD role. Requires ChunkCache and one host per serving
+                        instance. Default OFF.
+  --disaggregation-enable-chunk-prefill-transfer, --no-disaggregation-enable-chunk-prefill-transfer
+                        Register and pull each completed prefill chunk through
+                        Raiden so transfer overlaps the next chunk forward.
+                        Requires Raiden, ChunkCache, and chunked prefill.
+                        Default OFF.
+  --disaggregation-side-channel-port DISAGGREGATION_SIDE_CHANNEL_PORT
+                        ZMQ ROUTER port the prefill side binds for D->P pull-
+                        done notifications. The decoder connects DEALER
+                        sockets to this port per-ack. Default 9600.
+  --disaggregation-mode {null,prefill,decode}
+                        PD role of this engine. 'null' runs the normal
+                        scheduler unchanged. 'prefill' / 'decode' route
+                        through the PD-aware event loop and require
+                        --disaggregation-bootstrap-url.
+  --disaggregation-bootstrap-url DISAGGREGATION_BOOTSTRAP_URL
+                        HTTP base URL of the central bootstrap server, e.g.
+                        http://10.0.0.1:8998. Required when --disaggregation-
+                        mode != null.
+  --disaggregation-bootstrap-port DISAGGREGATION_BOOTSTRAP_PORT
+                        When the engine ALSO hosts the bootstrap server
+                        (single-node deployments), this is the port it binds.
+  --disaggregation-transfer-port DISAGGREGATION_TRANSFER_PORT
+                        JaxTransferWrapper port the prefill side binds.
+                        Reported to the bootstrap server on register.
+  --disaggregation-d2h-pool-size DISAGGREGATION_D2H_POOL_SIZE
+                        QueueHostKVPool buffer count (path A only). Default
+                        64.
+  --disaggregation-d2h-max-tokens DISAGGREGATION_D2H_MAX_TOKENS
+                        Per-buffer token capacity for QueueHostKVPool (path
+                        A). Each buffer is sized to hold one request's padded
+                        KV up to this many tokens; must be >= your longest PD
+                        prompt. Defaults to max_total_num_tokens at engine
+                        init time.
+  --disaggregation-host-ip DISAGGREGATION_HOST_IP
+                        Per-host IP this process publishes to the bootstrap
+                        server so remote pulls go over DCN. If omitted,
+                        resolve via $HOSTNAME with a socket.gethostbyname
+                        fallback. Reject bind addresses (0.0.0.0, 127.0.0.1).
+  --disaggregation-bootstrap-timeout-seconds DISAGGREGATION_BOOTSTRAP_TIMEOUT_SECONDS
+                        Bootstrap-server query timeout in seconds. <=0 to
+                        disable.
+  --disaggregation-pull-timeout-seconds DISAGGREGATION_PULL_TIMEOUT_SECONDS
+                        Decode-side pull timeout in seconds. A receiver stuck
+                        in TRANSFERRING longer than this is reaped to FAILED.
+                        With Raiden, this also bounds engine terminalization
+                        after abort, so FINISH_ABORT may be delayed by up to
+                        this interval. <=0 to disable.
+  --disaggregation-ack-timeout-seconds DISAGGREGATION_ACK_TIMEOUT_SECONDS
+                        Prefill-side ack timeout in seconds. A sender whose
+                        ack is not received within this window is reaped to
+                        FAILED and its host buffer / wrapper ref are released.
+                        <=0 to disable.
+  --disaggregation-orphan-reaper-interval-seconds DISAGGREGATION_ORPHAN_REAPER_INTERVAL_SECONDS
+                        How often the background reaper scans for orphan
+                        senders/receivers.
+  --disaggregation-decode-watchdog-seconds DISAGGREGATION_DECODE_WATCHDOG_SECONDS
+                        Diagnostic: if > 0, a watchdog logs the stuck decode
+                        event-loop phase + backlog snapshot + main-thread
+                        traceback when one loop tick exceeds this many
+                        seconds. 0 disables it (default). Opt-in for stress
+                        debugging.
+  --disaggregation-num-reserved-decode-tokens DISAGGREGATION_NUM_RESERVED_DECODE_TOKENS
+                        Decode-side admission headroom (KV tokens) held back
+                        per in-flight/running request when admitting a queued
+                        PD request, so running decode steps never OOM while
+                        others are mid-transfer. Insufficient capacity defers
+                        admission (FIFO requeue), never aborts.
+  --disaggregation-max-inflight-transfers DISAGGREGATION_MAX_INFLIGHT_TRANSFERS
+                        Max concurrent in-flight KV transfers admitted on the
+                        decode side. Each in-flight pull allocates a
+                        destination KV buffer on decode HBM until it is
+                        scattered into the paged pool; this cap bounds that
+                        transient HBM so a burst of concurrent requests does
+                        not OOM decode. Excess requests defer (FIFO requeue),
+                        never abort. 0 disables the cap (unbounded).
+  --disaggregation-shared-secret DISAGGREGATION_SHARED_SECRET
+                        Shared secret applied to all three PD channels
+                        (bootstrap HTTP, transfer pull side-channel, ZMQ ack
+                        channel). The environment variable
+                        SGL_JAX_PD_SHARED_SECRET overrides this if both are
+                        set. None disables auth (default for backward
+                        compatibility; production should always set it).
+  --disaggregation-channel-number DISAGGREGATION_CHANNEL_NUMBER
+                        Parallel transfer channels per (P, D) pair.
+  --embedded-cfg-scale EMBEDDED_CFG_SCALE
+                        Embedded CFG scale
+  --flow-shift FLOW_SHIFT
+                        Flow shift parameter
+  --dit-precision {fp32,fp16,bf16}
+                        Precision for the DiT model
+  --vae-precision {fp32,fp16,bf16}
+                        Precision for VAE
+  --vae-tiling          Enable VAE tiling
+  --vae-sp              Enable VAE spatial parallelism
+  --text-encoder-precisions {fp32,fp16,bf16} [{fp32,fp16,bf16} ...]
+                        Precision for each text encoder
+  --image-encoder-precision {fp32,fp16,bf16}
+                        Precision for image encoder
+  --precompile-width-heights PRECOMPILE_WIDTH_HEIGHTS [PRECOMPILE_WIDTH_HEIGHTS ...]
+                        Set the list of width and height for jax jit, format
+                        width*height
+  --precompile-frame-paddings PRECOMPILE_FRAME_PADDINGS [PRECOMPILE_FRAME_PADDINGS ...]
+                        Set the frame count list for jax jit

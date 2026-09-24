@@ -1,0 +1,14 @@
+{
+  "short": {
+    "tp1_distinct_measured_outputs": 1,
+    "tp2_distinct_measured_outputs": 1,
+    "cross_tp_exact_match": false,
+    "cross_tp_first_different_token_zero_based": 25
+  },
+  "long": {
+    "tp1_distinct_measured_outputs": 1,
+    "tp2_distinct_measured_outputs": 1,
+    "cross_tp_exact_match": false,
+    "cross_tp_first_different_token_zero_based": 19
+  }
+}

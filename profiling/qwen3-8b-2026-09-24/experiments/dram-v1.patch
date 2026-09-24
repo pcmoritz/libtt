@@ -1,0 +1,85 @@
+diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Passes.h b/include/ttmlir/Dialect/TTNN/Transforms/Passes.h
+--- a/include/ttmlir/Dialect/TTNN/Transforms/Passes.h
++++ b/include/ttmlir/Dialect/TTNN/Transforms/Passes.h
+@@ -23,6 +23,8 @@
+ 
+ enum class FileSplitTarget { EmitPy, EmitC };
+ 
++std::unique_ptr<mlir::Pass> createTTNNDecodeDRAMMatmul();
++
+ // TTNN Passes
+ #define GEN_PASS_DECL
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -465,6 +465,7 @@
+     }
+ 
+     createTTNNPipelineAnalysisPasses(devicePm, options);
++    devicePm.addPass(createTTNNDecodeDRAMMatmul());
+ 
+     // Materialize PrepareConv3dWeightsOp for every Conv3dOp. Runs after the
+     // optimizer (so it can read the optimizer's chosen Conv3dConfigAttr) but
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNDecodeDRAMMatmul.cpp b/lib/Dialect/TTNN/Transforms/TTNNDecodeDRAMMatmul.cpp
+new file mode 100644
+--- /dev/null
++++ b/lib/Dialect/TTNN/Transforms/TTNNDecodeDRAMMatmul.cpp
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
++#include "ttmlir/Dialect/TTNN/Types/Types.h"
++#include "mlir/IR/PatternMatch.h"
++#include <cstdlib>
++
++namespace mlir::tt::ttnn {
++namespace {
++class DecodeDRAMMatmul : public PassWrapper<DecodeDRAMMatmul, OperationPass<ModuleOp>> {
++public:
++  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DecodeDRAMMatmul)
++  StringRef getArgument() const final { return "ttnn-decode-dram-matmul"; }
++  void runOnOperation() final {
++    // Experimental until end-to-end numerical and performance validation.
++    if (!std::getenv("LIBTT_DECODE_DRAM_MATMUL")) return;
++    SmallVector<MatmulOp> candidates;
++    getOperation()->walk([&](MatmulOp op) { candidates.push_back(op); });
++    for (MatmulOp op : candidates) {
++      if (op.getTransposeA() || op.getTransposeB() || op.getMatmulProgramConfigAttr() ||
++          op->hasAttr("ttnn.fused_swiglu") || op.getActivationAttr()) continue;
++      auto at = op.getA().getType();
++      auto bt = op.getB().getType();
++      auto ot = op.getResult().getType();
++      if (at.getRank()!=2 || bt.getRank()!=2 || ot.getRank()!=2) continue;
++      int64_t m=at.getDimSize(0), k=at.getDimSize(1), n=bt.getDimSize(1);
++      if (m<1 || m>2 || k<2048 || k>16384 || k%2048 || n<2048 || n>8192 || n%256) continue;
++      auto al=dyn_cast<TTNNLayoutAttr>(at.getEncoding());
++      auto bl=dyn_cast<TTNNLayoutAttr>(bt.getEncoding());
++      auto ol=dyn_cast<TTNNLayoutAttr>(ot.getEncoding());
++      if (!al || !bl || !ol || bl.getDataType()!=ttcore::DataType::BFP_BFloat8 ||
++          al.getDataType()!=ttcore::DataType::BFloat16 || ol.getDataType()!=ttcore::DataType::BFloat16) continue;
++      auto chip=ttcore::getCurrentScopeSystemDesc(op).getChipDesc(0);
++      if (chip.getArch().getValue()!=ttcore::Arch::Blackhole || chip.getNumDramChannels()!=8) continue;
++      auto device=ttcore::lookupDevice(op.getOperation());
++      auto sharded=[&](RankedTensorType t, BufferType buffer) {
++        auto layout=TTNNLayoutAttr::Builder(t).setBufferType(buffer)
++          .setMemoryLayout(TensorMemoryLayout::WidthSharded).setGridShape({1,8})
++          .buildWithCanonicalCorePlacement(device);
++        return t.cloneWithEncoding(layout);
++      };
++      IRRewriter rewriter(op.getContext());
++      rewriter.setInsertionPoint(op);
++      auto a=rewriter.create<ToTensorSpecOp>(op.getLoc(),sharded(at,BufferType::L1),op.getA());
++      auto b=rewriter.create<ToTensorSpecOp>(op.getLoc(),sharded(bt,BufferType::DRAM),op.getB());
++      auto config=MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfigAttr::get(op.getContext(),8,1,n/256,UnaryWithParamAttr());
++      auto result=rewriter.create<MatmulOp>(op.getLoc(),sharded(ot,BufferType::L1),a.getResult(),b.getResult(),false,false,config,StringAttr());
++      auto compute=op.getComputeConfigAttr();
++      if (!compute) compute=DeviceComputeKernelConfigAttr::get(op.getContext());
++      result.setComputeConfigAttr(compute.withFp32DestAccEn(true).withPackerL1Acc(true));
++      auto output=rewriter.create<ToTensorSpecOp>(op.getLoc(),ot,result.getResult());
++      rewriter.replaceOp(op,output.getResult());
++    }
++  }
++};
++}
++std::unique_ptr<mlir::Pass> createTTNNDecodeDRAMMatmul() { return std::make_unique<DecodeDRAMMatmul>(); }
++}

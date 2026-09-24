@@ -1,0 +1,23 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/tmp/libtt-profile/sglang-multinode/python/sgl_jax/launch_server.py", line 39, in <module>
+    main()
+  File "/tmp/libtt-profile/sglang-multinode/python/sgl_jax/launch_server.py", line 24, in main
+    from sgl_jax.srt.entrypoints import http_server
+  File "/tmp/libtt-profile/sglang-multinode/python/sgl_jax/srt/entrypoints/http_server.py", line 35, in <module>
+    from sgl_jax.srt.entrypoints.engine import _launch_subprocesses_or_threads
+  File "/tmp/libtt-profile/sglang-multinode/python/sgl_jax/srt/entrypoints/engine.py", line 23, in <module>
+    from flax import nnx
+  File "/tmp/libtt-profile/multinode-venv/lib/python3.12/site-packages/flax/nnx/__init__.py", line 22, in <module>
+    from .bridge import wrappers as wrappers
+  File "/tmp/libtt-profile/multinode-venv/lib/python3.12/site-packages/flax/nnx/bridge/__init__.py", line 16, in <module>
+    from .wrappers import functional as functional
+  File "/tmp/libtt-profile/multinode-venv/lib/python3.12/site-packages/flax/nnx/bridge/wrappers.py", line 26, in <module>
+    from flax.nnx import graphlib
+  File "/tmp/libtt-profile/multinode-venv/lib/python3.12/site-packages/flax/nnx/graphlib.py", line 27, in <module>
+    from flax.nnx import filterlib, reprlib, traversals, variablelib
+  File "/tmp/libtt-profile/multinode-venv/lib/python3.12/site-packages/flax/nnx/variablelib.py", line 298, in <module>
+    class NewVariable(hjx.HiPrimitive):
+                      ^^^^^^^^^^^^^^^
+AttributeError: module 'jax.experimental.hijax' has no attribute 'HiPrimitive'

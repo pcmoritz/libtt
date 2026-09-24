@@ -1,0 +1,16 @@
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp
+@@ -356,7 +356,12 @@
+     bool composite_all_gather = composite_common::use_composite_all_gather(input_tensor, composite_dim);
+     bool composite_reduce_scatter =
+         composite_common::use_composite_reduce_scatter(input_tensor, composite_dim, cluster_axis);
+-    if (composite_all_gather || composite_reduce_scatter || (dim != composite_dim)) {
++    // For a two-device decode vector, exchanging the full vector once avoids
++    // the second collective startup of reduce-scatter followed by all-gather.
++    const bool small_two_device_reduce =
++        num_devices == 2 && input_tensor.dtype() == DataType::BFLOAT16 &&
++        !input_is_sharded && input_tensor.logical_shape().volume() <= 8192;
++    if (small_two_device_reduce || composite_all_gather || composite_reduce_scatter || (dim != composite_dim)) {
+         // All reduce = all gather + local reduce
+         log_debug(tt::LogOp, "Using composite all gather + local reduce");
+ 

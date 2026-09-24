@@ -771,6 +771,25 @@ TTNN_OPERATION_SRC_EXCLUDES = [
     "ttnn/cpp/ttnn/operations/**/tests/**",
 ]
 
+TTNN_CCL_OPERATION_SRCS = [
+    "ttnn/cpp/ttnn/operations/ccl/all_broadcast/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/all_gather/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/all_reduce/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/mesh_partition/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/reduce_scatter/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/common/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/all_gather_async/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/moreh/moreh_sum/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/ccl_common.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/ccl_host_datastructures.cpp",
+    "ttnn/cpp/ttnn/operations/ccl/ccl_op_fusion.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/llama_common.cpp",
+]
+
 TTNN_EXPERIMENTAL_OPERATION_SRCS = [
     "ttnn/cpp/ttnn/operations/experimental/dropout/**/*.cpp",
     "ttnn/cpp/ttnn/operations/experimental/indexer_score/**/*.cpp",
@@ -915,21 +934,117 @@ cc_library(
     linkstatic = True,
 )
 
-cc_library(
-    name = "tt_metal_host_tensor_runtime_support_upstream",
-    srcs = [
-        "tt_metal/impl/tensor/libtt_fabric_disabled_host_tensor_runtime.cpp",
+TT_FABRIC_PROTOS = [
+    "tt_metal/fabric/protobuf/intermesh_connection_table.proto",
+    "tt_metal/fabric/protobuf/mesh_graph_descriptor.proto",
+    "tt_metal/fabric/protobuf/physical_grouping_descriptor.proto",
+    "tt_metal/fabric/protobuf/physical_system_descriptor.proto",
+    "tt_metal/fabric/protobuf/port_descriptor_table.proto",
+    "tt_metal/fabric/protobuf/router_port_directions.proto",
+    "tools/scaleout/factory_system_descriptor/schemas/factory_system_descriptor.proto",
+    "tools/scaleout/cabling_descriptor/schemas/node_config.proto",
+    "tools/scaleout/cabling_descriptor/schemas/cluster_config.proto",
+    "tools/scaleout/deployment_descriptor/schemas/deployment.proto",
+    "tools/scaleout/validation/schemas/ethernet_link_metrics.proto",
+]
+
+genrule(
+    name = "tt_fabric_proto_generated",
+    srcs = TT_FABRIC_PROTOS,
+    outs = [
+        "fabric_generated/protobuf/" + path.split("/")[-1].removesuffix(".proto") + suffix
+        for path in TT_FABRIC_PROTOS
+        for suffix in [".pb.cc", ".pb.h"]
     ],
-    hdrs = TT_METAL_RUNTIME_HDRS,
-    copts = TT_METAL_RUNTIME_COPTS,
-    includes = TT_METAL_RUNTIME_INCLUDE_DIRS,
-    deps = [
-        ":tt_metal_common",
-        ":tt_metal_host_tensor_upstream",
-    ],
-    alwayslink = True,
-    linkstatic = True,
+    tools = ["@com_google_protobuf//:protoc"],
+    cmd = "mkdir -p $(RULEDIR)/fabric_generated/protobuf && " +
+          "$(location @com_google_protobuf//:protoc) " +
+          "--cpp_out=$(RULEDIR)/fabric_generated/protobuf " +
+          "-I$$(dirname $(location tools/scaleout/cabling_descriptor/schemas/node_config.proto)) " +
+          "-I$$(dirname $(location tools/scaleout/deployment_descriptor/schemas/deployment.proto)) " +
+          "-I$$(dirname $(location tools/scaleout/factory_system_descriptor/schemas/factory_system_descriptor.proto)) " +
+          "-I$$(dirname $(location tools/scaleout/validation/schemas/ethernet_link_metrics.proto)) " +
+          "-I$$(dirname $(location tt_metal/fabric/protobuf/intermesh_connection_table.proto)) " +
+          "$(SRCS)",
 )
+
+cc_library(
+    name = "tt_fabric_proto",
+    srcs = [
+        "fabric_generated/protobuf/" + path.split("/")[-1].removesuffix(".proto") + ".pb.cc"
+        for path in TT_FABRIC_PROTOS
+    ],
+    hdrs = [
+        "fabric_generated/protobuf/" + path.split("/")[-1].removesuffix(".proto") + ".pb.h"
+        for path in TT_FABRIC_PROTOS
+    ],
+    copts = ["-std=c++17"],
+    includes = ["fabric_generated", "fabric_generated/protobuf"],
+    deps = ["@com_google_protobuf//:protobuf"],
+)
+
+TT_FABRIC_SRCS = [
+    "tt_metal/fabric/control_plane.cpp",
+    "tt_metal/fabric/mesh_graph_descriptor.cpp",
+    "tt_metal/fabric/routing_table_generator.cpp",
+    "tt_metal/fabric/mesh_graph.cpp",
+    "tt_metal/fabric/erisc_datamover_builder.cpp",
+    "tt_metal/fabric/fabric_router_channel_mapping.cpp",
+    "tt_metal/fabric/fabric_router_builder.cpp",
+    "tt_metal/fabric/compute_mesh_router_builder.cpp",
+    "tt_metal/fabric/fabric_builder.cpp",
+    "tt_metal/fabric/builder/fabric_builder_config.cpp",
+    "tt_metal/fabric/builder/fabric_builder_helpers.cpp",
+    "tt_metal/fabric/builder/fabric_core_placement.cpp",
+    "tt_metal/fabric/builder/fabric_channel_allocator.cpp",
+    "tt_metal/fabric/builder/fabric_static_sized_channels_allocator.cpp",
+    "tt_metal/fabric/builder/fabric_remote_channels_allocator.cpp",
+    "tt_metal/fabric/builder/static_sized_channel_connection_writer_adapter.cpp",
+    "tt_metal/fabric/builder/connection_registry.cpp",
+    "tt_metal/fabric/builder/router_connection_mapping.cpp",
+    "tt_metal/fabric/channel_trimming_export.cpp",
+    "tt_metal/fabric/channel_trimming_import.cpp",
+    "tt_metal/fabric/channel_trimming_io.cpp",
+    "tt_metal/fabric/channel_trimming_report.cpp",
+    "tt_metal/fabric/fabric.cpp",
+    "tt_metal/fabric/fabric_vc2_connection.cpp",
+    "tt_metal/fabric/fabric_init.cpp",
+    "tt_metal/fabric/fabric_host_utils.cpp",
+    "tt_metal/fabric/fabric_switch_manager.cpp",
+    "tt_metal/fabric/fabric_telemetry_reader.cpp",
+    "tt_metal/fabric/fabric_context.cpp",
+    "tt_metal/fabric/fabric_builder_context.cpp",
+    "tt_metal/fabric/fabric_mux_config.cpp",
+    "tt_metal/fabric/fabric_mux_v2_config.cpp",
+    "tt_metal/fabric/fabric_tensix_builder.cpp",
+    "tt_metal/fabric/fabric_tensix_builder_impl.cpp",
+    "tt_metal/fabric/fabric_types.cpp",
+    "tt_metal/fabric/compressed_direction_table.cpp",
+    "tt_metal/fabric/compressed_routing_path.cpp",
+    "tt_metal/fabric/serialization/router_port_directions.cpp",
+    "tt_metal/fabric/serialization/physical_system_descriptor_serialization.cpp",
+    "tt_metal/fabric/serialization/intermesh_connections_serialization.cpp",
+    "tt_metal/fabric/serialization/port_descriptor_serialization.cpp",
+    "tt_metal/fabric/ccl/ccl_common.cpp",
+    "tt_metal/fabric/physical_system_discovery.cpp",
+    "tt_metal/fabric/physical_system_descriptor.cpp",
+    "tt_metal/fabric/topology_mapper.cpp",
+    "tt_metal/fabric/topology_mapper_utils.cpp",
+    "tt_metal/fabric/topology_solver.cpp",
+    "tt_metal/fabric/topology_solver_sat.cpp",
+    "tt_metal/fabric/topology_solver_sat_solver.cpp",
+    "tt_metal/fabric/pipeline_builder.cpp",
+    "tt_metal/fabric/physical_grouping_descriptor_core.cpp",
+    "tt_metal/fabric/physical_grouping_descriptor_graph_building.cpp",
+    "tt_metal/fabric/physical_grouping_descriptor_matching.cpp",
+    "tools/scaleout/node/node.cpp",
+    "tools/scaleout/node/node_types.cpp",
+    "tools/scaleout/board/board.cpp",
+    "tools/scaleout/cabling_generator/cabling_generator.cpp",
+    "tools/scaleout/cabling_generator/regen_descriptors.cpp",
+    "tools/scaleout/connector/connector.cpp",
+    "tools/scaleout/factory_system_descriptor/utils.cpp",
+]
 
 cc_library(
     name = "tt_metal_device_tensor_upstream",
@@ -947,6 +1062,8 @@ cc_library(
         "tt_metal/distributed/mesh_buffer.cpp",
         "tt_metal/distributed/mesh_command_queue_base.cpp",
         "tt_metal/distributed/mesh_device.cpp",
+        "tt_metal/distributed/mesh_socket.cpp",
+        "tt_metal/distributed/mesh_socket_utils.cpp",
         "tt_metal/distributed/mesh_device_view.cpp",
         "tt_metal/distributed/mesh_event.cpp",
         "tt_metal/distributed/mesh_socket_serialization.cpp",
@@ -963,9 +1080,10 @@ cc_library(
         "tt_metal/distributed/sd_mesh_command_queue.cpp",
         "tt_metal/distributed/shm_resource_tracker.cpp",
         "tt_metal/distributed/system_mesh.cpp",
+        "tt_metal/distributed/system_mesh_translation_map.cpp",
+        "tt_metal/distributed/experimental/internal_cluster.cpp",
         "@//third_party/tt_xla:tt_metal_runtime_cold_stubs.cc",
         ":tt_metal_inspector_stub_source",
-        "tt_metal/fabric/fabric_types.cpp",
         "tt_metal/hal.cpp",
         "tt_metal/impl/allocator/algorithms/free_list_opt.cpp",
         "tt_metal/impl/allocator/allocator.cpp",
@@ -1101,12 +1219,14 @@ cc_library(
         "tt_metal/llrt/tt_elffile.cpp",
         "tt_metal/llrt/tt_memory.cpp",
         "tt_metal/llrt/tunnels_from_mmio_device.cpp",
-    ] + TT_METAL_FLATBUFFER_SRCS + TT_METAL_JIT_BUILD_SRCS,
-    hdrs = TT_METAL_RUNTIME_HDRS,
+    ] + TT_METAL_FLATBUFFER_SRCS + TT_METAL_JIT_BUILD_SRCS + TT_FABRIC_SRCS,
+    hdrs = TT_METAL_RUNTIME_HDRS + glob(["tools/scaleout/**/*.hpp"]),
     copts = TT_METAL_RUNTIME_COPTS,
-    includes = TT_METAL_RUNTIME_INCLUDE_DIRS,
+    includes = TT_METAL_RUNTIME_INCLUDE_DIRS + ["tools/scaleout"],
     deps = [
         ":tt_metal_common",
+        ":tt_fabric_proto",
+        "@cadical//:cadical",
         ":tt_metal_hal_blackhole_upstream",
         ":tt_metal_hal_quasar_upstream",
         ":tt_metal_hal_wormhole_upstream",
@@ -1304,6 +1424,12 @@ cc_library(
     ) + glob(
         TTNN_EXPERIMENTAL_OPERATION_SRCS,
         exclude = TTNN_OPERATION_SRC_EXCLUDES,
+    ) + glob(
+        TTNN_CCL_OPERATION_SRCS,
+        exclude = [p for p in TTNN_OPERATION_SRC_EXCLUDES if p not in [
+            "ttnn/cpp/ttnn/operations/ccl/**",
+            "ttnn/cpp/ttnn/operations/moreh/**",
+        ]],
     )).to_list(),
     hdrs = TTNN_RUNTIME_HDRS,
     copts = TT_METAL_RUNTIME_COPTS,
@@ -1312,4 +1438,36 @@ cc_library(
         ":tt_metal_device_tensor_upstream",
     ],
     linkstatic = True,
+)
+
+cc_library(
+    name = "ttnn_distributed_tensor_upstream",
+    srcs = [
+        "ttnn/core/distributed/distributed_tensor.cpp",
+        "ttnn/core/distributed/distribution_mode.cpp",
+        "ttnn/core/tensor/xtensor/partition.cpp",
+    ],
+    copts = TT_METAL_RUNTIME_COPTS,
+    includes = TTNN_RUNTIME_INCLUDE_DIRS,
+    deps = [
+        ":ttnn_tensor_upstream",
+        "@xtensor//:xtensor",
+    ],
+    linkstatic = True,
+)
+
+filegroup(
+    name = "mesh_socket_test_sources",
+    srcs = [
+        "tests/tt_metal/multihost/fabric_tests/mesh_socket_yaml_parser.cpp",
+        "tests/tt_metal/multihost/fabric_tests/mesh_socket_test_context.cpp",
+        "tests/tt_metal/multihost/fabric_tests/socket_send_recv_utils.cpp",
+    ],
+)
+
+filegroup(
+    name = "mesh_socket_test_headers",
+    srcs = glob(["tests/tt_metal/multihost/fabric_tests/*.hpp"]) + [
+        "tests/tt_metal/test_utils/test_common.hpp",
+    ],
 )

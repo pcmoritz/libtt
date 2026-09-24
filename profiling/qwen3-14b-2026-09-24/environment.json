@@ -1,0 +1,19 @@
+{
+  "model": "Qwen/Qwen3-14B",
+  "model_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
+  "libtt_commit": "3f9d1371cf6c67a3c5f7a67c9481a647ac0c8563",
+  "sglang_jax_commit": "6ca38400e6130bc242b215af52b8984bc859036e",
+  "wheel_sha256": "4b5f5477f0598192b99aa88a58271b40d19dda7f8331ffbb61f1df920a811c66",
+  "tp1_devices": [
+    "0000:01:00.0"
+  ],
+  "tp2_devices": [
+    "0000:01:00.0",
+    "0000:04:00.0"
+  ],
+  "activation_dtype": "bfloat16",
+  "weight_dtype": "bfloat8_b",
+  "output_tokens": 128,
+  "warmup_requests_per_prompt": 3,
+  "measured_requests_per_prompt": 5
+}

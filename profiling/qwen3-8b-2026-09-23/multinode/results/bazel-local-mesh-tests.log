@@ -1,0 +1,148 @@
+Computing main repo mapping: 
+Loading: 
+Loading: 0 packages loaded
+Analyzing: target //tests:libtt_test_suite (1 packages loaded, 0 targets configured)
+Analyzing: target //tests:libtt_test_suite (1 packages loaded, 0 targets configured)
+
+Analyzing: target //tests:libtt_test_suite (7 packages loaded, 34 targets configured)
+
+Analyzing: target //tests:libtt_test_suite (7 packages loaded, 34 targets configured)
+
+Analyzing: target //tests:libtt_test_suite (7 packages loaded, 34 targets configured)
+
+Analyzing: target //tests:libtt_test_suite (16 packages loaded, 749 targets configured)
+
+Analyzing: target //tests:libtt_test_suite (16 packages loaded, 749 targets configured)
+
+Analyzing: target //tests:libtt_test_suite (19 packages loaded, 824 targets configured)
+
+Analyzing: target //tests:libtt_test_suite (20 packages loaded, 840 targets configured)
+
+Analyzing: target //tests:libtt_test_suite (21 packages loaded, 1189 targets configured)
+
+Analyzing: target //tests:libtt_test_suite (25 packages loaded, 2199 targets configured)
+
+Analyzing: target //tests:libtt_test_suite (25 packages loaded, 2199 targets configured)
+
+INFO: Analyzed target //tests:libtt_test_suite (27 packages loaded, 3654 targets configured).
+[7,399 / 7,400] [Prepa] runfiles for //tests:libtt_test_suite
+[7,400 / 7,401] Testing //tests:libtt_test_suite; 1s local
+[7,400 / 7,401] Testing //tests:libtt_test_suite; 8s local
+FAIL: //tests:libtt_test_suite (Segmentation fault) (see /home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/testlogs/tests/libtt_test_suite/test.log)
+INFO: From Testing //tests:libtt_test_suite:
+==================== Test output for //tests:libtt_test_suite:
+Platform 'tt' is experimental and not all JAX functionality may be correctly supported!
+2026-09-23 23:23:28.673 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 23:23:28.673 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 23:23:28.673 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:95)
+2026-09-23 23:23:28.673 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:114)
+2026-09-23 23:23:28.681 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:574)
+2026-09-23 23:23:28.681 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:118)
+2026-09-23 23:23:28.681 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:23:28.681 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 23:23:28.719 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1}/[0, 3] and remote chip ids {} (cluster.cpp:162)
+2026-09-23 23:23:28.719 | info     |             UMD | IOMMU: enabled (cluster.cpp:142)
+2026-09-23 23:23:28.719 | info     |             UMD | KMD version: 2.10.0 (cluster.cpp:145)
+2026-09-23 23:23:28.719 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 23:23:28.720 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 23:23:28.721 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 23:23:28.766 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:23:28.766 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:23:28.766 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:23:28.766 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:23:28.766 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:23:28.766 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:23:28.766 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:23:28.766 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:23:31.476 | info     |           Metal | [Real-time profiler] Device 0 sync complete: 100 samples, frequency=1.349958 GHz, device_time_at_sync=1149895272284 cycles (realtime_profiler_manager.cpp:1390)
+2026-09-23 23:23:31.476 | info     |           Metal | [Real-time profiler] Device 1 sync complete: 100 samples, frequency=1.349961 GHz, device_time_at_sync=472631692074 cycles (realtime_profiler_manager.cpp:1390)
+2026-09-23 23:23:31.487 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-9 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 23:23:31.487 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-8 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 23:23:31.488 | critical |          Always | TT_FATAL: Chip 1 logical eth core 0-3 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 23:23:31.488 | critical |          Always | TT_FATAL: Chip 1 logical eth core 0-2 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 23:23:31.603 | info     |           Metal | Fabric config changed from FabricConfig::DISABLED to FabricConfig::FABRIC_1D, reinitializing control plane (metal_env.cpp:333)
+2026-09-23 23:23:31.603 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 23:23:31.603 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 23:23:31.603 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:23:31.603 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:23:31.603 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:23:31.603 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 23:23:31.603 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 23:23:31.603 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 23:23:31.629 | info     |           Metal | Initializing Fabric (fabric_firmware_initializer.cpp:296)
+2026-09-23 23:23:32.551 | info     |           Metal | Fabric initialized on Device 0 (device.cpp:550)
+2026-09-23 23:23:32.558 | info     |           Metal | Fabric initialized on Device 1 (device.cpp:550)
+2026-09-23 23:23:32.558 | info     |           Metal | Fabric initialized on 2 devices (fabric_firmware_initializer.cpp:444)
+2026-09-23 23:23:32.558 | info     |           Metal | Fabric Initialized with config FabricConfig::FABRIC_1D (fabric_firmware_initializer.cpp:313)
+2026-09-23 23:23:34.143 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:1081)
+Using JAX 0.11.2 with 2 TT device(s) from jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl
+============================= test session starts ==============================
+platform linux -- Python 3.13.9, pytest-8.4.2, pluggy-1.6.0
+rootdir: /home/ttuser/libtt/tests/libtt
+configfile: pytest.ini
+testpaths: .
+collected 103 items / 99 deselected / 4 selected
+
+local_mesh_regression_test.py FFatal Python error: Segmentation fault
+
+Current thread 0x00007ed91cd07740 (most recent call first):
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_jax/site-packages/jax/_src/compiler.py", line 395 in backend_compile_and_load
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_jax/site-packages/jax/_src/profiler.py", line 420 in wrapper
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_jax/site-packages/jax/_src/compiler.py", line 464 in compile_or_get_cached
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_jax/site-packages/jax/_src/interpreters/pxla.py", line 1534 in _cached_compilation
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_jax/site-packages/jax/_src/interpreters/pxla.py", line 1754 in from_hlo
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_jax/site-packages/jax/_src/interpreters/pxla.py", line 1257 in compile
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_jax/site-packages/jax/_src/pjit.py", line 1151 in _pjit_call_impl_python
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_jax/site-packages/jax/_src/pjit.py", line 142 in _run_python_pjit
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_jax/site-packages/jax/_src/pjit.py", line 266 in cache_miss
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_jax/site-packages/jax/_src/traceback_util.py", line 194 in reraise_with_filtered_traceback
+  File "/home/ttuser/libtt/tests/libtt/local_mesh_regression_test.py", line 34 in test_local_mesh_outputs_remain_shard_local
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pytest/site-packages/_pytest/python.py", line 157 in pytest_pyfunc_call
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pytest/site-packages/_pytest/python.py", line 1671 in runtest
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pytest/site-packages/_pytest/runner.py", line 178 in pytest_runtest_call
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pytest/site-packages/_pytest/runner.py", line 246 in <lambda>
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pytest/site-packages/_pytest/runner.py", line 344 in from_call
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pytest/site-packages/_pytest/runner.py", line 245 in call_and_report
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pytest/site-packages/_pytest/runner.py", line 136 in runtestprotocol
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pytest/site-packages/_pytest/runner.py", line 117 in pytest_runtest_protocol
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pytest/site-packages/_pytest/main.py", line 367 in pytest_runtestloop
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pytest/site-packages/_pytest/main.py", line 343 in _main
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pytest/site-packages/_pytest/main.py", line 289 in wrap_session
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pytest/site-packages/_pytest/main.py", line 336 in pytest_cmdline_main
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_callers.py", line 121 in _multicall
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_manager.py", line 120 in _hookexec
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pluggy/site-packages/pluggy/_hooks.py", line 512 in __call__
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/rules_python++pip+jax_test_pip_313_pytest/site-packages/_pytest/config/__init__.py", line 175 in main
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/_main/tests/pytest_runner.py", line 76 in main
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/_main/tests/pytest_runner.py", line 80 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 98 in _run_module_code
+  File "<frozen runpy>", line 287 in run_path
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/_main/tests/_libtt_test_suite_stage2_bootstrap.py", line 287 in _run_py_path
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/_main/tests/_libtt_test_suite_stage2_bootstrap.py", line 493 in main
+  File "/home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/bin/tests/libtt_test_suite.runfiles/_main/tests/_libtt_test_suite_stage2_bootstrap.py", line 499 in <module>
+
+Extension modules: jaxlib.cpu_feature_guard, numpy._core._multiarray_umath, numpy.linalg._umath_linalg, numpy.random._common, numpy.random.bit_generator, numpy.random._bounded_integers, numpy.random._mt19937, numpy.random.mtrand, numpy.random._philox, numpy.random._pcg64, numpy.random._sfc64, numpy.random._generator (total: 12)
+================================================================================
+INFO: Found 1 test target...
+Target //tests:libtt_test_suite up-to-date:
+  bazel-bin/tests/libtt_test_suite
+INFO: Elapsed time: 26.493s, Critical Path: 8.32s
+INFO: 31 processes: 9 internal, 2 local, 21 processwrapper-sandbox.
+INFO: Build completed, 1 test FAILED, 31 total actions
+//tests:libtt_test_suite                                                 FAILED in 8.1s
+  /home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/testlogs/tests/libtt_test_suite/test.log
+
+Executed 1 out of 1 test: 1 fails locally.

@@ -1,0 +1,5 @@
+{
+  "output_ids_equal": true,
+  "token_logprobs_equal": true,
+  "top3_logprobs_equal": true
+}

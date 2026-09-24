@@ -1,0 +1,39 @@
+exec ${PAGER:-/usr/bin/less} "$0" || exit 1
+Executing tests from //tests:libtt_test_suite
+-----------------------------------------------------------------------------
+Platform 'tt' is experimental and not all JAX functionality may be correctly supported!
+2026-09-24 04:56:10.416 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-24 04:56:10.416 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-24 04:56:10.417 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:95)
+2026-09-24 04:56:10.417 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:114)
+2026-09-24 04:56:10.420 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:574)
+2026-09-24 04:56:10.420 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:118)
+2026-09-24 04:56:10.420 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 04:56:10.440 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:162)
+2026-09-24 04:56:10.440 | info     |             UMD | IOMMU: enabled (cluster.cpp:142)
+2026-09-24 04:56:10.440 | info     |             UMD | KMD version: 2.10.0 (cluster.cpp:145)
+2026-09-24 04:56:10.440 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-24 04:56:10.440 | warning  |          Device | Using CUSTOM cluster type for P300 board with 1 chips (tt_cluster.cpp:202)
+2026-09-24 04:56:10.440 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-24 04:56:10.441 | warning  |             UMD | AICLK settled at 1331 MHz, within 5% of the requested 1350 MHz but not an exact match. Proceeding. (tt_device.cpp:320)
+2026-09-24 04:56:10.441 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-24 04:56:10.465 | info     |     Distributed | Using custom mesh graph descriptor: /tmp/libtt-profile/tp1.textproto (metal_env.cpp:433)
+2026-09-24 04:56:10.465 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-24 04:56:10.465 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2400)
+2026-09-24 04:56:10.465 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2408)
+2026-09-24 04:56:13.159 | info     |           Metal | [Real-time profiler] Device 0 sync complete: 100 samples, frequency=1.350017 GHz, device_time_at_sync=6816280481909 cycles (realtime_profiler_manager.cpp:1390)
+2026-09-24 04:56:13.170 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-9 connects to a remote mmio device (assert.hpp:104)
+2026-09-24 04:56:13.170 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-8 connects to a remote mmio device (assert.hpp:104)
+2026-09-24 04:56:13.170 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-4 connects to a remote mmio device (assert.hpp:104)
+2026-09-24 04:56:13.170 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-2 connects to a remote mmio device (assert.hpp:104)
+2026-09-24 04:56:13.344 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:1081)
+Using JAX 0.11.2 with 1 TT device(s) from jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl
+................                                                         [100%]
+16 passed in 14.76s
+2026-09-24 04:56:28.401 | info     |    BuildKernels | JIT cache stats: 0/199 hits (0.0%) [0 cached, 179 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:197)
+2026-09-24 04:56:28.401 | info     |    BuildKernels | JIT telemetry: 2 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-09-24 04:56:28.404 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-24 04:56:28.404 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-24 04:56:28.497 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-24 04:56:28.497 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-24 04:56:28.497 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)

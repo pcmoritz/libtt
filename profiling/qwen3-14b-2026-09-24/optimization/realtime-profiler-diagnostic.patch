@@ -1,0 +1,64 @@
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -27,6 +27,12 @@
+ #include "tracy/Tracy.hpp"
+ 
+ #include <cstring>
++#include <cstdlib>
++#include <fstream>
++#include <mutex>
++#include <sstream>
++#include <unistd.h>
++#include <tt-metalium/experimental/realtime_profiler.hpp>
+ #include <memory>
+ #include <numeric>
+ #include <optional>
+@@ -592,6 +598,40 @@
+   return ::tt::tt_metal::GetNumAvailableDevices();
+ }
+ 
++// Opt-in diagnostic hook; owned by the profiler callback registry.
++static void enableRealtimeCSV() {
++  static std::mutex registrationMutex;
++  std::lock_guard<std::mutex> registrationLock(registrationMutex);
++  static unsigned registration = 0;
++  [&] {
++    const char *prefix = std::getenv("LIBTT_PROFILE_CSV");
++    if (!prefix || !*prefix) return;
++    struct Sink { std::mutex mutex; std::ofstream file; };
++    auto sink = std::make_shared<Sink>();
++    sink->file.open(std::string(prefix) + "." + std::to_string(getpid()) + "." + std::to_string(registration++) + ".csv");
++    LOG_ASSERT(sink->file.is_open(), "Cannot open LIBTT_PROFILE_CSV output");
++    sink->file << "runtime_id,chip_id,start,end,duration_ns,dropped,kernels\n";
++    ::tt::tt_metal::experimental::RegisterProgramRealtimeProfilerCallback(
++        [sink](const ::tt::tt_metal::experimental::ProgramRealtimeRecordBatch &batch) {
++          std::ostringstream rows;
++          for (const auto &record : batch.records) {
++            rows << record.runtime_id << ',' << record.chip_id << ','
++                 << record.start_timestamp << ',' << record.end_timestamp << ','
++                 << (record.end_timestamp - record.start_timestamp) / record.frequency
++                 << ',' << batch.dropped << ",\"";
++            for (const auto source : record.kernel_sources) {
++              for (char c : source) { if (c == '"') rows << '"'; rows << c; }
++              rows << ';';
++            }
++            rows << "\"\n";
++          }
++          std::lock_guard<std::mutex> lock(sink->mutex);
++          sink->file << rows.str();
++          sink->file.flush();
++        });
++  }();
++}
++
+ Device openMeshDevice(const MeshDeviceOptions &options) {
+   std::optional<::ttnn::MeshShape> meshShape = std::nullopt;
+   if (options.meshShape.has_value()) {
+@@ -615,6 +653,7 @@
+   std::shared_ptr<::ttnn::MeshDevice> meshDevice =
+       ::ttnn::MeshDevice::create(meshConfig, l1SmallSize, traceRegionSize,
+                                  options.numHWCQs, dispatchCoreTypeValue);
++  enableRealtimeCSV();
+ 
+   if (options.enableProgramCache) {
+     meshDevice->enable_program_cache();

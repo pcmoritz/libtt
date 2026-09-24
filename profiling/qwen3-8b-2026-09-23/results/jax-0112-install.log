@@ -1,0 +1,13 @@
+Using Python 3.12.3 environment at: /tmp/libtt-profile/venv
+Resolved 6 packages in 143ms
+Downloading jaxlib (85.7MiB)
+Downloading jax (3.2MiB)
+ Downloaded jax
+ Downloaded jaxlib
+Prepared 2 packages in 2.82s
+Uninstalled 2 packages in 7ms
+Installed 2 packages in 3ms
+ - jax==0.11.1
+ + jax==0.11.2
+ - jaxlib==0.11.1
+ + jaxlib==0.11.2

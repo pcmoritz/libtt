@@ -1,3 +1,4 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
 load("@jax_test_pip//:requirements.bzl", "requirement")
 load("@rules_python//python:defs.bzl", "py_test")
 
@@ -95,4 +96,13 @@ py_test(
     main = "pytest_runner.py",
     tags = DEVICE_TEST_TAGS,
     timeout = "eternal",
+)
+
+cc_test(
+    name = "key_value_context_test",
+    srcs = ["key_value_context_test.cc"],
+    linkstatic = True,
+    copts = ["-std=c++20"],
+    deps = ["//:key_value_context"],
+    timeout = "short",
 )

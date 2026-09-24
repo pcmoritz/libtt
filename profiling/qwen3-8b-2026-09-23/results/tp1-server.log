@@ -1,0 +1,190 @@
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[2026-09-23 22:49:22] server_args=ServerArgs(model_path='Qwen/Qwen3-8B', tokenizer_path='Qwen/Qwen3-8B', tokenizer_mode='auto', tokenizer_backend='huggingface', skip_tokenizer_init=False, load_format='auto', model_loader_extra_config='{}', trust_remote_code=False, context_length=None, is_embedding=False, revision=None, model_impl='auto', model_layer_nums=None, host='127.0.0.1', port=31000, skip_server_warmup=True, warmups=None, dtype='bfloat16', quantization=None, quantization_param_path=None, quantization_config_path=None, kv_cache_dtype='auto', dtype_config=None, mem_fraction_static=0.88, max_running_requests=2, max_total_tokens=1024, max_prefill_tokens=256, chunked_prefill_size=256, enable_mixed_chunk=False, schedule_policy='fcfs', schedule_conservativeness=1.0, page_size=32, swa_full_tokens_ratio=0.8, recurrent_state_memory_ratio=0.9, max_recurrent_state_size=None, recurrent_track_interval=None, disable_hybrid_swa_memory=False, device='tt', device_indexes=None, pd_disaggregation='', pd_prefill_mem_fraction=0.85, pd_decode_mem_fraction=0.85, pd_prefill_max_tokens=20480, pd_decode_max_tokens=25600, pd_num_prefill=1, pd_num_decode=1, pd_prefill_tp_size=0, pd_prefill_ep_size=0, tp_size=1, ep_size=1, ep_num_redundant_experts=0, ep_dispatch_algorithm=None, enable_sequence_parallel=False, stream_interval=1, stream_output=False, random_seed=42, constrained_json_whitespace_pattern=None, constrained_json_disable_any_whitespace=False, watchdog_timeout=1200.0, dist_timeout=None, download_dir=None, sleep_on_idle=False, dp_size=1, enable_dp_lm_head=False, moe_dp_size=1, dp_schedule_policy='min_running_queue', log_level='info', log_level_http=None, log_requests=False, log_requests_level=0, crash_dump_folder=None, show_time_cost=False, enable_metrics=False, bucket_time_to_first_token=None, bucket_inter_token_latency=None, bucket_e2e_request_latency=None, decode_log_interval=40, enable_request_time_stats_logging=False, kv_events_config=None, api_key=None, served_model_name='Qwen/Qwen3-8B', file_storage_path='sglang_storage', enable_cache_report=False, reasoning_parser=None, tool_call_parser=None, dist_init_addr=None, nnodes=1, node_rank=0, json_model_override_args='{}', preferred_sampling_params=None, disable_radix_cache=True, enable_unified_radix_tree=False, hicache_storage='disable', hicache_ratio=2.0, hicache_write_through_threshold=1, hicache_write_policy='write_through', enable_recurrent_extra_buffer=False, allow_auto_truncate=False, enable_tokenizer_batch_encode=False, disable_overlap_schedule=True, enable_precision_tracer=False, attention_backend='tt', gdn_prefill_impl='fused_chunk_parallel', dsa_use_pallas=True, moe_backend='epmoe', disable_jax_allreduce_metadata=False, enable_topk_kernel=True, grammar_backend='llguidance', max_seq_len=4096, precompile_token_paddings=None, precompile_bs_paddings=None, precompile_vision_patch_paddings=None, vision_encoder_parallel='dp', disable_precompile=True, speculative_algorithm=None, speculative_draft_model_path=None, speculative_draft_model_revision=None, speculative_num_steps=4, speculative_eagle_topk=5, speculative_num_draft_tokens=4, speculative_sample_from_anchor=False, speculative_accept_threshold_single=1.0, speculative_accept_threshold_acc=1.0, enable_deterministic_sampling=False, enable_single_process=False, enable_nan_detection=False, enable_lora=False, max_lora_rank=None, lora_target_modules=None, lora_paths=None, max_loaded_loras=None, max_loras_per_batch=8, lora_eviction_policy='lru', enable_static_lora=False, lora_scaling=None, enable_engine_loop_run_forever_daemon=False, multimodal=False, limit_mm_data_per_request=None, mm_processor_worker_num=0, enable_return_routed_experts=False, enable_expert_balance_debug=False, expert_balance_segment_counter=100, expert_balance_output_file=None, init_expert_location='trivial', enable_expert_distribution_recorder=False, expert_distribution_recorder_buffer_size=100, expert_distribution_recorder_output_file=None, disaggregation_mode='null', disaggregation_bootstrap_url=None, disaggregation_bootstrap_port=8998, disaggregation_transfer_port=30001, disaggregation_enable_d2h=False, disaggregation_use_raiden=False, disaggregation_enable_overlap_schedule=False, disaggregation_enable_chunk_prefill_transfer=False, disaggregation_side_channel_port=9600, disaggregation_d2h_pool_size=64, disaggregation_d2h_max_tokens=None, disaggregation_channel_number=4, disaggregation_host_ip=None, disaggregation_bootstrap_timeout_seconds=5.0, disaggregation_pull_timeout_seconds=30.0, disaggregation_ack_timeout_seconds=60.0, disaggregation_orphan_reaper_interval_seconds=5.0, disaggregation_shared_secret=None, disaggregation_decode_watchdog_seconds=0.0, disaggregation_num_reserved_decode_tokens=512, disaggregation_max_inflight_transfers=8)
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[2026-09-23 22:49:23] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-8B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[2026-09-23 22:49:23] Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[2026-09-23 22:49:23] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-8B/b968826d9c46dd6066d109eabc6255188de91218/config.json?%2FQwen%2FQwen3-8B%2Fresolve%2Fmain%2Fconfig.json=&etag=%22d46195ac87f837ad233d02b2f80f148bf7c005e0%22 "HTTP/1.1 200 OK"
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[2026-09-23 22:49:23] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-8B/resolve/main/generation_config.json "HTTP/1.1 307 Temporary Redirect"
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[2026-09-23 22:49:23] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-8B/b968826d9c46dd6066d109eabc6255188de91218/generation_config.json?%2FQwen%2FQwen3-8B%2Fresolve%2Fmain%2Fgeneration_config.json=&etag=%2220a8a9156fc8c3f25295ca067f61fdf120d517c5%22 "HTTP/1.1 200 OK"
+[2026-09-23 22:49:23] No quantization config found in HF config or user config
+[2026-09-23 22:49:23] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-8B/revision/main "HTTP/1.1 200 OK"
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 4222.45it/s]
+[2026-09-23 22:49:24] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-8B/revision/main "HTTP/1.1 200 OK"
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 4919.04it/s]
+[2026-09-23 22:49:24] XLA persistent compilation cache: enabled, dir=/tmp/libtt-profile/jax-cache-tp1, min_compile_time=0s
+[2026-09-23 22:49:24] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-8B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[2026-09-23 22:49:24] Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[2026-09-23 22:49:24] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-8B/b968826d9c46dd6066d109eabc6255188de91218/config.json?%2FQwen%2FQwen3-8B%2Fresolve%2Fmain%2Fconfig.json=&etag=%22d46195ac87f837ad233d02b2f80f148bf7c005e0%22 "HTTP/1.1 200 OK"
+[2026-09-23 22:49:25] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-8B/resolve/main/generation_config.json "HTTP/1.1 307 Temporary Redirect"
+[2026-09-23 22:49:25] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-8B/b968826d9c46dd6066d109eabc6255188de91218/generation_config.json?%2FQwen%2FQwen3-8B%2Fresolve%2Fmain%2Fgeneration_config.json=&etag=%2220a8a9156fc8c3f25295ca067f61fdf120d517c5%22 "HTTP/1.1 200 OK"
+[2026-09-23 22:49:25] No quantization config found in HF config or user config
+[2026-09-23 22:49:25] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-8B/revision/main "HTTP/1.1 200 OK"
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 4897.98it/s]
+[2026-09-23 22:49:26] Initialized GuidanceBackend with whitespace_pattern=None
+[2026-09-23 22:49:26] Platform 'tt' is experimental and not all JAX functionality may be correctly supported!
+2026-09-23 22:49:26.852 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 22:49:26.852 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 22:49:26.852 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:95)
+2026-09-23 22:49:26.852 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:114)
+2026-09-23 22:49:26.856 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:574)
+2026-09-23 22:49:26.856 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:118)
+2026-09-23 22:49:26.856 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 22:49:26.876 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:162)
+2026-09-23 22:49:26.876 | info     |             UMD | IOMMU: enabled (cluster.cpp:142)
+2026-09-23 22:49:26.876 | info     |             UMD | KMD version: 2.10.0 (cluster.cpp:145)
+2026-09-23 22:49:26.876 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 22:49:26.876 | warning  |          Device | Using CUSTOM cluster type for P300 board with 1 chips (tt_cluster.cpp:202)
+2026-09-23 22:49:26.876 | critical |          Always | TT_FATAL: Custom fabric mesh graph descriptor path must be specified for CUSTOM cluster type (assert.hpp:104)
+2026-09-23 22:49:26.876 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 22:49:26.876 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+[2026-09-23 22:49:26] Scheduler hit an exception: Traceback (most recent call last):
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 826, in backends
+    backend = _init_backend(platform)
+              ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 910, in _init_backend
+    backend = registration.factory()
+              ^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 563, in make_pjrt_c_api_client
+    return xla_client.make_c_api_client(plugin_name, updated_options, None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/xla_client.py", line 160, in make_c_api_client
+    return _xla.get_c_api_client(
+           ^^^^^^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: INTERNAL: TT_FATAL @ external/+http_archive+tt_metal/tt_metal/llrt/tt_cluster.cpp:279: this->rtoptions_.is_custom_fabric_mesh_graph_desc_path_specified()
+info:
+Custom fabric mesh graph descriptor path must be specified for CUSTOM cluster type
+backtrace:
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x413732e) [0x7d8c4d53732e]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x4139321) [0x7d8c4d539321]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x41399d5) [0x7d8c4d5399d5]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x3f7165b) [0x7d8c4d37165b]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x3f72078) [0x7d8c4d372078]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x3f72319) [0x7d8c4d372319]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x3f67e6b) [0x7d8c4d367e6b]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x3f68265) [0x7d8c4d368265]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x401ac7f) [0x7d8c4d41ac7f]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x1495440) [0x7d8c4a895440]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x14be075) [0x7d8c4a8be075]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x8bd57f) [0x7d8c49cbd57f]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x8d2176) [0x7d8c49cd2176]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x8d22f4) [0x7d8c49cd22f4]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x8d23a6) [0x7d8c49cd23a6]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x3b1cc39) [0x7d8d6bf34c39]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x3b1c8d0) [0x7d8d6bf348d0]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x7a42077) [0x7d8d6fe5a077]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x7a419d0) [0x7d8d6fe599d0]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x3c73dce) [0x7d8d6c08bdce]
+ --- sglang::scheduler(PyObject_Vectorcall+0x35) [0x5499b5]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0xadf) [0x5d710f]
+ --- sglang::scheduler(PyObject_Call+0x115) [0x54b1d5]
+ --- sglang::scheduler() [0x64f814]
+ --- sglang::scheduler(_PyObject_MakeTpCall+0x75) [0x548fb5]
+ --- sglang::scheduler(PyObject_Vectorcall+0x35) [0x5499b5]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0xadf) [0x5d710f]
+ --- sglang::scheduler(PyObject_Vectorcall+0x35) [0x5499b5]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0xe12ed34) [0x7d8d76546d34]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0xe130e23) [0x7d8d76548e23]
+ --- sglang::scheduler() [0x551a56]
+ --- sglang::scheduler(_PyObject_Call_Prepend+0x111) [0x54a851]
+ --- sglang::scheduler() [0x5a3778]
+ --- sglang::scheduler(_PyObject_MakeTpCall+0x75) [0x548fb5]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0xadf) [0x5d710f]
+ --- sglang::scheduler(_PyObject_Call_Prepend+0xc2) [0x54a802]
+ --- sglang::scheduler() [0x59e0ff]
+ --- sglang::scheduler() [0x599bd3]
+ --- sglang::scheduler(_PyObject_MakeTpCall+0x75) [0x548fb5]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0xadf) [0x5d710f]
+ --- sglang::scheduler(PyEval_EvalCode+0x15b) [0x5d55eb]
+ --- sglang::scheduler(PyRun_StringFlags+0xd3) [0x608733]
+ --- sglang::scheduler(PyRun_SimpleStringFlags+0x3e) [0x6b40de]
+ --- sglang::scheduler(Py_RunMain+0x481) [0x6bcda1]
+ --- sglang::scheduler(Py_BytesMain+0x2d) [0x6bc7bd]
+ --- /lib/x86_64-linux-gnu/libc.so.6(+0x2a1ca) [0x7d8d7802a1ca]
+ --- /lib/x86_64-linux-gnu/libc.so.6(__libc_start_main+0x8b) [0x7d8d7802a28b]
+ --- sglang::scheduler(_start+0x25) [0x657a05]
+
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/managers/scheduler.py", line 2976, in run_scheduler_process
+    scheduler = Scheduler(server_args, port_args)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/managers/scheduler.py", line 378, in __init__
+    self.mesh = create_device_mesh(
+                ^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/sglang-jax/python/sgl_jax/srt/utils/mesh_utils.py", line 30, in create_device_mesh
+    devices = jax.devices()
+              ^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 1024, in devices
+    return get_backend(backend).devices()
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 958, in get_backend
+    return _get_backend_uncached(platform)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 937, in _get_backend_uncached
+    bs = backends()
+         ^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/xla_bridge.py", line 842, in backends
+    raise RuntimeError(err_msg)
+RuntimeError: Unable to initialize backend 'tt': INTERNAL: TT_FATAL @ external/+http_archive+tt_metal/tt_metal/llrt/tt_cluster.cpp:279: this->rtoptions_.is_custom_fabric_mesh_graph_desc_path_specified()
+info:
+Custom fabric mesh graph descriptor path must be specified for CUSTOM cluster type
+backtrace:
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x413732e) [0x7d8c4d53732e]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x4139321) [0x7d8c4d539321]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x41399d5) [0x7d8c4d5399d5]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x3f7165b) [0x7d8c4d37165b]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x3f72078) [0x7d8c4d372078]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x3f72319) [0x7d8c4d372319]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x3f67e6b) [0x7d8c4d367e6b]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x3f68265) [0x7d8c4d368265]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x401ac7f) [0x7d8c4d41ac7f]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x1495440) [0x7d8c4a895440]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x14be075) [0x7d8c4a8be075]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x8bd57f) [0x7d8c49cbd57f]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x8d2176) [0x7d8c49cd2176]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x8d22f4) [0x7d8c49cd22f4]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x8d23a6) [0x7d8c49cd23a6]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x3b1cc39) [0x7d8d6bf34c39]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x3b1c8d0) [0x7d8d6bf348d0]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x7a42077) [0x7d8d6fe5a077]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x7a419d0) [0x7d8d6fe599d0]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0x3c73dce) [0x7d8d6c08bdce]
+ --- sglang::scheduler(PyObject_Vectorcall+0x35) [0x5499b5]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0xadf) [0x5d710f]
+ --- sglang::scheduler(PyObject_Call+0x115) [0x54b1d5]
+ --- sglang::scheduler() [0x64f814]
+ --- sglang::scheduler(_PyObject_MakeTpCall+0x75) [0x548fb5]
+ --- sglang::scheduler(PyObject_Vectorcall+0x35) [0x5499b5]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0xadf) [0x5d710f]
+ --- sglang::scheduler(PyObject_Vectorcall+0x35) [0x5499b5]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0xe12ed34) [0x7d8d76546d34]
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jaxlib/libjax_common.so(+0xe130e23) [0x7d8d76548e23]
+ --- sglang::scheduler() [0x551a56]
+ --- sglang::scheduler(_PyObject_Call_Prepend+0x111) [0x54a851]
+ --- sglang::scheduler() [0x5a3778]
+ --- sglang::scheduler(_PyObject_MakeTpCall+0x75) [0x548fb5]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0xadf) [0x5d710f]
+ --- sglang::scheduler(_PyObject_Call_Prepend+0xc2) [0x54a802]
+ --- sglang::scheduler() [0x59e0ff]
+ --- sglang::scheduler() [0x599bd3]
+ --- sglang::scheduler(_PyObject_MakeTpCall+0x75) [0x548fb5]
+ --- sglang::scheduler(_PyEval_EvalFrameDefault+0xadf) [0x5d710f]
+ --- sglang::scheduler(PyEval_EvalCode+0x15b) [0x5d55eb]
+ --- sglang::scheduler(PyRun_StringFlags+0xd3) [0x608733]
+ --- sglang::scheduler(PyRun_SimpleStringFlags+0x3e) [0x6b40de]
+ --- sglang::scheduler(Py_RunMain+0x481) [0x6bcda1]
+ --- sglang::scheduler(Py_BytesMain+0x2d) [0x6bc7bd]
+ --- /lib/x86_64-linux-gnu/libc.so.6(+0x2a1ca) [0x7d8d7802a1ca]
+ --- /lib/x86_64-linux-gnu/libc.so.6(__libc_start_main+0x8b) [0x7d8d7802a28b]
+ --- sglang::scheduler(_start+0x25) [0x657a05]
+ (set JAX_PLATFORMS='' to automatically choose an available backend)
+
+[2026-09-23 22:49:26] Received sigquit from a child process. It usually means the child failed.

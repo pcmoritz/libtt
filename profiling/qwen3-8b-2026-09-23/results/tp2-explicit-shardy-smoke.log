@@ -1,0 +1,86 @@
+Platform 'tt' is experimental and not all JAX functionality may be correctly supported!
+2026-09-23 22:49:02.009 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-23 22:49:02.009 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-23 22:49:02.009 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:95)
+2026-09-23 22:49:02.009 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:114)
+2026-09-23 22:49:02.016 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:574)
+2026-09-23 22:49:02.016 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:118)
+2026-09-23 22:49:02.016 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 22:49:02.016 | warning  |             UMD | Board 0x46131935046 has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-23 22:49:02.056 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1}/[0, 3] and remote chip ids {} (cluster.cpp:162)
+2026-09-23 22:49:02.056 | info     |             UMD | IOMMU: enabled (cluster.cpp:142)
+2026-09-23 22:49:02.056 | info     |             UMD | KMD version: 2.10.0 (cluster.cpp:145)
+2026-09-23 22:49:02.056 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-23 22:49:02.057 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-23 22:49:02.059 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-23 22:49:02.104 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 22:49:02.104 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 22:49:02.104 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:49:02.104 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:49:02.104 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:49:02.104 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:49:02.104 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 22:49:02.104 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 22:49:02.765 | info     |           Metal | [Real-time profiler] Device 0 sync complete: 100 samples, frequency=1.350048 GHz, device_time_at_sync=52540066800 cycles (realtime_profiler_manager.cpp:1390)
+2026-09-23 22:49:02.765 | info     |           Metal | [Real-time profiler] Device 1 sync complete: 100 samples, frequency=1.350049 GHz, device_time_at_sync=47194404436 cycles (realtime_profiler_manager.cpp:1390)
+2026-09-23 22:49:02.776 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-9 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 22:49:02.776 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-8 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 22:49:02.776 | critical |          Always | TT_FATAL: Chip 1 logical eth core 0-3 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 22:49:02.776 | critical |          Always | TT_FATAL: Chip 1 logical eth core 0-2 connects to a remote mmio device (assert.hpp:104)
+2026-09-23 22:49:02.892 | info     |           Metal | Fabric config changed from FabricConfig::DISABLED to FabricConfig::FABRIC_1D, reinitializing control plane (metal_env.cpp:333)
+2026-09-23 22:49:02.892 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-23 22:49:02.892 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-23 22:49:02.892 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:49:02.892 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:49:02.892 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=1 (bus_id=0x4) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:49:02.892 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-23 22:49:02.892 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2400)
+2026-09-23 22:49:02.892 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {1:2} (topology_mapper_utils.cpp:2408)
+2026-09-23 22:49:02.918 | info     |           Metal | Initializing Fabric (fabric_firmware_initializer.cpp:296)
+2026-09-23 22:49:02.928 | info     |           Metal | Fabric initialized on Device 0 (device.cpp:550)
+2026-09-23 22:49:02.929 | info     |           Metal | Fabric initialized on Device 1 (device.cpp:550)
+2026-09-23 22:49:02.929 | info     |           Metal | Fabric initialized on 2 devices (fabric_firmware_initializer.cpp:444)
+2026-09-23 22:49:02.929 | info     |           Metal | Fabric Initialized with config FabricConfig::FABRIC_1D (fabric_firmware_initializer.cpp:313)
+2026-09-23 22:49:02.983 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:1081)
+Devices: [TTDevice(id=0, arch=Blackhole), TTDevice(id=1, arch=Blackhole)]
+2026-09-23 22:49:03.022 (   1.014s) [        9A5FB6C0]               assert.h:121    ERR| TT_FATAL: Runtime tensor does not match the PJRT shard: 8192 vs 4096 bytes
+2026-09-23 22:49:03.022 (   1.014s) [        9A5FB6C0]     buffer_instance.cc:497    ERR| Copy to host buffer failed with error: TT_FATAL @ external/+git_repository+tt_xla_src/pjrt_implementation/src/api/buffer_instance.cc:487: runtime_bytes == logicalTensorSize()
+info:
+Runtime tensor does not match the PJRT shard: 8192 vs 4096 bytes
+backtrace:
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x89477c) [0x791954e9477c]
+ --- /lib/x86_64-linux-gnu/libstdc++.so.6(+0xecdb4) [0x79199aeecdb4]
+ --- /lib/x86_64-linux-gnu/libc.so.6(+0x9cb84) [0x79199ba9cb84]
+ --- /lib/x86_64-linux-gnu/libc.so.6(+0x129ecc) [0x79199bb29ecc]
+
+2026-09-23 22:49:03.022 (   1.014s) [        995F96C0]               assert.h:121    ERR| TT_FATAL: Runtime tensor does not match the PJRT shard: 8192 vs 4096 bytes
+2026-09-23 22:49:03.022 (   1.014s) [        995F96C0]     buffer_instance.cc:497    ERR| Copy to host buffer failed with error: TT_FATAL @ external/+git_repository+tt_xla_src/pjrt_implementation/src/api/buffer_instance.cc:487: runtime_bytes == logicalTensorSize()
+info:
+Runtime tensor does not match the PJRT shard: 8192 vs 4096 bytes
+backtrace:
+ --- /tmp/libtt-profile/venv/lib/python3.12/site-packages/jax_plugins/libtt/libtt.so(+0x89477c) [0x791954e9477c]
+ --- /lib/x86_64-linux-gnu/libstdc++.so.6(+0xecdb4) [0x79199aeecdb4]
+ --- /lib/x86_64-linux-gnu/libc.so.6(+0x9cb84) [0x79199ba9cb84]
+ --- /lib/x86_64-linux-gnu/libc.so.6(+0x129ecc) [0x79199bb29ecc]
+
+Traceback (most recent call last):
+  File "/tmp/libtt-profile/tp_smoke.py", line 16, in <module>
+    np.testing.assert_allclose(np.asarray(f(a)), x+1)
+                               ^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/array.py", line 414, in __array__
+    return np.asarray(self._value, dtype=dtype, **kwds)  # pyrefly: ignore[no-matching-overload]
+                      ^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/profiler.py", line 420, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/venv/lib/python3.12/site-packages/jax/_src/array.py", line 666, in _value
+    npy_value[ind], _ = self._arrays[i]._single_device_array_to_np_array_did_copy()
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: INTERNAL: Error code: 13
+2026-09-23 22:49:03.197 | info     |    BuildKernels | JIT cache stats: 47/47 hits (100.0%) [47 cached, 16 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:197)
+2026-09-23 22:49:03.197 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-09-23 22:49:03.203 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-23 22:49:03.203 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-23 22:49:03.458 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-23 22:49:03.458 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-23 22:49:03.458 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)

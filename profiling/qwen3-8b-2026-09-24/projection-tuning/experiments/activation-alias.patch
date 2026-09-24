@@ -1,0 +1,51 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -10,6 +10,7 @@
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
++#include <cstdlib>
+ #include "ttmlir/Dialect/TTNN/Types/Types.h"
+ #include "ttmlir/Dialect/TTNN/Utils/TransformUtils.h"
+ #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
+@@ -111,8 +112,19 @@
+   // for:
+   // - Constants/parameters: Already on device and immutable
+   // - KV cache tensors: Device-native and updated in-place by cache operations
++  bool isLargeDeviceActivation(mlir::Type type) {
++    if (!std::getenv("LIBTT_KEEP_TRACE_ACTIVATIONS")) return false;
++    auto tensor = mlir::dyn_cast<RankedTensorType>(type);
++    if (!tensor || !tensor.hasStaticShape() || tensor.getNumElements() < 1024)
++      return false;
++    auto layout = mlir::dyn_cast_or_null<TTNNLayoutAttr>(tensor.getEncoding());
++    return layout && layout.getBufferType() != BufferType::SystemMemory &&
++           (tensor.getElementType().isBF16() || tensor.getElementType().isF32());
++  }
++
+   bool shouldKeepArgOnDevice(func::FuncOp op, size_t argIndex) {
+-    return ttcore::isConstantOrParameterArgumentType(op, argIndex) ||
++    return isLargeDeviceActivation(op.getArgument(argIndex).getType()) ||
++           ttcore::isConstantOrParameterArgumentType(op, argIndex) ||
+            ttcore::isKVCacheArgument(op, argIndex);
+   }
+ 
+@@ -124,6 +136,7 @@
+   //    buffer (e.g. stats scratch for distributed_rms_norm) that must be
+   //    passed through, not host-staged.
+   bool isDeviceResidentValue(mlir::Value value) {
++    if (isLargeDeviceActivation(value.getType())) return true;
+     if (auto blockArg = mlir::dyn_cast<BlockArgument>(value)) {
+       auto funcOp =
+           mlir::dyn_cast<func::FuncOp>(blockArg.getOwner()->getParentOp());
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -88,6 +88,7 @@
+   LOG_ASSERT(srcTensor.storage_type() == ::ttnn::StorageType::DEVICE &&
+                  dstTensor.storage_type() == ::ttnn::StorageType::DEVICE,
+              "srcTensor must be on device and dstTensor must be on device");
++  if (&srcTensor.mesh_buffer() == &dstTensor.mesh_buffer()) return;
+   ::ttnn::Tensor hostSrcTensor = ::ttnn::from_device(srcTensor);
+   ::ttnn::copy_to_device(hostSrcTensor, dstTensor);
+ }

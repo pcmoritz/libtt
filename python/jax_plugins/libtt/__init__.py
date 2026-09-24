@@ -27,3 +27,12 @@ def initialize() -> None:
         library_path=str(library_path),
         options=None,
     )
+
+    # Runs before JAX's exit handler shuts down its distributed coordinator.
+    import atexit
+    import ctypes
+
+    shutdown = ctypes.CDLL(str(library_path)).tt_pjrt_shutdown
+    shutdown.argtypes = []
+    shutdown.restype = None
+    atexit.register(shutdown)

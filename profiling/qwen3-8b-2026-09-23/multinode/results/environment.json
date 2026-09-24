@@ -1,0 +1,24 @@
+{
+  "libtt_base_commit": "6b74ca2ab2b86abc85a454460c451995f1b52f62",
+  "libtt_local_fixes": true,
+  "sglang_commit": "6ca38400e6130bc242b215af52b8984bc859036e",
+  "sglang_local_changes": "",
+  "python": "3.12.3",
+  "packages": {
+    "jax": "0.11.1",
+    "jaxlib": "0.11.1",
+    "flax": "0.12.9",
+    "transformers": "4.57.6",
+    "sglang-jax": "0.1.0rc1.dev73+g6ca38400e"
+  },
+  "partitioner": "shardy",
+  "cpu_profile": "performance",
+  "wheel_sha256": "b0a6aba66fb6a417507fa731b811ca84c6f94c82fffafb2e6fad93348da2a760",
+  "tp1_pci": [
+    "0000:01:00.0"
+  ],
+  "tp2_pci": [
+    "0000:01:00.0",
+    "0000:04:00.0"
+  ]
+}

@@ -1,0 +1,117 @@
+[
+  {
+    "file": "/tmp/libtt-profile/14b-opt/zero/export-tp2/irs/ttnn_1790230666323.mlir",
+    "function": "trace_0_main",
+    "phase": "prefill",
+    "batch": null,
+    "counts": {
+      "ttnn.add": 166,
+      "ttnn.all_reduce": 80,
+      "ttnn.chunked_scaled_dot_product_attention": 40,
+      "ttnn.clamp_scalar": 4,
+      "ttnn.concat": 80,
+      "ttnn.concatenate_heads": 40,
+      "ttnn.copy": 1,
+      "ttnn.cos": 1,
+      "ttnn.deallocate": 2749,
+      "ttnn.embedding": 162,
+      "ttnn.gt": 4,
+      "ttnn.matmul": 161,
+      "ttnn.multiply": 363,
+      "ttnn.paged_fill_cache": 80,
+      "ttnn.permute": 120,
+      "ttnn.reshape": 571,
+      "ttnn.rms_norm": 161,
+      "ttnn.silu": 40,
+      "ttnn.sin": 1,
+      "ttnn.slice_static": 360,
+      "ttnn.subtract": 80,
+      "ttnn.to_layout": 299,
+      "ttnn.typecast": 12,
+      "ttnn.where": 4
+    },
+    "fused_swiglu": 0,
+    "qkv_projection_chains": 0,
+    "bf8_projection_weight_shapes": {
+      "2560x5120": 40,
+      "5120x17408": 40,
+      "5120x3584": 40,
+      "75968x5120": 1,
+      "8704x5120": 40
+    },
+    "matmul_transpose_b": 1,
+    "residual_after_all_reduce": 80,
+    "rms_compute_configs": {
+      "#ttnn.device_compute_kernel_config<math_fidelity = hifi4, math_approx_mode = false, fp32_dest_acc_en = true, packer_l1_acc = true>": 161
+    },
+    "examples": {
+      "swiglu": null,
+      "qkv_projection": [],
+      "residual_chain": [
+        [
+          "%104 = \"ttnn.matmul\"(%103, %arg308) <{transpose_a = false, transpose_b = false}> {ttcore.weight_dtype = \"bfp_bf8\"} : (tensor<64x2560xbf16, #ttnn_layout62>, tensor<2560x5120x!ttcore.tile<32x32, bfp_bf8>, #ttnn_layout33>) -> tensor<64x5120xbf16, #ttnn_layout60> loc(#loc835)",
+          "%106 = \"ttnn.all_reduce\"(%105) <{cluster_axis = 1 : ui32, reduce_type = #ttcore.reduce_type<sum>, topology = #ttcore.topology<ring>}> : (tensor<1x1x64x5120xbf16, #ttnn_layout90>) -> tensor<1x1x64x5120xbf16, #ttnn_layout90> loc(#loc901)",
+          "%108 = \"ttnn.add\"(%107, %12) : (tensor<64x5120xbf16, #ttnn_layout60>, tensor<64x5120xbf16, #ttnn_layout60>) -> tensor<64x5120xbf16, #ttnn_layout60> loc(#loc751)"
+        ]
+      ],
+      "linear": null
+    }
+  },
+  {
+    "file": "/tmp/libtt-profile/14b-opt/zero/export-tp2/irs/ttnn_1790230719359.mlir",
+    "function": "trace_2_main",
+    "phase": "decode",
+    "batch": 1,
+    "counts": {
+      "ttnn.add": 81,
+      "ttnn.all_reduce": 80,
+      "ttnn.clamp_scalar": 1,
+      "ttnn.concat": 2,
+      "ttnn.copy": 1,
+      "ttnn.cos": 1,
+      "ttnn.deallocate": 991,
+      "ttnn.embedding": 1,
+      "ttnn.gt": 1,
+      "ttnn.matmul": 161,
+      "ttnn.multiply": 1,
+      "ttnn.nlp_create_qkv_heads_decode": 40,
+      "ttnn.paged_scaled_dot_product_attention_decode": 40,
+      "ttnn.paged_update_cache": 80,
+      "ttnn.reshape": 248,
+      "ttnn.rms_norm": 161,
+      "ttnn.rotary_embedding": 80,
+      "ttnn.sin": 1,
+      "ttnn.to_layout": 6,
+      "ttnn.typecast": 5,
+      "ttnn.where": 1
+    },
+    "fused_swiglu": 40,
+    "qkv_projection_chains": 40,
+    "bf8_projection_weight_shapes": {
+      "2560x5120": 40,
+      "5120x17408": 40,
+      "5120x3584": 40,
+      "75968x5120": 1,
+      "8704x5120": 40
+    },
+    "matmul_transpose_b": 1,
+    "residual_after_all_reduce": 80,
+    "rms_compute_configs": {
+      "#ttnn.device_compute_kernel_config<math_fidelity = hifi4, math_approx_mode = false, fp32_dest_acc_en = true, packer_l1_acc = true>": 161
+    },
+    "examples": {
+      "swiglu": "%44 = \"ttnn.matmul\"(%43, %arg337) <{transpose_a = false, transpose_b = false}> {ttcore.weight_dtype = \"bfp_bf8\", ttnn.fused_swiglu} : (tensor<1x5120xbf16, #ttnn_layout56>, tensor<5120x17408x!ttcore.tile<32x32, bfp_bf8>, #ttnn_layout2>) -> tensor<1x8704xbf16, #ttnn_layout69> loc(#loc760)",
+      "qkv_projection": [
+        "%16 = \"ttnn.matmul\"(%15, %arg238) <{transpose_a = false, transpose_b = false}> {ttcore.weight_dtype = \"bfp_bf8\"} : (tensor<1x5120xbf16, #ttnn_layout56>, tensor<5120x3584x!ttcore.tile<32x32, bfp_bf8>, #ttnn_layout10>) -> tensor<1x3584xbf16, #ttnn_layout57> loc(#loc761)"
+      ],
+      "residual_chain": [
+        [
+          "%38 = \"ttnn.matmul\"(%37, %arg403) <{transpose_a = false, transpose_b = false}> {ttcore.weight_dtype = \"bfp_bf8\"} : (tensor<1x2560xbf16, #ttnn_layout67>, tensor<2560x5120x!ttcore.tile<32x32, bfp_bf8>, #ttnn_layout31>) -> tensor<1x5120xbf16, #ttnn_layout56> loc(#loc763)",
+          "%40 = \"ttnn.all_reduce\"(%39) <{cluster_axis = 1 : ui32, reduce_type = #ttcore.reduce_type<sum>, topology = #ttcore.topology<ring>}> : (tensor<1x1x1x5120xbf16, #ttnn_layout68>) -> tensor<1x1x1x5120xbf16, #ttnn_layout68> loc(#loc798)",
+          "%42 = \"ttnn.add\"(%41, %12) : (tensor<1x5120xbf16, #ttnn_layout56>, tensor<1x5120xbf16, #ttnn_layout54>) -> tensor<1x5120xbf16, #ttnn_layout56> loc(#loc706)"
+        ]
+      ],
+      "linear": null
+    }
+  }
+]

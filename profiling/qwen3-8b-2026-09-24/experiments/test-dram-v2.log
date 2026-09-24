@@ -1,0 +1,425 @@
+Computing main repo mapping: 
+Loading: 
+Loading: 0 packages loaded
+Analyzing: target //tests:libtt_test_suite (1 packages loaded, 0 targets configured)
+Analyzing: target //tests:libtt_test_suite (1 packages loaded, 0 targets configured)
+
+INFO: Analyzed target //tests:libtt_test_suite (1 packages loaded, 114 targets configured).
+[7,401 / 7,402] Testing //tests:libtt_test_suite; 1s local
+[7,401 / 7,402] Testing //tests:libtt_test_suite; 23s local
+FAIL: //tests:libtt_test_suite (Exit 1) (see /home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/testlogs/tests/libtt_test_suite/test.log)
+INFO: From Testing //tests:libtt_test_suite:
+==================== Test output for //tests:libtt_test_suite:
+Platform 'tt' is experimental and not all JAX functionality may be correctly supported!
+2026-09-24 00:39:41.790 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-24 00:39:41.790 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-24 00:39:41.790 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:95)
+2026-09-24 00:39:41.790 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:114)
+2026-09-24 00:39:41.794 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:574)
+2026-09-24 00:39:41.794 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:118)
+2026-09-24 00:39:41.794 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:39:41.814 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:162)
+2026-09-24 00:39:41.814 | info     |             UMD | IOMMU: enabled (cluster.cpp:142)
+2026-09-24 00:39:41.814 | info     |             UMD | KMD version: 2.10.0 (cluster.cpp:145)
+2026-09-24 00:39:41.814 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-24 00:39:41.814 | warning  |          Device | Using CUSTOM cluster type for P300 board with 1 chips (tt_cluster.cpp:202)
+2026-09-24 00:39:41.814 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-24 00:39:41.815 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-24 00:39:41.839 | info     |     Distributed | Using custom mesh graph descriptor: /tmp/libtt-profile/tp1.textproto (metal_env.cpp:433)
+2026-09-24 00:39:41.839 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-24 00:39:41.840 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2400)
+2026-09-24 00:39:41.840 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2408)
+2026-09-24 00:39:44.576 | info     |           Metal | [Real-time profiler] Device 0 sync complete: 100 samples, frequency=1.349976 GHz, device_time_at_sync=4181489702850 cycles (realtime_profiler_manager.cpp:1390)
+2026-09-24 00:39:44.587 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-9 connects to a remote mmio device (assert.hpp:104)
+2026-09-24 00:39:44.588 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-8 connects to a remote mmio device (assert.hpp:104)
+2026-09-24 00:39:44.588 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-4 connects to a remote mmio device (assert.hpp:104)
+2026-09-24 00:39:44.588 | critical |          Always | TT_FATAL: Chip 0 logical eth core 0-2 connects to a remote mmio device (assert.hpp:104)
+2026-09-24 00:39:44.762 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:1081)
+Using JAX 0.11.2 with 1 TT device(s) from jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl
+============================= test session starts ==============================
+platform linux -- Python 3.13.9, pytest-8.4.2, pluggy-1.6.0
+rootdir: /home/ttuser/libtt/tests/libtt
+configfile: pytest.ini
+testpaths: .
+collected 117 items / 99 deselected / 18 selected
+
+decode_dram_matmul_test.py ........                                      [ 44%]
+swiglu_regression_test.py ........FF                                     [100%]
+
+=================================== FAILURES ===================================
+__________________ test_swiglu_projection_width[1-4096-12288] __________________
+
+rows = 1, inner_size = 4096, width = 12288
+
+    @pytest.mark.parametrize(
+        "rows,inner_size,width",
+        [(1, 64, n) for n in (3072, 4096, 6144, 9216, 12288)]
+        + [
+            (1, 32, 6144),
+            (1, 96, 6144),
+            (1, 4096, 6144),
+            (1, 4096, 12288),
+            (32, 512, 6144),
+        ],
+    )
+    def test_swiglu_projection_width(rows, inner_size, width):
+        def swiglu(x, weights):
+            weights = weights[None]
+            weights = jax.ffi.ffi_call(
+                "tt.weight_dtype_override",
+                jax.ShapeDtypeStruct(weights.shape, weights.dtype),
+                vmap_method="sequential",
+            )(weights, **{"ttcore.weight_dtype": "bfp_bf8"})[0]
+            up, gate = jnp.split(x @ weights, 2, axis=-1)
+            return up * jax.nn.silu(gate)
+    
+        run = jax.jit(
+            swiglu,
+            compiler_options={"optimization_level": "O1", "enable_trace": "true"},
+        )
+        device = jax.devices("tt")[0]
+        rng = np.random.default_rng(6)
+        for _ in range(3):
+            # Exactly representable BFP8 weights keep this focused on the fusion.
+            x = (rng.integers(-4, 5, (rows, inner_size)) / 16).astype(jnp.bfloat16)
+            weights = (rng.integers(-4, 5, (inner_size, 2 * width)) / 16).astype(jnp.bfloat16)
+            actual = run(jax.device_put(x, device), jax.device_put(weights, device))
+            up, gate = np.split(x.astype(np.float32) @ weights.astype(np.float32), 2, axis=-1)
+            expected = up * gate / (1 + np.exp(-gate))
+>           np.testing.assert_allclose(
+                np.asarray(actual).astype(np.float32), expected, atol=0.01, rtol=0.04
+            )
+
+swiglu_regression_test.py:44: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+args = (<function assert_allclose.<locals>.compare at 0x79a4447b5300>, array([[-0.10986328, -0.8359375 , -3.875     , ...,  0...), array([[-0.10874367, -0.8410992 , -3.654595  , ...,  0.10509555,
+         0.47054487,  0.56127036]], dtype=float32))
+kwds = {'equal_nan': True, 'err_msg': '', 'header': 'Not equal to tolerance rtol=0.04, atol=0.01', 'strict': False, ...}
+
+    @wraps(func)
+    def inner(*args, **kwds):
+        with self._recreate_cm():
+>           return func(*args, **kwds)
+                   ^^^^^^^^^^^^^^^^^^^
+E           AssertionError: 
+E           Not equal to tolerance rtol=0.04, atol=0.01
+E           
+E           Mismatched elements: 917 / 12288 (7.46%)
+E           Max absolute difference among violations: 0.47705364
+E           Max relative difference among violations: 3.008273
+E            ACTUAL: array([[-0.109863, -0.835938, -3.875   , ...,  0.103027,  0.480469,
+E                    0.554688]], dtype=float32)
+E            DESIRED: array([[-0.108744, -0.841099, -3.654595, ...,  0.105096,  0.470545,
+E                    0.56127 ]], dtype=float32)
+
+../../../.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/external/rules_python++python+python_3_13_x86_64-unknown-linux-gnu/lib/python3.13/contextlib.py:85: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-09-24 00:40:01.496 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_MPTV5Y/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-24 00:40:01.496 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.496 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-24 00:40:01.497 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.497 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-24 00:40:01.497 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.497 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-24 00:40:01.497 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-24 00:40:01.497 | warning  |          Device | Using CUSTOM cluster type for P300 board with 1 chips (tt_cluster.cpp:202)
+2026-09-24 00:40:01.497 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-24 00:40:01.497 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-24 00:40:01.498 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.498 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.498 | info     |     Distributed | Using custom mesh graph descriptor: /tmp/libtt-profile/tp1.textproto (metal_env.cpp:433)
+2026-09-24 00:40:01.498 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2400)
+2026-09-24 00:40:01.498 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2408)
+2026-09-24 00:40:01.500 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-24 00:40:01.501 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-24 00:40:01.501 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-24 00:40:01.501 | info     |           Metal | Disabling and clearing program cache on MeshDevice 66 (mesh_device.cpp:1091)
+2026-09-24 00:40:01.501 | info     |           Metal | Disabling and clearing program cache on MeshDevice 66 (mesh_device.cpp:1091)
+2026-09-24 00:40:01.501 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-24 00:40:01.501 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-24 00:40:01.501 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-24 00:40:01.501 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-24 00:40:01.501 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-24 00:40:01.501 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-24 00:40:01.501 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_MPTV5Y/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-24 00:40:01.501 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.501 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-24 00:40:01.501 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.501 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-24 00:40:01.501 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.501 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-24 00:40:01.502 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-24 00:40:01.502 | warning  |          Device | Using CUSTOM cluster type for P300 board with 1 chips (tt_cluster.cpp:202)
+2026-09-24 00:40:01.502 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-24 00:40:01.502 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-24 00:40:01.502 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.502 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.502 | info     |     Distributed | Using custom mesh graph descriptor: /tmp/libtt-profile/tp1.textproto (metal_env.cpp:433)
+2026-09-24 00:40:01.503 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2400)
+2026-09-24 00:40:01.503 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2408)
+2026-09-24 00:40:01.505 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-24 00:40:01.505 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-24 00:40:01.505 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-24 00:40:01.505 | info     |           Metal | Disabling and clearing program cache on MeshDevice 67 (mesh_device.cpp:1091)
+2026-09-24 00:40:01.505 | info     |           Metal | Disabling and clearing program cache on MeshDevice 67 (mesh_device.cpp:1091)
+2026-09-24 00:40:01.505 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-24 00:40:01.505 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-24 00:40:01.505 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-24 00:40:01.505 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-24 00:40:01.505 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-24 00:40:01.505 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-24 00:40:01.505 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_MPTV5Y/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-24 00:40:01.505 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.505 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-24 00:40:01.505 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.505 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-24 00:40:01.505 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.505 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-24 00:40:01.506 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-24 00:40:01.506 | warning  |          Device | Using CUSTOM cluster type for P300 board with 1 chips (tt_cluster.cpp:202)
+2026-09-24 00:40:01.506 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-24 00:40:01.506 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-24 00:40:01.506 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.506 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.506 | info     |     Distributed | Using custom mesh graph descriptor: /tmp/libtt-profile/tp1.textproto (metal_env.cpp:433)
+2026-09-24 00:40:01.507 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2400)
+2026-09-24 00:40:01.507 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2408)
+2026-09-24 00:40:01.508 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-24 00:40:01.508 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-24 00:40:01.508 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-24 00:40:01.508 | info     |           Metal | Disabling and clearing program cache on MeshDevice 68 (mesh_device.cpp:1091)
+2026-09-24 00:40:01.508 | info     |           Metal | Disabling and clearing program cache on MeshDevice 68 (mesh_device.cpp:1091)
+2026-09-24 00:40:01.509 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-24 00:40:01.509 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-24 00:40:01.509 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-24 00:40:01.509 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-24 00:40:01.509 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-24 00:40:01.509 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-24 00:40:01.509 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_MPTV5Y/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-24 00:40:01.509 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.509 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-24 00:40:01.509 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.509 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-24 00:40:01.509 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.509 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-24 00:40:01.510 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-24 00:40:01.510 | warning  |          Device | Using CUSTOM cluster type for P300 board with 1 chips (tt_cluster.cpp:202)
+2026-09-24 00:40:01.510 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-24 00:40:01.510 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-24 00:40:01.510 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.510 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:01.510 | info     |     Distributed | Using custom mesh graph descriptor: /tmp/libtt-profile/tp1.textproto (metal_env.cpp:433)
+2026-09-24 00:40:01.510 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2400)
+2026-09-24 00:40:01.510 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2408)
+2026-09-24 00:40:01.512 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-24 00:40:01.512 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-24 00:40:01.512 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-24 00:40:01.512 | info     |           Metal | Disabling and clearing program cache on MeshDevice 69 (mesh_device.cpp:1091)
+2026-09-24 00:40:01.525 | info     |           Metal | Disabling and clearing program cache on MeshDevice 69 (mesh_device.cpp:1091)
+2026-09-24 00:40:01.525 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-24 00:40:01.525 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-24 00:40:01.525 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-24 00:40:01.525 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-24 00:40:01.525 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-24 00:40:01.525 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+__________________ test_swiglu_projection_width[32-512-6144] ___________________
+
+rows = 32, inner_size = 512, width = 6144
+
+    @pytest.mark.parametrize(
+        "rows,inner_size,width",
+        [(1, 64, n) for n in (3072, 4096, 6144, 9216, 12288)]
+        + [
+            (1, 32, 6144),
+            (1, 96, 6144),
+            (1, 4096, 6144),
+            (1, 4096, 12288),
+            (32, 512, 6144),
+        ],
+    )
+    def test_swiglu_projection_width(rows, inner_size, width):
+        def swiglu(x, weights):
+            weights = weights[None]
+            weights = jax.ffi.ffi_call(
+                "tt.weight_dtype_override",
+                jax.ShapeDtypeStruct(weights.shape, weights.dtype),
+                vmap_method="sequential",
+            )(weights, **{"ttcore.weight_dtype": "bfp_bf8"})[0]
+            up, gate = jnp.split(x @ weights, 2, axis=-1)
+            return up * jax.nn.silu(gate)
+    
+        run = jax.jit(
+            swiglu,
+            compiler_options={"optimization_level": "O1", "enable_trace": "true"},
+        )
+        device = jax.devices("tt")[0]
+        rng = np.random.default_rng(6)
+        for _ in range(3):
+            # Exactly representable BFP8 weights keep this focused on the fusion.
+            x = (rng.integers(-4, 5, (rows, inner_size)) / 16).astype(jnp.bfloat16)
+            weights = (rng.integers(-4, 5, (inner_size, 2 * width)) / 16).astype(jnp.bfloat16)
+            actual = run(jax.device_put(x, device), jax.device_put(weights, device))
+            up, gate = np.split(x.astype(np.float32) @ weights.astype(np.float32), 2, axis=-1)
+            expected = up * gate / (1 + np.exp(-gate))
+>           np.testing.assert_allclose(
+                np.asarray(actual).astype(np.float32), expected, atol=0.01, rtol=0.04
+            )
+
+swiglu_regression_test.py:44: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+args = (<function assert_allclose.<locals>.compare at 0x79a4447b5260>, array([[-1.11328125e-01, -1.59179688e-01, -2.25585938e...937e-01,  4.9468715e-02, -2.9597338e-02, ...,
+         1.0798065e-02, -3.2727930e-03, -5.2920286e-02]], dtype=float32))
+kwds = {'equal_nan': True, 'err_msg': '', 'header': 'Not equal to tolerance rtol=0.04, atol=0.01', 'strict': False, ...}
+
+    @wraps(func)
+    def inner(*args, **kwds):
+        with self._recreate_cm():
+>           return func(*args, **kwds)
+                   ^^^^^^^^^^^^^^^^^^^
+E           AssertionError: 
+E           Not equal to tolerance rtol=0.04, atol=0.01
+E           
+E           Mismatched elements: 150 / 196608 (0.0763%)
+E           Max absolute difference among violations: 0.1637671
+E           Max relative difference among violations: 3.0378106
+E            ACTUAL: array([[-1.113281e-01, -1.591797e-01, -2.255859e-01, ..., -7.080078e-02,
+E                    1.176758e-01, -1.287460e-04],
+E                  [ 1.274109e-03, -1.892090e-02,  3.320312e-02, ...,  1.875000e-01,...
+E            DESIRED: array([[-1.117665e-01, -1.593101e-01, -2.253499e-01, ..., -7.075288e-02,
+E                    1.177539e-01, -1.294464e-04],
+E                  [ 1.281696e-03, -1.893471e-02,  3.306340e-02, ...,  1.818437e-01,...
+
+../../../.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/external/rules_python++python+python_3_13_x86_64-unknown-linux-gnu/lib/python3.13/contextlib.py:85: AssertionError
+----------------------------- Captured stdout call -----------------------------
+2026-09-24 00:40:02.448 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_MPTV5Y/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-24 00:40:02.449 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.449 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-24 00:40:02.449 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.449 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-24 00:40:02.449 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.449 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-24 00:40:02.449 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-24 00:40:02.449 | warning  |          Device | Using CUSTOM cluster type for P300 board with 1 chips (tt_cluster.cpp:202)
+2026-09-24 00:40:02.450 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-24 00:40:02.450 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-24 00:40:02.450 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.450 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.450 | info     |     Distributed | Using custom mesh graph descriptor: /tmp/libtt-profile/tp1.textproto (metal_env.cpp:433)
+2026-09-24 00:40:02.450 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2400)
+2026-09-24 00:40:02.450 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2408)
+2026-09-24 00:40:02.453 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-24 00:40:02.453 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-24 00:40:02.453 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-24 00:40:02.453 | info     |           Metal | Disabling and clearing program cache on MeshDevice 70 (mesh_device.cpp:1091)
+2026-09-24 00:40:02.453 | info     |           Metal | Disabling and clearing program cache on MeshDevice 70 (mesh_device.cpp:1091)
+2026-09-24 00:40:02.453 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-24 00:40:02.453 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-24 00:40:02.453 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-24 00:40:02.453 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-24 00:40:02.453 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-24 00:40:02.453 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-24 00:40:02.453 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_MPTV5Y/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-24 00:40:02.453 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.453 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-24 00:40:02.454 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.454 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-24 00:40:02.454 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.454 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-24 00:40:02.454 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-24 00:40:02.454 | warning  |          Device | Using CUSTOM cluster type for P300 board with 1 chips (tt_cluster.cpp:202)
+2026-09-24 00:40:02.454 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-24 00:40:02.454 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-24 00:40:02.455 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.455 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.455 | info     |     Distributed | Using custom mesh graph descriptor: /tmp/libtt-profile/tp1.textproto (metal_env.cpp:433)
+2026-09-24 00:40:02.455 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2400)
+2026-09-24 00:40:02.455 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2408)
+2026-09-24 00:40:02.457 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-24 00:40:02.457 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-24 00:40:02.457 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-24 00:40:02.457 | info     |           Metal | Disabling and clearing program cache on MeshDevice 71 (mesh_device.cpp:1091)
+2026-09-24 00:40:02.457 | info     |           Metal | Disabling and clearing program cache on MeshDevice 71 (mesh_device.cpp:1091)
+2026-09-24 00:40:02.457 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-24 00:40:02.457 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-24 00:40:02.457 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-24 00:40:02.457 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-24 00:40:02.457 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-24 00:40:02.457 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-24 00:40:02.457 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_MPTV5Y/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-24 00:40:02.457 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.457 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-24 00:40:02.457 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.457 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-24 00:40:02.458 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.458 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-24 00:40:02.458 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-24 00:40:02.458 | warning  |          Device | Using CUSTOM cluster type for P300 board with 1 chips (tt_cluster.cpp:202)
+2026-09-24 00:40:02.458 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-24 00:40:02.458 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-24 00:40:02.458 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.459 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.459 | info     |     Distributed | Using custom mesh graph descriptor: /tmp/libtt-profile/tp1.textproto (metal_env.cpp:433)
+2026-09-24 00:40:02.459 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2400)
+2026-09-24 00:40:02.459 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2408)
+2026-09-24 00:40:02.460 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-24 00:40:02.461 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-24 00:40:02.461 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-24 00:40:02.461 | info     |           Metal | Disabling and clearing program cache on MeshDevice 72 (mesh_device.cpp:1091)
+2026-09-24 00:40:02.461 | info     |           Metal | Disabling and clearing program cache on MeshDevice 72 (mesh_device.cpp:1091)
+2026-09-24 00:40:02.461 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-24 00:40:02.461 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-24 00:40:02.461 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-24 00:40:02.461 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-24 00:40:02.461 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-24 00:40:02.461 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+2026-09-24 00:40:02.461 | info     |           Metal | Using programmatically configured mock mode: /tmp/umd_MPTV5Y/cluster_descriptor.yaml (metal_env.cpp:183)
+2026-09-24 00:40:02.461 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.461 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-24 00:40:02.461 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.461 | warning  |          Device | Currently using mock cluster descriptor, all device driver calls will be mocked (tt_cluster.cpp:251)
+2026-09-24 00:40:02.461 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.461 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-24 00:40:02.462 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-24 00:40:02.462 | warning  |          Device | Using CUSTOM cluster type for P300 board with 1 chips (tt_cluster.cpp:202)
+2026-09-24 00:40:02.462 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-24 00:40:02.462 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-24 00:40:02.462 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.463 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:40:02.463 | info     |     Distributed | Using custom mesh graph descriptor: /tmp/libtt-profile/tp1.textproto (metal_env.cpp:433)
+2026-09-24 00:40:02.463 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2400)
+2026-09-24 00:40:02.463 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2408)
+2026-09-24 00:40:02.464 | info     |           Metal | Skipping host-side CQ initialization for mock devices (command_queue_initializer.cpp:27)
+2026-09-24 00:40:02.464 | info     |           Metal | Skipping dispatch firmware initialization for mock devices (dispatch_kernel_initializer.cpp:70)
+2026-09-24 00:40:02.464 | info     |           Metal | Skipping fabric configure (router sync) for mock/emule devices (fabric_firmware_initializer.cpp:328)
+2026-09-24 00:40:02.464 | info     |           Metal | Disabling and clearing program cache on MeshDevice 73 (mesh_device.cpp:1091)
+2026-09-24 00:40:02.474 | info     |           Metal | Disabling and clearing program cache on MeshDevice 73 (mesh_device.cpp:1091)
+2026-09-24 00:40:02.474 | info     |           Metal | Skipping fabric teardown for mock/emule devices (fabric_firmware_initializer.cpp:343)
+2026-09-24 00:40:02.474 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-24 00:40:02.474 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-24 00:40:02.474 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-24 00:40:02.474 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-24 00:40:02.474 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+=========================== short test summary info ============================
+FAILED swiglu_regression_test.py::test_swiglu_projection_width[1-4096-12288]
+FAILED swiglu_regression_test.py::test_swiglu_projection_width[32-512-6144]
+================= 2 failed, 16 passed, 99 deselected in 18.55s =================
+2026-09-24 00:40:03.637 | info     |    BuildKernels | JIT cache stats: 0/238 hits (0.0%) [0 cached, 141 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:197)
+2026-09-24 00:40:03.637 | info     |    BuildKernels | JIT telemetry: 2 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-09-24 00:40:03.640 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-24 00:40:03.640 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-24 00:40:03.784 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-24 00:40:03.784 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-24 00:40:03.784 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+================================================================================
+INFO: Found 1 test target...
+Target //tests:libtt_test_suite up-to-date:
+  bazel-bin/tests/libtt_test_suite
+INFO: Elapsed time: 23.824s, Critical Path: 23.27s
+INFO: 3 processes: 28 action cache hit, 2 internal, 2 local.
+INFO: Build completed, 1 test FAILED, 3 total actions
+//tests:libtt_test_suite                                                 FAILED in 23.2s
+  /home/ttuser/.cache/bazel/_bazel_ttuser/ef55f4fe18dbb61509e52f9b5f768607/execroot/_main/bazel-out/k8-opt/testlogs/tests/libtt_test_suite/test.log
+
+Executed 1 out of 1 test: 1 fails locally.

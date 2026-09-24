@@ -1,0 +1,26 @@
+{
+  "tp1-measured-short": {
+    "requests": 5,
+    "all_match": true
+  },
+  "tp1-measured-long": {
+    "requests": 5,
+    "all_match": true
+  },
+  "tp1-concurrent-short": {
+    "requests": 2,
+    "all_match": true
+  },
+  "tp2-measured-short": {
+    "requests": 5,
+    "all_match": true
+  },
+  "tp2-measured-long": {
+    "requests": 5,
+    "all_match": true
+  },
+  "tp2-concurrent-short": {
+    "requests": 2,
+    "all_match": true
+  }
+}

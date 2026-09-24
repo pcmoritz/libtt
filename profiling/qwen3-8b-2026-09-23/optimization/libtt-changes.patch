@@ -1,0 +1,343 @@
+diff --git a/MODULE.bazel b/MODULE.bazel
+index 858c80e..9ae7308 100644
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -250,6 +250,7 @@ http_archive(
+         "//third_party/tt_metal:remove_boost_dependencies.patch",
+         "//third_party/tt_metal:fabric_build.patch",
+         "//third_party/tt_metal:all_gather_packet_headers.patch",
++        "//third_party/tt_metal:reshaped_mesh_link_discovery.patch",
+         "//third_party/tt_metal:all_gather_slice_overflow.patch",
+         "//third_party/tt_metal:fabric_router_teardown.patch",
+         "//third_party/tt_metal:fabric_packet_size.patch",
+@@ -388,6 +389,7 @@ git_repository(
+         "//third_party/tt_xla:tt_xla_main_entry_function.patch",
+         "//third_party/tt_xla:tt_xla_donation.patch",
+         "//third_party/tt_xla:tt_xla_jax_distributed.patch",
++        "//third_party/tt_xla:tt_xla_local_mesh_shards.patch",
+     ],
+     remote = "https://github.com/tenstorrent/tt-xla.git",
+ )
+@@ -496,6 +498,7 @@ git_repository(
+         "//third_party/tt_xla:tt_mlir_integer_gather_offsets.patch",
+         "//third_party/tt_xla:tt_mlir_dynamic_slice_index_dtype.patch",
+         "//third_party/tt_xla:tt_mlir_jax_distributed.patch",
++        "//third_party/tt_xla:tt_mlir_local_mesh_scalar.patch",
+         "//third_party/tt_xla:tt_mlir_row_major_all_gather.patch",
+     ],
+     remote = "https://github.com/tenstorrent/tt-mlir.git",
+diff --git a/third_party/tt_xla/tt_mlir_control_flow_runtime.cpp b/third_party/tt_xla/tt_mlir_control_flow_runtime.cpp
+index 1ce47f4..e9180c7 100644
+--- a/third_party/tt_xla/tt_mlir_control_flow_runtime.cpp
++++ b/third_party/tt_xla/tt_mlir_control_flow_runtime.cpp
+@@ -69,58 +69,68 @@ private:
+   bool restored = false;
+ };
+ 
+-::ttnn::Tensor getHostScalar(const ::tt::runtime::Tensor &tensor) {
++template <typename ReadScalar>
++auto readHostScalar(const ::tt::runtime::Tensor &tensor, ReadScalar read) {
+   auto hostTensors = ::tt::runtime::ttnn::toHost(
+       tensor, /*untilize=*/true, /*blocking=*/true);
+-  LOG_ASSERT(hostTensors.size() == 1,
+-             "Control-flow scalar must have one shard");
+-  return hostTensors.front()
+-      .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
+-      .getTensor();
++  LOG_ASSERT(!hostTensors.empty(),
++             "Control-flow scalar must have a local shard");
++  auto value = read(hostTensors.front()
++                        .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
++                        .getTensor());
++  for (size_t i = 1; i < hostTensors.size(); ++i) {
++    LOG_ASSERT(value == read(hostTensors[i]
++                                 .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
++                                 .getTensor()),
++               "Control-flow scalar replicas must agree across local devices");
++  }
++  return value;
+ }
+ 
+ int64_t readIntegerScalar(const ::tt::runtime::Tensor &tensor) {
+-  const ::ttnn::Tensor hostTensor = getHostScalar(tensor);
+-  switch (hostTensor.dtype()) {
+-  case ::ttnn::DataType::INT32:
+-    return utils::getScalarFromTensor<int32_t>(hostTensor);
+-  case ::ttnn::DataType::UINT32:
+-    return static_cast<int64_t>(
+-        utils::getScalarFromTensor<uint32_t>(hostTensor));
+-  case ::ttnn::DataType::UINT16:
+-    return static_cast<int64_t>(
+-        utils::getScalarFromTensor<uint16_t>(hostTensor));
+-  case ::ttnn::DataType::UINT8:
+-    return static_cast<int64_t>(
+-        utils::getScalarFromTensor<uint8_t>(hostTensor));
+-  default:
+-    LOG_FATAL("Unsupported control-flow integer scalar data type");
+-  }
++  return readHostScalar(tensor, [](const ::ttnn::Tensor &hostTensor) -> int64_t {
++    switch (hostTensor.dtype()) {
++    case ::ttnn::DataType::INT32:
++      return utils::getScalarFromTensor<int32_t>(hostTensor);
++    case ::ttnn::DataType::UINT32:
++      return static_cast<int64_t>(
++          utils::getScalarFromTensor<uint32_t>(hostTensor));
++    case ::ttnn::DataType::UINT16:
++      return static_cast<int64_t>(
++          utils::getScalarFromTensor<uint16_t>(hostTensor));
++    case ::ttnn::DataType::UINT8:
++      return static_cast<int64_t>(
++          utils::getScalarFromTensor<uint8_t>(hostTensor));
++    default:
++      LOG_FATAL("Unsupported control-flow integer scalar data type");
++    }
++  });
+ }
+ 
+ bool readConditionScalar(const ::tt::runtime::Tensor &tensor) {
+-  const ::ttnn::Tensor hostTensor = getHostScalar(tensor);
+-  switch (hostTensor.dtype()) {
+-  case ::ttnn::DataType::INT32:
+-    return utils::getScalarFromTensor<int32_t>(hostTensor) != 0;
+-  case ::ttnn::DataType::UINT32:
+-    return utils::getScalarFromTensor<uint32_t>(hostTensor) != 0;
+-  case ::ttnn::DataType::UINT16:
+-    return utils::getScalarFromTensor<uint16_t>(hostTensor) != 0;
+-  case ::ttnn::DataType::UINT8:
+-    return utils::getScalarFromTensor<uint8_t>(hostTensor) != 0;
+-  case ::ttnn::DataType::FLOAT32:
+-    return utils::getScalarFromTensor<float>(hostTensor) != 0;
+-  case ::ttnn::DataType::BFLOAT16:
+-    return static_cast<float>(utils::getScalarFromTensor<bfloat16>(hostTensor)) !=
+-           0;
+-  case ::ttnn::DataType::FLOAT16:
+-    return static_cast<float>(
+-               utils::getScalarFromTensor<::tt::tt_metal::float16>(hostTensor)) !=
+-           0;
+-  default:
+-    LOG_FATAL("Unsupported loop condition scalar data type");
+-  }
++  return readHostScalar(tensor, [](const ::ttnn::Tensor &hostTensor) -> bool {
++    switch (hostTensor.dtype()) {
++    case ::ttnn::DataType::INT32:
++      return utils::getScalarFromTensor<int32_t>(hostTensor) != 0;
++    case ::ttnn::DataType::UINT32:
++      return utils::getScalarFromTensor<uint32_t>(hostTensor) != 0;
++    case ::ttnn::DataType::UINT16:
++      return utils::getScalarFromTensor<uint16_t>(hostTensor) != 0;
++    case ::ttnn::DataType::UINT8:
++      return utils::getScalarFromTensor<uint8_t>(hostTensor) != 0;
++    case ::ttnn::DataType::FLOAT32:
++      return utils::getScalarFromTensor<float>(hostTensor) != 0;
++    case ::ttnn::DataType::BFLOAT16:
++      return static_cast<float>(utils::getScalarFromTensor<bfloat16>(hostTensor)) !=
++             0;
++    case ::ttnn::DataType::FLOAT16:
++      return static_cast<float>(
++                 utils::getScalarFromTensor<::tt::tt_metal::float16>(hostTensor)) !=
++             0;
++    default:
++      LOG_FATAL("Unsupported loop condition scalar data type");
++    }
++  });
+ }
+ 
+ } // namespace
+diff --git a/third_party/tt_metal/reshaped_mesh_link_discovery.patch b/third_party/tt_metal/reshaped_mesh_link_discovery.patch
+new file mode 100644
+index 0000000..d33e388
+--- /dev/null
++++ b/third_party/tt_metal/reshaped_mesh_link_discovery.patch
+@@ -0,0 +1,33 @@
++--- ttnn/cpp/ttnn/operations/ccl/common/host/moe_utils.cpp
+++++ ttnn/cpp/ttnn/operations/ccl/common/host/moe_utils.cpp
++@@ -138,7 +138,29 @@
++         for (const auto axis : cluster_axes) {
++             for (const auto direction : directions[axis]) {
++                 if (applicable_to_coord(coord, axis, direction)) {
++-                    auto planes_in_direction = tt::tt_fabric::get_num_usable_routing_planes(fabric_node_id, direction);
+++                    // A reshaped MeshDevice's axes need not match the physical
+++                    // fabric's compass directions. Query the route to the actual
+++                    // neighbor instead of assuming axis 1 always runs east/west.
+++                    auto neighbor = coord.get_neighbor(
+++                        mesh_shape, positive_direction(direction) ? 1 : -1,
+++                        axis, detail::get_boundary_mode(topology));
+++                    auto forwarding = tt::tt_fabric::get_eth_forwarding_direction(
+++                        fabric_node_id, mesh_device.get_fabric_node_id(neighbor.value()));
+++                    auto fabric_direction = direction;
+++                    if (forwarding.has_value()) {
+++                        using tt::tt_fabric::eth_chan_directions;
+++                        using tt::tt_fabric::RoutingDirection;
+++                        switch (forwarding.value()) {
+++                            case eth_chan_directions::NORTH: fabric_direction = RoutingDirection::N; break;
+++                            case eth_chan_directions::SOUTH: fabric_direction = RoutingDirection::S; break;
+++                            case eth_chan_directions::EAST: fabric_direction = RoutingDirection::E; break;
+++                            case eth_chan_directions::WEST: fabric_direction = RoutingDirection::W; break;
+++                            case eth_chan_directions::Z: fabric_direction = RoutingDirection::Z; break;
+++                            default: break;
+++                        }
+++                    }
+++                    auto planes_in_direction =
+++                        tt::tt_fabric::get_num_usable_routing_planes(fabric_node_id, fabric_direction);
++                     log_debug(
++                         tt::LogOp,
++                         "fabric_node_id: {}, direction: {}, planes_in_direction: {}",
+diff --git a/third_party/tt_xla/tt_mlir_local_mesh_scalar.patch b/third_party/tt_xla/tt_mlir_local_mesh_scalar.patch
+new file mode 100644
+index 0000000..e551728
+--- /dev/null
++++ b/third_party/tt_xla/tt_mlir_local_mesh_scalar.patch
+@@ -0,0 +1,25 @@
++--- a/runtime/include/tt/runtime/detail/ttnn/utils.h
+++++ b/runtime/include/tt/runtime/detail/ttnn/utils.h
++@@ -211,6 +211,22 @@
++ 
++ template <typename T>
++ inline T getScalarFromTensor(const ::ttnn::Tensor &tensor) {
+++  if (isOnHost(tensor.storage_type())) {
+++    // A replicated scalar can have one host buffer per local mesh device.
+++    // Read local replicas without gathering buffers owned by other hosts.
+++    std::optional<T> value;
+++    tensor.host_storage().buffer().apply(
+++        [&](const ::tt::tt_metal::HostBuffer &buffer) {
+++          ::ttnn::Tensor shard(buffer, tensor.tensor_spec());
+++          std::vector<T> data = shard.to_vector<T>();
+++          LOG_ASSERT(data.size() == 1, "Scalar tensor must have one element");
+++          LOG_ASSERT(!value || *value == data[0],
+++                     "Replicated scalar values must agree across local devices");
+++          value = data[0];
+++        });
+++    LOG_ASSERT(value.has_value(), "Scalar tensor must have a local buffer");
+++    return *value;
+++  }
++   std::vector<T> data = tensor.to_vector<T>();
++   LOG_ASSERT(data.size() == 1, "Scalar tensor must have one element");
++   return data[0];
+diff --git a/third_party/tt_xla/tt_xla_local_mesh_shards.patch b/third_party/tt_xla/tt_xla_local_mesh_shards.patch
+new file mode 100644
+index 0000000..fac066e
+--- /dev/null
++++ b/third_party/tt_xla/tt_xla_local_mesh_shards.patch
+@@ -0,0 +1,20 @@
++--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
+++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
++@@ -439,7 +439,7 @@
++     }
++   }
++ 
++-  if (client_instance->isMultiProcess()) {
+++  if (client_instance->isMultiProcess() || target_num_devices > 1) {
++     // JAX shards inferred inputs before execution too. Expose direct shard_map
++     // boundary annotations so the compiler does not shard those inputs twice.
++     auto main = (*mlir_module).lookupSymbol<mlir::func::FuncOp>("main");
++@@ -482,7 +482,7 @@
++   }
++ 
++   std::vector<int64_t> result_presharded = collectResultPresharded(mlir_module);
++-  if (client_instance->isMultiProcess()) {
+++  if (client_instance->isMultiProcess() || target_num_devices > 1) {
++     // PJRT returns local shards even when Shardy infers output partitioning.
++     // Do not aggregate them into a global host tensor at the graph boundary.
++     std::fill(result_presharded.begin(), result_presharded.end(), 1);
+diff --git a/tests/libtt/local_mesh_regression_test.py b/tests/libtt/local_mesh_regression_test.py
+new file mode 100644
+index 0000000..bd253a8
+--- /dev/null
++++ b/tests/libtt/local_mesh_regression_test.py
+@@ -0,0 +1,96 @@
++"""Keep PJRT shards and replicated trace predicates valid on a local mesh."""
++
++import jax
++import numpy as np
++import pytest
++from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
++
++
++@pytest.fixture
++def local_mesh():
++    devices = jax.local_devices(backend="tt")
++    if len(devices) < 2:
++        pytest.skip("Requires two local TT devices")
++    # This integration uses Shardy; the general test runner defaults to GSPMD.
++    previous = jax.config.jax_use_shardy_partitioner
++    jax.config.update("jax_use_shardy_partitioner", True)
++    try:
++        yield Mesh(np.array(devices[:2]), ("tp",))
++    finally:
++        jax.config.update("jax_use_shardy_partitioner", previous)
++
++
++@pytest.mark.parametrize("explicit", [False, True])
++def test_local_mesh_outputs_remain_shard_local(local_mesh, explicit):
++    sharding = NamedSharding(local_mesh, P("tp", None))
++    source = np.arange(64 * 32, dtype=np.float32).reshape(64, 32)
++    value = jax.device_put(source, sharding)
++
++    def add_one(x):
++        return x + 1
++
++    if explicit:
++        add_one = jax.shard_map(
++            add_one,
++            mesh=local_mesh,
++            in_specs=P("tp", None),
++            out_specs=P("tp", None),
++            check_vma=False,
++        )
++    result = jax.jit(add_one)(value)
++    np.testing.assert_array_equal(np.asarray(result), source + 1)
++    for shard in result.addressable_shards:
++        np.testing.assert_array_equal(np.asarray(shard.data), (source + 1)[shard.index])
++
++
++@pytest.mark.parametrize("trace", [False, True])
++def test_local_mesh_replicated_conditional(local_mesh, trace):
++    sharding = NamedSharding(local_mesh, P("tp", None))
++    replicated = NamedSharding(local_mesh, P())
++    source = np.arange(64 * 32, dtype=np.float32).reshape(64, 32)
++    value = jax.device_put(source, sharding)
++
++    def choose(predicate, x):
++        return jax.lax.cond(predicate, lambda v: v + 1, lambda v: v - 1, x)
++
++    choose = jax.jit(
++        choose,
++        in_shardings=(replicated, sharding),
++        out_shardings=sharding,
++        compiler_options={"enable_trace": str(trace).lower(), "optimization_level": "O1"},
++    )
++    # Each predicate exercises warmup, capture, and replay, interleaved so that
++    # reusing a trace for the wrong replicated scalar produces the wrong answer.
++    for predicate in (True, False) * 4:
++        flag = jax.device_put(np.asarray(predicate), replicated)
++        result = choose(flag, value)
++        np.testing.assert_array_equal(np.asarray(result), source + (1 if predicate else -1))
++
++
++@pytest.mark.parametrize("width", [32, 4096, 8224])
++@pytest.mark.parametrize("trace", [False, True])
++def test_local_mesh_collective_sum(local_mesh, width, trace):
++    """Different rank inputs must sum correctly, including after trace replay."""
++    import jax.numpy as jnp
++
++    sharding = NamedSharding(local_mesh, P("tp", None))
++    reduce_sum = jax.shard_map(
++        lambda x: jax.lax.psum(x, "tp"),
++        mesh=local_mesh,
++        in_specs=P("tp", None),
++        out_specs=P(),
++        check_vma=False,
++    )
++    reduce_sum = jax.jit(
++        reduce_sum,
++        compiler_options={"enable_trace": str(trace).lower(), "optimization_level": "O1"},
++    )
++    for step in range(5):
++        source = ((np.arange(2 * width).reshape(2, width) + step) % 47 - 23).astype(
++            jnp.bfloat16
++        )
++        result = reduce_sum(jax.device_put(source, sharding))
++        expected = source.astype(np.float32).sum(axis=0, keepdims=True)
++        np.testing.assert_array_equal(np.asarray(result, dtype=np.float32), expected)
++        for shard in result.addressable_shards:
++            np.testing.assert_array_equal(np.asarray(shard.data, dtype=np.float32), expected)

@@ -1,0 +1,18 @@
+{
+  "short": {
+    "prompt_tokens": 5,
+    "completion_tokens": 128,
+    "ttft_s": 0.06848250900293351,
+    "e2e_s": 3.733791580001707,
+    "decode_tokens_per_s": 34.64862035272922,
+    "tpot_ms": 28.861178015742595
+  },
+  "long": {
+    "prompt_tokens": 199,
+    "completion_tokens": 128,
+    "ttft_s": 0.10785273000146844,
+    "e2e_s": 3.890261875003489,
+    "decode_tokens_per_s": 33.577082976942194,
+    "tpot_ms": 29.78221785039256
+  }
+}

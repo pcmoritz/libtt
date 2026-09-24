@@ -1,0 +1,47 @@
+2026-09-24 00:33:11.393 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-24 00:33:11.394 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-24 00:33:11.394 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:95)
+2026-09-24 00:33:11.394 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:114)
+2026-09-24 00:33:11.397 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:574)
+2026-09-24 00:33:11.397 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:118)
+2026-09-24 00:33:11.397 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:33:11.417 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:162)
+2026-09-24 00:33:11.417 | info     |             UMD | IOMMU: enabled (cluster.cpp:142)
+2026-09-24 00:33:11.417 | info     |             UMD | KMD version: 2.10.0 (cluster.cpp:145)
+2026-09-24 00:33:11.417 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-24 00:33:11.417 | warning  |          Device | Using CUSTOM cluster type for P300 board with 1 chips (tt_cluster.cpp:202)
+2026-09-24 00:33:11.417 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-24 00:33:11.443 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-24 00:33:11.467 | info     |     Distributed | Using custom mesh graph descriptor: /tmp/libtt-profile/tp1.textproto (metal_env.cpp:433)
+2026-09-24 00:33:11.468 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-24 00:33:11.468 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2400)
+2026-09-24 00:33:11.468 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2408)
+2026-09-24 00:33:12.155 | info     |           Metal | [Real-time profiler] Device 0 sync complete: 100 samples, frequency=1.349927 GHz, device_time_at_sync=4034219123915 cycles (realtime_profiler_manager.cpp:1390)
+2026-09-24 00:33:12.167 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:1081)
+DRAM_BANKS 8
+DRAM_RESULT 6144 4096 2 112.412
+DRAM_RESULT 6144 4096 4 97.2763
+DRAM_RESULT 6144 4096 8 90.7156
+DRAM_RESULT 6144 4096 12 89.2728
+2026-09-24 00:33:14.242 | critical |          Always | TT_THROW: Statically allocated circular buffers in program 22 clash with L1 buffers on core range [0-0 - 7-9]. L1 buffer allocated at 1458176 and static circular buffer region ends at 1561472 (assert.hpp:104)
+terminate called after throwing an instance of 'std::runtime_error'
+  what():  TT_THROW @ external/+http_archive+tt_metal/tt_metal/impl/program/program.cpp:1757: tt::exception
+info:
+Statically allocated circular buffers in program 22 clash with L1 buffers on core range [0-0 - 7-9]. L1 buffer allocated at 1458176 and static circular buffer region ends at 1561472
+backtrace:
+ --- bazel-bin/profiling/qwen3-8b-2026-09-24/kernel-tuning/matmul_bench(+0x72c831) [0x64225f48b831]
+ --- bazel-bin/profiling/qwen3-8b-2026-09-24/kernel-tuning/matmul_bench(+0x72c99a) [0x64225f48b99a]
+ --- bazel-bin/profiling/qwen3-8b-2026-09-24/kernel-tuning/matmul_bench(+0x582b7d) [0x64225f2e1b7d]
+ --- bazel-bin/profiling/qwen3-8b-2026-09-24/kernel-tuning/matmul_bench(+0x52e966) [0x64225f28d966]
+ --- bazel-bin/profiling/qwen3-8b-2026-09-24/kernel-tuning/matmul_bench(+0x314059) [0x64225f073059]
+ --- bazel-bin/profiling/qwen3-8b-2026-09-24/kernel-tuning/matmul_bench(+0x3156b5) [0x64225f0746b5]
+ --- bazel-bin/profiling/qwen3-8b-2026-09-24/kernel-tuning/matmul_bench(+0x3189c5) [0x64225f0779c5]
+ --- bazel-bin/profiling/qwen3-8b-2026-09-24/kernel-tuning/matmul_bench(+0x319027) [0x64225f078027]
+ --- bazel-bin/profiling/qwen3-8b-2026-09-24/kernel-tuning/matmul_bench(+0x319ef6) [0x64225f078ef6]
+ --- bazel-bin/profiling/qwen3-8b-2026-09-24/kernel-tuning/matmul_bench(+0x2d4fa0) [0x64225f033fa0]
+ --- bazel-bin/profiling/qwen3-8b-2026-09-24/kernel-tuning/matmul_bench(+0x2d680e) [0x64225f03580e]
+ --- bazel-bin/profiling/qwen3-8b-2026-09-24/kernel-tuning/matmul_bench(+0x10f217) [0x64225ee6e217]
+ --- /lib/x86_64-linux-gnu/libc.so.6(+0x2a1ca) [0x790fca02a1ca]
+ --- /lib/x86_64-linux-gnu/libc.so.6(__libc_start_main+0x8b) [0x790fca02a28b]
+ --- bazel-bin/profiling/qwen3-8b-2026-09-24/kernel-tuning/matmul_bench(+0x2181a5) [0x64225ef771a5]
+

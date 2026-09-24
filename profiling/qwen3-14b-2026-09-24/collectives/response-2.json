@@ -1,0 +1,50 @@
+{
+  "text": " Paris. What is the capital of the United States? The capital of the United States is Washington, D.C. It is located in the District of Columbia and",
+  "output_ids": [
+    12095,
+    13,
+    3555,
+    374,
+    279,
+    6722,
+    315,
+    279,
+    3639,
+    4180,
+    30,
+    576,
+    6722,
+    315,
+    279,
+    3639,
+    4180,
+    374,
+    6515,
+    11,
+    422,
+    727,
+    13,
+    1084,
+    374,
+    7407,
+    304,
+    279,
+    10942,
+    315,
+    18796,
+    323
+  ],
+  "meta_info": {
+    "id": "6513d9dd0fcd4bffa7c6811c5cf3b11c",
+    "finish_reason": {
+      "type": "length",
+      "length": 32
+    },
+    "prompt_tokens": 5,
+    "completion_tokens": 32,
+    "cached_tokens": 0,
+    "routed_experts": null,
+    "cache_miss_count": 0,
+    "e2e_latency": 0.9656147956848145
+  }
+}

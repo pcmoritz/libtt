@@ -1,0 +1,24 @@
+fabric_config:
+  topology: Mesh
+
+tests:
+  - name: bidirectional_64k_32_transactions
+    num_iterations: 1
+    memory_config:
+      fifo_size: 16384
+      page_size: 4096
+      data_size: 65536
+      num_transactions: 32
+    pattern_expansions:
+      - type: all_to_all_device_unicast
+        core_coord: [0, 0]
+  - name: bidirectional_256k_8_transactions
+    num_iterations: 1
+    memory_config:
+      fifo_size: 16384
+      page_size: 4096
+      data_size: 262144
+      num_transactions: 8
+    pattern_expansions:
+      - type: all_to_all_device_unicast
+        core_coord: [0, 0]

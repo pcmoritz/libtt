@@ -1,0 +1,13 @@
+diff --git a/python/sgl_jax/srt/hardware_backend/tt/attention/tt_backend.py b/python/sgl_jax/srt/hardware_backend/tt/attention/tt_backend.py
+index 3988afce..702efe32 100644
+--- a/python/sgl_jax/srt/hardware_backend/tt/attention/tt_backend.py
++++ b/python/sgl_jax/srt/hardware_backend/tt/attention/tt_backend.py
+@@ -124,7 +124,7 @@ class TTAttention(AttentionBackend):
+     token_to_kv_pool_class = TTTokenToKVPool
+     compiler_options = {
+         "experimental_enable_permute_matmul_fusion": "true",
+-        "optimization_level": "1",
++        "optimization_level": "O1",
+         "experimental_weight_dtype": "bfp_bf8",
+         "enable_trace": "true",
+     }

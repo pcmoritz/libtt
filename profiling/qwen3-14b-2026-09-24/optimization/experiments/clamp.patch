@@ -1,0 +1,67 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
+@@ -260,12 +260,11 @@
+     const uint32_t Kt = a.padded_shape()[-1] / TILE_WIDTH;
+     const uint32_t fused_Nt = b.padded_shape()[-1] / TILE_WIDTH;
+     const uint32_t half_Nt = fused_Nt / 2;
+-    const uint32_t per_core_N = half_Nt / num_cores;
++    const uint32_t per_core_N = (half_Nt + num_cores - 1) / num_cores;
+     const uint32_t combined_per_core_N = 2 * per_core_N;
+     const uint32_t num_blocks = Kt / in0_block_w;
+     const uint32_t in1_block_num_tiles = in0_block_w * combined_per_core_N;
+ 
+-    TT_FATAL(half_Nt % num_cores == 0, "SwiGLU output tiles must divide across 96 cores");
+     TT_FATAL(Kt % in0_block_w == 0, "SwiGLU K tiles must divide by the K block width");
+     TT_FATAL(Kt % in0_mcast_w == 0, "SwiGLU K tiles must divide by the multicast width");
+     TT_FATAL(combined_per_core_N > 0 && combined_per_core_N <= 8, "SwiGLU gate and up outputs must fit in DST");
+diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+@@ -2130,8 +2130,9 @@
+         TT_FATAL(a_shape.size() == 2 && b_shape.size() == 2 && a_shape[-2] > 0 &&
+                      a_shape[-2] <= TILE_HEIGHT && a_shape_padded[-2] == TILE_HEIGHT,
+                  "SwiGLU matmul supports a single tile row only");
+-        TT_FATAL(b_shape[-1] % (2 * TILE_WIDTH * 96) == 0,
+-                 "SwiGLU matmul half width must divide evenly across 96 cores");
++        TT_FATAL(b_shape[-1] % (2 * TILE_WIDTH) == 0 &&
++                     b_shape[-1] >= 2 * TILE_WIDTH * 96 && b_shape[-1] <= 2 * TILE_WIDTH * 96 * 4,
++                 "SwiGLU matmul half width must contain 96 to 384 whole tiles");
+         TT_FATAL(input_tensor_a.dtype() == DataType::BFLOAT16 &&
+                      input_tensor_b.dtype() == DataType::BFLOAT8_B &&
+                      attributes.output_dtype == DataType::BFLOAT16,
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
+@@ -32,14 +32,13 @@
+         cb_reserve_back(cb_weights, in1_block_tiles);
+         uint32_t weights_ptr = get_write_ptr(cb_weights);
+         for (uint32_t k = 0; k < in0_block_w; ++k) {
+-            const uint32_t row = (k0 + k) * fused_Nt + n_start;
+-            const uint32_t up_row = row;
+-            const uint32_t gate_row = row + half_Nt;
+             for (uint32_t n = 0; n < per_core_N; ++n) {
+                 const uint32_t gate_local = (k * combined_per_core_N + n) * get_tile_size(cb_weights);
+                 const uint32_t up_local = gate_local + per_core_N * get_tile_size(cb_weights);
+-                noc_async_read_tile(gate_row + n, weight, weights_ptr + gate_local);
+-                noc_async_read_tile(up_row + n, weight, weights_ptr + up_local);
++                // Unused tail columns read a valid tile; their independent outputs are discarded.
++                const uint32_t column = n_start + n < half_Nt ? n_start + n : half_Nt - 1;
++                noc_async_read_tile((k0 + k) * fused_Nt + half_Nt + column, weight, weights_ptr + gate_local);
++                noc_async_read_tile((k0 + k) * fused_Nt + column, weight, weights_ptr + up_local);
+             }
+         }
+         noc_async_read_barrier();
+@@ -51,8 +50,10 @@
+     const uint32_t page_bytes = get_local_cb_interface(cb_out).fifo_page_size;
+     for (uint32_t n = 0; n < per_core_N; ++n) {
+         out_cb.wait_front(1);
+-        noc.async_write(out_cb, output, page_bytes, {}, {.page_id = n_start + n});
+-        noc.async_writes_flushed();
++        if (n_start + n < half_Nt) {
++            noc.async_write(out_cb, output, page_bytes, {}, {.page_id = n_start + n});
++            noc.async_writes_flushed();
++        }
+         out_cb.pop_front(1);
+     }
+     noc.async_write_barrier();

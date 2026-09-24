@@ -1,0 +1,19 @@
+Computing main repo mapping: 
+Loading: 
+Loading: 0 packages loaded
+Analyzing: target //tests:libtt_test_suite (0 packages loaded, 0 targets configured)
+Analyzing: target //tests:libtt_test_suite (0 packages loaded, 0 targets configured)
+
+INFO: Analyzed target //tests:libtt_test_suite (0 packages loaded, 9 targets configured).
+[7,400 / 7,401] Testing //tests:libtt_test_suite; 1s local
+[7,400 / 7,401] Testing //tests:libtt_test_suite; 12s local
+INFO: Found 1 test target...
+Target //tests:libtt_test_suite up-to-date:
+  bazel-bin/tests/libtt_test_suite
+INFO: Elapsed time: 13.302s, Critical Path: 12.97s
+INFO: 2 processes: 8 action cache hit, 1 internal, 2 local.
+INFO: Build completed successfully, 2 total actions
+//tests:libtt_test_suite                                                 PASSED in 12.9s
+
+Executed 1 out of 1 test: 1 test passes.
+There were tests whose specified size is too big. Use the --test_verbose_timeout_warnings command line option to see which ones these are.

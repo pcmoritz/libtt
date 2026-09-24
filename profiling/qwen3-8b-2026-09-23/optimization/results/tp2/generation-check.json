@@ -1,0 +1,76 @@
+[
+  {
+    "prompt": "What is the capital of France? Reply with only the city name.",
+    "expected": "paris",
+    "passed": true,
+    "response": {
+      "text": "Paris",
+      "output_ids": [
+        59604
+      ],
+      "meta_info": {
+        "id": "133b5dc74f77420abb382ef2015dbc26",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 151645
+        },
+        "prompt_tokens": 26,
+        "completion_tokens": 2,
+        "cached_tokens": 0,
+        "routed_experts": null,
+        "cache_miss_count": 0,
+        "e2e_latency": 0.08022618293762207
+      }
+    }
+  },
+  {
+    "prompt": "What is 2 + 2? Reply with only the number.",
+    "expected": "4",
+    "passed": true,
+    "response": {
+      "text": "4",
+      "output_ids": [
+        19
+      ],
+      "meta_info": {
+        "id": "1bf70468c9dc46ab8408241327089887",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 151645
+        },
+        "prompt_tokens": 26,
+        "completion_tokens": 2,
+        "cached_tokens": 0,
+        "routed_experts": null,
+        "cache_miss_count": 0,
+        "e2e_latency": 0.07698702812194824
+      }
+    }
+  },
+  {
+    "prompt": "What is the chemical symbol for water? Reply with only the formula.",
+    "expected": "h2o",
+    "passed": true,
+    "response": {
+      "text": "H\u2082O",
+      "output_ids": [
+        39,
+        31807,
+        46
+      ],
+      "meta_info": {
+        "id": "9b8b34cd45d941e6b0934f4911bea12d",
+        "finish_reason": {
+          "type": "stop",
+          "matched": 151645
+        },
+        "prompt_tokens": 26,
+        "completion_tokens": 4,
+        "cached_tokens": 0,
+        "routed_experts": null,
+        "cache_miss_count": 0,
+        "e2e_latency": 0.11563825607299805
+      }
+    }
+  }
+]

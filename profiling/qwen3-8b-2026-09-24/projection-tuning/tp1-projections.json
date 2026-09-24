@@ -1,0 +1,58 @@
+{
+  "0": {
+    "complete_decode_iterations": 16,
+    "window_ms": 500,
+    "median_lm_head_to_lm_head_ms": 28.427839259259258,
+    "median_program_covered_ms": 26.815216296296295,
+    "program_category_ms_per_token": {
+      "matmul": 21.83679925925926,
+      "experimental/transformer/nlp_create_qkv_heads_decode": 1.2119922222222224,
+      "normalization/layernorm": 0.7662062962962963,
+      "experimental/paged_cache": 0.6084955555555556,
+      "reduction/generic": 0.4305162962962963,
+      "experimental/transformer/rotary_embedding": 0.3276074074074074,
+      "data_movement/tilize": 0.27642370370370367,
+      "transformer/sdpa_decode": 0.27311703703703705,
+      "data_movement/sharded": 0.26353999999999994,
+      "data_movement/reshape_view": 0.1594659259259259,
+      "data_movement/fill_pad": 0.15192185185185186,
+      "eltwise/binary_ng": 0.12332037037037037,
+      "data_movement/copy": 0.10088962962962963,
+      "copy/typecast": 0.09180666666666665,
+      "eltwise/unary": 0.08510851851851851,
+      "data_movement/untilize": 0.06298925925925924,
+      "reduction/argmax": 0.030697037037037037,
+      "data_movement/transpose": 0.007462592592592593,
+      "eltwise/ternary": 0.002416296296296296,
+      "embedding": 0.0018133333333333332
+    },
+    "max_reported_dropped": 0,
+    "projections": {
+      "qkv": {
+        "median_kernel_us": 72.8096,
+        "median_total_ms_per_token": 2.6223203999999996,
+        "sample_count": 576
+      },
+      "attention_output": {
+        "median_kernel_us": 48.27445,
+        "median_total_ms_per_token": 1.73895175,
+        "sample_count": 576
+      },
+      "swiglu": {
+        "median_kernel_us": 285.59950000000003,
+        "median_total_ms_per_token": 10.284522500000001,
+        "sample_count": 576
+      },
+      "down": {
+        "median_kernel_us": 135.80450000000002,
+        "median_total_ms_per_token": 4.8938295,
+        "sample_count": 576
+      },
+      "lm_head": {
+        "median_kernel_us": 2293.745,
+        "median_total_ms_per_token": 2.293745,
+        "sample_count": 16
+      }
+    }
+  }
+}

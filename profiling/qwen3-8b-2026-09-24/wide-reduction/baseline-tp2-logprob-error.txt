@@ -1,0 +1,31 @@
+error: number of output elements (622329856) doesn't match expected number of elements (311164928)
+2026-09-24 05:09:51.935 (  93.353s) [        303C3080]      module_builder.cc:945    ERR| Failed to run stablehlo pipeline
+[2026-09-24 05:09:51] Scheduler hit an exception: Traceback (most recent call last):
+  File "/tmp/libtt-profile/sglang-multinode/python/sgl_jax/srt/managers/scheduler.py", line 2936, in run_scheduler_process
+    dispatch_scheduler_event_loop(scheduler, server_args)
+  File "/tmp/libtt-profile/sglang-multinode/python/sgl_jax/srt/managers/scheduler.py", line 2901, in dispatch_scheduler_event_loop
+    scheduler.event_loop_normal()
+  File "/tmp/libtt-profile/sglang-multinode/python/sgl_jax/srt/managers/scheduler.py", line 968, in event_loop_normal
+    result = self.run_batch(batch)
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/sglang-multinode/python/sgl_jax/srt/managers/scheduler.py", line 2446, in run_batch
+    _worker.forward_batch_generation(model_worker_batch, sampling_metadata=None)
+  File "/tmp/libtt-profile/sglang-multinode/python/sgl_jax/srt/managers/tp_worker.py", line 535, in forward_batch_generation
+    logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
+                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/sglang-multinode/python/sgl_jax/srt/model_executor/model_runner.py", line 971, in forward
+    ret = self._forward_raw(forward_batch, logits_metadata)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/sglang-multinode/python/sgl_jax/srt/model_executor/model_runner.py", line 990, in _forward_raw
+    ret = self._forward(forward_batch, logits_metadata)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/sglang-multinode/python/sgl_jax/srt/model_executor/model_runner.py", line 899, in _forward
+    output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
+                                               ^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/libtt-profile/sglang-multinode/python/sgl_jax/srt/model_executor/model_runner.py", line 442, in run_model_wrapper
+    return jitted_run_model(
+           ^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: INTERNAL: Error code: 13
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+

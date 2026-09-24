@@ -1,0 +1,24 @@
+2026-09-24 00:22:44.042 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-24 00:22:44.042 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-24 00:22:44.042 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:95)
+2026-09-24 00:22:44.042 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:114)
+2026-09-24 00:22:44.046 | info     |             UMD | Established firmware bundle version: 19.13.1 (topology_discovery.cpp:574)
+2026-09-24 00:22:44.046 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:118)
+2026-09-24 00:22:44.046 | warning  |             UMD | Board 0x4613193403b has 1 chips, but expected 2 chips for board type p300. (cluster_descriptor.cpp:1232)
+2026-09-24 00:22:44.065 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:162)
+2026-09-24 00:22:44.065 | info     |             UMD | IOMMU: enabled (cluster.cpp:142)
+2026-09-24 00:22:44.065 | info     |             UMD | KMD version: 2.10.0 (cluster.cpp:145)
+2026-09-24 00:22:44.065 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-24 00:22:44.065 | warning  |          Device | Using CUSTOM cluster type for P300 board with 1 chips (tt_cluster.cpp:202)
+2026-09-24 00:22:44.066 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-24 00:22:44.066 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-24 00:22:44.091 | info     |     Distributed | Using custom mesh graph descriptor: /tmp/libtt-profile/tp1.textproto (metal_env.cpp:433)
+2026-09-24 00:22:44.092 | warning  |          Always | Unknown motherboard 'B850M-C' for chip_id=0 (bus_id=0x1) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:106)
+2026-09-24 00:22:44.092 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2400)
+2026-09-24 00:22:44.092 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:2408)
+2026-09-24 00:22:44.737 | info     |           Metal | [Real-time profiler] Device 0 sync complete: 100 samples, frequency=1.349795 GHz, device_time_at_sync=4020460492785 cycles (realtime_profiler_manager.cpp:1390)
+2026-09-24 00:22:44.747 | info     |           Metal | Enabling program cache on MeshDevice 1 (mesh_device.cpp:1081)
+RESULT 6144 4096 11 10 2 151.262
+Mismatch at 0: 98 expected 96 grid 11,10 block 4
+terminate called after throwing an instance of 'std::runtime_error'
+  what():  incorrect result
