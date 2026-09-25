@@ -1,14 +1,3 @@
-diff --git a/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h b/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
---- a/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
-+++ b/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
-@@ -31,6 +31,7 @@
-       {1, 16},
-       {1, 32},
-       {1, 64},
-+      {2, 1},
-       {2, 2},
-       {2, 4},
-       {2, 8},
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
@@ -36,7 +25,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    /*
    We need to figure out what the cluster axis is based on replica_groups.
    Replica groups define which device axis we are performing the collective
-@@ -4844,13 +4857,20 @@
+@@ -4844,13 +4857,33 @@
  
    // Case where we have single devices in each replica_group (ie perform
    // collective communication operation against itself which should be optimized
@@ -45,21 +34,36 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  // away).
    if (replicaGroupsShape[1] != 1) {
      auto firstElementIt = replicaGroups.begin();
-     auto secondElementIt = firstElementIt + 1;
- 
-     clusterAxis = (((*firstElementIt) + 1) == *secondElementIt);
-+    // Consecutive IDs run along axis 0 for an Nx1 mesh.
+-    auto secondElementIt = firstElementIt + 1;
++    const int64_t stride = (*(firstElementIt + 1)).getSExtValue() -
++                           (*firstElementIt).getSExtValue();
++    const int64_t groupSize = replicaGroupsShape[1];
++
++    // In a row-major [rows, cols] mesh, axis 1 groups consecutive IDs and
++    // axis 0 groups IDs that are cols apart. Match both the stride and the
++    // group size against the mesh, so an Nx1 mesh resolves to axis 0.
 +    if (auto meshes = module->getAttrOfType<ttcore::MeshesAttr>(
 +            ttcore::MeshesAttr::name)) {
 +      auto shape = meshes.getMeshes().front().getShape();
-+      if (shape.size() == 2 && shape[1] == 1) {
-+        clusterAxis = 0;
++      if (shape.size() == 2) {
++        if (stride == 1 && groupSize == shape[1]) {
++          clusterAxis = 1;
++          return success();
++        }
++        if (stride == shape[1] && groupSize == shape[0]) {
++          clusterAxis = 0;
++          return success();
++        }
++        return failure();
 +      }
 +    }
+ 
+-    clusterAxis = (((*firstElementIt) + 1) == *secondElementIt);
++    clusterAxis = stride == 1;
      return success();
    }
  
-@@ -5241,9 +5261,15 @@
+@@ -5241,9 +5274,15 @@
        }
      }
  
@@ -76,7 +80,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp, "AllReduceOp cannot specify cluster axis.");
      }
-@@ -5315,9 +5341,15 @@
+@@ -5315,9 +5354,15 @@
        }
      }
  
@@ -93,7 +97,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp, "ReduceScatterOp cannot specify cluster axis.");
      }
-@@ -5358,9 +5390,15 @@
+@@ -5358,9 +5403,15 @@
      auto outputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult(0).getType()));
  
