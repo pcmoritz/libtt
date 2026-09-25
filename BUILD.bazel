@@ -81,6 +81,15 @@ copy_file(
     allow_symlink = True,
 )
 
+# The plugin keys JAX's persistent compilation cache by this hash, so that
+# executables compiled by another build of libtt.so are not reused.
+genrule(
+    name = "jax_plugin_library_hash",
+    srcs = [":jax_plugin_shared_library"],
+    outs = ["python/jax_plugins/libtt/libtt.so.sha256"],
+    cmd = "sha256sum $< | cut -d ' ' -f 1 > $@",
+)
+
 py_wheel(
     name = "jax_tt_plugin_wheel",
     distribution = "jax-tt-plugin",
@@ -99,6 +108,7 @@ py_wheel(
     version = "0.1.0",
     deps = [
         ":jax_plugin",
+        ":jax_plugin_library_hash",
         ":jax_plugin_shared_library",
     ],
 )
