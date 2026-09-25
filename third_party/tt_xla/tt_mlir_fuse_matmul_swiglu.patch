@@ -1,8 +1,7 @@
 diff --git a/include/ttmlir/Target/TTNN/operations/matmul.fbs b/include/ttmlir/Target/TTNN/operations/matmul.fbs
-index 7966cee..accaf4a 100644
 --- a/include/ttmlir/Target/TTNN/operations/matmul.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/matmul.fbs
-@@ -70,6 +70,7 @@ table MatmulOp {
+@@ -70,6 +70,7 @@
    matmul_program_config: tt.target.ttnn.MatmulProgramConfig;
    activation: string;
    compute_config: tt.target.ttnn.DeviceComputeKernelConfig;
@@ -11,10 +10,9 @@ index 7966cee..accaf4a 100644
  // ANCHOR_END: adding_an_op_matmul_fbs
  
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-index cb557b9..7b0eedd 100644
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-@@ -2614,6 +2614,13 @@ std::optional<int64_t> getMatmulInnerDim(::mlir::RankedTensorType inputA,
+@@ -2828,6 +2828,13 @@
      expectedOutputShape.push_back(inputBShape[inputBShape.size() - 1]);
    }
  
@@ -29,10 +27,9 @@ index cb557b9..7b0eedd 100644
    // scalars in IR, hence check that the output is at least 1D tensor of size 1.
    if (expectedOutputShape.size() == 0) {
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-index ac04b7e..3343a62 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -8,6 +8,7 @@
+@@ -10,6 +10,7 @@
  #include "ttmlir/Utils.h"
  
  #include "llvm/ADT/SmallVector.h"
@@ -40,7 +37,7 @@ index ac04b7e..3343a62 100644
  
  #ifdef TTMLIR_ENABLE_OPMODEL
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
-@@ -174,6 +175,102 @@ private:
+@@ -176,6 +177,91 @@
    }
  };
  
@@ -79,48 +76,37 @@ index ac04b7e..3343a62 100644
 +      return failure();
 +    }
 +
++    // Shapes supported by the fused TT-Metal kernel: BF16 activations and
++    // output, BFP8 weights, one tile row, K in two-tile blocks, and one to
++    // four output tiles per core on 96 cores.
++    constexpr int64_t kTilesAcrossCores = 96 * 32;
++    auto weightDtype =
++        matmulOp->getAttrOfType<mlir::StringAttr>("ttcore.weight_dtype");
 +    auto lhsType = matmulOp.getA().getType();
-+    if (!lhsType.getElementType().isBF16() || lhsType.getRank() != 2 ||
-+        lhsType.getDimSize(1) <= 0 || lhsType.getDimSize(1) % 64 != 0) {
-+      return failure();
-+    }
-+
-+    auto inputType = matmulOp.getType();
-+    // The fused runtime uses BFP8 weights and up to four output tiles on 96 cores.
-+    auto weightDtype = matmulOp->getAttrOfType<mlir::StringAttr>(
-+        "ttcore.weight_dtype");
-+    if (!weightDtype || weightDtype.getValue() != "bfp_bf8") {
-+      return failure();
-+    }
-+
 +    auto outputType = multiplyOp.getType();
-+    ArrayRef<int64_t> inputShape = inputType.getShape();
-+    ArrayRef<int64_t> outputShape = outputType.getShape();
-+    if (!outputType.getElementType().isBF16() ||
-+        inputShape.size() != 2 || outputShape.size() != 2 ||
-+        inputShape[0] < 1 || inputShape[0] > 32 ||
-+        outputShape[0] != inputShape[0] ||
-+        inputShape[1] != 2 * outputShape[1] ||
-+        outputShape[1] < 96 * 32 || outputShape[1] > 96 * 4 * 32 ||
-+        outputShape[1] % (96 * 32) != 0) {
++    ArrayRef<int64_t> shape = matmulOp.getType().getShape();
++    int64_t half = outputType.getShape().back();
++    if (!weightDtype || weightDtype.getValue() != "bfp_bf8" ||
++        !lhsType.getElementType().isBF16() ||
++        !outputType.getElementType().isBF16() || shape.size() != 2 ||
++        shape[0] > 32 || lhsType.getShape().back() % 64 != 0 ||
++        half % kTilesAcrossCores != 0 || half < kTilesAcrossCores ||
++        half > 4 * kTilesAcrossCores) {
 +      return failure();
 +    }
 +
-+    int64_t half = outputShape[1];
-+    auto isHalfSlice = [](SliceStaticOp slice, int64_t rows, int64_t begin,
-+                          int64_t end) {
-+      auto begins = llvm::cantFail(
-+          ttmlir::utils::getIntegerVector<int64_t>(slice.getBegins()));
-+      auto ends = llvm::cantFail(
-+          ttmlir::utils::getIntegerVector<int64_t>(slice.getEnds()));
-+      auto steps = llvm::cantFail(
-+          ttmlir::utils::getIntegerVector<int64_t>(slice.getStep()));
-+      return begins.size() == 2 && ends.size() == 2 && steps.size() == 2 &&
-+             begins[0] == 0 && begins[1] == begin && ends[0] == rows &&
-+             ends[1] == end && steps[0] == 1 && steps[1] == 1;
++    // The two slices must be exactly the up and gate halves of the output.
++    auto isHalf = [&](SliceStaticOp slice, int64_t begin) {
++      auto values = [](mlir::ArrayAttr attr) {
++        return llvm::cantFail(ttmlir::utils::getIntegerVector<int64_t>(attr));
++      };
++      return values(slice.getBegins()) == SmallVector<int64_t>{0, begin} &&
++             values(slice.getEnds()) ==
++                 SmallVector<int64_t>{shape[0], begin + half} &&
++             values(slice.getStep()) == SmallVector<int64_t>{1, 1};
 +    };
-+    if (!isHalfSlice(otherSlice, inputShape[0], 0, half) ||
-+        !isHalfSlice(activatedSlice, inputShape[0], half, 2 * half)) {
++    if (shape[1] != 2 * half || !isHalf(otherSlice, 0) ||
++        !isHalf(activatedSlice, half)) {
 +      return failure();
 +    }
 +
@@ -143,7 +129,7 @@ index ac04b7e..3343a62 100644
  #ifdef TTMLIR_ENABLE_OPMODEL
  
  // ============================================================================
-@@ -346,7 +436,7 @@ public:
+@@ -435,7 +521,7 @@
      RewritePatternSet patterns(&getContext());
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
@@ -153,10 +139,9 @@ index ac04b7e..3343a62 100644
          TTNNConv2dWithActivation<SiluOp>, TTNNConv2dWithActivation<SigmoidOp>,
          TTNNMatmulAndLinearWithActivation<MatmulOp, SigmoidOp>,
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-index 8160ec9..6819e90 100644
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -562,7 +562,7 @@ createOp(FlatbufferObjectCache &cache, MatmulOp op) {
+@@ -585,7 +585,7 @@
    return ::tt::target::ttnn::CreateMatmulOp(
        *cache.fbb, a, b, output, op.getTransposeA(), op.getTransposeB(),
        matmulProgramConfigType, matmulProgramConfigDesc, activation,
@@ -166,10 +151,9 @@ index 8160ec9..6819e90 100644
  // ANCHOR_END: adding_an_op_matmul_serialize_to_binary
  
 diff --git a/runtime/lib/ttnn/operations/matmul/matmul.cpp b/runtime/lib/ttnn/operations/matmul/matmul.cpp
-index dfe05ba..f196225 100644
 --- a/runtime/lib/ttnn/operations/matmul/matmul.cpp
 +++ b/runtime/lib/ttnn/operations/matmul/matmul.cpp
-@@ -72,12 +72,18 @@ void run(const ::tt::target::ttnn::MatmulOp *op, ProgramContext &context) {
+@@ -72,12 +72,18 @@
          utils::createDeviceComputeKernelConfig(op->compute_config());
    }
  
