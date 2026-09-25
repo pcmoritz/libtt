@@ -16,7 +16,6 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "mlir/Transforms/RegionUtils.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
@@ -192,6 +191,23 @@ analyzeCountedLoop(stablehlo::WhileOp whileOp,
                          .step = *resolvedStep};
 }
 
+// Dialect conversion can leave operands referring to a detached block until
+// its replacements are committed (for example when inlining shard_map).
+// Include every external operand, not only values in ancestor regions.
+void collectCaptures(MutableArrayRef<Region> regions,
+                     llvm::SetVector<Value> &captures) {
+  for (Region &region : regions) {
+    region.walk([&](Operation *op) {
+      for (Value operand : op->getOperands()) {
+        Region *parent = operand.getParentRegion();
+        if (!parent || !region.isAncestor(parent)) {
+          captures.insert(operand);
+        }
+      }
+    });
+  }
+}
+
 func::FuncOp outlineRegion(ConversionPatternRewriter &rewriter,
                            Operation *controlFlowOp, Region &region,
                            llvm::StringRef suffix, ValueRange inputs,
@@ -276,7 +292,7 @@ public:
     }
 
     llvm::SetVector<Value> captures;
-    getUsedValuesDefinedAbove(whileOp->getRegions(), captures);
+    collectCaptures(whileOp->getRegions(), captures);
     SmallVector<Value> convertedCaptures;
     if (failed(rewriter.getRemappedValues(captures.getArrayRef(),
                                           convertedCaptures))) {
@@ -349,7 +365,7 @@ public:
     }
 
     llvm::SetVector<Value> captures;
-    getUsedValuesDefinedAbove(caseOp->getRegions(), captures);
+    collectCaptures(caseOp->getRegions(), captures);
     SmallVector<Value> convertedCaptures;
     if (failed(rewriter.getRemappedValues(captures.getArrayRef(),
                                           convertedCaptures))) {

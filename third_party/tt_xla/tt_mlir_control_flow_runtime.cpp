@@ -69,58 +69,68 @@ private:
   bool restored = false;
 };
 
-::ttnn::Tensor getHostScalar(const ::tt::runtime::Tensor &tensor) {
+template <typename ReadScalar>
+auto readHostScalar(const ::tt::runtime::Tensor &tensor, ReadScalar read) {
   auto hostTensors = ::tt::runtime::ttnn::toHost(
       tensor, /*untilize=*/true, /*blocking=*/true);
-  LOG_ASSERT(hostTensors.size() == 1,
-             "Control-flow scalar must have one shard");
-  return hostTensors.front()
-      .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
-      .getTensor();
+  LOG_ASSERT(!hostTensors.empty(),
+             "Control-flow scalar must have a local shard");
+  auto value = read(hostTensors.front()
+                        .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
+                        .getTensor());
+  for (size_t i = 1; i < hostTensors.size(); ++i) {
+    LOG_ASSERT(value == read(hostTensors[i]
+                                 .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
+                                 .getTensor()),
+               "Control-flow scalar replicas must agree across local devices");
+  }
+  return value;
 }
 
 int64_t readIntegerScalar(const ::tt::runtime::Tensor &tensor) {
-  const ::ttnn::Tensor hostTensor = getHostScalar(tensor);
-  switch (hostTensor.dtype()) {
-  case ::ttnn::DataType::INT32:
-    return utils::getScalarFromTensor<int32_t>(hostTensor);
-  case ::ttnn::DataType::UINT32:
-    return static_cast<int64_t>(
-        utils::getScalarFromTensor<uint32_t>(hostTensor));
-  case ::ttnn::DataType::UINT16:
-    return static_cast<int64_t>(
-        utils::getScalarFromTensor<uint16_t>(hostTensor));
-  case ::ttnn::DataType::UINT8:
-    return static_cast<int64_t>(
-        utils::getScalarFromTensor<uint8_t>(hostTensor));
-  default:
-    LOG_FATAL("Unsupported control-flow integer scalar data type");
-  }
+  return readHostScalar(tensor, [](const ::ttnn::Tensor &hostTensor) -> int64_t {
+    switch (hostTensor.dtype()) {
+    case ::ttnn::DataType::INT32:
+      return utils::getScalarFromTensor<int32_t>(hostTensor);
+    case ::ttnn::DataType::UINT32:
+      return static_cast<int64_t>(
+          utils::getScalarFromTensor<uint32_t>(hostTensor));
+    case ::ttnn::DataType::UINT16:
+      return static_cast<int64_t>(
+          utils::getScalarFromTensor<uint16_t>(hostTensor));
+    case ::ttnn::DataType::UINT8:
+      return static_cast<int64_t>(
+          utils::getScalarFromTensor<uint8_t>(hostTensor));
+    default:
+      LOG_FATAL("Unsupported control-flow integer scalar data type");
+    }
+  });
 }
 
 bool readConditionScalar(const ::tt::runtime::Tensor &tensor) {
-  const ::ttnn::Tensor hostTensor = getHostScalar(tensor);
-  switch (hostTensor.dtype()) {
-  case ::ttnn::DataType::INT32:
-    return utils::getScalarFromTensor<int32_t>(hostTensor) != 0;
-  case ::ttnn::DataType::UINT32:
-    return utils::getScalarFromTensor<uint32_t>(hostTensor) != 0;
-  case ::ttnn::DataType::UINT16:
-    return utils::getScalarFromTensor<uint16_t>(hostTensor) != 0;
-  case ::ttnn::DataType::UINT8:
-    return utils::getScalarFromTensor<uint8_t>(hostTensor) != 0;
-  case ::ttnn::DataType::FLOAT32:
-    return utils::getScalarFromTensor<float>(hostTensor) != 0;
-  case ::ttnn::DataType::BFLOAT16:
-    return static_cast<float>(utils::getScalarFromTensor<bfloat16>(hostTensor)) !=
-           0;
-  case ::ttnn::DataType::FLOAT16:
-    return static_cast<float>(
-               utils::getScalarFromTensor<::tt::tt_metal::float16>(hostTensor)) !=
-           0;
-  default:
-    LOG_FATAL("Unsupported loop condition scalar data type");
-  }
+  return readHostScalar(tensor, [](const ::ttnn::Tensor &hostTensor) -> bool {
+    switch (hostTensor.dtype()) {
+    case ::ttnn::DataType::INT32:
+      return utils::getScalarFromTensor<int32_t>(hostTensor) != 0;
+    case ::ttnn::DataType::UINT32:
+      return utils::getScalarFromTensor<uint32_t>(hostTensor) != 0;
+    case ::ttnn::DataType::UINT16:
+      return utils::getScalarFromTensor<uint16_t>(hostTensor) != 0;
+    case ::ttnn::DataType::UINT8:
+      return utils::getScalarFromTensor<uint8_t>(hostTensor) != 0;
+    case ::ttnn::DataType::FLOAT32:
+      return utils::getScalarFromTensor<float>(hostTensor) != 0;
+    case ::ttnn::DataType::BFLOAT16:
+      return static_cast<float>(utils::getScalarFromTensor<bfloat16>(hostTensor)) !=
+             0;
+    case ::ttnn::DataType::FLOAT16:
+      return static_cast<float>(
+                 utils::getScalarFromTensor<::tt::tt_metal::float16>(hostTensor)) !=
+             0;
+    default:
+      LOG_FATAL("Unsupported loop condition scalar data type");
+    }
+  });
 }
 
 } // namespace
