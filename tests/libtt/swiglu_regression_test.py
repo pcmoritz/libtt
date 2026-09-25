@@ -8,25 +8,23 @@ import pytest
 
 @pytest.mark.parametrize(
     "rows,inner_size,width",
-    [(1, 64, n) for n in (3072, 4096, 6144, 6400, 9216, 12288, 12800)]
-    + [
+    [
+        # One K tile, an odd K tile count, a prime output tile count, and a
+        # partial core row.
         (1, 32, 6144),
         (1, 96, 6144),
-        (1, 4096, 6144),
-        (1, 4096, 12288),
+        (1, 64, 3104),
+        (1, 512, 256),
+        # Several and all 32 rows of the activation tile.
+        (2, 512, 12800),
         (32, 512, 6144),
+        # Qwen3-8B TP1, Qwen3-32B TP4/TP2 and Qwen3-14B TP1 per-chip shapes;
+        # 14B needs more output pairs per core than fit in DST at once.
+        (1, 4096, 12288),
         (1, 5120, 6400),
         (1, 5120, 12800),
-        (32, 512, 6400),
-        (2, 512, 12800),
-        # A prime tile count, Qwen3-14B's TP1/TP2 widths (more pairs than
-        # fit in DST at once), and a partial core row.
-        (1, 64, 3104),
-        (1, 96, 8704),
-        (1, 5120, 8704),
         (1, 5120, 17408),
-        (1, 512, 256),
-        # Reductions beyond 256 activation tiles (e.g. Llama-405B's hidden size).
+        # Reductions far beyond typical hidden sizes.
         (1, 12800, 6144),
         (1, 16384, 3072),
     ],

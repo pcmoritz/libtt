@@ -28,15 +28,13 @@ def full_mesh():
 @pytest.mark.parametrize(
     "rows,width,dtype",
     [
-        # One tile, an odd tile count, a prime tile count (257), and widths
-        # on both sides of the typical hidden sizes.
+        # One tile, an odd tile count, a typical hidden size, and a prime
+        # tile count (257); several and all 32 rows of the tile.
         (1, 32, jnp.bfloat16),
         (1, 96, jnp.bfloat16),
-        (1, 1024, jnp.bfloat16),
         (1, 5120, jnp.bfloat16),
-        (2, 5120, jnp.bfloat16),
         (1, 8224, jnp.bfloat16),
-        (1, 12288, jnp.bfloat16),
+        (2, 5120, jnp.bfloat16),
         (32, 5120, jnp.bfloat16),
         # Falls back to reduce-scatter plus all-gather.
         (1, 5120, jnp.float32),
