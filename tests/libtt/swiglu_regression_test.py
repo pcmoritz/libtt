@@ -1,4 +1,4 @@
-"""Check fused SwiGLU projections and unsupported-shape fallbacks."""
+"""Check fused SwiGLU decode projections across widths and reduction sizes."""
 
 import jax
 import jax.numpy as jnp
@@ -8,16 +8,28 @@ import pytest
 
 @pytest.mark.parametrize(
     "rows,inner_size,width",
-    [(1, 64, n) for n in (3072, 4096, 6144, 9216, 12288)]
-    + [
+    [
+        # One K tile, an odd K tile count, a prime output tile count, and a
+        # partial core row.
         (1, 32, 6144),
         (1, 96, 6144),
-        (1, 4096, 6144),
-        (1, 4096, 12288),
+        (1, 64, 3104),
+        (1, 512, 256),
+        # Several and all 32 rows of the activation tile.
+        (2, 512, 12800),
         (32, 512, 6144),
+        # Qwen3-8B TP1, Qwen3-32B TP4/TP2 and Qwen3-14B TP1 per-chip shapes;
+        # 14B needs more output pairs per core than fit in DST at once.
+        (1, 4096, 12288),
+        (1, 5120, 6400),
+        (1, 5120, 12800),
+        (1, 5120, 17408),
+        # Reductions far beyond typical hidden sizes.
+        (1, 12800, 6144),
+        (1, 16384, 3072),
     ],
 )
-def test_swiglu_projection_width(rows, inner_size, width):
+def test_swiglu_projection_width(rows, inner_size, width, tmp_path):
     def swiglu(x, weights):
         weights = weights[None]
         weights = jax.ffi.ffi_call(
@@ -30,7 +42,11 @@ def test_swiglu_projection_width(rows, inner_size, width):
 
     run = jax.jit(
         swiglu,
-        compiler_options={"optimization_level": "O1", "enable_trace": "true"},
+        compiler_options={
+            "optimization_level": "O1",
+            "enable_trace": "true",
+            "export_path": str(tmp_path),
+        },
     )
     device = jax.devices("tt")[0]
     rng = np.random.default_rng(6)
@@ -44,3 +60,9 @@ def test_swiglu_projection_width(rows, inner_size, width):
         np.testing.assert_allclose(
             np.asarray(actual).astype(np.float32), expected, atol=0.01, rtol=0.04
         )
+
+    # A numerical pass alone could also come from the unfused path.
+    assert any(
+        "ttnn.fused_swiglu" in path.read_text()
+        for path in (tmp_path / "irs").glob("ttnn*.mlir")
+    ), "projection did not select fused SwiGLU"

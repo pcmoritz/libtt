@@ -37,7 +37,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  
  #ifdef TTMLIR_ENABLE_OPMODEL
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
-@@ -176,6 +177,91 @@
+@@ -176,6 +177,89 @@
    }
  };
  
@@ -76,22 +76,20 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +      return failure();
 +    }
 +
-+    // Shapes supported by the fused TT-Metal kernel: BF16 activations and
-+    // output, BFP8 weights, one tile row, K in two-tile blocks, and one to
-+    // four output tiles per core on 96 cores.
-+    constexpr int64_t kTilesAcrossCores = 96 * 32;
++    // The fused TT-Metal kernel takes BF16 activations and output, BFP8
++    // weights, one tile row, and tile-aligned K and halves.
++    auto [tileHeight, tileWidth] = ttcore::TileType::getDefaultShape();
 +    auto weightDtype =
 +        matmulOp->getAttrOfType<mlir::StringAttr>("ttcore.weight_dtype");
 +    auto lhsType = matmulOp.getA().getType();
 +    auto outputType = multiplyOp.getType();
 +    ArrayRef<int64_t> shape = matmulOp.getType().getShape();
++    int64_t k = lhsType.getShape().back();
 +    int64_t half = outputType.getShape().back();
 +    if (!weightDtype || weightDtype.getValue() != "bfp_bf8" ||
 +        !lhsType.getElementType().isBF16() ||
 +        !outputType.getElementType().isBF16() || shape.size() != 2 ||
-+        shape[0] > 32 || lhsType.getShape().back() % 64 != 0 ||
-+        half % kTilesAcrossCores != 0 || half < kTilesAcrossCores ||
-+        half > 4 * kTilesAcrossCores) {
++        shape[0] > tileHeight || k % tileWidth != 0 || half % tileWidth != 0) {
 +      return failure();
 +    }
 +
@@ -129,7 +127,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  #ifdef TTMLIR_ENABLE_OPMODEL
  
  // ============================================================================
-@@ -435,7 +521,7 @@
+@@ -435,7 +519,7 @@
      RewritePatternSet patterns(&getContext());
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
