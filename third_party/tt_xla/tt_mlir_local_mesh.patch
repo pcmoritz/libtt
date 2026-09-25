@@ -25,7 +25,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    /*
    We need to figure out what the cluster axis is based on replica_groups.
    Replica groups define which device axis we are performing the collective
-@@ -4844,13 +4857,19 @@
+@@ -4844,14 +4857,44 @@
  
    // Case where we have single devices in each replica_group (ie perform
    // collective communication operation against itself which should be optimized
@@ -33,24 +33,50 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -  // 1x32 etc) and cannot have (32x1, 8x1).
 +  // away).
    if (replicaGroupsShape[1] != 1) {
-     auto firstElementIt = replicaGroups.begin();
+-    auto firstElementIt = replicaGroups.begin();
 -    auto secondElementIt = firstElementIt + 1;
--
--    clusterAxis = (((*firstElementIt) + 1) == *secondElementIt);
-+    const int64_t stride = (*(firstElementIt + 1)).getSExtValue() -
-+                           (*firstElementIt).getSExtValue();
-+    int64_t cols = 0;
-+    if (auto meshes = module->getAttrOfType<ttcore::MeshesAttr>(
-+            ttcore::MeshesAttr::name)) {
-+      cols = meshes.getMeshes().front().getShape().back();
++    auto meshes =
++        module->getAttrOfType<ttcore::MeshesAttr>(ttcore::MeshesAttr::name);
++    if (!meshes) {
++      // Without a mesh there is nothing to validate against; keep the
++      // upstream heuristic that consecutive IDs run along axis 1.
++      auto firstElementIt = replicaGroups.begin();
++      clusterAxis = (((*firstElementIt) + 1) == *(firstElementIt + 1));
++      return success();
 +    }
-+    // Device IDs are row-major, so consecutive IDs run along axis 1, unless
-+    // that axis has size one (an Nx1 mesh).
-+    clusterAxis = stride == 1 && cols != 1;
-     return success();
+ 
+-    clusterAxis = (((*firstElementIt) + 1) == *secondElementIt);
+-    return success();
++    // Replica groups must be the whole rows (axis 1) or whole columns
++    // (axis 0) of the row-major device mesh, in order. Anything else, such as
++    // [[0, 1], [2, 3]] on a 1x4 mesh, cannot be expressed as a cluster axis.
++    ArrayRef<int64_t> shape = meshes.getMeshes().front().getShape();
++    if (shape.size() != 2) {
++      return failure();
++    }
++    const int64_t rows = shape[0];
++    const int64_t cols = shape[1];
++    auto ids = llvm::to_vector(replicaGroups.getValues<int64_t>());
++    if (replicaGroupsShape[1] == cols &&
++        llvm::equal(ids, llvm::seq<int64_t>(0, rows * cols))) {
++      clusterAxis = 1;
++      return success();
++    }
++    SmallVector<int64_t> columns;
++    for (int64_t c = 0; c < cols; ++c) {
++      for (int64_t r = 0; r < rows; ++r) {
++        columns.push_back(r * cols + c);
++      }
++    }
++    if (replicaGroupsShape[1] == rows && ids == columns) {
++      clusterAxis = 0;
++      return success();
++    }
++    return failure();
    }
  
-@@ -5241,9 +5260,15 @@
+   // If replicaGroupsShape[1] == 1, then the cluster axis should be set to 0.
+@@ -5241,9 +5284,15 @@
        }
      }
  
@@ -67,7 +93,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp, "AllReduceOp cannot specify cluster axis.");
      }
-@@ -5315,9 +5340,15 @@
+@@ -5315,9 +5364,15 @@
        }
      }
  
@@ -84,7 +110,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp, "ReduceScatterOp cannot specify cluster axis.");
      }
-@@ -5358,9 +5389,15 @@
+@@ -5358,9 +5413,15 @@
      auto outputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult(0).getType()));
  
