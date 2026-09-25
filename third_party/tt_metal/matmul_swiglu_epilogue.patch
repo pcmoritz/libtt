@@ -322,7 +322,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu_weights.hpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu_weights.hpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu_weights.hpp
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,52 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -331,62 +331,54 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu
 +#include <cstdint>
 +#include "api/dataflow/dataflow_api.h"
 +
-+// Weight blocks of one SwiGLU core in consumption order. The core's output
-+// tile pairs are processed in groups of up to `group` (bounded by DST), and
-+// each group walks K in blocks of `kblock` tiles. Even blocks travel on
-+// RISCV_0's NOC and odd blocks on RISCV_1's. Every block occupies
-+// kblock * 2 * group CB tiles, so a narrower last group keeps the CB block
-+// size constant.
-+template <uint32_t Kt, uint32_t kblock, uint32_t group>
-+struct SwiGLUBlocks {
-+    uint32_t count;
-+    uint32_t group_start = 0;
-+    uint32_t k0 = 0;
++// Streams one SwiGLU core's weight blocks into `cb` in consumption order.
++// The core's output tile pairs are processed in groups of up to `group`
++// (bounded by DST), and each group walks K in blocks of `in0_block_w` tiles.
++// Even blocks travel on RISCV_0's NOC and odd blocks on RISCV_1's; this reads
++// the blocks with index % 2 == parity. A block holds, for each K row, the
++// group's gate tiles followed by its up tiles (up columns are the first half
++// of the fused weight, gate the second). Every block occupies the same CB
++// space, so a narrower last group keeps the block size constant. `poll` runs
++// while waiting for CB space, so the caller can make other progress.
++template <uint32_t parity, typename Accessor, typename Poll>
++FORCE_INLINE void stream_swiglu_weights(
++    const Accessor& weight, uint32_t n_start, uint32_t count, uint32_t cb, Poll poll) {
++    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
++    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
++    constexpr uint32_t kblock = get_named_compile_time_arg_val("in0_block_w");
++    constexpr uint32_t group = get_named_compile_time_arg_val("group");
++    constexpr uint32_t block_tiles = kblock * 2 * group;
++    const uint32_t tile_bytes = get_tile_size(cb);
 +    uint32_t index = 0;
-+
-+    bool done() const { return group_start >= count; }
-+    uint32_t width() const { return count - group_start < group ? count - group_start : group; }
-+    void next() {
-+        k0 += kblock;
-+        if (k0 >= Kt) {
-+            k0 = 0;
-+            group_start += group;
-+        }
-+        ++index;
-+    }
-+    // Moves to the first or next block with index % 2 == parity.
-+    void seek(uint32_t parity) {
-+        while (!done() && (index & 1) != parity) {
-+            next();
-+        }
-+    }
-+    void next_owned(uint32_t parity) {
-+        next();
-+        seek(parity);
-+    }
-+};
-+
-+// Reads one block: for each K row, the group's gate tiles followed by its up
-+// tiles. Up columns are the first half of the fused weight, gate the second.
-+template <uint32_t Kt, uint32_t kblock, uint32_t group, typename Accessor>
-+FORCE_INLINE void read_swiglu_weight_block(
-+    const Accessor& weight, uint32_t half_Nt, uint32_t n_start, const SwiGLUBlocks<Kt, kblock, group>& block,
-+    uint32_t ptr, uint32_t tile_bytes) {
-+    const uint32_t width = block.width();
-+    for (uint32_t k = 0; k < kblock; ++k) {
-+        const uint32_t up_row = (block.k0 + k) * 2 * half_Nt + n_start + block.group_start;
-+        const uint32_t gate_row = up_row + half_Nt;
-+        for (uint32_t n = 0; n < width; ++n) {
-+            const uint32_t gate_local = (k * 2 * width + n) * tile_bytes;
-+            noc_async_read_tile(gate_row + n, weight, ptr + gate_local);
-+            noc_async_read_tile(up_row + n, weight, ptr + gate_local + width * tile_bytes);
++    for (uint32_t group_start = 0; group_start < count; group_start += group) {
++        const uint32_t width = count - group_start < group ? count - group_start : group;
++        for (uint32_t k0 = 0; k0 < Kt; k0 += kblock, ++index) {
++            if ((index & 1) != parity) {
++                continue;
++            }
++            do {
++                poll();
++            } while (!cb_pages_reservable_at_back(cb, block_tiles));
++            cb_reserve_back(cb, block_tiles);
++            const uint32_t ptr = get_write_ptr(cb);
++            for (uint32_t k = 0; k < kblock; ++k) {
++                const uint32_t up_row = (k0 + k) * 2 * half_Nt + n_start + group_start;
++                const uint32_t gate_row = up_row + half_Nt;
++                for (uint32_t n = 0; n < width; ++n) {
++                    const uint32_t gate_local = ptr + (k * 2 * width + n) * tile_bytes;
++                    noc_async_read_tile(gate_row + n, weight, gate_local);
++                    noc_async_read_tile(up_row + n, weight, gate_local + width * tile_bytes);
++                }
++            }
++            noc_async_read_barrier();
++            cb_push_back(cb, block_tiles);
 +        }
 +    }
 +}
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,37 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -406,24 +398,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +
 +    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
 +    constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
-+    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
-+    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
-+    constexpr uint32_t kblock = get_named_compile_time_arg_val("in0_block_w");
-+    constexpr uint32_t group = get_named_compile_time_arg_val("group");
-+    constexpr uint32_t block_tiles = kblock * 2 * group;
-+
 +    constexpr auto weight_args = TensorAccessorArgs<0>();
 +    constexpr auto output_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
 +    const auto weight = TensorAccessor(weight_args, weight_addr);
 +    const auto output = TensorAccessor(output_args, output_addr);
 +
-+    SwiGLUBlocks<Kt, kblock, group> block{count};
-+    for (block.seek(0); !block.done(); block.next_owned(0)) {
-+        cb_reserve_back(cb_weights, block_tiles);
-+        read_swiglu_weight_block(weight, half_Nt, n_start, block, get_write_ptr(cb_weights), get_tile_size(cb_weights));
-+        noc_async_read_barrier();
-+        cb_push_back(cb_weights, block_tiles);
-+    }
++    stream_swiglu_weights<0>(weight, n_start, count, cb_weights, [] {});
 +
 +    Noc noc;
 +    CircularBuffer out_cb(cb_out);
@@ -439,7 +419,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,53 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -450,9 +430,8 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +#include "api/dataflow/noc_semaphore.h"
 +#include "matmul_swiglu_weights.hpp"
 +
-+// RISCV_1 on multicast receivers: publish activation chunks as they land,
-+// and stream this core's odd weight blocks without blocking on weight CB
-+// space while activation chunks are still pending.
++// RISCV_1 on multicast receivers: publish activation chunks as they land
++// and stream this core's odd weight blocks in between.
 +void kernel_main() {
 +    const uint32_t sender_x = get_arg_val<uint32_t>(0);
 +    const uint32_t sender_y = get_arg_val<uint32_t>(1);
@@ -463,14 +442,9 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    constexpr uint32_t cb_in0_id = get_named_compile_time_arg_val("cb_in0");
 +    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights2");
 +    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
-+    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
-+    constexpr uint32_t kblock = get_named_compile_time_arg_val("in0_block_w");
-+    constexpr uint32_t group = get_named_compile_time_arg_val("group");
 +    constexpr uint32_t in0_mcast_w = get_named_compile_time_arg_val("in0_mcast_w");
 +    constexpr uint32_t sender_sem_id = get_named_compile_time_arg_val("sender_sem");
 +    constexpr uint32_t receiver_sem_id = get_named_compile_time_arg_val("receiver_sem");
-+    constexpr uint32_t num_chunks = Kt / in0_mcast_w;
-+    constexpr uint32_t block_tiles = kblock * 2 * group;
 +    constexpr auto weight_args = TensorAccessorArgs<0>();
 +    const auto weight = TensorAccessor(weight_args, weight_addr);
 +
@@ -485,33 +459,24 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    cb_in0.reserve_back(Kt);
 +    receiver_sem.set(0);
 +    sender_sem.up(noc, sender_x, sender_y, 1);
-+
-+    SwiGLUBlocks<Kt, kblock, group> block{count};
-+    block.seek(1);
++    constexpr uint32_t num_chunks = Kt / in0_mcast_w;
 +    uint32_t chunks = 0;
-+    while (chunks < num_chunks || !block.done()) {
-+        if (chunks < num_chunks) {
-+            invalidate_l1_cache();
-+            if (*chunks_landed > chunks) {
-+                cb_in0.push_back(in0_mcast_w);
-+                ++chunks;
-+                continue;
-+            }
++    auto publish_landed = [&] {
++        invalidate_l1_cache();
++        for (const uint32_t landed = *chunks_landed; chunks < landed; ++chunks) {
++            cb_in0.push_back(in0_mcast_w);
 +        }
-+        if (!block.done() && (chunks == num_chunks || cb_pages_reservable_at_back(cb_weights, block_tiles))) {
-+            cb_reserve_back(cb_weights, block_tiles);
-+            read_swiglu_weight_block(
-+                weight, half_Nt, n_start, block, get_write_ptr(cb_weights), get_tile_size(cb_weights));
-+            noc_async_read_barrier();
-+            cb_push_back(cb_weights, block_tiles);
-+            block.next_owned(1);
-+        }
++    };
++    stream_swiglu_weights<1>(weight, n_start, count, cb_weights, publish_landed);
++    for (; chunks < num_chunks; ++chunks) {
++        receiver_sem.wait_min(chunks + 1);
++        cb_in0.push_back(in0_mcast_w);
 +    }
 +}
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,86 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -543,14 +508,10 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    constexpr uint32_t cb_in0_id = get_named_compile_time_arg_val("cb_in0");
 +    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights2");
 +    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
-+    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
-+    constexpr uint32_t kblock = get_named_compile_time_arg_val("in0_block_w");
-+    constexpr uint32_t group = get_named_compile_time_arg_val("group");
 +    constexpr uint32_t in0_mcast_w = get_named_compile_time_arg_val("in0_mcast_w");
 +    constexpr uint32_t sender_sem_id = get_named_compile_time_arg_val("sender_sem");
 +    constexpr uint32_t receiver_sem_id = get_named_compile_time_arg_val("receiver_sem");
 +    constexpr uint32_t num_chunks = Kt / in0_mcast_w;
-+    constexpr uint32_t block_tiles = kblock * 2 * group;
 +    static_assert(Kt % in0_mcast_w == 0);
 +    constexpr auto input_args = TensorAccessorArgs<0>();
 +    constexpr auto weight_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
@@ -599,13 +560,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +        noc.async_read_barrier();
 +    }
 +
-+    SwiGLUBlocks<Kt, kblock, group> block{count};
-+    for (block.seek(1); !block.done(); block.next_owned(1)) {
-+        cb_reserve_back(cb_weights, block_tiles);
-+        read_swiglu_weight_block(weight, half_Nt, n_start, block, get_write_ptr(cb_weights), get_tile_size(cb_weights));
-+        noc_async_read_barrier();
-+        cb_push_back(cb_weights, block_tiles);
-+    }
++    stream_swiglu_weights<1>(weight, n_start, count, cb_weights, [] {});
 +    noc.async_write_barrier();
 +}
 diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp

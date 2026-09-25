@@ -159,26 +159,6 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
          std::optional<tt::tt_metal::SubDeviceId>& sub_device_id,
          bool use_noc1_only,
          bool use_optimal_ccl_for_llama,
-@@ -90,7 +90,8 @@
-         "use_noc1_only",
-         "use_optimal_ccl_for_llama",
-         "cluster_axis",
--        "sub_device_id");
-+        "sub_device_id",
-+        "fp32_dest_acc");
-     auto attribute_values() const {
-         return std::make_tuple(
-             num_links,
-@@ -101,7 +102,8 @@
-             use_noc1_only,
-             use_optimal_ccl_for_llama,
-             cluster_axis,
--            sub_device_id);
-+            sub_device_id,
-+            fp32_dest_acc);
-     }
- };
- 
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
