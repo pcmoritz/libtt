@@ -9,13 +9,14 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 @pytest.fixture
 def local_mesh():
     devices = jax.local_devices(backend="tt")
-    if len(devices) < 2:
-        pytest.skip("Requires two local TT devices")
+    # A two-chip sub-mesh of a larger visible system is not supported yet.
+    if len(devices) != 2:
+        pytest.skip("Requires exactly two visible TT devices")
     # This integration uses Shardy; the general test runner defaults to GSPMD.
     previous = jax.config.jax_use_shardy_partitioner
     jax.config.update("jax_use_shardy_partitioner", True)
     try:
-        yield Mesh(np.array(devices[:2]), ("tp",))
+        yield Mesh(np.array(devices), ("tp",))
     finally:
         jax.config.update("jax_use_shardy_partitioner", previous)
 

@@ -12,8 +12,23 @@ diff --git a/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h b/include/tt
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -4807,7 +4807,7 @@
+@@ -4805,9 +4805,22 @@
+   return getReduceTypeFromRegion(op->getRegion(0));
+ }
  
++// A collective with one device per replica group is the identity, regardless
++// of which mesh dimension happens to have size one.
++template <typename OpTy, typename AdaptorTy>
++static LogicalResult
++replaceSingleDeviceCollective(OpTy srcOp, AdaptorTy adaptor,
++                              ConversionPatternRewriter &rewriter) {
++  if (adaptor.getReplicaGroups().getType().getShape()[1] != 1) {
++    return failure();
++  }
++  rewriter.replaceOp(srcOp, adaptor.getOperands());
++  return success();
++}
++
  static LogicalResult
  determineClusterAxis(::mlir::DenseIntElementsAttr replicaGroups,
 -                     uint32_t &clusterAxis) {
@@ -21,7 +36,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    /*
    We need to figure out what the cluster axis is based on replica_groups.
    Replica groups define which device axis we are performing the collective
-@@ -4844,13 +4844,20 @@
+@@ -4844,13 +4857,20 @@
  
    // Case where we have single devices in each replica_group (ie perform
    // collective communication operation against itself which should be optimized
@@ -44,14 +59,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      return success();
    }
  
-@@ -5241,9 +5248,18 @@
+@@ -5241,9 +5261,15 @@
        }
      }
  
-+    // A collective with one device per group is the identity, regardless of
-+    // which mesh dimension happens to have size one.
-+    if (adaptor.getReplicaGroups().getType().getShape()[1] == 1) {
-+      rewriter.replaceOp(srcOp, adaptor.getOperands());
++    if (succeeded(replaceSingleDeviceCollective(srcOp, adaptor, rewriter))) {
 +      return success();
 +    }
 +
@@ -64,14 +76,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp, "AllReduceOp cannot specify cluster axis.");
      }
-@@ -5315,9 +5331,18 @@
+@@ -5315,9 +5341,15 @@
        }
      }
  
-+    // A collective with one device per group is the identity, regardless of
-+    // which mesh dimension happens to have size one.
-+    if (adaptor.getReplicaGroups().getType().getShape()[1] == 1) {
-+      rewriter.replaceOp(srcOp, adaptor.getOperands());
++    if (succeeded(replaceSingleDeviceCollective(srcOp, adaptor, rewriter))) {
 +      return success();
 +    }
 +
@@ -84,14 +93,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp, "ReduceScatterOp cannot specify cluster axis.");
      }
-@@ -5358,9 +5383,18 @@
+@@ -5358,9 +5390,15 @@
      auto outputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult(0).getType()));
  
-+    // A collective with one device per group is the identity, regardless of
-+    // which mesh dimension happens to have size one.
-+    if (adaptor.getReplicaGroups().getType().getShape()[1] == 1) {
-+      rewriter.replaceOp(srcOp, adaptor.getOperands());
++    if (succeeded(replaceSingleDeviceCollective(srcOp, adaptor, rewriter))) {
 +      return success();
 +    }
 +

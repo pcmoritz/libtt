@@ -1,36 +1,28 @@
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
 --- a/pjrt_implementation/src/api/client_instance.cc
 +++ b/pjrt_implementation/src/api/client_instance.cc
-@@ -416,7 +416,8 @@
-   m_addressable_devices_raw.reserve(devices_count);
- 
-   for (size_t i = 0; i < devices_count; ++i) {
--    int global_device_id = m_system_descriptor->chip_desc_indices()->Get(i);
-+    // Descriptor indices can repeat when devices have the same chip type.
-+    int global_device_id = i;
-     int local_device_id = i;
- 
-     // For now, just make all devices addressable.
-@@ -901,11 +902,17 @@
+@@ -901,11 +901,20 @@
    ZoneScoped;
    DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_Client_DefaultDeviceAssignment");
  
 -  // TODO(mrakita): Revisit this implementation.
 -  for (size_t i = 0; i < args->default_assignment_size; ++i) {
 -    args->default_assignment[i] = 0;
--  }
--
 +  const auto &devices = ClientInstance::unwrap(args->client)->getDevicesRaw();
 +  const int64_t count =
 +      static_cast<int64_t>(args->num_replicas) * args->num_partitions;
 +  if (args->num_replicas < 1 || args->num_partitions < 1 ||
-+      count > devices.size() || count > args->default_assignment_size)
++      count > static_cast<int64_t>(devices.size()) ||
++      count > static_cast<int64_t>(args->default_assignment_size)) {
 +    return *ErrorInstance::makeError(
 +                tt_pjrt_status::kInvalidArgument,
 +                "Device assignment exceeds available TT devices")
 +                .release();
-+  for (int64_t i = 0; i < count; ++i)
++  }
++  for (int64_t i = 0; i < count; ++i) {
 +    args->default_assignment[i] = devices[i]->getGlobalDeviceId();
+   }
+-
    return nullptr;
  }
  
