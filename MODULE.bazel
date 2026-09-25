@@ -305,6 +305,7 @@ http_archive(
         "//third_party/tt_metal:trace_allocation_state.patch",
         "//third_party/tt_metal:recurrent_attention.patch",
         "//third_party/tt_metal:rotary_logical_heads.patch",
+        "//third_party/tt_metal:inline_small_shard_writes.patch",
     ],
     sha256 = "a222d1f6fe7f6aec62f69e22199a3537a31a58aa5ead52e4ab470b7d87472ecb",
     strip_prefix = "tt-metal-5beed318d0f0d1c6212e605947fb0be80c9e0a1d",
