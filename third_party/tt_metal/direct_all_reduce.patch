@@ -254,7 +254,30 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      const auto output_tensor_shard_num_pages = output_tensor_shard_shape[0] * output_tensor_shard_shape[1] / TILE_HW;
      const auto num_output_cores = output_tensor_cores.num_cores();
  
-@@ -373,11 +372,27 @@
+@@ -356,6 +355,22 @@
+     /* reduction cb */
+     uint32_t reduction_CB_single_tile_size = output_tensor.tensor_spec().tile().get_tile_size(df);
+     uint32_t reduction_CB_tiles = output_tensor_shard_num_pages * ring_size;
++    // A decode activation fills only the first rows of each tile. The direct
++    // path exchanges and reduces just those rows of the two upper faces, packed
++    // in 64-byte aligned chunks, and scatters the sums back into the output
++    // tiles. Padding rows of the output are left undefined.
++    const uint32_t logical_rows = input_tensor.logical_shape()[-2];
++    const bool packed_rows = direct && logical_rows <= TILE_HEIGHT / 2;
++    std::map<std::string, std::string> packed_rows_defines;
++    uint32_t reduction_block_pages = output_tensor_shard_num_pages;
++    if (packed_rows) {
++        packed_rows_defines = {{"PACKED_ROWS", std::to_string(logical_rows)}};
++        // A face row holds 16 BF16 values; chunks keep the 64-byte DRAM alignment.
++        constexpr uint32_t face_row_bytes = 16 * 2;
++        const uint32_t packed_tile_bytes = 2 * tt::round_up(logical_rows * face_row_bytes, 64);
++        reduction_block_pages =
++            tt::div_up(output_tensor_shard_num_pages * packed_tile_bytes, l1_scratch_cb_page_size_bytes);
++    }
+     uint32_t reduction_CB_size = reduction_CB_tiles * reduction_CB_single_tile_size;
+ 
+     uint32_t reduction_cb_index = tt::CBIndex::c_1;
+@@ -373,19 +388,35 @@
      uint32_t out_cb_index = tt::CBIndex::c_2;
      tt::tt_metal::CircularBufferConfig out_cb_config =
          tt::tt_metal::CircularBufferConfig(out_CB_size, {{out_cb_index, output_df}})
@@ -273,7 +296,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
 +            "ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_writer.cpp",
 +            output_tensor_cores, tt::tt_metal::DataMovementConfig{
 +                .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
-+                .noc = tt::tt_metal::NOC::NOC_0, .compile_args = args});
++                .noc = tt::tt_metal::NOC::NOC_0, .compile_args = args, .defines = packed_rows_defines});
 +        uint32_t start = 0;
 +        for (const auto& core : corerange_to_cores(output_tensor_cores, std::nullopt, true)) {
 +            tt::tt_metal::SetRuntimeArgs(program, *output_writer, core, {output_tensor.buffer()->address(), start});
@@ -284,7 +307,26 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      // Create reduction dataflow kernel
      auto reduction_reader_kernel_config = tt::tt_metal::DataMovementConfig{
          .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
-@@ -426,11 +441,12 @@
+         .noc = use_noc1_only ? tt::tt_metal::NOC::NOC_1 : reader_noc,
+         .noc_mode = use_noc1_only ? tt::tt_metal::NOC_MODE::DM_DYNAMIC_NOC : tt::tt_metal::NOC_MODE::DM_DEDICATED_NOC};
+     reduction_reader_kernel_config.compile_args = {
+-        reduction_cb_index,  // reduction_cb_index
+-        reduction_CB_tiles,  // total_num_reduction_tiles
++        reduction_cb_index,                  // reduction_cb_index
++        reduction_block_pages * ring_size,  // total_num_reduction_tiles
+     };
+     auto reduction_reader_kernel_id = tt::tt_metal::CreateKernel(
+         program,
+@@ -415,7 +446,7 @@
+         output_cores_all,
+         reduction_kernel_config);
+     tt::tt_metal::SetRuntimeArgs(
+-        program, reduction_kernel_id, output_tensor_cores, {1, ring_size, output_tensor_shard_num_pages});
++        program, reduction_kernel_id, output_tensor_cores, {1, ring_size, reduction_block_pages});
+     if (!output_cores_unused.empty()) {
+         tt::tt_metal::SetRuntimeArgs(program, reduction_kernel_id, output_cores_unused, {!has_work, 0, 0});
+     }
+@@ -426,18 +457,20 @@
          src0_cb_index,              // cb0_id
          op_config.get_page_size(),  // tensor0_page_size
      };
@@ -298,7 +340,26 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
          sender_worker_core_range,
          tt::tt_metal::DataMovementConfig{
              .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
-@@ -501,6 +517,7 @@
+             .noc = reader_noc,
+             .noc_mode =
+                 use_noc1_only ? tt::tt_metal::NOC_MODE::DM_DYNAMIC_NOC : tt::tt_metal::NOC_MODE::DM_DEDICATED_NOC,
+-            .compile_args = reader_compile_args});
++            .compile_args = reader_compile_args,
++            .defines = packed_rows_defines});
+ 
+     // Writer
+     std::vector<uint32_t> writer_compile_args = {
+@@ -463,7 +496,8 @@
+             .noc = writer_noc,
+             .noc_mode =
+                 use_noc1_only ? tt::tt_metal::NOC_MODE::DM_DYNAMIC_NOC : tt::tt_metal::NOC_MODE::DM_DEDICATED_NOC,
+-            .compile_args = writer_compile_args});
++            .compile_args = writer_compile_args,
++            .defines = packed_rows_defines});
+ 
+     // Kernel Runtime Args
+     for (uint32_t link = 0; link < num_links; link++) {
+@@ -501,6 +535,7 @@
          };
          reader_rt_args.insert(reader_rt_args.end(), input_tensor_cores_x.begin(), input_tensor_cores_x.end());
          reader_rt_args.insert(reader_rt_args.end(), input_tensor_cores_y.begin(), input_tensor_cores_y.end());
@@ -306,7 +367,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
          log_trace(tt::LogOp, "Reader Runtime Args:");
          for ([[maybe_unused]] const auto& arg : reader_rt_args) {
              log_trace(tt::LogOp, "\t{}", arg);
-@@ -598,6 +615,7 @@
+@@ -598,6 +633,7 @@
              .reduction_reader_kernel_id = reduction_reader_kernel_id,
              .sender_worker_cores = sender_worker_cores,
              .output_tensor_cores = output_tensor_cores,
@@ -314,7 +375,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
              .cb_out = cb_out,
              .cb_reduction = cb_reduction}};
  }
-@@ -614,7 +632,7 @@
+@@ -614,7 +650,7 @@
          const auto& input_tensor = tensor_args.input_tensor;
          const auto& buffer_tensor = tensor_args.buffer_tensor;
  
@@ -323,7 +384,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  
          // update senders
          auto& worker_reader_sender_runtime_args_by_core =
-@@ -630,7 +648,12 @@
+@@ -630,7 +666,12 @@
              auto& worker_writer_sender_runtime_args = worker_writer_sender_runtime_args_by_core[core.x][core.y];
              worker_writer_sender_runtime_args[1] = semaphore.address();
          }
@@ -357,7 +418,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_reader.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_reader.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_reader.cpp
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,37 @@
 +// SPDX-License-Identifier: Apache-2.0
 +#include "api/dataflow/dataflow_api.h"
 +void kernel_main() {
@@ -369,6 +430,22 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
 +    const uint32_t total = get_arg_val<uint32_t>(2);
 +    const uint32_t cores = get_arg_val<uint32_t>(4);
 +    const uint32_t start = get_arg_val<uint32_t>(5 + 2 * cores);
++#ifdef PACKED_ROWS
++    // Read just the first PACKED_ROWS rows of each tile: the start of its two
++    // upper 16x16 faces (32 bytes per row, rounded up to the 64-byte DRAM
++    // alignment). Pack them back to back.
++    constexpr uint32_t face = (PACKED_ROWS * 32 + 63) / 64 * 64;
++    const uint32_t pages = (total * 2 * face + page - 1) / page;
++    cb_reserve_back(cb, pages);
++    const uint32_t dst = get_write_ptr(cb);
++    for (uint32_t t = 0; t < total; ++t) {
++        noc_async_read(src.get_noc_addr(start + t), dst + 2 * t * face, face);
++        noc_async_read(src.get_noc_addr(start + t, 512), dst + (2 * t + 1) * face, face);
++    }
++    noc_async_read_barrier();
++    cb_push_back(cb, pages);
++    return;
++#endif
 +    for (uint32_t i = 0; i < total;) {
 +        const uint32_t n = (total-i < chunk) ? total-i : chunk;
 +        cb_reserve_back(cb, n);
@@ -382,7 +459,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_writer.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_writer.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_writer.cpp
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,30 @@
 +// SPDX-License-Identifier: Apache-2.0
 +#include "api/dataflow/dataflow_api.h"
 +void kernel_main() {
@@ -392,9 +469,109 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
 +    const uint32_t page = get_tile_size(cb);
 +    const auto dst = TensorAccessor(spec, get_arg_val<uint32_t>(0), page);
 +    const uint32_t start = get_arg_val<uint32_t>(1);
++#ifdef PACKED_ROWS
++    // The sums are packed (see dram_reader); put each tile's rows back at the
++    // start of its two upper faces.
++    constexpr uint32_t face = (PACKED_ROWS * 32 + 63) / 64 * 64;
++    const uint32_t pages = (count * 2 * face + page - 1) / page;
++    cb_wait_front(cb, pages);
++    const uint32_t packed = get_read_ptr(cb);
++    for (uint32_t t = 0; t < count; ++t) {
++        noc_async_write(packed + 2 * t * face, dst.get_noc_addr(start + t), face);
++        noc_async_write(packed + (2 * t + 1) * face, dst.get_noc_addr(start + t, 512), face);
++    }
++    noc_async_write_barrier();
++    cb_pop_front(cb, pages);
++    return;
++#endif
 +    cb_wait_front(cb, count);
 +    const uint32_t src = get_read_ptr(cb);
 +    for (uint32_t j = 0; j < count; ++j) noc_async_write_tile(start+j, dst, src+j*page);
 +    noc_async_write_barrier();
 +    cb_pop_front(cb, count);
 +}
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/worker_writer.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/worker_writer.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/worker_writer.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/worker_writer.cpp
+@@ -34,6 +34,13 @@
+ constexpr ccl_routing_utils::line_multicast_route_info_t backward_multicast_route_info =
+     ccl_routing_utils::get_line_multicast_route_info_from_args<8 + ccl_routing_utils::num_line_multicast_args>();
+ 
++#ifdef PACKED_ROWS
++// The first PACKED_ROWS rows of each tile arrive packed (see dram_reader).
++constexpr uint32_t packed_page_size = 2 * ((PACKED_ROWS * 32 + 63) / 64 * 64);
++#else
++constexpr uint32_t packed_page_size = tensor0_page_size;
++#endif
++
+ void kernel_main() {
+     ///////////////////////////////////////////////////
+     // ARGS
+@@ -112,13 +119,24 @@
+     uint32_t tiles_read = 0;
+     uint32_t shard_tile_id = first_core_tile_start_offset;
+     uint32_t core_id = 0;
+-    uint32_t writer_chip_offset = my_chip_id * num_tiles_per_core * tensor0_page_size;
++    // Each chip's slot on a reduction core spans whole pages.
++    const uint32_t slot_bytes =
++        (num_tiles_per_core * packed_page_size + tensor0_page_size - 1) / tensor0_page_size * tensor0_page_size;
++    uint32_t writer_chip_offset = my_chip_id * slot_bytes;
++    constexpr uint32_t tiles_per_packet = packet_size_in_pages * tensor0_page_size / packed_page_size;
++#ifdef PACKED_ROWS
++    const uint32_t packed_pages = (num_tiles_to_read * packed_page_size + tensor0_page_size - 1) / tensor0_page_size;
++    cb0.wait_front(packed_pages);
++    size_t l1_read_addr = cb0.get_read_ptr();
++#endif
+ 
+     while (tiles_read < num_tiles_to_read) {
+-        uint32_t num_tiles_to_read_this_core = std::min(num_tiles_per_core - shard_tile_id, packet_size_in_pages);
++        uint32_t num_tiles_to_read_this_core = std::min(num_tiles_per_core - shard_tile_id, tiles_per_packet);
+         num_tiles_to_read_this_core = std::min(num_tiles_to_read - tiles_read, num_tiles_to_read_this_core);
++#ifndef PACKED_ROWS
+         cb0.wait_front(num_tiles_to_read_this_core);
+         size_t l1_read_addr = cb0.get_read_ptr();
++#endif
+ 
+         uint64_t noc0_dest_noc_addr =
+             safe_get_noc_addr(core_noc_x[core_id], core_noc_y[core_id], reduction_input_addr + writer_chip_offset);
+@@ -126,7 +144,7 @@
+         uint64_t sema_noc_addr = safe_get_noc_addr(core_noc_x[core_id], core_noc_y[core_id], out_ready_sem_bank_addr);
+ 
+         // Within-shard offset
+-        noc0_dest_noc_addr += shard_tile_id * tensor0_page_size;
++        noc0_dest_noc_addr += shard_tile_id * packed_page_size;
+ 
+         // This issues a flush barrier
+         if (shard_tile_id + num_tiles_to_read_this_core >= num_tiles_per_core ||
+@@ -137,7 +155,7 @@
+                 pkt_hdr_backward,
+                 fabric_connection,
+                 l1_read_addr,
+-                num_tiles_to_read_this_core * tensor0_page_size,
++                num_tiles_to_read_this_core * packed_page_size,
+                 sema_noc_addr,
+                 static_cast<uint32_t>(1),
+                 false);
+@@ -149,7 +167,7 @@
+                 pkt_hdr_backward,
+                 fabric_connection,
+                 l1_read_addr,
+-                num_tiles_to_read_this_core * tensor0_page_size);
++                num_tiles_to_read_this_core * packed_page_size);
+         }
+ 
+         tiles_read += num_tiles_to_read_this_core;
+@@ -158,8 +176,13 @@
+             shard_tile_id = 0;
+             core_id++;
+         }
++#ifndef PACKED_ROWS
+         cb0.pop_front(num_tiles_to_read_this_core);
++#endif
+     }
++#ifdef PACKED_ROWS
++    cb0.pop_front(packed_pages);
++#endif
+ 
+     // 2. local semaphore increment
+     // Device 2.0 migration: legacy primitive retained: out_ready_sem_bank_addr is the address of a GlobalSemaphore.
