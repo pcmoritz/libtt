@@ -1,0 +1,14 @@
+diff --git tt_metal/fabric/fabric_context.cpp tt_metal/fabric/fabric_context.cpp
+--- tt_metal/fabric/fabric_context.cpp
++++ tt_metal/fabric/fabric_context.cpp
+@@ -223,6 +223,10 @@
+     if (router_config_.max_packet_payload_size_bytes.has_value()) {
+         return validate_and_apply_packet_size(hal, arch, router_config_.max_packet_payload_size_bytes.value());
+     }
++    // Pack three FP32 tiles instead of using the BFP8-sized default.
++    if (arch == tt::ARCH::BLACKHOLE) {
++        return validate_and_apply_packet_size(hal, arch, 12288);
++    }
+     // Default behavior
+     if (is_2D_routing_enabled_) {
+         return tt::tt_fabric::FabricEriscDatamoverBuilder::default_mesh_packet_payload_size_bytes;

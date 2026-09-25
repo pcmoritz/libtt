@@ -21,6 +21,11 @@ python -m pip install bazel-bin/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl
 
 The wheel contains `libtt.so` and libtt's JAX initialization hook.
 
+## Local tensor parallelism
+
+See [Qwen3-8B on two QuietBox chips](docs/qwen3-8b-quietbox-tp2.md) for the
+single-process TP2 launch recipe and multi-chip regression tests.
+
 ## JAX tests
 
 Run the upstream JAX smoke tests against this checkout's plugin wheel:
