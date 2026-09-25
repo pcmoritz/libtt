@@ -1,0 +1,1145 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
+@@ -259,9 +259,16 @@
+     const uint32_t group0_y = use_100_cores ? 9 : 8;
+     const uint32_t group1_x = use_100_cores ? 10 : 8;
+     constexpr uint32_t in0_block_w = 2;
+-    constexpr uint32_t in0_mcast_w = 2;
++    constexpr uint32_t in1_buffers = 2;
++    // Even K blocks stream on RISCV_0's NOC and odd blocks on RISCV_1's NOC.
++    constexpr uint32_t dual_noc = 1;
+ 
+     const uint32_t Kt = a.padded_shape()[-1] / TILE_WIDTH;
++    // The activation arrives in multicast chunks of up to eight tiles.
++    uint32_t in0_mcast_w = 8;
++    while (Kt % in0_mcast_w != 0) {
++        in0_mcast_w /= 2;
++    }
+     const uint32_t fused_Nt = b.padded_shape()[-1] / TILE_WIDTH;
+     const uint32_t half_Nt = fused_Nt / 2;
+     const uint32_t per_core_N = half_Nt / num_cores;
+@@ -297,8 +304,10 @@
+             }}},
+         });
+     };
+-    add_cb(tt::CBIndex::c_0, 2 * in0_mcast_w, in0_format, in0_tile_size);
+-    add_cb(tt::CBIndex::c_1, 2 * in1_block_num_tiles, in1_format, in1_tile_size);
++    // The activation block stays resident for the whole reduction.
++    add_cb(tt::CBIndex::c_0, Kt, in0_format, in0_tile_size);
++    add_cb(tt::CBIndex::c_1, in1_buffers * in1_block_num_tiles, in1_format, in1_tile_size);
++    add_cb(tt::CBIndex::c_2, in1_buffers * in1_block_num_tiles, in1_format, in1_tile_size);
+     add_cb(tt::CBIndex::c_16, per_core_N, output_format, output_tile_size);
+ 
+     constexpr uint32_t sender_sem_id = 0;
+@@ -332,6 +341,16 @@
+ 
+     std::vector<uint32_t> in0_sender_compile_args;
+     tt::tt_metal::TensorAccessorArgs(a).append_to(in0_sender_compile_args);
++    tt::tt_metal::TensorAccessorArgs(b).append_to(in0_sender_compile_args);
++    std::vector<uint32_t> in0_receiver_compile_args;
++    tt::tt_metal::TensorAccessorArgs(b).append_to(in0_receiver_compile_args);
++    const std::vector<std::pair<std::string, uint32_t>> weight_split_args = {
++        {"cb_weights2", tt::CBIndex::c_2},
++        {"half_Nt", half_Nt},
++        {"per_core_N", per_core_N},
++        {"in0_block_w", in0_block_w},
++        {"dual_noc", dual_noc},
++    };
+     auto make_sender_desc = [&](const CoreRangeSet& sender_cores, uint32_t num_dests) {
+         KernelDescriptor sender_desc;
+         sender_desc.kernel_source =
+@@ -347,6 +366,8 @@
+             {"sender_sem", sender_sem_id},
+             {"receiver_sem", receiver_sem_id},
+         };
++        sender_desc.named_compile_time_args.insert(
++            sender_desc.named_compile_time_args.end(), weight_split_args.begin(), weight_split_args.end());
+         sender_desc.config = tt::tt_metal::DataMovementConfigDescriptor{
+             .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc};
+         return sender_desc;
+@@ -359,14 +380,18 @@
+          static_cast<uint32_t>(mcast_start0.x),
+          static_cast<uint32_t>(mcast_start0.y),
+          static_cast<uint32_t>(mcast_end0.x),
+-         static_cast<uint32_t>(mcast_end0.y)});
++         static_cast<uint32_t>(mcast_end0.y),
++         b,
++         0u});
+     in0_sender_desc1.emplace_runtime_args(
+         sender_core1,
+         {a,
+          static_cast<uint32_t>(mcast_start1.x),
+          static_cast<uint32_t>(mcast_start1.y),
+          static_cast<uint32_t>(mcast_end1.x),
+-         static_cast<uint32_t>(mcast_end1.y)});
++         static_cast<uint32_t>(mcast_end1.y),
++         b,
++         static_cast<uint32_t>(sender_core1.y * grid_x + sender_core1.x)});
+ 
+     KernelDescriptor in0_receiver_desc;
+     in0_receiver_desc.kernel_source =
+@@ -380,6 +405,9 @@
+         {"sender_sem", sender_sem_id},
+         {"receiver_sem", receiver_sem_id},
+     };
++    in0_receiver_desc.named_compile_time_args.insert(
++        in0_receiver_desc.named_compile_time_args.end(), weight_split_args.begin(), weight_split_args.end());
++    in0_receiver_desc.compile_time_args = in0_receiver_compile_args;
+     in0_receiver_desc.config = tt::tt_metal::DataMovementConfigDescriptor{
+         .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc};
+ 
+@@ -399,6 +427,7 @@
+         {"half_Nt", half_Nt},
+         {"per_core_N", per_core_N},
+         {"in0_block_w", in0_block_w},
++        {"dual_noc", dual_noc},
+     };
+     reader_desc.config = tt::tt_metal::DataMovementConfigDescriptor{
+         .processor = tt_metal::DataMovementProcessor::RISCV_0, .noc = in1_noc};
+@@ -413,7 +442,9 @@
+             in0_receiver_desc.emplace_runtime_args(
+                 core,
+                 {static_cast<uint32_t>(group_sender_physical.x),
+-                 static_cast<uint32_t>(group_sender_physical.y)});
++                 static_cast<uint32_t>(group_sender_physical.y),
++                 b,
++                 i});
+         }
+     }
+     desc.semaphores.push_back(tt::tt_metal::SemaphoreDescriptor{
+@@ -446,6 +477,8 @@
+         {"cb_in0", tt::CBIndex::c_0},
+         {"cb_weights", tt::CBIndex::c_1},
+         {"cb_out", tt::CBIndex::c_16},
++        {"cb_weights2", tt::CBIndex::c_2},
++        {"dual_noc", dual_noc},
+     };
+     compute_desc.config = ComputeConfigDescriptor{
+         .math_fidelity = math_fidelity,
+@@ -456,4 +489,224 @@
+     return desc;
+ }
+ 
++ProgramDescriptor MatmulDecodeStreamProgramFactory::create_descriptor(
++    const ttnn::prim::MatmulParams& operation_attributes,
++    const ttnn::prim::MatmulInputs& tensor_args,
++    std::vector<ttnn::Tensor>& tensor_return_value,
++    const std::optional<CoreRangeSet>& /*core_range_set*/) {
++    const auto& a = tensor_args.input_tensors.at(0).mesh_tensor();
++    const auto& b = tensor_args.input_tensors.at(1).mesh_tensor();
++    const auto& output = tensor_return_value.at(0).mesh_tensor();
++    auto* device = &a.mutable_device();
++
++    const uint32_t Kt = a.padded_shape()[-1] / TILE_WIDTH;
++    const uint32_t Nt = b.padded_shape()[-1] / TILE_WIDTH;
++    const auto grid = device->compute_with_storage_grid_size();
++    const uint32_t grid_x = grid.x;
++    const uint32_t max_cores = grid.x * grid.y;
++
++    // Prefer an even split of output tiles; otherwise use every core and let
++    // per-core counts differ by one.
++    uint32_t num_cores = std::min(max_cores, Nt);
++    for (uint32_t c = num_cores; c * 10 >= max_cores * 7; --c) {
++        if (Nt % c == 0) {
++            num_cores = c;
++            break;
++        }
++    }
++    const uint32_t max_count = tt::div_up(Nt, num_cores);
++    const uint32_t groups = tt::div_up(max_count, 8u);
++    const uint32_t group = tt::div_up(max_count, groups);
++    uint32_t kblock = 8;
++    while (kblock > 1 && (Kt % kblock != 0 || kblock * group > 16)) {
++        kblock /= 2;
++    }
++    uint32_t in0_mcast_w = 8;
++    while (Kt % in0_mcast_w != 0) {
++        in0_mcast_w /= 2;
++    }
++    constexpr uint32_t dual_noc = 1;
++    constexpr uint32_t in1_buffers = 2;
++    TT_FATAL(Kt % kblock == 0, "Decode stream K block must divide K");
++    const uint32_t block_tiles = kblock * group;
++
++    const uint32_t full_rows = num_cores / grid_x;
++    const uint32_t last_row = num_cores % grid_x;
++    TT_FATAL(full_rows > 0 && full_rows + (last_row ? 1 : 0) <= grid.y, "Decode stream needs a full core row");
++    std::vector<CoreRange> ranges{CoreRange(CoreCoord(0, 0), CoreCoord(grid_x - 1, full_rows - 1))};
++    if (last_row) {
++        ranges.emplace_back(CoreCoord(0, full_rows), CoreCoord(last_row - 1, full_rows));
++    }
++    const CoreRangeSet compute_cores(ranges);
++    // When the compute cores leave the last grid row free, feed the multicast
++    // from idle cores there so no compute core also carries the activation.
++    const bool dedicated_senders = full_rows + (last_row ? 1 : 0) < grid.y && grid_x >= 2;
++    std::vector<CoreCoord> senders{dedicated_senders ? CoreCoord(0, grid.y - 1) : CoreCoord(0, 0)};
++    if (last_row) {
++        senders.push_back(dedicated_senders ? CoreCoord(1, grid.y - 1) : CoreCoord(0, full_rows));
++    }
++    std::vector<CoreRange> sender_ranges;
++    for (const auto& sender : senders) {
++        sender_ranges.emplace_back(sender, sender);
++    }
++    const CoreRangeSet all_cores =
++        dedicated_senders ? compute_cores.merge(CoreRangeSet(sender_ranges)) : compute_cores;
++
++    const auto in0_format = tt_metal::datatype_to_dataformat_converter(a.dtype());
++    const auto in1_format = tt_metal::datatype_to_dataformat_converter(b.dtype());
++    const auto output_format = tt_metal::datatype_to_dataformat_converter(output.dtype());
++    ProgramDescriptor desc;
++    auto add_cb = [&](uint32_t index, uint32_t tiles, tt::DataFormat format) {
++        const uint32_t page_size = tt::tile_size(format);
++        desc.cbs.push_back(CBDescriptor{
++            .total_size = tiles * page_size,
++            .core_ranges = all_cores,
++            .format_descriptors = {{CBFormatDescriptor{
++                .buffer_index = index, .data_format = format, .page_size = page_size}}},
++        });
++    };
++    add_cb(tt::CBIndex::c_0, Kt, in0_format);
++    add_cb(tt::CBIndex::c_1, in1_buffers * block_tiles, in1_format);
++    add_cb(tt::CBIndex::c_2, in1_buffers * block_tiles, in1_format);
++    add_cb(tt::CBIndex::c_16, max_count, output_format);
++
++    constexpr uint32_t sender_sem_id = 0;
++    constexpr uint32_t receiver_sem_id = 1;
++    desc.semaphores.push_back(tt::tt_metal::SemaphoreDescriptor{
++        .id = sender_sem_id, .core_ranges = all_cores, .initial_value = 0});
++    desc.semaphores.push_back(tt::tt_metal::SemaphoreDescriptor{
++        .id = receiver_sem_id, .core_ranges = all_cores, .initial_value = 0});
++
++    const auto in0_noc = tt::tt_metal::detail::preferred_noc_for_dram_write(device->arch());
++    const auto in1_noc = tt::tt_metal::detail::preferred_noc_for_dram_read(device->arch());
++    const std::vector<std::pair<std::string, uint32_t>> common_args = {
++        {"cb_in0", tt::CBIndex::c_0},
++        {"cb_weights", tt::CBIndex::c_1},
++        {"cb_weights2", tt::CBIndex::c_2},
++        {"cb_out", tt::CBIndex::c_16},
++        {"Kt", Kt},
++        {"Nt", Nt},
++        {"kblock", kblock},
++        {"group", group},
++        {"in0_mcast_w", in0_mcast_w},
++        {"dual_noc", dual_noc},
++        {"sender_sem", sender_sem_id},
++        {"receiver_sem", receiver_sem_id},
++    };
++    auto make_kernel = [&](const char* source, CoreRangeSet cores, std::vector<uint32_t> compile_args,
++                           tt_metal::DataMovementProcessor processor, tt::tt_metal::NOC noc) {
++        KernelDescriptor kernel;
++        kernel.kernel_source = source;
++        kernel.source_type = KernelDescriptor::SourceType::FILE_PATH;
++        kernel.core_ranges = std::move(cores);
++        kernel.compile_time_args = std::move(compile_args);
++        kernel.named_compile_time_args = common_args;
++        kernel.config = tt::tt_metal::DataMovementConfigDescriptor{.processor = processor, .noc = noc};
++        return kernel;
++    };
++
++    std::vector<uint32_t> reader_args;
++    tt::tt_metal::TensorAccessorArgs(b).append_to(reader_args);
++    tt::tt_metal::TensorAccessorArgs(output).append_to(reader_args);
++    std::vector<uint32_t> sender_args;
++    tt::tt_metal::TensorAccessorArgs(a).append_to(sender_args);
++    tt::tt_metal::TensorAccessorArgs(b).append_to(sender_args);
++    std::vector<uint32_t> receiver_args;
++    tt::tt_metal::TensorAccessorArgs(b).append_to(receiver_args);
++
++    // One multicast group per rectangle of compute cores.
++    std::vector<CoreRange> receiver_ranges;
++    if (dedicated_senders) {
++        receiver_ranges = ranges;
++    } else if (grid_x > 1) {
++        receiver_ranges.emplace_back(CoreCoord(1, 0), CoreCoord(grid_x - 1, 0));
++    }
++    if (!dedicated_senders && full_rows > 1) {
++        receiver_ranges.emplace_back(CoreCoord(0, 1), CoreCoord(grid_x - 1, full_rows - 1));
++    }
++    if (!dedicated_senders && last_row > 1) {
++        receiver_ranges.emplace_back(CoreCoord(1, full_rows), CoreCoord(last_row - 1, full_rows));
++    }
++    auto reader = make_kernel(
++        "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_decode_stream.cpp", compute_cores, reader_args,
++        tt_metal::DataMovementProcessor::RISCV_0, in1_noc);
++    auto sender = make_kernel(
++        "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/decode_stream_in0_sender.cpp",
++        CoreRangeSet(sender_ranges), sender_args, tt_metal::DataMovementProcessor::RISCV_1, in0_noc);
++    auto receiver = make_kernel(
++        "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/decode_stream_in0_receiver.cpp",
++        CoreRangeSet(receiver_ranges), receiver_args, tt_metal::DataMovementProcessor::RISCV_1, in0_noc);
++
++    TT_FATAL(operation_attributes.compute_kernel_config.has_value(), "Decode stream compute config is required");
++    auto [math_fidelity, math_approx_mode, fp32_dest_acc_en, packer_l1_acc, dst_full_sync_en] =
++        get_compute_kernel_config_args(device->arch(), operation_attributes.compute_kernel_config.value());
++    KernelDescriptor compute;
++    compute.kernel_source = "ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/decode_stream.cpp";
++    compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
++    compute.core_ranges = compute_cores;
++    compute.named_compile_time_args = common_args;
++    compute.config = ComputeConfigDescriptor{
++        .math_fidelity = math_fidelity,
++        .fp32_dest_acc_en = true,
++        .dst_full_sync_en = true,
++        .math_approx_mode = math_approx_mode};
++
++    const uint32_t base_count = Nt / num_cores;
++    const uint32_t extra = Nt % num_cores;
++    auto add_sender = [&](const CoreCoord& core, bool group0, uint32_t n_start, uint32_t count) {
++        auto start = device->worker_core_from_logical_core(group0 ? CoreCoord(0, 0) : CoreCoord(0, full_rows));
++        auto end = device->worker_core_from_logical_core(
++            group0 ? CoreCoord(grid_x - 1, full_rows - 1) : CoreCoord(last_row - 1, full_rows));
++        if (in0_noc == tt::tt_metal::NOC::NOC_1) {
++            std::swap(start, end);
++        }
++        const uint32_t num_dests = (group0 ? grid_x * full_rows : last_row) - (dedicated_senders ? 0 : 1);
++        sender.emplace_runtime_args(
++            core,
++            {a,
++             static_cast<uint32_t>(start.x),
++             static_cast<uint32_t>(start.y),
++             static_cast<uint32_t>(end.x),
++             static_cast<uint32_t>(end.y),
++             num_dests,
++             b,
++             n_start,
++             count});
++    };
++    if (dedicated_senders) {
++        for (uint32_t g = 0; g < senders.size(); ++g) {
++            add_sender(senders[g], g == 0, 0, 0);
++        }
++    }
++    uint32_t n_start = 0;
++    for (uint32_t i = 0; i < num_cores; ++i) {
++        const CoreCoord core{i % grid_x, i / grid_x};
++        const uint32_t count = base_count + (i < extra ? 1 : 0);
++        reader.emplace_runtime_args(core, {b, output, n_start, count});
++        compute.emplace_runtime_args(core, {count});
++        const bool group0 = core.y < full_rows;
++        const CoreCoord group_sender = group0 ? senders[0] : senders[1];
++        if (core == group_sender) {
++            add_sender(core, group0, n_start, count);
++        } else {
++            const auto sender_physical = device->worker_core_from_logical_core(group_sender);
++            receiver.emplace_runtime_args(
++                core,
++                {static_cast<uint32_t>(sender_physical.x),
++                 static_cast<uint32_t>(sender_physical.y),
++                 b,
++                 n_start,
++                 count});
++        }
++        n_start += count;
++    }
++    desc.kernels.push_back(std::move(reader));
++    desc.kernels.push_back(std::move(sender));
++    if (!receiver_ranges.empty()) {
++        desc.kernels.push_back(std::move(receiver));
++    }
++    desc.kernels.push_back(std::move(compute));
++    return desc;
++}
++
+ }  // namespace ttnn::prim
+diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
+--- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
++++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
+@@ -26,4 +26,15 @@
+         const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
+ };
+ 
++// Decode matmul of one activation tile row against BFP8 DRAM weights. The
++// activation stays resident in L1 while each core streams its weight columns
++// over both NOCs.
++struct MatmulDecodeStreamProgramFactory {
++    static tt::tt_metal::ProgramDescriptor create_descriptor(
++        const ttnn::prim::MatmulParams& operation_attributes,
++        const ttnn::prim::MatmulInputs& tensor_args,
++        std::vector<ttnn::Tensor>& tensor_return_value,
++        const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
++};
++
+ }  // namespace ttnn::prim
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/decode_stream.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/decode_stream.cpp
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/decode_stream.cpp
+@@ -0,0 +1,58 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++#include <cstdint>
++#include "api/compute/compute_kernel_hw_startup.h"
++#include "api/compute/matmul.h"
++#include "api/dataflow/circular_buffer.h"
++#include "api/compute/compute_kernel_api.h"
++
++// One activation tile row times this core's weight columns. Each output group
++// accumulates the full K reduction in FP32 DST before packing. The activation
++// stays resident, so later groups reuse it without another transfer.
++void kernel_main() {
++    const uint32_t count = get_arg_val<uint32_t>(0);
++
++    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
++    constexpr uint32_t kblock = get_named_compile_time_arg_val("kblock");
++    constexpr uint32_t group = get_named_compile_time_arg_val("group");
++    constexpr bool dual_noc = get_named_compile_time_arg_val("dual_noc");
++    constexpr uint32_t cb_in0 = get_named_compile_time_arg_val("cb_in0");
++    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
++    constexpr uint32_t cb_weights2 = get_named_compile_time_arg_val("cb_weights2");
++    constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
++    constexpr uint32_t block_tiles = kblock * group;
++    static_assert(group > 0 && group <= 8, "output group must fit in FP32 DST");
++
++    compute_kernel_hw_startup<SrcOrder::Reverse>(cb_in0, cb_weights, cb_out);
++    matmul_block_init(cb_in0, cb_weights, 0, 1, 1, kblock);
++    uint32_t in0_ready = 0;
++    uint32_t index = 0;
++    for (uint32_t group_start = 0; group_start < count; group_start += group) {
++        const uint32_t width = count - group_start < group ? count - group_start : group;
++        tile_regs_acquire();
++        for (uint32_t k0 = 0; k0 < Kt; k0 += kblock, ++index) {
++            const uint32_t cb_block = (dual_noc && (index & 1)) ? cb_weights2 : cb_weights;
++            if (in0_ready < k0 + kblock) {
++                in0_ready = k0 + kblock;
++                cb_wait_front(cb_in0, in0_ready);
++            }
++            cb_wait_front(cb_block, block_tiles);
++            for (uint32_t k = 0; k < kblock; ++k) {
++                for (uint32_t n = 0; n < width; ++n) {
++                    matmul_block(cb_in0, cb_block, k0 + k, k * width + n, n, /*transpose=*/0, 1, 1, kblock);
++                }
++            }
++            cb_pop_front(cb_block, block_tiles);
++        }
++        tile_regs_commit();
++        tile_regs_wait();
++        cb_reserve_back(cb_out, width);
++        for (uint32_t n = 0; n < width; ++n) {
++            pack_tile(n, cb_out);
++        }
++        cb_push_back(cb_out, width);
++        tile_regs_release();
++    }
++    cb_pop_front(cb_in0, Kt);
++}
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
+@@ -17,6 +17,8 @@
+     constexpr uint32_t cb_in0 = get_named_compile_time_arg_val("cb_in0");
+     constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
+     constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
++    constexpr uint32_t cb_weights2 = get_named_compile_time_arg_val("cb_weights2");
++    constexpr bool dual_noc = get_named_compile_time_arg_val("dual_noc");
+     constexpr uint32_t combined_per_core_N = 2 * per_core_N;
+     constexpr uint32_t out_subblock_w = 2;
+     static_assert(combined_per_core_N > 0 && combined_per_core_N <= 8, "gate and up must fit in DST");
+@@ -26,17 +28,19 @@
+     // Both projections fit in DST; retain them across all K blocks.
+     tile_regs_acquire();
+     for (uint32_t block = 0; block < num_blocks; ++block) {
++        // With the dual-NOC split, odd K blocks arrive through the second CB.
++        const uint32_t cb_block = (dual_noc && (block & 1)) ? cb_weights2 : cb_weights;
+         cb_wait_front(cb_in0, in0_block_tiles);
+-        cb_wait_front(cb_weights, in1_block_tiles);
++        cb_wait_front(cb_block, in1_block_tiles);
+         for (uint32_t k = 0; k < in0_block_w; ++k) {
+             for (uint32_t offset = 0; offset < combined_per_core_N; offset += out_subblock_w) {
+                 matmul_block(
+-                    cb_in0, cb_weights, k, k * combined_per_core_N + offset, offset,
++                    cb_in0, cb_block, k, k * combined_per_core_N + offset, offset,
+                     /*transpose=*/0, out_subblock_w, 1, in0_block_w);
+             }
+         }
+         cb_pop_front(cb_in0, in0_block_tiles);
+-        cb_pop_front(cb_weights, in1_block_tiles);
++        cb_pop_front(cb_block, in1_block_tiles);
+     }
+ 
+     // Gate occupies the first per_core_N tiles, followed by up.
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/decode_stream_blocks.hpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/decode_stream_blocks.hpp
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/decode_stream_blocks.hpp
+@@ -0,0 +1,55 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <cstdint>
++#include "api/dataflow/dataflow_api.h"
++
++// Weight blocks of a decode-stream matmul core, in consumption order: output
++// tiles are processed in groups of up to `group` tiles, and each group walks
++// K in blocks of `kblock` tiles. Even blocks travel on RISCV_0's NOC and odd
++// blocks on RISCV_1's NOC. Every block occupies kblock * group CB tiles, so
++// narrower final groups keep the CB block size constant.
++template <uint32_t Kt, uint32_t kblock, uint32_t group>
++struct DecodeStreamBlocks {
++    uint32_t count;
++    uint32_t group_start = 0;
++    uint32_t k0 = 0;
++    uint32_t index = 0;
++
++    bool done() const { return group_start >= count; }
++    uint32_t width() const { return count - group_start < group ? count - group_start : group; }
++    void next() {
++        k0 += kblock;
++        if (k0 >= Kt) {
++            k0 = 0;
++            group_start += group;
++        }
++        ++index;
++    }
++    // Blocks with index % stride == parity belong to the calling RISC.
++    void first_owned(uint32_t stride, uint32_t parity) {
++        while (!done() && index % stride != parity) {
++            next();
++        }
++    }
++    void next_owned(uint32_t stride, uint32_t parity) {
++        do {
++            next();
++        } while (!done() && index % stride != parity);
++    }
++};
++
++template <uint32_t Kt, uint32_t kblock, uint32_t group, typename Accessor>
++FORCE_INLINE void read_decode_stream_block(
++    const Accessor& weight, uint32_t Nt, uint32_t n_start, const DecodeStreamBlocks<Kt, kblock, group>& block,
++    uint32_t ptr, uint32_t tile_bytes) {
++    const uint32_t width = block.width();
++    for (uint32_t k = 0; k < kblock; ++k) {
++        const uint32_t row = (block.k0 + k) * Nt + n_start + block.group_start;
++        for (uint32_t n = 0; n < width; ++n) {
++            noc_async_read_tile(row + n, weight, ptr + (k * width + n) * tile_bytes);
++        }
++    }
++}
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/decode_stream_in0_receiver.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/decode_stream_in0_receiver.cpp
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/decode_stream_in0_receiver.cpp
+@@ -0,0 +1,69 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++#include <cstdint>
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++#include "api/dataflow/circular_buffer.h"
++#include "api/dataflow/noc_semaphore.h"
++#include "decode_stream_blocks.hpp"
++
++// RISCV_1 on multicast receivers: publish activation chunks as they land and
++// stream the odd weight blocks, never blocking on weight CB space while
++// activation chunks are still pending.
++void kernel_main() {
++    const uint32_t sender_x = get_arg_val<uint32_t>(0);
++    const uint32_t sender_y = get_arg_val<uint32_t>(1);
++    const uint32_t weight_addr = get_arg_val<uint32_t>(2);
++    const uint32_t n_start = get_arg_val<uint32_t>(3);
++    const uint32_t count = get_arg_val<uint32_t>(4);
++
++    constexpr uint32_t cb_in0_id = get_named_compile_time_arg_val("cb_in0");
++    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights2");
++    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
++    constexpr uint32_t Nt = get_named_compile_time_arg_val("Nt");
++    constexpr uint32_t in0_mcast_w = get_named_compile_time_arg_val("in0_mcast_w");
++    constexpr uint32_t sender_sem_id = get_named_compile_time_arg_val("sender_sem");
++    constexpr uint32_t receiver_sem_id = get_named_compile_time_arg_val("receiver_sem");
++    constexpr uint32_t kblock = get_named_compile_time_arg_val("kblock");
++    constexpr uint32_t group = get_named_compile_time_arg_val("group");
++    constexpr bool dual_noc = get_named_compile_time_arg_val("dual_noc");
++    constexpr uint32_t num_chunks = Kt / in0_mcast_w;
++    constexpr uint32_t block_tiles = kblock * group;
++    constexpr auto weight_args = TensorAccessorArgs<0>();
++    const auto weight = TensorAccessor(weight_args, weight_addr);
++
++    Noc noc;
++    CircularBuffer cb_in0(cb_in0_id);
++    Semaphore<> sender_sem(sender_sem_id);
++    Semaphore<> receiver_sem(receiver_sem_id);
++    volatile tt_l1_ptr uint32_t* chunks_landed =
++        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(receiver_sem_id));
++
++    // The CB holds all Kt tiles, so one handshake covers every chunk.
++    cb_in0.reserve_back(Kt);
++    receiver_sem.set(0);
++    sender_sem.up(noc, sender_x, sender_y, 1);
++
++    DecodeStreamBlocks<Kt, kblock, group> block{dual_noc ? count : 0};
++    block.first_owned(2, 1);
++    uint32_t chunks = 0;
++    while (chunks < num_chunks || !block.done()) {
++        if (chunks < num_chunks) {
++            invalidate_l1_cache();
++            if (*chunks_landed > chunks) {
++                cb_in0.push_back(in0_mcast_w);
++                ++chunks;
++                continue;
++            }
++        }
++        if (!block.done() && (chunks == num_chunks || cb_pages_reservable_at_back(cb_weights, block_tiles))) {
++            cb_reserve_back(cb_weights, block_tiles);
++            read_decode_stream_block(
++                weight, Nt, n_start, block, get_write_ptr(cb_weights), get_tile_size(cb_weights));
++            noc_async_read_barrier();
++            cb_push_back(cb_weights, block_tiles);
++            block.next_owned(2, 1);
++        }
++    }
++}
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/decode_stream_in0_sender.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/decode_stream_in0_sender.cpp
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/decode_stream_in0_sender.cpp
+@@ -0,0 +1,115 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++#include <cstdint>
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++#include "api/dataflow/circular_buffer.h"
++#include "api/dataflow/noc_semaphore.h"
++#include "api/dataflow/endpoints.h"
++#include "api/core_local_mem.h"
++#include "decode_stream_blocks.hpp"
++
++// RISCV_1 on a multicast sender. The activation row block stays resident in
++// every core's L1: after one readiness handshake, stream it in chunks, with
++// the DRAM read of the next chunk overlapping the multicast of the current
++// one and a counting semaphore announcing landed chunks. The odd weight
++// blocks for this core follow.
++void kernel_main() {
++    const uint32_t input_addr = get_arg_val<uint32_t>(0);
++    const uint32_t dest_start_x = get_arg_val<uint32_t>(1);
++    const uint32_t dest_start_y = get_arg_val<uint32_t>(2);
++    const uint32_t dest_end_x = get_arg_val<uint32_t>(3);
++    const uint32_t dest_end_y = get_arg_val<uint32_t>(4);
++    const uint32_t num_dests = get_arg_val<uint32_t>(5);
++    const uint32_t weight_addr = get_arg_val<uint32_t>(6);
++    const uint32_t n_start = get_arg_val<uint32_t>(7);
++    const uint32_t count = get_arg_val<uint32_t>(8);
++
++    constexpr uint32_t cb_in0_id = get_named_compile_time_arg_val("cb_in0");
++    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights2");
++    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
++    constexpr uint32_t Nt = get_named_compile_time_arg_val("Nt");
++    constexpr uint32_t in0_mcast_w = get_named_compile_time_arg_val("in0_mcast_w");
++    constexpr uint32_t sender_sem_id = get_named_compile_time_arg_val("sender_sem");
++    constexpr uint32_t receiver_sem_id = get_named_compile_time_arg_val("receiver_sem");
++    constexpr uint32_t kblock = get_named_compile_time_arg_val("kblock");
++    constexpr uint32_t group = get_named_compile_time_arg_val("group");
++    constexpr bool dual_noc = get_named_compile_time_arg_val("dual_noc");
++    constexpr uint32_t block_tiles = kblock * group;
++    constexpr uint32_t num_chunks = Kt / in0_mcast_w;
++    static_assert(Kt % in0_mcast_w == 0);
++    constexpr auto input_args = TensorAccessorArgs<0>();
++    constexpr auto weight_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
++
++    const auto input = TensorAccessor(input_args, input_addr);
++    const auto weight = TensorAccessor(weight_args, weight_addr);
++    Noc noc;
++    CircularBuffer cb_in0(cb_in0_id);
++    Semaphore<> sender_sem(sender_sem_id);
++    Semaphore<> receiver_sem(receiver_sem_id);
++    constexpr uint32_t tile_bytes = get_tile_size(cb_in0_id);
++    constexpr uint32_t chunk_bytes = in0_mcast_w * tile_bytes;
++
++    cb_in0.reserve_back(Kt);
++    const uint32_t base = cb_in0.get_write_ptr();
++    auto read_chunk = [&](uint32_t chunk) {
++        for (uint32_t k = 0; k < in0_mcast_w; ++k) {
++            const uint32_t tile = chunk * in0_mcast_w + k;
++            noc_async_read_tile(tile, input, base + tile * tile_bytes);
++        }
++    };
++
++    DecodeStreamBlocks<Kt, kblock, group> block{dual_noc ? count : 0};
++    block.first_owned(2, 1);
++    // Interleave this core's odd weight blocks with the activation chunks so
++    // the sender does not finish its own share of weights last.
++    auto read_weight_block_if_free = [&]() {
++        if (!block.done() && cb_pages_reservable_at_back(cb_weights, block_tiles)) {
++            cb_reserve_back(cb_weights, block_tiles);
++            read_decode_stream_block(
++                weight, Nt, n_start, block, get_write_ptr(cb_weights), get_tile_size(cb_weights));
++            return true;
++        }
++        return false;
++    };
++
++    read_chunk(0);
++    noc.async_read_barrier();
++    sender_sem.wait(num_dests);
++    sender_sem.set(0);
++    for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
++        if (chunk + 1 < num_chunks) {
++            read_chunk(chunk + 1);
++        }
++        if (num_dests > 0) {
++            const uint32_t addr = base + chunk * chunk_bytes;
++            MulticastEndpoint mcast_dst;
++            noc.async_write_multicast(
++                CoreLocalMem<uint32_t>(addr), mcast_dst, chunk_bytes, num_dests, {},
++                {.noc_x_start = dest_start_x, .noc_y_start = dest_start_y,
++                 .noc_x_end = dest_end_x, .noc_y_end = dest_end_y, .addr = addr}, true);
++#ifdef ARCH_BLACKHOLE
++            noc.async_writes_flushed();
++#endif
++            receiver_sem.set(chunk + 1);
++            receiver_sem.set_multicast(
++                noc, dest_start_x, dest_start_y, dest_end_x, dest_end_y, num_dests);
++        }
++        cb_in0.push_back(in0_mcast_w);
++        const bool weights = read_weight_block_if_free();
++        noc.async_read_barrier();
++        if (weights) {
++            cb_push_back(cb_weights, block_tiles);
++            block.next_owned(2, 1);
++        }
++    }
++
++    for (; !block.done(); block.next_owned(2, 1)) {
++        cb_reserve_back(cb_weights, block_tiles);
++        read_decode_stream_block(weight, Nt, n_start, block, get_write_ptr(cb_weights), get_tile_size(cb_weights));
++        noc_async_read_barrier();
++        cb_push_back(cb_weights, block_tiles);
++    }
++    noc.async_write_barrier();
++}
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu_weights.hpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu_weights.hpp
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu_weights.hpp
+@@ -0,0 +1,26 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <cstdint>
++#include "api/dataflow/dataflow_api.h"
++
++// Reads one K block of this core's fused gate/up weight tiles into `ptr`.
++// Gate tiles come first, then up tiles, for each K row of the block.
++template <uint32_t in0_block_w, uint32_t per_core_N, uint32_t half_Nt, typename Accessor>
++FORCE_INLINE void read_swiglu_weight_block(
++    const Accessor& weight, uint32_t k0, uint32_t n_start, uint32_t ptr, uint32_t tile_bytes) {
++    constexpr uint32_t fused_Nt = 2 * half_Nt;
++    constexpr uint32_t combined_per_core_N = 2 * per_core_N;
++    for (uint32_t k = 0; k < in0_block_w; ++k) {
++        const uint32_t up_row = (k0 + k) * fused_Nt + n_start;
++        const uint32_t gate_row = up_row + half_Nt;
++        for (uint32_t n = 0; n < per_core_N; ++n) {
++            const uint32_t gate_local = (k * combined_per_core_N + n) * tile_bytes;
++            const uint32_t up_local = gate_local + per_core_N * tile_bytes;
++            noc_async_read_tile(gate_row + n, weight, ptr + gate_local);
++            noc_async_read_tile(up_row + n, weight, ptr + up_local);
++        }
++    }
++}
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_decode_stream.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_decode_stream.cpp
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_decode_stream.cpp
+@@ -0,0 +1,50 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++#include <cstdint>
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++#include "api/dataflow/circular_buffer.h"
++#include "decode_stream_blocks.hpp"
++
++// RISCV_0: stream the even weight blocks (all blocks without the dual-NOC
++// split), then write this core's output tiles.
++void kernel_main() {
++    const uint32_t weight_addr = get_arg_val<uint32_t>(0);
++    const uint32_t output_addr = get_arg_val<uint32_t>(1);
++    const uint32_t n_start = get_arg_val<uint32_t>(2);
++    const uint32_t count = get_arg_val<uint32_t>(3);
++
++    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
++    constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
++    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
++    constexpr uint32_t Nt = get_named_compile_time_arg_val("Nt");
++    constexpr uint32_t kblock = get_named_compile_time_arg_val("kblock");
++    constexpr uint32_t group = get_named_compile_time_arg_val("group");
++    constexpr uint32_t stride = get_named_compile_time_arg_val("dual_noc") ? 2 : 1;
++    constexpr uint32_t block_tiles = kblock * group;
++
++    constexpr auto weight_args = TensorAccessorArgs<0>();
++    constexpr auto output_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
++    const auto weight = TensorAccessor(weight_args, weight_addr);
++    const auto output = TensorAccessor(output_args, output_addr);
++
++    DecodeStreamBlocks<Kt, kblock, group> block{count};
++    for (block.first_owned(stride, 0); !block.done(); block.next_owned(stride, 0)) {
++        cb_reserve_back(cb_weights, block_tiles);
++        read_decode_stream_block(weight, Nt, n_start, block, get_write_ptr(cb_weights), get_tile_size(cb_weights));
++        noc_async_read_barrier();
++        cb_push_back(cb_weights, block_tiles);
++    }
++
++    Noc noc;
++    CircularBuffer out_cb(cb_out);
++    const uint32_t page_bytes = get_local_cb_interface(cb_out).fifo_page_size;
++    for (uint32_t n = 0; n < count; ++n) {
++        out_cb.wait_front(1);
++        noc.async_write(out_cb, output, page_bytes, {}, {.page_id = n_start + n});
++        noc.async_writes_flushed();
++        out_cb.pop_front(1);
++    }
++    noc.async_write_barrier();
++}
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
+@@ -5,7 +5,10 @@
+ #include "api/dataflow/dataflow_api.h"
+ #include "api/dataflow/noc.h"
+ #include "api/dataflow/circular_buffer.h"
++#include "matmul_swiglu_weights.hpp"
+ 
++// Streams the even K blocks of this core's weights (all blocks without the
++// dual-NOC split), then writes the SwiGLU output tiles.
+ void kernel_main() {
+     const uint32_t weight_addr = get_arg_val<uint32_t>(0);
+     const uint32_t output_addr = get_arg_val<uint32_t>(1);
+@@ -17,31 +20,19 @@
+     constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
+     constexpr uint32_t per_core_N = get_named_compile_time_arg_val("per_core_N");
+     constexpr uint32_t in0_block_w = get_named_compile_time_arg_val("in0_block_w");
+-    constexpr uint32_t fused_Nt = 2 * half_Nt;
+-    constexpr uint32_t combined_per_core_N = 2 * per_core_N;
+-    constexpr uint32_t in1_block_tiles = in0_block_w * combined_per_core_N;
++    constexpr uint32_t block_stride = get_named_compile_time_arg_val("dual_noc") ? 2 : 1;
++    constexpr uint32_t in1_block_tiles = in0_block_w * 2 * per_core_N;
+ 
+     constexpr auto weight_args = TensorAccessorArgs<0>();
+     constexpr auto output_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
+     const auto weight = TensorAccessor(weight_args, weight_addr);
+     const auto output = TensorAccessor(output_args, output_addr);
+-
+     const uint32_t n_start = core_n * per_core_N;
+ 
+-    for (uint32_t k0 = 0; k0 < Kt; k0 += in0_block_w) {
++    for (uint32_t k0 = 0; k0 < Kt; k0 += block_stride * in0_block_w) {
+         cb_reserve_back(cb_weights, in1_block_tiles);
+-        uint32_t weights_ptr = get_write_ptr(cb_weights);
+-        for (uint32_t k = 0; k < in0_block_w; ++k) {
+-            const uint32_t row = (k0 + k) * fused_Nt + n_start;
+-            const uint32_t up_row = row;
+-            const uint32_t gate_row = row + half_Nt;
+-            for (uint32_t n = 0; n < per_core_N; ++n) {
+-                const uint32_t gate_local = (k * combined_per_core_N + n) * get_tile_size(cb_weights);
+-                const uint32_t up_local = gate_local + per_core_N * get_tile_size(cb_weights);
+-                noc_async_read_tile(gate_row + n, weight, weights_ptr + gate_local);
+-                noc_async_read_tile(up_row + n, weight, weights_ptr + up_local);
+-            }
+-        }
++        read_swiglu_weight_block<in0_block_w, per_core_N, half_Nt>(
++            weight, k0, n_start, get_write_ptr(cb_weights), get_tile_size(cb_weights));
+         noc_async_read_barrier();
+         cb_push_back(cb_weights, in1_block_tiles);
+     }
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
+@@ -6,27 +6,63 @@
+ #include "api/dataflow/noc.h"
+ #include "api/dataflow/circular_buffer.h"
+ #include "api/dataflow/noc_semaphore.h"
++#include "matmul_swiglu_weights.hpp"
+ 
+ void kernel_main() {
+     const uint32_t sender_x = get_arg_val<uint32_t>(0);
+     const uint32_t sender_y = get_arg_val<uint32_t>(1);
++    const uint32_t weight_addr = get_arg_val<uint32_t>(2);
++    const uint32_t core_n = get_arg_val<uint32_t>(3);
+ 
+     constexpr uint32_t cb_in0_id = get_named_compile_time_arg_val("cb_in0");
++    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights2");
+     constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
+     constexpr uint32_t in0_mcast_w = get_named_compile_time_arg_val("in0_mcast_w");
+     constexpr uint32_t sender_sem_id = get_named_compile_time_arg_val("sender_sem");
+     constexpr uint32_t receiver_sem_id = get_named_compile_time_arg_val("receiver_sem");
++    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
++    constexpr uint32_t per_core_N = get_named_compile_time_arg_val("per_core_N");
++    constexpr uint32_t in0_block_w = get_named_compile_time_arg_val("in0_block_w");
++    constexpr bool dual_noc = get_named_compile_time_arg_val("dual_noc");
++    constexpr uint32_t num_chunks = Kt / in0_mcast_w;
++    constexpr uint32_t in1_block_tiles = in0_block_w * 2 * per_core_N;
++    constexpr auto weight_args = TensorAccessorArgs<0>();
++    const auto weight = TensorAccessor(weight_args, weight_addr);
++    const uint32_t n_start = core_n * per_core_N;
+ 
+     Noc noc;
+     CircularBuffer cb_in0(cb_in0_id);
+     Semaphore<> sender_sem(sender_sem_id);
+     Semaphore<> receiver_sem(receiver_sem_id);
++    volatile tt_l1_ptr uint32_t* chunks_landed =
++        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(receiver_sem_id));
+ 
+-    for (uint32_t k0 = 0; k0 < Kt; k0 += in0_mcast_w) {
+-        cb_in0.reserve_back(in0_mcast_w);
+-        receiver_sem.set(INVALID);
+-        sender_sem.up(noc, sender_x, sender_y, 1);
+-        receiver_sem.wait(VALID);
+-        cb_in0.push_back(in0_mcast_w);
++    // The CB holds all Kt tiles, so one handshake covers every chunk.
++    cb_in0.reserve_back(Kt);
++    receiver_sem.set(0);
++    sender_sem.up(noc, sender_x, sender_y, 1);
++
++    // Publish activation chunks as they land. With the dual-NOC split, also
++    // stream the odd weight K blocks on this RISC's NOC, but never block on
++    // weight CB space while activation chunks are still pending.
++    uint32_t chunks = 0;
++    uint32_t k0 = dual_noc ? in0_block_w : Kt;
++    while (chunks < num_chunks || k0 < Kt) {
++        if (chunks < num_chunks) {
++            invalidate_l1_cache();
++            if (*chunks_landed > chunks) {
++                cb_in0.push_back(in0_mcast_w);
++                ++chunks;
++                continue;
++            }
++        }
++        if (k0 < Kt && (chunks == num_chunks || cb_pages_reservable_at_back(cb_weights, in1_block_tiles))) {
++            cb_reserve_back(cb_weights, in1_block_tiles);
++            read_swiglu_weight_block<in0_block_w, per_core_N, half_Nt>(
++                weight, k0, n_start, get_write_ptr(cb_weights), get_tile_size(cb_weights));
++            noc_async_read_barrier();
++            cb_push_back(cb_weights, in1_block_tiles);
++            k0 += 2 * in0_block_w;
++        }
+     }
+ }
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
+@@ -8,50 +8,89 @@
+ #include "api/dataflow/noc_semaphore.h"
+ #include "api/dataflow/endpoints.h"
+ #include "api/core_local_mem.h"
++#include "matmul_swiglu_weights.hpp"
+ 
++// The whole activation row block stays resident in every core's L1. After a
++// single readiness handshake, stream it in chunks: the DRAM read of the next
++// chunk overlaps the multicast of the current one, and a counting semaphore
++// tells receivers how many chunks have landed. With the dual-NOC split, the
++// odd weight K blocks for this core follow on the same RISC.
+ void kernel_main() {
+     const uint32_t input_addr = get_arg_val<uint32_t>(0);
+     const uint32_t dest_start_x = get_arg_val<uint32_t>(1);
+     const uint32_t dest_start_y = get_arg_val<uint32_t>(2);
+     const uint32_t dest_end_x = get_arg_val<uint32_t>(3);
+     const uint32_t dest_end_y = get_arg_val<uint32_t>(4);
++    const uint32_t weight_addr = get_arg_val<uint32_t>(5);
++    const uint32_t core_n = get_arg_val<uint32_t>(6);
+ 
+     constexpr uint32_t cb_in0_id = get_named_compile_time_arg_val("cb_in0");
++    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights2");
+     constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
+     constexpr uint32_t in0_mcast_w = get_named_compile_time_arg_val("in0_mcast_w");
+     constexpr uint32_t num_dests = get_named_compile_time_arg_val("num_dests");
+     constexpr uint32_t sender_sem_id = get_named_compile_time_arg_val("sender_sem");
+     constexpr uint32_t receiver_sem_id = get_named_compile_time_arg_val("receiver_sem");
++    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
++    constexpr uint32_t per_core_N = get_named_compile_time_arg_val("per_core_N");
++    constexpr uint32_t in0_block_w = get_named_compile_time_arg_val("in0_block_w");
++    constexpr bool dual_noc = get_named_compile_time_arg_val("dual_noc");
++    constexpr uint32_t in1_block_tiles = in0_block_w * 2 * per_core_N;
+     constexpr auto input_args = TensorAccessorArgs<0>();
++    constexpr auto weight_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
++    constexpr uint32_t num_chunks = Kt / in0_mcast_w;
++    static_assert(Kt % in0_mcast_w == 0);
+ 
+     const auto input = TensorAccessor(input_args, input_addr);
++    const auto weight = TensorAccessor(weight_args, weight_addr);
++    const uint32_t n_start = core_n * per_core_N;
+     Noc noc;
+     CircularBuffer cb_in0(cb_in0_id);
+     Semaphore<> sender_sem(sender_sem_id);
+     Semaphore<> receiver_sem(receiver_sem_id);
+-    receiver_sem.set(VALID);
+-    constexpr uint32_t block_bytes = in0_mcast_w * get_tile_size(cb_in0_id);
++    constexpr uint32_t tile_bytes = get_tile_size(cb_in0_id);
++    constexpr uint32_t chunk_bytes = in0_mcast_w * tile_bytes;
+ 
+-    for (uint32_t k0 = 0; k0 < Kt; k0 += in0_mcast_w) {
+-        cb_in0.reserve_back(in0_mcast_w);
+-        const uint32_t write_ptr = cb_in0.get_write_ptr();
++    cb_in0.reserve_back(Kt);
++    const uint32_t base = cb_in0.get_write_ptr();
++    auto read_chunk = [&](uint32_t chunk) {
+         for (uint32_t k = 0; k < in0_mcast_w; ++k) {
+-            noc_async_read_tile(k0 + k, input, write_ptr + k * get_tile_size(cb_in0_id));
++            const uint32_t tile = chunk * in0_mcast_w + k;
++            noc_async_read_tile(tile, input, base + tile * tile_bytes);
+         }
+-        noc.async_read_barrier();
++    };
+ 
+-        sender_sem.wait(num_dests);
+-        sender_sem.set(0);
++    read_chunk(0);
++    noc.async_read_barrier();
++    sender_sem.wait(num_dests);
++    sender_sem.set(0);
++    for (uint32_t chunk = 0; chunk < num_chunks; ++chunk) {
++        if (chunk + 1 < num_chunks) {
++            read_chunk(chunk + 1);
++        }
++        const uint32_t addr = base + chunk * chunk_bytes;
+         MulticastEndpoint mcast_dst;
+         noc.async_write_multicast(
+-            CoreLocalMem<uint32_t>(write_ptr), mcast_dst, block_bytes, num_dests, {},
++            CoreLocalMem<uint32_t>(addr), mcast_dst, chunk_bytes, num_dests, {},
+             {.noc_x_start = dest_start_x, .noc_y_start = dest_start_y,
+-             .noc_x_end = dest_end_x, .noc_y_end = dest_end_y, .addr = write_ptr}, true);
++             .noc_x_end = dest_end_x, .noc_y_end = dest_end_y, .addr = addr}, true);
+ #ifdef ARCH_BLACKHOLE
+         noc.async_writes_flushed();
+ #endif
++        receiver_sem.set(chunk + 1);
+         receiver_sem.set_multicast(
+             noc, dest_start_x, dest_start_y, dest_end_x, dest_end_y, num_dests);
+         cb_in0.push_back(in0_mcast_w);
++        noc.async_read_barrier();
++    }
++    if constexpr (dual_noc) {
++        for (uint32_t k0 = in0_block_w; k0 < Kt; k0 += 2 * in0_block_w) {
++            cb_reserve_back(cb_weights, in1_block_tiles);
++            read_swiglu_weight_block<in0_block_w, per_core_N, half_Nt>(
++                weight, k0, n_start, get_write_ptr(cb_weights), get_tile_size(cb_weights));
++            noc_async_read_barrier();
++            cb_push_back(cb_weights, in1_block_tiles);
++        }
+     }
++    noc.async_write_barrier();
+ }
+diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ // SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+ //
+ // SPDX-License-Identifier: Apache-2.0
+@@ -2065,6 +2066,9 @@
+     if (operation_attributes.fused_swiglu) {
+         return MatmulSwiGLUProgramFactory{};
+     }
++    if (operation_attributes.decode_stream) {
++        return MatmulDecodeStreamProgramFactory{};
++    }
+     const auto& config = operation_attributes.program_config.value();
+ 
+     return std::visit(
+@@ -2125,6 +2129,10 @@
+     // ---- universal checks, part 1: independent of the chosen program config ----
+     validate_matmul_operand_basics(input_tensor_a, input_tensor_b, in0_tile, in1_tile);
+     validate_matmul_matrix_dimensions(a_shape, b_shape, a_shape_padded, b_shape_padded, in0_tile, in1_tile);
++    if (attributes.decode_stream) {
++        // Eligibility was checked when the attributes were created.
++        return;
++    }
+     if (attributes.fused_swiglu) {
+         TT_FATAL(!attributes.transpose_a && !attributes.transpose_b, "SwiGLU matmul does not support transpose");
+         TT_FATAL(a_shape.size() == 2 && b_shape.size() == 2 && a_shape[-2] > 0 &&
+@@ -2796,6 +2804,61 @@
+         parameters.fused_swiglu};
+ }
+ 
++namespace {
++
++// Decode projections: one activation tile row, BFP8 weights, everything
++// DRAM interleaved, and no caller-selected program or fused epilogue. These
++// are bound by weight streaming, which the decode-stream factory spreads over
++// both NOCs. Set LIBTT_DECODE_STREAM=0 to use the generic factories.
++bool use_decode_stream(
++    const Tensor& a,
++    const Tensor& b,
++    const std::optional<Tensor>& bias,
++    const std::optional<Tensor>& optional_output_tensor,
++    const MatmulParams& attributes) {
++    static const bool enabled = [] {
++        const char* value = std::getenv("LIBTT_DECODE_STREAM");
++        return !value || std::string(value) != "0";
++    }();
++    if (!enabled || attributes.program_config.has_value() || attributes.user_core_coord.has_value() ||
++        attributes.fused_swiglu || attributes.user_fused_activation.has_value() || attributes.transpose_a ||
++        attributes.transpose_b || attributes.untilize_out || attributes.global_cb.has_value() ||
++        attributes.sub_device_id.has_value() ||
++        (attributes.output_tile.has_value() && (attributes.output_tile->get_height() != TILE_HEIGHT ||
++                                                attributes.output_tile->get_width() != TILE_WIDTH)) ||
++        bias.has_value() ||
++        optional_output_tensor.has_value()) {
++        return false;
++    }
++    if (a.device()->arch() != tt::ARCH::BLACKHOLE || a.dtype() != DataType::BFLOAT16 ||
++        b.dtype() != DataType::BFLOAT8_B ||
++        (attributes.output_dtype.value_or(a.dtype()) != DataType::BFLOAT16 &&
++         attributes.output_dtype.value_or(a.dtype()) != DataType::FLOAT32) ||
++        a.layout() != Layout::TILE || b.layout() != Layout::TILE || a.memory_config() != DRAM_MEMORY_CONFIG ||
++        b.memory_config() != DRAM_MEMORY_CONFIG || attributes.output_mem_config != DRAM_MEMORY_CONFIG) {
++        return false;
++    }
++    const auto& a_tile = a.tensor_spec().tile();
++    const auto& b_tile = b.tensor_spec().tile();
++    if (a_tile.get_height() != TILE_HEIGHT || a_tile.get_width() != TILE_WIDTH ||
++        b_tile.get_height() != TILE_HEIGHT || b_tile.get_width() != TILE_WIDTH) {
++        return false;
++    }
++    const auto& a_shape = a.padded_shape();
++    const auto& b_shape = b.padded_shape();
++    if (a_shape.rank() < 2 || b_shape.rank() < 2 || a_shape[-2] != TILE_HEIGHT || a_shape[-1] != b_shape[-2] ||
++        a.physical_volume() != a_shape[-2] * a_shape[-1] || b.physical_volume() != b_shape[-2] * b_shape[-1]) {
++        return false;
++    }
++    // The whole activation row block stays resident in L1.
++    const uint32_t Kt = a_shape[-1] / TILE_WIDTH;
++    const uint32_t Nt = b_shape[-1] / TILE_WIDTH;
++    const auto grid = a.device()->compute_with_storage_grid_size();
++    return Kt >= 8 && Kt <= 400 && Nt >= 2 * grid.x && Nt >= grid.x * grid.y / 2;
++}
++
++}  // namespace
++
+ MatmulDeviceOperation::tensor_return_value_t matmul(
+     const Tensor& input_tensor_a,
+     const Tensor& input_tensor_b,
+@@ -2803,6 +2866,8 @@
+     const std::optional<Tensor>& optional_output_tensor,
+     const MatmulParams& attributes) {
+     MatmulParams normalized_attributes = attributes;
++    normalized_attributes.decode_stream =
++        use_decode_stream(input_tensor_a, input_tensor_b, bias, optional_output_tensor, attributes);
+     if (!normalized_attributes.program_config.has_value()) {
+         uint32_t bias_single_tile_size = 0;
+         if (bias.has_value()) {
+diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
+--- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
++++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
+@@ -23,6 +23,7 @@
+ 
+     using program_factory_t = std::variant<
+         MatmulSwiGLUProgramFactory,
++        MatmulDecodeStreamProgramFactory,
+         MatmulMultiCoreProgramFactory,
+         MatmulMultiCoreReuseOptimizedProgramFactory,
+         MatmulMultiCoreReuseMcast1DProgramFactory,
+diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
+--- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
++++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
+@@ -28,6 +28,7 @@
+     std::optional<tt::tt_metal::experimental::GlobalCircularBuffer> global_cb = std::nullopt;
+     std::optional<tt::tt_metal::SubDeviceId> sub_device_id = std::nullopt;
+     bool fused_swiglu = false;
++    bool decode_stream = false;
+ };
+ 
+ struct MatmulInputs {

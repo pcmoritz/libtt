@@ -1,0 +1,388 @@
+diff --git ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp
+--- ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp
++++ ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp
+@@ -3,6 +3,10 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "all_reduce.hpp"
++#include <cstdlib>
++#include "ttnn/operations/ccl/common/host/moe_utils.hpp"
++#include "ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp"
++#include "ttnn/tensor/tensor_ops.hpp"
+ 
+ #include <tt-metalium/experimental/fabric/fabric.hpp>
+ 
+@@ -41,6 +45,41 @@
+     // Determine topology
+     tt::tt_fabric::Topology topology_ = ::ttnn::ccl::get_usable_topology(input_tensor, topology, cluster_axis);
+     topology_ = ::ttnn::ccl::convert_2d_to_1d_topology(topology_);
++    // Decode-sized Blackhole TP2/TP4 sums use one exchange/reduce program.
++    // Fabric traffic lands in L1 scratch; DRAM input/output use tensor
++    // accessors.
++    const auto& shape = input_tensor.logical_shape();
++    const char* enabled = std::getenv("LIBTT_MINIMAL_ALL_REDUCE");
++    const uint32_t ring_size =
++        cluster_axis ? ttnn::ccl::get_topological_dimension(input_tensor, cluster_axis) : 0;
++    if ((!enabled || std::string(enabled) != "0") && cluster_axis && !subdevice_id &&
++        mesh_device->arch() == tt::ARCH::BLACKHOLE && (ring_size == 2 || ring_size == 4) &&
++        mesh_device->num_devices() == ring_size &&
++        input_tensor.dtype() == DataType::BFLOAT16 && input_tensor.layout() == Layout::TILE &&
++        input_tensor.memory_config() == DRAM_MEMORY_CONFIG &&
++        memory_config.value_or(DRAM_MEMORY_CONFIG) == DRAM_MEMORY_CONFIG &&
++        shape.size() >= 2 && shape[-1] >= 1024 && shape[-1] <= 8192 && shape[-1] % 1024 == 0 &&
++        input_tensor.logical_volume() / shape[-1] <= 2 &&
++        input_tensor.physical_volume() == 32 * shape[-1]) {
++        constexpr uint32_t workers = 32;
++        const uint32_t shard_width = shape[-1] / workers;
++        const CoreRangeSet cores(CoreRange(CoreCoord(0, 0), CoreCoord(7, 3)));
++        const MemoryConfig scratch_config(
++            TensorMemoryLayout::WIDTH_SHARDED, BufferType::L1,
++            tt::tt_metal::ShardSpec(cores, {32, ring_size * shard_width}, ShardOrientation::ROW_MAJOR));
++        ttsl::SmallVector<uint32_t> scratch_shape(shape.cbegin(), shape.cend());
++        scratch_shape.back() *= ring_size;
++        auto scratch = ttnn::create_device_tensor(
++            tt::tt_metal::TensorSpec(
++                Shape(scratch_shape),
++                tt::tt_metal::TensorLayout(input_tensor.dtype(), input_tensor.tensor_spec().page_config(), scratch_config)),
++            mesh_device, input_tensor.tensor_topology());
++        const auto links = num_links.value_or(ttnn::operations::ccl::common::get_num_links(*mesh_device, cluster_axis));
++        auto reduced = ttnn::prim::all_reduce_async(
++            input_tensor, scratch, *cluster_axis, *mesh_device, topology_, std::nullopt,
++            input_tensor.dtype(), DRAM_MEMORY_CONFIG, links, subdevice_id, false, false, true);
++        return reduced;
++    }
+     // Call the experimental all_reduce_async with Sum operation
+     return ::ttnn::experimental::all_reduce_async(
+         input_tensor,
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
+@@ -21,6 +21,27 @@
+     const auto& buffer_tensor = tensor_args.buffer_tensor;
+     const auto& page_size = input_tensor.buffer()->page_size();
+ 
++    if (input_tensor.memory_config() == DRAM_MEMORY_CONFIG) {
++        TT_FATAL(input_tensor.device()->arch() == tt::ARCH::BLACKHOLE && (args.ring_size == 2 || args.ring_size == 4),
++                 "Direct DRAM exchange requires Blackhole TP2 or TP4");
++        TT_FATAL(args.output_mem_config == DRAM_MEMORY_CONFIG && !args.use_noc1_only,
++                 "Direct DRAM exchange requires DRAM output and dedicated NOCs");
++        TT_FATAL(input_tensor.dtype() == DataType::BFLOAT16 && args.dtype == DataType::BFLOAT16 &&
++                 input_tensor.layout() == Layout::TILE, "Direct exchange requires tiled BF16");
++        const auto width = input_tensor.logical_shape()[-1];
++        TT_FATAL(width >= 1024 && width <= 8192 && width % 1024 == 0 &&
++                 input_tensor.logical_volume() / width <= 2 && input_tensor.physical_volume() == 32 * width, "Unsupported direct exchange shape");
++        TT_FATAL(buffer_tensor.memory_config().memory_layout() == TensorMemoryLayout::WIDTH_SHARDED &&
++                 buffer_tensor.memory_config().buffer_type() == BufferType::L1,
++                 "Direct exchange scratch must be width sharded L1");
++        const auto& spec = buffer_tensor.shard_spec().value();
++        TT_FATAL(spec.grid == CoreRangeSet(CoreRange(CoreCoord(0, 0), CoreCoord(7, 3))) &&
++                 spec.shape[0] == 32 && spec.shape[1] == args.ring_size * width / 32 &&
++                 spec.orientation == ShardOrientation::ROW_MAJOR, "Invalid scratch layout");
++        TT_FATAL(args.num_links > 0 && args.num_links <= 32, "Invalid link count");
++        return;
++    }
++
+     TT_FATAL(
+         (tt::tt_metal::hal::get_arch_name() != "blackhole") ||
+             (input_tensor.memory_config().buffer_type() != BufferType::DRAM),
+@@ -258,7 +279,7 @@
+     uint32_t cluster_axis,
+     MeshDevice& mesh_device,
+     ttnn::ccl::Topology topology,
+-    const GlobalSemaphore& multi_device_global_semaphore,
++    const std::optional<GlobalSemaphore>& multi_device_global_semaphore,
+     std::optional<DataType> dtype,
+     const std::optional<MemoryConfig>& memory_config,
+     std::optional<size_t> num_preferred_links,
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp
+@@ -39,7 +39,7 @@
+     uint32_t cluster_axis,
+     MeshDevice& mesh_device,
+     ttnn::ccl::Topology topology,
+-    const GlobalSemaphore& multi_device_global_semaphore,
++    const std::optional<GlobalSemaphore>& multi_device_global_semaphore,
+     std::optional<DataType> dtype,
+     const std::optional<MemoryConfig>& memory_config,
+     std::optional<size_t> num_preferred_links,
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation_types.hpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation_types.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation_types.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation_types.hpp
+@@ -24,7 +24,7 @@
+     DataType dtype = DataType::BFLOAT16;
+     MemoryConfig output_mem_config;
+     ttnn::ccl::Topology topology;
+-    GlobalSemaphore semaphore;
++    std::optional<GlobalSemaphore> semaphore;
+     std::optional<tt::tt_metal::SubDeviceId> sub_device_id;
+     bool use_noc1_only = false;
+     bool use_optimal_ccl_for_llama = false;
+@@ -41,7 +41,7 @@
+         DataType dtype,
+         MemoryConfig output_mem_config,
+         ttnn::ccl::Topology topology,
+-        GlobalSemaphore semaphore,
++        std::optional<GlobalSemaphore> semaphore,
+         std::optional<tt::tt_metal::SubDeviceId>& sub_device_id,
+         bool use_noc1_only,
+         bool use_optimal_ccl_for_llama,
+@@ -90,7 +90,8 @@
+         "use_noc1_only",
+         "use_optimal_ccl_for_llama",
+         "cluster_axis",
+-        "sub_device_id");
++        "sub_device_id",
++        "fp32_dest_acc");
+     auto attribute_values() const {
+         return std::make_tuple(
+             num_links,
+@@ -101,7 +102,8 @@
+             use_noc1_only,
+             use_optimal_ccl_for_llama,
+             cluster_axis,
+-            sub_device_id);
++            sub_device_id,
++            fp32_dest_acc);
+     }
+ };
+ 
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
+@@ -5,6 +5,7 @@
+ #include "all_reduce_async_program_factory.hpp"
+ 
+ #include <algorithm>
++#include <tt-metalium/tensor_accessor_args.hpp>
+ 
+ #include <tt-metalium/core_coord.hpp>
+ #include <tt-metalium/buffer.hpp>
+@@ -93,8 +94,17 @@
+     Tensor& tensor_return_value) {
+     tt::tt_metal::distributed::MeshWorkload workload;
+     std::unordered_map<ttnn::MeshCoordinateRange, shared_variables_t> shared_variables;
++    auto attributes = operation_attributes;
++    if (!attributes.semaphore) {
++        auto* device = tensor_args.input_tensor.device();
++        auto sd = attributes.sub_device_id.value_or(device->get_sub_device_ids().at(0));
++        auto cores = device->worker_cores(tt::tt_metal::HalProgrammableCoreType::TENSIX, sd);
++        attributes.semaphore = ttnn::global_semaphore::create_global_semaphore(device, cores, 0);
++        tt::tt_metal::distributed::Synchronize(device, std::nullopt, {});
++    }
+     for (const auto& coord : tensor_coords.coords()) {
+-        auto cached_program = create_at(operation_attributes, coord, tensor_args, tensor_return_value);
++        auto cached_program = create_at(attributes, coord, tensor_args, tensor_return_value);
++        cached_program.shared_variables.owned_semaphore = attributes.semaphore;
+         workload.add_program(ttnn::MeshCoordinateRange(coord), std::move(cached_program.program));
+         shared_variables.emplace(ttnn::MeshCoordinateRange(coord), std::move(cached_program.shared_variables));
+     }
+@@ -124,22 +134,10 @@
+ 
+     auto input_tensor_memory_config = input_tensor.memory_config();
+     auto output_tensor_memory_config = output_tensor.memory_config();
+-    [[maybe_unused]] uint32_t input_shard_num_cores = input_tensor_memory_config.shard_spec()->grid.num_cores();
+-    [[maybe_unused]] uint32_t output_shard_num_cores = output_tensor_memory_config.shard_spec()->grid.num_cores();
+-
+-    log_debug(tt::LogOp, "input_tensor_shape: {}", input_tensor_shape);
+-    log_debug(tt::LogOp, "input_tensor_memory_config: {}", input_tensor_memory_config);
+-    log_debug(tt::LogOp, "output_tensor_memory_config: {}", output_tensor_memory_config);
+-    log_debug(tt::LogOp, "input_shard_num_cores: {}", input_shard_num_cores);
+-    log_debug(tt::LogOp, "output_shard_num_cores: {}", output_shard_num_cores);
+-    log_debug(
+-        tt::LogOp,
+-        "input_tensor_memory_config.shard_spec()->shape: {}",
+-        input_tensor_memory_config.shard_spec()->shape);
+-    log_debug(
+-        tt::LogOp,
+-        "output_tensor_memory_config.shard_spec()->shape: {}",
+-        output_tensor_memory_config.shard_spec()->shape);
++    const bool direct = input_tensor_memory_config == DRAM_MEMORY_CONFIG;
++    auto input_spec = direct ? buffer_tensor.shard_spec().value() : input_tensor.shard_spec().value();
++    if (direct) input_spec.shape[1] /= operation_attributes.ring_size;
++    const auto output_spec = direct ? input_spec : output_tensor.shard_spec().value();
+ 
+     log_debug(tt::LogOp, "Running TG Llama specific all_reduce_async_minimal_multi_core_with_workers");
+     // previously parameters from all_reduce_async_minimal_multi_core_with_workers
+@@ -147,7 +145,7 @@
+     const auto& num_links = operation_attributes.num_links;
+     const auto& ring_size = operation_attributes.ring_size;
+     const auto& topology = operation_attributes.topology;
+-    const auto& semaphore = operation_attributes.semaphore;
++    const auto& semaphore = operation_attributes.semaphore.value();
+     const auto& sub_device_id = operation_attributes.sub_device_id;
+     const auto& use_noc1_only = operation_attributes.use_noc1_only;
+     const auto& use_optimal_ccl_for_llama = operation_attributes.use_optimal_ccl_for_llama;
+@@ -174,14 +172,15 @@
+ 
+     // Tensor Info
+     [[maybe_unused]] const auto input_tensor_num_pages = input_tensor.buffer()->num_pages();
+-    const auto input_tensor_cores = input_tensor.memory_config().shard_spec()->grid;
+-    const auto input_tensor_shard_shape = input_tensor.memory_config().shard_spec()->shape;
++    const auto input_tensor_cores = input_spec.grid;
++    const auto input_tensor_shard_shape = input_spec.shape;
+     const auto input_tensor_shard_num_pages = input_tensor_shard_shape[0] * input_tensor_shard_shape[1] / TILE_HW;
+     const auto num_input_cores = input_tensor_cores.num_cores();
+     const auto output_tensor_num_pages = output_tensor.buffer()->num_pages();
+     // Get only cores that have actual data
+-    const auto& output_tensor_original_corerangeset = output_tensor.memory_config().shard_spec()->grid;
+-    const auto& cores_with_data = output_tensor.buffer()->buffer_distribution_spec()->cores_with_data();
++    const auto& output_tensor_original_corerangeset = output_spec.grid;
++    const auto cores_with_data = direct ? corerange_to_cores(output_spec.grid, std::nullopt, true) :
++        output_tensor.buffer()->buffer_distribution_spec()->cores_with_data();
+ 
+     // filter output_tensor_cores to only include cores that have data and preserve original order
+     CoreRangeSet output_tensor_cores;
+@@ -195,7 +194,7 @@
+         }
+         output_tensor_cores = CoreRangeSet(output_core_ranges);
+     }
+-    const auto output_tensor_shard_shape = output_tensor.memory_config().shard_spec()->shape;
++    const auto output_tensor_shard_shape = output_spec.shape;
+     const auto output_tensor_shard_num_pages = output_tensor_shard_shape[0] * output_tensor_shard_shape[1] / TILE_HW;
+     const auto num_output_cores = output_tensor_cores.num_cores();
+ 
+@@ -373,11 +372,27 @@
+     uint32_t out_cb_index = tt::CBIndex::c_2;
+     tt::tt_metal::CircularBufferConfig out_cb_config =
+         tt::tt_metal::CircularBufferConfig(out_CB_size, {{out_cb_index, output_df}})
+-            .set_page_size(out_cb_index, out_CB_single_tile_size)
+-            .set_globally_allocated_address(*output_tensor.buffer());  // TODO: Remove once new cb attached for output
++            .set_page_size(out_cb_index, out_CB_single_tile_size);
++    if (!direct) out_cb_config.set_globally_allocated_address(*output_tensor.buffer());
+     auto cb_out = tt::tt_metal::CreateCircularBuffer(
+         program, output_tensor_cores, out_cb_config);  // TODO: This should be the output cores instead
+ 
++    std::optional<tt::tt_metal::KernelHandle> output_writer;
++    if (direct) {
++        std::vector<uint32_t> args = {out_cb_index, output_tensor_shard_num_pages};
++        tt::tt_metal::TensorAccessorArgs(output_tensor.buffer()).append_to(args);
++        output_writer = tt::tt_metal::CreateKernel(program,
++            "ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_writer.cpp",
++            output_tensor_cores, tt::tt_metal::DataMovementConfig{
++                .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
++                .noc = tt::tt_metal::NOC::NOC_0, .compile_args = args});
++        uint32_t start = 0;
++        for (const auto& core : corerange_to_cores(output_tensor_cores, std::nullopt, true)) {
++            tt::tt_metal::SetRuntimeArgs(program, *output_writer, core, {output_tensor.buffer()->address(), start});
++            start += output_tensor_shard_num_pages;
++        }
++    }
++
+     // Create reduction dataflow kernel
+     auto reduction_reader_kernel_config = tt::tt_metal::DataMovementConfig{
+         .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
+@@ -426,11 +441,12 @@
+         src0_cb_index,              // cb0_id
+         op_config.get_page_size(),  // tensor0_page_size
+     };
++    if (direct) tt::tt_metal::TensorAccessorArgs(input_tensor.buffer()).append_to(reader_compile_args);
+     log_trace(tt::LogOp, "Reader Compile Args:");
+     auto worker_sender_reader_kernel_id = tt::tt_metal::CreateKernel(
+         program,
+         "ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/"
+-        "worker_reader.cpp",
++        + std::string(direct ? "dram_reader.cpp" : "worker_reader.cpp"),
+         sender_worker_core_range,
+         tt::tt_metal::DataMovementConfig{
+             .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
+@@ -501,6 +517,7 @@
+         };
+         reader_rt_args.insert(reader_rt_args.end(), input_tensor_cores_x.begin(), input_tensor_cores_x.end());
+         reader_rt_args.insert(reader_rt_args.end(), input_tensor_cores_y.begin(), input_tensor_cores_y.end());
++        reader_rt_args.push_back(input_cores_idx_per_link[link].first * input_tensor_shard_num_pages + input_first_core_tile_start_offset);
+         log_trace(tt::LogOp, "Reader Runtime Args:");
+         for ([[maybe_unused]] const auto& arg : reader_rt_args) {
+             log_trace(tt::LogOp, "\t{}", arg);
+@@ -598,6 +615,7 @@
+             .reduction_reader_kernel_id = reduction_reader_kernel_id,
+             .sender_worker_cores = sender_worker_cores,
+             .output_tensor_cores = output_tensor_cores,
++            .output_writer = output_writer,
+             .cb_out = cb_out,
+             .cb_reduction = cb_reduction}};
+ }
+@@ -614,7 +632,7 @@
+         const auto& input_tensor = tensor_args.input_tensor;
+         const auto& buffer_tensor = tensor_args.buffer_tensor;
+ 
+-        auto semaphore = operation_attributes.semaphore;
++        const auto& semaphore = operation_attributes.semaphore ? *operation_attributes.semaphore : *shared_vars.owned_semaphore;
+ 
+         // update senders
+         auto& worker_reader_sender_runtime_args_by_core =
+@@ -630,7 +648,12 @@
+             auto& worker_writer_sender_runtime_args = worker_writer_sender_runtime_args_by_core[core.x][core.y];
+             worker_writer_sender_runtime_args[1] = semaphore.address();
+         }
+-        UpdateDynamicCircularBufferAddress(program, shared_vars.cb_out, *output_tensor.buffer());
++        if (shared_vars.output_writer) {
++            for (const auto& core : corerange_to_cores(shared_vars.output_tensor_cores, std::nullopt, true))
++                GetRuntimeArgs(program, *shared_vars.output_writer, core)[0] = output_tensor.buffer()->address();
++        } else {
++            UpdateDynamicCircularBufferAddress(program, shared_vars.cb_out, *output_tensor.buffer());
++        }
+         UpdateDynamicCircularBufferAddress(program, shared_vars.cb_reduction, *buffer_tensor.buffer());
+         for (const auto& cr : shared_vars.output_tensor_cores.ranges()) {
+             for (const auto& core : corerange_to_cores(cr, std::nullopt, true)) {
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.hpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.hpp
+@@ -10,11 +10,13 @@
+ namespace ttnn::experimental::prim {
+ 
+ struct AllReduceAsyncSharedVariables {
++    std::optional<GlobalSemaphore> owned_semaphore;
+     tt::tt_metal::KernelHandle worker_sender_reader_kernel_id{};
+     tt::tt_metal::KernelHandle worker_sender_writer_kernel_id{};
+     tt::tt_metal::KernelHandle reduction_reader_kernel_id{};
+     std::vector<tt::tt_metal::CoreCoord> sender_worker_cores;
+     CoreRangeSet output_tensor_cores;
++    std::optional<tt::tt_metal::KernelHandle> output_writer;
+     tt::tt_metal::CBHandle cb_out{};
+     tt::tt_metal::CBHandle cb_reduction{};
+ };
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_reader.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_reader.cpp
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_reader.cpp
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "api/dataflow/dataflow_api.h"
++void kernel_main() {
++    constexpr uint32_t cb = get_compile_time_arg_val(1);
++    constexpr uint32_t page = get_compile_time_arg_val(2);
++    constexpr auto spec = TensorAccessorArgs<3>();
++    const auto src = TensorAccessor(spec, get_arg_val<uint32_t>(0), page);
++    const uint32_t chunk = get_arg_val<uint32_t>(1);
++    const uint32_t total = get_arg_val<uint32_t>(2);
++    const uint32_t cores = get_arg_val<uint32_t>(4);
++    const uint32_t start = get_arg_val<uint32_t>(5 + 2 * cores);
++    for (uint32_t i = 0; i < total;) {
++        const uint32_t n = (total-i < chunk) ? total-i : chunk;
++        cb_reserve_back(cb, n);
++        const uint32_t dst = get_write_ptr(cb);
++        for (uint32_t j = 0; j < n; ++j) noc_async_read_tile(start+i+j, src, dst+j*page);
++        noc_async_read_barrier();
++        cb_push_back(cb, n);
++        i += n;
++    }
++}
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_writer.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_writer.cpp
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_writer.cpp
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "api/dataflow/dataflow_api.h"
++void kernel_main() {
++    constexpr uint32_t cb = get_compile_time_arg_val(0);
++    constexpr uint32_t count = get_compile_time_arg_val(1);
++    constexpr auto spec = TensorAccessorArgs<2>();
++    const uint32_t page = get_tile_size(cb);
++    const auto dst = TensorAccessor(spec, get_arg_val<uint32_t>(0), page);
++    const uint32_t start = get_arg_val<uint32_t>(1);
++    cb_wait_front(cb, count);
++    const uint32_t src = get_read_ptr(cb);
++    for (uint32_t j = 0; j < count; ++j) noc_async_write_tile(start+j, dst, src+j*page);
++    noc_async_write_barrier();
++    cb_pop_front(cb, count);
++}

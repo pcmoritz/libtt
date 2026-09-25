@@ -40,7 +40,7 @@ index ac04b7e..3343a62 100644
  
  #ifdef TTMLIR_ENABLE_OPMODEL
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
-@@ -174,6 +175,102 @@ private:
+@@ -174,6 +175,103 @@ private:
    }
  };
  
@@ -86,7 +86,7 @@ index ac04b7e..3343a62 100644
 +    }
 +
 +    auto inputType = matmulOp.getType();
-+    // The fused runtime uses BFP8 weights and up to four output tiles on 96 cores.
++    // The fused runtime uses BFP8 weights and up to four output tiles per core.
 +    auto weightDtype = matmulOp->getAttrOfType<mlir::StringAttr>(
 +        "ttcore.weight_dtype");
 +    if (!weightDtype || weightDtype.getValue() != "bfp_bf8") {
@@ -101,8 +101,9 @@ index ac04b7e..3343a62 100644
 +        inputShape[0] < 1 || inputShape[0] > 32 ||
 +        outputShape[0] != inputShape[0] ||
 +        inputShape[1] != 2 * outputShape[1] ||
-+        outputShape[1] < 96 * 32 || outputShape[1] > 96 * 4 * 32 ||
-+        outputShape[1] % (96 * 32) != 0) {
++        !((outputShape[1] >= 96 * 32 && outputShape[1] <= 96 * 4 * 32 &&
++           outputShape[1] % (96 * 32) == 0) ||
++          outputShape[1] == 6400 || outputShape[1] == 12800)) {
 +      return failure();
 +    }
 +
@@ -143,7 +144,7 @@ index ac04b7e..3343a62 100644
  #ifdef TTMLIR_ENABLE_OPMODEL
  
  // ============================================================================
-@@ -346,7 +436,7 @@ public:
+@@ -346,7 +444,7 @@ public:
      RewritePatternSet patterns(&getContext());
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
