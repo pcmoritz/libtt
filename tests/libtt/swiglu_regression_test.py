@@ -26,6 +26,9 @@ import pytest
         (1, 5120, 8704),
         (1, 5120, 17408),
         (1, 512, 256),
+        # Reductions beyond 256 activation tiles (e.g. Llama-405B's hidden size).
+        (1, 12800, 6144),
+        (1, 16384, 3072),
     ],
 )
 def test_swiglu_projection_width(rows, inner_size, width, tmp_path):

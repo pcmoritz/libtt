@@ -1,18 +1,25 @@
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
-@@ -241,4 +241,201 @@
+@@ -241,4 +241,208 @@
      return desc;
  }
  
-+std::optional<SwiGLULayout> swiglu_layout(uint32_t Kt, uint32_t half_Nt, uint32_t num_worker_cores) {
-+    // The activation row block stays resident in L1 for the whole reduction.
-+    constexpr uint32_t max_resident_activation_tiles = 256;
++namespace {
++
++// Core layout of the fused SwiGLU decode projection: output tile pairs are
++// split as evenly as possible over num_cores cores, and each core processes
++// its pairs in passes of up to `group`.
++struct SwiGLULayout {
++    uint32_t num_cores;
++    uint32_t group;
++    uint32_t in0_block_w;
++    uint32_t in0_mcast_w;
++};
++
++SwiGLULayout swiglu_layout(uint32_t Kt, uint32_t half_Nt, uint32_t num_worker_cores) {
 +    // Gate and up accumulators for one pass share the eight FP32 DST tiles.
 +    constexpr uint32_t max_group = 4;
-+    if (Kt == 0 || Kt > max_resident_activation_tiles || half_Nt == 0 || num_worker_cores == 0) {
-+        return std::nullopt;
-+    }
 +    const uint32_t num_cores = std::min(half_Nt, num_worker_cores);
 +    const uint32_t max_per_core = tt::div_up(half_Nt, num_cores);
 +    const uint32_t passes = tt::div_up(max_per_core, max_group);
@@ -28,6 +35,8 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +    };
 +}
 +
++}  // namespace
++
 +ProgramDescriptor MatmulSwiGLUProgramFactory::create_descriptor(
 +    const ttnn::prim::MatmulParams& operation_attributes,
 +    const ttnn::prim::MatmulInputs& tensor_args,
@@ -41,9 +50,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +    const uint32_t Kt = a.padded_shape()[-1] / TILE_WIDTH;
 +    const uint32_t half_Nt = b.padded_shape()[-1] / TILE_WIDTH / 2;
 +    const auto grid = device->compute_with_storage_grid_size();
-+    const auto layout = swiglu_layout(Kt, half_Nt, grid.x * grid.y);
-+    TT_FATAL(layout.has_value(), "Unsupported SwiGLU matmul shape");
-+    const auto [num_cores, group, in0_block_w, in0_mcast_w] = *layout;
++    const auto [num_cores, group, in0_block_w, in0_mcast_w] = swiglu_layout(Kt, half_Nt, grid.x * grid.y);
 +    constexpr uint32_t in1_buffers = 2;
 +    const uint32_t in1_block_num_tiles = in0_block_w * 2 * group;
 +    // Output tile pairs are split as evenly as possible: the first `extra`
@@ -215,28 +222,13 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
  #include "ttnn/device_operation.hpp"
  #include "ttnn/operations/matmul/device/matmul_device_operation_types.hpp"
  #include <tt-metalium/program_descriptors.hpp>
-@@ -14,6 +16,29 @@
+@@ -14,6 +16,14 @@
      static tt::tt_metal::ProgramDescriptor create_descriptor(
          const ttnn::prim::MatmulParams& operation_attributes,
          const ttnn::prim::MatmulInputs& tensor_args,
 +        std::vector<ttnn::Tensor>& tensor_return_value,
 +        const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
 +};
-+
-+// Core layout of the fused SwiGLU decode projection: output tile pairs are
-+// split as evenly as possible over num_cores cores, and each core processes
-+// its pairs in passes of up to `group`.
-+struct SwiGLULayout {
-+    uint32_t num_cores;
-+    uint32_t group;
-+    uint32_t in0_block_w;
-+    uint32_t in0_mcast_w;
-+};
-+
-+// Layout for Kt activation tiles and half_Nt output tile pairs on a grid of
-+// num_worker_cores, or nullopt if the fused program cannot hold the
-+// activation in L1.
-+std::optional<SwiGLULayout> swiglu_layout(uint32_t Kt, uint32_t half_Nt, uint32_t num_worker_cores);
 +
 +struct MatmulSwiGLUProgramFactory {
 +    static tt::tt_metal::ProgramDescriptor create_descriptor(
@@ -576,7 +568,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
      const auto& config = operation_attributes.program_config.value();
  
      return std::visit(
-@@ -2122,6 +2125,30 @@
+@@ -2122,6 +2125,28 @@
      // ---- universal checks, part 1: independent of the chosen program config ----
      validate_matmul_operand_basics(input_tensor_a, input_tensor_b, in0_tile, in1_tile);
      validate_matmul_matrix_dimensions(a_shape, b_shape, a_shape_padded, b_shape_padded, in0_tile, in1_tile);
@@ -585,11 +577,9 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
 +        TT_FATAL(a_shape.size() == 2 && b_shape.size() == 2 && a_shape[-2] > 0 &&
 +                     a_shape_padded[-2] == TILE_HEIGHT,
 +                 "SwiGLU matmul supports a single tile row only");
-+        TT_FATAL(a_shape[-1] % TILE_WIDTH == 0 && b_shape[-1] % (2 * TILE_WIDTH) == 0,
-+                 "SwiGLU matmul needs tile-aligned K and up/gate halves");
-+        const auto grid = input_tensor_a.device()->compute_with_storage_grid_size();
-+        TT_FATAL(swiglu_layout(a_shape[-1] / TILE_WIDTH, b_shape[-1] / TILE_WIDTH / 2, grid.x * grid.y).has_value(),
-+                 "SwiGLU matmul activation does not fit in L1");
++        TT_FATAL(a_shape[-1] > 0 && b_shape[-1] > 0 && a_shape[-1] % TILE_WIDTH == 0 &&
++                     b_shape[-1] % (2 * TILE_WIDTH) == 0,
++                 "SwiGLU matmul needs non-empty, tile-aligned K and up/gate halves");
 +        TT_FATAL(input_tensor_a.dtype() == DataType::BFLOAT16 &&
 +                     input_tensor_b.dtype() == DataType::BFLOAT8_B &&
 +                     attributes.output_dtype == DataType::BFLOAT16,
@@ -607,7 +597,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
      validate_matmul_bfloat4_tile_dims(input_tensor_a, input_tensor_b, in0_tile, in1_tile);
      validate_matmul_optional_tensors(attributes, args);
  
-@@ -2281,8 +2308,13 @@
+@@ -2281,8 +2306,13 @@
      const auto& input_tensor_b = input_tensors.at(1);
  
      // Use the compute_matmul_output_shape function to get the output shape
@@ -622,7 +612,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
  
      const auto& a_shape_padded =
          operations::matmul::utilities::get_matmul_tensor_padded_shape(input_tensor_a, attributes.transpose_a);
-@@ -2757,7 +2789,8 @@
+@@ -2757,7 +2787,8 @@
          parameters.transpose_b,
          output_tile,
          parameters.global_cb,

@@ -77,8 +77,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +    }
 +
 +    // The fused TT-Metal kernel takes BF16 activations and output, BFP8
-+    // weights, one tile row, tile-aligned K and halves, and keeps the
-+    // activation resident in L1 (at most 256 K tiles).
++    // weights, one tile row, and tile-aligned K and halves.
++    auto [tileHeight, tileWidth] = ttcore::TileType::getDefaultShape();
 +    auto weightDtype =
 +        matmulOp->getAttrOfType<mlir::StringAttr>("ttcore.weight_dtype");
 +    auto lhsType = matmulOp.getA().getType();
@@ -89,7 +89,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +    if (!weightDtype || weightDtype.getValue() != "bfp_bf8" ||
 +        !lhsType.getElementType().isBF16() ||
 +        !outputType.getElementType().isBF16() || shape.size() != 2 ||
-+        shape[0] > 32 || k % 32 != 0 || k / 32 > 256 || half % 32 != 0) {
++        shape[0] > tileHeight || k % tileWidth != 0 || half % tileWidth != 0) {
 +      return failure();
 +    }
 +
