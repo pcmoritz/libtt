@@ -19,9 +19,12 @@ import pytest
         (1, 5120, 12800),
         (32, 512, 6400),
         (2, 512, 12800),
-        # A prime tile count, Qwen3-14B's TP2 width, and a partial core row.
+        # A prime tile count, Qwen3-14B's TP1/TP2 widths (more pairs than
+        # fit in DST at once), and a partial core row.
         (1, 64, 3104),
         (1, 96, 8704),
+        (1, 5120, 8704),
+        (1, 5120, 17408),
         (1, 512, 256),
     ],
 )

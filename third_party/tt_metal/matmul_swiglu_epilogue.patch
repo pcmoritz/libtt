@@ -1,33 +1,31 @@
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
-@@ -241,4 +241,192 @@
+@@ -241,4 +241,201 @@
      return desc;
  }
  
 +std::optional<SwiGLULayout> swiglu_layout(uint32_t Kt, uint32_t half_Nt, uint32_t num_worker_cores) {
 +    // The activation row block stays resident in L1 for the whole reduction.
 +    constexpr uint32_t max_resident_activation_tiles = 256;
-+    // Gate and up accumulators for one core share the eight FP32 DST tiles.
-+    constexpr uint32_t max_per_core_N = 4;
-+    if (Kt == 0 || Kt > max_resident_activation_tiles || half_Nt == 0) {
++    // Gate and up accumulators for one pass share the eight FP32 DST tiles.
++    constexpr uint32_t max_group = 4;
++    if (Kt == 0 || Kt > max_resident_activation_tiles || half_Nt == 0 || num_worker_cores == 0) {
 +        return std::nullopt;
 +    }
-+    for (uint32_t per_core_N = 1; per_core_N <= max_per_core_N; ++per_core_N) {
-+        if (half_Nt % per_core_N == 0 && half_Nt / per_core_N <= num_worker_cores) {
-+            uint32_t in0_mcast_w = 8;
-+            while (Kt % in0_mcast_w != 0) {
-+                in0_mcast_w /= 2;
-+            }
-+            return SwiGLULayout{
-+                .num_cores = half_Nt / per_core_N,
-+                .per_core_N = per_core_N,
-+                .in0_block_w = Kt % 2 == 0 ? 2u : 1u,
-+                .in0_mcast_w = in0_mcast_w,
-+            };
-+        }
++    const uint32_t num_cores = std::min(half_Nt, num_worker_cores);
++    const uint32_t max_per_core = tt::div_up(half_Nt, num_cores);
++    const uint32_t passes = tt::div_up(max_per_core, max_group);
++    uint32_t in0_mcast_w = 8;
++    while (Kt % in0_mcast_w != 0) {
++        in0_mcast_w /= 2;
 +    }
-+    return std::nullopt;
++    return SwiGLULayout{
++        .num_cores = num_cores,
++        .group = tt::div_up(max_per_core, passes),
++        .in0_block_w = Kt % 2 == 0 ? 2u : 1u,
++        .in0_mcast_w = in0_mcast_w,
++    };
 +}
 +
 +ProgramDescriptor MatmulSwiGLUProgramFactory::create_descriptor(
@@ -45,11 +43,15 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +    const auto grid = device->compute_with_storage_grid_size();
 +    const auto layout = swiglu_layout(Kt, half_Nt, grid.x * grid.y);
 +    TT_FATAL(layout.has_value(), "Unsupported SwiGLU matmul shape");
-+    const auto [num_cores, per_core_N, in0_block_w, in0_mcast_w] = *layout;
++    const auto [num_cores, group, in0_block_w, in0_mcast_w] = *layout;
 +    constexpr uint32_t in1_buffers = 2;
-+    const uint32_t combined_per_core_N = 2 * per_core_N;
-+    const uint32_t num_blocks = Kt / in0_block_w;
-+    const uint32_t in1_block_num_tiles = in0_block_w * combined_per_core_N;
++    const uint32_t in1_block_num_tiles = in0_block_w * 2 * group;
++    // Output tile pairs are split as evenly as possible: the first `extra`
++    // cores take one more than the rest.
++    const uint32_t base_count = half_Nt / num_cores;
++    const uint32_t extra = half_Nt % num_cores;
++    auto count_of = [&](uint32_t i) { return base_count + (i < extra ? 1 : 0); };
++    auto start_of = [&](uint32_t i) { return i * base_count + std::min(i, extra); };
 +
 +    // Cores are numbered row-major over the worker grid. Full rows form one
 +    // multicast group and a partial last row forms another; the first core
@@ -82,7 +84,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +    // Even weight K blocks arrive on RISCV_0's NOC and odd blocks on RISCV_1's.
 +    add_cb(tt::CBIndex::c_1, in1_buffers * in1_block_num_tiles, in1_format);
 +    add_cb(tt::CBIndex::c_2, in1_buffers * in1_block_num_tiles, in1_format);
-+    add_cb(tt::CBIndex::c_16, per_core_N, output_format);
++    add_cb(tt::CBIndex::c_16, count_of(0), output_format);
 +
 +    constexpr uint32_t sender_sem_id = 0;
 +    constexpr uint32_t receiver_sem_id = 1;
@@ -100,7 +102,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +        {"cb_out", tt::CBIndex::c_16},
 +        {"Kt", Kt},
 +        {"half_Nt", half_Nt},
-+        {"per_core_N", per_core_N},
++        {"group", group},
 +        {"in0_block_w", in0_block_w},
 +        {"in0_mcast_w", in0_mcast_w},
 +        {"sender_sem", sender_sem_id},
@@ -155,16 +157,21 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +             static_cast<uint32_t>(end.y),
 +             last - first,
 +             b,
-+             first});
++             start_of(first),
++             count_of(first)});
 +        for (uint32_t i = first + 1; i <= last; ++i) {
 +            receiver_ranges.emplace_back(core_at(i), core_at(i));
 +            receiver.emplace_runtime_args(
 +                core_at(i),
-+                {static_cast<uint32_t>(sender_physical.x), static_cast<uint32_t>(sender_physical.y), b, i});
++                {static_cast<uint32_t>(sender_physical.x),
++                 static_cast<uint32_t>(sender_physical.y),
++                 b,
++                 start_of(i),
++                 count_of(i)});
 +        }
 +    }
 +    for (uint32_t i = 0; i < num_cores; ++i) {
-+        reader.emplace_runtime_args(core_at(i), {b, output, i});
++        reader.emplace_runtime_args(core_at(i), {b, output, start_of(i), count_of(i)});
 +    }
 +    sender.core_ranges = CoreRangeSet(sender_ranges);
 +    desc.kernels.push_back(std::move(reader));
@@ -182,8 +189,10 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +    compute.kernel_source = "ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp";
 +    compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
 +    compute.core_ranges = all_cores;
-+    compute.compile_time_args = {in0_block_w, in0_block_w, in1_block_num_tiles, per_core_N, num_blocks};
 +    compute.named_compile_time_args = common_args;
++    for (uint32_t i = 0; i < num_cores; ++i) {
++        compute.emplace_runtime_args(core_at(i), {count_of(i)});
++    }
 +    compute.config = ComputeConfigDescriptor{
 +        .math_fidelity = math_fidelity,
 +        .fp32_dest_acc_en = true,
@@ -206,7 +215,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
  #include "ttnn/device_operation.hpp"
  #include "ttnn/operations/matmul/device/matmul_device_operation_types.hpp"
  #include <tt-metalium/program_descriptors.hpp>
-@@ -14,6 +16,27 @@
+@@ -14,6 +16,29 @@
      static tt::tt_metal::ProgramDescriptor create_descriptor(
          const ttnn::prim::MatmulParams& operation_attributes,
          const ttnn::prim::MatmulInputs& tensor_args,
@@ -214,17 +223,19 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +        const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
 +};
 +
-+// Core layout of the fused SwiGLU decode projection: output tiles split over
-+// num_cores cores, per_core_N gate and per_core_N up tiles each.
++// Core layout of the fused SwiGLU decode projection: output tile pairs are
++// split as evenly as possible over num_cores cores, and each core processes
++// its pairs in passes of up to `group`.
 +struct SwiGLULayout {
 +    uint32_t num_cores;
-+    uint32_t per_core_N;
++    uint32_t group;
 +    uint32_t in0_block_w;
 +    uint32_t in0_mcast_w;
 +};
 +
-+// Layout for Kt activation tiles and half_Nt output tiles on a grid of
-+// num_worker_cores, or nullopt if the fused program cannot handle the shape.
++// Layout for Kt activation tiles and half_Nt output tile pairs on a grid of
++// num_worker_cores, or nullopt if the fused program cannot hold the
++// activation in L1.
 +std::optional<SwiGLULayout> swiglu_layout(uint32_t Kt, uint32_t half_Nt, uint32_t num_worker_cores);
 +
 +struct MatmulSwiGLUProgramFactory {
@@ -237,7 +248,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,70 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -248,62 +259,70 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.
 +#include "api/dataflow/circular_buffer.h"
 +#include "api/compute/compute_kernel_api.h"
 +
++// silu(gate) * up for this core's output tile pairs. Each group of up to
++// `group` pairs accumulates the full K reduction in FP32 DST; the activation
++// stays resident, so later groups reuse it.
 +void kernel_main() {
-+    constexpr uint32_t in0_block_w = get_compile_time_arg_val(0);
-+    constexpr uint32_t in0_block_tiles = get_compile_time_arg_val(1);
-+    constexpr uint32_t in1_block_tiles = get_compile_time_arg_val(2);
-+    constexpr uint32_t per_core_N = get_compile_time_arg_val(3);
-+    constexpr uint32_t num_blocks = get_compile_time_arg_val(4);
++    const uint32_t count = get_arg_val<uint32_t>(0);
++
++    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
++    constexpr uint32_t kblock = get_named_compile_time_arg_val("in0_block_w");
++    constexpr uint32_t group = get_named_compile_time_arg_val("group");
 +    constexpr uint32_t cb_in0 = get_named_compile_time_arg_val("cb_in0");
 +    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
-+    constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
 +    constexpr uint32_t cb_weights2 = get_named_compile_time_arg_val("cb_weights2");
-+    constexpr uint32_t combined_per_core_N = 2 * per_core_N;
-+    constexpr uint32_t out_subblock_w = 2;
-+    static_assert(combined_per_core_N > 0 && combined_per_core_N <= 8, "gate and up must fit in DST");
++    constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
++    constexpr uint32_t block_tiles = kblock * 2 * group;
++    static_assert(group > 0 && 2 * group <= 8, "gate and up must fit in FP32 DST");
 +
 +    compute_kernel_hw_startup<SrcOrder::Reverse>(cb_in0, cb_weights, cb_out);
-+    matmul_block_init(cb_in0, cb_weights, 0, out_subblock_w, 1, in0_block_w);
-+    // Both projections fit in DST; retain them across all K blocks.
-+    tile_regs_acquire();
-+    for (uint32_t block = 0; block < num_blocks; ++block) {
-+        // Odd K blocks arrive through the second NOC's CB.
-+        const uint32_t cb_block = (block & 1) ? cb_weights2 : cb_weights;
-+        cb_wait_front(cb_in0, in0_block_tiles);
-+        cb_wait_front(cb_block, in1_block_tiles);
-+        for (uint32_t k = 0; k < in0_block_w; ++k) {
-+            for (uint32_t offset = 0; offset < combined_per_core_N; offset += out_subblock_w) {
-+                matmul_block(
-+                    cb_in0, cb_block, k, k * combined_per_core_N + offset, offset,
-+                    /*transpose=*/0, out_subblock_w, 1, in0_block_w);
++    uint32_t in0_ready = 0;
++    uint32_t index = 0;
++    for (uint32_t group_start = 0; group_start < count; group_start += group) {
++        const uint32_t width = count - group_start < group ? count - group_start : group;
++        matmul_block_init(cb_in0, cb_weights, 0, /*ct_dim=*/2, /*rt_dim=*/1, kblock);
++        tile_regs_acquire();
++        for (uint32_t k0 = 0; k0 < Kt; k0 += kblock, ++index) {
++            // Odd blocks arrive through the second NOC's CB.
++            const uint32_t cb_block = (index & 1) ? cb_weights2 : cb_weights;
++            if (in0_ready < k0 + kblock) {
++                in0_ready = k0 + kblock;
++                cb_wait_front(cb_in0, in0_ready);
 +            }
++            cb_wait_front(cb_block, block_tiles);
++            for (uint32_t k = 0; k < kblock; ++k) {
++                for (uint32_t offset = 0; offset < 2 * width; offset += 2) {
++                    matmul_block(cb_in0, cb_block, k0 + k, k * 2 * width + offset, offset, /*transpose=*/0, 2, 1,
++                                 kblock);
++                }
++            }
++            cb_pop_front(cb_block, block_tiles);
 +        }
-+        cb_pop_front(cb_in0, in0_block_tiles);
-+        cb_pop_front(cb_block, in1_block_tiles);
-+    }
 +
-+    // Gate occupies the first per_core_N tiles, followed by up.
-+    silu_tile_init();
-+    for (uint32_t i = 0; i < per_core_N; ++i) {
-+        silu_tile(i);
++        // Gate occupies the first `width` DST tiles, followed by up.
++        silu_tile_init();
++        for (uint32_t i = 0; i < width; ++i) {
++            silu_tile(i);
++        }
++        mul_binary_tile_init();
++        for (uint32_t i = 0; i < width; ++i) {
++            mul_binary_tile(i, width + i, i);
++        }
++        tile_regs_commit();
++        tile_regs_wait();
++        cb_reserve_back(cb_out, width);
++        for (uint32_t i = 0; i < width; ++i) {
++            pack_tile(i, cb_out);
++        }
++        cb_push_back(cb_out, width);
++        tile_regs_release();
 +    }
-+    mul_binary_tile_init();
-+    for (uint32_t i = 0; i < per_core_N; ++i) {
-+        mul_binary_tile(i, per_core_N + i, i);
-+    }
-+    tile_regs_commit();
-+    tile_regs_wait();
-+    cb_reserve_back(cb_out, per_core_N);
-+    for (uint32_t i = 0; i < per_core_N; ++i) {
-+        pack_tile(i, cb_out);
-+    }
-+    cb_push_back(cb_out, per_core_N);
-+    tile_regs_release();
++    cb_pop_front(cb_in0, Kt);
 +}
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu_weights.hpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu_weights.hpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu_weights.hpp
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,60 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -312,21 +331,55 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu
 +#include <cstdint>
 +#include "api/dataflow/dataflow_api.h"
 +
-+// Reads one K block of this core's fused gate/up weight tiles into `ptr`.
-+// Gate tiles come first, then up tiles, for each K row of the block.
-+template <uint32_t in0_block_w, uint32_t per_core_N, uint32_t half_Nt, typename Accessor>
++// Weight blocks of one SwiGLU core in consumption order. The core's output
++// tile pairs are processed in groups of up to `group` (bounded by DST), and
++// each group walks K in blocks of `kblock` tiles. Even blocks travel on
++// RISCV_0's NOC and odd blocks on RISCV_1's. Every block occupies
++// kblock * 2 * group CB tiles, so a narrower last group keeps the CB block
++// size constant.
++template <uint32_t Kt, uint32_t kblock, uint32_t group>
++struct SwiGLUBlocks {
++    uint32_t count;
++    uint32_t group_start = 0;
++    uint32_t k0 = 0;
++    uint32_t index = 0;
++
++    bool done() const { return group_start >= count; }
++    uint32_t width() const { return count - group_start < group ? count - group_start : group; }
++    void next() {
++        k0 += kblock;
++        if (k0 >= Kt) {
++            k0 = 0;
++            group_start += group;
++        }
++        ++index;
++    }
++    // Moves to the first or next block with index % 2 == parity.
++    void seek(uint32_t parity) {
++        while (!done() && (index & 1) != parity) {
++            next();
++        }
++    }
++    void next_owned(uint32_t parity) {
++        next();
++        seek(parity);
++    }
++};
++
++// Reads one block: for each K row, the group's gate tiles followed by its up
++// tiles. Up columns are the first half of the fused weight, gate the second.
++template <uint32_t Kt, uint32_t kblock, uint32_t group, typename Accessor>
 +FORCE_INLINE void read_swiglu_weight_block(
-+    const Accessor& weight, uint32_t k0, uint32_t n_start, uint32_t ptr, uint32_t tile_bytes) {
-+    constexpr uint32_t fused_Nt = 2 * half_Nt;
-+    constexpr uint32_t combined_per_core_N = 2 * per_core_N;
-+    for (uint32_t k = 0; k < in0_block_w; ++k) {
-+        const uint32_t up_row = (k0 + k) * fused_Nt + n_start;
++    const Accessor& weight, uint32_t half_Nt, uint32_t n_start, const SwiGLUBlocks<Kt, kblock, group>& block,
++    uint32_t ptr, uint32_t tile_bytes) {
++    const uint32_t width = block.width();
++    for (uint32_t k = 0; k < kblock; ++k) {
++        const uint32_t up_row = (block.k0 + k) * 2 * half_Nt + n_start + block.group_start;
 +        const uint32_t gate_row = up_row + half_Nt;
-+        for (uint32_t n = 0; n < per_core_N; ++n) {
-+            const uint32_t gate_local = (k * combined_per_core_N + n) * tile_bytes;
-+            const uint32_t up_local = gate_local + per_core_N * tile_bytes;
++        for (uint32_t n = 0; n < width; ++n) {
++            const uint32_t gate_local = (k * 2 * width + n) * tile_bytes;
 +            noc_async_read_tile(gate_row + n, weight, ptr + gate_local);
-+            noc_async_read_tile(up_row + n, weight, ptr + up_local);
++            noc_async_read_tile(up_row + n, weight, ptr + gate_local + width * tile_bytes);
 +        }
 +    }
 +}
@@ -343,39 +396,39 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +#include "api/dataflow/circular_buffer.h"
 +#include "matmul_swiglu_weights.hpp"
 +
-+// Streams the even K blocks of this core's weights on RISCV_0's NOC, then
-+// writes the SwiGLU output tiles.
++// Streams the even weight blocks of this core on RISCV_0's NOC, then writes
++// the core's SwiGLU output tiles.
 +void kernel_main() {
 +    const uint32_t weight_addr = get_arg_val<uint32_t>(0);
 +    const uint32_t output_addr = get_arg_val<uint32_t>(1);
-+    const uint32_t core_n = get_arg_val<uint32_t>(2);
++    const uint32_t n_start = get_arg_val<uint32_t>(2);
++    const uint32_t count = get_arg_val<uint32_t>(3);
 +
 +    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
 +    constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
 +    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
 +    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
-+    constexpr uint32_t per_core_N = get_named_compile_time_arg_val("per_core_N");
-+    constexpr uint32_t in0_block_w = get_named_compile_time_arg_val("in0_block_w");
-+    constexpr uint32_t in1_block_tiles = in0_block_w * 2 * per_core_N;
++    constexpr uint32_t kblock = get_named_compile_time_arg_val("in0_block_w");
++    constexpr uint32_t group = get_named_compile_time_arg_val("group");
++    constexpr uint32_t block_tiles = kblock * 2 * group;
 +
 +    constexpr auto weight_args = TensorAccessorArgs<0>();
 +    constexpr auto output_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
 +    const auto weight = TensorAccessor(weight_args, weight_addr);
 +    const auto output = TensorAccessor(output_args, output_addr);
-+    const uint32_t n_start = core_n * per_core_N;
 +
-+    for (uint32_t k0 = 0; k0 < Kt; k0 += 2 * in0_block_w) {
-+        cb_reserve_back(cb_weights, in1_block_tiles);
-+        read_swiglu_weight_block<in0_block_w, per_core_N, half_Nt>(
-+            weight, k0, n_start, get_write_ptr(cb_weights), get_tile_size(cb_weights));
++    SwiGLUBlocks<Kt, kblock, group> block{count};
++    for (block.seek(0); !block.done(); block.next_owned(0)) {
++        cb_reserve_back(cb_weights, block_tiles);
++        read_swiglu_weight_block(weight, half_Nt, n_start, block, get_write_ptr(cb_weights), get_tile_size(cb_weights));
 +        noc_async_read_barrier();
-+        cb_push_back(cb_weights, in1_block_tiles);
++        cb_push_back(cb_weights, block_tiles);
 +    }
 +
 +    Noc noc;
 +    CircularBuffer out_cb(cb_out);
 +    const uint32_t page_bytes = get_local_cb_interface(cb_out).fifo_page_size;
-+    for (uint32_t n = 0; n < per_core_N; ++n) {
++    for (uint32_t n = 0; n < count; ++n) {
 +        out_cb.wait_front(1);
 +        noc.async_write(out_cb, output, page_bytes, {}, {.page_id = n_start + n});
 +        noc.async_writes_flushed();
@@ -386,7 +439,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,68 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -397,26 +450,29 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +#include "api/dataflow/noc_semaphore.h"
 +#include "matmul_swiglu_weights.hpp"
 +
++// RISCV_1 on multicast receivers: publish activation chunks as they land,
++// and stream this core's odd weight blocks without blocking on weight CB
++// space while activation chunks are still pending.
 +void kernel_main() {
 +    const uint32_t sender_x = get_arg_val<uint32_t>(0);
 +    const uint32_t sender_y = get_arg_val<uint32_t>(1);
 +    const uint32_t weight_addr = get_arg_val<uint32_t>(2);
-+    const uint32_t core_n = get_arg_val<uint32_t>(3);
++    const uint32_t n_start = get_arg_val<uint32_t>(3);
++    const uint32_t count = get_arg_val<uint32_t>(4);
 +
 +    constexpr uint32_t cb_in0_id = get_named_compile_time_arg_val("cb_in0");
 +    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights2");
 +    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
++    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
++    constexpr uint32_t kblock = get_named_compile_time_arg_val("in0_block_w");
++    constexpr uint32_t group = get_named_compile_time_arg_val("group");
 +    constexpr uint32_t in0_mcast_w = get_named_compile_time_arg_val("in0_mcast_w");
 +    constexpr uint32_t sender_sem_id = get_named_compile_time_arg_val("sender_sem");
 +    constexpr uint32_t receiver_sem_id = get_named_compile_time_arg_val("receiver_sem");
-+    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
-+    constexpr uint32_t per_core_N = get_named_compile_time_arg_val("per_core_N");
-+    constexpr uint32_t in0_block_w = get_named_compile_time_arg_val("in0_block_w");
 +    constexpr uint32_t num_chunks = Kt / in0_mcast_w;
-+    constexpr uint32_t in1_block_tiles = in0_block_w * 2 * per_core_N;
++    constexpr uint32_t block_tiles = kblock * 2 * group;
 +    constexpr auto weight_args = TensorAccessorArgs<0>();
 +    const auto weight = TensorAccessor(weight_args, weight_addr);
-+    const uint32_t n_start = core_n * per_core_N;
 +
 +    Noc noc;
 +    CircularBuffer cb_in0(cb_in0_id);
@@ -430,12 +486,10 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    receiver_sem.set(0);
 +    sender_sem.up(noc, sender_x, sender_y, 1);
 +
-+    // Publish activation chunks as they land, and stream the odd weight K
-+    // blocks on this RISC's NOC without blocking on weight CB space while
-+    // activation chunks are still pending.
++    SwiGLUBlocks<Kt, kblock, group> block{count};
++    block.seek(1);
 +    uint32_t chunks = 0;
-+    uint32_t k0 = in0_block_w;
-+    while (chunks < num_chunks || k0 < Kt) {
++    while (chunks < num_chunks || !block.done()) {
 +        if (chunks < num_chunks) {
 +            invalidate_l1_cache();
 +            if (*chunks_landed > chunks) {
@@ -444,20 +498,20 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +                continue;
 +            }
 +        }
-+        if (k0 < Kt && (chunks == num_chunks || cb_pages_reservable_at_back(cb_weights, in1_block_tiles))) {
-+            cb_reserve_back(cb_weights, in1_block_tiles);
-+            read_swiglu_weight_block<in0_block_w, per_core_N, half_Nt>(
-+                weight, k0, n_start, get_write_ptr(cb_weights), get_tile_size(cb_weights));
++        if (!block.done() && (chunks == num_chunks || cb_pages_reservable_at_back(cb_weights, block_tiles))) {
++            cb_reserve_back(cb_weights, block_tiles);
++            read_swiglu_weight_block(
++                weight, half_Nt, n_start, block, get_write_ptr(cb_weights), get_tile_size(cb_weights));
 +            noc_async_read_barrier();
-+            cb_push_back(cb_weights, in1_block_tiles);
-+            k0 += 2 * in0_block_w;
++            cb_push_back(cb_weights, block_tiles);
++            block.next_owned(1);
 +        }
 +    }
 +}
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,96 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -470,11 +524,11 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +#include "api/core_local_mem.h"
 +#include "matmul_swiglu_weights.hpp"
 +
-+// The whole activation row block stays resident in every core's L1. After a
-+// single readiness handshake, stream it in chunks: the DRAM read of the next
-+// chunk overlaps the multicast of the current one, and a counting semaphore
-+// tells receivers how many chunks have landed. The odd weight K blocks for
-+// this core follow on the same RISC.
++// RISCV_1 on the first core of a multicast group. The activation row block
++// stays resident in every core's L1: after one readiness handshake, stream it
++// in chunks, overlapping the DRAM read of the next chunk with the multicast
++// of the current one; a counting semaphore tells receivers how many chunks
++// have landed. This core's odd weight blocks follow.
 +void kernel_main() {
 +    const uint32_t input_addr = get_arg_val<uint32_t>(0);
 +    const uint32_t dest_start_x = get_arg_val<uint32_t>(1);
@@ -483,26 +537,26 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    const uint32_t dest_end_y = get_arg_val<uint32_t>(4);
 +    const uint32_t num_dests = get_arg_val<uint32_t>(5);
 +    const uint32_t weight_addr = get_arg_val<uint32_t>(6);
-+    const uint32_t core_n = get_arg_val<uint32_t>(7);
++    const uint32_t n_start = get_arg_val<uint32_t>(7);
++    const uint32_t count = get_arg_val<uint32_t>(8);
 +
 +    constexpr uint32_t cb_in0_id = get_named_compile_time_arg_val("cb_in0");
 +    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights2");
 +    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
++    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
++    constexpr uint32_t kblock = get_named_compile_time_arg_val("in0_block_w");
++    constexpr uint32_t group = get_named_compile_time_arg_val("group");
 +    constexpr uint32_t in0_mcast_w = get_named_compile_time_arg_val("in0_mcast_w");
 +    constexpr uint32_t sender_sem_id = get_named_compile_time_arg_val("sender_sem");
 +    constexpr uint32_t receiver_sem_id = get_named_compile_time_arg_val("receiver_sem");
-+    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
-+    constexpr uint32_t per_core_N = get_named_compile_time_arg_val("per_core_N");
-+    constexpr uint32_t in0_block_w = get_named_compile_time_arg_val("in0_block_w");
-+    constexpr uint32_t in1_block_tiles = in0_block_w * 2 * per_core_N;
++    constexpr uint32_t num_chunks = Kt / in0_mcast_w;
++    constexpr uint32_t block_tiles = kblock * 2 * group;
++    static_assert(Kt % in0_mcast_w == 0);
 +    constexpr auto input_args = TensorAccessorArgs<0>();
 +    constexpr auto weight_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
-+    constexpr uint32_t num_chunks = Kt / in0_mcast_w;
-+    static_assert(Kt % in0_mcast_w == 0);
 +
 +    const auto input = TensorAccessor(input_args, input_addr);
 +    const auto weight = TensorAccessor(weight_args, weight_addr);
-+    const uint32_t n_start = core_n * per_core_N;
 +    Noc noc;
 +    CircularBuffer cb_in0(cb_in0_id);
 +    Semaphore<> sender_sem(sender_sem_id);
@@ -544,12 +598,13 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +        cb_in0.push_back(in0_mcast_w);
 +        noc.async_read_barrier();
 +    }
-+    for (uint32_t k0 = in0_block_w; k0 < Kt; k0 += 2 * in0_block_w) {
-+        cb_reserve_back(cb_weights, in1_block_tiles);
-+        read_swiglu_weight_block<in0_block_w, per_core_N, half_Nt>(
-+            weight, k0, n_start, get_write_ptr(cb_weights), get_tile_size(cb_weights));
++
++    SwiGLUBlocks<Kt, kblock, group> block{count};
++    for (block.seek(1); !block.done(); block.next_owned(1)) {
++        cb_reserve_back(cb_weights, block_tiles);
++        read_swiglu_weight_block(weight, half_Nt, n_start, block, get_write_ptr(cb_weights), get_tile_size(cb_weights));
 +        noc_async_read_barrier();
-+        cb_push_back(cb_weights, in1_block_tiles);
++        cb_push_back(cb_weights, block_tiles);
 +    }
 +    noc.async_write_barrier();
 +}
@@ -579,7 +634,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
 +                 "SwiGLU matmul needs tile-aligned K and up/gate halves");
 +        const auto grid = input_tensor_a.device()->compute_with_storage_grid_size();
 +        TT_FATAL(swiglu_layout(a_shape[-1] / TILE_WIDTH, b_shape[-1] / TILE_WIDTH / 2, grid.x * grid.y).has_value(),
-+                 "SwiGLU matmul shape does not fit the fused program on this worker grid");
++                 "SwiGLU matmul activation does not fit in L1");
 +        TT_FATAL(input_tensor_a.dtype() == DataType::BFLOAT16 &&
 +                     input_tensor_b.dtype() == DataType::BFLOAT8_B &&
 +                     attributes.output_dtype == DataType::BFLOAT16,
