@@ -1,4 +1,4 @@
-"""Exercise TP2/TP4 decode sums, multiple collectives, and trace inputs.
+"""Exercise decode-sized all-reduce across widths, collectives and trace inputs.
 
 The mesh spans every visible device, so run once with two and once with four
 chips visible to cover both exchange/reduce ring sizes.
@@ -28,13 +28,17 @@ def full_mesh():
 @pytest.mark.parametrize(
     "rows,width,dtype",
     [
+        # One tile, an odd tile count, a prime tile count (257), and widths
+        # on both sides of the typical hidden sizes.
+        (1, 32, jnp.bfloat16),
+        (1, 96, jnp.bfloat16),
         (1, 1024, jnp.bfloat16),
-        (1, 4096, jnp.bfloat16),
         (1, 5120, jnp.bfloat16),
         (2, 5120, jnp.bfloat16),
-        (1, 8192, jnp.bfloat16),
         (1, 8224, jnp.bfloat16),
+        (1, 12288, jnp.bfloat16),
         (32, 5120, jnp.bfloat16),
+        # Falls back to reduce-scatter plus all-gather.
         (1, 5120, jnp.float32),
     ],
 )

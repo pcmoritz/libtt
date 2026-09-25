@@ -37,7 +37,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  
  #ifdef TTMLIR_ENABLE_OPMODEL
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
-@@ -176,6 +177,91 @@
+@@ -176,6 +177,104 @@
    }
  };
  
@@ -76,22 +76,35 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +      return failure();
 +    }
 +
-+    // Shapes supported by the fused TT-Metal kernel: BF16 activations and
-+    // output, BFP8 weights, one tile row, K in two-tile blocks, and one to
-+    // four output tiles per core on 96 cores, or on 100 cores when the tiles
-+    // do not divide across 96.
++    // The fused TT-Metal kernel takes BF16 activations and output, BFP8
++    // weights, one tile row, tile-aligned K and halves, keeps the activation
++    // resident in L1 (at most 256 K tiles), and gives each worker core one to
++    // four gate/up output tile pairs. Mirrors swiglu_layout in TT-Metal.
 +    auto weightDtype =
 +        matmulOp->getAttrOfType<mlir::StringAttr>("ttcore.weight_dtype");
 +    auto lhsType = matmulOp.getA().getType();
 +    auto outputType = multiplyOp.getType();
 +    ArrayRef<int64_t> shape = matmulOp.getType().getShape();
++    int64_t k = lhsType.getShape().back();
 +    int64_t half = outputType.getShape().back();
-+    int64_t cores = (half / 32) % 96 == 0 ? 96 : 100;
++    int64_t workerCores = 1;
++    for (int64_t dim :
++         ttcore::getCurrentScopeSystemDesc(matmulOp).getChipDescs()[0].getGrid()) {
++      workerCores *= dim;
++    }
++    auto fitsCores = [&](int64_t tiles) {
++      for (int64_t perCore = 1; perCore <= 4; ++perCore) {
++        if (tiles % perCore == 0 && tiles / perCore <= workerCores) {
++          return true;
++        }
++      }
++      return false;
++    };
 +    if (!weightDtype || weightDtype.getValue() != "bfp_bf8" ||
 +        !lhsType.getElementType().isBF16() ||
 +        !outputType.getElementType().isBF16() || shape.size() != 2 ||
-+        shape[0] > 32 || lhsType.getShape().back() % 64 != 0 ||
-+        half % (32 * cores) != 0 || half > 4 * 32 * cores) {
++        shape[0] > 32 || k % 32 != 0 || k / 32 > 256 || half % 32 != 0 ||
++        !fitsCores(half / 32)) {
 +      return failure();
 +    }
 +
@@ -129,7 +142,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  #ifdef TTMLIR_ENABLE_OPMODEL
  
  // ============================================================================
-@@ -435,7 +521,7 @@
+@@ -435,7 +534,7 @@
      RewritePatternSet patterns(&getContext());
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973

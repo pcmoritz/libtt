@@ -250,7 +250,7 @@ http_archive(
         "//third_party/tt_metal:fabric_build.patch",
         "//third_party/tt_metal:all_gather_packet_headers.patch",
         "//third_party/tt_metal:reshaped_mesh_link_discovery.patch",
-        "//third_party/tt_metal:tp_minimal_all_reduce.patch",
+        "//third_party/tt_metal:direct_all_reduce.patch",
         "//third_party/tt_metal:all_gather_slice_overflow.patch",
         "//third_party/tt_metal:fabric_router_teardown.patch",
         "//third_party/tt_metal:fabric_packet_size.patch",

@@ -1,10 +1,35 @@
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
-@@ -241,4 +241,251 @@
+@@ -241,4 +241,192 @@
      return desc;
  }
  
++std::optional<SwiGLULayout> swiglu_layout(uint32_t Kt, uint32_t half_Nt, uint32_t num_worker_cores) {
++    // The activation row block stays resident in L1 for the whole reduction.
++    constexpr uint32_t max_resident_activation_tiles = 256;
++    // Gate and up accumulators for one core share the eight FP32 DST tiles.
++    constexpr uint32_t max_per_core_N = 4;
++    if (Kt == 0 || Kt > max_resident_activation_tiles || half_Nt == 0) {
++        return std::nullopt;
++    }
++    for (uint32_t per_core_N = 1; per_core_N <= max_per_core_N; ++per_core_N) {
++        if (half_Nt % per_core_N == 0 && half_Nt / per_core_N <= num_worker_cores) {
++            uint32_t in0_mcast_w = 8;
++            while (Kt % in0_mcast_w != 0) {
++                in0_mcast_w /= 2;
++            }
++            return SwiGLULayout{
++                .num_cores = half_Nt / per_core_N,
++                .per_core_N = per_core_N,
++                .in0_block_w = Kt % 2 == 0 ? 2u : 1u,
++                .in0_mcast_w = in0_mcast_w,
++            };
++        }
++    }
++    return std::nullopt;
++}
++
 +ProgramDescriptor MatmulSwiGLUProgramFactory::create_descriptor(
 +    const ttnn::prim::MatmulParams& operation_attributes,
 +    const ttnn::prim::MatmulInputs& tensor_args,
@@ -13,242 +38,158 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +    const auto& a = tensor_args.input_tensors.at(0).mesh_tensor();
 +    const auto& b = tensor_args.input_tensors.at(1).mesh_tensor();
 +    const auto& output = tensor_return_value.at(0).mesh_tensor();
-+
-+    // Split the output tiles over 96 cores (11x8 plus a partial row) or, when
-+    // they do not divide evenly, over a 10x10 grid.
-+    const bool use_100_cores = (b.padded_shape()[-1] / TILE_WIDTH / 2) % 96 != 0;
-+    const uint32_t grid_x = use_100_cores ? 10 : 11;
-+    const uint32_t num_cores = use_100_cores ? 100 : 96;
-+    const uint32_t group0_y = use_100_cores ? 9 : 8;
-+    const uint32_t group1_x = use_100_cores ? 10 : 8;
-+    constexpr uint32_t in0_block_w = 2;
-+    constexpr uint32_t in1_buffers = 2;
-+    // Even K blocks stream on RISCV_0's NOC and odd blocks on RISCV_1's NOC.
-+    constexpr uint32_t dual_noc = 1;
++    auto* device = &a.mutable_device();
 +
 +    const uint32_t Kt = a.padded_shape()[-1] / TILE_WIDTH;
-+    // The activation arrives in multicast chunks of up to eight tiles.
-+    uint32_t in0_mcast_w = 8;
-+    while (Kt % in0_mcast_w != 0) {
-+        in0_mcast_w /= 2;
-+    }
-+    const uint32_t fused_Nt = b.padded_shape()[-1] / TILE_WIDTH;
-+    const uint32_t half_Nt = fused_Nt / 2;
-+    const uint32_t per_core_N = half_Nt / num_cores;
++    const uint32_t half_Nt = b.padded_shape()[-1] / TILE_WIDTH / 2;
++    const auto grid = device->compute_with_storage_grid_size();
++    const auto layout = swiglu_layout(Kt, half_Nt, grid.x * grid.y);
++    TT_FATAL(layout.has_value(), "Unsupported SwiGLU matmul shape");
++    const auto [num_cores, per_core_N, in0_block_w, in0_mcast_w] = *layout;
++    constexpr uint32_t in1_buffers = 2;
 +    const uint32_t combined_per_core_N = 2 * per_core_N;
 +    const uint32_t num_blocks = Kt / in0_block_w;
 +    const uint32_t in1_block_num_tiles = in0_block_w * combined_per_core_N;
 +
-+    TT_FATAL(half_Nt % num_cores == 0, "SwiGLU output tiles must divide across the worker grid");
-+    TT_FATAL(Kt % in0_block_w == 0, "SwiGLU K tiles must divide by the K block width");
-+    TT_FATAL(Kt % in0_mcast_w == 0, "SwiGLU K tiles must divide by the multicast width");
-+    TT_FATAL(combined_per_core_N > 0 && combined_per_core_N <= 8, "SwiGLU gate and up outputs must fit in DST");
++    // Cores are numbered row-major over the worker grid. Full rows form one
++    // multicast group and a partial last row forms another; the first core
++    // of each group multicasts the activation to the rest of it.
++    const uint32_t grid_x = grid.x;
++    auto core_at = [&](uint32_t i) { return CoreCoord(i % grid_x, i / grid_x); };
++    std::vector<CoreRange> groups;
++    if (num_cores >= grid_x) {
++        groups.emplace_back(CoreCoord(0, 0), core_at(num_cores / grid_x * grid_x - 1));
++    }
++    if (num_cores % grid_x != 0) {
++        groups.emplace_back(core_at(num_cores / grid_x * grid_x), core_at(num_cores - 1));
++    }
++    const CoreRangeSet all_cores(groups);
 +
-+    const CoreRangeSet all_cores(std::vector<CoreRange>{
-+        CoreRange(CoreCoord(0, 0), CoreCoord(grid_x - 1, group0_y - 1)),
-+        CoreRange(CoreCoord(0, group0_y), CoreCoord(group1_x - 1, group0_y)),
-+    });
 +    const auto in0_format = tt_metal::datatype_to_dataformat_converter(a.dtype());
 +    const auto in1_format = tt_metal::datatype_to_dataformat_converter(b.dtype());
 +    const auto output_format = tt_metal::datatype_to_dataformat_converter(output.dtype());
-+    const uint32_t in0_tile_size = tt::tile_size(in0_format);
-+    const uint32_t in1_tile_size = tt::tile_size(in1_format);
-+    const uint32_t output_tile_size = tt::tile_size(output_format);
-+
 +    ProgramDescriptor desc;
-+    auto add_cb = [&](uint32_t index, uint32_t tiles, tt::DataFormat format, uint32_t page_size) {
++    auto add_cb = [&](uint32_t index, uint32_t tiles, tt::DataFormat format) {
++        const uint32_t page_size = tt::tile_size(format);
 +        desc.cbs.push_back(CBDescriptor{
 +            .total_size = tiles * page_size,
 +            .core_ranges = all_cores,
 +            .format_descriptors = {{CBFormatDescriptor{
-+                .buffer_index = index,
-+                .data_format = format,
-+                .page_size = page_size,
-+            }}},
++                .buffer_index = index, .data_format = format, .page_size = page_size}}},
 +        });
 +    };
-+    // The activation block stays resident for the whole reduction.
-+    add_cb(tt::CBIndex::c_0, Kt, in0_format, in0_tile_size);
-+    add_cb(tt::CBIndex::c_1, in1_buffers * in1_block_num_tiles, in1_format, in1_tile_size);
-+    add_cb(tt::CBIndex::c_2, in1_buffers * in1_block_num_tiles, in1_format, in1_tile_size);
-+    add_cb(tt::CBIndex::c_16, per_core_N, output_format, output_tile_size);
++    add_cb(tt::CBIndex::c_0, Kt, in0_format);
++    // Even weight K blocks arrive on RISCV_0's NOC and odd blocks on RISCV_1's.
++    add_cb(tt::CBIndex::c_1, in1_buffers * in1_block_num_tiles, in1_format);
++    add_cb(tt::CBIndex::c_2, in1_buffers * in1_block_num_tiles, in1_format);
++    add_cb(tt::CBIndex::c_16, per_core_N, output_format);
 +
 +    constexpr uint32_t sender_sem_id = 0;
 +    constexpr uint32_t receiver_sem_id = 1;
-+    const CoreCoord sender_core0(0, 0);
-+    const CoreCoord sender_core1(0, group0_y);
-+    const CoreRangeSet sender_cores0(CoreRange(sender_core0, sender_core0));
-+    const CoreRangeSet sender_cores1(CoreRange(sender_core1, sender_core1));
-+    const CoreRangeSet receiver_cores(std::vector<CoreRange>{
-+        CoreRange(CoreCoord(1, 0), CoreCoord(grid_x - 1, 0)),
-+        CoreRange(CoreCoord(0, 1), CoreCoord(grid_x - 1, group0_y - 1)),
-+        CoreRange(CoreCoord(1, group0_y), CoreCoord(group1_x - 1, group0_y)),
-+    });
-+    auto* device = &a.mutable_device();
-+    const auto sender_physical0 = device->worker_core_from_logical_core(sender_core0);
-+    const auto sender_physical1 = device->worker_core_from_logical_core(sender_core1);
-+    auto mcast_start0 = device->worker_core_from_logical_core(CoreCoord(0, 0));
-+    auto mcast_end0 = device->worker_core_from_logical_core(CoreCoord(grid_x - 1, group0_y - 1));
-+    auto mcast_start1 = device->worker_core_from_logical_core(CoreCoord(0, group0_y));
-+    auto mcast_end1 = device->worker_core_from_logical_core(CoreCoord(group1_x - 1, group0_y));
-+    const auto in0_noc = tt::tt_metal::detail::preferred_noc_for_dram_write(device->arch());
-+    const auto in1_noc = tt::tt_metal::detail::preferred_noc_for_dram_read(device->arch());
-+    if (in0_noc == tt::tt_metal::NOC::NOC_1) {
-+        auto tmp = mcast_start0;
-+        mcast_start0 = mcast_end0;
-+        mcast_end0 = tmp;
-+        tmp = mcast_start1;
-+        mcast_start1 = mcast_end1;
-+        mcast_end1 = tmp;
-+    }
-+
-+    std::vector<uint32_t> in0_sender_compile_args;
-+    tt::tt_metal::TensorAccessorArgs(a).append_to(in0_sender_compile_args);
-+    tt::tt_metal::TensorAccessorArgs(b).append_to(in0_sender_compile_args);
-+    std::vector<uint32_t> in0_receiver_compile_args;
-+    tt::tt_metal::TensorAccessorArgs(b).append_to(in0_receiver_compile_args);
-+    const std::vector<std::pair<std::string, uint32_t>> weight_split_args = {
-+        {"cb_weights2", tt::CBIndex::c_2},
-+        {"half_Nt", half_Nt},
-+        {"per_core_N", per_core_N},
-+        {"in0_block_w", in0_block_w},
-+        {"dual_noc", dual_noc},
-+    };
-+    auto make_sender_desc = [&](const CoreRangeSet& sender_cores, uint32_t num_dests) {
-+        KernelDescriptor sender_desc;
-+        sender_desc.kernel_source =
-+            "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp";
-+        sender_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
-+        sender_desc.core_ranges = sender_cores;
-+        sender_desc.compile_time_args = in0_sender_compile_args;
-+        sender_desc.named_compile_time_args = {
-+            {"cb_in0", tt::CBIndex::c_0},
-+            {"Kt", Kt},
-+            {"in0_mcast_w", in0_mcast_w},
-+            {"num_dests", num_dests},
-+            {"sender_sem", sender_sem_id},
-+            {"receiver_sem", receiver_sem_id},
-+        };
-+        sender_desc.named_compile_time_args.insert(
-+            sender_desc.named_compile_time_args.end(), weight_split_args.begin(), weight_split_args.end());
-+        sender_desc.config = tt::tt_metal::DataMovementConfigDescriptor{
-+            .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc};
-+        return sender_desc;
-+    };
-+    auto in0_sender_desc0 = make_sender_desc(sender_cores0, grid_x * group0_y - 1);
-+    auto in0_sender_desc1 = make_sender_desc(sender_cores1, group1_x - 1);
-+    in0_sender_desc0.emplace_runtime_args(
-+        sender_core0,
-+        {a,
-+         static_cast<uint32_t>(mcast_start0.x),
-+         static_cast<uint32_t>(mcast_start0.y),
-+         static_cast<uint32_t>(mcast_end0.x),
-+         static_cast<uint32_t>(mcast_end0.y),
-+         b,
-+         0u});
-+    in0_sender_desc1.emplace_runtime_args(
-+        sender_core1,
-+        {a,
-+         static_cast<uint32_t>(mcast_start1.x),
-+         static_cast<uint32_t>(mcast_start1.y),
-+         static_cast<uint32_t>(mcast_end1.x),
-+         static_cast<uint32_t>(mcast_end1.y),
-+         b,
-+         static_cast<uint32_t>(sender_core1.y * grid_x + sender_core1.x)});
-+
-+    KernelDescriptor in0_receiver_desc;
-+    in0_receiver_desc.kernel_source =
-+        "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp";
-+    in0_receiver_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
-+    in0_receiver_desc.core_ranges = receiver_cores;
-+    in0_receiver_desc.named_compile_time_args = {
-+        {"cb_in0", tt::CBIndex::c_0},
-+        {"Kt", Kt},
-+        {"in0_mcast_w", in0_mcast_w},
-+        {"sender_sem", sender_sem_id},
-+        {"receiver_sem", receiver_sem_id},
-+    };
-+    in0_receiver_desc.named_compile_time_args.insert(
-+        in0_receiver_desc.named_compile_time_args.end(), weight_split_args.begin(), weight_split_args.end());
-+    in0_receiver_desc.compile_time_args = in0_receiver_compile_args;
-+    in0_receiver_desc.config = tt::tt_metal::DataMovementConfigDescriptor{
-+        .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = in0_noc};
-+
-+    std::vector<uint32_t> reader_compile_time_args;
-+    tt::tt_metal::TensorAccessorArgs(b).append_to(reader_compile_time_args);
-+    tt::tt_metal::TensorAccessorArgs(output).append_to(reader_compile_time_args);
-+    KernelDescriptor reader_desc;
-+    reader_desc.kernel_source =
-+        "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp";
-+    reader_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
-+    reader_desc.core_ranges = all_cores;
-+    reader_desc.compile_time_args = reader_compile_time_args;
-+    reader_desc.named_compile_time_args = {
-+        {"cb_weights", tt::CBIndex::c_1},
-+        {"cb_out", tt::CBIndex::c_16},
-+        {"Kt", Kt},
-+        {"half_Nt", half_Nt},
-+        {"per_core_N", per_core_N},
-+        {"in0_block_w", in0_block_w},
-+        {"dual_noc", dual_noc},
-+    };
-+    reader_desc.config = tt::tt_metal::DataMovementConfigDescriptor{
-+        .processor = tt_metal::DataMovementProcessor::RISCV_0, .noc = in1_noc};
-+
-+    for (uint32_t i = 0; i < num_cores; ++i) {
-+        CoreCoord core{i % grid_x, i / grid_x};
-+        reader_desc.emplace_runtime_args(core, {b, output, i});
-+        const bool group0 = core.y < group0_y;
-+        const auto group_sender = group0 ? sender_core0 : sender_core1;
-+        const auto group_sender_physical = group0 ? sender_physical0 : sender_physical1;
-+        if (core != group_sender) {
-+            in0_receiver_desc.emplace_runtime_args(
-+                core,
-+                {static_cast<uint32_t>(group_sender_physical.x),
-+                 static_cast<uint32_t>(group_sender_physical.y),
-+                 b,
-+                 i});
-+        }
-+    }
 +    desc.semaphores.push_back(tt::tt_metal::SemaphoreDescriptor{
 +        .id = sender_sem_id, .core_ranges = all_cores, .initial_value = 0});
 +    desc.semaphores.push_back(tt::tt_metal::SemaphoreDescriptor{
 +        .id = receiver_sem_id, .core_ranges = all_cores, .initial_value = 0});
-+    desc.kernels.push_back(std::move(in0_sender_desc0));
-+    desc.kernels.push_back(std::move(in0_sender_desc1));
-+    desc.kernels.push_back(std::move(in0_receiver_desc));
-+    desc.kernels.push_back(std::move(reader_desc));
++
++    const auto in0_noc = tt::tt_metal::detail::preferred_noc_for_dram_write(device->arch());
++    const auto in1_noc = tt::tt_metal::detail::preferred_noc_for_dram_read(device->arch());
++    const std::vector<std::pair<std::string, uint32_t>> common_args = {
++        {"cb_in0", tt::CBIndex::c_0},
++        {"cb_weights", tt::CBIndex::c_1},
++        {"cb_weights2", tt::CBIndex::c_2},
++        {"cb_out", tt::CBIndex::c_16},
++        {"Kt", Kt},
++        {"half_Nt", half_Nt},
++        {"per_core_N", per_core_N},
++        {"in0_block_w", in0_block_w},
++        {"in0_mcast_w", in0_mcast_w},
++        {"sender_sem", sender_sem_id},
++        {"receiver_sem", receiver_sem_id},
++    };
++    auto make_kernel = [&](const char* name, std::vector<uint32_t> compile_args,
++                           tt_metal::DataMovementProcessor processor, tt::tt_metal::NOC noc) {
++        KernelDescriptor kernel;
++        kernel.kernel_source =
++            std::string("ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/") + name;
++        kernel.source_type = KernelDescriptor::SourceType::FILE_PATH;
++        kernel.compile_time_args = std::move(compile_args);
++        kernel.named_compile_time_args = common_args;
++        kernel.config = tt::tt_metal::DataMovementConfigDescriptor{.processor = processor, .noc = noc};
++        return kernel;
++    };
++
++    std::vector<uint32_t> reader_args;
++    tt::tt_metal::TensorAccessorArgs(b).append_to(reader_args);
++    tt::tt_metal::TensorAccessorArgs(output).append_to(reader_args);
++    auto reader = make_kernel(
++        "reader_matmul_swiglu.cpp", reader_args, tt_metal::DataMovementProcessor::RISCV_0, in1_noc);
++    reader.core_ranges = all_cores;
++    std::vector<uint32_t> sender_args;
++    tt::tt_metal::TensorAccessorArgs(a).append_to(sender_args);
++    tt::tt_metal::TensorAccessorArgs(b).append_to(sender_args);
++    auto sender = make_kernel(
++        "reader_matmul_swiglu_in0_sender.cpp", sender_args, tt_metal::DataMovementProcessor::RISCV_1, in0_noc);
++    std::vector<uint32_t> receiver_args;
++    tt::tt_metal::TensorAccessorArgs(b).append_to(receiver_args);
++    auto receiver = make_kernel(
++        "reader_matmul_swiglu_in0_receiver.cpp", receiver_args, tt_metal::DataMovementProcessor::RISCV_1, in0_noc);
++
++    std::vector<CoreRange> sender_ranges;
++    std::vector<CoreRange> receiver_ranges;
++    for (const auto& group : groups) {
++        sender_ranges.emplace_back(group.start_coord, group.start_coord);
++        const uint32_t first = group.start_coord.y * grid_x + group.start_coord.x;
++        const uint32_t last = group.end_coord.y * grid_x + group.end_coord.x;
++        auto start = device->worker_core_from_logical_core(group.start_coord);
++        auto end = device->worker_core_from_logical_core(group.end_coord);
++        const auto sender_physical = start;
++        if (in0_noc == tt::tt_metal::NOC::NOC_1) {
++            std::swap(start, end);
++        }
++        sender.emplace_runtime_args(
++            group.start_coord,
++            {a,
++             static_cast<uint32_t>(start.x),
++             static_cast<uint32_t>(start.y),
++             static_cast<uint32_t>(end.x),
++             static_cast<uint32_t>(end.y),
++             last - first,
++             b,
++             first});
++        for (uint32_t i = first + 1; i <= last; ++i) {
++            receiver_ranges.emplace_back(core_at(i), core_at(i));
++            receiver.emplace_runtime_args(
++                core_at(i),
++                {static_cast<uint32_t>(sender_physical.x), static_cast<uint32_t>(sender_physical.y), b, i});
++        }
++    }
++    for (uint32_t i = 0; i < num_cores; ++i) {
++        reader.emplace_runtime_args(core_at(i), {b, output, i});
++    }
++    sender.core_ranges = CoreRangeSet(sender_ranges);
++    desc.kernels.push_back(std::move(reader));
++    desc.kernels.push_back(std::move(sender));
++    if (!receiver_ranges.empty()) {
++        receiver.core_ranges = CoreRangeSet(receiver_ranges).merge_ranges();
++        desc.kernels.push_back(std::move(receiver));
++    }
 +
 +    TT_FATAL(operation_attributes.compute_kernel_config.has_value(), "SwiGLU compute config is required");
 +    auto [math_fidelity, math_approx_mode, fp32_dest_acc_en, packer_l1_acc, dst_full_sync_en] =
-+        get_compute_kernel_config_args(a.mutable_device().arch(), operation_attributes.compute_kernel_config.value());
++        get_compute_kernel_config_args(device->arch(), operation_attributes.compute_kernel_config.value());
 +    TT_FATAL(fp32_dest_acc_en && dst_full_sync_en && !packer_l1_acc, "SwiGLU requires full FP32 DST accumulation");
-+
-+    KernelDescriptor compute_desc;
-+    compute_desc.kernel_source =
-+        "ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp";
-+    compute_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
-+    compute_desc.core_ranges = all_cores;
-+    compute_desc.compile_time_args = {
-+        in0_block_w,
-+        in0_block_w,
-+        in1_block_num_tiles,
-+        per_core_N,
-+        num_blocks,
-+    };
-+    compute_desc.named_compile_time_args = {
-+        {"cb_in0", tt::CBIndex::c_0},
-+        {"cb_weights", tt::CBIndex::c_1},
-+        {"cb_out", tt::CBIndex::c_16},
-+        {"cb_weights2", tt::CBIndex::c_2},
-+        {"dual_noc", dual_noc},
-+    };
-+    compute_desc.config = ComputeConfigDescriptor{
++    KernelDescriptor compute;
++    compute.kernel_source = "ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp";
++    compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
++    compute.core_ranges = all_cores;
++    compute.compile_time_args = {in0_block_w, in0_block_w, in1_block_num_tiles, per_core_N, num_blocks};
++    compute.named_compile_time_args = common_args;
++    compute.config = ComputeConfigDescriptor{
 +        .math_fidelity = math_fidelity,
 +        .fp32_dest_acc_en = true,
 +        .dst_full_sync_en = dst_full_sync_en,
 +        .math_approx_mode = math_approx_mode};
-+    desc.kernels.push_back(std::move(compute_desc));
++    desc.kernels.push_back(std::move(compute));
 +    return desc;
 +}
 +
@@ -256,23 +197,47 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
 --- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.hpp
-@@ -18,4 +18,12 @@
-         const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
- };
+@@ -4,6 +4,8 @@
  
-+struct MatmulSwiGLUProgramFactory {
-+    static tt::tt_metal::ProgramDescriptor create_descriptor(
-+        const ttnn::prim::MatmulParams& operation_attributes,
-+        const ttnn::prim::MatmulInputs& tensor_args,
+ #pragma once
+ 
++#include <optional>
++
+ #include "ttnn/device_operation.hpp"
+ #include "ttnn/operations/matmul/device/matmul_device_operation_types.hpp"
+ #include <tt-metalium/program_descriptors.hpp>
+@@ -14,6 +16,27 @@
+     static tt::tt_metal::ProgramDescriptor create_descriptor(
+         const ttnn::prim::MatmulParams& operation_attributes,
+         const ttnn::prim::MatmulInputs& tensor_args,
 +        std::vector<ttnn::Tensor>& tensor_return_value,
 +        const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
 +};
 +
- }  // namespace ttnn::prim
++// Core layout of the fused SwiGLU decode projection: output tiles split over
++// num_cores cores, per_core_N gate and per_core_N up tiles each.
++struct SwiGLULayout {
++    uint32_t num_cores;
++    uint32_t per_core_N;
++    uint32_t in0_block_w;
++    uint32_t in0_mcast_w;
++};
++
++// Layout for Kt activation tiles and half_Nt output tiles on a grid of
++// num_worker_cores, or nullopt if the fused program cannot handle the shape.
++std::optional<SwiGLULayout> swiglu_layout(uint32_t Kt, uint32_t half_Nt, uint32_t num_worker_cores);
++
++struct MatmulSwiGLUProgramFactory {
++    static tt::tt_metal::ProgramDescriptor create_descriptor(
++        const ttnn::prim::MatmulParams& operation_attributes,
++        const ttnn::prim::MatmulInputs& tensor_args,
+         std::vector<ttnn::Tensor>& tensor_return_value,
+         const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
+ };
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,62 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -293,7 +258,6 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.
 +    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
 +    constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
 +    constexpr uint32_t cb_weights2 = get_named_compile_time_arg_val("cb_weights2");
-+    constexpr bool dual_noc = get_named_compile_time_arg_val("dual_noc");
 +    constexpr uint32_t combined_per_core_N = 2 * per_core_N;
 +    constexpr uint32_t out_subblock_w = 2;
 +    static_assert(combined_per_core_N > 0 && combined_per_core_N <= 8, "gate and up must fit in DST");
@@ -303,8 +267,8 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.
 +    // Both projections fit in DST; retain them across all K blocks.
 +    tile_regs_acquire();
 +    for (uint32_t block = 0; block < num_blocks; ++block) {
-+        // With the dual-NOC split, odd K blocks arrive through the second CB.
-+        const uint32_t cb_block = (dual_noc && (block & 1)) ? cb_weights2 : cb_weights;
++        // Odd K blocks arrive through the second NOC's CB.
++        const uint32_t cb_block = (block & 1) ? cb_weights2 : cb_weights;
 +        cb_wait_front(cb_in0, in0_block_tiles);
 +        cb_wait_front(cb_block, in1_block_tiles);
 +        for (uint32_t k = 0; k < in0_block_w; ++k) {
@@ -369,7 +333,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,49 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -379,8 +343,8 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +#include "api/dataflow/circular_buffer.h"
 +#include "matmul_swiglu_weights.hpp"
 +
-+// Streams the even K blocks of this core's weights (all blocks without the
-+// dual-NOC split), then writes the SwiGLU output tiles.
++// Streams the even K blocks of this core's weights on RISCV_0's NOC, then
++// writes the SwiGLU output tiles.
 +void kernel_main() {
 +    const uint32_t weight_addr = get_arg_val<uint32_t>(0);
 +    const uint32_t output_addr = get_arg_val<uint32_t>(1);
@@ -392,7 +356,6 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
 +    constexpr uint32_t per_core_N = get_named_compile_time_arg_val("per_core_N");
 +    constexpr uint32_t in0_block_w = get_named_compile_time_arg_val("in0_block_w");
-+    constexpr uint32_t block_stride = get_named_compile_time_arg_val("dual_noc") ? 2 : 1;
 +    constexpr uint32_t in1_block_tiles = in0_block_w * 2 * per_core_N;
 +
 +    constexpr auto weight_args = TensorAccessorArgs<0>();
@@ -401,7 +364,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    const auto output = TensorAccessor(output_args, output_addr);
 +    const uint32_t n_start = core_n * per_core_N;
 +
-+    for (uint32_t k0 = 0; k0 < Kt; k0 += block_stride * in0_block_w) {
++    for (uint32_t k0 = 0; k0 < Kt; k0 += 2 * in0_block_w) {
 +        cb_reserve_back(cb_weights, in1_block_tiles);
 +        read_swiglu_weight_block<in0_block_w, per_core_N, half_Nt>(
 +            weight, k0, n_start, get_write_ptr(cb_weights), get_tile_size(cb_weights));
@@ -423,7 +386,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,67 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -449,7 +412,6 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
 +    constexpr uint32_t per_core_N = get_named_compile_time_arg_val("per_core_N");
 +    constexpr uint32_t in0_block_w = get_named_compile_time_arg_val("in0_block_w");
-+    constexpr bool dual_noc = get_named_compile_time_arg_val("dual_noc");
 +    constexpr uint32_t num_chunks = Kt / in0_mcast_w;
 +    constexpr uint32_t in1_block_tiles = in0_block_w * 2 * per_core_N;
 +    constexpr auto weight_args = TensorAccessorArgs<0>();
@@ -468,11 +430,11 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    receiver_sem.set(0);
 +    sender_sem.up(noc, sender_x, sender_y, 1);
 +
-+    // Publish activation chunks as they land. With the dual-NOC split, also
-+    // stream the odd weight K blocks on this RISC's NOC, but never block on
-+    // weight CB space while activation chunks are still pending.
++    // Publish activation chunks as they land, and stream the odd weight K
++    // blocks on this RISC's NOC without blocking on weight CB space while
++    // activation chunks are still pending.
 +    uint32_t chunks = 0;
-+    uint32_t k0 = dual_noc ? in0_block_w : Kt;
++    uint32_t k0 = in0_block_w;
 +    while (chunks < num_chunks || k0 < Kt) {
 +        if (chunks < num_chunks) {
 +            invalidate_l1_cache();
@@ -495,7 +457,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,95 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -511,28 +473,27 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +// The whole activation row block stays resident in every core's L1. After a
 +// single readiness handshake, stream it in chunks: the DRAM read of the next
 +// chunk overlaps the multicast of the current one, and a counting semaphore
-+// tells receivers how many chunks have landed. With the dual-NOC split, the
-+// odd weight K blocks for this core follow on the same RISC.
++// tells receivers how many chunks have landed. The odd weight K blocks for
++// this core follow on the same RISC.
 +void kernel_main() {
 +    const uint32_t input_addr = get_arg_val<uint32_t>(0);
 +    const uint32_t dest_start_x = get_arg_val<uint32_t>(1);
 +    const uint32_t dest_start_y = get_arg_val<uint32_t>(2);
 +    const uint32_t dest_end_x = get_arg_val<uint32_t>(3);
 +    const uint32_t dest_end_y = get_arg_val<uint32_t>(4);
-+    const uint32_t weight_addr = get_arg_val<uint32_t>(5);
-+    const uint32_t core_n = get_arg_val<uint32_t>(6);
++    const uint32_t num_dests = get_arg_val<uint32_t>(5);
++    const uint32_t weight_addr = get_arg_val<uint32_t>(6);
++    const uint32_t core_n = get_arg_val<uint32_t>(7);
 +
 +    constexpr uint32_t cb_in0_id = get_named_compile_time_arg_val("cb_in0");
 +    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights2");
 +    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
 +    constexpr uint32_t in0_mcast_w = get_named_compile_time_arg_val("in0_mcast_w");
-+    constexpr uint32_t num_dests = get_named_compile_time_arg_val("num_dests");
 +    constexpr uint32_t sender_sem_id = get_named_compile_time_arg_val("sender_sem");
 +    constexpr uint32_t receiver_sem_id = get_named_compile_time_arg_val("receiver_sem");
 +    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
 +    constexpr uint32_t per_core_N = get_named_compile_time_arg_val("per_core_N");
 +    constexpr uint32_t in0_block_w = get_named_compile_time_arg_val("in0_block_w");
-+    constexpr bool dual_noc = get_named_compile_time_arg_val("dual_noc");
 +    constexpr uint32_t in1_block_tiles = in0_block_w * 2 * per_core_N;
 +    constexpr auto input_args = TensorAccessorArgs<0>();
 +    constexpr auto weight_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
@@ -566,29 +527,29 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +        if (chunk + 1 < num_chunks) {
 +            read_chunk(chunk + 1);
 +        }
-+        const uint32_t addr = base + chunk * chunk_bytes;
-+        MulticastEndpoint mcast_dst;
-+        noc.async_write_multicast(
-+            CoreLocalMem<uint32_t>(addr), mcast_dst, chunk_bytes, num_dests, {},
-+            {.noc_x_start = dest_start_x, .noc_y_start = dest_start_y,
-+             .noc_x_end = dest_end_x, .noc_y_end = dest_end_y, .addr = addr}, true);
++        if (num_dests > 0) {
++            const uint32_t addr = base + chunk * chunk_bytes;
++            MulticastEndpoint mcast_dst;
++            noc.async_write_multicast(
++                CoreLocalMem<uint32_t>(addr), mcast_dst, chunk_bytes, num_dests, {},
++                {.noc_x_start = dest_start_x, .noc_y_start = dest_start_y,
++                 .noc_x_end = dest_end_x, .noc_y_end = dest_end_y, .addr = addr}, true);
 +#ifdef ARCH_BLACKHOLE
-+        noc.async_writes_flushed();
++            noc.async_writes_flushed();
 +#endif
-+        receiver_sem.set(chunk + 1);
-+        receiver_sem.set_multicast(
-+            noc, dest_start_x, dest_start_y, dest_end_x, dest_end_y, num_dests);
++            receiver_sem.set(chunk + 1);
++            receiver_sem.set_multicast(
++                noc, dest_start_x, dest_start_y, dest_end_x, dest_end_y, num_dests);
++        }
 +        cb_in0.push_back(in0_mcast_w);
 +        noc.async_read_barrier();
 +    }
-+    if constexpr (dual_noc) {
-+        for (uint32_t k0 = in0_block_w; k0 < Kt; k0 += 2 * in0_block_w) {
-+            cb_reserve_back(cb_weights, in1_block_tiles);
-+            read_swiglu_weight_block<in0_block_w, per_core_N, half_Nt>(
-+                weight, k0, n_start, get_write_ptr(cb_weights), get_tile_size(cb_weights));
-+            noc_async_read_barrier();
-+            cb_push_back(cb_weights, in1_block_tiles);
-+        }
++    for (uint32_t k0 = in0_block_w; k0 < Kt; k0 += 2 * in0_block_w) {
++        cb_reserve_back(cb_weights, in1_block_tiles);
++        read_swiglu_weight_block<in0_block_w, per_core_N, half_Nt>(
++            weight, k0, n_start, get_write_ptr(cb_weights), get_tile_size(cb_weights));
++        noc_async_read_barrier();
++        cb_push_back(cb_weights, in1_block_tiles);
 +    }
 +    noc.async_write_barrier();
 +}
@@ -605,21 +566,20 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
      const auto& config = operation_attributes.program_config.value();
  
      return std::visit(
-@@ -2122,6 +2125,34 @@
+@@ -2122,6 +2125,30 @@
      // ---- universal checks, part 1: independent of the chosen program config ----
      validate_matmul_operand_basics(input_tensor_a, input_tensor_b, in0_tile, in1_tile);
      validate_matmul_matrix_dimensions(a_shape, b_shape, a_shape_padded, b_shape_padded, in0_tile, in1_tile);
 +    if (attributes.fused_swiglu) {
 +        TT_FATAL(!attributes.transpose_a && !attributes.transpose_b, "SwiGLU matmul does not support transpose");
 +        TT_FATAL(a_shape.size() == 2 && b_shape.size() == 2 && a_shape[-2] > 0 &&
-+                     a_shape[-2] <= TILE_HEIGHT && a_shape_padded[-2] == TILE_HEIGHT,
++                     a_shape_padded[-2] == TILE_HEIGHT,
 +                 "SwiGLU matmul supports a single tile row only");
-+        // The factory uses 96 cores, or a 10x10 grid when 96 does not divide.
-+        const uint32_t half_Nt = b_shape[-1] / TILE_WIDTH / 2;
-+        const bool use_100_cores = half_Nt % 96 != 0;
-+        const uint32_t num_cores = use_100_cores ? 100 : 96;
-+        TT_FATAL(b_shape[-1] % (2 * TILE_WIDTH) == 0 && half_Nt % num_cores == 0,
-+                 "SwiGLU matmul half width must divide evenly across the worker grid");
++        TT_FATAL(a_shape[-1] % TILE_WIDTH == 0 && b_shape[-1] % (2 * TILE_WIDTH) == 0,
++                 "SwiGLU matmul needs tile-aligned K and up/gate halves");
++        const auto grid = input_tensor_a.device()->compute_with_storage_grid_size();
++        TT_FATAL(swiglu_layout(a_shape[-1] / TILE_WIDTH, b_shape[-1] / TILE_WIDTH / 2, grid.x * grid.y).has_value(),
++                 "SwiGLU matmul shape does not fit the fused program on this worker grid");
 +        TT_FATAL(input_tensor_a.dtype() == DataType::BFLOAT16 &&
 +                     input_tensor_b.dtype() == DataType::BFLOAT8_B &&
 +                     attributes.output_dtype == DataType::BFLOAT16,
@@ -631,16 +591,13 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
 +        TT_FATAL(optional_input_tensors.size() == 1 && !optional_input_tensors[0].has_value() &&
 +                     args.optional_output_tensors.size() == 1 && !args.optional_output_tensors[0].has_value(),
 +                 "SwiGLU matmul does not support bias or caller-provided output");
-+        auto grid = input_tensor_a.device()->compute_with_storage_grid_size();
-+        TT_FATAL(use_100_cores ? (grid.x >= 10 && grid.y >= 10) : (grid.x >= 11 && grid.y >= 9),
-+                 "SwiGLU matmul requires a 10x10 or 11x9 worker grid for its selected layout");
 +        return;
 +    }
 +
      validate_matmul_bfloat4_tile_dims(input_tensor_a, input_tensor_b, in0_tile, in1_tile);
      validate_matmul_optional_tensors(attributes, args);
  
-@@ -2281,8 +2312,13 @@
+@@ -2281,8 +2308,13 @@
      const auto& input_tensor_b = input_tensors.at(1);
  
      // Use the compute_matmul_output_shape function to get the output shape
@@ -655,7 +612,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
  
      const auto& a_shape_padded =
          operations::matmul::utilities::get_matmul_tensor_padded_shape(input_tensor_a, attributes.transpose_a);
-@@ -2757,7 +2793,8 @@
+@@ -2757,7 +2789,8 @@
          parameters.transpose_b,
          output_tile,
          parameters.global_cb,

@@ -1,4 +1,4 @@
-"""Check fused SwiGLU projections and unsupported-shape fallbacks."""
+"""Check fused SwiGLU decode projections across widths and reduction sizes."""
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +19,10 @@ import pytest
         (1, 5120, 12800),
         (32, 512, 6400),
         (2, 512, 12800),
+        # A prime tile count, Qwen3-14B's TP2 width, and a partial core row.
+        (1, 64, 3104),
+        (1, 96, 8704),
+        (1, 512, 256),
     ],
 )
 def test_swiglu_projection_width(rows, inner_size, width, tmp_path):
@@ -53,10 +57,8 @@ def test_swiglu_projection_width(rows, inner_size, width, tmp_path):
             np.asarray(actual).astype(np.float32), expected, atol=0.01, rtol=0.04
         )
 
-    # A numerical pass alone could also come from the unfused fallback.
-    # Verify that the new shapes actually exercise the fused runtime.
-    if width in (6400, 12800):
-        assert any(
-            "ttnn.fused_swiglu" in path.read_text()
-            for path in (tmp_path / "irs").glob("ttnn*.mlir")
-        ), "Qwen3-32B projection did not select fused SwiGLU"
+    # A numerical pass alone could also come from the unfused path.
+    assert any(
+        "ttnn.fused_swiglu" in path.read_text()
+        for path in (tmp_path / "irs").glob("ttnn*.mlir")
+    ), "projection did not select fused SwiGLU"
