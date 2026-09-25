@@ -59,6 +59,12 @@ def main() -> int:
 
         jax._src.__path__.append(str(source_helpers))
 
+    # Upstream tests assert that no test replaces the global compilation cache
+    # or changes config, which creating the cache on first use would do.
+    from jax._src import compilation_cache
+
+    compilation_cache._initialize_cache()
+
     if not args.skip_device_check:
         import jax
 
