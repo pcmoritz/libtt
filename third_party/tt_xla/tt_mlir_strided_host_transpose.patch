@@ -1,0 +1,133 @@
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -26,8 +26,12 @@
+ 
+ #include "tracy/Tracy.hpp"
+ 
++#include <algorithm>
+ #include <cstring>
+ #include <memory>
++#include <thread>
++
++#include "hwy/highway.h"
+ #include <numeric>
+ #include <optional>
+ #include <variant>
+@@ -64,6 +68,97 @@ static bool isContiguous(const std::vector<std::uint32_t> &shape,
+   return true;
+ }
+ 
++namespace hn = hwy::HWY_NAMESPACE;
++
++// One round of an 8x8 transpose: interleaves vector i with vector i + 4 at the
++// lane width of `d`, into positions 2i (low halves) and 2i + 1 (high halves).
++template <class D, class V>
++static inline void interleaveRound(D d, V (&v)[8]) {
++  const hn::Repartition<std::uint64_t, D> d64;
++  V t[8];
++  HWY_UNROLL(4)
++  for (int i = 0; i < 4; ++i) {
++    const auto a = hn::BitCast(d, v[i]);
++    const auto b = hn::BitCast(d, v[i + 4]);
++    t[2 * i] = hn::BitCast(d64, hn::InterleaveLower(d, a, b));
++    t[2 * i + 1] = hn::BitCast(d64, hn::InterleaveUpper(d, a, b));
++  }
++  HWY_UNROLL(8)
++  for (int i = 0; i < 8; ++i) {
++    v[i] = t[i];
++  }
++}
++
++// Transposes an 8x8 block of 16-bit values: reads 8 source columns of 8
++// contiguous rows each, writes 8 output rows of 8 columns each. Rounds of 16,
++// 32 and 64-bit interleaves transpose rows loaded in bit-reversed order.
++static inline void transpose8x8(const std::uint16_t *src, std::int64_t srcStride,
++                                std::uint16_t *dst, std::int64_t dstStride) {
++  constexpr int kBitReversed[8] = {0, 4, 2, 6, 1, 5, 3, 7};
++  const hn::FixedTag<std::uint16_t, 8> d16;
++  const hn::Repartition<std::uint32_t, decltype(d16)> d32;
++  const hn::Repartition<std::uint64_t, decltype(d16)> d64;
++  hn::Vec<decltype(d64)> v[8];
++  HWY_UNROLL(8)
++  for (int i = 0; i < 8; ++i) {
++    v[i] = hn::BitCast(d64, hn::LoadU(d16, src + kBitReversed[i] * srcStride));
++  }
++  interleaveRound(d16, v);
++  interleaveRound(d32, v);
++  interleaveRound(d64, v);
++  HWY_UNROLL(8)
++  for (int i = 0; i < 8; ++i) {
++    hn::StoreU(hn::BitCast(d16, v[i]), d16, dst + i * dstStride);
++  }
++}
++
++// Transposes a column-major 16-bit matrix (element (r, c) at
++// src[r + c * colStride]) into row-major `out`, in 64x64 tiles of 8x8 blocks,
++// on up to eight threads. Within a tile, each group of 8 output rows is written
++// left to right, in 128-byte runs per row. `rows` and `cols` must be multiples
++// of 8.
++static void transpose16(const std::uint16_t *src, std::int64_t colStride,
++                        std::uint16_t *out, std::int64_t rows,
++                        std::int64_t cols) {
++  constexpr std::int64_t kTile = 64;
++  // Tiles start at 128-byte source boundaries when the source is 16-byte
++  // aligned (the first tile is shorter), so each tile reads whole cache lines.
++  const auto address = reinterpret_cast<std::uintptr_t>(src);
++  const std::int64_t head =
++      address % 16 == 0 ? (128 - address % 128) % 128 / 2 : 0;
++  const auto copyRows = [&](std::int64_t rowBegin, std::int64_t rowEnd) {
++    for (std::int64_t r0 = rowBegin; r0 < rowEnd;) {
++      const std::int64_t r1 = std::min(
++          r0 < head ? head : head + (r0 - head) / kTile * kTile + kTile, rowEnd);
++      for (std::int64_t c0 = 0; c0 < cols; c0 += kTile) {
++        for (std::int64_t r = r0; r < r1; r += 8) {
++          for (std::int64_t c = c0; c < std::min(c0 + kTile, cols); c += 8) {
++            transpose8x8(src + r + c * colStride, colStride,
++                         out + r * cols + c, cols);
++          }
++        }
++      }
++      r0 = r1;
++    }
++  };
++
++  // At least 4M elements (8 MB) per thread; row bands stay multiples of 8.
++  const std::int64_t numThreads =
++      std::clamp<std::int64_t>(rows * cols / (4 << 20), 1, 8);
++  if (numThreads == 1) {
++    copyRows(0, rows);
++    return;
++  }
++  std::vector<std::thread> threads;
++  for (std::int64_t t = 0; t < numThreads; ++t) {
++    threads.emplace_back(copyRows, rows * t / numThreads / 8 * 8,
++                         rows * (t + 1) / numThreads / 8 * 8);
++  }
++  for (std::thread &thread : threads) {
++    thread.join();
++  }
++}
++
+ // Gathers a strided host buffer into a dense, contiguous byte buffer.
+ static std::shared_ptr<std::byte[]>
+ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
+@@ -86,6 +181,19 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
+   }
+   const size_t runBytes = runElements * itemsize;
+ 
++  // A transposed 16-bit matrix (e.g. `w.T` of a bf16 weight, possibly with
++  // size-one dimensions) would take one memcpy per element.
++  if (itemsize == 2 && runElements == 1 && numDims >= 2 &&
++      stride[numDims - 2] == 1 && shape[numDims - 2] % 8 == 0 &&
++      shape[numDims - 1] % 8 == 0 &&
++      std::all_of(shape.begin(), shape.begin() + numDims - 2,
++                  [](std::uint32_t n) { return n == 1; })) {
++    transpose16(static_cast<const std::uint16_t *>(data), stride[numDims - 1],
++                reinterpret_cast<std::uint16_t *>(out.get()),
++                shape[numDims - 2], shape[numDims - 1]);
++    return out;
++  }
++
+   // `stride` is signed: a negative stride (e.g. a reversed view) walks backward
+   // from `data`, which points at the first logical element.
+   const std::byte *src = static_cast<const std::byte *>(data);

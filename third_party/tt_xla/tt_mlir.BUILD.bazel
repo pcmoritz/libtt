@@ -1363,6 +1363,7 @@ cc_library(
         "include",
     ],
     deps = _TTMLIR_COMMON_DEPS + [
+        "@highway//:hwy",
         "@tt_metal//:ttnn_tensor_upstream",
         "@tt_metal//:ttnn_distributed_tensor_upstream",
     ],

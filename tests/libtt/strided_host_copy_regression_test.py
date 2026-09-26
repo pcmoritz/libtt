@@ -15,6 +15,7 @@ VIEWS = {
     "reversed": lambda x: x[::-1, ::-1],
     "inner_slice_3d": lambda x: x.reshape(4, 16, 64)[:, 2:10, 16:48],
     "singleton_axis": lambda x: x[:, 8:40, None],
+    "transpose_singleton": lambda x: x.T[:, :, None],
 }
 
 
