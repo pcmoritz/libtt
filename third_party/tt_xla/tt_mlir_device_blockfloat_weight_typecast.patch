@@ -1,0 +1,48 @@
+--- a/lib/Dialect/TTNN/Transforms/TTNNWeightDtypeConversion.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNWeightDtypeConversion.cpp
+@@ -99,38 +99,13 @@ public:
+     auto newWeightType =
+         ttnn::utils::RankedTensorTypeFactory::create(weightType, dtype);
+ 
+-    // Blockfloat targets (BFP_BFloat4, BFP_BFloat8) go through a host-side
+-    // typecast via: from_device → typecast (host) → to_device.
+-    // The host typecast dispatches to tt-metal's host packer for BFP
+-    // formats. Const-eval results are cached at compile time, so the
+-    // host roundtrip is paid once per cached weight per program.
+-    //
+-    // Other targets (e.g. BFloat16 per-tensor override) keep the existing
+-    // single-`typecast` device codepath.
+-    mlir::Value newWeight;
+-    if (dtype == ttcore::DataType::BFP_BFloat4 ||
+-        dtype == ttcore::DataType::BFP_BFloat8) {
+-      auto hostInputType = ttnn::utils::RankedTensorTypeFactory::create(
+-          mlir::cast<RankedTensorType>(weight.getType()),
+-          ttnn::BufferType::SystemMemory);
+-      auto fromDevOp =
+-          rewriter.create<FromDeviceOp>(op.getLoc(), hostInputType, weight);
+-
+-      auto hostOutputType =
+-          ttnn::utils::RankedTensorTypeFactory::create(hostInputType, dtype);
+-      auto typecastOp = rewriter.create<TypecastOp>(op.getLoc(), hostOutputType,
+-                                                    fromDevOp.getResult());
+-
+-      mlir::Value device = ttnn::utils::getOrInsertDevice(rewriter, op);
+-      auto toDevOp = rewriter.create<ToDeviceOp>(
+-          op.getLoc(), newWeightType, typecastOp.getResult(), device);
+-      newWeight = toDevOp.getResult();
+-    } else {
+-      // Single device typecast for non-blockfloat targets.
+-      auto typecastOp =
+-          rewriter.create<TypecastOp>(op.getLoc(), newWeightType, weight);
+-      newWeight = typecastOp.getResult();
+-    }
++    // Convert on device, blockfloat targets included: the weight is already
++    // tiled on device, and a host typecast would read it back and upload it
++    // again. The device packer rounds ties away from zero where the host packer
++    // rounds them to even; both are within half a mantissa step.
++    auto typecastOp =
++        rewriter.create<TypecastOp>(op.getLoc(), newWeightType, weight);
++    mlir::Value newWeight = typecastOp.getResult();
+ 
+     // Update op to use the new weight. The per-op "ttcore.weight_dtype"
+     // attribute is intentionally kept: the greedy rewriter may re-match this

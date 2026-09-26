@@ -1,0 +1,172 @@
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -26,8 +26,14 @@
+ 
+ #include "tracy/Tracy.hpp"
+ 
++#include <algorithm>
+ #include <cstring>
+ #include <memory>
++#include <thread>
++
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#endif
+ #include <numeric>
+ #include <optional>
+ #include <variant>
+@@ -64,6 +70,114 @@ static bool isContiguous(const std::vector<std::uint32_t> &shape,
+   return true;
+ }
+ 
++#if defined(__SSE2__)
++// Transposes an 8x8 block of 16-bit values: reads 8 source columns of 8
++// contiguous rows each, writes 8 output rows of 8 columns each.
++static inline void transpose8x8(const std::uint16_t *src, std::int64_t srcStride,
++                                std::uint16_t *dst, std::int64_t dstStride) {
++  __m128i a[8], b[8], c[8];
++  for (int i = 0; i < 8; ++i) {
++    a[i] = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + i * srcStride));
++  }
++  for (int i = 0; i < 4; ++i) {
++    b[2 * i] = _mm_unpacklo_epi16(a[2 * i], a[2 * i + 1]);
++    b[2 * i + 1] = _mm_unpackhi_epi16(a[2 * i], a[2 * i + 1]);
++  }
++  for (int i = 0; i < 2; ++i) {
++    c[4 * i + 0] = _mm_unpacklo_epi32(b[4 * i + 0], b[4 * i + 2]);
++    c[4 * i + 1] = _mm_unpackhi_epi32(b[4 * i + 0], b[4 * i + 2]);
++    c[4 * i + 2] = _mm_unpacklo_epi32(b[4 * i + 1], b[4 * i + 3]);
++    c[4 * i + 3] = _mm_unpackhi_epi32(b[4 * i + 1], b[4 * i + 3]);
++  }
++  for (int i = 0; i < 4; ++i) {
++    _mm_storeu_si128(reinterpret_cast<__m128i *>(dst + (2 * i) * dstStride),
++                     _mm_unpacklo_epi64(c[i], c[i + 4]));
++    _mm_storeu_si128(
++        reinterpret_cast<__m128i *>(dst + (2 * i + 1) * dstStride),
++        _mm_unpackhi_epi64(c[i], c[i + 4]));
++  }
++}
++#endif
++
++// Copies a transposed view into `out`: the last two dimensions are gathered
++// with a cache-blocked transpose (source stride 1 along dimension -2), in
++// parallel over row blocks. Outer dimensions may have any stride.
++template <typename T>
++static void gatherTransposed(const T *src, T *out,
++                             const std::vector<std::uint32_t> &shape,
++                             const std::vector<std::int64_t> &stride) {
++  constexpr std::int64_t kBlock = 64;
++  const size_t numDims = shape.size();
++  const std::int64_t rows = shape[numDims - 2];
++  const std::int64_t cols = shape[numDims - 1];
++  const std::int64_t colStride = stride[numDims - 1];
++  const std::int64_t rowBlocks = (rows + kBlock - 1) / kBlock;
++  std::int64_t numOuter = 1;
++  for (size_t d = 0; d + 2 < numDims; ++d) {
++    numOuter *= shape[d];
++  }
++
++  const auto copyTasks = [&](std::int64_t begin, std::int64_t end) {
++    for (std::int64_t task = begin; task < end; ++task) {
++      std::int64_t outer = task / rowBlocks;
++      const std::int64_t r0 = (task % rowBlocks) * kBlock;
++      const std::int64_t r1 = std::min(r0 + kBlock, rows);
++      std::int64_t srcOffset = 0;
++      for (size_t d = numDims - 2; d-- > 0;) {
++        srcOffset += (outer % shape[d]) * stride[d];
++        outer /= shape[d];
++      }
++      const T *matrix = src + srcOffset;
++      T *dst = out + (task / rowBlocks) * rows * cols;
++      for (std::int64_t c0 = 0; c0 < cols; c0 += kBlock) {
++        const std::int64_t c1 = std::min(c0 + kBlock, cols);
++#if defined(__SSE2__)
++        if constexpr (sizeof(T) == 2) {
++          if (r1 - r0 == kBlock && c1 - c0 == kBlock) {
++            for (std::int64_t c = c0; c < c1; c += 8) {
++              for (std::int64_t r = r0; r < r1; r += 8) {
++                transpose8x8(reinterpret_cast<const std::uint16_t *>(
++                                 matrix + r + c * colStride),
++                             colStride,
++                             reinterpret_cast<std::uint16_t *>(dst + r * cols + c),
++                             cols);
++              }
++            }
++            continue;
++          }
++        }
++#endif
++        for (std::int64_t c = c0; c < c1; ++c) {
++          const T *column = matrix + c * colStride;
++          for (std::int64_t r = r0; r < r1; ++r) {
++            dst[r * cols + c] = column[r];
++          }
++        }
++      }
++    }
++  };
++
++  const std::int64_t numTasks = numOuter * rowBlocks;
++  constexpr std::int64_t minBytesPerThread = 8 << 20;
++  const std::int64_t bytes = numOuter * rows * cols * sizeof(T);
++  const std::int64_t numThreads = std::max<std::int64_t>(
++      1, std::min<std::int64_t>({std::thread::hardware_concurrency(), 8,
++                                 bytes / minBytesPerThread, numTasks}));
++  if (numThreads == 1) {
++    copyTasks(0, numTasks);
++    return;
++  }
++  std::vector<std::thread> threads;
++  threads.reserve(numThreads);
++  for (std::int64_t t = 0; t < numThreads; ++t) {
++    threads.emplace_back(copyTasks, numTasks * t / numThreads,
++                         numTasks * (t + 1) / numThreads);
++  }
++  for (std::thread &thread : threads) {
++    thread.join();
++  }
++}
++
+ // Gathers a strided host buffer into a dense, contiguous byte buffer.
+ static std::shared_ptr<std::byte[]>
+ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
+@@ -86,6 +200,39 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
+   }
+   const size_t runBytes = runElements * itemsize;
+ 
++  // A transposed view (e.g. `w.T`) would take one memcpy per element. Any
++  // trailing size-one dimensions skipped above do not change the order.
++  if (runElements == 1 && numDims >= 2 && stride[numDims - 2] == 1) {
++    const std::vector<std::uint32_t> denseShape(shape.begin(),
++                                                shape.begin() + numDims);
++    const std::vector<std::int64_t> denseStride(stride.begin(),
++                                                stride.begin() + numDims);
++    switch (itemsize) {
++    case 1:
++      gatherTransposed(static_cast<const std::uint8_t *>(data),
++                       reinterpret_cast<std::uint8_t *>(out.get()), denseShape,
++                       denseStride);
++      return out;
++    case 2:
++      gatherTransposed(static_cast<const std::uint16_t *>(data),
++                       reinterpret_cast<std::uint16_t *>(out.get()), denseShape,
++                       denseStride);
++      return out;
++    case 4:
++      gatherTransposed(static_cast<const std::uint32_t *>(data),
++                       reinterpret_cast<std::uint32_t *>(out.get()), denseShape,
++                       denseStride);
++      return out;
++    case 8:
++      gatherTransposed(static_cast<const std::uint64_t *>(data),
++                       reinterpret_cast<std::uint64_t *>(out.get()), denseShape,
++                       denseStride);
++      return out;
++    default:
++      break;
++    }
++  }
++
+   // `stride` is signed: a negative stride (e.g. a reversed view) walks backward
+   // from `data`, which points at the first logical element.
+   const std::byte *src = static_cast<const std::byte *>(data);
