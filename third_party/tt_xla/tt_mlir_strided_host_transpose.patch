@@ -1,6 +1,6 @@
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -26,8 +26,14 @@
+@@ -26,8 +26,12 @@
  
  #include "tracy/Tracy.hpp"
  
@@ -9,44 +9,65 @@
  #include <memory>
 +#include <thread>
 +
-+#if defined(__SSE2__)
-+#include <emmintrin.h>
-+#endif
++#include "hwy/highway.h"
  #include <numeric>
  #include <optional>
  #include <variant>
-@@ -64,6 +70,114 @@ static bool isContiguous(const std::vector<std::uint32_t> &shape,
+@@ -64,6 +68,135 @@ static bool isContiguous(const std::vector<std::uint32_t> &shape,
    return true;
  }
  
-+#if defined(__SSE2__)
++namespace hn = hwy::HWY_NAMESPACE;
++
 +// Transposes an 8x8 block of 16-bit values: reads 8 source columns of 8
-+// contiguous rows each, writes 8 output rows of 8 columns each.
++// contiguous rows each, writes 8 output rows of 8 columns each. 16-bit, then
++// 32-bit, then 64-bit interleaves of 128-bit vectors do the transpose.
 +static inline void transpose8x8(const std::uint16_t *src, std::int64_t srcStride,
 +                                std::uint16_t *dst, std::int64_t dstStride) {
-+  __m128i a[8], b[8], c[8];
-+  for (int i = 0; i < 8; ++i) {
-+    a[i] = _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + i * srcStride));
-+  }
-+  for (int i = 0; i < 4; ++i) {
-+    b[2 * i] = _mm_unpacklo_epi16(a[2 * i], a[2 * i + 1]);
-+    b[2 * i + 1] = _mm_unpackhi_epi16(a[2 * i], a[2 * i + 1]);
-+  }
-+  for (int i = 0; i < 2; ++i) {
-+    c[4 * i + 0] = _mm_unpacklo_epi32(b[4 * i + 0], b[4 * i + 2]);
-+    c[4 * i + 1] = _mm_unpackhi_epi32(b[4 * i + 0], b[4 * i + 2]);
-+    c[4 * i + 2] = _mm_unpacklo_epi32(b[4 * i + 1], b[4 * i + 3]);
-+    c[4 * i + 3] = _mm_unpackhi_epi32(b[4 * i + 1], b[4 * i + 3]);
-+  }
-+  for (int i = 0; i < 4; ++i) {
-+    _mm_storeu_si128(reinterpret_cast<__m128i *>(dst + (2 * i) * dstStride),
-+                     _mm_unpacklo_epi64(c[i], c[i + 4]));
-+    _mm_storeu_si128(
-+        reinterpret_cast<__m128i *>(dst + (2 * i + 1) * dstStride),
-+        _mm_unpackhi_epi64(c[i], c[i + 4]));
-+  }
++  const hn::FixedTag<std::uint16_t, 8> d16;
++  const hn::Repartition<std::uint32_t, decltype(d16)> d32;
++  const hn::Repartition<std::uint64_t, decltype(d16)> d64;
++  const auto a0 = hn::LoadU(d16, src + 0 * srcStride);
++  const auto a1 = hn::LoadU(d16, src + 1 * srcStride);
++  const auto a2 = hn::LoadU(d16, src + 2 * srcStride);
++  const auto a3 = hn::LoadU(d16, src + 3 * srcStride);
++  const auto a4 = hn::LoadU(d16, src + 4 * srcStride);
++  const auto a5 = hn::LoadU(d16, src + 5 * srcStride);
++  const auto a6 = hn::LoadU(d16, src + 6 * srcStride);
++  const auto a7 = hn::LoadU(d16, src + 7 * srcStride);
++  const auto b0 = hn::BitCast(d32, hn::InterleaveLower(d16, a0, a1));
++  const auto b1 = hn::BitCast(d32, hn::InterleaveUpper(d16, a0, a1));
++  const auto b2 = hn::BitCast(d32, hn::InterleaveLower(d16, a2, a3));
++  const auto b3 = hn::BitCast(d32, hn::InterleaveUpper(d16, a2, a3));
++  const auto b4 = hn::BitCast(d32, hn::InterleaveLower(d16, a4, a5));
++  const auto b5 = hn::BitCast(d32, hn::InterleaveUpper(d16, a4, a5));
++  const auto b6 = hn::BitCast(d32, hn::InterleaveLower(d16, a6, a7));
++  const auto b7 = hn::BitCast(d32, hn::InterleaveUpper(d16, a6, a7));
++  const auto c0 = hn::BitCast(d64, hn::InterleaveLower(d32, b0, b2));
++  const auto c1 = hn::BitCast(d64, hn::InterleaveUpper(d32, b0, b2));
++  const auto c2 = hn::BitCast(d64, hn::InterleaveLower(d32, b1, b3));
++  const auto c3 = hn::BitCast(d64, hn::InterleaveUpper(d32, b1, b3));
++  const auto c4 = hn::BitCast(d64, hn::InterleaveLower(d32, b4, b6));
++  const auto c5 = hn::BitCast(d64, hn::InterleaveUpper(d32, b4, b6));
++  const auto c6 = hn::BitCast(d64, hn::InterleaveLower(d32, b5, b7));
++  const auto c7 = hn::BitCast(d64, hn::InterleaveUpper(d32, b5, b7));
++  hn::StoreU(hn::BitCast(d16, hn::InterleaveLower(d64, c0, c4)), d16,
++             dst + 0 * dstStride);
++  hn::StoreU(hn::BitCast(d16, hn::InterleaveUpper(d64, c0, c4)), d16,
++             dst + 1 * dstStride);
++  hn::StoreU(hn::BitCast(d16, hn::InterleaveLower(d64, c1, c5)), d16,
++             dst + 2 * dstStride);
++  hn::StoreU(hn::BitCast(d16, hn::InterleaveUpper(d64, c1, c5)), d16,
++             dst + 3 * dstStride);
++  hn::StoreU(hn::BitCast(d16, hn::InterleaveLower(d64, c2, c6)), d16,
++             dst + 4 * dstStride);
++  hn::StoreU(hn::BitCast(d16, hn::InterleaveUpper(d64, c2, c6)), d16,
++             dst + 5 * dstStride);
++  hn::StoreU(hn::BitCast(d16, hn::InterleaveLower(d64, c3, c7)), d16,
++             dst + 6 * dstStride);
++  hn::StoreU(hn::BitCast(d16, hn::InterleaveUpper(d64, c3, c7)), d16,
++             dst + 7 * dstStride);
 +}
-+#endif
 +
 +// Copies a transposed view into `out`: the last two dimensions are gathered
 +// with a cache-blocked transpose (source stride 1 along dimension -2), in
@@ -80,7 +101,6 @@
 +      T *dst = out + (task / rowBlocks) * rows * cols;
 +      for (std::int64_t c0 = 0; c0 < cols; c0 += kBlock) {
 +        const std::int64_t c1 = std::min(c0 + kBlock, cols);
-+#if defined(__SSE2__)
 +        if constexpr (sizeof(T) == 2) {
 +          if (r1 - r0 == kBlock && c1 - c0 == kBlock) {
 +            for (std::int64_t c = c0; c < c1; c += 8) {
@@ -95,7 +115,6 @@
 +            continue;
 +          }
 +        }
-+#endif
 +        for (std::int64_t c = c0; c < c1; ++c) {
 +          const T *column = matrix + c * colStride;
 +          for (std::int64_t r = r0; r < r1; ++r) {
@@ -130,7 +149,7 @@
  // Gathers a strided host buffer into a dense, contiguous byte buffer.
  static std::shared_ptr<std::byte[]>
  gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
-@@ -86,6 +200,39 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
+@@ -86,6 +219,39 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
    }
    const size_t runBytes = runElements * itemsize;
  

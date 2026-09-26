@@ -1,6 +1,7 @@
 module(name = "libtt", version = "0.1.0")
 
 bazel_dep(name = "bazel_skylib", version = "1.8.2")
+bazel_dep(name = "highway", version = "1.4.0")
 bazel_dep(name = "numactl", version = "2.0.19.bcr.1")
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "protobuf", version = "33.4", repo_name = "com_google_protobuf")
