@@ -1,0 +1,67 @@
+--- a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+@@ -76,9 +76,64 @@
+       }
+       rewriter.eraseOp(op);
+     }
++    foldHostBlockfloatTypecasts(module, rewriter);
+   }
+ 
+ private:
++  // A blockfloat weight conversion of a host row-major tensor decomposes to
++  //   to_device -> to_layout(TILE) -> from_device -> typecast(bfp, host).
++  // Typecast the host input directly instead: the host blockfloat packer
++  // tilizes while packing, so the tensor never makes the device round-trip.
++  void foldHostBlockfloatTypecasts(ModuleOp module,
++                                   IRRewriter &rewriter) const {
++    llvm::SmallVector<ttnn::TypecastOp> typecasts;
++    module->walk([&](ttnn::TypecastOp op) { typecasts.push_back(op); });
++    for (ttnn::TypecastOp typecast : typecasts) {
++      auto fromDevice = typecast.getInput().getDefiningOp<ttnn::FromDeviceOp>();
++      if (!fromDevice || !fromDevice->hasOneUse()) {
++        continue;
++      }
++      auto toLayout = fromDevice.getInput().getDefiningOp<ttnn::ToLayoutOp>();
++      if (!toLayout || !toLayout->hasOneUse()) {
++        continue;
++      }
++      auto toDevice = toLayout.getInput().getDefiningOp<ttnn::ToDeviceOp>();
++      if (!toDevice || !toDevice->hasOneUse()) {
++        continue;
++      }
++
++      mlir::Value hostInput = toDevice.getInput();
++      auto inputType = mlir::cast<RankedTensorType>(hostInput.getType());
++      auto input = mlir::cast<TTNNLayoutAttr>(inputType.getEncoding());
++      auto tiled = mlir::cast<TTNNLayoutAttr>(
++          toLayout.getResult().getType().getEncoding());
++      auto output = mlir::cast<TTNNLayoutAttr>(
++          typecast.getResult().getType().getEncoding());
++      bool blockfloat =
++          output.getDataType() == ttcore::DataType::BFP_BFloat8 ||
++          output.getDataType() == ttcore::DataType::BFP_BFloat4;
++      if (!blockfloat || !input.isSystemBufferType() || input.isTiled() ||
++          !tiled.isTiled() || !output.isSystemBufferType() ||
++          input.getDataType() != tiled.getDataType()) {
++        continue;
++      }
++      // The host packer cannot pad, so the shape must be tile aligned.
++      ArrayRef<int64_t> shape = inputType.getShape();
++      if (shape.size() < 2 || shape[shape.size() - 2] % TILE_HEIGHT != 0 ||
++          shape.back() % TILE_WIDTH != 0) {
++        continue;
++      }
++
++      rewriter.setInsertionPoint(typecast);
++      mlir::Value hostCast = createOp<ttnn::TypecastOp>(
++          rewriter, typecast.getResult().getType(), hostInput);
++      rewriter.replaceOp(typecast, hostCast);
++      rewriter.eraseOp(fromDevice);
++      rewriter.eraseOp(toLayout);
++      rewriter.eraseOp(toDevice);
++    }
++  }
++
+   //===--------------------------------------------------------------------===//
+   // CPU-hoist boundary detection.
+   //===--------------------------------------------------------------------===//

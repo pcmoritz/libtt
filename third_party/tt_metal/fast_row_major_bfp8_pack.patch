@@ -1,0 +1,145 @@
+diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_format/blockfloat_common.cpp
+--- tt_metal/impl/data_format/blockfloat_common.cpp
++++ tt_metal/impl/data_format/blockfloat_common.cpp
+@@ -443,6 +443,89 @@
+ 
+ }  // namespace
+ 
++std::vector<uint32_t> pack_row_major_bfloat16_as_bfp8_b_tiles(
++    ttsl::Span<const bfloat16> input_data, uint32_t height, uint32_t width) {
++    constexpr uint32_t tile_height = tt::constants::TILE_HEIGHT;
++    constexpr uint32_t tile_width = tt::constants::TILE_WIDTH;
++    constexpr uint32_t face_height = tt::constants::FACE_HEIGHT;
++    constexpr uint32_t face_width = tt::constants::FACE_WIDTH;
++    constexpr uint32_t faces_per_row = tile_width / face_width;
++    constexpr uint32_t rows_per_tile = (tile_height / face_height) * faces_per_row * face_height;
++    constexpr uint32_t exponent_words_per_tile = rows_per_tile / 4;
++    constexpr uint32_t words_per_tile = exponent_words_per_tile + tile_height * tile_width / 4;
++
++    TT_FATAL(
++        height % tile_height == 0 && width % tile_width == 0 &&
++            input_data.size() == static_cast<size_t>(height) * width,
++        "Row-major Bfp8_b packing needs a tile-aligned {}x{} matrix, got {} values",
++        height,
++        width,
++        input_data.size());
++    const uint32_t tile_rows = height / tile_height;
++    const uint32_t tiles_per_row = width / tile_width;
++    std::vector<uint32_t> packed_result(static_cast<size_t>(tile_rows) * tiles_per_row * words_per_tile);
++
++    // Same packing as pack_tiled_bfloat16_as_bfp8_b, but each face row is read
++    // straight from the row-major matrix, so no tilized copy is needed.
++    const auto pack_tile_rows = [&](uint32_t begin, uint32_t end) {
++        for (uint32_t tile_row = begin; tile_row < end; ++tile_row) {
++            for (uint32_t tile_col = 0; tile_col < tiles_per_row; ++tile_col) {
++                uint32_t* const tile_output =
++                    packed_result.data() + (static_cast<size_t>(tile_row) * tiles_per_row + tile_col) * words_per_tile;
++                uint32_t* const data_output = tile_output + exponent_words_per_tile;
++                for (uint32_t row = 0; row < rows_per_tile; ++row) {
++                    const uint32_t face = row / face_height;
++                    const size_t matrix_row =
++                        static_cast<size_t>(tile_row) * tile_height + (face / faces_per_row) * face_height +
++                        row % face_height;
++                    const size_t matrix_col = static_cast<size_t>(tile_col) * tile_width + (face % faces_per_row) * face_width;
++                    const bfloat16* const row_input = input_data.data() + matrix_row * width + matrix_col;
++
++                    uint32_t shared_exp = 0;
++                    for (uint32_t col = 0; col < face_width; ++col) {
++                        const uint16_t bits = std::bit_cast<uint16_t>(row_input[col]);
++                        shared_exp = std::max(shared_exp, static_cast<uint32_t>((bits & 0x7f80) >> 7));
++                    }
++                    tile_output[row / 4] |= shared_exp << ((row % 4) * 8);
++                    for (uint32_t group = 0; group < face_width / 4; ++group) {
++                        uint32_t packed_word = 0;
++                        for (uint32_t i = 0; i < 4; ++i) {
++                            const uint16_t bits = std::bit_cast<uint16_t>(row_input[group * 4 + i]);
++                            packed_word |= static_cast<uint32_t>(pack_bfloat16_as_bfp8_b(bits, shared_exp)) << (i * 8);
++                        }
++                        data_output[row * (face_width / 4) + group] = packed_word;
++                    }
++                }
++            }
++        }
++    };
++
++    constexpr uint32_t min_tiles_per_thread = 512;
++    constexpr uint32_t max_threads = 8;
++    const uint32_t thread_count = std::min<uint32_t>(
++        {std::max(1u, std::thread::hardware_concurrency()),
++         max_threads,
++         std::max(1u, tile_rows * tiles_per_row / min_tiles_per_thread),
++         std::max(1u, tile_rows)});
++    if (thread_count == 1) {
++        pack_tile_rows(0, tile_rows);
++        return packed_result;
++    }
++
++    (void)bfloat16_to_bfp8_b_lut();
++    std::vector<std::thread> threads;
++    threads.reserve(thread_count);
++    for (uint32_t thread_index = 0; thread_index < thread_count; ++thread_index) {
++        const uint32_t begin = static_cast<uint64_t>(tile_rows) * thread_index / thread_count;
++        const uint32_t end = static_cast<uint64_t>(tile_rows) * (thread_index + 1) / thread_count;
++        threads.emplace_back([&, begin, end] { pack_tile_rows(begin, end); });
++    }
++    for (auto& thread : threads) {
++        thread.join();
++    }
++    return packed_result;
++}
++
+ template <tt::DataFormat BfpFormat>
+ std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles(
+     ttsl::Span<const float> fp32_vec,
+diff --git tt_metal/impl/data_format/blockfloat_common.hpp tt_metal/impl/data_format/blockfloat_common.hpp
+--- tt_metal/impl/data_format/blockfloat_common.hpp
++++ tt_metal/impl/data_format/blockfloat_common.hpp
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ #include <stdint.h>
++#include <tt-metalium/bfloat16.hpp>
+ #include <tt-metalium/tile.hpp>
+ #include <tt-metalium/tt_backend_api_types.hpp>
+ #include <tt_stl/span.hpp>
+@@ -33,6 +34,11 @@
+     bool is_exp_a,
+     const std::optional<tt::tt_metal::Tile>& tile = std::nullopt);
+ 
++// Packs a tile-aligned `height` x `width` row-major bfloat16 matrix into 32x32
++// Bfp8_b tiles, tilizing on the fly.
++std::vector<uint32_t> pack_row_major_bfloat16_as_bfp8_b_tiles(
++    ttsl::Span<const bfloat16> input_data, uint32_t height, uint32_t width);
++
+ template <tt::DataFormat BfpFormat, typename T>
+ std::vector<uint32_t> pack_as_bfp_tiles(
+     ttsl::Span<const T> input_data,
+diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
+--- tt_metal/impl/tensor/tensor_apis.cpp
++++ tt_metal/impl/tensor/tensor_apis.cpp
+@@ -12,6 +12,7 @@
+ #include <unordered_set>
+ 
+ #include "host_tensor_impl.hpp"
++#include "impl/data_format/blockfloat_common.hpp"
+ #include "mesh_tensor_impl.hpp"
+ 
+ #include <tt-metalium/bfloat16.hpp>
+@@ -445,6 +446,17 @@
+             ttsl::Span<const SrcType> data = buffer.view_as<const SrcType>();
+             std::vector<SrcType> tilized_data;  // empty if `data` is already in tile layout.
+             if (input_tensor_spec.layout() == Layout::ROW_MAJOR) {
++                if constexpr (std::is_same_v<SrcType, bfloat16> && std::is_same_v<DstType, bfloat8_tag>) {
++                    // Fused tilize + pack, skipping the tilized copy.
++                    const auto& tile = output_spec.tile();
++                    const auto shape = output_spec.physical_shape();
++                    if (tile.get_tile_shape() == std::array<uint32_t, 2>{32, 32} &&
++                        tile.get_face_shape() == std::array<uint32_t, 2>{16, 16} &&
++                        data.size() == shape.height() * shape.width()) {
++                        return tt::tt_metal::HostBuffer(
++                            pack_row_major_bfloat16_as_bfp8_b_tiles(data, shape.height(), shape.width()));
++                    }
++                }
+                 tilized_data =
+                     tensor_impl::to_tile_major_layout(output_spec.physical_shape(), output_spec.tile(), data);
+                 data = ttsl::make_const_span(tilized_data);
