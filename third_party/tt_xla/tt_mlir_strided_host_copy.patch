@@ -1,6 +1,6 @@
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -65,31 +65,36 @@
+@@ -65,31 +65,38 @@ static bool isContiguous(const std::vector<std::uint32_t> &shape,
  }
  
  // Gathers a strided host buffer into a dense, contiguous byte buffer.
@@ -22,10 +22,12 @@
 -  const size_t numDims = shape.size();
 -  std::vector<std::int64_t> idx(numDims, 0);
 +  // Copy the longest dense suffix of dimensions with each memcpy, e.g. whole
-+  // rows of a column slice.
++  // rows of a column slice. Size-one dimensions have arbitrary strides and do
++  // not break the suffix, as in isContiguous().
 +  size_t numDims = shape.size();
 +  std::int64_t runElements = 1;
-+  while (numDims > 0 && stride[numDims - 1] == runElements) {
++  while (numDims > 0 &&
++         (shape[numDims - 1] == 1 || stride[numDims - 1] == runElements)) {
 +    runElements *= shape[--numDims];
 +  }
 +  const size_t runBytes = runElements * itemsize;
@@ -49,7 +51,7 @@
  
      for (size_t d = numDims; d-- > 0;) {
        if (++idx[d] < shape[d]) {
-@@ -102,19 +107,31 @@
+@@ -102,19 +109,31 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
    return out;
  }
  
@@ -85,7 +87,7 @@
    }
  
    if (!::tt::runtime::utils::isSupportedDataType(dataType)) {
-@@ -131,13 +148,15 @@
+@@ -131,13 +150,15 @@ createOwnedTTNNTensor(const void *data, const std::vector<std::uint32_t> &shape,
      std::uint32_t itemSizeToUse =
          ::tt::runtime::utils::dataTypeElementSize(dataTypeToUse);
  
@@ -104,7 +106,7 @@
    }
  
    ::ttnn::Shape ttnnShape(shape);
-@@ -145,20 +164,20 @@
+@@ -145,20 +166,20 @@ createOwnedTTNNTensor(const void *data, const std::vector<std::uint32_t> &shape,
  
    switch (ttnnDataType) {
    case ::ttnn::DataType::FLOAT32:
