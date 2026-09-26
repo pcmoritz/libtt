@@ -500,6 +500,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_dynamic_slice_index_dtype.patch",
         "//third_party/tt_xla:tt_mlir_local_mesh.patch",
         "//third_party/tt_xla:tt_mlir_local_mesh_scalar.patch",
+        "//third_party/tt_xla:tt_mlir_strided_host_copy.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
