@@ -13,7 +13,7 @@
  #include <numeric>
  #include <optional>
  #include <variant>
-@@ -64,6 +68,93 @@ static bool isContiguous(const std::vector<std::uint32_t> &shape,
+@@ -64,6 +68,97 @@ static bool isContiguous(const std::vector<std::uint32_t> &shape,
    return true;
  }
  
@@ -94,6 +94,10 @@
 +  // At least 4M elements (8 MB) per thread; row bands stay multiples of 8.
 +  const std::int64_t numThreads =
 +      std::clamp<std::int64_t>(rows * cols / (4 << 20), 1, 8);
++  if (numThreads == 1) {
++    copyRows(0, rows);
++    return;
++  }
 +  std::vector<std::thread> threads;
 +  for (std::int64_t t = 0; t < numThreads; ++t) {
 +    threads.emplace_back(copyRows, rows * t / numThreads / 8 * 8,
@@ -107,7 +111,7 @@
  // Gathers a strided host buffer into a dense, contiguous byte buffer.
  static std::shared_ptr<std::byte[]>
  gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
-@@ -86,6 +177,19 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
+@@ -86,6 +181,19 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
    }
    const size_t runBytes = runElements * itemsize;
  
