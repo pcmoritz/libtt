@@ -54,32 +54,26 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
  
      return failure();
-@@ -355,15 +372,18 @@
+@@ -355,15 +371,15 @@
    }
  
    LogicalResult
 -  matchAndRewriteInternalArgMax(mlir::stablehlo::ReduceOp &srcOp,
 -                                mlir::stablehlo::ReduceOp::Adaptor &adaptor,
 -                                ConversionPatternRewriter &rewriter) const {
-+  matchAndRewriteInternalArgMax(
-+      mlir::stablehlo::ReduceOp &srcOp, mlir::Value input,
-+      ConversionPatternRewriter &rewriter,
-+      mlir::ArrayAttr dimArg = {}) const {
++  matchAndRewriteInternalArgMax(mlir::stablehlo::ReduceOp &srcOp,
++                                mlir::Value input,
++                                ConversionPatternRewriter &rewriter) const {
      auto outputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult(1).getType()));
  
--    // Can't reuse the original dimensions attribute because it uses i64 type.
--    mlir::ArrayAttr dimArg = rewriter.getI32ArrayAttr(
--        llvm::SmallVector<int32_t>(srcOp.getDimensions()));
-+    if (!dimArg) {
-+      // Can't reuse the original dimensions attribute because it uses i64 type.
-+      dimArg = rewriter.getI32ArrayAttr(
-+          llvm::SmallVector<int32_t>(srcOp.getDimensions()));
-+    }
+     // Can't reuse the original dimensions attribute because it uses i64 type.
+     mlir::ArrayAttr dimArg = rewriter.getI32ArrayAttr(
+         llvm::SmallVector<int32_t>(srcOp.getDimensions()));
 
      // stablehlo.reduce op generates two results; the first output is maximum
      // value which is not consumed in subsequent graph and the second out is the
-@@ -375,7 +395,7 @@
+@@ -375,7 +391,7 @@
      // original op uses with the new op, and finally, erase the original op
      // explicitly.
      ttir::ArgMaxOp newOp = rewriter.create<tt::ttir::ArgMaxOp>(
@@ -88,7 +82,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
          false /* keep_dim */, dimArg);
  
      srcOp->getResults().back().replaceAllUsesWith(newOp->getResults().front());
-@@ -384,6 +404,55 @@
+@@ -384,6 +400,30 @@
      return success();
    }
  
@@ -113,38 +107,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +            srcOp->getLoc(), inputType, input);
 +      }
 +    }
-+    // TODO: Remove this permutation once tt-metal supports row-major argmax
-+    // reductions on non-last dimensions.
-+    int64_t dimension = srcOp.getDimensions().front();
-+    int64_t rank = inputType.getRank();
-+    if (dimension != rank - 1) {
-+      llvm::SmallVector<int64_t> permutation;
-+      llvm::SmallVector<int64_t> permutedShape;
-+      for (int64_t i = 0; i < rank; ++i) {
-+        if (i != dimension) {
-+          permutation.push_back(i);
-+          permutedShape.push_back(inputType.getDimSize(i));
-+        }
-+      }
-+      permutation.push_back(dimension);
-+      permutedShape.push_back(inputType.getDimSize(dimension));
-+      auto permutedType = RankedTensorType::get(
-+          permutedShape, elementType, inputType.getEncoding());
-+      reversedInput = rewriter.create<ttir::PermuteOp>(
-+          srcOp->getLoc(), permutedType, reversedInput, permutation);
-+      dimension = rank - 1;
-+    }
-+
-+    mlir::ArrayAttr dimArg = rewriter.getI32ArrayAttr(
-+        llvm::SmallVector<int32_t>{static_cast<int32_t>(dimension)});
-+    return matchAndRewriteInternalArgMax(srcOp, reversedInput, rewriter,
-+                                         dimArg);
++    return matchAndRewriteInternalArgMax(srcOp, reversedInput, rewriter);
 +  }
 +
    // This function verify all the required conditions to convert stablehlo
    // reduce op to TTIR argmax op
    // 1. Two inputs values ot the op.
-@@ -420,6 +489,45 @@
+@@ -420,6 +460,45 @@
      return true;
    }
  
@@ -190,7 +159,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Validate the inputs.
    bool hasValidArgMaxInputs(mlir::OperandRange inputs) const {
      if (inputs.size() != 2) {
-@@ -478,6 +586,22 @@
+@@ -478,6 +557,22 @@
      return true;
    }
  
@@ -213,7 +182,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Validate reducer body.
    bool hasValidArgMaxReducerBody(mlir::Region &body) const {
      auto &blocks = body.getBlocks();
-@@ -496,13 +620,29 @@
+@@ -496,13 +591,29 @@
      if (verifyTorchOpArgMaxPattern(firstOp)) {
        return true;
      }
@@ -244,7 +213,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Pattern match the ops for tt-torch ArgMax op.
    // The pattern is as follows:
    //  stablehlo.compare (GE)
-@@ -580,15 +720,16 @@ private:
+@@ -580,15 +691,16 @@ private:
    // stablehlo.select / stablehlo.maximum
    // stablehlo.select
    // stablehlo.return

@@ -508,6 +508,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_collective_lowerings.patch",
         "//third_party/tt_xla:tt_mlir_empty_meshes.patch",
         "//third_party/tt_xla:tt_mlir_sdy_reduction_kind.patch",
+        "//third_party/tt_xla:tt_mlir_argmax_last_dim.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

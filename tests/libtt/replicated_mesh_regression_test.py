@@ -48,12 +48,29 @@ def test_explicit_mesh_replicated_values():
     np.testing.assert_allclose(np.asarray(edges), np.histogram_bin_edges(values, bins=100), rtol=1e-6)
 
 
-@pytest.mark.parametrize("reduce", [jnp.min, jnp.max, jnp.sum])
+@pytest.mark.parametrize("reduce", [jnp.min, jnp.max, jnp.sum, jnp.argmin, jnp.argmax])
 @pytest.mark.parametrize("axis", [None, 0])
 def test_reduce_over_sharded_axis(reduce, axis):
-    # Shardy combines partial results with the reduction's own computation.
+    # Shardy combines partial results with the reduction's own computation;
+    # argmin and argmax gather their (value, index) partial results.
     mesh = _mesh()
     values = np.arange(8 * mesh.devices.size * 4, dtype=np.int32).reshape(-1, 4)
     x = jax.device_put(values, NamedSharding(mesh, P("x")))
     out = jax.jit(lambda v: reduce(v, axis=axis))(x)
     np.testing.assert_array_equal(np.asarray(out), np.asarray(reduce(values, axis=axis)))
+
+
+def test_argmax_over_sharded_vocab():
+    # Greedy sampling from vocab-sharded logits: the smallest index wins ties,
+    # also across devices.
+    mesh = _mesh()
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal((8, 256)) / 4).astype(jnp.bfloat16)
+    w = (rng.standard_normal((256, 512 * mesh.devices.size)) / 16).astype(jnp.bfloat16)
+    w[:, 3] = w[:, 512 * mesh.devices.size - 5] = 1
+    logits_fn = jax.jit(lambda x, w: (x @ w).astype(np.float32))
+    x = jax.device_put(x, NamedSharding(mesh, P()))
+    w = jax.device_put(w, NamedSharding(mesh, P(None, "x")))
+    logits = np.asarray(logits_fn(x, w))
+    tokens = np.asarray(jax.jit(lambda x, w: jnp.argmax(logits_fn(x, w), axis=1))(x, w))
+    np.testing.assert_array_equal(tokens, np.argmax(logits, axis=1))

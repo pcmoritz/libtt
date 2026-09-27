@@ -1,20 +1,29 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cpp b/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cpp
 --- a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cpp
-@@ -135,6 +135,31 @@
+@@ -21,6 +21,7 @@
+ #include <cassert>
+ #include <shardy/dialect/sdy/ir/constants.h>
+ #include <shardy/dialect/sdy/ir/dialect.h>
++#include <shardy/dialect/sdy/ir/utils.h>
+ 
+ namespace mlir::tt::stablehlo {
+ 
+@@ -135,6 +136,218 @@
    rewriter.create<mlir::stablehlo::ReturnOp>(loc, reductionOp.getResult());
  }
  
 +// Shardy inserts all-reduces and reduce-scatters after ops whose reduction
-+// dimensions are sharded. Partial results of a stablehlo.reduce combine with
-+// the reduce's own computation (max, min, ...); others, e.g. dot_general, sum.
-+// A variadic reduce (e.g. argmax) cannot be combined result by result.
-+static FailureOr<mlir::stablehlo::ReduceOp> getSourceReduce(Value operand) {
-+  auto reduceOp = operand.getDefiningOp<mlir::stablehlo::ReduceOp>();
-+  if (reduceOp && reduceOp->getNumResults() != 1) {
-+    return failure();
++// dimensions are sharded. Like XLA's SPMD partitioner, partial results of a
++// stablehlo.reduce combine with the reduce's own computation (max, min, ...);
++// others, e.g. dot_general, and unreduced values sum. A variadic reduce (e.g.
++// argmax) cannot be combined result by result, see reduceArgMinMax.
++static mlir::stablehlo::ReduceOp getSourceReduce(Value operand) {
++  mlir::sdy::TensorShardingAttr sharding = mlir::sdy::getSharding(operand);
++  if (sharding && !sharding.getUnreducedAxes().empty()) {
++    return nullptr;
 +  }
-+  return reduceOp;
++  return operand.getDefiningOp<mlir::stablehlo::ReduceOp>();
 +}
 +
 +template <typename SrcOp>
@@ -30,48 +39,232 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cp
 +                             srcOp.getRegion().end());
 +}
 +
++// The iota whose slice `value` is on this device, along `dim`, or null.
++static mlir::stablehlo::IotaOp getSlicedIota(Value value, int64_t dim) {
++  auto composite = value.getDefiningOp<mlir::stablehlo::CompositeOp>();
++  if (!composite || composite.getName() != "sdy.all_slice") {
++    return nullptr;
++  }
++  auto iota = composite.getOperand(0).getDefiningOp<mlir::stablehlo::IotaOp>();
++  return iota && iota.getIotaDimension() == static_cast<uint64_t>(dim) ? iota
++                                                                       : nullptr;
++}
++
++// A reduce with a single result over `dims`, combining with Op.
++template <typename Op>
++static Value reduceWith(PatternRewriter &rewriter, mlir::Location loc,
++                        Value input, Value init, int64_t dim) {
++  auto type = mlir::cast<mlir::RankedTensorType>(input.getType());
++  llvm::SmallVector<int64_t> shape(type.getShape());
++  shape.erase(shape.begin() + dim);
++  auto reduceOp = rewriter.create<mlir::stablehlo::ReduceOp>(
++      loc, TypeRange{mlir::RankedTensorType::get(shape, type.getElementType())},
++      ValueRange{input}, ValueRange{init}, rewriter.getDenseI64ArrayAttr({dim}));
++  mlir::Type scalarType = init.getType();
++  mlir::OpBuilder::InsertionGuard guard(rewriter);
++  mlir::Block *block = rewriter.createBlock(
++      &reduceOp.getBody(), {}, {scalarType, scalarType}, {loc, loc});
++  rewriter.create<mlir::stablehlo::ReturnOp>(
++      loc, rewriter
++               .create<Op>(loc, block->getArgument(0), block->getArgument(1))
++               .getResult());
++  return reduceOp.getResult(0);
++}
++
++// The index of the extreme value along `dim` with `reduceOp`'s argmin/argmax
++// reducer: the index result of a reduce over (input, iota), which tt-mlir
++// lowers to ttir.argmax as long as the value result stays unused.
++static Value argMinMax(PatternRewriter &rewriter, mlir::Location loc,
++                       mlir::stablehlo::ReduceOp reduceOp, Value input,
++                       int64_t dim) {
++  auto type = mlir::cast<mlir::RankedTensorType>(input.getType());
++  auto indexType = mlir::cast<mlir::RankedTensorType>(
++      reduceOp.getResult(1).getType());
++  Value iota = rewriter.create<mlir::stablehlo::IotaOp>(
++      loc, mlir::RankedTensorType::get(type.getShape(),
++                                       indexType.getElementType()),
++      dim);
++  llvm::SmallVector<int64_t> shape(type.getShape());
++  shape.erase(shape.begin() + dim);
++  auto argReduce = rewriter.create<mlir::stablehlo::ReduceOp>(
++      loc,
++      TypeRange{mlir::RankedTensorType::get(shape, type.getElementType()),
++                mlir::RankedTensorType::get(shape, indexType.getElementType())},
++      ValueRange{input, iota}, reduceOp.getInitValues(),
++      rewriter.getDenseI64ArrayAttr({dim}));
++  rewriter.cloneRegionBefore(reduceOp.getBody(), argReduce.getBody(),
++                             argReduce.getBody().end());
++  return argReduce.getResult(1);
++}
++
++// Combines an argmin/argmax (a reduce over values and a sliced iota) over a
++// dimension sharded along one mesh axis. As in XLA, each device finds its
++// extreme value and global index, both are gathered, and the reducer picks
++// the winning device; the earliest device wins ties, which holds the smallest
++// index. Each step is a single-result reduce or an argmax that tt-mlir lowers.
++static LogicalResult
++reduceArgMinMax(mlir::sdy::AllReduceOp srcOp, mlir::stablehlo::ReduceOp reduceOp,
++                mlir::tt::shardy_utils::MeshMap &meshMap,
++                mlir::stablehlo::ChannelHandleAttr channelHandleAttr,
++                PatternRewriter &rewriter) {
++  if (reduceOp->getNumResults() != 2 || reduceOp.getDimensions().size() != 1 ||
++      srcOp.getReductionAxes().size() != 1) {
++    return rewriter.notifyMatchFailure(
++        srcOp, "only argmin/argmax over one mesh axis can be all-reduced");
++  }
++  int64_t dim = reduceOp.getDimensions()[0];
++  // argmax starts from the lowest value, argmin from the highest.
++  auto init = reduceOp.getInitValues()[0]
++                  .getDefiningOp<mlir::stablehlo::ConstantOp>();
++  if (!getSlicedIota(reduceOp.getInputs()[1], dim) || !init) {
++    return rewriter.notifyMatchFailure(
++        srcOp, "only argmin/argmax over one mesh axis can be all-reduced");
++  }
++  mlir::Attribute initValue = init.getValue().getSplatValue<mlir::Attribute>();
++  bool isMax;
++  if (auto floatInit = mlir::dyn_cast<mlir::FloatAttr>(initValue)) {
++    isMax = floatInit.getValue().isNegative();
++  } else {
++    llvm::APInt intInit = mlir::cast<mlir::IntegerAttr>(initValue).getValue();
++    isMax = init.getType().getElementType().isUnsignedInteger()
++                ? intInit.isMinValue()
++                : intInit.isMinSignedValue();
++  }
++  // Results without users, e.g. argmax's values, lost their all-reduce.
++  llvm::SmallVector<mlir::Operation *> allReduceOps;
++  for (Value result : reduceOp->getResults()) {
++    allReduceOps.push_back(
++        result.hasOneUse()
++            ? mlir::dyn_cast<mlir::sdy::AllReduceOp>(*result.user_begin())
++            : nullptr);
++    if (!result.use_empty() && !allReduceOps.back()) {
++      return rewriter.notifyMatchFailure(srcOp, "partial result is used");
++    }
++  }
++
++  mlir::Location loc = srcOp.getLoc();
++  rewriter.setInsertionPointAfter(reduceOp);
++  Value input = reduceOp.getInputs()[0];
++  Value slicedIota = reduceOp.getInputs()[1];
++  auto valueInit = reduceOp.getInitValues()[0];
++
++  // This device's extreme value and its global index: the local index plus
++  // where this device's slice of the iota starts.
++  Value value = isMax ? reduceWith<mlir::stablehlo::MaxOp>(rewriter, loc,
++                                                           input, valueInit, dim)
++                      : reduceWith<mlir::stablehlo::MinOp>(rewriter, loc,
++                                                           input, valueInit, dim);
++  auto slicedType = mlir::cast<mlir::RankedTensorType>(slicedIota.getType());
++  llvm::SmallVector<int64_t> limits(slicedType.getShape());
++  limits[dim] = 1;
++  llvm::SmallVector<int64_t> starts(limits.size(), 0), strides(limits.size(), 1);
++  auto indexType =
++      mlir::cast<mlir::RankedTensorType>(reduceOp.getResult(1).getType());
++  Value start = rewriter.create<mlir::stablehlo::ReshapeOp>(
++      loc, indexType,
++      rewriter.create<mlir::stablehlo::SliceOp>(loc, slicedIota, starts, limits,
++                                                strides));
++  Value index = rewriter.create<mlir::stablehlo::AddOp>(
++      loc, argMinMax(rewriter, loc, reduceOp, input, dim), start);
++
++  // Gather both from every device along the axis into a last dimension,
++  // [..., devices], which ttnn's argmax supports.
++  mlir::StringRef meshAxis = srcOp.getReductionAxes()[0].getName();
++  int64_t last = mlir::cast<mlir::RankedTensorType>(value.getType()).getRank();
++  auto gather = [&](Value result) -> Value {
++    auto type = mlir::cast<mlir::RankedTensorType>(result.getType());
++    llvm::SmallVector<int64_t> shape(type.getShape());
++    shape.push_back(1);
++    Value expanded = rewriter.create<mlir::stablehlo::ReshapeOp>(
++        loc, mlir::RankedTensorType::get(shape, type.getElementType()), result);
++    shape[last] = meshMap[meshAxis.str()];
++    return rewriter
++        .create<mlir::stablehlo::AllGatherOp>(
++            loc, mlir::RankedTensorType::get(shape, type.getElementType()),
++            expanded, last,
++            createDenseAttrFromReplicaGroups(
++                rewriter.getContext(), populateReplicaGroups(meshMap, meshAxis)),
++            channelHandleAttr)
++        .getResult(0);
++  };
++  Value values = gather(value);
++  Value indices = gather(index);
++
++  // The winning device, and the global index it found.
++  auto gatheredType = mlir::cast<mlir::RankedTensorType>(indices.getType());
++  Value devices = rewriter.create<mlir::stablehlo::IotaOp>(loc, gatheredType, last);
++  Value winner = argMinMax(rewriter, loc, reduceOp, values, last);
++  Value isWinner = rewriter.create<mlir::stablehlo::CompareOp>(
++      loc, devices,
++      rewriter.create<mlir::stablehlo::BroadcastInDimOp>(
++          loc, gatheredType, winner,
++          llvm::to_vector(llvm::seq<int64_t>(0, last))),
++      mlir::stablehlo::ComparisonDirection::EQ);
++  Value zeros = rewriter.create<mlir::stablehlo::ConstantOp>(
++      loc, rewriter.getZeroAttr(gatheredType));
++  Value zero = rewriter.create<mlir::stablehlo::ConstantOp>(
++      loc, rewriter.getZeroAttr(
++               mlir::RankedTensorType::get({}, gatheredType.getElementType())));
++  Value result = reduceWith<mlir::stablehlo::AddOp>(
++      rewriter, loc,
++      rewriter.create<mlir::stablehlo::SelectOp>(loc, isWinner, indices, zeros),
++      zero, last);
++
++  if (allReduceOps[0]) {
++    rewriter.replaceOp(
++        allReduceOps[0],
++        isMax ? reduceWith<mlir::stablehlo::MaxOp>(rewriter, loc, values,
++                                                   valueInit, last)
++              : reduceWith<mlir::stablehlo::MinOp>(rewriter, loc, values,
++                                                   valueInit, last));
++  }
++  if (allReduceOps[1]) {
++    rewriter.replaceOp(allReduceOps[1], result);
++  }
++  rewriter.eraseOp(reduceOp);
++  return success();
++}
++
  // AllGatherOp
  class ShardyToStableHLOAllGatherOpRewritePattern
      : public OpRewritePattern<mlir::sdy::AllGatherOp> {
-@@ -217,6 +242,12 @@
+@@ -217,6 +430,11 @@
      // for each axes that needs to be reduced.
      mlir::tt::shardy_utils::MeshMap meshMap =
          getMeshMap<mlir::sdy::ReduceScatterOp>(srcOp);
-+    FailureOr<mlir::stablehlo::ReduceOp> sourceReduce =
-+        getSourceReduce(srcOp.getOperand());
-+    if (failed(sourceReduce)) {
++    mlir::stablehlo::ReduceOp sourceReduce = getSourceReduce(srcOp.getOperand());
++    if (sourceReduce && sourceReduce->getNumResults() != 1) {
 +      return rewriter.notifyMatchFailure(
 +          srcOp, "cannot reduce-scatter the results of a variadic reduce");
 +    }
  
      Value result = srcOp.getOperand();
      for (auto [reduceScatterDim, axisRefListAttr] :
-@@ -248,9 +279,8 @@
+@@ -248,9 +466,8 @@
                  channelHandleAttr);
          result = reduceScatterOp.getResult();
  
 -        addReductionBlock<mlir::stablehlo::ReduceScatterOp,
 -                          mlir::stablehlo::AddOp>(rewriter, reduceScatterOp,
 -                                                  newOutputType);
-+        addSourceReductionBlock(rewriter, reduceScatterOp, *sourceReduce,
++        addSourceReductionBlock(rewriter, reduceScatterOp, sourceReduce,
 +                                newOutputType);
          // Restore insertion point after addReductionBlock, which leaves
          // the rewriter inside the reduction region.
          rewriter.setInsertionPointAfter(reduceScatterOp);
-@@ -291,6 +321,12 @@
+@@ -291,6 +508,11 @@
      // each axes that needs to be reduced.
      mlir::tt::shardy_utils::MeshMap meshMap =
          getMeshMap<mlir::sdy::AllReduceOp>(srcOp);
-+    FailureOr<mlir::stablehlo::ReduceOp> sourceReduce =
-+        getSourceReduce(srcOp.getOperand());
-+    if (failed(sourceReduce)) {
-+      return rewriter.notifyMatchFailure(
-+          srcOp, "cannot all-reduce the results of a variadic reduce");
++    mlir::stablehlo::ReduceOp sourceReduce = getSourceReduce(srcOp.getOperand());
++    if (sourceReduce && sourceReduce->getNumResults() != 1) {
++      return reduceArgMinMax(srcOp, sourceReduce, meshMap, channelHandleAttr,
++                             rewriter);
 +    }
      Value result = srcOp.getOperand();
  
      for (auto reductionAxis : srcOp.getReductionAxes()) {
-@@ -307,11 +343,8 @@
+@@ -307,11 +529,8 @@
                channelHandleAttr);
        result = allReduceOp.getResult(0);
  
@@ -80,7 +273,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cp
 -      // support for custom reduction types.
 -      addReductionBlock<mlir::stablehlo::AllReduceOp, mlir::stablehlo::AddOp>(
 -          rewriter, allReduceOp, newOutputType);
-+      addSourceReductionBlock(rewriter, allReduceOp, *sourceReduce,
++      addSourceReductionBlock(rewriter, allReduceOp, sourceReduce,
 +                              newOutputType);
        // Restore insertion point after addReductionBlock, which leaves
        // the rewriter inside the reduction region.
