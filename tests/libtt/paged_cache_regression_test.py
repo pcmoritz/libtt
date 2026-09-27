@@ -6,9 +6,10 @@ import numpy as np
 import pytest
 
 
+@pytest.mark.parametrize("repeat", [False, True])
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize("tokens", [16, 32])
-def test_shared_page_updates(trace, tokens):
+def test_shared_page_updates(trace, tokens, repeat):
     device = jax.devices("tt")[0]
     dtype = jnp.bfloat16
     rng = np.random.default_rng(0)
@@ -16,6 +17,9 @@ def test_shared_page_updates(trace, tokens):
     cache = jax.device_put(expected.copy(), device)
     pages = np.tile(np.arange(16, dtype=np.int32)[::-1], (tokens, 1))
     positions = np.arange(tokens, dtype=np.int32) + 24
+    if repeat:
+        # A later row written to the same position replaces the earlier one.
+        positions[1::2] = positions[::2]
     # Exercise skipped writes before, between and after valid updates.
     positions[[0, tokens // 2, -1]] = -1
 
