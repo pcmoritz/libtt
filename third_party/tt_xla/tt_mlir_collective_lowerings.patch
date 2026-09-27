@@ -1,56 +1,7 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5311,6 +5311,16 @@
-       auto outputType = mlir::cast<RankedTensorType>(
-           getTypeConverter()->convertType(resultOperand.getType()));
- 
-+      if (*reduceType == ttcore::ReduceType::Max ||
-+          *reduceType == ttcore::ReduceType::Min) {
-+        allReduceOpResults.push_back(
-+            gatherAndReduce(srcOp.getLoc(), inputOperand, outputType,
-+                            *reduceType, clusterAxis,
-+                            adaptor.getReplicaGroups().getType().getShape()[1],
-+                            rewriter));
-+        continue;
-+      }
-+
-       auto allReduceOp = rewriter.create<mlir::tt::ttir::AllReduceOp>(
-           srcOp.getLoc(), outputType, inputOperand, *reduceType, clusterAxis);
- 
-@@ -5322,6 +5332,32 @@
-   }
- 
- private:
-+  // ttir.all_reduce only sums. For max and min, gather the replica group's
-+  // values along a new leading dimension and reduce it locally.
-+  static mlir::Value gatherAndReduce(Location loc, mlir::Value input,
-+                                     RankedTensorType outputType,
-+                                     ttcore::ReduceType reduceType,
-+                                     uint32_t clusterAxis, int64_t groupSize,
-+                                     ConversionPatternRewriter &rewriter) {
-+    llvm::SmallVector<int64_t> shape{1};
-+    llvm::append_range(shape, outputType.getShape());
-+    auto unsqueezed = rewriter.create<ttir::ReshapeOp>(
-+        loc, RankedTensorType::get(shape, outputType.getElementType()), input,
-+        rewriter.getI32ArrayAttr(llvm::to_vector_of<int32_t>(shape)));
-+    shape[0] = groupSize;
-+    auto gathered = rewriter.create<ttir::AllGatherOp>(
-+        loc, RankedTensorType::get(shape, outputType.getElementType()),
-+        unsqueezed, /*all_gather_dim=*/0, clusterAxis);
-+    auto keepDim = rewriter.getBoolAttr(false);
-+    auto dims = rewriter.getI32ArrayAttr({0});
-+    if (reduceType == ttcore::ReduceType::Max) {
-+      return rewriter.create<ttir::MaxOp>(loc, outputType, gathered, keepDim,
-+                                          dims);
-+    }
-+    return rewriter.create<ttir::MinOp>(loc, outputType, gathered, keepDim,
-+                                        dims);
-+  }
-+
-   LogicalResult
-   checkConversionLegality(mlir::stablehlo::AllReduceOp &srcOp,
-                           mlir::stablehlo::AllReduceOp::Adaptor adaptor,
-@@ -5337,6 +5373,58 @@
+@@ -5337,6 +5337,58 @@
  } // namespace
  
  namespace {
@@ -109,7 +60,7 @@
  class StableHLOToTTIRReduceScatterOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::ReduceScatterOp> {
    using OpConversionPattern<
-@@ -12269,6 +12357,8 @@
+@@ -12269,6 +12321,8 @@
                                         RewritePatternSet &patterns,
                                         TypeConverter &typeConverter) {
    patterns.add<StableHLOToTTIRAllReduceOpConversionPattern>(typeConverter, ctx);
@@ -118,3 +69,48 @@
    patterns.add<StableHLOToTTIRAllGatherOpConversionPattern>(typeConverter, ctx);
    patterns.add<CacheFillUpdatePattern>(typeConverter, ctx);
    patterns.add<StableHLOToTTIRReduceScatterOpConversionPattern>(typeConverter,
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -5592,8 +5592,10 @@
+ ::mlir::LogicalResult mlir::tt::ttir::AllReduceOp::verify() {
+   ::mlir::tt::ttcore::ReduceType reduceType = getReduceType();
+ 
+-  // Currently TTIR only supports the sum reduce types.
+-  if (reduceType != ::mlir::tt::ttcore::ReduceType::Sum) {
++  // TTNN all_reduce supports sum, max and min.
++  if (reduceType != ::mlir::tt::ttcore::ReduceType::Sum &&
++      reduceType != ::mlir::tt::ttcore::ReduceType::Max &&
++      reduceType != ::mlir::tt::ttcore::ReduceType::Min) {
+     return emitOpError("Invalid reduction type for all reduce op.");
+   }
+ 
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -4570,8 +4570,10 @@
+ ::mlir::LogicalResult AllReduceOp::verify() {
+   ::mlir::tt::ttcore::ReduceType reduceType = getReduceType();
+ 
+-  // Currently TTNN only supports the sum reduce types.
+-  if (reduceType != ::mlir::tt::ttcore::ReduceType::Sum) {
++  // ttnn::all_reduce supports sum, max and min.
++  if (reduceType != ::mlir::tt::ttcore::ReduceType::Sum &&
++      reduceType != ::mlir::tt::ttcore::ReduceType::Max &&
++      reduceType != ::mlir::tt::ttcore::ReduceType::Min) {
+     return emitOpError("Invalid reduction type for all reduce op.");
+   }
+ 
+diff --git a/runtime/lib/ttnn/operations/ccl/all_reduce.cpp b/runtime/lib/ttnn/operations/ccl/all_reduce.cpp
+--- a/runtime/lib/ttnn/operations/ccl/all_reduce.cpp
++++ b/runtime/lib/ttnn/operations/ccl/all_reduce.cpp
+@@ -34,7 +34,8 @@
+   }
+ 
+   ::ttnn::Tensor out = ::ttnn::all_reduce(
+-      input, clusterAxis, subDeviceId, outputMemoryConfig, numLinks, topology);
++      input, clusterAxis, subDeviceId, outputMemoryConfig, numLinks, topology,
++      ::tt::runtime::ttnn::utils::getReduceType(op->reduce_type()));
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+ } // namespace tt::runtime::ttnn::operations::ccl
