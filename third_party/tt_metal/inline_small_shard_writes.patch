@@ -1,0 +1,45 @@
+diff --git tt_metal/distributed/mesh_command_queue_base.cpp tt_metal/distributed/mesh_command_queue_base.cpp
+--- tt_metal/distributed/mesh_command_queue_base.cpp
++++ tt_metal/distributed/mesh_command_queue_base.cpp
+@@ -2,6 +2,7 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
+ 
++#include <algorithm>
+ #include <tt_stl/fmt.hpp>
+ #include "mesh_command_queue_base.hpp"
+ 
+@@ -255,15 +256,31 @@
+             }
+         };
+ 
++    // Handing a shard to the dispatch thread pool costs tens of microseconds,
++    // more than copying a small shard, so small writes (e.g. per-step decode
++    // inputs) are issued from this thread.
++    constexpr DeviceAddr max_inline_shard_bytes = 64 * 1024;
++    const bool inline_writes = std::all_of(
++        shard_data_transfers.begin(), shard_data_transfers.end(), [&buffer](const auto& transfer) {
++            const auto& region = transfer.region();
++            return (region ? region->size : buffer.device_local_size()) <= max_inline_shard_bytes;
++        });
+     for (std::size_t shard_idx = 0; shard_idx < shard_data_transfers.size(); shard_idx++) {
+         auto shard_coord = shard_data_transfers[shard_idx].shard_coord();
+-        if (mesh_device_->impl().is_local(shard_coord)) {
++        if (!mesh_device_->impl().is_local(shard_coord)) {
++            continue;
++        }
++        if (inline_writes) {
++            dispatch_lambda(shard_idx);
++        } else {
+             dispatch_thread_pool_->enqueue(
+                 [&dispatch_lambda, shard_idx]() { dispatch_lambda(shard_idx); },
+                 mesh_device_->impl().get_device(shard_coord)->id());
+         }
+     }
+-    dispatch_thread_pool_->wait();
++    if (!inline_writes) {
++        dispatch_thread_pool_->wait();
++    }
+ 
+     if (any_pinned_used.load(std::memory_order_relaxed)) {
+         this->invalidate_prefetcher_cache_after_pinned_write();

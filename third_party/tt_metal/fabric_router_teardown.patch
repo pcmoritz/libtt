@@ -1,0 +1,12 @@
+diff --git tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+--- tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
++++ tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_router.cpp
+@@ -2921,6 +2921,8 @@
+     static_assert(noc_mode != DM_DYNAMIC_NOC, "Update here when enabling dynamic noc mode");
+     noc_async_write_barrier();
+     noc_async_atomic_barrier();
++    // Restore the command buffers before the firmware's kernel-exit checks.
++    noc_clear_packet_tags(noc_index);
+ 
+     if constexpr (NUM_ACTIVE_ERISCS > 1) {
+         wait_for_other_local_erisc();

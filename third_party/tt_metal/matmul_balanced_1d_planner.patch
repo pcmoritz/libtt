@@ -25,10 +25,10 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
      const auto N = utilities::get_N_dim(b_shape_padded, /*tile=*/std::nullopt);
 +    const uint32_t num_cores = grid_size.x * grid_size.y;
 +    const uint32_t n_tiles = N / in1_tile.get_width();
-+    const bool wide_n_matmul =
++    const bool decode_matmul =
 +        all_dram_interleaved && !user_shard_spec.has_value() && mcast_in0 && !out_sharded &&
-+        M == in0_tile.get_height() && n_tiles > num_cores;
-+    const bool balance_per_core_N = wide_n_matmul && n_tiles < 2 * num_cores;
++        M == in0_tile.get_height();
++    const bool balance_per_core_N = decode_matmul && n_tiles > num_cores && n_tiles < 2 * num_cores;
      uint32_t per_core_M, per_core_N;
  
      // If user provided a shard spec (BLOCK_SHARDED on 1D grid), derive per_core values from it
@@ -38,7 +38,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
      }
 -    uint32_t in0_block_w = K / in0_tile.get_width() % 2 == 0 ? 2 : 1;
 +    const uint32_t k_tiles = K / in0_tile.get_width();
-+    uint32_t in0_block_w = balance_per_core_N ? 4 : (wide_n_matmul ? 8 : 2);
++    uint32_t in0_block_w = decode_matmul ? 8 : 2;
 +    while (k_tiles % in0_block_w != 0) {
 +        in0_block_w /= 2;
 +    }
@@ -49,7 +49,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
          in0_block_w,
          utilities::estimate_interm_tile_size(compute_kernel_config, output_dtype),
 -        /*adjust_in0_block_w=*/false);
-+        /*adjust_in0_block_w=*/wide_n_matmul);
++        /*adjust_in0_block_w=*/decode_matmul);
 +    in0_block_w = mutlti_dim_per_core_factor[2];
      uint32_t out_block_h = mutlti_dim_per_core_factor[0];
      uint32_t out_block_w = mutlti_dim_per_core_factor[1];

@@ -1,0 +1,48 @@
+--- ttnn/cpp/ttnn/operations/ccl/common/host/moe_utils.cpp
++++ ttnn/cpp/ttnn/operations/ccl/common/host/moe_utils.cpp
+@@ -123,12 +123,11 @@
+         return direction == tt::tt_fabric::RoutingDirection::E || direction == tt::tt_fabric::RoutingDirection::S;
+     };
+ 
+-    auto applicable_to_coord =
+-        [&](const MeshCoordinate& coord, size_t cluster_axis, tt::tt_fabric::RoutingDirection direction) -> bool {
++    auto neighbor_of =
++        [&](const MeshCoordinate& coord, size_t cluster_axis, tt::tt_fabric::RoutingDirection direction) {
+         auto boundary_mode = detail::get_boundary_mode(topology);
+         int offset = positive_direction(direction) ? 1 : -1;
+-        auto neighbor = coord.get_neighbor(mesh_shape, offset, cluster_axis, boundary_mode);
+-        return neighbor.has_value();
++        return coord.get_neighbor(mesh_shape, offset, cluster_axis, boundary_mode);
+     };
+ 
+     size_t num_available_routing_planes = std::numeric_limits<size_t>::max();
+@@ -137,8 +136,27 @@
+ 
+         for (const auto axis : cluster_axes) {
+             for (const auto direction : directions[axis]) {
+-                if (applicable_to_coord(coord, axis, direction)) {
+-                    auto planes_in_direction = tt::tt_fabric::get_num_usable_routing_planes(fabric_node_id, direction);
++                if (auto neighbor = neighbor_of(coord, axis, direction)) {
++                    // A reshaped MeshDevice's axes need not match the physical
++                    // fabric's compass directions. Query the route to the actual
++                    // neighbor instead of assuming axis 1 always runs east/west.
++                    auto forwarding = tt::tt_fabric::get_eth_forwarding_direction(
++                        fabric_node_id, mesh_device.get_fabric_node_id(*neighbor));
++                    auto fabric_direction = direction;
++                    if (forwarding.has_value()) {
++                        using tt::tt_fabric::eth_chan_directions;
++                        using tt::tt_fabric::RoutingDirection;
++                        switch (forwarding.value()) {
++                            case eth_chan_directions::NORTH: fabric_direction = RoutingDirection::N; break;
++                            case eth_chan_directions::SOUTH: fabric_direction = RoutingDirection::S; break;
++                            case eth_chan_directions::EAST: fabric_direction = RoutingDirection::E; break;
++                            case eth_chan_directions::WEST: fabric_direction = RoutingDirection::W; break;
++                            case eth_chan_directions::Z: fabric_direction = RoutingDirection::Z; break;
++                            default: break;
++                        }
++                    }
++                    auto planes_in_direction =
++                        tt::tt_fabric::get_num_usable_routing_planes(fabric_node_id, fabric_direction);
+                     log_debug(
+                         tt::LogOp,
+                         "fabric_node_id: {}, direction: {}, planes_in_direction: {}",

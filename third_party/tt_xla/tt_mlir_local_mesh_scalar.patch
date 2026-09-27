@@ -1,0 +1,25 @@
+--- a/runtime/include/tt/runtime/detail/ttnn/utils.h
++++ b/runtime/include/tt/runtime/detail/ttnn/utils.h
+@@ -211,6 +211,22 @@
+ 
+ template <typename T>
+ inline T getScalarFromTensor(const ::ttnn::Tensor &tensor) {
++  if (isOnHost(tensor.storage_type())) {
++    // A replicated scalar can have one host buffer per local mesh device.
++    // Read local replicas without gathering buffers owned by other hosts.
++    std::optional<T> value;
++    tensor.host_storage().buffer().apply(
++        [&](const ::tt::tt_metal::HostBuffer &buffer) {
++          ::ttnn::Tensor shard(buffer, tensor.tensor_spec());
++          std::vector<T> data = shard.to_vector<T>();
++          LOG_ASSERT(data.size() == 1, "Scalar tensor must have one element");
++          LOG_ASSERT(!value || *value == data[0],
++                     "Replicated scalar values must agree across local devices");
++          value = data[0];
++        });
++    LOG_ASSERT(value.has_value(), "Scalar tensor must have a local buffer");
++    return *value;
++  }
+   std::vector<T> data = tensor.to_vector<T>();
+   LOG_ASSERT(data.size() == 1, "Scalar tensor must have one element");
+   return data[0];
