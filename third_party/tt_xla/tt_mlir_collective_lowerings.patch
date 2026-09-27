@@ -1,0 +1,120 @@
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -5311,6 +5311,16 @@
+       auto outputType = mlir::cast<RankedTensorType>(
+           getTypeConverter()->convertType(resultOperand.getType()));
+ 
++      if (*reduceType == ttcore::ReduceType::Max ||
++          *reduceType == ttcore::ReduceType::Min) {
++        allReduceOpResults.push_back(
++            gatherAndReduce(srcOp.getLoc(), inputOperand, outputType,
++                            *reduceType, clusterAxis,
++                            adaptor.getReplicaGroups().getType().getShape()[1],
++                            rewriter));
++        continue;
++      }
++
+       auto allReduceOp = rewriter.create<mlir::tt::ttir::AllReduceOp>(
+           srcOp.getLoc(), outputType, inputOperand, *reduceType, clusterAxis);
+ 
+@@ -5322,6 +5332,32 @@
+   }
+ 
+ private:
++  // ttir.all_reduce only sums. For max and min, gather the replica group's
++  // values along a new leading dimension and reduce it locally.
++  static mlir::Value gatherAndReduce(Location loc, mlir::Value input,
++                                     RankedTensorType outputType,
++                                     ttcore::ReduceType reduceType,
++                                     uint32_t clusterAxis, int64_t groupSize,
++                                     ConversionPatternRewriter &rewriter) {
++    llvm::SmallVector<int64_t> shape{1};
++    llvm::append_range(shape, outputType.getShape());
++    auto unsqueezed = rewriter.create<ttir::ReshapeOp>(
++        loc, RankedTensorType::get(shape, outputType.getElementType()), input,
++        rewriter.getI32ArrayAttr(llvm::to_vector_of<int32_t>(shape)));
++    shape[0] = groupSize;
++    auto gathered = rewriter.create<ttir::AllGatherOp>(
++        loc, RankedTensorType::get(shape, outputType.getElementType()),
++        unsqueezed, /*all_gather_dim=*/0, clusterAxis);
++    auto keepDim = rewriter.getBoolAttr(false);
++    auto dims = rewriter.getI32ArrayAttr({0});
++    if (reduceType == ttcore::ReduceType::Max) {
++      return rewriter.create<ttir::MaxOp>(loc, outputType, gathered, keepDim,
++                                          dims);
++    }
++    return rewriter.create<ttir::MinOp>(loc, outputType, gathered, keepDim,
++                                        dims);
++  }
++
+   LogicalResult
+   checkConversionLegality(mlir::stablehlo::AllReduceOp &srcOp,
+                           mlir::stablehlo::AllReduceOp::Adaptor adaptor,
+@@ -5337,6 +5373,58 @@
+ } // namespace
+ 
+ namespace {
++// Each device's index in the mesh: partition an iota over the mesh so that
++// every device keeps its own element.
++class StableHLOToTTIRPartitionIdOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::PartitionIdOp> {
++  using OpConversionPattern<
++      mlir::stablehlo::PartitionIdOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::PartitionIdOp srcOp,
++                  mlir::stablehlo::PartitionIdOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto outputType = mlir::cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getResult().getType()));
++    Type elementType = outputType.getElementType();
++    llvm::SmallVector<int64_t> meshShape{1};
++    if (auto meshes = srcOp->getParentOfType<mlir::ModuleOp>()
++                          ->getAttrOfType<ttcore::MeshesAttr>(
++                              ttcore::MeshesAttr::name);
++        meshes && !meshes.getMeshes().empty()) {
++      meshShape = llvm::to_vector(meshes.getMeshes()[0].getShape());
++    }
++
++    llvm::SmallVector<APInt> ids;
++    for (int64_t id = 0, e = ttmlir::utils::volume<int64_t>(meshShape); id < e;
++         ++id) {
++      ids.push_back(APInt(elementType.getIntOrFloatBitWidth(), id));
++    }
++    mlir::Value current = rewriter.create<ttir::ConstantOp>(
++        srcOp.getLoc(), RankedTensorType::get(meshShape, elementType),
++        DenseElementsAttr::get(RankedTensorType::get(meshShape, elementType),
++                               ids));
++    llvm::SmallVector<int64_t> shape(meshShape);
++    for (auto [axis, size] : llvm::enumerate(meshShape)) {
++      if (size == 1) {
++        continue;
++      }
++      shape[axis] = 1;
++      current = rewriter.create<ttir::MeshPartitionOp>(
++          srcOp.getLoc(), RankedTensorType::get(shape, elementType), current,
++          rewriter.getSI32IntegerAttr(axis), rewriter.getUI32IntegerAttr(axis));
++    }
++    rewriter.replaceOpWithNewOp<ttir::ReshapeOp>(
++        srcOp, outputType, current,
++        rewriter.getI32ArrayAttr(
++            llvm::to_vector_of<int32_t>(outputType.getShape())));
++    return success();
++  }
++};
++} // namespace
++
++namespace {
+ class StableHLOToTTIRReduceScatterOpConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::ReduceScatterOp> {
+   using OpConversionPattern<
+@@ -12269,6 +12357,8 @@
+                                        RewritePatternSet &patterns,
+                                        TypeConverter &typeConverter) {
+   patterns.add<StableHLOToTTIRAllReduceOpConversionPattern>(typeConverter, ctx);
++  patterns.add<StableHLOToTTIRPartitionIdOpConversionPattern>(typeConverter,
++                                                              ctx);
+   patterns.add<StableHLOToTTIRAllGatherOpConversionPattern>(typeConverter, ctx);
+   patterns.add<CacheFillUpdatePattern>(typeConverter, ctx);
+   patterns.add<StableHLOToTTIRReduceScatterOpConversionPattern>(typeConverter,
