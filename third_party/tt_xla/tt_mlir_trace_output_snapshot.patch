@@ -1,0 +1,122 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+--- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+@@ -5,6 +5,7 @@
+ #ifndef TT_RUNTIME_DETAIL_TTNN_TYPES_TRACE_CACHE_H
+ #define TT_RUNTIME_DETAIL_TTNN_TYPES_TRACE_CACHE_H
+ 
++#include <array>
+ #include <cstdint>
+ #include <vector>
+ 
+@@ -24,6 +25,11 @@ struct TraceVariant {
+   std::vector<::tt::runtime::Tensor> inputTensors;
+   /// Persistent output slots this trace was captured against.
+   std::vector<::tt::runtime::Tensor> outputTensors;
++  /// Two copies of the output slots that replays publish alternately, so an
++  /// output stays valid while the next replay runs. They are allocated before
++  /// capture, so publishing allocates nothing that could overlap the trace.
++  std::array<std::vector<::tt::runtime::Tensor>, 2> outputSnapshots;
++  size_t nextOutputSnapshot = 0;
+   /// Slots allocated exclusively for this trace. Caller-owned device inputs
+   /// are intentionally excluded.
+   std::vector<::tt::runtime::Tensor> ownedTensors;
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -14,6 +14,7 @@
+ #include "tt/runtime/detail/ttnn/utils.h"
+ #include "tt/runtime/types.h"
+ #include "ttnn/operations/core/core.hpp"
++#include "ttnn/operations/data_movement/clone/clone.hpp"
+ #include "ttnn/operations/data_movement/copy/copy.hpp"
+ 
+ namespace tt::runtime::ttnn::operations::trace {
+@@ -238,18 +239,30 @@ updateTraceInputSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+   }
+ }
+ 
+-// Publishes the persistent output slots as the op's outputs.
++// Publishes the op's outputs. Every replay rewrites the same output slots, so
++// the outputs are copied into the next of two snapshots. A caller may then hold
++// an output while the next replay runs, as an overlapping scheduler does.
+ static void
+ publishTraceOutputs(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+-                    ProgramContext &context,
+-                    const std::vector<::tt::runtime::Tensor> &outputSlots) {
+-  LOG_ASSERT(op->outputs()->size() == outputSlots.size(),
++                    ProgramContext &context, TraceVariant &variant) {
++  LOG_ASSERT(op->outputs()->size() == variant.outputTensors.size(),
+              "Mismatched number of outputs, expected: ", op->outputs()->size(),
+-             " got: ", outputSlots.size());
++             " got: ", variant.outputTensors.size());
++  std::vector<::tt::runtime::Tensor> &snapshot =
++      variant.outputSnapshots[variant.nextOutputSnapshot];
++  variant.nextOutputSnapshot ^= 1;
+   for (size_t i = 0; i < op->outputs()->size(); i++) {
+     const ::tt::target::ttnn::TensorRef *output = op->outputs()->Get(i);
++    ::ttnn::Tensor &snapshotTensor =
++        ::tt::runtime::ttnn::utils::getTTNNTensorFromRuntimeTensor(snapshot[i]);
++    ::ttnn::copy(::tt::runtime::ttnn::utils::getTTNNTensorFromRuntimeTensor(
++                     variant.outputTensors[i]),
++                 snapshotTensor);
++    snapshot[i]
++        .as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN)
++        .updateVersion();
+     context.getTensorPool().insertRuntimeTensorAndValidate(output,
+-                                                           outputSlots[i]);
++                                                           snapshot[i]);
+   }
+ }
+ 
+@@ -302,6 +315,17 @@ static TraceVariant captureTrace(
+   captureInputs.insert(captureInputs.end(), outputSlots.begin(),
+                        outputSlots.end());
+ 
++  // Allocate the output snapshots before capture; see publishTraceOutputs.
++  std::array<std::vector<::tt::runtime::Tensor>, 2> outputSnapshots;
++  for (std::vector<::tt::runtime::Tensor> &snapshot : outputSnapshots) {
++    for (const ::tt::runtime::Tensor &slot : outputSlots) {
++      snapshot.push_back(::tt::runtime::ttnn::utils::createRuntimeTensorFromTTNN(
++          ::ttnn::clone(
++              ::tt::runtime::ttnn::utils::getTTNNTensorFromRuntimeTensor(slot),
++              std::nullopt, std::nullopt, std::nullopt)));
++    }
++  }
++
+   std::vector<::tt::runtime::GlobalSemaphore> semaphoreInputs =
+       utils::collectSemaphoreInputs(op->semaphore_inputs(), context);
+ 
+@@ -330,6 +354,9 @@ static TraceVariant captureTrace(
+   }
+   ownedTensors.insert(ownedTensors.end(), outputSlots.begin(),
+                       outputSlots.end());
++  for (const std::vector<::tt::runtime::Tensor> &snapshot : outputSnapshots) {
++    ownedTensors.insert(ownedTensors.end(), snapshot.begin(), snapshot.end());
++  }
+ 
+   TraceVariant variant{
+       .traceId = ::ttnn::MeshTraceId(
+@@ -338,11 +365,12 @@ static TraceVariant captureTrace(
+       .traceKey = traceKey,
+       .inputTensors = inputSlots,
+       .outputTensors = outputSlots,
++      .outputSnapshots = std::move(outputSnapshots),
+       .ownedTensors = std::move(ownedTensors)};
+ 
+   // The capture program replays the trace once, so the output slots already
+   // hold this invocation's results.
+-  publishTraceOutputs(op, context, outputSlots);
++  publishTraceOutputs(op, context, variant);
+ 
+   return variant;
+ }
+@@ -357,7 +385,7 @@ static void executeTrace(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+   ::ttnn::operations::trace::execute_trace(
+       &meshDevice, variant.traceId, ::ttnn::QueueId(0), /*blocking=*/false);
+ 
+-  publishTraceOutputs(op, context, variant.outputTensors);
++  publishTraceOutputs(op, context, variant);
+ }
+ 
+ // A device-resident trace input is captured by address, unlike a host input
