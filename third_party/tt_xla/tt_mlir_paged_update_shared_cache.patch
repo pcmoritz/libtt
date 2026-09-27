@@ -1,0 +1,20 @@
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10033,6 +10033,17 @@
+       }
+     }
+
++    if (auto config = getFfiBackendConfig(srcOp)) {
++      if (mlir::Attribute attr = config.get("share_cache")) {
++        auto shareCacheAttr = mlir::dyn_cast<BoolAttr>(attr);
++        if (!shareCacheAttr) {
++          return rewriter.notifyMatchFailure(
++              srcOp, "share_cache must be a boolean attribute");
++        }
++        shareCache = shareCacheAttr.getValue();
++      }
++    }
++
+     // ttir.paged_update_cache mutates the cache in place and has no result;
+     // rewire the custom_call result to the cache operand.
+     rewriter.create<ttir::PagedUpdateCacheOp>(
