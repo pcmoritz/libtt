@@ -1,0 +1,87 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cpp b/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cpp
+@@ -135,6 +135,31 @@
+   rewriter.create<mlir::stablehlo::ReturnOp>(loc, reductionOp.getResult());
+ }
+ 
++// Shardy inserts all-reduces and reduce-scatters after ops whose reduction
++// dimensions are sharded. Partial results of a stablehlo.reduce combine with
++// the reduce's own computation (max, min, ...); others, e.g. dot_general, sum.
++// A variadic reduce (e.g. argmax) cannot be combined result by result.
++static FailureOr<mlir::stablehlo::ReduceOp> getSourceReduce(Value operand) {
++  auto reduceOp = operand.getDefiningOp<mlir::stablehlo::ReduceOp>();
++  if (reduceOp && reduceOp->getNumResults() != 1) {
++    return failure();
++  }
++  return reduceOp;
++}
++
++template <typename SrcOp>
++static void addSourceReductionBlock(PatternRewriter &rewriter, SrcOp &srcOp,
++                                    mlir::stablehlo::ReduceOp sourceReduce,
++                                    mlir::RankedTensorType outputType) {
++  if (!sourceReduce) {
++    addReductionBlock<SrcOp, mlir::stablehlo::AddOp>(rewriter, srcOp,
++                                                     outputType);
++    return;
++  }
++  rewriter.cloneRegionBefore(sourceReduce.getBody(), srcOp.getRegion(),
++                             srcOp.getRegion().end());
++}
++
+ // AllGatherOp
+ class ShardyToStableHLOAllGatherOpRewritePattern
+     : public OpRewritePattern<mlir::sdy::AllGatherOp> {
+@@ -217,6 +242,12 @@
+     // for each axes that needs to be reduced.
+     mlir::tt::shardy_utils::MeshMap meshMap =
+         getMeshMap<mlir::sdy::ReduceScatterOp>(srcOp);
++    FailureOr<mlir::stablehlo::ReduceOp> sourceReduce =
++        getSourceReduce(srcOp.getOperand());
++    if (failed(sourceReduce)) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "cannot reduce-scatter the results of a variadic reduce");
++    }
+ 
+     Value result = srcOp.getOperand();
+     for (auto [reduceScatterDim, axisRefListAttr] :
+@@ -248,9 +279,8 @@
+                 channelHandleAttr);
+         result = reduceScatterOp.getResult();
+ 
+-        addReductionBlock<mlir::stablehlo::ReduceScatterOp,
+-                          mlir::stablehlo::AddOp>(rewriter, reduceScatterOp,
+-                                                  newOutputType);
++        addSourceReductionBlock(rewriter, reduceScatterOp, *sourceReduce,
++                                newOutputType);
+         // Restore insertion point after addReductionBlock, which leaves
+         // the rewriter inside the reduction region.
+         rewriter.setInsertionPointAfter(reduceScatterOp);
+@@ -291,6 +321,12 @@
+     // each axes that needs to be reduced.
+     mlir::tt::shardy_utils::MeshMap meshMap =
+         getMeshMap<mlir::sdy::AllReduceOp>(srcOp);
++    FailureOr<mlir::stablehlo::ReduceOp> sourceReduce =
++        getSourceReduce(srcOp.getOperand());
++    if (failed(sourceReduce)) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "cannot all-reduce the results of a variadic reduce");
++    }
+     Value result = srcOp.getOperand();
+ 
+     for (auto reductionAxis : srcOp.getReductionAxes()) {
+@@ -307,11 +343,8 @@
+               channelHandleAttr);
+       result = allReduceOp.getResult(0);
+ 
+-      // Create a single block because stablehlo.all_reduce op is a region based
+-      // op. Default the reduction type to sum since shardy does not have
+-      // support for custom reduction types.
+-      addReductionBlock<mlir::stablehlo::AllReduceOp, mlir::stablehlo::AddOp>(
+-          rewriter, allReduceOp, newOutputType);
++      addSourceReductionBlock(rewriter, allReduceOp, *sourceReduce,
++                              newOutputType);
+       // Restore insertion point after addReductionBlock, which leaves
+       // the rewriter inside the reduction region.
+       rewriter.setInsertionPointAfter(allReduceOp);

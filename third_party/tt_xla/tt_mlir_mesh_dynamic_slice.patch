@@ -1,0 +1,67 @@
+diff --git a/runtime/lib/ttnn/operations/data_movement/slice.cpp b/runtime/lib/ttnn/operations/data_movement/slice.cpp
+--- a/runtime/lib/ttnn/operations/data_movement/slice.cpp
++++ b/runtime/lib/ttnn/operations/data_movement/slice.cpp
+@@ -8,8 +8,10 @@
+ #include "tt/runtime/detail/ttnn/utils.h"
+ 
+ #include "ttmlir/Target/TTNN/program_generated.h"
++#include "ttnn/distributed/api.hpp"
+ #include "ttnn/operations/data_movement/slice/slice.hpp"
+ #include <cstdint>
++#include <vector>
+ 
+ namespace tt::runtime::ttnn::operations::data_movement {
+ static void runSliceStaticOp(const ::tt::target::ttnn::SliceOp *op,
+@@ -38,6 +40,29 @@
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+ 
++// On a mesh, dynamic slice bounds hold one value per device. One program
++// slices every device the same way, so the bounds must agree across devices.
++template <typename T>
++static ::ttsl::SmallVector<int32_t>
++agreedSliceBounds(const std::vector<::ttnn::Tensor> &shards) {
++  std::vector<T> values = shards.front().to_vector<T>();
++  for (const ::ttnn::Tensor &shard : shards) {
++    LOG_ASSERT(shard.to_vector<T>() == values,
++               "Dynamic slice bounds differ across devices");
++  }
++  return ::ttsl::SmallVector<int32_t>(values.begin(), values.end());
++}
++
++static ::ttsl::SmallVector<int32_t>
++agreedSliceBounds(const ::ttnn::Tensor &bounds) {
++  std::vector<::ttnn::Tensor> shards =
++      ::ttnn::distributed::get_device_tensors(bounds);
++  if (bounds.dtype() == ::ttnn::DataType::UINT32) {
++    return agreedSliceBounds<uint32_t>(shards);
++  }
++  return agreedSliceBounds<int32_t>(shards);
++}
++
+ static void runSliceDynamicOp(const ::tt::target::ttnn::SliceOp *op,
+                               ProgramTensorPool &tensorPool) {
+   const ::ttnn::Tensor &in = tensorPool.getTTNNTensorAndValidate(op->in());
+@@ -59,6 +84,22 @@
+       ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(
+           ::tt::runtime::ttnn::utils::getTensorRefMemoryConfig(op->out()));
+ 
++  if (::ttnn::distributed::get_device_tensors(begins).size() > 1) {
++    ::ttsl::SmallVector<int32_t> beginValues = agreedSliceBounds(begins);
++    ::ttsl::SmallVector<int32_t> endValues = agreedSliceBounds(ends);
++    ::ttsl::SmallVector<int32_t> stepValues(beginValues.size(), 1);
++    if (step) {
++      stepValues.assign(step->begin(), step->end());
++    }
++    ::ttnn::Tensor out = ::ttnn::slice(
++        in, ttsl::Span<const int32_t>(beginValues.data(), beginValues.size()),
++        ttsl::Span<const int32_t>(endValues.data(), endValues.size()),
++        ttsl::Span<const int32_t>(stepValues.data(), stepValues.size()),
++        memoryConfig);
++    tensorPool.insertTTNNTensorAndValidate(op->out(), out);
++    return;
++  }
++
+   ::ttnn::Tensor out = ::ttnn::slice(in, begins, ends, step, memoryConfig);
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
