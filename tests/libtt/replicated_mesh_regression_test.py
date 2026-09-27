@@ -60,6 +60,19 @@ def test_reduce_over_sharded_axis(reduce, axis):
     np.testing.assert_array_equal(np.asarray(out), np.asarray(reduce(values, axis=axis)))
 
 
+@pytest.mark.parametrize("reduce", [jnp.argmin, jnp.argmax])
+@pytest.mark.parametrize("value", [False, True])
+def test_bool_arg_reduce_over_sharded_axis(reduce, value):
+    # Only the last device holds `value`, so it wins argmax (True) or argmin
+    # (False).
+    mesh = _mesh()
+    rows = 8 * mesh.devices.size
+    values = np.tile((np.arange(rows) >= rows - 2)[:, None] == value, (1, 4))
+    x = jax.device_put(values, NamedSharding(mesh, P("x")))
+    out = jax.jit(lambda v: reduce(v, axis=0))(x)
+    np.testing.assert_array_equal(np.asarray(out), reduce(values, axis=0))
+
+
 def test_argmax_over_sharded_vocab():
     # Greedy sampling from vocab-sharded logits: the smallest index wins ties,
     # also across devices.
