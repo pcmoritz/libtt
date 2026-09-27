@@ -1,0 +1,49 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -613,6 +613,19 @@ binaryOpDTypeWorkaround(mlir::Operation *op, mlir::Type elementType) {
+   // All remaining binary ops.
+   // Tracked in :
+   // https://github.com/issues/created?issue=tenstorrent%7Ctt-metal%7C25112
++  // Integer division is truncating. tt-metal divides INT32 exactly (the
++  // runtime selects rounding_mode="trunc"), and narrower integers widen to
++  // INT32 exactly. UINT32 does not fit INT32 and still divides in Float32.
++  if (isa<ttnn::DivideOp>(op) && isa<IntegerType>(elementType)) {
++    if (dType == mlir::tt::ttcore::DataType::Int32) {
++      return {};
++    }
++    if (dType == mlir::tt::ttcore::DataType::UInt32) {
++      return mlir::tt::ttcore::DataType::Float32;
++    }
++    return mlir::tt::ttcore::DataType::Int32;
++  }
++
+   if (isa<ttnn::DivideOp, ttnn::PowTensorOp>(op)) {
+     if (dType == mlir::tt::ttcore::DataType::Float32 ||
+         dType == mlir::tt::ttcore::DataType::BFloat16 ||
+diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp b/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
+--- a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
++++ b/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
+@@ -100,9 +100,19 @@ void run(const ::tt::target::ttnn::EltwiseBinaryOp *op,
+     break;
+   }
+   case ::tt::target::ttnn::EltwiseBinaryOpType::Divide: {
+-    runEltwiseBinaryOp(op, tensorPool, [](auto &&...args) {
+-      return ::ttnn::divide(std::forward<decltype(args)>(args)...);
+-    });
++    runEltwiseBinaryOp(
++        op, tensorPool,
++        [](const ::ttnn::Tensor &lhs, const ::ttnn::Tensor &rhs,
++           std::optional<::ttnn::DataType> outputDataType,
++           std::optional<::ttnn::MemoryConfig> outputMemoryConfig) {
++          // Integer division truncates; plain divide of INT32 returns the
++          // FLOAT32 quotient instead.
++          if (lhs.dtype() == ::ttnn::DataType::INT32) {
++            return ::ttnn::div(lhs, rhs, /*fast_and_approximate_mode=*/false,
++                               "trunc", outputDataType, outputMemoryConfig);
++          }
++          return ::ttnn::divide(lhs, rhs, outputDataType, outputMemoryConfig);
++        });
+     break;
+   }
+   case ::tt::target::ttnn::EltwiseBinaryOpType::LogicalAnd: {

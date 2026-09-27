@@ -1,0 +1,36 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -5809,9 +5809,16 @@ public:
+     // Reshape start indices to 1D tensors for concat op.
+     ValueRange startIndicesRange = adaptor.getStartIndices();
+     SmallVector<Value> startIndicesValues1D;
+-    auto startIndexElementType =
++    auto inputIndexElementType =
+         mlir::cast<RankedTensorType>(startIndicesRange[0].getType())
+             .getElementType();
++    // Clamp and offset narrow indices as Int32: a UInt8 index of 128 was
++    // clamped as if it were negative.
++    mlir::Type startIndexElementType = inputIndexElementType;
++    if (auto integerType = mlir::dyn_cast<IntegerType>(inputIndexElementType);
++        integerType && integerType.getWidth() < 32) {
++      startIndexElementType = rewriter.getIntegerType(32, /*isSigned=*/true);
++    }
+     auto singleElementTensorType =
+         RankedTensorType::get({1}, startIndexElementType);
+ 
+@@ -5819,9 +5826,13 @@ public:
+       Value reshapedIndex = rewriter.create<ttir::ReshapeOp>(
+           srcOp.getLoc(),
+           RankedTensorType::get(singleElementTensorType.getShape(),
+-                                startIndexElementType,
++                                inputIndexElementType,
+                                 singleElementTensorType.getEncoding()),
+           startIndex, rewriter.getI32ArrayAttr({1}));
++      if (inputIndexElementType != startIndexElementType) {
++        reshapedIndex = rewriter.create<ttir::TypecastOp>(
++            srcOp.getLoc(), singleElementTensorType, reshapedIndex);
++      }
+       reshapedIndex = rewriter.create<ttir::ClampScalarOp>(
+           srcOp.getLoc(), singleElementTensorType, reshapedIndex,
+           rewriter.getI32IntegerAttr(0),

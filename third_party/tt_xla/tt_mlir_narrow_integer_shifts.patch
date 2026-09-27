@@ -1,0 +1,127 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -12122,6 +12122,83 @@ public:
+   }
+ };
+ 
++// Shifts of 8- and 16-bit integers. TTNN shifts these as Int32, and narrowing
++// the Int32 result saturated rather than wrapped (a left shift of UInt16 gave
++// 65535), a logical right shift of a negative narrow value shifted in the
++// Int32 sign bits, and an arithmetic right shift of an unsigned narrow value
++// did not treat its top bit as the sign. Compute in Int32 with the narrow
++// width's semantics explicitly, so the result is in range before narrowing.
++template <typename SrcOp>
++class StableHLOToTTIRNarrowShiftOpConversionPattern
++    : public OpConversionPattern<SrcOp> {
++  using OpConversionPattern<SrcOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(SrcOp srcOp, typename SrcOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto type = mlir::cast<RankedTensorType>(
++        this->getTypeConverter()->convertType(srcOp.getType()));
++    auto integerType = mlir::dyn_cast<IntegerType>(type.getElementType());
++    if (!integerType || integerType.getWidth() >= 32 ||
++        integerType.getWidth() == 1) {
++      return rewriter.notifyMatchFailure(srcOp, "not a narrow integer shift");
++    }
++    const unsigned width = integerType.getWidth();
++    const bool isUnsigned = integerType.isUnsigned();
++    Location loc = srcOp.getLoc();
++    auto wideType = type.clone(rewriter.getIntegerType(32, /*isSigned=*/true));
++    auto constant = [&](int64_t value) -> Value {
++      return rewriter.create<ttir::ConstantOp>(
++          loc, wideType,
++          DenseElementsAttr::get(
++              wideType, rewriter.getIntegerAttr(wideType.getElementType(),
++                                                value)));
++    };
++    const int64_t mask = (int64_t{1} << width) - 1;
++    const int64_t signBit = int64_t{1} << (width - 1);
++    auto zeroExtend = [&](Value value) -> Value {
++      return rewriter.create<ttir::BitwiseAndOp>(loc, wideType, value,
++                                                 constant(mask));
++    };
++    auto signExtend = [&](Value value) -> Value {
++      Value flipped = rewriter.create<ttir::BitwiseXorOp>(
++          loc, wideType, zeroExtend(value), constant(signBit));
++      return rewriter.create<ttir::SubtractOp>(loc, wideType, flipped,
++                                               constant(signBit));
++    };
++
++    // Conservative folding keeps these widening casts from merging with
++    // neighbouring casts (e.g. of a UInt8 arange, which TTNN cannot create).
++    Value x = rewriter.create<ttir::TypecastOp>(loc, wideType, adaptor.getLhs(),
++                                                /*conservative_folding=*/true);
++    // Amounts are unsigned; any amount of at least the width behaves like 31.
++    Value amount = rewriter.create<ttir::MinimumOp>(
++        loc, wideType,
++        zeroExtend(
++            rewriter.create<ttir::TypecastOp>(loc, wideType, adaptor.getRhs(),
++                                              /*conservative_folding=*/true)),
++        constant(31));
++
++    Value result;
++    if constexpr (std::is_same_v<SrcOp, mlir::stablehlo::ShiftLeftOp>) {
++      result = rewriter.create<ttir::LogicalLeftShiftOp>(loc, wideType, x,
++                                                          amount);
++    } else if constexpr (std::is_same_v<SrcOp,
++                                        mlir::stablehlo::ShiftRightLogicalOp>) {
++      result = rewriter.create<ttir::LogicalRightShiftOp>(
++          loc, wideType, zeroExtend(x), amount);
++    } else {
++      result = rewriter.create<ttir::RightShiftOp>(loc, wideType,
++                                                    signExtend(x), amount);
++    }
++    result = isUnsigned ? zeroExtend(result) : signExtend(result);
++    rewriter.replaceOpWithNewOp<ttir::TypecastOp>(srcOp, type, result,
++                                                  /*conservative_folding=*/true);
++    return success();
++  }
++};
++
+ class StableHLOToTTIRCountLeadingZerosOpConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::ClzOp> {
+   using OpConversionPattern<
+@@ -12313,6 +12390,13 @@ addElementwiseBinaryOpsConversionPatterns(MLIRContext *ctx,
+   patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+       mlir::stablehlo::ShiftLeftOp, mlir::tt::ttir::LogicalLeftShiftOp>>(
+       typeConverter, ctx);
++  patterns.add<
++      StableHLOToTTIRNarrowShiftOpConversionPattern<mlir::stablehlo::ShiftLeftOp>,
++      StableHLOToTTIRNarrowShiftOpConversionPattern<
++          mlir::stablehlo::ShiftRightLogicalOp>,
++      StableHLOToTTIRNarrowShiftOpConversionPattern<
++          mlir::stablehlo::ShiftRightArithmeticOp>>(typeConverter, ctx,
++                                                    /*benefit=*/2);
+ }
+ 
+ static void addReduceOpsConversionPatterns(MLIRContext *ctx,
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -4086,6 +4086,22 @@ mlir::OpFoldResult mlir::tt::ttir::TypecastOp::fold(FoldAdaptor adaptor) {
+ ::llvm::LogicalResult
+ mlir::tt::ttir::TypecastOp::canonicalize(mlir::tt::ttir::TypecastOp op,
+                                          ::mlir::PatternRewriter &rewriter) {
++  // Create an integer arange directly in the wider integer type it is cast
++  // to. This keeps TTNN from having to create aranges of types it does not
++  // support (e.g. UInt8) when the cast is not absorbed by a workaround.
++  if (auto arange = op.getInput().getDefiningOp<mlir::tt::ttir::ArangeOp>()) {
++    auto inputType =
++        mlir::dyn_cast<IntegerType>(arange.getType().getElementType());
++    auto outputType = mlir::dyn_cast<IntegerType>(op.getType().getElementType());
++    if (inputType && outputType && arange->hasOneUse() &&
++        outputType.getWidth() >= inputType.getWidth()) {
++      rewriter.replaceOpWithNewOp<mlir::tt::ttir::ArangeOp>(
++          op, op.getType(), arange.getStart(), arange.getEnd(),
++          arange.getStep(), arange.getArangeDimension());
++      return mlir::success();
++    }
++  }
++
+   // Fold two consecutive typecast ops into a single one.
+   ::mlir::tt::ttir::TypecastOp producerOp =
+       op.getInput().getDefiningOp<mlir::tt::ttir::TypecastOp>();

@@ -1,0 +1,112 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -318,10 +318,18 @@ public:
+                                                             rewriter);
+     }
+     if (mlir::isa<mlir::stablehlo::MaxOp>(innerOp)) {
++      if (isUnsigned32(adaptor.getInputs().front())) {
++        return matchAndRewriteUnsigned32(srcOp, adaptor, rewriter,
++                                         /*isMax=*/true);
++      }
+       return matchAndRewriteInternal<mlir::tt::ttir::MaxOp>(srcOp, adaptor,
+                                                             rewriter);
+     }
+     if (mlir::isa<mlir::stablehlo::MinOp>(innerOp)) {
++      if (isUnsigned32(adaptor.getInputs().front())) {
++        return matchAndRewriteUnsigned32(srcOp, adaptor, rewriter,
++                                         /*isMax=*/false);
++      }
+       return matchAndRewriteInternal<mlir::tt::ttir::MinOp>(srcOp, adaptor,
+                                                             rewriter);
+     }
+@@ -400,6 +408,89 @@ private:
+     return success();
+   }
+ 
++  static bool isUnsigned32(mlir::Value value) {
++    auto integerType = mlir::dyn_cast<IntegerType>(
++        mlir::cast<RankedTensorType>(value.getType()).getElementType());
++    return integerType && integerType.isUnsigned() &&
++           integerType.getWidth() == 32;
++  }
++
++  // tt-metal reduces UINT32 through float32, which is inexact above 2^24,
++  // and its INT32 min/max mishandle INT32_MIN, so no 32-bit reinterpretation
++  // is exact either. Reduce the 16-bit halves as INT32 instead: the minimum of
++  // the high halves, then the minimum low half among the elements that share
++  // it. Max uses max(x) = ~min(~x).
++  LogicalResult
++  matchAndRewriteUnsigned32(mlir::stablehlo::ReduceOp &srcOp,
++                            mlir::stablehlo::ReduceOp::Adaptor &adaptor,
++                            ConversionPatternRewriter &rewriter,
++                            bool isMax) const {
++    mlir::Location loc = srcOp->getLoc();
++    mlir::Value x = adaptor.getInputs().front();
++    auto inputType = mlir::cast<RankedTensorType>(x.getType());
++    auto outputType = mlir::cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getResultTypes().front()));
++    auto signedInputType =
++        inputType.clone(rewriter.getIntegerType(32, /*isSigned=*/true));
++    auto signedOutputType = outputType.clone(signedInputType.getElementType());
++    llvm::SmallVector<int32_t> dims(srcOp.getDimensions());
++    mlir::ArrayAttr dimArg = rewriter.getI32ArrayAttr(dims);
++    llvm::SmallVector<int64_t> keptShape(inputType.getShape());
++    llvm::SmallVector<int64_t> repeats(inputType.getRank(), 1);
++    for (int32_t dim : dims) {
++      repeats[dim] = keptShape[dim];
++      keptShape[dim] = 1;
++    }
++    auto keptType = signedInputType.clone(keptShape);
++    auto constant = [&](RankedTensorType type, uint32_t value) -> mlir::Value {
++      return rewriter.create<ttir::ConstantOp>(
++          loc, type,
++          DenseElementsAttr::get(
++              type, rewriter.getIntegerAttr(type.getElementType(), value)));
++    };
++
++    if (isMax) {
++      x = rewriter.create<ttir::BitwiseNotOp>(loc, inputType, x);
++    }
++    mlir::Value high = rewriter.create<ttir::BitcastConvertOp>(
++        loc, signedInputType,
++        rewriter.create<ttir::LogicalRightShiftOp>(
++            loc, inputType, x, constant(inputType, 16)));
++    mlir::Value low = rewriter.create<ttir::BitcastConvertOp>(
++        loc, signedInputType,
++        rewriter.create<ttir::BitwiseAndOp>(loc, inputType, x,
++                                            constant(inputType, 0xFFFF)));
++    mlir::Value minHigh = rewriter.create<ttir::MinOp>(
++        loc, keptType, high, /*keep_dim=*/true, dimArg);
++    mlir::Value isMinHigh = rewriter.create<ttir::EqualOp>(
++        loc, signedInputType.clone(rewriter.getI1Type()), high,
++        rewriter.create<ttir::BroadcastOp>(
++            loc, signedInputType, minHigh,
++            rewriter.getDenseI64ArrayAttr(repeats)));
++    mlir::Value lowCandidates = rewriter.create<ttir::WhereOp>(
++        loc, signedInputType, isMinHigh, low,
++        constant(signedInputType, 0x10000));
++    mlir::Value minLow = rewriter.create<ttir::MinOp>(
++        loc, signedOutputType, lowCandidates, /*keep_dim=*/false, dimArg);
++    mlir::Value minHighReduced = rewriter.create<ttir::ReshapeOp>(
++        loc, signedOutputType, minHigh,
++        rewriter.getI32ArrayAttr(llvm::SmallVector<int32_t>(
++            outputType.getShape().begin(), outputType.getShape().end())));
++    mlir::Value combined = rewriter.create<ttir::BitwiseOrOp>(
++        loc, signedOutputType,
++        rewriter.create<ttir::LogicalLeftShiftOp>(
++            loc, signedOutputType, minHighReduced,
++            constant(signedOutputType, 16)),
++        minLow);
++    mlir::Value result =
++        rewriter.create<ttir::BitcastConvertOp>(loc, outputType, combined);
++    if (isMax) {
++      result = rewriter.create<ttir::BitwiseNotOp>(loc, outputType, result);
++    }
++    rewriter.replaceOp(srcOp, result);
++    return success();
++  }
++
+   template <typename ReductionOp, typename CombineOp>
+   mlir::Value createReductionWithInit(
+       mlir::Location loc, RankedTensorType outputType, mlir::Value input,
