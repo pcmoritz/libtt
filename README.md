@@ -103,15 +103,11 @@ bazel build //:jax_tt_plugin_wheel
 export LIBTT_WHEEL="$PWD/bazel-bin/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl"
 ```
 
-Then check out the SGLang-JAX TT backend branch from
-[sgl-project/sglang-jax#1527](https://github.com/sgl-project/sglang-jax/pull/1527):
+Then check out SGLang-JAX, which includes the TT backend:
 
 ```bash
 export SGLANG_JAX_DIR="$HOME/sglang-jax"
 git clone https://github.com/sgl-project/sglang-jax.git "$SGLANG_JAX_DIR"
-cd "$SGLANG_JAX_DIR"
-git fetch origin pull/1527/head:pr-1527
-git switch pr-1527
 ```
 
 Create a Python environment for that checkout, install SGLang-JAX and the
@@ -122,14 +118,14 @@ cd "$SGLANG_JAX_DIR"
 uv venv --python 3.12
 uv pip install --python .venv/bin/python \
   -e python \
-  jax==0.8.1 \
-  jaxlib==0.8.1 \
+  jax==0.11.1 \
+  jaxlib==0.11.1 \
   "$LIBTT_WHEEL"
 
 env -u TT_METAL_RUNTIME_ROOT \
   PYTHONPATH="$SGLANG_JAX_DIR/python" \
   JAX_PLATFORMS=tt \
-  JAX_USE_SHARDY_PARTITIONER=false \
+  JAX_USE_SHARDY_PARTITIONER=true \
   JAX_COMPILATION_CACHE_DIR=/tmp/sglang-jax-qwen3-8b-jax-cache \
   .venv/bin/python -m sgl_jax.launch_server \
     --model-path Qwen/Qwen3-8B \

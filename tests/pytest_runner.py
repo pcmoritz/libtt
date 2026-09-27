@@ -46,7 +46,6 @@ def main() -> int:
     # Keep TT as the default while making CPU available to upstream tests that
     # explicitly exercise default-device and cross-backend behavior.
     os.environ["JAX_PLATFORMS"] = "tt,cpu"
-    os.environ["JAX_USE_SHARDY_PARTITIONER"] = "false"
     os.environ.setdefault(
         "JAX_COMPILATION_CACHE_DIR",
         str(Path(os.environ.get("TEST_TMPDIR", "/tmp")) / "jax_compilation_cache"),

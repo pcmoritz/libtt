@@ -461,7 +461,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_disable_ttlang_python_resolver.patch",
         "//third_party/tt_xla:tt_mlir_ttnn_only_register_all.patch",
         "//third_party/tt_xla:tt_mlir_ttnn_only_runtime_paths.patch",
-        "//third_party/tt_xla:tt_mlir_strip_sharding_constraints.patch",
         "//third_party/tt_xla:tt_mlir_fast_is_sharded_module.patch",
         "//third_party/tt_xla:tt_mlir_fuse_jax_rms_norm.patch",
         "//third_party/tt_xla:tt_mlir_fuse_expanded_silu.patch",
