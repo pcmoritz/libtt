@@ -22,7 +22,7 @@ diff --git a/runtime/include/tt/runtime/detail/ttnn/utils.h b/runtime/include/tt
 +        values = std::move(data);
 +      });
 +  LOG_ASSERT(values.has_value(), "Tensor must have a local buffer");
-+  return *values;
++  return std::move(*values);
 +}
 +
  template <typename T>

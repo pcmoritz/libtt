@@ -1,14 +1,14 @@
 diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 --- a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 +++ b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
-@@ -102,8 +102,38 @@
+@@ -102,8 +102,43 @@
    addMeshToModule(module, meshName, meshMap);
  }
  
 +// An empty mesh is a placeholder that shardings of replicated values may
 +// refer to (JAX adds @empty_mesh next to the real mesh). Point those shardings
 +// at the one other mesh and drop the empty ones.
-+static void replaceEmptyMeshes(mlir::ModuleOp &module) {
++static mlir::LogicalResult replaceEmptyMeshes(mlir::ModuleOp &module) {
 +  auto meshOps = getMeshOps(module);
 +  llvm::SmallVector<mlir::sdy::MeshOp> emptyMeshOps;
 +  mlir::sdy::MeshOp otherMeshOp;
@@ -16,31 +16,36 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +    if (meshOp.getMeshAttr().empty()) {
 +      emptyMeshOps.push_back(meshOp);
 +    } else if (otherMeshOp) {
-+      return;
++      return mlir::success();
 +    } else {
 +      otherMeshOp = meshOp;
 +    }
 +  }
 +  if (!otherMeshOp) {
-+    return;
++    return mlir::success();
 +  }
 +  for (mlir::sdy::MeshOp emptyMeshOp : emptyMeshOps) {
 +    if (mlir::failed(mlir::SymbolTable::replaceAllSymbolUses(
 +            emptyMeshOp.getSymNameAttr(), otherMeshOp.getSymNameAttr(),
 +            module))) {
-+      return;
++      return emptyMeshOp.emitError("Could not replace uses of empty mesh @")
++             << emptyMeshOp.getSymName() << " with mesh @"
++             << otherMeshOp.getSymName();
 +    }
 +    emptyMeshOp.erase();
 +  }
++  return mlir::success();
 +}
 +
  // Normalize a 0D or 1D mesh to 2D. 0D meshes get {1,1}, 1D meshes get {1,N}.
  mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
-+  replaceEmptyMeshes(module);
++  if (mlir::failed(replaceEmptyMeshes(module))) {
++    return mlir::failure();
++  }
    auto meshOps = getMeshOps(module);
    if (meshOps.empty()) {
      return mlir::success();
-@@ -132,6 +162,11 @@
+@@ -132,6 +167,11 @@
    if (meshRank == 1) {
      axisName = meshOps[0].getMeshAttr().getAxes()[0].getName().str();
      axisSize = meshShape[0];
