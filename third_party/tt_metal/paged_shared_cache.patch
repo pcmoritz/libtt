@@ -1,0 +1,341 @@
+diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp
+@@ -145,7 +145,8 @@
+                 "Expect batch in input tensor match the batch in cache tensor");
+         }
+     } else {
+-        TT_FATAL(!operation_attributes.share_cache, "share_cache not supported with paged cache");
++        // The shared-cache semaphore also serializes read/modify/write updates
++        // to overlapping physical pages. Each input retains its own page table.
+         TT_FATAL(update_idxs_tensor.has_value(), "Paged cache requires update_idxs tensor");
+
+         auto page_table_val = page_table.value();
+diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/reader_update_cache_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/reader_update_cache_interleaved_start_id.cpp
+--- ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/reader_update_cache_interleaved_start_id.cpp
++++ ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/reader_update_cache_interleaved_start_id.cpp
+@@ -44,8 +44,12 @@ void kernel_main() {
+     // 0 = legacy unbounded behavior; nonzero = wrap update_idx mod this value before
+     // page_table lookup (bounded sliding-window cache support).
+     constexpr uint32_t cache_position_modulo = get_compile_time_arg_val(18);
++    // Shared paged updates: each tile is read, updated with the rows of every user
++    // that targets it, and written back once by that tile's first user.
++    constexpr bool grouped = get_compile_time_arg_val(19) == 1;
++    constexpr uint32_t num_users = get_compile_time_arg_val(20);
+ 
+-    constexpr auto s0_args = TensorAccessorArgs<19>();
++    constexpr auto s0_args = TensorAccessorArgs<21>();
+     constexpr auto index_tensor_args = TensorAccessorArgs<s0_args.next_compile_time_args_offset()>();
+     constexpr auto page_table_args = TensorAccessorArgs<index_tensor_args.next_compile_time_args_offset()>();
+ 
+@@ -96,23 +100,38 @@ void kernel_main() {
+                 const auto page_table_gen = TensorAccessor(page_table_args, page_table_tensor_addr);
+                 cb_page_table.reserve_back(1);
+                 uint32_t page_table_cb_wr_ptr = cb_page_table.get_write_ptr();
+-                noc.async_read(
+-                    page_table_gen,
+-                    CoreLocalMem<uint32_t>(page_table_cb_wr_ptr),
+-                    page_table_stick_size,
+-                    {.page_id = my_batch_idx},
+-                    {});
++                // Grouped mode reads every user's page table row, in user order.
++                for (uint32_t user = grouped ? 0 : my_batch_idx; user < (grouped ? num_users : my_batch_idx + 1);
++                     ++user) {
++                    noc.async_read(
++                        page_table_gen,
++                        CoreLocalMem<uint32_t>(page_table_cb_wr_ptr + (grouped ? user : 0) * page_table_stick_size),
++                        page_table_stick_size,
++                        {.page_id = user},
++                        {});
++                }
+                 noc.async_read_barrier();
+                 cb_page_table.push_back(1);
+-                volatile tt_l1_ptr uint32_t* page_table_ptr =
+-                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(page_table_cb_wr_ptr);
+-
+-                const uint32_t virtual_block_id = update_idx / block_size;
+-                const uint32_t physical_block_id = page_table_ptr[virtual_block_id];
+-                const uint32_t block_start_id = physical_block_id * num_heads * block_size_t * Wt;
+-                const uint32_t block_row_tile = (update_idx % block_size) / TILE_HEIGHT;
+-                const uint32_t block_offset = block_row_tile * Wt;
+-                cache_id = block_start_id + block_offset;
++                auto tile_id = [&](uint32_t user) {
++                    const uint32_t raw_idx = index_ptr[user];
++                    if (raw_idx == (uint32_t)-1) {
++                        return (uint32_t)-1;
++                    }
++                    const uint32_t idx = cache_position_modulo > 0 ? raw_idx % cache_position_modulo : raw_idx;
++                    volatile tt_l1_ptr uint32_t* page_table_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
++                        page_table_cb_wr_ptr + (grouped ? user : 0) * page_table_stick_size);
++                    const uint32_t physical_block_id = page_table_ptr[idx / block_size];
++                    return physical_block_id * num_heads * block_size_t * Wt +
++                           (idx % block_size) / TILE_HEIGHT * Wt;
++                };
++                (void)update_idx;
++                cache_id = tile_id(my_batch_idx);
++                if constexpr (grouped) {
++                    // Only the first user of a tile reads and writes it.
++                    for (uint32_t user = 0; user < my_batch_idx; ++user) {
++                        skip_update |= tile_id(user) == cache_id;
++                    }
++                }
+ 
+             } else {
+                 const uint32_t cache_batch_tile_offset = my_batch_idx * cache_batch_num_tiles;
+diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/writer_update_cache_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/writer_update_cache_interleaved_start_id.cpp
+--- ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/writer_update_cache_interleaved_start_id.cpp
++++ ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/writer_update_cache_interleaved_start_id.cpp
+@@ -45,8 +45,13 @@ void kernel_main() {
+     // 0 = legacy unbounded behavior; nonzero = wrap update_idx mod this value before
+     // page_table lookup (bounded sliding-window cache support).
+     constexpr uint32_t cache_position_modulo = get_compile_time_arg_val(17);
++    // Shared paged updates: the first user of a tile writes the rows of every
++    // user that targets it, reading their untilized inputs from their cores.
++    constexpr bool grouped = get_compile_time_arg_val(18) == 1;
++    constexpr uint32_t num_users = get_compile_time_arg_val(19);
++    constexpr uint32_t page_table_stick_size = get_compile_time_arg_val(20);
+ 
+-    constexpr auto s0_args = TensorAccessorArgs<18>();
++    constexpr auto s0_args = TensorAccessorArgs<21>();
+ 
+     constexpr uint32_t head_offset_t = Wt * St;
+ 
+@@ -68,6 +73,9 @@ void kernel_main() {
+     uint32_t update_idx = 0;
+ 
+     bool skip_update = false;
++    // Grouped mode: the tile each user updates (-1 if none) and its row offset.
++    uint32_t user_tile[grouped ? num_users : 1];
++    uint32_t user_offset_B[grouped ? num_users : 1];
+ 
+     if constexpr (use_index_tensor) {
+         cb_index.wait_front(1);
+@@ -87,15 +95,25 @@ void kernel_main() {
+             if constexpr (is_paged_cache) {
+                 cb_page_table.wait_front(1);
+                 uint32_t page_table_cb_rd_ptr = cb_page_table.get_read_ptr();
+-                volatile tt_l1_ptr uint32_t* page_table_ptr =
+-                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(page_table_cb_rd_ptr);
+-
+-                const uint32_t virtual_block_id = update_idx / block_size;
+-                const uint32_t physical_block_id = page_table_ptr[virtual_block_id];
+-                const uint32_t block_start_id = physical_block_id * num_heads * block_size_t * Wt;
+-                const uint32_t block_row_tile = (update_idx % block_size) / TILE_HEIGHT;
+-                const uint32_t block_offset = block_row_tile * Wt;
+-                cache_id = block_start_id + block_offset;
++                auto tile_id = [&](uint32_t user) {
++                    const uint32_t raw_idx = index_ptr[user];
++                    if (raw_idx == (uint32_t)-1) {
++                        return (uint32_t)-1;
++                    }
++                    const uint32_t idx = cache_position_modulo > 0 ? raw_idx % cache_position_modulo : raw_idx;
++                    volatile tt_l1_ptr uint32_t* page_table_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
++                        page_table_cb_rd_ptr + (grouped ? user : 0) * page_table_stick_size);
++                    const uint32_t physical_block_id = page_table_ptr[idx / block_size];
++                    return physical_block_id * num_heads * block_size_t * Wt +
++                           (idx % block_size) / TILE_HEIGHT * Wt;
++                };
++                cache_id = tile_id(my_batch_idx);
++                if constexpr (grouped) {
++                    for (uint32_t user = 0; user < num_users; ++user) {
++                        user_tile[user] = tile_id(user);
++                        user_offset_B[user] = index_ptr[user] % TILE_HEIGHT * Wbytes;
++                    }
++                }
+ 
+                 // Page-table value consumed; pop to balance the wait above.
+                 cb_page_table.pop_front(1);
+@@ -118,18 +136,67 @@ void kernel_main() {
+     uint32_t input_l1_read_addr = cb_untilized_input.get_read_ptr();
+     UnicastEndpoint local_src;
+ 
++    // In grouped mode, a user that is not the first of its tile hands its input
++    // to that first user (the leader) and waits until the leader has read it.
++    const uint32_t my_tile = cache_id;
++    uint32_t leader = my_batch_idx;
++    uint32_t members = 0;
++    Semaphore<> sem(receiver_sem_id);
++    if constexpr (grouped) {
++        if (!skip_update) {
++            for (uint32_t user = 0; user < num_users; ++user) {
++                if (user_tile[user] == my_tile) {
++                    leader = user < leader ? user : leader;
++                    members += user != my_batch_idx;
++                }
++            }
++        }
++        if (leader != my_batch_idx) {
++            sem.up(noc, get_arg_val<uint32_t>(7 + 2 * leader), get_arg_val<uint32_t>(8 + 2 * leader), 1);
++            noc.async_atomic_barrier();
++            skip_update = true;
++            members = 0;
++        } else if (members > 0) {
++            // A row written by a later user replaces an earlier user's row, as it
++            // would when updates are serialized.
++            for (uint32_t user = 0; user < num_users; ++user) {
++                for (uint32_t later = user + 1; later < num_users; ++later) {
++                    if (user_tile[later] == user_tile[user] && user_offset_B[later] == user_offset_B[user]) {
++                        user_offset_B[user] = (uint32_t)-1;
++                    }
++                }
++            }
++            sem.wait_min(members);
++        }
++    }
++
+     for (uint32_t cur_head = 0; cur_head < num_heads; ++cur_head) {
+         // Wait on compute to untilize a block. Update that block in L1.
+         cb_untilized_cache.wait_front(Wt);
+         cb_untilized_cache2.reserve_back(Wt);
+ 
+         uint32_t cache_l1_write_addr = cb_untilized_cache.get_read_ptr() + cache_tile_offset_B;
+-        noc.async_read(
+-            local_src,
+-            CoreLocalMem<uint32_t>(cache_l1_write_addr),
+-            Wbytes,
+-            {.noc_x = my_noc_x, .noc_y = my_noc_y, .addr = input_l1_read_addr},
+-            {});
++        if (grouped && members > 0) {
++            for (uint32_t user = 0; user < num_users; ++user) {
++                if (user_tile[user] == my_tile && user_offset_B[user] != (uint32_t)-1) {
++                    noc.async_read(
++                        local_src,
++                        CoreLocalMem<uint32_t>(cb_untilized_cache.get_read_ptr() + user_offset_B[user]),
++                        Wbytes,
++                        {.noc_x = get_arg_val<uint32_t>(7 + 2 * user),
++                         .noc_y = get_arg_val<uint32_t>(8 + 2 * user),
++                         .addr = input_l1_read_addr},
++                        {});
++                }
++            }
++        } else {
++            noc.async_read(
++                local_src,
++                CoreLocalMem<uint32_t>(cache_l1_write_addr),
++                Wbytes,
++                {.noc_x = my_noc_x, .noc_y = my_noc_y, .addr = input_l1_read_addr},
++                {});
++        }
+         noc.async_read_barrier();
+         cb_untilized_cache2.push_back(Wt);
+         cb_untilized_cache.pop_front(Wt);  // NEW
+@@ -160,6 +227,19 @@ void kernel_main() {
+ 
+     cb_untilized_input.pop_front(Wt);
+ 
++    if constexpr (grouped) {
++        if (leader != my_batch_idx) {
++            sem.wait_min(1);  // released by the leader
++        } else if (members > 0) {
++            for (uint32_t user = 0; user < num_users; ++user) {
++                if (user != my_batch_idx && user_tile[user] == my_tile) {
++                    sem.up(noc, get_arg_val<uint32_t>(7 + 2 * user), get_arg_val<uint32_t>(8 + 2 * user), 1);
++                }
++            }
++            noc.async_atomic_barrier();
++        }
++    }
++
+     if (send_signal) {
+         // send signal to receiver core that we are done using the input CB
+         Semaphore<>(receiver_sem_id).up(noc, send_core_x, send_core_y, 1);
+diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_program_factory.cpp
+@@ -170,6 +170,15 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
+     const std::optional<ShardSpec>& shard_spec = input_tensor.shard_spec();
+     CoreRangeSet all_cores = shard_spec.value().grid;
+     uint32_t num_cores = all_cores.num_cores();
++
++    // Shared paged updates write each tile once, from its first user, instead of
++    // serializing all users through one semaphore chain.
++    const bool grouped = operation_attributes.share_cache && is_paged_cache && use_index_tensor;
++    if (grouped) {
++        TT_FATAL(
++            page_table.value().padded_shape()[0] >= num_cores,
++            "Shared paged cache update needs a page table row per user");
++    }
+     uint32_t num_input_tiles = shard_spec.value().shape[0] * shard_spec.value().shape[1] / TILE_HW;
+     auto* in1_buffer = shard_spec.has_value() ? input_tensor.buffer() : nullptr;
+ 
+@@ -264,13 +273,15 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
+     }
+ 
+     if (is_paged_cache) {
++        // Grouped updates read every user's page table row.
++        const uint32_t page_table_cb_size = (grouped ? num_cores : 1) * page_table_stick_size;
+         desc.cbs.push_back(CBDescriptor{
+-            .total_size = page_table_stick_size,
++            .total_size = page_table_cb_size,
+             .core_ranges = all_cores,
+             .format_descriptors = {{CBFormatDescriptor{
+                 .buffer_index = static_cast<uint8_t>(cb_pagetable_id),
+                 .data_format = page_table_data_format,
+-                .page_size = page_table_stick_size,
++                .page_size = page_table_cb_size,
+             }}},
+         });
+     }
+@@ -304,6 +315,8 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
+         St,
+         in0_sequential_mode_semaphore_id,
+         cache_position_modulo,
++        (std::uint32_t)grouped,
++        num_cores,
+     };
+     TensorAccessorArgs(dst_buffer).append_to(reader_compile_time_args);
+     TensorAccessorArgs(update_idxs_tensor.has_value() ? update_idxs_tensor->buffer() : nullptr)
+@@ -331,6 +344,9 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
+         St,
+         in0_sequential_mode_semaphore_id,
+         cache_position_modulo,
++        (std::uint32_t)grouped,
++        num_cores,
++        page_table_stick_size,
+     };
+     TensorAccessorArgs(dst_buffer).append_to(writer_compile_time_args);
+ 
+@@ -386,7 +402,7 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
+ 
+         bool wait_to_start, send_signal;
+         uint32_t send_core_x, send_core_y;
+-        if (operation_attributes.share_cache) {
++        if (operation_attributes.share_cache && !grouped) {
+             // Share cache
+             wait_to_start = i != 0;
+             send_signal = i != num_cores - 1;
+@@ -420,17 +436,23 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
+             reader_desc.emplace_runtime_args(core, rargs);
+         }
+ 
+-        writer_desc.emplace_runtime_args(
+-            core,
+-            {
+-                dst_buffer,
+-                use_index_tensor ? 0u : cache_start_id,
+-                use_index_tensor ? 0u : tile_update_offset_B,
+-                i,
+-                static_cast<uint32_t>(send_signal),
+-                send_core_x,
+-                send_core_y,
+-            });
++        KernelDescriptor::RTArgList wargs;
++        wargs.push_back(dst_buffer);
++        wargs.push_back(use_index_tensor ? 0u : cache_start_id);
++        wargs.push_back(use_index_tensor ? 0u : tile_update_offset_B);
++        wargs.push_back(i);
++        wargs.push_back(static_cast<uint32_t>(send_signal));
++        wargs.push_back(send_core_x);
++        wargs.push_back(send_core_y);
++        if (grouped) {
++            // Every user's core, which grouped writers read inputs from and signal.
++            for (const CoreCoord& user_core : cores) {
++                const CoreCoord physical = device->worker_core_from_logical_core(user_core);
++                wargs.push_back(static_cast<uint32_t>(physical.x));
++                wargs.push_back(static_cast<uint32_t>(physical.y));
++            }
++        }
++        writer_desc.emplace_runtime_args(core, wargs);
+     }
+ 
+     desc.kernels.push_back(std::move(reader_desc));
