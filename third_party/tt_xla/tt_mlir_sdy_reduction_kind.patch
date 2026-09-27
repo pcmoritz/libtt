@@ -9,7 +9,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cp
  
  namespace mlir::tt::stablehlo {
  
-@@ -135,6 +136,218 @@
+@@ -135,6 +136,211 @@
    rewriter.create<mlir::stablehlo::ReturnOp>(loc, reductionOp.getResult());
  }
  
@@ -39,18 +39,17 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cp
 +                             srcOp.getRegion().end());
 +}
 +
-+// The iota whose slice `value` is on this device, along `dim`, or null.
-+static mlir::stablehlo::IotaOp getSlicedIota(Value value, int64_t dim) {
++// Whether `value` is this device's slice of an iota along `dim`.
++static bool isSlicedIota(Value value, int64_t dim) {
 +  auto composite = value.getDefiningOp<mlir::stablehlo::CompositeOp>();
 +  if (!composite || composite.getName() != "sdy.all_slice") {
-+    return nullptr;
++    return false;
 +  }
 +  auto iota = composite.getOperand(0).getDefiningOp<mlir::stablehlo::IotaOp>();
-+  return iota && iota.getIotaDimension() == static_cast<uint64_t>(dim) ? iota
-+                                                                       : nullptr;
++  return iota && iota.getIotaDimension() == static_cast<uint64_t>(dim);
 +}
 +
-+// A reduce with a single result over `dims`, combining with Op.
++// A reduce with a single result over `dim`, combining with Op.
 +template <typename Op>
 +static Value reduceWith(PatternRewriter &rewriter, mlir::Location loc,
 +                        Value input, Value init, int64_t dim) {
@@ -107,19 +106,16 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cp
 +                mlir::tt::shardy_utils::MeshMap &meshMap,
 +                mlir::stablehlo::ChannelHandleAttr channelHandleAttr,
 +                PatternRewriter &rewriter) {
++  Value valueInit = reduceOp.getInitValues()[0];
++  auto init = valueInit.getDefiningOp<mlir::stablehlo::ConstantOp>();
 +  if (reduceOp->getNumResults() != 2 || reduceOp.getDimensions().size() != 1 ||
-+      srcOp.getReductionAxes().size() != 1) {
++      srcOp.getReductionAxes().size() != 1 || !init ||
++      !isSlicedIota(reduceOp.getInputs()[1], reduceOp.getDimensions()[0])) {
 +    return rewriter.notifyMatchFailure(
 +        srcOp, "only argmin/argmax over one mesh axis can be all-reduced");
 +  }
 +  int64_t dim = reduceOp.getDimensions()[0];
 +  // argmax starts from the lowest value, argmin from the highest.
-+  auto init = reduceOp.getInitValues()[0]
-+                  .getDefiningOp<mlir::stablehlo::ConstantOp>();
-+  if (!getSlicedIota(reduceOp.getInputs()[1], dim) || !init) {
-+    return rewriter.notifyMatchFailure(
-+        srcOp, "only argmin/argmax over one mesh axis can be all-reduced");
-+  }
 +  mlir::Attribute initValue = init.getValue().getSplatValue<mlir::Attribute>();
 +  bool isMax;
 +  if (auto floatInit = mlir::dyn_cast<mlir::FloatAttr>(initValue)) {
@@ -146,14 +142,16 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cp
 +  rewriter.setInsertionPointAfter(reduceOp);
 +  Value input = reduceOp.getInputs()[0];
 +  Value slicedIota = reduceOp.getInputs()[1];
-+  auto valueInit = reduceOp.getInitValues()[0];
++  auto extreme = [&](Value values, int64_t along) {
++    return isMax ? reduceWith<mlir::stablehlo::MaxOp>(rewriter, loc, values,
++                                                      valueInit, along)
++                 : reduceWith<mlir::stablehlo::MinOp>(rewriter, loc, values,
++                                                      valueInit, along);
++  };
 +
 +  // This device's extreme value and its global index: the local index plus
 +  // where this device's slice of the iota starts.
-+  Value value = isMax ? reduceWith<mlir::stablehlo::MaxOp>(rewriter, loc,
-+                                                           input, valueInit, dim)
-+                      : reduceWith<mlir::stablehlo::MinOp>(rewriter, loc,
-+                                                           input, valueInit, dim);
++  Value value = extreme(input, dim);
 +  auto slicedType = mlir::cast<mlir::RankedTensorType>(slicedIota.getType());
 +  llvm::SmallVector<int64_t> limits(slicedType.getShape());
 +  limits[dim] = 1;
@@ -211,12 +209,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cp
 +      zero, last);
 +
 +  if (allReduceOps[0]) {
-+    rewriter.replaceOp(
-+        allReduceOps[0],
-+        isMax ? reduceWith<mlir::stablehlo::MaxOp>(rewriter, loc, values,
-+                                                   valueInit, last)
-+              : reduceWith<mlir::stablehlo::MinOp>(rewriter, loc, values,
-+                                                   valueInit, last));
++    rewriter.replaceOp(allReduceOps[0], extreme(values, last));
 +  }
 +  if (allReduceOps[1]) {
 +    rewriter.replaceOp(allReduceOps[1], result);
@@ -228,7 +221,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cp
  // AllGatherOp
  class ShardyToStableHLOAllGatherOpRewritePattern
      : public OpRewritePattern<mlir::sdy::AllGatherOp> {
-@@ -217,6 +430,11 @@
+@@ -217,6 +423,11 @@
      // for each axes that needs to be reduced.
      mlir::tt::shardy_utils::MeshMap meshMap =
          getMeshMap<mlir::sdy::ReduceScatterOp>(srcOp);
@@ -240,7 +233,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cp
  
      Value result = srcOp.getOperand();
      for (auto [reduceScatterDim, axisRefListAttr] :
-@@ -248,9 +466,8 @@
+@@ -248,9 +459,8 @@
                  channelHandleAttr);
          result = reduceScatterOp.getResult();
  
@@ -252,7 +245,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cp
          // Restore insertion point after addReductionBlock, which leaves
          // the rewriter inside the reduction region.
          rewriter.setInsertionPointAfter(reduceScatterOp);
-@@ -291,6 +508,11 @@
+@@ -291,6 +501,11 @@
      // each axes that needs to be reduced.
      mlir::tt::shardy_utils::MeshMap meshMap =
          getMeshMap<mlir::sdy::AllReduceOp>(srcOp);
@@ -264,7 +257,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ShardyCCLToStableHLOCCLPatterns.cp
      Value result = srcOp.getOperand();
  
      for (auto reductionAxis : srcOp.getReductionAxes()) {
-@@ -307,11 +529,8 @@
+@@ -307,11 +522,8 @@
                channelHandleAttr);
        result = allReduceOp.getResult(0);
  
