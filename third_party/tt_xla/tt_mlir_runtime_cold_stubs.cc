@@ -8,7 +8,6 @@
 #include "operations/ccl/moe_expert_token_remap.h"
 #include "operations/ccl/moe_compute.h"
 #include "operations/ccl/moe_gpt.h"
-#include "operations/ccl/point_to_point.h"
 #include "operations/ccl/prepare_moe_compute_w0_w1_weights.h"
 #include "operations/ccl/prepare_moe_compute_w2_weights.h"
 #include "operations/ccl/reduce_scatter.h"
@@ -71,10 +70,6 @@ void run(const ::tt::target::ttnn::MoeComputeOp *, ProgramContext &) {
 
 void run(const ::tt::target::ttnn::MoeGptOp *, ProgramContext &) {
   unsupported("ttnn.moe_gpt");
-}
-
-void run(const ::tt::target::ttnn::PointToPointOp *, ProgramContext &) {
-  unsupported("ttnn.point_to_point");
 }
 
 void run(const ::tt::target::ttnn::PrepareMoEComputeW0W1WeightsOp *,
