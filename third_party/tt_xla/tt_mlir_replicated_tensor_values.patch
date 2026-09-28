@@ -1,0 +1,91 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/utils.h b/runtime/include/tt/runtime/detail/ttnn/utils.h
+--- a/runtime/include/tt/runtime/detail/ttnn/utils.h
++++ b/runtime/include/tt/runtime/detail/ttnn/utils.h
+@@ -209,9 +209,29 @@
+   return createBorrowedTTNNTensor<T>(dataPtr, shape);
+ }
+ 
++// Values of a tensor replicated over the local mesh devices, which can hold
++// one host buffer each. Buffers owned by other hosts are not read.
++template <typename T>
++inline std::vector<T> getReplicatedValues(const ::ttnn::Tensor &tensor) {
++  if (!isOnHost(tensor.storage_type())) {
++    return getReplicatedValues<T>(tensor.cpu());
++  }
++  std::optional<std::vector<T>> values;
++  tensor.host_storage().buffer().apply(
++      [&](const ::tt::tt_metal::HostBuffer &buffer) {
++        std::vector<T> data =
++            ::ttnn::Tensor(buffer, tensor.tensor_spec()).to_vector<T>();
++        LOG_ASSERT(!values || *values == data,
++                   "Replicated values must agree across local devices");
++        values = std::move(data);
++      });
++  LOG_ASSERT(values.has_value(), "Tensor must have a local buffer");
++  return std::move(*values);
++}
++
+ template <typename T>
+ inline T getScalarFromTensor(const ::ttnn::Tensor &tensor) {
+-  std::vector<T> data = tensor.to_vector<T>();
++  std::vector<T> data = getReplicatedValues<T>(tensor);
+   LOG_ASSERT(data.size() == 1, "Scalar tensor must have one element");
+   return data[0];
+ }
+diff --git a/runtime/lib/ttnn/operations/data_movement/slice.cpp b/runtime/lib/ttnn/operations/data_movement/slice.cpp
+--- a/runtime/lib/ttnn/operations/data_movement/slice.cpp
++++ b/runtime/lib/ttnn/operations/data_movement/slice.cpp
+@@ -38,28 +38,42 @@
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+ 
++// Dynamic bounds hold the same values on every device of a mesh.
++static ::ttsl::SmallVector<int32_t>
++getSliceBounds(const ::ttnn::Tensor &bounds) {
++  if (bounds.dtype() == ::ttnn::DataType::UINT32) {
++    std::vector<uint32_t> values =
++        ::tt::runtime::ttnn::utils::getReplicatedValues<uint32_t>(bounds);
++    return ::ttsl::SmallVector<int32_t>(values.begin(), values.end());
++  }
++  std::vector<int32_t> values =
++      ::tt::runtime::ttnn::utils::getReplicatedValues<int32_t>(bounds);
++  return ::ttsl::SmallVector<int32_t>(values.begin(), values.end());
++}
++
+ static void runSliceDynamicOp(const ::tt::target::ttnn::SliceOp *op,
+                               ProgramTensorPool &tensorPool) {
+   const ::ttnn::Tensor &in = tensorPool.getTTNNTensorAndValidate(op->in());
+ 
+-  const ::ttnn::Tensor &begins = tensorPool.getTTNNTensorAndValidate(
+-      op->params_as<target::ttnn::SliceDynamicOpParams>()->begins());
+-  const ::ttnn::Tensor &ends = tensorPool.getTTNNTensorAndValidate(
+-      op->params_as<target::ttnn::SliceDynamicOpParams>()->ends());
+-
+-  std::optional<::ttsl::SmallVector<uint32_t>> step;
++  ::ttsl::SmallVector<int32_t> begins =
++      getSliceBounds(tensorPool.getTTNNTensorAndValidate(
++          op->params_as<target::ttnn::SliceDynamicOpParams>()->begins()));
++  ::ttsl::SmallVector<int32_t> ends =
++      getSliceBounds(tensorPool.getTTNNTensorAndValidate(
++          op->params_as<target::ttnn::SliceDynamicOpParams>()->ends()));
++  ::ttsl::SmallVector<int32_t> step(begins.size(), 1);
+   if (op->step() && op->step()->size() > 0) {
+-    step = ::ttsl::SmallVector<uint32_t>();
+-    step->resize(op->step()->size());
+-    std::transform(op->step()->begin(), op->step()->end(), step->begin(),
+-                   [](int32_t v) { return static_cast<uint32_t>(v); });
++    step.assign(op->step()->begin(), op->step()->end());
+   }
+ 
+   std::optional<::ttnn::MemoryConfig> memoryConfig =
+       ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(
+           ::tt::runtime::ttnn::utils::getTensorRefMemoryConfig(op->out()));
+ 
+-  ::ttnn::Tensor out = ::ttnn::slice(in, begins, ends, step, memoryConfig);
++  ::ttnn::Tensor out = ::ttnn::slice(
++      in, ttsl::Span<const int32_t>(begins.data(), begins.size()),
++      ttsl::Span<const int32_t>(ends.data(), ends.size()),
++      ttsl::Span<const int32_t>(step.data(), step.size()), memoryConfig);
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }

@@ -40,3 +40,22 @@ def test_large_fp32_gather(trace, shape, axis):
         indices = np.array(indices, np.int32)
         result = run(jax.device_put(values, device), jax.device_put(indices, device))
         np.testing.assert_array_equal(np.asarray(result), np.take(values, indices, axis=axis))
+
+
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize("dtype", [np.int32, np.uint32])
+@pytest.mark.parametrize("tail", [(), (4,)])
+def test_multidimensional_integer_gather(trace, dtype, tail):
+    shape = (2, 32) + tail
+    values = np.arange(np.prod(shape), dtype=dtype).reshape(shape) + dtype(2**24 + 257)
+    if dtype == np.int32:
+        values[0] *= -1
+    indices = np.array([np.arange(15, -1, -1), np.arange(16, 32)], np.int32)
+    rows = np.arange(2)[:, None]
+    run = jax.jit(
+        lambda x, i: x[jnp.arange(2)[:, None], i],
+        compiler_options={"optimization_level": "O1", "enable_trace": str(trace).lower()},
+    )
+    device = jax.devices("tt")[0]
+    result = run(jax.device_put(values, device), jax.device_put(indices, device))
+    np.testing.assert_array_equal(np.asarray(result), values[rows, indices])

@@ -1,0 +1,827 @@
+diff --git ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp
+--- ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp
++++ ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp
+@@ -22,7 +22,8 @@
+     const std::optional<tt::tt_metal::SubDeviceId>& subdevice_id,
+     const std::optional<ttnn::MemoryConfig>& memory_config,
+     std::optional<uint32_t> num_links,
+-    std::optional<tt::tt_fabric::Topology> topology) {
++    std::optional<tt::tt_fabric::Topology> topology,
++    reduction_common::ReduceType reduce_type) {
+     // If cluster_axis is None, but mesh shape is not 1xM or Mx1, then we call all-reduce on cluster_axis=1, then
+     // all-reduce on cluster_axis=0
+     if (cluster_axis == std::nullopt) {
+@@ -32,7 +33,7 @@
+         if (!mesh_shape.is_line_topology()) {
+             Tensor tensor = input_tensor;
+             for (size_t i = 0; i < mesh_shape.dims(); ++i) {
+-                tensor = ttnn::all_reduce(tensor, i, subdevice_id, memory_config, num_links, topology);
++                tensor = ttnn::all_reduce(tensor, i, subdevice_id, memory_config, num_links, topology, reduce_type);
+             }
+             return tensor;
+         }
+@@ -67,9 +68,8 @@
+         const auto links = num_links.value_or(ttnn::operations::ccl::common::get_num_links(*mesh_device, cluster_axis));
+         return ttnn::prim::all_reduce_async(
+             input_tensor, scratch, *cluster_axis, *mesh_device, topology_, std::nullopt,
+-            input_tensor.dtype(), DRAM_MEMORY_CONFIG, links, subdevice_id, false, false, true);
++            input_tensor.dtype(), DRAM_MEMORY_CONFIG, links, subdevice_id, false, false, true, reduce_type);
+     }
+-    // Call the experimental all_reduce_async with Sum operation
+     return ::ttnn::experimental::all_reduce_async(
+         input_tensor,
+         cluster_axis,
+@@ -77,7 +77,7 @@
+         std::nullopt,                       // barrier_semaphores
+         std::nullopt,                       // rs_global_semaphores
+         std::nullopt,                       // ag_global_semaphores
+-        reduction_common::ReduceType::Sum,  // Always use Sum
++        reduce_type,
+         memory_config,
+         topology_,
+         num_links,
+diff --git ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.hpp ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.hpp
+--- ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.hpp
++++ ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.hpp
+@@ -7,6 +7,7 @@
+ #include <tt-metalium/sub_device_types.hpp>
+ #include <tt-metalium/experimental/fabric/fabric_edm_types.hpp>
+ #include "ttnn/types.hpp"
++#include "ttnn/operations/reduction/reduction_common/reduction_common.hpp"
+ 
+ namespace ttnn {
+ 
+@@ -16,6 +17,7 @@
+     const std::optional<tt::tt_metal::SubDeviceId>& subdevice_id = std::nullopt,
+     const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
+     std::optional<uint32_t> num_links = std::nullopt,
+-    std::optional<tt::tt_fabric::Topology> topology = std::nullopt);
++    std::optional<tt::tt_fabric::Topology> topology = std::nullopt,
++    reduction_common::ReduceType reduce_type = reduction_common::ReduceType::Sum);
+ 
+ }  // namespace ttnn
+diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_device_operation.cpp ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_device_operation.cpp
+@@ -279,7 +279,8 @@
+     std::optional<uint32_t> num_workers_per_link,
+     std::optional<uint32_t> num_buffers_per_channel,
+     const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
+-    bool use_l1_small_for_semaphores) {
++    bool use_l1_small_for_semaphores,
++    reduction_common::ReduceType math_op) {
+     using OperationType = ttnn::operations::ccl::ReduceScatterDeviceOperation;
+     return ttnn::device_operation::launch<OperationType>(
+         OperationType::operation_attributes_t{
+@@ -294,7 +295,8 @@
+             .num_workers_per_link = num_workers_per_link,
+             .num_buffers_per_channel = num_buffers_per_channel,
+             .compute_kernel_config = compute_kernel_config,
+-            .use_l1_small_for_semaphores = use_l1_small_for_semaphores},
++            .use_l1_small_for_semaphores = use_l1_small_for_semaphores,
++            .math_op = math_op},
+         OperationType::tensor_args_t{.input_tensor = input_tensor, .optional_output_tensor = optional_output_tensor});
+ }
+ }  // namespace ttnn::prim
+diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_device_operation.hpp ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_device_operation.hpp
+--- ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_device_operation.hpp
++++ ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_device_operation.hpp
+@@ -15,6 +15,7 @@
+ #include <tt-metalium/sub_device.hpp>
+ #include <tt-metalium/experimental/fabric/fabric_edm_types.hpp>
+ #include "ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_op_device_operation_types.hpp"
++#include "ttnn/operations/reduction/reduction_common/reduction_common.hpp"
+ 
+ namespace ttnn::operations::ccl {
+ 
+@@ -35,6 +36,7 @@
+         const std::optional<uint32_t> num_buffers_per_channel;
+         const std::optional<ttnn::DeviceComputeKernelConfig> compute_kernel_config;
+         const bool use_l1_small_for_semaphores = false;
++        const reduction_common::ReduceType math_op = reduction_common::ReduceType::Sum;
+     };
+ 
+     struct tensor_args_t {
+@@ -101,5 +103,6 @@
+     std::optional<uint32_t> num_workers_per_link,
+     std::optional<uint32_t> num_buffers_per_channel,
+     const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt,
+-    bool use_l1_small_for_semaphores = false);
++    bool use_l1_small_for_semaphores = false,
++    reduction_common::ReduceType math_op = reduction_common::ReduceType::Sum);
+ }  // namespace ttnn::prim
+diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_program_factory.cpp ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_program_factory.cpp
+@@ -135,7 +135,8 @@
+         operation_attributes.num_workers_per_link,
+         operation_attributes.num_buffers_per_channel,
+         first_coord,  // first core in the subdevice is our offset as we don't use this version for fusions
+-        operation_attributes.compute_kernel_config);
++        operation_attributes.compute_kernel_config,
++        operation_attributes.math_op);
+ 
+     shared_variables_t shared_vars{
+         .multidevice_semaphores = multidevice_semaphores,
+diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp
+--- ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp
++++ ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp
+@@ -32,7 +32,8 @@
+     std::optional<uint32_t> num_workers_per_link,
+     std::optional<uint32_t> num_buffers_per_channel,
+     const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
+-    bool use_l1_small_for_semaphores) {
++    bool use_l1_small_for_semaphores,
++    reduction_common::ReduceType math_op) {
+     // If cluster_axis is None, but mesh shape is not 1xM or Mx1, then we call reduce-scatter on cluster_axis=1, then
+     // reduce-scatter on cluster_axis=0
+     if (cluster_axis == std::nullopt) {
+@@ -54,7 +55,8 @@
+                     num_workers_per_link,
+                     num_buffers_per_channel,
+                     compute_kernel_config,
+-                    use_l1_small_for_semaphores);
++                    use_l1_small_for_semaphores,
++                    math_op);
+             }
+             return tensor;
+         }
+@@ -74,6 +76,7 @@
+         ttnn::ccl::resolve_fp32_acc_compute_kernel_config(compute_kernel_config, input_tensor.dtype());
+ 
+     if (composite_common::use_composite_reduce_scatter(input_tensor, dim, cluster_axis)) {
++        TT_FATAL(math_op == reduction_common::ReduceType::Sum, "Composite reduce-scatter only sums");
+         return composite_common::composite_reduce_scatter(
+             input_tensor,
+             dim,
+@@ -102,7 +105,8 @@
+                num_workers_per_link,
+                num_buffers_per_channel,
+                resolved_compute_kernel_config,
+-               use_l1_small_for_semaphores)
++               use_l1_small_for_semaphores,
++               math_op)
+         .at(1);  // first is the intermediate tensor
+ }
+ 
+diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.hpp ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.hpp
+--- ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.hpp
++++ ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.hpp
+@@ -7,6 +7,7 @@
+ #include <tt-metalium/sub_device_types.hpp>
+ #include <tt-metalium/experimental/fabric/fabric_edm_types.hpp>
+ #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
++#include "ttnn/operations/reduction/reduction_common/reduction_common.hpp"
+ #include "ttnn/types.hpp"
+ 
+ namespace ttnn {
+@@ -25,6 +26,7 @@
+     std::optional<uint32_t> num_workers_per_link = std::nullopt,
+     std::optional<uint32_t> num_buffers_per_channel = std::nullopt,
+     const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt,
+-    bool use_l1_small_for_semaphores = false);
++    bool use_l1_small_for_semaphores = false,
++    reduction_common::ReduceType math_op = reduction_common::ReduceType::Sum);
+ 
+ }  // namespace ttnn
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp
+@@ -99,6 +99,19 @@
+     return sum_tensor;
+ }
+ 
++Tensor local_max_or_min(
++    const ttnn::Tensor& gathered_tensor,
++    int reduce_dim,
++    reduction_common::ReduceType math_op,
++    const std::optional<ttnn::MemoryConfig>& memory_config) {
++    TT_FATAL(
++        math_op == reduction_common::ReduceType::Max || math_op == reduction_common::ReduceType::Min,
++        "All-reduce only supports sum, max and min");
++    return math_op == reduction_common::ReduceType::Max
++               ? ttnn::max(gathered_tensor, reduce_dim, /*keepdim=*/true, memory_config)
++               : ttnn::min(gathered_tensor, reduce_dim, /*keepdim=*/true, memory_config);
++}
++
+ // moreh sum does not support float32 datatype
+ Tensor local_sum_float32(
+     const ttnn::Tensor& gathered_tensor,
+@@ -240,6 +253,12 @@
+         reshaped_tensor.deallocate();
+ 
+         // Reduce (num_devices, B, C, H, W) -> (1, B, C, H, W)
++        if (math_op != reduction_common::ReduceType::Sum) {
++            auto reduced = ttnn::operations::experimental::ccl::local_max_or_min(
++                gather_tensor, static_cast<int>(composite_dim), math_op, out_memory_config);
++            gather_tensor.deallocate();
++            return ttnn::reshape(reduced, initial_shape);
++        }
+         bool is_float32 = (input_tensor.dtype() == ttnn::DataType::FLOAT32);
+         auto sum_tensor = is_float32
+                               ? ttnn::operations::experimental::ccl::local_sum_float32(
+@@ -255,6 +274,7 @@
+     // Reduce scatter + all gather
+     log_debug(tt::LogOp, "Using reduce scatter + all gather");
+ 
++    TT_FATAL(math_op == reduction_common::ReduceType::Sum, "Persistent-semaphore all-reduce only sums");
+     ttnn::Tensor scattered_tensor = ttnn::experimental::reduce_scatter_minimal_async(
+         working_input_tensor,
+         std::nullopt,
+@@ -382,6 +402,12 @@
+         reshaped_tensor.deallocate();
+ 
+         // Reduce (num_devices, B, C, H, W) -> (1, B, C, H, W)
++        if (math_op != reduction_common::ReduceType::Sum) {
++            auto reduced = ttnn::operations::experimental::ccl::local_max_or_min(
++                gather_tensor, static_cast<int>(composite_dim), math_op, out_memory_config);
++            gather_tensor.deallocate();
++            return ttnn::reshape(reduced, initial_shape);
++        }
+         bool is_float32 = (input_tensor.dtype() == ttnn::DataType::FLOAT32);
+         auto sum_tensor = is_float32
+                               ? ttnn::operations::experimental::ccl::local_sum_float32(
+@@ -398,6 +424,7 @@
+     log_debug(tt::LogOp, "Using reduce scatter + all gather");
+     ttnn::Tensor scattered_tensor;
+     if (rs_global_semaphores.has_value() && barrier_semaphores.has_value()) {
++        TT_FATAL(math_op == reduction_common::ReduceType::Sum, "Persistent-semaphore all-reduce only sums");
+         scattered_tensor = ttnn::experimental::reduce_scatter_minimal_async(
+             working_input_tensor,
+             std::nullopt,
+@@ -423,7 +450,10 @@
+             topology_,
+             std::nullopt,
+             std::nullopt,
+-            std::nullopt);
++            std::nullopt,
++            /*compute_kernel_config=*/std::nullopt,
++            /*use_l1_small_for_semaphores=*/false,
++            math_op);
+     }
+     if (interleaved_input_tensor.has_value()) {
+         interleaved_input_tensor->deallocate();
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
+@@ -308,7 +308,8 @@
+     std::optional<tt::tt_metal::SubDeviceId> subdevice_id,
+     bool use_noc1_only,
+     bool use_optimal_ccl_for_llama,
+-    bool fp32_dest_acc) {
++    bool fp32_dest_acc,
++    reduction_common::ReduceType math_op) {
+     using OperationType = ttnn::experimental::prim::AllReduceAsyncDeviceOperation;
+     const auto& mesh_view = mesh_device.get_view();
+     TT_FATAL(
+@@ -327,7 +328,8 @@
+         use_optimal_ccl_for_llama,
+         cluster_axis,
+         &mesh_device,
+-        fp32_dest_acc);
++        fp32_dest_acc,
++        math_op);
+     auto tensor_args = OperationType::tensor_args_t{.input_tensor = input_tensor, .buffer_tensor = buffer_tensor};
+ 
+     return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp
+@@ -52,6 +52,7 @@
+     std::optional<tt::tt_metal::SubDeviceId> subdevice_id,
+     bool use_noc1_only,
+     bool use_optimal_ccl_for_llama,
+-    bool fp32_dest_acc = false);
++    bool fp32_dest_acc = false,
++    reduction_common::ReduceType math_op = reduction_common::ReduceType::Sum);
+ 
+ }  // namespace ttnn::prim
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation_types.hpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation_types.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation_types.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation_types.hpp
+@@ -15,6 +15,7 @@
+ #include "ttnn/operations/ccl/ccl_common.hpp"
+ #include "ttnn/operations/ccl/ccl_op_fusion.hpp"
+ #include "ttnn/global_semaphore.hpp"
++#include "ttnn/operations/reduction/reduction_common/reduction_common.hpp"
+ 
+ namespace ttnn::experimental::prim {
+ 
+@@ -34,6 +35,7 @@
+     // preserves existing bf16 behavior; opted into per-call (e.g. the Llama LM-head all_reduce, whose
+     // ring-order-dependent bf16 sum caused per-row logit non-determinism).
+     bool fp32_dest_acc = false;
++    reduction_common::ReduceType math_op = reduction_common::ReduceType::Sum;
+ 
+     AllReduceAsyncParams(
+         uint32_t num_links,
+@@ -47,7 +49,8 @@
+         bool use_optimal_ccl_for_llama,
+         uint32_t cluster_axis,
+         distributed::MeshDevice* mesh_device,
+-        bool fp32_dest_acc = false) :
++        bool fp32_dest_acc = false,
++        reduction_common::ReduceType math_op = reduction_common::ReduceType::Sum) :
+         num_links(num_links),
+         ring_size(ring_size),
+         dtype(dtype),
+@@ -59,7 +62,8 @@
+         use_optimal_ccl_for_llama(use_optimal_ccl_for_llama),
+         cluster_axis(cluster_axis),
+         mesh_device(mesh_device),
+-        fp32_dest_acc(fp32_dest_acc) {}
++        fp32_dest_acc(fp32_dest_acc),
++        math_op(math_op) {}
+ 
+     // Add attributes method for reflection
+     auto attributes() const {
+@@ -76,6 +80,7 @@
+         attrs.emplace_back("use_optimal_ccl_for_llama", use_optimal_ccl_for_llama);
+         attrs.emplace_back("cluster_axis", cluster_axis);
+         attrs.emplace_back("fp32_dest_acc", fp32_dest_acc);
++        attrs.emplace_back("math_op", math_op);
+         return attrs;
+     }
+ 
+@@ -90,7 +95,8 @@
+         "use_noc1_only",
+         "use_optimal_ccl_for_llama",
+         "cluster_axis",
+-        "sub_device_id");
++        "sub_device_id",
++        "math_op");
+     auto attribute_values() const {
+         return std::make_tuple(
+             num_links,
+@@ -101,7 +107,8 @@
+             use_noc1_only,
+             use_optimal_ccl_for_llama,
+             cluster_axis,
+-            sub_device_id);
++            sub_device_id,
++            math_op);
+     }
+ };
+ 
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
+@@ -16,6 +16,7 @@
+ #include "ttnn/operations/experimental/ccl/llama_common.hpp"
+ #include "ttnn/operations/ccl/ccl_host_datastructures.hpp"
+ #include "ttnn/operations/ccl/ccl_common.hpp"
++#include "ttnn/operations/experimental/ccl/reduce_scatter_common/reduce_scatter_program_utils.hpp"
+ #include "ttnn/operations/math.hpp"
+ #include <tt-metalium/work_split.hpp>
+ #include <tt-metalium/constants.hpp>
+@@ -423,6 +424,7 @@
+         reduction_cb_index,  // reduction_cb_index
+         out_cb_index,        // out_cb_index
+     };
++    ttnn::experimental::ccl::configure_reduce_op(reduction_kernel_config, operation_attributes.math_op, input_tensor.dtype());
+     auto reduction_kernel_id = tt::tt_metal::CreateKernel(
+         program,
+         "ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/compute/"
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/compute/reduction.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/compute/reduction.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/compute/reduction.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/compute/reduction.cpp
+@@ -5,6 +5,7 @@
+ #include <cstdint>
+ #include "api/compute/eltwise_binary.h"
+ #include "api/dataflow/circular_buffer.h"
++#include "cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/kernels/reduce_tiles.hpp"
+ 
+ void kernel_main() {
+     constexpr uint32_t cb_in0 = get_compile_time_arg_val(0);
+@@ -21,7 +22,12 @@
+     const uint32_t block_num_tiles = get_arg_val<uint32_t>(rt_args_idx++);
+     const uint32_t copy_first_block = num_blocks % 2 != 0;
+ 
++#ifdef REDUCE_OP
++    // Max and min keep their second operands in the other half of DST.
++    constexpr uint32_t max_dst_tiles = 4;
++#else
+     constexpr uint32_t max_dst_tiles = 8;  // TODO: Make general
++#endif
+ 
+     CircularBuffer cb_in(cb_in0);
+     CircularBuffer cb_out(cb_out0);
+@@ -38,6 +44,14 @@
+     for (uint32_t p = 0; p < num_pack_iters; ++p) {
+         uint32_t num_tiles_to_pack = std::min(max_dst_tiles, block_num_tiles - block_num_tiles_cnt);
+         tile_regs_acquire();
++#ifdef REDUCE_OP
++        const uint32_t first_tile = p * max_dst_tiles;
++        load_tiles(cb_in0, first_tile, 0, num_tiles_to_pack);
++        for (uint32_t block = 1; block < num_blocks; ++block) {
++            load_tiles(cb_in0, block * block_num_tiles + first_tile, num_tiles_to_pack, num_tiles_to_pack);
++            reduce_dst_tiles(num_tiles_to_pack);
++        }
++#else
+         for (uint32_t block = 0; block < num_blocks; block += 2) {
+             if (copy_first_block && block == 0) {
+                 // TODO: Future support
+@@ -52,6 +66,7 @@
+                 }
+             }
+         }
++#endif
+         tile_regs_commit();
+ 
+         // Pack output tiles
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/kernels/reduce_tiles.hpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/kernels/reduce_tiles.hpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/kernels/reduce_tiles.hpp
+@@ -0,0 +1,39 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++// Max and min reductions for kernels that otherwise sum with add_tiles. The
++// host defines REDUCE_OP and REDUCE_OP_INIT (see reduce_op_defines) to the SFPU
++// function, which reads both operands from DST: results live in DST[0, n) and
++// second operands in DST[n, 2n), so n is at most half of DST.
++#ifdef REDUCE_OP
++
++#include "api/compute/binary_max_min.h"
++#include "api/compute/tile_move_copy.h"
++
++// DST[dst + i] = tile first + i of cb, for i < num_tiles.
++ALWI void load_tiles(uint32_t cb, uint32_t first, uint32_t dst, uint32_t num_tiles) {
++    copy_tile_to_dst_init_short(cb);
++    for (uint32_t i = 0; i < num_tiles; ++i) {
++        copy_tile(cb, first + i, dst + i);
++    }
++}
++
++// DST[i] = REDUCE_OP(DST[i], DST[num_tiles + i]), for i < num_tiles.
++ALWI void reduce_dst_tiles(uint32_t num_tiles) {
++    REDUCE_OP_INIT();
++    for (uint32_t i = 0; i < num_tiles; ++i) {
++        REDUCE_OP(i, num_tiles + i, i);
++    }
++}
++
++// DST[i] = REDUCE_OP(tile i of cb_a, tile i of cb_b), for i < num_tiles.
++ALWI void reduce_tiles(uint32_t cb_a, uint32_t cb_b, uint32_t num_tiles) {
++    load_tiles(cb_a, 0, 0, num_tiles);
++    load_tiles(cb_b, 0, num_tiles, num_tiles);
++    reduce_dst_tiles(num_tiles);
++}
++
++#endif
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/reduce_scatter_program_utils.cpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/reduce_scatter_program_utils.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/reduce_scatter_program_utils.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/reduce_scatter_program_utils.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <tt-logger/tt-logger.hpp>
+ #include <tt-metalium/hal.hpp>
++#include <tt-metalium/circular_buffer_constants.h>
+ 
+ #include "ttnn/operations/experimental/ccl/composite_common.hpp"
+ 
+@@ -278,4 +279,32 @@
+     worker_rt_args.push_back(static_cast<uint32_t>(termination_master_virtual_core.y));
+ }
+ 
++bool reduce_op_uses_fp32_dest(reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype) {
++    return math_op != reduction_common::ReduceType::Sum &&
++           (dtype == tt::tt_metal::DataType::FLOAT32 || dtype == tt::tt_metal::DataType::INT32 ||
++            dtype == tt::tt_metal::DataType::UINT32);
++}
++
++void configure_reduce_op(
++    tt::tt_metal::ComputeConfig& config, reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype) {
++    if (math_op == reduction_common::ReduceType::Sum) {
++        return;
++    }
++    TT_FATAL(
++        math_op == reduction_common::ReduceType::Max || math_op == reduction_common::ReduceType::Min,
++        "Reductions only support sum, max and min");
++    std::string op = math_op == reduction_common::ReduceType::Max ? "binary_max" : "binary_min";
++    if (dtype == tt::tt_metal::DataType::INT32) {
++        op += "_int32";
++    } else if (dtype == tt::tt_metal::DataType::UINT32) {
++        op += "_uint32";
++    }
++    config.defines["REDUCE_OP"] = op + "_tile";
++    config.defines["REDUCE_OP_INIT"] = op + "_tile_init";
++    if (reduce_op_uses_fp32_dest(math_op, dtype)) {
++        config.fp32_dest_acc_en = true;
++        config.unpack_to_dest_mode.assign(NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::UnpackToDestFp32);
++    }
++}
++
+ }  // namespace ttnn::experimental::ccl
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/reduce_scatter_program_utils.hpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/reduce_scatter_program_utils.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/reduce_scatter_program_utils.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/reduce_scatter_program_utils.hpp
+@@ -5,7 +5,9 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include <map>
+ #include <optional>
++#include <string>
+ #include <tuple>
+ #include <vector>
+ 
+@@ -16,6 +18,7 @@
+ 
+ #include "ttnn/distributed/types.hpp"
+ #include "ttnn/operations/ccl/ccl_host_datastructures.hpp"
++#include "ttnn/operations/reduction/reduction_common/reduction_common.hpp"
+ #include "ttnn/tensor/tensor.hpp"
+ 
+ namespace ttnn::experimental::ccl {
+@@ -96,4 +99,13 @@
+     tt::tt_metal::ProgramDescriptor& desc,
+     tt::tt_metal::KernelDescriptor::RTArgList& worker_rt_args);
+ 
++// Whether max or min of 32-bit data needs a 32-bit DST.
++bool reduce_op_uses_fp32_dest(reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype);
++
++// Configures how a reduction kernel combines tiles. Sums need nothing; max and
++// min name the SFPU functions for the data type in REDUCE_OP and REDUCE_OP_INIT
++// and unpack 32-bit data straight into a 32-bit DST so it compares exactly.
++void configure_reduce_op(
++    tt::tt_metal::ComputeConfig& config, reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype);
++
+ }  // namespace ttnn::experimental::ccl
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/dim_zero_line_reduction.cpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/dim_zero_line_reduction.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/dim_zero_line_reduction.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/dim_zero_line_reduction.cpp
+@@ -5,6 +5,7 @@
+ #include <cstdint>
+ #include "api/compute/eltwise_binary.h"
+ #include "api/dataflow/circular_buffer.h"
++#include "cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/kernels/reduce_tiles.hpp"
+ 
+ void kernel_main() {
+     // Define all compile-time arguments at the beginning
+@@ -39,9 +40,13 @@
+                 cb_intermediate.wait_front(tile_granularity);
+ 
+                 tile_regs_acquire();
++#ifdef REDUCE_OP
++                reduce_tiles(input_cb_id, intermediate_cb, num_pages_to_read);
++#else
+                 for (uint32_t tile_id = 0; tile_id < num_pages_to_read; tile_id++) {
+                     add_tiles(input_cb_id, intermediate_cb, tile_id, tile_id, tile_id);
+                 }
++#endif
+                 tile_regs_commit();
+ 
+                 cb_input.pop_front(tile_granularity);
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/dim_zero_ring_reduction.cpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/dim_zero_ring_reduction.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/dim_zero_ring_reduction.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/dim_zero_ring_reduction.cpp
+@@ -5,6 +5,7 @@
+ #include <cstdint>
+ #include "api/compute/eltwise_binary.h"
+ #include "api/dataflow/circular_buffer.h"
++#include "cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/kernels/reduce_tiles.hpp"
+ 
+ void kernel_main() {
+     // Define all compile-time arguments at the beginning
+@@ -52,9 +53,13 @@
+                 cb_intermediate.wait_front(tile_granularity);
+ 
+                 tile_regs_acquire();
++#ifdef REDUCE_OP
++                reduce_tiles(input_cb_id, intermediate_cb, num_pages_to_read);
++#else
+                 for (uint32_t tile_id = 0; tile_id < num_pages_to_read; tile_id++) {
+                     add_tiles(input_cb_id, intermediate_cb, tile_id, tile_id, tile_id);
+                 }
++#endif
+                 tile_regs_commit();
+ 
+                 cb_input.pop_front(tile_granularity);
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/line_reduction.cpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/line_reduction.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/line_reduction.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/line_reduction.cpp
+@@ -5,6 +5,7 @@
+ #include <cstdint>
+ #include "api/compute/eltwise_binary.h"
+ #include "api/dataflow/circular_buffer.h"
++#include "cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/kernels/reduce_tiles.hpp"
+ 
+ void kernel_main() {
+     // Define all compile-time arguments at the beginning
+@@ -41,9 +42,13 @@
+                     cb_intermediate.wait_front(tile_granularity);
+ 
+                     tile_regs_acquire();
++#ifdef REDUCE_OP
++                    reduce_tiles(input_cb_id, intermediate_cb, num_pages_to_read);
++#else
+                     for (uint32_t tile_id = 0; tile_id < num_pages_to_read; tile_id++) {
+                         add_tiles(input_cb_id, intermediate_cb, tile_id, tile_id, tile_id);
+                     }
++#endif
+                     tile_regs_commit();
+ 
+                     cb_input.pop_front(tile_granularity);
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/ring_reduction.cpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/ring_reduction.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/ring_reduction.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/ring_reduction.cpp
+@@ -9,6 +9,7 @@
+ #include "api/compute/eltwise_unary/eltwise_unary.h"
+ #include "cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/kernels/common.hpp"
+ #include "api/dataflow/circular_buffer.h"
++#include "cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/kernels/reduce_tiles.hpp"
+ 
+ void kernel_main() {
+     // Define all compile-time arguments at the beginning
+@@ -90,6 +91,13 @@
+                             cb_interm.wait_front(tile_granularity);
+ 
+                             tile_regs_acquire();  // acquire DST registers for MATH thread, resets DST to 0
++#ifdef REDUCE_OP
++                            reduce_tiles(cb_interm_id, cb_input_id, tiles_to_read);
++                            if (reduce_output) {
++                                load_tiles(cb_interm2_id, 0, tiles_to_read, tiles_to_read);
++                                reduce_dst_tiles(tiles_to_read);
++                            }
++#else
+                             if (reduce_output) {
+                                 copy_tile_init(cb_interm2_id);
+                                 for (uint32_t tile_id = 0; tile_id < tiles_to_read; ++tile_id) {
+@@ -102,6 +110,7 @@
+                             for (uint32_t tile_id = 0; tile_id < tiles_to_read; ++tile_id) {
+                                 add_tiles(cb_interm_id, cb_input_id, tile_id, tile_id, tile_id);
+                             }
++#endif
+                             tile_regs_commit();  // release lock on DST by MATH thread, signal the PACK thread
+ 
+                             if (reduce_output) {
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_line_program_factory.hpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_line_program_factory.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_line_program_factory.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_line_program_factory.hpp
+@@ -7,6 +7,7 @@
+ #include "reduce_scatter_minimal_async_op_device_operation_types.hpp"
+ #include "ttnn/device_operation.hpp"
+ #include "ttnn/operations/ccl/ccl_op_fusion.hpp"
++#include "ttnn/operations/reduction/reduction_common/reduction_common.hpp"
+ 
+ #include <tt-metalium/core_coord.hpp>
+ #include <tt-metalium/host_api.hpp>
+@@ -62,7 +63,8 @@
+     std::optional<uint32_t> num_workers_per_direction_opt,
+     std::optional<uint32_t> num_buffers_per_channel,
+     CoreCoord core_grid_offset,
+-    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config);
++    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
++    reduction_common::ReduceType math_op = reduction_common::ReduceType::Sum);
+ 
+ // Override runtime arguments helper for line topology
+ void line_reduce_scatter_minimal_async_helper_override_runtime_arguments(
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_program.cpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_program.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_program.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_program.cpp
+@@ -357,7 +357,8 @@
+     std::optional<uint32_t> num_workers_per_direction_opt,
+     std::optional<uint32_t> num_buffers_per_channel,
+     const CoreCoord core_grid_offset,
+-    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config) {
++    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
++    reduction_common::ReduceType math_op = reduction_common::ReduceType::Sum) {
+     auto* mesh_device = input_tensor.device();
+     [[maybe_unused]] bool is_first_chip = ring_index == 0;
+     [[maybe_unused]] bool is_last_chip = ring_index == ring_size - 1;
+@@ -493,7 +494,9 @@
+     const uint32_t output_channel_num_pages = output_batch_num_pages / slice_C;
+ 
+     // Extract compute kernel config parameters
+-    const bool fp32_dest_acc_en = ttnn::get_fp32_dest_acc_en(compute_kernel_config);
++    const bool fp32_dest_acc_en =
++        ttnn::get_fp32_dest_acc_en(compute_kernel_config) ||
++        ::ttnn::experimental::ccl::reduce_op_uses_fp32_dest(math_op, input_tensor.dtype());
+     const tt::tt_metal::MathFidelity math_fidelity = compute_kernel_config.has_value()
+         ? ttnn::get_math_fidelity(compute_kernel_config)
+         : tt::tt_metal::MathFidelity::HiFi4;
+@@ -509,6 +512,10 @@
+     uint32_t num_pages_per_packet = packet_size_bytes / l1_scratch_cb_page_size_bytes;
+     uint32_t num_tiles_to_write_per_packet = std::min(max_target_noc_addresses_per_packet, num_pages_per_packet);
+     uint32_t tile_granularity = std::min(4 * num_tiles_to_write_per_packet, max_dst_size);
++    if (math_op != reduction_common::ReduceType::Sum) {
++        // Max and min read both operands from DST, so they use half of it.
++        tile_granularity = std::min(tile_granularity, max_dst_size / 2);
++    }
+     uint32_t cb_num_pages = 2 * tile_granularity;  // double buffering
+     tt::DataFormat df = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
+ 
+@@ -684,6 +691,7 @@
+                                           : "ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/"
+                                             "device/kernels/ring_reduction.cpp";
+ 
++    ::ttnn::experimental::ccl::configure_reduce_op(compute_kernel_config_, math_op, input_tensor.dtype());
+     auto compute_kernel_id =
+         tt::tt_metal::CreateKernel(program, compute_kernel_path, sender_worker_core_range_set, compute_kernel_config_);
+ 
+@@ -958,7 +966,8 @@
+     std::optional<uint32_t> num_workers_per_direction_opt,
+     std::optional<uint32_t> num_buffers_per_channel,
+     const CoreCoord core_grid_offset,
+-    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config) {
++    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
++    reduction_common::ReduceType math_op = reduction_common::ReduceType::Sum) {
+     /**
+      * Line Reduce Scatter
+      *
+@@ -1066,7 +1075,9 @@
+     CoreRangeSet mux_core_range_set = CoreRangeSet(mux_core_ranges);
+ 
+     // Extract compute kernel config parameters
+-    const bool fp32_dest_acc_en = ttnn::get_fp32_dest_acc_en(compute_kernel_config);
++    const bool fp32_dest_acc_en =
++        ttnn::get_fp32_dest_acc_en(compute_kernel_config) ||
++        ::ttnn::experimental::ccl::reduce_op_uses_fp32_dest(math_op, input_tensor.dtype());
+     const tt::tt_metal::MathFidelity math_fidelity = compute_kernel_config.has_value()
+         ? ttnn::get_math_fidelity(compute_kernel_config)
+         : tt::tt_metal::MathFidelity::HiFi4;
+@@ -1080,6 +1091,10 @@
+     uint32_t max_scatter_write_pages = 2;
+     uint32_t tiles_to_write_per_packet = std::min(num_pages_per_packet, max_scatter_write_pages);
+     uint32_t tile_granularity = std::min(4 * num_pages_per_packet, max_dst_size);
++    if (math_op != reduction_common::ReduceType::Sum) {
++        // Max and min read both operands from DST, so they use half of it.
++        tile_granularity = std::min(tile_granularity, max_dst_size / 2);
++    }
+     uint32_t cb_num_pages = 3 * tile_granularity;  // triple buffering
+     tt::DataFormat df = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
+ 
+@@ -1338,6 +1353,7 @@
+             slice_C,
+             normalized_dim)
+     };
++    ::ttnn::experimental::ccl::configure_reduce_op(sender_reduce_kernel_config, math_op, input_tensor.dtype());
+ 
+     std::string sender_reduce_kernel_path =
+         normalized_dim == 0 ? "ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/"
+@@ -1597,7 +1613,8 @@
+     std::optional<uint32_t> num_workers_per_direction_opt,
+     std::optional<uint32_t> num_buffers_per_channel,
+     CoreCoord core_grid_offset,
+-    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config) {
++    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
++    reduction_common::ReduceType math_op) {
+     return ::ttnn::build_ring_reduce_scatter_minimal_async_program_artifacts(
+         program,
+         input_tensor,
+@@ -1620,7 +1637,8 @@
+         num_workers_per_direction_opt,
+         num_buffers_per_channel,
+         core_grid_offset,
+-        compute_kernel_config);
++        compute_kernel_config,
++        math_op);
+ }
+ 
+ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_artifacts(
+@@ -1645,7 +1663,8 @@
+     std::optional<uint32_t> num_workers_per_direction_opt,
+     std::optional<uint32_t> num_buffers_per_channel,
+     CoreCoord core_grid_offset,
+-    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config) {
++    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
++    reduction_common::ReduceType math_op) {
+     return ::ttnn::build_line_reduce_scatter_minimal_async_program_artifacts(
+         program,
+         input_tensor,
+@@ -1668,7 +1687,8 @@
+         num_workers_per_direction_opt,
+         num_buffers_per_channel,
+         core_grid_offset,
+-        compute_kernel_config);
++        compute_kernel_config,
++        math_op);
+ }
+ 
+ void ring_reduce_scatter_minimal_async_helper_override_runtime_arguments(
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_ring_program_factory.hpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_ring_program_factory.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_ring_program_factory.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_ring_program_factory.hpp
+@@ -7,6 +7,7 @@
+ #include "reduce_scatter_minimal_async_op_device_operation_types.hpp"
+ #include "ttnn/device_operation.hpp"
+ #include "ttnn/operations/ccl/ccl_op_fusion.hpp"
++#include "ttnn/operations/reduction/reduction_common/reduction_common.hpp"
+ 
+ #include <tt-metalium/core_coord.hpp>
+ #include <tt-metalium/host_api.hpp>
+@@ -62,7 +63,8 @@
+     std::optional<uint32_t> num_workers_per_direction_opt,
+     std::optional<uint32_t> num_buffers_per_channel,
+     CoreCoord core_grid_offset,
+-    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config);
++    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
++    reduction_common::ReduceType math_op = reduction_common::ReduceType::Sum);
+ 
+ // Override runtime arguments helper for ring topology
+ void ring_reduce_scatter_minimal_async_helper_override_runtime_arguments(

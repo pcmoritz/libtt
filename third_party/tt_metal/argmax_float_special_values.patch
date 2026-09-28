@@ -1,0 +1,95 @@
+diff --git a/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp b/ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp
+--- ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp
++++ ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_common.hpp
+@@ -108,6 +108,27 @@
+     return (a & FLOAT16_SIGN_MASK) ? a < b : a > b;
+ }
+ 
++// Argmax treats both zeros as equal and selects the first NaN, regardless of
++// its sign or payload. The generic numeric comparators do not implement this.
++template <DataFormat data_format, typename ValueType, typename CompareFunc>
++inline bool argmax_greater(ValueType a, ValueType b, CompareFunc compare_func) {
++    if constexpr (data_format == DataFormat::Float16_b || data_format == DataFormat::Float16 ||
++                  data_format == DataFormat::Float32) {
++        constexpr uint32_t magnitude_mask = data_format == DataFormat::Float32 ? 0x7FFFFFFF : 0x7FFF;
++        constexpr uint32_t infinity = data_format == DataFormat::Float32 ? 0x7F800000 :
++                                      data_format == DataFormat::Float16 ? 0x7C00 : 0x7F80;
++        const auto magnitude_a = a & magnitude_mask;
++        const auto magnitude_b = b & magnitude_mask;
++        if (magnitude_a > infinity || magnitude_b > infinity) {
++            return magnitude_a > infinity && magnitude_b <= infinity;
++        }
++        if ((magnitude_a | magnitude_b) == 0) {
++            return false;
++        }
++    }
++    return compare_func(a, b);
++}
++
+ /**
+  * @brief Helper function to calculate the index for argmax operations.
+  *
+@@ -141,10 +162,10 @@
+  * @param index The index of the value
+  * @param compare_func The comparison function to use
+  */
+-template <typename ValueType, typename CompareFunc>
++template <DataFormat data_format, typename ValueType, typename CompareFunc>
+ inline void update_max_if_greater(
+     ValueType& max_val, uint32_t& max_idx, const ValueType val, const uint32_t index, CompareFunc compare_func) {
+-    if (compare_func(val, max_val)) {
++    if (argmax_greater<data_format>(val, max_val, compare_func)) {
+         max_idx = index;
+         max_val = val;
+     }
+@@ -191,17 +212,17 @@
+     const uint32_t index = calculate_argmax_index(reduce_all, k, j, i, inner_dim_units, red_dim_units);
+ 
+     if constexpr (data_format == DataFormat::Float16_b) {
+-        update_max_if_greater(max_val, max_idx, val, index, bfloat16_greater);
++        update_max_if_greater<data_format>(max_val, max_idx, val, index, bfloat16_greater);
+     } else if constexpr (data_format == DataFormat::Float16) {
+-        update_max_if_greater(max_val, max_idx, val, index, float16_greater);
++        update_max_if_greater<data_format>(max_val, max_idx, val, index, float16_greater);
+     } else if constexpr (data_format == DataFormat::Float32) {
+-        update_max_if_greater(max_val, max_idx, val, index, float32_greater);
++        update_max_if_greater<data_format>(max_val, max_idx, val, index, float32_greater);
+     } else if constexpr (data_format == DataFormat::UInt16) {
+-        update_max_if_greater(max_val, max_idx, val, index, [](auto a, auto b) { return a > b; });
++        update_max_if_greater<data_format>(max_val, max_idx, val, index, [](auto a, auto b) { return a > b; });
+     } else if constexpr (data_format == DataFormat::Int32) {
+-        update_max_if_greater(max_val, max_idx, val, index, int32_greater);
++        update_max_if_greater<data_format>(max_val, max_idx, val, index, int32_greater);
+     } else if constexpr (data_format == DataFormat::UInt32) {
+-        update_max_if_greater(max_val, max_idx, val, index, [](auto a, auto b) { return a > b; });
++        update_max_if_greater<data_format>(max_val, max_idx, val, index, [](auto a, auto b) { return a > b; });
+     } else {
+         // We need a value-dependent expression (gcc-12) that is not
+         // tautologically false (gcc-15)
+@@ -236,10 +257,10 @@
+     CompareFunc compare_func) {
+     ValueType val = i_red_vals[inner_idx];
+ 
+-    if (compare_func(val, max_val)) {
++    if (argmax_greater<data_format>(val, max_val, compare_func)) {
+         max_idx = i_red_idxs[inner_idx];
+         max_val = val;
+-    } else if ((val == max_val) && (i_red_idxs[inner_idx] < max_idx)) {
++    } else if (!argmax_greater<data_format>(max_val, val, compare_func) && (i_red_idxs[inner_idx] < max_idx)) {
+         max_idx = i_red_idxs[inner_idx];
+     }
+ }
+@@ -276,11 +297,11 @@
+     const uint32_t inner_dim_units,
+     const uint32_t red_dim_units,
+     CompareFunc compare_func) {
+-    if (compare_func(val, max_val)) {
++    if (argmax_greater<data_format>(val, max_val, compare_func)) {
+         auto full_idx = outer_idx * inner_dim_units * red_dim_units + j * red_dim_units + i;
+         max_idx = reduce_all ? full_idx : i;
+         max_val = val;
+-    } else if (val == max_val) {
++    } else if (!argmax_greater<data_format>(max_val, val, compare_func)) {
+         auto full_idx = outer_idx * inner_dim_units * red_dim_units + j * red_dim_units + i;
+         max_idx = reduce_all ? std::min(max_idx, full_idx) : std::min(max_idx, i);
+     }
