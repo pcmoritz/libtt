@@ -1,27 +1,26 @@
 diff --git a/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp b/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
 --- a/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
 +++ b/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
-@@ -2,6 +2,8 @@
- //
- // SPDX-License-Identifier: Apache-2.0
+@@ -30,10 +30,12 @@
+   MeshMapperConfig meshMapperConfig;
  
-+#include <algorithm>
-+
- #include "tt/runtime/detail/common/logger.h"
- #include "tt/runtime/detail/ttnn/ttnn.h"
- #include "tt/runtime/detail/ttnn/utils.h"
-@@ -47,8 +49,23 @@
+   auto *placements = op->mapper_config()->placements();
++  bool replicate = true;
+   for (const auto *placement : *placements) {
+     if (placement->type() == ::tt::target::ttnn::PlacementType::Replicate) {
+       meshMapperConfig.placements.push_back(MeshMapperConfig::Replicate());
+     } else if (placement->type() == ::tt::target::ttnn::PlacementType::Shard) {
++      replicate = false;
+       meshMapperConfig.placements.push_back(
+           MeshMapperConfig::Shard{placement->dim()});
+     }
+@@ -47,8 +49,18 @@
    }
    std::unique_ptr<TensorToMesh> meshMapper =
        ::ttnn::distributed::create_mesh_mapper(meshDevice, meshMapperConfig);
 +
 +  // An input that JAX already placed on every device arrives with one host
 +  // buffer per device, each holding the same data. Replicate one of them.
-+  bool replicate = std::all_of(
-+      placements->begin(), placements->end(), [](const auto *placement) {
-+        return placement->type() ==
-+               ::tt::target::ttnn::PlacementType::Replicate;
-+      });
 +  const auto &buffer = input.host_storage().buffer();
 +  ::ttnn::Tensor source = input;
 +  if (replicate && buffer.shape().mesh_size() > 1 &&
