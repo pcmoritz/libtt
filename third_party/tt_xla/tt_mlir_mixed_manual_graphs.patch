@@ -1,25 +1,39 @@
 diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 --- a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 +++ b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
-@@ -249,35 +249,42 @@ bool sdyAnnotationsExist(mlir::ModuleOp &module) {
+@@ -249,36 +249,42 @@
    return false;
  }
  
 -// Check if the graph is solved.
-+// A function is solved when manual computations already partition it: its
-+// arguments feed only computations that are manual over every mesh axis of
-+// size > 1, and there is at least one. A function that also computes on its
-+// arguments outside of them (e.g. a shard_map inside automatically sharded
-+// code), or leaves axes automatic inside them, still needs propagation.
++// A module is solved when manual computations already partition it: the top
++// level of each public function holds only computations that are manual over
++// every mesh axis of size > 1, and returns. Anything else, e.g. a shard_map
++// next to automatically sharded ops, still needs propagation and localization.
  bool isGraphSolved(mlir::ModuleOp &module) {
 -  for (auto &op : module.getBody()->getOperations()) {
 -    if (!mlir::isa<func::FuncOp>(op)) {
--      continue;
 +  llvm::SmallVector<mlir::sdy::MeshOp> meshOps = getMeshOps(module);
-+  auto isManual = [&](mlir::Operation *op) {
++  if (meshOps.size() != 1) {
++    return false;
++  }
++  auto isFullyManual = [&](mlir::Operation &op) {
 +    auto manual = mlir::dyn_cast<mlir::sdy::ManualComputationOp>(op);
 +    if (!manual || manual.getManualAxes().empty()) {
 +      return false;
++    }
++    return llvm::all_of(
++        meshOps.front().getMesh().getAxes(), [&](mlir::sdy::MeshAxisAttr axis) {
++          return axis.getSize() == 1 ||
++                 llvm::is_contained(manual.getManualAxes(),
++                                    mlir::StringAttr::get(module.getContext(),
++                                                          axis.getName()));
++        });
++  };
++  bool hasManual = false;
++  for (auto funcOp : module.getBody()->getOps<func::FuncOp>()) {
++    if (!funcOp.isPublic() || funcOp.isExternal()) {
+       continue;
      }
 -
 -    func::FuncOp funcOp = mlir::cast<func::FuncOp>(op);
@@ -34,40 +48,26 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 -        if (!manualComputationOp.getManualAxes().empty()) {
 -          return WalkResult::interrupt();
 -        }
--      }
++    for (mlir::Operation &op : funcOp.getBody().front()) {
++      if (isFullyManual(op)) {
++        hasManual = true;
++      } else if (!mlir::isa<func::ReturnOp>(op)) {
++        return false;
+       }
 -
 -      return WalkResult::advance();
 -    });
 -
 -    if (result.wasInterrupted()) {
-+    if (meshOps.empty()) {
-+      return true;
-+    }
-+    return llvm::all_of(
-+        meshOps.front().getMesh().getAxes(), [&](mlir::sdy::MeshAxisAttr axis) {
-+          return axis.getSize() == 1 ||
-+                 llvm::is_contained(manual.getManualAxes(),
-+                                    mlir::StringAttr::get(module.getContext(),
-+                                                          axis.getName()));
-+        });
-+  };
-+  for (auto funcOp : module.getBody()->getOps<func::FuncOp>()) {
-+    bool hasManual = false;
-+    funcOp.walk([&](mlir::Operation *op) { hasManual |= isManual(op); });
-+    bool argumentsOnlyFeedManual =
-+        llvm::all_of(funcOp.getArguments(), [&](mlir::BlockArgument arg) {
-+          return llvm::all_of(arg.getUsers(), [&](mlir::Operation *user) {
-+            return isManual(user) || mlir::isa<mlir::func::ReturnOp>(user);
-+          });
-+        });
-+    if (hasManual && argumentsOnlyFeedManual) {
-       return true;
+-      return true;
      }
    }
 -
-   return false;
+-  return false;
++  return hasManual;
  }
  
+ // Create a new DictionaryAttr from an old DictionaryAttr with all sdy.sharding
 diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 --- a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
