@@ -37,25 +37,26 @@ diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_cle
  
  #include "mlir/Pass/PassManager.h"
  #include "mlir/Transforms/Passes.h"
-@@ -383,6 +384,17 @@
+@@ -383,6 +384,18 @@
      manualComputationOps.push_back(op);
    });
  
 +  // The program distributes unsharded arguments itself, so JAX must pass
 +  // them whole. Note them before the TT attributes are stripped.
 +  auto main = module.lookupSymbol<mlir::func::FuncOp>("main");
-+  llvm::SmallVector<bool> unsharded;
-+  for (unsigned i = 0; main && i < main.getNumArguments(); ++i) {
++  TT_FATAL(main, "Expected a main function in module");
++  llvm::SmallVector<bool> unsharded(main.getNumArguments());
++  for (unsigned i = 0; i < unsharded.size(); ++i) {
 +    auto status = main.getArgAttrOfType<mlir::tt::ttcore::ShardStatusAttr>(
 +        i, mlir::tt::ttcore::ShardStatusAttr::name);
-+    unsharded.push_back(status && status.getValue() ==
-+                                      mlir::tt::ttcore::ShardStatus::Unsharded);
++    unsharded[i] = status && status.getValue() ==
++                                 mlir::tt::ttcore::ShardStatus::Unsharded;
 +  }
 +
    module.walk([&](mlir::func::FuncOp funcOp) {
      internal::stripTTDialectAttributes(funcOp);
    });
-@@ -409,6 +421,29 @@
+@@ -409,6 +422,29 @@
      auto meshOp = meshOps.front();
  
      auto manualComputationOp = manualComputationOps.front();
