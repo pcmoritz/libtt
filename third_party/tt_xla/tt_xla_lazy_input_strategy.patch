@@ -1,26 +1,3 @@
-diff --git a/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h b/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h
---- a/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h
-+++ b/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h
-@@ -9,6 +9,7 @@
- // c++ standard library includes
- #include <cstdint>
- #include <memory>
-+#include <mutex>
- #include <optional>
- #include <vector>
- 
-@@ -64,6 +65,11 @@ private:
-   void
-   materializeShellTensors(const std::vector<BufferInstance *> &arg_buffers);
- 
-+  // Expected layouts of the inputs of program 0, read from the flatbuffer
-+  // once instead of on every execution.
-+  std::once_flag m_input_layouts_once;
-+  std::vector<tt::runtime::Layout> m_input_layouts;
-+
-   // Creates flatbuffer loaded executable instance from the executable image.
-   FlatbufferLoadedExecutableInstance(
-       std::shared_ptr<FlatbufferExecutableImage> executable_image,
 diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/tensor.h
 --- a/pjrt_implementation/inc/api/tensor.h
 +++ b/pjrt_implementation/inc/api/tensor.h
@@ -43,13 +20,10 @@ diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/
 diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
-@@ -59,17 +59,14 @@ FlatbufferLoadedExecutableInstance::prepareInputTensor(
-   FlatbufferExecutableImage *executable_image =
-       static_cast<FlatbufferExecutableImage *>(m_executable_image.get());
+@@ -62,23 +62,27 @@ FlatbufferLoadedExecutableInstance::prepareInputTensor(
+   tt::runtime::Layout expected_layout = tt::runtime::getLayout(
+       executable_image->getFlatbufferBinary(), program_index, arg_index);
  
--  tt::runtime::Layout expected_layout = tt::runtime::getLayout(
--      executable_image->getFlatbufferBinary(), program_index, arg_index);
--
 -  mlir::FailureOr<std::unordered_map<std::string, std::string>> strategy =
 -      fillStrategyMapFromSharding(
 -          m_executable_image->getInputSharding(arg_index), num_devices);
@@ -58,18 +32,10 @@ diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.c
 -    LOG_F(ERROR, "Failed to fill strategy map from sharding");
 -    return std::nullopt;
 -  }
-+  TT_FATAL(program_index == 0, "Only program 0 is executed");
-+  std::call_once(m_input_layouts_once, [&] {
-+    for (size_t i = 0; i < m_executable_image->getNumInputs(); ++i) {
-+      m_input_layouts.push_back(tt::runtime::getLayout(
-+          executable_image->getFlatbufferBinary(), program_index, i));
-+    }
-+  });
-+  const tt::runtime::Layout &expected_layout = m_input_layouts[arg_index];
- 
+-
    bool is_distributed = ::tt::runtime::getCurrentHostRuntime() ==
                          tt::runtime::HostRuntime::Distributed;
-@@ -77,8 +74,21 @@ FlatbufferLoadedExecutableInstance::prepareInputTensor(
+   if (is_distributed) {
      materializeShellTensors(arg_buffers);
    }
  
