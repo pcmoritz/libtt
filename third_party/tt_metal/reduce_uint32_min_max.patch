@@ -13,7 +13,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
  #include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
  #include "ttnn/operations/reduction/generic/device/welford_reduce_device_operation.hpp"
  #include "ttnn/operations/data_movement/permute/permute.hpp"
-@@ -675,6 +680,35 @@ Tensor mean(
+@@ -675,6 +680,41 @@ Tensor mean(
          fast_and_approximate_mode);
  }
  
@@ -30,18 +30,24 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
 +    const std::optional<MemoryConfig>& memory_config,
 +    const std::optional<CoreRangeSet>& sub_core_grids) {
 +    auto constant = [&](const Tensor& like, int value) { return ttnn::full_like(like, value); };
-+    auto reduce_int32 = [&](const Tensor& t, bool keep) {
-+        return is_max ? ttnn::max(t, dim_arg, keep, memory_config, std::nullopt, 1.0f, true, sub_core_grids)
-+                      : ttnn::min(t, dim_arg, keep, memory_config, std::nullopt, 1.0f, true, sub_core_grids);
++    // Reduce with kept dims so the high-half extreme broadcasts against the input, and drop them once at the end.
++    auto reduce_int32 = [&](const Tensor& t) {
++        return is_max ? ttnn::max(t, dim_arg, true, memory_config, std::nullopt, 1.0f, true, sub_core_grids)
++                      : ttnn::min(t, dim_arg, true, memory_config, std::nullopt, 1.0f, true, sub_core_grids);
 +    };
 +    Tensor high = ttnn::typecast(ttnn::logical_right_shift(input, constant(input, 16)), DataType::INT32);
 +    Tensor low = ttnn::typecast(ttnn::bitwise_and(input, constant(input, 0xFFFF)), DataType::INT32);
++    Tensor high_extreme = reduce_int32(high);
 +    // Low halves of elements whose high half is not the extreme can never win.
-+    Tensor candidates =
-+        ttnn::where(ttnn::eq(high, reduce_int32(high, true)), low, constant(low, is_max ? -1 : 0x10000));
-+    Tensor high_result = ttnn::typecast(reduce_int32(high, keepdim), DataType::UINT32);
-+    Tensor low_result = ttnn::typecast(reduce_int32(candidates, keepdim), DataType::UINT32);
-+    return ttnn::bitwise_or(ttnn::logical_left_shift(high_result, constant(high_result, 16)), low_result);
++    Tensor candidates = ttnn::where(ttnn::eq(high, high_extreme), low, constant(low, is_max ? -1 : 0x10000));
++    Tensor high_result = ttnn::typecast(high_extreme, DataType::UINT32);
++    Tensor low_result = ttnn::typecast(reduce_int32(candidates), DataType::UINT32);
++    Tensor result = ttnn::bitwise_or(ttnn::logical_left_shift(high_result, constant(high_result, 16)), low_result);
++    if (keepdim) {
++        return result;
++    }
++    return operations::reduction::adjust_shape(
++        result, input.logical_shape(), false, ::reduction_common::generate_reduce_dim(input, dim_arg), {});
 +}
 +
 +}  // namespace
@@ -49,7 +55,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
  Tensor max(
      const Tensor& input_tensor_arg,
      const std::optional<std::variant<int, int64_t, ttsl::SmallVector<int>>>& dim_arg,
-@@ -684,6 +718,9 @@ Tensor max(
+@@ -684,6 +724,9 @@ Tensor max(
      float scalar,
      bool correction,
      const std::optional<CoreRangeSet>& sub_core_grids) {
@@ -59,7 +65,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
      /* Scaling is applied after reduction, so flip the op for negative scalars:
       * max(s * x) = s * min(x) when s < 0.*/
      if (scalar < 0.0f) {
-@@ -717,6 +754,9 @@ Tensor min(
+@@ -717,6 +760,9 @@ Tensor min(
      float scalar,
      bool correction,
      const std::optional<CoreRangeSet>& sub_core_grids) {

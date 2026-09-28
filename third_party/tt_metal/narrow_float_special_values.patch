@@ -19,7 +19,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_ty
 index 0609fef..92a788f 100644
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
-@@ -244,10 +244,8 @@ inline void calculate_typecast_fp32_to_uint32() {
+@@ -244,19 +244,28 @@ inline void calculate_typecast_fp32_to_uint32() {
  
  template <bool APPROXIMATION_MODE, int ITERATIONS>
  inline void calculate_typecast_fp32_to_fp16b() {
@@ -27,18 +27,25 @@ index 0609fef..92a788f 100644
 -    // low 16 bits (&0xFFFF0000), and store FP32 for 32-bit-Dest correctness. The historical
 -    // macro relied on a FP16B store to truncate and does not reproduce the masked-FP32 result,
 -    // so it is not equivalent and is not restored here. See #46751.
+-#pragma GCC unroll 0
+-    for (int d = 0; d < ITERATIONS; d++) {
+-        TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::DEFAULT, ADDR_MOD_7, 0);
+-        TTI_SFPSHFT((-16) & 0xFFF, p_sfpu::LREG1, p_sfpu::LREG0, 5);                // lreg[0] = lreg[1] >> 16
+-        TTI_SFPAND(0, p_sfpu::LREG12, p_sfpu::LREG0, 0);                            // lreg[0] &= 1
+-        TTI_SFPIADD(0, p_sfpu::LREG13, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);  // lreg[1] += 0x7FFF
+-        TTI_SFPIADD(0, p_sfpu::LREG0, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);   // lreg[1] += lreg[0]
+-        TTI_SFPAND(0, p_sfpu::LREG14, p_sfpu::LREG1, 0);                            // lreg[1] &= 0xFFFF0000
+-        TTI_SFPSTORE(p_sfpu::LREG1, InstrModLoadStore::FP32, ADDR_MOD_6, 0);
 +    // Round to nearest even, then store the raw BFloat16 bits through a UInt16
 +    // output CB so signed zero is not canonicalized by the BFloat16 pack path.
- #pragma GCC unroll 0
-     for (int d = 0; d < ITERATIONS; d++) {
-         TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::DEFAULT, ADDR_MOD_7, 0);
-@@ -256,7 +254,20 @@ inline void calculate_typecast_fp32_to_fp16b() {
-         TTI_SFPIADD(0, p_sfpu::LREG13, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);  // lreg[1] += 0x7FFF
-         TTI_SFPIADD(0, p_sfpu::LREG0, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);   // lreg[1] += lreg[0]
-         TTI_SFPAND(0, p_sfpu::LREG14, p_sfpu::LREG1, 0);                            // lreg[1] &= 0xFFFF0000
--        TTI_SFPSTORE(p_sfpu::LREG1, InstrModLoadStore::FP32, ADDR_MOD_6, 0);
-+        TTI_SFPSHFT((-16) & 0xFFF, p_sfpu::LREG1, p_sfpu::LREG1, 5);
-+        TTI_SFPSTORE(p_sfpu::LREG1, SFPSTORE_MODE_SWAP_HI_LO16, ADDR_MOD_6, 0);
++    // NaN stays a quiet NaN rather than rounding into infinity.
++    for (int d = 0; d < ITERATIONS; d++) {
++        sfpi::vFloat x = sfpi::dst_reg[0];
++        sfpi::vUInt bits = sfpi::as<sfpi::vUInt>(x);
++        sfpi::vUInt bfloatBits = (bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16;
++        v_if((bits & 0x7fffffffU) > 0x7f800000U) { bfloatBits = (bits >> 16) | 0x40U; }
++        v_endif;
++        __builtin_rvtt_sfpstore(bfloatBits.get(), 0, 9 /* swap high/low 16 */, ADDR_MOD_6);
 +    }
 +}
 +
@@ -58,7 +65,7 @@ diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_
 index 611b88e..d8b9ed8 100644
 --- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 +++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
-@@ -257,10 +257,8 @@ inline void calculate_typecast_fp32_to_uint32() {
+@@ -257,20 +257,28 @@ inline void calculate_typecast_fp32_to_uint32() {
  
  template <bool APPROXIMATION_MODE, int ITERATIONS>
  inline void calculate_typecast_fp32_to_fp16b() {
@@ -66,18 +73,26 @@ index 611b88e..d8b9ed8 100644
 -    // low 16 bits (&0xFFFF0000), and store FP32 for 32-bit-Dest correctness. The historical
 -    // macro relied on a FP16B store to truncate and does not reproduce the masked-FP32 result,
 -    // so it is not equivalent and is not restored here. See #46751.
+-#pragma GCC unroll 0
+-    for (int d = 0; d < ITERATIONS; d++) {
+-        TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::DEFAULT, ADDR_MOD_3, 0);
+-        TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::DEFAULT, ADDR_MOD_3, 0);
+-        TTI_SFPSHFT((-16) & 0xFFF, 0, p_sfpu::LREG0, 1);                            // lreg[0] >>= 16
+-        TTI_SFPAND(0, p_sfpu::LREG12, p_sfpu::LREG0, 0);                            // lreg[0] &= 1
+-        TTI_SFPIADD(0, p_sfpu::LREG13, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);  // lreg[1] += 0x7FFF
+-        TTI_SFPIADD(0, p_sfpu::LREG0, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);   // lreg[1] += lreg[0]
+-        TTI_SFPAND(0, p_sfpu::LREG14, p_sfpu::LREG1, 0);                            // lreg[1] &= 0xFFFF0000
+-        TTI_SFPSTORE(p_sfpu::LREG1, InstrModLoadStore::FP32, ADDR_MOD_2, 0);
 +    // Round to nearest even, then store the raw BFloat16 bits through a UInt16
 +    // output CB so signed zero is not canonicalized by the BFloat16 pack path.
- #pragma GCC unroll 0
-     for (int d = 0; d < ITERATIONS; d++) {
-         TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::DEFAULT, ADDR_MOD_3, 0);
-@@ -270,7 +268,20 @@ inline void calculate_typecast_fp32_to_fp16b() {
-         TTI_SFPIADD(0, p_sfpu::LREG13, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);  // lreg[1] += 0x7FFF
-         TTI_SFPIADD(0, p_sfpu::LREG0, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);   // lreg[1] += lreg[0]
-         TTI_SFPAND(0, p_sfpu::LREG14, p_sfpu::LREG1, 0);                            // lreg[1] &= 0xFFFF0000
--        TTI_SFPSTORE(p_sfpu::LREG1, InstrModLoadStore::FP32, ADDR_MOD_2, 0);
-+        TTI_SFPSHFT((-16) & 0xFFF, 0, p_sfpu::LREG1, 1);
-+        TTI_SFPSTORE(p_sfpu::LREG1, SFPSTORE_MODE_SWAP_HI_LO16, ADDR_MOD_2, 0);
++    // NaN stays a quiet NaN rather than rounding into infinity.
++    for (int d = 0; d < ITERATIONS; d++) {
++        sfpi::vFloat x = sfpi::dst_reg[0];
++        sfpi::vUInt bits = sfpi::as<sfpi::vUInt>(x);
++        sfpi::vUInt bfloatBits = (bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16;
++        v_if((bits & 0x7fffffffU) > 0x7f800000U) { bfloatBits = (bits >> 16) | 0x40U; }
++        v_endif;
++        __builtin_rvtt_sfpstore(bfloatBits.get(), 0, 9 /* swap high/low 16 */, ADDR_MOD_2);
 +    }
 +}
 +

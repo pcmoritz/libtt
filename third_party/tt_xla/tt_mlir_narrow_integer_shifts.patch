@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -12122,6 +12122,83 @@ public:
+@@ -12122,6 +12122,84 @@ public:
    }
  };
  
@@ -55,13 +55,14 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    // neighbouring casts (e.g. of a UInt8 arange, which TTNN cannot create).
 +    Value x = rewriter.create<ttir::TypecastOp>(loc, wideType, adaptor.getLhs(),
 +                                                /*conservative_folding=*/true);
-+    // Amounts are unsigned; any amount of at least the width behaves like 31.
++    // Amounts are unsigned. Shifting by the width already gives the result of
++    // any larger amount (zero, or the sign fill for arithmetic right shifts).
 +    Value amount = rewriter.create<ttir::MinimumOp>(
 +        loc, wideType,
 +        zeroExtend(
 +            rewriter.create<ttir::TypecastOp>(loc, wideType, adaptor.getRhs(),
 +                                              /*conservative_folding=*/true)),
-+        constant(31));
++        constant(width));
 +
 +    Value result;
 +    if constexpr (std::is_same_v<SrcOp, mlir::stablehlo::ShiftLeftOp>) {
@@ -85,7 +86,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  class StableHLOToTTIRCountLeadingZerosOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::ClzOp> {
    using OpConversionPattern<
-@@ -12313,6 +12390,13 @@ addElementwiseBinaryOpsConversionPatterns(MLIRContext *ctx,
+@@ -12313,6 +12391,13 @@ addElementwiseBinaryOpsConversionPatterns(MLIRContext *ctx,
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<
        mlir::stablehlo::ShiftLeftOp, mlir::tt::ttir::LogicalLeftShiftOp>>(
        typeConverter, ctx);
@@ -102,19 +103,22 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 --- a/lib/Dialect/TTIR/IR/TTIROps.cpp
 +++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
-@@ -4086,6 +4086,22 @@ mlir::OpFoldResult mlir::tt::ttir::TypecastOp::fold(FoldAdaptor adaptor) {
+@@ -4086,6 +4086,25 @@ mlir::OpFoldResult mlir::tt::ttir::TypecastOp::fold(FoldAdaptor adaptor) {
  ::llvm::LogicalResult
  mlir::tt::ttir::TypecastOp::canonicalize(mlir::tt::ttir::TypecastOp op,
                                           ::mlir::PatternRewriter &rewriter) {
 +  // Create an integer arange directly in the wider integer type it is cast
-+  // to. This keeps TTNN from having to create aranges of types it does not
-+  // support (e.g. UInt8) when the cast is not absorbed by a workaround.
++  // to, when that type holds every value of the narrow one (so the cast
++  // cannot change a value). This keeps TTNN from having to create aranges of
++  // types it does not support (e.g. UInt8) when the cast is not absorbed by a
++  // workaround.
 +  if (auto arange = op.getInput().getDefiningOp<mlir::tt::ttir::ArangeOp>()) {
 +    auto inputType =
 +        mlir::dyn_cast<IntegerType>(arange.getType().getElementType());
 +    auto outputType = mlir::dyn_cast<IntegerType>(op.getType().getElementType());
 +    if (inputType && outputType && arange->hasOneUse() &&
-+        outputType.getWidth() >= inputType.getWidth()) {
++        outputType.getWidth() > inputType.getWidth() &&
++        (inputType.isUnsigned() || !outputType.isUnsigned())) {
 +      rewriter.replaceOpWithNewOp<mlir::tt::ttir::ArangeOp>(
 +          op, op.getType(), arange.getStart(), arange.getEnd(),
 +          arange.getStep(), arange.getArangeDimension());

@@ -516,10 +516,8 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_sdy_reduction_kind.patch",
         "//third_party/tt_xla:tt_mlir_argmax_last_dim.patch",
         "//third_party/tt_xla:tt_mlir_integer_divide.patch",
-        "//third_party/tt_xla:tt_mlir_dynamic_slice_narrow_index.patch",
         "//third_party/tt_xla:tt_mlir_narrow_integer_shifts.patch",
         "//third_party/tt_xla:tt_mlir_uint32_max_native.patch",
-        "//third_party/tt_xla:tt_mlir_float16_embedding.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
