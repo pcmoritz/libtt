@@ -1,18 +1,106 @@
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h
+@@ -38,5 +38,31 @@ inline void cast_fp16a_to_fp32() {
+     }
+ }
+ 
++// Raw BFloat16 bits in a UInt16 tile -> raw Float16 bits, rounded to nearest even.
++template <bool APPROXIMATION_MODE, int ITERATIONS>
++inline void cast_fp16b_to_fp16a() {
++    for (int d = 0; d < ITERATIONS; d++) {
++        // UInt16 tiles unpack into the low half of each 32-bit Dest word.
++        sfpi::vUInt bits(sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>());
++        bits &= 0xffffU;
++        sfpi::vUInt halfBits = float32_to_float16_bits_rne(sfpi::as<sfpi::vFloat>(bits << 16));
++        __builtin_rvtt_sfpstore(halfBits.get(), 0, 9 /* swap high/low 16 */, ADDR_MOD_6);
++    }
++}
++
++// Raw Float16 bits in a UInt16 tile -> raw BFloat16 bits, rounded to nearest even.
++template <bool APPROXIMATION_MODE, int ITERATIONS>
++inline void cast_fp16a_to_fp16b() {
++    for (int d = 0; d < ITERATIONS; d++) {
++        sfpi::vUInt bits(sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>());
++        bits &= 0xffffU;
++        sfpi::vUInt fp32Bits = float16_to_float32_bits(bits);
++        // Float16 values need at most 11 significant bits, which BFloat16 (8) may round.
++        fp32Bits += 0x7fffU + ((fp32Bits >> 16) & 1U);
++        sfpi::vUInt bfloatBits = fp32Bits >> 16;
++        __builtin_rvtt_sfpstore(bfloatBits.get(), 0, 9 /* swap high/low 16 */, ADDR_MOD_6);
++    }
++}
++
+ }  // namespace sfpu
+ }  // namespace ckernel
+diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
+--- tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
++++ tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
+@@ -108,6 +108,22 @@ ALWI void typecast_tile(uint32_t idst) {
+             (APPROX, 8 /* ITERATIONS */),
+             idst,
+             VectorMode::RC));
++    } else if constexpr (in_format == DataFormat::Float16_b && out_format == DataFormat::Float16) {
++        MATH(SFPU_UNARY_CALL(
++            DST_SYNC_MODE,
++            DST_ACCUM_MODE,
++            cast_fp16b_to_fp16a,
++            (APPROX, 8 /* ITERATIONS */),
++            idst,
++            VectorMode::RC));
++    } else if constexpr (in_format == DataFormat::Float16 && out_format == DataFormat::Float16_b) {
++        MATH(SFPU_UNARY_CALL(
++            DST_SYNC_MODE,
++            DST_ACCUM_MODE,
++            cast_fp16a_to_fp16b,
++            (APPROX, 8 /* ITERATIONS */),
++            idst,
++            VectorMode::RC));
+     } else if constexpr (in_format == DataFormat::Float16_b && out_format == DataFormat::UInt16) {
+         MATH(SFPU_UNARY_CALL(
+             DST_SYNC_MODE,
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
+@@ -13,8 +13,12 @@ namespace ttnn::prim {
+ 
+ inline tt::DataFormat typecast_input_format(
+     tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
+-    return (input_dtype == tt::tt_metal::DataType::FLOAT16 || input_dtype == tt::tt_metal::DataType::BFLOAT16) &&
+-                   output_dtype == tt::tt_metal::DataType::FLOAT32
++    const bool float16_bfloat16 =
++        (input_dtype == tt::tt_metal::DataType::FLOAT16 && output_dtype == tt::tt_metal::DataType::BFLOAT16) ||
++        (input_dtype == tt::tt_metal::DataType::BFLOAT16 && output_dtype == tt::tt_metal::DataType::FLOAT16);
++    return ((input_dtype == tt::tt_metal::DataType::FLOAT16 || input_dtype == tt::tt_metal::DataType::BFLOAT16) &&
++            output_dtype == tt::tt_metal::DataType::FLOAT32) ||
++                   float16_bfloat16
+                ? tt::DataFormat::UInt16
+                : tt::tt_metal::datatype_to_dataformat_converter(input_dtype);
+ }
+@@ -25,9 +29,10 @@ inline tt::DataFormat typecast_output_format(
+         output_dtype == tt::tt_metal::DataType::FLOAT16 &&
+         (input_dtype == tt::tt_metal::DataType::FLOAT32 || input_dtype == tt::tt_metal::DataType::UINT8 ||
+          input_dtype == tt::tt_metal::DataType::UINT16 || input_dtype == tt::tt_metal::DataType::UINT32 ||
+-         input_dtype == tt::tt_metal::DataType::INT32);
++         input_dtype == tt::tt_metal::DataType::INT32 || input_dtype == tt::tt_metal::DataType::BFLOAT16);
+     const bool exact_bfloat16_output =
+-        input_dtype == tt::tt_metal::DataType::FLOAT32 && output_dtype == tt::tt_metal::DataType::BFLOAT16;
++        (input_dtype == tt::tt_metal::DataType::FLOAT32 || input_dtype == tt::tt_metal::DataType::FLOAT16) &&
++        output_dtype == tt::tt_metal::DataType::BFLOAT16;
+     return exact_float16_output || exact_bfloat16_output
+                ? tt::DataFormat::UInt16
+                : tt::tt_metal::datatype_to_dataformat_converter(output_dtype);
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
-@@ -52,6 +52,18 @@ inline Tensor typecast_impl(
+@@ -52,6 +52,14 @@ inline Tensor typecast_impl(
              promoted, output_dtype, memory_config, optional_output_tensor, sub_core_grids);
      }
  
-+    // Direct conversions between Float16 and the bfloat formats produce
-+    // garbage (e.g. BFloat16 3.0 -> Float16 0.0). Both convert exactly to and
-+    // from Float32, so go through Float32.
-+    auto is_bfloat = [](DataType dtype) {
-+        return dtype == DataType::BFLOAT16 || dtype == DataType::BFLOAT8_B || dtype == DataType::BFLOAT4_B;
-+    };
-+    if ((input_tensor.dtype() == DataType::FLOAT16 && is_bfloat(output_dtype)) ||
-+        (is_bfloat(input_tensor.dtype()) && output_dtype == DataType::FLOAT16)) {
++    // Float16 <-> the block-float formats converts through Float32. Float16 <-> BFloat16 converts per tile.
++    auto is_block_float = [](DataType dtype) { return dtype == DataType::BFLOAT8_B || dtype == DataType::BFLOAT4_B; };
++    if ((input_tensor.dtype() == DataType::FLOAT16 && is_block_float(output_dtype)) ||
++        (is_block_float(input_tensor.dtype()) && output_dtype == DataType::FLOAT16)) {
 +        auto promoted = typecast_impl(input_tensor, DataType::FLOAT32, std::nullopt, std::nullopt, sub_core_grids);
 +        return typecast_impl(promoted, output_dtype, memory_config, optional_output_tensor, sub_core_grids);
 +    }
@@ -20,3 +108,15 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/ope
      // Device tensor path
      DataType input_dtype = input_tensor.dtype();
      bool preserve_fp32_precision =
+@@ -63,7 +71,10 @@ inline Tensor typecast_impl(
+                             output_dtype == DataType::INT32 or output_dtype == DataType::FLOAT32 or
+                             (input_dtype == DataType::UINT16 and output_dtype == DataType::FLOAT16) or
+                             input_dtype == DataType::UINT32 or input_dtype == DataType::INT32 or
+-                            output_dtype == DataType::FP8_E4M3 or input_dtype == DataType::FP8_E4M3;
++                            output_dtype == DataType::FP8_E4M3 or input_dtype == DataType::FP8_E4M3 or
++                            // Float16 <-> BFloat16 converts raw bits in 32-bit dest.
++                            (input_dtype == DataType::FLOAT16 and output_dtype == DataType::BFLOAT16) or
++                            (input_dtype == DataType::BFLOAT16 and output_dtype == DataType::FLOAT16);
+     bool bfp8_pack_precise = (output_dtype == DataType::BFLOAT8_B);
+     auto output_memory_config = optional_output_tensor.has_value()
+                                     ? optional_output_tensor.value().memory_config()
