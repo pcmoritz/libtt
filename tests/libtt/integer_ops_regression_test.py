@@ -61,3 +61,10 @@ def test_float16_where_with_scalar_predicate():
         np.var(values.reshape(2, 2).astype(np.float32), axis=0).astype(np.float16),
         rtol=1e-3,
     )
+
+
+@pytest.mark.parametrize("src, dst", [(jnp.bfloat16, np.float16), (np.float16, jnp.bfloat16)])
+def test_float16_bfloat16_typecast(src, dst):
+    values = np.array([3.0, -1.5, 0.0, 0.5, 1024.0, np.inf, -np.inf], np.float32).astype(src)
+    actual = _run(lambda x: (x * 1).astype(dst) * 1, values)
+    np.testing.assert_array_equal(actual, values.astype(np.float32).astype(dst))

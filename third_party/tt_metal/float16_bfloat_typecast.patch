@@ -1,0 +1,22 @@
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+@@ -52,6 +52,18 @@ inline Tensor typecast_impl(
+             promoted, output_dtype, memory_config, optional_output_tensor, sub_core_grids);
+     }
+ 
++    // Direct conversions between Float16 and the bfloat formats produce
++    // garbage (e.g. BFloat16 3.0 -> Float16 0.0). Both convert exactly to and
++    // from Float32, so go through Float32.
++    auto is_bfloat = [](DataType dtype) {
++        return dtype == DataType::BFLOAT16 || dtype == DataType::BFLOAT8_B || dtype == DataType::BFLOAT4_B;
++    };
++    if ((input_tensor.dtype() == DataType::FLOAT16 && is_bfloat(output_dtype)) ||
++        (is_bfloat(input_tensor.dtype()) && output_dtype == DataType::FLOAT16)) {
++        auto promoted = typecast_impl(input_tensor, DataType::FLOAT32, std::nullopt, std::nullopt, sub_core_grids);
++        return typecast_impl(promoted, output_dtype, memory_config, optional_output_tensor, sub_core_grids);
++    }
++
+     // Device tensor path
+     DataType input_dtype = input_tensor.dtype();
+     bool preserve_fp32_precision =
