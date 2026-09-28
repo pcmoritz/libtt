@@ -55,7 +55,7 @@ diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_cle
    module.walk([&](mlir::func::FuncOp funcOp) {
      internal::stripTTDialectAttributes(funcOp);
    });
-@@ -409,6 +421,32 @@
+@@ -409,6 +421,29 @@
      auto meshOp = meshOps.front();
  
      auto manualComputationOp = manualComputationOps.front();
@@ -68,14 +68,11 @@ diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_cle
 +      auto argument = mlir::dyn_cast<mlir::BlockArgument>(operand);
 +      if (argument && argument.getOwner() == &main.getBody().front()) {
 +        auto index = argument.getArgNumber();
-+        auto declared = main.getArgAttrOfType<mlir::sdy::TensorShardingAttr>(
-+            index, mlir::sdy::TensorShardingAttr::name);
 +        inputShardings[index] = mlir::StringAttr::get(
 +            module.getContext(),
 +            unsharded[index] ? std::string("{replicated}")
 +                             : internal::extractHloShardingString(
-+                                   declared ? declared : sharding,
-+                                   meshOp.getMeshAttr()));
++                                   sharding, meshOp.getMeshAttr()));
 +      }
 +    }
 +    if (llvm::all_of(inputShardings,
