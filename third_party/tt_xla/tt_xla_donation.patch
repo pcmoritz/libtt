@@ -62,7 +62,7 @@ diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.c
 diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
-@@ -344,2 +344,78 @@
+@@ -346,2 +346,88 @@
  
 +void LoadedExecutableInstance::invalidateDonatedInputs(
 +    PJRT_LoadedExecutable_Execute_Args *args,
@@ -108,10 +108,27 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
 +    }
 +  }
 +
++  // A donated buffer may appear in no other input position. Only the few
++  // donated buffers are tracked; other buffers may repeat freely.
++  std::vector<bool> is_donated(args->num_args);
++  for (size_t input_index : donated_indices) {
++    is_donated[input_index] = true;
++  }
++  std::unordered_set<BufferInstance *> donated_buffers;
++  donated_buffers.reserve(donated_indices.size());
 +  for (size_t device_index = 0; device_index < args->num_devices;
 +       ++device_index) {
-+    std::unordered_set<BufferInstance *> used_buffers;
-+    std::unordered_set<BufferInstance *> donated_buffers;
++    donated_buffers.clear();
++    for (size_t input_index : donated_indices) {
++      if (!donated_buffers
++               .insert(BufferInstance::unwrap(
++                   args->argument_lists[device_index][input_index]))
++               .second) {
++        LOG_F(ERROR, "Input buffer %zu on device %zu is donated twice",
++              input_index, device_index);
++        return tt_pjrt_status::kInvalidArgument;
++      }
++    }
 +    for (size_t input_index = 0; input_index < args->num_args; ++input_index) {
 +      BufferInstance *buffer = BufferInstance::unwrap(
 +          args->argument_lists[device_index][input_index]);
@@ -120,19 +137,12 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
 +              input_index, device_index);
 +        return tt_pjrt_status::kInvalidArgument;
 +      }
-+
-+      const bool must_donate = donated_indices.contains(input_index);
-+      const bool already_used = !used_buffers.insert(buffer).second;
-+      const bool already_donated = donated_buffers.contains(buffer);
-+      if ((must_donate && already_used) || already_donated) {
++      if (!is_donated[input_index] && donated_buffers.contains(buffer)) {
 +        LOG_F(ERROR,
 +              "Input buffer %zu on device %zu is used in conflicting "
 +              "donated and non-donated positions",
 +              input_index, device_index);
 +        return tt_pjrt_status::kInvalidArgument;
-+      }
-+      if (must_donate) {
-+        donated_buffers.insert(buffer);
 +      }
 +    }
 +  }
@@ -144,7 +154,7 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
 diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
 --- a/pjrt_implementation/src/api/module_builder/module_builder.cc
 +++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
-@@ -100,2 +100,23 @@
+@@ -124,2 +124,23 @@
  
 +// TODO: Implement proper buffer donation by preserving the input/output alias
 +// mapping through compilation and reusing donated input storage for outputs.
@@ -168,18 +178,18 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 +}
 +
  // Returns true if any sharding genuinely partitions a tensor across devices
-@@ -342,2 +363,5 @@
+@@ -394,2 +415,5 @@
  
 +  std::vector<size_t> donatable_input_indices =
 +      collectDonatableInputIndices(mlir_module);
 +
    status = runFrontendSHLOPipeline(mlir_module, compile_options.export_path,
-@@ -484,3 +505,3 @@ ModuleBuilder::buildModule(
+@@ -484,3 +508,3 @@
    if (is_codegen_py_load) {
 -    return buildModuleForTTNNCodegenLoad(
 +    auto result = buildModuleForTTNNCodegenLoad(
          mlir_module, std::move(original_mlir_code), std::move(num_arguments),
-@@ -488,2 +509,7 @@ ModuleBuilder::buildModule(
+@@ -488,2 +512,7 @@
          std::move(optimized_mlir_code), graph_hash, std::move(compile_options));
 +    if (std::get<1>(result)) {
 +      std::get<1>(result)->setDonatableInputIndices(
@@ -187,21 +197,21 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 +    }
 +    return result;
    }
-@@ -460,2 +484,3 @@
+@@ -529,2 +558,3 @@
    // a name, otherwise some default string like the current one.
 +  std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>> result;
    std::string executable_name = "tt_executable";
-@@ -463,3 +488,3 @@
+@@ -532,3 +562,3 @@
    if (compile_options.backend == BackendRuntime::TTNNFlatbuffer) {
 -    return buildModuleForTTNNRuntime(
 +    result = buildModuleForTTNNRuntime(
          mlir_module, std::move(original_mlir_code), std::move(ttir_mlir),
-@@ -540,3 +567,3 @@ ModuleBuilder::buildModule(
+@@ -540,3 +570,3 @@
    } else if (is_codegen_cpp || is_codegen_py) {
 -    return buildModuleForTTNNCodegen(
 +    result = buildModuleForTTNNCodegen(
          mlir_module, std::move(original_mlir_code), std::move(ttir_mlir),
-@@ -547,6 +574,12 @@ ModuleBuilder::buildModule(
+@@ -547,6 +577,12 @@
          std::move(optimized_mlir_code), graph_hash, std::move(compile_options));
 +  } else {
 +    LOG_F(ERROR, "Unsupported backend option");
@@ -219,7 +229,7 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 diff --git a/pjrt_implementation/src/api/so_loaded_executable_instance.cc b/pjrt_implementation/src/api/so_loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/so_loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/so_loaded_executable_instance.cc
-@@ -96,2 +96,8 @@
+@@ -97,2 +97,8 @@
  
 +  DonationIndices donated_indices;
 +  tt_pjrt_status status = validateInputBuffers(args, donated_indices);
@@ -228,12 +238,12 @@ diff --git a/pjrt_implementation/src/api/so_loaded_executable_instance.cc b/pjrt
 +  }
 +
    std::optional<tt::runtime::Device> runtime_device =
-@@ -110,3 +116,3 @@
+@@ -111,3 +117,3 @@
    input_tensors.reserve(args->num_args);
 -  tt_pjrt_status status = getInputRuntimeTensors(
 +  status = getInputRuntimeTensors(
        args->argument_lists, args->num_args, args->num_devices, *runtime_device,
-@@ -164,2 +170,4 @@
+@@ -175,2 +181,4 @@
    }
 +  invalidateDonatedInputs(args, donated_indices);
 +
