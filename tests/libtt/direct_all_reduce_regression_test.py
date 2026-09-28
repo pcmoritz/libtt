@@ -29,12 +29,15 @@ def full_mesh():
     "rows,width,dtype",
     [
         # One tile, an odd tile count, a typical hidden size, and a prime
-        # tile count (257); several and all 32 rows of the tile.
+        # tile count (257); several rows, the most rows that are packed (16)
+        # and the fewest that are not (17), and all 32 rows of the tile.
         (1, 32, jnp.bfloat16),
         (1, 96, jnp.bfloat16),
         (1, 5120, jnp.bfloat16),
         (1, 8224, jnp.bfloat16),
         (2, 5120, jnp.bfloat16),
+        (16, 5120, jnp.bfloat16),
+        (17, 5120, jnp.bfloat16),
         (32, 5120, jnp.bfloat16),
         # Falls back to reduce-scatter plus all-gather.
         (1, 5120, jnp.float32),
