@@ -35,3 +35,13 @@ def test_numpy_argument_next_to_sharded_argument():
     ws = jax.device_put(w, NamedSharding(mesh, P(None, "tensor")))
     out = jax.jit(lambda a, b: a @ b)(x, ws)
     np.testing.assert_allclose(np.asarray(out), x @ w, rtol=1e-2)
+
+
+def test_replicated_result_as_argument():
+    # A replicated result of one program is already a single tensor spread
+    # over the mesh when the next program takes it.
+    mesh = _mesh()
+    x = np.arange(64 * 32, dtype=np.float32).reshape(64, 32)
+    xs = jax.device_put(x, NamedSharding(mesh, P()))
+    doubled = jax.jit(lambda a: a * 2, out_shardings=NamedSharding(mesh, P()))(xs)
+    np.testing.assert_array_equal(np.asarray(doubled[:, 4:9]), 2 * x[:, 4:9])

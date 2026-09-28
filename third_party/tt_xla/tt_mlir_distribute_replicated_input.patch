@@ -10,24 +10,28 @@ diff --git a/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp b/runtime/lib
  #include "tt/runtime/detail/common/logger.h"
  #include "tt/runtime/detail/ttnn/ttnn.h"
  #include "tt/runtime/detail/ttnn/utils.h"
-@@ -39,6 +41,20 @@
-     }
+@@ -47,8 +49,23 @@
    }
- 
-+  // An input that JAX already placed on every device arrives as one host
-+  // buffer per device. Replicating it again would need a single buffer.
-+  bool replicate =
-+      std::all_of(placements->begin(), placements->end(), [](const auto *placement) {
-+        return placement->type() == ::tt::target::ttnn::PlacementType::Replicate;
-+      });
-+  size_t buffers = 0;
-+  input.host_storage().buffer().apply(
-+      [&](const ::tt::tt_metal::HostBuffer &) { ++buffers; });
-+  if (replicate && buffers > 1 && buffers == meshDevice.num_devices()) {
-+    tensorPool.insertTTNNTensorAndValidate(op->out(), input);
-+    return;
-+  }
+   std::unique_ptr<TensorToMesh> meshMapper =
+       ::ttnn::distributed::create_mesh_mapper(meshDevice, meshMapperConfig);
 +
-   if (op->mapper_config()->mesh_shape_override()) {
-     ::ttsl::SmallVector<uint32_t> meshShapeOverride(
-         op->mapper_config()->mesh_shape_override()->begin(),
++  // An input that JAX already placed on every device arrives with one host
++  // buffer per device, each holding the same data. Replicate one of them.
++  bool replicate = std::all_of(
++      placements->begin(), placements->end(), [](const auto *placement) {
++        return placement->type() ==
++               ::tt::target::ttnn::PlacementType::Replicate;
++      });
++  const auto &buffer = input.host_storage().buffer();
++  ::ttnn::Tensor source = input;
++  if (replicate && buffer.shape().mesh_size() > 1 &&
++      !buffer.shard_coords().empty()) {
++    source = ::ttnn::Tensor(*buffer.get_shard(*buffer.shard_coords().begin()),
++                            input.tensor_spec());
++  }
+   ::ttnn::Tensor out =
+-      ::ttnn::distributed::distribute_tensor(input, *meshMapper);
++      ::ttnn::distributed::distribute_tensor(source, *meshMapper);
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
