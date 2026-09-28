@@ -489,9 +489,9 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
  namespace ttnn::operations::core::CMAKE_UNIQUE_NAMESPACE {
  namespace {
 +
-+// BF16 and UInt16 have identical storage. Keep the owning storage alive while
++// BF16, FP16 and UInt16 have identical storage. Keep the owning storage alive while
 +// viewing the same allocation with a format that does not canonicalize floats.
-+Tensor view_bfloat16_bits(const Tensor& input, DataType dtype) {
++Tensor view_16bit_float_bits(const Tensor& input, DataType dtype) {
 +    const auto& spec = input.tensor_spec();
 +    tt::tt_metal::TensorSpec view_spec(
 +        spec.logical_shape(),
@@ -507,7 +507,7 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
  
  bool requires_padding_change(const ttnn::Tensor& tensor, ttnn::Layout layout) {
      if (layout == Layout::ROW_MAJOR) {
-@@ -75,6 +93,17 @@
+@@ -75,6 +93,21 @@
                  "the memory_config won't be changed!");
          }
          return tensor_arg;
@@ -515,13 +515,17 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
 +
 +    // Layout conversion must preserve every bit, including NaNs and -0.
 +    // Reuse the integer data-movement kernels without copying the payload.
-+    if (tensor_arg.storage_type() == StorageType::DEVICE && tensor_arg.dtype() == DataType::BFLOAT16 &&
-+        dtype.value_or(DataType::BFLOAT16) == DataType::BFLOAT16) {
-+        auto raw = view_bfloat16_bits(tensor_arg, DataType::UINT16);
++    const bool is_16bit_float = tensor_arg.dtype() == DataType::BFLOAT16 || tensor_arg.dtype() == DataType::FLOAT16;
++    if (tensor_arg.storage_type() == StorageType::DEVICE && is_16bit_float &&
++        dtype.value_or(tensor_arg.dtype()) == tensor_arg.dtype()) {
++        const uint16_t pad_bits = tensor_arg.dtype() == DataType::BFLOAT16
++                                      ? std::bit_cast<uint16_t>(bfloat16(pad_value))
++                                      : std::bit_cast<uint16_t>(static_cast<_Float16>(pad_value));
++        auto raw = view_16bit_float_bits(tensor_arg, DataType::UINT16);
 +        auto converted = to_layout_impl(
 +            raw, layout, DataType::UINT16, memory_config, sub_core_grids,
-+            static_cast<float>(std::bit_cast<uint16_t>(bfloat16(pad_value))));
-+        return view_bfloat16_bits(converted, DataType::BFLOAT16);
++            static_cast<float>(pad_bits));
++        return view_16bit_float_bits(converted, tensor_arg.dtype());
      }
  
      const std::set<ttnn::Layout> supported_layouts = {

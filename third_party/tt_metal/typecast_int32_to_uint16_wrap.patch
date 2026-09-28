@@ -1,0 +1,24 @@
+diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
+--- tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
++++ tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
+@@ -299,10 +299,11 @@ ALWI void typecast_tile(uint32_t idst) {
+             idst,
+             VectorMode::RC));
+     } else if constexpr (in_format == DataFormat::Int32 && out_format == DataFormat::UInt16) {
++        // Wrap like integer narrowing: keep the low 16 bits, which are the same for Int32 and UInt32.
+         MATH(SFPU_UNARY_CALL(
+             DST_SYNC_MODE,
+             DST_ACCUM_MODE,
+-            calculate_typecast_int32_to_uint16,
++            calculate_typecast_uint32_to_uint16,
+             (APPROX, 8 /* ITERATIONS */),
+             idst,
+             VectorMode::RC));
+@@ -469,6 +470,6 @@ ALWI void typecast_tile_init() {
+     } else if constexpr (in_format == DataFormat::UInt32 && out_format == DataFormat::UInt16) {
+         MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint32_to_uint16, (APPROX)));
+     } else if constexpr (in_format == DataFormat::Int32 && out_format == DataFormat::UInt16) {
+-        MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_int32_to_uint16, (APPROX)));
++        MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint32_to_uint16, (APPROX)));
+     } else if constexpr (
+         in_format == DataFormat::UInt32 &&

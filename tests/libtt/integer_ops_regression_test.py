@@ -115,9 +115,24 @@ def test_float16_bfloat16_typecast(src, dst):
     if src == np.float16:
         # A NaN with a small payload must stay NaN rather than round to infinity.
         values = np.concatenate([values, np.array([0x7C01, 0xFC01], np.uint16).view(np.float16)])
-    # Pass the raw bits and bitcast on device: Float16 program inputs flush -0 and subnormals.
-    actual = _run(lambda bits: lax.bitcast_convert_type(bits, src).astype(dst), values.view(np.uint16))
+    actual = _run(lambda x: x.astype(dst), values)
     expected = values.astype(np.float32).astype(dst)
     # Compare as float32 so NaNs in the same positions count as equal for bfloat16 too.
     np.testing.assert_array_equal(actual.astype(np.float32), expected.astype(np.float32))
     np.testing.assert_array_equal(np.signbit(actual[~np.isnan(expected)]), np.signbit(expected[~np.isnan(expected)]))
+
+
+@pytest.mark.parametrize("dtype", [np.float16, jnp.bfloat16])
+def test_16bit_float_layout_round_trip(dtype):
+    # Tilizing a program input must keep every bit: -0, subnormals, infinities and NaN payloads.
+    bits = np.array([0x8000, 0x0001, 0x8001, 0x03FF, 0x3C00, 0x7C00, 0xFC00, 0x7C01, 0xFE00, 0x7BFF], np.uint16)
+    values = bits.view(dtype)
+    np.testing.assert_array_equal(_run(lambda x: x, values).view(np.uint16), bits)
+    np.testing.assert_array_equal(_run(lambda x: x.reshape(2, 5), values).view(np.uint16), bits.reshape(2, 5))
+
+
+@pytest.mark.parametrize("src", [np.int32, np.int16, np.int8])
+def test_signed_to_uint16_wraps(src):
+    info = np.iinfo(src)
+    values = np.array([-4, -1, 0, 3, info.min, info.max] + ([70000, -70000] if src == np.int32 else []), src)
+    np.testing.assert_array_equal(_run(lambda x: x.astype(jnp.uint16), values), values.astype(np.uint16))
