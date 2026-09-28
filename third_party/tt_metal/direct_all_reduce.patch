@@ -254,7 +254,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      const auto output_tensor_shard_num_pages = output_tensor_shard_shape[0] * output_tensor_shard_shape[1] / TILE_HW;
      const auto num_output_cores = output_tensor_cores.num_cores();
  
-@@ -356,6 +355,18 @@
+@@ -356,6 +355,20 @@
      /* reduction cb */
      uint32_t reduction_CB_single_tile_size = output_tensor.tensor_spec().tile().get_tile_size(df);
      uint32_t reduction_CB_tiles = output_tensor_shard_num_pages * ring_size;
@@ -263,17 +263,19 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
 +    // each rank's slot, reduces the slots elementwise as before, and scatters
 +    // the packed sums back into the output tiles. Padding rows of the output
 +    // are left undefined.
-+    const uint32_t logical_rows = input_tensor.logical_shape()[-2];
-+    std::map<std::string, std::string> packed_rows_defines;
-+    if (direct && logical_rows <= TILE_HEIGHT / 2) {
-+        // A BF16 face row is 32 bytes; each face's rows keep the 64-byte DRAM alignment.
-+        const uint32_t packed_tile_bytes = 2 * tt::round_up(logical_rows * 32, 64);
-+        packed_rows_defines = {{"PACKED_TILE_BYTES", std::to_string(packed_tile_bytes)}};
++    std::map<std::string, std::string> packing_defines;
++    if (direct) {
++        const uint32_t logical_rows = input_tensor.logical_shape()[-2];
++        if (logical_rows <= TILE_HEIGHT / 2) {
++            // A BF16 face row is 32 bytes; each face's rows keep the 64-byte DRAM alignment.
++            const uint32_t packed_tile_bytes = 2 * tt::round_up(logical_rows * 32, 64);
++            packing_defines = {{"PACKED_TILE_BYTES", std::to_string(packed_tile_bytes)}};
++        }
 +    }
      uint32_t reduction_CB_size = reduction_CB_tiles * reduction_CB_single_tile_size;
  
      uint32_t reduction_cb_index = tt::CBIndex::c_1;
-@@ -373,11 +384,27 @@
+@@ -373,11 +386,27 @@
      uint32_t out_cb_index = tt::CBIndex::c_2;
      tt::tt_metal::CircularBufferConfig out_cb_config =
          tt::tt_metal::CircularBufferConfig(out_CB_size, {{out_cb_index, output_df}})
@@ -292,7 +294,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
 +            "ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_writer.cpp",
 +            output_tensor_cores, tt::tt_metal::DataMovementConfig{
 +                .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
-+                .noc = tt::tt_metal::NOC::NOC_0, .compile_args = args, .defines = packed_rows_defines});
++                .noc = tt::tt_metal::NOC::NOC_0, .compile_args = args, .defines = packing_defines});
 +        uint32_t start = 0;
 +        for (const auto& core : corerange_to_cores(output_tensor_cores, std::nullopt, true)) {
 +            tt::tt_metal::SetRuntimeArgs(program, *output_writer, core, {output_tensor.buffer()->address(), start});
@@ -303,7 +305,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      // Create reduction dataflow kernel
      auto reduction_reader_kernel_config = tt::tt_metal::DataMovementConfig{
          .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
-@@ -426,18 +453,20 @@
+@@ -426,18 +455,20 @@
          src0_cb_index,              // cb0_id
          op_config.get_page_size(),  // tensor0_page_size
      };
@@ -322,21 +324,21 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
                  use_noc1_only ? tt::tt_metal::NOC_MODE::DM_DYNAMIC_NOC : tt::tt_metal::NOC_MODE::DM_DEDICATED_NOC,
 -            .compile_args = reader_compile_args});
 +            .compile_args = reader_compile_args,
-+            .defines = packed_rows_defines});
++            .defines = packing_defines});
  
      // Writer
      std::vector<uint32_t> writer_compile_args = {
-@@ -463,7 +492,8 @@
+@@ -463,7 +494,8 @@
              .noc = writer_noc,
              .noc_mode =
                  use_noc1_only ? tt::tt_metal::NOC_MODE::DM_DYNAMIC_NOC : tt::tt_metal::NOC_MODE::DM_DEDICATED_NOC,
 -            .compile_args = writer_compile_args});
 +            .compile_args = writer_compile_args,
-+            .defines = packed_rows_defines});
++            .defines = packing_defines});
  
      // Kernel Runtime Args
      for (uint32_t link = 0; link < num_links; link++) {
-@@ -501,6 +531,7 @@
+@@ -501,6 +533,7 @@
          };
          reader_rt_args.insert(reader_rt_args.end(), input_tensor_cores_x.begin(), input_tensor_cores_x.end());
          reader_rt_args.insert(reader_rt_args.end(), input_tensor_cores_y.begin(), input_tensor_cores_y.end());
@@ -344,7 +346,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
          log_trace(tt::LogOp, "Reader Runtime Args:");
          for ([[maybe_unused]] const auto& arg : reader_rt_args) {
              log_trace(tt::LogOp, "\t{}", arg);
-@@ -598,6 +629,7 @@
+@@ -598,6 +631,7 @@
              .reduction_reader_kernel_id = reduction_reader_kernel_id,
              .sender_worker_cores = sender_worker_cores,
              .output_tensor_cores = output_tensor_cores,
@@ -352,7 +354,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
              .cb_out = cb_out,
              .cb_reduction = cb_reduction}};
  }
-@@ -614,7 +646,7 @@
+@@ -614,7 +648,7 @@
          const auto& input_tensor = tensor_args.input_tensor;
          const auto& buffer_tensor = tensor_args.buffer_tensor;
  
@@ -361,7 +363,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  
          // update senders
          auto& worker_reader_sender_runtime_args_by_core =
-@@ -630,7 +662,12 @@
+@@ -630,7 +664,12 @@
              auto& worker_writer_sender_runtime_args = worker_writer_sender_runtime_args_by_core[core.x][core.y];
              worker_writer_sender_runtime_args[1] = semaphore.address();
          }
