@@ -1,0 +1,36 @@
+diff --git a/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp b/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
+--- a/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
++++ b/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
+@@ -30,10 +30,12 @@
+   MeshMapperConfig meshMapperConfig;
+ 
+   auto *placements = op->mapper_config()->placements();
++  bool replicate = true;
+   for (const auto *placement : *placements) {
+     if (placement->type() == ::tt::target::ttnn::PlacementType::Replicate) {
+       meshMapperConfig.placements.push_back(MeshMapperConfig::Replicate());
+     } else if (placement->type() == ::tt::target::ttnn::PlacementType::Shard) {
++      replicate = false;
+       meshMapperConfig.placements.push_back(
+           MeshMapperConfig::Shard{placement->dim()});
+     }
+@@ -47,8 +49,18 @@
+   }
+   std::unique_ptr<TensorToMesh> meshMapper =
+       ::ttnn::distributed::create_mesh_mapper(meshDevice, meshMapperConfig);
++
++  // An input that JAX already placed on every device arrives with one host
++  // buffer per device, each holding the same data. Replicate one of them.
++  const auto &buffer = input.host_storage().buffer();
++  ::ttnn::Tensor source = input;
++  if (replicate && buffer.shape().mesh_size() > 1 &&
++      !buffer.shard_coords().empty()) {
++    source = ::ttnn::Tensor(*buffer.get_shard(*buffer.shard_coords().begin()),
++                            input.tensor_spec());
++  }
+   ::ttnn::Tensor out =
+-      ::ttnn::distributed::distribute_tensor(input, *meshMapper);
++      ::ttnn::distributed::distribute_tensor(source, *meshMapper);
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
