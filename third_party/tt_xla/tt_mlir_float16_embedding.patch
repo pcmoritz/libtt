@@ -1,0 +1,21 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -158,10 +158,13 @@ TTNNOperandsWorkaroundsFactory::createEmbeddingOpOperandsWorkarounds(
+   outputTiledBf16Workaround.tensorLayoutWorkaround = Layout::Tile;
+   if (weightDtype != ttcore::DataType::BFloat16 &&
+       weightDtype != ttcore::DataType::Float32) {
+-    weightRowMajorBf16Workaround.tensorDataTypeWorkaround =
+-        ttcore::DataType::BFloat16;
+-    outputTiledBf16Workaround.tensorDataTypeWorkaround =
+-        ttcore::DataType::BFloat16;
++    // Float16 gathers through Float32, which holds every Float16 value;
++    // BFloat16 would round them.
++    ttcore::DataType gatherDtype = weightDtype == ttcore::DataType::Float16
++                                       ? ttcore::DataType::Float32
++                                       : ttcore::DataType::BFloat16;
++    weightRowMajorBf16Workaround.tensorDataTypeWorkaround = gatherDtype;
++    outputTiledBf16Workaround.tensorDataTypeWorkaround = gatherDtype;
+   }
+   return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds(0, 0)
+       .addInputOperandWorkaround(inputRowMajorInt32Workaround)
