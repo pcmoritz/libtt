@@ -19,7 +19,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_ty
 index 0609fef..92a788f 100644
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
-@@ -244,10 +244,8 @@ inline void calculate_typecast_fp32_to_uint32() {
+@@ -244,19 +244,28 @@ inline void calculate_typecast_fp32_to_uint32() {
  
  template <bool APPROXIMATION_MODE, int ITERATIONS>
  inline void calculate_typecast_fp32_to_fp16b() {
@@ -27,18 +27,25 @@ index 0609fef..92a788f 100644
 -    // low 16 bits (&0xFFFF0000), and store FP32 for 32-bit-Dest correctness. The historical
 -    // macro relied on a FP16B store to truncate and does not reproduce the masked-FP32 result,
 -    // so it is not equivalent and is not restored here. See #46751.
+-#pragma GCC unroll 0
+-    for (int d = 0; d < ITERATIONS; d++) {
+-        TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::DEFAULT, ADDR_MOD_7, 0);
+-        TTI_SFPSHFT((-16) & 0xFFF, p_sfpu::LREG1, p_sfpu::LREG0, 5);                // lreg[0] = lreg[1] >> 16
+-        TTI_SFPAND(0, p_sfpu::LREG12, p_sfpu::LREG0, 0);                            // lreg[0] &= 1
+-        TTI_SFPIADD(0, p_sfpu::LREG13, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);  // lreg[1] += 0x7FFF
+-        TTI_SFPIADD(0, p_sfpu::LREG0, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);   // lreg[1] += lreg[0]
+-        TTI_SFPAND(0, p_sfpu::LREG14, p_sfpu::LREG1, 0);                            // lreg[1] &= 0xFFFF0000
+-        TTI_SFPSTORE(p_sfpu::LREG1, InstrModLoadStore::FP32, ADDR_MOD_6, 0);
 +    // Round to nearest even, then store the raw BFloat16 bits through a UInt16
 +    // output CB so signed zero is not canonicalized by the BFloat16 pack path.
- #pragma GCC unroll 0
-     for (int d = 0; d < ITERATIONS; d++) {
-         TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::DEFAULT, ADDR_MOD_7, 0);
-@@ -256,7 +254,20 @@ inline void calculate_typecast_fp32_to_fp16b() {
-         TTI_SFPIADD(0, p_sfpu::LREG13, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);  // lreg[1] += 0x7FFF
-         TTI_SFPIADD(0, p_sfpu::LREG0, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);   // lreg[1] += lreg[0]
-         TTI_SFPAND(0, p_sfpu::LREG14, p_sfpu::LREG1, 0);                            // lreg[1] &= 0xFFFF0000
--        TTI_SFPSTORE(p_sfpu::LREG1, InstrModLoadStore::FP32, ADDR_MOD_6, 0);
-+        TTI_SFPSHFT((-16) & 0xFFF, p_sfpu::LREG1, p_sfpu::LREG1, 5);
-+        TTI_SFPSTORE(p_sfpu::LREG1, SFPSTORE_MODE_SWAP_HI_LO16, ADDR_MOD_6, 0);
++    // NaN stays a quiet NaN rather than rounding into infinity.
++    for (int d = 0; d < ITERATIONS; d++) {
++        sfpi::vFloat x = sfpi::dst_reg[0];
++        sfpi::vUInt bits = sfpi::as<sfpi::vUInt>(x);
++        sfpi::vUInt bfloatBits = (bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16;
++        v_if((bits & 0x7fffffffU) > 0x7f800000U) { bfloatBits = (bits >> 16) | 0x40U; }
++        v_endif;
++        __builtin_rvtt_sfpstore(bfloatBits.get(), 0, 9 /* swap high/low 16 */, ADDR_MOD_6);
 +    }
 +}
 +
@@ -58,7 +65,7 @@ diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_
 index 611b88e..d8b9ed8 100644
 --- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 +++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
-@@ -257,10 +257,8 @@ inline void calculate_typecast_fp32_to_uint32() {
+@@ -257,20 +257,28 @@ inline void calculate_typecast_fp32_to_uint32() {
  
  template <bool APPROXIMATION_MODE, int ITERATIONS>
  inline void calculate_typecast_fp32_to_fp16b() {
@@ -66,18 +73,26 @@ index 611b88e..d8b9ed8 100644
 -    // low 16 bits (&0xFFFF0000), and store FP32 for 32-bit-Dest correctness. The historical
 -    // macro relied on a FP16B store to truncate and does not reproduce the masked-FP32 result,
 -    // so it is not equivalent and is not restored here. See #46751.
+-#pragma GCC unroll 0
+-    for (int d = 0; d < ITERATIONS; d++) {
+-        TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::DEFAULT, ADDR_MOD_3, 0);
+-        TTI_SFPLOAD(p_sfpu::LREG1, InstrModLoadStore::DEFAULT, ADDR_MOD_3, 0);
+-        TTI_SFPSHFT((-16) & 0xFFF, 0, p_sfpu::LREG0, 1);                            // lreg[0] >>= 16
+-        TTI_SFPAND(0, p_sfpu::LREG12, p_sfpu::LREG0, 0);                            // lreg[0] &= 1
+-        TTI_SFPIADD(0, p_sfpu::LREG13, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);  // lreg[1] += 0x7FFF
+-        TTI_SFPIADD(0, p_sfpu::LREG0, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);   // lreg[1] += lreg[0]
+-        TTI_SFPAND(0, p_sfpu::LREG14, p_sfpu::LREG1, 0);                            // lreg[1] &= 0xFFFF0000
+-        TTI_SFPSTORE(p_sfpu::LREG1, InstrModLoadStore::FP32, ADDR_MOD_2, 0);
 +    // Round to nearest even, then store the raw BFloat16 bits through a UInt16
 +    // output CB so signed zero is not canonicalized by the BFloat16 pack path.
- #pragma GCC unroll 0
-     for (int d = 0; d < ITERATIONS; d++) {
-         TTI_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::DEFAULT, ADDR_MOD_3, 0);
-@@ -270,7 +268,20 @@ inline void calculate_typecast_fp32_to_fp16b() {
-         TTI_SFPIADD(0, p_sfpu::LREG13, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);  // lreg[1] += 0x7FFF
-         TTI_SFPIADD(0, p_sfpu::LREG0, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_CC_NONE);   // lreg[1] += lreg[0]
-         TTI_SFPAND(0, p_sfpu::LREG14, p_sfpu::LREG1, 0);                            // lreg[1] &= 0xFFFF0000
--        TTI_SFPSTORE(p_sfpu::LREG1, InstrModLoadStore::FP32, ADDR_MOD_2, 0);
-+        TTI_SFPSHFT((-16) & 0xFFF, 0, p_sfpu::LREG1, 1);
-+        TTI_SFPSTORE(p_sfpu::LREG1, SFPSTORE_MODE_SWAP_HI_LO16, ADDR_MOD_2, 0);
++    // NaN stays a quiet NaN rather than rounding into infinity.
++    for (int d = 0; d < ITERATIONS; d++) {
++        sfpi::vFloat x = sfpi::dst_reg[0];
++        sfpi::vUInt bits = sfpi::as<sfpi::vUInt>(x);
++        sfpi::vUInt bfloatBits = (bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16;
++        v_if((bits & 0x7fffffffU) > 0x7f800000U) { bfloatBits = (bits >> 16) | 0x40U; }
++        v_endif;
++        __builtin_rvtt_sfpstore(bfloatBits.get(), 0, 9 /* swap high/low 16 */, ADDR_MOD_2);
 +    }
 +}
 +
@@ -474,9 +489,9 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
  namespace ttnn::operations::core::CMAKE_UNIQUE_NAMESPACE {
  namespace {
 +
-+// BF16 and UInt16 have identical storage. Keep the owning storage alive while
++// BF16, FP16 and UInt16 have identical storage. Keep the owning storage alive while
 +// viewing the same allocation with a format that does not canonicalize floats.
-+Tensor view_bfloat16_bits(const Tensor& input, DataType dtype) {
++Tensor view_16bit_float_bits(const Tensor& input, DataType dtype) {
 +    const auto& spec = input.tensor_spec();
 +    tt::tt_metal::TensorSpec view_spec(
 +        spec.logical_shape(),
@@ -492,7 +507,7 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
  
  bool requires_padding_change(const ttnn::Tensor& tensor, ttnn::Layout layout) {
      if (layout == Layout::ROW_MAJOR) {
-@@ -75,6 +93,17 @@
+@@ -75,6 +93,21 @@
                  "the memory_config won't be changed!");
          }
          return tensor_arg;
@@ -500,13 +515,17 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
 +
 +    // Layout conversion must preserve every bit, including NaNs and -0.
 +    // Reuse the integer data-movement kernels without copying the payload.
-+    if (tensor_arg.storage_type() == StorageType::DEVICE && tensor_arg.dtype() == DataType::BFLOAT16 &&
-+        dtype.value_or(DataType::BFLOAT16) == DataType::BFLOAT16) {
-+        auto raw = view_bfloat16_bits(tensor_arg, DataType::UINT16);
++    const bool is_16bit_float = tensor_arg.dtype() == DataType::BFLOAT16 || tensor_arg.dtype() == DataType::FLOAT16;
++    if (tensor_arg.storage_type() == StorageType::DEVICE && is_16bit_float &&
++        dtype.value_or(tensor_arg.dtype()) == tensor_arg.dtype()) {
++        const uint16_t pad_bits = tensor_arg.dtype() == DataType::BFLOAT16
++                                      ? std::bit_cast<uint16_t>(bfloat16(pad_value))
++                                      : std::bit_cast<uint16_t>(static_cast<_Float16>(pad_value));
++        auto raw = view_16bit_float_bits(tensor_arg, DataType::UINT16);
 +        auto converted = to_layout_impl(
 +            raw, layout, DataType::UINT16, memory_config, sub_core_grids,
-+            static_cast<float>(std::bit_cast<uint16_t>(bfloat16(pad_value))));
-+        return view_bfloat16_bits(converted, DataType::BFLOAT16);
++            static_cast<float>(pad_bits));
++        return view_16bit_float_bits(converted, tensor_arg.dtype());
      }
  
      const std::set<ttnn::Layout> supported_layouts = {

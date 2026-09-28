@@ -1,0 +1,19 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -956,12 +956,13 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
+           .getElementType();
+   // Keep supported integer reductions exact: Float32 rounds values above
+   // 2^24 and cannot represent the INT32_MAX identity used by min.
+-  bool supportsInt32 =
++  bool supports32BitInteger =
+       inputType.isInteger(32) &&
+       (mlir::isa<ttnn::MinOp>(op) ||
++       (mlir::isa<ttnn::MaxOp>(op) && inputType.isUnsignedInteger()) ||
+        (mlir::isa<ttnn::SumOp>(op) && !inputType.isUnsignedInteger()));
+   TTNNOperandWorkarounds operandWorkaround;
+-  if (!inputType.isF32() && !inputType.isBF16() && !supportsInt32) {
++  if (!inputType.isF32() && !inputType.isBF16() && !supports32BitInteger) {
+     operandWorkaround.tensorDataTypeWorkaround =
+         mlir::tt::ttcore::DataType::Float32;
+   }
