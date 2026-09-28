@@ -45,3 +45,14 @@ def test_replicated_result_as_argument():
     xs = jax.device_put(x, NamedSharding(mesh, P()))
     doubled = jax.jit(lambda a: a * 2, out_shardings=NamedSharding(mesh, P()))(xs)
     np.testing.assert_array_equal(np.asarray(doubled[:, 4:9]), 2 * x[:, 4:9])
+
+
+def test_replicated_argument_sharded_by_the_program():
+    # Adding a NumPy array to a sharded array shards the NumPy array inside the
+    # program, although it arrives on every device.
+    mesh = _mesh()
+    n = mesh.shape["tensor"]
+    x = np.arange(8 * 4 * n, dtype=np.float32).reshape(8, 4 * n)
+    xs = jax.device_put(x, NamedSharding(mesh, P(None, "tensor")))
+    y = np.ones_like(x)
+    np.testing.assert_array_equal(np.asarray(xs + y), x + y)
