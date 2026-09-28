@@ -1,0 +1,71 @@
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
+@@ -13,6 +13,11 @@
+ #include "ttnn/operations/reduction/generic/device/reduce_op.hpp"
+ #include "ttnn/operations/reduction/reduction_common/reduction_common.hpp"
+ #include "ttnn/operations/core/core.hpp"
++#include "ttnn/operations/copy/typecast/typecast.hpp"
++#include "ttnn/operations/eltwise/binary/binary.hpp"
++#include "ttnn/operations/eltwise/binary/binary_composite.hpp"
++#include "ttnn/operations/eltwise/ternary/ternary.hpp"
++#include "ttnn/operations/eltwise/unary/unary.hpp"
+ #include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
+ #include "ttnn/operations/reduction/generic/device/welford_reduce_device_operation.hpp"
+ #include "ttnn/operations/data_movement/permute/permute.hpp"
+@@ -675,6 +680,35 @@ Tensor mean(
+         fast_and_approximate_mode);
+ }
+ 
++namespace {
++
++// UINT32 reductions run through float32, which is inexact above 2^24, and INT32 min/max mishandle
++// INT32_MIN, so reinterpreting UINT32 as INT32 is not exact either. Reduce the 16-bit halves as INT32
++// instead: the extreme high half, then the extreme low half among the elements that share it.
++Tensor uint32_min_max(
++    bool is_max,
++    const Tensor& input,
++    const std::optional<std::variant<int, int64_t, ttsl::SmallVector<int>>>& dim_arg,
++    bool keepdim,
++    const std::optional<MemoryConfig>& memory_config,
++    const std::optional<CoreRangeSet>& sub_core_grids) {
++    auto constant = [&](const Tensor& like, int value) { return ttnn::full_like(like, value); };
++    auto reduce_int32 = [&](const Tensor& t, bool keep) {
++        return is_max ? ttnn::max(t, dim_arg, keep, memory_config, std::nullopt, 1.0f, true, sub_core_grids)
++                      : ttnn::min(t, dim_arg, keep, memory_config, std::nullopt, 1.0f, true, sub_core_grids);
++    };
++    Tensor high = ttnn::typecast(ttnn::logical_right_shift(input, constant(input, 16)), DataType::INT32);
++    Tensor low = ttnn::typecast(ttnn::bitwise_and(input, constant(input, 0xFFFF)), DataType::INT32);
++    // Low halves of elements whose high half is not the extreme can never win.
++    Tensor candidates =
++        ttnn::where(ttnn::eq(high, reduce_int32(high, true)), low, constant(low, is_max ? -1 : 0x10000));
++    Tensor high_result = ttnn::typecast(reduce_int32(high, keepdim), DataType::UINT32);
++    Tensor low_result = ttnn::typecast(reduce_int32(candidates, keepdim), DataType::UINT32);
++    return ttnn::bitwise_or(ttnn::logical_left_shift(high_result, constant(high_result, 16)), low_result);
++}
++
++}  // namespace
++
+ Tensor max(
+     const Tensor& input_tensor_arg,
+     const std::optional<std::variant<int, int64_t, ttsl::SmallVector<int>>>& dim_arg,
+@@ -684,6 +718,9 @@ Tensor max(
+     float scalar,
+     bool correction,
+     const std::optional<CoreRangeSet>& sub_core_grids) {
++    if (input_tensor_arg.dtype() == DataType::UINT32 && scalar == 1.0f) {
++        return uint32_min_max(true, input_tensor_arg, dim_arg, keepdim, memory_config_arg, sub_core_grids);
++    }
+     /* Scaling is applied after reduction, so flip the op for negative scalars:
+      * max(s * x) = s * min(x) when s < 0.*/
+     if (scalar < 0.0f) {
+@@ -717,6 +754,9 @@ Tensor min(
+     float scalar,
+     bool correction,
+     const std::optional<CoreRangeSet>& sub_core_grids) {
++    if (input_tensor_arg.dtype() == DataType::UINT32 && scalar == 1.0f) {
++        return uint32_min_max(false, input_tensor_arg, dim_arg, keepdim, memory_config_arg, sub_core_grids);
++    }
+     /* Scaling is applied after reduction, so flip the op for negative scalars:
+      * min(s * x) = s * max(x) when s < 0.*/
+     if (scalar < 0.0f) {

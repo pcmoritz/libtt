@@ -1,0 +1,11 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -959,6 +959,7 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
+   bool supportsInt32 =
+       inputType.isInteger(32) &&
+       (mlir::isa<ttnn::MinOp>(op) ||
++       (mlir::isa<ttnn::MaxOp>(op) && inputType.isUnsignedInteger()) ||
+        (mlir::isa<ttnn::SumOp>(op) && !inputType.isUnsignedInteger()));
+   TTNNOperandWorkarounds operandWorkaround;
+   if (!inputType.isF32() && !inputType.isBF16() && !supportsInt32) {
