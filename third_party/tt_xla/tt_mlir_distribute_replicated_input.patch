@@ -1,0 +1,33 @@
+diff --git a/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp b/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
+--- a/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
++++ b/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
+@@ -2,6 +2,8 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
+ 
++#include <algorithm>
++
+ #include "tt/runtime/detail/common/logger.h"
+ #include "tt/runtime/detail/ttnn/ttnn.h"
+ #include "tt/runtime/detail/ttnn/utils.h"
+@@ -39,6 +41,20 @@
+     }
+   }
+ 
++  // An input that JAX already placed on every device arrives as one host
++  // buffer per device. Replicating it again would need a single buffer.
++  bool replicate =
++      std::all_of(placements->begin(), placements->end(), [](const auto *placement) {
++        return placement->type() == ::tt::target::ttnn::PlacementType::Replicate;
++      });
++  size_t buffers = 0;
++  input.host_storage().buffer().apply(
++      [&](const ::tt::tt_metal::HostBuffer &) { ++buffers; });
++  if (replicate && buffers > 1 && buffers == meshDevice.num_devices()) {
++    tensorPool.insertTTNNTensorAndValidate(op->out(), input);
++    return;
++  }
++
+   if (op->mapper_config()->mesh_shape_override()) {
+     ::ttsl::SmallVector<uint32_t> meshShapeOverride(
+         op->mapper_config()->mesh_shape_override()->begin(),
