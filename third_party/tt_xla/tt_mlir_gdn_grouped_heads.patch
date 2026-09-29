@@ -1,0 +1,182 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -3745,6 +3745,170 @@
+ 
+ } // namespace
+ 
++// Gated delta decode reads the query and key head of each value head's group,
++// so grouped query/key heads need not be repeated. Matches a slice with
++// group-aligned head bounds of x [B, H, D] repeated r times per head, as
++// repeat_interleave(x, r, dim=1) or
++//   reshape(broadcast(reshape(x, [B, H, 1, D]), [B, H, r, D]), [B, H * r, D]),
++// optionally times a scalar, and slices x instead.
++class GatedDeltaDecodeGroupedHeadsPattern
++    : public mlir::OpRewritePattern<GatedDeltaDecodeOp> {
++public:
++  using mlir::OpRewritePattern<GatedDeltaDecodeOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(GatedDeltaDecodeOp op,
++                  mlir::PatternRewriter &rewriter) const final {
++    std::optional<Grouped> query = match(op.getQuery());
++    std::optional<Grouped> key = match(op.getKey());
++    if (!query || !key || query->repeats != key->repeats) {
++      return mlir::failure();
++    }
++    Value newQuery = ungroup(rewriter, *query);
++    Value newKey = ungroup(rewriter, *key);
++    rewriter.modifyOpInPlace(op, [&] {
++      op.getQueryMutable().assign(newQuery);
++      op.getKeyMutable().assign(newKey);
++    });
++    return mlir::success();
++  }
++
++private:
++  struct Grouped {
++    Value heads; // [B, H, D] before repetition.
++    int64_t repeats;
++    int64_t begin, end; // Bounds on the repeated heads.
++    Value scalar;       // Optional factor with all dimensions of size 1,
++    Attribute fill;     // or optional constant factor.
++    Location loc;
++  };
++
++  static std::optional<Grouped> match(Value value) {
++    Location loc = value.getLoc();
++    Value scalar;
++    Attribute fill;
++    if (auto multiply = value.getDefiningOp<MultiplyOp>()) {
++      for (auto [operand, other] :
++           {std::pair(multiply.getLhs(), multiply.getRhs()),
++            std::pair(multiply.getRhs(), multiply.getLhs())}) {
++        auto broadcast = other.getDefiningOp<BroadcastOp>();
++        DenseElementsAttr constant;
++        if (auto full = other.getDefiningOp<FullOp>()) {
++          fill = full.getFillValue();
++        } else if (matchPattern(other, m_Constant(&constant)) &&
++                   constant.isSplat()) {
++          fill = constant.getSplatValue<Attribute>();
++        } else if (broadcast &&
++                   llvm::all_of(mlir::cast<RankedTensorType>(
++                                    broadcast.getInput().getType())
++                                    .getShape(),
++                                [](int64_t size) { return size == 1; })) {
++          scalar = broadcast.getInput();
++        }
++        if (scalar || fill) {
++          value = operand;
++          break;
++        }
++      }
++      if (!scalar && !fill) {
++        return std::nullopt;
++      }
++    }
++    auto slice = value.getDefiningOp<SliceStaticOp>();
++    std::optional<std::pair<Value, int64_t>> repeated =
++        slice ? matchRepeatedHeads(slice.getInput()) : std::nullopt;
++    if (!repeated) {
++      return std::nullopt;
++    }
++    auto [heads, repeats] = *repeated;
++    auto headsShape = mlir::cast<RankedTensorType>(heads.getType()).getShape();
++    const int64_t batch = headsShape[0], dim = headsShape[2];
++    auto bounds = [](ArrayAttr attr) {
++      return llvm::to_vector(llvm::map_range(attr, [](Attribute value) {
++        return mlir::cast<IntegerAttr>(value).getInt();
++      }));
++    };
++    auto begins = bounds(slice.getBegins());
++    auto ends = bounds(slice.getEnds());
++    auto steps = bounds(slice.getStep());
++    if (begins != ArrayRef<int64_t>{0, begins[1], 0} ||
++        ends != ArrayRef<int64_t>{batch, ends[1], dim} ||
++        steps != ArrayRef<int64_t>{1, 1, 1} || begins[1] % repeats != 0 ||
++        ends[1] % repeats != 0) {
++      return std::nullopt;
++    }
++    return Grouped{heads, repeats, begins[1], ends[1], scalar, fill, loc};
++  }
++
++  // Returns x [B, H, D] and r for x with each head repeated r times.
++  static std::optional<std::pair<Value, int64_t>>
++  matchRepeatedHeads(Value value) {
++    if (auto repeat = value.getDefiningOp<RepeatInterleaveOp>()) {
++      auto type = mlir::cast<RankedTensorType>(repeat.getInput().getType());
++      if (type.getRank() != 3 || (repeat.getDim() != 1 && repeat.getDim() != -2)) {
++        return std::nullopt;
++      }
++      return std::pair(repeat.getInput(), int64_t(repeat.getRepeats()));
++    }
++    auto outer = value.getDefiningOp<ReshapeOp>();
++    auto broadcast =
++        outer ? outer.getInput().getDefiningOp<BroadcastOp>() : nullptr;
++    auto inner =
++        broadcast ? broadcast.getInput().getDefiningOp<ReshapeOp>() : nullptr;
++    if (!inner) {
++      return std::nullopt;
++    }
++    Value heads = inner.getInput();
++    auto headsShape = mlir::cast<RankedTensorType>(heads.getType()).getShape();
++    auto innerShape = inner.getType().getShape();
++    auto broadcastShape = broadcast.getType().getShape();
++    auto outerShape = outer.getType().getShape();
++    if (headsShape.size() != 3 || innerShape.size() != 4 ||
++        broadcastShape.size() != 4 || outerShape.size() != 3) {
++      return std::nullopt;
++    }
++    const int64_t batch = headsShape[0], numHeads = headsShape[1],
++                  dim = headsShape[2], repeats = broadcastShape[2];
++    if (innerShape != ArrayRef<int64_t>{batch, numHeads, 1, dim} ||
++        broadcastShape != ArrayRef<int64_t>{batch, numHeads, repeats, dim} ||
++        outerShape != ArrayRef<int64_t>{batch, numHeads * repeats, dim}) {
++      return std::nullopt;
++    }
++    return std::pair(heads, repeats);
++  }
++
++  static Value ungroup(mlir::PatternRewriter &rewriter, const Grouped &group) {
++    auto type = mlir::cast<RankedTensorType>(group.heads.getType());
++    SmallVector<int64_t> shape(type.getShape());
++    const int32_t begin = group.begin / group.repeats;
++    const int32_t end = group.end / group.repeats;
++    shape[1] = end - begin;
++    auto slicedType =
++        RankedTensorType::get(shape, type.getElementType(), type.getEncoding());
++    Value result = rewriter.create<SliceStaticOp>(
++        group.loc, slicedType, group.heads,
++        rewriter.getI32ArrayAttr({0, begin, 0}),
++        rewriter.getI32ArrayAttr({static_cast<int32_t>(shape[0]), end,
++                                  static_cast<int32_t>(shape[2])}),
++        rewriter.getI32ArrayAttr({1, 1, 1}));
++    Value factor;
++    if (group.fill) {
++      factor = rewriter.create<FullOp>(group.loc, slicedType, group.fill);
++    } else if (group.scalar) {
++      factor = rewriter.create<BroadcastOp>(
++          group.loc, slicedType, group.scalar,
++          ttmlir::utils::getBroadcastDimensions<int64_t>(
++              mlir::cast<RankedTensorType>(group.scalar.getType()).getShape(),
++              shape));
++    }
++    if (factor) {
++      result =
++          rewriter.create<MultiplyOp>(group.loc, slicedType, result, factor);
++    }
++    return result;
++  }
++};
++
+ class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
+ public:
+   using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
+@@ -3796,6 +3960,7 @@
+       patterns.add<SpatialMeanOptimizationPattern>(&getContext());
+       patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
+       patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
++      patterns.add<GatedDeltaDecodeGroupedHeadsPattern>(&getContext());
+       if (permuteSliceAfterMatmulEnabled) {
+         patterns.add<PermuteSliceAfterMatmulPattern>(&getContext());
+       }

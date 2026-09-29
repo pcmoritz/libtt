@@ -975,7 +975,7 @@ new file mode 100644
 index 0000000..e981660
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,212 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1052,6 +1052,7 @@ index 0000000..e981660
 +    constexpr uint32_t num_heads = get_compile_time_arg_val(3);
 +    constexpr uint32_t workers_per_head = get_compile_time_arg_val(4);
 +    constexpr uint32_t num_workers = get_compile_time_arg_val(5);
++    constexpr uint32_t num_key_heads = get_compile_time_arg_val(6);
 +    constexpr uint32_t vt = full_vt / workers_per_head;
 +    constexpr uint32_t state_tiles = kt * vt;
 +    constexpr uint32_t tile_bytes = 4096;
@@ -1068,7 +1069,7 @@ index 0000000..e981660
 +    const uint32_t state_indices_address = get_arg_val<uint32_t>(9);
 +    const uint32_t has_initial_state_address = get_arg_val<uint32_t>(10);
 +
-+    constexpr auto query_args = TensorAccessorArgs<6>();
++    constexpr auto query_args = TensorAccessorArgs<7>();
 +    constexpr auto key_args = TensorAccessorArgs<query_args.next_compile_time_args_offset()>();
 +    constexpr auto value_args = TensorAccessorArgs<key_args.next_compile_time_args_offset()>();
 +    constexpr auto beta_logits_args = TensorAccessorArgs<value_args.next_compile_time_args_offset()>();
@@ -1146,10 +1147,12 @@ index 0000000..e981660
 +    }
 +
 +    const uint32_t head_tile = batch * ((num_heads + 31) / 32) + head / 32;
-+    read_vector(noc, query, query_cb, head_tile * kt, head % 32, kt);
++    const uint32_t key_head = head / (num_heads / num_key_heads);
++    const uint32_t key_tile = batch * ((num_key_heads + 31) / 32) + key_head / 32;
++    read_vector(noc, query, query_cb, key_tile * kt, key_head % 32, kt);
 +
 +    key_transposed_cb.reserve_back(kt);
-+    read_vector(noc, key, key_cb, head_tile * kt, head % 32, kt);
++    read_vector(noc, key, key_cb, key_tile * kt, key_head % 32, kt);
 +
 +    read_vector(noc, value, value_cb,
 +                head_tile * full_vt + column_start, head % 32, vt);
@@ -1286,7 +1289,7 @@ new file mode 100644
 index 0000000..b7ced7a
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,263 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1349,11 +1352,15 @@ index 0000000..b7ced7a
 +
 +void DecodeOperation::validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t& in) {
 +    const auto& query_shape = in.query.logical_shape();
-+    TT_FATAL(query_shape.rank() == 3, "query must have rank 3");
-+    const uint32_t batch_size = query_shape[0];
-+    const uint32_t num_heads = query_shape[1];
++    const auto& value_shape = in.value.logical_shape();
++    TT_FATAL(query_shape.rank() == 3 && value_shape.rank() == 3, "query and value must have rank 3");
++    const uint32_t batch_size = value_shape[0];
++    const uint32_t num_heads = value_shape[1];
++    // Grouped queries: each query/key head serves consecutive value heads.
++    const uint32_t num_key_heads = query_shape[1];
 +    TT_FATAL(batch_size > 0 && batch_size <= 32, "batch size must be in [1, 32]");
-+    TT_FATAL(num_heads > 0, "number of heads must be positive");
++    TT_FATAL(num_key_heads > 0 && num_heads % num_key_heads == 0,
++             "value heads must be a multiple of query heads");
 +    validate_tensor(in.query, DataType::FLOAT32, "query");
 +    validate_tensor(in.key, DataType::FLOAT32, "key");
 +    validate_tensor(in.value, DataType::FLOAT32, "value");
@@ -1366,8 +1373,8 @@ index 0000000..b7ced7a
 +    validate_tensor(in.has_initial_state, DataType::BFLOAT16, "initial-state mask");
 +
 +    constexpr uint32_t dim = 128;
-+    check_shape(in.query, {batch_size, num_heads, dim}, "query");
-+    check_shape(in.key, {batch_size, num_heads, dim}, "key");
++    check_shape(in.query, {batch_size, num_key_heads, dim}, "query");
++    check_shape(in.key, {batch_size, num_key_heads, dim}, "key");
 +    check_shape(in.value, {batch_size, num_heads, dim}, "value");
 +    check_shape(in.beta_logits, {batch_size, num_heads}, "beta logits");
 +    check_shape(in.delta_time, {batch_size, num_heads}, "delta time");
@@ -1385,12 +1392,12 @@ index 0000000..b7ced7a
 +
 +DecodeOperation::spec_return_value_t DecodeOperation::compute_output_specs(
 +    const operation_attributes_t&, const tensor_args_t& in) {
-+    return in.query.tensor_spec();
++    return in.value.tensor_spec();
 +}
 +
 +DecodeOperation::tensor_return_value_t DecodeOperation::create_output_tensors(
 +    const operation_attributes_t&, const tensor_args_t& in) {
-+    return create_device_tensor(in.query.tensor_spec(), in.query.device());
++    return create_device_tensor(in.value.tensor_spec(), in.value.device());
 +}
 +
 +ProgramDescriptor DecodeOperation::create_descriptor(
@@ -1400,8 +1407,9 @@ index 0000000..b7ced7a
 +    constexpr uint32_t workers_per_head = 2;
 +    constexpr uint32_t worker_vt = vt / workers_per_head;
 +    constexpr uint32_t state_tiles = kt * worker_vt;
-+    const uint32_t batch_size = in.query.logical_shape()[0];
-+    const uint32_t num_heads = in.query.logical_shape()[1];
++    const uint32_t batch_size = in.value.logical_shape()[0];
++    const uint32_t num_heads = in.value.logical_shape()[1];
++    const uint32_t num_key_heads = in.query.logical_shape()[1];
 +    ProgramDescriptor program;
 +
 +    auto* device = in.query.device();
@@ -1441,7 +1449,7 @@ index 0000000..b7ced7a
 +    make_cb(29, 1, tt::DataFormat::Int32);      // state index (writer)
 +
 +    std::vector<uint32_t> reader_args = {
-+        kt, vt, batch_size, num_heads, workers_per_head, num_workers};
++        kt, vt, batch_size, num_heads, workers_per_head, num_workers, num_key_heads};
 +    TensorAccessorArgs(in.query.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.key.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.value.buffer()).append_to(reader_args);
