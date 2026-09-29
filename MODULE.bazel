@@ -520,6 +520,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_shared_lhs_aligned_slices.patch",
         "//third_party/tt_xla:tt_mlir_gdn_grouped_heads.patch",
         "//third_party/tt_xla:tt_mlir_gdn_qk_norm.patch",
+        "//third_party/tt_xla:tt_mlir_concat_adjacent_slices.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
