@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3745,6 +3745,170 @@
+@@ -3745,6 +3745,259 @@
  
  } // namespace
  
@@ -10,7 +10,9 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +// group-aligned head bounds of x [B, H, D] repeated r times per head, as
 +// repeat_interleave(x, r, dim=1) or
 +//   reshape(broadcast(reshape(x, [B, H, 1, D]), [B, H, r, D]), [B, H * r, D]),
-+// optionally times a scalar, and slices x instead.
++// optionally times a scalar, and slices x instead. When the query and key are
++// L2-normalized heads of one tensor and only a constant scales the query, the
++// kernel reads, normalizes and scales them itself.
 +class GatedDeltaDecodeGroupedHeadsPattern
 +    : public mlir::OpRewritePattern<GatedDeltaDecodeOp> {
 +public:
@@ -23,6 +25,24 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    std::optional<Grouped> key = match(op.getKey());
 +    if (!query || !key || query->repeats != key->repeats) {
 +      return mlir::failure();
++    }
++    std::optional<Normalized> normalized = matchL2Norm(query->heads);
++    if (normalized && query->heads == key->heads && !query->scalar &&
++        !key->scalar && !key->fill) {
++      float scale =
++          query->fill
++              ? mlir::cast<FloatAttr>(query->fill).getValue().convertToFloat()
++              : 1.0f;
++      rewriter.modifyOpInPlace(op, [&] {
++        op.getQueryMutable().assign(normalized->input);
++        op.getKeyMutable().assign(normalized->input);
++        op.setQueryHeadOffset(query->begin / query->repeats);
++        op.setKeyHeadOffset(key->begin / key->repeats);
++        op.setNumKeyHeads((key->end - key->begin) / key->repeats);
++        op.setNormalizeEpsAttr(rewriter.getF32FloatAttr(normalized->eps));
++        op.setQueryScaleAttr(rewriter.getF32FloatAttr(scale));
++      });
++      return mlir::success();
 +    }
 +    Value newQuery = ungroup(rewriter, *query);
 +    Value newKey = ungroup(rewriter, *key);
@@ -100,6 +120,75 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    return Grouped{heads, repeats, begins[1], ends[1], scalar, fill, loc};
 +  }
 +
++  struct Normalized {
++    Value input; // [B, H, D] before normalization.
++    float eps;
++  };
++
++  static Value skipBroadcastsAndReshapes(Value value) {
++    while (Operation *op = value.getDefiningOp()) {
++      if (!isa<BroadcastOp, ReshapeOp>(op)) {
++        break;
++      }
++      value = op->getOperand(0);
++    }
++    return value;
++  }
++
++  static std::optional<float> constantValue(Value value) {
++    value = skipBroadcastsAndReshapes(value);
++    if (auto full = value.getDefiningOp<FullOp>()) {
++      if (auto fill = mlir::dyn_cast<FloatAttr>(full.getFillValue())) {
++        return fill.getValue().convertToFloat();
++      }
++    }
++    DenseElementsAttr constant;
++    if (matchPattern(value, m_Constant(&constant)) && constant.isSplat() &&
++        isa<FloatType>(constant.getElementType())) {
++      return constant.getSplatValue<APFloat>().convertToFloat();
++    }
++    return std::nullopt;
++  }
++
++  // Matches x / sqrt(sum(x * x, last dim) + eps) for f32 x [B, H, 128], the
++  // normalization the decode kernel applies.
++  static std::optional<Normalized> matchL2Norm(Value value) {
++    auto div = value.getDefiningOp<DivOp>();
++    auto sqrt = div ? skipBroadcastsAndReshapes(div.getRhs())
++                          .getDefiningOp<SqrtOp>()
++                    : nullptr;
++    auto add = sqrt ? skipBroadcastsAndReshapes(sqrt.getInput())
++                          .getDefiningOp<AddOp>()
++                    : nullptr;
++    if (!add) {
++      return std::nullopt;
++    }
++    Value x = div.getLhs();
++    auto type = mlir::cast<RankedTensorType>(x.getType());
++    if (type.getRank() != 3 || type.getDimSize(2) != 128 ||
++        !type.getElementType().isF32()) {
++      return std::nullopt;
++    }
++    for (auto [sumSide, epsSide] : {std::pair(add.getLhs(), add.getRhs()),
++                                    std::pair(add.getRhs(), add.getLhs())}) {
++      auto sum = skipBroadcastsAndReshapes(sumSide).getDefiningOp<SumOp>();
++      std::optional<float> eps = constantValue(epsSide);
++      auto square = sum ? sum.getInput().getDefiningOp<MultiplyOp>() : nullptr;
++      if (!square || !eps || square.getLhs() != x || square.getRhs() != x) {
++        continue;
++      }
++      std::optional<ArrayAttr> dims = sum.getDimArg();
++      if (!dims || dims->size() != 1) {
++        continue;
++      }
++      int64_t dim = mlir::cast<IntegerAttr>((*dims)[0]).getInt();
++      if (dim == 2 || dim == -1) {
++        return Normalized{x, *eps};
++      }
++    }
++    return std::nullopt;
++  }
++
 +  // Returns x [B, H, D] and r for x with each head repeated r times.
 +  static std::optional<std::pair<Value, int64_t>>
 +  matchRepeatedHeads(Value value) {
@@ -172,7 +261,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -3796,6 +3960,7 @@
+@@ -3796,6 +4049,7 @@
        patterns.add<SpatialMeanOptimizationPattern>(&getContext());
        patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
        patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
