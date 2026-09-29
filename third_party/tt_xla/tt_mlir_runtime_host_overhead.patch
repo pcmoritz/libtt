@@ -1,0 +1,38 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h
+--- a/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h
+@@ -42,9 +42,14 @@
+ std::string to_string(const CacheKey &key);
+ 
+ struct CacheKeyHasher {
++  // Every const-eval lookup hashes a key, so combine the fields directly
++  // instead of formatting the key into a string first.
+   std::size_t operator()(const CacheKey &k) const {
+-    // TODO(pilkic): Optimize hash function if needed.
+-    return std::hash<std::string>{}(to_string(k));
++    std::size_t hash = std::hash<std::string>{}(k.funcHash) ^ k.deviceId;
++    for (std::uint64_t version : k.inputVersions) {
++      hash = hash * 0x100000001b3ULL ^ version;
++    }
++    return hash;
+   }
+ };
+ 
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -231,10 +231,14 @@
+               "Executing operation: ", op->debug_info()->c_str());
+     // TODO(#7743): Remove these tracy messages.
+     // Currently they are being used by `ttrt perf` for parsing the csv output.
++    // Without perf tracing they do nothing, but their arguments would still
++    // be built for every op.
++#if defined(TT_RUNTIME_ENABLE_PERF_TRACE) && TT_RUNTIME_ENABLE_PERF_TRACE == 1
+     perf::Env::get().tracyLogOpLocation(std::string(op->loc_info()->c_str()));
+     perf::Env::get().tracyLogConstEvalProgram(constEvalProgram);
+     perf::Env::get().tracyLogProgramMetadata(
+         perf::Env::get().tracyProgramMetadata);
++#endif
+     runOpCallback(debug::Hooks::get().getPreOperatorCallback(),
+                   executableHandle, op, context.get());
+     runOperation(op);

@@ -1,0 +1,60 @@
+diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/tensor.h
+--- a/pjrt_implementation/inc/api/tensor.h
++++ b/pjrt_implementation/inc/api/tensor.h
+@@ -129,12 +129,13 @@ public: // Constructors needs to be public for std::shared_ptr.
+   // Removes shard from shards (by setting shard to nullptr).
+   void remove_shard(const BufferInstance *shard) noexcept;
+ 
++  // Returns whether all shards share the same runtime tensor.
++  static bool have_same_tensor(const std::vector<BufferInstance *> &shards);
++
+   // Moves pjrt tensor to host.
+   void move_to_host() noexcept;
+ 
+ private:
+-  // Returns whether all shards share the same runtime tensor.
+-  static bool have_same_tensor(const std::vector<BufferInstance *> &shards);
+   static PjrtTensor &from_shards(const std::vector<BufferInstance *> &shards);
+   static uint64_t next_uid();
+ 
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -62,23 +62,27 @@ FlatbufferLoadedExecutableInstance::prepareInputTensor(
+   tt::runtime::Layout expected_layout = tt::runtime::getLayout(
+       executable_image->getFlatbufferBinary(), program_index, arg_index);
+ 
+-  mlir::FailureOr<std::unordered_map<std::string, std::string>> strategy =
+-      fillStrategyMapFromSharding(
+-          m_executable_image->getInputSharding(arg_index), num_devices);
+-
+-  if (mlir::failed(strategy)) {
+-    LOG_F(ERROR, "Failed to fill strategy map from sharding");
+-    return std::nullopt;
+-  }
+-
+   bool is_distributed = ::tt::runtime::getCurrentHostRuntime() ==
+                         tt::runtime::HostRuntime::Distributed;
+   if (is_distributed) {
+     materializeShellTensors(arg_buffers);
+   }
+ 
++  // The strategy only matters when the shards need a new runtime tensor.
++  std::unordered_map<std::string, std::string> strategy;
++  if (!PjrtTensor::have_same_tensor(arg_buffers)) {
++    mlir::FailureOr<std::unordered_map<std::string, std::string>> filled =
++        fillStrategyMapFromSharding(
++            m_executable_image->getInputSharding(arg_index), num_devices);
++    if (mlir::failed(filled)) {
++      LOG_F(ERROR, "Failed to fill strategy map from sharding");
++      return std::nullopt;
++    }
++    strategy = std::move(*filled);
++  }
++
+   PjrtTensor &tensor = PjrtTensor::from_pjrt_buffers(
+-      arg_buffers, m_executable_image->getDevicesMeshShape(), *strategy);
++      arg_buffers, m_executable_image->getDevicesMeshShape(), strategy);
+ 
+   tensor.ensure_layout(runtime_device, expected_layout);
+ 
