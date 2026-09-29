@@ -28,6 +28,10 @@ def _bfp8(weights):
         # An odd K tile count and a prime output tile count.
         (1, 96, 32 * 163, True, False, "bfp_bf8"),
         (1, 1024, 5120, True, False, "bf16"),
+        # A width that is not a whole number of tiles, as when a narrow
+        # projection is fused into a wide one.
+        (1, 1024, 5120 + 24, False, False, "bfp_bf8"),
+        (1, 1024, 5120 + 24, False, True, "bfp_bf8"),
     ],
 )
 def test_decode_matmul(rows, inner_size, width, residual, transposed, weight_dtype):

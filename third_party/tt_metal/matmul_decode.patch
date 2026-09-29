@@ -672,8 +672,8 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
 +           a.dtype() == DataType::BFLOAT16 && is_tile_row(a, K) &&
 +           (output_dtype == DataType::BFLOAT16 || output_dtype == DataType::FLOAT32) &&
 +           b.layout() == Layout::TILE && b.tensor_spec().tile() == tt::tt_metal::Tile() &&
-+           b_shape.volume() == static_cast<uint64_t>(K) * N && b.logical_shape()[-1] % TILE_WIDTH == 0 &&
-+           b.logical_shape()[-2] % TILE_WIDTH == 0 && N / TILE_WIDTH >= grid.x * grid.y &&
++           b_shape.volume() == static_cast<uint64_t>(K) * N &&
++           b.logical_shape()[attributes.transpose_b ? -1 : -2] % TILE_WIDTH == 0 && N / TILE_WIDTH >= grid.x * grid.y &&
 +           is_dram_interleaved(b.memory_config()) && is_dram_interleaved(attributes.output_mem_config);
 +}
 +
