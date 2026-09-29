@@ -1,0 +1,33 @@
+diff --git a/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp b/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
+--- a/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
++++ b/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "tt/runtime/detail/common/logger.h"
++#include "tt/runtime/detail/ttnn/operations/utils.h"
+ #include "tt/runtime/detail/ttnn/ttnn.h"
+ #include "tt/runtime/detail/ttnn/utils.h"
+ #include "ttnn/distributed/distributed_tensor.hpp"
+@@ -47,8 +48,20 @@
+   }
+   std::unique_ptr<TensorToMesh> meshMapper =
+       ::ttnn::distributed::create_mesh_mapper(meshDevice, meshMapperConfig);
++
++  // An input that JAX already placed on every device arrives with one host
++  // buffer per device. Buffers that each hold the whole tensor are copies of
++  // it, so distribute one of them.
++  const auto &buffer = input.host_storage().buffer();
++  ::ttnn::Tensor source = input;
++  if (buffer.shape().mesh_size() > 1 && !buffer.shard_coords().empty() &&
++      input.logical_shape() ==
++          utils::toTTNNShape(*op->in()->desc()->shape())) {
++    source = ::ttnn::Tensor(*buffer.get_shard(*buffer.shard_coords().begin()),
++                            input.tensor_spec());
++  }
+   ::ttnn::Tensor out =
+-      ::ttnn::distributed::distribute_tensor(input, *meshMapper);
++      ::ttnn::distributed::distribute_tensor(source, *meshMapper);
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
