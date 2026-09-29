@@ -1,0 +1,21 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -2091,6 +2091,17 @@
+       }
+     }
+ 
++    // A tiled slice needs a tile-aligned start. Put the outputs whose width
++    // is a multiple of a tile first, so that at most the last one, e.g. a
++    // narrow gate projection, starts inside a tile.
++    std::stable_partition(result.ops.begin(), result.ops.end(), [](OpType op) {
++      auto type = mlir::cast<RankedTensorType>(op.getType());
++      return type.getDimSize(type.getRank() - 1) % ttnn::TILE_WIDTH == 0;
++    });
++    if (!result.ops.empty()) {
++      result.firstTransposeB = result.ops.front().getTransposeB();
++    }
++
+     sortQKVProjectionCandidates(result);
+ 
+     return result;
