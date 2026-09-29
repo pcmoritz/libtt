@@ -1,7 +1,7 @@
 diff --git a/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h
 --- a/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h
 +++ b/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h
-@@ -42,9 +42,19 @@
+@@ -42,9 +42,14 @@
  std::string to_string(const CacheKey &key);
  
  struct CacheKeyHasher {
@@ -10,14 +10,9 @@ diff --git a/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h 
    std::size_t operator()(const CacheKey &k) const {
 -    // TODO(pilkic): Optimize hash function if needed.
 -    return std::hash<std::string>{}(to_string(k));
-+    std::size_t hash = std::hash<std::string>{}(k.funcHash);
-+    auto combine = [&hash](std::uint64_t value) {
-+      hash ^= std::hash<std::uint64_t>{}(value) + 0x9e3779b97f4a7c15ULL +
-+              (hash << 6) + (hash >> 2);
-+    };
-+    combine(static_cast<std::uint64_t>(k.deviceId));
++    std::size_t hash = std::hash<std::string>{}(k.funcHash) ^ k.deviceId;
 +    for (std::uint64_t version : k.inputVersions) {
-+      combine(version);
++      hash = hash * 0x100000001b3ULL ^ version;
 +    }
 +    return hash;
    }

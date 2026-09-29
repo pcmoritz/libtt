@@ -309,13 +309,13 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +  }
 +};
 +
- class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
- public:
-   using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -3796,6 +4100,7 @@
-       patterns.add<SpatialMeanOptimizationPattern>(&getContext());
+ // A concatenation of slices that cut adjacent ranges of one tensor along the
+ // concatenated dimension is a single slice, e.g. rebuilding [q | k | v] from a
+ // fused [q | k | v | z] projection.
+@@ -3855,6 +4159,7 @@
        patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
        patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
+       patterns.add<ConcatOfAdjacentSlicesPattern>(&getContext());
 +      patterns.add<GatedDeltaDecodeGroupedHeadsPattern>(&getContext());
        if (permuteSliceAfterMatmulEnabled) {
          patterns.add<PermuteSliceAfterMatmulPattern>(&getContext());

@@ -62,7 +62,7 @@ diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.c
 diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
-@@ -346,2 +346,88 @@
+@@ -346,2 +346,85 @@
  
 +void LoadedExecutableInstance::invalidateDonatedInputs(
 +    PJRT_LoadedExecutable_Execute_Args *args,
@@ -110,10 +110,6 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
 +
 +  // A donated buffer may appear in no other input position. Only the few
 +  // donated buffers are tracked; other buffers may repeat freely.
-+  std::vector<bool> is_donated(args->num_args);
-+  for (size_t input_index : donated_indices) {
-+    is_donated[input_index] = true;
-+  }
 +  std::unordered_set<BufferInstance *> donated_buffers;
 +  donated_buffers.reserve(donated_indices.size());
 +  for (size_t device_index = 0; device_index < args->num_devices;
@@ -137,7 +133,8 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
 +              input_index, device_index);
 +        return tt_pjrt_status::kInvalidArgument;
 +      }
-+      if (!is_donated[input_index] && donated_buffers.contains(buffer)) {
++      if (donated_buffers.contains(buffer) &&
++          !donated_indices.contains(input_index)) {
 +        LOG_F(ERROR,
 +              "Input buffer %zu on device %zu is used in conflicting "
 +              "donated and non-donated positions",
