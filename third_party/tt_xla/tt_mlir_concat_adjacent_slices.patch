@@ -1,0 +1,76 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -3734,6 +3734,64 @@
+ 
+ } // namespace
+ 
++// A concatenation of slices that cut adjacent ranges of one tensor along the
++// concatenated dimension is a single slice, e.g. rebuilding [q | k | v] from a
++// fused [q | k | v | z] projection.
++class ConcatOfAdjacentSlicesPattern : public mlir::OpRewritePattern<ConcatOp> {
++public:
++  using mlir::OpRewritePattern<ConcatOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(ConcatOp op, mlir::PatternRewriter &rewriter) const final {
++    const int64_t rank = op.getType().getRank();
++    const int64_t dim = op.getDim() < 0 ? op.getDim() + rank : op.getDim();
++    auto values = [](ArrayAttr attr) {
++      return llvm::to_vector(llvm::map_range(attr, [](Attribute value) {
++        return static_cast<int32_t>(mlir::cast<IntegerAttr>(value).getInt());
++      }));
++    };
++    Value source;
++    SmallVector<int32_t> begins, ends;
++    for (Value input : op.getInputs()) {
++      auto slice = input.getDefiningOp<SliceStaticOp>();
++      if (!slice || (source && slice.getInput() != source) ||
++          llvm::any_of(values(slice.getStep()),
++                       [](int32_t step) { return step != 1; })) {
++        return mlir::failure();
++      }
++      auto sliceBegins = values(slice.getBegins());
++      auto sliceEnds = values(slice.getEnds());
++      if (!source) {
++        source = slice.getInput();
++        begins = sliceBegins;
++        ends = sliceEnds;
++        continue;
++      }
++      for (int64_t d = 0; d < rank; ++d) {
++        if (d == dim) {
++          // Along the concatenated dimension, the next slice must start
++          // exactly where the accumulated slices end.
++          if (sliceBegins[d] != ends[d]) {
++            return mlir::failure();
++          }
++        } else {
++          // Along every other dimension, both slices must cover exactly the
++          // same range.
++          if (sliceBegins[d] != begins[d] || sliceEnds[d] != ends[d]) {
++            return mlir::failure();
++          }
++        }
++      }
++      ends[dim] = sliceEnds[dim];
++    }
++    rewriter.replaceOpWithNewOp<SliceStaticOp>(
++        op, op.getType(), source, rewriter.getI32ArrayAttr(begins),
++        rewriter.getI32ArrayAttr(ends),
++        rewriter.getI32ArrayAttr(SmallVector<int32_t>(rank, 1)));
++    return mlir::success();
++  }
++};
++
+ class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
+ public:
+   using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
+@@ -3785,6 +3843,7 @@
+       patterns.add<SpatialMeanOptimizationPattern>(&getContext());
+       patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
+       patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
++      patterns.add<ConcatOfAdjacentSlicesPattern>(&getContext());
+       if (permuteSliceAfterMatmulEnabled) {
+         patterns.add<PermuteSliceAfterMatmulPattern>(&getContext());
+       }
