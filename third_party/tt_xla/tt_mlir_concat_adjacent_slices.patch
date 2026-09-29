@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3734,6 +3734,56 @@
+@@ -3734,6 +3734,64 @@
  
  } // namespace
  
@@ -38,11 +38,19 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +        ends = sliceEnds;
 +        continue;
 +      }
-+      // Same bounds in the other dimensions, starting where the last ended.
 +      for (int64_t d = 0; d < rank; ++d) {
-+        if (d == dim ? sliceBegins[d] != ends[d]
-+                     : sliceBegins[d] != begins[d] || sliceEnds[d] != ends[d]) {
-+          return mlir::failure();
++        if (d == dim) {
++          // Along the concatenated dimension, the next slice must start
++          // exactly where the accumulated slices end.
++          if (sliceBegins[d] != ends[d]) {
++            return mlir::failure();
++          }
++        } else {
++          // Along every other dimension, both slices must cover exactly the
++          // same range.
++          if (sliceBegins[d] != begins[d] || sliceEnds[d] != ends[d]) {
++            return mlir::failure();
++          }
 +        }
 +      }
 +      ends[dim] = sliceEnds[dim];
@@ -58,7 +66,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -3785,6 +3835,7 @@
+@@ -3785,6 +3843,7 @@
        patterns.add<SpatialMeanOptimizationPattern>(&getContext());
        patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
        patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
