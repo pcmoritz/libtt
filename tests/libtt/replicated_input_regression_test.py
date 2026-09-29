@@ -54,7 +54,7 @@ def test_replicated_argument_sharded_by_the_program():
     n = mesh.shape["tensor"]
     x = np.arange(8 * 4 * n, dtype=np.float32).reshape(8, 4 * n)
     xs = jax.device_put(x, NamedSharding(mesh, P(None, "tensor")))
-    y = -np.arange(x.size, dtype=np.float32).reshape(x.shape)
+    y = 3 * np.arange(x.size, dtype=np.float32).reshape(x.shape) + 7
     np.testing.assert_array_equal(np.asarray(xs + y), x + y)
 
 
@@ -64,4 +64,5 @@ def test_scalar_argument_next_to_sharded_argument():
     x = np.arange(8 * 4 * n, dtype=np.float32).reshape(8, 4 * n)
     xs = jax.device_put(x, NamedSharding(mesh, P(None, "tensor")))
     step = np.float32(3)
-    np.testing.assert_array_equal(np.asarray(xs + step), x + step)
+    add = jax.jit(lambda a, s: a + s)
+    np.testing.assert_array_equal(np.asarray(add(xs, step)), x + step)
