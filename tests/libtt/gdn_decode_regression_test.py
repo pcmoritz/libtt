@@ -16,13 +16,23 @@ def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial):
 
 
 @pytest.mark.parametrize("trace", [False, True])
-@pytest.mark.parametrize("batch,key_heads,groups", [(1, 4, 3), (2, 2, 2), (1, 4, 1)])
-def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups):
+@pytest.mark.parametrize(
+    "batch,key_heads,groups,flat", [(1, 4, 3, False), (1, 4, 3, True), (2, 2, 2, True), (1, 4, 1, False)]
+)
+def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, flat):
     # Like Qwen3.5: normalize q and k together, repeat each head for its group
-    # of value heads, then split and scale q.
+    # of value heads, then split and scale q. With flat, q, k and v are slices
+    # of one BF16 [B, (2 * key_heads + heads) * D] convolution output.
     heads, dim = key_heads * groups, 128
 
     def decode(state, qk, v, b, a, A_log, dt_bias, indices, initial):
+        if flat:
+            mixed = jnp.concatenate(
+                [qk.reshape(batch, -1), v.reshape(batch, -1)], axis=1
+            ).astype(jnp.bfloat16)
+            mixed = mixed @ jnp.eye(mixed.shape[1], dtype=mixed.dtype)
+            qk = mixed[:, : 2 * key_heads * dim].reshape(batch, 2 * key_heads, dim).astype(jnp.float32)
+            v = mixed[:, 2 * key_heads * dim :].reshape(batch, heads, dim).astype(jnp.float32)
         qk = qk / jnp.sqrt(jnp.sum(qk * qk, axis=-1, keepdims=True) + 1e-6)
         qk = jnp.repeat(qk, groups, axis=-2)
         q, k = qk[:, :heads], qk[:, heads:]
@@ -38,6 +48,9 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups):
     for _ in range(3):
         qk = rng.normal(0, 1, (batch, 2 * key_heads, dim)).astype(np.float32)
         v = rng.normal(0, 0.5, (batch, heads, dim)).astype(np.float32)
+        if flat:
+            # The program rounds the flat input to BF16.
+            qk, v = (x.astype(jnp.bfloat16).astype(np.float32) for x in (qk, v))
         b = rng.normal(0, 1, (batch, heads)).astype(np.float32)
         a = rng.normal(0, 1, (batch, heads)).astype(np.float32)
         A_log = rng.uniform(-1, 1, heads).astype(np.float32)

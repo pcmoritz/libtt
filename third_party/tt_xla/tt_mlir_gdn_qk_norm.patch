@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -6478,7 +6478,12 @@
+@@ -6478,7 +6478,13 @@
                         AnyRankedTensor:$a_log,
                         AnyRankedTensor:$dt_bias,
                         AnyRankedTensor:$state_indices,
@@ -9,6 +9,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$has_initial_state,
 +                       DefaultValuedAttr<UI32Attr, "0">:$query_head_offset,
 +                       DefaultValuedAttr<UI32Attr, "0">:$key_head_offset,
++                       DefaultValuedAttr<UI32Attr, "0">:$value_head_offset,
 +                       DefaultValuedAttr<UI32Attr, "0">:$num_key_heads,
 +                       OptionalAttr<F32Attr>:$normalize_eps,
 +                       DefaultValuedAttr<F32Attr, "1.0f">:$query_scale);
@@ -18,7 +19,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4310,7 +4310,12 @@
+@@ -4310,7 +4310,13 @@
                         AnyRankedTensor:$a_log,
                         AnyRankedTensor:$dt_bias,
                         AnyRankedTensor:$state_indices,
@@ -26,6 +27,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$has_initial_state,
 +                       DefaultValuedAttr<UI32Attr, "0">:$query_head_offset,
 +                       DefaultValuedAttr<UI32Attr, "0">:$key_head_offset,
++                       DefaultValuedAttr<UI32Attr, "0">:$value_head_offset,
 +                       DefaultValuedAttr<UI32Attr, "0">:$num_key_heads,
 +                       OptionalAttr<F32Attr>:$normalize_eps,
 +                       DefaultValuedAttr<F32Attr, "1.0f">:$query_scale);
@@ -35,7 +37,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
 --- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
-@@ -108,6 +108,12 @@
+@@ -108,6 +108,13 @@
    state_indices: tt.target.ttnn.TensorRef;
    has_initial_state: tt.target.ttnn.TensorRef;
    output: tt.target.ttnn.TensorRef;
@@ -45,6 +47,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 +  normalize: bool;
 +  eps: float;
 +  query_scale: float = 1.0;
++  value_head_offset: uint32;
  }
  
  table CausalConv1dUpdateOp {
@@ -73,7 +76,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +      op.getQueryHeadOffset(), op.getKeyHeadOffset(), op.getNumKeyHeads(),
 +      op.getNormalizeEps().has_value(),
 +      op.getNormalizeEps().value_or(llvm::APFloat(0.0f)).convertToFloat(),
-+      op.getQueryScale().convertToFloat());
++      op.getQueryScale().convertToFloat(), op.getValueHeadOffset());
  }
  
  ::flatbuffers::Offset<::tt::target::ttnn::CausalConv1dUpdateOp>
@@ -88,7 +91,7 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +      tiled(get(op->has_initial_state()), ::ttnn::DataType::BFLOAT16),
 +      op->query_head_offset(), op->key_head_offset(), op->num_key_heads(),
 +      op->normalize() ? std::optional<float>(op->eps()) : std::nullopt,
-+      op->query_scale());
++      op->query_scale(), op->value_head_offset());
    put(pool, op->output(), output);
  }
  

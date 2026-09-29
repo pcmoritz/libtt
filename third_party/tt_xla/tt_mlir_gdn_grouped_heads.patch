@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3745,6 +3745,259 @@
+@@ -3745,6 +3745,310 @@
  
  } // namespace
  
@@ -12,7 +12,8 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +//   reshape(broadcast(reshape(x, [B, H, 1, D]), [B, H, r, D]), [B, H * r, D]),
 +// optionally times a scalar, and slices x instead. When the query and key are
 +// L2-normalized heads of one tensor and only a constant scales the query, the
-+// kernel reads, normalizes and scales them itself.
++// kernel reads, normalizes and scales them itself; when they and the value are
++// head-aligned slices of one flat tensor, it reads all three from that tensor.
 +class GatedDeltaDecodeGroupedHeadsPattern
 +    : public mlir::OpRewritePattern<GatedDeltaDecodeOp> {
 +public:
@@ -33,11 +34,34 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +          query->fill
 +              ? mlir::cast<FloatAttr>(query->fill).getValue().convertToFloat()
 +              : 1.0f;
++      Value input = normalized->input;
++      int64_t qkOffset = 0, valueOffset = 0;
++      std::optional<std::pair<Value, int64_t>> qkSource =
++          flatSource(normalized->input);
++      std::optional<std::pair<Value, int64_t>> valueSource =
++          flatSource(op.getValue());
++      if (qkSource && valueSource && qkSource->first == valueSource->first) {
++        auto flatType = mlir::cast<RankedTensorType>(qkSource->first.getType());
++        input = qkSource->first;
++        if (!flatType.getElementType().isF32()) {
++          input = rewriter.create<TypecastOp>(
++              op.getLoc(),
++              RankedTensorType::get(flatType.getShape(), rewriter.getF32Type(),
++                                    flatType.getEncoding()),
++              input);
++        }
++        qkOffset = qkSource->second;
++        valueOffset = valueSource->second;
++      }
 +      rewriter.modifyOpInPlace(op, [&] {
-+        op.getQueryMutable().assign(normalized->input);
-+        op.getKeyMutable().assign(normalized->input);
-+        op.setQueryHeadOffset(query->begin / query->repeats);
-+        op.setKeyHeadOffset(key->begin / key->repeats);
++        op.getQueryMutable().assign(input);
++        op.getKeyMutable().assign(input);
++        if (qkOffset || valueOffset || input != normalized->input) {
++          op.getValueMutable().assign(input);
++          op.setValueHeadOffset(valueOffset);
++        }
++        op.setQueryHeadOffset(qkOffset + query->begin / query->repeats);
++        op.setKeyHeadOffset(qkOffset + key->begin / key->repeats);
 +        op.setNumKeyHeads((key->end - key->begin) / key->repeats);
 +        op.setNormalizeEpsAttr(rewriter.getF32FloatAttr(normalized->eps));
 +        op.setQueryScaleAttr(rewriter.getF32FloatAttr(scale));
@@ -124,6 +148,33 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    Value input; // [B, H, D] before normalization.
 +    float eps;
 +  };
++
++  // Returns the flat [B, W] tensor of which value [B, H, 128] reshapes a slice
++  // of whole heads, and the slice's first head.
++  static std::optional<std::pair<Value, int64_t>> flatSource(Value value) {
++    while (Operation *op = value.getDefiningOp()) {
++      if (!isa<TypecastOp, ReshapeOp>(op)) {
++        break;
++      }
++      value = op->getOperand(0);
++    }
++    auto slice = value.getDefiningOp<SliceStaticOp>();
++    if (!slice) {
++      return std::nullopt;
++    }
++    auto shape = mlir::cast<RankedTensorType>(slice.getInput().getType())
++                     .getShape();
++    auto bound = [](ArrayAttr attr, size_t i) {
++      return mlir::cast<IntegerAttr>(attr[i]).getInt();
++    };
++    if (shape.size() != 2 || bound(slice.getBegins(), 0) != 0 ||
++        bound(slice.getEnds(), 0) != shape[0] ||
++        bound(slice.getStep(), 0) != 1 || bound(slice.getStep(), 1) != 1 ||
++        bound(slice.getBegins(), 1) % 128 != 0) {
++      return std::nullopt;
++    }
++    return std::pair(slice.getInput(), bound(slice.getBegins(), 1) / 128);
++  }
 +
 +  static Value skipBroadcastsAndReshapes(Value value) {
 +    while (Operation *op = value.getDefiningOp()) {
@@ -261,7 +312,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -3796,6 +4049,7 @@
+@@ -3796,6 +4100,7 @@
        patterns.add<SpatialMeanOptimizationPattern>(&getContext());
        patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
        patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
