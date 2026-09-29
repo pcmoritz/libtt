@@ -29,13 +29,39 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc
 --- a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc
 +++ b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc
-@@ -409,6 +409,31 @@
+@@ -27,6 +27,7 @@
+ #include "mlir/IR/Types.h"
+ #include "mlir/Support/LLVM.h"
+ #include "shardy/dialect/sdy/ir/dialect.h"
++#include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+ 
+ #include "mlir/Pass/PassManager.h"
+ #include "mlir/Transforms/Passes.h"
+@@ -383,6 +384,18 @@
+     manualComputationOps.push_back(op);
+   });
+ 
++  // The program distributes unsharded arguments itself, so JAX must pass
++  // them whole. Note them before the TT attributes are stripped.
++  auto main = module.lookupSymbol<mlir::func::FuncOp>("main");
++  TT_FATAL(main, "Expected a main function in module");
++  llvm::SmallVector<bool> unsharded(main.getNumArguments());
++  for (unsigned i = 0; i < unsharded.size(); ++i) {
++    auto status = main.getArgAttrOfType<mlir::tt::ttcore::ShardStatusAttr>(
++        i, mlir::tt::ttcore::ShardStatusAttr::name);
++    unsharded[i] = status && status.getValue() ==
++                                 mlir::tt::ttcore::ShardStatus::Unsharded;
++  }
++
+   module.walk([&](mlir::func::FuncOp funcOp) {
+     internal::stripTTDialectAttributes(funcOp);
+   });
+@@ -409,6 +422,32 @@
      auto meshOp = meshOps.front();
  
      auto manualComputationOp = manualComputationOps.front();
 +    // JAX queries parameter shardings from the module metadata, not the
 +    // parameter instructions. Preserve them before removing the function body.
-+    auto main = module.lookupSymbol<mlir::func::FuncOp>("main");
 +    llvm::SmallVector<mlir::Attribute> inputShardings(main.getNumArguments());
 +    for (auto [operand, sharding] :
 +         llvm::zip(manualComputationOp.getOperands(),
@@ -46,9 +72,11 @@ diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_cle
 +        auto declared = main.getArgAttrOfType<mlir::sdy::TensorShardingAttr>(
 +            index, mlir::sdy::TensorShardingAttr::name);
 +        inputShardings[index] = mlir::StringAttr::get(
-+            module.getContext(), internal::extractHloShardingString(
-+                                     declared ? declared : sharding,
-+                                     meshOp.getMeshAttr()));
++            module.getContext(),
++            unsharded[index] ? std::string("{replicated}")
++                             : internal::extractHloShardingString(
++                                   declared ? declared : sharding,
++                                   meshOp.getMeshAttr()));
 +      }
 +    }
 +    if (llvm::all_of(inputShardings,
