@@ -6,37 +6,45 @@ import numpy as np
 import pytest
 
 
-def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial):
+def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial, **attributes):
     return jax.ffi.ffi_call(
         "tt.gated_delta_decode",
-        (jax.ShapeDtypeStruct(state.shape, state.dtype), jax.ShapeDtypeStruct(v.shape, jnp.float32)),
+        (
+            jax.ShapeDtypeStruct(state.shape, state.dtype),
+            jax.ShapeDtypeStruct((*b.shape, state.shape[-1]), jnp.float32),
+        ),
         input_output_aliases={0: 0},
         vmap_method="sequential",
-    )(state, q, k, v, b, a, A_log, dt_bias, indices, initial)
+    )(state, q, k, v, b, a, A_log, dt_bias, indices, initial, **attributes)
 
 
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize(
-    "batch,key_heads,groups,flat", [(1, 4, 3, False), (1, 4, 3, True), (2, 2, 2, True), (1, 4, 1, False)]
+    "batch,key_heads,groups,layout",
+    [(1, 4, 3, "flat"), (2, 2, 2, "flat"), (1, 4, 3, "grouped"), (1, 4, 1, "grouped")],
 )
-def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, flat):
-    # Like Qwen3.5: normalize q and k together, repeat each head for its group
-    # of value heads, then split and scale q. With flat, q, k and v are slices
-    # of one BF16 [B, (2 * key_heads + heads) * D] convolution output.
+def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, layout):
+    # Like Qwen3.5: L2-normalized q and k, each head serving a group of value
+    # heads, and a scaled q. With "flat", the kernel reads q, k and v as heads
+    # of one [B, (2 * key_heads + heads) * D] tensor and normalizes q and k
+    # itself; with "grouped", q and k arrive normalized with key_heads heads.
     heads, dim = key_heads * groups, 128
+    eps, scale = 1e-6, dim**-0.5
 
     def decode(state, qk, v, b, a, A_log, dt_bias, indices, initial):
-        if flat:
-            mixed = jnp.concatenate(
-                [qk.reshape(batch, -1), v.reshape(batch, -1)], axis=1
-            ).astype(jnp.bfloat16)
-            mixed = mixed @ jnp.eye(mixed.shape[1], dtype=mixed.dtype)
-            qk = mixed[:, : 2 * key_heads * dim].reshape(batch, 2 * key_heads, dim).astype(jnp.float32)
-            v = mixed[:, 2 * key_heads * dim :].reshape(batch, heads, dim).astype(jnp.float32)
-        qk = qk / jnp.sqrt(jnp.sum(qk * qk, axis=-1, keepdims=True) + 1e-6)
-        qk = jnp.repeat(qk, groups, axis=-2)
-        q, k = qk[:, :heads], qk[:, heads:]
-        return gated_delta_decode(state, q * dim**-0.5, k, v, b, a, A_log, dt_bias, indices, initial)
+        if layout == "flat":
+            mixed = jnp.concatenate([qk.reshape(batch, -1), v.reshape(batch, -1)], axis=1)
+            return gated_delta_decode(
+                state, mixed, mixed, mixed, b, a, A_log, dt_bias, indices, initial,
+                key_head_offset=np.uint32(key_heads),
+                value_head_offset=np.uint32(2 * key_heads),
+                num_key_heads=np.uint32(key_heads),
+                normalize_eps=np.float32(eps),
+                query_scale=np.float32(scale),
+            )
+        qk = qk / jnp.sqrt(jnp.sum(qk * qk, axis=-1, keepdims=True) + eps)
+        q, k = qk[:, :key_heads] * scale, qk[:, key_heads:]
+        return gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial)
 
     device = jax.devices("tt")[0]
     run = jax.jit(
@@ -48,9 +56,6 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, flat):
     for _ in range(3):
         qk = rng.normal(0, 1, (batch, 2 * key_heads, dim)).astype(np.float32)
         v = rng.normal(0, 0.5, (batch, heads, dim)).astype(np.float32)
-        if flat:
-            # The program rounds the flat input to BF16.
-            qk, v = (x.astype(jnp.bfloat16).astype(np.float32) for x in (qk, v))
         b = rng.normal(0, 1, (batch, heads)).astype(np.float32)
         a = rng.normal(0, 1, (batch, heads)).astype(np.float32)
         A_log = rng.uniform(-1, 1, heads).astype(np.float32)
@@ -60,8 +65,8 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, flat):
         indices = (1 + rng.permutation(slots - 1)[:batch]).astype(np.int32)
         initial = (np.arange(batch) % 2 == 0).astype(jnp.bfloat16)
 
-        norm = qk / np.sqrt(np.sum(qk * qk, axis=-1, keepdims=True) + 1e-6)
-        q = np.repeat(norm[:, :key_heads], groups, axis=1) * dim**-0.5
+        norm = qk / np.sqrt(np.sum(qk * qk, axis=-1, keepdims=True) + eps)
+        q = np.repeat(norm[:, :key_heads], groups, axis=1) * scale
         k = np.repeat(norm[:, key_heads:], groups, axis=1)
         beta = 1 / (1 + np.exp(-b))
         gate = -np.exp(A_log) * np.log1p(np.exp(a + dt_bias))
