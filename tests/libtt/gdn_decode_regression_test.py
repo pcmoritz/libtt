@@ -36,11 +36,11 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, layout):
             mixed = jnp.concatenate([qk.reshape(batch, -1), v.reshape(batch, -1)], axis=1)
             return gated_delta_decode(
                 state, mixed, mixed, mixed, b, a, A_log, dt_bias, indices, initial,
-                key_head_offset=np.uint32(key_heads),
-                value_head_offset=np.uint32(2 * key_heads),
-                num_key_heads=np.uint32(key_heads),
-                normalize_eps=np.float32(eps),
-                query_scale=np.float32(scale),
+                key_head_offset=key_heads,
+                value_head_offset=2 * key_heads,
+                num_key_heads=key_heads,
+                normalize_eps=eps,
+                query_scale=scale,
             )
         qk = qk / jnp.sqrt(jnp.sum(qk * qk, axis=-1, keepdims=True) + eps)
         q, k = qk[:, :key_heads] * scale, qk[:, key_heads:]
