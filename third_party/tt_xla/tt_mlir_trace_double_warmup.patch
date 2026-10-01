@@ -1,0 +1,23 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -733,9 +733,16 @@
+       warmupArgs[i] = scratch;
+     }
+ 
+-    // Execute the trace function once without capture to compile programs and
+-    // populate program cache.
+-    builder.create<func::CallOp>(captureFunc.getLoc(), traceFunc, warmupArgs);
++    // Execute the trace function without capture to compile programs and
++    // populate program cache. Twice: an op's first run can leave a persistent
++    // allocation (e.g. a collective's global semaphore in L1), and ops whose
++    // program depends on free L1, such as a matmul's block sizes, would then
++    // need a different program during capture than in the first warmup, if
++    // they run before it. The second warmup compiles them as captured.
++    for (int warmup = 0; warmup < 2; ++warmup) {
++      builder.create<func::CallOp>(captureFunc.getLoc(), traceFunc,
++                                   warmupArgs);
++    }
+ 
+     auto beginTraceCaptureOp = builder.create<ttnn::BeginTraceCaptureOp>(
+         captureFunc.getLoc(), utils::getTraceIdType(context), deviceOp,
