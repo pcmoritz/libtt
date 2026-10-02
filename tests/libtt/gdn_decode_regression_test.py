@@ -20,19 +20,21 @@ def gated_delta_decode(state, qkv, b, a, A_log, dt_bias, indices, initial):
 
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize(
-    "batch,key_heads,groups,qk_scale",
+    "batch,key_heads,groups,qk_scale,dtype",
     [
-        (1, 4, 3, 1.0),
-        (2, 2, 2, 1.0),
-        (1, 4, 1, 1.0),
+        (1, 4, 3, 1.0, np.float32),
+        (2, 2, 2, 1.0, np.float32),
+        (1, 4, 1, 1.0, np.float32),
         # 48 value heads: scalars and outputs past head 32, and more workers.
-        (2, 16, 3, 1.0),
+        (2, 16, 3, 1.0, np.float32),
         # Tiny and zero q and k, whose norms the epsilon dominates.
-        (1, 4, 3, 1e-4),
-        (1, 4, 3, 0.0),
+        (1, 4, 3, 1e-4, np.float32),
+        (1, 4, 3, 0.0, np.float32),
+        # A BFLOAT16 convolution output, which the runtime converts to FP32.
+        (1, 4, 3, 1.0, jnp.bfloat16),
     ],
 )
-def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale):
+def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale, dtype):
     # Like Qwen3.5: the kernel reads q, k and v as heads of one
     # [B, (2 * key_heads + heads) * D] tensor, L2-normalizes q and k, scales q,
     # and each q/k head serves a group of value heads.
@@ -40,7 +42,7 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale):
     eps, scale = 1e-6, dim**-0.5
 
     def decode(state, qk, v, b, a, A_log, dt_bias, indices, initial):
-        mixed = jnp.concatenate([qk.reshape(batch, -1), v.reshape(batch, -1)], axis=1)
+        mixed = jnp.concatenate([qk.reshape(batch, -1), v.reshape(batch, -1)], axis=1).astype(dtype)
         return gated_delta_decode(state, mixed, b, a, A_log, dt_bias, indices, initial)
 
     device = jax.devices("tt")[0]
@@ -51,8 +53,9 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale):
     rng = np.random.default_rng(71)
     slots = batch + 2
     for _ in range(3):
-        qk = (rng.normal(0, 1, (batch, 2 * key_heads, dim)) * qk_scale).astype(np.float32)
-        v = rng.normal(0, 0.5, (batch, heads, dim)).astype(np.float32)
+        # The inputs as the kernel sees them, rounded to dtype.
+        qk = (rng.normal(0, 1, (batch, 2 * key_heads, dim)) * qk_scale).astype(dtype).astype(np.float32)
+        v = rng.normal(0, 0.5, (batch, heads, dim)).astype(dtype).astype(np.float32)
         b = rng.normal(0, 1, (batch, heads)).astype(np.float32)
         a = rng.normal(0, 1, (batch, heads)).astype(np.float32)
         A_log = rng.uniform(-1, 1, heads).astype(np.float32)
