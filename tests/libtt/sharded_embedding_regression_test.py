@@ -11,8 +11,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 @pytest.mark.parametrize("ids_shape", [(8,), (2, 5)])
 def test_row_sharded_embedding(dtype, ids_shape, tmp_path):
     # Like a vocabulary-parallel token embedding: each device holds a range of
-    # rows, and the lookup is replicated. A bf16 table must not be all-gathered
-    # onto every device; float32 keeps the all-gather for exact results.
+    # rows, and the lookup is replicated. The table must not be all-gathered
+    # onto every device.
     devices = jax.devices("tt")
     if len(devices) < 2:
         pytest.skip("needs at least two devices")
@@ -41,4 +41,4 @@ def test_row_sharded_embedding(dtype, ids_shape, tmp_path):
     (ir,) = (tmp_path / "irs").glob("ttnn_runtime_embedding_*.mlir")
     text = ir.read_text()
     assert '"ttnn.embedding"' in text
-    assert ('"ttnn.all_gather"' in text) == (dtype == np.float32)
+    assert '"ttnn.all_gather"' not in text

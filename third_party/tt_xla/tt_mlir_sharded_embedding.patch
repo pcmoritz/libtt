@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3792,6 +3792,98 @@
+@@ -3792,6 +3792,99 @@
    }
  };
  
@@ -9,8 +9,8 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +// all-gather the whole table first, e.g. a vocabulary-parallel token
 +// embedding. Instead, each device looks up the indices that fall into its
 +// rows and zeroes the others, and an all-reduce sums the lookups. Every index
-+// is in the rows of exactly one device, so the sum is exact. Only for bf16:
-+// the device all-reduce does not keep full float32 precision.
++// is in the rows of exactly one device, so the sum is exact. Only for
++// bfloat16 and float32 tables, whose sums across devices are exact.
 +class ShardedEmbeddingPattern : public mlir::OpRewritePattern<EmbeddingOp> {
 +public:
 +  using mlir::OpRewritePattern<EmbeddingOp>::OpRewritePattern;
@@ -25,8 +25,9 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    auto gather = table.getDefiningOp<AllGatherOp>();
 +    auto indicesType = mlir::cast<RankedTensorType>(op.getInput().getType());
 +    auto indexType = mlir::dyn_cast<IntegerType>(indicesType.getElementType());
++    Type valueType = op.getType().getElementType();
 +    if (!gather || gather.getAllGatherDim() != 0 ||
-+        !op.getType().getElementType().isBF16() || !indexType ||
++        !(valueType.isBF16() || valueType.isF32()) || !indexType ||
 +        indexType.getWidth() != 32 || indexType.isUnsigned()) {
 +      return mlir::failure();
 +    }
@@ -100,7 +101,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -3844,6 +3936,7 @@
+@@ -3844,6 +3937,7 @@
        patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
        patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
        patterns.add<ConcatOfAdjacentSlicesPattern>(&getContext());
