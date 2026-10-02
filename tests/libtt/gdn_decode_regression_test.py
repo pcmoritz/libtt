@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 
-def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial):
+def gated_delta_decode(state, qkv, b, a, A_log, dt_bias, indices, initial):
     return jax.ffi.ffi_call(
         "tt.gated_delta_decode",
         (
@@ -15,12 +15,24 @@ def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial):
         ),
         input_output_aliases={0: 0},
         vmap_method="sequential",
-    )(state, q, k, v, b, a, A_log, dt_bias, indices, initial)
+    )(state, qkv, b, a, A_log, dt_bias, indices, initial)
 
 
 @pytest.mark.parametrize("trace", [False, True])
-@pytest.mark.parametrize("batch,key_heads,groups", [(1, 4, 3), (2, 2, 2), (1, 4, 1)])
-def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups):
+@pytest.mark.parametrize(
+    "batch,key_heads,groups,qk_scale",
+    [
+        (1, 4, 3, 1.0),
+        (2, 2, 2, 1.0),
+        (1, 4, 1, 1.0),
+        # 48 value heads: scalars and outputs past head 32, and more workers.
+        (2, 16, 3, 1.0),
+        # Tiny and zero q and k, whose norms the epsilon dominates.
+        (1, 4, 3, 1e-4),
+        (1, 4, 3, 0.0),
+    ],
+)
+def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale):
     # Like Qwen3.5: the kernel reads q, k and v as heads of one
     # [B, (2 * key_heads + heads) * D] tensor, L2-normalizes q and k, scales q,
     # and each q/k head serves a group of value heads.
@@ -29,7 +41,7 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups):
 
     def decode(state, qk, v, b, a, A_log, dt_bias, indices, initial):
         mixed = jnp.concatenate([qk.reshape(batch, -1), v.reshape(batch, -1)], axis=1)
-        return gated_delta_decode(state, mixed, mixed, mixed, b, a, A_log, dt_bias, indices, initial)
+        return gated_delta_decode(state, mixed, b, a, A_log, dt_bias, indices, initial)
 
     device = jax.devices("tt")[0]
     run = jax.jit(
@@ -39,7 +51,7 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups):
     rng = np.random.default_rng(71)
     slots = batch + 2
     for _ in range(3):
-        qk = rng.normal(0, 1, (batch, 2 * key_heads, dim)).astype(np.float32)
+        qk = (rng.normal(0, 1, (batch, 2 * key_heads, dim)) * qk_scale).astype(np.float32)
         v = rng.normal(0, 0.5, (batch, heads, dim)).astype(np.float32)
         b = rng.normal(0, 1, (batch, heads)).astype(np.float32)
         a = rng.normal(0, 1, (batch, heads)).astype(np.float32)
