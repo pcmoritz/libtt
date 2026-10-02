@@ -519,6 +519,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_runtime_host_overhead.patch",
         "//third_party/tt_xla:tt_mlir_concat_adjacent_slices.patch",
         "//third_party/tt_xla:tt_mlir_sharded_gather.patch",
+        "//third_party/tt_xla:tt_mlir_gdn_decode_attributes.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
