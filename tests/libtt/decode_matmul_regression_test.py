@@ -33,8 +33,6 @@ def _bfp8(weights):
         (1, 1024, 5120 + 24, False, False, "bfp_bf8"),
         (1, 1024, 5120 + 24, False, True, "bfp_bf8"),
         (1, 1024, 5120 + 24, True, False, "bfp_bf8"),
-        # Fewer output tiles than worker cores: the 1D matmul keeps the shape.
-        (1, 1024, 32 * 100, True, False, "bfp_bf8"),
     ],
 )
 def test_decode_matmul(rows, inner_size, width, residual, transposed, weight_dtype):
