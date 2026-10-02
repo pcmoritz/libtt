@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 --- a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
-@@ -531,6 +531,174 @@
+@@ -531,6 +531,166 @@
    return mlir::success();
  }
  
@@ -30,13 +30,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +    if (axes.empty()) {
 +      return;
 +    }
-+    int64_t shards = 1;
-+    for (mlir::sdy::AxisRefAttr axis : axes) {
-+      shards *= axis.getSize(mesh);
-+    }
-+    int64_t shardSize = gather.getOperand().getType().getDimSize(dim) / shards;
 +
-+    mlir::MLIRContext *context = builder.getContext();
 +    mlir::Location loc = gather.getLoc();
 +    mlir::Value indices = gather.getStartIndices();
 +    auto indicesType = mlir::cast<mlir::RankedTensorType>(indices.getType());
@@ -48,21 +42,23 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +                                             /*createIfMissing=*/false);
 +    mlir::sdy::TensorShardingAttr resultSharding =
 +        shardy_utils::getFirstSharding(gather);
-+    auto annotate = [&](mlir::Value value,
-+                        mlir::sdy::TensorShardingAttr sharding) {
-+      if (sharding) {
-+        mlir::sdy::setSharding(value, sharding);
-+      }
++    if (!resultSharding) {
++      resultSharding = shardy_utils::getDefaultTensorSdyShardingAttr(
++          builder.getContext(), globalMeshOp.getSymName(), resultType);
++    }
++    // New values have the sharding of the indices or of the slices.
++    auto sharded = [](mlir::Value value,
++                      mlir::sdy::TensorShardingAttr sharding) {
++      mlir::sdy::setSharding(value, sharding);
 +      return value;
 +    };
-+    auto constant = [&](mlir::Type type, mlir::Attribute value) {
++    auto scalar = [&](mlir::Type type, mlir::Attribute value) -> mlir::Value {
 +      return builder.create<mlir::stablehlo::ConstantOp>(
 +          loc, mlir::DenseElementsAttr::get(
 +                   mlir::RankedTensorType::get({}, type), value));
 +    };
-+
-+    auto scalar = [&](int64_t value) -> mlir::Value {
-+      return constant(indexType, builder.getIntegerAttr(indexType, value));
++    auto index = [&](int64_t value) {
++      return scalar(indexType, builder.getIntegerAttr(indexType, value));
 +    };
 +
 +    // The device's shard: its coordinates along `axes`, from
@@ -72,6 +68,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +        loc, mlir::RankedTensorType::get({}, indexType),
 +        builder.create<mlir::stablehlo::PartitionIdOp>(loc));
 +    mlir::Value shard;
++    int64_t shards = 1;
 +    for (mlir::sdy::AxisRefAttr axis : axes) {
 +      int64_t stride = 1;
 +      for (mlir::sdy::MeshAxisAttr meshAxis : llvm::reverse(mesh.getAxes())) {
@@ -86,97 +83,92 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +      int64_t size = axis.getSize(mesh);
 +      mlir::Value coord = device;
 +      if (stride > 1) {
-+        coord = builder.create<mlir::stablehlo::DivOp>(loc, coord,
-+                                                       scalar(stride));
++        coord = builder.create<mlir::stablehlo::DivOp>(loc, coord, index(stride));
 +      }
 +      if (mesh.getTotalSize() / stride > size) {
-+        coord =
-+            builder.create<mlir::stablehlo::RemOp>(loc, coord, scalar(size));
++        coord = builder.create<mlir::stablehlo::RemOp>(loc, coord, index(size));
 +      }
 +      shard = shard ? builder.create<mlir::stablehlo::AddOp>(
 +                          loc,
-+                          builder.create<mlir::stablehlo::MulOp>(
-+                              loc, shard, scalar(size)),
++                          builder.create<mlir::stablehlo::MulOp>(loc, shard,
++                                                                 index(size)),
 +                          coord)
 +                    : coord;
++      shards *= size;
 +    }
-+    mlir::Value offset = builder.create<mlir::stablehlo::MulOp>(
-+        loc, shard, scalar(shardSize));
-+    offset = annotate(builder.create<mlir::stablehlo::BroadcastInDimOp>(
-+                          loc, indicesType, offset,
-+                          builder.getDenseI64ArrayAttr({})),
-+                      indicesSharding);
++    int64_t shardSize = gather.getOperand().getType().getDimSize(dim) / shards;
++    mlir::Value offset = sharded(
++        builder.create<mlir::stablehlo::BroadcastInDimOp>(
++            loc, indicesType,
++            builder.create<mlir::stablehlo::MulOp>(loc, shard,
++                                                   index(shardSize)),
++            builder.getDenseI64ArrayAttr({})),
++        indicesSharding);
 +
-+    mlir::Value local = annotate(
++    mlir::Value local = sharded(
 +        builder.create<mlir::stablehlo::SubtractOp>(loc, indices, offset),
 +        indicesSharding);
-+    mlir::Value clamped = annotate(
-+        builder.create<mlir::stablehlo::ClampOp>(loc, indicesType, scalar(0),
-+                                                 local, scalar(shardSize - 1)),
++    mlir::Value clamped = sharded(
++        builder.create<mlir::stablehlo::ClampOp>(loc, indicesType, index(0),
++                                                 local, index(shardSize - 1)),
 +        indicesSharding);
 +    gather.getStartIndicesMutable().assign(clamped);
 +
-+    // Zero the slices of indices in other shards. The mask drops the index
++    // Zero the slices of indices in other shards: the mask drops the index
 +    // vector dimension and is broadcast over the slices' offset dimensions.
-+    mlir::Value mine = annotate(
++    mlir::Value mine = sharded(
 +        builder.create<mlir::stablehlo::CompareOp>(
 +            loc, clamped, local, mlir::stablehlo::ComparisonDirection::EQ),
 +        indicesSharding);
 +    llvm::SmallVector<int64_t> batchShape;
 +    llvm::SmallVector<mlir::sdy::DimensionShardingAttr> batchDimShardings;
 +    for (auto [i, size] : llvm::enumerate(indicesType.getShape())) {
-+      if (static_cast<int64_t>(i) == dims.getIndexVectorDim()) {
-+        continue;
-+      }
-+      batchShape.push_back(size);
-+      if (indicesSharding) {
++      if (static_cast<int64_t>(i) != dims.getIndexVectorDim()) {
++        batchShape.push_back(size);
 +        batchDimShardings.push_back(indicesSharding.getDimShardings()[i]);
 +      }
 +    }
-+    mlir::sdy::TensorShardingAttr batchSharding;
-+    if (indicesSharding) {
-+      batchSharding = mlir::sdy::TensorShardingAttr::get(
-+          context, indicesSharding.getMeshOrRef(), batchDimShardings,
-+          indicesSharding.getReplicatedAxes(),
-+          indicesSharding.getUnreducedAxes());
-+    }
-+    mine = annotate(builder.create<mlir::stablehlo::ReshapeOp>(
-+                        loc,
-+                        mlir::RankedTensorType::get(batchShape,
-+                                                    builder.getI1Type()),
-+                        mine),
-+                    batchSharding);
++    mine = sharded(builder.create<mlir::stablehlo::ReshapeOp>(
++                       loc,
++                       mlir::RankedTensorType::get(batchShape,
++                                                   builder.getI1Type()),
++                       mine),
++                   mlir::sdy::TensorShardingAttr::get(
++                       builder.getContext(), indicesSharding.getMeshOrRef(),
++                       batchDimShardings, indicesSharding.getReplicatedAxes(),
++                       indicesSharding.getUnreducedAxes()));
 +    llvm::SmallVector<int64_t> batchDims;
 +    for (int64_t i = 0; i < resultType.getRank(); ++i) {
 +      if (!llvm::is_contained(dims.getOffsetDims(), i)) {
 +        batchDims.push_back(i);
 +      }
 +    }
-+    mine = annotate(builder.create<mlir::stablehlo::BroadcastInDimOp>(
-+                        loc,
-+                        mlir::RankedTensorType::get(resultType.getShape(),
-+                                                    builder.getI1Type()),
-+                        mine, builder.getDenseI64ArrayAttr(batchDims)),
-+                    resultSharding);
++    mine = sharded(builder.create<mlir::stablehlo::BroadcastInDimOp>(
++                       loc,
++                       mlir::RankedTensorType::get(resultType.getShape(),
++                                                   builder.getI1Type()),
++                       mine, builder.getDenseI64ArrayAttr(batchDims)),
++                   resultSharding);
 +    mlir::Type elementType = resultType.getElementType();
-+    mlir::Value zeros = annotate(
++    mlir::Value zeros = sharded(
 +        builder.create<mlir::stablehlo::BroadcastInDimOp>(
 +            loc, resultType,
-+            constant(elementType, builder.getZeroAttr(elementType)),
++            scalar(elementType, builder.getZeroAttr(elementType)),
 +            builder.getDenseI64ArrayAttr({})),
 +        resultSharding);
 +    builder.setInsertionPointAfter(gather);
-+    auto masked = builder.create<mlir::stablehlo::SelectOp>(
-+        loc, mine, gather.getResult(), zeros);
-+    annotate(masked, resultSharding);
-+    gather.getResult().replaceAllUsesExcept(masked, masked);
++    mlir::Value masked =
++        sharded(builder.create<mlir::stablehlo::SelectOp>(
++                    loc, mine, gather.getResult(), zeros),
++                resultSharding);
++    gather.getResult().replaceAllUsesExcept(masked, masked.getDefiningOp());
 +  });
 +}
 +
  class UpdateGlobalToLocalShapesPass
      : public impl::UpdateGlobalToLocalShapesPassBase<
            UpdateGlobalToLocalShapesPass> {
-@@ -591,6 +759,8 @@
+@@ -591,6 +751,8 @@
  
      globalMeshOp = parsedMeshOps[0];
  
