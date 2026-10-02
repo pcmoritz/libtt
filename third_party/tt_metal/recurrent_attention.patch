@@ -782,7 +782,7 @@ new file mode 100644
 index 0000000..2df32b1
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,256 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -793,8 +793,10 @@ index 0000000..2df32b1
 +#include "api/compute/compute_kernel_hw_startup.h"
 +#include "api/compute/eltwise_binary.h"
 +#include "api/compute/eltwise_binary_sfpu.h"
++#include "api/compute/eltwise_unary/binop_with_scalar.h"
 +#include "api/compute/eltwise_unary/exp.h"
 +#include "api/compute/eltwise_unary/negative.h"
++#include "api/compute/eltwise_unary/rsqrt.h"
 +#include "api/compute/eltwise_unary/softplus.h"
 +#include "api/compute/matmul.h"
 +#include "api/compute/tile_move_copy.h"
@@ -806,6 +808,8 @@ index 0000000..2df32b1
 +    constexpr uint32_t num_heads = get_compile_time_arg_val(3);
 +    constexpr uint32_t workers_per_head = get_compile_time_arg_val(4);
 +    constexpr uint32_t num_workers = get_compile_time_arg_val(5);
++    constexpr uint32_t eps = get_compile_time_arg_val(6);
++    constexpr uint32_t query_scale = get_compile_time_arg_val(7);
 +    const uint32_t worker = get_arg_val<uint32_t>(0);
 +    constexpr uint32_t state_tiles = kt * vt;
 +
@@ -824,11 +828,60 @@ index 0000000..2df32b1
 +    constexpr uint32_t dt_bias = tt::CBIndex::c_14;
 +    constexpr uint32_t beta = tt::CBIndex::c_16;
 +    constexpr uint32_t decay = tt::CBIndex::c_20;
++    constexpr uint32_t query_transposed = tt::CBIndex::c_7;
++    constexpr uint32_t squared_norm = tt::CBIndex::c_21;
++    constexpr uint32_t key_factor = tt::CBIndex::c_22;
++    constexpr uint32_t query_factor = tt::CBIndex::c_23;
++
++    // factor = scale / sqrt(x x^T + eps) in every element of a tile, where x
++    // is a row vector in row 0 of kt tiles and x^T holds it in column 0.
++    auto normalization_factor = [&](uint32_t x, uint32_t x_transposed, uint32_t factor, uint32_t scale) {
++        cb_wait_front(x, kt);
++        cb_wait_front(x_transposed, kt);
++        cb_reserve_back(squared_norm, 1);
++        reconfig_data_format<SrcOrder::Reverse>(x, x_transposed);
++        matmul_init(x, x_transposed);
++        tile_regs_acquire();
++        for (uint32_t inner = 0; inner < kt; ++inner) {
++            matmul_tiles(x, x_transposed, inner, inner, 0);
++        }
++        binop_with_scalar_tile_init();
++        add_unary_tile(0, eps);
++        rsqrt_tile_init();
++        rsqrt_tile(0);
++        binop_with_scalar_tile_init();
++        mul_unary_tile(0, scale);
++        tile_regs_commit();
++        tile_regs_wait();
++        pack_reconfig_data_format(squared_norm);
++        pack_tile(0, squared_norm, 0);
++        tile_regs_release();
++        cb_push_back(squared_norm, 1);
++
++        cb_wait_front(squared_norm, 1);
++        cb_reserve_back(factor, 1);
++        unary_bcast_init<BroadcastType::SCALAR>(squared_norm, factor);
++        tile_regs_acquire();
++        unary_bcast<BroadcastType::SCALAR>(squared_norm, 0, 0);
++        tile_regs_commit();
++        tile_regs_wait();
++        pack_reconfig_data_format(factor);
++        pack_tile(0, factor, 0);
++        tile_regs_release();
++        cb_push_back(factor, 1);
++        cb_pop_front(squared_norm, 1);
++    };
 +
 +    // Configure the FP32 unpack/pack paths before the first compute API call.
 +    compute_kernel_hw_startup<SrcOrder::Reverse>(key, state, scaled_delta);
-+    matmul_init(key, state);
 +    for (uint32_t work = worker; work < batch_size * num_heads * workers_per_head; work += num_workers) {
++    // The kernel works with the unnormalized q and k and scales the products
++    // they take part in.
++    normalization_factor(key, key_transposed, key_factor, 0x3F800000u);
++    normalization_factor(query, query_transposed, query_factor, query_scale);
++    cb_wait_front(key_factor, 1);
++    cb_wait_front(query_factor, 1);
++
 +    // beta = sigmoid(beta_logits)
 +    cb_wait_front(beta_logits, 1);
 +    cb_reserve_back(beta, 1);
@@ -907,6 +960,10 @@ index 0000000..2df32b1
 +            matmul_tiles(key, state_mid, inner, inner * vt + column, 0);
 +        }
 +        binary_dest_reuse_tiles_init<
++            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(key_factor);
++        binary_dest_reuse_tiles<
++            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(key_factor, 0, 0);
++        binary_dest_reuse_tiles_init<
 +            EltwiseBinaryType::ELWSUB, EltwiseBinaryReuseDestType::DEST_TO_SRCB>(value);
 +        binary_dest_reuse_tiles<
 +            EltwiseBinaryType::ELWSUB, EltwiseBinaryReuseDestType::DEST_TO_SRCB>(value, column, 0);
@@ -914,6 +971,11 @@ index 0000000..2df32b1
 +            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(beta);
 +        binary_dest_reuse_tiles<
 +            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(beta, 0, 0);
++        // The update uses the unnormalized key^T, so scale its delta.
++        binary_dest_reuse_tiles_init<
++            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(key_factor);
++        binary_dest_reuse_tiles<
++            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(key_factor, 0, 0);
 +        tile_regs_commit();
 +        tile_regs_wait();
 +        pack_tile(0, scaled_delta, column);
@@ -946,16 +1008,20 @@ index 0000000..2df32b1
 +    cb_pop_front(scaled_delta, vt);
 +
 +    // output = query * state_new; reuse the FP32 pack configuration.
-+    reconfig_data_format<SrcOrder::Reverse>(query, state_new);
-+    matmul_init(query, state_new);
 +    cb_wait_front(query, kt);
 +    cb_wait_front(state_new, state_tiles);
 +    cb_reserve_back(output, vt);
 +    for (uint32_t column = 0; column < vt; ++column) {
++        reconfig_data_format<SrcOrder::Reverse>(query, state_new);
++        matmul_init(query, state_new);
 +        tile_regs_acquire();
 +        for (uint32_t inner = 0; inner < kt; ++inner) {
 +            matmul_tiles(query, state_new, inner, inner * vt + column, 0);
 +        }
++        binary_dest_reuse_tiles_init<
++            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(query_factor);
++        binary_dest_reuse_tiles<
++            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(query_factor, 0, 0);
 +        tile_regs_commit();
 +        tile_regs_wait();
 +        pack_tile(0, output, column);
@@ -968,6 +1034,9 @@ index 0000000..2df32b1
 +    cb_pop_front(value, vt);
 +    cb_pop_front(decay, 1);
 +    cb_pop_front(beta, 1);
++    cb_pop_front(query_transposed, kt);
++    cb_pop_front(key_factor, 1);
++    cb_pop_front(query_factor, 1);
 +    }
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
@@ -975,7 +1044,7 @@ new file mode 100644
 index 0000000..e981660
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,214 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -988,8 +1057,8 @@ index 0000000..e981660
 +
 +namespace {
 +
-+// Load one head from packed [B,H,D] tiles into row zero of each compute
-+// tile. This avoids materializing 31 padding rows per head in DRAM.
++// Load one token's head from flat [B, heads * D] tiles into row zero of each
++// compute tile.
 +template <typename Accessor>
 +FORCE_INLINE void read_vector(
 +    Noc& noc, const Accessor& input, CircularBuffer& cb,
@@ -1052,26 +1121,24 @@ index 0000000..e981660
 +    constexpr uint32_t num_heads = get_compile_time_arg_val(3);
 +    constexpr uint32_t workers_per_head = get_compile_time_arg_val(4);
 +    constexpr uint32_t num_workers = get_compile_time_arg_val(5);
++    constexpr uint32_t key_heads = get_compile_time_arg_val(6);
++    constexpr uint32_t qkv_heads = get_compile_time_arg_val(7);
 +    constexpr uint32_t vt = full_vt / workers_per_head;
 +    constexpr uint32_t state_tiles = kt * vt;
 +    constexpr uint32_t tile_bytes = 4096;
 +
 +    const uint32_t worker = get_arg_val<uint32_t>(0);
-+    const uint32_t query_address = get_arg_val<uint32_t>(1);
-+    const uint32_t key_address = get_arg_val<uint32_t>(2);
-+    const uint32_t value_address = get_arg_val<uint32_t>(3);
-+    const uint32_t beta_logits_address = get_arg_val<uint32_t>(4);
-+    const uint32_t delta_time_address = get_arg_val<uint32_t>(5);
-+    const uint32_t a_log_address = get_arg_val<uint32_t>(6);
-+    const uint32_t dt_bias_address = get_arg_val<uint32_t>(7);
-+    const uint32_t state_address = get_arg_val<uint32_t>(8);
-+    const uint32_t state_indices_address = get_arg_val<uint32_t>(9);
-+    const uint32_t has_initial_state_address = get_arg_val<uint32_t>(10);
++    const uint32_t qkv_address = get_arg_val<uint32_t>(1);
++    const uint32_t beta_logits_address = get_arg_val<uint32_t>(2);
++    const uint32_t delta_time_address = get_arg_val<uint32_t>(3);
++    const uint32_t a_log_address = get_arg_val<uint32_t>(4);
++    const uint32_t dt_bias_address = get_arg_val<uint32_t>(5);
++    const uint32_t state_address = get_arg_val<uint32_t>(6);
++    const uint32_t state_indices_address = get_arg_val<uint32_t>(7);
++    const uint32_t has_initial_state_address = get_arg_val<uint32_t>(8);
 +
-+    constexpr auto query_args = TensorAccessorArgs<6>();
-+    constexpr auto key_args = TensorAccessorArgs<query_args.next_compile_time_args_offset()>();
-+    constexpr auto value_args = TensorAccessorArgs<key_args.next_compile_time_args_offset()>();
-+    constexpr auto beta_logits_args = TensorAccessorArgs<value_args.next_compile_time_args_offset()>();
++    constexpr auto qkv_args = TensorAccessorArgs<8>();
++    constexpr auto beta_logits_args = TensorAccessorArgs<qkv_args.next_compile_time_args_offset()>();
 +    constexpr auto delta_time_args = TensorAccessorArgs<beta_logits_args.next_compile_time_args_offset()>();
 +    constexpr auto a_log_args = TensorAccessorArgs<delta_time_args.next_compile_time_args_offset()>();
 +    constexpr auto dt_bias_args = TensorAccessorArgs<a_log_args.next_compile_time_args_offset()>();
@@ -1079,9 +1146,7 @@ index 0000000..e981660
 +    constexpr auto state_indices_args = TensorAccessorArgs<state_args.next_compile_time_args_offset()>();
 +    constexpr auto has_initial_state_args =
 +        TensorAccessorArgs<state_indices_args.next_compile_time_args_offset()>();
-+    const auto query = TensorAccessor(query_args, query_address, tile_bytes);
-+    const auto key = TensorAccessor(key_args, key_address, tile_bytes);
-+    const auto value = TensorAccessor(value_args, value_address, tile_bytes);
++    const auto qkv = TensorAccessor(qkv_args, qkv_address, tile_bytes);
 +    const auto beta_logits = TensorAccessor(beta_logits_args, beta_logits_address, tile_bytes);
 +    const auto delta_time = TensorAccessor(delta_time_args, delta_time_address, tile_bytes);
 +    const auto a_log = TensorAccessor(a_log_args, a_log_address, tile_bytes);
@@ -1100,6 +1165,7 @@ index 0000000..e981660
 +    CircularBuffer value_cb(tt::CBIndex::c_3);
 +    CircularBuffer delta_time_cb(tt::CBIndex::c_4);
 +    CircularBuffer beta_logits_cb(tt::CBIndex::c_5);
++    CircularBuffer query_transposed_cb(tt::CBIndex::c_7);
 +    CircularBuffer key_transposed_cb(tt::CBIndex::c_9);
 +    CircularBuffer a_log_cb(tt::CBIndex::c_13);
 +    CircularBuffer dt_bias_cb(tt::CBIndex::c_14);
@@ -1145,14 +1211,18 @@ index 0000000..e981660
 +        noc.async_write_zeros(state_cb, state_tiles * tile_bytes);
 +    }
 +
-+    const uint32_t head_tile = batch * ((num_heads + 31) / 32) + head / 32;
-+    read_vector(noc, query, query_cb, head_tile * kt, head % 32, kt);
++    // Query head g, key head K + g and value head 2 * K + head of the flat
++    // qkv tensor, where g = head / (H / K); a head spans kt == full_vt tiles.
++    auto page = [&](uint32_t qkv_head) { return ((batch / 32) * qkv_heads + qkv_head) * kt; };
++    const uint32_t group_head = head / (num_heads / key_heads);
++    read_vector(noc, qkv, query_cb, page(group_head), batch % 32, kt);
 +
 +    key_transposed_cb.reserve_back(kt);
-+    read_vector(noc, key, key_cb, head_tile * kt, head % 32, kt);
++    read_vector(noc, qkv, key_cb, page(key_heads + group_head), batch % 32, kt);
++    query_transposed_cb.reserve_back(kt);
++    noc.async_write_zeros(query_transposed_cb, kt * tile_bytes);
 +
-+    read_vector(noc, value, value_cb,
-+                head_tile * full_vt + column_start, head % 32, vt);
++    read_vector(noc, qkv, value_cb, page(2 * key_heads + head) + column_start, batch % 32, vt);
 +
 +    const uint32_t scalar_page =
 +        (batch / 32) * ((num_heads + 31) / 32) + head / 32;
@@ -1166,12 +1236,16 @@ index 0000000..e981660
 +    noc.async_read_barrier();
 +    noc.write_zeros_l1_barrier();
 +    state_cb.push_back(state_tiles);
-+    query_cb.push_back(kt);
 +    for (uint32_t tile = 0; tile < kt; ++tile) {
++        transpose_row_tile(
++            query_cb.get_write_ptr() + tile * tile_bytes,
++            query_transposed_cb.get_write_ptr() + tile * tile_bytes);
 +        transpose_row_tile(
 +            key_cb.get_write_ptr() + tile * tile_bytes,
 +            key_transposed_cb.get_write_ptr() + tile * tile_bytes);
 +    }
++    query_transposed_cb.push_back(kt);
++    query_cb.push_back(kt);
 +    key_cb.push_back(kt);
 +    key_transposed_cb.push_back(kt);
 +    value_cb.push_back(vt);
@@ -1286,13 +1360,15 @@ new file mode 100644
 index 0000000..b7ced7a
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,272 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#include "ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp"
 +
 +#include <algorithm>
++#include <bit>
++#include <cmath>
 +#include <utility>
 +
 +#include <tt-metalium/buffer.hpp>
@@ -1311,9 +1387,7 @@ index 0000000..b7ced7a
 +struct DecodeParams {};
 +
 +struct DecodeInputs {
-+    Tensor query;
-+    Tensor key;
-+    Tensor value;
++    Tensor qkv;
 +    Tensor beta_logits;
 +    Tensor delta_time;
 +    Tensor a_log;
@@ -1347,16 +1421,32 @@ index 0000000..b7ced7a
 +    TT_FATAL(tensor.logical_shape() == Shape(expected), "{} shape mismatch", name);
 +}
 +
++constexpr uint32_t head_dim = 128;
++
++// The heads of the flat [B, (2 * K + H) * D] qkv tensor.
++uint32_t qkv_heads(const DecodeInputs& in) { return in.qkv.logical_shape()[-1] / head_dim; }
++
++// K, the number of query and key heads.
++uint32_t key_heads(const DecodeInputs& in) {
++    return (qkv_heads(in) - in.beta_logits.logical_shape()[1]) / 2;
++}
++
 +void DecodeOperation::validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t& in) {
-+    const auto& query_shape = in.query.logical_shape();
-+    TT_FATAL(query_shape.rank() == 3, "query must have rank 3");
-+    const uint32_t batch_size = query_shape[0];
-+    const uint32_t num_heads = query_shape[1];
++    TT_FATAL(in.beta_logits.logical_shape().rank() == 2, "beta logits must have rank 2");
++    const uint32_t batch_size = in.beta_logits.logical_shape()[0];
++    const uint32_t num_heads = in.beta_logits.logical_shape()[1];
++    const auto& qkv_shape = in.qkv.logical_shape();
++    TT_FATAL(
++        qkv_shape.rank() == 2 && qkv_shape[0] == batch_size && qkv_shape[1] % head_dim == 0,
++        "qkv must be the flat [B, (2 * K + H) * {}] causal convolution output", head_dim);
 +    TT_FATAL(batch_size > 0 && batch_size <= 32, "batch size must be in [1, 32]");
 +    TT_FATAL(num_heads > 0, "number of heads must be positive");
-+    validate_tensor(in.query, DataType::FLOAT32, "query");
-+    validate_tensor(in.key, DataType::FLOAT32, "key");
-+    validate_tensor(in.value, DataType::FLOAT32, "value");
++    TT_FATAL(qkv_heads(in) > num_heads, "qkv must hold query and key heads before the value heads");
++    const uint32_t num_key_heads = key_heads(in);
++    TT_FATAL(
++        2 * num_key_heads + num_heads == qkv_heads(in) && num_heads % num_key_heads == 0,
++        "value heads must be a multiple of the query and key heads");
++    validate_tensor(in.qkv, DataType::FLOAT32, "qkv");
 +    validate_tensor(in.beta_logits, DataType::FLOAT32, "beta logits");
 +    validate_tensor(in.delta_time, DataType::FLOAT32, "delta time");
 +    validate_tensor(in.a_log, DataType::FLOAT32, "A log");
@@ -1365,11 +1455,7 @@ index 0000000..b7ced7a
 +    validate_tensor(in.state_indices, DataType::INT32, "state indices");
 +    validate_tensor(in.has_initial_state, DataType::BFLOAT16, "initial-state mask");
 +
-+    constexpr uint32_t dim = 128;
-+    check_shape(in.query, {batch_size, num_heads, dim}, "query");
-+    check_shape(in.key, {batch_size, num_heads, dim}, "key");
-+    check_shape(in.value, {batch_size, num_heads, dim}, "value");
-+    check_shape(in.beta_logits, {batch_size, num_heads}, "beta logits");
++    constexpr uint32_t dim = head_dim;
 +    check_shape(in.delta_time, {batch_size, num_heads}, "delta time");
 +    check_shape(in.a_log, {num_heads}, "A log");
 +    check_shape(in.dt_bias, {num_heads}, "delta-time bias");
@@ -1385,12 +1471,15 @@ index 0000000..b7ced7a
 +
 +DecodeOperation::spec_return_value_t DecodeOperation::compute_output_specs(
 +    const operation_attributes_t&, const tensor_args_t& in) {
-+    return in.query.tensor_spec();
++    const auto& shape = in.beta_logits.logical_shape();
++    return TensorSpec(
++        Shape({shape[0], shape[1], head_dim}),
++        TensorLayout(DataType::FLOAT32, PageConfig(Layout::TILE), MemoryConfig{}));
 +}
 +
 +DecodeOperation::tensor_return_value_t DecodeOperation::create_output_tensors(
-+    const operation_attributes_t&, const tensor_args_t& in) {
-+    return create_device_tensor(in.query.tensor_spec(), in.query.device());
++    const operation_attributes_t& params, const tensor_args_t& in) {
++    return create_device_tensor(compute_output_specs(params, in), in.qkv.device());
 +}
 +
 +ProgramDescriptor DecodeOperation::create_descriptor(
@@ -1400,11 +1489,12 @@ index 0000000..b7ced7a
 +    constexpr uint32_t workers_per_head = 2;
 +    constexpr uint32_t worker_vt = vt / workers_per_head;
 +    constexpr uint32_t state_tiles = kt * worker_vt;
-+    const uint32_t batch_size = in.query.logical_shape()[0];
-+    const uint32_t num_heads = in.query.logical_shape()[1];
++    const uint32_t batch_size = in.beta_logits.logical_shape()[0];
++    const uint32_t num_heads = in.beta_logits.logical_shape()[1];
++    const uint32_t num_key_heads = key_heads(in);
 +    ProgramDescriptor program;
 +
-+    auto* device = in.query.device();
++    auto* device = in.qkv.device();
 +    const CoreCoord grid = device->compute_with_storage_grid_size();
 +    const uint32_t num_workers =
 +        std::min(batch_size * num_heads * workers_per_head,
@@ -1428,6 +1518,7 @@ index 0000000..b7ced7a
 +    make_cb(4, 1);            // delta time
 +    make_cb(5, 1);            // beta logits
 +    make_cb(6, state_tiles);  // decayed state
++    make_cb(7, kt);           // transposed query
 +    make_cb(9, kt);           // transposed key
 +    make_cb(10, worker_vt);   // scaled delta
 +    make_cb(11, state_tiles); // updated state
@@ -1438,13 +1529,14 @@ index 0000000..b7ced7a
 +    make_cb(16, 1);           // beta
 +    make_cb(17, 1, tt::DataFormat::Float16_b);  // has-initial-state flag
 +    make_cb(20, 1);           // decay
++    make_cb(21, 1);           // squared norm
++    make_cb(22, 1);           // key normalization factor
++    make_cb(23, 1);           // query normalization factor
 +    make_cb(29, 1, tt::DataFormat::Int32);      // state index (writer)
 +
 +    std::vector<uint32_t> reader_args = {
-+        kt, vt, batch_size, num_heads, workers_per_head, num_workers};
-+    TensorAccessorArgs(in.query.buffer()).append_to(reader_args);
-+    TensorAccessorArgs(in.key.buffer()).append_to(reader_args);
-+    TensorAccessorArgs(in.value.buffer()).append_to(reader_args);
++        kt, vt, batch_size, num_heads, workers_per_head, num_workers, num_key_heads, qkv_heads(in)};
++    TensorAccessorArgs(in.qkv.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.beta_logits.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.delta_time.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.a_log.buffer()).append_to(reader_args);
@@ -1479,9 +1571,11 @@ index 0000000..b7ced7a
 +        .kernel_source = kernel_dir + "compute/gated_delta_decode.cpp",
 +        .core_ranges = cores,
 +        .compile_time_args = {
-+            kt, worker_vt, batch_size, num_heads, workers_per_head, num_workers},
++            kt, worker_vt, batch_size, num_heads, workers_per_head, num_workers,
++            std::bit_cast<uint32_t>(1e-6f),  // normalization eps
++            std::bit_cast<uint32_t>(1.0f / std::sqrt(static_cast<float>(head_dim)))},  // query scale
 +        .config = ComputeConfigDescriptor{
-+            .math_fidelity = tt::tt_metal::MathFidelity::HiFi2,
++            .math_fidelity = tt::tt_metal::MathFidelity::HiFi4,
 +            .fp32_dest_acc_en = true,
 +            .math_approx_mode = false}};
 +
@@ -1490,9 +1584,7 @@ index 0000000..b7ced7a
 +        reader.emplace_runtime_args(
 +            core,
 +            {worker,
-+             in.query.buffer(),
-+             in.key.buffer(),
-+             in.value.buffer(),
++             in.qkv.buffer(),
 +             in.beta_logits.buffer(),
 +             in.delta_time.buffer(),
 +             in.a_log.buffer(),
@@ -1519,9 +1611,7 @@ index 0000000..b7ced7a
 +namespace ttnn::transformer {
 +
 +Tensor gated_delta_decode(
-+    const Tensor& query,
-+    const Tensor& key,
-+    const Tensor& value,
++    const Tensor& qkv,
 +    const Tensor& beta_logits,
 +    const Tensor& delta_time,
 +    const Tensor& a_log,
@@ -1532,9 +1622,7 @@ index 0000000..b7ced7a
 +    using Op = prim::DecodeOperation;
 +    return device_operation::launch<Op>(
 +        {},
-+        {.query = query,
-+         .key = key,
-+         .value = value,
++        {.qkv = qkv,
 +         .beta_logits = beta_logits,
 +         .delta_time = delta_time,
 +         .a_log = a_log,
@@ -1550,7 +1638,7 @@ new file mode 100644
 index 0000000..b14e1cd
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,31 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1560,17 +1648,19 @@ index 0000000..b14e1cd
 +
 +namespace ttnn::transformer {
 +
-+// One recurrent gated-delta decode step. Q/K/V and output are packed [B,H,D].
-+// Query and key are normalized. Scalar gates are fused into the device kernel:
++// One recurrent gated-delta decode step for B tokens and H value heads of
++// dimension D = 128, as in Qwen3.5. qkv is the flat [B, (2 * K + H) * D]
++// output of the causal convolution: K query heads, K key heads, then H value
++// heads. Value head h uses query and key head h / (H / K). The kernel L2-normalizes q and k,
++// x / sqrt(sum(x^2) + 1e-6), scales q by D^-0.5, and fuses the scalar gates:
 +// beta = sigmoid(beta_logits)
 +// decay = exp(-exp(a_log) * softplus(delta_time + dt_bias))
 +// state_mid = decay * state
 +// state' = state_mid + k^T * (beta * (v - k * state_mid))
 +// output = q * state'
++// The output is [B, H, D].
 +Tensor gated_delta_decode(
-+    const Tensor& query,
-+    const Tensor& key,
-+    const Tensor& value,
++    const Tensor& qkv,
 +    const Tensor& beta_logits,
 +    const Tensor& delta_time,
 +    const Tensor& a_log,

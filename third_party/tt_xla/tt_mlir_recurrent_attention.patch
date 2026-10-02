@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -6456,6 +6456,49 @@
+@@ -6456,6 +6456,47 @@
    let hasVerifier = 1;
  }
  
@@ -19,9 +19,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +def TTIR_GatedDeltaDecodeOp : TTIR_InplaceOp<"gated_delta_decode", [TTIR_CacheOpInterface]> {
 +  let summary = "gated delta decode.";
 +  let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
-+                       AnyRankedTensor:$query,
-+                       AnyRankedTensor:$key,
-+                       AnyRankedTensor:$value,
++                       AnyRankedTensor:$qkv,
 +                       AnyRankedTensor:$beta_logits,
 +                       AnyRankedTensor:$delta_time,
 +                       AnyRankedTensor:$a_log,
@@ -54,7 +52,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4284,6 +4284,53 @@
+@@ -4284,6 +4284,51 @@
      let hasVerifier = 1;
  }
  
@@ -76,9 +74,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +def TTNN_GatedDeltaDecodeOp : TTNN_InplaceOp<"gated_delta_decode", [OpModelExempt]> {
 +  let summary = "gated delta decode.";
 +  let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
-+                       AnyRankedTensor:$query,
-+                       AnyRankedTensor:$key,
-+                       AnyRankedTensor:$value,
++                       AnyRankedTensor:$qkv,
 +                       AnyRankedTensor:$beta_logits,
 +                       AnyRankedTensor:$delta_time,
 +                       AnyRankedTensor:$a_log,
@@ -111,7 +107,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
 --- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
-@@ -79,6 +79,50 @@
+@@ -79,6 +79,48 @@
    attention_sink: tt.target.ttnn.TensorRef;
    out: tt.target.ttnn.TensorRef;
    memcfg: tt.target.ttnn.MemoryConfig;
@@ -134,9 +130,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 +
 +table GatedDeltaDecodeOp {
 +  cache: tt.target.ttnn.TensorRef;
-+  query: tt.target.ttnn.TensorRef;
-+  key: tt.target.ttnn.TensorRef;
-+  value: tt.target.ttnn.TensorRef;
++  qkv: tt.target.ttnn.TensorRef;
 +  beta_logits: tt.target.ttnn.TensorRef;
 +  delta_time: tt.target.ttnn.TensorRef;
 +  a_log: tt.target.ttnn.TensorRef;
@@ -208,7 +202,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      return success();
 +    }
 +    if (name == "tt.gated_delta_decode") {
-+      if (op.getNumOperands() != 10 || op.getNumResults() != 2) {
++      if (op.getNumOperands() != 8 || op.getNumResults() != 2) {
 +        return op.emitOpError("invalid recurrent call arity");
 +      }
 +      if (failed(requireOutputOperandAlias(op, 0, 0))) {
@@ -393,9 +387,9 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +        getOperandThroughDPSOps(value));
 +  };
 +  return ::tt::target::ttnn::CreateGatedDeltaDecodeOp(
-+      *cache.fbb, tensor(op.getCache()), tensor(op.getQuery()),
-+      tensor(op.getKey()), tensor(op.getValue()), tensor(op.getBetaLogits()),
-+      tensor(op.getDeltaTime()), tensor(op.getALog()), tensor(op.getDtBias()),
++      *cache.fbb, tensor(op.getCache()), tensor(op.getQkv()),
++      tensor(op.getBetaLogits()), tensor(op.getDeltaTime()),
++      tensor(op.getALog()), tensor(op.getDtBias()),
 +      tensor(op.getStateIndices()), tensor(op.getHasInitialState()),
 +      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
 +                                  std::nullopt));
@@ -534,7 +528,7 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.h b/runtime/lib/t
 diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,95 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +#include "operations/transformer/recurrent.h"
@@ -595,9 +589,7 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +    return pool.getTTNNTensorAndValidate(ref);
 +  };
 +  auto output = ::ttnn::transformer::gated_delta_decode(
-+      tiled(get(op->query()), ::ttnn::DataType::FLOAT32),
-+      tiled(get(op->key()), ::ttnn::DataType::FLOAT32),
-+      tiled(get(op->value()), ::ttnn::DataType::FLOAT32),
++      tiled(get(op->qkv()), ::ttnn::DataType::FLOAT32),
 +      tiled(get(op->beta_logits()), ::ttnn::DataType::FLOAT32),
 +      tiled(get(op->delta_time()), ::ttnn::DataType::FLOAT32),
 +      tiled(get(op->a_log()), ::ttnn::DataType::FLOAT32),
