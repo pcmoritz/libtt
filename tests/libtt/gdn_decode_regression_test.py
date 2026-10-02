@@ -1,4 +1,4 @@
-"""GDN decode with query and key heads shared by groups of value heads."""
+"""GDN decode from the flat convolution output, with grouped query and key heads."""
 
 import jax
 import jax.numpy as jnp
@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 
-def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial, **attributes):
+def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial):
     return jax.ffi.ffi_call(
         "tt.gated_delta_decode",
         (
@@ -15,36 +15,21 @@ def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial, *
         ),
         input_output_aliases={0: 0},
         vmap_method="sequential",
-    )(state, q, k, v, b, a, A_log, dt_bias, indices, initial, **attributes)
+    )(state, q, k, v, b, a, A_log, dt_bias, indices, initial)
 
 
 @pytest.mark.parametrize("trace", [False, True])
-@pytest.mark.parametrize(
-    "batch,key_heads,groups,layout",
-    [(1, 4, 3, "flat"), (2, 2, 2, "flat"), (1, 4, 3, "grouped"), (1, 4, 1, "grouped")],
-)
-def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, layout):
-    # Like Qwen3.5: L2-normalized q and k, each head serving a group of value
-    # heads, and a scaled q. With "flat", the kernel reads q, k and v as heads
-    # of one [B, (2 * key_heads + heads) * D] tensor and normalizes q and k
-    # itself; with "grouped", q and k arrive normalized with key_heads heads.
+@pytest.mark.parametrize("batch,key_heads,groups", [(1, 4, 3), (2, 2, 2), (1, 4, 1)])
+def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups):
+    # Like Qwen3.5: the kernel reads q, k and v as heads of one
+    # [B, (2 * key_heads + heads) * D] tensor, L2-normalizes q and k, scales q,
+    # and each q/k head serves a group of value heads.
     heads, dim = key_heads * groups, 128
     eps, scale = 1e-6, dim**-0.5
 
     def decode(state, qk, v, b, a, A_log, dt_bias, indices, initial):
-        if layout == "flat":
-            mixed = jnp.concatenate([qk.reshape(batch, -1), v.reshape(batch, -1)], axis=1)
-            return gated_delta_decode(
-                state, mixed, mixed, mixed, b, a, A_log, dt_bias, indices, initial,
-                key_head_offset=key_heads,
-                value_head_offset=2 * key_heads,
-                num_key_heads=key_heads,
-                normalize_eps=eps,
-                query_scale=scale,
-            )
-        qk = qk / jnp.sqrt(jnp.sum(qk * qk, axis=-1, keepdims=True) + eps)
-        q, k = qk[:, :key_heads] * scale, qk[:, key_heads:]
-        return gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial)
+        mixed = jnp.concatenate([qk.reshape(batch, -1), v.reshape(batch, -1)], axis=1)
+        return gated_delta_decode(state, mixed, mixed, mixed, b, a, A_log, dt_bias, indices, initial)
 
     device = jax.devices("tt")[0]
     run = jax.jit(
