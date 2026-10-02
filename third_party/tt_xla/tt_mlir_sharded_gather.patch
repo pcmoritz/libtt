@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 --- a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
-@@ -531,6 +531,141 @@
+@@ -531,6 +531,147 @@
    return mlir::success();
  }
  
@@ -18,6 +18,8 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +  rootModule.walk([&](mlir::stablehlo::GatherOp gather) {
 +    mlir::stablehlo::GatherDimensionNumbersAttr dims =
 +        gather.getDimensionNumbers();
++    // Shardy keeps exactly these gathers' operands sharded along the indexed
++    // dimension (see the GatherOp rule in libtt's shardy_gather_replication.patch).
 +    if (dims.getStartIndexMap().size() != 1) {
 +      return;
 +    }
@@ -28,8 +30,12 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +                                             /*createIfMissing=*/false)
 +            .getDimShardings()[dim]
 +            .getAxes();
-+    // In a shard_map, the indices of a table sharded along its manual axes are
-+    // already local.
++    if (axes.empty()) {
++      return;
++    }
++    // WrapUnderManualComputation wraps each function in a manual computation,
++    // so a user's shard_map is a nested one. Its block arguments report its
++    // in_shardings, but along its manual axes the indices are already local.
 +    auto shardMap = gather->getParentOfType<mlir::sdy::ManualComputationOp>();
 +    if (shardMap && shardMap->getParentOfType<mlir::sdy::ManualComputationOp>() &&
 +        llvm::any_of(axes, [&](mlir::sdy::AxisRefAttr axis) {
@@ -37,9 +43,6 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +                                    mlir::StringAttr::get(
 +                                        builder.getContext(), axis.getName()));
 +        })) {
-+      return;
-+    }
-+    if (axes.empty()) {
 +      return;
 +    }
 +
@@ -57,6 +60,9 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +
 +    // The device's shard: its coordinates along `axes`, from
 +    // stablehlo.partition_id, which numbers devices row-major over the mesh.
++    // (Looking the offset up in a table with dynamic_slice doesn't work: TTNN
++    // reads the start index on the host, which needs it to be the same on
++    // every device.)
 +    builder.setInsertionPoint(gather);
 +    mlir::Value device = builder.create<mlir::stablehlo::ConvertOp>(
 +        loc, mlir::RankedTensorType::get({}, indexType),
@@ -143,7 +149,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
  class UpdateGlobalToLocalShapesPass
      : public impl::UpdateGlobalToLocalShapesPassBase<
            UpdateGlobalToLocalShapesPass> {
-@@ -613,6 +748,8 @@
+@@ -613,6 +754,8 @@
        }
      });
  
