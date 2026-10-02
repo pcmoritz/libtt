@@ -433,21 +433,20 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/kerne
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/kernels/reduce_tiles.hpp
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,41 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +//
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#pragma once
 +
-+// Max, min and 32-bit sum reductions for kernels that otherwise sum with
++// Max, min and float32 sum reductions for kernels that otherwise sum with
 +// add_tiles. The host defines REDUCE_OP and REDUCE_OP_INIT (see
 +// reduce_op_defines) to the SFPU function, which reads both operands from DST:
 +// results live in DST[0, n) and second operands in DST[n, 2n), so n is at most
 +// half of DST.
 +#ifdef REDUCE_OP
 +
-+#include "api/compute/add_int_sfpu.h"
 +#include "api/compute/binary_max_min.h"
 +#include "api/compute/eltwise_binary_sfpu.h"
 +#include "api/compute/tile_move_copy.h"
@@ -487,53 +486,46 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/reduc
  
  #include "ttnn/operations/experimental/ccl/composite_common.hpp"
  
-@@ -278,4 +279,53 @@
+@@ -278,4 +279,46 @@
      worker_rt_args.push_back(static_cast<uint32_t>(termination_master_virtual_core.y));
  }
  
 +bool reduce_op_reads_dst(reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype) {
-+    return math_op != reduction_common::ReduceType::Sum || reduce_op_uses_fp32_dest(math_op, dtype);
++    return math_op != reduction_common::ReduceType::Sum || dtype == tt::tt_metal::DataType::FLOAT32;
 +}
 +
-+bool reduce_op_uses_fp32_dest(reduction_common::ReduceType /*math_op*/, tt::tt_metal::DataType dtype) {
++bool reduce_op_uses_fp32_dest(reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype) {
++    if (math_op == reduction_common::ReduceType::Sum) {
++        return dtype == tt::tt_metal::DataType::FLOAT32;
++    }
 +    return dtype == tt::tt_metal::DataType::FLOAT32 || dtype == tt::tt_metal::DataType::INT32 ||
 +           dtype == tt::tt_metal::DataType::UINT32;
 +}
 +
 +void configure_reduce_op(
 +    tt::tt_metal::ComputeConfig& config, reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype) {
-+    std::string op;
-+    std::string init;
 +    if (math_op == reduction_common::ReduceType::Sum) {
 +        // add_tiles adds on the FPU, whose source registers keep only TF32, so
-+        // 32-bit sums go through the SFPU with a 32-bit DST instead.
++        // float32 sums go through the SFPU with float32 DST instead.
 +        if (dtype == tt::tt_metal::DataType::FLOAT32) {
-+            op = "add_binary_tile";
-+            init = "add_binary_tile_init";
-+        } else if (dtype == tt::tt_metal::DataType::INT32) {
-+            op = "add_int_tile<DataFormat::Int32>";
-+            init = "add_int_tile_init";
-+        } else if (dtype == tt::tt_metal::DataType::UINT32) {
-+            op = "add_int_tile<DataFormat::UInt32>";
-+            init = "add_int_tile_init";
-+        } else {
-+            return;
++            config.defines["REDUCE_OP"] = "add_binary_tile";
++            config.defines["REDUCE_OP_INIT"] = "add_binary_tile_init";
++            config.fp32_dest_acc_en = true;
++            config.unpack_to_dest_mode.assign(NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::UnpackToDestFp32);
 +        }
-+    } else {
-+        TT_FATAL(
-+            math_op == reduction_common::ReduceType::Max || math_op == reduction_common::ReduceType::Min,
-+            "Reductions only support sum, max and min");
-+        std::string name = math_op == reduction_common::ReduceType::Max ? "binary_max" : "binary_min";
-+        if (dtype == tt::tt_metal::DataType::INT32) {
-+            name += "_int32";
-+        } else if (dtype == tt::tt_metal::DataType::UINT32) {
-+            name += "_uint32";
-+        }
-+        op = name + "_tile";
-+        init = name + "_tile_init";
++        return;
 +    }
-+    config.defines["REDUCE_OP"] = op;
-+    config.defines["REDUCE_OP_INIT"] = init;
++    TT_FATAL(
++        math_op == reduction_common::ReduceType::Max || math_op == reduction_common::ReduceType::Min,
++        "Reductions only support sum, max and min");
++    std::string op = math_op == reduction_common::ReduceType::Max ? "binary_max" : "binary_min";
++    if (dtype == tt::tt_metal::DataType::INT32) {
++        op += "_int32";
++    } else if (dtype == tt::tt_metal::DataType::UINT32) {
++        op += "_uint32";
++    }
++    config.defines["REDUCE_OP"] = op + "_tile";
++    config.defines["REDUCE_OP_INIT"] = op + "_tile_init";
 +    if (reduce_op_uses_fp32_dest(math_op, dtype)) {
 +        config.fp32_dest_acc_en = true;
 +        config.unpack_to_dest_mode.assign(NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::UnpackToDestFp32);
@@ -566,17 +558,17 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/reduc
      tt::tt_metal::ProgramDescriptor& desc,
      tt::tt_metal::KernelDescriptor::RTArgList& worker_rt_args);
  
-+// Whether the reduction reads both operands from DST (max, min and 32-bit
++// Whether the reduction reads both operands from DST (max, min and float32
 +// sums), so it can only use half of DST.
 +bool reduce_op_reads_dst(reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype);
 +
-+// Whether the reduction needs a 32-bit DST: any reduction of 32-bit data.
++// Whether max or min of 32-bit data, or a float32 sum, needs a 32-bit DST.
 +bool reduce_op_uses_fp32_dest(reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype);
 +
-+// Configures how a reduction kernel combines tiles. Sums of 16-bit data need
-+// nothing; 32-bit sums, max and min name the SFPU functions for the data type
-+// in REDUCE_OP and REDUCE_OP_INIT and unpack 32-bit data straight into a
-+// 32-bit DST so they are exact.
++// Configures how a reduction kernel combines tiles. Sums need nothing, except
++// float32 sums; those, max and min name the SFPU functions for the data type in
++// REDUCE_OP and REDUCE_OP_INIT and unpack 32-bit data straight into a 32-bit
++// DST so they are exact.
 +void configure_reduce_op(
 +    tt::tt_metal::ComputeConfig& config, reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype);
 +
