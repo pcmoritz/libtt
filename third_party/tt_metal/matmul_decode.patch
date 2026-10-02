@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
-@@ -241,4 +241,228 @@ ProgramDescriptor MatmulMultiCoreProgramFactory::create_descriptor(
+@@ -241,4 +241,227 @@ ProgramDescriptor MatmulMultiCoreProgramFactory::create_descriptor(
      return desc;
  }
  
@@ -194,11 +194,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +        }
 +    }
 +    for (uint32_t i = 0; i < num_cores; ++i) {
++        std::vector<std::variant<uint32_t, std::reference_wrapper<const tt::tt_metal::MeshTensor>>> args = {
++            b, output, start_of(i), count_of(i)};
 +        if (bias_tensor.has_value()) {
-+            reader.emplace_runtime_args(core_at(i), {b, output, start_of(i), count_of(i), bias_tensor->mesh_tensor()});
-+        } else {
-+            reader.emplace_runtime_args(core_at(i), {b, output, start_of(i), count_of(i), 0u});
++            args.emplace_back(bias_tensor->mesh_tensor());
 +        }
++        reader.emplace_runtime_args(core_at(i), args);
 +    }
 +    sender.core_ranges = CoreRangeSet(sender_ranges);
 +    desc.kernels.push_back(std::move(reader));
@@ -208,10 +209,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +        desc.kernels.push_back(std::move(receiver));
 +    }
 +
-+    // The kernel accumulates every output tile over all of K in FP32 DST.
-+    [[maybe_unused]] auto [math_fidelity, math_approx_mode, fp32_dest_acc_en, packer_l1_acc, dst_full_sync_en] =
-+        get_compute_kernel_config_args(
-+            device->arch(), operation_attributes.compute_kernel_config.value_or(DeviceComputeKernelConfig{}));
++    const auto config = operation_attributes.compute_kernel_config.value_or(DeviceComputeKernelConfig{});
 +    KernelDescriptor compute;
 +    compute.kernel_source = "ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp";
 +    compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
@@ -220,11 +218,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +    for (uint32_t i = 0; i < num_cores; ++i) {
 +        compute.emplace_runtime_args(core_at(i), {count_of(i)});
 +    }
++    // The kernel accumulates every output tile over all of K in FP32 DST.
 +    compute.config = ComputeConfigDescriptor{
-+        .math_fidelity = math_fidelity,
++        .math_fidelity = config.math_fidelity,
 +        .fp32_dest_acc_en = true,
 +        .dst_full_sync_en = true,
-+        .math_approx_mode = math_approx_mode};
++        .math_approx_mode = config.math_approx_mode};
 +    desc.kernels.push_back(std::move(compute));
 +    return desc;
 +}
@@ -426,13 +425,14 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +#include "api/dataflow/circular_buffer.h"
 +#include "matmul_decode_weights.hpp"
 +
-+// Reads the bias tiles of this core's output columns, whose accessor
-+// arguments follow the output's (a template, so no-bias kernels skip them).
++// Reads the bias tiles of this core's output columns. The bias address is
++// runtime argument 4 and its accessor arguments follow the output's; kernels
++// without a bias have neither.
 +template <bool has_bias, uint32_t args_offset>
-+FORCE_INLINE void read_bias(uint32_t bias_addr, uint32_t n_start, uint32_t count, uint32_t cb_bias) {
++FORCE_INLINE void read_bias(uint32_t n_start, uint32_t count, uint32_t cb_bias) {
 +    if constexpr (has_bias) {
 +        constexpr auto bias_args = TensorAccessorArgs<args_offset>();
-+        const auto bias = TensorAccessor(bias_args, bias_addr);
++        const auto bias = TensorAccessor(bias_args, get_arg_val<uint32_t>(4));
 +        const uint32_t tile_bytes = get_tile_size(cb_bias);
 +        cb_reserve_back(cb_bias, count);
 +        for (uint32_t n = 0; n < count; ++n) {
@@ -450,7 +450,6 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    const uint32_t output_addr = get_arg_val<uint32_t>(1);
 +    const uint32_t n_start = get_arg_val<uint32_t>(2);
 +    const uint32_t count = get_arg_val<uint32_t>(3);
-+    const uint32_t bias_addr = get_arg_val<uint32_t>(4);
 +
 +    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
 +    constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
@@ -460,7 +459,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    constexpr auto output_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
 +    const auto weight = TensorAccessor(weight_args, weight_addr);
 +    const auto output = TensorAccessor(output_args, output_addr);
-+    read_bias<has_bias, output_args.next_compile_time_args_offset()>(bias_addr, n_start, count, cb_bias);
++    read_bias<has_bias, output_args.next_compile_time_args_offset()>(n_start, count, cb_bias);
 +
 +    stream_decode_weights<0>(weight, n_start, count, cb_weights, [] {});
 +
@@ -625,7 +624,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
-@@ -2058,10 +2058,60 @@ bool get_broadcast_batch(
+@@ -2058,14 +2058,56 @@ bool get_broadcast_batch(
      return broadcast_batch;
  }
  
@@ -634,21 +633,14 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
 +           memory_config.memory_layout() == TensorMemoryLayout::INTERLEAVED;
 +}
 +
-+// One tile row of BF16 activations times DRAM-interleaved weights, as in LLM
-+// decode, with at least one output tile per worker core. The decode matmul
-+// streams such weights on both NOCs and splits the output columns evenly over
-+// the cores; with fewer output tiles, the 1D matmul keeps more cores busy.
++// A 1D matmul of one tile row of BF16 activations times DRAM-interleaved
++// weights, as in LLM decode, with at least one output tile per worker core.
++// The decode matmul streams such weights on both NOCs and splits the output
++// columns evenly over the cores; with fewer output tiles, the 1D matmul keeps
++// more cores busy. Like the 1D matmul, it adds row 0 of the bias to every row.
 +bool is_decode_matmul(const MatmulParams& attributes, const MatmulInputs& args) {
 +    const auto& a = args.input_tensors.at(0);
 +    const auto& b = args.input_tensors.at(1);
-+    const bool fused_activation = std::visit(
-+        [](const auto& config) {
-+            if constexpr (requires { config.fused_activation; }) {
-+                return config.fused_activation.has_value();
-+            }
-+            return false;
-+        },
-+        attributes.program_config.value());
 +    const bool has_output = !args.optional_output_tensors.empty() && args.optional_output_tensors[0].has_value();
 +    const auto& a_shape = a.padded_shape();
 +    const auto& b_shape = b.padded_shape();
@@ -659,16 +651,15 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
 +    auto is_tile_row = [&](const Tensor& t, uint32_t width) {
 +        return t.layout() == Layout::TILE && t.tensor_spec().tile() == tt::tt_metal::Tile() &&
 +               t.padded_shape().volume() == static_cast<uint64_t>(TILE_HEIGHT) * width &&
-+               t.logical_shape()[-1] % TILE_WIDTH == 0 && is_dram_interleaved(t.memory_config());
++               is_dram_interleaved(t.memory_config());
 +    };
-+    // A bias is added from its first row, which a single tile row holds.
 +    const auto bias = args.optional_input_tensors.empty() ? std::nullopt : args.optional_input_tensors[0];
 +    const bool bias_ok = !bias.has_value() || (is_tile_row(*bias, N) && (bias->dtype() == DataType::BFLOAT16 ||
 +                                                                          bias->dtype() == DataType::FLOAT32));
-+    return !fused_activation && bias_ok && !has_output && !attributes.transpose_a && !attributes.untilize_out &&
++    return bias_ok && !has_output && !attributes.transpose_a && !attributes.untilize_out &&
 +           !attributes.user_fused_activation.has_value() && !attributes.global_cb.has_value() &&
 +           attributes.output_tile.value_or(tt::tt_metal::Tile()) == tt::tt_metal::Tile() &&
-+           a.dtype() == DataType::BFLOAT16 && is_tile_row(a, K) &&
++           a.dtype() == DataType::BFLOAT16 && is_tile_row(a, K) && a.logical_shape()[-1] % TILE_WIDTH == 0 &&
 +           (output_dtype == DataType::BFLOAT16 || output_dtype == DataType::FLOAT32) &&
 +           b.layout() == Layout::TILE && b.tensor_spec().tile() == tt::tt_metal::Tile() &&
 +           b_shape.volume() == static_cast<uint64_t>(K) * N &&
@@ -681,13 +672,28 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
  MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_factory(
 -    const operation_attributes_t& operation_attributes, const tensor_args_t& /*tensor_args*/) {
 +    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
-+    if (operation_attributes.fused_swiglu || is_decode_matmul(operation_attributes, tensor_args)) {
++    if (operation_attributes.fused_swiglu) {
 +        return MatmulDecodeProgramFactory{};
 +    }
      const auto& config = operation_attributes.program_config.value();
  
      return std::visit(
-@@ -2122,6 +2172,28 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
+-        [](const auto& c) -> program_factory_t {
++        [&](const auto& c) -> program_factory_t {
+             using T = std::decay_t<decltype(c)>;
+             if constexpr (std::is_same_v<T, operations::matmul::MatmulMultiCoreProgramConfig>) {
+                 return MatmulMultiCoreProgramFactory{};
+@@ -2078,6 +2120,9 @@ MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_f
+                 if (c.gather_in0) {
+                     return MatmulMeshWorkloadMultiCoreReuseMcast1DProgramFactory{};
+                 }
++                if (!c.fused_activation.has_value() && is_decode_matmul(operation_attributes, tensor_args)) {
++                    return MatmulDecodeProgramFactory{};
++                }
+                 return MatmulMultiCoreReuseMcast1DProgramFactory{};
+             } else if constexpr (std::is_same_v<
+                                      T,
+@@ -2122,6 +2167,28 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
      // ---- universal checks, part 1: independent of the chosen program config ----
      validate_matmul_operand_basics(input_tensor_a, input_tensor_b, in0_tile, in1_tile);
      validate_matmul_matrix_dimensions(a_shape, b_shape, a_shape_padded, b_shape_padded, in0_tile, in1_tile);
@@ -716,7 +722,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
      validate_matmul_bfloat4_tile_dims(input_tensor_a, input_tensor_b, in0_tile, in1_tile);
      validate_matmul_optional_tensors(attributes, args);
  
-@@ -2281,8 +2353,13 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
+@@ -2281,8 +2348,13 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
      const auto& input_tensor_b = input_tensors.at(1);
  
      // Use the compute_matmul_output_shape function to get the output shape
@@ -731,7 +737,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
  
      const auto& a_shape_padded =
          operations::matmul::utilities::get_matmul_tensor_padded_shape(input_tensor_a, attributes.transpose_a);
-@@ -2757,7 +2834,8 @@ MatmulParams create_matmul_attributes(
+@@ -2757,7 +2829,8 @@ MatmulParams create_matmul_attributes(
          parameters.transpose_b,
          output_tile,
          parameters.global_cb,

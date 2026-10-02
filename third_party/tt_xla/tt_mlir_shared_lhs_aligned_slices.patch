@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -2091,6 +2091,17 @@
+@@ -2091,6 +2091,14 @@
        }
      }
  
@@ -12,9 +12,6 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +      auto type = mlir::cast<RankedTensorType>(op.getType());
 +      return type.getDimSize(type.getRank() - 1) % ttnn::TILE_WIDTH == 0;
 +    });
-+    if (!result.ops.empty()) {
-+      result.firstTransposeB = result.ops.front().getTransposeB();
-+    }
 +
      sortQKVProjectionCandidates(result);
  
