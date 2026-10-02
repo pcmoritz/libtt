@@ -42,3 +42,42 @@ def test_row_sharded_embedding(dtype, ids_shape, tmp_path):
     text = ir.read_text()
     assert '"ttnn.embedding"' in text
     assert '"ttnn.all_gather"' not in text
+
+
+# On a 2x2 mesh the device's shard comes from its mesh coordinates, and the
+# indices may be sharded along the other axis.
+@pytest.mark.parametrize(
+    "table_spec,ids_spec",
+    [
+        (P("x", None), P()),
+        (P("y", None), P()),
+        (P(("x", "y"), None), P()),
+        (P(("y", "x"), None), P()),
+        (P("y", None), P("x")),
+    ],
+)
+def test_row_sharded_embedding_2d_mesh(table_spec, ids_spec, tmp_path):
+    devices = jax.devices("tt")
+    if len(devices) != 4:
+        pytest.skip("needs four devices")
+    mesh = jax.make_mesh((2, 2), ("x", "y"), devices=devices)
+    table = np.random.default_rng(0).normal(size=(256, 256)).astype(np.float32)
+    ids = np.array([0, 63, 64, 127, 128, 255, 200, 5], np.int32)
+
+    run = jax.jit(
+        lambda t, i: t.at[i].get(out_sharding=NamedSharding(mesh, ids_spec)),
+        compiler_options={
+            "export_path": str(tmp_path),
+            "export_model_name": "embedding",
+            "export_tensors": "false",
+        },
+    )
+    with jax.set_mesh(mesh):
+        out = run(
+            jax.device_put(table, NamedSharding(mesh, table_spec)),
+            jax.device_put(ids, NamedSharding(mesh, ids_spec)),
+        )
+    np.testing.assert_array_equal(np.asarray(out), table[ids])
+
+    (ir,) = (tmp_path / "irs").glob("ttnn_runtime_embedding_*.mlir")
+    assert '"ttnn.all_gather"' not in ir.read_text()
