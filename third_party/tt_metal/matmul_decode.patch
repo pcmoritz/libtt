@@ -1,33 +1,34 @@
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp
-@@ -241,4 +241,208 @@
+@@ -241,4 +241,227 @@ ProgramDescriptor MatmulMultiCoreProgramFactory::create_descriptor(
      return desc;
  }
  
 +namespace {
 +
-+// Core layout of the fused SwiGLU decode projection: output tile pairs are
-+// split as evenly as possible over num_cores cores, and each core processes
-+// its pairs in passes of up to `group`.
-+struct SwiGLULayout {
++// Core layout of a decode matmul: output tiles are split as evenly as possible
++// over num_cores cores, and each core processes its tiles in passes of up to
++// `group`.
++struct DecodeLayout {
 +    uint32_t num_cores;
 +    uint32_t group;
 +    uint32_t in0_block_w;
 +    uint32_t in0_mcast_w;
 +};
 +
-+SwiGLULayout swiglu_layout(uint32_t Kt, uint32_t half_Nt, uint32_t num_worker_cores) {
-+    // Gate and up accumulators for one pass share the eight FP32 DST tiles.
-+    constexpr uint32_t max_group = 4;
-+    const uint32_t num_cores = std::min(half_Nt, num_worker_cores);
-+    const uint32_t max_per_core = tt::div_up(half_Nt, num_cores);
++DecodeLayout decode_layout(uint32_t Kt, uint32_t out_Nt, uint32_t halves, uint32_t num_worker_cores) {
++    // The accumulators of every weight half for one pass share the eight FP32
++    // DST tiles.
++    const uint32_t max_group = 8 / halves;
++    const uint32_t num_cores = std::min(out_Nt, num_worker_cores);
++    const uint32_t max_per_core = tt::div_up(out_Nt, num_cores);
 +    const uint32_t passes = tt::div_up(max_per_core, max_group);
 +    uint32_t in0_mcast_w = 8;
 +    while (Kt % in0_mcast_w != 0) {
 +        in0_mcast_w /= 2;
 +    }
-+    return SwiGLULayout{
++    return DecodeLayout{
 +        .num_cores = num_cores,
 +        .group = tt::div_up(max_per_core, passes),
 +        .in0_block_w = Kt % 2 == 0 ? 2u : 1u,
@@ -37,7 +38,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +
 +}  // namespace
 +
-+ProgramDescriptor MatmulSwiGLUProgramFactory::create_descriptor(
++ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
 +    const ttnn::prim::MatmulParams& operation_attributes,
 +    const ttnn::prim::MatmulInputs& tensor_args,
 +    std::vector<ttnn::Tensor>& tensor_return_value,
@@ -48,15 +49,20 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +    auto* device = &a.mutable_device();
 +
 +    const uint32_t Kt = a.padded_shape()[-1] / TILE_WIDTH;
-+    const uint32_t half_Nt = b.padded_shape()[-1] / TILE_WIDTH / 2;
++    // SwiGLU's weight holds an up and a gate half for every output tile.
++    const uint32_t halves = operation_attributes.fused_swiglu ? 2 : 1;
++    const bool transpose_b = operation_attributes.transpose_b;
++    const uint32_t out_Nt = b.padded_shape()[transpose_b ? -2 : -1] / TILE_WIDTH / halves;
++    const auto bias_tensor = tensor_args.optional_input_tensors.empty() ? std::nullopt
++                                                                     : tensor_args.optional_input_tensors[0];
 +    const auto grid = device->compute_with_storage_grid_size();
-+    const auto [num_cores, group, in0_block_w, in0_mcast_w] = swiglu_layout(Kt, half_Nt, grid.x * grid.y);
++    const auto [num_cores, group, in0_block_w, in0_mcast_w] = decode_layout(Kt, out_Nt, halves, grid.x * grid.y);
 +    constexpr uint32_t in1_buffers = 2;
-+    const uint32_t in1_block_num_tiles = in0_block_w * 2 * group;
-+    // Output tile pairs are split as evenly as possible: the first `extra`
-+    // cores take one more than the rest.
-+    const uint32_t base_count = half_Nt / num_cores;
-+    const uint32_t extra = half_Nt % num_cores;
++    const uint32_t in1_block_num_tiles = in0_block_w * halves * group;
++    // Output tiles are split as evenly as possible: the first `extra` cores
++    // take one more than the rest.
++    const uint32_t base_count = out_Nt / num_cores;
++    const uint32_t extra = out_Nt % num_cores;
 +    auto count_of = [&](uint32_t i) { return base_count + (i < extra ? 1 : 0); };
 +    auto start_of = [&](uint32_t i) { return i * base_count + std::min(i, extra); };
 +
@@ -92,6 +98,9 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +    add_cb(tt::CBIndex::c_1, in1_buffers * in1_block_num_tiles, in1_format);
 +    add_cb(tt::CBIndex::c_2, in1_buffers * in1_block_num_tiles, in1_format);
 +    add_cb(tt::CBIndex::c_16, count_of(0), output_format);
++    if (bias_tensor.has_value()) {
++        add_cb(tt::CBIndex::c_3, count_of(0), tt_metal::datatype_to_dataformat_converter(bias_tensor->dtype()));
++    }
 +
 +    constexpr uint32_t sender_sem_id = 0;
 +    constexpr uint32_t receiver_sem_id = 1;
@@ -107,8 +116,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +        {"cb_weights", tt::CBIndex::c_1},
 +        {"cb_weights2", tt::CBIndex::c_2},
 +        {"cb_out", tt::CBIndex::c_16},
++        {"cb_bias", tt::CBIndex::c_3},
++        {"has_bias", bias_tensor.has_value()},
++        {"transpose_b", transpose_b},
 +        {"Kt", Kt},
-+        {"half_Nt", half_Nt},
++        {"halves", halves},
++        {"out_Nt", out_Nt},
 +        {"group", group},
 +        {"in0_block_w", in0_block_w},
 +        {"in0_mcast_w", in0_mcast_w},
@@ -130,18 +143,21 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +    std::vector<uint32_t> reader_args;
 +    tt::tt_metal::TensorAccessorArgs(b).append_to(reader_args);
 +    tt::tt_metal::TensorAccessorArgs(output).append_to(reader_args);
++    if (bias_tensor.has_value()) {
++        tt::tt_metal::TensorAccessorArgs(bias_tensor->mesh_tensor()).append_to(reader_args);
++    }
 +    auto reader = make_kernel(
-+        "reader_matmul_swiglu.cpp", reader_args, tt_metal::DataMovementProcessor::RISCV_0, in1_noc);
++        "reader_matmul_decode.cpp", reader_args, tt_metal::DataMovementProcessor::RISCV_0, in1_noc);
 +    reader.core_ranges = all_cores;
 +    std::vector<uint32_t> sender_args;
 +    tt::tt_metal::TensorAccessorArgs(a).append_to(sender_args);
 +    tt::tt_metal::TensorAccessorArgs(b).append_to(sender_args);
 +    auto sender = make_kernel(
-+        "reader_matmul_swiglu_in0_sender.cpp", sender_args, tt_metal::DataMovementProcessor::RISCV_1, in0_noc);
++        "reader_matmul_decode_in0_sender.cpp", sender_args, tt_metal::DataMovementProcessor::RISCV_1, in0_noc);
 +    std::vector<uint32_t> receiver_args;
 +    tt::tt_metal::TensorAccessorArgs(b).append_to(receiver_args);
 +    auto receiver = make_kernel(
-+        "reader_matmul_swiglu_in0_receiver.cpp", receiver_args, tt_metal::DataMovementProcessor::RISCV_1, in0_noc);
++        "reader_matmul_decode_in0_receiver.cpp", receiver_args, tt_metal::DataMovementProcessor::RISCV_1, in0_noc);
 +
 +    std::vector<CoreRange> sender_ranges;
 +    std::vector<CoreRange> receiver_ranges;
@@ -178,7 +194,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +        }
 +    }
 +    for (uint32_t i = 0; i < num_cores; ++i) {
-+        reader.emplace_runtime_args(core_at(i), {b, output, start_of(i), count_of(i)});
++        std::vector<std::variant<uint32_t, std::reference_wrapper<const tt::tt_metal::MeshTensor>>> args = {
++            b, output, start_of(i), count_of(i)};
++        if (bias_tensor.has_value()) {
++            args.emplace_back(bias_tensor->mesh_tensor());
++        }
++        reader.emplace_runtime_args(core_at(i), args);
 +    }
 +    sender.core_ranges = CoreRangeSet(sender_ranges);
 +    desc.kernels.push_back(std::move(reader));
@@ -188,23 +209,21 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
 +        desc.kernels.push_back(std::move(receiver));
 +    }
 +
-+    TT_FATAL(operation_attributes.compute_kernel_config.has_value(), "SwiGLU compute config is required");
-+    auto [math_fidelity, math_approx_mode, fp32_dest_acc_en, packer_l1_acc, dst_full_sync_en] =
-+        get_compute_kernel_config_args(device->arch(), operation_attributes.compute_kernel_config.value());
-+    TT_FATAL(fp32_dest_acc_en && dst_full_sync_en && !packer_l1_acc, "SwiGLU requires full FP32 DST accumulation");
++    const auto config = operation_attributes.compute_kernel_config.value_or(DeviceComputeKernelConfig{});
 +    KernelDescriptor compute;
-+    compute.kernel_source = "ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp";
++    compute.kernel_source = "ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp";
 +    compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
 +    compute.core_ranges = all_cores;
 +    compute.named_compile_time_args = common_args;
 +    for (uint32_t i = 0; i < num_cores; ++i) {
 +        compute.emplace_runtime_args(core_at(i), {count_of(i)});
 +    }
++    // The kernel accumulates every output tile over all of K in FP32 DST.
 +    compute.config = ComputeConfigDescriptor{
-+        .math_fidelity = math_fidelity,
++        .math_fidelity = config.math_fidelity,
 +        .fp32_dest_acc_en = true,
-+        .dst_full_sync_en = dst_full_sync_en,
-+        .math_approx_mode = math_approx_mode};
++        .dst_full_sync_en = true,
++        .math_approx_mode = config.math_approx_mode};
 +    desc.kernels.push_back(std::move(compute));
 +    return desc;
 +}
@@ -222,58 +241,76 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_progr
  #include "ttnn/device_operation.hpp"
  #include "ttnn/operations/matmul/device/matmul_device_operation_types.hpp"
  #include <tt-metalium/program_descriptors.hpp>
-@@ -14,6 +16,14 @@
-     static tt::tt_metal::ProgramDescriptor create_descriptor(
-         const ttnn::prim::MatmulParams& operation_attributes,
-         const ttnn::prim::MatmulInputs& tensor_args,
+@@ -18,4 +20,14 @@ struct MatmulMultiCoreProgramFactory {
+         const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
+ };
+ 
++// Decode matmul (one tile row of activations) streaming DRAM-interleaved
++// weights; also computes SwiGLU when fused_swiglu is set.
++struct MatmulDecodeProgramFactory {
++    static tt::tt_metal::ProgramDescriptor create_descriptor(
++        const ttnn::prim::MatmulParams& operation_attributes,
++        const ttnn::prim::MatmulInputs& tensor_args,
 +        std::vector<ttnn::Tensor>& tensor_return_value,
 +        const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
 +};
 +
-+struct MatmulSwiGLUProgramFactory {
-+    static tt::tt_metal::ProgramDescriptor create_descriptor(
-+        const ttnn::prim::MatmulParams& operation_attributes,
-+        const ttnn::prim::MatmulInputs& tensor_args,
-         std::vector<ttnn::Tensor>& tensor_return_value,
-         const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
- };
-diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
+ }  // namespace ttnn::prim
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
 --- /dev/null
-+++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.cpp
-@@ -0,0 +1,70 @@
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
+@@ -0,0 +1,93 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#include <cstdint>
++#include "api/compute/bcast.h"
 +#include "api/compute/compute_kernel_hw_startup.h"
 +#include "api/compute/eltwise_binary_sfpu.h"
 +#include "api/compute/matmul.h"
++#include "api/compute/reconfig_data_format.h"
 +#include "api/dataflow/circular_buffer.h"
 +#include "api/compute/compute_kernel_api.h"
 +
-+// silu(gate) * up for this core's output tile pairs. Each group of up to
-+// `group` pairs accumulates the full K reduction in FP32 DST; the activation
-+// stays resident, so later groups reuse it.
++// This core's output tiles, or silu(gate) * up for SwiGLU's two weight halves.
++// Each group of up to `group` output tiles accumulates the full K reduction in
++// FP32 DST, starting from the bias if there is one; the activation stays
++// resident, so later groups reuse it.
 +void kernel_main() {
 +    const uint32_t count = get_arg_val<uint32_t>(0);
 +
 +    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
++    constexpr uint32_t halves = get_named_compile_time_arg_val("halves");
 +    constexpr uint32_t kblock = get_named_compile_time_arg_val("in0_block_w");
 +    constexpr uint32_t group = get_named_compile_time_arg_val("group");
 +    constexpr uint32_t cb_in0 = get_named_compile_time_arg_val("cb_in0");
 +    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
 +    constexpr uint32_t cb_weights2 = get_named_compile_time_arg_val("cb_weights2");
 +    constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
-+    constexpr uint32_t block_tiles = kblock * 2 * group;
-+    static_assert(group > 0 && 2 * group <= 8, "gate and up must fit in FP32 DST");
++    constexpr uint32_t cb_bias = get_named_compile_time_arg_val("cb_bias");
++    constexpr bool has_bias = get_named_compile_time_arg_val("has_bias");
++    constexpr uint32_t transpose_b = get_named_compile_time_arg_val("transpose_b");
++    constexpr uint32_t block_tiles = kblock * halves * group;
++    static_assert(group > 0 && halves * group <= 8, "a group's accumulators must fit in FP32 DST");
 +
 +    compute_kernel_hw_startup<SrcOrder::Reverse>(cb_in0, cb_weights, cb_out);
++    if constexpr (has_bias) {
++        cb_wait_front(cb_bias, count);
++    }
 +    uint32_t in0_ready = 0;
 +    uint32_t index = 0;
 +    for (uint32_t group_start = 0; group_start < count; group_start += group) {
 +        const uint32_t width = count - group_start < group ? count - group_start : group;
-+        matmul_block_init(cb_in0, cb_weights, 0, /*ct_dim=*/2, /*rt_dim=*/1, kblock);
 +        tile_regs_acquire();
++        if constexpr (has_bias) {
++            // Row 0 of the bias, broadcast over the rows as by the 1D matmul.
++            unary_bcast_init<BroadcastType::ROW>(cb_bias, cb_out);
++            for (uint32_t i = 0; i < width; ++i) {
++                unary_bcast<BroadcastType::ROW>(cb_bias, group_start + i, i);
++            }
++            reconfig_data_format<SrcOrder::Reverse>(cb_in0, cb_weights);
++        }
++        matmul_block_init(cb_in0, cb_weights, transpose_b, /*ct_dim=*/halves, /*rt_dim=*/1, kblock);
 +        for (uint32_t k0 = 0; k0 < Kt; k0 += kblock, ++index) {
 +            // Odd blocks arrive through the second NOC's CB.
 +            const uint32_t cb_block = (index & 1) ? cb_weights2 : cb_weights;
@@ -283,22 +320,24 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.
 +            }
 +            cb_wait_front(cb_block, block_tiles);
 +            for (uint32_t k = 0; k < kblock; ++k) {
-+                for (uint32_t offset = 0; offset < 2 * width; offset += 2) {
-+                    matmul_block(cb_in0, cb_block, k0 + k, k * 2 * width + offset, offset, /*transpose=*/0, 2, 1,
-+                                 kblock);
++                for (uint32_t offset = 0; offset < halves * width; offset += halves) {
++                    matmul_block(cb_in0, cb_block, k0 + k, k * halves * width + offset, offset, transpose_b, halves,
++                                 1, kblock);
 +                }
 +            }
 +            cb_pop_front(cb_block, block_tiles);
 +        }
 +
-+        // Gate occupies the first `width` DST tiles, followed by up.
-+        silu_tile_init();
-+        for (uint32_t i = 0; i < width; ++i) {
-+            silu_tile(i);
-+        }
-+        mul_binary_tile_init();
-+        for (uint32_t i = 0; i < width; ++i) {
-+            mul_binary_tile(i, width + i, i);
++        if constexpr (halves == 2) {
++            // Gate occupies the first `width` DST tiles, followed by up.
++            silu_tile_init();
++            for (uint32_t i = 0; i < width; ++i) {
++                silu_tile(i);
++            }
++            mul_binary_tile_init();
++            for (uint32_t i = 0; i < width; ++i) {
++                mul_binary_tile(i, width + i, i);
++            }
 +        }
 +        tile_regs_commit();
 +        tile_regs_wait();
@@ -310,11 +349,14 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_swiglu.
 +        tile_regs_release();
 +    }
 +    cb_pop_front(cb_in0, Kt);
++    if constexpr (has_bias) {
++        cb_pop_front(cb_bias, count);
++    }
 +}
-diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu_weights.hpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu_weights.hpp
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp
 --- /dev/null
-+++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu_weights.hpp
-@@ -0,0 +1,52 @@
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp
+@@ -0,0 +1,55 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -323,23 +365,26 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu
 +#include <cstdint>
 +#include "api/dataflow/dataflow_api.h"
 +
-+// Streams one SwiGLU core's weight blocks into `cb` in consumption order.
-+// The core's output tile pairs are processed in groups of up to `group`
++// Streams one decode matmul core's weight blocks into `cb` in consumption
++// order. The core's output tiles are processed in groups of up to `group`
 +// (bounded by DST), and each group walks K in blocks of `in0_block_w` tiles.
 +// Even blocks travel on RISCV_0's NOC and odd blocks on RISCV_1's; this reads
-+// the blocks with index % 2 == parity. A block holds, for each K row, the
-+// group's gate tiles followed by its up tiles (up columns are the first half
-+// of the fused weight, gate the second). Every block occupies the same CB
-+// space, so a narrower last group keeps the block size constant. `poll` runs
-+// while waiting for CB space, so the caller can make other progress.
++// the blocks with index % 2 == parity. For each K row, a block holds the
++// group's weight tiles of every half in turn: a plain matmul has one half, and
++// SwiGLU's [up | gate] weight has two, read gate first. A transposed weight
++// is stored [N, K]. Every block occupies the same CB space, so a narrower last
++// group keeps the block size constant. `poll` runs while waiting for CB space,
++// so the caller can make other progress.
 +template <uint32_t parity, typename Accessor, typename Poll>
-+FORCE_INLINE void stream_swiglu_weights(
++FORCE_INLINE void stream_decode_weights(
 +    const Accessor& weight, uint32_t n_start, uint32_t count, uint32_t cb, Poll poll) {
 +    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
-+    constexpr uint32_t half_Nt = get_named_compile_time_arg_val("half_Nt");
++    constexpr uint32_t halves = get_named_compile_time_arg_val("halves");
++    constexpr uint32_t out_Nt = get_named_compile_time_arg_val("out_Nt");
 +    constexpr uint32_t kblock = get_named_compile_time_arg_val("in0_block_w");
 +    constexpr uint32_t group = get_named_compile_time_arg_val("group");
-+    constexpr uint32_t block_tiles = kblock * 2 * group;
++    constexpr bool transpose_b = get_named_compile_time_arg_val("transpose_b");
++    constexpr uint32_t block_tiles = kblock * halves * group;
 +    const uint32_t tile_bytes = get_tile_size(cb);
 +    uint32_t index = 0;
 +    for (uint32_t group_start = 0; group_start < count; group_start += group) {
@@ -352,14 +397,14 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu
 +                poll();
 +            } while (!cb_pages_reservable_at_back(cb, block_tiles));
 +            cb_reserve_back(cb, block_tiles);
-+            const uint32_t ptr = get_write_ptr(cb);
++            uint32_t local = get_write_ptr(cb);
 +            for (uint32_t k = 0; k < kblock; ++k) {
-+                const uint32_t up_row = (k0 + k) * 2 * half_Nt + n_start + group_start;
-+                const uint32_t gate_row = up_row + half_Nt;
-+                for (uint32_t n = 0; n < width; ++n) {
-+                    const uint32_t gate_local = ptr + (k * 2 * width + n) * tile_bytes;
-+                    noc_async_read_tile(gate_row + n, weight, gate_local);
-+                    noc_async_read_tile(up_row + n, weight, gate_local + width * tile_bytes);
++                for (uint32_t half = 0; half < halves; ++half) {
++                    const uint32_t first = (halves - 1 - half) * out_Nt + n_start + group_start;
++                    for (uint32_t n = first; n < first + width; ++n, local += tile_bytes) {
++                        const uint32_t tile = transpose_b ? n * Kt + k0 + k : (k0 + k) * halves * out_Nt + n;
++                        noc_async_read_tile(tile, weight, local);
++                    }
 +                }
 +            }
 +            noc_async_read_barrier();
@@ -367,10 +412,10 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_swiglu
 +        }
 +    }
 +}
-diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
 --- /dev/null
-+++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu.cpp
-@@ -0,0 +1,37 @@
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
+@@ -0,0 +1,58 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -378,10 +423,28 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +#include "api/dataflow/dataflow_api.h"
 +#include "api/dataflow/noc.h"
 +#include "api/dataflow/circular_buffer.h"
-+#include "matmul_swiglu_weights.hpp"
++#include "matmul_decode_weights.hpp"
 +
-+// Streams the even weight blocks of this core on RISCV_0's NOC, then writes
-+// the core's SwiGLU output tiles.
++// Reads the bias tiles of this core's output columns. The bias address is
++// runtime argument 4 and its accessor arguments follow the output's; kernels
++// without a bias have neither.
++template <bool has_bias, uint32_t args_offset>
++FORCE_INLINE void read_bias(uint32_t n_start, uint32_t count, uint32_t cb_bias) {
++    if constexpr (has_bias) {
++        constexpr auto bias_args = TensorAccessorArgs<args_offset>();
++        const auto bias = TensorAccessor(bias_args, get_arg_val<uint32_t>(4));
++        const uint32_t tile_bytes = get_tile_size(cb_bias);
++        cb_reserve_back(cb_bias, count);
++        for (uint32_t n = 0; n < count; ++n) {
++            noc_async_read_tile(n_start + n, bias, get_write_ptr(cb_bias) + n * tile_bytes);
++        }
++        noc_async_read_barrier();
++        cb_push_back(cb_bias, count);
++    }
++}
++
++// Reads this core's bias tiles, streams its even weight blocks on RISCV_0's
++// NOC, then writes its output tiles.
 +void kernel_main() {
 +    const uint32_t weight_addr = get_arg_val<uint32_t>(0);
 +    const uint32_t output_addr = get_arg_val<uint32_t>(1);
@@ -390,12 +453,15 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +
 +    constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
 +    constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
++    constexpr uint32_t cb_bias = get_named_compile_time_arg_val("cb_bias");
++    constexpr bool has_bias = get_named_compile_time_arg_val("has_bias");
 +    constexpr auto weight_args = TensorAccessorArgs<0>();
 +    constexpr auto output_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
 +    const auto weight = TensorAccessor(weight_args, weight_addr);
 +    const auto output = TensorAccessor(output_args, output_addr);
++    read_bias<has_bias, output_args.next_compile_time_args_offset()>(n_start, count, cb_bias);
 +
-+    stream_swiglu_weights<0>(weight, n_start, count, cb_weights, [] {});
++    stream_decode_weights<0>(weight, n_start, count, cb_weights, [] {});
 +
 +    Noc noc;
 +    CircularBuffer out_cb(cb_out);
@@ -408,9 +474,9 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    }
 +    noc.async_write_barrier();
 +}
-diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp
 --- /dev/null
-+++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_receiver.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp
 @@ -0,0 +1,53 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
@@ -420,7 +486,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +#include "api/dataflow/noc.h"
 +#include "api/dataflow/circular_buffer.h"
 +#include "api/dataflow/noc_semaphore.h"
-+#include "matmul_swiglu_weights.hpp"
++#include "matmul_decode_weights.hpp"
 +
 +// RISCV_1 on multicast receivers: publish activation chunks as they land
 +// and stream this core's odd weight blocks in between.
@@ -459,15 +525,15 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +            cb_in0.push_back(in0_mcast_w);
 +        }
 +    };
-+    stream_swiglu_weights<1>(weight, n_start, count, cb_weights, publish_landed);
++    stream_decode_weights<1>(weight, n_start, count, cb_weights, publish_landed);
 +    for (; chunks < num_chunks; ++chunks) {
 +        receiver_sem.wait_min(chunks + 1);
 +        cb_in0.push_back(in0_mcast_w);
 +    }
 +}
-diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_sender.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_sender.cpp
 --- /dev/null
-+++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_swiglu_in0_sender.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_sender.cpp
 @@ -0,0 +1,86 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
@@ -479,7 +545,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +#include "api/dataflow/noc_semaphore.h"
 +#include "api/dataflow/endpoints.h"
 +#include "api/core_local_mem.h"
-+#include "matmul_swiglu_weights.hpp"
++#include "matmul_decode_weights.hpp"
 +
 +// RISCV_1 on the first core of a multicast group. The activation row block
 +// stays resident in every core's L1: after one readiness handshake, stream it
@@ -552,23 +618,82 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +        noc.async_read_barrier();
 +    }
 +
-+    stream_swiglu_weights<1>(weight, n_start, count, cb_weights, [] {});
++    stream_decode_weights<1>(weight, n_start, count, cb_weights, [] {});
 +    noc.async_write_barrier();
 +}
 diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
-@@ -2062,6 +2062,9 @@
+@@ -2058,14 +2058,56 @@ bool get_broadcast_batch(
+     return broadcast_batch;
+ }
+ 
++bool is_dram_interleaved(const MemoryConfig& memory_config) {
++    return memory_config.buffer_type() == BufferType::DRAM &&
++           memory_config.memory_layout() == TensorMemoryLayout::INTERLEAVED;
++}
++
++// A 1D matmul of one tile row of BF16 activations times DRAM-interleaved
++// weights, as in LLM decode, with at least one output tile per worker core.
++// The decode matmul streams such weights on both NOCs and splits the output
++// columns evenly over the cores; with fewer output tiles, the 1D matmul keeps
++// more cores busy. Like the 1D matmul, it adds row 0 of the bias to every row.
++bool is_decode_matmul(const MatmulParams& attributes, const MatmulInputs& args) {
++    const auto& a = args.input_tensors.at(0);
++    const auto& b = args.input_tensors.at(1);
++    const bool has_output = !args.optional_output_tensors.empty() && args.optional_output_tensors[0].has_value();
++    const auto& a_shape = a.padded_shape();
++    const auto& b_shape = b.padded_shape();
++    const uint32_t K = a_shape[-1];
++    const uint32_t N = b_shape[attributes.transpose_b ? -2 : -1];
++    const auto output_dtype = attributes.output_dtype.value_or(a.dtype());
++    const auto grid = a.device()->compute_with_storage_grid_size();
++    auto is_tile_row = [&](const Tensor& t, uint32_t width) {
++        return t.layout() == Layout::TILE && t.tensor_spec().tile() == tt::tt_metal::Tile() &&
++               t.padded_shape().volume() == static_cast<uint64_t>(TILE_HEIGHT) * width &&
++               is_dram_interleaved(t.memory_config());
++    };
++    const auto bias = args.optional_input_tensors.empty() ? std::nullopt : args.optional_input_tensors[0];
++    const bool bias_ok = !bias.has_value() || (is_tile_row(*bias, N) && (bias->dtype() == DataType::BFLOAT16 ||
++                                                                          bias->dtype() == DataType::FLOAT32));
++    return bias_ok && !has_output && !attributes.transpose_a && !attributes.untilize_out &&
++           !attributes.user_fused_activation.has_value() && !attributes.global_cb.has_value() &&
++           attributes.output_tile.value_or(tt::tt_metal::Tile()) == tt::tt_metal::Tile() &&
++           a.dtype() == DataType::BFLOAT16 && is_tile_row(a, K) && a.logical_shape()[-1] % TILE_WIDTH == 0 &&
++           (output_dtype == DataType::BFLOAT16 || output_dtype == DataType::FLOAT32) &&
++           b.layout() == Layout::TILE && b.tensor_spec().tile() == tt::tt_metal::Tile() &&
++           b_shape.volume() == static_cast<uint64_t>(K) * N &&
++           b.logical_shape()[attributes.transpose_b ? -1 : -2] % TILE_WIDTH == 0 && N / TILE_WIDTH >= grid.x * grid.y &&
++           is_dram_interleaved(b.memory_config()) && is_dram_interleaved(attributes.output_mem_config);
++}
++
+ }  // namespace
  
  MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_factory(
-     const operation_attributes_t& operation_attributes, const tensor_args_t& /*tensor_args*/) {
+-    const operation_attributes_t& operation_attributes, const tensor_args_t& /*tensor_args*/) {
++    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
 +    if (operation_attributes.fused_swiglu) {
-+        return MatmulSwiGLUProgramFactory{};
++        return MatmulDecodeProgramFactory{};
 +    }
      const auto& config = operation_attributes.program_config.value();
  
      return std::visit(
-@@ -2122,6 +2125,28 @@
+-        [](const auto& c) -> program_factory_t {
++        [&](const auto& c) -> program_factory_t {
+             using T = std::decay_t<decltype(c)>;
+             if constexpr (std::is_same_v<T, operations::matmul::MatmulMultiCoreProgramConfig>) {
+                 return MatmulMultiCoreProgramFactory{};
+@@ -2078,6 +2120,9 @@ MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_f
+                 if (c.gather_in0) {
+                     return MatmulMeshWorkloadMultiCoreReuseMcast1DProgramFactory{};
+                 }
++                if (!c.fused_activation.has_value() && is_decode_matmul(operation_attributes, tensor_args)) {
++                    return MatmulDecodeProgramFactory{};
++                }
+                 return MatmulMultiCoreReuseMcast1DProgramFactory{};
+             } else if constexpr (std::is_same_v<
+                                      T,
+@@ -2122,6 +2167,28 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
      // ---- universal checks, part 1: independent of the chosen program config ----
      validate_matmul_operand_basics(input_tensor_a, input_tensor_b, in0_tile, in1_tile);
      validate_matmul_matrix_dimensions(a_shape, b_shape, a_shape_padded, b_shape_padded, in0_tile, in1_tile);
@@ -597,7 +722,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
      validate_matmul_bfloat4_tile_dims(input_tensor_a, input_tensor_b, in0_tile, in1_tile);
      validate_matmul_optional_tensors(attributes, args);
  
-@@ -2281,8 +2306,13 @@
+@@ -2281,8 +2348,13 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
      const auto& input_tensor_b = input_tensors.at(1);
  
      // Use the compute_matmul_output_shape function to get the output shape
@@ -612,7 +737,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
  
      const auto& a_shape_padded =
          operations::matmul::utilities::get_matmul_tensor_padded_shape(input_tensor_a, attributes.transpose_a);
-@@ -2757,7 +2787,8 @@
+@@ -2757,7 +2829,8 @@ MatmulParams create_matmul_attributes(
          parameters.transpose_b,
          output_tile,
          parameters.global_cb,
@@ -625,18 +750,18 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
 diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
 --- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
-@@ -22,6 +22,7 @@
+@@ -22,6 +22,7 @@ struct MatmulDeviceOperation {
      using tensor_return_value_t = std::vector<Tensor>;
  
      using program_factory_t = std::variant<
-+        MatmulSwiGLUProgramFactory,
++        MatmulDecodeProgramFactory,
          MatmulMultiCoreProgramFactory,
          MatmulMultiCoreReuseOptimizedProgramFactory,
          MatmulMultiCoreReuseMcast1DProgramFactory,
 diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
 --- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
-@@ -27,6 +27,7 @@
+@@ -27,6 +27,7 @@ struct MatmulParams {
      std::optional<tt::tt_metal::Tile> output_tile = std::nullopt;
      std::optional<tt::tt_metal::experimental::GlobalCircularBuffer> global_cb = std::nullopt;
      std::optional<tt::tt_metal::SubDeviceId> sub_device_id = std::nullopt;
@@ -647,7 +772,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-@@ -411,6 +411,29 @@
+@@ -411,6 +411,25 @@ Tensor matmul(
          optional_output_tensor);
  }
  
@@ -660,11 +785,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 +    ttnn::prim::MatmulParams params;
 +    params.output_mem_config = memory_config.value_or(ttnn::DRAM_MEMORY_CONFIG);
 +    params.output_dtype = dtype;
-+    auto swiglu_compute_kernel_config = compute_kernel_config.value_or(DeviceComputeKernelConfig{});
-+    swiglu_compute_kernel_config.fp32_dest_acc_en = true;
-+    swiglu_compute_kernel_config.dst_full_sync_en = true;
-+    swiglu_compute_kernel_config.packer_l1_acc = false;
-+    params.compute_kernel_config = swiglu_compute_kernel_config;
++    params.compute_kernel_config = compute_kernel_config;
 +    params.fused_swiglu = true;
 +    auto attributes = ttnn::prim::create_matmul_attributes(
 +        input_tensor_a, input_tensor_b, params, {std::nullopt});
@@ -680,7 +801,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/matmul/matmul.hpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.hpp
-@@ -45,6 +45,15 @@
+@@ -45,6 +45,15 @@ Tensor matmul(
      const std::optional<const GlobalCircularBuffer>& global_cb = std::nullopt,
      const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id = std::nullopt);
  
@@ -696,7 +817,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/m
  std::vector<Tensor> matmul_batched_weights(
      const Tensor& input_tensor_a,
      const std::vector<Tensor>& input_tensors_b,
-@@ -118,6 +127,7 @@
+@@ -118,6 +127,7 @@ Tensor sparse_matmul(
  using operations::matmul::addmm;
  using operations::matmul::linear;
  using operations::matmul::matmul;
