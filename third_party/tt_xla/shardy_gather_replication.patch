@@ -1,13 +1,16 @@
 diff --git a/shardy/dialect/sdy/transforms/propagation/op_sharding_rule_registry.cc b/shardy/dialect/sdy/transforms/propagation/op_sharding_rule_registry.cc
 --- a/shardy/dialect/sdy/transforms/propagation/op_sharding_rule_registry.cc
 +++ b/shardy/dialect/sdy/transforms/propagation/op_sharding_rule_registry.cc
-@@ -850,6 +850,11 @@
+@@ -850,6 +850,14 @@
              dimNums.getStartIndicesBatchingDims(),
              [&](int64_t inputDim, int64_t indicesDim, int64_t slicesDim,
                  int64_t factorSize, FactorType factorType, bool isBlocked) {
-+              // TT-MLIR does not yet lower shard-relative gather indices and
-+              // mask results owned by other shards. A sum alone is incorrect.
-+              if (factorType == FactorType::kReduction) {
++              // Keeping the operand dimension sharded needs indices relative to
++              // each shard, which TT-MLIR only computes for a gather that
++              // indexes just this dimension (shiftGatherIndicesIntoShards in
++              // UpdateGlobalToLocalShapes.cpp checks the same condition).
++              if (factorType == FactorType::kReduction &&
++                  dimNums.getStartIndexMap() != ArrayRef<int64_t>{inputDim}) {
 +                factorType = FactorType::kNeedReplication;
 +              }
                builder.addFactor({inputDim, indicesDim}, slicesDim, factorSize,
