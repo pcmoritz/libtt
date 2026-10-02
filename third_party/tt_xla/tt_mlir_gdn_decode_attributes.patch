@@ -43,11 +43,11 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
    output: tt.target.ttnn.TensorRef;
 +  query_head_offset: uint32;
 +  key_head_offset: uint32;
++  value_head_offset: uint32;
 +  num_key_heads: uint32;
 +  normalize: bool;
 +  eps: float;
 +  query_scale: float = 1.0;
-+  value_head_offset: uint32;
  }
  
  table CausalConv1dUpdateOp {
@@ -58,8 +58,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        auto type = getTypeConverter()->convertType(op.getResult(1).getType());
        auto result = rewriter.create<ttir::GatedDeltaDecodeOp>(
            op.getLoc(), type, adaptor.getOperands());
-+      // Optional FFI attributes: query/key/value head offsets and the key head
-+      // count for grouped or flat inputs, and in-kernel normalization.
++      // Optional FFI attributes: the head layout of the inputs and in-kernel
++      // normalization (see ttnn::transformer::gated_delta_decode).
 +      if (mlir::DictionaryAttr config = getFfiBackendConfig(op)) {
 +        for (StringRef attrName : {"query_head_offset", "key_head_offset",
 +                                   "value_head_offset", "num_key_heads"}) {
@@ -102,25 +102,26 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
        cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
 -                                  std::nullopt));
 +                                  std::nullopt),
-+      op.getQueryHeadOffset(), op.getKeyHeadOffset(), op.getNumKeyHeads(),
-+      op.getNormalizeEps().has_value(),
++      op.getQueryHeadOffset(), op.getKeyHeadOffset(), op.getValueHeadOffset(),
++      op.getNumKeyHeads(), op.getNormalizeEps().has_value(),
 +      op.getNormalizeEps().value_or(llvm::APFloat(0.0f)).convertToFloat(),
-+      op.getQueryScale().convertToFloat(), op.getValueHeadOffset());
++      op.getQueryScale().convertToFloat());
  }
  
  ::flatbuffers::Offset<::tt::target::ttnn::CausalConv1dUpdateOp>
 diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
 --- a/runtime/lib/ttnn/operations/transformer/recurrent.cpp
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
-@@ -66,7 +66,10 @@
+@@ -66,7 +66,11 @@
        tiled(get(op->a_log()), ::ttnn::DataType::FLOAT32),
        tiled(get(op->dt_bias()), ::ttnn::DataType::FLOAT32), get(op->cache()),
        tiled(get(op->state_indices()), ::ttnn::DataType::INT32),
 -      tiled(get(op->has_initial_state()), ::ttnn::DataType::BFLOAT16));
 +      tiled(get(op->has_initial_state()), ::ttnn::DataType::BFLOAT16),
-+      op->query_head_offset(), op->key_head_offset(), op->num_key_heads(),
++      op->query_head_offset(), op->key_head_offset(), op->value_head_offset(),
++      op->num_key_heads(),
 +      op->normalize() ? std::optional<float>(op->eps()) : std::nullopt,
-+      op->query_scale(), op->value_head_offset());
++      op->query_scale());
    put(pool, op->output(), output);
  }
  

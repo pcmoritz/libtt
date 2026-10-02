@@ -357,7 +357,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,55 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -373,10 +373,9 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode
 +// the blocks with index % 2 == parity. For each K row, a block holds the
 +// group's weight tiles of every half in turn: a plain matmul has one half, and
 +// SwiGLU's [up | gate] weight has two, read gate first. A transposed weight
-+// is stored [N, K]. Every block occupies
-+// the same CB space, so a narrower last group keeps the block size constant.
-+// `poll` runs while waiting for CB space, so the caller can make other
-+// progress.
++// is stored [N, K]. Every block occupies the same CB space, so a narrower last
++// group keeps the block size constant. `poll` runs while waiting for CB space,
++// so the caller can make other progress.
 +template <uint32_t parity, typename Accessor, typename Poll>
 +FORCE_INLINE void stream_decode_weights(
 +    const Accessor& weight, uint32_t n_start, uint32_t count, uint32_t cb, Poll poll) {
