@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 --- a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
-@@ -531,6 +531,134 @@
+@@ -531,6 +531,141 @@
    return mlir::success();
  }
  
@@ -62,6 +62,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +        loc, mlir::RankedTensorType::get({}, indexType),
 +        builder.create<mlir::stablehlo::PartitionIdOp>(loc));
 +    mlir::Value shard;
++    int64_t shards = 1;
 +    for (mlir::sdy::AxisRefAttr axis : axes) {
 +      int64_t stride = 1;
 +      for (mlir::sdy::MeshAxisAttr meshAxis : llvm::reverse(mesh.getAxes())) {
@@ -70,10 +71,11 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +        }
 +        stride *= meshAxis.getSize();
 +      }
-+      if (mlir::sdy::SubAxisInfoAttr subAxis = axis.getSubAxisInfo()) {
-+        stride *= subAxis.getPreSize();
-+      }
 +      int64_t size = axis.getSize(mesh);
++      // A sub-axis "x":(m)k splits x into [m, k, rest], major to minor.
++      if (mlir::sdy::SubAxisInfoAttr subAxis = axis.getSubAxisInfo()) {
++        stride *= mesh.getAxisSize(axis.getName()) / (subAxis.getPreSize() * size);
++      }
 +      mlir::Value coord = builder.create<mlir::stablehlo::RemOp>(
 +          loc, builder.create<mlir::stablehlo::DivOp>(loc, device, index(stride)),
 +          index(size));
@@ -83,6 +85,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +                                                                 index(size)),
 +                          coord)
 +                    : coord;
++      shards *= size;
 +    }
 +    int64_t shardSize = gather.getOperand().getType().getDimSize(dim);
 +    mlir::Value offset = builder.create<mlir::stablehlo::BroadcastInDimOp>(
@@ -90,8 +93,12 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +        builder.create<mlir::stablehlo::MulOp>(loc, shard, index(shardSize)),
 +        builder.getDenseI64ArrayAttr({}));
 +
++    // Gather clamps indices into the whole operand, so clamp before finding
++    // the owning shard.
++    mlir::Value global = builder.create<mlir::stablehlo::ClampOp>(
++        loc, indicesType, index(0), indices, index(shards * shardSize - 1));
 +    mlir::Value local =
-+        builder.create<mlir::stablehlo::SubtractOp>(loc, indices, offset);
++        builder.create<mlir::stablehlo::SubtractOp>(loc, global, offset);
 +    mlir::Value clamped = builder.create<mlir::stablehlo::ClampOp>(
 +        loc, indicesType, index(0), local, index(shardSize - 1));
 +    gather.getStartIndicesMutable().assign(clamped);
@@ -136,7 +143,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
  class UpdateGlobalToLocalShapesPass
      : public impl::UpdateGlobalToLocalShapesPassBase<
            UpdateGlobalToLocalShapesPass> {
-@@ -613,6 +741,8 @@
+@@ -613,6 +748,8 @@
        }
      });
  

@@ -119,3 +119,23 @@ def test_lookup_in_shard_map(tmp_path):
             jax.device_put(ids, NamedSharding(mesh, P())),
         )
     np.testing.assert_array_equal(np.asarray(out), table[ids] * 2)
+
+
+def test_out_of_range_indices_are_clamped():
+    # Gather clamps indices into the whole table, so an index past the end
+    # reads the last row rather than zeros. (JAX wraps negative indices.)
+    devices = jax.devices("tt")
+    if len(devices) < 2:
+        pytest.skip("needs at least two devices")
+    mesh = jax.make_mesh((1, len(devices)), ("data", "tensor"), devices=devices)
+    rows = 64 * len(devices)
+    table = np.random.default_rng(0).normal(size=(rows, 256)).astype(np.float32)
+    ids = np.array([rows, rows + 70, 2**30, rows + 1, 0, rows - 1, 64, 3], np.int32)
+
+    run = jax.jit(lambda t, i: t.at[i].get(mode="clip", out_sharding=NamedSharding(mesh, P())))
+    with jax.set_mesh(mesh):
+        out = run(
+            jax.device_put(table, NamedSharding(mesh, P("tensor", None))),
+            jax.device_put(ids, NamedSharding(mesh, P())),
+        )
+    np.testing.assert_array_equal(np.asarray(out), table[np.minimum(ids, rows - 1)])
