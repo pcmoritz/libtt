@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 --- a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
-@@ -531,6 +531,166 @@
+@@ -531,6 +531,162 @@
    return mlir::success();
  }
  
@@ -81,13 +81,9 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +        stride *= subAxis.getPreSize();
 +      }
 +      int64_t size = axis.getSize(mesh);
-+      mlir::Value coord = device;
-+      if (stride > 1) {
-+        coord = builder.create<mlir::stablehlo::DivOp>(loc, coord, index(stride));
-+      }
-+      if (mesh.getTotalSize() / stride > size) {
-+        coord = builder.create<mlir::stablehlo::RemOp>(loc, coord, index(size));
-+      }
++      mlir::Value coord = builder.create<mlir::stablehlo::RemOp>(
++          loc, builder.create<mlir::stablehlo::DivOp>(loc, device, index(stride)),
++          index(size));
 +      shard = shard ? builder.create<mlir::stablehlo::AddOp>(
 +                          loc,
 +                          builder.create<mlir::stablehlo::MulOp>(loc, shard,
@@ -168,7 +164,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
  class UpdateGlobalToLocalShapesPass
      : public impl::UpdateGlobalToLocalShapesPassBase<
            UpdateGlobalToLocalShapesPass> {
-@@ -591,6 +751,8 @@
+@@ -591,6 +747,8 @@
  
      globalMeshOp = parsedMeshOps[0];
  
