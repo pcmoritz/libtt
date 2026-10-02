@@ -374,7 +374,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  #include "ttnn/operations/math.hpp"
  #include <tt-metalium/work_split.hpp>
  #include <tt-metalium/constants.hpp>
-@@ -423,6 +424,7 @@
+@@ -437,6 +438,7 @@
          reduction_cb_index,  // reduction_cb_index
          out_cb_index,        // out_cb_index
      };
@@ -433,20 +433,22 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/kerne
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/kernels/reduce_tiles.hpp
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,41 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +//
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#pragma once
 +
-+// Max and min reductions for kernels that otherwise sum with add_tiles. The
-+// host defines REDUCE_OP and REDUCE_OP_INIT (see reduce_op_defines) to the SFPU
-+// function, which reads both operands from DST: results live in DST[0, n) and
-+// second operands in DST[n, 2n), so n is at most half of DST.
++// Max, min and float32 sum reductions for kernels that otherwise sum with
++// add_tiles. The host defines REDUCE_OP and REDUCE_OP_INIT (see
++// reduce_op_defines) to the SFPU function, which reads both operands from DST:
++// results live in DST[0, n) and second operands in DST[n, 2n), so n is at most
++// half of DST.
 +#ifdef REDUCE_OP
 +
 +#include "api/compute/binary_max_min.h"
++#include "api/compute/eltwise_binary_sfpu.h"
 +#include "api/compute/tile_move_copy.h"
 +
 +// DST[dst + i] = tile first + i of cb, for i < num_tiles.
@@ -484,19 +486,33 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/reduc
  
  #include "ttnn/operations/experimental/ccl/composite_common.hpp"
  
-@@ -278,4 +279,32 @@
+@@ -278,4 +279,46 @@
      worker_rt_args.push_back(static_cast<uint32_t>(termination_master_virtual_core.y));
  }
  
++bool reduce_op_reads_dst(reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype) {
++    return math_op != reduction_common::ReduceType::Sum || dtype == tt::tt_metal::DataType::FLOAT32;
++}
++
 +bool reduce_op_uses_fp32_dest(reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype) {
-+    return math_op != reduction_common::ReduceType::Sum &&
-+           (dtype == tt::tt_metal::DataType::FLOAT32 || dtype == tt::tt_metal::DataType::INT32 ||
-+            dtype == tt::tt_metal::DataType::UINT32);
++    if (math_op == reduction_common::ReduceType::Sum) {
++        return dtype == tt::tt_metal::DataType::FLOAT32;
++    }
++    return dtype == tt::tt_metal::DataType::FLOAT32 || dtype == tt::tt_metal::DataType::INT32 ||
++           dtype == tt::tt_metal::DataType::UINT32;
 +}
 +
 +void configure_reduce_op(
 +    tt::tt_metal::ComputeConfig& config, reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype) {
 +    if (math_op == reduction_common::ReduceType::Sum) {
++        // add_tiles adds on the FPU, whose source registers keep only TF32, so
++        // float32 sums go through the SFPU with float32 DST instead.
++        if (dtype == tt::tt_metal::DataType::FLOAT32) {
++            config.defines["REDUCE_OP"] = "add_binary_tile";
++            config.defines["REDUCE_OP_INIT"] = "add_binary_tile_init";
++            config.fp32_dest_acc_en = true;
++            config.unpack_to_dest_mode.assign(NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::UnpackToDestFp32);
++        }
 +        return;
 +    }
 +    TT_FATAL(
@@ -538,16 +554,21 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/reduc
  #include "ttnn/tensor/tensor.hpp"
  
  namespace ttnn::experimental::ccl {
-@@ -96,4 +99,13 @@
+@@ -96,4 +99,18 @@
      tt::tt_metal::ProgramDescriptor& desc,
      tt::tt_metal::KernelDescriptor::RTArgList& worker_rt_args);
  
-+// Whether max or min of 32-bit data needs a 32-bit DST.
++// Whether the reduction reads both operands from DST (max, min and float32
++// sums), so it can only use half of DST.
++bool reduce_op_reads_dst(reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype);
++
++// Whether max or min of 32-bit data, or a float32 sum, needs a 32-bit DST.
 +bool reduce_op_uses_fp32_dest(reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype);
 +
-+// Configures how a reduction kernel combines tiles. Sums need nothing; max and
-+// min name the SFPU functions for the data type in REDUCE_OP and REDUCE_OP_INIT
-+// and unpack 32-bit data straight into a 32-bit DST so it compares exactly.
++// Configures how a reduction kernel combines tiles. Sums need nothing, except
++// float32 sums; those, max and min name the SFPU functions for the data type in
++// REDUCE_OP and REDUCE_OP_INIT and unpack 32-bit data straight into a 32-bit
++// DST so they are exact.
 +void configure_reduce_op(
 +    tt::tt_metal::ComputeConfig& config, reduction_common::ReduceType math_op, tt::tt_metal::DataType dtype);
 +
@@ -709,8 +730,8 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
      uint32_t num_pages_per_packet = packet_size_bytes / l1_scratch_cb_page_size_bytes;
      uint32_t num_tiles_to_write_per_packet = std::min(max_target_noc_addresses_per_packet, num_pages_per_packet);
      uint32_t tile_granularity = std::min(4 * num_tiles_to_write_per_packet, max_dst_size);
-+    if (math_op != reduction_common::ReduceType::Sum) {
-+        // Max and min read both operands from DST, so they use half of it.
++    if (::ttnn::experimental::ccl::reduce_op_reads_dst(math_op, input_tensor.dtype())) {
++        // Max, min and float32 sums read both operands from DST, so they use half of it.
 +        tile_granularity = std::min(tile_granularity, max_dst_size / 2);
 +    }
      uint32_t cb_num_pages = 2 * tile_granularity;  // double buffering
@@ -749,8 +770,8 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
      uint32_t max_scatter_write_pages = 2;
      uint32_t tiles_to_write_per_packet = std::min(num_pages_per_packet, max_scatter_write_pages);
      uint32_t tile_granularity = std::min(4 * num_pages_per_packet, max_dst_size);
-+    if (math_op != reduction_common::ReduceType::Sum) {
-+        // Max and min read both operands from DST, so they use half of it.
++    if (::ttnn::experimental::ccl::reduce_op_reads_dst(math_op, input_tensor.dtype())) {
++        // Max, min and float32 sums read both operands from DST, so they use half of it.
 +        tile_granularity = std::min(tile_granularity, max_dst_size / 2);
 +    }
      uint32_t cb_num_pages = 3 * tile_granularity;  // triple buffering
