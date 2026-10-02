@@ -30,7 +30,7 @@ def gated_delta_decode(state, qkv, b, a, A_log, dt_bias, indices, initial):
         # Tiny and zero q and k, whose norms the epsilon dominates.
         (1, 4, 3, 1e-4, np.float32),
         (1, 4, 3, 0.0, np.float32),
-        # A BFLOAT16 convolution output, which the runtime converts to FP32.
+        # BFLOAT16 convolution output and gate logits, as the model passes them.
         (1, 4, 3, 1.0, jnp.bfloat16),
     ],
 )
@@ -43,7 +43,9 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale, dty
 
     def decode(state, qk, v, b, a, A_log, dt_bias, indices, initial):
         mixed = jnp.concatenate([qk.reshape(batch, -1), v.reshape(batch, -1)], axis=1).astype(dtype)
-        return gated_delta_decode(state, mixed, b, a, A_log, dt_bias, indices, initial)
+        return gated_delta_decode(
+            state, mixed, b.astype(dtype), a.astype(dtype), A_log, dt_bias, indices, initial
+        )
 
     device = jax.devices("tt")[0]
     run = jax.jit(
@@ -56,8 +58,8 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale, dty
         # The inputs as the kernel sees them, rounded to dtype.
         qk = (rng.normal(0, 1, (batch, 2 * key_heads, dim)) * qk_scale).astype(dtype).astype(np.float32)
         v = rng.normal(0, 0.5, (batch, heads, dim)).astype(dtype).astype(np.float32)
-        b = rng.normal(0, 1, (batch, heads)).astype(np.float32)
-        a = rng.normal(0, 1, (batch, heads)).astype(np.float32)
+        b = rng.normal(0, 1, (batch, heads)).astype(dtype).astype(np.float32)
+        a = rng.normal(0, 1, (batch, heads)).astype(dtype).astype(np.float32)
         A_log = rng.uniform(-1, 1, heads).astype(np.float32)
         dt_bias = rng.uniform(-1, 1, heads).astype(np.float32)
         state = rng.normal(0, 0.05, (slots, heads, dim, dim)).astype(np.float32)

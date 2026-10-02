@@ -528,7 +528,7 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.h b/runtime/lib/t
 diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,101 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +#include "operations/transformer/recurrent.h"
@@ -554,6 +554,12 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +  return result.memory_config() == config
 +             ? result
 +             : ::ttnn::to_memory_config(result, config);
++}
++// The model's activations stay BFLOAT16; anything else becomes FLOAT32.
++::ttnn::Tensor activation(const ::ttnn::Tensor &input) {
++  return tiled(input, input.dtype() == ::ttnn::DataType::BFLOAT16
++                          ? ::ttnn::DataType::BFLOAT16
++                          : ::ttnn::DataType::FLOAT32);
 +}
 +void put(ProgramTensorPool &pool, const ::tt::target::ttnn::TensorRef *ref,
 +         const ::ttnn::Tensor &tensor) {
@@ -589,9 +595,8 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +    return pool.getTTNNTensorAndValidate(ref);
 +  };
 +  auto output = ::ttnn::transformer::gated_delta_decode(
-+      tiled(get(op->qkv()), ::ttnn::DataType::FLOAT32),
-+      tiled(get(op->beta_logits()), ::ttnn::DataType::FLOAT32),
-+      tiled(get(op->delta_time()), ::ttnn::DataType::FLOAT32),
++      activation(get(op->qkv())), activation(get(op->beta_logits())),
++      activation(get(op->delta_time())),
 +      tiled(get(op->a_log()), ::ttnn::DataType::FLOAT32),
 +      tiled(get(op->dt_bias()), ::ttnn::DataType::FLOAT32), get(op->cache()),
 +      tiled(get(op->state_indices()), ::ttnn::DataType::INT32),
@@ -609,7 +614,8 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +      tiled(get(op->input()), ::ttnn::DataType::BFLOAT16), get(op->cache()),
 +      tiled(get(op->weight()), ::ttnn::DataType::BFLOAT16),
 +      tiled(get(op->state_indices()), ::ttnn::DataType::INT32),
-+      tiled(get(op->has_initial_state()), ::ttnn::DataType::BFLOAT16));
++      tiled(get(op->has_initial_state()), ::ttnn::DataType::BFLOAT16),
++      utils::getDataType(op->output()));
 +  put(pool, op->output(), output);
 +}
 +
