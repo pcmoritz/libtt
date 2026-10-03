@@ -1,0 +1,361 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNBase.td b/include/ttmlir/Dialect/TTNN/IR/TTNNBase.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNBase.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNBase.td
+@@ -63,6 +63,16 @@
+         Op<TTNN_Dialect, mnemonic, [Pure, CheckTileTypeTrait, TTNN_WorkaroundInterface, DeclareOpInterfaceMethods<TTNN_MemoryConfigOpInterface>, DeclareOpInterfaceMethods<TTNN_DtypeOpInterface>] #
+         IfOpModelRequired<traits>.value # traits>;
+ 
++// An op whose result is a new buffer or device resource. Two of them are two
++// resources even when their operands and attributes match (the slots of a
++// trace, the scratch of a distributed op, its semaphores), so the op is not
++// Pure: its result carries an allocation effect, declare it as
++// Res<..., [MemAlloc]>, and CSE never merges two of them. An unused one is
++// still dead.
++class TTNN_AllocationOp<string mnemonic, list<Trait> traits = []> :
++        Op<TTNN_Dialect, mnemonic, [CheckTileTypeTrait, TTNN_WorkaroundInterface, DeclareOpInterfaceMethods<TTNN_MemoryConfigOpInterface>, DeclareOpInterfaceMethods<TTNN_DtypeOpInterface>] #
++        IfOpModelRequired<traits>.value # traits>;
++
+ class TTNN_InplaceOp<string mnemonic, list<Trait> traits = []> :
+         Op<TTNN_Dialect, mnemonic, [MemoryEffects<[MemWrite]>, TTNN_WorkaroundInterface, DeclareOpInterfaceMethods<TTNN_MemoryConfigOpInterface>, DeclareOpInterfaceMethods<TTNN_DtypeOpInterface>] #
+         IfOpModelRequired<traits>.value # traits>;
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -3154,16 +3154,17 @@
+ class TTNN_CreationOp<string mnemonic, list<Trait> traits = []> :
+     TTNN_Op<mnemonic, [TTCore_CreationOpTrait, TTNN_TensorSpecInterface, TTNN_DeviceOperandInterface, TTNN_LayoutOpInterface] # traits>;
+ 
+-def TTNN_EmptyOp : TTNN_CreationOp<"empty", [TTCore_NonCacheableTrait]> {
++def TTNN_EmptyOp : TTNN_AllocationOp<"empty", [TTCore_CreationOpTrait, TTNN_TensorSpecInterface, TTNN_DeviceOperandInterface, TTNN_LayoutOpInterface, TTCore_NonCacheableTrait]> {
+     let summary = "Empty op.";
+     let description = [{
+-      Tensor empty operation
++      Tensor empty operation: allocates a buffer, which ops may then write in
++      place, so two empty ops of one spec are two buffers.
+     }];
+ 
+     let arguments = (ins TTNN_Device:$device,
+                          TTNN_ShapeAttr:$shape);
+ 
+-    let results = (outs AnyRankedTensor:$result);
++    let results = (outs Res<AnyRankedTensor, "the new buffer", [MemAlloc]>:$result);
+ 
+     let hasVerifier = 1;
+ }
+@@ -4669,7 +4670,7 @@
+   let hasVerifier = 1;
+ }
+ 
+-def TTNN_CreateGlobalSemaphoreOp : TTNN_Op<"create_global_semaphore", [TTCore_CreationOpTrait, TTCore_NonCacheableTrait, OpModelExempt]> {
++def TTNN_CreateGlobalSemaphoreOp : TTNN_AllocationOp<"create_global_semaphore", [TTCore_CreationOpTrait, TTCore_NonCacheableTrait, OpModelExempt]> {
+     let summary = "Create global semaphore op.";
+     let description = [{
+       Creates a global semaphore with the specified core range and initial value.
+@@ -4698,7 +4699,7 @@
+     let arguments = (ins TTNN_Device:$device,
+                          OptionalAttr<UI32Attr>:$initial_value,
+                          TTNN_CoreRangeSetAttr:$core_range_set);
+-    let results = (outs TTNN_GlobalSemaphore:$result);
++    let results = (outs Res<TTNN_GlobalSemaphore, "the new semaphore", [MemAlloc]>:$result);
+ }
+ 
+ def TTNN_ResetGlobalSemaphoreOp : TTNN_Op<"reset_global_semaphore", [OpModelExempt]> {
+@@ -4784,7 +4785,7 @@
+   let hasVerifier = 1;
+ }
+ 
+-def TTNN_AllocateMoeComputeSemaphoreOp : TTNN_Op<"allocate_moe_compute_semaphore", [TTCore_CreationOpTrait, TTCore_NonCacheableTrait, OpModelExempt]> {
++def TTNN_AllocateMoeComputeSemaphoreOp : TTNN_AllocationOp<"allocate_moe_compute_semaphore", [TTCore_CreationOpTrait, TTCore_NonCacheableTrait, OpModelExempt]> {
+     let summary = "Allocate the moe_compute A2A combine semaphore.";
+     let description = [{
+       Creates the cross-device global semaphore used by `ttnn.moe_compute`'s
+@@ -4804,7 +4805,7 @@
+                          UI32Attr:$hidden_size,
+                          OptionalAttr<UI32Attr>:$initial_value,
+                          TTNN_CoreRangeSetAttr:$mux_core_range_set);
+-    let results = (outs TTNN_GlobalSemaphore:$result);
++    let results = (outs Res<TTNN_GlobalSemaphore, "the new semaphore", [MemAlloc]>:$result);
+ }
+ 
+ #endif
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -260,6 +260,22 @@
+   return mlir::failure();
+ }
+ 
++// The cache ops (fill_cache, update_cache, the paged and recurrent updates)
++// write their cache operand in place and have no result, while the custom call
++// they lower returns the updated cache. The updated cache gets its own SSA
++// value: an optimization barrier on the cache, created after the write. Reads
++// after the update use that value and reads before it use the operand, so CSE
++// cannot merge a read after the update into one before it, and the barrier's
++// side effects keep it after the write. The barriers fold away before
++// deallocation, after the last CSE.
++static mlir::Value createUpdatedCache(mlir::OpBuilder &builder,
++                                      mlir::Location loc, mlir::Value cache) {
++  return builder
++      .create<mlir::tt::ttcore::OptimizationBarrierOp>(
++          loc, mlir::TypeRange{cache.getType()}, mlir::ValueRange{cache})
++      .getResult(0);
++}
++
+ namespace {
+ template <typename SrcOp, typename DestOp,
+           typename Adaptor = typename SrcOp::Adaptor>
+@@ -7909,7 +7925,8 @@
+       );
+     }
+ 
+-    rewriter.replaceOp(scatterOp, cache);
++    rewriter.replaceOp(scatterOp,
++                       createUpdatedCache(rewriter, scatterOp.getLoc(), cache));
+ 
+     return mlir::success();
+   }
+@@ -9967,11 +9984,12 @@
+     auto cache = adaptor.getOperands()[0];
+     auto input = adaptor.getOperands()[1];
+ 
+-    // ttir.fill_cache mutates the cache in place and has no result; rewire the
+-    // custom_call result to the cache operand.
++    // ttir.fill_cache mutates the cache in place and has no result; the
++    // custom_call result is the updated cache.
+     rewriter.create<ttir::FillCacheOp>(srcOp.getLoc(), cache, input,
+                                        batchOffsetInt);
+-    rewriter.replaceOp(srcOp, cache);
++    rewriter.replaceOp(srcOp,
++                       createUpdatedCache(rewriter, srcOp.getLoc(), cache));
+ 
+     return success();
+   }
+@@ -10043,11 +10061,12 @@
+     auto input = adaptor.getOperands()[1];
+     auto updateIndex = adaptor.getOperands()[2];
+ 
+-    // ttir.update_cache mutates the cache in place and has no result; rewire
+-    // the custom_call result to the cache operand.
++    // ttir.update_cache mutates the cache in place and has no result; the
++    // custom_call result is the updated cache.
+     rewriter.create<ttir::UpdateCacheOp>(srcOp.getLoc(), cache, input,
+                                          updateIndex, batchOffsetInt);
+-    rewriter.replaceOp(srcOp, cache);
++    rewriter.replaceOp(srcOp,
++                       createUpdatedCache(rewriter, srcOp.getLoc(), cache));
+ 
+     return success();
+   }
+@@ -10114,10 +10133,11 @@
+     }
+ 
+     // ttir.paged_update_cache mutates the cache in place and has no result;
+-    // rewire the custom_call result to the cache operand.
++    // the custom_call result is the updated cache.
+     rewriter.create<ttir::PagedUpdateCacheOp>(
+         srcOp.getLoc(), cache, input, updateIndex, shareCache, pageTable);
+-    rewriter.replaceOp(srcOp, cache);
++    rewriter.replaceOp(srcOp,
++                       createUpdatedCache(rewriter, srcOp.getLoc(), cache));
+ 
+     return success();
+   }
+@@ -10187,8 +10207,8 @@
+ 
+ namespace {
+ // Explicit recurrent calls use the same in-place cache contract as paged KV
+-// ops. The FFI returns an alias for functional JAX; the dialect retains the
+-// cache operand.
++// ops. The FFI returns an alias for functional JAX; the dialect op writes the
++// cache operand, and the alias becomes the updated cache (createUpdatedCache).
+ class StableHLORecurrentOpConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
+ public:
+@@ -10220,7 +10240,9 @@
+       auto type = getTypeConverter()->convertType(op.getResult(1).getType());
+       auto result = rewriter.create<ttir::GatedDeltaDecodeOp>(
+           op.getLoc(), type, adaptor.getOperands());
+-      rewriter.replaceOp(op, {adaptor.getOperands()[0], result.getResult()});
++      rewriter.replaceOp(
++          op, {createUpdatedCache(rewriter, op.getLoc(), adaptor.getOperands()[0]),
++               result.getResult()});
+       return success();
+     }
+     if (name == "tt.causal_conv1d_update") {
+@@ -10233,7 +10255,9 @@
+       auto type = getTypeConverter()->convertType(op.getResult(1).getType());
+       auto result = rewriter.create<ttir::CausalConv1dUpdateOp>(
+           op.getLoc(), type, adaptor.getOperands());
+-      rewriter.replaceOp(op, {adaptor.getOperands()[0], result.getResult()});
++      rewriter.replaceOp(
++          op, {createUpdatedCache(rewriter, op.getLoc(), adaptor.getOperands()[0]),
++               result.getResult()});
+       return success();
+     }
+     if (name == "tt.state_pool_update") {
+@@ -10245,7 +10269,8 @@
+       }
+       rewriter.create<ttir::StatePoolUpdateOp>(op.getLoc(), TypeRange{},
+                                                adaptor.getOperands());
+-      rewriter.replaceOp(op, adaptor.getOperands()[0]);
++      rewriter.replaceOp(
++          op, createUpdatedCache(rewriter, op.getLoc(), adaptor.getOperands()[0]));
+       return success();
+     }
+     return failure();
+@@ -10288,10 +10313,11 @@
+         adaptor.getOperands().size() == 4 ? adaptor.getOperands()[3] : nullptr;
+ 
+     // ttir.paged_fill_cache mutates the cache in place and has no result;
+-    // rewire the custom_call result to the cache operand.
++    // the custom_call result is the updated cache.
+     rewriter.create<ttir::PagedFillCacheOp>(srcOp.getLoc(), cache, input,
+                                             pageTable, batchIdxTensor);
+-    rewriter.replaceOp(srcOp, cache);
++    rewriter.replaceOp(srcOp,
++                       createUpdatedCache(rewriter, srcOp.getLoc(), cache));
+ 
+     return success();
+   }
+diff --git a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp b/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
+--- a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
++++ b/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
+@@ -2,6 +2,7 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
+ 
++#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+ #include "ttmlir/Dialect/TTCore/IR/Utils.h"
+ #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
+ #include "ttmlir/Dialect/TTIR/IR/TTIROpsInterfaces.h"
+@@ -29,7 +30,14 @@
+       llvm::DenseMap<BlockArgument, bool> cacheArgs;
+ 
+       funcOp.walk([&](CacheOpInterface cacheOp) {
++        // A later update of a cache writes the barrier that versions the
++        // earlier one (see createUpdatedCache); look through those.
+         mlir::Value cacheValue = cacheOp.getCache();
++        while (auto barrier =
++                   cacheValue.getDefiningOp<ttcore::OptimizationBarrierOp>()) {
++          cacheValue = barrier.getInputs()[mlir::cast<mlir::OpResult>(cacheValue)
++                                               .getResultNumber()];
++        }
+         bool isRecurrent =
+             mlir::isa<GatedDeltaDecodeOp, CausalConv1dUpdateOp, StatePoolUpdateOp>(
+                 cacheOp.getOperation());
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -515,6 +515,12 @@
+     // Workarounds pass and Layout decompositions can leave behind redundant
+     // typecast->typecast chains. Canonicalize them away to save memory.
+     devicePm.addPass(mlir::createCanonicalizerPass());
++    // The layout pass converts every use of a value on its own, so a value
++    // read by many ops (a decode step's state indices, by every layer) gets the
++    // same tilize or typecast per use. CSE keeps one. It is safe this late
++    // because cache updates version the cache (optimization barriers, folded
++    // below) and buffer and semaphore creations are allocations, not Pure.
++    devicePm.addPass(mlir::createCSEPass());
+ 
+     // Fold ttcore.optimization_barrier ops before deallocation.
+     devicePm.addPass(ttcore::createTTCoreOptimizationBarrierFold());
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNAllocateDistributedOpBuffers.cpp b/lib/Dialect/TTNN/Transforms/TTNNAllocateDistributedOpBuffers.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNAllocateDistributedOpBuffers.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNAllocateDistributedOpBuffers.cpp
+@@ -7,6 +7,10 @@
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
+ 
+ #include "mlir/IR/PatternMatch.h"
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/DenseSet.h"
++
++#include <tuple>
+ 
+ namespace mlir::tt::ttnn {
+ 
+@@ -17,6 +21,9 @@
+ 
+ // Walks every DistributedOpInterface op and invokes allocateBuffers. The
+ // interface implementation owns the allocation logic and is idempotent.
++// Distributed ops run one after another, so the scratch buffers they get of
++// one spec are shared: per block, the first of each spec stands in for the
++// rest. (ttnn.empty is an allocation, so CSE does not merge them.)
+ class TTNNAllocateDistributedOpBuffers
+     : public impl::TTNNAllocateDistributedOpBuffersBase<
+           TTNNAllocateDistributedOpBuffers> {
+@@ -28,8 +35,29 @@
+     ModuleOp moduleOp = getOperation();
+     IRRewriter rewriter(&getContext());
+ 
++    llvm::DenseSet<Operation *> existing;
++    moduleOp.walk([&](EmptyOp op) { existing.insert(op); });
+     moduleOp.walk(
+         [&](DistributedOpInterface op) { op.allocateBuffers(rewriter); });
++
++    using Spec = std::tuple<Block *, Type, Attribute, Value>;
++    llvm::DenseMap<Spec, EmptyOp> first;
++    llvm::SmallVector<EmptyOp> shared;
++    moduleOp.walk([&](EmptyOp op) {
++      if (existing.contains(op)) {
++        return;
++      }
++      Spec spec{op->getBlock(), op.getType(), op->getAttrDictionary(),
++                op.getDevice()};
++      if (!first.try_emplace(spec, op).second) {
++        shared.push_back(op);
++      }
++    });
++    for (EmptyOp op : shared) {
++      EmptyOp keep = first.lookup(Spec{op->getBlock(), op.getType(),
++                                       op->getAttrDictionary(), op.getDevice()});
++      rewriter.replaceOp(op, keep.getResult());
++    }
+   }
+ };
+ 
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
++#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+ #include "ttmlir/Dialect/TTCore/IR/Utils.h"
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
+@@ -31,9 +32,11 @@
+ 
+   // Ops that are safe to propagate dtype through on the kv_cache → cache_op
+   // path. Extend this list when new transparent ops appear on that path.
+-  // Currently, the list is empty, but we may want to allow certain TMs in the
+-  // future.
+-  static bool isAllowedOnCachePath(Operation *op) { return false; }
++  // The optimization barriers that version a cache after each update pass the
++  // same buffer through.
++  static bool isAllowedOnCachePath(Operation *op) {
++    return mlir::isa_and_present<ttcore::OptimizationBarrierOp>(op);
++  }
+ 
+   // Walks the linear tensor chain from `value` back through allowed ops,
+   // collecting intermediate tensor values into `chain`. Returns the
+@@ -232,6 +235,19 @@
+             });
+       });
+ 
++      // The barriers that version a converted cache after its last update
++      // (read by attention or returned) are the same buffer: give them its
++      // dtype too. In program order, so a barrier of a barrier follows.
++      funcOp.walk([&](ttcore::OptimizationBarrierOp barrier) {
++        for (auto [input, result] :
++             llvm::zip(barrier.getInputs(), barrier.getResults())) {
++          if (input.getType() != result.getType() &&
++              canPropagateDtype(funcOp, input)) {
++            result.setType(input.getType());
++          }
++        }
++      });
++
+       // Insert typecasts on the input (fill value) of each cache op
+       // so the written data matches the new cache dtype.
+       // PagedUpdateCacheOp is excluded since tt-metal enforces
