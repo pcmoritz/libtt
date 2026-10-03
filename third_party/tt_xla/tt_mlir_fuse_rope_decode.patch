@@ -1,13 +1,15 @@
 diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
 --- a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
 +++ b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
-@@ -391,6 +391,35 @@
+@@ -391,8 +391,37 @@
    return concatOp.getOperand(0);
  }
  
+-// Replace the anchor op with a ttcore.composite "rotary_embedding" that
+-// references a decomposition function.
 +Value reshapeTo(PatternRewriter &rewriter, Location loc, Value value,
 +                RankedTensorType type) {
-+  if (mlir::cast<RankedTensorType>(value.getType()) == type) return value;
++  if (value.getType() == type) return value;
 +  return rewriter.create<ReshapeOp>(
 +      loc, type, value,
 +      rewriter.getI32ArrayAttr(
@@ -34,9 +36,11 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 +  shape.back() = cacheType.getShape().back();
 +  return RankedTensorType::get(shape, cacheType.getElementType());
 +}
- // Replace the anchor op with a ttcore.composite "rotary_embedding" that
- // references a decomposition function.
++// Create a ttcore.composite "rotary_embedding", at the anchor op's location,
++// that references a decomposition function.
  // Detects self-concat cos/sin at the IR level (same as TTNN decomposition's
+ // matchSelfConcatLastDim) to choose the optimal decomposition form.
+ //
 @@ -400,10 +429,10 @@
  // so that ttnn::RotaryEmbeddingOp promotion (force-promote path) can still
  // match the expected shapes. The decomposition body uses the half-dim
@@ -52,7 +56,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
    auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
    auto cosType = mlir::cast<RankedTensorType>(cosInput.getType());
    auto sinType = mlir::cast<RankedTensorType>(sinInput.getType());
-@@ -425,11 +454,25 @@
+@@ -425,11 +454,26 @@
    moduleBuilder.insert(decompFunc);
  
    // Create the ttcore.composite op.
@@ -71,6 +75,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 +      .getResult(0);
 +}
 +
++// Replace the anchor op with a rotary composite (createRoPEComposite).
 +void replaceWithRoPEComposite(Operation *anchorOp,
 +                              mlir::PatternRewriter &rewriter, Value xSource,
 +                              Value cosInput, Value sinInput,
@@ -83,9 +88,13 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
  }
  
  } // namespace
-@@ -537,13 +580,15 @@
+@@ -535,15 +579,18 @@
+     return failure();
+   }
  
-   // Must concat on last dimension with exactly 2 operands.
+-  // Must concat on last dimension with exactly 2 operands.
++  // Must concat on the last dimension, of rank 4 or of rank 3 followed by a
++  // reshape to rank 4 (the decode form), with 2 or 3 operands.
    auto resultType = mlir::cast<RankedTensorType>(srcOp.getType());
 -  if (resultType.getRank() != 4) {
 +  ReshapeOp rank4Reshape = getRank4DecodeReshapeUser(srcOp);
@@ -104,9 +113,12 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
      return failure();
    }
  
-@@ -609,10 +654,23 @@
+@@ -607,12 +654,25 @@
+     return failure();
+   }
  
-   // Input must be 4D.
+-  // Input must be 4D.
++  // Input must be 4D, or rank 3 in the decode form.
    auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
 -  if (inputType.getRank() != 4) {
 +  if (inputType.getRank() != 4 && !rank4Reshape) {
@@ -129,7 +141,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
    // sub: x1*cos - x2*sin => subSlice0 = x1 (first half), subSlice1 = x2
    // add: x2*cos + x1*sin => addSlice0 = x2, addSlice1 = x1
    if (!isFirstHalfSlice(subSlice0) || !isSecondHalfSlice(subSlice1)) {
-@@ -642,37 +700,74 @@
+@@ -642,37 +702,74 @@
      return failure();
    }
  
