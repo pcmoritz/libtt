@@ -1402,6 +1402,7 @@ cc_library(
         "ttnn/cpp/ttnn/operations/experimental/reshape/view.cpp",
         "ttnn/cpp/ttnn/operations/matmul/matmul.cpp",
         "ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp",
+        "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp",
         "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_program_factory.cpp",
         "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_batched_hs_dram_sharded_program_factory.cpp",
         "ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp",
