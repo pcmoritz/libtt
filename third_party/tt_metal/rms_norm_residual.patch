@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,167 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -37,8 +37,6 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +    constexpr uint32_t cb_rstd = get_named_compile_time_arg_val("cb_rstd");
 +    constexpr uint32_t cb_norm = get_named_compile_time_arg_val("cb_norm");
 +    constexpr uint32_t rows = get_named_compile_time_arg_val("rows");
-+    // The most tiles any core has: the size of the per-tile buffers.
-+    constexpr uint32_t tiles = get_named_compile_time_arg_val("tiles");
 +    constexpr uint32_t eps = get_named_compile_time_arg_val("eps");
 +    constexpr uint32_t inv_width = get_named_compile_time_arg_val("inv_width");
 +
@@ -97,7 +95,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +    // scaled = sum * weight (one per column) needs nothing from the other
 +    // cores, so it is done while their sums are gathered.
 +    cb_wait_front(cb_weight, count);
-+    cb_reserve_back(cb_scaled, tiles);
++    cb_reserve_back(cb_scaled, count);
 +    reconfig_data_format(cb_sum, cb_weight);
 +    mul_bcast_rows_init_short(cb_sum, cb_weight);
 +    for (uint32_t b = 0; b < count; b += batch) {
@@ -108,7 +106,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +        }
 +        pack_block(cb_scaled, b, n);
 +    }
-+    cb_push_back(cb_scaled, tiles);
++    cb_push_back(cb_scaled, count);
 +    cb_pop_front(cb_weight, count);
 +    cb_pop_front(cb_sum, count);
 +
@@ -154,7 +152,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +    cb_pop_front(cb_scaler, 1);
 +
 +    // norm = scaled * rstd (one per row)
-+    cb_wait_front(cb_scaled, tiles);
++    cb_wait_front(cb_scaled, count);
 +    cb_wait_front(cb_rstd, 1);
 +    cb_reserve_back(cb_norm, count);
 +    reconfig_data_format(cb_scaled, cb_rstd);
@@ -168,7 +166,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +        pack_block(cb_norm, b, n);
 +    }
 +    cb_push_back(cb_norm, count);
-+    cb_pop_front(cb_scaled, tiles);
++    cb_pop_front(cb_scaled, count);
 +    cb_pop_front(cb_rstd, 1);
 +}
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/reader_rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/reader_rms_norm_residual.cpp
@@ -261,7 +259,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/writer_rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/writer_rms_norm_residual.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/writer_rms_norm_residual.cpp
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,150 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -273,11 +271,14 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +// Writes the first `rows` rows of this core's sum and norm tiles, and
 +// exchanges the rows' sums of squares through the first core. That core
 +// zeroes its exchange tile and tells the others with the `cleared`
-+// semaphore; every core then writes its rows' sums, the diagonal of its
-+// partial tile, into column `worker` of the exchange tile and counts itself
-+// in on the `written` semaphore; the first core multicasts the rstd column
-+// into every other core's rstd buffer and sets their `valid` semaphore. The
-+// buffers have the same address on every core.
++// semaphore (zeroing only the columns past the cores would avoid the
++// handshake, but one store at a time it costs 6 us for 32 rows on 5 cores,
++// while the handshake costs nothing measurable); every core then writes its
++// rows' sums, the diagonal of its partial tile, into column `worker` of the
++// exchange tile and counts itself in on the `written` semaphore; the first
++// core multicasts the rstd column into every other core's rstd buffer and
++// sets their `valid` semaphore. The buffers have the same address on every
++// core.
 +void kernel_main() {
 +    const uint32_t worker = get_arg_val<uint32_t>(0);
 +    const uint32_t start = get_arg_val<uint32_t>(1);
@@ -346,9 +347,9 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +
 +    // The exchange tile has the same address on every core; only the first
 +    // core's is written, after it zeroed it.
-+    cb_reserve_back(cb_exchange, 1);
 +    const uint32_t exchange = get_write_ptr(cb_exchange);
 +    if (worker == 0) {
++        cb_reserve_back(cb_exchange, 1);
 +        {
 +            Noc noc;
 +            CircularBuffer cb(cb_exchange);
@@ -412,7 +413,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,259 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -583,7 +584,6 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_res
 +        {"cb_norm", 10},
 +        {"num_cores", num_cores},
 +        {"rows", input.logical_shape()[0]},
-+        {"tiles", max_count},
 +        {"valid_sem", valid_sem_id},
 +        {"written_sem", written_sem_id},
 +        {"cleared_sem", cleared_sem_id},

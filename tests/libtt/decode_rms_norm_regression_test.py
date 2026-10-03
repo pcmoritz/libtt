@@ -14,8 +14,13 @@ from jax import lax
         # Qwen3.8-27B and Qwen3.5-9B hidden sizes, with the model's FP32 weight.
         (1, 5120, jnp.float32),
         (1, 4096, jnp.float32),
-        # Several rows, rows in the lower faces of the tile, and all rows.
+        # Several rows, around the SFPU iteration boundaries (two rows per
+        # iteration, eight iterations per face), rows in the lower faces of
+        # the tile, and all rows.
         (2, 5120, jnp.float32),
+        (3, 5120, jnp.float32),
+        (15, 5120, jnp.float32),
+        (16, 5120, jnp.float32),
         (17, 5120, jnp.float32),
         (32, 5120, jnp.float32),
         # 65 tiles over 32 cores: one core has three tiles, the rest two.
