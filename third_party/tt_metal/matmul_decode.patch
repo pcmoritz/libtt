@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
  #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
  #include "ttnn/types.hpp"
  #include <ranges>
-@@ -1018,16 +1019,156 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
+@@ -1018,16 +1019,159 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
  }
  }  // namespace bmm_op_utils
  
@@ -54,6 +54,9 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +    if (attributes.transpose_a || attributes.untilize_out || attributes.user_fused_activation.has_value() ||
 +        attributes.global_cb.has_value()) {
 +        return "transpose_a, untilize_out, fused activations and global circular buffers are not supported";
++    }
++    if (attributes.sub_device_id.has_value()) {
++        return "sub-devices are not supported: the program places its cores from (0, 0) of the device grid";
 +    }
 +
 +    const auto a_shape_padded = utilities::get_matmul_tensor_padded_shape(input_tensor_a, attributes.transpose_a);
@@ -167,7 +170,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
      auto config = generate_matmul_program_config(
          input_tensor_a,
          input_tensor_b,
-@@ -1046,7 +1187,9 @@ MatmulProgramConfig get_program_config(
+@@ -1046,7 +1190,9 @@ MatmulProgramConfig get_program_config(
      std::visit(
          [input_tensor_a](const auto& program_config) {
              using ProgramConfigType = std::decay_t<decltype(program_config)>;
@@ -270,7 +273,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_t
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,288 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -389,11 +392,9 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +                                                                     : tensor_args.optional_input_tensors[0];
 +    const auto grid = config.compute_with_storage_grid_size;
 +    const uint32_t in0_block_w = config.in0_block_w;
-+    const auto plan = plan_decode(a.padded_shape(), b.padded_shape(), transpose_b, config);
-+    const auto [Kt, halves, out_Nt, num_cores, group, in0_mcast_w, base_count, extra] = plan;
-+    const uint32_t in1_block_num_tiles = in0_block_w * halves * group;
-+    auto count_of = [&](uint32_t i) { return plan.count_of(i); };
-+    auto start_of = [&](uint32_t i) { return plan.start_of(i); };
++    const DecodePlan plan = plan_decode(a.padded_shape(), b.padded_shape(), transpose_b, config);
++    const uint32_t num_cores = plan.num_cores;
++    const uint32_t in1_block_num_tiles = in0_block_w * plan.halves * plan.group;
 +
 +    // Cores are numbered row-major over the worker grid. Full rows form one
 +    // multicast group and a partial last row forms another; the first core
@@ -422,13 +423,13 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +                .buffer_index = index, .data_format = format, .page_size = page_size}}},
 +        });
 +    };
-+    add_cb(tt::CBIndex::c_0, Kt, in0_format);
++    add_cb(tt::CBIndex::c_0, plan.Kt, in0_format);
 +    // Even weight K blocks arrive on RISCV_0's NOC and odd blocks on RISCV_1's.
 +    add_cb(tt::CBIndex::c_1, in1_buffers * in1_block_num_tiles, in1_format);
 +    add_cb(tt::CBIndex::c_2, in1_buffers * in1_block_num_tiles, in1_format);
-+    add_cb(tt::CBIndex::c_16, count_of(0), output_format);
++    add_cb(tt::CBIndex::c_16, plan.count_of(0), output_format);
 +    if (bias_tensor.has_value()) {
-+        add_cb(tt::CBIndex::c_3, count_of(0), tt_metal::datatype_to_dataformat_converter(bias_tensor->dtype()));
++        add_cb(tt::CBIndex::c_3, plan.count_of(0), tt_metal::datatype_to_dataformat_converter(bias_tensor->dtype()));
 +    }
 +
 +    constexpr uint32_t sender_sem_id = 0;
@@ -448,12 +449,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +        {"cb_bias", tt::CBIndex::c_3},
 +        {"has_bias", bias_tensor.has_value()},
 +        {"transpose_b", transpose_b},
-+        {"Kt", Kt},
-+        {"halves", halves},
-+        {"out_Nt", out_Nt},
-+        {"group", group},
++        {"Kt", plan.Kt},
++        {"halves", plan.halves},
++        {"out_Nt", plan.out_Nt},
++        {"group", plan.group},
 +        {"in0_block_w", in0_block_w},
-+        {"in0_mcast_w", in0_mcast_w},
++        {"in0_mcast_w", plan.in0_mcast_w},
 +        {"sender_sem", sender_sem_id},
 +        {"receiver_sem", receiver_sem_id},
 +    };
@@ -509,8 +510,8 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +             static_cast<uint32_t>(end.y),
 +             last - first,
 +             b,
-+             start_of(first),
-+             count_of(first)});
++             plan.start_of(first),
++             plan.count_of(first)});
 +        for (uint32_t i = first + 1; i <= last; ++i) {
 +            receiver_ranges.emplace_back(core_at(i), core_at(i));
 +            receiver.emplace_runtime_args(
@@ -518,13 +519,13 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +                {static_cast<uint32_t>(sender_physical.x),
 +                 static_cast<uint32_t>(sender_physical.y),
 +                 b,
-+                 start_of(i),
-+                 count_of(i)});
++                 plan.start_of(i),
++                 plan.count_of(i)});
 +        }
 +    }
 +    for (uint32_t i = 0; i < num_cores; ++i) {
 +        std::vector<std::variant<uint32_t, std::reference_wrapper<const tt::tt_metal::MeshTensor>>> args = {
-+            b, output, start_of(i), count_of(i)};
++            b, output, plan.start_of(i), plan.count_of(i)};
 +        if (bias_tensor.has_value()) {
 +            args.emplace_back(bias_tensor->mesh_tensor());
 +        }
@@ -547,7 +548,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +    compute.core_ranges = all_cores;
 +    compute.named_compile_time_args = common_args;
 +    for (uint32_t i = 0; i < num_cores; ++i) {
-+        compute.emplace_runtime_args(core_at(i), {count_of(i)});
++        compute.emplace_runtime_args(core_at(i), {plan.count_of(i)});
 +    }
 +    // The kernel accumulates every output tile over all of K in FP32 DST.
 +    compute.config = ComputeConfigDescriptor{
@@ -1119,7 +1120,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.hpp
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-@@ -263,7 +263,8 @@ static ttnn::Tensor bound_matmul(
+@@ -263,14 +263,16 @@ static ttnn::Tensor bound_matmul(
          parameters.transpose_a,
          parameters.transpose_b,
          bias_single_tile_size,
@@ -1129,7 +1130,16 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
      //----------------------------------------------------------------------------------------------
  
      // Decide if we need to manually transpose or if the program config will handle it
-@@ -411,6 +412,28 @@ Tensor matmul(
+     bool needs_manual_transpose =
+         !(std::holds_alternative<MatmulMultiCoreReuseMultiCast1DProgramConfig>(chosen_program_config) ||
+           std::holds_alternative<MatmulMultiCoreReuseMultiCastProgramConfig>(chosen_program_config) ||
+-          std::holds_alternative<MatmulMultiCoreReuseProgramConfig>(chosen_program_config));
++          std::holds_alternative<MatmulMultiCoreReuseProgramConfig>(chosen_program_config) ||
++          std::holds_alternative<MatmulDecodeProgramConfig>(chosen_program_config));
+     bool needs_manual_transpose_a = parameters.transpose_a && needs_manual_transpose;
+     bool needs_manual_transpose_b = parameters.transpose_b && needs_manual_transpose;
+ 
+@@ -411,6 +413,28 @@ Tensor matmul(
          optional_output_tensor);
  }
  

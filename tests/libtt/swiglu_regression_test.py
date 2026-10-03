@@ -70,9 +70,17 @@ def test_swiglu_projection_width(rows, inner_size, width, tmp_path):
 
 def test_swiglu_halves_of_partial_tiles_stay_unfused(tmp_path):
     """Halves that are not whole tiles cannot be split by the kernel: the
-    projection must keep the separate matmul, split, silu and multiply."""
+    projection must keep the separate matmul, split, silu and multiply. The
+    weight is BFP8 like a fused one, and the total width of 100 pads to 128,
+    which a check on the padded width would accept."""
 
     def swiglu(x, weights):
+        weights = weights[None]
+        weights = jax.ffi.ffi_call(
+            "tt.weight_dtype_override",
+            jax.ShapeDtypeStruct(weights.shape, weights.dtype),
+            vmap_method="sequential",
+        )(weights, **{"ttcore.weight_dtype": "bfp_bf8"})[0]
         up, gate = jnp.split(x @ weights, 2, axis=-1)
         return up * jax.nn.silu(gate)
 
@@ -80,11 +88,11 @@ def test_swiglu_halves_of_partial_tiles_stay_unfused(tmp_path):
     device = jax.devices("tt")[0]
     rng = np.random.default_rng(8)
     x = (rng.integers(-4, 5, (1, 512)) / 16).astype(jnp.bfloat16)
-    weights = (rng.integers(-4, 5, (512, 2 * 100)) / 16).astype(jnp.bfloat16)
+    weights = (rng.integers(-4, 5, (512, 100)) / 16).astype(jnp.bfloat16)
     actual = run(jax.device_put(x, device), jax.device_put(weights, device))
     up, gate = np.split(x.astype(np.float32) @ weights.astype(np.float32), 2, axis=-1)
     expected = up * gate / (1 + np.exp(-gate))
     np.testing.assert_allclose(np.asarray(actual).astype(np.float32), expected, atol=0.01, rtol=0.04)
-    assert not any(
-        "ttnn.fused_swiglu" in path.read_text() for path in (tmp_path / "irs").glob("ttnn*.mlir")
-    ), "halves of partial tiles were fused"
+    irs = list((tmp_path / "irs").glob("ttnn*.mlir"))
+    assert irs, "no IR was exported"
+    assert not any("ttnn.fused_swiglu" in path.read_text() for path in irs), "halves of partial tiles were fused"

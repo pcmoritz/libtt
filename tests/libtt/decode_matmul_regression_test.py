@@ -22,9 +22,12 @@ def _bfp8(weights):
         # A residual add fuses into the matmul as a bias.
         (1, 1024, 5120, True, False, "bfp_bf8"),
         (4, 1024, 5120, True, False, "bfp_bf8"),
-        # LM heads keep the embedding layout, [width, inner_size].
+        # LM heads keep the embedding layout, [width, inner_size]; the kernel
+        # reads it transposed, with or without a bias.
         (1, 1024, 5120, False, True, "bfp_bf8"),
         (4, 1024, 5120, False, True, "bfp_bf8"),
+        (1, 1024, 5120, True, True, "bfp_bf8"),
+        (1, 96, 32 * 163, True, True, "bfp_bf8"),
         # An odd K tile count and a prime output tile count.
         (1, 96, 32 * 163, True, False, "bfp_bf8"),
         (1, 1024, 5120, True, False, "bf16"),
@@ -79,3 +82,28 @@ def test_large_reduction_is_left_to_the_other_matmuls():
     actual = run(*(jax.device_put(v, device) for v in (x, weights, bias)))
     expected = x.astype(np.float32) @ weights.astype(np.float32) + bias.astype(np.float32)
     np.testing.assert_allclose(np.asarray(actual).astype(np.float32), expected, atol=0.5, rtol=0.05)
+
+
+def test_transposed_weight_is_read_in_place(tmp_path):
+    """The decode kernel reads a transposed weight as it is stored. A weight
+    that depends on the activation cannot be transposed ahead of time, so the
+    matmul must carry the transpose itself rather than materialize one."""
+
+    def project(x, weights, bias):
+        return x @ _bfp8(weights * x[0, 0]).T + bias
+
+    run = jax.jit(project, compiler_options={"optimization_level": "O1", "export_path": str(tmp_path)})
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(11)
+    x = (rng.integers(-4, 5, (1, 1024)) / 16).astype(np.float32)
+    x[0, 0] = 1.0
+    x = x.astype(jnp.bfloat16)
+    weights = (rng.integers(-4, 5, (5120, 1024)) / 16).astype(jnp.bfloat16)
+    bias = (rng.integers(-64, 65, (1, 5120)) / 16).astype(jnp.bfloat16)
+    actual = run(*(jax.device_put(v, device) for v in (x, weights, bias)))
+    expected = x.astype(np.float32) @ weights.astype(np.float32).T + bias.astype(np.float32)
+    np.testing.assert_allclose(np.asarray(actual).astype(np.float32), expected, atol=1 / 64, rtol=1 / 128)
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn*.mlir")]
+    assert irs, "no IR was exported"
+    assert any("transpose_b = true" in ir for ir in irs), "the matmul does not carry the transpose"
+    assert not any("ttnn.permute" in ir or "ttnn.transpose" in ir for ir in irs), "a transpose was materialized"
