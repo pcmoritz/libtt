@@ -32,7 +32,7 @@ index 0000000..b63b736
 +
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..319385ff2c493681ca4984cc19b05cc1f978d069
+index 0000000..319385f
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
 @@ -0,0 +1,55 @@
@@ -243,7 +243,7 @@ index 0000000..70b15c7
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_update.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..1b7ed9ce3bf2d3bd7c6a668de2135882ce9cdff6
+index 0000000..606cded
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_update.cpp
 @@ -0,0 +1,32 @@
@@ -281,7 +281,7 @@ index 0000000000000000000000000000000000000000..1b7ed9ce3bf2d3bd7c6a668de2135882
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..fdc2b2c7240e8faf4275793f5f8f55c88edf70f8
+index 0000000..4dc04a0
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
 @@ -0,0 +1,22 @@
@@ -309,7 +309,7 @@ index 0000000000000000000000000000000000000000..fdc2b2c7240e8faf4275793f5f8f55c8
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..bd5a7a3a140089f7538718670adf89e2398801a1
+index 0000000..06486af
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
 @@ -0,0 +1,211 @@
@@ -526,7 +526,7 @@ index 0000000000000000000000000000000000000000..bd5a7a3a140089f7538718670adf89e2
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..2edf619f538f0ec0030270d1f9d244e400f3259b
+index 0000000..2edf619
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
 @@ -0,0 +1,65 @@
@@ -597,7 +597,7 @@ index 0000000000000000000000000000000000000000..2edf619f538f0ec0030270d1f9d244e4
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..dafb9778090fcb155b09a491ac46185e23355c9a
+index 0000000..dafb977
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp
 @@ -0,0 +1,15 @@
@@ -618,7 +618,7 @@ index 0000000000000000000000000000000000000000..dafb9778090fcb155b09a491ac46185e
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..56a7196bd2bd068667dc37fae1690a3a1f99c8e3
+index 0000000..56a7196
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
 @@ -0,0 +1,167 @@
@@ -791,7 +791,7 @@ index 0000000000000000000000000000000000000000..56a7196bd2bd068667dc37fae1690a3a
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
 new file mode 100644
-index 0000000..2df32b1
+index 0000000..3f1ffc7
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
 @@ -0,0 +1,256 @@
@@ -1053,10 +1053,10 @@ index 0000000..2df32b1
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
 new file mode 100644
-index 0000000..e981660
+index 0000000..a162037
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,232 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1144,6 +1144,12 @@ index 0000000..e981660
 +    constexpr uint32_t qkv_heads = get_compile_time_arg_val(7);
 +    // The gate logits' element type: the raw bits of BFLOAT16 or FLOAT32.
 +    using GateLogits = std::conditional_t<get_compile_time_arg_val(8) == 4, uint32_t, uint16_t>;
++    // Each gate tensor is [B, W] tiles, with the heads at columns from
++    // beta_column (delta_time_column) on.
++    constexpr uint32_t beta_column = get_compile_time_arg_val(9);
++    constexpr uint32_t beta_row_tiles = get_compile_time_arg_val(10);
++    constexpr uint32_t delta_time_column = get_compile_time_arg_val(11);
++    constexpr uint32_t delta_time_row_tiles = get_compile_time_arg_val(12);
 +    constexpr uint32_t vt = full_vt / workers_per_head;
 +    constexpr uint32_t state_tiles = kt * vt;
 +    constexpr uint32_t tile_bytes = 4096;
@@ -1158,7 +1164,7 @@ index 0000000..e981660
 +    const uint32_t state_indices_address = get_arg_val<uint32_t>(7);
 +    const uint32_t has_initial_state_address = get_arg_val<uint32_t>(8);
 +
-+    constexpr auto qkv_args = TensorAccessorArgs<9>();
++    constexpr auto qkv_args = TensorAccessorArgs<13>();
 +    constexpr auto beta_logits_args = TensorAccessorArgs<qkv_args.next_compile_time_args_offset()>();
 +    constexpr auto delta_time_args = TensorAccessorArgs<beta_logits_args.next_compile_time_args_offset()>();
 +    constexpr auto a_log_args = TensorAccessorArgs<delta_time_args.next_compile_time_args_offset()>();
@@ -1245,14 +1251,17 @@ index 0000000..e981660
 +
 +    read_vector(noc, qkv, value_cb, page(2 * key_heads + head) + column_start, batch % 32, vt);
 +
-+    const uint32_t scalar_page =
-+        (batch / 32) * ((num_heads + 31) / 32) + head / 32;
 +    const uint32_t scalar_row = batch % 32;
-+    const uint32_t scalar_column = head % 32;
-+    read_scalar<GateLogits>(noc, beta_logits, beta_logits_cb, scalar_page, scalar_row, scalar_column);
-+    read_scalar<GateLogits>(noc, delta_time, delta_time_cb, scalar_page, scalar_row, scalar_column);
-+    read_scalar<uint32_t>(noc, a_log, a_log_cb, head / 32, 0, scalar_column);
-+    read_scalar<uint32_t>(noc, dt_bias, dt_bias_cb, head / 32, 0, scalar_column);
++    const uint32_t beta_head = beta_column + head;
++    const uint32_t delta_time_head = delta_time_column + head;
++    read_scalar<GateLogits>(
++        noc, beta_logits, beta_logits_cb, (batch / 32) * beta_row_tiles + beta_head / 32, scalar_row,
++        beta_head % 32);
++    read_scalar<GateLogits>(
++        noc, delta_time, delta_time_cb, (batch / 32) * delta_time_row_tiles + delta_time_head / 32,
++        scalar_row, delta_time_head % 32);
++    read_scalar<uint32_t>(noc, a_log, a_log_cb, head / 32, 0, head % 32);
++    read_scalar<uint32_t>(noc, dt_bias, dt_bias_cb, head / 32, 0, head % 32);
 +    noc.async_write_zeros(key_transposed_cb, kt * tile_bytes);
 +    noc.async_read_barrier();
 +    noc.write_zeros_l1_barrier();
@@ -1270,13 +1279,13 @@ index 0000000..e981660
 +    key_cb.push_back(kt);
 +    key_transposed_cb.push_back(kt);
 +    value_cb.push_back(vt);
-+    make_scalar_tile<GateLogits>(noc, beta_logits_cb, scalar_row, scalar_column);
++    make_scalar_tile<GateLogits>(noc, beta_logits_cb, scalar_row, beta_head % 32);
 +    beta_logits_cb.push_back(1);
-+    make_scalar_tile<GateLogits>(noc, delta_time_cb, scalar_row, scalar_column);
++    make_scalar_tile<GateLogits>(noc, delta_time_cb, scalar_row, delta_time_head % 32);
 +    delta_time_cb.push_back(1);
-+    make_scalar_tile<uint32_t>(noc, a_log_cb, 0, scalar_column);
++    make_scalar_tile<uint32_t>(noc, a_log_cb, 0, head % 32);
 +    a_log_cb.push_back(1);
-+    make_scalar_tile<uint32_t>(noc, dt_bias_cb, 0, scalar_column);
++    make_scalar_tile<uint32_t>(noc, dt_bias_cb, 0, head % 32);
 +    dt_bias_cb.push_back(1);
 +    }
 +}
@@ -1378,10 +1387,10 @@ index 0000000..ea01b86
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
 new file mode 100644
-index 0000000..b7ced7a
+index 0000000..b901881
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,298 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1406,7 +1415,12 @@ index 0000000..b7ced7a
 +namespace ttnn::prim {
 +namespace {
 +
-+struct DecodeParams {};
++struct DecodeParams {
++    // The column of head 0 in each gate tensor. The model's gate logits are
++    // the two halves of one [B, 2 * H] projection, read in place.
++    uint32_t beta_column = 0;
++    uint32_t delta_time_column = 0;
++};
 +
 +struct DecodeInputs {
 +    Tensor qkv;
@@ -1447,18 +1461,28 @@ index 0000000..b7ced7a
 +
 +constexpr uint32_t head_dim = 128;
 +
++// H, the value heads: the state pool is [slots, H, D, D].
++uint32_t num_heads(const DecodeInputs& in) { return in.state.logical_shape()[1]; }
++
 +// The heads of the flat [B, (2 * K + H) * D] qkv tensor.
 +uint32_t qkv_heads(const DecodeInputs& in) { return in.qkv.logical_shape()[-1] / head_dim; }
 +
 +// K, the number of query and key heads.
-+uint32_t key_heads(const DecodeInputs& in) {
-+    return (qkv_heads(in) - in.beta_logits.logical_shape()[1]) / 2;
-+}
++uint32_t key_heads(const DecodeInputs& in) { return (qkv_heads(in) - num_heads(in)) / 2; }
 +
-+void DecodeOperation::validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t& in) {
++// The tiles of one tile row of a [B, W] gate tensor.
++uint32_t gate_row_tiles(const Tensor& gate) { return (gate.logical_shape()[1] + 31) / 32; }
++
++void DecodeOperation::validate_on_program_cache_miss(
++    const operation_attributes_t& params, const tensor_args_t& in) {
++    const auto& state_shape = in.state.logical_shape();
++    TT_FATAL(
++        state_shape.rank() == 4 && state_shape[0] >= 2 && state_shape[2] == head_dim &&
++            state_shape[3] == head_dim,
++        "state must be [slots >= 2, heads, {}, {}]", head_dim, head_dim);
 +    TT_FATAL(in.beta_logits.logical_shape().rank() == 2, "beta logits must have rank 2");
 +    const uint32_t batch_size = in.beta_logits.logical_shape()[0];
-+    const uint32_t num_heads = in.beta_logits.logical_shape()[1];
++    const uint32_t num_heads = prim::num_heads(in);
 +    const auto& qkv_shape = in.qkv.logical_shape();
 +    TT_FATAL(
 +        qkv_shape.rank() == 2 && qkv_shape[0] == batch_size && qkv_shape[1] % head_dim == 0,
@@ -1481,25 +1505,26 @@ index 0000000..b7ced7a
 +    validate_tensor(in.state_indices, {DataType::INT32}, "state indices");
 +    validate_tensor(in.has_initial_state, {DataType::BFLOAT16}, "initial-state mask");
 +
-+    constexpr uint32_t dim = head_dim;
-+    check_shape(in.delta_time, {batch_size, num_heads}, "delta time");
++    // A gate is [B, W] with the heads at columns [column, column + H).
++    auto check_gate = [&](const Tensor& gate, uint32_t column, const char* name) {
++        const auto& shape = gate.logical_shape();
++        TT_FATAL(
++            shape.rank() == 2 && shape[0] == batch_size && column + num_heads <= shape[1],
++            "{} must be [{}, >= {}] with the heads at columns {} to {}", name, batch_size,
++            column + num_heads, column, column + num_heads);
++    };
++    check_gate(in.beta_logits, params.beta_column, "beta logits");
++    check_gate(in.delta_time, params.delta_time_column, "delta time");
 +    check_shape(in.a_log, {num_heads}, "A log");
 +    check_shape(in.dt_bias, {num_heads}, "delta-time bias");
-+    const auto& state_shape = in.state.logical_shape();
-+    TT_FATAL(
-+        state_shape.rank() == 4 && state_shape[0] >= 2 &&
-+            state_shape[1] == num_heads && state_shape[2] == dim &&
-+            state_shape[3] == dim,
-+        "state shape mismatch");
 +    check_shape(in.state_indices, {batch_size}, "state indices");
 +    check_shape(in.has_initial_state, {batch_size}, "initial-state mask");
 +}
 +
 +DecodeOperation::spec_return_value_t DecodeOperation::compute_output_specs(
 +    const operation_attributes_t&, const tensor_args_t& in) {
-+    const auto& shape = in.beta_logits.logical_shape();
 +    return TensorSpec(
-+        Shape({shape[0], shape[1], head_dim}),
++        Shape({in.beta_logits.logical_shape()[0], num_heads(in), head_dim}),
 +        TensorLayout(DataType::FLOAT32, PageConfig(Layout::TILE), MemoryConfig{}));
 +}
 +
@@ -1509,14 +1534,14 @@ index 0000000..b7ced7a
 +}
 +
 +ProgramDescriptor DecodeOperation::create_descriptor(
-+    const operation_attributes_t&, const tensor_args_t& in, tensor_return_value_t& output) {
++    const operation_attributes_t& params, const tensor_args_t& in, tensor_return_value_t& output) {
 +    constexpr uint32_t kt = 4;
 +    constexpr uint32_t vt = 4;
 +    constexpr uint32_t workers_per_head = 2;
 +    constexpr uint32_t worker_vt = vt / workers_per_head;
 +    constexpr uint32_t state_tiles = kt * worker_vt;
 +    const uint32_t batch_size = in.beta_logits.logical_shape()[0];
-+    const uint32_t num_heads = in.beta_logits.logical_shape()[1];
++    const uint32_t num_heads = prim::num_heads(in);
 +    const uint32_t num_key_heads = key_heads(in);
 +    ProgramDescriptor program;
 +
@@ -1562,7 +1587,9 @@ index 0000000..b7ced7a
 +
 +    std::vector<uint32_t> reader_args = {
 +        kt, vt, batch_size, num_heads, workers_per_head, num_workers, num_key_heads, qkv_heads(in),
-+        in.beta_logits.element_size()};
++        in.beta_logits.element_size(),
++        params.beta_column, gate_row_tiles(in.beta_logits),
++        params.delta_time_column, gate_row_tiles(in.delta_time)};
 +    TensorAccessorArgs(in.qkv.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.beta_logits.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.delta_time.buffer()).append_to(reader_args);
@@ -1645,10 +1672,12 @@ index 0000000..b7ced7a
 +    const Tensor& dt_bias,
 +    const Tensor& state,
 +    const Tensor& state_indices,
-+    const Tensor& has_initial_state) {
++    const Tensor& has_initial_state,
++    uint32_t beta_column,
++    uint32_t delta_time_column) {
 +    using Op = prim::DecodeOperation;
 +    return device_operation::launch<Op>(
-+        {},
++        {.beta_column = beta_column, .delta_time_column = delta_time_column},
 +        {.qkv = qkv,
 +         .beta_logits = beta_logits,
 +         .delta_time = delta_time,
@@ -1662,10 +1691,10 @@ index 0000000..b7ced7a
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp
 new file mode 100644
-index 0000000..b14e1cd
+index 0000000..397a899
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,36 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1685,7 +1714,10 @@ index 0000000..b14e1cd
 +// state_mid = decay * state
 +// state' = state_mid + k^T * (beta * (v - k * state_mid))
 +// output = q * state'
-+// The output is [B, H, D].
++// The output is [B, H, D]. beta_logits and delta_time are [B, W] tensors
++// holding the heads at columns [beta_column, beta_column + H) and
++// [delta_time_column, delta_time_column + H): the two halves of the model's
++// gate projection are read in place.
 +Tensor gated_delta_decode(
 +    const Tensor& qkv,
 +    const Tensor& beta_logits,
@@ -1694,7 +1726,9 @@ index 0000000..b14e1cd
 +    const Tensor& dt_bias,
 +    const Tensor& state,
 +    const Tensor& state_indices,
-+    const Tensor& has_initial_state);
++    const Tensor& has_initial_state,
++    uint32_t beta_column = 0,
++    uint32_t delta_time_column = 0);
 +
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
@@ -1938,8 +1972,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ke
          }
          noc.async_write_barrier();
 -        cbout.pop_front(cv);
-+        cbfs.pop_front(kv);
-     }
+-    }
 -
 -    // final_state [BH, K, V]: same V-block slicing (row stride Vt_full over K rows).
 -    CircularBuffer cbfs(cb_final);
@@ -1951,7 +1984,8 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ke
 -        for (uint32_t vt = 0; vt < Vt; vt++) {
 -            noc.async_write(src, fs_acc, tb_fs, {.offset_bytes = (r * Vt + vt) * tb_fs}, {.page_id = dst + vt});
 -        }
--    }
++        cbfs.pop_front(kv);
+     }
 -    noc.async_write_barrier();
 -    cbfs.pop_front(kv);
  }
