@@ -528,7 +528,7 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.h b/runtime/lib/t
 diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,103 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +#include "operations/transformer/recurrent.h"
@@ -555,7 +555,8 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +             ? result
 +             : ::ttnn::to_memory_config(result, config);
 +}
-+// The model's activations stay BFLOAT16; anything else becomes FLOAT32.
++// The gate logits stay BFLOAT16 when the model passes them so; anything
++// else becomes FLOAT32.
 +::ttnn::Tensor activation(const ::ttnn::Tensor &input) {
 +  return tiled(input, input.dtype() == ::ttnn::DataType::BFLOAT16
 +                          ? ::ttnn::DataType::BFLOAT16
@@ -595,7 +596,8 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +    return pool.getTTNNTensorAndValidate(ref);
 +  };
 +  auto output = ::ttnn::transformer::gated_delta_decode(
-+      activation(get(op->qkv())), activation(get(op->beta_logits())),
++      tiled(get(op->qkv()), ::ttnn::DataType::FLOAT32),
++      activation(get(op->beta_logits())),
 +      activation(get(op->delta_time())),
 +      tiled(get(op->a_log()), ::ttnn::DataType::FLOAT32),
 +      tiled(get(op->dt_bias()), ::ttnn::DataType::FLOAT32), get(op->cache()),

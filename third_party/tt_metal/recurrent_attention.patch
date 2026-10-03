@@ -284,13 +284,12 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..fdc2b2c7240e8faf4275793f5f8f55c88edf70f8
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,22 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#pragma once
 +
-+#include <optional>
 +
 +#include "ttnn/tensor/tensor.hpp"
 +
@@ -298,14 +297,14 @@ index 0000000000000000000000000000000000000000..fdc2b2c7240e8faf4275793f5f8f55c8
 +
 +// One four-tap depthwise causal convolution decode step. The operation
 +// gathers and updates request state in place, and returns silu(conv) in
-+// output_dtype, BFLOAT16 or FLOAT32, by default the input's dtype.
++// output_dtype, BFLOAT16 or FLOAT32.
 +Tensor causal_conv1d_update(
 +    const Tensor& input,
 +    const Tensor& state,
 +    const Tensor& weight,
 +    const Tensor& state_indices,
 +    const Tensor& has_initial_state,
-+    std::optional<tt::tt_metal::DataType> output_dtype = std::nullopt);
++    tt::tt_metal::DataType output_dtype = tt::tt_metal::DataType::BFLOAT16);
 +
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
@@ -513,10 +512,10 @@ index 0000000000000000000000000000000000000000..bd5a7a3a140089f7538718670adf89e2
 +    const Tensor& weight,
 +    const Tensor& state_indices,
 +    const Tensor& has_initial_state,
-+    std::optional<DataType> output_dtype) {
++    DataType output_dtype) {
 +    using Op = prim::ConvOperation;
 +    return device_operation::launch<Op>(
-+        {.output_dtype = output_dtype.value_or(input.dtype())},
++        {.output_dtype = output_dtype},
 +        {.input = input,
 +         .state = state,
 +         .weight = weight,
@@ -1057,7 +1056,7 @@ new file mode 100644
 index 0000000..e981660
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,226 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1070,13 +1069,9 @@ index 0000000..e981660
 +
 +namespace {
 +
-+// Load one token's head from flat [B, heads * D] tiles of `element_bytes`
-+// elements into row zero of each FP32 compute tile. BFLOAT16 rows are read as
-+// their 64-byte aligned row pair into the tile's last face, which
-+// widen_vector moves to row zero once it is read.
-+constexpr uint32_t narrow_scratch = 3 * 256 * sizeof(uint32_t);
-+
-+template <uint32_t element_bytes, typename Accessor>
++// Load one token's head from flat [B, heads * D] FP32 tiles into row zero of
++// each compute tile.
++template <typename Accessor>
 +FORCE_INLINE void read_vector(
 +    Noc& noc, const Accessor& input, CircularBuffer& cb,
 +    uint32_t page, uint32_t row, uint32_t tiles) {
@@ -1085,38 +1080,10 @@ index 0000000..e981660
 +    noc.write_zeros_l1_barrier();
 +    for (uint32_t tile = 0; tile < tiles; ++tile) {
 +        for (uint32_t face = 0; face < 2; ++face) {
-+            if constexpr (element_bytes == 4) {
-+                noc.async_read(
-+                    input, cb, 64,
-+                    {.page_id = page + tile, .offset_bytes = tile_offset(row, face * 16) * 4},
-+                    {.offset_bytes = tile * 4096 + face * 1024});
-+            } else {
-+                noc.async_read(
-+                    input, cb, 64,
-+                    {.page_id = page + tile, .offset_bytes = tile_offset(row & ~1u, face * 16) * 2},
-+                    {.offset_bytes = tile * 4096 + narrow_scratch + face * 64});
-+            }
-+        }
-+    }
-+}
-+
-+template <uint32_t element_bytes>
-+FORCE_INLINE void widen_vector(CircularBuffer& cb, uint32_t row, uint32_t tiles) {
-+    if constexpr (element_bytes == 4) {
-+        return;
-+    }
-+    for (uint32_t tile = 0; tile < tiles; ++tile) {
-+        const uint32_t address = cb.get_write_ptr() + tile * 4096;
-+        volatile tt_l1_ptr uint32_t* wide = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(address);
-+        for (uint32_t face = 0; face < 2; ++face) {
-+            volatile tt_l1_ptr uint16_t* narrow = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(
-+                address + narrow_scratch + face * 64 + (row & 1) * 32);
-+            for (uint32_t i = 0; i < 16; ++i) {
-+                wide[face * 256 + i] = static_cast<uint32_t>(narrow[i]) << 16;
-+            }
-+        }
-+        for (uint32_t i = 0; i < 32; ++i) {
-+            wide[narrow_scratch / sizeof(uint32_t) + i] = 0;
++            noc.async_read(
++                input, cb, 64,
++                {.page_id = page + tile, .offset_bytes = tile_offset(row, face * 16) * 4},
++                {.offset_bytes = tile * 4096 + face * 1024});
 +        }
 +    }
 +}
@@ -1178,13 +1145,11 @@ index 0000000..e981660
 +    constexpr uint32_t num_workers = get_compile_time_arg_val(5);
 +    constexpr uint32_t key_heads = get_compile_time_arg_val(6);
 +    constexpr uint32_t qkv_heads = get_compile_time_arg_val(7);
-+    constexpr uint32_t qkv_bytes = get_compile_time_arg_val(8);
-+    constexpr uint32_t beta_logits_bytes = get_compile_time_arg_val(9);
-+    constexpr uint32_t delta_time_bytes = get_compile_time_arg_val(10);
++    constexpr uint32_t beta_logits_bytes = get_compile_time_arg_val(8);
++    constexpr uint32_t delta_time_bytes = get_compile_time_arg_val(9);
 +    constexpr uint32_t vt = full_vt / workers_per_head;
 +    constexpr uint32_t state_tiles = kt * vt;
 +    constexpr uint32_t tile_bytes = 4096;
-+    constexpr uint32_t qkv_tile_bytes = 1024 * qkv_bytes;  // in DRAM
 +
 +    const uint32_t worker = get_arg_val<uint32_t>(0);
 +    const uint32_t qkv_address = get_arg_val<uint32_t>(1);
@@ -1196,7 +1161,7 @@ index 0000000..e981660
 +    const uint32_t state_indices_address = get_arg_val<uint32_t>(7);
 +    const uint32_t has_initial_state_address = get_arg_val<uint32_t>(8);
 +
-+    constexpr auto qkv_args = TensorAccessorArgs<11>();
++    constexpr auto qkv_args = TensorAccessorArgs<10>();
 +    constexpr auto beta_logits_args = TensorAccessorArgs<qkv_args.next_compile_time_args_offset()>();
 +    constexpr auto delta_time_args = TensorAccessorArgs<beta_logits_args.next_compile_time_args_offset()>();
 +    constexpr auto a_log_args = TensorAccessorArgs<delta_time_args.next_compile_time_args_offset()>();
@@ -1205,7 +1170,7 @@ index 0000000..e981660
 +    constexpr auto state_indices_args = TensorAccessorArgs<state_args.next_compile_time_args_offset()>();
 +    constexpr auto has_initial_state_args =
 +        TensorAccessorArgs<state_indices_args.next_compile_time_args_offset()>();
-+    const auto qkv = TensorAccessor(qkv_args, qkv_address, qkv_tile_bytes);
++    const auto qkv = TensorAccessor(qkv_args, qkv_address, tile_bytes);
 +    const auto beta_logits = TensorAccessor(beta_logits_args, beta_logits_address, 1024 * beta_logits_bytes);
 +    const auto delta_time = TensorAccessor(delta_time_args, delta_time_address, 1024 * delta_time_bytes);
 +    const auto a_log = TensorAccessor(a_log_args, a_log_address, tile_bytes);
@@ -1274,14 +1239,14 @@ index 0000000..e981660
 +    // qkv tensor, where g = head / (H / K); a head spans kt == full_vt tiles.
 +    auto page = [&](uint32_t qkv_head) { return ((batch / 32) * qkv_heads + qkv_head) * kt; };
 +    const uint32_t group_head = head / (num_heads / key_heads);
-+    read_vector<qkv_bytes>(noc, qkv, query_cb, page(group_head), batch % 32, kt);
++    read_vector(noc, qkv, query_cb, page(group_head), batch % 32, kt);
 +
 +    key_transposed_cb.reserve_back(kt);
-+    read_vector<qkv_bytes>(noc, qkv, key_cb, page(key_heads + group_head), batch % 32, kt);
++    read_vector(noc, qkv, key_cb, page(key_heads + group_head), batch % 32, kt);
 +    query_transposed_cb.reserve_back(kt);
 +    noc.async_write_zeros(query_transposed_cb, kt * tile_bytes);
 +
-+    read_vector<qkv_bytes>(noc, qkv, value_cb, page(2 * key_heads + head) + column_start, batch % 32, vt);
++    read_vector(noc, qkv, value_cb, page(2 * key_heads + head) + column_start, batch % 32, vt);
 +
 +    const uint32_t scalar_page =
 +        (batch / 32) * ((num_heads + 31) / 32) + head / 32;
@@ -1295,9 +1260,6 @@ index 0000000..e981660
 +    noc.async_read_barrier();
 +    noc.write_zeros_l1_barrier();
 +    state_cb.push_back(state_tiles);
-+    widen_vector<qkv_bytes>(query_cb, batch % 32, kt);
-+    widen_vector<qkv_bytes>(key_cb, batch % 32, kt);
-+    widen_vector<qkv_bytes>(value_cb, batch % 32, vt);
 +    for (uint32_t tile = 0; tile < kt; ++tile) {
 +        transpose_row_tile(
 +            query_cb.get_write_ptr() + tile * tile_bytes,
@@ -1422,7 +1384,7 @@ new file mode 100644
 index 0000000..b7ced7a
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,284 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1479,8 +1441,8 @@ index 0000000..b7ced7a
 +    TT_FATAL(tensor.dtype() == dtype, "{} has an unsupported dtype", name);
 +}
 +
-+// The convolution output and the per-token gate logits may arrive as the
-+// model's BFLOAT16 activations or as FLOAT32.
++// The per-token gate logits may arrive as the model's BFLOAT16 activations
++// or as FLOAT32.
 +void validate_activation(const Tensor& tensor, const char* name) {
 +    TT_FATAL(tensor.storage_type() == StorageType::DEVICE, "{} must be on device", name);
 +    TT_FATAL(tensor.buffer() != nullptr, "{} must be allocated", name);
@@ -1519,7 +1481,7 @@ index 0000000..b7ced7a
 +    TT_FATAL(
 +        2 * num_key_heads + num_heads == qkv_heads(in) && num_heads % num_key_heads == 0,
 +        "value heads must be a multiple of the query and key heads");
-+    validate_activation(in.qkv, "qkv");
++    validate_tensor(in.qkv, DataType::FLOAT32, "qkv");
 +    validate_activation(in.beta_logits, "beta logits");
 +    validate_activation(in.delta_time, "delta time");
 +    validate_tensor(in.a_log, DataType::FLOAT32, "A log");
@@ -1607,10 +1569,9 @@ index 0000000..b7ced7a
 +    make_cb(23, 1);           // query normalization factor
 +    make_cb(29, 1, tt::DataFormat::Int32);      // state index (writer)
 +
-+    auto element_bytes = [](const Tensor& tensor) { return tensor.dtype() == DataType::FLOAT32 ? 4u : 2u; };
 +    std::vector<uint32_t> reader_args = {
 +        kt, vt, batch_size, num_heads, workers_per_head, num_workers, num_key_heads, qkv_heads(in),
-+        element_bytes(in.qkv), element_bytes(in.beta_logits), element_bytes(in.delta_time)};
++        in.beta_logits.element_size(), in.delta_time.element_size()};
 +    TensorAccessorArgs(in.qkv.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.beta_logits.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.delta_time.buffer()).append_to(reader_args);
