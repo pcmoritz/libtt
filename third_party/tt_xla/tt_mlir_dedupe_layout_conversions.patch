@@ -1,0 +1,97 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+@@ -11,6 +11,7 @@
+ #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
+ #include "ttmlir/Support/Logger.h"
+ 
++#include "mlir/Interfaces/SideEffectInterfaces.h"
+ #include "llvm/Support/MathExtras.h"
+ 
+ #include <cassert>
+@@ -76,6 +77,85 @@
+       }
+       rewriter.eraseOp(op);
+     }
++    deduplicateConversions(module, rewriter);
++  }
++
++private:
++  // The layout pass converts every use of a value on its own, so a value
++  // used by many ops (a decode step's state indices, by every layer) gets
++  // the same conversion as many times. Within a block, the same layout
++  // conversion or typecast of the same value is one op, the first; the
++  // chains behind it fold too: the walk replaces as it goes, in order.
++  //
++  // This is CSE restricted to conversions, except that it respects writes:
++  // the in-place ops (copy, update_cache, the recurrent state updates) modify
++  // an operand behind its SSA value, and the dialect marks conversions Pure,
++  // so plain CSE would reuse a conversion made before such a write. Here a
++  // write ends the reuse of the written value, both as the source of
++  // conversions and as a kept result: the values an op's write effects name,
++  // or every operand of an op whose write effects name none.
++  // Calls forget on each value op may write: the values its write effects
++  // name (an in-place op names its cache operand, beside the blanket write
++  // effect of its class), else every operand.
++  template <typename Forget>
++  static void forgetWrites(Operation *op, Forget &&forget) {
++    if (isMemoryEffectFree(op)) {
++      return;
++    }
++    bool named = false;
++    if (auto effects = dyn_cast<MemoryEffectOpInterface>(op)) {
++      llvm::SmallVector<MemoryEffects::EffectInstance> instances;
++      effects.getEffects(instances);
++      for (const MemoryEffects::EffectInstance &instance : instances) {
++        if (isa<MemoryEffects::Write>(instance.getEffect()) &&
++            instance.getValue()) {
++          forget(instance.getValue());
++          named = true;
++        }
++      }
++    }
++    if (!named) {
++      for (Value operand : op->getOperands()) {
++        forget(operand);
++      }
++    }
++  }
++
++  void deduplicateConversions(ModuleOp module, IRRewriter &rewriter) {
++    module->walk([&](func::FuncOp func) {
++      if (func.isDeclaration()) {
++        return;
++      }
++      using Key = std::pair<Value, Type>;
++      llvm::DenseMap<Key, Operation *> first;
++      auto forget = [&](Value written) {
++        llvm::SmallVector<Key> keys;
++        for (auto &[key, keep] : first) {
++          if (key.first == written || keep->getResult(0) == written) {
++            keys.push_back(key);
++          }
++        }
++        for (const Key &key : keys) {
++          first.erase(key);
++        }
++      };
++      func->walk([&](Operation *op) {
++        if (!isa<ttnn::ToLayoutOp, ttnn::TypecastOp>(op) ||
++            op->getNumOperands() != 1 || op->getNumResults() != 1) {
++          forgetWrites(op, forget);
++          return;
++        }
++        auto [it, inserted] = first.try_emplace(
++            Key{op->getOperand(0), op->getResult(0).getType()}, op);
++        Operation *keep = it->second;
++        if (inserted || keep->getBlock() != op->getBlock() ||
++            keep->getName() != op->getName() ||
++            keep->getAttrDictionary() != op->getAttrDictionary()) {
++          return;
++        }
++        rewriter.replaceOp(op, keep->getResult(0));
++      });
++    });
+   }
+ 
+ private:
