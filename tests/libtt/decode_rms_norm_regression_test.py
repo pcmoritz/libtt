@@ -87,7 +87,8 @@ def _reference(x, r, w, eps=1e-6):
 
 def test_rms_norm_residual_with_an_earlier_consumer_of_the_sum(tmp_path):
     """Another use of the sum that precedes the norm must still see the fused
-    op's sum: the fused op takes the add's place."""
+    op's sum: the fused op takes the add's place, where the weight is
+    already defined."""
     eps = 1e-6
 
     def layer(x, r, w):
@@ -135,3 +136,30 @@ def test_rms_norm_residual_leaves_wide_rows_unfused(tmp_path):
     assert irs, "no IR was exported"
     assert any("ttnn.rms_norm" in ir for ir in irs), "no norm in the IR"
     assert not any("ttnn.rms_norm_residual" in ir for ir in irs), "a row too wide for L1 was fused"
+
+
+def test_rms_norm_residual_with_the_weight_cast_after_the_add(tmp_path):
+    """The model's norm casts a BF16 weight to FP32 after the add; the fused
+    op then takes the norm's place, where the cast is already defined."""
+    eps = 1e-6
+
+    def layer(x, r, w):
+        h = x + r
+        hf = h.astype(jnp.float32)
+        var = jnp.mean(hf * hf, axis=-1, keepdims=True)
+        hf = hf * lax.rsqrt(var + eps)
+        hf = hf * jnp.asarray(w, jnp.float32)
+        return hf.astype(jnp.bfloat16), h
+
+    run = jax.jit(layer, compiler_options={"optimization_level": "O1", "export_path": str(tmp_path)})
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(6)
+    x = rng.normal(0, 1, (1, 5120)).astype(jnp.bfloat16)
+    r = rng.normal(0, 1, (1, 5120)).astype(jnp.bfloat16)
+    w = rng.uniform(0.5, 1.5, (5120,)).astype(jnp.bfloat16)
+    n, h = run(*(jax.device_put(v, device) for v in (x, r, w)))
+    expected_norm, expected_sum = _reference(x, r, w)
+    np.testing.assert_allclose(np.asarray(h).astype(np.float32), expected_sum.astype(np.float32), rtol=2**-7, atol=0)
+    np.testing.assert_allclose(np.asarray(n).astype(np.float32), expected_norm, atol=1e-2, rtol=1e-2)
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn*.mlir")]
+    assert irs and any("ttnn.rms_norm_residual" in ir for ir in irs), "the add and the norm were not fused"

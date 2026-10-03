@@ -116,7 +116,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3800,6 +3800,63 @@ public:
+@@ -3800,6 +3800,76 @@ public:
    }
  };
  
@@ -157,17 +157,30 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +        weightType.getDimSize(weightType.getRank() - 1) != type.getDimSize(1)) {
 +      return failure();
 +    }
-+    // The fused op replaces the add's result, so it goes where the add is,
-+    // which every use of the sum follows; the weight must be defined by then.
++    // The fused op defines both the norm and the sum, so it must go where
++    // the weight is defined and every use of the sum follows: at the norm
++    // when the sum's other uses all come after it (the model's case, where
++    // the weight's cast sits between the add and the norm), else at the add
++    // when the weight is already defined there.
 +    if (add->getBlock() != op->getBlock()) {
 +      return failure();
 +    }
-+    if (auto *weightOp = op.getWeight().getDefiningOp();
-+        weightOp && !(weightOp->getBlock() == add->getBlock() &&
-+                      weightOp->isBeforeInBlock(add))) {
++    const bool usesFollowNorm =
++        llvm::all_of(add->getResult(0).getUsers(), [&](Operation *user) {
++          return user == op || (user->getBlock() == op->getBlock() &&
++                                op->isBeforeInBlock(user));
++        });
++    auto *weightOp = op.getWeight().getDefiningOp();
++    const bool weightBeforeAdd =
++        !weightOp || weightOp->getBlock() != add->getBlock() ||
++        weightOp->isBeforeInBlock(add);
++    if (usesFollowNorm) {
++      rewriter.setInsertionPoint(op);
++    } else if (weightBeforeAdd) {
++      rewriter.setInsertionPoint(add);
++    } else {
 +      return failure();
 +    }
-+    rewriter.setInsertionPoint(add);
 +    auto fused = rewriter.create<RMSNormResidualOp>(
 +        op.getLoc(), TypeRange{op.getType(), type}, add->getOperand(0),
 +        add->getOperand(1), op.getWeight(), op.getEpsilonAttr());
@@ -180,7 +193,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -3857,6 +3914,7 @@ public:
+@@ -3857,6 +3927,7 @@ public:
        }
        patterns.add<RMSNormFusionPattern>(&getContext());
        patterns.add<NormalizeRMSNormFusionPattern>(&getContext());
