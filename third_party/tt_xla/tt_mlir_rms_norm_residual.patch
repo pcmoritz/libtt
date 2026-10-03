@@ -1,0 +1,308 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -2297,6 +2297,20 @@ def TTIR_BatchNormTrainingOp : TTIR_NamedOp<"batch_norm_training"> {
+   let hasVerifier = 1;
+ }
+ 
++def TTIR_RMSNormResidualOp : TTIR_NamedOp<"rms_norm_residual"> {
++  let summary = "RMS normalization of a residual sum that also returns the sum";
++  let description = [{
++    sum = input + residual, and output = sum / sqrt(mean(sum^2) + epsilon) * weight
++    over the last dimension, for one tile row of decode activations. The sum is
++    returned too: it is the residual stream the next layer adds to.
++  }];
++  let arguments = (ins AnyRankedTensor:$input,
++                       AnyRankedTensor:$residual,
++                       AnyRankedTensor:$weight,
++                       DefaultValuedAttr<F32Attr, "1e-05">:$epsilon);
++  let results = (outs AnyRankedTensor:$output, AnyRankedTensor:$sum);
++}
++
+ def TTIR_RMSNormOp : TTIR_NamedOp<"rms_norm", [AttrSizedOperandSegments]> {
+   let summary = "RMS normalization operation";
+   let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -2669,6 +2669,19 @@ def TTNN_BatchNormTrainingOp : TTNN_Op<"batch_norm_training", [AttrSizedOperandS
+     let hasVerifier = 1;
+ }
+ 
++def TTNN_RMSNormResidualOp : TTNN_Op<"rms_norm_residual", [OpModelExempt]> {
++  let summary = "RMS normalization of a residual sum that also returns the sum";
++  let description = [{
++    sum = input + residual, and output = sum / sqrt(mean(sum^2) + epsilon) * weight
++    over the last dimension, for one tile row of decode activations.
++  }];
++  let arguments = (ins AnyRankedTensor:$input,
++                       AnyRankedTensor:$residual,
++                       AnyRankedTensor:$weight,
++                       DefaultValuedAttr<F32Attr, "1e-05">:$epsilon);
++  let results = (outs AnyRankedTensor:$output, AnyRankedTensor:$sum);
++}
++
+ def TTNN_RMSNormOp : TTNN_Op<"rms_norm", [AttrSizedOperandSegments, TTNN_ComputeKernelConfigOpInterface]> {
+     let summary = "RMS normalization op.";
+     let description = [{
+diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/ttmlir/Target/TTNN/operations/normalization.fbs
+--- a/include/ttmlir/Target/TTNN/operations/normalization.fbs
++++ b/include/ttmlir/Target/TTNN/operations/normalization.fbs
+@@ -47,6 +47,15 @@ table RMSNormOp {
+   compute_config: tt.target.ttnn.DeviceComputeKernelConfig;
+ }
+ 
++table RMSNormResidualOp {
++  input: tt.target.ttnn.TensorRef;
++  residual: tt.target.ttnn.TensorRef;
++  weight: tt.target.ttnn.TensorRef;
++  epsilon: float;
++  out: tt.target.ttnn.TensorRef;
++  sum: tt.target.ttnn.TensorRef;
++}
++
+ table LayerNormShardedMultiCoreProgramConfig {
+   compute_with_storage_grid_size: tt.target.ttnn.CoreCoord;
+   subblock_w: uint64;
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -137,6 +137,7 @@ union OpType {
+   RepeatOp,
+   RMSNormPreAllGatherOp,
+   RMSNormOp,
++  RMSNormResidualOp,
+   ReshapeOp,
+   SamplingOp,
+   ScaledDotProductAttentionOp,
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -1226,6 +1226,26 @@ public:
+   }
+ };
+ 
++class RMSNormResidualOpConversionPattern
++    : public OpConversionPattern<ttir::RMSNormResidualOp> {
++public:
++  using OpConversionPattern<ttir::RMSNormResidualOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(ttir::RMSNormResidualOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    SmallVector<Type> types;
++    if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
++                                                      types))) {
++      return failure();
++    }
++    rewriter.replaceOpWithNewOp<ttnn::RMSNormResidualOp>(
++        op, types, adaptor.getInput(), adaptor.getResidual(),
++        adaptor.getWeight(), op.getEpsilonAttr());
++    return success();
++  }
++};
++
+ class AdamWOpConversionPattern : public OpConversionPattern<ttir::AdamWOp> {
+ public:
+   using OpConversionPattern<ttir::AdamWOp>::OpConversionPattern;
+@@ -4033,6 +4053,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            SDPAForwardOpConversionPattern,
+            SDPABackwardOpConversionPattern,
+            RMSNormOpConversionPattern,
++           RMSNormResidualOpConversionPattern,
+            DistributedRMSNormOpConversionPattern,
+            DistributedLayerNormOpConversionPattern,
+            LayerNormOpConversionPattern,
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -3800,6 +3800,76 @@ public:
+   }
+ };
+ 
++// Fuses the residual add that feeds a decode RMS norm into the norm, with the
++// sum as a second result since the next layer adds to it:
++//   sum = add(x, r); norm = rms_norm(sum, w)  ->  norm, sum = rms_norm_residual(x, r, w)
++// for one tile row of activations, which the fused program handles.
++class RMSNormResidualFusionPattern : public mlir::OpRewritePattern<RMSNormOp> {
++public:
++  using mlir::OpRewritePattern<RMSNormOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(RMSNormOp op, mlir::PatternRewriter &rewriter) const override {
++    auto add = op.getInput().getDefiningOp<AddOp>();
++    if (!add || !op.getWeight() || op.getBias()) {
++      return failure();
++    }
++    auto type = mlir::cast<RankedTensorType>(op.getInput().getType());
++    constexpr int64_t tile = 32;
++    // The program keeps a core's tiles of every operand and intermediate in
++    // L1: up to ceil(width / 32 / 32) tiles of about 18 KiB each, plus
++    // 24 KiB. A width of 65536 is 64 tiles per core, about 1.2 MiB, which
++    // fits the 1.5 MiB of a Blackhole core.
++    constexpr int64_t maxWidth = 65536;
++    if (type.getRank() != 2 || type.getDimSize(0) < 1 || type.getDimSize(0) > tile ||
++        type.getDimSize(1) % tile != 0 || type.getDimSize(1) > maxWidth ||
++        !type.getElementType().isBF16()) {
++      return failure();
++    }
++    if (op.getNormalizedShape().size() != 1 ||
++        op.getNormalizedShape()[0] != type.getDimSize(1) ||
++        op.getType() != type || add->getOperand(0).getType() != type ||
++        add->getOperand(1).getType() != type) {
++      return failure();
++    }
++    auto weightType = mlir::cast<RankedTensorType>(op.getWeight().getType());
++    if (weightType.getNumElements() != type.getDimSize(1) ||
++        weightType.getDimSize(weightType.getRank() - 1) != type.getDimSize(1)) {
++      return failure();
++    }
++    // The fused op defines both the norm and the sum, so it must go where
++    // the weight is defined and every use of the sum follows: at the norm
++    // when the sum's other uses all come after it (the model's case, where
++    // the weight's cast sits between the add and the norm), else at the add
++    // when the weight is already defined there.
++    if (add->getBlock() != op->getBlock()) {
++      return failure();
++    }
++    const bool usesFollowNorm =
++        llvm::all_of(add->getResult(0).getUsers(), [&](Operation *user) {
++          return user == op || (user->getBlock() == op->getBlock() &&
++                                op->isBeforeInBlock(user));
++        });
++    auto *weightOp = op.getWeight().getDefiningOp();
++    const bool weightBeforeAdd =
++        !weightOp || weightOp->getBlock() != add->getBlock() ||
++        weightOp->isBeforeInBlock(add);
++    if (usesFollowNorm) {
++      rewriter.setInsertionPoint(op);
++    } else if (weightBeforeAdd) {
++      rewriter.setInsertionPoint(add);
++    } else {
++      return failure();
++    }
++    auto fused = rewriter.create<RMSNormResidualOp>(
++        op.getLoc(), TypeRange{op.getType(), type}, add->getOperand(0),
++        add->getOperand(1), op.getWeight(), op.getEpsilonAttr());
++    rewriter.replaceOp(op, fused.getOutput());
++    rewriter.replaceOp(add, fused.getSum());
++    return success();
++  }
++};
++
+ class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
+ public:
+   using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
+@@ -3857,6 +3927,7 @@ public:
+       }
+       patterns.add<RMSNormFusionPattern>(&getContext());
+       patterns.add<NormalizeRMSNormFusionPattern>(&getContext());
++      patterns.add<RMSNormResidualFusionPattern>(&getContext());
+ 
+       patterns.add<GeluFusionPattern>(&getContext());
+       patterns.add<Relu6FusionPattern>(&getContext());
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -1766,6 +1766,21 @@ createOp(FlatbufferObjectCache &cache, RMSNormOp op) {
+       memoryConfig, output, computeConfig.value_or(0));
+ }
+ 
++::flatbuffers::Offset<::tt::target::ttnn::RMSNormResidualOp>
++createOp(FlatbufferObjectCache &cache, RMSNormResidualOp op) {
++  auto tensor = [&](Value value) {
++    return cache.at<::tt::target::ttnn::TensorRef>(
++        getOperandThroughDPSOps(value));
++  };
++  return ::tt::target::ttnn::CreateRMSNormResidualOp(
++      *cache.fbb, tensor(op.getInput()), tensor(op.getResidual()),
++      tensor(op.getWeight()), op.getEpsilon().convertToFloat(),
++      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
++                                  std::nullopt),
++      cache.getOrCreateNoSharding(op.getSum(), tensorValueToFlatbuffer,
++                                  std::nullopt));
++}
++
+ ::flatbuffers::Offset<::tt::target::ttnn::DistributedRMSNormOp>
+ createOp(FlatbufferObjectCache &cache, DistributedRMSNormOp op) {
+   auto input = cache.at<::tt::target::ttnn::TensorRef>(
+@@ -5085,6 +5100,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createOp(cache, rmsNormOp), debugString,
+                            locInfo);
+   }
++  if (auto rmsNormResidualOp = dyn_cast<RMSNormResidualOp>(op)) {
++    return createOperation(cache, createOp(cache, rmsNormResidualOp),
++                           debugString, locInfo);
++  }
+   if (auto distributedRMSNormOp = dyn_cast<DistributedRMSNormOp>(op);
+       distributedRMSNormOp) {
+     return createOperation(cache, createOp(cache, distributedRMSNormOp),
+diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm_residual.cpp b/runtime/lib/ttnn/operations/normalization/rms_norm_residual.cpp
+--- /dev/null
++++ b/runtime/lib/ttnn/operations/normalization/rms_norm_residual.cpp
+@@ -0,0 +1,23 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#include "operations/normalization/rms_norm_residual.h"
++#include "tt/runtime/detail/ttnn/operations/utils.h"
++#include "tt/runtime/detail/ttnn/utils.h"
++#include "ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.hpp"
++
++namespace tt::runtime::ttnn::operations::rms_norm_residual {
++void run(const ::tt::target::ttnn::RMSNormResidualOp *op,
++         ProgramContext &context) {
++  ProgramTensorPool &pool = context.getTensorPool();
++  const ::ttnn::Tensor &input = pool.getTTNNTensorAndValidate(op->input());
++  const ::ttnn::Tensor &residual =
++      pool.getTTNNTensorAndValidate(op->residual());
++  const ::ttnn::Tensor &weight = pool.getTTNNTensorAndValidate(op->weight());
++  auto outputs = ::ttnn::normalization::rms_norm_residual(
++      input, residual, weight, op->epsilon());
++  pool.insertTTNNTensorAndValidate(op->out(), outputs.at(0));
++  pool.insertTTNNTensorAndValidate(op->sum(), outputs.at(1));
++}
++} // namespace tt::runtime::ttnn::operations::rms_norm_residual
+diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm_residual.h b/runtime/lib/ttnn/operations/normalization/rms_norm_residual.h
+--- /dev/null
++++ b/runtime/lib/ttnn/operations/normalization/rms_norm_residual.h
+@@ -0,0 +1,16 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#ifndef RUNTIME_LIB_TTNN_OPERATIONS_NORMALIZATION_RMS_NORM_RESIDUAL_H
++#define RUNTIME_LIB_TTNN_OPERATIONS_NORMALIZATION_RMS_NORM_RESIDUAL_H
++
++#include "tt/runtime/detail/ttnn/types/types.h"
++#include "ttmlir/Target/TTNN/program_generated.h"
++
++namespace tt::runtime::ttnn::operations::rms_norm_residual {
++void run(const ::tt::target::ttnn::RMSNormResidualOp *op,
++         ProgramContext &context);
++} // namespace tt::runtime::ttnn::operations::rms_norm_residual
++
++#endif
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -92,6 +92,7 @@
+ #include "operations/normalization/layer_norm_post_all_gather.h"
+ #include "operations/normalization/layer_norm_pre_all_gather.h"
+ #include "operations/normalization/rms_norm.h"
++#include "operations/normalization/rms_norm_residual.h"
+ #include "operations/normalization/rms_norm_pre_all_gather.h"
+ #include "operations/normalization/softmax.h"
+ #include "operations/pool/pool2d.h"
+@@ -480,6 +481,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+   case ::tt::target::ttnn::OpType::RMSNormOp: {
+     return operations::rms_norm::run(op->type_as_RMSNormOp(), getContext());
+   }
++  case ::tt::target::ttnn::OpType::RMSNormResidualOp: {
++    return operations::rms_norm_residual::run(op->type_as_RMSNormResidualOp(),
++                                              getContext());
++  }
+   case ::tt::target::ttnn::OpType::RMSNormPreAllGatherOp: {
+     return operations::rms_norm_pre_all_gather::run(
+         op->type_as_RMSNormPreAllGatherOp(), getContext());
