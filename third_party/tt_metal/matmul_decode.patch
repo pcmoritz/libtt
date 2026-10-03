@@ -1,61 +1,18 @@
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
-@@ -1018,6 +1018,71 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "ttnn/operations/matmul/device/config/matmul_program_config.hpp"
++#include "ttnn/operations/matmul/device/factory/matmul_decode_program_factory.hpp"
+ #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
+ #include "ttnn/types.hpp"
+ #include <ranges>
+@@ -1018,16 +1019,156 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
  }
  }  // namespace bmm_op_utils
  
-+namespace {
-+
-+bool is_dram_interleaved(const MemoryConfig& memory_config) {
-+    return memory_config.buffer_type() == BufferType::DRAM &&
-+           memory_config.memory_layout() == TensorMemoryLayout::INTERLEAVED;
-+}
-+
-+// Whether the decode matmul is the right program for an automatically
-+// configured matmul: one tile row of BF16 activations times DRAM-interleaved
-+// weights in the default tile, with a BF16 or FP32 output and at least one
-+// output tile per worker core. With fewer output tiles, the 1D matmul keeps
-+// more cores busy by splitting K. The bias, if any, must be a BF16 or FP32
-+// tile row, which the planner only knows by its tile size. These are the
-+// heuristics; validate_matmul_decode_config checks the kernel's requirements.
-+bool prefer_decode_matmul(
-+    const Tensor& input_tensor_a,
-+    const Tensor& input_tensor_b,
-+    const uint32_t bias_single_tile_size,
-+    const ttnn::prim::MatmulParams& attributes) {
-+    using namespace tt::constants;
-+    const auto& a_shape = input_tensor_a.padded_shape();
-+    const auto& b_shape = input_tensor_b.padded_shape();
-+    const uint32_t K = a_shape[-1];
-+    const uint32_t N = b_shape[attributes.transpose_b ? -2 : -1];
-+    const auto output_dtype = attributes.output_dtype.value_or(input_tensor_a.dtype());
-+    const auto grid = input_tensor_a.device()->compute_with_storage_grid_size();
-+    const auto default_tile = tt::tt_metal::Tile();
-+    const bool plain_matmul = !attributes.transpose_a && !attributes.untilize_out &&
-+                              !attributes.user_fused_activation.has_value() && !attributes.global_cb.has_value() &&
-+                              attributes.output_tile.value_or(default_tile) == default_tile;
-+    const bool activation_ok = input_tensor_a.dtype() == DataType::BFLOAT16 &&
-+                               input_tensor_a.layout() == Layout::TILE &&
-+                               input_tensor_a.tensor_spec().tile() == default_tile &&
-+                               is_dram_interleaved(input_tensor_a.memory_config()) &&
-+                               a_shape.volume() == static_cast<uint64_t>(TILE_HEIGHT) * K &&
-+                               input_tensor_a.logical_shape()[-1] % TILE_WIDTH == 0;
-+    const bool weight_ok = input_tensor_b.layout() == Layout::TILE &&
-+                           input_tensor_b.tensor_spec().tile() == default_tile &&
-+                           is_dram_interleaved(input_tensor_b.memory_config()) &&
-+                           b_shape.volume() == static_cast<uint64_t>(K) * N &&
-+                           input_tensor_b.logical_shape()[attributes.transpose_b ? -1 : -2] % TILE_WIDTH == 0;
-+    const bool bias_ok = bias_single_tile_size == 0 ||
-+                         bias_single_tile_size == tt::tile_size(tt::DataFormat::Float16_b) ||
-+                         bias_single_tile_size == tt::tile_size(tt::DataFormat::Float32);
-+    const bool output_ok = (output_dtype == DataType::BFLOAT16 || output_dtype == DataType::FLOAT32) &&
-+                           is_dram_interleaved(attributes.output_mem_config);
-+    return plain_matmul && activation_ok && weight_ok && bias_ok && output_ok && N / TILE_WIDTH >= grid.x * grid.y;
-+}
-+
-+}  // namespace
-+
 +MatmulDecodeProgramConfig create_matmul_decode_program_config(
 +    const Tensor& input_tensor_a, const tt::tt_metal::CoreCoord& compute_with_storage_grid_size, const bool fuse_swiglu) {
 +    const auto& a_shape_padded = utilities::get_matmul_tensor_padded_shape(input_tensor_a, /*transpose_a=*/false);
@@ -70,22 +27,147 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +    };
 +}
 +
++std::optional<std::string> matmul_decode_unsupported_reason(
++    const Tensor& input_tensor_a,
++    const Tensor& input_tensor_b,
++    const std::optional<const Tensor>& bias,
++    const ttnn::prim::MatmulParams& attributes,
++    const MatmulDecodeProgramConfig& config) {
++    using namespace tt::constants;
++    const CoreCoord device_grid = input_tensor_a.device()->compute_with_storage_grid_size();
++    const auto& grid = config.compute_with_storage_grid_size;
++    if (grid.x == 0 || grid.y == 0 || grid.x > device_grid.x || grid.y > device_grid.y) {
++        return fmt::format(
++            "compute_with_storage_grid_size ({}, {}) must be non-zero and fit within the device grid ({}, {})",
++            grid.x,
++            grid.y,
++            device_grid.x,
++            device_grid.y);
++    }
++    const auto default_tile = tt::tt_metal::Tile();
++    const auto in0_tile = utilities::get_matmul_tile(input_tensor_a, attributes.transpose_a);
++    const auto in1_tile = utilities::get_matmul_tile(input_tensor_b, attributes.transpose_b);
++    if (in0_tile != default_tile || in1_tile != default_tile ||
++        attributes.output_tile.value_or(default_tile) != default_tile) {
++        return fmt::format("only the default {}x{} tile is supported", TILE_HEIGHT, TILE_WIDTH);
++    }
++    if (attributes.transpose_a || attributes.untilize_out || attributes.user_fused_activation.has_value() ||
++        attributes.global_cb.has_value()) {
++        return "transpose_a, untilize_out, fused activations and global circular buffers are not supported";
++    }
++
++    const auto a_shape_padded = utilities::get_matmul_tensor_padded_shape(input_tensor_a, attributes.transpose_a);
++    const auto b_shape_padded = utilities::get_matmul_tensor_padded_shape(input_tensor_b, attributes.transpose_b);
++    const uint32_t K = a_shape_padded[-1];
++    const uint32_t N = b_shape_padded[-1];
++    if (input_tensor_a.dtype() != DataType::BFLOAT16 || input_tensor_a.layout() != Layout::TILE ||
++        !utilities::is_dram_interleaved(input_tensor_a.memory_config())) {
++        return fmt::format(
++            "input A must be a tiled BFLOAT16 tensor in interleaved DRAM, got dtype {}, layout {}, memory config {}",
++            input_tensor_a.dtype(),
++            input_tensor_a.layout(),
++            input_tensor_a.memory_config());
++    }
++    if (a_shape_padded.volume() != static_cast<uint64_t>(TILE_HEIGHT) * K) {
++        return fmt::format("input A must be a single tile row, got padded shape {}", a_shape_padded);
++    }
++    if (input_tensor_a.logical_shape()[-1] % TILE_WIDTH != 0) {
++        return fmt::format(
++            "K ({}) must be a multiple of the tile width {}", input_tensor_a.logical_shape()[-1], TILE_WIDTH);
++    }
++    if (input_tensor_b.layout() != Layout::TILE || !utilities::is_dram_interleaved(input_tensor_b.memory_config())) {
++        return fmt::format(
++            "input B must be a tiled tensor in interleaved DRAM, got layout {}, memory config {}",
++            input_tensor_b.layout(),
++            input_tensor_b.memory_config());
++    }
++    if (b_shape_padded.volume() != static_cast<uint64_t>(K) * N) {
++        return fmt::format("input B must be a single [K, N] matrix, got padded shape {}", b_shape_padded);
++    }
++    const uint32_t b_logical_K = input_tensor_b.logical_shape()[attributes.transpose_b ? -1 : -2];
++    if (b_logical_K % TILE_WIDTH != 0) {
++        return fmt::format("K of input B ({}) must be a multiple of the tile width {}", b_logical_K, TILE_WIDTH);
++    }
++    const uint32_t Kt = K / TILE_WIDTH;
++    if (config.in0_block_w == 0 || Kt % config.in0_block_w != 0) {
++        return fmt::format("Kt ({}) must be divisible by in0_block_w ({})", Kt, config.in0_block_w);
++    }
++
++    const auto output_dtype = attributes.output_dtype.value_or(input_tensor_a.dtype());
++    if ((output_dtype != DataType::BFLOAT16 && output_dtype != DataType::FLOAT32) ||
++        !utilities::is_dram_interleaved(attributes.output_mem_config)) {
++        return fmt::format(
++            "the output must be BFLOAT16 or FLOAT32 in interleaved DRAM, got dtype {}, memory config {}",
++            output_dtype,
++            attributes.output_mem_config);
++    }
++
++    if (config.fuse_swiglu) {
++        // The kernel splits the weight at half its padded width, so the halves
++        // must be whole tiles of the logical width too.
++        const uint32_t b_logical_N = input_tensor_b.logical_shape()[attributes.transpose_b ? -2 : -1];
++        if (b_logical_N % (2 * TILE_WIDTH) != 0) {
++            return fmt::format(
++                "a SwiGLU weight holds an up and a gate half of whole tiles, got a logical N of {}", b_logical_N);
++        }
++        if (bias.has_value()) {
++            return "SwiGLU does not take a bias";
++        }
++    }
++    if (bias.has_value()) {
++        if ((bias->dtype() != DataType::BFLOAT16 && bias->dtype() != DataType::FLOAT32) ||
++            bias->layout() != Layout::TILE || !utilities::is_dram_interleaved(bias->memory_config())) {
++            return fmt::format(
++                "the bias must be a tiled BFLOAT16 or FLOAT32 tensor in interleaved DRAM, got dtype {}, layout {}, "
++                "memory config {}",
++                bias->dtype(),
++                bias->layout(),
++                bias->memory_config());
++        }
++    }
++
++    // The whole activation row stays resident on every core.
++    const uint32_t cb_bytes = ttnn::prim::matmul_decode_cb_bytes(
++        input_tensor_a, input_tensor_b, bias, attributes.transpose_b, output_dtype, config);
++    const uint32_t max_l1_space = utilities::get_max_l1_space(input_tensor_a);
++    if (cb_bytes > max_l1_space) {
++        return fmt::format(
++            "the program needs {} bytes of L1 per core for its circular buffers, more than the {} available",
++            cb_bytes,
++            max_l1_space);
++    }
++    return std::nullopt;
++}
++
  MatmulProgramConfig get_program_config(
      const Tensor& input_tensor_a,
      const Tensor& input_tensor_b,
-@@ -1028,6 +1093,11 @@ MatmulProgramConfig get_program_config(
+     const bool transpose_a,
+     const bool transpose_b,
+     const uint32_t bias_single_tile_size,
+-    const ttnn::prim::MatmulParams& attributes) {
++    const ttnn::prim::MatmulParams& attributes,
++    const std::optional<const Tensor>& bias) {
      if (attributes.program_config.has_value()) {
          return attributes.program_config.value();
      }
-+    if (!attributes.user_core_coord.has_value() &&
-+        prefer_decode_matmul(input_tensor_a, input_tensor_b, bias_single_tile_size, attributes)) {
-+        return create_matmul_decode_program_config(
-+            input_tensor_a, input_tensor_a.device()->compute_with_storage_grid_size(), /*fuse_swiglu=*/false);
++    // The decode program when it can run the matmul and there is at least one
++    // output tile per worker core; with fewer, the 1D matmul keeps more cores
++    // busy by splitting K.
++    if (!attributes.user_core_coord.has_value()) {
++        const auto grid = input_tensor_a.device()->compute_with_storage_grid_size();
++        const auto decode_config = create_matmul_decode_program_config(input_tensor_a, grid, /*fuse_swiglu=*/false);
++        const uint32_t N = utilities::get_matmul_tensor_padded_shape(input_tensor_b, transpose_b)[-1];
++        if (N / tt::constants::TILE_WIDTH >= grid.x * grid.y &&
++            !matmul_decode_unsupported_reason(input_tensor_a, input_tensor_b, bias, attributes, decode_config)
++                 .has_value()) {
++            return decode_config;
++        }
 +    }
      auto config = generate_matmul_program_config(
          input_tensor_a,
          input_tensor_b,
-@@ -1046,7 +1116,9 @@ MatmulProgramConfig get_program_config(
+@@ -1046,7 +1187,9 @@ MatmulProgramConfig get_program_config(
      std::visit(
          [input_tensor_a](const auto& program_config) {
              using ProgramConfigType = std::decay_t<decltype(program_config)>;
@@ -99,7 +181,17 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.hpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.hpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.hpp
-@@ -28,6 +28,11 @@ MatmulProgramConfig create_simple_matmul_program_config(
+@@ -4,6 +4,9 @@
+ 
+ #pragma once
+ 
++#include <optional>
++#include <string>
++
+ #include "ttnn/operations/matmul/device/matmul_device_operation_types.hpp"
+ #include "ttnn/operations/matmul/device/config/matmul_program_config_types.hpp"
+ 
+@@ -28,12 +31,29 @@ MatmulProgramConfig create_simple_matmul_program_config(
      const tt::tt_metal::MemoryConfig& mem_config,
      tt::tt_metal::DataType output_dtype);
  
@@ -108,9 +200,28 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.h
 +MatmulDecodeProgramConfig create_matmul_decode_program_config(
 +    const Tensor& input_tensor_a, const tt::tt_metal::CoreCoord& compute_with_storage_grid_size, bool fuse_swiglu);
 +
++// Why the decode program cannot run this matmul with `config`, or nothing if
++// it can: the tensors, their layouts and memory, the config, and the
++// program's L1 footprint. The planner chooses the decode program only when
++// this is empty, and validation reports it.
++std::optional<std::string> matmul_decode_unsupported_reason(
++    const Tensor& input_tensor_a,
++    const Tensor& input_tensor_b,
++    const std::optional<const Tensor>& bias,
++    const ttnn::prim::MatmulParams& attributes,
++    const MatmulDecodeProgramConfig& config);
++
  MatmulProgramConfig get_program_config(
      const Tensor& input_tensor_a,
      const Tensor& input_tensor_b,
+     bool transpose_a,
+     bool transpose_b,
+     uint32_t bias_single_tile_size,
+-    const ttnn::prim::MatmulParams& attributes);
++    const ttnn::prim::MatmulParams& attributes,
++    const std::optional<const Tensor>& bias = std::nullopt);
+ 
+ }  // namespace ttnn::operations::matmul
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
@@ -159,7 +270,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_t
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,290 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -190,16 +301,32 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +namespace {
 +
 +// Per-core schedule of a decode matmul: the output tiles are split as evenly
-+// as possible over num_cores cores, and each core processes its tiles in
-+// passes of up to `group`. The activation row is multicast in chunks of
-+// in0_mcast_w tiles.
-+struct DecodeLayout {
++// as possible over num_cores cores, the first `extra` cores taking one more,
++// and each core processes its tiles in passes of up to `group`. The
++// activation row is multicast in chunks of in0_mcast_w tiles.
++struct DecodePlan {
++    uint32_t Kt;
++    uint32_t halves;
++    uint32_t out_Nt;
 +    uint32_t num_cores;
 +    uint32_t group;
 +    uint32_t in0_mcast_w;
++    uint32_t base_count;
++    uint32_t extra;
++    uint32_t count_of(uint32_t core) const { return base_count + (core < extra ? 1 : 0); }
++    uint32_t start_of(uint32_t core) const { return core * base_count + std::min(core, extra); }
 +};
 +
-+DecodeLayout decode_layout(uint32_t Kt, uint32_t out_Nt, uint32_t halves, uint32_t num_worker_cores) {
++DecodePlan plan_decode(
++    const ttnn::Shape& a_padded_shape,
++    const ttnn::Shape& b_padded_shape,
++    bool transpose_b,
++    const operations::matmul::MatmulDecodeProgramConfig& config) {
++    const uint32_t Kt = a_padded_shape[-1] / TILE_WIDTH;
++    // SwiGLU's weight holds an up and a gate half for every output tile.
++    const uint32_t halves = config.fuse_swiglu ? 2 : 1;
++    const uint32_t out_Nt = b_padded_shape[transpose_b ? -2 : -1] / TILE_WIDTH / halves;
++    const uint32_t num_worker_cores = config.compute_with_storage_grid_size.x * config.compute_with_storage_grid_size.y;
 +    // The accumulators of every weight half for one pass share the eight FP32
 +    // DST tiles.
 +    const uint32_t max_group = 8 / halves;
@@ -210,14 +337,39 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +    while (Kt % in0_mcast_w != 0) {
 +        in0_mcast_w /= 2;
 +    }
-+    return DecodeLayout{
++    return DecodePlan{
++        .Kt = Kt,
++        .halves = halves,
++        .out_Nt = out_Nt,
 +        .num_cores = num_cores,
 +        .group = tt::div_up(max_per_core, passes),
 +        .in0_mcast_w = in0_mcast_w,
++        .base_count = out_Nt / num_cores,
++        .extra = out_Nt % num_cores,
 +    };
 +}
 +
++constexpr uint32_t in1_buffers = 2;
++
 +}  // namespace
++
++uint32_t matmul_decode_cb_bytes(
++    const ttnn::Tensor& input_tensor_a,
++    const ttnn::Tensor& input_tensor_b,
++    const std::optional<const ttnn::Tensor>& bias,
++    const bool transpose_b,
++    const tt::tt_metal::DataType output_dtype,
++    const operations::matmul::MatmulDecodeProgramConfig& config) {
++    const auto plan = plan_decode(input_tensor_a.padded_shape(), input_tensor_b.padded_shape(), transpose_b, config);
++    auto tile_bytes = [](tt::tt_metal::DataType dtype) {
++        return tt::tile_size(tt_metal::datatype_to_dataformat_converter(dtype));
++    };
++    const uint32_t weight_block_tiles = config.in0_block_w * plan.halves * plan.group;
++    return plan.Kt * tile_bytes(input_tensor_a.dtype()) +
++           2 * in1_buffers * weight_block_tiles * tile_bytes(input_tensor_b.dtype()) +
++           plan.count_of(0) * tile_bytes(output_dtype) +
++           (bias.has_value() ? plan.count_of(0) * tile_bytes(bias->dtype()) : 0);
++}
 +
 +ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
 +    const ttnn::prim::MatmulParams& operation_attributes,
@@ -232,24 +384,16 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +    const auto& config =
 +        std::get<operations::matmul::MatmulDecodeProgramConfig>(operation_attributes.program_config.value());
 +
-+    const uint32_t Kt = a.padded_shape()[-1] / TILE_WIDTH;
-+    // SwiGLU's weight holds an up and a gate half for every output tile.
-+    const uint32_t halves = config.fuse_swiglu ? 2 : 1;
 +    const bool transpose_b = operation_attributes.transpose_b;
-+    const uint32_t out_Nt = b.padded_shape()[transpose_b ? -2 : -1] / TILE_WIDTH / halves;
 +    const auto bias_tensor = tensor_args.optional_input_tensors.empty() ? std::nullopt
 +                                                                     : tensor_args.optional_input_tensors[0];
 +    const auto grid = config.compute_with_storage_grid_size;
 +    const uint32_t in0_block_w = config.in0_block_w;
-+    const auto [num_cores, group, in0_mcast_w] = decode_layout(Kt, out_Nt, halves, grid.x * grid.y);
-+    constexpr uint32_t in1_buffers = 2;
++    const auto plan = plan_decode(a.padded_shape(), b.padded_shape(), transpose_b, config);
++    const auto [Kt, halves, out_Nt, num_cores, group, in0_mcast_w, base_count, extra] = plan;
 +    const uint32_t in1_block_num_tiles = in0_block_w * halves * group;
-+    // Output tiles are split as evenly as possible: the first `extra` cores
-+    // take one more than the rest.
-+    const uint32_t base_count = out_Nt / num_cores;
-+    const uint32_t extra = out_Nt % num_cores;
-+    auto count_of = [&](uint32_t i) { return base_count + (i < extra ? 1 : 0); };
-+    auto start_of = [&](uint32_t i) { return i * base_count + std::min(i, extra); };
++    auto count_of = [&](uint32_t i) { return plan.count_of(i); };
++    auto start_of = [&](uint32_t i) { return plan.start_of(i); };
 +
 +    // Cores are numbered row-major over the worker grid. Full rows form one
 +    // multicast group and a partial last row forms another; the first core
@@ -420,7 +564,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.hpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.hpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.hpp
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,36 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -434,6 +578,17 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +#include <tt-metalium/program_descriptors.hpp>
 +
 +namespace ttnn::prim {
++
++// The circular-buffer bytes per core of the decode program: the whole
++// activation row, two double-buffered weight blocks, and this core's output
++// and bias tiles. What create_descriptor allocates.
++uint32_t matmul_decode_cb_bytes(
++    const ttnn::Tensor& input_tensor_a,
++    const ttnn::Tensor& input_tensor_b,
++    const std::optional<const ttnn::Tensor>& bias,
++    bool transpose_b,
++    tt::tt_metal::DataType output_dtype,
++    const operations::matmul::MatmulDecodeProgramConfig& config);
 +
 +// Program factory of MatmulDecodeProgramConfig: one tile row of activations
 +// times DRAM-interleaved weights, optionally finishing with SwiGLU.
@@ -837,137 +992,29 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
              } else {
                  // Non-MultiCore. Grid-bounds check applies to Reuse/Mcast2D/Mcast1D only
                  // (DRAMSharded/BatchedDRAMSharded map to DRAM banks).
-@@ -1996,6 +1999,129 @@ void validate_matmul_mcast1d_config(
+@@ -1996,6 +1999,21 @@ void validate_matmul_mcast1d_config(
      }
  }
  
-+// Decode config: one tile row of BF16 activations and the weights in interleaved DRAM with
-+// tile-aligned K and the default tile, a BF16 or FP32 output in interleaved DRAM, and a
-+// worker grid within the device. A bias is a BF16 or FP32 tile row in interleaved DRAM
-+// (validate_matmul_bias_shape checks its shape). With fuse_swiglu, the weight holds two
-+// halves of whole tiles and there is no bias.
++// Decode config: what the planner checks before choosing it, reported here
++// for explicit configs. validate_matmul_bias_shape checks the bias shape.
 +void validate_matmul_decode_config(
 +    const Tensor& input_tensor_a,
 +    const Tensor& input_tensor_b,
 +    const std::optional<const Tensor>& optional_bias,
 +    const MatmulParams& attributes,
-+    const ttnn::Shape& a_shape_padded,
-+    const ttnn::Shape& b_shape_padded,
-+    const tt::tt_metal::Tile& in0_tile,
-+    const tt::tt_metal::Tile& in1_tile,
 +    const operations::matmul::MatmulDecodeProgramConfig& program_config) {
 +    const auto config_name = ttsl::get_type_name(program_config);
-+    auto is_dram_interleaved = [](const MemoryConfig& memory_config) {
-+        return memory_config.buffer_type() == BufferType::DRAM &&
-+               memory_config.memory_layout() == TensorMemoryLayout::INTERLEAVED;
-+    };
-+
-+    const CoreCoord device_grid = input_tensor_a.device()->compute_with_storage_grid_size();
-+    const auto& grid = program_config.compute_with_storage_grid_size;
-+    TT_FATAL(
-+        grid.x > 0 && grid.y > 0 && grid.x <= device_grid.x && grid.y <= device_grid.y,
-+        "{}: compute_with_storage_grid_size ({}, {}) must be non-zero and fit within device grid ({}, {})",
-+        config_name,
-+        grid.x,
-+        grid.y,
-+        device_grid.x,
-+        device_grid.y);
-+
-+    const auto default_tile = tt::tt_metal::Tile();
-+    TT_FATAL(
-+        in0_tile == default_tile && in1_tile == default_tile &&
-+            attributes.output_tile.value_or(default_tile) == default_tile,
-+        "{}: only the default {}x{} tile is supported",
-+        config_name,
-+        TILE_HEIGHT,
-+        TILE_WIDTH);
-+    TT_FATAL(
-+        !attributes.transpose_a && !attributes.untilize_out && !attributes.user_fused_activation.has_value() &&
-+            !attributes.global_cb.has_value(),
-+        "{}: transpose_a, untilize_out, fused activations and global circular buffers are not supported",
-+        config_name);
-+
-+    const uint32_t K = a_shape_padded[-1];
-+    const uint32_t N = b_shape_padded[-1];
-+    TT_FATAL(
-+        input_tensor_a.dtype() == DataType::BFLOAT16 && input_tensor_a.layout() == Layout::TILE &&
-+            is_dram_interleaved(input_tensor_a.memory_config()),
-+        "{}: input A must be a tiled BFLOAT16 tensor in interleaved DRAM, got dtype {}, layout {}, memory config {}",
-+        config_name,
-+        input_tensor_a.dtype(),
-+        input_tensor_a.layout(),
-+        input_tensor_a.memory_config());
-+    TT_FATAL(
-+        a_shape_padded.volume() == static_cast<uint64_t>(TILE_HEIGHT) * K,
-+        "{}: input A must be a single tile row, got padded shape {}",
-+        config_name,
-+        a_shape_padded);
-+    TT_FATAL(
-+        input_tensor_a.logical_shape()[-1] % TILE_WIDTH == 0,
-+        "{}: K ({}) must be a multiple of the tile width {}",
-+        config_name,
-+        input_tensor_a.logical_shape()[-1],
-+        TILE_WIDTH);
-+    TT_FATAL(
-+        input_tensor_b.layout() == Layout::TILE && is_dram_interleaved(input_tensor_b.memory_config()),
-+        "{}: input B must be a tiled tensor in interleaved DRAM, got layout {}, memory config {}",
-+        config_name,
-+        input_tensor_b.layout(),
-+        input_tensor_b.memory_config());
-+    TT_FATAL(
-+        b_shape_padded.volume() == static_cast<uint64_t>(K) * N,
-+        "{}: input B must be a single [K, N] matrix, got padded shape {}",
-+        config_name,
-+        b_shape_padded);
-+    TT_FATAL(
-+        input_tensor_b.logical_shape()[attributes.transpose_b ? -1 : -2] % TILE_WIDTH == 0,
-+        "{}: K of input B ({}) must be a multiple of the tile width {}",
-+        config_name,
-+        input_tensor_b.logical_shape()[attributes.transpose_b ? -1 : -2],
-+        TILE_WIDTH);
-+    const uint32_t Kt = K / TILE_WIDTH;
-+    TT_FATAL(
-+        program_config.in0_block_w > 0 && Kt % program_config.in0_block_w == 0,
-+        "{}: Kt ({}) must be divisible by in0_block_w ({})",
-+        config_name,
-+        Kt,
-+        program_config.in0_block_w);
-+
 +    TT_FATAL(attributes.output_dtype.has_value(), "{}: output_dtype must be populated", config_name);
-+    TT_FATAL(
-+        (attributes.output_dtype.value() == DataType::BFLOAT16 || attributes.output_dtype.value() == DataType::FLOAT32) &&
-+            is_dram_interleaved(attributes.output_mem_config),
-+        "{}: the output must be BFLOAT16 or FLOAT32 in interleaved DRAM, got dtype {}, memory config {}",
-+        config_name,
-+        attributes.output_dtype.value(),
-+        attributes.output_mem_config);
-+
-+    if (program_config.fuse_swiglu) {
-+        TT_FATAL(
-+            N % (2 * TILE_WIDTH) == 0,
-+            "{}: a SwiGLU weight holds an up and a gate half of whole tiles, got N = {}",
-+            config_name,
-+            N);
-+        TT_FATAL(!optional_bias.has_value(), "{}: SwiGLU does not take a bias", config_name);
-+    }
-+    if (optional_bias.has_value()) {
-+        const auto& bias = optional_bias.value();
-+        TT_FATAL(
-+            (bias.dtype() == DataType::BFLOAT16 || bias.dtype() == DataType::FLOAT32) &&
-+                bias.layout() == Layout::TILE && is_dram_interleaved(bias.memory_config()),
-+            "{}: the bias must be a tiled BFLOAT16 or FLOAT32 tensor in interleaved DRAM, got dtype {}, layout {}, "
-+            "memory config {}",
-+            config_name,
-+            bias.dtype(),
-+            bias.layout(),
-+            bias.memory_config());
-+    }
++    const auto reason = operations::matmul::matmul_decode_unsupported_reason(
++        input_tensor_a, input_tensor_b, optional_bias, attributes, program_config);
++    TT_FATAL(!reason.has_value(), "{}: {}", config_name, reason.value_or(""));
 +}
 +
  // Shared Mcast2D/Mcast1D preamble — the fuse_batch gate. Fused batch requires B batch==1,
  // and transpose_a is unsupported when real batch dims survive with M_per_batch > 1.
  void validate_matmul_mcast_fuse_batch_preamble(
-@@ -2086,6 +2212,8 @@ MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_f
+@@ -2086,6 +2104,8 @@ MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_f
              } else if constexpr (
                  std::is_same_v<T, operations::matmul::MatmulMultiCoreReuseMultiCastBatchedDRAMShardedProgramConfig>) {
                  return MatmulMultiCoreReuseBatchedHSDRAMShardedProgramFactory{};
@@ -976,25 +1023,26 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
              } else {
                  TT_THROW("Unknown program config type");
              }
-@@ -2224,6 +2352,17 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
+@@ -2138,7 +2158,8 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
+         attributes.transpose_a,
+         attributes.transpose_b,
+         bias_single_tile_size,
+-        attributes);
++        attributes,
++        optional_bias);
+     operations::matmul::normalize_program_config(
+         chosen_program_config, input_tensor_a.device()->compute_with_storage_grid_size());
+ 
+@@ -2224,6 +2245,8 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
                      in0_tile,
                      in1_tile,
                      program_config);
 +            } else if constexpr (std::is_same_v<ProgramConfigType, operations::matmul::MatmulDecodeProgramConfig>) {
-+                validate_matmul_decode_config(
-+                    input_tensor_a,
-+                    input_tensor_b,
-+                    optional_bias,
-+                    attributes,
-+                    a_shape_padded,
-+                    b_shape_padded,
-+                    in0_tile,
-+                    in1_tile,
-+                    program_config);
++                validate_matmul_decode_config(input_tensor_a, input_tensor_b, optional_bias, attributes, program_config);
              } else if constexpr (std::is_same_v<
                                       ProgramConfigType,
                                       operations::matmul::MatmulMultiCoreReuseProgramConfig>) {
-@@ -2281,8 +2420,18 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
+@@ -2281,8 +2304,18 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
      const auto& input_tensor_b = input_tensors.at(1);
  
      // Use the compute_matmul_output_shape function to get the output shape
@@ -1014,6 +1062,26 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
  
      const auto& a_shape_padded =
          operations::matmul::utilities::get_matmul_tensor_padded_shape(input_tensor_a, attributes.transpose_a);
+@@ -2311,7 +2344,8 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
+             attributes.transpose_a,
+             attributes.transpose_b,
+             bias_single_tile_size,
+-            attributes);
++            attributes,
++            optional_bias);
+         // Soft-normalize so downstream variant code can safely read allowed_worker_cores; the warning
+         // for missing allowed_worker_cores was emitted at the entry point above.
+         operations::matmul::normalize_program_config(
+@@ -2780,7 +2814,8 @@ MatmulDeviceOperation::tensor_return_value_t matmul(
+             normalized_attributes.transpose_a,
+             normalized_attributes.transpose_b,
+             bias_single_tile_size,
+-            normalized_attributes);
++            normalized_attributes,
++            bias);
+     }
+     operations::matmul::normalize_program_config(
+         normalized_attributes.program_config.value(), input_tensor_a.device()->compute_with_storage_grid_size());
 diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
 --- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp
@@ -1033,10 +1101,35 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.hpp tt
          MatmulMultiCoreProgramFactory,
          MatmulMultiCoreReuseOptimizedProgramFactory,
          MatmulMultiCoreReuseMcast1DProgramFactory,
+diff --git ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.hpp ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.hpp
+--- ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.hpp
++++ ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.hpp
+@@ -33,6 +33,11 @@ inline bool fused_matmul_bias_row_broadcastable(const std::optional<const Tensor
+     return shape[-2] == 1;
+ }
+ 
++inline bool is_dram_interleaved(const tt::tt_metal::MemoryConfig& memory_config) {
++    return memory_config.buffer_type() == tt::tt_metal::BufferType::DRAM &&
++           memory_config.memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED;
++}
++
+ uint32_t get_estimated_size_of_cbs(
+     uint32_t per_core_M,
+     uint32_t per_core_N,
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-@@ -411,6 +411,28 @@ Tensor matmul(
+@@ -263,7 +263,8 @@ static ttnn::Tensor bound_matmul(
+         parameters.transpose_a,
+         parameters.transpose_b,
+         bias_single_tile_size,
+-        matmul_struct);
++        matmul_struct,
++        bias);
+     //----------------------------------------------------------------------------------------------
+ 
+     // Decide if we need to manually transpose or if the program config will handle it
+@@ -411,6 +412,28 @@ Tensor matmul(
          optional_output_tensor);
  }
  
