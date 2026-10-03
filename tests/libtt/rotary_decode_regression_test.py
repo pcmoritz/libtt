@@ -96,3 +96,38 @@ def test_partial_rotary_decode(tmp_path, trace, heads, tail):
         rest = xf[..., 64:] if tail == "slice" else np.flip(xf[..., 64:], axis=-1) * 2
         expected = np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s, rest], axis=-1)
         np.testing.assert_allclose(actual.reshape(1, heads, 256), expected, atol=0.05, rtol=0.02)
+
+
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize("heads", [1, 6])
+def test_partial_rotary_rank4(tmp_path, trace, heads):
+    """The partial rotary on rank-4 input [1, heads, 1, 256], with no reshape
+    after the concat: the fused rotary replaces the concat itself."""
+
+    def rotate(x, cos, sin):
+        rotary = x[..., :64]
+        x1, x2 = rotary[..., :32], rotary[..., 32:]
+        return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin, x[..., 64:]], axis=-1)
+
+    run = jax.jit(
+        rotate,
+        compiler_options={
+            "optimization_level": "O1",
+            "enable_trace": str(trace).lower(),
+            "export_path": str(tmp_path),
+        },
+    )
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(13)
+    for step in range(3):
+        x = rng.normal(0, 1, (1, heads, 1, 256)).astype(jnp.bfloat16)
+        angles = rng.uniform(-3, 3, (1, 1, 1, 32))
+        cos, sin = (f(angles).astype(jnp.bfloat16) for f in (np.cos, np.sin))
+        actual = np.asarray(run(*(jax.device_put(a, device) for a in (x, cos, sin)))).astype(np.float32)
+        if step == 0:
+            irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+            assert any("ttnn.rotary_embedding" in ir for ir in irs)
+        xf, c, s = (a.astype(np.float32) for a in (x, cos, sin))
+        x1, x2 = xf[..., :32], xf[..., 32:64]
+        expected = np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s, xf[..., 64:]], axis=-1)
+        np.testing.assert_allclose(actual, expected, atol=0.05, rtol=0.02)

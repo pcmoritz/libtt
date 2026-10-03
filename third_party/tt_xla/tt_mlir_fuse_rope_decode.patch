@@ -129,7 +129,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
    // sub: x1*cos - x2*sin => subSlice0 = x1 (first half), subSlice1 = x2
    // add: x2*cos + x1*sin => addSlice0 = x2, addSlice1 = x1
    if (!isFirstHalfSlice(subSlice0) || !isSecondHalfSlice(subSlice1)) {
-@@ -642,37 +700,68 @@
+@@ -642,37 +700,74 @@
      return failure();
    }
  
@@ -180,27 +180,33 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
  
 -  replaceWithRoPEComposite(srcOp, rewriter, xSource, cosFull, sinFull,
 -                           resultType);
-+  // cos/sin are half-dim, one row in the decode form. They are brought to
-+  // the composite's rank first, then self-concatenated to the full rotary
-+  // width, so that ttnn::RotaryEmbeddingOp promotion sees full-dim caches and
-+  // the decomposition recognizes the self-concat and uses the halves.
++  // cos/sin are half-dim, one row in the decode form. Match both before
++  // rewriting anything: halfCache only unwraps and validates.
 +  auto halfCache = [&](Value embedding) -> Value {
 +    if (!rank4Reshape) {
 +      return get4DEmbeddingInput(embedding);
 +    }
 +    Value half = skipBroadcastOnly(embedding);
 +    auto type = mlir::cast<RankedTensorType>(half.getType());
-+    if (type.getNumElements() != type.getShape().back()) {
-+      return nullptr;
-+    }
-+    return reshapeTo(rewriter, loc, half, getCacheTypeFor(type, outputType));
++    return type.getNumElements() == type.getShape().back() ? half : nullptr;
 +  };
 +  Value cosHalf = halfCache(subEmb0);
 +  Value sinHalf = halfCache(subEmb1);
 +  if (!cosHalf || !sinHalf) {
 +    return failure();
 +  }
++
++  // Bring a half cache to the composite's rank, then self-concatenate it to
++  // the full rotary width, so that ttnn::RotaryEmbeddingOp promotion sees
++  // full-dim caches and the decomposition recognizes the self-concat and
++  // uses the halves.
 +  auto selfConcat = [&](Value half) {
++    if (rank4Reshape) {
++      half = reshapeTo(
++          rewriter, loc, half,
++          getCacheTypeFor(mlir::cast<RankedTensorType>(half.getType()),
++                          outputType));
++    }
 +    auto type = mlir::cast<RankedTensorType>(half.getType());
 +    SmallVector<int64_t> shape(type.getShape());
 +    shape.back() *= 2;
