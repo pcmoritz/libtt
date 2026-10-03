@@ -1,0 +1,139 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_higher_dim_rm_interleaved.cpp ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_higher_dim_rm_interleaved.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_higher_dim_rm_interleaved.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_higher_dim_rm_interleaved.cpp
+@@ -28,12 +28,14 @@ void kernel_main() {
+     const uint32_t nop = get_arg_val<uint32_t>(7);
+ 
+     constexpr uint32_t original_page_size_bytes = get_compile_time_arg_val(0);
+-    constexpr uint32_t cb_id_in0 = get_compile_time_arg_val(1);
+-    constexpr uint32_t cb_id_in1 = get_compile_time_arg_val(2);
+-    // cb_id_in0 and cb_id_in1 are each 1 page of size: 128 + page_size_bytes.
+-    constexpr uint32_t LOWER_DIMS = get_compile_time_arg_val(3);
+-    constexpr uint32_t REP_DIM = get_compile_time_arg_val(4);
+-    constexpr auto src_args = TensorAccessorArgs<5, 0>();
++    // Each page is copied in chunks of at most chunk_size_bytes, a multiple of 64 bytes.
++    constexpr uint32_t chunk_size_bytes = get_compile_time_arg_val(1);
++    constexpr uint32_t cb_id_in0 = get_compile_time_arg_val(2);
++    constexpr uint32_t cb_id_in1 = get_compile_time_arg_val(3);
++    // cb_id_in0 and cb_id_in1 are each 1 page of size: 128 + chunk_size_bytes.
++    constexpr uint32_t LOWER_DIMS = get_compile_time_arg_val(4);
++    constexpr uint32_t REP_DIM = get_compile_time_arg_val(5);
++    constexpr auto src_args = TensorAccessorArgs<6, 0>();
+     constexpr auto dst_args =
+         TensorAccessorArgs<src_args.next_compile_time_args_offset(), src_args.num_common_runtime_args()>();
+ 
+@@ -80,36 +82,42 @@ void kernel_main() {
+             uint32_t r_offset = r * LOWER_DIMS;
+             for (uint32_t l = lower_dim_start; l < lower_dim_end; l++) {
+                 uint32_t read_offset = h_offset + r_offset + l;
+-                src_noc_addr = s.get_noc_addr(read_offset, 0);
+-                data_location = input_buffer + (src_noc_addr & r_offset_to_use);
+-
+-                CoreLocalMem<uint32_t> dst_mem(data_location);
+-                noc.async_read<NocOptions::DEFAULT, original_page_size_bytes>(
+-                    s,
+-                    dst_mem,
+-                    original_page_size_bytes,
+-                    {.page_id = read_offset, .offset_bytes = 0},
+-                    {.offset_bytes = 0});
+-                noc.async_read_barrier();
+-
+-                for (uint32_t n = 0; n < repetitions; n++) {
+-                    uint32_t write_offset = h_offset_rep + n * LOWER_DIMS_TIMES_REP_DIM + r_offset + l;
+-                    const uint64_t dst_noc_addr = d.get_noc_addr(write_offset, 0);
+-                    if ((data_location & w_offset_to_use) != (dst_noc_addr & w_offset_to_use)) {
+-                        const uint32_t target_align_buffer = alignment_buffer + (dst_noc_addr & w_offset_to_use);
+-                        tt_memmove<false, false, false, original_page_size_bytes>(
+-                            noc, target_align_buffer, data_location, original_page_size_bytes);
+-                        data_location = alignment_buffer + (dst_noc_addr & w_offset_to_use);
++                for (uint32_t chunk_offset = 0; chunk_offset < original_page_size_bytes;
++                     chunk_offset += chunk_size_bytes) {
++                    const uint32_t chunk_bytes = original_page_size_bytes - chunk_offset < chunk_size_bytes
++                                                     ? original_page_size_bytes - chunk_offset
++                                                     : chunk_size_bytes;
++                    src_noc_addr = s.get_noc_addr(read_offset, chunk_offset);
++                    data_location = input_buffer + (src_noc_addr & r_offset_to_use);
++
++                    CoreLocalMem<uint32_t> dst_mem(data_location);
++                    noc.async_read<NocOptions::DEFAULT, chunk_size_bytes>(
++                        s,
++                        dst_mem,
++                        chunk_bytes,
++                        {.page_id = read_offset, .offset_bytes = chunk_offset},
++                        {.offset_bytes = 0});
++                    noc.async_read_barrier();
++
++                    for (uint32_t n = 0; n < repetitions; n++) {
++                        uint32_t write_offset = h_offset_rep + n * LOWER_DIMS_TIMES_REP_DIM + r_offset + l;
++                        const uint64_t dst_noc_addr = d.get_noc_addr(write_offset, chunk_offset);
++                        if ((data_location & w_offset_to_use) != (dst_noc_addr & w_offset_to_use)) {
++                            const uint32_t target_align_buffer = alignment_buffer + (dst_noc_addr & w_offset_to_use);
++                            tt_memmove<false, false, false, chunk_size_bytes>(
++                                noc, target_align_buffer, data_location, chunk_bytes);
++                            data_location = alignment_buffer + (dst_noc_addr & w_offset_to_use);
++                        }
++                        CoreLocalMem<uint32_t> src_mem(data_location);
++                        noc.async_write<NocOptions::DEFAULT, chunk_size_bytes>(
++                            src_mem,
++                            d,
++                            chunk_bytes,
++                            {.offset_bytes = 0},
++                            {.page_id = write_offset, .offset_bytes = chunk_offset});
+                     }
+-                    CoreLocalMem<uint32_t> src_mem(data_location);
+-                    noc.async_write<NocOptions::DEFAULT, original_page_size_bytes>(
+-                        src_mem,
+-                        d,
+-                        original_page_size_bytes,
+-                        {.offset_bytes = 0},
+-                        {.page_id = write_offset, .offset_bytes = 0});
++                    noc.async_write_barrier();
+                 }
+-                noc.async_write_barrier();
+             }
+         }
+     }
+diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_higher_dim.cpp ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_higher_dim.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_higher_dim.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_factory_higher_dim.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "ttnn/operations/data_movement/repeat/device/repeat_program_factory_higher_dim.hpp"
+ 
++#include <algorithm>
+ #include <cstdint>
+ 
+ #include <tt-metalium/host_api.hpp>
+@@ -63,7 +64,6 @@ ProgramDescriptor RepeatProgramFactoryHigherDim::create_descriptor(
+     Buffer* src_buffer = input.buffer();
+     Buffer* dst_buffer = output.buffer();
+     TT_FATAL(dst_buffer != nullptr, "Output buffer should be allocated on device!");
+-    const uint32_t cb_size_bytes = (READ_ALIGNMENT * 2) + page_size_bytes;
+     constexpr uint32_t src0_cb_index = 0;
+     constexpr uint32_t src1_cb_index = 1;
+ 
+@@ -73,6 +73,16 @@ ProgramDescriptor RepeatProgramFactoryHigherDim::create_descriptor(
+     const bool dst_sharded = dst_buffer->buffer_distribution_spec().has_value();
+     const bool needs_alignment_cb = !is_tile_native && !src_sharded && !dst_sharded;
+ 
++    // The interleaved RM kernel copies each page in chunks of at most this many bytes, so its two
++    // CBs stay small however wide a row is (a 248320-wide int32 row is a 970 KiB page, and two
++    // such CBs exceed L1). The chunk is a multiple of READ_ALIGNMENT, so every chunk of a page
++    // keeps the page's source and destination alignment.
++    constexpr uint32_t max_chunk_size_bytes = 64 * 1024;
++    static_assert(max_chunk_size_bytes % READ_ALIGNMENT == 0);
++    const uint32_t chunk_size_bytes =
++        needs_alignment_cb ? std::min(page_size_bytes, max_chunk_size_bytes) : page_size_bytes;
++    const uint32_t cb_size_bytes = (READ_ALIGNMENT * 2) + chunk_size_bytes;
++
+     ProgramDescriptor desc;
+ 
+     desc.cbs.push_back(CBDescriptor{
+@@ -113,6 +123,7 @@ ProgramDescriptor RepeatProgramFactoryHigherDim::create_descriptor(
+             "ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_higher_dim_rm_interleaved.cpp";
+         compile_time_args = {
+             (std::uint32_t)page_size_bytes,
++            chunk_size_bytes,
+             src0_cb_index,
+             src1_cb_index,
+             number_of_lower_pages,
