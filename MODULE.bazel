@@ -522,6 +522,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_sharded_gather.patch",
         "//third_party/tt_xla:tt_mlir_shared_lhs_aligned_slices.patch",
         "//third_party/tt_xla:tt_mlir_rms_norm_residual.patch",
+        "//third_party/tt_xla:tt_mlir_dedupe_layout_conversions.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

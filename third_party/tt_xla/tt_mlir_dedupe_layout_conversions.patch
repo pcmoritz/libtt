@@ -1,0 +1,42 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+@@ -76,6 +76,38 @@
+       }
+       rewriter.eraseOp(op);
+     }
++    deduplicateConversions(module, rewriter);
++  }
++
++private:
++  // The layout pass converts every use of a value on its own, so a value
++  // used by many ops (a decode step's state indices, by every layer) gets
++  // the same conversion as many times. Within a block, the same layout
++  // conversion or typecast of the same value is one op, the first; the
++  // chains behind it fold too: the walk replaces as it goes, in order.
++  void deduplicateConversions(ModuleOp module, IRRewriter &rewriter) {
++    module->walk([&](func::FuncOp func) {
++      if (func.isDeclaration()) {
++        return;
++      }
++      using Key = std::pair<Value, Type>;
++      llvm::DenseMap<Key, Operation *> first;
++      func->walk([&](Operation *op) {
++        if (!isa<ttnn::ToLayoutOp, ttnn::TypecastOp>(op) ||
++            op->getNumOperands() != 1 || op->getNumResults() != 1) {
++          return;
++        }
++        auto [it, inserted] = first.try_emplace(
++            Key{op->getOperand(0), op->getResult(0).getType()}, op);
++        Operation *keep = it->second;
++        if (inserted || keep->getBlock() != op->getBlock() ||
++            keep->getName() != op->getName() ||
++            keep->getAttrDictionary() != op->getAttrDictionary()) {
++          return;
++        }
++        rewriter.replaceOp(op, keep->getResult(0));
++      });
++    });
+   }
+ 
+ private:
