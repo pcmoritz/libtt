@@ -1,0 +1,185 @@
+diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
+--- a/pjrt_implementation/inc/api/client_instance.h
++++ b/pjrt_implementation/inc/api/client_instance.h
+@@ -125,6 +125,11 @@ public:
+   tt::runtime::Device
+   getOrCreateMeshDevice(const std::vector<uint32_t> &target_mesh_shape);
+ 
++  // Whether the open parent mesh spans several chips. A single-device program
++  // then runs on it, replicated on every chip, instead of reopening the mesh
++  // at shape (1, 1), which moves every device tensor to host and back.
++  bool hasMultiChipParentMesh() const;
++
+   // Returns the fabric config computed for the current mesh device.
+   const std::optional<tt::runtime::MeshFabricConfig> &getFabricConfig() const {
+     return m_fabric_config;
+diff --git a/pjrt_implementation/inc/api/loaded_executable_instance.h b/pjrt_implementation/inc/api/loaded_executable_instance.h
+--- a/pjrt_implementation/inc/api/loaded_executable_instance.h
++++ b/pjrt_implementation/inc/api/loaded_executable_instance.h
+@@ -128,10 +128,14 @@ protected:
+   // Opens devices on which input arguments are placed, which we assume are the
+   // the devices where computation will run, if their count is equal to the
+   // corresponding devices count in the mesh shape estimated by the compiler.
++  // When `replicated` is given, a single-device program inside an open
++  // multi-chip mesh runs on that mesh, replicated on every chip, and the flag
++  // says whether it does. The caller must then pass the program's inputs and
++  // outputs through host, where a replicated tensor becomes one buffer.
+   std::optional<tt::runtime::Device>
+   getOrCreateMeshDevice(PJRT_Buffer *const *const *argument_lists,
+                         size_t num_args, size_t num_devices,
+-                        PJRT_Device *pjrt_device);
++                        PJRT_Device *pjrt_device, bool *replicated = nullptr);
+ 
+   // Collects device ids from the addressable devices.
+   std::unordered_set<int>
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -684,6 +684,14 @@ ClientInstance::openMeshDevice(const std::vector<uint32_t> &mesh_shape) {
+   return tt::runtime::openMeshDevice(options);
+ }
+ 
++bool ClientInstance::hasMultiChipParentMesh() const {
++  if (!m_parent_mesh.has_value()) {
++    return false;
++  }
++  std::vector<uint32_t> shape = tt::runtime::getMeshShape(*m_parent_mesh);
++  return shape.size() == 2 && shape[0] * shape[1] > 1;
++}
++
+ void ClientInstance::closeParentMesh() {
+   if (m_parent_mesh.has_value()) {
+     DLOG_F(LOG_DEBUG, "Closing parent mesh.");
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -189,15 +189,33 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+     return status;
+   }
+ 
+-  std::optional<tt::runtime::Device> runtime_device =
+-      getOrCreateMeshDevice(args->argument_lists, args->num_args,
+-                            args->num_devices, args->execute_device);
++  // Single-device programs, such as JAX's eager ops on uncommitted arrays,
++  // run replicated on an open multi-chip mesh instead of reopening it at
++  // shape (1, 1), which would move every device tensor to host and back.
++  // Their inputs and outputs pass through host, where each replicated
++  // tensor becomes the one buffer the program reads or writes.
++  bool replicated = false;
++  std::optional<tt::runtime::Device> runtime_device = getOrCreateMeshDevice(
++      args->argument_lists, args->num_args, args->num_devices,
++      args->execute_device, &replicated);
+ 
+   if (!runtime_device) {
+     // Logging is done inside `getOrCreateMeshDevice`.
+     return tt_pjrt_status::kInternal;
+   }
+ 
++  if (replicated) {
++    for (size_t arg_index = 0; arg_index < args->num_args; ++arg_index) {
++      PjrtTensor *tensor =
++          BufferInstance::unwrap(args->argument_lists[0][arg_index])
++              ->getPjrtTensor()
++              .get();
++      if (tensor && tensor->has_runtime_tensor()) {
++        tensor->move_to_host();
++      }
++    }
++  }
++
+   // Assuming only one program per flatbuffer for now.
+   std::uint32_t program_index = 0;
+ 
+@@ -247,6 +265,30 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+     if (!tt_pjrt_status_is_ok(status)) {
+       return status;
+     }
++
++    if (replicated) {
++      // Preparing the inputs uploaded them, replicated, in place; return them
++      // and the outputs to host so each stays one buffer of one device.
++      for (size_t output_index = 0; output_index < output_tensors.size();
++           ++output_index) {
++        PjrtTensor *tensor =
++            BufferInstance::unwrap(args->output_lists[0][output_index])
++                ->getPjrtTensor()
++                .get();
++        if (tensor && tensor->has_runtime_tensor()) {
++          tensor->move_to_host();
++        }
++      }
++      for (size_t arg_index = 0; arg_index < args->num_args; ++arg_index) {
++        PjrtTensor *tensor =
++            BufferInstance::unwrap(args->argument_lists[0][arg_index])
++                ->getPjrtTensor()
++                .get();
++        if (tensor && tensor->has_runtime_tensor()) {
++          tensor->move_to_host();
++        }
++      }
++    }
+   }
+ 
+   invalidateDonatedInputs(args, donated_indices);
+diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
+@@ -101,7 +101,10 @@ void LoadedExecutableInstance::dumpInputs(
+ std::optional<tt::runtime::Device>
+ LoadedExecutableInstance::getOrCreateMeshDevice(
+     PJRT_Buffer *const *const *argument_lists, size_t num_args,
+-    size_t num_devices, PJRT_Device *pjrt_device) {
++    size_t num_devices, PJRT_Device *pjrt_device, bool *replicated) {
++  if (replicated) {
++    *replicated = false;
++  }
+   std::unordered_set<int> device_ids =
+       getDeviceIds(argument_lists, num_args, num_devices);
+ 
+@@ -134,6 +137,12 @@ LoadedExecutableInstance::getOrCreateMeshDevice(
+   // buffers devices to these devices.
+   // https://github.com/tenstorrent/tt-xla/issues/502
+ 
++  if (replicated && mesh_shape_num_devices == 1 &&
++      m_client_instance->hasMultiChipParentMesh()) {
++    *replicated = true;
++    return *m_client_instance->parentMesh();
++  }
++
+   return m_client_instance->getOrCreateMeshDevice(devices_mesh_shape);
+ }
+ 
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -579,8 +579,14 @@ ModuleBuilder::buildModule(
+   // tt-xla creates 1D mesh by default, so if compiler determines a different
+   // mesh shape, we need to update the mesh in the client instance to match the
+   // compiler determined mesh shape.
++  //
++  // A single-device program runs replicated on a multi-chip mesh (see
++  // FlatbufferLoadedExecutableInstance::execute), so it keeps the mesh.
++  const bool single_device_replicated =
++      mesh_shape.size() == 2 && mesh_shape[0] * mesh_shape[1] == 1 &&
++      client_instance->hasMultiChipParentMesh();
+   if (current_mesh_shape.has_value() &&
+-      current_mesh_shape.value() != mesh_shape) {
++      current_mesh_shape.value() != mesh_shape && !single_device_replicated) {
+     client_instance->getOrCreateMeshDevice(mesh_shape);
+   }
+ 
+diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api/tensor.cc
+--- a/pjrt_implementation/src/api/tensor.cc
++++ b/pjrt_implementation/src/api/tensor.cc
+@@ -151,7 +151,10 @@ void PjrtTensor::move_to_host() noexcept {
+   std::vector<tt::runtime::Tensor> tensors =
+       tt::runtime::toHost(*m_runtime_tensor, /*untilize=*/true);
+ 
+-  TT_FATAL(tensors.size() == m_shards.size() || tensors.size() == 1,
++  // A single buffer may hold a tensor replicated on every chip, when a
++  // single-device program ran on a multi-chip mesh; its shards are equal.
++  TT_FATAL(tensors.size() == m_shards.size() || tensors.size() == 1 ||
++               m_shards.size() == 1,
+            "Unexpected number of tensors after move to host: "
+            "tensors.size()={}, m_shards.size()={}",
+            tensors.size(), m_shards.size());
