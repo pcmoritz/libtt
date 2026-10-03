@@ -58,16 +58,19 @@ def test_rotary_decode_logical_heads(trace, heads):
 
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize("heads", [1, 6, 32])
-def test_partial_rotary_decode(tmp_path, trace, heads):
+@pytest.mark.parametrize("tail", ["slice", "independent"])
+def test_partial_rotary_decode(tmp_path, trace, heads, tail):
     """Qwen3.5 rotates the first 64 of 256 head dims: x[..., :64] by
     (x1 cos - x2 sin, x2 cos + x1 sin) with x[..., 64:] appended. The rotated
-    part becomes one fused rotary; the rest is concatenated unchanged."""
+    part becomes one fused rotary; the tail is concatenated unchanged, also
+    when it is not a slice of the rotated tensor."""
 
     def decode(x, cos, sin):
         rotary = x[..., :64]
         x1, x2 = rotary[..., :32], rotary[..., 32:]
         c, s = cos[:, None, :], sin[:, None, :]
-        out = jnp.concatenate([x1 * c - x2 * s, x2 * c + x1 * s, x[..., 64:]], axis=-1)
+        rest = x[..., 64:] if tail == "slice" else jnp.flip(x[..., 64:], axis=-1) * 2
+        out = jnp.concatenate([x1 * c - x2 * s, x2 * c + x1 * s, rest], axis=-1)
         return out.reshape(1, 1, heads, 256)
 
     run = jax.jit(
@@ -90,5 +93,6 @@ def test_partial_rotary_decode(tmp_path, trace, heads):
             assert any("ttnn.rotary_embedding" in ir for ir in irs)
         xf, c, s = (a.astype(np.float32) for a in (x, cos, sin))
         x1, x2 = xf[..., :32], xf[..., 32:64]
-        expected = np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s, xf[..., 64:]], axis=-1)
+        rest = xf[..., 64:] if tail == "slice" else np.flip(xf[..., 64:], axis=-1) * 2
+        expected = np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s, rest], axis=-1)
         np.testing.assert_allclose(actual.reshape(1, heads, 256), expected, atol=0.05, rtol=0.02)

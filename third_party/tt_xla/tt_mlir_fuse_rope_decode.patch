@@ -97,125 +97,134 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 -    return failure();
 -  }
 -  if (srcOp.getNumOperands() != 2) {
-+  // A partial rotary (Qwen3.5 rotates the first 64 of 256 dims) appends the
-+  // rest of the head unrotated: concat(x1*cos - x2*sin, x2*cos + x1*sin,
-+  // x[..., R:]), where x1 and x2 are the halves of x[..., :R].
++  // A third operand is appended unrotated, as a partial rotary does
++  // (Qwen3.5 rotates the first 64 of 256 dims): concat(x1*cos - x2*sin,
++  // x2*cos + x1*sin, tail) -> concat(rotary(x), tail).
 +  if (srcOp.getNumOperands() != 2 && srcOp.getNumOperands() != 3) {
      return failure();
    }
  
-@@ -609,7 +654,34 @@
+@@ -609,10 +654,23 @@
  
    // Input must be 4D.
    auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
 -  if (inputType.getRank() != 4) {
 +  if (inputType.getRank() != 4 && !rank4Reshape) {
-+    return failure();
-+  }
-+
-+  // For a partial rotary, xSource is x[..., :R] and the third operand is
-+  // x[..., R:] of the same x; the rotary covers xSource only.
-+  SliceStaticOp passSlice;
-+  if (srcOp.getNumOperands() == 3) {
-+    auto rotSlice = xSource.getDefiningOp<SliceStaticOp>();
-+    passSlice = srcOp.getOperand(2).getDefiningOp<SliceStaticOp>();
-+    if (!rotSlice || !passSlice ||
-+        rotSlice.getOperand() != passSlice.getOperand() ||
-+        rotSlice.getOperand().getType() != resultType) {
-+      return failure();
-+    }
-+    int64_t last = resultType.getRank() - 1;
-+    int64_t rotary = inputType.getShape()[last];
-+    auto rotRange = getSliceOnDim(rotSlice, last);
-+    auto passRange = getSliceOnDim(passSlice, last);
-+    if (!rotRange || !passRange || rotRange->first != 0 ||
-+        rotRange->second != rotary || passRange->first != rotary ||
-+        passRange->second != resultType.getShape()[last]) {
-+      return failure();
-+    }
-+  }
-+  int64_t rotaryElements =
-+      passSlice ? inputType.getNumElements() : resultType.getNumElements();
-+  if (rank4Reshape && inputType.getNumElements() != rotaryElements) {
      return failure();
    }
  
-@@ -646,12 +718,17 @@
-   // cos/sin inputs so that ttnn::RotaryEmbeddingOp promotion can match
-   // the expected full-dim shapes. The decomposition body will detect the
-   // self-concat and use the half-dim operand directly.
++  // The two rotation halves concatenate to the rotation of xSource, so
++  // xSource has their concatenated shape. A tail is appended unchanged,
++  // whatever computes it.
++  SmallVector<int64_t> rotatedShape(
++      mlir::cast<RankedTensorType>(subOp.getType()).getShape());
++  rotatedShape.back() +=
++      mlir::cast<RankedTensorType>(addOp.getType()).getShape().back();
++  if (inputType.getShape() != ArrayRef<int64_t>(rotatedShape) ||
++      inputType.getElementType() != resultType.getElementType()) {
++    return failure();
++  }
++  Value tail = srcOp.getNumOperands() == 3 ? srcOp.getOperand(2) : Value();
++
+   // sub: x1*cos - x2*sin => subSlice0 = x1 (first half), subSlice1 = x2
+   // add: x2*cos + x1*sin => addSlice0 = x2, addSlice1 = x1
+   if (!isFirstHalfSlice(subSlice0) || !isSecondHalfSlice(subSlice1)) {
+@@ -642,37 +700,68 @@
+     return failure();
+   }
+ 
+-  // cos/sin are half-dim. Create concat(half, half) as the composite's
+-  // cos/sin inputs so that ttnn::RotaryEmbeddingOp promotion can match
+-  // the expected full-dim shapes. The decomposition body will detect the
+-  // self-concat and use the half-dim operand directly.
 -  Value cosHalf = get4DEmbeddingInput(subEmb0);
 -  Value sinHalf = get4DEmbeddingInput(subEmb1);
-+  Value cosHalf =
-+      rank4Reshape ? skipBroadcastOnly(subEmb0) : get4DEmbeddingInput(subEmb0);
-+  Value sinHalf =
-+      rank4Reshape ? skipBroadcastOnly(subEmb1) : get4DEmbeddingInput(subEmb1);
- 
-   auto cosHalfType = mlir::cast<RankedTensorType>(cosHalf.getType());
-   auto sinHalfType = mlir::cast<RankedTensorType>(sinHalf.getType());
- 
-+  if (rank4Reshape && (cosHalfType.getRank() != resultType.getRank() ||
-+                       sinHalfType.getRank() != resultType.getRank()))
-+    return failure();
-   int64_t lastDim = resultType.getRank() - 1;
- 
-   SmallVector<int64_t> cosFullShape(cosHalfType.getShape());
-@@ -671,8 +748,56 @@
-       srcOp.getLoc(), sinFullType, ValueRange{sinHalf, sinHalf},
-       rewriter.getSI32IntegerAttr(lastDim));
+-
+-  auto cosHalfType = mlir::cast<RankedTensorType>(cosHalf.getType());
+-  auto sinHalfType = mlir::cast<RankedTensorType>(sinHalf.getType());
+-
+-  int64_t lastDim = resultType.getRank() - 1;
+-
+-  SmallVector<int64_t> cosFullShape(cosHalfType.getShape());
+-  cosFullShape[lastDim] *= 2;
+-  auto cosFullType =
+-      RankedTensorType::get(cosFullShape, cosHalfType.getElementType());
+-
+-  SmallVector<int64_t> sinFullShape(sinHalfType.getShape());
+-  sinFullShape[lastDim] *= 2;
+-  auto sinFullType =
+-      RankedTensorType::get(sinFullShape, sinHalfType.getElementType());
+-
+-  auto cosFull = rewriter.create<ConcatOp>(
+-      srcOp.getLoc(), cosFullType, ValueRange{cosHalf, cosHalf},
+-      rewriter.getSI32IntegerAttr(lastDim));
+-  auto sinFull = rewriter.create<ConcatOp>(
+-      srcOp.getLoc(), sinFullType, ValueRange{sinHalf, sinHalf},
+-      rewriter.getSI32IntegerAttr(lastDim));
++  // The decode form is a rank-3 concat followed by a reshape to rank 4: the
++  // rewrite replaces that reshape and works at rank 4, with token_index 0.
++  // Otherwise it replaces the rank-4 concat itself.
++  Location loc = srcOp.getLoc();
++  Operation *anchor =
++      rank4Reshape ? rank4Reshape.getOperation() : srcOp.getOperation();
++  auto outputType = mlir::cast<RankedTensorType>(anchor->getResult(0).getType());
++  int64_t lastDim = outputType.getRank() - 1;
++  // A value at the output's rank: the output shape with its own last dim.
++  auto atOutputRank = [&](Value value) {
++    auto type = mlir::cast<RankedTensorType>(value.getType());
++    SmallVector<int64_t> shape(outputType.getShape());
++    shape.back() = type.getShape().back();
++    return reshapeTo(rewriter, loc, value,
++                     RankedTensorType::get(shape, type.getElementType()));
++  };
  
 -  replaceWithRoPEComposite(srcOp, rewriter, xSource, cosFull, sinFull,
 -                           resultType);
-+  if (!rank4Reshape && !passSlice) {
-+    replaceWithRoPEComposite(srcOp, rewriter, xSource, cosFull, sinFull,
-+                             resultType);
-+    return success();
++  // cos/sin are half-dim, one row in the decode form. They are brought to
++  // the composite's rank first, then self-concatenated to the full rotary
++  // width, so that ttnn::RotaryEmbeddingOp promotion sees full-dim caches and
++  // the decomposition recognizes the self-concat and uses the halves.
++  auto halfCache = [&](Value embedding) -> Value {
++    if (!rank4Reshape) {
++      return get4DEmbeddingInput(embedding);
++    }
++    Value half = skipBroadcastOnly(embedding);
++    auto type = mlir::cast<RankedTensorType>(half.getType());
++    if (type.getNumElements() != type.getShape().back()) {
++      return nullptr;
++    }
++    return reshapeTo(rewriter, loc, half, getCacheTypeFor(type, outputType));
++  };
++  Value cosHalf = halfCache(subEmb0);
++  Value sinHalf = halfCache(subEmb1);
++  if (!cosHalf || !sinHalf) {
++    return failure();
 +  }
-+  if (!rank4Reshape) {
-+    // A rank-4 partial rotary: rotate x[..., :R], append x[..., R:].
-+    Value rotated = createRoPEComposite(srcOp, rewriter, xSource, cosFull,
-+                                        sinFull, inputType);
-+    rewriter.replaceOpWithNewOp<ConcatOp>(
-+        srcOp, resultType, ValueRange{rotated, passSlice.getResult()},
++  auto selfConcat = [&](Value half) {
++    auto type = mlir::cast<RankedTensorType>(half.getType());
++    SmallVector<int64_t> shape(type.getShape());
++    shape.back() *= 2;
++    return rewriter.create<ConcatOp>(
++        loc, RankedTensorType::get(shape, type.getElementType()),
++        ValueRange{half, half}, rewriter.getSI32IntegerAttr(lastDim));
++  };
++
++  Value x = rank4Reshape ? atOutputRank(xSource) : xSource;
++  DictionaryAttr attributes;
++  if (rank4Reshape) {
++    attributes = rewriter.getDictionaryAttr({rewriter.getNamedAttr(
++        "token_index", rewriter.getUI32IntegerAttr(0))});
++  }
++  Value replacement = createRoPEComposite(
++      anchor, rewriter, x, selfConcat(cosHalf), selfConcat(sinHalf),
++      mlir::cast<RankedTensorType>(x.getType()), attributes);
++  if (tail) {
++    replacement = rewriter.create<ConcatOp>(
++        loc, outputType,
++        ValueRange{replacement, rank4Reshape ? atOutputRank(tail) : tail},
 +        rewriter.getSI32IntegerAttr(lastDim));
-+    return success();
 +  }
-+  auto rank4Type = mlir::cast<RankedTensorType>(rank4Reshape.getType());
-+  SmallVector<int64_t> rotaryShape(rank4Type.getShape());
-+  rotaryShape.back() = inputType.getShape().back();
-+  auto compositeResultType =
-+      passSlice ? RankedTensorType::get(rotaryShape, rank4Type.getElementType())
-+                : rank4Type;
-+  Value compositeX =
-+      reshapeTo(rewriter, srcOp.getLoc(), xSource,
-+                RankedTensorType::get(compositeResultType.getShape(),
-+                                      inputType.getElementType()));
-+  Value compositeCos =
-+      reshapeTo(rewriter, srcOp.getLoc(), cosFull,
-+                getCacheTypeFor(cosFullType, compositeResultType));
-+  Value compositeSin =
-+      reshapeTo(rewriter, srcOp.getLoc(), sinFull,
-+                getCacheTypeFor(sinFullType, compositeResultType));
-+  auto compositeAttributes = rewriter.getDictionaryAttr(
-+      {rewriter.getNamedAttr("token_index", rewriter.getUI32IntegerAttr(0))});
-+  if (!passSlice) {
-+    replaceWithRoPEComposite(rank4Reshape.getOperation(), rewriter, compositeX,
-+                             compositeCos, compositeSin, compositeResultType,
-+                             compositeAttributes);
-+    return success();
-+  }
-+  Value rotated = createRoPEComposite(
-+      rank4Reshape.getOperation(), rewriter, compositeX, compositeCos,
-+      compositeSin, compositeResultType, compositeAttributes);
-+  auto passType = mlir::cast<RankedTensorType>(passSlice.getType());
-+  SmallVector<int64_t> passShape(rank4Type.getShape());
-+  passShape.back() = passType.getShape().back();
-+  Value pass = reshapeTo(
-+      rewriter, srcOp.getLoc(), passSlice.getResult(),
-+      RankedTensorType::get(passShape, passType.getElementType()));
-+  rewriter.replaceOpWithNewOp<ConcatOp>(
-+      rank4Reshape, rank4Type, ValueRange{rotated, pass},
-+      rewriter.getSI32IntegerAttr(rank4Type.getRank() - 1));
++  rewriter.replaceOp(anchor, replacement);
    return success();
  }
  
