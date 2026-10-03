@@ -116,7 +116,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3800,6 +3800,46 @@ public:
+@@ -3800,6 +3800,63 @@ public:
    }
  };
  
@@ -136,8 +136,14 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    }
 +    auto type = mlir::cast<RankedTensorType>(op.getInput().getType());
 +    constexpr int64_t tile = 32;
++    // The program keeps a core's tiles of every operand and intermediate in
++    // L1: up to ceil(width / 32 / 32) tiles of about 18 KiB each, plus
++    // 24 KiB. A width of 65536 is 64 tiles per core, about 1.2 MiB, which
++    // fits the 1.5 MiB of a Blackhole core.
++    constexpr int64_t maxWidth = 65536;
 +    if (type.getRank() != 2 || type.getDimSize(0) < 1 || type.getDimSize(0) > tile ||
-+        type.getDimSize(1) % tile != 0 || !type.getElementType().isBF16()) {
++        type.getDimSize(1) % tile != 0 || type.getDimSize(1) > maxWidth ||
++        !type.getElementType().isBF16()) {
 +      return failure();
 +    }
 +    if (op.getNormalizedShape().size() != 1 ||
@@ -151,6 +157,17 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +        weightType.getDimSize(weightType.getRank() - 1) != type.getDimSize(1)) {
 +      return failure();
 +    }
++    // The fused op replaces the add's result, so it goes where the add is,
++    // which every use of the sum follows; the weight must be defined by then.
++    if (add->getBlock() != op->getBlock()) {
++      return failure();
++    }
++    if (auto *weightOp = op.getWeight().getDefiningOp();
++        weightOp && !(weightOp->getBlock() == add->getBlock() &&
++                      weightOp->isBeforeInBlock(add))) {
++      return failure();
++    }
++    rewriter.setInsertionPoint(add);
 +    auto fused = rewriter.create<RMSNormResidualOp>(
 +        op.getLoc(), TypeRange{op.getType(), type}, add->getOperand(0),
 +        add->getOperand(1), op.getWeight(), op.getEpsilonAttr());
@@ -163,7 +180,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -3857,6 +3897,7 @@ public:
+@@ -3857,6 +3914,7 @@ public:
        }
        patterns.add<RMSNormFusionPattern>(&getContext());
        patterns.add<NormalizeRMSNormFusionPattern>(&getContext());
@@ -208,7 +225,6 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
        distributedRMSNormOp) {
      return createOperation(cache, createOp(cache, distributedRMSNormOp),
 diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm_residual.cpp b/runtime/lib/ttnn/operations/normalization/rms_norm_residual.cpp
-new file mode 100644
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/normalization/rms_norm_residual.cpp
 @@ -0,0 +1,23 @@
@@ -236,7 +252,6 @@ new file mode 100644
 +}
 +} // namespace tt::runtime::ttnn::operations::rms_norm_residual
 diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm_residual.h b/runtime/lib/ttnn/operations/normalization/rms_norm_residual.h
-new file mode 100644
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/normalization/rms_norm_residual.h
 @@ -0,0 +1,16 @@

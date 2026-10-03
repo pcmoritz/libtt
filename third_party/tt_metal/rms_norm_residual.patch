@@ -1,8 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
-new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,222 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -40,6 +39,10 @@ new file mode 100644
 +    constexpr uint32_t cb_rstd = get_named_compile_time_arg_val("cb_rstd");
 +    constexpr uint32_t cb_norm = get_named_compile_time_arg_val("cb_norm");
 +    constexpr uint32_t rows = get_named_compile_time_arg_val("rows");
++    // The squares buffer holds `tiles` tiles, the most any core has, and is
++    // used twice; each use advances it by all of them so the second use
++    // starts at its beginning again.
++    constexpr uint32_t tiles = get_named_compile_time_arg_val("tiles");
 +    constexpr uint32_t eps = get_named_compile_time_arg_val("eps");
 +    constexpr uint32_t inv_width = get_named_compile_time_arg_val("inv_width");
 +
@@ -109,7 +112,7 @@ new file mode 100644
 +        cb_push_back(cb_partial_row, 1);
 +    } else {
 +        // squares = sum * sum
-+        cb_reserve_back(cb_squares, count);
++        cb_reserve_back(cb_squares, tiles);
 +        reconfig_data_format(cb_sum, cb_sum);
 +        mul_tiles_init(cb_sum, cb_sum);
 +        for (uint32_t b = 0; b < count; b += batch) {
@@ -120,9 +123,9 @@ new file mode 100644
 +            }
 +            pack_block(cb_squares, b, n);
 +        }
-+        cb_push_back(cb_squares, count);
++        cb_push_back(cb_squares, tiles);
 +        // partial = the row sums of this core's squares, a column, then a row
-+        cb_wait_front(cb_squares, count);
++        cb_wait_front(cb_squares, tiles);
 +        cb_wait_front(cb_scaler, 1);
 +        cb_reserve_back(cb_partial, 1);
 +        // A row reduce unpacks the scaler first; set the formats in that order.
@@ -135,14 +138,14 @@ new file mode 100644
 +        reduce_uninit(cb_squares);
 +        pack_block(cb_partial, 0, 1);
 +        cb_push_back(cb_partial, 1);
-+        cb_pop_front(cb_squares, count);
++        cb_pop_front(cb_squares, tiles);
 +        transpose(cb_partial, cb_partial_row);
 +    }
 +
 +    // scaled = sum * weight (one per column) needs nothing from the other
 +    // cores, so it is done while their rows are gathered.
 +    cb_wait_front(cb_weight, count);
-+    cb_reserve_back(cb_squares, count);
++    cb_reserve_back(cb_squares, tiles);
 +    reconfig_data_format(cb_sum, cb_weight);
 +    mul_bcast_rows_init_short(cb_sum, cb_weight);
 +    for (uint32_t b = 0; b < count; b += batch) {
@@ -153,7 +156,7 @@ new file mode 100644
 +        }
 +        pack_block(cb_squares, b, n);
 +    }
-+    cb_push_back(cb_squares, count);
++    cb_push_back(cb_squares, tiles);
 +    cb_pop_front(cb_weight, count);
 +    cb_pop_front(cb_sum, count);
 +
@@ -204,7 +207,7 @@ new file mode 100644
 +    if constexpr (rows != 1) {
 +        transpose(cb_rstd_row, cb_rstd);
 +    }
-+    cb_wait_front(cb_squares, count);
++    cb_wait_front(cb_squares, tiles);
 +    cb_wait_front(cb_column, 1);
 +    cb_reserve_back(cb_norm, count);
 +    reconfig_data_format(cb_squares, cb_column);
@@ -218,11 +221,10 @@ new file mode 100644
 +        pack_block(cb_norm, b, n);
 +    }
 +    cb_push_back(cb_norm, count);
-+    cb_pop_front(cb_squares, count);
++    cb_pop_front(cb_squares, tiles);
 +    cb_pop_front(cb_column, 1);
 +}
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/reader_rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/reader_rms_norm_residual.cpp
-new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/reader_rms_norm_residual.cpp
 @@ -0,0 +1,83 @@
@@ -310,7 +312,6 @@ new file mode 100644
 +    cb_push_back(cb_weight, count);
 +}
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/writer_rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/writer_rms_norm_residual.cpp
-new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/writer_rms_norm_residual.cpp
 @@ -0,0 +1,132 @@
@@ -447,10 +448,9 @@ new file mode 100644
 +    *written = 0;
 +}
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp
-new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,258 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -575,8 +575,10 @@ new file mode 100644
 +    ProgramDescriptor program;
 +    const auto row_format = datatype_to_dataformat_converter(input.dtype());
 +    const auto weight_format = datatype_to_dataformat_converter(weight.dtype());
++    uint32_t cb_bytes = 0;
 +    auto make_cb = [&](uint32_t index, uint32_t tiles, tt::DataFormat format) {
 +        const uint32_t page_size = tt::tile_size(format);
++        cb_bytes += tiles * page_size;
 +        program.cbs.push_back(CBDescriptor{
 +            .total_size = tiles * page_size,
 +            .core_ranges = cores,
@@ -596,6 +598,14 @@ new file mode 100644
 +    make_cb(10, 1, tt::DataFormat::Float32);        // rsqrt(mean + eps) as a row
 +    make_cb(11, 1, tt::DataFormat::Float32);        // the same as a column
 +    make_cb(12, max_count, row_format);             // norm, for the writer
++    const uint32_t l1_bytes =
++        device->l1_size_per_core() - device->allocator()->get_base_allocator_addr(tt::tt_metal::HalMemType::L1);
++    TT_FATAL(
++        cb_bytes <= l1_bytes,
++        "the circular buffers need {} bytes of L1 per core for a width of {}, more than the {} available",
++        cb_bytes,
++        width,
++        l1_bytes);
 +
 +    // The first core counts the rows written into its gather tile; the
 +    // others are told when the rstd tile has arrived.
@@ -610,6 +620,7 @@ new file mode 100644
 +        {"cb_rstd_row", 10}, {"cb_rstd", 11}, {"cb_norm", 12},
 +        {"num_cores", num_cores},
 +        {"rows", input.logical_shape()[0]},
++        {"tiles", max_count},
 +        {"valid_sem", valid_sem_id},
 +        {"written_sem", written_sem_id},
 +        {"eps", std::bit_cast<uint32_t>(params.epsilon)},
@@ -648,16 +659,17 @@ new file mode 100644
 +            .math_approx_mode = false}};
 +
 +    // Every core writes its row into the first core's gather tile, and that
-+    // core multicasts the rstd tile to the rectangles the cores form: the
-+    // full rows of the grid, and the partial last row. A rectangle's
-+    // destination count leaves out the first core itself.
++    // core multicasts the rstd tile to the rectangles of the core set: the
++    // full rows of the grid and the partial last row. A rectangle's
++    // destination count leaves out the first core itself. The writer takes
++    // two rectangles, the second one possibly empty.
 +    const CoreCoord gather = device->worker_core_from_logical_core(core_at(0));
++    TT_FATAL(cores.ranges().size() <= 2, "the cores must form at most two rectangles, got {}", cores.ranges().size());
 +    std::vector<uint32_t> rectangles;
-+    auto add_rectangle = [&](uint32_t first_core, uint32_t last_core) {
-+        const bool has_first = first_core == 0;
-+        const uint32_t dests = last_core + 1 - first_core - (has_first ? 1 : 0);
-+        const CoreCoord start = device->worker_core_from_logical_core(core_at(first_core));
-+        const CoreCoord end = device->worker_core_from_logical_core(core_at(last_core));
++    for (const CoreRange& range : cores.ranges()) {
++        const CoreCoord start = device->worker_core_from_logical_core(range.start_coord);
++        const CoreCoord end = device->worker_core_from_logical_core(range.end_coord);
++        const uint32_t dests = range.size() - (range.contains(core_at(0)) ? 1 : 0);
 +        rectangles.insert(
 +            rectangles.end(),
 +            {static_cast<uint32_t>(start.x),
@@ -665,18 +677,8 @@ new file mode 100644
 +             static_cast<uint32_t>(end.x),
 +             static_cast<uint32_t>(end.y),
 +             dests});
-+    };
-+    const uint32_t full_rows = num_cores / grid.x;
-+    if (full_rows > 0) {
-+        add_rectangle(0, full_rows * grid.x - 1);
-+    } else {
-+        rectangles.insert(rectangles.end(), {0, 0, 0, 0, 0});
 +    }
-+    if (num_cores % grid.x != 0) {
-+        add_rectangle(full_rows * grid.x, num_cores - 1);
-+    } else {
-+        rectangles.insert(rectangles.end(), {0, 0, 0, 0, 0});
-+    }
++    rectangles.resize(10, 0);
 +    for (uint32_t i = 0; i < num_cores; ++i) {
 +        const CoreCoord core = core_at(i);
 +        reader.emplace_runtime_args(core, {i, start_of(i), count_of(i), input, residual, weight});
@@ -708,7 +710,6 @@ new file mode 100644
 +
 +}  // namespace ttnn::normalization
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.hpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.hpp
-new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.hpp
 @@ -0,0 +1,19 @@
