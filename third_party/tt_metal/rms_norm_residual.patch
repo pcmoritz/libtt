@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,169 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -15,12 +15,12 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +#include "api/compute/matmul.h"
 +#include "api/compute/reconfig_data_format.h"
 +#include "api/compute/reduce.h"
-+#include "api/compute/transpose.h"
 +
-+// sum = input + residual for this core's tiles, then the rows' partial sums
-+// of squares as row 0 of a tile that the writer gathers on the first core;
-+// that core turns the gathered rows into rsqrt(mean(sum^2) + eps) per row
-+// and the writer multicasts it; norm = sum * weight * rstd.
++// sum = input + residual for this core's tiles. The rows' sums of squares
++// over those tiles are the diagonal of sum * sum^T, a tile the writer takes
++// them from to gather on the first core, one column per core; that core
++// sums the rows, turns them into rsqrt(mean + eps), and the writer
++// multicasts the column. norm = sum * weight * rstd.
 +void kernel_main() {
 +    const uint32_t count = get_arg_val<uint32_t>(0);
 +    const bool first = get_arg_val<uint32_t>(1) != 0;
@@ -30,18 +30,14 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +    constexpr uint32_t cb_weight = get_named_compile_time_arg_val("cb_weight");
 +    constexpr uint32_t cb_sum = get_named_compile_time_arg_val("cb_sum");
 +    constexpr uint32_t cb_sum_out = get_named_compile_time_arg_val("cb_sum_out");
-+    constexpr uint32_t cb_squares = get_named_compile_time_arg_val("cb_squares");
++    constexpr uint32_t cb_scaled = get_named_compile_time_arg_val("cb_scaled");
 +    constexpr uint32_t cb_scaler = get_named_compile_time_arg_val("cb_scaler");
 +    constexpr uint32_t cb_partial = get_named_compile_time_arg_val("cb_partial");
-+    constexpr uint32_t cb_partial_row = get_named_compile_time_arg_val("cb_partial_row");
 +    constexpr uint32_t cb_exchange = get_named_compile_time_arg_val("cb_exchange");
-+    constexpr uint32_t cb_rstd_row = get_named_compile_time_arg_val("cb_rstd_row");
 +    constexpr uint32_t cb_rstd = get_named_compile_time_arg_val("cb_rstd");
 +    constexpr uint32_t cb_norm = get_named_compile_time_arg_val("cb_norm");
 +    constexpr uint32_t rows = get_named_compile_time_arg_val("rows");
-+    // The squares buffer holds `tiles` tiles, the most any core has, and is
-+    // used twice; each use advances it by all of them so the second use
-+    // starts at its beginning again.
++    // The most tiles any core has: the size of the per-tile buffers.
 +    constexpr uint32_t tiles = get_named_compile_time_arg_val("tiles");
 +    constexpr uint32_t eps = get_named_compile_time_arg_val("eps");
 +    constexpr uint32_t inv_width = get_named_compile_time_arg_val("inv_width");
@@ -57,18 +53,6 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +            pack_tile(j, cb, first_tile + j);
 +        }
 +        tile_regs_release();
-+    };
-+    // Transpose the one tile of `in` into `out`.
-+    auto transpose = [&](uint32_t in, uint32_t out) {
-+        cb_wait_front(in, 1);
-+        cb_reserve_back(out, 1);
-+        reconfig_data_format_srca(in);
-+        transpose_init(in);
-+        tile_regs_acquire();
-+        transpose_tile(in, 0, 0);
-+        pack_block(out, 0, 1);
-+        cb_push_back(out, 1);
-+        cb_pop_front(in, 1);
 +    };
 +
 +    // sum = input + residual, once for the writer and once to normalize.
@@ -97,55 +81,23 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +    cb_pop_front(cb_input, count);
 +    cb_pop_front(cb_residual, count);
 +
++    // partial = sum * sum^T over this core's tiles: its diagonal holds every
++    // row's sum of squares.
 +    cb_wait_front(cb_sum, count);
-+    if constexpr (rows == 1) {
-+        // The row's sum of squares is element (0, 0) of sum * sum^T,
-+        // accumulated over this core's tiles.
-+        cb_reserve_back(cb_partial_row, 1);
-+        reconfig_data_format(cb_sum, cb_sum);
-+        matmul_init(cb_sum, cb_sum, /*transpose=*/1);
-+        tile_regs_acquire();
-+        for (uint32_t i = 0; i < count; ++i) {
-+            matmul_tiles(cb_sum, cb_sum, i, i, 0);
-+        }
-+        pack_block(cb_partial_row, 0, 1);
-+        cb_push_back(cb_partial_row, 1);
-+    } else {
-+        // squares = sum * sum
-+        cb_reserve_back(cb_squares, tiles);
-+        reconfig_data_format(cb_sum, cb_sum);
-+        mul_tiles_init(cb_sum, cb_sum);
-+        for (uint32_t b = 0; b < count; b += batch) {
-+            const uint32_t n = count - b < batch ? count - b : batch;
-+            tile_regs_acquire();
-+            for (uint32_t j = 0; j < n; ++j) {
-+                mul_tiles(cb_sum, cb_sum, b + j, b + j, j);
-+            }
-+            pack_block(cb_squares, b, n);
-+        }
-+        cb_push_back(cb_squares, tiles);
-+        // partial = the row sums of this core's squares, a column, then a row
-+        cb_wait_front(cb_squares, tiles);
-+        cb_wait_front(cb_scaler, 1);
-+        cb_reserve_back(cb_partial, 1);
-+        // A row reduce unpacks the scaler first; set the formats in that order.
-+        reconfig_data_format(cb_scaler, cb_squares);
-+        reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_squares, cb_scaler, cb_partial);
-+        tile_regs_acquire();
-+        for (uint32_t i = 0; i < count; ++i) {
-+            reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_squares, cb_scaler, i, 0, 0);
-+        }
-+        reduce_uninit(cb_squares);
-+        pack_block(cb_partial, 0, 1);
-+        cb_push_back(cb_partial, 1);
-+        cb_pop_front(cb_squares, tiles);
-+        transpose(cb_partial, cb_partial_row);
++    cb_reserve_back(cb_partial, 1);
++    reconfig_data_format(cb_sum, cb_sum);
++    matmul_init(cb_sum, cb_sum, /*transpose=*/1);
++    tile_regs_acquire();
++    for (uint32_t i = 0; i < count; ++i) {
++        matmul_tiles(cb_sum, cb_sum, i, i, 0);
 +    }
++    pack_block(cb_partial, 0, 1);
++    cb_push_back(cb_partial, 1);
 +
 +    // scaled = sum * weight (one per column) needs nothing from the other
-+    // cores, so it is done while their rows are gathered.
++    // cores, so it is done while their sums are gathered.
 +    cb_wait_front(cb_weight, count);
-+    cb_reserve_back(cb_squares, tiles);
++    cb_reserve_back(cb_scaled, tiles);
 +    reconfig_data_format(cb_sum, cb_weight);
 +    mul_bcast_rows_init_short(cb_sum, cb_weight);
 +    for (uint32_t b = 0; b < count; b += batch) {
@@ -154,75 +106,70 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +        for (uint32_t j = 0; j < n; ++j) {
 +            mul_tiles_bcast_rows(cb_sum, cb_weight, b + j, b + j, j);
 +        }
-+        pack_block(cb_squares, b, n);
++        pack_block(cb_scaled, b, n);
 +    }
-+    cb_push_back(cb_squares, tiles);
++    cb_push_back(cb_scaled, tiles);
 +    cb_pop_front(cb_weight, count);
 +    cb_pop_front(cb_sum, count);
 +
 +    if (first) {
-+        // The exchange tile holds every core's partial row; its column sums
-+        // are the row sums of squares over the whole width, in row 0.
++        // The exchange tile holds every core's sums of squares, one column
++        // per core and one row per row; their row sums are the whole width's.
 +        cb_wait_front(cb_exchange, 1);
 +        cb_wait_front(cb_scaler, 1);
-+        cb_reserve_back(cb_rstd_row, 1);
-+        cb_reserve_back(cb_partial_row, 1);
-+        reconfig_data_format(cb_exchange, cb_scaler);
-+        reduce_init<PoolType::SUM, ReduceDim::REDUCE_COL>(cb_exchange, cb_scaler, cb_rstd_row);
++        cb_reserve_back(cb_rstd, 1);
++        cb_reserve_back(cb_partial, 1);
++        // A row reduce unpacks the scaler first; set the formats in that order.
++        reconfig_data_format(cb_scaler, cb_exchange);
++        reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_exchange, cb_scaler, cb_rstd);
 +        tile_regs_acquire();
-+        reduce_tile<PoolType::SUM, ReduceDim::REDUCE_COL>(cb_exchange, cb_scaler, 0, 0, 0);
++        reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_exchange, cb_scaler, 0, 0, 0);
 +        reduce_uninit(cb_exchange);
-+        // rstd = rsqrt(sum / width + eps) over row 0 only: the SFPU's row
-+        // mode covers faces 0 and 1, and for the single row its first
-+        // iteration already includes element (0, 0).
-+        constexpr int sfpu_iterations = rows == 1 ? 1 : 8;
++        // rstd = rsqrt(sum / width + eps) down column 0: the SFPU's column
++        // mode covers faces 0 and 2, two rows per iteration.
++        constexpr int sfpu_iterations = rows < 16 ? (rows + 1) / 2 : 8;
 +        binop_with_scalar_tile_init();
 +        MATH(SFPU_UNARY_CALL(
 +            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
-+            (APPROX, ckernel::sfpu::MUL, sfpu_iterations), 0, VectorMode::R, inv_width));
++            (APPROX, ckernel::sfpu::MUL, sfpu_iterations), 0, VectorMode::C, inv_width));
 +        MATH(SFPU_UNARY_CALL(
 +            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
-+            (APPROX, ckernel::sfpu::ADD, sfpu_iterations), 0, VectorMode::R, eps));
++            (APPROX, ckernel::sfpu::ADD, sfpu_iterations), 0, VectorMode::C, eps));
 +        rsqrt_tile_init();
 +        MATH(SFPU_UNARY_CALL(
 +            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_rsqrt,
-+            (APPROX, sfpu_iterations, DST_ACCUM_MODE, false, false), 0, VectorMode::R));
++            (APPROX, sfpu_iterations, DST_ACCUM_MODE, false, false), 0, VectorMode::C));
 +        // Once for this core, once for the writer to multicast.
 +        tile_regs_commit();
 +        tile_regs_wait();
-+        pack_reconfig_data_format(cb_rstd_row);
-+        pack_tile(0, cb_rstd_row, 0);
-+        pack_tile(0, cb_partial_row, 0);
++        pack_reconfig_data_format(cb_rstd);
++        pack_tile(0, cb_rstd, 0);
++        pack_tile(0, cb_partial, 0);
 +        tile_regs_release();
-+        cb_push_back(cb_rstd_row, 1);
-+        cb_push_back(cb_partial_row, 1);
++        cb_push_back(cb_rstd, 1);
++        cb_push_back(cb_partial, 1);
 +        cb_pop_front(cb_exchange, 1);
 +    }
 +    cb_wait_front(cb_scaler, 1);
 +    cb_pop_front(cb_scaler, 1);
 +
-+    // norm = scaled * rstd (one per row): element (0, 0) of the rstd tile for
-+    // the single row, else its row 0 transposed into a column.
-+    constexpr uint32_t cb_column = rows == 1 ? cb_rstd_row : cb_rstd;
-+    if constexpr (rows != 1) {
-+        transpose(cb_rstd_row, cb_rstd);
-+    }
-+    cb_wait_front(cb_squares, tiles);
-+    cb_wait_front(cb_column, 1);
++    // norm = scaled * rstd (one per row)
++    cb_wait_front(cb_scaled, tiles);
++    cb_wait_front(cb_rstd, 1);
 +    cb_reserve_back(cb_norm, count);
-+    reconfig_data_format(cb_squares, cb_column);
-+    mul_bcast_cols_init_short(cb_squares, cb_column);
++    reconfig_data_format(cb_scaled, cb_rstd);
++    mul_bcast_cols_init_short(cb_scaled, cb_rstd);
 +    for (uint32_t b = 0; b < count; b += batch) {
 +        const uint32_t n = count - b < batch ? count - b : batch;
 +        tile_regs_acquire();
 +        for (uint32_t j = 0; j < n; ++j) {
-+            mul_tiles_bcast_cols(cb_squares, cb_column, b + j, 0, j);
++            mul_tiles_bcast_cols(cb_scaled, cb_rstd, b + j, 0, j);
 +        }
 +        pack_block(cb_norm, b, n);
 +    }
 +    cb_push_back(cb_norm, count);
-+    cb_pop_front(cb_squares, tiles);
-+    cb_pop_front(cb_column, 1);
++    cb_pop_front(cb_scaled, tiles);
++    cb_pop_front(cb_rstd, 1);
 +}
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/reader_rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/reader_rms_norm_residual.cpp
 --- /dev/null
@@ -314,19 +261,23 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/writer_rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/writer_rms_norm_residual.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/writer_rms_norm_residual.cpp
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,147 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#include <cstdint>
++#include "api/dataflow/circular_buffer.h"
 +#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
 +
 +// Writes the first `rows` rows of this core's sum and norm tiles, and
-+// exchanges the partial sums of squares through the first core: every core
-+// writes row 0 of its partial tile into row `worker` of the gather tile on
-+// core 0 and counts itself in on the `written` semaphore there; core 0
-+// multicasts the rstd tile into every other core's rstd_row buffer and sets
-+// their `valid` semaphore. The buffers have the same address on every core.
++// exchanges the rows' sums of squares through the first core. That core
++// zeroes its exchange tile and tells the others with the `cleared`
++// semaphore; every core then writes its rows' sums, the diagonal of its
++// partial tile, into column `worker` of the exchange tile and counts itself
++// in on the `written` semaphore; the first core multicasts the rstd column
++// into every other core's rstd buffer and sets their `valid` semaphore. The
++// buffers have the same address on every core.
 +void kernel_main() {
 +    const uint32_t worker = get_arg_val<uint32_t>(0);
 +    const uint32_t start = get_arg_val<uint32_t>(1);
@@ -340,23 +291,43 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +    constexpr uint32_t rectangles_arg = 7;
 +
 +    constexpr uint32_t cb_sum_out = get_named_compile_time_arg_val("cb_sum_out");
-+    constexpr uint32_t cb_partial_row = get_named_compile_time_arg_val("cb_partial_row");
++    constexpr uint32_t cb_partial = get_named_compile_time_arg_val("cb_partial");
 +    constexpr uint32_t cb_exchange = get_named_compile_time_arg_val("cb_exchange");
-+    constexpr uint32_t cb_rstd_row = get_named_compile_time_arg_val("cb_rstd_row");
++    constexpr uint32_t cb_rstd = get_named_compile_time_arg_val("cb_rstd");
 +    constexpr uint32_t cb_norm = get_named_compile_time_arg_val("cb_norm");
 +    constexpr uint32_t num_cores = get_named_compile_time_arg_val("num_cores");
 +    constexpr uint32_t rows = get_named_compile_time_arg_val("rows");
 +    constexpr uint32_t valid_sem = get_named_compile_time_arg_val("valid_sem");
 +    constexpr uint32_t written_sem = get_named_compile_time_arg_val("written_sem");
++    constexpr uint32_t cleared_sem = get_named_compile_time_arg_val("cleared_sem");
 +    constexpr auto sum_args = TensorAccessorArgs<0>();
 +    constexpr auto norm_args = TensorAccessorArgs<sum_args.next_compile_time_args_offset()>();
 +    const auto sum = TensorAccessor(sum_args, sum_addr, get_tile_size(cb_sum_out));
 +    const auto norm = TensorAccessor(norm_args, norm_addr, get_tile_size(cb_norm));
 +    const uint32_t valid_addr = get_semaphore(valid_sem);
 +    const uint32_t written_addr = get_semaphore(written_sem);
++    const uint32_t cleared_addr = get_semaphore(cleared_sem);
 +    volatile tt_l1_ptr uint32_t* valid = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(valid_addr);
 +    volatile tt_l1_ptr uint32_t* written = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(written_addr);
-+
++    volatile tt_l1_ptr uint32_t* cleared = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cleared_addr);
++    auto rectangle = [&](uint32_t r, uint32_t field) { return get_arg_val<uint32_t>(rectangles_arg + 5 * r + field); };
++    // `source` of the first core goes to `address` on every other core.
++    auto multicast = [&](uint32_t source, uint32_t address, uint32_t bytes, uint32_t sem_addr) {
++        for (uint32_t r = 0; r < 2; ++r) {
++            const uint32_t dests = rectangle(r, 4);
++            if (dests == 0) {
++                continue;
++            }
++            const uint32_t x0 = rectangle(r, 0), y0 = rectangle(r, 1), x1 = rectangle(r, 2), y1 = rectangle(r, 3);
++            if (bytes > 0) {
++                noc_async_write_multicast(source, get_noc_multicast_addr(x0, y0, x1, y1, address), bytes, dests, true);
++#ifdef ARCH_BLACKHOLE
++                noc_async_writes_flushed();
++#endif
++            }
++            noc_semaphore_set_multicast(sem_addr, get_noc_multicast_addr(x0, y0, x1, y1, sem_addr), dests);
++        }
++    };
 +    auto write_rows = [&](const auto& tensor, uint32_t tile, uint32_t cb) {
 +        const uint64_t dest = tensor.get_noc_addr(start + tile);
 +        const uint32_t source = get_read_ptr(cb) + tile * get_tile_size(cb);
@@ -373,68 +344,59 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +        }
 +    };
 +
++    // The exchange tile has the same address on every core; only the first
++    // core's is written, after it zeroed it.
++    cb_reserve_back(cb_exchange, 1);
++    const uint32_t exchange = get_write_ptr(cb_exchange);
++    if (worker == 0) {
++        {
++            Noc noc;
++            CircularBuffer cb(cb_exchange);
++            noc.async_write_zeros(cb, 4096);
++            noc.write_zeros_l1_barrier();
++        }
++        *cleared = 1;
++        multicast(0, 0, 0, cleared_addr);
++    }
++
 +    cb_wait_front(cb_sum_out, count);
 +    for (uint32_t i = 0; i < count; ++i) {
 +        write_rows(sum, i, cb_sum_out);
 +    }
 +
-+    // Row `worker` of a 32x32 FP32 tile: 64 bytes in each of two faces.
-+    cb_reserve_back(cb_exchange, 1);
-+    const uint32_t exchange = get_write_ptr(cb_exchange);
-+    cb_wait_front(cb_partial_row, 1);
-+    const uint32_t source = get_read_ptr(cb_partial_row);
-+    const uint32_t face = (worker / 16) * 2;
-+    const uint32_t row_offset = (worker % 16) * 64;
-+    for (uint32_t half = 0; half < 2; ++half) {
-+        noc_async_write(
-+            source + half * 1024, get_noc_addr(gather_x, gather_y, exchange + (face + half) * 1024 + row_offset), 64);
++    // Element (r, r) of the partial tile goes to element (r, worker) of the
++    // exchange tile. In a 32x32 FP32 tile, element (r, c) is in face
++    // (r / 16) * 2 + c / 16 at row r % 16, column c % 16.
++    cb_wait_front(cb_partial, 1);
++    const uint32_t partial = get_read_ptr(cb_partial);
++    if (worker != 0) {
++        noc_semaphore_wait(cleared, 1);
++        *cleared = 0;
++    }
++    for (uint32_t r = 0; r < rows; ++r) {
++        const uint32_t value = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
++            partial + ((r / 16) * 3) * 1024 + (r % 16) * 64 + (r % 16) * 4);
++        const uint32_t dest = exchange + ((r / 16) * 2 + worker / 16) * 1024 + (r % 16) * 64 + (worker % 16) * 4;
++        noc_inline_dw_write(get_noc_addr(gather_x, gather_y, dest), value);
 +    }
 +    noc_async_write_barrier();
 +    noc_semaphore_inc(get_noc_addr(gather_x, gather_y, written_addr), 1);
-+    cb_pop_front(cb_partial_row, 1);
++    cb_pop_front(cb_partial, 1);
 +
 +    if (worker == 0) {
-+        // Rows past the cores are nobody's; zero them.
-+        for (uint32_t row = num_cores; row < 32; ++row) {
-+            for (uint32_t half = 0; half < 2; ++half) {
-+                volatile tt_l1_ptr uint32_t* piece = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
-+                    exchange + ((row / 16) * 2 + half) * 1024 + (row % 16) * 64);
-+                for (uint32_t k = 0; k < 16; ++k) {
-+                    piece[k] = 0;
-+                }
-+            }
-+        }
 +        noc_semaphore_wait_min(written, num_cores);
 +        cb_push_back(cb_exchange, 1);
-+
-+        // The rstd tile from the compute kernel goes to every other core.
-+        cb_wait_front(cb_partial_row, 1);
-+        const uint32_t rstd_source = get_read_ptr(cb_partial_row);
-+        const uint32_t rstd_dest = get_write_ptr(cb_rstd_row);
++        // The rstd column from the compute kernel goes to every other core.
++        cb_wait_front(cb_partial, 1);
 +        *valid = 1;
-+        for (uint32_t r = 0; r < 2; ++r) {
-+            const uint32_t x0 = get_arg_val<uint32_t>(rectangles_arg + 5 * r);
-+            const uint32_t y0 = get_arg_val<uint32_t>(rectangles_arg + 5 * r + 1);
-+            const uint32_t x1 = get_arg_val<uint32_t>(rectangles_arg + 5 * r + 2);
-+            const uint32_t y1 = get_arg_val<uint32_t>(rectangles_arg + 5 * r + 3);
-+            const uint32_t dests = get_arg_val<uint32_t>(rectangles_arg + 5 * r + 4);
-+            if (dests == 0) {
-+                continue;
-+            }
-+            noc_async_write_multicast(
-+                rstd_source, get_noc_multicast_addr(x0, y0, x1, y1, rstd_dest), get_tile_size(cb_rstd_row), dests, true);
-+#ifdef ARCH_BLACKHOLE
-+            noc_async_writes_flushed();
-+#endif
-+            noc_semaphore_set_multicast(valid_addr, get_noc_multicast_addr(x0, y0, x1, y1, valid_addr), dests);
-+        }
++        multicast(get_read_ptr(cb_partial), get_write_ptr(cb_rstd), get_tile_size(cb_rstd), valid_addr);
 +        noc_async_write_barrier();
-+        cb_pop_front(cb_partial_row, 1);
++        cb_pop_front(cb_partial, 1);
 +    } else {
-+        cb_reserve_back(cb_rstd_row, 1);
++        cb_reserve_back(cb_rstd, 1);
 +        noc_semaphore_wait(valid, 1);
 +        *valid = 0;
-+        cb_push_back(cb_rstd_row, 1);
++        cb_push_back(cb_rstd, 1);
 +    }
 +
 +    cb_wait_front(cb_norm, count);
@@ -450,7 +412,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,260 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -590,14 +552,12 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_res
 +    make_cb(2, max_count, weight_format);           // weight tiles
 +    make_cb(3, max_count, row_format);              // sum, kept for the normalization
 +    make_cb(4, max_count, row_format);              // sum, for the writer
-+    make_cb(5, max_count, tt::DataFormat::Float32); // squares, then sum * weight
++    make_cb(5, max_count, tt::DataFormat::Float32); // sum * weight
 +    make_cb(6, 1, tt::DataFormat::Float32);         // reduce scaler
-+    make_cb(7, 1, tt::DataFormat::Float32);         // this core's row sums of squares (column)
-+    make_cb(8, 1, tt::DataFormat::Float32);         // the same as a row, for the exchange; then the rstd for the writer
-+    make_cb(9, 1, tt::DataFormat::Float32);         // every core's row sums, one row per core
-+    make_cb(10, 1, tt::DataFormat::Float32);        // rsqrt(mean + eps) as a row
-+    make_cb(11, 1, tt::DataFormat::Float32);        // the same as a column
-+    make_cb(12, max_count, row_format);             // norm, for the writer
++    make_cb(7, 1, tt::DataFormat::Float32);         // sum * sum^T, for the writer; then the rstd for the writer
++    make_cb(8, 1, tt::DataFormat::Float32);         // every core's sums of squares, one column per core
++    make_cb(9, 1, tt::DataFormat::Float32);         // rsqrt(mean + eps), one per row, a column
++    make_cb(10, max_count, row_format);             // norm, for the writer
 +    const uint32_t l1_bytes =
 +        device->l1_size_per_core() - device->allocator()->get_base_allocator_addr(tt::tt_metal::HalMemType::L1);
 +    TT_FATAL(
@@ -607,22 +567,26 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_res
 +        width,
 +        l1_bytes);
 +
-+    // The first core counts the rows written into its gather tile; the
-+    // others are told when the rstd tile has arrived.
++    // The first core counts the columns written into its exchange tile; the
++    // others are told when it has zeroed that tile, and when the rstd column
++    // has arrived.
 +    constexpr uint32_t valid_sem_id = 0;
 +    constexpr uint32_t written_sem_id = 1;
-+    program.semaphores.push_back(SemaphoreDescriptor{.id = valid_sem_id, .core_ranges = cores, .initial_value = 0});
-+    program.semaphores.push_back(SemaphoreDescriptor{.id = written_sem_id, .core_ranges = cores, .initial_value = 0});
++    constexpr uint32_t cleared_sem_id = 2;
++    for (uint32_t id : {valid_sem_id, written_sem_id, cleared_sem_id}) {
++        program.semaphores.push_back(SemaphoreDescriptor{.id = id, .core_ranges = cores, .initial_value = 0});
++    }
 +
 +    const std::vector<std::pair<std::string, uint32_t>> common_args = {
 +        {"cb_input", 0},  {"cb_residual", 1}, {"cb_weight", 2},   {"cb_sum", 3},      {"cb_sum_out", 4},
-+        {"cb_squares", 5}, {"cb_scaler", 6},  {"cb_partial", 7},  {"cb_partial_row", 8}, {"cb_exchange", 9},
-+        {"cb_rstd_row", 10}, {"cb_rstd", 11}, {"cb_norm", 12},
++        {"cb_scaled", 5},  {"cb_scaler", 6},   {"cb_partial", 7},  {"cb_exchange", 8}, {"cb_rstd", 9},
++        {"cb_norm", 10},
 +        {"num_cores", num_cores},
 +        {"rows", input.logical_shape()[0]},
 +        {"tiles", max_count},
 +        {"valid_sem", valid_sem_id},
 +        {"written_sem", written_sem_id},
++        {"cleared_sem", cleared_sem_id},
 +        {"eps", std::bit_cast<uint32_t>(params.epsilon)},
 +        {"inv_width", std::bit_cast<uint32_t>(1.0f / static_cast<float>(width))},
 +    };
@@ -658,8 +622,8 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_res
 +            .fp32_dest_acc_en = true,
 +            .math_approx_mode = false}};
 +
-+    // Every core writes its row into the first core's gather tile, and that
-+    // core multicasts the rstd tile to the rectangles of the core set: the
++    // Every core writes its column into the first core's exchange tile, and
++    // that core multicasts the rstd column to the rectangles of the core set: the
 +    // full rows of the grid and the partial last row. A rectangle's
 +    // destination count leaves out the first core itself. The writer takes
 +    // two rectangles, the second one possibly empty.
