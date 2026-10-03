@@ -1056,7 +1056,7 @@ new file mode 100644
 index 0000000..e981660
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,230 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1088,17 +1088,22 @@ index 0000000..e981660
 +    }
 +}
 +
-+// Read the 64-byte aligned piece of the row holding the scalar to the start
-+// of the tile: 16 FP32 elements, or 32 BFLOAT16 elements of a row pair.
++// The scalar's byte offset in its tile, and the 64-byte aligned piece of
++// the tile that holds it.
++template <uint32_t element_bytes>
++FORCE_INLINE uint32_t scalar_offset(uint32_t row, uint32_t column) {
++    return tile_offset(row, column) * element_bytes;
++}
++
++// Read the 64-byte piece holding the scalar to the start of the tile.
 +template <uint32_t element_bytes, typename Accessor>
 +FORCE_INLINE void read_scalar(
 +    Noc& noc, const Accessor& input, CircularBuffer& cb,
 +    uint32_t page, uint32_t row, uint32_t column) {
-+    const uint32_t aligned_row = element_bytes == 4 ? row : row & ~1u;
 +    cb.reserve_back(1);
 +    noc.async_read(
 +        input, cb, 64,
-+        {.page_id = page, .offset_bytes = tile_offset(aligned_row, (column / 16) * 16) * element_bytes},
++        {.page_id = page, .offset_bytes = scalar_offset<element_bytes>(row, column) & ~63u},
 +        {.offset_bytes = 0});
 +}
 +
@@ -1107,14 +1112,13 @@ index 0000000..e981660
 +template <uint32_t element_bytes>
 +FORCE_INLINE void make_scalar_tile(Noc& noc, CircularBuffer& cb, uint32_t row, uint32_t column) {
 +    const uint32_t address = cb.get_write_ptr();
++    const uint32_t index = (scalar_offset<element_bytes>(row, column) & 63u) / element_bytes;
 +    volatile tt_l1_ptr uint32_t* tile = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(address);
 +    uint32_t element;
 +    if constexpr (element_bytes == 4) {
-+        element = tile[column % 16];
++        element = tile[index];
 +    } else {
-+        element = static_cast<uint32_t>(
-+                      reinterpret_cast<volatile tt_l1_ptr uint16_t*>(address)[(row & 1) * 16 + column % 16])
-+                  << 16;
++        element = static_cast<uint32_t>(reinterpret_cast<volatile tt_l1_ptr uint16_t*>(address)[index]) << 16;
 +    }
 +    noc.async_write_zeros(cb, 4096);
 +    noc.write_zeros_l1_barrier();
@@ -1384,7 +1388,7 @@ new file mode 100644
 index 0000000..b7ced7a
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,277 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1393,6 +1397,7 @@ index 0000000..b7ced7a
 +#include <algorithm>
 +#include <bit>
 +#include <cmath>
++#include <initializer_list>
 +#include <utility>
 +
 +#include <tt-metalium/buffer.hpp>
@@ -1434,22 +1439,13 @@ index 0000000..b7ced7a
 +    static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
 +};
 +
-+void validate_tensor(const Tensor& tensor, DataType dtype, const char* name) {
-+    TT_FATAL(tensor.storage_type() == StorageType::DEVICE, "{} must be on device", name);
-+    TT_FATAL(tensor.buffer() != nullptr, "{} must be allocated", name);
-+    TT_FATAL(tensor.layout() == Layout::TILE, "{} must use TILE layout", name);
-+    TT_FATAL(tensor.dtype() == dtype, "{} has an unsupported dtype", name);
-+}
-+
-+// The per-token gate logits may arrive as the model's BFLOAT16 activations
-+// or as FLOAT32.
-+void validate_activation(const Tensor& tensor, const char* name) {
++void validate_tensor(const Tensor& tensor, std::initializer_list<DataType> dtypes, const char* name) {
 +    TT_FATAL(tensor.storage_type() == StorageType::DEVICE, "{} must be on device", name);
 +    TT_FATAL(tensor.buffer() != nullptr, "{} must be allocated", name);
 +    TT_FATAL(tensor.layout() == Layout::TILE, "{} must use TILE layout", name);
 +    TT_FATAL(
-+        tensor.dtype() == DataType::BFLOAT16 || tensor.dtype() == DataType::FLOAT32,
-+        "{} must be BFLOAT16 or FLOAT32", name);
++        std::find(dtypes.begin(), dtypes.end(), tensor.dtype()) != dtypes.end(),
++        "{} has an unsupported dtype {}", name, tensor.dtype());
 +}
 +
 +void check_shape(const Tensor& tensor, std::initializer_list<uint32_t> expected, const char* name) {
@@ -1481,14 +1477,15 @@ index 0000000..b7ced7a
 +    TT_FATAL(
 +        2 * num_key_heads + num_heads == qkv_heads(in) && num_heads % num_key_heads == 0,
 +        "value heads must be a multiple of the query and key heads");
-+    validate_tensor(in.qkv, DataType::FLOAT32, "qkv");
-+    validate_activation(in.beta_logits, "beta logits");
-+    validate_activation(in.delta_time, "delta time");
-+    validate_tensor(in.a_log, DataType::FLOAT32, "A log");
-+    validate_tensor(in.dt_bias, DataType::FLOAT32, "delta-time bias");
-+    validate_tensor(in.state, DataType::FLOAT32, "state");
-+    validate_tensor(in.state_indices, DataType::INT32, "state indices");
-+    validate_tensor(in.has_initial_state, DataType::BFLOAT16, "initial-state mask");
++    validate_tensor(in.qkv, {DataType::FLOAT32}, "qkv");
++    // The per-token gate logits may arrive as the model's BFLOAT16 activations.
++    validate_tensor(in.beta_logits, {DataType::BFLOAT16, DataType::FLOAT32}, "beta logits");
++    validate_tensor(in.delta_time, {DataType::BFLOAT16, DataType::FLOAT32}, "delta time");
++    validate_tensor(in.a_log, {DataType::FLOAT32}, "A log");
++    validate_tensor(in.dt_bias, {DataType::FLOAT32}, "delta-time bias");
++    validate_tensor(in.state, {DataType::FLOAT32}, "state");
++    validate_tensor(in.state_indices, {DataType::INT32}, "state indices");
++    validate_tensor(in.has_initial_state, {DataType::BFLOAT16}, "initial-state mask");
 +
 +    constexpr uint32_t dim = head_dim;
 +    check_shape(in.delta_time, {batch_size, num_heads}, "delta time");
