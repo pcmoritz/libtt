@@ -1053,10 +1053,10 @@ index 0000000..3f1ffc7
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
 new file mode 100644
-index 0000000..a162037
+index 0000000..4c7396d
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,227 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1144,12 +1144,10 @@ index 0000000..a162037
 +    constexpr uint32_t qkv_heads = get_compile_time_arg_val(7);
 +    // The gate logits' element type: the raw bits of BFLOAT16 or FLOAT32.
 +    using GateLogits = std::conditional_t<get_compile_time_arg_val(8) == 4, uint32_t, uint16_t>;
-+    // Each gate tensor is [B, W] tiles, with the heads at columns from
-+    // beta_column (delta_time_column) on.
++    // Each gate tensor is [B, W], with the heads at columns from beta_column
++    // (delta_time_column) on; B <= 32, so a scalar is in the first tile row.
 +    constexpr uint32_t beta_column = get_compile_time_arg_val(9);
-+    constexpr uint32_t beta_row_tiles = get_compile_time_arg_val(10);
-+    constexpr uint32_t delta_time_column = get_compile_time_arg_val(11);
-+    constexpr uint32_t delta_time_row_tiles = get_compile_time_arg_val(12);
++    constexpr uint32_t delta_time_column = get_compile_time_arg_val(10);
 +    constexpr uint32_t vt = full_vt / workers_per_head;
 +    constexpr uint32_t state_tiles = kt * vt;
 +    constexpr uint32_t tile_bytes = 4096;
@@ -1164,7 +1162,7 @@ index 0000000..a162037
 +    const uint32_t state_indices_address = get_arg_val<uint32_t>(7);
 +    const uint32_t has_initial_state_address = get_arg_val<uint32_t>(8);
 +
-+    constexpr auto qkv_args = TensorAccessorArgs<13>();
++    constexpr auto qkv_args = TensorAccessorArgs<11>();
 +    constexpr auto beta_logits_args = TensorAccessorArgs<qkv_args.next_compile_time_args_offset()>();
 +    constexpr auto delta_time_args = TensorAccessorArgs<beta_logits_args.next_compile_time_args_offset()>();
 +    constexpr auto a_log_args = TensorAccessorArgs<delta_time_args.next_compile_time_args_offset()>();
@@ -1251,15 +1249,12 @@ index 0000000..a162037
 +
 +    read_vector(noc, qkv, value_cb, page(2 * key_heads + head) + column_start, batch % 32, vt);
 +
-+    const uint32_t scalar_row = batch % 32;
 +    const uint32_t beta_head = beta_column + head;
 +    const uint32_t delta_time_head = delta_time_column + head;
 +    read_scalar<GateLogits>(
-+        noc, beta_logits, beta_logits_cb, (batch / 32) * beta_row_tiles + beta_head / 32, scalar_row,
-+        beta_head % 32);
++        noc, beta_logits, beta_logits_cb, beta_head / 32, batch, beta_head % 32);
 +    read_scalar<GateLogits>(
-+        noc, delta_time, delta_time_cb, (batch / 32) * delta_time_row_tiles + delta_time_head / 32,
-+        scalar_row, delta_time_head % 32);
++        noc, delta_time, delta_time_cb, delta_time_head / 32, batch, delta_time_head % 32);
 +    read_scalar<uint32_t>(noc, a_log, a_log_cb, head / 32, 0, head % 32);
 +    read_scalar<uint32_t>(noc, dt_bias, dt_bias_cb, head / 32, 0, head % 32);
 +    noc.async_write_zeros(key_transposed_cb, kt * tile_bytes);
@@ -1279,9 +1274,9 @@ index 0000000..a162037
 +    key_cb.push_back(kt);
 +    key_transposed_cb.push_back(kt);
 +    value_cb.push_back(vt);
-+    make_scalar_tile<GateLogits>(noc, beta_logits_cb, scalar_row, beta_head % 32);
++    make_scalar_tile<GateLogits>(noc, beta_logits_cb, batch, beta_head % 32);
 +    beta_logits_cb.push_back(1);
-+    make_scalar_tile<GateLogits>(noc, delta_time_cb, scalar_row, delta_time_head % 32);
++    make_scalar_tile<GateLogits>(noc, delta_time_cb, batch, delta_time_head % 32);
 +    delta_time_cb.push_back(1);
 +    make_scalar_tile<uint32_t>(noc, a_log_cb, 0, head % 32);
 +    a_log_cb.push_back(1);
@@ -1387,10 +1382,10 @@ index 0000000..ea01b86
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
 new file mode 100644
-index 0000000..b901881
+index 0000000..0ecec60
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,294 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1469,9 +1464,6 @@ index 0000000..b901881
 +
 +// K, the number of query and key heads.
 +uint32_t key_heads(const DecodeInputs& in) { return (qkv_heads(in) - num_heads(in)) / 2; }
-+
-+// The tiles of one tile row of a [B, W] gate tensor.
-+uint32_t gate_row_tiles(const Tensor& gate) { return (gate.logical_shape()[1] + 31) / 32; }
 +
 +void DecodeOperation::validate_on_program_cache_miss(
 +    const operation_attributes_t& params, const tensor_args_t& in) {
@@ -1588,8 +1580,7 @@ index 0000000..b901881
 +    std::vector<uint32_t> reader_args = {
 +        kt, vt, batch_size, num_heads, workers_per_head, num_workers, num_key_heads, qkv_heads(in),
 +        in.beta_logits.element_size(),
-+        params.beta_column, gate_row_tiles(in.beta_logits),
-+        params.delta_time_column, gate_row_tiles(in.delta_time)};
++        params.beta_column, params.delta_time_column};
 +    TensorAccessorArgs(in.qkv.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.beta_logits.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.delta_time.buffer()).append_to(reader_args);

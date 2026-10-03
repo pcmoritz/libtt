@@ -71,21 +71,6 @@ def test_gdn_decode_grouped_heads(
             "export_path": str(tmp_path),
         },
     )
-    if packed_gates:
-        spec = lambda shape, dtype: jax.ShapeDtypeStruct(shape, dtype)
-        run.lower(
-            spec((batch + 2, heads, dim, dim), jnp.float32),
-            spec((batch, 2 * key_heads, dim), jnp.float32),
-            spec((batch, heads, dim), jnp.float32),
-            (spec((batch, 2 * heads), gate_dtype),),
-            spec((heads,), jnp.float32),
-            spec((heads,), jnp.float32),
-            spec((batch,), jnp.int32),
-            spec((batch,), jnp.bfloat16),
-        ).compile()
-        (ir,) = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
-        assert "ttnn.slice" not in ir
-        assert f"delta_time_column = {heads} : i32" in ir
     rng = np.random.default_rng(71)
     slots = batch + 2
     for _ in range(3):
@@ -122,6 +107,13 @@ def test_gdn_decode_grouped_heads(
         )
         np.testing.assert_allclose(np.asarray(actual_state), expected_state, atol=2e-3, rtol=0.05)
         np.testing.assert_allclose(np.asarray(actual_output), expected_output, atol=2e-3, rtol=0.05)
+
+    if packed_gates:
+        # The slices of the packed gates fold into the kernel's column offsets.
+        (ir_path,) = (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")
+        ir = ir_path.read_text()
+        assert "ttnn.slice" not in ir
+        assert f"delta_time_column = {heads} : i32" in ir
 
 
 @pytest.mark.parametrize("output_dtype", [jnp.bfloat16, jnp.float32])
