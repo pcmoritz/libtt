@@ -12,7 +12,7 @@ Build and install the plugin into the Python environment used by SGLang-JAX:
 ```bash
 bazel build -c opt //:jax_tt_plugin_wheel
 python -m pip install --force-reinstall --no-deps \
-  bazel-bin/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl
+  bazel-bin/jax_tt_plugin-0.1.1-py3-none-linux_x86_64.whl
 ```
 
 Select the two connected chips by PCI address. These are the addresses on the

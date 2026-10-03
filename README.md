@@ -16,7 +16,7 @@ The local code in this repository is intentionally small:
 
 ```bash
 bazel build //:jax_tt_plugin_wheel
-python -m pip install bazel-bin/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl
+python -m pip install bazel-bin/jax_tt_plugin-0.1.1-py3-none-linux_x86_64.whl
 ```
 
 The wheel contains `libtt.so` and libtt's JAX initialization hook.
@@ -100,7 +100,7 @@ Build the plugin wheel first:
 ```bash
 cd /path/to/libtt
 bazel build //:jax_tt_plugin_wheel
-export LIBTT_WHEEL="$PWD/bazel-bin/jax_tt_plugin-0.1.0-py3-none-linux_x86_64.whl"
+export LIBTT_WHEEL="$PWD/bazel-bin/jax_tt_plugin-0.1.1-py3-none-linux_x86_64.whl"
 ```
 
 Then check out SGLang-JAX, which includes the TT backend:

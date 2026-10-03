@@ -272,8 +272,10 @@ pkg_tar(
         ":tt_metal_runtime_sources",
     ],
     compressor = ":libtt_zstd_compressor",
+    # Release wheels: level 19 with a 2^27-byte long-distance window keeps the
+    # wheel under PyPI's 100 MB file limit (see libtt_zstd_compressor.cc).
     compressor_args = select({
-        ":release_compression": "19",
+        ":release_compression": "19 27",
         "//conditions:default": "9",
     }),
     extension = "tar.zst",
