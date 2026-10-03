@@ -20,21 +20,25 @@ def gated_delta_decode(state, qkv, b, a, A_log, dt_bias, indices, initial):
 
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize(
-    "batch,key_heads,groups,qk_scale,dtype",
+    "batch,key_heads,groups,qk_scale,qkv_dtype,gate_dtype",
     [
-        (1, 4, 3, 1.0, np.float32),
-        (2, 2, 2, 1.0, np.float32),
-        (1, 4, 1, 1.0, np.float32),
+        (1, 4, 3, 1.0, np.float32, np.float32),
+        (2, 2, 2, 1.0, np.float32, np.float32),
+        (1, 4, 1, 1.0, np.float32, np.float32),
         # 48 value heads: scalars and outputs past head 32, and more workers.
-        (2, 16, 3, 1.0, np.float32),
+        (2, 16, 3, 1.0, np.float32, np.float32),
         # Tiny and zero q and k, whose norms the epsilon dominates.
-        (1, 4, 3, 1e-4, np.float32),
-        (1, 4, 3, 0.0, np.float32),
-        # A BFLOAT16 convolution output, which the runtime converts to FP32.
-        (1, 4, 3, 1.0, jnp.bfloat16),
+        (1, 4, 3, 1e-4, np.float32, np.float32),
+        (1, 4, 3, 0.0, np.float32, np.float32),
+        # The serving combination: the FP32 convolution output with the
+        # model's BFLOAT16 gate logits, with odd rows and gate columns past
+        # the first face.
+        (2, 16, 3, 1.0, np.float32, jnp.bfloat16),
+        # A BFLOAT16 convolution output is widened before the kernel.
+        (1, 4, 3, 1.0, jnp.bfloat16, jnp.bfloat16),
     ],
 )
-def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale, dtype):
+def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale, qkv_dtype, gate_dtype):
     # Like Qwen3.5: the kernel reads q, k and v as heads of one
     # [B, (2 * key_heads + heads) * D] tensor, L2-normalizes q and k, scales q,
     # and each q/k head serves a group of value heads.
@@ -42,8 +46,10 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale, dty
     eps, scale = 1e-6, dim**-0.5
 
     def decode(state, qk, v, b, a, A_log, dt_bias, indices, initial):
-        mixed = jnp.concatenate([qk.reshape(batch, -1), v.reshape(batch, -1)], axis=1).astype(dtype)
-        return gated_delta_decode(state, mixed, b, a, A_log, dt_bias, indices, initial)
+        mixed = jnp.concatenate([qk.reshape(batch, -1), v.reshape(batch, -1)], axis=1).astype(qkv_dtype)
+        return gated_delta_decode(
+            state, mixed, b.astype(gate_dtype), a.astype(gate_dtype), A_log, dt_bias, indices, initial
+        )
 
     device = jax.devices("tt")[0]
     run = jax.jit(
@@ -54,10 +60,10 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale, dty
     slots = batch + 2
     for _ in range(3):
         # The inputs as the kernel sees them, rounded to dtype.
-        qk = (rng.normal(0, 1, (batch, 2 * key_heads, dim)) * qk_scale).astype(dtype).astype(np.float32)
-        v = rng.normal(0, 0.5, (batch, heads, dim)).astype(dtype).astype(np.float32)
-        b = rng.normal(0, 1, (batch, heads)).astype(np.float32)
-        a = rng.normal(0, 1, (batch, heads)).astype(np.float32)
+        qk = (rng.normal(0, 1, (batch, 2 * key_heads, dim)) * qk_scale).astype(qkv_dtype).astype(np.float32)
+        v = rng.normal(0, 0.5, (batch, heads, dim)).astype(qkv_dtype).astype(np.float32)
+        b = rng.normal(0, 1, (batch, heads)).astype(gate_dtype).astype(np.float32)
+        a = rng.normal(0, 1, (batch, heads)).astype(gate_dtype).astype(np.float32)
         A_log = rng.uniform(-1, 1, heads).astype(np.float32)
         dt_bias = rng.uniform(-1, 1, heads).astype(np.float32)
         state = rng.normal(0, 0.05, (slots, heads, dim, dim)).astype(np.float32)
@@ -85,3 +91,46 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale, dty
         )
         np.testing.assert_allclose(np.asarray(actual_state), expected_state, atol=2e-3, rtol=0.05)
         np.testing.assert_allclose(np.asarray(actual_output), expected_output, atol=2e-3, rtol=0.05)
+
+
+@pytest.mark.parametrize("output_dtype", [jnp.bfloat16, jnp.float32])
+def test_conv_update_output_dtype(output_dtype):
+    """The convolution update writes silu(conv) in the dtype the graph
+    declares: BFLOAT16, or FP32 for the decode kernel without a cast."""
+    batch, channels, slots, taps = 2, 256, 4, 4
+
+    def conv_update(state, value, weight, indices, initial):
+        return jax.ffi.ffi_call(
+            "tt.causal_conv1d_update",
+            (
+                jax.ShapeDtypeStruct(state.shape, state.dtype),
+                jax.ShapeDtypeStruct(value.shape, output_dtype),
+            ),
+            input_output_aliases={0: 0},
+            vmap_method="sequential",
+        )(state, value, weight, indices, initial)
+
+    device = jax.devices("tt")[0]
+    run = jax.jit(conv_update, compiler_options={"optimization_level": "O1"})
+    rng = np.random.default_rng(5)
+    state = rng.normal(0, 1, (slots, channels, taps - 1)).astype(jnp.bfloat16)
+    value = rng.normal(0, 1, (batch, channels)).astype(jnp.bfloat16)
+    weight = rng.normal(0, 0.5, (channels, taps)).astype(jnp.bfloat16)
+    indices = np.array([2, 1], np.int32)
+    initial = np.array([1, 0], np.float32).astype(jnp.bfloat16)
+    new_state, out = run(*(jax.device_put(x, device) for x in (state, value, weight, indices, initial)))
+
+    s = state.astype(np.float32)
+    history = np.stack([np.where(initial[i], s[slot], 0) for i, slot in enumerate(indices)])  # [B, C, 3]
+    history = np.concatenate([history, value.astype(np.float32)[:, :, None]], axis=-1)  # [B, C, 4]
+    conv = np.sum(history * weight.astype(np.float32)[None], axis=-1)
+    expected = conv / (1 + np.exp(-conv))
+    actual = np.asarray(out).astype(np.float32)
+    assert out.dtype == output_dtype
+    # The kernel computes in BF16 either way; the FP32 output only spares the
+    # decode kernel a cast.
+    np.testing.assert_allclose(actual, expected, atol=1 / 64, rtol=1 / 64)
+    expected_state = s.copy()
+    for i, slot in enumerate(indices):
+        expected_state[slot] = history[i, :, 1:]
+    np.testing.assert_allclose(np.asarray(new_state).astype(np.float32), expected_state, atol=0, rtol=0)
