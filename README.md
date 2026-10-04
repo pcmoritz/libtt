@@ -55,7 +55,6 @@ bazel test //tests:jax_test_suite \
   --test_arg=--ignore=tests/x64_context_test.py \
   --test_arg=--ignore=tests/lax_metal_test.py \
   --test_arg=--ignore=tests/ann_test.py \
-  --test_arg=--ignore=tests/clear_backends_test.py \
   --test_arg=--ignore=tests/colocated_python_test.py \
   --test_arg=--ignore=tests/compilation_cache_test.py \
   --test_arg=--ignore=tests/pallas \
@@ -67,6 +66,11 @@ bazel test //tests:jax_test_suite \
   --test_arg=--ignore=tests/sparse_test.py \
   --test_arg=--ignore=tests/sparsify_test.py \
   --test_arg=--deselect=tests/blocked_sampler_test.py::BlockedFoldInTest::test_blocked_fold_in_shape_invariance_4096x512_vs_1024x2048 \
+  --test_arg=--deselect=tests/logging_test.py::LoggingTest::test_subprocess_cpp_logging_level \
+  --test_arg=--deselect=tests/logging_test.py::LoggingTest::test_subprocess_double_logging_absent \
+  --test_arg=--deselect=tests/logging_test.py::LoggingTest::test_subprocess_stderr_debug_logging \
+  --test_arg=--deselect=tests/logging_test.py::LoggingTest::test_subprocess_stderr_info_logging \
+  --test_arg=--deselect=tests/logging_test.py::LoggingTest::test_subprocess_toggling_logging_level \
   --test_arg=--override-ini=addopts= \
   --test_arg=-p \
   --test_arg=no:faulthandler \

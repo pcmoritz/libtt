@@ -1,0 +1,49 @@
+diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
+--- a/pjrt_implementation/inc/api/client_instance.h
++++ b/pjrt_implementation/inc/api/client_instance.h
+@@ -62,6 +62,11 @@
+ 
+   static GlobalClientInstanceSingleton &getInstance();
+   std::unique_ptr<ClientInstance> m_client_instance;
++
++  // Number of PJRT clients handed out for `m_client_instance`. A framework can
++  // create a new client before destroying the old one (e.g. after
++  // `jax.clear_backends()`), so they share one instance, which owns the device.
++  int m_ref_count = 0;
+ };
+ 
+ // Represents PJRT_Client structure and the functionality around it.
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -274,21 +274,28 @@
+ }
+ 
+ PJRT_Error *GlobalClientInstanceSingleton::initClient() {
++  GlobalClientInstanceSingleton &singleton_instance = getInstance();
++  if (singleton_instance.isInitialized()) {
++    ++singleton_instance.m_ref_count;
++    return nullptr;
++  }
++
+   std::unique_ptr<ClientInstance> client = std::make_unique<ClientInstance>();
+   PJRT_Error *error = client->initialize();
+   if (error) {
+     return error;
+   }
+ 
+-  GlobalClientInstanceSingleton &singleton_instance = getInstance();
+   singleton_instance.m_client_instance = std::move(client);
++  singleton_instance.m_ref_count = 1;
+ 
+   return nullptr;
+ }
+ 
+ void GlobalClientInstanceSingleton::destroyClient() {
+   GlobalClientInstanceSingleton &singleton_instance = getInstance();
+-  if (singleton_instance.isInitialized()) {
++  if (singleton_instance.isInitialized() &&
++      --singleton_instance.m_ref_count == 0) {
+     singleton_instance.m_client_instance.reset();
+   }
+ }
