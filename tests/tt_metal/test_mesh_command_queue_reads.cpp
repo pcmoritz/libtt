@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -133,6 +134,30 @@ TEST_F(MeshCommandQueueReadTest, WriteQueuesWhileBlockingReadWaits) {
         }
     }
     FAIL() << "the read was never queued before the write in 5 attempts";
+}
+
+TEST_F(MeshCommandQueueReadTest, BlockingReadSleepsWhileWaiting) {
+    auto& cq = mesh_device_->mesh_command_queue();
+    write_flag(0);
+    EnqueueMeshWorkload(cq, gate_, false);
+
+    auto host = DistributedHostBuffer::create(mesh_device_->shape());
+    for (const auto& coord : MeshCoordinateRange(mesh_device_->shape())) {
+        host.emplace_shard(coord, [&] { return HostBuffer(std::vector<uint32_t>(data_->size() / sizeof(uint32_t))); });
+    }
+    double cpu_ms = 0;
+    std::thread reader([&] {
+        timespec begin{}, end{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &begin);
+        cq.enqueue_read(data_, host, std::nullopt, /*blocking=*/true);
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end);
+        cpu_ms = (end.tv_sec - begin.tv_sec) * 1e3 + (end.tv_nsec - begin.tv_nsec) / 1e6;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    write_flag(1);
+    reader.join();
+    // The read waited about half a second; it must not have spun for it.
+    EXPECT_LT(cpu_ms, 100.0);
 }
 
 }  // namespace

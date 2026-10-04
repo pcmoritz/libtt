@@ -129,5 +129,29 @@ TEST_F(MeshTraceReservedDramTest, ReleasingTheLastTraceFreesItsTransients) {
     EXPECT_TRUE(allocated_range(*buffer).overlaps(transient));
 }
 
+TEST_F(MeshTraceReservedDramTest, BufferThatOnlyFitsInTransientsTakesThem) {
+    // Reserving a trace's transients must not make an allocation fail that would fit without them.
+    const DeviceAddr num_banks = mesh_device_->allocator()->get_num_banks(BufferType::DRAM);
+    const DeviceAddr largest_free = mesh_device_->allocator()->get_statistics(BufferType::DRAM).largest_free_block_bytes;
+    const DeviceAddr size = largest_free * 6 / 10 / kPageSize * kPageSize * num_banks;
+
+    auto& cq = mesh_device_->mesh_command_queue();
+    const MeshTraceId trace_id = BeginTraceCapture(mesh_device_.get(), cq.id());
+    DeviceAddr address = 0;
+    {
+        auto transient = create_dram_buffer(mesh_device_.get(), size);
+        address = transient->address();
+        EnqueueMeshWorkload(cq, blank_, false);
+    }
+    mesh_device_->end_mesh_trace(cq.id(), trace_id);
+
+    std::shared_ptr<MeshBuffer> buffer;
+    ASSERT_NO_THROW(buffer = create_dram_buffer(mesh_device_.get(), size));
+    EXPECT_TRUE(allocated_range(*buffer).overlaps(bank_range(mesh_device_.get(), address, size)));
+    // The trace now has to be captured again before it can replay.
+    EXPECT_FALSE(mesh_device_->is_mesh_trace_replay_safe(trace_id));
+    mesh_device_->release_mesh_trace(trace_id);
+}
+
 }  // namespace
 }  // namespace tt::tt_metal::distributed::test

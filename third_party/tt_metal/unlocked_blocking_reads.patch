@@ -1,15 +1,7 @@
 diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/fd_mesh_command_queue.cpp
 --- tt_metal/distributed/fd_mesh_command_queue.cpp
 +++ tt_metal/distributed/fd_mesh_command_queue.cpp
-@@ -14,6 +14,7 @@
- #include <tt-metalium/experimental/fabric/control_plane.hpp>
- #include <tt-metalium/tt_metal.hpp>
- #include <algorithm>
-+#include <thread>
- #include <array>
- #include <functional>
- #include <optional>
-@@ -324,15 +325,22 @@
+@@ -324,15 +324,22 @@
      }
  }
  
@@ -36,7 +28,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
                  return;
              }
              reads_processed_cv_.wait_for(reads_processed_lock, poll_interval, predicate);
-@@ -725,6 +733,52 @@
+@@ -725,6 +732,53 @@
      }
  }
  
@@ -57,18 +49,19 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 +        return done;
 +    };
 +    const bool poll_watcher = this->watcher_test_mode_enabled();
-+    constexpr auto watcher_poll_interval = std::chrono::milliseconds(100);
-+    auto next_watcher_poll = std::chrono::steady_clock::now() + watcher_poll_interval;
++    std::unique_lock<std::mutex> lock(reads_processed_cv_mutex_);
 +    while (!event_done()) {
-+        if (poll_watcher && std::chrono::steady_clock::now() >= next_watcher_poll) {
-+            // Sets the failure state below if the watcher has caught an error.
-+            this->poll_watcher_error_in_test_mode();
-+            next_watcher_poll = std::chrono::steady_clock::now() + watcher_poll_interval;
-+        }
 +        if (thread_exception_state_.load() || exit_condition_.load()) {
++            lock.unlock();
 +            this->throw_read_failure();
 +        }
-+        std::this_thread::yield();
++        // The reader thread notifies after each event it reads, and on failure. The timeout only paces the
++        // watcher check.
++        reads_processed_cv_.wait_for(lock, std::chrono::milliseconds(100));
++        if (poll_watcher && !event_done()) {
++            // Sets the failure state checked above if the watcher has caught an error.
++            this->poll_watcher_error_in_test_mode();
++        }
 +    }
 +}
 +
@@ -89,6 +82,16 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  void FDMeshCommandQueue::finish(ttsl::Span<const SubDeviceId> sub_device_ids) {
      ZoneScopedN("FDMeshCommandQueue::finish");
      auto lock = lock_api_function_();
+@@ -1010,6 +1064,9 @@
+                             this->copy_buffer_data_to_user_space(mesh_read_descriptor);
+                         } else if constexpr (std::is_same_v<T, MeshReadEventDescriptor>) {
+                             this->read_completion_queue_event(mesh_read_descriptor);
++                            // Wake reads waiting for this event without the API lock.
++                            { std::lock_guard<std::mutex> lock(reads_processed_cv_mutex_); }
++                            reads_processed_cv_.notify_all();
+                         } else {
+                             this->read_l1_data_from_completion_queue(mesh_read_descriptor);
+                         }
 diff --git tt_metal/distributed/fd_mesh_command_queue.hpp tt_metal/distributed/fd_mesh_command_queue.hpp
 --- tt_metal/distributed/fd_mesh_command_queue.hpp
 +++ tt_metal/distributed/fd_mesh_command_queue.hpp
