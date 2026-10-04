@@ -1,0 +1,55 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -6961,9 +6961,48 @@
+ 
+     auto gatherType = RankedTensorType::get(
+         gatherShape, outputType.getElementType(), outputType.getEncoding());
+-    Value gather = rewriter.create<ttir::GatherOp>(
+-        srcOp.getLoc(), gatherType, operand, indices,
+-        rewriter.getI32IntegerAttr(static_cast<int32_t>(indexedDim)));
++    Value gather;
++    if (gatherShape[indexedDim] == 1 &&
++        mlir::isa<FloatType>(outputType.getElementType())) {
++      // One index per row of the indexed dimension (take_along_axis with a
++      // single index, such as picking each token's logprob): select it by
++      // comparing the index with the positions along the dimension and sum.
++      // ttnn::gather walks the whole dimension for every output element: 2.4 s
++      // against 11 ms for 512 rows of 248320 floats.
++      auto indicesType = mlir::cast<RankedTensorType>(indices.getType());
++      // StableHLO clamps start indices into the operand.
++      indices = rewriter.create<ttir::ClampScalarOp>(
++          srcOp.getLoc(), indicesType, indices, rewriter.getI32IntegerAttr(0),
++          rewriter.getI32IntegerAttr(operandShape[indexedDim] - 1));
++      auto rowIndicesType =
++          RankedTensorType::get(operandShape, indicesType.getElementType(),
++                                indicesType.getEncoding());
++      Value rowIndices = rewriter.create<ttir::BroadcastOp>(
++          srcOp.getLoc(), rowIndicesType, indices,
++          rewriter.getDenseI64ArrayAttr(
++              ttmlir::utils::getBroadcastDimensions<int64_t>(gatherShape,
++                                                             operandShape)));
++      Value positions = rewriter.create<ttir::ArangeOp>(
++          srcOp.getLoc(), rowIndicesType, /*start=*/0,
++          /*end=*/operandShape[indexedDim], /*step=*/1,
++          /*arange_dimension=*/indexedDim);
++      Value selected = rewriter.create<ttir::EqualOp>(
++          srcOp.getLoc(), rowIndicesType.clone(rewriter.getI1Type()), positions,
++          rowIndices);
++      auto pickedType = RankedTensorType::get(
++          operandShape, outputType.getElementType(), outputType.getEncoding());
++      Value zeros = rewriter.create<ttir::FullOp>(
++          srcOp.getLoc(), pickedType, rewriter.getF32FloatAttr(0.0f));
++      Value picked = rewriter.create<ttir::WhereOp>(
++          srcOp.getLoc(), pickedType, selected, operand, zeros);
++      gather = rewriter.create<ttir::SumOp>(
++          srcOp.getLoc(), gatherType, picked, /*keepDim=*/true,
++          rewriter.getI32ArrayAttr({static_cast<int32_t>(indexedDim)}));
++    } else {
++      gather = rewriter.create<ttir::GatherOp>(
++          srcOp.getLoc(), gatherType, operand, indices,
++          rewriter.getI32IntegerAttr(static_cast<int32_t>(indexedDim)));
++    }
+ 
+     if (needsOutputReshape) {
+       gather = rewriter.create<ttir::ReshapeOp>(
