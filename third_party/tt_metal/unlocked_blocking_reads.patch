@@ -1,17 +1,23 @@
 diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/fd_mesh_command_queue.cpp
 --- tt_metal/distributed/fd_mesh_command_queue.cpp
 +++ tt_metal/distributed/fd_mesh_command_queue.cpp
-@@ -324,15 +324,22 @@
+@@ -301,7 +301,8 @@
+ 
+ CoreType FDMeshCommandQueue::dispatch_core_type() const { return this->dispatch_core_type_; }
+ 
+-bool FDMeshCommandQueue::record_watcher_error_in_test_mode(ChipId device_id) {
++bool FDMeshCommandQueue::record_watcher_error_in_test_mode() {
++    const ChipId device_id = mesh_device_->get_devices().at(0)->id();
+     const auto error_message = tt::llrt::internal_::get_watcher_error_message_in_test_mode(device_id);
+     if (!error_message.has_value()) {
+         return false;
+@@ -324,15 +325,18 @@
      }
  }
  
 +bool FDMeshCommandQueue::watcher_test_mode_enabled() const {
 +    const auto& rtoptions = MetalContext::instance(mesh_device_->impl().get_context_id()).rtoptions();
 +    return rtoptions.get_watcher_enabled() && rtoptions.get_test_mode_enabled();
-+}
-+
-+bool FDMeshCommandQueue::poll_watcher_error_in_test_mode() {
-+    return this->record_watcher_error_in_test_mode(mesh_device_->get_devices().at(0)->id());
 +}
 +
  void FDMeshCommandQueue::wait_for_outstanding_reads(std::unique_lock<std::mutex>& reads_processed_lock) {
@@ -24,11 +30,11 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
          constexpr auto poll_interval = std::chrono::milliseconds(100);
          while (num_outstanding_reads_.load() != 0 && !thread_exception_state_.load()) {
 -            if (record_watcher_error_in_test_mode(device_id)) {
-+            if (this->poll_watcher_error_in_test_mode()) {
++            if (this->record_watcher_error_in_test_mode()) {
                  return;
              }
              reads_processed_cv_.wait_for(reads_processed_lock, poll_interval, predicate);
-@@ -725,6 +732,53 @@
+@@ -725,6 +729,53 @@
      }
  }
  
@@ -60,7 +66,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 +        reads_processed_cv_.wait_for(lock, std::chrono::milliseconds(100));
 +        if (poll_watcher && !event_done()) {
 +            // Sets the failure state checked above if the watcher has caught an error.
-+            this->poll_watcher_error_in_test_mode();
++            this->record_watcher_error_in_test_mode();
 +        }
 +    }
 +}
@@ -82,7 +88,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  void FDMeshCommandQueue::finish(ttsl::Span<const SubDeviceId> sub_device_ids) {
      ZoneScopedN("FDMeshCommandQueue::finish");
      auto lock = lock_api_function_();
-@@ -1010,6 +1064,9 @@
+@@ -1010,6 +1061,9 @@
                              this->copy_buffer_data_to_user_space(mesh_read_descriptor);
                          } else if constexpr (std::is_same_v<T, MeshReadEventDescriptor>) {
                              this->read_completion_queue_event(mesh_read_descriptor);
@@ -95,7 +101,16 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 diff --git tt_metal/distributed/fd_mesh_command_queue.hpp tt_metal/distributed/fd_mesh_command_queue.hpp
 --- tt_metal/distributed/fd_mesh_command_queue.hpp
 +++ tt_metal/distributed/fd_mesh_command_queue.hpp
-@@ -205,6 +205,12 @@
+@@ -174,7 +174,7 @@
+     void wait_for_outstanding_reads(std::unique_lock<std::mutex>& reads_processed_lock);
+ 
+     // Route watcher faults through the same exception path as the completion-queue reader thread.
+-    bool record_watcher_error_in_test_mode(ChipId device_id);
++    bool record_watcher_error_in_test_mode();
+ 
+     // Distributed context used to synchronize operations done by all active ranks on the given mesh device.
+     std::shared_ptr<distributed::multihost::DistributedContext> active_distributed_context_;
+@@ -205,6 +205,10 @@
          ttsl::Span<const SubDeviceId> sub_device_ids = {},
          const std::optional<MeshCoordinateRange>& device_range = std::nullopt) override;
      void invalidate_prefetcher_cache_after_pinned_write() override;
@@ -103,8 +118,6 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.hpp tt_metal/distributed/f
 +    void wait_for_host_event_unlocked(const MeshEvent& event) override;
 +    [[noreturn]] void throw_read_failure();
 +    bool watcher_test_mode_enabled() const;
-+    // Returns true and sets the reader failure state if the watcher has caught an error.
-+    bool poll_watcher_error_in_test_mode();
  
  public:
      FDMeshCommandQueue(

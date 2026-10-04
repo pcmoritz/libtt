@@ -17,28 +17,16 @@ diff --git tt_metal/distributed/mesh_device.cpp tt_metal/distributed/mesh_device
      for (AllocatorImpl* allocator : this->get_trace_allocators()) {
          allocator->begin_trace_allocation_tracking();
          trace_buffer->allocation_footprints.emplace_back(allocator, TraceAllocationFootprint{});
-@@ -1399,16 +1401,21 @@
-     DeviceAddr dram_allocation_high_water_mark = 0;
-     DeviceAddr dram_deletion_high_water_mark = 0;
-     AllocatorImpl* mesh_allocator = this->allocator_impl().get();
-+    TraceAllocationFootprint mesh_footprint;
-     for (auto& [allocator, footprint] : trace_buffer->allocation_footprints) {
-         footprint = allocator->end_trace_allocation_tracking();
+@@ -1404,6 +1406,9 @@
          if (allocator == mesh_allocator) {
              dram_allocation_high_water_mark = allocator->get_dram_allocation_high_water_mark();
              dram_deletion_high_water_mark = allocator->get_dram_deletion_high_water_mark();
-+            mesh_footprint = footprint;
++            // Restores the pool suspended in begin_mesh_trace, even if this capture allocated nothing, and before
++            // the trace buffer itself is allocated.
++            mesh_allocator->add_trace_dram_footprint(*trace_id, footprint);
          }
      }
      std::erase_if(
-         trace_buffer->allocation_footprints,
-         [](const auto& allocator_footprint) { return allocator_footprint.second.empty(); });
-+    // Restore the pool suspended in begin_mesh_trace, even if this capture allocated nothing, and before the
-+    // trace buffer itself is allocated.
-+    mesh_allocator->add_trace_dram_footprint(*trace_id, mesh_footprint);
- 
-     MeshTrace::populate_mesh_buffer(
-         *(mesh_command_queues_[cq_id]), trace_buffer, dram_allocation_high_water_mark, dram_deletion_high_water_mark);
 diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocator.cpp
 --- tt_metal/impl/allocator/allocator.cpp
 +++ tt_metal/impl/allocator/allocator.cpp
@@ -69,7 +57,7 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
      dram_manager_->deallocate_all();
      l1_manager_->deallocate_all();
      l1_small_manager_->deallocate_all();
-@@ -525,8 +538,45 @@
+@@ -525,8 +538,44 @@
             l1_small_manager_->has_live_allocation_overlap(footprint.l1_small);
  }
  
@@ -79,16 +67,14 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
 +        trace_dram_footprints_[trace_id] = footprint.dram;
 +    }
 +    // Also restores a pool suspended for this capture when the capture allocated nothing.
-+    this->release_trace_dram_reservations();
-+    this->reserve_trace_dram_footprints();
++    this->refresh_trace_dram_reservations();
 +}
 +
 +void AllocatorImpl::remove_trace_dram_footprint(uint32_t trace_id) {
 +    std::lock_guard<std::mutex> lock(mutex_);
 +    trace_dram_footprints_.erase(trace_id);
 +    // Re-reserve even for an unknown trace: releasing a trace whose capture never ended restores the pool.
-+    this->release_trace_dram_reservations();
-+    this->reserve_trace_dram_footprints();
++    this->refresh_trace_dram_reservations();
 +}
 +
 +void AllocatorImpl::suspend_trace_dram_reservations() {
@@ -96,7 +82,8 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
 +    this->release_trace_dram_reservations();
 +}
 +
-+void AllocatorImpl::reserve_trace_dram_footprints() {
++void AllocatorImpl::refresh_trace_dram_reservations() {
++    this->release_trace_dram_reservations();
 +    for (const auto& [trace_id, footprint] : trace_dram_footprints_) {
 +        auto reserved = dram_manager_->reserve_free_regions(footprint);
 +        trace_dram_reservations_.insert(trace_dram_reservations_.end(), reserved.begin(), reserved.end());
@@ -115,7 +102,7 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
      dram_manager_->clear();
      l1_manager_->clear();
      l1_small_manager_->clear();
-@@ -596,6 +646,8 @@
+@@ -596,6 +645,8 @@
      }
  
      // Clear all buffer types
@@ -150,14 +137,15 @@ diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocat
      // what does clear even mean on an allocator???
      void clear();
  
-@@ -152,6 +161,12 @@
+@@ -152,6 +161,13 @@
      std::unordered_map<BufferType, std::unordered_map<CoreCoord, std::vector<std::uint32_t>>> logical_core_to_bank_ids_;
      std::unordered_set<Buffer*> allocated_buffers_;
  
 +    // DRAM footprints of live traces, and the parts of them currently reserved.
 +    std::map<uint32_t, BankManager::AllocationFootprint> trace_dram_footprints_;
 +    BankManager::AllocationFootprint trace_dram_reservations_;
-+    void reserve_trace_dram_footprints();
++    // Releases the reservations and reserves the free parts of every live trace's footprint again.
++    void refresh_trace_dram_reservations();
 +    void release_trace_dram_reservations();
 +
      // HYBRID mode: device allocators to query per-bank ranges during lockstep allocation.
