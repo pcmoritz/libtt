@@ -531,6 +531,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_sort_integer_values.patch",
         "//third_party/tt_xla:tt_mlir_permute_int32.patch",
         "//third_party/tt_xla:tt_mlir_reverse_integers.patch",
+        "//third_party/tt_xla:tt_mlir_sort_int32_keys.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

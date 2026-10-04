@@ -1,0 +1,161 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -9274,22 +9274,36 @@
+ 
+     // Step 3: Emit SortOp.
+ 
+-    auto sortOp = rewriter.create<ttir::SortOp>(
+-        loc, outputTypes, adaptor.getInputs().front(),
+-        rewriter.getSI32IntegerAttr(sortDim),
+-        rewriter.getBoolAttr(*isDescending), rewriter.getBoolAttr(isStable));
++    Value sortedKeys;
++    Value indices;
++    auto keyElemType = dyn_cast<IntegerType>(
++        cast<RankedTensorType>(srcOp.getInputs().front().getType())
++            .getElementType());
++    if (keyElemType && keyElemType.getWidth() == 32) {
++      std::tie(sortedKeys, indices) =
++          sortInt32Keys(rewriter, loc, adaptor.getInputs().front(),
++                        keyElemType.isUnsigned(), outputTypes[1], sortDim,
++                        *isDescending);
++    } else {
++      auto sortOp = rewriter.create<ttir::SortOp>(
++          loc, outputTypes, adaptor.getInputs().front(),
++          rewriter.getSI32IntegerAttr(sortDim),
++          rewriter.getBoolAttr(*isDescending), rewriter.getBoolAttr(isStable));
++      sortedKeys = sortOp.getValues();
++      indices = sortOp.getIndices();
++    }
+ 
+     // Step 4: SortType-specific lowering.
+ 
+     // SortType::kValueOnly - Replace values output and ignore indices output.
+     if (sortType == SortType::kValueOnly) {
+-      rewriter.replaceOp(srcOp, sortOp.getValues());
++      rewriter.replaceOp(srcOp, sortedKeys);
+       return success();
+     }
+ 
+     // SortType::kValueIndex - Replace the source op with values/indices output.
+     if (sortType == SortType::kValueIndex) {
+-      rewriter.replaceOp(srcOp, sortOp->getResults());
++      rewriter.replaceOp(srcOp, ValueRange{sortedKeys, indices});
+       return success();
+     }
+ 
+@@ -9326,7 +9340,6 @@
+     //   4. For each value tensor: permute (sortDim last), flatten to [total,
+     //   1], EmbeddingOp with flat_indices, reshape to permuted shape, permute
+     //   back to original axis order.
+-    Value indices = sortOp.getIndices();
+     auto indicesType = cast<RankedTensorType>(indices.getType());
+     int64_t rank = indicesType.getRank();
+     ArrayRef<int64_t> origShape = indicesType.getShape();
+@@ -9370,7 +9383,7 @@
+ 
+     // Per value tensor: permute sortDim to last -> flatten -> EmbeddingOp ->
+     // reshape -> permute back.
+-    SmallVector<Value> results{sortOp.getValues()};
++    SmallVector<Value> results{sortedKeys};
+ 
+     for (size_t i = 1; i < srcOp.getInputs().size(); ++i) {
+       auto valType = cast<RankedTensorType>(
+@@ -9453,6 +9466,97 @@
+     return isa_and_nonnull<mlir::stablehlo::IotaOp>(op);
+   }
+ 
++  // ttnn.sort has no 32-bit integer path, and float32 cannot hold every
++  // 32-bit integer exactly. Sort by the low and then the high 16 bits instead
++  // (an LSD radix sort): each half is exact in float32, and because both passes
++  // are stable, the second keeps the order of the first among equal high
++  // halves. The low half is unsigned; the high half carries the sign.
++  //
++  // The passes run on keys permuted to [prePost, dSort], sorting and gathering
++  // along dimension 1, because ttnn.gather mishandles tensors above rank 4.
++  std::pair<Value, Value> sortInt32Keys(ConversionPatternRewriter &rewriter,
++                                        Location loc, Value keys,
++                                        bool isUnsigned,
++                                        Type indicesTypeArg, int64_t sortDim,
++                                        bool isDescending) const {
++    auto keyType = cast<RankedTensorType>(keys.getType());
++    auto indicesType = cast<RankedTensorType>(indicesTypeArg);
++    int64_t rank = keyType.getRank();
++    int64_t dSort = keyType.getShape()[sortDim];
++    int64_t prePost = keyType.getNumElements() / dSort;
++
++    SmallVector<int64_t> perm;
++    for (int64_t i = 0; i < rank; ++i) {
++      if (i != sortDim) {
++        perm.push_back(i);
++      }
++    }
++    perm.push_back(sortDim);
++    SmallVector<int64_t> invPerm = ttmlir::utils::inversePermutation(perm);
++    SmallVector<int64_t> permShape =
++        ttmlir::utils::applyPermutation(keyType.getShape(), perm);
++    SmallVector<int32_t> permShapeI32(permShape.begin(), permShape.end());
++
++    auto to2D = [&](Value value) -> Value {
++      Type elemType = cast<RankedTensorType>(value.getType()).getElementType();
++      value = rewriter.create<ttir::PermuteOp>(
++          loc, RankedTensorType::get(permShape, elemType), value, perm);
++      return rewriter.create<ttir::ReshapeOp>(
++          loc, RankedTensorType::get({prePost, dSort}, elemType), value,
++          rewriter.getI32ArrayAttr({static_cast<int32_t>(prePost),
++                                    static_cast<int32_t>(dSort)}));
++    };
++    auto fromRows = [&](Value value, RankedTensorType resultType) -> Value {
++      Type elemType = resultType.getElementType();
++      value = rewriter.create<ttir::ReshapeOp>(
++          loc, RankedTensorType::get(permShape, elemType), value,
++          rewriter.getI32ArrayAttr(permShapeI32));
++      return rewriter.create<ttir::PermuteOp>(loc, resultType, value, invPerm);
++    };
++
++    Value rows = to2D(keys);
++    auto rowsType = cast<RankedTensorType>(rows.getType());
++    auto halfType = RankedTensorType::get({prePost, dSort},
++                                          rewriter.getF32Type());
++    auto rowIndicesType = RankedTensorType::get(
++        {prePost, dSort}, indicesType.getElementType());
++    auto full = [&](int32_t value) -> Value {
++      return rewriter.create<ttir::FullOp>(loc, rowsType,
++                                           rewriter.getI32IntegerAttr(value));
++    };
++    auto gather = [&](Value input, Value index) -> Value {
++      return rewriter.create<ttir::GatherOp>(loc, input.getType(), input,
++                                             index,
++                                             rewriter.getI32IntegerAttr(1));
++    };
++    auto stableSort = [&](Value input) -> Value {
++      return rewriter
++          .create<ttir::SortOp>(loc, TypeRange{halfType, rowIndicesType}, input,
++                                rewriter.getSI32IntegerAttr(1),
++                                rewriter.getBoolAttr(isDescending),
++                                rewriter.getBoolAttr(true))
++          .getIndices();
++    };
++
++    Value low =
++        rewriter.create<ttir::BitwiseAndOp>(loc, rowsType, rows, full(0xFFFF));
++    Value high =
++        isUnsigned
++            ? rewriter.create<ttir::LogicalRightShiftOp>(loc, rowsType, rows,
++                                                         full(16))
++                  .getResult()
++            : rewriter.create<ttir::RightShiftOp>(loc, rowsType, rows, full(16))
++                  .getResult();
++    low = rewriter.create<ttir::TypecastOp>(loc, halfType, low);
++    high = rewriter.create<ttir::TypecastOp>(loc, halfType, high);
++
++    Value lowOrder = stableSort(low);
++    Value highOrder = stableSort(gather(high, lowOrder));
++    Value indices = gather(lowOrder, highOrder);
++    return {fromRows(gather(rows, indices), keyType),
++            fromRows(indices, indicesType)};
++  }
++
+   mlir::FailureOr<bool> getSortDirection(mlir::stablehlo::SortOp &srcOp) const {
+     Block &block = srcOp.getComparator().front();
+     for (auto &op : block.getOperations()) {
