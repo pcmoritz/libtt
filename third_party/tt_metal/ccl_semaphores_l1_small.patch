@@ -1,0 +1,35 @@
+diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_program_factory.cpp ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_program_factory.cpp
+@@ -36,8 +36,13 @@
+     auto subdevice_core_range_set = mesh_device->worker_cores(tt::tt_metal::HalProgrammableCoreType::TENSIX, sd_id);
+     // create semaphores
+     // 3 semaphores used for within op synchronizations
+-    auto sem_buffer_type = operation_attributes.use_l1_small_for_semaphores ? tt::tt_metal::BufferType::L1_SMALL
+-                                                                            : tt::tt_metal::BufferType::L1;
++    // Like all_gather, keep the semaphores out of L1 whenever an L1_SMALL region exists: they live as long as the
++    // cached program, and in L1 they would lower the L1 budget that ops such as matmul size their programs by,
++    // so a later run of the same ops would need different programs (and a trace capture would fail).
++    auto sem_buffer_type = operation_attributes.use_l1_small_for_semaphores ||
++                                   mesh_device->allocator()->get_bank_size(tt::tt_metal::BufferType::L1_SMALL) > 0
++                               ? tt::tt_metal::BufferType::L1_SMALL
++                               : tt::tt_metal::BufferType::L1;
+     std::vector<tt::tt_metal::GlobalSemaphore> multidevice_semaphores = {
+         ttnn::global_semaphore::create_global_semaphore(mesh_device, subdevice_core_range_set, 0, sem_buffer_type),
+         ttnn::global_semaphore::create_global_semaphore(mesh_device, subdevice_core_range_set, 0, sem_buffer_type),
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
+@@ -100,7 +100,11 @@
+         auto* device = tensor_args.input_tensor.device();
+         auto sd = attributes.sub_device_id.value_or(device->get_sub_device_ids().at(0));
+         auto cores = device->worker_cores(tt::tt_metal::HalProgrammableCoreType::TENSIX, sd);
+-        attributes.semaphore = ttnn::global_semaphore::create_global_semaphore(device, cores, 0);
++        // Keep the semaphore out of L1 when possible, as reduce_scatter does.
++        const auto sem_buffer_type = device->allocator()->get_bank_size(tt::tt_metal::BufferType::L1_SMALL) > 0
++                                         ? tt::tt_metal::BufferType::L1_SMALL
++                                         : tt::tt_metal::BufferType::L1;
++        attributes.semaphore = ttnn::global_semaphore::create_global_semaphore(device, cores, 0, sem_buffer_type);
+         tt::tt_metal::distributed::Synchronize(device, std::nullopt, {});
+     }
+     for (const auto& coord : tensor_coords.coords()) {

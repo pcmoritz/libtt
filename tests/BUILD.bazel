@@ -113,5 +113,7 @@ cc_test(
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
         "@tt_metal//:tt_metal_device_tensor_upstream",
+        "@tt_metal//:ttnn_distributed_tensor_upstream",
+        "@tt_metal//:ttnn_tensor_upstream",
     ],
 )
