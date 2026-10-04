@@ -1,0 +1,143 @@
+diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/fd_mesh_command_queue.cpp
+--- tt_metal/distributed/fd_mesh_command_queue.cpp
++++ tt_metal/distributed/fd_mesh_command_queue.cpp
+@@ -14,6 +14,7 @@
+ #include <tt-metalium/experimental/fabric/control_plane.hpp>
+ #include <tt-metalium/tt_metal.hpp>
+ #include <algorithm>
++#include <thread>
+ #include <array>
+ #include <functional>
+ #include <optional>
+@@ -725,6 +726,33 @@
+     }
+ }
+ 
++bool FDMeshCommandQueue::supports_unlocked_read_wait() const {
++    return this->get_target_device_type() != tt::TargetDevice::Mock &&
++           this->get_target_device_type() != tt::TargetDevice::Emule;
++}
++
++void FDMeshCommandQueue::wait_for_host_event_unlocked(const MeshEvent& event) {
++    // The reader thread processes the completion queue in order, so once it has seen the event, it has
++    // also copied every read queued before it.
++    auto event_done = [&] {
++        bool done = true;
++        for_each_local(mesh_device_, event.device_range(), [&](const auto& coord) {
++            done = done && mesh_device_->impl().get_device(coord)->sysmem_manager().get_last_completed_event(event.mesh_cq_id()) >=
++                               event.id();
++        });
++        return done;
++    };
++    while (!event_done()) {
++        if (thread_exception_state_.load()) {
++            // Rethrows the reader thread's exception.
++            auto lock = lock_api_function_();
++            this->finish_nolock();
++            return;
++        }
++        std::this_thread::yield();
++    }
++}
++
+ void FDMeshCommandQueue::finish(ttsl::Span<const SubDeviceId> sub_device_ids) {
+     ZoneScopedN("FDMeshCommandQueue::finish");
+     auto lock = lock_api_function_();
+diff --git tt_metal/distributed/fd_mesh_command_queue.hpp tt_metal/distributed/fd_mesh_command_queue.hpp
+--- tt_metal/distributed/fd_mesh_command_queue.hpp
++++ tt_metal/distributed/fd_mesh_command_queue.hpp
+@@ -205,6 +205,8 @@
+         ttsl::Span<const SubDeviceId> sub_device_ids = {},
+         const std::optional<MeshCoordinateRange>& device_range = std::nullopt) override;
+     void invalidate_prefetcher_cache_after_pinned_write() override;
++    bool supports_unlocked_read_wait() const override;
++    void wait_for_host_event_unlocked(const MeshEvent& event) override;
+ 
+ public:
+     FDMeshCommandQueue(
+diff --git tt_metal/distributed/mesh_command_queue_base.cpp tt_metal/distributed/mesh_command_queue_base.cpp
+--- tt_metal/distributed/mesh_command_queue_base.cpp
++++ tt_metal/distributed/mesh_command_queue_base.cpp
+@@ -388,32 +388,46 @@
+     DistributedHostBuffer& host_buffer,
+     const std::optional<std::unordered_set<MeshCoordinate>>& shards,
+     bool blocking) {
+-    auto lock = lock_api_function_();
+-    std::vector<distributed::ShardDataTransfer> shard_data_transfers;
+-    // For non-blocking reads, capture a MemoryPin for each shard so the host
+-    // buffer stays alive until the async reader thread finishes the memcpy
+-    // (fixes use-after-free, issue #43638). For blocking reads finish_nolock()
+-    // ensures the copy is complete before we return, so no pin is needed.
+-    std::vector<MemoryPin> memory_pins;
+-    for (const auto& coord : MeshCoordinateRange(buffer->device()->shape())) {
+-        if (shards.has_value() && !shards->contains(coord)) {
+-            continue;
+-        }
++    std::optional<MeshEvent> read_done;
++    {
++        auto lock = lock_api_function_();
++        // A blocking read waits for all work queued ahead of it. Wait outside the API lock where
++        // possible, so other threads can keep queueing work (such as the next step's inputs and
++        // trace) while the device drains.
++        const bool wait_unlocked = blocking && this->supports_unlocked_read_wait();
++        std::vector<distributed::ShardDataTransfer> shard_data_transfers;
++        // For non-blocking reads, capture a MemoryPin for each shard so the host
++        // buffer stays alive until the async reader thread finishes the memcpy
++        // (fixes use-after-free, issue #43638). For blocking reads finish_nolock()
++        // ensures the copy is complete before we return, so no pin is needed.
++        std::vector<MemoryPin> memory_pins;
++        for (const auto& coord : MeshCoordinateRange(buffer->device()->shape())) {
++            if (shards.has_value() && !shards->contains(coord)) {
++                continue;
++            }
+ 
+-        auto buf = host_buffer.get_shard(coord);
+-        if (buf.has_value()) {
+-            if (!blocking) {
+-                memory_pins.push_back(buf->pin());
++            auto buf = host_buffer.get_shard(coord);
++            if (buf.has_value()) {
++                if (!blocking || wait_unlocked) {
++                    memory_pins.push_back(buf->pin());
++                }
++                auto xfer = distributed::ShardDataTransfer{coord}
++                                .host_data(buf->view_bytes().data())
++                                .region(BufferRegion(0, buf->view_bytes().size()));
++                experimental::ShardDataTransferSetPinnedMemory(xfer, experimental::HostBufferGetPinnedMemory(*buf));
++                shard_data_transfers.push_back(std::move(xfer));
+             }
+-            auto xfer = distributed::ShardDataTransfer{coord}
+-                            .host_data(buf->view_bytes().data())
+-                            .region(BufferRegion(0, buf->view_bytes().size()));
+-            experimental::ShardDataTransferSetPinnedMemory(xfer, experimental::HostBufferGetPinnedMemory(*buf));
+-            shard_data_transfers.push_back(std::move(xfer));
+         }
+-    }
+ 
+-    this->enqueue_read_shards_nolock(shard_data_transfers, buffer, blocking, std::move(memory_pins));
++        this->enqueue_read_shards_nolock(
++            shard_data_transfers, buffer, blocking && !wait_unlocked, std::move(memory_pins));
++        if (wait_unlocked) {
++            read_done = this->enqueue_record_event_to_host_nolock();
++        }
++    }
++    if (read_done.has_value()) {
++        this->wait_for_host_event_unlocked(*read_done);
++    }
+ }
+ 
+ void MeshCommandQueue::enqueue_write_shards(
+diff --git tt_metal/distributed/mesh_command_queue_base.hpp tt_metal/distributed/mesh_command_queue_base.hpp
+--- tt_metal/distributed/mesh_command_queue_base.hpp
++++ tt_metal/distributed/mesh_command_queue_base.hpp
+@@ -60,6 +60,10 @@
+         ttsl::Span<const SubDeviceId> sub_device_ids = {},
+         const std::optional<MeshCoordinateRange>& device_range = std::nullopt) = 0;
+     virtual void invalidate_prefetcher_cache_after_pinned_write() {}
++    // Whether a blocking read can wait for its data without holding lock_api_function_(). If so,
++    // wait_for_host_event_unlocked() returns once the host has processed `event`.
++    virtual bool supports_unlocked_read_wait() const { return false; }
++    virtual void wait_for_host_event_unlocked(const MeshEvent& /*event*/) {}
+ 
+     tt::TargetDevice get_target_device_type() const;
+ 
