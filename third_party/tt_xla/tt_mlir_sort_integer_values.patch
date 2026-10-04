@@ -1,0 +1,20 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -9380,6 +9380,16 @@
+ 
+       Value val = srcOp.getInputs()[i];
+ 
++      // ttnn.embedding only takes bf16 or f32 tables, so integer tensors would
++      // round through bf16. Gather them along sortDim instead, which is exact.
++      if (auto intType = dyn_cast<IntegerType>(valType.getElementType());
++          intType && intType.getWidth() >= 16) {
++        results.push_back(rewriter.create<ttir::GatherOp>(
++            loc, valType, val, indices,
++            rewriter.getI32IntegerAttr(static_cast<int32_t>(sortDim))));
++        continue;
++      }
++
+       // Permute value tensor so sortDim is last.
+       auto permValType =
+           RankedTensorType::get(permValShape, valType.getElementType());
