@@ -1,0 +1,93 @@
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+@@ -40,6 +40,7 @@
+ #include "ttmlir/Dialect/TTNN/Transforms/Workarounds/Decomposition/UpsampleOpRewritePattern.h"
+ #include "ttmlir/Dialect/TTNN/Types/Types.h"
+ #include "ttmlir/Dialect/TTNN/Utils/TransformUtils.h"
++#include "ttmlir/Conversion/TTIRToTTNN/Utils.h"
+ #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
+ #include "ttmlir/Utils.h"
+ 
+@@ -332,6 +333,71 @@
+   const std::set<mlir::StringRef> *enabledOps;
+ };
+ 
++// A reduction over a long last dimension of only a few rows runs on one core
++// per tile row: summing two rows of a 37984-entry vocab shard took 264 us.
++// Reduce groups of 32 first, which spreads the work over the tile rows of
++// [rows, width / 32, 32], then reduce the groups: about 70 us. Runs after the
++// TTIR fusions, so norms over hidden sizes are already fused.
++template <typename ReductionOpTy>
++class WideRowReductionSplitWorkaround : public OpRewritePattern<ReductionOpTy> {
++public:
++  using OpRewritePattern<ReductionOpTy>::OpRewritePattern;
++
++  LogicalResult matchAndRewrite(ReductionOpTy op,
++                                PatternRewriter &rewriter) const override {
++    RankedTensorType inputType = op.getInput().getType();
++    ArrayRef<int64_t> inputShape = inputType.getShape();
++    int64_t rank = inputType.getRank();
++    std::optional<ArrayAttr> dims = op.getDimArg();
++    if (rank == 0 || !inputType.hasStaticShape() || !dims ||
++        dims->size() != 1) {
++      return failure();
++    }
++    int64_t dim = mlir::cast<IntegerAttr>((*dims)[0]).getInt();
++    if (dim != -1 && dim != rank - 1) {
++      return failure();
++    }
++    constexpr int64_t kGroup = 32;
++    int64_t width = inputShape.back();
++    int64_t rows = 1;
++    for (int64_t size : inputShape.drop_back()) {
++      rows *= size;
++    }
++    int64_t groups = width / kGroup;
++    // Only one tile row (a decode batch) of vocab-sized rows (at least 16384):
++    // more rows already reduce on a core per tile row, and splitting prefill
++    // logprob reductions of hundreds of rows made serving hang intermittently.
++    if (width % kGroup != 0 || groups < 512 || rows > kGroup) {
++      return failure();
++    }
++
++    Location loc = op.getLoc();
++    // [..., width] -> [..., groups, 32] -> [..., groups] -> the result.
++    SmallVector<int64_t> partialShape(inputShape.drop_back());
++    partialShape.push_back(groups);
++    SmallVector<int64_t> groupedShape(partialShape);
++    groupedShape.push_back(kGroup);
++    ttnn::ReshapeOp grouped = ttir_to_ttnn::utils::generateReshape(
++        op.getInput(), groupedShape, rewriter,
++        ttmlir::utils::appendLocationSuffix(loc, "_group_rows"));
++    auto partial = rewriter.create<ReductionOpTy>(
++        ttmlir::utils::appendLocationSuffix(loc, "_reduce_groups"),
++        ttnn::utils::RankedTensorTypeFactory::create(op.getResult().getType(),
++                                                     partialShape),
++        grouped.getResult(), /*keep_dim=*/false,
++        rewriter.getI32ArrayAttr({static_cast<int32_t>(rank)}));
++    partial.setComputeConfigAttr(op.getComputeConfigAttr());
++    // The partial results have the input's rank, so the original dimension
++    // applies.
++    auto result = rewriter.create<ReductionOpTy>(
++        loc, op.getResult().getType(), partial.getResult(), op.getKeepDim(),
++        *dims);
++    result.setComputeConfigAttr(op.getComputeConfigAttr());
++    rewriter.replaceOp(op, result.getResult());
++    return success();
++  }
++};
++
+ // This pattern wraps an si32-indexed gather in a fill-style mask, modeled
+ // on what JAX emits for `jax.lax.gather(..., mode='fill')`:
+ //
+@@ -465,6 +531,9 @@
+       RewritePatternSet patterns(&getContext());
+       patterns.add<
+           GatherSi32Workaround, UInt32WhereWorkaround,
++          WideRowReductionSplitWorkaround<ttnn::SumOp>,
++          WideRowReductionSplitWorkaround<ttnn::MaxOp>,
++          WideRowReductionSplitWorkaround<ttnn::MinOp>,
+           workarounds::decomposition::GatherOpRank1RewritePattern,
+           workarounds::decomposition::SamplingOpRank2RewritePattern,
+           workarounds::decomposition::TTNNCollectiveReshapeWorkaround<
