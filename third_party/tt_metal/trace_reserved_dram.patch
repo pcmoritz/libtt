@@ -1,0 +1,233 @@
+diff --git tt_metal/distributed/mesh_device.cpp tt_metal/distributed/mesh_device.cpp
+--- tt_metal/distributed/mesh_device.cpp
++++ tt_metal/distributed/mesh_device.cpp
+@@ -1317,6 +1317,7 @@
+ 
+     validate_sub_device_manager_tracker();
+     sub_device_manager_tracker_->get_active_sub_device_manager()->release_trace(trace_id);
++    this->allocator_impl()->remove_trace_dram_footprint(*trace_id);
+ 
+     // Drop any Tensor prefetcher requests captured under this trace so they don't outlive it.
+     if (tensor_prefetcher_) {
+@@ -1372,6 +1373,7 @@
+         this->mesh_id_,
+         active_sub_device_manager->id());
+     auto& trace_buffer = active_sub_device_manager->create_trace(trace_id);
++    this->allocator_impl()->suspend_trace_dram_reservations();
+     for (AllocatorImpl* allocator : this->get_trace_allocators()) {
+         allocator->begin_trace_allocation_tracking();
+         trace_buffer->allocation_footprints.emplace_back(allocator, TraceAllocationFootprint{});
+@@ -1404,6 +1406,9 @@
+         if (allocator == mesh_allocator) {
+             dram_allocation_high_water_mark = allocator->get_dram_allocation_high_water_mark();
+             dram_deletion_high_water_mark = allocator->get_dram_deletion_high_water_mark();
++            // Restores the pool suspended in begin_mesh_trace, even if this capture allocated nothing, and before
++            // the trace buffer itself is allocated.
++            mesh_allocator->add_trace_dram_footprint(*trace_id, footprint);
+         }
+     }
+     std::erase_if(
+diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocator.cpp
+--- tt_metal/impl/allocator/allocator.cpp
++++ tt_metal/impl/allocator/allocator.cpp
+@@ -62,6 +62,17 @@
+         config_->dram_alignment,
+         config_->dram_unreserved_base,
+         config_->disable_interleaved);
++    // Without the transient DRAM reserved for captured traces a buffer would not fit: give it up rather than fail,
++    // until the next capture or trace release reserves it again. A trace whose transients the buffer overlaps is
++    // captured again before its next replay. Runs with mutex_ held.
++    dram_manager_->set_out_of_memory_handler([this] {
++        if (trace_dram_reservations_.empty()) {
++            return false;
++        }
++        log_warning(tt::LogMetal, "Releasing the transient DRAM reserved for captured traces to fit a DRAM buffer");
++        this->release_trace_dram_reservations();
++        return true;
++    });
+     for (uint32_t bank_id = 0; bank_id < config_->num_dram_channels; bank_id++) {
+         CoreCoord logical_core = CoreCoord{bank_id, 0};
+         bank_id_to_dram_channel_.insert({bank_id, bank_id});
+@@ -239,6 +250,8 @@
+ 
+ void AllocatorImpl::deallocate_buffers() {
+     std::lock_guard<std::mutex> lock(mutex_);
++    this->release_trace_dram_reservations();
++    trace_dram_footprints_.clear();
+     dram_manager_->deallocate_all();
+     l1_manager_->deallocate_all();
+     l1_small_manager_->deallocate_all();
+@@ -525,8 +538,44 @@
+            l1_small_manager_->has_live_allocation_overlap(footprint.l1_small);
+ }
+ 
++void AllocatorImpl::add_trace_dram_footprint(uint32_t trace_id, const TraceAllocationFootprint& footprint) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!footprint.dram.empty()) {
++        trace_dram_footprints_[trace_id] = footprint.dram;
++    }
++    // Also restores a pool suspended for this capture when the capture allocated nothing.
++    this->refresh_trace_dram_reservations();
++}
++
++void AllocatorImpl::remove_trace_dram_footprint(uint32_t trace_id) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    trace_dram_footprints_.erase(trace_id);
++    // Re-reserve even for an unknown trace: releasing a trace whose capture never ended restores the pool.
++    this->refresh_trace_dram_reservations();
++}
++
++void AllocatorImpl::suspend_trace_dram_reservations() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    this->release_trace_dram_reservations();
++}
++
++void AllocatorImpl::refresh_trace_dram_reservations() {
++    this->release_trace_dram_reservations();
++    for (const auto& [trace_id, footprint] : trace_dram_footprints_) {
++        auto reserved = dram_manager_->reserve_free_regions(footprint);
++        trace_dram_reservations_.insert(trace_dram_reservations_.end(), reserved.begin(), reserved.end());
++    }
++}
++
++void AllocatorImpl::release_trace_dram_reservations() {
++    dram_manager_->release_reserved_regions(trace_dram_reservations_);
++    trace_dram_reservations_.clear();
++}
++
+ void AllocatorImpl::clear() {
+     std::lock_guard<std::mutex> lock(mutex_);
++    trace_dram_footprints_.clear();
++    trace_dram_reservations_.clear();
+     dram_manager_->clear();
+     l1_manager_->clear();
+     l1_small_manager_->clear();
+@@ -596,6 +645,8 @@
+     }
+ 
+     // Clear all buffer types
++    this->release_trace_dram_reservations();
++    trace_dram_footprints_.clear();
+     dram_manager_->deallocate_all();
+     l1_manager_->deallocate_all();
+     l1_small_manager_->deallocate_all();
+diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocator.hpp
+--- tt_metal/impl/allocator/allocator.hpp
++++ tt_metal/impl/allocator/allocator.hpp
+@@ -9,6 +9,7 @@
+ 
+ #include "impl/allocator/allocator_types.hpp"
+ #include "impl/allocator/bank_manager.hpp"
++#include <map>
+ 
+ namespace tt::tt_metal {
+ 
+@@ -101,6 +102,14 @@
+     TraceAllocationFootprint end_trace_allocation_tracking();
+     bool has_live_allocation_overlap(const TraceAllocationFootprint& footprint) const;
+ 
++    // Keeps the DRAM regions that captured traces use for transient buffers out of the free list, so buffers
++    // allocated between replays do not land there and force a re-capture. Captures run in queue order and
++    // free their transients before the next one starts, so all traces share one reserved pool.
++    void add_trace_dram_footprint(uint32_t trace_id, const TraceAllocationFootprint& footprint);
++    void remove_trace_dram_footprint(uint32_t trace_id);
++    // Frees the pool while a trace is captured, so the new trace's transients reuse it.
++    void suspend_trace_dram_reservations();
++
+     // what does clear even mean on an allocator???
+     void clear();
+ 
+@@ -152,6 +161,13 @@
+     std::unordered_map<BufferType, std::unordered_map<CoreCoord, std::vector<std::uint32_t>>> logical_core_to_bank_ids_;
+     std::unordered_set<Buffer*> allocated_buffers_;
+ 
++    // DRAM footprints of live traces, and the parts of them currently reserved.
++    std::map<uint32_t, BankManager::AllocationFootprint> trace_dram_footprints_;
++    BankManager::AllocationFootprint trace_dram_reservations_;
++    // Releases the reservations and reserves the free parts of every live trace's footprint again.
++    void refresh_trace_dram_reservations();
++    void release_trace_dram_reservations();
++
+     // HYBRID mode: device allocators to query per-bank ranges during lockstep allocation.
+     std::vector<AllocatorImpl*> hybrid_device_allocators_;
+ 
+diff --git tt_metal/impl/allocator/bank_manager.cpp tt_metal/impl/allocator/bank_manager.cpp
+--- tt_metal/impl/allocator/bank_manager.cpp
++++ tt_metal/impl/allocator/bank_manager.cpp
+@@ -447,6 +447,9 @@
+     // vs. top-down allocation
+     if (dependent_allocators.empty()) {
+         auto address = alloc->allocate(size_per_bank, bottom_up, address_limit);
++        if (!address.has_value() && out_of_memory_handler_ && out_of_memory_handler_()) {
++            address = alloc->allocate(size_per_bank, bottom_up, address_limit);
++        }
+         if (!address.has_value()) {
+             auto mem_stats = alloc->get_statistics();
+             TT_FATAL(
+@@ -694,6 +697,41 @@
+     return false;
+ }
+ 
++BankManager::AllocationFootprint BankManager::reserve_free_regions(const AllocationFootprint& footprint) {
++    AllocationFootprint reserved;
++    for (const AllocationRegion& region : footprint) {
++        const AllocatorDependencies::AllocatorID allocator_id{region.allocator_id};
++        auto* alloc = this->get_allocator_from_id(allocator_id);
++        TT_FATAL(alloc, "Allocator not initialized for ID {}", region.allocator_id);
++        for (const auto& [free_begin, free_end] : alloc->available_addresses(1)) {
++            const DeviceAddr begin = std::max(region.begin, free_begin);
++            const DeviceAddr end = std::min(region.end, free_end);
++            if (begin >= end) {
++                continue;
++            }
++            if (alloc->allocate_at_address(begin, end - begin).has_value()) {
++                reserved.push_back({region.allocator_id, begin, end});
++            }
++        }
++        this->invalidate_allocated_ranges_cache_for_dependent_allocators(allocator_id);
++    }
++    return reserved;
++}
++
++void BankManager::release_reserved_regions(const AllocationFootprint& reserved) {
++    for (const AllocationRegion& region : reserved) {
++        const AllocatorDependencies::AllocatorID allocator_id{region.allocator_id};
++        auto* alloc = this->get_allocator_from_id(allocator_id);
++        TT_FATAL(alloc, "Allocator not initialized for ID {}", region.allocator_id);
++        // Never free a buffer that took the address after the allocator was reset.
++        if (allocated_buffers_[region.allocator_id].contains(region.begin)) {
++            continue;
++        }
++        alloc->deallocate(region.begin);
++        this->invalidate_allocated_ranges_cache_for_dependent_allocators(allocator_id);
++    }
++}
++
+ void BankManager::record_allocation_region(
+     AllocatorDependencies::AllocatorID allocator_id, DeviceAddr address, DeviceAddr size) {
+     if (!tracking_high_water_mark_) {
+diff --git tt_metal/impl/allocator/bank_manager.hpp tt_metal/impl/allocator/bank_manager.hpp
+--- tt_metal/impl/allocator/bank_manager.hpp
++++ tt_metal/impl/allocator/bank_manager.hpp
+@@ -145,6 +145,13 @@
+     DeviceAddr get_deletion_high_water_mark() const;
+     AllocationFootprint take_allocation_footprint();
+     bool has_live_allocation_overlap(const AllocationFootprint& footprint) const;
++    // Allocates the parts of the footprint that are currently free without tracking them as buffers, so they
++    // are skipped by has_live_allocation_overlap. Returns the reserved regions.
++    AllocationFootprint reserve_free_regions(const AllocationFootprint& footprint);
++    void release_reserved_regions(const AllocationFootprint& reserved);
++    // Called once when an allocation without dependent allocators does not fit; returns true if it freed memory,
++    // and the allocation is tried again.
++    void set_out_of_memory_handler(std::function<bool()> handler) { out_of_memory_handler_ = std::move(handler); }
+ 
+     // Cross-allocator mirroring: mark a region as allocated/deallocated in a specific sub-allocator.
+     // Used to mirror lockstep allocations from the mesh-level allocator into per-device allocators.
+@@ -199,6 +206,7 @@
+     DeviceAddr allocation_high_water_mark_ = 0;
+     DeviceAddr deletion_high_water_mark_ = 0;
+     AllocationFootprint allocation_footprint_;
++    std::function<bool()> out_of_memory_handler_;
+ 
+     /*********************************
+      * Allocator-independent methods *

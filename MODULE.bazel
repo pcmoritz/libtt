@@ -1,6 +1,7 @@
 module(name = "libtt", version = "0.1.1")
 
 bazel_dep(name = "bazel_skylib", version = "1.8.2")
+bazel_dep(name = "googletest", version = "1.17.0.bcr.2", dev_dependency = True)
 bazel_dep(name = "highway", version = "1.4.0")
 bazel_dep(name = "numactl", version = "2.0.19.bcr.1")
 bazel_dep(name = "platforms", version = "1.0.0")
@@ -313,6 +314,8 @@ http_archive(
         "//third_party/tt_metal:uninitialized_read_buffer.patch",
         "//third_party/tt_metal:all_reduce_sfpu_reductions.patch",
         "//third_party/tt_metal:repeat_wide_rows.patch",
+        "//third_party/tt_metal:trace_reserved_dram.patch",
+        "//third_party/tt_metal:unlocked_blocking_reads.patch",
     ],
     sha256 = "a222d1f6fe7f6aec62f69e22199a3537a31a58aa5ead52e4ab470b7d87472ecb",
     strip_prefix = "tt-metal-5beed318d0f0d1c6212e605947fb0be80c9e0a1d",
