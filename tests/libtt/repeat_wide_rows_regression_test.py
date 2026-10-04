@@ -20,6 +20,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
         (np.int32, 100003),  # A row that is not a multiple of 16 bytes.
         (np.float32, 16384),  # Exactly one chunk.
         (jnp.bfloat16, 262147),
+        (np.int32, 8),  # Short row: one chunk, smaller than the read alignment.
     ],
 )
 def test_broadcast_wide_row(dtype, width, trace):

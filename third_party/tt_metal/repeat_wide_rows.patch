@@ -1,28 +1,31 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_higher_dim_rm_interleaved.cpp ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_higher_dim_rm_interleaved.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_higher_dim_rm_interleaved.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_higher_dim_rm_interleaved.cpp
-@@ -28,12 +28,14 @@ void kernel_main() {
-     const uint32_t nop = get_arg_val<uint32_t>(7);
+@@ -6,6 +6,7 @@
+ // Tensor layout: <higher_dim, rep_dim, lower_dim, page_size>
  
+ #include <stdint.h>
++#include <algorithm>
+ #include "api/dataflow/dataflow_api.h"
+ #include "ttnn/operations/data_movement/common/kernels/common.hpp"
+ #include "api/dataflow/noc.h"
+@@ -30,10 +31,13 @@ void kernel_main() {
      constexpr uint32_t original_page_size_bytes = get_compile_time_arg_val(0);
--    constexpr uint32_t cb_id_in0 = get_compile_time_arg_val(1);
--    constexpr uint32_t cb_id_in1 = get_compile_time_arg_val(2);
+     constexpr uint32_t cb_id_in0 = get_compile_time_arg_val(1);
+     constexpr uint32_t cb_id_in1 = get_compile_time_arg_val(2);
 -    // cb_id_in0 and cb_id_in1 are each 1 page of size: 128 + page_size_bytes.
--    constexpr uint32_t LOWER_DIMS = get_compile_time_arg_val(3);
--    constexpr uint32_t REP_DIM = get_compile_time_arg_val(4);
--    constexpr auto src_args = TensorAccessorArgs<5, 0>();
-+    // Each page is copied in chunks of at most chunk_size_bytes, a multiple of 64 bytes.
-+    constexpr uint32_t chunk_size_bytes = get_compile_time_arg_val(1);
-+    constexpr uint32_t cb_id_in0 = get_compile_time_arg_val(2);
-+    constexpr uint32_t cb_id_in1 = get_compile_time_arg_val(3);
 +    // cb_id_in0 and cb_id_in1 are each 1 page of size: 128 + chunk_size_bytes.
-+    constexpr uint32_t LOWER_DIMS = get_compile_time_arg_val(4);
-+    constexpr uint32_t REP_DIM = get_compile_time_arg_val(5);
+     constexpr uint32_t LOWER_DIMS = get_compile_time_arg_val(3);
+     constexpr uint32_t REP_DIM = get_compile_time_arg_val(4);
+-    constexpr auto src_args = TensorAccessorArgs<5, 0>();
++    // Multi-chunk rows use an alignment-multiple stride, preserving each
++    // page's source and destination alignment. Short rows use one chunk.
++    constexpr uint32_t chunk_size_bytes = get_compile_time_arg_val(5);
 +    constexpr auto src_args = TensorAccessorArgs<6, 0>();
      constexpr auto dst_args =
          TensorAccessorArgs<src_args.next_compile_time_args_offset(), src_args.num_common_runtime_args()>();
  
-@@ -80,36 +82,42 @@ void kernel_main() {
+@@ -80,36 +84,41 @@ void kernel_main() {
              uint32_t r_offset = r * LOWER_DIMS;
              for (uint32_t l = lower_dim_start; l < lower_dim_end; l++) {
                  uint32_t read_offset = h_offset + r_offset + l;
@@ -48,9 +51,8 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_h
 -                        data_location = alignment_buffer + (dst_noc_addr & w_offset_to_use);
 +                for (uint32_t chunk_offset = 0; chunk_offset < original_page_size_bytes;
 +                     chunk_offset += chunk_size_bytes) {
-+                    const uint32_t chunk_bytes = original_page_size_bytes - chunk_offset < chunk_size_bytes
-+                                                     ? original_page_size_bytes - chunk_offset
-+                                                     : chunk_size_bytes;
++                    const uint32_t chunk_bytes =
++                        std::min(chunk_size_bytes, original_page_size_bytes - chunk_offset);
 +                    src_noc_addr = s.get_noc_addr(read_offset, chunk_offset);
 +                    data_location = input_buffer + (src_noc_addr & r_offset_to_use);
 +
@@ -112,14 +114,15 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_f
      constexpr uint32_t src0_cb_index = 0;
      constexpr uint32_t src1_cb_index = 1;
  
-@@ -73,6 +73,16 @@ ProgramDescriptor RepeatProgramFactoryHigherDim::create_descriptor(
+@@ -73,6 +73,17 @@ ProgramDescriptor RepeatProgramFactoryHigherDim::create_descriptor(
      const bool dst_sharded = dst_buffer->buffer_distribution_spec().has_value();
      const bool needs_alignment_cb = !is_tile_native && !src_sharded && !dst_sharded;
  
 +    // The interleaved RM kernel copies each page in chunks of at most this many bytes, so its two
 +    // CBs stay small however wide a row is (a 248320-wide int32 row is a 970 KiB page, and two
-+    // such CBs exceed L1). The chunk is a multiple of READ_ALIGNMENT, so every chunk of a page
-+    // keeps the page's source and destination alignment.
++    // such CBs exceed L1).
++    // Multi-chunk rows use an alignment-multiple stride, preserving each
++    // page's source and destination alignment. Short rows use one chunk.
 +    constexpr uint32_t max_chunk_size_bytes = 64 * 1024;
 +    static_assert(max_chunk_size_bytes % READ_ALIGNMENT == 0);
 +    const uint32_t chunk_size_bytes =
@@ -129,11 +132,14 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/repeat_program_f
      ProgramDescriptor desc;
  
      desc.cbs.push_back(CBDescriptor{
-@@ -113,6 +123,7 @@ ProgramDescriptor RepeatProgramFactoryHigherDim::create_descriptor(
-             "ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_higher_dim_rm_interleaved.cpp";
-         compile_time_args = {
-             (std::uint32_t)page_size_bytes,
-+            chunk_size_bytes,
+@@ -116,7 +127,9 @@ ProgramDescriptor RepeatProgramFactoryHigherDim::create_descriptor(
              src0_cb_index,
              src1_cb_index,
              number_of_lower_pages,
+-            number_of_rep_dim_pages};
++            number_of_rep_dim_pages,
++            chunk_size_bytes,
++        };
+     }
+ 
+     std::vector<uint32_t> common_runtime_args;
