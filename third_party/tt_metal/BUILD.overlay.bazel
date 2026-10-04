@@ -270,6 +270,7 @@ pkg_tar(
         "@tt_umd//:cluster_descriptor_examples",
         ":tt_metal_blackhole_runtime_hw_assets",
         ":tt_metal_runtime_sources",
+        "@//ttnn:kernels",
     ],
     compressor = ":libtt_zstd_compressor",
     # Release wheels: level 19 with a 2^27-byte long-distance window keeps the
@@ -1417,6 +1418,7 @@ cc_library(
         "ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.cpp",
         "ttnn/cpp/ttnn/operations/moreh/moreh_helper_functions.cpp",
         "@//third_party/tt_xla:tt_metal_cold_stubs.cc",
+        "@//ttnn:operation_srcs",
     ] + glob(
         ["ttnn/cpp/ttnn/operations/**/*.cpp"],
         exclude = TTNN_OPERATION_SRC_EXCLUDES + [
@@ -1437,6 +1439,7 @@ cc_library(
     includes = TTNN_RUNTIME_INCLUDE_DIRS,
     deps = [
         ":tt_metal_device_tensor_upstream",
+        "@//ttnn:operation_headers",
     ],
     linkstatic = True,
 )

@@ -530,6 +530,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_rms_norm_residual.patch",
         "//third_party/tt_xla:tt_mlir_sort_integer_values.patch",
         "//third_party/tt_xla:tt_mlir_permute_int32.patch",
+        "//third_party/tt_xla:tt_mlir_qkv_heads_norm_rope_decode.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

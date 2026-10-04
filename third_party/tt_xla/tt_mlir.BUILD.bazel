@@ -1241,6 +1241,7 @@ cc_library(
         "lib/Conversion/TTIRToEmitPy/CaptureMeshShape.cpp",
         "@//third_party/tt_xla:tt_mlir_control_flow.cpp",
         "@//third_party/tt_xla:tt_mlir_compiler_cold_stubs.cc",
+        "@//tt_mlir:compiler_srcs",
     ] + glob(
         [
             "lib/Conversion/StableHLOToTTIR/**/*.cpp",
@@ -1288,7 +1289,7 @@ cc_library(
         "include/ttmlir/OpModel/TTNN",
         "lib",
     ],
-    deps = _TTMLIR_COMMON_DEPS,
+    deps = _TTMLIR_COMMON_DEPS + ["@//tt_mlir:compiler_headers"],
     alwayslink = True,
 )
 
@@ -1340,6 +1341,7 @@ cc_library(
         "@//third_party/tt_xla:tt_mlir_runtime_cold_stubs.cc",
         "@//third_party/tt_xla:tt_mlir_runtime_conv_stubs.cc",
         "@//third_party/tt_xla:tt_mlir_runtime_debug_stubs.cc",
+        "@//tt_mlir:runtime_srcs",
     ],
     hdrs = glob(
         [
@@ -1364,6 +1366,7 @@ cc_library(
         "include",
     ],
     deps = _TTMLIR_COMMON_DEPS + [
+        "@//tt_mlir:runtime_headers",
         "@highway//:hwy",
         "@tt_metal//:ttnn_tensor_upstream",
         "@tt_metal//:ttnn_distributed_tensor_upstream",
