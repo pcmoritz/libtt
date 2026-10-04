@@ -5,34 +5,15 @@ every replay. Once the capture freed them, a first-fit allocator handed that
 region to the next small buffer, so the trace was no longer safe to replay and
 was captured again on every call (SGLang-JAX's overlap scheduler allocates a few
 small tensors between steps). Captured traces now keep their transient DRAM
-reserved: small buffers allocated between replays must not cause a capture,
-and must keep their values.
+reserved; replays and the buffers allocated between them must stay correct.
+tests/tt_metal/test_mesh_trace_reserved_dram.cpp checks the reservations.
 """
-
-import ctypes
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import jax_plugins.libtt
 import numpy as np
 
 OPTIONS = {"optimization_level": "O1", "enable_trace": "true"}
-
-
-def _hook(name):
-    # Test hooks exported by the plugin; the library is already loaded by JAX.
-    lib = ctypes.CDLL(str(Path(jax_plugins.libtt.__file__).with_name("libtt.so")))
-    getattr(lib, name).restype = ctypes.c_uint64
-    return getattr(lib, name)()
-
-
-def _mesh_trace_captures():
-    return _hook("libtt_mesh_trace_captures")
-
-
-def _trace_reserved_dram_bytes():
-    return _hook("libtt_trace_reserved_dram_bytes")
 
 
 def _step(x, w):
@@ -65,7 +46,7 @@ def _small_buffers(device, i):
     ]
 
 
-def test_buffers_allocated_between_replays_do_not_recapture():
+def test_buffers_allocated_between_replays_keep_values():
     device = jax.devices("tt")[0]
     rng = np.random.default_rng(0)
     step = jax.jit(_step, compiler_options=OPTIONS)
@@ -74,7 +55,6 @@ def test_buffers_allocated_between_replays_do_not_recapture():
 
     x = rng.standard_normal((32, 256)).astype(jnp.bfloat16)
     _check_step(step(jax.device_put(x, device), w_dev), x, w)
-    captures = _mesh_trace_captures()
 
     kept = []
     for i in range(1, 7):
@@ -83,12 +63,11 @@ def test_buffers_allocated_between_replays_do_not_recapture():
         _check_step(step(jax.device_put(x, device), w_dev), x, w)
         for value, buffer in kept:
             np.testing.assert_array_equal(np.asarray(buffer), value)
-    assert _mesh_trace_captures() == captures
 
 
-def test_second_capture_keeps_first_trace_reserved():
-    # Capturing another trace frees the shared pool while it runs, then must
-    # reserve it again for both traces.
+def test_two_traces_with_buffers_allocated_between_replays():
+    # Capturing another trace frees the shared pool while it runs, then
+    # reserves it again for both traces.
     device = jax.devices("tt")[0]
     rng = np.random.default_rng(1)
     first = jax.jit(_step, compiler_options=OPTIONS)
@@ -100,8 +79,6 @@ def test_second_capture_keeps_first_trace_reserved():
 
     _check_step(first(x_dev, w_dev), x, w)
     second(x_dev).block_until_ready()
-    assert _trace_reserved_dram_bytes() > 0
-    captures = _mesh_trace_captures()
 
     kept = []
     for i in range(1, 5):
@@ -115,4 +92,3 @@ def test_second_capture_keeps_first_trace_reserved():
         )
     for value, buffer in kept:
         np.testing.assert_array_equal(np.asarray(buffer), value)
-    assert _mesh_trace_captures() == captures

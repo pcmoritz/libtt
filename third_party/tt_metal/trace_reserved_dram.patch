@@ -1,19 +1,7 @@
 diff --git tt_metal/distributed/mesh_device.cpp tt_metal/distributed/mesh_device.cpp
 --- tt_metal/distributed/mesh_device.cpp
 +++ tt_metal/distributed/mesh_device.cpp
-@@ -273,6 +273,11 @@
- // NOLINTNEXTLINE(readability-make-member-function-const)
- void MeshDeviceImpl::mark_allocations_safe() { this->allocator_impl()->mark_allocations_safe(); }
- 
-+namespace {
-+// Number of mesh traces captured in this process; read by tests.
-+std::atomic<uint64_t> mesh_trace_captures{0};
-+}  // namespace
-+
- std::vector<AllocatorImpl*> MeshDeviceImpl::get_trace_allocators() const {
-     std::vector<AllocatorImpl*> allocators;
-     std::unordered_set<AllocatorImpl*> seen;
-@@ -1317,6 +1322,7 @@
+@@ -1317,6 +1317,7 @@
  
      validate_sub_device_manager_tracker();
      sub_device_manager_tracker_->get_active_sub_device_manager()->release_trace(trace_id);
@@ -21,7 +9,7 @@ diff --git tt_metal/distributed/mesh_device.cpp tt_metal/distributed/mesh_device
  
      // Drop any Tensor prefetcher requests captured under this trace so they don't outlive it.
      if (tensor_prefetcher_) {
-@@ -1372,6 +1378,7 @@
+@@ -1372,6 +1373,7 @@
          this->mesh_id_,
          active_sub_device_manager->id());
      auto& trace_buffer = active_sub_device_manager->create_trace(trace_id);
@@ -29,7 +17,7 @@ diff --git tt_metal/distributed/mesh_device.cpp tt_metal/distributed/mesh_device
      for (AllocatorImpl* allocator : this->get_trace_allocators()) {
          allocator->begin_trace_allocation_tracking();
          trace_buffer->allocation_footprints.emplace_back(allocator, TraceAllocationFootprint{});
-@@ -1399,16 +1406,22 @@
+@@ -1399,16 +1401,21 @@
      DeviceAddr dram_allocation_high_water_mark = 0;
      DeviceAddr dram_deletion_high_water_mark = 0;
      AllocatorImpl* mesh_allocator = this->allocator_impl().get();
@@ -48,43 +36,13 @@ diff --git tt_metal/distributed/mesh_device.cpp tt_metal/distributed/mesh_device
 +    // Restore the pool suspended in begin_mesh_trace, even if this capture allocated nothing, and before the
 +    // trace buffer itself is allocated.
 +    mesh_allocator->add_trace_dram_footprint(*trace_id, mesh_footprint);
-+    mesh_trace_captures.fetch_add(1);
  
      MeshTrace::populate_mesh_buffer(
          *(mesh_command_queues_[cq_id]), trace_buffer, dram_allocation_high_water_mark, dram_deletion_high_water_mark);
-@@ -1970,3 +1983,8 @@
- std::ostream& operator<<(std::ostream& os, const MeshDevice& mesh_device) { return os << mesh_device.to_string(); }
- 
- }  // namespace tt::tt_metal::distributed
-+
-+// Test hook: number of mesh traces captured in this process.
-+extern "C" __attribute__((visibility("default"))) uint64_t libtt_mesh_trace_captures() {
-+    return tt::tt_metal::distributed::mesh_trace_captures.load();
-+}
 diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocator.cpp
 --- tt_metal/impl/allocator/allocator.cpp
 +++ tt_metal/impl/allocator/allocator.cpp
-@@ -2,6 +2,7 @@
- //
- // SPDX-License-Identifier: Apache-2.0
- 
-+#include <atomic>
- #include <memory>
- #include <tt-metalium/allocator.hpp>
- #include <tt-metalium/experimental/allocator.hpp>
-@@ -110,6 +111,11 @@
-     }
- }
- 
-+namespace {
-+// Per-bank bytes held by trace DRAM reservations, summed over all allocators; read by tests.
-+std::atomic<uint64_t> trace_dram_reserved_bytes{0};
-+}  // namespace
-+
- void AllocatorImpl::verify_safe_allocation() const {
-     // Inform the user that its unsafe to allocate buffers when a trace is live on device.
-     // If the user does this, they are meant to ensure that buffers allocated when a trace is active,
-@@ -239,6 +245,8 @@
+@@ -239,6 +239,8 @@
  
  void AllocatorImpl::deallocate_buffers() {
      std::lock_guard<std::mutex> lock(mutex_);
@@ -93,7 +51,7 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
      dram_manager_->deallocate_all();
      l1_manager_->deallocate_all();
      l1_small_manager_->deallocate_all();
-@@ -525,8 +533,55 @@
+@@ -525,8 +527,45 @@
             l1_small_manager_->has_live_allocation_overlap(footprint.l1_small);
  }
  
@@ -123,33 +81,23 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
 +void AllocatorImpl::reserve_trace_dram_footprints() {
 +    for (const auto& [trace_id, footprint] : trace_dram_footprints_) {
 +        auto reserved = dram_manager_->reserve_free_regions(footprint);
-+        for (const auto& region : reserved) {
-+            trace_dram_reserved_bytes.fetch_add(region.end - region.begin);
-+        }
 +        trace_dram_reservations_.insert(trace_dram_reservations_.end(), reserved.begin(), reserved.end());
 +    }
 +}
 +
 +void AllocatorImpl::release_trace_dram_reservations() {
 +    dram_manager_->release_reserved_regions(trace_dram_reservations_);
-+    this->forget_trace_dram_reservations();
-+}
-+
-+void AllocatorImpl::forget_trace_dram_reservations() {
-+    for (const auto& region : trace_dram_reservations_) {
-+        trace_dram_reserved_bytes.fetch_sub(region.end - region.begin);
-+    }
 +    trace_dram_reservations_.clear();
 +}
 +
  void AllocatorImpl::clear() {
      std::lock_guard<std::mutex> lock(mutex_);
 +    trace_dram_footprints_.clear();
-+    this->forget_trace_dram_reservations();
++    trace_dram_reservations_.clear();
      dram_manager_->clear();
      l1_manager_->clear();
      l1_small_manager_->clear();
-@@ -596,6 +651,8 @@
+@@ -596,6 +635,8 @@
      }
  
      // Clear all buffer types
@@ -158,15 +106,6 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
      dram_manager_->deallocate_all();
      l1_manager_->deallocate_all();
      l1_small_manager_->deallocate_all();
-@@ -688,3 +745,8 @@
- }
- 
- }  // namespace tt::tt_metal::experimental
-+
-+// Test hook: per-bank bytes currently reserved for the transient DRAM of captured traces.
-+extern "C" __attribute__((visibility("default"))) uint64_t libtt_trace_reserved_dram_bytes() {
-+    return tt::tt_metal::trace_dram_reserved_bytes.load();
-+}
 diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocator.hpp
 --- tt_metal/impl/allocator/allocator.hpp
 +++ tt_metal/impl/allocator/allocator.hpp
@@ -193,7 +132,7 @@ diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocat
      // what does clear even mean on an allocator???
      void clear();
  
-@@ -152,6 +161,14 @@
+@@ -152,6 +161,12 @@
      std::unordered_map<BufferType, std::unordered_map<CoreCoord, std::vector<std::uint32_t>>> logical_core_to_bank_ids_;
      std::unordered_set<Buffer*> allocated_buffers_;
  
@@ -202,8 +141,6 @@ diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocat
 +    BankManager::AllocationFootprint trace_dram_reservations_;
 +    void reserve_trace_dram_footprints();
 +    void release_trace_dram_reservations();
-+    // Drops the bookkeeping for reservations that the bank manager no longer holds.
-+    void forget_trace_dram_reservations();
 +
      // HYBRID mode: device allocators to query per-bank ranges during lockstep allocation.
      std::vector<AllocatorImpl*> hybrid_device_allocators_;
