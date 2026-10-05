@@ -4,6 +4,11 @@ SGLang-JAX projects q, k and v, normalizes the q and k heads and applies the
 rotary embedding; tt-mlir turns that into nlp_create_qkv_heads_decode, two
 rms_norms and two rotary_embeddings, which now become a single
 nlp_create_qkv_heads_decode_norm_rope. Its q, k and v must match NumPy.
+
+The full attention layers of Qwen3.5 and Qwen3.8 fuse the same way: their
+q projection holds an output gate after every q head, the norms are Gemma
+norms with weight 1 + w, and the interleaved M-RoPE rotates only the first 64
+of 256 elements per head.
 """
 
 import jax
@@ -105,3 +110,113 @@ def test_qkv_norm_rope_decode(trace, heads, kv_heads, tmp_path):
     assert irs, "no IR was exported"
     assert any("ttnn.nlp_create_qkv_heads_decode_norm_rope" in ir for ir in irs), "the prologue was not fused"
     assert not any("ttnn.rotary_embedding" in ir for ir in irs), "a rotary embedding was left over"
+
+
+GATED_HEAD_DIM = 256
+ROTARY_DIM = 64
+MROPE_SECTION = (11, 11, 10)
+
+
+def gemma_rms_norm(x, weight):
+    # sglang-jax's GemmaRMSNorm: the weight is an offset from 1.
+    xf = x.astype(jnp.float32)
+    var = jnp.mean(lax.square(xf), axis=-1, keepdims=True)
+    return (xf * lax.rsqrt(var + EPS) * (1.0 + weight.astype(jnp.float32))).astype(x.dtype)
+
+
+def interleaved_mrope(x):
+    # sglang-jax's apply_interleaved_rope: [3, tokens, ROTARY_DIM / 2] of
+    # time, height and width frequencies to [tokens, ROTARY_DIM / 2].
+    out = x[0]
+    for axis in (1, 2):
+        part = slice(axis, MROPE_SECTION[axis] * 3, 3)
+        out = out.at[..., part].set(x[axis, ..., part])
+    return out
+
+
+def make_gated_prologue(heads, kv_heads):
+    d = GATED_HEAD_DIM
+    inv_freq = 1.0 / (1e7 ** (np.arange(0, ROTARY_DIM, 2, dtype=np.float32) / ROTARY_DIM))
+
+    def partial_rotary(x, cos, sin):
+        return jnp.concatenate((rotary(x[..., :ROTARY_DIM], cos, sin), x[..., ROTARY_DIM:]), axis=-1)
+
+    def prologue(x, wq, wk, wv, q_norm, k_norm, positions):
+        # Qwen3_5Attention: q and its gate per head, then k and v.
+        with jax.named_scope("q_proj"):
+            q_gate = (x @ wq).reshape(-1, heads, 2 * d)
+        with jax.named_scope("k_proj"):
+            k = x @ wk
+        with jax.named_scope("v_proj"):
+            v = x @ wv
+        q, gate = q_gate[..., :d], q_gate[..., d:]
+        q = gemma_rms_norm(q, q_norm)
+        k = gemma_rms_norm(k.reshape(-1, kv_heads, d), k_norm)
+        # Text positions: the same for time, height and width.
+        freqs = jnp.tile(positions[None, :], (3, 1)).astype(jnp.float32)[..., None] * inv_freq
+        cos = interleaved_mrope(jnp.cos(freqs).astype(x.dtype))
+        sin = interleaved_mrope(jnp.sin(freqs).astype(x.dtype))
+        q, k = partial_rotary(q, cos, sin), partial_rotary(k, cos, sin)
+        return (
+            q.reshape(1, 1, heads, d),
+            k.reshape(1, 1, kv_heads, d),
+            v.reshape(1, 1, kv_heads, d),
+            gate,
+        )
+
+    return prologue
+
+
+def gated_reference(x, wq, wk, wv, q_norm, k_norm, position, heads, kv_heads):
+    d = GATED_HEAD_DIM
+    x, wq, wk, wv, q_norm, k_norm = (a.astype(np.float32) for a in (x, wq, wk, wv, q_norm, k_norm))
+    freqs = position * (1.0 / (1e7 ** (np.arange(0, ROTARY_DIM, 2, dtype=np.float32) / ROTARY_DIM)))
+    cos, sin = np.cos(freqs), np.sin(freqs)
+
+    def norm_rope(h, weight):
+        h = h * (1.0 / np.sqrt(np.mean(h * h, axis=-1, keepdims=True) + EPS)) * (1 + weight)
+        h1, h2 = h[..., : ROTARY_DIM // 2], h[..., ROTARY_DIM // 2 : ROTARY_DIM]
+        return np.concatenate((h1 * cos - h2 * sin, h2 * cos + h1 * sin, h[..., ROTARY_DIM:]), axis=-1)
+
+    q_gate = (x @ wq).reshape(heads, 2 * d)
+    q = norm_rope(q_gate[:, :d], q_norm)
+    k = norm_rope((x @ wk).reshape(kv_heads, d), k_norm)
+    v = (x @ wv).reshape(kv_heads, d)
+    return q, k, v, q_gate[:, d:]
+
+
+@pytest.mark.parametrize("trace", [False, True])
+# Qwen3.5-9B at TP4, TP2 and TP1, and Qwen3.8-27B at TP4 and TP2.
+@pytest.mark.parametrize("heads,kv_heads", [(4, 1), (8, 2), (16, 4), (6, 1), (12, 2)])
+def test_gated_qkv_norm_partial_rope_decode(trace, heads, kv_heads, tmp_path):
+    d = GATED_HEAD_DIM
+    run = jax.jit(
+        make_gated_prologue(heads, kv_heads),
+        compiler_options={
+            "optimization_level": "O1",
+            "enable_trace": str(trace).lower(),
+            "export_path": str(tmp_path),
+        },
+    )
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(heads)
+    weights = [
+        (rng.standard_normal((HIDDEN, n * d)) / np.sqrt(HIDDEN)).astype(jnp.bfloat16)
+        for n in (2 * heads, kv_heads, kv_heads)
+    ]
+    norms = [rng.uniform(-0.5, 0.5, d).astype(jnp.bfloat16) for _ in range(2)]
+    on_device = [jax.device_put(a, device) for a in weights + norms]
+    for position in (5, 1000, 31):  # Warmup, capture, and replay with changed inputs.
+        x = rng.standard_normal((1, HIDDEN)).astype(jnp.bfloat16)
+        positions = np.array([position], dtype=np.int32)
+        outputs = run(jax.device_put(x, device), *on_device, jax.device_put(positions, device))
+        expected = gated_reference(x, *weights, *norms, position, heads, kv_heads)
+        for name, actual, want in zip(("q", "k", "v", "gate"), outputs, expected):
+            actual = np.asarray(actual).astype(np.float32).reshape(want.shape)
+            np.testing.assert_allclose(actual, want, atol=0.06, rtol=0.03, err_msg=f"{name} at {position}")
+
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert irs, "no IR was exported"
+    assert any("ttnn.nlp_create_qkv_heads_decode_norm_rope" in ir for ir in irs), "the prologue was not fused"
+    for op in ("ttnn.rotary_embedding", "ttnn.rms_norm"):
+        assert not any(op in ir for ir in irs), f"a {op} was left over"

@@ -31,6 +31,30 @@ public:
                   mlir::PatternRewriter &rewriter) const override;
 };
 
+// Fuses the decode attention prologue of a projection whose q heads are each
+// followed by an output gate head, as in Qwen3.5, which
+// nlp_create_qkv_heads_decode does not split:
+//
+//   matmul -> [q|gate] heads: reshape [.., 2 * D] -> slice q -> rms_norm ->
+//   rope
+//                                                -> slice gate
+//          -> k: rms_norm -> rope
+//          -> v: reshape [1, B, Hkv, D]
+//
+// where rope is a rotary_embedding with token_index 0 of the whole head or of
+// its first elements, sliced off and concatenated back. q, k and v become the
+// results of one nlp_create_qkv_heads_decode_norm_rope with gated_query; the
+// gate keeps its slices of the projection.
+class GatedQKVHeadsDecodeNormRopeFusing
+    : public mlir::OpRewritePattern<MatmulOp> {
+public:
+  using OpRewritePattern<MatmulOp>::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(MatmulOp matmulOp,
+                  mlir::PatternRewriter &rewriter) const override;
+};
+
 } // namespace mlir::tt::ttnn::fusing
 
 #endif
