@@ -81,7 +81,15 @@ def test_all_reduce(full_mesh, trace, rows, width, dtype):
 def test_leading_dimension_padding_falls_back(full_mesh, trace):
     # Two logical rows in separate leading batches occupy two padded tile rows.
     # They must not use the single-tile-row decode specialization.
+    #
+    # That takes reduce-scatter + all-gather. On a ring of four, the all-gather
+    # alternates the packets for the chip two hops away between both
+    # directions; its completion once followed only one of them, so about 1 in
+    # 150 traced runs left a tile of the previous run on a chip. Untraced runs
+    # leave enough time between programs to hide it, so the traced four-chip
+    # case runs many times and checks every chip.
     ranks = full_mesh.size
+    iterations = 1500 if trace and ranks == 4 else 4
     spec = P("tp", None, None)
     run = jax.jit(
         jax.shard_map(
@@ -94,8 +102,9 @@ def test_leading_dimension_padding_falls_back(full_mesh, trace):
         compiler_options={"optimization_level": "O1", "enable_trace": str(trace).lower()},
     )
     rng = np.random.default_rng(567)
-    for _ in range(4):
+    for i in range(iterations):
         x = (rng.integers(-64, 64, (2 * ranks, 1, 5120)) / 8).astype(jnp.bfloat16)
         actual = run(jax.device_put(x, NamedSharding(full_mesh, spec)))
         expected = x.astype(np.float32).reshape(ranks, 2, 1, 5120).sum(axis=0).astype(jnp.bfloat16)
-        np.testing.assert_array_equal(np.asarray(actual), expected)
+        for chip, shard in enumerate(actual.addressable_shards):
+            np.testing.assert_array_equal(np.asarray(shard.data), expected, err_msg=f"run {i}, chip {chip}")

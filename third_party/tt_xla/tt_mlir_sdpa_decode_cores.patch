@@ -1,0 +1,45 @@
+diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedScaledDotProductAttentionDecodeProgramConfigRewritePattern.h b/include/ttmlir/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedScaledDotProductAttentionDecodeProgramConfigRewritePattern.h
+--- a/include/ttmlir/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedScaledDotProductAttentionDecodeProgramConfigRewritePattern.h
++++ b/include/ttmlir/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedScaledDotProductAttentionDecodeProgramConfigRewritePattern.h
+@@ -16,9 +16,10 @@ namespace mlir::tt::ttnn::workarounds::decomposition {
+ // decode program config; the tt-metal default approx-exp path fails SFPI
+ // compile. Metal issue reference:
+ // https://github.com/tenstorrent/tt-metal/issues/40301
+-// An existing config is preserved, otherwise metal's defaults are replicated
+-// (q/k_chunk_size = 32, max_cores_per_head_batch = 1), since passing a config
+-// disables metal's auto-default.
++// An existing config is preserved. Otherwise the pattern sets one that splits
++// each KV head across up to 16 cores and, for causal attention, reads 64-token
++// KV chunks (see the implementation), since passing a config disables metal's
++// auto-default anyway.
+ class PagedScaledDotProductAttentionDecodeProgramConfigRewritePattern
+     : public OpRewritePattern<ttnn::PagedScaledDotProductAttentionDecodeOp> {
+ public:
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedScaledDotProductAttentionDecodeProgramConfigRewritePattern.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedScaledDotProductAttentionDecodeProgramConfigRewritePattern.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedScaledDotProductAttentionDecodeProgramConfigRewritePattern.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedScaledDotProductAttentionDecodeProgramConfigRewritePattern.cpp
+@@ -30,14 +30,19 @@ LogicalResult PagedScaledDotProductAttentionDecodeProgramConfigRewritePattern::
+ 
+   SDPAProgramConfigAttr existing = srcOp.getProgramConfigAttr();
+ 
+-  // Preserve an existing config and layer exp_approx_mode = false on top;
+-  // otherwise replicate metal's paged-decode defaults.
++  // Preserve an existing config and layer exp_approx_mode = false on top.
++  // Otherwise split each KV head of each user across up to 16 cores (metal
++  // caps this at the cores the batch leaves free) instead of metal's
++  // paged-decode default of one: with few users and KV heads per device, one
++  // core per head leaves most of the grid idle and makes every decode step
++  // scan each head's cache serially. Causal attention reads the cache in
++  // 64-token chunks, halving the chunk count; non-causal attention keeps 32,
++  // which every cache length divides.
+   CoreCoordAttr grid;
+   CoreRangeSetAttr subCoreGrids = nullptr;
+   uint64_t qChunkSize = 32; // kDefaultDecodeChunkSize
+-  uint64_t kChunkSize = 32; // kDefaultDecodeChunkSize
+-  std::optional<uint32_t> maxCoresPerHeadBatch =
+-      1; // kDefaultMaxCoresPerHeadBatch
++  uint64_t kChunkSize = srcOp.getIsCausal() ? 64 : 32;
++  std::optional<uint32_t> maxCoresPerHeadBatch = 16;
+ 
+   if (existing) {
+     grid = existing.getComputeWithStorageGridSize();
