@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4075,6 +4075,40 @@
+@@ -4075,6 +4075,39 @@
    let hasVerifier = 1;
  }
  
@@ -17,9 +17,9 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +    those of nlp_create_qkv_heads_decode: q and k after the norm and rotary,
 +    and v.
 +
-+    A nonzero rotary_dim below head_dim rotates only the first rotary_dim
-+    elements of each head, with cos and sin rows of rotary_dim; the rest pass
-+    through normalized. With gated_query, each q head of the input is
++    cos_cache and sin_cache may be narrower than head_dim: only as many
++    leading elements of each head are rotated (a multiple of 64), and the
++    rest pass through normalized. With gated_query, each q head of the input is
 +    followed by an output gate head of head_dim, which is not read: the
 +    input is [1, 1, B, (2 * num_heads + 2 * num_kv_heads) * head_dim].
 +  }];
@@ -31,7 +31,6 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +                       UI32Attr:$num_heads,
 +                       UI32Attr:$num_kv_heads,
 +                       F32Attr:$epsilon,
-+                       DefaultValuedAttr<UI32Attr, "0">:$rotary_dim,
 +                       DefaultValuedAttr<BoolAttr, "false">:$gated_query);
 +
 +  let results = (outs AnyRankedTensor:$query,
@@ -45,7 +44,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
 --- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
-@@ -148,6 +148,21 @@
+@@ -148,6 +148,20 @@
    cluster_axis: uint32 = null;
  }
  
@@ -60,7 +59,6 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 +  num_heads: uint32;
 +  num_kv_heads: uint32;
 +  epsilon: float;
-+  rotary_dim: uint32;
 +  gated_query: bool;
 +}
 +
@@ -120,7 +118,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +      tensor(op.getCosCache()),
 +      tensor(op.getSinCache()), output(op.getQuery()), output(op.getKey()),
 +      output(op.getValue()), op.getNumHeads(), op.getNumKvHeads(),
-+      op.getEpsilon().convertToFloat(), op.getRotaryDim(), op.getGatedQuery());
++      op.getEpsilon().convertToFloat(), op.getGatedQuery());
 +}
 +
  ::flatbuffers::Offset<::tt::target::ttnn::SplitQueryKeyValueAndSplitHeadsOp>

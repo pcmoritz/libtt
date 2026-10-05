@@ -29,8 +29,6 @@ struct QKVHeadsNormRopeDecodeParams {
     uint32_t num_q_heads = 0;
     uint32_t num_kv_heads = 0;
     float epsilon = 1e-6f;
-    // 0 rotates the whole head.
-    uint32_t rotary_dim = 0;
     bool gated_query = false;
 };
 
@@ -63,9 +61,8 @@ uint32_t head_dim_of(const QKVHeadsNormRopeDecodeParams& params, const Tensor& q
     return qkv.logical_shape()[3] / input_heads(params);
 }
 
-uint32_t rotary_dim_of(const QKVHeadsNormRopeDecodeParams& params, const Tensor& qkv) {
-    return params.rotary_dim ? params.rotary_dim : head_dim_of(params, qkv);
-}
+// The elements of a head that are rotated: the width of the cos row.
+uint32_t rotary_dim_of(const QKVHeadsNormRopeDecodeInputs& in) { return in.cos.logical_shape()[-1]; }
 
 void validate_interleaved(const Tensor& tensor, const char* name) {
     TT_FATAL(tensor.storage_type() == StorageType::DEVICE, "{} must be on device", name);
@@ -94,18 +91,16 @@ void QKVHeadsNormRopeDecodeOperation::validate_on_program_cache_miss(
     const uint32_t heads = input_heads(params);
     TT_FATAL(shape[3] % heads == 0, "width {} must split into {} heads", shape[3], heads);
     const uint32_t head_dim = head_dim_of(params, in.qkv);
-    const uint32_t rotary_dim = rotary_dim_of(params, in.qkv);
+    const uint32_t rotary_dim = rotary_dim_of(in);
     TT_FATAL(head_dim % TILE_WIDTH == 0, "head_dim {} must be a multiple of 32", head_dim);
     // rotate_half swaps whole tiles.
     TT_FATAL(
-        rotary_dim % (2 * TILE_WIDTH) == 0 && rotary_dim <= head_dim,
-        "rotary_dim {} must be a multiple of 64 of at most head_dim {}", rotary_dim, head_dim);
+        rotary_dim > 0 && rotary_dim % (2 * TILE_WIDTH) == 0 && rotary_dim <= head_dim,
+        "rotary_dim {} (the width of cos) must be a multiple of 64 of at most head_dim {}", rotary_dim, head_dim);
     auto validate_row = [&](const Tensor& tensor, const char* name) {
         validate_interleaved(tensor, name);
         const auto& row_shape = tensor.logical_shape();
-        TT_FATAL(
-            row_shape[-1] == rotary_dim && row_shape.volume() == rotary_dim,
-            "{} shape {} must be one row of rotary_dim {}", name, row_shape, rotary_dim);
+        TT_FATAL(row_shape.volume() == rotary_dim, "{} shape {} must be one row", name, row_shape);
     };
     validate_interleaved(in.norm_weight, "norm_weight");
     TT_FATAL(
@@ -116,6 +111,9 @@ void QKVHeadsNormRopeDecodeOperation::validate_on_program_cache_miss(
         head_dim);
     validate_row(in.cos, "cos");
     validate_row(in.sin, "sin");
+    TT_FATAL(
+        in.sin.logical_shape() == in.cos.logical_shape(),
+        "sin shape {} must match cos shape {}", in.sin.logical_shape(), in.cos.logical_shape());
 }
 
 QKVHeadsNormRopeDecodeOperation::spec_return_value_t QKVHeadsNormRopeDecodeOperation::compute_output_specs(
@@ -159,7 +157,7 @@ ProgramDescriptor QKVHeadsNormRopeDecodeOperation::create_descriptor(
 
     const uint32_t head_dim = head_dim_of(params, in.qkv);
     const uint32_t head_tiles = head_dim / TILE_WIDTH;
-    const uint32_t rotary_tiles = rotary_dim_of(params, in.qkv) / TILE_WIDTH;
+    const uint32_t rotary_tiles = rotary_dim_of(in) / TILE_WIDTH;
     // The heads read: q, k and v, not the gates.
     const uint32_t num_heads = params.num_q_heads + 2 * params.num_kv_heads;
     // The k heads are stacked below the q heads, a row each.
@@ -296,14 +294,12 @@ std::vector<Tensor> nlp_create_qkv_heads_decode_norm_rope(
     uint32_t num_q_heads,
     uint32_t num_kv_heads,
     float epsilon,
-    uint32_t rotary_dim,
     bool gated_query) {
     using Op = prim::QKVHeadsNormRopeDecodeOperation;
     return device_operation::launch<Op>(
         {.num_q_heads = num_q_heads,
          .num_kv_heads = num_kv_heads,
          .epsilon = epsilon,
-         .rotary_dim = rotary_dim,
          .gated_query = gated_query},
         {.qkv = qkv, .norm_weight = norm_weight, .cos = cos, .sin = sin});
 }

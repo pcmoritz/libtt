@@ -18,9 +18,11 @@ namespace mlir::tt::ttnn::fusing {
 //                               -> v
 //
 // with token_index 0 and the same cos/sin for q and k, into one
-// nlp_create_qkv_heads_decode_norm_rope (one program instead of five). Its
-// weight row per head is a repeat and concat of the two norm weights, which
-// const-eval folds for model weights.
+// nlp_create_qkv_heads_decode_norm_rope (one program instead of five). The
+// rotary embedding may also cover only the first elements of each head,
+// sliced off and concatenated back onto the rest. Its weight row per head is
+// a repeat and concat of the two norm weights, which const-eval folds for
+// model weights.
 class NLPCreateQKVHeadsDecodeNormRopeFusing
     : public mlir::OpRewritePattern<NLPCreateQKVHeadsDecodeOp> {
 public:

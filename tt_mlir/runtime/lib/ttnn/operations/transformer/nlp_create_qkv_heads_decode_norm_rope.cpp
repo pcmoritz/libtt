@@ -18,8 +18,7 @@ void run(const ::tt::target::ttnn::NLPCreateQKVHeadsDecodeNormRopeOp *op,
       ::ttnn::transformer::nlp_create_qkv_heads_decode_norm_rope(
           tensor(op->input()), tensor(op->norm_weight()),
           tensor(op->cos_cache()), tensor(op->sin_cache()), op->num_heads(),
-          op->num_kv_heads(), op->epsilon(), op->rotary_dim(),
-          op->gated_query());
+          op->num_kv_heads(), op->epsilon(), op->gated_query());
   pool.insertTTNNTensorAndValidate(op->q_out(), outputs.at(0));
   pool.insertTTNNTensorAndValidate(op->k_out(), outputs.at(1));
   pool.insertTTNNTensorAndValidate(op->v_out(), outputs.at(2));

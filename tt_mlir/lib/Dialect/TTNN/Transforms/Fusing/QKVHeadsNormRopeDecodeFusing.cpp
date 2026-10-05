@@ -33,24 +33,29 @@ Operation *getSingleNonDeallocUser(Value value) {
   return users.size() == 1 ? users.front() : nullptr;
 }
 
-// The single user of `value`, or of a reshape of it that keeps the last
-// dimension when that reshape is the single user. Such a reshape regroups
-// whole rows: a norm or rotary embedding over the last dimension sees the
-// same rows. With `splitRows`, the reshape may also split each row into
-// several, as a projection [B, heads * D] into heads [B, heads, D].
-Operation *getUserThroughRowReshape(Value value, bool splitRows = false) {
+// The single user of `value` and the operand it reads: `value` itself, or a
+// reshape of `value` that is its single user and keeps the last dimension.
+// Such a reshape regroups whole rows: a norm or rotary embedding over the
+// last dimension sees the same rows. With `splitRows`, the reshape may also
+// split each row into several, as a projection [B, heads * D] into heads
+// [B, heads, D].
+struct OperandUse {
+  Value operand;
+  Operation *user;
+};
+
+OperandUse getUseThroughRowReshape(Value value, bool splitRows = false) {
   Operation *user = getSingleNonDeallocUser(value);
-  auto reshape = dyn_cast_or_null<ReshapeOp>(user);
-  if (!reshape) {
-    return user;
+  if (auto reshape = dyn_cast_or_null<ReshapeOp>(user)) {
+    int64_t from =
+        mlir::cast<RankedTensorType>(value.getType()).getShape().back();
+    int64_t to = reshape.getType().getShape().back();
+    if (to == from || (splitRows && to > 0 && from % to == 0)) {
+      return {reshape.getResult(),
+              getSingleNonDeallocUser(reshape.getResult())};
+    }
   }
-  int64_t from =
-      mlir::cast<RankedTensorType>(value.getType()).getShape().back();
-  int64_t to = reshape.getType().getShape().back();
-  if (to == from || (splitRows && to > 0 && from % to == 0)) {
-    return getSingleNonDeallocUser(reshape.getResult());
-  }
-  return user;
+  return {value, user};
 }
 
 // The [begin, end) of a static slice with step 1 that only slices the last
@@ -75,47 +80,14 @@ getLastDimSlice(SliceStaticOp slice) {
   return std::make_pair(at(slice.getBegins(), last), at(slice.getEnds(), last));
 }
 
-// The norm with a weight and no bias over heads of headDim of a projection
-// slice, directly or split into heads by a reshape.
-RMSNormOp getNormOf(Value slice, int64_t headDim) {
-  auto norm = dyn_cast_or_null<RMSNormOp>(
-      getUserThroughRowReshape(slice, /*splitRows=*/true));
-  if (!norm || !norm.getWeight() || norm.getBias() ||
-      norm.getInput().getType().getShape().back() != headDim) {
+// A rotary embedding with token_index 0 of `input` (not of its cos or sin).
+RotaryEmbeddingOp getDecodeRope(OperandUse use) {
+  auto rope = dyn_cast_or_null<RotaryEmbeddingOp>(use.user);
+  if (!rope || rope.getInput() != use.operand || !rope.getTokenIndex() ||
+      *rope.getTokenIndex() != 0) {
     return nullptr;
   }
-  Value input = norm.getInput();
-  if (auto reshape = input.getDefiningOp<ReshapeOp>()) {
-    input = reshape.getInput();
-  }
-  return input == slice ? norm : nullptr;
-}
-
-bool isDecodeRope(Operation *op) {
-  auto rope = dyn_cast_or_null<RotaryEmbeddingOp>(op);
-  return rope && rope.getTokenIndex() && *rope.getTokenIndex() == 0;
-}
-
-// The rms_norm -> rotary_embedding chain on a q or k result of a decode
-// heads op: a norm with a weight and no bias, whose only user is a rotary
-// embedding with token_index 0.
-struct NormRopeChain {
-  RMSNormOp norm;
-  RotaryEmbeddingOp rope;
-};
-
-std::optional<NormRopeChain> matchNormRope(Value heads) {
-  auto norm = dyn_cast_or_null<RMSNormOp>(getSingleNonDeallocUser(heads));
-  if (!norm || norm.getInput() != heads || !norm.getWeight() ||
-      norm.getBias()) {
-    return std::nullopt;
-  }
-  auto rope = dyn_cast_or_null<RotaryEmbeddingOp>(
-      getSingleNonDeallocUser(norm.getResult()));
-  if (!rope || rope.getInput() != norm.getResult() || !isDecodeRope(rope)) {
-    return std::nullopt;
-  }
-  return NormRopeChain{norm, rope};
+  return rope;
 }
 
 // The rotary embedding of normalized heads [.., D]: of the whole head, or of
@@ -131,20 +103,15 @@ struct RopeMatch {
 std::optional<RopeMatch> matchRope(Value normed) {
   int64_t headDim =
       mlir::cast<RankedTensorType>(normed.getType()).getShape().back();
-  if (auto rope =
-          dyn_cast_or_null<RotaryEmbeddingOp>(getUserThroughRowReshape(normed));
-      rope && isDecodeRope(rope)) {
+  OperandUse use = getUseThroughRowReshape(normed);
+  if (RotaryEmbeddingOp rope = getDecodeRope(use)) {
     return RopeMatch{rope.getResult(), rope.getCosCache(), rope.getSinCache(),
                      headDim};
   }
 
-  // The partial rotary slices, possibly of a reshape that regroups the rows.
-  if (auto reshape =
-          dyn_cast_or_null<ReshapeOp>(getSingleNonDeallocUser(normed));
-      reshape && reshape.getType().getShape().back() == headDim) {
-    normed = reshape.getResult();
-  }
-  SmallVector<Operation *> users = getNonDeallocUsers(normed);
+  // The partial rotary slices of the normalized heads, or of a reshape that
+  // regroups their rows.
+  SmallVector<Operation *> users = getNonDeallocUsers(use.operand);
   if (users.size() != 2) {
     return std::nullopt;
   }
@@ -167,9 +134,9 @@ std::optional<RopeMatch> matchRope(Value normed) {
       secondBounds->second != headDim) {
     return std::nullopt;
   }
-  auto rope = dyn_cast_or_null<RotaryEmbeddingOp>(
-      getUserThroughRowReshape(first.getResult()));
-  if (!rope || !isDecodeRope(rope)) {
+  RotaryEmbeddingOp rope =
+      getDecodeRope(getUseThroughRowReshape(first.getResult()));
+  if (!rope) {
     return std::nullopt;
   }
   // The pass-through part, reshaped like the rotated part.
@@ -189,6 +156,35 @@ std::optional<RopeMatch> matchRope(Value normed) {
   }
   return RopeMatch{concat.getResult(), rope.getCosCache(), rope.getSinCache(),
                    rotaryDim};
+}
+
+// An rms_norm with a weight and no bias over heads of headDim, directly or
+// after a reshape that splits rows into heads, then its rotary embedding.
+struct NormRope {
+  RMSNormOp norm;
+  RopeMatch rope;
+};
+
+std::optional<NormRope> matchNormRope(Value heads, int64_t headDim) {
+  OperandUse use = getUseThroughRowReshape(heads, /*splitRows=*/true);
+  auto norm = dyn_cast_or_null<RMSNormOp>(use.user);
+  if (!norm || norm.getInput() != use.operand || !norm.getWeight() ||
+      norm.getBias() ||
+      norm.getInput().getType().getShape().back() != headDim) {
+    return std::nullopt;
+  }
+  std::optional<RopeMatch> rope = matchRope(norm.getResult());
+  if (!rope) {
+    return std::nullopt;
+  }
+  return NormRope{norm, *rope};
+}
+
+// The q and k chains of one prologue: the same cos, sin and epsilon.
+bool areCompatible(NormRope q, NormRope k) {
+  return q.rope.cos == k.rope.cos && q.rope.sin == k.rope.sin &&
+         q.rope.rotaryDim == k.rope.rotaryDim &&
+         q.norm.getEpsilonAttr() == k.norm.getEpsilonAttr();
 }
 
 // A tiled, interleaved DRAM tensor of BF16 or FP32, as the fused op reads.
@@ -324,7 +320,6 @@ mlir::LogicalResult createFusedOp(const FusedPrologue &p,
       input, normWeight.getResult(), p.cos, p.sin,
       rewriter.getUI32IntegerAttr(p.numHeads),
       rewriter.getUI32IntegerAttr(p.numKVHeads), p.epsilon,
-      rewriter.getUI32IntegerAttr(p.rotaryDim == p.headDim ? 0 : p.rotaryDim),
       rewriter.getBoolAttr(p.gatedQuery));
   // The replaced chains are left without users and erased as dead.
   rewriter.replaceAllUsesWith(p.query, fused.getQuery());
@@ -341,39 +336,26 @@ mlir::LogicalResult NLPCreateQKVHeadsDecodeNormRopeFusing::matchAndRewrite(
       (decodeOp.getOverlapQkCoregrid() && !*decodeOp.getOverlapQkCoregrid())) {
     return mlir::failure();
   }
-  std::optional<NormRopeChain> q = matchNormRope(decodeOp.getQuery());
-  std::optional<NormRopeChain> k = matchNormRope(decodeOp.getKey());
-  if (!q || !k || q->rope.getCosCache() != k->rope.getCosCache() ||
-      q->rope.getSinCache() != k->rope.getSinCache() ||
-      q->norm.getEpsilonAttr() != k->norm.getEpsilonAttr()) {
-    return mlir::failure();
-  }
   ArrayRef<int64_t> inputShape = decodeOp.getInput().getType().getShape();
-  if (inputShape.size() != 4 || inputShape[0] != 1 || inputShape[1] != 1) {
-    return mlir::failure();
-  }
   uint32_t numHeads = decodeOp.getNumHeads();
   uint32_t numKVHeads = decodeOp.getNumKvHeads().value_or(numHeads);
-  if (inputShape[3] % (numHeads + 2 * numKVHeads) != 0) {
+  if (inputShape.size() != 4 || inputShape[0] != 1 || inputShape[1] != 1 ||
+      inputShape[3] % (numHeads + 2 * numKVHeads) != 0) {
     return mlir::failure();
   }
   int64_t headDim = inputShape[3] / (numHeads + 2 * numKVHeads);
-  if (failed(createFusedOp(
-          FusedPrologue{decodeOp.getLoc(), decodeOp.getInput(),
-                        q->norm.getWeight(), k->norm.getWeight(),
-                        q->rope.getCosCache(), q->rope.getSinCache(), numHeads,
-                        numKVHeads, headDim, headDim, /*gatedQuery=*/false,
-                        q->norm.getEpsilonAttr(), q->rope.getResult(),
-                        k->rope.getResult(), decodeOp.getValue()},
-          rewriter))) {
+  std::optional<NormRope> q = matchNormRope(decodeOp.getQuery(), headDim);
+  std::optional<NormRope> k = matchNormRope(decodeOp.getKey(), headDim);
+  if (!q || !k || !areCompatible(*q, *k)) {
     return mlir::failure();
   }
-  rewriter.eraseOp(q->rope);
-  rewriter.eraseOp(k->rope);
-  rewriter.eraseOp(q->norm);
-  rewriter.eraseOp(k->norm);
-  rewriter.eraseOp(decodeOp);
-  return mlir::success();
+  return createFusedOp(
+      FusedPrologue{decodeOp.getLoc(), decodeOp.getInput(), q->norm.getWeight(),
+                    k->norm.getWeight(), q->rope.cos, q->rope.sin, numHeads,
+                    numKVHeads, headDim, q->rope.rotaryDim,
+                    /*gatedQuery=*/false, q->norm.getEpsilonAttr(),
+                    q->rope.result, k->rope.result, decodeOp.getValue()},
+      rewriter);
 }
 
 mlir::LogicalResult GatedQKVHeadsDecodeNormRopeFusing::matchAndRewrite(
@@ -433,15 +415,9 @@ mlir::LogicalResult GatedQKVHeadsDecodeNormRopeFusing::matchAndRewrite(
   }
   auto numKVHeads = static_cast<uint32_t>(kWidth / headDim);
 
-  RMSNormOp qNorm = getNormOf(qSlice.getResult(), headDim);
-  RMSNormOp kNorm = getNormOf(kSlice.getResult(), headDim);
-  if (!qNorm || !kNorm || qNorm.getEpsilonAttr() != kNorm.getEpsilonAttr()) {
-    return mlir::failure();
-  }
-  std::optional<RopeMatch> qRope = matchRope(qNorm.getResult());
-  std::optional<RopeMatch> kRope = matchRope(kNorm.getResult());
-  if (!qRope || !kRope || qRope->cos != kRope->cos ||
-      qRope->sin != kRope->sin || qRope->rotaryDim != kRope->rotaryDim) {
+  std::optional<NormRope> q = matchNormRope(qSlice.getResult(), headDim);
+  std::optional<NormRope> k = matchNormRope(kSlice.getResult(), headDim);
+  if (!q || !k || !areCompatible(*q, *k)) {
     return mlir::failure();
   }
   auto value =
@@ -449,13 +425,14 @@ mlir::LogicalResult GatedQKVHeadsDecodeNormRopeFusing::matchAndRewrite(
   if (!value) {
     return mlir::failure();
   }
-  return createFusedOp(
-      FusedPrologue{matmulOp.getLoc(), matmulOp.getResult(), qNorm.getWeight(),
-                    kNorm.getWeight(), qRope->cos, qRope->sin, numHeads,
-                    numKVHeads, headDim, qRope->rotaryDim, /*gatedQuery=*/true,
-                    qNorm.getEpsilonAttr(), qRope->result, kRope->result,
-                    value.getResult()},
-      rewriter);
+  return createFusedOp(FusedPrologue{matmulOp.getLoc(), matmulOp.getResult(),
+                                     q->norm.getWeight(), k->norm.getWeight(),
+                                     q->rope.cos, q->rope.sin, numHeads,
+                                     numKVHeads, headDim, q->rope.rotaryDim,
+                                     /*gatedQuery=*/true,
+                                     q->norm.getEpsilonAttr(), q->rope.result,
+                                     k->rope.result, value.getResult()},
+                       rewriter);
 }
 
 } // namespace mlir::tt::ttnn::fusing

@@ -27,7 +27,7 @@ struct Case {
     uint32_t num_q_heads;
     uint32_t num_kv_heads;
     uint32_t head_dim;
-    // 0 rotates the whole head.
+    // The width of cos and sin; 0 is the whole head.
     uint32_t rotary_dim = 0;
     bool gated_query = false;
 };
@@ -94,8 +94,7 @@ TEST_P(QKVHeadsNormRopeDecodeTest, MatchesSeparateSteps) {
         const ttnn::Tensor sin_device = to_device(sin, ttnn::Shape({1, 1, 1, rotary_dim}));
 
         const std::vector<ttnn::Tensor> outputs = ttnn::transformer::nlp_create_qkv_heads_decode_norm_rope(
-            qkv_device, weight_device, cos_device, sin_device, num_q_heads, num_kv_heads, epsilon, rotary_dim_param,
-            gated_query);
+            qkv_device, weight_device, cos_device, sin_device, num_q_heads, num_kv_heads, epsilon, gated_query);
         ASSERT_EQ(outputs.size(), 3u);
 
         // Head `head` of user `user`; q and k heads use weight row `weight_row`.
