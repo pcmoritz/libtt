@@ -79,3 +79,16 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn
          case UnaryOpType::RECIP: return {"recip_tile_init<false>();", fmt::format("recip_tile<false>({});", idst)};
          case UnaryOpType::GELU: return {"gelu_tile_init();", fmt::format("gelu_tile({});", idst)};
          case UnaryOpType::GELU_TANH: return {"gelu_tanh_tile_init();", fmt::format("gelu_tanh_tile({});", idst)};
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
+@@ -71,7 +71,8 @@ bool unary_op_supports_integer_dtype(UnaryOpType op_type, DataType dtype) {
+         case UnaryOpType::RIGHT_SHIFT:
+         case UnaryOpType::SQUARE: return is_int32_uint32_uint16(dtype);
+ 
+-        case UnaryOpType::BITWISE_NOT: return is_int32_uint32(dtype);
++        // UINT16 already worked before this check existed; UINT8 has its own kernel.
++        case UnaryOpType::BITWISE_NOT: return is_int32_uint32_uint16(dtype) || dtype == DataType::UINT8;
+ 
+         case UnaryOpType::RELU:
+         case UnaryOpType::RELU6:

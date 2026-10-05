@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
-@@ -127,6 +127,20 @@ void UnaryDeviceOperation::validate_on_program_cache_miss(
+@@ -129,6 +129,20 @@ void UnaryDeviceOperation::validate_on_program_cache_miss(
      const auto& input_tensor = tensor_args.input;
      const auto& output_tensor = tensor_args.output_tensor;
  
