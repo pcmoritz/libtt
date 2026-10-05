@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -11089,6 +11089,7 @@ public:
+@@ -11092,6 +11092,7 @@ public:
      return success();
    }
  };
@@ -9,7 +9,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  } // namespace
  
  namespace {
-@@ -11191,6 +11192,94 @@ public:
+@@ -11194,6 +11195,94 @@ public:
      return success();
    }
  };
@@ -104,7 +104,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  } // namespace
  
  namespace {
-@@ -11482,6 +11571,7 @@ static void addReduceOpsConversionPatterns(MLIRContext *ctx,
+@@ -11485,6 +11574,7 @@ static void addReduceOpsConversionPatterns(MLIRContext *ctx,
                                             TypeConverter &typeConverter) {
    patterns.add<StableHLOToTTIRReduceOpConversionPattern>(typeConverter, ctx);
    patterns.add<StableHLOTopKOpMHLOConversionPattern>(typeConverter, ctx);

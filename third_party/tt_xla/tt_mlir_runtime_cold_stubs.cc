@@ -24,10 +24,16 @@
 #include "operations/tensor_serialization/dump_tensor.h"
 #include "operations/tensor_serialization/load_tensor.h"
 #include "operations/ttml/adamw.h"
+#include "operations/ttml/cross_entropy_bw.h"
 #include "operations/ttml/cross_entropy_fw.h"
+#include "operations/ttml/layernorm_bw.h"
 #include "operations/ttml/layernorm_fw.h"
+#include "operations/ttml/rmsnorm_bw.h"
+#include "operations/ttml/rmsnorm_fw.h"
 #include "operations/ttml/sdpa_bw.h"
 #include "operations/ttml/sdpa_fw.h"
+#include "operations/ttml/softmax_backward.h"
+#include "operations/ttml/swiglu_elemwise_bw.h"
 
 #include <stdexcept>
 #include <string>
@@ -190,6 +196,30 @@ void run(const ::tt::target::ttnn::LayerNormForwardOp *, ProgramContext &) {
 
 void run(const ::tt::target::ttnn::CrossEntropyForwardOp *, ProgramContext &) {
   unsupported("ttnn.cross_entropy_forward");
+}
+
+void run(const ::tt::target::ttnn::CrossEntropyBackwardOp *, ProgramContext &) {
+  unsupported("ttnn.cross_entropy_backward");
+}
+
+void run(const ::tt::target::ttnn::LayerNormBackwardOp *, ProgramContext &) {
+  unsupported("ttnn.layernorm_backward");
+}
+
+void run(const ::tt::target::ttnn::RMSNormBackwardOp *, ProgramContext &) {
+  unsupported("ttnn.rmsnorm_backward");
+}
+
+void run(const ::tt::target::ttnn::RMSNormForwardOp *, ProgramContext &) {
+  unsupported("ttnn.rmsnorm_forward");
+}
+
+void run(const ::tt::target::ttnn::SoftmaxBackwardOp *, ProgramContext &) {
+  unsupported("ttnn.softmax_backward");
+}
+
+void run(const ::tt::target::ttnn::SwigluElemwiseBackwardOp *, ProgramContext &) {
+  unsupported("ttnn.swiglu_elemwise_backward");
 }
 
 } // namespace tt::runtime::ttnn::operations::ttml

@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -11039,6 +11039,37 @@ public:
+@@ -11042,6 +11042,37 @@ public:
      return success();
    }
  };
@@ -39,7 +39,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  } // namespace
  
  static void
-@@ -11065,8 +11096,7 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+@@ -11068,8 +11099,7 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<
        mlir::stablehlo::IsFiniteOp, mlir::tt::ttir::IsFiniteOp>>(typeConverter,
                                                                  ctx);

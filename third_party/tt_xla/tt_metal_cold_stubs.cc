@@ -5,8 +5,9 @@
 #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp"
 #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.hpp"
 #include "ttnn/operations/experimental/conv3d/conv3d.hpp"
+#include "ttnn/operations/experimental/quasar/binary/binary.hpp"
+#include "ttnn/operations/experimental/quasar/to_layout/to_layout_op.hpp"
 #include "ttnn/operations/experimental/transformer/dit_rms_norm_unary_fused/dit_rms_norm_unary_fused.hpp"
-#include "ttnn/operations/experimental/unary_backward/gelu_backward/gelu_backward.hpp"
 #include "ttnn/operations/pool/upsample/upsample.hpp"
 #include "ttnn/tensor/serialization.hpp"
 
@@ -34,9 +35,18 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     std::optional<ttnn::experimental::ccl::AllGatherFusedOpSignaler> &,
     CoreCoord, ttnn::ccl::CoreAllocationStrategy, std::optional<uint32_t>,
     std::optional<uint32_t>, std::optional<Tensor>, std::optional<Tensor>,
-    uint32_t, uint32_t, uint32_t, bool) {
+    uint32_t, uint32_t, uint32_t, bool, bool, RingAttentionRankMapping) {
   unsupported("ttnn::ring_attention_all_gather_async");
 }
+
+namespace ring_attention_all_gather_async_detail {
+
+bool uses_output_bank_owned_schedule(const std::vector<Tensor> &,
+                                     const std::vector<Tensor> &, int32_t) {
+  unsupported("ttnn::ring_attention_all_gather_async");
+}
+
+} // namespace ring_attention_all_gather_async_detail
 
 void ring_attention_neighbor_halo_exchange_helper(
     tt::tt_metal::ProgramDescriptor &, const std::vector<Tensor> &,
@@ -89,11 +99,6 @@ ttnn::Tensor dit_rms_norm_unary_fused(
     std::optional<const ttnn::DeviceComputeKernelConfig>,
     const std::optional<ttnn::operations::unary::UnaryWithParam> &) {
   unsupported("ttnn::experimental::dit_rms_norm_unary_fused");
-}
-
-Tensor gelu_bw(const Tensor &, const Tensor &, const std::string &,
-               const std::optional<MemoryConfig> &, std::optional<Tensor>) {
-  unsupported("ttnn::experimental::gelu_bw");
 }
 
 CoreCoord get_moe_tilize_drain_core(MeshDevice *, uint32_t, uint32_t,
@@ -149,3 +154,28 @@ Tensor load_tensor_flatbuffer(
 }
 
 } // namespace ttnn
+
+// Quasar is not a libtt target; tt-mlir's runtime only calls these on Quasar.
+namespace ttnn::operations::experimental::quasar {
+
+Tensor to_layout(const Tensor &, Layout, const std::optional<DataType> &,
+                 const std::optional<MemoryConfig> &,
+                 const std::optional<CoreRangeSet> &, float) {
+  unsupported("ttnn::experimental::quasar::to_layout");
+}
+
+namespace binary {
+
+Tensor add(const Tensor &, const Tensor &, const std::optional<const DataType> &,
+           const std::optional<MemoryConfig> &, const std::optional<Tensor> &,
+           ttsl::Span<const operations::unary::EltwiseUnaryWithParam>,
+           ttsl::Span<const operations::unary::EltwiseUnaryWithParam>,
+           ttsl::Span<const operations::unary::EltwiseUnaryWithParam>,
+           const std::optional<CoreRangeSet> &,
+           const std::optional<tt::tt_metal::SubDeviceId> &) {
+  unsupported("ttnn::experimental::quasar::add");
+}
+
+} // namespace binary
+
+} // namespace ttnn::operations::experimental::quasar

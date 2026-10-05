@@ -337,8 +337,11 @@ genrule(
         "inspector_stubs/impl/debug/inspector/inspector.hpp",
         "inspector_stubs/tt_metal/impl/debug/inspector/data.hpp",
         "inspector_stubs/tt_metal/impl/debug/inspector/inspector.hpp",
+        # The streaming profiler needs Tracy, which libtt does not build.
+        "inspector_stubs/impl/streaming_profiler/streaming_profiler_receiver.hpp",
     ],
     cmd = "mkdir -p $(@D)/inspector_stubs/debug/inspector " +
+          "$(@D)/inspector_stubs/impl/streaming_profiler " +
           "$(@D)/inspector_stubs/impl/debug/inspector " +
           "$(@D)/inspector_stubs/tt_metal/impl/debug/inspector; " +
           "printf '%s\\n' " +
@@ -393,7 +396,23 @@ genrule(
           "cp $(@D)/inspector_stubs/debug/inspector/data.hpp $(@D)/inspector_stubs/impl/debug/inspector/data.hpp; " +
           "cp $(@D)/inspector_stubs/debug/inspector/inspector.hpp $(@D)/inspector_stubs/impl/debug/inspector/inspector.hpp; " +
           "cp $(@D)/inspector_stubs/debug/inspector/data.hpp $(@D)/inspector_stubs/tt_metal/impl/debug/inspector/data.hpp; " +
-          "cp $(@D)/inspector_stubs/debug/inspector/inspector.hpp $(@D)/inspector_stubs/tt_metal/impl/debug/inspector/inspector.hpp",
+          "cp $(@D)/inspector_stubs/debug/inspector/inspector.hpp $(@D)/inspector_stubs/tt_metal/impl/debug/inspector/inspector.hpp; " +
+          "printf '%s\\n' " +
+          "'#pragma once' " +
+          "'#include <memory>' " +
+          "'#include <tt_stl/assert.hpp>' " +
+          "'namespace tt::tt_metal::distributed {' " +
+          "'class MeshDevice;' " +
+          "'}  // namespace tt::tt_metal::distributed' " +
+          "'namespace tt::tt_metal::streaming_profiler {' " +
+          "'class Receiver {' " +
+          "'public:' " +
+          "'    static std::unique_ptr<Receiver> create(const std::shared_ptr<distributed::MeshDevice>&) {' " +
+          "'        TT_THROW(\"libtt is built without the streaming profiler\");' " +
+          "'    }' " +
+          "'};' " +
+          "'}  // namespace tt::tt_metal::streaming_profiler' " +
+          "> $(@D)/inspector_stubs/impl/streaming_profiler/streaming_profiler_receiver.hpp",
 )
 
 genrule(
@@ -572,6 +591,9 @@ cc_library(
         "tt_stl/**/*.hpp",
     ], allow_empty = True) + [
         ":tt_metal_flatbuffer_headers",
+        "tt_metal/impl/buffers/buffer_impl.hpp",
+        "tt_metal/impl/buffers/buffer_sharding_args_impl.hpp",
+        "tt_metal/impl/buffers/compute_page_mapping.hpp",
         "tt_metal/impl/tensor/spec/memory_config/memory_config_impl.hpp",
     ],
     copts = [
@@ -670,6 +692,14 @@ TT_METAL_RUNTIME_HDRS = glob(
         "tt_metal/impl/lightmetal/**/*.hpp",
         "tt_metal/impl/memory_tracking/**/*.h",
         "tt_metal/impl/memory_tracking/**/*.hpp",
+        "tt_metal/impl/graph/**/*.h",
+        "tt_metal/impl/graph/**/*.hpp",
+        "tt_metal/impl/experimental/**/*.h",
+        "tt_metal/impl/experimental/**/*.hpp",
+        "tt_metal/impl/range_lockstep_allocation/**/*.h",
+        "tt_metal/impl/range_lockstep_allocation/**/*.hpp",
+        "tt_metal/impl/metal2_host_api/**/*.h",
+        "tt_metal/impl/metal2_host_api/**/*.hpp",
         "tt_metal/impl/per_core_allocation/**/*.h",
         "tt_metal/impl/per_core_allocation/**/*.hpp",
         "tt_metal/impl/profiler/**/*.h",
@@ -840,6 +870,7 @@ TTNN_EXPERIMENTAL_OPERATION_SRCS = [
 TT_METAL_JIT_BUILD_SRCS = [
     "tt_metal/jit_build/build.cpp",
     "tt_metal/jit_build/build_cache_telemetry.cpp",
+    "tt_metal/jit_build/pch.cpp",
     "tt_metal/jit_build/build_env_manager.cpp",
     "tt_metal/jit_build/data_format.cpp",
     "tt_metal/jit_build/depend.cpp",
@@ -1116,12 +1147,14 @@ cc_library(
         "tt_metal/impl/allocator/allocator_state.cpp",
         "tt_metal/impl/allocator/bank_manager.cpp",
         "tt_metal/impl/allocator/l1_banking_allocator.cpp",
+        "tt_metal/impl/allocator/persistent_l1_arena.cpp",
         "tt_metal/impl/buffers/buffer.cpp",
         "tt_metal/impl/buffers/buffer_page_mapping.cpp",
         "tt_metal/impl/buffers/circular_buffer.cpp",
         "tt_metal/impl/buffers/circular_buffer_config.cpp",
         "tt_metal/impl/buffers/cross_node_dfb.cpp",
         "tt_metal/impl/buffers/dispatch.cpp",
+        "tt_metal/impl/buffers/prefetcher_pipe.cpp",
         "tt_metal/impl/buffers/drisc_l1_arena.cpp",
         "tt_metal/impl/buffers/global_circular_buffer.cpp",
         "tt_metal/impl/buffers/global_semaphore.cpp",
@@ -1196,6 +1229,7 @@ cc_library(
         "tt_metal/impl/graph/graph_tracking.cpp",
         "tt_metal/impl/host_api/temp_quasar_api.cpp",
         "tt_metal/impl/host_api/tt_metal.cpp",
+        "tt_metal/impl/internal/reload_table.cpp",
         "tt_metal/impl/internal/service/service_core_manager.cpp",
         "tt_metal/impl/kernels/kernel.cpp",
         "tt_metal/impl/kernels/kernel_types.cpp",
@@ -1210,6 +1244,8 @@ cc_library(
         "tt_metal/impl/metal2_host_api/tensor_spec_relaxations.cpp",
         "tt_metal/impl/per_core_allocation/buffer.cpp",
         "tt_metal/impl/per_core_allocation/memory_config.cpp",
+        "tt_metal/impl/range_lockstep_allocation/buffer.cpp",
+        "tt_metal/impl/range_lockstep_allocation/memory_config.cpp",
         "tt_metal/impl/per_core_allocation/mesh_buffer.cpp",
         "tt_metal/impl/profiler/profiler.cpp",
         "tt_metal/impl/profiler/profiler_analysis.cpp",
@@ -1241,11 +1277,11 @@ cc_library(
         "tt_metal/llrt/llrt.cpp",
         "tt_metal/llrt/metal_soc_descriptor.cpp",
         "tt_metal/llrt/rtoptions.cpp",
-        "tt_metal/llrt/tlb_config.cpp",
         "tt_metal/llrt/tt_cluster.cpp",
         "tt_metal/llrt/tt_elffile.cpp",
         "tt_metal/llrt/tt_memory.cpp",
         "tt_metal/llrt/tunnels_from_mmio_device.cpp",
+        "tt_metal/llrt/zone_meta.cpp",
     ] + TT_METAL_FLATBUFFER_SRCS + TT_METAL_JIT_BUILD_SRCS + TT_FABRIC_SRCS,
     hdrs = TT_METAL_RUNTIME_HDRS + glob(["tools/scaleout/**/*.hpp"]),
     copts = TT_METAL_RUNTIME_COPTS,

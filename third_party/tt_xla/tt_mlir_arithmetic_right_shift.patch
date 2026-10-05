@@ -46,7 +46,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/eltwise.fbs b/include/ttmlir/
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -11393,6 +11393,9 @@ addElementwiseBinaryOpsConversionPatterns(MLIRContext *ctx,
+@@ -11396,6 +11396,9 @@ addElementwiseBinaryOpsConversionPatterns(MLIRContext *ctx,
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<
        mlir::stablehlo::ShiftRightLogicalOp,
        mlir::tt::ttir::LogicalRightShiftOp>>(typeConverter, ctx);

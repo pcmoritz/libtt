@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5352,6 +5352,58 @@ private:
+@@ -5355,6 +5355,58 @@ private:
  };
  } // namespace
  
@@ -60,7 +60,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  namespace {
  class StableHLOToTTIRReduceScatterOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::ReduceScatterOp> {
-@@ -12212,6 +12264,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
+@@ -12215,6 +12267,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
                                         RewritePatternSet &patterns,
                                         TypeConverter &typeConverter) {
    patterns.add<StableHLOToTTIRAllReduceOpConversionPattern>(typeConverter, ctx);

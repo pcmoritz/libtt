@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -4639,6 +4639,146 @@ getReduceTypeFromRegion(Region &region) {
+@@ -4642,6 +4642,146 @@ getReduceTypeFromRegion(Region &region) {
        std::make_error_code(std::errc::operation_not_supported));
  }
  
@@ -148,7 +148,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  static llvm::ErrorOr<ttcore::ReduceType> getReduceType(Operation *op) {
    if (!llvm::isa<mlir::stablehlo::AllReduceOp, mlir::stablehlo::ReduceScatterOp,
                   mlir::stablehlo::ScatterOp>(op)) {
-@@ -7916,19 +8056,24 @@ public:
+@@ -7919,19 +8059,24 @@ public:
      }
  
      // Convert reduceType stablehlo attribute into ttir attribute.
@@ -180,7 +180,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp, "the scatter's update computation neither combines its "
                   "arguments nor returns the update value");
-@@ -7936,29 +8081,93 @@ public:
+@@ -7939,29 +8084,93 @@ public:
  
      RankedTensorType outputType = mlir::cast<RankedTensorType>(
          this->getTypeConverter()->convertType(srcOp.getResults()[0].getType()));
@@ -282,7 +282,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      Value flattenedInput = ttir::utils::flattenTensor(
          rewriter, srcOp.getLoc(), inputTensor, "_input_flatten");
      Value flattenedUpdate = ttir::utils::flattenTensor(
-@@ -7968,7 +8177,7 @@ public:
+@@ -7971,7 +8180,7 @@ public:
          srcOp.getLoc(), mlir::cast<RankedTensorType>(flattenedInput.getType()),
          flattenedInput, flattenedIndices, flattenedUpdate,
          rewriter.getI32IntegerAttr(SCATTER_DIMENSION),
@@ -291,7 +291,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      // Reshape result back to original input shape.
      Value reshapedResult = ttir::utils::createReshapeOp(
-@@ -7976,11 +8185,97 @@ public:
+@@ -7979,11 +8188,97 @@ public:
          ttmlir::utils::appendLocationSuffix(srcOp.getLoc(), "_result_reshape"),
          scatterResult, inputShape);
  
@@ -389,7 +389,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Where each operand dimension draws its extent and its written position
    // from: how a StableHLO scatter lines up with the operand's dimensions.
    struct OperandDimSources {
-@@ -8051,12 +8346,6 @@ private:
+@@ -8054,12 +8349,6 @@ private:
                              ttcore::ReduceType reduceType,
                              RankedTensorType outputType,
                              ConversionPatternRewriter &rewriter) const {
@@ -402,7 +402,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      OperandDimSources sources = computeOperandDimSources(srcOp);
      if (failed(checkAlignedScatterLegality(srcOp, sources, rewriter))) {
        return failure();
-@@ -8378,11 +8667,9 @@ private:
+@@ -8381,11 +8670,9 @@ private:
      auto dimensionNumbers = adaptor.getScatterDimensionNumbers();
      ArrayRef<int64_t> scatterDimsToOperandDims =
          dimensionNumbers.getScatterDimsToOperandDims();
@@ -417,7 +417,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      // Scatters along at most one operand dimension are checked by
      // computeOperandAlignedLayout instead, which has to work the mapping out in
-@@ -8391,14 +8678,8 @@ private:
+@@ -8394,14 +8681,8 @@ private:
        return success();
      }
  
@@ -434,7 +434,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      int64_t indexRank = op.getScatterIndices().getType().getRank();
      if (dimensionNumbers.getIndexVectorDim() != indexRank - 1) {
-@@ -8486,6 +8767,23 @@ private:
+@@ -8489,6 +8770,23 @@ private:
      return flatIndices;
    }
  
@@ -458,7 +458,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    /// Computes flattened 1D indices for multi-dimensional scatter.
    ///
    /// Handles both cases:
-@@ -8523,6 +8821,10 @@ private:
+@@ -8526,6 +8824,10 @@ private:
          scatterDimNumbers.getUpdateWindowDims();
      ArrayRef<int64_t> scatterDimsToOperandDims =
          scatterDimNumbers.getScatterDimsToOperandDims();
@@ -469,7 +469,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      int64_t indexVectorDim = scatterDimNumbers.getIndexVectorDim();
      int64_t operandRank = operandShape.size();
      Location loc = op.getLoc();
-@@ -8530,6 +8832,8 @@ private:
+@@ -8533,6 +8835,8 @@ private:
      // Build set of inserted window dims for fast lookup.
      llvm::DenseSet<int64_t> insertedDimsSet(insertedWindowDims.begin(),
                                              insertedWindowDims.end());
@@ -478,7 +478,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      // Build reverse map: operand dim -> index position in scatter indices.
      llvm::DenseMap<int64_t, int64_t> scatterDimToIdxPos;
-@@ -8562,6 +8866,54 @@ private:
+@@ -8565,6 +8869,54 @@ private:
      // Total number of expanded indices (one per one scalar update).
      int64_t expandedNumIndices = numScatterPositions * windowSize;
  
@@ -533,7 +533,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      // First, reshape the original indices to shape
      // [numScatterPositions, originalIndexSize].
      int64_t originalIndexSize = indicesShape[indexVectorDim];
-@@ -8658,31 +9010,42 @@ private:
+@@ -8661,31 +9013,42 @@ private:
      // b) window-only: use window offset only
      // c) both scatter-indexed and window: add scatter index + window offset
      llvm::SmallVector<Value> indexSlices;
@@ -594,7 +594,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        }
  
        if (isWindowDim) {
-@@ -8704,11 +9067,23 @@ private:
+@@ -8707,11 +9070,23 @@ private:
          }
        }
  

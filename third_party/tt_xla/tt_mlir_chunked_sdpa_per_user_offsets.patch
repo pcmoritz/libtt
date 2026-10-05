@@ -64,7 +64,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
  namespace {
  template <typename SrcOp, typename DestOp,
-@@ -9833,6 +9866,9 @@ public:
+@@ -9836,6 +9869,9 @@ public:
        return failure();
      }
  
@@ -74,7 +74,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if (adaptor.getOperands().size() != 2 || srcOp.getResults().size() != 1) {
        return rewriter.notifyMatchFailure(
            srcOp,
-@@ -9904,6 +9940,9 @@ public:
+@@ -9907,6 +9943,9 @@ public:
        return failure();
      }
  
@@ -84,7 +84,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if (adaptor.getOperands().size() != 3 || srcOp.getResults().size() != 1) {
        return rewriter.notifyMatchFailure(
            srcOp, "UpdateCache op must have exactly three operands and one "
-@@ -9975,6 +10014,9 @@ public:
+@@ -9978,6 +10017,9 @@ public:
        return failure();
      }
  
@@ -94,7 +94,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if (adaptor.getOperands().size() != 4 || srcOp.getResults().size() != 1) {
        return rewriter.notifyMatchFailure(
            srcOp, "PagedUpdateCache op must have exactly four operands and one "
-@@ -10092,6 +10134,9 @@ public:
+@@ -10095,6 +10137,9 @@ public:
        return failure();
      }
  
@@ -104,7 +104,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if ((adaptor.getOperands().size() != 4 &&
           adaptor.getOperands().size() != 3) ||
          srcOp.getResults().size() != 1) {
-@@ -10329,121 +10374,80 @@ public:
+@@ -10332,121 +10377,80 @@ public:
        return failure();
      }
  
@@ -282,7 +282,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      RankedTensorType outputType = cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult(0).getType()));
-@@ -10452,12 +10456,10 @@ public:
+@@ -10455,12 +10459,10 @@ public:
  
      rewriter.replaceOpWithNewOp<
          mlir::tt::ttir::PagedScaledDotProductAttentionDecodeOp>(
@@ -299,7 +299,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      return success();
    }
  };
-@@ -10478,23 +10480,20 @@ public:
+@@ -10481,23 +10483,20 @@ public:
        return failure();
      }
  
@@ -336,7 +336,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
  
      Value query = adaptor.getOperands()[0];
-@@ -10533,7 +10532,6 @@ namespace {
+@@ -10536,7 +10535,6 @@ namespace {
  class StableHLOToTTIRPagedFlashMLADecodeOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
    using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;

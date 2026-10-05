@@ -185,7 +185,7 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10120,6 +10120,72 @@ public:
+@@ -10123,6 +10123,72 @@ public:
  } // namespace
  
  namespace {
@@ -258,7 +258,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  class StableHLOPagedFillCacheConversionPattern
      : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
    using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
-@@ -12105,6 +12171,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
+@@ -12108,6 +12174,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
                                                                  ctx);
    patterns.add<StableHLOToTTIRCollectivePermuteOpConversionPattern>(
        typeConverter, ctx);
@@ -645,7 +645,7 @@ new file mode 100644
 +      get(op->query()), get(op->key()), get(op->value()), get(op->gate()),
 +      get(op->beta()), 1.0f,
 +      tiled(get(op->initial_state()), ::ttnn::DataType::FLOAT32), true, 32,
-+      false, false,
++      false, false, /*use_mcast=*/true,
 +      ::ttnn::DRAM_MEMORY_CONFIG, std::nullopt, get(op->eye()), get(op->tril()),
 +      get(op->ones()), get(op->masks()));
 +  put(pool, op->final_state(), state.value());

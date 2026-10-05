@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -9316,68 +9316,18 @@ public:
+@@ -9319,68 +9319,18 @@ public:
        outputTypes.push_back(indicesType);
      }
  
@@ -80,7 +80,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      int64_t total = prePost * dSort;
  
      // Build permutation: all dims except sortDim, then sortDim last.
-@@ -9390,73 +9340,126 @@ public:
+@@ -9393,73 +9343,126 @@ public:
      }
      perm.push_back(sortDim);
      SmallVector<int64_t> invPerm = ttmlir::utils::inversePermutation(perm);
@@ -266,7 +266,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
  
      rewriter.replaceOp(srcOp, results);
-@@ -9481,6 +9484,60 @@ private:
+@@ -9484,6 +9487,60 @@ private:
      return isa_and_nonnull<mlir::stablehlo::IotaOp>(op);
    }
  

@@ -180,10 +180,10 @@ http_archive(
 http_archive(
     name = "tracy",
     build_file = "//third_party/tracy:BUILD.overlay.bazel",
-    sha256 = "c458fdce48b6e540ea37091157253e6a8d74a3bd4fcbd152f17769a604484870",
-    strip_prefix = "tracy-117100515bb21d9a6b3a8f0eee50ecd91f961408",
+    sha256 = "0a05879224e526524fcc2b455e2bad907de6f1e2b6171de1638ac3af1be3398b",
+    strip_prefix = "tracy-9c3ca7e5fe48cecf90aa518c82552aae706cf110",
     urls = [
-        "https://github.com/tenstorrent-metal/tracy/archive/117100515bb21d9a6b3a8f0eee50ecd91f961408.tar.gz",
+        "https://github.com/tenstorrent-metal/tracy/archive/9c3ca7e5fe48cecf90aa518c82552aae706cf110.tar.gz",
     ],
 )
 

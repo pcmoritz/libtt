@@ -89,7 +89,7 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -12410,9 +12410,15 @@ static void addAllToAllOpsConversionPattern(MLIRContext *ctx,
+@@ -12413,9 +12413,15 @@ static void addAllToAllOpsConversionPattern(MLIRContext *ctx,
  
  namespace mlir::tt {
  

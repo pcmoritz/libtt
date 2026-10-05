@@ -350,7 +350,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        } else if (isa<mlir::stablehlo::AddOp>(reductionOp) && initVal == ZERO) {
          // Special case of sum pooling followed by a convenient div op.
          // TODO(acicovic): Check why was i == 0 originally added as a condition.
-@@ -3850,6 +3908,9 @@ private:
+@@ -3853,6 +3911,9 @@ private:
        if (checkInitValue(constantValue, elementType,
                           TypicalInitReductionValue::NEG_INF)) {
          initValues.push_back(TypicalInitReductionValue::NEG_INF);
@@ -360,7 +360,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        } else if (checkInitValue(constantValue, elementType,
                                  TypicalInitReductionValue::ZERO)) {
          initValues.push_back(TypicalInitReductionValue::ZERO);
-@@ -4726,8 +4787,8 @@ public:
+@@ -4729,8 +4790,8 @@ public:
      }
  
      Location loc = srcOp.getLoc();
@@ -371,7 +371,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto initValue_ = srcOp.getInitValue();
  
      // Get window attributes
-@@ -4755,7 +4816,34 @@ public:
+@@ -4758,7 +4819,34 @@ public:
          loc, operandType, rewriter.getF32FloatAttr(fillValue));
  
      // Tensor which we scatter into
@@ -407,7 +407,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      // Generate defaults if they dont exist
      // Default window strides is all ones
-@@ -4771,52 +4859,17 @@ public:
+@@ -4774,52 +4862,17 @@ public:
                   : rewriter.getDenseI64ArrayAttr(
                         SmallVector<int64_t>(windowDims.size() * 2, 0));
  
@@ -469,7 +469,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      // Adjust args to match definition in MaxPool2dWithIndices
      auto kernel = rewriter.getDenseI32ArrayAttr(
-@@ -4838,31 +4891,32 @@ public:
+@@ -4841,31 +4894,32 @@ public:
  
      auto ceilMode = rewriter.getBoolAttr(false);
  
@@ -523,7 +523,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
                                rewriter.getIntegerType(32)); // i32 for indices
  
      Value pooledEmpty = rewriter.create<ttir::EmptyOp>(loc, pooledType);
-@@ -4907,8 +4961,14 @@ public:
+@@ -4910,8 +4964,14 @@ public:
        return rewriter.notifyMatchFailure(
            srcOp, "SelectAndScatterOp cannot specify reduce type.");
      }
@@ -539,7 +539,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto scatterResult = rewriter.create<ttir::ScatterOp>(
          loc, scatterOutputType,
          reshapedFullTensor, // input tensor
-@@ -4918,34 +4978,32 @@ public:
+@@ -4921,34 +4981,32 @@ public:
          reduceTypeAttr);    // reduction type
  
      // Reshape back to N,H,W,C
@@ -596,7 +596,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    RankedTensorType getNHWFlattenedType(RankedTensorType unflattenedType) const {
      llvm::ArrayRef<int64_t> shape = unflattenedType.getShape();
      assert(shape.size() == 4 && "Expected 4D NHWC tensor");
-@@ -4956,9 +5014,8 @@ private:
+@@ -4959,9 +5017,8 @@ private:
    }
  
    ttir::ReshapeOp
