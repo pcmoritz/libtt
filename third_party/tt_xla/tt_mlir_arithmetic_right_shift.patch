@@ -204,5 +204,5 @@ diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp b/r
 +    break;
 +  }
    case ::tt::target::ttnn::EltwiseBinaryCompositeOpType::Remainder: {
-     runEltwiseBinaryCompositeOpWithActivations(
-         op, tensorPool,
+     // The compiler fuses no activations into remainder.
+     runEltwiseBinaryCompositeOp(
