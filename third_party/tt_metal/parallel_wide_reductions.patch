@@ -49,29 +49,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/
  std::map<std::string, std::string> get_defines(
      tt::tt_metal::ReduceOpMath reduce_op, tt::tt_metal::ReduceOpDim reduce_dim) {
      std::map<std::string, std::string> defines;
-@@ -139,21 +170,6 @@ Tensor reduce(
-     const bool both_interleaved =
-         input_tensor.memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED &&
-         output_mem_config.memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED;
--    const bool rm_base_eligible =
--        input_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR && input_tensor.logical_shape().rank() == 4 &&
--        both_interleaved &&
--        (input_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16 ||
--         input_tensor.dtype() == tt::tt_metal::DataType::FLOAT32) &&
--        (reduce_math == tt::tt_metal::ReduceOpMath::AVG || reduce_math == tt::tt_metal::ReduceOpMath::SUM);
--
--    // A TILE request must be explicit: std::nullopt means "whatever the selected path emits".
--    // The RM H path can emit both layouts, so it stays eligible; the RM W path can emit only
--    // ROW_MAJOR, so a TILE request sends it back to the tilize + tile-reduce path.
--    const bool explicit_tile_request = output_layout == tt::tt_metal::Layout::TILE;
--    const bool use_rm_dense_w =
--        rm_base_eligible && reduce_dim == tt::tt_metal::ReduceOpDim::W && !explicit_tile_request;
--    const bool use_rm_dense_h = rm_base_eligible && reduce_dim == tt::tt_metal::ReduceOpDim::H;
--    const bool use_rm_dense = use_rm_dense_w || use_rm_dense_h;
- 
-     // Accurate fp32 SFPU path (the FPU truncates fp32 to tf32 on the way into SrcA/SrcB). Falls back
-     // to the FPU without fp32_dest_acc_en or on Quasar (no SFPU reduce LLKs). The dense RM kernels
-@@ -170,6 +186,61 @@ Tensor reduce(
+@@ -170,6 +201,45 @@ Tensor reduce(
  
      const bool use_sfpu_fp32_reduce = use_sfpu_fp32_sum || use_sfpu_fp32_mean || use_sfpu_fp32_max || use_sfpu_fp32_min;
  
@@ -113,22 +91,6 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/
 +                Shape{padded_shape[0], padded_shape[1], padded_shape[2], tile.get_width()});
 +        }
 +    }
-+
-+    const bool rm_base_eligible =
-+        input_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR && input_tensor.logical_shape().rank() == 4 &&
-+        both_interleaved &&
-+        (input_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16 ||
-+         input_tensor.dtype() == tt::tt_metal::DataType::FLOAT32) &&
-+        (reduce_math == tt::tt_metal::ReduceOpMath::AVG || reduce_math == tt::tt_metal::ReduceOpMath::SUM);
-+
-+    // A TILE request must be explicit: std::nullopt means "whatever the selected path emits".
-+    // The RM H path can emit both layouts, so it stays eligible; the RM W path can emit only
-+    // ROW_MAJOR, so a TILE request sends it back to the tilize + tile-reduce path.
-+    const bool explicit_tile_request = output_layout == tt::tt_metal::Layout::TILE;
-+    const bool use_rm_dense_w =
-+        rm_base_eligible && reduce_dim == tt::tt_metal::ReduceOpDim::W && !explicit_tile_request;
-+    const bool use_rm_dense_h = rm_base_eligible && reduce_dim == tt::tt_metal::ReduceOpDim::H;
-+    const bool use_rm_dense = use_rm_dense_w || use_rm_dense_h;
 +
      // The FPU has no float/bf16 MIN primitive, so fast-mode MIN lowers to -MAX(-x) via the fused
      // negate kernels. Accurate fp32 MIN drives the LLK MIN reduce directly (like Int32 MIN) and must
