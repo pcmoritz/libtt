@@ -126,7 +126,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_pro
 diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp
 --- ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp
 +++ ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp
-@@ -107,7 +107,8 @@ ttnn::Tensor reduce_scatter(
+@@ -107,7 +107,8 @@
      std::optional<uint32_t> num_workers_per_link,
      std::optional<uint32_t> num_buffers_per_channel,
      const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
@@ -136,7 +136,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp ttnn/c
      // If cluster_axis is None, but mesh shape is not 1xM or Mx1, then we call reduce-scatter on cluster_axis=1, then
      // reduce-scatter on cluster_axis=0
      if (cluster_axis == std::nullopt) {
-@@ -129,7 +130,8 @@ ttnn::Tensor reduce_scatter(
+@@ -129,7 +130,8 @@
                      num_workers_per_link,
                      num_buffers_per_channel,
                      compute_kernel_config,
@@ -146,7 +146,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp ttnn/c
              }
              return tensor;
          }
-@@ -149,6 +151,7 @@ ttnn::Tensor reduce_scatter(
+@@ -149,6 +151,7 @@
          ttnn::ccl::resolve_fp32_acc_compute_kernel_config(compute_kernel_config, input_tensor.dtype());
  
      if (composite_common::use_composite_reduce_scatter(input_tensor, dim, cluster_axis)) {
@@ -154,7 +154,23 @@ diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp ttnn/c
          return composite_common::composite_reduce_scatter(
              input_tensor,
              dim,
-@@ -232,7 +235,8 @@ ttnn::Tensor reduce_scatter(
+@@ -166,8 +169,13 @@
+     // Small-shape fast path: one fabric hop per contribution instead of the ring's N/2 relay steps.
+     // Gated on topology/layout/size -- see use_direct_reduce_scatter. Called through the prim so the
+     // caller's optional output tensor can be reused without also having to own the staging buffer;
+-    // staging stays op-allocated, which is what compiles the writer's start barrier in.
+-    if (use_direct_reduce_scatter(
++    // staging stays op-allocated, which is what compiles the writer's start barrier in. The direct op
++    // only sums, and only the ring op reduces 32-bit dtypes exactly.
++    const DataType dtype = input_tensor.dtype();
++    const bool direct_supports_reduction = math_op == reduction_common::ReduceType::Sum &&
++                                           dtype != DataType::FLOAT32 && dtype != DataType::INT32 &&
++                                           dtype != DataType::UINT32;
++    if (direct_supports_reduction && use_direct_reduce_scatter(
+             input_tensor,
+             dim,
+             cluster_axis,
+@@ -232,7 +240,8 @@
                 num_workers_per_link,
                 num_buffers_per_channel,
                 resolved_compute_kernel_config,
