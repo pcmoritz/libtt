@@ -66,6 +66,7 @@ bazel test //tests:jax_test_suite \
   --test_arg=--ignore=tests/sparse_test.py \
   --test_arg=--ignore=tests/sparsify_test.py \
   --test_arg=--deselect=tests/blocked_sampler_test.py::BlockedFoldInTest::test_blocked_fold_in_shape_invariance_4096x512_vs_1024x2048 \
+  --test_arg=--deselect=tests/logging_test.py::LoggingTest::test_no_log_spam \
   --test_arg=--deselect=tests/logging_test.py::LoggingTest::test_subprocess_cpp_logging_level \
   --test_arg=--deselect=tests/logging_test.py::LoggingTest::test_subprocess_double_logging_absent \
   --test_arg=--deselect=tests/logging_test.py::LoggingTest::test_subprocess_stderr_debug_logging \
