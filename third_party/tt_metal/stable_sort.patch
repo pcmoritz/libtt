@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
-@@ -36,13 +36,14 @@ void prepare_uint16_fp32_dest_value_tiles_for_pack(uint32_t dst_tile_a, uint32_t
+@@ -36,13 +36,14 @@
   * @param index_transposed_dfb Output circular buffer for transposed index tiles.
   * @param Wt Number of tiles to process (should be even).
   * @param switch_dir If true, alternates the sorting direction for each tile pair to build a bitonic sequence.
@@ -17,7 +17,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
  FORCE_INLINE
  void sort_Wt_tiles_row_to_bitonic_sequence(
      DataflowBuffer& input_dfb,
-@@ -51,12 +52,12 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
+@@ -51,12 +52,12 @@
      DataflowBuffer& index_transposed_dfb,
      const uint32_t Wt,
      const bool switch_dir,
@@ -32,7 +32,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
      for (uint32_t wt = 0; wt < Wt; wt += 2) {
          tile_regs_acquire();
  
-@@ -75,7 +76,7 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
+@@ -75,7 +76,7 @@
          transpose_tile(index_dfb.get_id(), 1, 3);
  
          // llk_topk_sort -> inplace
@@ -44,7 +44,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
-@@ -28,6 +28,7 @@ void kernel_main() {
+@@ -28,6 +28,7 @@
      constexpr uint32_t number_of_tiles_per_core = get_arg(args::number_of_tiles_per_core);
      constexpr uint32_t number_of_cores_used = get_arg(args::number_of_cores_used);
      constexpr bool ascending = get_arg(args::ascending) == 1;
@@ -52,7 +52,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
  
      DataflowBuffer input_tensor_dfb(dfb::input_tensor);
      DataflowBuffer index_tensor_dfb(dfb::index_tensor);
-@@ -96,7 +97,7 @@ void kernel_main() {
+@@ -96,7 +97,7 @@
          bool dir = ascending ^ ((core_id & 1) == 1);
  
          // Read input value data
@@ -61,7 +61,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
              input_tensor_dfb,
              index_tensor_dfb,
              input_tensor_transposed_dfb,
-@@ -153,24 +154,15 @@ void kernel_main() {
+@@ -153,40 +154,31 @@
                              copy_tile(dfb::index_tensor_transposed, left_tile_id, index_dest_start);
                              copy_tile(dfb::index_tensor_transposed, right_tile_id, index_dest_end);
  
@@ -91,7 +91,10 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
                                  }
                              }
                              // UInt16-in-32b-DEST: mode-9 packer fixup before packing values (#50215).
-@@ -180,13 +172,13 @@ void kernel_main() {
+-                            prepare_uint16_fp32_dest_value_tiles_for_pack(tile_input_low, tile_input_high);
++                            prepare_uint16_fp32_dest_value_tiles_for_pack(input_dest_start, input_dest_end);
+                             tile_regs_commit();
+                             tile_regs_wait();
  
                              // Pack value tiles to the transposed buffer
                              pack_reconfig_data_format(dfb::input_tensor_transposed);
@@ -109,7 +112,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
  
                              tile_regs_release();
                          }
-@@ -257,15 +249,18 @@ void kernel_main() {
+@@ -257,15 +249,18 @@
  
                          value_tensor_peer_dfb.pop_front(one_tile);
  
@@ -136,7 +139,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
-@@ -154,26 +154,16 @@ void kernel_main() {
+@@ -154,31 +154,21 @@
                                  copy_tile(dfb::index_tensor, 1, index_dest_end);
                              }
  
@@ -169,7 +172,13 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
                                  }
                              }
  
-@@ -196,12 +186,12 @@ void kernel_main() {
+                             // UInt16-in-32b-DEST: mode-9 packer fixup before packing values (#50215).
+-                            prepare_uint16_fp32_dest_value_tiles_for_pack(tile_input_low, tile_input_high);
++                            prepare_uint16_fp32_dest_value_tiles_for_pack(input_dest_start, input_dest_end);
+ 
+                             tile_regs_commit();
+ 
+@@ -196,12 +186,12 @@
  
                                  tile_regs_wait();
                                  pack_reconfig_data_format(dfb::input_tensor_transposed);
@@ -186,7 +195,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
                                  tile_regs_release();
  
                                  input_tensor_transposed_dfb.push_back(2 * one_tile);
-@@ -261,12 +251,12 @@ void kernel_main() {
+@@ -261,12 +251,12 @@
                                  tile_regs_wait();
                                  // Process value tiles
                                  pack_reconfig_data_format(dfb::input_tensor_output);
@@ -206,7 +215,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
-@@ -176,7 +176,7 @@ void kernel_main() {
+@@ -176,7 +176,7 @@
          }
  #endif
  
@@ -215,7 +224,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
              input_tensor_dfb,
              index_tensor_dfb,
              input_tensor_transposed_dfb,
-@@ -230,24 +230,15 @@ void kernel_main() {
+@@ -230,40 +230,31 @@
                          copy_tile(dfb::input_tensor_transposed, left_tile_id, input_dest_start);
                          copy_tile(dfb::input_tensor_transposed, right_tile_id, input_dest_end);
  
@@ -245,7 +254,11 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
                              }
                          }
  
-@@ -258,12 +249,12 @@ void kernel_main() {
+                         // UInt16-in-32b-DEST: mode-9 packer fixup before packing values (#50215).
+-                        prepare_uint16_fp32_dest_value_tiles_for_pack(tile_input_low, tile_input_high);
++                        prepare_uint16_fp32_dest_value_tiles_for_pack(input_dest_start, input_dest_end);
+ 
+                         tile_regs_commit();
                          tile_regs_wait();
  
                          pack_reconfig_data_format(dfb::input_tensor_transposed);
@@ -265,7 +278,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
-@@ -1322,6 +1322,7 @@ ttnn::device_operation::ProgramArtifacts SortProgramFactoryCrossCoreDataExchange
+@@ -1322,6 +1322,7 @@
                  {"number_of_tiles_per_core", number_of_tiles_per_core},
                  {"number_of_cores_used", all_core_utilization_count},
                  {"ascending", static_cast<uint32_t>(!attributes.descending)},
@@ -284,7 +297,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
  #include "ttnn/operations/creation/creation.hpp"
  #include "ttnn/operations/data_movement/fill_pad/fill_pad.hpp"
  #include "ttnn/operations/data_movement/pad/pad.hpp"
-@@ -244,8 +245,6 @@ std::vector<Tensor> sort(
+@@ -244,8 +245,6 @@
      const bool stable,
      const std::optional<MemoryConfig>& memory_config,
      std::optional<std::tuple<Tensor&, Tensor&>> optional_output_tensors) {
@@ -293,7 +306,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
      const ttnn::Shape& original_lshape = input_tensor.logical_shape();
      const auto rank = input_tensor.logical_shape().rank();
  
-@@ -311,10 +310,19 @@ std::vector<Tensor> sort(
+@@ -311,10 +310,19 @@
      // is still sharded when it is called.  We capture the user-requested output
      // memory config in sort_mem_cfg above before doing this conversion so that
      // the output can be converted back to the sharded config after sorting.
@@ -314,7 +327,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
      Tensor padded_input_tensor =
          dm::pre_sort_transform_tensor(transform_input, dim, is_dim_last_idx, is_rank_le_4d, descending);
      const MemoryConfig device_op_mem_cfg = sort_mem_cfg.is_sharded() ? ttnn::DRAM_MEMORY_CONFIG : sort_mem_cfg;
-@@ -332,7 +340,7 @@ std::vector<Tensor> sort(
+@@ -332,7 +340,7 @@
          const auto& out1 = std::get<1>(*optional_output_tensors);
          const bool values_layout_match = (out0.layout() == padded_input_tensor.layout());
          const bool indices_layout_match = (out1.layout() == padded_input_tensor.layout());
@@ -323,7 +336,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
          if (!preallocated_layout_mismatch) {
              const auto canonicalize_output = [&](const Tensor& t) {
                  return dm::pre_sort_transform_tensor(t, dim, is_dim_last_idx, is_rank_le_4d, descending);
-@@ -350,6 +358,10 @@ std::vector<Tensor> sort(
+@@ -350,6 +358,10 @@
      auto results = dm::post_sort_transform_tensor(
          input_tensor, sorted_tensors, dim, is_dim_last_idx, original_lshape, device_op_mem_cfg);
  

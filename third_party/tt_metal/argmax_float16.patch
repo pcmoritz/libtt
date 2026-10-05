@@ -177,7 +177,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argma
  
 +        } else if constexpr (data_format == DataFormat::Float16) {
 +            volatile tt_l1_ptr auto i_red_vals =
-+                reinterpret_cast<volatile tt_l1_ptr uint16_t*>(red_val_cb_local_base_addr + i * red_val_size_per_core);
++                reinterpret_cast<volatile tt_l1_ptr uint16_t*>(red_val_dfb_local_base_addr + i * red_val_size_per_core);
 +
 +            process_core_data<data_format>(
 +                inner_idx, i_red_vals, i_red_idxs, max_val, max_idx, float16_greater);
