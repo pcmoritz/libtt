@@ -11,3 +11,30 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/compute
  
          // transpose input
          dfb_tilize_exp.wait_front(1);
+diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
+@@ -691,6 +691,11 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreTiledG
+             case DataType::BFLOAT16:
+                 padding_val_packed = pack_two_bfloat16_into_uint32({bfloat16(pad_value), bfloat16(pad_value)});
+                 break;
++            case DataType::FLOAT16: {
++                auto value = float16(pad_value).bits;
++                padding_val_packed = pack_two_uint16_into_uint32({value, value});
++                break;
++            }
+             case DataType::UINT16:
+                 padding_val_packed =
+                     pack_two_uint16_into_uint32({float_to_uint16(pad_value), float_to_uint16(pad_value)});
+@@ -738,7 +743,10 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreTiledG
+ 
+     all_cores = num_cores > padded_num_cores ? all_cores : padded_all_cores;
+ 
+-    tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
++    // Permute is bit-preserving, so use UInt16 to avoid FP16 conversion.
++    tt::DataFormat cb_data_format = input_tensor.dtype() == DataType::FLOAT16
++                                        ? tt::DataFormat::UInt16
++                                        : tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
+     uint32_t input_page_size = detail::tile_size(tensor_return_value) + misalignment;
+ 
+     // ---- Resource names ----
