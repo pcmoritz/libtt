@@ -1,0 +1,27 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -861,19 +861,14 @@
+       .addOutputOperandWorkaround(operandWorkaround);
+ }
+ 
+-// ttnn.permute will not work correctly on 32-bit integers. This workaround will
+-// typecast the 32-bit integers to 32-bit floats before the ttnn.permute op and
+-// typecast the output back.
+-// tt-metal issue: https://github.com/tenstorrent/tt-metal/issues/19950
++// ttnn.permute used to produce wrong data for 32-bit integers, so they were
++// typecast to float32, which rounds values beyond 2^24. tt-metal fixed this
++// (https://github.com/tenstorrent/tt-metal/issues/19950), so 32-bit integers
++// are now permuted directly.
+ TTNNOperandsWorkarounds
+ TTNNOperandsWorkaroundsFactory::createPermuteOpOperandWorkaround(
+     mlir::RankedTensorType inputType) {
+   TTNNOperandWorkarounds operandWorkaround;
+-  if (auto elementType = dyn_cast<IntegerType>(inputType.getElementType());
+-      elementType && elementType.getWidth() == 32) {
+-    operandWorkaround.tensorDataTypeWorkaround =
+-        mlir::tt::ttcore::DataType::Float32;
+-  }
+ 
+   return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+       .addInputOperandWorkaround(operandWorkaround)

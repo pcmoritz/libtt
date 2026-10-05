@@ -1,0 +1,51 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -9385,19 +9385,35 @@
+           RankedTensorType::get(permValShape, valType.getElementType());
+       val = rewriter.create<ttir::PermuteOp>(loc, permValType, val, perm);
+ 
+-      // Flatten to [total, 1] - EmbeddingOp requires 2D weights.
+-      auto weightType =
+-          RankedTensorType::get({total, 1}, valType.getElementType());
+-      val = rewriter.create<ttir::ReshapeOp>(
+-          loc, weightType, val,
+-          rewriter.getI32ArrayAttr({static_cast<int32_t>(total), 1}));
++      // ttnn.embedding only takes bf16 or f32 tables, so integer tensors would
++      // round through bf16. Gather their rows of [prePost, dSort] by the
++      // per-row sort indices instead, which is exact. Gathering in 2-D also
++      // avoids ttnn.gather's mishandling of tensors above rank 4.
++      if (auto intType = dyn_cast<IntegerType>(valType.getElementType());
++          intType && intType.getWidth() >= 16) {
++        auto rowsType =
++            RankedTensorType::get({prePost, dSort}, valType.getElementType());
++        val = rewriter.create<ttir::ReshapeOp>(
++            loc, rowsType, val,
++            rewriter.getI32ArrayAttr({static_cast<int32_t>(prePost),
++                                      static_cast<int32_t>(dSort)}));
++        val = rewriter.create<ttir::GatherOp>(loc, rowsType, val, indices2D,
++                                              rewriter.getI32IntegerAttr(1));
++      } else {
++        // Flatten to [total, 1] - EmbeddingOp requires 2D weights.
++        auto weightType =
++            RankedTensorType::get({total, 1}, valType.getElementType());
++        val = rewriter.create<ttir::ReshapeOp>(
++            loc, weightType, val,
++            rewriter.getI32ArrayAttr({static_cast<int32_t>(total), 1}));
+ 
+-      // EmbeddingOp: indices [prePost, dSort] * weights [total, 1]
+-      //   -> output [prePost, dSort, 1].
+-      auto embOutType =
+-          RankedTensorType::get({prePost, dSort, 1}, valType.getElementType());
+-      val =
+-          rewriter.create<ttir::EmbeddingOp>(loc, embOutType, flatIndices, val);
++        // EmbeddingOp: indices [prePost, dSort] * weights [total, 1]
++        //   -> output [prePost, dSort, 1].
++        auto embOutType = RankedTensorType::get({prePost, dSort, 1},
++                                                valType.getElementType());
++        val = rewriter.create<ttir::EmbeddingOp>(loc, embOutType, flatIndices,
++                                                 val);
++      }
+ 
+       // Reshape [prePost, dSort, 1] -> permuted shape [...non-sort dims...,
+       // dSort].
