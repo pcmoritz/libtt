@@ -11,6 +11,8 @@
 // tiles and head h of the k heads to row num_q_heads + h, so that one pass of
 // the compute kernel normalizes and rotates both; head h of the v heads goes
 // to row h of the v output, as nlp_create_qkv_heads_decode places them.
+// With a gated query, every q head of the projection is followed by its gate
+// head, which is not read.
 // The heads alternate between the two RISCs. A face row of a head (16
 // elements) may be narrower than the DRAM read alignment, so each is read as
 // the aligned chunk around it into scratch and then moved into place by the
@@ -43,6 +45,8 @@ void kernel_main() {
     constexpr uint32_t num_q_heads = get_named_compile_time_arg_val("num_q_heads");
     constexpr uint32_t num_kv_heads = get_named_compile_time_arg_val("num_kv_heads");
     constexpr uint32_t head_tiles = get_named_compile_time_arg_val("head_tiles");
+    constexpr uint32_t rotary_tiles = get_named_compile_time_arg_val("rotary_tiles");
+    constexpr uint32_t q_head_stride = get_named_compile_time_arg_val("q_head_stride");
     constexpr uint32_t row_tiles = get_named_compile_time_arg_val("row_tiles");
     constexpr uint32_t q_row_tiles = get_named_compile_time_arg_val("q_row_tiles");
     constexpr uint32_t row_bytes = get_named_compile_time_arg_val("row_bytes");
@@ -59,6 +63,11 @@ void kernel_main() {
     // and 3 rows 16-31.
     auto row_in_tile = [&](uint32_t r) { return (r % 16) * row_bytes + (r / 16) * 2 * face_bytes; };
     const auto qkv = TensorAccessor(qkv_args, qkv_addr, tile_bytes);
+    // The first tile of a head in the projection.
+    auto head_tile = [&](uint32_t head) {
+        return head < num_q_heads ? head * q_head_stride
+                                  : num_q_heads * q_head_stride + (head - num_q_heads) * head_tiles;
+    };
 
     auto read_tiles = [&](const auto& args, uint32_t addr, uint32_t cb, uint32_t count) {
         const auto tensor = TensorAccessor(args, addr, get_tile_size(cb));
@@ -84,7 +93,7 @@ void kernel_main() {
             const uint32_t tile = head * head_tiles + i;
             for (uint32_t half = 0; half < 2; ++half) {
                 noc_async_read(
-                    qkv.get_noc_addr(tile) + row_offset + half * face_bytes - skew,
+                    qkv.get_noc_addr(head_tile(head) + i) + row_offset + half * face_bytes - skew,
                     scratch + (2 * tile + half) * alignment,
                     alignment);
             }
@@ -93,8 +102,8 @@ void kernel_main() {
     if constexpr (role == 0) {
         read_tiles(weight_args, weight_addr, cb_weight, row_tiles * head_tiles);
     } else {
-        read_tiles(cos_args, cos_addr, cb_cos, head_tiles);
-        read_tiles(sin_args, sin_addr, cb_sin, head_tiles);
+        read_tiles(cos_args, cos_addr, cb_cos, rotary_tiles);
+        read_tiles(sin_args, sin_addr, cb_sin, rotary_tiles);
         // The reduce scaler: FP32 ones in row 0 of each face.
         Noc noc;
         CircularBuffer scaler(cb_scaler);
@@ -141,8 +150,8 @@ void kernel_main() {
     }
     cb_reserve_back(cb_placed, 1);
     cb_push_back(cb_placed, 1);
-    cb_push_back(cb_cos, head_tiles);
-    cb_push_back(cb_sin, head_tiles);
+    cb_push_back(cb_cos, rotary_tiles);
+    cb_push_back(cb_sin, rotary_tiles);
     cb_push_back(cb_v_out, head_tiles);
 
     // Move the k rows of the output, rows num_q_heads.. of the stacked tiles,

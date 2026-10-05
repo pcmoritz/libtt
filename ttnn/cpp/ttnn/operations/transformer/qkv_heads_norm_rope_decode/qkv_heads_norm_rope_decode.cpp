@@ -29,6 +29,7 @@ struct QKVHeadsNormRopeDecodeParams {
     uint32_t num_q_heads = 0;
     uint32_t num_kv_heads = 0;
     float epsilon = 1e-6f;
+    bool gated_query = false;
 };
 
 struct QKVHeadsNormRopeDecodeInputs {
@@ -51,9 +52,17 @@ struct QKVHeadsNormRopeDecodeOperation {
     static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
 };
 
-uint32_t head_dim_of(const QKVHeadsNormRopeDecodeParams& params, const Tensor& qkv) {
-    return qkv.logical_shape()[3] / (params.num_q_heads + 2 * params.num_kv_heads);
+// Heads of qkv: the q heads (each with its gate head when gated), k and v.
+uint32_t input_heads(const QKVHeadsNormRopeDecodeParams& params) {
+    return (params.gated_query ? 2 : 1) * params.num_q_heads + 2 * params.num_kv_heads;
 }
+
+uint32_t head_dim_of(const QKVHeadsNormRopeDecodeParams& params, const Tensor& qkv) {
+    return qkv.logical_shape()[3] / input_heads(params);
+}
+
+// The elements of a head that are rotated: the width of the cos row.
+uint32_t rotary_dim_of(const QKVHeadsNormRopeDecodeInputs& in) { return in.cos.logical_shape()[-1]; }
 
 void validate_interleaved(const Tensor& tensor, const char* name) {
     TT_FATAL(tensor.storage_type() == StorageType::DEVICE, "{} must be on device", name);
@@ -79,17 +88,19 @@ void QKVHeadsNormRopeDecodeOperation::validate_on_program_cache_miss(
         params.num_q_heads > 0 && params.num_kv_heads > 0 && params.num_kv_heads <= params.num_q_heads &&
             params.num_kv_heads <= TILE_HEIGHT,
         "unsupported head counts {} and {}", params.num_q_heads, params.num_kv_heads);
-    const uint32_t heads = params.num_q_heads + 2 * params.num_kv_heads;
+    const uint32_t heads = input_heads(params);
     TT_FATAL(shape[3] % heads == 0, "width {} must split into {} heads", shape[3], heads);
     const uint32_t head_dim = head_dim_of(params, in.qkv);
+    const uint32_t rotary_dim = rotary_dim_of(in);
+    TT_FATAL(head_dim % TILE_WIDTH == 0, "head_dim {} must be a multiple of 32", head_dim);
     // rotate_half swaps whole tiles.
-    TT_FATAL(head_dim % (2 * TILE_WIDTH) == 0, "head_dim {} must be a multiple of 64", head_dim);
+    TT_FATAL(
+        rotary_dim > 0 && rotary_dim % (2 * TILE_WIDTH) == 0 && rotary_dim <= head_dim,
+        "rotary_dim {} (the width of cos) must be a multiple of 64 of at most head_dim {}", rotary_dim, head_dim);
     auto validate_row = [&](const Tensor& tensor, const char* name) {
         validate_interleaved(tensor, name);
         const auto& row_shape = tensor.logical_shape();
-        TT_FATAL(
-            row_shape[-1] == head_dim && row_shape.volume() == head_dim,
-            "{} shape {} must be one row of head_dim {}", name, row_shape, head_dim);
+        TT_FATAL(row_shape.volume() == rotary_dim, "{} shape {} must be one row", name, row_shape);
     };
     validate_interleaved(in.norm_weight, "norm_weight");
     TT_FATAL(
@@ -100,6 +111,9 @@ void QKVHeadsNormRopeDecodeOperation::validate_on_program_cache_miss(
         head_dim);
     validate_row(in.cos, "cos");
     validate_row(in.sin, "sin");
+    TT_FATAL(
+        in.sin.logical_shape() == in.cos.logical_shape(),
+        "sin shape {} must match cos shape {}", in.sin.logical_shape(), in.cos.logical_shape());
 }
 
 QKVHeadsNormRopeDecodeOperation::spec_return_value_t QKVHeadsNormRopeDecodeOperation::compute_output_specs(
@@ -143,6 +157,8 @@ ProgramDescriptor QKVHeadsNormRopeDecodeOperation::create_descriptor(
 
     const uint32_t head_dim = head_dim_of(params, in.qkv);
     const uint32_t head_tiles = head_dim / TILE_WIDTH;
+    const uint32_t rotary_tiles = rotary_dim_of(in) / TILE_WIDTH;
+    // The heads read: q, k and v, not the gates.
     const uint32_t num_heads = params.num_q_heads + 2 * params.num_kv_heads;
     // The k heads are stacked below the q heads, a row each.
     const uint32_t row_tiles = (params.num_q_heads + params.num_kv_heads + TILE_HEIGHT - 1) / TILE_HEIGHT;
@@ -173,15 +189,15 @@ ProgramDescriptor QKVHeadsNormRopeDecodeOperation::create_descriptor(
     const auto fp32 = tt::DataFormat::Float32;
     make_cb(0, row_tiles * head_tiles, row_format);                                            // q and k heads
     make_cb(1, row_tiles * head_tiles, datatype_to_dataformat_converter(in.norm_weight.dtype()));  // weights
-    make_cb(2, head_tiles, datatype_to_dataformat_converter(in.cos.dtype()));                    // cos
-    make_cb(3, head_tiles, datatype_to_dataformat_converter(in.sin.dtype()));                    // sin
+    make_cb(2, rotary_tiles, datatype_to_dataformat_converter(in.cos.dtype()));                  // cos
+    make_cb(3, rotary_tiles, datatype_to_dataformat_converter(in.sin.dtype()));                  // sin
     make_cb(4, 1, fp32);                                                                       // reduce scaler
     make_cb(5, head_tiles, fp32);                                                              // squares
     make_cb(6, 1, fp32);                                                                       // rstd, a column
     make_cb(7, head_tiles, fp32);                                                              // normalized
     make_cb(8, head_tiles, fp32);                                                              // * weight
-    make_cb(9, head_tiles, fp32);                                                              // * cos
-    make_cb(10, head_tiles, fp32);                                                             // rotated * sin
+    make_cb(9, rotary_tiles, fp32);                                                            // * cos
+    make_cb(10, rotary_tiles, fp32);                                                           // rotated * sin
     if (row_tiles > q_row_tiles) {
         make_cb(11, (row_tiles - q_row_tiles) * head_tiles, row_format);  // rows past the q output
     }
@@ -216,6 +232,9 @@ ProgramDescriptor QKVHeadsNormRopeDecodeOperation::create_descriptor(
         {"num_q_heads", params.num_q_heads},
         {"num_kv_heads", params.num_kv_heads},
         {"head_tiles", head_tiles},
+        {"rotary_tiles", rotary_tiles},
+        // Tiles from one q head of qkv to the next.
+        {"q_head_stride", (params.gated_query ? 2 : 1) * head_tiles},
         {"row_tiles", row_tiles},
         {"q_row_tiles", q_row_tiles},
         {"row_bytes", row_bytes},
@@ -274,10 +293,14 @@ std::vector<Tensor> nlp_create_qkv_heads_decode_norm_rope(
     const Tensor& sin,
     uint32_t num_q_heads,
     uint32_t num_kv_heads,
-    float epsilon) {
+    float epsilon,
+    bool gated_query) {
     using Op = prim::QKVHeadsNormRopeDecodeOperation;
     return device_operation::launch<Op>(
-        {.num_q_heads = num_q_heads, .num_kv_heads = num_kv_heads, .epsilon = epsilon},
+        {.num_q_heads = num_q_heads,
+         .num_kv_heads = num_kv_heads,
+         .epsilon = epsilon,
+         .gated_query = gated_query},
         {.qkv = qkv, .norm_weight = norm_weight, .cos = cos, .sin = sin});
 }
 

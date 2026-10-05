@@ -10,13 +10,15 @@
 #include "api/compute/eltwise_unary/rsqrt.h"
 #include "api/compute/reconfig_data_format.h"
 #include "api/compute/reduce.h"
+#include "api/compute/tile_move_copy.h"
 
 // For every tile row of stacked q and k heads, one head per row:
 // out = rotary(x / sqrt(mean(x^2) + eps) * weight), with a weight row per
 // head and out = y * cos + rotate_half(y) * sin, where rotate_half(y) =
-// [-y2, y1] for the halves y1, y2 of a head (whole tiles) and cos and sin are
-// row 0 for every row. Row tiles below q_row_tiles go to the q output, the
-// rest to the k stage.
+// [-y2, y1] for the halves y1, y2 of the first rotary_tiles of a head (whole
+// tiles) and cos and sin are row 0 for every row. Tiles past rotary_tiles
+// are y. Row tiles below q_row_tiles go to the q output, the rest to the k
+// stage.
 void kernel_main() {
     constexpr uint32_t cb_heads = get_named_compile_time_arg_val("cb_heads");
     constexpr uint32_t cb_weight = get_named_compile_time_arg_val("cb_weight");
@@ -32,18 +34,19 @@ void kernel_main() {
     constexpr uint32_t cb_q_out = get_named_compile_time_arg_val("cb_q_out");
     constexpr uint32_t cb_k_stage = get_named_compile_time_arg_val("cb_k_stage");
     constexpr uint32_t head_tiles = get_named_compile_time_arg_val("head_tiles");
+    constexpr uint32_t rotary_tiles = get_named_compile_time_arg_val("rotary_tiles");
     constexpr uint32_t row_tiles = get_named_compile_time_arg_val("row_tiles");
     constexpr uint32_t q_row_tiles = get_named_compile_time_arg_val("q_row_tiles");
     constexpr uint32_t eps = get_named_compile_time_arg_val("eps");
     constexpr uint32_t inv_head_dim = get_named_compile_time_arg_val("inv_head_dim");
-    constexpr uint32_t half = head_tiles / 2;
+    constexpr uint32_t half = rotary_tiles / 2;
 
-    // One tile op per DST acquire for tiles j of a head row, packed as tile j
-    // of `cb`.
-    auto each_tile = [&](uint32_t cb, auto op) {
-        cb_reserve_back(cb, head_tiles);
+    // One tile op per DST acquire for tiles j < count of a head row, packed as
+    // tile j of `cb`.
+    auto each_tile = [&](uint32_t cb, auto op, uint32_t count) {
+        cb_reserve_back(cb, count);
         pack_reconfig_data_format(cb);
-        for (uint32_t j = 0; j < head_tiles; ++j) {
+        for (uint32_t j = 0; j < count; ++j) {
             tile_regs_acquire();
             op(j);
             tile_regs_commit();
@@ -51,13 +54,13 @@ void kernel_main() {
             pack_tile(0, cb, j);
             tile_regs_release();
         }
-        cb_push_back(cb, head_tiles);
+        cb_push_back(cb, count);
     };
 
     compute_kernel_hw_startup(cb_heads, cb_heads, cb_squares);
     cb_wait_front(cb_scaler, 1);
-    cb_wait_front(cb_cos, head_tiles);
-    cb_wait_front(cb_sin, head_tiles);
+    cb_wait_front(cb_cos, rotary_tiles);
+    cb_wait_front(cb_sin, rotary_tiles);
     cb_wait_front(cb_heads, row_tiles * head_tiles);
     cb_wait_front(cb_weight, row_tiles * head_tiles);
     for (uint32_t r = 0; r < row_tiles; ++r) {
@@ -65,7 +68,7 @@ void kernel_main() {
 
         reconfig_data_format(cb_heads, cb_heads);
         mul_tiles_init(cb_heads, cb_heads);
-        each_tile(cb_squares, [&](uint32_t j) { mul_tiles(cb_heads, cb_heads, base + j, base + j, 0); });
+        each_tile(cb_squares, [&](uint32_t j) { mul_tiles(cb_heads, cb_heads, base + j, base + j, 0); }, head_tiles);
 
         // rstd = rsqrt(sum / head_dim + eps), one per row, down column 0. A
         // row reduce unpacks the scaler first; set the formats in that order.
@@ -103,47 +106,53 @@ void kernel_main() {
         cb_wait_front(cb_rstd, 1);
         reconfig_data_format(cb_heads, cb_rstd);
         mul_bcast_cols_init_short(cb_heads, cb_rstd);
-        each_tile(cb_normed, [&](uint32_t j) { mul_tiles_bcast_cols(cb_heads, cb_rstd, base + j, 0, 0); });
+        each_tile(cb_normed, [&](uint32_t j) { mul_tiles_bcast_cols(cb_heads, cb_rstd, base + j, 0, 0); }, head_tiles);
         cb_pop_front(cb_rstd, 1);
 
         // weighted = normed * weight (a row per head)
         cb_wait_front(cb_normed, head_tiles);
         reconfig_data_format(cb_normed, cb_weight);
         mul_tiles_init(cb_normed, cb_weight);
-        each_tile(cb_weighted, [&](uint32_t j) { mul_tiles(cb_normed, cb_weight, j, base + j, 0); });
+        each_tile(cb_weighted, [&](uint32_t j) { mul_tiles(cb_normed, cb_weight, j, base + j, 0); }, head_tiles);
         cb_pop_front(cb_normed, head_tiles);
 
         // cos_part = weighted * cos, sin_part = weighted[the other half] * sin
         cb_wait_front(cb_weighted, head_tiles);
         reconfig_data_format(cb_weighted, cb_cos);
         mul_bcast_rows_init_short(cb_weighted, cb_cos);
-        each_tile(cb_cos_part, [&](uint32_t j) { mul_tiles_bcast_rows(cb_weighted, cb_cos, j, j, 0); });
+        each_tile(
+            cb_cos_part, [&](uint32_t j) { mul_tiles_bcast_rows(cb_weighted, cb_cos, j, j, 0); }, rotary_tiles);
         reconfig_data_format(cb_weighted, cb_sin);
         mul_bcast_rows_init_short(cb_weighted, cb_sin);
-        each_tile(cb_sin_part, [&](uint32_t j) {
-            mul_tiles_bcast_rows(cb_weighted, cb_sin, (j + half) % head_tiles, j, 0);
-        });
-        cb_pop_front(cb_weighted, head_tiles);
+        each_tile(
+            cb_sin_part,
+            [&](uint32_t j) { mul_tiles_bcast_rows(cb_weighted, cb_sin, (j + half) % rotary_tiles, j, 0); },
+            rotary_tiles);
 
-        // out = cos_part - sin_part in the first half, + in the second.
-        cb_wait_front(cb_cos_part, head_tiles);
-        cb_wait_front(cb_sin_part, head_tiles);
+        // out = cos_part - sin_part in the first half, + in the second, and
+        // weighted past the rotary tiles (all three FP32).
+        cb_wait_front(cb_cos_part, rotary_tiles);
+        cb_wait_front(cb_sin_part, rotary_tiles);
         reconfig_data_format(cb_cos_part, cb_sin_part);
         each_tile(r < q_row_tiles ? cb_q_out : cb_k_stage, [&](uint32_t j) {
             if (j < half) {
                 sub_tiles_init(cb_cos_part, cb_sin_part);
                 sub_tiles(cb_cos_part, cb_sin_part, j, j, 0);
-            } else {
+            } else if (j < rotary_tiles) {
                 add_tiles_init(cb_cos_part, cb_sin_part);
                 add_tiles(cb_cos_part, cb_sin_part, j, j, 0);
+            } else {
+                copy_tile_to_dst_init_short(cb_weighted);
+                copy_tile(cb_weighted, j, 0);
             }
-        });
-        cb_pop_front(cb_cos_part, head_tiles);
-        cb_pop_front(cb_sin_part, head_tiles);
+        }, head_tiles);
+        cb_pop_front(cb_cos_part, rotary_tiles);
+        cb_pop_front(cb_sin_part, rotary_tiles);
+        cb_pop_front(cb_weighted, head_tiles);
     }
     cb_pop_front(cb_heads, row_tiles * head_tiles);
     cb_pop_front(cb_weight, row_tiles * head_tiles);
     cb_pop_front(cb_scaler, 1);
-    cb_pop_front(cb_cos, head_tiles);
-    cb_pop_front(cb_sin, head_tiles);
+    cb_pop_front(cb_cos, rotary_tiles);
+    cb_pop_front(cb_sin, rotary_tiles);
 }
