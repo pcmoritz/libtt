@@ -1,0 +1,27 @@
+# libtt's own ttnn operations, laid out like tt-metal's ttnn/ so that they read
+# and include like upstream ones (ttnn/operations/...). The host code is built
+# into tt-metal's ttnn library and the device kernels go into the runtime
+# archive at the same paths as tt-metal's (third_party/tt_metal/BUILD.overlay.bazel).
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+KERNELS = ["cpp/ttnn/operations/**/kernels/**"]
+
+filegroup(
+    name = "operation_srcs",
+    srcs = glob(["cpp/ttnn/operations/**/*.cpp"], exclude = KERNELS),
+)
+
+cc_library(
+    name = "operation_headers",
+    hdrs = glob(["cpp/ttnn/operations/**/*.hpp"], exclude = KERNELS),
+    includes = ["cpp"],
+)
+
+# Compiled at run time, like tt-metal's kernels.
+filegroup(
+    name = "kernels",
+    srcs = glob(KERNELS),
+)

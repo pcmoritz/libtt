@@ -1,0 +1,30 @@
+# libtt's own tt-mlir sources, laid out like tt-mlir so that they read and
+# include like upstream ones. third_party/tt_xla/tt_mlir.BUILD.bazel builds
+# them into the compiler and runtime libraries; patches only touch upstream
+# files (to declare ops and register patterns).
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "compiler_srcs",
+    srcs = glob(["lib/**/*.cpp"], allow_empty = True),
+)
+
+cc_library(
+    name = "compiler_headers",
+    hdrs = glob(["include/**/*.h"], allow_empty = True),
+    includes = ["include"],
+)
+
+filegroup(
+    name = "runtime_srcs",
+    srcs = glob(["runtime/lib/**/*.cpp"], allow_empty = True),
+)
+
+cc_library(
+    name = "runtime_headers",
+    hdrs = glob(["runtime/lib/**/*.h"], allow_empty = True),
+    includes = ["runtime/lib/ttnn"],
+)
