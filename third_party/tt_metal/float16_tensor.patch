@@ -317,7 +317,7 @@ diff --git tt_metal/impl/data_format/tilize_utils.cpp tt_metal/impl/data_format/
 diff --git tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp
 --- tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp
 +++ tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp
-@@ -1732,7 +1732,19 @@ uint32_t ProgramImpl::assign_dfb_device_slot(const DataflowBufferImpl& dfb) cons
+@@ -1732,7 +1732,20 @@ uint32_t ProgramImpl::assign_dfb_device_slot(const DataflowBufferImpl& dfb) cons
          }
      }
  
@@ -328,8 +328,9 @@ diff --git tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp tt_metal/impl/dataf
 +        // unpack) take c_16..c_23, the range the JIT exempts from the unpacker's shared exponent width, so
 +        // e.g. a Float16 output can follow a Float16_b input. Other buffers stay out of that range.
 +        constexpr uint64_t output_range = uint64_t(0xFF) << 16;
++        constexpr uint16_t tensix = 1u << 2;  // Gen1 compute kernels are bit 2 (BindDataflowBufferToProducerConsumerKernels)
 +        const bool is_compute_output =
-+            (dfb.config.producer_risc_mask & 0xFF00) != 0 && (dfb.config.consumer_risc_mask & 0xFF00) == 0;
++            (dfb.config.producer_risc_mask & tensix) != 0 && (dfb.config.consumer_risc_mask & tensix) == 0;
 +        const uint64_t preferred = free_slots & (is_compute_output ? output_range : ~output_range);
 +        if (preferred != 0) {
 +            free_slots = preferred;
