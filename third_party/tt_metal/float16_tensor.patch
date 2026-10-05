@@ -139,6 +139,7 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
      } else if constexpr (in_format == DataFormat::UInt16 && out_format == DataFormat::Float32) {
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint16_to_fp32, (APPROX)));
 diff --git tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h
+new file mode 100644
 --- /dev/null
 +++ tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h
 @@ -0,0 +1,85 @@

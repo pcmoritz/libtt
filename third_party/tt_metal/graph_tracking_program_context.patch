@@ -1,7 +1,7 @@
 diff --git tt_metal/impl/graph/graph_tracking.cpp tt_metal/impl/graph/graph_tracking.cpp
 --- tt_metal/impl/graph/graph_tracking.cpp
 +++ tt_metal/impl/graph/graph_tracking.cpp
-@@ -123,7 +123,9 @@
+@@ -123,7 +123,9 @@ void track_program_l1(GraphTracker& tracker, detail::ProgramImpl& program, const
      }
      // Scratchpads stack on the same program-scope L1 region as the dataflow buffers, one region per
      // binding: kernels may only share a scratchpad spec across disjoint cores.
