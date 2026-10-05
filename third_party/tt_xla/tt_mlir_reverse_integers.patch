@@ -1,0 +1,49 @@
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -150,19 +150,33 @@
+     current =
+         rewriter.create<ttir::ReshapeOp>(loc, flatType, current, shapeAttr);
+ 
+-    // Step 3: Create reversed linear indices [N-1, N-2, ..., 0].
+-    SmallVector<int32_t> indices(nReversing);
+-    for (int32_t i = 0; i < nReversing; i++) {
+-      indices[i] = nReversing - 1 - i;
+-    }
+-    auto idxType = RankedTensorType::get(
+-        {nReversing}, rewriter.getIntegerType(32, /*isSigned=*/true));
+-    auto idxAttr = DenseIntElementsAttr::get(idxType, indices);
+-    Value idxConst = rewriter.create<ttir::ConstantOp>(loc, idxType, idxAttr);
++    // ttnn.embedding only takes bf16 or f32 tables, so integer tensors would
++    // round through bf16. Gather their rows instead, which is exact.
++    if (auto intType = dyn_cast<IntegerType>(inputType.getElementType());
++        intType && intType.getWidth() >= 16) {
++      auto rowIdxType = RankedTensorType::get(flatShape, rewriter.getI32Type(),
++                                              inputType.getEncoding());
++      Value reversedRows = rewriter.create<ttir::ArangeOp>(
++          loc, rowIdxType, /*start=*/nReversing - 1, /*end=*/-1, /*step=*/-1,
++          /*arange_dimension=*/0);
++      current = rewriter.create<ttir::GatherOp>(loc, flatType, current,
++                                                reversedRows,
++                                                rewriter.getI32IntegerAttr(0));
++    } else {
++      // Step 3: Create reversed linear indices [N-1, N-2, ..., 0].
++      SmallVector<int32_t> indices(nReversing);
++      for (int32_t i = 0; i < nReversing; i++) {
++        indices[i] = nReversing - 1 - i;
++      }
++      auto idxType = RankedTensorType::get(
++          {nReversing}, rewriter.getIntegerType(32, /*isSigned=*/true));
++      auto idxAttr = DenseIntElementsAttr::get(idxType, indices);
++      Value idxConst = rewriter.create<ttir::ConstantOp>(loc, idxType, idxAttr);
+ 
+-    // Step 4: EmbeddingOp to reorder rows.
+-    current =
+-        rewriter.create<ttir::EmbeddingOp>(loc, flatType, idxConst, current);
++      // Step 4: EmbeddingOp to reorder rows.
++      current = rewriter.create<ttir::EmbeddingOp>(loc, flatType, idxConst,
++                                                   current);
++    }
+ 
+     // Step 5: Reshape back to permuted shape.
+     auto permShapeAttr = rewriter.getI32ArrayAttr(
