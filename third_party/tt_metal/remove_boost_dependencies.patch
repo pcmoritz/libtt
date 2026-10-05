@@ -1,4 +1,4 @@
-diff -ruN tt_metal/common/mesh_coord.cpp tt_metal/common/mesh_coord.cpp
+diff --git tt_metal/common/mesh_coord.cpp tt_metal/common/mesh_coord.cpp
 --- tt_metal/common/mesh_coord.cpp
 +++ tt_metal/common/mesh_coord.cpp
 @@ -5,7 +5,6 @@
@@ -9,18 +9,18 @@ diff -ruN tt_metal/common/mesh_coord.cpp tt_metal/common/mesh_coord.cpp
  #include <fmt/format.h>
  #include <mesh_coord.hpp>
  #include <tt_stl/span.hpp>
-diff -ruN ttnn/core/graph/graph_processor.cpp ttnn/core/graph/graph_processor.cpp
+diff --git ttnn/core/graph/graph_processor.cpp ttnn/core/graph/graph_processor.cpp
 --- ttnn/core/graph/graph_processor.cpp
 +++ ttnn/core/graph/graph_processor.cpp
-@@ -10,14 +10,14 @@
- #include "ttnn/tensor/tensor_utils.hpp"
+@@ -11,7 +11,6 @@
  #include "ttnn/cluster.hpp"
  #include "ttnn/reports.hpp"
+ #include <tt_metal/impl/version.hpp>
 -#include <boost/algorithm/string/replace.hpp>
  #include <cstdlib>
  
  #include <fstream>
- #include <sstream>
+@@ -20,6 +19,7 @@
  #include <enchantum/enchantum.hpp>
  #include <memory>
  #include <string>
@@ -28,8 +28,7 @@ diff -ruN ttnn/core/graph/graph_processor.cpp ttnn/core/graph/graph_processor.cp
  #include <tt-metalium/allocator.hpp>
  #include <tt-metalium/circular_buffer.hpp>
  #include <tt-metalium/hal_types.hpp>
-@@ -415,10 +415,14 @@
-     };
+@@ -506,9 +506,13 @@ void GraphProcessor::track_function_start(
  
      std::vector<std::string> serialized_arguments;
      serialized_arguments.reserve(input_parameters.size());

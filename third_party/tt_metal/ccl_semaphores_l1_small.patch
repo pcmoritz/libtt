@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_program_factory.cpp ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_program_factory.cpp
-@@ -36,8 +36,13 @@
+@@ -36,8 +36,13 @@ ReduceScatterDeviceOperation::ReduceScatterProgram::create_mesh_workload(
      auto subdevice_core_range_set = mesh_device->worker_cores(tt::tt_metal::HalProgrammableCoreType::TENSIX, sd_id);
      // create semaphores
      // 3 semaphores used for within op synchronizations
@@ -20,7 +20,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_pro
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
-@@ -100,7 +100,11 @@
+@@ -100,7 +100,11 @@ AllReduceAsyncMeshWorkloadFactory::cached_mesh_workload_t AllReduceAsyncMeshWork
          auto* device = tensor_args.input_tensor.device();
          auto sd = attributes.sub_device_id.value_or(device->get_sub_device_ids().at(0));
          auto cores = device->worker_cores(tt::tt_metal::HalProgrammableCoreType::TENSIX, sd);

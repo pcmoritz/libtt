@@ -1,4 +1,5 @@
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
+new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
 @@ -0,0 +1,167 @@
@@ -129,10 +130,10 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +        binop_with_scalar_tile_init();
 +        MATH(SFPU_UNARY_CALL(
 +            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
-+            (APPROX, ckernel::sfpu::MUL, sfpu_iterations), 0, VectorMode::C, inv_width));
++            (APPROX, ckernel::sfpu::MUL, sfpu_iterations, DST_ACCUM_MODE), 0, VectorMode::C, inv_width));
 +        MATH(SFPU_UNARY_CALL(
 +            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
-+            (APPROX, ckernel::sfpu::ADD, sfpu_iterations), 0, VectorMode::C, eps));
++            (APPROX, ckernel::sfpu::ADD, sfpu_iterations, DST_ACCUM_MODE), 0, VectorMode::C, eps));
 +        rsqrt_tile_init();
 +        MATH(SFPU_UNARY_CALL(
 +            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_rsqrt,
@@ -170,6 +171,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +    cb_pop_front(cb_rstd, 1);
 +}
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/reader_rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/reader_rms_norm_residual.cpp
+new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/reader_rms_norm_residual.cpp
 @@ -0,0 +1,83 @@
@@ -257,6 +259,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +    cb_push_back(cb_weight, count);
 +}
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/writer_rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/writer_rms_norm_residual.cpp
+new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/writer_rms_norm_residual.cpp
 @@ -0,0 +1,150 @@
@@ -411,6 +414,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 +    *written = 0;
 +}
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp
+new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp
 @@ -0,0 +1,259 @@
@@ -674,6 +678,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_res
 +
 +}  // namespace ttnn::normalization
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.hpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.hpp
+new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.hpp
 @@ -0,0 +1,19 @@

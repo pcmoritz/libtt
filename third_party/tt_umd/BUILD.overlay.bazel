@@ -22,15 +22,24 @@ genrule(
           "> $@",
 )
 
+# Kernel-mode driver userspace library, built in-tree by UMD's CMake.
+cc_library(
+    name = "tt-kmd-lib",
+    srcs = [
+        "tt-kmd-lib/src/ioctl.h",
+        "tt-kmd-lib/src/tt_kmd_lib.c",
+    ],
+    hdrs = glob(["tt-kmd-lib/api/tt-kmd-lib/*.h"]),
+    copts = ["-std=gnu11"],
+    includes = ["tt-kmd-lib/api"],
+)
+
 cc_library(
     name = "tt-umd",
     srcs = [
         ":simulation_chip_path_stub",
     ] + glob(
-        [
-            "device/**/*.c",
-            "device/**/*.cpp",
-        ],
+        ["device/**/*.cpp"],
         exclude = [
             "device/chip/sw_emule_chip.cpp",
             "device/firmware/wormhole_18_3_firmware_info_provider.cpp",
@@ -47,11 +56,8 @@ cc_library(
         ],
     ),
     hdrs = glob([
-        "device/**/*.h",
         "device/**/*.hpp",
-        "device/api/**/*.h",
         "device/api/**/*.hpp",
-        "src/firmware/riscv/**/*.h",
     ]),
     copts = [
         "-std=c++17",
@@ -70,6 +76,7 @@ cc_library(
         "-lrt",
     ],
     deps = [
+        ":tt-kmd-lib",
         "@fmt//:fmt-header-only",
         "@hwloc//:hwloc",
         "@spdlog//:spdlog",

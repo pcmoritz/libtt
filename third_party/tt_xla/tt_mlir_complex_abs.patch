@@ -4,15 +4,15 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 @@ -2,6 +2,7 @@
  //
  // SPDX-License-Identifier: Apache-2.0
-
+ 
 +#include <limits>
  #include <utility>
-
+ 
  #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h"
-@@ -738,6 +739,74 @@
+@@ -738,6 +739,74 @@ public:
  };
  } // namespace
-
+ 
 +// Computes hypot(real, imag) with scaling to avoid squaring large components.
 +namespace {
 +class ComplexAbsOpConversionPattern
@@ -84,7 +84,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
  // Rewrites select(pred, complex_true, complex_false) for the trailing
  // real/imag representation. A non-scalar predicate must be broadcast over the
  // new component dimension before selecting between the converted branches.
-@@ -1164,6 +1233,10 @@
+@@ -1164,6 +1233,10 @@ struct StableHLOComplexDataTypeConversionPass
            return !hasComplexElementType(op.getOperand().getType()) &&
                   !hasComplexElementType(op.getType());
          });
@@ -95,8 +95,8 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
      target.addDynamicallyLegalOp<mlir::stablehlo::CompareOp>(
          [](mlir::stablehlo::CompareOp op) {
            return !hasComplexElementType(op.getLhs().getType());
-@@ -1207,6 +1280,7 @@
-
+@@ -1207,6 +1280,7 @@ struct StableHLOComplexDataTypeConversionPass
+ 
      RewritePatternSet patterns(&getContext());
      patterns.add<
 +        ComplexAbsOpConversionPattern,

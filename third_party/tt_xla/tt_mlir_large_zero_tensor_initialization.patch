@@ -1,15 +1,16 @@
 diff --git a/runtime/lib/ttnn/types/layout_converter.cpp b/runtime/lib/ttnn/types/layout_converter.cpp
 --- a/runtime/lib/ttnn/types/layout_converter.cpp
 +++ b/runtime/lib/ttnn/types/layout_converter.cpp
-@@ -8,1 +8,7 @@
+@@ -7,7 +7,51 @@
+ #include "tt/runtime/detail/ttnn/types/types.h"
  #include "tt/runtime/detail/ttnn/utils.h"
-+
+ 
 +#include <tt-metalium/constants.hpp>
 +
 +#include <algorithm>
 +#include <cstdint>
 +#include <limits>
-@@ -10,4 +16,42 @@
++
  namespace tt::runtime::ttnn {
 +namespace {
 +
@@ -52,7 +53,7 @@ diff --git a/runtime/lib/ttnn/types/layout_converter.cpp b/runtime/lib/ttnn/type
  
  LayoutConverter::LayoutConverter(const LayoutDesc &inputDesc,
                                   const LayoutDesc &outputDesc)
-@@ -122,5 +166,19 @@
+@@ -105,6 +149,20 @@ LayoutConverter::fromDeviceIfNeeded(const ::ttnn::Tensor &input) {
      return out;
    }
  
@@ -72,3 +73,4 @@ diff --git a/runtime/lib/ttnn/types/layout_converter.cpp b/runtime/lib/ttnn/type
 +
    if (shouldTilize &&
        utils::canTilizeOnDevice(outputDesc.dataType, outputDesc.memoryConfig)) {
+     ::ttnn::Tensor out = toDeviceIfNeeded(input, targetDevice);

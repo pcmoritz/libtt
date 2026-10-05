@@ -1,10 +1,10 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10644,6 +10644,49 @@
+@@ -11009,6 +11009,49 @@ public:
  };
  } // namespace
-
+ 
 +namespace {
 +class StableHLOToTTIRPopulationCountOpConversionPattern
 +    : public OpConversionPattern<mlir::stablehlo::PopulationCountOp> {
@@ -51,12 +51,12 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  static void
  addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
                                           RewritePatternSet &patterns,
-@@ -11072,6 +11115,8 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+@@ -11050,6 +11093,8 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<
-       mlir::stablehlo::ConvertOp, mlir::tt::ttir::TypecastOp>>(typeConverter,
+       mlir::stablehlo::LogisticOp, mlir::tt::ttir::SigmoidOp>>(typeConverter,
                                                                 ctx);
 +  patterns.add<StableHLOToTTIRPopulationCountOpConversionPattern>(
 +      typeConverter, ctx);
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<
-       mlir::stablehlo::CeilOp, mlir::tt::ttir::CeilOp>>(typeConverter, ctx);
+       mlir::stablehlo::TanOp, mlir::tt::ttir::TanOp>>(typeConverter, ctx);
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<

@@ -1,8 +1,32 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1129,7 +1129,7 @@ def TTNN_ProdOp : TTNN_Op<"prod"> {
+   let extraClassDeclaration = [{
+     wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+       return
+-        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds();
++        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(*this);
+     }
+ 
+   }];
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -348,7 +348,8 @@ public:
+   createReductionOpOperandsWorkarounds(mlir::Operation *op);
+ 
+   // Create workaround for reduce (full) product op operands.
+-  static TTNNOperandsWorkarounds createReduceProdOpOperandsWorkarounds();
++  static TTNNOperandsWorkarounds
++  createReduceProdOpOperandsWorkarounds(mlir::Operation *op);
+ 
+   // Create workarounds for sort op operands.
+   static TTNNOperandsWorkarounds
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-index 1111111..2222222 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -7010,6 +7010,11 @@ public:
+@@ -7186,6 +7186,11 @@ public:
      auto operandType = mlir::cast<RankedTensorType>(operand.getType());
      auto updateType = mlir::cast<RankedTensorType>(update.getType());
  
@@ -15,10 +39,12 @@ index 1111111..2222222 100644
        return rewriter.notifyMatchFailure(
            srcOp, "EmbeddingBackward requires 2D weight table (operand)");
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-index 1111111..2222222 100644
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -922,5 +922,11 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
+@@ -952,8 +952,14 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
+   auto inputType =
+       mlir::cast<mlir::RankedTensorType>(op->getOperand(0).getType())
+           .getElementType();
 +  // Keep supported integer reductions exact: Float32 rounds values above
 +  // 2^24 and cannot represent the INT32_MAX identity used by min.
 +  bool supportsInt32 =
@@ -31,7 +57,9 @@ index 1111111..2222222 100644
      operandWorkaround.tensorDataTypeWorkaround =
          mlir::tt::ttcore::DataType::Float32;
    }
-@@ -935,11 +941,6 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
+@@ -964,15 +970,10 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
+ }
+ 
  // Factory method to create a set of workarounds for reduce product op operands.
 -// tt-metal only supports full product reduction for bfloat16 data type.
  TTNNOperandsWorkarounds
@@ -46,26 +74,14 @@ index 1111111..2222222 100644
 +    mlir::Operation *op) {
 +  return createReductionOpOperandsWorkarounds(op);
  }
-diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-index 1111111..2222222 100644
---- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-+++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -999 +999 @@ def TTNN_ProdOp : TTNN_Op<"prod"> {
--        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds();
-+        wa::TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(*this);
-diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
-index 1111111..2222222 100644
---- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
-+++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
-@@ -351 +351,2 @@ class TTNNOperandsWorkaroundsFactory {
--  static TTNNOperandsWorkarounds createReduceProdOpOperandsWorkarounds();
-+  static TTNNOperandsWorkarounds
-+  createReduceProdOpOperandsWorkarounds(mlir::Operation *op);
+ 
+ // Factory method to create a set of workaround for SortOp operands.
 diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
-index 1111111..2222222 100644
 --- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
 +++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
-@@ -96,9 +96,15 @@ private:
+@@ -109,11 +109,17 @@ private:
+   }
+ 
    // Identifies function input arguments that are candidates for RowMajor layout
 -  // propagation. Currently restricted to integer tensor types only.
 +  // propagation. F32 inputs are also eligible when the function uses scatter.

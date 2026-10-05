@@ -1,7 +1,10 @@
 diff --git a/runtime/lib/ttnn/operations/transformer/chunked_scaled_dot_product_attention.cpp b/runtime/lib/ttnn/operations/transformer/chunked_scaled_dot_product_attention.cpp
 --- a/runtime/lib/ttnn/operations/transformer/chunked_scaled_dot_product_attention.cpp
 +++ b/runtime/lib/ttnn/operations/transformer/chunked_scaled_dot_product_attention.cpp
-@@ -42,8 +42,29 @@ static void runChunkedScaledDotProductAttentionOp(
+@@ -39,12 +39,33 @@ static void runChunkedScaledDotProductAttentionOp(
+     programConfig = utils::createSDPAProgramConfig(op->program_config());
+   }
+ 
 +  // TTNN otherwise defaults to approximate exponentiation. Use the fixed
 +  // page-aligned program configuration used by upstream flexible chunked SDPA.
 +  if (!programConfig) {
@@ -32,3 +35,4 @@ diff --git a/runtime/lib/ttnn/operations/transformer/chunked_scaled_dot_product_
 +          /*compute_kernel_config=*/computeKernelConfig);
    tensorPool.insertTTNNTensorAndValidate(op->out(), out);
  }
+ 

@@ -1,7 +1,8 @@
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h
-@@ -25,5 +25,6 @@ inline void calculate_sign(const uint /*exponent_size_8*/) {
+@@ -26,7 +26,8 @@ inline void calculate_sign(const uint /*exponent_size_8*/) {
+     for (int d = 0; d < ITERATIONS; d++) {
          sfpi::vFloat v = sfpi::dst_reg[0];
          sfpi::vFloat res = 1.0f;
 -        v_if(v < 0.0F) { res = -1.0f; }
@@ -9,10 +10,12 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_si
 +        v_elseif(v < 0.0F) { res = -1.0f; }
          v_elseif(_sfpu_is_fp16_zero_(v)) { res = 0.0f; }
          v_endif;
+         sfpi::dst_reg[0] = res;
 diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h
 --- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h
 +++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h
-@@ -25,5 +25,6 @@ inline void calculate_sign(const uint /*exponent_size_8*/) {
+@@ -26,7 +26,8 @@ inline void calculate_sign(const uint /*exponent_size_8*/) {
+     for (int d = 0; d < ITERATIONS; d++) {
          sfpi::vFloat v = sfpi::dst_reg[0];
          sfpi::vFloat res = 1.0f;
 -        v_if(v < 0.0F) { res = -1.0f; }
@@ -20,3 +23,4 @@ diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_
 +        v_elseif(v < 0.0F) { res = -1.0f; }
          v_elseif(_sfpu_is_fp16_zero_(v)) { res = 0.0f; }
          v_endif;
+         sfpi::dst_reg[0] = res;

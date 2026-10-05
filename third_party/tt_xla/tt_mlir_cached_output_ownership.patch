@@ -1,7 +1,7 @@
 diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/include/tt/runtime/detail/ttnn/types/types.h
 --- a/runtime/include/tt/runtime/detail/ttnn/types/types.h
 +++ b/runtime/include/tt/runtime/detail/ttnn/types/types.h
-@@ -72,6 +72,13 @@
+@@ -72,6 +72,13 @@ public:
    bool shouldRetain() const { return retain.load(std::memory_order_relaxed); }
    void setRetain(bool val) { retain.store(val, std::memory_order_relaxed); }
  
@@ -15,20 +15,20 @@ diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/incl
    uint64_t getVersion() const {
      return version.load(std::memory_order_relaxed);
    }
-@@ -99,6 +106,9 @@
-   // the program from deallocating the tensor
+@@ -100,6 +107,9 @@ private:
    std::atomic<bool> retain;
    std::atomic<uint64_t> version;
-+
+ 
 +  // Constant-cache storage must be copied before returning it to the caller.
 +  std::atomic<bool> constEvalOutput{false};
- 
++
    static uint64_t getLatestVersion();
  
+   // Callbacks to be called on destruction of the tensor.
 diff --git a/runtime/lib/ttnn/operations/cache/load_cached.cpp b/runtime/lib/ttnn/operations/cache/load_cached.cpp
 --- a/runtime/lib/ttnn/operations/cache/load_cached.cpp
 +++ b/runtime/lib/ttnn/operations/cache/load_cached.cpp
-@@ -78,6 +78,7 @@
+@@ -78,6 +78,7 @@ void run(const ::tt::target::ttnn::LoadCachedOp *op, ProgramContext &context) {
      ::tt::runtime::ttnn::TTNNTensorWrapper &outputWrapper =
          output.as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN);
      outputWrapper.setRetain(true);
@@ -39,7 +39,7 @@ diff --git a/runtime/lib/ttnn/operations/cache/load_cached.cpp b/runtime/lib/ttn
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -2495,6 +2495,19 @@
+@@ -2607,6 +2607,19 @@ submit(Device deviceHandle, Binary executableHandle, std::uint32_t programIndex,
        executor->gatherOutputTensors();
    executor.reset();
  

@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_reader.cpp ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_reader.cpp
 --- ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_reader.cpp
 +++ ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_reader.cpp
-@@ -144,6 +144,27 @@
+@@ -144,6 +144,27 @@ void kernel_main() {
                  1u});  // increment 1
      }
  
@@ -29,7 +29,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_read
      // Initialization barrier:
      // In some cases we don't have a guarantee that the output tensor has been allocated
      // on remote devices (every device's command queue executes asynchronously). So we wait
-@@ -312,12 +333,19 @@
+@@ -312,12 +333,19 @@ void kernel_main() {
              fabric_connection,
              sem_route_id,
              tt::tt_fabric::NocUnicastAtomicIncCommandHeader{barrier_sem_noc_addr_in_pkt, 0});
@@ -54,7 +54,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_read
 diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_writer.cpp ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_writer.cpp
 --- ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_writer.cpp
 +++ ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_writer.cpp
-@@ -136,6 +136,27 @@
+@@ -136,6 +136,27 @@ void kernel_main() {
                  1u});  // increment 1
      }
  
@@ -82,7 +82,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_writ
      // Initialization barrier:
      // In some cases we don't have a guarantee that the output tensor has been allocated
      // on remote devices (every device's command queue executes asynchronously). So we wait
-@@ -239,6 +260,12 @@
+@@ -239,6 +260,12 @@ void kernel_main() {
              fabric_connection,
              sem_route_id,
              tt::tt_fabric::NocUnicastAtomicIncCommandHeader{barrier_sem_noc_addr_in_pkt, 0});

@@ -22,7 +22,7 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
    api->PJRT_Buffer_Memory = internal::onBufferMemory;
  }
  
-@@ -729,6 +730,21 @@ PJRT_Error *onBufferDevice(PJRT_Buffer_Device_Args *args) {
+@@ -723,6 +724,21 @@ PJRT_Error *onBufferDevice(PJRT_Buffer_Device_Args *args) {
    return nullptr;
  }
  

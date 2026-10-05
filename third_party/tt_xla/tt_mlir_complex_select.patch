@@ -1,8 +1,10 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 --- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
-@@ -279,0 +279,37 @@
-+
+@@ -277,6 +277,43 @@ public:
+ };
+ } // namespace
+ 
 +// Rewrites select(pred, complex_true, complex_false) for the trailing
 +// real/imag representation. A non-scalar predicate must be broadcast over the
 +// new component dimension before selecting between the converted branches.
@@ -39,7 +41,11 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +  }
 +};
 +} // namespace
-@@ -655,5 +692,6 @@ struct StableHLOComplexDataTypeConversionPass
++
+ // Decomposes real(x) / imag(x) -> tensor<...xf32>:
+ //
+ //   tensor<d0x...xdNx2>   <- unpacked complex layout
+@@ -656,7 +693,8 @@ struct StableHLOComplexDataTypeConversionPass
          mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
          mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
          mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp, mlir::stablehlo::MulOp,
@@ -47,9 +53,13 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +        mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp,
 +        mlir::stablehlo::SelectOp>(
          isNotComplexType);
-@@ -699,4 +736,5 @@ struct StableHLOComplexDataTypeConversionPass
+ 
+     target.addIllegalOp<mlir::stablehlo::ComplexOp, mlir::stablehlo::RealOp,
+@@ -700,6 +738,7 @@ struct StableHLOComplexDataTypeConversionPass
          ComplexConstantOpConversionPattern, ComplexGatherOpConversionPattern,
          ComplexIotaOpConversionPattern,
          ComplexMulOpConversionPattern,
 +        ComplexSelectOpConversionPattern,
          ComplexSliceOpConversionPattern,
+         ComplexTypeDefaultConversionPattern<mlir::stablehlo::AddOp>,
+         ComplexTypeDefaultConversionPattern<mlir::stablehlo::ConcatenateOp>,

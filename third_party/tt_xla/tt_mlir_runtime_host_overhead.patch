@@ -1,7 +1,7 @@
 diff --git a/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h
 --- a/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h
 +++ b/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h
-@@ -42,9 +42,14 @@
+@@ -42,9 +42,14 @@ struct CacheKey {
  std::string to_string(const CacheKey &key);
  
  struct CacheKeyHasher {
@@ -21,7 +21,7 @@ diff --git a/runtime/include/tt/runtime/detail/ttnn/types/global_tensor_cache.h 
 diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
 --- a/runtime/lib/ttnn/program_executor.cpp
 +++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -231,10 +231,14 @@
+@@ -234,10 +234,14 @@ void ProgramExecutor::execute() {
                "Executing operation: ", op->debug_info()->c_str());
      // TODO(#7743): Remove these tracy messages.
      // Currently they are being used by `ttrt perf` for parsing the csv output.

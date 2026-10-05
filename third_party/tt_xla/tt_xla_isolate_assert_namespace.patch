@@ -1,21 +1,57 @@
 diff --git a/pjrt_implementation/inc/utils/assert.h b/pjrt_implementation/inc/utils/assert.h
 --- a/pjrt_implementation/inc/utils/assert.h
 +++ b/pjrt_implementation/inc/utils/assert.h
-@@ -40 +40 @@
+@@ -37,7 +37,7 @@
+ // tt-xla includes
+ #include "logging.h"
+ 
 -namespace tt::assert {
 +namespace tt::pjrt::assert {
-@@ -128 +128 @@ tt_throw_impl(const char *file, int line, const char *assert_type,
+ 
+ namespace detail {
+ static std::string demangle(const char *str);
+@@ -125,7 +125,7 @@ tt_throw_impl(const char *file, int line, const char *assert_type,
+       std::getenv("TT_XLA_DISABLE_BACKTRACE") != nullptr;
+   if (!disable_backtrace) {
+     trace_message_ss << "backtrace:\n";
 -    trace_message_ss << tt::assert::backtrace_to_string(100, 3, " --- ");
 +    trace_message_ss << tt::pjrt::assert::backtrace_to_string(100, 3, " --- ");
-@@ -165 +165 @@ inline void tt_assert(char const *file, int line, char const *assert_type,
+   }
+   trace_message_ss << std::flush;
+   throw std::runtime_error(trace_message_ss.str());
+@@ -162,7 +162,7 @@ inline void tt_assert(char const *file, int line, char const *assert_type,
+   }
+ }
+ } // namespace detail
 -} // namespace tt::assert
 +} // namespace tt::pjrt::assert
-@@ -175 +175 @@ inline void tt_assert(char const *file, int line, char const *assert_type,
+ 
+ // Adding do while around TT_ASSERT to allow flexible usage of the macro. More
+ // details can be found in Stack Overflow post:
+@@ -172,7 +172,7 @@ inline void tt_assert(char const *file, int line, char const *assert_type,
+ #define TT_ASSERT(condition, ...)                                              \
+   do {                                                                         \
+     if (not(condition)) [[unlikely]]                                           \
 -      tt::assert::detail::tt_assert(__FILE__, __LINE__, "TT_ASSERT",           \
 +      tt::pjrt::assert::detail::tt_assert(__FILE__, __LINE__, "TT_ASSERT",     \
-@@ -189 +189 @@ inline void tt_assert(char const *file, int line, char const *assert_type,
+                                     (condition), #condition, ##__VA_ARGS__);   \
+   } while (0) // NOLINT(cppcoreguidelines-macro-usage)
+ #endif
+@@ -186,7 +186,7 @@ inline void tt_assert(char const *file, int line, char const *assert_type,
+ 
+ #ifndef TT_THROW
+ #define TT_THROW(...)                                                          \
 -  tt::assert::detail::tt_throw(__FILE__, __LINE__, "TT_THROW",                 \
 +  tt::pjrt::assert::detail::tt_throw(__FILE__, __LINE__, "TT_THROW",           \
-@@ -197 +197 @@ inline void tt_assert(char const *file, int line, char const *assert_type,
+                                "tt::exception", ##__VA_ARGS__)
+ #endif
+ 
+@@ -194,7 +194,7 @@ inline void tt_assert(char const *file, int line, char const *assert_type,
+ #define TT_FATAL(condition, message, ...)                                      \
+   do {                                                                         \
+     if (not(condition)) [[unlikely]] {                                         \
 -      tt::assert::detail::tt_throw(__FILE__, __LINE__, "TT_FATAL", #condition, \
 +      tt::pjrt::assert::detail::tt_throw(__FILE__, __LINE__, "TT_FATAL", #condition, \
+                                    message, ##__VA_ARGS__);                    \
+       __builtin_unreachable();                                                 \
+     }                                                                          \

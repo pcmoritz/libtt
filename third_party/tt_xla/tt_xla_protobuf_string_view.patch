@@ -1,5 +1,4 @@
 diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implementation/src/api/compile_options_parser.cc
-index 7a9f567..c6b4fa7 100644
 --- a/pjrt_implementation/src/api/compile_options_parser.cc
 +++ b/pjrt_implementation/src/api/compile_options_parser.cc
 @@ -67,7 +67,7 @@ bool CompileOptionsParser::parseNestedProtobufField(
@@ -20,7 +19,7 @@ index 7a9f567..c6b4fa7 100644
        google::protobuf::io::CodedInputStream packed_stream(
            reinterpret_cast<const uint8_t *>(packed_data.data()),
            packed_data.size());
-@@ -225,7 +225,7 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+@@ -261,7 +261,7 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
        continue;
      }
  

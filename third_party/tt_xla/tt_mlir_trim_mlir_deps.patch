@@ -65,7 +65,7 @@ diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pip
  #include "ttmlir/Conversion/TTIRToLinalg/TTIRToLinalg.h"
  
  namespace mlir::tt::ttir {
-@@ -103,105 +97,6 @@
+@@ -103,105 +97,6 @@ void createStableHLOToTTIRPipeline(
  }
  #endif
  
@@ -171,7 +171,7 @@ diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pip
  void createLinalgToLLVMPipeline(OpPassManager &manager,
                                  const LinalgToLLVMPipelineOptions &options) {
    // These are initial passes to ensure we start with well-form linalg dialect
-@@ -324,9 +219,6 @@
+@@ -324,9 +219,6 @@ void registerTTIRPipelines() {
        mlir::tt::ttir::createStableHLOToTTIRPipeline);
  #endif
  
@@ -241,7 +241,7 @@ diff --git a/lib/RegisterAll.cpp b/lib/RegisterAll.cpp
  
  void mlir::tt::registerAllDialects(mlir::DialectRegistry &registry) {
    registry.insert<
-@@ -111,16 +108,16 @@
+@@ -111,16 +108,16 @@ void mlir::tt::registerAllExtensions(mlir::DialectRegistry &registry) {
    vector::registerBufferizableOpInterfaceExternalModels(registry);
    vector::registerConvertVectorToLLVMInterface(registry);
    registerConvertComplexToLLVMInterface(registry);
@@ -274,7 +274,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbufferRegistration.cpp b/lib/Target/TTNN/
  #include "mlir/Target/LLVMIR/Export.h"
  #include "mlir/Tools/mlir-translate/Translation.h"
  
-@@ -36,7 +37,9 @@
+@@ -36,7 +37,9 @@ void registerTTNNToFlatbuffer() {
                          mlir::quant::QuantDialect
                          >();
          // clang-format on

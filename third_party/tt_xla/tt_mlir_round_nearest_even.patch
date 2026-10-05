@@ -1,11 +1,10 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10129,6 +10129,65 @@ public:
+@@ -10809,6 +10809,65 @@ public:
  };
  } // namespace
--
-+
+ 
 +namespace {
 +class StableHLOToTTIRRoundNearestEvenOpConversionPattern
 +    : public OpConversionPattern<mlir::stablehlo::RoundNearestEvenOp> {
@@ -68,12 +67,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  namespace {
  class StableHLOToTTIRReducePrecisionOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::ReducePrecisionOp> {
-@@ -10237,5 +10296,7 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
--
-+
+@@ -10909,8 +10968,7 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+ 
    patterns.add<StableHLOToTTIROpRoundOpConversionPattern>(typeConverter, ctx);
+ 
+-  patterns.add<StableHLOToTTIROpDefaultConversionPattern<
+-      mlir::stablehlo::RoundNearestEvenOp, mlir::tt::ttir::RoundOp>>(
 +  patterns.add<StableHLOToTTIRRoundNearestEvenOpConversionPattern>(
-+      typeConverter, ctx);
+       typeConverter, ctx);
    patterns.add<StableHLOToTTIRReducePrecisionOpConversionPattern>(
        typeConverter, ctx);
- }

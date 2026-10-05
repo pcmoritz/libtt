@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4075,6 +4075,32 @@
+@@ -4288,6 +4288,32 @@ def NLPCreateQKVHeadsDecodeOp : TTNN_Op<"nlp_create_qkv_heads_decode"> {
    let hasVerifier = 1;
  }
  
@@ -37,7 +37,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
 --- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
-@@ -148,6 +148,19 @@
+@@ -148,6 +148,19 @@ table IndexerScoreDsaOp {
    cluster_axis: uint32 = null;
  }
  
@@ -60,7 +60,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
 --- a/include/ttmlir/Target/TTNN/program.fbs
 +++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -55,6 +55,7 @@
+@@ -55,6 +55,7 @@ union OpType {
    RotaryEmbeddingLlamaOp,
    RotaryEmbeddingOp,
    NLPCreateQKVHeadsDecodeOp,
@@ -71,15 +71,15 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -13,6 +13,7 @@
- #include "llvm/Support/Error.h"
+@@ -15,6 +15,7 @@
  
+ #include "mlir/Interfaces/SideEffectInterfaces.h"
  #ifdef TTMLIR_ENABLE_OPMODEL
 +#include "ttmlir/Dialect/TTNN/Transforms/Fusing/QKVHeadsNormRopeDecodeFusing.h"
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/SDPAFusingPattern.h"
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h"
-@@ -558,6 +559,8 @@
+@@ -802,6 +803,8 @@ public:
        patterns.add<NLPConcatHeadsDecodeFusing>(&getContext());
        patterns.add<fusing::NLPDecodeQKVProjectionFusing>(&getContext(),
                                                           validationConfig);
@@ -91,7 +91,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -4181,6 +4181,24 @@
+@@ -4325,6 +4325,24 @@ createOp(FlatbufferObjectCache &cache, NLPCreateQKVHeadsDecodeOp op) {
        overlapQKCoregrid, batchOffset, sliceSize, memoryConfig);
  }
  
@@ -116,7 +116,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
  ::flatbuffers::Offset<::tt::target::ttnn::SplitQueryKeyValueAndSplitHeadsOp>
  createOp(FlatbufferObjectCache &cache, SplitQueryKeyValueAndSplitHeadsOp op) {
    auto inputTensor = cache.at<::tt::target::ttnn::TensorRef>(
-@@ -5235,6 +5253,10 @@
+@@ -5400,6 +5418,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, nlpCreateQKVHeadsDecodeOp),
                             debugString, locInfo);
    }
@@ -130,7 +130,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
 --- a/runtime/lib/ttnn/program_executor.cpp
 +++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -119,6 +119,7 @@
+@@ -120,6 +120,7 @@
  #include "operations/transformer/nlp_concat_heads.h"
  #include "operations/transformer/nlp_concat_heads_decode.h"
  #include "operations/transformer/nlp_create_qkv_heads_decode.h"
@@ -138,7 +138,7 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
  #include "operations/transformer/paged_flash_multi_latent_attention_decode.h"
  #include "operations/transformer/paged_scaled_dot_product_attention_decode.h"
  #include "operations/transformer/recurrent.h"
-@@ -439,6 +440,10 @@
+@@ -448,6 +449,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
      return operations::transformer::run(op->type_as_NLPCreateQKVHeadsDecodeOp(),
                                          getContext());
    }

@@ -1,6 +1,7 @@
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
-@@ -369,25 +369,16 @@
+@@ -369,25 +369,16 @@ FORCE_INLINE void fill_tile_with_first_row_bfloat16(uint32_t l1_write_ptr) {
  // Reads the very first row of the CB and fills the entire tile with the same row.
  // Tile is assumed to have 32-bit elements (float32/int32).
  FORCE_INLINE void fill_tile_with_first_row(uint32_t l1_write_ptr) {
@@ -22,7 +23,6 @@
 -        }
 -        row_offset = 0;  // Reset for the next face pair
 -        num_rows = 16;   // Process all rows for the next face pair
--    }
 +    constexpr uint32_t row_bytes = 16 * sizeof(uint32_t);
 +    constexpr uint32_t face_bytes = 16 * row_bytes;
 +    // Double the populated rows in each upper face, then copy both faces down.
@@ -30,7 +30,7 @@
 +        noc_async_read(get_noc_addr(l1_write_ptr), l1_write_ptr + bytes, bytes);
 +        noc_async_read(get_noc_addr(l1_write_ptr + face_bytes), l1_write_ptr + face_bytes + bytes, bytes);
 +        noc_async_read_barrier();
-+    }
+     }
 +    noc_async_read(get_noc_addr(l1_write_ptr), l1_write_ptr + 2 * face_bytes, 2 * face_bytes);
 +    noc_async_read_barrier();
  }

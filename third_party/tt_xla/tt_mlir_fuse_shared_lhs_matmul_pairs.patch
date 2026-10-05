@@ -1,7 +1,7 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -1873,9 +1873,9 @@ private:
-     bool allSameTransposeB = true;
+@@ -1874,7 +1874,7 @@ private:
      bool firstTransposeB = false;
  
      bool isValid() const {
@@ -10,8 +10,8 @@
      }
  
      bool getTargetTransposeB() const {
-       return allSameTransposeB ? firstTransposeB : false;
-@@ -2043,5 +2043,6 @@
+@@ -2014,7 +2014,8 @@ private:
+ 
      for (Operation *user : sharedLHS.getUsers()) {
        auto op = dyn_cast<OpType>(user);
 -      if (!op || op.getA() != sharedLHS) {
@@ -19,3 +19,4 @@
 +          llvm::is_contained(result.ops, op)) {
          continue;
        }
+ 

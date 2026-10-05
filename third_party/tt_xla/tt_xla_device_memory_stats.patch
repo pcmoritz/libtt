@@ -1,8 +1,7 @@
 diff --git a/pjrt_implementation/inc/api/device_instance.h b/pjrt_implementation/inc/api/device_instance.h
-index 6dd09d5..f2b67d7 100644
 --- a/pjrt_implementation/inc/api/device_instance.h
 +++ b/pjrt_implementation/inc/api/device_instance.h
-@@ -62,6 +62,9 @@ public:
+@@ -65,6 +65,9 @@ public:
    // Returns global device ID.
    int getGlobalDeviceId() const { return m_description.getDeviceId(); }
  
@@ -12,7 +11,7 @@ index 6dd09d5..f2b67d7 100644
    // Sets process index from which this device is addressable.
    void setProcessIndex(int process_index) {
      m_description.setProcessIndex(process_index);
-@@ -91,7 +94,7 @@ private:
+@@ -94,7 +97,7 @@ private:
        : m_client(client),
          m_description(global_device_id, arch, dram_size_bytes),
          m_is_addressable(is_addressable), m_local_device_id(local_device_id),
@@ -21,7 +20,7 @@ index 6dd09d5..f2b67d7 100644
  
    // back-reference to client.
    ClientInstance *m_client;
-@@ -112,6 +116,9 @@ private:
+@@ -115,6 +118,9 @@ private:
    // Default addressable memory where the data processed by this device should
    // be stored.
    MemoryInstance *m_default_memory;
@@ -31,7 +30,7 @@ index 6dd09d5..f2b67d7 100644
  };
  
  namespace internal {
-@@ -131,6 +138,15 @@ onDeviceAddressableMemories(PJRT_Device_AddressableMemories_Args *args);
+@@ -135,6 +141,15 @@ onDeviceAddressableMemories(PJRT_Device_AddressableMemories_Args *args);
  // Implements PJRT_Device_DefaultMemory API function.
  PJRT_Error *onDeviceDefaultMemory(PJRT_Device_DefaultMemory_Args *args);
  
@@ -47,11 +46,23 @@ index 6dd09d5..f2b67d7 100644
  } // namespace internal
  
  } // namespace tt::pjrt
+diff --git a/pjrt_implementation/inc/api/memory_instance.h b/pjrt_implementation/inc/api/memory_instance.h
+--- a/pjrt_implementation/inc/api/memory_instance.h
++++ b/pjrt_implementation/inc/api/memory_instance.h
+@@ -78,6 +78,9 @@ private:
+   MemoryInstance(std::vector<DeviceInstance *> &addressable_by_devices,
+                  size_t id, bool is_host_memory);
+ 
++  // PJRT_Memory's optional function table must be the first field.
++  const PJRT_Memory_FunctionTable *m_vtable = nullptr;
++
+   // List of devices that can access this memory.
+   std::vector<DeviceInstance *> m_addressable_by_devices;
+ 
 diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementation/src/api/device_instance.cc
-index 7766535..0bf19b5 100644
 --- a/pjrt_implementation/src/api/device_instance.cc
 +++ b/pjrt_implementation/src/api/device_instance.cc
-@@ -43,6 +43,9 @@ void DeviceInstance::bindApi(PJRT_Api *api) {
+@@ -41,6 +41,9 @@ void DeviceInstance::bindApi(PJRT_Api *api) {
    api->PJRT_Device_LocalHardwareId = internal::onDeviceLocalHardwareId;
    api->PJRT_Device_AddressableMemories = internal::onDeviceAddressableMemories;
    api->PJRT_Device_DefaultMemory = internal::onDeviceDefaultMemory;
@@ -61,7 +72,7 @@ index 7766535..0bf19b5 100644
  }
  
  namespace internal {
-@@ -98,6 +101,58 @@ PJRT_Error *onDeviceDefaultMemory(PJRT_Device_DefaultMemory_Args *args) {
+@@ -96,6 +99,58 @@ PJRT_Error *onDeviceDefaultMemory(PJRT_Device_DefaultMemory_Args *args) {
    return nullptr;
  };
  
@@ -120,14 +131,3 @@ index 7766535..0bf19b5 100644
  } // namespace internal
  
  } // namespace tt::pjrt
-diff --git a/pjrt_implementation/inc/api/memory_instance.h b/pjrt_implementation/inc/api/memory_instance.h
---- a/pjrt_implementation/inc/api/memory_instance.h
-+++ b/pjrt_implementation/inc/api/memory_instance.h
-@@ -81,4 +81,7 @@ private:
-                  size_t id, bool is_host_memory);
-
-+  // PJRT_Memory's optional function table must be the first field.
-+  const PJRT_Memory_FunctionTable *m_vtable = nullptr;
-+
-   // List of devices that can access this memory.
-   std::vector<DeviceInstance *> m_addressable_by_devices;

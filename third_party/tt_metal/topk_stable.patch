@@ -1,134 +1,111 @@
 diff --git tt_metal/hw/inc/api/compute/compute_kernel_api.h tt_metal/hw/inc/api/compute/compute_kernel_api.h
-index 5ebfb63..687c7e0 100644
 --- tt_metal/hw/inc/api/compute/compute_kernel_api.h
 +++ tt_metal/hw/inc/api/compute/compute_kernel_api.h
-@@ -708,16 +708,17 @@ ALWI void silu_tile_init_pack() { PACK(SFPU_UNARY_INIT_FN(silu, sfpu::silu_init,
+@@ -713,16 +713,17 @@ ALWI void silu_tile_init_pack() { PACK(SFPU_UNARY_INIT_FN(silu, sfpu::silu_init,
   * | i_end_step      | The end step to perform if i_start_phase == i_end_phase                    | int32    | 4 to 6                                                | False    |
   * | i_start_step    | The start step to perform if i_start_phase == i_end_phase                  | int32    | 4 to 6                                                | False    |
   * | stable_sort     | Maintain order of indices for equal values                                 | bool     | true, false                                           | False    |
 + * | descending      | Order equal values by increasing index in a descending sort                | bool     | true, false                                           | False    |
   */
  // clang-format on
--template <bool stable_sort = false>
-+template <bool stable_sort = false, bool descending = false>
+-template <bool stable_sort = false, bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
++template <bool stable_sort = false, bool descending = false, bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
  ALWI void topk_local_sort(
      uint32_t idst, int idir, int i_end_phase, int i_start_phase = 0, int i_end_step = 0, int i_start_step = 0) {
      MATH(SFPU_UNARY_CALL(
          DST_SYNC_MODE,
-         DST_ACCUM_MODE,
+         is_fp32_dest_acc_en,
          calculate_bitonic_topk_phases_steps,
--        (true /* APPROXIMATE */, DST_ACCUM_MODE, stable_sort),
-+        (true /* APPROXIMATE */, DST_ACCUM_MODE, stable_sort, descending),
+-        (true /* APPROXIMATE */, is_fp32_dest_acc_en, stable_sort),
++        (true /* APPROXIMATE */, is_fp32_dest_acc_en, stable_sort, descending),
          idst,
          VectorMode::RC_custom,
          idir,
-@@ -758,0 +760 @@ ALWI void topk_local_sort(
+@@ -760,22 +761,28 @@ ALWI void topk_local_sort(
+  * | idst            | The index of the tile in DST register buffer to perform the computation on | uint32_t | Must be less than the size of the DST register buffer | True     |
+  * | m_iter          | The index of the merge & rebuild iteration of the algorithm                | int32    | 0 to 9                                                | True     |
+  * | k               | The number of sorted values to return                                      | int32    | {4, 8, 16, 32, 64}                                    | True     |
 + * | descending      | Order equal values by increasing index in a descending sort                | bool     | true, false                                           | False    |
-@@ -761,2 +763,2 @@ ALWI void topk_local_sort(
--template <bool idir = false, bool stable_sort = false>
--ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
-+template <bool idir, bool stable_sort, bool descending>
-+ALWI void topk_merge_impl(uint32_t idst, int m_iter, int k) {
-@@ -767 +769 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
--        (true /* APPROXIMATE */, DST_ACCUM_MODE, idir, stable_sort),
-+        (true /* APPROXIMATE */, DST_ACCUM_MODE, idir, stable_sort, descending),
-@@ -773,0 +776,14 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
-+// Keep the legacy unstable API separate: its callers provide only idir, and
-+// descending is unused when stable_sort is false. Stable callers must pass the
-+// global direction explicitly because their local idir alternates; combining
-+// these overloads with defaults could silently derive it from the wrong idir.
-+template <bool idir = false>
-+ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
-+    topk_merge_impl<idir, false, !idir>(idst, m_iter, k);
-+}
+  * | stable_sort     | Maintain order of indices for equal values                                 | bool     | true, false                                           | False    |
+  */
+ // clang-format on
+-template <bool idir = false, bool stable_sort = false, bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
++template <
++    bool idir = false,
++    bool stable_sort = false,
++    bool descending = !idir,
++    bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
+ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
+     MATH(SFPU_UNARY_CALL(
+         DST_SYNC_MODE,
+         is_fp32_dest_acc_en,
+         calculate_bitonic_topk_merge,
+-        (true /* APPROXIMATE */, is_fp32_dest_acc_en, idir, stable_sort),
++        (true /* APPROXIMATE */, is_fp32_dest_acc_en, idir, stable_sort, descending),
+         idst,
+         VectorMode::RC_custom,
+         m_iter,
+         k));
+ }
+ 
 +
-+template <bool idir, bool stable_sort, bool descending>
-+ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
-+    topk_merge_impl<idir, stable_sort, descending>(idst, m_iter, k);
-+}
-+
-@@ -802,15 +804,16 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
+ // topK rebuild
+ // clang-format off
+ /**
+@@ -807,15 +814,16 @@ ALWI void topk_merge(uint32_t idst, int m_iter, int k) {
   * | logk            | The log of K                                                               | int32    | 2 to 6                                                | True     |
   * | skip_second     | Whether or not to skip second tile                                         | int32    | 0 to 1                                                | True     |
   * | stable_sort     | Maintain order of indices for equal values                                 | bool     | true, false                                           | False    |
 + * | descending      | Order equal values by increasing index in a descending sort                | bool     | true, false                                           | False    |
   */
  // clang-format on
--template <bool stable_sort = false>
-+template <bool stable_sort = false, bool descending = false>
+-template <bool stable_sort = false, bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
++template <bool stable_sort = false, bool descending = false, bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
  ALWI void topk_rebuild(uint32_t idst, bool idir, int m_iter, int k, int logk, int skip_second) {
      MATH(SFPU_UNARY_CALL(
          DST_SYNC_MODE,
-         DST_ACCUM_MODE,
+         is_fp32_dest_acc_en,
          calculate_bitonic_topk_rebuild,
--        (true /* APPROXIMATE */, DST_ACCUM_MODE, stable_sort),
-+        (true /* APPROXIMATE */, DST_ACCUM_MODE, stable_sort, descending),
+-        (true /* APPROXIMATE */, is_fp32_dest_acc_en, stable_sort),
++        (true /* APPROXIMATE */, is_fp32_dest_acc_en, stable_sort, descending),
          idst,
          VectorMode::RC_custom,
          idir,
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
-index ba02e38..73129c6 100644
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
-@@ -345,7 +345,11 @@ void kernel_main() {
+@@ -353,7 +353,8 @@ void kernel_main() {
                  // Merge and sort 64 elements (32 existing + 32 new) using topk_local_sort
                  // Results: dest reg 0 = top 32 elements, dest reg 1 = bottom 32 elements
                  // largest flag determines ascending (0) vs descending (1) sort order
--                ckernel::topk_local_sort(0, (int)!largest, end_phase);
-+                if (largest) {
-+                    ckernel::topk_local_sort<true, true>(0, 0, end_phase);
-+                } else {
-+                    ckernel::topk_local_sort<true, false>(0, 1, end_phase);
-+                }
+-                ckernel::topk_local_sort<stable_sort>(0, (int)!largest, end_phase);
++                // A stable descending sort keeps the lowest index first among equal values.
++                ckernel::topk_local_sort<stable_sort, static_cast<bool>(largest)>(0, (int)!largest, end_phase);
  
                  // Pack sorted results: dest reg 0 -> result buffer, dest reg 1 -> secondary buffer
                  tile_regs_commit();
-diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
-index 34849a4..62cd3ba 100644
---- ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
-+++ ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
-@@ -46,5 +46,9 @@ void process_and_sort_tiles(
-         }
-         // llk_topk_sort -> inplace
--        ckernel::topk_local_sort(0, (int)ascending, end_phase);
-+        if (ascending) {
-+            ckernel::topk_local_sort<true, false>(0, 1, end_phase);
-+        } else {
-+            ckernel::topk_local_sort<true, true>(0, 0, end_phase);
-+        }
-         tile_regs_commit();
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
+@@ -109,7 +109,11 @@ TopKDeviceOperation::program_factory_t TopKDeviceOperation::select_program_facto
+     const uint32_t reduced_width = input_shape[args.dim];
+     const uint32_t tile_height = input_tensor.tensor_spec().tile().get_height();
+     const uint32_t num_tile_rows = input_shape.volume() / reduced_width / tile_height;
+-    bool multicore_supported = topk_multicore_structurally_eligible(reduced_width, num_tile_rows, args.k);
++    // Only the single-core network keeps stable ties in index order: the multi-core
++    // local and final merges do not. This costs speed on power-of-two rows the
++    // multi-core path would take (2.6 instead of 0.3 ms for 2x8192, k=32).
++    bool multicore_supported =
++        !args.stable && topk_multicore_structurally_eligible(reduced_width, num_tile_rows, args.k);
  
-@@ -103,7 +107,11 @@ void process_tile_pair(
+     // The multi-core path takes the first (and only supported) core range below; a
+     // malformed grid (zero or multiple ranges) falls back to single-core here and is
+@@ -320,7 +324,7 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
+     const uint32_t reduced_width = input_shape[args.dim];
+     const uint32_t tile_height = input_tensor.tensor_spec().tile().get_height();
+     const uint32_t num_tile_rows = input_shape.volume() / reduced_width / tile_height;
+-    if (topk_multicore_structurally_eligible(reduced_width, num_tile_rows, args.k)) {
++    if (!args.stable && topk_multicore_structurally_eligible(reduced_width, num_tile_rows, args.k)) {
+         auto* device = input_tensor.device();
  
-     // merge values - move larger 32 values into 0th dest and lower 32 values into 1st dest
-     // sort within the larger 32 values
--    ckernel::topk_rebuild(0, (uint32_t)ascending, m_iter, K, logk, target_tiles_is_one);
-+    if (ascending) {
-+        ckernel::topk_rebuild<true, false>(0, 1, m_iter, K, logk, target_tiles_is_one);
-+    } else {
-+        ckernel::topk_rebuild<true, true>(0, 0, m_iter, K, logk, target_tiles_is_one);
-+    }
- 
-     tile_regs_commit();
-     tile_regs_wait();
-@@ -165,9 +173,9 @@ void process_tiles(
- 
-             // merge values - move larger 32 values into 0th dest and lower 32 values into 1st dest
-             if (largest) {
--                ckernel::topk_merge<false>(0, m_iter, K);
-+                ckernel::topk_merge<false, true, true>(0, m_iter, K);
-             } else {
--                ckernel::topk_merge<true>(0, m_iter, K);
-+                ckernel::topk_merge<true, true, false>(0, m_iter, K);
-             }
- 
-             // ckernel::topk_merge(0, m_iter, K);
-diff --git ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
---- ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
-+++ ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
-@@ -289 +289 @@ void topk(
--    ckernel::topk_merge<false, stable_sort>(0, 0, 32);
-+    ckernel::topk_merge<false, stable_sort, true>(0, 0, 32);
-@@ -303 +303 @@ void topk(
--        ckernel::topk_merge<false, stable_sort>(0, 0, 32);
-+        ckernel::topk_merge<false, stable_sort, true>(0, 0, 32);
+         // Set up data formats for memory cost calculations

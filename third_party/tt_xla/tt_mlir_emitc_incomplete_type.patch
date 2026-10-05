@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Conversion/TTNNToEmitC/EmitCConversion.h b/include/ttmlir/Conversion/TTNNToEmitC/EmitCConversion.h
 --- a/include/ttmlir/Conversion/TTNNToEmitC/EmitCConversion.h
 +++ b/include/ttmlir/Conversion/TTNNToEmitC/EmitCConversion.h
-@@ -2187,6 +2187,6 @@ public:
+@@ -2247,7 +2247,7 @@ public:
    template <
        typename MLIRAttrTy, typename = std::void_t<TTNNTargetT<MLIRAttrTy>>,
        typename =
@@ -9,3 +9,4 @@ diff --git a/include/ttmlir/Conversion/TTNNToEmitC/EmitCConversion.h b/include/t
 +          std::enable_if_t<std::is_convertible_v<MLIRAttrTy &, mlir::Attribute>>>
    mlir::Attribute emit(MLIRAttrTy attr) {
      auto convertedValue =
+         EmitCTypeConverter<TTNNTargetT<MLIRAttrTy>>::convert(attr);

@@ -1,6 +1,7 @@
+diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 --- a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 +++ b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
-@@ -716,20 +716,28 @@
+@@ -742,20 +742,28 @@ bool isShardedModule(mlir::ModuleOp &module) {
      return false;
    }
    auto globalMeshOp = parsedMeshOps[0];

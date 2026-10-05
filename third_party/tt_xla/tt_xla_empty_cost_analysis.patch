@@ -1,7 +1,8 @@
 diff --git a/pjrt_implementation/inc/api/executable_instance.h b/pjrt_implementation/inc/api/executable_instance.h
 --- a/pjrt_implementation/inc/api/executable_instance.h
 +++ b/pjrt_implementation/inc/api/executable_instance.h
-@@ -113,5 +113,9 @@ PJRT_Error *onExecutableSizeOfGeneratedCodeInBytes(
+@@ -112,6 +112,10 @@ PJRT_Error *onExecutableSerialize(PJRT_Executable_Serialize_Args *args);
+ // Implements PJRT_Executable_Fingerprint API function.
  PJRT_Error *onExecutableFingerprint(PJRT_Executable_Fingerprint_Args *args);
  
 +// Implements PJRT_Executable_GetCostAnalysis API function.
@@ -14,7 +15,8 @@ diff --git a/pjrt_implementation/inc/api/executable_instance.h b/pjrt_implementa
 diff --git a/pjrt_implementation/src/api/executable_instance.cc b/pjrt_implementation/src/api/executable_instance.cc
 --- a/pjrt_implementation/src/api/executable_instance.cc
 +++ b/pjrt_implementation/src/api/executable_instance.cc
-@@ -49,5 +49,7 @@ void ExecutableInstance::bindApi(PJRT_Api *api) {
+@@ -48,6 +48,8 @@ void ExecutableInstance::bindApi(PJRT_Api *api) {
+   api->PJRT_Executable_SizeOfGeneratedCodeInBytes =
        internal::onExecutableSizeOfGeneratedCodeInBytes;
    api->PJRT_Executable_Fingerprint = internal::onExecutableFingerprint;
 +  api->PJRT_Executable_GetCostAnalysis =
@@ -22,7 +24,7 @@ diff --git a/pjrt_implementation/src/api/executable_instance.cc b/pjrt_implement
    api->PJRT_Executable_OutputElementTypes =
        internal::onExecutableOutputElementTypes;
    api->PJRT_Executable_OutputDimensions =
-@@ -180,6 +182,18 @@ PJRT_Error *onExecutableFingerprint(PJRT_Executable_Fingerprint_Args *args) {
+@@ -193,6 +195,18 @@ PJRT_Error *onExecutableFingerprint(PJRT_Executable_Fingerprint_Args *args) {
    return nullptr;
  }
  

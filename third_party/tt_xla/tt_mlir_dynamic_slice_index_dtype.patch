@@ -1,10 +1,10 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5629,14 +5629,14 @@
+@@ -5603,14 +5603,14 @@ public:
                                startIndicesTensorType.getEncoding()),
          startIndicesValues1D, /*dim=*/0);
-
+ 
 -    // Create a 1D constant tensor with slice_sizes values.
 -    SmallVector<int32_t> sliceSizesInt32(sliceSizes.begin(), sliceSizes.end());
 -    auto sliceSizesTensorType = RankedTensorType::get(
@@ -20,6 +20,6 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto sliceSizesConstant = rewriter.create<mlir::tt::ttir::ConstantOp>(
 -        srcOp.getLoc(), sliceSizesTensorType, sliceSizesAttr);
 +        srcOp.getLoc(), startIndicesTensorType, sliceSizesAttr);
-
+ 
      // Create an add op that adds the slice sizes to start indices to get end
      // indices.

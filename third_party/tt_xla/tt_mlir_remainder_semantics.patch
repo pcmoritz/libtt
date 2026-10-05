@@ -1,9 +1,18 @@
 diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp b/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
 --- a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
 +++ b/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
-@@ -88,3 +88,21 @@ void run(const ::tt::target::ttnn::EltwiseBinaryCompositeOp *op,
-            const std::optional<::ttnn::MemoryConfig> &memCfg) {
--          return ::ttnn::remainder(lhs, rhs, std::nullopt, memCfg);
+@@ -145,9 +145,30 @@ void run(const ::tt::target::ttnn::EltwiseBinaryCompositeOp *op,
+     break;
+   }
+   case ::tt::target::ttnn::EltwiseBinaryCompositeOpType::Remainder: {
+-    runEltwiseBinaryCompositeOpWithActivations(
+-        op, tensorPool, [](auto &&...args) {
+-          return ::ttnn::remainder(std::forward<decltype(args)>(args)...);
++    // The compiler fuses no activations into remainder.
++    runEltwiseBinaryCompositeOp(
++        op, tensorPool,
++        [](const ::ttnn::Tensor &lhs, const ::ttnn::Tensor &rhs,
++           const std::optional<::ttnn::MemoryConfig> &memCfg) {
 +          // StableHLO uses truncating remainder. For unsigned values floor and
 +          // truncation agree, while TTNN's fmod does not support them.
 +          const auto dtype = lhs.dtype();
@@ -24,3 +33,29 @@ diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp b/r
 +          }
 +          return ::ttnn::fmod(lhs, rhs, memCfg);
          });
+     break;
+   }
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -217,6 +217,10 @@ public:
+   mlir::LogicalResult
+   matchAndRewrite(ElementwiseBinaryActivations binaryOpWithActivations,
+                   mlir::PatternRewriter &rewriter) const final {
++    // Remainder runs as a truncating fmod, which takes no activations.
++    if (isa<RemainderOp>(binaryOpWithActivations.getOperation())) {
++      return mlir::failure();
++    }
+     auto binaryOp =
+         mlir::cast<ElementwiseBinary>(binaryOpWithActivations.getOperation());
+     bool isFused = false;
+@@ -305,7 +309,8 @@ private:
+   }
+ 
+   ElementwiseBinaryActivations getFusableBinaryOp(Value operand) const {
+-    if (!operand.hasOneUse()) {
++    // Remainder runs as a truncating fmod, which takes no activations.
++    if (!operand.hasOneUse() || operand.getDefiningOp<RemainderOp>()) {
+       return {};
+     }
+ 

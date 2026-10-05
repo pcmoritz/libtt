@@ -84,10 +84,10 @@ void kernel_main() {
         binop_with_scalar_tile_init();
         MATH(SFPU_UNARY_CALL(
             DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
-            (APPROX, ckernel::sfpu::MUL, 8), 0, VectorMode::C, inv_head_dim));
+            (APPROX, ckernel::sfpu::MUL, 8, DST_ACCUM_MODE), 0, VectorMode::C, inv_head_dim));
         MATH(SFPU_UNARY_CALL(
             DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
-            (APPROX, ckernel::sfpu::ADD, 8), 0, VectorMode::C, eps));
+            (APPROX, ckernel::sfpu::ADD, 8, DST_ACCUM_MODE), 0, VectorMode::C, eps));
         rsqrt_tile_init();
         MATH(SFPU_UNARY_CALL(
             DST_SYNC_MODE, DST_ACCUM_MODE, calculate_rsqrt, (APPROX, 8, DST_ACCUM_MODE, false, false), 0,

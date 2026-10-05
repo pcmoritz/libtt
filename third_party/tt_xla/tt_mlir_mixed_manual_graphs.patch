@@ -1,7 +1,69 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
+--- a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
++++ b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
+@@ -298,9 +298,12 @@ static mlir::LogicalResult updateManualAxes(MLIRContext *context,
+   mlir::sdy::ManualAxesAttr manualAxesAttr =
+       mlir::sdy::ManualAxesAttr::get(context, manualAxes);
+ 
+-  // Update the manual axes in the mlir module.
++  // Update the manual axes in the mlir module. Manual computations nested in
++  // another one (a shard_map in automatically sharded code) already compute on
++  // device-local shapes; they are inlined once their surroundings are local.
+   mlir::WalkResult result = funcOp.getBody().walk([&](mlir::Operation *op) {
+-    if (!mlir::isa<mlir::sdy::ManualComputationOp>(op)) {
++    if (!mlir::isa<mlir::sdy::ManualComputationOp>(op) ||
++        op->getParentOfType<mlir::sdy::ManualComputationOp>()) {
+       return WalkResult::advance();
+     }
+ 
+@@ -342,6 +345,33 @@ static mlir::LogicalResult updateManualAxes(MLIRContext *context,
+   return mlir::failure(result.wasInterrupted());
+ }
+ 
++// Inline manual computations nested in another one. Their operands now have
++// the device-local shapes of their in_shardings. The region's arguments are
++// local over its manual axes only, but ops in the region have been localized
++// over its automatic axes from their own shardings, so they take the operands.
++static void inlineNestedManualComputations(func::FuncOp &funcOp) {
++  llvm::SmallVector<mlir::sdy::ManualComputationOp> nested;
++  // Post-order: inner computations come first.
++  funcOp.walk([&](mlir::sdy::ManualComputationOp op) {
++    if (op->getParentOfType<mlir::sdy::ManualComputationOp>()) {
++      nested.push_back(op);
++    }
++  });
++  for (mlir::sdy::ManualComputationOp op : nested) {
++    mlir::Block &body = op.getRegion().front();
++    auto returnOp = mlir::cast<mlir::sdy::ReturnOp>(body.getTerminator());
++    for (auto [arg, operand] : llvm::zip(body.getArguments(), op.getOperands())) {
++      arg.replaceAllUsesWith(operand);
++    }
++    op.getResults().replaceAllUsesWith(returnOp.getOperands());
++    op->getBlock()->getOperations().splice(mlir::Block::iterator(op),
++                                           body.getOperations(), body.begin(),
++                                           mlir::Block::iterator(returnOp));
++    returnOp->erase();
++    op->erase();
++  }
++}
++
+ // Update all shapes in the module based on their sdy tensor sharding attribute.
+ static mlir::LogicalResult updateShapes(MLIRContext *context,
+                                         mlir::OpBuilder &builder,
+@@ -583,6 +613,9 @@ public:
+       }
+     });
+ 
++    rootModule.walk(
++        [&](func::FuncOp funcOp) { inlineNestedManualComputations(funcOp); });
++
+     // Shardy updates the operand shapes but not
+     // the feature_group_count attribute, so we fix it here from the local
+     // types.
 diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 --- a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 +++ b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
-@@ -249,36 +249,42 @@
+@@ -249,36 +249,42 @@ bool sdyAnnotationsExist(mlir::ModuleOp &module) {
    return false;
  }
  
@@ -68,65 +130,3 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
  }
  
  // Create a new DictionaryAttr from an old DictionaryAttr with all sdy.sharding
-diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
---- a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
-+++ b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
-@@ -298,9 +298,12 @@ static mlir::LogicalResult updateManualAxes(MLIRContext *context,
-   mlir::sdy::ManualAxesAttr manualAxesAttr =
-       mlir::sdy::ManualAxesAttr::get(context, manualAxes);
- 
--  // Update the manual axes in the mlir module.
-+  // Update the manual axes in the mlir module. Manual computations nested in
-+  // another one (a shard_map in automatically sharded code) already compute on
-+  // device-local shapes; they are inlined once their surroundings are local.
-   mlir::WalkResult result = funcOp.getBody().walk([&](mlir::Operation *op) {
--    if (!mlir::isa<mlir::sdy::ManualComputationOp>(op)) {
-+    if (!mlir::isa<mlir::sdy::ManualComputationOp>(op) ||
-+        op->getParentOfType<mlir::sdy::ManualComputationOp>()) {
-       return WalkResult::advance();
-     }
- 
-@@ -342,6 +345,33 @@ static mlir::LogicalResult updateManualAxes(MLIRContext *context,
-   return mlir::failure(result.wasInterrupted());
- }
- 
-+// Inline manual computations nested in another one. Their operands now have
-+// the device-local shapes of their in_shardings. The region's arguments are
-+// local over its manual axes only, but ops in the region have been localized
-+// over its automatic axes from their own shardings, so they take the operands.
-+static void inlineNestedManualComputations(func::FuncOp &funcOp) {
-+  llvm::SmallVector<mlir::sdy::ManualComputationOp> nested;
-+  // Post-order: inner computations come first.
-+  funcOp.walk([&](mlir::sdy::ManualComputationOp op) {
-+    if (op->getParentOfType<mlir::sdy::ManualComputationOp>()) {
-+      nested.push_back(op);
-+    }
-+  });
-+  for (mlir::sdy::ManualComputationOp op : nested) {
-+    mlir::Block &body = op.getRegion().front();
-+    auto returnOp = mlir::cast<mlir::sdy::ReturnOp>(body.getTerminator());
-+    for (auto [arg, operand] : llvm::zip(body.getArguments(), op.getOperands())) {
-+      arg.replaceAllUsesWith(operand);
-+    }
-+    op.getResults().replaceAllUsesWith(returnOp.getOperands());
-+    op->getBlock()->getOperations().splice(mlir::Block::iterator(op),
-+                                           body.getOperations(), body.begin(),
-+                                           mlir::Block::iterator(returnOp));
-+    returnOp->erase();
-+    op->erase();
-+  }
-+}
-+
- // Update all shapes in the module based on their sdy tensor sharding attribute.
- static mlir::LogicalResult updateShapes(MLIRContext *context,
-                                         mlir::OpBuilder &builder,
-@@ -583,6 +613,9 @@ public:
-       }
-     });
- 
-+    rootModule.walk(
-+        [&](func::FuncOp funcOp) { inlineNestedManualComputations(funcOp); });
-+
-     // Shardy updates the operand shapes but not
-     // the feature_group_count attribute, so we fix it here from the local
-     // types.

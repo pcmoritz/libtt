@@ -1,7 +1,9 @@
 diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
 --- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
 +++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
-@@ -361,7 +361,3 @@ private:
+@@ -290,11 +290,7 @@ private:
+ 
+         if (!rmOutputLayout) {
            llvm::consumeError(rmOutputLayout.takeError());
 -          // TODO(rpavlovicTT): Remove when
 -          // https://github.com/tenstorrent/tt-mlir/pull/8413 is merged.
@@ -10,3 +12,5 @@ diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagati
 -          }
 +          insertTiledFixup(rewriter, use, current);
            continue;
+         }
+ 

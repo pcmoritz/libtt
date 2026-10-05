@@ -1,5 +1,4 @@
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-index 0fc4cf7..d18197c 100644
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 @@ -62,6 +62,16 @@ foldConsecutiveDataCastOps(T op, ::mlir::PatternRewriter &rewriter) {

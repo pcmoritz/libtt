@@ -1,16 +1,3 @@
-# The Metal 2.0 scatter port passed the input and index outer shapes as
-# advanced runtime varargs.  When a cached scatter reader was reused, those
-# varargs were not reliably restored for that program, so the reader could use
-# shape extents installed by a different scatter program.  This caused
-# order-dependent wrong results in 68 previously passing scatter-,
-# dynamic-update-, and scan-derived JAX tests.
-#
-# Moving only the outer shapes to compiler defines makes the values part of the
-# reader kernel specialization and fixes the cached path.  This is deliberately
-# a correctness workaround: it compiles a separate reader kernel for each
-# distinct input/index outer-shape pair.  Remove it once cached advanced runtime
-# varargs are reliably associated with the program that supplied them.
-
 diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp

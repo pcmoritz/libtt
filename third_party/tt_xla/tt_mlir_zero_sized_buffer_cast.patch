@@ -1,7 +1,8 @@
 diff --git a/runtime/lib/common/utils.cpp b/runtime/lib/common/utils.cpp
 --- a/runtime/lib/common/utils.cpp
 +++ b/runtime/lib/common/utils.cpp
-@@ -292,5 +292,8 @@ void handleBufferCast(const void *oldBuffer, void *newBuffer,
+@@ -292,6 +292,9 @@ getUnsupportedDataTypeAlias(::tt::target::DataType unsupportedDataType) {
+ void handleBufferCast(const void *oldBuffer, void *newBuffer,
                        target::DataType oldDataType,
                        target::DataType newDataType, int64_t numElements) {
 +  if (numElements == 0) {

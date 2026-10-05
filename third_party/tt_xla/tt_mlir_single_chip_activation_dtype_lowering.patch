@@ -1,14 +1,35 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp b/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNActivationDtypeLowering.cpp
-@@ -180,1 +179,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+@@ -177,7 +177,6 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+ 
+   // Walk the single-use chain from the matmul to its first non-flow user.
+   llvm::SmallVector<Operation *> flowOps;
 -  bool sawCCL = false;
-@@ -194,1 +193,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+   Value cur = matmul.getResult();
+   Operation *exit = nullptr;
+   while (true) {
+@@ -191,7 +190,6 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+       if (user->getNumResults() != 1) {
+         return false;
+       }
 -      sawCCL |= isCCLOp(user);
-@@ -202,3 +200,0 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+       flowOps.push_back(user);
+       cur = user->getResult(0);
+       continue;
+@@ -199,9 +197,6 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+     exit = user;
+     break;
+   }
 -  if (!sawCCL) {
 -    return false;
 -  }
-@@ -211,4 +206,9 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+ 
+   // Exit must be the gate multiply feeding the FF2 matmul, and FF2 must reach a
+   // residual add downstream (where bf16 is restored).
+@@ -209,8 +204,13 @@ static bool tryMLPUpGateMatcher(MatmulOp matmul) {
+   if (!gate || !gate.getResult().hasOneUse()) {
+     return false;
    }
 -  auto ff2 = mlir::dyn_cast<MatmulOp>(*gate.getResult().getUsers().begin());
 -  if (!ff2 || !matmulReachesResidualAdd(ff2)) {
@@ -20,3 +41,5 @@
 +             !isLowerableFloat(getValueDtype(ff2Linear.getBias())) ||
 +             !isLowerableFloat(getValueDtype(ff2Linear.getResult()))) {
      return false;
+   }
+ 

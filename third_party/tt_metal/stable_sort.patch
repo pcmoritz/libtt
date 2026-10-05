@@ -1,38 +1,70 @@
-# Port of pcmoritz/libtt#175, adapted to the compile-time TopK direction API.
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
-index 68c51b1..bcd8c93 100644
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
-@@ -23 +23 @@
+@@ -36,13 +36,14 @@ void prepare_uint16_fp32_dest_value_tiles_for_pack(uint32_t dst_tile_a, uint32_t
+  * @param index_transposed_dfb Output circular buffer for transposed index tiles.
+  * @param Wt Number of tiles to process (should be even).
+  * @param switch_dir If true, alternates the sorting direction for each tile pair to build a bitonic sequence.
 - * @param ascending Initial sorting direction: true for ascending, false for descending.
 + * @param initial_dir Initial local sorting direction: true for ascending, false for descending.
-@@ -29,2 +29,3 @@
+  * @param end_phase Indicates the current phase of the bitonic sort (used by the local sort kernel).
+  *
+  * The function assumes that the input and index buffers contain at least Wt tiles,
+  * and that Wt is a multiple of 2. It reserves space in the output buffers, processes
+  * tiles in pairs, and pushes the results to the output buffers upon completion.
   */
 +template <bool stable, bool descending>
  FORCE_INLINE
-@@ -38 +39 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
+ void sort_Wt_tiles_row_to_bitonic_sequence(
+     DataflowBuffer& input_dfb,
+@@ -51,12 +52,12 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
+     DataflowBuffer& index_transposed_dfb,
+     const uint32_t Wt,
+     const bool switch_dir,
 -    const bool ascending,
 +    const bool initial_dir,
-@@ -43 +44 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
+     const int end_phase) {
+     input_transposed_dfb.reserve_back(Wt);
+     index_transposed_dfb.reserve_back(Wt);
+ 
 -    bool ascending_local = ascending;
 +    bool ascending_local = initial_dir;
-@@ -62 +63 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
+     for (uint32_t wt = 0; wt < Wt; wt += 2) {
+         tile_regs_acquire();
+ 
+@@ -75,7 +76,7 @@ void sort_Wt_tiles_row_to_bitonic_sequence(
+         transpose_tile(index_dfb.get_id(), 1, 3);
+ 
+         // llk_topk_sort -> inplace
 -        ckernel::topk_local_sort(0, (int)ascending_local, end_phase);
 +        ckernel::topk_local_sort<stable, descending>(0, (int)ascending_local, end_phase);
+ 
+         // UInt16-in-32b-DEST: mode-9 packer fixup before packing values (#50215).
+         prepare_uint16_fp32_dest_value_tiles_for_pack(0, 1);
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
-index 4380d8d..59a52e5 100644
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
-@@ -30,2 +30,3 @@ void kernel_main() {
+@@ -28,6 +28,7 @@ void kernel_main() {
+     constexpr uint32_t number_of_tiles_per_core = get_arg(args::number_of_tiles_per_core);
+     constexpr uint32_t number_of_cores_used = get_arg(args::number_of_cores_used);
      constexpr bool ascending = get_arg(args::ascending) == 1;
 +    constexpr bool stable = get_arg(args::stable) != 0;
  
-@@ -103,3 +104,3 @@ void kernel_main() {
+     DataflowBuffer input_tensor_dfb(dfb::input_tensor);
+     DataflowBuffer index_tensor_dfb(dfb::index_tensor);
+@@ -96,7 +97,7 @@ void kernel_main() {
+         bool dir = ascending ^ ((core_id & 1) == 1);
+ 
          // Read input value data
 -        sort_Wt_tiles_row_to_bitonic_sequence(
 +        sort_Wt_tiles_row_to_bitonic_sequence<stable, !ascending>(
              input_tensor_dfb,
-@@ -161,19 +162,10 @@ void kernel_main() {
+             index_tensor_dfb,
+             input_tensor_transposed_dfb,
+@@ -153,40 +154,31 @@ void kernel_main() {
+                             copy_tile(dfb::index_tensor_transposed, left_tile_id, index_dest_start);
+                             copy_tile(dfb::index_tensor_transposed, right_tile_id, index_dest_end);
+ 
 -                            uint32_t tile_input_low = input_dest_start;
 -                            uint32_t tile_input_high = input_dest_end;
 -                            uint32_t tile_index_low = index_dest_start;
@@ -57,19 +89,32 @@ index 4380d8d..59a52e5 100644
 +                                } else {
 +                                    ckernel::topk_merge<false, stable, !ascending>(/*idst=*/0, m_iter, /*k=*/32);
                                  }
-@@ -168,3 +160,3 @@ void kernel_main() {
+                             }
+                             // UInt16-in-32b-DEST: mode-9 packer fixup before packing values (#50215).
+-                            prepare_uint16_fp32_dest_value_tiles_for_pack(tile_input_low, tile_input_high);
++                            prepare_uint16_fp32_dest_value_tiles_for_pack(input_dest_start, input_dest_end);
+                             tile_regs_commit();
+                             tile_regs_wait();
+ 
+                             // Pack value tiles to the transposed buffer
                              pack_reconfig_data_format(dfb::input_tensor_transposed);
 -                            pack_tile<true>(tile_input_low, dfb::input_tensor_transposed, left_tile_id);
 -                            pack_tile<true>(tile_input_high, dfb::input_tensor_transposed, right_tile_id);
 +                            pack_tile<true>(input_dest_start, dfb::input_tensor_transposed, left_tile_id);
 +                            pack_tile<true>(input_dest_end, dfb::input_tensor_transposed, right_tile_id);
-@@ -173,3 +165,3 @@ void kernel_main() {
+ 
+                             // Pack index tiles to the transposed buffer
                              pack_reconfig_data_format(dfb::index_tensor_transposed);
 -                            pack_tile<true>(tile_index_low, dfb::index_tensor_transposed, left_tile_id);
 -                            pack_tile<true>(tile_index_high, dfb::index_tensor_transposed, right_tile_id);
 +                            pack_tile<true>(index_dest_start, dfb::index_tensor_transposed, left_tile_id);
 +                            pack_tile<true>(index_dest_end, dfb::index_tensor_transposed, right_tile_id);
-@@ -243,7 +235,10 @@ void kernel_main() {
+ 
+                             tile_regs_release();
+                         }
+@@ -257,15 +249,18 @@ void kernel_main() {
+ 
+                         value_tensor_peer_dfb.pop_front(one_tile);
  
 -                        ckernel::topk_merge(0, m_iter, 32);
 +                        if (dir) {
@@ -84,16 +129,20 @@ index 4380d8d..59a52e5 100644
 +                        // DEST[0] corresponds to the left tile slot in the requested direction.
 +                        const uint32_t keep_left_slot = (i < j);
  
-@@ -260,3 +255,3 @@ void kernel_main() {
+                         uint32_t value_output_tile = input_dest_start;
                          uint32_t index_output_tile = index_dest_start;
 -                        if (!select_lower) {
 +                        if (!keep_left_slot) {
                              value_output_tile = input_dest_end;
+                             index_output_tile = index_dest_end;
+                         }
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
-index 922f7de..3458a7f 100644
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
-@@ -148,21 +148,11 @@ void kernel_main() {
+@@ -154,31 +154,21 @@ void kernel_main() {
+                                 copy_tile(dfb::index_tensor, 1, index_dest_end);
+                             }
+ 
 -                            uint32_t tile_input_low = input_dest_start;
 -                            uint32_t tile_input_high = input_dest_end;
 -                            uint32_t tile_index_low = index_dest_start;
@@ -121,41 +170,64 @@ index 922f7de..3458a7f 100644
 +                                } else {
 +                                    ckernel::topk_merge<false, stable, descending>(/*idst=*/0, m_iter, /*k=*/32);
                                  }
-@@ -186,8 +176,8 @@ void kernel_main() {
-                                 pack_reconfig_data_format(input_tensor_transposed_cb_id);
--                                pack_tile(tile_input_low, input_tensor_transposed_cb_id);
--                                pack_tile(tile_input_high, input_tensor_transposed_cb_id);
-+                                pack_tile(input_dest_start, input_tensor_transposed_cb_id);
-+                                pack_tile(input_dest_end, input_tensor_transposed_cb_id);
+                             }
  
-                                 pack_reconfig_data_format(index_tensor_transposed_cb_id);
--                                pack_tile(tile_index_low, index_tensor_transposed_cb_id);
--                                pack_tile(tile_index_high, index_tensor_transposed_cb_id);
-+                                pack_tile(index_dest_start, index_tensor_transposed_cb_id);
-+                                pack_tile(index_dest_end, index_tensor_transposed_cb_id);
-                                 tile_regs_release();
-@@ -249,8 +239,8 @@ void kernel_main() {
-                                 pack_reconfig_data_format(input_tensor_output_cb_id);
--                                pack_tile(tile_input_low, input_tensor_output_cb_id);
--                                pack_tile(tile_input_high, input_tensor_output_cb_id);
-+                                pack_tile(input_dest_start, input_tensor_output_cb_id);
-+                                pack_tile(input_dest_end, input_tensor_output_cb_id);
+                             // UInt16-in-32b-DEST: mode-9 packer fixup before packing values (#50215).
+-                            prepare_uint16_fp32_dest_value_tiles_for_pack(tile_input_low, tile_input_high);
++                            prepare_uint16_fp32_dest_value_tiles_for_pack(input_dest_start, input_dest_end);
  
-                                 pack_reconfig_data_format(index_tensor_output_cb_id);
--                                pack_tile(tile_index_low, index_tensor_output_cb_id);
--                                pack_tile(tile_index_high, index_tensor_output_cb_id);
-+                                pack_tile(index_dest_start, index_tensor_output_cb_id);
-+                                pack_tile(index_dest_end, index_tensor_output_cb_id);
+                             tile_regs_commit();
+ 
+@@ -196,12 +186,12 @@ void kernel_main() {
+ 
+                                 tile_regs_wait();
+                                 pack_reconfig_data_format(dfb::input_tensor_transposed);
+-                                pack_tile(tile_input_low, dfb::input_tensor_transposed);
+-                                pack_tile(tile_input_high, dfb::input_tensor_transposed);
++                                pack_tile(input_dest_start, dfb::input_tensor_transposed);
++                                pack_tile(input_dest_end, dfb::input_tensor_transposed);
+ 
+                                 pack_reconfig_data_format(dfb::index_tensor_transposed);
+-                                pack_tile(tile_index_low, dfb::index_tensor_transposed);
+-                                pack_tile(tile_index_high, dfb::index_tensor_transposed);
++                                pack_tile(index_dest_start, dfb::index_tensor_transposed);
++                                pack_tile(index_dest_end, dfb::index_tensor_transposed);
                                  tile_regs_release();
+ 
+                                 input_tensor_transposed_dfb.push_back(2 * one_tile);
+@@ -261,12 +251,12 @@ void kernel_main() {
+                                 tile_regs_wait();
+                                 // Process value tiles
+                                 pack_reconfig_data_format(dfb::input_tensor_output);
+-                                pack_tile(tile_input_low, dfb::input_tensor_output);
+-                                pack_tile(tile_input_high, dfb::input_tensor_output);
++                                pack_tile(input_dest_start, dfb::input_tensor_output);
++                                pack_tile(input_dest_end, dfb::input_tensor_output);
+ 
+                                 pack_reconfig_data_format(dfb::index_tensor_output);
+-                                pack_tile(tile_index_low, dfb::index_tensor_output);
+-                                pack_tile(tile_index_high, dfb::index_tensor_output);
++                                pack_tile(index_dest_start, dfb::index_tensor_output);
++                                pack_tile(index_dest_end, dfb::index_tensor_output);
+                                 tile_regs_release();
+ 
+                                 input_tensor_output_dfb.push_back(2 * one_tile);
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
-index 6d2b5eb..aa0cc14 100644
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
-@@ -183,2 +183,2 @@ void kernel_main() {
+@@ -176,7 +176,7 @@ void kernel_main() {
+         }
+ #endif
+ 
 -        sort_Wt_tiles_row_to_bitonic_sequence(
 +        sort_Wt_tiles_row_to_bitonic_sequence<stable, descending>(
              input_tensor_dfb,
-@@ -237,19 +237,10 @@ void kernel_main() {
+             index_tensor_dfb,
+             input_tensor_transposed_dfb,
+@@ -230,40 +230,31 @@ void kernel_main() {
+                         copy_tile(dfb::input_tensor_transposed, left_tile_id, input_dest_start);
+                         copy_tile(dfb::input_tensor_transposed, right_tile_id, input_dest_end);
+ 
 -                        uint32_t tile_input_low = input_dest_start;
 -                        uint32_t tile_input_high = input_dest_end;
 -                        uint32_t tile_index_low = index_dest_start;
@@ -180,45 +252,69 @@ index 6d2b5eb..aa0cc14 100644
 +                            } else {
 +                                ckernel::topk_merge<false, stable, descending>(/*idst=*/0, m_iter, /*k=*/64);
                              }
-@@ -244,3 +235,3 @@ void kernel_main() {
+                         }
+ 
+                         // UInt16-in-32b-DEST: mode-9 packer fixup before packing values (#50215).
+-                        prepare_uint16_fp32_dest_value_tiles_for_pack(tile_input_low, tile_input_high);
++                        prepare_uint16_fp32_dest_value_tiles_for_pack(input_dest_start, input_dest_end);
+ 
+                         tile_regs_commit();
+                         tile_regs_wait();
+ 
                          pack_reconfig_data_format(dfb::input_tensor_transposed);
 -                        pack_tile<true>(tile_input_low, dfb::input_tensor_transposed, left_tile_id);
 -                        pack_tile<true>(tile_input_high, dfb::input_tensor_transposed, right_tile_id);
 +                        pack_tile<true>(input_dest_start, dfb::input_tensor_transposed, left_tile_id);
 +                        pack_tile<true>(input_dest_end, dfb::input_tensor_transposed, right_tile_id);
-@@ -249,3 +240,3 @@ void kernel_main() {
+ 
                          pack_reconfig_data_format(dfb::index_tensor_transposed);
 -                        pack_tile<true>(tile_index_low, dfb::index_tensor_transposed, left_tile_id);
 -                        pack_tile<true>(tile_index_high, dfb::index_tensor_transposed, right_tile_id);
 +                        pack_tile<true>(index_dest_start, dfb::index_tensor_transposed, left_tile_id);
 +                        pack_tile<true>(index_dest_end, dfb::index_tensor_transposed, right_tile_id);
+ 
+                         synchronization_dfb.push_back(one_tile);
+ 
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
-index 3a76dff..7a13b16 100644
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
-@@ -1128,2 +1128,3 @@ ttnn::device_operation::ProgramArtifacts SortProgramFactoryCrossCoreDataExchange
+@@ -1322,6 +1322,7 @@ ttnn::device_operation::ProgramArtifacts SortProgramFactoryCrossCoreDataExchange
+                 {"number_of_tiles_per_core", number_of_tiles_per_core},
+                 {"number_of_cores_used", all_core_utilization_count},
                  {"ascending", static_cast<uint32_t>(!attributes.descending)},
 +                {"stable", static_cast<uint32_t>(attributes.stable)},
                  {"W_value_slice_bytes", W_value_slice_bytes},
+                 {"W_index_slice_bytes", W_index_slice_bytes},
+                 // The peer exchange moves TILE-format tiles in both configurations, but in ROW_MAJOR
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
-index 153d6a1..c7efd85 100644
 --- ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
-@@ -8,2 +8,3 @@
+@@ -6,6 +6,7 @@
+ #include "device/sort_device_operation.hpp"
+ 
  #include "ttnn/operations/core/core.hpp"
 +#include "ttnn/operations/copy/typecast/typecast.hpp"
  #include "ttnn/operations/creation/creation.hpp"
-@@ -232,4 +233,2 @@ std::vector<Tensor> sort(
+ #include "ttnn/operations/data_movement/fill_pad/fill_pad.hpp"
+ #include "ttnn/operations/data_movement/pad/pad.hpp"
+@@ -244,8 +245,6 @@ std::vector<Tensor> sort(
+     const bool stable,
+     const std::optional<MemoryConfig>& memory_config,
      std::optional<std::tuple<Tensor&, Tensor&>> optional_output_tensors) {
 -    TT_FATAL(!stable, "ttnn::sort: stable=True is not yet implemented.");
 -
      const ttnn::Shape& original_lshape = input_tensor.logical_shape();
-@@ -297,3 +296,3 @@ std::vector<Tensor> sort(
+     const auto rank = input_tensor.logical_shape().rank();
+ 
+@@ -311,10 +310,19 @@ std::vector<Tensor> sort(
+     // is still sharded when it is called.  We capture the user-requested output
+     // memory config in sort_mem_cfg above before doing this conversion so that
      // the output can be converted back to the sharded config after sorting.
 -    const Tensor transform_input = input_tensor.memory_config().is_sharded()
 +    const Tensor unsharded_input = input_tensor.memory_config().is_sharded()
                                         ? ttnn::to_memory_config(input_tensor, ttnn::DRAM_MEMORY_CONFIG)
-@@ -302 +301,10 @@ std::vector<Tensor> sort(
+                                        : input_tensor;
+ 
 +    // The SFPU bitonic primitive compares BF16/FP32 values. IEEE Float16 is
 +    // exactly representable in Float32, so promote it once around the device
 +    // sort instead of teaching every compare/merge and padding stage a second
@@ -229,14 +325,25 @@ index 153d6a1..c7efd85 100644
 +        promote_float16 ? ttnn::typecast(unsharded_input, DataType::FLOAT32) : unsharded_input;
 +
      Tensor padded_input_tensor =
-@@ -318,3 +325,3 @@ std::vector<Tensor> sort(
+         dm::pre_sort_transform_tensor(transform_input, dim, is_dim_last_idx, is_rank_le_4d, descending);
+     const MemoryConfig device_op_mem_cfg = sort_mem_cfg.is_sharded() ? ttnn::DRAM_MEMORY_CONFIG : sort_mem_cfg;
+@@ -332,7 +340,7 @@ std::vector<Tensor> sort(
+         const auto& out1 = std::get<1>(*optional_output_tensors);
+         const bool values_layout_match = (out0.layout() == padded_input_tensor.layout());
          const bool indices_layout_match = (out1.layout() == padded_input_tensor.layout());
 -        preallocated_layout_mismatch = !values_layout_match || !indices_layout_match;
 +        preallocated_layout_mismatch = promote_float16 || !values_layout_match || !indices_layout_match;
          if (!preallocated_layout_mismatch) {
-@@ -337 +344,5 @@ std::vector<Tensor> sort(
+             const auto canonicalize_output = [&](const Tensor& t) {
+                 return dm::pre_sort_transform_tensor(t, dim, is_dim_last_idx, is_rank_le_4d, descending);
+@@ -350,6 +358,10 @@ std::vector<Tensor> sort(
+     auto results = dm::post_sort_transform_tensor(
+         input_tensor, sorted_tensors, dim, is_dim_last_idx, original_lshape, device_op_mem_cfg);
+ 
 +    if (promote_float16) {
 +        results[0] = ttnn::typecast(results[0], DataType::FLOAT16);
 +    }
 +
      // The device op always writes to DRAM when sort_mem_cfg is sharded (to avoid
+     // shard-spec conflicts with the W-padded intermediate tensor shape).  After
+     // the post-transform slice has restored the original W dimension, convert back

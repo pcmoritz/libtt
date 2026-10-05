@@ -1,8 +1,7 @@
 diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
-index 156ab6f..4ca3c8f 100644
 --- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 +++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
-@@ -353,26 +353,12 @@ static TraceVariant captureTrace(
+@@ -350,26 +350,12 @@ static TraceVariant captureTrace(
  static void executeTrace(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
                           ProgramContext &context,
                           TraceVariant &variant) {

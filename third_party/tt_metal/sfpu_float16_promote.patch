@@ -210,9 +210,9 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_type
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factory.cpp
-@@ -26,12 +26,9 @@ tt::tt_metal::ProgramDescriptor TypecastProgramFactory::create_descriptor(
- 
-     tt::tt_metal::ProgramDescriptor desc;
+@@ -90,12 +90,9 @@ ttnn::device_operation::ProgramArtifacts TypecastProgramFactory::create_program_
+     const DataType& output_dtype = args.output_dtype;
+     const bool is_row_major = input.layout() == Layout::ROW_MAJOR;
  
 -    const tt::DataFormat cb_data_format_input =
 -        args.input_dtype == DataType::FLOAT16 && args.output_dtype == DataType::FLOAT32
@@ -225,9 +225,9 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factor
      const uint32_t single_tile_size_output = tt::tile_size(cb_data_format_output);
  
      const auto* device = input.device();
-@@ -207,9 +204,9 @@ tt::tt_metal::ProgramDescriptor TypecastSubgridProgramFactory::create_descriptor
+@@ -252,9 +249,9 @@ ttnn::device_operation::ProgramArtifacts TypecastSubgridProgramFactory::create_p
  
-     tt::tt_metal::ProgramDescriptor desc;
+     TT_FATAL(sub_core_grids.has_value(), "sub_core_grids cannot be null");
  
 -    tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
 +    tt::DataFormat cb_data_format = typecast_input_format(input_dtype, output_dtype);
@@ -236,13 +236,13 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factor
 +    tt::DataFormat cb_data_format_output = typecast_output_format(input_dtype, output_dtype);
      uint32_t single_tile_size_output = tt::tile_size(cb_data_format_output);
  
-     uint32_t ntiles = input.physical_volume() / tt::constants::TILE_HW;
+     const auto* device = input.device();
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_program_factory.cpp
-@@ -76,12 +76,9 @@ tt::tt_metal::ProgramDescriptor TypecastRowMajorChunkedProgramFactory::create_de
+@@ -76,12 +76,9 @@ ttnn::device_operation::ProgramArtifacts TypecastRowMajorChunkedProgramFactory::
  
-     tt::tt_metal::ProgramDescriptor desc;
+     TT_FATAL(input.layout() == Layout::ROW_MAJOR, "This factory is only for ROW_MAJOR layout");
  
 -    const tt::DataFormat cb_data_format_input =
 -        input_dtype == DataType::FLOAT16 && output_dtype == DataType::FLOAT32
@@ -258,7 +258,7 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_rm_chunked_pro
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_program_factory.cpp
-@@ -36,8 +36,8 @@ tt::tt_metal::ProgramDescriptor TypecastShardedProgramFactory::create_descriptor
+@@ -39,8 +39,8 @@ ttnn::device_operation::ProgramArtifacts TypecastShardedProgramFactory::create_p
          out_shard_spec.num_cores(),
          ncores);
  
@@ -325,13 +325,10 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
-@@ -877,9 +877,23 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -877,11 +877,25 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
           operation_attributes.binary_op_type == BinaryOpType::GT ||
           operation_attributes.binary_op_type == BinaryOpType::LE ||
           operation_attributes.binary_op_type == BinaryOpType::GE);
--    const auto a_data_format = datatype_to_dataformat_converter(a_dtype);
--    const auto b_data_format = datatype_to_dataformat_converter(b_dtype);
--    const auto c_data_format = datatype_to_dataformat_converter(c_dtype);
 +    const bool promote_narrow_float =
 +        is_sfpu_op && !is_fp16_comparison && unary::utils::uses_raw_16bit_sfpu_path(a_dtype) &&
 +        a_dtype == b_dtype && a_dtype == c_dtype &&
@@ -340,8 +337,14 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
 +    const bool exact_fp16_binary_output =
 +        a_dtype == DataType::FLOAT16 && b_dtype == DataType::FLOAT16 && c_dtype == DataType::FLOAT16 &&
 +        (promote_narrow_float || !is_sfpu_op);
-+    const auto a_data_format =
-+        promote_narrow_float_inputs ? unary::utils::raw_16bit_sfpu_format : datatype_to_dataformat_converter(a_dtype);
+     // Int8 quant input (dequant/requant operand A) is read through the UInt8 unpacker.
+-    const auto a_data_format =
+-        (is_quant_op && a_dtype == DataType::INT8) ? tt::DataFormat::UInt8 : datatype_to_dataformat_converter(a_dtype);
+-    const auto b_data_format = datatype_to_dataformat_converter(b_dtype);
+-    const auto c_data_format = datatype_to_dataformat_converter(c_dtype);
++    const auto a_data_format = promote_narrow_float_inputs ? unary::utils::raw_16bit_sfpu_format
++                               : (is_quant_op && a_dtype == DataType::INT8) ? tt::DataFormat::UInt8
++                                                                            : datatype_to_dataformat_converter(a_dtype);
 +    const auto b_data_format =
 +        promote_narrow_float_inputs ? unary::utils::raw_16bit_sfpu_format : datatype_to_dataformat_converter(b_dtype);
 +    // Promoted SFPU and FPU operations can leave infinity in FP32 DST,
@@ -349,10 +352,10 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
 +    const auto c_data_format = promote_narrow_float || exact_fp16_binary_output
 +                                   ? unary::utils::raw_16bit_sfpu_format
 +                                   : datatype_to_dataformat_converter(c_dtype);
+     // Int8 output is packed through the UInt8 packer path.
+     const auto c_pack_data_format = (c_dtype == DataType::INT8) ? tt::DataFormat::UInt8 : c_data_format;
  
-     uint32_t a_single_tile_size = tt::tile_size(a_data_format);
-     uint32_t b_single_tile_size = tt::tile_size(b_data_format);
-@@ -899,7 +913,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -903,7 +917,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
      const auto op_config = is_sfpu_op ? OpConfig(op_type, std::in_place_type<OpConfig::SfpuBinaryOp>, a_dtype)
                                        : OpConfig(op_type, std::in_place_type<OpConfig::FpuBinaryOp>, a_dtype);
  
@@ -361,7 +364,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
  
      // Quant/requant rounding depends on the output dtype. For uint8, we need fp32->uint8 rounding instead
      // of the default fp32->int8. The packer narrows the int32 SFPU result to uint8.
-@@ -926,6 +940,12 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -953,6 +967,12 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
          ttsl::SmallVector<unary::EltwiseUnaryWithParam> rhs_activations = operation_attributes.rhs_activations;
          ttsl::SmallVector<unary::EltwiseUnaryWithParam> post_activations = operation_attributes.post_activations;
  
@@ -374,7 +377,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
          if (op_config.process_lhs.has_value()) {
              lhs_activations.push_back(*op_config.process_lhs);
          }
-@@ -954,6 +974,9 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -981,6 +1001,9 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
          if (op_config.postprocess.has_value()) {
              post_activations.insert(post_activations.begin(), *op_config.postprocess);
          }
@@ -384,7 +387,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
  
          bool is_integer_division =
              (operation_attributes.binary_op_type == BinaryOpType::DIV && a_dtype == DataType::INT32 &&
-@@ -1042,9 +1065,10 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1069,9 +1092,10 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
      }
  
      if (not compute_kernel_defines["PROCESS_LHS_ACTIVATIONS(i)"].empty()) {
@@ -398,7 +401,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
          uint32_t a_intermediate_single_tile_size = tt::tile_size(a_intermediate_format);
          desc.cbs.push_back(CBDescriptor{
              .total_size = a_intermediate_single_tile_size * num_tiles_per_cycle,
-@@ -1073,9 +1097,10 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1100,9 +1124,10 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
      }
  
      if (not compute_kernel_defines["PROCESS_RHS_ACTIVATIONS(i)"].empty()) {
@@ -412,7 +415,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
          uint32_t b_intermediate_single_tile_size = tt::tile_size(b_intermediate_format);
          desc.cbs.push_back(CBDescriptor{
              .total_size = b_intermediate_single_tile_size * num_tiles_per_cycle,
-@@ -1192,9 +1217,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1219,9 +1244,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
                              b_data_format == tt::DataFormat::Float32 ||
                              (a_data_format == tt::DataFormat::Int32 && b_data_format == tt::DataFormat::Int32) ||
                              (a_data_format == tt::DataFormat::UInt32 && b_data_format == tt::DataFormat::UInt32) ||
@@ -424,7 +427,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
  
      uint32_t src0_cb_index = tt::CBIndex::c_0;
      uint32_t src1_cb_index = tt::CBIndex::c_1;
-@@ -1203,14 +1227,16 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1230,14 +1254,16 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
  
      std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
  
@@ -446,7 +449,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
          } else {
              unpack_to_dest_mode[src0_cb_index] =
                  (a_dtype == DataType::FLOAT32) ? tt::tt_metal::UnpackToDestMode::UnpackToDestFp32 : tt::tt_metal::UnpackToDestMode::Default;
-@@ -1258,7 +1284,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1285,7 +1311,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
      // Fall back to software broadcast for this combination - non-broadcast u16
      // relational ops and broadcasted arithmetic u16 ops (no postprocess) are
      // unaffected.
@@ -511,7 +514,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp ttnn
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-@@ -118,10 +118,32 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+@@ -358,10 +358,32 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
      const auto& input = tensor_args.input;
      const auto& ops_chain = operation_attributes.op_chain;
      TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
@@ -545,7 +548,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
      uint32_t packed_scalar1 = 0;
      uint32_t packed_scalar2 = 0;
  
-@@ -129,9 +151,12 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+@@ -369,9 +391,12 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
  
      const bool is_row_major = input.layout() == Layout::ROW_MAJOR;
  
@@ -560,7 +563,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
      if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
          cb_data_format_output = DataFormat::UInt16;
      }
-@@ -184,7 +209,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+@@ -424,7 +449,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
      }
  
      const bool math_approx_mode = false;

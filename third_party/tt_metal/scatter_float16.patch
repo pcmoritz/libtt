@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
 --- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
 +++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
-@@ -25,6 +25,11 @@ struct df_to_std<DataFormat::Float16_b> {
+@@ -31,6 +31,11 @@ struct df_to_std<DataFormat::Float16_b> {
      using std_type = uint16_t;
  };
  

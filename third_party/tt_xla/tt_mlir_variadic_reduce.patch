@@ -1,6 +1,7 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -267,6 +267,17 @@
+@@ -267,6 +267,17 @@ public:
        return legalityResult;
      }
  
@@ -18,7 +19,7 @@
      const mlir::Operation &innerOp = srcOp.getBody().front().front();
  
      if (mlir::isa<mlir::stablehlo::AddOp>(innerOp)) {
-@@ -293,14 +304,6 @@
+@@ -293,14 +304,6 @@ public:
        return matchAndRewriteInternal<mlir::tt::ttir::ReduceOrOp>(srcOp, adaptor,
                                                                   rewriter);
      }
@@ -33,7 +34,7 @@
      return failure();
    }
  
-@@ -371,6 +367,79 @@
+@@ -364,6 +367,79 @@ private:
      return success();
    }
  
@@ -111,5 +112,5 @@
 +  }
 +
    LogicalResult
-   matchAndRewriteInternalArgMax(
-       mlir::stablehlo::ReduceOp &srcOp, mlir::Value input,
+   matchAndRewriteInternalArgMax(mlir::stablehlo::ReduceOp &srcOp,
+                                 mlir::Value input,

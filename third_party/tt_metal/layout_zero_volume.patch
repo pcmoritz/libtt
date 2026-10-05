@@ -1,13 +1,46 @@
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "typecast.hpp"
+ #include "ttnn/operations/copy/typecast/device/typecast_device_op.hpp"
++#include "ttnn/operations/creation/creation.hpp"
+ #include "ttnn/operations/core/core.hpp"  // for to_dtype
+ #include "ttnn/tensor/tensor_utils.hpp"   // for is_cpu_tensor
+ 
+@@ -27,6 +28,17 @@ inline Tensor typecast_impl(
+         // For host tensors, memory_config is not applicable, so we ignore it
+         return ttnn::to_dtype(input_tensor, output_dtype);
+     }
++    if (input_tensor.logical_volume() == 0) {
++        if (optional_output_tensor.has_value()) {
++            return *optional_output_tensor;
++        }
++        return ttnn::empty(
++            input_tensor.logical_shape(),
++            output_dtype,
++            input_tensor.layout(),
++            input_tensor.device(),
++            memory_config.value_or(input_tensor.memory_config()));
++    }
+ 
+     // Device tensor path
+     DataType input_dtype = input_tensor.dtype();
 diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
-@@ -7,4 +7,5 @@
+@@ -6,6 +6,7 @@
+ 
  #include "device/tilize_device_operation.hpp"
  #include "ttnn/operations/core/core.hpp"
 +#include "ttnn/operations/creation/creation.hpp"
  #include "ttnn/operations/data_movement/common/common.hpp"
  #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
-@@ -52,2 +53,10 @@ ttnn::Tensor tilize(
+ 
+@@ -50,6 +51,14 @@ ttnn::Tensor tilize(
+     bool use_low_perf,
+     tt::tt_metal::Tile tile,
      const std::optional<CoreRangeSet>& sub_core_grids) {
 +    if (input_tensor.logical_volume() == 0) {
 +        return ttnn::empty(
@@ -18,16 +51,22 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp ttnn/cpp/ttn
 +            memory_config.value_or(input_tensor.memory_config()));
 +    }
      tt::DataFormat input_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
+     uint32_t input_single_tile_size = tile.get_tile_size(input_cb_data_format);
+     uint32_t output_single_tile_size =
 diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
-@@ -7,4 +7,5 @@
+@@ -9,6 +9,7 @@
  #include "device/untilize_device_operation.hpp"
+ #include "untilize_force.hpp"
  #include "ttnn/operation.hpp"
 +#include "ttnn/operations/creation/creation.hpp"
  #include "ttnn/operations/data_movement/common/common.hpp"
  #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
-@@ -46,2 +47,13 @@ ttnn::Tensor untilize(
+ #include "ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.hpp"
+@@ -46,6 +47,17 @@ ttnn::Tensor untilize_native(
+     const std::optional<MemoryConfig>& memory_config,
+     bool use_multicore,
      const std::optional<CoreRangeSet>& sub_core_grids) {
 +    if (input_tensor.logical_volume() == 0) {
 +        return ttnn::empty(
@@ -41,26 +80,5 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp ttnn/cpp
 +    }
 +
      // If the input tensor is not sharded, on DRAM and logical shape != padded shape, then unpad the input tensor.
-diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
---- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
-+++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
-@@ -6,2 +6,3 @@
- #include "ttnn/operations/copy/typecast/device/typecast_device_op.hpp"
-+#include "ttnn/operations/creation/creation.hpp"
- #include "ttnn/operations/core/core.hpp"  // for to_dtype
-@@ -27,3 +28,14 @@ inline Tensor typecast_impl(
-     }
--
-+    if (input_tensor.logical_volume() == 0) {
-+        if (optional_output_tensor.has_value()) {
-+            return *optional_output_tensor;
-+        }
-+        return ttnn::empty(
-+            input_tensor.logical_shape(),
-+            output_dtype,
-+            input_tensor.layout(),
-+            input_tensor.device(),
-+            memory_config.value_or(input_tensor.memory_config()));
-+    }
-+
-     // Device tensor path
+     // conv op_slicing logic requires the padding information to be present in the input tensor.
+     if (!input_tensor.is_sharded() && input_tensor.memory_config().is_dram() &&

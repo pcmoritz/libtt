@@ -1,19 +1,27 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5257,3 +5257,3 @@ class StableHLOGatherToEmbeddingPattern
+@@ -5273,7 +5273,7 @@ class StableHLOGatherToEmbeddingPattern
+    * transformation:
+    * - start indices tensor isn't 1D when we are indexing multiple dims
     * - operandBatchingDims and startIndicesBatchingDims are none
 -   * - sliceSizes are fullDim for dimensions we are not indexing
 +   * - non-indexed dimensions are sliced from zero when needed
     * - for dimensions we are indexing, sliceSizes must fit into one of:
-@@ -5476,6 +5476,2 @@ public:
+    *   - all sliceSizes are 1
+    *   - all sliceSizes are fullDim except one which can be anything
+@@ -5526,16 +5526,15 @@ public:
+         } else if (sliceSizes[i] != 1) {
+           partialIndexedDims++;
          }
 -      } else if (sliceSizes[i] != inputShape[i]) {
 -        return rewriter.notifyMatchFailure(
 -            srcOp, "Did not satisfy sliceSizes[i] = inputShape[i] for dims not "
 -                   "in startIndexMap");
        }
-@@ -5485,3 +5481,6 @@ public:
+     }
+ 
+     size_t remainingIndexedDims =
          startIndexMap.size() - fullIndexedDims - singletonIndexedDims;
 -    if (partialIndexedDims && (remainingIndexedDims != 1)) {
 +    IndexedDimInfo info = computeIndexedDimInfo(srcOp);
@@ -21,7 +29,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        (partialIndexedDims != 1 || info.startIndexMap.empty() ||
 +         sliceSizes[info.startIndexMap.back()] == 1)) {
        return rewriter.notifyMatchFailure(
-@@ -5522,3 +5521,26 @@ public:
+           srcOp,
+           "Did not satisfy slice conditions for dimensions in startIndexMap");
+@@ -5572,7 +5571,30 @@ public:
+            "gather lowering requires at least one flattened indexing dim");
+ 
      // Use adapted operands for building new ops (type-converted values).
 -    auto input = adaptor.getOperands()[0];
 +    Value input = adaptor.getOperands()[0];
@@ -49,7 +61,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
 +
      auto inputPermuted = permuteInput(
-@@ -5547,4 +5569,7 @@ public:
+         rewriter,
+         ttmlir::utils::appendLocationSuffix(srcOp->getLoc(), "_permuteInput"),
+@@ -5597,8 +5619,11 @@ public:
+       auto flattenedIndices = flattenStartIndices(
+           rewriter, inputPermuted.getType().getShape(), srcOp.getOperand(),
            startIndices, originalStartIndexMap, indexVectorDim);
 -      startIndices = mlir::cast<mlir::TypedValue<mlir::RankedTensorType>>(
 -          flattenedIndices.getResult());
@@ -59,18 +75,26 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      startIndices = rewriter.create<ttir::TypecastOp>(
 +          srcOp.getLoc(), flattenedType, flattenedIndices);
      } else if (originalStartIndexMap.size() != numIndexingDims) {
-@@ -5589,3 +5614,4 @@ public:
+       startIndices =
+           sliceStartIndices(rewriter,
+@@ -5639,7 +5664,8 @@ public:
+     return GatherOperands{mlir::cast<mlir::TypedValue<mlir::RankedTensorType>>(
+                               reshapedInput.getResult()),
                            startIndices, std::move(newOutputShape),
 -                          startIndexMap[0]};
 +                          needsExpansion ? originalStartIndexMap[actualIndexedDim]
 +                                         : startIndexMap[0]};
    }
-@@ -6141,18 +6167,8 @@ public:
+ 
+   // In StableHLO, startIndexMap attribute refers to which dims of input
+@@ -6191,22 +6217,12 @@ public:
+     auto outputType = mlir::cast<RankedTensorType>(
+         getTypeConverter()->convertType(srcOp.getResult().getType()));
      auto outputShape = outputType.getShape();
 +    bool needsOutputReshape = outputShape.size() != operandShape.size();
 +    SmallVector<int64_t> gatherShape(
 +        needsOutputReshape ? operandShape : outputShape);
-
+ 
 -    // Output rank must match operand rank for gather_dim semantics.
 -    if (static_cast<int64_t>(outputShape.size()) !=
 -        static_cast<int64_t>(operandShape.size())) {
@@ -87,7 +111,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto startIndices = adaptor.getOperands()[1];
 -
      SmallVector<int64_t> reshapedIndicesShape;
-@@ -6164,25 +6180,46 @@ public:
+     for (int64_t i = 0; i < static_cast<int64_t>(startIndicesShape.size());
+          ++i) {
+@@ -6214,29 +6230,50 @@ public:
+         reshapedIndicesShape.push_back(startIndicesShape[i]);
+       }
      }
 +    SmallVector<int64_t> indicesShape(reshapedIndicesShape);
 +
@@ -119,7 +147,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      gatherShape[indexedDim] = flattenedIndexSize;
 +      indicesShape[indexedDim] = flattenedIndexSize;
 +    }
-
+ 
      Value indices = startIndices;
 -    if (static_cast<int64_t>(reshapedIndicesShape.size()) !=
 -        static_cast<int64_t>(startIndicesShape.size())) {
@@ -136,7 +164,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -              llvm::to_vector_of<int32_t>(reshapedIndicesShape)));
 +              llvm::to_vector_of<int32_t>(indicesShape)));
      }
-
+ 
 -    // Step 2: If the output has more dimensions than our reshaped indices
 -    // (due to offset dims), we need to unsqueeze and broadcast.
 -    // e.g. indices: 256x1, output: 256x1x3 -> unsqueeze to 256x1x1,
@@ -150,7 +178,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    if (indicesShape.size() < gatherShape.size()) {
 +      SmallVector<int64_t> unsqueezedShape(indicesShape);
        for (int64_t od : offsetDims) {
-@@ -6233,21 +6270,152 @@ public:
+         unsqueezedShape.insert(unsqueezedShape.begin() + od, 1);
+       }
+@@ -6249,25 +6286,156 @@ public:
+           srcOp.getLoc(), unsqueezedType, indices,
+           rewriter.getI32ArrayAttr(
                llvm::to_vector_of<int32_t>(unsqueezedShape)));
 +      indicesShape = std::move(unsqueezedShape);
 +    }
@@ -316,7 +348,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -
 +        rewriter.getI32IntegerAttr(static_cast<int32_t>(gatherDim)));
      return success();
-@@ -10421,2 +10587,3 @@ static void addGatherOpConversionPattern
+   }
+ };
+@@ -10855,6 +11023,7 @@ static void addGatherOpConversionPattern(MLIRContext *ctx,
+                                          TypeConverter &typeConverter) {
+   patterns.add<StableHLOGatherToDynamicSlicePattern>(typeConverter, ctx);
    patterns.add<StableHLOGatherToGatherDimPattern>(typeConverter, ctx);
 +  patterns.add<StableHLOGatherWindowToGatherDimPattern>(typeConverter, ctx);
    patterns.add<StableHLOGatherToSliceRepeatConcatPattern>(typeConverter, ctx);
+   patterns.add<StableHLOGatherToEmbeddingPattern>(typeConverter, ctx);
+   patterns.add<StableHLOGatherIntToGatherPattern>(typeConverter, ctx);
