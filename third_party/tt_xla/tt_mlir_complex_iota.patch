@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 --- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
-@@ -87,6 +87,42 @@ static Value transposeLeadingToTrailing(Location loc, Value input,
+@@ -92,6 +92,42 @@ static Value transposeLeadingToTrailing(Location loc, Value input,
        .getResult();
  }
  
@@ -44,11 +44,18 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
  // ---------------------------------------------------------------------------
  // Conversion patterns
  // ---------------------------------------------------------------------------
-@@ -118,34 +154,44 @@ public:
+@@ -122,35 +158,45 @@ public:
+   matchAndRewrite(mlir::stablehlo::ComplexOp op, OpAdaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
      Location loc = op.getLoc();
 -    auto lhsType = mlir::cast<RankedTensorType>(adaptor.getLhs().getType());
--
++    rewriter.replaceOp(op, packRealImag(loc, adaptor.getLhs(),
++                                        adaptor.getRhs(), rewriter));
++    return success();
++  }
++};
++} // namespace
+ 
 -    SmallVector<int64_t> unsqueezedShape;
 -    unsqueezedShape.push_back(1);
 -    for (auto d : lhsType.getShape()) {
@@ -65,24 +72,6 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 -    concatShape.push_back(2);
 -    for (auto d : lhsType.getShape()) {
 -      concatShape.push_back(d);
--    }
--    auto concatType =
--        RankedTensorType::get(concatShape, lhsType.getElementType());
--    auto concatOp = rewriter.create<mlir::stablehlo::ConcatenateOp>(
--        loc, concatType,
--        ValueRange{reshapedLhs.getResult(), reshapedRhs.getResult()},
--        /*dimension=*/0);
--
--    auto transposed =
--        transposeLeadingToTrailing(loc, concatOp.getResult(), rewriter);
--    rewriter.replaceOp(op, transposed);
-+    rewriter.replaceOp(op, packRealImag(loc, adaptor.getLhs(),
-+                                        adaptor.getRhs(), rewriter));
-+    return success();
-+  }
-+};
-+} // namespace
-+
 +// Rewrites a complex stablehlo.iota as a real iota paired with an all-zero
 +// imaginary tensor. Merely changing the iota result to tensor<...x2xf32>
 +// would incorrectly generate the iota value in both component lanes.
@@ -101,8 +90,17 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +        mlir::dyn_cast<mlir::ComplexType>(originalType.getElementType());
 +    if (!complexType) {
 +      return failure();
-+    }
-+
+     }
+-    auto concatType =
+-        RankedTensorType::get(concatShape, lhsType.getElementType());
+-    auto concatOp = rewriter.create<mlir::stablehlo::ConcatenateOp>(
+-        loc, concatType,
+-        ValueRange{reshapedLhs.getResult(), reshapedRhs.getResult()},
+-        /*dimension=*/0);
+ 
+-    auto transposed =
+-        transposeLeadingToTrailing(loc, concatOp.getResult(), rewriter);
+-    rewriter.replaceOp(op, transposed);
 +    auto componentType = RankedTensorType::get(
 +        originalType.getShape(), complexType.getElementType());
 +    Value real = rewriter.create<mlir::stablehlo::IotaOp>(
@@ -118,23 +116,28 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
      return success();
    }
  };
-@@ -533,7 +579,8 @@ struct StableHLOComplexDataTypeConversionPass
+@@ -533,7 +579,9 @@ struct StableHLOComplexDataTypeConversionPass
          mlir::stablehlo::ConstantOp, mlir::stablehlo::ReshapeOp,
          mlir::stablehlo::SliceOp, mlir::stablehlo::GatherOp,
          mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
 -        mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp>(
 +        mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
-+        mlir::stablehlo::IotaOp>(
++        mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp,
++        mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp>(
          isNotComplexType);
  
      target.addIllegalOp<mlir::stablehlo::ComplexOp, mlir::stablehlo::RealOp,
-@@ -568,7 +615,8 @@ struct StableHLOComplexDataTypeConversionPass
-     RewritePatternSet patterns(&getContext());
+@@ -575,9 +623,13 @@ struct StableHLOComplexDataTypeConversionPass
      patterns.add<
          ComplexBroadcastInDimOpConversionPattern,
--        ComplexConstantOpConversionPattern, ComplexGatherOpConversionPattern,
-+        ComplexConstantOpConversionPattern, ComplexGatherOpConversionPattern,
+         ComplexConstantOpConversionPattern, ComplexGatherOpConversionPattern,
 +        ComplexIotaOpConversionPattern,
          ComplexSliceOpConversionPattern,
++        ComplexTypeDefaultConversionPattern<mlir::stablehlo::AddOp>,
          ComplexTypeDefaultConversionPattern<mlir::stablehlo::ConcatenateOp>,
++        ComplexTypeDefaultConversionPattern<mlir::stablehlo::NegOp>,
          ComplexTypeDefaultConversionPattern<mlir::stablehlo::ReshapeOp>,
++        ComplexTypeDefaultConversionPattern<mlir::stablehlo::SubtractOp>,
+         ComplexPassthroughConversionPattern<mlir::stablehlo::AllToAllOp>,
+         ComplexPassthroughConversionPattern<mlir::stablehlo::CompositeOp>,
+         ShardyManualComputationComplexConversionPattern,
