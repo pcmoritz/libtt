@@ -57,3 +57,50 @@ def test_sort_and_argsort_int32_keys(dtype, descending):
         expected_indices = np.argsort(keys, axis=-1, kind="stable")
     np.testing.assert_array_equal(values, expected)
     np.testing.assert_array_equal(indices, expected_indices)
+
+
+_BOUNDARY_KEYS = {
+    jnp.int32: [-(2**31), -65537, -65536, -65535, -1, 0, 1, 65535, 65536, 65537, 2**31 - 1],
+    jnp.uint32: [0, 1, 65535, 65536, 65537, 2**31 - 1, 2**31, 2**32 - 65536, 2**32 - 1],
+}
+
+
+def _boundary_keys(dtype, shape, dimension):
+    """Keys around the 16-bit radix boundaries, each value repeated along `dimension`."""
+    rng = np.random.default_rng(1)
+    pool = np.array(_BOUNDARY_KEYS[dtype], dtype=np.int64)
+    keys = rng.choice(pool, size=shape)
+    # Make sure every boundary value occurs at least twice in each slice.
+    reps = np.resize(np.repeat(pool, 2), shape[dimension])
+    keys[(slice(None),) * dimension + (slice(0, reps.size),)] = np.expand_dims(
+        reps, tuple(i for i in range(len(shape)) if i != dimension)
+    )
+    keys = np.take_along_axis(keys, rng.permuted(np.indices(shape)[dimension], axis=dimension), dimension)
+    return keys.astype(dtype)
+
+
+@pytest.mark.parametrize("dtype", [jnp.int32, jnp.uint32])
+@pytest.mark.parametrize("shape,dimension", [((300, 3), 0), ((2, 3, 40, 2, 2), 2)])
+def test_sort_int32_boundary_keys_with_integer_values(dtype, shape, dimension):
+    keys = _boundary_keys(dtype, shape, dimension)
+    payload = np.arange(keys.size, dtype=np.int32).reshape(shape) * 4099 - 2**30
+    sorted_keys, sorted_payload = jax.jit(
+        lambda k, p: lax.sort((k, p), dimension=dimension, num_keys=1, is_stable=True)
+    )(keys, payload)
+    order = np.argsort(keys, axis=dimension, kind="stable")
+    np.testing.assert_array_equal(sorted_keys, np.take_along_axis(keys, order, dimension))
+    np.testing.assert_array_equal(
+        sorted_payload, np.take_along_axis(payload, order, dimension)
+    )
+
+
+@pytest.mark.parametrize("dtype", [jnp.int32, jnp.uint32])
+@pytest.mark.parametrize("descending", [False, True])
+def test_argsort_int32_boundary_keys(dtype, descending):
+    keys = _boundary_keys(dtype, (300, 3), 0)
+    indices = jax.jit(
+        lambda k: jnp.argsort(k, axis=0, stable=True, descending=descending)
+    )(keys)
+    signed = keys.astype(np.int64)
+    expected = np.argsort(-signed if descending else signed, axis=0, kind="stable")
+    np.testing.assert_array_equal(indices, expected)
