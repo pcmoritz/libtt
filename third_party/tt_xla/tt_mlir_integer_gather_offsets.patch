@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5803,16 +5803,12 @@ class StableHLOGatherToEmbeddingPattern
+@@ -5851,16 +5851,12 @@ class StableHLOGatherToEmbeddingPattern
        return failure();
      }
  
@@ -22,7 +22,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
  
      return success();
-@@ -5858,7 +5854,7 @@ public:
+@@ -5906,7 +5902,7 @@ public:
      }
  
      // Normalize the gather into the shared 2D (weights, indices) operands and
@@ -31,7 +31,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      // checkBasicLegality and handled by StableHLOGatherIntToGatherPattern.
      GatherOperands ops = buildGatherOperands(srcOp, adaptor, rewriter);
  
-@@ -5997,13 +5993,6 @@ public:
+@@ -6045,13 +6041,6 @@ public:
                            needsExpansion};
    }
  
@@ -45,7 +45,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Shape/slice constraints required to normalize a gather into the 2D
    // (weights, indices) form. Element-type agnostic, so it is shared by the
    // embedding and integer-gather patterns.
-@@ -6167,17 +6156,9 @@ public:
+@@ -6215,17 +6204,9 @@ public:
      }
  
      if (numIndexingDims > 1) {
@@ -64,7 +64,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      } else if (originalStartIndexMap.size() != numIndexingDims) {
        startIndices =
            sliceStartIndices(rewriter,
-@@ -6269,75 +6250,88 @@ public:
+@@ -6317,75 +6298,88 @@ public:
      return ttir::utils::createReshapeOp(rewriter, loc, input, newInputShape);
    }
  
@@ -215,7 +215,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    }
  
    // If startIndicesShape[indexVectorDim] > 1, but we are actually slicing only
-@@ -6555,12 +6549,10 @@ public:
+@@ -6603,12 +6597,10 @@ public:
                                                startIndicesType.getEncoding());
  
      // Build offset matrix [totalWindow, M]: row r has all elements =
@@ -231,7 +231,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        for (int64_t col = 0; col < M; ++col) {
          matrixData[row * M + col] = v;
        }
-@@ -6584,7 +6576,7 @@ public:
+@@ -6632,7 +6624,7 @@ public:
    }
  };
  
@@ -240,7 +240,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  // to bf16 and rounds wide integers. Lowering to ttir.gather keeps integer
  // precision. Reuses StableHLOGatherToEmbeddingPattern's geometric
  // normalization (buildGatherOperands), then broadcasts the indices to the
-@@ -6594,7 +6586,7 @@ class StableHLOGatherIntToGatherPattern
+@@ -6642,7 +6634,7 @@ class StableHLOGatherIntToGatherPattern
      : public OpConversionPattern<mlir::stablehlo::GatherOp> {
    using OpConversionPattern<mlir::stablehlo::GatherOp>::OpConversionPattern;
  
@@ -249,7 +249,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // StableHLOGatherToEmbeddingPattern deliberately turns away.
    static LogicalResult checkLegality(mlir::stablehlo::GatherOp srcOp,
                                       PatternRewriter &rewriter) {
-@@ -6606,11 +6598,6 @@ class StableHLOGatherIntToGatherPattern
+@@ -6654,11 +6646,6 @@ class StableHLOGatherIntToGatherPattern
              srcOp, rewriter))) {
        return failure();
      }
@@ -261,7 +261,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      return success();
    }
  
-@@ -7511,8 +7498,7 @@ public:
+@@ -7559,8 +7546,7 @@ public:
          StableHLOGatherToEmbeddingPattern::reshapeStartIndices(
              rewriter,
              ttmlir::utils::appendLocationSuffix(loc, "_reshapeStartIndices"),

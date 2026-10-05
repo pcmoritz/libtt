@@ -1,7 +1,7 @@
 diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
 --- tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
 +++ tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
-@@ -164,7 +164,9 @@ ALWI void typecast_tile(uint32_t idst) {
+@@ -196,7 +196,9 @@ ALWI void typecast_tile(uint32_t idst) {
              (APPROX, 8 /* ITERATIONS */, is_fp32_dest_acc_en),
              idst,
              VectorMode::RC));
@@ -12,7 +12,7 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
          MATH(SFPU_UNARY_CALL(
              DST_SYNC_MODE,
              is_fp32_dest_acc_en,
-@@ -245,7 +247,9 @@ ALWI void typecast_tile(uint32_t idst) {
+@@ -277,7 +279,9 @@ ALWI void typecast_tile(uint32_t idst) {
              (APPROX, 8 /* ITERATIONS */),
              idst,
              VectorMode::RC));
@@ -23,7 +23,7 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
          MATH(SFPU_UNARY_CALL(
              DST_SYNC_MODE,
              is_fp32_dest_acc_en,
-@@ -391,7 +395,9 @@ ALWI void typecast_tile(uint32_t idst) {
+@@ -423,7 +427,9 @@ ALWI void typecast_tile(uint32_t idst) {
              (APPROX, 8 /* ITERATIONS */, (in_format == DataFormat::UInt16)),
              idst,
              VectorMode::RC));
@@ -34,7 +34,7 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
          MATH(SFPU_UNARY_CALL(
              DST_SYNC_MODE,
              is_fp32_dest_acc_en,
-@@ -421,6 +427,18 @@ ALWI void typecast_tile(uint32_t idst) {
+@@ -477,6 +483,18 @@ ALWI void typecast_tile(uint32_t idst) {
              idst,
              VectorMode::RC));
      }
@@ -53,7 +53,7 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
  #endif  // ARCH_QUASAR
  }
  
-@@ -452,12 +470,16 @@ ALWI void typecast_tile_init() {
+@@ -510,12 +528,16 @@ ALWI void typecast_tile_init() {
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint32_to_uint16, (APPROX)));
      } else if constexpr (in_format == DataFormat::Int32 && out_format == DataFormat::UInt16) {
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_int32_to_uint16, (APPROX)));
@@ -72,9 +72,9 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint16_to_fp32, (APPROX)));
      } else if constexpr (
          in_format == DataFormat::UInt16 &&
-@@ -485,7 +507,9 @@ ALWI void typecast_tile_init() {
+@@ -543,7 +565,9 @@ ALWI void typecast_tile_init() {
          (in_format == DataFormat::Int32 || in_format == DataFormat::UInt32 || in_format == DataFormat::UInt16) &&
-         out_format == DataFormat::UInt8) {
+         (out_format == DataFormat::UInt8 || out_format == DataFormat::Int8)) {
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint_to_uint8, (APPROX)));
 -    } else if constexpr (in_format == DataFormat::UInt8 && out_format == DataFormat::Float32) {
 +    } else if constexpr (
@@ -101,7 +101,7 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_type
 +        input_dtype == tt::tt_metal::DataType::FLOAT32 && output_dtype == tt::tt_metal::DataType::BFLOAT16;
 +    return exact_float16_output || exact_bfloat16_output
                 ? tt::DataFormat::UInt16
-                : tt::tt_metal::datatype_to_dataformat_converter(output_dtype);
+                : tt::tt_metal::cb_dataformat_for(output_dtype);
  }
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
@@ -126,7 +126,7 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/ope
      DataType input_dtype = input_tensor.dtype();
      bool preserve_fp32_precision =
 @@ -49,6 +61,7 @@ inline Tensor typecast_impl(
-         (input_dtype == DataType::UINT16 and output_dtype == DataType::UINT8) or (input_dtype == DataType::UINT8);
+         (input_dtype == DataType::UINT16 and is_8_bit_int(output_dtype)) or is_8_bit_int(input_dtype);
      bool fp32_dest_acc_en = preserve_fp32_precision or output_dtype == DataType::UINT32 or
                              output_dtype == DataType::INT32 or output_dtype == DataType::FLOAT32 or
 +                            (input_dtype == DataType::UINT16 and output_dtype == DataType::FLOAT16) or

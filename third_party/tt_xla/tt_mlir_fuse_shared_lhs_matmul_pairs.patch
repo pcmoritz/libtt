@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -1874,7 +1874,7 @@ private:
+@@ -1875,7 +1875,7 @@ private:
      bool firstTransposeB = false;
  
      bool isValid() const {
@@ -10,7 +10,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
      }
  
      bool getTargetTransposeB() const {
-@@ -2014,7 +2014,8 @@ private:
+@@ -2017,7 +2017,8 @@ private:
  
      for (Operation *user : sharedLHS.getUsers()) {
        auto op = dyn_cast<OpType>(user);

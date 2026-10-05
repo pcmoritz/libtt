@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -118,6 +118,7 @@ static bool hasUnsupportedFloatType(Type type) {
+@@ -119,6 +119,7 @@ static bool hasUnsupportedFloatType(Type type) {
  // Typical initialization values for reduction ops.
  enum TypicalInitReductionValue {
    NEG_INF, // It is also used for minimum integer value.
@@ -9,7 +9,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    ZERO,
    ONE, // Used for cumulative product operations.
  };
-@@ -134,6 +135,9 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+@@ -135,6 +136,9 @@ static bool checkInitValue(mlir::ElementsAttr initValue, mlir::Type elementType,
    if (desired == TypicalInitReductionValue::NEG_INF) {
      desiredF32 = -std::numeric_limits<float>::infinity();
      desiredF64 = -std::numeric_limits<double>::infinity();
@@ -19,7 +19,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    } else if (desired == TypicalInitReductionValue::ZERO) {
      desiredF32 = 0.0;
      desiredF64 = 0.0;
-@@ -151,6 +155,9 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+@@ -150,6 +154,9 @@ static bool checkInitValue(mlir::ElementsAttr initValue, mlir::Type elementType,
      if (desired == TypicalInitReductionValue::NEG_INF) {
        return value.isInfinity() && value.isNegative();
      }
@@ -29,7 +29,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if (desired == TypicalInitReductionValue::ZERO) {
        return value.isZero();
      }
-@@ -173,6 +180,11 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+@@ -170,6 +177,11 @@ static bool checkInitValue(mlir::ElementsAttr initValue, mlir::Type elementType,
      if (desired == TypicalInitReductionValue::ONE) {
        return value.isOne();
      }
@@ -41,7 +41,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      return integerType.isUnsigned() || integerType.getWidth() == 1
                 ? value.isZero()
                 : value.isMinSignedValue();
-@@ -282,7 +294,11 @@ public:
+@@ -279,7 +291,11 @@ public:
                                                                   rewriter);
      }
      if (isArgMax(srcOp, adaptor, rewriter)) {
@@ -54,7 +54,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
  
      return failure();
-@@ -350,7 +366,7 @@ private:
+@@ -347,7 +363,7 @@ private:
  
    LogicalResult
    matchAndRewriteInternalArgMax(mlir::stablehlo::ReduceOp &srcOp,
@@ -63,7 +63,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
                                  ConversionPatternRewriter &rewriter) const {
      auto outputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult(1).getType()));
-@@ -369,7 +385,7 @@ private:
+@@ -366,7 +382,7 @@ private:
      // original op uses with the new op, and finally, erase the original op
      // explicitly.
      ttir::ArgMaxOp newOp = rewriter.create<tt::ttir::ArgMaxOp>(
@@ -72,7 +72,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
          false /* keep_dim */, dimArg);
  
      srcOp->getResults().back().replaceAllUsesWith(newOp->getResults().front());
-@@ -378,6 +394,30 @@ private:
+@@ -375,6 +391,30 @@ private:
      return success();
    }
  
@@ -103,7 +103,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // This function verify all the required conditions to convert stablehlo
    // reduce op to TTIR argmax op
    // 1. Two inputs values ot the op.
-@@ -414,6 +454,45 @@ private:
+@@ -411,6 +451,45 @@ private:
      return true;
    }
  
@@ -149,7 +149,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Validate the inputs.
    bool hasValidArgMaxInputs(mlir::OperandRange inputs) const {
      if (inputs.size() != 2) {
-@@ -472,6 +551,22 @@ private:
+@@ -469,6 +548,22 @@ private:
      return true;
    }
  
@@ -172,7 +172,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Validate reducer body.
    bool hasValidArgMaxReducerBody(mlir::Region &body) const {
      auto &blocks = body.getBlocks();
-@@ -490,13 +585,29 @@ private:
+@@ -487,13 +582,29 @@ private:
      if (verifyTorchOpArgMaxPattern(firstOp)) {
        return true;
      }
@@ -203,7 +203,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Pattern match the ops for tt-torch ArgMax op.
    // The pattern is as follows:
    //  stablehlo.compare (GE)
-@@ -574,15 +685,16 @@ private:
+@@ -571,15 +682,16 @@ private:
    // stablehlo.select / stablehlo.maximum
    // stablehlo.select
    // stablehlo.return

@@ -78,7 +78,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs b/include/ttm
 diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
 --- a/include/ttmlir/Target/TTNN/program.fbs
 +++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -57,6 +57,7 @@ union OpType {
+@@ -59,6 +59,7 @@ union OpType {
    NLPCreateQKVHeadsDecodeOp,
    NLPConcatHeadsOp,
    ConstantOp,
@@ -89,7 +89,7 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -12305,9 +12305,15 @@ static void addAllToAllOpsConversionPattern(MLIRContext *ctx,
+@@ -12410,9 +12410,15 @@ static void addAllToAllOpsConversionPattern(MLIRContext *ctx,
  
  namespace mlir::tt {
  
@@ -128,7 +128,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
  #define GEN_PASS_DEF_TTNNLAYOUT
  #include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
  
-@@ -830,6 +832,7 @@ public:
+@@ -936,6 +938,7 @@ public:
      {
        RewritePatternSet patterns(&getContext());
        patterns.add<TTNNLayoutRewriter>(&getContext());
@@ -164,8 +164,8 @@ diff --git a/lib/Dialect/TTNN/Validation/OpConstraintValidation.cpp b/lib/Dialec
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -40,6 +40,12 @@
- #include "llvm/Support/raw_ostream.h"
+@@ -45,6 +45,12 @@
+ #include <optional>
  
  namespace mlir::tt::ttnn {
 +::flatbuffers::Offset<::tt::target::ttnn::Operation>
@@ -177,7 +177,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
  #define GEN_PASS_DEF_TTNNSERIALIZETOBINARY
  #include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
  
-@@ -5207,6 +5213,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -5459,6 +5465,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, constantOp), debugString,
                             locInfo);
    }
@@ -203,9 +203,9 @@ diff --git a/runtime/lib/ttnn/operations/mlir_native/func_call.h b/runtime/lib/t
 diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
 --- a/runtime/lib/ttnn/program_executor.cpp
 +++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -372,6 +372,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
-   case ::tt::target::ttnn::OpType::FuncCallOp: {
-     return operations::mlir_native::run(op->type_as_FuncCallOp(), getContext());
+@@ -383,6 +383,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+   case ::tt::target::ttnn::OpType::WhileOp: {
+     return operations::control_flow::run(op->type_as_WhileOp(), getContext());
    }
 +  case ::tt::target::ttnn::OpType::WhileLoopOp: {
 +    return operations::mlir_native::run(op->type_as_WhileLoopOp(),
@@ -217,8 +217,8 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -1610,6 +1610,11 @@ std::vector<tt::runtime::TensorRef> getOpOutputRefs(OpContext opContextHandle) {
-         opContext.type_as_FuncCallOp()->outputs());
+@@ -1632,6 +1632,11 @@ std::vector<tt::runtime::TensorRef> getOpOutputRefs(OpContext opContextHandle) {
+         opContext.type_as_WhileOp()->outputs());
      break;
    }
 +  case ::tt::target::ttnn::OpType::WhileLoopOp: {
@@ -229,7 +229,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    case ::tt::target::ttnn::OpType::CaptureOrExecuteTraceOp: {
      tensorRefs = utils::convertFbTensorRefsToVector(
          opContext.type_as_CaptureOrExecuteTraceOp()->outputs());
-@@ -2345,6 +2350,12 @@ std::vector<tt::runtime::TensorRef> getOpInputRefs(OpContext opContextHandle) {
+@@ -2439,6 +2444,12 @@ std::vector<tt::runtime::TensorRef> getOpInputRefs(OpContext opContextHandle) {
      }
      break;
    }

@@ -1,16 +1,19 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
-@@ -30,6 +30,59 @@ namespace ttnn {
+@@ -115,6 +115,59 @@ Tensor restore_scalar_output_layout(
  
- using namespace operations;
+ }  // namespace
  
 +namespace {
 +
++// binary_ng's MINIMUM/MAXIMUM have no UINT16 kernel and no mixed FLOAT16 kernel, so
++// those operands are compared in FLOAT32 and the result is cast back.
 +Tensor run_promoted_min_max(
 +    const Tensor& input_a,
 +    const Tensor& input_b,
 +    binary::BinaryOpType op_type,
++    const std::optional<const DataType>& output_dtype,
 +    const std::optional<MemoryConfig>& memory_config,
 +    const std::optional<Tensor>& optional_output_tensor,
 +    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
@@ -25,7 +28,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cp
 +            input_a,
 +            input_b,
 +            op_type,
-+            std::nullopt,
++            output_dtype,
 +            memory_config,
 +            optional_output_tensor,
 +            post_activations,
@@ -33,13 +36,10 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cp
 +            rhs_activations);
 +    }
 +
-+    const Tensor promoted_a = input_a.dtype() == DataType::FLOAT32
-+                                  ? input_a
-+                                  : ttnn::typecast(input_a, DataType::FLOAT32);
-+    const Tensor promoted_b = input_b.dtype() == DataType::FLOAT32
-+                                  ? input_b
-+                                  : ttnn::typecast(input_b, DataType::FLOAT32);
-+    const bool needs_cast_back = input_a.dtype() != DataType::FLOAT32;
++    const Tensor promoted_a = input_a.dtype() == DataType::FLOAT32 ? input_a : ttnn::typecast(input_a, DataType::FLOAT32);
++    const Tensor promoted_b = input_b.dtype() == DataType::FLOAT32 ? input_b : ttnn::typecast(input_b, DataType::FLOAT32);
++    const DataType result_dtype = output_dtype.value_or(input_a.dtype());
++    const bool needs_cast_back = result_dtype != DataType::FLOAT32;
 +    Tensor result = ttnn::detail::invoke_binary_ng(
 +        promoted_a,
 +        promoted_b,
@@ -53,15 +53,15 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cp
 +    if (!needs_cast_back) {
 +        return result;
 +    }
-+    return ttnn::typecast(result, input_a.dtype(), memory_config, optional_output_tensor);
++    return ttnn::typecast(result, result_dtype, memory_config, optional_output_tensor);
 +}
 +
 +}  // namespace
 +
  // nextafter
  Tensor nextafter(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
-     const float eps = tt::tt_metal::hal::get_eps();
-@@ -59,11 +112,10 @@ Tensor minimum(
+     return ttnn::detail::invoke_binary_ng(
+@@ -130,7 +183,7 @@ Tensor minimum(
      ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
      ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
      ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
@@ -70,11 +70,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cp
          input_tensor_a,
          input_tensor_b,
          binary::BinaryOpType::MINIMUM,
--        std::nullopt,
-         memory_config,
-         optional_output_tensor,
-         post_activations,
-@@ -100,11 +152,10 @@ Tensor maximum(
+@@ -180,7 +233,7 @@ Tensor maximum(
      ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
      ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
      ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
@@ -83,48 +79,31 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cp
          input_tensor_a,
          input_tensor_b,
          binary::BinaryOpType::MAXIMUM,
--        std::nullopt,
-         memory_config,
-         optional_output_tensor,
-         post_activations,
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
-@@ -223,31 +223,14 @@ Tensor clamp(
-     const std::optional<Tensor>& /*output_tensor*/) {
+@@ -223,21 +223,12 @@ Tensor clamp(
+     const std::optional<Tensor>& output_tensor) {
      auto output_memory_config = output_mem_config.value_or(input_a.memory_config());
      TT_FATAL((max.has_value() || min.has_value()), "Only one of 'min' or 'max' can be None. Please provide one value");
--    if (!max.has_value()) {
++    // maximum/minimum promote mixed FLOAT16 operands; where/ge would not.
+     if (!max.has_value()) {
 -        return ttnn::where(
 -            ttnn::ge(input_a, min.value(), std::nullopt, output_memory_config),
 -            input_a,
 -            min.value(),
--            output_memory_config);
-+    Tensor result = input_a;
-+    if (min.has_value()) {
-+        result = ttnn::maximum(result, min.value(), std::nullopt, output_memory_config);
+-            output_memory_config,
+-            output_tensor);
++        return ttnn::maximum(input_a, min.value(), std::nullopt, output_memory_config, output_tensor);
      }
--    if (!min.has_value()) {
+     if (!min.has_value()) {
 -        return ttnn::where(
 -            ttnn::le(input_a, max.value(), std::nullopt, output_memory_config),
 -            input_a,
 -            max.value(),
--            output_memory_config);
-+    if (max.has_value()) {
-+        result = ttnn::minimum(result, max.value(), std::nullopt, output_memory_config);
+-            output_memory_config,
+-            output_tensor);
++        return ttnn::minimum(input_a, max.value(), std::nullopt, output_memory_config, output_tensor);
      }
--    Tensor a_max = ttnn::minimum(input_a, max.value(), std::nullopt, output_memory_config);
--    Tensor temp = ttnn::where(
--        ttnn::eq(min.value(), 0.0f, std::nullopt, output_memory_config),
--        ttnn::relu(a_max, output_memory_config),
--        ttnn::maximum(a_max, min.value(), std::nullopt, output_memory_config),
--        output_memory_config);
--    return ttnn::where(
--        ttnn::gt(min.value(), max.value(), std::nullopt, output_memory_config),
--        max.value(),
--        temp,
--        output_memory_config);
-+    return result;
- }
- 
- // Gated Linear Unit activation: matmul(split[0],sigmoid(split[1]))
+     // y = max(min(x, max), lo) with lo = min(min, max).
+     // torch.clamp defines the degenerate case min > max as "every element becomes max"; clamping the

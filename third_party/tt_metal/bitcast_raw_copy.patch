@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
-@@ -30,6 +30,20 @@ void UnaryDeviceOperation::validate_on_program_cache_miss(
+@@ -127,6 +127,20 @@ void UnaryDeviceOperation::validate_on_program_cache_miss(
      const auto& input_tensor = tensor_args.input;
      const auto& output_tensor = tensor_args.output_tensor;
  
@@ -25,7 +25,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-@@ -358,6 +358,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+@@ -344,6 +344,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
      const auto& input = tensor_args.input;
      const auto& ops_chain = operation_attributes.op_chain;
      TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
@@ -33,10 +33,10 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
      auto compute_ops_chain = ops_chain;
      const bool promote_narrow_float =
          uses_raw_16bit_sfpu_path(input.dtype()) && ops_chain[0].type() != UnaryOpType::TYPECAST &&
-@@ -397,8 +398,11 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+@@ -383,8 +384,11 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
      DataFormat cb_data_format_output =
          promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format
-                                                       : datatype_to_dataformat_converter(output.dtype());
+                                                       : cb_dataformat_for(output.dtype());
 -    if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
 -        cb_data_format_output = DataFormat::UInt16;
 +    if (is_bitcast) {

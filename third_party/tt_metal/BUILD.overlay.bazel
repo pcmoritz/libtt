@@ -115,9 +115,9 @@ genrule(
     name = "tt_metal_version_hpp",
     srcs = ["cmake/tt_metal_version.hpp.in"],
     outs = ["tt_metal/impl/version.hpp"],
-    cmd = "sed -e 's/@VERSION_SHA@/d04395ed862b4c65eb6877000c40200f456cb74e/' " +
-          "-e 's/@VERSION_HASH@/d04395ed/' " +
-          "-e 's/@VERSION_FULL@/d04395ed/' " +
+    cmd = "sed -e 's/@VERSION_SHA@/cffd17520cdfc45dc85c1c47cc2aa49f6bff15c0/' " +
+          "-e 's/@VERSION_HASH@/cffd1752/' " +
+          "-e 's/@VERSION_FULL@/cffd1752/' " +
           "-e 's/@VERSION_DIRTY_CPP@/false/' $< > $@",
 )
 

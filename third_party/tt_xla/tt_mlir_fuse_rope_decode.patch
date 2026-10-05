@@ -246,7 +246,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
-@@ -193,6 +193,9 @@ static void registerBuiltinComposites() {
+@@ -400,6 +400,9 @@ static void registerBuiltinComposites() {
        [](ttcore::CompositeOp compositeOp,
           OpBuilder &builder) -> OpValidationResult {
          TT_assert(compositeOp.getInputs().size() == 3u);
@@ -256,7 +256,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect
  
          SmallVector<Type> resultTypes(compositeOp.getResultTypes());
          IsolatedIRValidationWrapper validator(compositeOp.getContext());
-@@ -200,16 +203,19 @@ static void registerBuiltinComposites() {
+@@ -407,16 +410,19 @@ static void registerBuiltinComposites() {
              compositeOp.getOperation(), compositeOp.getLoc(), resultTypes,
              compositeOp.getInputs()[0], compositeOp.getInputs()[1],
              compositeOp.getInputs()[2],

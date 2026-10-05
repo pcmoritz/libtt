@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -1150,7 +1150,9 @@ def TTNN_EmbeddingOp : TTNN_Op<"embedding"> {
+@@ -1166,7 +1166,9 @@ def TTNN_EmbeddingOp : TTNN_Op<"embedding"> {
  
      let extraClassDeclaration = [{
        wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
@@ -28,7 +28,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttml
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5344,6 +5344,40 @@ public:
+@@ -5392,6 +5392,40 @@ public:
      // checkBasicLegality and handled by StableHLOGatherIntToGatherPattern.
      GatherOperands ops = buildGatherOperands(srcOp, adaptor, rewriter);
  

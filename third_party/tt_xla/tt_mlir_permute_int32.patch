@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -892,19 +892,14 @@ TTNNOperandsWorkaroundsFactory::createPadOpOperandsWorkarounds(
+@@ -961,19 +961,14 @@ TTNNOperandsWorkaroundsFactory::createPadOpOperandsWorkarounds(
        .addOutputOperandWorkaround(operandWorkaround);
  }
  

@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10809,6 +10809,54 @@ public:
+@@ -10857,6 +10857,54 @@ public:
  };
  } // namespace
  
@@ -56,7 +56,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  static void
  addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
                                           RewritePatternSet &patterns,
-@@ -10864,6 +10912,8 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+@@ -10912,6 +10960,8 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<
        mlir::stablehlo::RoundNearestEvenOp, mlir::tt::ttir::RoundOp>>(
        typeConverter, ctx);

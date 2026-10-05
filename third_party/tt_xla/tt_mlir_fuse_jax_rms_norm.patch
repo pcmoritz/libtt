@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -2884,6 +2884,15 @@ public:
+@@ -2894,6 +2894,15 @@ public:
            });
      };
  
@@ -17,7 +17,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
      MultiplyOp innerMul =
          ttmlir::utils::findOpThrough<MultiplyOp, TypecastOp>(outerMul.getLhs());
      mlir::Value gammaRaw = outerMul.getRhs();
-@@ -2912,32 +2921,51 @@ public:
+@@ -2922,32 +2931,51 @@ public:
        return mlir::failure();
      }
  
@@ -87,7 +87,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  
      if (auto sq = meanInput.getDefiningOp<MultiplyOp>()) {
        if (sq.getLhs() == sq.getRhs()) {
-@@ -2950,7 +2978,12 @@ public:
+@@ -2960,7 +2988,12 @@ public:
      }
  
      if (!squareInput || squareInput != x) {
@@ -101,7 +101,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
      }
  
      auto epsFull = epsilon.getDefiningOp<FullOp>();
-@@ -2965,35 +2998,37 @@ public:
+@@ -2975,35 +3008,37 @@ public:
      mlir::Value gamma = lookThroughSafeOps(gammaRaw);
      llvm::SmallVector<int64_t> normalizedShape{normalizedDimSize};
  
@@ -160,7 +160,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
        if (mlir::Operation *xOp = x.getDefiningOp()) {
          x = utils::revertTypecastFolding(rewriter, xOp, x);
          inputType = mlir::cast<RankedTensorType>(x.getType());
-@@ -3004,13 +3039,14 @@ public:
+@@ -3014,13 +3049,14 @@ public:
      }
  
      rewriter.setInsertionPoint(outerMul);
@@ -180,7 +180,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
          /*bias=*/nullptr, rewriter.getDenseI64ArrayAttr(normalizedShape),
          rewriter.getF32FloatAttr(epsAttr.getValue().convertToFloat()));
  
-@@ -3020,7 +3056,10 @@ public:
+@@ -3030,7 +3066,10 @@ public:
      result = utils::reshapeAndCastToType(rewriter, outerMul.getLoc(), result,
                                           outputType);
  

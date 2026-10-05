@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -6306,15 +6306,16 @@ def TTIR_ChunkedScaledDotProductAttentionOp : TTIR_NamedOp<"chunked_scaled_dot_p
+@@ -6376,15 +6376,16 @@ def TTIR_ChunkedScaledDotProductAttentionOp : TTIR_NamedOp<"chunked_scaled_dot_p
      Chunked-prefill attention. A prefill chunk of `query` attends
      causally over the prefix tokens `[0, chunk_start_idx + chunk_len)` that are
      resident in the paged K/V cache, read on device via `page_table`. The prefix
@@ -24,7 +24,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -226,6 +226,39 @@ parseFloatFromStringAttr(const mlir::StringAttr &stringAttr, float &result) {
+@@ -223,6 +223,39 @@ parseFloatFromStringAttr(const mlir::StringAttr &stringAttr, float &result) {
    }
    return success();
  }
@@ -64,7 +64,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
  namespace {
  template <typename SrcOp, typename DestOp,
-@@ -9785,6 +9818,9 @@ public:
+@@ -9833,6 +9866,9 @@ public:
        return failure();
      }
  
@@ -74,7 +74,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if (adaptor.getOperands().size() != 2 || srcOp.getResults().size() != 1) {
        return rewriter.notifyMatchFailure(
            srcOp,
-@@ -9856,6 +9892,9 @@ public:
+@@ -9904,6 +9940,9 @@ public:
        return failure();
      }
  
@@ -84,7 +84,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if (adaptor.getOperands().size() != 3 || srcOp.getResults().size() != 1) {
        return rewriter.notifyMatchFailure(
            srcOp, "UpdateCache op must have exactly three operands and one "
-@@ -9927,6 +9966,9 @@ public:
+@@ -9975,6 +10014,9 @@ public:
        return failure();
      }
  
@@ -94,7 +94,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if (adaptor.getOperands().size() != 4 || srcOp.getResults().size() != 1) {
        return rewriter.notifyMatchFailure(
            srcOp, "PagedUpdateCache op must have exactly four operands and one "
-@@ -10044,6 +10086,9 @@ public:
+@@ -10092,6 +10134,9 @@ public:
        return failure();
      }
  
@@ -104,7 +104,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if ((adaptor.getOperands().size() != 4 &&
           adaptor.getOperands().size() != 3) ||
          srcOp.getResults().size() != 1) {
-@@ -10281,121 +10326,80 @@ public:
+@@ -10329,121 +10374,80 @@ public:
        return failure();
      }
  
@@ -282,7 +282,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      RankedTensorType outputType = cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult(0).getType()));
-@@ -10404,12 +10408,10 @@ public:
+@@ -10452,12 +10456,10 @@ public:
  
      rewriter.replaceOpWithNewOp<
          mlir::tt::ttir::PagedScaledDotProductAttentionDecodeOp>(
@@ -299,7 +299,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      return success();
    }
  };
-@@ -10430,23 +10432,20 @@ public:
+@@ -10478,23 +10480,20 @@ public:
        return failure();
      }
  
@@ -336,7 +336,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
  
      Value query = adaptor.getOperands()[0];
-@@ -10485,7 +10484,6 @@ namespace {
+@@ -10533,7 +10532,6 @@ namespace {
  class StableHLOToTTIRPagedFlashMLADecodeOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
    using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
@@ -347,7 +347,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -3372,12 +3372,75 @@ public:
+@@ -3368,12 +3368,75 @@ public:
    matchAndRewrite(ttir::ChunkedScaledDotProductAttentionOp op,
                    OpAdaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
@@ -474,7 +474,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/RegisterCustomShardingRule.cpp b/l
 diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 --- a/lib/Dialect/TTIR/IR/TTIROps.cpp
 +++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
-@@ -7866,10 +7866,6 @@ mlir::tt::ttir::ChunkedScaledDotProductAttentionOp::verify() {
+@@ -7909,10 +7909,6 @@ mlir::tt::ttir::ChunkedScaledDotProductAttentionOp::verify() {
    if (chunkStartIdxType.getRank() != 1) {
      return emitOpError("Chunk start index must be a 1D tensor.");
    }
@@ -485,7 +485,7 @@ diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
  
    // Verify element types. The BFP8/BFP4 KV cache typecast happens later in the
    // TTNN pipeline, so at TTIR query/key/value share one float element type.
-@@ -7903,6 +7899,11 @@ mlir::tt::ttir::ChunkedScaledDotProductAttentionOp::verify() {
+@@ -7946,6 +7942,11 @@ mlir::tt::ttir::ChunkedScaledDotProductAttentionOp::verify() {
    int64_t keyHeadSize = keyShape[3];
  
    // Verify shapes.

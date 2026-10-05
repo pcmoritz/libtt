@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 --- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 +++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
-@@ -303,6 +303,33 @@ struct DotGeneralToMatmulConversionPattern
+@@ -305,6 +305,33 @@ struct DotGeneralToMatmulConversionPattern
            op.getLoc(),
            RankedTensorType::get(matmulDestinationShape, elementType),
            lhsMatmulInput, rhsMatmulInput);

@@ -13,7 +13,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.
 diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
-@@ -70,10 +70,11 @@ FORCE_INLINE void scatter_along_chunk(
+@@ -68,10 +68,11 @@ FORCE_INLINE void scatter_along_chunk(
      // partial stick length and offset)
      for (uint32_t index_in_index_chunk = 0; index_in_index_chunk < index_chunk_size; ++index_in_index_chunk) {
          volatile index_type& index_value = index_l1_read_ptr[index_in_index_chunk];

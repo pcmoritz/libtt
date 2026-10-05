@@ -67,7 +67,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_p
          ComputeGen1Config compute_cfg{.enable_32_bit_dest = fp32_dest_acc_en};
          // Legacy set unpack_to_dest_mode[c_0] = UnpackToDestFp32 for Float32 → UnpackMode::UnpackToDest.
          // Compute consumes SRC0 (c_0); the required-entry rule fires only for Float32.
-@@ -696,12 +698,15 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreTiledG
+@@ -701,12 +703,15 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreTiledG
                      pack_two_uint16_into_uint32({float_to_uint16(pad_value), float_to_uint16(pad_value)});
                  break;
              case DataType::FLOAT32: padding_val_packed = std::bit_cast<uint32_t>(pad_value); break;
@@ -84,7 +84,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_p
          }
      }
  
-@@ -782,7 +787,8 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreTiledG
+@@ -790,7 +795,8 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreTiledG
  
      // ---- Compute config (Style B: build ComputeGen1Config directly, mirroring legacy) ----
      bool fp32_dest_acc_en = cb_data_format == tt::DataFormat::Float32 || cb_data_format == tt::DataFormat::Int32 ||
@@ -97,13 +97,13 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_p
 diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
-@@ -151,7 +151,8 @@ tt::tt_metal::ProgramDescriptor TransposeWHProgramFactory::create_descriptor(
+@@ -54,7 +54,8 @@ ttnn::device_operation::ProgramArtifacts TransposeWHProgramFactory::create_progr
  
-     bool fp32_dest_acc_en = src0_cb_data_format == tt::DataFormat::Float32 ||
-                             src0_cb_data_format == tt::DataFormat::Int32 ||
--                            src0_cb_data_format == tt::DataFormat::UInt32;
-+                            src0_cb_data_format == tt::DataFormat::UInt32 ||
-+                            src0_cb_data_format == tt::DataFormat::UInt8;
+     bool fp32_dest_acc_en = src0_dfb_data_format == tt::DataFormat::Float32 ||
+                             src0_dfb_data_format == tt::DataFormat::Int32 ||
+-                            src0_dfb_data_format == tt::DataFormat::UInt32;
++                            src0_dfb_data_format == tt::DataFormat::UInt32 ||
++                            src0_dfb_data_format == tt::DataFormat::UInt8;
  
      auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
  

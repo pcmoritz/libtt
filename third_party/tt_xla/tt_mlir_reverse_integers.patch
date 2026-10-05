@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 --- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 +++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
-@@ -157,19 +157,33 @@ struct ReverseOpConversionPattern
+@@ -159,19 +159,33 @@ struct ReverseOpConversionPattern
      current =
          rewriter.create<ttir::ReshapeOp>(loc, flatType, current, shapeAttr);
  

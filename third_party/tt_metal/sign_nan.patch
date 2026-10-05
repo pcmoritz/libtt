@@ -1,26 +1,24 @@
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h
-@@ -26,7 +26,8 @@ inline void calculate_sign(const uint /*exponent_size_8*/) {
-     for (int d = 0; d < ITERATIONS; d++) {
-         sfpi::vFloat v = sfpi::dst_reg[0];
-         sfpi::vFloat res = 1.0f;
--        v_if(v < 0.0F) { res = -1.0f; }
-+        v_if(sfpi::is_nan(v)) { res = v; }
-+        v_elseif(v < 0.0F) { res = -1.0f; }
-         v_elseif(_sfpu_is_fp16_zero_(v)) { res = 0.0f; }
+@@ -30,6 +30,8 @@ inline void calculate_sign(const uint /*exponent_size_8*/) {
+         sfpi::vFloat res = sfpi::copysgn(sfpi::vFloat(1.0f), v);
+         // SFPSETCC is unspecified for -0.0 (VectorUnit.md), so a bare compare can miss it.
+         v_if(sfpi::abs(v) == 0.0F) { res = 0.0f; }
++        // sign(NaN) is NaN.
++        v_elseif(sfpi::is_nan(v)) { res = v; }
          v_endif;
          sfpi::dst_reg[0] = res;
+         sfpi::dst_reg++;
 diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h
 --- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h
 +++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_sign.h
-@@ -26,7 +26,8 @@ inline void calculate_sign(const uint /*exponent_size_8*/) {
-     for (int d = 0; d < ITERATIONS; d++) {
-         sfpi::vFloat v = sfpi::dst_reg[0];
-         sfpi::vFloat res = 1.0f;
--        v_if(v < 0.0F) { res = -1.0f; }
-+        v_if(sfpi::is_nan(v)) { res = v; }
-+        v_elseif(v < 0.0F) { res = -1.0f; }
-         v_elseif(_sfpu_is_fp16_zero_(v)) { res = 0.0f; }
+@@ -30,6 +30,8 @@ inline void calculate_sign(const std::uint32_t /*exponent_size_8*/) {
+         sfpi::vFloat res = sfpi::copysgn(sfpi::vFloat(1.0f), v);
+         // SFPSETCC is unspecified for -0.0 (VectorUnit.md), so a bare compare can miss it.
+         v_if(sfpi::abs(v) == 0.0F) { res = 0.0f; }
++        // sign(NaN) is NaN.
++        v_elseif(sfpi::is_nan(v)) { res = v; }
          v_endif;
          sfpi::dst_reg[0] = res;
+         sfpi::dst_reg++;

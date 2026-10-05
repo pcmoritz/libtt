@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -2847,7 +2847,55 @@ public:
+@@ -2889,7 +2889,55 @@ public:
      RankedTensorType firstInputType =
          mlir::cast<RankedTensorType>(srcOp.getInputs()[0].getType());
      int64_t inputRank = firstInputType.getRank();

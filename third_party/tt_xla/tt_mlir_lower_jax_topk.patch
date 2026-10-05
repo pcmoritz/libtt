@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10282,7 +10282,7 @@ public:
+@@ -10330,7 +10330,7 @@ public:
      }
      auto input = adaptor.getOperands()[0];
      IntegerAttr dimAttr = IntegerAttr::get(rewriter.getIntegerType(32), -1);
@@ -10,7 +10,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      auto dictAttr = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
          srcOp->getDiscardableAttr("mhlo.attributes"));
-@@ -10308,10 +10308,10 @@ public:
+@@ -10356,10 +10356,10 @@ public:
      int32_t kValueI32 = static_cast<int32_t>(kValueI64.getSExtValue());
      kAttr = IntegerAttr::get(rewriter.getIntegerType(32), kValueI32);
  
@@ -26,7 +26,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -1839,7 +1839,7 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
+@@ -1999,7 +1999,7 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
  // TopK op pads the dimension to tile size, and uses UInt32 for indices if
  // padded dimension size > uint16_t::max
  
@@ -35,7 +35,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
  // Issue page: https://github.com/tenstorrent/tt-metal/issues/40086
  TTNNOperandsWorkarounds
  TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
-@@ -1848,15 +1848,19 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
+@@ -2008,15 +2008,19 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
    auto inputElementType = inputType.getElementType();
    std::optional<ttcore::DataType> inputDataType =
        ttcore::elementTypeToDataType(inputElementType);
@@ -59,7 +59,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
    } else {
      outputValuesWorkaround.tensorDataTypeWorkaround = *inputDataType;
    }
-@@ -1871,8 +1875,9 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
+@@ -2031,8 +2035,9 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
    auto inputShape = inputType.getShape();
    auto paddedShape = utils::getTilePaddedShape(inputShape);
    int64_t paddedDimSize = paddedShape[dimIndex];

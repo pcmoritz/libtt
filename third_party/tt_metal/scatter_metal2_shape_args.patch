@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_bf16_reduction_scatter.cpp
-@@ -139,9 +139,8 @@ void kernel_main() {
+@@ -130,9 +130,8 @@ void kernel_main() {
      using index_std_type = std_type_t<get_dataformat(dfb::index)>;
  
      constexpr uint32_t N = input_rank - 1;
@@ -128,7 +128,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program
 diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_bfloat16_program_factory.cpp
-@@ -124,6 +124,10 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
+@@ -122,6 +122,10 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
      KernelSpec reader{
          .unique_id = READER,
          .source = reader_kernel_path,
@@ -139,7 +139,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_
          .dfb_bindings =
              {
                  DFBBinding{
-@@ -173,10 +177,6 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
+@@ -167,10 +171,6 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
                       "scatter_reduction_type"},
              },
          .hw_config = ttnn::create_reader_datamovement_config(device->arch()),
@@ -150,7 +150,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_
      };
  
      KernelSpec writer{
-@@ -202,19 +202,8 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
+@@ -196,19 +196,8 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
          .hw_config = ttnn::create_writer_datamovement_config(device->arch()),
      };
  
@@ -170,7 +170,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_
  
      uint32_t stick_offset = 0;
      for (uint32_t i = 0; i < all_cores_in_bounding_box; ++i) {
-@@ -237,8 +226,6 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
+@@ -231,8 +220,6 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
               {"index_chunk_size", index_chunk_size},
               {"source_chunk_size", source_chunk_size},
               {"scatter_reduction_type", static_cast<uint32_t>(args.opt_reduction)}});
@@ -179,7 +179,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_reduce_
          AddRuntimeArgsForNode(
              writer_node_args,
              core,
-@@ -270,7 +257,6 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
+@@ -267,7 +254,6 @@ ttnn::device_operation::ProgramArtifacts ScatterReduceBfloat16ProgramFactory::cr
          KernelRunArgs{
              .kernel = READER,
              .runtime_arg_values = std::move(reader_node_args),

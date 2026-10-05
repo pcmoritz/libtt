@@ -1,15 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
 --- ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
-@@ -6,6 +6,7 @@
- #include "ttnn/operations/reduction/generic/device/reduce_op_device_operation.hpp"
- #include "ttnn/operations/reduction/generic/device/common.hpp"
- 
-+#include <algorithm>
- #include <optional>
- #include <string>
- 
-@@ -13,9 +14,39 @@
+@@ -16,9 +16,39 @@
  #include "ttnn/operations/eltwise/unary_backward/unary_backward.hpp"
  #include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
  #include "ttnn/operations/data_movement/common/common.hpp"
@@ -49,7 +41,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/
  std::map<std::string, std::string> get_defines(
      tt::tt_metal::ReduceOpMath reduce_op, tt::tt_metal::ReduceOpDim reduce_dim) {
      std::map<std::string, std::string> defines;
-@@ -170,6 +201,45 @@ Tensor reduce(
+@@ -213,6 +243,45 @@ Tensor reduce(
  
      const bool use_sfpu_fp32_reduce = use_sfpu_fp32_sum || use_sfpu_fp32_mean || use_sfpu_fp32_max || use_sfpu_fp32_min;
  

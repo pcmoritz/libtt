@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -721,6 +721,14 @@ def TTNN_LogicalRightShiftOp: TTNN_ElementwiseBinaryOp<"logical_right_shift">{
+@@ -737,6 +737,14 @@ def TTNN_LogicalRightShiftOp: TTNN_ElementwiseBinaryOp<"logical_right_shift">{
    let hasVerifier = 1;
  }
  
@@ -46,7 +46,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/eltwise.fbs b/include/ttmlir/
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -11403,6 +11403,9 @@ addElementwiseBinaryOpsConversionPatterns(MLIRContext *ctx,
+@@ -11393,6 +11393,9 @@ addElementwiseBinaryOpsConversionPatterns(MLIRContext *ctx,
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<
        mlir::stablehlo::ShiftRightLogicalOp,
        mlir::tt::ttir::LogicalRightShiftOp>>(typeConverter, ctx);
@@ -59,7 +59,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -3765,6 +3765,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -3813,6 +3813,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
             RequantizeOpConversionPattern,
             ElementwiseBinaryOpConversionPattern<ttir::AddOp, ttnn::AddOp>,
             ElementwiseBinaryOpConversionPattern<ttir::LogicalRightShiftOp, ttnn::LogicalRightShiftOp>,
@@ -70,7 +70,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 diff --git a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
 --- a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
 +++ b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
-@@ -6235,6 +6235,8 @@ void populateTTNNToEmitCPatterns(mlir::MLIRContext *ctx,
+@@ -6878,6 +6878,8 @@ void populateTTNNToEmitCPatterns(mlir::MLIRContext *ctx,
        EltwiseBinaryOpConversionPattern<mlir::tt::ttnn::LogicalOrOp>,
        EltwiseBinaryOpConversionPattern<mlir::tt::ttnn::LogicalXorOp>,
        EltwiseBinaryCompositeOpConversionPattern<mlir::tt::ttnn::BitwiseAndOp>,
@@ -82,7 +82,7 @@ diff --git a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp b/lib/Conversion/TTNNToE
 diff --git a/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp b/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
 --- a/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
 +++ b/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
-@@ -5729,6 +5729,8 @@ void populateTTNNToEmitPyPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -6032,6 +6032,8 @@ void populateTTNNToEmitPyPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
                 EltwiseBinaryOpConversionPattern<mlir::tt::ttnn::NotEqualOp>,
                 EltwiseBinaryOpConversionPattern<mlir::tt::ttnn::SubtractOp>,
                 EltwiseBinaryCompositeOpConversionPattern<mlir::tt::ttnn::BitwiseAndOp>,
@@ -107,7 +107,7 @@ diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/T
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -603,7 +603,8 @@ binaryOpDTypeWorkaround(mlir::Operation *op, mlir::Type elementType) {
+@@ -660,7 +660,8 @@ binaryOpDTypeWorkaround(mlir::Operation *op, mlir::Type elementType) {
    mlir::tt::ttcore::DataType dType =
        mlir::tt::ttcore::elementTypeToDataType(elementType);
  
@@ -147,7 +147,7 @@ diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/
 diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
 --- a/lib/OpModel/TTNN/TTNNOpModel.cpp
 +++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
-@@ -603,6 +603,8 @@ auto getOpSymbol() {
+@@ -616,6 +616,8 @@ auto getOpSymbol() {
      return WRAP_OP(::ttnn::logical_right_shift);
    } else if constexpr (std::is_same_v<OpTy, LogicalLeftShiftOp>) {
      return WRAP_OP(::ttnn::logical_left_shift);
@@ -156,7 +156,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
    } else if constexpr (std::is_same_v<OpTy, DivideOp>) {
      return WRAP_OP(::ttnn::divide);
    } else if constexpr (std::is_same_v<OpTy, EqualOp>) {
-@@ -1851,6 +1853,7 @@ template struct BinaryCompositeOpModel<BitwiseAndOp>;
+@@ -1864,6 +1866,7 @@ template struct BinaryCompositeOpModel<BitwiseAndOp>;
  template struct BinaryCompositeOpModel<BitwiseOrOp>;
  template struct BinaryCompositeOpModel<BitwiseXorOp>;
  template struct BinaryCompositeOpModel<LogicalLeftShiftOp>;
@@ -167,7 +167,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -2338,6 +2338,9 @@ createEltwiseBinaryCompositeOp(FlatbufferObjectCache &cache,
+@@ -2444,6 +2444,9 @@ createEltwiseBinaryCompositeOp(FlatbufferObjectCache &cache,
    } else if constexpr (std::is_same_v<EltwiseBinaryCompositeOp,
                                        LogicalLeftShiftOp>) {
      type = ::tt::target::ttnn::EltwiseBinaryCompositeOpType::LogicalLeftShift;
@@ -177,7 +177,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
    } else if (std::is_same_v<EltwiseBinaryCompositeOp, RemainderOp>) {
      type = ::tt::target::ttnn::EltwiseBinaryCompositeOpType::Remainder;
    } else if (std::is_same_v<EltwiseBinaryCompositeOp, PowTensorOp>) {
-@@ -4631,6 +4634,12 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -4905,6 +4908,12 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
                             createEltwiseBinaryCompositeOp(cache, bitwiseAndOp),
                             debugString, locInfo);
    }

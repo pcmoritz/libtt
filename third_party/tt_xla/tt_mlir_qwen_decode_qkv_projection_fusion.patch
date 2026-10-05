@@ -89,7 +89,7 @@ diff --git a/include/ttmlir/Utils.h b/include/ttmlir/Utils.h
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -2001,6 +2001,33 @@ private:
+@@ -2002,6 +2002,33 @@ private:
                                       rewriter.getSI32IntegerAttr(concatDim));
    }
  
@@ -123,7 +123,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
    // Collect all ops that share the same LHS operand and are compatible
    // for fusion.
    static FusionCandidates collectCandidates(OpType rootOp) {
-@@ -2064,6 +2091,8 @@ private:
+@@ -2074,6 +2101,8 @@ private:
        }
      }
  
@@ -376,7 +376,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -716,6 +716,8 @@ public:
+@@ -744,6 +744,8 @@ public:
          patterns.add<fusing::SDPAFusing>(&getContext(), validationConfig);
        }
        patterns.add<NLPConcatHeadsDecodeFusing>(&getContext());

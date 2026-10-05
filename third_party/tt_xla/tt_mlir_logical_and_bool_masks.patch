@@ -1,7 +1,7 @@
 diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp b/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
 --- a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
 +++ b/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
-@@ -134,8 +134,12 @@ void run(const ::tt::target::ttnn::EltwiseBinaryOp *op,
+@@ -143,8 +143,12 @@ void run(const ::tt::target::ttnn::EltwiseBinaryOp *op,
      break;
    }
    case ::tt::target::ttnn::EltwiseBinaryOpType::LogicalAnd: {

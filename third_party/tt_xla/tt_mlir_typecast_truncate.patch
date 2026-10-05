@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -2630,10 +2630,23 @@ public:
+@@ -2626,10 +2626,23 @@ public:
    matchAndRewrite(ttir::TypecastOp op, ttir::TypecastOp::Adaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
      auto resultType = op.getType();

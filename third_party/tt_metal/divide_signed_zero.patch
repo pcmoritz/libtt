@@ -1,7 +1,7 @@
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
-@@ -198,7 +198,9 @@ inline void calculate_sfpu_binary_div(
+@@ -253,7 +253,9 @@ inline void calculate_sfpu_binary_div(
              v_if(in0 == 0) { result = std::numeric_limits<float>::quiet_NaN(); }
              v_else {
                  result = std::numeric_limits<float>::infinity();
@@ -38,7 +38,7 @@ diff --git tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_binar
 diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 --- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 +++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
-@@ -197,7 +197,9 @@ inline void calculate_sfpu_binary_div(
+@@ -252,7 +252,9 @@ inline void calculate_sfpu_binary_div(
              v_if(in0 == 0) { result = std::numeric_limits<float>::quiet_NaN(); }
              v_else {
                  result = std::numeric_limits<float>::infinity();

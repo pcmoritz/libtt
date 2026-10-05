@@ -13,7 +13,7 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/Utils.h b/include/ttmlir/Dialect/T
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -6419,6 +6419,47 @@ def TTIR_ScaledDotProductAttentionOp : TTIR_NamedOp<"scaled_dot_product_attentio
+@@ -6489,6 +6489,47 @@ def TTIR_ScaledDotProductAttentionOp : TTIR_NamedOp<"scaled_dot_product_attentio
    let hasVerifier = 1;
  }
  
@@ -64,7 +64,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4497,6 +4497,51 @@ def TTNN_ScaledDotProductAttentionOp : TTNN_Op<"scaled_dot_product_attention", [
+@@ -4806,6 +4806,51 @@ def TTNN_ScaledDotProductAttentionOp : TTNN_Op<"scaled_dot_product_attention", [
      let hasVerifier = 1;
  }
  
@@ -171,7 +171,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
 --- a/include/ttmlir/Target/TTNN/program.fbs
 +++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -90,6 +90,10 @@ union OpType {
+@@ -93,6 +93,10 @@ union OpType {
    FuncCallOp,
    GatherOp,
    GenericOp,
@@ -185,7 +185,7 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10072,6 +10072,72 @@ public:
+@@ -10120,6 +10120,72 @@ public:
  } // namespace
  
  namespace {
@@ -258,7 +258,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  class StableHLOPagedFillCacheConversionPattern
      : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
    using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
-@@ -12115,6 +12181,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
+@@ -12105,6 +12171,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
                                                                  ctx);
    patterns.add<StableHLOToTTIRCollectivePermuteOpConversionPattern>(
        typeConverter, ctx);
@@ -270,7 +270,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -3447,6 +3447,86 @@ public:
+@@ -3443,6 +3443,86 @@ public:
  } // namespace
  
  namespace {
@@ -357,7 +357,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  class PagedFlashMultiLatentAttentionDecodeOpConversionPattern
      : public OpConversionPattern<ttir::PagedFlashMultiLatentAttentionDecodeOp> {
  public:
-@@ -3965,6 +4045,10 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -4012,6 +4092,10 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
             ScaledDotProductAttentionDecodeOpConversionPattern,
             PagedScaledDotProductAttentionDecodeOpConversionPattern,
             ChunkedScaledDotProductAttentionOpConversionPattern,
@@ -500,7 +500,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -3789,6 +3789,63 @@ createOp(FlatbufferObjectCache &cache, ScaledDotProductAttentionOp op) {
+@@ -3895,6 +3895,63 @@ createOp(FlatbufferObjectCache &cache, ScaledDotProductAttentionOp op) {
        slidingWindowSize, attentionSink, out, memoryConfig);
  }
  
@@ -564,7 +564,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
  ::flatbuffers::Offset<::tt::target::ttnn::FlashMlaPrefillOp>
  createOp(FlatbufferObjectCache &cache, FlashMlaPrefillOp op) {
    auto query = cache.at<::tt::target::ttnn::TensorRef>(
-@@ -5365,6 +5422,22 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -5617,6 +5674,22 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, scaledDotProductAttentionOp),
                             debugString, locInfo);
    }
@@ -717,7 +717,7 @@ new file mode 100644
 diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
 --- a/runtime/lib/ttnn/program_executor.cpp
 +++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -121,6 +121,7 @@
+@@ -123,6 +123,7 @@
  #include "operations/transformer/nlp_create_qkv_heads_decode.h"
  #include "operations/transformer/paged_flash_multi_latent_attention_decode.h"
  #include "operations/transformer/paged_scaled_dot_product_attention_decode.h"
@@ -725,7 +725,7 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
  #include "operations/transformer/rotary_embedding.h"
  #include "operations/transformer/rotary_embedding_llama.h"
  #include "operations/transformer/scaled_dot_product_attention.h"
-@@ -720,6 +721,18 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+@@ -752,6 +753,18 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
      return operations::transformer::run(
          op->type_as_ScaledDotProductAttentionOp(), getContext());
    }

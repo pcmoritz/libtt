@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -394,9 +394,9 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
+@@ -451,9 +451,9 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
  // tt-metal uses predicate type for where op operation. If the predicate data
  // type does not match with inputs/output data type; tt-metal can generate
  // incorrect results or other failures. Add a data type workaround if predicate
@@ -14,7 +14,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
  // tt-metal issues to track mixed data types ops bug.
  // https://github.com/tenstorrent/tt-metal/issues/17998
  // https://github.com/tenstorrent/tt-metal/issues/24511
-@@ -418,13 +418,22 @@ TTNNOperandsWorkaroundsFactory::createWhereOpOperandsWorkarounds(
+@@ -475,13 +475,22 @@ TTNNOperandsWorkaroundsFactory::createWhereOpOperandsWorkarounds(
    if (predicateElementType.isInteger() ||
        predicateElementType != inputElementType) {
      if (inputElementType.isInteger()) {
@@ -62,7 +62,7 @@ diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/
 diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
-@@ -422,6 +422,39 @@ public:
+@@ -423,6 +423,39 @@ public:
    }
  };
  
@@ -102,7 +102,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
  // Pass to apply workarounds to the operands of TTNN operations.
  class TTNNWorkarounds : public impl::TTNNWorkaroundsBase<TTNNWorkarounds> {
  public:
-@@ -431,7 +464,7 @@ public:
+@@ -432,7 +465,7 @@ public:
      if (decompositionWorkaroundsEnabled) {
        RewritePatternSet patterns(&getContext());
        patterns.add<

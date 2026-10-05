@@ -1,27 +1,24 @@
 diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/reader_update_cache_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/reader_update_cache_interleaved_start_id.cpp
 --- ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/reader_update_cache_interleaved_start_id.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/reader_update_cache_interleaved_start_id.cpp
-@@ -44,8 +44,12 @@ void kernel_main() {
+@@ -35,6 +35,10 @@ void kernel_main() {
      // 0 = legacy unbounded behavior; nonzero = wrap update_idx mod this value before
      // page_table lookup (bounded sliding-window cache support).
-     constexpr uint32_t cache_position_modulo = get_compile_time_arg_val(18);
+     constexpr auto cache_position_modulo = get_arg(args::cache_position_modulo);
 +    // Shared paged updates: each tile is read, updated with the rows of every user
 +    // that targets it, and written back once by that tile's first user.
-+    constexpr bool grouped = get_compile_time_arg_val(19) == 1;
-+    constexpr uint32_t num_users = get_compile_time_arg_val(20);
++    constexpr bool grouped = get_arg(args::grouped) == 1;
++    constexpr auto num_users = get_arg(args::num_users);
  
--    constexpr auto s0_args = TensorAccessorArgs<19>();
-+    constexpr auto s0_args = TensorAccessorArgs<21>();
-     constexpr auto index_tensor_args = TensorAccessorArgs<s0_args.next_compile_time_args_offset()>();
-     constexpr auto page_table_args = TensorAccessorArgs<index_tensor_args.next_compile_time_args_offset()>();
+     constexpr uint32_t head_offset_t = Wt * St;
  
-@@ -95,23 +99,38 @@ void kernel_main() {
-                 const auto page_table_gen = TensorAccessor(page_table_args, page_table_tensor_addr);
-                 cb_page_table.reserve_back(1);
-                 uint32_t page_table_cb_wr_ptr = cb_page_table.get_write_ptr();
+@@ -88,23 +92,38 @@ void kernel_main() {
+                 const auto page_table_gen = TensorAccessor(tensor::page_table);
+                 dfb_page_table.reserve_back(1);
+                 uint32_t page_table_wr_ptr = dfb_page_table.get_write_ptr();
 -                noc.async_read(
 -                    page_table_gen,
--                    CoreLocalMem<uint32_t>(page_table_cb_wr_ptr),
+-                    CoreLocalMem<uint32_t>(page_table_wr_ptr),
 -                    page_table_stick_size,
 -                    {.page_id = my_batch_idx},
 -                    {});
@@ -30,15 +27,15 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/data
 +                     ++user) {
 +                    noc.async_read(
 +                        page_table_gen,
-+                        CoreLocalMem<uint32_t>(page_table_cb_wr_ptr + (grouped ? user : 0) * page_table_stick_size),
++                        CoreLocalMem<uint32_t>(page_table_wr_ptr + (grouped ? user : 0) * page_table_stick_size),
 +                        page_table_stick_size,
 +                        {.page_id = user},
 +                        {});
 +                }
                  noc.async_read_barrier();
-                 cb_page_table.push_back(1);
+                 dfb_page_table.push_back(1);
 -                volatile tt_l1_ptr uint32_t* page_table_ptr =
--                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(page_table_cb_wr_ptr);
+-                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(page_table_wr_ptr);
 -
 -                const uint32_t virtual_block_id = update_idx / block_size;
 -                const uint32_t physical_block_id = page_table_ptr[virtual_block_id];
@@ -53,7 +50,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/data
 +                    }
 +                    const uint32_t idx = cache_position_modulo > 0 ? raw_idx % cache_position_modulo : raw_idx;
 +                    volatile tt_l1_ptr uint32_t* page_table_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
-+                        page_table_cb_wr_ptr + (grouped ? user : 0) * page_table_stick_size);
++                        page_table_wr_ptr + (grouped ? user : 0) * page_table_stick_size);
 +                    const uint32_t physical_block_id = page_table_ptr[idx / block_size];
 +                    return physical_block_id * num_heads * block_size_t * Wt +
 +                           (idx % block_size) / TILE_HEIGHT * Wt;
@@ -66,28 +63,26 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/data
 +                        skip_update |= tile_id(user) == cache_id;
 +                    }
 +                }
- 
-             } else {
-                 const uint32_t cache_batch_tile_offset = my_batch_idx * cache_batch_num_tiles;
+             }
+ #else
+             {
 diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/writer_update_cache_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/writer_update_cache_interleaved_start_id.cpp
 --- ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/writer_update_cache_interleaved_start_id.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/dataflow/writer_update_cache_interleaved_start_id.cpp
-@@ -45,8 +45,13 @@ void kernel_main() {
+@@ -36,6 +36,12 @@ void kernel_main() {
      // 0 = legacy unbounded behavior; nonzero = wrap update_idx mod this value before
      // page_table lookup (bounded sliding-window cache support).
-     constexpr uint32_t cache_position_modulo = get_compile_time_arg_val(17);
+     constexpr auto cache_position_modulo = get_arg(args::cache_position_modulo);
 +    // Shared paged updates: the first user of a tile writes the rows of every
 +    // user that targets it, reading their untilized inputs from their cores.
-+    constexpr bool grouped = get_compile_time_arg_val(18) == 1;
-+    constexpr uint32_t num_users = get_compile_time_arg_val(19);
-+    constexpr uint32_t page_table_stick_size = get_compile_time_arg_val(20);
- 
--    constexpr auto s0_args = TensorAccessorArgs<18>();
-+    constexpr auto s0_args = TensorAccessorArgs<21>();
++    // Each user's physical core (x, y) is a pair of common varargs.
++    constexpr bool grouped = get_arg(args::grouped) == 1;
++    constexpr auto num_users = get_arg(args::num_users);
++    constexpr auto page_table_stick_size = get_arg(args::page_table_stick_size);
  
      constexpr uint32_t head_offset_t = Wt * St;
  
-@@ -67,6 +72,9 @@ void kernel_main() {
+@@ -62,6 +68,9 @@ void kernel_main() {
      uint32_t update_idx = 0;
  
      bool skip_update = false;
@@ -95,14 +90,14 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/data
 +    uint32_t user_tile[grouped ? num_users : 1];
 +    uint32_t user_offset_B[grouped ? num_users : 1];
  
-     if constexpr (use_index_tensor) {
-         cb_index.wait_front(1);
-@@ -86,15 +94,25 @@ void kernel_main() {
-             if constexpr (is_paged_cache) {
-                 cb_page_table.wait_front(1);
-                 uint32_t page_table_cb_rd_ptr = cb_page_table.get_read_ptr();
+ #ifdef USE_INDEX_TENSOR
+     {
+@@ -83,15 +92,25 @@ void kernel_main() {
+             {
+                 dfb_page_table.wait_front(1);
+                 uint32_t page_table_rd_ptr = dfb_page_table.get_read_ptr();
 -                volatile tt_l1_ptr uint32_t* page_table_ptr =
--                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(page_table_cb_rd_ptr);
+-                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(page_table_rd_ptr);
 -
 -                const uint32_t virtual_block_id = update_idx / block_size;
 -                const uint32_t physical_block_id = page_table_ptr[virtual_block_id];
@@ -117,7 +112,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/data
 +                    }
 +                    const uint32_t idx = cache_position_modulo > 0 ? raw_idx % cache_position_modulo : raw_idx;
 +                    volatile tt_l1_ptr uint32_t* page_table_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
-+                        page_table_cb_rd_ptr + (grouped ? user : 0) * page_table_stick_size);
++                        page_table_rd_ptr + (grouped ? user : 0) * page_table_stick_size);
 +                    const uint32_t physical_block_id = page_table_ptr[idx / block_size];
 +                    return physical_block_id * num_heads * block_size_t * Wt +
 +                           (idx % block_size) / TILE_HEIGHT * Wt;
@@ -131,9 +126,9 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/data
 +                }
  
                  // Page-table value consumed; pop to balance the wait above.
-                 cb_page_table.pop_front(1);
-@@ -117,18 +135,67 @@ void kernel_main() {
-     uint32_t input_l1_read_addr = cb_untilized_input.get_read_ptr();
+                 dfb_page_table.pop_front(1);
+@@ -119,18 +138,67 @@ void kernel_main() {
+     uint32_t input_l1_read_addr = dfb_untilized_input.get_read_ptr();
      UnicastEndpoint local_src;
  
 +    // In grouped mode, a user that is not the first of its tile hands its input
@@ -141,7 +136,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/data
 +    const uint32_t my_tile = cache_id;
 +    uint32_t leader = my_batch_idx;
 +    uint32_t members = 0;
-+    Semaphore<> sem(receiver_sem_id);
++    Semaphore sem(sem::in0_seq);
 +    if constexpr (grouped) {
 +        if (!skip_update) {
 +            for (uint32_t user = 0; user < num_users; ++user) {
@@ -152,7 +147,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/data
 +            }
 +        }
 +        if (leader != my_batch_idx) {
-+            sem.up(noc, get_arg_val<uint32_t>(7 + 2 * leader), get_arg_val<uint32_t>(8 + 2 * leader), 1);
++            sem.up(noc, get_common_vararg(2 * leader), get_common_vararg(2 * leader + 1), 1);
 +            noc.async_atomic_barrier();
 +            skip_update = true;
 +            members = 0;
@@ -171,11 +166,11 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/data
 +    }
 +
      for (uint32_t cur_head = 0; cur_head < num_heads; ++cur_head) {
-         // Wait on compute to untilize a block. Update that block in L1.
-         cb_untilized_cache.wait_front(Wt);
-         cb_untilized_cache2.reserve_back(Wt);
+         // Wait on compute to untilize a block. Update that block in SRAM.
+         dfb_untilized_cache.wait_front(Wt);
+         dfb_untilized_cache2.reserve_back(Wt);
  
-         uint32_t cache_l1_write_addr = cb_untilized_cache.get_read_ptr() + cache_tile_offset_B;
+         uint32_t cache_l1_write_addr = dfb_untilized_cache.get_read_ptr() + cache_tile_offset_B;
 -        noc.async_read(
 -            local_src,
 -            CoreLocalMem<uint32_t>(cache_l1_write_addr),
@@ -187,10 +182,10 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/data
 +                if (user_tile[user] == my_tile && user_offset_B[user] != (uint32_t)-1) {
 +                    noc.async_read(
 +                        local_src,
-+                        CoreLocalMem<uint32_t>(cb_untilized_cache.get_read_ptr() + user_offset_B[user]),
++                        CoreLocalMem<uint32_t>(dfb_untilized_cache.get_read_ptr() + user_offset_B[user]),
 +                        Wbytes,
-+                        {.noc_x = get_arg_val<uint32_t>(7 + 2 * user),
-+                         .noc_y = get_arg_val<uint32_t>(8 + 2 * user),
++                        {.noc_x = get_common_vararg(2 * user),
++                         .noc_y = get_common_vararg(2 * user + 1),
 +                         .addr = input_l1_read_addr},
 +                        {});
 +                }
@@ -204,11 +199,11 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/data
 +                {});
 +        }
          noc.async_read_barrier();
-         cb_untilized_cache2.push_back(Wt);
-         cb_untilized_cache.pop_front(Wt);  // NEW
-@@ -159,6 +226,19 @@ void kernel_main() {
+         dfb_untilized_cache2.push_back(Wt);
+         dfb_untilized_cache.pop_front(Wt);  // NEW
+@@ -161,9 +229,22 @@ void kernel_main() {
  
-     cb_untilized_input.pop_front(Wt);
+     dfb_untilized_input.pop_front(Wt);
  
 +    if constexpr (grouped) {
 +        if (leader != my_batch_idx) {
@@ -216,7 +211,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/data
 +        } else if (members > 0) {
 +            for (uint32_t user = 0; user < num_users; ++user) {
 +                if (user != my_batch_idx && user_tile[user] == my_tile) {
-+                    sem.up(noc, get_arg_val<uint32_t>(7 + 2 * user), get_arg_val<uint32_t>(8 + 2 * user), 1);
++                    sem.up(noc, get_common_vararg(2 * user), get_common_vararg(2 * user + 1), 1);
 +                }
 +            }
 +            noc.async_atomic_barrier();
@@ -224,8 +219,12 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/kernels/data
 +    }
 +
      if (send_signal) {
-         // send signal to receiver core that we are done using the input CB
-         Semaphore<>(receiver_sem_id).up(noc, send_core_x, send_core_y, 1);
+         // send signal to receiver core that we are done using the input buffer
+-        Semaphore(sem::in0_seq).up(noc, send_core_x, send_core_y, 1);
++        sem.up(noc, send_core_x, send_core_y, 1);
+         noc.async_atomic_barrier();
+     }
+ }
 diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp
@@ -242,7 +241,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache
 diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_program_factory.cpp
-@@ -170,6 +170,15 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
+@@ -205,6 +205,15 @@ ttnn::device_operation::ProgramArtifacts build_paged_update_cache_artifacts(
      const std::optional<ShardSpec>& shard_spec = input_tensor.shard_spec();
      CoreRangeSet all_cores = shard_spec.value().grid;
      uint32_t num_cores = all_cores.num_cores();
@@ -256,46 +255,49 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache
 +            "Shared paged cache update needs a page table row per user");
 +    }
      uint32_t num_input_tiles = shard_spec.value().shape[0] * shard_spec.value().shape[1] / TILE_HW;
-     auto* in1_buffer = shard_spec.has_value() ? input_tensor.buffer() : nullptr;
  
-@@ -264,13 +273,15 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
-     }
- 
-     if (is_paged_cache) {
-+        // Grouped updates read every user's page table row.
-+        const uint32_t page_table_cb_size = (grouped ? num_cores : 1) * page_table_stick_size;
-         desc.cbs.push_back(CBDescriptor{
--            .total_size = page_table_stick_size,
-+            .total_size = page_table_cb_size,
-             .core_ranges = all_cores,
-             .format_descriptors = {{CBFormatDescriptor{
-                 .buffer_index = static_cast<uint8_t>(cb_pagetable_id),
-                 .data_format = page_table_data_format,
--                .page_size = page_table_stick_size,
-+                .page_size = page_table_cb_size,
-             }}},
+     uint32_t num_cache_tiles = 2 * Wt;   // double buffered
+@@ -274,9 +283,10 @@ ttnn::device_operation::ProgramArtifacts build_paged_update_cache_artifacts(
          });
      }
-@@ -304,6 +315,8 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
-         St,
-         in0_sequential_mode_semaphore_id,
-         cache_position_modulo,
-+        (std::uint32_t)grouped,
-+        num_cores,
+     if (is_paged_cache) {
++        // Grouped updates read every user's page table row.
+         dataflow_buffers.push_back(DataflowBufferSpec{
+             .unique_id = UC_PAGE_TABLE,
+-            .entry_size = page_table_stick_size,
++            .entry_size = (grouped ? num_cores : 1) * page_table_stick_size,
+             .num_entries = 1,
+             .data_format_metadata = page_table_data_format,
+         });
+@@ -366,6 +376,8 @@ ttnn::device_operation::ProgramArtifacts build_paged_update_cache_artifacts(
+                 {"page_table_stick_size", page_table_stick_size},
+                 {"St", St},
+                 {"cache_position_modulo", cache_position_modulo},
++                {"grouped", static_cast<uint32_t>(grouped)},
++                {"num_users", num_cores},
+             },
+         .runtime_arg_schema = {.runtime_arg_names = {"cache_start_id", "my_batch_idx", "wait_to_start"}},
+         .hw_config = create_reader_datamovement_config(device->arch()),
+@@ -445,6 +457,9 @@ ttnn::device_operation::ProgramArtifacts build_paged_update_cache_artifacts(
+                 {"max_blocks_per_seq", max_blocks_per_seq},
+                 {"St", St},
+                 {"cache_position_modulo", cache_position_modulo},
++                {"grouped", static_cast<uint32_t>(grouped)},
++                {"num_users", num_cores},
++                {"page_table_stick_size", page_table_stick_size},
+             },
+         .runtime_arg_schema =
+             {.runtime_arg_names =
+@@ -455,6 +470,8 @@ ttnn::device_operation::ProgramArtifacts build_paged_update_cache_artifacts(
+                   "send_core_x",
+                   "send_core_y"}},
+         .hw_config = create_writer_datamovement_config(device->arch()),
++        // Grouped writers read inputs from, and signal, every user's core: (x, y) per user.
++        .advanced_options = {.num_common_runtime_varargs = grouped ? 2 * num_cores : 0},
      };
-     TensorAccessorArgs(dst_buffer).append_to(reader_compile_time_args);
-     TensorAccessorArgs(update_idxs_tensor.has_value() ? update_idxs_tensor->buffer() : nullptr)
-@@ -331,6 +344,9 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
-         St,
-         in0_sequential_mode_semaphore_id,
-         cache_position_modulo,
-+        (std::uint32_t)grouped,
-+        num_cores,
-+        page_table_stick_size,
-     };
-     TensorAccessorArgs(dst_buffer).append_to(writer_compile_time_args);
  
-@@ -386,7 +402,7 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
+     // ---------------- Compute ----------------
+@@ -580,7 +597,7 @@ ttnn::device_operation::ProgramArtifacts build_paged_update_cache_artifacts(
  
          bool wait_to_start, send_signal;
          uint32_t send_core_x, send_core_y;
@@ -304,38 +306,18 @@ diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache
              // Share cache
              wait_to_start = i != 0;
              send_signal = i != num_cores - 1;
-@@ -420,17 +436,23 @@ ProgramDescriptor PagedUpdateCacheProgramFactory::create_descriptor(
-             reader_desc.emplace_runtime_args(core, rargs);
-         }
- 
--        writer_desc.emplace_runtime_args(
--            core,
--            {
--                dst_buffer,
--                use_index_tensor ? 0u : cache_start_id,
--                use_index_tensor ? 0u : tile_update_offset_B,
--                i,
--                static_cast<uint32_t>(send_signal),
--                send_core_x,
--                send_core_y,
--            });
-+        KernelDescriptor::RTArgList wargs;
-+        wargs.push_back(dst_buffer);
-+        wargs.push_back(use_index_tensor ? 0u : cache_start_id);
-+        wargs.push_back(use_index_tensor ? 0u : tile_update_offset_B);
-+        wargs.push_back(i);
-+        wargs.push_back(static_cast<uint32_t>(send_signal));
-+        wargs.push_back(send_core_x);
-+        wargs.push_back(send_core_y);
-+        if (grouped) {
-+            // Every user's core, which grouped writers read inputs from and signal.
-+            for (const CoreCoord& user_core : cores) {
-+                const CoreCoord physical = device->worker_core_from_logical_core(user_core);
-+                wargs.push_back(static_cast<uint32_t>(physical.x));
-+                wargs.push_back(static_cast<uint32_t>(physical.y));
-+            }
-+        }
-+        writer_desc.emplace_runtime_args(core, wargs);
+@@ -617,6 +634,14 @@ ttnn::device_operation::ProgramArtifacts build_paged_update_cache_artifacts(
+             });
      }
  
-     desc.kernels.push_back(std::move(reader_desc));
++    if (grouped) {
++        for (const CoreCoord& user_core : cores) {
++            const CoreCoord physical = device->worker_core_from_logical_core(user_core);
++            writer_run_args.advanced_options.common_runtime_varargs.push_back(physical.x);
++            writer_run_args.advanced_options.common_runtime_varargs.push_back(physical.y);
++        }
++    }
++
+     ProgramRunArgs run_args;
+     run_args.kernel_run_args = {std::move(reader_run_args), std::move(writer_run_args)};
+     run_args.tensor_args = paged_update_cache_tensor_args(tensor_args);
