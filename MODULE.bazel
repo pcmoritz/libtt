@@ -315,6 +315,7 @@ http_archive(
         "//third_party/tt_metal:ccl_semaphores_l1_small.patch",
         "//third_party/tt_metal:all_gather_alt_route_completion.patch",
         "//third_party/tt_metal:graph_tracking_program_context.patch",
+        "//third_party/tt_metal:conv_single_channel_not_depthwise.patch",
     ],
     sha256 = "b609f58d0b388cb73eb5be0df9812dd13e86d57c5eb4acf65cd02e687009a4e6",
     strip_prefix = "tt-metal-d04395ed862b4c65eb6877000c40200f456cb74e",

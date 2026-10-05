@@ -1,0 +1,14 @@
+diff --git ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp
+--- ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp
++++ ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp
+@@ -539,7 +539,9 @@ bool is_1d_depthwise_conv(
+     uint32_t kernel_height,
+     uint32_t image_height,
+     bool has_bias) {
+-    bool is_depthwise_conv = groups == input_channels && groups == output_channels;
++    // A single channel is an ordinary convolution, which the 1D depthwise path does not compute
++    // correctly (it returned garbage for every jnp.convolve).
++    bool is_depthwise_conv = groups > 1 && groups == input_channels && groups == output_channels;
+     // 1D depthwise path supports kernel_height == 1 (and any kernel_width >= 1). The kw>1 case
+     // accumulates across kernel taps via per-tap blocks in the depthwise factory.
+     return is_depthwise_conv && is_1d_conv(kernel_height, image_height) && !has_bias;
