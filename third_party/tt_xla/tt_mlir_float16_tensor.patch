@@ -13,17 +13,14 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h b/include/ttmlir/
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
-@@ -508,6 +508,10 @@ private:
-     if (!hasLayoutChange(input, output)) {
-       return false;
-     }
-+    if (input.getDataType() == ttcore::DataType::Float16 &&
-+        output.getDataType() == ttcore::DataType::Float16) {
-+      return false;
-+    }
-     return !isOnDeviceLayoutChangeSupportedForDataType(input.getDataType()) &&
-            !isOnDeviceLayoutChangeSupportedForDataType(output.getDataType());
-   }
+@@ -113,6 +113,7 @@ private:
+   bool
+   isOnDeviceLayoutChangeSupportedForDataType(ttcore::DataType dataType) const {
+     return dataType == ttcore::DataType::BFloat16 ||
++           dataType == ttcore::DataType::Float16 ||
+            dataType == ttcore::DataType::Float32 ||
+            dataType == ttcore::DataType::UInt32 ||
+            dataType == ttcore::DataType::UInt16 ||
 diff --git a/lib/OpModel/TTNN/Conversion.cpp b/lib/OpModel/TTNN/Conversion.cpp
 --- a/lib/OpModel/TTNN/Conversion.cpp
 +++ b/lib/OpModel/TTNN/Conversion.cpp
