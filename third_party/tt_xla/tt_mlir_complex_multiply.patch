@@ -1,11 +1,19 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 --- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
-@@ -4,0 +5,2 @@
-+
+@@ -2,6 +2,8 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
+ 
 +#include <utility>
-@@ -130,0 +132,37 @@
 +
+ #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h"
+ 
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+@@ -128,6 +130,43 @@ static Value packRealImag(Location loc, Value real, Value imag,
+   return transposeLeadingToTrailing(loc, concat.getResult(), builder);
+ }
+ 
 +// Extracts the real and imaginary components from tensor<...x2xf32> after a
 +// single transpose of the input.
 +static std::pair<Value, Value> unpackRealImag(Location loc, Value input,
@@ -42,8 +50,14 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +
 +  return {unpackComponent(0), unpackComponent(1)};
 +}
-@@ -204,0 +243,36 @@
 +
+ // ---------------------------------------------------------------------------
+ // Conversion patterns
+ // ---------------------------------------------------------------------------
+@@ -202,6 +241,42 @@ public:
+ };
+ } // namespace
+ 
 +// Decomposes (a + bi) * (c + di) into
 +//   real = ac - bd
 +//   imag = ad + bc
@@ -79,17 +93,24 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +  }
 +};
 +} // namespace
-@@ -581,5 +656,5 @@ struct StableHLOComplexDataTypeConversionPass
++
+ // Decomposes real(x) / imag(x) -> tensor<...xf32>:
+ //
+ //   tensor<d0x...xdNx2>   <- unpacked complex layout
+@@ -580,7 +655,7 @@ struct StableHLOComplexDataTypeConversionPass
+         mlir::stablehlo::SliceOp, mlir::stablehlo::GatherOp,
          mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
          mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
 -        mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp,
 +        mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp, mlir::stablehlo::MulOp,
          mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp>(
          isNotComplexType);
-@@ -624,5 +699,6 @@ struct StableHLOComplexDataTypeConversionPass
+ 
+@@ -624,6 +699,7 @@ struct StableHLOComplexDataTypeConversionPass
          ComplexBroadcastInDimOpConversionPattern,
          ComplexConstantOpConversionPattern, ComplexGatherOpConversionPattern,
          ComplexIotaOpConversionPattern,
 +        ComplexMulOpConversionPattern,
          ComplexSliceOpConversionPattern,
          ComplexTypeDefaultConversionPattern<mlir::stablehlo::AddOp>,
+         ComplexTypeDefaultConversionPattern<mlir::stablehlo::ConcatenateOp>,

@@ -1,7 +1,7 @@
 diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/include/tt/runtime/detail/ttnn/types/types.h
 --- a/runtime/include/tt/runtime/detail/ttnn/types/types.h
 +++ b/runtime/include/tt/runtime/detail/ttnn/types/types.h
-@@ -124,6 +124,13 @@
+@@ -114,6 +114,13 @@ struct LayoutDesc {
    ::ttnn::Layout layout;
    ::ttnn::DataType dataType;
    std::optional<::ttnn::MemoryConfig> memoryConfig;
@@ -15,10 +15,91 @@ diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/incl
  
    static std::shared_ptr<LayoutDesc>
    fromTensor(const ::tt::runtime::Tensor &tensor);
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -10,6 +10,8 @@
+ #include "tt/runtime/detail/ttnn/types/types.h"
+ #include "tt/runtime/detail/ttnn/utils.h"
+ #include "tt/runtime/types.h"
++#include "ttnn/operations/core/core.hpp"
++#include "ttnn/operations/data_movement/copy/copy.hpp"
+ 
+ namespace tt::runtime::ttnn::operations::trace {
+ 
+@@ -41,6 +43,19 @@ static void copyTensorFromDeviceToDevice(const ::ttnn::Tensor &srcTensor,
+   ::ttnn::copy_to_device(hostSrcTensor, dstTensor);
+ }
+ 
++// Copies a host-staged input that already lives on device (e.g. another
++// executable's output) into its slot without leaving the device.
++static void copyTensorOnDevice(const ::ttnn::Tensor &srcTensor,
++                               ::ttnn::Tensor &dstTensor) {
++  ::ttnn::Tensor src = srcTensor;
++  if (src.layout() != dstTensor.layout() || src.dtype() != dstTensor.dtype() ||
++      src.memory_config() != dstTensor.memory_config()) {
++    src = ::ttnn::to_layout(src, dstTensor.layout(), dstTensor.dtype(),
++                            dstTensor.memory_config());
++  }
++  ::ttnn::copy(src, dstTensor);
++}
++
+ // Runs the slot allocation program, which allocates the persistent device
+ // buffers this trace will read from and write to. Runs exactly once per trace.
+ //
+@@ -122,7 +137,14 @@ updateTraceInputSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+     // across trace executions, so their versions are expected to match.
+     // Regular inputs live on host and change between executions, so a version
+     // mismatch is the expected case — we copy them from host to device below.
+-    if (inputTensorWrapper.getVersion() == inputSlotWrapper.getVersion()) {
++    // A staged input that lives on device may be another trace's output slot,
++    // which replays overwrite without bumping its version, so it is always
++    // copied.
++    const bool stagedOnDevice =
++        !deviceResident && inputTensorWrapper.getTensor().storage_type() ==
++                               ::ttnn::StorageType::DEVICE;
++    if (!stagedOnDevice &&
++        inputTensorWrapper.getVersion() == inputSlotWrapper.getVersion()) {
+       continue;
+     }
+ 
+@@ -136,6 +158,9 @@ updateTraceInputSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+                 i, ", expected version: ", inputSlotWrapper.getVersion());
+       copyTensorFromDeviceToDevice(inputTensorWrapper.getTensor(),
+                                    inputSlotWrapper.getTensor());
++    } else if (stagedOnDevice) {
++      copyTensorOnDevice(inputTensorWrapper.getTensor(),
++                         inputSlotWrapper.getTensor());
+     } else {
+       // Regular inputs reside on host and are copied into their trace input
+       // slots on device. A version mismatch is expected here since the host
+@@ -192,7 +217,21 @@ static TraceData captureTrace(
+                         outputSlots.size());
+   for (const ::tt::target::ttnn::TensorRef *input : *op->inputs()) {
+     if (!::tt::runtime::ttnn::utils::inDeviceMemory(input)) {
+-      captureInputs.push_back(tensorPool.getRuntimeTensorAndValidate(input));
++      const ::tt::runtime::Tensor &tensor =
++          tensorPool.getRuntimeTensorAndValidate(input);
++      const ::ttnn::Tensor &ttnnTensor =
++          ::tt::runtime::ttnn::utils::getTTNNTensorFromRuntimeTensor(tensor);
++      if (ttnnTensor.storage_type() != ::ttnn::StorageType::DEVICE) {
++        captureInputs.push_back(tensor);
++        continue;
++      }
++      // The capture program writes host-staged inputs into their slots itself,
++      // so an input that arrived on device goes through the host this once.
++      captureInputs.push_back(
++          ::tt::runtime::ttnn::utils::createRuntimeTensorFromTTNN(
++              ::ttnn::to_layout(
++                  ::ttnn::from_device(ttnnTensor),
++                  ::tt::runtime::ttnn::utils::inferLayoutFromTileShape(input))));
+     }
+   }
+   captureInputs.insert(captureInputs.end(), inputSlots.begin(),
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -983,6 +983,44 @@
+@@ -945,6 +945,44 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
    return result;
  }
  
@@ -63,7 +144,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
    const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
        LayoutDesc::fromTensor(tensor);
-@@ -990,6 +1028,12 @@
+@@ -952,6 +990,12 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
    const LayoutDesc &desiredLayoutDesc =
        layout.as<LayoutDesc>(DeviceRuntime::TTNN);
  
@@ -76,7 +157,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    return *tensorLayoutDesc == desiredLayoutDesc;
  }
  
-@@ -1028,6 +1072,11 @@
+@@ -990,6 +1034,11 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
  
    std::shared_ptr<LayoutDesc> layoutDesc = std::make_shared<LayoutDesc>(
        inputStorageType, inputLayout, inputDataType, inputMemoryConfig);
@@ -88,84 +169,3 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  
    return Layout(std::static_pointer_cast<void>(layoutDesc),
                  DeviceRuntime::TTNN);
-diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
---- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
-+++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
-@@ -13,6 +13,8 @@
- #include "tt/runtime/detail/ttnn/types/types.h"
- #include "tt/runtime/detail/ttnn/utils.h"
- #include "tt/runtime/types.h"
-+#include "ttnn/operations/core/core.hpp"
-+#include "ttnn/operations/data_movement/copy/copy.hpp"
- 
- namespace tt::runtime::ttnn::operations::trace {
- 
-@@ -92,6 +94,19 @@
-   ::ttnn::copy_to_device(hostSrcTensor, dstTensor);
- }
- 
-+// Copies a host-staged input that already lives on device (e.g. another
-+// executable's output) into its slot without leaving the device.
-+static void copyTensorOnDevice(const ::ttnn::Tensor &srcTensor,
-+                               ::ttnn::Tensor &dstTensor) {
-+  ::ttnn::Tensor src = srcTensor;
-+  if (src.layout() != dstTensor.layout() || src.dtype() != dstTensor.dtype() ||
-+      src.memory_config() != dstTensor.memory_config()) {
-+    src = ::ttnn::to_layout(src, dstTensor.layout(), dstTensor.dtype(),
-+                            dstTensor.memory_config());
-+  }
-+  ::ttnn::copy(src, dstTensor);
-+}
-+
- // Runs the slot allocation program, which allocates the persistent device
- // buffers this trace will read from and write to. Runs exactly once per trace.
- //
-@@ -185,7 +200,14 @@
-     // across trace executions, so their versions are expected to match.
-     // Regular inputs live on host and change between executions, so a version
-     // mismatch is the expected case — we copy them from host to device below.
--    if (inputTensorWrapper.getVersion() == inputSlotWrapper.getVersion()) {
-+    // A staged input that lives on device may be another trace's output slot,
-+    // which replays overwrite without bumping its version, so it is always
-+    // copied.
-+    const bool stagedOnDevice =
-+        !deviceResident && inputTensorWrapper.getTensor().storage_type() ==
-+                               ::ttnn::StorageType::DEVICE;
-+    if (!stagedOnDevice &&
-+        inputTensorWrapper.getVersion() == inputSlotWrapper.getVersion()) {
-       continue;
-     }
- 
-@@ -199,6 +221,9 @@
-                 i, ", expected version: ", inputSlotWrapper.getVersion());
-       copyTensorFromDeviceToDevice(inputTensorWrapper.getTensor(),
-                                    inputSlotWrapper.getTensor());
-+    } else if (stagedOnDevice) {
-+      copyTensorOnDevice(inputTensorWrapper.getTensor(),
-+                         inputSlotWrapper.getTensor());
-     } else {
-       // Regular inputs reside on host and are copied into their trace input
-       // slots on device. A version mismatch is expected here since the host
-@@ -255,7 +280,21 @@
-                         outputSlots.size());
-   for (const ::tt::target::ttnn::TensorRef *input : *op->inputs()) {
-     if (!::tt::runtime::ttnn::utils::inDeviceMemory(input)) {
--      captureInputs.push_back(tensorPool.getRuntimeTensorAndValidate(input));
-+      const ::tt::runtime::Tensor &tensor =
-+          tensorPool.getRuntimeTensorAndValidate(input);
-+      const ::ttnn::Tensor &ttnnTensor =
-+          ::tt::runtime::ttnn::utils::getTTNNTensorFromRuntimeTensor(tensor);
-+      if (ttnnTensor.storage_type() != ::ttnn::StorageType::DEVICE) {
-+        captureInputs.push_back(tensor);
-+        continue;
-+      }
-+      // The capture program writes host-staged inputs into their slots itself,
-+      // so an input that arrived on device goes through the host this once.
-+      captureInputs.push_back(
-+          ::tt::runtime::ttnn::utils::createRuntimeTensorFromTTNN(
-+              ::ttnn::to_layout(
-+                  ::ttnn::from_device(ttnnTensor),
-+                  ::tt::runtime::ttnn::utils::inferLayoutFromTileShape(input))));
-     }
-   }
-   captureInputs.insert(captureInputs.end(), inputSlots.begin(),

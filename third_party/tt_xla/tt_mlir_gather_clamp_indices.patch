@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5598,6 +5598,42 @@ public:
+@@ -5612,6 +5612,42 @@ public:
          adaptor.getOperands()[1]);
      auto indexVectorDim = dimensionNumbers.getIndexVectorDim();
  

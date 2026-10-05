@@ -1,7 +1,7 @@
 diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
 --- a/pjrt_implementation/src/api/buffer_instance.cc
 +++ b/pjrt_implementation/src/api/buffer_instance.cc
-@@ -513,18 +513,12 @@ void BufferInstance::markAsDataReady() {
+@@ -506,18 +506,12 @@ void BufferInstance::markAsDataReady() {
    }
  }
  

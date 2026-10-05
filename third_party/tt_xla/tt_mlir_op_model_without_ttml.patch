@@ -1,0 +1,112 @@
+diff --git a/include/ttmlir/OpModel/TTNN/MetalHeaders.h b/include/ttmlir/OpModel/TTNN/MetalHeaders.h
+--- a/include/ttmlir/OpModel/TTNN/MetalHeaders.h
++++ b/include/ttmlir/OpModel/TTNN/MetalHeaders.h
+@@ -32,11 +32,15 @@
+ }
+ } // namespace ttnn::graph::detail
+ 
++// tt-train (ttml) training ops need tt-train's sources; their op models are
++// only built when TTMLIR_ENABLE_TTML_OPMODEL is defined.
++#ifdef TTMLIR_ENABLE_TTML_OPMODEL
+ #include "metal/ops/cross_entropy_fw/cross_entropy_fw.hpp"
+ #include "metal/ops/layernorm_fw/layernorm_fw.hpp"
+ #include "metal/ops/sdpa_bw/sdpa_bw.hpp"
+ #include "metal/ops/sdpa_fw/sdpa_fw.hpp"
+ #include "metal/optimizers/adamw/adamw.hpp"
++#endif
+ #include "ttnn/graph/graph_query_op_constraints.hpp"
+ #include "ttnn/graph/graph_query_op_runtime.hpp"
+ #include "ttnn/graph/graph_trace_utils.hpp"
+diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
+--- a/lib/OpModel/TTNN/TTNNOpModel.cpp
++++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
+@@ -9405,7 +9405,7 @@
+     bool stochasticRounding, TTNNLayoutAttr outputLayout,
+     const MockAllocatorState *initialState) {
+ 
+-#ifdef TTMLIR_ENABLE_OPMODEL
++#if defined(TTMLIR_ENABLE_OPMODEL) && defined(TTMLIR_ENABLE_TTML_OPMODEL)
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 
+@@ -9458,7 +9458,7 @@
+     llvm::APFloat beta2, llvm::APFloat epsilon, llvm::APFloat weightDecay,
+     bool stochasticRounding, TTNNLayoutAttr outputLayout) {
+ 
+-#ifdef TTMLIR_ENABLE_OPMODEL
++#if defined(TTMLIR_ENABLE_OPMODEL) && defined(TTMLIR_ENABLE_TTML_OPMODEL)
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 
+@@ -9510,7 +9510,7 @@
+     ttcore::AttentionMaskType maskType, llvm::APFloat dropoutProbability,
+     bool returnIntermediates, TTNNLayoutAttr outputLayout,
+     const MockAllocatorState *initialState) {
+-#ifdef TTMLIR_ENABLE_OPMODEL
++#if defined(TTMLIR_ENABLE_OPMODEL) && defined(TTMLIR_ENABLE_TTML_OPMODEL)
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 
+@@ -9554,7 +9554,7 @@
+     std::optional<TTNNLayoutAttr> attentionMaskLayout,
+     ttcore::AttentionMaskType maskType, llvm::APFloat dropoutProbability,
+     bool returnIntermediates, TTNNLayoutAttr outputLayout) {
+-#ifdef TTMLIR_ENABLE_OPMODEL
++#if defined(TTMLIR_ENABLE_OPMODEL) && defined(TTMLIR_ENABLE_TTML_OPMODEL)
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 
+@@ -9601,7 +9601,7 @@
+     std::optional<TTNNLayoutAttr> attentionMaskLayout,
+     ttcore::AttentionMaskType maskType, llvm::APFloat dropoutProbability,
+     TTNNLayoutAttr outputLayout, const MockAllocatorState *initialState) {
+-#ifdef TTMLIR_ENABLE_OPMODEL
++#if defined(TTMLIR_ENABLE_OPMODEL) && defined(TTMLIR_ENABLE_TTML_OPMODEL)
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 
+@@ -9658,7 +9658,7 @@
+     std::optional<TTNNLayoutAttr> attentionMaskLayout,
+     ttcore::AttentionMaskType maskType, llvm::APFloat dropoutProbability,
+     TTNNLayoutAttr outputLayout) {
+-#ifdef TTMLIR_ENABLE_OPMODEL
++#if defined(TTMLIR_ENABLE_OPMODEL) && defined(TTMLIR_ENABLE_TTML_OPMODEL)
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 
+@@ -9708,7 +9708,7 @@
+     llvm::ArrayRef<int64_t> biasShape, TTNNLayoutAttr biasLayout,
+     llvm::APFloat epsilon, bool returnMeanRstd, TTNNLayoutAttr outputLayout,
+     const MockAllocatorState *initialState) {
+-#ifdef TTMLIR_ENABLE_OPMODEL
++#if defined(TTMLIR_ENABLE_OPMODEL) && defined(TTMLIR_ENABLE_TTML_OPMODEL)
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 
+@@ -9743,7 +9743,7 @@
+     llvm::ArrayRef<int64_t> weightShape, TTNNLayoutAttr weightLayout,
+     llvm::ArrayRef<int64_t> biasShape, TTNNLayoutAttr biasLayout,
+     llvm::APFloat epsilon, bool returnMeanRstd, TTNNLayoutAttr outputLayout) {
+-#ifdef TTMLIR_ENABLE_OPMODEL
++#if defined(TTMLIR_ENABLE_OPMODEL) && defined(TTMLIR_ENABLE_TTML_OPMODEL)
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 
+@@ -9776,7 +9776,7 @@
+     llvm::ArrayRef<int64_t> inputShape, TTNNLayoutAttr inputLayout,
+     llvm::ArrayRef<int64_t> targetShape, TTNNLayoutAttr targetLayout,
+     TTNNLayoutAttr outputLayout, const MockAllocatorState *initialState) {
+-#ifdef TTMLIR_ENABLE_OPMODEL
++#if defined(TTMLIR_ENABLE_OPMODEL) && defined(TTMLIR_ENABLE_TTML_OPMODEL)
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 
+@@ -9808,7 +9808,7 @@
+     llvm::ArrayRef<int64_t> inputShape, TTNNLayoutAttr inputLayout,
+     llvm::ArrayRef<int64_t> targetShape, TTNNLayoutAttr targetLayout,
+     TTNNLayoutAttr outputLayout) {
+-#ifdef TTMLIR_ENABLE_OPMODEL
++#if defined(TTMLIR_ENABLE_OPMODEL) && defined(TTMLIR_ENABLE_TTML_OPMODEL)
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+ 

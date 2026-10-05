@@ -1,315 +1,263 @@
-diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp
-new file mode 100644
-index 0000000..b63b736
---- /dev/null
-+++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp
-@@ -0,0 +1,26 @@
-+// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
-+// SPDX-License-Identifier: Apache-2.0
-+
-+#pragma once
-+
-+#include <stdint.h>
-+
-+#include "api/dataflow/dataflow_api.h"
-+
-+FORCE_INLINE uint32_t tile_offset(uint32_t row, uint32_t column) {
-+    const uint32_t face = (row / 16) * 2 + column / 16;
-+    return face * 256 + (row % 16) * 16 + column % 16;
-+}
-+
-+FORCE_INLINE uint32_t read_index(uint32_t address, uint32_t batch) {
-+    const volatile tt_l1_ptr uint32_t* tile =
-+        reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(address);
-+    return tile[tile_offset(0, batch)];
-+}
-+
-+FORCE_INLINE bool read_flag(uint32_t address, uint32_t batch) {
-+    const volatile tt_l1_ptr uint16_t* tile =
-+        reinterpret_cast<const volatile tt_l1_ptr uint16_t*>(address);
-+    return tile[tile_offset(0, batch)] != 0;
-+}
-+
-diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
-new file mode 100644
-index 0000000000000000000000000000000000000000..319385ff2c493681ca4984cc19b05cc1f978d069
---- /dev/null
-+++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
-@@ -0,0 +1,55 @@
-+// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
-+// SPDX-License-Identifier: Apache-2.0
-+
-+#include <stdint.h>
-+
-+#include "api/compute/common.h"
-+#include "api/compute/compute_kernel_api.h"
-+#include "api/compute/eltwise_binary_sfpu.h"
-+#include "api/compute/eltwise_unary/eltwise_unary.h"
-+#include "api/compute/tile_move_copy.h"
-+#include "api/dataflow/circular_buffer.h"
-+
-+void kernel_main() {
-+    constexpr uint32_t channel_tiles = get_compile_time_arg_val(0);
-+    constexpr uint32_t num_workers = get_compile_time_arg_val(1);
-+    const uint32_t worker = get_arg_val<uint32_t>(0);
-+
-+    constexpr uint32_t operands = tt::CBIndex::c_0;
-+    constexpr uint32_t output = tt::CBIndex::c_5;
-+    CircularBuffer operands_cb(operands);
-+    CircularBuffer output_cb(output);
-+
-+    init_sfpu(operands, output);
-+    for (uint32_t channel_tile = worker; channel_tile < channel_tiles;
-+         channel_tile += num_workers) {
-+        operands_cb.wait_front(8);
-+        output_cb.reserve_back(1);
-+        tile_regs_acquire();
-+
-+        copy_tile_to_dst_init_short(operands);
-+        for (uint32_t tile = 0; tile < 8; ++tile) {
-+            copy_tile(operands, tile, tile);
+diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
+@@ -80,7 +80,7 @@ ComputeConfigDescriptor compute_cfg() {
+ // is assigned a contiguous range [wi_start, wi_start+wi_count) reads/writes exactly those tiles —
+ // the DRAM result is byte-identical no matter how items are partitioned. The first `rem` cores get
+ // one extra item (ceil), the rest get floor; every used core gets >= 1 (since P <= total).
+-struct PrepWorkDist {
++struct WorkDist {
+     std::vector<CoreCoord> cores;  // used cores, in assignment order
+     std::vector<uint32_t> wi_start;
+     std::vector<uint32_t> wi_count;
+@@ -90,14 +90,14 @@ struct PrepWorkDist {
+ // `core_cap` bounds how many cores we may use (defaults to the whole grid). Perf A/B only:
+ // setting core_cap=BH reproduces the old "1 core/head, NC chunks serial" layout exactly (each
+ // head's NC work-items are contiguous, wi in [h*NC, h*NC+NC)), using the identical kernels.
+-PrepWorkDist distribute_prep(CoreCoord grid, uint32_t total, uint32_t core_cap) {
++WorkDist distribute_work(CoreCoord grid, uint32_t total, uint32_t core_cap) {
+     const uint32_t max_cores = std::min<uint32_t>(grid.x * grid.y, core_cap);
+     const uint32_t P = std::min(total, max_cores);
+     TT_FATAL(P > 0, "prep work distribution needs >= 1 work-item (total={})", total);
+     const uint32_t base = total / P;
+     const uint32_t rem = total % P;  // first `rem` cores get base+1
+ 
+-    PrepWorkDist d;
++    WorkDist d;
+     d.cores.reserve(P);
+     d.wi_start.reserve(P);
+     d.wi_count.reserve(P);
+@@ -124,44 +124,26 @@ PrepWorkDist distribute_prep(CoreCoord grid, uint32_t total, uint32_t core_cap)
+ // and o reduce over all K). We pick the finest V-blocking that fits the grid: the largest NV | Vt
+ // with BH*NV <= cores. Each core runs one (head, v-block) => BH*NV independent scans vs BH today.
+ struct ScanWorkDist {
+-    std::vector<CoreCoord> cores;
+-    std::vector<uint32_t> head;  // head index per core
+-    std::vector<uint32_t> vblk;  // v-block index per core
+-    uint32_t Vtl = 1;            // per-core v-block width (tiles) = Vt / NV
+-    uint32_t NV = 1;             // v-blocks per head
+-    CoreRangeSet core_set;
++    WorkDist work;
++    uint32_t Vtl = 1;  // per-core v-block width (tiles) = Vt / NV
++    uint32_t NV = 1;   // v-blocks per head
+ };
+ 
+ ScanWorkDist distribute_scan(CoreCoord grid, uint32_t BH, uint32_t Vt) {
+     const uint32_t ncores = grid.x * grid.y;
+-    TT_FATAL(BH <= ncores, "num_heads {} exceeds compute cores {}", BH, ncores);
+     // QWEN_GDN_SCAN_SERIAL=1 forces NV=1 (full V on 1 core/head, the old layout) for perf A/B only.
+     const char* serial_env = std::getenv("QWEN_GDN_SCAN_SERIAL");
+     const bool force_serial = serial_env && serial_env[0] == '1';
+     uint32_t NV = 1;
+-    for (uint32_t cand = force_serial ? 1u : Vt; cand >= 1; cand--) {  // cand==1 always satisfies
++    for (uint32_t cand = force_serial ? 1u : Vt; cand >= 1; cand--) {
+         if (Vt % cand == 0 && BH * cand <= ncores) {
+             NV = cand;
+             break;
+         }
+     }
+-    ScanWorkDist d;
+-    d.NV = NV;
+-    d.Vtl = Vt / NV;
+-    const uint32_t total = BH * NV;
+-    d.cores.reserve(total);
+-    d.head.reserve(total);
+-    d.vblk.reserve(total);
+-    std::set<CoreRange> crs;
+-    for (uint32_t i = 0; i < total; i++) {
+-        const CoreCoord core{i % grid.x, i / grid.x};  // row-major over the grid
+-        d.cores.push_back(core);
+-        d.head.push_back(i / NV);  // heads' v-blocks grouped contiguously
+-        d.vblk.push_back(i % NV);
+-        crs.insert(CoreRange{core, core});
+-    }
+-    d.core_set = CoreRangeSet{crs};
+-    return d;
++    // If heads exceed cores, NV stays one and each core scans several complete
++    // heads. Otherwise every work item is one independent (head, value block).
++    return {distribute_work(grid, BH * NV, ~0u), Vt / NV, NV};
+ }
+ 
+ }  // namespace
+@@ -188,7 +170,7 @@ tt::tt_metal::ProgramDescriptor ChunkGdnPrepProgramFactory::create_descriptor(
+     const uint32_t total_work = BH * NC;
+     const char* serial_env = std::getenv("QWEN_GDN_PREP_SERIAL");
+     const uint32_t core_cap = (serial_env && serial_env[0] == '1') ? BH : ~0u;
+-    auto dist = distribute_prep(device->compute_with_storage_grid_size(), total_work, core_cap);
++    auto dist = distribute_work(device->compute_with_storage_grid_size(), total_work, core_cap);
+     const CoreRangeSet& cores = dist.core_set;
+     const uint32_t n_used = static_cast<uint32_t>(dist.cores.size());
+ 
+@@ -364,9 +346,9 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
+     auto* device = in.v_beta.device();
+     // Value-parallel fan-out: each core runs one (head, v-block) sequential scan.
+     auto sdist = distribute_scan(device->compute_with_storage_grid_size(), BH, Vt_full);
+-    const CoreRangeSet& cores = sdist.core_set;
++    const CoreRangeSet& cores = sdist.work.core_set;
+     const uint32_t Vt = sdist.Vtl;  // per-core V-block width; CBs/compute use this
+-    const uint32_t n_used = static_cast<uint32_t>(sdist.cores.size());
++    const uint32_t n_used = static_cast<uint32_t>(sdist.work.cores.size());
+ 
+     // V-independent tensors (kd, q_decay, intra, k_dec_t, T_inv, dl) are read in FULL; only the
+     // V-dependent CBs (v_beta/state/out/scratch) shrink to the per-core V-block width Vt(=Vtl).
+@@ -460,13 +442,14 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
+     auto* fs_buf = outputs[1].buffer();
+ 
+     for (uint32_t i = 0; i < n_used; i++) {
+-        const auto& core = sdist.cores[i];
+-        const uint32_t h = sdist.head[i];
+-        const uint32_t vb = sdist.vblk[i];
++        const auto& core = sdist.work.cores[i];
++        const uint32_t h = sdist.work.wi_start[i] / sdist.NV;
++        const uint32_t vb = sdist.work.wi_start[i] % sdist.NV;
++        const uint32_t heads = sdist.work.wi_count[i];
+         reader.emplace_runtime_args(
+-            core, {h, vb, NC, vb_buf, kd_buf, qd_buf, it_buf, kdec_buf, dl_buf, ti_buf, s0_buf});
+-        writer.emplace_runtime_args(core, {h, vb, NC, o_buf, fs_buf});
+-        compute.emplace_runtime_args(core, {NC});
++            core, {h, vb, NC, vb_buf, kd_buf, qd_buf, it_buf, kdec_buf, dl_buf, ti_buf, s0_buf, heads});
++        writer.emplace_runtime_args(core, {h, vb, NC, o_buf, fs_buf, heads});
++        compute.emplace_runtime_args(core, {NC, heads});
+     }
+ 
+     desc.kernels.push_back(std::move(reader));
+diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/compute/chunk_gdn_scan.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/compute/chunk_gdn_scan.cpp
+--- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/compute/chunk_gdn_scan.cpp
++++ ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/compute/chunk_gdn_scan.cpp
+@@ -110,6 +110,7 @@ void kernel_main() {
+     constexpr uint32_t Kt = get_compile_time_arg_val(1);
+     constexpr uint32_t Vt = get_compile_time_arg_val(2);
+     const uint32_t NC = get_arg_val<uint32_t>(0);
++    const uint32_t heads = get_arg_val<uint32_t>(1);
+ 
+     constexpr uint32_t cc = Ct * Ct;
+     constexpr uint32_t ck = Ct * Kt;
+@@ -119,7 +120,8 @@ void kernel_main() {
+ 
+     compute_kernel_hw_startup(cb_kd, cb_vbeta, cb_out);
+ 
+-    for (uint32_t c = 0; c < NC; c++) {
++    for (uint32_t work = 0; work < heads * NC; work++) {
++        const uint32_t c = work % NC;
+         // State uses THREE single-producer CBs so no CB is produced by both the reader and
+         // compute (that reader->compute producer switch desyncs CB page pointers and deadlocks):
+         //   cb_S      : reader-produced initial state, consumed only by chunk 0.
+diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp
+--- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp
++++ ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp
+@@ -30,7 +30,8 @@ void kernel_main() {
+     constexpr auto s0_a = TensorAccessorArgs<ti_a.next_compile_time_args_offset()>();
+ 
+     // This core handles head h, V-block vb (columns [vb*Vt, vb*Vt+Vt) of the full V dimension).
+-    const uint32_t h = get_arg_val<uint32_t>(0);
++    const uint32_t first_head = get_arg_val<uint32_t>(0);
++    const uint32_t heads = get_arg_val<uint32_t>(11);
+     const uint32_t vb = get_arg_val<uint32_t>(1);
+     const uint32_t NC = get_arg_val<uint32_t>(2);
+     const uint32_t vb_addr = get_arg_val<uint32_t>(3);
+@@ -87,17 +88,19 @@ void kernel_main() {
+         cb.push_back(R * Vt);
+     };
+ 
+-    // initial state S [K, V] (once) — host always provides it (zeros if none). V-sliced.
+-    read_vslice(s0_acc, cb_S, h * Kt * Vt_full, Kt);
++    for (uint32_t h = first_head; h < first_head + heads; h++) {
++        // initial state S [K, V] (once) — host always provides it (zeros if none). V-sliced.
++        read_vslice(s0_acc, cb_S, h * Kt * Vt_full, Kt);
+ 
+-    for (uint32_t c = 0; c < NC; c++) {
+-        const uint32_t hc = h * NC + c;
+-        read_vslice(vb_acc, cb_vbeta, hc * Ct * Vt_full, Ct);  // v_beta [C, V] slice
+-        read_into(kd_acc, cb_kd, hc * ck, ck);                 // V-independent: full read
+-        read_into(qd_acc, cb_qdecay, hc * ck, ck);
+-        read_into(it_acc, cb_intra, hc * cc, cc);
+-        read_into(kc_acc, cb_kdec_t, hc * kc, kc);
+-        read_into(dl_acc, cb_dl, hc * 1, 1);
+-        read_into(ti_acc, cb_Tinv, hc * cc, cc);
++        for (uint32_t c = 0; c < NC; c++) {
++            const uint32_t hc = h * NC + c;
++            read_vslice(vb_acc, cb_vbeta, hc * Ct * Vt_full, Ct);  // v_beta [C, V] slice
++            read_into(kd_acc, cb_kd, hc * ck, ck);                 // V-independent: full read
++            read_into(qd_acc, cb_qdecay, hc * ck, ck);
++            read_into(it_acc, cb_intra, hc * cc, cc);
++            read_into(kc_acc, cb_kdec_t, hc * kc, kc);
++            read_into(dl_acc, cb_dl, hc * 1, 1);
++            read_into(ti_acc, cb_Tinv, hc * cc, cc);
 +        }
-+        // Four depthwise products occupy even DST registers.
-+        mul_binary_tile_init();
-+        mul_binary_tile(0, 1, 0);
-+        mul_binary_tile(2, 3, 2);
-+        mul_binary_tile(4, 5, 4);
-+        mul_binary_tile(6, 7, 6);
-+
-+        add_binary_tile_init();
-+        add_binary_tile(0, 2, 0);
-+        add_binary_tile(4, 6, 4);
-+        add_binary_tile(0, 4, 0);
-+        silu_tile_init();
-+        silu_tile(0);
-+
-+        tile_regs_commit();
-+        tile_regs_wait();
-+        pack_tile(0, output);
-+        operands_cb.pop_front(8);
-+        output_cb.push_back(1);
-+        tile_regs_release();
-+    }
-+}
-diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
-new file mode 100644
-index 0000000..70b15c7
---- /dev/null
-+++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
-@@ -0,0 +1,144 @@
-+// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
-+// SPDX-License-Identifier: Apache-2.0
-+
-+#include <stdint.h>
-+
-+#include "api/dataflow/circular_buffer.h"
-+#include "api/dataflow/dataflow_api.h"
-+#include "api/dataflow/noc.h"
-+#include "api/core_local_mem.h"
-+#include "recurrent_utils.hpp"
-+
-+namespace {
-+
-+FORCE_INLINE void copy_channel_to_row(
-+    uint32_t source_address, uint32_t source_column,
-+    uint32_t destination_address, uint32_t destination_row) {
-+    const volatile tt_l1_ptr uint16_t* source =
-+        reinterpret_cast<const volatile tt_l1_ptr uint16_t*>(source_address);
-+    volatile tt_l1_ptr uint16_t* destination =
-+        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(destination_address);
-+    for (uint32_t channel = 0; channel < 32; ++channel) {
-+        destination[tile_offset(destination_row, channel)] =
-+            source[tile_offset(channel, source_column)];
-+    }
-+}
-+
-+FORCE_INLINE void gather_and_update_state_tile(
-+    uint32_t state_address, uint32_t operands_address, uint32_t batch) {
-+    volatile tt_l1_ptr uint16_t* state =
-+        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(state_address);
-+    volatile tt_l1_ptr uint16_t* operands =
-+        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(operands_address);
-+    for (uint32_t channel = 0; channel < 32; ++channel) {
-+        const uint32_t source = tile_offset(channel, 0);
-+        const uint32_t row = tile_offset(batch, channel);
-+        const uint16_t old1 = state[source + 1];
-+        const uint16_t old2 = state[source + 2];
-+        operands[row] = state[source];
-+        operands[2 * 1024 + row] = old1;
-+        operands[4 * 1024 + row] = old2;
-+        state[source] = old1;
-+        state[source + 1] = old2;
-+        state[source + 2] = operands[6 * 1024 + row];
-+    }
-+}
-+
-+}  // namespace
-+
-+void kernel_main() {
-+    constexpr uint32_t channel_tiles = get_compile_time_arg_val(0);
-+    constexpr uint32_t batch_size = get_compile_time_arg_val(1);
-+    constexpr uint32_t num_workers = get_compile_time_arg_val(2);
-+    constexpr uint32_t tile_bytes = 2048;
-+    const uint32_t worker = get_arg_val<uint32_t>(0);
-+    const uint32_t input_address = get_arg_val<uint32_t>(1);
-+    const uint32_t state_address = get_arg_val<uint32_t>(2);
-+    const uint32_t weight_address = get_arg_val<uint32_t>(3);
-+    const uint32_t indices_address = get_arg_val<uint32_t>(4);
-+    const uint32_t flags_address = get_arg_val<uint32_t>(5);
-+
-+    constexpr auto input_args = TensorAccessorArgs<3>();
-+    constexpr auto state_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
-+    constexpr auto weight_args = TensorAccessorArgs<state_args.next_compile_time_args_offset()>();
-+    constexpr auto indices_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
-+    constexpr auto flags_args = TensorAccessorArgs<indices_args.next_compile_time_args_offset()>();
-+    const auto input = TensorAccessor(input_args, input_address, tile_bytes);
-+    const auto state = TensorAccessor(state_args, state_address, tile_bytes);
-+    const auto weight = TensorAccessor(weight_args, weight_address, tile_bytes);
-+    const auto indices = TensorAccessor(indices_args, indices_address, 4096);
-+    const auto flags = TensorAccessor(flags_args, flags_address, tile_bytes);
-+
-+    CircularBuffer operands_cb(tt::CBIndex::c_0);
-+    CircularBuffer state_scratch(tt::CBIndex::c_1);
-+    CircularBuffer weight_scratch(tt::CBIndex::c_2);
-+    CircularBuffer indices_scratch(tt::CBIndex::c_3);
-+    CircularBuffer flags_scratch(tt::CBIndex::c_4);
-+    Noc noc;
-+
-+    state_scratch.reserve_back(batch_size);
-+    weight_scratch.reserve_back(1);
-+    indices_scratch.reserve_back(1);
-+    flags_scratch.reserve_back(1);
-+    noc.async_read(indices, indices_scratch, 4096, {.page_id = 0}, {.offset_bytes = 0});
-+    noc.async_read(flags, flags_scratch, tile_bytes, {.page_id = 0}, {.offset_bytes = 0});
-+    noc.async_read_barrier();
-+
-+    for (uint32_t channel_tile = worker; channel_tile < channel_tiles;
-+         channel_tile += num_workers) {
-+        operands_cb.reserve_back(8);
-+        const uint32_t operands_address = operands_cb.get_write_ptr();
-+        noc.async_write_zeros(operands_cb, 8 * tile_bytes);
-+        noc.write_zeros_l1_barrier();
-+
-+        // x already has the desired [batch, channel] tile orientation.
-+        noc.async_read(
-+            input, operands_cb, tile_bytes, {.page_id = channel_tile},
-+            {.offset_bytes = 6 * tile_bytes});
-+        noc.async_read(
-+            weight, weight_scratch, tile_bytes, {.page_id = channel_tile},
-+            {.offset_bytes = 0});
-+        noc.async_read_barrier();
-+
-+        // Read active state tiles together. Dummy rows stay zero and do not
-+        // need weights because their input rows are zero as well.
-+        for (uint32_t batch = 0; batch < batch_size; ++batch) {
-+            const uint32_t slot = read_index(indices_scratch.get_write_ptr(), batch);
-+            if (slot == 0) {
-+                continue;
+     }
+ }
+diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/writer_chunk_gdn_scan.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/writer_chunk_gdn_scan.cpp
+--- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/writer_chunk_gdn_scan.cpp
++++ ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/writer_chunk_gdn_scan.cpp
+@@ -23,7 +23,8 @@ void kernel_main() {
+     constexpr auto o_a = TensorAccessorArgs<5>();
+     constexpr auto fs_a = TensorAccessorArgs<o_a.next_compile_time_args_offset()>();
+ 
+-    const uint32_t h = get_arg_val<uint32_t>(0);
++    const uint32_t first_head = get_arg_val<uint32_t>(0);
++    const uint32_t heads = get_arg_val<uint32_t>(5);
+     const uint32_t vb = get_arg_val<uint32_t>(1);
+     const uint32_t NC = get_arg_val<uint32_t>(2);
+     const uint32_t o_addr = get_arg_val<uint32_t>(3);
+@@ -42,32 +43,34 @@ void kernel_main() {
+     Noc noc;
+     CircularBuffer cbout(cb_out);
+ 
+-    // o [BH, NC, C, V]: scatter this V-block back — row stride Vt_full, column offset vb*Vt.
+-    for (uint32_t c = 0; c < NC; c++) {
+-        cbout.wait_front(cv);
+-        const uint32_t row_base = (h * NC + c) * Ct * Vt_full;
+-        auto src = use<CircularBuffer::AddrSelector::READ_PTR>(cbout);
+-        for (uint32_t r = 0; r < Ct; r++) {
++    for (uint32_t h = first_head; h < first_head + heads; h++) {
++        // o [BH, NC, C, V]: scatter this V-block back — row stride Vt_full, column offset vb*Vt.
++        for (uint32_t c = 0; c < NC; c++) {
++            cbout.wait_front(cv);
++            const uint32_t row_base = (h * NC + c) * Ct * Vt_full;
++            auto src = use<CircularBuffer::AddrSelector::READ_PTR>(cbout);
++            for (uint32_t r = 0; r < Ct; r++) {
++                const uint32_t dst = row_base + r * Vt_full + vb * Vt;
++                for (uint32_t vt = 0; vt < Vt; vt++) {
++                    noc.async_write(src, o_acc, tb_o, {.offset_bytes = (r * Vt + vt) * tb_o}, {.page_id = dst + vt});
++                }
 +            }
-+            for (uint32_t tap = 0; tap < 4; ++tap) {
-+                copy_channel_to_row(
-+                    weight_scratch.get_write_ptr(), tap,
-+                    operands_address + (2 * tap + 1) * tile_bytes, batch);
-+            }
-+            if (read_flag(flags_scratch.get_write_ptr(), batch)) {
-+                noc.async_read(
-+                    state, state_scratch, tile_bytes,
-+                    {.page_id = slot * channel_tiles + channel_tile},
-+                    {.offset_bytes = batch * tile_bytes});
-+            } else {
-+                noc.async_write_zeros(
-+                    state_scratch, tile_bytes, {.offset_bytes = batch * tile_bytes});
-+            }
++            noc.async_write_barrier();
++            cbout.pop_front(cv);
 +        }
-+        noc.async_read_barrier();
-+        noc.write_zeros_l1_barrier();
 +
-+        // Gather each slot's old history before updating its scratch tile and DRAM.
-+        for (uint32_t batch = 0; batch < batch_size; ++batch) {
-+            const uint32_t slot = read_index(indices_scratch.get_write_ptr(), batch);
-+            if (slot == 0) {
-+                continue;
-+            }
-+            const uint32_t state_address =
-+                state_scratch.get_write_ptr() + batch * tile_bytes;
-+            gather_and_update_state_tile(state_address, operands_address, batch);
-+            noc.async_write(
-+                CoreLocalMem<uint32_t>(state_address), state, tile_bytes, {},
-+                {.page_id = slot * channel_tiles + channel_tile});
-+        }
-+        operands_cb.push_back(8);
-+        noc.async_write_barrier();
-+    }
-+}
-diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_update.cpp
-new file mode 100644
-index 0000000000000000000000000000000000000000..1b7ed9ce3bf2d3bd7c6a668de2135882ce9cdff6
---- /dev/null
-+++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_update.cpp
-@@ -0,0 +1,32 @@
-+// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
-+// SPDX-License-Identifier: Apache-2.0
-+
-+#include <stdint.h>
-+
-+#include "api/dataflow/circular_buffer.h"
-+#include "api/dataflow/dataflow_api.h"
-+#include "api/dataflow/noc.h"
-+
-+void kernel_main() {
-+    constexpr uint32_t channel_tiles = get_compile_time_arg_val(0);
-+    constexpr uint32_t num_workers = get_compile_time_arg_val(1);
-+    const uint32_t worker = get_arg_val<uint32_t>(0);
-+    const uint32_t output_address = get_arg_val<uint32_t>(1);
-+
-+    // The output is BFLOAT16 or FLOAT32; the CB's tile size says which.
-+    const uint32_t tile_bytes = get_tile_size(tt::CBIndex::c_5);
-+    constexpr auto output_args = TensorAccessorArgs<2>();
-+    const auto output = TensorAccessor(output_args, output_address, tile_bytes);
-+    CircularBuffer output_cb(tt::CBIndex::c_5);
-+    Noc noc;
-+
-+    for (uint32_t channel_tile = worker; channel_tile < channel_tiles;
-+         channel_tile += num_workers) {
-+        output_cb.wait_front(1);
-+        noc.async_write(
-+            output_cb, output, tile_bytes, {.offset_bytes = 0},
-+            {.page_id = channel_tile});
-+        noc.async_write_barrier();
-+        output_cb.pop_front(1);
-+    }
-+}
-diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
-new file mode 100644
-index 0000000000000000000000000000000000000000..fdc2b2c7240e8faf4275793f5f8f55c88edf70f8
---- /dev/null
-+++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
-@@ -0,0 +1,22 @@
-+// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
-+// SPDX-License-Identifier: Apache-2.0
-+
-+#pragma once
-+
-+
-+#include "ttnn/tensor/tensor.hpp"
-+
-+namespace ttnn::transformer {
-+
-+// One four-tap depthwise causal convolution decode step. The operation
-+// gathers and updates request state in place, and returns silu(conv) in
-+// output_dtype, BFLOAT16 or FLOAT32.
-+Tensor causal_conv1d_update(
-+    const Tensor& input,
-+    const Tensor& state,
-+    const Tensor& weight,
-+    const Tensor& state_indices,
-+    const Tensor& has_initial_state,
-+    tt::tt_metal::DataType output_dtype = tt::tt_metal::DataType::BFLOAT16);
-+
-+}  // namespace ttnn::transformer
++        // final_state [BH, K, V]: same V-block slicing (row stride Vt_full over K rows).
++        CircularBuffer cbfs(cb_final);
++        cbfs.wait_front(kv);
++        const uint32_t row_base = h * Kt * Vt_full;
++        auto src = use<CircularBuffer::AddrSelector::READ_PTR>(cbfs);
++        for (uint32_t r = 0; r < Kt; r++) {
+             const uint32_t dst = row_base + r * Vt_full + vb * Vt;
+             for (uint32_t vt = 0; vt < Vt; vt++) {
+-                noc.async_write(src, o_acc, tb_o, {.offset_bytes = (r * Vt + vt) * tb_o}, {.page_id = dst + vt});
++                noc.async_write(src, fs_acc, tb_fs, {.offset_bytes = (r * Vt + vt) * tb_fs}, {.page_id = dst + vt});
+             }
+         }
+         noc.async_write_barrier();
+-        cbout.pop_front(cv);
+-    }
+-
+-    // final_state [BH, K, V]: same V-block slicing (row stride Vt_full over K rows).
+-    CircularBuffer cbfs(cb_final);
+-    cbfs.wait_front(kv);
+-    const uint32_t row_base = h * Kt * Vt_full;
+-    auto src = use<CircularBuffer::AddrSelector::READ_PTR>(cbfs);
+-    for (uint32_t r = 0; r < Kt; r++) {
+-        const uint32_t dst = row_base + r * Vt_full + vb * Vt;
+-        for (uint32_t vt = 0; vt < Vt; vt++) {
+-            noc.async_write(src, fs_acc, tb_fs, {.offset_bytes = (r * Vt + vt) * tb_fs}, {.page_id = dst + vt});
+-        }
++        cbfs.pop_front(kv);
+     }
+-    noc.async_write_barrier();
+-    cbfs.pop_front(kv);
+ }
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..bd5a7a3a140089f7538718670adf89e2398801a1
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
 @@ -0,0 +1,211 @@
@@ -524,274 +472,95 @@ index 0000000000000000000000000000000000000000..bd5a7a3a140089f7538718670adf89e2
 +}
 +
 +}  // namespace ttnn::transformer
-diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..2edf619f538f0ec0030270d1f9d244e400f3259b
 --- /dev/null
-+++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
-@@ -0,0 +1,65 @@
-+// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
-+// SPDX-License-Identifier: Apache-2.0
-+
-+#include <stdint.h>
-+
-+#include "api/core_local_mem.h"
-+#include "api/dataflow/circular_buffer.h"
-+#include "api/dataflow/dataflow_api.h"
-+#include "api/dataflow/noc.h"
-+#include "recurrent_utils.hpp"
-+
-+void kernel_main() {
-+    constexpr uint32_t batch_size = get_compile_time_arg_val(0);
-+    constexpr uint32_t pages_per_slice = get_compile_time_arg_val(1);
-+    constexpr uint32_t num_workers = get_compile_time_arg_val(2);
-+    constexpr uint32_t tile_bytes = get_compile_time_arg_val(3);
-+
-+    const uint32_t worker = get_arg_val<uint32_t>(0);
-+    const uint32_t state_pool_address = get_arg_val<uint32_t>(1);
-+    const uint32_t state_indices_address = get_arg_val<uint32_t>(2);
-+    const uint32_t updates_address = get_arg_val<uint32_t>(3);
-+
-+    constexpr auto state_pool_args = TensorAccessorArgs<4>();
-+    constexpr auto state_indices_args =
-+        TensorAccessorArgs<state_pool_args.next_compile_time_args_offset()>();
-+    constexpr auto updates_args =
-+        TensorAccessorArgs<state_indices_args.next_compile_time_args_offset()>();
-+    const auto state_pool =
-+        TensorAccessor(state_pool_args, state_pool_address, tile_bytes);
-+    const auto state_indices =
-+        TensorAccessor(state_indices_args, state_indices_address, 4096);
-+    const auto updates = TensorAccessor(updates_args, updates_address, tile_bytes);
-+
-+    CircularBuffer data_cb(tt::CBIndex::c_0);
-+    CircularBuffer indices_cb(tt::CBIndex::c_1);
-+    Noc noc;
-+
-+    // This kernel owns both buffers; reuse them as scratch without queueing tiles.
-+    data_cb.reserve_back(1);
-+    indices_cb.reserve_back(1);
-+    noc.async_read(
-+        state_indices, indices_cb, 4096,
-+        {.page_id = 0}, {.offset_bytes = 0});
-+    noc.async_read_barrier();
-+    const uint32_t total_pages = batch_size * pages_per_slice;
-+    for (uint32_t work = worker; work < total_pages; work += num_workers) {
-+        const uint32_t batch = work / pages_per_slice;
-+        const uint32_t page = work % pages_per_slice;
-+        const uint32_t slot = read_index(indices_cb.get_write_ptr(), batch);
-+        if (slot == 0) {
-+            continue;
-+        }
-+
-+        noc.async_read(
-+            updates, data_cb, tile_bytes,
-+            {.page_id = batch * pages_per_slice + page},
-+            {.offset_bytes = 0});
-+        noc.async_read_barrier();
-+        noc.async_write(
-+            CoreLocalMem<uint32_t>(data_cb.get_write_ptr()), state_pool, tile_bytes,
-+            {.offset_bytes = 0},
-+            {.page_id = slot * pages_per_slice + page});
-+        noc.async_write_barrier();
-+    }
-+}
-diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp
-new file mode 100644
-index 0000000000000000000000000000000000000000..dafb9778090fcb155b09a491ac46185e23355c9a
---- /dev/null
-+++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp
-@@ -0,0 +1,15 @@
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
+@@ -0,0 +1,22 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#pragma once
 +
++
 +#include "ttnn/tensor/tensor.hpp"
 +
 +namespace ttnn::transformer {
 +
-+Tensor state_pool_update(
-+    const Tensor& state_pool,
++// One four-tap depthwise causal convolution decode step. The operation
++// gathers and updates request state in place, and returns silu(conv) in
++// output_dtype, BFLOAT16 or FLOAT32.
++Tensor causal_conv1d_update(
++    const Tensor& input,
++    const Tensor& state,
++    const Tensor& weight,
 +    const Tensor& state_indices,
-+    const Tensor& updates);
++    const Tensor& has_initial_state,
++    tt::tt_metal::DataType output_dtype = tt::tt_metal::DataType::BFLOAT16);
 +
 +}  // namespace ttnn::transformer
-diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..56a7196bd2bd068667dc37fae1690a3a1f99c8e3
 --- /dev/null
-+++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
-@@ -0,0 +1,167 @@
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
+@@ -0,0 +1,55 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
-+#include "ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp"
++#include <stdint.h>
 +
-+#include <algorithm>
-+#include <utility>
++#include "api/compute/common.h"
++#include "api/compute/compute_kernel_api.h"
++#include "api/compute/eltwise_binary_sfpu.h"
++#include "api/compute/eltwise_unary/eltwise_unary.h"
++#include "api/compute/tile_move_copy.h"
++#include "api/dataflow/circular_buffer.h"
 +
-+#include <tt-metalium/program_descriptors.hpp>
-+#include <tt-metalium/tensor_accessor_args.hpp>
-+#include <tt-metalium/work_split.hpp>
-+#include "ttnn/device.hpp"
-+#include "ttnn/device_operation.hpp"
++void kernel_main() {
++    constexpr uint32_t channel_tiles = get_compile_time_arg_val(0);
++    constexpr uint32_t num_workers = get_compile_time_arg_val(1);
++    const uint32_t worker = get_arg_val<uint32_t>(0);
 +
-+using namespace tt::tt_metal;
++    constexpr uint32_t operands = tt::CBIndex::c_0;
++    constexpr uint32_t output = tt::CBIndex::c_5;
++    CircularBuffer operands_cb(operands);
++    CircularBuffer output_cb(output);
 +
-+namespace ttnn::prim {
-+namespace {
++    init_sfpu(operands, output);
++    for (uint32_t channel_tile = worker; channel_tile < channel_tiles;
++         channel_tile += num_workers) {
++        operands_cb.wait_front(8);
++        output_cb.reserve_back(1);
++        tile_regs_acquire();
 +
-+struct StatePoolUpdateParams {};
++        copy_tile_to_dst_init_short(operands);
++        for (uint32_t tile = 0; tile < 8; ++tile) {
++            copy_tile(operands, tile, tile);
++        }
++        // Four depthwise products occupy even DST registers.
++        mul_binary_tile_init();
++        mul_binary_tile(0, 1, 0);
++        mul_binary_tile(2, 3, 2);
++        mul_binary_tile(4, 5, 4);
++        mul_binary_tile(6, 7, 6);
 +
-+struct StatePoolUpdateInputs {
-+    Tensor state_pool;
-+    Tensor state_indices;
-+    Tensor updates;
-+};
++        add_binary_tile_init();
++        add_binary_tile(0, 2, 0);
++        add_binary_tile(4, 6, 4);
++        add_binary_tile(0, 4, 0);
++        silu_tile_init();
++        silu_tile(0);
 +
-+struct StatePoolUpdateOperation {
-+    using operation_attributes_t = StatePoolUpdateParams;
-+    using tensor_args_t = StatePoolUpdateInputs;
-+    using spec_return_value_t = TensorSpec;
-+    using tensor_return_value_t = Tensor;
-+
-+    static ProgramDescriptor create_descriptor(
-+        const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
-+    static void validate_on_program_cache_miss(
-+        const operation_attributes_t&, const tensor_args_t&);
-+    static spec_return_value_t compute_output_specs(
-+        const operation_attributes_t&, const tensor_args_t& inputs) {
-+        return inputs.state_pool.tensor_spec();
++        tile_regs_commit();
++        tile_regs_wait();
++        pack_tile(0, output);
++        operands_cb.pop_front(8);
++        output_cb.push_back(1);
++        tile_regs_release();
 +    }
-+    static tensor_return_value_t create_output_tensors(
-+        const operation_attributes_t&, const tensor_args_t& inputs) {
-+        return inputs.state_pool;
-+    }
-+};
-+
-+void validate_tensor(const Tensor& tensor, const char* name) {
-+    TT_FATAL(tensor.storage_type() == StorageType::DEVICE, "{} must be on device", name);
-+    TT_FATAL(tensor.buffer() != nullptr, "{} must be allocated", name);
-+    TT_FATAL(tensor.layout() == Layout::TILE, "{} must be tiled", name);
-+    TT_FATAL(!tensor.is_sharded(), "{} must be interleaved", name);
 +}
-+
-+void check_shape(const Tensor& tensor, std::initializer_list<uint32_t> expected, const char* name) {
-+    TT_FATAL(tensor.logical_shape() == Shape(expected), "{} shape mismatch", name);
-+}
-+
-+void StatePoolUpdateOperation::validate_on_program_cache_miss(
-+    const operation_attributes_t&, const tensor_args_t& inputs) {
-+    validate_tensor(inputs.state_pool, "state pool");
-+    validate_tensor(inputs.state_indices, "state indices");
-+    validate_tensor(inputs.updates, "updates");
-+    TT_FATAL(
-+        inputs.state_indices.dtype() == DataType::INT32,
-+        "state indices must be int32");
-+    TT_FATAL(
-+        inputs.state_pool.dtype() == inputs.updates.dtype(),
-+        "state pool and updates must have the same dtype");
-+
-+    const auto& pool_shape = inputs.state_pool.logical_shape();
-+    const auto& update_shape = inputs.updates.logical_shape();
-+    TT_FATAL(
-+        pool_shape.rank() >= 2 && pool_shape.rank() == update_shape.rank(),
-+        "state pool and updates must have the same rank of at least two");
-+    TT_FATAL(update_shape[0] <= 32, "updates must fit in one tile row");
-+    check_shape(inputs.state_indices, {update_shape[0]}, "state indices");
-+    for (uint32_t dim = 1; dim < pool_shape.rank(); ++dim) {
-+        TT_FATAL(
-+            pool_shape[dim] == update_shape[dim],
-+            "state pool and update slices must match");
-+    }
-+    TT_FATAL(
-+        inputs.state_pool.buffer()->num_pages() % pool_shape[0] == 0 &&
-+            inputs.updates.buffer()->num_pages() % update_shape[0] == 0 &&
-+            inputs.state_pool.buffer()->num_pages() / pool_shape[0] ==
-+                inputs.updates.buffer()->num_pages() / update_shape[0],
-+        "state pool and update slices must have the same page count");
-+}
-+
-+ProgramDescriptor StatePoolUpdateOperation::create_descriptor(
-+    const operation_attributes_t&, const tensor_args_t& inputs,
-+    tensor_return_value_t&) {
-+    const uint32_t batch_size = inputs.updates.logical_shape()[0];
-+    const uint32_t pages_per_slice =
-+        inputs.updates.buffer()->num_pages() / batch_size;
-+    const uint32_t total_pages = batch_size * pages_per_slice;
-+    const uint32_t tile_bytes = inputs.updates.buffer()->page_size();
-+
-+    ProgramDescriptor program;
-+    auto* device = inputs.state_pool.device();
-+    const CoreCoord grid = device->compute_with_storage_grid_size();
-+    const uint32_t num_workers = std::min(
-+        total_pages, static_cast<uint32_t>(grid.x * grid.y));
-+    CoreRangeSet cores = num_cores_to_corerangeset(num_workers, grid);
-+
-+    program.cbs = {
-+        CBDescriptor{
-+            .total_size = tile_bytes,
-+            .core_ranges = cores,
-+            .format_descriptors = {{
-+                .buffer_index = tt::CBIndex::c_0,
-+                .data_format = datatype_to_dataformat_converter(inputs.updates.dtype()),
-+                .page_size = tile_bytes}}},
-+        CBDescriptor{
-+            .total_size = 4096,
-+            .core_ranges = cores,
-+            .format_descriptors = {{
-+                .buffer_index = tt::CBIndex::c_1,
-+                .data_format = tt::DataFormat::Int32, .page_size = 4096}}}};
-+
-+    std::vector<uint32_t> compile_args = {
-+        batch_size, pages_per_slice, num_workers, tile_bytes};
-+    TensorAccessorArgs(inputs.state_pool.buffer()).append_to(compile_args);
-+    TensorAccessorArgs(inputs.state_indices.buffer()).append_to(compile_args);
-+    TensorAccessorArgs(inputs.updates.buffer()).append_to(compile_args);
-+
-+    KernelDescriptor kernel{
-+        .kernel_source = "ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/"
-+        "kernels/dataflow/state_pool_update.cpp",
-+        .core_ranges = cores,
-+        .compile_time_args = compile_args,
-+        .config = DataMovementConfigDescriptor{
-+            .processor = DataMovementProcessor::RISCV_0,
-+            .noc = NOC::RISCV_0_default}};
-+
-+    for (uint32_t worker = 0; worker < num_workers; ++worker) {
-+        const CoreCoord core{worker / grid.y, worker % grid.y};
-+        kernel.emplace_runtime_args(
-+            core,
-+            {worker, inputs.state_pool.buffer(),
-+             inputs.state_indices.buffer(),
-+             inputs.updates.buffer()});
-+    }
-+
-+    program.kernels.push_back(std::move(kernel));
-+    return program;
-+}
-+
-+}  // namespace
-+}  // namespace ttnn::prim
-+
-+namespace ttnn::transformer {
-+
-+Tensor state_pool_update(
-+    const Tensor& state_pool,
-+    const Tensor& state_indices,
-+    const Tensor& updates) {
-+    using Op = prim::StatePoolUpdateOperation;
-+    return device_operation::launch<Op>(
-+        {},
-+        {.state_pool = state_pool,
-+         .state_indices = state_indices,
-+         .updates = updates});
-+}
-+
-+}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
 new file mode 100644
-index 0000000..2df32b1
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
 @@ -0,0 +1,256 @@
@@ -1051,9 +820,157 @@ index 0000000..2df32b1
 +    cb_pop_front(query_factor, 1);
 +    }
 +}
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
+@@ -0,0 +1,144 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#include <stdint.h>
++
++#include "api/dataflow/circular_buffer.h"
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++#include "api/core_local_mem.h"
++#include "recurrent_utils.hpp"
++
++namespace {
++
++FORCE_INLINE void copy_channel_to_row(
++    uint32_t source_address, uint32_t source_column,
++    uint32_t destination_address, uint32_t destination_row) {
++    const volatile tt_l1_ptr uint16_t* source =
++        reinterpret_cast<const volatile tt_l1_ptr uint16_t*>(source_address);
++    volatile tt_l1_ptr uint16_t* destination =
++        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(destination_address);
++    for (uint32_t channel = 0; channel < 32; ++channel) {
++        destination[tile_offset(destination_row, channel)] =
++            source[tile_offset(channel, source_column)];
++    }
++}
++
++FORCE_INLINE void gather_and_update_state_tile(
++    uint32_t state_address, uint32_t operands_address, uint32_t batch) {
++    volatile tt_l1_ptr uint16_t* state =
++        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(state_address);
++    volatile tt_l1_ptr uint16_t* operands =
++        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(operands_address);
++    for (uint32_t channel = 0; channel < 32; ++channel) {
++        const uint32_t source = tile_offset(channel, 0);
++        const uint32_t row = tile_offset(batch, channel);
++        const uint16_t old1 = state[source + 1];
++        const uint16_t old2 = state[source + 2];
++        operands[row] = state[source];
++        operands[2 * 1024 + row] = old1;
++        operands[4 * 1024 + row] = old2;
++        state[source] = old1;
++        state[source + 1] = old2;
++        state[source + 2] = operands[6 * 1024 + row];
++    }
++}
++
++}  // namespace
++
++void kernel_main() {
++    constexpr uint32_t channel_tiles = get_compile_time_arg_val(0);
++    constexpr uint32_t batch_size = get_compile_time_arg_val(1);
++    constexpr uint32_t num_workers = get_compile_time_arg_val(2);
++    constexpr uint32_t tile_bytes = 2048;
++    const uint32_t worker = get_arg_val<uint32_t>(0);
++    const uint32_t input_address = get_arg_val<uint32_t>(1);
++    const uint32_t state_address = get_arg_val<uint32_t>(2);
++    const uint32_t weight_address = get_arg_val<uint32_t>(3);
++    const uint32_t indices_address = get_arg_val<uint32_t>(4);
++    const uint32_t flags_address = get_arg_val<uint32_t>(5);
++
++    constexpr auto input_args = TensorAccessorArgs<3>();
++    constexpr auto state_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
++    constexpr auto weight_args = TensorAccessorArgs<state_args.next_compile_time_args_offset()>();
++    constexpr auto indices_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
++    constexpr auto flags_args = TensorAccessorArgs<indices_args.next_compile_time_args_offset()>();
++    const auto input = TensorAccessor(input_args, input_address, tile_bytes);
++    const auto state = TensorAccessor(state_args, state_address, tile_bytes);
++    const auto weight = TensorAccessor(weight_args, weight_address, tile_bytes);
++    const auto indices = TensorAccessor(indices_args, indices_address, 4096);
++    const auto flags = TensorAccessor(flags_args, flags_address, tile_bytes);
++
++    CircularBuffer operands_cb(tt::CBIndex::c_0);
++    CircularBuffer state_scratch(tt::CBIndex::c_1);
++    CircularBuffer weight_scratch(tt::CBIndex::c_2);
++    CircularBuffer indices_scratch(tt::CBIndex::c_3);
++    CircularBuffer flags_scratch(tt::CBIndex::c_4);
++    Noc noc;
++
++    state_scratch.reserve_back(batch_size);
++    weight_scratch.reserve_back(1);
++    indices_scratch.reserve_back(1);
++    flags_scratch.reserve_back(1);
++    noc.async_read(indices, indices_scratch, 4096, {.page_id = 0}, {.offset_bytes = 0});
++    noc.async_read(flags, flags_scratch, tile_bytes, {.page_id = 0}, {.offset_bytes = 0});
++    noc.async_read_barrier();
++
++    for (uint32_t channel_tile = worker; channel_tile < channel_tiles;
++         channel_tile += num_workers) {
++        operands_cb.reserve_back(8);
++        const uint32_t operands_address = operands_cb.get_write_ptr();
++        noc.async_write_zeros(operands_cb, 8 * tile_bytes);
++        noc.write_zeros_l1_barrier();
++
++        // x already has the desired [batch, channel] tile orientation.
++        noc.async_read(
++            input, operands_cb, tile_bytes, {.page_id = channel_tile},
++            {.offset_bytes = 6 * tile_bytes});
++        noc.async_read(
++            weight, weight_scratch, tile_bytes, {.page_id = channel_tile},
++            {.offset_bytes = 0});
++        noc.async_read_barrier();
++
++        // Read active state tiles together. Dummy rows stay zero and do not
++        // need weights because their input rows are zero as well.
++        for (uint32_t batch = 0; batch < batch_size; ++batch) {
++            const uint32_t slot = read_index(indices_scratch.get_write_ptr(), batch);
++            if (slot == 0) {
++                continue;
++            }
++            for (uint32_t tap = 0; tap < 4; ++tap) {
++                copy_channel_to_row(
++                    weight_scratch.get_write_ptr(), tap,
++                    operands_address + (2 * tap + 1) * tile_bytes, batch);
++            }
++            if (read_flag(flags_scratch.get_write_ptr(), batch)) {
++                noc.async_read(
++                    state, state_scratch, tile_bytes,
++                    {.page_id = slot * channel_tiles + channel_tile},
++                    {.offset_bytes = batch * tile_bytes});
++            } else {
++                noc.async_write_zeros(
++                    state_scratch, tile_bytes, {.offset_bytes = batch * tile_bytes});
++            }
++        }
++        noc.async_read_barrier();
++        noc.write_zeros_l1_barrier();
++
++        // Gather each slot's old history before updating its scratch tile and DRAM.
++        for (uint32_t batch = 0; batch < batch_size; ++batch) {
++            const uint32_t slot = read_index(indices_scratch.get_write_ptr(), batch);
++            if (slot == 0) {
++                continue;
++            }
++            const uint32_t state_address =
++                state_scratch.get_write_ptr() + batch * tile_bytes;
++            gather_and_update_state_tile(state_address, operands_address, batch);
++            noc.async_write(
++                CoreLocalMem<uint32_t>(state_address), state, tile_bytes, {},
++                {.page_id = slot * channel_tiles + channel_tile});
++        }
++        operands_cb.push_back(8);
++        noc.async_write_barrier();
++    }
++}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
 new file mode 100644
-index 0000000..e981660
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
 @@ -0,0 +1,223 @@
@@ -1280,9 +1197,146 @@ index 0000000..e981660
 +    dt_bias_cb.push_back(1);
 +    }
 +}
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp
+@@ -0,0 +1,26 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <stdint.h>
++
++#include "api/dataflow/dataflow_api.h"
++
++FORCE_INLINE uint32_t tile_offset(uint32_t row, uint32_t column) {
++    const uint32_t face = (row / 16) * 2 + column / 16;
++    return face * 256 + (row % 16) * 16 + column % 16;
++}
++
++FORCE_INLINE uint32_t read_index(uint32_t address, uint32_t batch) {
++    const volatile tt_l1_ptr uint32_t* tile =
++        reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(address);
++    return tile[tile_offset(0, batch)];
++}
++
++FORCE_INLINE bool read_flag(uint32_t address, uint32_t batch) {
++    const volatile tt_l1_ptr uint16_t* tile =
++        reinterpret_cast<const volatile tt_l1_ptr uint16_t*>(address);
++    return tile[tile_offset(0, batch)] != 0;
++}
++
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
+@@ -0,0 +1,65 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#include <stdint.h>
++
++#include "api/core_local_mem.h"
++#include "api/dataflow/circular_buffer.h"
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++#include "recurrent_utils.hpp"
++
++void kernel_main() {
++    constexpr uint32_t batch_size = get_compile_time_arg_val(0);
++    constexpr uint32_t pages_per_slice = get_compile_time_arg_val(1);
++    constexpr uint32_t num_workers = get_compile_time_arg_val(2);
++    constexpr uint32_t tile_bytes = get_compile_time_arg_val(3);
++
++    const uint32_t worker = get_arg_val<uint32_t>(0);
++    const uint32_t state_pool_address = get_arg_val<uint32_t>(1);
++    const uint32_t state_indices_address = get_arg_val<uint32_t>(2);
++    const uint32_t updates_address = get_arg_val<uint32_t>(3);
++
++    constexpr auto state_pool_args = TensorAccessorArgs<4>();
++    constexpr auto state_indices_args =
++        TensorAccessorArgs<state_pool_args.next_compile_time_args_offset()>();
++    constexpr auto updates_args =
++        TensorAccessorArgs<state_indices_args.next_compile_time_args_offset()>();
++    const auto state_pool =
++        TensorAccessor(state_pool_args, state_pool_address, tile_bytes);
++    const auto state_indices =
++        TensorAccessor(state_indices_args, state_indices_address, 4096);
++    const auto updates = TensorAccessor(updates_args, updates_address, tile_bytes);
++
++    CircularBuffer data_cb(tt::CBIndex::c_0);
++    CircularBuffer indices_cb(tt::CBIndex::c_1);
++    Noc noc;
++
++    // This kernel owns both buffers; reuse them as scratch without queueing tiles.
++    data_cb.reserve_back(1);
++    indices_cb.reserve_back(1);
++    noc.async_read(
++        state_indices, indices_cb, 4096,
++        {.page_id = 0}, {.offset_bytes = 0});
++    noc.async_read_barrier();
++    const uint32_t total_pages = batch_size * pages_per_slice;
++    for (uint32_t work = worker; work < total_pages; work += num_workers) {
++        const uint32_t batch = work / pages_per_slice;
++        const uint32_t page = work % pages_per_slice;
++        const uint32_t slot = read_index(indices_cb.get_write_ptr(), batch);
++        if (slot == 0) {
++            continue;
++        }
++
++        noc.async_read(
++            updates, data_cb, tile_bytes,
++            {.page_id = batch * pages_per_slice + page},
++            {.offset_bytes = 0});
++        noc.async_read_barrier();
++        noc.async_write(
++            CoreLocalMem<uint32_t>(data_cb.get_write_ptr()), state_pool, tile_bytes,
++            {.offset_bytes = 0},
++            {.page_id = slot * pages_per_slice + page});
++        noc.async_write_barrier();
++    }
++}
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_update.cpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_causal_conv1d_update.cpp
+@@ -0,0 +1,32 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#include <stdint.h>
++
++#include "api/dataflow/circular_buffer.h"
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++
++void kernel_main() {
++    constexpr uint32_t channel_tiles = get_compile_time_arg_val(0);
++    constexpr uint32_t num_workers = get_compile_time_arg_val(1);
++    const uint32_t worker = get_arg_val<uint32_t>(0);
++    const uint32_t output_address = get_arg_val<uint32_t>(1);
++
++    // The output is BFLOAT16 or FLOAT32; the CB's tile size says which.
++    const uint32_t tile_bytes = get_tile_size(tt::CBIndex::c_5);
++    constexpr auto output_args = TensorAccessorArgs<2>();
++    const auto output = TensorAccessor(output_args, output_address, tile_bytes);
++    CircularBuffer output_cb(tt::CBIndex::c_5);
++    Noc noc;
++
++    for (uint32_t channel_tile = worker; channel_tile < channel_tiles;
++         channel_tile += num_workers) {
++        output_cb.wait_front(1);
++        noc.async_write(
++            output_cb, output, tile_bytes, {.offset_bytes = 0},
++            {.page_id = channel_tile});
++        noc.async_write_barrier();
++        output_cb.pop_front(1);
++    }
++}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp
 new file mode 100644
-index 0000000..ea01b86
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp
 @@ -0,0 +1,90 @@
@@ -1378,7 +1432,6 @@ index 0000000..ea01b86
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
 new file mode 100644
-index 0000000..b7ced7a
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
 @@ -0,0 +1,278 @@
@@ -1662,7 +1715,6 @@ index 0000000..b7ced7a
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp
 new file mode 100644
-index 0000000..b14e1cd
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp
 @@ -0,0 +1,31 @@
@@ -1697,261 +1749,195 @@ index 0000000..b14e1cd
 +    const Tensor& has_initial_state);
 +
 +}  // namespace ttnn::transformer
-diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
---- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
-@@ -80,7 +80,7 @@
- // is assigned a contiguous range [wi_start, wi_start+wi_count) reads/writes exactly those tiles —
- // the DRAM result is byte-identical no matter how items are partitioned. The first `rem` cores get
- // one extra item (ceil), the rest get floor; every used core gets >= 1 (since P <= total).
--struct PrepWorkDist {
-+struct WorkDist {
-     std::vector<CoreCoord> cores;  // used cores, in assignment order
-     std::vector<uint32_t> wi_start;
-     std::vector<uint32_t> wi_count;
-@@ -90,14 +90,14 @@
- // `core_cap` bounds how many cores we may use (defaults to the whole grid). Perf A/B only:
- // setting core_cap=BH reproduces the old "1 core/head, NC chunks serial" layout exactly (each
- // head's NC work-items are contiguous, wi in [h*NC, h*NC+NC)), using the identical kernels.
--PrepWorkDist distribute_prep(CoreCoord grid, uint32_t total, uint32_t core_cap) {
-+WorkDist distribute_work(CoreCoord grid, uint32_t total, uint32_t core_cap) {
-     const uint32_t max_cores = std::min<uint32_t>(grid.x * grid.y, core_cap);
-     const uint32_t P = std::min(total, max_cores);
-     TT_FATAL(P > 0, "prep work distribution needs >= 1 work-item (total={})", total);
-     const uint32_t base = total / P;
-     const uint32_t rem = total % P;  // first `rem` cores get base+1
- 
--    PrepWorkDist d;
-+    WorkDist d;
-     d.cores.reserve(P);
-     d.wi_start.reserve(P);
-     d.wi_count.reserve(P);
-@@ -124,44 +124,26 @@
- // and o reduce over all K). We pick the finest V-blocking that fits the grid: the largest NV | Vt
- // with BH*NV <= cores. Each core runs one (head, v-block) => BH*NV independent scans vs BH today.
- struct ScanWorkDist {
--    std::vector<CoreCoord> cores;
--    std::vector<uint32_t> head;  // head index per core
--    std::vector<uint32_t> vblk;  // v-block index per core
--    uint32_t Vtl = 1;            // per-core v-block width (tiles) = Vt / NV
--    uint32_t NV = 1;             // v-blocks per head
--    CoreRangeSet core_set;
-+    WorkDist work;
-+    uint32_t Vtl = 1;  // per-core v-block width (tiles) = Vt / NV
-+    uint32_t NV = 1;   // v-blocks per head
- };
- 
- ScanWorkDist distribute_scan(CoreCoord grid, uint32_t BH, uint32_t Vt) {
-     const uint32_t ncores = grid.x * grid.y;
--    TT_FATAL(BH <= ncores, "num_heads {} exceeds compute cores {}", BH, ncores);
-     // QWEN_GDN_SCAN_SERIAL=1 forces NV=1 (full V on 1 core/head, the old layout) for perf A/B only.
-     const char* serial_env = std::getenv("QWEN_GDN_SCAN_SERIAL");
-     const bool force_serial = serial_env && serial_env[0] == '1';
-     uint32_t NV = 1;
--    for (uint32_t cand = force_serial ? 1u : Vt; cand >= 1; cand--) {  // cand==1 always satisfies
-+    for (uint32_t cand = force_serial ? 1u : Vt; cand >= 1; cand--) {
-         if (Vt % cand == 0 && BH * cand <= ncores) {
-             NV = cand;
-             break;
-         }
-     }
--    ScanWorkDist d;
--    d.NV = NV;
--    d.Vtl = Vt / NV;
--    const uint32_t total = BH * NV;
--    d.cores.reserve(total);
--    d.head.reserve(total);
--    d.vblk.reserve(total);
--    std::set<CoreRange> crs;
--    for (uint32_t i = 0; i < total; i++) {
--        const CoreCoord core{i % grid.x, i / grid.x};  // row-major over the grid
--        d.cores.push_back(core);
--        d.head.push_back(i / NV);  // heads' v-blocks grouped contiguously
--        d.vblk.push_back(i % NV);
--        crs.insert(CoreRange{core, core});
--    }
--    d.core_set = CoreRangeSet{crs};
--    return d;
-+    // If heads exceed cores, NV stays one and each core scans several complete
-+    // heads. Otherwise every work item is one independent (head, value block).
-+    return {distribute_work(grid, BH * NV, ~0u), Vt / NV, NV};
- }
- 
- }  // namespace
-@@ -188,7 +170,7 @@
-     const uint32_t total_work = BH * NC;
-     const char* serial_env = std::getenv("QWEN_GDN_PREP_SERIAL");
-     const uint32_t core_cap = (serial_env && serial_env[0] == '1') ? BH : ~0u;
--    auto dist = distribute_prep(device->compute_with_storage_grid_size(), total_work, core_cap);
-+    auto dist = distribute_work(device->compute_with_storage_grid_size(), total_work, core_cap);
-     const CoreRangeSet& cores = dist.core_set;
-     const uint32_t n_used = static_cast<uint32_t>(dist.cores.size());
- 
-@@ -364,9 +346,9 @@
-     auto* device = in.v_beta.device();
-     // Value-parallel fan-out: each core runs one (head, v-block) sequential scan.
-     auto sdist = distribute_scan(device->compute_with_storage_grid_size(), BH, Vt_full);
--    const CoreRangeSet& cores = sdist.core_set;
-+    const CoreRangeSet& cores = sdist.work.core_set;
-     const uint32_t Vt = sdist.Vtl;  // per-core V-block width; CBs/compute use this
--    const uint32_t n_used = static_cast<uint32_t>(sdist.cores.size());
-+    const uint32_t n_used = static_cast<uint32_t>(sdist.work.cores.size());
- 
-     // V-independent tensors (kd, q_decay, intra, k_dec_t, T_inv, dl) are read in FULL; only the
-     // V-dependent CBs (v_beta/state/out/scratch) shrink to the per-core V-block width Vt(=Vtl).
-@@ -460,13 +442,14 @@
-     auto* fs_buf = outputs[1].buffer();
- 
-     for (uint32_t i = 0; i < n_used; i++) {
--        const auto& core = sdist.cores[i];
--        const uint32_t h = sdist.head[i];
--        const uint32_t vb = sdist.vblk[i];
-+        const auto& core = sdist.work.cores[i];
-+        const uint32_t h = sdist.work.wi_start[i] / sdist.NV;
-+        const uint32_t vb = sdist.work.wi_start[i] % sdist.NV;
-+        const uint32_t heads = sdist.work.wi_count[i];
-         reader.emplace_runtime_args(
--            core, {h, vb, NC, vb_buf, kd_buf, qd_buf, it_buf, kdec_buf, dl_buf, ti_buf, s0_buf});
--        writer.emplace_runtime_args(core, {h, vb, NC, o_buf, fs_buf});
--        compute.emplace_runtime_args(core, {NC});
-+            core, {h, vb, NC, vb_buf, kd_buf, qd_buf, it_buf, kdec_buf, dl_buf, ti_buf, s0_buf, heads});
-+        writer.emplace_runtime_args(core, {h, vb, NC, o_buf, fs_buf, heads});
-+        compute.emplace_runtime_args(core, {NC, heads});
-     }
- 
-     desc.kernels.push_back(std::move(reader));
-diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/compute/chunk_gdn_scan.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/compute/chunk_gdn_scan.cpp
---- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/compute/chunk_gdn_scan.cpp
-+++ ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/compute/chunk_gdn_scan.cpp
-@@ -110,6 +110,7 @@
-     constexpr uint32_t Kt = get_compile_time_arg_val(1);
-     constexpr uint32_t Vt = get_compile_time_arg_val(2);
-     const uint32_t NC = get_arg_val<uint32_t>(0);
-+    const uint32_t heads = get_arg_val<uint32_t>(1);
- 
-     constexpr uint32_t cc = Ct * Ct;
-     constexpr uint32_t ck = Ct * Kt;
-@@ -119,7 +120,8 @@
- 
-     compute_kernel_hw_startup(cb_kd, cb_vbeta, cb_out);
- 
--    for (uint32_t c = 0; c < NC; c++) {
-+    for (uint32_t work = 0; work < heads * NC; work++) {
-+        const uint32_t c = work % NC;
-         // State uses THREE single-producer CBs so no CB is produced by both the reader and
-         // compute (that reader->compute producer switch desyncs CB page pointers and deadlocks):
-         //   cb_S      : reader-produced initial state, consumed only by chunk 0.
-diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp
---- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp
-+++ ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp
-@@ -30,7 +30,8 @@
-     constexpr auto s0_a = TensorAccessorArgs<ti_a.next_compile_time_args_offset()>();
- 
-     // This core handles head h, V-block vb (columns [vb*Vt, vb*Vt+Vt) of the full V dimension).
--    const uint32_t h = get_arg_val<uint32_t>(0);
-+    const uint32_t first_head = get_arg_val<uint32_t>(0);
-+    const uint32_t heads = get_arg_val<uint32_t>(11);
-     const uint32_t vb = get_arg_val<uint32_t>(1);
-     const uint32_t NC = get_arg_val<uint32_t>(2);
-     const uint32_t vb_addr = get_arg_val<uint32_t>(3);
-@@ -87,17 +88,19 @@
-         cb.push_back(R * Vt);
-     };
- 
--    // initial state S [K, V] (once) — host always provides it (zeros if none). V-sliced.
--    read_vslice(s0_acc, cb_S, h * Kt * Vt_full, Kt);
-+    for (uint32_t h = first_head; h < first_head + heads; h++) {
-+        // initial state S [K, V] (once) — host always provides it (zeros if none). V-sliced.
-+        read_vslice(s0_acc, cb_S, h * Kt * Vt_full, Kt);
- 
--    for (uint32_t c = 0; c < NC; c++) {
--        const uint32_t hc = h * NC + c;
--        read_vslice(vb_acc, cb_vbeta, hc * Ct * Vt_full, Ct);  // v_beta [C, V] slice
--        read_into(kd_acc, cb_kd, hc * ck, ck);                 // V-independent: full read
--        read_into(qd_acc, cb_qdecay, hc * ck, ck);
--        read_into(it_acc, cb_intra, hc * cc, cc);
--        read_into(kc_acc, cb_kdec_t, hc * kc, kc);
--        read_into(dl_acc, cb_dl, hc * 1, 1);
--        read_into(ti_acc, cb_Tinv, hc * cc, cc);
-+        for (uint32_t c = 0; c < NC; c++) {
-+            const uint32_t hc = h * NC + c;
-+            read_vslice(vb_acc, cb_vbeta, hc * Ct * Vt_full, Ct);  // v_beta [C, V] slice
-+            read_into(kd_acc, cb_kd, hc * ck, ck);                 // V-independent: full read
-+            read_into(qd_acc, cb_qdecay, hc * ck, ck);
-+            read_into(it_acc, cb_intra, hc * cc, cc);
-+            read_into(kc_acc, cb_kdec_t, hc * kc, kc);
-+            read_into(dl_acc, cb_dl, hc * 1, 1);
-+            read_into(ti_acc, cb_Tinv, hc * cc, cc);
-+        }
-     }
- }
-diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/writer_chunk_gdn_scan.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/writer_chunk_gdn_scan.cpp
---- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/writer_chunk_gdn_scan.cpp
-+++ ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/writer_chunk_gdn_scan.cpp
-@@ -23,7 +23,8 @@
-     constexpr auto o_a = TensorAccessorArgs<5>();
-     constexpr auto fs_a = TensorAccessorArgs<o_a.next_compile_time_args_offset()>();
- 
--    const uint32_t h = get_arg_val<uint32_t>(0);
-+    const uint32_t first_head = get_arg_val<uint32_t>(0);
-+    const uint32_t heads = get_arg_val<uint32_t>(5);
-     const uint32_t vb = get_arg_val<uint32_t>(1);
-     const uint32_t NC = get_arg_val<uint32_t>(2);
-     const uint32_t o_addr = get_arg_val<uint32_t>(3);
-@@ -42,32 +43,34 @@
-     Noc noc;
-     CircularBuffer cbout(cb_out);
- 
--    // o [BH, NC, C, V]: scatter this V-block back — row stride Vt_full, column offset vb*Vt.
--    for (uint32_t c = 0; c < NC; c++) {
--        cbout.wait_front(cv);
--        const uint32_t row_base = (h * NC + c) * Ct * Vt_full;
--        auto src = use<CircularBuffer::AddrSelector::READ_PTR>(cbout);
--        for (uint32_t r = 0; r < Ct; r++) {
-+    for (uint32_t h = first_head; h < first_head + heads; h++) {
-+        // o [BH, NC, C, V]: scatter this V-block back — row stride Vt_full, column offset vb*Vt.
-+        for (uint32_t c = 0; c < NC; c++) {
-+            cbout.wait_front(cv);
-+            const uint32_t row_base = (h * NC + c) * Ct * Vt_full;
-+            auto src = use<CircularBuffer::AddrSelector::READ_PTR>(cbout);
-+            for (uint32_t r = 0; r < Ct; r++) {
-+                const uint32_t dst = row_base + r * Vt_full + vb * Vt;
-+                for (uint32_t vt = 0; vt < Vt; vt++) {
-+                    noc.async_write(src, o_acc, tb_o, {.offset_bytes = (r * Vt + vt) * tb_o}, {.page_id = dst + vt});
-+                }
-+            }
-+            noc.async_write_barrier();
-+            cbout.pop_front(cv);
-+        }
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
+@@ -0,0 +1,167 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
 +
-+        // final_state [BH, K, V]: same V-block slicing (row stride Vt_full over K rows).
-+        CircularBuffer cbfs(cb_final);
-+        cbfs.wait_front(kv);
-+        const uint32_t row_base = h * Kt * Vt_full;
-+        auto src = use<CircularBuffer::AddrSelector::READ_PTR>(cbfs);
-+        for (uint32_t r = 0; r < Kt; r++) {
-             const uint32_t dst = row_base + r * Vt_full + vb * Vt;
-             for (uint32_t vt = 0; vt < Vt; vt++) {
--                noc.async_write(src, o_acc, tb_o, {.offset_bytes = (r * Vt + vt) * tb_o}, {.page_id = dst + vt});
-+                noc.async_write(src, fs_acc, tb_fs, {.offset_bytes = (r * Vt + vt) * tb_fs}, {.page_id = dst + vt});
-             }
-         }
-         noc.async_write_barrier();
--        cbout.pop_front(cv);
-+        cbfs.pop_front(kv);
-     }
--
--    // final_state [BH, K, V]: same V-block slicing (row stride Vt_full over K rows).
--    CircularBuffer cbfs(cb_final);
--    cbfs.wait_front(kv);
--    const uint32_t row_base = h * Kt * Vt_full;
--    auto src = use<CircularBuffer::AddrSelector::READ_PTR>(cbfs);
--    for (uint32_t r = 0; r < Kt; r++) {
--        const uint32_t dst = row_base + r * Vt_full + vb * Vt;
--        for (uint32_t vt = 0; vt < Vt; vt++) {
--            noc.async_write(src, fs_acc, tb_fs, {.offset_bytes = (r * Vt + vt) * tb_fs}, {.page_id = dst + vt});
--        }
--    }
--    noc.async_write_barrier();
--    cbfs.pop_front(kv);
- }
++#include "ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp"
++
++#include <algorithm>
++#include <utility>
++
++#include <tt-metalium/program_descriptors.hpp>
++#include <tt-metalium/tensor_accessor_args.hpp>
++#include <tt-metalium/work_split.hpp>
++#include "ttnn/device.hpp"
++#include "ttnn/device_operation.hpp"
++
++using namespace tt::tt_metal;
++
++namespace ttnn::prim {
++namespace {
++
++struct StatePoolUpdateParams {};
++
++struct StatePoolUpdateInputs {
++    Tensor state_pool;
++    Tensor state_indices;
++    Tensor updates;
++};
++
++struct StatePoolUpdateOperation {
++    using operation_attributes_t = StatePoolUpdateParams;
++    using tensor_args_t = StatePoolUpdateInputs;
++    using spec_return_value_t = TensorSpec;
++    using tensor_return_value_t = Tensor;
++
++    static ProgramDescriptor create_descriptor(
++        const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
++    static void validate_on_program_cache_miss(
++        const operation_attributes_t&, const tensor_args_t&);
++    static spec_return_value_t compute_output_specs(
++        const operation_attributes_t&, const tensor_args_t& inputs) {
++        return inputs.state_pool.tensor_spec();
++    }
++    static tensor_return_value_t create_output_tensors(
++        const operation_attributes_t&, const tensor_args_t& inputs) {
++        return inputs.state_pool;
++    }
++};
++
++void validate_tensor(const Tensor& tensor, const char* name) {
++    TT_FATAL(tensor.storage_type() == StorageType::DEVICE, "{} must be on device", name);
++    TT_FATAL(tensor.buffer() != nullptr, "{} must be allocated", name);
++    TT_FATAL(tensor.layout() == Layout::TILE, "{} must be tiled", name);
++    TT_FATAL(!tensor.is_sharded(), "{} must be interleaved", name);
++}
++
++void check_shape(const Tensor& tensor, std::initializer_list<uint32_t> expected, const char* name) {
++    TT_FATAL(tensor.logical_shape() == Shape(expected), "{} shape mismatch", name);
++}
++
++void StatePoolUpdateOperation::validate_on_program_cache_miss(
++    const operation_attributes_t&, const tensor_args_t& inputs) {
++    validate_tensor(inputs.state_pool, "state pool");
++    validate_tensor(inputs.state_indices, "state indices");
++    validate_tensor(inputs.updates, "updates");
++    TT_FATAL(
++        inputs.state_indices.dtype() == DataType::INT32,
++        "state indices must be int32");
++    TT_FATAL(
++        inputs.state_pool.dtype() == inputs.updates.dtype(),
++        "state pool and updates must have the same dtype");
++
++    const auto& pool_shape = inputs.state_pool.logical_shape();
++    const auto& update_shape = inputs.updates.logical_shape();
++    TT_FATAL(
++        pool_shape.rank() >= 2 && pool_shape.rank() == update_shape.rank(),
++        "state pool and updates must have the same rank of at least two");
++    TT_FATAL(update_shape[0] <= 32, "updates must fit in one tile row");
++    check_shape(inputs.state_indices, {update_shape[0]}, "state indices");
++    for (uint32_t dim = 1; dim < pool_shape.rank(); ++dim) {
++        TT_FATAL(
++            pool_shape[dim] == update_shape[dim],
++            "state pool and update slices must match");
++    }
++    TT_FATAL(
++        inputs.state_pool.buffer()->num_pages() % pool_shape[0] == 0 &&
++            inputs.updates.buffer()->num_pages() % update_shape[0] == 0 &&
++            inputs.state_pool.buffer()->num_pages() / pool_shape[0] ==
++                inputs.updates.buffer()->num_pages() / update_shape[0],
++        "state pool and update slices must have the same page count");
++}
++
++ProgramDescriptor StatePoolUpdateOperation::create_descriptor(
++    const operation_attributes_t&, const tensor_args_t& inputs,
++    tensor_return_value_t&) {
++    const uint32_t batch_size = inputs.updates.logical_shape()[0];
++    const uint32_t pages_per_slice =
++        inputs.updates.buffer()->num_pages() / batch_size;
++    const uint32_t total_pages = batch_size * pages_per_slice;
++    const uint32_t tile_bytes = inputs.updates.buffer()->page_size();
++
++    ProgramDescriptor program;
++    auto* device = inputs.state_pool.device();
++    const CoreCoord grid = device->compute_with_storage_grid_size();
++    const uint32_t num_workers = std::min(
++        total_pages, static_cast<uint32_t>(grid.x * grid.y));
++    CoreRangeSet cores = num_cores_to_corerangeset(num_workers, grid);
++
++    program.cbs = {
++        CBDescriptor{
++            .total_size = tile_bytes,
++            .core_ranges = cores,
++            .format_descriptors = {{
++                .buffer_index = tt::CBIndex::c_0,
++                .data_format = datatype_to_dataformat_converter(inputs.updates.dtype()),
++                .page_size = tile_bytes}}},
++        CBDescriptor{
++            .total_size = 4096,
++            .core_ranges = cores,
++            .format_descriptors = {{
++                .buffer_index = tt::CBIndex::c_1,
++                .data_format = tt::DataFormat::Int32, .page_size = 4096}}}};
++
++    std::vector<uint32_t> compile_args = {
++        batch_size, pages_per_slice, num_workers, tile_bytes};
++    TensorAccessorArgs(inputs.state_pool.buffer()).append_to(compile_args);
++    TensorAccessorArgs(inputs.state_indices.buffer()).append_to(compile_args);
++    TensorAccessorArgs(inputs.updates.buffer()).append_to(compile_args);
++
++    KernelDescriptor kernel{
++        .kernel_source = "ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/"
++        "kernels/dataflow/state_pool_update.cpp",
++        .core_ranges = cores,
++        .compile_time_args = compile_args,
++        .config = DataMovementConfigDescriptor{
++            .processor = DataMovementProcessor::RISCV_0,
++            .noc = NOC::RISCV_0_default}};
++
++    for (uint32_t worker = 0; worker < num_workers; ++worker) {
++        const CoreCoord core{worker / grid.y, worker % grid.y};
++        kernel.emplace_runtime_args(
++            core,
++            {worker, inputs.state_pool.buffer(),
++             inputs.state_indices.buffer(),
++             inputs.updates.buffer()});
++    }
++
++    program.kernels.push_back(std::move(kernel));
++    return program;
++}
++
++}  // namespace
++}  // namespace ttnn::prim
++
++namespace ttnn::transformer {
++
++Tensor state_pool_update(
++    const Tensor& state_pool,
++    const Tensor& state_indices,
++    const Tensor& updates) {
++    using Op = prim::StatePoolUpdateOperation;
++    return device_operation::launch<Op>(
++        {},
++        {.state_pool = state_pool,
++         .state_indices = state_indices,
++         .updates = updates});
++}
++
++}  // namespace ttnn::transformer
+diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp
+@@ -0,0 +1,15 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include "ttnn/tensor/tensor.hpp"
++
++namespace ttnn::transformer {
++
++Tensor state_pool_update(
++    const Tensor& state_pool,
++    const Tensor& state_indices,
++    const Tensor& updates);
++
++}  // namespace ttnn::transformer

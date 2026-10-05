@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -944,22 +944,20 @@ TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(
+@@ -978,22 +978,20 @@ TTNNOperandsWorkaroundsFactory::createReduceProdOpOperandsWorkarounds(
  // tt-metal generates indices of type UInt16 or UInt32 depending on padded size.
  // Any mismatch between generated and expected data type will cause runtime to
  // assert. Issue page: https://github.com/tenstorrent/tt-mlir/issues/4405

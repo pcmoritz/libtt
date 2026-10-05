@@ -1,8 +1,7 @@
 diff --git a/pjrt_implementation/inc/api/compile_options.h b/pjrt_implementation/inc/api/compile_options.h
-index b1dd5b8..47b70dd 100644
 --- a/pjrt_implementation/inc/api/compile_options.h
 +++ b/pjrt_implementation/inc/api/compile_options.h
-@@ -94,7 +94,7 @@ struct CompileOptions {
+@@ -107,7 +107,7 @@ struct CompileOptions {
    // When enabled, const-eval operations are hoisted to be executed on the CPU
    // instead of being executed on the device. CPU execution uses 32-bit
    // precision for all operations, which can improve accuracy for some models.

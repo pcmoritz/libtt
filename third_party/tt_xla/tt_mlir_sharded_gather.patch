@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 --- a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
-@@ -531,6 +531,147 @@
+@@ -531,6 +531,147 @@ convertShardyCCLToStableHLOCCL(MLIRContext *context,
    return mlir::success();
  }
  
@@ -149,7 +149,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
  class UpdateGlobalToLocalShapesPass
      : public impl::UpdateGlobalToLocalShapesPassBase<
            UpdateGlobalToLocalShapesPass> {
-@@ -613,6 +754,8 @@
+@@ -613,6 +754,8 @@ public:
        }
      });
  

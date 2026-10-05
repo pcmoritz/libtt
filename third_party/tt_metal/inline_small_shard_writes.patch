@@ -9,7 +9,7 @@ diff --git tt_metal/distributed/mesh_command_queue_base.cpp tt_metal/distributed
  #include <tt_stl/fmt.hpp>
  #include "mesh_command_queue_base.hpp"
  
-@@ -255,15 +256,31 @@
+@@ -254,15 +255,31 @@ void MeshCommandQueueBase::enqueue_write_shards_nolock(
              }
          };
  

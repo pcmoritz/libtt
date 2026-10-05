@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
  #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
  #include "ttnn/types.hpp"
  #include <ranges>
-@@ -1018,16 +1019,159 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
+@@ -1022,16 +1023,159 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
  }
  }  // namespace bmm_op_utils
  
@@ -170,7 +170,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
      auto config = generate_matmul_program_config(
          input_tensor_a,
          input_tensor_b,
-@@ -1046,7 +1190,9 @@ MatmulProgramConfig get_program_config(
+@@ -1050,7 +1194,9 @@ MatmulProgramConfig get_program_config(
      std::visit(
          [input_tensor_a](const auto& program_config) {
              using ProgramConfigType = std::decay_t<decltype(program_config)>;
@@ -228,7 +228,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.h
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
-@@ -94,13 +94,31 @@ struct MatmulMultiCoreProgramConfig {
+@@ -92,13 +92,31 @@ struct MatmulMultiCoreProgramConfig {
      std::optional<CoreRangeSet> allowed_worker_cores = std::nullopt;
  };
  
@@ -261,7 +261,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_t
  
  // Ensures allowed_worker_cores is populated on every config variant that supports it.
  // If allowed_worker_cores is already set, it is left unchanged.  Otherwise it is
-@@ -126,7 +144,7 @@ inline void normalize_program_config(MatmulProgramConfig& config, const tt::tt_m
+@@ -124,7 +142,7 @@ inline void normalize_program_config(MatmulProgramConfig& config, const tt::tt_m
                      c.allowed_worker_cores = make_crs(device_grid);
                  }
              }
@@ -271,6 +271,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_t
          config);
  }
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
+new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
 @@ -0,0 +1,288 @@
@@ -563,6 +564,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +
 +}  // namespace ttnn::prim
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.hpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.hpp
+new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.hpp
 @@ -0,0 +1,36 @@
@@ -603,6 +605,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +
 +}  // namespace ttnn::prim
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
+new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
 @@ -0,0 +1,93 @@
@@ -700,6 +703,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
 +    }
 +}
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp
+new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp
 @@ -0,0 +1,55 @@
@@ -759,6 +763,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode
 +    }
 +}
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
+new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
 @@ -0,0 +1,58 @@
@@ -821,6 +826,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    noc.async_write_barrier();
 +}
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp
+new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp
 @@ -0,0 +1,53 @@
@@ -878,6 +884,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +    }
 +}
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_sender.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_sender.cpp
+new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_sender.cpp
 @@ -0,0 +1,86 @@
@@ -970,7 +977,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
-@@ -481,7 +481,8 @@ void validate_matmul_block_and_subblock_configuration(
+@@ -482,7 +482,8 @@ void validate_matmul_block_and_subblock_configuration(
                      operations::matmul::MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig> ||
                  std::is_same_v<
                      ProgramConfigType,
@@ -980,7 +987,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
                  return;
              }
              if constexpr (
-@@ -588,8 +589,10 @@ void validate_matmul_compute_grid_and_per_core_dims(
+@@ -589,8 +590,10 @@ void validate_matmul_compute_grid_and_per_core_dims(
      std::visit(
          [&](const auto& program_config) {
              using ProgramConfigType = std::decay_t<decltype(program_config)>;
@@ -993,7 +1000,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
              } else {
                  // Non-MultiCore. Grid-bounds check applies to Reuse/Mcast2D/Mcast1D only
                  // (DRAMSharded/BatchedDRAMSharded map to DRAM banks).
-@@ -1996,6 +1999,21 @@ void validate_matmul_mcast1d_config(
+@@ -2120,6 +2123,21 @@ void validate_matmul_mcast1d_config(
      }
  }
  
@@ -1015,7 +1022,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
  // Shared Mcast2D/Mcast1D preamble — the fuse_batch gate. Fused batch requires B batch==1,
  // and transpose_a is unsupported when real batch dims survive with M_per_batch > 1.
  void validate_matmul_mcast_fuse_batch_preamble(
-@@ -2086,6 +2104,8 @@ MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_f
+@@ -2212,6 +2230,8 @@ MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_f
              } else if constexpr (
                  std::is_same_v<T, operations::matmul::MatmulMultiCoreReuseMultiCastBatchedDRAMShardedProgramConfig>) {
                  return MatmulMultiCoreReuseBatchedHSDRAMShardedProgramFactory{};
@@ -1024,7 +1031,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
              } else {
                  TT_THROW("Unknown program config type");
              }
-@@ -2138,7 +2158,8 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
+@@ -2264,7 +2284,8 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
          attributes.transpose_a,
          attributes.transpose_b,
          bias_single_tile_size,
@@ -1034,7 +1041,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
      operations::matmul::normalize_program_config(
          chosen_program_config, input_tensor_a.device()->compute_with_storage_grid_size());
  
-@@ -2224,6 +2245,8 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
+@@ -2350,6 +2371,8 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
                      in0_tile,
                      in1_tile,
                      program_config);
@@ -1043,7 +1050,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
              } else if constexpr (std::is_same_v<
                                       ProgramConfigType,
                                       operations::matmul::MatmulMultiCoreReuseProgramConfig>) {
-@@ -2281,8 +2304,18 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
+@@ -2407,8 +2430,18 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
      const auto& input_tensor_b = input_tensors.at(1);
  
      // Use the compute_matmul_output_shape function to get the output shape
@@ -1063,7 +1070,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
  
      const auto& a_shape_padded =
          operations::matmul::utilities::get_matmul_tensor_padded_shape(input_tensor_a, attributes.transpose_a);
-@@ -2311,7 +2344,8 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
+@@ -2437,7 +2470,8 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
              attributes.transpose_a,
              attributes.transpose_b,
              bias_single_tile_size,
@@ -1073,7 +1080,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
          // Soft-normalize so downstream variant code can safely read allowed_worker_cores; the warning
          // for missing allowed_worker_cores was emitted at the entry point above.
          operations::matmul::normalize_program_config(
-@@ -2780,7 +2814,8 @@ MatmulDeviceOperation::tensor_return_value_t matmul(
+@@ -2906,7 +2940,8 @@ MatmulDeviceOperation::tensor_return_value_t matmul(
              normalized_attributes.transpose_a,
              normalized_attributes.transpose_b,
              bias_single_tile_size,
@@ -1189,7 +1196,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/m
  std::vector<Tensor> matmul_batched_weights(
      const Tensor& input_tensor_a,
      const std::vector<Tensor>& input_tensors_b,
-@@ -118,6 +129,7 @@ Tensor sparse_matmul(
+@@ -119,6 +130,7 @@ Tensor sparse_matmul(
  using operations::matmul::addmm;
  using operations::matmul::linear;
  using operations::matmul::matmul;

@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedUpdateCacheOpRewritePattern.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedUpdateCacheOpRewritePattern.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedUpdateCacheOpRewritePattern.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedUpdateCacheOpRewritePattern.cpp
-@@ -16,9 +16,11 @@
+@@ -16,9 +16,11 @@ namespace mlir::tt::ttnn::workarounds::decomposition {
  
  // This rewrite pattern applies a specific memory config to the input tensor
  // (fill value) of the ttnn.paged_update_cache op. The input must be height
@@ -14,7 +14,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/PagedUpdateCa
  
    RankedTensorType inputType =
        mlir::cast<RankedTensorType>(op.getInput().getType());
-@@ -48,22 +50,53 @@
+@@ -48,22 +50,53 @@ LogicalResult PagedUpdateCacheOpRewritePattern::matchAndRewrite(
    ttnn::TTNNLayoutAttr currentInputLayout =
        mlir::dyn_cast_or_null<ttnn::TTNNLayoutAttr>(
            op.getInput().getType().getEncoding());

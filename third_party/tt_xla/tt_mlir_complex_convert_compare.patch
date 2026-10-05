@@ -1,14 +1,23 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 --- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
-@@ -24,0 +25,6 @@
+@@ -21,6 +21,12 @@ using namespace mlir;
+ namespace mlir::tt::stablehlo {
+ #define GEN_PASS_DEF_STABLEHLOCOMPLEXDATATYPECONVERSIONPASS
+ #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h.inc"
 +static bool hasComplexElementType(Type type) {
 +  auto tensorType = mlir::dyn_cast<RankedTensorType>(type);
 +  return tensorType &&
 +         mlir::isa<mlir::ComplexType>(tensorType.getElementType());
 +}
 +
-@@ -206,0 +213,103 @@
+ 
+ //===----------------------------------------------------------------------===//
+ // ComplexDataTypeConversion overview
+@@ -203,6 +209,109 @@ public:
+   }
+ };
+ } // namespace
 +// Rewrites stablehlo.convert when either its operand or result is complex.
 +namespace {
 +class ComplexConvertOpConversionPattern
@@ -112,7 +121,13 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +};
 +} // namespace
 +
-@@ -699,0 +809,10 @@
+ 
+ // Rewrites a complex stablehlo.iota as a real iota paired with an all-zero
+ // imaginary tensor. Merely changing the iota result to tensor<...x2xf32>
+@@ -696,6 +805,16 @@ struct StableHLOComplexDataTypeConversionPass
+         mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp,
+         mlir::stablehlo::SelectOp>(
+         isNotComplexType);
 +    target.addDynamicallyLegalOp<mlir::stablehlo::ConvertOp>(
 +        [](mlir::stablehlo::ConvertOp op) {
 +          return !hasComplexElementType(op.getOperand().getType()) &&
@@ -123,7 +138,10 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +          return !hasComplexElementType(op.getLhs().getType());
 +        });
 +
-@@ -735,8 +854,10 @@ struct StableHLOComplexDataTypeConversionPass
+ 
+     target.addIllegalOp<mlir::stablehlo::ComplexOp, mlir::stablehlo::RealOp,
+                         mlir::stablehlo::ImagOp>();
+@@ -735,7 +854,9 @@ struct StableHLOComplexDataTypeConversionPass
      RewritePatternSet patterns(&getContext());
      patterns.add<
          ComplexBroadcastInDimOpConversionPattern,
@@ -134,4 +152,3 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
          ComplexIotaOpConversionPattern,
          ComplexMulOpConversionPattern,
          ComplexSelectOpConversionPattern,
-         ComplexSliceOpConversionPattern,

@@ -1,10 +1,11 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5337,6 +5337,58 @@
+@@ -5304,6 +5304,58 @@ private:
+ };
  } // namespace
  
- namespace {
++namespace {
 +// Each device's index in the mesh: partition an iota over the mesh so that
 +// every device keeps its own element.
 +class StableHLOToTTIRPartitionIdOpConversionPattern
@@ -56,11 +57,10 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +};
 +} // namespace
 +
-+namespace {
+ namespace {
  class StableHLOToTTIRReduceScatterOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::ReduceScatterOp> {
-   using OpConversionPattern<
-@@ -12269,6 +12321,8 @@
+@@ -12222,6 +12274,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
                                         RewritePatternSet &patterns,
                                         TypeConverter &typeConverter) {
    patterns.add<StableHLOToTTIRAllReduceOpConversionPattern>(typeConverter, ctx);
@@ -72,7 +72,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 --- a/lib/Dialect/TTIR/IR/TTIROps.cpp
 +++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
-@@ -5592,8 +5592,10 @@
+@@ -5629,8 +5629,10 @@ mlir::OpFoldResult mlir::tt::ttir::RepeatInterleaveOp::fold(FoldAdaptor fold) {
  ::mlir::LogicalResult mlir::tt::ttir::AllReduceOp::verify() {
    ::mlir::tt::ttcore::ReduceType reduceType = getReduceType();
  
@@ -88,7 +88,7 @@ diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-@@ -4570,8 +4570,10 @@
+@@ -4901,8 +4901,10 @@ mlir::tt::ttnn::ReduceScatterOp::fold(FoldAdaptor adaptor) {
  ::mlir::LogicalResult AllReduceOp::verify() {
    ::mlir::tt::ttcore::ReduceType reduceType = getReduceType();
  
@@ -104,7 +104,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 diff --git a/runtime/lib/ttnn/operations/ccl/all_reduce.cpp b/runtime/lib/ttnn/operations/ccl/all_reduce.cpp
 --- a/runtime/lib/ttnn/operations/ccl/all_reduce.cpp
 +++ b/runtime/lib/ttnn/operations/ccl/all_reduce.cpp
-@@ -34,7 +34,8 @@
+@@ -34,7 +34,8 @@ void run(const ::tt::target::ttnn::AllReduceOp *op, ProgramContext &context) {
    }
  
    ::ttnn::Tensor out = ::ttnn::all_reduce(

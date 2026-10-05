@@ -1,20 +1,21 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -108,6 +108,12 @@ getPaddingOrDefault(mlir::DenseIntElementsAttr attr, size_t numSpatialDims) {
-   }
+@@ -109,6 +109,12 @@ getPaddingOrDefault(mlir::DenseIntElementsAttr attr, size_t numSpatialDims) {
    return llvm::SmallVector<int64_t>(numSpatialDims * 2, 0);
  }
-+
+ 
 +static bool hasUnsupportedFloatType(Type type) {
 +  return mlir::isa<FloatType>(type) &&
 +         type.getIntOrFloatBitWidth() != 16 &&
 +         type.getIntOrFloatBitWidth() != 32;
 +}
- 
++
  // Typical initialization values for reduction ops.
  enum TypicalInitReductionValue {
-@@ -126,34 +132,19 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+   NEG_INF, // It is also used for minimum integer value.
+@@ -125,36 +131,21 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+ 
    float desiredF32;
    double desiredF64;
 -  int32_t desiredI32;
@@ -51,7 +52,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      initValueOp.getResult().getType().getElementType().isF16()) {
      const llvm::APFloat &value =
          *initValueOp.getValue().value_begin<llvm::APFloat>();
-@@ -173,32 +164,17 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+     if (desired == TypicalInitReductionValue::NEG_INF) {
+@@ -172,34 +163,19 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+   if (initValueOp.getResult().getType().getElementType().isF64()) {
      return *initValueOp.getValue().value_begin<double>() == desiredF64;
    }
 -  // Integer element types: read the constant as an APInt so both signed and
@@ -78,6 +81,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -      return value.getBoolValue() == desiredI1;
 +    if (desired == TypicalInitReductionValue::ZERO) {
 +      return value.isZero();
++    }
++    if (desired == TypicalInitReductionValue::ONE) {
++      return value.isOne();
      }
 -    int64_t desiredInt =
 -        width == 8 ? desiredI8 : (width == 32 ? desiredI32 : desiredI64);
@@ -86,15 +92,14 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -    // ui32 2147483648 == i32 INT32_MIN).
 -    return value == llvm::APInt(width, static_cast<uint64_t>(desiredInt),
 -                                /*isSigned=*/true);
-+    if (desired == TypicalInitReductionValue::ONE) {
-+      return value.isOne();
-+    }
 +    return integerType.isUnsigned() || integerType.getWidth() == 1
 +               ? value.isZero()
 +               : value.isMinSignedValue();
    }
  
-@@ -736,4 +718,11 @@ public:
+   return false;
+@@ -735,6 +711,13 @@ public:
+   matchAndRewrite(mlir::stablehlo::DotGeneralOp srcOp,
                    mlir::stablehlo::DotGeneralOp::Adaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
 +    Type lhsType = getElementTypeOrSelf(srcOp.getLhs());
@@ -106,7 +111,10 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
  
      auto outputType = mlir::cast<RankedTensorType>(
-@@ -1262,3 +1282,8 @@ private:
+         getTypeConverter()->convertType(srcOp.getResult().getType()));
+@@ -1271,6 +1254,11 @@ private:
+   LogicalResult
+   checkConversionLegality(mlir::stablehlo::ConstantOp &srcOp,
                            ConversionPatternRewriter &rewriter) const {
 +    if (hasUnsupportedFloatType(srcOp.getValue().getElementType())) {
 +      return rewriter.notifyMatchFailure(
@@ -115,12 +123,18 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +
      if (isa<DenseElementsAttr, DenseResourceElementsAttr>(srcOp.getValue()) &&
          !srcOp.getValue().getElementType().isIntOrFloat()) {
-@@ -2653,3 +2678,3 @@ public:
+       return rewriter.notifyMatchFailure(
+@@ -2670,7 +2658,7 @@ public:
+     RankedTensorType firstInputType =
+         mlir::cast<RankedTensorType>(srcOp.getInputs()[0].getType());
      int64_t inputRank = firstInputType.getRank();
 -    if (inputRank > 5) {
 +    if (inputRank == 0 || inputRank > 5) {
        return rewriter.notifyMatchFailure(srcOp, "Invalid input tensor rank.");
-@@ -4272,5 +4276,6 @@ public:
+     }
+ 
+@@ -4267,8 +4255,9 @@ public:
+     // Get indices of elements larger than one which correspond to spatial dims
      // (H, W)
      auto spatialDims = getIndicesofElementsLargerThanOne(windowDims);
 -    if (spatialDims.empty()) {
@@ -129,3 +143,5 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      return rewriter.notifyMatchFailure(
 +          srcOp, "only 4D operands with two spatial dimensions are supported");
      }
+ 
+     // Generate desired and current layouts (desired = N,H,W,C)

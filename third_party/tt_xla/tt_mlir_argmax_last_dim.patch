@@ -1,7 +1,27 @@
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -2051,14 +2051,14 @@ struct ArgMaxPattern : public OpConversionPattern<ttir::ArgMaxOp> {
+   LogicalResult
+   matchAndRewrite(ttir::ArgMaxOp op, OpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+-    // This pattern works as follows:
++    // This pattern works as follows, also for a single dimension:
+     // 1. Permute input tensor, i.e, put all reduction dimensions at the end.
+     // 2. Reshape the permuted tensor to make all reduction dimensions into one.
+     // 3. Create a new ArgMax op with the reshaped tensor and the new reduction
+     //    dimension.
+     // 4. Reshape the output tensor to the expected shape in case of keep dim.
+     auto tempDimArg = op.getDimArg();
+-    if (!tempDimArg || tempDimArg->size() <= 1) {
++    if (!tempDimArg) {
+       return failure();
+     }
+ 
 diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
 --- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
 +++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
-@@ -173,9 +173,17 @@
+@@ -166,9 +166,17 @@ struct TTIRToTTIRDecompositionPass
        return !isa_and_nonnull<ttir::FullOp>(op.getInput().getDefiningOp());
      });
  
@@ -20,23 +40,3 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.
      });
  
      target.addDynamicallyLegalOp<ttir::PadOp>([&](ttir::PadOp op) {
-diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
---- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
-+++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
-@@ -1875,14 +1875,14 @@
-   LogicalResult
-   matchAndRewrite(ttir::ArgMaxOp op, OpAdaptor adaptor,
-                   ConversionPatternRewriter &rewriter) const override {
--    // This pattern works as follows:
-+    // This pattern works as follows, also for a single dimension:
-     // 1. Permute input tensor, i.e, put all reduction dimensions at the end.
-     // 2. Reshape the permuted tensor to make all reduction dimensions into one.
-     // 3. Create a new ArgMax op with the reshaped tensor and the new reduction
-     //    dimension.
-     // 4. Reshape the output tensor to the expected shape in case of keep dim.
-     auto tempDimArg = op.getDimArg();
--    if (!tempDimArg || tempDimArg->size() <= 1) {
-+    if (!tempDimArg) {
-       return failure();
-     }
- 

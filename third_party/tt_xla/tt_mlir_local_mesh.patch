@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -4805,9 +4805,22 @@
+@@ -4773,9 +4773,22 @@ static llvm::ErrorOr<ttcore::ReduceType> getReduceType(Operation *op) {
    return getReduceTypeFromRegion(op->getRegion(0));
  }
  
@@ -25,7 +25,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    /*
    We need to figure out what the cluster axis is based on replica_groups.
    Replica groups define which device axis we are performing the collective
-@@ -4844,14 +4857,44 @@
+@@ -4812,14 +4825,44 @@ determineClusterAxis(::mlir::DenseIntElementsAttr replicaGroups,
  
    // Case where we have single devices in each replica_group (ie perform
    // collective communication operation against itself which should be optimized
@@ -76,7 +76,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    }
  
    // If replicaGroupsShape[1] == 1, then the cluster axis should be set to 0.
-@@ -5241,9 +5284,15 @@
+@@ -5209,9 +5252,15 @@ public:
        }
      }
  
@@ -93,7 +93,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp, "AllReduceOp cannot specify cluster axis.");
      }
-@@ -5315,9 +5364,15 @@
+@@ -5283,9 +5332,15 @@ public:
        }
      }
  
@@ -110,7 +110,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp, "ReduceScatterOp cannot specify cluster axis.");
      }
-@@ -5358,9 +5413,15 @@
+@@ -5326,9 +5381,15 @@ public:
      auto outputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult(0).getType()));
  
@@ -138,27 +138,31 @@ diff --git a/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp b/lib/Dialec
  #include "shardy/dialect/sdy/transforms/propagation/aggressive_propagation.h"
  #include "shardy/dialect/sdy/transforms/propagation/user_priority_propagation.h"
  
-@@ -25,6 +26,9 @@
- 
+@@ -26,6 +27,9 @@ void createStableHLOPipeline(OpPassManager &pm,
    // Convert any xla.sdy ops to sdy ops.
    pm.addPass(createConvertXlaSdyToSdyPass());
-+
+ 
 +  // JAX collectives can introduce identical meshes with different symbols.
 +  pm.addPass(mlir::sdy::createLiftInlinedMeshesPass());
- 
++
    // Optionally run aggressive StableHLO simplification if enabled.
    if (options.enableAggressiveSimplification) {
-@@ -50,3 +54,6 @@
-   analyzeMeshOptions.meshShape = llvm::to_vector(options.meshShape);
+     pm.addPass(mlir::stablehlo::createStablehloAggressiveSimplificationPass());
+@@ -51,6 +55,9 @@ void createStableHLOPipeline(OpPassManager &pm,
    analyzeMeshOptions.automaticArgAnalysis = options.automaticArgAnalysis;
    pm.addPass(createAnalyzeMeshPass(analyzeMeshOptions));
-+
+ 
 +  // Size-one axes must not create conflicts or reductions during propagation.
 +  pm.addPass(mlir::sdy::createRemoveSizeOneAxesPass());
++
+   // Optionally search for optimal sharding configuration by evaluating CCL
+   // costs across all candidate shardings.
+   if (options.enableAutoSharding) {
 diff --git a/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp b/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
 --- a/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
 +++ b/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
-@@ -1435,10 +1435,24 @@
+@@ -1434,14 +1434,28 @@ void MemoryLayoutPropagation::applyToIR() {
+   // First pass: apply op configs. Collected up front because applyOpConfig can
    // insert a reconciling cast right after the op it is configuring.
    SmallVector<Operation *> configuredOps;
 +  SmallVector<std::pair<OpOperand *, TTNNLayoutAttr>> exemptInputs;
@@ -179,7 +183,10 @@ diff --git a/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp b/lib/Dialect
    });
    for (Operation *op : configuredOps) {
      applyOpConfig(op, *getChosenCandidate(op));
-+  }
+   }
 +  for (auto [operand, layout] : exemptInputs) {
 +    insertReshardOp(operand->getOwner(), operand->getOperandNumber(), layout);
-   }
++  }
+ 
+   // Second pass: insert reshard ops (deduped per producer via reshardCache).
+   func->walk([&](Operation *op) {

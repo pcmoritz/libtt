@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
 --- a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
 +++ b/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp
-@@ -391,8 +391,37 @@
+@@ -391,8 +391,37 @@ std::optional<Value> matchSelfConcatLastDim(Value value) {
    return concatOp.getOperand(0);
  }
  
@@ -41,7 +41,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
  // Detects self-concat cos/sin at the IR level (same as TTNN decomposition's
  // matchSelfConcatLastDim) to choose the optimal decomposition form.
  //
-@@ -400,10 +429,10 @@
+@@ -400,10 +429,10 @@ std::optional<Value> matchSelfConcatLastDim(Value value) {
  // so that ttnn::RotaryEmbeddingOp promotion (force-promote path) can still
  // match the expected shapes. The decomposition body uses the half-dim
  // operands directly via implicit broadcasting.
@@ -56,7 +56,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
    auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
    auto cosType = mlir::cast<RankedTensorType>(cosInput.getType());
    auto sinType = mlir::cast<RankedTensorType>(sinInput.getType());
-@@ -425,11 +454,26 @@
+@@ -425,11 +454,26 @@ void replaceWithRoPEComposite(Operation *anchorOp,
    moduleBuilder.insert(decompFunc);
  
    // Create the ttcore.composite op.
@@ -88,7 +88,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
  }
  
  } // namespace
-@@ -535,15 +579,18 @@
+@@ -535,15 +579,18 @@ mlir::LogicalResult RoPEComplexRotationFusingPattern::matchAndRewrite(
      return failure();
    }
  
@@ -97,14 +97,14 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 +  // reshape to rank 4 (the decode form), with 2 or 3 operands.
    auto resultType = mlir::cast<RankedTensorType>(srcOp.getType());
 -  if (resultType.getRank() != 4) {
+-    return failure();
+-  }
+-  if (srcOp.getDim() != resultType.getRank() - 1) {
 +  ReshapeOp rank4Reshape = getRank4DecodeReshapeUser(srcOp);
 +  if (resultType.getRank() != 4 && !rank4Reshape) return failure();
 +  if (srcOp.getDim() != static_cast<int32_t>(resultType.getRank() - 1)) {
      return failure();
    }
--  if (srcOp.getDim() != resultType.getRank() - 1) {
--    return failure();
--  }
 -  if (srcOp.getNumOperands() != 2) {
 +  // A third operand is appended unrotated, as a partial rotary does
 +  // (Qwen3.5 rotates the first 64 of 256 dims): concat(x1*cos - x2*sin,
@@ -113,7 +113,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
      return failure();
    }
  
-@@ -607,12 +654,25 @@
+@@ -607,11 +654,24 @@ mlir::LogicalResult RoPEComplexRotationFusingPattern::matchAndRewrite(
      return failure();
    }
  
@@ -122,9 +122,9 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
    auto inputType = mlir::cast<RankedTensorType>(xSource.getType());
 -  if (inputType.getRank() != 4) {
 +  if (inputType.getRank() != 4 && !rank4Reshape) {
-     return failure();
-   }
- 
++    return failure();
++  }
++
 +  // The two rotation halves concatenate to the rotation of xSource, so
 +  // xSource has their concatenated shape. A tail is appended unchanged,
 +  // whatever computes it.
@@ -134,14 +134,13 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 +      mlir::cast<RankedTensorType>(addOp.getType()).getShape().back();
 +  if (inputType.getShape() != ArrayRef<int64_t>(rotatedShape) ||
 +      inputType.getElementType() != resultType.getElementType()) {
-+    return failure();
-+  }
+     return failure();
+   }
 +  Value tail = srcOp.getNumOperands() == 3 ? srcOp.getOperand(2) : Value();
-+
+ 
    // sub: x1*cos - x2*sin => subSlice0 = x1 (first half), subSlice1 = x2
    // add: x2*cos + x1*sin => addSlice0 = x2, addSlice1 = x1
-   if (!isFirstHalfSlice(subSlice0) || !isSecondHalfSlice(subSlice1)) {
-@@ -642,37 +702,74 @@
+@@ -642,37 +702,74 @@ mlir::LogicalResult RoPEComplexRotationFusingPattern::matchAndRewrite(
      return failure();
    }
  
@@ -161,18 +160,6 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 -  cosFullShape[lastDim] *= 2;
 -  auto cosFullType =
 -      RankedTensorType::get(cosFullShape, cosHalfType.getElementType());
--
--  SmallVector<int64_t> sinFullShape(sinHalfType.getShape());
--  sinFullShape[lastDim] *= 2;
--  auto sinFullType =
--      RankedTensorType::get(sinFullShape, sinHalfType.getElementType());
--
--  auto cosFull = rewriter.create<ConcatOp>(
--      srcOp.getLoc(), cosFullType, ValueRange{cosHalf, cosHalf},
--      rewriter.getSI32IntegerAttr(lastDim));
--  auto sinFull = rewriter.create<ConcatOp>(
--      srcOp.getLoc(), sinFullType, ValueRange{sinHalf, sinHalf},
--      rewriter.getSI32IntegerAttr(lastDim));
 +  // The decode form is a rank-3 concat followed by a reshape to rank 4: the
 +  // rewrite replaces that reshape and works at rank 4, with token_index 0.
 +  // Otherwise it replaces the rank-4 concat itself.
@@ -190,8 +177,10 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 +                     RankedTensorType::get(shape, type.getElementType()));
 +  };
  
--  replaceWithRoPEComposite(srcOp, rewriter, xSource, cosFull, sinFull,
--                           resultType);
+-  SmallVector<int64_t> sinFullShape(sinHalfType.getShape());
+-  sinFullShape[lastDim] *= 2;
+-  auto sinFullType =
+-      RankedTensorType::get(sinFullShape, sinHalfType.getElementType());
 +  // cos/sin are half-dim, one row in the decode form. Match both before
 +  // rewriting anything: halfCache only unwraps and validates.
 +  auto halfCache = [&](Value embedding) -> Value {
@@ -207,7 +196,13 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 +  if (!cosHalf || !sinHalf) {
 +    return failure();
 +  }
-+
+ 
+-  auto cosFull = rewriter.create<ConcatOp>(
+-      srcOp.getLoc(), cosFullType, ValueRange{cosHalf, cosHalf},
+-      rewriter.getSI32IntegerAttr(lastDim));
+-  auto sinFull = rewriter.create<ConcatOp>(
+-      srcOp.getLoc(), sinFullType, ValueRange{sinHalf, sinHalf},
+-      rewriter.getSI32IntegerAttr(lastDim));
 +  // Bring a half cache to the composite's rank, then self-concatenate it to
 +  // the full rotary width, so that ttnn::RotaryEmbeddingOp promotion sees
 +  // full-dim caches and the decomposition recognizes the self-concat and
@@ -226,7 +221,9 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 +        loc, RankedTensorType::get(shape, type.getElementType()),
 +        ValueRange{half, half}, rewriter.getSI32IntegerAttr(lastDim));
 +  };
-+
+ 
+-  replaceWithRoPEComposite(srcOp, rewriter, xSource, cosFull, sinFull,
+-                           resultType);
 +  Value x = rank4Reshape ? atOutputRank(xSource) : xSource;
 +  DictionaryAttr attributes;
 +  if (rank4Reshape) {
@@ -249,7 +246,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
-@@ -163,6 +163,9 @@
+@@ -193,6 +193,9 @@ static void registerBuiltinComposites() {
        [](ttcore::CompositeOp compositeOp,
           OpBuilder &builder) -> OpValidationResult {
          TT_assert(compositeOp.getInputs().size() == 3u);
@@ -259,7 +256,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect
  
          SmallVector<Type> resultTypes(compositeOp.getResultTypes());
          IsolatedIRValidationWrapper validator(compositeOp.getContext());
-@@ -170,16 +173,19 @@
+@@ -200,16 +203,19 @@ static void registerBuiltinComposites() {
              compositeOp.getOperation(), compositeOp.getLoc(), resultTypes,
              compositeOp.getInputs()[0], compositeOp.getInputs()[1],
              compositeOp.getInputs()[2],
@@ -284,7 +281,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect
 diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddingOpRewritePattern.cpp
-@@ -20,6 +20,7 @@
+@@ -20,6 +20,7 @@ getWorkaroundedOp(RotaryEmbeddingOp ropeOp, PatternRewriter &rewriter) {
      return std::nullopt;
    }
  

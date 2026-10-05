@@ -1,14 +1,16 @@
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -6,6 +6,7 @@
+@@ -4,6 +4,7 @@
+ 
  #include "mlir/IR/BuiltinTypes.h"
  #include "mlir/Support/LLVM.h"
 +#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
  #include "ttmlir/Dialect/TTCore/IR/Utils.h"
  #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
  #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
-@@ -115,9 +116,13 @@ private:
+@@ -151,9 +152,13 @@ private:
+ 
    // Collect all inputs and outputs outside the operation set to hoist.
    // Tensor inputs come first, followed by semaphore inputs.
 +  // Optimization-barrier results that pass a boundary input through are
@@ -22,7 +24,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
  
      // Create set for quick lookup
      llvm::SmallPtrSet<Operation *, 16> opSet(opsToHoist.begin(),
-@@ -178,6 +183,20 @@ private:
+@@ -214,6 +219,16 @@ private:
          for (auto &use : result.getUses()) {
            Operation *user = use.getOwner();
            if (!opSet.contains(user)) {
@@ -39,7 +41,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
              outputs.push_back(result);
              break;
            }
-@@ -260,6 +279,10 @@ private:
+@@ -271,6 +286,10 @@ private:
      llvm::SmallVector<mlir::Value> boundaryInputs;
      // Values of the original function that the trace produces.
      llvm::SmallVector<mlir::Value> boundaryOutputs;
@@ -49,7 +51,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +    llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> passthroughOutputs;
      // Number of leading tensor input arguments.
      size_t numTensorInputs = 0;
-@@ -328,9 +351,12 @@ private:
+     // Split point of the tensor input indices [0, numTensorInputs):
+@@ -338,8 +357,10 @@ private:
      llvm::SmallVector<mlir::Value> inputs;
      llvm::SmallVector<mlir::Value> outputs;
      llvm::SmallVector<mlir::Type> outputTypes;
@@ -58,14 +61,18 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
  
 -    collectFunctionBoundary(opsToHoist, inputs, outputs);
 +    collectFunctionBoundary(opsToHoist, inputs, outputs, passthroughOutputs);
-@@ -465,6 +491,7 @@ private:
+ 
+     // collectFunctionBoundary sorts tensors before semaphores; split there so
+     // the output slots can be inserted between the two groups.
+@@ -477,6 +498,7 @@ private:
      info.outputSlotTypes = std::move(outputTypes);
      info.boundaryInputs = std::move(inputs);
      info.boundaryOutputs = std::move(outputs);
 +    info.passthroughOutputs = std::move(passthroughOutputs);
      return info;
    }
-@@ -918,6 +945,10 @@ private:
+ 
+@@ -921,6 +943,10 @@ private:
        output.replaceAllUsesWith(traceOp->getResult(i));
      }
  

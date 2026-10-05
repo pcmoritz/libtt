@@ -1,7 +1,10 @@
 diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
 --- a/pjrt_implementation/src/api/buffer_instance.cc
 +++ b/pjrt_implementation/src/api/buffer_instance.cc
-@@ -675,6 +675,8 @@ PJRT_Error *onBufferCopyToDevice(PJRT_Buffer_CopyToDevice_Args *args) {
+@@ -671,10 +671,12 @@ PJRT_Error *onBufferCopyToDevice(PJRT_Buffer_CopyToDevice_Args *args) {
+   DeviceInstance *dst_device = DeviceInstance::unwrap(args->dst_device);
+   MemoryInstance *dst_memory = dst_device->getDefaultMemory();
+ 
 -  src_buffer->copyToDeviceMemory(
 +  tt_pjrt_status status = src_buffer->copyToDeviceMemory(
        dst_device, dst_memory,
@@ -12,7 +15,11 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
 +  }
    return nullptr;
  }
-@@ -697,6 +699,8 @@ PJRT_Error *onBufferCopyToMemory(PJRT_Buffer_CopyToMemory_Args *args) {
+ 
+@@ -693,10 +695,12 @@ PJRT_Error *onBufferCopyToMemory(PJRT_Buffer_CopyToMemory_Args *args) {
+     return *ErrorInstance::makeError(tt_pjrt_status::kUnimplemented).release();
+   }
+ 
 -  src_buffer->copyToDeviceMemory(
 +  tt_pjrt_status status = src_buffer->copyToDeviceMemory(
        dst_device, dst_memory,
@@ -23,16 +30,20 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
 +  }
    return nullptr;
  }
+ 
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
 --- a/pjrt_implementation/src/api/client_instance.cc
 +++ b/pjrt_implementation/src/api/client_instance.cc
-@@ -17,4 +17,5 @@
+@@ -16,6 +16,7 @@
+ #include <cstring>
  #include <filesystem>
  #include <map>
 +#include <mutex>
  #include <optional>
  
-@@ -499,4 +500,7 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+ // system includes
+@@ -498,6 +499,9 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+     const std::optional<std::vector<int64_t>> &replica_device_ids,
      size_t target_num_devices) {
  
 +  static std::mutex compile_mutex;
@@ -40,10 +51,13 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 +
    std::string_view mlir_code(mlir_program->code, mlir_program->code_size);
  
+   std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>> compile_result =
 diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implementation/src/api/compile_options_parser.cc
 --- a/pjrt_implementation/src/api/compile_options_parser.cc
 +++ b/pjrt_implementation/src/api/compile_options_parser.cc
-@@ -214,4 +214,12 @@
+@@ -248,8 +248,16 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+           if (exec_field.number() == kOptimizationLevelFieldNumber &&
+               exec_field.type() ==
                    google::protobuf::UnknownField::TYPE_VARINT) {
 +            uint64_t optimization_level = exec_field.varint();
 +            // XLA encodes O0, O1, and O2 as 9, 19, and 29.
@@ -57,10 +71,23 @@ diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implem
 -                                        std::to_string(exec_field.varint()));
 +                                        std::to_string(optimization_level));
            }
+         }
+       }
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -218,7 +218,6 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+                                     program_index, input_tensors);
+ 
+     if (!r) {
+-      m_client_instance->closeMeshDevice();
+       return tt_pjrt_status::kInternal;
+     }
+ 
 diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
-@@ -48,6 +48,8 @@
+@@ -48,6 +48,8 @@ void LoadedExecutableInstance::bindApi(PJRT_Api *api) {
        internal::onLoadedExecutableGetExecutable;
    api->PJRT_LoadedExecutable_AddressableDevices =
        internal::onLoadedExecutableAddressableDevices;
@@ -69,10 +96,10 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
    api->PJRT_LoadedExecutable_GetDeviceAssignment =
        internal::onLoadedExecutableGetDeviceAssignment;
    api->PJRT_LoadedExecutable_Delete = internal::onLoadedExecutableDelete;
-@@ -465,15 +467,17 @@
+@@ -465,15 +467,17 @@ onLoadedExecutableExecute(PJRT_LoadedExecutable_Execute_Args *args) {
    ZoneScoped;
    DLOG_F(LOG_DEBUG, "LoadedExecutableInstance::PJRT_LoadedExecutable_Execute");
-
+ 
 -  // We don't support the major-to-minor data layout transpose for callbacks
 -  // (added in PJRT API v0.110). If a client activates it we would silently
 -  // produce results with unexpected layout, leading to hard-to-debug PCC
@@ -92,10 +119,10 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
      DLOG_F(ERROR,
             "PJRT_ExecuteOptions::use_major_to_minor_data_layout_for_callbacks "
             "is not supported by the tt-xla plugin.");
-@@ -501,6 +505,12 @@
+@@ -501,8 +505,14 @@ onLoadedExecutableExecute(PJRT_LoadedExecutable_Execute_Args *args) {
      return nullptr;
    }
-
+ 
 +  static std::mutex execution_mutex;
 +  const std::lock_guard<std::mutex> lock(execution_mutex);
 +
@@ -106,18 +133,13 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
 +  }
 +  return nullptr;
  }
-diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
---- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
-+++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
-@@ -220,4 +220,3 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
-     if (!r) {
--      m_client_instance->closeMeshDevice();
-       return tt_pjrt_status::kInternal;
-     }
+ 
+ } // namespace internal
 diff --git a/pjrt_implementation/src/api_bindings.cc b/pjrt_implementation/src/api_bindings.cc
 --- a/pjrt_implementation/src/api_bindings.cc
 +++ b/pjrt_implementation/src/api_bindings.cc
-@@ -22,10 +22,60 @@
+@@ -21,12 +21,62 @@
+ #include "api/memory_instance.h"
  #include "api/plugin_attributes.h"
  #include "utils/logging.h"
 +#include "xla/pjrt/c/pjrt_c_api_profiler_extension.h"
@@ -179,3 +201,4 @@ diff --git a/pjrt_implementation/src/api_bindings.cc b/pjrt_implementation/src/a
 +      reinterpret_cast<PJRT_Extension_Base *>(&profilerExtension);
    api->pjrt_api_version.major_version = PJRT_API_MAJOR;
    api->pjrt_api_version.minor_version = PJRT_API_MINOR;
+ 

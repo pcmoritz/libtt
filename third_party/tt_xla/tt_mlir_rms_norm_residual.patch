@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -2297,6 +2297,20 @@ def TTIR_BatchNormTrainingOp : TTIR_NamedOp<"batch_norm_training"> {
+@@ -2318,6 +2318,20 @@ def TTIR_BatchNormTrainingOp : TTIR_NamedOp<"batch_norm_training"> {
    let hasVerifier = 1;
  }
  
@@ -25,7 +25,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -2669,6 +2669,19 @@ def TTNN_BatchNormTrainingOp : TTNN_Op<"batch_norm_training", [AttrSizedOperandS
+@@ -2761,6 +2761,19 @@ def TTNN_BatchNormTrainingOp : TTNN_Op<"batch_norm_training", [AttrSizedOperandS
      let hasVerifier = 1;
  }
  
@@ -48,8 +48,8 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/ttmlir/Target/TTNN/operations/normalization.fbs
 --- a/include/ttmlir/Target/TTNN/operations/normalization.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/normalization.fbs
-@@ -47,6 +47,15 @@ table RMSNormOp {
-   compute_config: tt.target.ttnn.DeviceComputeKernelConfig;
+@@ -59,6 +59,15 @@ table DitRMSNormUnaryFusedOp {
+   out: tt.target.ttnn.TensorRef;
  }
  
 +table RMSNormResidualOp {
@@ -67,7 +67,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/t
 diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
 --- a/include/ttmlir/Target/TTNN/program.fbs
 +++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -137,6 +137,7 @@ union OpType {
+@@ -141,6 +141,7 @@ union OpType {
    RepeatOp,
    RMSNormPreAllGatherOp,
    RMSNormOp,
@@ -105,9 +105,9 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  class AdamWOpConversionPattern : public OpConversionPattern<ttir::AdamWOp> {
  public:
    using OpConversionPattern<ttir::AdamWOp>::OpConversionPattern;
-@@ -4033,6 +4053,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
-            SDPAForwardOpConversionPattern,
-            SDPABackwardOpConversionPattern,
+@@ -4003,6 +4023,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            AdamWOpConversionPattern,
+            CrossEntropyForwardOpConversionPattern,
             RMSNormOpConversionPattern,
 +           RMSNormResidualOpConversionPattern,
             DistributedRMSNormOpConversionPattern,
@@ -116,7 +116,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3800,6 +3800,76 @@ public:
+@@ -3809,6 +3809,76 @@ public:
    }
  };
  
@@ -193,7 +193,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -3857,6 +3927,7 @@ public:
+@@ -3866,6 +3936,7 @@ public:
        }
        patterns.add<RMSNormFusionPattern>(&getContext());
        patterns.add<NormalizeRMSNormFusionPattern>(&getContext());
@@ -204,8 +204,8 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -1766,6 +1766,21 @@ createOp(FlatbufferObjectCache &cache, RMSNormOp op) {
-       memoryConfig, output, computeConfig.value_or(0));
+@@ -1860,6 +1860,21 @@ createOp(FlatbufferObjectCache &cache, DitRMSNormUnaryFusedOp op) {
+       computeConfig.value_or(0), output);
  }
  
 +::flatbuffers::Offset<::tt::target::ttnn::RMSNormResidualOp>
@@ -226,9 +226,9 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
  ::flatbuffers::Offset<::tt::target::ttnn::DistributedRMSNormOp>
  createOp(FlatbufferObjectCache &cache, DistributedRMSNormOp op) {
    auto input = cache.at<::tt::target::ttnn::TensorRef>(
-@@ -5085,6 +5100,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
-     return createOperation(cache, createOp(cache, rmsNormOp), debugString,
-                            locInfo);
+@@ -5250,6 +5265,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createOp(cache, ditRMSNormUnaryFusedOp),
+                            debugString, locInfo);
    }
 +  if (auto rmsNormResidualOp = dyn_cast<RMSNormResidualOp>(op)) {
 +    return createOperation(cache, createOp(cache, rmsNormResidualOp),
@@ -238,6 +238,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
        distributedRMSNormOp) {
      return createOperation(cache, createOp(cache, distributedRMSNormOp),
 diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm_residual.cpp b/runtime/lib/ttnn/operations/normalization/rms_norm_residual.cpp
+new file mode 100644
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/normalization/rms_norm_residual.cpp
 @@ -0,0 +1,23 @@
@@ -265,6 +266,7 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm_residual.cpp b/r
 +}
 +} // namespace tt::runtime::ttnn::operations::rms_norm_residual
 diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm_residual.h b/runtime/lib/ttnn/operations/normalization/rms_norm_residual.h
+new file mode 100644
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/normalization/rms_norm_residual.h
 @@ -0,0 +1,16 @@
@@ -287,7 +289,7 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm_residual.h b/run
 diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
 --- a/runtime/lib/ttnn/program_executor.cpp
 +++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -92,6 +92,7 @@
+@@ -93,6 +93,7 @@
  #include "operations/normalization/layer_norm_post_all_gather.h"
  #include "operations/normalization/layer_norm_pre_all_gather.h"
  #include "operations/normalization/rms_norm.h"
@@ -295,9 +297,9 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
  #include "operations/normalization/rms_norm_pre_all_gather.h"
  #include "operations/normalization/softmax.h"
  #include "operations/pool/pool2d.h"
-@@ -480,6 +481,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
-   case ::tt::target::ttnn::OpType::RMSNormOp: {
-     return operations::rms_norm::run(op->type_as_RMSNormOp(), getContext());
+@@ -493,6 +494,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+     return operations::dit_rms_norm_unary_fused::run(
+         op->type_as_DitRMSNormUnaryFusedOp(), getContext());
    }
 +  case ::tt::target::ttnn::OpType::RMSNormResidualOp: {
 +    return operations::rms_norm_residual::run(op->type_as_RMSNormResidualOp(),

@@ -1,21 +1,7 @@
-diff --git tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
---- tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
-+++ tt_metal/api/tt-metalium/experimental/tensor/impl/tensor_impl.hpp
-@@ -32,6 +32,10 @@
- 
- HostBuffer allocate_host_buffer(const TensorSpec& tensor_spec);
- 
-+// Like allocate_host_buffer, but leaves the contents uninitialized. For buffers
-+// that are fully overwritten, e.g. by a device read.
-+HostBuffer allocate_uninitialized_host_buffer(const TensorSpec& tensor_spec);
-+
- // Converts logical data into physical data based on tensor spec
- // - Logical data: Flat container of row major data corresponding to some ND logical shape
- // - Physical data: Flat container of physical data corresponding to tensor spec. It takes into account:
 diff --git tt_metal/impl/tensor/distributed_tensor_apis.cpp tt_metal/impl/tensor/distributed_tensor_apis.cpp
 --- tt_metal/impl/tensor/distributed_tensor_apis.cpp
 +++ tt_metal/impl/tensor/distributed_tensor_apis.cpp
-@@ -115,7 +115,7 @@
+@@ -116,7 +116,7 @@ HostTensor enqueue_read_tensor(
      distributed_host_buffer.emplace_shards(
          {coords.begin(), coords.end()},
          [&](const distributed::MeshCoordinate&) {
@@ -27,7 +13,7 @@ diff --git tt_metal/impl/tensor/distributed_tensor_apis.cpp tt_metal/impl/tensor
 diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
 --- tt_metal/impl/tensor/tensor_apis.cpp
 +++ tt_metal/impl/tensor/tensor_apis.cpp
-@@ -65,7 +65,7 @@
+@@ -66,7 +66,7 @@ HostTensor distributed::MeshCommandQueue::enqueue_read_tensor(const MeshTensor&
      distributed_host_buffer.emplace_shards(
          coords,
          [&](const distributed::MeshCoordinate&) {
@@ -39,7 +25,7 @@ diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis
 diff --git tt_metal/impl/tensor/tensor_impl.cpp tt_metal/impl/tensor/tensor_impl.cpp
 --- tt_metal/impl/tensor/tensor_impl.cpp
 +++ tt_metal/impl/tensor/tensor_impl.cpp
-@@ -56,6 +56,33 @@
+@@ -57,6 +57,33 @@ HostBuffer allocate_host_buffer(const TensorSpec& tensor_spec) {
      TT_THROW("Unreachable");
  }
  
@@ -73,3 +59,17 @@ diff --git tt_metal/impl/tensor/tensor_impl.cpp tt_metal/impl/tensor/tensor_impl
  // ======================================================================================
  //     Helpers for converting between logical <-> physical data with full tensor spec
  // ======================================================================================
+diff --git tt_metal/impl/tensor/tensor_impl.hpp tt_metal/impl/tensor/tensor_impl.hpp
+--- tt_metal/impl/tensor/tensor_impl.hpp
++++ tt_metal/impl/tensor/tensor_impl.hpp
+@@ -25,6 +25,10 @@ std::shared_ptr<distributed::MeshBuffer> allocate_device_buffer(
+ 
+ HostBuffer allocate_host_buffer(const TensorSpec& tensor_spec);
+ 
++// Like allocate_host_buffer, but leaves the contents uninitialized. For buffers
++// that are fully overwritten, e.g. by a device read.
++HostBuffer allocate_uninitialized_host_buffer(const TensorSpec& tensor_spec);
++
+ // Converts logical data into physical data based on tensor spec
+ // - Logical data: Flat container of row major data corresponding to some ND logical shape
+ // - Physical data: Flat container of physical data corresponding to tensor spec. It takes into account:

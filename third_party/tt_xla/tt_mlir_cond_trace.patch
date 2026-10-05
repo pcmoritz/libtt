@@ -1,8 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-index ed768f2..2cde09e 100644
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -3839,6 +3839,7 @@ def TTNN_CaptureOrExecuteTraceOp : TTNN_MemoryEffectOp<"capture_or_execute_trace
+@@ -4052,6 +4052,7 @@ def TTNN_CaptureOrExecuteTraceOp : TTNN_MemoryEffectOp<"capture_or_execute_trace
        - `execute_callee` FlatSymbolRefAttr: The symbol of the execute trace function.
        - `inputs` Variadic<AnyRankedTensor>: The input tensors to the trace function.
        - `semaphore_inputs` Variadic<TTNN_GlobalSemaphore>: Global semaphores forwarded into the capture/execute programs.
@@ -10,7 +9,7 @@ index ed768f2..2cde09e 100644
      Outputs:
        - `results` Variadic<AnyRankedTensor>: The output tensors from the trace function.
    }];
-@@ -3847,6 +3848,7 @@ def TTNN_CaptureOrExecuteTraceOp : TTNN_MemoryEffectOp<"capture_or_execute_trace
+@@ -4060,6 +4061,7 @@ def TTNN_CaptureOrExecuteTraceOp : TTNN_MemoryEffectOp<"capture_or_execute_trace
                         FlatSymbolRefAttr:$allocate_slots_callee,
                         FlatSymbolRefAttr:$capture_callee,
                         FlatSymbolRefAttr:$execute_callee,
@@ -19,7 +18,6 @@ index ed768f2..2cde09e 100644
                         Variadic<TTNN_GlobalSemaphore>:$semaphore_inputs);
  
 diff --git a/include/ttmlir/Target/TTNN/operations/trace.fbs b/include/ttmlir/Target/TTNN/operations/trace.fbs
-index 00ba16f..8d80733 100644
 --- a/include/ttmlir/Target/TTNN/operations/trace.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/trace.fbs
 @@ -30,4 +30,5 @@ table CaptureOrExecuteTraceOp {
@@ -29,10 +27,9 @@ index 00ba16f..8d80733 100644
 +  trace_key_input_indices: [uint32];
  }
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-index ca6f81c..84d8ace 100644
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-@@ -5613,6 +5613,22 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
+@@ -5944,6 +5944,22 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
    auto opInputs = this->getInputs();
    auto opSemaphoreInputs = this->getSemaphoreInputs();
    auto opOutputs = this->getResults();
@@ -55,7 +52,7 @@ index ca6f81c..84d8ace 100644
  
    // An input already on device acts as its own persistent slot and is handed
    // to the allocation program, while an input in system memory is staged into
-@@ -5777,7 +5793,7 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
+@@ -6108,7 +6124,7 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
                              "into the output slot arguments";
    }
  
@@ -64,7 +61,7 @@ index ca6f81c..84d8ace 100644
      auto tensorType = ::mlir::dyn_cast<RankedTensorType>(arg.getType());
      if (!tensorType) {
        if (::mlir::isa<ttnn::GlobalSemaphoreType>(arg.getType())) {
-@@ -5786,10 +5802,11 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
+@@ -6117,10 +6133,11 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
        return emitOpError() << "All input arguments of trace function must be "
                             << "ranked tensors or global semaphores";
      }
@@ -79,7 +76,7 @@ index ca6f81c..84d8ace 100644
      }
    }
  
-@@ -5835,6 +5852,14 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
+@@ -6166,6 +6183,14 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
                auto tensorType =
                    ::mlir::cast<RankedTensorType>(operand.getType());
                if (!utils::isTensorOnDevice(tensorType)) {
@@ -97,8 +94,7 @@ index ca6f81c..84d8ace 100644
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-@@ -704,5 +704,9 @@ private:
-     for (Operation *user : arg.getUsers()) {
+@@ -710,6 +710,10 @@ private:
        if (mlir::isa<ttir::MeshShardOp>(user)) {
          return true;
        }
@@ -107,10 +103,12 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
 +        return true;
 +      }
      }
+ 
+     return false;
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -316,6 +316,9 @@ private:
+@@ -317,6 +317,9 @@ private:
      llvm::SmallVector<mlir::Type> outputSlotTypes;
      // Types of the trailing semaphore arguments.
      llvm::SmallVector<mlir::Type> semaphoreTypes;
@@ -120,7 +118,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
  
      // Contiguous views over the two halves of the tensor-input partition.
      auto deviceResidentIndices() const {
-@@ -336,6 +339,9 @@ private:
+@@ -337,6 +340,9 @@ private:
        return llvm::ArrayRef<mlir::DictionaryAttr>(inputArgAttrs)
            .take_front(numDeviceResident);
      }
@@ -130,7 +128,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
    };
  
    // Creates the trace-main function and returns the TraceMainFuncInfo
-@@ -378,6 +384,34 @@ private:
+@@ -379,6 +385,34 @@ private:
              [&](mlir::Value input) { return isDeviceResidentValue(input); }) -
          inputs.begin();
  
@@ -165,7 +163,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
      for (mlir::Value output : outputs) {
        outputTypes.push_back(output.getType());
      }
-@@ -480,14 +514,24 @@ private:
+@@ -481,12 +515,22 @@ private:
      info.traceFunc = traceFuncOp;
      info.numTensorInputs = numTensorInputs;
      info.numDeviceResident = numDeviceResident;
@@ -188,15 +186,15 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
        } else {
          info.inputSlotTypes.push_back(utils::RankedTensorTypeFactory::create(
              tensorType, BufferType::DRAM));
-       }
+@@ -654,18 +698,21 @@ private:
+       traceOutputSlots.push_back(captureFunc.getArgument(outputSlotBase + i));
      }
-@@ -656,15 +700,18 @@ private:
+ 
 -    // Transfer the host-staged inputs into their device slots. This has to
 -    // happen before the capture window opens: tt-metal rejects host writes
--    // while a capture is active.
 +    // Start with input slots, forwarding trace keys directly from host.
 +    // Stage other host inputs before capture: tt-metal rejects host writes
-+    // while a capture is active.
+     // while a capture is active.
 +    llvm::SmallVector<mlir::Value> traceCallArgs(inputSlots);
      for (auto [h, argIndex] : llvm::enumerate(info.hostStagedIndices())) {
 +      if (info.isTraceKeyInput(argIndex)) {
@@ -215,7 +213,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
      llvm::append_range(traceCallArgs, traceOutputSlots);
      for (size_t i = 0; i < info.semaphoreTypes.size(); i++) {
        traceCallArgs.push_back(captureFunc.getArgument(semaphoreBase + i));
-@@ -934,7 +981,9 @@ private:
+@@ -935,7 +982,9 @@ private:
      auto traceOp = builder.create<ttnn::CaptureOrExecuteTraceOp>(
          funcOp.getLoc(), info.outputSlotTypes, device,
          allocateSlotsTraceSymbolAttr, captureTraceSymbolAttr,
@@ -226,7 +224,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
  
      // Replace uses of original outputs with the output of the trace op function
      for (size_t i = 0; i < info.boundaryOutputs.size(); i++) {
-@@ -992,8 +1041,8 @@ private:
+@@ -1035,8 +1084,8 @@ private:
    }
  
    mlir::LogicalResult processFuncOp(func::FuncOp funcOp) {
@@ -238,10 +236,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
      }
  
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-index 1035de0..bfd4e8f 100644
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -3342,6 +3342,12 @@ createOp(FlatbufferObjectCache &cache, CaptureOrExecuteTraceOp op,
+@@ -3486,6 +3486,12 @@ createOp(FlatbufferObjectCache &cache, CaptureOrExecuteTraceOp op,
          getOperandThroughDPSOps(input)));
    }
  
@@ -254,7 +251,7 @@ index 1035de0..bfd4e8f 100644
    std::vector<::flatbuffers::Offset<::tt::target::ttnn::TensorRef>> outputs;
    for (auto result : op.getResults()) {
      outputs.push_back(
-@@ -3376,7 +3382,7 @@ createOp(FlatbufferObjectCache &cache, CaptureOrExecuteTraceOp op,
+@@ -3520,7 +3526,7 @@ createOp(FlatbufferObjectCache &cache, CaptureOrExecuteTraceOp op,
    return ::tt::target::ttnn::CreateCaptureOrExecuteTraceOpDirect(
        *cache.fbb, cache.at<::tt::target::DeviceRef>(device), captureProgramIdx,
        executeProgramIdx, allocateSlotsProgramIdx, &inputs, &outputs,
@@ -264,7 +261,6 @@ index 1035de0..bfd4e8f 100644
  
  ::flatbuffers::Offset<::tt::target::ttnn::ConcatenateHeadsOp>
 diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
-index ff7837b..12aec8a 100644
 --- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
 +++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
 @@ -5,6 +5,7 @@
@@ -295,7 +291,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
  
  #include "operations/trace/capture_or_execute_trace.h"
  #include "tt/runtime/detail/common/logger.h"
-@@ -24,6 +25,54 @@ getTraceCacheKeys(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -26,6 +27,54 @@ getTraceCacheKeys(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
                                     op->execute_program_id())};
  }
  
@@ -350,7 +346,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
  static void copyTensorFromHostToDevice(const ::ttnn::Tensor &srcTensor,
                                         ::ttnn::Tensor &dstTensor) {
  
-@@ -115,6 +164,9 @@ updateTraceInputSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -130,6 +179,9 @@ updateTraceInputSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
               " got: ", inputSlots.size());
  
    for (size_t i = 0; i < op->inputs()->size(); i++) {
@@ -360,7 +356,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
      const ::tt::target::ttnn::TensorRef *input = op->inputs()->Get(i);
      const bool deviceResident =
          ::tt::runtime::ttnn::utils::inDeviceMemory(input);
-@@ -190,7 +242,8 @@ static TraceVariant captureTrace(
+@@ -215,7 +267,8 @@ static TraceVariant captureTrace(
      const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
      ProgramContext &context,
      std::vector<::tt::runtime::Tensor> &inputSlots,
@@ -370,7 +366,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
    ProgramTensorPool &tensorPool = context.getTensorPool();
    ::tt::runtime::Device deviceHandle = context.getDeviceHandle();
    // Program inputs are, in order: the host-staged inputs, the trace input
-@@ -243,6 +296,7 @@ static TraceVariant captureTrace(
+@@ -282,6 +335,7 @@ static TraceVariant captureTrace(
        .traceId = ::ttnn::MeshTraceId(
            ::tt::runtime::ttnn::utils::getScalarFromTensor<uint32_t>(
                traceIdTensor)),
@@ -378,7 +374,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
        .inputTensors = inputSlots,
        .outputTensors = outputSlots,
        .ownedTensors = std::move(ownedTensors)};
-@@ -328,6 +382,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -367,6 +421,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
            ->asSharedPtr<::tt::runtime::ttnn::TraceCache>(DeviceRuntime::TTNN);
    LOG_ASSERT(traceCache, "TraceCache must be initialized in DeviceHandle");
  
@@ -386,7 +382,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
    auto [mainProgramKey, captureExecuteKey] = getTraceCacheKeys(op, context);
  
    if (!traceCache->contains(mainProgramKey, captureExecuteKey)) {
-@@ -355,7 +410,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -394,7 +449,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
                            /*deviceResidentOnly=*/true);
      TraceData traceData;
      traceData.variants.push_back(
@@ -395,7 +391,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
      traceCache->insert(mainProgramKey, captureExecuteKey, std::move(traceData));
  
      debug::Stats::get().incrementStat("TraceCacheMiss");
-@@ -369,7 +424,8 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -408,7 +463,8 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
    auto variantIt = std::find_if(
        traceData->variants.rbegin(), traceData->variants.rend(),
        [&](const TraceVariant &variant) {
@@ -405,7 +401,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
                 meshDevice.is_mesh_trace_replay_safe(variant.traceId);
        });
  
-@@ -423,7 +479,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -462,7 +518,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
    updateTraceInputSlots(op, context, inputSlots,
                          /*deviceResidentOnly=*/true);
    traceData->variants.push_back(

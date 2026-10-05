@@ -9,7 +9,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
  #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
  #include "ttmlir/Utils.h"
  
-@@ -332,6 +333,71 @@
+@@ -332,6 +333,71 @@ private:
    const std::set<mlir::StringRef> *enabledOps;
  };
  
@@ -81,7 +81,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
  // This pattern wraps an si32-indexed gather in a fill-style mask, modeled
  // on what JAX emits for `jax.lax.gather(..., mode='fill')`:
  //
-@@ -465,6 +531,9 @@
+@@ -465,6 +531,9 @@ public:
        RewritePatternSet patterns(&getContext());
        patterns.add<
            GatherSi32Workaround, UInt32WhereWorkaround,

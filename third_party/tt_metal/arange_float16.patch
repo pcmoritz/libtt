@@ -1,7 +1,8 @@
 diff --git ttnn/cpp/ttnn/operations/creation/creation.cpp ttnn/cpp/ttnn/operations/creation/creation.cpp
 --- ttnn/cpp/ttnn/operations/creation/creation.cpp
 +++ ttnn/cpp/ttnn/operations/creation/creation.cpp
-@@ -35,6 +35,6 @@ Tensor arange_impl(
+@@ -34,7 +34,7 @@ Tensor arange_impl(
+ 
      auto index = 0;
      for (auto value = start; (step > 0) ? (value < stop) : (value > stop); value += step) {
 -        if constexpr (std::is_same_v<T, ::bfloat16>) {
@@ -9,7 +10,7 @@ diff --git ttnn/cpp/ttnn/operations/creation/creation.cpp ttnn/cpp/ttnn/operatio
              owned_buffer[index++] = T(static_cast<float>(value));
          } else {
              owned_buffer[index++] = static_cast<T>(value);
-@@ -76,6 +76,13 @@ template Tensor arange_impl<::bfloat16>(
+@@ -80,6 +80,13 @@ template Tensor arange_impl<::bfloat16>(
      const Layout layout,
      std::optional<std::reference_wrapper<MeshDevice>> device,
      const MemoryConfig& output_mem_config);
@@ -23,7 +24,7 @@ diff --git ttnn/cpp/ttnn/operations/creation/creation.cpp ttnn/cpp/ttnn/operatio
  template Tensor arange_impl<float>(
      const int64_t start,
      const int64_t stop,
-@@ -409,6 +416,7 @@ Tensor arange(
+@@ -418,6 +425,7 @@ Tensor arange(
  
      switch (dtype) {
          case DataType::BFLOAT16: return concrete_arange.template operator()<::bfloat16>();

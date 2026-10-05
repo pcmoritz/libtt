@@ -1,9 +1,7 @@
-# Consolidated owner for StableHLO scatter lowering changes.
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-index 2701ea4..487c93d 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -4617,6 +4617,146 @@ getReduceTypeFromRegion(Region &region) {
+@@ -4591,6 +4591,146 @@ getReduceTypeFromRegion(Region &region) {
        std::make_error_code(std::errc::operation_not_supported));
  }
  
@@ -150,7 +148,7 @@ index 2701ea4..487c93d 100644
  static llvm::ErrorOr<ttcore::ReduceType> getReduceType(Operation *op) {
    if (!llvm::isa<mlir::stablehlo::AllReduceOp, mlir::stablehlo::ReduceScatterOp,
                   mlir::stablehlo::ScatterOp>(op)) {
-@@ -7860,8 +8000,12 @@ public:
+@@ -7868,19 +8008,24 @@ public:
      }
  
      // Convert reduceType stablehlo attribute into ttir attribute.
@@ -168,18 +166,21 @@ index 2701ea4..487c93d 100644
 +        subtractReduction
 +            ? ttcore::ReduceType::Sum
 +            : binaryReduction.value_or(ttcore::ReduceType::Invalid);
-@@ -7872,7 +8016,8 @@ public:
+ 
+     // ReduceType::Invalid only records that the update computation does no
+     // arithmetic - it does not say which of the two arguments comes back out.
+     // `(operand, update) -> update` overwrites, which is what every lowering
      // below assumes, but `(operand, update) -> operand` keeps the original
      // value and would be silently turned into an overwrite.
 -    if (*scatterReduceType == ttcore::ReduceType::Invalid &&
-+    if (scatterReduceType == ttcore::ReduceType::Invalid &&
 -        !returnsUpdateValue(srcOp.getUpdateComputation())) {
++    if (scatterReduceType == ttcore::ReduceType::Invalid &&
 +        !returnsUpdateValue(srcOp.getUpdateComputation()) &&
 +        unaryApply == UnaryScatterApplyKind::None) {
        return rewriter.notifyMatchFailure(
            srcOp, "the scatter's update computation neither combines its "
                   "arguments nor returns the update value");
-@@ -7880,13 +8025,61 @@ public:
+@@ -7888,29 +8033,93 @@ public:
  
      RankedTensorType outputType = mlir::cast<RankedTensorType>(
          this->getTypeConverter()->convertType(srcOp.getResults()[0].getType()));
@@ -228,6 +229,7 @@ index 2701ea4..487c93d 100644
 -    ArrayRef<int64_t> scatterDimsToOperandDims =
 -        adaptor.getScatterDimensionNumbers().getScatterDimsToOperandDims();
 -    if (scatterDimsToOperandDims.size() <= 1) {
+-      return convertToSingleDimScatter(srcOp, adaptor, *scatterReduceType,
 +    ArrayRef<int64_t> insertedWindowDims =
 +        adaptor.getScatterDimensionNumbers().getInsertedWindowDims();
 +    ArrayRef<int64_t> inputBatchingDims =
@@ -241,11 +243,10 @@ index 2701ea4..487c93d 100644
 +                                inputType.getRank() == updateType.getRank();
 +    if (!subtractReduction && scatterDimsToOperandDims.size() <= 1 &&
 +        !inputType.getElementType().isF32() && canUseAlignedScatter) {
--      return convertToSingleDimScatter(srcOp, adaptor, *scatterReduceType,
 +      return convertToSingleDimScatter(srcOp, adaptor, scatterReduceType,
                                         outputType, rewriter);
      }
-@@ -7894,15 +8087,31 @@ public:
+ 
      // Multi-dimensional scatter: flatten everything to 1D and scatter scalars
      // along dimension 0.
      constexpr int32_t SCATTER_DIMENSION = 0;
@@ -281,14 +282,16 @@ index 2701ea4..487c93d 100644
      Value flattenedInput = ttir::utils::flattenTensor(
          rewriter, srcOp.getLoc(), inputTensor, "_input_flatten");
      Value flattenedUpdate = ttir::utils::flattenTensor(
-@@ -7911,5 +8120,5 @@ public:
-     Value scatterResult = rewriter.create<ttir::ScatterOp>(
+@@ -7920,7 +8129,7 @@ public:
          srcOp.getLoc(), mlir::cast<RankedTensorType>(flattenedInput.getType()),
          flattenedInput, flattenedIndices, flattenedUpdate,
          rewriter.getI32IntegerAttr(SCATTER_DIMENSION),
 -        ttcore::ReduceTypeAttr::get(rewriter.getContext(), *scatterReduceType));
 +        ttcore::ReduceTypeAttr::get(rewriter.getContext(), scatterReduceType));
-@@ -7920,6 +8129,10 @@ public:
+ 
+     // Reshape result back to original input shape.
+     Value reshapedResult = ttir::utils::createReshapeOp(
+@@ -7928,11 +8137,97 @@ public:
          ttmlir::utils::appendLocationSuffix(srcOp.getLoc(), "_result_reshape"),
          scatterResult, inputShape);
  
@@ -299,7 +302,7 @@ index 2701ea4..487c93d 100644
      rewriter.replaceOp(srcOp, reshapedResult);
      return success();
    }
-@@ -7927,5 +8140,87 @@ private:
+ 
  private:
 +  LogicalResult convertUnaryScatterApply(
 +      mlir::stablehlo::ScatterOp srcOp, Value inputTensor,
@@ -386,8 +389,8 @@ index 2701ea4..487c93d 100644
    // Where each operand dimension draws its extent and its written position
    // from: how a StableHLO scatter lines up with the operand's dimensions.
    struct OperandDimSources {
-     static constexpr int64_t kNone = -1;
-@@ -7996,10 +8291,4 @@
+@@ -8003,12 +8298,6 @@ private:
+                             ttcore::ReduceType reduceType,
                              RankedTensorType outputType,
                              ConversionPatternRewriter &rewriter) const {
 -    // An overwrite of the entire operand needs no scatter at all.
@@ -398,7 +401,8 @@ index 2701ea4..487c93d 100644
 -
      OperandDimSources sources = computeOperandDimSources(srcOp);
      if (failed(checkAlignedScatterLegality(srcOp, sources, rewriter))) {
-@@ -8322,11 +8611,9 @@ private:
+       return failure();
+@@ -8330,11 +8619,9 @@ private:
      auto dimensionNumbers = adaptor.getScatterDimensionNumbers();
      ArrayRef<int64_t> scatterDimsToOperandDims =
          dimensionNumbers.getScatterDimsToOperandDims();
@@ -413,7 +417,7 @@ index 2701ea4..487c93d 100644
  
      // Scatters along at most one operand dimension are checked by
      // computeOperandAlignedLayout instead, which has to work the mapping out in
-@@ -8335,14 +8622,8 @@ private:
+@@ -8343,14 +8630,8 @@ private:
        return success();
      }
  
@@ -430,7 +434,7 @@ index 2701ea4..487c93d 100644
  
      int64_t indexRank = op.getScatterIndices().getType().getRank();
      if (dimensionNumbers.getIndexVectorDim() != indexRank - 1) {
-@@ -8430,6 +8711,23 @@ private:
+@@ -8438,6 +8719,23 @@ private:
      return flatIndices;
    }
  
@@ -454,7 +458,7 @@ index 2701ea4..487c93d 100644
    /// Computes flattened 1D indices for multi-dimensional scatter.
    ///
    /// Handles both cases:
-@@ -8467,6 +8765,10 @@ private:
+@@ -8475,6 +8773,10 @@ private:
          scatterDimNumbers.getUpdateWindowDims();
      ArrayRef<int64_t> scatterDimsToOperandDims =
          scatterDimNumbers.getScatterDimsToOperandDims();
@@ -465,7 +469,7 @@ index 2701ea4..487c93d 100644
      int64_t indexVectorDim = scatterDimNumbers.getIndexVectorDim();
      int64_t operandRank = operandShape.size();
      Location loc = op.getLoc();
-@@ -8474,6 +8776,8 @@ private:
+@@ -8482,6 +8784,8 @@ private:
      // Build set of inserted window dims for fast lookup.
      llvm::DenseSet<int64_t> insertedDimsSet(insertedWindowDims.begin(),
                                              insertedWindowDims.end());
@@ -474,7 +478,7 @@ index 2701ea4..487c93d 100644
  
      // Build reverse map: operand dim -> index position in scatter indices.
      llvm::DenseMap<int64_t, int64_t> scatterDimToIdxPos;
-@@ -8506,6 +8810,54 @@ private:
+@@ -8514,6 +8818,54 @@ private:
      // Total number of expanded indices (one per one scalar update).
      int64_t expandedNumIndices = numScatterPositions * windowSize;
  
@@ -529,7 +533,7 @@ index 2701ea4..487c93d 100644
      // First, reshape the original indices to shape
      // [numScatterPositions, originalIndexSize].
      int64_t originalIndexSize = indicesShape[indexVectorDim];
-@@ -8602,31 +8954,42 @@ private:
+@@ -8610,31 +8962,42 @@ private:
      // b) window-only: use window offset only
      // c) both scatter-indexed and window: add scatter index + window offset
      llvm::SmallVector<Value> indexSlices;
@@ -590,7 +594,7 @@ index 2701ea4..487c93d 100644
        }
  
        if (isWindowDim) {
-@@ -8648,11 +9011,23 @@ private:
+@@ -8656,11 +9019,23 @@ private:
          }
        }
  

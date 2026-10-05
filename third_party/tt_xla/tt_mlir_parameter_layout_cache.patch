@@ -1,3 +1,36 @@
+diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+--- a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
++++ b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
+@@ -590,8 +590,10 @@ def TTNNConstEvalInputsToSystemMemory : Pass<"ttnn-force-const-eval-to-system-me
+     This pass also modifies the forward functions' arguments that correspond to const-eval
+     function inputs, forcing them to system memory as well.
+ 
+-    Note: only the arguments whose sole user is the ttcore.load_cached op are forced to system memory,
+-    in order to avoid unnecessary to_device transfers for other users.
++    Constant and parameter arguments with direct device users are also moved to system
++    memory. Their device conversions must be hoisted by a following const-eval pass,
++    so different graphs reuse the same host inputs and cached device layouts.
++    This extension does not move KV-cache arguments off device.
+   }];
+ }
+ 
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -493,10 +493,11 @@ void createTTIRToTTNNCommonPipeline(
+     if (options.enableConstEval) {
+       devicePm.addPass(transforms::createConstEvalHoistTransform());
+ 
+-      // Now that all const-eval passes have run, we can force the const-eval
+-      // function inputs to system memory.
++      // Keep parameter inputs on the host across graphs, then cache any
++      // device conversions introduced for directly used parameters.
+       if (options.enableConstEvalInputsToSystemMemory) {
+         devicePm.addPass(createTTNNConstEvalInputsToSystemMemory());
++        devicePm.addPass(transforms::createConstEvalHoistTransform());
+ 
+         // Clean up any redundant to_layout ops that may have been introduced
+         // previously.
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNConstEvalInputsToSystemMemory.cpp b/lib/Dialect/TTNN/Transforms/TTNNConstEvalInputsToSystemMemory.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNConstEvalInputsToSystemMemory.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNConstEvalInputsToSystemMemory.cpp
@@ -9,7 +42,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNConstEvalInputsToSystemMemory.cpp b
  #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
  #include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
  #include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
-@@ -77,11 +78,9 @@
+@@ -77,11 +78,9 @@ static bool shouldTransferArgumentToDevice(BlockArgument blockArgument) {
               .getValue() != BufferType::SystemMemory;
  }
  
@@ -24,7 +57,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNConstEvalInputsToSystemMemory.cpp b
  //
  static SmallVector<BlockArgument> moveConstEvalArgsToHost(func::FuncOp funcOp) {
    SmallVector<Type> argumentTypes;
-@@ -107,13 +106,27 @@
+@@ -107,13 +106,27 @@ static SmallVector<BlockArgument> moveConstEvalArgsToHost(func::FuncOp funcOp) {
        continue;
      }
  
@@ -55,7 +88,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNConstEvalInputsToSystemMemory.cpp b
      }
  
      // Convert the argument to system memory type.
-@@ -224,9 +237,9 @@
+@@ -224,9 +237,9 @@ public:
          //
          llvm::SmallVector<ttcore::LoadCachedOp> loadCachedOps;
          for (auto *userOp : convertedArgument.getUsers()) {
@@ -68,36 +101,3 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNConstEvalInputsToSystemMemory.cpp b
          }
  
          for (auto loadCachedOp : loadCachedOps) {
-diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
---- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
-+++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
-@@ -485,10 +485,11 @@
-     if (options.enableConstEval) {
-       devicePm.addPass(transforms::createConstEvalHoistTransform());
- 
--      // Now that all const-eval passes have run, we can force the const-eval
--      // function inputs to system memory.
-+      // Keep parameter inputs on the host across graphs, then cache any
-+      // device conversions introduced for directly used parameters.
-       if (options.enableConstEvalInputsToSystemMemory) {
-         devicePm.addPass(createTTNNConstEvalInputsToSystemMemory());
-+        devicePm.addPass(transforms::createConstEvalHoistTransform());
- 
-         // Clean up any redundant to_layout ops that may have been introduced
-         // previously.
-diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
---- a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
-+++ b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
-@@ -586,8 +586,10 @@
-     This pass also modifies the forward functions' arguments that correspond to const-eval
-     function inputs, forcing them to system memory as well.
- 
--    Note: only the arguments whose sole user is the ttcore.load_cached op are forced to system memory,
--    in order to avoid unnecessary to_device transfers for other users.
-+    Constant and parameter arguments with direct device users are also moved to system
-+    memory. Their device conversions must be hoisted by a following const-eval pass,
-+    so different graphs reuse the same host inputs and cached device layouts.
-+    This extension does not move KV-cache arguments off device.
-   }];
- }
- 

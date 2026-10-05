@@ -1,7 +1,9 @@
 diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
 --- a/pjrt_implementation/src/api/module_builder/module_builder.cc
 +++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
-@@ -407,2 +407,12 @@ ModuleBuilder::buildModule(
+@@ -405,6 +405,16 @@ ModuleBuilder::buildModule(
+     graph_hash = computeGraphHash(mlir_module);
+   }
  
 +  // JAX leaves custom-call computations public even though only @main is an
 +  // executable entry point.
@@ -14,3 +16,5 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 +  }
 +
    std::vector<mlir::tt::sharding_utils::MeshSharding> input_shardings;
+   status = collectInputShardings(mlir_module, input_shardings);
+   if (!tt_pjrt_status_is_ok(status)) {

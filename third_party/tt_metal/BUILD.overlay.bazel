@@ -109,6 +109,24 @@ genrule(
     ],
 )
 
+# CMake generates tt_metal/impl/version.hpp from this template at configure time.
+# Fill it in for the pinned tt-metal revision so the build stays reproducible.
+genrule(
+    name = "tt_metal_version_hpp",
+    srcs = ["cmake/tt_metal_version.hpp.in"],
+    outs = ["tt_metal/impl/version.hpp"],
+    cmd = "sed -e 's/@VERSION_SHA@/d04395ed862b4c65eb6877000c40200f456cb74e/' " +
+          "-e 's/@VERSION_HASH@/d04395ed/' " +
+          "-e 's/@VERSION_FULL@/d04395ed/' " +
+          "-e 's/@VERSION_DIRTY_CPP@/false/' $< > $@",
+)
+
+cc_library(
+    name = "tt_metal_version_header",
+    hdrs = [":tt_metal_version_hpp"],
+    includes = ["."],
+)
+
 filegroup(
     name = "tt_metal_flatbuffer_headers",
     srcs = [
@@ -352,6 +370,8 @@ genrule(
           "'    template <typename... Args> static void mesh_device_created(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void mesh_device_destroyed(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void mesh_device_initialized(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void mesh_buffer_allocated(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void mesh_buffer_deallocated(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void mesh_workload_created(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void mesh_workload_destroyed(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void mesh_workload_add_program(Args&&...) noexcept {}' " +
@@ -363,6 +383,7 @@ genrule(
           "'    template <typename... Args> static void set_prefetcher_core_info(Args&&...) {}' " +
           "'    static void clear_all_core_info() {}' " +
           "'    static std::string get_kernel_path_from_watcher_kernel_id(int) { return {}; }' " +
+          "'    template <typename... Args> static std::string get_kernel_elf_path(Args&&...) { return {}; }' " +
           "'    static void enable_kernel_path_collection() {}' " +
           "'    static inspector::RpcServer& get_rpc_server() { static inspector::RpcServer server; return server; }' " +
           "'    template <typename... Args> static void set_build_env_fw_compile_hash(Args&&...) {}' " +
@@ -1438,6 +1459,7 @@ cc_library(
     copts = TT_METAL_RUNTIME_COPTS,
     includes = TTNN_RUNTIME_INCLUDE_DIRS,
     deps = [
+        ":tt_metal_version_header",
         ":tt_metal_device_tensor_upstream",
         "@//ttnn:operation_headers",
     ],

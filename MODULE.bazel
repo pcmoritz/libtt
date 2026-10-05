@@ -211,10 +211,10 @@ http_archive(
     name = "tt_umd",
     build_file = "//third_party/tt_umd:BUILD.overlay.bazel",
     patches = ["//third_party/tt_umd:remove_initial_exec_tls.patch"],
-    sha256 = "4e0e419e1701839ac4927a68989b4a4bfef2eced81cc09cd185ebc104cd9e3ac",
-    strip_prefix = "tt-umd-ef7aa4b9dace8c75344f32886cfc7f31372cb2d1",
+    sha256 = "d6b9a9d4fa22af684d0150b67400df362ea66cd3758f61376826916e9ff462c6",
+    strip_prefix = "tt-umd-8f3ffb71150b4ebf9691b01fd24b5b6f8fb8d404",
     urls = [
-        "https://github.com/tenstorrent/tt-umd/archive/ef7aa4b9dace8c75344f32886cfc7f31372cb2d1.tar.gz",
+        "https://github.com/tenstorrent/tt-umd/archive/8f3ffb71150b4ebf9691b01fd24b5b6f8fb8d404.tar.gz",
     ],
 )
 
@@ -251,9 +251,7 @@ http_archive(
         "//third_party/tt_metal:remove_boost_dependencies.patch",
         "//third_party/tt_metal:fabric_build.patch",
         "//third_party/tt_metal:all_gather_packet_headers.patch",
-        "//third_party/tt_metal:reshaped_mesh_link_discovery.patch",
         "//third_party/tt_metal:direct_all_reduce.patch",
-        "//third_party/tt_metal:all_gather_slice_overflow.patch",
         "//third_party/tt_metal:fabric_router_teardown.patch",
         "//third_party/tt_metal:fabric_packet_size.patch",
         "//third_party/tt_metal:disable_inspector_runtime.patch",
@@ -265,7 +263,6 @@ http_archive(
         "//third_party/tt_metal:sdpa_decode_allow_l1_interleaved_q.patch",
         "//third_party/tt_metal:paged_shared_cache.patch",
         "//third_party/tt_metal:layernorm_allow_single_core_height_sharded.patch",
-        "//third_party/tt_metal:topk_float32.patch",
         "//third_party/tt_metal:topk_stable_llk.patch",
         "//third_party/tt_metal:topk_stable.patch",
         "//third_party/tt_metal:sign_integer.patch",
@@ -317,10 +314,10 @@ http_archive(
         "//third_party/tt_metal:ccl_semaphores_l1_small.patch",
         "//third_party/tt_metal:all_gather_alt_route_completion.patch",
     ],
-    sha256 = "a222d1f6fe7f6aec62f69e22199a3537a31a58aa5ead52e4ab470b7d87472ecb",
-    strip_prefix = "tt-metal-5beed318d0f0d1c6212e605947fb0be80c9e0a1d",
+    sha256 = "b609f58d0b388cb73eb5be0df9812dd13e86d57c5eb4acf65cd02e687009a4e6",
+    strip_prefix = "tt-metal-d04395ed862b4c65eb6877000c40200f456cb74e",
     urls = [
-        "https://github.com/tenstorrent/tt-metal/archive/5beed318d0f0d1c6212e605947fb0be80c9e0a1d.tar.gz",
+        "https://github.com/tenstorrent/tt-metal/archive/d04395ed862b4c65eb6877000c40200f456cb74e.tar.gz",
     ],
 )
 
@@ -378,7 +375,7 @@ llvm_configure(
 git_repository(
     name = "tt_xla_src",
     build_file = "//third_party/tt_xla:tt_xla.BUILD.bazel",
-    commit = "1c9f93e45db98d81814e850a748f35a53db2a0ab",
+    commit = "b00f52d896fb1738319174b56ef1364fa97ec7df",
     patch_args = ["-p1"],
     patches = [
         "//third_party/tt_xla:tt_xla_isolate_assert_namespace.patch",
@@ -409,7 +406,7 @@ git_repository(
 git_repository(
     name = "tt_mlir_src",
     build_file = "//third_party/tt_xla:tt_mlir.BUILD.bazel",
-    commit = "71046369d603b97fd6a8dd8b947ca8588ac2a74f",
+    commit = "c282803f8f628881e805b2bbf6dc5bf53a0d230d",
     patch_args = ["-p1"],
     patches = [
         "//third_party/tt_xla:tt_mlir_string_map_include.patch",
@@ -497,7 +494,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_parameter_layout_cache.patch",
         "//third_party/tt_xla:tt_mlir_emitc_incomplete_type.patch",
         "//third_party/tt_xla:tt_mlir_row_major_stop_fixup.patch",
-        "//third_party/tt_xla:tt_mlir_preserve_explicit_compute_config.patch",
         "//third_party/tt_xla:tt_mlir_chunked_sdpa_accuracy_config.patch",
         "//third_party/tt_xla:tt_mlir_chunked_sdpa_per_user_offsets.patch",
         "//third_party/tt_xla:tt_mlir_paged_fill_tiled_input.patch",
@@ -531,6 +527,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_reverse_integers.patch",
         "//third_party/tt_xla:tt_mlir_wide_row_reduction.patch",
         "//third_party/tt_xla:tt_mlir_trim_mlir_deps.patch",
+        "//third_party/tt_xla:tt_mlir_op_model_without_ttml.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

@@ -9,7 +9,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp b/runtime/lib
  #include "tt/runtime/detail/ttnn/ttnn.h"
  #include "tt/runtime/detail/ttnn/utils.h"
  #include "ttnn/distributed/distributed_tensor.hpp"
-@@ -47,8 +48,20 @@
+@@ -47,8 +48,20 @@ void run(const ::tt::target::ttnn::DistributeTensorOp *op,
    }
    std::unique_ptr<TensorToMesh> meshMapper =
        ::ttnn::distributed::create_mesh_mapper(meshDevice, meshMapperConfig);

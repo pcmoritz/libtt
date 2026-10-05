@@ -1,9 +1,10 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10033,6 +10033,17 @@
+@@ -10098,6 +10098,17 @@ public:
        }
      }
-
+ 
 +    if (auto config = getFfiBackendConfig(srcOp)) {
 +      if (mlir::Attribute attr = config.get("share_cache")) {
 +        auto shareCacheAttr = mlir::dyn_cast<BoolAttr>(attr);

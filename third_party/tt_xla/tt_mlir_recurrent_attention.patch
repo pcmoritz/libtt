@@ -1,7 +1,19 @@
+diff --git a/include/ttmlir/Dialect/TTCore/IR/Utils.h b/include/ttmlir/Dialect/TTCore/IR/Utils.h
+--- a/include/ttmlir/Dialect/TTCore/IR/Utils.h
++++ b/include/ttmlir/Dialect/TTCore/IR/Utils.h
+@@ -18,6 +18,8 @@
+ namespace mlir::tt::ttcore {
+ 
+ constexpr inline llvm::StringLiteral g_kvCacheAttrName = "ttcore.kv_cache";
++constexpr inline llvm::StringLiteral g_recurrentCacheAttrName =
++    "ttcore.recurrent_cache";
+ 
+ constexpr inline llvm::StringLiteral g_originalActivationNamesAttrName =
+     "ttcore.original_activation_names";
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -6456,6 +6456,47 @@
+@@ -6419,6 +6419,47 @@ def TTIR_ScaledDotProductAttentionOp : TTIR_NamedOp<"scaled_dot_product_attentio
    let hasVerifier = 1;
  }
  
@@ -52,7 +64,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4284,6 +4284,51 @@
+@@ -4497,6 +4497,51 @@ def TTNN_ScaledDotProductAttentionOp : TTNN_Op<"scaled_dot_product_attention", [
      let hasVerifier = 1;
  }
  
@@ -107,12 +119,10 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
 --- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
-@@ -79,6 +79,48 @@
-   attention_sink: tt.target.ttnn.TensorRef;
-   out: tt.target.ttnn.TensorRef;
+@@ -81,6 +81,48 @@ table ScaledDotProductAttentionOp {
    memcfg: tt.target.ttnn.MemoryConfig;
-+}
-+
+ }
+ 
 +table GatedDeltaRuleOp {
 +  query: tt.target.ttnn.TensorRef;
 +  key: tt.target.ttnn.TensorRef;
@@ -153,13 +163,15 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 +  cache: tt.target.ttnn.TensorRef;
 +  state_indices: tt.target.ttnn.TensorRef;
 +  updates: tt.target.ttnn.TensorRef;
- }
- 
++}
++
  table FlashMlaPrefillOp {
+   query: tt.target.ttnn.TensorRef;
+   key: tt.target.ttnn.TensorRef;
 diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
 --- a/include/ttmlir/Target/TTNN/program.fbs
 +++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -87,6 +87,10 @@
+@@ -90,6 +90,10 @@ union OpType {
    FuncCallOp,
    GatherOp,
    GenericOp,
@@ -173,7 +185,7 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10064,6 +10064,72 @@
+@@ -10072,6 +10072,72 @@ public:
  } // namespace
  
  namespace {
@@ -246,7 +258,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  class StableHLOPagedFillCacheConversionPattern
      : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
    using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
-@@ -12106,6 +12172,8 @@
+@@ -12115,6 +12181,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
                                                                  ctx);
    patterns.add<StableHLOToTTIRCollectivePermuteOpConversionPattern>(
        typeConverter, ctx);
@@ -258,7 +270,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -3477,6 +3477,86 @@
+@@ -3447,6 +3447,86 @@ public:
  } // namespace
  
  namespace {
@@ -345,7 +357,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  class PagedFlashMultiLatentAttentionDecodeOpConversionPattern
      : public OpConversionPattern<ttir::PagedFlashMultiLatentAttentionDecodeOp> {
  public:
-@@ -3995,6 +4075,10 @@
+@@ -3965,6 +4045,10 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
             ScaledDotProductAttentionDecodeOpConversionPattern,
             PagedScaledDotProductAttentionDecodeOpConversionPattern,
             ChunkedScaledDotProductAttentionOpConversionPattern,
@@ -356,10 +368,139 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
             PagedFlashMultiLatentAttentionDecodeOpConversionPattern,
             SplitQueryKeyValueAndSplitHeadsOpConversionPattern,
             GeluBackwardOpConversionPattern,
+diff --git a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp b/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
+--- a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
++++ b/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
+@@ -8,7 +8,7 @@
+ #include "ttmlir/Dialect/TTIR/Transforms/Passes.h"
+ 
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+-#include "llvm/ADT/DenseSet.h"
++#include "llvm/ADT/DenseMap.h"
+ 
+ namespace mlir::tt::ttir {
+ #define GEN_PASS_DEF_TTIRINFERKVCACHEARGUMENTTYPES
+@@ -26,15 +26,18 @@ public:
+     MLIRContext *context = moduleOp.getContext();
+ 
+     moduleOp.walk([&](func::FuncOp funcOp) {
+-      llvm::DenseSet<BlockArgument> cacheArgs;
++      llvm::DenseMap<BlockArgument, bool> cacheArgs;
+ 
+       funcOp.walk([&](CacheOpInterface cacheOp) {
+         mlir::Value cacheValue = cacheOp.getCache();
++        bool isRecurrent =
++            mlir::isa<GatedDeltaDecodeOp, CausalConv1dUpdateOp, StatePoolUpdateOp>(
++                cacheOp.getOperation());
+ 
+         // Direct BlockArgument → CacheOp connection.
+         if (auto blockArg = llvm::dyn_cast<BlockArgument>(cacheValue)) {
+           if (blockArg.getOwner()->getParentOp() == funcOp) {
+-            cacheArgs.insert(blockArg);
++            cacheArgs[blockArg] |= isRecurrent;
+           }
+           return;
+         }
+@@ -47,16 +50,23 @@ public:
+             if (auto blockArg =
+                     llvm::dyn_cast<BlockArgument>(meshShardOp.getInput())) {
+               if (blockArg.getOwner()->getParentOp() == funcOp) {
+-                cacheArgs.insert(blockArg);
++                cacheArgs[blockArg] |= isRecurrent;
+               }
+             }
+           }
+         }
+       });
+ 
+-      for (auto blockArg : cacheArgs) {
++      for (auto [blockArg, isRecurrent] : cacheArgs) {
+         funcOp.setArgAttr(blockArg.getArgNumber(), ttcore::g_kvCacheAttrName,
+                           mlir::UnitAttr::get(context));
++        // Recurrent updates read the previous state, so trace warmup must use
++        // a private copy. Ordinary attention KV writes need no such copy.
++        if (isRecurrent) {
++          funcOp.setArgAttr(blockArg.getArgNumber(),
++                            ttcore::g_recurrentCacheAttrName,
++                            mlir::UnitAttr::get(context));
++        }
+       }
+     });
+   }
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
+@@ -64,12 +64,14 @@ public:
+   }
+ 
+   // Returns true if the chain from `value` back through allowed ops terminates
+-  // at a kv_cache-labeled block argument. Does not modify any types.
++  // at a non-recurrent kv_cache argument. Does not modify any types.
+   static bool canPropagateDtype(func::FuncOp funcOp, Value value) {
+     llvm::SmallVector<Value> chain;
+     BlockArgument blockArg = collectChainToRoot(value, chain);
+-    return blockArg && funcOp.getArgAttr(blockArg.getArgNumber(),
+-                                         ttcore::g_kvCacheAttrName);
++    return blockArg &&
++           funcOp.getArgAttr(blockArg.getArgNumber(), ttcore::g_kvCacheAttrName) &&
++           !funcOp.getArgAttr(blockArg.getArgNumber(),
++                             ttcore::g_recurrentCacheAttrName);
+   }
+ 
+   static bool isKVCacheReturnOperand(func::FuncOp funcOp, Value value) {
+@@ -92,7 +94,7 @@ public:
+     return ttcore::LocalShapeAttr::get(ctx, newLocalShapeType);
+   }
+ 
+-  // Updates all kv_cache block arg types and the function signature to
++  // Updates eligible kv_cache block arg types and the function signature to
+   // targetDtype. Only call this after all cache op paths have been validated.
+   static void convertCacheArgTypes(func::FuncOp funcOp,
+                                    ttcore::DataType targetDtype) {
+@@ -103,7 +105,7 @@ public:
+ 
+     for (auto &arg : funcOp.getBody().getArguments()) {
+       unsigned idx = arg.getArgNumber();
+-      if (!funcOp.getArgAttr(idx, ttcore::g_kvCacheAttrName)) {
++      if (!canPropagateDtype(funcOp, arg)) {
+         continue;
+       }
+ 
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -718,10 +718,25 @@ private:
+       traceCallArgs.push_back(captureFunc.getArgument(semaphoreBase + i));
+     }
+ 
++    // Warmup must not advance caller-owned recurrent state. Compile against
++    // temporary cache copies; capture and replay use the original slots.
++    // The deallocation pass releases these copies after the warmup call.
++    llvm::SmallVector<mlir::Value> warmupArgs(traceCallArgs);
++    for (size_t i : info.deviceResidentIndices()) {
++      if (!info.inputArgAttrs[i].contains(ttcore::g_recurrentCacheAttrName)) {
++        continue;
++      }
++      auto scratch =
++          createSlot(builder, captureFunc.getLoc(), deviceOp,
++                     mlir::cast<RankedTensorType>(inputSlots[i].getType()));
++      builder.create<ttnn::CopyOp>(captureFunc.getLoc(), inputSlots[i],
++                                   scratch);
++      warmupArgs[i] = scratch;
++    }
++
+     // Execute the trace function once without capture to compile programs and
+     // populate program cache.
+-    builder.create<func::CallOp>(captureFunc.getLoc(), traceFunc,
+-                                 traceCallArgs);
++    builder.create<func::CallOp>(captureFunc.getLoc(), traceFunc, warmupArgs);
+ 
+     auto beginTraceCaptureOp = builder.create<ttnn::BeginTraceCaptureOp>(
+         captureFunc.getLoc(), utils::getTraceIdType(context), deviceOp,
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -3645,6 +3645,63 @@
+@@ -3789,6 +3789,63 @@ createOp(FlatbufferObjectCache &cache, ScaledDotProductAttentionOp op) {
        slidingWindowSize, attentionSink, out, memoryConfig);
  }
  
@@ -423,7 +564,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
  ::flatbuffers::Offset<::tt::target::ttnn::FlashMlaPrefillOp>
  createOp(FlatbufferObjectCache &cache, FlashMlaPrefillOp op) {
    auto query = cache.at<::tt::target::ttnn::TensorRef>(
-@@ -5200,6 +5257,22 @@
+@@ -5365,6 +5422,22 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, scaledDotProductAttentionOp),
                             debugString, locInfo);
    }
@@ -446,86 +587,8 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
    if (auto flashMlaPrefillOp = dyn_cast<FlashMlaPrefillOp>(op);
        flashMlaPrefillOp) {
      return createOperation(cache, createOp(cache, flashMlaPrefillOp),
-diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
---- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-+++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -717,10 +717,25 @@
-       traceCallArgs.push_back(captureFunc.getArgument(semaphoreBase + i));
-     }
- 
-+    // Warmup must not advance caller-owned recurrent state. Compile against
-+    // temporary cache copies; capture and replay use the original slots.
-+    // The deallocation pass releases these copies after the warmup call.
-+    llvm::SmallVector<mlir::Value> warmupArgs(traceCallArgs);
-+    for (size_t i : info.deviceResidentIndices()) {
-+      if (!info.inputArgAttrs[i].contains(ttcore::g_recurrentCacheAttrName)) {
-+        continue;
-+      }
-+      auto scratch =
-+          createSlot(builder, captureFunc.getLoc(), deviceOp,
-+                     mlir::cast<RankedTensorType>(inputSlots[i].getType()));
-+      builder.create<ttnn::CopyOp>(captureFunc.getLoc(), inputSlots[i],
-+                                   scratch);
-+      warmupArgs[i] = scratch;
-+    }
-+
-     // Execute the trace function once without capture to compile programs and
-     // populate program cache.
--    builder.create<func::CallOp>(captureFunc.getLoc(), traceFunc,
--                                 traceCallArgs);
-+    builder.create<func::CallOp>(captureFunc.getLoc(), traceFunc, warmupArgs);
- 
-     auto beginTraceCaptureOp = builder.create<ttnn::BeginTraceCaptureOp>(
-         captureFunc.getLoc(), utils::getTraceIdType(context), deviceOp,
-diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
---- a/runtime/lib/ttnn/program_executor.cpp
-+++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -120,6 +120,7 @@
- #include "operations/transformer/nlp_create_qkv_heads_decode.h"
- #include "operations/transformer/paged_flash_multi_latent_attention_decode.h"
- #include "operations/transformer/paged_scaled_dot_product_attention_decode.h"
-+#include "operations/transformer/recurrent.h"
- #include "operations/transformer/rotary_embedding.h"
- #include "operations/transformer/rotary_embedding_llama.h"
- #include "operations/transformer/scaled_dot_product_attention.h"
-@@ -699,6 +700,18 @@
-     return operations::transformer::run(
-         op->type_as_ScaledDotProductAttentionOp(), getContext());
-   }
-+  case ::tt::target::ttnn::OpType::GatedDeltaRuleOp:
-+    return operations::transformer::run(op->type_as_GatedDeltaRuleOp(),
-+                                        getContext());
-+  case ::tt::target::ttnn::OpType::GatedDeltaDecodeOp:
-+    return operations::transformer::run(op->type_as_GatedDeltaDecodeOp(),
-+                                        getContext());
-+  case ::tt::target::ttnn::OpType::CausalConv1dUpdateOp:
-+    return operations::transformer::run(op->type_as_CausalConv1dUpdateOp(),
-+                                        getContext());
-+  case ::tt::target::ttnn::OpType::StatePoolUpdateOp:
-+    return operations::transformer::run(op->type_as_StatePoolUpdateOp(),
-+                                        getContext());
-   case ::tt::target::ttnn::OpType::FlashMlaPrefillOp: {
-     return operations::transformer::run(op->type_as_FlashMlaPrefillOp(),
-                                         getContext());
-diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.h b/runtime/lib/ttnn/operations/transformer/recurrent.h
---- /dev/null
-+++ b/runtime/lib/ttnn/operations/transformer/recurrent.h
-@@ -0,0 +1,14 @@
-+// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
-+// SPDX-License-Identifier: Apache-2.0
-+#pragma once
-+#include "tt/runtime/detail/ttnn/types/types.h"
-+namespace tt::runtime::ttnn::operations::transformer {
-+void run(const ::tt::target::ttnn::GatedDeltaRuleOp *op,
-+         ProgramContext &context);
-+void run(const ::tt::target::ttnn::GatedDeltaDecodeOp *op,
-+         ProgramContext &context);
-+void run(const ::tt::target::ttnn::CausalConv1dUpdateOp *op,
-+         ProgramContext &context);
-+void run(const ::tt::target::ttnn::StatePoolUpdateOp *op,
-+         ProgramContext &context);
-+} // namespace tt::runtime::ttnn::operations::transformer
 diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
+new file mode 100644
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
 @@ -0,0 +1,103 @@
@@ -632,107 +695,52 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 +      tiled(pool.getTTNNTensorAndValidate(op->updates()), cache.dtype()));
 +}
 +} // namespace tt::runtime::ttnn::operations::transformer
-diff --git a/include/ttmlir/Dialect/TTCore/IR/Utils.h b/include/ttmlir/Dialect/TTCore/IR/Utils.h
---- a/include/ttmlir/Dialect/TTCore/IR/Utils.h
-+++ b/include/ttmlir/Dialect/TTCore/IR/Utils.h
-@@ -18,6 +18,8 @@
- namespace mlir::tt::ttcore {
-
- constexpr inline llvm::StringLiteral g_kvCacheAttrName = "ttcore.kv_cache";
-+constexpr inline llvm::StringLiteral g_recurrentCacheAttrName =
-+    "ttcore.recurrent_cache";
-
- constexpr inline llvm::StringLiteral g_originalActivationNamesAttrName =
-     "ttcore.original_activation_names";
-diff --git a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp b/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
---- a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
-+++ b/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
-@@ -8,7 +8,7 @@
- #include "ttmlir/Dialect/TTIR/Transforms/Passes.h"
-
- #include "mlir/Dialect/Func/IR/FuncOps.h"
--#include "llvm/ADT/DenseSet.h"
-+#include "llvm/ADT/DenseMap.h"
-
- namespace mlir::tt::ttir {
- #define GEN_PASS_DEF_TTIRINFERKVCACHEARGUMENTTYPES
-@@ -26,15 +26,18 @@
-     MLIRContext *context = moduleOp.getContext();
-
-     moduleOp.walk([&](func::FuncOp funcOp) {
--      llvm::DenseSet<BlockArgument> cacheArgs;
-+      llvm::DenseMap<BlockArgument, bool> cacheArgs;
-
-       funcOp.walk([&](CacheOpInterface cacheOp) {
-         mlir::Value cacheValue = cacheOp.getCache();
-+        bool isRecurrent =
-+            mlir::isa<GatedDeltaDecodeOp, CausalConv1dUpdateOp, StatePoolUpdateOp>(
-+                cacheOp.getOperation());
-
-         // Direct BlockArgument → CacheOp connection.
-         if (auto blockArg = llvm::dyn_cast<BlockArgument>(cacheValue)) {
-           if (blockArg.getOwner()->getParentOp() == funcOp) {
--            cacheArgs.insert(blockArg);
-+            cacheArgs[blockArg] |= isRecurrent;
-           }
-           return;
-         }
-@@ -47,16 +50,23 @@
-             if (auto blockArg =
-                     llvm::dyn_cast<BlockArgument>(meshShardOp.getInput())) {
-               if (blockArg.getOwner()->getParentOp() == funcOp) {
--                cacheArgs.insert(blockArg);
-+                cacheArgs[blockArg] |= isRecurrent;
-               }
-             }
-           }
-         }
-       });
-
--      for (auto blockArg : cacheArgs) {
-+      for (auto [blockArg, isRecurrent] : cacheArgs) {
-         funcOp.setArgAttr(blockArg.getArgNumber(), ttcore::g_kvCacheAttrName,
-                           mlir::UnitAttr::get(context));
-+        // Recurrent updates read the previous state, so trace warmup must use
-+        // a private copy. Ordinary attention KV writes need no such copy.
-+        if (isRecurrent) {
-+          funcOp.setArgAttr(blockArg.getArgNumber(),
-+                            ttcore::g_recurrentCacheAttrName,
-+                            mlir::UnitAttr::get(context));
-+        }
-       }
-     });
+diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.h b/runtime/lib/ttnn/operations/transformer/recurrent.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/lib/ttnn/operations/transformer/recurrent.h
+@@ -0,0 +1,14 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "tt/runtime/detail/ttnn/types/types.h"
++namespace tt::runtime::ttnn::operations::transformer {
++void run(const ::tt::target::ttnn::GatedDeltaRuleOp *op,
++         ProgramContext &context);
++void run(const ::tt::target::ttnn::GatedDeltaDecodeOp *op,
++         ProgramContext &context);
++void run(const ::tt::target::ttnn::CausalConv1dUpdateOp *op,
++         ProgramContext &context);
++void run(const ::tt::target::ttnn::StatePoolUpdateOp *op,
++         ProgramContext &context);
++} // namespace tt::runtime::ttnn::operations::transformer
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -121,6 +121,7 @@
+ #include "operations/transformer/nlp_create_qkv_heads_decode.h"
+ #include "operations/transformer/paged_flash_multi_latent_attention_decode.h"
+ #include "operations/transformer/paged_scaled_dot_product_attention_decode.h"
++#include "operations/transformer/recurrent.h"
+ #include "operations/transformer/rotary_embedding.h"
+ #include "operations/transformer/rotary_embedding_llama.h"
+ #include "operations/transformer/scaled_dot_product_attention.h"
+@@ -720,6 +721,18 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+     return operations::transformer::run(
+         op->type_as_ScaledDotProductAttentionOp(), getContext());
    }
-diff --git a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
---- a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
-+++ b/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp
-@@ -65,10 +65,12 @@
-
-   // Returns true if the chain from `value` back through allowed ops terminates
--  // at a kv_cache-labeled block argument. Does not modify any types.
-+  // at a non-recurrent kv_cache argument. Does not modify any types.
-   static bool canPropagateDtype(func::FuncOp funcOp, Value value) {
-     llvm::SmallVector<Value> chain;
-     BlockArgument blockArg = collectChainToRoot(value, chain);
--    return blockArg && funcOp.getArgAttr(blockArg.getArgNumber(),
--                                         ttcore::g_kvCacheAttrName);
-+    return blockArg &&
-+           funcOp.getArgAttr(blockArg.getArgNumber(), ttcore::g_kvCacheAttrName) &&
-+           !funcOp.getArgAttr(blockArg.getArgNumber(),
-+                             ttcore::g_recurrentCacheAttrName);
-   }
-
-@@ -93,5 +95,5 @@
-   }
-
--  // Updates all kv_cache block arg types and the function signature to
-+  // Updates eligible kv_cache block arg types and the function signature to
-   // targetDtype. Only call this after all cache op paths have been validated.
-   static void convertCacheArgTypes(func::FuncOp funcOp,
-@@ -104,5 +106,5 @@
-     for (auto &arg : funcOp.getBody().getArguments()) {
-       unsigned idx = arg.getArgNumber();
--      if (!funcOp.getArgAttr(idx, ttcore::g_kvCacheAttrName)) {
-+      if (!canPropagateDtype(funcOp, arg)) {
-         continue;
-       }
++  case ::tt::target::ttnn::OpType::GatedDeltaRuleOp:
++    return operations::transformer::run(op->type_as_GatedDeltaRuleOp(),
++                                        getContext());
++  case ::tt::target::ttnn::OpType::GatedDeltaDecodeOp:
++    return operations::transformer::run(op->type_as_GatedDeltaDecodeOp(),
++                                        getContext());
++  case ::tt::target::ttnn::OpType::CausalConv1dUpdateOp:
++    return operations::transformer::run(op->type_as_CausalConv1dUpdateOp(),
++                                        getContext());
++  case ::tt::target::ttnn::OpType::StatePoolUpdateOp:
++    return operations::transformer::run(op->type_as_StatePoolUpdateOp(),
++                                        getContext());
+   case ::tt::target::ttnn::OpType::FlashMlaPrefillOp: {
+     return operations::transformer::run(op->type_as_FlashMlaPrefillOp(),
+                                         getContext());

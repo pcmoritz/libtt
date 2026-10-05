@@ -1,7 +1,7 @@
 diff --git tt_metal/fabric/fabric_context.cpp tt_metal/fabric/fabric_context.cpp
 --- tt_metal/fabric/fabric_context.cpp
 +++ tt_metal/fabric/fabric_context.cpp
-@@ -223,6 +223,11 @@
+@@ -223,6 +223,11 @@ size_t FabricContext::compute_max_payload_size_bytes(const tt_metal::Hal& hal, t
      if (router_config_.max_packet_payload_size_bytes.has_value()) {
          return validate_and_apply_packet_size(hal, arch, router_config_.max_packet_payload_size_bytes.value());
      }

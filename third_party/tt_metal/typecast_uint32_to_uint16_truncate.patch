@@ -1,7 +1,10 @@
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
-@@ -516,14 +516,7 @@ inline void calculate_typecast_uint32_to_uint16() {
+@@ -515,18 +515,11 @@ inline void calculate_typecast_uint16_to_uint32() {
+ 
+ template <bool APPROXIMATION_MODE, int ITERATIONS>
+ inline void calculate_typecast_uint32_to_uint16() {
 -    // Kept as a plain loop (no SFPLOADMACRO): #46231 rewrote this to shift the value right by 16
 -    // and saturate via SFPGT on the *high* bits before the swap-hi-lo16 store. The historical
 -    // macro tested the low 16 bits instead and computes a different result, so it is not
@@ -18,10 +21,14 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_ty
 +        TTI_SFPSTORE(p_sfpu::LREG0, SFPSTORE_MODE_SWAP_HI_LO16, ADDR_MOD_6, 0);
      }
  }
+ 
 diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 --- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 +++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
-@@ -534,16 +534,7 @@ inline void calculate_typecast_uint32_to_uint16() {
+@@ -533,20 +533,11 @@ inline void calculate_typecast_uint16_to_uint32() {
+ 
+ template <bool APPROXIMATION_MODE, int ITERATIONS>
+ inline void calculate_typecast_uint32_to_uint16() {
 -    // Kept as a plain loop (no SFPLOADMACRO): #46231 rewrote this to shift the value right by 16
 -    // and renormalize (2's-complement + shift + OR) before the swap-hi-lo16 store. The historical
 -    // macro used a LO16-load 2-macro pipeline on a different bit layout and computes a different
@@ -40,3 +47,4 @@ diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_
 +        TTI_SFPSTORE(p_sfpu::LREG0, SFPSTORE_MODE_SWAP_HI_LO16, ADDR_MOD_2, 0);
      }
  }
+ 

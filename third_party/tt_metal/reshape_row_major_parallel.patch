@@ -1,16 +1,27 @@
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp b/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_interleaved.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_interleaved.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_interleaved.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_interleaved.cpp
+@@ -58,6 +58,7 @@ void kernel_main() {
+     constexpr bool src_aligned_to_16 = get_arg(args::src_aligned_to_16) == 1;
+     constexpr uint32_t source_page_size_bytes = get_arg(args::source_page_size_bytes);
+     constexpr uint32_t dest_page_size_bytes = get_arg(args::dest_page_size_bytes);
++    constexpr uint32_t source_chunks = get_arg(args::source_chunks);
+     constexpr uint32_t num_dest_write_slots = get_arg(args::num_dest_write_slots);
+     constexpr uint32_t dest_slot_size_bytes = get_arg(args::dest_slot_size_bytes);
+     constexpr uint32_t dest_write_size_bytes = get_arg(args::dest_write_size_bytes);
+@@ -103,7 +104,7 @@ void kernel_main() {
+         // (write-after-read), corrupting the output.  Uses the object-noc flush to match the writes.
+         noc.async_writes_flushed();
+         // Read from source
+-        uint64_t src_noc_addr = s.get_noc_addr(i, 0);
++        uint64_t src_noc_addr = s.get_noc_addr(i / source_chunks, (i % source_chunks) * source_page_size_bytes);
+ 
+         if constexpr (src_aligned_to_64 || ((!decltype(s)::is_dram) && src_aligned_to_16)) {  // Aligned to 64 bytes or
+                                                                                               // 16 bytes but L1
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
-@@ -3,6 +3,8 @@
- // SPDX-License-Identifier: Apache-2.0
- 
- #include "ttnn/operations/data_movement/reshape_view/device/reshape_row_major_program_factory.hpp"
-+
-+#include <algorithm>
- 
- #include <tt-metalium/host_api.hpp>
- #include <tt-metalium/program_descriptors.hpp>
-@@ -43,6 +45,18 @@
+@@ -103,6 +103,18 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
  
      uint32_t source_page_size_bytes = input_log_shape[-1] * data_size;
      uint32_t dest_page_size_bytes = output_log_shape[-1] * data_size;
@@ -29,7 +40,7 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_
      uint32_t source_read_size_bytes = ((source_page_size_bytes - 1) & MASK_64) + 128;
      uint32_t read_start_page = 0;
      uint32_t write_start_page = 0;
-@@ -51,7 +65,7 @@
+@@ -110,7 +122,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
      TT_ASSERT(dst_buffer != nullptr, "Output buffer should be allocated on device!");
      // Find how many input pages each core is responsible for so that we always start at the beginning of a read and
      // write page Since the logical volumes match, we are guaranteed that the very last page is aligned
@@ -38,18 +49,16 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_
      while ((responsibility * source_page_size_bytes) % dest_page_size_bytes != 0) {
          responsibility++;
      }
-@@ -93,7 +107,8 @@
-         src0_cb_index,
-         src1_cb_index,
-         source_page_size_bytes,
--        dest_page_size_bytes};
-+        dest_page_size_bytes,
-+        source_chunks};
-     TensorAccessorArgs(*src_buffer).append_to(compile_time_args);
-     TensorAccessorArgs(*dst_buffer).append_to(compile_time_args);
+@@ -161,6 +173,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+         {"num_dest_write_slots", num_dest_write_slots},
+         {"dest_slot_size_bytes", dest_slot_size_bytes},
+         {"dest_write_size_bytes", dest_write_size_bytes},
++        {"source_chunks", source_chunks},
+     };
  
-@@ -158,7 +173,7 @@
-             // set the compile time args
+     const KernelSpec::RuntimeArgSchema rta_schema = {
+@@ -262,7 +275,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+         } else {
              const uint32_t start_of_read = read_start_page;
              uint32_t end_of_read = read_start_page + responsibility;
 -            end_of_read = end_of_read < input_log_shape[-2] ? end_of_read : input_log_shape[-2];
@@ -57,7 +66,7 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_
              uint32_t pages_for_this_core = end_of_read - start_of_read;
              uint32_t write_jump = (pages_for_this_core * source_page_size_bytes) / dest_page_size_bytes;
  
-@@ -208,7 +223,7 @@
+@@ -315,7 +328,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
              }
              write_start_page += write_jump;
              read_start_page = end_of_read;
@@ -66,25 +75,3 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_
          }
      }
  
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_interleaved.cpp b/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_interleaved.cpp
---- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_interleaved.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_interleaved.cpp
-@@ -52,7 +52,8 @@
-     constexpr uint32_t cb_id_in1 = get_compile_time_arg_val(3);
-     constexpr uint32_t source_page_size_bytes = get_compile_time_arg_val(4);
-     constexpr uint32_t dest_page_size_bytes = get_compile_time_arg_val(5);
--    constexpr auto src_args = TensorAccessorArgs<6>();
-+    constexpr uint32_t source_chunks = get_compile_time_arg_val(6);
-+    constexpr auto src_args = TensorAccessorArgs<7>();
-     constexpr auto dst_args = TensorAccessorArgs<src_args.next_compile_time_args_offset()>();
- 
-     // Since we need to operate on a grid of cores but sometimes pages don't split properly, if nop then don't use this
-@@ -93,7 +94,7 @@
-         // (write-after-read), corrupting the output.  Uses the object-noc flush to match the writes.
-         noc.async_writes_flushed();
-         // Read from source
--        uint64_t src_noc_addr = s.get_noc_addr(i, 0);
-+        uint64_t src_noc_addr = s.get_noc_addr(i / source_chunks, (i % source_chunks) * source_page_size_bytes);
- 
-         if constexpr (src_aligned_to_64 || ((!src_args.is_dram) && src_aligned_to_16)) {  // Aligned to 64 bytes or 16
-                                                                                           // bytes but L1

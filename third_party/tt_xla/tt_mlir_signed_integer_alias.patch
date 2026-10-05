@@ -1,8 +1,8 @@
 diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
-index 6b4077c6..8cff02b0 100644
 --- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
 +++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
-@@ -206,9 +206,12 @@ static DataType elementTypeToDataTypeImpl(mlir::Type elementType) {
+@@ -205,10 +205,13 @@ inline std::optional<DataType> elementTypeToDataTypeImpl(Type elementType) {
+     switch (intType.getWidth()) {
      case 1:
        return DataType::Bool;
 +    // TTNN has no signed 8- or 16-bit tensor dtype.
@@ -17,8 +17,38 @@ index 6b4077c6..8cff02b0 100644
      case 32:
      case 64:
        return (intType.isSigned() || intType.isSignless()) ? DataType::Int32
+diff --git a/runtime/include/tt/runtime/utils.h b/runtime/include/tt/runtime/utils.h
+--- a/runtime/include/tt/runtime/utils.h
++++ b/runtime/include/tt/runtime/utils.h
+@@ -36,22 +36,11 @@ inline void handleEquallySignedIntegerBufferCast(const FromTy *oldBuffer,
+                 "std::memcpy(newBuffer, oldBuffer, numElements * "
+                 "sizeof(FromTy)) instead.");
+ 
+-  constexpr ToTy toTyMax = std::numeric_limits<ToTy>::max();
+-  constexpr ToTy toTyMin = std::numeric_limits<ToTy>::min();
+-  if constexpr (sizeof(ToTy) >= sizeof(FromTy)) {
+-    for (int64_t i = 0; i < numElements; i++) {
+-      newBuffer[i] = static_cast<ToTy>(oldBuffer[i]);
+-    }
+-  } else {
+-    for (int64_t i = 0; i < numElements; i++) {
+-      if (oldBuffer[i] < static_cast<FromTy>(toTyMin)) {
+-        newBuffer[i] = toTyMin;
+-      } else if (oldBuffer[i] > static_cast<FromTy>(toTyMax)) {
+-        newBuffer[i] = toTyMax;
+-      } else {
+-        newBuffer[i] = static_cast<ToTy>(oldBuffer[i]);
+-      }
+-    }
++  // Integer narrowing is modular: retain the low bits rather than saturating.
++  // This is also required when converting a widened runtime alias (for
++  // example, Int32 storage) back to its logical Int8 or Int16 type.
++  for (int64_t i = 0; i < numElements; i++) {
++    newBuffer[i] = static_cast<ToTy>(oldBuffer[i]);
+   }
+ }
+ 
 diff --git a/runtime/lib/common/utils.cpp b/runtime/lib/common/utils.cpp
-index 81e64390..225ac22c 100644
 --- a/runtime/lib/common/utils.cpp
 +++ b/runtime/lib/common/utils.cpp
 @@ -273,9 +273,9 @@ getUnsupportedDataTypeAlias(::tt::target::DataType unsupportedDataType) {
@@ -67,30 +97,3 @@ index 81e64390..225ac22c 100644
    } else if (oldDataType == tt::target::DataType::Int8 &&
               newDataType == tt::target::DataType::UInt8) {
      detail::handleIntegerBufferCast<int8_t, uint8_t>(
-diff --git a/runtime/include/tt/runtime/utils.h b/runtime/include/tt/runtime/utils.h
---- a/runtime/include/tt/runtime/utils.h
-+++ b/runtime/include/tt/runtime/utils.h
-@@ -40,18 +40,7 @@ inline void handleEquallySignedIntegerBufferCast(const FromTy *oldBuffer,
--  constexpr ToTy toTyMax = std::numeric_limits<ToTy>::max();
--  constexpr ToTy toTyMin = std::numeric_limits<ToTy>::min();
--  if constexpr (sizeof(ToTy) >= sizeof(FromTy)) {
--    for (int64_t i = 0; i < numElements; i++) {
--      newBuffer[i] = static_cast<ToTy>(oldBuffer[i]);
--    }
--  } else {
--    for (int64_t i = 0; i < numElements; i++) {
--      if (oldBuffer[i] < static_cast<FromTy>(toTyMin)) {
--        newBuffer[i] = toTyMin;
--      } else if (oldBuffer[i] > static_cast<FromTy>(toTyMax)) {
--        newBuffer[i] = toTyMax;
--      } else {
--        newBuffer[i] = static_cast<ToTy>(oldBuffer[i]);
--      }
--    }
-+  // Integer narrowing is modular: retain the low bits rather than saturating.
-+  // This is also required when converting a widened runtime alias (for
-+  // example, Int32 storage) back to its logical Int8 or Int16 type.
-+  for (int64_t i = 0; i < numElements; i++) {
-+    newBuffer[i] = static_cast<ToTy>(oldBuffer[i]);
-   }
- }

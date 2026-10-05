@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Target/TTNN/operations/matmul.fbs b/include/ttmlir/Target/TTNN/operations/matmul.fbs
 --- a/include/ttmlir/Target/TTNN/operations/matmul.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/matmul.fbs
-@@ -70,6 +70,7 @@
+@@ -70,6 +70,7 @@ table MatmulOp {
    matmul_program_config: tt.target.ttnn.MatmulProgramConfig;
    activation: string;
    compute_config: tt.target.ttnn.DeviceComputeKernelConfig;
@@ -12,7 +12,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/matmul.fbs b/include/ttmlir/T
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-@@ -2828,6 +2828,13 @@
+@@ -2976,6 +2976,13 @@ std::optional<int64_t> getMatmulInnerDim(::mlir::RankedTensorType inputA,
      expectedOutputShape.push_back(inputBShape[inputBShape.size() - 1]);
    }
  
@@ -29,17 +29,17 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -10,6 +10,7 @@
+@@ -11,6 +11,7 @@
  #include "ttmlir/Utils.h"
  
  #include "llvm/ADT/SmallVector.h"
 +#include "llvm/Support/Error.h"
  
+ #include "mlir/Interfaces/SideEffectInterfaces.h"
  #ifdef TTMLIR_ENABLE_OPMODEL
- #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
-@@ -176,6 +177,89 @@
-   }
+@@ -314,6 +315,89 @@ private:
  };
+ } // namespace
  
 +// Fold the decode MLP's concatenated [up | gate] projection and SwiGLU into a
 +// single half-width matmul.  The runtime implements this marker with a
@@ -127,8 +127,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  #ifdef TTMLIR_ENABLE_OPMODEL
  
  // ============================================================================
-@@ -435,7 +519,7 @@
-     RewritePatternSet patterns(&getContext());
+@@ -679,7 +763,7 @@ public:
+     }
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
 -    patterns.add<
@@ -139,7 +139,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -585,7 +585,7 @@
+@@ -573,7 +573,7 @@ createOp(FlatbufferObjectCache &cache, MatmulOp op) {
    return ::tt::target::ttnn::CreateMatmulOp(
        *cache.fbb, a, b, output, op.getTransposeA(), op.getTransposeB(),
        matmulProgramConfigType, matmulProgramConfigDesc, activation,
@@ -151,7 +151,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 diff --git a/runtime/lib/ttnn/operations/matmul/matmul.cpp b/runtime/lib/ttnn/operations/matmul/matmul.cpp
 --- a/runtime/lib/ttnn/operations/matmul/matmul.cpp
 +++ b/runtime/lib/ttnn/operations/matmul/matmul.cpp
-@@ -72,12 +72,18 @@
+@@ -72,12 +72,18 @@ void run(const ::tt::target::ttnn::MatmulOp *op, ProgramContext &context) {
          utils::createDeviceComputeKernelConfig(op->compute_config());
    }
  

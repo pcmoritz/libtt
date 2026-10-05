@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/Broadcast.cpp b/lib/Dialect/TTIR/Transforms/Broadcast.cpp
 --- a/lib/Dialect/TTIR/Transforms/Broadcast.cpp
 +++ b/lib/Dialect/TTIR/Transforms/Broadcast.cpp
-@@ -26,9 +26,11 @@ static bool addOutputBroadcastIfNeeded(Operation *op,
+@@ -25,9 +25,11 @@ static bool addOutputBroadcastIfNeeded(Operation *op,
    for (Value operand : op->getOperands()) {
      auto shape = mlir::cast<RankedTensorType>(operand.getType()).getShape();
      llvm::SmallVector<int64_t> prev = implicitShape;

@@ -1,7 +1,10 @@
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
-@@ -158,7 +158,8 @@ inline void calculate_sfpu_binary_div(const uint dst_index_in0, const uint dst_in
+@@ -181,10 +181,11 @@ inline void calculate_sfpu_binary_div(
+         sfpi::vFloat r = sfpu_reciprocal_iter<2>(in1);
+         sfpi::vFloat result = in0 * r;
+         if constexpr (is_fp32_dest_acc_en) {
 -            // Skip quotient refinement when in0*r is already non-finite (biased exponent == 255).
 +            // Skip quotient refinement when the result or divisor is non-finite (biased exponent == 255).
              // If in0*r = +/-inf, then the residual e = in0 - (+/-inf)*in1 = -/+inf and
@@ -15,7 +18,10 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_bi
 diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 --- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 +++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
-@@ -160,7 +160,8 @@ inline void calculate_sfpu_binary_div(
+@@ -180,10 +180,11 @@ inline void calculate_sfpu_binary_div(
+         sfpi::vFloat r = sfpu_reciprocal_iter<2>(in1);
+         sfpi::vFloat result = in0 * r;
+         if constexpr (is_fp32_dest_acc_en) {
 -            // Skip quotient refinement when in0*r is already non-finite (biased exponent == 255).
 +            // Skip quotient refinement when the result or divisor is non-finite (biased exponent == 255).
              // If in0*r = +/-inf, then the residual e = in0 - (+/-inf)*in1 = -/+inf and

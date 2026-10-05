@@ -1,7 +1,7 @@
 diff --git a/runtime/include/tt/runtime/detail/ttnn/utils.h b/runtime/include/tt/runtime/detail/ttnn/utils.h
 --- a/runtime/include/tt/runtime/detail/ttnn/utils.h
 +++ b/runtime/include/tt/runtime/detail/ttnn/utils.h
-@@ -209,9 +209,29 @@
+@@ -209,9 +209,29 @@ inline ::ttnn::Tensor createBorrowedTTNNTensor(void *rawData,
    return createBorrowedTTNNTensor<T>(dataPtr, shape);
  }
  
@@ -35,7 +35,7 @@ diff --git a/runtime/include/tt/runtime/detail/ttnn/utils.h b/runtime/include/tt
 diff --git a/runtime/lib/ttnn/operations/data_movement/slice.cpp b/runtime/lib/ttnn/operations/data_movement/slice.cpp
 --- a/runtime/lib/ttnn/operations/data_movement/slice.cpp
 +++ b/runtime/lib/ttnn/operations/data_movement/slice.cpp
-@@ -38,28 +38,42 @@
+@@ -38,28 +38,42 @@ static void runSliceStaticOp(const ::tt::target::ttnn::SliceOp *op,
    tensorPool.insertTTNNTensorAndValidate(op->out(), out);
  }
  

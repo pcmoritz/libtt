@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 --- a/lib/Dialect/TTIR/IR/TTIROps.cpp
 +++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
-@@ -2830,6 +2830,32 @@
+@@ -2830,6 +2830,32 @@ static mlir::OpFoldResult constFoldReshape(mlir::tt::ttir::ReshapeOp op,
  //
  void mlir::tt::ttir::ReshapeOp::getCanonicalizationPatterns(
      mlir::RewritePatternSet &patterns, mlir::MLIRContext *context) {

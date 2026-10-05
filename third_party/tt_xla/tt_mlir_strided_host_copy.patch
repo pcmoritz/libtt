@@ -1,3 +1,4 @@
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
 @@ -65,31 +65,38 @@ static bool isContiguous(const std::vector<std::uint32_t> &shape,
