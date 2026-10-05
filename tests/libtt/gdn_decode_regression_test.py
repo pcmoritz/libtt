@@ -1,5 +1,7 @@
 """GDN decode from the flat convolution output, with grouped query and key heads."""
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -134,3 +136,46 @@ def test_conv_update_output_dtype(output_dtype):
     for i, slot in enumerate(indices):
         expected_state[slot] = history[i, :, 1:]
     np.testing.assert_allclose(np.asarray(new_state).astype(np.float32), expected_state, atol=0, rtol=0)
+
+
+def test_layers_share_converted_slot_indices(tmp_path):
+    """Every GDN layer of a decode step reads the same recurrent-state slots.
+    The layout conversions tt-mlir adds for each use of the slot indices
+    (twice per layer in Qwen3.5) are merged into one per step, and each layer
+    still updates its own state."""
+    batch, heads, dim = 1, 4, 128
+
+    def step(state, mixed, b, a, A_log, dt_bias, indices, initial):
+        return gated_delta_decode(state, mixed, b, a, A_log, dt_bias, indices, initial)
+
+    def two_layers(state0, state1, mixed0, mixed1, b, a, A_log, dt_bias, indices, initial):
+        return (
+            step(state0, mixed0, b, a, A_log, dt_bias, indices, initial)
+            + step(state1, mixed1, b, a, A_log, dt_bias, indices, initial)
+        )
+
+    device = jax.devices("tt")[0]
+    options = {"optimization_level": "O1", "enable_trace": "true"}
+    run_two = jax.jit(two_layers, compiler_options={**options, "export_path": str(tmp_path)})
+    run_one = jax.jit(step, compiler_options=options)
+    rng = np.random.default_rng(5)
+    slots = 3
+    states = [rng.normal(0, 0.05, (slots, heads, dim, dim)).astype(np.float32) for _ in range(2)]
+    mixed = [rng.normal(0, 1, (batch, 3 * heads * dim)).astype(np.float32) for _ in range(2)]
+    b, a = (rng.normal(0, 1, (batch, heads)).astype(np.float32) for _ in range(2))
+    A_log, dt_bias = (rng.uniform(-1, 1, heads).astype(np.float32) for _ in range(2))
+    indices = np.array([2], dtype=np.int32)
+    initial = np.ones(batch, dtype=jnp.bfloat16)
+    put = lambda *xs: [jax.device_put(x, device) for x in xs]
+
+    actual = run_two(*put(*states, *mixed, b, a, A_log, dt_bias, indices, initial))
+    for layer in range(2):
+        expected = run_one(*put(states[layer], mixed[layer], b, a, A_log, dt_bias, indices, initial))
+        for got, want in zip(actual[2 * layer : 2 * layer + 2], expected):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert irs, "no IR was exported"
+    for ir in irs:
+        conversions = re.findall(r'= ("ttnn\.to_layout"\(%\w+\)[^\n]*?) loc', ir)
+        assert len(conversions) == len(set(conversions)), conversions
