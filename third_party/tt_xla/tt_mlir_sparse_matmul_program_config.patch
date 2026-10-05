@@ -1,0 +1,43 @@
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -1589,16 +1589,36 @@ createSparseMatmulProgramConfigAttr(MLIRContext *ctx, RankedTensorType aType,
+   int64_t perCoreN =
+       std::max(static_cast<int64_t>(1), (NTiles + usedCoreX - 1) / usedCoreX);
+ 
++  // Step K in wide blocks: each block costs a multicast handshake, so one-tile
++  // blocks make a decode-sized expert matmul several times slower. Take the
++  // widest block dividing K, up to 32 tiles, whose double-buffered in0 and in1
++  // blocks fit in 256 tiles of L1.
++  int64_t KTiles = (aShape[aShape.size() - 1] + tileW - 1) / tileW;
++  int64_t in0BlockW = 1;
++  for (int64_t w = 1; w <= std::min<int64_t>(KTiles, 32); ++w) {
++    if (KTiles % w == 0 && 2 * w * (perCoreM + perCoreN) <= 256) {
++      in0BlockW = w;
++    }
++  }
++  // Write each core's whole output row at once, in subblocks of at most four
++  // tiles, which DEST holds with FP32 accumulation.
++  int64_t outSubblockW = 1;
++  for (int64_t w = 1; w <= std::min<int64_t>(perCoreN, 4); ++w) {
++    if (perCoreN % w == 0) {
++      outSubblockW = w;
++    }
++  }
++
+   auto gridAttr = ttnn::CoreCoordAttr::get(ctx, usedCoreX, coreY);
+   auto hopCoresAttr = ttnn::CoreRangeSetAttr::get(ctx, {});
+ 
+   return ttnn::MatmulMultiCoreReuseMultiCast1DProgramConfigAttr::get(
+       ctx, gridAttr,
+-      /*in0_block_w=*/1,
++      /*in0_block_w=*/static_cast<uint64_t>(in0BlockW),
+       /*out_subblock_h=*/1,
+-      /*out_subblock_w=*/1,
++      /*out_subblock_w=*/static_cast<uint64_t>(outSubblockW),
+       /*out_block_h=*/1,
+-      /*out_block_w=*/1,
++      /*out_block_w=*/static_cast<uint64_t>(perCoreN),
+       /*per_core_m=*/static_cast<uint64_t>(perCoreM),
+       /*per_core_n=*/static_cast<uint64_t>(perCoreN),
+       /*fuse_batch=*/false,

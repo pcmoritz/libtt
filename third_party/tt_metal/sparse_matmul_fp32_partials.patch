@@ -1,0 +1,45 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/sparse/factory/sparse_matmul_multicore_reuse_mcast_1d_optimized.cpp ttnn/cpp/ttnn/operations/matmul/device/sparse/factory/sparse_matmul_multicore_reuse_mcast_1d_optimized.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/sparse/factory/sparse_matmul_multicore_reuse_mcast_1d_optimized.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/sparse/factory/sparse_matmul_multicore_reuse_mcast_1d_optimized.cpp
+@@ -117,7 +117,6 @@ SparseMatmulMultiCoreReuseMcast1DProgramFactory::create(
+     const uint32_t in0_aligned_tile_size = tt::align(in0_single_tile_size, dram_alignment);
+     const uint32_t in1_aligned_tile_size = tt::align(in1_single_tile_size, dram_alignment);
+     const auto output_single_tile_size = output_tile.get_tile_size(output_data_format);
+-    const auto interm0_single_tile_size = output_tile.get_tile_size(output_data_format);
+ 
+     auto* const in0_buffer = a.buffer();
+     auto* const in1_buffer = b.buffer();
+@@ -192,6 +191,9 @@ SparseMatmulMultiCoreReuseMcast1DProgramFactory::create(
+     const auto interm0_data_format = packer_l1_acc_en
+                                          ? (fp32_dest_acc_en ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b)
+                                          : (fp32_dest_acc_en ? tt::DataFormat::Float32 : output_data_format);
++    // Size partials by their own format: FP32 partials are twice as large as
++    // BF16 outputs, and a buffer sized by the output overflows.
++    const auto interm0_single_tile_size = output_tile.get_tile_size(interm0_data_format);
+ 
+     uint32_t in0_block_h = out_block_h;
+     uint32_t in1_block_w = out_block_w;
+@@ -546,6 +548,15 @@ SparseMatmulMultiCoreReuseMcast1DProgramFactory::create(
+         false,                  // in0_transpose_tile
+     };
+ 
++    // FP32 partials reload into DEST between K blocks; unless their CB is
++    // unpacked to DEST as FP32, the reload goes through SrcA and rounds them to
++    // TF32 at every block, as the dense 1D matmul factory notes.
++    std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(
++        NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
++    if (fp32_dest_acc_en && interm0_data_format == tt::DataFormat::Float32) {
++        unpack_to_dest_mode[tt::CBIndex::c_5] = tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
++    }
++
+     // Create compute kernel
+     // bool fp32_dest_acc_en = false;
+     // Gelu currently has better accuracy when run in approx mode
+@@ -558,6 +569,7 @@ SparseMatmulMultiCoreReuseMcast1DProgramFactory::create(
+             .math_fidelity = math_fidelity,
+             .fp32_dest_acc_en = fp32_dest_acc_en,
+             .dst_full_sync_en = dst_full_sync_en,
++            .unpack_to_dest_mode = unpack_to_dest_mode,
+             .math_approx_mode = math_approx_mode,
+             .compile_args = compute_kernel_args,
+             .defines = mm_kernel_defines,
