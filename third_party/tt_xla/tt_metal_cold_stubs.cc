@@ -1,6 +1,7 @@
 #include "ttnn/operations/ccl/ccl_common.hpp"
 #include "ttnn/operations/ccl/ccl_op_fusion.hpp"
 #include "ttnn/operations/experimental/ccl/ring_attention_all_gather_async/device/ring_attention_all_gather_async_device_operation.hpp"
+#include "ttnn/operations/experimental/ccl/ring_attention_all_gather_async/device/ring_attention_all_gather_async_multi_core_with_workers_program_factory.hpp"
 #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp"
 #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.hpp"
 #include "ttnn/operations/experimental/conv3d/conv3d.hpp"
@@ -35,6 +36,18 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     std::optional<uint32_t>, std::optional<Tensor>, std::optional<Tensor>,
     uint32_t, uint32_t, uint32_t, bool) {
   unsupported("ttnn::ring_attention_all_gather_async");
+}
+
+void ring_attention_neighbor_halo_exchange_helper(
+    tt::tt_metal::ProgramDescriptor &, const std::vector<Tensor> &,
+    const MeshCoordinate &, const MeshCoordinate &, const MeshCoordinate &,
+    std::vector<Tensor> &, uint32_t, uint32_t, uint32_t, ttnn::ccl::Topology,
+    const std::vector<GlobalSemaphore> &,
+    const std::optional<tt::tt_metal::SubDeviceId> &,
+    const ttnn::experimental::ccl::AllGatherFusedOpSignaler &, CoreCoord,
+    ttnn::ccl::CoreAllocationStrategy, std::optional<uint32_t>,
+    std::optional<uint32_t>, const RingAttentionNeighborHaloConfig &) {
+  unsupported("ttnn::ring_attention_neighbor_halo_exchange");
 }
 
 } // namespace ttnn
