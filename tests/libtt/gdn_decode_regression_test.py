@@ -19,6 +19,7 @@ def gated_delta_decode(state, qkv, b, a, A_log, dt_bias, indices, initial):
 
 
 @pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize("packed_gates", [False, True])
 @pytest.mark.parametrize(
     "batch,key_heads,groups,qk_scale,qkv_dtype,gate_dtype",
     [
@@ -38,15 +39,25 @@ def gated_delta_decode(state, qkv, b, a, A_log, dt_bias, indices, initial):
         (1, 4, 3, 1.0, jnp.bfloat16, jnp.bfloat16),
     ],
 )
-def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale, qkv_dtype, gate_dtype):
+def test_gdn_decode_grouped_heads(
+    tmp_path, trace, packed_gates, batch, key_heads, groups, qk_scale, qkv_dtype, gate_dtype
+):
     # Like Qwen3.5: the kernel reads q, k and v as heads of one
     # [B, (2 * key_heads + heads) * D] tensor, L2-normalizes q and k, scales q,
-    # and each q/k head serves a group of value heads.
+    # and each q/k head serves a group of value heads. With packed gates, b and
+    # a are the halves of one [B, 2 * heads] projection, split as the model
+    # does, and the compiler folds the slices into the kernel's column offsets.
     heads, dim = key_heads * groups, 128
     eps, scale = 1e-6, dim**-0.5
 
-    def decode(state, qk, v, b, a, A_log, dt_bias, indices, initial):
+    def decode(state, qk, v, gates, A_log, dt_bias, indices, initial):
         mixed = jnp.concatenate([qk.reshape(batch, -1), v.reshape(batch, -1)], axis=1).astype(qkv_dtype)
+        if packed_gates:
+            # The model's merged column-parallel split: a unit dimension around the slices.
+            (ba,) = gates
+            b, a = (part.reshape(batch, heads) for part in jnp.split(ba.reshape(batch, 1, -1), 2, axis=-1))
+        else:
+            b, a = gates
         return gated_delta_decode(
             state, mixed, b.astype(gate_dtype), a.astype(gate_dtype), A_log, dt_bias, indices, initial
         )
@@ -54,7 +65,11 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale, qkv
     device = jax.devices("tt")[0]
     run = jax.jit(
         decode,
-        compiler_options={"optimization_level": "O1", "enable_trace": str(trace).lower()},
+        compiler_options={
+            "optimization_level": "O1",
+            "enable_trace": str(trace).lower(),
+            "export_path": str(tmp_path),
+        },
     )
     rng = np.random.default_rng(71)
     slots = batch + 2
@@ -86,11 +101,19 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale, qkv
             expected_state[slot] = s
             expected_output[i] = np.einsum("hk,hkv->hv", q[i], s)
 
+        gates = (np.concatenate([b, a], axis=1).astype(gate_dtype),) if packed_gates else (b, a)
         actual_state, actual_output = run(
-            *(jax.device_put(x, device) for x in (state, qk, v, b, a, A_log, dt_bias, indices, initial))
+            *jax.device_put((state, qk, v, gates, A_log, dt_bias, indices, initial), device)
         )
         np.testing.assert_allclose(np.asarray(actual_state), expected_state, atol=2e-3, rtol=0.05)
         np.testing.assert_allclose(np.asarray(actual_output), expected_output, atol=2e-3, rtol=0.05)
+
+    if packed_gates:
+        # The slices of the packed gates fold into the kernel's column offsets.
+        (ir_path,) = (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")
+        ir = ir_path.read_text()
+        assert "ttnn.slice" not in ir
+        assert f"delta_time_column = {heads} : i32" in ir
 
 
 @pytest.mark.parametrize("output_dtype", [jnp.bfloat16, jnp.float32])
