@@ -71,309 +71,40 @@ diff --git tt_metal/hw/inc/api/compute/compute_kernel_api.h tt_metal/hw/inc/api/
          idst,
          VectorMode::RC_custom,
          idir,
-diff --git ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
---- ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
-+++ ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/moe_grouped_topk/device/kernels/compute/moe_gate_common_compute.hpp
-@@ -327,7 +327,7 @@ void topk(
-     transpose_tile(cb_winning_group_indices_id, 1, 3);
-     // llk_topk_sort -> inplace
-     ckernel::topk_local_sort<stable_sort>(0, (int)ascending, 4);
--    ckernel::topk_merge<false, stable_sort>(0, 0, 32);
-+    ckernel::topk_merge<false, stable_sort, true>(0, 0, 32);
- 
-     // Use insertion sort; discard lower half and keep upper half
-     // Compare upper half with the next tile; insert into correct position
-@@ -341,7 +341,7 @@ void topk(
-         transpose_tile(cb_winning_group_indices_id, j, 3);
- 
-         ckernel::topk_local_sort<stable_sort>(0, (int)ascending, 4);
--        ckernel::topk_merge<false, stable_sort>(0, 0, 32);
-+        ckernel::topk_merge<false, stable_sort, true>(0, 0, 32);
-     }
-     ckernel::topk_rebuild<stable_sort>(0, (int)ascending, 0, 32, 5, true);
-     tile_regs_commit();
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.cpp
-@@ -10,14 +10,13 @@
- #include "api/compute/reconfig_data_format.h"
- #include "api/compute/pack.h"
- #include "api/dataflow/dataflow_buffer.h"
--#include "experimental/kernel_args.h"
- 
- /**
-  * Transpose tiles from width-height to height-width format and pack to destination buffer
-  * Used in final stage to convert sorted results back to output format
-  *
-- * @param input_dfb_index    Dataflow buffer id for the tiles to transpose (source buffer)
-- * @param dest_dfb_index     Dataflow buffer id to store transposed tiles (destination buffer)
-+ * @param input_dfb_index    Circular buffer index containing tiles to transpose (source buffer)
-+ * @param dest_dfb_index     Circular buffer index to store transposed tiles (destination buffer)
-  * @param total_tiles       Number of tiles to process and transpose
-  */
- FORCE_INLINE void transpose_and_pack(
-@@ -56,11 +55,11 @@ FORCE_INLINE void transpose_and_pack(
- }
- 
- /**
-- * Pack two destination tiles (values and indices) to their respective dataflow buffers
-+ * Pack two destination tiles (values and indices) to their respective circular buffers
-  * Used after merge operation to store sorted results
-  *
-- * @param dfb0            Dataflow buffer id for packing the first tile (values)
-- * @param dfb1            Dataflow buffer id for packing the second tile (indices)
-+ * @param dfb0            Circular buffer index for packing the first tile (values)
-+ * @param dfb1            Circular buffer index for packing the second tile (indices)
-  * @param base_offset    Base offset in destination registers (first tile at base_offset, second at base_offset+1)
-  */
- FORCE_INLINE void pack_results(const uint32_t dfb0, const uint32_t dfb1, const uint32_t base_offset) {
-@@ -76,10 +75,10 @@ FORCE_INLINE void pack_results(const uint32_t dfb0, const uint32_t dfb1, const u
- }
- 
- /**
-- * Read tile from dataflow buffer and transpose it to destination register
-+ * Read tile from circular buffer and transpose it to destination register
-  * Used to prepare input tiles for sorting operations
-  *
-- * @param dfb               Dataflow buffer id to read tile from
-+ * @param dfb               Circular buffer index to read tile from
-  * @param base_offset      Base offset in destination register where transposed tile will be stored
-  */
- FORCE_INLINE void read_cb_and_transpose(const uint32_t dfb, const uint32_t base_offset) {
-@@ -91,10 +90,10 @@ FORCE_INLINE void read_cb_and_transpose(const uint32_t dfb, const uint32_t base_
- }
- 
- /**
-- * Utility function: Wait for tiles and pop them from front of dataflow buffer
-+ * Utility function: Wait for tiles and pop them from front of circular buffer
-  * Refactored to reduce code duplication
-  *
-- * @param dfb      Dataflow buffer id to operate on
-+ * @param dfb      Circular buffer index to operate on
-  * @param count   Number of tiles to wait for and then remove from the front of the buffer
-  */
- FORCE_INLINE void cb_wait_pop_front(const uint32_t dfb, const uint32_t count) {
-@@ -104,10 +103,10 @@ FORCE_INLINE void cb_wait_pop_front(const uint32_t dfb, const uint32_t count) {
- }
- 
- /**
-- * Utility function: Reserve space and push tiles to back of dataflow buffer
-+ * Utility function: Reserve space and push tiles to back of circular buffer
-  * Refactored to reduce code duplication
-  *
-- * @param dfb      Dataflow buffer id to operate on
-+ * @param dfb      Circular buffer index to operate on
-  * @param count   Number of tile slots to reserve at the back and then mark as available
-  */
- FORCE_INLINE void cb_reserve_push_back(const uint32_t dfb, const uint32_t count) {
-@@ -118,24 +117,21 @@ FORCE_INLINE void cb_reserve_push_back(const uint32_t dfb, const uint32_t count)
- 
- void kernel_main() {
-     // Runtime arguments
--    const uint32_t work_per_core = get_arg(args::work_per_core);
--
--    // Dataflow buffer handles
--    constexpr auto input_val_dfb_index = dfb::input;                  // Input values buffer
--    constexpr auto input_ind_dfb_index = dfb::index;                  // Input indices buffer
--    constexpr auto transposed_val_dfb_index = dfb::transposed_val;    // Transposed values buffer
--    constexpr auto transposed_ind_dfb_index = dfb::transposed_ind;    // Transposed indices buffer
--    constexpr auto result_prep_val_dfb_index = dfb::result_prep_val;  // Result preparation values buffer
--    constexpr auto result_prep_ind_dfb_index = dfb::result_prep_ind;  // Result preparation indices buffer
--    constexpr auto output_val_dfb_index = dfb::output_val;            // Final output values buffer
--    constexpr auto output_ind_dfb_index = dfb::output_ind;            // Final output indices buffer
-+    const uint32_t work_per_core = get_arg_val<uint32_t>(0);
- 
-     // Compile time args
--    constexpr uint32_t Ht = get_arg(args::Ht);                      // Height in tiles
--    constexpr uint32_t Wt = get_arg(args::Wt);                      // Width in tiles
--    constexpr uint32_t output_tiles = get_arg(args::output_tiles);  // Number of output tiles (ceil(K/32))
--    constexpr uint32_t largest = get_arg(args::largest);            // 1 for largest K, 0 for smallest K
--    constexpr bool stable_sort = get_arg(args::stable_sort) == 1;   // Ties keep the lowest index
-+    constexpr uint32_t input_val_dfb_index = get_compile_time_arg_val(0);        // Input values circular buffer
-+    constexpr uint32_t input_ind_dfb_index = get_compile_time_arg_val(1);        // Input indices circular buffer
-+    constexpr uint32_t transposed_val_dfb_index = get_compile_time_arg_val(2);   // Transposed values buffer
-+    constexpr uint32_t transposed_ind_dfb_index = get_compile_time_arg_val(3);   // Transposed indices buffer
-+    constexpr uint32_t result_prep_val_dfb_index = get_compile_time_arg_val(4);  // Result preparation values buffer
-+    constexpr uint32_t result_prep_ind_dfb_index = get_compile_time_arg_val(5);  // Result preparation indices buffer
-+    constexpr uint32_t output_val_dfb_index = get_compile_time_arg_val(6);       // Final output values buffer
-+    constexpr uint32_t output_ind_dfb_index = get_compile_time_arg_val(7);       // Final output indices buffer
-+    constexpr uint32_t Ht = get_compile_time_arg_val(8);                        // Height in tiles
-+    constexpr uint32_t Wt = get_compile_time_arg_val(9);                        // Width in tiles
-+    constexpr uint32_t output_tiles = get_compile_time_arg_val(10);             // Number of output tiles (ceil(K/32))
-+    constexpr uint32_t largest = get_compile_time_arg_val(11);                  // 1 for largest K, 0 for smallest K
- 
-     // Initialize kernel components
-     compute_kernel_hw_startup(input_val_dfb_index, input_ind_dfb_index, output_val_dfb_index);
-@@ -323,13 +319,11 @@ void kernel_main() {
- 
-                 // Load tiles into destination registers for merging
-                 // Load existing sorted values into dest reg 0
--                reconfig_data_format_srca(dfb1, dfb0);
--                copy_init(dfb0);
-+                copy_tile_to_dst_init_short_with_dt(dfb1, dfb0);
-                 copy_tile(dfb0, 0, DST_VAL);
- 
-                 // Load existing sorted indices into dest reg 2
--                reconfig_data_format_srca(dfb0, dfb1);
--                copy_init(dfb1);
-+                copy_tile_to_dst_init_short_with_dt(dfb0, dfb1);
-                 copy_tile(dfb1, 0, DST_IND);
- 
-                 if (first_sort_from_transposed) {
-@@ -340,20 +334,22 @@ void kernel_main() {
-                 }
- 
-                 // Load new input values into dest reg 1
--                reconfig_data_format_srca(transposed_ind_dfb_index, transposed_val_dfb_index);
--                copy_init(transposed_val_dfb_index);
-+                copy_tile_to_dst_init_short_with_dt(transposed_ind_dfb_index, transposed_val_dfb_index);
-                 copy_tile(transposed_val_dfb_index, transposed_offset, 1);
- 
-                 // Load new input indices into dest reg 3
--                reconfig_data_format_srca(transposed_val_dfb_index, transposed_ind_dfb_index);
--                copy_init(transposed_ind_dfb_index);
-+                copy_tile_to_dst_init_short_with_dt(transposed_val_dfb_index, transposed_ind_dfb_index);
-                 copy_tile(transposed_ind_dfb_index, transposed_offset, 3);
- 
-                 // Perform merge and sort operation
+@@ -353,7 +353,8 @@ void kernel_main() {
                  // Merge and sort 64 elements (32 existing + 32 new) using topk_local_sort
                  // Results: dest reg 0 = top 32 elements, dest reg 1 = bottom 32 elements
                  // largest flag determines ascending (0) vs descending (1) sort order
 -                ckernel::topk_local_sort<stable_sort>(0, (int)!largest, end_phase);
-+                if (largest) {
-+                    ckernel::topk_local_sort<true, true>(0, 0, end_phase);
-+                } else {
-+                    ckernel::topk_local_sort<true, false>(0, 1, end_phase);
-+                }
++                // A stable descending sort keeps the lowest index first among equal values.
++                ckernel::topk_local_sort<stable_sort, static_cast<bool>(largest)>(0, (int)!largest, end_phase);
  
                  // Pack sorted results: dest reg 0 -> result buffer, dest reg 1 -> secondary buffer
                  tile_regs_commit();
-diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
---- ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
-+++ ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_common_funcs.hpp
-@@ -6,11 +6,6 @@
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
+@@ -109,7 +109,10 @@ TopKDeviceOperation::program_factory_t TopKDeviceOperation::select_program_facto
+     const uint32_t reduced_width = input_shape[args.dim];
+     const uint32_t tile_height = input_tensor.tensor_spec().tile().get_height();
+     const uint32_t num_tile_rows = input_shape.volume() / reduced_width / tile_height;
+-    bool multicore_supported = topk_multicore_structurally_eligible(reduced_width, num_tile_rows, args.k);
++    // Only the single-core network keeps stable ties in index order: the multi-core
++    // local and final merges do not.
++    bool multicore_supported =
++        !args.stable && topk_multicore_structurally_eligible(reduced_width, num_tile_rows, args.k);
  
- #include "api/dataflow/dataflow_buffer.h"
+     // The multi-core path takes the first (and only supported) core range below; a
+     // malformed grid (zero or multiple ranges) falls back to single-core here and is
+@@ -320,7 +323,7 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
+     const uint32_t reduced_width = input_shape[args.dim];
+     const uint32_t tile_height = input_tensor.tensor_spec().tile().get_height();
+     const uint32_t num_tile_rows = input_shape.volume() / reduced_width / tile_height;
+-    if (topk_multicore_structurally_eligible(reduced_width, num_tile_rows, args.k)) {
++    if (!args.stable && topk_multicore_structurally_eligible(reduced_width, num_tile_rows, args.k)) {
+         auto* device = input_tensor.device();
  
--// stable_sort selects the LLK's stable bitonic network: equal values keep the lowest index, so ties
--// are broken deterministically rather than by array position. It defaults to false so every existing
--// caller (ttnn.topk, the deepseek grouped-gate/MoE kernels) keeps its current behaviour; only callers
--// that explicitly instantiate with true opt in.
--template <bool stable_sort = false>
- void process_and_sort_tiles(
-     uint32_t input_dfb_index,
-     uint32_t index_dfb_index,
-@@ -50,7 +45,11 @@ void process_and_sort_tiles(
-             transpose_tile(index_dfb_index, 1, 3);
-         }
-         // llk_topk_sort -> inplace
--        ckernel::topk_local_sort<stable_sort>(0, (int)ascending, end_phase);
-+        if (ascending) {
-+            ckernel::topk_local_sort<true, false>(0, 1, end_phase);
-+        } else {
-+            ckernel::topk_local_sort<true, true>(0, 0, end_phase);
-+        }
-         tile_regs_commit();
- 
-         input_dfb.pop_front(tiles_to_wait);
-@@ -77,7 +76,6 @@ void process_and_sort_tiles(
-     index_transposed_dfb.push_back(Wt);
- }
- 
--template <bool stable_sort = false>
- void process_tile_pair(
-     uint32_t left_ind,
-     uint32_t right_ind,
-@@ -94,16 +92,14 @@ void process_tile_pair(
-     bool target_tiles_is_one) {
-     tile_regs_acquire();
- 
--    reconfig_data_format_srca(index_transposed_dfb_index, input_transposed_dfb_index);
--    copy_init(input_transposed_dfb_index);
-+    copy_tile_to_dst_init_short_with_dt(index_transposed_dfb_index, input_transposed_dfb_index);
-     copy_tile(input_transposed_dfb_index, left_ind, input_dest_start);
-     if (!target_tiles_is_one) {
-         copy_tile(input_transposed_dfb_index, right_ind, input_dest_end);
-     }
- 
-     // unpack indices into dest
--    reconfig_data_format_srca(input_transposed_dfb_index, index_transposed_dfb_index);
--    copy_init(index_transposed_dfb_index);
-+    copy_tile_to_dst_init_short_with_dt(input_transposed_dfb_index, index_transposed_dfb_index);
-     copy_tile(index_transposed_dfb_index, left_ind, index_dest_start);
-     if (!target_tiles_is_one) {
-         copy_tile(index_transposed_dfb_index, right_ind, index_dest_end);
-@@ -111,7 +107,11 @@ void process_tile_pair(
- 
-     // merge values - move larger 32 values into 0th dest and lower 32 values into 1st dest
-     // sort within the larger 32 values
--    ckernel::topk_rebuild<stable_sort>(0, (uint32_t)ascending, m_iter, K, logk, target_tiles_is_one);
-+    if (ascending) {
-+        ckernel::topk_rebuild<true, false>(0, 1, m_iter, K, logk, target_tiles_is_one);
-+    } else {
-+        ckernel::topk_rebuild<true, true>(0, 0, m_iter, K, logk, target_tiles_is_one);
-+    }
- 
-     tile_regs_commit();
-     tile_regs_wait();
-@@ -133,7 +133,6 @@ void process_tile_pair(
-     tile_regs_release();
- }
- 
--template <bool stable_sort = false>
- void process_tiles(
-     uint32_t m_iter,
-     uint32_t K,
-@@ -163,22 +162,20 @@ void process_tiles(
- 
-             tile_regs_acquire();
- 
--            reconfig_data_format_srca(index_transposed_dfb_index, input_transposed_dfb_index);
--            copy_init(input_transposed_dfb_index);
-+            copy_tile_to_dst_init_short_with_dt(index_transposed_dfb_index, input_transposed_dfb_index);
-             copy_tile(input_transposed_dfb_index, left_tile_id, input_dest_start);
-             copy_tile(input_transposed_dfb_index, right_tile_id, input_dest_end);
- 
-             // unpack indices into dest
--            reconfig_data_format_srca(input_transposed_dfb_index, index_transposed_dfb_index);
--            copy_init(index_transposed_dfb_index);
-+            copy_tile_to_dst_init_short_with_dt(input_transposed_dfb_index, index_transposed_dfb_index);
-             copy_tile(index_transposed_dfb_index, left_tile_id, index_dest_start);
-             copy_tile(index_transposed_dfb_index, right_tile_id, index_dest_end);
- 
-             // merge values - move larger 32 values into 0th dest and lower 32 values into 1st dest
-             if (largest) {
--                ckernel::topk_merge<false, stable_sort>(0, m_iter, K);
-+                ckernel::topk_merge<false, true, true>(0, m_iter, K);
-             } else {
--                ckernel::topk_merge<true, stable_sort>(0, m_iter, K);
-+                ckernel::topk_merge<true, true, false>(0, m_iter, K);
-             }
- 
-             // ckernel::topk_merge(0, m_iter, K);
-@@ -201,7 +198,6 @@ void process_tiles(
-     }
- }
- 
--template <bool stable_sort = false>
- void process_iteration(
-     uint32_t m_iter,
-     uint32_t K,
-@@ -225,7 +221,7 @@ void process_iteration(
-     input_transposed_dfb.wait_front(Wt);
-     index_transposed_dfb.wait_front(Wt);
- 
--    process_tiles<stable_sort>(
-+    process_tiles(
-         m_iter,
-         K,
-         Wt,
-@@ -270,7 +266,7 @@ void process_iteration(
-             sel_tile_id[sel_tile_id_ptr] = left_ind;
-             sel_tile_id_ptr++;
-             if (sel_tile_id_ptr == target_tiles) {
--                process_tile_pair<stable_sort>(
-+                process_tile_pair(
-                     sel_tile_id[0],
-                     sel_tile_id[1],
-                     input_transposed_dfb_index,
+         // Set up data formats for memory cost calculations

@@ -71,3 +71,18 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
  
    wa::TTNNOperandWorkarounds outputIndicesWorkaround;
    if (useUint16Indices) {
+diff --git a/runtime/lib/ttnn/operations/reduction/topk.cpp b/runtime/lib/ttnn/operations/reduction/topk.cpp
+--- a/runtime/lib/ttnn/operations/reduction/topk.cpp
++++ b/runtime/lib/ttnn/operations/reduction/topk.cpp
+@@ -25,7 +25,10 @@ static void runReductionTopKOp(const ::tt::target::ttnn::TopKOp *op,
+                    /*memory_config=*/outputMemoryConfig,
+                    /*sub_core_grids=*/std::nullopt,
+                    /*indices_tensor=*/std::nullopt,
+-                   /*preallocated_output_tensors=*/std::nullopt);
++                   /*preallocated_output_tensors=*/std::nullopt,
++                   // JAX's top_k keeps the lowest index first among equal
++                   // values.
++                   /*stable=*/true);
+ 
+   for (size_t i = 0; i < op->outputs()->size(); ++i) {
+     tensorPool.insertTTNNTensorAndValidate(op->outputs()->Get(i), outputs[i]);
