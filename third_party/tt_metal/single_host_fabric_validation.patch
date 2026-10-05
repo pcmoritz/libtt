@@ -1,0 +1,16 @@
+diff --git tt_metal/fabric/control_plane.cpp tt_metal/fabric/control_plane.cpp
+--- tt_metal/fabric/control_plane.cpp
++++ tt_metal/fabric/control_plane.cpp
+@@ -754,6 +754,12 @@ void ControlPlane::validate_fabric_config_across_ranks() {
+     using tt::tt_metal::distributed::multihost::ReduceOp;
+     const auto& distributed_context = this->distributed_context_.get();
+     const auto world_size = static_cast<uint32_t>(*distributed_context.size());
++    // A single rank has nothing to compare against, and the single-host context
++    // (used when building without MPI) does not implement collectives.
++    if (world_size == 1) {
++        this->validated_fabric_config_ = this->fabric_config_;
++        return;
++    }
+     const auto rank = static_cast<uint32_t>(*distributed_context.rank());
+ 
+     // Source the local mesh ids and per-mesh host rank from the topology mapper (the actual mapped

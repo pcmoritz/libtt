@@ -18,6 +18,24 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
                  .data_format = c_pack_data_format,
                  .page_size = c_single_tile_size,
              }}},
+@@ -1479,7 +1479,7 @@ void BinaryNgDeviceOperation::ProgramFactory::override_runtime_arguments(
+     }
+ 
+     // Re-point tensor-backed (globally-allocated) circular buffers at the CURRENT buffers, by CBIndex.
+-    // binary_ng convention: c_0 = input_a, c_1 = input_b, c_2 = output.  Addressing by CBIndex (not by
++    // binary_ng convention: c_0 = input_a, c_1 = input_b, c_16 = output.  Addressing by CBIndex (not by
+     // enumeration order) is what makes the in-place alias correct: the output CB always tracks the
+     // output buffer even when it shares a Buffer* with an input.
+     tt::tt_metal::Buffer* a_buffer = a.buffer();
+@@ -1494,7 +1494,7 @@ void BinaryNgDeviceOperation::ProgramFactory::override_runtime_arguments(
+             tt::tt_metal::UpdateDynamicCircularBufferAddress(program, cb->id(), *a_buffer);
+         } else if (indices.contains(static_cast<uint8_t>(tt::CBIndex::c_1)) && b_buffer != nullptr) {
+             tt::tt_metal::UpdateDynamicCircularBufferAddress(program, cb->id(), *b_buffer);
+-        } else if (indices.contains(static_cast<uint8_t>(tt::CBIndex::c_2)) && c_buffer != nullptr) {
++        } else if (indices.contains(static_cast<uint8_t>(tt::CBIndex::c_16)) && c_buffer != nullptr) {
+             tt::tt_metal::UpdateDynamicCircularBufferAddress(program, cb->id(), *c_buffer);
+         }
+     }
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary.cpp

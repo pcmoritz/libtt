@@ -69,5 +69,6 @@ void ClearNocData(tt_metal::MetalEnvImpl &, ChipId) {}
 namespace tracy {
 
 void SetThreadName(const char *) {}
+void SetThreadName(uint32_t, const char *) {}
 
 } // namespace tracy
