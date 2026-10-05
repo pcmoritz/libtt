@@ -1,9 +1,10 @@
 """StableHLO remainder truncates: the result takes the sign of the dividend.
 
 tt-mlir lowers it to TTNN's fmod; TTNN's remainder floors instead, which
-differs for operands of opposite signs (-5 rem 3 is -2, not 1). Unary ops
-around a remainder are not fused into it as activations, so they cannot
-switch it to the flooring kernel.
+differs for operands of opposite signs (-5 rem 3 is -2, not 1). tt-mlir does
+not fuse unary ops into a remainder as activations, which would need the
+flooring kernel; that fusion is off by default, so the unary-op test checks
+the truncating result rather than the exclusion itself.
 """
 
 import jax
@@ -31,7 +32,7 @@ def test_remainder_truncates(dtype):
 
 @pytest.mark.parametrize("dtype", [np.float32, jnp.bfloat16])
 def test_remainder_between_unary_ops(dtype):
-    # neg on an input and abs on the output are fusable unary ops.
+    # neg on an input and abs on the output are unary ops activation fusion would take.
     a, b = operands(dtype, seed=1)
     run = jax.jit(lambda x, y: jnp.abs(lax.rem(-x, y)), compiler_options={"optimization_level": "O1"})
     out = run(*(jax.device_put(x, jax.devices("tt")[0]) for x in (a, b)))

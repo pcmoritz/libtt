@@ -87,19 +87,20 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk.c
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
-@@ -109,7 +109,10 @@ TopKDeviceOperation::program_factory_t TopKDeviceOperation::select_program_facto
+@@ -109,7 +109,11 @@ TopKDeviceOperation::program_factory_t TopKDeviceOperation::select_program_facto
      const uint32_t reduced_width = input_shape[args.dim];
      const uint32_t tile_height = input_tensor.tensor_spec().tile().get_height();
      const uint32_t num_tile_rows = input_shape.volume() / reduced_width / tile_height;
 -    bool multicore_supported = topk_multicore_structurally_eligible(reduced_width, num_tile_rows, args.k);
 +    // Only the single-core network keeps stable ties in index order: the multi-core
-+    // local and final merges do not.
++    // local and final merges do not. This costs speed on power-of-two rows the
++    // multi-core path would take (2.6 instead of 0.3 ms for 2x8192, k=32).
 +    bool multicore_supported =
 +        !args.stable && topk_multicore_structurally_eligible(reduced_width, num_tile_rows, args.k);
  
      // The multi-core path takes the first (and only supported) core range below; a
      // malformed grid (zero or multiple ranges) falls back to single-core here and is
-@@ -320,7 +323,7 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
+@@ -320,7 +324,7 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
      const uint32_t reduced_width = input_shape[args.dim];
      const uint32_t tile_height = input_tensor.tensor_spec().tile().get_height();
      const uint32_t num_tile_rows = input_shape.volume() / reduced_width / tile_height;
