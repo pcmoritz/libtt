@@ -81,7 +81,7 @@ bazel test //tests:jax_test_suite \
   --test_arg=-v
 ```
 
-Historical baseline (August 2026): **2800 failed, 22837 passed, 6531 skipped.**
+Baseline (October 2026): **2591 failed, 25178 passed, 6733 skipped.**
 
 ## libtt tests
 
