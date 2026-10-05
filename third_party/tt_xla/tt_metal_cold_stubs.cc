@@ -4,6 +4,7 @@
 #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp"
 #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.hpp"
 #include "ttnn/operations/experimental/conv3d/conv3d.hpp"
+#include "ttnn/operations/experimental/transformer/dit_rms_norm_unary_fused/dit_rms_norm_unary_fused.hpp"
 #include "ttnn/operations/experimental/unary_backward/gelu_backward/gelu_backward.hpp"
 #include "ttnn/operations/pool/upsample/upsample.hpp"
 #include "ttnn/tensor/serialization.hpp"
@@ -32,7 +33,7 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     std::optional<ttnn::experimental::ccl::AllGatherFusedOpSignaler> &,
     CoreCoord, ttnn::ccl::CoreAllocationStrategy, std::optional<uint32_t>,
     std::optional<uint32_t>, std::optional<Tensor>, std::optional<Tensor>,
-    uint32_t, uint32_t, uint32_t) {
+    uint32_t, uint32_t, uint32_t, bool) {
   unsupported("ttnn::ring_attention_all_gather_async");
 }
 
@@ -60,8 +61,21 @@ ttnn::Tensor conv3d(
     const std::array<uint32_t, 3> &, const std::array<uint32_t, 3> &,
     const std::array<uint32_t, 3> &, const std::string &, uint32_t,
     const std::optional<MemoryConfig> &,
-    std::optional<DeviceComputeKernelConfig>) {
+    std::optional<DeviceComputeKernelConfig>, const std::optional<ttnn::Tensor> &,
+    uint32_t, uint32_t, const std::optional<ttnn::Tensor> &, uint32_t,
+    uint32_t) {
   unsupported("ttnn::conv3d");
+}
+
+ttnn::Tensor dit_rms_norm_unary_fused(
+    const ttnn::Tensor &, float, const std::optional<const ttnn::Tensor> &,
+    const std::optional<const ttnn::Tensor> &,
+    const std::optional<const ttnn::Tensor> &,
+    const std::optional<MemoryConfig> &,
+    const std::optional<const ttnn::prim::LayerNormProgramConfig> &,
+    std::optional<const ttnn::DeviceComputeKernelConfig>,
+    const std::optional<ttnn::operations::unary::UnaryWithParam> &) {
+  unsupported("ttnn::experimental::dit_rms_norm_unary_fused");
 }
 
 Tensor gelu_bw(const Tensor &, const Tensor &, const std::string &,
