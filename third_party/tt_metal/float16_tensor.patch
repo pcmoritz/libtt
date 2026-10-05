@@ -139,7 +139,6 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
      } else if constexpr (in_format == DataFormat::UInt16 && out_format == DataFormat::Float32) {
          MATH(SFPU_UNARY_INIT_FN(typecast, sfpu::init_typecast_uint16_to_fp32, (APPROX)));
 diff --git tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h
-new file mode 100644
 --- /dev/null
 +++ tt_metal/hw/inc/internal/tt-1xx/float16_conversion.h
 @@ -0,0 +1,85 @@
@@ -314,31 +313,6 @@ diff --git tt_metal/impl/data_format/tilize_utils.cpp tt_metal/impl/data_format/
  template std::vector<uint8_t> convert_layout<uint8_t>(ttsl::Span<const uint8_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
  template std::vector<uint16_t> convert_layout<uint16_t>(ttsl::Span<const uint16_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
  template std::vector<uint32_t> convert_layout<uint32_t>(ttsl::Span<const uint32_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
-diff --git tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp
---- tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp
-+++ tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp
-@@ -1732,7 +1732,20 @@ uint32_t ProgramImpl::assign_dfb_device_slot(const DataflowBufferImpl& dfb) cons
-         }
-     }
- 
--    const uint64_t free_slots = ~used_slots;
-+    uint64_t free_slots = ~used_slots;
-+    if (!hal.has_tile_counter_registers()) {
-+        // Gen1 keeps the legacy circular-buffer convention: outputs a compute kernel packs (and does not
-+        // unpack) take c_16..c_23, the range the JIT exempts from the unpacker's shared exponent width, so
-+        // e.g. a Float16 output can follow a Float16_b input. Other buffers stay out of that range.
-+        constexpr uint64_t output_range = uint64_t(0xFF) << 16;
-+        constexpr uint16_t tensix = 1u << 2;  // Gen1 compute kernels are bit 2 (BindDataflowBufferToProducerConsumerKernels)
-+        const bool is_compute_output =
-+            (dfb.config.producer_risc_mask & tensix) != 0 && (dfb.config.consumer_risc_mask & tensix) == 0;
-+        const uint64_t preferred = free_slots & (is_compute_output ? output_range : ~output_range);
-+        if (preferred != 0) {
-+            free_slots = preferred;
-+        }
-+    }
-     const uint32_t slot = free_slots ? static_cast<uint32_t>(__builtin_ctzll(free_slots)) : max_slots;
-     TT_FATAL(
-         slot < max_slots,
 diff --git tt_metal/impl/tensor/host_tensor.cpp tt_metal/impl/tensor/host_tensor.cpp
 --- tt_metal/impl/tensor/host_tensor.cpp
 +++ tt_metal/impl/tensor/host_tensor.cpp

@@ -1,0 +1,28 @@
+diff --git tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp
+--- tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp
++++ tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp
+@@ -1732,7 +1732,23 @@ uint32_t ProgramImpl::assign_dfb_device_slot(const DataflowBufferImpl& dfb) cons
+         }
+     }
+ 
+-    const uint64_t free_slots = ~used_slots;
++    // Only the arch's slots can be taken.
++    const uint64_t arch_slots = max_slots >= 64 ? ~uint64_t(0) : (uint64_t(1) << max_slots) - 1;
++    uint64_t free_slots = ~used_slots & arch_slots;
++    if (!hal.has_tile_counter_registers()) {
++        // Gen1 keeps the legacy circular-buffer convention: outputs a compute kernel packs (and does not
++        // unpack) take c_16..c_23, the range the JIT exempts from the unpacker's shared exponent width, so
++        // e.g. a Float16 output can follow a Float16_b input. Other buffers stay out of that range.
++        constexpr uint64_t output_range = uint64_t(0xFF) << 16;
++        // Gen1 risc masks mark compute kernels with bit 2 (gen2 uses bits 8-15).
++        constexpr uint16_t gen1_compute = 1u << 2;
++        const bool is_compute_output = (dfb.config.producer_risc_mask & gen1_compute) != 0 &&
++                                       (dfb.config.consumer_risc_mask & gen1_compute) == 0;
++        const uint64_t preferred = free_slots & (is_compute_output ? output_range : ~output_range);
++        if (preferred != 0) {
++            free_slots = preferred;
++        }
++    }
+     const uint32_t slot = free_slots ? static_cast<uint32_t>(__builtin_ctzll(free_slots)) : max_slots;
+     TT_FATAL(
+         slot < max_slots,

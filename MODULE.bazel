@@ -283,6 +283,7 @@ http_archive(
         "//third_party/tt_metal:log1p_signed_zero.patch",
         "//third_party/tt_metal:bitwise_not_uint8.patch",
         "//third_party/tt_metal:float16_tensor.patch",
+        "//third_party/tt_metal:dfb_compute_output_slots.patch",
         "//third_party/tt_metal:host_tensor_value_initialization.patch",
         "//third_party/tt_metal:float16_min_max.patch",
         "//third_party/tt_metal:float16_accumulation.patch",
