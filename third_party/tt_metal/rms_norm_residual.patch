@@ -130,10 +130,10 @@ new file mode 100644
 +        binop_with_scalar_tile_init();
 +        MATH(SFPU_UNARY_CALL(
 +            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
-+            (APPROX, ckernel::sfpu::MUL, sfpu_iterations), 0, VectorMode::C, inv_width));
++            (APPROX, ckernel::sfpu::MUL, sfpu_iterations, DST_ACCUM_MODE), 0, VectorMode::C, inv_width));
 +        MATH(SFPU_UNARY_CALL(
 +            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
-+            (APPROX, ckernel::sfpu::ADD, sfpu_iterations), 0, VectorMode::C, eps));
++            (APPROX, ckernel::sfpu::ADD, sfpu_iterations, DST_ACCUM_MODE), 0, VectorMode::C, eps));
 +        rsqrt_tile_init();
 +        MATH(SFPU_UNARY_CALL(
 +            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_rsqrt,
