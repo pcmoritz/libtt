@@ -1,0 +1,287 @@
+diff --git a/lib/Dialect/TTCore/IR/TTCoreDialect.cpp b/lib/Dialect/TTCore/IR/TTCoreDialect.cpp
+--- a/lib/Dialect/TTCore/IR/TTCoreDialect.cpp
++++ b/lib/Dialect/TTCore/IR/TTCoreDialect.cpp
+@@ -5,7 +5,6 @@
+ #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
+ 
+ #include "mlir/IR/DialectImplementation.h"
+-#include "mlir/InitAllDialects.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+ #include "llvm/ADT/TypeSwitch.h"
+diff --git a/lib/Dialect/TTIR/IR/TTIRDialect.cpp b/lib/Dialect/TTIR/IR/TTIRDialect.cpp
+--- a/lib/Dialect/TTIR/IR/TTIRDialect.cpp
++++ b/lib/Dialect/TTIR/IR/TTIRDialect.cpp
+@@ -12,7 +12,6 @@
+ #include "mlir/Dialect/SCF/IR/SCF.h"
+ #include "mlir/Dialect/Tensor/IR/Tensor.h"
+ #include "mlir/IR/DialectImplementation.h"
+-#include "mlir/InitAllDialects.h"
+ #include "mlir/Interfaces/FoldInterfaces.h"
+ #include "mlir/Transforms/InliningUtils.h"
+ #include "llvm/ADT/StringSet.h"
+diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+--- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
++++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+@@ -5,11 +5,13 @@
+ #include "ttmlir/Dialect/TTIR/Pipelines/TTIRPipelines.h"
+ 
+ #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
++#include "mlir/Conversion/BufferizationToMemRef/BufferizationToMemRef.h"
+ #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+ #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
+ #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+ #include "mlir/Conversion/MathToLibm/MathToLibm.h"
+-#include "mlir/Conversion/Passes.h"
++#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
++#include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+ #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+ #include "mlir/Conversion/TensorToLinalg/TensorToLinalgPass.h"
+ #include "mlir/Conversion/TosaToArith/TosaToArith.h"
+@@ -19,11 +21,8 @@
+ #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+ #include "mlir/Dialect/Linalg/Passes.h"
+ #include "mlir/Dialect/SCF/Transforms/Passes.h"
+-#include "mlir/InitAllDialects.h"
+-#include "mlir/InitAllPasses.h"
+ #include "mlir/Pass/PassManager.h"
+ #include "mlir/Pass/PassRegistry.h"
+-#include "mlir/Tools/mlir-opt/MlirOptMain.h"
+ #include "mlir/Transforms/Passes.h"
+ 
+ #include "ttmlir/Conversion/Passes.h"
+@@ -40,14 +39,9 @@
+ #endif
+ 
+ #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
+-#include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
+-#include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
+-#include "mlir/Conversion/NVVMToLLVM/NVVMToLLVM.h"
+ #include "mlir/Dialect/Affine/Passes.h"
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+-#include "mlir/Dialect/GPU/Transforms/Passes.h"
+ #include "mlir/Dialect/MemRef/Transforms/Passes.h"
+-#include "mlir/Target/LLVMIR/Export.h"
+ #include "ttmlir/Conversion/TTIRToLinalg/TTIRToLinalg.h"
+ 
+ namespace mlir::tt::ttir {
+@@ -103,105 +97,6 @@
+ }
+ #endif
+ 
+-void createTTIRToNVVMPipeline(OpPassManager &manager,
+-                              const TTIRToNVVMPipelineOptions &options) {
+-  // These are initial passes to ensure we start with well-form linalg dialect
+-  // operations.
+-
+-  manager.addPass(createConvertTTIRToLinalgPass());
+-  TosaToLinalgOptions tosaToLinalgOptions;
+-  tosaToLinalgOptions.aggressiveReduceConstant = true;
+-  tosa::addTosaToLinalgPasses(manager, tosaToLinalgOptions, {}, {});
+-  // Add tosa-to-tensor/arith passes to handle tosa.const operations.
+-  manager.addPass(createTosaToTensorPass());
+-  manager.addPass(createTosaToArithPass());
+-  manager.addPass(mlir::createConvertElementwiseToLinalgPass());
+-  manager.addPass(mlir::createConvertTensorToLinalgPass());
+-
+-  // Everything is converted to linalg, which can be bufferized.
+-  // One-shot bufferize passes convert tensors into memrefs, which can be
+-  // lowered into LLVM Dialect.  See:
+-  // https://mlir.llvm.org/docs/Bufferization/#ownership-based-buffer-deallocation
+-  bufferization::OneShotBufferizePassOptions bufferizePassOptions;
+-  bufferizePassOptions.bufferizeFunctionBoundaries = true;
+-  bufferizePassOptions.functionBoundaryTypeConversion =
+-      bufferization::LayoutMapOption::IdentityLayoutMap;
+-  bufferizePassOptions.unknownTypeConversion =
+-      bufferization::LayoutMapOption::IdentityLayoutMap;
+-  manager.addPass(
+-      mlir::bufferization::createOneShotBufferizePass(bufferizePassOptions));
+-  mlir::bufferization::BufferDeallocationPipelineOptions deallocationOptions;
+-  mlir::bufferization::buildBufferDeallocationPipeline(manager,
+-                                                       deallocationOptions);
+-
+-  // This transforms high-level linalg operations into parallel loop nests that
+-  //  explicitly iterate over tensor elements.
+-  manager.addPass(mlir::createConvertLinalgToParallelLoopsPass());
+-
+-  // Fuses parallel loops to reduce the number of parallel loops.
+-  manager.addPass(createParallelLoopFusionPass());
+-
+-  // Collapses parallel loops to suit GPU mapping.
+-  manager.addPass(transforms::createCollapseParallelLoops());
+-
+-  // Tiles parallel loops to improve GPU occupancy.
+-  manager.addPass(createParallelLoopTilingPass({32}, true));
+-
+-  // Maps parallel loops to GPU execution model, distributing iterations across
+-  //   GPU threads and blocks.
+-  manager.addPass(createGpuMapParallelLoopsPass());
+-  manager.addPass(createConvertParallelLoopToGpuPass());
+-
+-  // Extracts GPU kernel regions into separate GPU functions that can be
+-  // launched from host code.
+-  manager.addPass(mlir::createGpuKernelOutliningPass());
+-
+-  // Converts affine dialect operations to standard control flow and arithmetic
+-  // operations.
+-  manager.addPass(createLowerAffinePass());
+-
+-  // Decomposes complex memref types into simpler ones that can be handled by
+-  // the GPU backends.
+-  manager.addPass(mlir::createGpuDecomposeMemrefsPass());
+-
+-  // Expands metadata for strided memory accesses to explicit calculations.
+-  manager.addPass(mlir::memref::createExpandStridedMetadataPass());
+-
+-  // Normalizes memory references to a form expected by the GPU backends.
+-  manager.addPass(memref::createNormalizeMemRefsPass());
+-
+-  // Converts GPU dialect operations to NVVM dialect (NVIDIA's LLVM-based IR),
+-  //  using bare pointer calling conventions for memrefs.
+-  ConvertGpuOpsToNVVMOpsOptions convertGpuOpsToNVVMOpsOptions;
+-  convertGpuOpsToNVVMOpsOptions.useBarePtrCallConv = true;
+-  convertGpuOpsToNVVMOpsOptions.indexBitwidth = 0;
+-  manager.addPass(createConvertGpuOpsToNVVMOps(convertGpuOpsToNVVMOpsOptions));
+-
+-  // Attaches target-specific information to the NVVM module, specifying the GPU
+-  // architecture, PTX version features, and optimization level.
+-
+-  GpuNVVMAttachTargetOptions gpunvvmOptions;
+-  gpunvvmOptions.chip = options.chip;
+-  gpunvvmOptions.features = options.features;
+-  gpunvvmOptions.optLevel = options.optLevel;
+-  manager.addPass(createGpuNVVMAttachTarget(gpunvvmOptions));
+-
+-  // Translates NVVM dialect to standard LLVM dialect for further processing.
+-  manager.addPass(createConvertNVVMToLLVMPass());
+-
+-  // Converts remaining SCF operations to control flow and LLVM dialect.
+-  manager.addPass(mlir::createSCFToControlFlowPass());
+-  manager.addPass(mlir::createConvertControlFlowToLLVMPass());
+-
+-  // Embed CUDA target attributes for flatbuffer translation.
+-  transforms::EmbedCudaTargetAttributesOptions embedCudaTargetAttributesOptions;
+-  embedCudaTargetAttributesOptions.chip = options.chip;
+-  embedCudaTargetAttributesOptions.features = options.features;
+-  embedCudaTargetAttributesOptions.opt_level = options.optLevel;
+-  manager.addPass(transforms::createEmbedCudaTargetAttributes(
+-      embedCudaTargetAttributesOptions));
+-}
+-
+ void createLinalgToLLVMPipeline(OpPassManager &manager,
+                                 const LinalgToLLVMPipelineOptions &options) {
+   // These are initial passes to ensure we start with well-form linalg dialect
+@@ -324,9 +219,6 @@
+       mlir::tt::ttir::createStableHLOToTTIRPipeline);
+ #endif
+ 
+-  mlir::PassPipelineRegistration<TTIRToNVVMPipelineOptions>(
+-      "convert-ttir-to-nvvm", "Pipeline lowering ttir to nvvm dialect.",
+-      mlir::tt::ttir::createTTIRToNVVMPipeline);
+   mlir::PassPipelineRegistration<LinalgToLLVMPipelineOptions>(
+       "linalg-to-llvm-pipeline", "Pipeline lowering linalg to llvm dialect.",
+       mlir::tt::ttir::createLinalgToLLVMPipeline);
+diff --git a/lib/Dialect/TTKernel/IR/TTKernelDialect.cpp b/lib/Dialect/TTKernel/IR/TTKernelDialect.cpp
+--- a/lib/Dialect/TTKernel/IR/TTKernelDialect.cpp
++++ b/lib/Dialect/TTKernel/IR/TTKernelDialect.cpp
+@@ -9,7 +9,6 @@
+ #include "mlir/Dialect/MemRef/IR/MemRef.h"
+ #include "mlir/Dialect/SCF/IR/SCF.h"
+ #include "mlir/IR/DialectImplementation.h"
+-#include "mlir/InitAllDialects.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
+ #include "ttmlir/Dialect/TTKernel/IR/TTKernelOps.h"
+ #include "ttmlir/Dialect/TTKernel/IR/TTKernelOpsTypes.h"
+diff --git a/lib/Dialect/TTMetal/IR/TTMetalDialect.cpp b/lib/Dialect/TTMetal/IR/TTMetalDialect.cpp
+--- a/lib/Dialect/TTMetal/IR/TTMetalDialect.cpp
++++ b/lib/Dialect/TTMetal/IR/TTMetalDialect.cpp
+@@ -12,7 +12,6 @@
+ #include "mlir/Dialect/SCF/IR/SCF.h"
+ #include "mlir/Dialect/Tensor/IR/Tensor.h"
+ #include "mlir/IR/DialectImplementation.h"
+-#include "mlir/InitAllDialects.h"
+ #include "mlir/Interfaces/FoldInterfaces.h"
+ #include "llvm/ADT/TypeSwitch.h"
+ 
+diff --git a/lib/Dialect/TTNN/IR/TTNNDialect.cpp b/lib/Dialect/TTNN/IR/TTNNDialect.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNDialect.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNDialect.cpp
+@@ -11,7 +11,6 @@
+ #include "mlir/Dialect/SCF/IR/SCF.h"
+ #include "mlir/Dialect/Tensor/IR/Tensor.h"
+ #include "mlir/IR/DialectImplementation.h"
+-#include "mlir/InitAllDialects.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
+diff --git a/lib/RegisterAll.cpp b/lib/RegisterAll.cpp
+--- a/lib/RegisterAll.cpp
++++ b/lib/RegisterAll.cpp
+@@ -41,8 +41,6 @@
+ #include "mlir/Dialect/Vector/IR/VectorOps.h"
+ #include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
+ #include "mlir/IR/DialectRegistry.h"
+-#include "mlir/InitAllDialects.h"
+-#include "mlir/InitAllPasses.h"
+ #include "mlir/Transforms/Passes.h"
+ #include "ttmlir/Dialect/Linalg/Transforms/SynchronizableOpInterfaceImpl.h"
+ 
+@@ -64,12 +62,11 @@
+ #include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
+ #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+ #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+-#include "mlir/Conversion/NVVMToLLVM/NVVMToLLVM.h"
+-#include "mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h"
+ #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+ #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+ #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+-#include "mlir/Target/LLVMIR/Dialect/All.h"
++#include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
++#include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
+ 
+ void mlir::tt::registerAllDialects(mlir::DialectRegistry &registry) {
+   registry.insert<
+@@ -111,16 +108,16 @@
+   vector::registerBufferizableOpInterfaceExternalModels(registry);
+   vector::registerConvertVectorToLLVMInterface(registry);
+   registerConvertComplexToLLVMInterface(registry);
+-  registerConvertNVVMToLLVMInterface(registry);
+   registerConvertMathToLLVMInterface(registry);
+-  registerConvertOpenMPToLLVMInterface(registry);
+   registerConvertMemRefToLLVMInterface(registry);
+   arith::registerConvertArithToLLVMInterface(registry);
+   index::registerConvertIndexToLLVMInterface(registry);
+   ub::registerConvertUBToLLVMInterface(registry);
+   cf::registerConvertControlFlowToLLVMInterface(registry);
+   registerConvertFuncToLLVMInterface(registry);
+-  registerAllToLLVMIRTranslations(registry);
++  // Only the builtin and LLVM dialects reach LLVM IR.
++  registerBuiltinDialectTranslation(registry);
++  registerLLVMDialectTranslation(registry);
+   tensor::registerSubsetOpInterfaceExternalModels(registry);
+   linalg::registerSubsetOpInterfaceExternalModels(registry);
+   linalg::registerSynchronizableOpInterfaceExternalModels(registry);
+diff --git a/lib/Target/TTNN/TTNNToFlatbufferRegistration.cpp b/lib/Target/TTNN/TTNNToFlatbufferRegistration.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbufferRegistration.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbufferRegistration.cpp
+@@ -6,7 +6,8 @@
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+ #include "mlir/Dialect/Quant/IR/Quant.h"
+-#include "mlir/Target/LLVMIR/Dialect/All.h"
++#include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
++#include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
+ #include "mlir/Target/LLVMIR/Export.h"
+ #include "mlir/Tools/mlir-translate/Translation.h"
+ 
+@@ -36,7 +37,9 @@
+                         mlir::quant::QuantDialect
+                         >();
+         // clang-format on
+-        registerAllToLLVMIRTranslations(registry);
++        // Only the builtin and LLVM dialects reach LLVM IR here.
++        registerBuiltinDialectTranslation(registry);
++        registerLLVMDialectTranslation(registry);
+       });
+ }
+ 
