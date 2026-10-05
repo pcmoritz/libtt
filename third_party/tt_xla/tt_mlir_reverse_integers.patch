@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 --- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 +++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
-@@ -150,19 +150,37 @@
+@@ -150,19 +150,33 @@
      current =
          rewriter.create<ttir::ReshapeOp>(loc, flatType, current, shapeAttr);
  
@@ -20,13 +20,9 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +        intType && intType.getWidth() >= 16) {
 +      auto rowIdxType = RankedTensorType::get(flatShape, rewriter.getI32Type(),
 +                                              inputType.getEncoding());
-+      Value rows = rewriter.create<ttir::ArangeOp>(
-+          loc, rowIdxType, /*start=*/0, /*end=*/nReversing, /*step=*/1,
++      Value reversedRows = rewriter.create<ttir::ArangeOp>(
++          loc, rowIdxType, /*start=*/nReversing - 1, /*end=*/-1, /*step=*/-1,
 +          /*arange_dimension=*/0);
-+      Value last = rewriter.create<ttir::FullOp>(
-+          loc, rowIdxType, rewriter.getI32IntegerAttr(nReversing - 1));
-+      Value reversedRows =
-+          rewriter.create<ttir::SubtractOp>(loc, rowIdxType, last, rows);
 +      current = rewriter.create<ttir::GatherOp>(loc, flatType, current,
 +                                                reversedRows,
 +                                                rewriter.getI32IntegerAttr(0));
