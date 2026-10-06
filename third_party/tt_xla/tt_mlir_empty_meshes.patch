@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 --- a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 +++ b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
-@@ -10,9 +10,11 @@
+@@ -10,6 +10,7 @@
  #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
  
  #include "mlir/AsmParser/AsmParser.h"
@@ -9,11 +9,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
  #include "mlir/IR/IRMapping.h"
  #include "llvm/Support/Error.h"
  
-+#include "shardy/dialect/sdy/ir/utils.h"
- #include "stablehlo/dialect/StablehloOps.h"
- 
- #include <numeric>
-@@ -102,8 +104,474 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
+@@ -102,8 +103,428 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
    addMeshToModule(module, meshName, meshMap);
  }
  
@@ -102,11 +98,9 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +  llvm::SmallVector<llvm::SmallVector<int64_t>> byDevice;
 +};
 +
-+// A prime-sized sub-axis of a target mesh axis.
-+struct Digit {
-+  llvm::StringRef axis;
-+  int64_t axisSize;
-+  int64_t preSize;
++// A target mesh axis and every device's coordinate on it.
++struct TargetAxis {
++  llvm::StringRef name;
 +  int64_t size;
 +  llvm::SmallVector<int64_t> values;
 +};
@@ -118,77 +112,48 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +  return ref ? ref.getValue() : llvm::StringRef();
 +}
 +
-+static llvm::SmallVector<Digit> digitsOf(const MeshCoordinates &target) {
-+  llvm::SmallVector<Digit> digits;
++static llvm::SmallVector<TargetAxis>
++targetAxesOf(const MeshCoordinates &target) {
++  llvm::SmallVector<TargetAxis> axes;
 +  for (mlir::sdy::MeshAxisAttr axis : target.mesh.getAxes()) {
-+    int64_t preSize = 1, rest = axis.getSize();
-+    for (int64_t factor = 2; rest > 1; ++factor) {
-+      for (; rest % factor == 0; rest /= factor, preSize *= factor) {
-+        digits.push_back({axis.getName(), axis.getSize(), preSize, factor,
-+                          target.values(axis.getName(), preSize, factor)});
-+      }
-+    }
++    axes.push_back({axis.getName(), axis.getSize(),
++                    target.values(axis.getName(), 1, axis.getSize())});
 +  }
-+  return digits;
++  return axes;
 +}
 +
-+// `values` (one per device, in [0, size)) as a major-to-minor combination of
-+// target digits, like the device-to-tile maps XLA derives from shardings.
-+static std::optional<llvm::SmallVector<const Digit *>>
++// `values` (one per device, in [0, size)) as a major-to-minor sequence of
++// whole target axes, like the device-to-tile maps XLA derives from shardings.
++// Only whole axes: tt-mlir does not support sub-axes in shardings.
++static std::optional<llvm::SmallVector<const TargetAxis *>>
 +decompose(llvm::ArrayRef<int64_t> values, int64_t size,
-+          llvm::ArrayRef<Digit> digits,
-+          llvm::SmallVector<const Digit *> &used) {
++          llvm::ArrayRef<TargetAxis> axes,
++          llvm::SmallVector<const TargetAxis *> &used) {
 +  if (size == 1) {
-+    return llvm::SmallVector<const Digit *>();
++    return llvm::SmallVector<const TargetAxis *>();
 +  }
-+  for (const Digit &digit : digits) {
-+    if (size % digit.size != 0 || llvm::is_contained(used, &digit)) {
++  for (const TargetAxis &axis : axes) {
++    if (size % axis.size != 0 || llvm::is_contained(used, &axis)) {
 +      continue;
 +    }
-+    int64_t minor = size / digit.size;
++    int64_t minor = size / axis.size;
 +    bool matches = true;
 +    llvm::SmallVector<int64_t> rest;
-+    for (auto [value, digitValue] : llvm::zip_equal(values, digit.values)) {
-+      matches &= value / minor == digitValue;
++    for (auto [value, axisValue] : llvm::zip_equal(values, axis.values)) {
++      matches &= value / minor == axisValue;
 +      rest.push_back(value % minor);
 +    }
 +    if (!matches) {
 +      continue;
 +    }
-+    used.push_back(&digit);
-+    if (auto tail = decompose(rest, minor, digits, used)) {
-+      tail->insert(tail->begin(), &digit);
++    used.push_back(&axis);
++    if (auto tail = decompose(rest, minor, axes, used)) {
++      tail->insert(tail->begin(), &axis);
 +      return tail;
 +    }
 +    used.pop_back();
 +  }
 +  return std::nullopt;
-+}
-+
-+// A digit as an axis ref: the whole axis when the digit spans it.
-+static mlir::sdy::AxisRefAttr digitRef(mlir::MLIRContext *context,
-+                                       const Digit &digit) {
-+  if (digit.preSize == 1 && digit.size == digit.axisSize) {
-+    return mlir::sdy::AxisRefAttr::get(context, digit.axis);
-+  }
-+  return mlir::sdy::AxisRefAttr::get(context, digit.axis, digit.preSize,
-+                                     digit.size);
-+}
-+
-+// `refs` with each run of consecutive sub-axes of one axis joined, keeping
-+// their order, as Shardy wants such a run written as one (sub-)axis.
-+static llvm::SmallVector<mlir::sdy::AxisRefAttr>
-+mergeAdjacent(llvm::ArrayRef<mlir::sdy::AxisRefAttr> refs,
-+              mlir::sdy::MeshAttr mesh) {
-+  llvm::SmallVector<mlir::sdy::AxisRefAttr> merged;
-+  for (mlir::sdy::AxisRefAttr ref : refs) {
-+    if (!merged.empty() && merged.back().canMerge(ref)) {
-+      merged.back() = merged.back().merge(ref, mesh);
-+    } else {
-+      merged.push_back(ref);
-+    }
-+  }
-+  return merged;
 +}
 +
 +// The mesh `mesh` becomes as a target: size-one axes go when it has more than
@@ -233,9 +198,8 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +} // namespace
 +
 +// How the module reads on `targetOp`'s mesh, or none when it cannot read on
-+// it in a form tt-mlir compiles: every axis used on any of `meshOps` must be
-+// expressible through target axes, without sub-axes, which tt-mlir does not
-+// support in shardings, and manual axes must become whole target axes.
++// it in a form tt-mlir compiles: every axis used on any of `meshOps`, manual
++// axes included, must be a sequence of whole target axes.
 +static std::optional<MeshRewritePlan>
 +planMeshRewrite(mlir::ModuleOp module, llvm::ArrayRef<mlir::sdy::MeshOp> meshOps,
 +                llvm::ArrayRef<int64_t> devices, mlir::sdy::MeshOp targetOp) {
@@ -267,10 +231,10 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +    return std::nullopt;
 +  }
 +
-+  llvm::SmallVector<Digit> digits =
-+      digitsOf(MeshCoordinates(*target, devices));
-+  // A (sub-)axis of a mesh, as a function of the device, through target
-+  // digits, major to minor.
++  llvm::SmallVector<TargetAxis> targetAxes =
++      targetAxesOf(MeshCoordinates(*target, devices));
++  // (Sub-)axes of a mesh, as functions of the device, through target axes,
++  // major to minor.
 +  auto express = [&](llvm::StringRef mesh,
 +                     llvm::ArrayRef<mlir::sdy::AxisRefAttr> refs)
 +      -> std::optional<llvm::SmallVector<mlir::sdy::AxisRefAttr>> {
@@ -283,27 +247,26 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +        preSize = subAxis.getPreSize();
 +        size = subAxis.getSize();
 +      }
-+      llvm::SmallVector<const Digit *> used;
-+      auto refDigits =
++      llvm::SmallVector<const TargetAxis *> used;
++      auto axes =
 +          decompose(meshCoordinates.values(ref.getName(), preSize, size), size,
-+                    digits, used);
-+      if (!refDigits) {
++                    targetAxes, used);
++      if (!axes) {
 +        return std::nullopt;
 +      }
-+      for (const Digit *digit : *refDigits) {
-+        result.push_back(digitRef(context, *digit));
++      for (const TargetAxis *axis : *axes) {
++        result.push_back(mlir::sdy::AxisRefAttr::get(context, axis->name));
 +      }
 +    }
 +    return result;
 +  };
-+  auto hasSubAxis = [](llvm::ArrayRef<mlir::sdy::AxisRefAttr> refs) {
-+    return llvm::any_of(refs, [](mlir::sdy::AxisRefAttr ref) {
-+      return bool(ref.getSubAxisInfo());
-+    });
++  auto inMeshOrder = [&](llvm::SmallVector<mlir::sdy::AxisRefAttr> refs) {
++    llvm::sort(refs, mlir::sdy::AxisRefAttr::getMeshComparator(*target));
++    return refs;
 +  };
 +
 +  // Tensor shardings keep each dimension's axis order; replicated and
-+  // unreduced axes go in mesh order.
++  // unreduced axes go in the target's order.
 +  auto rewrite = [&](mlir::sdy::TensorShardingAttr sharding)
 +      -> std::optional<mlir::sdy::TensorShardingAttr> {
 +    llvm::StringRef mesh = meshName(sharding);
@@ -313,26 +276,17 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +      if (!axes) {
 +        return std::nullopt;
 +      }
-+      llvm::SmallVector<mlir::sdy::AxisRefAttr> merged =
-+          mergeAdjacent(*axes, *target);
-+      if (hasSubAxis(merged)) {
-+        return std::nullopt;
-+      }
 +      dims.push_back(mlir::sdy::DimensionShardingAttr::get(
-+          context, merged, dim.getIsClosed(), dim.getPriority()));
++          context, *axes, dim.getIsClosed(), dim.getPriority()));
 +    }
 +    auto replicated = express(mesh, sharding.getReplicatedAxes());
 +    auto unreduced = express(mesh, sharding.getUnreducedAxes());
 +    if (!replicated || !unreduced) {
 +      return std::nullopt;
 +    }
-+    mlir::sdy::sortAndMergeAxes(*replicated, *target);
-+    mlir::sdy::sortAndMergeAxes(*unreduced, *target);
-+    if (hasSubAxis(*replicated) || hasSubAxis(*unreduced)) {
-+      return std::nullopt;
-+    }
-+    return mlir::sdy::TensorShardingAttr::get(context, targetOp.getSymName(),
-+                                              dims, *replicated, *unreduced);
++    return mlir::sdy::TensorShardingAttr::get(
++        context, targetOp.getSymName(), dims, inMeshOrder(*replicated),
++        inMeshOrder(*unreduced));
 +  };
 +
 +  bool expressible = true;
@@ -379,12 +333,8 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +        if (!axes) {
 +          return mlir::WalkResult::interrupt();
 +        }
-+        mlir::sdy::sortAndMergeAxes(*axes, *target);
-+        if (hasSubAxis(*axes)) {
-+          return mlir::WalkResult::interrupt();
-+        }
 +        llvm::SmallVector<mlir::StringAttr> names;
-+        for (mlir::sdy::AxisRefAttr axis : *axes) {
++        for (mlir::sdy::AxisRefAttr axis : inMeshOrder(*axes)) {
 +          names.push_back(mlir::StringAttr::get(context, axis.getName()));
 +        }
 +        plan.manualAxes.emplace_back(
@@ -488,7 +438,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
    auto meshOps = getMeshOps(module);
    if (meshOps.empty()) {
      return mlir::success();
-@@ -132,6 +600,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
+@@ -132,6 +553,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
    if (meshRank == 1) {
      axisName = meshOps[0].getMeshAttr().getAxes()[0].getName().str();
      axisSize = meshShape[0];
