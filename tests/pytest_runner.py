@@ -4,6 +4,7 @@
 import argparse
 import os
 from pathlib import Path
+import pwd
 import sys
 import zipfile
 
@@ -40,6 +41,13 @@ def main() -> int:
     with zipfile.ZipFile(plugin_wheel) as wheel:
         wheel.extractall(plugin_root)
     sys.path.insert(0, str(plugin_root))
+
+    # Bazel sets HOME to the per-run TEST_TMPDIR, where tt-metal keeps its
+    # compiled-kernel cache (~/.cache/tt-metal-cache), so every run recompiled
+    # every kernel. Device tests run unsandboxed: use the real home directory so
+    # the cache persists like it does outside Bazel. TT_METAL_CACHE still wins.
+    if os.environ.get("HOME") == os.environ.get("TEST_TMPDIR"):
+        os.environ["HOME"] = pwd.getpwuid(os.getuid()).pw_dir
 
     os.environ.pop("TT_METAL_RUNTIME_ROOT", None)
     os.environ.pop("PJRT_NAMES_AND_LIBRARY_PATHS", None)
