@@ -403,6 +403,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_host_shards.patch",
         "//third_party/tt_xla:tt_xla_program_device_count.patch",
         "//third_party/tt_xla:tt_xla_device_assignment_order.patch",
+        "//third_party/tt_xla:tt_xla_parameter_shardings.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )

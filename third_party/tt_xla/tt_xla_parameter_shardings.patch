@@ -1,0 +1,153 @@
+diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc
+--- a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc
++++ b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc
+@@ -27,6 +27,7 @@
+ #include "mlir/IR/Types.h"
+ #include "mlir/Support/LLVM.h"
+ #include "shardy/dialect/sdy/ir/dialect.h"
++#include "ttmlir/Dialect/StableHLO/Utils/GSPMDUtils.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+ 
+ #include "mlir/Pass/PassManager.h"
+@@ -411,6 +412,11 @@ cleanForXlaIngestion(mlir::OwningOpRef<mlir::ModuleOp> &mlir_module) {
+   llvm::SmallVector<mlir::sdy::MeshOp> meshOps;
+   module.walk([&](mlir::sdy::MeshOp op) { meshOps.push_back(op); });
+ 
++  // JAX queries parameter shardings from the module metadata, not the
++  // parameter instructions, and keeps an argument's sharding unspecified, so
++  // it cannot place the argument, when the module has none for it.
++  llvm::SmallVector<mlir::Attribute> inputShardings(main.getNumArguments());
++
+   // Extract out shardings and simplify the main funcop only when manual
+   // computation ops are present (shardy path). When they are not present
+   // (non-shardy path), we still need to strip sdy.mesh ops and TT dialect
+@@ -422,9 +428,8 @@ cleanForXlaIngestion(mlir::OwningOpRef<mlir::ModuleOp> &mlir_module) {
+     auto meshOp = meshOps.front();
+ 
+     auto manualComputationOp = manualComputationOps.front();
+-    // JAX queries parameter shardings from the module metadata, not the
+-    // parameter instructions. Preserve them before removing the function body.
+-    llvm::SmallVector<mlir::Attribute> inputShardings(main.getNumArguments());
++    // Preserve the shardings of the arguments the manual computation takes
++    // before removing the function body.
+     for (auto [operand, sharding] :
+          llvm::zip(manualComputationOp.getOperands(),
+                    manualComputationOp.getInShardings().getShardings())) {
+@@ -441,13 +446,6 @@ cleanForXlaIngestion(mlir::OwningOpRef<mlir::ModuleOp> &mlir_module) {
+                                    meshOp.getMeshAttr()));
+       }
+     }
+-    if (llvm::all_of(inputShardings,
+-                     [](mlir::Attribute attr) { return bool(attr); })) {
+-      module->setAttr(
+-          "mhlo.spmd_parameters_shardings",
+-          mlir::ArrayAttr::get(module.getContext(), inputShardings));
+-    }
+-
+     auto outShardingResult = internal::extractSdyManualComputationOutSharding(
+         manualComputationOp, meshOp.getMeshAttr());
+ 
+@@ -475,6 +473,48 @@ cleanForXlaIngestion(mlir::OwningOpRef<mlir::ModuleOp> &mlir_module) {
+     return tt_pjrt_status::kInternal;
+   }
+ 
++  // Without a manual computation or GSPMD annotations to tell JAX the
++  // shardings, a program for one chip takes and gives everything replicated,
++  // and other programs take their arguments as declared, or replicated.
++  bool declaredOnly = manualComputationOps.empty() &&
++                      !mlir::tt::gspmd_utils::gspmdAnnotationsExist(module);
++  bool oneChip = meshOps.empty() ||
++                 llvm::all_of(meshOps.front().getMeshAttr().getAxes(),
++                              [](mlir::sdy::MeshAxisAttr axis) {
++                                return axis.getSize() == 1;
++                              });
++  for (unsigned index = 0; declaredOnly && index < inputShardings.size();
++       ++index) {
++    if (inputShardings[index]) {
++      continue;
++    }
++    auto declared = main.getArgAttrOfType<mlir::sdy::TensorShardingAttr>(
++        index, mlir::sdy::TensorShardingAttr::name);
++    inputShardings[index] = mlir::StringAttr::get(
++        module.getContext(),
++        declared && !unsharded[index] && !oneChip && meshOps.size() == 1
++            ? internal::extractHloShardingString(declared,
++                                                 meshOps.front().getMeshAttr())
++            : std::string("{replicated}"));
++  }
++  if (llvm::all_of(inputShardings,
++                   [](mlir::Attribute attr) { return bool(attr); })) {
++    module->setAttr("mhlo.spmd_parameters_shardings",
++                    mlir::ArrayAttr::get(module.getContext(), inputShardings));
++  }
++  if (declaredOnly && oneChip && main.getNumResults() > 0 &&
++      !module->hasAttr("mhlo.spmd_output_sharding")) {
++    llvm::SmallVector<std::string> replicated(main.getNumResults(),
++                                              "{replicated}");
++    std::string outputShardings = "{";
++    llvm::raw_string_ostream os(outputShardings);
++    llvm::interleave(replicated, os, ",");
++    outputShardings += "}";
++    module->setAttr(
++        "mhlo.spmd_output_sharding",
++        mlir::StringAttr::get(module.getContext(), outputShardings));
++  }
++
+   // Remove sdy.mesh operations
+   for (auto meshOp : meshOps) {
+     meshOp.erase();
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -712,10 +712,11 @@ std::optional<tt::runtime::Device> ClientInstance::getOrCreateSubMesh(
+   }
+   const uint32_t rows = target_mesh_shape[0];
+   const uint32_t cols = target_mesh_shape[1];
+-  // Programs over every chip run on the mesh itself until one over some of
+-  // them comes along.
+-  if (rows * cols <= 1 || rows * cols > num_chips ||
+-      (rows * cols == num_chips && !m_root_mesh.has_value())) {
++  // Programs over one or every chip run on a mesh of their own until one over
++  // some of them comes along.
++  if (rows * cols < 1 || rows * cols > num_chips ||
++      ((rows * cols == 1 || rows * cols == num_chips) &&
++       !m_root_mesh.has_value())) {
+     return std::nullopt;
+   }
+ 
+diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
+@@ -120,6 +120,16 @@ LoadedExecutableInstance::getOrCreateMeshDevice(
+     }
+   }
+ 
++  // JAX places a replicated input on every device of the assignment even for
++  // a program compiled for one chip; run on the first device's copy, whose
++  // result then stands for every device.
++  if (mesh_shape_num_devices == 1 && device_ids.size() > 1 && num_args > 0 &&
++      num_devices > 0) {
++    device_ids = {BufferInstance::unwrap(argument_lists[0][0])
++                      ->getDevice()
++                      ->getGlobalDeviceId()};
++  }
++
+   if (device_ids.size() != mesh_shape_num_devices) {
+     LOG_F(ERROR,
+           "Input buffers are placed on a different number of devices (%zu) "
+@@ -181,6 +191,15 @@ tt_pjrt_status LoadedExecutableInstance::getInputRuntimeTensors(
+     size_t num_devices, const tt::runtime::Device &runtime_device,
+     std::uint32_t program_index,
+     std::vector<tt::runtime::Tensor> &input_tensors) {
++  // A program for one chip takes the first device's copy of its replicated
++  // inputs.
++  const std::vector<std::uint32_t> &devices_mesh_shape =
++      m_executable_image->getDevicesMeshShape();
++  if (std::accumulate(devices_mesh_shape.begin(), devices_mesh_shape.end(), 1,
++                      std::multiplies<std::uint32_t>{}) == 1) {
++    num_devices = std::min<size_t>(num_devices, 1);
++  }
++
+   for (size_t arg_index = 0; arg_index < num_args; ++arg_index) {
+     std::vector<BufferInstance *> arg_buffers;
+     arg_buffers.reserve(num_devices);
