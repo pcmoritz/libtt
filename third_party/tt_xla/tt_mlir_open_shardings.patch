@@ -1,0 +1,16 @@
+diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
+--- a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
++++ b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
+@@ -1026,10 +1026,8 @@ llvm::Expected<bool> parseSdySharding(mlir::sdy::TensorShardingAttr sdySharding,
+     meshShape.push_back(meshAxisAttr.getSize());
+   }
+ 
+-  if (!sdySharding.isFullyClosed()) {
+-    return llvm::createStringError(
+-        "Sharding with open dimension is currently not supported.");
+-  }
++  // An open dimension may be sharded further, but the tensor is laid out by
++  // the axes it names so far, so read it as closed.
+ 
+   // Iterate each dimSharding in TensorShardingAttr.
+   for (auto [dimIdx, dimSharding] :
