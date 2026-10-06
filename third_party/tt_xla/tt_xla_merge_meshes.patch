@@ -1,0 +1,26 @@
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -58,6 +58,7 @@
+ #include "ttmlir/Dialect/StableHLO/Utils/CollectMeshShardings.h"
+ #include "ttmlir/Dialect/StableHLO/Utils/GSPMDUtils.h"
+ #include "ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h"
++#include "ttmlir/Dialect/StableHLO/Utils/ShardyUtils.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+ #include "ttmlir/Dialect/TTIR/Pipelines/TTIRPipelines.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Passes.h"
+@@ -663,6 +664,14 @@ tt_pjrt_status ModuleBuilder::runFrontendSHLOPipeline(
+     const std::optional<std::string> &export_path,
+     const std::string &model_name) {
+ 
++  // JAX may give each shard_map or sharding its own mesh; tt-mlir compiles
++  // for one, and the sharding analysis below reads shardings against it.
++  mlir::ModuleOp module = mlir_module.get();
++  if (mlir::failed(mlir::tt::shardy_utils::mergeMeshes(module))) {
++    LOG_F(ERROR, "Failed to merge the module's meshes");
++    return tt_pjrt_status::kInternal;
++  }
++
+   tt_pjrt_status status =
+       frontend_passes::annotateArgumentAttributes(mlir_module);
+ 
