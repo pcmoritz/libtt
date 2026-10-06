@@ -1,0 +1,14 @@
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -676,8 +676,9 @@
+   // TODO(jnie-TT, #1485): This is a temporary way to set trace region size
+   // until we have a proper way for a user to pass device options. After that
+   // this should be removed. Issue for device options:
+   // https://github.com/tenstorrent/tt-xla/issues/1480
+-  std::optional<size_t> traceRegionSize = std::nullopt;
++  // The runtime traces while-loop bodies, which needs a trace region.
++  std::optional<size_t> traceRegionSize = size_t{32} << 20;
+   if (std::getenv("TT_RUNTIME_TRACE_REGION_SIZE") != nullptr) {
+     traceRegionSize = std::stoull(std::getenv("TT_RUNTIME_TRACE_REGION_SIZE"));
+   }

@@ -7,9 +7,17 @@
 #include "tt/runtime/detail/ttnn/program_executor.h"
 #include "tt/runtime/detail/ttnn/ttnn.h"
 #include "tt/runtime/detail/ttnn/utils.h"
+#include "tt/runtime/utils.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <mutex>
+#include <optional>
+#include <map>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -133,6 +141,126 @@ bool readConditionScalar(const ::tt::runtime::Tensor &tensor) {
   });
 }
 
+// Loop bodies are captured into a TT-Metal trace and replayed, which replaces
+// the host dispatch of every body op with one replay per iteration. Set
+// TT_RUNTIME_TRACE_LOOP_BODIES=0 to execute bodies op by op.
+bool loopBodyTracingEnabled() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("TT_RUNTIME_TRACE_LOOP_BODIES");
+    return env == nullptr || std::strcmp(env, "0") != 0;
+  }();
+  return enabled;
+}
+
+// Bodies whose captures failed once, keyed by executable and body program.
+std::mutex untraceableBodiesMutex;
+std::set<std::pair<uint64_t, uint32_t>> untraceableBodies;
+
+// Iterations each condition-driven loop body ran the last time. A capture
+// costs about one iteration of dispatch, so bodies of short loops are not
+// traced again.
+constexpr uint64_t kMinTracedIterations = 8;
+std::mutex lastIterationsMutex;
+std::map<std::pair<uint64_t, uint32_t>, uint64_t> lastIterations;
+
+std::pair<uint64_t, uint32_t> bodyKey(ProgramContext &context,
+                                      uint32_t programId) {
+  return {context.getExecutableHandle().id(), programId};
+}
+
+// A trace records device commands only: anything that talks to the host
+// (transfers, readbacks, nested control flow, CPU-hoisted ops) cannot be
+// captured. Bodies with such ops, or with any result outside device memory,
+// run op by op.
+bool isTraceableBody(ProgramContext &context, uint32_t programId,
+                     size_t stateSize) {
+  {
+    std::lock_guard lock(untraceableBodiesMutex);
+    if (untraceableBodies.count(bodyKey(context, programId))) {
+      return false;
+    }
+  }
+  using ::tt::target::ttnn::OpType;
+  const auto *program =
+      utils::getProgram(context.getExecutableHandle(), programId);
+  // Body inputs past the loop state are captures, which the loop never
+  // changes.
+  std::set<uint32_t> captureIds;
+  for (size_t i = stateSize; i < program->inputs()->size(); ++i) {
+    captureIds.insert(program->inputs()->Get(i)->global_id());
+  }
+  for (const auto *operation : *program->operations()) {
+    switch (operation->type_type()) {
+    case OpType::LoadCachedOp: {
+      // Cached constants computed from captures are filled by the first
+      // iteration and then only looked up. Ones computed from loop state would
+      // rerun the constant program (and are keyed by tensor versions, which
+      // slot updates do not bump), so such bodies are not traced.
+      for (const auto *input : *operation->type_as_LoadCachedOp()->inputs()) {
+        if (!captureIds.count(input->global_id())) {
+          return false;
+        }
+      }
+      continue;
+    }
+    case OpType::WhileLoopOp:
+    case OpType::WhileOp:
+    case OpType::CaseOp:
+    case OpType::CpuOp:
+    case OpType::FuncCallOp:
+    case OpType::FromDeviceOp:
+    case OpType::ToDeviceOp:
+    case OpType::CaptureOrExecuteTraceOp:
+    case OpType::BeginTraceCaptureOp:
+    case OpType::EndTraceCaptureOp:
+    case OpType::ExecuteTraceOp:
+    case OpType::WriteTensorOp:
+    case OpType::DumpTensorOp:
+    case OpType::LoadTensorOp:
+    case OpType::PrintOp:
+    case OpType::BreakpointOp:
+    case OpType::MemorySnapshotOp:
+    case OpType::CreateGlobalSemaphoreOp:
+    case OpType::ResetGlobalSemaphoreOp:
+    case OpType::AllocateMoeComputeSemaphoreOp:
+      return false;
+    default:
+      break;
+    }
+    try {
+      auto opHandle = ::tt::runtime::utils::unsafeBorrowShared(
+          const_cast<::tt::target::ttnn::Operation *>(operation));
+      for (const auto &ref :
+           getOpOutputRefs(OpContext(opHandle, DeviceRuntime::TTNN))) {
+        if (!utils::inDeviceMemory(
+                &ref.as<::tt::target::ttnn::TensorRef>(DeviceRuntime::TTNN))) {
+          return false;
+        }
+      }
+    } catch (const std::exception &) {
+      // Op types the ref helper does not know are treated as untraceable.
+      return false;
+    }
+  }
+  return true;
+}
+
+bool isDeviceTensor(const ::tt::runtime::Tensor &tensor) {
+  return tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
+             .getTensor()
+             .storage_type() == ::ttnn::StorageType::DEVICE;
+}
+
+// Tensors that share storage share the mesh buffer object.
+const void *bufferOf(const ::tt::runtime::Tensor &tensor) {
+  const ::ttnn::Tensor &ttnnTensor =
+      tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
+  return ttnnTensor.storage_type() == ::ttnn::StorageType::DEVICE &&
+                 ttnnTensor.is_allocated()
+             ? &ttnnTensor.mesh_buffer()
+             : nullptr;
+}
+
 } // namespace
 
 void run(const ::tt::target::ttnn::WhileLoopOp *op,
@@ -183,16 +311,191 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
     }
   };
 
+  // After one untraced iteration has populated the program cache, the body is
+  // captured once into a trace against persistent per-state slots, and every
+  // further iteration is a single replay. The trace ends by copying each new
+  // state value into its slot, so the next replay and the condition program
+  // read the current state from the same buffers.
+  ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();
+  std::optional<::ttnn::MeshTraceId> bodyTrace;
+  struct ReleaseTrace {
+    ::ttnn::MeshDevice &device;
+    std::optional<::ttnn::MeshTraceId> &trace;
+    ~ReleaseTrace() {
+      if (trace) {
+        device.mesh_command_queue(0).finish();
+        ::ttnn::operations::trace::release_trace(&device, *trace);
+      }
+    }
+  } releaseTrace{meshDevice, bodyTrace};
+  const std::vector<::tt::runtime::Tensor> callerInputs = inputs;
+  bool captureAttempted = false;
+
+  std::vector<uint32_t> updated(op->output_indices()->begin(),
+                                op->output_indices()->end());
+
+  // Runs the body on the state slots and writes each new state value back into
+  // its slot. Results that are themselves state slots (e.g. a body that swaps
+  // two values) are read before any slot is overwritten.
+  auto runBodyIntoSlots = [&](std::vector<::tt::runtime::Tensor> &bodyOutputs) {
+    bodyOutputs = execute(op->program_id());
+    LOG_ASSERT(bodyOutputs.size() == updated.size(),
+               "While loop body output arity mismatch");
+    std::vector<std::pair<::ttnn::Tensor, uint32_t>> writes;
+    for (size_t i = 0; i < bodyOutputs.size(); ++i) {
+      const void *buffer = bufferOf(bodyOutputs[i]);
+      if (buffer == bufferOf(inputs[updated[i]])) {
+        continue;
+      }
+      ::ttnn::Tensor value =
+          bodyOutputs[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
+      if (std::any_of(updated.begin(), updated.end(), [&](uint32_t state) {
+            return bufferOf(inputs[state]) == buffer;
+          })) {
+        value = ::ttnn::clone(value, std::nullopt, std::nullopt, std::nullopt);
+      }
+      writes.emplace_back(std::move(value), updated[i]);
+    }
+    for (auto &[value, state] : writes) {
+      const ::ttnn::Tensor &slot =
+          inputs[state].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
+      if (value.layout() != slot.layout() || value.dtype() != slot.dtype() ||
+          value.memory_config() != slot.memory_config()) {
+        value = ::ttnn::to_layout(value, slot.layout(), slot.dtype(),
+                                  slot.memory_config());
+      }
+      ::ttnn::copy(value, slot);
+    }
+  };
+
+  // Runs the current iteration untraced against the state slots, which also
+  // brings every program the trace will contain into the program cache (a
+  // trace cannot load new binaries), then captures the body for the following
+  // iterations.
+  auto runIterationAndCaptureBody = [&] {
+    // Replays write into the updated state buffers, so each must be private
+    // to the loop: not shared with another state value, a capture, or a
+    // tensor the enclosing program still owns.
+    for (uint32_t state : updated) {
+      const void *buffer = bufferOf(inputs[state]);
+      bool shared = false;
+      for (size_t j = 0; j < inputs.size(); ++j) {
+        shared |= j != state && bufferOf(inputs[j]) == buffer;
+      }
+      for (const auto &callerInput : callerInputs) {
+        shared |= bufferOf(callerInput) == buffer;
+      }
+      shared &= buffer != nullptr;
+      if (shared) {
+        inputs[state] = utils::createRuntimeTensorFromTTNN(::ttnn::clone(
+            inputs[state].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor(),
+            std::nullopt, std::nullopt, std::nullopt));
+        retention.retain(inputs[state]);
+      }
+    }
+
+    // If writing a result into its slot is unsupported (e.g. a dtype the copy
+    // ops do not handle), hand the results over as plain state instead; only
+    // the loop's own slots were written, and they are all replaced.
+    std::vector<::tt::runtime::Tensor> bodyOutputs;
+    try {
+      runBodyIntoSlots(bodyOutputs);
+    } catch (const std::exception &error) {
+      LOG_ASSERT(bodyOutputs.size() == updated.size(),
+                 "While loop body failed: ", error.what());
+      for (size_t i = 0; i < bodyOutputs.size(); ++i) {
+        retention.retain(bodyOutputs[i]);
+        inputs[updated[i]] = std::move(bodyOutputs[i]);
+      }
+      LOG_WARNING("Running while loop body op by op; cannot update its state "
+                  "in place: ",
+                  error.what());
+      std::lock_guard lock(untraceableBodiesMutex);
+      untraceableBodies.insert(bodyKey(context, op->program_id()));
+      return;
+    }
+    bodyOutputs.clear();
+
+    auto &queue = meshDevice.mesh_command_queue(0);
+    queue.finish();
+    ::ttnn::MeshTraceId trace = ::ttnn::operations::trace::begin_trace_capture(
+        &meshDevice, ::ttnn::QueueId(0));
+    try {
+      runBodyIntoSlots(bodyOutputs);
+      bodyOutputs.clear();
+      ::ttnn::operations::trace::end_trace_capture(&meshDevice, trace,
+                                                   ::ttnn::QueueId(0));
+    } catch (const std::exception &error) {
+      // Nothing was executed during the capture, so the slots still hold the
+      // current state and the loop can continue op by op, provided the queue
+      // has left capture mode. Otherwise later commands would be recorded
+      // instead of executed, so fail loudly rather than return wrong results.
+      try {
+        if (queue.trace_id().has_value()) {
+          ::ttnn::operations::trace::end_trace_capture(&meshDevice, trace,
+                                                       ::ttnn::QueueId(0));
+        }
+        ::ttnn::operations::trace::release_trace(&meshDevice, trace);
+      } catch (const std::exception &) {
+      }
+      if (queue.trace_id().has_value()) {
+        throw;
+      }
+      LOG_WARNING("Running while loop body op by op; trace capture failed: ",
+                  error.what());
+      std::lock_guard lock(untraceableBodiesMutex);
+      untraceableBodies.insert(bodyKey(context, op->program_id()));
+      return;
+    }
+    bodyTrace = trace;
+  };
+
+  // `completed` iterations have run; `remaining` is known for counted loops.
+  auto runIteration = [&](uint64_t completed,
+                          std::optional<uint64_t> remaining) {
+    // Decide once, after the first iteration: tracing pays off when at least
+    // two replays follow the capture iteration.
+    if (!captureAttempted && completed >= 1) {
+      captureAttempted = true;
+      std::optional<uint64_t> previous;
+      if (!remaining) {
+        std::lock_guard lock(lastIterationsMutex);
+        auto it = lastIterations.find(bodyKey(context, op->program_id()));
+        if (it != lastIterations.end()) {
+          previous = it->second;
+        }
+      }
+      if (remaining.value_or(3) >= 3 &&
+          previous.value_or(kMinTracedIterations) >= kMinTracedIterations &&
+          loopBodyTracingEnabled() &&
+          meshDevice.get_program_cache().is_enabled() &&
+          std::all_of(inputs.begin(), inputs.end(), isDeviceTensor) &&
+          isTraceableBody(context, op->program_id(), stateSize)) {
+        runIterationAndCaptureBody();
+        return;
+      }
+    }
+    if (bodyTrace) {
+      ::ttnn::operations::trace::execute_trace(&meshDevice, *bodyTrace,
+                                               ::ttnn::QueueId(0),
+                                               /*blocking=*/false);
+      return;
+    }
+    executeBody();
+  };
+
   if (op->condition_program_id() >= 0) {
-    while (true) {
+    for (uint64_t completed = 0;; ++completed) {
       std::vector<::tt::runtime::Tensor> conditionOutputs =
           execute(static_cast<uint32_t>(op->condition_program_id()));
       LOG_ASSERT(conditionOutputs.size() == 1,
                  "Loop condition must return one value");
       if (!readConditionScalar(conditionOutputs.front())) {
+        std::lock_guard lock(lastIterationsMutex);
+        lastIterations[bodyKey(context, op->program_id())] = completed;
         break;
       }
-      executeBody();
+      runIteration(completed, std::nullopt);
     }
   } else {
     int64_t initial = getBound(op->initial());
@@ -207,7 +510,7 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
                   static_cast<uint64_t>(step);
     }
     for (uint64_t iteration = 0; iteration < tripCount; ++iteration) {
-      executeBody();
+      runIteration(iteration, tripCount - iteration);
     }
   }
 
