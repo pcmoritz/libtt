@@ -1,0 +1,18 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -8051,9 +8051,11 @@ mlir::tt::ttnn::PagedFlashMultiLatentAttentionDecodeOp::verify() {
+   }
+   if (constantsPresent == 4) {
+     SmallVector<int64_t> squareConstantShape = {1, 1, chunkSize, chunkSize};
+-    for (auto [name, value] :
+-         llvm::zip_equal(ArrayRef<StringRef>({"eye", "tril", "ones"}),
+-                         ArrayRef<Value>({getEye(), getTril(), getOnes()}))) {
++    // Named arrays: a range-for destroys temporaries in its range expression
++    // before the body runs, so ArrayRefs to braced lists would dangle.
++    const StringRef names[] = {"eye", "tril", "ones"};
++    const Value values[] = {getEye(), getTril(), getOnes()};
++    for (auto [name, value] : llvm::zip_equal(names, values)) {
+       RankedTensorType type = cast<RankedTensorType>(value.getType());
+       if (!type.getElementType().isF32() ||
+           type.getShape() != ArrayRef<int64_t>(squareConstantShape)) {

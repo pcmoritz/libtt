@@ -499,6 +499,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_large_zero_tensor_initialization.patch",
         "//third_party/tt_xla:tt_mlir_cached_output_ownership.patch",
         "//third_party/tt_xla:tt_mlir_recurrent_attention.patch",
+        "//third_party/tt_xla:tt_mlir_chunk_gdn_verifier_lifetime.patch",
         "//third_party/tt_xla:tt_mlir_integer_gather_offsets.patch",
         "//third_party/tt_xla:tt_mlir_dynamic_slice_index_dtype.patch",
         "//third_party/tt_xla:tt_mlir_local_mesh.patch",

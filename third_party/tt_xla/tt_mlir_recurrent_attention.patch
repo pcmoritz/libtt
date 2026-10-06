@@ -64,24 +64,10 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4806,6 +4806,51 @@ def TTNN_ScaledDotProductAttentionOp : TTNN_Op<"scaled_dot_product_attention", [
+@@ -4806,6 +4806,37 @@ def TTNN_ScaledDotProductAttentionOp : TTNN_Op<"scaled_dot_product_attention", [
      let hasVerifier = 1;
  }
  
-+def TTNN_GatedDeltaRuleOp : TTNN_Op<"gated_delta_rule", [OpModelExempt]> {
-+  let summary = "gated delta rule.";
-+  let arguments = (ins AnyRankedTensor:$query,
-+                       AnyRankedTensor:$key,
-+                       AnyRankedTensor:$value,
-+                       AnyRankedTensor:$gate,
-+                       AnyRankedTensor:$beta,
-+                       AnyRankedTensor:$initial_state,
-+                       AnyRankedTensor:$eye,
-+                       AnyRankedTensor:$tril,
-+                       AnyRankedTensor:$ones,
-+                       AnyRankedTensor:$masks);
-+  let results = (outs AnyRankedTensor:$final_state, AnyRankedTensor:$output);
-+}
 +
 +def TTNN_GatedDeltaDecodeOp : TTNN_InplaceOp<"gated_delta_decode", [OpModelExempt]> {
 +  let summary = "gated delta decode.";
@@ -119,24 +105,10 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
 --- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
-@@ -81,6 +81,48 @@ table ScaledDotProductAttentionOp {
+@@ -81,6 +81,34 @@ table ScaledDotProductAttentionOp {
    memcfg: tt.target.ttnn.MemoryConfig;
  }
  
-+table GatedDeltaRuleOp {
-+  query: tt.target.ttnn.TensorRef;
-+  key: tt.target.ttnn.TensorRef;
-+  value: tt.target.ttnn.TensorRef;
-+  gate: tt.target.ttnn.TensorRef;
-+  beta: tt.target.ttnn.TensorRef;
-+  initial_state: tt.target.ttnn.TensorRef;
-+  eye: tt.target.ttnn.TensorRef;
-+  tril: tt.target.ttnn.TensorRef;
-+  ones: tt.target.ttnn.TensorRef;
-+  masks: tt.target.ttnn.TensorRef;
-+  final_state: tt.target.ttnn.TensorRef;
-+  output: tt.target.ttnn.TensorRef;
-+}
 +
 +table GatedDeltaDecodeOp {
 +  cache: tt.target.ttnn.TensorRef;
@@ -171,11 +143,10 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
 --- a/include/ttmlir/Target/TTNN/program.fbs
 +++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -93,6 +93,10 @@ union OpType {
+@@ -93,6 +93,9 @@ union OpType {
    FuncCallOp,
    GatherOp,
    GenericOp,
-+  GatedDeltaRuleOp,
 +  GatedDeltaDecodeOp,
 +  CausalConv1dUpdateOp,
 +  StatePoolUpdateOp,
@@ -270,7 +241,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -3443,6 +3443,86 @@ public:
+@@ -3443,6 +3443,94 @@ public:
  } // namespace
  
  namespace {
@@ -340,7 +311,15 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +    appendConstant(tril, tile);
 +    appendConstant(ones, tile);
 +    appendConstant(masks, 3 * tile);
-+    rewriter.replaceOpWithNewOp<ttnn::GatedDeltaRuleOp>(op, types, operands);
++    // Upstream's op returns (output, final_state); ttir's order is the reverse.
++    auto chunk = rewriter.create<ttnn::ChunkGatedDeltaRuleOp>(
++        op.getLoc(), TypeRange{types[1], types[0]}, operands[0], operands[1],
++        operands[2], operands[3], operands[4], operands[5], operands[6],
++        operands[7], operands[8], operands[9], rewriter.getF32FloatAttr(1.0f),
++        rewriter.getBoolAttr(true), rewriter.getUI32IntegerAttr(tile),
++        rewriter.getBoolAttr(false), rewriter.getBoolAttr(false),
++        /*memory_config=*/nullptr, /*compute_config=*/nullptr);
++    rewriter.replaceOp(op, {chunk.getFinalState(), chunk.getOutput()});
 +    return success();
 +  }
 +};
@@ -357,7 +336,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  class PagedFlashMultiLatentAttentionDecodeOpConversionPattern
      : public OpConversionPattern<ttir::PagedFlashMultiLatentAttentionDecodeOp> {
  public:
-@@ -4012,6 +4092,10 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -4012,6 +4100,10 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
             ScaledDotProductAttentionDecodeOpConversionPattern,
             PagedScaledDotProductAttentionDecodeOpConversionPattern,
             ChunkedScaledDotProductAttentionOpConversionPattern,
@@ -500,27 +479,10 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -3895,6 +3895,63 @@ createOp(FlatbufferObjectCache &cache, ScaledDotProductAttentionOp op) {
+@@ -3895,6 +3895,46 @@ createOp(FlatbufferObjectCache &cache, ScaledDotProductAttentionOp op) {
        slidingWindowSize, attentionSink, out, memoryConfig);
  }
  
-+::flatbuffers::Offset<::tt::target::ttnn::GatedDeltaRuleOp>
-+createOp(FlatbufferObjectCache &cache, GatedDeltaRuleOp op) {
-+  auto tensor = [&](Value value) {
-+    return cache.at<::tt::target::ttnn::TensorRef>(
-+        getOperandThroughDPSOps(value));
-+  };
-+  return ::tt::target::ttnn::CreateGatedDeltaRuleOp(
-+      *cache.fbb, tensor(op.getQuery()), tensor(op.getKey()),
-+      tensor(op.getValue()), tensor(op.getGate()), tensor(op.getBeta()),
-+      tensor(op.getInitialState()), tensor(op.getEye()), tensor(op.getTril()),
-+      tensor(op.getOnes()), tensor(op.getMasks()),
-+      cache.getOrCreateNoSharding(op.getFinalState(), tensorValueToFlatbuffer,
-+                                  std::nullopt),
-+      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
-+                                  std::nullopt));
-+}
-+
 +::flatbuffers::Offset<::tt::target::ttnn::GatedDeltaDecodeOp>
 +createOp(FlatbufferObjectCache &cache, GatedDeltaDecodeOp op) {
 +  auto tensor = [&](Value value) {
@@ -564,14 +526,10 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
  ::flatbuffers::Offset<::tt::target::ttnn::FlashMlaPrefillOp>
  createOp(FlatbufferObjectCache &cache, FlashMlaPrefillOp op) {
    auto query = cache.at<::tt::target::ttnn::TensorRef>(
-@@ -5617,6 +5674,22 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -5617,6 +5657,18 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, scaledDotProductAttentionOp),
                             debugString, locInfo);
    }
-+  if (auto recurrentOp = dyn_cast<GatedDeltaRuleOp>(op)) {
-+    return createOperation(cache, createOp(cache, recurrentOp), debugString,
-+                           locInfo);
-+  }
 +  if (auto recurrentOp = dyn_cast<GatedDeltaDecodeOp>(op)) {
 +    return createOperation(cache, createOp(cache, recurrentOp), debugString,
 +                           locInfo);
@@ -591,14 +549,13 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 new file mode 100644
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,85 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +#include "operations/transformer/recurrent.h"
 +#include "tt/runtime/detail/ttnn/operations/utils.h"
 +#include "tt/runtime/detail/ttnn/ttnn.h"
 +#include "tt/runtime/detail/ttnn/utils.h"
-+#include "ttnn/operations/transformer/chunk_gated_delta_rule/chunk_gated_delta_rule.hpp"
 +#include "ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp"
 +#include "ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp"
 +#include "ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp"
@@ -634,23 +591,6 @@ new file mode 100644
 +                 config.value_or(::ttnn::DRAM_MEMORY_CONFIG)));
 +}
 +} // namespace
-+
-+void run(const ::tt::target::ttnn::GatedDeltaRuleOp *op,
-+         ProgramContext &context) {
-+  auto &pool = context.getTensorPool();
-+  auto get = [&](const auto *ref) -> const ::ttnn::Tensor & {
-+    return pool.getTTNNTensorAndValidate(ref);
-+  };
-+  auto [output, state] = ::ttnn::transformer::chunk_gated_delta_rule(
-+      get(op->query()), get(op->key()), get(op->value()), get(op->gate()),
-+      get(op->beta()), 1.0f,
-+      tiled(get(op->initial_state()), ::ttnn::DataType::FLOAT32), true, 32,
-+      false, false, /*use_mcast=*/true,
-+      ::ttnn::DRAM_MEMORY_CONFIG, std::nullopt, get(op->eye()), get(op->tril()),
-+      get(op->ones()), get(op->masks()));
-+  put(pool, op->final_state(), state.value());
-+  put(pool, op->output(), output);
-+}
 +
 +void run(const ::tt::target::ttnn::GatedDeltaDecodeOp *op,
 +         ProgramContext &context) {
@@ -699,14 +639,12 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.h b/runtime/lib/t
 new file mode 100644
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.h
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,12 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +#pragma once
 +#include "tt/runtime/detail/ttnn/types/types.h"
 +namespace tt::runtime::ttnn::operations::transformer {
-+void run(const ::tt::target::ttnn::GatedDeltaRuleOp *op,
-+         ProgramContext &context);
 +void run(const ::tt::target::ttnn::GatedDeltaDecodeOp *op,
 +         ProgramContext &context);
 +void run(const ::tt::target::ttnn::CausalConv1dUpdateOp *op,
@@ -725,13 +663,10 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
  #include "operations/transformer/rotary_embedding.h"
  #include "operations/transformer/rotary_embedding_llama.h"
  #include "operations/transformer/scaled_dot_product_attention.h"
-@@ -752,6 +753,18 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+@@ -752,6 +753,15 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
      return operations::transformer::run(
          op->type_as_ScaledDotProductAttentionOp(), getContext());
    }
-+  case ::tt::target::ttnn::OpType::GatedDeltaRuleOp:
-+    return operations::transformer::run(op->type_as_GatedDeltaRuleOp(),
-+                                        getContext());
 +  case ::tt::target::ttnn::OpType::GatedDeltaDecodeOp:
 +    return operations::transformer::run(op->type_as_GatedDeltaDecodeOp(),
 +                                        getContext());
