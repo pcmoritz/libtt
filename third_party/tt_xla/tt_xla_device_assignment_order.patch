@@ -1,0 +1,98 @@
+diff --git a/pjrt_implementation/inc/api/compile_options_parser.h b/pjrt_implementation/inc/api/compile_options_parser.h
+--- a/pjrt_implementation/inc/api/compile_options_parser.h
++++ b/pjrt_implementation/inc/api/compile_options_parser.h
+@@ -76,13 +76,13 @@ public:
+   // packed or unpacked).
+   static void extractDeviceIdsFromComputationDevice(
+       const google::protobuf::UnknownFieldSet &comp_device_fields,
+-      std::set<int64_t> &out_device_ids);
++      std::vector<int64_t> &out_device_ids);
+ 
+   // Helper function to extract device IDs from a DeviceAssignmentProto.
+   // ComputationDevice is field number 3 in DeviceAssignmentProto.
+   static void extractDeviceIdsFromDeviceAssignment(
+       const google::protobuf::UnknownFieldSet &device_assign_fields,
+-      std::set<int64_t> &out_device_ids);
++      std::vector<int64_t> &out_device_ids);
+ 
+   // Parse math_fidelity string and convert to OptionalMathFidelity enum.
+   // Returns kSuccess and sets out_math_fidelity if parsing succeeds.
+diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implementation/src/api/compile_options_parser.cc
+--- a/pjrt_implementation/src/api/compile_options_parser.cc
++++ b/pjrt_implementation/src/api/compile_options_parser.cc
+@@ -4,6 +4,9 @@
+ 
+ #include "api/compile_options_parser.h"
+ 
++// c++ standard library includes
++#include <algorithm>
++
+ // PJRT implementation headers
+ #include "api/compile_options.h"
+ 
+@@ -74,9 +77,18 @@ bool CompileOptionsParser::parseNestedProtobufField(
+   return out_fields.ParseFromCodedStream(&input);
+ }
+ 
++// The device assignment lists the devices in partition order, which the
++// executable's devices and the order of its per-device buffers must keep.
++static void appendUnique(std::vector<int64_t> &device_ids, int64_t device_id) {
++  if (std::find(device_ids.begin(), device_ids.end(), device_id) ==
++      device_ids.end()) {
++    device_ids.push_back(device_id);
++  }
++}
++
+ void CompileOptionsParser::extractDeviceIdsFromComputationDevice(
+     const google::protobuf::UnknownFieldSet &comp_device_fields,
+-    std::set<int64_t> &out_device_ids) {
++    std::vector<int64_t> &out_device_ids) {
+   constexpr int kDeviceIdFieldNumber = 1;
+ 
+   for (int i = 0; i < comp_device_fields.field_count(); ++i) {
+@@ -88,7 +100,7 @@ void CompileOptionsParser::extractDeviceIdsFromComputationDevice(
+ 
+     if (field.type() == google::protobuf::UnknownField::TYPE_VARINT) {
+       // Unpacked repeated field
+-      out_device_ids.insert(field.varint());
++      appendUnique(out_device_ids, static_cast<int64_t>(field.varint()));
+     } else if (field.type() ==
+                google::protobuf::UnknownField::TYPE_LENGTH_DELIMITED) {
+       // Packed repeated field
+@@ -99,7 +111,7 @@ void CompileOptionsParser::extractDeviceIdsFromComputationDevice(
+ 
+       uint64_t value;
+       while (packed_stream.ReadVarint64(&value)) {
+-        out_device_ids.insert(static_cast<int64_t>(value));
++        appendUnique(out_device_ids, static_cast<int64_t>(value));
+       }
+     }
+   }
+@@ -107,7 +119,7 @@ void CompileOptionsParser::extractDeviceIdsFromComputationDevice(
+ 
+ void CompileOptionsParser::extractDeviceIdsFromDeviceAssignment(
+     const google::protobuf::UnknownFieldSet &device_assign_fields,
+-    std::set<int64_t> &out_device_ids) {
++    std::vector<int64_t> &out_device_ids) {
+   constexpr int kComputationDeviceFieldNumber = 3;
+ 
+   for (int i = 0; i < device_assign_fields.field_count(); ++i) {
+@@ -127,7 +139,7 @@ void CompileOptionsParser::extractDeviceIdsFromDeviceAssignment(
+ tt_pjrt_status CompileOptionsParser::extractReplicaDeviceIds(
+     const google::protobuf::UnknownFieldSet &unknown_fields,
+     std::optional<std::vector<int64_t>> &out_replica_device_ids) {
+-  std::set<int64_t> unique_device_ids;
++  std::vector<int64_t> unique_device_ids;
+ 
+   // The CompileOptionsProto protobuf layout is defined in
+   // https://github.com/openxla/xla/blob/main/xla/pjrt/proto/compile_options.proto
+@@ -169,8 +181,7 @@ tt_pjrt_status CompileOptionsParser::extractReplicaDeviceIds(
+   }
+ 
+   if (!unique_device_ids.empty()) {
+-    out_replica_device_ids = std::vector<int64_t>(unique_device_ids.begin(),
+-                                                  unique_device_ids.end());
++    out_replica_device_ids = std::move(unique_device_ids);
+   }
+   return tt_pjrt_status::kSuccess;
+ }
