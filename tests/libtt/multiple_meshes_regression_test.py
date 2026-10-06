@@ -105,7 +105,7 @@ def test_axis_index_without_operands_on_size_one_axis(devices):
     np.testing.assert_array_equal(np.asarray(out), np.ravel(expected))
 
 
-@pytest.mark.parametrize("rows", [4])
+@pytest.mark.parametrize("rows", [4, 2])
 def test_mesh_with_trailing_size_one_axis(devices, rows):
     """tt-mlir takes (1, n) meshes; an (n, 1) mesh is the same devices."""
     mesh = Mesh(devices[:rows].reshape(rows, 1), ("x", "y"))

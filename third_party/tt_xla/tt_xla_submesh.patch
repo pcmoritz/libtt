@@ -1,0 +1,188 @@
+diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
+--- a/pjrt_implementation/inc/api/client_instance.h
++++ b/pjrt_implementation/inc/api/client_instance.h
+@@ -125,10 +125,15 @@ public:
+   // shape, it is returned. Otherwise, we close any previously opened mesh
+   // device and open a new one with the provided shape.
+   //
++  // A mesh over some but not all chips is a submesh of one over every chip,
++  // placed on the chips in `device_ids` when they form a block of it: opening
++  // only some chips starts fabric routers whose ethernet partners never answer.
++  //
+   // NOTE: this method is not thread-safe and we will need to revisit this when
+   // adding support for parallel execution.
+   tt::runtime::Device
+-  getOrCreateMeshDevice(const std::vector<uint32_t> &target_mesh_shape);
++  getOrCreateMeshDevice(const std::vector<uint32_t> &target_mesh_shape,
++                        const std::unordered_set<int> &device_ids = {});
+ 
+   // Returns the fabric config computed for the current mesh device.
+   const std::optional<tt::runtime::MeshFabricConfig> &getFabricConfig() const {
+@@ -212,9 +217,26 @@ private:
+   // True when TT_COMPILE_ONLY_SYSTEM_DESC was set
+   bool m_compile_only = false;
+ 
+-  // Currently in-use mesh device.
++  // Currently in-use mesh device: the opened mesh, or a submesh of it.
+   std::optional<tt::runtime::Device> m_parent_mesh;
+ 
++  // The opened mesh over every chip, running nothing itself, once programs
++  // run on submeshes of it.
++  std::optional<tt::runtime::Device> m_root_mesh;
++
++  // Shape and offset of m_parent_mesh while it is a submesh.
++  std::optional<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>>
++      m_submesh_placement;
++
++  // Returns a submesh of the root mesh for a mesh shape over some of the chips,
++  // or over all of them once the root mesh is open; nullopt otherwise.
++  std::optional<tt::runtime::Device>
++  getOrCreateSubMesh(const std::vector<uint32_t> &target_mesh_shape,
++                     const std::unordered_set<int> &device_ids);
++
++  // Releases the submesh in use, if any, making the root mesh current.
++  void releaseSubMesh();
++
+   // Fabric config computed for the current mesh device.
+   std::optional<tt::runtime::MeshFabricConfig> m_fabric_config;
+ 
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -11,6 +11,7 @@
+ #include "api/client_instance.h"
+ 
+ // c++ standard library includes
++#include <algorithm>
+ #include <cerrno>
+ #include <cstddef>
+ #include <cstring>
+@@ -591,7 +592,18 @@ ClientInstance::computeFabricConfig(const std::vector<uint32_t> &mesh_shape) {
+ }
+ 
+ tt::runtime::Device ClientInstance::getOrCreateMeshDevice(
+-    const std::vector<uint32_t> &target_mesh_shape) {
++    const std::vector<uint32_t> &target_mesh_shape,
++    const std::unordered_set<int> &device_ids) {
++
++  if (std::optional<tt::runtime::Device> submesh =
++          getOrCreateSubMesh(target_mesh_shape, device_ids)) {
++    return *submesh;
++  }
++
++  if (m_submesh_placement.has_value()) {
++    TensorPool::move_tensors_to_host();
++    releaseSubMesh();
++  }
+ 
+   if (!m_parent_mesh.has_value()) {
+     m_parent_mesh = openMeshDevice(target_mesh_shape);
+@@ -691,7 +703,95 @@ ClientInstance::openMeshDevice(const std::vector<uint32_t> &mesh_shape) {
+   return tt::runtime::openMeshDevice(options);
+ }
+ 
++std::optional<tt::runtime::Device> ClientInstance::getOrCreateSubMesh(
++    const std::vector<uint32_t> &target_mesh_shape,
++    const std::unordered_set<int> &device_ids) {
++  const uint32_t num_chips = static_cast<uint32_t>(m_devices.size());
++  if (m_compile_only || target_mesh_shape.size() != 2) {
++    return std::nullopt;
++  }
++  const uint32_t rows = target_mesh_shape[0];
++  const uint32_t cols = target_mesh_shape[1];
++  // Programs over every chip run on the mesh itself until one over some of
++  // them comes along.
++  if (rows * cols <= 1 || rows * cols > num_chips ||
++      (rows * cols == num_chips && !m_root_mesh.has_value())) {
++    return std::nullopt;
++  }
++
++  // From then on every program runs on a submesh of a root mesh that runs
++  // nothing itself, so a submesh never takes over chips holding the device
++  // state of programs run on another mesh: opening the root drops what
++  // earlier programs left, and releasing a submesh drops what it left.
++  auto holds = [&](const std::vector<uint32_t> &shape) {
++    return shape.size() == 2 && shape[0] * shape[1] == num_chips &&
++           rows <= shape[0] && cols <= shape[1];
++  };
++  if (!m_root_mesh.has_value() ||
++      !holds(tt::runtime::getMeshShape(*m_root_mesh))) {
++    std::vector<uint32_t> root_shape = {1, num_chips};
++    if (!holds(root_shape) && num_chips % rows == 0) {
++      root_shape = {rows, num_chips / rows};
++    }
++    if (!holds(root_shape)) {
++      return std::nullopt;
++    }
++    TensorPool::move_tensors_to_host();
++    closeParentMesh();
++    m_root_mesh = openMeshDevice(root_shape);
++    m_parent_mesh = m_root_mesh;
++  }
++
++  // Chips are numbered row-major over the root mesh. Place the submesh on the
++  // inputs' chips when they form a block, else at the origin.
++  const std::vector<uint32_t> root_shape =
++      tt::runtime::getMeshShape(*m_root_mesh);
++  std::vector<uint32_t> offset = {0, 0};
++  if (!device_ids.empty()) {
++    const int first = *std::min_element(device_ids.begin(), device_ids.end());
++    const uint32_t row = first / root_shape[1];
++    const uint32_t col = first % root_shape[1];
++    bool block = device_ids.size() == rows * cols &&
++                 row + rows <= root_shape[0] && col + cols <= root_shape[1];
++    for (uint32_t r = 0; block && r < rows; ++r) {
++      for (uint32_t c = 0; block && c < cols; ++c) {
++        block = device_ids.count((row + r) * root_shape[1] + col + c) > 0;
++      }
++    }
++    if (block) {
++      offset = {row, col};
++    }
++  }
++
++  auto placement = std::make_pair(target_mesh_shape, offset);
++  if (m_submesh_placement == placement) {
++    return *m_parent_mesh;
++  }
++  DLOG_F(LOG_DEBUG,
++         "ClientInstance::getOrCreateSubMesh - submesh %s at %s of %s",
++         utils::to_string(target_mesh_shape).c_str(),
++         utils::to_string(offset).c_str(),
++         utils::to_string(root_shape).c_str());
++  // Device tensors belong to the mesh they were made on.
++  TensorPool::move_tensors_to_host();
++  releaseSubMesh();
++  m_parent_mesh =
++      tt::runtime::createSubMeshDevice(*m_root_mesh, target_mesh_shape, offset);
++  m_submesh_placement = placement;
++  return *m_parent_mesh;
++}
++
++void ClientInstance::releaseSubMesh() {
++  if (m_submesh_placement.has_value()) {
++    tt::runtime::releaseSubMeshDevice(*m_parent_mesh);
++    m_parent_mesh = m_root_mesh;
++    m_submesh_placement.reset();
++  }
++}
++
+ void ClientInstance::closeParentMesh() {
++  releaseSubMesh();
++  m_root_mesh.reset();
+   if (m_parent_mesh.has_value()) {
+     DLOG_F(LOG_DEBUG, "Closing parent mesh.");
+     tt::runtime::closeMeshDevice(*m_parent_mesh);
+diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
+@@ -134,7 +134,8 @@ LoadedExecutableInstance::getOrCreateMeshDevice(
+   // buffers devices to these devices.
+   // https://github.com/tenstorrent/tt-xla/issues/502
+ 
+-  return m_client_instance->getOrCreateMeshDevice(devices_mesh_shape);
++  return m_client_instance->getOrCreateMeshDevice(devices_mesh_shape,
++                                                   device_ids);
+ }
+ 
+ std::unordered_set<int> LoadedExecutableInstance::getDeviceIds(
