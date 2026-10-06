@@ -1,0 +1,41 @@
+diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
+@@ -111,6 +111,15 @@ LoadedExecutableInstance::getOrCreateMeshDevice(
+       std::accumulate(devices_mesh_shape.begin(), devices_mesh_shape.end(), 1,
+                       std::multiplies<std::uint32_t>{}));
+ 
++  // Without inputs, run on as many chips as the program was compiled for.
++  if (num_args == 0 && device_ids.size() != mesh_shape_num_devices &&
++      mesh_shape_num_devices <= m_addressable_devices.size()) {
++    device_ids.clear();
++    for (size_t i = 0; i < mesh_shape_num_devices; ++i) {
++      device_ids.emplace(m_addressable_devices[i]->getGlobalDeviceId());
++    }
++  }
++
+   if (device_ids.size() != mesh_shape_num_devices) {
+     LOG_F(ERROR,
+           "Input buffers are placed on a different number of devices (%zu) "
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -947,9 +947,16 @@ tt_pjrt_status ModuleBuilder::runCompilerStableHLOPipeline(
+       (moduleHasShardingConstraints(mlir_module) ||
+        anyShardedAcrossDevices(output_shardings) ||
+        (!moduleHasAnyFuncArguments(mlir_module) && target_num_devices > 1))) {
++    // The mesh in use may span other chips than the program's partitions,
++    // e.g. all of them while the program runs on some.
++    std::vector<uint32_t> fallback_mesh_shape = *current_mesh_shape;
++    if (target_num_devices > 0 &&
++        fallback_mesh_shape[0] * fallback_mesh_shape[1] != target_num_devices) {
++      fallback_mesh_shape = {1, static_cast<uint32_t>(target_num_devices)};
++    }
+     stablehlo_pipeline_options.meshShape = {
+-        static_cast<int64_t>((*current_mesh_shape)[0]),
+-        static_cast<int64_t>((*current_mesh_shape)[1])};
++        static_cast<int64_t>(fallback_mesh_shape[0]),
++        static_cast<int64_t>(fallback_mesh_shape[1])};
+   }
+   mlir::tt::stablehlo::createStableHLOPipeline(stablehlo_pipeline_pm,
+                                                stablehlo_pipeline_options);
