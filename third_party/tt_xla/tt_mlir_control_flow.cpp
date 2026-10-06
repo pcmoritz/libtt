@@ -435,10 +435,8 @@ public:
 void populateStableHLOControlFlowToTTIRPatterns(
     MLIRContext *context, RewritePatternSet &patterns,
     TypeConverter &typeConverter) {
-  // Outrank upstream's stablehlo.while pattern, which then only handles loops
-  // these decline.
   patterns.add<CaseOpConversionPattern, WhileOpConversionPattern>(
-      typeConverter, context, /*benefit=*/2);
+      typeConverter, context);
 }
 
 namespace ttnn {

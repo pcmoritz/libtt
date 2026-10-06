@@ -105,6 +105,16 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    addElementwiseUnaryOpsConversionPatterns(ctx, patterns, typeConverter);
    addElementwiseBinaryOpsConversionPatterns(ctx, patterns, typeConverter);
    addQuantizeOpsConversionPattern(ctx, patterns, typeConverter);
+@@ -12454,7 +12460,8 @@ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
+   addSparseMatmulOpConversionPattern(ctx, patterns, typeConverter);
+   addAllToAllOpsConversionPattern(ctx, patterns, typeConverter);
+   addTTLangOpConversionPattern(ctx, patterns, typeConverter);
+-  addWhileOpConversionPattern(ctx, patterns, typeConverter);
++  // libtt lowers stablehlo.while itself (tt_mlir_control_flow.cpp).
++  // addWhileOpConversionPattern(ctx, patterns, typeConverter);
+ }
+ 
+ } // namespace mlir::tt
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNNPass.cpp
