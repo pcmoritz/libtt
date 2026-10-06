@@ -400,6 +400,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_shared_client_instance.patch",
         "//third_party/tt_xla:tt_xla_merge_meshes.patch",
         "//third_party/tt_xla:tt_xla_submesh.patch",
+        "//third_party/tt_xla:tt_xla_host_shards.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
