@@ -14,7 +14,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp ttnn/cpp/ttn
 diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
-@@ -405,14 +405,6 @@ Tensor concat_impl(
+@@ -511,14 +511,6 @@ Tensor concat_impl(
          }
          return concat_impl(interleaved_inputs, dim, groups, output_mem_config, sub_core_grids);
      }

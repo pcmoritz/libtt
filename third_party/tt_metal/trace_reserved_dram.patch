@@ -1,7 +1,7 @@
 diff --git tt_metal/distributed/mesh_device.cpp tt_metal/distributed/mesh_device.cpp
 --- tt_metal/distributed/mesh_device.cpp
 +++ tt_metal/distributed/mesh_device.cpp
-@@ -1388,6 +1388,7 @@ void MeshDeviceImpl::release_mesh_trace(const MeshTraceId& trace_id) {
+@@ -1532,6 +1532,7 @@ void MeshDeviceImpl::release_mesh_trace(const MeshTraceId& trace_id) {
  
      validate_sub_device_manager_tracker();
      sub_device_manager_tracker_->get_active_sub_device_manager()->release_trace(trace_id);
@@ -9,7 +9,7 @@ diff --git tt_metal/distributed/mesh_device.cpp tt_metal/distributed/mesh_device
  
      // Drop any Tensor prefetcher requests captured under this trace so they don't outlive it.
      if (tensor_prefetcher_) {
-@@ -1438,6 +1439,7 @@ void MeshDeviceImpl::begin_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id
+@@ -1582,6 +1583,7 @@ void MeshDeviceImpl::begin_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id
          this->mesh_id_,
          active_sub_device_manager->id());
      auto& trace_buffer = active_sub_device_manager->create_trace(trace_id);
@@ -17,7 +17,7 @@ diff --git tt_metal/distributed/mesh_device.cpp tt_metal/distributed/mesh_device
      for (AllocatorImpl* allocator : this->get_trace_allocators()) {
          allocator->begin_trace_allocation_tracking();
          trace_buffer->allocation_footprints.emplace_back(allocator, TraceAllocationFootprint{});
-@@ -1476,6 +1478,9 @@ void MeshDeviceImpl::end_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id)
+@@ -1620,6 +1622,9 @@ void MeshDeviceImpl::end_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id)
          if (allocator == mesh_allocator) {
              dram_allocation_high_water_mark = allocator->get_dram_allocation_high_water_mark();
              dram_deletion_high_water_mark = allocator->get_dram_deletion_high_water_mark();
@@ -30,7 +30,7 @@ diff --git tt_metal/distributed/mesh_device.cpp tt_metal/distributed/mesh_device
 diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocator.cpp
 --- tt_metal/impl/allocator/allocator.cpp
 +++ tt_metal/impl/allocator/allocator.cpp
-@@ -67,6 +67,17 @@ void AllocatorImpl::init_one_bank_per_channel() {
+@@ -77,6 +77,17 @@ void AllocatorImpl::init_one_bank_per_channel() {
          config_->dram_alignment,
          config_->dram_unreserved_base,
          config_->disable_interleaved);
@@ -48,7 +48,7 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
      for (uint32_t bank_id = 0; bank_id < config_->num_dram_channels; bank_id++) {
          CoreCoord logical_core = CoreCoord{bank_id, 0};
          bank_id_to_dram_channel_.insert({bank_id, bank_id});
-@@ -251,6 +262,8 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
+@@ -353,6 +364,8 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
  
  void AllocatorImpl::deallocate_buffers() {
      std::lock_guard<std::mutex> lock(mutex_);
@@ -57,7 +57,7 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
      dram_manager_->deallocate_all();
      l1_manager_->deallocate_all();
      l1_small_manager_->deallocate_all();
-@@ -534,8 +547,44 @@ bool AllocatorImpl::has_live_allocation_overlap(const TraceAllocationFootprint&
+@@ -672,8 +685,44 @@ bool AllocatorImpl::has_live_allocation_overlap(const TraceAllocationFootprint&
             l1_small_manager_->has_live_allocation_overlap(footprint.l1_small);
  }
  
@@ -102,7 +102,7 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
      dram_manager_->clear();
      l1_manager_->clear();
      l1_small_manager_->clear();
-@@ -605,6 +654,8 @@ void AllocatorImpl::override_state(const AllocatorState& state) {
+@@ -751,6 +800,8 @@ void AllocatorImpl::override_state(const AllocatorState& state) {
      }
  
      // Clear all buffer types
@@ -114,15 +114,15 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
 diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocator.hpp
 --- tt_metal/impl/allocator/allocator.hpp
 +++ tt_metal/impl/allocator/allocator.hpp
-@@ -12,6 +12,7 @@
- 
+@@ -16,6 +16,7 @@
  #include "impl/allocator/allocator_types.hpp"
  #include "impl/allocator/bank_manager.hpp"
+ #include "impl/allocator/persistent_l1_arena.hpp"
 +#include <map>
  
  namespace tt::tt_metal {
  
-@@ -120,6 +121,14 @@ public:
+@@ -144,6 +145,14 @@ public:
      TraceAllocationFootprint end_trace_allocation_tracking();
      bool has_live_allocation_overlap(const TraceAllocationFootprint& footprint) const;
  
@@ -137,7 +137,7 @@ diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocat
      // what does clear even mean on an allocator???
      void clear();
  
-@@ -174,6 +183,13 @@ private:
+@@ -211,6 +220,13 @@ private:
      std::unordered_map<BufferType, std::unordered_map<CoreCoord, std::vector<std::uint32_t>>> logical_core_to_bank_ids_;
      std::unordered_set<Buffer*> allocated_buffers_;
  
@@ -154,7 +154,7 @@ diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocat
 diff --git tt_metal/impl/allocator/bank_manager.cpp tt_metal/impl/allocator/bank_manager.cpp
 --- tt_metal/impl/allocator/bank_manager.cpp
 +++ tt_metal/impl/allocator/bank_manager.cpp
-@@ -447,6 +447,9 @@ uint64_t BankManager::allocate_buffer(
+@@ -480,6 +480,9 @@ uint64_t BankManager::allocate_buffer(
      // vs. top-down allocation
      if (dependent_allocators.empty()) {
          auto address = alloc->allocate(size_per_bank, bottom_up, address_limit);
@@ -164,7 +164,7 @@ diff --git tt_metal/impl/allocator/bank_manager.cpp tt_metal/impl/allocator/bank
          if (!address.has_value()) {
              auto mem_stats = alloc->get_statistics();
              TT_FATAL(
-@@ -694,6 +697,41 @@ bool BankManager::has_live_allocation_overlap(const AllocationFootprint& footpri
+@@ -747,6 +750,41 @@ bool BankManager::has_live_allocation_overlap(const AllocationFootprint& footpri
      return false;
  }
  
@@ -209,7 +209,7 @@ diff --git tt_metal/impl/allocator/bank_manager.cpp tt_metal/impl/allocator/bank
 diff --git tt_metal/impl/allocator/bank_manager.hpp tt_metal/impl/allocator/bank_manager.hpp
 --- tt_metal/impl/allocator/bank_manager.hpp
 +++ tt_metal/impl/allocator/bank_manager.hpp
-@@ -145,6 +145,13 @@ public:
+@@ -149,6 +149,13 @@ public:
      DeviceAddr get_deletion_high_water_mark() const;
      AllocationFootprint take_allocation_footprint();
      bool has_live_allocation_overlap(const AllocationFootprint& footprint) const;
@@ -223,7 +223,7 @@ diff --git tt_metal/impl/allocator/bank_manager.hpp tt_metal/impl/allocator/bank
  
      // Cross-allocator mirroring: mark a region as allocated/deallocated in a specific sub-allocator.
      // Used to mirror lockstep allocations from the mesh-level allocator into per-device allocators.
-@@ -199,6 +206,7 @@ private:
+@@ -203,6 +210,7 @@ private:
      DeviceAddr allocation_high_water_mark_ = 0;
      DeviceAddr deletion_high_water_mark_ = 0;
      AllocationFootprint allocation_footprint_;

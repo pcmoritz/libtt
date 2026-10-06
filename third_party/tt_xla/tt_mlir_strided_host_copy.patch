@@ -1,7 +1,7 @@
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -65,31 +65,38 @@ static bool isContiguous(const std::vector<std::uint32_t> &shape,
+@@ -66,31 +66,38 @@ static bool isContiguous(const std::vector<std::uint32_t> &shape,
  }
  
  // Gathers a strided host buffer into a dense, contiguous byte buffer.
@@ -52,7 +52,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  
      for (size_t d = numDims; d-- > 0;) {
        if (++idx[d] < shape[d]) {
-@@ -102,19 +109,31 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
+@@ -103,19 +110,31 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
    return out;
  }
  
@@ -88,7 +88,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    }
  
    if (!::tt::runtime::utils::isSupportedDataType(dataType)) {
-@@ -131,13 +150,15 @@ createOwnedTTNNTensor(const void *data, const std::vector<std::uint32_t> &shape,
+@@ -132,13 +151,15 @@ createOwnedTTNNTensor(const void *data, const std::vector<std::uint32_t> &shape,
      std::uint32_t itemSizeToUse =
          ::tt::runtime::utils::dataTypeElementSize(dataTypeToUse);
  
@@ -107,7 +107,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    }
  
    ::ttnn::Shape ttnnShape(shape);
-@@ -145,20 +166,20 @@ createOwnedTTNNTensor(const void *data, const std::vector<std::uint32_t> &shape,
+@@ -146,20 +167,20 @@ createOwnedTTNNTensor(const void *data, const std::vector<std::uint32_t> &shape,
  
    switch (ttnnDataType) {
    case ::ttnn::DataType::FLOAT32:

@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
-@@ -80,7 +80,7 @@ ComputeConfigDescriptor compute_cfg() {
+@@ -82,7 +82,7 @@ ComputeConfigDescriptor compute_cfg() {
  // is assigned a contiguous range [wi_start, wi_start+wi_count) reads/writes exactly those tiles —
  // the DRAM result is byte-identical no matter how items are partitioned. The first `rem` cores get
  // one extra item (ceil), the rest get floor; every used core gets >= 1 (since P <= total).
@@ -10,7 +10,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ch
      std::vector<CoreCoord> cores;  // used cores, in assignment order
      std::vector<uint32_t> wi_start;
      std::vector<uint32_t> wi_count;
-@@ -90,14 +90,14 @@ struct PrepWorkDist {
+@@ -92,14 +92,14 @@ struct PrepWorkDist {
  // `core_cap` bounds how many cores we may use (defaults to the whole grid). Perf A/B only:
  // setting core_cap=BH reproduces the old "1 core/head, NC chunks serial" layout exactly (each
  // head's NC work-items are contiguous, wi in [h*NC, h*NC+NC)), using the identical kernels.
@@ -27,59 +27,45 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ch
      d.cores.reserve(P);
      d.wi_start.reserve(P);
      d.wi_count.reserve(P);
-@@ -124,44 +124,26 @@ PrepWorkDist distribute_prep(CoreCoord grid, uint32_t total, uint32_t core_cap)
- // and o reduce over all K). We pick the finest V-blocking that fits the grid: the largest NV | Vt
- // with BH*NV <= cores. Each core runs one (head, v-block) => BH*NV independent scans vs BH today.
- struct ScanWorkDist {
--    std::vector<CoreCoord> cores;
--    std::vector<uint32_t> head;  // head index per core
--    std::vector<uint32_t> vblk;  // v-block index per core
--    uint32_t Vtl = 1;            // per-core v-block width (tiles) = Vt / NV
--    uint32_t NV = 1;             // v-blocks per head
--    CoreRangeSet core_set;
-+    WorkDist work;
-+    uint32_t Vtl = 1;  // per-core v-block width (tiles) = Vt / NV
-+    uint32_t NV = 1;   // v-blocks per head
- };
+@@ -132,6 +132,7 @@ struct ScanWorkDist {
+     std::vector<CoreCoord> cores;
+     std::vector<uint32_t> head;  // head index per core
+     std::vector<uint32_t> vblk;  // v-block index per core
++    std::vector<uint32_t> heads;  // consecutive heads per core, from head[i] (> 1 only without multicast)
+     uint32_t Vtl = 1;            // per-core v-block width (tiles) = Vt / NV
+     uint32_t NV = 1;             // v-blocks per head
+     CoreRangeSet core_set;
+@@ -139,7 +140,20 @@ struct ScanWorkDist {
  
- ScanWorkDist distribute_scan(CoreCoord grid, uint32_t BH, uint32_t Vt) {
+ ScanWorkDist distribute_scan(CoreCoord grid, uint32_t BH, uint32_t Vt, bool force_serial) {
      const uint32_t ncores = grid.x * grid.y;
 -    TT_FATAL(BH <= ncores, "num_heads {} exceeds compute cores {}", BH, ncores);
-     // QWEN_GDN_SCAN_SERIAL=1 forces NV=1 (full V on 1 core/head, the old layout) for perf A/B only.
-     const char* serial_env = std::getenv("QWEN_GDN_SCAN_SERIAL");
-     const bool force_serial = serial_env && serial_env[0] == '1';
-     uint32_t NV = 1;
--    for (uint32_t cand = force_serial ? 1u : Vt; cand >= 1; cand--) {  // cand==1 always satisfies
-+    for (uint32_t cand = force_serial ? 1u : Vt; cand >= 1; cand--) {
-         if (Vt % cand == 0 && BH * cand <= ncores) {
-             NV = cand;
-             break;
-         }
++    if (BH > ncores) {
++        // More heads than cores: NV stays one (no multicast) and each core scans several
++        // complete heads.
++        WorkDist work = distribute_work(grid, BH, ~0u);
++        ScanWorkDist d;
++        d.cores = std::move(work.cores);
++        d.head = std::move(work.wi_start);
++        d.heads = std::move(work.wi_count);
++        d.vblk.assign(d.cores.size(), 0);
++        d.Vtl = Vt;
++        d.NV = 1;
++        d.core_set = std::move(work.core_set);
++        return d;
++    }
+     // force_serial (QWEN_GDN_SCAN_SERIAL=1, hashed into ChunkGdnScanParams) pins NV=1 — full V on
+     // 1 core/head, the old layout — for perf A/B only.
+     // Row-aligned placement: each head's NV v-block cores must form a 1xNV NoC RECTANGLE (the
+@@ -174,6 +188,7 @@ ScanWorkDist distribute_scan(CoreCoord grid, uint32_t BH, uint32_t Vt, bool forc
+         d.cores.push_back(core);
+         d.head.push_back(h);
+         d.vblk.push_back(v);
++        d.heads.push_back(1);
+         crs.insert(CoreRange{core, core});
      }
--    ScanWorkDist d;
--    d.NV = NV;
--    d.Vtl = Vt / NV;
--    const uint32_t total = BH * NV;
--    d.cores.reserve(total);
--    d.head.reserve(total);
--    d.vblk.reserve(total);
--    std::set<CoreRange> crs;
--    for (uint32_t i = 0; i < total; i++) {
--        const CoreCoord core{i % grid.x, i / grid.x};  // row-major over the grid
--        d.cores.push_back(core);
--        d.head.push_back(i / NV);  // heads' v-blocks grouped contiguously
--        d.vblk.push_back(i % NV);
--        crs.insert(CoreRange{core, core});
--    }
--    d.core_set = CoreRangeSet{crs};
--    return d;
-+    // If heads exceed cores, NV stays one and each core scans several complete
-+    // heads. Otherwise every work item is one independent (head, value block).
-+    return {distribute_work(grid, BH * NV, ~0u), Vt / NV, NV};
- }
- 
- }  // namespace
-@@ -188,7 +170,7 @@ tt::tt_metal::ProgramDescriptor ChunkGdnPrepProgramFactory::create_descriptor(
+     d.core_set = CoreRangeSet{crs};
+@@ -206,7 +221,7 @@ tt::tt_metal::ProgramDescriptor ChunkGdnPrepProgramFactory::create_descriptor(
      const uint32_t total_work = BH * NC;
      const char* serial_env = std::getenv("QWEN_GDN_PREP_SERIAL");
      const uint32_t core_cap = (serial_env && serial_env[0] == '1') ? BH : ~0u;
@@ -88,34 +74,24 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ch
      const CoreRangeSet& cores = dist.core_set;
      const uint32_t n_used = static_cast<uint32_t>(dist.cores.size());
  
-@@ -364,9 +346,9 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
-     auto* device = in.v_beta.device();
-     // Value-parallel fan-out: each core runs one (head, v-block) sequential scan.
-     auto sdist = distribute_scan(device->compute_with_storage_grid_size(), BH, Vt_full);
--    const CoreRangeSet& cores = sdist.core_set;
-+    const CoreRangeSet& cores = sdist.work.core_set;
-     const uint32_t Vt = sdist.Vtl;  // per-core V-block width; CBs/compute use this
--    const uint32_t n_used = static_cast<uint32_t>(sdist.cores.size());
-+    const uint32_t n_used = static_cast<uint32_t>(sdist.work.cores.size());
- 
-     // V-independent tensors (kd, q_decay, intra, k_dec_t, T_inv, dl) are read in FULL; only the
-     // V-dependent CBs (v_beta/state/out/scratch) shrink to the per-core V-block width Vt(=Vtl).
-@@ -460,13 +442,14 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
-     auto* fs_buf = outputs[1].buffer();
- 
-     for (uint32_t i = 0; i < n_used; i++) {
--        const auto& core = sdist.cores[i];
--        const uint32_t h = sdist.head[i];
--        const uint32_t vb = sdist.vblk[i];
-+        const auto& core = sdist.work.cores[i];
-+        const uint32_t h = sdist.work.wi_start[i] / sdist.NV;
-+        const uint32_t vb = sdist.work.wi_start[i] % sdist.NV;
-+        const uint32_t heads = sdist.work.wi_count[i];
-         reader.emplace_runtime_args(
--            core, {h, vb, NC, vb_buf, kd_buf, qd_buf, it_buf, kdec_buf, dl_buf, ti_buf, s0_buf});
+@@ -537,9 +552,10 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
+         const auto& core = sdist.cores[i];
+         const uint32_t h = sdist.head[i];
+         const uint32_t vb = sdist.vblk[i];
++        const uint32_t heads = sdist.heads[i];
+         if (!do_mcast) {
+             reader.emplace_runtime_args(
+-                core, {h, vb, NC, vb_buf, kd_buf, qd_buf, it_buf, kdec_buf, dl_buf, ti_buf, s0_buf});
++                core, {h, vb, NC, vb_buf, kd_buf, qd_buf, it_buf, kdec_buf, dl_buf, ti_buf, s0_buf, heads});
+         } else if (vb == 0) {
+             // Sender. Its receivers are the 1x(NV-1) rectangle immediately to its right (the
+             // row-aligned placement guarantees cores[i+1 .. i+NV-1] are this head's remaining
+@@ -572,8 +588,8 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
+             receiver.emplace_runtime_args(
+                 core, {h, vb, NC, vb_buf, s0_buf, static_cast<uint32_t>(snd.x), static_cast<uint32_t>(snd.y)});
+         }
 -        writer.emplace_runtime_args(core, {h, vb, NC, o_buf, fs_buf});
 -        compute.emplace_runtime_args(core, {NC});
-+            core, {h, vb, NC, vb_buf, kd_buf, qd_buf, it_buf, kdec_buf, dl_buf, ti_buf, s0_buf, heads});
 +        writer.emplace_runtime_args(core, {h, vb, NC, o_buf, fs_buf, heads});
 +        compute.emplace_runtime_args(core, {NC, heads});
      }
@@ -145,26 +121,20 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ke
 diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp
 --- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp
 +++ ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp
-@@ -30,7 +30,8 @@ void kernel_main() {
-     constexpr auto s0_a = TensorAccessorArgs<ti_a.next_compile_time_args_offset()>();
- 
-     // This core handles head h, V-block vb (columns [vb*Vt, vb*Vt+Vt) of the full V dimension).
--    const uint32_t h = get_arg_val<uint32_t>(0);
-+    const uint32_t first_head = get_arg_val<uint32_t>(0);
-+    const uint32_t heads = get_arg_val<uint32_t>(11);
-     const uint32_t vb = get_arg_val<uint32_t>(1);
-     const uint32_t NC = get_arg_val<uint32_t>(2);
-     const uint32_t vb_addr = get_arg_val<uint32_t>(3);
-@@ -87,17 +88,19 @@ void kernel_main() {
-         cb.push_back(R * Vt);
+@@ -144,7 +144,9 @@ void kernel_main() {
      };
  
--    // initial state S [K, V] (once) — host always provides it (zeros if none). V-sliced.
--    read_vslice(s0_acc, cb_S, h * Kt * Vt_full, Kt);
-+    for (uint32_t h = first_head; h < first_head + heads; h++) {
-+        // initial state S [K, V] (once) — host always provides it (zeros if none). V-sliced.
-+        read_vslice(s0_acc, cb_S, h * Kt * Vt_full, Kt);
+     // initial state S [K, V] (once) — host always provides it (zeros if none). V-sliced.
++#if defined(GDN_MCAST_SENDER) || defined(GDN_MCAST_RECEIVER)
+     read_vslice(s0_acc, cb_S, h * Kt * Vt_full, Kt);
++#endif
  
+ #if defined(GDN_MCAST_SENDER)
+     Semaphore<> ready(SEM_READY);
+@@ -266,15 +268,22 @@ void kernel_main() {
+     noc.async_atomic_barrier();
+ 
+ #else
 -    for (uint32_t c = 0; c < NC; c++) {
 -        const uint32_t hc = h * NC + c;
 -        read_vslice(vb_acc, cb_vbeta, hc * Ct * Vt_full, Ct);  // v_beta [C, V] slice
@@ -174,8 +144,14 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ke
 -        read_into(kc_acc, cb_kdec_t, hc * kc, kc);
 -        read_into(dl_acc, cb_dl, hc * 1, 1);
 -        read_into(ti_acc, cb_Tinv, hc * cc, cc);
++    // Without multicast a core may scan several consecutive heads (more heads than cores).
++    const uint32_t heads = get_arg_val<uint32_t>(11);
++    for (uint32_t head = h; head < h + heads; head++) {
++        // initial state S [K, V] (once per head) — host always provides it (zeros if none). V-sliced.
++        read_vslice(s0_acc, cb_S, head * Kt * Vt_full, Kt);
++
 +        for (uint32_t c = 0; c < NC; c++) {
-+            const uint32_t hc = h * NC + c;
++            const uint32_t hc = head * NC + c;
 +            read_vslice(vb_acc, cb_vbeta, hc * Ct * Vt_full, Ct);  // v_beta [C, V] slice
 +            read_into(kd_acc, cb_kd, hc * ck, ck);                 // V-independent: full read
 +            read_into(qd_acc, cb_qdecay, hc * ck, ck);
@@ -185,6 +161,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ke
 +            read_into(ti_acc, cb_Tinv, hc * cc, cc);
 +        }
      }
+ #endif
  }
 diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/writer_chunk_gdn_scan.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/writer_chunk_gdn_scan.cpp
 --- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/writer_chunk_gdn_scan.cpp

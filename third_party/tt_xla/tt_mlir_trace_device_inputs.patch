@@ -99,7 +99,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -945,6 +945,44 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+@@ -954,6 +954,44 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
    return result;
  }
  
@@ -144,7 +144,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
    const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
        LayoutDesc::fromTensor(tensor);
-@@ -952,6 +990,12 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
+@@ -961,6 +999,12 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
    const LayoutDesc &desiredLayoutDesc =
        layout.as<LayoutDesc>(DeviceRuntime::TTNN);
  
@@ -157,7 +157,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    return *tensorLayoutDesc == desiredLayoutDesc;
  }
  
-@@ -990,6 +1034,11 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
+@@ -999,6 +1043,11 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
  
    std::shared_ptr<LayoutDesc> layoutDesc = std::make_shared<LayoutDesc>(
        inputStorageType, inputLayout, inputDataType, inputMemoryConfig);

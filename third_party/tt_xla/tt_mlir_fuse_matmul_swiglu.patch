@@ -37,7 +37,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  
  #include "mlir/Interfaces/SideEffectInterfaces.h"
  #ifdef TTMLIR_ENABLE_OPMODEL
-@@ -314,6 +315,89 @@ private:
+@@ -334,6 +335,89 @@ private:
  };
  } // namespace
  
@@ -127,7 +127,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  #ifdef TTMLIR_ENABLE_OPMODEL
  
  // ============================================================================
-@@ -679,7 +763,7 @@ public:
+@@ -707,7 +791,7 @@ public:
      }
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
@@ -139,7 +139,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -573,7 +573,7 @@ createOp(FlatbufferObjectCache &cache, MatmulOp op) {
+@@ -578,7 +578,7 @@ createOp(FlatbufferObjectCache &cache, MatmulOp op) {
    return ::tt::target::ttnn::CreateMatmulOp(
        *cache.fbb, a, b, output, op.getTransposeA(), op.getTransposeB(),
        matmulProgramConfigType, matmulProgramConfigDesc, activation,

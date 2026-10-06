@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
 --- a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
 +++ b/include/ttmlir/Dialect/TTNN/Transforms/Passes.td
-@@ -590,8 +590,10 @@ def TTNNConstEvalInputsToSystemMemory : Pass<"ttnn-force-const-eval-to-system-me
+@@ -596,8 +596,10 @@ def TTNNConstEvalInputsToSystemMemory : Pass<"ttnn-force-const-eval-to-system-me
      This pass also modifies the forward functions' arguments that correspond to const-eval
      function inputs, forcing them to system memory as well.
  
@@ -17,7 +17,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/Transforms/Passes.td b/include/ttmlir/D
 diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 --- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 +++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
-@@ -493,10 +493,11 @@ void createTTIRToTTNNCommonPipeline(
+@@ -536,10 +536,11 @@ void createTTIRToTTNNCommonPipeline(
      if (options.enableConstEval) {
        devicePm.addPass(transforms::createConstEvalHoistTransform());
  

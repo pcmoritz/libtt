@@ -21,6 +21,7 @@ _TTNN_FBS = [
     "binary.fbs",
     "operations/ccl.fbs",
     "operations/configs.fbs",
+    "operations/control_flow.fbs",
     "operations/conv.fbs",
     "operations/cpu.fbs",
     "operations/creation.fbs",

@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5273,7 +5273,7 @@ class StableHLOGatherToEmbeddingPattern
+@@ -5321,7 +5321,7 @@ class StableHLOGatherToEmbeddingPattern
     * transformation:
     * - start indices tensor isn't 1D when we are indexing multiple dims
     * - operandBatchingDims and startIndicesBatchingDims are none
@@ -10,7 +10,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
     * - for dimensions we are indexing, sliceSizes must fit into one of:
     *   - all sliceSizes are 1
     *   - all sliceSizes are fullDim except one which can be anything
-@@ -5526,16 +5526,15 @@ public:
+@@ -5574,16 +5574,15 @@ public:
          } else if (sliceSizes[i] != 1) {
            partialIndexedDims++;
          }
@@ -31,7 +31,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp,
            "Did not satisfy slice conditions for dimensions in startIndexMap");
-@@ -5572,7 +5571,30 @@ public:
+@@ -5620,7 +5619,30 @@ public:
             "gather lowering requires at least one flattened indexing dim");
  
      // Use adapted operands for building new ops (type-converted values).
@@ -63,7 +63,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto inputPermuted = permuteInput(
          rewriter,
          ttmlir::utils::appendLocationSuffix(srcOp->getLoc(), "_permuteInput"),
-@@ -5597,8 +5619,11 @@ public:
+@@ -5645,8 +5667,11 @@ public:
        auto flattenedIndices = flattenStartIndices(
            rewriter, inputPermuted.getType().getShape(), srcOp.getOperand(),
            startIndices, originalStartIndexMap, indexVectorDim);
@@ -77,7 +77,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      } else if (originalStartIndexMap.size() != numIndexingDims) {
        startIndices =
            sliceStartIndices(rewriter,
-@@ -5639,7 +5664,8 @@ public:
+@@ -5687,7 +5712,8 @@ public:
      return GatherOperands{mlir::cast<mlir::TypedValue<mlir::RankedTensorType>>(
                                reshapedInput.getResult()),
                            startIndices, std::move(newOutputShape),
@@ -87,7 +87,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    }
  
    // In StableHLO, startIndexMap attribute refers to which dims of input
-@@ -6191,22 +6217,12 @@ public:
+@@ -6239,22 +6265,12 @@ public:
      auto outputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult().getType()));
      auto outputShape = outputType.getShape();
@@ -113,7 +113,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      SmallVector<int64_t> reshapedIndicesShape;
      for (int64_t i = 0; i < static_cast<int64_t>(startIndicesShape.size());
           ++i) {
-@@ -6214,29 +6230,50 @@ public:
+@@ -6262,29 +6278,50 @@ public:
          reshapedIndicesShape.push_back(startIndicesShape[i]);
        }
      }
@@ -180,7 +180,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        for (int64_t od : offsetDims) {
          unsqueezedShape.insert(unsqueezedShape.begin() + od, 1);
        }
-@@ -6249,25 +6286,156 @@ public:
+@@ -6297,25 +6334,156 @@ public:
            srcOp.getLoc(), unsqueezedType, indices,
            rewriter.getI32ArrayAttr(
                llvm::to_vector_of<int32_t>(unsqueezedShape)));
@@ -350,7 +350,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      return success();
    }
  };
-@@ -10855,6 +11023,7 @@ static void addGatherOpConversionPattern(MLIRContext *ctx,
+@@ -10903,6 +11071,7 @@ static void addGatherOpConversionPattern(MLIRContext *ctx,
                                           TypeConverter &typeConverter) {
    patterns.add<StableHLOGatherToDynamicSlicePattern>(typeConverter, ctx);
    patterns.add<StableHLOGatherToGatherDimPattern>(typeConverter, ctx);

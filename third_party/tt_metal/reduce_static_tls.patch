@@ -15,7 +15,7 @@ diff --git tt_metal/common/filesystem_utils.cpp tt_metal/common/filesystem_utils
 diff --git tt_metal/impl/dispatch/system_memory_manager.cpp tt_metal/impl/dispatch/system_memory_manager.cpp
 --- tt_metal/impl/dispatch/system_memory_manager.cpp
 +++ tt_metal/impl/dispatch/system_memory_manager.cpp
-@@ -513,7 +513,7 @@ std::vector<SystemMemoryCQInterface>& SystemMemoryManager::get_cq_interfaces() {
+@@ -520,7 +520,7 @@ std::vector<SystemMemoryCQInterface>& SystemMemoryManager::get_cq_interfaces() {
  
  void* SystemMemoryManager::issue_queue_reserve(uint32_t cmd_size_B, const uint8_t cq_id) {
      if (is_mock_device()) {
@@ -39,7 +39,7 @@ diff --git tt_metal/impl/event/dispatch.cpp tt_metal/impl/event/dispatch.cpp
 diff --git tt_metal/impl/program/dispatch.cpp tt_metal/impl/program/dispatch.cpp
 --- tt_metal/impl/program/dispatch.cpp
 +++ tt_metal/impl/program/dispatch.cpp
-@@ -596,7 +596,7 @@ void insert_stall_cmds(ProgramCommandSequence& program_command_sequence, SubDevi
+@@ -712,7 +712,7 @@ void insert_stall_cmds(ProgramCommandSequence& program_command_sequence, SubDevi
  // Watcher only: pre-fill an RTA payload region with 0xBEEF0000 | rand16 so unused runtime-arg slots are
  // obviously unset on device (equality tests are likely to fail). With watcher off the region stays zero.
  void fill_runtime_args_watcher_pattern(uint32_t* dst, uint32_t num_words) {
@@ -48,21 +48,21 @@ diff --git tt_metal/impl/program/dispatch.cpp tt_metal/impl/program/dispatch.cpp
      std::uniform_int_distribution<int> dist(0, 65535);
      for (uint32_t i = 0; i < num_words; i++) {
          dst[i] = WATCHER_RTA_UNSET_PATTERN | static_cast<uint16_t>(dist(gen));
-@@ -655,7 +655,7 @@ void generate_runtime_args_cmds(
+@@ -771,7 +771,7 @@ void generate_runtime_args_cmds(
          std::is_same_v<PackedSubCmd, CQDispatchWritePackedMulticastSubCmd>);
  
      const uint32_t l1_alignment = metal_ctx.hal().get_alignment(HalMemType::L1);
--    thread_local static auto get_runtime_payload_sizeB =
-+    static const auto get_runtime_payload_sizeB =
-         [](uint32_t num_packed_cmds,
-            uint32_t runtime_args_len,
-            bool is_unicast,
-@@ -669,7 +669,7 @@ void generate_runtime_args_cmds(
-                 (no_stride ? 1 : num_packed_cmds) * tt::align(runtime_args_len * sizeof(uint32_t), l1_alignment);
-             return dispatch_cmd_sizeB + aligned_runtime_data_sizeB;
-         };
--    thread_local static auto get_runtime_args_data_offset = [](uint32_t num_packed_cmds,
-+    static const auto get_runtime_args_data_offset = [](uint32_t num_packed_cmds,
-                                                                uint32_t /*runtime_args_len*/,
-                                                                bool is_unicast,
-                                                                uint32_t l1_alignment) {
+-    thread_local static auto get_runtime_payload_sizeB = [](uint32_t num_packed_cmds,
++    static const auto get_runtime_payload_sizeB = [](uint32_t num_packed_cmds,
+                                                             uint32_t runtime_args_len,
+                                                             bool is_unicast,
+                                                             bool no_stride,
+@@ -783,7 +783,7 @@ void generate_runtime_args_cmds(
+             (no_stride ? 1 : num_packed_cmds) * tt::align(runtime_args_len * sizeof(uint32_t), l1_alignment);
+         return dispatch_cmd_sizeB + aligned_runtime_data_sizeB;
+     };
+-    thread_local static auto get_runtime_args_data_offset =
++    static const auto get_runtime_args_data_offset =
+         [](uint32_t num_packed_cmds, uint32_t /*runtime_args_len*/, bool is_unicast, uint32_t l1_alignment) {
+             uint32_t sub_cmd_sizeB =
+                 is_unicast ? sizeof(CQDispatchWritePackedUnicastSubCmd) : sizeof(CQDispatchWritePackedMulticastSubCmd);

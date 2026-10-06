@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5034,9 +5034,6 @@ public:
+@@ -5082,9 +5082,6 @@ public:
  };
  } // namespace
  
@@ -11,7 +11,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  namespace {
  class StableHLOToTTIRDynamicSliceOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::DynamicSliceOp> {
-@@ -5050,6 +5047,10 @@ public:
+@@ -5098,6 +5095,10 @@ public:
                    ConversionPatternRewriter &rewriter) const override {
      auto outputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult().getType()));
@@ -22,7 +22,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      // Reshape start indices to 1D tensors for concat op.
      ValueRange startIndicesRange = adaptor.getStartIndices();
-@@ -5060,13 +5061,17 @@ public:
+@@ -5108,13 +5109,17 @@ public:
      auto singleElementTensorType =
          RankedTensorType::get({1}, startIndexElementType);
  
@@ -42,7 +42,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        startIndicesValues1D.push_back(reshapedIndex);
      }
      // Create a single 1D tensor from start indices values using concat op.
-@@ -5081,7 +5086,6 @@ public:
+@@ -5129,7 +5134,6 @@ public:
          startIndicesValues1D, /*dim=*/0);
  
      // Create a 1D constant tensor with slice_sizes values.
@@ -50,7 +50,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      SmallVector<int32_t> sliceSizesInt32(sliceSizes.begin(), sliceSizes.end());
      auto sliceSizesTensorType = RankedTensorType::get(
          {static_cast<int64_t>(sliceSizesInt32.size())}, rewriter.getI32Type());
-@@ -5108,6 +5112,128 @@ public:
+@@ -5156,6 +5160,128 @@ public:
  };
  } // namespace
  
@@ -179,7 +179,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  namespace {
  class StableHLOToTTIROpClampOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::ClampOp> {
-@@ -10675,6 +10801,8 @@ static void addDynamicSliceOpConversionPattern(MLIRContext *ctx,
+@@ -10723,6 +10849,8 @@ static void addDynamicSliceOpConversionPattern(MLIRContext *ctx,
                                                 TypeConverter &typeConverter) {
    patterns.add<StableHLOToTTIRDynamicSliceOpConversionPattern>(typeConverter,
                                                                 ctx);

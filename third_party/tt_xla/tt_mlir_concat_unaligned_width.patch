@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -1485,6 +1485,14 @@ def TTNN_ConcatOp : TTNN_Op<"concat"> {
+@@ -1529,6 +1529,14 @@ def TTNN_ConcatOp : TTNN_Op<"concat"> {
      let results = (outs AnyRankedTensor:$result);
  
      let hasVerifier = 1;
@@ -19,7 +19,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
-@@ -290,6 +290,9 @@ public:
+@@ -298,6 +298,9 @@ public:
    static TTNNOperandsWorkarounds
    createReshapeOpOperandsWorkarounds(RankedTensorType inputType);
  
@@ -32,7 +32,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttml
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -459,6 +459,40 @@ TTNNOperandsWorkaroundsFactory::createReshapeOpOperandsWorkarounds(
+@@ -516,6 +516,40 @@ TTNNOperandsWorkaroundsFactory::createReshapeOpOperandsWorkarounds(
        .addOutputOperandWorkaround(typeWorkarounds);
  }
  
@@ -76,7 +76,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
-@@ -545,6 +545,7 @@ const std::set<mlir::StringRef>
+@@ -547,6 +547,7 @@ const std::set<mlir::StringRef>
          ttnn::WhereOp::getOperationName(), ttnn::FullOp::getOperationName(),
          ttnn::EmbeddingOp::getOperationName(),
          ttnn::ScatterOp::getOperationName(),

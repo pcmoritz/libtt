@@ -1,17 +1,17 @@
 diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/fd_mesh_command_queue.cpp
 --- tt_metal/distributed/fd_mesh_command_queue.cpp
 +++ tt_metal/distributed/fd_mesh_command_queue.cpp
-@@ -302,7 +302,8 @@ CoreCoord FDMeshCommandQueue::virtual_program_dispatch_core() const { return thi
+@@ -320,7 +320,8 @@ CoreCoord FDMeshCommandQueue::virtual_program_dispatch_core() const { return thi
  
  CoreType FDMeshCommandQueue::dispatch_core_type() const { return this->dispatch_core_type_; }
  
 -bool FDMeshCommandQueue::record_watcher_error_in_test_mode(ChipId device_id) {
 +bool FDMeshCommandQueue::record_watcher_error_in_test_mode() {
 +    const ChipId device_id = mesh_device_->get_devices().at(0)->id();
-     const auto error_message = tt::llrt::internal_::get_watcher_error_message_in_test_mode(device_id);
+     auto& context = MetalContext::instance(mesh_device_->impl().get_context_id());
+     const auto error_message = tt::llrt::internal_::get_watcher_error_message_in_test_mode(context, device_id);
      if (!error_message.has_value()) {
-         return false;
-@@ -325,15 +326,18 @@ bool FDMeshCommandQueue::record_watcher_error_in_test_mode(ChipId device_id) {
+@@ -344,15 +345,18 @@ bool FDMeshCommandQueue::record_watcher_error_in_test_mode(ChipId device_id) {
      }
  }
  
@@ -34,7 +34,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
                  return;
              }
              reads_processed_cv_.wait_for(reads_processed_lock, poll_interval, predicate);
-@@ -752,6 +756,53 @@ void FDMeshCommandQueue::finish_nolock(ttsl::Span<const SubDeviceId> sub_device_
+@@ -789,6 +793,53 @@ void FDMeshCommandQueue::finish_nolock(ttsl::Span<const SubDeviceId> sub_device_
      }
  }
  
@@ -88,7 +88,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  void FDMeshCommandQueue::finish(ttsl::Span<const SubDeviceId> sub_device_ids) {
      ZoneScopedN("FDMeshCommandQueue::finish");
      auto lock = lock_api_function_();
-@@ -1034,6 +1085,9 @@ void FDMeshCommandQueue::read_completion_queue() {
+@@ -1072,6 +1123,9 @@ void FDMeshCommandQueue::read_completion_queue() {
                              this->copy_buffer_data_to_user_space(mesh_read_descriptor);
                          } else if constexpr (std::is_same_v<T, MeshReadEventDescriptor>) {
                              this->read_completion_queue_event(mesh_read_descriptor);
@@ -101,7 +101,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 diff --git tt_metal/distributed/fd_mesh_command_queue.hpp tt_metal/distributed/fd_mesh_command_queue.hpp
 --- tt_metal/distributed/fd_mesh_command_queue.hpp
 +++ tt_metal/distributed/fd_mesh_command_queue.hpp
-@@ -182,7 +182,7 @@ private:
+@@ -179,7 +179,7 @@ private:
      void wait_for_outstanding_reads(std::unique_lock<std::mutex>& reads_processed_lock);
  
      // Route watcher faults through the same exception path as the completion-queue reader thread.
@@ -110,7 +110,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.hpp tt_metal/distributed/f
  
      // Distributed context used to synchronize operations done by all active ranks on the given mesh device.
      std::shared_ptr<distributed::multihost::DistributedContext> active_distributed_context_;
-@@ -213,6 +213,10 @@ protected:
+@@ -210,6 +210,10 @@ protected:
          ttsl::Span<const SubDeviceId> sub_device_ids = {},
          const std::optional<MeshCoordinateRange>& device_range = std::nullopt) override;
      void invalidate_prefetcher_cache_after_pinned_write() override;

@@ -19,8 +19,8 @@ diff --git ttnn/core/graph/graph_processor.cpp ttnn/core/graph/graph_processor.c
 -#include <boost/algorithm/string/replace.hpp>
  #include <cstdlib>
  
- #include <fstream>
-@@ -20,6 +19,7 @@
+ #include <algorithm>
+@@ -21,6 +20,7 @@
  #include <enchantum/enchantum.hpp>
  #include <memory>
  #include <string>
@@ -28,7 +28,7 @@ diff --git ttnn/core/graph/graph_processor.cpp ttnn/core/graph/graph_processor.c
  #include <tt-metalium/allocator.hpp>
  #include <tt-metalium/circular_buffer.hpp>
  #include <tt-metalium/hal_types.hpp>
-@@ -506,9 +506,13 @@ void GraphProcessor::track_function_start(
+@@ -507,9 +507,13 @@ void GraphProcessor::track_function_start(
  
      std::vector<std::string> serialized_arguments;
      serialized_arguments.reserve(input_parameters.size());

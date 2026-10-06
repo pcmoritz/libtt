@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -2502,8 +2502,8 @@ def TTNN_ConvTranspose2dOp : TTNN_Op<"conv_transpose2d", [TTNN_ComputeKernelConf
+@@ -2546,8 +2546,8 @@ def TTNN_ConvTranspose2dOp : TTNN_Op<"conv_transpose2d", [TTNN_ComputeKernelConf
            - K_W is the width of the kernel
  
          - `output` AnyRankedTensor: expected in the following format (N, H_out, W_out, O) where:
@@ -12,7 +12,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
  
        Attributes:
          - `in_channels` i32: The number of input channels.
-@@ -2513,7 +2513,7 @@ def TTNN_ConvTranspose2dOp : TTNN_Op<"conv_transpose2d", [TTNN_ComputeKernelConf
+@@ -2557,7 +2557,7 @@ def TTNN_ConvTranspose2dOp : TTNN_Op<"conv_transpose2d", [TTNN_ComputeKernelConf
          - `input_width` i32: The input width.
          - `kernel_size` array<2xi32>: The kernel size.
          - `stride` array<2xi32>: Controls the stride for the cross-correlation.
@@ -24,7 +24,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -2370,15 +2370,16 @@ private:
+@@ -2412,15 +2412,16 @@ private:
                                    computeElementType);
  
      Value permutedWeight = weight;
@@ -47,7 +47,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto kernelPermutation = generateConvKernelPermutation(
          op, isTransposed ? conv2dTransposeKernelLayout : conv2dKernelLayout);
      auto weightOutputShape = ::ttmlir::utils::applyPermutation(
-@@ -2393,15 +2394,9 @@ private:
+@@ -2435,15 +2436,9 @@ private:
      if (isTransposed) {
        // [TODO](mmanzoor) Verify the implementation of transposed convolution
        // for tt-xla. https://github.com/tenstorrent/tt-mlir/issues/3293
@@ -66,7 +66,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        // Recomputing padding attribute based on Torch-MLIR lowering of
        // conv_transposed2d op: [top, left, bottom, right].
        // https://github.com/llvm/torch-mlir/blob/main/lib/Conversion/TorchToStablehlo/Linear.cpp
-@@ -2410,7 +2405,7 @@ private:
+@@ -2452,7 +2447,7 @@ private:
            adaptor.getDimensionNumbers().getKernelSpatialDimensions();
        int64_t kernelHeightDim = kernelSpatialDims[SPATIAL_DIM_HEIGHT];
        int64_t kernelWidthDim = kernelSpatialDims[SPATIAL_DIM_WIDTH];
@@ -75,7 +75,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
            static_cast<int32_t>((weightType.getShape()[kernelHeightDim] - 1) *
                                     rhsDilation[SPATIAL_DIM_HEIGHT] -
                                 paddingMatrix[SPATIAL_DIM_HEIGHT][0]),
-@@ -2419,11 +2414,29 @@ private:
+@@ -2461,11 +2456,29 @@ private:
                                 paddingMatrix[SPATIAL_DIM_WIDTH][0]),
            static_cast<int32_t>((weightType.getShape()[kernelHeightDim] - 1) *
                                     rhsDilation[SPATIAL_DIM_HEIGHT] -
@@ -108,7 +108,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        // Input dilation (lhs dilation) is used for stride for transposed
        // convolution.
        auto inputDilationAttr = rewriter.getDenseI32ArrayAttr({
-@@ -2483,7 +2496,7 @@ private:
+@@ -2525,7 +2538,7 @@ private:
  
        // Use full builder with explicit dimension attributes.
        newConv = rewriter.create<ttir::ConvTranspose2dOp>(
@@ -117,7 +117,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
            inputDilationAttr, paddingAttr, outputPaddingAttr, dilationAttr,
            rewriter.getI32IntegerAttr(groups),
            rewriter.getI64IntegerAttr(batchDim),
-@@ -2491,6 +2504,12 @@ private:
+@@ -2533,6 +2546,12 @@ private:
            rewriter.getI64IntegerAttr(widthDim),
            rewriter.getI64IntegerAttr(channelDim));
  
@@ -133,7 +133,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -2341,18 +2341,6 @@ public:
+@@ -2337,18 +2337,6 @@ public:
      }
      auto paddingAttr = *maybePaddingAttr;
  
@@ -152,7 +152,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
      auto outputPaddingAttr =
          attrToDenseI32ArrayAttr(adaptor.getOutputPadding(), rewriter);
      if (auto error = outputPaddingAttr.takeError()) {
-@@ -2376,7 +2364,7 @@ public:
+@@ -2372,7 +2360,7 @@ public:
          op, getTypeConverter()->convertType(outputTy), adaptor.getInput(),
          adaptor.getWeight(), adaptor.getBias(), device, inChannelsAttr,
          outChannelsAttr, batchSizeAttr, inputHeightAttr, inputWidthAttr,
@@ -204,7 +204,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
 --- a/lib/OpModel/TTNN/TTNNOpModel.cpp
 +++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
-@@ -6433,7 +6433,7 @@ llvm::Expected<OpConstraints> OpModel<ConvTranspose2dOp>::getOpConstraints(
+@@ -6447,7 +6447,7 @@ llvm::Expected<OpConstraints> OpModel<ConvTranspose2dOp>::getOpConstraints(
          input_width,
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(kernel_size),
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(stride),
@@ -213,7 +213,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(output_padding),
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(dilation),
          groups, outputDtype, biasSpec, conv2dConfigConverted,
-@@ -6515,7 +6515,7 @@ llvm::Expected<size_t> OpModel<ConvTranspose2dOp>::getOpRuntime(
+@@ -6529,7 +6529,7 @@ llvm::Expected<size_t> OpModel<ConvTranspose2dOp>::getOpRuntime(
          in_channels, out_channels, batch_size, input_height, input_width,
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(kernel_size),
          conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(stride),

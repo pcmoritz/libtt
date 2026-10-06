@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -109,6 +109,12 @@ getPaddingOrDefault(mlir::DenseIntElementsAttr attr, size_t numSpatialDims) {
+@@ -110,6 +110,12 @@ getPaddingOrDefault(mlir::DenseIntElementsAttr attr, size_t numSpatialDims) {
    return llvm::SmallVector<int64_t>(numSpatialDims * 2, 0);
  }
  
@@ -14,7 +14,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  // Typical initialization values for reduction ops.
  enum TypicalInitReductionValue {
    NEG_INF, // It is also used for minimum integer value.
-@@ -125,36 +131,21 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
+@@ -126,36 +132,20 @@ static bool checkInitValue(mlir::ElementsAttr initValue, mlir::Type elementType,
  
    float desiredF32;
    double desiredF64;
@@ -47,15 +47,14 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      return false;
    }
  
--  if (initValueOp.getResult().getType().getElementType().isBF16()) {
-+  if (initValueOp.getResult().getType().getElementType().isBF16() ||
-+      initValueOp.getResult().getType().getElementType().isF16()) {
-     const llvm::APFloat &value =
-         *initValueOp.getValue().value_begin<llvm::APFloat>();
+-  if (elementType.isBF16()) {
++  if (elementType.isBF16() || elementType.isF16()) {
+     const llvm::APFloat &value = *initValue.value_begin<llvm::APFloat>();
      if (desired == TypicalInitReductionValue::NEG_INF) {
-@@ -172,34 +163,19 @@ static bool checkInitValue(mlir::stablehlo::ConstantOp initValueOp,
-   if (initValueOp.getResult().getType().getElementType().isF64()) {
-     return *initValueOp.getValue().value_begin<double>() == desiredF64;
+       return value.isInfinity() && value.isNegative();
+@@ -172,32 +162,17 @@ static bool checkInitValue(mlir::ElementsAttr initValue, mlir::Type elementType,
+   if (elementType.isF64()) {
+     return *initValue.value_begin<double>() == desiredF64;
    }
 -  // Integer element types: read the constant as an APInt so both signed and
 -  // unsigned attributes work. value_begin<int32_t>()/<int64_t>() assert with
@@ -63,9 +62,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -  // unsigned (ui32/ui64) attributes -- e.g. the dense<4294967295> :
 -  // tensor<ui32> sentinel that torch 2.11's max_pool2d_with_indices lowering
 -  // emits (#9031).
--  if (auto intType = mlir::dyn_cast<mlir::IntegerType>(
-+  if (auto integerType = mlir::dyn_cast<IntegerType>(
-           initValueOp.getResult().getType().getElementType())) {
+-  if (auto intType = mlir::dyn_cast<mlir::IntegerType>(elementType)) {
 -    unsigned width = intType.getWidth();
 -    // Restrict to the widths the original signed-typed reads handled
 -    // (i1/i8/i32/i64). Other widths previously fell through to `return false`,
@@ -73,15 +70,14 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -    // avoids the unsigned-iteration assert without changing which widths match.
 -    if (width != 1 && width != 8 && width != 32 && width != 64) {
 -      return false;
--    }
--    const llvm::APInt &value =
-+    llvm::APInt value =
-         *initValueOp.getValue().value_begin<llvm::APInt>();
--    if (width == 1) {
--      return value.getBoolValue() == desiredI1;
++  if (auto integerType = mlir::dyn_cast<IntegerType>(elementType)) {
++    llvm::APInt value = *initValue.value_begin<llvm::APInt>();
 +    if (desired == TypicalInitReductionValue::ZERO) {
 +      return value.isZero();
-+    }
+     }
+-    const llvm::APInt &value = *initValue.value_begin<llvm::APInt>();
+-    if (width == 1) {
+-      return value.getBoolValue() == desiredI1;
 +    if (desired == TypicalInitReductionValue::ONE) {
 +      return value.isOne();
      }
@@ -98,7 +94,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    }
  
    return false;
-@@ -735,6 +711,13 @@ public:
+@@ -778,6 +753,13 @@ public:
    matchAndRewrite(mlir::stablehlo::DotGeneralOp srcOp,
                    mlir::stablehlo::DotGeneralOp::Adaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
@@ -112,7 +108,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      auto outputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult().getType()));
-@@ -1271,6 +1254,11 @@ private:
+@@ -1314,6 +1296,11 @@ private:
    LogicalResult
    checkConversionLegality(mlir::stablehlo::ConstantOp &srcOp,
                            ConversionPatternRewriter &rewriter) const {
@@ -124,7 +120,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if (isa<DenseElementsAttr, DenseResourceElementsAttr>(srcOp.getValue()) &&
          !srcOp.getValue().getElementType().isIntOrFloat()) {
        return rewriter.notifyMatchFailure(
-@@ -2670,7 +2658,7 @@ public:
+@@ -2713,7 +2700,7 @@ public:
      RankedTensorType firstInputType =
          mlir::cast<RankedTensorType>(srcOp.getInputs()[0].getType());
      int64_t inputRank = firstInputType.getRank();
@@ -133,7 +129,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(srcOp, "Invalid input tensor rank.");
      }
  
-@@ -4267,8 +4255,9 @@ public:
+@@ -4316,8 +4303,9 @@ public:
      // Get indices of elements larger than one which correspond to spatial dims
      // (H, W)
      auto spatialDims = getIndicesofElementsLargerThanOne(windowDims);

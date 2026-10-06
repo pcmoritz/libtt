@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
-@@ -1144,14 +1144,14 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1183,14 +1183,14 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
          });
      }
  
@@ -18,6 +18,24 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
                  .data_format = c_pack_data_format,
                  .page_size = c_single_tile_size,
              }}},
+@@ -1479,7 +1479,7 @@ void BinaryNgDeviceOperation::ProgramFactory::override_runtime_arguments(
+     }
+ 
+     // Re-point tensor-backed (globally-allocated) circular buffers at the CURRENT buffers, by CBIndex.
+-    // binary_ng convention: c_0 = input_a, c_1 = input_b, c_2 = output.  Addressing by CBIndex (not by
++    // binary_ng convention: c_0 = input_a, c_1 = input_b, c_16 = output.  Addressing by CBIndex (not by
+     // enumeration order) is what makes the in-place alias correct: the output CB always tracks the
+     // output buffer even when it shares a Buffer* with an input.
+     tt::tt_metal::Buffer* a_buffer = a.buffer();
+@@ -1494,7 +1494,7 @@ void BinaryNgDeviceOperation::ProgramFactory::override_runtime_arguments(
+             tt::tt_metal::UpdateDynamicCircularBufferAddress(program, cb->id(), *a_buffer);
+         } else if (indices.contains(static_cast<uint8_t>(tt::CBIndex::c_1)) && b_buffer != nullptr) {
+             tt::tt_metal::UpdateDynamicCircularBufferAddress(program, cb->id(), *b_buffer);
+-        } else if (indices.contains(static_cast<uint8_t>(tt::CBIndex::c_2)) && c_buffer != nullptr) {
++        } else if (indices.contains(static_cast<uint8_t>(tt::CBIndex::c_16)) && c_buffer != nullptr) {
+             tt::tt_metal::UpdateDynamicCircularBufferAddress(program, cb->id(), *c_buffer);
+         }
+     }
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary.cpp
@@ -52,12 +70,12 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/elt
 -    CircularBuffer cb_out(tt::CBIndex::c_2);
 +    CircularBuffer cb_out(tt::CBIndex::c_16);
  
-     compute_kernel_hw_startup(cb_post_lhs.get_cb_id(), cb_post_rhs.get_cb_id(), cb_out.get_cb_id());
- #ifdef PACK_RELU
+     // FPU operands are unpacked from these CBs straight into srcA/srcB, so the swapped
+     // order has to hold for the format setup and the LLK init too, not just the op call.
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu.cpp
-@@ -119,7 +119,7 @@ void kernel_main() {
+@@ -120,7 +120,7 @@ void kernel_main() {
  
      constexpr auto cb_pre_lhs_id = tt::CBIndex::c_0;
      constexpr auto cb_pre_rhs_id = tt::CBIndex::c_1;
@@ -69,7 +87,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/elt
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_no_bcast.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_no_bcast.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_no_bcast.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_no_bcast.cpp
-@@ -95,7 +95,7 @@ void kernel_main() {
+@@ -96,7 +96,7 @@ void kernel_main() {
  
      constexpr auto cb_pre_lhs_id = tt::CBIndex::c_0;
      constexpr auto cb_pre_rhs_id = tt::CBIndex::c_1;
@@ -81,7 +99,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/elt
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_scalar.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_scalar.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_scalar.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_scalar.cpp
-@@ -88,7 +88,7 @@ void kernel_main() {
+@@ -93,7 +93,7 @@ void kernel_main() {
  
      constexpr auto cb_pre_lhs_id = tt::CBIndex::c_0;
      constexpr auto cb_pre_rhs_id = tt::CBIndex::c_1;
@@ -93,15 +111,15 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/elt
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_where_no_bcast.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_where_no_bcast.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_where_no_bcast.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_where_no_bcast.cpp
-@@ -20,7 +20,7 @@ void kernel_main() {
+@@ -26,7 +26,7 @@ void kernel_main() {
  
-     DataflowBuffer dfb_in0(tt::CBIndex::c_0);
-     DataflowBuffer dfb_in1(tt::CBIndex::c_1);
--    DataflowBuffer dfb_out(tt::CBIndex::c_2);
-+    DataflowBuffer dfb_out(tt::CBIndex::c_16);
+     constexpr auto dfb_cond_id = tt::CBIndex::c_0;
+     constexpr auto dfb_tensor_id = tt::CBIndex::c_1;
+-    constexpr auto dfb_out_id = tt::CBIndex::c_2;
++    constexpr auto dfb_out_id = tt::CBIndex::c_16;
  
-     compute_kernel_hw_startup(dfb_in0.get_id(), dfb_out.get_id());
-     copy_init(dfb_in0.get_id());
+ #if WHERE_TTS
+     // TTS: tensor is true value, goes to dst_reg 1
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_where_sfpu.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_where_sfpu.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_where_sfpu.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_where_sfpu.cpp
@@ -141,7 +159,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/wr
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_col_bcast.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_col_bcast.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_col_bcast.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_col_bcast.cpp
-@@ -119,7 +119,7 @@ void kernel_main() {
+@@ -115,7 +115,7 @@ void kernel_main() {
          return;
      }
  
@@ -165,7 +183,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_row_col_bcast.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_row_col_bcast.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_row_col_bcast.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_row_col_bcast.cpp
-@@ -106,7 +106,7 @@ void kernel_main() {
+@@ -101,7 +101,7 @@ void kernel_main() {
          return;
      }
  
@@ -177,7 +195,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_scalar_bcast.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_scalar_bcast.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_scalar_bcast.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_scalar_bcast.cpp
-@@ -118,7 +118,7 @@ void kernel_main() {
+@@ -114,7 +114,7 @@ void kernel_main() {
          return;
      }
  
@@ -201,7 +219,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_sfpu_row_bcast.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_sfpu_row_bcast.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_sfpu_row_bcast.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_sfpu_row_bcast.cpp
-@@ -39,7 +39,7 @@ void kernel_main() {
+@@ -40,7 +40,7 @@ void kernel_main() {
  
      constexpr uint32_t num_tiles_per_cycle = get_compile_time_arg_val(0);
  
@@ -213,7 +231,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_sfpu_row_col_bcast.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_sfpu_row_col_bcast.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_sfpu_row_col_bcast.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_binary_sfpu_row_col_bcast.cpp
-@@ -148,7 +148,7 @@ void kernel_main() {
+@@ -147,7 +147,7 @@ void kernel_main() {
          return;
      }
  
@@ -249,7 +267,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_where_sfpu_row_col_bcast.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_where_sfpu_row_col_bcast.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_where_sfpu_row_col_bcast.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/compute/eltwise_where_sfpu_row_col_bcast.cpp
-@@ -143,7 +143,7 @@ void kernel_main() {
+@@ -141,7 +141,7 @@ void kernel_main() {
  
      constexpr auto cb_in0 = tt::CBIndex::c_0;
      constexpr auto cb_in1 = tt::CBIndex::c_1;

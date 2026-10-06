@@ -13,7 +13,7 @@ diff --git tt_metal/fabric/compute_mesh_router_builder.cpp tt_metal/fabric/compu
 diff --git tt_metal/fabric/control_plane.cpp tt_metal/fabric/control_plane.cpp
 --- tt_metal/fabric/control_plane.cpp
 +++ tt_metal/fabric/control_plane.cpp
-@@ -38,7 +38,7 @@
+@@ -34,7 +34,7 @@
  #include "hostdevcommon/fabric_common.h"
  #include "fabric_host_utils.hpp"
  #include <tt-metalium/experimental/fabric/fabric_telemetry.hpp>

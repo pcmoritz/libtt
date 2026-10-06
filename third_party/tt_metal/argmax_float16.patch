@@ -138,18 +138,18 @@ diff --git ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/argmax_commo
      CompareFunc compare_func) {
 -    if (compare_func(val, max_val)) {
 +    if (argmax_greater<data_format>(val, max_val, compare_func)) {
-         auto full_idx = outer_idx * inner_dim_units * red_dim_units + j * red_dim_units + i;
+         auto full_idx = (outer_idx * inner_dim_units * red_dim_units) + (j * red_dim_units) + i;
          max_idx = reduce_all ? full_idx : i;
          max_val = val;
 -    } else if (val == max_val) {
 +    } else if (!argmax_greater<data_format>(max_val, val, compare_func)) {
-         auto full_idx = outer_idx * inner_dim_units * red_dim_units + j * red_dim_units + i;
+         auto full_idx = (outer_idx * inner_dim_units * red_dim_units) + (j * red_dim_units) + i;
          max_idx = reduce_all ? std::min(max_idx, full_idx) : std::min(max_idx, i);
      }
 diff --git ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp
 --- ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argmax_interleaved_multicore.cpp
-@@ -78,6 +78,13 @@ inline void find_argmax_for_core(
+@@ -88,6 +88,13 @@ inline void find_argmax_for_core(
                          return bfloat16_greater(a, b);
                      });
  
@@ -163,7 +163,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argma
              } else if constexpr (data_format == DataFormat::UInt16) {
                  uint16_t val = in_vals[i - red_dim_offset];
                  process_value_comparison<data_format, uint16_t, reduce_all>(
-@@ -130,6 +137,7 @@ inline void find_argmax_for_core(
+@@ -140,6 +147,7 @@ inline void find_argmax_for_core(
   * @tparam num_cores Number of cores that participated in the reduction operation
   * @tparam data_format Data format of the values being compared. Supported formats:
   *                     - DataFormat::Float16_b: 16-bit bfloat16 floating point
@@ -171,7 +171,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argma
   *                     - DataFormat::UInt16: 16-bit unsigned integer
   *                     - DataFormat::Float32: 32-bit IEEE 754 floating point
   *                     - DataFormat::Int32: 32-bit signed integer
-@@ -171,6 +179,13 @@ inline uint32_t find_argmax_from_intermediate_outputs(
+@@ -181,6 +189,13 @@ inline uint32_t find_argmax_from_intermediate_outputs(
                      return bfloat16_greater(a, b);
                  });
  
@@ -183,5 +183,5 @@ diff --git ttnn/cpp/ttnn/operations/reduction/argmax/device/kernels/reader_argma
 +                inner_idx, i_red_vals, i_red_idxs, max_val, max_idx, float16_greater);
 +
          } else if constexpr (data_format == DataFormat::UInt16) {
-             volatile tt_l1_ptr auto i_red_vals =
-                 reinterpret_cast<volatile tt_l1_ptr uint16_t*>(red_val_dfb_local_base_addr + i * red_val_size_per_core);
+             volatile tt_l1_ptr auto i_red_vals = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(
+                 red_val_dfb_local_base_addr + (i * red_val_size_per_core));

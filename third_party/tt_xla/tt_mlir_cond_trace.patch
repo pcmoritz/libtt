@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4052,6 +4052,7 @@ def TTNN_CaptureOrExecuteTraceOp : TTNN_MemoryEffectOp<"capture_or_execute_trace
+@@ -4289,6 +4289,7 @@ def TTNN_CaptureOrExecuteTraceOp : TTNN_MemoryEffectOp<"capture_or_execute_trace
        - `execute_callee` FlatSymbolRefAttr: The symbol of the execute trace function.
        - `inputs` Variadic<AnyRankedTensor>: The input tensors to the trace function.
        - `semaphore_inputs` Variadic<TTNN_GlobalSemaphore>: Global semaphores forwarded into the capture/execute programs.
@@ -9,7 +9,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
      Outputs:
        - `results` Variadic<AnyRankedTensor>: The output tensors from the trace function.
    }];
-@@ -4060,6 +4061,7 @@ def TTNN_CaptureOrExecuteTraceOp : TTNN_MemoryEffectOp<"capture_or_execute_trace
+@@ -4297,6 +4298,7 @@ def TTNN_CaptureOrExecuteTraceOp : TTNN_MemoryEffectOp<"capture_or_execute_trace
                         FlatSymbolRefAttr:$allocate_slots_callee,
                         FlatSymbolRefAttr:$capture_callee,
                         FlatSymbolRefAttr:$execute_callee,
@@ -29,7 +29,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/trace.fbs b/include/ttmlir/Ta
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-@@ -5944,6 +5944,22 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
+@@ -6311,6 +6311,22 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
    auto opInputs = this->getInputs();
    auto opSemaphoreInputs = this->getSemaphoreInputs();
    auto opOutputs = this->getResults();
@@ -52,7 +52,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
  
    // An input already on device acts as its own persistent slot and is handed
    // to the allocation program, while an input in system memory is staged into
-@@ -6108,7 +6124,7 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
+@@ -6475,7 +6491,7 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
                              "into the output slot arguments";
    }
  
@@ -61,7 +61,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
      auto tensorType = ::mlir::dyn_cast<RankedTensorType>(arg.getType());
      if (!tensorType) {
        if (::mlir::isa<ttnn::GlobalSemaphoreType>(arg.getType())) {
-@@ -6117,10 +6133,11 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
+@@ -6484,10 +6500,11 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
        return emitOpError() << "All input arguments of trace function must be "
                             << "ranked tensors or global semaphores";
      }
@@ -76,7 +76,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
      }
    }
  
-@@ -6166,6 +6183,14 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
+@@ -6533,6 +6550,14 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
                auto tensorType =
                    ::mlir::cast<RankedTensorType>(operand.getType());
                if (!utils::isTensorOnDevice(tensorType)) {
@@ -238,7 +238,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -3486,6 +3486,12 @@ createOp(FlatbufferObjectCache &cache, CaptureOrExecuteTraceOp op,
+@@ -3592,6 +3592,12 @@ createOp(FlatbufferObjectCache &cache, CaptureOrExecuteTraceOp op,
          getOperandThroughDPSOps(input)));
    }
  
@@ -251,7 +251,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
    std::vector<::flatbuffers::Offset<::tt::target::ttnn::TensorRef>> outputs;
    for (auto result : op.getResults()) {
      outputs.push_back(
-@@ -3520,7 +3526,7 @@ createOp(FlatbufferObjectCache &cache, CaptureOrExecuteTraceOp op,
+@@ -3626,7 +3632,7 @@ createOp(FlatbufferObjectCache &cache, CaptureOrExecuteTraceOp op,
    return ::tt::target::ttnn::CreateCaptureOrExecuteTraceOpDirect(
        *cache.fbb, cache.at<::tt::target::DeviceRef>(device), captureProgramIdx,
        executeProgramIdx, allocateSlotsProgramIdx, &inputs, &outputs,

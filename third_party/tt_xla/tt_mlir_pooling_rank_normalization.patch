@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -3013,6 +3013,106 @@ public:
+@@ -3055,6 +3055,106 @@ public:
  
  namespace {
  
@@ -108,7 +108,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  class StableHLOToTTIRReduceWindowOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::ReduceWindowOp> {
    using OpConversionPattern<
-@@ -3029,6 +3129,7 @@ public:
+@@ -3071,6 +3171,7 @@ public:
                    mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
      using TypicalInitReductionValue::NEG_INF;
@@ -116,7 +116,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      using TypicalInitReductionValue::ZERO;
  
      // Validate basic op structure.
-@@ -3079,6 +3180,9 @@ public:
+@@ -3121,6 +3222,9 @@ public:
        } else if (isa<mlir::stablehlo::MaxOp>(reduceOp)) {
          result = rewriter.create<ttir::MaximumOp>(srcOp.getLoc(), resultType,
                                                     input, init);
@@ -126,7 +126,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        } else if (isa<mlir::stablehlo::MulOp>(reduceOp)) {
          result = rewriter.create<ttir::MultiplyOp>(srcOp.getLoc(), resultType,
                                                      input, init);
-@@ -3110,6 +3214,7 @@ public:
+@@ -3152,6 +3256,7 @@ public:
      SmallVector<mlir::Operation *> reductionOps;
      for (Operation &op : llvm::drop_end(operations, 1)) {
        if (!isa<mlir::stablehlo::AddOp, mlir::stablehlo::MaxOp,
@@ -134,7 +134,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
                 mlir::stablehlo::MulOp>(&op)) {
          return rewriter.notifyMatchFailure(srcOp, "Unsupported reduction op.");
        }
-@@ -3180,87 +3285,27 @@ public:
+@@ -3222,87 +3327,27 @@ public:
        }
      }
  
@@ -237,7 +237,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      // Construct attributes for TTIR pooling ops.
  
-@@ -3301,56 +3346,55 @@ public:
+@@ -3343,56 +3388,55 @@ public:
  
        RankedTensorType inputType =
            mlir::cast<RankedTensorType>(input.getType());
@@ -329,7 +329,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
          }
          return result;
        };
-@@ -3362,6 +3406,20 @@ public:
+@@ -3404,6 +3448,20 @@ public:
                           strideForTTIROps, dilationForTTIROps,
                           paddingForTTIROps, ceilMode)
                       .getResult();
@@ -350,17 +350,17 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        } else if (isa<mlir::stablehlo::AddOp>(reductionOp) && initVal == ZERO) {
          // Special case of sum pooling followed by a convenient div op.
          // TODO(acicovic): Check why was i == 0 originally added as a condition.
-@@ -3804,6 +3862,9 @@ private:
-       }
-       if (checkInitValue(constantOp, TypicalInitReductionValue::NEG_INF)) {
+@@ -3853,6 +3911,9 @@ private:
+       if (checkInitValue(constantValue, elementType,
+                          TypicalInitReductionValue::NEG_INF)) {
          initValues.push_back(TypicalInitReductionValue::NEG_INF);
-+      } else if (checkInitValue(constantOp,
++      } else if (checkInitValue(constantValue, elementType,
 +                                TypicalInitReductionValue::POS_INF)) {
 +        initValues.push_back(TypicalInitReductionValue::POS_INF);
-       } else if (checkInitValue(constantOp, TypicalInitReductionValue::ZERO)) {
+       } else if (checkInitValue(constantValue, elementType,
+                                 TypicalInitReductionValue::ZERO)) {
          initValues.push_back(TypicalInitReductionValue::ZERO);
-       } else if (checkInitValue(constantOp, TypicalInitReductionValue::ONE)) {
-@@ -4678,8 +4739,8 @@ public:
+@@ -4729,8 +4790,8 @@ public:
      }
  
      Location loc = srcOp.getLoc();
@@ -371,7 +371,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto initValue_ = srcOp.getInitValue();
  
      // Get window attributes
-@@ -4707,7 +4768,34 @@ public:
+@@ -4758,7 +4819,34 @@ public:
          loc, operandType, rewriter.getF32FloatAttr(fillValue));
  
      // Tensor which we scatter into
@@ -407,7 +407,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      // Generate defaults if they dont exist
      // Default window strides is all ones
-@@ -4723,52 +4811,17 @@ public:
+@@ -4774,52 +4862,17 @@ public:
                   : rewriter.getDenseI64ArrayAttr(
                         SmallVector<int64_t>(windowDims.size() * 2, 0));
  
@@ -469,7 +469,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      // Adjust args to match definition in MaxPool2dWithIndices
      auto kernel = rewriter.getDenseI32ArrayAttr(
-@@ -4790,31 +4843,32 @@ public:
+@@ -4841,31 +4894,32 @@ public:
  
      auto ceilMode = rewriter.getBoolAttr(false);
  
@@ -523,7 +523,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
                                rewriter.getIntegerType(32)); // i32 for indices
  
      Value pooledEmpty = rewriter.create<ttir::EmptyOp>(loc, pooledType);
-@@ -4859,8 +4913,14 @@ public:
+@@ -4910,8 +4964,14 @@ public:
        return rewriter.notifyMatchFailure(
            srcOp, "SelectAndScatterOp cannot specify reduce type.");
      }
@@ -539,7 +539,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto scatterResult = rewriter.create<ttir::ScatterOp>(
          loc, scatterOutputType,
          reshapedFullTensor, // input tensor
-@@ -4870,34 +4930,32 @@ public:
+@@ -4921,34 +4981,32 @@ public:
          reduceTypeAttr);    // reduction type
  
      // Reshape back to N,H,W,C
@@ -596,7 +596,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    RankedTensorType getNHWFlattenedType(RankedTensorType unflattenedType) const {
      llvm::ArrayRef<int64_t> shape = unflattenedType.getShape();
      assert(shape.size() == 4 && "Expected 4D NHWC tensor");
-@@ -4908,9 +4966,8 @@ private:
+@@ -4959,9 +5017,8 @@ private:
    }
  
    ttir::ReshapeOp

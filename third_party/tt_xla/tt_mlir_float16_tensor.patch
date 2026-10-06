@@ -104,7 +104,7 @@ diff --git a/runtime/lib/ttnn/operations/utils/utils.cpp b/runtime/lib/ttnn/oper
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -146,6 +146,9 @@ createOwnedTTNNTensor(const void *data, const std::vector<std::uint32_t> &shape,
+@@ -147,6 +147,9 @@ createOwnedTTNNTensor(const void *data, const std::vector<std::uint32_t> &shape,
    switch (ttnnDataType) {
    case ::ttnn::DataType::FLOAT32:
      return utils::createTTNNTensor<float>(src, ttnnShape, ttnnDataType);
@@ -114,7 +114,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    case ::ttnn::DataType::BFLOAT16:
      return utils::createTTNNTensor<bfloat16>(src, ttnnShape, ttnnDataType);
    case ::ttnn::DataType::UINT32:
-@@ -260,6 +263,9 @@ createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
+@@ -269,6 +272,9 @@ createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
    case ::tt::target::DataType::Float32:
      return utils::createRuntimeTensorFromTTNN(
          utils::createBorrowedTTNNTensor<float>(data, ttnnShape));
@@ -124,7 +124,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    case ::tt::target::DataType::BFloat16:
      return utils::createRuntimeTensorFromTTNN(
          utils::createBorrowedTTNNTensor<bfloat16>(data, ttnnShape));
-@@ -471,6 +477,13 @@ std::vector<std::byte> getTensorDataBuffer(::tt::runtime::Tensor tensor) {
+@@ -480,6 +486,13 @@ std::vector<std::byte> getTensorDataBuffer(::tt::runtime::Tensor tensor) {
      std::memcpy(dataVec.data(), dataPtr, dataVec.size());
      return dataVec;
    }

@@ -1,7 +1,7 @@
 diff --git tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp
 --- tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp
 +++ tt_metal/impl/dataflow_buffer/dataflow_buffer.cpp
-@@ -1732,7 +1732,23 @@ uint32_t ProgramImpl::assign_dfb_device_slot(const DataflowBufferImpl& dfb) cons
+@@ -1820,7 +1820,23 @@ uint32_t ProgramImpl::assign_dfb_device_slot(const DataflowBufferImpl& dfb) cons
          }
      }
  

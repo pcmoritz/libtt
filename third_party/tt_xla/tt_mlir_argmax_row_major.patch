@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
-@@ -619,9 +619,11 @@ const std::set<mlir::StringRef>
+@@ -621,9 +621,11 @@ const std::set<mlir::StringRef>
          ttnn::AllToAllCombineOp::getOperationName(),
          ttnn::MoeExpertTokenRemapOp::getOperationName(),
          ttnn::SparseMatmulOp::getOperationName(),

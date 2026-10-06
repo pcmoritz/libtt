@@ -142,7 +142,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/unti
 diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
-@@ -71,6 +71,7 @@ ttnn::Tensor untilize_native(
+@@ -70,6 +70,7 @@ ttnn::Tensor untilize_native(
              input_tensor, output_tensor_end, memory_config, use_multicore, sub_core_grids);
      }
      bool fp32_dest_acc_en = input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||
@@ -153,8 +153,8 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp ttnn/cpp
 diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp
-@@ -112,8 +112,7 @@ tt::tt_metal::ProgramDescriptor UntilizeWithUnpaddingMultiCoreInterleavedProgram
-         writer_page_size = out_mem_config.shard_spec().value().shape[1] * output.element_size();
+@@ -118,8 +118,7 @@ tt::tt_metal::ProgramDescriptor UntilizeWithUnpaddingMultiCoreInterleavedProgram
+         }
      }
      std::vector<uint32_t> writer_ct_args = {
 -        (input_cb_data_format == tt::DataFormat::Float32 or input_cb_data_format == tt::DataFormat::UInt32 or
@@ -163,7 +163,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device
          unpadded_row_size_bytes,
          writer_page_size};
      TensorAccessorArgs(*dst_buffer).append_to(writer_ct_args);
-@@ -130,7 +129,7 @@ tt::tt_metal::ProgramDescriptor UntilizeWithUnpaddingMultiCoreInterleavedProgram
+@@ -136,7 +135,7 @@ tt::tt_metal::ProgramDescriptor UntilizeWithUnpaddingMultiCoreInterleavedProgram
       */
      KernelDescriptor::Defines compute_kernel_defines;
      if (input_cb_data_format == tt::DataFormat::Int32 || input_cb_data_format == tt::DataFormat::UInt32 ||
@@ -183,8 +183,8 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device
 +    constexpr uint32_t num_tiles_per_row = get_compile_time_arg_val(0);
      constexpr uint32_t unpadded_X_size = get_compile_time_arg_val(1);
      // Per-shard page size in bytes: shard width for BLOCK/WIDTH-sharded output (a logical row
-     // spans multiple shards), full unpadded row otherwise. Feeds noc_async_write_sharded's
-@@ -29,8 +29,6 @@ void kernel_main() {
+     // spans multiple shards), the destination buffer's aligned page size for HEIGHT-sharded output
+@@ -31,8 +31,6 @@ void kernel_main() {
      constexpr uint32_t writer_page_size = get_compile_time_arg_val(2);
      constexpr auto dst_args = TensorAccessorArgs<3>();
  

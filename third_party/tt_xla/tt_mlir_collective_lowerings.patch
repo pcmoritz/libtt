@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -5304,6 +5304,58 @@ private:
+@@ -5355,6 +5355,58 @@ private:
  };
  } // namespace
  
@@ -60,7 +60,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  namespace {
  class StableHLOToTTIRReduceScatterOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::ReduceScatterOp> {
-@@ -12222,6 +12274,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
+@@ -12215,6 +12267,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
                                         RewritePatternSet &patterns,
                                         TypeConverter &typeConverter) {
    patterns.add<StableHLOToTTIRAllReduceOpConversionPattern>(typeConverter, ctx);
@@ -72,7 +72,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 --- a/lib/Dialect/TTIR/IR/TTIROps.cpp
 +++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
-@@ -5629,8 +5629,10 @@ mlir::OpFoldResult mlir::tt::ttir::RepeatInterleaveOp::fold(FoldAdaptor fold) {
+@@ -5731,8 +5731,10 @@ mlir::OpFoldResult mlir::tt::ttir::RepeatInterleaveOp::fold(FoldAdaptor fold) {
  ::mlir::LogicalResult mlir::tt::ttir::AllReduceOp::verify() {
    ::mlir::tt::ttcore::ReduceType reduceType = getReduceType();
  
@@ -88,7 +88,7 @@ diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-@@ -4901,8 +4901,10 @@ mlir::tt::ttnn::ReduceScatterOp::fold(FoldAdaptor adaptor) {
+@@ -5268,8 +5268,10 @@ mlir::tt::ttnn::ReduceScatterOp::fold(FoldAdaptor adaptor) {
  ::mlir::LogicalResult AllReduceOp::verify() {
    ::mlir::tt::ttcore::ReduceType reduceType = getReduceType();
  

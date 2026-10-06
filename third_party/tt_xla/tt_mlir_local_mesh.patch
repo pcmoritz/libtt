@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -4773,9 +4773,22 @@ static llvm::ErrorOr<ttcore::ReduceType> getReduceType(Operation *op) {
+@@ -4824,9 +4824,22 @@ static llvm::ErrorOr<ttcore::ReduceType> getReduceType(Operation *op) {
    return getReduceTypeFromRegion(op->getRegion(0));
  }
  
@@ -25,7 +25,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    /*
    We need to figure out what the cluster axis is based on replica_groups.
    Replica groups define which device axis we are performing the collective
-@@ -4812,14 +4825,44 @@ determineClusterAxis(::mlir::DenseIntElementsAttr replicaGroups,
+@@ -4863,14 +4876,44 @@ determineClusterAxis(::mlir::DenseIntElementsAttr replicaGroups,
  
    // Case where we have single devices in each replica_group (ie perform
    // collective communication operation against itself which should be optimized
@@ -76,7 +76,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    }
  
    // If replicaGroupsShape[1] == 1, then the cluster axis should be set to 0.
-@@ -5209,9 +5252,15 @@ public:
+@@ -5260,9 +5303,15 @@ public:
        }
      }
  
@@ -93,7 +93,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp, "AllReduceOp cannot specify cluster axis.");
      }
-@@ -5283,9 +5332,15 @@ public:
+@@ -5334,9 +5383,15 @@ public:
        }
      }
  
@@ -110,7 +110,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp, "ReduceScatterOp cannot specify cluster axis.");
      }
-@@ -5326,9 +5381,15 @@ public:
+@@ -5377,9 +5432,15 @@ public:
      auto outputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult(0).getType()));
  
@@ -161,7 +161,7 @@ diff --git a/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp b/lib/Dialec
 diff --git a/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp b/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
 --- a/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
 +++ b/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
-@@ -1434,14 +1434,28 @@ void MemoryLayoutPropagation::applyToIR() {
+@@ -1459,14 +1459,28 @@ void MemoryLayoutPropagation::applyToIR() {
    // First pass: apply op configs. Collected up front because applyOpConfig can
    // insert a reconciling cast right after the op it is configuring.
    SmallVector<Operation *> configuredOps;

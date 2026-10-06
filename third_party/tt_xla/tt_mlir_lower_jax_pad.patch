@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -8259,10 +8259,51 @@ class StableHLOToTTIROpPadOpConversionPattern
+@@ -8307,10 +8307,51 @@ class StableHLOToTTIROpPadOpConversionPattern
    using OpConversionPattern<mlir::stablehlo::PadOp>::OpConversionPattern;
  
  public:
@@ -53,7 +53,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      LogicalResult legalityResult =
          checkConversionLegality(srcOp, adaptor, rewriter);
-@@ -8290,6 +8331,30 @@ public:
+@@ -8338,6 +8379,30 @@ public:
        steps.push_back(eachVal + 1);
        sum += eachVal;
      }
@@ -84,7 +84,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      if (sum != 0) {
        auto fullOp = rewriter.create<ttir::FullOp>(
            srcOp.getLoc(), outputType, rewriter.getF32FloatAttr(value));
-@@ -8311,7 +8376,7 @@ public:
+@@ -8359,7 +8424,7 @@ public:
        flatIndices.append(counters.begin(), counters.end());
        int64_t numIndices = 1;
  
@@ -93,7 +93,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        while (current_index < counters.size() &&
               counters[counters.size() - 1] <
                   upperbounds[upperbounds.size() - 1]) {
-@@ -8320,7 +8385,7 @@ public:
+@@ -8368,7 +8433,7 @@ public:
          while (current_index < counters.size() &&
                 counters[current_index] >= upperbounds[current_index]) {
            counters[current_index] = lowerbounds[current_index];
@@ -102,7 +102,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
            if (current_index < counters.size()) {
              counters[current_index] += steps[current_index];
            }
-@@ -8330,7 +8395,7 @@ public:
+@@ -8378,7 +8443,7 @@ public:
            break;
          }
          if (reset) {

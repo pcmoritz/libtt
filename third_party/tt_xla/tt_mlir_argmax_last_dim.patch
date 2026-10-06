@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 --- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 +++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
-@@ -2051,14 +2051,14 @@ struct ArgMaxPattern : public OpConversionPattern<ttir::ArgMaxOp> {
+@@ -2041,14 +2041,14 @@ struct ArgMaxPattern : public OpConversionPattern<ttir::ArgMaxOp> {
    LogicalResult
    matchAndRewrite(ttir::ArgMaxOp op, OpAdaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
@@ -21,7 +21,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
 --- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
 +++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
-@@ -166,9 +166,17 @@ struct TTIRToTTIRDecompositionPass
+@@ -191,9 +191,17 @@ struct TTIRToTTIRDecompositionPass
        return !isa_and_nonnull<ttir::FullOp>(op.getInput().getDefiningOp());
      });
  

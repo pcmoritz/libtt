@@ -86,3 +86,17 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn
              return {
                  "clamp_tile_init();",
                  fmt::format(
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
+@@ -33,8 +33,9 @@ bool is_relu_family_int(DataType dtype) { return is_int32(dtype) || is_unsigned_
+ bool unary_op_supports_integer_dtype(UnaryOpType op_type, DataType dtype) {
+     switch (op_type) {
+         case UnaryOpType::ABS: return is_unsigned_int(dtype);
++        // clamp_tile_uint32 handles UINT32.
++        case UnaryOpType::CLAMP_TSS: return is_int32_uint32(dtype);
+         case UnaryOpType::ABS_INT32:
+-        case UnaryOpType::CLAMP_TSS:
+         case UnaryOpType::GEZ:
+         case UnaryOpType::GTZ:
+         case UnaryOpType::LEZ:

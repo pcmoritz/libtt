@@ -243,7 +243,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_op
          case LCM:
          case GCD: return (a == INT32 && b == INT32);
          case LEFT_SHIFT:
-@@ -633,8 +637,9 @@ ttnn::operations::binary_ng::BinaryNgDeviceOperation::tensor_return_value_t bina
+@@ -639,8 +643,9 @@ ttnn::operations::binary_ng::BinaryNgDeviceOperation::tensor_return_value_t bina
          fast_and_approximate_mode,
          output_tensor ? output_tensor->dtype() : output_dtype.value_or(dtype_a),
          input_tensor_a.device()->arch());
@@ -254,7 +254,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_op
      bool is_quant_op = ttnn::operations::binary::utils::is_quant_op(binary_op_type);
      bool is_where_op =
          (binary_op_type == ttnn::operations::binary_ng::BinaryOpType::WHERE_TTS ||
-@@ -790,8 +795,9 @@ ttnn::operations::binary_ng::BinaryNgDeviceOperation::tensor_return_value_t bina
+@@ -798,8 +803,9 @@ ttnn::operations::binary_ng::BinaryNgDeviceOperation::tensor_return_value_t bina
          fast_and_approximate_mode,
          output_tensor ? output_tensor->dtype() : output_dtype.value_or(dtype_a),
          input_tensor_a.device()->arch());
@@ -280,22 +280,22 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
 +         operation_attributes.binary_op_type == BinaryOpType::GT ||
 +         operation_attributes.binary_op_type == BinaryOpType::LE ||
 +         operation_attributes.binary_op_type == BinaryOpType::GE);
-     // Int8 quant input (dequant/requant operand A) is read through the UInt8 unpacker.
-     const auto a_data_format =
-         (is_quant_op && a_dtype == DataType::INT8) ? tt::DataFormat::UInt8 : datatype_to_dataformat_converter(a_dtype);
-@@ -1204,8 +1212,9 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
-     // loading fp32 tiles into a DST configured for bf16 produces tile-aligned corruption
-     // for broadcast multiply (issue 43196).
-     bool fp32_dest_acc_en = c_data_format == tt::DataFormat::UInt32 || c_data_format == tt::DataFormat::Int32 ||
--                            a_data_format == tt::DataFormat::Float16 ||
--                            b_data_format == tt::DataFormat::Float16 || c_data_format == tt::DataFormat::Float16 ||
-+                            (!is_fp16_comparison &&
-+                             (a_data_format == tt::DataFormat::Float16 || b_data_format == tt::DataFormat::Float16 ||
-+                              c_data_format == tt::DataFormat::Float16)) ||
-                             c_data_format == tt::DataFormat::Float32 || a_data_format == tt::DataFormat::Float32 ||
-                             b_data_format == tt::DataFormat::Float32 ||
-                             (a_data_format == tt::DataFormat::Int32 && b_data_format == tt::DataFormat::Int32) ||
-@@ -1221,7 +1230,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+     // Int8 input (dequant/requant operand A) is read through the UInt8 unpacker.
+     const auto a_data_format = cb_dataformat_for(a_dtype);
+     const auto b_data_format = datatype_to_dataformat_converter(b_dtype);
+@@ -1039,8 +1047,9 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+     // tiles a compute batch may hold in DST (below), not only the compute kernel config.
+     const bool fp32_dest_acc_en =
+         c_data_format == tt::DataFormat::UInt32 || c_data_format == tt::DataFormat::Int32 ||
+-        a_data_format == tt::DataFormat::Float16 || b_data_format == tt::DataFormat::Float16 ||
+-        c_data_format == tt::DataFormat::Float16 ||
++        (!is_fp16_comparison &&
++         (a_data_format == tt::DataFormat::Float16 || b_data_format == tt::DataFormat::Float16 ||
++          c_data_format == tt::DataFormat::Float16)) ||
+         c_data_format == tt::DataFormat::Float32 || a_data_format == tt::DataFormat::Float32 ||
+         b_data_format == tt::DataFormat::Float32 ||
+         (a_data_format == tt::DataFormat::Int32 && b_data_format == tt::DataFormat::Int32) ||
+@@ -1247,7 +1256,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
  
      std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
  
@@ -307,7 +307,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
-@@ -514,6 +514,9 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+@@ -529,6 +529,9 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
                      fmt::format("lt_int_tile_init<DataFormat::{}>();", *int_data_format),
                      fmt::format("lt_int_tile<DataFormat::{}>", *int_data_format)};
              }
@@ -317,7 +317,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
              return {"lt_binary_tile_init();", "lt_binary_tile"};
          case GT:
              if (int_data_format) {
-@@ -521,6 +524,9 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+@@ -536,6 +539,9 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
                      fmt::format("gt_int_tile_init<DataFormat::{}>();", *int_data_format),
                      fmt::format("gt_int_tile<DataFormat::{}>", *int_data_format)};
              }
@@ -327,7 +327,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
              return {"gt_binary_tile_init();", "gt_binary_tile"};
          case GE:
              if (int_data_format) {
-@@ -528,6 +534,9 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+@@ -543,6 +549,9 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
                      fmt::format("ge_int_tile_init<DataFormat::{}>();", *int_data_format),
                      fmt::format("ge_int_tile<DataFormat::{}>", *int_data_format)};
              }
@@ -337,7 +337,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
              return {"ge_binary_tile_init();", "ge_binary_tile"};
          case LE:
              if (int_data_format) {
-@@ -535,6 +544,9 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+@@ -550,6 +559,9 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
                      fmt::format("le_int_tile_init<DataFormat::{}>();", *int_data_format),
                      fmt::format("le_int_tile<DataFormat::{}>", *int_data_format)};
              }
@@ -347,7 +347,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
              return {"le_binary_tile_init();", "le_binary_tile"};
          case EQ:
              if (int_data_format) {
-@@ -542,6 +554,9 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+@@ -557,6 +569,9 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
                      fmt::format("eq_int_tile_init<DataFormat::{}>();", *int_data_format),
                      fmt::format("eq_int_tile<DataFormat::{}>", *int_data_format)};
              }
@@ -357,7 +357,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
              return {"eq_binary_tile_init();", "eq_binary_tile"};
          case NE:
              if (int_data_format) {
-@@ -549,6 +564,9 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+@@ -564,6 +579,9 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
                      fmt::format("ne_int_tile_init<DataFormat::{}>();", *int_data_format),
                      fmt::format("ne_int_tile<DataFormat::{}>", *int_data_format)};
              }

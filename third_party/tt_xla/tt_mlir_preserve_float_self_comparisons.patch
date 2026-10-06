@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 --- a/lib/Dialect/TTIR/IR/TTIROps.cpp
 +++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
-@@ -8788,13 +8788,15 @@ static bool anyZero(mlir::ElementsAttr elems) {
+@@ -8831,13 +8831,15 @@ static bool anyZero(mlir::ElementsAttr elems) {
        });
  }
  

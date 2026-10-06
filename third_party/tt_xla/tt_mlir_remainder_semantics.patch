@@ -1,3 +1,27 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -222,6 +222,10 @@ public:
+   mlir::LogicalResult
+   matchAndRewrite(ElementwiseBinaryActivations binaryOpWithActivations,
+                   mlir::PatternRewriter &rewriter) const final {
++    // Remainder runs as a truncating fmod, which takes no activations.
++    if (isa<RemainderOp>(binaryOpWithActivations.getOperation())) {
++      return mlir::failure();
++    }
+     auto binaryOp =
+         mlir::cast<ElementwiseBinary>(binaryOpWithActivations.getOperation());
+     bool isFused = false;
+@@ -320,7 +324,8 @@ private:
+   }
+ 
+   ElementwiseBinaryActivations getFusableBinaryOp(Value operand) const {
+-    if (!operand.hasOneUse()) {
++    // Remainder runs as a truncating fmod, which takes no activations.
++    if (!operand.hasOneUse() || operand.getDefiningOp<RemainderOp>()) {
+       return {};
+     }
+ 
 diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp b/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
 --- a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
 +++ b/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp
@@ -35,27 +59,3 @@ diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary_composite.cpp b/r
          });
      break;
    }
-diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
---- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-+++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -217,6 +217,10 @@ public:
-   mlir::LogicalResult
-   matchAndRewrite(ElementwiseBinaryActivations binaryOpWithActivations,
-                   mlir::PatternRewriter &rewriter) const final {
-+    // Remainder runs as a truncating fmod, which takes no activations.
-+    if (isa<RemainderOp>(binaryOpWithActivations.getOperation())) {
-+      return mlir::failure();
-+    }
-     auto binaryOp =
-         mlir::cast<ElementwiseBinary>(binaryOpWithActivations.getOperation());
-     bool isFused = false;
-@@ -305,7 +309,8 @@ private:
-   }
- 
-   ElementwiseBinaryActivations getFusableBinaryOp(Value operand) const {
--    if (!operand.hasOneUse()) {
-+    // Remainder runs as a truncating fmod, which takes no activations.
-+    if (!operand.hasOneUse() || operand.getDefiningOp<RemainderOp>()) {
-       return {};
-     }
- 

@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -267,6 +267,17 @@ public:
+@@ -264,6 +264,17 @@ public:
        return legalityResult;
      }
  
@@ -19,7 +19,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      const mlir::Operation &innerOp = srcOp.getBody().front().front();
  
      if (mlir::isa<mlir::stablehlo::AddOp>(innerOp)) {
-@@ -293,14 +304,6 @@ public:
+@@ -290,14 +301,6 @@ public:
        return matchAndRewriteInternal<mlir::tt::ttir::ReduceOrOp>(srcOp, adaptor,
                                                                   rewriter);
      }
@@ -34,7 +34,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      return failure();
    }
  
-@@ -364,6 +367,79 @@ private:
+@@ -361,6 +364,79 @@ private:
      return success();
    }
  
