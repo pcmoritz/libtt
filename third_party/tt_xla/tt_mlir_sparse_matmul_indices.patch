@@ -82,7 +82,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/matmul.fbs b/include/ttmlir/T
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -12747,23 +12747,37 @@ public:
+@@ -12747,23 +12747,39 @@ public:
        }
      }
  
@@ -104,9 +104,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    Value indices =
 +        adaptor.getOperands().size() == 4 ? adaptor.getOperands()[3] : Value();
 +    if (indices) {
-+      // The ids are a list; TTNN reads them as a single row.
++      // The ids are a list; TTNN reads them as a single row, so every dim
++      // but the last must be 1.
 +      auto indicesType = cast<RankedTensorType>(indices.getType());
-+      if (indicesType.getRank() != 1) {
++      if (indicesType.getRank() == 0 ||
++          indicesType.getShape().back() != indicesType.getNumElements()) {
 +        indices = ttir::utils::createReshapeOp(
 +            rewriter, srcOp.getLoc(), indices,
 +            {static_cast<int64_t>(indicesType.getNumElements())});
