@@ -1,0 +1,123 @@
+"""Programs may use several meshes over the same devices.
+
+JAX lets every shard_map or sharding choose its own mesh, e.g. a layer that
+arranges the model's (data, tensor) devices as (expert, tensor). tt-mlir
+compiles a program for one mesh, so libtt rewrites shardings on the other
+meshes in terms of whole axes of one of them, the first that can express them
+all.
+"""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
+
+
+@pytest.fixture
+def devices():
+    devices = jax.devices("tt")
+    if len(devices) != 4:
+        pytest.skip("needs exactly four chips")
+    return np.array(devices)
+
+
+def test_reduction_on_renamed_mesh(devices):
+    """A layer's own (expert, model) mesh next to the model's (data, tensor)."""
+    outer = Mesh(devices.reshape(1, 4), ("data", "tensor"))
+    inner = Mesh(devices.reshape(1, 4), ("expert", "model"))
+
+    @jax.jit
+    def run(x, w, bias):
+        partial = jax.shard_map(
+            lambda x, w: jax.lax.psum(x @ w, "model"),
+            mesh=inner,
+            in_specs=(P(None, "model"), P("model", None)),
+            out_specs=P(),
+        )(x, w)
+        return jax.lax.with_sharding_constraint(partial + bias, NamedSharding(outer, P()))
+
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((8, 64)).astype(np.float32)
+    w = rng.standard_normal((64, 32)).astype(np.float32)
+    bias = rng.standard_normal((8, 32)).astype(np.float32)
+    out = run(
+        jax.device_put(x, NamedSharding(outer, P())),
+        jax.device_put(w, NamedSharding(inner, P("model", None))),
+        jax.device_put(bias, NamedSharding(outer, P())),
+    )
+    np.testing.assert_allclose(np.asarray(out), x @ w + bias, rtol=2e-2, atol=2e-1)
+
+
+@pytest.mark.parametrize(
+    "outer_shape,inner_shape,inner_axes",
+    [
+        ((2, 2), (2, 2), ("expert", "model")),  # Renamed axes.
+        ((1, 4), (2, 2), ("expert", "model")),  # One outer axis spans both.
+        ((2, 2), (1, 4), "model"),  # One inner axis spans both outer axes.
+    ],
+)
+def test_sharding_on_reshaped_mesh(devices, outer_shape, inner_shape, inner_axes):
+    outer = Mesh(devices.reshape(outer_shape), ("data", "tensor"))
+    inner = Mesh(devices.reshape(inner_shape), ("expert", "model"))
+
+    @jax.jit
+    def run(x, y):
+        z = jax.shard_map(
+            lambda x: jnp.tanh(x) * 2,
+            mesh=inner,
+            in_specs=P(None, inner_axes),
+            out_specs=P(None, inner_axes),
+        )(x)
+        return z + y
+
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal((8, 64)).astype(np.float32)
+    y = rng.standard_normal((8, 64)).astype(np.float32)
+    out = run(
+        jax.device_put(x, NamedSharding(inner, P(None, inner_axes))),
+        jax.device_put(y, NamedSharding(outer, P())),
+    )
+    np.testing.assert_allclose(np.asarray(out), np.tanh(x) * 2 + y, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("rows", [4])
+def test_mesh_with_trailing_size_one_axis(devices, rows):
+    """tt-mlir takes (1, n) meshes; an (n, 1) mesh is the same devices."""
+    mesh = Mesh(devices[:rows].reshape(rows, 1), ("x", "y"))
+    x = np.arange(8 * 4, dtype=np.float32).reshape(8, 4)
+    run = jax.jit(
+        jax.shard_map(
+            lambda x: jax.lax.psum(x, "x"), mesh=mesh, in_specs=P("x", "y"), out_specs=P(None, "y")
+        )
+    )
+    out = run(jax.device_put(x, NamedSharding(mesh, P("x", "y"))))
+    np.testing.assert_allclose(np.asarray(out), x.reshape(rows, -1, 4).sum(0))
+
+
+def test_first_mesh_that_cannot_hold_the_others(devices, tmp_path):
+    """The (1, 4) mesh comes first, but its axis would hold the (2, 2) mesh's
+    axes only as sub-axes, so the shardings go onto the (2, 2) mesh."""
+    outer = Mesh(devices.reshape(1, 4), ("data", "tensor"))
+    inner = Mesh(devices.reshape(2, 2), ("expert", "model"))
+
+    @jax.jit
+    def run(x):
+        return jax.shard_map(
+            lambda x: jnp.tanh(x) * 2,
+            mesh=inner,
+            in_specs=P(None, ("expert", "model")),
+            out_specs=P(None, ("expert", "model")),
+        )(x)
+
+    x = np.random.default_rng(2).standard_normal((8, 64)).astype(np.float32)
+    x_on_outer = jax.device_put(x, NamedSharding(outer, P(None, "tensor")))
+    meshes = [line for line in run.lower(x_on_outer).as_text().splitlines() if "sdy.mesh @" in line]
+    assert '"tensor"' in meshes[0] and '"expert"' in meshes[1]
+    compiled = run.lower(x_on_outer).compile({"export_path": str(tmp_path)})
+    (frontend,) = (tmp_path / "irs").glob("shlo_frontend_*.mlir")
+    merged = [line for line in frontend.read_text().splitlines() if "sdy.mesh @" in line]
+    assert len(merged) == 1 and '"expert"=2, "model"=2' in merged[0]
+    out = compiled(x_on_outer)
+    np.testing.assert_allclose(np.asarray(out), np.tanh(x) * 2, rtol=2e-2, atol=2e-2)

@@ -398,6 +398,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_local_mesh.patch",
         "//third_party/tt_xla:tt_xla_lazy_input_strategy.patch",
         "//third_party/tt_xla:tt_xla_shared_client_instance.patch",
+        "//third_party/tt_xla:tt_xla_merge_meshes.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -508,6 +509,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_collective_lowerings.patch",
         "//third_party/tt_xla:tt_mlir_paged_update_shared_cache.patch",
         "//third_party/tt_xla:tt_mlir_empty_meshes.patch",
+        "//third_party/tt_xla:tt_mlir_column_meshes.patch",
         "//third_party/tt_xla:tt_mlir_sdy_reduction_kind.patch",
         "//third_party/tt_xla:tt_mlir_argmax_last_dim.patch",
         "//third_party/tt_xla:tt_mlir_mixed_manual_graphs.patch",
