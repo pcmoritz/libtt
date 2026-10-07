@@ -33,11 +33,14 @@ def _run(devices, ids):
         jax.shard_map(lambda a: jax.lax.psum(a, "x"), mesh=mesh, in_specs=P("x"), out_specs=P())
     )(sharded)
     np.testing.assert_allclose(np.asarray(total), x.reshape(len(ids), -1, 2).sum(0))
-    return out
 
 
 def test_switching_between_submeshes_and_the_whole_mesh(devices):
-    first = _run(devices, [0, 1])
+    mesh = Mesh(np.array(devices[:2]), ("x",))
+    x = np.arange(16, dtype=np.float32).reshape(8, 2)
+    double = jax.jit(lambda a: a * 2)
+    # Left on the chips, unread, while programs run on other meshes.
+    kept = double(jax.device_put(x, NamedSharding(mesh, P("x"))))
     _run(devices, [2, 3])
     _run(devices, [0, 1, 2, 3])
     _run(devices, [0, 1])
@@ -45,10 +48,8 @@ def test_switching_between_submeshes_and_the_whole_mesh(devices):
     np.testing.assert_allclose(np.asarray(single), 2)
     _run(devices, [2, 3])
     _run(devices, [0, 1, 2, 3])
-    # Results of earlier programs stay readable.
-    np.testing.assert_allclose(
-        np.asarray(first), np.arange(16, dtype=np.float32).reshape(8, 2) * 2 + 1
-    )
+    np.testing.assert_allclose(np.asarray(double(kept)), x * 4)
+    np.testing.assert_allclose(np.asarray(kept), x * 2)
 
 
 def test_whole_mesh_after_a_submesh_program_without_inputs(devices):

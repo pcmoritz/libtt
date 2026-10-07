@@ -84,8 +84,8 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 +  };
 +  const bool reopen_root = !m_root_mesh.has_value() ||
 +                           !holds(tt::runtime::getMeshShape(*m_root_mesh));
-+  const std::vector<uint32_t> root_shape = {rows, num_chips / rows};
-+  if (reopen_root && (num_chips % rows != 0 || !holds(root_shape))) {
++  // As rows * cols <= num_chips, a root of `rows` rows holds the submesh.
++  if (reopen_root && num_chips % rows != 0) {
 +    return std::nullopt;
 +  }
 +
@@ -95,7 +95,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 +  TensorPool::move_tensors_to_host();
 +  if (reopen_root) {
 +    closeParentMesh();
-+    m_root_mesh = openMeshDevice(root_shape);
++    m_root_mesh = openMeshDevice({rows, num_chips / rows});
 +  } else {
 +    releaseSubMesh();
 +  }
