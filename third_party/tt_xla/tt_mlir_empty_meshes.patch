@@ -13,7 +13,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
  #include "stablehlo/dialect/StablehloOps.h"
  
  #include <numeric>
-@@ -102,8 +104,382 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
+@@ -102,8 +104,429 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
    addMeshToModule(module, meshName, meshMap);
  }
  
@@ -137,9 +137,43 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +  });
 +}
 +
++// The (rows, columns) device grid tt-mlir compiles `mesh` for: (1, n) for a
++// one-axis mesh.
++static llvm::SmallVector<int64_t> gridShape(mlir::sdy::MeshAttr mesh) {
++  llvm::SmallVector<int64_t> shape = getMeshShapeFromMeshAttr(mesh);
++  while (shape.size() < 2) {
++    shape.insert(shape.begin(), 1);
++  }
++  return shape;
++}
++
++// Whether tt-mlir can run collectives over `groups` on `grid`: each group must
++// be one device, or the groups must be its rows or its columns, in order
++// (determineClusterAxis in StableHLOToTTIRPatterns.cpp).
++static bool supportsReplicaGroups(mlir::DenseIntElementsAttr groups,
++                                  llvm::ArrayRef<int64_t> grid) {
++  llvm::ArrayRef<int64_t> shape = groups.getType().getShape();
++  if (shape.size() != 2 || shape[1] == 1) {
++    return shape.size() == 2;
++  }
++  auto ids = llvm::to_vector(groups.getValues<int64_t>());
++  const int64_t rows = grid[0];
++  const int64_t cols = grid[1];
++  if (shape[1] == cols && llvm::equal(ids, llvm::seq<int64_t>(0, rows * cols))) {
++    return true;
++  }
++  llvm::SmallVector<int64_t> columns;
++  for (int64_t c = 0; c < cols; ++c) {
++    for (int64_t r = 0; r < rows; ++r) {
++      columns.push_back(r * cols + c);
++    }
++  }
++  return shape[1] == rows && ids == columns;
++}
++
 +// The mesh `mesh` becomes as a target: size-one axes go when it has more than
 +// two axes, so e.g. (1, 4, 1) becomes (4), which does not move a device. None
-+// when more than two axes remain, which tt-mlir cannot compile for.
++// when more than two axes remain, or tt-mlir does not take the grid.
 +static std::optional<mlir::sdy::MeshAttr>
 +targetMesh(mlir::sdy::MeshAttr mesh) {
 +  mlir::MLIRContext *context = mesh.getContext();
@@ -154,6 +188,9 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +      return std::nullopt;
 +    }
 +    mesh = mlir::sdy::MeshAttr::get(context, axes, mesh.getDeviceIds());
++  }
++  if (mlir::failed(sharding_utils::checkValidMesh(gridShape(mesh)))) {
++    return std::nullopt;
 +  }
 +  return mesh;
 +}
@@ -230,8 +267,14 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +      if (!axes) {
 +        return std::nullopt;
 +      }
++      // A closed dimension left without axes has no priority, as Shardy's
++      // size-one-axis removal also drops it.
++      std::optional<int64_t> priority = dim.getPriority();
++      if (axes->empty() && dim.getIsClosed()) {
++        priority = std::nullopt;
++      }
 +      dims.push_back(mlir::sdy::DimensionShardingAttr::get(
-+          context, *axes, dim.getIsClosed(), dim.getPriority()));
++          context, *axes, dim.getIsClosed(), priority));
 +    }
 +    auto replicated = express(mesh, sharding.getReplicatedAxes());
 +    auto unreduced = express(mesh, sharding.getUnreducedAxes());
@@ -243,23 +286,22 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +        inMeshOrder(*unreduced));
 +  };
 +
-+  // Manual axes name whole axes of their region's mesh; a region without
-+  // operands still has results.
++  // Manual axes name whole axes of their region's mesh, the one its operand
++  // and result shardings share apart from empty placeholder meshes.
++  mlir::SymbolTable symbolTable(module);
 +  auto planManualAxes = [&](mlir::sdy::ManualComputationOp op) {
-+    llvm::ArrayRef<mlir::sdy::TensorShardingAttr> shardings =
-+        op.getInShardings().getShardings();
-+    if (shardings.empty()) {
-+      shardings = op.getOutShardings().getShardings();
-+    }
-+    if (shardings.empty() ||
-+        !meshes.contains(meshName(shardings.front()))) {
++    auto mesh = mlir::dyn_cast_or_null<mlir::FlatSymbolRefAttr>(
++        mlir::sdy::getCommonMeshOrRef(op.getInShardings().getShardings(),
++                                      op.getOutShardings().getShardings(),
++                                      symbolTable));
++    if (!mesh || !meshes.contains(mesh.getValue())) {
 +      return true;
 +    }
 +    llvm::SmallVector<mlir::sdy::AxisRefAttr> refs;
 +    for (mlir::StringAttr axis : op.getManualAxes()) {
 +      refs.push_back(mlir::sdy::AxisRefAttr::get(context, axis.getValue()));
 +    }
-+    auto axes = express(meshName(shardings.front()), refs);
++    auto axes = express(mesh.getValue(), refs);
 +    if (!axes) {
 +      return false;
 +    }
@@ -291,10 +333,15 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +        if (!expressible) {
 +          return;
 +        }
-+        // Explicit collectives name axes outside any sharding; leave them be
-+        // unless their mesh stays as it is.
-+        if (auto collective =
-+                mlir::dyn_cast<mlir::sdy::CollectiveOpInterface>(op)) {
++        if (auto groups =
++                op->getAttrOfType<mlir::DenseIntElementsAttr>("replica_groups")) {
++          // Collectives over device groups must run along a row or column of
++          // the target's grid.
++          expressible = supportsReplicaGroups(groups, gridShape(*target));
++        } else if (auto collective =
++                       mlir::dyn_cast<mlir::sdy::CollectiveOpInterface>(op)) {
++          // Explicit collectives name axes outside any sharding; leave them be
++          // unless their mesh stays as it is.
 +          llvm::StringRef mesh = meshName(collective.getOutSharding());
 +          expressible = !meshes.contains(mesh) ||
 +                        (mesh == targetOp.getSymName() && !targetChanges);
@@ -396,7 +443,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
    auto meshOps = getMeshOps(module);
    if (meshOps.empty()) {
      return mlir::success();
-@@ -132,6 +508,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
+@@ -132,6 +555,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
    if (meshRank == 1) {
      axisName = meshOps[0].getMeshAttr().getAxes()[0].getName().str();
      axisSize = meshShape[0];

@@ -144,3 +144,25 @@ def test_first_mesh_that_cannot_hold_the_others(devices, tmp_path):
     assert len(merged) == 1 and '"expert"=2, "model"=2' in merged[0]
     out = compiled(x_on_outer)
     np.testing.assert_allclose(np.asarray(out), np.tanh(x) * 2, rtol=2e-2, atol=2e-2)
+
+
+def test_reduction_over_every_chip_on_a_line_mesh(devices):
+    """A psum over all four chips runs along the (1, 4) mesh's row, not across
+    both axes of the (2, 2) mesh that comes first."""
+    square = Mesh(devices.reshape(2, 2), ("data", "tensor"))
+    line = Mesh(devices.reshape(1, 4), ("rows", "cols"))
+
+    @jax.jit
+    def run(x, y):
+        total = jax.shard_map(
+            lambda v: jax.lax.psum(v, "cols"), mesh=line, in_specs=P(None, "cols"), out_specs=P()
+        )(y)
+        return x + total
+
+    x = np.ones((8, 16), np.float32)
+    y = np.arange(8 * 64, dtype=np.float32).reshape(8, 64)
+    out = run(
+        jax.device_put(x, NamedSharding(square, P())),
+        jax.device_put(y, NamedSharding(line, P(None, "cols"))),
+    )
+    np.testing.assert_allclose(np.asarray(out), x + y.reshape(8, 4, 16).sum(1), rtol=1e-2)
