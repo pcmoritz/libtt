@@ -312,6 +312,7 @@ http_archive(
         "//third_party/tt_metal:graph_tracking_program_context.patch",
         "//third_party/tt_metal:conv_single_channel_not_depthwise.patch",
         "//third_party/tt_metal:single_host_all_reduce.patch",
+        "//third_party/tt_metal:sparse_matmul_fp32_partials.patch",
     ],
     sha256 = "e7ce42e8dd832189662a9af0e8d2b397680a75bbab4f71986efb8300435e1eba",
     strip_prefix = "tt-metal-cffd17520cdfc45dc85c1c47cc2aa49f6bff15c0",
@@ -530,6 +531,8 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_op_model_without_ttml.patch",
         "//third_party/tt_xla:tt_mlir_submesh_quiesce.patch",
         "//third_party/tt_xla:tt_mlir_open_shardings.patch",
+        "//third_party/tt_xla:tt_mlir_sparse_matmul_compute_config.patch",
+        "//third_party/tt_xla:tt_mlir_sparse_matmul_program_config.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

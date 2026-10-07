@@ -1,0 +1,16 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1751,7 +1751,11 @@ def TTNN_MatmulOp : TTNN_Op<"matmul", [TTNN_ComputeKernelConfigOpInterface]> {
+ }
+ // ANCHOR_END: adding_an_op_matmul_ttnn
+ 
+-def TTNN_SparseMatmulOp : TTNN_Op<"sparse_matmul", [OpModelExempt]> {
++// Like matmul, take the pipeline's compute kernel config. Without it TTNN
++// picks LoFi for any matmul with a program config, which sparse matmul always
++// has, so experts were less precise than the dense layers around them.
++def TTNN_SparseMatmulOp : TTNN_Op<"sparse_matmul", [OpModelExempt,
++                                                    TTNN_ComputeKernelConfigOpInterface]> {
+     let summary = "Sparse block matrix multiplication with sparsity mask.";
+     let description = [{
+       The `sparse_matmul` operation performs batched matrix multiplication where
