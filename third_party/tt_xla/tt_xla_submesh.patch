@@ -41,7 +41,7 @@ diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
 --- a/pjrt_implementation/src/api/client_instance.cc
 +++ b/pjrt_implementation/src/api/client_instance.cc
-@@ -593,6 +593,16 @@ ClientInstance::computeFabricConfig(const std::vector<uint32_t> &mesh_shape) {
+@@ -593,6 +593,11 @@ ClientInstance::computeFabricConfig(const std::vector<uint32_t> &mesh_shape) {
  tt::runtime::Device ClientInstance::getOrCreateMeshDevice(
      const std::vector<uint32_t> &target_mesh_shape) {
  
@@ -50,20 +50,18 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 +    return *submesh;
 +  }
 +
-+  if (m_submesh_shape.has_value()) {
-+    TensorPool::move_tensors_to_host();
-+    releaseSubMesh();
-+  }
-+
    if (!m_parent_mesh.has_value()) {
      m_parent_mesh = openMeshDevice(target_mesh_shape);
      return *m_parent_mesh;
-@@ -691,7 +701,67 @@ ClientInstance::openMeshDevice(const std::vector<uint32_t> &mesh_shape) {
+@@ -691,7 +696,67 @@ ClientInstance::openMeshDevice(const std::vector<uint32_t> &mesh_shape) {
    return tt::runtime::openMeshDevice(options);
  }
  
 +std::optional<tt::runtime::Device> ClientInstance::getOrCreateSubMesh(
 +    const std::vector<uint32_t> &target_mesh_shape) {
++  if (m_submesh_shape == target_mesh_shape) {
++    return *m_parent_mesh;
++  }
 +  const uint32_t num_chips = static_cast<uint32_t>(m_devices.size());
 +  if (m_compile_only || target_mesh_shape.size() != 2) {
 +    return std::nullopt;
@@ -84,28 +82,25 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 +  auto holds = [&](const std::vector<uint32_t> &shape) {
 +    return rows <= shape[0] && cols <= shape[1];
 +  };
-+  if (!m_root_mesh.has_value() ||
-+      !holds(tt::runtime::getMeshShape(*m_root_mesh))) {
-+    const std::vector<uint32_t> root_shape = {rows, num_chips / rows};
-+    if (num_chips % rows != 0 || !holds(root_shape)) {
-+      return std::nullopt;
-+    }
-+    TensorPool::move_tensors_to_host();
-+    closeParentMesh();
-+    m_root_mesh = openMeshDevice(root_shape);
-+    m_parent_mesh = m_root_mesh;
++  const bool reopen_root = !m_root_mesh.has_value() ||
++                           !holds(tt::runtime::getMeshShape(*m_root_mesh));
++  const std::vector<uint32_t> root_shape = {rows, num_chips / rows};
++  if (reopen_root && (num_chips % rows != 0 || !holds(root_shape))) {
++    return std::nullopt;
 +  }
 +
-+  // Every submesh starts at the root's first chip: device tensors move to the
-+  // host whenever the submesh changes, so which chips it takes does not matter.
-+  if (m_submesh_shape == target_mesh_shape) {
-+    return *m_parent_mesh;
-+  }
 +  DLOG_F(LOG_DEBUG, "ClientInstance::getOrCreateSubMesh - submesh %s",
 +         utils::to_string(target_mesh_shape).c_str());
 +  // Device tensors belong to the mesh they were made on.
 +  TensorPool::move_tensors_to_host();
-+  releaseSubMesh();
++  if (reopen_root) {
++    closeParentMesh();
++    m_root_mesh = openMeshDevice(root_shape);
++  } else {
++    releaseSubMesh();
++  }
++  // Every submesh starts at the root's first chip: device tensors move to the
++  // host whenever the submesh changes, so which chips it takes does not matter.
 +  m_parent_mesh = tt::runtime::createSubMeshDevice(
 +      *m_root_mesh, target_mesh_shape, std::nullopt);
 +  m_submesh_shape = target_mesh_shape;
