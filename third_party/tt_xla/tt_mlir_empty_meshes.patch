@@ -13,7 +13,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
  #include "stablehlo/dialect/StablehloOps.h"
  
  #include <numeric>
-@@ -102,8 +104,386 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
+@@ -102,8 +104,389 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
    addMeshToModule(module, meshName, meshMap);
  }
  
@@ -57,41 +57,57 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +  return llvm::to_vector(llvm::seq<int64_t>(0, mesh.getTotalSize()));
 +}
 +
-+// Every device's coordinate on each axis of `mesh`, indexed by the device's
-+// position in `devices`. Meshes lay their device order out row-major, so an
-+// axis's coordinate is a device's position divided by the product of the sizes
-+// of the axes minor to it, modulo its size.
-+static llvm::StringMap<llvm::SmallVector<int64_t>>
-+axisValues(mlir::sdy::MeshAttr mesh, llvm::ArrayRef<int64_t> devices) {
-+  llvm::DenseMap<int64_t, int64_t> position;
-+  for (auto [index, device] : llvm::enumerate(deviceOrder(mesh))) {
-+    position[device] = index;
-+  }
-+  llvm::StringMap<llvm::SmallVector<int64_t>> values;
-+  int64_t stride = 1;
-+  for (mlir::sdy::MeshAxisAttr axis : llvm::reverse(mesh.getAxes())) {
-+    llvm::SmallVector<int64_t> &coordinates = values[axis.getName()];
-+    for (int64_t device : devices) {
-+      coordinates.push_back(position.lookup(device) / stride % axis.getSize());
-+    }
-+    stride *= axis.getSize();
-+  }
-+  return values;
-+}
-+
-+namespace {
-+// Whole target axes, major to minor, and the coordinate they give each device.
-+struct TargetAxes {
-+  llvm::SmallVector<llvm::StringRef, 2> names;
-+  llvm::SmallVector<int64_t> values;
-+};
-+} // namespace
-+
 +// The mesh a sharding refers to by name; empty for an inlined mesh.
 +static llvm::StringRef meshName(mlir::sdy::TensorShardingAttr sharding) {
 +  auto ref = mlir::dyn_cast<mlir::FlatSymbolRefAttr>(sharding.getMeshOrRef());
 +  return ref ? ref.getValue() : llvm::StringRef();
 +}
++
++// The index of the shard `deviceId` holds along `axes`, major to minor: its
++// position in the grid those axes of `mesh` form. Meshes lay their device
++// order out row-major, so an axis steps once per the product of the sizes of
++// the axes minor to it. The whole-axes part of sdy::getShardIndex, which newer
++// Shardy shares; use that instead once Shardy is upgraded.
++static int64_t getShardIndex(int64_t deviceId, mlir::sdy::MeshAttr mesh,
++                             llvm::ArrayRef<mlir::sdy::AxisRefAttr> axes) {
++  int64_t position = deviceId;
++  if (!mesh.getDeviceIds().empty()) {
++    position = llvm::find(mesh.getDeviceIds(), deviceId) -
++               mesh.getDeviceIds().begin();
++  }
++  int64_t shardIndex = 0;
++  for (mlir::sdy::AxisRefAttr axis : axes) {
++    int64_t stride = 1;
++    for (mlir::sdy::MeshAxisAttr meshAxis : llvm::reverse(mesh.getAxes())) {
++      if (meshAxis.getName() == axis.getName()) {
++        break;
++      }
++      stride *= meshAxis.getSize();
++    }
++    int64_t size = axis.getSize(mesh);
++    shardIndex = shardIndex * size + position / stride % size;
++  }
++  return shardIndex;
++}
++
++// Every device's shard index along `axes`, a function of the device that pins
++// the axes down: each index occurs on some device.
++static llvm::SmallVector<int64_t>
++shardIndices(mlir::sdy::MeshAttr mesh,
++             llvm::ArrayRef<mlir::sdy::AxisRefAttr> axes,
++             llvm::ArrayRef<int64_t> devices) {
++  return llvm::map_to_vector(devices, [&](int64_t device) {
++    return getShardIndex(device, mesh, axes);
++  });
++}
++
++namespace {
++// Whole target axes, major to minor, and every device's shard index along them.
++struct TargetAxes {
++  llvm::SmallVector<mlir::sdy::AxisRefAttr, 2> axes;
++  llvm::SmallVector<int64_t> shardIndices;
++};
++} // namespace
 +
 +// Every sequence of the target's non-unit axes, of which there are at most
 +// two: none, either alone, or both in either order. The two orders number the
@@ -99,32 +115,26 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +// Only whole axes, as tt-mlir does not support sub-axes in shardings.
 +static llvm::SmallVector<TargetAxes>
 +targetAxesOf(mlir::sdy::MeshAttr target, llvm::ArrayRef<int64_t> devices) {
-+  llvm::StringMap<llvm::SmallVector<int64_t>> values =
-+      axisValues(target, devices);
-+  llvm::SmallVector<mlir::sdy::MeshAxisAttr, 2> axes;
++  mlir::MLIRContext *context = target.getContext();
++  llvm::SmallVector<mlir::sdy::AxisRefAttr, 2> axes;
 +  for (mlir::sdy::MeshAxisAttr axis : target.getAxes()) {
 +    if (axis.getSize() > 1) {
-+      axes.push_back(axis);
++      axes.push_back(mlir::sdy::AxisRefAttr::get(context, axis.getName()));
 +    }
 +  }
 +  assert(axes.size() <= 2 && "a target has at most two non-unit axes");
-+  llvm::SmallVector<TargetAxes> sequences = {
-+      {{}, llvm::SmallVector<int64_t>(devices.size(), 0)}};
-+  for (mlir::sdy::MeshAxisAttr axis : axes) {
-+    sequences.push_back({{axis.getName()}, values[axis.getName()]});
++  llvm::SmallVector<llvm::SmallVector<mlir::sdy::AxisRefAttr, 2>> sequences = {
++      {}};
++  for (mlir::sdy::AxisRefAttr axis : axes) {
++    sequences.push_back({axis});
 +  }
 +  if (axes.size() == 2) {
-+    for (auto [major, minor] : {std::pair(axes[0], axes[1]),
-+                                std::pair(axes[1], axes[0])}) {
-+      TargetAxes both{{major.getName(), minor.getName()}, {}};
-+      for (auto [majorValue, minorValue] : llvm::zip_equal(
-+               values[major.getName()], values[minor.getName()])) {
-+        both.values.push_back(majorValue * minor.getSize() + minorValue);
-+      }
-+      sequences.push_back(std::move(both));
-+    }
++    sequences.push_back({axes[0], axes[1]});
++    sequences.push_back({axes[1], axes[0]});
 +  }
-+  return sequences;
++  return llvm::map_to_vector(sequences, [&](auto &sequence) {
++    return TargetAxes{sequence, shardIndices(target, sequence, devices)};
++  });
 +}
 +
 +// The mesh `mesh` becomes as a target: size-one axes go when it has more than
@@ -181,40 +191,33 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +  }
 +  MeshRewritePlan plan{targetOp, *target, {}, {}};
 +
-+  llvm::StringMap<llvm::StringMap<llvm::SmallVector<int64_t>>> coordinates;
++  llvm::StringMap<mlir::sdy::MeshAttr> meshes;
 +  for (mlir::sdy::MeshOp meshOp : meshOps) {
-+    coordinates[meshOp.getSymName()] =
-+        axisValues(meshOp.getMeshAttr(), devices);
++    meshes[meshOp.getSymName()] = meshOp.getMeshAttr();
 +  }
 +
 +  llvm::SmallVector<TargetAxes> targetAxes = targetAxesOf(*target, devices);
-+  // Axes of a mesh, as functions of the device, through target axes, major to
-+  // minor, like the device-to-tile maps XLA derives from shardings. Sub-axes
++  // Axes of a mesh as the target axes with the same shard index on every
++  // device, like the device-to-tile maps XLA derives from shardings. Sub-axes
 +  // have no such form.
 +  auto express = [&](llvm::StringRef mesh,
 +                     llvm::ArrayRef<mlir::sdy::AxisRefAttr> refs)
 +      -> std::optional<llvm::SmallVector<mlir::sdy::AxisRefAttr>> {
-+    const llvm::StringMap<llvm::SmallVector<int64_t>> &meshAxes =
-+        coordinates.find(mesh)->second;
 +    llvm::SmallVector<mlir::sdy::AxisRefAttr> result;
 +    for (mlir::sdy::AxisRefAttr ref : refs) {
 +      if (ref.getSubAxisInfo()) {
 +        return std::nullopt;
 +      }
-+      // Each coordinate of an axis occurs on some device, so the values also
-+      // pin down its size.
-+      const llvm::SmallVector<int64_t> &values =
-+          meshAxes.find(ref.getName())->second;
++      llvm::SmallVector<int64_t> indices =
++          shardIndices(meshes.lookup(mesh), ref, devices);
 +      const TargetAxes *match =
 +          llvm::find_if(targetAxes, [&](const TargetAxes &axes) {
-+            return axes.values == values;
++            return axes.shardIndices == indices;
 +          });
 +      if (match == targetAxes.end()) {
 +        return std::nullopt;
 +      }
-+      for (llvm::StringRef name : match->names) {
-+        result.push_back(mlir::sdy::AxisRefAttr::get(context, name));
-+      }
++      result.append(match->axes.begin(), match->axes.end());
 +    }
 +    return result;
 +  };
@@ -256,7 +259,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +      shardings = op.getOutShardings().getShardings();
 +    }
 +    if (shardings.empty() ||
-+        !coordinates.contains(meshName(shardings.front()))) {
++        !meshes.contains(meshName(shardings.front()))) {
 +      return true;
 +    }
 +    llvm::SmallVector<mlir::sdy::AxisRefAttr> refs;
@@ -281,7 +284,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +      module,
 +      [&](mlir::sdy::TensorShardingAttr sharding) {
 +        if (!expressible || plan.shardings.contains(sharding) ||
-+            !coordinates.contains(meshName(sharding))) {
++            !meshes.contains(meshName(sharding))) {
 +          return;
 +        }
 +        std::optional<mlir::sdy::TensorShardingAttr> rewritten =
@@ -300,7 +303,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +        if (auto collective =
 +                mlir::dyn_cast<mlir::sdy::CollectiveOpInterface>(op)) {
 +          llvm::StringRef mesh = meshName(collective.getOutSharding());
-+          expressible = !coordinates.contains(mesh) ||
++          expressible = !meshes.contains(mesh) ||
 +                        (mesh == targetOp.getSymName() && !targetChanges);
 +        } else if (auto manual =
 +                       mlir::dyn_cast<mlir::sdy::ManualComputationOp>(op)) {
@@ -400,7 +403,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
    auto meshOps = getMeshOps(module);
    if (meshOps.empty()) {
      return mlir::success();
-@@ -132,6 +512,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
+@@ -132,6 +515,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
    if (meshRank == 1) {
      axisName = meshOps[0].getMeshAttr().getAxes()[0].getName().str();
      axisSize = meshShape[0];
