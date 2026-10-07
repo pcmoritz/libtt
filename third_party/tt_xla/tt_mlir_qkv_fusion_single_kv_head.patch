@@ -1,0 +1,29 @@
+diff --git a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.cpp
+@@ -650,6 +650,25 @@ int64_t decodeHeadDim(const DecodeQKVHead &head) {
+ }
+ 
+ std::optional<DecodeQKVHead> matchDecodeQKVHead(SliceStaticOp sliceOp) {
++  // A single head goes straight from the slice to its RMSNorm: the
++  // [B, D] -> [B, 1, D] reshape folds away when a device has one KV head.
++  if (auto rmsNormOp = dyn_cast_or_null<RMSNormOp>(
++          lookThroughTypecasts(sliceOp.getResult()))) {
++    auto decodeReshapeOp = dyn_cast_or_null<ReshapeOp>(
++        lookThroughTypecasts(rmsNormOp.getResult()));
++    if (!decodeReshapeOp || decodeReshapeOp.getType().getRank() != 4) {
++      return std::nullopt;
++    }
++    ArrayRef<int64_t> sliceShape = sliceOp.getType().getShape();
++    ArrayRef<int64_t> decodeShape = decodeReshapeOp.getType().getShape();
++    if (sliceShape.size() != 2 || decodeShape[0] != 1 ||
++        sliceShape[0] != decodeShape[1] || decodeShape[2] != 1 ||
++        sliceShape[1] != decodeShape[3]) {
++      return std::nullopt;
++    }
++    return DecodeQKVHead{sliceOp, ReshapeOp(), rmsNormOp, decodeReshapeOp};
++  }
++
+   auto firstReshapeOp =
+       dyn_cast_or_null<ReshapeOp>(lookThroughTypecasts(sliceOp.getResult()));
+   if (!firstReshapeOp) {
