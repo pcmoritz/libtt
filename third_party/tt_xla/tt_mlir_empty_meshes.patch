@@ -13,7 +13,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
  #include "stablehlo/dialect/StablehloOps.h"
  
  #include <numeric>
-@@ -102,8 +104,404 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
+@@ -102,8 +104,402 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
    addMeshToModule(module, meshName, meshMap);
  }
  
@@ -50,26 +50,18 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +}
 +
 +namespace {
-+// Each device's coordinates in a mesh, indexed by the device's position in a
-+// reference device order: meshes lay their device order out row-major.
++// Each device's position in a mesh's row-major device order, indexed by the
++// device's position in a reference device order.
 +class MeshCoordinates {
 +public:
 +  MeshCoordinates(mlir::sdy::MeshAttr mesh, llvm::ArrayRef<int64_t> devices)
 +      : mesh(mesh) {
-+    llvm::SmallVector<int64_t> order = deviceOrder(mesh);
 +    llvm::DenseMap<int64_t, int64_t> position;
-+    for (auto [index, device] : llvm::enumerate(order)) {
++    for (auto [index, device] : llvm::enumerate(deviceOrder(mesh))) {
 +      position[device] = index;
 +    }
-+    llvm::ArrayRef<mlir::sdy::MeshAxisAttr> axes = mesh.getAxes();
 +    for (int64_t device : devices) {
-+      int64_t rest = position.lookup(device);
-+      llvm::SmallVector<int64_t> coordinates(axes.size());
-+      for (size_t axis = axes.size(); axis-- > 0;) {
-+        coordinates[axis] = rest % axes[axis].getSize();
-+        rest /= axes[axis].getSize();
-+      }
-+      byDevice.push_back(std::move(coordinates));
++      positions.push_back(position.lookup(device));
 +    }
 +  }
 +
@@ -80,18 +72,21 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +    return llvm::to_vector(llvm::seq<int64_t>(0, mesh.getTotalSize()));
 +  }
 +
-+  // The coordinate of sub-axis (preSize, size) of `axis` on every device.
-+  llvm::SmallVector<int64_t> values(llvm::StringRef axis, int64_t preSize,
-+                                    int64_t size) const {
-+    llvm::ArrayRef<mlir::sdy::MeshAxisAttr> axes = mesh.getAxes();
-+    size_t index = llvm::find_if(axes, [&](mlir::sdy::MeshAxisAttr a) {
-+                     return a.getName() == axis;
-+                   }) -
-+                   axes.begin();
-+    int64_t minor = axes[index].getSize() / (preSize * size);
++  // Every device's coordinate on `axis`, which steps once per the product of
++  // the sizes of the axes minor to it.
++  llvm::SmallVector<int64_t> values(llvm::StringRef axis) const {
++    int64_t stride = 1;
++    int64_t size = 1;
++    for (mlir::sdy::MeshAxisAttr meshAxis : llvm::reverse(mesh.getAxes())) {
++      if (meshAxis.getName() == axis) {
++        size = meshAxis.getSize();
++        break;
++      }
++      stride *= meshAxis.getSize();
++    }
 +    llvm::SmallVector<int64_t> result;
-+    for (const llvm::SmallVector<int64_t> &coordinates : byDevice) {
-+      result.push_back(coordinates[index] / minor % size);
++    for (int64_t position : positions) {
++      result.push_back(position / stride % size);
 +    }
 +    return result;
 +  }
@@ -99,7 +94,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +  mlir::sdy::MeshAttr mesh;
 +
 +private:
-+  llvm::SmallVector<llvm::SmallVector<int64_t>> byDevice;
++  llvm::SmallVector<int64_t> positions;
 +};
 +
 +// Whole target axes, major to minor, and the coordinate they give each device.
@@ -119,7 +114,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +// Every sequence of the target's non-unit axes, of which there are at most
 +// two: none, either alone, or both in either order. The two orders number the
 +// devices differently, so a mesh over a permutation of them matches the other.
-+// Only whole axes: tt-mlir does not support sub-axes in shardings.
++// Only whole axes, as tt-mlir does not support sub-axes in shardings.
 +static llvm::SmallVector<TargetAxes>
 +targetAxesOf(const MeshCoordinates &target, size_t numDevices) {
 +  llvm::SmallVector<TargetAxes> single;
@@ -127,7 +122,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +    if (axis.getSize() > 1) {
 +      single.push_back({{axis.getName()},
 +                        axis.getSize(),
-+                        target.values(axis.getName(), 1, axis.getSize())});
++                        target.values(axis.getName())});
 +    }
 +  }
 +  assert(single.size() <= 2 && "a target has at most two non-unit axes");
@@ -211,17 +206,20 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +
 +  llvm::SmallVector<TargetAxes> targetAxes =
 +      targetAxesOf(MeshCoordinates(*target, devices), devices.size());
-+  // (Sub-)axes of a mesh, as functions of the device, through target axes,
-+  // major to minor, like the device-to-tile maps XLA derives from shardings.
++  // Axes of a mesh, as functions of the device, through target axes, major to
++  // minor, like the device-to-tile maps XLA derives from shardings. Sub-axes
++  // have no such form.
 +  auto express = [&](llvm::StringRef mesh,
 +                     llvm::ArrayRef<mlir::sdy::AxisRefAttr> refs)
 +      -> std::optional<llvm::SmallVector<mlir::sdy::AxisRefAttr>> {
 +    const MeshCoordinates &meshCoordinates = coordinates.find(mesh)->second;
 +    llvm::SmallVector<mlir::sdy::AxisRefAttr> result;
 +    for (mlir::sdy::AxisRefAttr ref : refs) {
++      if (ref.getSubAxisInfo()) {
++        return std::nullopt;
++      }
 +      int64_t size = ref.getSize(meshCoordinates.mesh);
-+      llvm::SmallVector<int64_t> values = meshCoordinates.values(
-+          ref.getName(), ref.getSubAxisPreSize(), size);
++      llvm::SmallVector<int64_t> values = meshCoordinates.values(ref.getName());
 +      const TargetAxes *match =
 +          llvm::find_if(targetAxes, [&](const TargetAxes &axes) {
 +            return axes.size == size && axes.values == values;
@@ -418,7 +416,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
    auto meshOps = getMeshOps(module);
    if (meshOps.empty()) {
      return mlir::success();
-@@ -132,6 +530,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
+@@ -132,6 +528,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
    if (meshRank == 1) {
      axisName = meshOps[0].getMeshAttr().getAxes()[0].getName().str();
      axisSize = meshShape[0];
