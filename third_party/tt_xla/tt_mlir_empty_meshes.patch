@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 --- a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
 +++ b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
-@@ -10,6 +10,7 @@
+@@ -10,9 +10,11 @@
  #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
  
  #include "mlir/AsmParser/AsmParser.h"
@@ -9,7 +9,11 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
  #include "mlir/IR/IRMapping.h"
  #include "llvm/Support/Error.h"
  
-@@ -102,8 +103,419 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
++#include "shardy/dialect/sdy/transforms/common/sharding_walker.h"
+ #include "stablehlo/dialect/StablehloOps.h"
+ 
+ #include <numeric>
+@@ -102,8 +104,404 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
    addMeshToModule(module, meshName, meshMap);
  }
  
@@ -179,10 +183,9 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +struct MeshRewritePlan {
 +  mlir::sdy::MeshOp targetOp;
 +  mlir::sdy::MeshAttr target;
-+  llvm::DenseMap<mlir::Attribute, mlir::Attribute> shardings;
-+  llvm::SmallVector<
-+      std::pair<mlir::sdy::ManualComputationOp, mlir::sdy::ManualAxesAttr>>
-+      manualAxes;
++  llvm::DenseMap<mlir::sdy::TensorShardingAttr, mlir::sdy::TensorShardingAttr>
++      shardings;
++  llvm::DenseMap<mlir::Operation *, mlir::sdy::ManualAxesAttr> manualAxes;
 +};
 +} // namespace
 +
@@ -200,24 +203,10 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +  }
 +  MeshRewritePlan plan{targetOp, *target, {}, {}};
 +
-+  // Explicit collectives name axes outside any sharding; leave them be
-+  // unless their mesh stays as it is.
-+  bool targetChanges = *target != targetOp.getMeshAttr();
 +  llvm::StringMap<MeshCoordinates> coordinates;
 +  for (mlir::sdy::MeshOp meshOp : meshOps) {
 +    coordinates.try_emplace(meshOp.getSymName(),
 +                            MeshCoordinates(meshOp.getMeshAttr(), devices));
-+  }
-+  mlir::WalkResult collectives =
-+      module.walk([&](mlir::sdy::CollectiveOpInterface op) {
-+        llvm::StringRef mesh = meshName(op.getOutSharding());
-+        bool rewritten = coordinates.contains(mesh) &&
-+                         (mesh != targetOp.getSymName() || targetChanges);
-+        return rewritten ? mlir::WalkResult::interrupt()
-+                         : mlir::WalkResult::advance();
-+      });
-+  if (collectives.wasInterrupted()) {
-+    return std::nullopt;
 +  }
 +
 +  llvm::SmallVector<TargetAxes> targetAxes =
@@ -230,14 +219,9 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +    const MeshCoordinates &meshCoordinates = coordinates.find(mesh)->second;
 +    llvm::SmallVector<mlir::sdy::AxisRefAttr> result;
 +    for (mlir::sdy::AxisRefAttr ref : refs) {
-+      int64_t preSize = 1;
-+      int64_t size = meshCoordinates.mesh.getAxisSize(ref.getName());
-+      if (mlir::sdy::SubAxisInfoAttr subAxis = ref.getSubAxisInfo()) {
-+        preSize = subAxis.getPreSize();
-+        size = subAxis.getSize();
-+      }
-+      llvm::SmallVector<int64_t> values =
-+          meshCoordinates.values(ref.getName(), preSize, size);
++      int64_t size = ref.getSize(meshCoordinates.mesh);
++      llvm::SmallVector<int64_t> values = meshCoordinates.values(
++          ref.getName(), ref.getSubAxisPreSize(), size);
 +      const TargetAxes *match =
 +          llvm::find_if(targetAxes, [&](const TargetAxes &axes) {
 +            return axes.size == size && axes.values == values;
@@ -280,59 +264,67 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +        inMeshOrder(*unreduced));
 +  };
 +
-+  bool expressible = true;
-+  mlir::AttrTypeWalker walker;
-+  walker.addWalk([&](mlir::sdy::TensorShardingAttr sharding) {
-+    if (!expressible || plan.shardings.contains(sharding) ||
-+        !coordinates.contains(meshName(sharding))) {
-+      return;
-+    }
-+    std::optional<mlir::sdy::TensorShardingAttr> rewritten = rewrite(sharding);
-+    expressible = rewritten.has_value();
-+    if (rewritten) {
-+      plan.shardings[sharding] = *rewritten;
-+    }
-+  });
-+  module.walk([&](mlir::Operation *op) {
-+    walker.walk(op->getAttrDictionary());
-+    return expressible ? mlir::WalkResult::advance()
-+                       : mlir::WalkResult::interrupt();
-+  });
-+  if (!expressible) {
-+    return std::nullopt;
-+  }
-+
 +  // Manual axes name whole axes of their region's mesh; a region without
 +  // operands still has results.
-+  mlir::WalkResult manual =
-+      module.walk([&](mlir::sdy::ManualComputationOp op) {
-+        llvm::ArrayRef<mlir::sdy::TensorShardingAttr> shardings =
-+            op.getInShardings().getShardings();
-+        if (shardings.empty()) {
-+          shardings = op.getOutShardings().getShardings();
++  auto planManualAxes = [&](mlir::sdy::ManualComputationOp op) {
++    llvm::ArrayRef<mlir::sdy::TensorShardingAttr> shardings =
++        op.getInShardings().getShardings();
++    if (shardings.empty()) {
++      shardings = op.getOutShardings().getShardings();
++    }
++    if (shardings.empty() ||
++        !coordinates.contains(meshName(shardings.front()))) {
++      return true;
++    }
++    llvm::SmallVector<mlir::sdy::AxisRefAttr> refs;
++    for (mlir::StringAttr axis : op.getManualAxes()) {
++      refs.push_back(mlir::sdy::AxisRefAttr::get(context, axis.getValue()));
++    }
++    auto axes = express(meshName(shardings.front()), refs);
++    if (!axes) {
++      return false;
++    }
++    llvm::SmallVector<mlir::StringAttr> names;
++    for (mlir::sdy::AxisRefAttr axis : inMeshOrder(*axes)) {
++      names.push_back(mlir::StringAttr::get(context, axis.getName()));
++    }
++    plan.manualAxes[op] = mlir::sdy::ManualAxesAttr::get(context, names);
++    return true;
++  };
++
++  bool targetChanges = *target != targetOp.getMeshAttr();
++  bool expressible = true;
++  mlir::sdy::walkShardings(
++      module,
++      [&](mlir::sdy::TensorShardingAttr sharding) {
++        if (!expressible || plan.shardings.contains(sharding) ||
++            !coordinates.contains(meshName(sharding))) {
++          return;
 +        }
-+        if (shardings.empty() ||
-+            !coordinates.contains(meshName(shardings.front()))) {
-+          return mlir::WalkResult::advance();
++        std::optional<mlir::sdy::TensorShardingAttr> rewritten =
++            rewrite(sharding);
++        expressible = rewritten.has_value();
++        if (rewritten) {
++          plan.shardings[sharding] = *rewritten;
 +        }
-+        llvm::SmallVector<mlir::sdy::AxisRefAttr> refs;
-+        for (mlir::StringAttr axis : op.getManualAxes()) {
-+          refs.push_back(
-+              mlir::sdy::AxisRefAttr::get(context, axis.getValue()));
++      },
++      [&](mlir::Operation *op) {
++        if (!expressible) {
++          return;
 +        }
-+        auto axes = express(meshName(shardings.front()), refs);
-+        if (!axes) {
-+          return mlir::WalkResult::interrupt();
++        // Explicit collectives name axes outside any sharding; leave them be
++        // unless their mesh stays as it is.
++        if (auto collective =
++                mlir::dyn_cast<mlir::sdy::CollectiveOpInterface>(op)) {
++          llvm::StringRef mesh = meshName(collective.getOutSharding());
++          expressible = !coordinates.contains(mesh) ||
++                        (mesh == targetOp.getSymName() && !targetChanges);
++        } else if (auto manual =
++                       mlir::dyn_cast<mlir::sdy::ManualComputationOp>(op)) {
++          expressible = planManualAxes(manual);
 +        }
-+        llvm::SmallVector<mlir::StringAttr> names;
-+        for (mlir::sdy::AxisRefAttr axis : inMeshOrder(*axes)) {
-+          names.push_back(mlir::StringAttr::get(context, axis.getName()));
-+        }
-+        plan.manualAxes.emplace_back(
-+            op, mlir::sdy::ManualAxesAttr::get(context, names));
-+        return mlir::WalkResult::advance();
 +      });
-+  if (manual.wasInterrupted()) {
++  if (!expressible) {
 +    return std::nullopt;
 +  }
 +  return plan;
@@ -342,21 +334,18 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +applyMeshRewrite(mlir::ModuleOp module,
 +                 llvm::ArrayRef<mlir::sdy::MeshOp> meshOps,
 +                 const MeshRewritePlan &plan) {
-+  for (auto [op, axes] : plan.manualAxes) {
-+    mlir::sdy::ManualComputationOp(op).setManualAxesAttr(axes);
-+  }
-+  mlir::AttrTypeReplacer replacer;
-+  replacer.addReplacement([&](mlir::sdy::TensorShardingAttr sharding)
-+                              -> std::optional<mlir::Attribute> {
-+    auto it = plan.shardings.find(sharding);
-+    if (it == plan.shardings.end()) {
-+      return std::nullopt;
-+    }
-+    return it->second;
-+  });
-+  replacer.recursivelyReplaceElementsIn(module, /*replaceAttrs=*/true,
-+                                        /*replaceLocs=*/false,
-+                                        /*replaceTypes=*/false);
++  mlir::sdy::transformShardings(
++      module,
++      [&](mlir::sdy::TensorShardingAttr sharding) {
++        auto it = plan.shardings.find(sharding);
++        return it == plan.shardings.end() ? sharding : it->second;
++      },
++      [&](mlir::Operation *op) {
++        if (auto it = plan.manualAxes.find(op); it != plan.manualAxes.end()) {
++          mlir::cast<mlir::sdy::ManualComputationOp>(op).setManualAxesAttr(
++              it->second);
++        }
++      });
 +  mlir::sdy::MeshOp targetOp = plan.targetOp;
 +  targetOp.setMeshAttr(plan.target);
 +  for (mlir::sdy::MeshOp meshOp : meshOps) {
@@ -429,7 +418,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
    auto meshOps = getMeshOps(module);
    if (meshOps.empty()) {
      return mlir::success();
-@@ -132,6 +544,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
+@@ -132,6 +530,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
    if (meshRank == 1) {
      axisName = meshOps[0].getMeshAttr().getAxes()[0].getName().str();
      axisSize = meshShape[0];
