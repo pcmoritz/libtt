@@ -16,3 +16,21 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_constants.hpp ttn
  constexpr uint32_t multi_core_low_ht_max_tile_rows = 2;
  
  // The multi-core bitonic sort network addresses elements with 16-bit indices,
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
+@@ -654,8 +654,12 @@ std::vector<Tensor> topk(
+         }
+     }
+ 
+-    // Fill any implicit tile padding with appropriate values
+-    padded_tensor = ttnn::fill_implicit_tile_padding(padded_tensor, pad_val);
++    // Fill any implicit tile padding with appropriate values. Rows are sorted independently, so
++    // when the reduced dim fills whole tiles only padding rows exist and need no fill (a decode
++    // router's top-k over 128 or 256 experts saves a 4 us program).
++    if (padded_tensor.logical_shape()[-1] % padded_tensor.tensor_spec().tile().get_width() != 0) {
++        padded_tensor = ttnn::fill_implicit_tile_padding(padded_tensor, pad_val);
++    }
+ 
+     // Preprocess optional output tensors if provided
+     std::optional<std::tuple<Tensor, Tensor>> output_tensors = std::nullopt;
