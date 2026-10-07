@@ -533,6 +533,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_open_shardings.patch",
         "//third_party/tt_xla:tt_mlir_sparse_matmul_compute_config.patch",
         "//third_party/tt_xla:tt_mlir_sparse_matmul_program_config.patch",
+        "//third_party/tt_xla:tt_mlir_sparse_matmul_indices.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
