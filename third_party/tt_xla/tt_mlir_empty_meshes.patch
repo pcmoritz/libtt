@@ -13,7 +13,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
  #include "stablehlo/dialect/StablehloOps.h"
  
  #include <numeric>
-@@ -102,8 +104,389 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
+@@ -102,8 +104,382 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
    addMeshToModule(module, meshName, meshMap);
  }
  
@@ -138,10 +138,8 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +}
 +
 +// The mesh `mesh` becomes as a target: size-one axes go when it has more than
-+// two axes, so e.g. (1, 4, 1) becomes (4), and come first otherwise, so (2, 1)
-+// becomes (1, 2), as tt-mlir takes (1, n) meshes but not (n, 1) ones. Neither
-+// moves a device. None when more than two axes remain, which tt-mlir cannot
-+// compile for.
++// two axes, so e.g. (1, 4, 1) becomes (4), which does not move a device. None
++// when more than two axes remain, which tt-mlir cannot compile for.
 +static std::optional<mlir::sdy::MeshAttr>
 +targetMesh(mlir::sdy::MeshAttr mesh) {
 +  mlir::MLIRContext *context = mesh.getContext();
@@ -156,11 +154,6 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +      return std::nullopt;
 +    }
 +    mesh = mlir::sdy::MeshAttr::get(context, axes, mesh.getDeviceIds());
-+  }
-+  if (mesh.getAxes().size() == 2 && mesh.getAxes()[0].getSize() > 1 &&
-+      mesh.getAxes()[1].getSize() == 1) {
-+    mesh = mlir::sdy::MeshAttr::get(
-+        context, {mesh.getAxes()[1], mesh.getAxes()[0]}, mesh.getDeviceIds());
 +  }
 +  return mesh;
 +}
@@ -403,7 +396,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
    auto meshOps = getMeshOps(module);
    if (meshOps.empty()) {
      return mlir::success();
-@@ -132,6 +515,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
+@@ -132,6 +508,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
    if (meshRank == 1) {
      axisName = meshOps[0].getMeshAttr().getAxes()[0].getName().str();
      axisSize = meshShape[0];
