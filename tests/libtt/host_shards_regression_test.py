@@ -1,25 +1,34 @@
-"""A multi-device input may be assembled from shards still on their chips.
+"""A multi-device input may be assembled from shards still on a chip.
 
-tt-xla builds a multi-device input from host shards, so a shard that is the
-result of an earlier single-chip program must move to the host first.
+tt-xla builds a multi-device input from host shards, so shards left on a chip
+by an earlier program must move to the host first. Checking second-order
+forward-mode gradients of a shard_map hands over such shards.
 """
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
+from jax.test_util import check_grads
 
 
-def test_sharded_input_from_single_chip_results():
+def test_second_order_forward_gradients_of_a_shard_map():
     devices = jax.devices("tt")
-    if len(devices) < 2:
-        pytest.skip("needs two chips")
-    devices = devices[:2]
-    x = np.arange(16, dtype=np.float32).reshape(8, 2)
-    add_one = jax.jit(lambda a: a + 1)
-    shards = [add_one(jax.device_put(x[4 * i : 4 * i + 4], d)) for i, d in enumerate(devices)]
-    sharding = NamedSharding(Mesh(np.array(devices), ("x",)), P("x"))
-    arr = jax.make_array_from_single_device_arrays(x.shape, sharding, shards)
-    out = jax.jit(lambda a: a * 2)(arr)
-    np.testing.assert_allclose(np.asarray(out), (x + 1) * 2)
+    if len(devices) < 4:
+        pytest.skip("needs four chips")
+    mesh = Mesh(np.array(devices[:4]).reshape(2, 2), ("x", "y"))
+
+    @jax.jit
+    def f(x, y):
+        return jax.shard_map(
+            lambda x, y: jnp.sin(x) + 3 + jnp.tan(2.0) * jnp.cos(x) + y,
+            mesh=mesh,
+            in_specs=(P("x"), P(None)),
+            out_specs=P("x"),
+        )(x, y)
+
+    x = jnp.arange(8.0) / 10
+    y = jnp.arange(4.0) / 10
+    check_grads(f, (x, y), modes=["fwd"], order=2, atol=5e-2, rtol=5e-2)
