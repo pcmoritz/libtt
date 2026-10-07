@@ -53,7 +53,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    if (!m_parent_mesh.has_value()) {
      m_parent_mesh = openMeshDevice(target_mesh_shape);
      return *m_parent_mesh;
-@@ -691,7 +696,67 @@ ClientInstance::openMeshDevice(const std::vector<uint32_t> &mesh_shape) {
+@@ -691,7 +696,69 @@ ClientInstance::openMeshDevice(const std::vector<uint32_t> &mesh_shape) {
    return tt::runtime::openMeshDevice(options);
  }
  
@@ -85,8 +85,10 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 +  const bool reopen_root = !m_root_mesh.has_value() ||
 +                           !holds(tt::runtime::getMeshShape(*m_root_mesh));
 +  // As rows * cols <= num_chips, a root of `rows` rows holds the submesh.
++  // Opening only its chips instead would fail, so stop if there is none.
 +  if (reopen_root && num_chips % rows != 0) {
-+    return std::nullopt;
++    LOG_F(FATAL, "No mesh over all %u chips has %u rows for a %ux%u submesh",
++          num_chips, rows, rows, cols);
 +  }
 +
 +  DLOG_F(LOG_DEBUG, "ClientInstance::getOrCreateSubMesh - submesh %s",

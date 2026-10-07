@@ -28,15 +28,21 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  Device createSubMeshDevice(
      Device parentMesh, const std::vector<uint32_t> &meshShape,
      const std::optional<const std::vector<uint32_t>> &meshOffset) {
-@@ -821,6 +834,7 @@ Device createSubMeshDevice(
+@@ -821,8 +834,13 @@ Device createSubMeshDevice(
          ::ttnn::MeshCoordinate{meshOffset.value()[0], meshOffset.value()[1]};
    }
  
 +  handOverChips(parentMeshDevice, parentMeshDevice);
    std::shared_ptr<::ttnn::MeshDevice> subMeshDevice =
        parentMeshDevice.create_submesh(shape, offset);
++  // A submesh gets a program cache of its own, enabled by default.
++  if (!parentMeshDevice.get_program_cache().is_enabled()) {
++    subMeshDevice->disable_and_clear_program_cache();
++  }
  
-@@ -838,6 +852,7 @@ void releaseSubMeshDevice(Device subMesh) {
+   auto ttnnTraceCache =
+       std::make_shared<::tt::runtime::ttnn::TraceCache>(subMeshDevice);
+@@ -838,6 +856,7 @@ void releaseSubMeshDevice(Device subMesh) {
  
    LOG_ASSERT(!ttnnMeshDevice.is_parent_mesh(), "Mesh device must be a submesh");
  
