@@ -13,7 +13,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
  #include "stablehlo/dialect/StablehloOps.h"
  
  #include <numeric>
-@@ -102,8 +104,214 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
+@@ -102,8 +104,218 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
    addMeshToModule(module, meshName, meshMap);
  }
  
@@ -101,42 +101,46 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +    return mlir::success();
 +  }
 +
-+  // Every mesh's axes as axes of the target.
-+  mlir::sdy::MeshOp targetOp;
-+  llvm::StringMap<llvm::StringMap<llvm::SmallVector<mlir::sdy::AxisRefAttr>>>
-+      onTarget;
-+  for (mlir::sdy::MeshOp candidate : meshOps) {
-+    bool holds = true;
-+    onTarget.clear();
-+    for (mlir::sdy::MeshOp meshOp : meshOps) {
-+      holds &= meshOp.getMeshAttr().getDeviceIds() ==
-+               candidate.getMeshAttr().getDeviceIds();
-+      for (auto &[axis, span] : axisSpans(meshOp.getMeshAttr())) {
-+        auto axes = tile(span, candidate.getMeshAttr());
-+        holds &= axes.has_value();
-+        if (axes) {
-+          onTarget[meshOp.getSymName()][axis] = *axes;
-+        }
-+      }
-+    }
-+    if (holds) {
-+      targetOp = candidate;
-+      break;
++  for (mlir::sdy::MeshOp meshOp : meshOps) {
++    if (meshOp.getMeshAttr().getDeviceIds() !=
++        meshOps.front().getMeshAttr().getDeviceIds()) {
++      return meshOp.emitError("Mesh @")
++             << meshOp.getSymName() << " lists other devices than mesh @"
++             << meshOps.front().getSymName();
 +    }
 +  }
-+  if (!targetOp) {
-+    return module.emitError("No mesh of the module holds the axes of all its "
-+                            "meshes over the same devices");
++
++  // A target tiling every axis holds every mesh's stride boundaries, so it has
++  // the most axes larger than one, and any mesh with as many has the same
++  // boundaries: take the first such mesh.
++  auto bigAxes = [](mlir::sdy::MeshOp meshOp) {
++    return llvm::count_if(
++        meshOp.getMeshAttr().getAxes(),
++        [](mlir::sdy::MeshAxisAttr axis) { return axis.getSize() > 1; });
++  };
++  mlir::sdy::MeshOp targetOp = *llvm::max_element(
++      meshOps, [&](mlir::sdy::MeshOp a, mlir::sdy::MeshOp b) {
++        return bigAxes(a) < bigAxes(b);
++      });
++
++  // Every mesh's axes as axes of the target.
++  llvm::StringMap<llvm::StringMap<llvm::SmallVector<mlir::sdy::AxisRefAttr>>>
++      onTarget;
++  for (mlir::sdy::MeshOp meshOp : meshOps) {
++    for (auto &[axis, span] : axisSpans(meshOp.getMeshAttr())) {
++      std::optional<llvm::SmallVector<mlir::sdy::AxisRefAttr>> axes =
++          tile(span, targetOp.getMeshAttr());
++      if (!axes) {
++        return meshOp.emitError("No mesh holds axis \"")
++               << axis << "\" of mesh @" << meshOp.getSymName()
++               << " and the axes of all other meshes";
++      }
++      onTarget[meshOp.getSymName()][axis] = *axes;
++    }
 +  }
 +
 +  mlir::MLIRContext *context = module.getContext();
 +  mlir::sdy::MeshAttr target = targetOp.getMeshAttr();
-+  // Sub-axes do not carry over; their mesh then stays in use and is reported.
-+  auto wholeAxes = [](llvm::ArrayRef<mlir::sdy::AxisRefAttr> axes) {
-+    return llvm::none_of(axes, [](mlir::sdy::AxisRefAttr axis) {
-+      return bool(axis.getSubAxisInfo());
-+    });
-+  };
 +  auto mapAxes = [&](llvm::StringRef mesh,
 +                     llvm::ArrayRef<mlir::sdy::AxisRefAttr> axes,
 +                     bool inTargetOrder) {
@@ -155,11 +159,10 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +      [&](mlir::sdy::TensorShardingAttr sharding) {
 +        auto ref =
 +            mlir::dyn_cast<mlir::FlatSymbolRefAttr>(sharding.getMeshOrRef());
++        // Sub-axes do not carry over; their mesh stays in use and is reported.
 +        if (!ref || !onTarget.contains(ref.getValue()) ||
-+            !wholeAxes(sharding.getReplicatedAxes()) ||
-+            !wholeAxes(sharding.getUnreducedAxes()) ||
-+            !llvm::all_of(sharding.getDimShardings(), [&](auto dim) {
-+              return wholeAxes(dim.getAxes());
++            sharding.anyOfAxisRef([](mlir::sdy::AxisRefAttr axis) {
++              return bool(axis.getSubAxisInfo());
 +            })) {
 +          return sharding;
 +        }
@@ -182,12 +185,13 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +      [&](mlir::Operation *op) {
 +        // Manual axes name axes of the mesh the region's shardings share.
 +        auto manual = mlir::dyn_cast<mlir::sdy::ManualComputationOp>(op);
-+        auto mesh = manual ? mlir::dyn_cast_or_null<mlir::FlatSymbolRefAttr>(
-+                                 mlir::sdy::getCommonMeshOrRef(
-+                                     manual.getInShardings().getShardings(),
-+                                     manual.getOutShardings().getShardings(),
-+                                     symbolTable))
-+                           : nullptr;
++        if (!manual) {
++          return;
++        }
++        auto mesh = mlir::dyn_cast_or_null<mlir::FlatSymbolRefAttr>(
++            mlir::sdy::getCommonMeshOrRef(
++                manual.getInShardings().getShardings(),
++                manual.getOutShardings().getShardings(), symbolTable));
 +        if (!mesh || !onTarget.contains(mesh.getValue())) {
 +          return;
 +        }
@@ -228,7 +232,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
    auto meshOps = getMeshOps(module);
    if (meshOps.empty()) {
      return mlir::success();
-@@ -132,6 +340,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
+@@ -132,6 +344,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
    if (meshRank == 1) {
      axisName = meshOps[0].getMeshAttr().getAxes()[0].getName().str();
      axisSize = meshShape[0];
