@@ -2,10 +2,9 @@
 
 Opening a mesh over only some chips starts fabric routers whose ethernet
 partners never answer, so libtt then opens a mesh over every chip that runs
-nothing itself and runs every program on a submesh of it, on the chips its
-inputs live on. Switching submeshes must hand over the chips' command queues
-and leave nothing of the submesh being left on them, as each allocates device
-memory on its own.
+nothing itself and runs every program on a submesh of it. Switching submeshes
+must hand over the chips' command queues and leave nothing of the submesh being
+left on them, as each allocates device memory on its own.
 """
 
 import jax
