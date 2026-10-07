@@ -1,17 +1,17 @@
 diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api/tensor.cc
 --- a/pjrt_implementation/src/api/tensor.cc
 +++ b/pjrt_implementation/src/api/tensor.cc
-@@ -224,6 +224,13 @@ tt::runtime::Tensor PjrtTensor::rt_tensor_from_strategy(
+@@ -224,7 +224,12 @@ tt::runtime::Tensor PjrtTensor::rt_tensor_from_strategy(
    std::vector<tt::runtime::Tensor> tensors;
    tensors.reserve(shards.size());
  
-+  // A multi-device tensor is assembled from host shards, but a shard may still
-+  // be on a device, e.g. the result of an earlier single-chip program.
+-  for (const BufferInstance *shard : shards) {
 +  for (BufferInstance *shard : shards) {
++    // A multi-device tensor is assembled from host shards, but a shard may
++    // still be on a device, e.g. the result of an earlier single-chip program.
 +    if (shard->getPjrtTensor()) {
 +      shard->getPjrtTensor()->move_to_host();
 +    }
-+  }
-   for (const BufferInstance *shard : shards) {
      tensors.emplace_back(shard->runtimeTensor());
    }
+ 
