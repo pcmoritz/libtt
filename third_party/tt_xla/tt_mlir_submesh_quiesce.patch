@@ -1,0 +1,52 @@
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -12,6 +12,7 @@
+ #include "tt/runtime/detail/ttnn/layout_converter.h"
+ #include "tt/runtime/detail/ttnn/program_executor.h"
+ #include "tt/runtime/detail/ttnn/ttnn.h"
++#include "tt/runtime/detail/ttnn/types/global_tensor_cache.h"
+ #include "tt/runtime/detail/ttnn/types/trace_cache.h"
+ #include "tt/runtime/detail/ttnn/types/types.h"
+ #include "tt/runtime/detail/ttnn/utils.h"
+@@ -802,6 +803,18 @@ void closeMeshDevice(Device parentMesh) {
+   ttnnMeshDevice.close();
+ }
+ 
++// A parent mesh and its submeshes allocate from separate allocators over the
++// same chips, and only one of them may drive a chip's command queues at a time.
++// Hand the chips over with nothing of `leaving` left on them: finish all work,
++// and drop cached programs (whose kernel binaries live in device buffers) and
++// cached const-eval results, as closing the mesh would.
++static void handOverChips(::ttnn::MeshDevice &parentMeshDevice,
++                          ::ttnn::MeshDevice &leaving) {
++  parentMeshDevice.quiesce_devices();
++  leaving.clear_program_cache();
++  ::tt::runtime::GlobalTensorCache::getInstance().clear();
++}
++
+ Device createSubMeshDevice(
+     Device parentMesh, const std::vector<uint32_t> &meshShape,
+     const std::optional<const std::vector<uint32_t>> &meshOffset) {
+@@ -821,8 +834,13 @@ Device createSubMeshDevice(
+         ::ttnn::MeshCoordinate{meshOffset.value()[0], meshOffset.value()[1]};
+   }
+ 
++  handOverChips(parentMeshDevice, parentMeshDevice);
+   std::shared_ptr<::ttnn::MeshDevice> subMeshDevice =
+       parentMeshDevice.create_submesh(shape, offset);
++  // A submesh gets a program cache of its own, enabled by default.
++  if (!parentMeshDevice.get_program_cache().is_enabled()) {
++    subMeshDevice->disable_and_clear_program_cache();
++  }
+ 
+   auto ttnnTraceCache =
+       std::make_shared<::tt::runtime::ttnn::TraceCache>(subMeshDevice);
+@@ -838,6 +856,7 @@ void releaseSubMeshDevice(Device subMesh) {
+ 
+   LOG_ASSERT(!ttnnMeshDevice.is_parent_mesh(), "Mesh device must be a submesh");
+ 
++  handOverChips(*ttnnMeshDevice.get_parent_mesh(), ttnnMeshDevice);
+   ttnnMeshDevice.close();
+ }
+ 
