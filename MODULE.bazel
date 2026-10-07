@@ -315,6 +315,7 @@ http_archive(
         "//third_party/tt_metal:sparse_matmul_fp32_partials.patch",
         "//third_party/tt_metal:sparse_matmul_slot_groups.patch",
         "//third_party/tt_metal:topk_multicore_router_width.patch",
+        "//third_party/tt_metal:sparse_matmul_indexed_no_fill.patch",
     ],
     sha256 = "e7ce42e8dd832189662a9af0e8d2b397680a75bbab4f71986efb8300435e1eba",
     strip_prefix = "tt-metal-cffd17520cdfc45dc85c1c47cc2aa49f6bff15c0",
