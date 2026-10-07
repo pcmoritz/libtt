@@ -1,0 +1,53 @@
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -1573,21 +1573,30 @@ createSparseMatmulProgramConfigAttr(MLIRContext *ctx, RankedTensorType aType,
+ 
+   int64_t NTiles = (N + tileW - 1) / tileW;
+ 
+-  // For 1D multicast (mcast_in0=true), Y rows replicate and X columns
+-  // distribute N tiles. The runtime requires ceil(NTiles / perCoreN) to equal
+-  // usedCoreX (all X-columns must have work). Reduce coreX until this holds.
+-  int64_t usedCoreX = std::min(coreX, NTiles);
+-  while (usedCoreX > 1) {
+-    int64_t pcn = (NTiles + usedCoreX - 1) / usedCoreX;
+-    if ((NTiles + pcn - 1) / pcn == usedCoreX) {
++  // With 1D multicast (mcast_in0=true) each core computes perCoreN columns of
++  // the output, and the cores with work must fill the grid's rectangle (the
++  // in0 multicast covers its bounding box). Split N over as many cores as the
++  // device has, in a usedCoreX x usedCoreY rectangle of ceil(NTiles /
++  // perCoreN) cores: a decode-sized expert matmul streams its weights at the
++  // rate of the cores reading them.
++  int64_t perCoreN = 1;
++  int64_t usedCoreX = 1;
++  int64_t usedCoreY = 1;
++  for (; perCoreN <= NTiles; ++perCoreN) {
++    int64_t blocks = (NTiles + perCoreN - 1) / perCoreN;
++    for (int64_t x = std::min(coreX, blocks); x >= 1; --x) {
++      if (blocks % x == 0 && blocks / x <= coreY) {
++        usedCoreX = x;
++        usedCoreY = blocks / x;
++        break;
++      }
++    }
++    if (usedCoreX * usedCoreY == blocks) {
+       break;
+     }
+-    --usedCoreX;
+   }
+ 
+   int64_t perCoreM = std::max(static_cast<int64_t>(1), M / tileH);
+-  int64_t perCoreN =
+-      std::max(static_cast<int64_t>(1), (NTiles + usedCoreX - 1) / usedCoreX);
+ 
+   // Step K in wide blocks: each block costs a multicast handshake, so one-tile
+   // blocks make a decode-sized expert matmul several times slower. Take the
+@@ -1609,7 +1618,7 @@ createSparseMatmulProgramConfigAttr(MLIRContext *ctx, RankedTensorType aType,
+     }
+   }
+ 
+-  auto gridAttr = ttnn::CoreCoordAttr::get(ctx, usedCoreX, coreY);
++  auto gridAttr = ttnn::CoreCoordAttr::get(ctx, usedCoreX, usedCoreY);
+   auto hopCoresAttr = ttnn::CoreRangeSetAttr::get(ctx, {});
+ 
+   return ttnn::MatmulMultiCoreReuseMultiCast1DProgramConfigAttr::get(
