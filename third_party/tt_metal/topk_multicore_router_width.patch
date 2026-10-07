@@ -1,0 +1,36 @@
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_constants.hpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_constants.hpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_constants.hpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_constants.hpp
+@@ -15,10 +15,10 @@ constexpr uint32_t multi_core_min_width = 8192;
+ // Ht-aware relaxation of multi_core_min_width: inputs with at most
+ // multi_core_low_ht_max_tile_rows tile rows leave most of the grid idle on the
+ // row-parallel single-core factory, so the column-split multi-core path is
+-// enabled from multi_core_low_ht_min_width up. 1024 is the smallest pow2 width
+-// that still gives every local core >= min_dim_per_core elements at a useful
+-// core count (measured ~4x on 32x2048 k=32, p150a).
+-constexpr uint32_t multi_core_low_ht_min_width = 1024;
++// enabled from multi_core_low_ht_min_width up (measured ~4x on 32x2048 k=32,
++// p150a). It also wins at mixture-of-experts router widths: a 1x128 k=8 top-k
++// takes 10 us on two cores against 27 us on one, and 1x256 13 us against 59.
++constexpr uint32_t multi_core_low_ht_min_width = 128;
+ constexpr uint32_t multi_core_low_ht_max_tile_rows = 2;
+ 
+ // The multi-core bitonic sort network addresses elements with 16-bit indices,
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
+@@ -654,8 +654,12 @@ std::vector<Tensor> topk(
+         }
+     }
+ 
+-    // Fill any implicit tile padding with appropriate values
+-    padded_tensor = ttnn::fill_implicit_tile_padding(padded_tensor, pad_val);
++    // Fill any implicit tile padding with appropriate values. Rows are sorted independently, so
++    // when the reduced dim fills whole tiles only padding rows exist and need no fill (a decode
++    // router's top-k over 128 or 256 experts saves a 4 us program).
++    if (padded_tensor.logical_shape()[-1] % padded_tensor.tensor_spec().tile().get_width() != 0) {
++        padded_tensor = ttnn::fill_implicit_tile_padding(padded_tensor, pad_val);
++    }
+ 
+     // Preprocess optional output tensors if provided
+     std::optional<std::tuple<Tensor, Tensor>> output_tensors = std::nullopt;

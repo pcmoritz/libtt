@@ -1,0 +1,337 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -6698,6 +6698,13 @@ def TTIR_SparseMatmulOp : TTIR_NamedOp<"sparse_matmul"> {
+       - `nnz` (Optional Integer): Number of non-zero blocks per row. If absent, it is
+          inferred at runtime.
+ 
++      Indexed mode: with the optional `indices` operand (a 1D list of
++      `num_active` group ids, e.g. the top-k expert ids), only those groups of
++      `b` are computed, and the output's group axis holds `num_active` compact
++      slots, slot `i` for group `indices[i]`. In the both-sparse mode `a` is
++      then compact too: [1, num_active, M, K]. `nnz` must be absent; the
++      sparsity tensor keeps its shape but is not read.
++
+       Supported Modes:
+       - is_input_a_sparse=false, is_input_b_sparse=true (column-parallel):
+         a: [A, B, M, K], b: [1, E, K, N], sparsity: [A, B, 1, E]
+@@ -6721,6 +6728,7 @@ def TTIR_SparseMatmulOp : TTIR_NamedOp<"sparse_matmul"> {
+     let arguments = (ins AnyRankedTensor:$a,
+                          AnyRankedTensor:$b,
+                          AnyRankedTensor:$sparsity,
++                         Optional<AnyRankedTensor>:$indices,
+                          DefaultValuedAttr<BoolAttr, "false">:$is_input_a_sparse,
+                          DefaultValuedAttr<BoolAttr, "true">:$is_input_b_sparse,
+                          OptionalAttr<I64Attr>:$nnz);
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1775,6 +1775,13 @@ def TTNN_SparseMatmulOp : TTNN_Op<"sparse_matmul", [OpModelExempt,
+         a: [1, E, M, K], b: [1, E, K, N], sparsity: [1, 1, 1, E]
+         -> output: [1, E, M, N]
+ 
++      Indexed mode: with the optional `indices` operand (a 1D list of
++      `num_active` group ids, e.g. the top-k expert ids), only those groups of
++      `b` are computed, and the output's group axis holds `num_active` compact
++      slots, slot `i` for group `indices[i]`. In the both-sparse mode `a` is
++      then compact too: [1, num_active, M, K]. `nnz` must be absent; the
++      sparsity tensor keeps its shape but is not read.
++
+       Example:
+       ```mlir
+       %result = "ttnn.sparse_matmul"(%activations, %weights, %sparsity) <{
+@@ -1787,6 +1794,7 @@ def TTNN_SparseMatmulOp : TTNN_Op<"sparse_matmul", [OpModelExempt,
+     let arguments = (ins AnyRankedTensor:$a,
+                          AnyRankedTensor:$b,
+                          AnyRankedTensor:$sparsity,
++                         Optional<AnyRankedTensor>:$indices,
+                          DefaultValuedAttr<BoolAttr, "false">:$is_input_a_sparse,
+                          DefaultValuedAttr<BoolAttr, "true">:$is_input_b_sparse,
+                          OptionalAttr<I64Attr>:$nnz,
+@@ -1797,7 +1805,7 @@ def TTNN_SparseMatmulOp : TTNN_Op<"sparse_matmul", [OpModelExempt,
+ 
+     let extraClassDeclaration = [{
+       wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+-        return wa::TTNNOperandsWorkaroundsFactory::createSparseMatmulOpOperandsWorkarounds();
++        return wa::TTNNOperandsWorkaroundsFactory::createSparseMatmulOpOperandsWorkarounds(getOperation());
+       }
+     }];
+ 
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -441,7 +441,8 @@ public:
+   // Create workarounds for sparse_matmul op operands.
+   // Sparsity tensor must be in ROW_MAJOR layout.
+   // Issue page: https://github.com/tenstorrent/tt-metal/issues/39126
+-  static TTNNOperandsWorkarounds createSparseMatmulOpOperandsWorkarounds();
++  static TTNNOperandsWorkarounds
++  createSparseMatmulOpOperandsWorkarounds(Operation *op);
+ 
+   // Create workarounds for prepare_conv3d_weights op operands.
+   // Weight tensor must be in system memory and ROW_MAJOR layout.
+diff --git a/include/ttmlir/Target/TTNN/operations/matmul.fbs b/include/ttmlir/Target/TTNN/operations/matmul.fbs
+--- a/include/ttmlir/Target/TTNN/operations/matmul.fbs
++++ b/include/ttmlir/Target/TTNN/operations/matmul.fbs
+@@ -98,4 +98,5 @@ table SparseMatmulOp {
+   memory_config: tt.target.ttnn.MemoryConfig;
+   dtype: tt.target.DataType;
+   compute_config: tt.target.ttnn.DeviceComputeKernelConfig;
++  indices: tt.target.ttnn.TensorRef;
+ }
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -12747,23 +12747,39 @@ public:
+       }
+     }
+ 
+-    // Get operands
+-    if (adaptor.getOperands().size() != 3) {
++    // Get operands: a, b, sparsity and, in indexed mode, the group ids.
++    if (adaptor.getOperands().size() != 3 &&
++        adaptor.getOperands().size() != 4) {
+       return rewriter.notifyMatchFailure(
+-          srcOp,
+-          "SparseMatmul op expects exactly 3 operands (a, b, sparsity).");
++          srcOp, "SparseMatmul op expects 3 operands (a, b, sparsity) or 4 "
++                 "(a, b, sparsity, indices).");
+     }
+ 
+     Value inputA = adaptor.getOperands()[0];
+     Value inputB = adaptor.getOperands()[1];
+     Value sparsity = adaptor.getOperands()[2];
++    Value indices =
++        adaptor.getOperands().size() == 4 ? adaptor.getOperands()[3] : Value();
++    if (indices) {
++      // The ids are a list; TTNN reads them as a single row, so every dim
++      // but the last must be 1.
++      auto indicesType = cast<RankedTensorType>(indices.getType());
++      if (indicesType.getRank() == 0 ||
++          indicesType.getShape().back() != indicesType.getNumElements()) {
++        indices = ttir::utils::createReshapeOp(
++            rewriter, srcOp.getLoc(), indices,
++            {static_cast<int64_t>(indicesType.getNumElements())});
++      }
++      // In indexed mode the loop count is the number of ids.
++      nnzAttr = nullptr;
++    }
+ 
+     RankedTensorType outputType = cast<RankedTensorType>(
+         getTypeConverter()->convertType(srcOp.getResult(0).getType()));
+ 
+     rewriter.replaceOpWithNewOp<ttir::SparseMatmulOp>(
+-        srcOp, outputType, inputA, inputB, sparsity, isInputASparseAttr,
+-        isInputBSparseAttr, nnzAttr);
++        srcOp, outputType, inputA, inputB, sparsity, indices,
++        isInputASparseAttr, isInputBSparseAttr, nnzAttr);
+ 
+     return success();
+   }
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -1653,7 +1653,8 @@ public:
+ 
+     auto newOp = rewriter.replaceOpWithNewOp<ttnn::SparseMatmulOp>(
+         op, this->getTypeConverter()->convertType(op.getType()), adaptor.getA(),
+-        adaptor.getB(), adaptor.getSparsity(), op.getIsInputASparse(),
++        adaptor.getB(), adaptor.getSparsity(), adaptor.getIndices(),
++        op.getIsInputASparse(),
+         op.getIsInputBSparse(), nnzAttr,
+         /*program_config=*/programConfigAttr,
+         /*compute_config=*/nullptr);
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -8277,6 +8277,21 @@ mlir::tt::ttir::PagedFlashMultiLatentAttentionDecodeOp::verify() {
+                        "experts in Input B");
+   }
+ 
++  // In indexed mode the output's group axis has a slot per index.
++  int64_t groups = E;
++  if (getIndices()) {
++    if (!isInputBSparse) {
++      return emitOpError("indices require is_input_b_sparse");
++    }
++    if (getNnz()) {
++      return emitOpError("nnz must not be set together with indices");
++    }
++    groups = getIndices().getType().getNumElements();
++    if (groups > E) {
++      return emitOpError("indices must not list more groups than Input B has");
++    }
++  }
++
+   // Verify output shape based on sparse mode (including batch dimensions)
+   llvm::ArrayRef<int64_t> outputShape = outputType.getShape();
+ 
+@@ -8285,7 +8300,7 @@ mlir::tt::ttir::PagedFlashMultiLatentAttentionDecodeOp::verify() {
+     if (outputShape.size() != 4) {
+       return emitOpError("Output must be 4D for sparse-sparse mode");
+     }
+-    if (outputShape[0] != 1 || outputShape[1] != E || outputShape[2] != M ||
++    if (outputShape[0] != 1 || outputShape[1] != groups || outputShape[2] != M ||
+         outputShape[3] != N) {
+       return emitOpError(
+           "Output shape must be [1, E, M, N] for sparse-sparse mode");
+@@ -8298,7 +8313,7 @@ mlir::tt::ttir::PagedFlashMultiLatentAttentionDecodeOp::verify() {
+     int64_t A = aShape[0];
+     int64_t B = aShape[1];
+     if (outputShape[0] != A || outputShape[1] != B || outputShape[2] != 1 ||
+-        outputShape[3] != E || outputShape[4] != M || outputShape[5] != N) {
++        outputShape[3] != groups || outputShape[4] != M || outputShape[5] != N) {
+       return emitOpError(
+           "Output shape must be [A, B, 1, E, M, N] for dense-sparse mode");
+     }
+@@ -8308,7 +8323,7 @@ mlir::tt::ttir::PagedFlashMultiLatentAttentionDecodeOp::verify() {
+       return emitOpError("Output must be 4D for sparse-dense mode");
+     }
+     int64_t A = aShape[0];
+-    if (outputShape[0] != A || outputShape[1] != E || outputShape[2] != M ||
++    if (outputShape[0] != A || outputShape[1] != groups || outputShape[2] != M ||
+         outputShape[3] != N) {
+       return emitOpError(
+           "Output shape must be [A, E, M, N] for sparse-dense mode");
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -3146,6 +3146,21 @@ void mlir::tt::ttnn::MatmulOp::getCanonicalizationPatterns(
+                        "experts in Input B");
+   }
+ 
++  // In indexed mode the output's group axis has a slot per index.
++  int64_t groups = E;
++  if (getIndices()) {
++    if (!isInputBSparse) {
++      return emitOpError("indices require is_input_b_sparse");
++    }
++    if (getNnz()) {
++      return emitOpError("nnz must not be set together with indices");
++    }
++    groups = getIndices().getType().getNumElements();
++    if (groups > E) {
++      return emitOpError("indices must not list more groups than Input B has");
++    }
++  }
++
+   // Verify output shape based on sparse mode (including batch dimensions)
+   llvm::ArrayRef<int64_t> outputShape = outputType.getShape();
+ 
+@@ -3154,7 +3169,7 @@ void mlir::tt::ttnn::MatmulOp::getCanonicalizationPatterns(
+     if (outputShape.size() != 4) {
+       return emitOpError("Output must be 4D for sparse-sparse mode");
+     }
+-    if (outputShape[0] != 1 || outputShape[1] != E || outputShape[2] != M ||
++    if (outputShape[0] != 1 || outputShape[1] != groups || outputShape[2] != M ||
+         outputShape[3] != N) {
+       return emitOpError(
+           "Output shape must be [1, E, M, N] for sparse-sparse mode");
+@@ -3167,7 +3182,7 @@ void mlir::tt::ttnn::MatmulOp::getCanonicalizationPatterns(
+     int64_t A = aShape[0];
+     int64_t B = aShape[1];
+     if (outputShape[0] != A || outputShape[1] != B || outputShape[2] != 1 ||
+-        outputShape[3] != E || outputShape[4] != M || outputShape[5] != N) {
++        outputShape[3] != groups || outputShape[4] != M || outputShape[5] != N) {
+       return emitOpError(
+           "Output shape must be [A, B, 1, E, M, N] for dense-sparse mode");
+     }
+@@ -3177,7 +3192,7 @@ void mlir::tt::ttnn::MatmulOp::getCanonicalizationPatterns(
+       return emitOpError("Output must be 4D for sparse-dense mode");
+     }
+     int64_t A = aShape[0];
+-    if (outputShape[0] != A || outputShape[1] != E || outputShape[2] != M ||
++    if (outputShape[0] != A || outputShape[1] != groups || outputShape[2] != M ||
+         outputShape[3] != N) {
+       return emitOpError(
+           "Output shape must be [A, E, M, N] for sparse-dense mode");
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -1647,19 +1647,28 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
+ // the moe_expert_token_remap path, UInt16(0/1) -> BFloat16(0.0/1.0) is also
+ // non-zero-preserving, so the kernel still sees the correct mask.
+ // Issue page: https://github.com/tenstorrent/tt-metal/issues/39126
+-// Inputs: a (input 0), b (input 1), sparsity (input 2)
++// Inputs: a (input 0), b (input 1), sparsity (input 2), and in indexed mode
++// the group ids (input 3), which TTNN reads as a ROW_MAJOR UINT16 row.
+ TTNNOperandsWorkarounds
+-TTNNOperandsWorkaroundsFactory::createSparseMatmulOpOperandsWorkarounds() {
++TTNNOperandsWorkaroundsFactory::createSparseMatmulOpOperandsWorkarounds(
++    Operation *op) {
+   TTNNOperandWorkarounds emptyWorkaround;
+   TTNNOperandWorkarounds sparsityWorkaround;
+   sparsityWorkaround.tensorLayoutWorkaround = Layout::RowMajor;
+   sparsityWorkaround.tensorDataTypeWorkaround = ttcore::DataType::BFloat16;
+ 
+-  return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+-      .addInputOperandWorkaround(emptyWorkaround)    // input a
+-      .addInputOperandWorkaround(emptyWorkaround)    // input b
+-      .addInputOperandWorkaround(sparsityWorkaround) // sparsity tensor
+-      .addOutputOperandWorkaround(emptyWorkaround);  // output
++  TTNNOperandsWorkarounds workarounds =
++      TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
++          .addInputOperandWorkaround(emptyWorkaround)     // input a
++          .addInputOperandWorkaround(emptyWorkaround)     // input b
++          .addInputOperandWorkaround(sparsityWorkaround); // sparsity tensor
++  if (op->getNumOperands() == 4) {
++    TTNNOperandWorkarounds indicesWorkaround;
++    indicesWorkaround.tensorLayoutWorkaround = Layout::RowMajor;
++    indicesWorkaround.tensorDataTypeWorkaround = ttcore::DataType::UInt16;
++    workarounds.addInputOperandWorkaround(indicesWorkaround);
++  }
++  return workarounds.addOutputOperandWorkaround(emptyWorkaround); // output
+ }
+ 
+ // Factory method to create workarounds for all_to_all_dispatch op operands.
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -602,6 +602,11 @@ createOp(FlatbufferObjectCache &cache, SparseMatmulOp op) {
+       getOperandThroughDPSOps(op.getB()));
+   auto sparsity = cache.at<::tt::target::ttnn::TensorRef>(
+       getOperandThroughDPSOps(op.getSparsity()));
++  ::flatbuffers::Offset<::tt::target::ttnn::TensorRef> indices = 0;
++  if (op.getIndices()) {
++    indices = cache.at<::tt::target::ttnn::TensorRef>(
++        getOperandThroughDPSOps(op.getIndices()));
++  }
+   auto output = cache.getOrCreateNoSharding(
+       op.getResult(), tensorValueToFlatbuffer, std::nullopt);
+ 
+@@ -628,7 +633,7 @@ createOp(FlatbufferObjectCache &cache, SparseMatmulOp op) {
+   return ::tt::target::ttnn::CreateSparseMatmulOp(
+       *cache.fbb, a, b, sparsity, output, op.getIsInputASparse(),
+       op.getIsInputBSparse(), nnz, programConfig, memoryConfig, dtype,
+-      computeConfig.value_or(0));
++      computeConfig.value_or(0), indices);
+ }
+ 
+ ::flatbuffers::Offset<::tt::target::ttnn::FuncCallOp>
+diff --git a/runtime/lib/ttnn/operations/matmul/matmul.cpp b/runtime/lib/ttnn/operations/matmul/matmul.cpp
+--- a/runtime/lib/ttnn/operations/matmul/matmul.cpp
++++ b/runtime/lib/ttnn/operations/matmul/matmul.cpp
+@@ -137,6 +137,10 @@ void run(const ::tt::target::ttnn::SparseMatmulOp *op,
+   const ::ttnn::Tensor &b = tensorPool.getTTNNTensorAndValidate(op->b());
+   const ::ttnn::Tensor &sparsity =
+       tensorPool.getTTNNTensorAndValidate(op->sparsity());
++  std::optional<::ttnn::Tensor> indices;
++  if (op->indices()) {
++    indices = tensorPool.getTTNNTensorAndValidate(op->indices());
++  }
+ 
+   auto outputMemoryConfig =
+       ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(
+@@ -197,7 +201,11 @@ void run(const ::tt::target::ttnn::SparseMatmulOp *op,
+                             /*dtype=*/std::nullopt,
+                             /*compute_kernel_config=*/computeConfig,
+                             /*core_grid=*/std::nullopt,
+-                            /*output_tile=*/std::nullopt);
++                            /*output_tile=*/std::nullopt,
++                            /*optional_output_tensor=*/std::nullopt,
++                            /*global_cb=*/std::nullopt,
++                            /*sub_device_id=*/std::nullopt,
++                            /*indices=*/indices);
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), output);
+ }

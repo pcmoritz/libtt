@@ -1,0 +1,102 @@
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -1555,7 +1555,9 @@ namespace {
+ static ttnn::MatmulMultiCoreReuseMultiCast1DProgramConfigAttr
+ createSparseMatmulProgramConfigAttr(MLIRContext *ctx, RankedTensorType aType,
+                                     RankedTensorType bType,
+-                                    ttcore::DeviceAttr deviceAttr) {
++                                    ttcore::DeviceAttr deviceAttr,
++                                    bool isInputASparse = false,
++                                    int64_t numActive = 0) {
+   constexpr int64_t tileH = 32;
+   constexpr int64_t tileW = 32;
+ 
+@@ -1573,21 +1575,52 @@ createSparseMatmulProgramConfigAttr(MLIRContext *ctx, RankedTensorType aType,
+ 
+   int64_t NTiles = (N + tileW - 1) / tileW;
+ 
+-  // For 1D multicast (mcast_in0=true), Y rows replicate and X columns
+-  // distribute N tiles. The runtime requires ceil(NTiles / perCoreN) to equal
+-  // usedCoreX (all X-columns must have work). Reduce coreX until this holds.
+-  int64_t usedCoreX = std::min(coreX, NTiles);
+-  while (usedCoreX > 1) {
+-    int64_t pcn = (NTiles + usedCoreX - 1) / usedCoreX;
+-    if ((NTiles + pcn - 1) / pcn == usedCoreX) {
++  // With 1D multicast (mcast_in0=true) each core computes perCoreN columns of
++  // the output, and the cores with work must fill the grid's rectangle (the
++  // in0 multicast covers its bounding box). Split N over as many cores as the
++  // device has, in a usedCoreX x usedCoreY rectangle of ceil(NTiles /
++  // perCoreN) cores: a decode-sized expert matmul streams its weights at the
++  // rate of the cores reading them.
++  int64_t perCoreN = 1;
++  int64_t usedCoreX = 1;
++  int64_t usedCoreY = 1;
++  for (; perCoreN <= NTiles; ++perCoreN) {
++    int64_t blocks = (NTiles + perCoreN - 1) / perCoreN;
++    for (int64_t x = std::min(coreX, blocks); x >= 1; --x) {
++      if (blocks % x == 0 && blocks / x <= coreY) {
++        usedCoreX = x;
++        usedCoreY = blocks / x;
++        break;
++      }
++    }
++    if (usedCoreX * usedCoreY == blocks) {
+       break;
+     }
+-    --usedCoreX;
++  }
++
++  // An indexed matmul with a broadcast A runs its slots one after another on
++  // the same cores. TTNN's sparse matmul then spreads them over the grid rows
++  // of a grid one row of output blocks wide: row g runs slots g, g + rows, ...
++  // Use that when it leaves each core less to stream.
++  if (numActive > 1 && !isInputASparse) {
++    int64_t rowPerCoreN = (NTiles + coreX - 1) / coreX;
++    int64_t rowBlocks = (NTiles + rowPerCoreN - 1) / rowPerCoreN;
++    int64_t groups = 1;
++    for (int64_t g = std::min(coreY, numActive); g > 1; --g) {
++      if (numActive % g == 0) {
++        groups = g;
++        break;
++      }
++    }
++    if (groups > 1 &&
++        numActive / groups * rowPerCoreN < numActive * perCoreN) {
++      perCoreN = rowPerCoreN;
++      usedCoreX = rowBlocks;
++      usedCoreY = groups;
++    }
+   }
+ 
+   int64_t perCoreM = std::max(static_cast<int64_t>(1), M / tileH);
+-  int64_t perCoreN =
+-      std::max(static_cast<int64_t>(1), (NTiles + usedCoreX - 1) / usedCoreX);
+ 
+   // Step K in wide blocks: each block costs a multicast handshake, so one-tile
+   // blocks make a decode-sized expert matmul several times slower. Take the
+@@ -1609,7 +1642,7 @@ createSparseMatmulProgramConfigAttr(MLIRContext *ctx, RankedTensorType aType,
+     }
+   }
+ 
+-  auto gridAttr = ttnn::CoreCoordAttr::get(ctx, usedCoreX, coreY);
++  auto gridAttr = ttnn::CoreCoordAttr::get(ctx, usedCoreX, usedCoreY);
+   auto hopCoresAttr = ttnn::CoreRangeSetAttr::get(ctx, {});
+ 
+   return ttnn::MatmulMultiCoreReuseMultiCast1DProgramConfigAttr::get(
+@@ -1648,8 +1681,14 @@ public:
+     auto aType = mlir::cast<RankedTensorType>(adaptor.getA().getType());
+     auto bType = mlir::cast<RankedTensorType>(adaptor.getB().getType());
+     auto deviceAttr = ttcore::lookupDevice(op);
++    int64_t numActive = 0;
++    if (auto indices = adaptor.getIndices()) {
++      numActive =
++          mlir::cast<RankedTensorType>(indices.getType()).getNumElements();
++    }
+     auto programConfigAttr = createSparseMatmulProgramConfigAttr(
+-        rewriter.getContext(), aType, bType, deviceAttr);
++        rewriter.getContext(), aType, bType, deviceAttr,
++        op.getIsInputASparse(), numActive);
+ 
+     auto newOp = rewriter.replaceOpWithNewOp<ttnn::SparseMatmulOp>(
+         op, this->getTypeConverter()->convertType(op.getType()), adaptor.getA(),

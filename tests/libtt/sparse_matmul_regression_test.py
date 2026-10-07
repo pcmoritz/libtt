@@ -6,6 +6,10 @@ range. With tt-mlir's HiFi4 and FP32 accumulation they were still off by 1.7%
 at K=2048, since the sparse factory reloaded its FP32 partials through SrcA,
 rounding them to TF32 after every K block. Expert pairs the sparsity
 skips must come back as zeros, since MoE layers sum over every expert.
+
+With a fourth operand, a list of expert ids, the matmul runs only those
+experts and returns one compact slot per id, so a decode step reads just the
+experts its tokens picked.
 """
 
 import jax
@@ -15,12 +19,12 @@ import pytest
 from jax.experimental.xla_metadata import set_xla_metadata
 
 
-def sparse_matmul(a, b, sparsity, shape, *, a_sparse, b_sparse):
+def sparse_matmul(a, b, sparsity, shape, *indices, a_sparse, b_sparse):
     with set_xla_metadata(
         is_input_a_sparse=str(a_sparse).lower(), is_input_b_sparse=str(b_sparse).lower(), nnz="0"
     ):
         return jax.ffi.ffi_call("tt.sparse_matmul", jax.ShapeDtypeStruct(shape, a.dtype))(
-            a, b, sparsity
+            a, b, sparsity, *indices
         )
 
 
@@ -71,3 +75,35 @@ def test_expert_inputs_sparse(blocks, tile, experts, k, n):
     out = as_f64(f(*jax.device_put((a, b, sparsity), jax.devices("tt")[0])))
     want = np.einsum("aemk,ekn->aemn", as_f64(a), as_f64(b)[0])
     assert_close_where_active(out, want, active)
+
+
+@pytest.mark.parametrize("ids", [[5, 0, 11, 3, 7, 14, 2, 9], [3, 3, 1]])
+def test_indexed_expert_weights(ids):
+    """A token tile [1, 1, M, K] times the listed experts of [1, E, K, N]:
+    [1, 1, 1, len(ids), M, N], one slot per id, repeats included."""
+    experts, k, n = 16, 2048, 192
+    rng = np.random.default_rng(len(ids))
+    a, b = bf16(rng, (1, 1, 32, k), 1.0), bf16(rng, (1, experts, k, n), k**-0.5)
+    sparsity = np.ones((1, 1, 1, experts), jnp.bfloat16)
+    indices = np.array(ids, np.int32)
+    shape = (1, 1, 1, len(ids), 32, n)
+    f = jax.jit(lambda *x: sparse_matmul(*x[:3], shape, x[3], a_sparse=False, b_sparse=True))
+    out = as_f64(f(*jax.device_put((a, b, sparsity, indices), jax.devices("tt")[0])))[0, 0, 0]
+    want = np.einsum("mk,ikn->imn", as_f64(a)[0, 0], as_f64(b)[0][ids])
+    assert_close_where_active(out, want, np.ones(len(ids)))
+
+
+@pytest.mark.parametrize("ids", [[5, 0, 11, 3, 7, 14, 2, 9], [3, 3, 1]])
+def test_indexed_expert_inputs_and_weights(ids):
+    """Compact per-slot activations [1, len(ids), M, K] times the listed experts
+    of [1, E, K, N]: the down projection, [1, len(ids), M, N]."""
+    experts, k, n = 16, 192, 2048
+    rng = np.random.default_rng(len(ids) + 1)
+    a, b = bf16(rng, (1, len(ids), 32, k), 1.0), bf16(rng, (1, experts, k, n), k**-0.5)
+    sparsity = np.ones((1, 1, 1, experts), jnp.bfloat16)
+    indices = np.array(ids, np.int32)
+    shape = (1, len(ids), 32, n)
+    f = jax.jit(lambda *x: sparse_matmul(*x[:3], shape, x[3], a_sparse=True, b_sparse=True))
+    out = as_f64(f(*jax.device_put((a, b, sparsity, indices), jax.devices("tt")[0])))[0]
+    want = np.einsum("imk,ikn->imn", as_f64(a)[0], as_f64(b)[0][ids])
+    assert_close_where_active(out, want, np.ones(len(ids)))
