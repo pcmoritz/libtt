@@ -509,7 +509,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_collective_lowerings.patch",
         "//third_party/tt_xla:tt_mlir_paged_update_shared_cache.patch",
         "//third_party/tt_xla:tt_mlir_empty_meshes.patch",
-        "//third_party/tt_xla:tt_mlir_column_meshes.patch",
+        "//third_party/tt_xla:tt_mlir_unit_axes.patch",
         "//third_party/tt_xla:tt_mlir_sdy_reduction_kind.patch",
         "//third_party/tt_xla:tt_mlir_argmax_last_dim.patch",
         "//third_party/tt_xla:tt_mlir_mixed_manual_graphs.patch",

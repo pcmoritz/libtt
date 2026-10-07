@@ -1,0 +1,52 @@
+diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
+--- a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
++++ b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
+@@ -184,7 +184,7 @@ mlir::LogicalResult mergeMeshes(mlir::ModuleOp &module) {
+       meshOps.push_back(meshOp);
+     }
+   }
+-  if (meshOps.size() < 2) {
++  if (meshOps.empty()) {
+     return mlir::success();
+   }
+ 
+@@ -213,13 +213,22 @@ mlir::LogicalResult mergeMeshes(mlir::ModuleOp &module) {
+         return nonUnitAxisCount(a) < nonUnitAxisCount(b);
+       });
+ 
++  // The target drops its size-one axes, so e.g. (1, 4, 1) and (4, 1) become
++  // (4): they span no strides, so axes tile without them.
++  mlir::sdy::MeshAttr target = mlir::sdy::MeshAttr::get(
++      module.getContext(),
++      llvm::to_vector(llvm::make_filter_range(
++          targetOp.getMeshAttr().getAxes(),
++          [](mlir::sdy::MeshAxisAttr axis) { return axis.getSize() > 1; })),
++      targetOp.getMeshAttr().getDeviceIds());
++
+   // Every mesh's axes as axes of the target.
+   llvm::StringMap<llvm::StringMap<llvm::SmallVector<mlir::sdy::AxisRefAttr>>>
+       onTarget;
+   for (mlir::sdy::MeshOp meshOp : meshOps) {
+     for (auto &[axis, span] : axisSpans(meshOp.getMeshAttr())) {
+       std::optional<llvm::SmallVector<mlir::sdy::AxisRefAttr>> axes =
+-          tile(span, targetOp.getMeshAttr());
++          tile(span, target);
+       if (!axes) {
+         return meshOp.emitError("No mesh holds axis \"")
+                << axis << "\" of mesh @" << meshOp.getSymName()
+@@ -230,7 +239,6 @@ mlir::LogicalResult mergeMeshes(mlir::ModuleOp &module) {
+   }
+ 
+   mlir::MLIRContext *context = module.getContext();
+-  mlir::sdy::MeshAttr target = targetOp.getMeshAttr();
+   auto mapAxes = [&](llvm::StringRef mesh,
+                      llvm::ArrayRef<mlir::sdy::AxisRefAttr> axes,
+                      bool inTargetOrder) {
+@@ -308,6 +316,7 @@ mlir::LogicalResult mergeMeshes(mlir::ModuleOp &module) {
+       meshOp.erase();
+     }
+   }
++  targetOp.setMeshAttr(target);
+   return mlir::success();
+ }
+ 

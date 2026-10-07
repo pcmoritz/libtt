@@ -82,6 +82,29 @@ def test_sharding_on_reshaped_mesh(devices, outer_shape, inner_shape, inner_axes
     np.testing.assert_allclose(np.asarray(out), np.tanh(x) * 2 + y, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize("shape", [(1, 4, 1), (1, 2, 2)])
+def test_mesh_with_size_one_axes(devices, shape):
+    """Meshes of more than two axes, all but two of size one, become 2D."""
+    mesh = Mesh(devices.reshape(shape), ("a", "b", "c"))
+    spec = P("a", "b", "c")
+    x = np.arange(2 * 16 * 4, dtype=np.float32).reshape(2, 16, 4)
+    run = jax.jit(jax.shard_map(lambda x: x * x + 2, mesh=mesh, in_specs=spec, out_specs=spec))
+    out = run(jax.device_put(x, NamedSharding(mesh, spec)))
+    np.testing.assert_allclose(np.asarray(out), x * x + 2, rtol=1e-2)
+
+
+def test_axis_index_without_operands_on_size_one_axis(devices):
+    """A shard_map without operands still names the dropped axis as manual."""
+    mesh = Mesh(devices.reshape(1, 2, 2), ("x", "y", "z"))
+
+    def indices():
+        return jnp.array([jax.lax.axis_index(name) for name in mesh.axis_names])
+
+    out = jax.jit(jax.shard_map(indices, mesh=mesh, in_specs=(), out_specs=P(mesh.axis_names)))()
+    expected = [[0, y, z] for y in range(2) for z in range(2)]
+    np.testing.assert_array_equal(np.asarray(out), np.ravel(expected))
+
+
 @pytest.mark.parametrize("rows", [4])
 def test_mesh_with_trailing_size_one_axis(devices, rows):
     """tt-mlir takes (1, n) meshes; an (n, 1) mesh is the same devices."""
