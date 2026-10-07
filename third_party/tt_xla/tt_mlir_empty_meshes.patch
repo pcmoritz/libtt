@@ -13,7 +13,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
  #include "stablehlo/dialect/StablehloOps.h"
  
  #include <numeric>
-@@ -102,8 +104,218 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
+@@ -102,8 +104,221 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
    addMeshToModule(module, meshName, meshMap);
  }
  
@@ -101,9 +101,12 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +    return mlir::success();
 +  }
 +
++  // An empty list of device ids means 0..n-1, so compare device counts too.
++  mlir::sdy::MeshAttr first = meshOps.front().getMeshAttr();
 +  for (mlir::sdy::MeshOp meshOp : meshOps) {
-+    if (meshOp.getMeshAttr().getDeviceIds() !=
-+        meshOps.front().getMeshAttr().getDeviceIds()) {
++    mlir::sdy::MeshAttr mesh = meshOp.getMeshAttr();
++    if (mesh.getTotalSize() != first.getTotalSize() ||
++        mesh.getDeviceIds() != first.getDeviceIds()) {
 +      return meshOp.emitError("Mesh @")
 +             << meshOp.getSymName() << " lists other devices than mesh @"
 +             << meshOps.front().getSymName();
@@ -111,16 +114,16 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +  }
 +
 +  // A target tiling every axis holds every mesh's stride boundaries, so it has
-+  // the most axes larger than one, and any mesh with as many has the same
-+  // boundaries: take the first such mesh.
-+  auto bigAxes = [](mlir::sdy::MeshOp meshOp) {
++  // the most non-unit axes. If a common target exists, any mesh with that many
++  // has its stride boundaries, so take the first; tiling rejects the others.
++  auto nonUnitAxisCount = [](mlir::sdy::MeshOp meshOp) {
 +    return llvm::count_if(
 +        meshOp.getMeshAttr().getAxes(),
 +        [](mlir::sdy::MeshAxisAttr axis) { return axis.getSize() > 1; });
 +  };
 +  mlir::sdy::MeshOp targetOp = *llvm::max_element(
 +      meshOps, [&](mlir::sdy::MeshOp a, mlir::sdy::MeshOp b) {
-+        return bigAxes(a) < bigAxes(b);
++        return nonUnitAxisCount(a) < nonUnitAxisCount(b);
 +      });
 +
 +  // Every mesh's axes as axes of the target.
@@ -232,7 +235,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
    auto meshOps = getMeshOps(module);
    if (meshOps.empty()) {
      return mlir::success();
-@@ -132,6 +344,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
+@@ -132,6 +347,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
    if (meshRank == 1) {
      axisName = meshOps[0].getMeshAttr().getAxes()[0].getName().str();
      axisSize = meshShape[0];
