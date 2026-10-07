@@ -1,0 +1,56 @@
+diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
+--- a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
++++ b/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp
+@@ -184,7 +184,8 @@ mlir::LogicalResult mergeMeshes(mlir::ModuleOp &module) {
+       meshOps.push_back(meshOp);
+     }
+   }
+-  if (meshOps.size() < 2) {
++  if (meshOps.empty() ||
++      (meshOps.size() == 1 && meshOps[0].getMeshAttr().getAxes().size() <= 2)) {
+     return mlir::success();
+   }
+ 
+@@ -210,13 +211,25 @@ mlir::LogicalResult mergeMeshes(mlir::ModuleOp &module) {
+         return bigAxes(a) < bigAxes(b);
+       });
+ 
++  // A target of more than two axes drops its size-one ones, so e.g. (1, 4, 1)
++  // becomes (4): they span no strides, so axes tile without them.
++  mlir::sdy::MeshAttr target = targetOp.getMeshAttr();
++  if (target.getAxes().size() > 2) {
++    target = mlir::sdy::MeshAttr::get(
++        target.getContext(),
++        llvm::to_vector(llvm::make_filter_range(
++            target.getAxes(),
++            [](mlir::sdy::MeshAxisAttr axis) { return axis.getSize() > 1; })),
++        target.getDeviceIds());
++  }
++
+   // Every mesh's axes as axes of the target.
+   llvm::StringMap<llvm::StringMap<llvm::SmallVector<mlir::sdy::AxisRefAttr>>>
+       onTarget;
+   for (mlir::sdy::MeshOp meshOp : meshOps) {
+     for (auto &[axis, span] : axisSpans(meshOp.getMeshAttr())) {
+       std::optional<llvm::SmallVector<mlir::sdy::AxisRefAttr>> axes =
+-          tile(span, targetOp.getMeshAttr());
++          tile(span, target);
+       if (!axes) {
+         return meshOp.emitError("No mesh holds axis \"")
+                << axis << "\" of mesh @" << meshOp.getSymName()
+@@ -227,7 +240,6 @@ mlir::LogicalResult mergeMeshes(mlir::ModuleOp &module) {
+   }
+ 
+   mlir::MLIRContext *context = module.getContext();
+-  mlir::sdy::MeshAttr target = targetOp.getMeshAttr();
+   auto mapAxes = [&](llvm::StringRef mesh,
+                      llvm::ArrayRef<mlir::sdy::AxisRefAttr> axes,
+                      bool inTargetOrder) {
+@@ -305,6 +317,7 @@ mlir::LogicalResult mergeMeshes(mlir::ModuleOp &module) {
+       meshOp.erase();
+     }
+   }
++  targetOp.setMeshAttr(target);
+   return mlir::success();
+ }
+ 
