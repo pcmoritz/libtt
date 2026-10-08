@@ -1,14 +1,15 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -541,6 +541,52 @@ public:
+@@ -541,6 +541,50 @@ public:
    }
  };
  
 +// An FP32 matmul with a BF16 operand cast up to FP32, such as a router's
 +// FP32 gate applied to BF16 hidden states, reads the BF16 tensor directly: the
-+// cast is exact and the matmul unpacks each operand from its own format, so
-+// the result is the same without the cast's program.
++// cast is exact and the matmul unpacks each operand from its own format. TTNN
++// picks the same fidelity for an FP32 input with a BF16 one as for two FP32
++// inputs, so the result is the same without the cast's program.
 +class MatmulBF16OperandCastPattern : public mlir::OpRewritePattern<MatmulOp> {
 +  using mlir::OpRewritePattern<MatmulOp>::OpRewritePattern;
 +
@@ -21,9 +22,13 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +          .getElementType()
 +          .isF32();
 +    };
-+    auto bf16Source = [&](mlir::Value value) -> mlir::Value {
++    if (!isF32(matmulOp.getA()) || !isF32(matmulOp.getB()) ||
++        !isF32(matmulOp.getResult())) {
++      return mlir::failure();
++    }
++    auto bf16Source = [](mlir::Value value) -> mlir::Value {
 +      auto typecastOp = value.getDefiningOp<TypecastOp>();
-+      if (!typecastOp || !isF32(value) ||
++      if (!typecastOp ||
 +          !mlir::cast<mlir::RankedTensorType>(typecastOp.getInput().getType())
 +               .getElementType()
 +               .isBF16()) {
@@ -31,30 +36,23 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +      }
 +      return typecastOp.getInput();
 +    };
-+    if (!isF32(matmulOp.getResult())) {
-+      return mlir::failure();
-+    }
-+    // One operand only: with both cast, the matmul would run in BF16.
 +    mlir::Value a = bf16Source(matmulOp.getA());
 +    mlir::Value b = bf16Source(matmulOp.getB());
-+    if (a && !b && isF32(matmulOp.getB())) {
-+      rewriter.modifyOpInPlace(matmulOp,
-+                               [&] { matmulOp.getAMutable().assign(a); });
-+      return mlir::success();
++    // Exactly one: with both cast, the matmul would run in BF16.
++    if (bool(a) == bool(b)) {
++      return mlir::failure();
 +    }
-+    if (b && !a && isF32(matmulOp.getA())) {
-+      rewriter.modifyOpInPlace(matmulOp,
-+                               [&] { matmulOp.getBMutable().assign(b); });
-+      return mlir::success();
-+    }
-+    return mlir::failure();
++    mlir::OpOperand &operand =
++        a ? matmulOp.getAMutable() : matmulOp.getBMutable();
++    rewriter.modifyOpInPlace(matmulOp, [&] { operand.assign(a ? a : b); });
++    return mlir::success();
 +  }
 +};
 +
  // This pattern detects and fuses a sequence of operations that implement
  // relu. If a zeros op is consumed by a maximum op, we can fuse the zeros and
  // maximum op into a relu op.
-@@ -4065,6 +4111,7 @@ public:
+@@ -4065,6 +4109,7 @@ public:
        patterns.add<SoftmaxFusionPattern>(&getContext());
        patterns.add<NumericStableSoftmaxFusionPattern>(&getContext());
        patterns.add<TopKSoftmaxRenormalizePattern>(&getContext());
