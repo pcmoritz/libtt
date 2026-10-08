@@ -838,6 +838,8 @@ TTNN_CCL_OPERATION_SRCS = [
     "ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/**/*.cpp",
     "ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_direct/**/*.cpp",
     "ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_common/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/**/*.cpp",
+    "ttnn/cpp/ttnn/operations/experimental/ccl/moe/selective_reduce_combine/**/*.cpp",
     "ttnn/cpp/ttnn/operations/moreh/moreh_sum/**/*.cpp",
     "ttnn/cpp/ttnn/operations/ccl/ccl_common.cpp",
     "ttnn/cpp/ttnn/operations/ccl/ccl_host_datastructures.cpp",
