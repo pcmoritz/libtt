@@ -1,4 +1,3 @@
-#include "operations/ccl/allocate_moe_compute_semaphore.h"
 #include "operations/ccl/all_gather.h"
 #include "operations/ccl/all_reduce.h"
 #include "operations/ccl/all_reduce_async.h"
@@ -6,10 +5,7 @@
 #include "operations/ccl/all_to_all_dispatch.h"
 #include "operations/ccl/all_to_all_dispatch_metadata.h"
 #include "operations/ccl/moe_expert_token_remap.h"
-#include "operations/ccl/moe_compute.h"
 #include "operations/ccl/moe_gpt.h"
-#include "operations/ccl/prepare_moe_compute_w0_w1_weights.h"
-#include "operations/ccl/prepare_moe_compute_w2_weights.h"
 #include "operations/ccl/reduce_scatter.h"
 #include "operations/ccl/selective_reduce_combine.h"
 #include "operations/cpu/cpu.h"
@@ -50,11 +46,6 @@ namespace {
 
 namespace tt::runtime::ttnn::operations::ccl {
 
-void run(const ::tt::target::ttnn::AllocateMoeComputeSemaphoreOp *,
-         ProgramContext &) {
-  unsupported("ttnn.allocate_moe_compute_semaphore");
-}
-
 void run(const ::tt::target::ttnn::AllToAllCombineOp *, ProgramContext &) {
   unsupported("ttnn.all_to_all_combine");
 }
@@ -72,22 +63,8 @@ void run(const ::tt::target::ttnn::MoeExpertTokenRemapOp *, ProgramContext &) {
   unsupported("ttnn.moe_expert_token_remap");
 }
 
-void run(const ::tt::target::ttnn::MoeComputeOp *, ProgramContext &) {
-  unsupported("ttnn.moe_compute");
-}
-
 void run(const ::tt::target::ttnn::MoeGptOp *, ProgramContext &) {
   unsupported("ttnn.moe_gpt");
-}
-
-void run(const ::tt::target::ttnn::PrepareMoEComputeW0W1WeightsOp *,
-         ProgramContext &) {
-  unsupported("ttnn.prepare_moe_compute_w0_w1_weights");
-}
-
-void run(const ::tt::target::ttnn::PrepareMoEComputeW2WeightsOp *,
-         ProgramContext &) {
-  unsupported("ttnn.prepare_moe_compute_w2_weights");
 }
 
 void run(const ::tt::target::ttnn::SelectiveReduceCombineOp *,
