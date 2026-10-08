@@ -328,17 +328,30 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  
      // Writer
      std::vector<uint32_t> writer_compile_args = {
-@@ -465,7 +496,8 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -455,6 +486,12 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+     writer_compile_args.insert(writer_compile_args.end(), forward_args.begin(), forward_args.end());
+     writer_compile_args.insert(writer_compile_args.end(), backward_args.begin(), backward_args.end());
+     log_trace(tt::LogOp, "Writer Compile Args:");
++    // A direct exchange writes into scratch the peers allocate for this call, which a peer still running its
++    // previous program may be using; its writers first wait for every peer to start (see worker_writer).
++    auto writer_defines = packing_defines;
++    if (direct) {
++        writer_defines["WAIT_FOR_PEERS"] = "1";
++    }
+     auto worker_sender_writer_kernel_id = tt::tt_metal::CreateKernel(
+         program,
+         "ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/"
+@@ -465,7 +502,8 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
              .noc = writer_noc,
              .noc_mode =
                  use_noc1_only ? tt::tt_metal::NOC_MODE::DM_DYNAMIC_NOC : tt::tt_metal::NOC_MODE::DM_DEDICATED_NOC,
 -            .compile_args = writer_compile_args});
 +            .compile_args = writer_compile_args,
-+            .defines = packing_defines});
++            .defines = writer_defines});
  
      // Kernel Runtime Args
      for (uint32_t link = 0; link < num_links; link++) {
-@@ -509,6 +541,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -509,6 +547,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
          };
          reader_rt_args.insert(reader_rt_args.end(), input_tensor_cores_x.begin(), input_tensor_cores_x.end());
          reader_rt_args.insert(reader_rt_args.end(), input_tensor_cores_y.begin(), input_tensor_cores_y.end());
@@ -346,7 +359,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
          log_trace(tt::LogOp, "Reader Runtime Args:");
          for ([[maybe_unused]] const auto& arg : reader_rt_args) {
              log_trace(tt::LogOp, "\t{}", arg);
-@@ -611,6 +644,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -611,6 +650,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
              .reduction_reader_kernel_id = reduction_reader_kernel_id,
              .sender_worker_cores = sender_worker_cores,
              .output_tensor_cores = output_tensor_cores,
@@ -354,7 +367,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
              .cb_out = cb_out,
              .cb_reduction = cb_reduction}};
  }
-@@ -627,7 +661,7 @@ void AllReduceAsyncMeshWorkloadFactory::override_runtime_arguments(
+@@ -627,7 +667,7 @@ void AllReduceAsyncMeshWorkloadFactory::override_runtime_arguments(
          const auto& input_tensor = tensor_args.input_tensor;
          const auto& buffer_tensor = tensor_args.buffer_tensor;
  
@@ -363,7 +376,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  
          // update senders
          auto& worker_reader_sender_runtime_args_by_core =
-@@ -643,7 +677,12 @@ void AllReduceAsyncMeshWorkloadFactory::override_runtime_arguments(
+@@ -643,7 +683,12 @@ void AllReduceAsyncMeshWorkloadFactory::override_runtime_arguments(
              auto& worker_writer_sender_runtime_args = worker_writer_sender_runtime_args_by_core[core.x][core.y];
              worker_writer_sender_runtime_args[1] = semaphore.address();
          }
@@ -490,7 +503,42 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
  void kernel_main() {
      ///////////////////////////////////////////////////
      // ARGS
-@@ -112,13 +119,23 @@ void kernel_main() {
+@@ -108,17 +115,58 @@ void kernel_main() {
+         fabric_connection.open_finish();
+     }
+ 
++#ifdef WAIT_FOR_PEERS
++    // The scratch this writes into is allocated when the exchange is enqueued, so a peer still running its previous
++    // program may be using it. Tell the peers this chip runs the exchange (its scratch is free), then wait until
++    // they all do. The count lives in this core's copy of the global semaphore, which only the reduction cores use.
++    // The reset cannot erase a peer's next arrival: this writer sends its data after it, and no peer finishes the
++    // exchange without that data. A writer without tiles has no such data, so it skips the handshake; the work split
++    // is the same on every chip, so its peers' writers on this core skip it too.
++    if (num_tiles_to_read != 0) {
++        const uint64_t ready_noc_addr =
++            safe_get_noc_addr(out_ready_sem_noc0_x, out_ready_sem_noc0_y, out_ready_sem_bank_addr, 0);
++        auto send_ready = [&](auto& connection, volatile PACKET_HEADER_TYPE* header) {
++            // The payload sends below set their own commands on these headers; the routes stay.
++            header->to_noc_unicast_atomic_inc(
++                tt::tt_fabric::NocUnicastAtomicIncCommandHeader{ready_noc_addr, static_cast<uint32_t>(1)});
++            connection.wait_for_empty_write_slot();
++            connection.send_payload_flush_blocking_from_address(
++                reinterpret_cast<uint32_t>(header), sizeof(PACKET_HEADER_TYPE));
++        };
++        if (fabric_connection.has_forward_connection()) {
++            send_ready(fabric_connection.get_forward_connection(), pkt_hdr_forward);
++        }
++        if (fabric_connection.has_backward_connection()) {
++            send_ready(fabric_connection.get_backward_connection(), pkt_hdr_backward);
++        }
++        // Device 2.0 migration: legacy primitive retained: out_ready_sem_bank_addr is a GlobalSemaphore address.
++        auto* ready = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(out_ready_sem_bank_addr);
++        noc_semaphore_wait_min(ready, num_targets_forward_direction + num_targets_backward_direction);
++        noc_semaphore_set(ready, 0);
++    }
++#endif
++
+     // 1. mcast via fabric to remote tensor addresses
      uint32_t tiles_read = 0;
      uint32_t shard_tile_id = first_core_tile_start_offset;
      uint32_t core_id = 0;
@@ -515,7 +563,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
  
          uint64_t noc0_dest_noc_addr =
              safe_get_noc_addr(core_noc_x[core_id], core_noc_y[core_id], reduction_input_addr + writer_chip_offset);
-@@ -126,7 +143,7 @@ void kernel_main() {
+@@ -126,7 +174,7 @@ void kernel_main() {
          uint64_t sema_noc_addr = safe_get_noc_addr(core_noc_x[core_id], core_noc_y[core_id], out_ready_sem_bank_addr);
  
          // Within-shard offset
@@ -524,7 +572,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
  
          // This issues a flush barrier
          if (shard_tile_id + num_tiles_to_read_this_core >= num_tiles_per_core ||
-@@ -137,7 +154,7 @@ void kernel_main() {
+@@ -137,7 +185,7 @@ void kernel_main() {
                  pkt_hdr_backward,
                  fabric_connection,
                  l1_read_addr,
@@ -533,7 +581,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
                  sema_noc_addr,
                  static_cast<uint32_t>(1),
                  false);
-@@ -149,7 +166,7 @@ void kernel_main() {
+@@ -149,7 +197,7 @@ void kernel_main() {
                  pkt_hdr_backward,
                  fabric_connection,
                  l1_read_addr,
@@ -542,7 +590,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
          }
  
          tiles_read += num_tiles_to_read_this_core;
-@@ -158,8 +175,13 @@ void kernel_main() {
+@@ -158,8 +206,13 @@ void kernel_main() {
              shard_tile_id = 0;
              core_id++;
          }
