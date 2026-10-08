@@ -315,6 +315,7 @@ http_archive(
         "//third_party/tt_metal:topk_multicore_router_width.patch",
         "//third_party/tt_metal:moe_compute_local_output.patch",
         "//third_party/tt_metal:moe_compute_local_output_unlabeled_replicas.patch",
+        "//third_party/tt_metal:softmax_exact_fp32_stable.patch",
     ],
     sha256 = "e7ce42e8dd832189662a9af0e8d2b397680a75bbab4f71986efb8300435e1eba",
     strip_prefix = "tt-metal-cffd17520cdfc45dc85c1c47cc2aa49f6bff15c0",
@@ -534,6 +535,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_submesh_quiesce.patch",
         "//third_party/tt_xla:tt_mlir_open_shardings.patch",
         "//third_party/tt_xla:tt_mlir_moe_compute_local.patch",
+        "//third_party/tt_xla:tt_mlir_jax_stable_softmax.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
