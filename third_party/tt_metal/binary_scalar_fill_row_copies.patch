@@ -1,0 +1,65 @@
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
+@@ -5,6 +5,27 @@
+ #pragma once
+ 
+ #include "api/dataflow/dataflow_api.h"
++#include "ckernel.h"
++
++// Fills a tile in L1 with copies of its first face row, which the caller has written: the NoC
++// copies that row down the first face and then the first face over the other three, 18 NoC
++// reads instead of 512 (16-bit) or 1024 (32-bit) RISC stores.
++FORCE_INLINE void fill_tile_from_first_face_row(uint32_t l1_write_ptr, uint32_t row_bytes) {
++    constexpr uint32_t face_rows = 16;
++    const uint32_t face_bytes = face_rows * row_bytes;
++    // A baby-RISCV store can retire before its write lands in L1, and the RISC and the NoC reach
++    // L1 in no fixed order: read the last written word back before the NoC copies the row.
++    (void)ckernel::load_blocking(reinterpret_cast<volatile uint32_t*>(l1_write_ptr + row_bytes - 4));
++    const uint64_t src = get_noc_addr(l1_write_ptr);
++    for (uint32_t r = 1; r < face_rows; ++r) {
++        noc_async_read(src, l1_write_ptr + r * row_bytes, row_bytes);
++    }
++    noc_async_read_barrier();
++    for (uint32_t f = 1; f < 4; ++f) {
++        noc_async_read(src, l1_write_ptr + f * face_bytes, face_bytes);
++    }
++    noc_async_read_barrier();
++}
+ 
+ // Fills one full tile of bfloat16 with a scalar value
+ // Scalar is assumed to be a 16-bit value double packed into a u32
+@@ -32,26 +53,28 @@ FORCE_INLINE void fill_tile_with_first_element_bfloat16(uint32_t l1_write_ptr) {
+     const uint16_t first_elem = read_ptr[0];
+     const uint32_t packed_first_elem = (static_cast<uint32_t>(first_elem) << 16) | static_cast<uint32_t>(first_elem);
+ 
+-    // Since all elements in the tile are the same, we can ignore the faces and assume the entire
+-    // tile is contiguous in memory.
++    // All elements are the same, so the faces need no special handling: fill the first face row
++    // and copy it.
+     auto* write_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_write_ptr);
+-    // TODO: should I fill one face like this and then use noc to fill the rest?
+-    for (uint32_t i = 0; i < 512; ++i) {
++    for (uint32_t i = 0; i < 8; ++i) {
+         write_ptr[i] = packed_first_elem;
+     }
++    fill_tile_from_first_face_row(l1_write_ptr, 16 * sizeof(uint16_t));
+ }
+ 
+ // Reads the very first element of the CB and fills the entire tile with that value.
+ // Tile is assumed to have 32-bit elements (float32 or int32).
+ template <typename T>
+ FORCE_INLINE void fill_tile_with_first_element(uint32_t l1_write_ptr) {
++    static_assert(sizeof(T) == 4, "fill_tile_with_first_element takes 32-bit elements");
+     auto* read_ptr = reinterpret_cast<volatile tt_l1_ptr T*>(l1_write_ptr);
+     const T first_elem = read_ptr[0];
+ 
+     auto* write_ptr = reinterpret_cast<volatile tt_l1_ptr T*>(l1_write_ptr);
+-    for (uint32_t i = 0; i < 1024; ++i) {
++    for (uint32_t i = 1; i < 16; ++i) {
+         write_ptr[i] = first_elem;
+     }
++    fill_tile_from_first_face_row(l1_write_ptr, 16 * sizeof(T));
+ }
+ 
+ // Reads the very first element of the CB and fills the entire tile with that value.
