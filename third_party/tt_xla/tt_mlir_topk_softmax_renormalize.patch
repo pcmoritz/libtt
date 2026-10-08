@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -468,6 +468,80 @@ static bool isFullOpWithValue(Value value, float expectedValue,
+@@ -468,6 +468,85 @@ static bool isFullOpWithValue(Value value, float expectedValue,
    return false;
  }
  
@@ -42,18 +42,16 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +      return mlir::failure();
 +    }
 +
-+    // The denominator is the sum of the values over the same dim, reshaped or
-+    // broadcast back to their shape.
-+    mlir::Value denominator = divOp.getRhs();
-+    while (mlir::Operation *op = denominator.getDefiningOp()) {
-+      if (!mlir::isa<BroadcastOp, ReshapeOp>(op)) {
-+        break;
-+      }
-+      denominator = op->getOperand(0);
++    // Each row must be divided by its own sum: a keep-dim sum of the values
++    // over the last dim, possibly broadcast back to their shape.
++    // ReductionWithReshapePattern folds JAX's sum and reshape into one.
++    if (divOp.getType() != values.getType()) {
++      return mlir::failure();
 +    }
-+    auto sumOp = denominator.getDefiningOp<SumOp>();
-+    if (!sumOp || sumOp.getInput() != values || !sumOp.getDimArg() ||
-+        sumOp.getDimArg()->size() != 1 ||
++    auto sumOp =
++        ttmlir::utils::findOpThrough<SumOp, BroadcastOp>(divOp.getRhs());
++    if (!sumOp || !sumOp.getKeepDim() || sumOp.getInput() != values ||
++        !sumOp.getDimArg() || sumOp.getDimArg()->size() != 1 ||
 +        normalize(mlir::cast<mlir::IntegerAttr>((*sumOp.getDimArg())[0])
 +                      .getInt()) != dim) {
 +      return mlir::failure();
@@ -65,11 +63,18 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +      }
 +    }
 +
-+    auto newTopK = rewriter.create<TopKOp>(
-+        topkOp.getLoc(), topkOp.getValues().getType(),
-+        topkOp.getIndices().getType(), softmaxOp.getInput(),
-+        topkOp.getKAttr(), rewriter.getI32IntegerAttr(dim),
-+        topkOp.getLargestAttr(), topkOp.getSortedAttr());
++    // The new top-k replaces the old one's indices, which may be read before
++    // the division, so it goes where the old one is.
++    TopKOp newTopK;
++    {
++      mlir::OpBuilder::InsertionGuard guard(rewriter);
++      rewriter.setInsertionPoint(topkOp);
++      newTopK = rewriter.create<TopKOp>(
++          topkOp.getLoc(), topkOp.getValues().getType(),
++          topkOp.getIndices().getType(), softmaxOp.getInput(),
++          topkOp.getKAttr(), rewriter.getI32IntegerAttr(dim),
++          topkOp.getLargestAttr(), topkOp.getSortedAttr());
++    }
 +    auto newSoftmax = rewriter.create<SoftmaxOp>(
 +        divOp.getLoc(), divOp.getType(), newTopK.getValues(), dim,
 +        /*numericStable=*/true);
@@ -82,7 +87,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  // This pattern detects and fuses a sequence of operations that implement
  // relu. If a zeros op is consumed by a maximum op, we can fuse the zeros and
  // maximum op into a relu op.
-@@ -3991,6 +4065,7 @@ public:
+@@ -3991,6 +4070,7 @@ public:
  
        patterns.add<SoftmaxFusionPattern>(&getContext());
        patterns.add<NumericStableSoftmaxFusionPattern>(&getContext());
