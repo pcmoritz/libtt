@@ -12,6 +12,8 @@ import pytest
     "shape,dimension",
     [
         ((3, 64), 1),
+        # Indices of the lower faces and of more than one tile row.
+        ((33, 128), 1),
         # Above rank 4, ttnn.gather restores a non-last dimension incorrectly.
         ((2, 3, 2, 32, 32), 0),
         ((2, 3, 2, 32, 32), 2),
