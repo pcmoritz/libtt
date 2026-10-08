@@ -53,7 +53,11 @@ def test_scalar_per_batch(dtype, op, batch):
     rng = np.random.default_rng(6)
     n = int(np.prod(batch))
     x = positive(rng, batch + (33, 70), dtype)
-    s = (0.5 + np.arange(n, dtype=np.float32) / n).reshape(batch + (1, 1)).astype(dtype)
+    # Alternating signs keep neighbouring scalars apart in BF16 too, and reversing them between
+    # runs then changes every batch's scalar.
+    s = 0.5 + np.arange(n, dtype=np.float32) / n
+    s[1::2] *= -1
+    s = s.reshape(batch + (1, 1)).astype(dtype)
     run = jax.jit(getattr(jnp, op))
     check_binary(run, op, x, s, dtype)
     check_binary(run, op, x, s.reshape(-1)[::-1].reshape(s.shape).copy(), dtype)
