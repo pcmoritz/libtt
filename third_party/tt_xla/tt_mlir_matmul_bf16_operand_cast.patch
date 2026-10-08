@@ -1,0 +1,64 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -399,6 +399,52 @@ static bool isFullOpWithValue(Value value, float expectedValue,
+   return false;
+ }
+ 
++// An FP32 matmul with a BF16 operand cast up to FP32, such as a router's
++// FP32 gate applied to BF16 hidden states, reads the BF16 tensor directly: the
++// cast is exact and the matmul unpacks each operand from its own format, so
++// the result is the same without the cast's program.
++class MatmulBF16OperandCastPattern : public mlir::OpRewritePattern<MatmulOp> {
++  using mlir::OpRewritePattern<MatmulOp>::OpRewritePattern;
++
++public:
++  mlir::LogicalResult
++  matchAndRewrite(MatmulOp matmulOp,
++                  mlir::PatternRewriter &rewriter) const final {
++    auto isF32 = [](mlir::Value value) {
++      return mlir::cast<mlir::RankedTensorType>(value.getType())
++          .getElementType()
++          .isF32();
++    };
++    auto bf16Source = [&](mlir::Value value) -> mlir::Value {
++      auto typecastOp = value.getDefiningOp<TypecastOp>();
++      if (!typecastOp || !isF32(value) ||
++          !mlir::cast<mlir::RankedTensorType>(typecastOp.getInput().getType())
++               .getElementType()
++               .isBF16()) {
++        return nullptr;
++      }
++      return typecastOp.getInput();
++    };
++    if (!isF32(matmulOp.getResult())) {
++      return mlir::failure();
++    }
++    // One operand only: with both cast, the matmul would run in BF16.
++    mlir::Value a = bf16Source(matmulOp.getA());
++    mlir::Value b = bf16Source(matmulOp.getB());
++    if (a && !b && isF32(matmulOp.getB())) {
++      rewriter.modifyOpInPlace(matmulOp,
++                               [&] { matmulOp.getAMutable().assign(a); });
++      return mlir::success();
++    }
++    if (b && !a && isF32(matmulOp.getA())) {
++      rewriter.modifyOpInPlace(matmulOp,
++                               [&] { matmulOp.getBMutable().assign(b); });
++      return mlir::success();
++    }
++    return mlir::failure();
++  }
++};
++
+ // This pattern detects and fuses a sequence of operations that implement
+ // relu. If a zeros op is consumed by a maximum op, we can fuse the zeros and
+ // maximum op into a relu op.
+@@ -3922,6 +3968,7 @@ public:
+ 
+       patterns.add<SoftmaxFusionPattern>(&getContext());
+       patterns.add<NumericStableSoftmaxFusionPattern>(&getContext());
++      patterns.add<MatmulBF16OperandCastPattern>(&getContext());
+ 
+       patterns.add<ReluFusionPattern>(&getContext());
+ 

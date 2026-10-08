@@ -531,6 +531,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_op_model_without_ttml.patch",
         "//third_party/tt_xla:tt_mlir_submesh_quiesce.patch",
         "//third_party/tt_xla:tt_mlir_open_shardings.patch",
+        "//third_party/tt_xla:tt_mlir_matmul_bf16_operand_cast.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
