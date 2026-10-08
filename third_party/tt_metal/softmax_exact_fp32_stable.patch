@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
  #include "api/compute/softmax.h"
  #include "api/compute/reduce.h"
  #include "api/dataflow/dataflow_buffer.h"
-@@ -64,6 +65,113 @@ void calc_numeric_stable(std::uint32_t Wt, std::uint32_t ndst) {
+@@ -64,6 +65,108 @@ void calc_numeric_stable(std::uint32_t Wt, std::uint32_t ndst) {
      dfb_out_obj.wait_front(static_cast<uint16_t>(Wt));
  }
  
@@ -17,59 +17,18 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
 +// calc_numeric_stable for FP32 input. The matrix unit reads its operands through 19-bit source
 +// registers, which would leave x - max(x) with about 10 mantissa bits (probabilities of rows
 +// around 30 5% off, around 1000 25%) and a max far enough below a large row to overflow the exp.
-+// Here the row is unpacked straight to DEST, the max reduce runs on the SFPU at full FP32, and so
-+// do the subtraction and the -inf padding mask of a row that does not fill its last tile. A
-+// masked row is first streamed into dfb_x with its mask; otherwise dfb_in is read directly.
-+template <
-+    std::uint32_t dfb_in,
-+    std::uint32_t dfb_max_scaler,
-+    std::uint32_t dfb_max,
-+    std::uint32_t dfb_x,
-+    std::uint32_t dfb_out,
-+    bool masked,
-+    std::uint32_t dfb_mask>
++// Here the row is unpacked straight to DEST, and the max reduce and the subtraction run on the
++// SFPU at full FP32.
++template <std::uint32_t dfb_in, std::uint32_t dfb_max_scaler, std::uint32_t dfb_max, std::uint32_t dfb_out>
 +void calc_numeric_stable_exact(std::uint32_t Wt, std::uint32_t ndst) {
-+    constexpr std::uint32_t dfb_row = masked ? dfb_x : dfb_in;
-+    DataflowBuffer dfb_row_obj(dfb_row);
++    DataflowBuffer dfb_in_obj(dfb_in);
 +    DataflowBuffer dfb_max_obj(dfb_max);
 +    DataflowBuffer dfb_out_obj(dfb_out);
-+
-+    if constexpr (masked) {
-+        DataflowBuffer dfb_in_obj(dfb_in);
-+        DataflowBuffer(dfb_mask).wait_front(1);  // pushed once by the reader, never popped
-+        pack_reconfig_data_format(dfb_x);
-+        // DEST tiles per block: the x tiles and the mask.
-+        const std::uint32_t blk = ndst > 1 ? ndst - 1 : 1;
-+        for (std::uint32_t wt = 0; wt < Wt; wt += blk) {
-+            const std::uint32_t rem = (wt + blk > Wt) ? (Wt - wt) : blk;  // clamped final block
-+            dfb_in_obj.wait_front(static_cast<uint16_t>(rem));
-+            tile_regs_acquire();
-+            copy_init(dfb_in);
-+            for (std::uint32_t wt8 = 0; wt8 < rem; wt8++) {
-+                copy_tile(dfb_in, wt8, wt8);
-+            }
-+            if (wt + rem == Wt) {  // the row's last tile: -inf over the padding
-+                unary_bcast_init<BroadcastType::ROW>(dfb_mask);
-+                unary_bcast<BroadcastType::ROW>(dfb_mask, 0, rem);
-+                add_binary_tile_init();
-+                add_binary_tile(rem - 1, rem, rem - 1);
-+            }
-+            tile_regs_commit();
-+            dfb_in_obj.pop_front(static_cast<uint16_t>(rem));
-+            DataflowBuffer(dfb_x).reserve_back(static_cast<uint16_t>(rem));
-+            tile_regs_wait();
-+            for (std::uint32_t wt8 = 0; wt8 < rem; wt8++) {
-+                pack_tile(wt8, dfb_x);
-+            }
-+            tile_regs_release();
-+            DataflowBuffer(dfb_x).push_back(static_cast<uint16_t>(rem));
-+        }
-+    }
 +
 +    compute_kernel_lib::reduce<
 +        PoolType::MAX,
 +        ReduceDim::REDUCE_ROW,
-+        dfb_row,
++        dfb_in,
 +        dfb_max_scaler,
 +        dfb_max,
 +        compute_kernel_lib::ReduceInputPolicy::WaitUpfrontNoPop,
@@ -83,9 +42,9 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
 +    for (std::uint32_t wt = 0; wt < Wt; wt += blk) {
 +        const std::uint32_t rem = (wt + blk > Wt) ? (Wt - wt) : blk;  // clamped final block
 +        tile_regs_acquire();
-+        copy_init(dfb_row);
++        copy_init(dfb_in);
 +        for (std::uint32_t wt8 = 0; wt8 < rem; wt8++) {
-+            copy_tile(dfb_row, wt + wt8, wt8);
++            copy_tile(dfb_in, wt + wt8, wt8);
 +        }
 +        unary_bcast_init<BroadcastType::COL>(dfb_max);
 +        unary_bcast<BroadcastType::COL>(dfb_max, 0, rem);
@@ -114,33 +73,70 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
 +        tile_regs_release();
 +        dfb_out_obj.push_back(static_cast<uint16_t>(rem));
 +    }
-+    dfb_row_obj.pop_front(static_cast<uint16_t>(Wt));
++    dfb_in_obj.pop_front(static_cast<uint16_t>(Wt));
 +    dfb_max_obj.pop_front(1);
 +    dfb_out_obj.wait_front(static_cast<uint16_t>(Wt));
++}
++
++// Copies a row that does not fill its last tile from dfb_in to dfb_x in FP32, with the -inf padding
++// mask added on the SFPU, for calc_numeric_stable_exact. Blocks of 2 or 3 tiles divide dfb_in's
++// capacity (2 * ndst), so no block crosses its end, and leave a DEST tile for the mask.
++template <std::uint32_t dfb_in, std::uint32_t dfb_mask, std::uint32_t dfb_x>
++void mask_padded_row_exact(std::uint32_t Wt, std::uint32_t in_capacity) {
++    DataflowBuffer dfb_in_obj(dfb_in);
++    DataflowBuffer dfb_x_obj(dfb_x);
++    DataflowBuffer(dfb_mask).wait_front(1);  // pushed once by the reader, never popped
++    pack_reconfig_data_format(dfb_x);
++    const std::uint32_t blk = in_capacity % 3 == 0 ? 3 : 2;
++    for (std::uint32_t wt = 0; wt < Wt; wt += blk) {
++        const std::uint32_t rem = (wt + blk > Wt) ? (Wt - wt) : blk;  // clamped final block
++        dfb_in_obj.wait_front(static_cast<uint16_t>(rem));
++        tile_regs_acquire();
++        copy_init(dfb_in);
++        for (std::uint32_t wt8 = 0; wt8 < rem; wt8++) {
++            copy_tile(dfb_in, wt8, wt8);
++        }
++        if (wt + rem == Wt) {  // the row's last tile
++            unary_bcast_init<BroadcastType::ROW>(dfb_mask);
++            unary_bcast<BroadcastType::ROW>(dfb_mask, 0, rem);
++            add_binary_tile_init();
++            add_binary_tile(rem - 1, rem, rem - 1);
++        }
++        tile_regs_commit();
++        dfb_in_obj.pop_front(static_cast<uint16_t>(rem));
++        dfb_x_obj.reserve_back(static_cast<uint16_t>(rem));
++        tile_regs_wait();
++        for (std::uint32_t wt8 = 0; wt8 < rem; wt8++) {
++            pack_tile(wt8, dfb_x);
++        }
++        tile_regs_release();
++        dfb_x_obj.push_back(static_cast<uint16_t>(rem));
++    }
 +}
 +#endif
 +
  // CB consumers cannot wrap mid-fifo: pops in one cycle must land exactly on fifo_limit.
  // After a partial row (Wt not a multiple of the CB capacity), rd/wr sit at that offset.
  // Push/pop `pad` tiles to complete the cycle and return pointers to the CB base.
-@@ -265,7 +373,9 @@ void kernel_main() {
+@@ -265,7 +368,10 @@ void kernel_main() {
  #ifndef NUMERIC_STABLE
          exp_tile_init<EXP_APPROX>();
  #endif
 -#ifdef MASK_PADDED_DATA
 +#if defined(MASK_PADDED_DATA) && defined(EXACT_FP32_STABLE)
-+        calc_numeric_stable_exact<dfb_in0, dfb_max_scaler, dfb_max, dfb_x, dfb_exps, true, dfb_mask_padded>(Wt, ndst);
++        mask_padded_row_exact<dfb_in0, dfb_mask_padded, dfb_x>(Wt, in0_t);
++        calc_numeric_stable_exact<dfb_x, dfb_max_scaler, dfb_max, dfb_exps>(Wt, ndst);
 +#elif defined(MASK_PADDED_DATA)
          {
              for (std::uint32_t wt = 0; wt < Wt; wt += ndst) {
                  const std::uint32_t rem = (wt + ndst > Wt) ? (Wt - wt) : ndst;  // clamped final block
-@@ -308,7 +418,9 @@ void kernel_main() {
+@@ -308,7 +414,9 @@ void kernel_main() {
          {
  // add numeric_stable
  // fuse exp with sub tiles
 -#ifdef NUMERIC_STABLE
 +#if defined(EXACT_FP32_STABLE)
-+            calc_numeric_stable_exact<dfb_in0, dfb_max_scaler, dfb_max, 0, dfb_exps, false, 0>(Wt, ndst);
++            calc_numeric_stable_exact<dfb_in0, dfb_max_scaler, dfb_max, dfb_exps>(Wt, ndst);
 +#elif defined(NUMERIC_STABLE)
              calc_numeric_stable<dfb_in0, dfb_max_scaler, dfb_max, dfb_exps>(Wt, ndst);
  #else
@@ -167,28 +163,20 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_device_
 diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp
 --- ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp
 +++ ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp
-@@ -110,6 +110,12 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
-         attributes.numeric_stable && !has_mask && !mask_padded_data;
-     const bool small_kernel_numeric_stable_uses_cb_x_at_wt =
-         attributes.numeric_stable && (has_mask || mask_padded_data);
+@@ -298,6 +298,12 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
+     // cb_x: only needed when calc_numeric_stable consumes a separate post-mask buffer (mask or
+     // mask-padded path), or when the streaming large kernel is selected. In the no-mask
+     // numeric_stable path softmax.cpp aliases cb_x to cb_exps, so we skip the allocation.
 +    // FP32 numeric-stable softmax without an attention mask reduces and subtracts the row max in
 +    // FP32 on the SFPU: the matrix unit reads its operands through 19-bit source registers, which
 +    // would leave x - max(x) about 10 mantissa bits. The row (cb_in0, or cb_x with the padding
 +    // mask) and the max are unpacked straight to DEST for that.
-+    const bool exact_fp32_numeric_stable = attributes.numeric_stable && !has_mask &&
-+                                           in0_cb_data_format == tt::DataFormat::Float32 && fp32_dest_acc_en;
- 
-     // These tile capacity counts for CBs need to match the number of tiles expected by the kernel (softmax.cpp)
-     std::uint32_t in0_t =
-@@ -298,6 +304,7 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
-     // cb_x: only needed when calc_numeric_stable consumes a separate post-mask buffer (mask or
-     // mask-padded path), or when the streaming large kernel is selected. In the no-mask
-     // numeric_stable path softmax.cpp aliases cb_x to cb_exps, so we skip the allocation.
-+    const bool exact_fp32_stable_kernel = exact_fp32_numeric_stable && !use_large_kernel;
++    const bool exact_fp32_stable_kernel = attributes.numeric_stable && !has_mask && !use_large_kernel &&
++                                          in0_cb_data_format == tt::DataFormat::Float32 && fp32_dest_acc_en;
      const bool alloc_cb_x = small_kernel_numeric_stable_uses_cb_x_at_wt || use_large_kernel;
      if (alloc_cb_x) {
          dfbs.push_back(DataflowBufferSpec{
-@@ -327,6 +334,14 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
+@@ -327,6 +333,14 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
      if (!use_large_kernel && mask_padded_data) {
          compute_defines["MASK_PADDED_DATA"] = "1";
      }
@@ -203,36 +191,36 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program
  
      // ---- Reader kernel ----
      Group<DFBBinding> reader_bindings = {
-@@ -466,7 +481,18 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
-                 gen1.unpack_modes.insert({name, tt::tt_metal::UnpackMode::UnpackToSrc});
+@@ -461,12 +475,16 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
+     auto compute_hw = ttnn::to_compute_hardware_config(arch, attributes.compute_kernel_config);
+     if (fp32_dest_acc_en) {
+         auto& gen1 = std::get<ComputeGen1Config>(compute_hw);
+-        auto add_unpack = [&](const DFBSpecName& name, tt::DataFormat fmt) {
++        auto add_unpack = [&](const DFBSpecName& name,
++                              tt::DataFormat fmt,
++                              tt::tt_metal::UnpackMode mode = tt::tt_metal::UnpackMode::UnpackToSrc) {
+             if (fmt == tt::DataFormat::Float32) {
+-                gen1.unpack_modes.insert({name, tt::tt_metal::UnpackMode::UnpackToSrc});
++                gen1.unpack_modes.insert({name, mode});
              }
          };
 -        add_unpack(IN0, in0_cb_data_format);
-+        if (exact_fp32_stable_kernel) {
-+            gen1.unpack_modes.insert({IN0, tt::tt_metal::UnpackMode::UnpackToDest});
-+        } else {
-+            add_unpack(IN0, in0_cb_data_format);
-+        }
-+        auto add_unpack_exact = [&](const DFBSpecName& name) {
-+            if (exact_fp32_stable_kernel) {
-+                gen1.unpack_modes.insert({name, tt::tt_metal::UnpackMode::UnpackToDest});
-+            } else {
-+                add_unpack(name, im_cb_data_format);
-+            }
-+        };
++        const auto exact_mode =
++            exact_fp32_stable_kernel ? tt::tt_metal::UnpackMode::UnpackToDest : tt::tt_metal::UnpackMode::UnpackToSrc;
++        add_unpack(IN0, in0_cb_data_format, exact_mode);
          add_unpack(MAX_SCALER, max_scaler_cb_data_format);
          add_unpack(SUM_SCALER, sum_scaler_cb_data_format);
          add_unpack(MASK_PADDED, mask_cb_data_format);
-@@ -478,10 +504,10 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
+@@ -478,10 +496,10 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
              add_unpack(SCALE_MASK, im_cb_data_format);
          }
          if (attributes.numeric_stable) {
 -            add_unpack(MAX, im_cb_data_format);
-+            add_unpack_exact(MAX);
++            add_unpack(MAX, im_cb_data_format, exact_mode);
          }
          if (alloc_cb_x) {
 -            add_unpack(X, im_cb_data_format);
-+            add_unpack_exact(X);
++            add_unpack(X, im_cb_data_format, exact_mode);
          }
          if (use_large_kernel) {
              add_unpack(PREV_REDUCE, im_cb_data_format);

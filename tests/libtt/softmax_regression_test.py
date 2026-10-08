@@ -34,6 +34,8 @@ def reference(x, axis):
         ((5, 128), -1),  # up to 16 rows in a tile: the exp skips the bottom faces
         ((16, 70), -1),
         ((33, 70), -1),  # rows that do not fill their last tile
+        ((2, 289), -1),  # padded rows streamed through the input buffer in several blocks
+        ((2, 4095), -1),
         ((2, 4096), -1),  # the longest fused row
         ((2, 8192), -1),  # unfused: TTNN may stream it
         ((2, 3, 40), -1),
