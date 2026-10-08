@@ -1,18 +1,16 @@
 diff --git ttnn/cpp/ttnn/kernel_lib/index_tile_dataflow.hpp ttnn/cpp/ttnn/kernel_lib/index_tile_dataflow.hpp
 --- ttnn/cpp/ttnn/kernel_lib/index_tile_dataflow.hpp
 +++ ttnn/cpp/ttnn/kernel_lib/index_tile_dataflow.hpp
-@@ -26,13 +26,17 @@ namespace dataflow_kernel_lib {
+@@ -26,13 +26,14 @@ namespace dataflow_kernel_lib {
   * and the two lower faces repeat the two upper ones. Only 32 of the 1024 entries are distinct.
   *
   * Rather than store all 1024 entries with the RISC, seed two rows of each upper face and let the
 - * NoC replicate them. Per tile that is 32 stores of a 32-bit word holding two indices, and 15 NoC
 - * read commands, against 1024 16-bit stores. This is the same construction the DeepSeek gate
+- * writers already use
 + * NoC replicate them. Per tile that is 32 stores of a 32-bit word holding two 16-bit indices (64
-+ * stores of one 32-bit index), and 15 NoC read commands, against 1024 stores. With 32-bit
-+ * indices the stores made an FP32 top-k of 128 values on two cores take 24 us instead of 18 us
-+ * on Blackhole.
-+ * This is the same construction the DeepSeek gate
-  * writers already use
++ * stores of one 32-bit index), and 15 NoC read commands, against 1024 stores. This is the same
++ * construction the DeepSeek gate writers already use
   * (experimental/reduction/deepseek_grouped_gate, experimental/deepseek_prefill/moe_grouped_topk).
   *
   * T selects the index width, which must match the top-k LLK's dest mode: uint16_t for the
@@ -22,7 +20,7 @@ diff --git ttnn/cpp/ttnn/kernel_lib/index_tile_dataflow.hpp ttnn/cpp/ttnn/kernel
   *
   * @param dfb_id Dataflow buffer to write the generated index tile to
   * @param wt     Width tile position [0, Wt)
-@@ -49,87 +53,78 @@ FORCE_INLINE void generate_index_tile(const uint32_t dfb_id, const uint32_t wt)
+@@ -49,87 +50,67 @@ FORCE_INLINE void generate_index_tile(const uint32_t dfb_id, const uint32_t wt)
      const uint32_t tile_addr = dfb.get_write_ptr();
      const uint32_t w = wt << 5;  // wt * 32
  
@@ -50,19 +48,10 @@ diff --git ttnn/cpp/ttnn/kernel_lib/index_tile_dataflow.hpp ttnn/cpp/ttnn/kernel
 -        constexpr uint32_t seed_rows = 2;
 -        constexpr uint32_t seed_words = seed_rows * face_size / 2;
 -        constexpr uint32_t seed_bytes = seed_rows * face_line_bytes;
-+    // How many rows of each upper face the RISC seeds before the NoC replicates them. Per tile
-+    // that is tile_faces * seed_rows * words_per_line stores and
-+    // tile_faces * (face_size / seed_rows - 1) + 1 NoC read commands, so a second seed row
-+    // trades 16 more stores for 16 fewer reads: 32 stores and 15 reads for 16-bit indices,
-+    // against 16 and 31 at one row. Two is the measured optimum on `ttnn.sort [1,1,32,8192]`, the shape where
-+    // this cost is most exposed: 1 row 839 us, 2 rows 805 us, 4 rows 839 us, 8 rows 925 us.
-+    // The reads are asynchronous and overlap, so those four points are the evidence rather
-+    // than a per-instruction cost model.
-+    //
-+    // The optimum depends on what a store costs against a NoC read command, which is a property
-+    // of the machine. One to four rows sit inside a 4% band on the numbers above, so a part
-+    // with a different ratio pays at most that much until someone re-measures; eight rows is
-+    // where the trade clearly turns. Only this constant needs to change.
++    // How many rows of each upper face the RISC seeds before the NoC replicates them: each more
++    // row trades tile_faces * words_per_line stores for fewer NoC read commands. Two measured
++    // best for 16-bit indices on Blackhole and no worse than one or four for 32-bit ones; the
++    // best value depends on a store's cost against a read's.
 +    constexpr uint32_t seed_rows = 2;
 +    constexpr uint32_t seed_words = seed_rows * words_per_line;
 +    constexpr uint32_t seed_bytes = seed_rows * face_line_bytes;
@@ -147,15 +136,13 @@ diff --git ttnn/cpp/ttnn/kernel_lib/index_tile_dataflow.hpp ttnn/cpp/ttnn/kernel
 -                }
 -            }
 +        // Replicate the seed down the remaining rows of the face.
-+        uint32_t dst_addr = face_addr + seed_bytes;
 +        for (uint32_t k = seed_rows; k < face_size; k += seed_rows) {
 +            noc.async_read(
 +                local_l1,
-+                CoreLocalMem<uint32_t>(dst_addr),
++                CoreLocalMem<uint32_t>(face_addr + k * face_line_bytes),
 +                seed_bytes,
 +                {.noc_x = my_x[noc_id], .noc_y = my_y[noc_id], .addr = face_addr},
 +                {});
-+            dst_addr += seed_bytes;
          }
      }
 +    noc.async_read_barrier();
