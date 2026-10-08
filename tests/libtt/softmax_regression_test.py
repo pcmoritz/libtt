@@ -34,6 +34,7 @@ def reference(x, axis):
         ((5, 128), -1),  # up to 16 rows in a tile: the exp skips the bottom faces
         ((16, 70), -1),
         ((33, 70), -1),  # rows that do not fill their last tile
+        ((3, 8), -1),  # a padded row in one tile, such as a router's top 8 renormalized
         ((2, 289), -1),  # padded rows streamed through the input buffer in several blocks
         ((2, 4095), -1),
         ((2, 4096), -1),  # the longest fused row
