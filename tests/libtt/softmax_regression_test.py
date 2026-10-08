@@ -9,7 +9,9 @@ inputs. TTNN subtracts the row maximum of an FP32 input in FP32 and masks the
 padding of a row that does not fill its last tile the same way. Logits around a
 thousand overflow a softmax that does not subtract the maximum, and lose their
 low bits where the subtraction runs at the matrix unit's 19 bits. BF16 softmax
-(JAX sums its exponentials in FP32) and softmax over other dims keep JAX's ops.
+(JAX sums its exponentials in FP32), softmax over other dims and rows longer
+than 4096, which TTNN may stream through a kernel without the FP32 subtraction,
+keep JAX's ops.
 """
 
 import jax
@@ -29,7 +31,11 @@ def reference(x, axis):
     "shape,axis",
     [
         ((1, 128), -1),  # a mixture-of-experts router's probabilities
+        ((5, 128), -1),  # up to 16 rows in a tile: the exp skips the bottom faces
+        ((16, 70), -1),
         ((33, 70), -1),  # rows that do not fill their last tile
+        ((2, 4096), -1),  # the longest fused row
+        ((2, 8192), -1),  # unfused: TTNN may stream it
         ((2, 3, 40), -1),
         ((40, 6), 0),
     ],
@@ -46,7 +52,7 @@ def test_softmax_is_one_accurate_stable_program(dtype, offset, shape, axis, tmp_
     else:
         np.testing.assert_allclose(got, want, rtol=6e-2, atol=4e-3)
 
-    if dtype != np.float32:
+    if dtype != np.float32 or shape[-1] > 4096:
         return
     irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
     assert irs, "no IR was exported"
@@ -55,3 +61,12 @@ def test_softmax_is_one_accurate_stable_program(dtype, offset, shape, axis, tmp_
     if axis == -1:
         assert "numericStable = true" in ir, "the softmax was not made numerically stable"
         assert '"ttnn.max"' not in ir and '"ttnn.subtract"' not in ir, "the max subtraction was left over"
+
+
+def test_softmax_of_a_large_constant_row():
+    """A max rounded to 19 bits can sit far below a large row: here 2**20 against
+    2**20 + 256, so x - max would be 256 and its exp overflow. The softmax of a
+    constant row is uniform."""
+    x = np.full((2, 128), 2.0**20 + 256, dtype=np.float32)
+    got = np.asarray(jax.jit(jax.nn.softmax)(jax.device_put(x, jax.devices("tt")[0])))
+    np.testing.assert_allclose(got, np.full_like(x, 1 / 128), rtol=1e-2)

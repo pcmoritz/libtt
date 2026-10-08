@@ -1,10 +1,50 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -290,6 +290,64 @@ public:
+@@ -290,6 +290,91 @@ public:
    }
  };
  
++// Reads a splat scalar value from a constant-like value, tracing back through
++// layout ops (typecast/reshape/broadcast/repeat_interleave). Handles
++// ttir.full, ttir.constant (splat) and ttir.zeros. Returns std::nullopt if the
++// value is not a recognizable scalar constant.
++static std::optional<double> getSplatConstantValue(mlir::Value value) {
++  value = utils::lookThroughLayoutOps(value);
++  mlir::Operation *op = value.getDefiningOp();
++  if (!op) {
++    return std::nullopt;
++  }
++  if (mlir::isa<ZerosOp>(op)) {
++    return 0.0;
++  }
++  if (auto fullOp = mlir::dyn_cast<FullOp>(op)) {
++    mlir::Attribute fill = fullOp.getFillValue();
++    if (auto floatAttr = mlir::dyn_cast<mlir::FloatAttr>(fill)) {
++      return floatAttr.getValue().convertToDouble();
++    }
++    if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(fill)) {
++      return static_cast<double>(intAttr.getValue().getSExtValue());
++    }
++    return std::nullopt;
++  }
++  if (auto constOp = mlir::dyn_cast<ConstantOp>(op)) {
++    auto elements = mlir::dyn_cast<mlir::ElementsAttr>(constOp.getValue());
++    if (!elements || !elements.isSplat()) {
++      return std::nullopt;
++    }
++    mlir::Type elemType = elements.getElementType();
++    if (mlir::isa<mlir::FloatType>(elemType)) {
++      return elements.getSplatValue<mlir::APFloat>().convertToDouble();
++    }
++    if (mlir::isa<mlir::IntegerType>(elemType)) {
++      return static_cast<double>(
++          elements.getSplatValue<llvm::APInt>().getSExtValue());
++    }
++  }
++  return std::nullopt;
++}
++
 +// JAX's softmax subtracts max(x, initial=-inf) along the softmax dim:
 +// maximum(-inf, max(x, keep_dim=false)), reshaped to the keep_dim shape and
 +// broadcast back. Returns that max.
@@ -27,21 +67,8 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    return value;
 +  };
 +  auto isNegativeInfinity = [](mlir::Value value) {
-+    mlir::Operation *op = utils::lookThroughLayoutOps(value).getDefiningOp();
-+    std::optional<llvm::APFloat> splat;
-+    if (auto fullOp = mlir::dyn_cast_or_null<FullOp>(op)) {
-+      if (auto fill = mlir::dyn_cast<mlir::FloatAttr>(fullOp.getFillValue())) {
-+        splat = fill.getValue();
-+      }
-+    } else if (auto constantOp = mlir::dyn_cast_or_null<ConstantOp>(op)) {
-+      auto elements =
-+          mlir::dyn_cast<mlir::DenseElementsAttr>(constantOp.getValue());
-+      if (elements && elements.isSplat() &&
-+          mlir::isa<mlir::FloatType>(elements.getElementType())) {
-+        splat = elements.getSplatValue<llvm::APFloat>();
-+      }
-+    }
-+    return splat && splat->isInfinity() && splat->isNegative();
++    std::optional<double> splat = getSplatConstantValue(value);
++    return splat && *splat == -std::numeric_limits<double>::infinity();
 +  };
 +  mlir::Value max = throughReshapes(subtracted);
 +  if (auto maximumOp = max.getDefiningOp<MaximumOp>()) {
@@ -66,7 +93,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  // This pattern detects and fuses numerically stable softmax operations:
  // softmax(x - max(x)) -> softmax(x, numericStable=true).
  //
-@@ -326,6 +384,22 @@ public:
+@@ -326,6 +411,26 @@ public:
      // Check if we have a max operation.
      auto maxOp =
          ttmlir::utils::findOpThrough<MaxOp, BroadcastOp>(subtractedValue);
@@ -81,15 +108,19 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +        dim += inputType.getRank();
 +      }
 +      // TTNN subtracts the max of an FP32 row in FP32 only for softmax over the
-+      // last dim; elsewhere JAX's own subtraction keeps the low bits.
-+      if (dim == inputType.getRank() - 1) {
++      // last dim, and only in the kernel that holds a whole row in L1: rows of
++      // more than 4096 values may take its streaming kernel. Elsewhere JAX's own
++      // subtraction keeps the low bits.
++      constexpr int64_t maxExactRowLength = 4096;
++      if (dim == inputType.getRank() - 1 && !inputType.isDynamicDim(dim) &&
++          inputType.getDimSize(dim) <= maxExactRowLength) {
 +        maxOp = findJaxSoftmaxMax(subtractedValue, inputType, dim);
 +      }
 +    }
      if (!maxOp) {
        return mlir::failure();
      }
-@@ -335,9 +409,8 @@ public:
+@@ -335,9 +440,8 @@ public:
        return mlir::failure();
      }
  
@@ -101,6 +132,53 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
        return mlir::failure();
      }
  
+@@ -3164,46 +3268,6 @@ public:
+   }
+ };
+ 
+-// Reads a splat scalar value from a constant-like value, tracing back through
+-// layout ops (typecast/reshape/broadcast/repeat_interleave). Handles
+-// ttir.full, ttir.constant (splat) and ttir.zeros. Returns std::nullopt if the
+-// value is not a recognizable scalar constant.
+-static std::optional<double> getSplatConstantValue(mlir::Value value) {
+-  value = utils::lookThroughLayoutOps(value);
+-  mlir::Operation *op = value.getDefiningOp();
+-  if (!op) {
+-    return std::nullopt;
+-  }
+-  if (mlir::isa<ZerosOp>(op)) {
+-    return 0.0;
+-  }
+-  if (auto fullOp = mlir::dyn_cast<FullOp>(op)) {
+-    mlir::Attribute fill = fullOp.getFillValue();
+-    if (auto floatAttr = mlir::dyn_cast<mlir::FloatAttr>(fill)) {
+-      return floatAttr.getValue().convertToDouble();
+-    }
+-    if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(fill)) {
+-      return static_cast<double>(intAttr.getValue().getSExtValue());
+-    }
+-    return std::nullopt;
+-  }
+-  if (auto constOp = mlir::dyn_cast<ConstantOp>(op)) {
+-    auto elements = mlir::dyn_cast<mlir::ElementsAttr>(constOp.getValue());
+-    if (!elements || !elements.isSplat()) {
+-      return std::nullopt;
+-    }
+-    mlir::Type elemType = elements.getElementType();
+-    if (mlir::isa<mlir::FloatType>(elemType)) {
+-      return elements.getSplatValue<mlir::APFloat>().convertToDouble();
+-    }
+-    if (mlir::isa<mlir::IntegerType>(elemType)) {
+-      return static_cast<double>(
+-          elements.getSplatValue<llvm::APInt>().getSExtValue());
+-    }
+-  }
+-  return std::nullopt;
+-}
+-
+ // Returns true if `value` is a splat scalar constant approximately equal to
+ // `expected` within the given relative tolerance.
+ static bool isApproxScalarConstant(mlir::Value value, double expected,
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
