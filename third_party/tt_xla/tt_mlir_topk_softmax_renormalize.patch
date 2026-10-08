@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -468,6 +468,85 @@ static bool isFullOpWithValue(Value value, float expectedValue,
+@@ -468,6 +468,79 @@ static bool isFullOpWithValue(Value value, float expectedValue,
    return false;
  }
  
@@ -57,24 +57,18 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +      return mlir::failure();
 +    }
 +    // Nothing else may read the renormalized-away values.
-+    for (mlir::Operation *user : values.getUsers()) {
-+      if (user != sumOp.getOperation() && user != divOp.getOperation()) {
-+        return mlir::failure();
-+      }
++    if (ttmlir::utils::countUsers(values) != 2) {
++      return mlir::failure();
 +    }
 +
 +    // The new top-k replaces the old one's indices, which may be read before
-+    // the division, so it goes where the old one is.
-+    TopKOp newTopK;
-+    {
-+      mlir::OpBuilder::InsertionGuard guard(rewriter);
-+      rewriter.setInsertionPoint(topkOp);
-+      newTopK = rewriter.create<TopKOp>(
-+          topkOp.getLoc(), topkOp.getValues().getType(),
-+          topkOp.getIndices().getType(), softmaxOp.getInput(),
-+          topkOp.getKAttr(), rewriter.getI32IntegerAttr(dim),
-+          topkOp.getLargestAttr(), topkOp.getSortedAttr());
-+    }
++    // the division, so both new ops go where the old top-k is.
++    rewriter.setInsertionPoint(topkOp);
++    auto newTopK = rewriter.create<TopKOp>(
++        topkOp.getLoc(), topkOp.getValues().getType(),
++        topkOp.getIndices().getType(), softmaxOp.getInput(), topkOp.getKAttr(),
++        rewriter.getI32IntegerAttr(dim), topkOp.getLargestAttr(),
++        topkOp.getSortedAttr());
 +    auto newSoftmax = rewriter.create<SoftmaxOp>(
 +        divOp.getLoc(), divOp.getType(), newTopK.getValues(), dim,
 +        /*numericStable=*/true);
@@ -87,7 +81,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  // This pattern detects and fuses a sequence of operations that implement
  // relu. If a zeros op is consumed by a maximum op, we can fuse the zeros and
  // maximum op into a relu op.
-@@ -3991,6 +4070,7 @@ public:
+@@ -3991,6 +4064,7 @@ public:
  
        patterns.add<SoftmaxFusionPattern>(&getContext());
        patterns.add<NumericStableSoftmaxFusionPattern>(&getContext());

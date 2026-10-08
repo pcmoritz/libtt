@@ -70,27 +70,33 @@ def test_router(tokens, experts, k, renormalize, tmp_path):
         check_rewritten(exported_ir(tmp_path), experts)
 
 
-def test_router_after_gate(tmp_path):
+def test_router_in_a_model(tmp_path):
     # As in a model: the logits come from an FP32 matmul of the BF16 hidden
-    # state with the gate. One-hot hidden states pick the gate's rows.
-    tokens, experts, k = 4, 128, 8
+    # state with the gate (one-hot hidden states pick the gate's rows), and the
+    # experts are gathered before the weights are renormalized, so the
+    # rewritten top-k must come before the gather.
+    tokens, experts, k, width = 4, 128, 8, 16
     hidden = np.eye(tokens, HIDDEN).astype(jnp.bfloat16)
     gate = np.zeros((HIDDEN, experts), np.float32)
     gate[:tokens] = distinct_logits(tokens, experts, 0)
+    table = np.random.default_rng(1).standard_normal((experts, width)).astype(np.float32)
 
-    def run(hidden, gate):
+    def run(hidden, gate, table):
         logits = jnp.dot(hidden.astype(jnp.float32), gate, precision=lax.Precision.HIGHEST)
-        return route(logits, k, renormalize=True)
+        weights, ids = lax.top_k(jax.nn.softmax(logits, axis=-1), k)
+        selected = jnp.take(table, ids, axis=0)
+        return weights / weights.sum(axis=-1, keepdims=True), ids, selected
 
     device = jax.devices("tt")[0]
-    weights, ids = (
+    weights, ids, selected = (
         np.asarray(a)
         for a in jax.jit(run, compiler_options={"export_path": str(tmp_path)})(
-            jax.device_put(hidden, device), jax.device_put(gate, device)
+            *(jax.device_put(a, device) for a in (hidden, gate, table))
         )
     )
 
     check_route(gate[:tokens], k, True, weights, ids)
+    np.testing.assert_array_equal(selected, table[ids])
     check_rewritten(exported_ir(tmp_path), experts)
 
 
@@ -114,27 +120,3 @@ def test_denominator_broadcast_across_rows(tmp_path):
     softmaxes = [line for line in exported_ir(tmp_path).splitlines() if '"ttnn.softmax"' in line]
     assert any(f"x{experts}xf32" in line for line in softmaxes), "the division was rewritten to a softmax"
 
-
-def test_ids_read_before_renormalization(tmp_path):
-    # The experts are gathered before the weights are renormalized, so the
-    # rewritten top-k must come before the gather.
-    rows, experts, k, width = 4, 64, 8, 16
-
-    def run(logits, table):
-        weights, ids = lax.top_k(jax.nn.softmax(logits, axis=-1), k)
-        selected = jnp.take(table, ids, axis=0)
-        return weights / jnp.sum(weights, axis=-1, keepdims=True), ids, selected
-
-    logits = distinct_logits(rows, experts, 1)
-    table = np.random.default_rng(2).standard_normal((experts, width)).astype(np.float32)
-    device = jax.devices("tt")[0]
-    weights, ids, selected = (
-        np.asarray(a)
-        for a in jax.jit(run, compiler_options={"export_path": str(tmp_path)})(
-            jax.device_put(logits, device), jax.device_put(table, device)
-        )
-    )
-
-    check_route(logits, k, True, weights, ids)
-    np.testing.assert_array_equal(selected, table[ids])
-    check_rewritten(exported_ir(tmp_path), experts)
