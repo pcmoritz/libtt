@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
  #include "api/compute/softmax.h"
  #include "api/compute/reduce.h"
  #include "api/dataflow/dataflow_buffer.h"
-@@ -64,6 +65,108 @@ void calc_numeric_stable(std::uint32_t Wt, std::uint32_t ndst) {
+@@ -64,6 +65,111 @@ void calc_numeric_stable(std::uint32_t Wt, std::uint32_t ndst) {
      dfb_out_obj.wait_front(static_cast<uint16_t>(Wt));
  }
  
@@ -97,6 +97,9 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
 +            copy_tile(dfb_in, wt8, wt8);
 +        }
 +        if (wt + rem == Wt) {  // the row's last tile
++            // The broadcast reads the BF16 mask through source register B, which still holds the
++            // format of whatever it read last (the FP32 max scaler on the first row).
++            reconfig_data_format_srcb(dfb_mask);
 +            unary_bcast_init<BroadcastType::ROW>(dfb_mask);
 +            unary_bcast<BroadcastType::ROW>(dfb_mask, 0, rem);
 +            add_binary_tile_init();
@@ -118,7 +121,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
  // CB consumers cannot wrap mid-fifo: pops in one cycle must land exactly on fifo_limit.
  // After a partial row (Wt not a multiple of the CB capacity), rd/wr sit at that offset.
  // Push/pop `pad` tiles to complete the cycle and return pointers to the CB base.
-@@ -265,7 +368,10 @@ void kernel_main() {
+@@ -265,7 +371,10 @@ void kernel_main() {
  #ifndef NUMERIC_STABLE
          exp_tile_init<EXP_APPROX>();
  #endif
@@ -130,7 +133,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
          {
              for (std::uint32_t wt = 0; wt < Wt; wt += ndst) {
                  const std::uint32_t rem = (wt + ndst > Wt) ? (Wt - wt) : ndst;  // clamped final block
-@@ -308,7 +414,9 @@ void kernel_main() {
+@@ -308,7 +417,9 @@ void kernel_main() {
          {
  // add numeric_stable
  // fuse exp with sub tiles
