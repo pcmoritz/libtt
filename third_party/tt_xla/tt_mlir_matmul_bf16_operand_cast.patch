@@ -1,9 +1,9 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -399,6 +399,52 @@ static bool isFullOpWithValue(Value value, float expectedValue,
-   return false;
- }
+@@ -541,6 +541,52 @@ public:
+   }
+ };
  
 +// An FP32 matmul with a BF16 operand cast up to FP32, such as a router's
 +// FP32 gate applied to BF16 hidden states, reads the BF16 tensor directly: the
@@ -54,10 +54,10 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  // This pattern detects and fuses a sequence of operations that implement
  // relu. If a zeros op is consumed by a maximum op, we can fuse the zeros and
  // maximum op into a relu op.
-@@ -3922,6 +3968,7 @@ public:
- 
+@@ -4065,6 +4111,7 @@ public:
        patterns.add<SoftmaxFusionPattern>(&getContext());
        patterns.add<NumericStableSoftmaxFusionPattern>(&getContext());
+       patterns.add<TopKSoftmaxRenormalizePattern>(&getContext());
 +      patterns.add<MatmulBF16OperandCastPattern>(&getContext());
  
        patterns.add<ReluFusionPattern>(&getContext());
