@@ -1,0 +1,57 @@
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_constants.hpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_constants.hpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_constants.hpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_constants.hpp
+@@ -15,10 +15,12 @@ constexpr uint32_t multi_core_min_width = 8192;
+ // Ht-aware relaxation of multi_core_min_width: inputs with at most
+ // multi_core_low_ht_max_tile_rows tile rows leave most of the grid idle on the
+ // row-parallel single-core factory, so the column-split multi-core path is
+-// enabled from multi_core_low_ht_min_width up. 1024 is the smallest pow2 width
+-// that still gives every local core >= min_dim_per_core elements at a useful
+-// core count (measured ~4x on 32x2048 k=32, p150a).
+-constexpr uint32_t multi_core_low_ht_min_width = 1024;
++// enabled from multi_core_low_ht_min_width up (measured ~4x on 32x2048 k=32,
++// p150a). 128 is the smallest pow2 width that gives two local cores
++// min_dim_per_core elements each: a mixture-of-experts router's top-8 of 128 or
++// 256 experts on one tile row takes 10 us there against 27 us on one core, and
++// 13 us against 59 (p300c).
++constexpr uint32_t multi_core_low_ht_min_width = 128;
+ constexpr uint32_t multi_core_low_ht_max_tile_rows = 2;
+ 
+ // The multi-core bitonic sort network addresses elements with 16-bit indices,
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_final.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_final.cpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_final.cpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_final.cpp
+@@ -81,7 +81,6 @@ void kernel_main() {
+     // init pack, compute and unpack
+     compute_kernel_hw_startup(input_dfb_index, values_dfb_index);
+     copy_init(input_dfb_index);
+-    ckernel::topk_tile_init<fused_keys>();
+     constexpr auto tie_order = ckernel::topk_tie_order_from_global_direction(largest != 0);
+ 
+     DataflowBuffer input_dfb(input_dfb_index);
+@@ -91,6 +90,10 @@ void kernel_main() {
+ 
+     // Aggregate results from all local cores for each height row
+     for (std::uint32_t ht = 0; ht < Ht; ++ht) {
++        // Init per row, not once: the rebuild records its replay buffer once per m_iter and replays
++        // it after that, but the previous row's FP32 transpose recorded its own sequence there; with
++        // a single rebuild per row (two local cores) the next row would replay the transpose.
++        ckernel::topk_tile_init<fused_keys>();
+         input_dfb.wait_front(Wt);  // Wait for all local TopK results (values, or packed keys when fused)
+         if constexpr (!fused_keys) {
+             index_dfb.wait_front(Wt);  // Wait for all local TopK results (indices)
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_local.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_local.cpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_local.cpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/device/kernels/compute/topk_local.cpp
+@@ -144,7 +144,10 @@ void kernel_main() {
+ 
+     // Process each height row independently
+     for (std::uint32_t ht = 0; ht < Ht; ++ht) {
+-        bool ascending = !largest;  // Sort direction for bitonic sequence properties
++        // Sort direction for bitonic sequence properties. A chunk of exactly K elements gets no
++        // rebuild below, which is what turns the other chunks to this core's direction_init, so
++        // its sort uses direction_init itself: the final merge needs alternating directions.
++        bool ascending = ((Wt * 32) / K < 2) ? (direction_init != 0) : !largest;
+ 
+         // Initial bitonic sort on local width chunk
+         process_and_sort_tiles<network_stable, fused_keys, largest != 0, tie_order>(
