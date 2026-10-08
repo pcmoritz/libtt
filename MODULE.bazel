@@ -536,6 +536,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_open_shardings.patch",
         "//third_party/tt_xla:tt_mlir_moe_compute_local.patch",
         "//third_party/tt_xla:tt_mlir_jax_stable_softmax.patch",
+        "//third_party/tt_xla:tt_mlir_topk_softmax_renormalize.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

@@ -1,0 +1,91 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -468,6 +468,79 @@ static bool isFullOpWithValue(Value value, float expectedValue,
+   return false;
+ }
+ 
++// A mixture-of-experts router takes the top k of softmax(x) and renormalizes
++// them over the k picks: p_i / sum_k p_j, which is exp(x_i) / sum_k exp(x_j),
++// the softmax of the top k of x. Rewrite it that way:
++//
++//   %p = softmax(%x)                   %v, %i = topk(%x)
++//   %v, %i = topk(%p)          ->      %w = softmax(%v)
++//   %w = div(%v, sum(%v))
++//
++// which skips the softmax over all of x and the renormalization's reduction and
++// division. softmax is monotonic, so topk picks the same indices from x as from
++// softmax(x), except where rounding makes two softmax values of different x
++// equal: topk(softmax(x)) breaks that tie by index, topk(x) by x.
++class TopKSoftmaxRenormalizePattern : public mlir::OpRewritePattern<DivOp> {
++  using mlir::OpRewritePattern<DivOp>::OpRewritePattern;
++
++public:
++  mlir::LogicalResult
++  matchAndRewrite(DivOp divOp, mlir::PatternRewriter &rewriter) const final {
++    mlir::Value values = divOp.getLhs();
++    auto topkOp = values.getDefiningOp<TopKOp>();
++    if (!topkOp || topkOp.getValues() != values || !topkOp.getLargest()) {
++      return mlir::failure();
++    }
++    auto softmaxOp = topkOp.getInputTensor().getDefiningOp<SoftmaxOp>();
++    if (!softmaxOp || !softmaxOp.getResult().hasOneUse()) {
++      return mlir::failure();
++    }
++    auto inputType =
++        mlir::cast<mlir::RankedTensorType>(softmaxOp.getInput().getType());
++    const int64_t rank = inputType.getRank();
++    auto normalize = [rank](int64_t dim) { return dim < 0 ? dim + rank : dim; };
++    const int64_t dim = rank - 1;
++    if (normalize(softmaxOp.getDimension()) != dim ||
++        normalize(topkOp.getDim()) != dim) {
++      return mlir::failure();
++    }
++
++    // Each row must be divided by its own sum: a keep-dim sum of the values
++    // over the last dim, possibly broadcast back to their shape.
++    // ReductionWithReshapePattern folds JAX's sum and reshape into one.
++    if (divOp.getType() != values.getType()) {
++      return mlir::failure();
++    }
++    auto sumOp =
++        ttmlir::utils::findOpThrough<SumOp, BroadcastOp>(divOp.getRhs());
++    if (!sumOp || !sumOp.getKeepDim() || sumOp.getInput() != values ||
++        !sumOp.getDimArg() || sumOp.getDimArg()->size() != 1 ||
++        normalize(mlir::cast<mlir::IntegerAttr>((*sumOp.getDimArg())[0])
++                      .getInt()) != dim) {
++      return mlir::failure();
++    }
++    // Nothing else may read the renormalized-away values.
++    if (ttmlir::utils::countUsers(values) != 2) {
++      return mlir::failure();
++    }
++
++    // The new top-k replaces the old one's indices, which may be read before
++    // the division, so both new ops go where the old top-k is.
++    rewriter.setInsertionPoint(topkOp);
++    auto newTopK = rewriter.create<TopKOp>(
++        topkOp.getLoc(), topkOp.getValues().getType(),
++        topkOp.getIndices().getType(), softmaxOp.getInput(), topkOp.getKAttr(),
++        rewriter.getI32IntegerAttr(dim), topkOp.getLargestAttr(),
++        topkOp.getSortedAttr());
++    auto newSoftmax = rewriter.create<SoftmaxOp>(
++        divOp.getLoc(), divOp.getType(), newTopK.getValues(), dim,
++        /*numericStable=*/true);
++    rewriter.replaceAllUsesWith(topkOp.getIndices(), newTopK.getIndices());
++    rewriter.replaceOp(divOp, newSoftmax.getResult());
++    return mlir::success();
++  }
++};
++
+ // This pattern detects and fuses a sequence of operations that implement
+ // relu. If a zeros op is consumed by a maximum op, we can fuse the zeros and
+ // maximum op into a relu op.
+@@ -3991,6 +4064,7 @@ public:
+ 
+       patterns.add<SoftmaxFusionPattern>(&getContext());
+       patterns.add<NumericStableSoftmaxFusionPattern>(&getContext());
++      patterns.add<TopKSoftmaxRenormalizePattern>(&getContext());
+ 
+       patterns.add<ReluFusionPattern>(&getContext());
+ 
