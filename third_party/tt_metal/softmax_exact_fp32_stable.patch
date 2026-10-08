@@ -1,0 +1,265 @@
+diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attention/compute/softmax.cpp ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attention/compute/softmax.cpp
+--- ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attention/compute/softmax.cpp
++++ ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attention/compute/softmax.cpp
+@@ -7,6 +7,7 @@
+ #include "api/compute/eltwise_binary.h"
+ #include "api/compute/tile_move_copy.h"
+ #include "api/compute/bcast.h"
++#include "api/compute/eltwise_binary_sfpu.h"
+ #include "api/compute/softmax.h"
+ #include "api/compute/reduce.h"
+ #include "api/dataflow/dataflow_buffer.h"
+@@ -64,6 +65,120 @@ void calc_numeric_stable(std::uint32_t Wt, std::uint32_t ndst) {
+     dfb_out_obj.wait_front(static_cast<uint16_t>(Wt));
+ }
+ 
++#ifdef EXACT_FP32_STABLE
++// calc_numeric_stable for FP32 input. The matrix unit reads its operands through 19-bit source
++// registers, so subtracting there leaves x - max(x) with about 10 mantissa bits: probabilities of
++// rows around 30 come out 5% off, around 1000 25%. Here dfb_in (the whole row) is unpacked straight
++// to DEST, the subtraction and the -inf padding mask of a row that does not fill its last tile run
++// on the SFPU in FP32, and the max reduce, which runs on the matrix unit, reads a copy of x in
++// dfb_x. The max only needs to be close: softmax is the same for any constant shift of a row.
++template <
++    std::uint32_t dfb_in,
++    std::uint32_t dfb_max_scaler,
++    std::uint32_t dfb_max,
++    std::uint32_t dfb_x,
++    std::uint32_t dfb_out,
++    bool masked,
++    std::uint32_t dfb_mask>
++void calc_numeric_stable_exact(std::uint32_t Wt, std::uint32_t ndst) {
++    DataflowBuffer dfb_in_obj(dfb_in);
++    DataflowBuffer dfb_x_obj(dfb_x);
++    DataflowBuffer dfb_max_obj(dfb_max);
++    DataflowBuffer dfb_out_obj(dfb_out);
++
++    // x tiles [wt, wt + rem) into DEST[0, rem), the last tile of the row masked; `spare` is a free
++    // DEST tile for the mask.
++    auto load_x = [&](std::uint32_t wt, std::uint32_t rem, std::uint32_t spare) {
++        copy_init(dfb_in);
++        for (std::uint32_t wt8 = 0; wt8 < rem; wt8++) {
++            copy_tile(dfb_in, wt + wt8, wt8);
++        }
++        if constexpr (masked) {
++            if (wt + rem == Wt) {
++                // The broadcast reads through source register B, which otherwise holds the max's
++                // format.
++                reconfig_data_format_srcb(dfb_max, dfb_mask);
++                unary_bcast_init<BroadcastType::ROW>(dfb_mask);
++                unary_bcast<BroadcastType::ROW>(dfb_mask, 0, spare);
++                reconfig_data_format_srcb(dfb_mask, dfb_max);
++                add_binary_tile_init();
++                add_binary_tile(rem - 1, spare, rem - 1);
++            }
++        }
++    };
++    // DEST tiles per block: the x tiles, the broadcast max and the mask.
++    const std::uint32_t blk = ndst > 2 ? ndst - 2 : 1;
++
++    if constexpr (masked) {
++        DataflowBuffer(dfb_mask).wait_front(1);  // pushed once by the reader, never popped
++    }
++    dfb_in_obj.wait_front(static_cast<uint16_t>(Wt));
++    reconfig_data_format(dfb_in, dfb_max);
++    pack_reconfig_data_format(dfb_x);
++    for (std::uint32_t wt = 0; wt < Wt; wt += blk) {
++        const std::uint32_t rem = (wt + blk > Wt) ? (Wt - wt) : blk;  // clamped final block
++        tile_regs_acquire();
++        load_x(wt, rem, rem);
++        tile_regs_commit();
++        dfb_x_obj.reserve_back(static_cast<uint16_t>(rem));
++        tile_regs_wait();
++        for (std::uint32_t wt8 = 0; wt8 < rem; wt8++) {
++            pack_tile(wt8, dfb_x);
++        }
++        tile_regs_release();
++        dfb_x_obj.push_back(static_cast<uint16_t>(rem));
++    }
++
++    compute_kernel_lib::reduce<
++        PoolType::MAX,
++        ReduceDim::REDUCE_ROW,
++        dfb_x,
++        dfb_max_scaler,
++        dfb_max,
++        compute_kernel_lib::ReduceInputPolicy::WaitUpfrontNoPop,
++        compute_kernel_lib::ReduceDataFormatReconfigMode::INPUT>(compute_kernel_lib::ReduceInputBlockShape::row(Wt));
++    dfb_x_obj.pop_front(static_cast<uint16_t>(Wt));
++
++    dfb_max_obj.wait_front(1);
++    reconfig_data_format(dfb_in, dfb_max);
++    pack_reconfig_data_format(dfb_out);
++    for (std::uint32_t wt = 0; wt < Wt; wt += blk) {
++        const std::uint32_t rem = (wt + blk > Wt) ? (Wt - wt) : blk;  // clamped final block
++        tile_regs_acquire();
++        load_x(wt, rem, rem + 1);
++        unary_bcast_init<BroadcastType::COL>(dfb_max);
++        unary_bcast<BroadcastType::COL>(dfb_max, 0, rem);
++        sub_binary_tile_init();
++        for (std::uint32_t wt8 = 0; wt8 < rem; wt8++) {
++            sub_binary_tile(wt8, rem, wt8);
++        }
++        exp_tile_init<EXP_APPROX>();
++        for (std::uint32_t wt8 = 0; wt8 < rem; wt8++) {
++#if defined(SOFTMAX_ROWS) && SOFTMAX_ROWS <= 4
++            // Rows 0-3 only: the top faces, two SFPU passes each. Takes the exp of a single-row
++            // softmax over 128 values from 10.4 to 7.2 us on Blackhole.
++            exp_tile<EXP_APPROX, false, InputClamping::ClampToNegative, 2>(wt8, VectorMode::R);
++#elif defined(SOFTMAX_ROWS)
++            exp_tile<EXP_APPROX>(wt8, VectorMode::R);  // rows 0-15: the top faces
++#else
++            exp_tile<EXP_APPROX>(wt8);
++#endif
++        }
++        tile_regs_commit();
++        dfb_out_obj.reserve_back(static_cast<uint16_t>(rem));
++        tile_regs_wait();
++        for (std::uint32_t wt8 = 0; wt8 < rem; wt8++) {
++            pack_tile(wt8, dfb_out);
++        }
++        tile_regs_release();
++        dfb_out_obj.push_back(static_cast<uint16_t>(rem));
++    }
++    dfb_in_obj.pop_front(static_cast<uint16_t>(Wt));
++    dfb_max_obj.pop_front(1);
++    dfb_out_obj.wait_front(static_cast<uint16_t>(Wt));
++}
++#endif
++
+ // CB consumers cannot wrap mid-fifo: pops in one cycle must land exactly on fifo_limit.
+ // After a partial row (Wt not a multiple of the CB capacity), rd/wr sit at that offset.
+ // Push/pop `pad` tiles to complete the cycle and return pointers to the CB base.
+@@ -145,9 +260,10 @@ void kernel_main() {
+     compute_kernel_hw_startup(dfb_in0, dfb_max_scaler, dfb_exps);
+ #ifdef NUMERIC_STABLE
+     constexpr auto dfb_max = dfb::max;
+-#if defined(FUSED_SCALE_MASK) || defined(MASK_PADDED_DATA)
++#if defined(FUSED_SCALE_MASK) || defined(MASK_PADDED_DATA) || defined(EXACT_FP32_STABLE)
+     // dfb_x is a distinct intermediate (c_10) only on the numeric-stable paths that post-process a masked
+-    // buffer; otherwise the reads go straight from dfb_in0 (see the calc_numeric_stable<dfb_in0,...> call).
++    // buffer, or hold the FP32 copy the exact path's max reduce reads; otherwise the reads go straight
++    // from dfb_in0 (see the calc_numeric_stable<dfb_in0,...> call).
+     constexpr auto dfb_x = dfb::x;
+     DataflowBuffer dfb_x_obj(dfb_x);
+ #endif
+@@ -265,7 +381,9 @@ void kernel_main() {
+ #ifndef NUMERIC_STABLE
+         exp_tile_init<EXP_APPROX>();
+ #endif
+-#ifdef MASK_PADDED_DATA
++#if defined(MASK_PADDED_DATA) && defined(EXACT_FP32_STABLE)
++        calc_numeric_stable_exact<dfb_in0, dfb_max_scaler, dfb_max, dfb_x, dfb_exps, true, dfb_mask_padded>(Wt, ndst);
++#elif defined(MASK_PADDED_DATA)
+         {
+             for (std::uint32_t wt = 0; wt < Wt; wt += ndst) {
+                 const std::uint32_t rem = (wt + ndst > Wt) ? (Wt - wt) : ndst;  // clamped final block
+@@ -308,7 +426,9 @@ void kernel_main() {
+         {
+ // add numeric_stable
+ // fuse exp with sub tiles
+-#ifdef NUMERIC_STABLE
++#if defined(EXACT_FP32_STABLE)
++            calc_numeric_stable_exact<dfb_in0, dfb_max_scaler, dfb_max, dfb_x, dfb_exps, false, 0>(Wt, ndst);
++#elif defined(NUMERIC_STABLE)
+             calc_numeric_stable<dfb_in0, dfb_max_scaler, dfb_max, dfb_exps>(Wt, ndst);
+ #else
+             for (std::uint32_t wt = 0; wt < Wt; wt += ndst) {
+@@ -389,7 +509,7 @@ void kernel_main() {
+         // Without NUMERIC_STABLE, dfb_x aliases dfb_exps; cycling it again would drift it per row.
+         cycle_dfb_pad(dfb_x, exps_pad);
+ #endif
+-#elif defined(NUMERIC_STABLE) && defined(MASK_PADDED_DATA)
++#elif (defined(NUMERIC_STABLE) && defined(MASK_PADDED_DATA)) || defined(EXACT_FP32_STABLE)
+         // dfb_x is a distinct buffer only here; without NUMERIC_STABLE it aliases dfb_exps (already cycled).
+         cycle_dfb_pad(dfb_x, exps_pad);
+ #endif
+diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_device_operation.cpp ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_device_operation.cpp
+@@ -378,12 +378,14 @@ SoftmaxDeviceOperation::create_op_performance_model(
+ 
+ // hw bug (#38306): on Wormhole B0, HiFi4 with fp32 accumulation can produce less accurate
+ // results than HiFi3 for some inputs. Use HiFi3 as the safe default when fp32 acc is enabled.
++// FP32 inputs default to the exact exp: the approximate one leaves FP32 probabilities about 3% off,
++// against 0.3% (Blackhole, softmax over 128 values).
+ static DeviceComputeKernelConfig softmax_init_compute_kernel_config(
+     tt::ARCH arch, const std::optional<const DeviceComputeKernelConfig>& compute_kernel_config, bool is_fp32) {
+     const auto is_wormhole = arch == tt::ARCH::WORMHOLE_B0;
+     const auto default_fidelity = (is_wormhole && is_fp32) ? tt::tt_metal::MathFidelity::HiFi3 : tt::tt_metal::MathFidelity::HiFi4;
+     verify_numerical_configuration(arch, compute_kernel_config);
+-    return init_device_compute_kernel_config(arch, compute_kernel_config, default_fidelity, true, is_fp32, false);
++    return init_device_compute_kernel_config(arch, compute_kernel_config, default_fidelity, !is_fp32, is_fp32, false);
+ }
+ 
+ Tensor softmax(
+diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp
+--- ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp
++++ ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp
+@@ -110,10 +110,17 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
+         attributes.numeric_stable && !has_mask && !mask_padded_data;
+     const bool small_kernel_numeric_stable_uses_cb_x_at_wt =
+         attributes.numeric_stable && (has_mask || mask_padded_data);
++    // FP32 numeric-stable softmax without masks subtracts the row max in FP32: the matrix unit
++    // reads its operands through 19-bit source registers, which would leave x - max(x) about 10
++    // mantissa bits. cb_in0 is unpacked straight to DEST for that, and the max reduce, which runs
++    // on the matrix unit, reads a copy of x in cb_x.
++    const bool exact_fp32_numeric_stable = attributes.numeric_stable && !has_mask &&
++                                           in0_cb_data_format == tt::DataFormat::Float32 && fp32_dest_acc_en;
+ 
+     // These tile capacity counts for CBs need to match the number of tiles expected by the kernel (softmax.cpp)
+-    std::uint32_t in0_t =
+-        small_kernel_numeric_stable_uses_cb_in0_at_wt ? tt::div_up(Wt, block_size) * block_size : block_size * 2;
++    std::uint32_t in0_t = small_kernel_numeric_stable_uses_cb_in0_at_wt || exact_fp32_numeric_stable
++                              ? tt::div_up(Wt, block_size) * block_size
++                              : block_size * 2;
+     std::uint32_t out0_t = block_size * 2;
+     std::uint32_t im1_t = 1;  // 1/sum(exp(x))
+     std::uint32_t in2_t = 1;  // scaler for reduce coming from reader
+@@ -138,7 +145,7 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
+     constexpr std::uint32_t single_tile_cb_count = 5;  // approximate
+     std::uint32_t cb_size_sum_bytes = (in0_t * in0_tile_size) + (im0_t * im_tile_size) + (out0_t * out0_tile_size) +
+                                       (single_tile_cb_count * im_tile_size);
+-    if (small_kernel_numeric_stable_uses_cb_x_at_wt) {
++    if (small_kernel_numeric_stable_uses_cb_x_at_wt || exact_fp32_numeric_stable) {
+         // cb_x (c_10) is only allocated for the small kernel when calc_numeric_stable consumes it.
+         // In the no-mask numeric_stable path the kernel aliases cb_x to cb_exps, so no extra CB is needed.
+         cb_size_sum_bytes += im4_t * im_tile_size;
+@@ -298,7 +305,8 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
+     // cb_x: only needed when calc_numeric_stable consumes a separate post-mask buffer (mask or
+     // mask-padded path), or when the streaming large kernel is selected. In the no-mask
+     // numeric_stable path softmax.cpp aliases cb_x to cb_exps, so we skip the allocation.
+-    const bool alloc_cb_x = small_kernel_numeric_stable_uses_cb_x_at_wt || use_large_kernel;
++    const bool exact_fp32_stable_kernel = exact_fp32_numeric_stable && !use_large_kernel;
++    const bool alloc_cb_x = small_kernel_numeric_stable_uses_cb_x_at_wt || use_large_kernel || exact_fp32_stable_kernel;
+     if (alloc_cb_x) {
+         dfbs.push_back(DataflowBufferSpec{
+             .unique_id = X,
+@@ -327,6 +335,14 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
+     if (!use_large_kernel && mask_padded_data) {
+         compute_defines["MASK_PADDED_DATA"] = "1";
+     }
++    if (exact_fp32_stable_kernel) {
++        compute_defines["EXACT_FP32_STABLE"] = "1";
++        // A decode-sized softmax holds a few rows in each tile; the exact path's SFPU exp then runs
++        // on the rows that hold data only.
++        if (shape.rank() >= 2 && shape[-2] == tile_height && shape_unpadded[-2] <= tile_height / 2) {
++            compute_defines["SOFTMAX_ROWS"] = std::to_string(shape_unpadded[-2]);
++        }
++    }
+ 
+     // ---- Reader kernel ----
+     Group<DFBBinding> reader_bindings = {
+@@ -466,7 +482,11 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
+                 gen1.unpack_modes.insert({name, tt::tt_metal::UnpackMode::UnpackToSrc});
+             }
+         };
+-        add_unpack(IN0, in0_cb_data_format);
++        if (exact_fp32_stable_kernel) {
++            gen1.unpack_modes.insert({IN0, tt::tt_metal::UnpackMode::UnpackToDest});
++        } else {
++            add_unpack(IN0, in0_cb_data_format);
++        }
+         add_unpack(MAX_SCALER, max_scaler_cb_data_format);
+         add_unpack(SUM_SCALER, sum_scaler_cb_data_format);
+         add_unpack(MASK_PADDED, mask_cb_data_format);

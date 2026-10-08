@@ -1,0 +1,126 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -290,6 +290,64 @@ public:
+   }
+ };
+ 
++// JAX's softmax subtracts max(x, initial=-inf) along the softmax dim:
++// maximum(-inf, max(x, keep_dim=false)), reshaped to the keep_dim shape and
++// broadcast back. Returns that max.
++static MaxOp findJaxSoftmaxMax(mlir::Value subtracted,
++                               mlir::RankedTensorType inputType,
++                               int64_t dim) {
++  if (auto broadcastOp = subtracted.getDefiningOp<BroadcastOp>()) {
++    subtracted = broadcastOp.getInput();
++  }
++  llvm::SmallVector<int64_t> keepDimShape(inputType.getShape());
++  keepDimShape[dim] = 1;
++  if (mlir::cast<mlir::RankedTensorType>(subtracted.getType()).getShape() !=
++      llvm::ArrayRef<int64_t>(keepDimShape)) {
++    return nullptr;
++  }
++  auto throughReshapes = [](mlir::Value value) {
++    while (auto reshapeOp = value.getDefiningOp<ReshapeOp>()) {
++      value = reshapeOp.getInput();
++    }
++    return value;
++  };
++  auto isNegativeInfinity = [](mlir::Value value) {
++    mlir::Operation *op = utils::lookThroughLayoutOps(value).getDefiningOp();
++    std::optional<llvm::APFloat> splat;
++    if (auto fullOp = mlir::dyn_cast_or_null<FullOp>(op)) {
++      if (auto fill = mlir::dyn_cast<mlir::FloatAttr>(fullOp.getFillValue())) {
++        splat = fill.getValue();
++      }
++    } else if (auto constantOp = mlir::dyn_cast_or_null<ConstantOp>(op)) {
++      auto elements =
++          mlir::dyn_cast<mlir::DenseElementsAttr>(constantOp.getValue());
++      if (elements && elements.isSplat() &&
++          mlir::isa<mlir::FloatType>(elements.getElementType())) {
++        splat = elements.getSplatValue<llvm::APFloat>();
++      }
++    }
++    return splat && splat->isInfinity() && splat->isNegative();
++  };
++  mlir::Value max = throughReshapes(subtracted);
++  if (auto maximumOp = max.getDefiningOp<MaximumOp>()) {
++    if (isNegativeInfinity(maximumOp.getLhs())) {
++      max = maximumOp.getRhs();
++    } else if (isNegativeInfinity(maximumOp.getRhs())) {
++      max = maximumOp.getLhs();
++    } else {
++      return nullptr;
++    }
++    max = throughReshapes(max);
++  }
++  // Without keep_dim, the max has the input's shape less the softmax dim, and
++  // reshapes keep row-major order, so the ones above only reinsert that dim.
++  auto maxOp = max.getDefiningOp<MaxOp>();
++  if (!maxOp || maxOp.getKeepDim()) {
++    return nullptr;
++  }
++  return maxOp;
++}
++
+ // This pattern detects and fuses numerically stable softmax operations:
+ // softmax(x - max(x)) -> softmax(x, numericStable=true).
+ //
+@@ -326,6 +384,22 @@ public:
+     // Check if we have a max operation.
+     auto maxOp =
+         ttmlir::utils::findOpThrough<MaxOp, BroadcastOp>(subtractedValue);
++    if (maxOp && !maxOp.getKeepDim()) {
++      maxOp = nullptr;
++    }
++    if (!maxOp) {
++      auto inputType =
++          mlir::cast<mlir::RankedTensorType>(originalInput.getType());
++      int64_t dim = softmaxOp.getDimension();
++      if (dim < 0) {
++        dim += inputType.getRank();
++      }
++      // TTNN subtracts the max of an FP32 row in FP32 only for softmax over the
++      // last dim; elsewhere JAX's own subtraction keeps the low bits.
++      if (dim == inputType.getRank() - 1) {
++        maxOp = findJaxSoftmaxMax(subtractedValue, inputType, dim);
++      }
++    }
+     if (!maxOp) {
+       return mlir::failure();
+     }
+@@ -335,9 +409,8 @@ public:
+       return mlir::failure();
+     }
+ 
+-    // Verify that max reduces along the same dimension as softmax
+-    // and has keep_dim=true for proper broadcasting.
+-    if (!maxOp.getDimArg() || !maxOp.getKeepDim()) {
++    // Verify that max reduces along the same dimension as softmax.
++    if (!maxOp.getDimArg()) {
+       return mlir::failure();
+     }
+ 
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -524,9 +524,18 @@ public:
+   LogicalResult
+   matchAndRewrite(ttir::SoftmaxOp op, OpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
++    // TTNN's softmax uses the approximate exp unless asked otherwise, which
++    // leaves FP32 probabilities about 3% off; FP32 inputs ask for the exact one.
++    ttnn::DeviceComputeKernelConfigAttr computeConfig;
++    if (op.getInput().getType().getElementType().isF32()) {
++      computeConfig =
++          ttnn::DeviceComputeKernelConfigAttr::get(rewriter.getContext())
++              .withMathApproxMode(false);
++    }
+     rewriter.replaceOpWithNewOp<ttnn::SoftmaxOp>(
+         op, this->getTypeConverter()->convertType(op.getType()),
+-        adaptor.getInput(), adaptor.getDimension(), adaptor.getNumericStable());
++        adaptor.getInput(), adaptor.getDimension(), adaptor.getNumericStable(),
++        computeConfig);
+     return success();
+   }
+ };
