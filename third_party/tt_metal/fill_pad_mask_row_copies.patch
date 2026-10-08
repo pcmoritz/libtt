@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/kernels/dataflow/fill_pad_dataflow_common.hpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/kernels/dataflow/fill_pad_dataflow_common.hpp
 --- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/kernels/dataflow/fill_pad_dataflow_common.hpp
 +++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/kernels/dataflow/fill_pad_dataflow_common.hpp
-@@ -4,6 +4,12 @@
+@@ -4,30 +4,95 @@
  
  #pragma once
  
@@ -14,10 +14,12 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/kernels/datafl
  /**
   * Write a mask tile into `p` using face layout.
   *
-@@ -11,22 +17,95 @@
+  * Positions where (gcol >= W_thresh OR grow >= H_thresh) receive `one_val`;
   * all other positions receive 0. Pass TILE for a threshold to disable that
-  * dimension's condition. TILE is the edge length of the tile in elements;
-  * a 2x2 face layout is assumed (FACE = TILE / 2).
+- * dimension's condition. TILE is the edge length of the tile in elements;
+- * a 2x2 face layout is assumed (FACE = TILE / 2).
++ * dimension's condition; one of the two must be TILE. TILE is the edge length
++ * of the tile in elements; a 2x2 face layout is assumed (FACE = TILE / 2).
 + *
 + * The writers build a right mask (H_thresh = TILE) or a bottom mask
 + * (W_thresh = TILE). Either way two faces repeat the other two, and each face is
@@ -39,83 +41,71 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/kernels/datafl
 -                for (uint32_t c = 0; c < FACE; c++) {
 -                    const uint32_t gcol = fc * FACE + c;
 -                    p[face_base + r * FACE + c] = (gcol >= W_thresh || grow >= H_thresh) ? one_val : zero_val;
+-                }
 +    const T zero_val = static_cast<T>(0);
 +    constexpr bool right_mask = H_thresh >= TILE;
 +    constexpr bool bottom_mask = W_thresh >= TILE;
-+    if constexpr (!(right_mask || bottom_mask)) {
-+        for (uint32_t fr = 0; fr < 2; fr++) {
-+            for (uint32_t fc = 0; fc < 2; fc++) {
-+                const uint32_t face_base = (fr * 2u + fc) * FACE * FACE;
-+                for (uint32_t r = 0; r < FACE; r++) {
-+                    const uint32_t grow = fr * FACE + r;
-+                    for (uint32_t c = 0; c < FACE; c++) {
-+                        const uint32_t gcol = fc * FACE + c;
-+                        p[face_base + r * FACE + c] = (gcol >= W_thresh || grow >= H_thresh) ? one_val : zero_val;
-+                    }
-+                }
++    static_assert(right_mask || bottom_mask, "fill_pad builds a right or a bottom mask");
++    constexpr uint32_t row_bytes = FACE * sizeof(T);
++    constexpr uint32_t face_bytes = FACE * row_bytes;
++    const uint32_t tile_addr = reinterpret_cast<uint32_t>(p);
++    // The two faces built here: the upper ones for a right mask (the lower ones repeat
++    // them), the left ones for a bottom mask (the right ones repeat them).
++    auto face_of = [](uint32_t f) { return right_mask ? f : 2u * f; };
++    // Rows [0, first_one_row) of a face hold the column pattern, the rest are all one.
++    auto first_one_row = [](uint32_t f) {
++        const uint32_t row0 = (right_mask ? 0u : f) * FACE;
++        return H_thresh <= row0 ? 0u : (H_thresh - row0 < FACE ? H_thresh - row0 : FACE);
++    };
++    uint32_t last_word = tile_addr;
++    for (uint32_t f = 0; f < 2u; ++f) {
++        const uint32_t fc = right_mask ? f : 0u;
++        T* face = p + face_of(f) * FACE * FACE;
++        const uint32_t split = first_one_row(f);
++        if (split > 0) {
++            for (uint32_t c = 0; c < FACE; ++c) {
++                face[c] = fc * FACE + c >= W_thresh ? one_val : zero_val;
 +            }
 +        }
-+    } else {
-+        constexpr uint32_t row_bytes = FACE * sizeof(T);
-+        constexpr uint32_t face_bytes = FACE * row_bytes;
-+        const uint32_t tile_addr = reinterpret_cast<uint32_t>(p);
-+        // The two faces built here: the upper ones for a right mask (the lower ones repeat
-+        // them), the left ones for a bottom mask (the right ones repeat them).
-+        auto face_of = [](uint32_t f) { return right_mask ? f : 2u * f; };
-+        // Rows [0, first_one_row) of a face hold the column pattern, the rest are all one.
-+        auto first_one_row = [](uint32_t f) {
-+            const uint32_t row0 = (right_mask ? 0u : f) * FACE;
-+            return H_thresh <= row0 ? 0u : (H_thresh - row0 < FACE ? H_thresh - row0 : FACE);
-+        };
-+        uint32_t last_word = tile_addr;
-+        for (uint32_t f = 0; f < 2u; ++f) {
-+            const uint32_t fc = right_mask ? f : 0u;
-+            T* face = p + face_of(f) * FACE * FACE;
-+            const uint32_t split = first_one_row(f);
-+            if (split > 0) {
-+                for (uint32_t c = 0; c < FACE; ++c) {
-+                    face[c] = fc * FACE + c >= W_thresh ? one_val : zero_val;
-                 }
++        if (split < FACE) {
++            for (uint32_t c = 0; c < FACE; ++c) {
++                face[split * FACE + c] = one_val;
              }
-+            if (split < FACE) {
-+                for (uint32_t c = 0; c < FACE; ++c) {
-+                    face[split * FACE + c] = one_val;
-+                }
-+            }
-+            last_word = reinterpret_cast<uint32_t>(face + (split < FACE ? split : 0u) * FACE + FACE) - 4u;
-+        }
-+        // A baby-RISCV store can retire before its write lands in L1, and the RISC and the NoC
-+        // reach L1 in no fixed order: read the last written word back before the NoC copies.
-+        (void)ckernel::load_blocking(reinterpret_cast<volatile uint32_t*>(last_word));
-+        Noc noc;
-+        const uint8_t noc_id = noc.get_noc_id();
-+        UnicastEndpoint local_l1;
-+        auto copy = [&](uint32_t dst, uint32_t src, uint32_t bytes) {
-+            noc.async_read(
-+                local_l1,
-+                CoreLocalMem<uint32_t>(dst),
-+                bytes,
-+                {.noc_x = my_x[noc_id], .noc_y = my_y[noc_id], .addr = src},
-+                {});
-+        };
-+        for (uint32_t f = 0; f < 2u; ++f) {
-+            const uint32_t face_addr = tile_addr + face_of(f) * face_bytes;
-+            const uint32_t split = first_one_row(f);
-+            for (uint32_t r = 1; r < split; ++r) {
-+                copy(face_addr + r * row_bytes, face_addr, row_bytes);
-+            }
-+            for (uint32_t r = split + 1; r < FACE; ++r) {
-+                copy(face_addr + r * row_bytes, face_addr + split * row_bytes, row_bytes);
-+            }
-+        }
-+        noc.async_read_barrier();
-+        if constexpr (right_mask) {
-+            copy(tile_addr + 2u * face_bytes, tile_addr, 2u * face_bytes);
-+        } else {
-+            copy(tile_addr + face_bytes, tile_addr, face_bytes);
-+            copy(tile_addr + 3u * face_bytes, tile_addr + 2u * face_bytes, face_bytes);
          }
-+        noc.async_read_barrier();
++        last_word = reinterpret_cast<uint32_t>(face + (split < FACE ? split : 0u) * FACE + FACE) - 4u;
++    }
++    // A baby-RISCV store can retire before its write lands in L1, and the RISC and the NoC
++    // reach L1 in no fixed order: read the last written word back before the NoC copies.
++    (void)ckernel::load_blocking(reinterpret_cast<volatile uint32_t*>(last_word));
++    Noc noc;
++    const uint8_t noc_id = noc.get_noc_id();
++    UnicastEndpoint local_l1;
++    auto copy = [&](uint32_t dst, uint32_t src, uint32_t bytes) {
++        noc.async_read(
++            local_l1,
++            CoreLocalMem<uint32_t>(dst),
++            bytes,
++            {.noc_x = my_x[noc_id], .noc_y = my_y[noc_id], .addr = src},
++            {});
++    };
++    for (uint32_t f = 0; f < 2u; ++f) {
++        const uint32_t face_addr = tile_addr + face_of(f) * face_bytes;
++        const uint32_t split = first_one_row(f);
++        for (uint32_t r = 1; r < split; ++r) {
++            copy(face_addr + r * row_bytes, face_addr, row_bytes);
++        }
++        for (uint32_t r = split + 1; r < FACE; ++r) {
++            copy(face_addr + r * row_bytes, face_addr + split * row_bytes, row_bytes);
++        }
++    }
++    noc.async_read_barrier();
++    if constexpr (right_mask) {
++        copy(tile_addr + 2u * face_bytes, tile_addr, 2u * face_bytes);
++    } else {
++        copy(tile_addr + face_bytes, tile_addr, face_bytes);
++        copy(tile_addr + 3u * face_bytes, tile_addr + 2u * face_bytes, face_bytes);
      }
++    noc.async_read_barrier();
  }
  
+ /**
