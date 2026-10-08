@@ -31,7 +31,7 @@ def rotary(x, cos, sin):
     return jnp.concatenate((x1 * cos - x2 * sin, x2 * cos + x1 * sin), axis=-1)
 
 
-def make_prologue(heads, kv_heads):
+def make_prologue(heads, kv_heads, joint_k_norm=False):
     inv_freq = 1.0 / (1e6 ** (np.arange(0, HEAD_DIM, 2, dtype=np.float32) / HEAD_DIM))
 
     def prologue(x, wq, wk, wv, q_norm, k_norm, positions):
@@ -42,7 +42,10 @@ def make_prologue(heads, kv_heads):
         with jax.named_scope("v_proj"):
             v = x @ wv
         q = rms_norm(q.reshape(-1, heads, HEAD_DIM), q_norm)
-        k = rms_norm(k.reshape(-1, kv_heads, HEAD_DIM), k_norm)
+        if joint_k_norm:  # One norm over all of k's heads, not one per head.
+            k = rms_norm(k, k_norm).reshape(-1, kv_heads, HEAD_DIM)
+        else:
+            k = rms_norm(k.reshape(-1, kv_heads, HEAD_DIM), k_norm)
         freqs = positions.astype(jnp.float32)[:, None] * inv_freq
         cos, sin = jnp.cos(freqs), jnp.sin(freqs)
         q, k = rotary(q, cos, sin), rotary(k, cos, sin)
@@ -56,25 +59,31 @@ def make_prologue(heads, kv_heads):
     return prologue
 
 
-def reference(x, wq, wk, wv, q_norm, k_norm, position, heads, kv_heads):
+def reference(x, wq, wk, wv, q_norm, k_norm, position, heads, kv_heads, joint_k_norm=False):
     x, wq, wk, wv, q_norm, k_norm = (a.astype(np.float32) for a in (x, wq, wk, wv, q_norm, k_norm))
     freqs = position * (1.0 / (1e6 ** (np.arange(0, HEAD_DIM, 2, dtype=np.float32) / HEAD_DIM)))
     cos, sin = np.cos(freqs), np.sin(freqs)
 
-    def norm_rope(h, weight):
-        h = h * (1.0 / np.sqrt(np.mean(h * h, axis=-1, keepdims=True) + EPS)) * weight
+    def norm(h, weight):
+        return h * (1.0 / np.sqrt(np.mean(h * h, axis=-1, keepdims=True) + EPS)) * weight
+
+    def rope(h):
         h1, h2 = h[..., : HEAD_DIM // 2], h[..., HEAD_DIM // 2 :]
         return np.concatenate((h1 * cos - h2 * sin, h2 * cos + h1 * sin), axis=-1)
 
-    q = norm_rope((x @ wq).reshape(heads, HEAD_DIM), q_norm)
-    k = norm_rope((x @ wk).reshape(kv_heads, HEAD_DIM), k_norm)
+    q = rope(norm((x @ wq).reshape(heads, HEAD_DIM), q_norm))
+    if joint_k_norm:
+        k = rope(norm(x @ wk, k_norm).reshape(kv_heads, HEAD_DIM))
+    else:
+        k = rope(norm((x @ wk).reshape(kv_heads, HEAD_DIM), k_norm))
     v = (x @ wv).reshape(kv_heads, HEAD_DIM)
     return q, k, v
 
 
 @pytest.mark.parametrize("trace", [False, True])
-# Qwen3-8B at TP4, TP2 and TP1, Qwen3-14B and Qwen3-32B at TP4.
-@pytest.mark.parametrize("heads,kv_heads", [(8, 2), (16, 4), (32, 8), (10, 2), (16, 2)])
+# Qwen3-8B at TP4, TP2 and TP1, Qwen3-14B and Qwen3-32B at TP4, and Qwen3-30B-A3B at TP4,
+# whose single KV head per device has no head reshape to match.
+@pytest.mark.parametrize("heads,kv_heads", [(8, 2), (16, 4), (32, 8), (10, 2), (16, 2), (8, 1)])
 def test_qkv_norm_rope_decode(trace, heads, kv_heads, tmp_path):
     run = jax.jit(
         make_prologue(heads, kv_heads),
@@ -105,3 +114,35 @@ def test_qkv_norm_rope_decode(trace, heads, kv_heads, tmp_path):
     assert irs, "no IR was exported"
     assert any("ttnn.nlp_create_qkv_heads_decode_norm_rope" in ir for ir in irs), "the prologue was not fused"
     assert not any("ttnn.rotary_embedding" in ir for ir in irs), "a rotary embedding was left over"
+
+
+def test_joint_kv_norm_is_not_fused(tmp_path):
+    """A norm over all of k's heads at once, [B, 2 * D] -> RMSNorm -> [1, B, 2, D],
+    is not a per-head norm: it must stay unfused and keep its values. Only a
+    single head may go from the slice straight to its norm."""
+    heads, kv_heads = 8, 2
+    run = jax.jit(
+        make_prologue(heads, kv_heads, joint_k_norm=True),
+        compiler_options={"optimization_level": "O1", "export_path": str(tmp_path)},
+    )
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(0)
+    weights = [
+        (rng.standard_normal((HIDDEN, n * HEAD_DIM)) / np.sqrt(HIDDEN)).astype(jnp.bfloat16)
+        for n in (heads, kv_heads, kv_heads)
+    ]
+    norms = [rng.uniform(0.5, 1.5, n * HEAD_DIM).astype(jnp.bfloat16) for n in (1, kv_heads)]
+    x = rng.standard_normal((1, HIDDEN)).astype(jnp.bfloat16)
+    args = [x] + weights + norms + [np.array([7], dtype=np.int32)]
+    q, k, v = run(*(jax.device_put(a, device) for a in args))
+    expected = reference(x, *weights, *norms, 7, heads, kv_heads, joint_k_norm=True)
+    # Unfused, the prologue rounds to BF16 between the norm and the rotary embedding.
+    for name, actual, want in zip("qkv", (q, k, v), expected):
+        actual = np.asarray(actual).astype(np.float32).reshape(want.shape)
+        np.testing.assert_allclose(actual, want, atol=0.1, rtol=0.03, err_msg=name)
+
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert irs, "no IR was exported"
+    # The prefix also covers nlp_create_qkv_heads_decode_norm_rope: the projection matcher itself
+    # must reject the joint norm, not only a later fusion.
+    assert not any("ttnn.nlp_create_qkv_heads_decode" in ir for ir in irs), "the joint norm was fused"
