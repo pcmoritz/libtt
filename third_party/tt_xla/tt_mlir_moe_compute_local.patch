@@ -1,0 +1,414 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -6974,7 +6974,10 @@ def TTIR_MoeComputeOp : TTIR_NamedOp<"moe_compute", [TTIR_CCL, AttrSizedOperandS
+         `combine_output`                 A2A selective-reduce-combined result.
+ 
+       The op always runs the full (combine) path; `cluster_axis` selects the
+-      mesh axis the A2A combine reduces over. The metal kernel internally
++      mesh axis the A2A combine reduces over. Without `cluster_axis`, each
++      device runs its own experts on its own tokens and writes their outputs
++      into a zeroed combine output, with no fabric; `rings` (2 or 3) then runs
++      the device's experts on that many matmul rings side by side. The metal kernel internally
+       allocates and frees its routing/tilize/matmul intermediates; only the
+       combine result is exposed in the IR.
+     }];
+@@ -6994,7 +6997,8 @@ def TTIR_MoeComputeOp : TTIR_NamedOp<"moe_compute", [TTIR_CCL, AttrSizedOperandS
+                          UI32Attr:$intermediate_size,
+                          DefaultValuedAttr<TTCore_MoEActivationFunctionAttr,
+                              "::mlir::tt::ttcore::MoEActivationFunction::Silu">:$activation_function,
+-                         UI32Attr:$cluster_axis);
++                         OptionalAttr<UI32Attr>:$cluster_axis,
++                         DefaultValuedAttr<UI32Attr, "0">:$rings);
+ 
+     let results = (outs AnyRankedTensor:$combine_output);
+ 
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -2126,10 +2126,11 @@ def TTNN_MoeComputeOp : TTNN_Op<"moe_compute",
+                          BoolAttr:$has_bias,
+                          DefaultValuedAttr<TTCore_MoEActivationFunctionAttr,
+                              "::mlir::tt::ttcore::MoEActivationFunction::Silu">:$activation_function,
+-                         UI32Attr:$cluster_axis,
++                         OptionalAttr<UI32Attr>:$cluster_axis,
+                          OptionalAttr<UI32Attr>:$num_links,
+                          OptionalAttr<TTCore_TopologyAttr>:$topology,
+-                         TTNN_CoreRangeSetAttr:$mux_core_range_set);
++                         TTNN_CoreRangeSetAttr:$mux_core_range_set,
++                         DefaultValuedAttr<UI32Attr, "0">:$rings);
+ 
+     let results = (outs AnyRankedTensor:$combine_output);
+ 
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -12768,6 +12768,89 @@ public:
+     return success();
+   }
+ };
++// This pattern recognizes and converts stablehlo.custom_call @tt.moe_compute
++// to ttir.moe_compute: operands (input [D, T, H], expert ids [T, k], scores
++// [T, k], expert-to-device mapping [D, E], w0 and w1 [L, E, H, N], w2
++// [L, E, N, H]), attributes from mhlo.frontend_attributes (layer_id,
++// output_height_shard_dim, activation, cluster_axis, which, if absent, runs
++// each device on its own, and rings), and a [k, T, H] result.
++class StableHLOToTTIRMoeComputeOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
++  using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::CustomCallOp srcOp,
++                  mlir::stablehlo::CustomCallOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    if (adaptor.getCallTargetNameAttr() != "tt.moe_compute") {
++      return failure();
++    }
++    if (adaptor.getOperands().size() != 7) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "MoeCompute op expects 7 operands (input, indices, scores, "
++                 "mapping, w0, w1, w2).");
++    }
++
++    mlir::DictionaryAttr frontendAttributes =
++        mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
++            srcOp->getDiscardableAttr("mhlo.frontend_attributes"));
++    auto u32Attr = [&](llvm::StringRef name,
++                       std::optional<uint32_t> fallback)
++        -> FailureOr<std::optional<uint32_t>> {
++      auto value = frontendAttributes
++                       ? frontendAttributes.getAs<mlir::StringAttr>(name)
++                       : nullptr;
++      if (!value) {
++        return fallback;
++      }
++      uint32_t result;
++      if (value.getValue().getAsInteger(10, result)) {
++        return failure();
++      }
++      return std::optional<uint32_t>(result);
++    };
++    auto layerId = u32Attr("layer_id", 0);
++    auto outputHeightShardDim = u32Attr("output_height_shard_dim", 4);
++    auto clusterAxis = u32Attr("cluster_axis", std::nullopt);
++    auto rings = u32Attr("rings", 0);
++    if (failed(layerId) || failed(outputHeightShardDim) ||
++        failed(clusterAxis) || failed(rings)) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "MoeCompute attributes must be unsigned integers.");
++    }
++
++    auto activation = ttcore::MoEActivationFunction::Silu;
++    if (auto name = frontendAttributes ? frontendAttributes.getAs<StringAttr>(
++                                             "activation")
++                                       : nullptr) {
++      auto parsed = ttcore::symbolizeMoEActivationFunction(name.getValue());
++      if (!parsed) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "MoeCompute activation must be silu or swiglu.");
++      }
++      activation = *parsed;
++    }
++
++    ValueRange operands = adaptor.getOperands();
++    auto w0Type = cast<RankedTensorType>(operands[4].getType());
++    RankedTensorType outputType = cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getResult(0).getType()));
++
++    auto u32 = [&](uint32_t value) {
++      return rewriter.getUI32IntegerAttr(value);
++    };
++    rewriter.replaceOpWithNewOp<ttir::MoeComputeOp>(
++        srcOp, outputType, operands[0], operands[1], operands[2], operands[3],
++        operands[4], operands[5], operands[6], /*bias_0=*/Value(),
++        /*bias_1=*/Value(), /*bias_2=*/Value(), u32(**layerId),
++        u32(**outputHeightShardDim), u32(w0Type.getShape().back()),
++        ttcore::MoEActivationFunctionAttr::get(getContext(), activation),
++        *clusterAxis ? u32(**clusterAxis) : IntegerAttr(), u32(**rings));
++    return success();
++  }
++};
++
+ // This pattern recognizes and converts stablehlo.custom_call
+ // @tt.all_to_all_dispatch to ttir.all_to_all_dispatch.
+ // Dispatch returns a tuple (dispatched, metadata), which stablehlo represents
+@@ -13235,6 +13318,13 @@ static void addSparseMatmulOpConversionPattern(MLIRContext *ctx,
+                                                                ctx);
+ }
+ 
++static void addMoeComputeOpConversionPattern(MLIRContext *ctx,
++                                             RewritePatternSet &patterns,
++                                             TypeConverter &typeConverter) {
++  patterns.add<StableHLOToTTIRMoeComputeOpConversionPattern>(typeConverter,
++                                                             ctx);
++}
++
+ static void addAllToAllOpsConversionPattern(MLIRContext *ctx,
+                                             RewritePatternSet &patterns,
+                                             TypeConverter &typeConverter) {
+@@ -13291,6 +13381,7 @@ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
+   addScaledDotProductAttentionDecodeOpConversionPattern(ctx, patterns,
+                                                         typeConverter);
+   addSparseMatmulOpConversionPattern(ctx, patterns, typeConverter);
++  addMoeComputeOpConversionPattern(ctx, patterns, typeConverter);
+   addAllToAllOpsConversionPattern(ctx, patterns, typeConverter);
+   addTTLangOpConversionPattern(ctx, patterns, typeConverter);
+   // libtt lowers stablehlo.while itself (tt_mlir_control_flow.cpp).
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -3499,8 +3499,11 @@ void mlir::tt::ttnn::MatmulOp::getCanonicalizationPatterns(
+ // The combine output buffer and cross-device semaphore are materialized in the
+ // function prelude so they are trace-hoistable. Both must be bound: tt-metal
+ // deadlocks the A2A combine unless optional_output_tensor and
+-// cross_device_semaphore are both provided.
+-bool MoeComputeOp::hasUnboundBuffers() { return !getOptionalOutputTensor(); }
++// cross_device_semaphore are both provided. Without a cluster axis there is no
++// A2A combine, and the runtime zeroes a fresh output on every call.
++bool MoeComputeOp::hasUnboundBuffers() {
++  return getClusterAxis() && !getOptionalOutputTensor();
++}
+ 
+ // NOLINTBEGIN(clang-analyzer-core.StackAddressEscape)
+ void MoeComputeOp::allocateBuffers(::mlir::RewriterBase &rewriter) {
+@@ -3530,7 +3533,9 @@ void MoeComputeOp::allocateBuffers(::mlir::RewriterBase &rewriter) {
+ }
+ // NOLINTEND(clang-analyzer-core.StackAddressEscape)
+ 
+-bool MoeComputeOp::hasUnboundSemaphores() { return !getCrossDeviceSemaphore(); }
++bool MoeComputeOp::hasUnboundSemaphores() {
++  return getClusterAxis() && !getCrossDeviceSemaphore();
++}
+ 
+ // NOLINTBEGIN(clang-analyzer-core.StackAddressEscape)
+ void MoeComputeOp::allocateSemaphores(::mlir::RewriterBase &rewriter) {
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNConfigureCCLOps.cpp b/lib/Dialect/TTNN/Transforms/TTNNConfigureCCLOps.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNConfigureCCLOps.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNConfigureCCLOps.cpp
+@@ -44,8 +44,11 @@ public:
+         [&](AllReduceOp op) { setCCLTopology(op, meshTopology, context); });
+     moduleOp.walk(
+         [&](ReduceScatterOp op) { setCCLTopology(op, meshTopology, context); });
+-    moduleOp.walk(
+-        [&](MoeComputeOp op) { setCCLTopology(op, meshTopology, context); });
++    moduleOp.walk([&](MoeComputeOp op) {
++      if (op.getClusterAxis()) {
++        setCCLTopology(op, meshTopology, context);
++      }
++    });
+   }
+ 
+ private:
+@@ -56,7 +59,8 @@ private:
+       return;
+     }
+ 
+-    uint32_t clusterAxis = op.getClusterAxis();
++    // MoeComputeOp's cluster axis is optional; it is set here.
++    uint32_t clusterAxis = std::optional<uint32_t>(op.getClusterAxis()).value();
+ 
+     // meshTopology follows meshShape indexing:
+     //   meshTopology[0] = row-axis (horizontal) connectivity
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -1478,10 +1478,12 @@ createOp(FlatbufferObjectCache &cache, MoeComputeOp op) {
+ 
+   auto activation = toFlatbuffer(cache, op.getActivationFunction());
+ 
+-  // cluster_axis is required but schema-optional; serialize it present.
+-  // num_links and topology are optional — serialize unset as the absent marker
+-  // (tt-metal asserts num_links > 0).
+-  auto clusterAxis = ::flatbuffers::Optional<uint32_t>(op.getClusterAxis());
++  // cluster_axis, num_links and topology are optional — serialize unset as
++  // the absent marker (tt-metal asserts num_links > 0).
++  ::flatbuffers::Optional<uint32_t> clusterAxis = ::flatbuffers::nullopt;
++  if (std::optional<uint32_t> axis = op.getClusterAxis()) {
++    clusterAxis = *axis;
++  }
+   auto numLinks = toFlatbuffer(cache, op.getNumLinks());
+   auto topology = toFlatbuffer(cache, op.getTopology());
+ 
+@@ -1495,7 +1497,7 @@ createOp(FlatbufferObjectCache &cache, MoeComputeOp op) {
+       w2, optionalOutput, crossDeviceSemaphore, deviceRef, op.getLayerId(),
+       op.getOutputHeightShardDim(), op.getIntermediateSize(), op.getHasBias(),
+       clusterAxis, activation, numLinks, topology, muxCoreRangeSet,
+-      combineOutput);
++      combineOutput, op.getRings());
+ }
+ 
+ // Convert ttcore::ReduceType to tt::target::ttnn::ScatterReduceType
+diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
+--- a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
++++ b/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
+@@ -9,7 +9,10 @@
+ #include "tt/runtime/detail/ttnn/ttnn.h"
+ #include "tt/runtime/detail/ttnn/utils.h"
+ 
++#include "ttnn/operations/core/core.hpp"
++#include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
+ #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp"
++#include "ttnn/operations/full/full.hpp"
+ 
+ namespace tt::runtime::ttnn::operations::ccl {
+ 
+@@ -27,9 +30,135 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
+   return ::ttnn::experimental::prim::detail::MoEActivationFunction::SILU;
+ }
+ 
++// tt-metal reads the expert indices and scores from L1 on the core that drains
++// the tilize stage, the core its placement picks for this hidden size.
++::ttnn::Tensor toTilizeDrainCore(const ::ttnn::Tensor &tensor,
++                                 const ::ttnn::Tensor &input,
++                                 uint32_t outputHeightShardDim) {
++  ::ttnn::MeshDevice *meshDevice = input.device();
++  uint32_t hiddenSize = input.logical_shape()[-1];
++  // As the op picks its data-parallel combine cores: the largest divisor of
++  // the hidden tiles, at most 4, that also divides the matmul ring.
++  uint32_t ringSize = meshDevice->arch() == ::tt::ARCH::BLACKHOLE
++                          ? meshDevice
++                                ->get_optimal_dram_bank_to_logical_worker_assignment(
++                                    ::tt::tt_metal::NOC::RISCV_0_default)
++                                .size()
++                          : 12;
++  uint32_t dataParallelCores = 1;
++  for (uint32_t d = 4; d >= 1; --d) {
++    if ((hiddenSize / 32) % d == 0 && ringSize % d == 0) {
++      dataParallelCores = d;
++      break;
++    }
++  }
++  ::ttnn::CoreCoord core = ::ttnn::experimental::get_moe_tilize_drain_core(
++      meshDevice, outputHeightShardDim, dataParallelCores, hiddenSize);
++  const ::ttnn::Shape &shape = tensor.logical_shape();
++  uint32_t rows = shape.volume() / shape[-1];
++  ::ttnn::MemoryConfig memoryConfig(
++      ::ttnn::TensorMemoryLayout::HEIGHT_SHARDED, ::ttnn::BufferType::L1,
++      ::tt::tt_metal::ShardSpec(::ttnn::CoreRangeSet(::ttnn::CoreRange(core)),
++                                {rows, shape[-1]},
++                                ::tt::tt_metal::ShardOrientation::ROW_MAJOR));
++  return ::ttnn::to_memory_config(
++      ::ttnn::to_layout(tensor, ::ttnn::Layout::ROW_MAJOR), memoryConfig);
++}
++
++// Without a cluster axis, each device runs the experts its mapping row places
++// on it for all of its tokens, with no fabric (tt-metal's local combine).
++// Slots of experts on other devices are left as they are, so the combine
++// output starts zeroed.
++void runLocal(const ::tt::target::ttnn::MoeComputeOp *op,
++              ProgramContext &context) {
++  ProgramTensorPool &tensorPool = context.getTensorPool();
++  const ::ttnn::Tensor &tilizeInput =
++      tensorPool.getTTNNTensorAndValidate(op->tilize_input_tensor());
++  const ::ttnn::Tensor &indices =
++      tensorPool.getTTNNTensorAndValidate(op->tilize_expert_indices_tensor());
++  const ::ttnn::Tensor &scores =
++      tensorPool.getTTNNTensorAndValidate(op->tilize_expert_scores_tensor());
++  // The optimizer may have placed them there already.
++  ::ttnn::Tensor tilizeIndices =
++      toTilizeDrainCore(indices, tilizeInput, op->output_height_shard_dim());
++  ::ttnn::Tensor tilizeScores =
++      toTilizeDrainCore(scores, tilizeInput, op->output_height_shard_dim());
++  const ::ttnn::Tensor &tilizeMapping =
++      tensorPool.getTTNNTensorAndValidate(op->tilize_expert_mapping_tensor());
++  const ::ttnn::Tensor &w0w1 =
++      tensorPool.getTTNNTensorAndValidate(op->matmul_w0_w1_tensor());
++  const ::ttnn::Tensor &w2 =
++      tensorPool.getTTNNTensorAndValidate(op->matmul_w2_tensor());
++
++  // tt-metal's local output path: on a mesh axis of extent 1 there is nothing
++  // to combine, and each chip writes its experts' rows of the [k, tokens,
++  // hidden] output and zeros for the rest. The op's result may view it as any
++  // shape of that size, such as [k * tokens, hidden], which tiles without
++  // padding each expert's rows.
++  ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();
++  const auto &meshShape = meshDevice.shape();
++  std::optional<uint32_t> localAxis;
++  for (uint32_t axis = 0; axis < meshShape.dims(); ++axis) {
++    if (meshShape[axis] == 1) {
++      localAxis = axis;
++      break;
++    }
++  }
++  LOG_ASSERT(localAxis, "moe_compute without a cluster axis needs a mesh axis "
++                        "of extent 1");
++
++  // Several rings run a chip's experts side by side (an expert with fewer
++  // chunks than rings goes whole to the least-loaded ring), but then the rows
++  // of other chips' experts are not written, so the output starts zeroed.
++  const uint32_t rings = op->rings();
++  std::optional<::ttnn::Tensor> output;
++  if (rings > 1) {
++    uint32_t hiddenSize = tilizeInput.logical_shape()[-1];
++    output = ::ttnn::moreh_full(
++        {tilizeIndices.logical_shape()[-1],
++         static_cast<uint32_t>(tilizeInput.logical_volume() / hiddenSize),
++         hiddenSize},
++        0.0f, &meshDevice, ::ttnn::DataType::BFLOAT16, ::ttnn::Layout::ROW_MAJOR,
++        ::ttnn::DRAM_MEMORY_CONFIG);
++  }
++
++  std::vector<::ttnn::Tensor> results = ::ttnn::experimental::moe_compute(
++      tilizeInput, tilizeIndices, tilizeScores, tilizeMapping, w0w1, w2,
++      op->layer_id(), op->output_height_shard_dim(), op->intermediate_size(),
++      op->has_bias(), localAxis, /*topology=*/std::nullopt,
++      /*num_links=*/std::nullopt, /*mux_core_range_set=*/std::nullopt,
++      /*output_memory_config=*/::ttnn::DRAM_MEMORY_CONFIG, output,
++      /*optional_cross_device_semaphore=*/std::nullopt,
++      toMetalActivation(op->activation_function()),
++      /*compute_only=*/false, /*num_shared_experts_per_device=*/std::nullopt,
++      /*local_combine=*/false, /*zero_fill_non_owned_rows=*/rings < 2,
++      /*prefill_rings=*/rings);
++
++  LOG_ASSERT(results.size() == 6, "moe_compute returned ", results.size(),
++             " tensors; expected 6");
++  tensorPool.insertTTNNTensorAndValidate(
++      op->combine_output(),
++      ::ttnn::reshape(results[5], operations::utils::toTTNNShape(
++                                      *op->combine_output()->desc()->shape())));
++  for (size_t i = 0; i < 5; ++i) {
++    ::ttnn::deallocate(results[i]);
++  }
++  if (tilizeIndices.buffer() != indices.buffer()) {
++    ::ttnn::deallocate(tilizeIndices);
++  }
++  if (tilizeScores.buffer() != scores.buffer()) {
++    ::ttnn::deallocate(tilizeScores);
++  }
++}
++
+ } // namespace
+ 
+ void run(const ::tt::target::ttnn::MoeComputeOp *op, ProgramContext &context) {
++  if (!op->cluster_axis()) {
++    runLocal(op, context);
++    return;
++  }
++
+   ProgramTensorPool &tensorPool = context.getTensorPool();
+ 
+   const ::ttnn::Tensor &tilizeInput =
+diff --git a/include/ttmlir/Target/TTNN/operations/ccl.fbs b/include/ttmlir/Target/TTNN/operations/ccl.fbs
+--- a/include/ttmlir/Target/TTNN/operations/ccl.fbs
++++ b/include/ttmlir/Target/TTNN/operations/ccl.fbs
+@@ -204,4 +204,7 @@ table MoeComputeOp {
+   // Only the A2A combine output is exposed; tt-metal's routing/tilize/matmul
+   // intermediates are allocated and freed inside the runtime handler.
+   combine_output: tt.target.ttnn.TensorRef;
++  // Without a cluster axis: how many matmul rings run a chip's experts (0
++  // and 1: one; 2 and 3: experts side by side).
++  rings: uint32;
+ }
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -1875,7 +1875,7 @@ public:
+         op.getOutputHeightShardDimAttr(), op.getIntermediateSizeAttr(),
+         hasBiasAttr, op.getActivationFunctionAttr(), op.getClusterAxisAttr(),
+         /*num_links=*/mlir::IntegerAttr(), /*topology=*/ttcore::TopologyAttr(),
+-        muxCoreRangeSet);
++        muxCoreRangeSet, op.getRingsAttr());
+     return success();
+   }
+ };
