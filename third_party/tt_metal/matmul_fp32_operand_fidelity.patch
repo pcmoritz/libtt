@@ -1,0 +1,24 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+@@ -2859,11 +2859,18 @@ MatmulParams create_matmul_attributes(
+          (input_tensor_b.dtype() == DataType::BFLOAT8_B || input_tensor_b.dtype() == DataType::BFLOAT4_B));
+     const auto increase_fidelity = !has_program_config && !has_user_grid && !are_inputs_low_precision_df;
+     auto math_fidelity = increase_fidelity ? MathFidelity::HiFi2 : MathFidelity::LoFi;
+-    bool are_inputs_32F = (input_tensor_a.dtype() == DataType::FLOAT32 && input_tensor_b.dtype() == DataType::FLOAT32);
++    // An FP32 input with a BF16 one, such as a router's FP32 gate applied to BF16 hidden states, needs the
++    // FP32 fidelity as much as two FP32 inputs do. Block-float inputs keep theirs.
++    auto is_32F_or_16F = [](const Tensor& t) {
++        return t.dtype() == DataType::FLOAT32 || t.dtype() == DataType::BFLOAT16;
++    };
++    bool use_fp32_fidelity =
++        (input_tensor_a.dtype() == DataType::FLOAT32 || input_tensor_b.dtype() == DataType::FLOAT32) &&
++        is_32F_or_16F(input_tensor_a) && is_32F_or_16F(input_tensor_b);
+     // Due to hardware bug (#38306), HiFi4 + fp32_dest_acc_en can sometime produce incorrect results on Wormhole.
+     // When inputs are FLOAT32 (which drives fp32_dest_acc_en=True by default), use HiFi3 on Wormhole B0.
+     const auto is_wormhole = arch == tt::ARCH::WORMHOLE_B0;
+-    math_fidelity = are_inputs_32F ? (is_wormhole ? MathFidelity::HiFi3 : MathFidelity::HiFi4) : math_fidelity;
++    math_fidelity = use_fp32_fidelity ? (is_wormhole ? MathFidelity::HiFi3 : MathFidelity::HiFi4) : math_fidelity;
+ 
+     bool broadcast_batch = parameters.bcast_batch.value_or(get_broadcast_batch(
+         input_tensor_a, input_tensor_b, parameters.transpose_a, parameters.transpose_b, parameters.program_config));
