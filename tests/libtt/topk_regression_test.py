@@ -53,3 +53,15 @@ def test_top_k_ties_keep_lowest_index(dtype, shape, k):
     np.testing.assert_array_equal(np.asarray(values).astype(np.float32), want_values.astype(np.float32))
     np.testing.assert_array_equal(np.asarray(indices), want_indices)
 
+
+@pytest.mark.parametrize("dtype", [np.float32, "bfloat16"])
+@pytest.mark.parametrize("rows", [1, 33])
+def test_top_k_ignores_width_padding(dtype, rows):
+    """A row that does not fill whole tiles has its padding filled before the
+    sort: with every value negative, zero-filled padding would win."""
+    rng = np.random.default_rng(rows)
+    x = rng.integers(-9, 0, (rows, 127)).astype(np.float32).astype(dtype)
+    values, indices = jax.jit(lambda a: lax.top_k(a, 8))(jax.device_put(x, jax.devices("tt")[0]))
+    want_values, want_indices = reference(np.asarray(x), 8)
+    np.testing.assert_array_equal(np.asarray(values).astype(np.float32), want_values.astype(np.float32))
+    np.testing.assert_array_equal(np.asarray(indices), want_indices)
