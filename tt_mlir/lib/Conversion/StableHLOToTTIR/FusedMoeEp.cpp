@@ -24,8 +24,7 @@
 // writes each pair's output unweighted. This lowering chunks the tokens, builds
 // the expert-to-device mapping, and sums each token's slots with its weights in
 // one matmul accumulated in FP32; the kernel reads the ids as they are and
-// skips padding's negative ids. The frontend attribute `rings` (default 3)
-// sets how many matmul rings run a device's experts side by side.
+// skips padding's negative ids.
 
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
@@ -38,13 +37,15 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <numeric>
 
 namespace mlir::tt {
 namespace {
 
 constexpr int64_t kMaxTokensPerCall = 512;
-constexpr uint32_t kDefaultRings = 3;
+// Matmul rings that run a device's experts side by side.
+constexpr uint32_t kRings = 3;
 
 class FusedMoeEpConversionPattern
     : public OpConversionPattern<stablehlo::CustomCallOp> {
@@ -81,15 +82,6 @@ public:
               "w1 [E_local, H, I]");
     }
 
-    uint32_t rings = kDefaultRings;
-    if (auto attrs = op->getAttrOfType<DictionaryAttr>(
-            "mhlo.frontend_attributes")) {
-      if (auto value = attrs.getAs<StringAttr>("rings");
-          value && value.getValue().getAsInteger(10, rings)) {
-        return rewriter.notifyMatchFailure(op, "rings must be an integer");
-      }
-    }
-
     Location loc = op.getLoc();
     MLIRContext *ctx = getContext();
     const int64_t tokens = xType.getDimSize(0);
@@ -102,9 +94,9 @@ public:
                           ->getAttrOfType<ttcore::MeshesAttr>(
                               ttcore::MeshesAttr::name);
         meshes && !meshes.getMeshes().empty()) {
-      for (int64_t size : meshes.getMeshes()[0].getShape()) {
-        devices *= size;
-      }
+      ArrayRef<int64_t> shape = meshes.getMeshes()[0].getShape();
+      devices = std::accumulate(shape.begin(), shape.end(), int64_t{1},
+                                std::multiplies<>());
     }
     const int64_t experts = localExperts * devices;
 
@@ -112,9 +104,7 @@ public:
     Type f32 = rewriter.getF32Type();
     Type u16 = IntegerType::get(ctx, 16, IntegerType::Unsigned);
     auto typed = [](Value value, ArrayRef<int64_t> shape, Type elementType) {
-      return RankedTensorType::get(
-          shape, elementType,
-          cast<RankedTensorType>(value.getType()).getEncoding());
+      return cast<RankedTensorType>(value.getType()).clone(shape, elementType);
     };
     auto castTo = [&](Value value, Type elementType) -> Value {
       auto type = cast<RankedTensorType>(value.getType());
@@ -174,19 +164,23 @@ public:
 
     auto activation = ttcore::MoEActivationFunctionAttr::get(
         ctx, ttcore::MoEActivationFunction::Silu);
-    // A 0/1 matrix, 1 where row r's index rows[r] equals column c's cols[c]:
-    // only the two index vectors are constants, and the comparison runs once,
-    // when the program loads.
-    auto mask = [&](ArrayRef<float> rows, ArrayRef<float> cols) -> Value {
+    // An [m, n] 0/1 matrix, 1 where row r equals column c's index index(c):
+    // only the row and column indices are constants, and the comparison runs
+    // once, when the program loads.
+    auto mask = [&](int64_t m, int64_t n, auto index) -> Value {
+      SmallVector<float> rowIndices(m), colIndices(n);
+      std::iota(rowIndices.begin(), rowIndices.end(), 0.0f);
+      for (int64_t c = 0; c < n; ++c) {
+        colIndices[c] = index(c);
+      }
       auto vector = [&](ArrayRef<int64_t> shape, ArrayRef<float> values) {
         auto type = RankedTensorType::get(shape, f32);
         return rewriter.create<ttir::ConstantOp>(
             loc, type, DenseElementsAttr::get(type, values));
       };
-      const int64_t m = rows.size(), n = cols.size();
       return rewriter.create<ttir::EqualOp>(
-          loc, RankedTensorType::get({m, n}, f32), vector({m, 1}, rows),
-          vector({1, n}, cols));
+          loc, RankedTensorType::get({m, n}, f32), vector({m, 1}, rowIndices),
+          vector({1, n}, colIndices));
     };
     SmallVector<Value> outputs;
     for (int64_t begin = 0; begin < tokens; begin += kMaxTokensPerCall) {
@@ -201,7 +195,7 @@ public:
           /*bias_2=*/Value(), rewriter.getUI32IntegerAttr(0),
           rewriter.getUI32IntegerAttr(4),
           rewriter.getUI32IntegerAttr(intermediate), activation,
-          /*cluster_axis=*/IntegerAttr(), rewriter.getUI32IntegerAttr(rings));
+          /*cluster_axis=*/IntegerAttr(), rewriter.getUI32IntegerAttr(kRings));
 
       // Each token's weighted sum of its slots as one matmul in FP32: row i
       // of the placement matrix holds token i's weight j at column j * t + i,
@@ -211,15 +205,8 @@ public:
       Value placement = chunkWeights;
       if (t > 1) {
         // Column j * t + i is slot j of token i.
-        SmallVector<float> slot(k), token(t), slotOf(k * t), tokenOf(k * t);
-        std::iota(slot.begin(), slot.end(), 0.0f);
-        std::iota(token.begin(), token.end(), 0.0f);
-        for (int64_t c = 0; c < k * t; ++c) {
-          slotOf[c] = c / t;
-          tokenOf[c] = c % t;
-        }
-        Value spread = mask(slot, slotOf);
-        Value own = mask(token, tokenOf);
+        Value spread = mask(k, k * t, [t](int64_t c) { return c / t; });
+        Value own = mask(t, k * t, [t](int64_t c) { return c % t; });
         auto placementType = typed(chunkWeights, {t, k * t}, f32);
         placement = rewriter.create<ttir::MultiplyOp>(
             loc, placementType,
