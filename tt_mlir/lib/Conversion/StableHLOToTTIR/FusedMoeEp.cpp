@@ -44,6 +44,9 @@ namespace {
 
 constexpr int64_t kMaxTokensPerCall = 512;
 constexpr uint32_t kDefaultRings = 3;
+// Up to this many tokens per call, the combine's placement matrix comes from
+// [t, k * t] constants (64 KiB per 8 slots at 64 tokens).
+constexpr int64_t kMaxTokensForConstantPlacement = 64;
 
 class FusedMoeEpConversionPattern
     : public OpConversionPattern<stablehlo::CustomCallOp> {
@@ -208,28 +211,56 @@ public:
           /*cluster_axis=*/IntegerAttr(), rewriter.getUI32IntegerAttr(rings));
 
       // Each token's weighted sum of its slots as one matmul in FP32: row i
-      // of the placement matrix holds token i's weights at its slots' rows.
+      // of the placement matrix holds token i's weights at its slots' rows,
+      // weight j at column j * t + i.
       Value chunkWeights = castTo(rows(weights, begin, end), f32);
-      SmallVector<float> eye(t * t, 0.0f);
-      for (int64_t i = 0; i < t; ++i) {
-        eye[i * t + i] = 1.0f;
+      Value placement;
+      if (t <= kMaxTokensForConstantPlacement) {
+        // Spread each weight over its slot's t columns with a 0/1 matmul and
+        // keep the token's own column with a 0/1 mask: no reshapes, which
+        // cost more than these small matmul and multiply.
+        SmallVector<float> spread(k * k * t, 0.0f), own(t * k * t, 0.0f);
+        for (int64_t j = 0; j < k; ++j) {
+          for (int64_t i = 0; i < t; ++i) {
+            spread[j * k * t + j * t + i] = 1.0f;
+            own[i * k * t + j * t + i] = 1.0f;
+          }
+        }
+        auto constant = [&](ArrayRef<int64_t> shape, ArrayRef<float> values) {
+          auto type = RankedTensorType::get(shape, f32);
+          return rewriter.create<ttir::ConstantOp>(
+              loc, type, DenseElementsAttr::get(type, values));
+        };
+        Value spreadWeights = rewriter.create<ttir::MatmulOp>(
+            loc, typed(chunkWeights, {t, k * t}, f32), chunkWeights,
+            constant({k, k * t}, spread));
+        placement = rewriter.create<ttir::MultiplyOp>(
+            loc, typed(chunkWeights, {t, k * t}, f32), spreadWeights,
+            constant({t, k * t}, own));
+      } else {
+        SmallVector<float> eye(t * t, 0.0f);
+        for (int64_t i = 0; i < t; ++i) {
+          eye[i * t + i] = 1.0f;
+        }
+        auto eyeType = RankedTensorType::get({t, 1, t}, f32);
+        placement = reshape(
+            rewriter.create<ttir::MultiplyOp>(
+                loc, typed(chunkWeights, {t, k, t}, f32),
+                rewriter.create<ttir::BroadcastOp>(
+                    loc, typed(chunkWeights, {t, k, t}, f32),
+                    reshape(chunkWeights, {t, k, 1}),
+                    rewriter.getDenseI64ArrayAttr({1, 1, t})),
+                rewriter.create<ttir::BroadcastOp>(
+                    loc, typed(chunkWeights, {t, k, t}, f32),
+                    rewriter.create<ttir::ConstantOp>(
+                        loc, eyeType,
+                        DenseElementsAttr::get(eyeType, ArrayRef<float>(eye))),
+                    rewriter.getDenseI64ArrayAttr({1, k, 1}))),
+            {t, k * t});
       }
-      auto eyeType = RankedTensorType::get({t, 1, t}, f32);
-      Value placement = rewriter.create<ttir::MultiplyOp>(
-          loc, typed(chunkWeights, {t, k, t}, f32),
-          rewriter.create<ttir::BroadcastOp>(
-              loc, typed(chunkWeights, {t, k, t}, f32),
-              reshape(chunkWeights, {t, k, 1}),
-              rewriter.getDenseI64ArrayAttr({1, 1, t})),
-          rewriter.create<ttir::BroadcastOp>(
-              loc, typed(chunkWeights, {t, k, t}, f32),
-              rewriter.create<ttir::ConstantOp>(
-                  loc, eyeType,
-                  DenseElementsAttr::get(eyeType, ArrayRef<float>(eye))),
-              rewriter.getDenseI64ArrayAttr({1, k, 1})));
       Value sum = rewriter.create<ttir::MatmulOp>(
           loc, typed(chunkWeights, {t, hidden}, f32),
-          reshape(placement, {t, k * t}), slots);
+          placement, slots);
       outputs.push_back(castTo(sum, outType.getElementType()));
     }
     if (outputs.size() == 1) {

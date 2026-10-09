@@ -255,7 +255,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
 --- a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
 +++ b/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
-@@ -9,7 +9,10 @@
+@@ -9,7 +9,11 @@
  #include "tt/runtime/detail/ttnn/ttnn.h"
  #include "tt/runtime/detail/ttnn/utils.h"
  
@@ -263,10 +263,11 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
 +#include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
  #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp"
 +#include "ttnn/operations/full/full.hpp"
++#include <tt-metalium/work_split.hpp>
  
  namespace tt::runtime::ttnn::operations::ccl {
  
-@@ -27,9 +30,135 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
+@@ -27,9 +31,160 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
    return ::ttnn::experimental::prim::detail::MoEActivationFunction::SILU;
  }
  
@@ -376,10 +377,35 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
 +
 +  LOG_ASSERT(results.size() == 6, "moe_compute returned ", results.size(),
 +             " tensors; expected 6");
-+  tensorPool.insertTTNNTensorAndValidate(
-+      op->combine_output(),
++  ::ttnn::Tensor combined =
 +      ::ttnn::reshape(results[5], operations::utils::toTTNNShape(
-+                                      *op->combine_output()->desc()->shape())));
++                                      *op->combine_output()->desc()->shape()));
++  // The consumer tilizes the row-major output. From DRAM, a few rows that are
++  // wide (such as 64 x 2048 for 8 tokens) take TTNN's block tilize, which
++  // reads them in small pieces; whole tile rows tilize faster sharded in L1,
++  // one tile row per core, and the tiles are returned to DRAM.
++  const ::ttnn::Shape &combinedShape = combined.logical_shape();
++  uint32_t combinedRows = combinedShape.volume() / combinedShape[-1];
++  auto grid = meshDevice.compute_with_storage_grid_size();
++  if (combinedRows % 32 == 0 &&
++      combinedRows / 32 <= grid.x * grid.y) {
++    ::ttnn::MemoryConfig l1(
++        ::ttnn::TensorMemoryLayout::HEIGHT_SHARDED, ::ttnn::BufferType::L1,
++        ::tt::tt_metal::ShardSpec(
++            ::tt::tt_metal::num_cores_to_corerangeset(combinedRows / 32, grid,
++                                                      /*row_wise=*/true),
++            {32, combinedShape[-1]},
++            ::tt::tt_metal::ShardOrientation::ROW_MAJOR));
++    ::ttnn::Tensor sharded = ::ttnn::to_memory_config(combined, l1);
++    ::ttnn::Tensor tiled = ::ttnn::to_layout(sharded, ::ttnn::Layout::TILE);
++    ::ttnn::deallocate(sharded);
++    ::ttnn::Tensor dram =
++        ::ttnn::to_memory_config(tiled, ::ttnn::DRAM_MEMORY_CONFIG);
++    ::ttnn::deallocate(tiled);
++    ::ttnn::deallocate(combined);
++    combined = dram;
++  }
++  tensorPool.insertTTNNTensorAndValidate(op->combine_output(), combined);
 +  for (size_t i = 0; i < 5; ++i) {
 +    ::ttnn::deallocate(results[i]);
 +  }
