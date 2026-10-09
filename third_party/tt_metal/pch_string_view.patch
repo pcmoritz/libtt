@@ -1,0 +1,12 @@
+diff --git tt_metal/hw/inc/internal/pch.h tt_metal/hw/inc/internal/pch.h
+--- tt_metal/hw/inc/internal/pch.h
++++ tt_metal/hw/inc/internal/pch.h
+@@ -21,6 +21,8 @@
+ #include <limits>
+ #include <new>
+ #include <optional>
++// api/compile_time_args.h, used by every kernel with compile-time arguments.
++#include <string_view>
+ #include <tuple>
+ #include <type_traits>
+ #include <utility>
