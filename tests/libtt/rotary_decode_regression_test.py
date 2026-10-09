@@ -217,3 +217,43 @@ def test_rotary_decode_mixed_cache_broadcasts(tmp_path, trace):
         hi = x2 * c[None, :, :] + x1 * s[:, None, :]
         expected = np.concatenate([lo, hi], axis=-1)
         np.testing.assert_allclose(actual.reshape(n, n, 128), expected, atol=0.05, rtol=0.02)
+
+
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize("rotary", [128, 64])
+def test_rotary_prefill(tmp_path, trace, rotary):
+    """A prefill, x [1, heads, seq, 128] rotated position by position by caches
+    [1, 1, seq, half]: rotary_embedding's sequence mode, which streams one cache
+    tile per input tile. 65 positions take three tile rows, the last partly
+    filled, and six heads repeat them; with a partial rotary (Qwen3.5) the tail
+    is appended unchanged."""
+
+    half = rotary // 2
+
+    def prefill(x, cos, sin):
+        x1, x2 = x[..., :rotary][..., :half], x[..., :rotary][..., half:]
+        parts = [x1 * cos - x2 * sin, x2 * cos + x1 * sin] + ([x[..., rotary:]] if rotary < 128 else [])
+        return jnp.concatenate(parts, axis=-1)
+
+    run = jax.jit(
+        prefill,
+        compiler_options={
+            "optimization_level": "O1",
+            "enable_trace": str(trace).lower(),
+            "export_path": str(tmp_path),
+        },
+    )
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(29)
+    for step in range(3):  # Warmup, capture, and replay with changed inputs.
+        x = rng.normal(0, 1, (1, 6, 65, 128)).astype(jnp.bfloat16)
+        angles = rng.uniform(-3, 3, (1, 1, 65, half))
+        cos, sin = (f(angles).astype(jnp.bfloat16) for f in (np.cos, np.sin))
+        actual = np.asarray(run(*(jax.device_put(a, device) for a in (x, cos, sin)))).astype(np.float32)
+        if step == 0:
+            irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+            assert any("ttnn.rotary_embedding" in ir for ir in irs)
+        xf, c, s = (a.astype(np.float32) for a in (x, cos, sin))
+        x1, x2 = xf[..., :half], xf[..., half:rotary]
+        expected = np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s, xf[..., rotary:]], axis=-1)
+        np.testing.assert_allclose(actual, expected, atol=0.05, rtol=0.02)
