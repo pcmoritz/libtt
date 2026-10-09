@@ -1,0 +1,89 @@
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
+@@ -410,57 +410,48 @@ FORCE_INLINE void fill_tile_with_first_row(uint32_t l1_write_ptr) {
+     noc_async_read_barrier();
+ }
+ 
++// Fills faces 1 and 3 of a tile with faces 0 and 2, which the caller has written: two NoC reads.
++FORCE_INLINE void copy_left_faces_right(uint32_t l1_write_ptr, uint32_t face_bytes) {
++    // A baby-RISCV store can retire before its write lands in L1, and the RISC and the NoC reach
++    // L1 in no fixed order: read the last written word back before the NoC copies the faces.
++    (void)ckernel::load_blocking(reinterpret_cast<volatile uint32_t*>(l1_write_ptr + 3 * face_bytes - 4));
++    noc_async_read(get_noc_addr(l1_write_ptr), l1_write_ptr + face_bytes, face_bytes);
++    noc_async_read(get_noc_addr(l1_write_ptr + 2 * face_bytes), l1_write_ptr + 3 * face_bytes, face_bytes);
++    noc_async_read_barrier();
++}
++
+ // Reads the very first column of the CB and fills the entire tile with the same column.
+-// Tile is assumed to have 16-bit elements.
++// Tile is assumed to have 16-bit elements. A row of the tile is a row of faces 0 and 1 (rows 0 to
++// 15) or 2 and 3: the left faces' rows are filled from their first elements and copied right.
+ FORCE_INLINE void fill_tile_with_first_column_bfloat16(uint32_t l1_write_ptr) {
+-    // Here we have to account for the fact that a tile consists of 4 16x16 faces.
+-    // So we have to fill faces 0 and 1 with the first column of face 0, and faces 2 and 3
+-    // with the first column of face 2.
+     auto* ptr = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(l1_write_ptr);
+-
+-    constexpr uint32_t num_rows = 16;
+-
+-    // iterate over face pairs (0,1) and (2,3)
+-    for (uint32_t k = 0, face_offset = 0; k < 2; ++k, face_offset += 512) {
+-        for (uint32_t row = 0, row_offset = 0; row < num_rows; ++row, row_offset += 16) {
+-            uint32_t dst_offset = face_offset + row_offset;
+-            auto src_val = ptr[dst_offset];
+-
+-            ptr[dst_offset + 256] = src_val;  // first column of right face
+-            for (uint32_t col = 1; col < 16; ++col) {
+-                ptr[dst_offset + col] = src_val;        // left face
+-                ptr[dst_offset + col + 256] = src_val;  // right face
++    auto* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_write_ptr);
++    for (uint32_t face_offset = 0; face_offset < 1024; face_offset += 512) {
++        for (uint32_t row_offset = 0; row_offset < 256; row_offset += 16) {
++            const uint32_t first = ptr[face_offset + row_offset];
++            const uint32_t packed = (first << 16) | first;
++            const uint32_t word = (face_offset + row_offset) / 2;
++            for (uint32_t i = 0; i < 8; ++i) {
++                words[word + i] = packed;
+             }
+         }
+     }
++    copy_left_faces_right(l1_write_ptr, 256 * sizeof(uint16_t));
+ }
+ 
+ // Reads the very first column of the CB and fills the entire tile with the same column.
+-// Tile is assumed to have 32-bit elements (float32/int32).
++// Tile is assumed to have 32-bit elements (float32/int32), filled as the 16-bit case.
+ FORCE_INLINE void fill_tile_with_first_column(uint32_t l1_write_ptr) {
+-    // Tile with 4 faces (16x16) and 32-bit elements
+     auto* ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_write_ptr);
+-
+-    constexpr uint32_t num_rows = 16;             // Number of rows per face
+-    constexpr uint32_t face_row_stride = 16;      // Elements per row
+-    constexpr uint32_t face_size = 256;           // Total elements per face (16x16)
+-    constexpr uint32_t face_offset_stride = 512;  // Total elements per pair of faces (2x16x16)
+-
+-    // Iterate over face pairs (0,1) and (2,3)
+-    for (uint32_t k = 0, face_offset = 0; k < 2; ++k, face_offset += face_offset_stride) {
+-        for (uint32_t row = 0, row_offset = 0; row < num_rows; ++row, row_offset += face_row_stride) {
+-            uint32_t left_dst_offset = face_offset + row_offset;      // Left face (0 or 2)
+-            uint32_t right_dst_offset = left_dst_offset + face_size;  // Right face (1 or 3)
+-
+-            // Read the first column value for the current row from the left face
+-            auto src_val = ptr[left_dst_offset];
+-
+-            for (uint32_t col = 0; col < face_row_stride; ++col) {
+-                ptr[left_dst_offset + col] = src_val;   // left face
+-                ptr[right_dst_offset + col] = src_val;  // right face
++    for (uint32_t face_offset = 0; face_offset < 1024; face_offset += 512) {
++        for (uint32_t row_offset = 0; row_offset < 256; row_offset += 16) {
++            const uint32_t first = ptr[face_offset + row_offset];
++            for (uint32_t col = 1; col < 16; ++col) {
++                ptr[face_offset + row_offset + col] = first;
+             }
+         }
+     }
++    copy_left_faces_right(l1_write_ptr, 256 * sizeof(uint32_t));
+ }
+ 
+ // Row-major helpers for 32-bit elements (float32/int32/uint32).
