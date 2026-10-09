@@ -1,0 +1,124 @@
+diff --git tt_metal/hw/inc/internal/pch_compute.h tt_metal/hw/inc/internal/pch_compute.h
+new file mode 100644
+--- /dev/null
++++ tt_metal/hw/inc/internal/pch_compute.h
+@@ -0,0 +1,33 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++// Precompiled header for TRISC kernel compiles: the standard library plus the low-level LLK and
++// device headers every compute kernel includes. It is built with the target's own defines
++// (device and processor configuration) but none of a kernel's, so only headers that do not depend
++// on per-kernel macros, compile-time args or generated kernel headers may be listed here. GCC
++// rejects the PCH (and parses the headers as usual) if a kernel defines a macro they use
++// differently.
++
++#pragma once
++
++#include "internal/pch.h"
++
++#include "ckernel.h"
++#include "internal/debug/fw_debug.h"
++#include "llk_param_structs.h"
++#include "tools/profiler/kernel_profiler.hpp"
++#include "internal/debug/stack_usage.h"
++
++// The parts of internal/firmware_common.h that do not depend on the kernel. The header itself
++// cannot be precompiled: it includes api/compile_time_args.h (KERNEL_COMPILE_TIME_ARGS) and the
++// dataflow API (generated chlkc_descriptors.h, per-kernel NOC_INDEX).
++#include "ckernel_globals.h"
++#include "internal/tensix_functions.h"
++#include "internal/risc_attribs.h"
++#include "dev_mem_map.h"
++#include "hostdevcommon/kernel_structs.h"
++#include "hostdev/rta_constants.h"
++#include "hostdev/dev_msgs.h"
++#include "noc/noc_parameters.h"
++#include "api/debug/dprint.h"
+diff --git tt_metal/hw/inc/internal/pch_dataflow.h tt_metal/hw/inc/internal/pch_dataflow.h
+new file mode 100644
+--- /dev/null
++++ tt_metal/hw/inc/internal/pch_dataflow.h
+@@ -0,0 +1,34 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++// Precompiled header for BRISC/NCRISC kernel compiles: the standard library plus the low-level
++// device headers every data-movement kernel includes. It is built with the target's own defines
++// (device and processor configuration) but none of a kernel's, so only headers that do not depend
++// on per-kernel macros, compile-time args or generated kernel headers may be listed here. GCC
++// rejects the PCH (and parses the headers as usual) if a kernel defines a macro they use
++// differently.
++
++#pragma once
++
++#include "internal/pch.h"
++
++#include "risc_common.h"
++#include "noc.h"
++#include "ckernel_structs.h"
++#include "c_tensix_core.h"
++#include "tools/profiler/noc_debugging_profiler.hpp"
++#include "internal/debug/stack_usage.h"
++
++// The parts of internal/firmware_common.h that do not depend on the kernel. The header itself
++// cannot be precompiled: it includes api/compile_time_args.h (KERNEL_COMPILE_TIME_ARGS) and the
++// dataflow API (generated chlkc_descriptors.h, per-kernel NOC_INDEX).
++#include "ckernel_globals.h"
++#include "internal/tensix_functions.h"
++#include "internal/risc_attribs.h"
++#include "dev_mem_map.h"
++#include "hostdevcommon/kernel_structs.h"
++#include "hostdev/rta_constants.h"
++#include "hostdev/dev_msgs.h"
++#include "noc/noc_parameters.h"
++#include "api/debug/dprint.h"
+diff --git tt_metal/jit_build/build.cpp tt_metal/jit_build/build.cpp
+--- tt_metal/jit_build/build.cpp
++++ tt_metal/jit_build/build.cpp
+@@ -759,12 +759,37 @@ void JitBuildState::compile_one(const string& out_dir, const JitBuildSettings* s
+ 
+     // Add the machine-local PCH here so exported recipes remain portable.
+     // Exclude build-map dump flags from the PCH profile.
+-    const std::string pch = tt::jit_build::ensure_pch(
+-        env_.gpp_,
+-        recipe.compiler_opt_level,
+-        recipe.cflags,
+-        recipe.pch_umbrella,
+-        fs::path(env_.out_root_) / "pch");
++    //
++    // Kernel builds first try a per-processor PCH that also holds the low-level device headers
++    // every kernel of that processor includes. It is built with this target's defines and
++    // include paths (device and processor configuration) but none of the kernel's own defines
++    // or include paths, so one artifact serves every kernel of the target. Fall back to the standard-library PCH
++    // if it cannot be built (e.g. on an architecture whose headers it does not cover).
++    std::string pch;
++    if (!is_fw_) {
++        const char* project_umbrella = nullptr;
++        if (target_name_ == "brisc" || target_name_ == "ncrisc") {
++            project_umbrella = "tt_metal/hw/inc/internal/pch_dataflow.h";
++        } else if (target_name_.starts_with("trisc")) {
++            project_umbrella = "tt_metal/hw/inc/internal/pch_compute.h";
++        }
++        if (project_umbrella != nullptr) {
++            pch = tt::jit_build::ensure_pch(
++                env_.gpp_,
++                recipe.compiler_opt_level,
++                fmt::format("{} {} {}", recipe.cflags, defines_, includes_),
++                fs::path(env_.root_) / project_umbrella,
++                fs::path(env_.out_root_) / "pch");
++        }
++    }
++    if (pch.empty()) {
++        pch = tt::jit_build::ensure_pch(
++            env_.gpp_,
++            recipe.compiler_opt_level,
++            recipe.cflags,
++            recipe.pch_umbrella,
++            fs::path(env_.out_root_) / "pch");
++    }
+ 
+     // Preserve the recipe's defines for watcher logging.
+     std::vector<std::string> defines = recipe.defines;
