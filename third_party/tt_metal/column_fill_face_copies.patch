@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
-@@ -410,57 +410,48 @@ FORCE_INLINE void fill_tile_with_first_row(uint32_t l1_write_ptr) {
+@@ -410,57 +410,50 @@ FORCE_INLINE void fill_tile_with_first_row(uint32_t l1_write_ptr) {
      noc_async_read_barrier();
  }
  
@@ -43,6 +43,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fi
 +            const uint32_t first = ptr[face_offset + row_offset];
 +            const uint32_t packed = (first << 16) | first;
 +            const uint32_t word = (face_offset + row_offset) / 2;
++#pragma GCC unroll 8
 +            for (uint32_t i = 0; i < 8; ++i) {
 +                words[word + i] = packed;
              }
@@ -78,6 +79,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fi
 +    for (uint32_t face_offset = 0; face_offset < 1024; face_offset += 512) {
 +        for (uint32_t row_offset = 0; row_offset < 256; row_offset += 16) {
 +            const uint32_t first = ptr[face_offset + row_offset];
++#pragma GCC unroll 15
 +            for (uint32_t col = 1; col < 16; ++col) {
 +                ptr[face_offset + row_offset + col] = first;
              }
