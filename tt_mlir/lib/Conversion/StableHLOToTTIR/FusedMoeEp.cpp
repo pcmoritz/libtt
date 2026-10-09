@@ -23,10 +23,9 @@
 // runs only the (token, expert) pairs of the experts its device owns and
 // writes each pair's output unweighted. This lowering chunks the tokens, builds
 // the expert-to-device mapping, and sums each token's slots with its weights in
-// one matmul accumulated in FP32; the kernel reads the ids and weights as they
-// are and skips padding's negative ids. The frontend
-// attribute `rings` (default 3) sets how many matmul rings run a device's
-// experts side by side.
+// one matmul accumulated in FP32; the kernel reads the ids as they are and
+// skips padding's negative ids. The frontend attribute `rings` (default 3)
+// sets how many matmul rings run a device's experts side by side.
 
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
@@ -39,15 +38,13 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <numeric>
 
 namespace mlir::tt {
 namespace {
 
 constexpr int64_t kMaxTokensPerCall = 512;
 constexpr uint32_t kDefaultRings = 3;
-// Up to this many tokens per call, the combine's placement matrix comes from
-// [t, k * t] constants (64 KiB per 8 slots at 64 tokens).
-constexpr int64_t kMaxTokensForConstantPlacement = 64;
 
 class FusedMoeEpConversionPattern
     : public OpConversionPattern<stablehlo::CustomCallOp> {
@@ -155,8 +152,7 @@ public:
     // where it skips them), activations in BF16, and the experts with a
     // leading layer dimension. Its local output reads no scores: the weights
     // only fill the operand.
-    Value kernelIds = ids;
-    Value kernelX = reshape(castTo(x, bf16), {1, tokens, hidden});
+    Value kernelX = castTo(x, bf16);
     auto withLayer = [&](Value w) {
       auto shape = cast<RankedTensorType>(w.getType()).getShape();
       return reshape(w, {1, shape[0], shape[1], shape[2]});
@@ -178,79 +174,58 @@ public:
 
     auto activation = ttcore::MoEActivationFunctionAttr::get(
         ctx, ttcore::MoEActivationFunction::Silu);
+    // A 0/1 matrix, 1 where row r's index rows[r] equals column c's cols[c]:
+    // only the two index vectors are constants, and the comparison runs once,
+    // when the program loads.
+    auto mask = [&](ArrayRef<float> rows, ArrayRef<float> cols) -> Value {
+      auto vector = [&](ArrayRef<int64_t> shape, ArrayRef<float> values) {
+        auto type = RankedTensorType::get(shape, f32);
+        return rewriter.create<ttir::ConstantOp>(
+            loc, type, DenseElementsAttr::get(type, values));
+      };
+      const int64_t m = rows.size(), n = cols.size();
+      return rewriter.create<ttir::EqualOp>(
+          loc, RankedTensorType::get({m, n}, f32), vector({m, 1}, rows),
+          vector({1, n}, cols));
+    };
     SmallVector<Value> outputs;
     for (int64_t begin = 0; begin < tokens; begin += kMaxTokensPerCall) {
       const int64_t end = std::min(tokens, begin + kMaxTokensPerCall);
       const int64_t t = end - begin;
-      Value chunkX = kernelX;
-      if (begin != 0 || end != tokens) {
-        chunkX = rewriter.create<ttir::SliceStaticOp>(
-            loc, typed(kernelX, {1, t, hidden}, bf16), kernelX,
-            rewriter.getI32ArrayAttr({0, static_cast<int32_t>(begin), 0}),
-            rewriter.getI32ArrayAttr(
-                {1, static_cast<int32_t>(end), static_cast<int32_t>(hidden)}),
-            rewriter.getI32ArrayAttr({1, 1, 1}));
-      }
       // Row j * t + i holds token i's j-th expert output, unweighted.
       Value slots = rewriter.create<ttir::MoeComputeOp>(
-          loc, typed(kernelX, {k * t, hidden}, bf16), chunkX,
-          rows(kernelIds, begin, end), rows(weights, begin, end), mapping,
-          kernelW1, kernelW3, kernelW2, /*bias_0=*/Value(), /*bias_1=*/Value(),
+          loc, typed(kernelX, {k * t, hidden}, bf16),
+          reshape(rows(kernelX, begin, end), {1, t, hidden}),
+          rows(ids, begin, end), rows(weights, begin, end), mapping, kernelW1,
+          kernelW3, kernelW2, /*bias_0=*/Value(), /*bias_1=*/Value(),
           /*bias_2=*/Value(), rewriter.getUI32IntegerAttr(0),
           rewriter.getUI32IntegerAttr(4),
           rewriter.getUI32IntegerAttr(intermediate), activation,
           /*cluster_axis=*/IntegerAttr(), rewriter.getUI32IntegerAttr(rings));
 
       // Each token's weighted sum of its slots as one matmul in FP32: row i
-      // of the placement matrix holds token i's weights at its slots' rows,
-      // weight j at column j * t + i.
+      // of the placement matrix holds token i's weight j at column j * t + i,
+      // its weights spread over t columns each and masked to its own column.
+      // One token's slots are rows 0 to k - 1: its weights as they are.
       Value chunkWeights = castTo(rows(weights, begin, end), f32);
-      Value placement;
-      if (t == 1) {
-        // One token's slots are rows 0 to k - 1: its weights as they are.
-        placement = chunkWeights;
-      } else if (t <= kMaxTokensForConstantPlacement) {
-        // Spread each weight over its slot's t columns with a 0/1 matmul and
-        // keep the token's own column with a 0/1 mask: no reshapes, which
-        // cost more than these small matmul and multiply.
-        SmallVector<float> spread(k * k * t, 0.0f), own(t * k * t, 0.0f);
-        for (int64_t j = 0; j < k; ++j) {
-          for (int64_t i = 0; i < t; ++i) {
-            spread[j * k * t + j * t + i] = 1.0f;
-            own[i * k * t + j * t + i] = 1.0f;
-          }
+      Value placement = chunkWeights;
+      if (t > 1) {
+        // Column j * t + i is slot j of token i.
+        SmallVector<float> slot(k), token(t), slotOf(k * t), tokenOf(k * t);
+        std::iota(slot.begin(), slot.end(), 0.0f);
+        std::iota(token.begin(), token.end(), 0.0f);
+        for (int64_t c = 0; c < k * t; ++c) {
+          slotOf[c] = c / t;
+          tokenOf[c] = c % t;
         }
-        auto constant = [&](ArrayRef<int64_t> shape, ArrayRef<float> values) {
-          auto type = RankedTensorType::get(shape, f32);
-          return rewriter.create<ttir::ConstantOp>(
-              loc, type, DenseElementsAttr::get(type, values));
-        };
-        Value spreadWeights = rewriter.create<ttir::MatmulOp>(
-            loc, typed(chunkWeights, {t, k * t}, f32), chunkWeights,
-            constant({k, k * t}, spread));
+        Value spread = mask(slot, slotOf);
+        Value own = mask(token, tokenOf);
+        auto placementType = typed(chunkWeights, {t, k * t}, f32);
         placement = rewriter.create<ttir::MultiplyOp>(
-            loc, typed(chunkWeights, {t, k * t}, f32), spreadWeights,
-            constant({t, k * t}, own));
-      } else {
-        SmallVector<float> eye(t * t, 0.0f);
-        for (int64_t i = 0; i < t; ++i) {
-          eye[i * t + i] = 1.0f;
-        }
-        auto eyeType = RankedTensorType::get({t, 1, t}, f32);
-        placement = reshape(
-            rewriter.create<ttir::MultiplyOp>(
-                loc, typed(chunkWeights, {t, k, t}, f32),
-                rewriter.create<ttir::BroadcastOp>(
-                    loc, typed(chunkWeights, {t, k, t}, f32),
-                    reshape(chunkWeights, {t, k, 1}),
-                    rewriter.getDenseI64ArrayAttr({1, 1, t})),
-                rewriter.create<ttir::BroadcastOp>(
-                    loc, typed(chunkWeights, {t, k, t}, f32),
-                    rewriter.create<ttir::ConstantOp>(
-                        loc, eyeType,
-                        DenseElementsAttr::get(eyeType, ArrayRef<float>(eye))),
-                    rewriter.getDenseI64ArrayAttr({1, k, 1}))),
-            {t, k * t});
+            loc, placementType,
+            rewriter.create<ttir::MatmulOp>(loc, placementType, chunkWeights,
+                                            spread),
+            own);
       }
       // The matmul accumulates in FP32 and writes the output's type.
       outputs.push_back(rewriter.create<ttir::MatmulOp>(
