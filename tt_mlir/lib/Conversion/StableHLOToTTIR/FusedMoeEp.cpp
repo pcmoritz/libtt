@@ -22,7 +22,7 @@
 // The kernel stores the experts in BFP4, takes up to 512 tokens per call,
 // runs only the (token, expert) pairs of the experts its device owns and
 // writes each pair's output unweighted. This lowering chunks the tokens, builds
-// the expert-to-device mapping, gives padding an expert id no device owns, and
+// the expert-to-device mapping, gives padding an expert id past the experts, and
 // sums each token's slots with its weights in one FP32 matmul. The frontend
 // attribute `rings` (default 3) sets how many matmul rings run a device's
 // experts side by side.
@@ -149,19 +149,15 @@ public:
           rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
     };
 
-    // The kernel's operands: indices as uint16 with padding at expert id E,
-    // which no device owns, scores and activations in BF16, and the experts
-    // with a leading layer dimension.
-    Value padding = rewriter.create<ttir::LessThanOp>(
+    // The kernel's operands: indices as uint16, their low 16 bits (TTNN's
+    // typecast saturates), so that padding's negative ids land past the
+    // experts, where the kernel skips them; scores and activations in BF16, and
+    // the experts with a leading layer dimension.
+    Value lowBits = rewriter.create<ttir::BitwiseAndOp>(
         loc, idsType, ids,
         rewriter.create<ttir::FullOp>(loc, idsType,
-                                      rewriter.getI32IntegerAttr(0)));
-    Value validIds = rewriter.create<ttir::WhereOp>(
-        loc, idsType, padding,
-        rewriter.create<ttir::FullOp>(
-            loc, idsType, rewriter.getI32IntegerAttr(experts)),
-        ids);
-    Value kernelIds = castTo(validIds, u16);
+                                      rewriter.getI32IntegerAttr(0xFFFF)));
+    Value kernelIds = castTo(lowBits, u16);
     Value kernelScores = castTo(weights, bf16);
     Value kernelX = reshape(castTo(x, bf16), {1, tokens, hidden});
     auto withLayer = [&](Value w) {
@@ -172,16 +168,14 @@ public:
     Value kernelW3 = withLayer(w3);
     Value kernelW2 = withLayer(w2);
 
-    // Every device's row of the mapping gives each expert's device; padding's
-    // id E belongs to none.
+    // Every device's row of the mapping gives each expert's device.
     SmallVector<APInt> owners;
     for (int64_t d = 0; d < devices; ++d) {
       for (int64_t e = 0; e < experts; ++e) {
         owners.push_back(APInt(16, e / localExperts));
       }
-      owners.push_back(APInt(16, devices));
     }
-    auto mappingType = RankedTensorType::get({devices, experts + 1}, u16);
+    auto mappingType = RankedTensorType::get({devices, experts}, u16);
     Value mapping = rewriter.create<ttir::ConstantOp>(
         loc, mappingType, DenseElementsAttr::get(mappingType, owners));
 

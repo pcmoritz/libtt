@@ -1,0 +1,30 @@
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_reader.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_reader.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_reader.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_reader.cpp
+@@ -621,6 +621,11 @@ void kernel_main() {
+         for (uint32_t k = 0; k < selected_experts_k; k++) {
+             const uint16_t selected_expert = token_indices[k];
+ 
++            // An id past the experts (such as a padding token's) selects no expert.
++            if (selected_expert >= experts) {
++                continue;
++            }
++
+             // Check if this expert maps to our device first (likely to fail, skip early)
+             if (source_device_mapping[selected_expert] != linearized_mesh_coord) {
+                 continue;
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_writer.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_writer.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_writer.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_writer.cpp
+@@ -385,6 +385,11 @@ void kernel_main() {
+         for (uint32_t k = 0; k < selected_experts_k; k++) {
+             const uint16_t selected_expert = token_indices[k];
+ 
++            // An id past the experts (such as a padding token's) selects no expert.
++            if (selected_expert >= experts) {
++                continue;
++            }
++
+             // Check if this expert maps to our device first
+             if (source_device_mapping[selected_expert] != linearized_mesh_coord) {
+                 continue;
