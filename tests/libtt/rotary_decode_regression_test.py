@@ -134,13 +134,14 @@ def test_partial_rotary_rank4(tmp_path, trace, heads):
 
 
 @pytest.mark.parametrize("trace", [False, True])
-@pytest.mark.parametrize("tokens,heads", [(3, 1), (8, 8), (32, 6)])
+@pytest.mark.parametrize("tokens,heads", [(3, 1), (8, 8), (32, 6), (33, 6)])
 @pytest.mark.parametrize("rotary", [128, 64])
 def test_rotary_batched_decode(tmp_path, trace, tokens, heads, rotary):
     """A decode batch, each token at its own position: x [tokens, heads, 128]
     rotated by its token's cos and sin row, then reshaped to
     [1, tokens, heads, 128] for attention. It becomes one fused rotary over the
-    tokens; with a partial rotary (Qwen3.5) the tail is appended unchanged."""
+    tokens; with a partial rotary (Qwen3.5) the tail is appended unchanged.
+    33 tokens span two cache tiles, the second partly filled."""
 
     half = rotary // 2
 
@@ -173,3 +174,44 @@ def test_rotary_batched_decode(tmp_path, trace, tokens, heads, rotary):
         c, s = c[:, None, :], s[:, None, :]
         expected = np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s, xf[..., rotary:]], axis=-1)
         np.testing.assert_allclose(actual.reshape(tokens, heads, 128), expected, atol=0.05, rtol=0.02)
+
+
+@pytest.mark.parametrize("trace", [False, True])
+def test_rotary_decode_mixed_cache_broadcasts(tmp_path, trace):
+    """With tokens == heads, a cache broadcast per token in one rotation half
+    and per head in the other has the same shapes as the batched decode
+    rotary but is not a rotary: it must not be fused, and is computed as
+    written."""
+
+    n = 8
+
+    def decode(x, cos, sin):
+        x1, x2 = x[..., :64], x[..., 64:]
+        lo = x1 * cos[:, None, :] - x2 * sin[:, None, :]
+        hi = x2 * cos[None, :, :] + x1 * sin[:, None, :]
+        return jnp.concatenate([lo, hi], axis=-1).reshape(1, n, n, 128)
+
+    run = jax.jit(
+        decode,
+        compiler_options={
+            "optimization_level": "O1",
+            "enable_trace": str(trace).lower(),
+            "export_path": str(tmp_path),
+        },
+    )
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(19)
+    for step in range(3):  # Warmup, capture, and replay with changed inputs.
+        x = rng.normal(0, 1, (n, n, 128)).astype(jnp.bfloat16)
+        angles = rng.uniform(-3, 3, (n, 64))
+        cos, sin = (f(angles).astype(jnp.bfloat16) for f in (np.cos, np.sin))
+        actual = np.asarray(run(*(jax.device_put(a, device) for a in (x, cos, sin)))).astype(np.float32)
+        if step == 0:
+            irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+            assert not any("ttnn.rotary_embedding" in ir for ir in irs)
+        xf, c, s = (a.astype(np.float32) for a in (x, cos, sin))
+        x1, x2 = xf[..., :64], xf[..., 64:]
+        lo = x1 * c[:, None, :] - x2 * s[:, None, :]
+        hi = x2 * c[None, :, :] + x1 * s[:, None, :]
+        expected = np.concatenate([lo, hi], axis=-1)
+        np.testing.assert_allclose(actual.reshape(n, n, 128), expected, atol=0.05, rtol=0.02)
