@@ -36,7 +36,7 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
  
    registry.insert<mlir::arith::ArithDialect>();
    registry.insert<mlir::func::FuncDialect>();
-@@ -304,15 +303,29 @@ ModuleBuilder::ModuleBuilder()
+@@ -304,15 +303,32 @@ ModuleBuilder::ModuleBuilder()
    mlir::func::registerAllExtensions(registry);
    mlir::tt::registerAllExtensions(registry);
  
@@ -47,9 +47,12 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 +  return registry;
 +}
  
++// Like XLA's per-compile contexts, run single-threaded: with threading enabled,
++// every type and attribute uniquing takes a lock, which costs more than the
++// pass parallelism gains on typical programs (13.8 -> 11.4 ms per compile).
 +static std::unique_ptr<mlir::MLIRContext> createMlirContext() {
-+  auto context =
-+      std::make_unique<mlir::MLIRContext>(getDialectRegistry());
++  auto context = std::make_unique<mlir::MLIRContext>(
++      getDialectRegistry(), mlir::MLIRContext::Threading::DISABLED);
    // We need to allow unregistered dialects since shardy uses specific mhlo
    // dialect attributes, which are not registered in the context and live in the
    // openXLA repository. See issue:
@@ -70,7 +73,7 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
  
    // Try to load tt-alchemist library and function pointers.
    m_tt_alchemist_handler.initialize();
-@@ -326,6 +339,8 @@ ModuleBuilder::buildModule(
+@@ -326,6 +342,8 @@ ModuleBuilder::buildModule(
      ClientInstance *client_instance, size_t target_num_devices) {
    DLOG_F(LOG_DEBUG, "ModuleBuilder::buildModule");
  
@@ -79,7 +82,7 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
    auto compile_options = CompileOptions::parse(compile_options_map);
  
    // IR export keys dump filenames by export_model_name and appends _g{N} (e.g.
-@@ -362,7 +377,8 @@ ModuleBuilder::buildModule(
+@@ -362,7 +380,8 @@ ModuleBuilder::buildModule(
  
    tt_pjrt_status status;
    mlir::OwningOpRef<mlir::ModuleOp> mlir_module;
@@ -89,7 +92,7 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
                              compile_options.export_model_name);
    if (!tt_pjrt_status_is_ok(status)) {
      return {status, nullptr};
-@@ -527,12 +543,13 @@ ModuleBuilder::buildModule(
+@@ -527,12 +546,13 @@ ModuleBuilder::buildModule(
  
  tt_pjrt_status
  ModuleBuilder::createVHLOModule(const std::string_view &mlir_code,
