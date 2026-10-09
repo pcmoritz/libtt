@@ -1,17 +1,16 @@
 diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_device_operation.cpp
-@@ -49,10 +49,21 @@ void RotaryEmbeddingDeviceOperation::validate_on_program_cache_miss(
+@@ -49,10 +49,20 @@ void RotaryEmbeddingDeviceOperation::validate_on_program_cache_miss(
      // interaction is resolved.
      TT_FATAL(cos.dtype() == sin.dtype(), "Cos and Sin dtypes must match");
      TT_FATAL(cos.padded_shape() == sin.padded_shape(), "Cos and Sin dims must match");
 +    // Batched decode (see rotary_embedding): caches [1, B, 1, X] for input [1, B, H, X].
 +    const bool batched = !args.token_idx.has_value() && cos.padded_shape()[1] > 1;
++    const uint32_t expected_cache_batch = batched ? input_tensor.padded_shape()[1] : 1;
      TT_FATAL(
 -        cos.padded_shape()[0] == 1 && cos.padded_shape()[1] == 1 && cos.padded_shape()[-1] == X,
-+        cos.padded_shape()[0] == 1 &&
-+            (cos.padded_shape()[1] == 1 || cos.padded_shape()[1] == input_tensor.padded_shape()[1]) &&
-+            cos.padded_shape()[-1] == X,
++        cos.padded_shape()[0] == 1 && cos.padded_shape()[1] == expected_cache_batch && cos.padded_shape()[-1] == X,
          "Cos dims must match input dims");
 -    if (args.token_idx.has_value()) {
 +    if (batched) {
@@ -25,7 +24,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/de
          TT_FATAL(cos.padded_shape()[-2] >= args.token_idx.value(), "Cos dims must match input dims");
      } else {
          TT_FATAL(cos.padded_shape()[-2] >= seq_len, "Cos dims must match input dims");
-@@ -100,7 +111,8 @@ tt::tt_metal::TensorSpec RotaryEmbeddingDeviceOperation::compute_output_specs(
+@@ -100,7 +110,8 @@ tt::tt_metal::TensorSpec RotaryEmbeddingDeviceOperation::compute_output_specs(
      const operation_attributes_t& args, const tensor_args_t& tensor_args) {
      const auto& input_tensor = tensor_args.input;
      auto shape = input_tensor.logical_shape();
@@ -38,26 +37,25 @@ diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/de
 diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/rotary_embedding.cpp ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/rotary_embedding.cpp
 --- ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/rotary_embedding.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/rotary_embedding.cpp
-@@ -38,9 +38,16 @@ ttnn::Tensor rotary_embedding(
+@@ -38,9 +38,15 @@ ttnn::Tensor rotary_embedding(
          cos_cache.padded_shape(),
          sin_cache.padded_shape());
  
 +    // Batched decode: input [1, B, H, X] with one cos and sin row per batch entry, caches [1, B, 1, X]:
 +    // batch entry b is rotated by row b, as each token of a decode batch is at its own position.
 +    const bool batched = !token_index.has_value() && cos_cache.padded_shape()[1] > 1;
++    const uint32_t expected_cache_batch = batched ? input_tensor.padded_shape()[1] : 1;
      TT_FATAL(
 -        cos_cache.padded_shape()[0] == 1 && cos_cache.padded_shape()[1] == 1 && cos_cache.padded_shape()[-1] == X,
 -        "Cosine cache dimensions must match input dimensions. Expected (1, 1, {}), but got {}.",
-+        cos_cache.padded_shape()[0] == 1 &&
-+            (cos_cache.padded_shape()[1] == 1 || cos_cache.padded_shape()[1] == input_tensor.padded_shape()[1]) &&
++        cos_cache.padded_shape()[0] == 1 && cos_cache.padded_shape()[1] == expected_cache_batch &&
 +            cos_cache.padded_shape()[-1] == X,
-+        "Cosine cache dimensions must match input dimensions. Expected (1, 1, {}) or (1, {}, 1, {}), but got {}.",
-+        X,
-+        input_tensor.padded_shape()[1],
++        "Cosine cache dimensions must match input dimensions. Expected (1, {}, *, {}), but got {}.",
++        expected_cache_batch,
          X,
          cos_cache.padded_shape());
  
-@@ -57,6 +64,13 @@ ttnn::Tensor rotary_embedding(
+@@ -57,6 +63,13 @@ ttnn::Tensor rotary_embedding(
              "Cosine cache must cover the token index. Token index: {}, Cos cache sequence length: {}.",
              token_index.value(),
              cos_seq_len);
@@ -74,84 +72,92 @@ diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/ro
 diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/compute/rotary_embedding.cpp ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/compute/rotary_embedding.cpp
 --- ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/compute/rotary_embedding.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/compute/rotary_embedding.cpp
-@@ -109,6 +109,11 @@ void kernel_main() {
-     constexpr uint32_t updated_sin_cb = sin_cb;
- #endif
-     for (uint32_t i = 0; i < num_rows; ++i) {
+@@ -35,8 +35,15 @@ ALWI void mul_tiles_chain(uint32_t in1_idx) {
+             PackTile<output(out_cb, ReservePolicy::PerTile, PushPolicy::PerTile, DataFormatReconfig::Disabled)>{});
+     } else {
+         (void)in1_idx;
 +#ifdef BATCHED_DECODE
-+        // The row's batch entry's cos and sin tiles, used for the whole row.
-+        CircularBuffer(updated_cos_cb).wait_front(Wt);
-+        CircularBuffer(updated_sin_cb).wait_front(Wt);
++        // Batched decode streams one cache tile per input tile, whose first row is the batch entry's.
++        constexpr auto cache = input(
++            in1_cb, BroadcastDim::Row, WaitPolicy::PerTile, PopPolicy::PerTile, DataFormatReconfig::Disabled);
++#else
++        constexpr auto cache = input(in1_cb, WaitPolicy::PerTile, PopPolicy::PerTile, DataFormatReconfig::Disabled);
 +#endif
-         for (uint32_t j = 0; j < Wt; ++j) {
-             const uint32_t in1_idx = kDecodeMode ? j : 0;
-             if (j < half_Wt) {
-@@ -142,5 +147,9 @@ void kernel_main() {
-                 compute_kernel_lib::input(sin_interm_cb),
-                 compute_kernel_lib::output(out_cb)>(compute_kernel_lib::IterationShape::tiles(onetile));
-         }
-+#ifdef BATCHED_DECODE
-+        CircularBuffer(updated_cos_cb).pop_front(Wt);
-+        CircularBuffer(updated_sin_cb).pop_front(Wt);
-+#endif
+         mul<input(in0_cb, WaitPolicy::PerTile, PopPolicy::PerTile, DataFormatReconfig::Disabled),
+-            input(in1_cb, WaitPolicy::PerTile, PopPolicy::PerTile, DataFormatReconfig::Disabled),
++            cache,
+             output(out_cb, ReservePolicy::PerTile, PushPolicy::PerTile, DataFormatReconfig::Disabled)>(
+             IterationShape::one_tile());
      }
- }
 diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/dataflow/reader_rotary_embedding_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/dataflow/reader_rotary_embedding_interleaved_start_id.cpp
 --- ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/dataflow/reader_rotary_embedding_interleaved_start_id.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/dataflow/reader_rotary_embedding_interleaved_start_id.cpp
-@@ -83,6 +83,24 @@ void kernel_main() {
- 
+@@ -84,41 +84,32 @@ void kernel_main() {
      // read a ublock of tiles from src to CB, and then push the ublock to unpacker
      for (uint32_t i = 0; i < num_rows; ++i) {
-+#ifdef BATCHED_DECODE
-+        // The row's batch entry: its Wt cos and sin tiles, whose first row is broadcast over the row.
-+        cb_sin.reserve_back(Wt);
-+        cb_cos.reserve_back(Wt);
-+        uint32_t sin_l1_write_addr = cb_sin.get_write_ptr();
-+        uint32_t cos_l1_write_addr = cb_cos.get_write_ptr();
-+        for (uint32_t j = 0; j < Wt; j++) {
-+            noc.async_read(
-+                s2, CoreLocalMem<uint32_t>(sin_l1_write_addr), sin_tile_bytes, {.page_id = cos_sin_curr_id + j}, {});
-+            noc.async_read(
-+                s1, CoreLocalMem<uint32_t>(cos_l1_write_addr), cos_tile_bytes, {.page_id = cos_sin_curr_id + j}, {});
-+            sin_l1_write_addr += sin_tile_bytes;
-+            cos_l1_write_addr += cos_tile_bytes;
-+        }
-+        noc.async_read_barrier();
-+        cb_sin.push_back(Wt);
-+        cb_cos.push_back(Wt);
-+#endif
          for (uint32_t j = 0; j < Wt; ++j) {
++            // The tile's reads (rotated input, input and, streamed, its sin and cos tiles) share one barrier.
              cb_rotated_input.reserve_back(onetile);
-             uint32_t rotated_input_l1_write_addr = cb_rotated_input.get_write_ptr();
-@@ -96,7 +114,7 @@ void kernel_main() {
-             cb_rotated_input.push_back(onetile);
-             rotated_input_curr_id++;
- 
--#ifndef DECODE_MODE
-+#if !defined(DECODE_MODE) && !defined(BATCHED_DECODE)
+-            uint32_t rotated_input_l1_write_addr = cb_rotated_input.get_write_ptr();
++            cb_input.reserve_back(onetile);
+             noc.async_read(
+                 s0,
+-                CoreLocalMem<uint32_t>(rotated_input_l1_write_addr),
++                CoreLocalMem<uint32_t>(cb_rotated_input.get_write_ptr()),
+                 input_tile_bytes,
+                 {.page_id = rotated_input_curr_id},
+                 {});
+-            noc.async_read_barrier();
+-            cb_rotated_input.push_back(onetile);
+-            rotated_input_curr_id++;
+-
++            noc.async_read(
++                s0, CoreLocalMem<uint32_t>(cb_input.get_write_ptr()), input_tile_bytes, {.page_id = input_curr_id}, {});
+ #ifndef DECODE_MODE
              cb_sin.reserve_back(onetile);
-             uint32_t sin_l1_write_addr = cb_sin.get_write_ptr();
+-            uint32_t sin_l1_write_addr = cb_sin.get_write_ptr();
++            cb_cos.reserve_back(onetile);
              noc.async_read(
-@@ -113,7 +131,7 @@ void kernel_main() {
+-                s2, CoreLocalMem<uint32_t>(sin_l1_write_addr), sin_tile_bytes, {.page_id = cos_sin_curr_id}, {});
+-            noc.async_read_barrier();
+-            cb_sin.push_back(onetile);
+-#endif
+-
+-            cb_input.reserve_back(onetile);
+-            uint32_t input_l1_write_addr = cb_input.get_write_ptr();
++                s2, CoreLocalMem<uint32_t>(cb_sin.get_write_ptr()), sin_tile_bytes, {.page_id = cos_sin_curr_id}, {});
+             noc.async_read(
+-                s0, CoreLocalMem<uint32_t>(input_l1_write_addr), input_tile_bytes, {.page_id = input_curr_id}, {});
++                s1, CoreLocalMem<uint32_t>(cb_cos.get_write_ptr()), cos_tile_bytes, {.page_id = cos_sin_curr_id}, {});
++#endif
+             noc.async_read_barrier();
++            cb_rotated_input.push_back(onetile);
              cb_input.push_back(onetile);
++            rotated_input_curr_id++;
              input_curr_id++;
- 
--#ifndef DECODE_MODE
-+#if !defined(DECODE_MODE) && !defined(BATCHED_DECODE)
-             cb_cos.reserve_back(onetile);
-             uint32_t cos_l1_write_addr = cb_cos.get_write_ptr();
-             noc.async_read(
-@@ -128,7 +146,13 @@ void kernel_main() {
+-
+ #ifndef DECODE_MODE
+-            cb_cos.reserve_back(onetile);
+-            uint32_t cos_l1_write_addr = cb_cos.get_write_ptr();
+-            noc.async_read(
+-                s1, CoreLocalMem<uint32_t>(cos_l1_write_addr), cos_tile_bytes, {.page_id = cos_sin_curr_id}, {});
+-            noc.async_read_barrier();
++            cb_sin.push_back(onetile);
+             cb_cos.push_back(onetile);
+             cos_sin_curr_id++;
+ #endif
+@@ -128,7 +119,15 @@ void kernel_main() {
              }
          }
          rotated_input_curr_id += Wt;
 -#ifndef DECODE_MODE
 +#ifdef BATCHED_DECODE
++        // The cache tiles of the next batch entry follow; another tile row of the same entry reads its tiles again.
 +        ht++;
 +        if (ht == Ht) {
 +            ht = 0;
-+            cos_sin_curr_id += Wt;
++        } else {
++            cos_sin_curr_id -= Wt;
 +        }
 +#elif !defined(DECODE_MODE)
          ht++;
@@ -160,17 +166,18 @@ diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/de
 diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_program_factory.cpp
-@@ -485,6 +485,9 @@ ProgramDescriptor create_multi_tile_descriptor(
+@@ -485,6 +485,10 @@ ProgramDescriptor create_multi_tile_descriptor(
      const auto& sin = tensor_args.sin;
      auto& output = tensor_return_value;
      const auto& token_idx = operation_attributes.token_idx;
-+    // Batched decode: caches [1, B, 1, X], one row per batch entry of input [1, B, H, X]. Each input tile row
-+    // reads its batch entry's Wt cos and sin tiles, whose first row the compute kernel broadcasts.
++    // Batched decode: caches [1, B, 1, X], one row per batch entry of input [1, B, H, X]. As in the sequence mode,
++    // the reader streams one cache tile per input tile, its batch entry's, whose first row the compute kernel
++    // broadcasts.
 +    const bool batched = !token_idx.has_value() && cos.padded_shape()[1] > 1;
  
      tt::DataFormat input_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
      uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
-@@ -697,6 +700,9 @@ ProgramDescriptor create_multi_tile_descriptor(
+@@ -697,6 +701,9 @@ ProgramDescriptor create_multi_tile_descriptor(
          reader_kernel_defines.emplace_back("DECODE_MODE", "1");
          writer_kernel_defines.emplace_back("DECODE_MODE", "1");
          compute_kernel_defines.emplace_back("DECODE_MODE", "1");
@@ -180,16 +187,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/de
      }
  
      const uint16_t bfloat16_scalar = std::bit_cast<uint16_t>(bfloat16(-1.0f));
-@@ -790,7 +796,7 @@ ProgramDescriptor create_multi_tile_descriptor(
-         (std::uint32_t)num_rows_per_core_group_1,
-         (std::uint32_t)Wt,
-         (std::uint32_t)half_Wt,
--        (std::uint32_t)token_idx.has_value()};
-+        (std::uint32_t)(token_idx.has_value() || batched)};
-     if (token_idx.has_value()) {
-         compute_kernel_args_group_1.insert(
-             compute_kernel_args_group_1.end(),
-@@ -856,7 +862,9 @@ ProgramDescriptor create_multi_tile_descriptor(
+@@ -856,7 +863,9 @@ ProgramDescriptor create_multi_tile_descriptor(
              num_rows_per_core = num_rows_per_core_group_2;
          }
  

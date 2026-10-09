@@ -134,14 +134,16 @@ def test_partial_rotary_rank4(tmp_path, trace, heads):
 
 
 @pytest.mark.parametrize("trace", [False, True])
-@pytest.mark.parametrize("tokens,heads", [(3, 1), (8, 8), (32, 6), (33, 6)])
+@pytest.mark.parametrize("tokens,heads", [(3, 1), (8, 8), (32, 6), (33, 6), (129, 65)])
 @pytest.mark.parametrize("rotary", [128, 64])
 def test_rotary_batched_decode(tmp_path, trace, tokens, heads, rotary):
     """A decode batch, each token at its own position: x [tokens, heads, 128]
     rotated by its token's cos and sin row, then reshaped to
     [1, tokens, heads, 128] for attention. It becomes one fused rotary over the
     tokens; with a partial rotary (Qwen3.5) the tail is appended unchanged.
-    33 tokens span two cache tiles, the second partly filled."""
+    33 tokens span two cache tiles, the second partly filled; 65 heads take three
+    tile rows per token, and 129 tokens several rows per core, which read a
+    token's cache tiles again and cross from one token to the next."""
 
     half = rotary // 2
 
