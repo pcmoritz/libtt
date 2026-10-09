@@ -147,11 +147,24 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  static void addAllToAllOpsConversionPattern(MLIRContext *ctx,
                                              RewritePatternSet &patterns,
                                              TypeConverter &typeConverter) {
-@@ -13291,6 +13381,7 @@ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
+@@ -13250,6 +13340,11 @@ void populateStableHLOControlFlowToTTIRPatterns(
+     MLIRContext *context, RewritePatternSet &patterns,
+     TypeConverter &typeConverter);
+ 
++// tt.fused_moe_ep, in libtt's tt_mlir/lib/Conversion/StableHLOToTTIR/FusedMoeEp.cpp.
++void populateFusedMoeEpToTTIRPatterns(MLIRContext *context,
++                                      RewritePatternSet &patterns,
++                                      TypeConverter &typeConverter);
++
+ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
+                                      RewritePatternSet &patterns,
+                                      TypeConverter &typeConverter) {
+@@ -13291,6 +13386,8 @@ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
    addScaledDotProductAttentionDecodeOpConversionPattern(ctx, patterns,
                                                          typeConverter);
    addSparseMatmulOpConversionPattern(ctx, patterns, typeConverter);
 +  addMoeComputeOpConversionPattern(ctx, patterns, typeConverter);
++  populateFusedMoeEpToTTIRPatterns(ctx, patterns, typeConverter);
    addAllToAllOpsConversionPattern(ctx, patterns, typeConverter);
    addTTLangOpConversionPattern(ctx, patterns, typeConverter);
    // libtt lowers stablehlo.while itself (tt_mlir_control_flow.cpp).
