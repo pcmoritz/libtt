@@ -149,16 +149,12 @@ public:
           rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
     };
 
-    // The kernel's operands: indices as uint16, their low 16 bits (TTNN's
-    // typecast saturates), so that padding's negative ids land past the
-    // experts, where the kernel skips them; scores and activations in BF16, and
-    // the experts with a leading layer dimension.
-    Value lowBits = rewriter.create<ttir::BitwiseAndOp>(
-        loc, idsType, ids,
-        rewriter.create<ttir::FullOp>(loc, idsType,
-                                      rewriter.getI32IntegerAttr(0xFFFF)));
-    Value kernelIds = castTo(lowBits, u16);
-    Value kernelScores = castTo(weights, bf16);
+    // The kernel's operands: the ids as they are (the kernel reads an int32
+    // id's low 16 bits, so that padding's negative ids land past the experts,
+    // where it skips them), activations in BF16, and the experts with a
+    // leading layer dimension. Its local output reads no scores: the weights
+    // only fill the operand.
+    Value kernelIds = ids;
     Value kernelX = reshape(castTo(x, bf16), {1, tokens, hidden});
     auto withLayer = [&](Value w) {
       auto shape = cast<RankedTensorType>(w.getType()).getShape();
@@ -197,7 +193,7 @@ public:
       // Row j * t + i holds token i's j-th expert output, unweighted.
       Value slots = rewriter.create<ttir::MoeComputeOp>(
           loc, typed(kernelX, {k * t, hidden}, bf16), chunkX,
-          rows(kernelIds, begin, end), rows(kernelScores, begin, end), mapping,
+          rows(kernelIds, begin, end), rows(weights, begin, end), mapping,
           kernelW1, kernelW3, kernelW2, /*bias_0=*/Value(), /*bias_1=*/Value(),
           /*bias_2=*/Value(), rewriter.getUI32IntegerAttr(0),
           rewriter.getUI32IntegerAttr(4),

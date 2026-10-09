@@ -317,6 +317,7 @@ http_archive(
         "//third_party/tt_metal:moe_compute_local_output.patch",
         "//third_party/tt_metal:moe_compute_local_output_unlabeled_replicas.patch",
         "//third_party/tt_metal:moe_compute_skip_unknown_experts.patch",
+        "//third_party/tt_metal:moe_compute_wide_routing.patch",
         "//third_party/tt_metal:fill_pad_mask_row_copies.patch",
         "//third_party/tt_metal:softmax_exact_fp32_stable.patch",
         "//third_party/tt_metal:matmul_fp32_operand_fidelity.patch",
