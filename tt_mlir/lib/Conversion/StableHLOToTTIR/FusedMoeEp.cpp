@@ -22,8 +22,9 @@
 // The kernel stores the experts in BFP4, takes up to 512 tokens per call,
 // runs only the (token, expert) pairs of the experts its device owns and
 // writes each pair's output unweighted. This lowering chunks the tokens, builds
-// the expert-to-device mapping, gives padding an expert id past the experts, and
-// sums each token's slots with its weights in one FP32 matmul. The frontend
+// the expert-to-device mapping, and sums each token's slots with its weights in
+// one matmul accumulated in FP32; the kernel reads the ids and weights as they
+// are and skips padding's negative ids. The frontend
 // attribute `rings` (default 3) sets how many matmul rings run a device's
 // experts side by side.
 
@@ -205,7 +206,10 @@ public:
       // weight j at column j * t + i.
       Value chunkWeights = castTo(rows(weights, begin, end), f32);
       Value placement;
-      if (t <= kMaxTokensForConstantPlacement) {
+      if (t == 1) {
+        // One token's slots are rows 0 to k - 1: its weights as they are.
+        placement = chunkWeights;
+      } else if (t <= kMaxTokensForConstantPlacement) {
         // Spread each weight over its slot's t columns with a 0/1 matmul and
         // keep the token's own column with a 0/1 mask: no reshapes, which
         // cost more than these small matmul and multiply.
@@ -248,10 +252,10 @@ public:
                     rewriter.getDenseI64ArrayAttr({1, k, 1}))),
             {t, k * t});
       }
-      Value sum = rewriter.create<ttir::MatmulOp>(
-          loc, typed(chunkWeights, {t, hidden}, f32),
-          placement, slots);
-      outputs.push_back(castTo(sum, outType.getElementType()));
+      // The matmul accumulates in FP32 and writes the output's type.
+      outputs.push_back(rewriter.create<ttir::MatmulOp>(
+          loc, typed(chunkWeights, {t, hidden}, outType.getElementType()),
+          placement, slots));
     }
     if (outputs.size() == 1) {
       rewriter.replaceOp(op, outputs.front());
