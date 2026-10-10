@@ -221,10 +221,10 @@ http_archive(
 http_archive(
     name = "sfpi",
     build_file = "//third_party/sfpi:BUILD.overlay.bazel",
-    sha256 = "b02a9ac4803cb6882f8d3b10151fa01a8fe04303f103fef0815451274ab9b793",
+    sha256 = "7acee167421f8ecdc7e06dc6783f92956793f44e88498d1bf3f56e263cd3c2c1",
     strip_prefix = "sfpi",
     urls = [
-        "https://github.com/tenstorrent/sfpi/releases/download/7.79.0/sfpi_7.79.0_x86_64_debian.txz",
+        "https://github.com/tenstorrent/sfpi/releases/download/7.80.0/sfpi_7.80.0_x86_64_debian.txz",
     ],
 )
 
@@ -244,7 +244,9 @@ http_archive(
 http_archive(
     name = "tt_metal",
     build_file = "//third_party/tt_metal:BUILD.overlay.bazel",
-    # Keep tt-metal aligned with the revision selected by this tt-mlir commit.
+    # tt-mlir selects cffd175; this is 26 commits later, for the program-cache fix that binds a tensor passed
+    # as two inputs to distinct slots (eb97711, tenstorrent/tt-metal#55670). Return to tt-mlir's revision
+    # once tt-mlir moves past it.
     patches = [
         "//third_party/tt_metal:wormhole_build_empty_sources.patch",
         "//third_party/tt_metal:reduce_static_tls.patch",
@@ -331,10 +333,10 @@ http_archive(
         "//third_party/tt_metal:typecast_int32_to_uint16_wrap.patch",
         "//third_party/tt_metal:typecast_float16_bfloat16.patch",
     ],
-    sha256 = "e7ce42e8dd832189662a9af0e8d2b397680a75bbab4f71986efb8300435e1eba",
-    strip_prefix = "tt-metal-cffd17520cdfc45dc85c1c47cc2aa49f6bff15c0",
+    sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
+    strip_prefix = "tt-metal-eb97711f4be2a30cfbff05266faf90bf9780d0c2",
     urls = [
-        "https://github.com/tenstorrent/tt-metal/archive/cffd17520cdfc45dc85c1c47cc2aa49f6bff15c0.tar.gz",
+        "https://github.com/tenstorrent/tt-metal/archive/eb97711f4be2a30cfbff05266faf90bf9780d0c2.tar.gz",
     ],
 )
 

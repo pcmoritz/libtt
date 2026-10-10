@@ -194,6 +194,31 @@ TEST_F(MatmulFp32Test, InfinitiesAndNaNsStayInTheirRowsAndColumns) {
     }
 }
 
+// The program cache binds the kernels' inputs to the op's tensors by identity.
+// A program created for matmul_fp32(x, x) must still read y in a later
+// matmul_fp32(x, y) of the same shapes (tenstorrent/tt-metal#55605).
+TEST_F(MatmulFp32Test, SameTensorTwiceThenTwoTensors) {
+    constexpr uint32_t N = 64;
+    std::mt19937 rng(11);
+    const std::vector<float> x = random_values(N * N, rng);
+    const std::vector<float> y = random_values(N * N, rng);
+    const ttnn::Tensor x_device = to_device(x, {N, N});
+    const ttnn::Tensor y_device = to_device(y, {N, N});
+
+    auto check = [&](const ttnn::Tensor& c_device, const std::vector<float>& a, const std::vector<float>& b) {
+        const std::vector<float> c = c_device.cpu().to_vector<float>();
+        const Reference ref = reference_matmul(a, {N, N}, b, {N, N});
+        for (size_t i = 0; i < c.size(); ++i) {
+            ASSERT_LE(std::abs(c[i] - ref.value[i]), N * std::ldexp(1.0, -24) * ref.abs_sum[i])
+                << "element " << i << ": " << c[i] << " vs " << ref.value[i];
+        }
+    };
+    check(ttnn::experimental::matmul_fp32(x_device, x_device), x, x);
+    check(ttnn::experimental::matmul_fp32(x_device, y_device), x, y);
+    check(ttnn::experimental::matmul_fp32(y_device, x_device), y, x);
+    check(ttnn::experimental::matmul_fp32(y_device, y_device), y, y);
+}
+
 // A K that is not a multiple of 32 pads the last k tile of both inputs. The
 // padding of a tensor that an earlier operation produced can hold anything,
 // including infinities and NaNs, and none of it may reach the outputs.
