@@ -323,6 +323,7 @@ http_archive(
         "//third_party/tt_metal:rotary_embedding_batched_decode.patch",
         "//third_party/tt_metal:column_fill_face_copies.patch",
         "//third_party/tt_metal:pch_string_view.patch",
+        "//third_party/tt_metal:tilize_wide_rows.patch",
     ],
     sha256 = "e7ce42e8dd832189662a9af0e8d2b397680a75bbab4f71986efb8300435e1eba",
     strip_prefix = "tt-metal-cffd17520cdfc45dc85c1c47cc2aa49f6bff15c0",
