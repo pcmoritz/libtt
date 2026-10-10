@@ -1,0 +1,166 @@
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_max_min.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_max_min.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_max_min.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary_max_min.h
+@@ -60,6 +60,42 @@
+ #endif
+ }
+ 
++// Gives the value in LREG `X` the sign `NAN_SIGN` if it is NaN. Expects +inf in
++// LREG3 and uses LREG2.
++template <uint X, uint NAN_SIGN>
++inline void set_nan_sign() {
++    // if |x| > inf, i.e. x is NaN: inf - |x| < 0
++    TTI_SFPSETSGN(0, X, p_sfpu::LREG2, 1);  // SFPSETSGN_MOD1_ARG_IMM
++    TTI_SFPIADD(0, p_sfpu::LREG3, p_sfpu::LREG2, sfpi::SFPIADD_MOD1_ARG_2SCOMP_LREG_DST | sfpi::SFPIADD_MOD1_CC_LT0);
++    TTI_SFPSETSGN(NAN_SIGN, X, X, 1);  // SFPSETSGN_MOD1_ARG_IMM
++    TTI_SFPENCC(0, 0, 0, 0);
++}
++
++// Float max or min that propagates NaN from either operand, as IEEE maximum and
++// minimum and JAX do. SFPSWAP orders sign-magnitude bit patterns, so +NaN is the
++// largest value and -NaN the smallest: a NaN operand is given the sign that wins
++// (+ for max, - for min) and is then selected like any other value.
++template <bool IS_MAX_OP = true, int ITERATIONS = 8>
++inline void calculate_binary_max_min_nan(const uint dst_index_in0, const uint dst_index_in1, const uint dst_index_out) {
++    constexpr uint a = p_sfpu::LREG0;
++    constexpr uint b = p_sfpu::LREG1;
++    constexpr uint nan_sign = IS_MAX_OP ? 0 : 1;
++    constexpr uint dst_tile_size = 64;
++
++    TTI_SFPLOADI(p_sfpu::LREG3, sfpi::SFPLOADI_MOD0_FLOATB, 0x7f80);  // +inf
++
++#pragma GCC unroll 0
++    for (int d = 0; d < ITERATIONS; d++) {
++        TT_SFPLOAD(a, InstrModLoadStore::DEFAULT, ADDR_MOD_7, dst_index_in0 * dst_tile_size);
++        TT_SFPLOAD(b, InstrModLoadStore::DEFAULT, ADDR_MOD_7, dst_index_in1 * dst_tile_size);
++        set_nan_sign<a, nan_sign>();
++        set_nan_sign<b, nan_sign>();
++        // Maximum in b, minimum in a.
++        TTI_SFPSWAP(0, b, a, sfpi::SFPSWAP_MOD1_VEC_MIN_MAX);
++        TT_SFPSTORE(IS_MAX_OP ? b : a, InstrModLoadStore::DEFAULT, ADDR_MOD_6, dst_index_out * dst_tile_size);
++    }
++}
++
+ template <bool IS_MAX_OP = true, bool IS_UNSIGNED = false, int ITERATIONS = 8>
+ inline void calculate_binary_max_min_int32(
+     const uint dst_index_in0, const uint dst_index_in1, const uint dst_index_out) {
+diff --git tt_metal/hw/inc/api/compute/binary_max_min.h tt_metal/hw/inc/api/compute/binary_max_min.h
+--- tt_metal/hw/inc/api/compute/binary_max_min.h
++++ tt_metal/hw/inc/api/compute/binary_max_min.h
+@@ -284,4 +284,33 @@
+ #endif
+ }
+ 
++#ifdef ARCH_BLACKHOLE
++// Float max and min that propagate NaN from either operand, of either sign
++// (binary_max_tile and binary_min_tile skip -NaN and +NaN respectively). They
++// share binary_max_tile_init and binary_min_tile_init.
++ALWI void binary_max_nan_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
++    MATH((SFPU_BINARY_CALL(
++        DST_SYNC_MODE,
++        DST_ACCUM_MODE,
++        calculate_binary_max_min_nan,
++        (true /* IS_MAX */),
++        idst0,
++        idst1,
++        odst,
++        VectorMode::RC)));
++}
++
++ALWI void binary_min_nan_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
++    MATH((SFPU_BINARY_CALL(
++        DST_SYNC_MODE,
++        DST_ACCUM_MODE,
++        calculate_binary_max_min_nan,
++        (false /* IS_MAX */),
++        idst0,
++        idst1,
++        odst,
++        VectorMode::RC)));
++}
++#endif  // ARCH_BLACKHOLE
++
+ }  // namespace ckernel
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation_types.hpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation_types.hpp
+--- ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation_types.hpp
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation_types.hpp
+@@ -13,7 +13,7 @@
+ 
+ namespace ttnn::prim {
+ 
+-enum class AccumulationOp : uint8_t { CUMSUM, CUMPROD };
++enum class AccumulationOp : uint8_t { CUMSUM, CUMPROD, CUMMAX, CUMMIN };
+ 
+ struct AccumulationParams {
+     const int32_t dim;
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_program_factory.cpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_program_factory.cpp
+@@ -17,6 +17,7 @@
+ #include <tt-metalium/work_split.hpp>
+ 
+ #include <bit>
++#include <limits>
+ #include <map>
+ #include <string>
+ #include <utility>
+@@ -150,7 +151,35 @@
+ 
+     std::map<std::string, std::string> defines_kernel_args = {};
+ 
+-    if (is_integer_format(dst_cb_data_format)) {
++    const bool is_integer = is_integer_format(dst_cb_data_format);
++    float default_acc_value = 0.f;
++    if (operation_attributes.op == AccumulationOp::CUMMAX || operation_attributes.op == AccumulationOp::CUMMIN) {
++        // The accumulator starts at the reduction's identity: the lowest value for max, the
++        // highest for min. Integer identities are passed as bit patterns, like cumprod's 1.
++        const bool is_max = operation_attributes.op == AccumulationOp::CUMMAX;
++        const char* reduction = is_max ? "max" : "min";
++        if (is_integer) {
++            TT_FATAL(
++                dst_cb_data_format == DataFormat::Int32 || dst_cb_data_format == DataFormat::UInt32,
++                "cummax/cummin support Int32 and UInt32 integers, got {}",
++                dst_cb_data_format);
++            const bool is_unsigned = dst_cb_data_format == DataFormat::UInt32;
++            const char* suffix = is_unsigned ? "_uint32" : "_int32";
++            defines_kernel_args["BINARY_OP_INIT"] = fmt::format("binary_{}{}_tile_init", reduction, suffix);
++            defines_kernel_args["BINARY_OP"] = fmt::format("binary_{}{}_tile", reduction, suffix);
++            defines_kernel_args["FILL_TILE"] = fmt::format("fill_tile_int<{}>", acc_dataformat_name);
++            const uint32_t lowest = is_unsigned ? 0U : 0x80000000U;
++            const uint32_t highest = is_unsigned ? 0xFFFFFFFFU : 0x7FFFFFFFU;
++            default_acc_value = std::bit_cast<float>(is_max ? lowest : highest);
++        } else {
++            // NaN from any input element propagates to the rest of the scan.
++            defines_kernel_args["BINARY_OP_INIT"] = fmt::format("binary_{}_tile_init", reduction);
++            defines_kernel_args["BINARY_OP"] = fmt::format("binary_{}_nan_tile", reduction);
++            defines_kernel_args["FILL_TILE"] = "fill_tile_bitcast";
++            default_acc_value = is_max ? -std::numeric_limits<float>::infinity()
++                                       : std::numeric_limits<float>::infinity();
++        }
++    } else if (is_integer) {
+         defines_kernel_args["BINARY_OP_INIT"] = operation_attributes.op == AccumulationOp::CUMSUM
+                                                     ? "add_int_tile_init"
+                                                     : fmt::format("mul_int_tile_init<{}>", acc_dataformat_name);
+@@ -166,10 +195,9 @@
+         defines_kernel_args["FILL_TILE"] = "fill_tile_bitcast";
+     }
+ 
+-    float default_acc_value = 0.f;
+     if (operation_attributes.op == AccumulationOp::CUMPROD) {
+         default_acc_value = 1.f;
+-        if (is_integer_format(dst_cb_data_format)) {
++        if (is_integer) {
+             // Kernel reinterprets the 4-byte CT arg as int32 in the integer path; pack the bit
+             // pattern 0x00000001 so it lands as integer 1, not float 1.0f's bit pattern.
+             default_acc_value = std::bit_cast<float>(1U);
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/compute/accumulation_compute.cpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/compute/accumulation_compute.cpp
+--- ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/compute/accumulation_compute.cpp
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/compute/accumulation_compute.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "api/compute/compute_kernel_api.h"
+ #include "api/compute/add_int_sfpu.h"
++#include "api/compute/binary_max_min.h"
+ #include "api/compute/mul_int_sfpu.h"
+ #include "api/compute/eltwise_binary.h"
+ #include "api/compute/eltwise_unary/eltwise_unary.h"
