@@ -63,11 +63,14 @@ def test_sort_and_argsort_int32_keys(dtype, descending):
 _BOUNDARY_KEYS = {
     jnp.int32: [-(2**31), -65537, -65536, -65535, -1, 0, 1, 65535, 65536, 65537, 2**31 - 1],
     jnp.uint32: [0, 1, 65535, 65536, 65537, 2**31 - 1, 2**31, 2**32 - 65536, 2**32 - 1],
+    # Narrow keys sort as float32: their range extremes and neighbours.
+    jnp.int8: [-128, -127, -2, -1, 0, 1, 126, 127],
+    jnp.int16: [-32768, -32767, -257, -256, -1, 0, 1, 255, 256, 32766, 32767],
 }
 
 
 def _boundary_keys(dtype, shape, dimension):
-    """Keys around the 16-bit radix boundaries, each value repeated along `dimension`."""
+    """Boundary keys (see _BOUNDARY_KEYS), each value repeated along `dimension`."""
     rng = np.random.default_rng(1)
     pool = np.array(_BOUNDARY_KEYS[dtype], dtype=np.int64)
     keys = rng.choice(pool, size=shape)
@@ -80,7 +83,7 @@ def _boundary_keys(dtype, shape, dimension):
     return keys.astype(dtype)
 
 
-@pytest.mark.parametrize("dtype", [jnp.int32, jnp.uint32])
+@pytest.mark.parametrize("dtype", [jnp.int32, jnp.uint32, jnp.int8, jnp.int16])
 @pytest.mark.parametrize("shape,dimension", [((300, 3), 0), ((2, 3, 40, 2, 2), 2)])
 def test_sort_int32_boundary_keys_with_integer_values(dtype, shape, dimension):
     keys = _boundary_keys(dtype, shape, dimension)
@@ -95,7 +98,7 @@ def test_sort_int32_boundary_keys_with_integer_values(dtype, shape, dimension):
     )
 
 
-@pytest.mark.parametrize("dtype", [jnp.int32, jnp.uint32])
+@pytest.mark.parametrize("dtype", [jnp.int32, jnp.uint32, jnp.int8, jnp.int16])
 @pytest.mark.parametrize("descending", [False, True])
 def test_argsort_int32_boundary_keys(dtype, descending):
     keys = _boundary_keys(dtype, (300, 3), 0)

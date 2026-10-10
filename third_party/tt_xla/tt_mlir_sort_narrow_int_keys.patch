@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -9407,11 +9407,28 @@
+@@ -9407,11 +9407,26 @@
          indices = fromRows(indices2D, indicesType);
        }
      } else {
@@ -13,9 +13,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      Value keys = adaptor.getInputs().front();
 +      SmallVector<Type> sortTypes(outputTypes);
 +      if (isNarrowSignedKey) {
-+        auto floatType = RankedTensorType::get(valueType.getShape(),
-+                                               rewriter.getF32Type(),
-+                                               valueType.getEncoding());
++        auto floatType = valueType.clone(rewriter.getF32Type());
 +        keys = rewriter.create<ttir::TypecastOp>(loc, floatType, keys);
 +        sortTypes.front() = floatType;
 +      }
