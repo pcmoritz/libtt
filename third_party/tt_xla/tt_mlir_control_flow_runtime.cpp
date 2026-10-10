@@ -16,7 +16,6 @@
 #include <exception>
 #include <mutex>
 #include <optional>
-#include <map>
 #include <set>
 #include <utility>
 #include <vector>
@@ -156,12 +155,10 @@ bool loopBodyTracingEnabled() {
 std::mutex untraceableBodiesMutex;
 std::set<std::pair<uint64_t, uint32_t>> untraceableBodies;
 
-// Iterations each condition-driven loop body ran the last time. A capture
-// costs about one iteration of dispatch, so bodies of short loops are not
-// traced again.
-constexpr uint64_t kMinTracedIterations = 8;
-std::mutex lastIterationsMutex;
-std::map<std::pair<uint64_t, uint32_t>, uint64_t> lastIterations;
+// A condition-driven loop's trip count is unknown, so its body is captured
+// only once this many iterations have run in the current invocation; short
+// loops never pay for a capture.
+constexpr uint64_t kMinTracedIterations = 3;
 
 std::pair<uint64_t, uint32_t> bodyKey(ProgramContext &context,
                                       uint32_t programId) {
@@ -336,29 +333,33 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
 
   // Runs the body on the state slots and writes each new state value back into
   // its slot. Results that are themselves state slots (e.g. a body that swaps
-  // two values) are read before any slot is overwritten.
+  // two values) are replaced by snapshots before any slot is overwritten, so
+  // bodyOutputs holds the complete new state even if a later write fails.
   auto runBodyIntoSlots = [&](std::vector<::tt::runtime::Tensor> &bodyOutputs) {
     bodyOutputs = execute(op->program_id());
     LOG_ASSERT(bodyOutputs.size() == updated.size(),
                "While loop body output arity mismatch");
-    std::vector<std::pair<::ttnn::Tensor, uint32_t>> writes;
+    std::vector<size_t> writes;
     for (size_t i = 0; i < bodyOutputs.size(); ++i) {
       const void *buffer = bufferOf(bodyOutputs[i]);
       if (buffer == bufferOf(inputs[updated[i]])) {
         continue;
       }
-      ::ttnn::Tensor value =
-          bodyOutputs[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
       if (std::any_of(updated.begin(), updated.end(), [&](uint32_t state) {
             return bufferOf(inputs[state]) == buffer;
           })) {
-        value = ::ttnn::clone(value, std::nullopt, std::nullopt, std::nullopt);
+        bodyOutputs[i] = utils::createRuntimeTensorFromTTNN(::ttnn::clone(
+            bodyOutputs[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor(),
+            std::nullopt, std::nullopt, std::nullopt));
       }
-      writes.emplace_back(std::move(value), updated[i]);
+      writes.push_back(i);
     }
-    for (auto &[value, state] : writes) {
-      const ::ttnn::Tensor &slot =
-          inputs[state].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
+    for (size_t i : writes) {
+      ::ttnn::Tensor value =
+          bodyOutputs[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
+      const ::ttnn::Tensor &slot = inputs[updated[i]]
+                                       .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
+                                       .getTensor();
       if (value.layout() != slot.layout() || value.dtype() != slot.dtype() ||
           value.memory_config() != slot.memory_config()) {
         value = ::ttnn::to_layout(value, slot.layout(), slot.dtype(),
@@ -453,21 +454,12 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
   // `completed` iterations have run; `remaining` is known for counted loops.
   auto runIteration = [&](uint64_t completed,
                           std::optional<uint64_t> remaining) {
-    // Decide once, after the first iteration: tracing pays off when at least
-    // two replays follow the capture iteration.
-    if (!captureAttempted && completed >= 1) {
+    // Decide once: a counted loop after its first iteration, when at least two
+    // replays would follow the capture iteration; a condition loop once it has
+    // run kMinTracedIterations iterations.
+    if (!captureAttempted && completed >= (remaining ? 1 : kMinTracedIterations)) {
       captureAttempted = true;
-      std::optional<uint64_t> previous;
-      if (!remaining) {
-        std::lock_guard lock(lastIterationsMutex);
-        auto it = lastIterations.find(bodyKey(context, op->program_id()));
-        if (it != lastIterations.end()) {
-          previous = it->second;
-        }
-      }
-      if (remaining.value_or(3) >= 3 &&
-          previous.value_or(kMinTracedIterations) >= kMinTracedIterations &&
-          loopBodyTracingEnabled() &&
+      if (remaining.value_or(3) >= 3 && loopBodyTracingEnabled() &&
           meshDevice.get_program_cache().is_enabled() &&
           std::all_of(inputs.begin(), inputs.end(), isDeviceTensor) &&
           isTraceableBody(context, op->program_id(), stateSize)) {
@@ -491,8 +483,6 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
       LOG_ASSERT(conditionOutputs.size() == 1,
                  "Loop condition must return one value");
       if (!readConditionScalar(conditionOutputs.front())) {
-        std::lock_guard lock(lastIterationsMutex);
-        lastIterations[bodyKey(context, op->program_id())] = completed;
         break;
       }
       runIteration(completed, std::nullopt);
