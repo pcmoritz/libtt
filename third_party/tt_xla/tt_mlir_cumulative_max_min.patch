@@ -1,0 +1,363 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -3435,6 +3435,28 @@
+   let hasFolder = 1;
+ }
+ 
++def TTIR_CumulativeOp : TTIR_NamedOp<"cumulative"> {
++  let summary = "Cumulative reduction operation.";
++  let description = [{
++    Computes a running reduction of the input along `dim`: each output element
++    reduces all input elements along `dim` up to and including its position.
++    `reduction` names the reduction: "max" or "min".
++
++    Example:
++    ```mlir
++    %result = "ttir.cumulative"(%input) <{dim = 1 : i64, reduction = "max"}> : (tensor<2x3xf32>) -> tensor<2x3xf32>
++    // [[1, 3, 2],     [[1, 3, 3],
++    //  [5, 4, 6]]  ->  [5, 5, 6]]
++    ```
++  }];
++
++  let arguments = (ins AnyRankedTensor:$input,
++                       I64Attr:$dim,
++                       StrAttr:$reduction);
++
++  let results = (outs AnyRankedTensor:$result);
++}
++
+ def TTIR_SoftmaxOp : TTIR_NamedOp<"softmax"> {
+     let summary = "Softmax normalization operation.";
+     let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1338,6 +1338,20 @@
+ 
+ }
+ 
++def TTNN_CumulativeOp : TTNN_Op<"cumulative", [OpModelExempt]> {
++  let summary = "Cumulative reduction op.";
++  let description = [{
++    Running reduction of the input along `dim`; `reduction` is "max" or "min".
++    Runs on ttnn's accumulation kernel, like cumsum and cumprod.
++  }];
++
++  let arguments = (ins AnyRankedTensor:$input,
++                       SI32Attr:$dim,
++                       StrAttr:$reduction);
++
++  let results = (outs AnyRankedTensor:$result);
++}
++
+ def TTNN_ConcatenateHeadsOp: TTNN_Op<"concatenate_heads"> {
+     let summary = "Concatenate heads op used in attention layer.";
+     let description = [{
+diff --git a/include/ttmlir/Target/TTNN/operations/cumprod.fbs b/include/ttmlir/Target/TTNN/operations/cumprod.fbs
+--- a/include/ttmlir/Target/TTNN/operations/cumprod.fbs
++++ b/include/ttmlir/Target/TTNN/operations/cumprod.fbs
+@@ -3,6 +3,21 @@
+ 
+ namespace tt.target.ttnn;
+ 
++enum CumulativeReduction: uint32 {
++  Max,
++  Min,
++}
++
++// A running reduction along dim (ttnn's accumulation kernel).
++table CumulativeOp {
++  in: tt.target.ttnn.TensorRef;
++  out: tt.target.ttnn.TensorRef;
++  dim: int32;
++  reduction: CumulativeReduction;
++  dtype: tt.target.DataType = null;
++  memcfg: tt.target.ttnn.MemoryConfig;
++}
++
+ table CumProdOp {
+   in: tt.target.ttnn.TensorRef;
+   out: tt.target.ttnn.TensorRef;
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -187,6 +187,7 @@
+   AllocateMoeComputeSemaphoreOp,
+   CopyOp,
+   WhileOp,
++  CumulativeOp,
+ }
+ 
+ table Operation {
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -3377,6 +3377,19 @@
+                                                  *cumulativeMatch, rewriter);
+         return success();
+       }
++
++      // Running max and min lower to the general cumulative op.
++      for (auto [reduction, initValue] :
++           {std::pair{"max", TypicalInitReductionValue::NEG_INF},
++            std::pair{"min", TypicalInitReductionValue::POS_INF}}) {
++        cumulativeMatch = isCumulativeExtremum(srcOp, adaptor, reductionOps[0],
++                                               padding, initValue);
++        if (cumulativeMatch) {
++          replaceWithCumulativeReduction(srcOp, adaptor, *cumulativeMatch,
++                                         reduction, rewriter);
++          return success();
++        }
++      }
+     }
+ 
+     // Handle 5D input with three non-trivial window dimensions (3D max
+@@ -3919,6 +3932,57 @@
+     return match;
+   }
+ 
++  // A running max (init -inf, or the lowest integer) or min (init +inf, or
++  // the highest integer) along one dimension; see isCumProd for the window
++  // conditions.
++  std::optional<CumulativeReductionMatch>
++  isCumulativeExtremum(mlir::stablehlo::ReduceWindowOp &srcOp,
++                       mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
++                       mlir::Operation *frontOp, DenseI64ArrayAttr padding,
++                       TypicalInitReductionValue initValue) const {
++    bool isMax = initValue == TypicalInitReductionValue::NEG_INF;
++    if (!(isMax ? isa<mlir::stablehlo::MaxOp>(frontOp)
++                : isa<mlir::stablehlo::MinOp>(frontOp)) ||
++        !hasInitValue(srcOp, initValue) || !hasValidWindowAttributes(adaptor)) {
++      return std::nullopt;
++    }
++    CumulativeReductionMatch match;
++    if (!hasValidInputAndPadding(srcOp, adaptor, match, padding)) {
++      return std::nullopt;
++    }
++    return match;
++  }
++
++  // Lowers a running max or min to ttir.cumulative. Unlike cumsum and cumprod,
++  // integers keep their type: ttnn's accumulation kernel takes max and min
++  // natively, and float32 cannot hold every int32. Like ttnn's elementwise
++  // max and min, it compares sign-magnitude bits: +NaN is the largest value
++  // and -NaN the smallest, so cummax propagates +NaN but cummin does not.
++  void replaceWithCumulativeReduction(
++      mlir::stablehlo::ReduceWindowOp srcOp,
++      mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
++      CumulativeReductionMatch match, llvm::StringRef reduction,
++      ConversionPatternRewriter &rewriter) const {
++    auto resultType = cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getResult(0).getType()));
++    DenseI64ArrayAttr dimensions =
++        rewriter.getDenseI64ArrayAttr({match.dimension});
++    Value input = adaptor.getInputs()[0];
++    if (match.reverse) {
++      input = rewriter.create<ttir::ReverseOp>(srcOp.getLoc(), resultType,
++                                                input, dimensions);
++    }
++    Value result = rewriter.create<ttir::CumulativeOp>(
++        srcOp.getLoc(), resultType, input,
++        rewriter.getI64IntegerAttr(match.dimension),
++        rewriter.getStringAttr(reduction));
++    if (match.reverse) {
++      result = rewriter.create<ttir::ReverseOp>(srcOp.getLoc(), resultType,
++                                                 result, dimensions);
++    }
++    rewriter.replaceOp(srcOp, result);
++  }
++
+   // Helper function to find the StableHLO constant defining op by traversing
+   // through operations that preserve constant semantics (similar to
+   // getConstantValueDefiningOp).
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -484,6 +484,22 @@
+ } // namespace
+ 
+ namespace {
++class CumulativeOpConversionPattern
++    : public OpConversionPattern<ttir::CumulativeOp> {
++public:
++  using OpConversionPattern<ttir::CumulativeOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(ttir::CumulativeOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    rewriter.replaceOpWithNewOp<ttnn::CumulativeOp>(
++        op, this->getTypeConverter()->convertType(op.getType()),
++        adaptor.getInput(), static_cast<int32_t>(adaptor.getDim()),
++        adaptor.getReduction());
++    return success();
++  }
++};
++
+ class CumProdOpConversionPattern : public OpConversionPattern<ttir::CumProdOp> {
+ public:
+   using OpConversionPattern<ttir::CumProdOp>::OpConversionPattern;
+@@ -4063,6 +4079,7 @@
+            RepeatOpConversionPattern,
+            CumSumOpConversionPattern,
+            CumProdOpConversionPattern,
++           CumulativeOpConversionPattern,
+            RepeatInterleaveOpConversionPattern,
+            SoftmaxOpConversionPattern,
+            SortOpConversionPattern,
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -681,6 +681,22 @@
+                                             dtype, memoryConfig);
+ }
+ 
++::flatbuffers::Offset<::tt::target::ttnn::CumulativeOp>
++createOp(FlatbufferObjectCache &cache, CumulativeOp op) {
++  auto in = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getInput()));
++  auto output = cache.getOrCreateNoSharding(op.getResult(),
++                                            tensorValueToFlatbuffer,
++                                            /*local_shape*/ std::nullopt);
++  auto memoryConfig = toFlatbuffer(cache, op.getMemoryConfigAttr());
++  auto dtype = toFlatbuffer(cache, op.getDtypeAttr());
++  ::tt::target::ttnn::CumulativeReduction reduction =
++      op.getReduction() == "max" ? ::tt::target::ttnn::CumulativeReduction::Max
++                                 : ::tt::target::ttnn::CumulativeReduction::Min;
++  return ::tt::target::ttnn::CreateCumulativeOp(
++      *cache.fbb, in, output, op.getDim(), reduction, dtype, memoryConfig);
++}
++
+ ::flatbuffers::Offset<::tt::target::ttnn::CumProdOp>
+ createOp(FlatbufferObjectCache &cache, CumProdOp op) {
+   auto in = cache.at<::tt::target::ttnn::TensorRef>(
+@@ -5266,6 +5282,10 @@
+     return createOperation(cache, createOp(cache, cumProdOp), debugString,
+                            locInfo);
+   }
++  if (auto cumulativeOp = dyn_cast<CumulativeOp>(op); cumulativeOp) {
++    return createOperation(cache, createOp(cache, cumulativeOp), debugString,
++                           locInfo);
++  }
+   if (auto sumOp = dyn_cast<SumOp>(op); sumOp) {
+     return createOperation(cache, createReductionOp(cache, sumOp), debugString,
+                            locInfo);
+diff --git a/runtime/lib/ttnn/operations/reduction/cumulative.cpp b/runtime/lib/ttnn/operations/reduction/cumulative.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/lib/ttnn/operations/reduction/cumulative.cpp
+@@ -0,0 +1,47 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#include "operations/reduction/cumulative.h"
++
++#include "tt/runtime/detail/common/logger.h"
++#include "tt/runtime/detail/ttnn/ttnn.h"
++
++#include "tt/runtime/detail/ttnn/operations/utils.h"
++#include "tt/runtime/detail/ttnn/utils.h"
++#include "ttmlir/Target/TTNN/program_generated.h"
++#include "ttnn/operations/reduction/accumulation/accumulation_common.hpp"
++
++#include <optional>
++
++namespace tt::runtime::ttnn::operations::reduction::cumulative {
++void run(const ::tt::target::ttnn::CumulativeOp *op, ProgramContext &context) {
++  ProgramTensorPool &tensorPool = context.getTensorPool();
++  const ::ttnn::Tensor &in = tensorPool.getTTNNTensorAndValidate(op->in());
++
++  std::optional<::ttnn::MemoryConfig> outputMemoryConfig =
++      ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(op->memcfg());
++
++  std::optional<::ttnn::DataType> dtype = std::nullopt;
++  if (op->dtype()) {
++    dtype = ::tt::runtime::ttnn::utils::toTTNNDataType(*op->dtype());
++  }
++
++  ::ttnn::prim::AccumulationOp accumulationOp;
++  switch (op->reduction()) {
++  case ::tt::target::ttnn::CumulativeReduction::Max:
++    accumulationOp = ::ttnn::prim::AccumulationOp::CUMMAX;
++    break;
++  case ::tt::target::ttnn::CumulativeReduction::Min:
++    accumulationOp = ::ttnn::prim::AccumulationOp::CUMMIN;
++    break;
++  }
++
++  ::ttnn::Tensor out =
++      ::ttnn::operations::reduction::accumulation::common::accumulation_invoke(
++          in, op->dim(), dtype, /*optional_out=*/std::nullopt,
++          /*reverse_order=*/false, outputMemoryConfig, accumulationOp);
++
++  tensorPool.insertTTNNTensorAndValidate(op->out(), out);
++}
++} // namespace tt::runtime::ttnn::operations::reduction::cumulative
+diff --git a/runtime/lib/ttnn/operations/reduction/cumulative.h b/runtime/lib/ttnn/operations/reduction/cumulative.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/lib/ttnn/operations/reduction/cumulative.h
+@@ -0,0 +1,15 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#ifndef RUNTIME_LIB_TTNN_OPERATIONS_REDUCTION_CUMULATIVE_H
++#define RUNTIME_LIB_TTNN_OPERATIONS_REDUCTION_CUMULATIVE_H
++
++#include "tt/runtime/detail/ttnn/types/types.h"
++#include "ttmlir/Target/TTNN/program_generated.h"
++
++namespace tt::runtime::ttnn::operations::reduction::cumulative {
++void run(const ::tt::target::ttnn::CumulativeOp *op, ProgramContext &context);
++} // namespace tt::runtime::ttnn::operations::reduction::cumulative
++
++#endif // RUNTIME_LIB_TTNN_OPERATIONS_REDUCTION_CUMULATIVE_H
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -102,6 +102,7 @@
+ #include "operations/rand/rand.h"
+ #include "operations/reduction/argmax.h"
+ #include "operations/reduction/cumprod.h"
++#include "operations/reduction/cumulative.h"
+ #include "operations/reduction/cumsum.h"
+ #include "operations/reduction/prod.h"
+ #include "operations/reduction/reduction.h"
+@@ -405,6 +406,10 @@
+     return operations::reduction::cumprod::run(op->type_as_CumProdOp(),
+                                                getContext());
+   }
++  case ::tt::target::ttnn::OpType::CumulativeOp: {
++    return operations::reduction::cumulative::run(op->type_as_CumulativeOp(),
++                                                  getContext());
++  }
+   case ::tt::target::ttnn::OpType::ReductionArgMaxOp: {
+     return operations::reduction::run(op->type_as_ReductionArgMaxOp(),
+                                       getContext());
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -1464,6 +1464,10 @@
+     tensorRefs = {opContext.type_as_CumProdOp()->out()};
+     break;
+   }
++  case ::tt::target::ttnn::OpType::CumulativeOp: {
++    tensorRefs = {opContext.type_as_CumulativeOp()->out()};
++    break;
++  }
+   case ::tt::target::ttnn::OpType::RandOp: {
+     tensorRefs = {opContext.type_as_RandOp()->out()};
+     break;
+@@ -2095,6 +2099,10 @@
+     tensorRefs = {opContext.type_as_CumProdOp()->in()};
+     break;
+   }
++  case ::tt::target::ttnn::OpType::CumulativeOp: {
++    tensorRefs = {opContext.type_as_CumulativeOp()->in()};
++    break;
++  }
+   case ::tt::target::ttnn::OpType::ReductionArgMaxOp: {
+     tensorRefs = {opContext.type_as_ReductionArgMaxOp()->in()};
+     break;
