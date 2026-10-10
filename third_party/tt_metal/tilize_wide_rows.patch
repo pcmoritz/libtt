@@ -1,14 +1,15 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
-@@ -350,7 +350,12 @@ TilizeDeviceOperation::program_factory_t TilizeDeviceOperation::select_program_f
+@@ -350,7 +350,13 @@ TilizeDeviceOperation::program_factory_t TilizeDeviceOperation::select_program_f
      size_t grid_area = available_grid.num_cores();
      auto [ncores, nblocks_per_core] = compute_ncores(grid_area, nblocks);
      constexpr uint32_t threshold_row_block = 32;
 -    if (num_tiles_per_row > threshold_row_block &&
 +    // Wide interleaved rows go to the default factory, which splits a few tile rows by width over the cores
-+    // itself: the block factory's narrow pieces were slower at every size measured (64 x 2048 bf16: 26 us
-+    // against 9 us; 4096 x 2048: 150 us against 88 us).
++    // itself (tilize_width_slices). The block factory's narrow pieces were slower at every shape measured on
++    // Blackhole, bf16: 64 x 2048 26 us against 4.2 us, 64 x 2144 (67 tiles, no slices, 2 cores) 26 us against
++    // 14 us, 3552 x 2048 133 us against 81 us.
 +    const bool interleaved_rows = !input_tensor_a.memory_config().is_sharded() &&
 +                                  input_tensor_a.logical_shape()[-1] % tile_width == 0;
 +    if (!interleaved_rows && num_tiles_per_row > threshold_row_block &&
@@ -40,21 +41,19 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/kernels/dataflow
 diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
-@@ -53,13 +53,24 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
+@@ -53,13 +53,22 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
      CoreRangeSet default_grid(default_cores);
      CoreRangeSet available_grid = sub_core_grids.has_value() ? sub_core_grids.value() : default_grid;
  
-+    // With fewer tile rows than cores, an interleaved input's tile rows are split by width too: each core
-+    // tilizes one slice of one tile row, at least kMinSliceTiles wide.
-+    constexpr uint32_t kMinSliceTiles = 4;
-+    uint32_t slices = 1;
-+    if (!a.is_sharded() && logical_width % tile_width == 0) {
-+        while (ntiles_per_block % (2 * slices) == 0 && ntiles_per_block / (2 * slices) >= kMinSliceTiles &&
-+               nblocks * 2 * slices <= available_grid.num_cores()) {
-+            slices *= 2;
-+        }
-+    }
++    // With fewer tile rows than cores, an interleaved input's tile rows are split by width too. There are then at
++    // most as many slices as cores, so each core tilizes exactly one slice of one tile row.
++    const uint32_t slices = !a.is_sharded() && logical_width % tile_width == 0
++                                ? tilize_width_slices(ntiles_per_block, nblocks, available_grid.num_cores())
++                                : 1;
 +    const uint32_t slice_tiles = ntiles_per_block / slices;
++    // A row's bytes per slice (the whole page with one slice).
++    const uint32_t slice_bytes =
++        slices == 1 ? src0_buffer->page_size() : slice_tiles * tile_width * static_cast<uint32_t>(a.element_size());
      auto [ncores, all_cores, core_range, core_range_cliff, nblocks_per_core, nblocks_per_core_cliff] =
 -        ttnn::split_blocks_for_tilize(available_grid, nblocks);
 +        ttnn::split_blocks_for_tilize(available_grid, nblocks * slices);
@@ -63,11 +62,11 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_cor
      uint32_t page_size = src0_buffer->page_size();
      uint32_t num_pages_in_row = 1;
 -    uint32_t size_of_valid_data_in_last_page_in_row = page_size;
-+    uint32_t size_of_valid_data_in_last_page_in_row = page_size / slices;
++    uint32_t size_of_valid_data_in_last_page_in_row = slice_bytes;
      if (a.is_sharded()) {
          uint32_t shard_width =
              a.shard_spec().has_value() ? a.shard_spec().value().shape[1] : a.nd_shard_spec().value().shard_shape[-1];
-@@ -85,14 +96,14 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
+@@ -85,14 +94,14 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
      DataflowBufferSpec input_dfb{
          .unique_id = INPUT_DFB,
          .entry_size = input_single_tile_size,
@@ -84,7 +83,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_cor
          .data_format_metadata = output_data_format,
          .tile_format_metadata = operation_attributes.tile,
      };
-@@ -120,7 +131,12 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
+@@ -120,7 +129,12 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
               {"size_of_valid_data_in_last_page_in_row", size_of_valid_data_in_last_page_in_row}},
          .runtime_arg_schema =
              {.runtime_arg_names =
@@ -98,7 +97,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_cor
          .hw_config = ttnn::create_reader_datamovement_config(device->arch()),
      };
  
-@@ -165,7 +181,7 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
+@@ -165,7 +179,7 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
                       .endpoint_type = DFBEndpointType::PRODUCER,
                   }},
              .compile_time_args =
@@ -107,7 +106,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_cor
              .hw_config = ComputeHardwareConfig{compute_cfg},
          };
      };
-@@ -214,43 +230,29 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
+@@ -214,43 +228,29 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
      KernelRunArgs reader_ra{.kernel = READER};
      KernelRunArgs writer_ra{.kernel = WRITER};
  
@@ -115,23 +114,33 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_cor
 -    uint32_t ncores_full = ncores - (cliff ? 1 : 0);
 -    uint32_t tile_start_id = 0;
 -    uint32_t page_start_id = 0;
-+    // Work item w is slice w % slices of tile row w / slices; a core takes consecutive items (whole tile rows
-+    // when there is one slice).
++    // Work item w is slice w % slices of tile row w / slices, and its tiles start at w * slice_tiles. A core
++    // takes consecutive items: whole tile rows with one slice, else a single slice (items == 1).
 +    uint32_t ncores_full = ncores - (has_cliff ? 1 : 0);
 +    uint32_t item = 0;
      const auto& cores = corerange_to_cores(available_grid);
 -    for (uint32_t i = 0; i < ncores_full; ++i) {
 -        const CoreCoord& core = cores[i];
--        AddRuntimeArgsForNode(
--            reader_ra.runtime_arg_values,
++    for (uint32_t i = 0; i < ncores; ++i) {
++        const uint32_t items = i < ncores_full ? nblocks_per_core : nblocks_per_core_cliff;
++        const uint32_t row = item / slices;
++        const uint32_t slice = item % slices;
+         AddRuntimeArgsForNode(
+             reader_ra.runtime_arg_values,
 -            core,
 -            {{"num_rows", nblocks_per_core * tile_height},
 -             {"num_tiles_per_block", ntiles_per_block},
 -             {"block_width_size", page_size},
--             {"num_full_blocks_in_row", uint32_t{1}},
++            cores[i],
++            {{"num_rows", items * tile_height},
++             {"num_tiles_per_block", slice_tiles},
++             {"block_width_size", slice_bytes},
+              {"num_full_blocks_in_row", uint32_t{1}},
 -             {"start_page_id", page_start_id}});
--        AddRuntimeArgsForNode(
--            writer_ra.runtime_arg_values,
++             {"start_page_id", row * tile_height * num_pages_in_row},
++             {"start_offset_bytes", slice * slice_bytes}});
+         AddRuntimeArgsForNode(
+             writer_ra.runtime_arg_values,
 -            core,
 -            {{"num_pages", ntiles_per_block * nblocks_per_core}, {"start_id", tile_start_id}});
 -
@@ -140,31 +149,45 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_cor
 -    }
 -    if (cliff) {
 -        const CoreCoord& core = cores[ncores_full];
-+    for (uint32_t i = 0; i < ncores; ++i) {
-+        const uint32_t items = i < ncores_full ? nblocks_per_core : nblocks_per_core_cliff;
-+        const uint32_t row = item / slices;
-+        const uint32_t slice = item % slices;
-         AddRuntimeArgsForNode(
-             reader_ra.runtime_arg_values,
+-        AddRuntimeArgsForNode(
+-            reader_ra.runtime_arg_values,
 -            core,
 -            {{"num_rows", nblocks_per_core_cliff * tile_height},
 -             {"num_tiles_per_block", ntiles_per_block},
 -             {"block_width_size", page_size},
-+            cores[i],
-+            {{"num_rows", (slices == 1 ? items : 1) * tile_height},
-+             {"num_tiles_per_block", slice_tiles},
-+             {"block_width_size", page_size / slices},
-              {"num_full_blocks_in_row", uint32_t{1}},
+-             {"num_full_blocks_in_row", uint32_t{1}},
 -             {"start_page_id", page_start_id}});
-+             {"start_page_id", row * tile_height * num_pages_in_row},
-+             {"start_offset_bytes", slice * (page_size / slices)}});
-         AddRuntimeArgsForNode(
-             writer_ra.runtime_arg_values,
+-        AddRuntimeArgsForNode(
+-            writer_ra.runtime_arg_values,
 -            core,
 -            {{"num_pages", ntiles_per_block * nblocks_per_core_cliff}, {"start_id", tile_start_id}});
 +            cores[i],
-+            {{"num_pages", slice_tiles * items}, {"start_id", row * ntiles_per_block + slice * slice_tiles}});
++            {{"num_pages", slice_tiles * items}, {"start_id", item * slice_tiles}});
 +        item += items;
      }
  
      run_args.kernel_run_args = {std::move(reader_ra), std::move(writer_ra)};
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.hpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.hpp
+@@ -17,6 +17,20 @@
+ 
+ namespace ttnn::prim {
+ 
++// How many width slices the default factory splits each tile row of an interleaved input into: the most that
++// divide a tile row, each at least 4 tiles wide, with every slice on a core of its own. One slice means that
++// cores take whole tile rows.
++inline uint32_t tilize_width_slices(uint32_t tiles_per_row, uint32_t tile_rows, uint32_t cores) {
++    constexpr uint32_t min_slice_tiles = 4;
++    uint32_t slices = 1;
++    for (uint32_t s = 2; tiles_per_row / s >= min_slice_tiles; ++s) {
++        if (tiles_per_row % s == 0 && tile_rows * s <= cores) {
++            slices = s;
++        }
++    }
++    return slices;
++}
++
+ struct TilizeDeviceOperation {
+     using operation_attributes_t = ttnn::prim::TilizeParams;
+     using tensor_args_t = ttnn::prim::TilizeInputs;
