@@ -1,0 +1,107 @@
+diff --git a/pjrt_implementation/inc/utils/logging.h b/pjrt_implementation/inc/utils/logging.h
+--- a/pjrt_implementation/inc/utils/logging.h
++++ b/pjrt_implementation/inc/utils/logging.h
+@@ -18,8 +18,20 @@
+ 
+ #include <loguru/loguru.hpp>
+ 
++#include <string>
++
+ namespace tt::pjrt {
+ void initializeLogging();
++
++// Collects the errors logged on this thread while alive, joined with "; ".
++struct ScopedErrorCollector {
++  ScopedErrorCollector();
++  ~ScopedErrorCollector();
++  static void record(const std::string &error);
++
++  std::string errors;
++};
++
+ bool isBringupStageLoggingEnabled();
+ void logBringupStage(const char *stage_name);
+ } // namespace tt::pjrt
+diff --git a/pjrt_implementation/src/utils/logging.cc b/pjrt_implementation/src/utils/logging.cc
+--- a/pjrt_implementation/src/utils/logging.cc
++++ b/pjrt_implementation/src/utils/logging.cc
+@@ -15,7 +15,42 @@
+ 
+ namespace tt::pjrt {
+ 
++static thread_local ScopedErrorCollector *t_error_collector = nullptr;
++
++// Keeps verbose compiler failures to a manageable message.
++static constexpr size_t c_max_collected_errors_size = 4000;
++
++ScopedErrorCollector::ScopedErrorCollector() { t_error_collector = this; }
++
++ScopedErrorCollector::~ScopedErrorCollector() { t_error_collector = nullptr; }
++
++void ScopedErrorCollector::record(const std::string &error) {
++  if (!t_error_collector) {
++    return;
++  }
++  std::string &errors = t_error_collector->errors;
++  if (errors.size() >= c_max_collected_errors_size) {
++    return;
++  }
++  errors += (errors.empty() ? "" : "; ") + error;
++  if (errors.size() > c_max_collected_errors_size) {
++    errors.resize(c_max_collected_errors_size);
++    errors += "...";
++  }
++}
++
+ void initializeLogging() {
++  static const bool error_collector_registered = [] {
++    loguru::add_callback(
++        "tt_pjrt_error_collector",
++        [](void *, const loguru::Message &message) {
++          ScopedErrorCollector::record(message.message);
++        },
++        nullptr, loguru::Verbosity_ERROR);
++    return true;
++  }();
++  (void)error_collector_registered;
++
+   // Everything with a verbosity equal or below g_stderr_verbosity will
+   // be written to stderr. Setting to INFO by default.
+   loguru::g_stderr_verbosity = loguru::NamedVerbosity::Verbosity_INFO;
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -962,10 +962,16 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
+ 
+   ClientInstance *client_instance = ClientInstance::unwrap(args->client);
+ 
++  // A bare status code would not say why compilation failed.
++  ScopedErrorCollector compile_errors;
+   tt_pjrt_status compile_status = client_instance->compileMlirProgram(
+       args->program,
+       reinterpret_cast<LoadedExecutableInstance **>(&args->executable),
+       compile_options_map, replica_device_ids, target_num_devices);
++  if (!tt_pjrt_status_is_ok(compile_status) && !compile_errors.errors.empty()) {
++    return *ErrorInstance::makeError(compile_status, compile_errors.errors)
++                .release();
++  }
+ 
+   return *ErrorInstance::makeError(compile_status).release();
+ }
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -341,6 +341,13 @@ static std::unique_ptr<mlir::MLIRContext> createMlirContext() {
+   // openXLA repository. See issue:
+   // https://github.com/tenstorrent/tt-xla/issues/355
+   context->allowUnregisteredDialects();
++  // Collect error diagnostics, then let the default handler print them.
++  context->getDiagEngine().registerHandler([](mlir::Diagnostic &diag) {
++    if (diag.getSeverity() == mlir::DiagnosticSeverity::Error) {
++      ScopedErrorCollector::record(diag.str());
++    }
++    return mlir::failure();
++  });
+   return context;
+ }
+ 
