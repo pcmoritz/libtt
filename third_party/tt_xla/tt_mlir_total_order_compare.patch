@@ -47,37 +47,140 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -212,9 +212,12 @@
+@@ -212,9 +212,13 @@
    LogicalResult
    matchAndRewrite(TTIROpTy op, OpAdaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
 -    rewriter.replaceOpWithNewOp<TTNNOpTy>(
++    auto totalOrder = op->getAttr("ttcore.total_order");
 +    auto newOp = rewriter.replaceOpWithNewOp<TTNNOpTy>(
          op, this->getTypeConverter()->convertType(op.getType()),
          adaptor.getLhs(), adaptor.getRhs());
-+    if (auto attr = op->getAttr("ttcore.total_order")) {
-+      newOp->setAttr("ttcore.total_order", attr);
++    if (totalOrder) {
++      newOp->setAttr("ttcore.total_order", totalOrder);
 +    }
      return success();
    }
  };
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -656,8 +656,12 @@
+   // NOLINTBEGIN(clang-analyzer-core.StackAddressEscape)
+   patterns.add(
+       +[](mlir::tt::ttir::LessEqualOp op, mlir::PatternRewriter &rewriter) {
+-        rewriter.replaceOpWithNewOp<mlir::tt::ttir::GreaterEqualOp>(
++        auto totalOrder = op->getAttr("ttcore.total_order");
++        auto newOp = rewriter.replaceOpWithNewOp<mlir::tt::ttir::GreaterEqualOp>(
+             op, op.getResult().getType(), op.getRhs(), op.getLhs());
++        if (totalOrder) {
++          newOp->setAttr("ttcore.total_order", totalOrder);
++        }
+         return mlir::success();
+       });
+   // NOLINTEND(clang-analyzer-core.StackAddressEscape)
+@@ -673,8 +677,12 @@
+   // NOLINTBEGIN(clang-analyzer-core.StackAddressEscape)
+   patterns.add(
+       +[](mlir::tt::ttir::LessThanOp op, mlir::PatternRewriter &rewriter) {
+-        rewriter.replaceOpWithNewOp<mlir::tt::ttir::GreaterThanOp>(
++        auto totalOrder = op->getAttr("ttcore.total_order");
++        auto newOp = rewriter.replaceOpWithNewOp<mlir::tt::ttir::GreaterThanOp>(
+             op, op.getResult().getType(), op.getRhs(), op.getLhs());
++        if (totalOrder) {
++          newOp->setAttr("ttcore.total_order", totalOrder);
++        }
+         return mlir::success();
+       });
+   // NOLINTEND(clang-analyzer-core.StackAddressEscape)
+@@ -8920,6 +8928,10 @@
+ //===----------------------------------------------------------------------===//
+ 
+ ::mlir::OpFoldResult mlir::tt::ttir::EqualOp::fold(FoldAdaptor adaptor) {
++  // Constant folding compares floats in the ordinary order.
++  if ((*this)->hasAttr("ttcore.total_order")) {
++    return nullptr;
++  }
+   if (mlir::OpFoldResult result =
+           foldSelfComparison(*this, getLhs(), getRhs(), /*foldToTrue=*/true)) {
+     return result;
+@@ -8938,6 +8950,10 @@
+ //===----------------------------------------------------------------------===//
+ 
+ ::mlir::OpFoldResult mlir::tt::ttir::NotEqualOp::fold(FoldAdaptor adaptor) {
++  // Constant folding compares floats in the ordinary order.
++  if ((*this)->hasAttr("ttcore.total_order")) {
++    return nullptr;
++  }
+   if (mlir::OpFoldResult result =
+           foldSelfComparison(*this, getLhs(), getRhs(), /*foldToTrue=*/false)) {
+     return result;
+@@ -8956,6 +8972,10 @@
+ //===----------------------------------------------------------------------===//
+ 
+ ::mlir::OpFoldResult mlir::tt::ttir::GreaterEqualOp::fold(FoldAdaptor adaptor) {
++  // Constant folding compares floats in the ordinary order.
++  if ((*this)->hasAttr("ttcore.total_order")) {
++    return nullptr;
++  }
+   auto intType = mlir::dyn_cast<mlir::IntegerType>(getType().getElementType());
+   auto isUnsigned = intType && intType.isUnsignedInteger();
+   return constantFoldEltwiseBinary(
+@@ -8974,6 +8994,10 @@
+ //===----------------------------------------------------------------------===//
+ 
+ ::mlir::OpFoldResult mlir::tt::ttir::GreaterThanOp::fold(FoldAdaptor adaptor) {
++  // Constant folding compares floats in the ordinary order.
++  if ((*this)->hasAttr("ttcore.total_order")) {
++    return nullptr;
++  }
+   auto intType = mlir::dyn_cast<mlir::IntegerType>(getType().getElementType());
+   auto isUnsigned = intType && intType.isUnsignedInteger();
+   return constantFoldEltwiseBinary(
 diff --git a/lib/Dialect/TTIR/Transforms/PredicateTypeAlignment.cpp b/lib/Dialect/TTIR/Transforms/PredicateTypeAlignment.cpp
 --- a/lib/Dialect/TTIR/Transforms/PredicateTypeAlignment.cpp
 +++ b/lib/Dialect/TTIR/Transforms/PredicateTypeAlignment.cpp
-@@ -190,8 +190,11 @@
+@@ -190,8 +190,12 @@
      auto newResultType =
          buildTensorWithElementType(resultType, lhsType.getElementType());
  
 -    rewriter.replaceOpWithNewOp<ComparisonOp>(op, newResultType, op.getLhs(),
 -                                              op.getRhs());
++    auto totalOrder = op->getAttr("ttcore.total_order");
 +    auto newOp = rewriter.replaceOpWithNewOp<ComparisonOp>(
 +        op, newResultType, op.getLhs(), op.getRhs());
-+    if (auto attr = op->getAttr("ttcore.total_order")) {
-+      newOp->setAttr("ttcore.total_order", attr);
++    if (totalOrder) {
++      newOp->setAttr("ttcore.total_order", totalOrder);
 +    }
      return mlir::success();
    }
  };
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -226,8 +226,10 @@
+   mlir::LogicalResult
+   matchAndRewrite(ElementwiseBinaryActivations binaryOpWithActivations,
+                   mlir::PatternRewriter &rewriter) const final {
+-    // Remainder runs as a truncating fmod, which takes no activations.
+-    if (isa<RemainderOp>(binaryOpWithActivations.getOperation())) {
++    // Remainder runs as a truncating fmod, and a total-order comparison as a
++    // native SFPU comparison; neither takes activations.
++    if (isa<RemainderOp>(binaryOpWithActivations.getOperation()) ||
++        binaryOpWithActivations->hasAttr("ttcore.total_order")) {
+       return mlir::failure();
+     }
+     auto binaryOp =
+@@ -309,7 +311,8 @@
+     }
+ 
+     auto binaryOp = getFusableBinaryOp(unaryOp.getInput());
+-    if (!binaryOp) {
++    // A total-order comparison takes no activations.
++    if (!binaryOp || binaryOp->hasAttr("ttcore.total_order")) {
+       return failure();
+     }
+ 
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
@@ -103,7 +206,7 @@ diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp b/runtime/lib
  #include "ttnn/operations/experimental/quasar/binary/binary.hpp"
  
  #include <vector>
-@@ -64,9 +66,65 @@
+@@ -64,9 +66,69 @@
    tensorPool.insertTTNNTensorAndValidate(op->out(), out);
  }
  
@@ -135,8 +238,12 @@ diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp b/runtime/lib
 +  default:
 +    LOG_FATAL("Total order is only defined for comparisons");
 +  }
-+  LOG_ASSERT(!op->output_activations() && !op->input_tensor_a_activations() &&
-+                 !op->input_tensor_b_activations(),
++  auto empty = [](const auto *activations) {
++    return activations == nullptr || activations->size() == 0;
++  };
++  LOG_ASSERT(empty(op->output_activations()) &&
++                 empty(op->input_tensor_a_activations()) &&
++                 empty(op->input_tensor_b_activations()),
 +             "Total-order comparisons take no activations");
 +
 +  const ::ttnn::Tensor &lhs = tensorPool.getTTNNTensorAndValidate(op->lhs());

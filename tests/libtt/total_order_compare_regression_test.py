@@ -90,13 +90,35 @@ def test_total_order_compare(direction):
     np.testing.assert_array_equal(np.asarray(got), expected)
 
 
-def test_total_order_compare_runs_natively(tmp_path):
+# LT and LE are canonicalized to GT and GE with swapped operands, which must
+# keep the marker.
+@pytest.mark.parametrize("direction", ["LT", "LE", "GT", "EQ"])
+def test_total_order_compare_runs_natively(direction, tmp_path):
     # The comparison reaches TTNN as one marked op, without bit-key arithmetic.
-    run = jax.jit(TOTAL_ORDER_COMPARE["LT"].bind, compiler_options={"export_path": str(tmp_path)})
+    run = jax.jit(TOTAL_ORDER_COMPARE[direction].bind, compiler_options={"export_path": str(tmp_path)})
     run(device_put(X), device_put(Y))
     irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn*.mlir")]
     assert irs and any("ttcore.total_order" in ir for ir in irs)
     assert not any("bitcast_convert" in ir for ir in irs)
+
+
+# Constant operands, where ordinary float folding would give EQ(-0, +0) = true
+# and EQ(NaN, NaN) = false.
+@pytest.mark.parametrize("direction", DIRECTIONS)
+@pytest.mark.parametrize(
+    "lhs_bits,rhs_bits",
+    [
+        ([0x80000000] * 4, [0x00000000] * 4),  # splat -0 vs +0
+        ([0x7FC00000] * 4, [0x7FC00000] * 4),  # splat NaN vs NaN
+        ([0x80000000, 0x7FC00000, 0xFFC00000, 0x7F800000], [0x00000000, 0x7FC00000, 0x7FC00000, 0x7FC00000]),
+    ],
+)
+def test_total_order_compare_of_constants(direction, lhs_bits, rhs_bits):
+    lhs = np.array(lhs_bits, np.uint32).view(np.float32)
+    rhs = np.array(rhs_bits, np.uint32).view(np.float32)
+    got = jax.jit(lambda: TOTAL_ORDER_COMPARE[direction].bind(jnp.asarray(lhs), jnp.asarray(rhs)))()
+    expected = NUMPY_OPS[direction](total_order_keys(lhs), total_order_keys(rhs))
+    np.testing.assert_array_equal(np.asarray(got), expected)
 
 
 @pytest.mark.parametrize("direction", DIRECTIONS)
