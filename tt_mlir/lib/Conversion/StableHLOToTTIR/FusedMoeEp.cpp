@@ -153,10 +153,10 @@ public:
           rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
     };
 
-    // The kernel's operands: the ids as they are (the kernel reads an int32
-    // id's low 16 bits, so that padding's negative ids land past the experts,
-    // where it skips them) and the experts with a leading layer dimension. Its
-    // local output reads no scores: the weights only fill the operand.
+    // The kernel's operands: the ids as they are (the kernel reads them as
+    // unsigned, so that padding's negative ids land past the experts, where it
+    // skips them) and the experts with a leading layer dimension. Its local
+    // output reads no scores: the weights only fill the operand.
     auto withLayer = [&](Value w) {
       auto shape = cast<RankedTensorType>(w.getType()).getShape();
       return reshape(w, {1, shape[0], shape[1], shape[2]});

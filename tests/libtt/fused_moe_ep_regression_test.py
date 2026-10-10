@@ -34,7 +34,8 @@ def problem(rng, tokens, experts, padding):
     w2 = rng.standard_normal((experts, INTERMEDIATE, HIDDEN)) * INTERMEDIATE**-0.5
     x = rng.standard_normal((tokens, HIDDEN))
     ids = np.stack([rng.choice(experts, K, replace=False) for _ in range(tokens)]).astype(np.int32)
-    ids[tokens - padding :] = -1
+    # Any negative id is padding, also one whose low 16 bits are an expert's.
+    ids[tokens - padding :] = rng.choice([-1, -65536, np.iinfo(np.int32).min], (padding, K))
     weights = rng.random((tokens, K)).astype(np.float32)
     weights /= weights.sum(1, keepdims=True)
     bf16 = lambda a: np.asarray(a).astype(jnp.bfloat16)

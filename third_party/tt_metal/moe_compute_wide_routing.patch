@@ -1,17 +1,20 @@
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h
-@@ -140,6 +140,16 @@ constexpr bool in_window(uint32_t) { return false; }
+@@ -140,6 +140,19 @@ constexpr bool in_window(uint32_t) { return false; }
  #endif
  #define MOE_STUDY_FAULT(point) (MOE_STUDY_DELAY_##point > 0)
  #define MOE_STUDY_PARAM(point) (MOE_STUDY_DELAY_##point)
 +namespace moe_ring::routing {
-+// A token's routing row holds uint16 expert ids, or int32 ids as a router produces them, read as an id's low 16 bits
-+// (a negative padding id lands past the experts).
++// A token's routing row holds uint16 expert ids, or int32 ids as a router produces them, read at their full width:
++// a negative id, such as a padding token's, lands past the experts as an unsigned value.
 +template <bool kWide>
-+inline uint16_t expert_id(uint32_t row, uint32_t k) {
-+    // Little endian: an int32 id's low 16 bits are its first half.
-+    return reinterpret_cast<const uint16_t*>(row)[kWide ? 2 * k : k];
++inline uint32_t expert_id(uint32_t row, uint32_t k) {
++    if constexpr (kWide) {
++        return reinterpret_cast<const uint32_t*>(row)[k];
++    } else {
++        return reinterpret_cast<const uint16_t*>(row)[k];
++    }
 +}
 +}  // namespace moe_ring::routing
 +
@@ -43,7 +46,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  
          for (uint32_t k = 0; k < selected_experts_k; k++) {
 -            const uint16_t selected_expert = token_indices[k];
-+            const uint16_t selected_expert = moe_ring::routing::expert_id<wide_routing>(token_indices, k);
++            const uint32_t selected_expert = moe_ring::routing::expert_id<wide_routing>(token_indices, k);
  
              // An id past the experts (such as a padding token's) selects no expert.
              if (selected_expert >= experts) {
@@ -72,7 +75,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  
          for (uint32_t k = 0; k < selected_experts_k; k++) {
 -            const uint16_t selected_expert = token_indices[k];
-+            const uint16_t selected_expert = moe_ring::routing::expert_id<wide_routing>(token_indices, k);
++            const uint32_t selected_expert = moe_ring::routing::expert_id<wide_routing>(token_indices, k);
  
              // An id past the experts (such as a padding token's) selects no expert.
              if (selected_expert >= experts) {
