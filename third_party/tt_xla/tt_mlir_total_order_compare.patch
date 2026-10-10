@@ -19,7 +19,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    LogicalResult
    matchAndRewrite(mlir::stablehlo::CompareOp srcOp,
                    mlir::stablehlo::CompareOp::Adaptor adaptor,
-@@ -4353,6 +4359,28 @@
+@@ -4353,6 +4359,24 @@
      mlir::stablehlo::ComparisonDirection direction =
          srcOp.getComparisonDirection();
  
@@ -37,24 +37,20 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      Value lhs = toTotalOrderKey(srcOp.getLhs(), bitsOnly, rewriter);
 +      Value rhs = toTotalOrderKey(srcOp.getRhs(), bitsOnly, rewriter);
 +      rewriter.replaceOpWithNewOp<mlir::stablehlo::CompareOp>(
-+          srcOp, srcOp.getType(), lhs, rhs,
-+          mlir::stablehlo::ComparisonDirectionAttr::get(getContext(),
-+                                                        direction),
-+          mlir::stablehlo::ComparisonTypeAttr::get(
-+              getContext(), mlir::stablehlo::ComparisonType::SIGNED));
++          srcOp, lhs, rhs, direction, mlir::stablehlo::ComparisonType::SIGNED);
 +      return success();
 +    }
 +
      switch (direction) {
      case mlir::stablehlo::ComparisonDirection::EQ: {
        return matchAndRewriteInternal<mlir::tt::ttir::EqualOp>(srcOp, adaptor,
-@@ -4389,6 +4417,46 @@
+@@ -4389,6 +4413,44 @@
    }
  
  private:
 +  // Returns int32 keys whose signed order is the IEEE total order of `value`'s
-+  // floats (as float32), as in XLA's ComparisonExpander:
-+  //   key = bits < 0 ? bits ^ 0x7fffffff : bits
++  // floats (as float32), as in XLA's ComparisonExpander but branchless:
++  //   key = bits ^ ((bits >> 31) & 0x7fffffff)
 +  // The bits of a non-negative float already order as an integer; flipping
 +  // all but the sign bit of a negative one reverses the order of negatives.
 +  // Keys of a broadcast are computed before it, on the smaller tensor.
@@ -83,13 +79,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      return rewriter.create<mlir::stablehlo::ConstantOp>(
 +          loc, DenseElementsAttr::get(i32Type, llvm::ArrayRef<int32_t>{fill}));
 +    };
-+    Value negative = rewriter.create<mlir::stablehlo::CompareOp>(
-+        loc, bits, constant(0), mlir::stablehlo::ComparisonDirection::LT,
-+        mlir::stablehlo::ComparisonType::SIGNED);
-+    Value flipped =
-+        rewriter.create<mlir::stablehlo::XorOp>(loc, bits, constant(0x7FFFFFFF));
-+    return rewriter.create<mlir::stablehlo::SelectOp>(loc, negative, flipped,
-+                                                      bits);
++    Value sign = rewriter.create<mlir::stablehlo::ShiftRightArithmeticOp>(
++        loc, bits, constant(31));
++    Value mask =
++        rewriter.create<mlir::stablehlo::AndOp>(loc, sign, constant(0x7FFFFFFF));
++    return rewriter.create<mlir::stablehlo::XorOp>(loc, bits, mask);
 +  }
 +
    template <typename DestOp>

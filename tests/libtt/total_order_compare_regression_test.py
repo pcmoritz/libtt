@@ -145,11 +145,13 @@ def test_float_compare_unchanged(direction):
     np.testing.assert_array_equal(np.asarray(got), NUMPY_OPS[direction](X, Y))
 
 
+# scan compares in a loop; compare_all compares broadcast operands.
+@pytest.mark.parametrize("method", ["scan", "compare_all"])
 @pytest.mark.parametrize("side", ["left", "right"])
-def test_searchsorted_special_values(side):
+def test_searchsorted_special_values(side, method):
     # bfloat16 is not covered: on device its NaN compares equal to inf even
     # before the comparison, a separate issue.
     a = np.sort(np.array([np.nan, -np.inf, -1.5, -0.0, 0.0, 1e-30, 2.5, np.inf, 1.0, np.nan, 2.5], np.float32))
     v = np.array([np.nan, -np.inf, -1.5, -0.0, 0.0, 1e-30, 2.5, np.inf, 3.0, -2.0], np.float32)
-    got = jax.jit(lambda a, v: jnp.searchsorted(a, v, side=side))(device_put(a), device_put(v))
+    got = jax.jit(lambda a, v: jnp.searchsorted(a, v, side=side, method=method))(device_put(a), device_put(v))
     np.testing.assert_array_equal(np.asarray(got), np.searchsorted(a, v, side=side))
