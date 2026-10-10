@@ -1,0 +1,171 @@
+diff --git a/include/ttmlir/Target/TTNN/operations/eltwise.fbs b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+--- a/include/ttmlir/Target/TTNN/operations/eltwise.fbs
++++ b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+@@ -34,6 +34,8 @@
+   input_tensor_a_activations: [UnaryWithParam];
+   input_tensor_b_activations: [UnaryWithParam];
+   out: tt.target.ttnn.TensorRef;
++  // A float32 comparison in IEEE 754 total order (StableHLO TOTALORDER).
++  total_order: bool = false;
+ }
+ 
+ enum EltwiseBinaryCompositeOpType: uint32 {
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -4397,6 +4397,30 @@
+     auto outputType = mlir::cast<RankedTensorType>(
+         this->getTypeConverter()->convertType(srcOp.getResult().getType()));
+ 
++    // A total-order float comparison (as in JAX's sort and searchsorted
++    // comparators) orders -NaN < -inf < ... < -0 < +0 < ... < +inf < +NaN,
++    // which ordinary float comparisons do not: ordered comparisons with NaN
++    // are false. Mark it `ttcore.total_order`; the runtime runs it as a native
++    // float32 total-order comparison, so narrower floats are cast to float32.
++    if (srcOp.getCompareType() ==
++            mlir::stablehlo::ComparisonType::TOTALORDER &&
++        isa<FloatType>(
++            cast<RankedTensorType>(adaptor.getLhs().getType()).getElementType())) {
++      auto toFloat32 = [&](Value value) -> Value {
++        auto type = cast<RankedTensorType>(value.getType());
++        if (type.getElementType() == rewriter.getF32Type()) {
++          return value;
++        }
++        return rewriter.create<ttir::TypecastOp>(
++            srcOp.getLoc(), type.clone(rewriter.getF32Type()), value);
++      };
++      auto newOp = rewriter.replaceOpWithNewOp<DestOp>(
++          srcOp, outputType, toFloat32(adaptor.getLhs()),
++          toFloat32(adaptor.getRhs()));
++      newOp->setAttr("ttcore.total_order", rewriter.getUnitAttr());
++      return success();
++    }
++
+     // If one operand is a `stablehlo.convert(narrow -> wider)` and the other
+     // is a `stablehlo.constant<wider>` whose elements fit in the narrow
+     // type, replace both with the narrow input and a freshly-narrowed
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -212,9 +212,12 @@
+   LogicalResult
+   matchAndRewrite(TTIROpTy op, OpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+-    rewriter.replaceOpWithNewOp<TTNNOpTy>(
++    auto newOp = rewriter.replaceOpWithNewOp<TTNNOpTy>(
+         op, this->getTypeConverter()->convertType(op.getType()),
+         adaptor.getLhs(), adaptor.getRhs());
++    if (auto attr = op->getAttr("ttcore.total_order")) {
++      newOp->setAttr("ttcore.total_order", attr);
++    }
+     return success();
+   }
+ };
+diff --git a/lib/Dialect/TTIR/Transforms/PredicateTypeAlignment.cpp b/lib/Dialect/TTIR/Transforms/PredicateTypeAlignment.cpp
+--- a/lib/Dialect/TTIR/Transforms/PredicateTypeAlignment.cpp
++++ b/lib/Dialect/TTIR/Transforms/PredicateTypeAlignment.cpp
+@@ -190,8 +190,11 @@
+     auto newResultType =
+         buildTensorWithElementType(resultType, lhsType.getElementType());
+ 
+-    rewriter.replaceOpWithNewOp<ComparisonOp>(op, newResultType, op.getLhs(),
+-                                              op.getRhs());
++    auto newOp = rewriter.replaceOpWithNewOp<ComparisonOp>(
++        op, newResultType, op.getLhs(), op.getRhs());
++    if (auto attr = op->getAttr("ttcore.total_order")) {
++      newOp->setAttr("ttcore.total_order", attr);
++    }
+     return mlir::success();
+   }
+ };
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -2458,7 +2458,8 @@
+ 
+   return ::tt::target::ttnn::CreateEltwiseBinaryOp(
+       *cache.fbb, type, lhs, rhs, outputDtype, memoryConfig, activations,
+-      inputTensorAActivations, inputTensorBActivations, out);
++      inputTensorAActivations, inputTensorBActivations, out,
++      op->hasAttr("ttcore.total_order"));
+ }
+ 
+ template <typename EltwiseBinaryCompositeOp>
+diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp b/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
+--- a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
++++ b/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
+@@ -7,6 +7,8 @@
+ #include "tt/runtime/detail/ttnn/ttnn.h"
+ #include "tt/runtime/detail/ttnn/utils.h"
+ 
++#include "ttnn/operations/copy/typecast/typecast.hpp"
++#include "ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.hpp"
+ #include "ttnn/operations/experimental/quasar/binary/binary.hpp"
+ 
+ #include <vector>
+@@ -64,9 +66,65 @@
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+ 
++// A float32 comparison in IEEE 754 total order, which binary_ng runs as a
++// native SFPU comparison (Blackhole).
++static void runTotalOrderCompareOp(const ::tt::target::ttnn::EltwiseBinaryOp *op,
++                                   ProgramTensorPool &tensorPool) {
++  using ::ttnn::operations::binary_ng::BinaryOpType;
++  BinaryOpType type;
++  switch (op->type()) {
++  case ::tt::target::ttnn::EltwiseBinaryOpType::Equal:
++    type = BinaryOpType::EQ_TOTAL_ORDER;
++    break;
++  case ::tt::target::ttnn::EltwiseBinaryOpType::NotEqual:
++    type = BinaryOpType::NE_TOTAL_ORDER;
++    break;
++  case ::tt::target::ttnn::EltwiseBinaryOpType::LessThan:
++    type = BinaryOpType::LT_TOTAL_ORDER;
++    break;
++  case ::tt::target::ttnn::EltwiseBinaryOpType::GreaterThan:
++    type = BinaryOpType::GT_TOTAL_ORDER;
++    break;
++  case ::tt::target::ttnn::EltwiseBinaryOpType::LessEqual:
++    type = BinaryOpType::LE_TOTAL_ORDER;
++    break;
++  case ::tt::target::ttnn::EltwiseBinaryOpType::GreaterEqual:
++    type = BinaryOpType::GE_TOTAL_ORDER;
++    break;
++  default:
++    LOG_FATAL("Total order is only defined for comparisons");
++  }
++  LOG_ASSERT(!op->output_activations() && !op->input_tensor_a_activations() &&
++                 !op->input_tensor_b_activations(),
++             "Total-order comparisons take no activations");
++
++  const ::ttnn::Tensor &lhs = tensorPool.getTTNNTensorAndValidate(op->lhs());
++  const ::ttnn::Tensor &rhs = tensorPool.getTTNNTensorAndValidate(op->rhs());
++  std::optional<::ttnn::MemoryConfig> outputMemoryConfig =
++      ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(
++          op->memory_config());
++
++  // binary_ng packs wrong values when a float32 comparison asks for a narrower
++  // result, so compare to float32 and typecast.
++  ::ttnn::Tensor out = ::ttnn::prim::binary_ng(lhs, rhs, type, std::nullopt,
++                                               outputMemoryConfig);
++  if (op->output_dtype()) {
++    ::ttnn::DataType outputDataType =
++        ::tt::runtime::ttnn::utils::toTTNNDataType(*(op->output_dtype()));
++    if (outputDataType != out.dtype()) {
++      out = ::ttnn::typecast(out, outputDataType, outputMemoryConfig);
++    }
++  }
++  tensorPool.insertTTNNTensorAndValidate(op->out(), out);
++}
++
+ void run(const ::tt::target::ttnn::EltwiseBinaryOp *op,
+          ProgramContext &context) {
+   ProgramTensorPool &tensorPool = context.getTensorPool();
++  if (op->total_order()) {
++    runTotalOrderCompareOp(op, tensorPool);
++    return;
++  }
+   switch (op->type()) {
+   /* Eltwise Binary */
+   case ::tt::target::ttnn::EltwiseBinaryOpType::Add: {
