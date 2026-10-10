@@ -1,0 +1,31 @@
+diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+--- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
++++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+@@ -18,6 +18,7 @@
+ #include "ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.hpp"
+ #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
+ #include "ttnn/operations/experimental/reshape/view.hpp"
++#include "ttnn/operations/copy/typecast/typecast.hpp"
+ #include "ttnn/operations/core/core.hpp"
+ #include "ttnn/types.hpp"
+ 
+@@ -112,6 +113,19 @@
+         return view_float16_bits(converted, float_dtype);
+     }
+ 
++    // Tilize converts dtypes in the packer, which turns FP16 infinities into NaN
++    // and flushes FP16 subnormals to zero. Tilize in the input dtype, which keeps
++    // every FP16 bit (see above), and convert with the exact SFPU typecast.
++    const auto is_float = [](DataType type) {
++        return type == DataType::FLOAT32 || type == DataType::BFLOAT16 || type == DataType::FLOAT16;
++    };
++    if (tensor_arg.storage_type() == StorageType::DEVICE && layout == Layout::TILE && dtype.has_value() &&
++        *dtype != tensor_arg.dtype() && (*dtype == DataType::FLOAT16 || tensor_arg.dtype() == DataType::FLOAT16) &&
++        is_float(*dtype) && is_float(tensor_arg.dtype())) {
++        auto tiled = to_layout_impl(tensor_arg, layout, std::nullopt, memory_config, sub_core_grids, pad_value);
++        return ttnn::typecast(tiled, *dtype, memory_config, std::nullopt, sub_core_grids);
++    }
++
+     const std::set<ttnn::Layout> supported_layouts = {
+         ttnn::ROW_MAJOR_LAYOUT,
+         ttnn::TILE_LAYOUT,

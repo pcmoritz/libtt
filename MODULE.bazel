@@ -333,6 +333,7 @@ http_archive(
         "//third_party/tt_metal:typecast_int32_to_uint16_wrap.patch",
         "//third_party/tt_metal:typecast_float16_bfloat16.patch",
         "//third_party/tt_metal:binary_float16_add_sub_sfpu.patch",
+        "//third_party/tt_metal:to_layout_float16_typecast.patch",
     ],
     sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
     strip_prefix = "tt-metal-eb97711f4be2a30cfbff05266faf90bf9780d0c2",
