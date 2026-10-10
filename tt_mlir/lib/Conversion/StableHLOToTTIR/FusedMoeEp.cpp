@@ -1,5 +1,4 @@
-// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
-//
+// SPDX-FileCopyrightText: © 2026 libtt authors
 // SPDX-License-Identifier: Apache-2.0
 
 // tt.fused_moe_ep: a mixture-of-experts layer's experts on one device of an
