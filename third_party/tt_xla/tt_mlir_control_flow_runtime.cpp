@@ -6,6 +6,7 @@
 #include "tt/runtime/detail/common/logger.h"
 #include "tt/runtime/detail/ttnn/program_executor.h"
 #include "tt/runtime/detail/ttnn/ttnn.h"
+#include "tt/runtime/detail/ttnn/types/trace_cache.h"
 #include "tt/runtime/detail/ttnn/utils.h"
 #include "tt/runtime/utils.h"
 
@@ -14,7 +15,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include <mutex>
 #include <optional>
 #include <set>
 #include <utility>
@@ -158,10 +158,6 @@ bool logLoopTraces() {
   return env != nullptr && std::strcmp(env, "0") != 0;
 }
 
-// Bodies whose captures failed once, keyed by executable and body program.
-std::mutex untraceableBodiesMutex;
-std::set<std::pair<uint64_t, uint32_t>> untraceableBodies;
-
 // A condition-driven loop's trip count is unknown, so its body is captured
 // only once this many iterations have run in the current invocation; short
 // loops never pay for a capture.
@@ -176,13 +172,10 @@ std::pair<uint64_t, uint32_t> bodyKey(ProgramContext &context,
 // (transfers, readbacks, nested control flow, CPU-hoisted ops) cannot be
 // captured. Bodies with such ops, or with any result outside device memory,
 // run op by op.
-bool isTraceableBody(ProgramContext &context, uint32_t programId,
-                     size_t stateSize) {
-  {
-    std::lock_guard lock(untraceableBodiesMutex);
-    if (untraceableBodies.count(bodyKey(context, programId))) {
-      return false;
-    }
+bool isTraceableBody(ProgramContext &context, TraceCache &traceCache,
+                     uint32_t programId, size_t stateSize) {
+  if (traceCache.untraceableLoopBodies.count(bodyKey(context, programId))) {
+    return false;
   }
   using ::tt::target::ttnn::OpType;
   const auto *program =
@@ -321,6 +314,9 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
   // state value into its slot, so the next replay and the condition program
   // read the current state from the same buffers.
   ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();
+  TraceCache &traceCache =
+      context.getDeviceHandle().getTraceCache()->as<TraceCache>(
+          DeviceRuntime::TTNN);
   std::optional<::ttnn::MeshTraceId> bodyTrace;
   struct ReleaseTrace {
     ::ttnn::MeshDevice &device;
@@ -403,8 +399,8 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
       LOG_WARNING("Running while loop body op by op; cannot update its state "
                   "in place: ",
                   error.what());
-      std::lock_guard lock(untraceableBodiesMutex);
-      untraceableBodies.insert(bodyKey(context, op->program_id()));
+      traceCache.untraceableLoopBodies.insert(
+          bodyKey(context, op->program_id()));
       return;
     }
     bodyOutputs.clear();
@@ -436,8 +432,8 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
       }
       LOG_WARNING("Running while loop body op by op; trace capture failed: ",
                   error.what());
-      std::lock_guard lock(untraceableBodiesMutex);
-      untraceableBodies.insert(bodyKey(context, op->program_id()));
+      traceCache.untraceableLoopBodies.insert(
+          bodyKey(context, op->program_id()));
       return;
     }
     bodyTrace = trace;
@@ -458,7 +454,7 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
       if (remaining.value_or(3) >= 3 && loopBodyTracingEnabled() &&
           meshDevice.get_program_cache().is_enabled() &&
           std::all_of(inputs.begin(), inputs.end(), isDeviceTensor) &&
-          isTraceableBody(context, op->program_id(), stateSize)) {
+          isTraceableBody(context, traceCache, op->program_id(), stateSize)) {
         runIterationAndCaptureBody();
         return;
       }
