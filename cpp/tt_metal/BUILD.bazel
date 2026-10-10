@@ -1,0 +1,12 @@
+# libtt's own tt-metal device code, laid out like tt-metal's tt_metal/. It goes
+# into the runtime archive at the same paths as tt-metal's (cpp/tt_metal/ ->
+# tt_metal/, see third_party/tt_metal/BUILD.overlay.bazel), so kernels include
+# it like upstream headers, e.g. "api/compute/matmul_fp32.h".
+
+package(default_visibility = ["//visibility:public"])
+
+# Compiled at run time, like tt-metal's kernels.
+filegroup(
+    name = "kernels",
+    srcs = glob(["hw/**"]),
+)
