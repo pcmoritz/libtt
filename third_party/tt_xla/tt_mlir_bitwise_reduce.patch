@@ -1,0 +1,169 @@
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -291,6 +291,10 @@
+   matchAndRewrite(mlir::stablehlo::ReduceOp srcOp,
+                   mlir::stablehlo::ReduceOp::Adaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
++    if (isElementwiseFoldReduction(srcOp)) {
++      return matchAndRewriteElementwiseFold(srcOp, adaptor, rewriter);
++    }
++
+     LogicalResult legalityResult =
+         checkConversionLegality(srcOp, adaptor, rewriter);
+     if (!legalityResult.succeeded()) {
+@@ -338,6 +342,155 @@
+   }
+ 
+ private:
++  // StableHLO reduces integers with bitwise and/or/xor, but TTIR only has
++  // logical and/or reductions on booleans. Matches a single-input reduce whose
++  // body applies one of these ops directly to its arguments, for integer
++  // inputs, or xor for boolean inputs.
++  bool isElementwiseFoldReduction(mlir::stablehlo::ReduceOp &srcOp) const {
++    if (srcOp.getInputs().size() != 1 || !srcOp.getBody().hasOneBlock()) {
++      return false;
++    }
++    Block &body = srcOp.getBody().front();
++    if (body.getNumArguments() != 2 || body.getOperations().size() != 2) {
++      return false;
++    }
++    Operation &combiner = body.front();
++    if (!mlir::isa<mlir::stablehlo::AndOp, mlir::stablehlo::OrOp,
++                   mlir::stablehlo::XorOp>(combiner)) {
++      return false;
++    }
++    auto returnOp =
++        mlir::dyn_cast<mlir::stablehlo::ReturnOp>(body.getTerminator());
++    if (!returnOp || returnOp.getNumOperands() != 1 ||
++        returnOp.getOperand(0) != combiner.getResult(0)) {
++      return false;
++    }
++    Value lhs = combiner.getOperand(0);
++    Value rhs = combiner.getOperand(1);
++    Value accumulator = body.getArgument(0);
++    Value element = body.getArgument(1);
++    if (!((lhs == accumulator && rhs == element) ||
++          (lhs == element && rhs == accumulator))) {
++      return false;
++    }
++    auto inputType =
++        mlir::cast<RankedTensorType>(srcOp.getInputs().front().getType());
++    return inputType.getElementTypeBitWidth() != 1 ||
++           mlir::isa<mlir::stablehlo::XorOp>(combiner);
++  }
++
++  // Halves each reduced dimension until one element is left, combining the
++  // halves elementwise and carrying an odd middle element to the next step.
++  // The result is then combined with the init value unless that is the op's
++  // identity.
++  LogicalResult
++  matchAndRewriteElementwiseFold(mlir::stablehlo::ReduceOp &srcOp,
++                                 mlir::stablehlo::ReduceOp::Adaptor &adaptor,
++                                 ConversionPatternRewriter &rewriter) const {
++    Operation &combiner = srcOp.getBody().front().front();
++    Location loc = srcOp.getLoc();
++    auto outputType = mlir::cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getResult(0).getType()));
++    Value value = adaptor.getInputs().front();
++    auto inputType = mlir::cast<RankedTensorType>(value.getType());
++    bool isBoolean = inputType.getElementTypeBitWidth() == 1;
++
++    auto combine = [&](Value lhs, Value rhs) -> Value {
++      Type type = lhs.getType();
++      if (mlir::isa<mlir::stablehlo::AndOp>(combiner)) {
++        if (isBoolean) {
++          return rewriter.create<ttir::LogicalAndOp>(loc, type, lhs, rhs);
++        }
++        return rewriter.create<ttir::BitwiseAndOp>(loc, type, lhs, rhs);
++      }
++      if (mlir::isa<mlir::stablehlo::OrOp>(combiner)) {
++        if (isBoolean) {
++          return rewriter.create<ttir::LogicalOrOp>(loc, type, lhs, rhs);
++        }
++        return rewriter.create<ttir::BitwiseOrOp>(loc, type, lhs, rhs);
++      }
++      if (isBoolean) {
++        return rewriter.create<ttir::LogicalXorOp>(loc, type, lhs, rhs);
++      }
++      return rewriter.create<ttir::BitwiseXorOp>(loc, type, lhs, rhs);
++    };
++
++    llvm::SmallVector<int64_t> shape(inputType.getShape());
++    auto slice = [&](Value input, int64_t dim, int64_t begin, int64_t end) {
++      llvm::SmallVector<int32_t> begins(shape.size(), 0);
++      llvm::SmallVector<int32_t> ends(shape.begin(), shape.end());
++      llvm::SmallVector<int32_t> steps(shape.size(), 1);
++      begins[dim] = begin;
++      ends[dim] = end;
++      llvm::SmallVector<int64_t> sliceShape(shape);
++      sliceShape[dim] = end - begin;
++      return rewriter.create<ttir::SliceStaticOp>(
++          loc, inputType.clone(sliceShape), input,
++          rewriter.getI32ArrayAttr(begins), rewriter.getI32ArrayAttr(ends),
++          rewriter.getI32ArrayAttr(steps));
++    };
++
++    bool isEmpty = false;
++    for (int64_t dim : srcOp.getDimensions()) {
++      isEmpty |= shape[dim] == 0;
++      while (shape[dim] > 1) {
++        int64_t size = shape[dim];
++        int64_t half = size / 2;
++        Value folded = combine(slice(value, dim, 0, half),
++                               slice(value, dim, size - half, size));
++        llvm::SmallVector<int64_t> foldedShape(shape);
++        foldedShape[dim] = half;
++        if (size % 2 != 0) {
++          foldedShape[dim] = half + 1;
++          llvm::SmallVector<Value> pieces = {
++              folded, slice(value, dim, half, half + 1)};
++          folded = rewriter.create<ttir::ConcatOp>(
++              loc, inputType.clone(foldedShape), pieces, dim);
++        }
++        value = folded;
++        shape = foldedShape;
++      }
++    }
++
++    bool needsInit = isEmpty || !isIdentityInitValue(srcOp, combiner);
++    Value init;
++    if (needsInit &&
++        failed(ttir::utils::broadcastValue(
++            rewriter, adaptor.getInitValues().front(), outputType, init, loc,
++            /*frontUnsqueeze=*/false))) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "reduce init value is not broadcastable");
++    }
++    if (isEmpty) {
++      rewriter.replaceOp(srcOp, init);
++      return success();
++    }
++
++    value = rewriter.create<ttir::ReshapeOp>(
++        loc, outputType, value,
++        rewriter.getI32ArrayAttr(
++            llvm::to_vector_of<int32_t>(outputType.getShape())));
++    if (needsInit) {
++      value = combine(value, init);
++    }
++    rewriter.replaceOp(srcOp, value);
++    return success();
++  }
++
++  // All ones is the identity of and; zero is the identity of or and xor.
++  bool isIdentityInitValue(mlir::stablehlo::ReduceOp &srcOp,
++                           Operation &combiner) const {
++    auto constant = srcOp.getInitValues()
++                        .front()
++                        .getDefiningOp<mlir::stablehlo::ConstantOp>();
++    if (!constant || !constant.getValue().isSplat()) {
++      return false;
++    }
++    APInt init = constant.getValue().getSplatValue<APInt>();
++    return mlir::isa<mlir::stablehlo::AndOp>(combiner) ? init.isAllOnes()
++                                                       : init.isZero();
++  }
++
+   LogicalResult
+   checkConversionLegality(mlir::stablehlo::ReduceOp &srcOp,
+                           mlir::stablehlo::ReduceOp::Adaptor adaptor,
