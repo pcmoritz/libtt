@@ -1,8 +1,11 @@
 """While-loop bodies are captured into a trace and replayed per iteration.
 
 Numerical checks alone pass even if every iteration silently falls back to
-op-by-op execution, so the tests also check the runtime's fallback warning.
+op-by-op execution, so the tests read the runtime's per-loop iteration and
+replay counts (TT_RUNTIME_LOG_LOOP_TRACES=1).
 """
+
+import re
 
 import jax
 import jax.numpy as jnp
@@ -10,46 +13,54 @@ import numpy as np
 import pytest
 
 FALLBACK = "Running while loop body op by op"
+LOOP_TRACE = re.compile(r"While loop trace \((\w+) loop\): (\d+) iterations, (\d+) replays")
 
 
 def device_put(x):
     return jax.device_put(x, jax.devices("tt")[0])
 
 
-@pytest.mark.parametrize("iterations", [3, 50])
-def test_counted_loop_replays_trace(iterations, capfd):
-    run = jax.jit(
-        lambda x: jax.lax.fori_loop(0, iterations, lambda i, x: x * 0.5 + 1.0, x)
-    )
-    x = np.random.default_rng(0).uniform(-4, 4, (32, 64)).astype(np.float32)
-    expected = x.copy()
-    for _ in range(iterations):
-        expected = expected * 0.5 + 1.0
+@pytest.fixture
+def loop_traces(capfd, monkeypatch):
+    """Returns a function that yields (kind, iterations, replays) per loop run."""
+    monkeypatch.setenv("TT_RUNTIME_LOG_LOOP_TRACES", "1")
+    capfd.readouterr()
+
+    def read():
+        output = "".join(capfd.readouterr())
+        assert FALLBACK not in output
+        return [(k, int(n), int(r)) for k, n, r in LOOP_TRACE.findall(output)]
+
+    return read
+
+
+# A counted loop captures its body during the second iteration when at least
+# two replays follow, so every later iteration is a replay.
+@pytest.mark.parametrize("iterations,replays", [(3, 0), (4, 2), (50, 48)])
+def test_counted_loop_replays_trace(iterations, replays, loop_traces):
+    # x counts the iterations exactly, so a missed replay changes the result.
+    run = jax.jit(lambda x: jax.lax.fori_loop(0, iterations, lambda i, x: x + 1.0, x))
+    x = np.random.default_rng(0).integers(-4, 4, (32, 64)).astype(np.float32)
     for _ in range(2):
-        np.testing.assert_allclose(
-            np.asarray(run(device_put(x))), expected, rtol=1e-6, atol=1e-6
-        )
-    assert FALLBACK not in "".join(capfd.readouterr())
+        np.testing.assert_array_equal(np.asarray(run(device_put(x))), x + iterations)
+    assert loop_traces() == [("counted", iterations, replays)] * 2
 
 
-def test_condition_loop_short_and_long_invocations(capfd):
-    # The trip count is only known at run time; short invocations run op by op
-    # and long ones are traced, in any order.
+def test_condition_loop_short_and_long_invocations(loop_traces):
+    # The predicate depends on the evolving tensor, so the loop keeps its
+    # condition program. Its trip count is only known at run time: the body is
+    # captured during the fourth iteration, and short invocations never are.
     def loop(x, n):
-        return jax.lax.while_loop(
-            lambda s: s[0] < n, lambda s: (s[0] + 1, s[1] * 0.5 + 1.0), (0, x)
-        )[1]
+        return jax.lax.while_loop(lambda x: jnp.any(x < n), lambda x: x + 1.0, x)
 
     run = jax.jit(loop)
-    x = np.random.default_rng(1).uniform(-4, 4, (32, 64)).astype(np.float32)
-    for n in [2, 20, 3, 30, 9, 1]:
-        expected = x.copy()
-        for _ in range(n):
-            expected = expected * 0.5 + 1.0
-        np.testing.assert_allclose(
-            np.asarray(run(device_put(x), n)), expected, rtol=1e-6, atol=1e-6
-        )
-    assert FALLBACK not in "".join(capfd.readouterr())
+    x = np.zeros((32, 64), np.float32)
+    x[0, 0] = -1.0
+    counts = [2, 20, 3, 30, 9, 1, 4, 5]
+    for n in counts:
+        got = np.asarray(run(device_put(x), np.float32(n)))
+        np.testing.assert_array_equal(got, x + n + 1)
+    assert loop_traces() == [("condition", n + 1, max(0, n - 3)) for n in counts]
 
 
 @pytest.mark.parametrize("third_dtype", [np.float32, np.float16])
