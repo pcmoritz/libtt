@@ -7,6 +7,8 @@ about 1e-3 relative. With precision=HIGHEST, tt-mlir marks the matmul
 exact result. The default precision keeps the fast matrix unit.
 """
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -53,19 +55,17 @@ def test_highest_precision_is_fp32_exact(case, tmp_path):
 
     highest = run(lax.Precision.HIGHEST, "highest")
     assert highest.dtype == np.float32
-    reference = np.einsum("...ij,jk->...ik", a, b.T if case == "transposed_rhs" else b)
-    a_ref = a.reshape(-1, k) if case == "batched" else a
     b_ref = b.T if case == "transposed_rhs" else b
-    exact_error = error(highest.reshape(-1, highest.shape[-1]), a_ref, b_ref)
+    exact_error = error(highest, a, b_ref)
     # FP32 multiply-adds with one rounding each: within k * 2^-24 of the bound, in practice a few 1e-7.
     assert exact_error <= k * 2.0**-24, f"highest precision is off by {exact_error:.3g}"
     assert "ttcore.fp32_exact" in ttnn_ir(tmp_path / "highest"), "the matmul was not marked exact"
 
     default = run(lax.Precision.DEFAULT, "default")
-    default_error = error(default.reshape(-1, default.shape[-1]), a_ref, b_ref)
+    default_error = error(default, a, b_ref)
     assert default_error > 1e-5, f"the default precision was exact too ({default_error:.3g}); did it take the slow path?"
     assert "ttcore.fp32_exact" not in ttnn_ir(tmp_path / "default")
-    np.testing.assert_allclose(default, reference, rtol=2e-2, atol=2e-2)
+    np.testing.assert_allclose(default, a @ b_ref, rtol=2e-2, atol=2e-2)
 
 
 def test_same_operand_twice_then_two_operands():
@@ -92,20 +92,47 @@ def test_same_operand_twice_then_two_operands():
     assert error(yx, y, x) <= bound, f"y @ x after x @ x is off by {error(yx, y, x):.3g}"
 
 
-def test_activation_after_exact_matmul(tmp_path):
-    """The exact matmul has no fused activation; the activation runs on its own."""
+@pytest.mark.parametrize("precision", ["DEFAULT", "HIGHEST"])
+def test_activation_after_exact_matmul(precision, tmp_path):
+    """TTNN fuses a SiLU into an ordinary matmul, but not into an exact one, which has no fused activation."""
     rng = np.random.default_rng(3)
     a = rng.standard_normal((64, 96)).astype(np.float32)
-    b = rng.standard_normal((96, 128)).astype(np.float32)
+    b = (rng.standard_normal((96, 128)) / np.sqrt(96)).astype(np.float32)
     device = jax.devices("tt")[0]
     f = jax.jit(
-        lambda x, w: jax.nn.relu(jnp.dot(x, w, precision=lax.Precision.HIGHEST)),
+        lambda x, w: jax.nn.silu(jnp.dot(x, w, precision=getattr(lax.Precision, precision))),
         compiler_options={"export_path": str(tmp_path)},
     )
     got = np.asarray(f(jax.device_put(a, device), jax.device_put(b, device)))
-    exact = np.maximum(np.asarray(a, np.float64) @ np.asarray(b, np.float64), 0)
-    bound = np.abs(np.asarray(a, np.float64)) @ np.abs(np.asarray(b, np.float64))
-    assert np.max(np.abs(got - exact) / np.maximum(bound, 1e-30)) <= 96 * 2.0**-24
+    exact = a.astype(np.float64) @ b
+    np.testing.assert_allclose(got, exact / (1 + np.exp(-exact)), atol=1e-2)
     ir = ttnn_ir(tmp_path)
-    assert "ttcore.fp32_exact" in ir
-    assert '"ttnn.relu"' in ir, "the activation was fused into the exact matmul"
+    fused = 'activation = "silu"' in ir
+    if precision == "HIGHEST":
+        assert "ttcore.fp32_exact" in ir
+        assert not fused and '"ttnn.silu"' in ir, "the SiLU was fused into the exact matmul"
+    else:
+        assert fused and '"ttnn.silu"' not in ir, "the SiLU was not fused into the ordinary matmul"
+
+
+def test_exact_matmul_layouts_at_o2(tmp_path):
+    """The O2 optimizer shards matmuls, but the vector-unit kernel takes interleaved tensors only."""
+    rng = np.random.default_rng(4)
+    a = rng.standard_normal((128, 512)).astype(np.float32)
+    b = (rng.standard_normal((512, 512)) / np.sqrt(512)).astype(np.float32)
+    device = jax.devices("tt")[0]
+    f = jax.jit(
+        lambda x, w: jnp.dot(jnp.dot(x * 2.0, w, precision=lax.Precision.HIGHEST), w, precision=lax.Precision.HIGHEST),
+        compiler_options={"optimization_level": "O2", "export_path": str(tmp_path)},
+    )
+    got = np.asarray(f(jax.device_put(a, device), jax.device_put(b, device)))
+    first = (2.0 * a.astype(np.float64)) @ b
+    # Two FP32 matmuls, the first one's rounding carried through the second; TF32 would be off by about 1e-3.
+    assert error(got, first, b) <= 1e-5
+    ir = ttnn_ir(tmp_path)
+    layouts = dict(re.findall(r"^(#ttnn_layout\d*) = (.*)$", ir, re.M))
+    matmuls = [line for line in ir.splitlines() if '"ttnn.matmul"' in line and "ttcore.fp32_exact" in line]
+    assert len(matmuls) == 2
+    for line in matmuls:
+        for alias in re.findall(r"tensor<[^>]*?, (#ttnn_layout\d*)>", line):
+            assert "sharded" not in layouts[alias], f"an exact matmul got a sharded layout: {layouts[alias]}"

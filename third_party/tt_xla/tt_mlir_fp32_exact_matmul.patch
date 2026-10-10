@@ -11,10 +11,10 @@ index accaf4a..93cff66 100644
  // ANCHOR_END: adding_an_op_matmul_fbs
  
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-index 434b336..38564fa 100644
+index 434b336..bf38121 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -991,15 +991,33 @@ public:
+@@ -991,15 +991,34 @@ public:
      auto outputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getResult().getType()));
  
@@ -25,10 +25,11 @@ index 434b336..38564fa 100644
          adaptor.getDotDimensionNumbers().getLhsContractingDimensions(),
          adaptor.getDotDimensionNumbers().getRhsBatchingDimensions(),
          adaptor.getDotDimensionNumbers().getRhsContractingDimensions());
-+    // The matrix unit reads FP32 inputs as TF32. A dot_general of FP32 inputs
-+    // at the highest precision gets FP32 products and sums (the runtime's
++    // The matrix unit reads FP32 inputs as TF32. An FP32 dot_general at the
++    // highest precision gets FP32 products and sums (the runtime's
 +    // ttnn::experimental::matmul_fp32, on the vector unit).
-+    if (lhsType.isF32() && rhsType.isF32() && asksForHighestPrecision(srcOp)) {
++    if (lhsType.isF32() && rhsType.isF32() &&
++        outputType.getElementType().isF32() && asksForHighestPrecision(srcOp)) {
 +      newOp->setAttr("ttcore.fp32_exact", rewriter.getUnitAttr());
 +    }
  
@@ -104,22 +105,32 @@ index e885db7..00c253f 100644
      return mlir::success();
    });
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-index 2b58082..7f99eae 100644
+index 2b58082..083fd74 100644
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -1558,6 +1558,11 @@ public:
-     if ((lhsMatmul && rhsMatmul) || (!lhsMatmul && !rhsMatmul)) {
-       return mlir::failure();
-     }
-+    // An exact FP32 matmul runs on the vector unit, which has no fused bias.
-+    if ((lhsMatmul && lhsMatmul->hasAttr("ttcore.fp32_exact")) ||
-+        (rhsMatmul && rhsMatmul->hasAttr("ttcore.fp32_exact"))) {
+@@ -553,6 +553,10 @@ public:
+   mlir::LogicalResult
+   matchAndRewrite(MatmulOp matmulOp,
+                   mlir::PatternRewriter &rewriter) const final {
++    // The vector-unit kernel of an exact FP32 matmul reads FP32 operands only.
++    if (matmulOp->hasAttr("ttcore.fp32_exact")) {
 +      return mlir::failure();
 +    }
+     auto isF32 = [](mlir::Value value) {
+       return mlir::cast<mlir::RankedTensorType>(value.getType())
+           .getElementType()
+@@ -1560,6 +1564,10 @@ public:
+     }
  
      MatmulOp matmulOp = lhsMatmul ? lhsMatmul : rhsMatmul;
++    // An exact FP32 matmul runs on the vector unit, which has no fused bias.
++    if (matmulOp->hasAttr("ttcore.fp32_exact")) {
++      return mlir::failure();
++    }
      ReshapeOp matmulReshape = lhsMatmul ? lhsReshape : rhsReshape;
-@@ -1940,6 +1945,11 @@ public:
+     TypedValue<RankedTensorType> rawBias =
+         lhsMatmul ? addOp.getRhs() : addOp.getLhs();
+@@ -1940,6 +1948,11 @@ public:
                                         newMatmulAVal, newMatmulBVal, newBias,
                                         transposeA, transposeB)
                       .getResult();
@@ -131,7 +142,7 @@ index 2b58082..7f99eae 100644
  
      // The narrowed output already has the slice's shape, so it replaces it.
      rewriter.replaceOp(slice, narrowedResult);
-@@ -2219,6 +2229,10 @@ private:
+@@ -2219,6 +2232,10 @@ private:
    // for fusion.
    static FusionCandidates collectCandidates(OpType rootOp) {
      FusionCandidates result;
@@ -142,7 +153,7 @@ index 2b58082..7f99eae 100644
      Value sharedLHS = rootOp.getA();
      result.firstTransposeB = rootOp.getTransposeB();
  
-@@ -2231,7 +2245,8 @@ private:
+@@ -2231,7 +2248,8 @@ private:
      for (Operation *user : sharedLHS.getUsers()) {
        auto op = dyn_cast<OpType>(user);
        if (!op || op.getA() != sharedLHS ||
@@ -152,24 +163,41 @@ index 2b58082..7f99eae 100644
          continue;
        }
  
-@@ -3730,6 +3745,7 @@ public:
-     // into the matmul would fall back to the global weight dtype.
-     auto weightDtype =
-         op->template getAttrOfType<mlir::StringAttr>("ttcore.weight_dtype");
-+    auto fp32Exact = op->getAttr("ttcore.fp32_exact");
- 
-     mlir::Operation *newOp;
-     if constexpr (std::is_same_v<OpType, MatmulOp>) {
-@@ -3747,6 +3763,9 @@ public:
-     if (weightDtype) {
-       newOp->setAttr("ttcore.weight_dtype", weightDtype);
-     }
-+    if (fp32Exact) {
-+      newOp->setAttr("ttcore.fp32_exact", fp32Exact);
+@@ -3711,6 +3729,11 @@ class PermuteMatmulFusionPattern : public mlir::OpRewritePattern<OpType> {
+ public:
+   mlir::LogicalResult
+   matchAndRewrite(OpType op, mlir::PatternRewriter &rewriter) const override {
++    // The vector-unit kernel of an exact FP32 matmul reads untransposed
++    // operands, so its permutes stay.
++    if (op->hasAttr("ttcore.fp32_exact")) {
++      return mlir::failure();
 +    }
+     auto inputACanonical = getPermuteOpOperand(op.getA());
+     auto inputBCanonical = getPermuteOpOperand(op.getB());
  
-     return mlir::success();
-   }
+diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+index 538fa6d..e5b287b 100644
+--- a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
++++ b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+@@ -3339,6 +3339,18 @@ llvm::Expected<op_model::OpConstraints> MatmulOp::getOpConstraints(
+         liveRecords) {
+   assert(inputs.size() == 2);
+ 
++  // An exact FP32 matmul runs ttnn::experimental::matmul_fp32, which takes
++  // interleaved tensors only.
++  auto sharded = [](TTNNLayoutAttr layout) {
++    return layout && layout.hasShardedTensorMemoryLayout();
++  };
++  if ((*this)->hasAttr("ttcore.fp32_exact") &&
++      (llvm::any_of(inputs, sharded) || sharded(opConfig.outputLayout))) {
++    return llvm::createStringError(
++        llvm::inconvertibleErrorCode(),
++        "An exact FP32 matmul requires interleaved inputs and output");
++  }
++
+   const auto inputShapeA = getA().getType().getShape();
+   const auto inputShapeB = getB().getType().getShape();
+ 
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 index f10b652..a072678 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
@@ -200,60 +228,28 @@ index 6d98b51..da78f90 100644
  // ANCHOR_END: adding_an_op_matmul_serialize_to_binary
  
 diff --git a/runtime/lib/ttnn/operations/matmul/matmul.cpp b/runtime/lib/ttnn/operations/matmul/matmul.cpp
-index f196225..6968135 100644
+index f196225..d02d983 100644
 --- a/runtime/lib/ttnn/operations/matmul/matmul.cpp
 +++ b/runtime/lib/ttnn/operations/matmul/matmul.cpp
-@@ -9,6 +9,9 @@
+@@ -9,6 +9,7 @@
  
  #include "tt/runtime/detail/ttnn/operations/utils.h"
  #include "tt/runtime/detail/ttnn/utils.h"
-+#include "ttnn/operations/copy/typecast/typecast.hpp"
-+#include "ttnn/operations/data_movement/transpose/transpose.hpp"
 +#include "ttnn/operations/experimental/matmul_fp32/matmul_fp32.hpp"
  
  #include <algorithm>
  #include <optional>
-@@ -44,6 +47,32 @@ static bool programCarriesFusedActivation(
- }
- 
- // ANCHOR: adding_an_op_matmul_runtime_operations
-+// FP32 products and sums on the vector unit, for a matmul of FP32 inputs at
-+// the highest precision. An operand that the compiler left in a narrower
-+// float type (a dropped exact cast) is cast here.
-+static ::ttnn::Tensor
-+matmulFp32(const ::ttnn::Tensor &lhs, const ::ttnn::Tensor &rhs,
-+           bool transposeA, bool transposeB,
-+           const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig,
-+           ::ttnn::DataType outputDataType) {
-+  auto prepare = [](const ::ttnn::Tensor &tensor, bool transpose) {
-+    ::ttnn::Tensor result = tensor;
-+    if (result.dtype() != ::ttnn::DataType::FLOAT32) {
-+      result = ::ttnn::typecast(result, ::ttnn::DataType::FLOAT32);
-+    }
-+    if (transpose) {
-+      result = ::ttnn::transpose(result, -2, -1);
-+    }
-+    return result;
-+  };
-+  ::ttnn::Tensor output = ::ttnn::experimental::matmul_fp32(
-+      prepare(lhs, transposeA), prepare(rhs, transposeB), outputMemoryConfig);
-+  if (output.dtype() != outputDataType) {
-+    output = ::ttnn::typecast(output, outputDataType, outputMemoryConfig);
-+  }
-+  return output;
-+}
-+
- void run(const ::tt::target::ttnn::MatmulOp *op, ProgramContext &context) {
-   ProgramTensorPool &tensorPool = context.getTensorPool();
-   const ::ttnn::Tensor &lhs = tensorPool.getTTNNTensorAndValidate(op->a());
-@@ -73,7 +102,10 @@ void run(const ::tt::target::ttnn::MatmulOp *op, ProgramContext &context) {
+@@ -73,7 +74,13 @@ void run(const ::tt::target::ttnn::MatmulOp *op, ProgramContext &context) {
    }
  
    ::ttnn::Tensor output;
 -  if (op->fused_swiglu()) {
 +  if (op->fp32_exact()) {
-+    output = matmulFp32(lhs, rhs, op->transpose_a(), op->transpose_b(),
-+                        outputMemoryConfig, outputDataType);
++    // FP32 products and sums on the vector unit. The compiler keeps the casts
++    // and permutes of an exact matmul, so its operands are untransposed FP32.
++    LOG_ASSERT(!op->transpose_a() && !op->transpose_b(),
++               "an exact FP32 matmul takes untransposed operands");
++    output = ::ttnn::experimental::matmul_fp32(lhs, rhs, outputMemoryConfig);
 +  } else if (op->fused_swiglu()) {
      output = ::ttnn::matmul_swiglu(
          lhs, rhs, outputMemoryConfig, outputDataType, computeConfig);
