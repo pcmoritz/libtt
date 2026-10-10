@@ -288,6 +288,7 @@ pkg_tar(
         "@tt_umd//:cluster_descriptor_examples",
         ":tt_metal_blackhole_runtime_hw_assets",
         ":tt_metal_runtime_sources",
+        "@//cpp/tt_metal:kernels",
         "@//ttnn:kernels",
     ],
     compressor = ":libtt_zstd_compressor",
@@ -302,6 +303,7 @@ pkg_tar(
     ownername = ".",
     portable_mtime = True,
     remap_paths = {
+        "cpp/tt_metal/": "tt_metal/",
         "../+http_archive+sfpi/": "runtime/sfpi/",
         "../sfpi/": "runtime/sfpi/",
         "../+http_archive+tt_metal/": "",
