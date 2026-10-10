@@ -4,7 +4,6 @@
 #pragma once
 
 #include <cstdint>
-#include <utility>
 
 #include "ckernel_addrmod.h"
 #include "ckernel_defs.h"
@@ -118,41 +117,33 @@ inline void _init_matmul_fp32_() {
 }
 
 // One k: X_g = row k of B into LREG[11 + g] for the four column groups, R =
-// column k of A into LREG4, then the eight rotations of R. Everything is a
-// compile-time constant, so the RISC-V issues prebuilt instructions.
-template <std::uint32_t DST_AT, std::uint32_t DST_B, std::uint32_t K>
-inline void _matmul_fp32_k_() {
+// column k of A into LREG4, then the eight rotations of R.
+inline void _matmul_fp32_k_(std::uint32_t at, std::uint32_t b, std::uint32_t k) {
     constexpr auto FP32 = InstrModLoadStore::FP32;
-    constexpr std::uint32_t at = DST_AT * MATMUL_FP32_TILE_ROWS;
-    constexpr std::uint32_t b = DST_B * MATMUL_FP32_TILE_ROWS;
-    constexpr std::uint32_t sub_row = K & 3;
-    // Address of the slot of tile row K in column group g.
-    constexpr std::uint32_t row = 32 * (K >> 4) + (K & 12);
+    const std::uint32_t sub_row = k & 3;
+    // Address of the slot of tile row k in column group g.
+    const std::uint32_t row = 32 * (k >> 4) + (k & 12);
     constexpr std::uint32_t group[4] = {0, 2, 16, 18};
     // The previous k's replays left the Dst address counter at acc(0, 8).
     math::clear_dst_reg_addr();
 
     // X_g; SFPTRANSP clobbers LREG0..7, so before R.
-#define MATMUL_FP32_X(g)                                                   \
-    TTI_SFPLOAD(p_sfpu::LREG0, FP32, ADDR_MOD_7, b + row + group[g]);      \
-    if constexpr (sub_row != 0) {                                          \
-        TTI_SFPTRANSP(0, 0, 0, 0);                                         \
-        TTI_SFPMOV(0, sub_row, p_sfpu::LREG0, 0);                          \
-    }                                                                      \
-    TTI_SFPCONFIG(0, p_sfpu::LREG11 + (g), 0);
-    MATMUL_FP32_X(0)
-    MATMUL_FP32_X(1)
-    MATMUL_FP32_X(2)
-    MATMUL_FP32_X(3)
-#undef MATMUL_FP32_X
+    for (std::uint32_t g = 0; g < 4; ++g) {
+        TT_SFPLOAD(p_sfpu::LREG0, FP32, ADDR_MOD_7, b + row + group[g]);
+        if (sub_row != 0) {
+            TTI_SFPTRANSP(0, 0, 0, 0);
+            TT_SFPMOV(0, sub_row, p_sfpu::LREG0, 0);
+        }
+        TT_SFPCONFIG(0, p_sfpu::LREG11 + g, 0);
+    }
 
-    // R: sub-row h of LREG[K % 4] after the transpose is group h of row K of A^T.
-    TTI_SFPLOAD(p_sfpu::LREG0, FP32, ADDR_MOD_7, at + row + group[0]);
-    TTI_SFPLOAD(p_sfpu::LREG1, FP32, ADDR_MOD_7, at + row + group[1]);
-    TTI_SFPLOAD(p_sfpu::LREG2, FP32, ADDR_MOD_7, at + row + group[2]);
-    TTI_SFPLOAD(p_sfpu::LREG3, FP32, ADDR_MOD_7, at + row + group[3]);
+    // R: sub-row h of LREG[k % 4] after the transpose is group h of row k of A^T.
+    TT_SFPLOAD(p_sfpu::LREG0, FP32, ADDR_MOD_7, at + row + group[0]);
+    TT_SFPLOAD(p_sfpu::LREG1, FP32, ADDR_MOD_7, at + row + group[1]);
+    TT_SFPLOAD(p_sfpu::LREG2, FP32, ADDR_MOD_7, at + row + group[2]);
+    TT_SFPLOAD(p_sfpu::LREG3, FP32, ADDR_MOD_7, at + row + group[3]);
     TTI_SFPTRANSP(0, 0, 0, 0);
-    TTI_SFPMOV(0, sub_row, p_sfpu::LREG4, 0);
+    TT_SFPMOV(0, sub_row, p_sfpu::LREG4, 0);
 
     for (std::uint32_t s = 0; s < 8; ++s) {
         lltt::replay(MATMUL_FP32_REPLAY_START, MATMUL_FP32_REPLAY_LEN);
@@ -163,18 +154,13 @@ inline void _matmul_fp32_k_() {
     TTI_SFPNOP;
 }
 
-template <std::uint32_t DST_AT, std::uint32_t DST_B, std::uint32_t... K>
-inline void _matmul_fp32_all_k_(std::integer_sequence<std::uint32_t, K...>) {
-    (_matmul_fp32_k_<DST_AT, DST_B, K>(), ...);
-}
-
-// acc (Dst tile DST_ACC, skewed) (+)= A * B, with A^T in Dst tile DST_AT and
-// B in DST_B. The tile indices are template parameters so that every address
-// is a compile-time constant; the run-time arguments repeat them.
-template <bool ACCUMULATE, std::uint32_t DST_AT, std::uint32_t DST_B, std::uint32_t DST_ACC>
-inline void _calculate_matmul_fp32_(std::uint32_t, std::uint32_t, std::uint32_t) {
+// acc (Dst tile dst_acc, skewed) (+)= A * B, with A^T in Dst tile dst_at and B in dst_b.
+template <bool ACCUMULATE>
+inline void _calculate_matmul_fp32_(std::uint32_t dst_at, std::uint32_t dst_b, std::uint32_t dst_acc) {
     constexpr auto FP32 = InstrModLoadStore::FP32;
-    constexpr std::uint32_t acc = DST_ACC * MATMUL_FP32_TILE_ROWS;
+    const std::uint32_t at = dst_at * MATMUL_FP32_TILE_ROWS;
+    const std::uint32_t b = dst_b * MATMUL_FP32_TILE_ROWS;
+    const std::uint32_t acc = dst_acc * MATMUL_FP32_TILE_ROWS;
     math::clear_dst_reg_addr();
 
     if constexpr (!ACCUMULATE) {
@@ -188,14 +174,17 @@ inline void _calculate_matmul_fp32_(std::uint32_t, std::uint32_t, std::uint32_t)
     // see _init_matmul_fp32_), then rotate R. The last load moves the Dst
     // address counter on to acc(g, s + 1).
     lltt::record(MATMUL_FP32_REPLAY_START, MATMUL_FP32_REPLAY_LEN);
-    TTI_SFPLOADMACRO((0 << 2) | p_sfpu::LREG0, FP32, ADDR_MOD_7, acc + _matmul_fp32_acc_(0, 0));
-    TTI_SFPLOADMACRO((1 << 2) | p_sfpu::LREG1, FP32, ADDR_MOD_7, acc + _matmul_fp32_acc_(1, 0));
-    TTI_SFPLOADMACRO((2 << 2) | p_sfpu::LREG2, FP32, ADDR_MOD_7, acc + _matmul_fp32_acc_(2, 0));
-    TTI_SFPLOADMACRO((3 << 2) | p_sfpu::LREG3, FP32, ADDR_MOD_6, acc + _matmul_fp32_acc_(3, 0));
+    TT_SFPLOADMACRO((0 << 2) | p_sfpu::LREG0, FP32, ADDR_MOD_7, acc + _matmul_fp32_acc_(0, 0));
+    TT_SFPLOADMACRO((1 << 2) | p_sfpu::LREG1, FP32, ADDR_MOD_7, acc + _matmul_fp32_acc_(1, 0));
+    TT_SFPLOADMACRO((2 << 2) | p_sfpu::LREG2, FP32, ADDR_MOD_7, acc + _matmul_fp32_acc_(2, 0));
+    TT_SFPLOADMACRO((3 << 2) | p_sfpu::LREG3, FP32, ADDR_MOD_6, acc + _matmul_fp32_acc_(3, 0));
     // R is read by the last MAD in this cycle, and written two cycles later.
     TTI_SFPSHFT2(0, p_sfpu::LREG4, p_sfpu::LREG4, sfpi::SFPSHFT2_MOD1_SUBVEC_SHFLROR1);
 
-    _matmul_fp32_all_k_<DST_AT, DST_B>(std::make_integer_sequence<std::uint32_t, 32>{});
+#pragma GCC unroll 0
+    for (std::uint32_t k = 0; k < 32; ++k) {
+        _matmul_fp32_k_(at, b, k);
+    }
     math::clear_dst_reg_addr();
 
     // Give SFPI-compiled code its -1.0 back.

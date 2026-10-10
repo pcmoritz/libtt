@@ -20,11 +20,12 @@ namespace ckernel {
 // multiply-add with one rounding. DST must hold FP32 data (fp32_dest_acc_en =
 // true, with the inputs unpacked to DST as FP32). For C = sum_k A_k * B_k:
 //
-//     matmul_fp32_transpose_a(a);                    // for each k:
-//     matmul_fp32_tile_init();
-//     matmul_fp32_tile<k != 0, a, b, acc>();
-//     ...
-//     matmul_fp32_tile_finish(acc, c, scratch);      // once
+//     matmul_fp32_tile_init();                       // once
+//     for each k:
+//         copy A_k to a and B_k to b;
+//         matmul_fp32_transpose_a(a);
+//         matmul_fp32_tile<k != 0>(a, b, acc);
+//     matmul_fp32_tile_finish(acc, c, scratch);
 //
 // acc holds the sums in an internal order; matmul_fp32_tile_finish writes C
 // in the usual tile order. acc, c and scratch must be distinct, and scratch
@@ -45,7 +46,8 @@ ALWI void matmul_fp32_transpose_a(uint32_t idst_a) {
 // clang-format off
 /**
  * Initializes the vector unit for matmul_fp32_tile and matmul_fp32_tile_finish.
- * Call it again after other operations, including matmul_fp32_transpose_a.
+ * Copies and matmul_fp32_transpose_a leave that state alone; other vector unit
+ * operations may not, so call it again after them.
  *
  * Return value: None
  */
@@ -56,28 +58,26 @@ ALWI void matmul_fp32_tile_init() { MATH((SFPU_BINARY_INIT_FN_NO_ARGS(unused, sf
 /**
  * Adds the product of two 32x32 tiles to the accumulator tile at idst_acc
  * (or sets it, if ACCUMULATE is false). idst_at holds A transposed (see
- * matmul_fp32_transpose_a), idst_b holds B. The DST indices are template
- * parameters so that the kernel's addresses are compile-time constants.
+ * matmul_fp32_transpose_a), idst_b holds B.
  *
  * The DST register buffer must be in acquired state via *tile_regs_acquire* call.
  *
  * Return value: None
  *
- * | Template argument | Description                           | Type     | Valid Range                                           | Required |
- * |-------------------|---------------------------------------|----------|-------------------------------------------------------|----------|
- * | ACCUMULATE        | Add to (true) or set (false) idst_acc | bool     |                                                       | True     |
- * | idst_at           | Index of the transposed A tile in DST | uint32_t | Must be less than the size of the DST register buffer | True     |
- * | idst_b            | Index of the B tile in DST            | uint32_t | Must be less than the size of the DST register buffer | True     |
- * | idst_acc          | Index of the accumulator tile in DST  | uint32_t | Must be less than the size of the DST register buffer | True     |
+ * | Argument   | Description                           | Type     | Valid Range                                           | Required |
+ * |------------|---------------------------------------|----------|-------------------------------------------------------|----------|
+ * | idst_at    | Index of the transposed A tile in DST | uint32_t | Must be less than the size of the DST register buffer | True     |
+ * | idst_b     | Index of the B tile in DST            | uint32_t | Must be less than the size of the DST register buffer | True     |
+ * | idst_acc   | Index of the accumulator tile in DST  | uint32_t | Must be less than the size of the DST register buffer | True     |
  */
 // clang-format on
-template <bool ACCUMULATE, uint32_t idst_at, uint32_t idst_b, uint32_t idst_acc>
-ALWI void matmul_fp32_tile() {
+template <bool ACCUMULATE = true>
+ALWI void matmul_fp32_tile(uint32_t idst_at, uint32_t idst_b, uint32_t idst_acc) {
     MATH((SFPU_BINARY_CALL(
         DST_SYNC_MODE,
         DST_ACCUM_MODE,
         _calculate_matmul_fp32_,
-        (ACCUMULATE, idst_at, idst_b, idst_acc),
+        (ACCUMULATE),
         idst_at,
         idst_b,
         idst_acc,

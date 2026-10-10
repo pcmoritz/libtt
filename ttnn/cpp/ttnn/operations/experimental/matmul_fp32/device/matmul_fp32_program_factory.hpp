@@ -10,9 +10,9 @@
 
 namespace ttnn::experimental::prim {
 
-// matmul's multi-core program (MatmulMultiCoreProgramFactory) with the vector
-// unit compute kernel: output tiles split over the cores, each core streaming
-// its tiles' A rows and B columns through matmul's reader and writer.
+// Splits the output tiles evenly over the cores. Each core computes its tiles
+// on the vector unit in runs along an output row, reading the run's A row
+// once; B streams one tile per k.
 struct MatmulFp32ProgramFactory {
     static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
         const MatmulFp32Params&, const MatmulFp32Inputs&, std::vector<Tensor>&);
