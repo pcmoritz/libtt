@@ -560,6 +560,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_sort_narrow_int_keys.patch",
         "//third_party/tt_xla:tt_mlir_total_order_compare.patch",
         "//third_party/tt_xla:tt_mlir_fp32_exact_matmul.patch",
+        "//third_party/tt_xla:tt_mlir_cumulative_elementwise_scan.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
