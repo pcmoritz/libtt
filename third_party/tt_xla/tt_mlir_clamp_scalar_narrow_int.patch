@@ -1,0 +1,59 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -3576,6 +3576,13 @@
+ 
+     let results = (outs AnyRankedTensor:$result);
+ 
++    let extraClassDeclaration = [{
++      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
++        return wa::TTNNOperandsWorkaroundsFactory::
++            createClampScalarOpOperandsWorkarounds(getInput().getType());
++      }
++    }];
++
+     let hasVerifier = 1;
+ 
+ }
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -298,6 +298,9 @@
+   static TTNNOperandsWorkarounds
+   createReshapeOpOperandsWorkarounds(RankedTensorType inputType);
+ 
++  static TTNNOperandsWorkarounds
++  createClampScalarOpOperandsWorkarounds(RankedTensorType inputType);
++
+   static TTNNOperandsWorkarounds createConcatOpOperandsWorkarounds(
+       mlir::Operation::operand_range inputs, int64_t dim);
+ 
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -525,6 +525,25 @@
+       .addOutputOperandWorkaround(typeWorkarounds);
+ }
+ 
++// Factory method to create a set of workarounds for clamp scalar operation
++// operands. Of the integer types, ttnn clamp only supports int32 and uint32,
++// so narrower integers are clamped as int32.
++TTNNOperandsWorkarounds
++TTNNOperandsWorkaroundsFactory::createClampScalarOpOperandsWorkarounds(
++    RankedTensorType inputType) {
++  TTNNOperandWorkarounds typeWorkarounds;
++  mlir::tt::ttcore::DataType dataType =
++      mlir::tt::ttcore::elementTypeToDataType(inputType.getElementType());
++  if (dataType == mlir::tt::ttcore::DataType::UInt8 ||
++      dataType == mlir::tt::ttcore::DataType::UInt16) {
++    typeWorkarounds.tensorDataTypeWorkaround =
++        mlir::tt::ttcore::DataType::Int32;
++  }
++  return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
++      .addInputOperandWorkaround(typeWorkarounds)
++      .addOutputOperandWorkaround(typeWorkarounds);
++}
++
+ TTNNOperandsWorkarounds
+ TTNNOperandsWorkaroundsFactory::createConcatOpOperandsWorkarounds(
+     mlir::Operation::operand_range inputs, int64_t dim) {
