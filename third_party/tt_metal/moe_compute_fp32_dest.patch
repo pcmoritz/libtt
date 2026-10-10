@@ -1,0 +1,72 @@
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/compute.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/compute.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/compute.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/compute.cpp
+@@ -66,7 +66,7 @@ struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::S
+             DST_SYNC_MODE,
+             DST_ACCUM_MODE,
+             calculate_silu,
+-            (false /*is_fp32_dest_acc_en*/, 8 /*ITERATIONS*/),
++            (DST_ACCUM_MODE, 8 /*ITERATIONS*/),
+             0 /*DST_IDX*/,
+             ::ckernel::VectorMode::RC));
+         if constexpr (kPairs == 2) {
+@@ -74,7 +74,7 @@ struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::S
+                 DST_SYNC_MODE,
+                 DST_ACCUM_MODE,
+                 calculate_silu,
+-                (false /*is_fp32_dest_acc_en*/, 8 /*ITERATIONS*/),
++                (DST_ACCUM_MODE, 8 /*ITERATIONS*/),
+                 2 /*DST_IDX*/,
+                 ::ckernel::VectorMode::RC));
+         }
+@@ -105,9 +105,9 @@ struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::S
+ template <uint32_t kPairs>
+ struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::SWIGLU, kPairs> {
+     static inline void compute() {
+-        PACK((llk_math_eltwise_binary_sfpu_swiglu<false>(0, 1, 0)));
++        PACK((llk_math_eltwise_binary_sfpu_swiglu<DST_ACCUM_MODE>(0, 1, 0)));
+         if constexpr (kPairs == 2) {
+-            PACK((llk_math_eltwise_binary_sfpu_swiglu<false>(2, 3, 2)));
++            PACK((llk_math_eltwise_binary_sfpu_swiglu<DST_ACCUM_MODE>(2, 3, 2)));
+         }
+     }
+ };
+@@ -120,12 +120,12 @@ struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::G
+         // for ring sizes where ceil(Nt/ring) is odd — e.g. gemma at ring=8) the next iteration's
+         // gelu reads a stale LUT and produces garbage. Re-init the LUT here so every gelu is valid.
+         // SILU/SWIGLU don't use this LUT, so they keep their cheaper once-per-chunk init.
+-        PACK((llk_math_eltwise_unary_sfpu_init<SfpuType::gelu>(ckernel::sfpu::gelu_init<true, false>)));
++        PACK((llk_math_eltwise_unary_sfpu_init<SfpuType::gelu>(ckernel::sfpu::gelu_init<true, DST_ACCUM_MODE>)));
+         PACK(SFPU_UNARY_CALL(
+             DST_SYNC_MODE,
+             DST_ACCUM_MODE,
+             calculate_gelu,
+-            (true /*APPROXIMATE*/, false /*is_fp32_dest_acc_en*/, 8 /*ITERATIONS*/),
++            (true /*APPROXIMATE*/, DST_ACCUM_MODE, 8 /*ITERATIONS*/),
+             0 /*DST_IDX*/,
+             ::ckernel::VectorMode::RC));
+         if constexpr (kPairs == 2) {
+@@ -133,7 +133,7 @@ struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::G
+                 DST_SYNC_MODE,
+                 DST_ACCUM_MODE,
+                 calculate_gelu,
+-                (true /*APPROXIMATE*/, false /*is_fp32_dest_acc_en*/, 8 /*ITERATIONS*/),
++                (true /*APPROXIMATE*/, DST_ACCUM_MODE, 8 /*ITERATIONS*/),
+                 2 /*DST_IDX*/,
+                 ::ckernel::VectorMode::RC));
+         }
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
+@@ -1714,7 +1714,10 @@ MoEComputeMeshWorkloadFactory::create_at(
+         ring_core_range_set,
+         tt::tt_metal::ComputeConfig{
+             .math_fidelity = tt::tt_metal::MathFidelity::LoFi,
+-            .fp32_dest_acc_en = false,
++            // FP32 DEST (tt-metal #59729), at no measurable time. Its effect depends on the shapes: against an FP32
++            // golden with the BFP4 weights, DeepSeek's experts go from rel L2 0.227 to 0.005; against BF16 weights,
++            // where the BFP4 rounding dominates, Qwen3-30B-A3B's go from 0.21 to 0.195.
++            .fp32_dest_acc_en = true,
+             .dst_full_sync_en = false,
+             .bfp8_pack_precise = false,
+             .math_approx_mode = true,

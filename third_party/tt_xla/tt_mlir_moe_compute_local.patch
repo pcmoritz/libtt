@@ -147,11 +147,24 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  static void addAllToAllOpsConversionPattern(MLIRContext *ctx,
                                              RewritePatternSet &patterns,
                                              TypeConverter &typeConverter) {
-@@ -13291,6 +13381,7 @@ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
+@@ -13250,6 +13340,11 @@ void populateStableHLOControlFlowToTTIRPatterns(
+     MLIRContext *context, RewritePatternSet &patterns,
+     TypeConverter &typeConverter);
+ 
++// tt.fused_moe_ep, in libtt's tt_mlir/lib/Conversion/StableHLOToTTIR/FusedMoeEp.cpp.
++void populateFusedMoeEpToTTIRPatterns(MLIRContext *context,
++                                      RewritePatternSet &patterns,
++                                      TypeConverter &typeConverter);
++
+ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
+                                      RewritePatternSet &patterns,
+                                      TypeConverter &typeConverter) {
+@@ -13291,6 +13386,8 @@ void populateStableHLOToTTIRPatterns(MLIRContext *ctx,
    addScaledDotProductAttentionDecodeOpConversionPattern(ctx, patterns,
                                                          typeConverter);
    addSparseMatmulOpConversionPattern(ctx, patterns, typeConverter);
 +  addMoeComputeOpConversionPattern(ctx, patterns, typeConverter);
++  populateFusedMoeEpToTTIRPatterns(ctx, patterns, typeConverter);
    addAllToAllOpsConversionPattern(ctx, patterns, typeConverter);
    addTTLangOpConversionPattern(ctx, patterns, typeConverter);
    // libtt lowers stablehlo.while itself (tt_mlir_control_flow.cpp).
@@ -242,18 +255,19 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
 --- a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
 +++ b/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
-@@ -9,7 +9,10 @@
+@@ -9,7 +9,11 @@
  #include "tt/runtime/detail/ttnn/ttnn.h"
  #include "tt/runtime/detail/ttnn/utils.h"
  
 +#include "ttnn/operations/core/core.hpp"
++#include "ttnn/operations/data_movement/untilize/untilize.hpp"
 +#include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
  #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp"
 +#include "ttnn/operations/full/full.hpp"
  
  namespace tt::runtime::ttnn::operations::ccl {
  
-@@ -27,9 +30,135 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
+@@ -27,9 +31,134 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
    return ::ttnn::experimental::prim::detail::MoEActivationFunction::SILU;
  }
  
@@ -288,8 +302,11 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
 +      ::tt::tt_metal::ShardSpec(::ttnn::CoreRangeSet(::ttnn::CoreRange(core)),
 +                                {rows, shape[-1]},
 +                                ::tt::tt_metal::ShardOrientation::ROW_MAJOR));
-+  return ::ttnn::to_memory_config(
-+      ::ttnn::to_layout(tensor, ::ttnn::Layout::ROW_MAJOR), memoryConfig);
++  // A tiled tensor is untilized straight into the shard, one program.
++  if (tensor.layout() == ::ttnn::Layout::TILE) {
++    return ::ttnn::untilize(tensor, memoryConfig);
++  }
++  return ::ttnn::to_memory_config(tensor, memoryConfig);
 +}
 +
 +// Without a cluster axis, each device runs the experts its mapping row places
@@ -305,11 +322,10 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
 +      tensorPool.getTTNNTensorAndValidate(op->tilize_expert_indices_tensor());
 +  const ::ttnn::Tensor &scores =
 +      tensorPool.getTTNNTensorAndValidate(op->tilize_expert_scores_tensor());
-+  // The optimizer may have placed them there already.
++  // The local output reads no scores: they only go into the combine's
++  // activation rows. The ids go to the drain core.
 +  ::ttnn::Tensor tilizeIndices =
 +      toTilizeDrainCore(indices, tilizeInput, op->output_height_shard_dim());
-+  ::ttnn::Tensor tilizeScores =
-+      toTilizeDrainCore(scores, tilizeInput, op->output_height_shard_dim());
 +  const ::ttnn::Tensor &tilizeMapping =
 +      tensorPool.getTTNNTensorAndValidate(op->tilize_expert_mapping_tensor());
 +  const ::ttnn::Tensor &w0w1 =
@@ -350,7 +366,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
 +  }
 +
 +  std::vector<::ttnn::Tensor> results = ::ttnn::experimental::moe_compute(
-+      tilizeInput, tilizeIndices, tilizeScores, tilizeMapping, w0w1, w2,
++      tilizeInput, tilizeIndices, scores, tilizeMapping, w0w1, w2,
 +      op->layer_id(), op->output_height_shard_dim(), op->intermediate_size(),
 +      op->has_bias(), localAxis, /*topology=*/std::nullopt,
 +      /*num_links=*/std::nullopt, /*mux_core_range_set=*/std::nullopt,
@@ -372,9 +388,6 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
 +  }
 +  if (tilizeIndices.buffer() != indices.buffer()) {
 +    ::ttnn::deallocate(tilizeIndices);
-+  }
-+  if (tilizeScores.buffer() != scores.buffer()) {
-+    ::ttnn::deallocate(tilizeScores);
 +  }
 +}
 +
@@ -412,3 +425,20 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
      return success();
    }
  };
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/TTNNDeduceMoEComputeLayouts.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/TTNNDeduceMoEComputeLayouts.cpp
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/TTNNDeduceMoEComputeLayouts.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/TTNNDeduceMoEComputeLayouts.cpp
+@@ -127,7 +127,12 @@ public:
+       CoreRangeSetAttr drainCoreRangeSet =
+           op_model::getMoeTilizeDrainCoreRangeSet(&op);
+       // Operands 1 (expert indices) and 2 (expert scores) are read by the
+-      // kernel from CBs allocated on the drain core.
++      // kernel from CBs allocated on the drain core. Without a cluster axis
++      // the kernel reads no scores and the runtime stages the ids itself, so
++      // that a router's tiled int32 ids take one program.
++      if (!op.getClusterAxis()) {
++        return;
++      }
+       reshardTilizeInputToDrainCore(op, /*operandIdx=*/1, drainCoreRangeSet);
+       reshardTilizeInputToDrainCore(op, /*operandIdx=*/2, drainCoreRangeSet);
+     });
