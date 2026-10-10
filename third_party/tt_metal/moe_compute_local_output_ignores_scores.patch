@@ -1,0 +1,84 @@
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_reader.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_reader.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_reader.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_reader.cpp
+@@ -523,12 +523,15 @@ void kernel_main() {
+                 num_tokens_this_core * aligned_indices_page_size,
+                 {.noc_x = drain_core_noc_x, .noc_y = drain_core_noc_y, .addr = local_indices_addr},
+                 {});
+-            noc_obj.async_read(
+-                UnicastEndpoint{},
+-                CoreLocalMem<uint32_t>(local_scores_addr),
+-                num_tokens_this_core * aligned_scores_page_size,
+-                {.noc_x = drain_core_noc_x, .noc_y = drain_core_noc_y, .addr = local_scores_addr},
+-                {});
++            // Scores only go into the combine's activation rows, which local_output doesn't build.
++            if constexpr (!local_output) {
++                noc_obj.async_read(
++                    UnicastEndpoint{},
++                    CoreLocalMem<uint32_t>(local_scores_addr),
++                    num_tokens_this_core * aligned_scores_page_size,
++                    {.noc_x = drain_core_noc_x, .noc_y = drain_core_noc_y, .addr = local_scores_addr},
++                    {});
++            }
+         }
+     }
+ 
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
+@@ -724,16 +724,19 @@ MoEComputeMeshWorkloadFactory::create_at(
+         tilize_indices_tensor.buffer());
+     const auto indices_cb_handle = std::get<1>(indices_cb_output);
+ 
+-    // Assume scores tensor is sharded in L1
+-    const auto scores_cb_output = tt::tt_metal::create_cb(
+-        scores_tensor_cb_id,
+-        program,
+-        tilize_core_range_set,
+-        tilize_input_scores_aligned_page_size,
+-        tilize_input_scores_pages,
+-        tilize_input_scores_data_format,
+-        tilize_input_scores_tensor.buffer());
+-    const auto scores_cb_handle = std::get<1>(scores_cb_output);
++    // Assume scores tensor is sharded in L1. Scores only go into the combine's activation rows, which local_output
++    // doesn't build: there the scores are left where they are.
++    std::optional<tt::tt_metal::CBHandle> scores_cb_handle;
++    if (!local_output) {
++        scores_cb_handle = std::get<1>(tt::tt_metal::create_cb(
++            scores_tensor_cb_id,
++            program,
++            tilize_core_range_set,
++            tilize_input_scores_aligned_page_size,
++            tilize_input_scores_pages,
++            tilize_input_scores_data_format,
++            tilize_input_scores_tensor.buffer()));
++    }
+ 
+     // For each batch's tokens, we need to read the relevant experts from the mapping tensor
+     // For in range (tokens) every time tokens/batch increments, read in new mapping tensor page
+@@ -1973,8 +1976,10 @@ void MoEComputeMeshWorkloadFactory::override_runtime_arguments(
+         tt::tt_metal::UpdateDynamicCircularBufferAddress(
+             program, shared_variables.indices_cb_handle, *tensor_args.tilize_expert_indices_tensor.buffer());
+ 
+-        tt::tt_metal::UpdateDynamicCircularBufferAddress(
+-            program, shared_variables.scores_cb_handle, *tensor_args.tilize_expert_scores_tensor.buffer());
++        if (shared_variables.scores_cb_handle) {
++            tt::tt_metal::UpdateDynamicCircularBufferAddress(
++                program, *shared_variables.scores_cb_handle, *tensor_args.tilize_expert_scores_tensor.buffer());
++        }
+ 
+         tt::tt_metal::UpdateDynamicCircularBufferAddress(
+             program, shared_variables.sharded_output_cb_handle, *tilize_output_tensor.buffer());
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.hpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.hpp
+@@ -32,7 +32,8 @@ struct MoEComputeMeshWorkloadFactory {
+         tt::tt_metal::CBHandle indices_cb_handle;
+ 
+         // CB handle for tensor backed scores tensor
+-        tt::tt_metal::CBHandle scores_cb_handle;
++        // Unset in local_output, which reads no scores.
++        std::optional<tt::tt_metal::CBHandle> scores_cb_handle;
+ 
+         // CB handle for shared global sharded tensor
+         tt::tt_metal::CBHandle sharded_output_cb_handle;

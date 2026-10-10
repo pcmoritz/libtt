@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h
-@@ -140,6 +140,19 @@ constexpr bool in_window(uint32_t) { return false; }
+@@ -140,6 +140,16 @@ constexpr bool in_window(uint32_t) { return false; }
  #endif
  #define MOE_STUDY_FAULT(point) (MOE_STUDY_DELAY_##point > 0)
  #define MOE_STUDY_PARAM(point) (MOE_STUDY_DELAY_##point)
@@ -10,11 +10,8 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
 +// (a negative padding id lands past the experts).
 +template <bool kWide>
 +inline uint16_t expert_id(uint32_t row, uint32_t k) {
-+    if constexpr (kWide) {
-+        return static_cast<uint16_t>(reinterpret_cast<const uint32_t*>(row)[k] & 0xFFFF);
-+    } else {
-+        return reinterpret_cast<const uint16_t*>(row)[k];
-+    }
++    // Little endian: an int32 id's low 16 bits are its first half.
++    return reinterpret_cast<const uint16_t*>(row)[kWide ? 2 * k : k];
 +}
 +}  // namespace moe_ring::routing
 +
@@ -32,29 +29,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  
      // Chunk info
      constexpr uint32_t tokens_per_chunk = get_named_compile_time_arg_val("tokens_per_chunk");
-@@ -522,12 +523,15 @@ void kernel_main() {
-                 num_tokens_this_core * aligned_indices_page_size,
-                 {.noc_x = drain_core_noc_x, .noc_y = drain_core_noc_y, .addr = local_indices_addr},
-                 {});
--            noc_obj.async_read(
--                UnicastEndpoint{},
--                CoreLocalMem<uint32_t>(local_scores_addr),
--                num_tokens_this_core * aligned_scores_page_size,
--                {.noc_x = drain_core_noc_x, .noc_y = drain_core_noc_y, .addr = local_scores_addr},
--                {});
-+            // Scores only go into the combine's activation rows, which local_output doesn't build.
-+            if constexpr (!local_output) {
-+                noc_obj.async_read(
-+                    UnicastEndpoint{},
-+                    CoreLocalMem<uint32_t>(local_scores_addr),
-+                    num_tokens_this_core * aligned_scores_page_size,
-+                    {.noc_x = drain_core_noc_x, .noc_y = drain_core_noc_y, .addr = local_scores_addr},
-+                    {});
-+            }
-         }
-     }
- 
-@@ -611,7 +615,7 @@ void kernel_main() {
+@@ -611,7 +612,7 @@ void kernel_main() {
              prev_device_in_group = device_in_group;
          }
  
@@ -63,7 +38,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
          const uint16_t* token_scores = reinterpret_cast<const uint16_t*>(scores_base + t * aligned_scores_page_size);
  
          // Defer pointer calculation until we know token is activated
-@@ -619,7 +623,7 @@ void kernel_main() {
+@@ -619,7 +620,7 @@ void kernel_main() {
          bool activated = false;
  
          for (uint32_t k = 0; k < selected_experts_k; k++) {
@@ -121,37 +96,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
-@@ -724,16 +724,19 @@ MoEComputeMeshWorkloadFactory::create_at(
-         tilize_indices_tensor.buffer());
-     const auto indices_cb_handle = std::get<1>(indices_cb_output);
- 
--    // Assume scores tensor is sharded in L1
--    const auto scores_cb_output = tt::tt_metal::create_cb(
--        scores_tensor_cb_id,
--        program,
--        tilize_core_range_set,
--        tilize_input_scores_aligned_page_size,
--        tilize_input_scores_pages,
--        tilize_input_scores_data_format,
--        tilize_input_scores_tensor.buffer());
--    const auto scores_cb_handle = std::get<1>(scores_cb_output);
-+    // Assume scores tensor is sharded in L1. Scores only go into the combine's activation rows, which local_output
-+    // doesn't build: there the scores are left where they are.
-+    tt::tt_metal::CBHandle scores_cb_handle = 0;
-+    if (!local_output) {
-+        scores_cb_handle = std::get<1>(tt::tt_metal::create_cb(
-+            scores_tensor_cb_id,
-+            program,
-+            tilize_core_range_set,
-+            tilize_input_scores_aligned_page_size,
-+            tilize_input_scores_pages,
-+            tilize_input_scores_data_format,
-+            tilize_input_scores_tensor.buffer()));
-+    }
- 
-     // For each batch's tokens, we need to read the relevant experts from the mapping tensor
-     // For in range (tokens) every time tokens/batch increments, read in new mapping tensor page
-@@ -1127,6 +1130,8 @@ MoEComputeMeshWorkloadFactory::create_at(
+@@ -1127,6 +1127,8 @@ MoEComputeMeshWorkloadFactory::create_at(
          {"experts", experts},
          {"experts_per_device", experts_per_device},
          {"selected_experts_k", selected_experts_k},
@@ -160,16 +105,3 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
  
          // Chunk info
          {"tokens_per_chunk", tokens_per_chunk},
-@@ -1971,8 +1976,10 @@ void MoEComputeMeshWorkloadFactory::override_runtime_arguments(
-         tt::tt_metal::UpdateDynamicCircularBufferAddress(
-             program, shared_variables.indices_cb_handle, *tensor_args.tilize_expert_indices_tensor.buffer());
- 
--        tt::tt_metal::UpdateDynamicCircularBufferAddress(
--            program, shared_variables.scores_cb_handle, *tensor_args.tilize_expert_scores_tensor.buffer());
-+        if (args.path != MoEComputePath::LocalOutput) {
-+            tt::tt_metal::UpdateDynamicCircularBufferAddress(
-+                program, shared_variables.scores_cb_handle, *tensor_args.tilize_expert_scores_tensor.buffer());
-+        }
- 
-         tt::tt_metal::UpdateDynamicCircularBufferAddress(
-             program, shared_variables.sharded_output_cb_handle, *tilize_output_tensor.buffer());
