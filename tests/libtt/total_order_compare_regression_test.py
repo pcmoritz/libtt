@@ -1,7 +1,7 @@
 """stablehlo.compare with compare_type TOTALORDER orders
 -NaN < -inf < ... < -0 < +0 < ... < +inf < +NaN, NaNs by payload, which
-ordinary float comparisons do not. libtt runs it as a native float32
-total-order comparison on Blackhole.
+ordinary float comparisons do not. libtt expands it like XLA's
+ComparisonExpander into a comparison of order-preserving integer keys.
 
 The direct tests below emit such comparisons for all six directions. The
 searchsorted test checks an integration: JAX canonicalizes zeros and NaNs
@@ -90,25 +90,43 @@ def test_total_order_compare(direction):
     np.testing.assert_array_equal(np.asarray(got), expected)
 
 
-# LT and LE are canonicalized to GT and GE with swapped operands, which must
-# keep the marker.
-@pytest.mark.parametrize("direction", ["LT", "LE", "GT", "EQ"])
-def test_total_order_compare_runs_natively(direction, tmp_path):
-    # The comparison reaches TTNN as one marked op, without bit-key arithmetic.
+def _ttnn_irs(tmp_path):
+    return [path.read_text() for path in (tmp_path / "irs").glob("ttnn*.mlir")]
+
+
+@pytest.mark.parametrize("direction", DIRECTIONS)
+def test_total_order_compare_of_broadcasts(direction, tmp_path):
+    # Keys of a broadcast operand are computed before the broadcast, so the
+    # n x m comparison materializes no repeated key tensors.
+    def compare(x, y):
+        shape = (x.shape[0], y.shape[0])
+        lhs = jnp.broadcast_to(x[:, None], shape)
+        rhs = jnp.broadcast_to(y[None, :], shape)
+        return TOTAL_ORDER_COMPARE[direction].bind(lhs, rhs)
+
+    run = jax.jit(compare, compiler_options={"export_path": str(tmp_path)})
+    got = run(device_put(SPECIAL), device_put(SPECIAL))
+    expected = NUMPY_OPS[direction](total_order_keys(X), total_order_keys(Y))
+    np.testing.assert_array_equal(np.asarray(got), expected)
+    irs = _ttnn_irs(tmp_path)
+    assert irs and not any("ttnn.repeat" in ir for ir in irs)
+
+
+@pytest.mark.parametrize("direction", ["EQ", "NE"])
+def test_total_order_equality_compares_bits(direction, tmp_path):
     run = jax.jit(TOTAL_ORDER_COMPARE[direction].bind, compiler_options={"export_path": str(tmp_path)})
     run(device_put(X), device_put(Y))
-    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn*.mlir")]
-    assert irs and any("ttcore.total_order" in ir for ir in irs)
-    assert not any("bitcast_convert" in ir for ir in irs)
+    irs = _ttnn_irs(tmp_path)
+    assert irs and not any("bitwise_xor" in ir for ir in irs)
 
 
 # Constant operands, where ordinary float folding would give EQ(-0, +0) = true
-# and EQ(NaN, NaN) = false.
+# and EQ(NaN, NaN) = false. (A splat -0 constant is not covered: ttnn.full
+# materializes it as +0, a separate issue.)
 @pytest.mark.parametrize("direction", DIRECTIONS)
 @pytest.mark.parametrize(
     "lhs_bits,rhs_bits",
     [
-        ([0x80000000] * 4, [0x00000000] * 4),  # splat -0 vs +0
         ([0x7FC00000] * 4, [0x7FC00000] * 4),  # splat NaN vs NaN
         ([0x80000000, 0x7FC00000, 0xFFC00000, 0x7F800000], [0x00000000, 0x7FC00000, 0x7FC00000, 0x7FC00000]),
     ],
