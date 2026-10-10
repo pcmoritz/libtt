@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -3435,6 +3435,28 @@
+@@ -3435,6 +3435,31 @@
    let hasFolder = 1;
  }
  
@@ -9,12 +9,12 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +  let summary = "Cumulative reduction operation.";
 +  let description = [{
 +    Computes a running reduction of the input along `dim`: each output element
-+    reduces all input elements along `dim` up to and including its position.
-+    `reduction` names the reduction: "max" or "min".
++    reduces all input elements along `dim` up to and including its position
++    (from the end of `dim` when `reverse` is set). `reduction` is max or min.
 +
 +    Example:
 +    ```mlir
-+    %result = "ttir.cumulative"(%input) <{dim = 1 : i64, reduction = "max"}> : (tensor<2x3xf32>) -> tensor<2x3xf32>
++    %result = "ttir.cumulative"(%input) <{dim = 1 : i64, reduction = #ttcore.reduce_type<max>}> : (tensor<2x3xf32>) -> tensor<2x3xf32>
 +    // [[1, 3, 2],     [[1, 3, 3],
 +    //  [5, 4, 6]]  ->  [5, 5, 6]]
 +    ```
@@ -22,9 +22,12 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +
 +  let arguments = (ins AnyRankedTensor:$input,
 +                       I64Attr:$dim,
-+                       StrAttr:$reduction);
++                       TTCore_ReduceTypeAttr:$reduction,
++                       DefaultValuedAttr<BoolAttr, "false">:$reverse);
 +
 +  let results = (outs AnyRankedTensor:$result);
++
++  let hasVerifier = 1;
 +}
 +
  def TTIR_SoftmaxOp : TTIR_NamedOp<"softmax"> {
@@ -33,22 +36,26 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -1338,6 +1338,20 @@
+@@ -1338,6 +1338,24 @@
  
  }
  
 +def TTNN_CumulativeOp : TTNN_Op<"cumulative", [OpModelExempt]> {
 +  let summary = "Cumulative reduction op.";
 +  let description = [{
-+    Running reduction of the input along `dim`; `reduction` is "max" or "min".
-+    Runs on ttnn's accumulation kernel, like cumsum and cumprod.
++    Running reduction of the input along `dim` (from its end when `reverse`
++    is set); `reduction` is max or min. Runs on ttnn's accumulation kernel,
++    like cumsum and cumprod.
 +  }];
 +
 +  let arguments = (ins AnyRankedTensor:$input,
 +                       SI32Attr:$dim,
-+                       StrAttr:$reduction);
++                       TTCore_ReduceTypeAttr:$reduction,
++                       DefaultValuedAttr<BoolAttr, "false">:$reverse);
 +
 +  let results = (outs AnyRankedTensor:$result);
++
++  let hasVerifier = 1;
 +}
 +
  def TTNN_ConcatenateHeadsOp: TTNN_Op<"concatenate_heads"> {
@@ -57,7 +64,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/cumprod.fbs b/include/ttmlir/Target/TTNN/operations/cumprod.fbs
 --- a/include/ttmlir/Target/TTNN/operations/cumprod.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/cumprod.fbs
-@@ -3,6 +3,21 @@
+@@ -3,6 +3,22 @@
  
  namespace tt.target.ttnn;
  
@@ -72,6 +79,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/cumprod.fbs b/include/ttmlir/
 +  out: tt.target.ttnn.TensorRef;
 +  dim: int32;
 +  reduction: CumulativeReduction;
++  reverse: bool = false;
 +  dtype: tt.target.DataType = null;
 +  memcfg: tt.target.ttnn.MemoryConfig;
 +}
@@ -93,15 +101,17 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -3377,6 +3377,19 @@
+@@ -3377,6 +3377,21 @@
                                                   *cumulativeMatch, rewriter);
          return success();
        }
 +
 +      // Running max and min lower to the general cumulative op.
 +      for (auto [reduction, initValue] :
-+           {std::pair{"max", TypicalInitReductionValue::NEG_INF},
-+            std::pair{"min", TypicalInitReductionValue::POS_INF}}) {
++           {std::pair{ttcore::ReduceType::Max,
++                      TypicalInitReductionValue::NEG_INF},
++            std::pair{ttcore::ReduceType::Min,
++                      TypicalInitReductionValue::POS_INF}}) {
 +        cumulativeMatch = isCumulativeExtremum(srcOp, adaptor, reductionOps[0],
 +                                               padding, initValue);
 +        if (cumulativeMatch) {
@@ -113,7 +123,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
  
      // Handle 5D input with three non-trivial window dimensions (3D max
-@@ -3919,6 +3932,57 @@
+@@ -3919,6 +3934,59 @@
      return match;
    }
  
@@ -140,32 +150,34 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +
 +  // Lowers a running max or min to ttir.cumulative. Unlike cumsum and cumprod,
 +  // integers keep their type: ttnn's accumulation kernel takes max and min
-+  // natively, and float32 cannot hold every int32. Like ttnn's elementwise
-+  // max and min, it compares sign-magnitude bits: +NaN is the largest value
-+  // and -NaN the smallest, so cummax propagates +NaN but cummin does not.
++  // natively, and float32 cannot hold every int32. The kernel takes 32-bit
++  // integers only, so narrower unsigned ones are scanned as uint32 (exact:
++  // max and min only select input values). Like ttnn's elementwise max and
++  // min, it compares sign-magnitude bits: +NaN is the largest value and -NaN
++  // the smallest, so cummax propagates +NaN but cummin does not.
 +  void replaceWithCumulativeReduction(
 +      mlir::stablehlo::ReduceWindowOp srcOp,
 +      mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
-+      CumulativeReductionMatch match, llvm::StringRef reduction,
++      CumulativeReductionMatch match, ttcore::ReduceType reduction,
 +      ConversionPatternRewriter &rewriter) const {
 +    auto resultType = cast<RankedTensorType>(
 +        getTypeConverter()->convertType(srcOp.getResult(0).getType()));
-+    DenseI64ArrayAttr dimensions =
-+        rewriter.getDenseI64ArrayAttr({match.dimension});
-+    Value input = adaptor.getInputs()[0];
-+    if (match.reverse) {
-+      input = rewriter.create<ttir::ReverseOp>(srcOp.getLoc(), resultType,
-+                                                input, dimensions);
++    RankedTensorType scanType = resultType;
++    if (auto intType = dyn_cast<IntegerType>(resultType.getElementType());
++        intType && intType.isUnsigned() && intType.getWidth() < 32) {
++      scanType = resultType.clone(rewriter.getIntegerType(32, false));
 +    }
-+    Value result = rewriter.create<ttir::CumulativeOp>(
-+        srcOp.getLoc(), resultType, input,
++    Value result = castToElementType(rewriter, srcOp.getLoc(),
++                                     adaptor.getInputs()[0],
++                                     scanType.getElementType());
++    result = rewriter.create<ttir::CumulativeOp>(
++        srcOp.getLoc(), scanType, result,
 +        rewriter.getI64IntegerAttr(match.dimension),
-+        rewriter.getStringAttr(reduction));
-+    if (match.reverse) {
-+      result = rewriter.create<ttir::ReverseOp>(srcOp.getLoc(), resultType,
-+                                                 result, dimensions);
-+    }
-+    rewriter.replaceOp(srcOp, result);
++        ttcore::ReduceTypeAttr::get(rewriter.getContext(), reduction),
++        rewriter.getBoolAttr(match.reverse));
++    rewriter.replaceOp(srcOp, castToElementType(rewriter, srcOp.getLoc(),
++                                                result,
++                                                resultType.getElementType()));
 +  }
 +
    // Helper function to find the StableHLO constant defining op by traversing
@@ -189,7 +201,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +    rewriter.replaceOpWithNewOp<ttnn::CumulativeOp>(
 +        op, this->getTypeConverter()->convertType(op.getType()),
 +        adaptor.getInput(), static_cast<int32_t>(adaptor.getDim()),
-+        adaptor.getReduction());
++        adaptor.getReduction(), adaptor.getReverse());
 +    return success();
 +  }
 +};
@@ -205,10 +217,62 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
             RepeatInterleaveOpConversionPattern,
             SoftmaxOpConversionPattern,
             SortOpConversionPattern,
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -7110,6 +7110,22 @@
+ //===----------------------------------------------------------------------===//
+ 
+ // CumProdOp verification
++::mlir::LogicalResult mlir::tt::ttir::CumulativeOp::verify() {
++  int64_t dim = getDim();
++  int64_t inputRank = getInput().getType().getRank();
++  if (dim < -inputRank || dim >= inputRank) {
++    return emitOpError() << "specified dimension should be between "
++                         << -inputRank << " and " << (inputRank - 1)
++                         << ", but got: " << dim;
++  }
++  if (getReduction() != ttcore::ReduceType::Max &&
++      getReduction() != ttcore::ReduceType::Min) {
++    return emitOpError() << "reduction must be max or min, but got: "
++                         << ttcore::stringifyReduceType(getReduction());
++  }
++  return success();
++}
++
+ ::mlir::LogicalResult mlir::tt::ttir::CumProdOp::verify() {
+   int64_t dim = getDim();
+   int64_t inputRank = getInput().getType().getRank();
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -237,6 +237,22 @@
+ // RandOp
+ //===----------------------------------------------------------------------===//
+ 
++::mlir::LogicalResult mlir::tt::ttnn::CumulativeOp::verify() {
++  int64_t dim = getDim();
++  int64_t inputRank = getInput().getType().getRank();
++  if (dim < -inputRank || dim >= inputRank) {
++    return emitOpError() << "specified dimension should be between "
++                         << -inputRank << " and " << (inputRank - 1)
++                         << ", but got: " << dim;
++  }
++  if (getReduction() != ttcore::ReduceType::Max &&
++      getReduction() != ttcore::ReduceType::Min) {
++    return emitOpError() << "reduction must be max or min, but got: "
++                         << ttcore::stringifyReduceType(getReduction());
++  }
++  return success();
++}
++
+ ::mlir::LogicalResult mlir::tt::ttnn::RandOp::verify() {
+   float low = getLow().convertToFloat();
+   float high = getHigh().convertToFloat();
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -681,6 +681,22 @@
+@@ -681,6 +681,32 @@
                                              dtype, memoryConfig);
  }
  
@@ -221,17 +285,27 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +                                            /*local_shape*/ std::nullopt);
 +  auto memoryConfig = toFlatbuffer(cache, op.getMemoryConfigAttr());
 +  auto dtype = toFlatbuffer(cache, op.getDtypeAttr());
-+  ::tt::target::ttnn::CumulativeReduction reduction =
-+      op.getReduction() == "max" ? ::tt::target::ttnn::CumulativeReduction::Max
-+                                 : ::tt::target::ttnn::CumulativeReduction::Min;
-+  return ::tt::target::ttnn::CreateCumulativeOp(
-+      *cache.fbb, in, output, op.getDim(), reduction, dtype, memoryConfig);
++  ::tt::target::ttnn::CumulativeReduction reduction;
++  switch (op.getReduction()) {
++  case ttcore::ReduceType::Max:
++    reduction = ::tt::target::ttnn::CumulativeReduction::Max;
++    break;
++  case ttcore::ReduceType::Min:
++    reduction = ::tt::target::ttnn::CumulativeReduction::Min;
++    break;
++  default:
++    llvm_unreachable("cumulative reduction is verified to be max or min");
++  }
++  return ::tt::target::ttnn::CreateCumulativeOp(*cache.fbb, in, output,
++                                                op.getDim(), reduction,
++                                                op.getReverse(), dtype,
++                                                memoryConfig);
 +}
 +
  ::flatbuffers::Offset<::tt::target::ttnn::CumProdOp>
  createOp(FlatbufferObjectCache &cache, CumProdOp op) {
    auto in = cache.at<::tt::target::ttnn::TensorRef>(
-@@ -5266,6 +5282,10 @@
+@@ -5266,6 +5292,10 @@
      return createOperation(cache, createOp(cache, cumProdOp), debugString,
                             locInfo);
    }
@@ -288,8 +362,8 @@ new file mode 100644
 +
 +  ::ttnn::Tensor out =
 +      ::ttnn::operations::reduction::accumulation::common::accumulation_invoke(
-+          in, op->dim(), dtype, /*optional_out=*/std::nullopt,
-+          /*reverse_order=*/false, outputMemoryConfig, accumulationOp);
++          in, op->dim(), dtype, /*optional_out=*/std::nullopt, op->reverse(),
++          outputMemoryConfig, accumulationOp);
 +
 +  tensorPool.insertTTNNTensorAndValidate(op->out(), out);
 +}

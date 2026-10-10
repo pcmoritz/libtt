@@ -1,8 +1,9 @@
 """lax.cummax and lax.cummin run on ttnn's accumulation kernel, like cumsum and
 cumprod. They used to lower to a bf16 max pool, which rounded float32 results.
 
-NaN inputs are not covered: like ttnn's elementwise max and min, the kernel
-compares sign-magnitude bits, so cummin does not propagate +NaN (JAX does).
+NaN: like ttnn's elementwise max and min, the kernel compares sign-magnitude
+bits, so +NaN is the largest value and -NaN the smallest. cummax propagates +NaN
+and cummin -NaN, as JAX does; the other two cases are expected failures.
 """
 
 import jax
@@ -23,10 +24,14 @@ def device_put(x):
 
 def values(dtype):
     rng = np.random.default_rng(0)
-    if dtype == jnp.int32:
-        # Beyond 2**24, so float32 arithmetic would round them.
-        x = rng.integers(-(2**31), 2**31 - 1, SHAPE, dtype=np.int64).astype(np.int32)
-        x[0, 0, :3] = [np.iinfo(np.int32).min, np.iinfo(np.int32).max, 16777217]
+    if np.issubdtype(dtype, np.integer):
+        # The full range: beyond 2**24, so float32 arithmetic would round them,
+        # and for uint32 beyond INT32_MAX.
+        info = np.iinfo(dtype)
+        x = rng.integers(info.min, info.max, SHAPE, dtype=np.int64, endpoint=True).astype(dtype)
+        x[0, 0, :2] = [info.min, info.max]
+        if dtype == np.uint32:
+            x[0, 1, :2] = [2**31, 2**31 - 1]
         return x
     # Values bf16 cannot hold, around 1e-3 as in testCumulativeReduce.
     x = rng.uniform(-1e-2, 1e-2, SHAPE).astype(np.float32)
@@ -35,14 +40,18 @@ def values(dtype):
 
 
 def reference(np_op, x, axis, reverse):
-    x = np.asarray(x, np.float64 if x.dtype != np.int32 else np.int64)
+    x = np.asarray(x, np.int64 if np.issubdtype(x.dtype, np.integer) else np.float64)
     if reverse:
         return np.flip(np_op(np.flip(x, axis), axis=axis), axis)
     return np_op(x, axis=axis)
 
 
 @pytest.mark.parametrize("op", sorted(OPS))
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.int32], ids=["f32", "bf16", "i32"])
+@pytest.mark.parametrize(
+    "dtype",
+    [jnp.float32, jnp.bfloat16, jnp.float16, jnp.int32, jnp.uint32, jnp.uint16, jnp.uint8],
+    ids=["f32", "bf16", "f16", "i32", "u32", "u16", "u8"],
+)
 @pytest.mark.parametrize("axis", [0, 1, 2])
 @pytest.mark.parametrize("reverse", [False, True])
 def test_cumulative_extremum(op, dtype, axis, reverse):
@@ -56,8 +65,31 @@ def test_cumulative_extremum(op, dtype, axis, reverse):
 
 
 def test_cumulative_extremum_runs_on_accumulation(tmp_path):
-    run = jax.jit(lambda x: jax.lax.cummax(x, axis=1), compiler_options={"export_path": str(tmp_path)})
+    # A reverse scan runs in the kernel, without reversing the tensor.
+    run = jax.jit(lambda x: jax.lax.cummax(x, axis=1, reverse=True), compiler_options={"export_path": str(tmp_path)})
     run(device_put(values(jnp.float32)))
     irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn*.mlir")]
     assert irs and any('"ttnn.cumulative"' in ir for ir in irs)
-    assert not any("max_pool2d" in ir for ir in irs)
+    assert not any("max_pool2d" in ir or '"ttnn.reverse"' in ir for ir in irs)
+
+
+_NAN_MISMATCH = pytest.mark.xfail(
+    strict=True, reason="sign-magnitude max/min: +NaN is skipped by min and -NaN by max"
+)
+
+
+@pytest.mark.parametrize(
+    "op,sign",
+    [
+        ("cummax", 1),
+        ("cummin", -1),
+        pytest.param("cummin", 1, marks=_NAN_MISMATCH),
+        pytest.param("cummax", -1, marks=_NAN_MISMATCH),
+    ],
+)
+def test_cumulative_extremum_propagates_nan(op, sign):
+    lax_op, _ = OPS[op]
+    nan = np.copysign(np.float32(np.nan), np.float32(sign))
+    x = np.array([[1.0, nan, 2.0, -5.0, 0.5]], np.float32)
+    got = np.asarray(jax.jit(lambda x: lax_op(x, axis=1))(device_put(x)))
+    np.testing.assert_array_equal(np.isnan(got), [[False, True, True, True, True]])
