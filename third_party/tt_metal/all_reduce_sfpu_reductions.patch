@@ -769,7 +769,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
      auto compute_kernel_id =
          tt::tt_metal::CreateKernel(program, compute_kernel_path, sender_worker_core_range_set, compute_kernel_config_);
  
-@@ -1131,7 +1139,8 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
+@@ -1133,7 +1141,8 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
      std::optional<uint32_t> num_workers_per_direction_opt,
      std::optional<uint32_t> num_buffers_per_channel,
      const CoreCoord core_grid_offset,
@@ -779,7 +779,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
      /**
       * Line Reduce Scatter
       *
-@@ -1257,7 +1266,9 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
+@@ -1259,7 +1268,9 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
      CoreRangeSet mux_core_range_set = CoreRangeSet(mux_core_ranges);
  
      // Extract compute kernel config parameters
@@ -790,7 +790,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
      const tt::tt_metal::MathFidelity math_fidelity = compute_kernel_config.has_value()
                                                           ? ttnn::get_math_fidelity(compute_kernel_config)
                                                           : tt::tt_metal::MathFidelity::HiFi4;
-@@ -1271,6 +1282,10 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
+@@ -1273,6 +1284,10 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
      uint32_t max_scatter_write_pages = 2;
      uint32_t tiles_to_write_per_packet = std::min(num_pages_per_packet, max_scatter_write_pages);
      uint32_t tile_granularity = std::min(4 * num_pages_per_packet, max_dst_size);
@@ -801,7 +801,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
      uint32_t cb_num_pages = 3 * tile_granularity;  // triple buffering
      tt::DataFormat df = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
  
-@@ -1531,6 +1546,7 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
+@@ -1533,6 +1548,7 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
              slice_B,
              slice_C,
              normalized_dim)};
@@ -809,7 +809,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
  
      std::string sender_reduce_kernel_path =
          normalized_dim == 0 ? "ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/"
-@@ -1791,7 +1807,8 @@ ReduceScatterProgramArtifacts build_ring_reduce_scatter_minimal_async_program_ar
+@@ -1795,7 +1811,8 @@ ReduceScatterProgramArtifacts build_ring_reduce_scatter_minimal_async_program_ar
      std::optional<uint32_t> num_workers_per_direction_opt,
      std::optional<uint32_t> num_buffers_per_channel,
      CoreCoord core_grid_offset,
@@ -819,7 +819,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
      return ::ttnn::build_ring_reduce_scatter_minimal_async_program_artifacts(
          program,
          input_tensor,
-@@ -1815,7 +1832,8 @@ ReduceScatterProgramArtifacts build_ring_reduce_scatter_minimal_async_program_ar
+@@ -1819,7 +1836,8 @@ ReduceScatterProgramArtifacts build_ring_reduce_scatter_minimal_async_program_ar
          num_workers_per_direction_opt,
          num_buffers_per_channel,
          core_grid_offset,
@@ -829,7 +829,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
  }
  
  ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_artifacts(
-@@ -1841,7 +1859,8 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
+@@ -1845,7 +1863,8 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
      std::optional<uint32_t> num_workers_per_direction_opt,
      std::optional<uint32_t> num_buffers_per_channel,
      CoreCoord core_grid_offset,
@@ -839,7 +839,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
      return ::ttnn::build_line_reduce_scatter_minimal_async_program_artifacts(
          program,
          input_tensor,
-@@ -1865,7 +1884,8 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
+@@ -1869,7 +1888,8 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
          num_workers_per_direction_opt,
          num_buffers_per_channel,
          core_grid_offset,

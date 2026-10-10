@@ -70,7 +70,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_t
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
-@@ -3162,6 +3162,7 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
+@@ -3181,6 +3181,7 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
      uint32_t out_block_w,
      uint32_t per_core_M,
      uint32_t per_core_N,
@@ -78,7 +78,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
      std::optional<UnaryWithParam> fused_activation,
      const MeshTensor& in0_tensor,
      const MeshTensor& in1_tensor,
-@@ -3293,6 +3294,18 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
+@@ -3312,6 +3313,18 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
  
      uint32_t num_blocks_y = ((M - 1) / per_core_M) + 1;
      uint32_t num_blocks_x = ((N - 1) / per_core_N) + 1;
@@ -97,7 +97,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
      uint32_t num_blocks_total = num_blocks_y * num_blocks_x;
      uint32_t num_cores_with_work = num_blocks_total;
  
-@@ -4052,6 +4065,27 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
+@@ -4320,6 +4333,27 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
          const auto& core = cores[i];
          uint32_t output_idx_x = i % num_blocks_x;
          uint32_t output_idx_y = i / num_blocks_x;
@@ -124,62 +124,54 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
 +            (out_block_w / out_subblock_w - core_last_block_num_nonzero_subblocks_w);
  
          if (in0_is_sharded) {
-             std::vector<uint32_t> mm_in0_sender_args;
-@@ -4120,7 +4154,7 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
-                 // READER
-                 // in1 tensor args
-                 (std::uint32_t)in1_tensor.address(),
--                (std::uint32_t)in1_tensor_start_tile_id_stride * output_idx_x,  // in1_tensor_start_tile_id
-+                (std::uint32_t)core_n_start * in1_tensor_stride_w,  // in1_tensor_start_tile_id
-                 // in1 mcast args
-                 (std::uint32_t)0,  // in1_mcast_dest_noc_start_x
-                 (std::uint32_t)0,  // in1_mcast_dest_noc_start_y
-@@ -4133,23 +4167,23 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
-                 // WRITER
-                 // out tensor args
-                 (std::uint32_t)out_tensor.address(),
--                ((std::uint32_t)output_idx_x * per_core_N) +
-+                (std::uint32_t)core_n_start +
-                     (output_idx_y * per_core_M * N)  // out_tensor_start_tile_id
-             };
- 
--            if (output_idx_x == num_blocks_x - 1) {
-+            if (partial_output_block) {
-                 // padding args (READER)
--                mm_in1_sender_writer_args.push_back(last_out_block_w);
-+                mm_in1_sender_writer_args.push_back(core_last_out_block_w);
- 
-                 // padding args (WRITER)
-                 mm_in1_sender_writer_args.push_back(in0_last_block_num_nonzero_subblocks_h);
-                 mm_in1_sender_writer_args.push_back(in0_last_subblock_of_last_block_h);
-                 mm_in1_sender_writer_args.push_back(in0_last_block_padded_block_tiles_h_skip);
-                 mm_in1_sender_writer_args.push_back(out_block_w / out_subblock_w);  // out_num_nonzero_subblocks_w
--                mm_in1_sender_writer_args.push_back(last_block_num_nonzero_subblocks_w);
--                mm_in1_sender_writer_args.push_back(last_subblock_of_last_block_w);
--                mm_in1_sender_writer_args.push_back(last_block_padded_subblock_tiles_addr_skip);
--                mm_in1_sender_writer_args.push_back(last_block_padded_block_tiles_w_skip);
-+                mm_in1_sender_writer_args.push_back(core_last_block_num_nonzero_subblocks_w);
-+                mm_in1_sender_writer_args.push_back(core_last_subblock_w);
-+                mm_in1_sender_writer_args.push_back(core_padded_subblock_tiles_addr_skip);
-+                mm_in1_sender_writer_args.push_back(core_padded_block_tiles_w_skip);
-             } else {
-                 // padding args (READER)
-                 mm_in1_sender_writer_args.push_back(out_block_w);
-@@ -4169,10 +4203,10 @@ static ProgramDescriptor create_program_mcast_in0_descriptor(
-             mm_in1_sender_writer_args.push_back(
-                 bias_tensor.has_value() ? (std::uint32_t)bias_tensor->address() : 0);  // smuggled-rta-ok
-             mm_in1_sender_writer_args.push_back(
--                bias_tensor.has_value() ? (std::uint32_t)per_core_N * output_idx_x : 0);  // in3_tensor_start_tile_id
-+                bias_tensor.has_value() ? (std::uint32_t)core_n_start : 0);  // in3_tensor_start_tile_id
+             std::vector<uint32_t> varargs;
+@@ -4360,36 +4394,34 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
+                 {{"in0_mcast_sender_noc_x", static_cast<uint32_t>(top_left_core_physical.x)},
+                  {"in0_mcast_sender_noc_y", static_cast<uint32_t>(top_left_core_physical.y)}});
+         }
+-
+         if (i < num_cores_with_work) {
+-            const bool last_x = (output_idx_x == num_blocks_x - 1);
+             AddRuntimeArgsForNode(
+                 in1_sender_run_args.runtime_arg_values,
+                 core,
+-                {{"in1_tensor_start_tile_id", static_cast<uint32_t>(in1_tensor_start_tile_id_stride * output_idx_x)},
++                {{"in1_tensor_start_tile_id", static_cast<uint32_t>(core_n_start * in1_tensor_stride_w)},
+                  {"in1_mcast_dest_noc_start_x", 0u},
+                  {"in1_mcast_dest_noc_start_y", 0u},
+                  {"in1_mcast_dest_noc_end_x", 0u},
+                  {"in1_mcast_dest_noc_end_y", 0u},
+-                 {"out_tensor_start_tile_id", (output_idx_x * per_core_N) + (output_idx_y * per_core_M * N)},
++                 {"out_tensor_start_tile_id", core_n_start + (output_idx_y * per_core_M * N)},
+                  // padding args (READER)
+-                 {"last_block_w", last_x ? last_out_block_w : out_block_w},
++                 {"last_block_w", partial_output_block ? core_last_out_block_w : out_block_w},
+                  // padding args (WRITER)
+                  {"out_num_nonzero_subblocks_h", in0_last_block_num_nonzero_subblocks_h},
+                  {"out_last_subblock_h", in0_last_subblock_of_last_block_h},
+                  {"padded_block_tiles_h_skip", in0_last_block_padded_block_tiles_h_skip},
+                  {"out_num_nonzero_subblocks_w", out_block_w / out_subblock_w},
+                  {"out_last_num_nonzero_subblocks_w",
+-                  last_x ? last_block_num_nonzero_subblocks_w : out_block_w / out_subblock_w},
+-                 {"out_last_subblock_w", last_x ? last_subblock_of_last_block_w : out_subblock_w},
+-                 {"padded_subblock_tiles_addr_skip", last_x ? last_block_padded_subblock_tiles_addr_skip : 0u},
+-                 {"padded_block_tiles_w_skip", last_x ? last_block_padded_block_tiles_w_skip : 0u}});
++                  partial_output_block ? core_last_block_num_nonzero_subblocks_w : out_block_w / out_subblock_w},
++                 {"out_last_subblock_w", partial_output_block ? core_last_subblock_w : out_subblock_w},
++                 {"padded_subblock_tiles_addr_skip", partial_output_block ? core_padded_subblock_tiles_addr_skip : 0u},
++                 {"padded_block_tiles_w_skip", partial_output_block ? core_padded_block_tiles_w_skip : 0u}});
+             if (bias_tensor.has_value()) {
+-                in1_sender_run_args.runtime_arg_values["in3_tensor_start_tile_id"][core] = per_core_N * output_idx_x;
++                in1_sender_run_args.runtime_arg_values["in3_tensor_start_tile_id"][core] = core_n_start;
+             }
              if (!output_is_sharded) {
--                if (output_idx_x == num_blocks_x - 1) {
--                    mm_in1_sender_writer_args.push_back(last_out_num_blocks_w);
-+                if (partial_output_block) {
-+                    mm_in1_sender_writer_args.push_back(core_last_out_num_blocks_w);
-                 } else {
-                     mm_in1_sender_writer_args.push_back(out_num_blocks_x);
-                 }
-@@ -5519,6 +5553,7 @@ ProgramDescriptor MatmulMultiCoreReuseMcast1DProgramFactory::create_descriptor(
+                 in1_sender_run_args.runtime_arg_values["last_num_blocks_w_dim"][core] =
+-                    last_x ? last_out_num_blocks_w : out_num_blocks_x;
++                    partial_output_block ? core_last_out_num_blocks_w : out_num_blocks_x;
+             }
+         }
+     }
+@@ -5908,6 +5940,7 @@ ttnn::device_operation::ProgramArtifacts MatmulMultiCoreReuseMcast1DProgramFacto
      auto out_block_w = program_config.out_block_w;
      auto per_core_M = program_config.per_core_M;
      auto per_core_N = program_config.per_core_N;
@@ -187,7 +179,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
      auto mcast_in0 = program_config.mcast_in0;
      auto gather_in0 = program_config.gather_in0;
  
-@@ -5633,6 +5668,7 @@ ProgramDescriptor MatmulMultiCoreReuseMcast1DProgramFactory::create_descriptor(
+@@ -6021,6 +6054,7 @@ ttnn::device_operation::ProgramArtifacts MatmulMultiCoreReuseMcast1DProgramFacto
              out_block_w,
              per_core_M,
              per_core_N,
