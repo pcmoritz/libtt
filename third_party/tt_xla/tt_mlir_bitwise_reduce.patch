@@ -11,7 +11,7 @@
      LogicalResult legalityResult =
          checkConversionLegality(srcOp, adaptor, rewriter);
      if (!legalityResult.succeeded()) {
-@@ -338,6 +342,155 @@
+@@ -338,6 +342,168 @@
    }
  
  private:
@@ -52,44 +52,70 @@
 +           mlir::isa<mlir::stablehlo::XorOp>(combiner);
 +  }
 +
-+  // Halves each reduced dimension until one element is left, combining the
-+  // halves elementwise and carrying an odd middle element to the next step.
-+  // The result is then combined with the init value unless that is the op's
-+  // identity.
++  // Boolean and/or keep their ttir.reduce_and/reduce_or lowering, so the
++  // halves are combined bitwise, or with logical xor for booleans.
 +  LogicalResult
 +  matchAndRewriteElementwiseFold(mlir::stablehlo::ReduceOp &srcOp,
 +                                 mlir::stablehlo::ReduceOp::Adaptor &adaptor,
 +                                 ConversionPatternRewriter &rewriter) const {
 +    Operation &combiner = srcOp.getBody().front().front();
++    if (mlir::isa<mlir::stablehlo::AndOp>(combiner)) {
++      return rewriteTreeReduction<ttir::BitwiseAndOp>(srcOp, adaptor,
++                                                      rewriter);
++    }
++    if (mlir::isa<mlir::stablehlo::OrOp>(combiner)) {
++      return rewriteTreeReduction<ttir::BitwiseOrOp>(srcOp, adaptor, rewriter);
++    }
++    auto inputType =
++        mlir::cast<RankedTensorType>(adaptor.getInputs().front().getType());
++    if (inputType.getElementTypeBitWidth() == 1) {
++      return rewriteTreeReduction<ttir::LogicalXorOp>(srcOp, adaptor,
++                                                      rewriter);
++    }
++    return rewriteTreeReduction<ttir::BitwiseXorOp>(srcOp, adaptor, rewriter);
++  }
++
++  // Halves each reduced dimension until one element is left, combining the
++  // halves with CombineOp and carrying an odd middle element to the next
++  // step. The result is then combined with the init value unless that is the
++  // op's identity. Reducing an empty dimension yields the init value.
++  template <typename CombineOp>
++  LogicalResult
++  rewriteTreeReduction(mlir::stablehlo::ReduceOp &srcOp,
++                       mlir::stablehlo::ReduceOp::Adaptor &adaptor,
++                       ConversionPatternRewriter &rewriter) const {
 +    Location loc = srcOp.getLoc();
 +    auto outputType = mlir::cast<RankedTensorType>(
 +        getTypeConverter()->convertType(srcOp.getResult(0).getType()));
 +    Value value = adaptor.getInputs().front();
 +    auto inputType = mlir::cast<RankedTensorType>(value.getType());
-+    bool isBoolean = inputType.getElementTypeBitWidth() == 1;
++    llvm::ArrayRef<int64_t> dimensions = srcOp.getDimensions();
++
++    auto broadcastInit = [&](Value &init) {
++      return ttir::utils::broadcastValue(rewriter,
++                                         adaptor.getInitValues().front(),
++                                         outputType, init, loc,
++                                         /*frontUnsqueeze=*/false);
++    };
++    if (llvm::any_of(dimensions, [&](int64_t dim) {
++          return inputType.getDimSize(dim) == 0;
++        })) {
++      Value init;
++      if (failed(broadcastInit(init))) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "reduce init value is not broadcastable");
++      }
++      rewriter.replaceOp(srcOp, init);
++      return success();
++    }
 +
 +    auto combine = [&](Value lhs, Value rhs) -> Value {
-+      Type type = lhs.getType();
-+      if (mlir::isa<mlir::stablehlo::AndOp>(combiner)) {
-+        if (isBoolean) {
-+          return rewriter.create<ttir::LogicalAndOp>(loc, type, lhs, rhs);
-+        }
-+        return rewriter.create<ttir::BitwiseAndOp>(loc, type, lhs, rhs);
-+      }
-+      if (mlir::isa<mlir::stablehlo::OrOp>(combiner)) {
-+        if (isBoolean) {
-+          return rewriter.create<ttir::LogicalOrOp>(loc, type, lhs, rhs);
-+        }
-+        return rewriter.create<ttir::BitwiseOrOp>(loc, type, lhs, rhs);
-+      }
-+      if (isBoolean) {
-+        return rewriter.create<ttir::LogicalXorOp>(loc, type, lhs, rhs);
-+      }
-+      return rewriter.create<ttir::BitwiseXorOp>(loc, type, lhs, rhs);
++      return rewriter.create<CombineOp>(loc, lhs.getType(), lhs, rhs);
 +    };
-+
-+    llvm::SmallVector<int64_t> shape(inputType.getShape());
-+    auto slice = [&](Value input, int64_t dim, int64_t begin, int64_t end) {
++    auto slice = [&](Value input, int64_t dim, int64_t begin,
++                     int64_t end) -> Value {
++      auto type = mlir::cast<RankedTensorType>(input.getType());
++      llvm::ArrayRef<int64_t> shape = type.getShape();
 +      llvm::SmallVector<int32_t> begins(shape.size(), 0);
 +      llvm::SmallVector<int32_t> ends(shape.begin(), shape.end());
 +      llvm::SmallVector<int32_t> steps(shape.size(), 1);
@@ -98,52 +124,39 @@
 +      llvm::SmallVector<int64_t> sliceShape(shape);
 +      sliceShape[dim] = end - begin;
 +      return rewriter.create<ttir::SliceStaticOp>(
-+          loc, inputType.clone(sliceShape), input,
-+          rewriter.getI32ArrayAttr(begins), rewriter.getI32ArrayAttr(ends),
-+          rewriter.getI32ArrayAttr(steps));
++          loc, type.clone(sliceShape), input, rewriter.getI32ArrayAttr(begins),
++          rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
 +    };
 +
-+    bool isEmpty = false;
-+    for (int64_t dim : srcOp.getDimensions()) {
-+      isEmpty |= shape[dim] == 0;
-+      while (shape[dim] > 1) {
-+        int64_t size = shape[dim];
++    for (int64_t dim : dimensions) {
++      for (int64_t size = inputType.getDimSize(dim); size > 1;
++           size = (size + 1) / 2) {
 +        int64_t half = size / 2;
 +        Value folded = combine(slice(value, dim, 0, half),
 +                               slice(value, dim, size - half, size));
-+        llvm::SmallVector<int64_t> foldedShape(shape);
-+        foldedShape[dim] = half;
 +        if (size % 2 != 0) {
++          auto foldedType = mlir::cast<RankedTensorType>(folded.getType());
++          llvm::SmallVector<int64_t> foldedShape(foldedType.getShape());
 +          foldedShape[dim] = half + 1;
 +          llvm::SmallVector<Value> pieces = {
 +              folded, slice(value, dim, half, half + 1)};
 +          folded = rewriter.create<ttir::ConcatOp>(
-+              loc, inputType.clone(foldedShape), pieces, dim);
++              loc, foldedType.clone(foldedShape), pieces, dim);
 +        }
 +        value = folded;
-+        shape = foldedShape;
 +      }
-+    }
-+
-+    bool needsInit = isEmpty || !isIdentityInitValue(srcOp, combiner);
-+    Value init;
-+    if (needsInit &&
-+        failed(ttir::utils::broadcastValue(
-+            rewriter, adaptor.getInitValues().front(), outputType, init, loc,
-+            /*frontUnsqueeze=*/false))) {
-+      return rewriter.notifyMatchFailure(
-+          srcOp, "reduce init value is not broadcastable");
-+    }
-+    if (isEmpty) {
-+      rewriter.replaceOp(srcOp, init);
-+      return success();
 +    }
 +
 +    value = rewriter.create<ttir::ReshapeOp>(
 +        loc, outputType, value,
 +        rewriter.getI32ArrayAttr(
 +            llvm::to_vector_of<int32_t>(outputType.getShape())));
-+    if (needsInit) {
++    if (!isIdentityInitValue(srcOp, srcOp.getBody().front().front())) {
++      Value init;
++      if (failed(broadcastInit(init))) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "reduce init value is not broadcastable");
++      }
 +      value = combine(value, init);
 +    }
 +    rewriter.replaceOp(srcOp, value);
