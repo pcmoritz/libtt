@@ -57,3 +57,16 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
  TTNNOperandsWorkarounds
  TTNNOperandsWorkaroundsFactory::createConcatOpOperandsWorkarounds(
      mlir::Operation::operand_range inputs, int64_t dim) {
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+@@ -650,6 +650,9 @@
+         ttnn::EmbeddingOp::getOperationName(),
+         ttnn::ScatterOp::getOperationName(),
+         ttnn::ConcatOp::getOperationName(),
++        // ttnn clamp TT_FATALs on uint8/uint16 inputs; its operands
++        // workaround clamps them as int32.
++        ttnn::ClampScalarOp::getOperationName(),
+         // TopK's operands workaround forces input bf16 + indices ui16/ui32;
+         // without it, opt_level>=1 dtype propagation picks f32. See #8141.
+         ttnn::TopKOp::getOperationName(),
