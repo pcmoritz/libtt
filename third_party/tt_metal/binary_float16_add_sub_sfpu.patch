@@ -1,0 +1,15 @@
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+@@ -54,7 +54,10 @@ bool is_binary_sfpu_op(
+         case ADD:
+         case SUB:
+         case RSUB:
+-            return !fast_and_approximate_mode || (a == b && (a == FLOAT32 || a == INT32 || a == UINT32 || a == UINT16));
++            // The FPU kernel flushes Float16 subnormal inputs to zero as it unpacks them, so Float16 takes the
++            // SFPU kernel even in fast mode, which widens Float16 to Float32 exactly.
++            return !fast_and_approximate_mode ||
++                   (a == b && (a == FLOAT32 || a == FLOAT16 || a == INT32 || a == UINT32 || a == UINT16));
+         case LOGICAL_AND:
+         case LOGICAL_OR:
+         case LOGICAL_XOR:
