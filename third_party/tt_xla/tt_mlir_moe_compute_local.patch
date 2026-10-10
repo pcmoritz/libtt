@@ -268,7 +268,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
  
  namespace tt::runtime::ttnn::operations::ccl {
  
-@@ -27,9 +32,159 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
+@@ -27,9 +32,165 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
    return ::ttnn::experimental::prim::detail::MoEActivationFunction::SILU;
  }
  
@@ -383,21 +383,23 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
 +  ::ttnn::Tensor combined =
 +      ::ttnn::reshape(results[5], operations::utils::toTTNNShape(
 +                                      *op->combine_output()->desc()->shape()));
-+  // The consumer tilizes the row-major output. From DRAM, a few rows that are
-+  // wide (such as 64 x 2048 for 8 tokens) take TTNN's block tilize, which
-+  // reads them in small pieces; whole tile rows tilize faster sharded in L1,
-+  // one tile row per core, and the tiles are returned to DRAM.
++  // The result is tiled. From DRAM, a few wide rows (such as 64 x 2048 for 8
++  // tokens) take TTNN's block tilize, which reads them in small pieces; whole
++  // tile rows tilize faster sharded in L1, spread over the cores, and the
++  // tiles are returned to DRAM.
 +  const ::ttnn::Shape &combinedShape = combined.logical_shape();
-+  uint32_t combinedRows = combinedShape.volume() / combinedShape[-1];
-+  auto grid = meshDevice.compute_with_storage_grid_size();
-+  if (combinedRows % 32 == 0 &&
-+      combinedRows / 32 <= grid.x * grid.y) {
++  const uint32_t tileRows = combinedShape.volume() / combinedShape[-1] / 32;
++  const auto grid = meshDevice.compute_with_storage_grid_size();
++  if (combinedShape.volume() / combinedShape[-1] % 32 == 0) {
++    const uint32_t cores = grid.x * grid.y;
++    const uint32_t rowsPerCore = (tileRows + cores - 1) / cores;
 +    ::ttnn::MemoryConfig l1(
 +        ::ttnn::TensorMemoryLayout::HEIGHT_SHARDED, ::ttnn::BufferType::L1,
 +        ::tt::tt_metal::ShardSpec(
-+            ::tt::tt_metal::num_cores_to_corerangeset(combinedRows / 32, grid,
-+                                                      /*row_wise=*/true),
-+            {32, combinedShape[-1]},
++            ::tt::tt_metal::num_cores_to_corerangeset(
++                (tileRows + rowsPerCore - 1) / rowsPerCore, grid,
++                /*row_wise=*/true),
++            {32 * rowsPerCore, combinedShape[-1]},
 +            ::tt::tt_metal::ShardOrientation::ROW_MAJOR));
 +    ::ttnn::Tensor sharded = ::ttnn::to_memory_config(combined, l1);
 +    ::ttnn::Tensor tiled = ::ttnn::to_layout(sharded, ::ttnn::Layout::TILE);
@@ -407,6 +409,10 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
 +    ::ttnn::deallocate(tiled);
 +    ::ttnn::deallocate(combined);
 +    combined = dram;
++  } else {
++    ::ttnn::Tensor tiled = ::ttnn::to_layout(combined, ::ttnn::Layout::TILE);
++    ::ttnn::deallocate(combined);
++    combined = tiled;
 +  }
 +  tensorPool.insertTTNNTensorAndValidate(op->combine_output(), combined);
 +  for (size_t i = 0; i < 5; ++i) {
@@ -468,3 +474,20 @@ diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/TTNNDeduceMoEComputeLay
        reshardTilizeInputToDrainCore(op, /*operandIdx=*/1, drainCoreRangeSet);
        reshardTilizeInputToDrainCore(op, /*operandIdx=*/2, drainCoreRangeSet);
      });
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -1941,9 +1941,11 @@ TTNNOperandsWorkaroundsFactory::createMoeComputeOpOperandsWorkarounds(
+   rmU16.tensorLayoutWorkaround = Layout::RowMajor;
+   rmU16.tensorDataTypeWorkaround = ttcore::DataType::UInt16;
+ 
+-  // combine output: ROW_MAJOR, DRAM INTERLEAVED, bfloat16.
++  // combine output: ROW_MAJOR, DRAM INTERLEAVED, bfloat16. Without a cluster
++  // axis the runtime tilizes the kernel's local output itself.
+   TTNNOperandWorkarounds combineOutput;
+-  combineOutput.tensorLayoutWorkaround = Layout::RowMajor;
++  combineOutput.tensorLayoutWorkaround =
++      op.getClusterAxis() ? Layout::RowMajor : Layout::Tile;
+   combineOutput.tensorBufferTypeWorkaround = BufferType::DRAM;
+   combineOutput.tensorMemoryLayoutWorkaround = TensorMemoryLayoutAttr::get(
+       op.getContext(), TensorMemoryLayout::Interleaved);
