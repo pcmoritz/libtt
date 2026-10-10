@@ -1,0 +1,83 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -4341,9 +4341,15 @@
+ namespace {
+ class StableHLOToTTIRCompareOpConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::CompareOp> {
+-  using OpConversionPattern<mlir::stablehlo::CompareOp>::OpConversionPattern;
+-
+ public:
++  // A total-order comparison is rewritten into an integer comparison, which
++  // this pattern then converts.
++  StableHLOToTTIRCompareOpConversionPattern(TypeConverter &typeConverter,
++                                            MLIRContext *ctx)
++      : OpConversionPattern(typeConverter, ctx) {
++    setHasBoundedRewriteRecursion();
++  }
++
+   LogicalResult
+   matchAndRewrite(mlir::stablehlo::CompareOp srcOp,
+                   mlir::stablehlo::CompareOp::Adaptor adaptor,
+@@ -4353,6 +4359,24 @@
+     mlir::stablehlo::ComparisonDirection direction =
+         srcOp.getComparisonDirection();
+ 
++    // A total-order float comparison (as in JAX's sort and searchsorted
++    // comparators) orders -NaN < -inf < ... < -0 < +0 < ... < +inf < +NaN,
++    // which ordinary float comparisons do not: ordered comparisons with NaN
++    // are false. Expand it like XLA's ComparisonExpander, into a signed
++    // comparison of order-preserving integer keys.
++    if (srcOp.getCompareType() ==
++            mlir::stablehlo::ComparisonType::TOTALORDER &&
++        isa<FloatType>(getElementTypeOrSelf(srcOp.getLhs().getType()))) {
++      // The keys are a bijection of the bits, so equality needs only the bits.
++      bool bitsOnly = direction == mlir::stablehlo::ComparisonDirection::EQ ||
++                      direction == mlir::stablehlo::ComparisonDirection::NE;
++      Value lhs = toTotalOrderKey(srcOp.getLhs(), bitsOnly, rewriter);
++      Value rhs = toTotalOrderKey(srcOp.getRhs(), bitsOnly, rewriter);
++      rewriter.replaceOpWithNewOp<mlir::stablehlo::CompareOp>(
++          srcOp, lhs, rhs, direction, mlir::stablehlo::ComparisonType::SIGNED);
++      return success();
++    }
++
+     switch (direction) {
+     case mlir::stablehlo::ComparisonDirection::EQ: {
+       return matchAndRewriteInternal<mlir::tt::ttir::EqualOp>(srcOp, adaptor,
+@@ -4389,6 +4413,36 @@
+   }
+ 
+ private:
++  // Returns int32 keys whose signed order is the IEEE total order of `value`'s
++  // floats (as float32), as in XLA's ComparisonExpander but branchless:
++  //   key = bits ^ ((bits >> 31) & 0x7fffffff)
++  // The bits of a non-negative float already order as an integer; flipping
++  // all but the sign bit of a negative one reverses the order of negatives.
++  Value toTotalOrderKey(Value value, bool bitsOnly,
++                        ConversionPatternRewriter &rewriter) const {
++    Location loc = value.getLoc();
++    auto type = cast<RankedTensorType>(value.getType());
++    auto i32Type = type.clone(rewriter.getI32Type());
++    if (type.getElementType() != rewriter.getF32Type()) {
++      value = rewriter.create<mlir::stablehlo::ConvertOp>(
++          loc, type.clone(rewriter.getF32Type()), value);
++    }
++    Value bits =
++        rewriter.create<mlir::stablehlo::BitcastConvertOp>(loc, i32Type, value);
++    if (bitsOnly) {
++      return bits;
++    }
++    auto constant = [&](int32_t fill) -> Value {
++      return rewriter.create<mlir::stablehlo::ConstantOp>(
++          loc, DenseElementsAttr::get(i32Type, llvm::ArrayRef<int32_t>{fill}));
++    };
++    Value sign = rewriter.create<mlir::stablehlo::ShiftRightArithmeticOp>(
++        loc, bits, constant(31));
++    Value mask =
++        rewriter.create<mlir::stablehlo::AndOp>(loc, sign, constant(0x7FFFFFFF));
++    return rewriter.create<mlir::stablehlo::XorOp>(loc, bits, mask);
++  }
++
+   template <typename DestOp>
+   LogicalResult
+   matchAndRewriteInternal(mlir::stablehlo::CompareOp srcOp,
