@@ -1,0 +1,159 @@
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -27,6 +27,7 @@
+ #include "mlir/IR/BuiltinAttributes.h"
+ #include "mlir/IR/BuiltinTypes.h"
+ #include "mlir/IR/DialectResourceBlobManager.h"
++#include "mlir/IR/IRMapping.h"
+ #include "mlir/IR/PatternMatch.h"
+ #include "mlir/IR/Region.h"
+ #include "mlir/IR/Value.h"
+@@ -3291,6 +3292,11 @@
+       return rewriter.notifyMatchFailure(srcOp, "Invalid input tensor rank.");
+     }
+ 
++    if (std::optional<CumulativeReductionMatch> scanMatch =
++            matchElementwiseScan(srcOp, adaptor)) {
++      return rewriteAsElementwiseScan(srcOp, adaptor, *scanMatch, rewriter);
++    }
++
+     // Validate init values.
+     std::optional<llvm::SmallVector<TypicalInitReductionValue>> initValues =
+         extractInitValues(srcOp);
+@@ -3798,6 +3804,136 @@
+     return success();
+   }
+ 
++  // Matches a cumulative reduce_window (see isCumSum) whose body chains
++  // several elementwise ops on its two arguments, such as the logaddexp body
++  // of cumlogsumexp. Bodies with a single op keep their dedicated lowerings.
++  std::optional<CumulativeReductionMatch>
++  matchElementwiseScan(mlir::stablehlo::ReduceWindowOp &srcOp,
++                       mlir::stablehlo::ReduceWindowOp::Adaptor adaptor) const {
++    if (srcOp.getInputs().size() != 1 || srcOp.getInitValues().size() != 1) {
++      return std::nullopt;
++    }
++    Block &block = srcOp.getBody().front();
++    auto returnOp = dyn_cast<mlir::stablehlo::ReturnOp>(block.back());
++    if (block.getNumArguments() != 2 || block.getOperations().size() < 3 ||
++        !returnOp || returnOp.getNumOperands() != 1) {
++      return std::nullopt;
++    }
++    for (Operation &op : llvm::drop_end(block.getOperations(), 1)) {
++      if (op.getNumRegions() != 0 || op.getNumResults() != 1 ||
++          !(op.hasTrait<OpTrait::Elementwise>() ||
++            isa<mlir::stablehlo::SelectOp>(op))) {
++        return std::nullopt;
++      }
++      for (Value operand : op.getOperands()) {
++        if (operand.getParentBlock() != &block) {
++          return std::nullopt;
++        }
++      }
++    }
++
++    if (!hasValidWindowAttributes(adaptor)) {
++      return std::nullopt;
++    }
++    DenseI64ArrayAttr padding =
++        adaptor.getPaddingAttr()
++            ? DenseI64ArrayAttr::get(
++                  srcOp.getContext(),
++                  SmallVector<int64_t>(
++                      adaptor.getPaddingAttr().getValues<int64_t>()))
++            : DenseI64ArrayAttr::get(
++                  srcOp.getContext(),
++                  SmallVector<int64_t>(
++                      adaptor.getWindowDimensionsAttr().size() * 2, 0));
++    CumulativeReductionMatch match;
++    if (!hasValidInputAndPadding(srcOp, adaptor, match, padding)) {
++      return std::nullopt;
++    }
++    return match;
++  }
++
++  // Lowers a cumulative reduce_window to a Hillis-Steele scan: each of
++  // log2(n) steps combines every element with the partial result `offset`
++  // positions before it (after it when reversed), using the init value where
++  // there is no such element. Like JAX's cumulative reductions, this treats
++  // the init value as the identity of the body. The body ops are re-created
++  // on whole tensors and legalized by their own patterns.
++  LogicalResult
++  rewriteAsElementwiseScan(mlir::stablehlo::ReduceWindowOp srcOp,
++                           mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
++                           CumulativeReductionMatch match,
++                           ConversionPatternRewriter &rewriter) const {
++    Location loc = srcOp.getLoc();
++    Value value = adaptor.getInputs().front();
++    auto inputType = mlir::cast<RankedTensorType>(value.getType());
++    llvm::ArrayRef<int64_t> shape = inputType.getShape();
++    int64_t dim = match.dimension;
++    int64_t size = shape[dim];
++    Block &block = srcOp.getBody().front();
++
++    auto slice = [&](Value input, int64_t begin, int64_t end) -> Value {
++      auto type = mlir::cast<RankedTensorType>(input.getType());
++      llvm::ArrayRef<int64_t> inputShape = type.getShape();
++      llvm::SmallVector<int32_t> begins(inputShape.size(), 0);
++      llvm::SmallVector<int32_t> ends(inputShape.begin(), inputShape.end());
++      llvm::SmallVector<int32_t> steps(inputShape.size(), 1);
++      begins[dim] = begin;
++      ends[dim] = end;
++      llvm::SmallVector<int64_t> sliceShape(inputShape);
++      sliceShape[dim] = end - begin;
++      return rewriter.create<ttir::SliceStaticOp>(
++          loc, type.clone(sliceShape), input, rewriter.getI32ArrayAttr(begins),
++          rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
++    };
++
++    auto applyBody = [&](Value lhs, Value rhs) -> Value {
++      auto type = mlir::cast<RankedTensorType>(lhs.getType());
++      IRMapping mapping;
++      mapping.map(block.getArgument(0), lhs);
++      mapping.map(block.getArgument(1), rhs);
++      for (Operation &op : llvm::drop_end(block.getOperations(), 1)) {
++        Type elementType =
++            mlir::cast<RankedTensorType>(op.getResult(0).getType())
++                .getElementType();
++        OperationState state(loc, op.getName());
++        state.addOperands(llvm::map_to_vector(
++            op.getOperands(),
++            [&](Value operand) { return mapping.lookup(operand); }));
++        state.types.push_back(type.clone(elementType));
++        state.addAttributes(op.getAttrs());
++        mapping.map(op.getResult(0),
++                    rewriter.create(state)->getResult(0));
++      }
++      return mapping.lookup(block.getTerminator()->getOperand(0));
++    };
++
++    for (int64_t offset = 1; offset < size; offset *= 2) {
++      llvm::SmallVector<int64_t> fillShape(shape);
++      fillShape[dim] = offset;
++      Value fill;
++      if (failed(ttir::utils::broadcastValue(
++              rewriter, adaptor.getInitValues().front(),
++              inputType.clone(fillShape), fill, loc,
++              /*frontUnsqueeze=*/false))) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "reduce_window init value is not broadcastable");
++      }
++      llvm::SmallVector<Value> pieces;
++      if (match.reverse) {
++        pieces = {slice(value, offset, size), fill};
++      } else {
++        pieces = {fill, slice(value, 0, size - offset)};
++      }
++      Value partner =
++          rewriter.create<ttir::ConcatOp>(loc, inputType, pieces, dim);
++      value = match.reverse ? applyBody(value, partner)
++                            : applyBody(partner, value);
++    }
++
++    rewriter.replaceOp(srcOp, value);
++    return success();
++  }
++
+   template <typename CumulativeOp>
+   void replaceWithCumulativeOp(
+       mlir::stablehlo::ReduceWindowOp srcOp,
