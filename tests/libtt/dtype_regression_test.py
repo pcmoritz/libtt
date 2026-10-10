@@ -30,3 +30,15 @@ def test_bfloat16_layout_roundtrip(shape):
     np.testing.assert_array_equal(
         np.asarray(actual).view(np.uint16), values.view(np.uint16)
     )
+
+
+@pytest.mark.parametrize("source", [np.int32, np.uint32])
+def test_integer_narrowing_to_uint16_wraps(source):
+    values = np.array(
+        [0, 1, -1, -2, -32768, -65535, -65536, -65537, 65535, 65536, 70000,
+         2**31 - 1, -(2**31)],
+        dtype=np.int64,
+    ).astype(source)
+    device_values = jax.device_put(values, jax.devices("tt")[0])
+    actual = jax.jit(lambda x: x.astype(np.uint16))(device_values)
+    np.testing.assert_array_equal(np.asarray(actual), values.astype(np.uint16))
