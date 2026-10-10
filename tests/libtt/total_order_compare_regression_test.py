@@ -95,21 +95,19 @@ def _ttnn_irs(tmp_path):
 
 
 @pytest.mark.parametrize("direction", DIRECTIONS)
-def test_total_order_compare_of_broadcasts(direction, tmp_path):
-    # Keys of a broadcast operand are computed before the broadcast, so the
-    # n x m comparison materializes no repeated key tensors.
+def test_total_order_compare_of_broadcasts(direction):
+    # An n x 1 operand against a 1 x m one.
+    x, y = SPECIAL, SPECIAL[:5]
+    full_shape = (x.size, y.size)
+
     def compare(x, y):
-        shape = (x.shape[0], y.shape[0])
-        lhs = jnp.broadcast_to(x[:, None], shape)
-        rhs = jnp.broadcast_to(y[None, :], shape)
+        lhs = jnp.broadcast_to(x[:, None], full_shape)
+        rhs = jnp.broadcast_to(y[None, :], full_shape)
         return TOTAL_ORDER_COMPARE[direction].bind(lhs, rhs)
 
-    run = jax.jit(compare, compiler_options={"export_path": str(tmp_path)})
-    got = run(device_put(SPECIAL), device_put(SPECIAL))
-    expected = NUMPY_OPS[direction](total_order_keys(X), total_order_keys(Y))
+    got = jax.jit(compare)(device_put(x), device_put(y))
+    expected = NUMPY_OPS[direction](total_order_keys(x)[:, None], total_order_keys(y)[None, :])
     np.testing.assert_array_equal(np.asarray(got), expected)
-    irs = _ttnn_irs(tmp_path)
-    assert irs and not any("ttnn.repeat" in ir for ir in irs)
 
 
 @pytest.mark.parametrize("direction", ["EQ", "NE"])

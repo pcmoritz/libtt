@@ -44,7 +44,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      switch (direction) {
      case mlir::stablehlo::ComparisonDirection::EQ: {
        return matchAndRewriteInternal<mlir::tt::ttir::EqualOp>(srcOp, adaptor,
-@@ -4389,6 +4413,44 @@
+@@ -4389,6 +4413,36 @@
    }
  
  private:
@@ -53,17 +53,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  //   key = bits ^ ((bits >> 31) & 0x7fffffff)
 +  // The bits of a non-negative float already order as an integer; flipping
 +  // all but the sign bit of a negative one reverses the order of negatives.
-+  // Keys of a broadcast are computed before it, on the smaller tensor.
 +  Value toTotalOrderKey(Value value, bool bitsOnly,
 +                        ConversionPatternRewriter &rewriter) const {
 +    Location loc = value.getLoc();
-+    if (auto broadcast =
-+            value.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()) {
-+      Value key = toTotalOrderKey(broadcast.getOperand(), bitsOnly, rewriter);
-+      return rewriter.create<mlir::stablehlo::BroadcastInDimOp>(
-+          loc, broadcast.getType().clone(rewriter.getI32Type()), key,
-+          broadcast.getBroadcastDimensionsAttr());
-+    }
 +    auto type = cast<RankedTensorType>(value.getType());
 +    auto i32Type = type.clone(rewriter.getI32Type());
 +    if (type.getElementType() != rewriter.getF32Type()) {
