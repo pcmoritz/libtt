@@ -70,16 +70,32 @@ public:
     Value w1 = adaptor.getOperands()[3];
     Value w3 = adaptor.getOperands()[4];
     Value w2 = adaptor.getOperands()[5];
+    auto shapeOf = [](Value value) {
+      return cast<RankedTensorType>(value.getType()).getShape();
+    };
     auto xType = cast<RankedTensorType>(x.getType());
     auto idsType = cast<RankedTensorType>(ids.getType());
     auto w1Type = cast<RankedTensorType>(w1.getType());
     auto outType = cast<RankedTensorType>(
         getTypeConverter()->convertType(op.getResult(0).getType()));
     if (xType.getRank() != 2 || idsType.getRank() != 2 ||
-        w1Type.getRank() != 3) {
+        w1Type.getRank() != 3 || shapeOf(weights) != idsType.getShape() ||
+        idsType.getDimSize(0) != xType.getDimSize(0) ||
+        w1Type.getDimSize(1) != xType.getDimSize(1) ||
+        shapeOf(w3) != w1Type.getShape() ||
+        shapeOf(w2) != ArrayRef<int64_t>{w1Type.getDimSize(0),
+                                         w1Type.getDimSize(2),
+                                         w1Type.getDimSize(1)}) {
       return rewriter.notifyMatchFailure(
-          op, "tt.fused_moe_ep expects x [T, H], topk_ids [T, k] and "
-              "w1 [E_local, H, I]");
+          op, "tt.fused_moe_ep expects x [T, H], topk_weights and topk_ids "
+              "[T, k], w1 and w3 [E_local, H, I] and w2 [E_local, I, H]");
+    }
+    // The kernel reads int32 or uint16 ids.
+    if (auto idType = dyn_cast<IntegerType>(idsType.getElementType());
+        !idType || !(idType.getWidth() == 32 ||
+                     (idType.getWidth() == 16 && idType.isUnsigned()))) {
+      return rewriter.notifyMatchFailure(
+          op, "tt.fused_moe_ep takes int32 or uint16 topk_ids");
     }
 
     Location loc = op.getLoc();
@@ -101,7 +117,7 @@ public:
     const int64_t experts = localExperts * devices;
 
     Type bf16 = rewriter.getBF16Type();
-    Type f32 = rewriter.getF32Type();
+    Type placementType = rewriter.getF32Type();
     Type u16 = IntegerType::get(ctx, 16, IntegerType::Unsigned);
     auto typed = [](Value value, ArrayRef<int64_t> shape, Type elementType) {
       return cast<RankedTensorType>(value.getType()).clone(shape, elementType);
@@ -139,10 +155,8 @@ public:
 
     // The kernel's operands: the ids as they are (the kernel reads an int32
     // id's low 16 bits, so that padding's negative ids land past the experts,
-    // where it skips them), activations in BF16, and the experts with a
-    // leading layer dimension. Its local output reads no scores: the weights
-    // only fill the operand.
-    Value kernelX = castTo(x, bf16);
+    // where it skips them) and the experts with a leading layer dimension. Its
+    // local output reads no scores: the weights only fill the operand.
     auto withLayer = [&](Value w) {
       auto shape = cast<RankedTensorType>(w.getType()).getShape();
       return reshape(w, {1, shape[0], shape[1], shape[2]});
@@ -174,24 +188,26 @@ public:
         colIndices[c] = index(c);
       }
       auto vector = [&](ArrayRef<int64_t> shape, ArrayRef<float> values) {
-        auto type = RankedTensorType::get(shape, f32);
+        auto type = RankedTensorType::get(shape, placementType);
         return rewriter.create<ttir::ConstantOp>(
             loc, type, DenseElementsAttr::get(type, values));
       };
       return rewriter.create<ttir::EqualOp>(
-          loc, RankedTensorType::get({m, n}, f32), vector({m, 1}, rowIndices),
+          loc, RankedTensorType::get({m, n}, placementType),
+          vector({m, 1}, rowIndices),
           vector({1, n}, colIndices));
     };
     SmallVector<Value> outputs;
     for (int64_t begin = 0; begin < tokens; begin += kMaxTokensPerCall) {
       const int64_t end = std::min(tokens, begin + kMaxTokensPerCall);
       const int64_t t = end - begin;
+      Value chunkWeights = rows(weights, begin, end);
       // Row j * t + i holds token i's j-th expert output, unweighted.
       Value slots = rewriter.create<ttir::MoeComputeOp>(
-          loc, typed(kernelX, {k * t, hidden}, bf16),
-          reshape(rows(kernelX, begin, end), {1, t, hidden}),
-          rows(ids, begin, end), rows(weights, begin, end), mapping, kernelW1,
-          kernelW3, kernelW2, /*bias_0=*/Value(), /*bias_1=*/Value(),
+          loc, typed(x, {k * t, hidden}, bf16),
+          reshape(rows(x, begin, end), {1, t, hidden}), rows(ids, begin, end),
+          chunkWeights, mapping, kernelW1, kernelW3, kernelW2,
+          /*bias_0=*/Value(), /*bias_1=*/Value(),
           /*bias_2=*/Value(), rewriter.getUI32IntegerAttr(0),
           rewriter.getUI32IntegerAttr(4),
           rewriter.getUI32IntegerAttr(intermediate), activation,
@@ -201,17 +217,15 @@ public:
       // of the placement matrix holds token i's weight j at column j * t + i,
       // its weights spread over t columns each and masked to its own column.
       // One token's slots are rows 0 to k - 1: its weights as they are.
-      Value chunkWeights = castTo(rows(weights, begin, end), f32);
-      Value placement = chunkWeights;
+      Value placement = castTo(chunkWeights, placementType);
       if (t > 1) {
         // Column j * t + i is slot j of token i.
         Value spread = mask(k, k * t, [t](int64_t c) { return c / t; });
         Value own = mask(t, k * t, [t](int64_t c) { return c % t; });
-        auto placementType = typed(chunkWeights, {t, k * t}, f32);
+        auto type = typed(chunkWeights, {t, k * t}, placementType);
         placement = rewriter.create<ttir::MultiplyOp>(
-            loc, placementType,
-            rewriter.create<ttir::MatmulOp>(loc, placementType, chunkWeights,
-                                            spread),
+            loc, type,
+            rewriter.create<ttir::MatmulOp>(loc, type, placement, spread),
             own);
       }
       // The matmul accumulates in FP32 and writes the output's type.
