@@ -16,9 +16,11 @@
 #include <string>
 #include <vector>
 
+#include <tt-metalium/host_buffer.hpp>
 #include <tt-metalium/mesh_device.hpp>
 
 #include "ttnn/operations/experimental/matmul_fp32/matmul_fp32.hpp"
+#include "ttnn/tensor/host_buffer/functions.hpp"
 #include "ttnn/tensor/tensor.hpp"
 
 namespace tt::tt_metal::distributed::test {
@@ -139,7 +141,15 @@ INSTANTIATE_TEST_SUITE_P(
         Case{{2, 3, 64, 32}, {32, 96}},
         Case{{2, 64, 64}, {2, 64, 32}},
         // Not tile aligned.
-        Case{{30, 50}, {50, 20}}),
+        Case{{30, 50}, {50, 20}},
+        // 520 output tiles: several runs per core, crossing output rows (13 tiles wide).
+        Case{{1280, 64}, {64, 416}},
+        // The A row kept in L1 for a run of two tiles: double buffered up to
+        // Kt = 128, single buffered up to Kt = 256, streamed one tile per k beyond.
+        Case{{32, 4096}, {4096, 64}},
+        Case{{32, 4128}, {4128, 64}},
+        Case{{32, 8192}, {8192, 64}},
+        Case{{32, 8224}, {8224, 64}}),
     [](const ::testing::TestParamInfo<Case>& info) {
         auto dims = [](const std::vector<uint32_t>& shape) {
             std::string s;
@@ -181,6 +191,48 @@ TEST_F(MatmulFp32Test, InfinitiesAndNaNsStayInTheirRowsAndColumns) {
                     << i << ", " << j;
             }
         }
+    }
+}
+
+// A K that is not a multiple of 32 pads the last k tile of both inputs. The
+// padding of a tensor that an earlier operation produced can hold anything,
+// including infinities and NaNs, and none of it may reach the outputs.
+TEST_F(MatmulFp32Test, PaddingOfTheContractionDimensionIsIgnored) {
+    constexpr uint32_t M = 40, K = 50, N = 70;
+    std::mt19937 rng(7);
+    const std::vector<float> a = random_values(M * K, rng);
+    const std::vector<float> b = random_values(K * N, rng);
+
+    // The tensor with `poison` in its padding: the padding of the tiled host
+    // data is where a tensor of ones has zeros.
+    auto poisoned = [&](const std::vector<float>& values, const std::vector<uint32_t>& shape, float poison) {
+        const TensorSpec spec(
+            ttnn::Shape(shape), TensorLayout(DataType::FLOAT32, PageConfig(Layout::TILE), MemoryConfig{}));
+        ttnn::Tensor host = ttnn::Tensor::from_vector(values, spec);
+        ttnn::Tensor ones = ttnn::Tensor::from_vector(std::vector<float>(values.size(), 1.0f), spec);
+        const auto data = host_buffer::get_as<float>(host);
+        const auto mask = host_buffer::get_as<float>(ones);
+        std::vector<float> physical(data.begin(), data.end());
+        size_t padding = 0;
+        for (size_t i = 0; i < physical.size(); ++i) {
+            if (mask[i] == 0.0f) {
+                physical[i] = poison;
+                ++padding;
+            }
+        }
+        EXPECT_GT(padding, 0u);
+        return ttnn::Tensor(HostBuffer(std::move(physical)), host.tensor_spec()).to_device(mesh_device_.get());
+    };
+
+    const ttnn::Tensor c_device = ttnn::experimental::matmul_fp32(
+        poisoned(a, {M, K}, std::numeric_limits<float>::infinity()),
+        poisoned(b, {K, N}, std::numeric_limits<float>::quiet_NaN()));
+    const std::vector<float> c = c_device.cpu().to_vector<float>();
+    const Reference ref = reference_matmul(a, {M, K}, b, {K, N});
+    ASSERT_EQ(c.size(), ref.value.size());
+    for (size_t i = 0; i < c.size(); ++i) {
+        ASSERT_TRUE(std::isfinite(c[i])) << "element " << i << ": " << c[i];
+        ASSERT_LE(std::abs(c[i] - ref.value[i]), K * std::ldexp(1.0, -24) * ref.abs_sum[i]) << "element " << i;
     }
 }
 

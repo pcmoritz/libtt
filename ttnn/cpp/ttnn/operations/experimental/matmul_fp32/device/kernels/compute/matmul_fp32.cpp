@@ -36,6 +36,7 @@ void kernel_main() {
     compute_kernel_hw_startup(dfb::in0, dfb::out);
     copy_init(dfb::in0);  // in1 has the same format, and the transposes leave the copy state alone
     matmul_fp32_tile_init();
+    matmul_fp32_transpose_a_init();
     const uint32_t end = first_tile + num_tiles;
     for (uint32_t tile = first_tile; tile < end;) {
         const uint32_t cols = matmul_fp32_run_cols(tile, end, Nt, run_width);

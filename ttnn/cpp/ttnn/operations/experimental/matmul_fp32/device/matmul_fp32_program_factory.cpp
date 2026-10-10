@@ -96,7 +96,7 @@ ttnn::device_operation::ProgramArtifacts MatmulFp32ProgramFactory::create_progra
                 TensorBinding{.tensor_parameter_name = IN0, .accessor_name = "in0"},
                 TensorBinding{.tensor_parameter_name = IN1, .accessor_name = "in1"},
             },
-        .compile_time_args = {{"a_last_ktile_w", static_cast<uint32_t>(a.logical_shape()[-1] % TILE_WIDTH)}},
+        .compile_time_args = {{"last_ktile_k", static_cast<uint32_t>(a.logical_shape()[-1] % TILE_WIDTH)}},
         .runtime_arg_schema =
             {.runtime_arg_names = {"first_tile", "num_tiles"}, .common_runtime_arg_names = common_arg_names},
         .hw_config = ttnn::create_reader_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),

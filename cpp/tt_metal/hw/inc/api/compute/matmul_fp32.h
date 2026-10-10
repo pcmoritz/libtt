@@ -21,6 +21,7 @@ namespace ckernel {
 // true, with the inputs unpacked to DST as FP32). For C = sum_k A_k * B_k:
 //
 //     matmul_fp32_tile_init();                       // once
+//     matmul_fp32_transpose_a_init();                // once
 //     for each k:
 //         copy A_k to a and B_k to b;
 //         matmul_fp32_transpose_a(a);
@@ -33,13 +34,22 @@ namespace ckernel {
 
 // clang-format off
 /**
+ * Initializes the in-DST transpose for matmul_fp32_transpose_a. Its state
+ * (address modifiers 0-3, replay slots 16-31) is separate from the matmul's.
+ *
+ * Return value: None
+ */
+// clang-format on
+ALWI void matmul_fp32_transpose_a_init() { transpose_dest_init</*is_32bit=*/true, /*transpose_of_faces=*/true>(); }
+
+// clang-format off
+/**
  * Transposes the A tile at idst_a in DST, exactly, as matmul_fp32_tile expects.
  *
  * Return value: None
  */
 // clang-format on
 ALWI void matmul_fp32_transpose_a(uint32_t idst_a) {
-    transpose_dest_init</*is_32bit=*/true, /*transpose_of_faces=*/true>();
     transpose_dest</*is_32bit=*/true, /*transpose_of_faces=*/true>(idst_a);
 }
 

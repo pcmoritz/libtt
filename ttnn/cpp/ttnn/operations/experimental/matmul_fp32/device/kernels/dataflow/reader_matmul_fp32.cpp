@@ -25,8 +25,10 @@ void kernel_main() {
     const uint32_t a_resident = get_arg(args::a_resident);
     const uint32_t first_tile = get_arg(args::first_tile);
     const uint32_t num_tiles = get_arg(args::num_tiles);
-    // Columns of the last k tile that lie past K, zeroed in A so that B's padding rows do not contribute.
-    constexpr uint32_t a_last_ktile_w = get_arg(args::a_last_ktile_w);
+    // Columns of A's and rows of B's last k tile that lie past K. Both are
+    // zeroed, since either could hold an infinity or NaN left by an earlier
+    // operation, and 0 * inf is NaN.
+    constexpr uint32_t last_ktile_k = get_arg(args::last_ktile_k);
 
     DataflowBuffer in0_dfb(dfb::in0);
     DataflowBuffer in1_dfb(dfb::in1);
@@ -47,9 +49,8 @@ void kernel_main() {
             noc.async_read(a, in0_dfb, in0_tile_bytes, {.page_id = a_row + k}, {.offset_bytes = offset_bytes});
         };
         auto pad_a = [&](uint32_t write_addr) {
-            if constexpr (a_last_ktile_w > 0) {
-                constexpr DataFormat in0_data_format = get_dataformat(dfb::in0);
-                pad_last_ktile<in0_data_format, a_last_ktile_w>(write_addr);
+            if constexpr (last_ktile_k > 0) {
+                pad_last_ktile<get_dataformat(dfb::in0), last_ktile_k>(write_addr);
             }
         };
         if (a_resident) {
@@ -71,10 +72,15 @@ void kernel_main() {
                 in1_dfb.reserve_back(1);
                 noc.async_read(b, in1_dfb, in1_tile_bytes, {.page_id = b_base + k * Nt + j}, {.offset_bytes = 0});
                 noc.async_read_barrier();
-                if (!a_resident) {
-                    if (k == Kt - 1) {
+                if (k == Kt - 1) {
+                    if constexpr (last_ktile_k > 0) {
+                        pad_last_transposed_ktile<get_dataformat(dfb::in1), last_ktile_k>(in1_dfb.get_write_ptr());
+                    }
+                    if (!a_resident) {
                         pad_a(in0_dfb.get_write_ptr());
                     }
+                }
+                if (!a_resident) {
                     in0_dfb.push_back(1);
                 }
                 in1_dfb.push_back(1);

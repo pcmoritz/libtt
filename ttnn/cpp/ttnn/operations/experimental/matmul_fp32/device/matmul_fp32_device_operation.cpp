@@ -3,12 +3,16 @@
 
 #include "ttnn/operations/experimental/matmul_fp32/device/matmul_fp32_device_operation.hpp"
 
+#include <array>
+
 #include <tt-metalium/constants.hpp>
 
 #include "ttnn/device_operation.hpp"
 
 namespace ttnn::experimental::prim {
 
+using tt::constants::TILE_HEIGHT;
+using tt::constants::TILE_WIDTH;
 using tt::tt_metal::DataType;
 using tt::tt_metal::Layout;
 
@@ -25,6 +29,10 @@ void MatmulFp32Operation::validate_on_program_cache_miss(const operation_attribu
             name);
         TT_FATAL(tensor->dtype() == DataType::FLOAT32, "matmul_fp32: {} must be FLOAT32, got {}", name, tensor->dtype());
         TT_FATAL(tensor->layout() == Layout::TILE, "matmul_fp32: {} must be in TILE layout", name);
+        const auto tile = tensor->tensor_spec().tile();
+        const bool ordinary_tile = tile.get_tile_shape() == std::array<uint32_t, 2>{TILE_HEIGHT, TILE_WIDTH} &&
+                                   !tile.get_transpose_of_faces() && !tile.get_transpose_within_face();
+        TT_FATAL(ordinary_tile, "matmul_fp32: {} must use ordinary {}x{} tiles", name, TILE_HEIGHT, TILE_WIDTH);
         TT_FATAL(
             tensor->memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED,
             "matmul_fp32: {} must be interleaved",
