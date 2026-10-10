@@ -557,6 +557,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_topk_softmax_renormalize.patch",
         "//third_party/tt_xla:tt_mlir_matmul_bf16_operand_cast.patch",
         "//third_party/tt_xla:tt_mlir_clamp_scalar_narrow_int.patch",
+        "//third_party/tt_xla:tt_mlir_sort_narrow_int_keys.patch",
         "//third_party/tt_xla:tt_mlir_fp32_exact_matmul.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",

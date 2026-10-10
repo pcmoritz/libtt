@@ -1,4 +1,5 @@
-"""32-bit integer keys must sort exactly, including values float32 cannot hold."""
+"""Integer keys must sort exactly: 32-bit ones, including values float32 cannot
+hold, and signed 8- and 16-bit ones, which are int32 tensors on device."""
 
 import jax
 from jax import lax
@@ -17,7 +18,7 @@ def _keys(dtype, shape):
     return keys
 
 
-@pytest.mark.parametrize("dtype", [jnp.int32, jnp.uint32])
+@pytest.mark.parametrize("dtype", [jnp.int32, jnp.uint32, jnp.int8, jnp.int16])
 @pytest.mark.parametrize(
     "shape,dimension",
     [
@@ -40,7 +41,7 @@ def test_sort_int32_keys_with_values(dtype, shape, dimension):
     )
 
 
-@pytest.mark.parametrize("dtype", [jnp.int32, jnp.uint32])
+@pytest.mark.parametrize("dtype", [jnp.int32, jnp.uint32, jnp.int8, jnp.int16])
 @pytest.mark.parametrize("descending", [False, True])
 def test_sort_and_argsort_int32_keys(dtype, descending):
     keys = _keys(dtype, (2, 300))
