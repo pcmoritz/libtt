@@ -1,0 +1,23 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+--- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+@@ -6,6 +6,8 @@
+ #define TT_RUNTIME_DETAIL_TTNN_TYPES_TRACE_CACHE_H
+ 
+ #include <cstdint>
++#include <set>
++#include <utility>
+ #include <vector>
+ 
+ #include "tt/runtime/detail/common/logger.h"
+@@ -72,6 +74,10 @@
+   /// traces.
+   void erase(const MainProgramKey &key);
+ 
++  /// While-loop bodies, by binary id and program id, whose trace capture
++  /// failed once. They run op by op from then on.
++  std::set<std::pair<std::uint64_t, std::uint32_t>> untraceableLoopBodies;
++
+ private:
+   using EntryKey = std::pair<MainProgramKey, CaptureExecuteProgramKey>;
+   static constexpr size_t kMaxEntries = 16;
