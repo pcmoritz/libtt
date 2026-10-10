@@ -1,9 +1,7 @@
 """lax.cummax and lax.cummin run on ttnn's accumulation kernel, like cumsum and
 cumprod. They used to lower to a bf16 max pool, which rounded float32 results.
 
-NaN: like ttnn's elementwise max and min, the kernel compares sign-magnitude
-bits, so +NaN is the largest value and -NaN the smallest. cummax propagates +NaN
-and cummin -NaN, as JAX does; the other two cases are expected failures.
+NaN propagates through both, from NaNs of either sign, as in JAX.
 """
 
 import jax
@@ -73,23 +71,18 @@ def test_cumulative_extremum_runs_on_accumulation(tmp_path):
     assert not any("max_pool2d" in ir or '"ttnn.reverse"' in ir for ir in irs)
 
 
-_NAN_MISMATCH = pytest.mark.xfail(
-    strict=True, reason="sign-magnitude max/min: +NaN is skipped by min and -NaN by max"
-)
-
-
-@pytest.mark.parametrize(
-    "op,sign",
-    [
-        ("cummax", 1),
-        ("cummin", -1),
-        pytest.param("cummin", 1, marks=_NAN_MISMATCH),
-        pytest.param("cummax", -1, marks=_NAN_MISMATCH),
-    ],
-)
-def test_cumulative_extremum_propagates_nan(op, sign):
+@pytest.mark.parametrize("op", sorted(OPS))
+@pytest.mark.parametrize("sign", [1, -1], ids=["pos_nan", "neg_nan"])
+# bfloat16 is not covered: on device, computing on a bfloat16 NaN turns it into
+# inf before any op sees it (even x * 1), a separate issue.
+@pytest.mark.parametrize("dtype", [jnp.float32], ids=["f32"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_cumulative_extremum_propagates_nan(op, sign, dtype, reverse):
     lax_op, _ = OPS[op]
     nan = np.copysign(np.float32(np.nan), np.float32(sign))
-    x = np.array([[1.0, nan, 2.0, -5.0, 0.5]], np.float32)
-    got = np.asarray(jax.jit(lambda x: lax_op(x, axis=1))(device_put(x)))
-    np.testing.assert_array_equal(np.isnan(got), [[False, True, True, True, True]])
+    x = np.array([[1.0, -np.inf, nan, 2.0, np.inf, -5.0, 0.5]], np.float32)
+    if reverse:
+        x = x[:, ::-1].copy()
+    got = np.asarray(jax.jit(lambda x: lax_op(x, axis=1, reverse=reverse))(device_put(x.astype(dtype))))
+    expected = [[False, False, True, True, True, True, True]]
+    np.testing.assert_array_equal(np.isnan(got.astype(np.float32)), expected if not reverse else [expected[0][::-1]])
