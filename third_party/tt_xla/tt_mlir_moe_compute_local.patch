@@ -267,7 +267,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
  
  namespace tt::runtime::ttnn::operations::ccl {
  
-@@ -27,9 +31,137 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
+@@ -27,9 +31,134 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
    return ::ttnn::experimental::prim::detail::MoEActivationFunction::SILU;
  }
  
@@ -379,13 +379,10 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
 +
 +  LOG_ASSERT(results.size() == 6, "moe_compute returned ", results.size(),
 +             " tensors; expected 6");
-+  ::ttnn::Tensor combined =
++  tensorPool.insertTTNNTensorAndValidate(
++      op->combine_output(),
 +      ::ttnn::reshape(results[5], operations::utils::toTTNNShape(
-+                                      *op->combine_output()->desc()->shape()));
-+  // The result is tiled.
-+  ::ttnn::Tensor tiled = ::ttnn::to_layout(combined, ::ttnn::Layout::TILE);
-+  ::ttnn::deallocate(combined);
-+  tensorPool.insertTTNNTensorAndValidate(op->combine_output(), tiled);
++                                      *op->combine_output()->desc()->shape())));
 +  for (size_t i = 0; i < 5; ++i) {
 +    ::ttnn::deallocate(results[i]);
 +  }
@@ -445,20 +442,3 @@ diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/TTNNDeduceMoEComputeLay
        reshardTilizeInputToDrainCore(op, /*operandIdx=*/1, drainCoreRangeSet);
        reshardTilizeInputToDrainCore(op, /*operandIdx=*/2, drainCoreRangeSet);
      });
-diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
---- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-+++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -1941,9 +1941,11 @@ TTNNOperandsWorkaroundsFactory::createMoeComputeOpOperandsWorkarounds(
-   rmU16.tensorLayoutWorkaround = Layout::RowMajor;
-   rmU16.tensorDataTypeWorkaround = ttcore::DataType::UInt16;
- 
--  // combine output: ROW_MAJOR, DRAM INTERLEAVED, bfloat16.
-+  // combine output: ROW_MAJOR, DRAM INTERLEAVED, bfloat16. Without a cluster
-+  // axis the runtime tilizes the kernel's local output itself.
-   TTNNOperandWorkarounds combineOutput;
--  combineOutput.tensorLayoutWorkaround = Layout::RowMajor;
-+  combineOutput.tensorLayoutWorkaround =
-+      op.getClusterAxis() ? Layout::RowMajor : Layout::Tile;
-   combineOutput.tensorBufferTypeWorkaround = BufferType::DRAM;
-   combineOutput.tensorMemoryLayoutWorkaround = TensorMemoryLayoutAttr::get(
-       op.getContext(), TensorMemoryLayout::Interleaved);
