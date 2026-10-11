@@ -1,0 +1,387 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -3163,6 +3163,33 @@
+     }];
+ }
+ 
++def TTIR_ReduceBitwiseAndOp : TTIR_ReductionOp<"reduce_bitwise_and"> {
++  let summary = "Bitwise AND reduction operation.";
++  let description = [{
++    The `reduce_bitwise_and` operation computes the bitwise AND of the integer elements
++    along the dimensions in `dim_arg` (all dimensions when absent). If `keep_dim` is set to true,
++    the reduced dimensions are retained with a size of 1.
++  }];
++}
++
++def TTIR_ReduceBitwiseOrOp : TTIR_ReductionOp<"reduce_bitwise_or"> {
++  let summary = "Bitwise OR reduction operation.";
++  let description = [{
++    The `reduce_bitwise_or` operation computes the bitwise OR of the integer elements
++    along the dimensions in `dim_arg` (all dimensions when absent). If `keep_dim` is set to true,
++    the reduced dimensions are retained with a size of 1.
++  }];
++}
++
++def TTIR_ReduceBitwiseXorOp : TTIR_ReductionOp<"reduce_bitwise_xor"> {
++  let summary = "Bitwise XOR reduction operation.";
++  let description = [{
++    The `reduce_bitwise_xor` operation computes the bitwise XOR of the integer elements
++    along the dimensions in `dim_arg` (all dimensions when absent). If `keep_dim` is set to true,
++    the reduced dimensions are retained with a size of 1.
++  }];
++}
++
+ def TTIR_ProdOp : TTIR_ReductionOp<"prod"> {
+   let summary = "Product reduction op.";
+   let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1076,6 +1076,27 @@
+   }];
+ }
+ 
++def TTNN_ReduceBitwiseAndOp : TTNN_ReductionOp<"reduce_bitwise_and", [TTNN_ComputeKernelConfigOpInterface, OpModelExempt]> {
++  let summary = "Bitwise AND reduction op.";
++  let description = [{
++    Bitwise AND reduction of a 32-bit integer tensor.
++  }];
++}
++
++def TTNN_ReduceBitwiseOrOp : TTNN_ReductionOp<"reduce_bitwise_or", [TTNN_ComputeKernelConfigOpInterface, OpModelExempt]> {
++  let summary = "Bitwise OR reduction op.";
++  let description = [{
++    Bitwise OR reduction of a 32-bit integer tensor.
++  }];
++}
++
++def TTNN_ReduceBitwiseXorOp : TTNN_ReductionOp<"reduce_bitwise_xor", [TTNN_ComputeKernelConfigOpInterface, OpModelExempt]> {
++  let summary = "Bitwise XOR reduction op.";
++  let description = [{
++    Bitwise XOR reduction of a 32-bit integer tensor.
++  }];
++}
++
+ def TTNN_ArgMaxOp : TTNN_Op<"argmax"> {
+   let summary = "Argmax reduction op.";
+   let description = [{
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -281,6 +281,9 @@
+ } // namespace
+ 
+ namespace {
++static Value castToElementType(ConversionPatternRewriter &rewriter,
++                               Location loc, Value value, Type elementType);
++
+ class StableHLOToTTIRReduceOpConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::ReduceOp> {
+ 
+@@ -326,6 +329,11 @@
+       return matchAndRewriteInternal<mlir::tt::ttir::ProdOp>(srcOp, adaptor,
+                                                              rewriter);
+     }
++    if (mlir::isa<mlir::stablehlo::AndOp, mlir::stablehlo::OrOp,
++                  mlir::stablehlo::XorOp>(innerOp) &&
++        (!isBoolean(srcOp) || mlir::isa<mlir::stablehlo::XorOp>(innerOp))) {
++      return matchAndRewriteBitwise(srcOp, adaptor, innerOp, rewriter);
++    }
+     if (mlir::isa<mlir::stablehlo::AndOp>(innerOp)) {
+       return matchAndRewriteInternal<mlir::tt::ttir::ReduceAndOp>(
+           srcOp, adaptor, rewriter);
+@@ -354,27 +362,81 @@
+           "Expecting StableHLO Reduce OP to have a body operation defined.");
+     }
+ 
+-    mlir::Operation &innerOp = srcOp.getBody().front().front();
+-    if (mlir::isa<mlir::stablehlo::AndOp>(innerOp) ||
+-        mlir::isa<mlir::stablehlo::OrOp>(innerOp)) {
+-      bool allOperandsAreBoolean = std::all_of(
+-          srcOp->operand_begin(), srcOp->operand_end(), [](auto operand) {
+-            return mlir::cast<RankedTensorType>(operand.getType())
+-                       .getElementTypeBitWidth() == 1;
+-          });
+-      // Stablehlo (unlike other dialects) has single op for both logical and
+-      // bitwise operation. Data type is used to distinguish between logical and
+-      // bitwise operation. If the datatype is boolean then it is a logical
+-      // operation; otherwise it is bitwise operation. This check ensure that
+-      // the inputs are boolean as tt-metal only supports logical operations.
+-      if (!allOperandsAreBoolean) {
+-        return rewriter.notifyMatchFailure(
+-            srcOp,
+-            "stablehlo.reduce for stablehlo.and/stablehlo.or operator is only "
+-            "supported for logical operator.");
+-      }
+-    }
++    return success();
++  }
++
++  // StableHLO has one op for logical and bitwise and/or/xor: on booleans they
++  // are logical.
++  static bool isBoolean(mlir::stablehlo::ReduceOp srcOp) {
++    return llvm::all_of(srcOp->getOperands(), [](Value operand) {
++      return mlir::cast<RankedTensorType>(operand.getType())
++                 .getElementTypeBitWidth() == 1;
++    });
++  }
++
++  // Bitwise and/or/xor of integers, or xor of booleans, reduced in 32-bit
++  // integers: booleans and unsigned integers as ui32, others as si32 (exact,
++  // as bitwise ops commute with zero and sign extension). The result is then
++  // combined with the init value.
++  LogicalResult
++  matchAndRewriteBitwise(mlir::stablehlo::ReduceOp &srcOp,
++                         mlir::stablehlo::ReduceOp::Adaptor &adaptor,
++                         const mlir::Operation &innerOp,
++                         ConversionPatternRewriter &rewriter) const {
++    Location loc = srcOp.getLoc();
++    auto outputType = mlir::cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getResultTypes().front()));
++    auto intType = mlir::dyn_cast<IntegerType>(outputType.getElementType());
++    if (!intType) {
++      return rewriter.notifyMatchFailure(srcOp, "expected an integer reduce");
++    }
++    bool isLogical = isBoolean(srcOp);
++    Type reduceElementType = intType;
++    if (intType.getWidth() != 32) {
++      reduceElementType =
++          isLogical || intType.isUnsigned()
++              ? rewriter.getIntegerType(32, /*isSigned=*/false)
++              : rewriter.getIntegerType(32, /*isSigned=*/true);
++    }
++    auto reduceType = outputType.clone(reduceElementType);
++    Value input = castToElementType(rewriter, loc, adaptor.getInputs().front(),
++                                    reduceElementType);
++    mlir::ArrayAttr dimArg = rewriter.getI32ArrayAttr(
++        llvm::SmallVector<int32_t>(srcOp.getDimensions()));
+ 
++    Value result;
++    if (mlir::isa<mlir::stablehlo::AndOp>(innerOp)) {
++      result = rewriter.create<ttir::ReduceBitwiseAndOp>(
++          loc, reduceType, input, /*keep_dim=*/false, dimArg);
++    } else if (mlir::isa<mlir::stablehlo::OrOp>(innerOp)) {
++      result = rewriter.create<ttir::ReduceBitwiseOrOp>(
++          loc, reduceType, input, /*keep_dim=*/false, dimArg);
++    } else {
++      result = rewriter.create<ttir::ReduceBitwiseXorOp>(
++          loc, reduceType, input, /*keep_dim=*/false, dimArg);
++    }
++    result = castToElementType(rewriter, loc, result, intType);
++
++    Value init;
++    if (failed(ttir::utils::broadcastValue(
++            rewriter, adaptor.getInitValues().front(), outputType, init, loc,
++            /*frontUnsqueeze=*/false))) {
++      return rewriter.notifyMatchFailure(srcOp,
++                                         "init value is not broadcastable");
++    }
++    if (mlir::isa<mlir::stablehlo::AndOp>(innerOp)) {
++      rewriter.replaceOpWithNewOp<ttir::BitwiseAndOp>(srcOp, outputType,
++                                                      result, init);
++    } else if (mlir::isa<mlir::stablehlo::OrOp>(innerOp)) {
++      rewriter.replaceOpWithNewOp<ttir::BitwiseOrOp>(srcOp, outputType, result,
++                                                     init);
++    } else if (isLogical) {
++      rewriter.replaceOpWithNewOp<ttir::LogicalXorOp>(srcOp, outputType,
++                                                      result, init);
++    } else {
++      rewriter.replaceOpWithNewOp<ttir::BitwiseXorOp>(srcOp, outputType,
++                                                      result, init);
++    }
+     return success();
+   }
+ 
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -4068,6 +4068,12 @@
+            ReductionOpConversionPattern<ttir::MeanOp, ttnn::MeanOp>,
+            ReductionOpConversionPattern<ttir::MaxOp, ttnn::MaxOp>,
+            ReductionOpConversionPattern<ttir::MinOp, ttnn::MinOp>,
++           ReductionOpConversionPattern<ttir::ReduceBitwiseAndOp,
++                                        ttnn::ReduceBitwiseAndOp>,
++           ReductionOpConversionPattern<ttir::ReduceBitwiseOrOp,
++                                        ttnn::ReduceBitwiseOrOp>,
++           ReductionOpConversionPattern<ttir::ReduceBitwiseXorOp,
++                                        ttnn::ReduceBitwiseXorOp>,
+            ReductionProdOpConversionPattern,
+            ReductionArgMaxOpConversionPattern,
+            ElementwiseUnaryWithFloatParameterOpConversionPattern<ttir::LeakyReluOp, ttnn::LeakyReluOp>,
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -6913,6 +6913,36 @@
+ }
+ 
+ //===----------------------------------------------------------------------===//
++// ReduceBitwiseAndOp
++//===----------------------------------------------------------------------===//
++
++// ReduceBitwiseAndOp verification.
++::mlir::LogicalResult mlir::tt::ttir::ReduceBitwiseAndOp::verify() {
++  return verifyReduceOp([&]() { return emitOpError(); }, getInput().getType(),
++                        getDimArg(), getKeepDim(), getType().getShape());
++}
++
++//===----------------------------------------------------------------------===//
++// ReduceBitwiseOrOp
++//===----------------------------------------------------------------------===//
++
++// ReduceBitwiseOrOp verification.
++::mlir::LogicalResult mlir::tt::ttir::ReduceBitwiseOrOp::verify() {
++  return verifyReduceOp([&]() { return emitOpError(); }, getInput().getType(),
++                        getDimArg(), getKeepDim(), getType().getShape());
++}
++
++//===----------------------------------------------------------------------===//
++// ReduceBitwiseXorOp
++//===----------------------------------------------------------------------===//
++
++// ReduceBitwiseXorOp verification.
++::mlir::LogicalResult mlir::tt::ttir::ReduceBitwiseXorOp::verify() {
++  return verifyReduceOp([&]() { return emitOpError(); }, getInput().getType(),
++                        getDimArg(), getKeepDim(), getType().getShape());
++}
++
++//===----------------------------------------------------------------------===//
+ // Reduce ArgMaxOp
+ //===----------------------------------------------------------------------===//
+ 
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -6088,6 +6088,39 @@
+ }
+ 
+ //===----------------------------------------------------------------------===//
++// ReduceBitwiseAndOp
++//===----------------------------------------------------------------------===//
++
++// ReduceBitwiseAndOp verification.
++::mlir::LogicalResult ReduceBitwiseAndOp::verify() {
++  return verifyReduceOp([&]() { return emitOpError(); }, getInput().getType(),
++                        getDimArg(), getKeepDim(),
++                        getResult().getType().getShape());
++}
++
++//===----------------------------------------------------------------------===//
++// ReduceBitwiseOrOp
++//===----------------------------------------------------------------------===//
++
++// ReduceBitwiseOrOp verification.
++::mlir::LogicalResult ReduceBitwiseOrOp::verify() {
++  return verifyReduceOp([&]() { return emitOpError(); }, getInput().getType(),
++                        getDimArg(), getKeepDim(),
++                        getResult().getType().getShape());
++}
++
++//===----------------------------------------------------------------------===//
++// ReduceBitwiseXorOp
++//===----------------------------------------------------------------------===//
++
++// ReduceBitwiseXorOp verification.
++::mlir::LogicalResult ReduceBitwiseXorOp::verify() {
++  return verifyReduceOp([&]() { return emitOpError(); }, getInput().getType(),
++                        getDimArg(), getKeepDim(),
++                        getResult().getType().getShape());
++}
++
++//===----------------------------------------------------------------------===//
+ // Reduce ProdOp
+ //===----------------------------------------------------------------------===//
+ 
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -3062,6 +3062,12 @@
+     type = ::tt::target::ttnn::ReductionOpType::Max;
+   } else if constexpr (std::is_same_v<ReductionOp, MinOp>) {
+     type = ::tt::target::ttnn::ReductionOpType::Min;
++  } else if constexpr (std::is_same_v<ReductionOp, ReduceBitwiseAndOp>) {
++    type = ::tt::target::ttnn::ReductionOpType::BitwiseAnd;
++  } else if constexpr (std::is_same_v<ReductionOp, ReduceBitwiseOrOp>) {
++    type = ::tt::target::ttnn::ReductionOpType::BitwiseOr;
++  } else if constexpr (std::is_same_v<ReductionOp, ReduceBitwiseXorOp>) {
++    type = ::tt::target::ttnn::ReductionOpType::BitwiseXor;
+   } else {
+     llvm_unreachable("unhandled ReductionOp");
+   }
+@@ -5315,6 +5321,18 @@
+     return createOperation(cache, createReductionOp(cache, minOp), debugString,
+                            locInfo);
+   }
++  if (auto andOp = dyn_cast<ReduceBitwiseAndOp>(op); andOp) {
++    return createOperation(cache, createReductionOp(cache, andOp), debugString,
++                           locInfo);
++  }
++  if (auto orOp = dyn_cast<ReduceBitwiseOrOp>(op); orOp) {
++    return createOperation(cache, createReductionOp(cache, orOp), debugString,
++                           locInfo);
++  }
++  if (auto xorOp = dyn_cast<ReduceBitwiseXorOp>(op); xorOp) {
++    return createOperation(cache, createReductionOp(cache, xorOp), debugString,
++                           locInfo);
++  }
+   if (auto argMaxOp = dyn_cast<ArgMaxOp>(op); argMaxOp) {
+     return createOperation(cache, createReductionArgMaxOp(cache, argMaxOp),
+                            debugString, locInfo);
+diff --git a/include/ttmlir/Target/TTNN/operations/reduction.fbs b/include/ttmlir/Target/TTNN/operations/reduction.fbs
+--- a/include/ttmlir/Target/TTNN/operations/reduction.fbs
++++ b/include/ttmlir/Target/TTNN/operations/reduction.fbs
+@@ -8,6 +8,9 @@
+   Mean,
+   Max,
+   Min,
++  BitwiseAnd,
++  BitwiseOr,
++  BitwiseXor,
+ }
+ 
+ table ReductionOp {
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -1061,11 +1061,14 @@
+       mlir::cast<mlir::RankedTensorType>(op->getOperand(0).getType())
+           .getElementType();
+   // Keep supported integer reductions exact: Float32 rounds values above
+-  // 2^24 and cannot represent the INT32_MAX identity used by min.
++  // 2^24 and cannot represent the INT32_MAX identity used by min. Bitwise
++  // reductions take signed and unsigned 32-bit integers.
+   bool supportsInt32 =
+       inputType.isInteger(32) &&
+       (mlir::isa<ttnn::MinOp>(op) ||
+-       (mlir::isa<ttnn::SumOp>(op) && !inputType.isUnsignedInteger()));
++       (mlir::isa<ttnn::SumOp>(op) && !inputType.isUnsignedInteger()) ||
++       mlir::isa<ttnn::ReduceBitwiseAndOp, ttnn::ReduceBitwiseOrOp,
++                 ttnn::ReduceBitwiseXorOp>(op));
+   TTNNOperandWorkarounds operandWorkaround;
+   if (!inputType.isF32() && !inputType.isBF16() && !supportsInt32) {
+     operandWorkaround.tensorDataTypeWorkaround =
+diff --git a/runtime/lib/ttnn/operations/reduction/reduction.cpp b/runtime/lib/ttnn/operations/reduction/reduction.cpp
+--- a/runtime/lib/ttnn/operations/reduction/reduction.cpp
++++ b/runtime/lib/ttnn/operations/reduction/reduction.cpp
+@@ -56,6 +56,21 @@
+                       computeConfig);
+     break;
+   }
++  case ::tt::target::ttnn::ReductionOpType::BitwiseAnd: {
++    out = ::ttnn::reduce_bitwise_and(in, dimArg, op->keep_dim(),
++                                     outputMemoryConfig, computeConfig);
++    break;
++  }
++  case ::tt::target::ttnn::ReductionOpType::BitwiseOr: {
++    out = ::ttnn::reduce_bitwise_or(in, dimArg, op->keep_dim(),
++                                    outputMemoryConfig, computeConfig);
++    break;
++  }
++  case ::tt::target::ttnn::ReductionOpType::BitwiseXor: {
++    out = ::ttnn::reduce_bitwise_xor(in, dimArg, op->keep_dim(),
++                                     outputMemoryConfig, computeConfig);
++    break;
++  }
+   }
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
