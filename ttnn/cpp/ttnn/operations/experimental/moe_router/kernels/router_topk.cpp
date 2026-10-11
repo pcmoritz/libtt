@@ -14,7 +14,9 @@
 // padded with -1e30 so that the softmax gives them zero weight, and the
 // indices into its indices tile, and copies its rows into the first core's
 // tiles. The first core masks the indices, hands the values to its compute
-// kernel and writes the indices and the weights.
+// kernel and writes the indices and the weights. With a weight, the gate
+// cores compute the logits and send each core's rows into its logits tiles
+// (see router_gate_writer.cpp).
 //
 // A tile holds four 16 x 16 faces, row-major: element (r, c) is element
 // (r % 16) * 16 + c % 16 of face (r / 16) * 2 + c / 16.
@@ -75,6 +77,8 @@ void kernel_main() {
     constexpr uint32_t cb_indices = get_named_compile_time_arg_val("cb_indices");
     constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
     constexpr uint32_t sem_id = get_named_compile_time_arg_val("sem");
+    constexpr bool fused = get_named_compile_time_arg_val("fused") != 0;
+    constexpr uint32_t logits_sem_id = get_named_compile_time_arg_val("logits_sem");
     static_assert(k >= 1 && k <= 32 && rows <= 32, "one tile of output");
     constexpr uint32_t padding = 0xF149F2CAu;  // -1e30
 
@@ -94,11 +98,13 @@ void kernel_main() {
 
     // Read only this core's rows. DRAM reads stay 64-byte aligned; BF16
     // therefore also fetches the adjacent row.
-    for (uint32_t row = first_row; row < rows; row += group) {
-        for (uint32_t j = 0; j < Wt; ++j) {
-            for (uint32_t half = 0; half < 2; ++half) {
-                const uint32_t offset = face_row_offset<value_bytes>(row, half) & ~63u;
-                noc_async_read(logits.get_noc_addr(j, offset), in_tiles + j * in_tile_bytes + offset, 64);
+    if constexpr (!fused) {
+        for (uint32_t row = first_row; row < rows; row += group) {
+            for (uint32_t j = 0; j < Wt; ++j) {
+                for (uint32_t half = 0; half < 2; ++half) {
+                    const uint32_t offset = face_row_offset<value_bytes>(row, half) & ~63u;
+                    noc_async_read(logits.get_noc_addr(j, offset), in_tiles + j * in_tile_bytes + offset, 64);
+                }
             }
         }
     }
@@ -147,32 +153,51 @@ void kernel_main() {
         cb_push_back(cb_scaler, 1);
     }
     noc_async_read_barrier();
+    if constexpr (fused) {
+        // One column of 32 experts from each owner.
+        volatile tt_l1_ptr uint32_t* logits_sem =
+            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(logits_sem_id));
+        noc_semaphore_wait_min(logits_sem, Wt);
+        noc_semaphore_set(logits_sem, 0);
+    }
 
+    // The logits have landed; the scan reads them with plain loads, which
+    // the compiler can schedule, a face row of 16 values at a time.
+    asm volatile("" ::: "memory");
     for (uint32_t row = first_row; row < rows; row += group) {
         uint32_t best_key[k];
-        uint32_t best_value[k];
         uint32_t best_index[k];
         uint32_t found = 0;
-        for (uint32_t col = 0; col < width; ++col) {
-            const uint32_t bits = element<value_bytes>(in_tiles, row, col);
-            const uint32_t wide = value_bytes == 4 ? bits : bits << 16;
-            const uint32_t key = (wide & 0x80000000u) ? ~wide : (wide | 0x80000000u);
-            if (found == k && key <= best_key[k - 1]) {
-                continue;
+        for (uint32_t start = 0; start < width; start += 16) {
+            const uint32_t run = width - start < 16 ? width - start : 16;
+            const uint32_t face_row =
+                in_tiles + (start / 32) * in_tile_bytes + face_row_offset<value_bytes>(row, (start / 16) % 2);
+            for (uint32_t i = 0; i < run; ++i) {
+                const uint32_t bits = value_bytes == 4 ? reinterpret_cast<const tt_l1_ptr uint32_t*>(face_row)[i]
+                                                       : reinterpret_cast<const tt_l1_ptr uint16_t*>(face_row)[i];
+                const uint32_t wide = value_bytes == 4 ? bits : bits << 16;
+                const uint32_t key = (wide & 0x80000000u) ? ~wide : (wide | 0x80000000u);
+                if (found == k && key <= best_key[k - 1]) {
+                    continue;
+                }
+                uint32_t pos = found < k ? found++ : k - 1;
+                while (pos > 0 && best_key[pos - 1] < key) {
+                    best_key[pos] = best_key[pos - 1];
+                    best_index[pos] = best_index[pos - 1];
+                    --pos;
+                }
+                best_key[pos] = key;
+                best_index[pos] = start + i;
             }
-            uint32_t pos = found < k ? found++ : k - 1;
-            while (pos > 0 && best_key[pos - 1] < key) {
-                best_key[pos] = best_key[pos - 1];
-                best_value[pos] = best_value[pos - 1];
-                best_index[pos] = best_index[pos - 1];
-                --pos;
-            }
-            best_key[pos] = key;
-            best_value[pos] = wide;
-            best_index[pos] = col;
         }
         for (uint32_t col = 0; col < 32; ++col) {
-            store32(values_tile, row, col, col < found ? best_value[col] : padding);
+            uint32_t value = padding;
+            if (col < found) {
+                // The value back from its key.
+                const uint32_t key = best_key[col];
+                value = (key & 0x80000000u) ? (key & 0x7FFFFFFFu) : ~key;
+            }
+            store32(values_tile, row, col, value);
             store32(indices_tile, row, col, col < found ? best_index[col] : 0);
         }
         if (!leader) {

@@ -11,10 +11,16 @@ namespace ttnn::experimental {
 // k values: {weights, indices}, both [rows, k], in `weights_dtype` (FLOAT32 or
 // BFLOAT16) and `indices_dtype` (INT32 or UINT32). With a `mask` ([1, 1] or
 // [rows, 1]), every index of a row whose mask is zero is the [1, 1] `fill`.
-bool moe_router_topk_supported(const Tensor &logits, uint32_t k,
+// With a `weight` ([K, width]), `logits` is instead the router's input
+// ([rows, K], K a multiple of 32) and the op computes the logits, input @
+// weight, itself: split over K across cores, with FP32 partial sums.
+bool moe_router_topk_supported(const Tensor &logits,
+                               const std::optional<Tensor> &weight, uint32_t k,
                                const std::optional<Tensor> &mask,
                                const std::optional<Tensor> &fill);
-std::vector<Tensor> moe_router_topk(const Tensor &logits, uint32_t k,
+std::vector<Tensor> moe_router_topk(const Tensor &logits,
+                                    const std::optional<Tensor> &weight,
+                                    uint32_t k,
                                     tt::tt_metal::DataType weights_dtype,
                                     tt::tt_metal::DataType indices_dtype,
                                     const std::optional<Tensor> &mask,

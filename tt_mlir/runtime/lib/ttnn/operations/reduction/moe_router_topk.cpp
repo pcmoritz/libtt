@@ -20,6 +20,10 @@ void run(const ::tt::target::ttnn::MoeRouterTopKOp *op,
     return tensor;
   };
   ::ttnn::Tensor logits = standard(pool.getTTNNTensorAndValidate(op->logits()));
+  std::optional<::ttnn::Tensor> weight;
+  if (op->weight()) {
+    weight = standard(pool.getTTNNTensorAndValidate(op->weight()));
+  }
   std::optional<::ttnn::Tensor> mask;
   std::optional<::ttnn::Tensor> fill;
   if (op->mask()) {
@@ -30,7 +34,7 @@ void run(const ::tt::target::ttnn::MoeRouterTopKOp *op,
     fill = standard(pool.getTTNNTensorAndValidate(op->fill()));
   }
   auto outputs = ::ttnn::experimental::moe_router_topk(
-      logits, op->k(), utils::getDataType(op->weights()),
+      logits, weight, op->k(), utils::getDataType(op->weights()),
       utils::getDataType(op->indices()), mask, fill);
   pool.insertTTNNTensorAndValidate(op->weights(), outputs.at(0));
   pool.insertTTNNTensorAndValidate(op->indices(), outputs.at(1));

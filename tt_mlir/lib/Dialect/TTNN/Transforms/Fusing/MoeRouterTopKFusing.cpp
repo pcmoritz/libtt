@@ -19,12 +19,38 @@ bool allUsersAfter(Value value, Operation *op) {
     return user->getBlock() == op->getBlock() && op->isBeforeInBlock(user);
   });
 }
+
+// The router's gate, when the logits are its only result's only use: a plain
+// FP32 matmul of the router's input [rows, K], K whole tiles, by a weight
+// [K, width]. The fused op computes it with FP32 partial sums. An exact
+// (ttcore.fp32_exact) matmul is left alone: the fused op would read FP32
+// operands through 19-bit source registers.
+MatmulOp gateMatmul(Value logits, Operation *topk) {
+  auto matmul = logits.getDefiningOp<MatmulOp>();
+  if (!matmul || !logits.hasOneUse() ||
+      matmul->getBlock() != topk->getBlock() || matmul.getTransposeA() ||
+      matmul.getTransposeB() || matmul.getActivation() ||
+      matmul->hasAttr("ttcore.fp32_exact")) {
+    return nullptr;
+  }
+  auto aType = cast<RankedTensorType>(matmul.getA().getType());
+  auto bType = cast<RankedTensorType>(matmul.getB().getType());
+  if (aType.getRank() != 2 || bType.getRank() != 2 ||
+      aType.getDimSize(1) % 32 != 0 ||
+      bType.getDimSize(0) != aType.getDimSize(1) ||
+      !cast<RankedTensorType>(logits.getType()).getElementType().isF32() ||
+      !(aType.getElementType().isBF16() || aType.getElementType().isF32())) {
+    return nullptr;
+  }
+  return matmul;
+}
 } // namespace
 
 // A mixture-of-experts router: the top k of each row of the router logits,
 // the softmax of the k values (the renormalized top k of their softmax, see
 // TopKSoftmaxRenormalizePattern) and the indices, with the rows of padding
-// tokens masked. One program does all of it for up to 32 rows (decode).
+// tokens masked, and the router's gate matmul when it computes the logits.
+// One program does all of it for up to 32 rows (decode).
 LogicalResult
 MoeRouterTopKFusing::matchAndRewrite(SoftmaxOp op,
                                      PatternRewriter &rewriter) const {
@@ -86,11 +112,19 @@ MoeRouterTopKFusing::matchAndRewrite(SoftmaxOp op,
     }
   }
 
+  MatmulOp gate = gateMatmul(topk.getInputTensor(), topk);
   rewriter.setInsertionPoint(insertion);
   auto fused = rewriter.create<MoeRouterTopKOp>(
-      op.getLoc(), TypeRange{weightsType, indicesType}, topk.getInputTensor(),
-      where ? where.getFirst() : Value(), where ? where.getThird() : Value(),
-      topk.getKAttr());
+      op.getLoc(), TypeRange{weightsType, indicesType},
+      gate ? gate.getA() : topk.getInputTensor(),
+      gate ? gate.getB() : Value(), where ? where.getFirst() : Value(),
+      where ? where.getThird() : Value(), topk.getKAttr());
+  if (gate) {
+    // The weight dtype conversion reads the weight's dtype from the op.
+    if (Attribute dtype = gate->getAttr("ttcore.weight_dtype")) {
+      fused->setAttr("ttcore.weight_dtype", dtype);
+    }
+  }
   rewriter.replaceOp(op, fused.getWeights());
   if (where) {
     rewriter.replaceOp(where, fused.getIndices());
@@ -98,6 +132,9 @@ MoeRouterTopKFusing::matchAndRewrite(SoftmaxOp op,
     rewriter.replaceAllUsesWith(indices, fused.getIndices());
   }
   rewriter.eraseOp(topk);
+  if (gate) {
+    rewriter.eraseOp(gate);
+  }
   return success();
 }
 
