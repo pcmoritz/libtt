@@ -17,8 +17,8 @@ SPECIAL = np.array(
     np.float32,
 )
 
-FORMATS = [(4, 3), (5, 2), (3, 4), (6, 8), (8, 0), (5, 10), (8, 7)]
-FORMAT_IDS = ["e4m3", "e5m2", "e3m4", "e6m8", "e8m0", "e5m10", "e8m7"]
+FORMATS = [(4, 3), (5, 2), (3, 4), (6, 8), (8, 0), (5, 10), (8, 7), (1, 2)]
+FORMAT_IDS = ["e4m3", "e5m2", "e3m4", "e6m8", "e8m0", "e5m10", "e8m7", "e1m2"]
 
 
 def values(dtype):
@@ -62,3 +62,30 @@ def test_reduce_precision_all_16_bit_patterns(dtype, bits):
 )
 def test_reduce_precision_subnormals(dtype, value, bits):
     assert_matches_cpu(np.full((4, 4), value, dtype), bits)
+
+
+def float32_boundaries(exponent_bits, mantissa_bits):
+    """Float32 bit patterns around the format's rounding, underflow and overflow
+    boundaries, plus subnormals, infinities and NaN, with both signs."""
+    dropped = max(23 - mantissa_bits, 0)
+    half = (1 << dropped) >> 1
+    last_kept = 1 << dropped if dropped < 23 else 0
+    mantissas = {0, 1, 0x7FFFFF, 0x400000, half, half - 1, half + 1, last_kept | half, last_kept | (half - 1), last_kept | (half + 1)}
+    reduced_bias = (1 << (exponent_bits - 1)) - 1
+    min_exponent, max_exponent = 127 - reduced_bias, 127 + reduced_bias
+    exponents = {0, 1, 127, 254, 255, min_exponent - 1, min_exponent, min_exponent + 1, max_exponent - 1, max_exponent, max_exponent + 1}
+    bits = [
+        sign << 31 | exponent << 23 | (mantissa & 0x7FFFFF)
+        for sign in (0, 1)
+        for exponent in sorted(e for e in exponents if 0 <= e <= 255)
+        for mantissa in sorted(m for m in mantissas if m >= 0)
+    ]
+    return np.array(bits, np.uint32).view(np.float32)
+
+
+# Raw float32 bit patterns at the boundaries of each format, including
+# exponent_bits == 1 and the full-precision identity.
+@pytest.mark.parametrize("bits", FORMATS + [(8, 23)], ids=FORMAT_IDS + ["e8m23"])
+def test_reduce_precision_float32_boundaries(bits):
+    assert_matches_cpu(float32_boundaries(*bits), bits)
+

@@ -5,7 +5,8 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
      }];
  }
  
-+def TTIR_ReducePrecisionOp : TTIR_ElementwiseUnaryOp<"reduce_precision"> {
++def TTIR_ReducePrecisionOp : TTIR_ElementwiseUnaryOp<"reduce_precision",
++    [AllShapesMatch<["input", "result"]>, AllElementTypesMatch<["input", "result"]>]> {
 +    let summary = "Elementwise reduce precision operation.";
 +    let description = [{
 +      Rounds each element of a float32, bfloat16 or float16 tensor to a
@@ -15,11 +16,10 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +      infinity, and keep NaN. The result has the input's type.
 +    }];
 +
-+    let arguments = (ins AnyRankedTensor:$input,
-+                         SI32Attr:$exponent_bits,
-+                         SI32Attr:$mantissa_bits);
-+
-+    let hasVerifier = 1;
++    let arguments = (ins RankedTensorOf<[F32, BF16, F16]>:$input,
++                         ConfinedAttr<SI32Attr, [IntMinValue<1>]>:$exponent_bits,
++                         ConfinedAttr<SI32Attr, [IntNonNegative]>:$mantissa_bits);
++    let results = (outs RankedTensorOf<[F32, BF16, F16]>:$result);
 +}
 +
  class TTIR_ElementwiseBinaryOp<string mnemonic, list<Trait> traits = []> :
@@ -32,7 +32,8 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
      }];
  }
  
-+def TTNN_ReducePrecisionOp : TTNN_ElementwiseUnaryOp<"reduce_precision", [OpModelExempt]> {
++def TTNN_ReducePrecisionOp : TTNN_ElementwiseUnaryOp<"reduce_precision",
++    [OpModelExempt, AllShapesMatch<["input", "result"]>, AllElementTypesMatch<["input", "result"]>]> {
 +    let summary = "Eltwise reduce precision op.";
 +    let description = [{
 +      Rounds a float32, bfloat16 or float16 tensor to a floating-point format
@@ -40,9 +41,10 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +      one kernel on the raw bits.
 +    }];
 +
-+    let arguments = (ins AnyRankedTensor:$input,
-+                         SI32Attr:$exponent_bits,
-+                         SI32Attr:$mantissa_bits);
++    let arguments = (ins RankedTensorOf<[F32, BF16, F16]>:$input,
++                         ConfinedAttr<SI32Attr, [IntMinValue<1>]>:$exponent_bits,
++                         ConfinedAttr<SI32Attr, [IntNonNegative]>:$mantissa_bits);
++    let results = (outs RankedTensorOf<[F32, BF16, F16]>:$result);
 +
 +    let builders =
 +    [
@@ -51,8 +53,6 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +        build($_builder, $_state, {input.getType()}, input, exponent_bits, mantissa_bits);
 +      }]>
 +    ];
-+
-+    let hasVerifier = 1;
 +}
 +
  def TTNN_AddOp : TTNN_ElementwiseBinaryOp<"add"> {
@@ -92,37 +92,6 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
             BroadcastOpConversionPattern,
             PadOpConversionPattern,
             PowOpConversionPattern,
-diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
---- a/lib/Dialect/TTIR/IR/TTIROps.cpp
-+++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
-@@ -7139,6 +7139,27 @@
- // CumProdOp
- //===----------------------------------------------------------------------===//
- 
-+// ReducePrecisionOp verification
-+::mlir::LogicalResult mlir::tt::ttir::ReducePrecisionOp::verify() {
-+  auto inputType = getInput().getType();
-+  auto resultType = getResult().getType();
-+  if (resultType.getShape() != inputType.getShape() ||
-+      resultType.getElementType() != inputType.getElementType()) {
-+    return emitOpError()
-+           << "result shape and element type must match the input";
-+  }
-+  if (!inputType.getElementType().isF32() &&
-+      !inputType.getElementType().isBF16() &&
-+      !inputType.getElementType().isF16()) {
-+    return emitOpError() << "input must be float32, bfloat16 or float16";
-+  }
-+  if (getExponentBits() < 1 || getMantissaBits() < 0) {
-+    return emitOpError() << "needs at least one exponent bit and a "
-+                            "non-negative number of mantissa bits";
-+  }
-+  return success();
-+}
-+
- // CumProdOp verification
- ::mlir::LogicalResult mlir::tt::ttir::CumulativeOp::verify() {
-   int64_t dim = getDim();
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
@@ -139,33 +108,6 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
  UnaryOpType CeilOp::getUnaryOpType() { return UnaryOpType::Ceil; }
  
  llvm::SmallVector<mlir::FloatAttr> CeilOp::getParams() { return {}; }
-@@ -237,6 +243,26 @@
- // RandOp
- //===----------------------------------------------------------------------===//
- 
-+::mlir::LogicalResult mlir::tt::ttnn::ReducePrecisionOp::verify() {
-+  auto inputType = getInput().getType();
-+  auto resultType = getResult().getType();
-+  if (resultType.getShape() != inputType.getShape() ||
-+      resultType.getElementType() != inputType.getElementType()) {
-+    return emitOpError()
-+           << "result shape and element type must match the input";
-+  }
-+  if (!inputType.getElementType().isF32() &&
-+      !inputType.getElementType().isBF16() &&
-+      !inputType.getElementType().isF16()) {
-+    return emitOpError() << "input must be float32, bfloat16 or float16";
-+  }
-+  if (getExponentBits() < 1 || getMantissaBits() < 0) {
-+    return emitOpError() << "needs at least one exponent bit and a "
-+                            "non-negative number of mantissa bits";
-+  }
-+  return success();
-+}
-+
- ::mlir::LogicalResult mlir::tt::ttnn::CumulativeOp::verify() {
-   int64_t dim = getDim();
-   int64_t inputRank = getInput().getType().getRank();
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
