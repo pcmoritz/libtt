@@ -41,23 +41,25 @@ diff --git ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl ttnn/cpp/ttnn/kernel_lib/
  template <
      uint32_t block_width_tiles,
      uint32_t input_dfb,
-@@ -79,8 +105,13 @@
-     // (fast tilize truncates fp32 → tf32). Has no effect on non-fp32 formats.
-     constexpr bool lossless_fp32_override =
-         (fp32_mode == tilize_config::Fp32Mode::Lossless) && is_fp32_input_format<input_dfb>();
--    constexpr bool use_fast =
--        can_use_fast_tilize<block_width_tiles, input_dfb, output_dfb>() && !lossless_fp32_override;
-+#ifdef TILIZE_FLOAT16_TO_FLOAT32
-+    constexpr bool float16_to_float32 = true;
-+#else
-+    constexpr bool float16_to_float32 = false;
-+#endif
-+    constexpr bool use_fast = can_use_fast_tilize<block_width_tiles, input_dfb, output_dfb>() &&
-+                              !lossless_fp32_override && !float16_to_float32;
+@@ -71,6 +97,17 @@
+     static_assert(input_dfb < 32, "Invalid input_dfb: must be less than 32");
+     static_assert(output_dfb < 32, "Invalid output_dfb: must be less than 32");
  
-     // Determine if we're doing data type reconfiguration
-     constexpr bool use_unpack_reconfig =
-@@ -137,6 +168,9 @@
++#ifdef TILIZE_FLOAT16_TO_FLOAT32
++    // The raw Float16 bits are only interpreted correctly in this configuration.
++    static_assert(DST_ACCUM_MODE, "Float16 -> Float32 tilize needs 32-bit Dest");
++    static_assert(
++        dfb_l1_format<input_dfb>() == static_cast<uint32_t>(DataFormat::UInt16),
++        "Float16 -> Float32 tilize needs a UInt16 input buffer so the unpacker keeps the raw Float16 bits");
++    static_assert(
++        dfb_l1_format<output_dfb>() == static_cast<uint32_t>(DataFormat::Float32),
++        "Float16 -> Float32 tilize needs a Float32 output buffer");
++#endif
++
+     // Runtime parameter validation
+     ASSERT(num_blocks > 0);
+ 
+@@ -137,6 +174,9 @@
          } else {
              tilize_init(input_dfb, block_width_tiles, output_dfb);
          }
@@ -67,17 +69,18 @@ diff --git ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl ttnn/cpp/ttnn/kernel_lib/
      }
  
      // Construct DataflowBuffer objects for sync operations.
-@@ -183,6 +217,10 @@
- 
+@@ -184,7 +224,11 @@
          if constexpr (use_fast) {
              fast_tilize_block(input_dfb, block_width_tiles, output_dfb);
-+#ifdef TILIZE_FLOAT16_TO_FLOAT32
-+        } else if constexpr (float16_to_float32) {
-+            tilize_block_float16_to_float32(input_dfb, block_width_tiles, output_dfb);
-+#endif
          } else {
++#ifdef TILIZE_FLOAT16_TO_FLOAT32
++            tilize_block_float16_to_float32(input_dfb, block_width_tiles, output_dfb);
++#else
              tilize_block(input_dfb, block_width_tiles, output_dfb);
++#endif
          }
+ 
+         out_dfb.push_back(block_width_tiles);
 diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
 --- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
 +++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
