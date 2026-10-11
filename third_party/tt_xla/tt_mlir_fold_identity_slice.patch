@@ -1,0 +1,22 @@
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -3503,6 +3503,18 @@
+ 
+ // SliceStaticOp Folder
+ mlir::OpFoldResult mlir::tt::ttir::SliceStaticOp::fold(FoldAdaptor adaptor) {
++  // A slice of the whole input with unit steps is the input. Folding it keeps
++  // later commutes from moving it past a reshape onto a rank-0 tensor, which
++  // cannot be sliced.
++  auto isConstant = [](ArrayAttr values, int64_t expected) {
++    return llvm::all_of(values, [&](Attribute value) {
++      return mlir::cast<IntegerAttr>(value).getInt() == expected;
++    });
++  };
++  if (getInput().getType() == getType() && isConstant(getBegins(), 0) &&
++      isConstant(getStep(), 1)) {
++    return getInput();
++  }
+ 
+   if (auto foldResult = foldConsecutiveSliceStatic(*this)) {
+     return foldResult;
