@@ -42,16 +42,31 @@ def test_integer_bitwise_reduce(op, dtype, dims):
 
 
 # Several tiles along each reduced dimension, with partial tiles, so the
-# reduction folds tiles and must pad them with the identity.
+# reduction folds tiles and must pad them with the identity. Random bits would
+# AND to zero and OR to all ones, so most bits stay set for AND and clear for OR.
 @pytest.mark.parametrize("op", sorted(OPS))
 @pytest.mark.parametrize("dims", [(0,), (1,), (2,), (1, 2)], ids=["d0", "d1", "d2", "d12"])
 def test_multi_tile_bitwise_reduce(op, dims):
     lax_op, np_op = OPS[op]
     x = random_integers(np.uint32, (35, 70, 45), seed=1)
     if op == "and":
-        # Random bits AND to zero over many elements; keep most bits set.
         x |= np.uint32(0xFFFF7FFE)
+    elif op == "or":
+        x &= np.uint32(0x00008001)
     np.testing.assert_array_equal(run(lambda v: lax_op(v, dims), x), reference(np_op, x, dims))
+
+
+# A single element decides the result, in a later tile of the reduced
+# dimension (and of the partial last tile for d1).
+@pytest.mark.parametrize("op", sorted(OPS))
+@pytest.mark.parametrize("dim", [0, 1, 2], ids=["d0", "d1", "d2"])
+def test_decisive_element_in_later_tile(op, dim):
+    lax_op, np_op = OPS[op]
+    x = np.full((35, 70, 45), 0xFFFFFFFF if op == "and" else 0, dtype=np.uint32)
+    index = [2, 3, 4]
+    index[dim] = x.shape[dim] - 1
+    x[tuple(index)] ^= np.uint32(0x00400000)
+    np.testing.assert_array_equal(run(lambda v: lax_op(v, (dim,)), x), np_op(x, axis=dim))
 
 
 @pytest.mark.parametrize("op", sorted(OPS))
@@ -69,7 +84,35 @@ def test_boolean_xor_reduce(dims):
 
 
 # A non-identity init value is combined into the result.
-def test_bitwise_or_reduce_with_init():
-    x = random_integers(np.uint32, (3, 4, 5), seed=4) & np.uint32(0x0F0F0F0F)
-    got = run(lambda v: lax.reduce(v, np.uint32(0x10000001), lax.bitwise_or, (1,)), x)
-    np.testing.assert_array_equal(got, np.bitwise_or.reduce(x, axis=1) | np.uint32(0x10000001))
+@pytest.mark.parametrize(
+    "op, init",
+    [("and", 0x0FF00FF0), ("or", 0x10000001), ("xor", 0x12345678)],
+    ids=["and", "or", "xor"],
+)
+def test_bitwise_reduce_with_init(op, init):
+    lax_op, np_op = OPS[op]
+    x = random_integers(np.uint32, (3, 4, 5), seed=4)
+    reducer = {"and": lax.bitwise_and, "or": lax.bitwise_or, "xor": lax.bitwise_xor}[op]
+    got = run(lambda v: lax.reduce(v, np.uint32(init), reducer, (1,)), x)
+    np.testing.assert_array_equal(got, np_op(np.concatenate([x, np.full((3, 1, 5), init, np.uint32)], axis=1), axis=1))
+
+
+# Reducing an empty dimension gives the identity: all ones for AND.
+@pytest.mark.parametrize("op", sorted(OPS))
+@pytest.mark.parametrize("dtype", [np.int32, np.uint32], ids=["i32", "u32"])
+def test_empty_bitwise_reduce(op, dtype):
+    lax_op, np_op = OPS[op]
+    x = np.zeros((3, 0, 5), dtype=dtype)
+    np.testing.assert_array_equal(run(lambda v: lax_op(v, (1,)), x), np_op(x, axis=1))
+
+
+# Only a body that is exactly the bitwise op lowers to the bitwise reduction:
+# ~(a ^ b) is associative but is not xor.
+def test_xnor_reducer_is_not_xor():
+    x = np.zeros((3,), dtype=np.int32)
+    xnor = lambda a, b: ~(a ^ b)
+    try:
+        got = run(lambda v: lax.reduce(v, np.int32(-1), xnor, (0,)), x)
+    except Exception:
+        return  # Not lowered, rather than miscompiled.
+    np.testing.assert_array_equal(got, np.int32(0))

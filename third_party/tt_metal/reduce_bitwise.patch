@@ -593,14 +593,48 @@ diff --git ttnn/cpp/ttnn/operations/reduction/reduction_common/reduction_common.
  };
  
  template <class Tuple, class T = std::decay_t<std::tuple_element_t<0, std::decay_t<Tuple>>>>
-@@ -51,6 +55,10 @@
+@@ -51,6 +55,8 @@
          case ReduceType::Std:
          case ReduceType::Var: return std::numeric_limits<float>::quiet_NaN();
          case ReduceType::Prod: return 1.0f;
-+        // All ones for INT32; ttnn::full cannot express all ones for UINT32.
-+        case ReduceType::BitwiseAnd: return -1.0f;
 +        case ReduceType::BitwiseOr:
 +        case ReduceType::BitwiseXor: return 0.0f;
          default:
              // Don't just return NaN, since it may not be appropriate for all reduction types.
              TT_THROW("Unhandled reduction type");
+@@ -98,15 +104,26 @@
+         }
+     }
+ 
+-    constexpr float fill_value = get_zero_volume_fill_value(reduce_type);
+-
+-    return ttnn::full(
+-        ttnn::Shape(output_shape),
+-        fill_value,
+-        input_tensor.dtype(),
+-        input_tensor.layout(),
+-        *input_tensor.device(),
+-        memory_config);
++    if constexpr (reduce_type == ReduceType::BitwiseAnd) {
++        // All ones: the integer -1 converts to 0xFFFFFFFF for UINT32.
++        return ttnn::full(
++            ttnn::Shape(output_shape),
++            -1,
++            input_tensor.dtype(),
++            input_tensor.layout(),
++            *input_tensor.device(),
++            memory_config);
++    } else {
++        constexpr float fill_value = get_zero_volume_fill_value(reduce_type);
++
++        return ttnn::full(
++            ttnn::Shape(output_shape),
++            fill_value,
++            input_tensor.dtype(),
++            input_tensor.layout(),
++            *input_tensor.device(),
++            memory_config);
++    }
+ }
+ 
+ }  // namespace reduction_common
