@@ -564,6 +564,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_total_order_compare.patch",
         "//third_party/tt_xla:tt_mlir_float16_bits.patch",
         "//third_party/tt_xla:tt_mlir_cumulative_max_min.patch",
+        "//third_party/tt_xla:tt_mlir_fold_identity_slice.patch",
         "//third_party/tt_xla:tt_mlir_fp32_exact_matmul.patch",
         "//third_party/tt_xla:tt_mlir_reduce_bitwise.patch",
     ],
