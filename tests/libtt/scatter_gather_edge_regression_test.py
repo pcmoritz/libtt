@@ -16,9 +16,10 @@ def assert_matches_cpu(f, *args):
     np.testing.assert_array_equal(on("tt", f, *args), on("cpu", f, *args))
 
 
+# Start indices above 127 catch a sign-extending widening.
 def test_vmapped_dynamic_slice_with_uint8_indices():
-    x = np.arange(4 * 9, dtype=np.float32).reshape(4, 9)
-    starts = np.array([0, 3, 5, 7], np.uint8)
+    x = np.arange(4 * 260, dtype=np.float32).reshape(4, 260)
+    starts = np.array([0, 127, 128, 255], np.uint8)
     assert_matches_cpu(jax.vmap(lambda row, start: lax.dynamic_slice(row, (start,), (2,))), x, starts)
 
 

@@ -10,10 +10,11 @@ def run(f, *args):
     return np.asarray(jax.jit(f)(*(jax.device_put(a, jax.devices("tt")[0]) for a in args)))
 
 
+# A dimension beyond 256 checks that values wrap around like NumPy's.
 def test_indices_uint8():
     with jax.default_device(jax.devices("tt")[0]):
-        got = jax.jit(lambda: jnp.indices((4, 5, 6), dtype=np.uint8))()
-    np.testing.assert_array_equal(np.asarray(got), np.indices((4, 5, 6), dtype=np.uint8))
+        got = jax.jit(lambda: jnp.indices((3, 300), dtype=np.uint8))()
+    np.testing.assert_array_equal(np.asarray(got), np.indices((3, 300), dtype=np.uint8))
 
 
 def test_packbits_unpackbits():

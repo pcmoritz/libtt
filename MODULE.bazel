@@ -571,7 +571,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_reduce_bitwise.patch",
         "//third_party/tt_xla:tt_mlir_reduce_precision_op.patch",
         "//third_party/tt_xla:tt_mlir_gather_narrow_index.patch",
-        "//third_party/tt_xla:tt_mlir_scatter_empty_update.patch",
         "//third_party/tt_xla:tt_mlir_scatter_float16_reduction.patch",
         "//third_party/tt_xla:tt_mlir_reduce_uint32_max_min.patch",
     ],
