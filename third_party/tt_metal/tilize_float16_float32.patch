@@ -1,0 +1,493 @@
+diff --git ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl
+--- ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl
++++ ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl
+@@ -12,6 +12,9 @@
+  */
+ #include "ttnn/cpp/ttnn/kernel_lib/dfb_helpers_compute.hpp"
+ #include "api/dataflow/dataflow_buffer.h"
++#ifdef TILIZE_FLOAT16_TO_FLOAT32
++#include "api/compute/eltwise_unary/typecast.h"
++#endif
+ 
+ // JIT generates chlkc_descriptors.h (not per-variable files), included via chlkc_list.h.
+ // The arrays are available in scope but guarded by TRISC type:
+@@ -54,6 +57,29 @@
+ // Main Function Implementation
+ // =============================================================================
+ 
++#ifdef TILIZE_FLOAT16_TO_FLOAT32
++// Unpacking Float16 flushes subnormals and -0 to +0. The factory instead declares the Float16 input as
++// UInt16, so its raw bits reach the low half of each 32-bit Dest word, and the SFPU widens them exactly
++// to Float32 before the tile is released to the packer.
++template <bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
++ALWI void tilize_block_float16_to_float32(uint32_t icb, uint32_t block, uint32_t ocb) {
++    UNPACK((llk_unpack_tilize_block(icb, block, 0)));
++
++    for (uint32_t t = 0; t < block; t++) {
++        MATH((llk_math_wait_for_dest_available()));
++        PACK((llk_packer_wait_for_math_done()));
++
++        MATH((llk_math_eltwise_unary_datacopy<DataCopyType::A2D, is_fp32_dest_acc_en, BroadcastType::NONE, UnpackToDestEn>(
++            0 /*dst index*/, icb)));
++        typecast_tile<static_cast<uint32_t>(DataFormat::Float16), static_cast<uint32_t>(DataFormat::Float32)>(0);
++        PACK((llk_pack<is_fp32_dest_acc_en, true, PackMode::Default>(0 /*tile index*/, ocb, t)));
++
++        MATH((llk_math_dest_section_done<is_fp32_dest_acc_en>()));
++        PACK((llk_pack_dest_section_done<is_fp32_dest_acc_en>()));
++    }
++}
++#endif
++
+ template <
+     uint32_t block_width_tiles,
+     uint32_t input_dfb,
+@@ -79,8 +105,13 @@
+     // (fast tilize truncates fp32 → tf32). Has no effect on non-fp32 formats.
+     constexpr bool lossless_fp32_override =
+         (fp32_mode == tilize_config::Fp32Mode::Lossless) && is_fp32_input_format<input_dfb>();
+-    constexpr bool use_fast =
+-        can_use_fast_tilize<block_width_tiles, input_dfb, output_dfb>() && !lossless_fp32_override;
++#ifdef TILIZE_FLOAT16_TO_FLOAT32
++    constexpr bool float16_to_float32 = true;
++#else
++    constexpr bool float16_to_float32 = false;
++#endif
++    constexpr bool use_fast = can_use_fast_tilize<block_width_tiles, input_dfb, output_dfb>() &&
++                              !lossless_fp32_override && !float16_to_float32;
+ 
+     // Determine if we're doing data type reconfiguration
+     constexpr bool use_unpack_reconfig =
+@@ -137,6 +168,9 @@
+         } else {
+             tilize_init(input_dfb, block_width_tiles, output_dfb);
+         }
++#ifdef TILIZE_FLOAT16_TO_FLOAT32
++        typecast_tile_init<static_cast<uint32_t>(DataFormat::Float16), static_cast<uint32_t>(DataFormat::Float32)>();
++#endif
+     }
+ 
+     // Construct DataflowBuffer objects for sync operations.
+@@ -183,6 +217,10 @@
+ 
+         if constexpr (use_fast) {
+             fast_tilize_block(input_dfb, block_width_tiles, output_dfb);
++#ifdef TILIZE_FLOAT16_TO_FLOAT32
++        } else if constexpr (float16_to_float32) {
++            tilize_block_float16_to_float32(input_dfb, block_width_tiles, output_dfb);
++#endif
+         } else {
+             tilize_block(input_dfb, block_width_tiles, output_dfb);
+         }
+diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+--- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
++++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+@@ -234,7 +234,10 @@
+                 return ttnn::experimental::view(tensor, output_shape, padded_output_shape);
+             } else {
+                 PadValue pad_value_variant;
+-                if (tensor.dtype() == ttnn::DataType::BFLOAT16 or tensor.dtype() == ttnn::DataType::FLOAT32) {
++                // Float pads are encoded in the input dtype, so a Float16 input that is tilized to
++                // Float32 still pads with Float16 bits.
++                if (tensor.dtype() == ttnn::DataType::BFLOAT16 or tensor.dtype() == ttnn::DataType::FLOAT32 or
++                    tensor.dtype() == ttnn::DataType::FLOAT16) {
+                     pad_value_variant = pad_value;
+                 } else if (tensor.dtype() == ttnn::DataType::INT32) {
+                     TT_FATAL(
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_float16_to_float32.hpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_float16_to_float32.hpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_float16_to_float32.hpp
+@@ -0,0 +1,44 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <tt-metalium/experimental/metal2_host_api/kernel_spec.hpp>
++#include <tt-metalium/program_descriptors.hpp>
++
++#include "ttnn/tensor/types.hpp"
++
++namespace ttnn::prim {
++
++// Unpacking Float16 flushes subnormals and -0 to +0. A Float16 -> Float32 tilize therefore declares its
++// input as UInt16, so the raw bits reach 32-bit Dest unchanged, and the compute kernel
++// (TILIZE_FLOAT16_TO_FLOAT32 in tilize_helpers.inl) widens them exactly with the SFPU before packing.
++inline bool is_float16_to_float32_tilize(tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
++    return input_dtype == tt::tt_metal::DataType::FLOAT16 && output_dtype == tt::tt_metal::DataType::FLOAT32;
++}
++
++inline tt::DataFormat tilize_input_data_format(
++    tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
++    return is_float16_to_float32_tilize(input_dtype, output_dtype)
++               ? tt::DataFormat::UInt16
++               : tt::tt_metal::datatype_to_dataformat_converter(input_dtype);
++}
++
++inline tt::tt_metal::KernelDescriptor::Defines tilize_compute_defines(bool float16_to_float32) {
++    if (!float16_to_float32) {
++        return {};
++    }
++    return {{"TILIZE_FLOAT16_TO_FLOAT32", "1"}};
++}
++
++inline tt::tt_metal::experimental::KernelSpec::CompilerOptions tilize_compiler_options(bool float16_to_float32) {
++    tt::tt_metal::experimental::KernelSpec::CompilerOptions options{
++        .opt_level = tt::tt_metal::KernelBuildOptLevel::O3};
++    for (const auto& [name, value] : tilize_compute_defines(float16_to_float32)) {
++        options.defines[name] = value;
++    }
++    return options;
++}
++
++}  // namespace ttnn::prim
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
+@@ -16,6 +16,7 @@
+ #include <tt-metalium/allocator.hpp>
+ #include <tt-metalium/program_descriptors.hpp>
+ #include <tt-metalium/tensor_accessor_args.hpp>
++#include "ttnn/operations/data_movement/tilize/device/tilize_float16_to_float32.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -47,7 +48,7 @@
+     const uint32_t tile_width = operation_attributes.tile.get_width();
+     const uint32_t tile_height = operation_attributes.tile.get_height();
+ 
+-    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_cb_data_format = tilize_input_data_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = operation_attributes.tile.get_tile_size(input_cb_data_format);
+     tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = operation_attributes.tile.get_tile_size(output_cb_data_format);
+@@ -57,6 +58,7 @@
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+                         output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B ||
+                         a.dtype() == DataType::UINT8;
++    const bool float16_to_float32 = is_float16_to_float32_tilize(a.dtype(), output.dtype());
+ 
+     const uint32_t tile_hw = operation_attributes.tile.get_tile_hw();
+     const uint32_t dram_alignment = tt::tt_metal::hal::get_dram_alignment();
+@@ -213,8 +215,9 @@
+             cd.source_type = KernelDescriptor::SourceType::FILE_PATH;
+             cd.core_ranges = cores;
+             cd.compile_time_args = {block_size_col, block_size_row, third_dim, set.input_index, set.output_index};
++            cd.defines = tilize_compute_defines(float16_to_float32);
+             cd.config = ComputeConfigDescriptor{
+-                .fp32_dest_acc_en = fp32_llk_acc,
++                .fp32_dest_acc_en = fp32_llk_acc || float16_to_float32,
+                 .unpack_to_dest_mode = unpack_to_dest_mode,
+             };
+             return cd;
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
++#include "ttnn/operations/data_movement/tilize/device/tilize_float16_to_float32.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -30,13 +31,14 @@
+     const uint32_t tile_width = operation_attributes.tile.get_width();
+     const uint32_t tile_height = operation_attributes.tile.get_height();
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_data_format = tilize_input_data_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = operation_attributes.tile.get_tile_size(input_data_format);
+     tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = operation_attributes.tile.get_tile_size(output_data_format);
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+                         output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B ||
+                         a.dtype() == DataType::UINT8;
++    const bool float16_to_float32 = is_float16_to_float32_tilize(a.dtype(), output.dtype());
+ 
+     Buffer* src0_buffer = a.buffer();
+     Buffer* dst_buffer = output.buffer();
+@@ -158,7 +160,7 @@
+ 
+     auto make_compute = [&](const KernelSpecName& id, uint32_t nblocks_per_core_arg) {
+         ComputeGen1Config compute_cfg;
+-        compute_cfg.enable_32_bit_dest = fp32_llk_acc;
++        compute_cfg.enable_32_bit_dest = fp32_llk_acc || float16_to_float32;
+         // UInt8 uses 32-bit dest as integer (not float): do not enable FP32 unpack-to-dest mode.
+         if (fp32_llk_acc && a.dtype() != DataType::UINT8) {
+             compute_cfg.unpack_modes.emplace(INPUT_DFB, UnpackMode::UnpackToDest);
+@@ -166,7 +168,7 @@
+         return KernelSpec{
+             .unique_id = id,
+             .source = "ttnn/cpp/ttnn/kernel/compute/tilize_metal2.cpp",
+-            .compiler_options = {.opt_level = KernelBuildOptLevel::O3},
++            .compiler_options = tilize_compiler_options(float16_to_float32),
+             .dfb_bindings =
+                 {DFBBinding{
+                      .dfb_spec_name = INPUT_DFB,
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_program_factory.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
++#include "ttnn/operations/data_movement/tilize/device/tilize_float16_to_float32.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -26,13 +27,14 @@
+     const Tensor& output = tensor_return_value;
+     const uint32_t tile_width = operation_attributes.tile.get_width();
+     const uint32_t tile_hw = operation_attributes.tile.get_tile_hw();
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(input.dtype());
++    tt::DataFormat input_data_format = tilize_input_data_format(input.dtype(), output.dtype());
+     uint32_t input_single_tile_size = operation_attributes.tile.get_tile_size(input_data_format);
+     tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = operation_attributes.tile.get_tile_size(output_data_format);
+     bool fp32_llk_acc = input.dtype() == DataType::FLOAT32 || input.dtype() == DataType::FP8_E4M3 ||
+                         output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B ||
+                         input.dtype() == DataType::UINT8;
++    const bool float16_to_float32 = is_float16_to_float32_tilize(input.dtype(), output.dtype());
+ 
+     auto shard_spec = input.shard_spec().value();
+     uint32_t num_tiles_per_shard = shard_spec.shape[0] * shard_spec.shape[1] / tile_hw;
+@@ -130,14 +132,14 @@
+     }
+ 
+     ComputeGen1Config compute_cfg;
+-    compute_cfg.enable_32_bit_dest = fp32_llk_acc;
++    compute_cfg.enable_32_bit_dest = fp32_llk_acc || float16_to_float32;
+     if (fp32_llk_acc && input.dtype() != DataType::UINT8) {
+         compute_cfg.unpack_modes.emplace(INPUT_DFB, UnpackMode::UnpackToDest);
+     }
+     KernelSpec compute{
+         .unique_id = COMPUTE,
+         .source = "ttnn/cpp/ttnn/kernel/compute/tilize_metal2.cpp",
+-        .compiler_options = {.opt_level = KernelBuildOptLevel::O3},
++        .compiler_options = tilize_compiler_options(float16_to_float32),
+         .dfb_bindings =
+             {DFBBinding{
+                  .dfb_spec_name = INPUT_DFB,
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_single_core_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_single_core_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_single_core_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_single_core_program_factory.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
++#include "ttnn/operations/data_movement/tilize/device/tilize_float16_to_float32.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -35,7 +36,7 @@
+ 
+     TT_FATAL(output.buffer() != nullptr, "Output buffer should be allocated on device!");
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_data_format = tilize_input_data_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = operation_attributes.tile.get_tile_size(input_data_format);
+ 
+     tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
+@@ -46,6 +47,7 @@
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+                         output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B ||
+                         a.dtype() == DataType::UINT8;
++    const bool float16_to_float32 = is_float16_to_float32_tilize(a.dtype(), output.dtype());
+ 
+     uint32_t num_tiles = a.physical_volume() / tile_hw;
+ 
+@@ -152,7 +154,7 @@
+     };
+ 
+     ComputeGen1Config compute_cfg;
+-    compute_cfg.enable_32_bit_dest = fp32_llk_acc;
++    compute_cfg.enable_32_bit_dest = fp32_llk_acc || float16_to_float32;
+     // UInt8 uses 32-bit dest as integer (not float): do not enable FP32 unpack-to-dest mode.
+     if (fp32_llk_acc && a.dtype() != DataType::UINT8) {
+         compute_cfg.unpack_modes.emplace(INPUT_DFB, UnpackMode::UnpackToDest);
+@@ -161,7 +163,7 @@
+     KernelSpec compute{
+         .unique_id = COMPUTE,
+         .source = "ttnn/cpp/ttnn/kernel/compute/tilize_metal2.cpp",
+-        .compiler_options = {.opt_level = KernelBuildOptLevel::O3},
++        .compiler_options = tilize_compiler_options(float16_to_float32),
+         .dfb_bindings =
+             {DFBBinding{
+                  .dfb_spec_name = INPUT_DFB,
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
+@@ -17,6 +17,7 @@
+ #include <tt-metalium/work_split.hpp>
+ #include <tt-metalium/tensor_accessor_args.hpp>
+ #include "ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.hpp"
++#include "ttnn/operations/data_movement/tilize/device/tilize_float16_to_float32.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -41,7 +42,7 @@
+     const Tensor& output = tensor_return_value;
+     const auto& sub_core_grids = operation_attributes.sub_core_grids;
+ 
+-    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_cb_data_format = tilize_input_data_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
+     tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
+@@ -49,6 +50,7 @@
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+                         output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B ||
+                         a.dtype() == DataType::UINT8;
++    const bool float16_to_float32 = is_float16_to_float32_tilize(a.dtype(), output.dtype());
+ 
+     IDevice* device = a.device();
+     CoreCoord grid_size = device->compute_with_storage_grid_size();
+@@ -206,8 +208,9 @@
+             cd.source_type = KernelDescriptor::SourceType::FILE_PATH;
+             cd.core_ranges = cores;
+             cd.compile_time_args = {block_size_col, block_size_row, third_dim, set.input_index, set.output_index};
++            cd.defines = tilize_compute_defines(float16_to_float32);
+             cd.config = ComputeConfigDescriptor{
+-                .fp32_dest_acc_en = fp32_llk_acc,
++                .fp32_dest_acc_en = fp32_llk_acc || float16_to_float32,
+                 .unpack_to_dest_mode = unpack_to_dest_mode,
+             };
+             return cd;
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp
+@@ -13,6 +13,7 @@
+ #include <tt-metalium/work_split.hpp>
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.hpp"
++#include "ttnn/operations/data_movement/tilize/device/tilize_float16_to_float32.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -24,13 +25,14 @@
+     const TilizeWithValPaddingParams& operation_attributes, const Tensor& input_tensor, Tensor& tensor_return_value) {
+     const Tensor& a = input_tensor;
+     const Tensor& output = tensor_return_value;
+-    tt::DataFormat input_dfb_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_dfb_data_format = tilize_input_data_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_dfb_data_format);
+     tt::DataFormat output_dfb_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_dfb_data_format);
+ 
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+                         output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B;
++    const bool float16_to_float32 = is_float16_to_float32_tilize(a.dtype(), output.dtype());
+ 
+     IDevice* device = a.device();
+     CoreCoord grid_size = device->compute_with_storage_grid_size();
+@@ -165,7 +167,7 @@
+     // unpack_to_dest_mode vector was Default everywhere except v[c_0] = UnpackToDestFp32 when
+     // fp32_llk_acc, i.e. UnpackToDest on the tilize input DFB (Default == UnpackToSrc is expressed by
+     // omitting the entry). Both compute KernelSpecs get the same config, as in legacy.
+-    ComputeGen1Config compute_gen1{.enable_32_bit_dest = fp32_llk_acc};
++    ComputeGen1Config compute_gen1{.enable_32_bit_dest = fp32_llk_acc || float16_to_float32};
+     if (fp32_llk_acc) {
+         compute_gen1.unpack_modes = ComputeUnpackModes{{IN, UnpackMode::UnpackToDest}};
+     }
+@@ -180,7 +182,7 @@
+             // O3 explicitly: the legacy ComputeConfigDescriptor set no opt_level and so resolved to
+             // O3, but Metal 2.0's type-agnostic CompilerOptions defaults to O2. Leaving it unset
+             // would drop a level on both compute specs' compile and link.
+-            .compiler_options = {.opt_level = KernelBuildOptLevel::O3},
++            .compiler_options = tilize_compiler_options(float16_to_float32),
+             .dfb_bindings =
+                 {DFBBinding{
+                      .dfb_spec_name = IN,
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp
+@@ -12,6 +12,7 @@
+ #include <tt-metalium/work_split.hpp>
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.hpp"
++#include "ttnn/operations/data_movement/tilize/device/tilize_float16_to_float32.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -27,13 +28,14 @@
+     bool src_sharded = a.memory_config().is_sharded();
+     bool out_sharded = output.memory_config().is_sharded();
+ 
+-    tt::DataFormat input_dfb_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_dfb_data_format = tilize_input_data_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_dfb_data_format);
+     tt::DataFormat output_dfb_data_format = datatype_to_dataformat_converter(output.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_dfb_data_format);
+ 
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+                         output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B;
++    const bool float16_to_float32 = is_float16_to_float32_tilize(a.dtype(), output.dtype());
+ 
+     auto input_shard_spec = a.shard_spec().value();
+     auto output_shard_spec = output.shard_spec().value();
+@@ -187,7 +189,7 @@
+     // unpack_to_dest_mode vector was Default everywhere except v[c_0] = UnpackToDestFp32 when
+     // fp32_llk_acc — c_0 is this factory's staging buffer, i.e. the tilize input DFB (Default ==
+     // UnpackToSrc is expressed by omitting the entry).
+-    ComputeGen1Config compute_gen1{.enable_32_bit_dest = fp32_llk_acc};
++    ComputeGen1Config compute_gen1{.enable_32_bit_dest = fp32_llk_acc || float16_to_float32};
+     if (fp32_llk_acc) {
+         compute_gen1.unpack_modes = ComputeUnpackModes{{STAGE, UnpackMode::UnpackToDest}};
+     }
+@@ -199,7 +201,7 @@
+         // O3 explicitly: the legacy ComputeConfigDescriptor set no opt_level and so resolved to O3,
+         // but Metal 2.0's type-agnostic CompilerOptions defaults to O2. Leaving it unset would drop
+         // a level on this kernel's compile and link.
+-        .compiler_options = {.opt_level = KernelBuildOptLevel::O3},
++        .compiler_options = tilize_compiler_options(float16_to_float32),
+         .dfb_bindings =
+             {DFBBinding{
+                  .dfb_spec_name = STAGE,
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp
+@@ -12,6 +12,7 @@
+ #include <tt-metalium/work_split.hpp>
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.hpp"
++#include "ttnn/operations/data_movement/tilize/device/tilize_float16_to_float32.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -28,7 +29,7 @@
+     CoreRange core = sub_core_grids.has_value() ? corerange_to_cores(sub_core_grids.value()).at(0) : default_core;
+     CoreRangeSet core_ranges{core};
+ 
+-    tt::DataFormat input_dfb_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_dfb_data_format = tilize_input_data_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_dfb_data_format);
+ 
+     tt::DataFormat output_dfb_data_format = datatype_to_dataformat_converter(output.dtype());
+@@ -36,6 +37,7 @@
+ 
+     bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+                         output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B;
++    const bool float16_to_float32 = is_float16_to_float32_tilize(a.dtype(), output.dtype());
+ 
+     int32_t num_tiles = output.physical_volume() / TILE_HW;
+ 
+@@ -208,7 +210,7 @@
+     // unpack_to_dest_mode vector was Default everywhere except v[c_0] = UnpackToDestFp32 when
+     // fp32_llk_acc, i.e. UnpackToDest on the tilize input DFB (Default == UnpackToSrc is expressed by
+     // omitting the entry).
+-    ComputeGen1Config compute_gen1{.enable_32_bit_dest = fp32_llk_acc};
++    ComputeGen1Config compute_gen1{.enable_32_bit_dest = fp32_llk_acc || float16_to_float32};
+     if (fp32_llk_acc) {
+         compute_gen1.unpack_modes = ComputeUnpackModes{{IN, UnpackMode::UnpackToDest}};
+     }
+@@ -220,7 +222,7 @@
+         // O3 explicitly: the legacy ComputeConfigDescriptor set no opt_level and so resolved to O3,
+         // but Metal 2.0's type-agnostic CompilerOptions defaults to O2. Leaving it unset would drop
+         // a level on this kernel's compile and link.
+-        .compiler_options = {.opt_level = KernelBuildOptLevel::O3},
++        .compiler_options = tilize_compiler_options(float16_to_float32),
+         .dfb_bindings =
+             {DFBBinding{
+                  .dfb_spec_name = IN,

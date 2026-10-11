@@ -71,3 +71,13 @@ def test_float16_gather_is_exact(op, shape):
     expected = OPS[op](np, x, order)
     got = jax.jit(lambda v: OPS[op](jnp, v, jnp.asarray(order)))(jax.device_put(x, jax.devices("tt")[0]))
     assert_same_float16(got, expected)
+
+
+# Every float16 bit pattern through a transpose. Permute runs as float32, so the row-major float16
+# input is tilized straight to float32, which widens the raw bits in the tilize kernel. (16, 4096)
+# has partial tiles along the rows and is wide enough for the block tilize factory.
+@pytest.mark.parametrize("shape", [(256, 256), (16, 4096)], ids=["tiles", "partial_tile_rows"])
+def test_float16_transpose_all_bit_patterns(shape):
+    x = np.arange(1 << 16, dtype=np.uint16).view(np.float16).reshape(shape)
+    got = jax.jit(lambda v: v.T)(jax.device_put(x, jax.devices("tt")[0]))
+    assert_same_float16(got, x.T)
