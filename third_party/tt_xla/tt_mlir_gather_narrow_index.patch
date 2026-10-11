@@ -1,0 +1,25 @@
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -3183,9 +3183,20 @@
+   LogicalResult
+   matchAndRewrite(ttir::GatherOp op, OpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
++    // ttnn.gather takes ui16 and 32-bit integer indices; widen narrower ones.
++    Value index = adaptor.getIndex();
++    RankedTensorType indexType = op.getIndex().getType();
++    auto indexElementType = mlir::cast<IntegerType>(indexType.getElementType());
++    if (!indexElementType.isUnsignedInteger(16) &&
++        !indexElementType.isInteger(32)) {
++      auto wideType = indexType.clone(rewriter.getIntegerType(
++          32, /*isSigned=*/!indexElementType.isUnsigned()));
++      index = rewriter.create<ttnn::TypecastOp>(
++          op.getLoc(), this->getTypeConverter()->convertType(wideType), index);
++    }
+     rewriter.replaceOpWithNewOp<ttnn::GatherOp>(
+         op, this->getTypeConverter()->convertType(op.getType()),
+-        adaptor.getInput(), adaptor.getIndex(), adaptor.getDim());
++        adaptor.getInput(), index, adaptor.getDim());
+     return success();
+   }
+ };
