@@ -1,0 +1,640 @@
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_reduce.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_reduce.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_reduce.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_reduce.h
+@@ -38,6 +38,25 @@
+ constexpr std::uint32_t ROWS_PER_TILE = 64;
+ constexpr std::uint32_t ROWS_PER_FACE = 16;
+ 
++// Bitwise integer reductions run the integer SUM kernels with the add swapped for the bitwise op.
++constexpr bool is_bitwise_pool_type(PoolType pool_type) {
++    return pool_type == PoolType::AND || pool_type == PoolType::OR || pool_type == PoolType::XOR;
++}
++
++// Integer combine of LREG src into LREG dest: an add for SUM and AVG, else the bitwise op.
++template <PoolType pool_type, std::uint32_t src, std::uint32_t dest>
++inline void integer_combine() {
++    if constexpr (pool_type == PoolType::AND) {
++        TTI_SFPAND(0, src, dest, 0);
++    } else if constexpr (pool_type == PoolType::OR) {
++        TTI_SFPOR(0, src, dest, 0);
++    } else if constexpr (pool_type == PoolType::XOR) {
++        TTI_SFPXOR(0, src, dest, 0);
++    } else {
++        TTI_SFPIADD(0, src, dest, 4);
++    }
++}
++
+ // Tile-layout address tables for the manual column MAX/MIN reduce path (calculate_reduce_max_min_uint16).
+ // Hoisted to file scope alongside the other reduce kernels for consistency.
+ //   COL_REDUCE_ODD_COLUMNS:    dest-word offset between the even- and odd-column halves of a face.
+@@ -290,7 +309,7 @@
+         // Step 2: Cross-face addition. Unlike the old approach where only position 0 of the
+         // cross-face sum was meaningful, here ALL 4 positions carry useful partial sums.
+         if constexpr (is_integer_mode) {
+-            TTI_SFPIADD(0, p_sfpu::LREG4, p_sfpu::LREG0, 4);  // LREG0 = upper + lower (int)
++            integer_combine<pool_type, p_sfpu::LREG4, p_sfpu::LREG0>();  // LREG0 = upper + lower (int)
+         } else {
+             TTI_SFPADD(
+                 p_sfpu::LREG0, p_sfpu::LCONST_1, p_sfpu::LREG4, p_sfpu::LREG0, 0);  // LREG0 = upper + lower (float)
+@@ -352,7 +371,7 @@
+  *
+  * @tparam is_integer_mode True for integer types (uses SFPIADD), false for float (uses SFPADD)
+  */
+-template <bool is_integer_mode>
++template <bool is_integer_mode, PoolType pool_type = PoolType::SUM>
+ inline void horizontal_reduce() {
+     // Phase 1: Rotate by 4 and add -> 8 partial sums (cols 0-7) become 4 duplicated pair sums.
+     TTI_SFPMOV(0, p_sfpu::LREG0, p_sfpu::LREG1, 0);
+@@ -369,8 +388,8 @@
+     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
+ 
+     if constexpr (is_integer_mode) {
+-        TTI_SFPIADD(0, p_sfpu::LREG1, p_sfpu::LREG0, 4);
+-        TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG4, 4);
++        integer_combine<pool_type, p_sfpu::LREG1, p_sfpu::LREG0>();
++        integer_combine<pool_type, p_sfpu::LREG5, p_sfpu::LREG4>();
+     } else {
+         TTI_SFPADD(
+             p_sfpu::LREG0, p_sfpu::LCONST_1, p_sfpu::LREG1, p_sfpu::LREG0, 0);  // lreg0 = lreg0 * 1.0 + lreg1 (float)
+@@ -386,8 +405,8 @@
+     TTI_SFPSHFT2(0, p_sfpu::LREG1, p_sfpu::LREG1, 3);
+     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
+     if constexpr (is_integer_mode) {
+-        TTI_SFPIADD(0, p_sfpu::LREG1, p_sfpu::LREG0, 4);
+-        TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG4, 4);
++        integer_combine<pool_type, p_sfpu::LREG1, p_sfpu::LREG0>();
++        integer_combine<pool_type, p_sfpu::LREG5, p_sfpu::LREG4>();
+     } else {
+         TTI_SFPADD(p_sfpu::LREG0, p_sfpu::LCONST_1, p_sfpu::LREG1, p_sfpu::LREG0, 0);
+         TTI_SFPADD(p_sfpu::LREG4, p_sfpu::LCONST_1, p_sfpu::LREG5, p_sfpu::LREG4, 0);
+@@ -399,8 +418,8 @@
+     TTI_SFPSHFT2(0, p_sfpu::LREG1, p_sfpu::LREG1, 3);
+     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
+     if constexpr (is_integer_mode) {
+-        TTI_SFPIADD(0, p_sfpu::LREG1, p_sfpu::LREG0, 4);
+-        TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG4, 4);
++        integer_combine<pool_type, p_sfpu::LREG1, p_sfpu::LREG0>();
++        integer_combine<pool_type, p_sfpu::LREG5, p_sfpu::LREG4>();
+     } else {
+         TTI_SFPADD(
+             p_sfpu::LREG0, p_sfpu::LCONST_1, p_sfpu::LREG1, p_sfpu::LREG0, 0);  // lreg0 = lreg0 * 1.0 + lreg1 (float)
+@@ -861,7 +880,11 @@
+     TT_SFPLOADI(scratch_lreg, sfpi::SFPLOADI_MOD0_LOWER, recip.low16);
+ }
+ 
+-template <InstrModLoadStore INSTRUCTION_MODE, bool clear_high_bits, bool is_avg = false>
++template <
++    InstrModLoadStore INSTRUCTION_MODE,
++    bool clear_high_bits,
++    bool is_avg = false,
++    PoolType pool_type = PoolType::SUM>
+ inline void perform_reduce_row_sum_tile(
+     std::uint32_t tile_row_offset,
+     std::uint32_t result_store_mode,
+@@ -951,7 +974,7 @@
+             }
+ 
+             // Horizontal reduction: consolidate all 8 SFPU columns into column 0 (interleaved for latency hiding)
+-            horizontal_reduce<is_integer_mode>();
++            horizontal_reduce<is_integer_mode, pool_type>();
+ 
+             // Int32: convert the two's-complement partial sums back to sign-magnitude before storing.
+             // Only LREG0 and LREG4 hold results, so LREG1/LREG5 are free GPR scratch.
+@@ -1006,7 +1029,12 @@
+  * @param tile_row_base Base address of the first tile in this row of tiles
+  * @param block_ct_dim Number of tiles along x axis of tensor (column tiles)
+  */
+-template <InstrModLoadStore INSTRUCTION_MODE, bool clear_high_bits, bool pack_low16, bool is_avg = false>
++template <
++    InstrModLoadStore INSTRUCTION_MODE,
++    bool clear_high_bits,
++    bool pack_low16,
++    bool is_avg = false,
++    PoolType pool_type = PoolType::SUM>
+ inline void sum_first_columns_across_tiles(
+     std::uint32_t tile_row_base, std::uint32_t block_ct_dim, RowAvgReciprocal recip = {}) {
+     constexpr bool is_integer_mode =
+@@ -1067,10 +1095,10 @@
+ 
+                 // Add LREG4-7 into LREG0-3
+                 if constexpr (is_integer_mode) {
+-                    TTI_SFPIADD(0, p_sfpu::LREG4, p_sfpu::LREG0, 4);
+-                    TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG1, 4);
+-                    TTI_SFPIADD(0, p_sfpu::LREG6, p_sfpu::LREG2, 4);
+-                    TTI_SFPIADD(0, p_sfpu::LREG7, p_sfpu::LREG3, 4);
++                    integer_combine<pool_type, p_sfpu::LREG4, p_sfpu::LREG0>();
++                    integer_combine<pool_type, p_sfpu::LREG5, p_sfpu::LREG1>();
++                    integer_combine<pool_type, p_sfpu::LREG6, p_sfpu::LREG2>();
++                    integer_combine<pool_type, p_sfpu::LREG7, p_sfpu::LREG3>();
+                 } else {
+                     TTI_SFPADD(p_sfpu::LREG0, p_sfpu::LCONST_1, p_sfpu::LREG4, p_sfpu::LREG0, 0);
+                     TTI_SFPADD(p_sfpu::LREG1, p_sfpu::LCONST_1, p_sfpu::LREG5, p_sfpu::LREG1, 0);
+@@ -1118,8 +1146,8 @@
+ template <PoolType pool_type, InstrModLoadStore INSTRUCTION_MODE, bool clear_high_bits, bool pack_low16>
+ inline void perform_reduce_row_sum_avg(std::uint32_t block_ct_dim, std::uint32_t block_rt_dim) {
+     static_assert(
+-        pool_type == PoolType::SUM || pool_type == PoolType::AVG,
+-        "perform_reduce_row_sum_avg only supports SUM and AVG pool types");
++        pool_type == PoolType::SUM || pool_type == PoolType::AVG || is_bitwise_pool_type(pool_type),
++        "perform_reduce_row_sum_avg only supports SUM, AVG and bitwise pool types");
+ 
+     // AVG divides each row sum by the number of reduced columns (32 per tile * block_ct_dim tiles).
+     // The reciprocal is computed once and passed down to whichever step performs the final store.
+@@ -1144,13 +1172,13 @@
+         // Step 1: Reduce each tile individually (horizontal reduction within each tile)
+         for (std::uint32_t j = 0; j < block_ct_dim; j++) {
+             std::uint32_t tile_offset = tile_row_offset + (ROWS_PER_TILE * j);
+-            perform_reduce_row_sum_tile<INSTRUCTION_MODE, clear_high_bits, is_avg>(
++            perform_reduce_row_sum_tile<INSTRUCTION_MODE, clear_high_bits, is_avg, pool_type>(
+                 tile_offset, tile_store_mode, divide_in_tile, recip);
+         }
+ 
+         // Step 2: Sum column 0 from all tiles in this row into tile 0's column 0
+         if (block_ct_dim > 1) {
+-            sum_first_columns_across_tiles<INSTRUCTION_MODE, clear_high_bits, pack_low16, is_avg>(
++            sum_first_columns_across_tiles<INSTRUCTION_MODE, clear_high_bits, pack_low16, is_avg, pool_type>(
+                 tile_row_offset, block_ct_dim, recip);
+         }
+     }
+@@ -1325,17 +1353,17 @@
+         lltt::record(0, 9);
+ 
+         // Full reduce (positions 0-5): interleaved upper/lower face summation
+-        TTI_SFPIADD(0, p_sfpu::LREG3, p_sfpu::LREG2, 4);  // LREG2 = LREG2 + LREG3
+-        TTI_SFPIADD(0, p_sfpu::LREG7, p_sfpu::LREG6, 4);  // LREG6 = LREG6 + LREG7
+-        TTI_SFPIADD(0, p_sfpu::LREG2, p_sfpu::LREG1, 4);  // LREG1 = LREG1 + LREG2
+-        TTI_SFPIADD(0, p_sfpu::LREG6, p_sfpu::LREG5, 4);  // LREG5 = LREG5 + LREG6
+-        TTI_SFPIADD(0, p_sfpu::LREG1, p_sfpu::LREG0, 4);  // LREG0 = LREG0 + LREG1
+-        TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG4, 4);  // LREG4 = LREG4 + LREG5
++        integer_combine<pool_type, p_sfpu::LREG3, p_sfpu::LREG2>();  // LREG2 = LREG2 + LREG3
++        integer_combine<pool_type, p_sfpu::LREG7, p_sfpu::LREG6>();  // LREG6 = LREG6 + LREG7
++        integer_combine<pool_type, p_sfpu::LREG2, p_sfpu::LREG1>();  // LREG1 = LREG1 + LREG2
++        integer_combine<pool_type, p_sfpu::LREG6, p_sfpu::LREG5>();  // LREG5 = LREG5 + LREG6
++        integer_combine<pool_type, p_sfpu::LREG1, p_sfpu::LREG0>();  // LREG0 = LREG0 + LREG1
++        integer_combine<pool_type, p_sfpu::LREG5, p_sfpu::LREG4>();  // LREG4 = LREG4 + LREG5
+ 
+         // Half reduce (positions 6-8): upper face only (LREG0-3)
+-        TTI_SFPIADD(0, p_sfpu::LREG3, p_sfpu::LREG2, 4);  // LREG2 = LREG2 + LREG3
+-        TTI_SFPIADD(0, p_sfpu::LREG2, p_sfpu::LREG1, 4);  // LREG1 = LREG1 + LREG2
+-        TTI_SFPIADD(0, p_sfpu::LREG1, p_sfpu::LREG0, 4);  // LREG0 = LREG0 + LREG1
++        integer_combine<pool_type, p_sfpu::LREG3, p_sfpu::LREG2>();  // LREG2 = LREG2 + LREG3
++        integer_combine<pool_type, p_sfpu::LREG2, p_sfpu::LREG1>();  // LREG1 = LREG1 + LREG2
++        integer_combine<pool_type, p_sfpu::LREG1, p_sfpu::LREG0>();  // LREG0 = LREG0 + LREG1
+     } else {
+         lltt::record(0, 9);
+ 
+@@ -1583,11 +1611,13 @@
+     static_assert(
+         reduce_dim == ReduceDim::REDUCE_COL ||
+             (reduce_dim == ReduceDim::REDUCE_ROW &&
+-             (pool_type == PoolType::SUM || (pool_type == PoolType::AVG && !is_integer_mode))),
+-        "Row reduction (REDUCE_ROW) supports SUM (all formats) and AVG (float formats only)");
++             (pool_type == PoolType::SUM || is_bitwise_pool_type(pool_type) ||
++              (pool_type == PoolType::AVG && !is_integer_mode))),
++        "Row reduction (REDUCE_ROW) supports SUM and bitwise (all formats) and AVG (float formats only)");
+     static_assert(
+-        pool_type == PoolType::SUM || pool_type == PoolType::AVG,
+-        "Only SUM and AVG pool types are currently supported on SFPU");
++        pool_type == PoolType::SUM || pool_type == PoolType::AVG ||
++            (is_bitwise_pool_type(pool_type) && is_integer_mode),
++        "Only SUM, AVG and integer AND, OR and XOR pool types are supported by this kernel");
+ 
+     // Supported instruction modes for SFPU reduce sum/avg (integer and float)
+     constexpr bool is_supported_reduce_instr_mode =
+@@ -1982,7 +2012,7 @@
+             // above, for both column and row reduce.
+             init_reduce_max_min<INSTRUCTION_MODE, pool_type, false>(block_ct_dim);
+         }
+-    } else if constexpr (pool_type == PoolType::SUM || pool_type == PoolType::AVG) {
++    } else if constexpr (pool_type == PoolType::SUM || pool_type == PoolType::AVG || is_bitwise_pool_type(pool_type)) {
+         init_reduce_sum_avg<INSTRUCTION_MODE, pool_type>();
+     } else {
+         static_assert(
+@@ -2025,8 +2055,8 @@
+         reduce_dim == ReduceDim::REDUCE_COL ||
+             (reduce_dim == ReduceDim::REDUCE_ROW &&
+              (pool_type == PoolType::SUM || pool_type == PoolType::MAX || pool_type == PoolType::MIN ||
+-              (pool_type == PoolType::AVG && is_float_format))),
+-        "Row reduction (REDUCE_ROW) supports SUM/MAX/MIN (all formats) and AVG (float formats only)");
++              is_bitwise_pool_type(pool_type) || (pool_type == PoolType::AVG && is_float_format))),
++        "Row reduction (REDUCE_ROW) supports SUM/MAX/MIN/bitwise (all formats) and AVG (float formats only)");
+     static_assert(
+         is_supported_reduce_format(format),
+         "Unsupported data format. Supported formats: Int32, UInt32, UInt16, Float32, Float16_b");
+@@ -2095,7 +2125,7 @@
+             calculate_reduce_max_min<pool_type, reduce_dim, INSTRUCTION_MODE, false, pack_low16>(block_rt_dim);
+ #endif
+         }
+-    } else if constexpr (pool_type == PoolType::SUM || pool_type == PoolType::AVG) {
++    } else if constexpr (pool_type == PoolType::SUM || pool_type == PoolType::AVG || is_bitwise_pool_type(pool_type)) {
+         calculate_reduce_sum_avg<pool_type, reduce_dim, INSTRUCTION_MODE, clear_high_bits, pack_low16>(
+             block_ct_dim, block_rt_dim);
+     } else {
+diff --git tt_metal/hw/inc/api/compute/compute_kernel_api.h tt_metal/hw/inc/api/compute/compute_kernel_api.h
+--- tt_metal/hw/inc/api/compute/compute_kernel_api.h
++++ tt_metal/hw/inc/api/compute/compute_kernel_api.h
+@@ -741,16 +741,24 @@
+     static_assert(
+         reduce_dim == ReduceDim::REDUCE_COL ||
+             (reduce_dim == ReduceDim::REDUCE_ROW &&
+-             (pool_type == PoolType::SUM || pool_type == PoolType::MAX || pool_type == PoolType::MIN)),
++             (pool_type == PoolType::SUM || pool_type == PoolType::MAX || pool_type == PoolType::MIN
++#ifndef ARCH_QUASAR
++              || pool_type == PoolType::AND || pool_type == PoolType::OR || pool_type == PoolType::XOR
++#endif
++              )),
+         "Only column reduction (REDUCE_COL) is supported for all pool types; row reduction (REDUCE_ROW) is only "
+-        "supported for SUM, MAX and MIN");
++        "supported for SUM, MAX, MIN, AND, OR and XOR");
+     static_assert(
+         sfpu_reduce_format_supported(format),
+         "Unsupported data format. Supported formats: " SFPU_REDUCE_SUPPORTED_FORMATS);
+     static_assert(
+         pool_type == PoolType::SUM || pool_type == PoolType::AVG || pool_type == PoolType::MAX ||
+-            pool_type == PoolType::MIN,
+-        "Unsupported pool type. Supported pool types: SUM, AVG, MAX, MIN");
++            pool_type == PoolType::MIN
++#ifdef ARCH_BLACKHOLE
++            || pool_type == PoolType::AND || pool_type == PoolType::OR || pool_type == PoolType::XOR
++#endif
++        ,
++        "Unsupported pool type. Supported pool types: SUM, AVG, MAX, MIN (and AND, OR, XOR on Blackhole)");
+ 
+     // This kernel is optimized for 32x32 tiles and uses RC_custom vector mode for custom reduction
+ #ifdef ARCH_QUASAR
+@@ -790,8 +798,12 @@
+ ALWI void sfpu_reduce_init() {
+     static_assert(
+         pool_type == PoolType::SUM || pool_type == PoolType::AVG || pool_type == PoolType::MAX ||
+-            pool_type == PoolType::MIN,
+-        "Unsupported pool type. Supported pool types: SUM, AVG, MAX, MIN");
++            pool_type == PoolType::MIN
++#ifdef ARCH_BLACKHOLE
++            || pool_type == PoolType::AND || pool_type == PoolType::OR || pool_type == PoolType::XOR
++#endif
++        ,
++        "Unsupported pool type. Supported pool types: SUM, AVG, MAX, MIN (and AND, OR, XOR on Blackhole)");
+     static_assert(
+         sfpu_reduce_format_supported(format),
+         "Unsupported data format. Supported formats: " SFPU_REDUCE_SUPPORTED_FORMATS);
+diff --git tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_defs.h tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_defs.h
+--- tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_defs.h
++++ tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_defs.h
+@@ -34,6 +34,10 @@
+     AVG,
+     MAX,
+     MIN,
++    // Bitwise reductions of integers (SFPU reduce only)
++    AND,
++    OR,
++    XOR,
+ };
+ 
+ enum class DataCopyType : std::uint8_t
+diff --git tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_defs.h tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_defs.h
+--- tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_defs.h
++++ tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_defs.h
+@@ -34,6 +34,10 @@
+     AVG,
+     MAX,
+     MIN,
++    // Bitwise reductions of integers (SFPU reduce only)
++    AND,
++    OR,
++    XOR,
+ };
+ 
+ enum class DataCopyType : std::uint8_t
+diff --git ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
+--- ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
++++ ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
+@@ -51,6 +51,15 @@
+     return false;
+ #else
+     if constexpr (
++        pool_type == ckernel::PoolType::AND || pool_type == ckernel::PoolType::OR ||
++        pool_type == ckernel::PoolType::XOR) {
++        // Bitwise reductions exist only on the SFPU, for 32-bit integers.
++        static_assert(
++            data_format == DataFormat::Int32 || data_format == DataFormat::UInt32,
++            "Bitwise reductions support Int32 and UInt32");
++        return reduce_dim == ckernel::ReduceDim::REDUCE_ROW || reduce_dim == ckernel::ReduceDim::REDUCE_COL;
++    }
++    if constexpr (
+         pool_type != ckernel::PoolType::MAX && pool_type != ckernel::PoolType::SUM &&
+         pool_type != ckernel::PoolType::MIN) {
+         return false;
+diff --git ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
+--- ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
++++ ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
+@@ -6,6 +6,7 @@
+ // Do not include directly - include reduce_helpers_compute.hpp instead
+ 
+ #include "api/compute/add_int_sfpu.h"
++#include "api/compute/binary_bitwise_sfpu.h"
+ #include "api/compute/eltwise_binary_sfpu.h"
+ #include "api/compute/binary_max_min.h"
+ #include "api/compute/compute_kernel_api.h"
+@@ -92,8 +93,9 @@
+     }
+ }
+ 
+-// Pool-type dispatched cross-tile fold init (MAX -> binary_max, MIN -> binary_min, SUM -> add).
+-// Used by compute_kernel_lib::reduce() for the Int32 SFPU path and for accurate fp32 reduces.
++// Pool-type dispatched cross-tile fold init (MAX -> binary_max, MIN -> binary_min, SUM -> add,
++// AND/OR/XOR -> the bitwise op). Used by compute_kernel_lib::reduce() for the integer SFPU path and
++// for accurate fp32 reduces.
+ template <PoolType pool_type, DataFormat format>
+ ALWI void sfpu_reduce_fold_init() {
+     if constexpr (pool_type == PoolType::SUM) {
+@@ -101,6 +103,9 @@
+ #ifndef ARCH_QUASAR  // Quasar's ckernel::PoolType has no MIN (and no SFPU reduce path)
+     } else if constexpr (pool_type == PoolType::MIN) {
+         sfpu_reduce_min_fold_init<format>();
++    } else if constexpr (
++        pool_type == PoolType::AND || pool_type == PoolType::OR || pool_type == PoolType::XOR) {
++        binary_bitwise_tile_init();
+ #endif
+     } else {
+         sfpu_reduce_max_fold_init<format>();
+@@ -121,6 +126,12 @@
+ #ifndef ARCH_QUASAR  // Quasar's ckernel::PoolType has no MIN (and no SFPU reduce path)
+         } else if constexpr (pool_type == PoolType::MIN) {
+             sfpu_reduce_min_fold_tile<format>(dst_idx, work_dst, dst_idx);
++        } else if constexpr (pool_type == PoolType::AND) {
++            bitwise_and_binary_tile<format>(dst_idx, work_dst, dst_idx);
++        } else if constexpr (pool_type == PoolType::OR) {
++            bitwise_or_binary_tile<format>(dst_idx, work_dst, dst_idx);
++        } else if constexpr (pool_type == PoolType::XOR) {
++            bitwise_xor_binary_tile<format>(dst_idx, work_dst, dst_idx);
+ #endif
+         } else {
+             sfpu_reduce_max_fold_tile<format>(dst_idx, work_dst, dst_idx);
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
+@@ -23,7 +23,12 @@
+ 
+ namespace tt::tt_metal {
+ 
+-enum class ReduceOpMath { SUM, AVG, MAX, MIN, STD, VAR };
++enum class ReduceOpMath { SUM, AVG, MAX, MIN, STD, VAR, AND, OR, XOR };
++
++// Bitwise and, or and xor of 32-bit integers, reduced on the SFPU.
++inline bool is_bitwise_reduce_math(ReduceOpMath math_op) {
++    return math_op == ReduceOpMath::AND || math_op == ReduceOpMath::OR || math_op == ReduceOpMath::XOR;
++}
+ 
+ enum class ReduceOpDim { H, W, HW };
+ 
+@@ -70,6 +75,9 @@
+ inline bool use_sfpu_reduce_path(
+     tt::tt_metal::DataType dtype, tt::tt_metal::ReduceOpMath math_op, bool use_sfpu_reduce = false) {
+     using tt::tt_metal::ReduceOpMath;
++    if (tt::tt_metal::is_bitwise_reduce_math(math_op)) {
++        return dtype == tt::tt_metal::DataType::INT32 || dtype == tt::tt_metal::DataType::UINT32;
++    }
+     if (dtype == tt::tt_metal::DataType::INT32) {
+         return math_op == ReduceOpMath::MAX || math_op == ReduceOpMath::SUM || math_op == ReduceOpMath::MIN;
+     }
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
+@@ -64,6 +64,9 @@
+         case tt::tt_metal::ReduceOpMath::MAX: defines["REDUCE_OP"] = "ckernel::PoolType::MAX"; break;
+         case tt::tt_metal::ReduceOpMath::MIN: defines["REDUCE_OP"] = "ckernel::PoolType::MIN"; break;
+         case tt::tt_metal::ReduceOpMath::AVG: defines["REDUCE_OP"] = "ckernel::PoolType::AVG"; break;
++        case tt::tt_metal::ReduceOpMath::AND: defines["REDUCE_OP"] = "ckernel::PoolType::AND"; break;
++        case tt::tt_metal::ReduceOpMath::OR: defines["REDUCE_OP"] = "ckernel::PoolType::OR"; break;
++        case tt::tt_metal::ReduceOpMath::XOR: defines["REDUCE_OP"] = "ckernel::PoolType::XOR"; break;
+         default: defines["REDUCE_OP"] = "ckernel::PoolType::SUM"; break;
+     }
+     defines["REDUCE_DIM"] = reduce_dim_str;
+@@ -72,6 +75,9 @@
+ 
+ // Padding identity for the pre-reduce tilize, mirroring get_pad_value() in generic_reductions.cpp.
+ static ttnn::PadValue get_tilize_pad_value(tt::tt_metal::ReduceOpMath reduce_math, tt::tt_metal::DataType dtype) {
++    if (tt::tt_metal::is_bitwise_reduce_math(reduce_math)) {
++        return ttnn::PadValue{reduce_math == tt::tt_metal::ReduceOpMath::AND ? uint32_t{0xFFFFFFFF} : uint32_t{0}};
++    }
+     if (dtype == tt::tt_metal::DataType::INT32) {
+         switch (reduce_math) {
+             case tt::tt_metal::ReduceOpMath::MAX: return ttnn::PadValue{uint32_t{0x80000001}};  // INT32_MIN + 1
+@@ -362,7 +368,7 @@
+         ((prepared_input.dtype() == tt::tt_metal::DataType::INT32 &&
+           (reduce_math == tt::tt_metal::ReduceOpMath::MAX || reduce_math == tt::tt_metal::ReduceOpMath::SUM ||
+            reduce_math == tt::tt_metal::ReduceOpMath::MIN)) ||
+-         use_sfpu_fp32_reduce);
++         tt::tt_metal::is_bitwise_reduce_math(reduce_math) || use_sfpu_fp32_reduce);
+ 
+     if (is_multicore_hw || use_two_step_hw_sfpu_reduce ||
+         (reduce_dim == tt::tt_metal::ReduceOpDim::HW && reduce_scaler < 0)) {
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
+@@ -91,11 +91,28 @@
+     return {non_height_width_dims, height_width_dims};
+ }
+ 
++constexpr bool is_bitwise_reduce_type(reduction_common::ReduceType reduce_type) {
++    return reduce_type == reduction_common::ReduceType::BitwiseAnd ||
++           reduce_type == reduction_common::ReduceType::BitwiseOr ||
++           reduce_type == reduction_common::ReduceType::BitwiseXor;
++}
++
++constexpr tt::tt_metal::ReduceOpMath bitwise_reduce_math(reduction_common::ReduceType reduce_type) {
++    return reduce_type == reduction_common::ReduceType::BitwiseAnd  ? tt::tt_metal::ReduceOpMath::AND
++           : reduce_type == reduction_common::ReduceType::BitwiseOr ? tt::tt_metal::ReduceOpMath::OR
++                                                                    : tt::tt_metal::ReduceOpMath::XOR;
++}
++
+ float get_pad_value(
+     reduction_common::ReduceType reduce_type, tt::tt_metal::DataType dtype = tt::tt_metal::DataType::FLOAT32) {
+     // Prod reduction is handled separately in prod.cpp.
+     TT_FATAL(reduce_type != reduction_common::ReduceType::Prod, "Prod reduction is not supported");
+ 
++    // Bitwise identities, carried as bit patterns like the INT32 sentinels below.
++    if (is_bitwise_reduce_type(reduce_type)) {
++        return std::bit_cast<float>(reduce_type == reduction_common::ReduceType::BitwiseAnd ? 0xFFFFFFFFu : 0u);
++    }
++
+     // INT32 max/min: pad_value flows through float-typed pad APIs (transpose / permute /
+     // tilize_with_val_padding / fill_pad), and static_cast<uint32_t>(±inf) is UB.
+     // We therefore carry the int32 sentinel as the float's bit pattern; the data-movement
+@@ -207,6 +224,11 @@
+                     int reduce_dim = i_dim;
+                     if (transpose) {
+                         output_tensor = ttnn::transpose(output_tensor, i_dim, -2, memory_config, pad_value);
++                        if constexpr (is_bitwise_reduce_type(reduce_type)) {
++                            // Transposes pad UINT32 numerically, which cannot express all ones.
++                            output_tensor = ttnn::fill_implicit_tile_padding(
++                                output_tensor, ttnn::PadValue{std::bit_cast<uint32_t>(pad_value)});
++                        }
+                         reduce_dim = rank - 2;
+                     }
+                     // Only the smallest-axis sub-step ends the chain; earlier sub-steps stay in fp32.
+@@ -247,7 +269,8 @@
+         };
+         constexpr bool linear_type = reduce_type == reduction_common::ReduceType::Sum ||
+                                      reduce_type == reduction_common::ReduceType::Max ||
+-                                     reduce_type == reduction_common::ReduceType::Min;
++                                     reduce_type == reduction_common::ReduceType::Min ||
++                                     is_bitwise_reduce_type(reduce_type);
+         if (dim.size() == 1 || linear_type) {
+             output_tensor = reduce_nd_loop(/*use_reduce_type=*/true, scalar);
+         } else if constexpr (reduce_type == reduction_common::ReduceType::Mean) {
+@@ -337,6 +360,16 @@
+                 sub_core_grids,
+                 /*negate=*/false,
+                 /*fast_and_approximate_mode=*/fast_and_approximate_mode);
++        } else if constexpr (is_bitwise_reduce_type(reduce_type)) {
++            output_tensor = ttnn::operations::reduction::generic::detail::reduce(
++                input_tensor,
++                bitwise_reduce_math(reduce_type),
++                reduce_op_dim,
++                scalar,
++                memory_config,
++                std::nullopt,
++                compute_kernel_config,
++                sub_core_grids);
+         } else {
+             TT_THROW("Unsupported reduction operation");
+         }
+@@ -569,7 +602,8 @@
+     bool is_tiled = input_tensor_arg.layout() == TILE_LAYOUT;
+     // For INT32 the pad sentinel is carried as a raw bit pattern (see get_pad_value); pass it through
+     // PadValue's integer arm so fill_pad reinterprets the bits rather than decoding numerically.
+-    const ttnn::PadValue fill_pad_value = input_tensor_arg.dtype() == tt::tt_metal::DataType::INT32
++    const ttnn::PadValue fill_pad_value = input_tensor_arg.dtype() == tt::tt_metal::DataType::INT32 ||
++                                                  is_bitwise_reduce_type(reduce_type)
+                                               ? ttnn::PadValue{std::bit_cast<uint32_t>(pad_value)}
+                                               : ttnn::PadValue{pad_value};
+     auto input_tensor =
+@@ -795,6 +829,36 @@
+         fast_and_approximate_mode);
+ }
+ 
++Tensor reduce_bitwise_and(
++    const Tensor& input_tensor_arg,
++    const std::optional<std::variant<int, int64_t, ttsl::SmallVector<int>>>& dim_arg,
++    bool keepdim,
++    const std::optional<MemoryConfig>& memory_config_arg,
++    const std::optional<DeviceComputeKernelConfig>& compute_kernel_config) {
++    return operations::reduction::reduce<reduction_common::ReduceType::BitwiseAnd>(
++        input_tensor_arg, dim_arg, keepdim, memory_config_arg, compute_kernel_config);
++}
++
++Tensor reduce_bitwise_or(
++    const Tensor& input_tensor_arg,
++    const std::optional<std::variant<int, int64_t, ttsl::SmallVector<int>>>& dim_arg,
++    bool keepdim,
++    const std::optional<MemoryConfig>& memory_config_arg,
++    const std::optional<DeviceComputeKernelConfig>& compute_kernel_config) {
++    return operations::reduction::reduce<reduction_common::ReduceType::BitwiseOr>(
++        input_tensor_arg, dim_arg, keepdim, memory_config_arg, compute_kernel_config);
++}
++
++Tensor reduce_bitwise_xor(
++    const Tensor& input_tensor_arg,
++    const std::optional<std::variant<int, int64_t, ttsl::SmallVector<int>>>& dim_arg,
++    bool keepdim,
++    const std::optional<MemoryConfig>& memory_config_arg,
++    const std::optional<DeviceComputeKernelConfig>& compute_kernel_config) {
++    return operations::reduction::reduce<reduction_common::ReduceType::BitwiseXor>(
++        input_tensor_arg, dim_arg, keepdim, memory_config_arg, compute_kernel_config);
++}
++
+ Tensor std(
+     const Tensor& input_tensor_arg,
+     const std::optional<std::variant<int, int64_t, ttsl::SmallVector<int>>>& dim_arg,
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.hpp ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.hpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.hpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.hpp
+@@ -82,6 +82,28 @@
+     // When false (default), fp32 min runs on the accurate SFPU path; true selects the faster tf32 FPU path.
+     bool fast_and_approximate_mode = false);
+ 
++// Bitwise and, or and xor reductions of INT32 and UINT32 tensors (Blackhole).
++Tensor reduce_bitwise_and(
++    const Tensor& input_tensor_arg,
++    const std::optional<std::variant<int, int64_t, ttsl::SmallVector<int>>>& dim_arg = std::nullopt,
++    bool keepdim = false,
++    const std::optional<MemoryConfig>& memory_config_arg = std::nullopt,
++    const std::optional<DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt);
++
++Tensor reduce_bitwise_or(
++    const Tensor& input_tensor_arg,
++    const std::optional<std::variant<int, int64_t, ttsl::SmallVector<int>>>& dim_arg = std::nullopt,
++    bool keepdim = false,
++    const std::optional<MemoryConfig>& memory_config_arg = std::nullopt,
++    const std::optional<DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt);
++
++Tensor reduce_bitwise_xor(
++    const Tensor& input_tensor_arg,
++    const std::optional<std::variant<int, int64_t, ttsl::SmallVector<int>>>& dim_arg = std::nullopt,
++    bool keepdim = false,
++    const std::optional<MemoryConfig>& memory_config_arg = std::nullopt,
++    const std::optional<DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt);
++
+ Tensor std(
+     const Tensor& input_tensor_arg,
+     const std::optional<std::variant<int, int64_t, ttsl::SmallVector<int>>>& dim_arg = std::nullopt,
+diff --git ttnn/cpp/ttnn/operations/reduction/reduction_common/reduction_common.hpp ttnn/cpp/ttnn/operations/reduction/reduction_common/reduction_common.hpp
+--- ttnn/cpp/ttnn/operations/reduction/reduction_common/reduction_common.hpp
++++ ttnn/cpp/ttnn/operations/reduction/reduction_common/reduction_common.hpp
+@@ -24,6 +24,10 @@
+     Std,
+     Var,
+     Prod,
++    // Bitwise reductions of 32-bit integers
++    BitwiseAnd,
++    BitwiseOr,
++    BitwiseXor,
+ };
+ 
+ template <class Tuple, class T = std::decay_t<std::tuple_element_t<0, std::decay_t<Tuple>>>>
+@@ -51,6 +55,8 @@
+         case ReduceType::Std:
+         case ReduceType::Var: return std::numeric_limits<float>::quiet_NaN();
+         case ReduceType::Prod: return 1.0f;
++        case ReduceType::BitwiseOr:
++        case ReduceType::BitwiseXor: return 0.0f;
+         default:
+             // Don't just return NaN, since it may not be appropriate for all reduction types.
+             TT_THROW("Unhandled reduction type");
+@@ -98,15 +104,26 @@
+         }
+     }
+ 
+-    constexpr float fill_value = get_zero_volume_fill_value(reduce_type);
+-
+-    return ttnn::full(
+-        ttnn::Shape(output_shape),
+-        fill_value,
+-        input_tensor.dtype(),
+-        input_tensor.layout(),
+-        *input_tensor.device(),
+-        memory_config);
++    if constexpr (reduce_type == ReduceType::BitwiseAnd) {
++        // All ones: the integer -1 converts to 0xFFFFFFFF for UINT32.
++        return ttnn::full(
++            ttnn::Shape(output_shape),
++            -1,
++            input_tensor.dtype(),
++            input_tensor.layout(),
++            *input_tensor.device(),
++            memory_config);
++    } else {
++        constexpr float fill_value = get_zero_volume_fill_value(reduce_type);
++
++        return ttnn::full(
++            ttnn::Shape(output_shape),
++            fill_value,
++            input_tensor.dtype(),
++            input_tensor.layout(),
++            *input_tensor.device(),
++            memory_config);
++    }
+ }
+ 
+ }  // namespace reduction_common
