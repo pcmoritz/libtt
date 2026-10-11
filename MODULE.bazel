@@ -336,6 +336,7 @@ http_archive(
         "//third_party/tt_metal:float16_data_movement_bits.patch",
         "//third_party/tt_metal:accumulation_max_min.patch",
         "//third_party/tt_metal:reduce_bitwise.patch",
+        "//third_party/tt_metal:reduce_precision_kernel.patch",
     ],
     sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
     strip_prefix = "tt-metal-eb97711f4be2a30cfbff05266faf90bf9780d0c2",
@@ -566,6 +567,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_cumulative_max_min.patch",
         "//third_party/tt_xla:tt_mlir_fp32_exact_matmul.patch",
         "//third_party/tt_xla:tt_mlir_reduce_bitwise.patch",
+        "//third_party/tt_xla:tt_mlir_reduce_precision_op.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

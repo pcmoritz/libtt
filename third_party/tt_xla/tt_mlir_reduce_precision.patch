@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10857,6 +10857,54 @@ public:
+@@ -10857,6 +10857,45 @@ public:
  };
  } // namespace
  
@@ -22,18 +22,6 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +
 +    int exponentBits = srcOp.getExponentBits();
 +    int mantissaBits = srcOp.getMantissaBits();
-+    Type reducedElementType;
-+    if (exponentBits == 5 && mantissaBits == 10) {
-+      reducedElementType = rewriter.getF16Type();
-+    } else if (exponentBits == 8 && mantissaBits == 7) {
-+      reducedElementType = rewriter.getBF16Type();
-+    } else if (exponentBits == 8 && mantissaBits == 23) {
-+      reducedElementType = rewriter.getF32Type();
-+    } else {
-+      return rewriter.notifyMatchFailure(
-+          srcOp, "requested floating-point format is not supported");
-+    }
-+
 +    int inputMantissaBits = inputType.getFPMantissaWidth() - 1;
 +    int inputExponentBits =
 +        inputType.getWidth() - inputMantissaBits - /*sign=*/1;
@@ -42,12 +30,15 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      rewriter.replaceOp(srcOp, adaptor.getOperand());
 +      return success();
 +    }
++    if (!(inputType.isF32() || inputType.isBF16() || inputType.isF16()) ||
++        exponentBits < 1) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "requested floating-point format is not supported");
++    }
 +
-+    auto reducedType = resultType.clone(reducedElementType);
-+    Value reduced = rewriter.create<ttir::TypecastOp>(
-+        srcOp.getLoc(), reducedType, adaptor.getOperand(), true);
-+    rewriter.replaceOpWithNewOp<ttir::TypecastOp>(
-+        srcOp, resultType, reduced, true);
++    // ttnn.reduce_precision rounds on the input's own bits, like XLA.
++    rewriter.replaceOpWithNewOp<ttir::ReducePrecisionOp>(
++        srcOp, resultType, adaptor.getOperand(), exponentBits, mantissaBits);
 +    return success();
 +  }
 +};
@@ -56,7 +47,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  static void
  addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
                                           RewritePatternSet &patterns,
-@@ -10912,6 +10960,8 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+@@ -10912,6 +10951,8 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<
        mlir::stablehlo::RoundNearestEvenOp, mlir::tt::ttir::RoundOp>>(
        typeConverter, ctx);
