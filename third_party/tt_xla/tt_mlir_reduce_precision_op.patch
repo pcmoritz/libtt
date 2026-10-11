@@ -1,0 +1,187 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -1478,6 +1478,23 @@
+     }];
+ }
+ 
++def TTIR_ReducePrecisionOp : TTIR_ElementwiseUnaryOp<"reduce_precision",
++    [AllShapesMatch<["input", "result"]>, AllElementTypesMatch<["input", "result"]>]> {
++    let summary = "Elementwise reduce precision operation.";
++    let description = [{
++      Rounds each element of a float32, bfloat16 or float16 tensor to a
++      floating-point format with `exponent_bits` and `mantissa_bits`, as
++      stablehlo.reduce_precision: round to nearest even, flush values below the
++      format's smallest normal to signed zero, saturate overflows to signed
++      infinity, and keep NaN. The result has the input's type.
++    }];
++
++    let arguments = (ins RankedTensorOf<[F32, BF16, F16]>:$input,
++                         ConfinedAttr<SI32Attr, [IntMinValue<1>]>:$exponent_bits,
++                         ConfinedAttr<SI32Attr, [IntNonNegative]>:$mantissa_bits);
++    let results = (outs RankedTensorOf<[F32, BF16, F16]>:$result);
++}
++
+ class TTIR_ElementwiseBinaryOp<string mnemonic, list<Trait> traits = []> :
+     TTIR_ElementwiseOp<mnemonic, [TwoOperands, TTIR_ElementwiseBinary, TTIR_QuantizableOpInterface] #  traits> {
+     let summary = "Base class for elementwise operations with two input tensors.";
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -704,6 +704,29 @@
+     }];
+ }
+ 
++def TTNN_ReducePrecisionOp : TTNN_ElementwiseUnaryOp<"reduce_precision",
++    [OpModelExempt, AllShapesMatch<["input", "result"]>, AllElementTypesMatch<["input", "result"]>]> {
++    let summary = "Eltwise reduce precision op.";
++    let description = [{
++      Rounds a float32, bfloat16 or float16 tensor to a floating-point format
++      with `exponent_bits` and `mantissa_bits`, like XLA's reduce_precision, in
++      one kernel on the raw bits.
++    }];
++
++    let arguments = (ins RankedTensorOf<[F32, BF16, F16]>:$input,
++                         ConfinedAttr<SI32Attr, [IntMinValue<1>]>:$exponent_bits,
++                         ConfinedAttr<SI32Attr, [IntNonNegative]>:$mantissa_bits);
++    let results = (outs RankedTensorOf<[F32, BF16, F16]>:$result);
++
++    let builders =
++    [
++      OpBuilder<(ins "Value": $input, "int32_t": $exponent_bits, "int32_t": $mantissa_bits),
++      [{
++        build($_builder, $_state, {input.getType()}, input, exponent_bits, mantissa_bits);
++      }]>
++    ];
++}
++
+ def TTNN_AddOp : TTNN_ElementwiseBinaryOp<"add"> {
+ 
+     let summary = "Eltwise add.";
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -500,6 +500,22 @@
+   }
+ };
+ 
++class ReducePrecisionOpConversionPattern
++    : public OpConversionPattern<ttir::ReducePrecisionOp> {
++public:
++  using OpConversionPattern<ttir::ReducePrecisionOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(ttir::ReducePrecisionOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    rewriter.replaceOpWithNewOp<ttnn::ReducePrecisionOp>(
++        op, this->getTypeConverter()->convertType(op.getType()),
++        adaptor.getInput(), adaptor.getExponentBits(),
++        adaptor.getMantissaBits());
++    return success();
++  }
++};
++
+ class CumProdOpConversionPattern : public OpConversionPattern<ttir::CumProdOp> {
+ public:
+   using OpConversionPattern<ttir::CumProdOp>::OpConversionPattern;
+@@ -4077,6 +4093,7 @@
+            ReductionProdOpConversionPattern,
+            ReductionArgMaxOpConversionPattern,
+            ElementwiseUnaryWithFloatParameterOpConversionPattern<ttir::LeakyReluOp, ttnn::LeakyReluOp>,
++           ReducePrecisionOpConversionPattern,
+            BroadcastOpConversionPattern,
+            PadOpConversionPattern,
+            PowOpConversionPattern,
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -97,6 +97,12 @@
+ 
+ llvm::SmallVector<mlir::FloatAttr> CbrtOp::getParams() { return {}; }
+ 
++// Unknown keeps reduce_precision out of unary fusion, which would lose the
++// raw-bit buffer configuration its kernel needs.
++UnaryOpType ReducePrecisionOp::getUnaryOpType() { return UnaryOpType::Unknown; }
++
++llvm::SmallVector<mlir::FloatAttr> ReducePrecisionOp::getParams() { return {}; }
++
+ UnaryOpType CeilOp::getUnaryOpType() { return UnaryOpType::Ceil; }
+ 
+ llvm::SmallVector<mlir::FloatAttr> CeilOp::getParams() { return {}; }
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -2959,6 +2959,13 @@
+                  .Union();
+   } else if constexpr (std::is_same_v<EltwiseUnaryOp, BitwiseNotOp>) {
+     type = ::tt::target::ttnn::EltwiseUnaryOpType::BitwiseNot;
++  } else if constexpr (std::is_same_v<EltwiseUnaryOp, ReducePrecisionOp>) {
++    type = ::tt::target::ttnn::EltwiseUnaryOpType::ReducePrecision;
++    paramsType = ::tt::target::ttnn::EltwiseUnaryOpParams::
++        EltwiseUnaryReducePrecisionParams;
++    params = ::tt::target::ttnn::CreateEltwiseUnaryReducePrecisionParams(
++                 *cache.fbb, op.getExponentBits(), op.getMantissaBits())
++                 .Union();
+   } else {
+     llvm_unreachable("unhandled EltwiseUnaryOp");
+   }
+@@ -5218,6 +5225,12 @@
+     return createOperation(cache, createEltwiseUnaryOp(cache, leakyReluOp),
+                            debugString, locInfo);
+   }
++  if (auto reducePrecisionOp = dyn_cast<ReducePrecisionOp>(op);
++      reducePrecisionOp) {
++    return createOperation(cache,
++                           createEltwiseUnaryOp(cache, reducePrecisionOp),
++                           debugString, locInfo);
++  }
+   if (auto ceilOp = dyn_cast<CeilOp>(op); ceilOp) {
+     return createOperation(cache, createEltwiseUnaryOp(cache, ceilOp),
+                            debugString, locInfo);
+diff --git a/include/ttmlir/Target/TTNN/operations/eltwise.fbs b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+--- a/include/ttmlir/Target/TTNN/operations/eltwise.fbs
++++ b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+@@ -184,10 +184,18 @@
+   Asin,
+   Asinh,
+   Round,
++  ReducePrecision,
++}
++
++// Target format of ReducePrecision.
++table EltwiseUnaryReducePrecisionParams {
++  exponent_bits: uint32;
++  mantissa_bits: uint32;
+ }
+ 
+ union EltwiseUnaryOpParams {
+-  EltwiseOpWithFloatParams
++  EltwiseOpWithFloatParams,
++  EltwiseUnaryReducePrecisionParams
+ }
+ 
+ table EltwiseUnaryOp {
+diff --git a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
+--- a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
++++ b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
+@@ -276,6 +276,20 @@
+     runEltwiseUnaryWithFloatParameterOp(op, tensorPool, ::ttnn::leaky_relu);
+     break;
+   }
++  case ::tt::target::ttnn::EltwiseUnaryOpType::ReducePrecision: {
++    const auto *params = op->params_as_EltwiseUnaryReducePrecisionParams();
++    runEltwiseUnaryOp(
++        op, tensorPool,
++        [&](const ::ttnn::Tensor &input,
++            const std::optional<::ttnn::MemoryConfig> &memoryConfig,
++            const std::optional<::ttnn::Tensor> &optionalOutput,
++            const std::optional<::ttnn::CoreRangeSet> &) {
++          return ::ttnn::reduce_precision(input, params->exponent_bits(),
++                                          params->mantissa_bits(), memoryConfig,
++                                          optionalOutput);
++        });
++    break;
++  }
+   case ::tt::target::ttnn::EltwiseUnaryOpType::BitwiseNot: {
+     runEltwiseUnaryOp(op, tensorPool, ::ttnn::bitwise_not);
+     break;
