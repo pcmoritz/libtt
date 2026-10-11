@@ -75,14 +75,15 @@ def test_cumulative_extremum_runs_on_accumulation(tmp_path):
 @pytest.mark.parametrize("sign", [1, -1], ids=["pos_nan", "neg_nan"])
 # bfloat16 is not covered: on device, computing on a bfloat16 NaN turns it into
 # inf before any op sees it (even x * 1), a separate issue.
-@pytest.mark.parametrize("dtype", [jnp.float32], ids=["f32"])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16], ids=["f32", "f16"])
 @pytest.mark.parametrize("reverse", [False, True])
 def test_cumulative_extremum_propagates_nan(op, sign, dtype, reverse):
-    lax_op, _ = OPS[op]
+    lax_op, np_op = OPS[op]
     nan = np.copysign(np.float32(np.nan), np.float32(sign))
     x = np.array([[1.0, -np.inf, nan, 2.0, np.inf, -5.0, 0.5]], np.float32)
     if reverse:
         x = x[:, ::-1].copy()
-    got = np.asarray(jax.jit(lambda x: lax_op(x, axis=1, reverse=reverse))(device_put(x.astype(dtype))))
-    expected = [[False, False, True, True, True, True, True]]
-    np.testing.assert_array_equal(np.isnan(got.astype(np.float32)), expected if not reverse else [expected[0][::-1]])
+    x = x.astype(dtype)
+    got = jax.jit(lambda x: lax_op(x, axis=1, reverse=reverse))(device_put(x))
+    # NaN positions must match, and the values before the first NaN too.
+    np.testing.assert_array_equal(np.asarray(got).astype(np.float64), reference(np_op, x, 1, reverse))
