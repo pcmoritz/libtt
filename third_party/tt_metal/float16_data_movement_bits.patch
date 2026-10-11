@@ -18,7 +18,15 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/common/common.hpp ttnn/cpp/ttn
 diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
-@@ -36,18 +36,18 @@
+@@ -12,6 +12,7 @@
+ #include "ttnn/metal_v2_artifacts.hpp"
+ #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ #include <algorithm>
+ #include <bit>
+ #include <map>
+@@ -36,13 +37,12 @@
      tt::DataFormat cb_data_format,
      std::uint32_t input_element_size_bytes,
      bool is_float_type,
@@ -30,52 +38,31 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
          {"MASK_ELEM_UINT",
           input_element_size_bytes == 1 ? "uint8_t" : input_element_size_bytes == 2 ? "uint16_t" : "uint32_t"});
 -    d.insert({"MASK_VALUE", is_fp32 ? "0x3F800000u" : is_fp16 ? "0x3C00u" : is_float_type ? "0x3F80u" : "1u"});
--    d.insert({"FILL_PAD_DATA_FMT", detail::get_where_data_fmt(input_tensor.dtype())});
 +    d.insert({"MASK_VALUE", is_fp32 ? "0x3F800000u" : is_float_type ? "0x3F80u" : "1u"});
-+    const DataType dtype = detail::fill_dtype(input_tensor.dtype());
-+    d.insert({"FILL_PAD_DATA_FMT", detail::get_where_data_fmt(dtype)});
+     d.insert({"FILL_PAD_DATA_FMT", detail::get_where_data_fmt(input_tensor.dtype())});
      if (!is_float_type) {
          d.insert(
-             {"FILL_PAD_FILL_DATA_FMT",
--             input_tensor.dtype() == DataType::UINT8 ? std::string("DataFormat::UInt32")
-+             dtype == DataType::UINT8 ? std::string("DataFormat::UInt32")
-                                                      : fmt::format("DataFormat::{}", cb_data_format)});
-     }
-     d.insert({"FILL_PAD_FILL_FN", is_float_type ? "fill_tile_bitcast" : "fill_tile_int<FILL_PAD_FILL_DATA_FMT>"});
-@@ -72,7 +72,8 @@
+@@ -72,7 +72,7 @@
      const ttnn::PadValue& fill_value = operation_attributes.fill_value;
      tt::tt_metal::IDevice* device = input_tensor.device();
  
 -    const tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
-+    const DataType dtype = detail::fill_dtype(input_tensor.dtype());
-+    const tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(dtype);
++    const tt::DataFormat cb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
      TT_FATAL(input_tensor.buffer() != nullptr, "Input buffer should be allocated on device!");
  
      const std::uint32_t input_element_size_bytes = detail::data_type_to_size.at(input_tensor.dtype());
-@@ -92,18 +93,15 @@
-     const bool has_right_pad = W_mod32 != 0;
+@@ -93,10 +93,8 @@
      const bool has_bottom_pad = H_mod32 != 0;
  
--    const bool is_float_type =
+     const bool is_float_type =
 -        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT16 ||
 -         input_tensor.dtype() == DataType::FLOAT32);
--    const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
++        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT32);
+     const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
 -    const bool is_fp16 = (input_tensor.dtype() == DataType::FLOAT16);
--    const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
--    const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
-+    const bool is_float_type = (dtype == DataType::BFLOAT16 || dtype == DataType::FLOAT32);
-+    const bool is_fp32 = (dtype == DataType::FLOAT32);
-+    const bool is_uint32 = (dtype == DataType::UINT32);
-+    const bool is_int32 = (dtype == DataType::INT32);
+     const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
+     const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
      // 32-bit integer types and unpacked UINT8 lanes need fp32_dest_acc_en
-     // so DST holds full 32-bit values
-     // and where_tile<UInt32/Int32> can use INT32-mode SFPLOAD/SFPSTORE correctly.
-     const bool need_fp32_dest_acc =
--        is_fp32 || is_uint32 || is_int32 || input_tensor.dtype() == DataType::UINT8;
-+        is_fp32 || is_uint32 || is_int32 || dtype == DataType::UINT8;
-     // Float types: raw bit pattern of fill_value for fill_tile_bitcast.
-     // Integer types: packed native bit pattern for fill_tile_int.
-     const std::uint32_t fill_bits = detail::pack_fill_value_for_dtype(input_tensor.dtype(), fill_value);
 @@ -169,7 +167,7 @@
  
      // ---- Defines ----
@@ -85,37 +72,27 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
      // has_right_pad / has_bottom_pad are promoted to preprocessor defines on the writer and
      // compute kernels (they gate the conditionally-bound right / bottom mask DFBs).
      auto mask_defines = fill_defines;
-@@ -366,7 +364,8 @@
+@@ -366,7 +364,7 @@
  
      const ttnn::PadValue& fill_value = operation_attributes.fill_value;
  
 -    const tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
-+    const DataType dtype = detail::fill_dtype(input_tensor.dtype());
-+    const tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(dtype);
++    const tt::DataFormat cb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
      tt::tt_metal::Buffer* tens_buffer = input_tensor.buffer();
      TT_FATAL(tens_buffer != nullptr, "Input buffer should be allocated on device!");
  
-@@ -495,15 +494,12 @@
-         group_ranges[key_of(ci)].emplace_back(ci.coord, ci.coord);
+@@ -496,10 +494,8 @@
      }
  
--    const bool is_float_type =
+     const bool is_float_type =
 -        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT16 ||
 -         input_tensor.dtype() == DataType::FLOAT32);
--    const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
++        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT32);
+     const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
 -    const bool is_fp16 = (input_tensor.dtype() == DataType::FLOAT16);
--    const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
--    const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
-+    const bool is_float_type = (dtype == DataType::BFLOAT16 || dtype == DataType::FLOAT32);
-+    const bool is_fp32 = (dtype == DataType::FLOAT32);
-+    const bool is_uint32 = (dtype == DataType::UINT32);
-+    const bool is_int32 = (dtype == DataType::INT32);
+     const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
+     const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
      const bool need_fp32_dest_acc =
--        is_fp32 || is_uint32 || is_int32 || input_tensor.dtype() == DataType::UINT8;
-+        is_fp32 || is_uint32 || is_int32 || dtype == DataType::UINT8;
-     const std::uint32_t fill_bits = detail::pack_fill_value_for_dtype(input_tensor.dtype(), fill_value);
- 
-     // ---- Named resources ----
 @@ -540,7 +536,7 @@
          "ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/kernels/compute/fill_pad_compute.cpp";
  
@@ -128,20 +105,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
 diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
 --- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
 +++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
-@@ -39,6 +39,12 @@
-     }
- }
- 
-+// Float16 is filled as UInt16, so its values pass through as raw bits: the Float16 where path
-+// zeroes the border tiles. pack_fill_value_for_dtype encodes a Float16 fill value as Float16 bits.
-+inline ttnn::DataType fill_dtype(ttnn::DataType dtype) {
-+    return dtype == ttnn::DataType::FLOAT16 ? ttnn::DataType::UINT16 : dtype;
-+}
-+
- // Dtype-directed wrapper used by both program factories. Chooses the native
- // fill type per dtype and packs it.
- // Float DataTypes (FLOAT32, BFLOAT16) keep the full float32 bit pattern — the
-@@ -56,8 +62,9 @@
+@@ -56,8 +56,9 @@
              case ttnn::DataType::UINT32: return fill_value;
              case ttnn::DataType::UINT8: return static_cast<std::uint8_t>(fill_value);
              case ttnn::DataType::UINT16: return pack_fill_value(static_cast<std::uint16_t>(fill_value));
@@ -152,7 +116,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
              case ttnn::DataType::FLOAT32: return pack_fill_value(static_cast<float>(fill_value));
              default: TT_THROW("fill_pad: unsupported dtype"); return 0u;
          }
-@@ -66,7 +73,7 @@
+@@ -66,7 +67,7 @@
      switch (dtype) {
          case ttnn::DataType::FLOAT32:
          case ttnn::DataType::BFLOAT16: return pack_fill_value(fill_value);
@@ -161,7 +125,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
          case ttnn::DataType::UINT8: return static_cast<std::uint8_t>(fill_value);
          case ttnn::DataType::UINT16: return pack_fill_value(static_cast<std::uint16_t>(fill_value));
          case ttnn::DataType::UINT32: return pack_fill_value(static_cast<std::uint32_t>(fill_value));
-@@ -81,7 +88,6 @@
+@@ -81,7 +82,6 @@
  inline std::string get_where_data_fmt(ttnn::DataType dtype) {
      switch (dtype) {
          case ttnn::DataType::FLOAT32: return "DataFormat::Float32";
@@ -199,8 +163,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_program_f
 -        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
 +        operations::data_movement::data_movement_format(tensor_args.input_tensor.dtype());
      const tt::DataFormat input_index_tensor_cb_data_format =
--        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
-+        operations::data_movement::data_movement_format(tensor_args.input_index_tensor.dtype());
+         tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
      const tt::DataFormat output_tensor_cb_data_format =
 -        tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
 +        operations::data_movement::data_movement_format(output_tensor.dtype());
@@ -214,8 +177,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_program_f
 -        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
 +        operations::data_movement::data_movement_format(tensor_args.input_tensor.dtype());
      const tt::DataFormat input_index_tensor_cb_data_format =
--        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
-+        operations::data_movement::data_movement_format(tensor_args.input_index_tensor.dtype());
+         tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
      const tt::DataFormat output_tensor_cb_data_format =
 -        tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
 +        operations::data_movement::data_movement_format(output_tensor.dtype());
@@ -229,8 +191,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_program_f
 -        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
 +        operations::data_movement::data_movement_format(tensor_args.input_tensor.dtype());
      const tt::DataFormat input_index_tensor_cb_data_format =
--        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
-+        operations::data_movement::data_movement_format(tensor_args.input_index_tensor.dtype());
+         tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
      const tt::DataFormat output_tensor_cb_data_format =
 -        tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
 +        operations::data_movement::data_movement_format(output_tensor.dtype());
@@ -244,8 +205,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_program_f
 -        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
 +        operations::data_movement::data_movement_format(tensor_args.input_tensor.dtype());
      const tt::DataFormat input_index_tensor_cb_data_format =
--        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
-+        operations::data_movement::data_movement_format(tensor_args.input_index_tensor.dtype());
+         tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
      const tt::DataFormat output_tensor_cb_data_format =
 -        tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
 +        operations::data_movement::data_movement_format(output_tensor.dtype());
@@ -518,41 +478,29 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_
 diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
-@@ -1006,7 +1006,19 @@
+@@ -1032,6 +1032,22 @@
+     }
+     auto output_data_format = datatype_to_dataformat_converter(output.dtype());
  
-     ProgramDescriptor desc;
- 
--    auto predicate_data_format = datatype_to_dataformat_converter(predicate_tensor.dtype());
 +    // where only selects values: where_tile<Float16_b> copies 16-bit patterns unchanged and tests the
-+    // predicate as a Float16_b number. Float16 values are moved as UInt16 bits instead of being unpacked,
-+    // which flushes subnormals and -0. Every input must then be UInt16, as each one is copied to Dest as
-+    // is; a bfloat16 or float16 predicate's bits still test as nonzero exactly for true.
++    // predicate as a Float16_b number. Float16 values are therefore moved as UInt16 bits rather than
++    // unpacked, which flushes subnormals and -0. All four buffers must agree, since each is copied to Dest
++    // as is; a bfloat16 or float16 predicate's bits still read as nonzero exactly when it is true.
 +    const bool select_bits =
 +        operation_attributes.ternary_op_type == TernaryOpType::WHERE && variant == TernaryVariant::TTT &&
 +        (predicate_tensor.dtype() == DataType::BFLOAT16 || predicate_tensor.dtype() == DataType::FLOAT16) &&
 +        value_true_tensor.value().dtype() == DataType::FLOAT16 &&
 +        value_false_tensor.value().dtype() == DataType::FLOAT16 && output.dtype() == DataType::FLOAT16;
-+    auto data_format = [&](DataType dtype) {
-+        return select_bits ? DataFormat::UInt16 : datatype_to_dataformat_converter(dtype);
-+    };
-+    auto predicate_data_format = data_format(predicate_tensor.dtype());
-     /*  The where_llk uses UINT16 instrn set for bfloat16 inputs.
-         If the bfloat16 inputs' CBs are set to UINT16 dataformat this will enable us to get 'NaN' in the outputs even
-        for bfloat16 dtype. We need to test the impact of this hack on the composite ops that use where op and on the
-@@ -1027,10 +1039,10 @@
-         value_true_data_format = value_false_data_format;
-     } else {
-         // TTT: both tensors exist
--        value_true_data_format = datatype_to_dataformat_converter(value_true_tensor.value().dtype());
--        value_false_data_format = datatype_to_dataformat_converter(value_false_tensor.value().dtype());
-+        value_true_data_format = data_format(value_true_tensor.value().dtype());
-+        value_false_data_format = data_format(value_false_tensor.value().dtype());
-     }
--    auto output_data_format = datatype_to_dataformat_converter(output.dtype());
-+    auto output_data_format = data_format(output.dtype());
- 
++    if (select_bits) {
++        predicate_data_format = DataFormat::UInt16;
++        value_true_data_format = DataFormat::UInt16;
++        value_false_data_format = DataFormat::UInt16;
++        output_data_format = DataFormat::UInt16;
++    }
++
      uint32_t predicate_single_tile_size = tt::tile_size(predicate_data_format);
      uint32_t value_true_single_tile_size = tt::tile_size(value_true_data_format);
+     uint32_t value_false_single_tile_size = tt::tile_size(value_false_data_format);
 diff --git ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
