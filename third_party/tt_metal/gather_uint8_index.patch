@@ -1,3 +1,4 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_device_operation.cpp
 @@ -126,8 +126,9 @@
@@ -12,6 +13,7 @@
          tensor_args.input_index_tensor.dtype());
      if (tensor_args.output_tensor.has_value()) {
          const auto output_shape = tensor_args.output_tensor.value().logical_shape();
+diff --git ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_device_operation.cpp
 @@ -68,8 +68,9 @@
