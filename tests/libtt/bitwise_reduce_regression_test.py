@@ -15,12 +15,6 @@ OPS = {
 }
 
 
-def reference(np_op, x, dims):
-    for dim in sorted(dims, reverse=True):
-        x = np_op(x, axis=dim)
-    return x
-
-
 def random_integers(dtype, shape, seed=0):
     info = np.iinfo(dtype)
     rng = np.random.default_rng(seed)
@@ -38,7 +32,7 @@ def run(fn, x):
 def test_integer_bitwise_reduce(op, dtype, dims):
     lax_op, np_op = OPS[op]
     x = random_integers(dtype, (3, 4, 5))
-    np.testing.assert_array_equal(run(lambda v: lax_op(v, dims), x), reference(np_op, x, dims))
+    np.testing.assert_array_equal(run(lambda v: lax_op(v, dims), x), np_op(x, axis=dims))
 
 
 # Several tiles along each reduced dimension, with partial tiles, so the
@@ -53,7 +47,7 @@ def test_multi_tile_bitwise_reduce(op, dims):
         x |= np.uint32(0xFFFF7FFE)
     elif op == "or":
         x &= np.uint32(0x00008001)
-    np.testing.assert_array_equal(run(lambda v: lax_op(v, dims), x), reference(np_op, x, dims))
+    np.testing.assert_array_equal(run(lambda v: lax_op(v, dims), x), np_op(x, axis=dims))
 
 
 # A single element decides the result, in a later tile of the reduced
@@ -74,13 +68,13 @@ def test_decisive_element_in_later_tile(op, dim):
 def test_narrow_integer_bitwise_reduce(op, dtype):
     lax_op, np_op = OPS[op]
     x = random_integers(dtype, (3, 4, 5), seed=2)
-    np.testing.assert_array_equal(run(lambda v: lax_op(v, (0, 2)), x), reference(np_op, x, (0, 2)))
+    np.testing.assert_array_equal(run(lambda v: lax_op(v, (0, 2)), x), np_op(x, axis=(0, 2)))
 
 
 @pytest.mark.parametrize("dims", [(0,), (1, 2), (0, 1, 2)], ids=["d0", "d12", "all"])
 def test_boolean_xor_reduce(dims):
     x = np.random.default_rng(3).random((3, 4, 5)) < 0.5
-    np.testing.assert_array_equal(run(lambda v: lax.reduce_xor(v, dims), x), reference(np.logical_xor.reduce, x, dims))
+    np.testing.assert_array_equal(run(lambda v: lax.reduce_xor(v, dims), x), np.logical_xor.reduce(x, axis=dims))
 
 
 # A non-identity init value is combined into the result.
@@ -94,7 +88,14 @@ def test_bitwise_reduce_with_init(op, init):
     x = random_integers(np.uint32, (3, 4, 5), seed=4)
     reducer = {"and": lax.bitwise_and, "or": lax.bitwise_or, "xor": lax.bitwise_xor}[op]
     got = run(lambda v: lax.reduce(v, np.uint32(init), reducer, (1,)), x)
-    np.testing.assert_array_equal(got, np_op(np.concatenate([x, np.full((3, 1, 5), init, np.uint32)], axis=1), axis=1))
+    np.testing.assert_array_equal(got, np_op(x, axis=1, initial=np.uint32(init)))
+
+
+# The reducer body may apply the op to its arguments in either order.
+def test_bitwise_reduce_reversed_operands():
+    x = random_integers(np.uint32, (3, 4, 5), seed=5)
+    got = run(lambda v: lax.reduce(v, np.uint32(0), lambda a, b: lax.bitwise_xor(b, a), (1,)), x)
+    np.testing.assert_array_equal(got, np.bitwise_xor.reduce(x, axis=1))
 
 
 # Reducing an empty dimension gives the identity: all ones for AND.
@@ -107,12 +108,8 @@ def test_empty_bitwise_reduce(op, dtype):
 
 
 # Only a body that is exactly the bitwise op lowers to the bitwise reduction:
-# ~(a ^ b) is associative but is not xor.
+# ~(a ^ b) is associative but is not xor, so it fails to legalize.
 def test_xnor_reducer_is_not_xor():
     x = np.zeros((3,), dtype=np.int32)
-    xnor = lambda a, b: ~(a ^ b)
-    try:
-        got = run(lambda v: lax.reduce(v, np.int32(-1), xnor, (0,)), x)
-    except Exception:
-        return  # Not lowered, rather than miscompiled.
-    np.testing.assert_array_equal(got, np.int32(0))
+    with pytest.raises(jax.errors.JaxRuntimeError, match="failed to legalize operation 'stablehlo.reduce'"):
+        run(lambda v: lax.reduce(v, np.int32(-1), lambda a, b: ~(a ^ b), (0,)), x)

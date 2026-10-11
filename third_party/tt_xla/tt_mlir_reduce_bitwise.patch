@@ -79,25 +79,42 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  class StableHLOToTTIRReduceOpConversionPattern
      : public OpConversionPattern<mlir::stablehlo::ReduceOp> {
  
-@@ -326,11 +329,15 @@
+@@ -326,11 +329,32 @@
        return matchAndRewriteInternal<mlir::tt::ttir::ProdOp>(srcOp, adaptor,
                                                               rewriter);
      }
 -    if (mlir::isa<mlir::stablehlo::AndOp>(innerOp)) {
-+    if (std::optional<BitwiseReducer> reducer = getBitwiseReducer(srcOp)) {
-+      return matchAndRewriteBitwise(srcOp, adaptor, *reducer, rewriter);
++    // Bitwise and/or on integers and xor on integers or booleans, when the
++    // body is exactly that op on its two arguments. On booleans, and/or are
++    // the logical reductions below.
++    using tt::stablehlo::utils::matchesBinaryReducer;
++    Block &body = srcOp.getBody().front();
++    bool isLogical = isBoolean(srcOp);
++    if (!isLogical && matchesBinaryReducer<mlir::stablehlo::AndOp>(body)) {
++      return matchAndRewriteBitwise<ttir::ReduceBitwiseAndOp,
++                                    ttir::BitwiseAndOp>(srcOp, adaptor,
++                                                        rewriter);
 +    }
-+    // On booleans, and/or are logical reductions.
-+    if (mlir::isa<mlir::stablehlo::AndOp>(innerOp) && isBoolean(srcOp)) {
++    if (!isLogical && matchesBinaryReducer<mlir::stablehlo::OrOp>(body)) {
++      return matchAndRewriteBitwise<ttir::ReduceBitwiseOrOp,
++                                    ttir::BitwiseOrOp>(srcOp, adaptor,
++                                                       rewriter);
++    }
++    if (matchesBinaryReducer<mlir::stablehlo::XorOp>(body)) {
++      return matchAndRewriteBitwise<ttir::ReduceBitwiseXorOp,
++                                    ttir::BitwiseXorOp>(srcOp, adaptor,
++                                                        rewriter);
++    }
++    if (isLogical && mlir::isa<mlir::stablehlo::AndOp>(innerOp)) {
        return matchAndRewriteInternal<mlir::tt::ttir::ReduceAndOp>(
            srcOp, adaptor, rewriter);
      }
 -    if (mlir::isa<mlir::stablehlo::OrOp>(innerOp)) {
-+    if (mlir::isa<mlir::stablehlo::OrOp>(innerOp) && isBoolean(srcOp)) {
++    if (isLogical && mlir::isa<mlir::stablehlo::OrOp>(innerOp)) {
        return matchAndRewriteInternal<mlir::tt::ttir::ReduceOrOp>(srcOp, adaptor,
                                                                   rewriter);
      }
-@@ -354,27 +361,128 @@
+@@ -354,27 +378,80 @@
            "Expecting StableHLO Reduce OP to have a body operation defined.");
      }
  
@@ -132,31 +149,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    });
 +  }
 +
-+  enum class BitwiseReducer { And, Or, Xor };
-+
-+  // A body that is exactly a bitwise and/or/xor of its two arguments, on
-+  // integers, or an xor of booleans (boolean and/or are logical reductions).
-+  static std::optional<BitwiseReducer>
-+  getBitwiseReducer(mlir::stablehlo::ReduceOp srcOp) {
-+    using mlir::tt::stablehlo::utils::matchesBinaryReducer;
-+    Block &body = srcOp.getBody().front();
-+    bool isLogical = isBoolean(srcOp);
-+    if (!isLogical && matchesBinaryReducer<mlir::stablehlo::AndOp>(body)) {
-+      return BitwiseReducer::And;
-+    }
-+    if (!isLogical && matchesBinaryReducer<mlir::stablehlo::OrOp>(body)) {
-+      return BitwiseReducer::Or;
-     }
-+    if (matchesBinaryReducer<mlir::stablehlo::XorOp>(body)) {
-+      return BitwiseReducer::Xor;
-+    }
-+    return std::nullopt;
-+  }
-+
 +  // Whether the init value is a constant identity: all ones for and, zero for
 +  // or and xor.
-+  static bool hasIdentityInit(mlir::stablehlo::ReduceOp srcOp,
-+                              BitwiseReducer reducer) {
++  static bool hasIdentityInit(mlir::stablehlo::ReduceOp srcOp, bool allOnes) {
 +    auto constant = srcOp.getInitValues()
 +                        .front()
 +                        .getDefiningOp<mlir::stablehlo::ConstantOp>();
@@ -165,19 +160,19 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +                 : nullptr;
 +    if (!init || !init.isSplat()) {
 +      return false;
-+    }
+     }
 +    APInt value = init.getSplatValue<APInt>();
-+    return reducer == BitwiseReducer::And ? value.isAllOnes() : value.isZero();
++    return allOnes ? value.isAllOnes() : value.isZero();
 +  }
  
 +  // Bitwise and/or/xor reductions run in 32-bit integers: booleans and
 +  // unsigned integers as ui32, others as si32 (exact, as bitwise ops commute
-+  // with zero and sign extension). A non-identity init is combined before the
-+  // result is narrowed back.
++  // with zero and sign extension). A non-identity init is combined with
++  // CombineOp before the result is narrowed back.
++  template <typename ReductionOp, typename CombineOp>
 +  LogicalResult
 +  matchAndRewriteBitwise(mlir::stablehlo::ReduceOp &srcOp,
 +                         mlir::stablehlo::ReduceOp::Adaptor &adaptor,
-+                         BitwiseReducer reducer,
 +                         ConversionPatternRewriter &rewriter) const {
 +    Location loc = srcOp.getLoc();
 +    auto outputType = mlir::cast<RankedTensorType>(
@@ -198,24 +193,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +                                    reduceElementType);
 +    mlir::ArrayAttr dimArg = rewriter.getI32ArrayAttr(
 +        llvm::SmallVector<int32_t>(srcOp.getDimensions()));
++    Value result = rewriter.create<ReductionOp>(loc, reduceType, input,
++                                                /*keep_dim=*/false, dimArg);
 +
-+    Value result;
-+    switch (reducer) {
-+    case BitwiseReducer::And:
-+      result = rewriter.create<ttir::ReduceBitwiseAndOp>(
-+          loc, reduceType, input, /*keep_dim=*/false, dimArg);
-+      break;
-+    case BitwiseReducer::Or:
-+      result = rewriter.create<ttir::ReduceBitwiseOrOp>(
-+          loc, reduceType, input, /*keep_dim=*/false, dimArg);
-+      break;
-+    case BitwiseReducer::Xor:
-+      result = rewriter.create<ttir::ReduceBitwiseXorOp>(
-+          loc, reduceType, input, /*keep_dim=*/false, dimArg);
-+      break;
-+    }
-+
-+    if (!hasIdentityInit(srcOp, reducer)) {
++    constexpr bool isAnd = std::is_same_v<CombineOp, ttir::BitwiseAndOp>;
++    if (!hasIdentityInit(srcOp, /*allOnes=*/isAnd)) {
 +      Value init;
 +      if (failed(ttir::utils::broadcastValue(
 +              rewriter,
@@ -225,20 +207,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        return rewriter.notifyMatchFailure(srcOp,
 +                                           "init value is not broadcastable");
 +      }
-+      switch (reducer) {
-+      case BitwiseReducer::And:
-+        result = rewriter.create<ttir::BitwiseAndOp>(loc, reduceType, result,
-+                                                     init);
-+        break;
-+      case BitwiseReducer::Or:
-+        result =
-+            rewriter.create<ttir::BitwiseOrOp>(loc, reduceType, result, init);
-+        break;
-+      case BitwiseReducer::Xor:
-+        result = rewriter.create<ttir::BitwiseXorOp>(loc, reduceType, result,
-+                                                     init);
-+        break;
-+      }
++      result = rewriter.create<CombineOp>(loc, reduceType, result, init);
 +    }
 +    rewriter.replaceOp(srcOp,
 +                       castToElementType(rewriter, loc, result, intType));
@@ -440,11 +409,12 @@ diff --git a/runtime/lib/ttnn/operations/reduction/reduction.cpp b/runtime/lib/t
 diff --git a/include/ttmlir/Dialect/StableHLO/Utils/Utils.h b/include/ttmlir/Dialect/StableHLO/Utils/Utils.h
 --- a/include/ttmlir/Dialect/StableHLO/Utils/Utils.h
 +++ b/include/ttmlir/Dialect/StableHLO/Utils/Utils.h
-@@ -40,6 +40,21 @@
+@@ -40,6 +40,26 @@
    return isTransposed;
  }
  
-+// Whether a reducer body is exactly `return BinaryOp(arg0, arg1)`.
++// Whether a reducer body is exactly `return BinaryOp(arg0, arg1)`, with the
++// arguments in either order (for commutative BinaryOp).
 +template <typename BinaryOp>
 +inline bool matchesBinaryReducer(Block &body) {
 +  if (body.getNumArguments() != 2 || body.getOperations().size() != 2) {
@@ -453,10 +423,14 @@ diff --git a/include/ttmlir/Dialect/StableHLO/Utils/Utils.h b/include/ttmlir/Dia
 +  auto binary = mlir::dyn_cast<BinaryOp>(body.front());
 +  auto returnOp =
 +      mlir::dyn_cast<::mlir::stablehlo::ReturnOp>(body.getTerminator());
-+  return binary && returnOp && returnOp.getNumOperands() == 1 &&
-+         binary.getLhs() == body.getArgument(0) &&
-+         binary.getRhs() == body.getArgument(1) &&
-+         returnOp.getOperand(0) == binary.getResult();
++  if (!binary || !returnOp || returnOp.getNumOperands() != 1 ||
++      returnOp.getOperand(0) != binary.getResult()) {
++    return false;
++  }
++  Value lhs = body.getArgument(0);
++  Value rhs = body.getArgument(1);
++  return (binary.getLhs() == lhs && binary.getRhs() == rhs) ||
++         (binary.getLhs() == rhs && binary.getRhs() == lhs);
 +}
 +
  } // namespace mlir::tt::stablehlo::utils
