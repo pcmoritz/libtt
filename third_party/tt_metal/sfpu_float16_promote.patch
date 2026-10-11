@@ -272,16 +272,18 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_progra
 diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
 --- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
 +++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
-@@ -8,6 +8,8 @@
+@@ -8,7 +8,10 @@
  #include <limits>
  #include <string_view>
  
 +#include <tt-metalium/experimental/distributed_tensor/distributed_tensor_apis.hpp>
 +
  #include "ttnn/distributed/types.hpp"
++#include "ttnn/operations/copy/typecast/typecast.hpp"
  #include "ttnn/operations/data_movement/pad/pad.hpp"
  #include "ttnn/operations/data_movement/tilize/tilize.hpp"
-@@ -22,6 +24,23 @@
+ #include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
+@@ -22,6 +25,23 @@
  namespace ttnn::operations::core::CMAKE_UNIQUE_NAMESPACE {
  namespace {
  
@@ -305,7 +307,7 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
  bool requires_padding_change(const ttnn::Tensor& tensor, ttnn::Layout layout) {
      if (layout == Layout::ROW_MAJOR) {
          // There shouldn't be extra paddings for Row Major layout
-@@ -77,6 +96,22 @@ Tensor to_layout_impl(
+@@ -77,6 +97,31 @@
          return tensor_arg;
      }
  
@@ -323,6 +325,15 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
 +        auto converted = to_layout_impl(
 +            raw, layout, DataType::UINT16, memory_config, sub_core_grids, static_cast<float>(pad_bits));
 +        return view_float16_bits(converted, float_dtype);
++    }
++
++    // Tilizing with a dtype change converts in the unpacker, which flushes FP16
++    // subnormals and -0 to +0. Tilize the FP16 bits unchanged, then typecast,
++    // which converts FP16 exactly.
++    if (tensor_arg.storage_type() == StorageType::DEVICE && tensor_arg.dtype() == DataType::FLOAT16 &&
++        layout == ttnn::TILE_LAYOUT && dtype.value_or(DataType::FLOAT16) != DataType::FLOAT16) {
++        auto tiled = to_layout_impl(tensor_arg, layout, DataType::FLOAT16, memory_config, sub_core_grids, pad_value);
++        return ttnn::typecast(tiled, dtype.value(), memory_config);
 +    }
 +
      const std::set<ttnn::Layout> supported_layouts = {
