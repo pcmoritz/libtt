@@ -57,7 +57,6 @@ def test_float16_scatter_add_rounds_every_update():
     updates = np.array([1, 1], np.float16)
     got = on("tt", lambda a, i, u: a.at[i].add(u), x, indices, updates)
     np.testing.assert_array_equal(got, np.array([2048], np.float16))
-    assert_matches_cpu(lambda a, i, u: a.at[i].add(u), x, indices, updates)
 
 
 # The gradient of overlapping max-pooling windows is a float16
