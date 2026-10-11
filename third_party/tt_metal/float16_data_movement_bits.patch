@@ -26,13 +26,18 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
  #include <algorithm>
  #include <bit>
  #include <map>
-@@ -36,13 +37,12 @@
+@@ -34,15 +35,15 @@
+ KernelSpec::CompilerOptions::Defines build_kernel_defines(
+     const Tensor& input_tensor,
      tt::DataFormat cb_data_format,
-     std::uint32_t input_element_size_bytes,
-     bool is_float_type,
+-    std::uint32_t input_element_size_bytes,
+-    bool is_float_type,
 -    bool is_fp32,
 -    bool is_fp16) {
-+    bool is_fp32) {
++    std::uint32_t input_element_size_bytes) {
++    // Float16 buffers are UInt16 by now, so they take the integer fill path.
++    const bool is_fp32 = cb_data_format == tt::DataFormat::Float32;
++    const bool is_float_type = is_fp32 || cb_data_format == tt::DataFormat::Float16_b;
      KernelSpec::CompilerOptions::Defines d;
      d.insert(
          {"MASK_ELEM_UINT",
@@ -42,7 +47,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
      d.insert({"FILL_PAD_DATA_FMT", detail::get_where_data_fmt(input_tensor.dtype())});
      if (!is_float_type) {
          d.insert(
-@@ -72,7 +72,7 @@
+@@ -72,7 +73,7 @@
      const ttnn::PadValue& fill_value = operation_attributes.fill_value;
      tt::tt_metal::IDevice* device = input_tensor.device();
  
@@ -51,28 +56,28 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
      TT_FATAL(input_tensor.buffer() != nullptr, "Input buffer should be allocated on device!");
  
      const std::uint32_t input_element_size_bytes = detail::data_type_to_size.at(input_tensor.dtype());
-@@ -93,10 +93,8 @@
+@@ -92,11 +93,7 @@
+     const bool has_right_pad = W_mod32 != 0;
      const bool has_bottom_pad = H_mod32 != 0;
  
-     const bool is_float_type =
+-    const bool is_float_type =
 -        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT16 ||
 -         input_tensor.dtype() == DataType::FLOAT32);
-+        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT32);
      const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
 -    const bool is_fp16 = (input_tensor.dtype() == DataType::FLOAT16);
      const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
      const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
      // 32-bit integer types and unpacked UINT8 lanes need fp32_dest_acc_en
-@@ -169,7 +167,7 @@
+@@ -169,7 +166,7 @@
  
      // ---- Defines ----
      const auto fill_defines = CMAKE_UNIQUE_NAMESPACE::build_kernel_defines(
 -        input_tensor, cb_data_format, input_element_size_bytes, is_float_type, is_fp32, is_fp16);
-+        input_tensor, cb_data_format, input_element_size_bytes, is_float_type, is_fp32);
++        input_tensor, cb_data_format, input_element_size_bytes);
      // has_right_pad / has_bottom_pad are promoted to preprocessor defines on the writer and
      // compute kernels (they gate the conditionally-bound right / bottom mask DFBs).
      auto mask_defines = fill_defines;
-@@ -366,7 +364,7 @@
+@@ -366,7 +363,7 @@
  
      const ttnn::PadValue& fill_value = operation_attributes.fill_value;
  
@@ -81,24 +86,24 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
      tt::tt_metal::Buffer* tens_buffer = input_tensor.buffer();
      TT_FATAL(tens_buffer != nullptr, "Input buffer should be allocated on device!");
  
-@@ -496,10 +494,8 @@
+@@ -495,11 +492,7 @@
+         group_ranges[key_of(ci)].emplace_back(ci.coord, ci.coord);
      }
  
-     const bool is_float_type =
+-    const bool is_float_type =
 -        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT16 ||
 -         input_tensor.dtype() == DataType::FLOAT32);
-+        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT32);
      const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
 -    const bool is_fp16 = (input_tensor.dtype() == DataType::FLOAT16);
      const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
      const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
      const bool need_fp32_dest_acc =
-@@ -540,7 +536,7 @@
+@@ -540,7 +533,7 @@
          "ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/kernels/compute/fill_pad_compute.cpp";
  
      const auto fill_defines = CMAKE_UNIQUE_NAMESPACE::build_kernel_defines(
 -        input_tensor, cb_data_format, input_element_size_bytes, is_float_type, is_fp32, is_fp16);
-+        input_tensor, cb_data_format, input_element_size_bytes, is_float_type, is_fp32);
++        input_tensor, cb_data_format, input_element_size_bytes);
  
      // ---- Build kernels + work units per group ----
      struct GroupInfo {
@@ -144,15 +149,6 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_prog
  
  namespace ttnn::operations::data_movement {
  
-@@ -51,7 +52,7 @@
-     const auto& input_mesh_tensor = input_tensor.mesh_tensor();
-     const auto& output_mesh_tensor = output_tensor.mesh_tensor();
- 
--    tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
-+    tt::DataFormat cb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
-     uint32_t input_rm_page_size = detail::page_size(input_tensor);
-     uint32_t output_rm_page_size = detail::page_size(tensor_return_value);
- 
 @@ -174,11 +175,11 @@
      const auto& input_mesh_tensor = input_tensor.mesh_tensor();
      const auto& output_mesh_tensor = output_tensor.mesh_tensor();
@@ -170,15 +166,6 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_prog
 diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
-@@ -27,7 +27,7 @@
- }
- 
- uint32_t tile_size(const ttnn::Tensor& input_tensor) {
--    auto dataformat = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
-+    auto dataformat = operations::data_movement::data_movement_format(input_tensor.dtype());
-     return tt::tile_size(dataformat);
- }
- 
 @@ -102,7 +102,7 @@
      const auto& input_mesh_tensor = input_tensor.mesh_tensor();
      const auto& output_mesh_tensor = output_tensor.mesh_tensor();

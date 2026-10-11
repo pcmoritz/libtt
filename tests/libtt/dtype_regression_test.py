@@ -42,3 +42,12 @@ def test_integer_narrowing_to_uint16_wraps(source):
     device_values = jax.device_put(values, jax.devices("tt")[0])
     actual = jax.jit(lambda x: x.astype(np.uint16))(device_values)
     np.testing.assert_array_equal(np.asarray(actual), values.astype(np.uint16))
+
+
+# A bool computed by an earlier program converts like one from the host.
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, jnp.bfloat16])
+def test_device_bool_conversion(dtype):
+    values = np.array([0.0, -1.0, 0.5, 0.0, 2.0], dtype=np.float32)
+    predicate = jax.jit(lambda x: x != 0)(jax.device_put(values, jax.devices("tt")[0]))
+    actual = jax.jit(lambda p: p.astype(dtype))(predicate)
+    np.testing.assert_array_equal(np.asarray(actual), (values != 0).astype(dtype))

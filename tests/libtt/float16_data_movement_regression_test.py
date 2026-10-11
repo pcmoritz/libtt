@@ -117,13 +117,12 @@ def test_float16_where_is_exact(shape):
     assert_same_bits(got, np.where(p, a, b))
 
 
-# A predicate produced on device arrives tiled, so turning it into a float16 predicate is a
-# dtype change without a layout change, which ttnn.to_layout used to skip.
+# A predicate computed by an earlier program reaches where as a device tensor; where keeps it
+# bfloat16 instead of converting it to float16.
 def test_float16_where_device_predicate():
     dev = jax.devices("tt")[0]
     c = np.array([0.0, -1.0, 0.5, 0.0, 2.0], np.float32)
     a = values((5,))
     p = jax.jit(lambda c: c != 0)(jax.device_put(c, dev))
-    np.testing.assert_array_equal(np.asarray(jax.jit(lambda p: p.astype(jnp.float16))(p)), (c != 0).astype(np.float16))
     got = jax.jit(lambda p, a, s: jnp.where(p, a, s))(p, jax.device_put(a, dev), jax.device_put(np.float16(0), dev))
     assert_same_bits(got, np.where(c != 0, a, np.float16(0)))
