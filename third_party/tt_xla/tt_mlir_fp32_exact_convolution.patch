@@ -1,0 +1,213 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -1973,6 +1973,201 @@
+   }
+ };
+ 
++// An FP32 convolution at the highest precision is lowered as im2col and an
++// FP32 dot_general at the highest precision, which runs with FP32 products and
++// sums on the vector unit (the TTNN convolution reads FP32 inputs as TF32).
++// The patches are one strided slice of the zero-padded input per kernel
++// offset, concatenated along the features. Built from StableHLO ops, which the
++// other patterns then convert; it runs before the other convolution patterns.
++struct ConvolutionFp32ExactPattern
++    : public OpConversionPattern<mlir::stablehlo::ConvolutionOp> {
++  ConvolutionFp32ExactPattern(TypeConverter &typeConverter, MLIRContext *ctx)
++      : OpConversionPattern(typeConverter, ctx, /*benefit=*/10) {}
++
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::ConvolutionOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    // Each kernel offset adds a slice of the input.
++    constexpr int64_t maxWindowSize = 256;
++    auto lhsType = mlir::cast<RankedTensorType>(op.getLhs().getType());
++    auto rhsType = mlir::cast<RankedTensorType>(op.getRhs().getType());
++    auto resultType = mlir::cast<RankedTensorType>(op.getType());
++    if (!lhsType.getElementType().isF32() ||
++        !rhsType.getElementType().isF32() ||
++        !resultType.getElementType().isF32() || !asksForHighestPrecision(op) ||
++        !lhsType.hasStaticShape() || !rhsType.hasStaticShape() ||
++        !resultType.hasStaticShape() || resultType.getNumElements() == 0 ||
++        op.getFeatureGroupCount() != 1 || op.getBatchGroupCount() != 1 ||
++        (op.getWindowReversal() &&
++         llvm::is_contained(*op.getWindowReversal(), true))) {
++      return rewriter.notifyMatchFailure(
++          op, "not an ungrouped FP32 convolution at the highest precision");
++    }
++
++    mlir::stablehlo::ConvDimensionNumbersAttr dims = op.getDimensionNumbers();
++    ArrayRef<int64_t> inputSpatial = dims.getInputSpatialDimensions();
++    ArrayRef<int64_t> kernelSpatial = dims.getKernelSpatialDimensions();
++    ArrayRef<int64_t> outputSpatial = dims.getOutputSpatialDimensions();
++    int64_t numSpatial = inputSpatial.size();
++    auto orOnes = [&](std::optional<ArrayRef<int64_t>> values) {
++      return values ? SmallVector<int64_t>(*values)
++                    : SmallVector<int64_t>(numSpatial, 1);
++    };
++    SmallVector<int64_t> strides = orOnes(op.getWindowStrides());
++    SmallVector<int64_t> kernelDilations = orOnes(op.getRhsDilation());
++    if (llvm::any_of(orOnes(op.getLhsDilation()),
++                     [](int64_t d) { return d != 1; })) {
++      return rewriter.notifyMatchFailure(op, "input dilation");
++    }
++    SmallVector<int64_t> padLow(numSpatial, 0), padHigh(numSpatial, 0);
++    if (std::optional<DenseIntElementsAttr> padding = op.getPadding()) {
++      auto values = llvm::to_vector(padding->getValues<int64_t>());
++      for (int64_t i = 0; i < numSpatial; ++i) {
++        padLow[i] = values[2 * i];
++        padHigh[i] = values[2 * i + 1];
++      }
++    }
++    if (llvm::any_of(padLow, [](int64_t p) { return p < 0; }) ||
++        llvm::any_of(padHigh, [](int64_t p) { return p < 0; })) {
++      return rewriter.notifyMatchFailure(op, "negative padding");
++    }
++    SmallVector<int64_t> window;
++    int64_t windowSize = 1;
++    for (int64_t dim : kernelSpatial) {
++      window.push_back(rhsType.getDimSize(dim));
++      windowSize *= window.back();
++    }
++    if (windowSize > maxWindowSize) {
++      return rewriter.notifyMatchFailure(op, "kernel window too large");
++    }
++
++    Location loc = op.getLoc();
++    Type f32 = rewriter.getF32Type();
++    auto transpose = [&](Value value, ArrayRef<int64_t> permutation) -> Value {
++      auto type = mlir::cast<RankedTensorType>(value.getType());
++      SmallVector<int64_t> shape;
++      for (int64_t dim : permutation) {
++        shape.push_back(type.getDimSize(dim));
++      }
++      return rewriter.create<mlir::stablehlo::TransposeOp>(
++          loc, RankedTensorType::get(shape, f32), value,
++          rewriter.getDenseI64ArrayAttr(permutation));
++    };
++
++    // The input as [batch, spatial..., features], zero-padded.
++    SmallVector<int64_t> inputPermutation = {dims.getInputBatchDimension()};
++    llvm::append_range(inputPermutation, inputSpatial);
++    inputPermutation.push_back(dims.getInputFeatureDimension());
++    Value input = transpose(op.getLhs(), inputPermutation);
++    int64_t batch = lhsType.getDimSize(dims.getInputBatchDimension());
++    int64_t features = lhsType.getDimSize(dims.getInputFeatureDimension());
++    if (llvm::any_of(padLow, [](int64_t p) { return p != 0; }) ||
++        llvm::any_of(padHigh, [](int64_t p) { return p != 0; })) {
++      SmallVector<int64_t> low = {0}, high = {0};
++      llvm::append_range(low, padLow);
++      llvm::append_range(high, padHigh);
++      low.push_back(0);
++      high.push_back(0);
++      SmallVector<int64_t> shape(
++          mlir::cast<RankedTensorType>(input.getType()).getShape());
++      for (int64_t i = 0; i < numSpatial; ++i) {
++        shape[i + 1] += padLow[i] + padHigh[i];
++      }
++      Value zero = rewriter.create<mlir::stablehlo::ConstantOp>(
++          loc, DenseElementsAttr::get(RankedTensorType::get({}, f32),
++                                      rewriter.getF32FloatAttr(0.0f)));
++      input = rewriter.create<mlir::stablehlo::PadOp>(
++          loc, RankedTensorType::get(shape, f32), input, zero, low, high,
++          SmallVector<int64_t>(numSpatial + 2, 0));
++    }
++
++    // One strided slice per kernel offset (row-major over the kernel's spatial
++    // dimensions), concatenated along the features.
++    SmallVector<int64_t> outShape = {batch};
++    for (int64_t dim : outputSpatial) {
++      outShape.push_back(resultType.getDimSize(dim));
++    }
++    SmallVector<Value> patches;
++    SmallVector<int64_t> offset(numSpatial, 0);
++    for (int64_t n = 0; n < windowSize; ++n) {
++      SmallVector<int64_t> start = {0}, limit = {batch}, step = {1};
++      for (int64_t i = 0; i < numSpatial; ++i) {
++        start.push_back(offset[i] * kernelDilations[i]);
++        limit.push_back(start.back() + (outShape[i + 1] - 1) * strides[i] + 1);
++        step.push_back(strides[i]);
++      }
++      start.push_back(0);
++      limit.push_back(features);
++      step.push_back(1);
++      patches.push_back(rewriter.create<mlir::stablehlo::SliceOp>(
++          loc, input, rewriter.getDenseI64ArrayAttr(start),
++          rewriter.getDenseI64ArrayAttr(limit),
++          rewriter.getDenseI64ArrayAttr(step)));
++      for (int64_t i = numSpatial - 1; i >= 0; --i) {
++        if (++offset[i] < window[i]) {
++          break;
++        }
++        offset[i] = 0;
++      }
++    }
++    SmallVector<int64_t> patchShape(outShape);
++    patchShape.push_back(windowSize * features);
++    Value patchMatrix =
++        patches.size() == 1
++            ? patches.front()
++            : rewriter.create<mlir::stablehlo::ConcatenateOp>(
++                  loc, RankedTensorType::get(patchShape, f32), patches,
++                  numSpatial + 1);
++
++    // The kernel as [spatial..., input features, output features], flattened
++    // to match the patches.
++    SmallVector<int64_t> kernelPermutation(kernelSpatial);
++    kernelPermutation.push_back(dims.getKernelInputFeatureDimension());
++    kernelPermutation.push_back(dims.getKernelOutputFeatureDimension());
++    int64_t outputFeatures =
++        rhsType.getDimSize(dims.getKernelOutputFeatureDimension());
++    Value kernel = rewriter.create<mlir::stablehlo::ReshapeOp>(
++        loc, RankedTensorType::get({windowSize * features, outputFeatures}, f32),
++        transpose(op.getRhs(), kernelPermutation));
++
++    auto highest = mlir::stablehlo::PrecisionAttr::get(
++        rewriter.getContext(), mlir::stablehlo::Precision::HIGHEST);
++    SmallVector<int64_t> productShape(outShape);
++    productShape.push_back(outputFeatures);
++    Value product = rewriter.create<mlir::stablehlo::DotGeneralOp>(
++        loc, RankedTensorType::get(productShape, f32), patchMatrix, kernel,
++        mlir::stablehlo::DotDimensionNumbersAttr::get(
++            rewriter.getContext(), /*lhsBatchingDimensions=*/{},
++            /*rhsBatchingDimensions=*/{},
++            /*lhsContractingDimensions=*/{numSpatial + 1},
++            /*rhsContractingDimensions=*/{0}),
++        rewriter.getArrayAttr({highest, highest}),
++        /*algorithm=*/nullptr);
++
++    // Back to the convolution's output layout.
++    SmallVector<int64_t> outputPermutation(numSpatial + 2);
++    outputPermutation[dims.getOutputBatchDimension()] = 0;
++    for (int64_t i = 0; i < numSpatial; ++i) {
++      outputPermutation[outputSpatial[i]] = i + 1;
++    }
++    outputPermutation[dims.getOutputFeatureDimension()] = numSpatial + 1;
++    rewriter.replaceOp(op, transpose(product, outputPermutation));
++    return success();
++  }
++
++private:
++  static bool asksForHighestPrecision(mlir::stablehlo::ConvolutionOp op) {
++    if (!op.getPrecisionConfig()) {
++      return false;
++    }
++    return llvm::any_of(*op.getPrecisionConfig(), [](mlir::Attribute attr) {
++      auto precision = mlir::dyn_cast<mlir::stablehlo::PrecisionAttr>(attr);
++      return precision &&
++             precision.getValue() == mlir::stablehlo::Precision::HIGHEST;
++    });
++  }
++};
++
+ struct ConvolutionInputDilationPattern
+     : public ConvolutionDecompositionPattern {
+   ConvolutionInputDilationPattern(TypeConverter &typeConverter,
+@@ -12605,6 +12800,7 @@
+   patterns.add<StableHLOToTTIRConvolutionOpConversionPattern>(typeConverter,
+                                                               ctx);
+   patterns.add<Convolution0DToDotGeneralPattern>(typeConverter, ctx);
++  patterns.add<ConvolutionFp32ExactPattern>(typeConverter, ctx);
+   patterns.add<ConvolutionInputDilationPattern>(typeConverter, ctx);
+   patterns.add<Legalize1DConvolutionPattern>(typeConverter, ctx);
+   patterns.add<ConvolutionToConv2dPattern>(typeConverter, ctx);
