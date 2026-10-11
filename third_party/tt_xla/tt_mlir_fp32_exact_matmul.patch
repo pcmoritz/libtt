@@ -254,3 +254,19 @@ index f196225..d02d983 100644
      output = ::ttnn::matmul_swiglu(
          lhs, rhs, outputMemoryConfig, outputDataType, computeConfig);
    } else {
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNWeightDtypeConversion.cpp b/lib/Dialect/TTNN/Transforms/TTNNWeightDtypeConversion.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNWeightDtypeConversion.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNWeightDtypeConversion.cpp
+@@ -42,6 +42,12 @@ public:
+ 
+   mlir::LogicalResult
+   matchAndRewrite(OpTy op, mlir::PatternRewriter &rewriter) const override {
++    // A matmul marked exact runs as matmul_fp32, which takes FP32 operands
++    // only: its weight keeps its dtype whatever the per-op or global one.
++    if (op->hasAttr("ttcore.fp32_exact")) {
++      return mlir::failure();
++    }
++
+     // Get the weight operand (B operand).
+     auto weight = op.getB();
+ 

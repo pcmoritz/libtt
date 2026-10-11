@@ -136,3 +136,39 @@ def test_exact_matmul_layouts_at_o2(tmp_path):
     for line in matmuls:
         for alias in re.findall(r"tensor<[^>]*?, (#ttnn_layout\d*)>", line):
             assert "sharded" not in layouts[alias], f"an exact matmul got a sharded layout: {layouts[alias]}"
+
+
+@pytest.mark.parametrize("global_dtype", [None, "bfp_bf8"])
+@pytest.mark.parametrize("weight_dtype", ["bfp_bf8", "bf16"])
+def test_exact_matmul_keeps_marked_weight(weight_dtype, global_dtype, tmp_path):
+    """A weight marked for a narrower dtype stays FP32 in an exact matmul.
+
+    sglang-jax's MoE gate computes its logits from a BF16 weight in FP32 at HIGHEST, and its TT backend
+    marks weights bfp_bf8. Converting the gate's weight failed at run time, since matmul_fp32 takes FP32
+    operands only. An ordinary matmul of the same weight still gets the marked dtype.
+    """
+    rng = np.random.default_rng(6)
+    # Qwen3-30B-A3B's gate: one token of 2048 features, 128 experts.
+    x = rng.standard_normal((1, 2048)).astype(jnp.bfloat16)
+    w = (rng.standard_normal((2048, 128)) / 32).astype(jnp.bfloat16)
+    device = jax.devices("tt")[0]
+
+    def gate(x, w):
+        w = jax.ffi.ffi_call("tt.weight_dtype_override", jax.ShapeDtypeStruct(w.shape, w.dtype))(
+            w, **{"ttcore.weight_dtype": weight_dtype}
+        )
+        exact = jnp.dot(x.astype(jnp.float32), w.astype(jnp.float32), precision=lax.Precision.HIGHEST)
+        return exact, jnp.dot(x, w)
+
+    options = {"optimization_level": "O1", "export_path": str(tmp_path)}
+    if global_dtype:
+        options["experimental_weight_dtype"] = global_dtype
+    exact, ordinary = jax.jit(gate, compiler_options=options)(jax.device_put(x, device), jax.device_put(w, device))
+    assert error(exact, x, w) <= 2048 * 2.0**-24, f"the exact matmul is off by {error(exact, x, w):.3g}"
+    np.testing.assert_allclose(
+        np.asarray(ordinary, np.float32), x.astype(np.float32) @ w.astype(np.float32), rtol=5e-2, atol=5e-2
+    )
+    ir = ttnn_ir(tmp_path)
+    assert "ttcore.fp32_exact" in ir
+    if weight_dtype == "bfp_bf8":
+        assert "bfp_bf8>" in ir, "the ordinary matmul's weight was not converted"
