@@ -1,8 +1,8 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
-@@ -99,9 +99,11 @@ ttnn::device_operation::ProgramArtifacts FillPadProgramFactory::create_program_a
-     const bool is_fp16 = (input_tensor.dtype() == DataType::FLOAT16);
+@@ -96,9 +96,11 @@ ttnn::device_operation::ProgramArtifacts FillPadProgramFactory::create_program_a
+     const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
      const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
      const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
 -    // 32-bit integer types need fp32_dest_acc_en so DST holds full 32-bit values
@@ -15,8 +15,8 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
      // Float types: raw bit pattern of fill_value for fill_tile_bitcast.
      // Integer types: packed native bit pattern for fill_tile_int.
      const std::uint32_t fill_bits = detail::pack_fill_value_for_dtype(input_tensor.dtype(), fill_value);
-@@ -500,7 +502,8 @@ ttnn::device_operation::ProgramArtifacts FillPadL1ShardedProgramFactory::create_
-     const bool is_fp16 = (input_tensor.dtype() == DataType::FLOAT16);
+@@ -495,7 +497,8 @@ ttnn::device_operation::ProgramArtifacts FillPadL1ShardedProgramFactory::create_
+     const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
      const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
      const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
 -    const bool need_fp32_dest_acc = is_fp32 || is_uint32 || is_int32;
@@ -84,7 +84,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_p
          }
      }
  
-@@ -790,7 +795,8 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreTiledG
+@@ -787,7 +792,8 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreTiledG
  
      // ---- Compute config (Style B: build ComputeGen1Config directly, mirroring legacy) ----
      bool fp32_dest_acc_en = cb_data_format == tt::DataFormat::Float32 || cb_data_format == tt::DataFormat::Int32 ||
