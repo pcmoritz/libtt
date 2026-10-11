@@ -1,0 +1,560 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/common/common.hpp ttnn/cpp/ttnn/operations/data_movement/common/common.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/common/common.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/common/common.hpp
+@@ -18,6 +18,13 @@
+ 
+ namespace ttnn::operations::data_movement {
+ 
++// Data movement only copies values, so a Float16 tensor is moved as UInt16 and no kernel interprets it.
++// Unpacking Float16 flushes subnormals and -0 to +0.
++inline tt::DataFormat data_movement_format(DataType dtype) {
++    return dtype == DataType::FLOAT16 ? tt::DataFormat::UInt16
++                                      : tt::tt_metal::datatype_to_dataformat_converter(dtype);
++}
++
+ ttnn::Shape squeeze_shape_to_ND(const ttnn::Shape& output_shape, uint32_t);
+ ttnn::Shape squeeze_shape_to_4D(const ttnn::Shape& output_shape);
+ ttnn::Shape squeeze_shape_to_3D(const ttnn::Shape& output_shape);
+diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
+@@ -43,11 +43,12 @@
+         {"MASK_ELEM_UINT",
+          input_element_size_bytes == 1 ? "uint8_t" : input_element_size_bytes == 2 ? "uint16_t" : "uint32_t"});
+     d.insert({"MASK_VALUE", is_fp32 ? "0x3F800000u" : is_fp16 ? "0x3C00u" : is_float_type ? "0x3F80u" : "1u"});
+-    d.insert({"FILL_PAD_DATA_FMT", detail::get_where_data_fmt(input_tensor.dtype())});
++    const DataType dtype = detail::fill_dtype(input_tensor.dtype());
++    d.insert({"FILL_PAD_DATA_FMT", detail::get_where_data_fmt(dtype)});
+     if (!is_float_type) {
+         d.insert(
+             {"FILL_PAD_FILL_DATA_FMT",
+-             input_tensor.dtype() == DataType::UINT8 ? std::string("DataFormat::UInt32")
++             dtype == DataType::UINT8 ? std::string("DataFormat::UInt32")
+                                                      : fmt::format("DataFormat::{}", cb_data_format)});
+     }
+     d.insert({"FILL_PAD_FILL_FN", is_float_type ? "fill_tile_bitcast" : "fill_tile_int<FILL_PAD_FILL_DATA_FMT>"});
+@@ -72,7 +73,8 @@
+     const ttnn::PadValue& fill_value = operation_attributes.fill_value;
+     tt::tt_metal::IDevice* device = input_tensor.device();
+ 
+-    const tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
++    const DataType dtype = detail::fill_dtype(input_tensor.dtype());
++    const tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(dtype);
+     TT_FATAL(input_tensor.buffer() != nullptr, "Input buffer should be allocated on device!");
+ 
+     const std::uint32_t input_element_size_bytes = detail::data_type_to_size.at(input_tensor.dtype());
+@@ -93,17 +95,16 @@
+     const bool has_bottom_pad = H_mod32 != 0;
+ 
+     const bool is_float_type =
+-        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT16 ||
+-         input_tensor.dtype() == DataType::FLOAT32);
+-    const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
+-    const bool is_fp16 = (input_tensor.dtype() == DataType::FLOAT16);
+-    const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
+-    const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
++        (dtype == DataType::BFLOAT16 || dtype == DataType::FLOAT16 || dtype == DataType::FLOAT32);
++    const bool is_fp32 = (dtype == DataType::FLOAT32);
++    const bool is_fp16 = (dtype == DataType::FLOAT16);
++    const bool is_uint32 = (dtype == DataType::UINT32);
++    const bool is_int32 = (dtype == DataType::INT32);
+     // 32-bit integer types and unpacked UINT8 lanes need fp32_dest_acc_en
+     // so DST holds full 32-bit values
+     // and where_tile<UInt32/Int32> can use INT32-mode SFPLOAD/SFPSTORE correctly.
+     const bool need_fp32_dest_acc =
+-        is_fp32 || is_uint32 || is_int32 || input_tensor.dtype() == DataType::UINT8;
++        is_fp32 || is_uint32 || is_int32 || dtype == DataType::UINT8;
+     // Float types: raw bit pattern of fill_value for fill_tile_bitcast.
+     // Integer types: packed native bit pattern for fill_tile_int.
+     const std::uint32_t fill_bits = detail::pack_fill_value_for_dtype(input_tensor.dtype(), fill_value);
+@@ -366,7 +367,8 @@
+ 
+     const ttnn::PadValue& fill_value = operation_attributes.fill_value;
+ 
+-    const tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
++    const DataType dtype = detail::fill_dtype(input_tensor.dtype());
++    const tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(dtype);
+     tt::tt_metal::Buffer* tens_buffer = input_tensor.buffer();
+     TT_FATAL(tens_buffer != nullptr, "Input buffer should be allocated on device!");
+ 
+@@ -496,14 +498,13 @@
+     }
+ 
+     const bool is_float_type =
+-        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT16 ||
+-         input_tensor.dtype() == DataType::FLOAT32);
+-    const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
+-    const bool is_fp16 = (input_tensor.dtype() == DataType::FLOAT16);
+-    const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
+-    const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
++        (dtype == DataType::BFLOAT16 || dtype == DataType::FLOAT16 || dtype == DataType::FLOAT32);
++    const bool is_fp32 = (dtype == DataType::FLOAT32);
++    const bool is_fp16 = (dtype == DataType::FLOAT16);
++    const bool is_uint32 = (dtype == DataType::UINT32);
++    const bool is_int32 = (dtype == DataType::INT32);
+     const bool need_fp32_dest_acc =
+-        is_fp32 || is_uint32 || is_int32 || input_tensor.dtype() == DataType::UINT8;
++        is_fp32 || is_uint32 || is_int32 || dtype == DataType::UINT8;
+     const std::uint32_t fill_bits = detail::pack_fill_value_for_dtype(input_tensor.dtype(), fill_value);
+ 
+     // ---- Named resources ----
+diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
+@@ -39,6 +39,12 @@
+     }
+ }
+ 
++// Float16 is filled as UInt16, so its values pass through as raw bits: the Float16 where path
++// zeroes the border tiles. pack_fill_value_for_dtype encodes a Float16 fill value as Float16 bits.
++inline ttnn::DataType fill_dtype(ttnn::DataType dtype) {
++    return dtype == ttnn::DataType::FLOAT16 ? ttnn::DataType::UINT16 : dtype;
++}
++
+ // Dtype-directed wrapper used by both program factories. Chooses the native
+ // fill type per dtype and packs it.
+ // Float DataTypes (FLOAT32, BFLOAT16) keep the full float32 bit pattern — the
+@@ -56,8 +62,9 @@
+             case ttnn::DataType::UINT32: return fill_value;
+             case ttnn::DataType::UINT8: return static_cast<std::uint8_t>(fill_value);
+             case ttnn::DataType::UINT16: return pack_fill_value(static_cast<std::uint16_t>(fill_value));
+-            case ttnn::DataType::BFLOAT16:
+             case ttnn::DataType::FLOAT16:
++                return pack_fill_value(tt::tt_metal::float16(static_cast<float>(fill_value)).bits);
++            case ttnn::DataType::BFLOAT16:
+             case ttnn::DataType::FLOAT32: return pack_fill_value(static_cast<float>(fill_value));
+             default: TT_THROW("fill_pad: unsupported dtype"); return 0u;
+         }
+@@ -66,7 +73,7 @@
+     switch (dtype) {
+         case ttnn::DataType::FLOAT32:
+         case ttnn::DataType::BFLOAT16: return pack_fill_value(fill_value);
+-        case ttnn::DataType::FLOAT16: return pack_fill_value(fill_value);
++        case ttnn::DataType::FLOAT16: return pack_fill_value(tt::tt_metal::float16(fill_value).bits);
+         case ttnn::DataType::UINT8: return static_cast<std::uint8_t>(fill_value);
+         case ttnn::DataType::UINT16: return pack_fill_value(static_cast<std::uint16_t>(fill_value));
+         case ttnn::DataType::UINT32: return pack_fill_value(static_cast<std::uint32_t>(fill_value));
+diff --git ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_program_factory.cpp
+@@ -17,6 +17,7 @@
+ #include <tt-metalium/work_split.hpp>
+ 
+ #include "gather_codegen_device_operation.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ namespace ttnn::prim {
+ using namespace tt::tt_metal;
+@@ -158,7 +159,7 @@
+ }
+ 
+ CBDescriptor make_tile_cb(uint32_t cb_id, const Tensor& tensor, uint32_t depth, const CoreRangeSet& core_range) {
+-    const tt::DataFormat data_format = tt::tt_metal::datatype_to_dataformat_converter(tensor.dtype());
++    const tt::DataFormat data_format = operations::data_movement::data_movement_format(tensor.dtype());
+     const uint32_t page_size = tensor.buffer()->aligned_page_size();
+     return CBDescriptor{
+         .total_size = depth * page_size,
+diff --git ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_program_factory.cpp
+@@ -41,11 +41,11 @@
+ ProgramDescriptor GatherDeviceOperation::SingleRowSingleCore::create_descriptor(
+     const GatherParams& attributes, const GatherInputs& tensor_args, Tensor& output_tensor) {
+     const tt::DataFormat input_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
++        operations::data_movement::data_movement_format(tensor_args.input_tensor.dtype());
+     const tt::DataFormat input_index_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
++        operations::data_movement::data_movement_format(tensor_args.input_index_tensor.dtype());
+     const tt::DataFormat output_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
++        operations::data_movement::data_movement_format(output_tensor.dtype());
+ 
+     const uint32_t input_tensor_tile_size = tile_size(input_tensor_cb_data_format);
+     const uint32_t input_index_tensor_tile_size = tile_size(input_index_tensor_cb_data_format);
+@@ -197,11 +197,11 @@
+ ProgramDescriptor GatherDeviceOperation::SingleRowMultiCore::create_descriptor(
+     const GatherParams& attributes, const GatherInputs& tensor_args, Tensor& output_tensor) {
+     const tt::DataFormat input_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
++        operations::data_movement::data_movement_format(tensor_args.input_tensor.dtype());
+     const tt::DataFormat input_index_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
++        operations::data_movement::data_movement_format(tensor_args.input_index_tensor.dtype());
+     const tt::DataFormat output_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
++        operations::data_movement::data_movement_format(output_tensor.dtype());
+ 
+     const uint32_t input_tensor_tile_size = tile_size(input_tensor_cb_data_format);
+     const uint32_t input_index_tensor_tile_size = tile_size(input_index_tensor_cb_data_format);
+@@ -357,11 +357,11 @@
+ ProgramDescriptor GatherDeviceOperation::RmSingleRowSingleCore::create_descriptor(
+     const GatherParams& attributes, const GatherInputs& tensor_args, Tensor& output_tensor) {
+     const tt::DataFormat input_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
++        operations::data_movement::data_movement_format(tensor_args.input_tensor.dtype());
+     const tt::DataFormat input_index_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
++        operations::data_movement::data_movement_format(tensor_args.input_index_tensor.dtype());
+     const tt::DataFormat output_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
++        operations::data_movement::data_movement_format(output_tensor.dtype());
+ 
+     auto* input_tensor_buffer = tensor_args.input_tensor.buffer();
+     auto* input_index_tensor_buffer = tensor_args.input_index_tensor.buffer();
+@@ -514,11 +514,11 @@
+ ProgramDescriptor GatherDeviceOperation::RmSingleRowMultiCore::create_descriptor(
+     const GatherParams& attributes, const GatherInputs& tensor_args, Tensor& output_tensor) {
+     const tt::DataFormat input_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
++        operations::data_movement::data_movement_format(tensor_args.input_tensor.dtype());
+     const tt::DataFormat input_index_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
++        operations::data_movement::data_movement_format(tensor_args.input_index_tensor.dtype());
+     const tt::DataFormat output_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
++        operations::data_movement::data_movement_format(output_tensor.dtype());
+ 
+     auto* const input_tensor_buffer = tensor_args.input_tensor.buffer();
+     auto* const input_index_tensor_buffer = tensor_args.input_index_tensor.buffer();
+diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp
+@@ -9,6 +9,7 @@
+ #include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
+ #include <tt-metalium/experimental/metal2_host_api/program_run_args.hpp>
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ namespace ttnn::operations::data_movement {
+ 
+@@ -51,7 +52,7 @@
+     const auto& input_mesh_tensor = input_tensor.mesh_tensor();
+     const auto& output_mesh_tensor = output_tensor.mesh_tensor();
+ 
+-    tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
++    tt::DataFormat cb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
+     uint32_t input_rm_page_size = detail::page_size(input_tensor);
+     uint32_t output_rm_page_size = detail::page_size(tensor_return_value);
+ 
+@@ -174,11 +175,11 @@
+     const auto& input_mesh_tensor = input_tensor.mesh_tensor();
+     const auto& output_mesh_tensor = output_tensor.mesh_tensor();
+ 
+-    tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
++    tt::DataFormat cb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
+     uint32_t w_block_size = constants::TILE_WIDTH;
+     uint32_t input_cb_page_size = w_block_size * input_tensor.element_size();
+ 
+-    tt::DataFormat cb_data_format_output = tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
++    tt::DataFormat cb_data_format_output = operations::data_movement::data_movement_format(output_tensor.dtype());
+     uint32_t x_block_size = constants::TILE_HEIGHT;
+     uint32_t output_cb_page_size = x_block_size * input_tensor.element_size();
+ 
+diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
+@@ -27,7 +27,7 @@
+ }
+ 
+ uint32_t tile_size(const ttnn::Tensor& input_tensor) {
+-    auto dataformat = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
++    auto dataformat = operations::data_movement::data_movement_format(input_tensor.dtype());
+     return tt::tile_size(dataformat);
+ }
+ 
+@@ -102,7 +102,7 @@
+     const auto& input_mesh_tensor = input_tensor.mesh_tensor();
+     const auto& output_mesh_tensor = output_tensor.mesh_tensor();
+ 
+-    tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
++    tt::DataFormat cb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
+     uint32_t input_page_size = detail::tile_size(input_tensor);
+     uint32_t num_tiles = detail::num_tiles(tensor_return_value);
+     uint32_t num_input_pages_to_read = 2;
+@@ -306,7 +306,7 @@
+     const auto& input_mesh_tensor = input_tensor.mesh_tensor();
+     const auto& output_mesh_tensor = output_tensor.mesh_tensor();
+ 
+-    tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
++    tt::DataFormat cb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
+     uint32_t input_page_size = detail::tile_size(input_tensor);
+ 
+     uint32_t num_tiles = detail::num_tiles(input_tensor);
+@@ -347,6 +347,11 @@
+             case DataType::BFLOAT16:
+                 padding_val_packed = pack_two_bfloat16_into_uint32({bfloat16(pad_value), bfloat16(pad_value)});
+                 break;
++            case DataType::FLOAT16: {
++                auto value = tt::tt_metal::float16(pad_value).bits;
++                padding_val_packed = pack_two_uint16_into_uint32({value, value});
++                break;
++            }
+             case DataType::UINT16:
+                 padding_val_packed =
+                     pack_two_uint16_into_uint32({float_to_uint16(pad_value), float_to_uint16(pad_value)});
+@@ -748,10 +753,7 @@
+ 
+     all_cores = num_cores > padded_num_cores ? all_cores : padded_all_cores;
+ 
+-    // Permute is bit-preserving, so use UInt16 to avoid FP16 conversion.
+-    tt::DataFormat cb_data_format = input_tensor.dtype() == DataType::FLOAT16
+-                                        ? tt::DataFormat::UInt16
+-                                        : tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
++    tt::DataFormat cb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
+     uint32_t input_page_size = detail::tile_size(tensor_return_value) + misalignment;
+ 
+     // ---- Resource names ----
+diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_cn_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_cn_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_cn_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_cn_program_factory.cpp
+@@ -10,6 +10,7 @@
+ #include <tt-metalium/constants.hpp>
+ #include <tt-metalium/host_api.hpp>
+ #include <tt-metalium/work_split.hpp>
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -38,7 +39,7 @@
+     TT_ASSERT(input_tensor.storage_type() == StorageType::DEVICE, "Operand to transpose_cn needs to be on device!");
+     TT_ASSERT(input_tensor.buffer() != nullptr, "Operand to transpose_cn needs to be allocated in a buffer on device!");
+ 
+-    tt::DataFormat dfb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
++    tt::DataFormat dfb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
+     uint32_t page_shape[2] = {TILE_WIDTH, TILE_HEIGHT};
+     if (input_tensor.layout() == Layout::ROW_MAJOR) {
+         page_shape[0] = 1;
+diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_rm_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_rm_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_rm_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_rm_program_factory.cpp
+@@ -11,6 +11,7 @@
+ #include <tt-metalium/host_api.hpp>
+ #include <tt-metalium/work_split.hpp>
+ #include <tt-logger/tt-logger.hpp>
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -121,7 +122,7 @@
+     uint32_t W = a_shape[3], H = a_shape[2], C = a_shape[1], N = a_shape[0];
+     uint32_t NCH = N * C * H;
+ 
+-    tt::DataFormat dfb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
++    tt::DataFormat dfb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
+ 
+     log_debug(tt::LogOp, "transpose_hc_rm");
+     log_debug(tt::LogOp, "dfb_data_format: {}", dfb_data_format);
+diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_sharded_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_sharded_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_sharded_program_factory.cpp
+@@ -12,6 +12,7 @@
+ #include <map>
+ #include <set>
+ #include <utility>
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -330,8 +331,8 @@
+ 
+     ProgramDescriptor desc;
+ 
+-    tt::DataFormat src0_cb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
+-    tt::DataFormat dst_cb_data_format = datatype_to_dataformat_converter(output_tensor.dtype());
++    tt::DataFormat src0_cb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
++    tt::DataFormat dst_cb_data_format = operations::data_movement::data_movement_format(output_tensor.dtype());
+ 
+     uint32_t W = input_tensor.logical_shape()[3], H = input_tensor.logical_shape()[2];
+     uint32_t C = input_tensor.logical_shape()[1], N = input_tensor.logical_shape()[0];
+diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_interleaved_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_interleaved_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_interleaved_program_factory.cpp
+@@ -109,7 +109,7 @@
+     uint32_t C = input_tensor.logical_shape()[1];
+     bool needs_padding = (C % tile_shape[1] != 0);
+ 
+-    tt::DataFormat dfb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
++    tt::DataFormat dfb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
+     uint32_t single_tile_size = tt::tile_size(dfb_data_format);
+ 
+     IDevice* device = input_tensor.device();
+@@ -169,6 +169,11 @@
+             case DataType::BFLOAT16:
+                 padding_val_packed = pack_two_bfloat16_into_uint32({bfloat16(pad_value), bfloat16(pad_value)});
+                 break;
++            case DataType::FLOAT16: {
++                auto value = tt::tt_metal::float16(pad_value).bits;
++                padding_val_packed = pack_two_uint16_into_uint32({value, value});
++                break;
++            }
+             case DataType::UINT16:
+                 padding_val_packed =
+                     pack_two_uint16_into_uint32({float_to_uint16(pad_value), float_to_uint16(pad_value)});
+diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_program_factory.cpp
+@@ -11,6 +11,7 @@
+ #include <tt-metalium/host_api.hpp>
+ #include <tt-metalium/work_split.hpp>
+ #include <tt-logger/tt-logger.hpp>
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -39,7 +40,7 @@
+     uint32_t sub_tile_line_bytes = 16 * input_tensor.element_size();
+     uint32_t num_tensor_tiles = input_tensor.physical_volume() / TILE_HW;
+ 
+-    tt::DataFormat dfb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
++    tt::DataFormat dfb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
+     uint32_t single_tile_size = tt::tile_size(dfb_data_format);
+ 
+     log_debug(tt::LogOp, "transpose_hc_tiled");
+diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
+@@ -11,6 +11,7 @@
+ #include <tt-metalium/constants.hpp>
+ #include <tt-metalium/host_api.hpp>
+ #include <tt-metalium/work_split.hpp>
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -45,9 +46,9 @@
+     uint32_t ht = (H + TILE_HEIGHT - 1) / TILE_HEIGHT;
+     uint32_t wt = (W + TILE_WIDTH - 1) / TILE_WIDTH;
+ 
+-    tt::DataFormat src0_dfb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
++    tt::DataFormat src0_dfb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
+     uint32_t src0_single_tile_size = tt::tile_size(src0_dfb_data_format);
+-    tt::DataFormat dst_dfb_data_format = datatype_to_dataformat_converter(output_tensor.dtype());
++    tt::DataFormat dst_dfb_data_format = operations::data_movement::data_movement_format(output_tensor.dtype());
+     uint32_t dst_single_tile_size = tt::tile_size(dst_dfb_data_format);
+ 
+     IDevice* device = input_tensor.device();
+diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_program_factory.cpp
+@@ -9,6 +9,7 @@
+ #include <tt-metalium/constants.hpp>
+ #include <tt-metalium/host_api.hpp>
+ #include <algorithm>
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -35,9 +36,9 @@
+     TT_ASSERT(input_tensor.storage_type() == StorageType::DEVICE, "Operand to transpose_wh needs to be on device!");
+     TT_ASSERT(input_tensor.buffer() != nullptr, "Operand to transpose_wh needs to be allocated in a buffer on device!");
+ 
+-    tt::DataFormat src0_dfb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
++    tt::DataFormat src0_dfb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
+     uint32_t src0_single_tile_size = tt::tile_size(src0_dfb_data_format);
+-    tt::DataFormat dst_dfb_data_format = datatype_to_dataformat_converter(output_tensor.dtype());
++    tt::DataFormat dst_dfb_data_format = operations::data_movement::data_movement_format(output_tensor.dtype());
+     uint32_t dst_single_tile_size = tt::tile_size(dst_dfb_data_format);
+ 
+     const auto tile = input_tensor.tensor_spec().tile();
+diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_rm_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_rm_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_rm_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_rm_program_factory.cpp
+@@ -10,6 +10,7 @@
+ #include <tt-logger/tt-logger.hpp>
+ 
+ #include <algorithm>
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -25,9 +26,9 @@
+ 
+     ProgramDescriptor desc;
+ 
+-    tt::DataFormat src0_cb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
++    tt::DataFormat src0_cb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
+     uint32_t src0_single_tile_size = tt::tile_size(src0_cb_data_format);
+-    tt::DataFormat dst_cb_data_format = datatype_to_dataformat_converter(output_tensor.dtype());
++    tt::DataFormat dst_cb_data_format = operations::data_movement::data_movement_format(output_tensor.dtype());
+     uint32_t dst_single_tile_size = tt::tile_size(dst_cb_data_format);
+ 
+     uint32_t W = input_tensor.logical_shape()[3], H = input_tensor.logical_shape()[2];
+diff --git ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/embedding/device/embedding_device_operation.cpp
+@@ -34,8 +34,9 @@
+         weights.layout() == Layout::ROW_MAJOR, "Weights tensor layout must be ROW_MAJOR but got {}", weights.layout());
+     TT_FATAL(a.dtype() == DataType::UINT32 or a.dtype() == DataType::BFLOAT16, "Input must be UINT32 or BFLOAT16");
+     TT_FATAL(
+-        weights.dtype() == DataType::BFLOAT16 or weights.dtype() == DataType::FLOAT32,
+-        "Weights tensor must have BFLOAT16 or FLOAT32 dtype");
++        weights.dtype() == DataType::BFLOAT16 or weights.dtype() == DataType::FLOAT32 or
++            weights.dtype() == DataType::FLOAT16,
++        "Weights tensor must have BFLOAT16, FLOAT32 or FLOAT16 dtype");
+     TT_FATAL(
+         a.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
+         "Embedding does not currently support sharded inputs");
+diff --git ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_factory.cpp
+@@ -8,6 +8,7 @@
+ #include <tt-metalium/host_api.hpp>
+ #include <tt-metalium/program_descriptors.hpp>
+ #include <tt-metalium/tensor_accessor_args.hpp>
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ namespace ttnn::prim {
+ 
+@@ -93,9 +94,9 @@
+         embeddings_index_type = EmbeddingsIndexType::UINT32;
+     }
+ 
+-    tt::DataFormat weights_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(weights.dtype());
++    tt::DataFormat weights_cb_data_format = operations::data_movement::data_movement_format(weights.dtype());
+     uint32_t weights_single_tile_size = tt::tile_size(weights_cb_data_format);
+-    tt::DataFormat output_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_cb_data_format = operations::data_movement::data_movement_format(output.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
+ 
+     // Hardcoded limit to reduce L1 usage. Should be updated to be tuned based on overall L1 usage
+diff --git ttnn/cpp/ttnn/operations/embedding/device/embeddings_rm_program_factory.cpp ttnn/cpp/ttnn/operations/embedding/device/embeddings_rm_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/embedding/device/embeddings_rm_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/embedding/device/embeddings_rm_program_factory.cpp
+@@ -11,6 +11,7 @@
+ #include <tt-metalium/tt_align.hpp>
+ 
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ namespace ttnn::prim {
+ 
+@@ -91,7 +92,7 @@
+ 
+     tt::DataFormat input_data_format = tt::tt_metal::datatype_to_dataformat_converter(a.dtype());
+ 
+-    tt::DataFormat weights_data_format = tt::tt_metal::datatype_to_dataformat_converter(weights.dtype());
++    tt::DataFormat weights_data_format = operations::data_movement::data_movement_format(weights.dtype());
+ 
+     uint32_t rounded_weight_page_size = tt::align(weight_page_size, alignment);
+ 
+diff --git ttnn/cpp/ttnn/operations/embedding/device/embeddings_tilized_indices_program_factory.cpp ttnn/cpp/ttnn/operations/embedding/device/embeddings_tilized_indices_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/embedding/device/embeddings_tilized_indices_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/embedding/device/embeddings_tilized_indices_program_factory.cpp
+@@ -11,6 +11,7 @@
+ #include <tt-metalium/tt_align.hpp>
+ 
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ namespace ttnn::prim {
+ 
+@@ -75,7 +76,7 @@
+ 
+     tt::DataFormat input_data_format = tt::tt_metal::datatype_to_dataformat_converter(a.dtype());
+ 
+-    tt::DataFormat weights_data_format = tt::tt_metal::datatype_to_dataformat_converter(weights.dtype());
++    tt::DataFormat weights_data_format = operations::data_movement::data_movement_format(weights.dtype());
+ 
+     uint32_t rounded_weight_page_size = tt::align(weight_page_size, alignment);
+ 
