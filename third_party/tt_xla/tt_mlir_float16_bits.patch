@@ -27,23 +27,22 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
  // type does not match with input. Native Int32 where keeps its operands exact;
  // other integer combinations use Float32 until their native paths are
 -// reliable.
-+// reliable. Float16 also uses Float32: the Float16 where kernel flushes
-+// subnormals and -0 to +0, and Float32 holds every Float16 exactly.
++// reliable. Float16 where moves its values as raw bits and tests a bfloat16
++// predicate as a number, so that predicate is kept as is.
  // tt-metal issues to track mixed data types ops bug.
  // https://github.com/tenstorrent/tt-metal/issues/17998
  // https://github.com/tenstorrent/tt-metal/issues/24511
-@@ -472,8 +474,12 @@
+@@ -472,8 +474,11 @@
    TTNNOperandWorkarounds inputTypeWorkaround;
    TTNNOperandWorkarounds outputTypeWorkaround;
  
 -  if (predicateElementType.isInteger() ||
 -      predicateElementType != inputElementType) {
-+  if (inputElementType.isF16()) {
-+    predicateTypeWorkaround = TTNNOperandWorkarounds(ttcore::DataType::Float32);
-+    inputTypeWorkaround = TTNNOperandWorkarounds(ttcore::DataType::Float32);
-+    outputTypeWorkaround = TTNNOperandWorkarounds(ttcore::DataType::Float32);
-+  } else if (predicateElementType.isInteger() ||
-+             predicateElementType != inputElementType) {
++  bool float16WithBf16Predicate =
++      inputElementType.isF16() && predicateElementType.isBF16();
++  if (!float16WithBf16Predicate &&
++      (predicateElementType.isInteger() ||
++       predicateElementType != inputElementType)) {
      if (inputElementType.isInteger()) {
        ttcore::DataType inputDataType =
            ttcore::elementTypeToDataType(inputElementType);
