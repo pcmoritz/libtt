@@ -1,15 +1,15 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
-@@ -39,11 +39,16 @@ KernelSpec::CompilerOptions::Defines build_kernel_defines(
-     bool is_fp32,
-     bool is_fp16) {
+@@ -38,11 +38,16 @@ KernelSpec::CompilerOptions::Defines build_kernel_defines(
+     bool is_float_type,
+     bool is_fp32) {
      KernelSpec::CompilerOptions::Defines d;
 -    d.insert({"MASK_ELEM_UINT", (input_element_size_bytes == 2) ? "uint16_t" : "uint32_t"});
 +    d.insert(
 +        {"MASK_ELEM_UINT",
 +         input_element_size_bytes == 1 ? "uint8_t" : input_element_size_bytes == 2 ? "uint16_t" : "uint32_t"});
-     d.insert({"MASK_VALUE", is_fp32 ? "0x3F800000u" : is_fp16 ? "0x3C00u" : is_float_type ? "0x3F80u" : "1u"});
+     d.insert({"MASK_VALUE", is_fp32 ? "0x3F800000u" : is_float_type ? "0x3F80u" : "1u"});
      d.insert({"FILL_PAD_DATA_FMT", detail::get_where_data_fmt(input_tensor.dtype())});
      if (!is_float_type) {
 -        d.insert({"FILL_PAD_FILL_DATA_FMT", fmt::format("DataFormat::{}", cb_data_format)});
@@ -37,20 +37,20 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
              case ttnn::DataType::UINT32: return fill_value;
 +            case ttnn::DataType::UINT8: return static_cast<std::uint8_t>(fill_value);
              case ttnn::DataType::UINT16: return pack_fill_value(static_cast<std::uint16_t>(fill_value));
-             case ttnn::DataType::BFLOAT16:
              case ttnn::DataType::FLOAT16:
-@@ -65,6 +67,7 @@ inline std::uint32_t pack_fill_value_for_dtype(ttnn::DataType dtype, const ttnn:
+                 return pack_fill_value(tt::tt_metal::float16(static_cast<float>(fill_value)).bits);
+@@ -66,6 +68,7 @@ inline std::uint32_t pack_fill_value_for_dtype(ttnn::DataType dtype, const ttnn:
          case ttnn::DataType::FLOAT32:
          case ttnn::DataType::BFLOAT16: return pack_fill_value(fill_value);
-         case ttnn::DataType::FLOAT16: return pack_fill_value(fill_value);
+         case ttnn::DataType::FLOAT16: return pack_fill_value(tt::tt_metal::float16(fill_value).bits);
 +        case ttnn::DataType::UINT8: return static_cast<std::uint8_t>(fill_value);
          case ttnn::DataType::UINT16: return pack_fill_value(static_cast<std::uint16_t>(fill_value));
          case ttnn::DataType::UINT32: return pack_fill_value(static_cast<std::uint32_t>(fill_value));
          case ttnn::DataType::INT32: return pack_fill_value(static_cast<std::int32_t>(fill_value));
-@@ -79,6 +82,7 @@ inline std::string get_where_data_fmt(ttnn::DataType dtype) {
+@@ -79,6 +82,7 @@ inline std::uint32_t pack_fill_value_for_dtype(ttnn::DataType dtype, const ttnn:
+ inline std::string get_where_data_fmt(ttnn::DataType dtype) {
      switch (dtype) {
          case ttnn::DataType::FLOAT32: return "DataFormat::Float32";
-         case ttnn::DataType::FLOAT16: return "DataFormat::Float16";
 +        case ttnn::DataType::UINT8: return "DataFormat::UInt32";
          case ttnn::DataType::UINT32: return "DataFormat::UInt32";
          case ttnn::DataType::INT32: return "DataFormat::Int32";

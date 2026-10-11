@@ -664,21 +664,6 @@ diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/cunpack_common.h tt_metal
  }
  
  // Canonical srcA channel-1 Z stride: face-sized row step.
-diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_where.h tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_where.h
---- tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_where.h
-+++ tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_where.h
-@@ -19,8 +19,9 @@ inline void _calculate_where_(
-     const std::uint32_t dst_index_in0, const std::uint32_t dst_index_in1, const std::uint32_t dst_index_in2, const std::uint32_t dst_index_out)
- {
-     static_assert(
--        data_format == DataFormat::Float32 || data_format == DataFormat::Float16_b || data_format == DataFormat::Int32 || data_format == DataFormat::UInt32,
--        "Unsupported data format for _calculate_where_(). Only Float32, Int32, UInt32, and Float16_b are allowed.");
-+        data_format == DataFormat::Float32 || data_format == DataFormat::Float16 ||
-+            data_format == DataFormat::Float16_b || data_format == DataFormat::Int32 || data_format == DataFormat::UInt32,
-+        "Unsupported data format for _calculate_where_().");
- 
-     int offset0 = (dst_index_in0 * 32) << 1;
-     int offset1 = (dst_index_in1 * 32) << 1;
 diff --git tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_math_eltwise_unary_datacopy.h tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_math_eltwise_unary_datacopy.h
 --- tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_math_eltwise_unary_datacopy.h
 +++ tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_math_eltwise_unary_datacopy.h
@@ -1059,65 +1044,6 @@ diff --git ttnn/cpp/ttnn/operations/creation/creation.cpp ttnn/cpp/ttnn/operatio
          case DataType::BFLOAT16: return concrete_full.template operator()<::bfloat16>(static_cast<float>(fill_value));
          case DataType::BFLOAT4_B:
          case DataType::BFLOAT8_B: {
-diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
---- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
-@@ -36,10 +36,11 @@ KernelSpec::CompilerOptions::Defines build_kernel_defines(
-     tt::DataFormat cb_data_format,
-     std::uint32_t input_element_size_bytes,
-     bool is_float_type,
--    bool is_fp32) {
-+    bool is_fp32,
-+    bool is_fp16) {
-     KernelSpec::CompilerOptions::Defines d;
-     d.insert({"MASK_ELEM_UINT", (input_element_size_bytes == 2) ? "uint16_t" : "uint32_t"});
--    d.insert({"MASK_VALUE", is_fp32 ? "0x3F800000u" : is_float_type ? "0x3F80u" : "1u"});
-+    d.insert({"MASK_VALUE", is_fp32 ? "0x3F800000u" : is_fp16 ? "0x3C00u" : is_float_type ? "0x3F80u" : "1u"});
-     d.insert({"FILL_PAD_DATA_FMT", detail::get_where_data_fmt(input_tensor.dtype())});
-     if (!is_float_type) {
-         d.insert({"FILL_PAD_FILL_DATA_FMT", fmt::format("DataFormat::{}", cb_data_format)});
-@@ -87,8 +88,10 @@ ttnn::device_operation::ProgramArtifacts FillPadProgramFactory::create_program_a
-     const bool has_bottom_pad = H_mod32 != 0;
- 
-     const bool is_float_type =
--        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT32);
-+        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT16 ||
-+         input_tensor.dtype() == DataType::FLOAT32);
-     const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
-+    const bool is_fp16 = (input_tensor.dtype() == DataType::FLOAT16);
-     const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
-     const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
-     // 32-bit integer types need fp32_dest_acc_en so DST holds full 32-bit values
-@@ -159,7 +162,7 @@ ttnn::device_operation::ProgramArtifacts FillPadProgramFactory::create_program_a
- 
-     // ---- Defines ----
-     const auto fill_defines = CMAKE_UNIQUE_NAMESPACE::build_kernel_defines(
--        input_tensor, cb_data_format, input_element_size_bytes, is_float_type, is_fp32);
-+        input_tensor, cb_data_format, input_element_size_bytes, is_float_type, is_fp32, is_fp16);
-     // has_right_pad / has_bottom_pad are promoted to preprocessor defines on the writer and
-     // compute kernels (they gate the conditionally-bound right / bottom mask DFBs).
-     auto mask_defines = fill_defines;
-@@ -486,8 +489,10 @@ ttnn::device_operation::ProgramArtifacts FillPadL1ShardedProgramFactory::create_
-     }
- 
-     const bool is_float_type =
--        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT32);
-+        (input_tensor.dtype() == DataType::BFLOAT16 || input_tensor.dtype() == DataType::FLOAT16 ||
-+         input_tensor.dtype() == DataType::FLOAT32);
-     const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
-+    const bool is_fp16 = (input_tensor.dtype() == DataType::FLOAT16);
-     const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
-     const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
-     const bool need_fp32_dest_acc = is_fp32 || is_uint32 || is_int32;
-@@ -527,7 +532,7 @@ ttnn::device_operation::ProgramArtifacts FillPadL1ShardedProgramFactory::create_
-         "ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/kernels/compute/fill_pad_compute.cpp";
- 
-     const auto fill_defines = CMAKE_UNIQUE_NAMESPACE::build_kernel_defines(
--        input_tensor, cb_data_format, input_element_size_bytes, is_float_type, is_fp32);
-+        input_tensor, cb_data_format, input_element_size_bytes, is_float_type, is_fp32, is_fp16);
- 
-     // ---- Build kernels + work units per group ----
-     struct GroupInfo {
 diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
 --- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
 +++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.hpp
@@ -1129,30 +1055,23 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
      {ttnn::DataType::FLOAT32, 4},
      {ttnn::DataType::UINT16, 2},
      {ttnn::DataType::UINT32, 4},
-@@ -54,6 +55,7 @@ inline std::uint32_t pack_fill_value_for_dtype(ttnn::DataType dtype, const ttnn:
+@@ -53,6 +54,8 @@ inline std::uint32_t pack_fill_value_for_dtype(ttnn::DataType dtype, const ttnn:
+             case ttnn::DataType::INT32:
              case ttnn::DataType::UINT32: return fill_value;
              case ttnn::DataType::UINT16: return pack_fill_value(static_cast<std::uint16_t>(fill_value));
-             case ttnn::DataType::BFLOAT16:
 +            case ttnn::DataType::FLOAT16:
++                return pack_fill_value(tt::tt_metal::float16(static_cast<float>(fill_value)).bits);
+             case ttnn::DataType::BFLOAT16:
              case ttnn::DataType::FLOAT32: return pack_fill_value(static_cast<float>(fill_value));
              default: TT_THROW("fill_pad: unsupported dtype"); return 0u;
-         }
-@@ -62,6 +64,7 @@ inline std::uint32_t pack_fill_value_for_dtype(ttnn::DataType dtype, const ttnn:
+@@ -62,6 +65,7 @@ inline std::uint32_t pack_fill_value_for_dtype(ttnn::DataType dtype, const ttnn:
      switch (dtype) {
          case ttnn::DataType::FLOAT32:
          case ttnn::DataType::BFLOAT16: return pack_fill_value(fill_value);
-+        case ttnn::DataType::FLOAT16: return pack_fill_value(fill_value);
++        case ttnn::DataType::FLOAT16: return pack_fill_value(tt::tt_metal::float16(fill_value).bits);
          case ttnn::DataType::UINT16: return pack_fill_value(static_cast<std::uint16_t>(fill_value));
          case ttnn::DataType::UINT32: return pack_fill_value(static_cast<std::uint32_t>(fill_value));
          case ttnn::DataType::INT32: return pack_fill_value(static_cast<std::int32_t>(fill_value));
-@@ -75,6 +78,7 @@ inline std::uint32_t pack_fill_value_for_dtype(ttnn::DataType dtype, const ttnn:
- inline std::string get_where_data_fmt(ttnn::DataType dtype) {
-     switch (dtype) {
-         case ttnn::DataType::FLOAT32: return "DataFormat::Float32";
-+        case ttnn::DataType::FLOAT16: return "DataFormat::Float16";
-         case ttnn::DataType::UINT32: return "DataFormat::UInt32";
-         case ttnn::DataType::INT32: return "DataFormat::Int32";
-         default: return "DataFormat::Float16_b";  // BFLOAT16, UINT16
 diff --git ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp
