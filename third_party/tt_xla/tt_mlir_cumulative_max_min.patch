@@ -1,26 +1,7 @@
-diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
---- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
-+++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
-@@ -128,6 +128,7 @@
- def TTCore_ReduceType_Var  : I32EnumAttrCase<"Var",  5, "var">;
- def TTCore_ReduceType_Prod  : I32EnumAttrCase<"Prod",  6, "prod">;
- def TTCore_ReduceType_Invalid: I32EnumAttrCase<"Invalid",  7, "invalid">;
-+def TTCore_ReduceType_LogSumExp: I32EnumAttrCase<"LogSumExp",  8, "logsumexp">;
- 
- def TTCore_ReduceType: I32EnumAttr<"ReduceType", "TT Reduce Type",
-                           [
-@@ -139,6 +140,7 @@
-                            TTCore_ReduceType_Var,
-                            TTCore_ReduceType_Prod,
-                            TTCore_ReduceType_Invalid,
-+                           TTCore_ReduceType_LogSumExp,
-                           ]> {
-   let genSpecializedAttr = 0;
-   let cppNamespace = "::mlir::tt::ttcore";
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -3435,6 +3435,31 @@
+@@ -3435,6 +3435,32 @@
    let hasFolder = 1;
  }
  
@@ -29,7 +10,8 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +  let description = [{
 +    Computes a running reduction of the input along `dim`: each output element
 +    reduces all input elements along `dim` up to and including its position
-+    (from the end of `dim` when `reverse` is set). `reduction` is max or min.
++    (from the end of `dim` when `reverse` is set). `reduction` is max, min or
++    logsumexp.
 +
 +    Example:
 +    ```mlir
@@ -63,7 +45,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +  let summary = "Cumulative reduction op.";
 +  let description = [{
 +    Running reduction of the input along `dim` (from its end when `reverse`
-+    is set); `reduction` is max or min. Runs on ttnn's accumulation kernel,
++    is set); `reduction` is max, min or logsumexp. Runs on ttnn's accumulation kernel,
 +    like cumsum and cumprod.
 +  }];
 +
@@ -121,14 +103,23 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -3302,6 +3302,15 @@
+@@ -3302,6 +3302,24 @@
        return rewriter.notifyMatchFailure(
            srcOp, "Mismatch between init values and inputs count.");
      }
++
++    DenseI64ArrayAttr windowDimensions = adaptor.getWindowDimensionsAttr();
++    DenseI64ArrayAttr padding =
++        adaptor.getPaddingAttr()
++            ? rewriter.getDenseI64ArrayAttr(SmallVector<int64_t>(
++                  adaptor.getPaddingAttr().getValues<int64_t>()))
++            : rewriter.getDenseI64ArrayAttr(
++                  SmallVector<int64_t>(windowDimensions.size() * 2, 0));
++
 +    // A running logsumexp has JAX's logaddexp as its body, which the checks
 +    // below reject; it lowers to the general cumulative op.
 +    if (std::optional<CumulativeReductionMatch> match =
-+            isCumulativeLogSumExp(srcOp, adaptor)) {
++            isCumulativeLogSumExp(srcOp, adaptor, padding)) {
 +      replaceWithCumulativeReduction(srcOp, adaptor, *match,
 +                                     ttcore::ReduceType::LogSumExp, rewriter);
 +      return success();
@@ -137,7 +128,29 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      // Validate block body.
      Block &block = srcOp.getBody().getBlocks().front();
      auto &operations = block.getOperations();
-@@ -3377,6 +3386,14 @@
+@@ -3325,8 +3343,6 @@
+ 
+     // Validate op attributes or assign default values if not provided.
+ 
+-    DenseI64ArrayAttr windowDimensions = adaptor.getWindowDimensionsAttr();
+-
+     DenseI64ArrayAttr windowStrides = adaptor.getWindowStridesAttr();
+     if (!windowStrides) {
+       windowStrides = rewriter.getDenseI64ArrayAttr(
+@@ -3342,12 +3358,6 @@
+       baseDilations = rewriter.getDenseI64ArrayAttr(
+           SmallVector<int64_t>(windowDimensions.size(), 1));
+     }
+-    DenseI64ArrayAttr padding =
+-        adaptor.getPaddingAttr()
+-            ? rewriter.getDenseI64ArrayAttr(SmallVector<int64_t>(
+-                  adaptor.getPaddingAttr().getValues<int64_t>()))
+-            : rewriter.getDenseI64ArrayAttr(
+-                  SmallVector<int64_t>(windowDimensions.size() * 2, 0));
+ 
+     BoolAttr ceilMode = rewriter.getBoolAttr(false);
+ 
+@@ -3377,6 +3387,14 @@
                                                   *cumulativeMatch, rewriter);
          return success();
        }
@@ -152,7 +165,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
  
      // Handle 5D input with three non-trivial window dimensions (3D max
-@@ -3919,6 +3936,149 @@
+@@ -3919,6 +3937,141 @@
      return match;
    }
  
@@ -245,25 +258,17 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  // A running logsumexp: one input reduced with logaddexp from log(0) = -inf
 +  // along one dimension; see isCumProd for the window conditions.
 +  std::optional<CumulativeReductionMatch>
-+  isCumulativeLogSumExp(
-+      mlir::stablehlo::ReduceWindowOp &srcOp,
-+      mlir::stablehlo::ReduceWindowOp::Adaptor adaptor) const {
++  isCumulativeLogSumExp(mlir::stablehlo::ReduceWindowOp &srcOp,
++                        mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
++                        DenseI64ArrayAttr padding) const {
 +    if (srcOp.getInputs().size() != 1 ||
 +        !isLogAddExpBody(srcOp.getBody().front()) ||
 +        !hasInitValue(srcOp, TypicalInitReductionValue::NEG_INF) ||
 +        !hasValidWindowAttributes(adaptor)) {
 +      return std::nullopt;
 +    }
-+    SmallVector<int64_t> padding(adaptor.getWindowDimensionsAttr().size() * 2,
-+                                 0);
-+    if (adaptor.getPaddingAttr()) {
-+      padding.assign(adaptor.getPaddingAttr().getValues<int64_t>().begin(),
-+                     adaptor.getPaddingAttr().getValues<int64_t>().end());
-+    }
 +    CumulativeReductionMatch match;
-+    if (!hasValidInputAndPadding(
-+            srcOp, adaptor, match,
-+            DenseI64ArrayAttr::get(srcOp.getContext(), padding))) {
++    if (!hasValidInputAndPadding(srcOp, adaptor, match, padding)) {
 +      return std::nullopt;
 +    }
 +    return match;
@@ -390,17 +395,6 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
  ::mlir::LogicalResult mlir::tt::ttnn::RandOp::verify() {
    float low = getLow().convertToFloat();
    float high = getHigh().convertToFloat();
-diff --git a/lib/OpModel/TTNN/Conversion.cpp b/lib/OpModel/TTNN/Conversion.cpp
---- a/lib/OpModel/TTNN/Conversion.cpp
-+++ b/lib/OpModel/TTNN/Conversion.cpp
-@@ -758,6 +758,7 @@
-   case ttcore::ReduceType::Mean:
-   case ttcore::ReduceType::Std:
-   case ttcore::ReduceType::Var:
-+  case ttcore::ReduceType::LogSumExp:
-     // These reduction types are not supported by scatter operation
-     llvm_unreachable("Unsupported reduction type");
-   }
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
@@ -451,6 +445,53 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
    if (auto sumOp = dyn_cast<SumOp>(op); sumOp) {
      return createOperation(cache, createReductionOp(cache, sumOp), debugString,
                             locInfo);
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -102,6 +102,7 @@
+ #include "operations/rand/rand.h"
+ #include "operations/reduction/argmax.h"
+ #include "operations/reduction/cumprod.h"
++#include "operations/reduction/cumulative.h"
+ #include "operations/reduction/cumsum.h"
+ #include "operations/reduction/prod.h"
+ #include "operations/reduction/reduction.h"
+@@ -405,6 +406,10 @@
+     return operations::reduction::cumprod::run(op->type_as_CumProdOp(),
+                                                getContext());
+   }
++  case ::tt::target::ttnn::OpType::CumulativeOp: {
++    return operations::reduction::cumulative::run(op->type_as_CumulativeOp(),
++                                                  getContext());
++  }
+   case ::tt::target::ttnn::OpType::ReductionArgMaxOp: {
+     return operations::reduction::run(op->type_as_ReductionArgMaxOp(),
+                                       getContext());
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -1464,6 +1464,10 @@
+     tensorRefs = {opContext.type_as_CumProdOp()->out()};
+     break;
+   }
++  case ::tt::target::ttnn::OpType::CumulativeOp: {
++    tensorRefs = {opContext.type_as_CumulativeOp()->out()};
++    break;
++  }
+   case ::tt::target::ttnn::OpType::RandOp: {
+     tensorRefs = {opContext.type_as_RandOp()->out()};
+     break;
+@@ -2095,6 +2099,10 @@
+     tensorRefs = {opContext.type_as_CumProdOp()->in()};
+     break;
+   }
++  case ::tt::target::ttnn::OpType::CumulativeOp: {
++    tensorRefs = {opContext.type_as_CumulativeOp()->in()};
++    break;
++  }
+   case ::tt::target::ttnn::OpType::ReductionArgMaxOp: {
+     tensorRefs = {opContext.type_as_ReductionArgMaxOp()->in()};
+     break;
 diff --git a/runtime/lib/ttnn/operations/reduction/cumulative.cpp b/runtime/lib/ttnn/operations/reduction/cumulative.cpp
 new file mode 100644
 --- /dev/null
@@ -526,50 +567,33 @@ new file mode 100644
 +} // namespace tt::runtime::ttnn::operations::reduction::cumulative
 +
 +#endif // RUNTIME_LIB_TTNN_OPERATIONS_REDUCTION_CUMULATIVE_H
-diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
---- a/runtime/lib/ttnn/program_executor.cpp
-+++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -102,6 +102,7 @@
- #include "operations/rand/rand.h"
- #include "operations/reduction/argmax.h"
- #include "operations/reduction/cumprod.h"
-+#include "operations/reduction/cumulative.h"
- #include "operations/reduction/cumsum.h"
- #include "operations/reduction/prod.h"
- #include "operations/reduction/reduction.h"
-@@ -405,6 +406,10 @@
-     return operations::reduction::cumprod::run(op->type_as_CumProdOp(),
-                                                getContext());
+diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
+--- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
++++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
+@@ -128,6 +128,7 @@
+ def TTCore_ReduceType_Var  : I32EnumAttrCase<"Var",  5, "var">;
+ def TTCore_ReduceType_Prod  : I32EnumAttrCase<"Prod",  6, "prod">;
+ def TTCore_ReduceType_Invalid: I32EnumAttrCase<"Invalid",  7, "invalid">;
++def TTCore_ReduceType_LogSumExp: I32EnumAttrCase<"LogSumExp",  8, "logsumexp">;
+ 
+ def TTCore_ReduceType: I32EnumAttr<"ReduceType", "TT Reduce Type",
+                           [
+@@ -139,6 +140,7 @@
+                            TTCore_ReduceType_Var,
+                            TTCore_ReduceType_Prod,
+                            TTCore_ReduceType_Invalid,
++                           TTCore_ReduceType_LogSumExp,
+                           ]> {
+   let genSpecializedAttr = 0;
+   let cppNamespace = "::mlir::tt::ttcore";
+diff --git a/lib/OpModel/TTNN/Conversion.cpp b/lib/OpModel/TTNN/Conversion.cpp
+--- a/lib/OpModel/TTNN/Conversion.cpp
++++ b/lib/OpModel/TTNN/Conversion.cpp
+@@ -758,6 +758,7 @@
+   case ttcore::ReduceType::Mean:
+   case ttcore::ReduceType::Std:
+   case ttcore::ReduceType::Var:
++  case ttcore::ReduceType::LogSumExp:
+     // These reduction types are not supported by scatter operation
+     llvm_unreachable("Unsupported reduction type");
    }
-+  case ::tt::target::ttnn::OpType::CumulativeOp: {
-+    return operations::reduction::cumulative::run(op->type_as_CumulativeOp(),
-+                                                  getContext());
-+  }
-   case ::tt::target::ttnn::OpType::ReductionArgMaxOp: {
-     return operations::reduction::run(op->type_as_ReductionArgMaxOp(),
-                                       getContext());
-diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
---- a/runtime/lib/ttnn/runtime.cpp
-+++ b/runtime/lib/ttnn/runtime.cpp
-@@ -1464,6 +1464,10 @@
-     tensorRefs = {opContext.type_as_CumProdOp()->out()};
-     break;
-   }
-+  case ::tt::target::ttnn::OpType::CumulativeOp: {
-+    tensorRefs = {opContext.type_as_CumulativeOp()->out()};
-+    break;
-+  }
-   case ::tt::target::ttnn::OpType::RandOp: {
-     tensorRefs = {opContext.type_as_RandOp()->out()};
-     break;
-@@ -2095,6 +2099,10 @@
-     tensorRefs = {opContext.type_as_CumProdOp()->in()};
-     break;
-   }
-+  case ::tt::target::ttnn::OpType::CumulativeOp: {
-+    tensorRefs = {opContext.type_as_CumulativeOp()->in()};
-+    break;
-+  }
-   case ::tt::target::ttnn::OpType::ReductionArgMaxOp: {
-     tensorRefs = {opContext.type_as_ReductionArgMaxOp()->in()};
-     break;
