@@ -133,85 +133,6 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
          case ttnn::DataType::UINT8: return "DataFormat::UInt32";
          case ttnn::DataType::UINT32: return "DataFormat::UInt32";
          case ttnn::DataType::INT32: return "DataFormat::Int32";
-diff --git ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_program_factory.cpp
---- ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_program_factory.cpp
-@@ -17,6 +17,7 @@
- #include <tt-metalium/work_split.hpp>
- 
- #include "gather_codegen_device_operation.hpp"
-+#include "ttnn/operations/data_movement/common/common.hpp"
- 
- namespace ttnn::prim {
- using namespace tt::tt_metal;
-@@ -158,7 +159,7 @@
- }
- 
- CBDescriptor make_tile_cb(uint32_t cb_id, const Tensor& tensor, uint32_t depth, const CoreRangeSet& core_range) {
--    const tt::DataFormat data_format = tt::tt_metal::datatype_to_dataformat_converter(tensor.dtype());
-+    const tt::DataFormat data_format = operations::data_movement::data_movement_format(tensor.dtype());
-     const uint32_t page_size = tensor.buffer()->aligned_page_size();
-     return CBDescriptor{
-         .total_size = depth * page_size,
-diff --git ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_program_factory.cpp
---- ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_program_factory.cpp
-@@ -41,11 +41,11 @@
- ProgramDescriptor GatherDeviceOperation::SingleRowSingleCore::create_descriptor(
-     const GatherParams& attributes, const GatherInputs& tensor_args, Tensor& output_tensor) {
-     const tt::DataFormat input_tensor_cb_data_format =
--        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
-+        operations::data_movement::data_movement_format(tensor_args.input_tensor.dtype());
-     const tt::DataFormat input_index_tensor_cb_data_format =
-         tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
-     const tt::DataFormat output_tensor_cb_data_format =
--        tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
-+        operations::data_movement::data_movement_format(output_tensor.dtype());
- 
-     const uint32_t input_tensor_tile_size = tile_size(input_tensor_cb_data_format);
-     const uint32_t input_index_tensor_tile_size = tile_size(input_index_tensor_cb_data_format);
-@@ -197,11 +197,11 @@
- ProgramDescriptor GatherDeviceOperation::SingleRowMultiCore::create_descriptor(
-     const GatherParams& attributes, const GatherInputs& tensor_args, Tensor& output_tensor) {
-     const tt::DataFormat input_tensor_cb_data_format =
--        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
-+        operations::data_movement::data_movement_format(tensor_args.input_tensor.dtype());
-     const tt::DataFormat input_index_tensor_cb_data_format =
-         tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
-     const tt::DataFormat output_tensor_cb_data_format =
--        tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
-+        operations::data_movement::data_movement_format(output_tensor.dtype());
- 
-     const uint32_t input_tensor_tile_size = tile_size(input_tensor_cb_data_format);
-     const uint32_t input_index_tensor_tile_size = tile_size(input_index_tensor_cb_data_format);
-@@ -357,11 +357,11 @@
- ProgramDescriptor GatherDeviceOperation::RmSingleRowSingleCore::create_descriptor(
-     const GatherParams& attributes, const GatherInputs& tensor_args, Tensor& output_tensor) {
-     const tt::DataFormat input_tensor_cb_data_format =
--        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
-+        operations::data_movement::data_movement_format(tensor_args.input_tensor.dtype());
-     const tt::DataFormat input_index_tensor_cb_data_format =
-         tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
-     const tt::DataFormat output_tensor_cb_data_format =
--        tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
-+        operations::data_movement::data_movement_format(output_tensor.dtype());
- 
-     auto* input_tensor_buffer = tensor_args.input_tensor.buffer();
-     auto* input_index_tensor_buffer = tensor_args.input_index_tensor.buffer();
-@@ -514,11 +514,11 @@
- ProgramDescriptor GatherDeviceOperation::RmSingleRowMultiCore::create_descriptor(
-     const GatherParams& attributes, const GatherInputs& tensor_args, Tensor& output_tensor) {
-     const tt::DataFormat input_tensor_cb_data_format =
--        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
-+        operations::data_movement::data_movement_format(tensor_args.input_tensor.dtype());
-     const tt::DataFormat input_index_tensor_cb_data_format =
-         tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_index_tensor.dtype());
-     const tt::DataFormat output_tensor_cb_data_format =
--        tt::tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
-+        operations::data_movement::data_movement_format(output_tensor.dtype());
- 
-     auto* const input_tensor_buffer = tensor_args.input_tensor.buffer();
-     auto* const input_index_tensor_buffer = tensor_args.input_index_tensor.buffer();
 diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp
@@ -300,80 +221,9 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_p
      uint32_t input_page_size = detail::tile_size(tensor_return_value) + misalignment;
  
      // ---- Resource names ----
-diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_cn_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_cn_program_factory.cpp
---- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_cn_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_cn_program_factory.cpp
-@@ -10,6 +10,7 @@
- #include <tt-metalium/constants.hpp>
- #include <tt-metalium/host_api.hpp>
- #include <tt-metalium/work_split.hpp>
-+#include "ttnn/operations/data_movement/common/common.hpp"
- 
- using namespace tt::constants;
- using namespace tt::tt_metal;
-@@ -38,7 +39,7 @@
-     TT_ASSERT(input_tensor.storage_type() == StorageType::DEVICE, "Operand to transpose_cn needs to be on device!");
-     TT_ASSERT(input_tensor.buffer() != nullptr, "Operand to transpose_cn needs to be allocated in a buffer on device!");
- 
--    tt::DataFormat dfb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
-+    tt::DataFormat dfb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
-     uint32_t page_shape[2] = {TILE_WIDTH, TILE_HEIGHT};
-     if (input_tensor.layout() == Layout::ROW_MAJOR) {
-         page_shape[0] = 1;
-diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_rm_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_rm_program_factory.cpp
---- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_rm_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_rm_program_factory.cpp
-@@ -11,6 +11,7 @@
- #include <tt-metalium/host_api.hpp>
- #include <tt-metalium/work_split.hpp>
- #include <tt-logger/tt-logger.hpp>
-+#include "ttnn/operations/data_movement/common/common.hpp"
- 
- using namespace tt::constants;
- using namespace tt::tt_metal;
-@@ -121,7 +122,7 @@
-     uint32_t W = a_shape[3], H = a_shape[2], C = a_shape[1], N = a_shape[0];
-     uint32_t NCH = N * C * H;
- 
--    tt::DataFormat dfb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
-+    tt::DataFormat dfb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
- 
-     log_debug(tt::LogOp, "transpose_hc_rm");
-     log_debug(tt::LogOp, "dfb_data_format: {}", dfb_data_format);
-diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_sharded_program_factory.cpp
---- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_sharded_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_sharded_program_factory.cpp
-@@ -12,6 +12,7 @@
- #include <map>
- #include <set>
- #include <utility>
-+#include "ttnn/operations/data_movement/common/common.hpp"
- 
- using namespace tt::constants;
- using namespace tt::tt_metal;
-@@ -330,8 +331,8 @@
- 
-     ProgramDescriptor desc;
- 
--    tt::DataFormat src0_cb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
--    tt::DataFormat dst_cb_data_format = datatype_to_dataformat_converter(output_tensor.dtype());
-+    tt::DataFormat src0_cb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
-+    tt::DataFormat dst_cb_data_format = operations::data_movement::data_movement_format(output_tensor.dtype());
- 
-     uint32_t W = input_tensor.logical_shape()[3], H = input_tensor.logical_shape()[2];
-     uint32_t C = input_tensor.logical_shape()[1], N = input_tensor.logical_shape()[0];
 diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_interleaved_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_interleaved_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_interleaved_program_factory.cpp
-@@ -109,7 +109,7 @@
-     uint32_t C = input_tensor.logical_shape()[1];
-     bool needs_padding = (C % tile_shape[1] != 0);
- 
--    tt::DataFormat dfb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
-+    tt::DataFormat dfb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
-     uint32_t single_tile_size = tt::tile_size(dfb_data_format);
- 
-     IDevice* device = input_tensor.device();
 @@ -169,6 +169,11 @@
              case DataType::BFLOAT16:
                  padding_val_packed = pack_two_bfloat16_into_uint32({bfloat16(pad_value), bfloat16(pad_value)});
@@ -386,26 +236,6 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_
              case DataType::UINT16:
                  padding_val_packed =
                      pack_two_uint16_into_uint32({float_to_uint16(pad_value), float_to_uint16(pad_value)});
-diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_program_factory.cpp
---- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_tiled_program_factory.cpp
-@@ -11,6 +11,7 @@
- #include <tt-metalium/host_api.hpp>
- #include <tt-metalium/work_split.hpp>
- #include <tt-logger/tt-logger.hpp>
-+#include "ttnn/operations/data_movement/common/common.hpp"
- 
- using namespace tt::constants;
- using namespace tt::tt_metal;
-@@ -39,7 +40,7 @@
-     uint32_t sub_tile_line_bytes = 16 * input_tensor.element_size();
-     uint32_t num_tensor_tiles = input_tensor.physical_volume() / TILE_HW;
- 
--    tt::DataFormat dfb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
-+    tt::DataFormat dfb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
-     uint32_t single_tile_size = tt::tile_size(dfb_data_format);
- 
-     log_debug(tt::LogOp, "transpose_hc_tiled");
 diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
@@ -539,43 +369,3 @@ diff --git ttnn/cpp/ttnn/operations/embedding/device/embeddings_fused_program_fa
      uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
  
      // Hardcoded limit to reduce L1 usage. Should be updated to be tuned based on overall L1 usage
-diff --git ttnn/cpp/ttnn/operations/embedding/device/embeddings_rm_program_factory.cpp ttnn/cpp/ttnn/operations/embedding/device/embeddings_rm_program_factory.cpp
---- ttnn/cpp/ttnn/operations/embedding/device/embeddings_rm_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/embedding/device/embeddings_rm_program_factory.cpp
-@@ -11,6 +11,7 @@
- #include <tt-metalium/tt_align.hpp>
- 
- #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
-+#include "ttnn/operations/data_movement/common/common.hpp"
- 
- namespace ttnn::prim {
- 
-@@ -91,7 +92,7 @@
- 
-     tt::DataFormat input_data_format = tt::tt_metal::datatype_to_dataformat_converter(a.dtype());
- 
--    tt::DataFormat weights_data_format = tt::tt_metal::datatype_to_dataformat_converter(weights.dtype());
-+    tt::DataFormat weights_data_format = operations::data_movement::data_movement_format(weights.dtype());
- 
-     uint32_t rounded_weight_page_size = tt::align(weight_page_size, alignment);
- 
-diff --git ttnn/cpp/ttnn/operations/embedding/device/embeddings_tilized_indices_program_factory.cpp ttnn/cpp/ttnn/operations/embedding/device/embeddings_tilized_indices_program_factory.cpp
---- ttnn/cpp/ttnn/operations/embedding/device/embeddings_tilized_indices_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/embedding/device/embeddings_tilized_indices_program_factory.cpp
-@@ -11,6 +11,7 @@
- #include <tt-metalium/tt_align.hpp>
- 
- #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
-+#include "ttnn/operations/data_movement/common/common.hpp"
- 
- namespace ttnn::prim {
- 
-@@ -75,7 +76,7 @@
- 
-     tt::DataFormat input_data_format = tt::tt_metal::datatype_to_dataformat_converter(a.dtype());
- 
--    tt::DataFormat weights_data_format = tt::tt_metal::datatype_to_dataformat_converter(weights.dtype());
-+    tt::DataFormat weights_data_format = operations::data_movement::data_movement_format(weights.dtype());
- 
-     uint32_t rounded_weight_page_size = tt::align(weight_page_size, alignment);
- 
