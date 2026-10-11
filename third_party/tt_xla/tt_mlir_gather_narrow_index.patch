@@ -1,25 +1,80 @@
-diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
---- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-+++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -3183,9 +3183,20 @@
-   LogicalResult
-   matchAndRewrite(ttir::GatherOp op, OpAdaptor adaptor,
-                   ConversionPatternRewriter &rewriter) const override {
-+    // ttnn.gather takes ui16 and 32-bit integer indices; widen narrower ones.
-+    Value index = adaptor.getIndex();
-+    RankedTensorType indexType = op.getIndex().getType();
-+    auto indexElementType = mlir::cast<IntegerType>(indexType.getElementType());
-+    if (!indexElementType.isUnsignedInteger(16) &&
-+        !indexElementType.isInteger(32)) {
-+      auto wideType = indexType.clone(rewriter.getIntegerType(
-+          32, /*isSigned=*/!indexElementType.isUnsigned()));
-+      index = rewriter.create<ttnn::TypecastOp>(
-+          op.getLoc(), this->getTypeConverter()->convertType(wideType), index);
-+    }
-     rewriter.replaceOpWithNewOp<ttnn::GatherOp>(
-         op, this->getTypeConverter()->convertType(op.getType()),
--        adaptor.getInput(), adaptor.getIndex(), adaptor.getDim());
-+        adaptor.getInput(), index, adaptor.getDim());
-     return success();
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -3948,7 +3948,7 @@
+ 
+     let extraClassDeclaration = [{
+       wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+-        return wa::TTNNOperandsWorkaroundsFactory::createGatherOpOperandsWorkarounds();
++        return wa::TTNNOperandsWorkaroundsFactory::createGatherOpOperandsWorkarounds(*this);
+       }
+     }];
+ }
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -271,9 +271,10 @@
+   static TTNNOperandsWorkarounds createUpsampleOpOperandsWorkarounds();
+ 
+   // Create workarounds for gather op operands. The input and index tensors must
+-  // always be in TILED layout.
++  // always be in TILED layout, and the index must be UInt16 or UInt32.
+   // tt-metal issue: https://github.com/tenstorrent/tt-metal/issues/41451
+-  static TTNNOperandsWorkarounds createGatherOpOperandsWorkarounds();
++  static TTNNOperandsWorkarounds
++  createGatherOpOperandsWorkarounds(mlir::Operation *op);
+ 
+   // Create workarounds for scatter op operands.
+   static TTNNOperandsWorkarounds
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -5252,10 +5252,9 @@
+   const ::mlir::RankedTensorType indexType = getIndex().getType();
+   const ::mlir::RankedTensorType resultType = getResult().getType();
+ 
+-  if (!indexType.getElementType().isUnsignedInteger(16) &&
+-      !indexType.getElementType().isInteger(32)) {
+-    return emitOpError() << "Index tensor element type must be one of "
+-                         << "ui16, ui32, si32 or i32, got "
++  // The workarounds cast indices other than ui16 and ui32 to ui32.
++  if (!mlir::isa<IntegerType>(indexType.getElementType())) {
++    return emitOpError() << "Index tensor element type must be an integer, got "
+                          << indexType.getElementType();
    }
- };
+ 
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -302,15 +302,28 @@
+ }
+ 
+ // Factory method to create a set of workarounds for GatherOp. The GatherOp
+-// requires the input and index tensors to be in TILED layout.
++// requires the input and index tensors to be in TILED layout, and tt-metal's
++// gather takes only UInt16 and UInt32 indices, so others are cast to UInt32.
+ // tt-metal issue: https://github.com/tenstorrent/tt-metal/issues/41451
+ TTNNOperandsWorkarounds
+-TTNNOperandsWorkaroundsFactory::createGatherOpOperandsWorkarounds() {
++TTNNOperandsWorkaroundsFactory::createGatherOpOperandsWorkarounds(
++    mlir::Operation *op) {
+   TTNNOperandWorkarounds tiledLayoutWorkaround;
+   tiledLayoutWorkaround.tensorLayoutWorkaround = Layout::Tile;
++  TTNNOperandWorkarounds indexWorkaround = tiledLayoutWorkaround;
++  Type indexElementType =
++      mlir::cast<RankedTensorType>(mlir::cast<ttnn::GatherOp>(op)
++                                       .getIndex()
++                                       .getType())
++          .getElementType();
++  if (!indexElementType.isUnsignedInteger(16) &&
++      !indexElementType.isUnsignedInteger(32)) {
++    indexWorkaround.tensorDataTypeWorkaround =
++        mlir::tt::ttcore::DataType::UInt32;
++  }
+   return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+       .addInputOperandWorkaround(tiledLayoutWorkaround)      // input
+-      .addInputOperandWorkaround(tiledLayoutWorkaround)      // index
++      .addInputOperandWorkaround(indexWorkaround)            // index
+       .addOutputOperandWorkaround(TTNNOperandWorkarounds()); // result
+ }
+ 
