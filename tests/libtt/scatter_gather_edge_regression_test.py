@@ -1,4 +1,4 @@
-"""Gather with uint8 indices (taken directly by ttnn.gather), scatter with an
+"""Gather with uint8 indices (cast to uint32 for ttnn.gather), scatter with an
 empty update (a no-op), and float16 scatter reductions: max and min compare
 the bits, add and multiply round to float16 after every update, as float16
 arithmetic does."""
@@ -25,7 +25,7 @@ def test_vmapped_dynamic_slice_with_uint8_indices():
     assert_matches_cpu(jax.vmap(lambda row, start: lax.dynamic_slice(row, (start,), (2,))), x, starts)
 
 
-# Gathering along a non-last axis transposes the uint8 index first.
+# Gathering along a non-last axis transposes the index first.
 def test_take_along_first_axis_with_uint8_indices():
     x = np.arange(6 * 40, dtype=np.float32).reshape(6, 40)
     indices = np.random.default_rng(0).integers(0, 6, size=(6, 40)).astype(np.uint8)

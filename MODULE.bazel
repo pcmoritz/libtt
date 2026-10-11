@@ -338,7 +338,6 @@ http_archive(
         "//third_party/tt_metal:reduce_bitwise.patch",
         "//third_party/tt_metal:reduce_precision_kernel.patch",
         "//third_party/tt_metal:arange_uint8.patch",
-        "//third_party/tt_metal:gather_uint8_index.patch",
         "//third_party/tt_metal:reduce_uint32_max_min.patch",
     ],
     sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
