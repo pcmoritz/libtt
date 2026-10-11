@@ -1,52 +1,47 @@
-diff --git ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl
---- ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl
-+++ ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl
-@@ -12,6 +12,9 @@
-  */
- #include "ttnn/cpp/ttnn/kernel_lib/dfb_helpers_compute.hpp"
- #include "api/dataflow/dataflow_buffer.h"
+diff --git tt_metal/hw/inc/api/compute/tilize.h tt_metal/hw/inc/api/compute/tilize.h
+--- tt_metal/hw/inc/api/compute/tilize.h
++++ tt_metal/hw/inc/api/compute/tilize.h
+@@ -6,6 +6,9 @@
+ 
+ #include "api/compute/common.h"
+ #include "api/compute/sentinel/compute_kernel_sentinel.h"
 +#ifdef TILIZE_FLOAT16_TO_FLOAT32
 +#include "api/compute/eltwise_unary/typecast.h"
 +#endif
- 
- // JIT generates chlkc_descriptors.h (not per-variable files), included via chlkc_list.h.
- // The arrays are available in scope but guarded by TRISC type:
-@@ -54,6 +57,29 @@
- // Main Function Implementation
- // =============================================================================
- 
+ #ifdef TRISC_MATH
+ #include "llk_math_unary_datacopy_api.h"
+ #ifdef ARCH_BLACKHOLE
+@@ -61,6 +64,9 @@
+ #ifdef ARCH_BLACKHOLE
+     PACK((llk_pack_init<PackMode::Tilize, false /* zero_output */>(ocb, 1 /* num_tiles */, icb)));
+ #endif
 +#ifdef TILIZE_FLOAT16_TO_FLOAT32
-+// Unpacking Float16 flushes subnormals and -0 to +0. The factory instead declares the Float16 input as
-+// UInt16, so its raw bits reach the low half of each 32-bit Dest word, and the SFPU widens them exactly
-+// to Float32 before the tile is released to the packer.
-+template <bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
-+ALWI void tilize_block_float16_to_float32(uint32_t icb, uint32_t block, uint32_t ocb) {
-+    UNPACK((llk_unpack_tilize_block(icb, block, 0)));
-+
-+    for (uint32_t t = 0; t < block; t++) {
-+        MATH((llk_math_wait_for_dest_available()));
-+        PACK((llk_packer_wait_for_math_done()));
-+
-+        MATH((llk_math_eltwise_unary_datacopy<DataCopyType::A2D, is_fp32_dest_acc_en, BroadcastType::NONE, UnpackToDestEn>(
-+            0 /*dst index*/, icb)));
-+        typecast_tile<static_cast<uint32_t>(DataFormat::Float16), static_cast<uint32_t>(DataFormat::Float32)>(0);
-+        PACK((llk_pack<is_fp32_dest_acc_en, true, PackMode::Default>(0 /*tile index*/, ocb, t)));
-+
-+        MATH((llk_math_dest_section_done<is_fp32_dest_acc_en>()));
-+        PACK((llk_pack_dest_section_done<is_fp32_dest_acc_en>()));
-+    }
-+}
++    typecast_tile_init<static_cast<uint32_t>(DataFormat::Float16), static_cast<uint32_t>(DataFormat::Float32)>();
 +#endif
-+
- template <
-     uint32_t block_width_tiles,
-     uint32_t input_dfb,
-@@ -71,6 +97,17 @@
+ #else
+     // TODO(SK) #42757: Quasar unpack tilize could issue block_ct_dim tiles per MOP invocation, but scheduling
+     // block_ct_dim against full_ct_dim would need a compute-API-level workaround since BH/WH operate
+@@ -161,6 +167,11 @@
+         // Datacopy
+         MATH((llk_math_eltwise_unary_datacopy<DataCopyType::A2D, is_fp32_dest_acc_en, BroadcastType::NONE, UnpackToDestEn>(
+             0 /*dst index*/, icb)));
++#ifdef TILIZE_FLOAT16_TO_FLOAT32
++        // The factory declares the Float16 input as UInt16, so its raw bits reach Dest unchanged (unpacking
++        // Float16 would flush subnormals and -0). Widen them exactly before the tile is released to the packer.
++        typecast_tile<static_cast<uint32_t>(DataFormat::Float16), static_cast<uint32_t>(DataFormat::Float32)>(0);
++#endif
+         PACK((llk_pack<is_fp32_dest_acc_en, true, PackMode::Default>(0 /*tile index*/, ocb, t + output_tile_index)));
+ #else
+         MATH((llk_math_eltwise_unary_datacopy(0 /*dst index*/, icb)));
+diff --git ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl
+--- ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl
++++ ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl
+@@ -71,6 +71,17 @@
      static_assert(input_dfb < 32, "Invalid input_dfb: must be less than 32");
      static_assert(output_dfb < 32, "Invalid output_dfb: must be less than 32");
  
 +#ifdef TILIZE_FLOAT16_TO_FLOAT32
-+    // The raw Float16 bits are only interpreted correctly in this configuration.
++    // tilize_block widens raw Float16 bits, which are only interpreted correctly in this configuration.
 +    static_assert(DST_ACCUM_MODE, "Float16 -> Float32 tilize needs 32-bit Dest");
 +    static_assert(
 +        dfb_l1_format<input_dfb>() == static_cast<uint32_t>(DataFormat::UInt16),
@@ -59,28 +54,6 @@ diff --git ttnn/cpp/ttnn/kernel_lib/tilize_helpers.inl ttnn/cpp/ttnn/kernel_lib/
      // Runtime parameter validation
      ASSERT(num_blocks > 0);
  
-@@ -137,6 +174,9 @@
-         } else {
-             tilize_init(input_dfb, block_width_tiles, output_dfb);
-         }
-+#ifdef TILIZE_FLOAT16_TO_FLOAT32
-+        typecast_tile_init<static_cast<uint32_t>(DataFormat::Float16), static_cast<uint32_t>(DataFormat::Float32)>();
-+#endif
-     }
- 
-     // Construct DataflowBuffer objects for sync operations.
-@@ -184,7 +224,11 @@
-         if constexpr (use_fast) {
-             fast_tilize_block(input_dfb, block_width_tiles, output_dfb);
-         } else {
-+#ifdef TILIZE_FLOAT16_TO_FLOAT32
-+            tilize_block_float16_to_float32(input_dfb, block_width_tiles, output_dfb);
-+#else
-             tilize_block(input_dfb, block_width_tiles, output_dfb);
-+#endif
-         }
- 
-         out_dfb.push_back(block_width_tiles);
 diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
 --- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
 +++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
@@ -116,7 +89,7 @@ new file mode 100644
 +
 +// Unpacking Float16 flushes subnormals and -0 to +0. A Float16 -> Float32 tilize therefore declares its
 +// input as UInt16, so the raw bits reach 32-bit Dest unchanged, and the compute kernel
-+// (TILIZE_FLOAT16_TO_FLOAT32 in tilize_helpers.inl) widens them exactly with the SFPU before packing.
++// (TILIZE_FLOAT16_TO_FLOAT32 in tilize_block) widens them exactly with the SFPU before packing.
 +inline bool is_float16_to_float32_tilize(tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
 +    return input_dtype == tt::tt_metal::DataType::FLOAT16 && output_dtype == tt::tt_metal::DataType::FLOAT32;
 +}
@@ -138,8 +111,8 @@ new file mode 100644
 +inline tt::tt_metal::experimental::KernelSpec::CompilerOptions tilize_compiler_options(bool float16_to_float32) {
 +    tt::tt_metal::experimental::KernelSpec::CompilerOptions options{
 +        .opt_level = tt::tt_metal::KernelBuildOptLevel::O3};
-+    for (const auto& [name, value] : tilize_compute_defines(float16_to_float32)) {
-+        options.defines[name] = value;
++    if (float16_to_float32) {
++        options.defines["TILIZE_FLOAT16_TO_FLOAT32"] = "1";
 +    }
 +    return options;
 +}
