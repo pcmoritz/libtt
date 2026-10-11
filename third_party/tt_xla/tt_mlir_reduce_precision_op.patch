@@ -1,70 +1,63 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -3488,6 +3488,25 @@
-   let hasVerifier = 1;
+@@ -1478,6 +1478,23 @@
+     }];
  }
  
-+def TTIR_ReducePrecisionOp : TTIR_NamedOp<"reduce_precision"> {
-+  let summary = "Reduce precision operation.";
-+  let description = [{
-+    Rounds each element of a float32, bfloat16 or float16 tensor to a
-+    floating-point format with `exponent_bits` and `mantissa_bits`, as
-+    stablehlo.reduce_precision: round to nearest even, flush values below the
-+    format's smallest normal to signed zero, saturate overflows to signed
-+    infinity, and keep NaN. The result has the input's type.
-+  }];
++def TTIR_ReducePrecisionOp : TTIR_ElementwiseUnaryOp<"reduce_precision"> {
++    let summary = "Elementwise reduce precision operation.";
++    let description = [{
++      Rounds each element of a float32, bfloat16 or float16 tensor to a
++      floating-point format with `exponent_bits` and `mantissa_bits`, as
++      stablehlo.reduce_precision: round to nearest even, flush values below the
++      format's smallest normal to signed zero, saturate overflows to signed
++      infinity, and keep NaN. The result has the input's type.
++    }];
 +
-+  let arguments = (ins AnyRankedTensor:$input,
-+                       SI32Attr:$exponent_bits,
-+                       SI32Attr:$mantissa_bits);
++    let arguments = (ins AnyRankedTensor:$input,
++                         SI32Attr:$exponent_bits,
++                         SI32Attr:$mantissa_bits);
 +
-+  let results = (outs AnyRankedTensor:$result);
-+
-+  let hasVerifier = 1;
++    let hasVerifier = 1;
 +}
 +
- def TTIR_SoftmaxOp : TTIR_NamedOp<"softmax"> {
-     let summary = "Softmax normalization operation.";
-     let description = [{
+ class TTIR_ElementwiseBinaryOp<string mnemonic, list<Trait> traits = []> :
+     TTIR_ElementwiseOp<mnemonic, [TwoOperands, TTIR_ElementwiseBinary, TTIR_QuantizableOpInterface] #  traits> {
+     let summary = "Base class for elementwise operations with two input tensors.";
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -1377,6 +1377,23 @@
-   let hasVerifier = 1;
+@@ -704,6 +704,29 @@
+     }];
  }
  
-+def TTNN_ReducePrecisionOp : TTNN_Op<"reduce_precision", [OpModelExempt]> {
-+  let summary = "Reduce precision op.";
-+  let description = [{
-+    Rounds a float32, bfloat16 or float16 tensor to a floating-point format
-+    with `exponent_bits` and `mantissa_bits`, like XLA's reduce_precision, in
-+    one kernel on the raw bits.
-+  }];
++def TTNN_ReducePrecisionOp : TTNN_ElementwiseUnaryOp<"reduce_precision", [OpModelExempt]> {
++    let summary = "Eltwise reduce precision op.";
++    let description = [{
++      Rounds a float32, bfloat16 or float16 tensor to a floating-point format
++      with `exponent_bits` and `mantissa_bits`, like XLA's reduce_precision, in
++      one kernel on the raw bits.
++    }];
 +
-+  let arguments = (ins AnyRankedTensor:$input,
-+                       SI32Attr:$exponent_bits,
-+                       SI32Attr:$mantissa_bits);
++    let arguments = (ins AnyRankedTensor:$input,
++                         SI32Attr:$exponent_bits,
++                         SI32Attr:$mantissa_bits);
 +
-+  let results = (outs AnyRankedTensor:$result);
++    let builders =
++    [
++      OpBuilder<(ins "Value": $input, "int32_t": $exponent_bits, "int32_t": $mantissa_bits),
++      [{
++        build($_builder, $_state, {input.getType()}, input, exponent_bits, mantissa_bits);
++      }]>
++    ];
 +
-+  let hasVerifier = 1;
++    let hasVerifier = 1;
 +}
 +
- def TTNN_ConcatenateHeadsOp: TTNN_Op<"concatenate_heads"> {
-     let summary = "Concatenate heads op used in attention layer.";
-     let description = [{
-diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
---- a/include/ttmlir/Target/TTNN/program.fbs
-+++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -188,6 +188,7 @@
-   CopyOp,
-   WhileOp,
-   CumulativeOp,
-+  ReducePrecisionOp,
- }
+ def TTNN_AddOp : TTNN_ElementwiseBinaryOp<"add"> {
  
- table Operation {
+     let summary = "Eltwise add.";
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
@@ -91,14 +84,14 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  class CumProdOpConversionPattern : public OpConversionPattern<ttir::CumProdOp> {
  public:
    using OpConversionPattern<ttir::CumProdOp>::OpConversionPattern;
-@@ -4086,6 +4102,7 @@
-            CumSumOpConversionPattern,
-            CumProdOpConversionPattern,
-            CumulativeOpConversionPattern,
+@@ -4077,6 +4093,7 @@
+            ReductionProdOpConversionPattern,
+            ReductionArgMaxOpConversionPattern,
+            ElementwiseUnaryWithFloatParameterOpConversionPattern<ttir::LeakyReluOp, ttnn::LeakyReluOp>,
 +           ReducePrecisionOpConversionPattern,
-            RepeatInterleaveOpConversionPattern,
-            SoftmaxOpConversionPattern,
-            SortOpConversionPattern,
+            BroadcastOpConversionPattern,
+            PadOpConversionPattern,
+            PowOpConversionPattern,
 diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 --- a/lib/Dialect/TTIR/IR/TTIROps.cpp
 +++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
@@ -157,159 +150,77 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -681,6 +681,19 @@
-                                             dtype, memoryConfig);
- }
- 
-+::flatbuffers::Offset<::tt::target::ttnn::ReducePrecisionOp>
-+createOp(FlatbufferObjectCache &cache, ReducePrecisionOp op) {
-+  auto in = cache.at<::tt::target::ttnn::TensorRef>(
-+      getOperandThroughDPSOps(op.getInput()));
-+  auto output = cache.getOrCreateNoSharding(op.getResult(),
-+                                            tensorValueToFlatbuffer,
-+                                            /*local_shape*/ std::nullopt);
-+  auto memoryConfig = toFlatbuffer(cache, op.getMemoryConfigAttr());
-+  return ::tt::target::ttnn::CreateReducePrecisionOp(
-+      *cache.fbb, in, output, op.getExponentBits(), op.getMantissaBits(),
-+      memoryConfig);
-+}
-+
- ::flatbuffers::Offset<::tt::target::ttnn::CumulativeOp>
- createOp(FlatbufferObjectCache &cache, CumulativeOp op) {
-   auto in = cache.at<::tt::target::ttnn::TensorRef>(
-@@ -5301,6 +5314,11 @@
-     return createOperation(cache, createOp(cache, cumProdOp), debugString,
-                            locInfo);
+@@ -2959,6 +2959,13 @@
+                  .Union();
+   } else if constexpr (std::is_same_v<EltwiseUnaryOp, BitwiseNotOp>) {
+     type = ::tt::target::ttnn::EltwiseUnaryOpType::BitwiseNot;
++  } else if constexpr (std::is_same_v<EltwiseUnaryOp, ReducePrecisionOp>) {
++    type = ::tt::target::ttnn::EltwiseUnaryOpType::ReducePrecision;
++    paramsType = ::tt::target::ttnn::EltwiseUnaryOpParams::
++        EltwiseUnaryReducePrecisionParams;
++    params = ::tt::target::ttnn::CreateEltwiseUnaryReducePrecisionParams(
++                 *cache.fbb, op.getExponentBits(), op.getMantissaBits())
++                 .Union();
+   } else {
+     llvm_unreachable("unhandled EltwiseUnaryOp");
+   }
+@@ -5218,6 +5225,12 @@
+     return createOperation(cache, createEltwiseUnaryOp(cache, leakyReluOp),
+                            debugString, locInfo);
    }
 +  if (auto reducePrecisionOp = dyn_cast<ReducePrecisionOp>(op);
 +      reducePrecisionOp) {
-+    return createOperation(cache, createOp(cache, reducePrecisionOp),
++    return createOperation(cache,
++                           createEltwiseUnaryOp(cache, reducePrecisionOp),
 +                           debugString, locInfo);
 +  }
-   if (auto cumulativeOp = dyn_cast<CumulativeOp>(op); cumulativeOp) {
-     return createOperation(cache, createOp(cache, cumulativeOp), debugString,
-                            locInfo);
-diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
---- a/runtime/lib/ttnn/program_executor.cpp
-+++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -68,6 +68,7 @@
- #include "operations/eltwise/ternary/where.h"
- #include "operations/eltwise/unary/unary.h"
- #include "operations/eltwise/unary/unary_composite.h"
-+#include "operations/eltwise/unary/reduce_precision.h"
- #include "operations/embedding/embedding.h"
- #include "operations/embedding/embedding_backward.h"
- #include "operations/experimental/dropout.h"
-@@ -410,6 +411,10 @@
-     return operations::reduction::cumulative::run(op->type_as_CumulativeOp(),
-                                                   getContext());
-   }
-+  case ::tt::target::ttnn::OpType::ReducePrecisionOp: {
-+    return operations::eltwise::unary::reduce_precision::run(
-+        op->type_as_ReducePrecisionOp(), getContext());
-+  }
-   case ::tt::target::ttnn::OpType::ReductionArgMaxOp: {
-     return operations::reduction::run(op->type_as_ReductionArgMaxOp(),
-                                       getContext());
-diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
---- a/runtime/lib/ttnn/runtime.cpp
-+++ b/runtime/lib/ttnn/runtime.cpp
-@@ -1468,6 +1468,10 @@
-     tensorRefs = {opContext.type_as_CumulativeOp()->out()};
-     break;
-   }
-+  case ::tt::target::ttnn::OpType::ReducePrecisionOp: {
-+    tensorRefs = {opContext.type_as_ReducePrecisionOp()->out()};
-+    break;
-+  }
-   case ::tt::target::ttnn::OpType::RandOp: {
-     tensorRefs = {opContext.type_as_RandOp()->out()};
-     break;
-@@ -2103,6 +2107,10 @@
-     tensorRefs = {opContext.type_as_CumulativeOp()->in()};
-     break;
-   }
-+  case ::tt::target::ttnn::OpType::ReducePrecisionOp: {
-+    tensorRefs = {opContext.type_as_ReducePrecisionOp()->in()};
-+    break;
-+  }
-   case ::tt::target::ttnn::OpType::ReductionArgMaxOp: {
-     tensorRefs = {opContext.type_as_ReductionArgMaxOp()->in()};
-     break;
+   if (auto ceilOp = dyn_cast<CeilOp>(op); ceilOp) {
+     return createOperation(cache, createEltwiseUnaryOp(cache, ceilOp),
+                            debugString, locInfo);
 diff --git a/include/ttmlir/Target/TTNN/operations/eltwise.fbs b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
 --- a/include/ttmlir/Target/TTNN/operations/eltwise.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
-@@ -198,6 +198,15 @@
-   params: EltwiseUnaryOpParams;
- }
- 
-+// Rounds to a floating-point format with the given widths (ttnn.reduce_precision).
-+table ReducePrecisionOp {
-+  in: tt.target.ttnn.TensorRef;
-+  out: tt.target.ttnn.TensorRef;
+@@ -184,10 +184,18 @@
+   Asin,
+   Asinh,
+   Round,
++  ReducePrecision,
++}
++
++// Target format of ReducePrecision.
++table EltwiseUnaryReducePrecisionParams {
 +  exponent_bits: uint32;
 +  mantissa_bits: uint32;
-+  memcfg: tt.target.ttnn.MemoryConfig;
-+}
-+
- enum EltwiseUnaryCompositeOpType: uint32 {
-   Cbrt,
-   ClampScalar,
-diff --git a/runtime/lib/ttnn/operations/eltwise/unary/reduce_precision.cpp b/runtime/lib/ttnn/operations/eltwise/unary/reduce_precision.cpp
-new file mode 100644
---- /dev/null
-+++ b/runtime/lib/ttnn/operations/eltwise/unary/reduce_precision.cpp
-@@ -0,0 +1,32 @@
-+// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
-+//
-+// SPDX-License-Identifier: Apache-2.0
-+
-+#include "operations/eltwise/unary/reduce_precision.h"
-+
-+#include "tt/runtime/detail/common/logger.h"
-+#include "tt/runtime/detail/ttnn/ttnn.h"
-+
-+#include "tt/runtime/detail/ttnn/operations/utils.h"
-+#include "tt/runtime/detail/ttnn/utils.h"
-+#include "ttmlir/Target/TTNN/program_generated.h"
-+#include "ttnn/operations/eltwise/unary/unary.hpp"
-+
-+#include <optional>
-+
-+namespace tt::runtime::ttnn::operations::eltwise::unary::reduce_precision {
-+void run(const ::tt::target::ttnn::ReducePrecisionOp *op,
-+         ProgramContext &context) {
-+  ProgramTensorPool &tensorPool = context.getTensorPool();
-+  const ::ttnn::Tensor &in = tensorPool.getTTNNTensorAndValidate(op->in());
-+
-+  std::optional<::ttnn::MemoryConfig> outputMemoryConfig =
-+      ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(op->memcfg());
-+
-+  ::ttnn::Tensor out =
-+      ::ttnn::reduce_precision(in, op->exponent_bits(), op->mantissa_bits(),
-+                               outputMemoryConfig);
-+
-+  tensorPool.insertTTNNTensorAndValidate(op->out(), out);
-+}
-+} // namespace tt::runtime::ttnn::operations::eltwise::unary::reduce_precision
-diff --git a/runtime/lib/ttnn/operations/eltwise/unary/reduce_precision.h b/runtime/lib/ttnn/operations/eltwise/unary/reduce_precision.h
-new file mode 100644
---- /dev/null
-+++ b/runtime/lib/ttnn/operations/eltwise/unary/reduce_precision.h
-@@ -0,0 +1,16 @@
-+// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
-+//
-+// SPDX-License-Identifier: Apache-2.0
-+
-+#ifndef RUNTIME_LIB_TTNN_OPERATIONS_ELTWISE_UNARY_REDUCE_PRECISION_H
-+#define RUNTIME_LIB_TTNN_OPERATIONS_ELTWISE_UNARY_REDUCE_PRECISION_H
-+
-+#include "tt/runtime/detail/ttnn/types/types.h"
-+#include "ttmlir/Target/TTNN/program_generated.h"
-+
-+namespace tt::runtime::ttnn::operations::eltwise::unary::reduce_precision {
-+void run(const ::tt::target::ttnn::ReducePrecisionOp *op,
-+         ProgramContext &context);
-+} // namespace tt::runtime::ttnn::operations::eltwise::unary::reduce_precision
-+
-+#endif // RUNTIME_LIB_TTNN_OPERATIONS_ELTWISE_UNARY_REDUCE_PRECISION_H
+ }
+ 
+ union EltwiseUnaryOpParams {
+-  EltwiseOpWithFloatParams
++  EltwiseOpWithFloatParams,
++  EltwiseUnaryReducePrecisionParams
+ }
+ 
+ table EltwiseUnaryOp {
+diff --git a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
+--- a/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
++++ b/runtime/lib/ttnn/operations/eltwise/unary/unary.cpp
+@@ -276,6 +276,20 @@
+     runEltwiseUnaryWithFloatParameterOp(op, tensorPool, ::ttnn::leaky_relu);
+     break;
+   }
++  case ::tt::target::ttnn::EltwiseUnaryOpType::ReducePrecision: {
++    const auto *params = op->params_as_EltwiseUnaryReducePrecisionParams();
++    runEltwiseUnaryOp(
++        op, tensorPool,
++        [&](const ::ttnn::Tensor &input,
++            const std::optional<::ttnn::MemoryConfig> &memoryConfig,
++            const std::optional<::ttnn::Tensor> &optionalOutput,
++            const std::optional<::ttnn::CoreRangeSet> &) {
++          return ::ttnn::reduce_precision(input, params->exponent_bits(),
++                                          params->mantissa_bits(), memoryConfig,
++                                          optionalOutput);
++        });
++    break;
++  }
+   case ::tt::target::ttnn::EltwiseUnaryOpType::BitwiseNot: {
+     runEltwiseUnaryOp(op, tensorPool, ::ttnn::bitwise_not);
+     break;
