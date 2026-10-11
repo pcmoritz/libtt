@@ -1,12 +1,13 @@
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_reduce.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_reduce.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_reduce.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_reduce.h
-@@ -1664,14 +1664,24 @@
+@@ -1664,14 +1664,22 @@
   * config, and being a symmetric exchange it leaves the corrected extreme in whichever register the
   * caller reads next. Mirrors calculate_binary_max_min_int32 in ckernel_sfpu_binary_max_min.h.
   *
-+ * For UInt32 (IS_UNSIGNED) sign-magnitude order is right only when neither operand has its top bit set,
-+ * so the pair is re-exchanged on lanes where either does (one extra instruction).
++ * For UInt32 (IS_UNSIGNED) the caller reverses the MAX/MIN direction: sign-magnitude order then ranks
++ * unsigned values correctly whenever either top bit is set, and the pair is re-exchanged on lanes where
++ * both top bits are clear (as in calculate_binary_max_min_int32's unsigned path).
 + *
   * @tparam HIGH_LREG The srcC register of the compare-and-swap.
   * @tparam LOW_LREG  The dest register of the compare-and-swap.
@@ -15,21 +16,18 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
 -template <std::uint32_t HIGH_LREG, std::uint32_t LOW_LREG>
 +template <std::uint32_t HIGH_LREG, std::uint32_t LOW_LREG, bool IS_UNSIGNED = false>
  inline void _emit_int32_signed_cswap_() {
++    // Signed: re-exchange where both operands are negative. Unsigned: where both top bits are clear.
++    constexpr std::uint32_t RESWAP_CONDITION =
++        IS_UNSIGNED ? sfpi::SFPSETCC_MOD1_LREG_GTE0 : sfpi::SFPSETCC_MOD1_LREG_LT0;
      TTI_SFPSWAP(0, HIGH_LREG, LOW_LREG, sfpi::SFPSWAP_MOD1_VEC_MIN_MAX);
 -    TTI_SFPSETCC(0, LOW_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_LT0);   // cc: LOW_LREG < 0
 -    TTI_SFPSETCC(0, HIGH_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_LT0);  // cc &= HIGH_LREG < 0 (both negative)
-+    if constexpr (IS_UNSIGNED) {
-+        TTI_SFPSETCC(0, LOW_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_GTE0);   // cc: LOW_LREG top bit clear
-+        TTI_SFPSETCC(0, HIGH_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_GTE0);  // cc &= HIGH_LREG top bit clear
-+        TTI_SFPCOMPC(0, 0, 0, 0);                                       // cc: either top bit set
-+    } else {
-+        TTI_SFPSETCC(0, LOW_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_LT0);   // cc: LOW_LREG < 0
-+        TTI_SFPSETCC(0, HIGH_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_LT0);  // cc &= HIGH_LREG < 0 (both negative)
-+    }
++    TTI_SFPSETCC(0, LOW_LREG, 0, RESWAP_CONDITION);   // cc: LOW_LREG condition
++    TTI_SFPSETCC(0, HIGH_LREG, 0, RESWAP_CONDITION);  // cc &= HIGH_LREG condition (both)
      TTI_SFPSWAP(0, HIGH_LREG, LOW_LREG, sfpi::SFPSWAP_MOD1_SWAP);
      TTI_SFPENCC(0, 0, 0, 0);
  }
-@@ -1684,6 +1694,7 @@
+@@ -1684,6 +1692,7 @@
   * are emitted sequentially rather than interleaved because each signed compare-and-swap manages its own
   * condition-code state (SFPSETCC/SFPENCC) and must not be interleaved with another.
   */
@@ -37,7 +35,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
  inline void horizontal_reduce_max_int32() {
      // Phase 1: rotate by 4 and compare -> 8 values become 4 duplicated pair extrema.
      TTI_SFPMOV(0, p_sfpu::LREG0, p_sfpu::LREG1, 0);
-@@ -1696,8 +1707,8 @@
+@@ -1696,8 +1705,8 @@
      TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
      TTI_SFPSHFT2(0, p_sfpu::LREG1, p_sfpu::LREG1, 3);
      TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
@@ -48,7 +46,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
  
      // Phase 2: rotate by 2 and compare -> pair extrema become duplicated quad extrema.
      TTI_SFPMOV(0, p_sfpu::LREG0, p_sfpu::LREG1, 0);
-@@ -1706,8 +1717,8 @@
+@@ -1706,8 +1715,8 @@
      TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
      TTI_SFPSHFT2(0, p_sfpu::LREG1, p_sfpu::LREG1, 3);
      TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
@@ -59,7 +57,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
  
      // Phase 3: rotate by 1 and compare -> quad extrema become the full 8-column extreme in every column.
      // The rotate butterfly replicates the extreme across all 8 columns, so no final "move to col 0"
-@@ -1716,14 +1727,15 @@
+@@ -1716,14 +1725,15 @@
      TTI_SFPMOV(0, p_sfpu::LREG4, p_sfpu::LREG5, 0);
      TTI_SFPSHFT2(0, p_sfpu::LREG1, p_sfpu::LREG1, 3);
      TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
@@ -77,7 +75,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
  inline void perform_reduce_row_max_tile_int32(std::uint32_t tile_row_offset, std::uint32_t result_store_mode) {
      constexpr InstrModLoadStore INSTRUCTION_MODE = InstrModLoadStore::INT32;
  #pragma GCC unroll 2
-@@ -1767,15 +1779,15 @@
+@@ -1767,15 +1777,15 @@
  
              // Vertical reduce via signed compare-and-swap (each is self-contained w.r.t. condition codes,
              // so unlike the float path they are emitted sequentially rather than interleaved).
@@ -100,7 +98,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
  
              TT_SFPSTORE(
                  p_sfpu::LREG0, result_store_mode, ADDR_MOD_7, tile_row_offset + face_pair_base + row_offset_first);
-@@ -1790,6 +1802,7 @@
+@@ -1790,6 +1800,7 @@
   *        plain INT32 and uses the signed compare-and-swap. Named _signed to avoid colliding with the
   *        sign-magnitude max_first_columns_across_tiles_int32 above (still used by the UInt16/UInt32 path).
   */
@@ -108,7 +106,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
  inline void max_first_columns_across_tiles_int32_signed(std::uint32_t tile_row_base, std::uint32_t block_ct_dim) {
      constexpr InstrModLoadStore INSTRUCTION_MODE = InstrModLoadStore::INT32;
      constexpr std::uint32_t RESULT_ROWS[8] = {0, 4, 8, 12, 32, 36, 40, 44};
-@@ -1810,10 +1823,10 @@
+@@ -1810,10 +1821,10 @@
              TT_SFPLOAD(p_sfpu::LREG6, INSTRUCTION_MODE, ADDR_MOD_7, tile_offset + RESULT_ROWS[base_idx + 2]);
              TT_SFPLOAD(p_sfpu::LREG7, INSTRUCTION_MODE, ADDR_MOD_7, tile_offset + RESULT_ROWS[base_idx + 3]);
  
@@ -123,7 +121,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
          }
  
          TT_SFPSTORE(p_sfpu::LREG0, INSTRUCTION_MODE, ADDR_MOD_7, tile_row_base + RESULT_ROWS[base_idx + 0]);
-@@ -1828,7 +1841,7 @@
+@@ -1828,7 +1839,7 @@
   *        but routes through the signed-Int32 per-tile and cross-tile helpers (horizontal_reduce_max_int32
   *        is fully inline, no recorded buffer). Correct over the full Int32 range.
   */
@@ -132,7 +130,17 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
  inline void perform_reduce_row_max_min_int32(std::uint32_t block_ct_dim, std::uint32_t block_rt_dim) {
      static_assert(
          pool_type == PoolType::MAX || pool_type == PoolType::MIN,
-@@ -1854,11 +1867,11 @@
+@@ -1840,7 +1851,8 @@
+     // MIN sets bit 8. The signed compare-and-swap's VEC_MIN_MAX obeys this bit; its both-negative fix is a
+     // direction-independent unconditional exchange.
+     _init_sfpu_config_reg();
+-    if constexpr (pool_type == PoolType::MIN) {
++    // UInt32 reverses the direction (see _emit_int32_signed_cswap_).
++    if constexpr ((pool_type == PoolType::MIN) != IS_UNSIGNED) {
+         TTI_SFPLOADI(ckernel::p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_LOWER, 0x0100);  // bit 8
+         TTI_SFPLOADI(ckernel::p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_UPPER, 0x0000);
+         TTI_SFPCONFIG(0, 0xF, 0);
+@@ -1854,11 +1866,11 @@
  
          for (std::uint32_t j = 0; j < block_ct_dim; j++) {
              std::uint32_t tile_offset = tile_row_offset + (ROWS_PER_TILE * j);
@@ -146,7 +154,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
          }
      }
  }
-@@ -1870,7 +1883,7 @@
+@@ -1870,19 +1882,20 @@
   *
   * @tparam pool_type The PoolType enum value (MAX or MIN). MAX inverts the swap direction here.
   */
@@ -154,16 +162,18 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
 +template <PoolType pool_type, bool IS_UNSIGNED = false>
  inline void init_reduce_max_min_int32_signed() {
      _init_sfpu_config_reg();
-     if constexpr (pool_type == PoolType::MAX) {
-@@ -1879,10 +1892,10 @@
+-    if constexpr (pool_type == PoolType::MAX) {
++    // UInt32 reverses the direction (see _emit_int32_signed_cswap_).
++    if constexpr ((pool_type == PoolType::MAX) != IS_UNSIGNED) {
+         TTI_SFPLOADI(ckernel::p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_LOWER, 0x0100);  // Load lower 16 bits (bit 8)
+         TTI_SFPLOADI(ckernel::p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_UPPER, 0x0000);  // Load upper 16 bits
          TTI_SFPCONFIG(0, 0xF, 0);
      }
  
--    lltt::record(0, 3 * INT32_SIGNED_CSWAP_LEN);
+     lltt::record(0, 3 * INT32_SIGNED_CSWAP_LEN);
 -    _emit_int32_signed_cswap_<p_sfpu::LREG7, p_sfpu::LREG6>();
 -    _emit_int32_signed_cswap_<p_sfpu::LREG6, p_sfpu::LREG5>();
 -    _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG4>();
-+    lltt::record(0, 3 * (INT32_SIGNED_CSWAP_LEN + IS_UNSIGNED));
 +    _emit_int32_signed_cswap_<p_sfpu::LREG7, p_sfpu::LREG6, IS_UNSIGNED>();
 +    _emit_int32_signed_cswap_<p_sfpu::LREG6, p_sfpu::LREG5, IS_UNSIGNED>();
 +    _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG4, IS_UNSIGNED>();
@@ -179,15 +189,6 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
  inline void calculate_reduce_max_min_int32_col() {
      static_assert(reduce_dim == ReduceDim::REDUCE_COL, "Only column reduction (REDUCE_COL) is supported here");
      static_assert(
-@@ -1904,7 +1917,7 @@
-         "Only MAX and MIN pool types are supported for this function");
- 
-     constexpr InstrModLoadStore INSTRUCTION_MODE = InstrModLoadStore::INT32;
--    constexpr std::uint32_t REPLAY_LEN = 3 * INT32_SIGNED_CSWAP_LEN;
-+    constexpr std::uint32_t REPLAY_LEN = 3 * (INT32_SIGNED_CSWAP_LEN + IS_UNSIGNED);
- 
-     constexpr std::uint32_t ODD_COLUMNS = 2;
-     constexpr std::uint32_t COLUMN_OFFSETS[4] = {0, 2, 0, 2};  // even, odd, even, odd
 @@ -1943,8 +1956,8 @@
          TTI_SFPTRANSP(0, 0, 0, 0);
  
@@ -314,7 +315,13 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp ttnn/cpp
 diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
 --- ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
-@@ -85,6 +85,9 @@
+@@ -80,11 +80,14 @@
+     }
+     if (dtype == tt::tt_metal::DataType::INT32) {
+         switch (reduce_math) {
+-            case tt::tt_metal::ReduceOpMath::MAX: return ttnn::PadValue{uint32_t{0x80000001}};  // INT32_MIN + 1
++            case tt::tt_metal::ReduceOpMath::MAX: return ttnn::PadValue{uint32_t{0x80000000}};  // INT32_MIN
+             case tt::tt_metal::ReduceOpMath::MIN: return ttnn::PadValue{uint32_t{0x7FFFFFFF}};  // INT32_MAX
              default: return ttnn::PadValue{uint32_t{0}};
          }
      }
@@ -344,7 +351,18 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/
 diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
 --- ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
-@@ -128,6 +128,10 @@
+@@ -119,15 +119,18 @@
+     // ops use bit_cast<uint32_t> on the INT32 branch to recover the original int32 bits.
+     if (dtype == tt::tt_metal::DataType::INT32) {
+         if (reduce_type == reduction_common::ReduceType::Max) {
+-            // SFPU int32 MAX reduce can return an incorrect maximum when the INT32_MIN bit pattern (0x80000000)
+-            // appears in padded lanes; use INT32_MIN + 1 instead.
+-            return std::bit_cast<float>(static_cast<uint32_t>(0x80000001u));  // INT32_MIN + 1
++            // The signed compare-and-swap ranks INT32_MIN correctly, so it is the exact identity.
++            return std::bit_cast<float>(static_cast<uint32_t>(0x80000000u));  // INT32_MIN
+         }
+         if (reduce_type == reduction_common::ReduceType::Min) {
+             return std::bit_cast<float>(static_cast<uint32_t>(0x7FFFFFFFu));  // INT32_MAX
          }
          return 0.0f;
      }
@@ -355,7 +373,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
  
      return reduce_type == reduction_common::ReduceType::Max
                 ? -std::numeric_limits<float>::infinity()
-@@ -224,7 +228,8 @@
+@@ -224,7 +227,8 @@
                      int reduce_dim = i_dim;
                      if (transpose) {
                          output_tensor = ttnn::transpose(output_tensor, i_dim, -2, memory_config, pad_value);
@@ -365,7 +383,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
                              // Transposes pad UINT32 numerically, which cannot express all ones.
                              output_tensor = ttnn::fill_implicit_tile_padding(
                                  output_tensor, ttnn::PadValue{std::bit_cast<uint32_t>(pad_value)});
-@@ -603,6 +608,7 @@
+@@ -603,6 +607,7 @@
      // For INT32 the pad sentinel is carried as a raw bit pattern (see get_pad_value); pass it through
      // PadValue's integer arm so fill_pad reinterprets the bits rather than decoding numerically.
      const ttnn::PadValue fill_pad_value = input_tensor_arg.dtype() == tt::tt_metal::DataType::INT32 ||

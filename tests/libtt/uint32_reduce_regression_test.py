@@ -27,22 +27,32 @@ def run(f, x):
     return np.asarray(jax.jit(f)(jax.device_put(x, jax.devices("tt")[0])))
 
 
-@pytest.mark.parametrize("op", [jnp.max, jnp.min], ids=["max", "min"])
+# NumPy references: jnp would run the reference on the TT device too.
+OPS = [(jnp.max, np.max), (jnp.min, np.min)]
+
+
+@pytest.mark.parametrize("jax_op, numpy_op", OPS, ids=["max", "min"])
 @pytest.mark.parametrize("dtype", [np.uint32, np.int32], ids=["u32", "i32"])
 # Several tiles with partial ones, so tile folding and padding identities matter.
 @pytest.mark.parametrize("axis", [0, 1, 2, (1, 2), None], ids=["d0", "d1", "d2", "d12", "all"])
-def test_integer_max_min(op, dtype, axis):
+def test_integer_max_min(jax_op, numpy_op, dtype, axis):
     x = values(dtype, (3, 40, 70))
-    np.testing.assert_array_equal(run(lambda v: op(v, axis=axis), x), op(x, axis=axis))
+    np.testing.assert_array_equal(run(lambda v: jax_op(v, axis=axis), x), numpy_op(x, axis=axis))
 
 
 # A single extreme value in a later tile decides each result.
-@pytest.mark.parametrize("op", [jnp.max, jnp.min], ids=["max", "min"])
+@pytest.mark.parametrize("jax_op, numpy_op", OPS, ids=["max", "min"])
 @pytest.mark.parametrize("axis", [1, 2], ids=["d1", "d2"])
-def test_uint32_decisive_value(op, axis):
-    x = np.full((2, 40, 70), 0x80000000 if op is jnp.max else 0x7FFFFFFF, np.uint32)
-    x[1, 39, 69] = 0xFFFFFFFF if op is jnp.max else 0
-    np.testing.assert_array_equal(run(lambda v: op(v, axis=axis), x), op(x, axis=axis))
+def test_uint32_decisive_value(jax_op, numpy_op, axis):
+    x = np.full((2, 40, 70), 0x80000000 if numpy_op is np.max else 0x7FFFFFFF, np.uint32)
+    x[1, 39, 69] = 0xFFFFFFFF if numpy_op is np.max else 0
+    np.testing.assert_array_equal(run(lambda v: jax_op(v, axis=axis), x), numpy_op(x, axis=axis))
+
+
+# The padding identity must not win: a padded slice whose maximum is INT32_MIN.
+def test_int32_max_of_int32_min():
+    x = np.full((2, 33), np.iinfo(np.int32).min, np.int32)
+    np.testing.assert_array_equal(run(lambda v: jnp.max(v, axis=1), x), np.max(x, axis=1))
 
 
 def test_uint32_ptp_and_nanmin():
