@@ -1,6 +1,6 @@
-"""Gather with uint8 indices (widened to 32 bits for ttnn.gather), scatter with
-an empty update (a no-op), and float16 scatter reductions (computed in
-float32, as tt-metal has no float16 scatter reductions)."""
+"""Gather with uint8 indices (cast to uint32 for ttnn.gather), scatter with an
+empty update (a no-op), and float16 scatter reductions, which tt-metal now
+rounds to float16 after every update, as float16 arithmetic does."""
 
 import jax
 import jax.numpy as jnp
@@ -38,3 +38,30 @@ def test_float16_scatter_add():
     indices = np.array([0, 2, 2, 7], np.int32)
     updates = np.array([0.5, 1.25, -2.0, 3.0], np.float16)
     assert_matches_cpu(lambda a, i, u: a.at[i].add(u), x, indices, updates)
+
+
+# Each update rounds to float16: 2048 + 1 rounds back to 2048 twice, where
+# accumulating in float32 and rounding once would give 2050.
+def test_float16_scatter_add_rounds_every_update():
+    x = np.array([2048], np.float16)
+    indices = np.array([0, 0], np.int32)
+    updates = np.array([1, 1], np.float16)
+    got = on("tt", lambda a, i, u: a.at[i].add(u), x, indices, updates)
+    np.testing.assert_array_equal(got, np.array([2048], np.float16))
+    assert_matches_cpu(lambda a, i, u: a.at[i].add(u), x, indices, updates)
+
+
+# The gradient of overlapping max-pooling windows is a float16
+# select_and_scatter, which accumulates several weighted updates per element.
+def test_float16_select_and_scatter_add():
+    x = np.random.default_rng(1).permutation(64).astype(np.float16).reshape(8, 8)
+    w = (np.random.default_rng(2).integers(1, 64, size=(7, 7)) * 0.37).astype(np.float16)
+
+    def grad(a, weights):
+        def pooled(v):
+            windows = lax.reduce_window(v, np.float16(-np.inf), lax.max, (2, 2), (1, 1), "VALID")
+            return jnp.sum((windows * weights).astype(np.float32))
+
+        return jax.grad(pooled)(a)
+
+    assert_matches_cpu(grad, x, w)

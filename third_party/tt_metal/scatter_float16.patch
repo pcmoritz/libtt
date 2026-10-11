@@ -1,39 +1,134 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
 --- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
 +++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/common.hpp
-@@ -31,6 +31,11 @@ struct df_to_std<DataFormat::Float16_b> {
-     using std_type = uint16_t;
+@@ -32,6 +32,11 @@
  };
  
-+template <>
+ template <>
 +struct df_to_std<DataFormat::Float16> {
 +    using std_type = uint16_t;
 +};
 +
- template <>
++template <>
  struct df_to_std<DataFormat::Int32> {
      using std_type = int32_t;
-diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_device_operation.cpp
---- ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_device_operation.cpp
-@@ -22,7 +22,7 @@ ScatterDeviceOperation::program_factory_t ScatterDeviceOperation::select_program
- }
- 
- void ScatterDeviceOperation::validate_on_program_cache_miss(
--    const operation_attributes_t& /*args*/, const tensor_args_t& tensor_args) {
-+    const operation_attributes_t& args, const tensor_args_t& tensor_args) {
-     const auto& input_tensor{tensor_args.input_tensor};
-     const auto& index_tensor{tensor_args.index_tensor};
-     const auto& src_tensor{tensor_args.src_tensor};
-@@ -30,6 +30,11 @@ void ScatterDeviceOperation::validate_on_program_cache_miss(
-     const auto& index_dtype{index_tensor.dtype()};
-     const auto& src_dtype{src_tensor.dtype()};
- 
-+    TT_FATAL(
-+        input_dtype != DataType::FLOAT16 ||
-+            args.opt_reduction == ttnn::operations::data_movement::scatter::ScatterReductionType::INVALID,
-+        "Float16 scatter reductions are not supported.");
+ };
+diff --git tt_metal/hw/inc/api/numeric/float16.h tt_metal/hw/inc/api/numeric/float16.h
+new file mode 100644
+--- /dev/null
++++ tt_metal/hw/inc/api/numeric/float16.h
+@@ -0,0 +1,74 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
++//
++// SPDX-License-Identifier: Apache-2.0
 +
-     TT_FATAL(
-         input_dtype == src_dtype,
-         "input_dtype differs from src_dtype (input_dtype: {}, src_dtype: {}).",
++#pragma once
++
++#include <cstring>
++#include <stdint.h>
++
++#include "internal/risc_attribs.h"
++
++// Scalar IEEE float16 conversions for data movement kernels. Integer-only, so they stay exact under the
++// -ffast-math the kernels build with.
++
++// Convert float16 (stored as uint16_t) to float. Exact, including subnormals, infinities and NaN.
++FORCE_INLINE float fp16_to_fp32(std::uint16_t fp16) {
++    std::uint32_t sign = static_cast<std::uint32_t>(fp16 & 0x8000u) << 16;
++    std::uint32_t exponent = (fp16 >> 10) & 0x1Fu;
++    std::uint32_t mantissa = fp16 & 0x3FFu;
++    std::uint32_t bits;
++    if (exponent == 0x1Fu) {
++        bits = sign | 0x7F800000u | (mantissa << 13);
++    } else if (exponent != 0) {
++        bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
++    } else if (mantissa == 0) {
++        bits = sign;
++    } else {
++        // Subnormal: normalize the mantissa into a float normal.
++        exponent = 113u;
++        while ((mantissa & 0x400u) == 0) {
++            mantissa <<= 1;
++            --exponent;
++        }
++        bits = sign | (exponent << 23) | ((mantissa & 0x3FFu) << 13);
++    }
++    float result;
++    std::memcpy(&result, &bits, sizeof(result));
++    return result;
++}
++
++// Convert a single-precision float to float16, rounding to nearest even: to subnormals below 2^-14, and to
++// infinity from 65520 up. NaN stays NaN.
++FORCE_INLINE std::uint16_t fp32_to_fp16(float x) {
++    std::uint32_t bits;
++    std::memcpy(&bits, &x, sizeof(bits));
++    std::uint32_t sign = (bits >> 16) & 0x8000u;
++    std::uint32_t magnitude = bits & 0x7FFFFFFFu;
++    if (magnitude > 0x7F800000u) {
++        return static_cast<std::uint16_t>(sign | 0x7E00u | ((magnitude >> 13) & 0x3FFu));
++    }
++    if (magnitude >= 0x477FF000u) {
++        return static_cast<std::uint16_t>(sign | 0x7C00u);
++    }
++    if (magnitude >= 0x38800000u) {
++        // Normal: rebias the exponent and round the mantissa from 23 to 10 bits; a carry into the exponent is
++        // correct.
++        std::uint32_t rounded = magnitude + 0xFFFu + ((magnitude >> 13) & 1u);
++        return static_cast<std::uint16_t>(sign | ((rounded - 0x38000000u) >> 13));
++    }
++    // Subnormal or zero: the result counts multiples of 2^-24.
++    std::uint32_t exponent = magnitude >> 23;
++    if (exponent < 102u) {
++        return static_cast<std::uint16_t>(sign);  // below 2^-25, which rounds to zero
++    }
++    std::uint32_t mantissa = (magnitude & 0x7FFFFFu) | 0x800000u;
++    std::uint32_t shift = 126u - exponent;
++    std::uint32_t result = mantissa >> shift;
++    std::uint32_t remainder = mantissa & ((1u << shift) - 1u);
++    std::uint32_t half = 1u << (shift - 1u);
++    if (remainder > half || (remainder == half && (result & 1u))) {
++        ++result;  // may carry into the smallest normal, which is the right encoding
++    }
++    return static_cast<std::uint16_t>(sign | result);
++}
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
+@@ -5,10 +5,12 @@
+ #include "api/dataflow/dataflow_api.h"
+ #include "api/dataflow/noc.h"
+ #include "api/dataflow/dataflow_buffer.h"
++#include "api/numeric/float16.h"
+ #include "experimental/kernel_args.h"
+ #include "../common.hpp"
+ 
+ #include <array>
++#include <type_traits>
+ 
+ namespace {
+ 
+@@ -30,6 +32,23 @@
+ template <typename number_type>
+ FORCE_INLINE number_type perform_reduction(
+     number_type input, number_type source_value, ScatterReductionType scatter_reduction_type, DataFormat data_format) {
++    if constexpr (std::is_same_v<number_type, uint16_t>) {
++        // Float16 reduces in float32 and rounds back after every update, which is exact Float16 arithmetic: float32
++        // has at least 2 * 11 + 2 bits of precision, so the double rounding is harmless.
++        if (data_format == DataFormat::Float16 && scatter_reduction_type != ScatterReductionType::INVALID) {
++            float a = fp16_to_fp32(input);
++            float b = fp16_to_fp32(source_value);
++            float result = b;
++            switch (scatter_reduction_type) {
++                case ScatterReductionType::ADD: result = a + b; break;
++                case ScatterReductionType::MULTIPLY: result = a * b; break;
++                case ScatterReductionType::AMAX: result = std::max(a, b); break;
++                case ScatterReductionType::AMIN: result = std::min(a, b); break;
++                default: break;
++            }
++            return fp32_to_fp16(result);
++        }
++    }
+     switch (scatter_reduction_type) {
+         case ScatterReductionType::ADD: {
+             return input + source_value;

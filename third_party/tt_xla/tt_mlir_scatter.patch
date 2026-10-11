@@ -195,7 +195,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return rewriter.notifyMatchFailure(
            srcOp, "the scatter's update computation neither combines its "
                   "arguments nor returns the update value");
-@@ -7939,29 +8092,93 @@ public:
+@@ -7939,29 +8092,97 @@ public:
  
      RankedTensorType outputType = mlir::cast<RankedTensorType>(
          this->getTypeConverter()->convertType(srcOp.getResults()[0].getType()));
@@ -217,7 +217,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    Value updateTensor = srcOp.getUpdates()[0];
 +    RankedTensorType updateType =
 +        mlir::cast<RankedTensorType>(updateTensor.getType());
-+    bool usesFloat32Transport = inputType.getElementType().isF16();
++    // Float16 overwrites and reductions run natively in tt-metal's scatter,
++    // which rounds after every update as Float16 arithmetic does. Only the
++    // unary apply path still transports Float16 through Float32.
++    bool usesFloat32Transport = inputType.getElementType().isF16() &&
++                                unaryApply != UnaryScatterApplyKind::None;
 +    if (usesFloat32Transport) {
 +      Type float32 = rewriter.getF32Type();
 +      inputType = inputType.clone(float32);
@@ -297,7 +301,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      Value flattenedInput = ttir::utils::flattenTensor(
          rewriter, srcOp.getLoc(), inputTensor, "_input_flatten");
      Value flattenedUpdate = ttir::utils::flattenTensor(
-@@ -7971,7 +8188,7 @@ public:
+@@ -7971,7 +8192,7 @@ public:
          srcOp.getLoc(), mlir::cast<RankedTensorType>(flattenedInput.getType()),
          flattenedInput, flattenedIndices, flattenedUpdate,
          rewriter.getI32IntegerAttr(SCATTER_DIMENSION),
@@ -306,7 +310,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      // Reshape result back to original input shape.
      Value reshapedResult = ttir::utils::createReshapeOp(
-@@ -7979,11 +8196,97 @@ public:
+@@ -7979,11 +8200,97 @@ public:
          ttmlir::utils::appendLocationSuffix(srcOp.getLoc(), "_result_reshape"),
          scatterResult, inputShape);
  
@@ -404,7 +408,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Where each operand dimension draws its extent and its written position
    // from: how a StableHLO scatter lines up with the operand's dimensions.
    struct OperandDimSources {
-@@ -8054,12 +8357,6 @@ private:
+@@ -8054,12 +8361,6 @@ private:
                              ttcore::ReduceType reduceType,
                              RankedTensorType outputType,
                              ConversionPatternRewriter &rewriter) const {
@@ -417,7 +421,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      OperandDimSources sources = computeOperandDimSources(srcOp);
      if (failed(checkAlignedScatterLegality(srcOp, sources, rewriter))) {
        return failure();
-@@ -8381,11 +8678,9 @@ private:
+@@ -8381,11 +8682,9 @@ private:
      auto dimensionNumbers = adaptor.getScatterDimensionNumbers();
      ArrayRef<int64_t> scatterDimsToOperandDims =
          dimensionNumbers.getScatterDimsToOperandDims();
@@ -432,7 +436,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      // Scatters along at most one operand dimension are checked by
      // computeOperandAlignedLayout instead, which has to work the mapping out in
-@@ -8394,14 +8689,8 @@ private:
+@@ -8394,14 +8693,8 @@ private:
        return success();
      }
  
@@ -449,7 +453,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      int64_t indexRank = op.getScatterIndices().getType().getRank();
      if (dimensionNumbers.getIndexVectorDim() != indexRank - 1) {
-@@ -8489,6 +8778,23 @@ private:
+@@ -8489,6 +8782,23 @@ private:
      return flatIndices;
    }
  
@@ -473,7 +477,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    /// Computes flattened 1D indices for multi-dimensional scatter.
    ///
    /// Handles both cases:
-@@ -8526,6 +8832,10 @@ private:
+@@ -8526,6 +8836,10 @@ private:
          scatterDimNumbers.getUpdateWindowDims();
      ArrayRef<int64_t> scatterDimsToOperandDims =
          scatterDimNumbers.getScatterDimsToOperandDims();
@@ -484,7 +488,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      int64_t indexVectorDim = scatterDimNumbers.getIndexVectorDim();
      int64_t operandRank = operandShape.size();
      Location loc = op.getLoc();
-@@ -8533,6 +8843,8 @@ private:
+@@ -8533,6 +8847,8 @@ private:
      // Build set of inserted window dims for fast lookup.
      llvm::DenseSet<int64_t> insertedDimsSet(insertedWindowDims.begin(),
                                              insertedWindowDims.end());
@@ -493,7 +497,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      // Build reverse map: operand dim -> index position in scatter indices.
      llvm::DenseMap<int64_t, int64_t> scatterDimToIdxPos;
-@@ -8565,6 +8877,54 @@ private:
+@@ -8565,6 +8881,54 @@ private:
      // Total number of expanded indices (one per one scalar update).
      int64_t expandedNumIndices = numScatterPositions * windowSize;
  
@@ -548,7 +552,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      // First, reshape the original indices to shape
      // [numScatterPositions, originalIndexSize].
      int64_t originalIndexSize = indicesShape[indexVectorDim];
-@@ -8661,31 +9021,42 @@ private:
+@@ -8661,31 +9025,42 @@ private:
      // b) window-only: use window offset only
      // c) both scatter-indexed and window: add scatter index + window offset
      llvm::SmallVector<Value> indexSlices;
@@ -609,7 +613,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        }
  
        if (isWindowDim) {
-@@ -8707,11 +9078,23 @@ private:
+@@ -8707,11 +9082,23 @@ private:
          }
        }
  
