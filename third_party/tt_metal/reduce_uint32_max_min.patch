@@ -1,0 +1,375 @@
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_reduce.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_reduce.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_reduce.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_reduce.h
+@@ -1664,14 +1664,24 @@
+  * config, and being a symmetric exchange it leaves the corrected extreme in whichever register the
+  * caller reads next. Mirrors calculate_binary_max_min_int32 in ckernel_sfpu_binary_max_min.h.
+  *
++ * For UInt32 (IS_UNSIGNED) sign-magnitude order is right only when neither operand has its top bit set,
++ * so the pair is re-exchanged on lanes where either does (one extra instruction).
++ *
+  * @tparam HIGH_LREG The srcC register of the compare-and-swap.
+  * @tparam LOW_LREG  The dest register of the compare-and-swap.
++ * @tparam IS_UNSIGNED Compare as UInt32 instead of two's-complement Int32.
+  */
+-template <std::uint32_t HIGH_LREG, std::uint32_t LOW_LREG>
++template <std::uint32_t HIGH_LREG, std::uint32_t LOW_LREG, bool IS_UNSIGNED = false>
+ inline void _emit_int32_signed_cswap_() {
+     TTI_SFPSWAP(0, HIGH_LREG, LOW_LREG, sfpi::SFPSWAP_MOD1_VEC_MIN_MAX);
+-    TTI_SFPSETCC(0, LOW_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_LT0);   // cc: LOW_LREG < 0
+-    TTI_SFPSETCC(0, HIGH_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_LT0);  // cc &= HIGH_LREG < 0 (both negative)
++    if constexpr (IS_UNSIGNED) {
++        TTI_SFPSETCC(0, LOW_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_GTE0);   // cc: LOW_LREG top bit clear
++        TTI_SFPSETCC(0, HIGH_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_GTE0);  // cc &= HIGH_LREG top bit clear
++        TTI_SFPCOMPC(0, 0, 0, 0);                                       // cc: either top bit set
++    } else {
++        TTI_SFPSETCC(0, LOW_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_LT0);   // cc: LOW_LREG < 0
++        TTI_SFPSETCC(0, HIGH_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_LT0);  // cc &= HIGH_LREG < 0 (both negative)
++    }
+     TTI_SFPSWAP(0, HIGH_LREG, LOW_LREG, sfpi::SFPSWAP_MOD1_SWAP);
+     TTI_SFPENCC(0, 0, 0, 0);
+ }
+@@ -1684,6 +1694,7 @@
+  * are emitted sequentially rather than interleaved because each signed compare-and-swap manages its own
+  * condition-code state (SFPSETCC/SFPENCC) and must not be interleaved with another.
+  */
++template <bool IS_UNSIGNED = false>
+ inline void horizontal_reduce_max_int32() {
+     // Phase 1: rotate by 4 and compare -> 8 values become 4 duplicated pair extrema.
+     TTI_SFPMOV(0, p_sfpu::LREG0, p_sfpu::LREG1, 0);
+@@ -1696,8 +1707,8 @@
+     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
+     TTI_SFPSHFT2(0, p_sfpu::LREG1, p_sfpu::LREG1, 3);
+     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
+-    _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1>();
+-    _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5>();
++    _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1, IS_UNSIGNED>();
++    _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5, IS_UNSIGNED>();
+ 
+     // Phase 2: rotate by 2 and compare -> pair extrema become duplicated quad extrema.
+     TTI_SFPMOV(0, p_sfpu::LREG0, p_sfpu::LREG1, 0);
+@@ -1706,8 +1717,8 @@
+     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
+     TTI_SFPSHFT2(0, p_sfpu::LREG1, p_sfpu::LREG1, 3);
+     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
+-    _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1>();
+-    _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5>();
++    _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1, IS_UNSIGNED>();
++    _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5, IS_UNSIGNED>();
+ 
+     // Phase 3: rotate by 1 and compare -> quad extrema become the full 8-column extreme in every column.
+     // The rotate butterfly replicates the extreme across all 8 columns, so no final "move to col 0"
+@@ -1716,14 +1727,15 @@
+     TTI_SFPMOV(0, p_sfpu::LREG4, p_sfpu::LREG5, 0);
+     TTI_SFPSHFT2(0, p_sfpu::LREG1, p_sfpu::LREG1, 3);
+     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
+-    _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1>();
+-    _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5>();
++    _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1, IS_UNSIGNED>();
++    _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5, IS_UNSIGNED>();
+ }
+ 
+ /**
+  * @brief Signed-Int32 per-tile row MAX/MIN reduction. Mirrors perform_reduce_row_max_tile but loads
+  *        plain INT32 (bits preserved) and uses the signed compare-and-swap so INT32_MIN is handled.
+  */
++template <bool IS_UNSIGNED = false>
+ inline void perform_reduce_row_max_tile_int32(std::uint32_t tile_row_offset, std::uint32_t result_store_mode) {
+     constexpr InstrModLoadStore INSTRUCTION_MODE = InstrModLoadStore::INT32;
+ #pragma GCC unroll 2
+@@ -1767,15 +1779,15 @@
+ 
+             // Vertical reduce via signed compare-and-swap (each is self-contained w.r.t. condition codes,
+             // so unlike the float path they are emitted sequentially rather than interleaved).
+-            _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG2>();
+-            _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG6>();
+-            _emit_int32_signed_cswap_<p_sfpu::LREG1, p_sfpu::LREG3>();
+-            _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG7>();
+-            _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1>();
+-            _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5>();
++            _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG2, IS_UNSIGNED>();
++            _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG6, IS_UNSIGNED>();
++            _emit_int32_signed_cswap_<p_sfpu::LREG1, p_sfpu::LREG3, IS_UNSIGNED>();
++            _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG7, IS_UNSIGNED>();
++            _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1, IS_UNSIGNED>();
++            _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5, IS_UNSIGNED>();
+ 
+             // Horizontal reduce: consolidate 8 SFPU columns into column 0.
+-            horizontal_reduce_max_int32();
++            horizontal_reduce_max_int32<IS_UNSIGNED>();
+ 
+             TT_SFPSTORE(
+                 p_sfpu::LREG0, result_store_mode, ADDR_MOD_7, tile_row_offset + face_pair_base + row_offset_first);
+@@ -1790,6 +1802,7 @@
+  *        plain INT32 and uses the signed compare-and-swap. Named _signed to avoid colliding with the
+  *        sign-magnitude max_first_columns_across_tiles_int32 above (still used by the UInt16/UInt32 path).
+  */
++template <bool IS_UNSIGNED = false>
+ inline void max_first_columns_across_tiles_int32_signed(std::uint32_t tile_row_base, std::uint32_t block_ct_dim) {
+     constexpr InstrModLoadStore INSTRUCTION_MODE = InstrModLoadStore::INT32;
+     constexpr std::uint32_t RESULT_ROWS[8] = {0, 4, 8, 12, 32, 36, 40, 44};
+@@ -1810,10 +1823,10 @@
+             TT_SFPLOAD(p_sfpu::LREG6, INSTRUCTION_MODE, ADDR_MOD_7, tile_offset + RESULT_ROWS[base_idx + 2]);
+             TT_SFPLOAD(p_sfpu::LREG7, INSTRUCTION_MODE, ADDR_MOD_7, tile_offset + RESULT_ROWS[base_idx + 3]);
+ 
+-            _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG4>();
+-            _emit_int32_signed_cswap_<p_sfpu::LREG1, p_sfpu::LREG5>();
+-            _emit_int32_signed_cswap_<p_sfpu::LREG2, p_sfpu::LREG6>();
+-            _emit_int32_signed_cswap_<p_sfpu::LREG3, p_sfpu::LREG7>();
++            _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG4, IS_UNSIGNED>();
++            _emit_int32_signed_cswap_<p_sfpu::LREG1, p_sfpu::LREG5, IS_UNSIGNED>();
++            _emit_int32_signed_cswap_<p_sfpu::LREG2, p_sfpu::LREG6, IS_UNSIGNED>();
++            _emit_int32_signed_cswap_<p_sfpu::LREG3, p_sfpu::LREG7, IS_UNSIGNED>();
+         }
+ 
+         TT_SFPSTORE(p_sfpu::LREG0, INSTRUCTION_MODE, ADDR_MOD_7, tile_row_base + RESULT_ROWS[base_idx + 0]);
+@@ -1828,7 +1841,7 @@
+  *        but routes through the signed-Int32 per-tile and cross-tile helpers (horizontal_reduce_max_int32
+  *        is fully inline, no recorded buffer). Correct over the full Int32 range.
+  */
+-template <PoolType pool_type>
++template <PoolType pool_type, bool IS_UNSIGNED = false>
+ inline void perform_reduce_row_max_min_int32(std::uint32_t block_ct_dim, std::uint32_t block_rt_dim) {
+     static_assert(
+         pool_type == PoolType::MAX || pool_type == PoolType::MIN,
+@@ -1854,11 +1867,11 @@
+ 
+         for (std::uint32_t j = 0; j < block_ct_dim; j++) {
+             std::uint32_t tile_offset = tile_row_offset + (ROWS_PER_TILE * j);
+-            perform_reduce_row_max_tile_int32(tile_offset, tile_store_mode);
++            perform_reduce_row_max_tile_int32<IS_UNSIGNED>(tile_offset, tile_store_mode);
+         }
+ 
+         if (block_ct_dim > 1) {
+-            max_first_columns_across_tiles_int32_signed(tile_row_offset, block_ct_dim);
++            max_first_columns_across_tiles_int32_signed<IS_UNSIGNED>(tile_row_offset, block_ct_dim);
+         }
+     }
+ }
+@@ -1870,7 +1883,7 @@
+  *
+  * @tparam pool_type The PoolType enum value (MAX or MIN). MAX inverts the swap direction here.
+  */
+-template <PoolType pool_type>
++template <PoolType pool_type, bool IS_UNSIGNED = false>
+ inline void init_reduce_max_min_int32_signed() {
+     _init_sfpu_config_reg();
+     if constexpr (pool_type == PoolType::MAX) {
+@@ -1879,10 +1892,10 @@
+         TTI_SFPCONFIG(0, 0xF, 0);
+     }
+ 
+-    lltt::record(0, 3 * INT32_SIGNED_CSWAP_LEN);
+-    _emit_int32_signed_cswap_<p_sfpu::LREG7, p_sfpu::LREG6>();
+-    _emit_int32_signed_cswap_<p_sfpu::LREG6, p_sfpu::LREG5>();
+-    _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG4>();
++    lltt::record(0, 3 * (INT32_SIGNED_CSWAP_LEN + IS_UNSIGNED));
++    _emit_int32_signed_cswap_<p_sfpu::LREG7, p_sfpu::LREG6, IS_UNSIGNED>();
++    _emit_int32_signed_cswap_<p_sfpu::LREG6, p_sfpu::LREG5, IS_UNSIGNED>();
++    _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG4, IS_UNSIGNED>();
+ }
+ 
+ /**
+@@ -1896,7 +1909,7 @@
+  * @tparam pool_type The PoolType enum value (MAX or MIN). MIN inverts the swap direction (set during init).
+  * @tparam reduce_dim The reduction dimension; must be REDUCE_COL for this helper.
+  */
+-template <PoolType pool_type, ReduceDim reduce_dim>
++template <PoolType pool_type, ReduceDim reduce_dim, bool IS_UNSIGNED = false>
+ inline void calculate_reduce_max_min_int32_col() {
+     static_assert(reduce_dim == ReduceDim::REDUCE_COL, "Only column reduction (REDUCE_COL) is supported here");
+     static_assert(
+@@ -1904,7 +1917,7 @@
+         "Only MAX and MIN pool types are supported for this function");
+ 
+     constexpr InstrModLoadStore INSTRUCTION_MODE = InstrModLoadStore::INT32;
+-    constexpr std::uint32_t REPLAY_LEN = 3 * INT32_SIGNED_CSWAP_LEN;
++    constexpr std::uint32_t REPLAY_LEN = 3 * (INT32_SIGNED_CSWAP_LEN + IS_UNSIGNED);
+ 
+     constexpr std::uint32_t ODD_COLUMNS = 2;
+     constexpr std::uint32_t COLUMN_OFFSETS[4] = {0, 2, 0, 2};  // even, odd, even, odd
+@@ -1943,8 +1956,8 @@
+         TTI_SFPTRANSP(0, 0, 0, 0);
+ 
+         // Signed compare-and-swap to combine the two vertically adjacent faces (even and odd columns).
+-        _emit_int32_signed_cswap_<p_sfpu::LREG7, p_sfpu::LREG6>();  // odd columns of face pair
+-        _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG4>();  // even columns of face pair
++        _emit_int32_signed_cswap_<p_sfpu::LREG7, p_sfpu::LREG6, IS_UNSIGNED>();  // odd columns of face pair
++        _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG4, IS_UNSIGNED>();  // even columns of face pair
+ 
+         TTI_SFPMOV(0, p_sfpu::LREG4, p_sfpu::LREG0, 0);
+         TTI_SFPMOV(0, p_sfpu::LREG6, p_sfpu::LREG1, 0);
+@@ -1981,8 +1994,10 @@
+     // AVG keeps INT32_2S_COMP; its divide-by-32 step assumes that mode. init_reduce has no reduce_dim, so
+     // the column reduce consumes the LREG4-7 -> LREG4 replay buffer recorded by init_reduce_max_min_int32_signed
+     // while the row reduce re-records its own config regardless.
++    // UInt32 MAX/MIN takes the same path with the unsigned compare-and-swap.
++    constexpr bool is_uint32 = format == DataFormat::UInt32;
+     constexpr bool int32_max_min =
+-        (format == DataFormat::Int32 && (pool_type == PoolType::MAX || pool_type == PoolType::MIN));
++        ((format == DataFormat::Int32 || is_uint32) && (pool_type == PoolType::MAX || pool_type == PoolType::MIN));
+     constexpr bool int32_2s_comp = (format == DataFormat::Int32 && pool_type == PoolType::AVG);
+     constexpr InstrModLoadStore INSTRUCTION_MODE =
+         int32_2s_comp ? InstrModLoadStore::INT32_2S_COMP : GetSfpLoadStoreInstrMod<format, is_fp32_dest_acc_en>();
+@@ -2000,7 +2015,7 @@
+         if constexpr (int32_max_min) {
+             // Signed Int32 MAX/MIN: records the LREG4-7 -> LREG4 signed compare-and-swap replay buffer
+             // (consumed by the column reduce) and the swap direction. Handles INT32_MIN correctly.
+-            init_reduce_max_min_int32_signed<pool_type>();
++            init_reduce_max_min_int32_signed<pool_type, is_uint32>();
+         } else if constexpr (clear_high_bits) {
+             // UInt16 in 32-bit dest uses the manual (non-LOADMACRO) compare-and-swap path so the
+             // garbage high bits can be masked before each swap. It reuses the Int32 path's 3-swap
+@@ -2075,8 +2090,10 @@
+     //        SFPIADD accumulate and back before the store, and perform_int_average's divide-by-32 is wired
+     //        for this mode, so the DEST word stays sign-magnitude (unlike SUM).
+     constexpr bool int32_avg = (format == DataFormat::Int32 && pool_type == PoolType::AVG);
++    // UInt32 MAX/MIN takes the same path with the unsigned compare-and-swap.
++    constexpr bool is_uint32 = format == DataFormat::UInt32;
+     constexpr bool int32_max_min =
+-        (format == DataFormat::Int32 && (pool_type == PoolType::MAX || pool_type == PoolType::MIN));
++        ((format == DataFormat::Int32 || is_uint32) && (pool_type == PoolType::MAX || pool_type == PoolType::MIN));
+     constexpr bool int32_max_min_col = int32_max_min && (reduce_dim == ReduceDim::REDUCE_COL);
+     constexpr bool int32_max_min_row = int32_max_min && (reduce_dim == ReduceDim::REDUCE_ROW);
+     constexpr InstrModLoadStore INSTRUCTION_MODE = int32_max_min ? InstrModLoadStore::INT32
+@@ -2100,10 +2117,10 @@
+             LLK_ASSERT(
+                 block_ct_dim == 1 && block_rt_dim == 1,
+                 "Int32 column MAX/MIN reduce only supports a single tile (block_ct_dim == block_rt_dim == 1)");
+-            calculate_reduce_max_min_int32_col<pool_type, reduce_dim>();
++            calculate_reduce_max_min_int32_col<pool_type, reduce_dim, is_uint32>();
+         } else if constexpr (int32_max_min_row) {
+             // Signed Int32 row MAX/MIN: two's-complement compare-and-swap path (handles INT32_MIN).
+-            perform_reduce_row_max_min_int32<pool_type>(block_ct_dim, block_rt_dim);
++            perform_reduce_row_max_min_int32<pool_type, is_uint32>(block_ct_dim, block_rt_dim);
+         } else if constexpr (reduce_dim == ReduceDim::REDUCE_ROW) {
+             static_assert(
+                 INSTRUCTION_MODE == InstrModLoadStore::FP32 || INSTRUCTION_MODE == InstrModLoadStore::INT32 ||
+diff --git ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
+--- ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
++++ ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
+@@ -64,7 +64,9 @@
+         pool_type != ckernel::PoolType::MIN) {
+         return false;
+     }
+-    if constexpr (data_format != DataFormat::Int32) {
++    // UInt32 MAX/MIN use the Int32 kernels with the unsigned compare-and-swap.
++    constexpr bool uint32_max_min = data_format == DataFormat::UInt32 && pool_type != ckernel::PoolType::SUM;
++    if constexpr (data_format != DataFormat::Int32 && !uint32_max_min) {
+         // pool_type is already narrowed to MAX/SUM/MIN above and all three have an SFPU fold, so
+         // Float32 only has to opt in via Accurate mode. Everything else non-Int32 stays on the FPU.
+         if constexpr (fp32_mode != ReduceFp32Mode::Accurate || data_format != DataFormat::Float32) {
+diff --git ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
+--- ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
++++ ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
+@@ -31,6 +31,8 @@
+ ALWI void sfpu_reduce_max_fold_init() {
+     if constexpr (format == DataFormat::Int32) {
+         binary_max_int32_tile_init();
++    } else if constexpr (format == DataFormat::UInt32) {
++        binary_max_uint32_tile_init();
+     } else {
+         binary_max_tile_init();
+     }
+@@ -40,6 +42,8 @@
+ ALWI void sfpu_reduce_max_fold_tile(uint32_t a, uint32_t b, uint32_t out) {
+     if constexpr (format == DataFormat::Int32) {
+         binary_max_int32_tile(a, b, out);
++    } else if constexpr (format == DataFormat::UInt32) {
++        binary_max_uint32_tile(a, b, out);
+     } else {
+         binary_max_tile(a, b, out);
+     }
+@@ -50,6 +54,8 @@
+ ALWI void sfpu_reduce_min_fold_init() {
+     if constexpr (format == DataFormat::Int32) {
+         binary_min_int32_tile_init();
++    } else if constexpr (format == DataFormat::UInt32) {
++        binary_min_uint32_tile_init();
+     } else {
+         binary_min_tile_init();
+     }
+@@ -59,6 +65,8 @@
+ ALWI void sfpu_reduce_min_fold_tile(uint32_t a, uint32_t b, uint32_t out) {
+     if constexpr (format == DataFormat::Int32) {
+         binary_min_int32_tile(a, b, out);
++    } else if constexpr (format == DataFormat::UInt32) {
++        binary_min_uint32_tile(a, b, out);
+     } else {
+         binary_min_tile(a, b, out);
+     }
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
+@@ -81,6 +81,9 @@
+     if (dtype == tt::tt_metal::DataType::INT32) {
+         return math_op == ReduceOpMath::MAX || math_op == ReduceOpMath::SUM || math_op == ReduceOpMath::MIN;
+     }
++    if (dtype == tt::tt_metal::DataType::UINT32) {
++        return math_op == ReduceOpMath::MAX || math_op == ReduceOpMath::MIN;
++    }
+     return use_sfpu_reduce && dtype == tt::tt_metal::DataType::FLOAT32 &&
+            (math_op == ReduceOpMath::SUM || math_op == ReduceOpMath::MAX || math_op == ReduceOpMath::MIN);
+ }
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp
+@@ -85,6 +85,9 @@
+             default: return ttnn::PadValue{uint32_t{0}};
+         }
+     }
++    if (dtype == tt::tt_metal::DataType::UINT32) {
++        return ttnn::PadValue{reduce_math == tt::tt_metal::ReduceOpMath::MIN ? uint32_t{0xFFFFFFFF} : uint32_t{0}};
++    }
+     return ttnn::PadValue{ttnn::prim::get_reduce_pad_value(reduce_math)};
+ }
+ 
+@@ -292,6 +295,7 @@
+     // negate kernels. Accurate fp32 MIN drives the LLK MIN reduce directly (like Int32 MIN) and must
+     // skip that lowering.
+     if (reduce_math == tt::tt_metal::ReduceOpMath::MIN && input_tensor.dtype() != tt::tt_metal::DataType::INT32 &&
++        input_tensor.dtype() != tt::tt_metal::DataType::UINT32 &&
+         !use_sfpu_fp32_min) {
+         return reduce_min(input_tensor, reduce_dim, scaler, output_mem_config, compute_kernel_config, sub_core_grids);
+     }
+@@ -368,6 +372,8 @@
+         ((prepared_input.dtype() == tt::tt_metal::DataType::INT32 &&
+           (reduce_math == tt::tt_metal::ReduceOpMath::MAX || reduce_math == tt::tt_metal::ReduceOpMath::SUM ||
+            reduce_math == tt::tt_metal::ReduceOpMath::MIN)) ||
++         (prepared_input.dtype() == tt::tt_metal::DataType::UINT32 &&
++          (reduce_math == tt::tt_metal::ReduceOpMath::MAX || reduce_math == tt::tt_metal::ReduceOpMath::MIN)) ||
+          tt::tt_metal::is_bitwise_reduce_math(reduce_math) || use_sfpu_fp32_reduce);
+ 
+     if (is_multicore_hw || use_two_step_hw_sfpu_reduce ||
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
+@@ -128,6 +128,10 @@
+         }
+         return 0.0f;
+     }
++    // UINT32 max/min: likewise carried as bit patterns.
++    if (dtype == tt::tt_metal::DataType::UINT32) {
++        return std::bit_cast<float>(reduce_type == reduction_common::ReduceType::Min ? 0xFFFFFFFFu : 0u);
++    }
+ 
+     return reduce_type == reduction_common::ReduceType::Max
+                ? -std::numeric_limits<float>::infinity()
+@@ -224,7 +228,8 @@
+                     int reduce_dim = i_dim;
+                     if (transpose) {
+                         output_tensor = ttnn::transpose(output_tensor, i_dim, -2, memory_config, pad_value);
+-                        if constexpr (is_bitwise_reduce_type(reduce_type)) {
++                        if (is_bitwise_reduce_type(reduce_type) ||
++                            output_tensor.dtype() == tt::tt_metal::DataType::UINT32) {
+                             // Transposes pad UINT32 numerically, which cannot express all ones.
+                             output_tensor = ttnn::fill_implicit_tile_padding(
+                                 output_tensor, ttnn::PadValue{std::bit_cast<uint32_t>(pad_value)});
+@@ -603,6 +608,7 @@
+     // For INT32 the pad sentinel is carried as a raw bit pattern (see get_pad_value); pass it through
+     // PadValue's integer arm so fill_pad reinterprets the bits rather than decoding numerically.
+     const ttnn::PadValue fill_pad_value = input_tensor_arg.dtype() == tt::tt_metal::DataType::INT32 ||
++                                                  input_tensor_arg.dtype() == tt::tt_metal::DataType::UINT32 ||
+                                                   is_bitwise_reduce_type(reduce_type)
+                                               ? ttnn::PadValue{std::bit_cast<uint32_t>(pad_value)}
+                                               : ttnn::PadValue{pad_value};

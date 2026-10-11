@@ -1,0 +1,18 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -1061,11 +1061,11 @@
+       mlir::cast<mlir::RankedTensorType>(op->getOperand(0).getType())
+           .getElementType();
+   // Keep supported integer reductions exact: Float32 rounds values above
+-  // 2^24 and cannot represent the INT32_MAX identity used by min. Bitwise
+-  // reductions take signed and unsigned 32-bit integers.
++  // 2^24 and cannot represent the INT32_MAX identity used by min. Max, min
++  // and bitwise reductions take signed and unsigned 32-bit integers.
+   bool supportsInt32 =
+       inputType.isInteger(32) &&
+-      (mlir::isa<ttnn::MinOp>(op) ||
++      (mlir::isa<ttnn::MaxOp, ttnn::MinOp>(op) ||
+        (mlir::isa<ttnn::SumOp>(op) && !inputType.isUnsignedInteger()) ||
+        mlir::isa<ttnn::ReduceBitwiseAndOp, ttnn::ReduceBitwiseOrOp,
+                  ttnn::ReduceBitwiseXorOp>(op));
