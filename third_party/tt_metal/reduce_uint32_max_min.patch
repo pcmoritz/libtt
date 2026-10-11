@@ -373,17 +373,32 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
  
      return reduce_type == reduction_common::ReduceType::Max
                 ? -std::numeric_limits<float>::infinity()
-@@ -224,7 +227,8 @@
+@@ -222,9 +225,13 @@
+ 
+                     bool transpose = i_dim < rank - 2;
                      int reduce_dim = i_dim;
++                    // Transposes convert a UINT32 pad value numerically, so it gets 0 (UINT32_MAX's bit
++                    // pattern is NaN as a float) and the typed identity is refilled below.
++                    const bool is_uint32 = output_tensor.dtype() == tt::tt_metal::DataType::UINT32;
++                    const float transpose_pad = is_uint32 ? 0.0f : pad_value;
                      if (transpose) {
-                         output_tensor = ttnn::transpose(output_tensor, i_dim, -2, memory_config, pad_value);
+-                        output_tensor = ttnn::transpose(output_tensor, i_dim, -2, memory_config, pad_value);
 -                        if constexpr (is_bitwise_reduce_type(reduce_type)) {
-+                        if (is_bitwise_reduce_type(reduce_type) ||
-+                            output_tensor.dtype() == tt::tt_metal::DataType::UINT32) {
++                        output_tensor = ttnn::transpose(output_tensor, i_dim, -2, memory_config, transpose_pad);
++                        if (is_bitwise_reduce_type(reduce_type) || is_uint32) {
                              // Transposes pad UINT32 numerically, which cannot express all ones.
                              output_tensor = ttnn::fill_implicit_tile_padding(
                                  output_tensor, ttnn::PadValue{std::bit_cast<uint32_t>(pad_value)});
-@@ -603,6 +607,7 @@
+@@ -261,7 +268,7 @@
+                             /*fast_and_approximate_mode=*/fast_and_approximate_mode);
+                     }
+                     if (transpose) {
+-                        output_tensor = ttnn::transpose(output_tensor, i_dim, -2, memory_config, pad_value);
++                        output_tensor = ttnn::transpose(output_tensor, i_dim, -2, memory_config, transpose_pad);
+                     }
+                 }
+             }
+@@ -603,6 +610,7 @@
      // For INT32 the pad sentinel is carried as a raw bit pattern (see get_pad_value); pass it through
      // PadValue's integer arm so fill_pad reinterprets the bits rather than decoding numerically.
      const ttnn::PadValue fill_pad_value = input_tensor_arg.dtype() == tt::tt_metal::DataType::INT32 ||

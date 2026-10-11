@@ -49,6 +49,29 @@ def test_uint32_decisive_value(jax_op, numpy_op, axis):
     np.testing.assert_array_equal(run(lambda v: jax_op(v, axis=axis), x), numpy_op(x, axis=axis))
 
 
+# One pair per compare-and-swap case: both top bits clear, different, both set.
+PAIRS = [(0, 1), (0x7FFFFFFF, 0x80000000), (0x80000000, 0x80000001)]
+
+
+@pytest.mark.parametrize("jax_op, numpy_op", OPS, ids=["max", "min"])
+@pytest.mark.parametrize("pair", PAIRS, ids=["clear", "mixed", "set"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["ab", "ba"])
+@pytest.mark.parametrize("axis", [0, 1], ids=["H", "W"])
+def test_uint32_compare_pairs(jax_op, numpy_op, pair, reverse, axis):
+    x = np.array([pair[::-1] if reverse else pair], np.uint32)
+    if axis == 0:
+        x = x.T
+    np.testing.assert_array_equal(run(lambda v: jax_op(v, axis=axis), x), numpy_op(x, axis=axis))
+
+
+# A full reduction of a single tile, which would otherwise take the single-core
+# scalar path; values on both sides of the top bit.
+@pytest.mark.parametrize("jax_op, numpy_op", OPS, ids=["max", "min"])
+def test_uint32_single_tile_full_reduction(jax_op, numpy_op):
+    x = np.array([[0x7FFFFFFF, 0x80000000, 1], [0xFFFFFFFE, 0, 0x80000001]], np.uint32)
+    np.testing.assert_array_equal(run(lambda v: jax_op(v), x), numpy_op(x))
+
+
 # The padding identity must not win: a padded slice whose maximum is INT32_MIN.
 def test_int32_max_of_int32_min():
     x = np.full((2, 33), np.iinfo(np.int32).min, np.int32)
