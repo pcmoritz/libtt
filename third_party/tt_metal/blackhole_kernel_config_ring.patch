@@ -1,0 +1,29 @@
+diff --git tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal_tensix.cpp tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal_tensix.cpp
+--- tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal_tensix.cpp
++++ tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal_tensix.cpp
+@@ -9,6 +9,7 @@
+ using namespace tt::tt_metal::blackhole::tensix;
+ 
+ #include <cstdint>
++#include <cstdlib>
+ 
+ #include "blackhole/bh_hal.hpp"
+ #include "blackhole/bh_hal_tensix_asserts.hpp"
+@@ -40,7 +41,16 @@ HalCoreInfoType create_tensix_mem_map() {
+     uint32_t max_alignment = std::max(DRAM_ALIGNMENT, L1_ALIGNMENT);
+ 
+     std::vector<DeviceAddr> mem_map_bases;
+-    const uint32_t default_l1_kernel_config_size = 69 * 1024;
++    // The kernel config ring holds the binaries and arguments of the programs
++    // dispatch has sent ahead of the running one. At 69 KB a large program
++    // (moe_compute is about 27 KB per core) after a run of short ones does not
++    // fit until they finish, and its binaries are written while the cores
++    // idle: ~9 us per MoE decode layer. 133 KB lets it go out ahead, with
++    // room to spare.
++    // LIBTT_KERNEL_CONFIG_KB overrides the size.
++    const char* kernel_config_kb = std::getenv("LIBTT_KERNEL_CONFIG_KB");
++    const uint32_t default_l1_kernel_config_size =
++        (kernel_config_kb != nullptr ? std::atoi(kernel_config_kb) : 133) * 1024;
+ 
+     mem_map_bases.resize(static_cast<std::size_t>(HalL1MemAddrType::COUNT), 0);
+     mem_map_bases[static_cast<std::size_t>(HalL1MemAddrType::BASE)] = MEM_L1_BASE;

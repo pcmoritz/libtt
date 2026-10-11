@@ -1,0 +1,138 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -5197,6 +5197,26 @@ def TTNN_SamplingOp : TTNN_Op<"sampling"> {
+   let hasVerifier = 1;
+ }
+ 
++// libtt: a mixture-of-experts router's topk, the softmax of its values and
++// the masking of its indices, as one op.
++def TTNN_MoeRouterTopKOp : TTNN_Op<"moe_router_topk", [OpModelExempt, AttrSizedOperandSegments]> {
++  let summary = "Top k of a router's logits, the softmax of the k values, and masked indices";
++  let description = [{
++    For each row of `logits`: the indices of its `k` largest values, largest
++    first, and the softmax of those values. With `mask` and `fill`, every
++    index of a row whose mask is zero is `fill`:
++    where(mask, topk(logits).indices, fill), softmax(topk(logits).values).
++  }];
++
++  let arguments = (ins AnyRankedTensor:$logits,
++                       Optional<AnyRankedTensor>:$mask,
++                       Optional<AnyRankedTensor>:$fill,
++                       I32Attr:$k);
++
++  let results = (outs AnyRankedTensor:$weights,
++                      AnyRankedTensor:$indices);
++}
++
+ def TTNN_TopKOp : TTNN_Op<"topk"> {
+   let summary = "Top-K selection operation.";
+   let description = [{
+diff --git a/include/ttmlir/Target/TTNN/operations/reduction.fbs b/include/ttmlir/Target/TTNN/operations/reduction.fbs
+--- a/include/ttmlir/Target/TTNN/operations/reduction.fbs
++++ b/include/ttmlir/Target/TTNN/operations/reduction.fbs
+@@ -35,6 +35,15 @@ table ReductionProdOp {
+   memcfg: tt.target.ttnn.MemoryConfig;
+ }
+ 
++table MoeRouterTopKOp {
++  logits: tt.target.ttnn.TensorRef;
++  mask: tt.target.ttnn.TensorRef;
++  fill: tt.target.ttnn.TensorRef;
++  k: uint32;
++  weights: tt.target.ttnn.TensorRef;
++  indices: tt.target.ttnn.TensorRef;
++}
++
+ table TopKOp {
+   input_tensor: tt.target.ttnn.TensorRef;
+   k: int32;
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -149,6 +149,7 @@ union OpType {
+   RMSNormPreAllGatherOp,
+   RMSNormOp,
+   RMSNormResidualOp,
++  MoeRouterTopKOp,
+   ReshapeOp,
+   SamplingOp,
+   ScaledDotProductAttentionOp,
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -16,6 +16,7 @@
+ #include "mlir/Interfaces/SideEffectInterfaces.h"
+ #ifdef TTMLIR_ENABLE_OPMODEL
+ #include "ttmlir/Dialect/TTNN/Transforms/Fusing/QKVHeadsNormRopeDecodeFusing.h"
++#include "ttmlir/Dialect/TTNN/Transforms/Fusing/MoeRouterTopKFusing.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Fusing/SDPAFusingPattern.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVFusingPatterns.h"
+@@ -829,6 +830,7 @@ public:
+         patterns.add<fusing::SDPAFusing>(&getContext(), validationConfig);
+       }
+       patterns.add<NLPConcatHeadsDecodeFusing>(&getContext());
++      patterns.add<fusing::MoeRouterTopKFusing>(&getContext());
+       patterns.add<fusing::NLPDecodeQKVProjectionFusing>(&getContext(),
+                                                          validationConfig);
+       patterns.add<fusing::NLPCreateQKVHeadsDecodeNormRopeFusing>(
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -4722,6 +4722,22 @@ createOp(FlatbufferObjectCache &cache, TopKOp op) {
+                                                 sorted, memoryConfig, &outputs);
+ }
+ 
++::flatbuffers::Offset<::tt::target::ttnn::MoeRouterTopKOp>
++createOp(FlatbufferObjectCache &cache, MoeRouterTopKOp op) {
++  auto tensor = [&](Value value) {
++    return value ? cache.at<::tt::target::ttnn::TensorRef>(
++                       getOperandThroughDPSOps(value))
++                 : ::flatbuffers::Offset<::tt::target::ttnn::TensorRef>();
++  };
++  return ::tt::target::ttnn::CreateMoeRouterTopKOp(
++      *cache.fbb, tensor(op.getLogits()), tensor(op.getMask()),
++      tensor(op.getFill()), static_cast<uint32_t>(op.getK()),
++      cache.getOrCreateNoSharding(op.getWeights(), tensorValueToFlatbuffer,
++                                  std::nullopt),
++      cache.getOrCreateNoSharding(op.getIndices(), tensorValueToFlatbuffer,
++                                  std::nullopt));
++}
++
+ ::flatbuffers::Offset<::tt::target::ttnn::SamplingOp>
+ createOp(FlatbufferObjectCache &cache, SamplingOp op) {
+   auto inputValues = cache.at<::tt::target::ttnn::TensorRef>(
+@@ -5783,6 +5799,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createOp(cache, regionEndOp), debugString,
+                            locInfo);
+   }
++  if (auto router = dyn_cast<MoeRouterTopKOp>(op)) {
++    return createOperation(cache, createOp(cache, router), debugString,
++                           locInfo);
++  }
+   if (auto topKOp = dyn_cast<TopKOp>(op); topKOp) {
+     return createOperation(cache, createOp(cache, topKOp), debugString,
+                            locInfo);
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -107,6 +107,7 @@
+ #include "operations/reduction/reduction.h"
+ #include "operations/reduction/sampling.h"
+ #include "operations/reduction/topk.h"
++#include "operations/reduction/moe_router_topk.h"
+ #include "operations/reduction/topk_router_gpt.h"
+ #include "operations/tensor_serialization/dump_tensor.h"
+ #include "operations/tensor_serialization/load_tensor.h"
+@@ -815,6 +816,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+   case ::tt::target::ttnn::OpType::RegionEndOp: {
+     return operations::debug::run(op->type_as_RegionEndOp(), getContext());
+   }
++  case ::tt::target::ttnn::OpType::MoeRouterTopKOp: {
++    return operations::reduction::run(op->type_as_MoeRouterTopKOp(),
++                                      getContext());
++  }
+   case ::tt::target::ttnn::OpType::TopKOp: {
+     return operations::reduction::topk::run(op->type_as_TopKOp(), getContext());
+   }
