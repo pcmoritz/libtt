@@ -1,10 +1,12 @@
-"""Gather with uint8 indices (cast to uint32 for ttnn.gather), scatter with an
-empty update (a no-op), and float16 scatter reductions, which tt-metal now
-rounds to float16 after every update, as float16 arithmetic does."""
+"""Gather with uint8 indices (taken directly by ttnn.gather), scatter with an
+empty update (a no-op), and float16 scatter reductions: max and min compare
+the bits, add and multiply round to float16 after every update, as float16
+arithmetic does."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax import lax
 
 
@@ -21,6 +23,13 @@ def test_vmapped_dynamic_slice_with_uint8_indices():
     x = np.arange(4 * 260, dtype=np.float32).reshape(4, 260)
     starts = np.array([0, 127, 128, 255], np.uint8)
     assert_matches_cpu(jax.vmap(lambda row, start: lax.dynamic_slice(row, (start,), (2,))), x, starts)
+
+
+# Gathering along a non-last axis transposes the uint8 index first.
+def test_take_along_first_axis_with_uint8_indices():
+    x = np.arange(6 * 40, dtype=np.float32).reshape(6, 40)
+    indices = np.random.default_rng(0).integers(0, 6, size=(6, 40)).astype(np.uint8)
+    assert_matches_cpu(lambda a, i: jnp.take_along_axis(a, i, axis=0), x, indices)
 
 
 def test_vmapped_dynamic_update_slice_with_empty_update():
@@ -65,3 +74,12 @@ def test_float16_select_and_scatter_add():
         return jax.grad(pooled)(a)
 
     assert_matches_cpu(grad, x, w)
+
+
+# Float16 max and min compare the bits: negatives, both zeros and NaN.
+@pytest.mark.parametrize("op", ["max", "min"])
+def test_float16_scatter_max_min(op):
+    x = np.array([-3.0, 0.0, -0.0, 2.5, 1.0, np.nan], np.float16)
+    indices = np.array([0, 0, 1, 2, 3, 3, 4, 5], np.int32)
+    updates = np.array([-2.0, -65504.0, -0.0, 0.0, np.nan, 7.0, -np.inf, 1.0], np.float16)
+    assert_matches_cpu(lambda a, i, u: getattr(a.at[i], op)(u), x, indices, updates)

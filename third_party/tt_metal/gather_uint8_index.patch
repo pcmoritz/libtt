@@ -1,0 +1,28 @@
+--- ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/gather/codegen/gather_codegen_device_operation.cpp
+@@ -126,8 +126,9 @@
+     }
+     TT_FATAL(
+         tensor_args.input_index_tensor.dtype() == DataType::UINT32 ||
+-            tensor_args.input_index_tensor.dtype() == DataType::UINT16,
+-        "gather_codegen: index tensor must be of type UINT32 or UINT16. Got: {}",
++            tensor_args.input_index_tensor.dtype() == DataType::UINT16 ||
++            tensor_args.input_index_tensor.dtype() == DataType::UINT8,
++        "gather_codegen: index tensor must be of type UINT32, UINT16 or UINT8. Got: {}",
+         tensor_args.input_index_tensor.dtype());
+     if (tensor_args.output_tensor.has_value()) {
+         const auto output_shape = tensor_args.output_tensor.value().logical_shape();
+--- ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/gather/device/gather_device_operation.cpp
+@@ -68,8 +68,9 @@
+     }
+     TT_FATAL(
+         tensor_args.input_index_tensor.dtype() == DataType::UINT32 ||
+-            tensor_args.input_index_tensor.dtype() == DataType::UINT16,
+-        "Index tensor must be of type UINT32 or UINT16. Got: {}",
++            tensor_args.input_index_tensor.dtype() == DataType::UINT16 ||
++            tensor_args.input_index_tensor.dtype() == DataType::UINT8,
++        "Index tensor must be of type UINT32, UINT16 or UINT8. Got: {}",
+         tensor_args.input_index_tensor.dtype());
+ 
+     for (int i = 0; i < input_tensor_rank - 1; ++i) {

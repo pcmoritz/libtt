@@ -95,7 +95,7 @@ new file mode 100644
 diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp
-@@ -5,10 +5,12 @@
+@@ -5,6 +5,7 @@
  #include "api/dataflow/dataflow_api.h"
  #include "api/dataflow/noc.h"
  #include "api/dataflow/dataflow_buffer.h"
@@ -103,32 +103,162 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflo
  #include "experimental/kernel_args.h"
  #include "../common.hpp"
  
- #include <array>
-+#include <type_traits>
+@@ -27,33 +28,49 @@
+     }
+ }
  
- namespace {
- 
-@@ -30,6 +32,23 @@
- template <typename number_type>
- FORCE_INLINE number_type perform_reduction(
-     number_type input, number_type source_value, ScatterReductionType scatter_reduction_type, DataFormat data_format) {
-+    if constexpr (std::is_same_v<number_type, uint16_t>) {
+-template <typename number_type>
+-FORCE_INLINE number_type perform_reduction(
+-    number_type input, number_type source_value, ScatterReductionType scatter_reduction_type, DataFormat data_format) {
+-    switch (scatter_reduction_type) {
+-        case ScatterReductionType::ADD: {
+-            return input + source_value;
+-        }
+-        case ScatterReductionType::MULTIPLY: {
+-            return input * source_value;
+-        }
+-        case ScatterReductionType::AMAX: {
+-            return std::max(input, source_value);
+-        }
+-        case ScatterReductionType::AMIN: {
+-            return std::min(input, source_value);
+-        }
+-        case ScatterReductionType::INVALID: {
+-            return source_value;
++// Float16 keys that order like the values: negatives flip all bits, the rest only the sign bit.
++FORCE_INLINE uint16_t fp16_order_key(uint16_t bits) { return bits ^ ((bits & 0x8000u) ? 0xffffu : 0x8000u); }
++
++FORCE_INLINE bool fp16_is_nan(uint16_t bits) { return (bits & 0x7fffu) > 0x7c00u; }
++
++template <DataFormat Format, ScatterReductionType Reduction>
++FORCE_INLINE std_type_t<Format> perform_reduction(std_type_t<Format> input, std_type_t<Format> source_value) {
++    constexpr bool is_float16 = Format == DataFormat::Float16;
++    if constexpr (is_float16 && (Reduction == ScatterReductionType::AMAX || Reduction == ScatterReductionType::AMIN)) {
++        // Compared on the bits, which is exact; NaN propagates.
++        if (fp16_is_nan(input)) {
++            return input;
+         }
+-        default: {
++        if (fp16_is_nan(source_value)) {
+             return source_value;
+         }
++        const uint16_t input_key = fp16_order_key(input);
++        const uint16_t source_key = fp16_order_key(source_value);
++        const bool keep_input =
++            Reduction == ScatterReductionType::AMAX ? input_key >= source_key : input_key <= source_key;
++        return keep_input ? input : source_value;
++    } else if constexpr (
++        is_float16 && (Reduction == ScatterReductionType::ADD || Reduction == ScatterReductionType::MULTIPLY)) {
 +        // Float16 reduces in float32 and rounds back after every update, which is exact Float16 arithmetic: float32
 +        // has at least 2 * 11 + 2 bits of precision, so the double rounding is harmless.
-+        if (data_format == DataFormat::Float16 && scatter_reduction_type != ScatterReductionType::INVALID) {
-+            float a = fp16_to_fp32(input);
-+            float b = fp16_to_fp32(source_value);
-+            float result = b;
-+            switch (scatter_reduction_type) {
-+                case ScatterReductionType::ADD: result = a + b; break;
-+                case ScatterReductionType::MULTIPLY: result = a * b; break;
-+                case ScatterReductionType::AMAX: result = std::max(a, b); break;
-+                case ScatterReductionType::AMIN: result = std::min(a, b); break;
-+                default: break;
-+            }
-+            return fp32_to_fp16(result);
-+        }
-+    }
-     switch (scatter_reduction_type) {
-         case ScatterReductionType::ADD: {
-             return input + source_value;
++        const float a = fp16_to_fp32(input);
++        const float b = fp16_to_fp32(source_value);
++        return fp32_to_fp16(Reduction == ScatterReductionType::ADD ? a + b : a * b);
++    } else if constexpr (Reduction == ScatterReductionType::ADD) {
++        return input + source_value;
++    } else if constexpr (Reduction == ScatterReductionType::MULTIPLY) {
++        return input * source_value;
++    } else if constexpr (Reduction == ScatterReductionType::AMAX) {
++        return std::max(input, source_value);
++    } else if constexpr (Reduction == ScatterReductionType::AMIN) {
++        return std::min(input, source_value);
++    } else {
++        return source_value;
+     }
+ }
+ 
+ // performs scatter on data loaded to dfb with load_to_dfb
+-template <typename number_type, typename index_type>
++template <DataFormat Format, ScatterReductionType Reduction, typename index_type>
+ FORCE_INLINE void scatter_along_chunk(
+     const DataflowBuffer& input_dfb,
+     const DataflowBuffer& index_dfb,
+@@ -62,8 +79,8 @@
+     const uint32_t& input_stick_size,
+     const uint32_t& input_offset,
+     const uint32_t& input_chunk_size,
+-    const uint32_t& index_chunk_size,
+-    const ScatterReductionType& scatter_reduction_type = ScatterReductionType::INVALID) {
++    const uint32_t& index_chunk_size) {
++    using number_type = std_type_t<Format>;
+     const uint32_t input_l1_read_addr = input_dfb.get_read_ptr();
+     const uint32_t index_l1_read_addr = index_dfb.get_read_ptr();
+     const uint32_t source_l1_read_addr = source_dfb.get_read_ptr();
+@@ -91,8 +108,8 @@
+         }
+         volatile number_type& source_value = source_l1_read_ptr[index_in_index_chunk];
+         const uint32_t& output_index = index_value - input_offset;
+-        output_l1_write_ptr[output_index] = perform_reduction<number_type>(
+-            output_l1_write_ptr[output_index], source_value, scatter_reduction_type, input_dfb.get_dataformat());
++        output_l1_write_ptr[output_index] =
++            perform_reduction<Format, Reduction>(output_l1_write_ptr[output_index], source_value);
+     }
+ }
+ 
+@@ -114,13 +131,14 @@
+     // 76800)
+     const auto index_chunk_size = get_arg(args::index_chunk_size);
+     const auto source_chunk_size = get_arg(args::source_chunk_size);
+-    const auto scatter_reduction_type = static_cast<ScatterReductionType>(get_arg(args::scatter_reduction_type));
++    constexpr auto scatter_reduction_type = static_cast<ScatterReductionType>(get_arg(args::scatter_reduction_type));
+ 
+     const auto input_addr_gtor = TensorAccessor(tensor::input);
+     const auto index_addr_gtor = TensorAccessor(tensor::index);
+     const auto source_addr_gtor = TensorAccessor(tensor::source);
+ 
+-    using input_std_type = std_type_t<get_dataformat(dfb::input)>;
++    constexpr DataFormat input_format = get_dataformat(dfb::input);
++    using input_std_type = std_type_t<input_format>;
+     using index_std_type = std_type_t<get_dataformat(dfb::index)>;
+ 
+     constexpr uint32_t N = input_rank - 1;
+@@ -182,7 +200,7 @@
+                         index_stick_id);
+                     index_dfb.wait_front(ONE_PAGE);
+                     source_dfb.wait_front(ONE_PAGE);
+-                    scatter_along_chunk<input_std_type, index_std_type>(
++                    scatter_along_chunk<input_format, scatter_reduction_type, index_std_type>(
+                         input_dfb,
+                         index_dfb,
+                         source_dfb,
+@@ -190,8 +208,7 @@
+                         input_stick_size,
+                         input_offset,
+                         input_chunk_length,
+-                        index_chunk_length,
+-                        scatter_reduction_type);
++                        index_chunk_length);
+                     source_dfb.pop_front(ONE_PAGE);
+                     index_dfb.pop_front(ONE_PAGE);
+                 }
+diff --git ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/scatter/device/scatter_program_factory.cpp
+@@ -152,6 +152,7 @@
+                 {"index_stick_size", index_stick_size},
+                 {"source_stick_size", source_stick_size},
+                 {"input_rank", static_cast<uint32_t>(input_shape.rank())},
++                {"scatter_reduction_type", static_cast<uint32_t>(args.opt_reduction)},
+             },
+         .runtime_arg_schema =
+             {
+@@ -160,8 +161,7 @@
+                      "sticks_for_core",
+                      "input_and_output_chunk_size",
+                      "index_chunk_size",
+-                     "source_chunk_size",
+-                     "scatter_reduction_type"},
++                     "source_chunk_size"},
+             },
+         .hw_config = ttnn::create_reader_datamovement_config(device->arch()),
+     };
+@@ -211,8 +211,7 @@
+              {"sticks_for_core", sticks_per_core},
+              {"input_and_output_chunk_size", input_and_output_chunk_size},
+              {"index_chunk_size", index_chunk_size},
+-             {"source_chunk_size", source_chunk_size},
+-             {"scatter_reduction_type", static_cast<uint32_t>(args.opt_reduction)}});
++             {"source_chunk_size", source_chunk_size}});
+         AddRuntimeArgsForNode(
+             writer_node_args,
+             core,
