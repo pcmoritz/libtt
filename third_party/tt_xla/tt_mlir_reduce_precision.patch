@@ -65,6 +65,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          loc, intType,
 +          rewriter.create<mlir::stablehlo::BitcastConvertOp>(loc, rawType, x));
 +    }
++    Value inputBits = bits;
 +    uint32_t signBit = 1u << (width - 1);
 +    uint32_t exponentMask = ((1u << inputExponentBits) - 1)
 +                            << inputMantissaBits;
@@ -112,22 +113,21 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +                                                        signedZero, bits);
 +    }
 +
-+    Value result;
++    // Rounding and the exponent handling can turn NaN into a number or
++    // infinity; NaN stays NaN. Selected on the bits, which keeps the payload.
++    bits = rewriter.create<mlir::stablehlo::SelectOp>(loc, isNan, inputBits,
++                                                      bits);
 +    if (width == 32) {
-+      result = rewriter.create<mlir::stablehlo::BitcastConvertOp>(
-+          loc, inputType, bits);
++      rewriter.replaceOpWithNewOp<mlir::stablehlo::BitcastConvertOp>(
++          srcOp, inputType, bits);
 +    } else {
 +      // Drop a rounding carry out of the input's width before narrowing.
 +      bits = rewriter.create<mlir::stablehlo::AndOp>(
 +          loc, bits, constant((1u << width) - 1));
-+      result = rewriter.create<mlir::stablehlo::BitcastConvertOp>(
-+          loc, inputType,
++      rewriter.replaceOpWithNewOp<mlir::stablehlo::BitcastConvertOp>(
++          srcOp, inputType,
 +          rewriter.create<mlir::stablehlo::ConvertOp>(loc, rawType, bits));
 +    }
-+    // Rounding and the exponent handling can turn NaN into a number or
-+    // infinity; NaN stays NaN.
-+    rewriter.replaceOpWithNewOp<mlir::stablehlo::SelectOp>(srcOp, isNan, x,
-+                                                           result);
 +    return success();
 +  }
 +};
