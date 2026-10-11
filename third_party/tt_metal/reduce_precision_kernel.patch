@@ -2,7 +2,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
 new file mode 100644
 --- /dev/null
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_reduce_precision.h
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,82 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -16,8 +16,6 @@ new file mode 100644
 +
 +namespace ckernel {
 +namespace sfpu {
-+
-+inline void reduce_precision_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
 +
 +// Rounds the floating-point values in Dest to a format with EXPONENT_BITS and MANTISSA_BITS, with XLA's bit
 +// manipulation on the input format's own bits: round to nearest even, flush values below the format's smallest
@@ -87,17 +85,6 @@ new file mode 100644
 +
 +}  // namespace sfpu
 +}  // namespace ckernel
-diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu_types.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu_types.h
---- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu_types.h
-+++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu_types.h
-@@ -113,6 +113,7 @@
-     tiled_prod,
-     bitwise_xor,
-     bitwise_not,
-+    reduce_precision,
-     bitwise_and,
-     bitwise_or,
-     right_shift,
 diff --git tt_metal/hw/inc/api/compute/eltwise_unary/reduce_precision.h tt_metal/hw/inc/api/compute/eltwise_unary/reduce_precision.h
 new file mode 100644
 --- /dev/null
@@ -143,7 +130,7 @@ new file mode 100644
 +        VectorMode::RC));
 +}
 +
-+ALWI void reduce_precision_tile_init() { MATH(SFPU_UNARY_INIT(reduce_precision)); }
++ALWI void reduce_precision_tile_init() { MATH(SFPU_UNARY_INIT(unused)); }
 +
 +}  // namespace ckernel
 diff --git tt_metal/hw/inc/api/compute/eltwise_unary/sfpu_split_includes.h tt_metal/hw/inc/api/compute/eltwise_unary/sfpu_split_includes.h
@@ -234,12 +221,13 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp ttnn
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-@@ -345,10 +345,12 @@
+@@ -345,10 +345,13 @@
      const auto& ops_chain = operation_attributes.op_chain;
      TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
      const bool is_bitcast = ops_chain.size() == 1 && ops_chain[0].type() == UnaryOpType::BITCAST;
-+    // reduce_precision works on the raw bits, as UInt16 or UInt32 like a bitcast.
 +    const bool is_reduce_precision = ops_chain.size() == 1 && ops_chain[0].type() == UnaryOpType::REDUCE_PRECISION;
++    // Both work on the raw bits, as UInt16 or UInt32 by element size, for input and output.
++    const bool uses_raw_bits = is_bitcast || is_reduce_precision;
      auto compute_ops_chain = ops_chain;
      const bool promote_narrow_float =
          uses_raw_16bit_sfpu_path(input.dtype()) && ops_chain[0].type() != UnaryOpType::TYPECAST &&
@@ -248,7 +236,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
          (input.dtype() == DataType::FLOAT16 || ops_chain[0].type() == UnaryOpType::NEG ||
           ops_chain[0].type() == UnaryOpType::ABS || ops_chain[0].type() == UnaryOpType::LOG1P) &&
          get_compute_kernel_path(ops_chain[0].type(), input.dtype()) == "eltwise_sfpu.cpp";
-@@ -368,8 +370,9 @@
+@@ -368,8 +371,9 @@
          }
      }
  
@@ -260,24 +248,24 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
                                    output.dtype() == DataType::FLOAT16 || promote_narrow_float;
      uint32_t packed_scalar1 = 0;
      uint32_t packed_scalar2 = 0;
-@@ -384,8 +387,8 @@
+@@ -384,8 +388,8 @@
      DataFormat cb_data_format_output =
          promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format
                                                        : cb_dataformat_for(output.dtype());
 -    if (is_bitcast) {
 -        // For BITCAST, cb_data_format_for_input below inherits this format.
-+    if (is_bitcast || is_reduce_precision) {
-+        // For BITCAST and REDUCE_PRECISION, cb_data_format_for_input below inherits this format.
++    if (uses_raw_bits) {
++        // cb_data_format_for_input below inherits this format.
          // Unsigned semantics therefore apply to both unpacking and packing.
          cb_data_format_output =
              input.element_size() == sizeof(uint16_t) ? DataFormat::UInt16 : DataFormat::UInt32;
-@@ -449,7 +452,8 @@
+@@ -448,8 +452,7 @@
+         "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/compute/{}",
          get_compute_kernel_path(ops_chain[0].type(), input.dtype()));
  
-     DataFormat cb_data_format_for_input =
+-    DataFormat cb_data_format_for_input =
 -        (ops_chain[0].type() == unary::UnaryOpType::BITCAST) ? cb_data_format_output : cb_data_format;
-+        (ops_chain[0].type() == unary::UnaryOpType::BITCAST || is_reduce_precision) ? cb_data_format_output
-+                                                                                      : cb_data_format;
++    DataFormat cb_data_format_for_input = uses_raw_bits ? cb_data_format_output : cb_data_format;
  
      // --- Circular Buffers ---
      desc.cbs.push_back(CBDescriptor{

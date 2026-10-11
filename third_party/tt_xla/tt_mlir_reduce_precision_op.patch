@@ -95,15 +95,18 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 --- a/lib/Dialect/TTIR/IR/TTIROps.cpp
 +++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
-@@ -7139,6 +7139,24 @@
+@@ -7139,6 +7139,27 @@
  // CumProdOp
  //===----------------------------------------------------------------------===//
  
 +// ReducePrecisionOp verification
 +::mlir::LogicalResult mlir::tt::ttir::ReducePrecisionOp::verify() {
 +  auto inputType = getInput().getType();
-+  if (getResult().getType() != inputType) {
-+    return emitOpError() << "result type must match the input type";
++  auto resultType = getResult().getType();
++  if (resultType.getShape() != inputType.getShape() ||
++      resultType.getElementType() != inputType.getElementType()) {
++    return emitOpError()
++           << "result shape and element type must match the input";
 +  }
 +  if (!inputType.getElementType().isF32() &&
 +      !inputType.getElementType().isBF16() &&
@@ -123,14 +126,30 @@ diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-@@ -237,6 +237,23 @@
+@@ -97,6 +97,12 @@
+ 
+ llvm::SmallVector<mlir::FloatAttr> CbrtOp::getParams() { return {}; }
+ 
++// Unknown keeps reduce_precision out of unary fusion, which would lose the
++// raw-bit buffer configuration its kernel needs.
++UnaryOpType ReducePrecisionOp::getUnaryOpType() { return UnaryOpType::Unknown; }
++
++llvm::SmallVector<mlir::FloatAttr> ReducePrecisionOp::getParams() { return {}; }
++
+ UnaryOpType CeilOp::getUnaryOpType() { return UnaryOpType::Ceil; }
+ 
+ llvm::SmallVector<mlir::FloatAttr> CeilOp::getParams() { return {}; }
+@@ -237,6 +243,26 @@
  // RandOp
  //===----------------------------------------------------------------------===//
  
 +::mlir::LogicalResult mlir::tt::ttnn::ReducePrecisionOp::verify() {
 +  auto inputType = getInput().getType();
-+  if (getResult().getType() != inputType) {
-+    return emitOpError() << "result type must match the input type";
++  auto resultType = getResult().getType();
++  if (resultType.getShape() != inputType.getShape() ||
++      resultType.getElementType() != inputType.getElementType()) {
++    return emitOpError()
++           << "result shape and element type must match the input";
 +  }
 +  if (!inputType.getElementType().isF32() &&
 +      !inputType.getElementType().isBF16() &&
