@@ -1,16 +1,17 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10857,6 +10857,145 @@ public:
+@@ -10857,6 +10857,134 @@ public:
  };
  } // namespace
  
 +namespace {
 +// Rounds to a floating-point format with the given exponent and mantissa
-+// widths. Float16, BFloat16 and Float32 are typecast round trips; other
-+// formats (e.g. float8) use XLA's bit manipulation on the Float32 bits:
-+// round to nearest even, flush values below the format's smallest normal to
-+// signed zero, saturate overflows to signed infinity, and keep NaN.
++// widths with XLA's bit manipulation on the input's own bits: round to nearest
++// even, flush values below the format's smallest normal to signed zero,
++// saturate overflows to signed infinity, and keep NaN (as XLA on the CPU).
++// Narrower inputs are widened to 32-bit integers bit by bit, never converted
++// numerically, so subnormals of the input format behave as in XLA.
 +class StableHLOToTTIRReducePrecisionOpConversionPattern
 +    : public OpConversionPattern<mlir::stablehlo::ReducePrecisionOp> {
 +  using OpConversionPattern<
@@ -21,60 +22,32 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  matchAndRewrite(mlir::stablehlo::ReducePrecisionOp srcOp,
 +                  mlir::stablehlo::ReducePrecisionOp::Adaptor adaptor,
 +                  ConversionPatternRewriter &rewriter) const override {
-+    auto resultType = mlir::cast<RankedTensorType>(
-+        getTypeConverter()->convertType(srcOp.getType()));
-+    auto inputType = mlir::cast<FloatType>(resultType.getElementType());
-+
++    auto inputType = mlir::cast<RankedTensorType>(srcOp.getType());
++    auto floatType = mlir::cast<FloatType>(inputType.getElementType());
++    int width = floatType.getWidth();
++    int inputMantissaBits = floatType.getFPMantissaWidth() - 1;
++    int inputExponentBits = width - inputMantissaBits - /*sign=*/1;
 +    int exponentBits = srcOp.getExponentBits();
 +    int mantissaBits = srcOp.getMantissaBits();
-+    int inputMantissaBits = inputType.getFPMantissaWidth() - 1;
-+    int inputExponentBits =
-+        inputType.getWidth() - inputMantissaBits - /*sign=*/1;
 +    if (exponentBits >= inputExponentBits &&
 +        mantissaBits >= inputMantissaBits) {
 +      rewriter.replaceOp(srcOp, adaptor.getOperand());
 +      return success();
 +    }
-+
-+    Type reducedElementType;
-+    if (exponentBits == 5 && mantissaBits == 10) {
-+      reducedElementType = rewriter.getF16Type();
-+    } else if (exponentBits == 8 && mantissaBits == 7) {
-+      reducedElementType = rewriter.getBF16Type();
-+    } else if (exponentBits == 8 && mantissaBits == 23) {
-+      reducedElementType = rewriter.getF32Type();
-+    }
-+    if (reducedElementType) {
-+      auto reducedType = resultType.clone(reducedElementType);
-+      Value reduced = rewriter.create<ttir::TypecastOp>(
-+          srcOp.getLoc(), reducedType, adaptor.getOperand(), true);
-+      rewriter.replaceOpWithNewOp<ttir::TypecastOp>(
-+          srcOp, resultType, reduced, true);
-+      return success();
-+    }
-+    if (inputType.getWidth() > 32 || exponentBits < 1) {
++    if (width > 32 || exponentBits < 1) {
 +      return rewriter.notifyMatchFailure(
 +          srcOp, "requested floating-point format is not supported");
 +    }
-+    rewriter.replaceOp(srcOp, reduceFloat32Bits(srcOp, exponentBits,
-+                                                mantissaBits, rewriter));
-+    return success();
-+  }
 +
-+private:
-+  // Built from StableHLO ops, which the other patterns then convert.
-+  static Value reduceFloat32Bits(mlir::stablehlo::ReducePrecisionOp srcOp,
-+                                 int exponentBits, int mantissaBits,
-+                                 ConversionPatternRewriter &rewriter) {
++    // Built from StableHLO ops, which the other patterns then convert.
 +    Location loc = srcOp.getLoc();
-+    Value input = srcOp.getOperand();
-+    auto originalType = mlir::cast<RankedTensorType>(input.getType());
-+    auto floatType = originalType.clone(rewriter.getF32Type());
-+    auto intType = originalType.clone(rewriter.getI32Type());
++    Value x = srcOp.getOperand();
++    auto intType = inputType.clone(rewriter.getI32Type());
 +    auto constant = [&](uint32_t value) -> Value {
 +      return rewriter.create<mlir::stablehlo::ConstantOp>(
 +          loc, DenseElementsAttr::get(intType, APInt(32, value)));
 +    };
++    // Every compared value is masked to at most 31 bits.
 +    auto compare = [&](Value lhs, Value rhs,
 +                       mlir::stablehlo::ComparisonDirection direction) {
 +      return rewriter.create<mlir::stablehlo::CompareOp>(
@@ -82,22 +55,28 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    };
 +    using mlir::stablehlo::ComparisonDirection;
 +
-+    Value x = input;
-+    if (originalType != floatType) {
-+      x = rewriter.create<mlir::stablehlo::ConvertOp>(loc, floatType, x);
++    Value bits;
++    RankedTensorType rawType;
++    if (width == 32) {
++      bits = rewriter.create<mlir::stablehlo::BitcastConvertOp>(loc, intType, x);
++    } else {
++      rawType = inputType.clone(rewriter.getIntegerType(width, false));
++      bits = rewriter.create<mlir::stablehlo::ConvertOp>(
++          loc, intType,
++          rewriter.create<mlir::stablehlo::BitcastConvertOp>(loc, rawType, x));
 +    }
-+    Value bits =
-+        rewriter.create<mlir::stablehlo::BitcastConvertOp>(loc, intType, x);
-+    Value magnitude =
-+        rewriter.create<mlir::stablehlo::AndOp>(loc, bits, constant(0x7FFFFFFF));
-+    Value isNan =
-+        compare(magnitude, constant(0x7F800000), ComparisonDirection::GT);
++    uint32_t signBit = 1u << (width - 1);
++    uint32_t exponentMask = ((1u << inputExponentBits) - 1)
++                            << inputMantissaBits;
++    Value isNan = compare(
++        rewriter.create<mlir::stablehlo::AndOp>(loc, bits,
++                                                constant(signBit - 1)),
++        constant(exponentMask), ComparisonDirection::GT);
 +
-+    constexpr int floatMantissaBits = 23;
-+    if (mantissaBits < floatMantissaBits) {
++    if (mantissaBits < inputMantissaBits) {
 +      // Round to nearest even: add 0111... plus the last kept bit, then
 +      // truncate. A carry into the exponent is correct.
-+      int dropped = floatMantissaBits - mantissaBits;
++      int dropped = inputMantissaBits - mantissaBits;
 +      uint32_t lastKeptBit = 1u << dropped;
 +      Value lastBit = rewriter.create<mlir::stablehlo::ShiftRightLogicalOp>(
 +          loc,
@@ -110,36 +89,46 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +          loc, rewriter.create<mlir::stablehlo::AddOp>(loc, bits, bias),
 +          constant(~(lastKeptBit - 1)));
 +    }
-+    constexpr int floatExponentBits = 8;
-+    if (exponentBits < floatExponentBits) {
++    if (exponentBits < inputExponentBits) {
++      uint32_t inputBias = (1u << (inputExponentBits - 1)) - 1;
 +      uint32_t reducedBias = (1u << (exponentBits - 1)) - 1;
-+      uint32_t maxExponent = 127 + reducedBias;
-+      uint32_t minExponent = 127 - reducedBias;
-+      Value exponent =
-+          rewriter.create<mlir::stablehlo::AndOp>(loc, bits, constant(0x7F800000));
-+      Value overflows = compare(exponent, constant(maxExponent << 23),
-+                                ComparisonDirection::GT);
-+      Value underflows = compare(exponent, constant(minExponent << 23),
-+                                 ComparisonDirection::LE);
-+      Value signedZero =
-+          rewriter.create<mlir::stablehlo::AndOp>(loc, bits, constant(0x80000000));
++      uint32_t maxExponent = inputBias + reducedBias;
++      uint32_t minExponent = inputBias - reducedBias;
++      Value exponent = rewriter.create<mlir::stablehlo::AndOp>(
++          loc, bits, constant(exponentMask));
++      Value overflows =
++          compare(exponent, constant(maxExponent << inputMantissaBits),
++                  ComparisonDirection::GT);
++      Value underflows =
++          compare(exponent, constant(minExponent << inputMantissaBits),
++                  ComparisonDirection::LE);
++      Value signedZero = rewriter.create<mlir::stablehlo::AndOp>(
++          loc, bits, constant(signBit));
 +      Value signedInfinity = rewriter.create<mlir::stablehlo::OrOp>(
-+          loc, signedZero, constant(0x7F800000));
++          loc, signedZero, constant(exponentMask));
 +      bits = rewriter.create<mlir::stablehlo::SelectOp>(loc, overflows,
 +                                                        signedInfinity, bits);
 +      bits = rewriter.create<mlir::stablehlo::SelectOp>(loc, underflows,
 +                                                        signedZero, bits);
 +    }
-+    Value result =
-+        rewriter.create<mlir::stablehlo::BitcastConvertOp>(loc, floatType, bits);
-+    // Rounding and the exponent handling can turn NaN into a number or
-+    // infinity; NaN stays NaN, as in XLA on the CPU.
-+    result = rewriter.create<mlir::stablehlo::SelectOp>(loc, isNan, x, result);
-+    if (originalType != floatType) {
-+      result =
-+          rewriter.create<mlir::stablehlo::ConvertOp>(loc, originalType, result);
++
++    Value result;
++    if (width == 32) {
++      result = rewriter.create<mlir::stablehlo::BitcastConvertOp>(
++          loc, inputType, bits);
++    } else {
++      // Drop a rounding carry out of the input's width before narrowing.
++      bits = rewriter.create<mlir::stablehlo::AndOp>(
++          loc, bits, constant((1u << width) - 1));
++      result = rewriter.create<mlir::stablehlo::BitcastConvertOp>(
++          loc, inputType,
++          rewriter.create<mlir::stablehlo::ConvertOp>(loc, rawType, bits));
 +    }
-+    return result;
++    // Rounding and the exponent handling can turn NaN into a number or
++    // infinity; NaN stays NaN.
++    rewriter.replaceOpWithNewOp<mlir::stablehlo::SelectOp>(srcOp, isNan, x,
++                                                           result);
++    return success();
 +  }
 +};
 +} // namespace
@@ -147,7 +136,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  static void
  addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
                                           RewritePatternSet &patterns,
-@@ -10912,6 +11051,8 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
+@@ -10912,6 +11040,8 @@ addElementwiseUnaryOpsConversionPatterns(MLIRContext *ctx,
    patterns.add<StableHLOToTTIROpDefaultConversionPattern<
        mlir::stablehlo::RoundNearestEvenOp, mlir::tt::ttir::RoundOp>>(
        typeConverter, ctx);

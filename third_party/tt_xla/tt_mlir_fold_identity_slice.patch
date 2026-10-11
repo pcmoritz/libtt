@@ -1,13 +1,11 @@
 diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 --- a/lib/Dialect/TTIR/IR/TTIROps.cpp
 +++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
-@@ -3503,6 +3503,18 @@
+@@ -3503,6 +3503,16 @@
  
  // SliceStaticOp Folder
  mlir::OpFoldResult mlir::tt::ttir::SliceStaticOp::fold(FoldAdaptor adaptor) {
-+  // A slice of the whole input with unit steps is the input. Folding it keeps
-+  // later commutes from moving it past a reshape onto a rank-0 tensor, which
-+  // cannot be sliced.
++  // A slice of the whole input with unit steps is the input.
 +  auto isConstant = [](ArrayAttr values, int64_t expected) {
 +    return llvm::all_of(values, [&](Attribute value) {
 +      return mlir::cast<IntegerAttr>(value).getInt() == expected;
@@ -20,3 +18,17 @@ diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
  
    if (auto foldResult = foldConsecutiveSliceStatic(*this)) {
      return foldResult;
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNMemoryManagement.cpp b/lib/Dialect/TTNN/Transforms/TTNNMemoryManagement.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNMemoryManagement.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNMemoryManagement.cpp
+@@ -396,6 +396,10 @@
+ 
+     RankedTensorType inputType = reshapeOp.getInput().getType();
+     RankedTensorType outputType = reshapeOp.getResult().getType();
++    // A rank-0 tensor cannot be sliced.
++    if (inputType.getRank() == 0) {
++      return failure();
++    }
+     ArrayRef<int64_t> inputShape = inputType.getShape();
+     ArrayRef<int64_t> outputShape = outputType.getShape();
+ 
