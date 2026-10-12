@@ -128,7 +128,7 @@ Geometry geometry(const IndexedRowsParams& params, const IndexedRowsInputs& in) 
         {"index_stride", g.index_stride_bytes / static_cast<uint32_t>(sizeof(uint32_t))},
         {"group", g.group},
         {"index_batch", g.index_batch},
-        {"resident", 0u},  // rows_scatter sets it
+        {"batch", 0u},  // rows_scatter: rows DFB entries
         {"elem_kind", elem_kind(in.table.dtype())},
         {"elem_bytes", g.elem_bytes},
         {"reduce", static_cast<uint32_t>(params.reduce)},
@@ -253,17 +253,14 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
     const auto& device = table.device();
     Geometry g = geometry(params, in);
 
-    // Owned pages that fit L1 are held there and written once after the
-    // updates; otherwise they stream to the output and updates read-modify-write
-    // DRAM. The split is even, so the largest share decides for every core.
+    // Owned pages stream through L1 in batches of up to `batch` chunks (as
+    // many as fit 512 KiB); each batch takes the updates that land in it and
+    // goes out once. The reader fills the batch `group` chunks at a time.
     const Split s = split(device, g.table.B * g.pages);
-    uint32_t max_pages = 0;
-    for (const auto& [core, range] : s.ranges) {
-        max_pages = std::max(max_pages, range.second);
-    }
-    constexpr uint32_t kResidentBudget = 512 * 1024;
-    const bool resident = g.page_bytes <= g.chunk_bytes && max_pages * g.entry_bytes <= kResidentBudget;
-    g.compile_time_args["resident"] = static_cast<uint32_t>(resident);
+    constexpr uint32_t kBatchBudget = 512 * 1024;
+    const uint32_t batch = std::max<uint32_t>(1, kBatchBudget / g.entry_bytes);
+    g.compile_time_args["batch"] = batch;
+    g.compile_time_args["group"] = std::min(g.group, batch);
 
     const KernelSpecName READER{"reader"};
     const KernelSpecName WRITER{"writer"};
@@ -277,10 +274,10 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
     const TensorParamName OUTPUT{"output"};
 
     Group<DataflowBufferSpec> dataflow_buffers = {
-        {.unique_id = ROWS_DFB, .entry_size = g.entry_bytes, .num_entries = resident ? max_pages : 2 * g.group},
+        {.unique_id = ROWS_DFB, .entry_size = g.entry_bytes, .num_entries = batch},
         {.unique_id = INDEX_DFB, .entry_size = g.index_entry_bytes, .num_entries = 1},
         {.unique_id = STREAM_DFB, .entry_size = g.source_entry_bytes, .num_entries = 1},
-        {.unique_id = SCRATCH_DFB, .entry_size = g.entry_bytes, .num_entries = 2},
+        {.unique_id = SCRATCH_DFB, .entry_size = g.entry_bytes, .num_entries = 1},
     };
 
     KernelSpec reader{

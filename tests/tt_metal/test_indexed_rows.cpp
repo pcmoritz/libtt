@@ -438,5 +438,35 @@ TEST_F(IndexedRowsTest, ManyPositionsStreamAndResidentScatterAdd) {
     EXPECT_EQ(out.cpu().to_vector<float>(), cref.scatter(ctable, cidx, csource, [](float, float s) { return s; }));
 }
 
+// Pages of a chunk (64 KiB) with more of them per core than fit the writer's
+// 512 KiB batch, so each core takes its pages in several batches: an overwrite
+// of a row and a reduction into a later batch must both land.
+TEST_F(IndexedRowsTest, ScatterPagesInSeveralBatches) {
+    Ref ref(/*B=*/1, /*R=*/32768, /*Bi=*/1, /*M=*/300, {1400}, {1});  // 1400 pages of 64 KiB bf16
+    std::mt19937 rng(9);
+    auto idx = random_indices(ref.M, -5, 1405, rng);
+    auto table = iota_values<bfloat16>(static_cast<size_t>(ref.N) * ref.R, 0.001f);
+    auto source = iota_values<bfloat16>(static_cast<size_t>(ref.M) * ref.R, -0.002f);
+    auto table_dev = to_device(table, {1, ref.N, ref.R}, DataType::BFLOAT16);
+    auto source_dev = to_device(source, {1, ref.M, ref.R}, DataType::BFLOAT16);
+    auto out = ttnn::experimental::rows_scatter(
+        table_dev, index_tensor(ref, idx, DataType::INT32), source_dev, IndexedRowsSpec{{1400}, {1}});
+    auto got = out.cpu().to_vector<bfloat16>();
+    auto want = ref.scatter(table, idx, source, [](bfloat16, bfloat16 s) { return s; });
+    ASSERT_EQ(got.size(), want.size());
+    for (size_t i = 0; i < got.size(); ++i) {
+        ASSERT_EQ(got[i].operator float(), want[i].operator float()) << "at " << i;
+    }
+    out = ttnn::experimental::rows_scatter(
+        table_dev, index_tensor(ref, idx, DataType::INT32), source_dev, IndexedRowsSpec{{1400}, {1}}, RowsReduce::Max);
+    got = out.cpu().to_vector<bfloat16>();
+    want = ref.scatter(table, idx, source, [](bfloat16 a, bfloat16 s) {
+        return static_cast<float>(s) > static_cast<float>(a) ? s : a;
+    });
+    for (size_t i = 0; i < got.size(); ++i) {
+        ASSERT_EQ(got[i].operator float(), want[i].operator float()) << "at " << i;
+    }
+}
+
 }  // namespace
 }  // namespace tt::tt_metal::distributed::test

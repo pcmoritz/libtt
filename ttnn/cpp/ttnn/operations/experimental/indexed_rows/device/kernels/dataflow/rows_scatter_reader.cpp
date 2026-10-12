@@ -3,8 +3,7 @@
 //
 // rows_scatter reader: streams this core's table pages (pages
 // [first_page, first_page + num_pages) of the [B, N, S, R] table) into the rows
-// DFB, chunk by chunk, for the writer to copy into the output before it applies
-// the updates that land in those pages.
+// DFB, chunk by chunk, for the writer to update in L1 and write out.
 
 #include <cstdint>
 

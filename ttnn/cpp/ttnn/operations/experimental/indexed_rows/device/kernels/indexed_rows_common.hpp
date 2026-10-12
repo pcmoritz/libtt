@@ -228,8 +228,10 @@ FORCE_INLINE T reduce_int(T cur, T upd) {
 }
 
 // cur[i] = reduce(cur[i], upd[i]) over `count` elements in L1.
+// Out of line: inlined into the scatter writer the element loop is scheduled
+// with the kernel's register pressure and runs 13% slower.
 template <uint32_t kElem, uint32_t kReduce>
-FORCE_INLINE void reduce_rows(uint32_t cur_addr, uint32_t upd_addr, uint32_t count) {
+__attribute__((noinline)) void reduce_rows(uint32_t cur_addr, uint32_t upd_addr, uint32_t count) {
     if constexpr (kElem == kF32) {
         auto* cur = reinterpret_cast<volatile tt_l1_ptr float*>(cur_addr);
         auto* upd = reinterpret_cast<volatile tt_l1_ptr float*>(upd_addr);
