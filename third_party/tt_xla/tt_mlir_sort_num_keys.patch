@@ -1,0 +1,125 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -9674,6 +9674,85 @@
+       return rewriter.create<ttir::PermuteOp>(loc, resultType, value, invPerm);
+     };
+ 
++    // Gathers rows along dimension 1 by row indices. Integer rows use
++    // ttir.gather; ttnn.embedding only takes bf16 or f32 tables, so other rows
++    // use EmbeddingOp, which looks up flat indices into a [total, 1] table:
++    //   flat[i, j] = i * dSort + rowIndices[i, j]
++    auto gatherRows = [&](Value rows, Value rowIndices) -> Value {
++      auto rowsType = cast<RankedTensorType>(rows.getType());
++      Type elemType = rowsType.getElementType();
++      if (auto intType = dyn_cast<IntegerType>(elemType);
++          intType && intType.getWidth() >= 16) {
++        return rewriter.create<ttir::GatherOp>(loc, rowsType, rows, rowIndices,
++                                               rewriter.getI32IntegerAttr(1));
++      }
++      auto rowIndicesType = cast<RankedTensorType>(rowIndices.getType());
++      Value rowOffsets = rewriter.create<ttir::ArangeOp>(
++          loc, rowIndicesType, /*start=*/0, /*end=*/total, /*step=*/dSort,
++          /*arange_dimension=*/0);
++      Value flat = rewriter.create<ttir::AddOp>(loc, rowIndicesType,
++                                                rowOffsets, rowIndices);
++      Value table = rewriter.create<ttir::ReshapeOp>(
++          loc, RankedTensorType::get({total, 1}, elemType), rows,
++          rewriter.getI32ArrayAttr({static_cast<int32_t>(total), 1}));
++      Value gathered = rewriter.create<ttir::EmbeddingOp>(
++          loc, RankedTensorType::get({prePost, dSort, 1}, elemType), flat,
++          table);
++      return rewriter.create<ttir::ReshapeOp>(
++          loc, rowsType, gathered,
++          rewriter.getI32ArrayAttr({static_cast<int32_t>(prePost),
++                                    static_cast<int32_t>(dSort)}));
++    };
++
++    // Several keys (lax.sort with num_keys > 1, as in jnp.lexsort): a later key
++    // only orders elements whose earlier keys are equal. Sort stably by each
++    // key from the least to the most significant one, each time reordering the
++    // key by the order so far (an LSD radix sort), then gather every input by
++    // the final order.
++    if (unsigned numKeys = getNumKeys(srcOp); numKeys > 1) {
++      auto rowIndicesType = RankedTensorType::get(
++          {prePost, dSort}, rewriter.getIntegerType(32));
++      Value order;
++      for (int k = static_cast<int>(numKeys) - 1; k >= 0; --k) {
++        Value key = toRows(adaptor.getInputs()[k]);
++        if (order) {
++          key = gatherRows(key, order);
++        }
++        auto keyType = cast<RankedTensorType>(key.getType());
++        auto intType = dyn_cast<IntegerType>(keyType.getElementType());
++        Value keyOrder;
++        if (intType && intType.getWidth() == 32) {
++          keyOrder = sortInt32KeyRows(rewriter, loc, key, intType.isUnsigned(),
++                                      rewriter.getIntegerType(32),
++                                      *isDescending)
++                         .second;
++        } else {
++          // Narrow signed keys are exact in float32, which ttnn.sort takes.
++          if (intType && !intType.isUnsigned()) {
++            keyType = keyType.clone(rewriter.getF32Type());
++            key = rewriter.create<ttir::TypecastOp>(loc, keyType, key);
++          }
++          keyOrder = rewriter
++                         .create<ttir::SortOp>(
++                             loc, TypeRange{keyType, rowIndicesType}, key,
++                             rewriter.getSI32IntegerAttr(1),
++                             rewriter.getBoolAttr(*isDescending),
++                             rewriter.getBoolAttr(true))
++                         .getIndices();
++        }
++        order = order ? gatherRows(order, keyOrder) : keyOrder;
++      }
++      SmallVector<Value> results;
++      for (auto [input, resultType] :
++           llvm::zip_equal(adaptor.getInputs(), srcOp.getResultTypes())) {
++        results.push_back(fromRows(
++            gatherRows(toRows(input), order),
++            cast<RankedTensorType>(getTypeConverter()->convertType(resultType))));
++      }
++      rewriter.replaceOp(srcOp, results);
++      return success();
++    }
++
+     // Step 4: Emit the sort. `indices2D` holds the sort indices as rows; it is
+     // set directly by the 32-bit integer sort and derived from `indices`
+     // otherwise.
+@@ -9864,6 +9943,35 @@
+     return {gather(rows, indices), indices};
+   }
+ 
++  // The number of sort keys. Lexicographic comparators (JAX's) order by
++  // operand pair (2i, 2i + 1) for key i, possibly through canonicalizing ops,
++  // so trace each ordering compare back to the comparator arguments it reads.
++  unsigned getNumKeys(mlir::stablehlo::SortOp &srcOp) const {
++    unsigned numKeys = 1;
++    srcOp.getComparator().front().walk([&](mlir::stablehlo::CompareOp cmpOp) {
++      if (cmpOp.getComparisonDirection() !=
++              mlir::stablehlo::ComparisonDirection::LT &&
++          cmpOp.getComparisonDirection() !=
++              mlir::stablehlo::ComparisonDirection::GT) {
++        return;
++      }
++      SmallVector<Value> worklist{cmpOp.getLhs()};
++      llvm::DenseSet<Value> visited;
++      while (!worklist.empty()) {
++        Value value = worklist.pop_back_val();
++        if (!visited.insert(value).second) {
++          continue;
++        }
++        if (auto arg = dyn_cast<BlockArgument>(value)) {
++          numKeys = std::max(numKeys, arg.getArgNumber() / 2 + 1);
++        } else if (Operation *def = value.getDefiningOp()) {
++          llvm::append_range(worklist, def->getOperands());
++        }
++      }
++    });
++    return numKeys;
++  }
++
+   mlir::FailureOr<bool> getSortDirection(mlir::stablehlo::SortOp &srcOp) const {
+     Block &block = srcOp.getComparator().front();
+     for (auto &op : block.getOperations()) {
