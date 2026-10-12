@@ -43,7 +43,7 @@ Value asInt32(ConversionPatternRewriter &rewriter, Location loc, Value value) {
     return value;
   }
   return rewriter.create<ttir::TypecastOp>(
-      loc, RankedTensorType::get(type.getShape(), rewriter.getI32Type()),
+      loc, RankedTensorType::get(type.getShape(), rewriter.getIntegerType(32, /*isSigned=*/true)),
       value);
 }
 
@@ -59,7 +59,7 @@ Value rowColumnIndices(ConversionPatternRewriter &rewriter, Location loc,
   const int64_t last = rank - 1;
   const int64_t width = operandShape[last];
   auto i32Type =
-      RankedTensorType::get(indexType.getShape(), rewriter.getI32Type());
+      RankedTensorType::get(indexType.getShape(), rewriter.getIntegerType(32, /*isSigned=*/true));
   SmallVector<int64_t> strides = mlir::computeStrides(operandShape);
   Value index32 = asInt32(rewriter, loc, index);
 
@@ -92,7 +92,7 @@ Value rowColumnIndices(ConversionPatternRewriter &rewriter, Location loc,
 
   const int64_t positions = volume(indexType.getShape());
   auto componentType =
-      RankedTensorType::get({1, positions, 1}, rewriter.getI32Type());
+      RankedTensorType::get({1, positions, 1}, rewriter.getIntegerType(32, /*isSigned=*/true));
   row = ttir::utils::createReshapeOp(rewriter, loc, row,
                                      componentType.getShape());
   column = ttir::utils::createReshapeOp(rewriter, loc, column,

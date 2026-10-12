@@ -288,7 +288,7 @@ IndexLayout buildIndices(ConversionPatternRewriter &rewriter, Location loc,
   if (!elementType.isInteger(32)) {
     value = rewriter.create<ttir::TypecastOp>(
         ttmlir::utils::appendLocationSuffix(loc, "_indices_i32"),
-        RankedTensorType::get({layout.Bi, layout.M, K}, rewriter.getI32Type()),
+        RankedTensorType::get({layout.Bi, layout.M, K}, rewriter.getIntegerType(32, /*isSigned=*/true)),
         value);
   }
 
@@ -1053,7 +1053,7 @@ public:
         start = ttir::utils::createReshapeOp(
             rewriter, ttmlir::utils::appendLocationSuffix(loc, "_start"), start,
             {1, 1, 1});
-        auto columnType = RankedTensorType::get({1, 1, 1}, rewriter.getI32Type());
+        auto columnType = RankedTensorType::get({1, 1, 1}, rewriter.getIntegerType(32, /*isSigned=*/true));
         if (!startType.getElementType().isInteger(32)) {
           start = rewriter.create<ttir::TypecastOp>(loc, columnType, start);
         }
@@ -1076,7 +1076,7 @@ public:
       } else {
         if (!zeros) {
           zeros = rewriter.create<ttir::FullOp>(
-              loc, RankedTensorType::get({1, 1, 1}, rewriter.getI32Type()),
+              loc, RankedTensorType::get({1, 1, 1}, rewriter.getIntegerType(32, /*isSigned=*/true)),
               rewriter.getI32IntegerAttr(0));
         }
         indexColumns.push_back(zeros);
@@ -1087,7 +1087,7 @@ public:
       indices = rewriter.create<ttir::ConcatOp>(
           ttmlir::utils::appendLocationSuffix(loc, "_starts"),
           RankedTensorType::get({1, 1, static_cast<int64_t>(indexColumns.size())},
-                                rewriter.getI32Type()),
+                                rewriter.getIntegerType(32, /*isSigned=*/true)),
           indexColumns, rewriter.getSI32IntegerAttr(2));
     }
 
