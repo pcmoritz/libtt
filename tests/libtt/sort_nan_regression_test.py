@@ -63,3 +63,34 @@ def test_sort_key_val_special_values_identity():
 def test_sort_2d_special_values(axis):
     x = values(5 * 37, np.float32, seed=5).reshape(5, 37)
     assert_matches_cpu(lambda v: jnp.sort(v, axis=axis), x)
+
+
+# Rows of more than 32768 elements pad to 65536 and use UINT32 indices, which
+# switches bfloat16 sorts to 32-bit DEST.
+def test_long_row_bfloat16_sort():
+    x = values(32769, jnp.bfloat16, seed=7)
+    assert_matches_cpu(jnp.sort, x)
+    assert_matches_cpu(lambda v: jnp.argsort(v, stable=True), x)
+
+
+def assert_is_sorting_permutation(x, indices, descending):
+    n = x.shape[-1]
+    assert indices.min() >= 0 and indices.max() < n
+    np.testing.assert_array_equal(np.sort(indices), np.arange(n))
+    expected = np.sort(x.astype(np.float32))
+    if descending:
+        expected = expected[::-1]
+    np.testing.assert_array_equal(x.astype(np.float32)[indices], expected)
+
+
+# Unstable sorts may order ties differently from the CPU, so check the values and
+# that the indices form a permutation that sorts them. bfloat16 padding equals the
+# canonical NaN, so it must not take the place of a real NaN.
+@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+@pytest.mark.parametrize("n", [6, 40], ids=["n6", "n40"])
+@pytest.mark.parametrize("descending", [False, True], ids=["asc", "desc"])
+def test_unstable_sort_special_values(dtype, n, descending):
+    x = values(n, dtype, seed=9)
+    assert_matches_cpu(lambda v: jnp.sort(v, stable=False, descending=descending), x)
+    indices = on("tt", lambda v: jnp.argsort(v, stable=False, descending=descending), x)
+    assert_is_sorting_permutation(x, indices, descending)

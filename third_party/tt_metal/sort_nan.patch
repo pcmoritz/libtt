@@ -226,7 +226,25 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
      const float pad_descending = is_uint16_input ? 0.0f : -std::numeric_limits<float>::infinity();
      const float pad_fill = descending ? pad_descending : pad_ascending;
  
-@@ -419,7 +423,13 @@
+@@ -385,7 +389,16 @@
+     // sort instead of teaching every compare/merge and padding stage a second
+     // 16-bit encoding. A caller-provided Float16 values output cannot back the
+     // promoted sort and is therefore populated only after the final typecast.
+-    const bool promote_float16 = input_tensor.dtype() == DataType::FLOAT16;
++    //
++    // BFloat16 sorts keep NaN in 16-bit DEST, where every pack is an identity pack. UINT32 indices (rows
++    // of more than 32768 elements, which pad to 65536, or a caller-provided UINT32 indices output) switch
++    // the sort to 32-bit DEST, where packing the values back to BFloat16 is a conversion that turns NaN
++    // into inf, so those sorts run in Float32 as well.
++    const bool uint32_indices =
++        original_lshape[normalized_dim] > 32768 ||
++        (optional_output_tensors.has_value() && std::get<1>(*optional_output_tensors).dtype() == DataType::UINT32);
++    const bool promote_float16 = input_tensor.dtype() == DataType::FLOAT16 ||
++                                 (input_tensor.dtype() == DataType::BFLOAT16 && uint32_indices);
+     const Tensor transform_input =
+         promote_float16 ? ttnn::typecast(unsharded_input, DataType::FLOAT32) : unsharded_input;
+ 
+@@ -419,13 +432,19 @@
      // pre_sort_transform_tensor always moves the sort dimension to position -1,
      // so the device op always sorts along the last dimension.
      auto sorted_tensors = ttnn::prim::sort(
@@ -241,3 +259,10 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
  
      auto results = dm::post_sort_transform_tensor(
          input_tensor, sorted_tensors, dim, is_dim_last_idx, original_lshape, device_op_mem_cfg);
+ 
+     if (promote_float16) {
+-        results[0] = ttnn::typecast(results[0], DataType::FLOAT16);
++        results[0] = ttnn::typecast(results[0], input_tensor.dtype());
+     }
+ 
+     // The device op always writes to DRAM when sort_mem_cfg is sharded (to avoid
