@@ -30,8 +30,10 @@ def test_ppermute_shifts_shards():
 
 # Per-device shards: one row takes the direct all-reduce (for 16-bit floats),
 # large shards reduce-scatter (along columns, or rows for one tile column),
-# and single-tile shards gather and reduce locally.
-@pytest.mark.parametrize("rows,cols", [(1, 1024), (256, 1024), (256, 32), (3, 32)])
+# and single-tile shards gather and reduce locally. Five 16-bit rows of 61
+# tiles take the direct all-reduce on one core: their packed rows fill 11.4
+# pages, which it reduces in max and min's DST batches of 4.
+@pytest.mark.parametrize("rows,cols", [(1, 1024), (5, 1952), (256, 1024), (256, 32), (3, 32)])
 @pytest.mark.parametrize("dtype", [np.float32, jnp.bfloat16, np.int32])
 @pytest.mark.parametrize("collective,reduce", [(jax.lax.pmax, np.max), (jax.lax.pmin, np.min)])
 def test_pmax_pmin(collective, reduce, dtype, rows, cols):
