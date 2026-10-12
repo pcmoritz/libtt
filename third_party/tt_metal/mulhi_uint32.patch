@@ -40,16 +40,17 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mu
 diff --git tt_metal/hw/inc/api/compute/mul_int_sfpu.h tt_metal/hw/inc/api/compute/mul_int_sfpu.h
 --- tt_metal/hw/inc/api/compute/mul_int_sfpu.h
 +++ tt_metal/hw/inc/api/compute/mul_int_sfpu.h
-@@ -88,4 +88,12 @@
+@@ -88,4 +88,13 @@
  #endif
  }
  
 +#ifdef ARCH_BLACKHOLE
-+// High 32 bits of the 64-bit product of two UInt32 tiles. Initialize with
-+// mul_int_tile_init<DataFormat::UInt32>().
++// High 32 bits of the 64-bit product of two UInt32 tiles.
 +ALWI void mulhi_uint32_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
 +    MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, mulhi_uint32, (APPROX), idst0, idst1, odst, VectorMode::RC)));
 +}
++
++ALWI void mulhi_uint32_tile_init() { MATH((SFPU_BINARY_INIT(mul_int32))); }
 +#endif
 +
  }  // namespace ckernel
@@ -118,7 +119,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
              return {"rsub_binary_tile_init();", fmt::format("rsub_binary_tile<{}>", kRneDstRoundingMode)};
          case GCD: return {"gcd_tile_init();", "gcd_tile"};
          case LCM: return {"lcm_tile_init();", "lcm_tile"};
-+        case MULHI: return {"mul_int_tile_init<DataFormat::UInt32>();", "mulhi_uint32_tile"};
++        case MULHI: return {"mulhi_uint32_tile_init();", "mulhi_uint32_tile"};
          case LEFT_SHIFT:
              return {
                  "binary_shift_tile_init();",

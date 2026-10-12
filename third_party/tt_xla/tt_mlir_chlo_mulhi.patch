@@ -100,13 +100,42 @@ diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp b/runtime/lib
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
-@@ -2383,6 +2383,9 @@
+@@ -2348,6 +2348,30 @@
+   }
+ };
+ 
++// uint32 chlo.mulhi runs as ttir.mulhi: its decomposition widens to 64 bits,
++// which are narrowed back to 32. Narrower types decompose correctly.
++class ChloMulHiConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::CompositeOp> {
++public:
++  using OpConversionPattern<mlir::stablehlo::CompositeOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::CompositeOp srcOp,
++                  mlir::stablehlo::CompositeOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    if (srcOp.getName() != "chlo.mulhi") {
++      return failure();
++    }
++    auto type = mlir::cast<RankedTensorType>(srcOp.getResult(0).getType());
++    if (!type.getElementType().isUnsignedInteger(32)) {
++      return rewriter.notifyMatchFailure(srcOp, "only uint32 is a ttir.mulhi");
++    }
++    rewriter.replaceOpWithNewOp<ttir::MulHiOp>(
++        srcOp, type, adaptor.getOperands()[0], adaptor.getOperands()[1]);
++    return success();
++  }
++};
++
+ struct LegalizeStableHLOCompositeToTTIR
+     : public ttir::impl::LegalizeStableHLOCompositeToTTIRBase<
+           LegalizeStableHLOCompositeToTTIR> {
+@@ -2383,6 +2407,7 @@
        context, "tenstorrent.gelu");
    patterns.add<StableHLOToTTIRCompositeOpConversionPattern<ttir::GeluOp>>(
        context, "tenstorrent.gelu_tanh");
-+  // Its decomposition widens to 64 bits, which are narrowed back to 32.
-+  patterns.add<StableHLOToTTIRCompositeOpConversionPattern<ttir::MulHiOp>>(
-+      context, "chlo.mulhi");
++  patterns.add<ChloMulHiConversionPattern>(context);
    patterns.add<TenstorrentAdamWConversionPattern>(context);
    patterns.add<TenstorrentSDPAForwardConversionPattern>(context);
    patterns.add<TenstorrentSDPABackwardConversionPattern>(context);

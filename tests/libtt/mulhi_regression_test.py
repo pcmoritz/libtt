@@ -25,8 +25,31 @@ def test_mulhi():
     b = rng.integers(0, 2**32, size=(4, 64), dtype=np.uint64).astype(np.uint32)
     a[0] = np.repeat(EDGES, 8)
     b[0] = np.tile(EDGES, 8)
-    expected = ((a.astype(np.uint64) * b.astype(np.uint64)) >> np.uint64(32)).astype(np.uint32)
-    np.testing.assert_array_equal(run(lax.mulhi, a, b), expected)
+    np.testing.assert_array_equal(run(lax.mulhi, a, b), mulhi_reference(a, b))
+
+
+def mulhi_reference(a, b):
+    bits = 8 * a.dtype.itemsize
+    return ((a.astype(np.uint64) * b.astype(np.uint64)) >> np.uint64(bits)).astype(a.dtype)
+
+
+# A scalar on either side, broadcast against a shape that is not tile aligned.
+@pytest.mark.parametrize("scalar_first", [False, True], ids=["tensor_scalar", "scalar_tensor"])
+def test_mulhi_broadcast_scalar(scalar_first):
+    x = np.random.default_rng(1).integers(0, 2**32, size=(3, 37), dtype=np.uint64).astype(np.uint32)
+    s = np.uint32(0x9E3779B9)
+    f = (lambda v, c: lax.mulhi(c, v)) if scalar_first else lax.mulhi
+    np.testing.assert_array_equal(run(f, x, s), mulhi_reference(x, np.full_like(x, s)))
+
+
+# Narrower types keep their decomposition, which needs no 64-bit arithmetic.
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16], ids=["u8", "u16"])
+def test_narrow_mulhi(dtype):
+    info = np.iinfo(dtype)
+    a = np.random.default_rng(2).integers(0, info.max, size=(4, 33), endpoint=True).astype(dtype)
+    b = np.random.default_rng(3).integers(0, info.max, size=(4, 33), endpoint=True).astype(dtype)
+    a[0, 0] = b[0, 0] = info.max
+    np.testing.assert_array_equal(run(lax.mulhi, a, b), mulhi_reference(a, b))
 
 
 # Known-answer vectors from JAX's random_impl_test.
