@@ -1,0 +1,207 @@
+diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
+--- tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
++++ tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
+@@ -900,10 +900,21 @@
+ // fused packed keys never take the comparator-stable path (their bf16 slab is widened into
+ // 32-bit DEST by the same SrcA datacopy, which canonicalizes +-0 before the fuse -- silicon-probed).
+ // Predicate: (x & 0x7FFFFFFF) == 0 (zero magnitude); action: x &= 0x7FFFFFFF (-> +0.0).
++// With CANONICALIZE_NAN, every NaN except 0x7FFFFFFF also becomes the quiet NaN 0x7FC00000, so
++// all NaNs form one tie class above +inf, as in stablehlo's sort comparators. Sort pads with
++// 0x7FFFFFFF, which therefore stays above every canonical value.
++template <bool CANONICALIZE_NAN = false>
+ inline void _topk_canonicalize_negzero_value_tiles_()
+ {
+     TOPK_SFPENCC_ALL_LANES_ON();
+     sfpi::vConstIntPrgm0 = 0x7FFFFFFF;
++    if constexpr (CANONICALIZE_NAN)
++    {
++        TTI_SFPLOADI(p_sfpu::LREG4, sfpi::SFPLOADI_MOD0_UPPER, 0x7F80); // +inf
++        TTI_SFPLOADI(p_sfpu::LREG4, sfpi::SFPLOADI_MOD0_LOWER, 0x0000);
++        TTI_SFPLOADI(p_sfpu::LREG5, sfpi::SFPLOADI_MOD0_UPPER, 0x7FC0); // canonical NaN
++        TTI_SFPLOADI(p_sfpu::LREG5, sfpi::SFPLOADI_MOD0_LOWER, 0x0000);
++    }
+     set_dst_write_addr(0);
+     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
+     for (std::uint32_t off = 0; off < 128; off += 2)
+@@ -914,6 +925,16 @@
+         TTI_SFPSETCC(0, p_sfpu::LREG1, 0, sfpi::SFPSETCC_MOD1_LREG_EQ0);
+         TTI_SFPAND(0, p_sfpu::LREG12, p_sfpu::LREG0, 0);
+         TOPK_SFPENCC_ALL_LANES_ON();
++        if constexpr (CANONICALIZE_NAN)
++        {
++            // NaN lanes: inf - |x| < 0. Of those, skip the padding word (x ^ 0x7FFFFFFF == 0).
++            TTI_SFPIADD(0, p_sfpu::LREG4, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_ARG_2SCOMP_LREG_DST | sfpi::SFPIADD_MOD1_CC_LT0);
++            TTI_SFPMOV(0, p_sfpu::LREG0, p_sfpu::LREG2, 0);
++            TTI_SFPXOR(0, p_sfpu::LREG12, p_sfpu::LREG2, 0);
++            TTI_SFPSETCC(0, p_sfpu::LREG2, 0, sfpi::SFPSETCC_MOD1_LREG_NE0);
++            TTI_SFPMOV(0, p_sfpu::LREG5, p_sfpu::LREG0, 0);
++            TOPK_SFPENCC_ALL_LANES_ON();
++        }
+         TT_SFPSTORE(p_sfpu::LREG0, InstrModLoadStore::INT32, ADDR_MOD_7, off);
+     }
+     set_dst_write_addr(0);
+diff --git tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
+--- tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
++++ tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
+@@ -904,10 +904,21 @@
+ // fused packed keys never take the comparator-stable path (their bf16 slab is widened into
+ // 32-bit DEST by the same SrcA datacopy, which canonicalizes +-0 before the fuse -- silicon-probed).
+ // Predicate: (x & 0x7FFFFFFF) == 0 (zero magnitude); action: x &= 0x7FFFFFFF (-> +0.0).
++// With CANONICALIZE_NAN, every NaN except 0x7FFFFFFF also becomes the quiet NaN 0x7FC00000, so
++// all NaNs form one tie class above +inf, as in stablehlo's sort comparators. Sort pads with
++// 0x7FFFFFFF, which therefore stays above every canonical value.
++template <bool CANONICALIZE_NAN = false>
+ inline void _topk_canonicalize_negzero_value_tiles_()
+ {
+     TOPK_SFPENCC_ALL_LANES_ON();
+     sfpi::vConstIntPrgm0 = 0x7FFFFFFF;
++    if constexpr (CANONICALIZE_NAN)
++    {
++        TTI_SFPLOADI(p_sfpu::LREG4, sfpi::SFPLOADI_MOD0_UPPER, 0x7F80); // +inf
++        TTI_SFPLOADI(p_sfpu::LREG4, sfpi::SFPLOADI_MOD0_LOWER, 0x0000);
++        TTI_SFPLOADI(p_sfpu::LREG5, sfpi::SFPLOADI_MOD0_UPPER, 0x7FC0); // canonical NaN
++        TTI_SFPLOADI(p_sfpu::LREG5, sfpi::SFPLOADI_MOD0_LOWER, 0x0000);
++    }
+     set_dst_write_addr(0);
+     TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
+     for (std::uint32_t off = 0; off < 128; off += 2)
+@@ -918,6 +929,16 @@
+         TTI_SFPSETCC(0, p_sfpu::LREG1, 0, sfpi::SFPSETCC_MOD1_LREG_EQ0);
+         TTI_SFPAND(0, p_sfpu::LREG12, p_sfpu::LREG0, 0);
+         TOPK_SFPENCC_ALL_LANES_ON();
++        if constexpr (CANONICALIZE_NAN)
++        {
++            // NaN lanes: inf - |x| < 0. Of those, skip the padding word (x ^ 0x7FFFFFFF == 0).
++            TTI_SFPIADD(0, p_sfpu::LREG4, p_sfpu::LREG1, sfpi::SFPIADD_MOD1_ARG_2SCOMP_LREG_DST | sfpi::SFPIADD_MOD1_CC_LT0);
++            TTI_SFPMOV(0, p_sfpu::LREG0, p_sfpu::LREG2, 0);
++            TTI_SFPXOR(0, p_sfpu::LREG12, p_sfpu::LREG2, 0);
++            TTI_SFPSETCC(0, p_sfpu::LREG2, 0, sfpi::SFPSETCC_MOD1_LREG_NE0);
++            TTI_SFPMOV(0, p_sfpu::LREG5, p_sfpu::LREG0, 0);
++            TOPK_SFPENCC_ALL_LANES_ON();
++        }
+         TT_SFPSTORE(p_sfpu::LREG0, InstrModLoadStore::INT32, ADDR_MOD_3, off);
+     }
+     set_dst_write_addr(0);
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
+@@ -98,10 +98,10 @@
+     _topk_stamp_tile_rank_range_<largest, TAG_BITS>(dst_tile_index, rank_base);
+ }
+ 
+-template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en>
++template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool canonicalize_nan = false>
+ inline void calculate_topk_canonicalize_negzero() {
+     if constexpr (is_fp32_dest_acc_en && !TOPK_UINT16_IN_FP32_DEST) {
+-        _topk_canonicalize_negzero_value_tiles_();
++        _topk_canonicalize_negzero_value_tiles_<canonicalize_nan>();
+     }
+ }
+ 
+diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
+--- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
++++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
+@@ -98,10 +98,10 @@
+     _topk_stamp_tile_rank_range_<largest, TAG_BITS>(dst_tile_index, rank_base);
+ }
+ 
+-template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en>
++template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool canonicalize_nan = false>
+ inline void calculate_topk_canonicalize_negzero() {
+     if constexpr (is_fp32_dest_acc_en && !TOPK_UINT16_IN_FP32_DEST) {
+-        _topk_canonicalize_negzero_value_tiles_();
++        _topk_canonicalize_negzero_value_tiles_<canonicalize_nan>();
+     }
+ }
+ 
+diff --git tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
+--- tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
++++ tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.h
+@@ -128,7 +128,7 @@
+     static_assert(!APPROXIMATION_MODE && APPROXIMATION_MODE, "Rank-stamped stable TopK is not supported on Quasar");
+ }
+ 
+-template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en>
++template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, bool canonicalize_nan = false>
+ inline void calculate_topk_canonicalize_negzero() {}
+ 
+ // Load 8 lanes (one value LREG pair + one index LREG pair) from Dest at runtime offsets.
+diff --git tt_metal/hw/inc/api/compute/topk.h tt_metal/hw/inc/api/compute/topk.h
+--- tt_metal/hw/inc/api/compute/topk.h
++++ tt_metal/hw/inc/api/compute/topk.h
+@@ -365,14 +365,15 @@
+  * Folds -0.0 into +0.0 in the two freshly loaded value tiles of a comparator-stable slab, so the
+  * sign-magnitude network treats both zeros as one tie class. Call once per fresh slab, before its
+  * first topk_local_sort, when stable_sort=true. No-op unless values are fp32-family in 32-bit DEST.
++ * canonicalize_nan also folds every NaN but the sort padding word 0x7FFFFFFF into one quiet NaN.
+  */
+-template <bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
++template <bool is_fp32_dest_acc_en = DST_ACCUM_MODE, bool canonicalize_nan = false>
+ ALWI void topk_canonicalize_negzero_values(uint32_t idst) {
+     MATH(SFPU_UNARY_CALL(
+         DST_SYNC_MODE,
+         is_fp32_dest_acc_en,
+         calculate_topk_canonicalize_negzero,
+-        (true /* APPROXIMATE */, is_fp32_dest_acc_en),
++        (true /* APPROXIMATE */, is_fp32_dest_acc_en, canonicalize_nan),
+         idst,
+         VectorMode::RC_custom));
+ }
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
+@@ -81,10 +81,8 @@
+         transpose_tile(index_dfb.get_id(), 0, 2);
+         transpose_tile(index_dfb.get_id(), 1, 3);
+ 
+-        // llk_topk_sort -> inplace
+-        if constexpr (stable_sort) {
+-            ckernel::topk_canonicalize_negzero_values(0);
+-        }
++        // llk_topk_sort -> inplace. Canonical zeros and NaNs give the comparator's order.
++        ckernel::topk_canonicalize_negzero_values<DST_ACCUM_MODE, /*canonicalize_nan=*/true>(0);
+         ckernel::topk_local_sort<stable_sort, DST_ACCUM_MODE, /*fused=*/false, /*rank_stamped=*/false, tie_order>(
+             0, (int)ascending_local, end_phase);
+ 
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
+@@ -163,10 +163,10 @@
+ 
+                             if (sub == 1) {
+                                 // Use sort LLK only the last substage to sort the last pair of tiles - speed up
+-                                if constexpr (stable) {
+-                                    if (stage == 1) {
+-                                        ckernel::topk_canonicalize_negzero_values(0);
+-                                    }
++                                if (stage == 1) {
++                                    ckernel::topk_canonicalize_negzero_values<
++                                        DST_ACCUM_MODE,
++                                        /*canonicalize_nan=*/true>(0);
+                                 }
+                                 ckernel::topk_local_sort<
+                                     stable,
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
+@@ -18,6 +18,7 @@
+ #include "ttnn/tensor/tensor_utils.hpp"
+ #include "ttnn/operations/data_movement/transpose/transpose.hpp"
+ 
++#include <bit>
+ #include <numeric>
+ 
+ namespace ttnn::operations::data_movement {
+@@ -80,8 +81,11 @@
+     // sort dimension.  In practice the primary use case (position indices
+     // bounded well below 65535) is not affected, but full-range UINT16 inputs
+     // may see incorrect indices for tied values at the boundary.
++    //
++    // Ascending float padding is the NaN 0x7FFFFFFF rather than +inf: the kernel folds every other
++    // NaN into 0x7FC00000, so padding sorts after NaNs, which sort after +inf.
+     const bool is_uint16_input = (input_tensor.dtype() == DataType::UINT16);
+-    const float pad_ascending = is_uint16_input ? 65535.0f : std::numeric_limits<float>::infinity();
++    const float pad_ascending = is_uint16_input ? 65535.0f : std::bit_cast<float>(0x7FFFFFFFu);
+     const float pad_descending = is_uint16_input ? 0.0f : -std::numeric_limits<float>::infinity();
+     const float pad_fill = descending ? pad_descending : pad_ascending;
+ 
