@@ -15,6 +15,7 @@ namespace ttnn::experimental::prim {
 struct IndexedRowsParams {
     ttsl::SmallVector<uint32_t> sizes;
     ttsl::SmallVector<uint32_t> windows;
+    bool column = false;
     // rows_gather: write zeros for clamped positions. rows_scatter: unused.
     bool fill_out_of_bounds = false;
     // rows_scatter only.

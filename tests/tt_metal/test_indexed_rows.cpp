@@ -52,23 +52,28 @@ protected:
 
 // Host reference of both ops over flat row-major [B, N, R] / [Bi, M, K] data.
 struct Ref {
-    uint32_t B, N, R, Bi, M, K;
+    uint32_t B, N, R, Bi, M, K;  // R: elements per row (all S pages)
     std::vector<uint32_t> sizes, windows, strides;
-    uint32_t W = 1;
+    bool column = false;
+    uint32_t W = 1;  // over the row components
 
-    Ref(uint32_t B, uint32_t R, uint32_t Bi, uint32_t M, std::vector<uint32_t> sizes_, std::vector<uint32_t> windows_) :
-        B(B), R(R), Bi(Bi), M(M), sizes(std::move(sizes_)), windows(std::move(windows_)) {
+    Ref(uint32_t B, uint32_t R, uint32_t Bi, uint32_t M, std::vector<uint32_t> sizes_, std::vector<uint32_t> windows_,
+        bool column_ = false) :
+        B(B), R(R), Bi(Bi), M(M), sizes(std::move(sizes_)), windows(std::move(windows_)), column(column_) {
         K = sizes.size();
+        const uint32_t KR = column ? K - 1 : K;
         N = 1;
-        strides.assign(K, 1);
-        for (uint32_t k = K; k-- > 0;) {
+        strides.assign(K, 0);
+        for (uint32_t k = KR; k-- > 0;) {
             strides[k] = N;
             N *= sizes[k];
         }
-        for (uint32_t w : windows) {
-            W *= w;
+        for (uint32_t k = 0; k < KR; ++k) {
+            W *= windows[k];
         }
     }
+    uint32_t col_window() const { return column ? windows.back() : R; }
+    uint32_t col(const std::vector<int64_t>& c) const { return column ? c.back() : 0; }
 
     // Clamped coordinates of position (bi, m); returns whether any clamped.
     bool coords(const std::vector<int32_t>& idx, uint32_t bi, uint32_t m, std::vector<int64_t>& c) const {
@@ -86,7 +91,7 @@ struct Ref {
 
     uint32_t row(const std::vector<int64_t>& c, uint32_t j) const {
         uint32_t r = 0;
-        for (uint32_t k = K; k-- > 0;) {
+        for (uint32_t k = (column ? K - 1 : K); k-- > 0;) {
             uint32_t o = j % windows[k];
             j /= windows[k];
             r += (c[k] + o) * strides[k];
@@ -96,18 +101,19 @@ struct Ref {
 
     template <typename T>
     std::vector<T> gather(const std::vector<T>& table, const std::vector<int32_t>& idx, bool fill) const {
-        std::vector<T> out(static_cast<size_t>(B) * M * W * R, T{});
+        const uint32_t w = col_window();
+        std::vector<T> out(static_cast<size_t>(B) * M * W * w, T{});
         std::vector<int64_t> c;
         for (uint32_t b = 0; b < B; ++b) {
             for (uint32_t m = 0; m < M; ++m) {
                 bool oob = coords(idx, Bi == 1 ? 0 : b, m, c);
                 for (uint32_t j = 0; j < W; ++j) {
-                    T* dst = out.data() + ((static_cast<size_t>(b) * M + m) * W + j) * R;
+                    T* dst = out.data() + ((static_cast<size_t>(b) * M + m) * W + j) * w;
                     if (oob && fill) {
                         continue;
                     }
-                    const T* src = table.data() + (static_cast<size_t>(b) * N + row(c, j)) * R;
-                    std::copy(src, src + R, dst);
+                    const T* src = table.data() + (static_cast<size_t>(b) * N + row(c, j)) * R + col(c);
+                    std::copy(src, src + w, dst);
                 }
             }
         }
@@ -124,10 +130,11 @@ struct Ref {
                 if (coords(idx, Bi == 1 ? 0 : b, m, c)) {
                     continue;
                 }
+                const uint32_t w = col_window();
                 for (uint32_t j = 0; j < W; ++j) {
-                    T* dst = out.data() + (static_cast<size_t>(b) * N + row(c, j)) * R;
-                    const T* src = source.data() + ((static_cast<size_t>(b) * M + m) * W + j) * R;
-                    for (uint32_t r = 0; r < R; ++r) {
+                    T* dst = out.data() + (static_cast<size_t>(b) * N + row(c, j)) * R + col(c);
+                    const T* src = source.data() + ((static_cast<size_t>(b) * M + m) * W + j) * w;
+                    for (uint32_t r = 0; r < w; ++r) {
                         dst[r] = combine(dst[r], src[r]);
                     }
                 }
@@ -317,6 +324,58 @@ TEST_F(IndexedRowsTest, ScatterMaxMinPropagateNaNAndWindows) {
         }
     }
     (void)nan;
+}
+
+TEST_F(IndexedRowsTest, GatherAndScatterRowsOfSeveralPages) {
+    // A [B, N, S, R] table: each row is S pages, as a KV cache's [heads, dim].
+    Ref ref(/*B=*/2, /*R=*/6 * 40, /*Bi=*/2, /*M=*/9, {50}, {1});
+    std::mt19937 rng(7);
+    auto table = iota_values<bfloat16>(ref.B * ref.N * ref.R, 0.5f);
+    auto idx = random_indices(ref.Bi * ref.M, -2, 52, rng);
+    auto out = ttnn::experimental::rows_gather(
+        to_device(table, {2, 50, 6, 40}, DataType::BFLOAT16), to_device(idx, {2, ref.M, 1}, DataType::INT32),
+        IndexedRowsSpec{{50}, {1}});
+    EXPECT_EQ(out.logical_shape(), ttnn::Shape({2, ref.M, 6, 40}));
+    auto got = out.cpu().to_vector<bfloat16>();
+    auto want = ref.gather(table, idx, false);
+    ASSERT_EQ(got.size(), want.size());
+    for (size_t i = 0; i < got.size(); ++i) {
+        ASSERT_EQ(static_cast<float>(got[i]), static_cast<float>(want[i])) << "at " << i;
+    }
+    auto source = iota_values<bfloat16>(ref.B * ref.M * ref.R, -1.0f);
+    out = ttnn::experimental::rows_scatter(
+        to_device(table, {2, 50, 6, 40}, DataType::BFLOAT16), to_device(idx, {2, ref.M, 1}, DataType::INT32),
+        to_device(source, {2, ref.M, 6, 40}, DataType::BFLOAT16), IndexedRowsSpec{{50}, {1}});
+    got = out.cpu().to_vector<bfloat16>();
+    want = ref.scatter(table, idx, source, [](bfloat16, bfloat16 s) { return s; });
+    for (size_t i = 0; i < got.size(); ++i) {
+        ASSERT_EQ(static_cast<float>(got[i]), static_cast<float>(want[i])) << "at " << i;
+    }
+}
+
+TEST_F(IndexedRowsTest, ColumnWindowGatherAndScatterAdd) {
+    // The last component picks a window of 3 elements inside a row of 100:
+    // a sampler's logprobs[row, label] with window 1 would be the same with w=1.
+    Ref ref(/*B=*/1, /*R=*/100, /*Bi=*/1, /*M=*/40, {16, 100}, {1, 3}, /*column=*/true);
+    std::mt19937 rng(8);
+    auto table = iota_values<float>(ref.N * ref.R, 1.0f);
+    std::vector<int32_t> idx(ref.M * 2);
+    for (uint32_t i = 0; i < ref.M; ++i) {
+        idx[i * 2] = random_indices(1, -1, 17, rng)[0];
+        idx[i * 2 + 1] = random_indices(1, -2, 102, rng)[0];
+    }
+    auto out = ttnn::experimental::rows_gather(
+        to_device(table, {1, 16, 100}, DataType::FLOAT32), to_device(idx, {1, ref.M, 2}, DataType::INT32),
+        IndexedRowsSpec{{16, 100}, {1, 3}, true});
+    EXPECT_EQ(out.logical_shape(), ttnn::Shape({1, ref.M * 3}));
+    EXPECT_EQ(out.cpu().to_vector<float>(), ref.gather(table, idx, false));
+
+    auto source = iota_values<float>(ref.M * 3, 0.25f);
+    out = ttnn::experimental::rows_scatter(
+        to_device(table, {1, 16, 100}, DataType::FLOAT32), to_device(idx, {1, ref.M, 2}, DataType::INT32),
+        to_device(source, {1, ref.M * 3}, DataType::FLOAT32), IndexedRowsSpec{{16, 100}, {1, 3}, true},
+        RowsReduce::Add);
+    EXPECT_EQ(out.cpu().to_vector<float>(), ref.scatter(table, idx, source, [](float a, float s) { return a + s; }));
 }
 
 }  // namespace

@@ -55,40 +55,44 @@ uint32_t elem_kind(tt::tt_metal::DataType dtype) {
     }
 }
 
-// The geometry both programs share: rows are moved in chunks of up to 64 KiB,
-// `group` chunks at a time; index pages are read `index_batch` at a time.
+// The geometry both programs share: pages move in chunks of up to 64 KiB (a
+// column window is one chunk), `group` chunks at a time; index pages are read
+// `index_batch` at a time.
 struct Geometry {
-    uint32_t B, N, R, Bi, M, K, W;
-    uint32_t elem_bytes, row_bytes, chunk_bytes, entry_bytes, group;
+    IndexedRowsTable table;
+    uint32_t Bi, M, K;
+    uint32_t elem_bytes, page_bytes, chunk_bytes, entry_bytes, group;
     uint32_t index_bytes, index_entry_bytes, index_batch;
+    uint32_t pages;  // table pages per batch
     KernelSpec::CompileTimeArgs compile_time_args;
     KernelSpec::CompilerOptions compiler_options;
 };
 
 Geometry geometry(const IndexedRowsParams& params, const IndexedRowsInputs& in) {
     Geometry g;
-    const auto& table_shape = in.table.logical_shape();
+    g.table = indexed_rows_table(params, in.table);
     const auto& index_shape = in.indices.logical_shape();
-    g.B = table_shape[0];
-    g.N = table_shape[1];
-    g.R = table_shape[2];
     g.Bi = index_shape[0];
     g.M = index_shape[1];
     g.K = index_shape[2];
-    g.W = indexed_rows_window(params);
     g.elem_bytes = in.table.element_size();
-    g.row_bytes = g.R * g.elem_bytes;
+    g.page_bytes = g.table.R * g.elem_bytes;
+    g.pages = g.table.N * g.table.S;
     constexpr uint32_t kMaxChunk = 64 * 1024;
-    g.chunk_bytes = std::min(g.row_bytes, kMaxChunk);
-    g.entry_bytes = align_entry(g.chunk_bytes);
+    g.chunk_bytes = std::min(g.page_bytes, kMaxChunk);
+    // A column window lands at its source offset within a 64-byte granule and
+    // is moved to its destination offset, so its entry has a granule of slack.
+    const uint32_t column_entry = params.column ? g.table.column_window * g.elem_bytes + kEntryAlign : 0;
+    g.entry_bytes = align_entry(std::max(g.chunk_bytes, column_entry));
     g.group = std::clamp<uint32_t>((256 * 1024) / g.entry_bytes, 1, 16);
     g.index_bytes = g.K * sizeof(uint32_t);
     g.index_entry_bytes = align_entry(g.index_bytes);
     g.index_batch = 128;
 
-    ttsl::SmallVector<uint32_t> strides(g.K);
+    const uint32_t row_components = g.K - (params.column ? 1 : 0);
+    ttsl::SmallVector<uint32_t> strides(g.K, 0);
     uint32_t stride = 1;
-    for (uint32_t k = g.K; k-- > 0;) {
+    for (uint32_t k = row_components; k-- > 0;) {
         strides[k] = stride;
         stride *= params.sizes[k];
     }
@@ -99,13 +103,15 @@ Geometry geometry(const IndexedRowsParams& params, const IndexedRowsInputs& in) 
     };
     g.compile_time_args = {
         {"num_components", g.K},
+        {"column", static_cast<uint32_t>(params.column)},
         {"index_unsigned", static_cast<uint32_t>(in.indices.dtype() == tt::tt_metal::DataType::UINT32)},
         {"fill_oob", static_cast<uint32_t>(params.fill_out_of_bounds)},
         {"index_shared", static_cast<uint32_t>(g.Bi == 1)},
-        {"window", g.W},
+        {"window", indexed_rows_window(params)},
         {"positions", g.M},
-        {"rows_per_batch", g.N},
-        {"row_bytes", g.row_bytes},
+        {"rows_per_batch", g.table.N},
+        {"pages_per_row", g.table.S},
+        {"page_bytes", g.page_bytes},
         {"chunk_bytes", g.chunk_bytes},
         {"index_bytes", g.index_bytes},
         {"group", g.group},
@@ -195,7 +201,7 @@ ttnn::device_operation::ProgramArtifacts RowsGatherProgramFactory::create_progra
         .hw_config = ttnn::create_writer_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
 
-    const Split s = split(device, g.B * g.M);
+    const Split s = split(device, g.table.B * g.M);
     KernelRunArgs reader_run_args{.kernel = READER};
     KernelRunArgs writer_run_args{.kernel = WRITER};
     for (const auto& [core, range] : s.ranges) {
@@ -288,7 +294,7 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
         .hw_config = ttnn::create_writer_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
 
-    const Split s = split(device, g.B * g.N);
+    const Split s = split(device, g.table.B * g.pages);
     KernelRunArgs reader_run_args{.kernel = READER};
     KernelRunArgs writer_run_args{.kernel = WRITER};
     for (const auto& [core, range] : s.ranges) {

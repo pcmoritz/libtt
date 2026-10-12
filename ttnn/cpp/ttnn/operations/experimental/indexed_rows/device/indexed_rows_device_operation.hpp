@@ -36,8 +36,17 @@ struct RowsScatterOperation {
     static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
 };
 
-// Shared by both operations' validation.
+// The table's geometry: [B, N, S..., R] rows of S pages of R elements.
+struct IndexedRowsTable {
+    uint32_t B, N, S, R;
+    ttsl::SmallVector<uint32_t> trailing;  // the dimensions after N
+    uint32_t column_window;                // 0 without a column component
+};
+
+// Shared by both operations.
 void validate_indexed_rows(const IndexedRowsParams&, const IndexedRowsInputs&, bool scatter);
-uint32_t indexed_rows_window(const IndexedRowsParams&);
+uint32_t indexed_rows_window(const IndexedRowsParams&);  // W over the row components
+IndexedRowsTable indexed_rows_table(const IndexedRowsParams&, const Tensor& table);
+tt::tt_metal::Shape indexed_rows_gathered_shape(const IndexedRowsParams&, const Tensor& table, const Tensor& indices);
 
 }  // namespace ttnn::experimental::prim

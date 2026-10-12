@@ -11,9 +11,9 @@
 // select_and_scatter.
 //
 // An embedding is a row lookup as is. A torch gather or scatter addresses
-// elements, so it becomes a lookup of single-element rows in the flattened
-// operand, with the flat index computed from the index tensor and the
-// coordinates of the other dimensions.
+// elements: the operand is viewed as rows of its last dimension, and each
+// element is addressed by its row (from the index tensor and the coordinates
+// of the other leading dimensions) and its column (a one-element window).
 
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
@@ -47,37 +47,71 @@ Value asInt32(ConversionPatternRewriter &rewriter, Location loc, Value value) {
       value);
 }
 
-// The flat (row-major) position in `operandShape` of every element of
-// `index`, which gives the coordinate along `dim`; the other coordinates are
-// the element's own. Shaped like `index`, int32.
-Value flatElementIndices(ConversionPatternRewriter &rewriter, Location loc,
-                         Value index, ArrayRef<int64_t> operandShape,
-                         int64_t dim) {
+// The row and column, in the operand viewed as [rows, last dim], of every
+// element of `index`, whose value is the coordinate along `dim`; the other
+// coordinates are the element's own. Returned as an int32 [1, positions, 2]
+// index tensor of (row, column) components.
+Value rowColumnIndices(ConversionPatternRewriter &rewriter, Location loc,
+                       Value index, ArrayRef<int64_t> operandShape,
+                       int64_t dim) {
   auto indexType = mlir::cast<RankedTensorType>(index.getType());
+  const int64_t rank = operandShape.size();
+  const int64_t last = rank - 1;
+  const int64_t width = operandShape[last];
   auto i32Type =
       RankedTensorType::get(indexType.getShape(), rewriter.getI32Type());
   SmallVector<int64_t> strides = mlir::computeStrides(operandShape);
-  Value flat = asInt32(rewriter, loc, index);
-  if (strides[dim] != 1) {
-    Value stride = rewriter.create<ttir::FullOp>(
-        loc, i32Type, rewriter.getI32IntegerAttr(strides[dim]));
-    flat = rewriter.create<ttir::MultiplyOp>(loc, i32Type, flat, stride);
-  }
-  for (auto [d, size] : llvm::enumerate(indexType.getShape())) {
-    if (static_cast<int64_t>(d) == dim || size == 1) {
-      continue;
+  Value index32 = asInt32(rewriter, loc, index);
+
+  auto coordinate = [&](int64_t d) -> Value {
+    return d == dim ? index32
+                    : rewriter.create<ttir::ArangeOp>(
+                          loc, i32Type, /*start=*/0,
+                          /*end=*/indexType.getDimSize(d), /*step=*/1,
+                          /*arange_dimension=*/d);
+  };
+  Value row;
+  for (int64_t d = 0; d < last; ++d) {
+    if (d != dim && indexType.getDimSize(d) == 1) {
+      continue; // a size-1 coordinate is 0
     }
-    Value coordinate = rewriter.create<ttir::ArangeOp>(
-        loc, i32Type, /*start=*/0, /*end=*/size * strides[d],
-        /*step=*/strides[d], /*arange_dimension=*/d);
-    flat = rewriter.create<ttir::AddOp>(loc, i32Type, flat, coordinate);
+    Value term = coordinate(d);
+    const int64_t rowStride = strides[d] / width;
+    if (rowStride != 1) {
+      Value stride = rewriter.create<ttir::FullOp>(
+          loc, i32Type, rewriter.getI32IntegerAttr(rowStride));
+      term = rewriter.create<ttir::MultiplyOp>(loc, i32Type, term, stride);
+    }
+    row = row ? rewriter.create<ttir::AddOp>(loc, i32Type, row, term) : term;
   }
-  return flat;
+  if (!row) {
+    row = rewriter.create<ttir::FullOp>(loc, i32Type,
+                                        rewriter.getI32IntegerAttr(0));
+  }
+  Value column = coordinate(last);
+
+  const int64_t positions = volume(indexType.getShape());
+  auto componentType =
+      RankedTensorType::get({1, positions, 1}, rewriter.getI32Type());
+  row = ttir::utils::createReshapeOp(rewriter, loc, row,
+                                     componentType.getShape());
+  column = ttir::utils::createReshapeOp(rewriter, loc, column,
+                                        componentType.getShape());
+  return rewriter.create<ttir::ConcatOp>(
+      loc, componentType.clone({1, positions, 2}), ValueRange{row, column},
+      rewriter.getSI32IntegerAttr(2));
 }
 
 Value asRows(ConversionPatternRewriter &rewriter, Location loc, Value value,
              int64_t rows, int64_t width) {
   return ttir::utils::createReshapeOp(rewriter, loc, value, {1, rows, width});
+}
+
+// The operand as a [1, rows, last dim] table, a view of its pages.
+std::pair<int64_t, int64_t> tableDims(RankedTensorType type) {
+  ArrayRef<int64_t> shape = type.getShape();
+  int64_t width = shape.empty() ? 1 : shape.back();
+  return {volume(shape) / width, width};
 }
 
 // ttir.gather: result[c] = input[c with c[dim] = index[c]].
@@ -95,18 +129,19 @@ public:
     if (dim < 0) {
       dim += inputType.getRank();
     }
-    int64_t elements = volume(inputType.getShape());
+    auto [rows, width] = tableDims(inputType);
     int64_t positions = volume(indexType.getShape());
-    Value table = asRows(rewriter, loc, adaptor.getInput(), elements, 1);
-    Value flat = flatElementIndices(rewriter, loc, adaptor.getIndex(),
-                                    inputType.getShape(), dim);
-    Value indices = asRows(rewriter, loc, flat, positions, 1);
-    Value rows = rewriter.create<ttir::RowsGatherOp>(
-        loc, RankedTensorType::get({1, positions, 1}, inputType.getElementType()),
-        table, indices, rewriter.getDenseI64ArrayAttr({elements}),
-        rewriter.getDenseI64ArrayAttr({1}), rewriter.getBoolAttr(false));
+    Value table = asRows(rewriter, loc, adaptor.getInput(), rows, width);
+    Value indices = rowColumnIndices(rewriter, loc, adaptor.getIndex(),
+                                     inputType.getShape(), dim);
+    Value gathered = rewriter.create<ttir::RowsGatherOp>(
+        loc, RankedTensorType::get({1, positions}, inputType.getElementType()),
+        table, indices, rewriter.getDenseI64ArrayAttr({rows, width}),
+        rewriter.getDenseI64ArrayAttr({1, 1}), rewriter.getBoolAttr(true),
+        rewriter.getBoolAttr(false));
     rewriter.replaceOp(op, ttir::utils::createReshapeOp(
-                               rewriter, loc, rows, op.getType().getShape()));
+                               rewriter, loc, gathered,
+                               op.getType().getShape()));
     return success();
   }
 };
@@ -126,30 +161,25 @@ public:
     if (dim < 0) {
       dim += inputType.getRank();
     }
-    int64_t elements = volume(inputType.getShape());
+    auto [rows, width] = tableDims(inputType);
     int64_t positions = volume(indexType.getShape());
-    Value table = asRows(rewriter, loc, adaptor.getInput(), elements, 1);
-    Value flat = flatElementIndices(rewriter, loc, adaptor.getIndex(),
-                                    inputType.getShape(), dim);
-    Value indices = asRows(rewriter, loc, flat, positions, 1);
-    Value source = asRows(rewriter, loc, adaptor.getSource(), positions, 1);
-    Value rows = rewriter.create<ttir::RowsScatterOp>(
+    Value table = asRows(rewriter, loc, adaptor.getInput(), rows, width);
+    Value indices = rowColumnIndices(rewriter, loc, adaptor.getIndex(),
+                                     inputType.getShape(), dim);
+    Value source = ttir::utils::createReshapeOp(rewriter, loc,
+                                                adaptor.getSource(),
+                                                {1, positions});
+    Value scattered = rewriter.create<ttir::RowsScatterOp>(
         loc, table.getType(), table, indices, source,
-        rewriter.getDenseI64ArrayAttr({elements}),
-        rewriter.getDenseI64ArrayAttr({1}), op.getScatterReduceTypeAttr());
+        rewriter.getDenseI64ArrayAttr({rows, width}),
+        rewriter.getDenseI64ArrayAttr({1, 1}), rewriter.getBoolAttr(true),
+        op.getScatterReduceTypeAttr());
     rewriter.replaceOp(op, ttir::utils::createReshapeOp(
-                               rewriter, loc, rows, op.getType().getShape()));
+                               rewriter, loc, scattered,
+                               op.getType().getShape()));
     return success();
   }
 };
-
-// The table [N, R] view of an embedding weight: its last dimension is the
-// row, everything before it the rows.
-std::pair<int64_t, int64_t> tableDims(RankedTensorType weightType) {
-  ArrayRef<int64_t> shape = weightType.getShape();
-  int64_t width = shape.back();
-  return {volume(shape) / width, width};
-}
 
 // ttir.embedding: result[i, :] = weight[input[i], :].
 class EmbeddingToRowsPattern : public OpConversionPattern<ttir::EmbeddingOp> {
@@ -173,7 +203,8 @@ public:
         loc,
         RankedTensorType::get({1, positions, width}, weightType.getElementType()),
         table, indices, rewriter.getDenseI64ArrayAttr({rows}),
-        rewriter.getDenseI64ArrayAttr({1}), rewriter.getBoolAttr(false));
+        rewriter.getDenseI64ArrayAttr({1}), rewriter.getBoolAttr(false),
+        rewriter.getBoolAttr(false));
     rewriter.replaceOp(op, ttir::utils::createReshapeOp(
                                rewriter, loc, gathered,
                                op.getType().getShape()));
@@ -219,7 +250,7 @@ public:
     Value gradient = rewriter.create<ttir::RowsScatterOp>(
         loc, tableType, table, indices, source,
         rewriter.getDenseI64ArrayAttr({rows}),
-        rewriter.getDenseI64ArrayAttr({1}),
+        rewriter.getDenseI64ArrayAttr({1}), rewriter.getBoolAttr(false),
         ttcore::ReduceTypeAttr::get(rewriter.getContext(),
                                     ttcore::ReduceType::Sum));
     rewriter.replaceOp(op, ttir::utils::createReshapeOp(

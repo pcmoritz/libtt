@@ -1,22 +1,28 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -5579,6 +5579,55 @@ def TTIR_GatherOp : TTIR_NamedOp<"gather"> {
+@@ -5579,6 +5579,64 @@ def TTIR_GatherOp : TTIR_NamedOp<"gather"> {
    let hasVerifier = 1;
  }
  
 +def TTIR_RowsGatherOp : TTIR_NamedOp<"rows_gather"> {
 +  let summary = "Gather rows of a [B, N, R] table by index";
 +  let description = [{
-+    `table` is a row-major tensor [B, N, R]: B batches of N rows of R elements.
++    `table` is a row-major tensor [B, N, S..., R]: B batches of N rows, each
++    row the trailing dimensions (S pages of R elements, kept as the operand's
++    pages).
 +    `indices` is an int32 tensor [Bi, M, K] with Bi equal to B or 1 (indices
 +    shared by every batch). The N rows are the row-major flattening of K
 +    dimensions of extents `sizes`; index component k is clamped into
 +    [0, sizes[k] - windows[k]] and names windows[k] consecutive positions, so
 +    each index position yields W = prod(windows) rows. The result is
-+    [B, M * W, R]:
++    [B, M * W, S..., R]:
 +
-+      result[b, m * W + j, :] = table[b, row_j(indices[bi, m, :]), :]
++      result[b, m * W + j, ...] = table[b, row_j(indices[bi, m, :]), ...]
++
++    With `column`, the last component instead picks a window of windows[K - 1]
++    elements inside the row's page (S must be 1) and the result is
++    [B, M * W * windows[K - 1]].
 +
 +    With `fill_out_of_bounds`, positions whose components needed clamping read
 +    as zeros instead. Any element type; rows are moved as bytes.
@@ -26,6 +32,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$indices,
 +                       DenseI64ArrayAttr:$sizes,
 +                       DenseI64ArrayAttr:$windows,
++                       DefaultValuedAttr<BoolAttr, "false">:$column,
 +                       DefaultValuedAttr<BoolAttr, "false">:$fill_out_of_bounds);
 +
 +  let results = (outs AnyRankedTensor:$result);
@@ -41,7 +48,8 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +
 +    or, with `reduce` other than invalid, the row reduced (sum, prod, max, min)
 +    with the source row. Duplicate positions apply in increasing m, so the
-+    result is deterministic. `source` is [B, M * W, R] in the table's type.
++    result is deterministic. `source` is shaped like the gather's result, in
++    the table's type.
 +  }];
 +
 +  let arguments = (ins AnyRankedTensor:$table,
@@ -49,6 +57,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$source,
 +                       DenseI64ArrayAttr:$sizes,
 +                       DenseI64ArrayAttr:$windows,
++                       DefaultValuedAttr<BoolAttr, "false">:$column,
 +                       TTCore_ReduceTypeAttr:$reduce);
 +
 +  let results = (outs AnyRankedTensor:$result);
@@ -60,7 +69,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -3951,6 +3951,54 @@ def TTNN_GatherOp : TTNN_Op<"gather"> {
+@@ -3951,6 +3951,56 @@ def TTNN_GatherOp : TTNN_Op<"gather"> {
      }];
  }
  
@@ -76,6 +85,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +                         AnyRankedTensor:$indices,
 +                         DenseI64ArrayAttr:$sizes,
 +                         DenseI64ArrayAttr:$windows,
++                         DefaultValuedAttr<BoolAttr, "false">:$column,
 +                         DefaultValuedAttr<BoolAttr, "false">:$fill_out_of_bounds);
 +
 +    let results = (outs AnyRankedTensor:$result);
@@ -101,6 +111,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +                         AnyRankedTensor:$source,
 +                         DenseI64ArrayAttr:$sizes,
 +                         DenseI64ArrayAttr:$windows,
++                         DefaultValuedAttr<BoolAttr, "false">:$column,
 +                         TTCore_ReduceTypeAttr:$reduce);
 +
 +    let results = (outs AnyRankedTensor:$result);
@@ -135,7 +146,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttml
 diff --git a/include/ttmlir/Target/TTNN/operations/data_movement.fbs b/include/ttmlir/Target/TTNN/operations/data_movement.fbs
 --- a/include/ttmlir/Target/TTNN/operations/data_movement.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/data_movement.fbs
-@@ -44,6 +44,29 @@ table GatherOp {
+@@ -44,6 +44,31 @@ table GatherOp {
    memory_config: tt.target.ttnn.MemoryConfig;
  }
  
@@ -147,6 +158,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/data_movement.fbs b/include/t
 +  out: tt.target.ttnn.TensorRef;
 +  sizes: [uint32];
 +  windows: [uint32];
++  column: bool;
 +  fill_out_of_bounds: bool;
 +}
 +
@@ -159,6 +171,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/data_movement.fbs b/include/t
 +  out: tt.target.ttnn.TensorRef;
 +  sizes: [uint32];
 +  windows: [uint32];
++  column: bool;
 +  reduce: ScatterReduceType;
 +}
 +
@@ -225,7 +238,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 --- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 +++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
-@@ -159,19 +159,26 @@ struct ReverseOpConversionPattern
+@@ -159,19 +159,27 @@ struct ReverseOpConversionPattern
      current =
          rewriter.create<ttir::ReshapeOp>(loc, flatType, current, shapeAttr);
  
@@ -257,14 +270,15 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +    Value reversed = rewriter.create<ttir::RowsGatherOp>(
 +        loc, tableType, table, reversedRows,
 +        rewriter.getDenseI64ArrayAttr({nReversing}),
-+        rewriter.getDenseI64ArrayAttr({1}), rewriter.getBoolAttr(false));
++        rewriter.getDenseI64ArrayAttr({1}), rewriter.getBoolAttr(false),
++        rewriter.getBoolAttr(false));
      current =
 -        rewriter.create<ttir::EmbeddingOp>(loc, flatType, idxConst, current);
 +        rewriter.create<ttir::ReshapeOp>(loc, flatType, reversed, shapeAttr);
  
      // Step 5: Reshape back to permuted shape.
      auto permShapeAttr = rewriter.getI32ArrayAttr(
-@@ -2453,10 +2460,19 @@ struct NegativePadOpDecompositionPattern
+@@ -2453,10 +2461,19 @@ struct NegativePadOpDecompositionPattern
  };
  } // namespace
  
@@ -307,7 +321,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -3191,6 +3191,41 @@ public:
+@@ -3191,6 +3191,42 @@ public:
  };
  } // namespace
  
@@ -323,7 +337,8 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +    rewriter.replaceOpWithNewOp<ttnn::RowsGatherOp>(
 +        op, this->getTypeConverter()->convertType(op.getType()),
 +        adaptor.getTable(), adaptor.getIndices(), adaptor.getSizesAttr(),
-+        adaptor.getWindowsAttr(), adaptor.getFillOutOfBoundsAttr());
++        adaptor.getWindowsAttr(), adaptor.getColumnAttr(),
++        adaptor.getFillOutOfBoundsAttr());
 +    return success();
 +  }
 +};
@@ -340,7 +355,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +        op, this->getTypeConverter()->convertType(op.getType()),
 +        adaptor.getTable(), adaptor.getIndices(), adaptor.getSource(),
 +        adaptor.getSizesAttr(), adaptor.getWindowsAttr(),
-+        adaptor.getReduceAttr());
++        adaptor.getColumnAttr(), adaptor.getReduceAttr());
 +    return success();
 +  }
 +};
@@ -349,7 +364,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  namespace {
  class PermuteOpConversionPattern : public OpConversionPattern<ttir::PermuteOp> {
  public:
-@@ -4097,8 +4132,6 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -4097,8 +4133,6 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
             BroadcastOpConversionPattern,
             PadOpConversionPattern,
             PowOpConversionPattern,
@@ -358,7 +373,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
             RepeatOpConversionPattern,
             CumSumOpConversionPattern,
             CumProdOpConversionPattern,
-@@ -4154,8 +4187,8 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -4154,8 +4188,8 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
             PagedUpdateCacheOpConversionPattern,
             SamplingOpConversionPattern,
             FillCacheOpConversionPattern,
@@ -431,10 +446,103 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
  // Factory method to create a set of workarounds for ScatterOp. The ScatterOp
  // expects the input to be in row-major layout if using f32, bf16, or int32.
  TTNNOperandsWorkarounds
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+@@ -344,6 +344,22 @@ private:
+           llvm::inconvertibleErrorCode());
+     }
+ 
++    // The rows ops (libtt's rows_gather and rows_scatter) read row-major
++    // operands and write a row-major result, which the layout pass already
++    // gave them; the op model does not know them, so answer here instead of
++    // restoring a tiled layout in front of them.
++    if (mlir::isa<ttnn::RowsGatherOp, ttnn::RowsScatterOp>(op)) {
++      auto resultLayout = mlir::cast<TTNNLayoutAttr>(
++          mlir::cast<RankedTensorType>(op->getResult(0).getType())
++              .getEncoding());
++      if (!resultLayout.isTiled()) {
++        return resultLayout;
++      }
++      return llvm::make_error<llvm::StringError>(
++          "Stopping RM propagation at a rows op with a tiled result",
++          llvm::inconvertibleErrorCode());
++    }
++
+     OpOperand &operand = op->getOpOperand(operandIdx);
+     RankedTensorType tensorType =
+         mlir::dyn_cast<RankedTensorType>(operand.get().getType());
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-@@ -719,6 +719,25 @@ private:
+@@ -214,6 +214,47 @@ static std::optional<Value> createToLayoutOp(PatternRewriter &rewriter,
+ // This function rewrites the operands and result to have the correct layout
+ // with respect to operand constraints.
+ namespace {
++// The rows ops (ttir.rows_gather and ttir.rows_scatter) read their table,
++// indices and source as row-major pages and write a row-major result. Those
++// operands, the reshapes and permutes that only view them, and the ops'
++// results stay row-major here: tiling a table on the way in would untilize it
++// again on every call (ttnn.reshape needs the same layout on both sides).
++static bool keepsRowMajor(Operation *op);
++
++static bool feedsRowsTable(OpOperand &use) {
++  Operation *owner = use.getOwner();
++  if (auto gather = mlir::dyn_cast<ttir::RowsGatherOp>(owner)) {
++    return use.get() == gather.getTable();
++  }
++  if (auto scatter = mlir::dyn_cast<ttir::RowsScatterOp>(owner)) {
++    return use.get() == scatter.getTable() ||
++           use.get() == scatter.getSource();
++  }
++  if (mlir::isa<ttir::ReshapeOp, ttir::PermuteOp>(owner)) {
++    return keepsRowMajor(owner);
++  }
++  return false;
++}
++
++static bool keepsRowMajor(Operation *op) {
++  if (mlir::isa<ttir::RowsGatherOp, ttir::RowsScatterOp>(op)) {
++    return true;
++  }
++  if (mlir::isa<ttir::ReshapeOp, ttir::PermuteOp>(op)) {
++    return !op->use_empty() && llvm::all_of(op->getUses(), feedsRowsTable);
++  }
++  return false;
++}
++
++// Whether `operand` of `op` is kept row-major here. The rows ops' indices are
++// left to the workarounds pass, which converts them after const-eval hoisting.
++static bool keepsRowMajorOperand(Operation *op, OpOperand &operand) {
++  if (mlir::isa<ttir::RowsGatherOp, ttir::RowsScatterOp>(op)) {
++    return feedsRowsTable(operand);
++  }
++  return keepsRowMajor(op);
++}
++
+ class TTNNLayoutRewriter : public OpInterfaceRewritePattern<ttir::TTIROp> {
+ public:
+   TTNNLayoutRewriter(MLIRContext *ctx)
+@@ -244,7 +285,7 @@ public:
+       // Given the operand constraint, create the desired layout for the operand
+       std::optional<Value> desiredLayout = createToLayoutOp(
+           rewriter, newLoc, operand.get(), g_defaultMemorySpaceDevice,
+-          /*tiled=*/true);
++          /*tiled=*/!keepsRowMajorOperand(op, operand));
+ 
+       // If layout changed update the operand
+       if (desiredLayout) {
+@@ -273,6 +314,9 @@ public:
+ 
+ private:
+   bool shouldTilizeResult(Operation *op) const {
++    if (keepsRowMajor(op)) {
++      return false;
++    }
+ 
+     // TTNN Reshape does not support implicit tilization/untilization
+     // Therefore input output layouts should be the same
+@@ -719,6 +763,25 @@ private:
      return false;
    }
  
@@ -460,7 +568,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
    bool shouldForceInputRowMajor(BlockArgument arg) const {
      func::FuncOp owningFunc = cast<func::FuncOp>(arg.getOwner()->getParentOp());
  
-@@ -739,8 +758,11 @@ private:
+@@ -739,8 +802,11 @@ private:
      // convert at the boundary instead: the runtime does it once at bind time
      // rather than on every invocation. Requiring all uses to agree keeps
      // arguments shared with e.g. a matmul tiled.
@@ -505,7 +613,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +  std::vector<uint32_t> windows(op.getWindows().begin(),
 +                                op.getWindows().end());
 +  return ::tt::target::ttnn::CreateRowsGatherOpDirect(
-+      *cache.fbb, table, indices, output, &sizes, &windows,
++      *cache.fbb, table, indices, output, &sizes, &windows, op.getColumn(),
 +      op.getFillOutOfBounds());
 +}
 +
@@ -525,7 +633,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +                                op.getWindows().end());
 +  return ::tt::target::ttnn::CreateRowsScatterOpDirect(
 +      *cache.fbb, table, indices, source, output, &sizes, &windows,
-+      toFlatbuffer(op.getReduce()));
++      op.getColumn(), toFlatbuffer(op.getReduce()));
 +}
 +
  ::flatbuffers::Offset<::tt::target::ttnn::PermuteOp>

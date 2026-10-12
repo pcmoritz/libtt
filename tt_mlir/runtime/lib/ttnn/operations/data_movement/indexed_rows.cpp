@@ -13,10 +13,11 @@ namespace {
 
 ::ttnn::experimental::IndexedRowsSpec
 toSpec(const ::flatbuffers::Vector<uint32_t> *sizes,
-       const ::flatbuffers::Vector<uint32_t> *windows) {
+       const ::flatbuffers::Vector<uint32_t> *windows, bool column) {
   ::ttnn::experimental::IndexedRowsSpec spec;
   spec.sizes.assign(sizes->begin(), sizes->end());
   spec.windows.assign(windows->begin(), windows->end());
+  spec.column = column;
   return spec;
 }
 
@@ -49,7 +50,7 @@ void run(const ::tt::target::ttnn::RowsGatherOp *op, ProgramContext &context) {
       ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(
           ::tt::runtime::ttnn::utils::getTensorRefMemoryConfig(op->out()));
   ::ttnn::Tensor out = ::ttnn::experimental::rows_gather(
-      table, indices, toSpec(op->sizes(), op->windows()),
+      table, indices, toSpec(op->sizes(), op->windows(), op->column()),
       op->fill_out_of_bounds(), outputMemoryConfig);
   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
 }
@@ -67,7 +68,7 @@ void run(const ::tt::target::ttnn::RowsScatterOp *op,
       ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(
           ::tt::runtime::ttnn::utils::getTensorRefMemoryConfig(op->out()));
   ::ttnn::Tensor out = ::ttnn::experimental::rows_scatter(
-      table, indices, source, toSpec(op->sizes(), op->windows()),
+      table, indices, source, toSpec(op->sizes(), op->windows(), op->column()),
       toReduce(op->reduce()), outputMemoryConfig);
   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
 }

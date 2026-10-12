@@ -4,17 +4,20 @@
 // StableHLO gather, scatter and dynamic_update_slice onto ttir.rows_gather and
 // ttir.rows_scatter.
 //
-// All three move whole rows of a table by index. The table is the operand
-// viewed as [B, N, R]: B leading dimensions whose index is shared with (or
-// comes from) the index tensor's batch, N rows addressed by the index
-// components, and R trailing elements copied per row. The index components
-// address a contiguous block of operand dimensions, each with a window of
-// consecutive positions (StableHLO's slice sizes or update window extents);
-// operand dimensions inside that block that are not indexed get a constant
-// zero component. Only when the StableHLO batching dimensions do not lead
-// the operand is it permuted, so a lookup in a large table never copies it.
-// Everything else - permuting and reshaping indices, updates and results -
-// touches the small operands only.
+// All three move rows of a table by index. The table is the operand viewed as
+// [B, N, S..., R]: B leading dimensions whose index is shared with (or comes
+// from) the index tensor's batch, N rows addressed by the index components,
+// and the trailing dimensions copied per row, kept as they are so the table has
+// the operand's pages (a row-major reshape that changes the last dimension
+// copies the tensor). The index components address a contiguous block of
+// operand dimensions, each with a window of consecutive positions (StableHLO's
+// slice sizes or update window extents); operand dimensions inside that block
+// that are not indexed get a constant zero component. When the block reaches
+// the last dimension, the last component addresses a window of columns inside
+// a row's page instead of flattening the operand to one-element rows. Only when
+// the StableHLO batching dimensions do not lead the operand is it permuted, so
+// a lookup in a large table never copies it. Everything else - permuting and
+// reshaping indices, updates and results - touches the small operands only.
 //
 // Out-of-bounds handling is the kernel's: gathers clamp each component into
 // the operand, scatters drop the update, exactly as StableHLO specifies, so no
@@ -79,9 +82,46 @@ struct Canonical {
   SmallVector<int64_t> columns;
   SmallVector<int64_t> sizes;
   SmallVector<int64_t> windows;
+  // Whether the last component addresses columns inside the row's page.
+  bool column = false;
   // Dimensions of the permuted operand.
   SmallVector<OperandDim> dims;
-  int64_t B = 1, N = 1, R = 1, W = 1;
+  int64_t B = 1, N = 1, W = 1; // W: over the row components
+  int64_t columnWindow = 1;
+
+  // The table's shape: [B, N, row dims...], or [B, N, R] with a column
+  // component (R the last dimension's extent).
+  SmallVector<int64_t> tableShape() const {
+    SmallVector<int64_t> shape{B, N};
+    if (column) {
+      shape.push_back(sizes.back());
+    } else {
+      for (int64_t d : rowDims) {
+        shape.push_back(dims[d].size);
+      }
+      if (rowDims.empty()) {
+        shape.push_back(1);
+      }
+    }
+    return shape;
+  }
+
+  // The shape of `positions` gathered rows: [B, positions * W, row dims...],
+  // or [B, positions * W * columnWindow] with a column component.
+  SmallVector<int64_t> gatheredShape(int64_t positions) const {
+    SmallVector<int64_t> shape{B, positions * W};
+    if (column) {
+      shape.back() *= columnWindow;
+    } else {
+      for (int64_t d : rowDims) {
+        shape.push_back(dims[d].size);
+      }
+      if (rowDims.empty()) {
+        shape.push_back(1);
+      }
+    }
+    return shape;
+  }
 };
 
 // Lays the operand out as [batch dims][component dims][row dims]. The
@@ -146,11 +186,11 @@ Canonical canonicalize(ArrayRef<OperandDim> operandDims) {
       regionEnd = std::max(regionEnd, d);
     }
   }
-  // With nothing indexed, every position is copied: one zero component of
-  // size 1 stands in for the (empty) region after the last dimension.
+  // With nothing indexed, every position is copied: the last dimension is the
+  // row and one zero component of size 1 stands in for the (empty) region.
   if (regionEnd < 0) {
-    regionStart = rank;
-    regionEnd = rank - 1;
+    regionStart = rank - 1;
+    regionEnd = rank - 2;
   }
   for (int64_t d = 0; d < rank; ++d) {
     if (d < regionStart) {
@@ -164,7 +204,6 @@ Canonical canonicalize(ArrayRef<OperandDim> operandDims) {
       c.windows.push_back(c.dims[d].window);
     } else {
       c.rowDims.push_back(d);
-      c.R *= c.dims[d].size;
     }
   }
   if (c.componentDims.empty()) {
@@ -172,8 +211,12 @@ Canonical canonicalize(ArrayRef<OperandDim> operandDims) {
     c.sizes.push_back(1);
     c.windows.push_back(1);
   }
-  c.N = product(c.sizes);
-  c.W = product(c.windows);
+  // A component on the last dimension addresses columns of the row's page.
+  c.column = !c.componentDims.empty() && c.componentDims.back() == rank - 1;
+  const size_t rowComponents = c.sizes.size() - (c.column ? 1 : 0);
+  c.N = product(ArrayRef<int64_t>(c.sizes).take_front(rowComponents));
+  c.W = product(ArrayRef<int64_t>(c.windows).take_front(rowComponents));
+  c.columnWindow = c.column ? c.windows.back() : 1;
   return c;
 }
 
@@ -190,7 +233,7 @@ Value buildTable(ConversionPatternRewriter &rewriter, Location loc,
   }
   return ttir::utils::createReshapeOp(
       rewriter, ttmlir::utils::appendLocationSuffix(loc, "_table"), operand,
-      {c.B, c.N, c.R});
+      c.tableShape());
 }
 
 // The index tensor as [Bi, M, K] int32 columns in component order.
@@ -451,15 +494,16 @@ public:
           srcOp, "index batches do not match the table's");
     }
 
-    auto gatherType = RankedTensorType::get(
-        {c.B, layout.M * c.W, c.R}, operandType.getElementType());
+    auto gatherType = RankedTensorType::get(c.gatheredShape(layout.M),
+                                            operandType.getElementType());
     // The sharded-table partitioner (UpdateGlobalToLocalShapes) marks the
     // gathers whose indices are relative to the device's shard: positions in
     // other shards read as zeros and the shards' results are summed.
     bool fillOutOfBounds = srcOp->hasAttr(kFillOutOfBoundsAttr);
     Value gathered = rewriter.create<ttir::RowsGatherOp>(
         loc, gatherType, table, layout.indices, i64Array(rewriter, c.sizes),
-        i64Array(rewriter, c.windows), rewriter.getBoolAttr(fillOutOfBounds));
+        i64Array(rewriter, c.windows), rewriter.getBoolAttr(c.column),
+        rewriter.getBoolAttr(fillOutOfBounds));
 
     // Back to the StableHLO result: offset dims hold the operand's
     // non-collapsed, non-batching dims in operand order; the other positions
@@ -708,7 +752,7 @@ Value scatterRows(ConversionPatternRewriter &rewriter, Location loc,
                   ttcore::ReduceType reduce, RankedTensorType operandType) {
   Value scattered = rewriter.create<ttir::RowsScatterOp>(
       loc, table.getType(), table, indices, source, i64Array(rewriter, c.sizes),
-      i64Array(rewriter, c.windows),
+      i64Array(rewriter, c.windows), rewriter.getBoolAttr(c.column),
       ttcore::ReduceTypeAttr::get(rewriter.getContext(), reduce));
   return untable(rewriter, loc, scattered, c, operandType);
 }
@@ -841,7 +885,7 @@ public:
       return rewriter.notifyMatchFailure(
           srcOp, "index batches do not match the table's");
     }
-    auto sourceType = RankedTensorType::get({c.B, layout.M * c.W, c.R},
+    auto sourceType = RankedTensorType::get(c.gatheredShape(layout.M),
                                             operandType.getElementType());
 
     if (computation->unary != UnaryApply::None) {
@@ -849,9 +893,10 @@ public:
       auto windows = i64Array(rewriter, c.windows);
       auto overwrite = ttcore::ReduceTypeAttr::get(rewriter.getContext(),
                                                    ttcore::ReduceType::Invalid);
+      auto columnAttr = rewriter.getBoolAttr(c.column);
       if (layout.M > kMaxUnrolledApply) {
         Value rows = rewriter.create<ttir::RowsGatherOp>(
-            loc, sourceType, table, layout.indices, sizes, windows,
+            loc, sourceType, table, layout.indices, sizes, windows, columnAttr,
             rewriter.getBoolAttr(false));
         rows = applyUnary(rewriter, loc, computation->unary, rows);
         rewriter.replaceOp(
@@ -861,7 +906,7 @@ public:
       }
       auto indicesType = mlir::cast<RankedTensorType>(layout.indices.getType());
       auto positionType = indicesType.clone({layout.Bi, 1, indicesType.getDimSize(2)});
-      auto rowsType = sourceType.clone({c.B, c.W, c.R});
+      auto rowsType = sourceType.clone(c.gatheredShape(1));
       Value current = table;
       for (int64_t m = 0; m < layout.M; ++m) {
         Value position = rewriter.create<ttir::SliceStaticOp>(
@@ -872,12 +917,12 @@ public:
                                       static_cast<int32_t>(indicesType.getDimSize(2))}),
             rewriter.getI32ArrayAttr({1, 1, 1}));
         Value rows = rewriter.create<ttir::RowsGatherOp>(
-            loc, rowsType, current, position, sizes, windows,
+            loc, rowsType, current, position, sizes, windows, columnAttr,
             rewriter.getBoolAttr(false));
         rows = applyUnary(rewriter, loc, computation->unary, rows);
         current = rewriter.create<ttir::RowsScatterOp>(
             loc, current.getType(), current, position, rows, sizes, windows,
-            overwrite);
+            columnAttr, overwrite);
       }
       rewriter.replaceOp(srcOp, untable(rewriter, loc, current, c, operandType));
       return success();
@@ -1048,8 +1093,8 @@ public:
 
     Value table = buildTable(rewriter, loc, operand, c);
     // The update's dims are the operand's: [batch][component windows][rows].
-    auto sourceType =
-        RankedTensorType::get({c.B, c.W, c.R}, operandType.getElementType());
+    auto sourceType = RankedTensorType::get(c.gatheredShape(1),
+                                            operandType.getElementType());
     Value source = ttir::utils::createReshapeOp(
         rewriter, ttmlir::utils::appendLocationSuffix(loc, "_source"), update,
         sourceType.getShape());

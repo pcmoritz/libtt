@@ -12,25 +12,32 @@
 
 namespace ttnn::experimental {
 
-// How an index tensor addresses a table's rows. A table [B, N, R] is N rows of
-// R elements per batch; its rows are the row-major flattening of K dimensions
-// of extents `sizes` (prod(sizes) == N). Index component k picks a start along
-// dimension k and `windows[k]` consecutive positions follow it, so each index
-// position names W = prod(windows) rows. Components are clamped into
+// How an index tensor addresses a table's rows. A table [B, N, S..., R] is, per
+// batch, N rows of S consecutive pages of R elements (S is the product of any
+// dimensions between N and the last; a table keeps its operand's page size).
+// The index tensor [Bi, M, K] holds K int32 components per position. The row
+// components (all K, or the first K - 1 with `column`) pick a start along a
+// dimension of extent sizes[k] and `windows[k]` consecutive positions follow
+// it; the dimensions are laid out row-major in the N rows, so each position
+// names W = prod(row windows) rows. With `column`, the last component picks a
+// window of windows[K - 1] elements inside each row's single page (S must be 1)
+// instead of the whole row. Components are clamped into
 // [0, sizes[k] - windows[k]] like StableHLO's gather start indices.
 struct IndexedRowsSpec {
     ttsl::SmallVector<uint32_t> sizes;
     ttsl::SmallVector<uint32_t> windows;
+    bool column = false;
 };
 
 enum class RowsReduce : uint32_t { None = 0, Add = 1, Mul = 2, Max = 3, Min = 4 };
 
-// out[b, m * W + j, :] = table[b, row_j(indices[bi, m, :]), :] for the W window
-// offsets j, with bi = b, or 0 when the index tensor has one batch. table is a
-// row-major [B, N, R] tensor of any element type, indices a row-major
-// [Bi, M, K] int32 or uint32 tensor; the output is row-major [B, M * W, R] in
-// the table's type. With fill_out_of_bounds, positions whose components needed
-// clamping read as zeros instead.
+// out[b, m * W + j, ...] = table[b, row_j(indices[bi, m, :]), ...] for the W
+// window offsets j, with bi = b, or 0 when the index tensor has one batch. table
+// is a row-major [B, N, S..., R] tensor of any element type, indices a row-major
+// [Bi, M, K] int32 or uint32 tensor; the output is row-major [B, M * W, S..., R]
+// in the table's type, or [B, M * W * w] with a column window of w elements.
+// With fill_out_of_bounds, positions whose components needed clamping read as
+// zeros instead.
 ttnn::Tensor rows_gather(
     const ttnn::Tensor& table,
     const ttnn::Tensor& indices,
@@ -38,11 +45,12 @@ ttnn::Tensor rows_gather(
     bool fill_out_of_bounds = false,
     const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt);
 
-// A copy of table with out[b, row_j(indices[bi, m, :]), :] = source[b, m * W + j, :]
+// A copy of table with out[b, row_j(indices[bi, m, :]), ...] = source[b, m * W + j, ...]
 // for every in-bounds position (out-of-bounds positions are dropped, as in
 // StableHLO's scatter), or reduced into it with `reduce`. Duplicate positions
 // apply in increasing m; the result is deterministic. source is row-major
-// [B, M * W, R] in the table's type.
+// [B, M * W, S..., R] in the table's type, or [B, M * W * w] with a column
+// window.
 ttnn::Tensor rows_scatter(
     const ttnn::Tensor& table,
     const ttnn::Tensor& indices,

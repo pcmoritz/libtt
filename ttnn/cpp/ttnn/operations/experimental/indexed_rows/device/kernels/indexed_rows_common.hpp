@@ -4,13 +4,16 @@
 // Shared by the indexed-rows kernels (rows_gather and rows_scatter): index
 // decoding, row addressing and the element-wise reductions of a scatter.
 //
-// A table is a row-major tensor [B, N, R] whose pages are rows of R elements.
+// A table is a row-major tensor [B, N, S, R]: B batches of N rows, each row
+// S consecutive pages of R elements (S is 1 unless the operand had trailing
+// dimensions, which are kept as pages so the table never changes page size).
 // An index tensor [Bi, M, K] holds, per batch and position, K int32
-// coordinates; coordinate k addresses a dimension of extent sizes[k] with a
-// window of windows[k] consecutive positions, and the dimensions are laid out
-// row-major in the table's N rows (strides[k] rows apart). A position names
-// W = prod(windows) rows: for window offset j (row-major over the K
-// windows), row(j) = sum_k (c_k + o_k(j)) * strides[k].
+// coordinates. The first KR address a dimension of extent sizes[k] with a
+// window of windows[k] consecutive positions; the dimensions are laid out
+// row-major in the N rows (strides[k] rows apart), so a position names
+// W = prod(row windows) rows: row(j) = sum_k (c_k + o_k(j)) * strides[k].
+// With a column component (K == KR + 1), the last coordinate picks a window of
+// windows[KR] elements inside each row's page instead of the whole row.
 
 #pragma once
 
@@ -59,12 +62,12 @@ FORCE_INLINE Coords<K> decode(
     return out;
 }
 
-// The table row of window offset j (row-major over the K windows).
-template <uint32_t K>
+// The table row of window offset j (row-major over the KR row windows).
+template <uint32_t KR, uint32_t K>
 FORCE_INLINE uint32_t window_row(
     const Coords<K>& coords, uint32_t j, const std::array<uint32_t, K>& windows, const std::array<uint32_t, K>& strides) {
     uint32_t row = 0;
-    for (uint32_t k = K; k-- > 0;) {
+    for (uint32_t k = KR; k-- > 0;) {
         const uint32_t o = j % windows[k];
         j /= windows[k];
         row += (static_cast<uint32_t>(coords.c[k]) + o) * strides[k];
@@ -272,6 +275,28 @@ FORCE_INLINE void reduce_rows(uint32_t cur_addr, uint32_t upd_addr, uint32_t cou
         auto* upd = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(upd_addr);
         for (uint32_t i = 0; i < count; ++i) {
             cur[i] = reduce_int<uint8_t, uint8_t, kReduce>(cur[i], upd[i]);
+        }
+    }
+}
+
+// NoC transfers need the L1 address to share the DRAM address's offset within
+// a 64-byte granule. A column window read from DRAM offset `src` is placed at
+// `src % 64` inside its 64-byte-slack entry; this moves it to `dst % 64` so it
+// can be written to DRAM offset `dst`. Overlap-safe.
+constexpr uint32_t kGranule = 64;
+
+FORCE_INLINE void realign(uint32_t base, uint32_t from, uint32_t to, uint32_t bytes) {
+    if (from == to) {
+        return;
+    }
+    auto* p = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(base);
+    if (to < from) {
+        for (uint32_t i = 0; i < bytes; ++i) {
+            p[to + i] = p[from + i];
+        }
+    } else {
+        for (uint32_t i = bytes; i-- > 0;) {
+            p[to + i] = p[from + i];
         }
     }
 }

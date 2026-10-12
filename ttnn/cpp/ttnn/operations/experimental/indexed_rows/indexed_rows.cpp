@@ -18,6 +18,7 @@ ttnn::Tensor rows_gather(
     prim::IndexedRowsParams params{
         .sizes = spec.sizes,
         .windows = spec.windows,
+        .column = spec.column,
         .fill_out_of_bounds = fill_out_of_bounds,
         .output_mem_config = memory_config.value_or(table.memory_config())};
     prim::IndexedRowsInputs inputs{.table = table, .indices = indices};
@@ -40,6 +41,7 @@ ttnn::Tensor rows_scatter(
     prim::IndexedRowsParams params{
         .sizes = spec.sizes,
         .windows = spec.windows,
+        .column = spec.column,
         .reduce = reduce,
         .output_mem_config = memory_config.value_or(table.memory_config())};
     prim::IndexedRowsInputs inputs{.table = table, .indices = indices, .source = source};
