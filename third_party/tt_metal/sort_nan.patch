@@ -226,25 +226,49 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
      const float pad_descending = is_uint16_input ? 0.0f : -std::numeric_limits<float>::infinity();
      const float pad_fill = descending ? pad_descending : pad_ascending;
  
-@@ -385,7 +389,16 @@
-     // sort instead of teaching every compare/merge and padding stage a second
-     // 16-bit encoding. A caller-provided Float16 values output cannot back the
-     // promoted sort and is therefore populated only after the final typecast.
+@@ -380,14 +384,25 @@
+                                        ? ttnn::to_memory_config(input_tensor, ttnn::DRAM_MEMORY_CONFIG)
+                                        : input_tensor;
+ 
+-    // The SFPU bitonic primitive compares BF16/FP32 values. IEEE Float16 is
+-    // exactly representable in Float32, so promote it once around the device
+-    // sort instead of teaching every compare/merge and padding stage a second
+-    // 16-bit encoding. A caller-provided Float16 values output cannot back the
+-    // promoted sort and is therefore populated only after the final typecast.
 -    const bool promote_float16 = input_tensor.dtype() == DataType::FLOAT16;
-+    //
-+    // BFloat16 sorts keep NaN in 16-bit DEST, where every pack is an identity pack. UINT32 indices (rows
-+    // of more than 32768 elements, which pad to 65536, or a caller-provided UINT32 indices output) switch
-+    // the sort to 32-bit DEST, where packing the values back to BFloat16 is a conversion that turns NaN
-+    // into inf, so those sorts run in Float32 as well.
++    // Sorts that cannot keep their 16-bit values exact on the device run in Float32, which holds every
++    // Float16 and BFloat16 value exactly; the values are cast back to the input type after the sort. A
++    // caller-provided values output cannot back the promoted sort and is populated after the final cast.
++    //  - Float16: the SFPU bitonic primitive compares BF16/FP32 values, so promoting once avoids teaching
++    //    every compare/merge and padding stage a second 16-bit encoding.
++    //  - BFloat16 with UINT32 indices (rows of more than 32768 elements, which pad to 65536, or a
++    //    caller-provided UINT32 indices output): UINT32 indices switch the sort to 32-bit DEST, and
++    //    widening BFloat16 into it through SrcA turns NaN into inf. Shorter BFloat16 rows stay in 16-bit
++    //    DEST, where every pack is an identity pack. These casts could be removed by moving BFloat16 values
++    //    as raw 16-bit words and widening them to Float32 in DEST with the SFPU.
++    // A caller-provided UINT16 indices output for a longer row is still promoted and rebound with UINT32
++    // indices; ttnn::sort callers in tt-mlir never pass output tensors.
 +    const bool uint32_indices =
 +        original_lshape[normalized_dim] > 32768 ||
 +        (optional_output_tensors.has_value() && std::get<1>(*optional_output_tensors).dtype() == DataType::UINT32);
-+    const bool promote_float16 = input_tensor.dtype() == DataType::FLOAT16 ||
-+                                 (input_tensor.dtype() == DataType::BFLOAT16 && uint32_indices);
++    const bool promote_to_float32 = input_tensor.dtype() == DataType::FLOAT16 ||
++                                    (input_tensor.dtype() == DataType::BFLOAT16 && uint32_indices);
      const Tensor transform_input =
-         promote_float16 ? ttnn::typecast(unsharded_input, DataType::FLOAT32) : unsharded_input;
+-        promote_float16 ? ttnn::typecast(unsharded_input, DataType::FLOAT32) : unsharded_input;
++        promote_to_float32 ? ttnn::typecast(unsharded_input, DataType::FLOAT32) : unsharded_input;
  
-@@ -419,13 +432,19 @@
+     Tensor padded_input_tensor =
+         dm::pre_sort_transform_tensor(transform_input, dim, is_dim_last_idx, is_rank_le_4d, descending);
+@@ -406,7 +421,7 @@
+         const auto& out1 = std::get<1>(*optional_output_tensors);
+         const bool values_layout_match = (out0.layout() == padded_input_tensor.layout());
+         const bool indices_layout_match = (out1.layout() == padded_input_tensor.layout());
+-        preallocated_layout_mismatch = promote_float16 || !values_layout_match || !indices_layout_match;
++        preallocated_layout_mismatch = promote_to_float32 || !values_layout_match || !indices_layout_match;
+         if (!preallocated_layout_mismatch) {
+             const auto canonicalize_output = [&](const Tensor& t) {
+                 return dm::pre_sort_transform_tensor(t, dim, is_dim_last_idx, is_rank_le_4d, descending);
+@@ -419,13 +434,19 @@
      // pre_sort_transform_tensor always moves the sort dimension to position -1,
      // so the device op always sorts along the last dimension.
      auto sorted_tensors = ttnn::prim::sort(
@@ -260,8 +284,9 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
      auto results = dm::post_sort_transform_tensor(
          input_tensor, sorted_tensors, dim, is_dim_last_idx, original_lshape, device_op_mem_cfg);
  
-     if (promote_float16) {
+-    if (promote_float16) {
 -        results[0] = ttnn::typecast(results[0], DataType::FLOAT16);
++    if (promote_to_float32) {
 +        results[0] = ttnn::typecast(results[0], input_tensor.dtype());
      }
  
