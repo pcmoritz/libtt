@@ -33,6 +33,8 @@ def full_mesh():
         # and the fewest that are not (17), and all 32 rows of the tile.
         (1, 32, jnp.bfloat16),
         (1, 96, jnp.bfloat16),
+        (1, 2048, jnp.bfloat16),
+        (1, 4096, jnp.bfloat16),
         (1, 5120, jnp.bfloat16),
         (1, 8224, jnp.bfloat16),
         (2, 5120, jnp.bfloat16),
