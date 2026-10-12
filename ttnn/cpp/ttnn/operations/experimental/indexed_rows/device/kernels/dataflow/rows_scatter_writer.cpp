@@ -118,8 +118,19 @@ void kernel_main() {
                         const uint32_t row = b * N + window_row<KR, K>(coords, j, windows, strides);
                         uint32_t dst;
                         if constexpr (column) {
-                            if (in_batch(row, static_cast<uint32_t>(coords.c[K - 1]) * elem_bytes, dst)) {
-                                apply(dst, source_l1 + (i * W + j) * column_bytes, column_bytes);
+                            // A window may straddle chunks (and so batches):
+                            // each chunk takes its part.
+                            uint32_t offset = static_cast<uint32_t>(coords.c[K - 1]) * elem_bytes;
+                            uint32_t src = source_l1 + (i * W + j) * column_bytes;
+                            for (uint32_t left = column_bytes; left > 0;) {
+                                const uint32_t room = chunk_bytes - offset % chunk_bytes;
+                                const uint32_t bytes = left < room ? left : room;
+                                if (in_batch(row, offset, dst)) {
+                                    apply(dst, src, bytes);
+                                }
+                                offset += bytes;
+                                src += bytes;
+                                left -= bytes;
                             }
                             continue;
                         }

@@ -468,5 +468,52 @@ TEST_F(IndexedRowsTest, ScatterPagesInSeveralBatches) {
     }
 }
 
+// A row width whose entry does not divide the 512 KiB batch (bf16 rows of 96:
+// 192-byte entries, 2730 per batch, filled 16 at a time): the batch must be a
+// multiple of the reader's group or the reader waits for space at the end of
+// the buffer that the writer frees only after the whole batch.
+TEST_F(IndexedRowsTest, ScatterBatchIsAMultipleOfTheReaderGroup) {
+    Ref ref(/*B=*/1, /*R=*/96, /*Bi=*/1, /*M=*/500, {400000}, {1});  // ~2860 pages per core
+    std::mt19937 rng(10);
+    auto idx = random_indices(ref.M, 0, 399999, rng);
+    auto table = iota_values<bfloat16>(static_cast<size_t>(ref.N) * ref.R, 0.001f);
+    auto source = iota_values<bfloat16>(static_cast<size_t>(ref.M) * ref.R, -0.5f);
+    auto out = ttnn::experimental::rows_scatter(
+        to_device(table, {1, ref.N, ref.R}, DataType::BFLOAT16), index_tensor(ref, idx, DataType::INT32),
+        to_device(source, {1, ref.M, ref.R}, DataType::BFLOAT16), IndexedRowsSpec{{400000}, {1}});
+    auto got = out.cpu().to_vector<bfloat16>();
+    auto want = ref.scatter(table, idx, source, [](bfloat16, bfloat16 s) { return s; });
+    ASSERT_EQ(got.size(), want.size());
+    for (size_t i = 0; i < got.size(); ++i) {
+        ASSERT_EQ(got[i].operator float(), want[i].operator float()) << "at " << i;
+    }
+}
+
+// Column windows that straddle a 64 KiB chunk boundary, including the boundary
+// between two L1 batches of a 600 KB row (10 chunks, 8 per batch): every byte
+// of the window lands, by overwrite and by reduction.
+TEST_F(IndexedRowsTest, ColumnWindowAcrossChunksAndBatches) {
+    Ref cref(/*B=*/1, /*R=*/150000, /*Bi=*/1, /*M=*/6, {2, 150000}, {1, 4}, /*column=*/true);
+    std::vector<int32_t> cidx = {
+        0, 131071,  // across the batch boundary (chunk 7 | chunk 8)
+        0, 16383,   // across chunk 0 | chunk 1
+        1, 131071,  // the other row, across the batch boundary
+        1, 149996,  // the last window of the row
+        0, 0,       // the first
+        1, 16383,   // duplicate of a crossing position's chunk pair
+    };
+    auto table = iota_values<float>(2 * 150000, 0.25f);
+    auto source = iota_values<float>(cref.M * 4, -3.0f);
+    auto out = ttnn::experimental::rows_scatter(
+        to_device(table, {1, 2, 150000}, DataType::FLOAT32), index_tensor(cref, cidx, DataType::INT32),
+        to_device(source, {1, cref.M * 4}, DataType::FLOAT32), IndexedRowsSpec{{2, 150000}, {1, 4}, true});
+    EXPECT_EQ(out.cpu().to_vector<float>(), cref.scatter(table, cidx, source, [](float, float s) { return s; }));
+    out = ttnn::experimental::rows_scatter(
+        to_device(table, {1, 2, 150000}, DataType::FLOAT32), index_tensor(cref, cidx, DataType::INT32),
+        to_device(source, {1, cref.M * 4}, DataType::FLOAT32), IndexedRowsSpec{{2, 150000}, {1, 4}, true},
+        RowsReduce::Add);
+    EXPECT_EQ(out.cpu().to_vector<float>(), cref.scatter(table, cidx, source, [](float a, float s) { return a + s; }));
+}
+
 }  // namespace
 }  // namespace tt::tt_metal::distributed::test

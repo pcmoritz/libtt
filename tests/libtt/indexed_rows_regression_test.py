@@ -192,6 +192,27 @@ def test_scatter_subtract_and_apply():
     want = np.array(x)
     want[idx] = -want[idx]
     assert_equal(got, want)
+    # Duplicates apply the function once per position (two negations cancel).
+    dup = np.array([1, 5, 1, 11, 1], np.int32)
+    got = run(lambda x, i: x.at[i].apply(jnp.negative), x, dup)
+    want = np.array(x)
+    want[[5, 11, 1]] = -want[[5, 11, 1]]
+    assert_equal(got, want)
+
+
+def test_scatter_apply_many_positions():
+    # Beyond the unrolling limit an apply needs unique_indices (one gather,
+    # apply and scatter); without it the compiler refuses rather than apply the
+    # function once to each destination.
+    rng = np.random.default_rng(14)
+    x = rng.normal(size=(2000, 4)).astype(np.float32)
+    idx = rng.permutation(2000)[:1500].astype(np.int32)
+    got = run(lambda x, i: x.at[i].apply(jnp.negative, unique_indices=True), x, idx)
+    want = np.array(x)
+    want[idx] = -want[idx]
+    assert_equal(got, want)
+    with pytest.raises(Exception, match="unique_indices"):
+        run(lambda x, i: x.at[i].apply(jnp.negative), x, idx)
 
 
 def test_scatter_middle_axis():

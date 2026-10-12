@@ -255,12 +255,16 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
 
     // Owned pages stream through L1 in batches of up to `batch` chunks (as
     // many as fit 512 KiB); each batch takes the updates that land in it and
-    // goes out once. The reader fills the batch `group` chunks at a time.
+    // goes out once. The reader fills the batch `group` chunks at a time, so
+    // the batch is a multiple of the group: a partial group at the end of the
+    // buffer would wait for space the writer only frees after the full batch.
     const Split s = split(device, g.table.B * g.pages);
     constexpr uint32_t kBatchBudget = 512 * 1024;
-    const uint32_t batch = std::max<uint32_t>(1, kBatchBudget / g.entry_bytes);
+    uint32_t batch = std::max<uint32_t>(1, kBatchBudget / g.entry_bytes);
+    const uint32_t group = std::min(g.group, batch);
+    batch -= batch % group;
     g.compile_time_args["batch"] = batch;
-    g.compile_time_args["group"] = std::min(g.group, batch);
+    g.compile_time_args["group"] = group;
 
     const KernelSpecName READER{"reader"};
     const KernelSpecName WRITER{"writer"};

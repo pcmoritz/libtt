@@ -963,7 +963,10 @@ public:
       auto overwrite = ttcore::ReduceTypeAttr::get(rewriter.getContext(),
                                                    ttcore::ReduceType::Invalid);
       auto columnAttr = rewriter.getBoolAttr(c.column);
-      if (layout.M > kMaxUnrolledApply) {
+      // Each position applies the function to what the previous ones left,
+      // so duplicates apply it repeatedly: positions are unrolled, up to a
+      // limit. With unique indices one gather, apply and scatter suffice.
+      if (srcOp.getUniqueIndices()) {
         Value rows = rewriter.create<ttir::RowsGatherOp>(
             loc, sourceType, table, layout.indices, sizes, windows, columnAttr,
             rewriter.getBoolAttr(false));
@@ -972,6 +975,13 @@ public:
             srcOp, scatterRows(rewriter, loc, table, layout.indices, rows, c,
                                ttcore::ReduceType::Invalid, operandType));
         return success();
+      }
+      if (layout.M > kMaxUnrolledApply) {
+        return srcOp.emitError()
+               << "a scatter applying a function at more than "
+               << kMaxUnrolledApply
+               << " positions needs unique_indices; duplicates would apply "
+                  "it once per position";
       }
       auto indicesType = mlir::cast<RankedTensorType>(layout.indices.getType());
       const int64_t K = indicesType.getDimSize(1);
