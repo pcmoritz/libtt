@@ -205,3 +205,23 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
      const float pad_descending = is_uint16_input ? 0.0f : -std::numeric_limits<float>::infinity();
      const float pad_fill = descending ? pad_descending : pad_ascending;
  
+@@ -385,7 +389,9 @@
+     // sort instead of teaching every compare/merge and padding stage a second
+     // 16-bit encoding. A caller-provided Float16 values output cannot back the
+     // promoted sort and is therefore populated only after the final typecast.
+-    const bool promote_float16 = input_tensor.dtype() == DataType::FLOAT16;
++    // BFloat16 is promoted as well: its 16-bit-DEST transport turns NaN into inf.
++    const bool promote_float16 =
++        input_tensor.dtype() == DataType::FLOAT16 || input_tensor.dtype() == DataType::BFLOAT16;
+     const Tensor transform_input =
+         promote_float16 ? ttnn::typecast(unsharded_input, DataType::FLOAT32) : unsharded_input;
+ 
+@@ -425,7 +431,7 @@
+         input_tensor, sorted_tensors, dim, is_dim_last_idx, original_lshape, device_op_mem_cfg);
+ 
+     if (promote_float16) {
+-        results[0] = ttnn::typecast(results[0], DataType::FLOAT16);
++        results[0] = ttnn::typecast(results[0], input_tensor.dtype());
+     }
+ 
+     // The device op always writes to DRAM when sort_mem_cfg is sharded (to avoid
