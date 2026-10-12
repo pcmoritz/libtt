@@ -1,0 +1,141 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -1989,6 +1989,14 @@
+     let hasFolder = 1;
+ }
+ 
++def TTIR_MulHiOp : TTIR_ElementwiseBinaryOp<"mulhi"> {
++    let summary = "Eltwise multiply high operation";
++    let description = [{
++      The `mulhi` operation computes the high 32 bits of the 64-bit product of
++      corresponding uint32 elements, as chlo.mulhi.
++    }];
++}
++
+ def TTIR_RightShiftOp : TTIR_ElementwiseBinaryOp<"right_shift"> {
+     let summary = "Eltwise Arithmetic Right Shift operation";
+     let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -760,6 +760,14 @@
+   let hasVerifier = 1;
+ }
+ 
++def TTNN_MulHiOp: TTNN_ElementwiseBinaryOp<"mulhi", [OpModelExempt]>{
++  let summary = "Eltwise multiply high operation";
++  let description = [{
++    The high 32 bits of the 64-bit product of corresponding uint32 elements
++    (Blackhole only).
++  }];
++}
++
+ def TTNN_BitwiseRightShiftOp :
+     TTNN_ElementwiseBinaryCompositeOp<"bitwise_right_shift"> {
+   let summary = "Eltwise arithmetic right shift operation";
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -4020,6 +4020,7 @@
+            RequantizeOpConversionPattern,
+            ElementwiseBinaryOpConversionPattern<ttir::AddOp, ttnn::AddOp>,
+            ElementwiseBinaryOpConversionPattern<ttir::LogicalRightShiftOp, ttnn::LogicalRightShiftOp>,
++           ElementwiseBinaryOpConversionPattern<ttir::MulHiOp, ttnn::MulHiOp>,
+            ElementwiseBinaryOpConversionPattern<ttir::RightShiftOp, ttnn::BitwiseRightShiftOp>,
+            ElementwiseBinaryOpConversionPattern<ttir::SubtractOp, ttnn::SubtractOp>,
+            ElementwiseBinaryOpConversionPattern<ttir::MultiplyOp, ttnn::MultiplyOp>,
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -2436,6 +2436,8 @@
+     type = ::tt::target::ttnn::EltwiseBinaryOpType::Multiply;
+   } else if constexpr (std::is_same_v<EltwiseBinaryOp, LogicalRightShiftOp>) {
+     type = ::tt::target::ttnn::EltwiseBinaryOpType::LogicalRightShift;
++  } else if constexpr (std::is_same_v<EltwiseBinaryOp, MulHiOp>) {
++    type = ::tt::target::ttnn::EltwiseBinaryOpType::MulHi;
+   } else if constexpr (std::is_same_v<EltwiseBinaryOp, SubtractOp>) {
+     type = ::tt::target::ttnn::EltwiseBinaryOpType::Subtract;
+   } else if constexpr (std::is_same_v<EltwiseBinaryOp, EqualOp>) {
+@@ -5016,6 +5018,10 @@
+                            createEltwiseBinaryOp(cache, logicalRightShiftOp),
+                            debugString, locInfo);
+   }
++  if (auto mulHiOp = dyn_cast<MulHiOp>(op); mulHiOp) {
++    return createOperation(cache, createEltwiseBinaryOp(cache, mulHiOp),
++                           debugString, locInfo);
++  }
+   if (auto divOp = dyn_cast<DivideOp>(op); divOp) {
+     return createOperation(cache, createEltwiseBinaryOp(cache, divOp),
+                            debugString, locInfo);
+diff --git a/include/ttmlir/Target/TTNN/operations/eltwise.fbs b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+--- a/include/ttmlir/Target/TTNN/operations/eltwise.fbs
++++ b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+@@ -21,7 +21,8 @@
+   Divide,
+   LogicalAnd,
+   LogicalOr,
+-  LogicalXor
++  LogicalXor,
++  MulHi
+ }
+ 
+ table EltwiseBinaryOp {
+diff --git a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp b/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
+--- a/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
++++ b/runtime/lib/ttnn/operations/eltwise/binary/binary.cpp
+@@ -94,6 +94,12 @@
+     });
+     break;
+   }
++  case ::tt::target::ttnn::EltwiseBinaryOpType::MulHi: {
++    runEltwiseBinaryOp(op, tensorPool, [](auto &&...args) {
++      return ::ttnn::mulhi(std::forward<decltype(args)>(args)...);
++    });
++    break;
++  }
+   case ::tt::target::ttnn::EltwiseBinaryOpType::Subtract: {
+     runEltwiseBinaryOp(op, tensorPool, [](auto &&...args) {
+       return ::ttnn::subtract(std::forward<decltype(args)>(args)...);
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
+@@ -2348,6 +2348,30 @@
+   }
+ };
+ 
++// uint32 chlo.mulhi runs as ttir.mulhi: its decomposition widens to 64 bits,
++// which are narrowed back to 32. Narrower types decompose correctly.
++class ChloMulHiConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::CompositeOp> {
++public:
++  using OpConversionPattern<mlir::stablehlo::CompositeOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::CompositeOp srcOp,
++                  mlir::stablehlo::CompositeOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    if (srcOp.getName() != "chlo.mulhi") {
++      return failure();
++    }
++    auto type = mlir::cast<RankedTensorType>(srcOp.getResult(0).getType());
++    if (!type.getElementType().isUnsignedInteger(32)) {
++      return rewriter.notifyMatchFailure(srcOp, "only uint32 is a ttir.mulhi");
++    }
++    rewriter.replaceOpWithNewOp<ttir::MulHiOp>(
++        srcOp, type, adaptor.getOperands()[0], adaptor.getOperands()[1]);
++    return success();
++  }
++};
++
+ struct LegalizeStableHLOCompositeToTTIR
+     : public ttir::impl::LegalizeStableHLOCompositeToTTIRBase<
+           LegalizeStableHLOCompositeToTTIR> {
+@@ -2383,6 +2407,7 @@
+       context, "tenstorrent.gelu");
+   patterns.add<StableHLOToTTIRCompositeOpConversionPattern<ttir::GeluOp>>(
+       context, "tenstorrent.gelu_tanh");
++  patterns.add<ChloMulHiConversionPattern>(context);
+   patterns.add<TenstorrentAdamWConversionPattern>(context);
+   patterns.add<TenstorrentSDPAForwardConversionPattern>(context);
+   patterns.add<TenstorrentSDPABackwardConversionPattern>(context);
