@@ -339,6 +339,7 @@ http_archive(
         "//third_party/tt_metal:reduce_precision_kernel.patch",
         "//third_party/tt_metal:arange_uint8.patch",
         "//third_party/tt_metal:reduce_uint32_max_min.patch",
+        "//third_party/tt_metal:sort_nan.patch",
     ],
     sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
     strip_prefix = "tt-metal-eb97711f4be2a30cfbff05266faf90bf9780d0c2",
