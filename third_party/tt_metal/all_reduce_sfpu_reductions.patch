@@ -390,7 +390,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  #include "ttnn/operations/math.hpp"
  #include <tt-metalium/work_split.hpp>
  #include <tt-metalium/constants.hpp>
-@@ -445,6 +446,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -450,6 +451,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
          reduction_cb_index,  // reduction_cb_index
          out_cb_index,        // out_cb_index
      };
@@ -422,7 +422,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
  
      CircularBuffer cb_in(cb_in0);
      CircularBuffer cb_out(cb_out0);
-@@ -46,6 +52,14 @@ void kernel_main() {
+@@ -45,6 +51,14 @@ void kernel_main() {
      for (uint32_t p = 0; p < num_pack_iters; ++p) {
          uint32_t num_tiles_to_pack = std::min(max_dst_tiles, reduce_tiles - block_num_tiles_cnt);
          tile_regs_acquire();
@@ -437,7 +437,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
          for (uint32_t block = 0; block < num_blocks; block += 2) {
              if (copy_first_block && block == 0) {
                  // TODO: Future support
-@@ -60,6 +74,7 @@ void kernel_main() {
+@@ -59,6 +73,7 @@ void kernel_main() {
                  }
              }
          }
