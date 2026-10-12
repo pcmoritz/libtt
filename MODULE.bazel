@@ -342,6 +342,8 @@ http_archive(
         "//third_party/tt_metal:sort_nan.patch",
         "//third_party/tt_metal:packer_identity_nan.patch",
         "//third_party/tt_metal:mulhi_uint32.patch",
+        "//third_party/tt_metal:max_min_nan_propagation.patch",
+        "//third_party/tt_metal:pow_nan_propagation.patch",
     ],
     sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
     strip_prefix = "tt-metal-eb97711f4be2a30cfbff05266faf90bf9780d0c2",
