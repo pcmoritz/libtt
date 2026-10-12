@@ -1,16 +1,16 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 --- a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
-@@ -531,6 +531,147 @@ convertShardyCCLToStableHLOCCL(MLIRContext *context,
+@@ -531,6 +531,110 @@ convertShardyCCLToStableHLOCCL(MLIRContext *context,
    return mlir::success();
  }
  
 +// Shardy can keep the operand dimension a gather indexes sharded, and then
 +// sums the gathered slices across the shards. Like XLA's SPMD partitioner
 +// (PartitionGatherTrivialSlicedOperandDimensions), each device makes the
-+// indices relative to its shard, clamps them into it, and zeroes the slices of
-+// indices in other shards. Every index is in exactly one shard. Runs on local
-+// shapes.
++// indices relative to its shard; the gather reads zeros for indices in other
++// shards (tt.fill_out_of_bounds, honored by libtt's rows_gather lowering), so
++// every index contributes from exactly one shard. Runs on local shapes.
 +static void shiftGatherIndicesIntoShards(mlir::OpBuilder &builder,
 +                                         mlir::sdy::MeshOp globalMeshOp,
 +                                         mlir::ModuleOp &rootModule) {
@@ -50,7 +50,6 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +    mlir::Value indices = gather.getStartIndices();
 +    auto indicesType = mlir::cast<mlir::RankedTensorType>(indices.getType());
 +    mlir::Type indexType = indicesType.getElementType();
-+    mlir::RankedTensorType resultType = gather.getType();
 +    auto index = [&](int64_t value) -> mlir::Value {
 +      return builder.create<mlir::stablehlo::ConstantOp>(
 +          loc, mlir::DenseElementsAttr::get(
@@ -100,56 +99,20 @@ diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/li
 +        builder.getDenseI64ArrayAttr({}));
 +
 +    // Gather clamps indices into the whole operand, so clamp before finding
-+    // the owning shard.
++    // the owning shard. The shard-relative index is left as is: out of
++    // [0, shardSize) it reads zeros, which the sum over shards ignores.
 +    mlir::Value global = builder.create<mlir::stablehlo::ClampOp>(
 +        loc, indicesType, index(0), indices, index(shards * shardSize - 1));
-+    mlir::Value local =
-+        builder.create<mlir::stablehlo::SubtractOp>(loc, global, offset);
-+    mlir::Value clamped = builder.create<mlir::stablehlo::ClampOp>(
-+        loc, indicesType, index(0), local, index(shardSize - 1));
-+    gather.getStartIndicesMutable().assign(clamped);
-+
-+    // Zero the slices of indices in other shards: the mask drops the index
-+    // vector dimension and is broadcast over the slices' offset dimensions.
-+    mlir::Value mine = builder.create<mlir::stablehlo::CompareOp>(
-+        loc, clamped, local, mlir::stablehlo::ComparisonDirection::EQ);
-+    llvm::SmallVector<int64_t> batchShape;
-+    for (auto [i, size] : llvm::enumerate(indicesType.getShape())) {
-+      if (static_cast<int64_t>(i) != dims.getIndexVectorDim()) {
-+        batchShape.push_back(size);
-+      }
-+    }
-+    mine = builder.create<mlir::stablehlo::ReshapeOp>(
-+        loc, mlir::RankedTensorType::get(batchShape, builder.getI1Type()),
-+        mine);
-+    llvm::SmallVector<int64_t> batchDims;
-+    for (int64_t i = 0; i < resultType.getRank(); ++i) {
-+      if (!llvm::is_contained(dims.getOffsetDims(), i)) {
-+        batchDims.push_back(i);
-+      }
-+    }
-+    mine = builder.create<mlir::stablehlo::BroadcastInDimOp>(
-+        loc,
-+        mlir::RankedTensorType::get(resultType.getShape(), builder.getI1Type()),
-+        mine, builder.getDenseI64ArrayAttr(batchDims));
-+    mlir::Value zeros = builder.create<mlir::stablehlo::ConstantOp>(
-+        loc, builder.getZeroAttr(resultType));
-+    builder.setInsertionPointAfter(gather);
-+    auto masked = builder.create<mlir::stablehlo::SelectOp>(
-+        loc, mine, gather.getResult(), zeros);
-+    // Collectives on the slices read their sharding.
-+    if (mlir::Attribute sharding =
-+            gather->getAttr(mlir::sdy::TensorShardingAttr::name)) {
-+      masked->setAttr(mlir::sdy::TensorShardingAttr::name, sharding);
-+    }
-+    gather.getResult().replaceAllUsesExcept(masked, masked);
++    gather.getStartIndicesMutable().assign(
++        builder.create<mlir::stablehlo::SubtractOp>(loc, global, offset));
++    gather->setAttr("tt.fill_out_of_bounds", builder.getUnitAttr());
 +  });
 +}
 +
  class UpdateGlobalToLocalShapesPass
      : public impl::UpdateGlobalToLocalShapesPassBase<
            UpdateGlobalToLocalShapesPass> {
-@@ -613,6 +754,8 @@ public:
+@@ -613,6 +717,8 @@ public:
        }
      });
  

@@ -1,0 +1,52 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -5082,9 +5082,6 @@ public:
+ };
+ } // namespace
+ 
+-// NOTE: StableHLO Dynamic Slice Op clamps start indices to ensure validity,
+-// but we don't. Would add multiple ops (worse perf) and doesn't appear in test
+-// models.
+ namespace {
+ class StableHLOToTTIRDynamicSliceOpConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::DynamicSliceOp> {
+@@ -5098,6 +5095,10 @@ public:
+                   ConversionPatternRewriter &rewriter) const override {
+     auto outputType = mlir::cast<RankedTensorType>(
+         getTypeConverter()->convertType(srcOp.getResult().getType()));
++    auto operandShape = mlir::cast<RankedTensorType>(
++                            adaptor.getOperand().getType())
++                            .getShape();
++    auto sliceSizes = srcOp.getSliceSizes();
+ 
+     // Reshape start indices to 1D tensors for concat op.
+     ValueRange startIndicesRange = adaptor.getStartIndices();
+@@ -5108,13 +5109,17 @@ public:
+     auto singleElementTensorType =
+         RankedTensorType::get({1}, startIndexElementType);
+ 
+-    for (Value startIndex : startIndicesRange) {
+-      auto reshapedIndex = rewriter.create<ttir::ReshapeOp>(
++    for (auto [dim, startIndex] : llvm::enumerate(startIndicesRange)) {
++      Value reshapedIndex = rewriter.create<ttir::ReshapeOp>(
+           srcOp.getLoc(),
+           RankedTensorType::get(singleElementTensorType.getShape(),
+                                 startIndexElementType,
+                                 singleElementTensorType.getEncoding()),
+           startIndex, rewriter.getI32ArrayAttr({1}));
++      reshapedIndex = rewriter.create<ttir::ClampScalarOp>(
++          srcOp.getLoc(), singleElementTensorType, reshapedIndex,
++          rewriter.getI32IntegerAttr(0),
++          rewriter.getI32IntegerAttr(operandShape[dim] - sliceSizes[dim]));
+       startIndicesValues1D.push_back(reshapedIndex);
+     }
+     // Create a single 1D tensor from start indices values using concat op.
+@@ -5129,7 +5134,6 @@ public:
+         startIndicesValues1D, /*dim=*/0);
+ 
+     // Create a 1D constant tensor with slice_sizes values.
+-    auto sliceSizes = srcOp.getSliceSizes();
+     SmallVector<int32_t> sliceSizesInt32(sliceSizes.begin(), sliceSizes.end());
+     auto sliceSizesTensorType = RankedTensorType::get(
+         {static_cast<int64_t>(sliceSizesInt32.size())}, rewriter.getI32Type());

@@ -1,0 +1,481 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -5579,6 +5579,55 @@ def TTIR_GatherOp : TTIR_NamedOp<"gather"> {
+   let hasVerifier = 1;
+ }
+ 
++def TTIR_RowsGatherOp : TTIR_NamedOp<"rows_gather"> {
++  let summary = "Gather rows of a [B, N, R] table by index";
++  let description = [{
++    `table` is a row-major tensor [B, N, R]: B batches of N rows of R elements.
++    `indices` is an int32 tensor [Bi, M, K] with Bi equal to B or 1 (indices
++    shared by every batch). The N rows are the row-major flattening of K
++    dimensions of extents `sizes`; index component k is clamped into
++    [0, sizes[k] - windows[k]] and names windows[k] consecutive positions, so
++    each index position yields W = prod(windows) rows. The result is
++    [B, M * W, R]:
++
++      result[b, m * W + j, :] = table[b, row_j(indices[bi, m, :]), :]
++
++    With `fill_out_of_bounds`, positions whose components needed clamping read
++    as zeros instead. Any element type; rows are moved as bytes.
++  }];
++
++  let arguments = (ins AnyRankedTensor:$table,
++                       AnyRankedTensor:$indices,
++                       DenseI64ArrayAttr:$sizes,
++                       DenseI64ArrayAttr:$windows,
++                       DefaultValuedAttr<BoolAttr, "false">:$fill_out_of_bounds);
++
++  let results = (outs AnyRankedTensor:$result);
++}
++
++def TTIR_RowsScatterOp : TTIR_NamedOp<"rows_scatter"> {
++  let summary = "Scatter rows into a [B, N, R] table by index";
++  let description = [{
++    The counterpart of `rows_gather`: a copy of `table` where, for every index
++    position whose components are all in bounds (others are dropped),
++
++      result[b, row_j(indices[bi, m, :]), :] = source[b, m * W + j, :]
++
++    or, with `reduce` other than invalid, the row reduced (sum, prod, max, min)
++    with the source row. Duplicate positions apply in increasing m, so the
++    result is deterministic. `source` is [B, M * W, R] in the table's type.
++  }];
++
++  let arguments = (ins AnyRankedTensor:$table,
++                       AnyRankedTensor:$indices,
++                       AnyRankedTensor:$source,
++                       DenseI64ArrayAttr:$sizes,
++                       DenseI64ArrayAttr:$windows,
++                       TTCore_ReduceTypeAttr:$reduce);
++
++  let results = (outs AnyRankedTensor:$result);
++}
++
+ //===----------------------------------------------------------------------===//
+ // TTIR creation ops
+ //===----------------------------------------------------------------------===//
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -3953,6 +3953,54 @@ def TTNN_GatherOp : TTNN_Op<"gather"> {
+     }];
+ }
+ 
++def TTNN_RowsGatherOp : TTNN_Op<"rows_gather", [OpModelExempt]> {
++    let summary = "Gather rows of a [B, N, R] table by index.";
++    let description = [{
++      ttnn::experimental::rows_gather: result[b, m * W + j, :] =
++      table[b, row_j(indices[bi, m, :]), :], see ttir.rows_gather. The table,
++      indices and result are row-major; indices are int32.
++    }];
++
++    let arguments = (ins AnyRankedTensor:$table,
++                         AnyRankedTensor:$indices,
++                         DenseI64ArrayAttr:$sizes,
++                         DenseI64ArrayAttr:$windows,
++                         DefaultValuedAttr<BoolAttr, "false">:$fill_out_of_bounds);
++
++    let results = (outs AnyRankedTensor:$result);
++
++    let extraClassDeclaration = [{
++      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
++        return wa::TTNNOperandsWorkaroundsFactory::createRowsGatherOpOperandsWorkarounds(*this);
++      }
++    }];
++}
++
++def TTNN_RowsScatterOp : TTNN_Op<"rows_scatter", [OpModelExempt]> {
++    let summary = "Scatter rows into a [B, N, R] table by index.";
++    let description = [{
++      ttnn::experimental::rows_scatter: a copy of the table with
++      result[b, row_j(indices[bi, m, :]), :] = source[b, m * W + j, :] (or the
++      reduction of both) for every in-bounds position, see ttir.rows_scatter.
++      Every operand and the result are row-major; indices are int32.
++    }];
++
++    let arguments = (ins AnyRankedTensor:$table,
++                         AnyRankedTensor:$indices,
++                         AnyRankedTensor:$source,
++                         DenseI64ArrayAttr:$sizes,
++                         DenseI64ArrayAttr:$windows,
++                         TTCore_ReduceTypeAttr:$reduce);
++
++    let results = (outs AnyRankedTensor:$result);
++
++    let extraClassDeclaration = [{
++      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
++        return wa::TTNNOperandsWorkaroundsFactory::createRowsScatterOpOperandsWorkarounds(*this);
++      }
++    }];
++}
++
+ def TTNN_AllGatherOp: TTNN_Op<"all_gather", [OpModelExempt]> {
+     let summary = "All gather op.";
+     let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -276,6 +276,13 @@ public:
+   static TTNNOperandsWorkarounds
+   createGatherOpOperandsWorkarounds(mlir::Operation *op);
+ 
++  // Create workarounds for rows_gather and rows_scatter: the kernels move
++  // row-major pages as bytes and read int32 indices.
++  static TTNNOperandsWorkarounds
++  createRowsGatherOpOperandsWorkarounds(mlir::Operation *op);
++  static TTNNOperandsWorkarounds
++  createRowsScatterOpOperandsWorkarounds(mlir::Operation *op);
++
+   // Create workarounds for scatter op operands.
+   static TTNNOperandsWorkarounds
+   createScatterOpOperandsWorkarounds(mlir::Operation *op);
+diff --git a/include/ttmlir/Target/TTNN/operations/data_movement.fbs b/include/ttmlir/Target/TTNN/operations/data_movement.fbs
+--- a/include/ttmlir/Target/TTNN/operations/data_movement.fbs
++++ b/include/ttmlir/Target/TTNN/operations/data_movement.fbs
+@@ -44,6 +44,29 @@ table GatherOp {
+   memory_config: tt.target.ttnn.MemoryConfig;
+ }
+ 
++// ttnn::experimental::rows_gather: the [B, N, R] table, [Bi, M, K] indices and
++// [B, M * W, R] result; sizes and windows describe the K index components.
++table RowsGatherOp {
++  input: tt.target.ttnn.TensorRef;
++  indices: tt.target.ttnn.TensorRef;
++  out: tt.target.ttnn.TensorRef;
++  sizes: [uint32];
++  windows: [uint32];
++  fill_out_of_bounds: bool;
++}
++
++// ttnn::experimental::rows_scatter: source is [B, M * W, R]; Invalid reduces
++// nothing and overwrites.
++table RowsScatterOp {
++  input: tt.target.ttnn.TensorRef;
++  indices: tt.target.ttnn.TensorRef;
++  source: tt.target.ttnn.TensorRef;
++  out: tt.target.ttnn.TensorRef;
++  sizes: [uint32];
++  windows: [uint32];
++  reduce: ScatterReduceType;
++}
++
+ table PadOp {
+   in: tt.target.ttnn.TensorRef;
+   out: tt.target.ttnn.TensorRef;
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -93,6 +93,8 @@ union OpType {
+   FullOp,
+   FuncCallOp,
+   GatherOp,
++  RowsGatherOp,
++  RowsScatterOp,
+   GenericOp,
+   GatedDeltaRuleOp,
+   GatedDeltaDecodeOp,
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -12011,15 +12011,19 @@ static void addClampOpConversionPattern(MLIRContext *ctx,
+   patterns.add<StableHLOToTTIROpClampOpConversionPattern>(typeConverter, ctx);
+ }
+ 
++// Gathers, scatters and dynamic_update_slice all lower to ttir.rows_gather and
++// ttir.rows_scatter, in libtt's
++// tt_mlir/lib/Conversion/StableHLOToTTIR/IndexedRows.cpp.
++namespace mlir::tt {
++void populateIndexedRowsToTTIRPatterns(MLIRContext *ctx,
++                                       RewritePatternSet &patterns,
++                                       TypeConverter &typeConverter);
++} // namespace mlir::tt
++
+ static void addGatherOpConversionPattern(MLIRContext *ctx,
+                                          RewritePatternSet &patterns,
+                                          TypeConverter &typeConverter) {
+-  patterns.add<StableHLOGatherToDynamicSlicePattern>(typeConverter, ctx);
+-  patterns.add<StableHLOGatherToGatherDimPattern>(typeConverter, ctx);
+-  patterns.add<StableHLOGatherToSliceRepeatConcatPattern>(typeConverter, ctx);
+-  patterns.add<StableHLOGatherToEmbeddingPattern>(typeConverter, ctx);
+-  patterns.add<StableHLOGatherIntToGatherPattern>(typeConverter, ctx);
+-  patterns.add<StableHLOGatherMultiPartialFlattenPattern>(typeConverter, ctx);
++  mlir::tt::populateIndexedRowsToTTIRPatterns(ctx, patterns, typeConverter);
+ }
+ 
+ static void addIotaOpConversionPattern(MLIRContext *ctx,
+@@ -12033,12 +12037,9 @@ static void addIotaOpConversionPattern(MLIRContext *ctx,
+       typeConverter, ctx);
+ }
+ 
+-static void addScatterOpConversionPatterns(MLIRContext *ctx,
+-                                           RewritePatternSet &patterns,
+-                                           TypeConverter &typeConverter) {
+-  patterns.add<StableHLOToTTIREmbeddingBackwardOpConversionPattern,
+-               StableHLOToTTIRScatterOpConversionPattern>(typeConverter, ctx);
+-  ;
++static void addScatterOpConversionPatterns(MLIRContext *, RewritePatternSet &,
++                                           TypeConverter &) {
++  // See addGatherOpConversionPattern.
+ }
+ 
+ static void addReverseOpConversionPattern(MLIRContext *ctx,
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -3191,6 +3191,41 @@ public:
+ };
+ } // namespace
+ 
++namespace {
++class RowsGatherOpConversionPattern
++    : public OpConversionPattern<ttir::RowsGatherOp> {
++  using OpConversionPattern<ttir::RowsGatherOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(ttir::RowsGatherOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    rewriter.replaceOpWithNewOp<ttnn::RowsGatherOp>(
++        op, this->getTypeConverter()->convertType(op.getType()),
++        adaptor.getTable(), adaptor.getIndices(), adaptor.getSizesAttr(),
++        adaptor.getWindowsAttr(), adaptor.getFillOutOfBoundsAttr());
++    return success();
++  }
++};
++
++class RowsScatterOpConversionPattern
++    : public OpConversionPattern<ttir::RowsScatterOp> {
++  using OpConversionPattern<ttir::RowsScatterOp>::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(ttir::RowsScatterOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    rewriter.replaceOpWithNewOp<ttnn::RowsScatterOp>(
++        op, this->getTypeConverter()->convertType(op.getType()),
++        adaptor.getTable(), adaptor.getIndices(), adaptor.getSource(),
++        adaptor.getSizesAttr(), adaptor.getWindowsAttr(),
++        adaptor.getReduceAttr());
++    return success();
++  }
++};
++} // namespace
++
+ namespace {
+ class PermuteOpConversionPattern : public OpConversionPattern<ttir::PermuteOp> {
+ public:
+@@ -4156,6 +4191,8 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            FillCacheOpConversionPattern,
+            ScatterOpConversionPattern,
+            GatherOpConversionPattern,
++           RowsGatherOpConversionPattern,
++           RowsScatterOpConversionPattern,
+            PermuteOpConversionPattern,
+            UpsampleOpConversionPattern,
+            AllToAllOpConversionPattern,
+diff --git a/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp b/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp
+--- a/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp
++++ b/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps.cpp
+@@ -21,7 +21,8 @@ namespace {
+ // StableHLO to TOSA/Linalg conversion.
+ static bool isNonLowerableSHLOOp([[maybe_unused]] mlir::Operation *op) {
+ #ifdef TTMLIR_ENABLE_STABLEHLO
+-  return llvm::isa<stablehlo::DynamicUpdateSliceOp, stablehlo::EinsumOp>(op);
++  // dynamic_update_slice lowers to ttir.rows_scatter (libtt's IndexedRows.cpp).
++  return llvm::isa<stablehlo::EinsumOp>(op);
+ #else
+   return false;
+ #endif
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -327,6 +327,45 @@ TTNNOperandsWorkaroundsFactory::createGatherOpOperandsWorkarounds(
+       .addOutputOperandWorkaround(TTNNOperandWorkarounds()); // result
+ }
+ 
++// rows_gather and rows_scatter (ttnn::experimental) move row-major pages as
++// bytes, so every tensor operand and the result are row-major, and read the
++// index components as int32 (uint32 passes as is).
++static TTNNOperandWorkarounds rowsIndexWorkaround(mlir::Value indices) {
++  TTNNOperandWorkarounds workaround;
++  workaround.tensorLayoutWorkaround = Layout::RowMajor;
++  Type elementType =
++      mlir::cast<RankedTensorType>(indices.getType()).getElementType();
++  if (!elementType.isInteger(32)) {
++    workaround.tensorDataTypeWorkaround = ttcore::DataType::Int32;
++  }
++  return workaround;
++}
++
++TTNNOperandsWorkarounds
++TTNNOperandsWorkaroundsFactory::createRowsGatherOpOperandsWorkarounds(
++    mlir::Operation *op) {
++  auto gather = mlir::cast<ttnn::RowsGatherOp>(op);
++  TTNNOperandWorkarounds rowMajor;
++  rowMajor.tensorLayoutWorkaround = Layout::RowMajor;
++  return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
++      .addInputOperandWorkaround(rowMajor)                             // table
++      .addInputOperandWorkaround(rowsIndexWorkaround(gather.getIndices()))
++      .addOutputOperandWorkaround(rowMajor);
++}
++
++TTNNOperandsWorkarounds
++TTNNOperandsWorkaroundsFactory::createRowsScatterOpOperandsWorkarounds(
++    mlir::Operation *op) {
++  auto scatter = mlir::cast<ttnn::RowsScatterOp>(op);
++  TTNNOperandWorkarounds rowMajor;
++  rowMajor.tensorLayoutWorkaround = Layout::RowMajor;
++  return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
++      .addInputOperandWorkaround(rowMajor)                             // table
++      .addInputOperandWorkaround(rowsIndexWorkaround(scatter.getIndices()))
++      .addInputOperandWorkaround(rowMajor)                             // source
++      .addOutputOperandWorkaround(rowMajor);
++}
++
+ // Factory method to create a set of workarounds for ScatterOp. The ScatterOp
+ // expects the input to be in row-major layout if using f32, bf16, or int32.
+ TTNNOperandsWorkarounds
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+@@ -719,6 +719,25 @@ private:
+     return false;
+   }
+ 
++  static bool feedsRowMajorReader(OpOperand &use) {
++    Operation *owner = use.getOwner();
++    if (mlir::isa<ttir::EmbeddingOp>(owner)) {
++      return true;
++    }
++    if (auto gather = mlir::dyn_cast<ttir::RowsGatherOp>(owner)) {
++      return use.get() == gather.getTable();
++    }
++    if (auto scatter = mlir::dyn_cast<ttir::RowsScatterOp>(owner)) {
++      return use.get() == scatter.getTable() ||
++             use.get() == scatter.getSource();
++    }
++    if (mlir::isa<ttir::ReshapeOp>(owner)) {
++      return !owner->use_empty() &&
++             llvm::all_of(owner->getUses(), feedsRowMajorReader);
++    }
++    return false;
++  }
++
+   bool shouldForceInputRowMajor(BlockArgument arg) const {
+     func::FuncOp owningFunc = cast<func::FuncOp>(arg.getOwner()->getParentOp());
+ 
+@@ -739,8 +758,11 @@ private:
+     // convert at the boundary instead: the runtime does it once at bind time
+     // rather than on every invocation. Requiring all uses to agree keeps
+     // arguments shared with e.g. a matmul tiled.
++    // The rows ops (ttnn::experimental::rows_gather and rows_scatter) read
++    // their table and source as row-major sticks too, usually through the
++    // reshapes that view the argument as a [B, N, R] table.
+     if (!arg.use_empty() && llvm::all_of(arg.getUses(), [](OpOperand &use) {
+-          return mlir::isa<ttir::EmbeddingOp>(use.getOwner());
++          return feedsRowMajorReader(use);
+         })) {
+       return true;
+     }
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+@@ -649,6 +649,8 @@ const std::set<mlir::StringRef>
+         ttnn::WhereOp::getOperationName(), ttnn::FullOp::getOperationName(),
+         ttnn::EmbeddingOp::getOperationName(),
+         ttnn::ScatterOp::getOperationName(),
++        ttnn::RowsGatherOp::getOperationName(),
++        ttnn::RowsScatterOp::getOperationName(),
+         ttnn::ConcatOp::getOperationName(),
+         // ttnn clamp TT_FATALs on uint8/uint16 inputs; its operands
+         // workaround clamps them as int32.
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -1583,6 +1583,42 @@ createOp(FlatbufferObjectCache &cache, GatherOp op) {
+                                             op.getDim(), memoryConfig);
+ }
+ 
++::flatbuffers::Offset<::tt::target::ttnn::RowsGatherOp>
++createOp(FlatbufferObjectCache &cache, RowsGatherOp op) {
++  auto table = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getTable()));
++  auto indices = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getIndices()));
++  auto output =
++      cache.getOrCreateNoSharding(op.getResult(), tensorValueToFlatbuffer,
++                                  /*local_shape*/ std::nullopt);
++  std::vector<uint32_t> sizes(op.getSizes().begin(), op.getSizes().end());
++  std::vector<uint32_t> windows(op.getWindows().begin(),
++                                op.getWindows().end());
++  return ::tt::target::ttnn::CreateRowsGatherOpDirect(
++      *cache.fbb, table, indices, output, &sizes, &windows,
++      op.getFillOutOfBounds());
++}
++
++::flatbuffers::Offset<::tt::target::ttnn::RowsScatterOp>
++createOp(FlatbufferObjectCache &cache, RowsScatterOp op) {
++  auto table = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getTable()));
++  auto indices = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getIndices()));
++  auto source = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getSource()));
++  auto output =
++      cache.getOrCreateNoSharding(op.getResult(), tensorValueToFlatbuffer,
++                                  /*local_shape*/ std::nullopt);
++  std::vector<uint32_t> sizes(op.getSizes().begin(), op.getSizes().end());
++  std::vector<uint32_t> windows(op.getWindows().begin(),
++                                op.getWindows().end());
++  return ::tt::target::ttnn::CreateRowsScatterOpDirect(
++      *cache.fbb, table, indices, source, output, &sizes, &windows,
++      toFlatbuffer(op.getReduce()));
++}
++
+ ::flatbuffers::Offset<::tt::target::ttnn::PermuteOp>
+ createOp(FlatbufferObjectCache &cache, PermuteOp op) {
+   flatbuffers::Offset<::tt::target::ttnn::TensorRef> input =
+@@ -5494,6 +5530,14 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createOp(cache, gatherOp), debugString,
+                            locInfo);
+   }
++  if (auto rowsGatherOp = dyn_cast<RowsGatherOp>(op); rowsGatherOp) {
++    return createOperation(cache, createOp(cache, rowsGatherOp), debugString,
++                           locInfo);
++  }
++  if (auto rowsScatterOp = dyn_cast<RowsScatterOp>(op); rowsScatterOp) {
++    return createOperation(cache, createOp(cache, rowsScatterOp), debugString,
++                           locInfo);
++  }
+   if (auto concatOp = dyn_cast<ConcatOp>(op); concatOp) {
+     return createOperation(cache, createConcatOp(cache, concatOp), debugString,
+                            locInfo);
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -50,6 +50,7 @@
+ #include "operations/data_movement/concat.h"
+ #include "operations/data_movement/copy.h"
+ #include "operations/data_movement/gather.h"
++#include "operations/data_movement/indexed_rows.h"
+ #include "operations/data_movement/pad.h"
+ #include "operations/data_movement/permute.h"
+ #include "operations/data_movement/repeat.h"
+@@ -449,6 +450,14 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+   case ::tt::target::ttnn::OpType::GatherOp: {
+     return operations::data_movement::run(op->type_as_GatherOp(), getContext());
+   }
++  case ::tt::target::ttnn::OpType::RowsGatherOp: {
++    return operations::data_movement::run(op->type_as_RowsGatherOp(),
++                                          getContext());
++  }
++  case ::tt::target::ttnn::OpType::RowsScatterOp: {
++    return operations::data_movement::run(op->type_as_RowsScatterOp(),
++                                          getContext());
++  }
+   case ::tt::target::ttnn::OpType::ConcatenateHeadsOp: {
+     return operations::transformer::run(op->type_as_ConcatenateHeadsOp(),
+                                         getContext());
