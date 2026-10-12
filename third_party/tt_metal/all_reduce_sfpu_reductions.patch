@@ -280,7 +280,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
-@@ -320,7 +320,8 @@ ttnn::experimental::prim::AllReduceAsyncDeviceOperation::tensor_return_value_t a
+@@ -322,7 +322,8 @@ ttnn::experimental::prim::AllReduceAsyncDeviceOperation::tensor_return_value_t a
      std::optional<tt::tt_metal::SubDeviceId> subdevice_id,
      bool use_noc1_only,
      bool use_optimal_ccl_for_llama,
@@ -290,7 +290,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      using OperationType = ttnn::experimental::prim::AllReduceAsyncDeviceOperation;
      const auto& mesh_view = mesh_device.get_view();
      TT_FATAL(
-@@ -339,7 +340,8 @@ ttnn::experimental::prim::AllReduceAsyncDeviceOperation::tensor_return_value_t a
+@@ -341,7 +342,8 @@ ttnn::experimental::prim::AllReduceAsyncDeviceOperation::tensor_return_value_t a
          use_optimal_ccl_for_llama,
          cluster_axis,
          &mesh_device,
@@ -390,7 +390,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  #include "ttnn/operations/math.hpp"
  #include <tt-metalium/work_split.hpp>
  #include <tt-metalium/constants.hpp>
-@@ -450,6 +451,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -452,6 +453,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
          reduction_cb_index,  // reduction_cb_index
          out_cb_index,        // out_cb_index
      };
