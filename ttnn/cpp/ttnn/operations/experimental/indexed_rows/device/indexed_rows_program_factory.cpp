@@ -57,13 +57,16 @@ uint32_t elem_kind(tt::tt_metal::DataType dtype) {
 
 // The geometry both programs share: pages move in chunks of up to 64 KiB (a
 // column window is one chunk), `group` chunks at a time; index pages are read
-// `index_batch` at a time.
+// `index_batch` positions at a time (one read per component).
 struct Geometry {
     IndexedRowsTable table;
     uint32_t Bi, M, K;
     uint32_t elem_bytes, page_bytes, chunk_bytes, entry_bytes, group;
-    uint32_t index_bytes, index_entry_bytes, index_batch;
-    uint32_t pages;  // table pages per batch
+    uint32_t index_batch;         // positions per streamed chunk
+    uint32_t index_stride_bytes;  // one component's part of an index chunk, with slack
+    uint32_t index_entry_bytes;   // a chunk of index positions: K components
+    uint32_t source_entry_bytes;  // a chunk of column-mode source, with slack
+    uint32_t pages;               // table pages per batch
     KernelSpec::CompileTimeArgs compile_time_args;
     KernelSpec::CompilerOptions compiler_options;
 };
@@ -73,8 +76,8 @@ Geometry geometry(const IndexedRowsParams& params, const IndexedRowsInputs& in) 
     g.table = indexed_rows_table(params, in.table);
     const auto& index_shape = in.indices.logical_shape();
     g.Bi = index_shape[0];
-    g.M = index_shape[1];
-    g.K = index_shape[2];
+    g.K = params.sizes.size();
+    g.M = index_shape[2];
     g.elem_bytes = in.table.element_size();
     g.page_bytes = g.table.R * g.elem_bytes;
     g.pages = g.table.N * g.table.S;
@@ -85,9 +88,18 @@ Geometry geometry(const IndexedRowsParams& params, const IndexedRowsInputs& in) 
     const uint32_t column_entry = params.column ? g.table.column_window * g.elem_bytes + kEntryAlign : 0;
     g.entry_bytes = align_entry(std::max(g.chunk_bytes, column_entry));
     g.group = std::clamp<uint32_t>((256 * 1024) / g.entry_bytes, 1, 16);
-    g.index_bytes = g.K * sizeof(uint32_t);
-    g.index_entry_bytes = align_entry(g.index_bytes);
-    g.index_batch = 128;
+    // Index positions (and, in column mode, their source) stream in chunks of
+    // up to 16 KiB of indices and 64 KiB of source.
+    const uint32_t index_bytes = g.K * sizeof(uint32_t);  // per position
+    const uint32_t source_per_position = params.column ? indexed_rows_window(params) * g.table.column_window * g.elem_bytes : 0;
+    g.index_batch = std::max<uint32_t>(1, (16 * 1024) / index_bytes);
+    if (source_per_position > 0) {
+        g.index_batch = std::clamp<uint32_t>((64 * 1024) / source_per_position, 1, g.index_batch);
+    }
+    g.index_batch = std::min<uint32_t>(g.index_batch, std::max<uint32_t>(g.M, 1));
+    g.index_stride_bytes = align_entry(g.index_batch * sizeof(uint32_t) + kEntryAlign);
+    g.index_entry_bytes = g.K * g.index_stride_bytes;
+    g.source_entry_bytes = align_entry(std::max<uint32_t>(g.index_batch * source_per_position, 1) + kEntryAlign);
 
     const uint32_t row_components = g.K - (params.column ? 1 : 0);
     ttsl::SmallVector<uint32_t> strides(g.K, 0);
@@ -113,9 +125,10 @@ Geometry geometry(const IndexedRowsParams& params, const IndexedRowsInputs& in) 
         {"pages_per_row", g.table.S},
         {"page_bytes", g.page_bytes},
         {"chunk_bytes", g.chunk_bytes},
-        {"index_bytes", g.index_bytes},
+        {"index_stride", g.index_stride_bytes / static_cast<uint32_t>(sizeof(uint32_t))},
         {"group", g.group},
         {"index_batch", g.index_batch},
+        {"resident", 0u},  // rows_scatter sets it
         {"elem_kind", elem_kind(in.table.dtype())},
         {"elem_bytes", g.elem_bytes},
         {"reduce", static_cast<uint32_t>(params.reduce)},
@@ -165,7 +178,7 @@ ttnn::device_operation::ProgramArtifacts RowsGatherProgramFactory::create_progra
 
     Group<DataflowBufferSpec> dataflow_buffers = {
         {.unique_id = ROWS_DFB, .entry_size = g.entry_bytes, .num_entries = 2 * g.group},
-        {.unique_id = INDEX_DFB, .entry_size = g.index_entry_bytes, .num_entries = g.index_batch},
+        {.unique_id = INDEX_DFB, .entry_size = g.index_entry_bytes, .num_entries = 1},
     };
 
     KernelSpec reader{
@@ -238,12 +251,25 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
     const auto& source = in.source->mesh_tensor();
     const auto& output = outputs.at(0).mesh_tensor();
     const auto& device = table.device();
-    const Geometry g = geometry(params, in);
+    Geometry g = geometry(params, in);
+
+    // Owned pages that fit L1 are held there and written once after the
+    // updates; otherwise they stream to the output and updates read-modify-write
+    // DRAM. The split is even, so the largest share decides for every core.
+    const Split s = split(device, g.table.B * g.pages);
+    uint32_t max_pages = 0;
+    for (const auto& [core, range] : s.ranges) {
+        max_pages = std::max(max_pages, range.second);
+    }
+    constexpr uint32_t kResidentBudget = 512 * 1024;
+    const bool resident = g.page_bytes <= g.chunk_bytes && max_pages * g.entry_bytes <= kResidentBudget;
+    g.compile_time_args["resident"] = static_cast<uint32_t>(resident);
 
     const KernelSpecName READER{"reader"};
     const KernelSpecName WRITER{"writer"};
     const DFBSpecName ROWS_DFB{"rows"};
     const DFBSpecName INDEX_DFB{"index"};
+    const DFBSpecName STREAM_DFB{"stream"};
     const DFBSpecName SCRATCH_DFB{"scratch"};
     const TensorParamName TABLE{"table"};
     const TensorParamName INDICES{"indices"};
@@ -251,8 +277,9 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
     const TensorParamName OUTPUT{"output"};
 
     Group<DataflowBufferSpec> dataflow_buffers = {
-        {.unique_id = ROWS_DFB, .entry_size = g.entry_bytes, .num_entries = 2 * g.group},
-        {.unique_id = INDEX_DFB, .entry_size = g.index_entry_bytes, .num_entries = g.index_batch},
+        {.unique_id = ROWS_DFB, .entry_size = g.entry_bytes, .num_entries = resident ? max_pages : 2 * g.group},
+        {.unique_id = INDEX_DFB, .entry_size = g.index_entry_bytes, .num_entries = 1},
+        {.unique_id = STREAM_DFB, .entry_size = g.source_entry_bytes, .num_entries = 1},
         {.unique_id = SCRATCH_DFB, .entry_size = g.entry_bytes, .num_entries = 2},
     };
 
@@ -279,6 +306,10 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
                 DFBBinding{.dfb_spec_name = INDEX_DFB, .accessor_name = "index", .endpoint_type = DFBEndpointType::PRODUCER},
                 DFBBinding{.dfb_spec_name = INDEX_DFB, .accessor_name = "index", .endpoint_type = DFBEndpointType::CONSUMER},
                 DFBBinding{
+                    .dfb_spec_name = STREAM_DFB, .accessor_name = "stream", .endpoint_type = DFBEndpointType::PRODUCER},
+                DFBBinding{
+                    .dfb_spec_name = STREAM_DFB, .accessor_name = "stream", .endpoint_type = DFBEndpointType::CONSUMER},
+                DFBBinding{
                     .dfb_spec_name = SCRATCH_DFB, .accessor_name = "scratch", .endpoint_type = DFBEndpointType::PRODUCER},
                 DFBBinding{
                     .dfb_spec_name = SCRATCH_DFB, .accessor_name = "scratch", .endpoint_type = DFBEndpointType::CONSUMER},
@@ -294,7 +325,6 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
         .hw_config = ttnn::create_writer_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
 
-    const Split s = split(device, g.table.B * g.pages);
     KernelRunArgs reader_run_args{.kernel = READER};
     KernelRunArgs writer_run_args{.kernel = WRITER};
     for (const auto& [core, range] : s.ranges) {

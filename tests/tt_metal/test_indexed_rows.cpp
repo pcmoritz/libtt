@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -47,10 +48,26 @@ protected:
         return ttnn::Tensor::from_vector(values, spec).to_device(mesh_device_.get());
     }
 
+    // The reference keeps indices as [Bi, M, K]; the ops take [Bi, K, M].
+    template <typename T, typename R>
+    ttnn::Tensor index_tensor(const R& ref, const std::vector<T>& idx, DataType dtype) {
+        std::vector<T> by_component(idx.size());
+        for (uint32_t bi = 0; bi < ref.Bi; ++bi) {
+            for (uint32_t m = 0; m < ref.M; ++m) {
+                for (uint32_t k = 0; k < ref.K; ++k) {
+                    by_component[(static_cast<size_t>(bi) * ref.K + k) * ref.M + m] =
+                        idx[(static_cast<size_t>(bi) * ref.M + m) * ref.K + k];
+                }
+            }
+        }
+        return to_device(by_component, {ref.Bi, ref.K, ref.M}, dtype);
+    }
+
     std::shared_ptr<MeshDevice> mesh_device_;
 };
 
-// Host reference of both ops over flat row-major [B, N, R] / [Bi, M, K] data.
+// Host reference of both ops over flat row-major [B, N, R] / [Bi, M, K] data
+// (the device index tensor is [Bi, K, M], see index_tensor).
 struct Ref {
     uint32_t B, N, R, Bi, M, K;  // R: elements per row (all S pages)
     std::vector<uint32_t> sizes, windows, strides;
@@ -168,7 +185,7 @@ TEST_F(IndexedRowsTest, GatherBf16ClampsIndices) {
     auto table = iota_values<bfloat16>(ref.N * ref.R, 0.5f);
     auto idx = random_indices(ref.M, -5, 104, rng);
     auto out = ttnn::experimental::rows_gather(
-        to_device(table, {1, ref.N, ref.R}, DataType::BFLOAT16), to_device(idx, {1, ref.M, 1}, DataType::INT32),
+        to_device(table, {1, ref.N, ref.R}, DataType::BFLOAT16), index_tensor(ref, idx, DataType::INT32),
         IndexedRowsSpec{{100}, {1}});
     EXPECT_EQ(out.logical_shape(), ttnn::Shape({1, ref.M, ref.R}));
     auto got = out.cpu().to_vector<bfloat16>();
@@ -193,7 +210,7 @@ TEST_F(IndexedRowsTest, GatherF32WindowsBatchedAndFill) {
     for (bool fill : {false, true}) {
         auto out = ttnn::experimental::rows_gather(
             to_device(table, {ref.B, ref.N, ref.R}, DataType::FLOAT32),
-            to_device(idx, {ref.Bi, ref.M, ref.K}, DataType::INT32), IndexedRowsSpec{{6, 8}, {1, 3}}, fill);
+            index_tensor(ref, idx, DataType::INT32), IndexedRowsSpec{{6, 8}, {1, 3}}, fill);
         EXPECT_EQ(out.logical_shape(), ttnn::Shape({ref.B, ref.M * ref.W, ref.R}));
         EXPECT_EQ(out.cpu().to_vector<float>(), ref.gather(table, idx, fill)) << "fill=" << fill;
     }
@@ -208,7 +225,7 @@ TEST_F(IndexedRowsTest, GatherSharedUint32IndicesSmallRows) {
     idx[3] = -1;  // as uint32: past the end, clamps high
     auto table_i32 = iota_values<int32_t>(ref.B * ref.N, 1000.0f);
     auto out = ttnn::experimental::rows_gather(
-        to_device(table_i32, {ref.B, ref.N, 1}, DataType::INT32), to_device(idx, {1, ref.M, 1}, DataType::UINT32),
+        to_device(table_i32, {ref.B, ref.N, 1}, DataType::INT32), index_tensor(ref, idx, DataType::UINT32),
         IndexedRowsSpec{{40}, {1}});
     auto want_idx = idx;
     want_idx[3] = 39;
@@ -216,7 +233,7 @@ TEST_F(IndexedRowsTest, GatherSharedUint32IndicesSmallRows) {
 
     auto table_u8 = iota_values<uint8_t>(ref.B * ref.N, 1.0f);
     out = ttnn::experimental::rows_gather(
-        to_device(table_u8, {ref.B, ref.N, 1}, DataType::UINT8), to_device(idx, {1, ref.M, 1}, DataType::UINT32),
+        to_device(table_u8, {ref.B, ref.N, 1}, DataType::UINT8), index_tensor(ref, idx, DataType::UINT32),
         IndexedRowsSpec{{40}, {1}});
     EXPECT_EQ(out.cpu().to_vector<uint8_t>(), ref.gather(table_u8, want_idx, false));
 }
@@ -226,7 +243,7 @@ TEST_F(IndexedRowsTest, GatherRowsLargerThanAChunk) {
     std::vector<int32_t> idx = {6, 0, 3, 3, 9};
     auto table = iota_values<bfloat16>(ref.N * ref.R, 0.25f);
     auto out = ttnn::experimental::rows_gather(
-        to_device(table, {1, ref.N, ref.R}, DataType::BFLOAT16), to_device(idx, {1, ref.M, 1}, DataType::INT32),
+        to_device(table, {1, ref.N, ref.R}, DataType::BFLOAT16), index_tensor(ref, idx, DataType::INT32),
         IndexedRowsSpec{{7}, {1}});
     auto got = out.cpu().to_vector<bfloat16>();
     auto want = ref.gather(table, idx, false);
@@ -244,7 +261,7 @@ TEST_F(IndexedRowsTest, ScatterOverwriteDropsAndOrdersDuplicates) {
     auto source = iota_values<float>(ref.B * ref.M * ref.R, -1.0f);
     auto out = ttnn::experimental::rows_scatter(
         to_device(table, {ref.B, ref.N, ref.R}, DataType::FLOAT32),
-        to_device(idx, {ref.Bi, ref.M, 1}, DataType::INT32), to_device(source, {ref.B, ref.M, ref.R}, DataType::FLOAT32),
+        index_tensor(ref, idx, DataType::INT32), to_device(source, {ref.B, ref.M, ref.R}, DataType::FLOAT32),
         IndexedRowsSpec{{50}, {1}});
     EXPECT_EQ(out.logical_shape(), ttnn::Shape({ref.B, ref.N, ref.R}));
     EXPECT_EQ(out.cpu().to_vector<float>(), ref.scatter(table, idx, source, [](float, float s) { return s; }));
@@ -258,7 +275,7 @@ TEST_F(IndexedRowsTest, ScatterAddF32Bf16Int32) {
         auto table = iota_values<float>(ref.N * ref.R, 1.0f);
         auto source = iota_values<float>(ref.M * ref.R, 0.125f);
         auto out = ttnn::experimental::rows_scatter(
-            to_device(table, {1, ref.N, ref.R}, DataType::FLOAT32), to_device(idx, {1, ref.M, 1}, DataType::INT32),
+            to_device(table, {1, ref.N, ref.R}, DataType::FLOAT32), index_tensor(ref, idx, DataType::INT32),
             to_device(source, {1, ref.M, ref.R}, DataType::FLOAT32), IndexedRowsSpec{{64}, {1}}, RowsReduce::Add);
         EXPECT_EQ(out.cpu().to_vector<float>(), ref.scatter(table, idx, source, [](float a, float s) { return a + s; }));
     }
@@ -266,7 +283,7 @@ TEST_F(IndexedRowsTest, ScatterAddF32Bf16Int32) {
         auto table = iota_values<bfloat16>(ref.N * ref.R, 1.0f);
         auto source = iota_values<bfloat16>(ref.M * ref.R, 0.125f);
         auto out = ttnn::experimental::rows_scatter(
-            to_device(table, {1, ref.N, ref.R}, DataType::BFLOAT16), to_device(idx, {1, ref.M, 1}, DataType::INT32),
+            to_device(table, {1, ref.N, ref.R}, DataType::BFLOAT16), index_tensor(ref, idx, DataType::INT32),
             to_device(source, {1, ref.M, ref.R}, DataType::BFLOAT16), IndexedRowsSpec{{64}, {1}}, RowsReduce::Add);
         auto got = out.cpu().to_vector<bfloat16>();
         auto want = ref.scatter(table, idx, source, [](bfloat16 a, bfloat16 s) {
@@ -282,7 +299,7 @@ TEST_F(IndexedRowsTest, ScatterAddF32Bf16Int32) {
         auto source = iota_values<int32_t>(ref.M * ref.R, 7.0f);
         table[0] = std::numeric_limits<int32_t>::max();  // wraps
         auto out = ttnn::experimental::rows_scatter(
-            to_device(table, {1, ref.N, ref.R}, DataType::INT32), to_device(idx, {1, ref.M, 1}, DataType::INT32),
+            to_device(table, {1, ref.N, ref.R}, DataType::INT32), index_tensor(ref, idx, DataType::INT32),
             to_device(source, {1, ref.M, ref.R}, DataType::INT32), IndexedRowsSpec{{64}, {1}}, RowsReduce::Add);
         EXPECT_EQ(out.cpu().to_vector<int32_t>(), ref.scatter(table, idx, source, [](int32_t a, int32_t s) {
             return static_cast<int32_t>(static_cast<uint32_t>(a) + static_cast<uint32_t>(s));
@@ -310,7 +327,7 @@ TEST_F(IndexedRowsTest, ScatterMaxMinPropagateNaNAndWindows) {
              std::pair{RowsReduce::Mul, +[](float a, float s) { return a * s; }},
          }) {
         auto out = ttnn::experimental::rows_scatter(
-            to_device(table, {1, ref.N, ref.R}, DataType::FLOAT32), to_device(idx, {1, ref.M, 2}, DataType::INT32),
+            to_device(table, {1, ref.N, ref.R}, DataType::FLOAT32), index_tensor(ref, idx, DataType::INT32),
             to_device(source, {1, ref.M * ref.W, ref.R}, DataType::FLOAT32), IndexedRowsSpec{{10, 4}, {2, 1}}, reduce);
         auto got = out.cpu().to_vector<float>();
         auto want = ref.scatter(table, idx, source, combine);
@@ -333,7 +350,7 @@ TEST_F(IndexedRowsTest, GatherAndScatterRowsOfSeveralPages) {
     auto table = iota_values<bfloat16>(ref.B * ref.N * ref.R, 0.5f);
     auto idx = random_indices(ref.Bi * ref.M, -2, 52, rng);
     auto out = ttnn::experimental::rows_gather(
-        to_device(table, {2, 50, 6, 40}, DataType::BFLOAT16), to_device(idx, {2, ref.M, 1}, DataType::INT32),
+        to_device(table, {2, 50, 6, 40}, DataType::BFLOAT16), index_tensor(ref, idx, DataType::INT32),
         IndexedRowsSpec{{50}, {1}});
     EXPECT_EQ(out.logical_shape(), ttnn::Shape({2, ref.M, 6, 40}));
     auto got = out.cpu().to_vector<bfloat16>();
@@ -344,7 +361,7 @@ TEST_F(IndexedRowsTest, GatherAndScatterRowsOfSeveralPages) {
     }
     auto source = iota_values<bfloat16>(ref.B * ref.M * ref.R, -1.0f);
     out = ttnn::experimental::rows_scatter(
-        to_device(table, {2, 50, 6, 40}, DataType::BFLOAT16), to_device(idx, {2, ref.M, 1}, DataType::INT32),
+        to_device(table, {2, 50, 6, 40}, DataType::BFLOAT16), index_tensor(ref, idx, DataType::INT32),
         to_device(source, {2, ref.M, 6, 40}, DataType::BFLOAT16), IndexedRowsSpec{{50}, {1}});
     got = out.cpu().to_vector<bfloat16>();
     want = ref.scatter(table, idx, source, [](bfloat16, bfloat16 s) { return s; });
@@ -365,17 +382,60 @@ TEST_F(IndexedRowsTest, ColumnWindowGatherAndScatterAdd) {
         idx[i * 2 + 1] = random_indices(1, -2, 102, rng)[0];
     }
     auto out = ttnn::experimental::rows_gather(
-        to_device(table, {1, 16, 100}, DataType::FLOAT32), to_device(idx, {1, ref.M, 2}, DataType::INT32),
+        to_device(table, {1, 16, 100}, DataType::FLOAT32), index_tensor(ref, idx, DataType::INT32),
         IndexedRowsSpec{{16, 100}, {1, 3}, true});
     EXPECT_EQ(out.logical_shape(), ttnn::Shape({1, ref.M * 3}));
     EXPECT_EQ(out.cpu().to_vector<float>(), ref.gather(table, idx, false));
 
     auto source = iota_values<float>(ref.M * 3, 0.25f);
     out = ttnn::experimental::rows_scatter(
-        to_device(table, {1, 16, 100}, DataType::FLOAT32), to_device(idx, {1, ref.M, 2}, DataType::INT32),
+        to_device(table, {1, 16, 100}, DataType::FLOAT32), index_tensor(ref, idx, DataType::INT32),
         to_device(source, {1, ref.M * 3}, DataType::FLOAT32), IndexedRowsSpec{{16, 100}, {1, 3}, true},
         RowsReduce::Add);
     EXPECT_EQ(out.cpu().to_vector<float>(), ref.scatter(table, idx, source, [](float a, float s) { return a + s; }));
+}
+
+TEST_F(IndexedRowsTest, ManyPositionsStreamAndResidentScatterAdd) {
+    // 20000 positions: several index chunks; a 64-row table whose pages stay
+    // in L1 on every core; duplicates accumulate.
+    Ref ref(/*B=*/1, /*R=*/24, /*Bi=*/1, /*M=*/20000, {64}, {1});
+    std::mt19937 rng(9);
+    auto table = iota_values<float>(ref.N * ref.R, 1.0f);
+    auto idx = random_indices(ref.M, -3, 70, rng);
+    auto out = ttnn::experimental::rows_gather(
+        to_device(table, {1, ref.N, ref.R}, DataType::FLOAT32), index_tensor(ref, idx, DataType::INT32),
+        IndexedRowsSpec{{64}, {1}});
+    EXPECT_EQ(out.cpu().to_vector<float>(), ref.gather(table, idx, false));
+    auto source = iota_values<float>(ref.M * ref.R, 0.125f);
+    out = ttnn::experimental::rows_scatter(
+        to_device(table, {1, ref.N, ref.R}, DataType::FLOAT32), index_tensor(ref, idx, DataType::INT32),
+        to_device(source, {1, ref.M, ref.R}, DataType::FLOAT32), IndexedRowsSpec{{64}, {1}}, RowsReduce::Add);
+    auto got = out.cpu().to_vector<float>();
+    auto want = ref.scatter(table, idx, source, [](float a, float s) { return a + s; });
+    ASSERT_EQ(got.size(), want.size());
+    for (size_t i = 0; i < got.size(); ++i) {
+        ASSERT_NEAR(got[i], want[i], 1e-2f) << "at " << i;
+    }
+    // The same through a column window: a permutation scatter per row.
+    Ref cref(/*B=*/1, /*R=*/4096, /*Bi=*/1, /*M=*/8 * 4096, {8, 4096}, {1, 1}, /*column=*/true);
+    std::vector<int32_t> cidx(cref.M * 2);
+    for (uint32_t r = 0; r < 8; ++r) {
+        std::vector<int32_t> perm(4096);
+        for (int32_t c = 0; c < 4096; ++c) {
+            perm[c] = c;
+        }
+        std::shuffle(perm.begin(), perm.end(), rng);
+        for (uint32_t c = 0; c < 4096; ++c) {
+            cidx[(r * 4096 + c) * 2] = r;
+            cidx[(r * 4096 + c) * 2 + 1] = perm[c];
+        }
+    }
+    auto ctable = std::vector<float>(8 * 4096, 0.0f);
+    auto csource = iota_values<float>(cref.M, 1.0f);
+    out = ttnn::experimental::rows_scatter(
+        to_device(ctable, {1, 8, 4096}, DataType::FLOAT32), index_tensor(cref, cidx, DataType::INT32),
+        to_device(csource, {1, cref.M}, DataType::FLOAT32), IndexedRowsSpec{{8, 4096}, {1, 1}, true});
+    EXPECT_EQ(out.cpu().to_vector<float>(), cref.scatter(ctable, cidx, csource, [](float, float s) { return s; }));
 }
 
 }  // namespace

@@ -40,7 +40,7 @@ IndexedRowsTable indexed_rows_table(const IndexedRowsParams& params, const Tenso
 tt::tt_metal::Shape indexed_rows_gathered_shape(
     const IndexedRowsParams& params, const Tensor& table, const Tensor& indices) {
     const IndexedRowsTable t = indexed_rows_table(params, table);
-    const uint32_t positions = indices.logical_shape()[1] * indexed_rows_window(params);
+    const uint32_t positions = indices.logical_shape()[2] * indexed_rows_window(params);
     if (params.column) {
         return tt::tt_metal::Shape({t.B, positions * t.column_window});
     }
@@ -75,7 +75,7 @@ void validate_indexed_rows(const IndexedRowsParams& params, const IndexedRowsInp
     check_tensor(in.table, "the table", 3);
     check_tensor(in.indices, "the index tensor", 3);
     TT_FATAL(
-        in.indices.logical_shape().rank() == 3, "{}: the index tensor must be [Bi, M, K], got {}", name, in.indices.logical_shape());
+        in.indices.logical_shape().rank() == 3, "{}: the index tensor must be [Bi, K, M], got {}", name, in.indices.logical_shape());
     TT_FATAL(
         in.indices.dtype() == DataType::INT32 || in.indices.dtype() == DataType::UINT32,
         "{}: the index tensor must be INT32 or UINT32, got {}",
@@ -84,15 +84,15 @@ void validate_indexed_rows(const IndexedRowsParams& params, const IndexedRowsInp
 
     const IndexedRowsTable t = indexed_rows_table(params, in.table);
     const auto& index_shape = in.indices.logical_shape();
-    const uint32_t Bi = index_shape[0], M = index_shape[1], K = index_shape[2];
+    const uint32_t Bi = index_shape[0], K = params.sizes.size();
     TT_FATAL(Bi == t.B || Bi == 1, "{}: the index tensor has {} batches, the table {}", name, Bi, t.B);
     TT_FATAL(
-        params.sizes.size() == K && params.windows.size() == K,
-        "{}: {} index components, but {} sizes and {} windows",
+        K >= 1 && params.windows.size() == K && index_shape[1] == K,
+        "{}: {} sizes and {} windows for an index tensor of {} components",
         name,
         K,
-        params.sizes.size(),
-        params.windows.size());
+        params.windows.size(),
+        index_shape[1]);
     // With a column component alone (K == 1), every batch is one row.
     const uint32_t row_components = K - (params.column ? 1 : 0);
     uint64_t rows = 1;

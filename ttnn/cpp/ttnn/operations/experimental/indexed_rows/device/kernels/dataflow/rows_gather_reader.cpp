@@ -35,7 +35,7 @@ void kernel_main() {
     constexpr uint32_t page_bytes = get_arg(args::page_bytes);
     constexpr uint32_t chunk_bytes = get_arg(args::chunk_bytes);
     constexpr uint32_t elem_bytes = get_arg(args::elem_bytes);
-    constexpr uint32_t index_bytes = get_arg(args::index_bytes);
+    constexpr uint32_t index_stride = get_arg(args::index_stride);  // words between components
     constexpr uint32_t group = get_arg(args::group);
     constexpr uint32_t index_batch = get_arg(args::index_batch);
     constexpr uint32_t C = column ? 1 : (page_bytes + chunk_bytes - 1) / chunk_bytes;
@@ -55,14 +55,14 @@ void kernel_main() {
     Noc noc;
 
     const uint32_t entry = rows.get_entry_size();
-    const uint32_t index_entry = index.get_entry_size();
     const uint32_t total = num_items * transfers_per_item;
 
-    // Index pages loaded so far: items [first_item, loaded_end), the current
-    // batch of which sits at the front of the index DFB.
+    // The index chunk loaded so far: items [chunk_begin, loaded_end), at
+    // `chunk_addr` in L1.
     uint32_t loaded_end = first_item;
-    uint32_t batch_begin = first_item;
-    uint32_t batch_count = 0;
+    uint32_t chunk_begin = first_item;
+    uint32_t chunk_addr = 0;
+    bool chunk_loaded = false;
     Coords<K> coords{};
     uint32_t coords_item = ~0u;
 
@@ -79,28 +79,27 @@ void kernel_main() {
             const uint32_t t = q % transfers_per_item;
             if (item != coords_item) {
                 if (item >= loaded_end) {
-                    // Load the next batch of index pages. A shared index tensor
-                    // restarts its pages at every batch of the table.
-                    if (batch_count != 0) {
-                        index.pop_front(batch_count);
+                    // Stream the next chunk of positions of this item's batch
+                    // (a shared index tensor has one batch).
+                    if (chunk_loaded) {
+                        index.pop_front(1);
                     }
                     const uint32_t m = item % M;
                     uint32_t n = first_item + num_items - item;
                     if (n > index_batch) {
                         n = index_batch;
                     }
-                    if (index_shared && n > M - m) {
+                    if (n > M - m) {
                         n = M - m;
                     }
-                    read_index_pages(noc, index, indices, index_shared ? m : item, n, index_bytes);
-                    index.wait_front(n);
-                    batch_begin = item;
-                    batch_count = n;
+                    chunk_addr = stream_index(
+                        noc, index, indices, K, index_stride * sizeof(uint32_t), index_shared ? 0 : item / M, m, n);
+                    chunk_loaded = true;
+                    chunk_begin = item;
                     loaded_end = item + n;
                 }
-                const uint32_t addr = index.get_read_ptr() + (item - batch_begin) * index_entry;
                 coords = decode<K, index_unsigned>(
-                    reinterpret_cast<volatile tt_l1_ptr const uint32_t*>(addr), sizes, windows);
+                    reinterpret_cast<const uint32_t*>(chunk_addr) + (item - chunk_begin), index_stride, sizes, windows);
                 coords_item = item;
             }
             const uint32_t b = item / M;
@@ -140,7 +139,7 @@ void kernel_main() {
         }
         rows.push_back(count);
     }
-    if (batch_count != 0) {
-        index.pop_front(batch_count);
+    if (chunk_loaded) {
+        index.pop_front(1);
     }
 }

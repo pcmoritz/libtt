@@ -11,8 +11,8 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +    `table` is a row-major tensor [B, N, S..., R]: B batches of N rows, each
 +    row the trailing dimensions (S pages of R elements, kept as the operand's
 +    pages).
-+    `indices` is an int32 tensor [Bi, M, K] with Bi equal to B or 1 (indices
-+    shared by every batch). The N rows are the row-major flattening of K
++    `indices` is an int32 tensor [Bi, K, M] with Bi equal to B or 1 (indices
++    shared by every batch): K components per position, one page per component. The N rows are the row-major flattening of K
 +    dimensions of extents `sizes`; index component k is clamped into
 +    [0, sizes[k] - windows[k]] and names windows[k] consecutive positions, so
 +    each index position yields W = prod(windows) rows. The result is
@@ -150,7 +150,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/data_movement.fbs b/include/t
    memory_config: tt.target.ttnn.MemoryConfig;
  }
  
-+// ttnn::experimental::rows_gather: the [B, N, R] table, [Bi, M, K] indices and
++// ttnn::experimental::rows_gather: the [B, N, R] table, [Bi, K, M] indices and
 +// [B, M * W, R] result; sizes and windows describe the K index components.
 +table RowsGatherOp {
 +  input: tt.target.ttnn.TensorRef;
@@ -255,11 +255,11 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 -    // Step 4: EmbeddingOp to reorder rows.
 +    // Steps 3 and 4: reorder the rows with a rows gather by the reversed
 +    // row indices [N-1, N-2, ..., 0]; every element type moves as bytes.
-+    auto rowIdxType = RankedTensorType::get({1, nReversing, 1},
++    auto rowIdxType = RankedTensorType::get({1, 1, nReversing},
 +                                            rewriter.getIntegerType(32, /*isSigned=*/true));
 +    Value reversedRows = rewriter.create<ttir::ArangeOp>(
 +        loc, rowIdxType, /*start=*/nReversing - 1, /*end=*/-1, /*step=*/-1,
-+        /*arange_dimension=*/1);
++        /*arange_dimension=*/2);
 +    SmallVector<int64_t> tableShape{1, nReversing, nNonReversing};
 +    auto tableType = RankedTensorType::get(
 +        tableShape, inputType.getElementType(), inputType.getEncoding());
@@ -467,27 +467,25 @@ diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagati
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-@@ -214,6 +214,47 @@ static std::optional<Value> createToLayoutOp(PatternRewriter &rewriter,
+@@ -214,6 +214,41 @@ static std::optional<Value> createToLayoutOp(PatternRewriter &rewriter,
  // This function rewrites the operands and result to have the correct layout
  // with respect to operand constraints.
  namespace {
 +// The rows ops (ttir.rows_gather and ttir.rows_scatter) read their table,
 +// indices and source as row-major pages and write a row-major result. Those
-+// operands, the reshapes and permutes that only view them, and the ops'
-+// results stay row-major here: tiling a table on the way in would untilize it
-+// again on every call (ttnn.reshape needs the same layout on both sides).
++// operands, the reshapes, permutes and concats that only assemble them, and
++// the ops' results stay row-major here: tiling a table on the way in would
++// untilize it again on every call (ttnn.reshape needs the same layout on both
++// sides), and a tiled [Bi, K, M] index tensor pads every component page to 32
++// rows.
 +static bool keepsRowMajor(Operation *op);
 +
-+static bool feedsRowsTable(OpOperand &use) {
++static bool feedsRowsOp(OpOperand &use) {
 +  Operation *owner = use.getOwner();
-+  if (auto gather = mlir::dyn_cast<ttir::RowsGatherOp>(owner)) {
-+    return use.get() == gather.getTable();
++  if (mlir::isa<ttir::RowsGatherOp, ttir::RowsScatterOp>(owner)) {
++    return true;
 +  }
-+  if (auto scatter = mlir::dyn_cast<ttir::RowsScatterOp>(owner)) {
-+    return use.get() == scatter.getTable() ||
-+           use.get() == scatter.getSource();
-+  }
-+  if (mlir::isa<ttir::ReshapeOp, ttir::PermuteOp>(owner)) {
++  if (mlir::isa<ttir::ReshapeOp, ttir::PermuteOp, ttir::ConcatOp>(owner)) {
 +    return keepsRowMajor(owner);
 +  }
 +  return false;
@@ -497,25 +495,21 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
 +  if (mlir::isa<ttir::RowsGatherOp, ttir::RowsScatterOp>(op)) {
 +    return true;
 +  }
-+  if (mlir::isa<ttir::ReshapeOp, ttir::PermuteOp>(op)) {
-+    return !op->use_empty() && llvm::all_of(op->getUses(), feedsRowsTable);
++  if (mlir::isa<ttir::ReshapeOp, ttir::PermuteOp, ttir::ConcatOp>(op)) {
++    return !op->use_empty() && llvm::all_of(op->getUses(), feedsRowsOp);
 +  }
 +  return false;
 +}
 +
-+// Whether `operand` of `op` is kept row-major here. The rows ops' indices are
-+// left to the workarounds pass, which converts them after const-eval hoisting.
++// Whether `operand` of `op` is kept row-major here.
 +static bool keepsRowMajorOperand(Operation *op, OpOperand &operand) {
-+  if (mlir::isa<ttir::RowsGatherOp, ttir::RowsScatterOp>(op)) {
-+    return feedsRowsTable(operand);
-+  }
 +  return keepsRowMajor(op);
 +}
 +
  class TTNNLayoutRewriter : public OpInterfaceRewritePattern<ttir::TTIROp> {
  public:
    TTNNLayoutRewriter(MLIRContext *ctx)
-@@ -232,9 +273,12 @@ public:
+@@ -232,9 +267,12 @@ public:
      for (OpOperand &operand : op->getOpOperands()) {
  
        // If the operand is a BroadcastOp or a ToLayout op do not put a
@@ -531,7 +525,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
          continue;
        }
  
-@@ -244,7 +288,7 @@ public:
+@@ -244,7 +282,7 @@ public:
        // Given the operand constraint, create the desired layout for the operand
        std::optional<Value> desiredLayout = createToLayoutOp(
            rewriter, newLoc, operand.get(), g_defaultMemorySpaceDevice,
@@ -540,7 +534,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
  
        // If layout changed update the operand
        if (desiredLayout) {
-@@ -273,6 +317,9 @@ public:
+@@ -273,6 +311,9 @@ public:
  
  private:
    bool shouldTilizeResult(Operation *op) const {
@@ -550,7 +544,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
  
      // TTNN Reshape does not support implicit tilization/untilization
      // Therefore input output layouts should be the same
-@@ -719,6 +766,25 @@ private:
+@@ -719,6 +760,25 @@ private:
      return false;
    }
  
@@ -576,7 +570,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
    bool shouldForceInputRowMajor(BlockArgument arg) const {
      func::FuncOp owningFunc = cast<func::FuncOp>(arg.getOwner()->getParentOp());
  
-@@ -739,8 +805,11 @@ private:
+@@ -739,8 +799,11 @@ private:
      // convert at the boundary instead: the runtime does it once at bind time
      // rather than on every invocation. Requiring all uses to agree keeps
      // arguments shared with e.g. a matmul tiled.

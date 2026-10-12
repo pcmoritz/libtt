@@ -7,8 +7,8 @@
 // A table is a row-major tensor [B, N, S, R]: B batches of N rows, each row
 // S consecutive pages of R elements (S is 1 unless the operand had trailing
 // dimensions, which are kept as pages so the table never changes page size).
-// An index tensor [Bi, M, K] holds, per batch and position, K int32
-// coordinates. The first KR address a dimension of extent sizes[k] with a
+// An index tensor [Bi, M * K] holds, per batch and position, K int32
+// coordinates (one page per batch, read in chunks). The first KR address a dimension of extent sizes[k] with a
 // window of windows[k] consecutive positions; the dimensions are laid out
 // row-major in the N rows (strides[k] rows apart), so a position names
 // W = prod(row windows) rows: row(j) = sum_k (c_k + o_k(j)) * strides[k].
@@ -18,6 +18,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -40,13 +41,19 @@ struct Coords {
 // any coordinate needed clamping (a scatter drops such positions, a gather in
 // fill mode writes zeros for them). Unsigned indices compare as unsigned, so
 // values past INT32_MAX clamp high instead of reading as negative.
-template <uint32_t K, bool kUnsigned>
-FORCE_INLINE Coords<K> decode(
-    volatile tt_l1_ptr const uint32_t* ptr, const std::array<uint32_t, K>& sizes, const std::array<uint32_t, K>& windows) {
-    Coords<K> out;
+// Decoding only the first KD components (the row components, KD = K - 1, when
+// a scatter decides whether it owns the row before looking at the column).
+// Component k of the position is at ptr[k * stride] (see stream_index). `ptr`
+// may be a plain pointer once the chunk is complete in L1, which lets the
+// compiler pipeline the loads of a scan.
+template <uint32_t KD, bool kUnsigned, std::size_t K, typename Ptr>
+FORCE_INLINE Coords<KD> decode(
+    Ptr ptr, uint32_t stride, const std::array<uint32_t, K>& sizes, const std::array<uint32_t, K>& windows) {
+    static_assert(KD <= K);
+    Coords<KD> out;
     out.out_of_bounds = false;
-    for (uint32_t k = 0; k < K; ++k) {
-        const uint32_t raw = ptr[k];
+    for (uint32_t k = 0; k < KD; ++k) {
+        const uint32_t raw = ptr[k * stride];
         const int32_t hi = static_cast<int32_t>(sizes[k] - windows[k]);
         int32_t c;
         if constexpr (kUnsigned) {
@@ -63,9 +70,10 @@ FORCE_INLINE Coords<K> decode(
 }
 
 // The table row of window offset j (row-major over the KR row windows).
-template <uint32_t KR, uint32_t K>
+template <uint32_t KR, uint32_t KC, std::size_t K>
 FORCE_INLINE uint32_t window_row(
-    const Coords<K>& coords, uint32_t j, const std::array<uint32_t, K>& windows, const std::array<uint32_t, K>& strides) {
+    const Coords<KC>& coords, uint32_t j, const std::array<uint32_t, K>& windows, const std::array<uint32_t, K>& strides) {
+    static_assert(KR <= KC && KC <= K);
     uint32_t row = 0;
     for (uint32_t k = KR; k-- > 0;) {
         const uint32_t o = j % windows[k];
@@ -301,25 +309,73 @@ FORCE_INLINE void realign(uint32_t base, uint32_t from, uint32_t to, uint32_t by
     }
 }
 
-// Reads `count` index pages, starting at page `first`, into the index DFB's
-// next `count` entries (one page per entry) and publishes them. The DFB is a
-// self-loop: the same kernel consumes them with wait_front/pop_front.
+// Streams a contiguous range of one DRAM page into a DFB entry: `bytes` from
+// `offset` of page `page_id` land at `offset % 64` of the entry (a NoC
+// transfer keeps the source's offset within a 64-byte granule), and the L1
+// address of the data is returned. The entry has a granule of slack. The DFB
+// is a self-loop: the same kernel pops the entry when done with it.
 template <typename Accessor>
-FORCE_INLINE void read_index_pages(
-    Noc& noc, DataflowBuffer& dfb, const Accessor& indices, uint32_t first, uint32_t count, uint32_t bytes) {
-    dfb.reserve_back(count);
-    const uint32_t entry = dfb.get_entry_size();
-    uint32_t addr = dfb.get_write_ptr();
-    for (uint32_t i = 0; i < count; ++i, addr += entry) {
+FORCE_INLINE uint32_t stream_chunk(
+    Noc& noc, DataflowBuffer& dfb, const Accessor& tensor, uint32_t page_id, uint32_t offset, uint32_t bytes) {
+    dfb.reserve_back(1);
+    const uint32_t addr = dfb.get_write_ptr() + offset % kGranule;
+    noc.async_read(
+        PrecomposedUnicastEndpoint{},
+        CoreLocalMem<uint32_t>(addr),
+        bytes,
+        {.noc_addr = tensor.get_noc_addr(page_id, offset)},
+        {.offset_bytes = 0});
+    noc.async_read_barrier();
+    asm volatile("" ::: "memory");  // the chunk may now be read through plain pointers
+    dfb.push_back(1);
+    return addr;
+}
+
+// Streams index positions [m0, m0 + n) of index batch `batch` into the one
+// entry of `dfb`: the index tensor is [Bi, K, M], one page per component, and
+// component k lands `stride_bytes` (a multiple of 64) after component 0. Returns
+// the L1 address of position m0's component 0; position i is at + 4 * i.
+template <typename Accessor>
+FORCE_INLINE uint32_t stream_index(
+    Noc& noc,
+    DataflowBuffer& dfb,
+    const Accessor& indices,
+    uint32_t K,
+    uint32_t stride_bytes,
+    uint32_t batch,
+    uint32_t m0,
+    uint32_t n) {
+    dfb.reserve_back(1);
+    const uint32_t base = dfb.get_write_ptr() + (m0 * sizeof(uint32_t)) % kGranule;
+    for (uint32_t k = 0; k < K; ++k) {
         noc.async_read(
             PrecomposedUnicastEndpoint{},
-            CoreLocalMem<uint32_t>(addr),
-            bytes,
-            {.noc_addr = indices.get_noc_addr(first + i)},
+            CoreLocalMem<uint32_t>(base + k * stride_bytes),
+            n * sizeof(uint32_t),
+            {.noc_addr = indices.get_noc_addr(batch * K + k, m0 * sizeof(uint32_t))},
             {.offset_bytes = 0});
     }
     noc.async_read_barrier();
-    dfb.push_back(count);
+    asm volatile("" ::: "memory");  // the chunk may now be read through plain pointers
+    dfb.push_back(1);
+    return base;
+}
+
+// Copies `bytes` within L1: by words when everything is word aligned.
+FORCE_INLINE void copy_l1(uint32_t dst, uint32_t src, uint32_t bytes) {
+    if (((dst | src | bytes) & 3) == 0) {
+        auto* d = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(dst);
+        auto* s = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(src);
+        for (uint32_t i = 0; i < bytes / 4; ++i) {
+            d[i] = s[i];
+        }
+        return;
+    }
+    auto* d = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(dst);
+    auto* s = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(src);
+    for (uint32_t i = 0; i < bytes; ++i) {
+        d[i] = s[i];
+    }
 }
 
 }  // namespace indexed_rows

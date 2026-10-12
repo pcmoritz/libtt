@@ -49,8 +49,8 @@ Value asInt32(ConversionPatternRewriter &rewriter, Location loc, Value value) {
 
 // The row and column, in the operand viewed as [rows, last dim], of every
 // element of `index`, whose value is the coordinate along `dim`; the other
-// coordinates are the element's own. Returned as an int32 [1, positions, 2]
-// index tensor of (row, column) components.
+// coordinates are the element's own. Returned as an int32 [1, 2, positions]
+// index tensor: a page of rows and a page of columns.
 Value rowColumnIndices(ConversionPatternRewriter &rewriter, Location loc,
                        Value index, ArrayRef<int64_t> operandShape,
                        int64_t dim) {
@@ -92,14 +92,14 @@ Value rowColumnIndices(ConversionPatternRewriter &rewriter, Location loc,
 
   const int64_t positions = volume(indexType.getShape());
   auto componentType =
-      RankedTensorType::get({1, positions, 1}, rewriter.getIntegerType(32, /*isSigned=*/true));
+      RankedTensorType::get({1, 1, positions}, rewriter.getIntegerType(32, /*isSigned=*/true));
   row = ttir::utils::createReshapeOp(rewriter, loc, row,
                                      componentType.getShape());
   column = ttir::utils::createReshapeOp(rewriter, loc, column,
                                         componentType.getShape());
   return rewriter.create<ttir::ConcatOp>(
-      loc, componentType.clone({1, positions, 2}), ValueRange{row, column},
-      rewriter.getSI32IntegerAttr(2));
+      loc, componentType.clone({1, 2, positions}), ValueRange{row, column},
+      rewriter.getSI32IntegerAttr(1));
 }
 
 Value asRows(ConversionPatternRewriter &rewriter, Location loc, Value value,
@@ -196,9 +196,9 @@ public:
     auto [rows, width] = tableDims(weightType);
     int64_t positions = volume(inputType.getShape());
     Value table = asRows(rewriter, loc, adaptor.getWeight(), rows, width);
-    Value indices =
-        asRows(rewriter, loc, asInt32(rewriter, loc, adaptor.getInput()),
-               positions, 1);
+    Value indices = ttir::utils::createReshapeOp(
+        rewriter, loc, asInt32(rewriter, loc, adaptor.getInput()),
+        {1, 1, positions});
     Value gathered = rewriter.create<ttir::RowsGatherOp>(
         loc,
         RankedTensorType::get({1, positions, width}, weightType.getElementType()),
@@ -233,9 +233,9 @@ public:
                          ? Attribute(rewriter.getF32FloatAttr(0.0f))
                          : Attribute(rewriter.getI32IntegerAttr(0));
     Value table = rewriter.create<ttir::FullOp>(loc, tableType, zero);
-    Value indices =
-        asRows(rewriter, loc, asInt32(rewriter, loc, adaptor.getInput()),
-               positions, 1);
+    Value indices = ttir::utils::createReshapeOp(
+        rewriter, loc, asInt32(rewriter, loc, adaptor.getInput()),
+        {1, 1, positions});
     Value source = adaptor.getInGradient();
     if (mlir::cast<RankedTensorType>(source.getType()).getElementType() !=
         resultType.getElementType()) {

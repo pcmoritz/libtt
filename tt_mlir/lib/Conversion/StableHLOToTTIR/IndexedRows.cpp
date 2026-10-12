@@ -236,7 +236,63 @@ Value buildTable(ConversionPatternRewriter &rewriter, Location loc,
       c.tableShape());
 }
 
-// The index tensor as [Bi, M, K] int32 columns in component order.
+// Moves dimensions by `permutation`: a reshape when only size-1 dimensions
+// move (their relative order among the others is immaterial), else a permute.
+Value moveDims(ConversionPatternRewriter &rewriter, Location loc, Value value,
+               ArrayRef<int64_t> permutation, StringRef suffix) {
+  if (isIdentity(permutation)) {
+    return value;
+  }
+  auto type = mlir::cast<RankedTensorType>(value.getType());
+  SmallVector<int64_t> shape =
+      ttmlir::utils::applyPermutation(type.getShape(), permutation);
+  auto nonUnit = [&](auto dims) {
+    return llvm::to_vector(llvm::make_filter_range(
+        dims, [&](int64_t d) { return type.getDimSize(d) != 1; }));
+  };
+  if (nonUnit(llvm::seq<int64_t>(0, type.getRank())) == nonUnit(permutation)) {
+    return ttir::utils::createReshapeOp(
+        rewriter, ttmlir::utils::appendLocationSuffix(loc, suffix), value,
+        shape);
+  }
+  return rewriter.create<ttir::PermuteOp>(
+      ttmlir::utils::appendLocationSuffix(loc, suffix), type.clone(shape),
+      value, permutation);
+}
+
+// The operands of the concatenate along `dim` that defines `value`, if any:
+// the converted op, or the StableHLO op when it is not converted yet.
+SmallVector<Value> concatenatedAlong(ConversionPatternRewriter &rewriter,
+                                     Value value, int64_t dim) {
+  const int64_t rank = mlir::cast<RankedTensorType>(value.getType()).getRank();
+  if (auto concat = value.getDefiningOp<ttir::ConcatOp>()) {
+    const int64_t d = concat.getDim() < 0 ? concat.getDim() + rank : concat.getDim();
+    if (d == dim) {
+      return SmallVector<Value>(concat.getInputs());
+    }
+  } else if (auto concat = value.getDefiningOp<stablehlo::ConcatenateOp>()) {
+    if (static_cast<int64_t>(concat.getDimension()) == dim) {
+      // Only pieces that are converted already (so their types are TTIR's).
+      SmallVector<Value> pieces;
+      for (Value input : concat.getInputs()) {
+        Value remapped = rewriter.getRemappedValue(input);
+        if (!remapped || remapped == input) {
+          return {};
+        }
+        pieces.push_back(remapped);
+      }
+      return pieces;
+    }
+  }
+  return {};
+}
+
+// The index tensor as [Bi, K, M] int32: for each batch, one page per
+// component (the kernels stream positions in chunks, one read per component).
+// StableHLO keeps the components innermost, and JAX assembles that index
+// vector by concatenating one [..., 1] piece per component; the pages are
+// built from those pieces, so no intermediate has K-element rows (which tile
+// to 32x32 and page to K elements).
 // `indexBatchingDims[i]` is the index dimension paired with the i-th operand
 // batching dimension in increasing operand order; the index dimensions other
 // than those and `indexVectorDim` are the positions, in increasing order.
@@ -267,70 +323,83 @@ IndexLayout buildIndices(ConversionPatternRewriter &rewriter, Location loc,
   for (int64_t d : layout.otherDims) {
     layout.M *= shape[d];
   }
-  const int64_t K = indexVectorDim < rank ? shape[indexVectorDim] : 1;
+  const bool hasVector = indexVectorDim < rank;
+  const int64_t K = hasVector ? shape[indexVectorDim] : 1;
+  Type i32 = rewriter.getIntegerType(32, /*isSigned=*/true);
 
+  // [batch..., components, positions...], per piece of the component dim.
   SmallVector<int64_t> permutation(layout.batchDims);
-  llvm::append_range(permutation, layout.otherDims);
-  if (indexVectorDim < rank) {
+  if (hasVector) {
     permutation.push_back(indexVectorDim);
   }
-  Value value = indices;
-  if (!isIdentity(permutation)) {
-    value = rewriter.create<ttir::PermuteOp>(
-        ttmlir::utils::appendLocationSuffix(loc, "_permute_indices"),
-        type.clone(ttmlir::utils::applyPermutation(shape, permutation)), value,
-        permutation);
+  llvm::append_range(permutation, layout.otherDims);
+  SmallVector<Value> pieces;
+  if (hasVector) {
+    pieces = concatenatedAlong(rewriter, indices, indexVectorDim);
   }
-  value = ttir::utils::createReshapeOp(
-      rewriter, ttmlir::utils::appendLocationSuffix(loc, "_indices"), value,
-      {layout.Bi, layout.M, K});
-  Type elementType = type.getElementType();
-  if (!elementType.isInteger(32)) {
-    value = rewriter.create<ttir::TypecastOp>(
-        ttmlir::utils::appendLocationSuffix(loc, "_indices_i32"),
-        RankedTensorType::get({layout.Bi, layout.M, K}, rewriter.getIntegerType(32, /*isSigned=*/true)),
-        value);
+  if (pieces.empty()) {
+    pieces.push_back(indices);
   }
+  SmallVector<Value> pages;
+  for (Value piece : pieces) {
+    auto pieceType = mlir::cast<RankedTensorType>(piece.getType());
+    const int64_t components = hasVector ? pieceType.getDimSize(indexVectorDim) : 1;
+    Value page = moveDims(rewriter, loc, piece, permutation, "_index_components");
+    page = ttir::utils::createReshapeOp(
+        rewriter, ttmlir::utils::appendLocationSuffix(loc, "_index_pages"),
+        page, {layout.Bi, components, layout.M});
+    if (pieceType.getElementType() != i32) {
+      page = rewriter.create<ttir::TypecastOp>(
+          ttmlir::utils::appendLocationSuffix(loc, "_indices_i32"),
+          RankedTensorType::get({layout.Bi, components, layout.M}, i32), page);
+    }
+    pages.push_back(page);
+  }
+  auto pageType = RankedTensorType::get({layout.Bi, 1, layout.M}, i32);
+  auto concatPages = [&](ArrayRef<Value> values, StringRef suffix) -> Value {
+    if (values.size() == 1) {
+      return values.front();
+    }
+    int64_t total = 0;
+    for (Value v : values) {
+      total += mlir::cast<RankedTensorType>(v.getType()).getDimSize(1);
+    }
+    return rewriter.create<ttir::ConcatOp>(
+        ttmlir::utils::appendLocationSuffix(loc, suffix),
+        pageType.clone({layout.Bi, total, layout.M}), values,
+        rewriter.getSI32IntegerAttr(1));
+  };
+  Value value = concatPages(pages, "_indices");
 
-  // Columns in component order, with zero columns for unindexed dimensions.
+  // Components in canonical order, with zero pages for unindexed dimensions.
   bool identityColumns =
       static_cast<int64_t>(c.columns.size()) == K &&
       llvm::equal(c.columns, llvm::seq<int64_t>(0, K));
-  if (!identityColumns) {
-    auto columnType = RankedTensorType::get(
-        {layout.Bi, layout.M, 1},
-        mlir::cast<RankedTensorType>(value.getType()).getElementType());
-    SmallVector<Value> columns;
-    Value zeros;
-    for (int64_t column : c.columns) {
-      if (column < 0) {
-        if (!zeros) {
-          zeros = rewriter.create<ttir::FullOp>(
-              ttmlir::utils::appendLocationSuffix(loc, "_zero_column"),
-              columnType, rewriter.getI32IntegerAttr(0));
-        }
-        columns.push_back(zeros);
-        continue;
-      }
-      columns.push_back(rewriter.create<ttir::SliceStaticOp>(
-          ttmlir::utils::appendLocationSuffix(loc, "_column"), columnType, value,
-          rewriter.getI32ArrayAttr({0, 0, static_cast<int32_t>(column)}),
-          rewriter.getI32ArrayAttr({static_cast<int32_t>(layout.Bi),
-                                    static_cast<int32_t>(layout.M),
-                                    static_cast<int32_t>(column + 1)}),
-          rewriter.getI32ArrayAttr({1, 1, 1})));
-    }
-    if (columns.size() == 1) {
-      value = columns.front();
-    } else {
-      value = rewriter.create<ttir::ConcatOp>(
-          ttmlir::utils::appendLocationSuffix(loc, "_columns"),
-          columnType.clone({layout.Bi, layout.M,
-                            static_cast<int64_t>(columns.size())}),
-          columns, rewriter.getSI32IntegerAttr(2));
-    }
+  if (identityColumns) {
+    layout.indices = value;
+    return layout;
   }
-  layout.indices = value;
+  SmallVector<Value> columns;
+  Value zeros;
+  for (int64_t column : c.columns) {
+    if (column < 0) {
+      if (!zeros) {
+        zeros = rewriter.create<ttir::FullOp>(
+            ttmlir::utils::appendLocationSuffix(loc, "_zero_column"),
+            pageType, rewriter.getI32IntegerAttr(0));
+      }
+      columns.push_back(zeros);
+      continue;
+    }
+    columns.push_back(rewriter.create<ttir::SliceStaticOp>(
+        ttmlir::utils::appendLocationSuffix(loc, "_column"), pageType, value,
+        rewriter.getI32ArrayAttr({0, static_cast<int32_t>(column), 0}),
+        rewriter.getI32ArrayAttr({static_cast<int32_t>(layout.Bi),
+                                  static_cast<int32_t>(column + 1),
+                                  static_cast<int32_t>(layout.M)}),
+        rewriter.getI32ArrayAttr({1, 1, 1})));
+  }
+  layout.indices = concatPages(columns, "_columns");
   return layout;
 }
 
@@ -905,16 +974,17 @@ public:
         return success();
       }
       auto indicesType = mlir::cast<RankedTensorType>(layout.indices.getType());
-      auto positionType = indicesType.clone({layout.Bi, 1, indicesType.getDimSize(2)});
+      const int64_t K = indicesType.getDimSize(1);
+      auto positionType = indicesType.clone({layout.Bi, K, 1});
       auto rowsType = sourceType.clone(c.gatheredShape(1));
       Value current = table;
       for (int64_t m = 0; m < layout.M; ++m) {
         Value position = rewriter.create<ttir::SliceStaticOp>(
             loc, positionType, layout.indices,
-            rewriter.getI32ArrayAttr({0, static_cast<int32_t>(m), 0}),
+            rewriter.getI32ArrayAttr({0, 0, static_cast<int32_t>(m)}),
             rewriter.getI32ArrayAttr({static_cast<int32_t>(layout.Bi),
-                                      static_cast<int32_t>(m + 1),
-                                      static_cast<int32_t>(indicesType.getDimSize(2))}),
+                                      static_cast<int32_t>(K),
+                                      static_cast<int32_t>(m + 1)}),
             rewriter.getI32ArrayAttr({1, 1, 1}));
         Value rows = rewriter.create<ttir::RowsGatherOp>(
             loc, rowsType, current, position, sizes, windows, columnAttr,
@@ -1052,8 +1122,8 @@ public:
         }
         start = ttir::utils::createReshapeOp(
             rewriter, ttmlir::utils::appendLocationSuffix(loc, "_start"), start,
-            {1, 1, 1});
-        auto columnType = RankedTensorType::get({1, 1, 1}, rewriter.getIntegerType(32, /*isSigned=*/true));
+            {1, 1});
+        auto columnType = RankedTensorType::get({1, 1}, rewriter.getIntegerType(32, /*isSigned=*/true));
         if (!startType.getElementType().isInteger(32)) {
           start = rewriter.create<ttir::TypecastOp>(loc, columnType, start);
         }
@@ -1076,7 +1146,7 @@ public:
       } else {
         if (!zeros) {
           zeros = rewriter.create<ttir::FullOp>(
-              loc, RankedTensorType::get({1, 1, 1}, rewriter.getIntegerType(32, /*isSigned=*/true)),
+              loc, RankedTensorType::get({1, 1}, rewriter.getIntegerType(32, /*isSigned=*/true)),
               rewriter.getI32IntegerAttr(0));
         }
         indexColumns.push_back(zeros);
@@ -1086,10 +1156,14 @@ public:
     if (indexColumns.size() > 1) {
       indices = rewriter.create<ttir::ConcatOp>(
           ttmlir::utils::appendLocationSuffix(loc, "_starts"),
-          RankedTensorType::get({1, 1, static_cast<int64_t>(indexColumns.size())},
+          RankedTensorType::get({1, static_cast<int64_t>(indexColumns.size())},
                                 rewriter.getIntegerType(32, /*isSigned=*/true)),
-          indexColumns, rewriter.getSI32IntegerAttr(2));
+          indexColumns, rewriter.getSI32IntegerAttr(1));
     }
+    // One position: [Bi, K, M] = [1, K, 1].
+    indices = ttir::utils::createReshapeOp(
+        rewriter, ttmlir::utils::appendLocationSuffix(loc, "_starts_pages"),
+        indices, {1, static_cast<int64_t>(indexColumns.size()), 1});
 
     Value table = buildTable(rewriter, loc, operand, c);
     // The update's dims are the operand's: [batch][component windows][rows].

@@ -23,7 +23,7 @@ ttnn::Tensor rows_gather(
         .output_mem_config = memory_config.value_or(table.memory_config())};
     prim::IndexedRowsInputs inputs{.table = table, .indices = indices};
     // Nothing to gather: the kernels have no work to split.
-    if (indices.logical_shape()[1] == 0 || table.logical_volume() == 0) {
+    if (indices.logical_shape()[2] == 0 || table.logical_volume() == 0) {
         prim::validate_indexed_rows(params, inputs, /*scatter=*/false);
         return Op::create_output_tensors(params, inputs)[0];
     }

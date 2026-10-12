@@ -15,7 +15,8 @@ namespace ttnn::experimental {
 // How an index tensor addresses a table's rows. A table [B, N, S..., R] is, per
 // batch, N rows of S consecutive pages of R elements (S is the product of any
 // dimensions between N and the last; a table keeps its operand's page size).
-// The index tensor [Bi, M, K] holds K int32 components per position. The row
+// The index tensor [Bi, M * K] holds K int32 components per position (one page
+// per batch, so the kernels stream it in chunks). The row
 // components (all K, or the first K - 1 with `column`) pick a start along a
 // dimension of extent sizes[k] and `windows[k]` consecutive positions follow
 // it; the dimensions are laid out row-major in the N rows, so each position
@@ -31,10 +32,11 @@ struct IndexedRowsSpec {
 
 enum class RowsReduce : uint32_t { None = 0, Add = 1, Mul = 2, Max = 3, Min = 4 };
 
-// out[b, m * W + j, ...] = table[b, row_j(indices[bi, m, :]), ...] for the W
+// out[b, m * W + j, ...] = table[b, row_j(indices[bi, :, m]), ...] for the W
 // window offsets j, with bi = b, or 0 when the index tensor has one batch. table
 // is a row-major [B, N, S..., R] tensor of any element type, indices a row-major
-// [Bi, M, K] int32 or uint32 tensor; the output is row-major [B, M * W, S..., R]
+// [Bi, K, M] int32 or uint32 tensor (one page per component, so that assembling
+// them never makes K-element pages); the output is row-major [B, M * W, S..., R]
 // in the table's type, or [B, M * W * w] with a column window of w elements.
 // With fill_out_of_bounds, positions whose components needed clamping read as
 // zeros instead.
@@ -45,7 +47,7 @@ ttnn::Tensor rows_gather(
     bool fill_out_of_bounds = false,
     const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt);
 
-// A copy of table with out[b, row_j(indices[bi, m, :]), ...] = source[b, m * W + j, ...]
+// A copy of table with out[b, row_j(indices[bi, :, m]), ...] = source[b, m * W + j, ...]
 // for every in-bounds position (out-of-bounds positions are dropped, as in
 // StableHLO's scatter), or reduced into it with `reduce`. Duplicate positions
 // apply in increasing m; the result is deterministic. source is row-major
