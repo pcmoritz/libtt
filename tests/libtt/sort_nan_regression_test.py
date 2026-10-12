@@ -18,7 +18,9 @@ def on(device, f, *args):
 
 def assert_matches_cpu(f, x):
     got, expected = on("tt", f, x), on("cpu", f, x)
-    np.testing.assert_array_equal(np.isnan(got.astype(np.float32)), np.isnan(expected.astype(np.float32)))
+    # numpy treats NaNs as equal only for its own float types, so compare bfloat16 as float32.
+    if got.dtype == jnp.bfloat16:
+        got, expected = got.astype(np.float32), expected.astype(np.float32)
     np.testing.assert_array_equal(got, expected)
 
 
