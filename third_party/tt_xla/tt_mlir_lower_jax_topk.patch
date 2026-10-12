@@ -40,7 +40,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
    std::optional<ttcore::DataType> inputDataType =
        ttcore::elementTypeToDataType(inputElementType);
 +  bool inputUsesFloat32 = inputDataType == ttcore::DataType::Float32 ||
-+                          inputElementType.isF16() || inputElementType.isInteger(32);
++                          inputElementType.isF16() || isa<IntegerType>(inputElementType);
  
    wa::TTNNOperandWorkarounds inputWorkaround;
    wa::TTNNOperandWorkarounds outputValuesWorkaround;
