@@ -1,0 +1,18 @@
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
+@@ -119,9 +119,11 @@
+     // OP requires K to be tile-aligned (multiples of 32), but user wants exact K
+     // If we had to round up K for op, trim the result down to the requested K value
+     if (adjusted_k != k) {
+-        // The kernels write whole tiles of adjusted_k columns, so for a 4D last-dim call the requested k is a
+-        // logical width change on the same buffer; the other cases still go through slice.
+-        if (orig_rank == 4 && is_dim_last_idx) {
++        // The kernels write whole tiles of adjusted_k columns, so for a last-dim call the requested k is a
++        // logical width change on the same buffer: the result is 4D here whatever the input's rank, and the
++        // rank restoration below only changes its leading dims. The two slices cost ~3 us of a router's 15 us
++        // top-8 of 128 (Blackhole). A call on another dim was transposed and still goes through slice.
++        if (is_dim_last_idx) {
+             for (auto& tensor : result) {
+                 auto logical_shape = tensor.logical_shape();
+                 logical_shape[3] = k;
