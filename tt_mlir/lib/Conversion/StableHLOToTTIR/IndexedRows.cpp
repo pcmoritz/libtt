@@ -401,12 +401,25 @@ public:
       rewriter.replaceOp(srcOp, zerosLike(rewriter, loc, resultType));
       return success();
     }
+    // A complex operand arrives as floats with a trailing dimension of 2,
+    // which is copied whole: an extra free dimension at the end of the row.
+    const int64_t originalRank = srcOp.getOperand().getType().getRank();
+    const int64_t extraDims = operandType.getRank() - originalRank;
+    if (extraDims < 0 ||
+        resultType.getRank() != srcOp.getType().getRank() + extraDims) {
+      return rewriter.notifyMatchFailure(srcOp, "unexpected converted ranks");
+    }
 
     // Classify the operand dimensions.
     SmallVector<OperandDim> dims(operandShape.size());
     for (auto [d, size] : llvm::enumerate(operandShape)) {
       OperandDim &dim = dims[d];
       dim.size = size;
+      if (static_cast<int64_t>(d) >= originalRank) {
+        dim.kind = DimKind::Free;
+        dim.window = size;
+        continue;
+      }
       dim.window = sliceSizes[d];
       if (llvm::is_contained(operandBatchingDims, d)) {
         dim.kind = DimKind::Batch;
@@ -422,7 +435,7 @@ public:
     // Index dims paired with the operand batching dims, in increasing operand
     // dim order (the order the batch dims take in the table).
     SmallVector<int64_t> indexBatchingDims;
-    for (int64_t d = 0; d < static_cast<int64_t>(operandShape.size()); ++d) {
+    for (int64_t d = 0; d < originalRank; ++d) {
       if (auto *it = llvm::find(operandBatchingDims, d);
           it != operandBatchingDims.end()) {
         indexBatchingDims.push_back(
@@ -464,7 +477,7 @@ public:
     // Where each original operand dim and index dim landed.
     SmallVector<int64_t> permutation(resultType.getRank(), -1);
     SmallVector<int64_t> operandOffsetDims;
-    for (int64_t d = 0; d < static_cast<int64_t>(operandShape.size()); ++d) {
+    for (int64_t d = 0; d < originalRank; ++d) {
       if (!llvm::is_contained(collapsedDims, d) &&
           !llvm::is_contained(operandBatchingDims, d)) {
         operandOffsetDims.push_back(d);
@@ -487,6 +500,10 @@ public:
     }
     for (auto [position, original] : llvm::zip(offsetDims, operandOffsetDims)) {
       permutation[position] = resultDimOfOperandDim(original);
+    }
+    for (int64_t i = 0; i < extraDims; ++i) {
+      permutation[srcOp.getType().getRank() + i] =
+          resultDimOfOperandDim(originalRank + i);
     }
     SmallVector<int64_t> indexDims;
     for (int64_t d = 0; d < indicesType.getRank(); ++d) {
@@ -668,15 +685,9 @@ Value applyUnary(ConversionPatternRewriter &rewriter, Location loc,
   llvm_unreachable("not a unary apply");
 }
 
-// Scatters `source` ([B, M * W, R]) into the table and restores the operand's
-// shape.
-Value scatterRows(ConversionPatternRewriter &rewriter, Location loc,
-                  Value table, Value indices, Value source, const Canonical &c,
-                  ttcore::ReduceType reduce, RankedTensorType operandType) {
-  Value scattered = rewriter.create<ttir::RowsScatterOp>(
-      loc, table.getType(), table, indices, source, i64Array(rewriter, c.sizes),
-      i64Array(rewriter, c.windows),
-      ttcore::ReduceTypeAttr::get(rewriter.getContext(), reduce));
+// Restores the operand's shape from a [B, N, R] table result.
+Value untable(ConversionPatternRewriter &rewriter, Location loc, Value scattered,
+              const Canonical &c, RankedTensorType operandType) {
   SmallVector<int64_t> permutedShape =
       ttmlir::utils::applyPermutation(operandType.getShape(), c.permutation);
   Value result = ttir::utils::createReshapeOp(
@@ -689,6 +700,24 @@ Value scatterRows(ConversionPatternRewriter &rewriter, Location loc,
   }
   return result;
 }
+
+// Scatters `source` ([B, M * W, R]) into the table and restores the operand's
+// shape.
+Value scatterRows(ConversionPatternRewriter &rewriter, Location loc,
+                  Value table, Value indices, Value source, const Canonical &c,
+                  ttcore::ReduceType reduce, RankedTensorType operandType) {
+  Value scattered = rewriter.create<ttir::RowsScatterOp>(
+      loc, table.getType(), table, indices, source, i64Array(rewriter, c.sizes),
+      i64Array(rewriter, c.windows),
+      ttcore::ReduceTypeAttr::get(rewriter.getContext(), reduce));
+  return untable(rewriter, loc, scattered, c, operandType);
+}
+
+// StableHLO applies a scatter's update computation once per update, so a
+// position that appears k times has its unary function applied k times. Up to
+// this many positions are applied one at a time to honor that; beyond it the
+// function is applied once per row.
+constexpr int64_t kMaxUnrolledApply = 1024;
 
 class ScatterConversionPattern
     : public OpConversionPattern<mlir::stablehlo::ScatterOp> {
@@ -740,10 +769,24 @@ public:
       return success();
     }
 
+    // A complex operand and its updates arrive as floats with a trailing
+    // dimension of 2, an extra free row dimension covered whole.
+    const int64_t originalRank =
+        mlir::cast<RankedTensorType>(srcOp.getInputs().front().getType())
+            .getRank();
+    const int64_t originalUpdatesRank =
+        mlir::cast<RankedTensorType>(srcOp.getUpdates().front().getType())
+            .getRank();
+    const int64_t extraDims = operandType.getRank() - originalRank;
+    if (extraDims < 0 ||
+        updatesType.getRank() != originalUpdatesRank + extraDims) {
+      return rewriter.notifyMatchFailure(srcOp, "unexpected converted ranks");
+    }
+
     // Update window dims pair, in order, with the operand dims that are
     // neither inserted nor batching, in increasing order.
     SmallVector<int64_t> windowOperandDims;
-    for (int64_t d = 0; d < static_cast<int64_t>(operandShape.size()); ++d) {
+    for (int64_t d = 0; d < originalRank; ++d) {
       if (!llvm::is_contained(insertedWindowDims, d) &&
           !llvm::is_contained(inputBatchingDims, d)) {
         windowOperandDims.push_back(d);
@@ -756,6 +799,9 @@ public:
     for (auto [u, d] : llvm::zip(updateWindowDims, windowOperandDims)) {
       updateDimOfOperandDim[d] = u;
     }
+    for (int64_t i = 0; i < extraDims; ++i) {
+      updateDimOfOperandDim[originalRank + i] = originalUpdatesRank + i;
+    }
 
     SmallVector<OperandDim> dims(operandShape.size());
     for (auto [d, size] : llvm::enumerate(operandShape)) {
@@ -763,6 +809,10 @@ public:
       dim.size = size;
       dim.window =
           updateDimOfOperandDim[d] >= 0 ? updatesShape[updateDimOfOperandDim[d]] : 1;
+      if (static_cast<int64_t>(d) >= originalRank) {
+        dim.kind = DimKind::Free;
+        continue;
+      }
       if (llvm::is_contained(inputBatchingDims, d)) {
         dim.kind = DimKind::Batch;
       } else if (auto *it = llvm::find(scatterDimsToOperandDims, d);
@@ -775,7 +825,7 @@ public:
     }
     Canonical c = canonicalize(dims);
     SmallVector<int64_t> indexBatchingDims;
-    for (int64_t d = 0; d < static_cast<int64_t>(operandShape.size()); ++d) {
+    for (int64_t d = 0; d < originalRank; ++d) {
       if (auto *it = llvm::find(inputBatchingDims, d);
           it != inputBatchingDims.end()) {
         indexBatchingDims.push_back(
@@ -795,13 +845,41 @@ public:
                                             operandType.getElementType());
 
     if (computation->unary != UnaryApply::None) {
-      Value rows = rewriter.create<ttir::RowsGatherOp>(
-          loc, sourceType, table, layout.indices, i64Array(rewriter, c.sizes),
-          i64Array(rewriter, c.windows), rewriter.getBoolAttr(false));
-      rows = applyUnary(rewriter, loc, computation->unary, rows);
-      rewriter.replaceOp(
-          srcOp, scatterRows(rewriter, loc, table, layout.indices, rows, c,
-                             ttcore::ReduceType::Invalid, operandType));
+      auto sizes = i64Array(rewriter, c.sizes);
+      auto windows = i64Array(rewriter, c.windows);
+      auto overwrite = ttcore::ReduceTypeAttr::get(rewriter.getContext(),
+                                                   ttcore::ReduceType::Invalid);
+      if (layout.M > kMaxUnrolledApply) {
+        Value rows = rewriter.create<ttir::RowsGatherOp>(
+            loc, sourceType, table, layout.indices, sizes, windows,
+            rewriter.getBoolAttr(false));
+        rows = applyUnary(rewriter, loc, computation->unary, rows);
+        rewriter.replaceOp(
+            srcOp, scatterRows(rewriter, loc, table, layout.indices, rows, c,
+                               ttcore::ReduceType::Invalid, operandType));
+        return success();
+      }
+      auto indicesType = mlir::cast<RankedTensorType>(layout.indices.getType());
+      auto positionType = indicesType.clone({layout.Bi, 1, indicesType.getDimSize(2)});
+      auto rowsType = sourceType.clone({c.B, c.W, c.R});
+      Value current = table;
+      for (int64_t m = 0; m < layout.M; ++m) {
+        Value position = rewriter.create<ttir::SliceStaticOp>(
+            loc, positionType, layout.indices,
+            rewriter.getI32ArrayAttr({0, static_cast<int32_t>(m), 0}),
+            rewriter.getI32ArrayAttr({static_cast<int32_t>(layout.Bi),
+                                      static_cast<int32_t>(m + 1),
+                                      static_cast<int32_t>(indicesType.getDimSize(2))}),
+            rewriter.getI32ArrayAttr({1, 1, 1}));
+        Value rows = rewriter.create<ttir::RowsGatherOp>(
+            loc, rowsType, current, position, sizes, windows,
+            rewriter.getBoolAttr(false));
+        rows = applyUnary(rewriter, loc, computation->unary, rows);
+        current = rewriter.create<ttir::RowsScatterOp>(
+            loc, current.getType(), current, position, rows, sizes, windows,
+            overwrite);
+      }
+      rewriter.replaceOp(srcOp, untable(rewriter, loc, current, c, operandType));
       return success();
     }
 
@@ -810,7 +888,7 @@ public:
     // dims (those not in update_window_dims) pair with the index dims other
     // than the index vector, in increasing order.
     SmallVector<int64_t> updateScatterDims;
-    for (int64_t u = 0; u < updatesType.getRank(); ++u) {
+    for (int64_t u = 0; u < originalUpdatesRank; ++u) {
       if (!llvm::is_contained(updateWindowDims, u)) {
         updateScatterDims.push_back(u);
       }
@@ -915,6 +993,10 @@ public:
       dim.size = size;
       dim.window = updateShape[d];
       dim.kind = DimKind::Free;
+      // A complex operand's trailing dimension of 2 has no start index.
+      if (static_cast<int64_t>(d) >= adaptor.getStartIndices().size()) {
+        continue;
+      }
       if (updateShape[d] != size) {
         dim.kind = DimKind::Indexed;
         dim.column = columns.size();
