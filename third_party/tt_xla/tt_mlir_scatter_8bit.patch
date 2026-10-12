@@ -1,0 +1,24 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -348,14 +348,19 @@
+   ttnn::TTNNLayoutAttr sourceLayoutAttr =
+       mlir::cast<ttnn::TTNNLayoutAttr>(sourceType.getEncoding());
+ 
++  // 8-bit integer values scatter as zeros; they are widened to Int32 below.
+   auto needsRowMajor = [](ttnn::TTNNLayoutAttr layout,
+                           mlir::RankedTensorType type) {
+     return layout.isTiled() &&
+            (type.getElementType().isF32() || type.getElementType().isBF16() ||
+-            type.getElementType().isInteger(32));
++            type.getElementType().isInteger(32) ||
++            type.getElementType().isInteger(8));
+   };
+ 
+   TTNNOperandWorkarounds inputSourceWorkaround;
++  if (inputType.getElementType().isInteger(8)) {
++    inputSourceWorkaround.tensorDataTypeWorkaround = ttcore::DataType::Int32;
++  }
+   if (needsRowMajor(inputLayoutAttr, inputType) ||
+       needsRowMajor(sourceLayoutAttr, sourceType)) {
+     inputSourceWorkaround.tensorLayoutWorkaround = Layout::RowMajor;
