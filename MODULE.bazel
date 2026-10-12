@@ -340,6 +340,7 @@ http_archive(
         "//third_party/tt_metal:arange_uint8.patch",
         "//third_party/tt_metal:reduce_uint32_max_min.patch",
         "//third_party/tt_metal:sort_nan.patch",
+        "//third_party/tt_metal:packer_identity_nan.patch",
         "//third_party/tt_metal:mulhi_uint32.patch",
     ],
     sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
