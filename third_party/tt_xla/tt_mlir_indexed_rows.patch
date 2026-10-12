@@ -523,16 +523,32 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
  class TTNNLayoutRewriter : public OpInterfaceRewritePattern<ttir::TTIROp> {
  public:
    TTNNLayoutRewriter(MLIRContext *ctx)
-@@ -244,7 +285,7 @@ public:
+@@ -232,9 +273,12 @@ public:
+     for (OpOperand &operand : op->getOpOperands()) {
+ 
+       // If the operand is a BroadcastOp or a ToLayout op do not put a
+-      // ToLayoutOp on its output
+-      if (operand.get().getDefiningOp<ttir::BroadcastOp>() ||
+-          operand.get().getDefiningOp<ttir::ToLayoutOp>()) {
++      // ToLayoutOp on its output, unless it must be row-major: the rows ops
++      // and the views feeding them read row-major pages, and their result
++      // types say so, so a tiled operand would be a lie at runtime.
++      const bool keepRowMajor = keepsRowMajorOperand(op, operand);
++      if (!keepRowMajor && (operand.get().getDefiningOp<ttir::BroadcastOp>() ||
++                            operand.get().getDefiningOp<ttir::ToLayoutOp>())) {
+         continue;
+       }
+ 
+@@ -244,7 +288,7 @@ public:
        // Given the operand constraint, create the desired layout for the operand
        std::optional<Value> desiredLayout = createToLayoutOp(
            rewriter, newLoc, operand.get(), g_defaultMemorySpaceDevice,
 -          /*tiled=*/true);
-+          /*tiled=*/!keepsRowMajorOperand(op, operand));
++          /*tiled=*/!keepRowMajor);
  
        // If layout changed update the operand
        if (desiredLayout) {
-@@ -273,6 +314,9 @@ public:
+@@ -273,6 +317,9 @@ public:
  
  private:
    bool shouldTilizeResult(Operation *op) const {
@@ -542,7 +558,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
  
      // TTNN Reshape does not support implicit tilization/untilization
      // Therefore input output layouts should be the same
-@@ -719,6 +763,25 @@ private:
+@@ -719,6 +766,25 @@ private:
      return false;
    }
  
@@ -568,7 +584,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
    bool shouldForceInputRowMajor(BlockArgument arg) const {
      func::FuncOp owningFunc = cast<func::FuncOp>(arg.getOwner()->getParentOp());
  
-@@ -739,8 +802,11 @@ private:
+@@ -739,8 +805,11 @@ private:
      // convert at the boundary instead: the runtime does it once at bind time
      // rather than on every invocation. Requiring all uses to agree keeps
      // arguments shared with e.g. a matmul tiled.
