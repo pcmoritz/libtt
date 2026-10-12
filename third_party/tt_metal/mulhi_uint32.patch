@@ -1,0 +1,157 @@
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mul_int32.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mul_int32.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mul_int32.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mul_int32.h
+@@ -201,4 +201,35 @@
+ #endif
+ }
+ 
++// High 32 bits of the 64-bit product of two uint32 values. SFPMUL24 multiplies
++// the low 23 bits of its operands; with a = a1 * 2^23 + a0 and lo/hi the low
++// and high 23 bits of a 46-bit product:
++//   mulhi(a, b) = ((lo(a1*b1) + hi(a1*b0) + hi(a0*b1)) << 14)
++//               + ((lo(a1*b0) + lo(a0*b1) + hi(a0*b0)) >> 9)
++template <bool APPROXIMATION_MODE, int ITERATIONS = 8>
++inline void mulhi_uint32(const uint dst_index_in0, const uint dst_index_in1, const uint dst_index_out) {
++    constexpr uint dst_tile_size = 64;
++#pragma GCC unroll 8
++    for (int d = 0; d < ITERATIONS; d++) {
++        TT_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::INT32, ADDR_MOD_7, dst_index_in0 * dst_tile_size);
++        TTI_SFPSHFT((-23) & 0xFFF, p_sfpu::LREG0, p_sfpu::LREG1, 5);  // a1 = a >> 23
++        TT_SFPLOAD(p_sfpu::LREG2, InstrModLoadStore::INT32, ADDR_MOD_7, dst_index_in1 * dst_tile_size);
++        TTI_SFPSHFT((-23) & 0xFFF, p_sfpu::LREG2, p_sfpu::LREG3, 5);  // b1 = b >> 23
++        TTI_SFPMUL24(p_sfpu::LREG1, p_sfpu::LREG3, p_sfpu::LCONST_0, p_sfpu::LREG4, sfpi::SFPMUL24_MOD1_LOWER);
++        TTI_SFPMUL24(p_sfpu::LREG1, p_sfpu::LREG2, p_sfpu::LCONST_0, p_sfpu::LREG5, sfpi::SFPMUL24_MOD1_UPPER);
++        TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG4, sfpi::SFPIADD_MOD1_CC_NONE);
++        TTI_SFPMUL24(p_sfpu::LREG0, p_sfpu::LREG3, p_sfpu::LCONST_0, p_sfpu::LREG5, sfpi::SFPMUL24_MOD1_UPPER);
++        TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG4, sfpi::SFPIADD_MOD1_CC_NONE);
++        TTI_SFPSHFT(14, p_sfpu::LREG4, p_sfpu::LREG4, 5);
++        TTI_SFPMUL24(p_sfpu::LREG1, p_sfpu::LREG2, p_sfpu::LCONST_0, p_sfpu::LREG5, sfpi::SFPMUL24_MOD1_LOWER);
++        TTI_SFPMUL24(p_sfpu::LREG0, p_sfpu::LREG3, p_sfpu::LCONST_0, p_sfpu::LREG6, sfpi::SFPMUL24_MOD1_LOWER);
++        TTI_SFPIADD(0, p_sfpu::LREG6, p_sfpu::LREG5, sfpi::SFPIADD_MOD1_CC_NONE);
++        TTI_SFPMUL24(p_sfpu::LREG0, p_sfpu::LREG2, p_sfpu::LCONST_0, p_sfpu::LREG6, sfpi::SFPMUL24_MOD1_UPPER);
++        TTI_SFPIADD(0, p_sfpu::LREG6, p_sfpu::LREG5, sfpi::SFPIADD_MOD1_CC_NONE);
++        TTI_SFPSHFT((-9) & 0xFFF, p_sfpu::LREG5, p_sfpu::LREG5, 5);
++        TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG4, sfpi::SFPIADD_MOD1_CC_NONE);
++        TT_SFPSTORE(p_sfpu::LREG4, InstrModLoadStore::INT32, ADDR_MOD_6, dst_index_out * dst_tile_size);
++    }
++}
++
+ }  // namespace ckernel::sfpu
+diff --git tt_metal/hw/inc/api/compute/mul_int_sfpu.h tt_metal/hw/inc/api/compute/mul_int_sfpu.h
+--- tt_metal/hw/inc/api/compute/mul_int_sfpu.h
++++ tt_metal/hw/inc/api/compute/mul_int_sfpu.h
+@@ -88,4 +88,12 @@
+ #endif
+ }
+ 
++#ifdef ARCH_BLACKHOLE
++// High 32 bits of the 64-bit product of two UInt32 tiles. Initialize with
++// mul_int_tile_init<DataFormat::UInt32>().
++ALWI void mulhi_uint32_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
++    MATH((SFPU_BINARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, mulhi_uint32, (APPROX), idst0, idst1, odst, VectorMode::RC)));
++}
++#endif
++
+ }  // namespace ckernel
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_types.hpp ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_types.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_types.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_types.hpp
+@@ -44,6 +44,7 @@
+     MINIMUM,
+     GCD,
+     LCM,
++    MULHI,
+     ADDALPHA,
+     SUBALPHA,
+     XLOGY,
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
+@@ -30,6 +30,7 @@
+     DT::BFLOAT16, DT::FLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::INT32, DT::UINT32};
+ 
+ inline constexpr std::array int32_only{DT::INT32};
++inline constexpr std::array uint32_only{DT::UINT32};
+ 
+ // Allowed input (tensor A) dtypes for REQUANT/DEQUANT: an int32 quantized tile, or a
+ // uint8/int8 quantized tile that reaches DST as a zero-extended byte before the SFPU casts it
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp
+@@ -44,6 +44,7 @@
+         case BinaryOpType::LCM:
+         case BinaryOpType::DIV_FLOOR:
+         case BinaryOpType::DIV_TRUNC: return int32_only;
++        case BinaryOpType::MULHI: return uint32_only;
+         case BinaryOpType::REQUANT:
+         case BinaryOpType::DEQUANT: return requant_dequant;
+         case BinaryOpType::LOGADDEXP:
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp
+@@ -66,6 +66,7 @@
+         RSUB,
+         GCD,
+         LCM,
++        MULHI,
+         LEFT_SHIFT,
+         RIGHT_SHIFT,
+         LOGICAL_RIGHT_SHIFT,
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
+@@ -359,6 +359,13 @@
+                 TT_THROW("Unsupported binary op for FPU {}", binary_op_type);
+             }
+             break;
++        case BinaryOpType::MULHI:
++            if (is_sfpu_op()) {
++                binary_op = SfpuBinaryOp::MULHI;
++            } else {
++                TT_THROW("Unsupported binary op for FPU {}", binary_op_type);
++            }
++            break;
+         case BinaryOpType::XLOGY:
+             if (is_sfpu_op()) {
+                 binary_op = SfpuBinaryOp::XLOGY;
+@@ -468,6 +475,7 @@
+             return {"rsub_binary_tile_init();", fmt::format("rsub_binary_tile<{}>", kRneDstRoundingMode)};
+         case GCD: return {"gcd_tile_init();", "gcd_tile"};
+         case LCM: return {"lcm_tile_init();", "lcm_tile"};
++        case MULHI: return {"mul_int_tile_init<DataFormat::UInt32>();", "mulhi_uint32_tile"};
+         case LEFT_SHIFT:
+             return {
+                 "binary_shift_tile_init();",
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+@@ -83,6 +83,7 @@
+                    (a != FLOAT16 || (output != FLOAT32 && output != INT32 && output != UINT32));
+         case LCM:
+         case GCD: return (a == INT32 && b == INT32);
++        case MULHI: return (a == UINT32 && b == UINT32);
+         case LEFT_SHIFT:
+         case RIGHT_SHIFT:
+             return ((a == INT32 || a == UINT32 || a == UINT16) && (b == INT32 || b == UINT32 || b == UINT16));
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/binary.hpp ttnn/cpp/ttnn/operations/eltwise/binary/binary.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/binary.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/binary.hpp
+@@ -510,6 +510,7 @@
+     const std::optional<MemoryConfig>& memory_config = std::nullopt,
+     const std::optional<Tensor>& output = std::nullopt);
+ TTNN_BINARY_OP_TENSOR_TENSOR(logical_right_shift, LOGICAL_RIGHT_SHIFT)
++TTNN_BINARY_OP_TENSOR_TENSOR(mulhi, MULHI)
+ TTNN_BINARY_OP_TENSOR_SCALAR(logical_right_shift, LOGICAL_RIGHT_SHIFT)
+ TTNN_BINARY_OP_TENSOR_TENSOR_BITWISE(bitwise_and, BITWISE_AND)
+ TTNN_BINARY_OP_TENSOR_INT32_BITWISE(bitwise_and, BITWISE_AND)
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/binary.cpp ttnn/cpp/ttnn/operations/eltwise/binary/binary.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/binary.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/binary.cpp
+@@ -1260,6 +1260,7 @@
+ TTNN_BINARY_OP_TENSOR_SCALAR_IMPL(squared_difference, SQUARED_DIFFERENCE)
+ TTNN_BINARY_OP_INPLACE_IMPL(squared_difference_, SQUARED_DIFFERENCE)
+ TTNN_BINARY_OP_TENSOR_TENSOR_IMPL(logical_right_shift, LOGICAL_RIGHT_SHIFT)
++TTNN_BINARY_OP_TENSOR_TENSOR_IMPL(mulhi, MULHI)
+ TTNN_BINARY_OP_TENSOR_SCALAR_IMPL(logical_right_shift, LOGICAL_RIGHT_SHIFT)
+ TTNN_BINARY_OP_TENSOR_TENSOR_BITWISE_IMPL(bitwise_and, BITWISE_AND)
+ TTNN_BINARY_OP_TENSOR_INT32_BITWISE_IMPL(bitwise_and, BITWISE_AND)
