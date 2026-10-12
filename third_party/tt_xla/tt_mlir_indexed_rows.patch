@@ -60,7 +60,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -3953,6 +3953,54 @@ def TTNN_GatherOp : TTNN_Op<"gather"> {
+@@ -3951,6 +3951,54 @@ def TTNN_GatherOp : TTNN_Op<"gather"> {
      }];
  }
  
@@ -118,9 +118,9 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
-@@ -276,6 +276,13 @@ public:
-   static TTNNOperandsWorkarounds
-   createGatherOpOperandsWorkarounds(mlir::Operation *op);
+@@ -274,6 +274,13 @@ public:
+   // tt-metal issue: https://github.com/tenstorrent/tt-metal/issues/41451
+   static TTNNOperandsWorkarounds createGatherOpOperandsWorkarounds();
  
 +  // Create workarounds for rows_gather and rows_scatter: the kernels move
 +  // row-major pages as bytes and read int32 indices.
@@ -180,7 +180,7 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -12011,15 +12011,19 @@ static void addClampOpConversionPattern(MLIRContext *ctx,
+@@ -11977,15 +11977,19 @@ static void addClampOpConversionPattern(MLIRContext *ctx,
    patterns.add<StableHLOToTTIROpClampOpConversionPattern>(typeConverter, ctx);
  }
  
@@ -206,7 +206,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  }
  
  static void addIotaOpConversionPattern(MLIRContext *ctx,
-@@ -12033,12 +12037,9 @@ static void addIotaOpConversionPattern(MLIRContext *ctx,
+@@ -11999,12 +12003,9 @@ static void addIotaOpConversionPattern(MLIRContext *ctx,
        typeConverter, ctx);
  }
  
@@ -222,6 +222,88 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  }
  
  static void addReverseOpConversionPattern(MLIRContext *ctx,
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -159,19 +159,26 @@ struct ReverseOpConversionPattern
+     current =
+         rewriter.create<ttir::ReshapeOp>(loc, flatType, current, shapeAttr);
+ 
+-    // Step 3: Create reversed linear indices [N-1, N-2, ..., 0].
+-    SmallVector<int32_t> indices(nReversing);
+-    for (int32_t i = 0; i < nReversing; i++) {
+-      indices[i] = nReversing - 1 - i;
+-    }
+-    auto idxType = RankedTensorType::get(
+-        {nReversing}, rewriter.getIntegerType(32, /*isSigned=*/true));
+-    auto idxAttr = DenseIntElementsAttr::get(idxType, indices);
+-    Value idxConst = rewriter.create<ttir::ConstantOp>(loc, idxType, idxAttr);
+-
+-    // Step 4: EmbeddingOp to reorder rows.
++    // Steps 3 and 4: reorder the rows with a rows gather by the reversed
++    // row indices [N-1, N-2, ..., 0]; every element type moves as bytes.
++    auto rowIdxType = RankedTensorType::get({1, nReversing, 1},
++                                            rewriter.getI32Type());
++    Value reversedRows = rewriter.create<ttir::ArangeOp>(
++        loc, rowIdxType, /*start=*/nReversing - 1, /*end=*/-1, /*step=*/-1,
++        /*arange_dimension=*/1);
++    SmallVector<int64_t> tableShape{1, nReversing, nNonReversing};
++    auto tableType = RankedTensorType::get(
++        tableShape, inputType.getElementType(), inputType.getEncoding());
++    Value table = rewriter.create<ttir::ReshapeOp>(
++        loc, tableType, current,
++        rewriter.getI32ArrayAttr(
++            SmallVector<int32_t>(tableShape.begin(), tableShape.end())));
++    Value reversed = rewriter.create<ttir::RowsGatherOp>(
++        loc, tableType, table, reversedRows,
++        rewriter.getDenseI64ArrayAttr({nReversing}),
++        rewriter.getDenseI64ArrayAttr({1}), rewriter.getBoolAttr(false));
+     current =
+-        rewriter.create<ttir::EmbeddingOp>(loc, flatType, idxConst, current);
++        rewriter.create<ttir::ReshapeOp>(loc, flatType, reversed, shapeAttr);
+ 
+     // Step 5: Reshape back to permuted shape.
+     auto permShapeAttr = rewriter.getI32ArrayAttr(
+@@ -2453,10 +2460,19 @@ struct NegativePadOpDecompositionPattern
+ };
+ } // namespace
+ 
++// ttir.gather, scatter, embedding and embedding_backward onto the rows ops, in
++// libtt's tt_mlir/lib/Conversion/TTIRToTTIRDecomposition/IndexedRowsDecomposition.cpp.
++void populateIndexedRowsDecompositionPatterns(MLIRContext *ctx,
++                                              RewritePatternSet &patterns,
++                                              TypeConverter &typeConverter);
++
+ void populateTTIRToTTIRDecompositionPatterns(MLIRContext *ctx,
+                                              RewritePatternSet &patterns,
+                                              TypeConverter &typeConverter,
+                                              DecompMode decompConfig) {
++  if (decompConfig == DecompMode::TTNN) {
++    populateIndexedRowsDecompositionPatterns(ctx, patterns, typeConverter);
++  }
+   patterns.add<PoolingToFullOp<ttir::MaxPool2dOp>>(typeConverter, ctx);
+   patterns.add<PoolingToFullOp<ttir::AvgPool2dOp>>(typeConverter, ctx);
+   patterns.add<IndexToSliceConversionPattern>(typeConverter, ctx);
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
+@@ -89,6 +89,16 @@ struct TTIRToTTIRDecompositionPass
+       break;
+     }
+ 
++    // Every indexed data movement runs on the indexed-rows kernels (libtt's
++    // IndexedRowsDecomposition.cpp): ttnn.gather, ttnn.scatter and
++    // ttnn.embedding are never emitted.
++    if (decompConfig == DecompMode::TTNN) {
++      target.addIllegalOp<ttir::GatherOp>();
++      target.addIllegalOp<ttir::ScatterOp>();
++      target.addIllegalOp<ttir::EmbeddingOp>();
++      target.addIllegalOp<ttir::EmbeddingBackwardOp>();
++    }
++
+     // These ops have additional conditions regardless of configuration
+     target.addDynamicallyLegalOp<ttir::ArangeOp>([&](ttir::ArangeOp op) {
+       auto shape = op.getResult().getType().getShape();
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
@@ -267,10 +349,21 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  namespace {
  class PermuteOpConversionPattern : public OpConversionPattern<ttir::PermuteOp> {
  public:
-@@ -4156,6 +4191,8 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -4097,8 +4132,6 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            BroadcastOpConversionPattern,
+            PadOpConversionPattern,
+            PowOpConversionPattern,
+-           EmbeddingOpConversionPattern,
+-           EmbeddingBackwardOpConversionPattern,
+            RepeatOpConversionPattern,
+            CumSumOpConversionPattern,
+            CumProdOpConversionPattern,
+@@ -4154,8 +4187,8 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            PagedUpdateCacheOpConversionPattern,
+            SamplingOpConversionPattern,
             FillCacheOpConversionPattern,
-            ScatterOpConversionPattern,
-            GatherOpConversionPattern,
+-           ScatterOpConversionPattern,
+-           GatherOpConversionPattern,
 +           RowsGatherOpConversionPattern,
 +           RowsScatterOpConversionPattern,
             PermuteOpConversionPattern,
@@ -292,7 +385,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/HoistCPUOps/CPUHoistNonLowerableSHLOOps
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -327,6 +327,45 @@ TTNNOperandsWorkaroundsFactory::createGatherOpOperandsWorkarounds(
+@@ -311,6 +311,45 @@ TTNNOperandsWorkaroundsFactory::createGatherOpOperandsWorkarounds() {
        .addOutputOperandWorkaround(TTNNOperandWorkarounds()); // result
  }
  

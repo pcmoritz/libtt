@@ -1,4 +1,8 @@
 #include "ttnn/operations/ccl/ccl_common.hpp"
+#include "ttnn/operations/data_movement/gather/gather.hpp"
+#include "ttnn/operations/data_movement/scatter/scatter.hpp"
+#include "ttnn/operations/embedding/embedding.hpp"
+#include "ttnn/operations/embedding_backward/embedding_backward.hpp"
 #include "ttnn/operations/ccl/ccl_op_fusion.hpp"
 #include "ttnn/operations/experimental/ccl/ring_attention_all_gather_async/device/ring_attention_all_gather_async_device_operation.hpp"
 #include "ttnn/operations/experimental/ccl/ring_attention_all_gather_async/device/ring_attention_all_gather_async_multi_core_with_workers_program_factory.hpp"
@@ -22,6 +26,34 @@ namespace {
 } // namespace
 
 namespace ttnn {
+// The compiler lowers every gather, scatter and embedding onto libtt's
+// rows_gather and rows_scatter; these ops' kernels are not built. tt-mlir's op
+// model still references their entry points.
+Tensor gather(
+    const Tensor &, int8_t, const Tensor &, bool,
+    const std::optional<tt::tt_metal::MemoryConfig> &, std::optional<Tensor>,
+    const std::optional<CoreRangeSet> &) {
+  unsupported("ttnn::gather");
+}
+Tensor scatter(const Tensor &, const int32_t &, const Tensor &, const Tensor &,
+               const std::optional<MemoryConfig> &,
+               const std::optional<std::string> &,
+               const std::optional<CoreRangeSet> &) {
+  unsupported("ttnn::scatter");
+}
+Tensor embedding(const Tensor &, const Tensor &, const std::optional<int> &,
+                 const std::optional<Layout> &, ttnn::prim::EmbeddingsType,
+                 std::optional<const DataType>,
+                 const std::optional<MemoryConfig> &,
+                 const std::optional<Tensor> &) {
+  unsupported("ttnn::embedding");
+}
+Tensor embedding_bw(const Tensor &, const Tensor &, const Tensor &,
+                    std::optional<const DataType>,
+                    const std::optional<MemoryConfig> &,
+                    const std::optional<Tensor> &) {
+  unsupported("ttnn::embedding_bw");
+}
 
 void ring_attention_all_gather_async_multi_core_with_workers_helper(
     tt::tt_metal::ProgramDescriptor &, const std::vector<Tensor> &,

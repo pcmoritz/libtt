@@ -9,6 +9,10 @@
 #include "operations/ccl/reduce_scatter.h"
 #include "operations/ccl/selective_reduce_combine.h"
 #include "operations/cpu/cpu.h"
+#include "operations/data_movement/gather.h"
+#include "operations/data_movement/scatter.h"
+#include "operations/embedding/embedding.h"
+#include "operations/embedding/embedding_backward.h"
 #include "operations/experimental/gelu_bw.h"
 #include "operations/kv_cache/update_cache.h"
 #include "operations/normalization/distributed_rms_norm.h"
@@ -43,6 +47,30 @@ namespace {
 }
 
 } // namespace
+
+// The compiler lowers every gather, scatter and embedding onto rows_gather and
+// rows_scatter (libtt's indexed-rows kernels); these ops are never emitted and
+// their ttnn kernels are not built.
+namespace tt::runtime::ttnn::operations::data_movement {
+void run(const ::tt::target::ttnn::GatherOp *, ProgramContext &) {
+  unsupported("ttnn.gather");
+}
+void run(const ::tt::target::ttnn::ScatterOp *, ProgramContext &) {
+  unsupported("ttnn.scatter");
+}
+} // namespace tt::runtime::ttnn::operations::data_movement
+
+namespace tt::runtime::ttnn::operations::embedding {
+void run(const ::tt::target::ttnn::EmbeddingOp *, ProgramContext &) {
+  unsupported("ttnn.embedding");
+}
+} // namespace tt::runtime::ttnn::operations::embedding
+
+namespace tt::runtime::ttnn::operations::embedding_backward {
+void run(const ::tt::target::ttnn::EmbeddingBackwardOp *, ProgramContext &) {
+  unsupported("ttnn.embedding_backward");
+}
+} // namespace tt::runtime::ttnn::operations::embedding_backward
 
 namespace tt::runtime::ttnn::operations::ccl {
 

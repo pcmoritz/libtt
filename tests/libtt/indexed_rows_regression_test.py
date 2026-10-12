@@ -246,3 +246,65 @@ def test_empty_updates():
     x = np.arange(20, dtype=np.float32).reshape(4, 5)
     idx = np.zeros((0,), np.int32)
     assert_equal(run(lambda x, i: x.at[i].set(jnp.zeros((0, 5), jnp.float32)), x, idx), x)
+
+
+def _compile_ir(tmp_path, fn, *args):
+    # The TTNN IR the plugin exports for a program.
+    device = jax.devices("tt")[0]
+    options = dict(
+        OPTIONS,
+        export_path=str(tmp_path),
+        export_model_name="routing",
+        export_tensors="false",
+    )
+    compiled = jax.jit(fn, compiler_options=options)
+    result = np.asarray(compiled(*[jax.device_put(a, device) for a in args]))
+    (ir,) = (tmp_path / "irs").glob("ttnn_runtime_routing_*.mlir")
+    return result, ir.read_text()
+
+
+@pytest.mark.parametrize(
+    "name,fn,args",
+    [
+        (
+            "embedding",
+            lambda t, i: jnp.take(t, i, axis=0, mode="clip"),
+            (np.ones((40, 64), jnp.bfloat16), np.array([3, 7], np.int32)),
+        ),
+        (
+            "flip",
+            lambda x: jnp.flip(x, axis=0),
+            (np.arange(96, dtype=np.float32).reshape(12, 8),),
+        ),
+        (
+            "flip_int",
+            lambda x: jnp.flip(x, axis=1),
+            (np.arange(96, dtype=np.int32).reshape(12, 8),),
+        ),
+        (
+            "scatter",
+            lambda x, i, v: x.at[i].set(v),
+            (np.zeros((16, 8), np.float32), np.array([1, 5], np.int32), np.ones((2, 8), np.float32)),
+        ),
+        (
+            "dynamic_update_slice",
+            lambda x, u: jax.lax.dynamic_update_slice(x, u, (2, 0)),
+            (np.zeros((16, 8), np.float32), np.ones((1, 8), np.float32)),
+        ),
+        (
+            "max_pool_grad",
+            lambda x: jax.grad(lambda x: jnp.sum(jax.lax.reduce_window(x, -jnp.inf, jax.lax.max, (1, 2, 2, 1), (1, 2, 2, 1), "VALID")))(x),
+            (np.random.default_rng(0).normal(size=(1, 8, 8, 4)).astype(np.float32),),
+        ),
+    ],
+)
+def test_indexed_moves_run_on_rows_kernels(tmp_path, name, fn, args):
+    # Nothing is routed through ttnn.embedding, ttnn.gather or ttnn.scatter,
+    # whose kernels are not built: every indexed move is a rows op.
+    result, ir = _compile_ir(tmp_path, fn, *args)
+    for op in ('"ttnn.embedding"', '"ttnn.gather"', '"ttnn.scatter"', '"ttnn.embedding_backward"'):
+        assert op not in ir, (name, op)
+    assert '"ttnn.rows_gather"' in ir or '"ttnn.rows_scatter"' in ir, name
+    cpu = jax.devices("cpu")[0]
+    want = np.asarray(jax.jit(fn)(*[jax.device_put(a, cpu) for a in args]))
+    assert_equal(result, want)
