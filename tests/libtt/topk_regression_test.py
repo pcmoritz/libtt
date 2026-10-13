@@ -68,10 +68,23 @@ def test_top_k_ignores_width_padding(dtype, rows):
 
 
 @pytest.mark.parametrize("dtype", [np.float32, "bfloat16"])
-@pytest.mark.parametrize("shape,k", [((128,), 8), ((1, 128), 8), ((2, 3, 128), 5), ((2, 1, 3, 4, 64), 6)])
+@pytest.mark.parametrize(
+    "shape,k",
+    [
+        ((128,), 8),
+        ((1, 128), 8),
+        ((2, 3, 128), 5),
+        ((2, 1, 3, 4, 64), 6),
+        # Past the selection path's k at this width: the sort networks run k = 64 and the result is trimmed.
+        ((128,), 33),
+        ((1, 128), 33),
+        ((2, 3, 128), 33),
+    ],
+)
 def test_top_k_of_any_rank_keeps_k_columns(dtype, shape, k):
-    """A k below a tile's width runs as one tile of columns and keeps the first
-    k as the logical width, whatever the rank around the last dim."""
+    """The result has k columns whatever the rank around the last dim. The
+    selection path writes k; the sort networks write whole tiles of columns,
+    and the result keeps the first k as its logical width."""
     rng = np.random.default_rng(len(shape) * 31 + k)
     x = rng.integers(-4, 5, shape).astype(np.float32).astype(dtype)
     values, indices = jax.jit(lambda a: lax.top_k(a, k))(jax.device_put(x, jax.devices("tt")[0]))
