@@ -39,16 +39,14 @@ protected:
     }
 };
 
-TEST_F(TopKSelectPlanTest, FewerSegmentsLeaveCoresToRowGroups) {
-    // One segment per 16 tiles makes 64 segments of one row group, and a group's first-segment core would gather
-    // 32 rows x 64 segments x 64 candidates, 1 MiB. The 64 KiB candidate limit allows 4 segments, which leaves 16
-    // cores per segment for row groups of 2 rows: 64 KiB of input and 4 KiB of candidates per core.
+TEST_F(TopKSelectPlanTest, RowsGetTheirOwnCoresFirst) {
+    // 32 rows on 64 cores: each row gets two cores, as two segments of 512 tiles, and each core scans one row.
     const auto split = plan(32, 32768, 64, 64);
     ASSERT_TRUE(split.has_value());
-    EXPECT_EQ(split->segments, 4u);
-    EXPECT_EQ(split->segment_tiles, 256u);
-    EXPECT_EQ(split->row_groups, 16u);
-    EXPECT_EQ(split->rows_per_core, 2u);
+    EXPECT_EQ(split->segments, 2u);
+    EXPECT_EQ(split->segment_tiles, 512u);
+    EXPECT_EQ(split->row_groups, 32u);
+    EXPECT_EQ(split->rows_per_core, 1u);
 }
 
 }  // namespace
