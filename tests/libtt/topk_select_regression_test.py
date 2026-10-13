@@ -82,3 +82,19 @@ def test_top_k_selection_orders_nan_inf_and_signed_zeros(dtype, width):
 def test_top_k_selection_all_equal(dtype):
     """Every value tied: the first k indices, in order."""
     check(np.full((2, 3000), 1.5, np.float32).astype(dtype), 9)
+
+
+@pytest.mark.parametrize("level", ["O0", "O1"])
+def test_top_k_int32_indices_need_no_typecast(level, tmp_path):
+    # 32-bit indices come out of ttnn.topk as int32, lax.top_k's dtype, with no typecast after it. At O1
+    # the optimizer checks the op's output types against ttnn's own.
+    x = np.random.default_rng(0).standard_normal((1, 128)).astype(np.float32)
+    options = {"optimization_level": level, "export_path": str(tmp_path)}
+    f = jax.jit(lambda a: lax.top_k(a, 8), compiler_options=options)
+    values, indices = f(jax.device_put(x, jax.devices("tt")[0]))
+    want_values, want_indices = reference(x, 8)
+    np.testing.assert_array_equal(np.asarray(indices), want_indices)
+    np.testing.assert_array_equal(np.asarray(values), want_values)
+    ir = "\n".join(path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir"))
+    assert "ttnn.topk" in ir
+    assert "ttnn.typecast" not in ir
