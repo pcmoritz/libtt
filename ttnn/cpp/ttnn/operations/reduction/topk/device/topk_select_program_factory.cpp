@@ -76,18 +76,24 @@ std::optional<TopKSelectPlan> topk_select_plan(
     }
     const uint32_t per_tile_row = cores / plan.tile_rows;
     const uint32_t rows = plan.rows();
-    plan.segments = std::min(per_tile_row, div_up(plan.Wt, min_segment_tiles));
-    plan.segment_tiles = div_up(plan.Wt, plan.segments);
-    plan.segments = div_up(plan.Wt, plan.segment_tiles);
-    plan.row_groups = std::max(1u, std::min(rows, per_tile_row / plan.segments));
-    plan.rows_per_core = div_up(rows, plan.row_groups);
-    // A group's first-segment core gathers k candidates per row and segment.
-    const uint32_t max_segments = max_candidate_bytes / (plan.rows_per_core * list_stride(k) * candidate_bytes);
-    if (plan.segments > max_segments) {
-        plan.segment_tiles = div_up(plan.Wt, std::max(1u, max_segments));
+    // Splits the width into about `segments` segments and gives the tile row's
+    // remaining cores to row groups.
+    const auto split = [&](uint32_t segments) {
+        plan.segment_tiles = div_up(plan.Wt, segments);
         plan.segments = div_up(plan.Wt, plan.segment_tiles);
+        plan.row_groups = std::max(1u, std::min(rows, per_tile_row / plan.segments));
+        plan.rows_per_core = div_up(rows, plan.row_groups);
+    };
+    split(std::min(per_tile_row, div_up(plan.Wt, min_segment_tiles)));
+    // A group's first-segment core gathers k candidates per row and segment.
+    const uint32_t list_bytes = list_stride(k) * candidate_bytes;
+    const uint32_t max_segments = max_candidate_bytes / (plan.rows_per_core * list_bytes);
+    if (plan.segments > max_segments) {
+        // Fewer segments free cores for more row groups, with fewer rows each.
+        split(std::max(1u, max_segments));
     }
-    if (plan.rows_per_core * plan.segment_tiles * 2 * face_row_read_bytes > max_input_bytes) {
+    if (plan.rows_per_core * plan.segments * list_bytes > max_candidate_bytes ||
+        plan.rows_per_core * plan.segment_tiles * 2 * face_row_read_bytes > max_input_bytes) {
         return std::nullopt;
     }
     return plan;

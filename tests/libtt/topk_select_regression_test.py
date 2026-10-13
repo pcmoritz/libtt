@@ -55,6 +55,8 @@ def check(x, k):
         ((1, 151936), 20),
         ((8, 50000), 5),
         ((3, 4097), 64),
+        # Too many candidates for one core per row: fewer segments, more row groups.
+        ((32, 32768), 64),
         # Several [H, W] slabs.
         ((2, 3, 4096), 7),
     ],
