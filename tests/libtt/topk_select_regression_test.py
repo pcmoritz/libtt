@@ -68,16 +68,59 @@ def test_top_k_selection(dtype, shape, k):
     check(x, k)
 
 
+# Special values by their bits as float32 and as bfloat16. lax.top_k on CPU returns bfloat16 NaNs with the
+# canonical payload, so only float32 carries the other NaN payloads.
+SPECIALS = {
+    "+nan": (0x7FC00000, 0x7FC0),
+    "+nan2": (0x7FC00123, 0x7FC0),
+    "+snan": (0x7F800001, 0x7FC0),
+    "-nan": (0xFFC00000, 0xFFC0),
+    "-nan2": (0xFFC00123, 0xFFC0),
+    "+inf": (0x7F800000, 0x7F80),
+    "-inf": (0xFF800000, 0xFF80),
+    "+max": (0x7F7FFFFF, 0x7F7F),
+    "-max": (0xFF7FFFFF, 0xFF7F),
+    "+1": (0x3F800000, 0x3F80),
+    "-1": (0xBF800000, 0xBF80),
+    "+den": (0x00000001, 0x0001),
+    "-den": (0x80000001, 0x8001),
+    "+0": (0x00000000, 0x0000),
+    "-0": (0x80000000, 0x8000),
+}
+
+
+def specials(names, dtype):
+    if dtype == np.float32:
+        return np.array([SPECIALS[n][0] for n in names], np.uint32).view(np.float32)
+    return np.array([SPECIALS[n][1] for n in names], np.uint16).view(jnp.bfloat16)
+
+
 @pytest.mark.parametrize("dtype", [np.float32, "bfloat16"])
-@pytest.mark.parametrize("width", [128, 5000])
-def test_top_k_selection_orders_nan_inf_and_signed_zeros(dtype, width):
-    rng = np.random.default_rng(width)
-    x = rng.standard_normal((2, width)).astype(np.float32)
-    specials = [np.nan, -np.nan, np.inf, -np.inf, 0.0, -0.0, 0.0, -0.0, np.nan]
-    for row in range(2):
-        cols = rng.choice(width, len(specials), replace=False)
-        x[row, cols] = specials
-    check(x.astype(dtype), 12)
+def test_top_k_selection_orders_special_values(dtype):
+    """Rows of only special values, each at least twice, and k one below the width: all of lax.top_k's order but
+    the lowest value, ties by index. (k equal to the width compiles to a full sort, not top_k.)"""
+    names = list(SPECIALS) * 2 + ["+0", "-0", "-nan2"]
+    rng = np.random.default_rng(0)
+    check(np.stack([specials(rng.permutation(names), dtype) for _ in range(3)]), len(names) - 1)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, "bfloat16"])
+def test_top_k_selection_boundary_among_zeros_and_nans(dtype):
+    """The 12th of 5000 values, in rows split into segments, is a -0.0 in the first row and a -NaN in the
+    second, with more of each left out: signed zeros, -inf and -NaN are ranked against each other and by
+    index across segments."""
+    width = 5000
+    zeros = ["-1"] * width
+    for col, name in {4900: "+nan", 3: "+inf", 777: "+max", 2500: "+1", 1200: "+den"}.items():
+        zeros[col] = name
+    for col in (4000, 100, 3300, 2100):
+        zeros[col] = "+0"
+    for col in (10, 4500, 600, 1700, 2900, 4999):
+        zeros[col] = "-0"
+    nans = ["-nan2"] * width
+    for col, name in {4321: "-nan", 50: "-nan", 2600: "-nan", 1000: "-inf", 3999: "-inf", 2222: "-1", 4444: "-0"}.items():
+        nans[col] = name
+    check(np.stack([specials(zeros, dtype), specials(nans, dtype)]), 12)
 
 
 @pytest.mark.parametrize("dtype", [np.float32, "bfloat16"])
