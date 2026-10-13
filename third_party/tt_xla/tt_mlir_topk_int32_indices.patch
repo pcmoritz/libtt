@@ -1,0 +1,27 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -2049,8 +2049,8 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
+ // Factory method to create a set of workarounds for topk op.
+ // This operation returns two outputs:
+ //   [0] values (same data type as input)
+-//   [1] indices (uint16 or uint32 depending on input shape)
+-// TopK op pads the dimension to tile size, and uses UInt32 for indices if
++//   [1] indices (uint16 or int32 depending on input shape)
++// TopK op pads the dimension to tile size, and uses Int32 for indices if
+ // padded dimension size > uint16_t::max
+ 
+ // Float16 and unsupported 32-bit integers use Float32; other unsupported types use BFloat16.
+@@ -2097,9 +2097,9 @@ TTNNOperandsWorkaroundsFactory::createTopKOpOperandsWorkarounds(
+   if (useUint16Indices) {
+     outputIndicesWorkaround.tensorDataTypeWorkaround = ttcore::DataType::UInt16;
+   } else {
+-    // If the dimension size exceeds uint16 max, we need to use uint32 for
+-    // indices.
+-    outputIndicesWorkaround.tensorDataTypeWorkaround = ttcore::DataType::UInt32;
++    // Otherwise ttnn.topk returns int32 indices, the type of JAX's top_k
++    // indices, so no typecast follows.
++    outputIndicesWorkaround.tensorDataTypeWorkaround = ttcore::DataType::Int32;
+   }
+ 
+   return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()

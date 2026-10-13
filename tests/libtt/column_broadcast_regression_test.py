@@ -4,7 +4,9 @@ tile takes its first value. The fill writes the left faces (rows 0 to 15 of
 faces 0 and 2) and copies them onto the right faces. Every row has its own
 value here, so a row taken from the wrong face or position changes the result;
 17 rows cross the boundary between faces 0 and 2, 40 rows take two tile rows,
-and results in columns 16 and up come from the copied right faces.
+and results in columns 16 and up come from the copied right faces. A tile
+row with at most 16 rows of data writes each of them into both top faces
+instead, and leaves the padding rows unfilled.
 """
 
 import jax
@@ -43,3 +45,20 @@ def test_add_column(rows, dtype):
     column = (np.arange(rows) - rows // 2).reshape(rows, 1).astype(dtype)
     actual = jax.jit(lambda x, c: x * 2 + c * 3)(*jax.device_put((x, column), jax.devices("tt")[0]))
     np.testing.assert_array_equal(np.asarray(actual), (x * 2 + column * 3).astype(dtype))
+
+
+@pytest.mark.parametrize("rows", [1, 5, 17, 40])
+@pytest.mark.parametrize("dtype", [jnp.int32, jnp.float32, jnp.bfloat16])
+def test_where_column_operands(rows, dtype):
+    # A column predicate and a column false value, as a MoE router masks its
+    # expert ids: the where reads both as column broadcasts. The operands are
+    # computed on the device, so they are tiles.
+    rng = np.random.default_rng(200 + rows)
+    x = rng.integers(-100, 100, (rows, 40)).astype(dtype)
+    m = rng.integers(-1, 2, rows).astype(dtype)
+    c = (np.arange(rows) - rows // 2).astype(dtype)
+    actual = jax.jit(lambda x, m, c: jnp.where((m > 0)[:, None], x, (c * 2)[:, None]))(
+        *jax.device_put((x, m, c), jax.devices("tt")[0])
+    )
+    expected = np.where((m > 0)[:, None], x, (c * 2)[:, None]).astype(dtype)
+    np.testing.assert_array_equal(np.asarray(actual), expected)
