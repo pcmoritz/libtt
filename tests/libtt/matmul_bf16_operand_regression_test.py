@@ -10,7 +10,11 @@ both operands cast, the casts stay: dropping both would make the matmul a BF16
 one.
 
 At the highest precision the matmul runs on the vector unit, which reads FP32
-operands only, so tt-mlir keeps every cast.
+operands only, so tt-mlir keeps the cast of a BF16 operand next to an FP32 one.
+With both operands cast from BF16 it drops both casts and runs the matmul on
+the matrix unit at its FP32 fidelity, which multiplies BF16 values exactly, as
+a TPU does at the highest precision: the result equals that of an FP32 matmul
+of the same values at the default precision.
 """
 
 import jax
@@ -31,23 +35,29 @@ def test_matmul_reads_bf16_operand(m, k, n, a_dtype, b_dtype, optimization_level
     b = (rng.standard_normal((k, n)) / np.sqrt(k)).astype(np.float32).astype(b_dtype)
     device = jax.devices("tt")[0]
 
-    def matmul(x, w):
-        return jnp.dot(x.astype(jnp.float32), w.astype(jnp.float32), precision=getattr(lax.Precision, precision))
+    def run(x, w, export_path, precision):
+        def matmul(x, w):
+            return jnp.dot(x.astype(jnp.float32), w.astype(jnp.float32), precision=getattr(lax.Precision, precision))
 
-    def run(x, w, export_path):
         options = {"optimization_level": optimization_level, "export_path": str(export_path)}
         return np.asarray(jax.jit(matmul, compiler_options=options)(jax.device_put(x, device), jax.device_put(w, device)))
 
-    got = run(a, b, tmp_path / "cast")
+    both_bf16 = a_dtype == b_dtype == "bfloat16"
+    got = run(a, b, tmp_path / "cast", precision)
     assert got.dtype == np.float32
-    want = run(np.asarray(a, np.float32), np.asarray(b, np.float32), tmp_path / "fp32")
+    want_precision = "DEFAULT" if both_bf16 else precision
+    want = run(np.asarray(a, np.float32), np.asarray(b, np.float32), tmp_path / "fp32", want_precision)
     np.testing.assert_array_equal(got, want)
 
     ir = "\n".join(path.read_text() for path in (tmp_path / "cast" / "irs").glob("ttnn_[0-9]*.mlir"))
     assert ir, "no IR was exported"
     casts = ir.count('"ttnn.typecast"')
-    if precision == "HIGHEST":
-        assert casts == [a_dtype, b_dtype].count("bfloat16"), "a cast of a BF16 operand of the exact matmul was dropped"
+    if precision == "HIGHEST" and both_bf16:
+        assert casts == 0, "a cast of the BF16 operands was kept"
+        assert "ttcore.fp32_exact" not in ir, "the BF16 matmul still runs on the vector unit"
+        assert "math_fidelity = hifi4" in ir and "fp32_dest_acc_en = true" in ir
+    elif precision == "HIGHEST":
+        assert casts == 1, "the cast of the BF16 operand of the exact matmul was dropped"
     elif "float32" in (a_dtype, b_dtype):
         assert casts == 0, "the BF16 operand was still cast"
     else:

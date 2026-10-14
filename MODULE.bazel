@@ -583,6 +583,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_reduce_uint32_max_min.patch",
         "//third_party/tt_xla:tt_mlir_chlo_mulhi.patch",
         "//third_party/tt_xla:tt_mlir_topk_int32_indices.patch",
+        "//third_party/tt_xla:tt_mlir_highest_bf16_matmul.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

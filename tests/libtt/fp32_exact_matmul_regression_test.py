@@ -136,3 +136,30 @@ def test_exact_matmul_layouts_at_o2(tmp_path):
     for line in matmuls:
         for alias in re.findall(r"tensor<[^>]*?, (#ttnn_layout\d*)>", line):
             assert "sharded" not in layouts[alias], f"an exact matmul got a sharded layout: {layouts[alias]}"
+
+
+@pytest.mark.parametrize("weight_dtype", ["bf16", "bfp_bf8"])
+def test_exact_matmul_with_narrowed_weight(weight_dtype, tmp_path):
+    """A weight converted to a narrower dtype on request runs on the matrix unit at its FP32 fidelity.
+
+    The vector-unit kernel reads FP32 operands only, so an FP32 router gate annotated BF8 by the
+    serving backend and applied at the highest precision used to stop in matmul_fp32.
+    """
+    rng = np.random.default_rng(6)
+    a = rng.standard_normal((1, 2048)).astype(np.float32)
+    b = (rng.standard_normal((2048, 128)) / np.sqrt(2048)).astype(np.float32)
+    device = jax.devices("tt")[0]
+
+    def gate(x, w):
+        w = jax.ffi.ffi_call("tt.weight_dtype_override", jax.ShapeDtypeStruct(w.shape, w.dtype))(
+            w, **{"ttcore.weight_dtype": weight_dtype}
+        )
+        return jnp.dot(x, w, precision=lax.Precision.HIGHEST)
+
+    f = jax.jit(gate, compiler_options={"optimization_level": "O1", "export_path": str(tmp_path)})
+    got = np.asarray(f(jax.device_put(a, device), jax.device_put(b, device)))
+    # BF8 keeps 7 mantissa bits per value; the products and sums stay close to FP32.
+    assert error(got, a, b) <= 1e-2, f"the matmul is off by {error(got, a, b):.3g}"
+    ir = ttnn_ir(tmp_path)
+    assert "ttcore.fp32_exact" not in ir, "the narrowed weight still went to the vector unit"
+    assert "math_fidelity = hifi4" in ir and "fp32_dest_acc_en = true" in ir

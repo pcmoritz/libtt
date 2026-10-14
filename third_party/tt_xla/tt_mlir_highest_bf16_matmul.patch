@@ -1,0 +1,93 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -546,6 +546,13 @@ public:
+ // cast is exact and the matmul unpacks each operand from its own format. TTNN
+ // picks the same fidelity for an FP32 input with a BF16 one as for two FP32
+ // inputs, so the result is the same without the cast's program.
++//
++// At the highest precision, a matmul of two BF16 tensors cast up to FP32, such
++// as a BF16 router gate applied to BF16 hidden states, reads both directly:
++// the matrix unit at full fidelity multiplies BF16 values exactly, as a TPU
++// does at the highest precision, and TTNNSetComputeKernelConfig runs it there
++// with FP32 accumulation instead of on the vector unit. With one FP32
++// operand, the vector unit's FP32 products need both operands in FP32.
+ class MatmulBF16OperandCastPattern : public mlir::OpRewritePattern<MatmulOp> {
+   using mlir::OpRewritePattern<MatmulOp>::OpRewritePattern;
+ 
+@@ -553,10 +560,6 @@ public:
+   mlir::LogicalResult
+   matchAndRewrite(MatmulOp matmulOp,
+                   mlir::PatternRewriter &rewriter) const final {
+-    // The vector-unit kernel of an exact FP32 matmul reads FP32 operands only.
+-    if (matmulOp->hasAttr("ttcore.fp32_exact")) {
+-      return mlir::failure();
+-    }
+     auto isF32 = [](mlir::Value value) {
+       return mlir::cast<mlir::RankedTensorType>(value.getType())
+           .getElementType()
+@@ -578,6 +581,16 @@ public:
+     };
+     mlir::Value a = bf16Source(matmulOp.getA());
+     mlir::Value b = bf16Source(matmulOp.getB());
++    if (matmulOp->hasAttr("ttcore.fp32_exact")) {
++      if (!a || !b) {
++        return mlir::failure();
++      }
++      rewriter.modifyOpInPlace(matmulOp, [&] {
++        matmulOp.getAMutable().assign(a);
++        matmulOp.getBMutable().assign(b);
++      });
++      return mlir::success();
++    }
+     // Exactly one: with both cast, the matmul would run in BF16.
+     if (bool(a) == bool(b)) {
+       return mlir::failure();
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp b/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
+@@ -45,6 +45,36 @@ void applyLargeInnerDimBf16MatmulConfig(OpTy op,
+   config = config.withPackerL1Acc(true);
+ }
+ 
++// A matmul at the highest precision (ttcore.fp32_exact) runs on the vector
++// unit, ttnn::experimental::matmul_fp32, which reads FP32 operands only. Once
++// an operand is narrower, a BF16 tensor whose cast to FP32 was dropped or a
++// weight converted to a narrower dtype on request, it runs on the matrix unit
++// at full fidelity with FP32 accumulation instead. The matrix unit then
++// multiplies BF16 values exactly, as a TPU does at the highest precision.
++// This runs after the weight dtype conversion and before the analysis passes,
++// so it sees the final operand dtypes and the optimizer sees the config.
++void applyNarrowedExactMatmulConfig(MatmulOp op,
++                                    DeviceComputeKernelConfigAttr &config) {
++  if (!op->hasAttr("ttcore.fp32_exact")) {
++    return;
++  }
++  auto isF32 = [](mlir::Value value) {
++    auto type = mlir::cast<RankedTensorType>(value.getType());
++    if (auto layout =
++            mlir::dyn_cast_or_null<TTNNLayoutAttr>(type.getEncoding())) {
++      return layout.getDataType() == ttcore::DataType::Float32;
++    }
++    return type.getElementType().isF32();
++  };
++  if (isF32(op.getA()) && isF32(op.getB())) {
++    return;
++  }
++  op->removeAttr("ttcore.fp32_exact");
++  config = config.withMathFidelity(MathFidelity::HiFi4)
++               .withFp32DestAccEn(true)
++               .withMathApproxMode(false);
++}
++
+ } // namespace
+ 
+ #define GEN_PASS_DEF_TTNNSETCOMPUTEKERNELCONFIG
+@@ -160,6 +190,7 @@ public:
+       // This fix is required for correctness of large matmuls/linears.
+       if (auto matmulOp = dyn_cast<MatmulOp>(op)) {
+         applyLargeInnerDimBf16MatmulConfig(matmulOp, config);
++        applyNarrowedExactMatmulConfig(matmulOp, config);
+       } else if (auto linearOp = dyn_cast<LinearOp>(op)) {
+         applyLargeInnerDimBf16MatmulConfig(linearOp, config);
+       }
