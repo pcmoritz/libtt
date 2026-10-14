@@ -1,7 +1,56 @@
 diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
 --- tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
 +++ tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h
-@@ -900,21 +900,44 @@
+@@ -202,6 +202,48 @@
+     set_dst_write_addr(0);
+ }
+ 
++// BFloat16 values sorted in 32-bit DEST travel as raw 16-bit words, since an FPU load would widen
++// them through SrcA, which turns NaN into infinity. A raw word copied or transposed into 32-bit DEST
++// lands in the low half with stale bits above it: widen it in place to the float32 bits of its
++// bfloat16 value. Runs on MATH while DEST is acquired, after the load has drained.
++inline void _topk_bf16_raw_to_fp32_tile_(std::uint32_t dst_tile_index)
++{
++    TOPK_SFPENCC_ALL_LANES_ON(); // the constant write and the strip sweep are lane-predicated
++    sfpi::vConstIntPrgm0 = TOPK_LO16_MASK;
++    TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
++    set_dst_write_addr(0);
++    TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
++    const std::uint32_t base = dst_tile_index * 64;
++    for (std::uint32_t off = 0; off < 64; off += 2)
++    {
++        TT_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::INT32, ADDR_MOD_7, base + off);
++        TTI_SFPAND(0, p_sfpu::LREG12, p_sfpu::LREG0, 0);
++        TTI_SFPSHFT(16, p_sfpu::LREG0, p_sfpu::LREG0, 5); // << 16
++        TT_SFPSTORE(p_sfpu::LREG0, InstrModLoadStore::INT32, ADDR_MOD_7, base + off);
++    }
++    set_dst_write_addr(0);
++}
++
++// Inverse of _topk_bf16_raw_to_fp32_tile_ before packing to a raw 16-bit buffer: the high 16 bits of
++// each float32 word, in the half the 16-bit pack reads (SFPSTORE mode 9).
++inline void _topk_fp32_to_bf16_raw_tile_(std::uint32_t dst_tile_index)
++{
++    TOPK_SFPENCC_ALL_LANES_ON(); // the constant write and the strip sweep are lane-predicated
++    sfpi::vConstIntPrgm0 = TOPK_LO16_MASK;
++    TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
++    set_dst_write_addr(0);
++    TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
++    const std::uint32_t base = dst_tile_index * 64;
++    for (std::uint32_t off = 0; off < 64; off += 2)
++    {
++        TT_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::INT32, ADDR_MOD_7, base + off);
++        TTI_SFPSHFT((-16) & 0xFFF, p_sfpu::LREG0, p_sfpu::LREG0, 5); // >> 16
++        TTI_SFPAND(0, p_sfpu::LREG12, p_sfpu::LREG0, 0);
++        TT_SFPSTORE(p_sfpu::LREG0, TOPK_SFPSTORE_MODE_PACK_UINT16, ADDR_MOD_7, base + off);
++    }
++    set_dst_write_addr(0);
++}
++
+ // Fused-key stable topk. Each datum becomes one 32-bit word: the bf16 value in the high half, its
+ // u16 index in the low half. SFPSWAP compares words by sign and magnitude, so equal values are
+ // ordered by the index bits and the plain unstable network sorts stably. So that the LOWER index
+@@ -900,21 +942,44 @@
  // fused packed keys never take the comparator-stable path (their bf16 slab is widened into
  // 32-bit DEST by the same SrcA datacopy, which canonicalizes +-0 before the fuse -- silicon-probed).
  // Predicate: (x & 0x7FFFFFFF) == 0 (zero magnitude); action: x &= 0x7FFFFFFF (-> +0.0).
@@ -51,7 +100,62 @@ diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h 
 diff --git tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
 --- tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
 +++ tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/sfpu/ckernel_sfpu_topk.h
-@@ -904,21 +904,44 @@
+@@ -208,6 +208,54 @@
+     set_dst_write_addr(0);
+ }
+ 
++// BFloat16 values sorted in 32-bit DEST travel as raw 16-bit words, since an FPU load would widen
++// them through SrcA, which turns NaN into infinity. A raw word copied or transposed into 32-bit DEST
++// lands in the low half with stale bits above it: widen it in place to the float32 bits of its
++// bfloat16 value. Runs on MATH while DEST is acquired, after the load has drained.
++inline void _topk_bf16_raw_to_fp32_tile_(std::uint32_t dst_tile_index)
++{
++    TOPK_SFPENCC_ALL_LANES_ON(); // the constant write and the strip sweep are lane-predicated
++    sfpi::vConstIntPrgm0 = TOPK_LO16_MASK;
++    TTI_SETC16(ADDR_MOD_SET_Base_ADDR32, 1);
++    TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
++    set_dst_write_addr(0);
++    TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
++    const std::uint32_t base = dst_tile_index * 64;
++    for (std::uint32_t off = 0; off < 64; off += 2)
++    {
++        TT_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::INT32, ADDR_MOD_3, base + off);
++        TTI_SFPAND(0, p_sfpu::LREG12, p_sfpu::LREG0, 0);
++        TTI_SFPSHFT(16, p_sfpu::LREG0, p_sfpu::LREG0, 5); // << 16
++        TT_SFPSTORE(p_sfpu::LREG0, InstrModLoadStore::INT32, ADDR_MOD_3, base + off);
++    }
++    TTI_STALLWAIT(p_stall::STALL_CFG, p_stall::WAIT_SFPU);
++    TTI_SETC16(ADDR_MOD_SET_Base_ADDR32, 0);
++    set_dst_write_addr(0);
++}
++
++// Inverse of _topk_bf16_raw_to_fp32_tile_ before packing to a raw 16-bit buffer: the high 16 bits of
++// each float32 word, in the half the 16-bit pack reads (SFPSTORE mode 9).
++inline void _topk_fp32_to_bf16_raw_tile_(std::uint32_t dst_tile_index)
++{
++    TOPK_SFPENCC_ALL_LANES_ON(); // the constant write and the strip sweep are lane-predicated
++    sfpi::vConstIntPrgm0 = TOPK_LO16_MASK;
++    TTI_SETC16(ADDR_MOD_SET_Base_ADDR32, 1);
++    TTI_STALLWAIT(p_stall::STALL_SFPU, p_stall::MATH);
++    set_dst_write_addr(0);
++    TTI_SETRWC(p_setrwc::CLR_NONE, 0, 0, 0, 0, p_setrwc::SET_D);
++    const std::uint32_t base = dst_tile_index * 64;
++    for (std::uint32_t off = 0; off < 64; off += 2)
++    {
++        TT_SFPLOAD(p_sfpu::LREG0, InstrModLoadStore::INT32, ADDR_MOD_3, base + off);
++        TTI_SFPSHFT((-16) & 0xFFF, p_sfpu::LREG0, p_sfpu::LREG0, 5); // >> 16
++        TTI_SFPAND(0, p_sfpu::LREG12, p_sfpu::LREG0, 0);
++        TT_SFPSTORE(p_sfpu::LREG0, TOPK_SFPSTORE_MODE_PACK_UINT16, ADDR_MOD_3, base + off);
++    }
++    TTI_STALLWAIT(p_stall::STALL_CFG, p_stall::WAIT_SFPU);
++    TTI_SETC16(ADDR_MOD_SET_Base_ADDR32, 0);
++    set_dst_write_addr(0);
++}
++
+ // Fused-key stable topk. Each datum becomes one 32-bit word: the bf16 value in the high half, its
+ // u16 index in the low half. SFPSWAP compares words by sign and magnitude, so equal values are
+ // ordered by the index bits and the plain unstable network sorts stably. So that the LOWER index
+@@ -904,21 +952,44 @@
  // fused packed keys never take the comparator-stable path (their bf16 slab is widened into
  // 32-bit DEST by the same SrcA datacopy, which canonicalizes +-0 before the fuse -- silicon-probed).
  // Predicate: (x & 0x7FFFFFFF) == 0 (zero magnitude); action: x &= 0x7FFFFFFF (-> +0.0).
@@ -146,6 +250,15 @@ diff --git tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_topk.
  inline void calculate_topk_canonicalize_negzero() {}
  
  // Load 8 lanes (one value LREG pair + one index LREG pair) from Dest at runtime offsets.
+@@ -768,6 +768,8 @@
+ // Defined so compute_kernel_api.h resolves the symbol on all architectures.
+ inline void topk_uint16_prepare_value_tile_for_pack(std::uint32_t /*tile_index*/) {}
+ inline void _topk_uint16_move_dest_tile_to_pack_half_(std::uint32_t /*tile_index*/) {}
++inline void _topk_bf16_raw_to_fp32_tile_(std::uint32_t /*dst_tile_index*/) {}
++inline void _topk_fp32_to_bf16_raw_tile_(std::uint32_t /*dst_tile_index*/) {}
+ // Rank-stamped strip stub: the mode itself is static_asserted off on Quasar (see topk_init /
+ // the network entries), so this is unreachable; it exists only so the arch-independent
+ // compute API (topk_strip_rank_tags) compiles.
 diff --git tt_metal/hw/inc/api/compute/topk.h tt_metal/hw/inc/api/compute/topk.h
 --- tt_metal/hw/inc/api/compute/topk.h
 +++ tt_metal/hw/inc/api/compute/topk.h
@@ -168,10 +281,84 @@ diff --git tt_metal/hw/inc/api/compute/topk.h tt_metal/hw/inc/api/compute/topk.h
          idst,
          VectorMode::RC_custom));
  }
+@@ -425,6 +427,28 @@
+ }
+ 
+ /**
++ * BFloat16 values sorted in 32-bit DEST travel as raw 16-bit words (UInt16 buffers), since an FPU load
++ * would widen them through SrcA, which turns NaN into infinity. Widens the raw words a copy or
++ * transpose left in DEST tile idst to the float32 bits of their bfloat16 values. Requires 32-bit DEST.
++ * Must run on MATH while DEST is acquired, after the load.
++ */
++template <bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
++ALWI void topk_bf16_raw_to_fp32(uint32_t idst) {
++    static_assert(is_fp32_dest_acc_en, "topk_bf16_raw_to_fp32 widens into 32-bit DEST words");
++    MATH((ckernel::sfpu::_topk_bf16_raw_to_fp32_tile_(idst)));
++}
++
++/**
++ * Inverse of topk_bf16_raw_to_fp32 before packing DEST tile idst to a raw 16-bit (UInt16) buffer.
++ * Requires 32-bit DEST. Must run on MATH while DEST is acquired (before tile_regs_commit / pack_tile).
++ */
++template <bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
++ALWI void topk_fp32_to_bf16_raw(uint32_t idst) {
++    static_assert(is_fp32_dest_acc_en, "topk_fp32_to_bf16_raw narrows 32-bit DEST words");
++    MATH((ckernel::sfpu::_topk_fp32_to_bf16_raw_tile_(idst)));
++}
++
++/**
+  * Moves a u16 DEST tile's datums from the low half of each 32-bit DEST word (where a u16 transpose
+  * lands them) into the packer-visible high half, stripping the stale garbage above them. Used by
+  * the fused-key TopK final extraction; unconditional (not gated on TOPK_UINT16_FP32_DEST). Requires
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_common.hpp
-@@ -81,10 +81,8 @@
+@@ -10,11 +10,37 @@
+ /**
+  * @brief Before packing UInt16 value tiles from 32-bit DEST, move values into the packer-visible high half.
+  * No-op unless TOPK_UINT16_FP32_DEST is defined (UInt16 values + UINT32 indices / fp32_dest_acc_en).
++ * With SORT_BF16_RAW_FP32_DEST, narrows float32 values back to raw bfloat16 words instead.
+  * Must be called on MATH while DEST is still acquired, before tile_regs_commit.
+  */
+ FORCE_INLINE
+ void prepare_uint16_fp32_dest_value_tile_for_pack(uint32_t dst_tile_index) {
++#ifdef SORT_BF16_RAW_FP32_DEST
++    topk_fp32_to_bf16_raw(dst_tile_index);
++#else
+     topk_uint16_prepare_value_tile_for_pack(dst_tile_index);
++#endif
++}
++
++/**
++ * @brief After loading value tiles into 32-bit DEST, widen raw bfloat16 words to float32.
++ * No-op unless SORT_BF16_RAW_FP32_DEST is defined: bfloat16 values sorted in 32-bit DEST (UINT32
++ * indices) travel as raw 16-bit words in UInt16 buffers, since an FPU load would widen them through
++ * SrcA, which turns NaN into infinity. Must be called on MATH while DEST is acquired, after the load.
++ */
++FORCE_INLINE
++void prepare_value_tile_after_load(uint32_t dst_tile_index) {
++#ifdef SORT_BF16_RAW_FP32_DEST
++    topk_bf16_raw_to_fp32(dst_tile_index);
++#else
++    (void)dst_tile_index;
++#endif
++}
++
++FORCE_INLINE
++void prepare_value_tiles_after_load(uint32_t dst_tile_a, uint32_t dst_tile_b) {
++    prepare_value_tile_after_load(dst_tile_a);
++    prepare_value_tile_after_load(dst_tile_b);
+ }
+ 
+ FORCE_INLINE
+@@ -75,16 +101,15 @@
+         transpose_init(input_dfb.get_id());
+         transpose_tile(input_dfb.get_id(), 0, 0);
+         transpose_tile(input_dfb.get_id(), 1, 1);
++        prepare_value_tiles_after_load(0, 1);
+ 
+         reconfig_data_format_srca(index_dfb.get_id());
+         transpose_init(index_dfb.get_id());
          transpose_tile(index_dfb.get_id(), 0, 2);
          transpose_tile(index_dfb.get_id(), 1, 3);
  
@@ -184,10 +371,34 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
          ckernel::topk_local_sort<stable_sort, DST_ACCUM_MODE, /*fused=*/false, /*rank_stamped=*/false, tie_order>(
              0, (int)ascending_local, end_phase);
  
+@@ -156,6 +181,7 @@
+ 
+         // UInt16-in-32b-DEST: transpose re-unpacks into low 16; fix up before pack (#50215).
+         if (prepare_uint16_value_for_pack) {
++            prepare_value_tile_after_load(0);
+             prepare_uint16_fp32_dest_value_tile_for_pack(0);
+         }
+ 
+@@ -283,6 +309,7 @@
+     copy_tile(src_dfb.get_id(), src_tile_id, dest_idx);
+ 
+     if (prepare_uint16_value_for_pack) {
++        prepare_value_tile_after_load(dest_idx);
+         prepare_uint16_fp32_dest_value_tile_for_pack(dest_idx);
+     }
+ 
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_multi_core.cpp
-@@ -163,10 +163,10 @@
+@@ -155,6 +155,7 @@
+                                 copy_tile(dfb::index_tensor, 0, index_dest_start);
+                                 copy_tile(dfb::index_tensor, 1, index_dest_end);
+                             }
++                            prepare_value_tiles_after_load(input_dest_start, input_dest_end);
+ 
+                             uint32_t tile_input_low = input_dest_start;
+                             uint32_t tile_input_high = input_dest_end;
+@@ -163,10 +164,10 @@
  
                              if (sub == 1) {
                                  // Use sort LLK only the last substage to sort the last pair of tiles - speed up
@@ -202,6 +413,14 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/so
                                  }
                                  ckernel::topk_local_sort<
                                      stable,
+@@ -233,6 +234,7 @@
+                                 transpose_init(dfb::input_tensor_transposed);
+                                 transpose_tile(dfb::input_tensor_transposed, 0, input_dest_start);
+                                 transpose_tile(dfb::input_tensor_transposed, 1, input_dest_end);
++                                prepare_value_tiles_after_load(input_dest_start, input_dest_end);
+                                 // UInt16-in-32b-DEST: transpose re-unpacks into low 16; fix up before pack (#50215).
+                                 prepare_uint16_fp32_dest_value_tiles_for_pack(input_dest_start, input_dest_end);
+                                 tile_regs_commit();
 diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp
@@ -226,7 +445,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
      const float pad_descending = is_uint16_input ? 0.0f : -std::numeric_limits<float>::infinity();
      const float pad_fill = descending ? pad_descending : pad_ascending;
  
-@@ -380,14 +384,25 @@
+@@ -380,14 +384,27 @@
                                         ? ttnn::to_memory_config(input_tensor, ttnn::DRAM_MEMORY_CONFIG)
                                         : input_tensor;
  
@@ -241,25 +460,27 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
 +    // caller-provided values output cannot back the promoted sort and is populated after the final cast.
 +    //  - Float16: the SFPU bitonic primitive compares BF16/FP32 values, so promoting once avoids teaching
 +    //    every compare/merge and padding stage a second 16-bit encoding.
-+    //  - BFloat16 with UINT32 indices (rows of more than 32768 elements, which pad to 65536, or a
++    //  - ROW_MAJOR BFloat16 with UINT32 indices (rows of more than 32768 elements, which pad to 65536, or a
 +    //    caller-provided UINT32 indices output): UINT32 indices switch the sort to 32-bit DEST, and
-+    //    widening BFloat16 into it through SrcA turns NaN into inf. Shorter BFloat16 rows stay in 16-bit
-+    //    DEST, where every pack is an identity pack. These casts could be removed by moving BFloat16 values
-+    //    as raw 16-bit words and widening them to Float32 in DEST with the SFPU.
-+    // A caller-provided UINT16 indices output for a longer row is still promoted and rebound with UINT32
-+    // indices; ttnn::sort callers in tt-mlir never pass output tensors.
++    //    widening BFloat16 into it through SrcA turns NaN into inf. The TILE kernels instead move BFloat16
++    //    values as raw 16-bit words and widen them to Float32 in DEST with the SFPU
++    //    (SORT_BF16_RAW_FP32_DEST); the ROW_MAJOR kernels, which tilize and untilize, do not. Shorter
++    //    BFloat16 rows stay in 16-bit DEST, where every pack is an identity pack.
++    // A caller-provided UINT16 indices output for a longer ROW_MAJOR row is still promoted and rebound with
++    // UINT32 indices; ttnn::sort callers in tt-mlir never pass output tensors.
 +    const bool uint32_indices =
 +        original_lshape[normalized_dim] > 32768 ||
 +        (optional_output_tensors.has_value() && std::get<1>(*optional_output_tensors).dtype() == DataType::UINT32);
-+    const bool promote_to_float32 = input_tensor.dtype() == DataType::FLOAT16 ||
-+                                    (input_tensor.dtype() == DataType::BFLOAT16 && uint32_indices);
++    const bool promote_to_float32 =
++        input_tensor.dtype() == DataType::FLOAT16 || (input_tensor.dtype() == DataType::BFLOAT16 && uint32_indices &&
++                                                      input_tensor.layout() == Layout::ROW_MAJOR);
      const Tensor transform_input =
 -        promote_float16 ? ttnn::typecast(unsharded_input, DataType::FLOAT32) : unsharded_input;
 +        promote_to_float32 ? ttnn::typecast(unsharded_input, DataType::FLOAT32) : unsharded_input;
  
      Tensor padded_input_tensor =
          dm::pre_sort_transform_tensor(transform_input, dim, is_dim_last_idx, is_rank_le_4d, descending);
-@@ -406,7 +421,7 @@
+@@ -406,7 +423,7 @@
          const auto& out1 = std::get<1>(*optional_output_tensors);
          const bool values_layout_match = (out0.layout() == padded_input_tensor.layout());
          const bool indices_layout_match = (out1.layout() == padded_input_tensor.layout());
@@ -268,7 +489,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
          if (!preallocated_layout_mismatch) {
              const auto canonicalize_output = [&](const Tensor& t) {
                  return dm::pre_sort_transform_tensor(t, dim, is_dim_last_idx, is_rank_le_4d, descending);
-@@ -419,13 +434,19 @@
+@@ -419,13 +436,19 @@
      // pre_sort_transform_tensor always moves the sort dimension to position -1,
      // so the device op always sorts along the last dimension.
      auto sorted_tensors = ttnn::prim::sort(
@@ -291,3 +512,232 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
      }
  
      // The device op always writes to DRAM when sort_mem_cfg is sharded (to avoid
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/sort_program_factory.cpp
+@@ -31,7 +31,12 @@
+ // when the input dtype is UInt16, so the reader/writer software-conversion loops (which
+ // reference `dfb::uint16_input_stage` etc.) must also be preprocessor-gated to avoid the
+ // undeclared handles from tripping name lookup on the non-UINT16 path.
+-KernelSpec::CompilerOptions::Defines sort_kernel_defines(bool is_row_major, bool is_uint16_input) {
++//
++// SORT_BF16_RAW_FP32_DEST marks BFloat16 keys sorted in 32-bit DEST (UINT32 indices). An FPU load would
++// widen them through SrcA, which turns NaN into infinity, so their buffers are UInt16 and the compute
++// kernel widens the raw words to float32 in DEST after each load and narrows them before each pack.
++KernelSpec::CompilerOptions::Defines sort_kernel_defines(
++    bool is_row_major, bool is_uint16_input, bool is_bf16_raw = false) {
+     KernelSpec::CompilerOptions::Defines defines;
+     if (is_row_major) {
+         defines.insert({"IS_ROW_MAJOR", "1"});
+@@ -39,14 +44,24 @@
+     if (is_uint16_input) {
+         defines.insert({"IS_UINT16_FP32_MODE", "1"});
+     }
++    if (is_bf16_raw) {
++        defines.insert({"SORT_BF16_RAW_FP32_DEST", "1"});
++    }
+     return defines;
+ }
+ 
++// Whether BFloat16 keys travel as raw 16-bit words (see SORT_BF16_RAW_FP32_DEST). Only the TILE layout
++// supports it; ROW_MAJOR BFloat16 sorts with UINT32 indices are promoted to Float32 by ttnn::sort.
++bool sorts_bf16_as_raw_words(const Tensor& input, DataType index_dtype) {
++    return input.dtype() == DataType::BFLOAT16 && index_dtype == DataType::UINT32 &&
++           input.layout() == Layout::TILE;
++}
++
+ // Layout-only overload kept for the CrossCore factory, which routes UINT16 inputs to
+ // a different program via select_program_factory and therefore never sets
+ // IS_UINT16_FP32_MODE (its reader/writer have no software-conversion loops).
+-KernelSpec::CompilerOptions::Defines layout_defines(bool is_row_major) {
+-    return sort_kernel_defines(is_row_major, /*is_uint16_input=*/false);
++KernelSpec::CompilerOptions::Defines layout_defines(bool is_row_major, bool is_bf16_raw = false) {
++    return sort_kernel_defines(is_row_major, /*is_uint16_input=*/false, is_bf16_raw);
+ }
+ 
+ }  // namespace
+@@ -107,8 +122,10 @@
+     // values from the DEST register are stored and read back without truncation.  The
+     // writer then converts Float32 → UInt16 element-by-element when sending to DRAM.
+     const bool is_uint16_input = (input_tensor_cb_data_format == tt::DataFormat::UInt16);
+-    const tt::DataFormat sort_value_cb_data_format =
+-        is_uint16_input ? tt::DataFormat::Float32 : input_tensor_cb_data_format;
++    const bool is_bf16_raw = sorts_bf16_as_raw_words(tensor_args.input_tensor, output_tensors.at(1).dtype());
++    const tt::DataFormat sort_value_cb_data_format = is_uint16_input ? tt::DataFormat::Float32
++                                                     : is_bf16_raw   ? tt::DataFormat::UInt16
++                                                                     : input_tensor_cb_data_format;
+     const uint32_t sort_value_tile_size = tile_size(sort_value_cb_data_format);
+     // Number of bytes a Float32-promoted RM value row occupies.  For UINT16 inputs
+     // the reader software-converts each UInt16 row into a Float32 row before handing
+@@ -539,7 +556,7 @@
+         .unique_id = READER,
+         .source = "ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/dataflow/"
+                   "reader_single_row_single_core.cpp",
+-        .compiler_options = {.defines = sort_kernel_defines(is_row_major, is_uint16_input)},
++        .compiler_options = {.defines = sort_kernel_defines(is_row_major, is_uint16_input, is_bf16_raw)},
+         .dfb_bindings = std::move(reader_dfb_bindings),
+         .tensor_bindings =
+             {
+@@ -564,7 +581,7 @@
+         .unique_id = WRITER,
+         .source = "ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/dataflow/"
+                   "writer_single_row_single_core.cpp",
+-        .compiler_options = {.defines = sort_kernel_defines(is_row_major, is_uint16_input)},
++        .compiler_options = {.defines = sort_kernel_defines(is_row_major, is_uint16_input, is_bf16_raw)},
+         .dfb_bindings = std::move(writer_dfb_bindings),
+         .tensor_bindings =
+             {
+@@ -613,7 +630,7 @@
+         // Compute kernels build at O3; the compiler-options default is O2, so the level is stated
+         // explicitly rather than inherited.
+         .compiler_options =
+-            {.defines = sort_kernel_defines(is_row_major, is_uint16_input),
++            {.defines = sort_kernel_defines(is_row_major, is_uint16_input, is_bf16_raw),
+              .opt_level = KernelSpec::CompilerOptions::OptLevel::O3},
+         .dfb_bindings = std::move(compute_dfb_bindings),
+         .compile_time_args =
+@@ -852,10 +869,13 @@
+ 
+ ttnn::device_operation::ProgramArtifacts SortProgramFactoryCrossCoreDataExchange::create_program_artifacts(
+     const SortParams& attributes, const SortInputs& tensor_args, std::vector<Tensor>& output_tensors) {
++    const bool is_bf16_raw = sorts_bf16_as_raw_words(tensor_args.input_tensor, output_tensors.at(1).dtype());
+     const tt::DataFormat input_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
++        is_bf16_raw ? tt::DataFormat::UInt16
++                    : tt::tt_metal::datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
+     const tt::DataFormat value_tensor_cb_data_format =
+-        tt::tt_metal::datatype_to_dataformat_converter(output_tensors.at(0).dtype());
++        is_bf16_raw ? tt::DataFormat::UInt16
++                    : tt::tt_metal::datatype_to_dataformat_converter(output_tensors.at(0).dtype());
+     const tt::DataFormat index_tensor_cb_data_format =
+         tt::tt_metal::datatype_to_dataformat_converter(output_tensors.at(1).dtype());
+     const tt::DataFormat packer_unpacker_sync_cb_data_format = input_tensor_cb_data_format == tt::DataFormat::Float16
+@@ -895,7 +915,7 @@
+     // routing invariant fails loudly instead of silently sorting UINT16 keys in
+     // bf16 mode and returning wrong indices.
+     TT_FATAL(
+-        input_tensor_cb_data_format != tt::DataFormat::UInt16,
++        input_tensor_cb_data_format != tt::DataFormat::UInt16 || is_bf16_raw,
+         "Invariant violated: UINT16 input reached the CrossCore sort factory.  "
+         "SortDeviceOperation::select_program_factory routes UINT16 to "
+         "SortProgramFactorySingleRowMultiCore for Wt above the SingleCore "
+@@ -1300,7 +1320,7 @@
+         .unique_id = READER,
+         .source = "ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/dataflow/"
+                   "reader_cross_core_data_exchange.cpp",
+-        .compiler_options = {.defines = layout_defines(is_row_major)},
++        .compiler_options = {.defines = layout_defines(is_row_major, is_bf16_raw)},
+         .dfb_bindings = std::move(reader_dfb_bindings),
+         .semaphore_bindings =
+             {
+@@ -1336,7 +1356,7 @@
+         .unique_id = WRITER,
+         .source = "ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/dataflow/"
+                   "writer_cross_core_data_exchange.cpp",
+-        .compiler_options = {.defines = layout_defines(is_row_major)},
++        .compiler_options = {.defines = layout_defines(is_row_major, is_bf16_raw)},
+         .dfb_bindings = std::move(writer_dfb_bindings),
+         .tensor_bindings =
+             {
+@@ -1379,7 +1399,7 @@
+         // Compute kernels build at O3; the compiler-options default is O2, so the level is stated
+         // explicitly rather than inherited.
+         .compiler_options =
+-            {.defines = layout_defines(is_row_major), .opt_level = KernelSpec::CompilerOptions::OptLevel::O3},
++            {.defines = layout_defines(is_row_major, is_bf16_raw), .opt_level = KernelSpec::CompilerOptions::OptLevel::O3},
+         .dfb_bindings = std::move(compute_dfb_bindings),
+         .compile_time_args =
+             {
+@@ -1470,13 +1490,15 @@
+                                 input_tensor_cb_data_format == tt::DataFormat::UInt16;
+ 
+     const bool is_uint16_input = (input_tensor_cb_data_format == tt::DataFormat::UInt16);
+-    const tt::DataFormat sort_value_cb_data_format =
+-        is_uint16_input ? tt::DataFormat::Float32 : input_tensor_cb_data_format;
++    const bool is_bf16_raw = sorts_bf16_as_raw_words(tensor_args.input_tensor, output_tensors.at(1).dtype());
++    const tt::DataFormat sort_value_cb_data_format = is_uint16_input ? tt::DataFormat::Float32
++                                                     : is_bf16_raw   ? tt::DataFormat::UInt16
++                                                                     : input_tensor_cb_data_format;
+     const uint32_t sort_value_tile_size = tile_size(sort_value_cb_data_format);
+     // For UINT16 inputs, c_0 must be Float32 because the reader does a software
+     // UInt16 → Float32 conversion (hardware unpack cannot convert UInt16 → Float32).
+     // See SortProgramFactorySingleRowSingleCore for the full rationale.
+-    const tt::DataFormat input_cb_data_format = is_uint16_input ? tt::DataFormat::Float32 : input_tensor_cb_data_format;
++    const tt::DataFormat input_cb_data_format = is_uint16_input ? tt::DataFormat::Float32 : sort_value_cb_data_format;
+     const uint32_t input_cb_tile_size = is_uint16_input ? sort_value_tile_size : input_tensor_tile_size;
+ 
+     const uint32_t log2Wt = std::log2(Wt);
+@@ -1967,7 +1989,7 @@
+         .unique_id = COORDINATOR,
+         .source = "ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/dataflow/"
+                   "coordinator_single_row_multi_core.cpp",
+-        .compiler_options = {.defines = sort_kernel_defines(is_row_major, is_uint16_input)},
++        .compiler_options = {.defines = sort_kernel_defines(is_row_major, is_uint16_input, is_bf16_raw)},
+         .dfb_bindings = std::move(coordinator_dfb_bindings),
+         .semaphore_bindings =
+             {
+@@ -2010,7 +2032,7 @@
+         .unique_id = READER,
+         .source = "ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/dataflow/"
+                   "reader_single_row_multi_core.cpp",
+-        .compiler_options = {.defines = sort_kernel_defines(is_row_major, is_uint16_input)},
++        .compiler_options = {.defines = sort_kernel_defines(is_row_major, is_uint16_input, is_bf16_raw)},
+         .dfb_bindings = std::move(reader_dfb_bindings),
+         .semaphore_bindings =
+             {
+@@ -2044,7 +2066,7 @@
+         .unique_id = WRITER,
+         .source = "ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/dataflow/"
+                   "writer_single_row_multi_core.cpp",
+-        .compiler_options = {.defines = sort_kernel_defines(is_row_major, is_uint16_input)},
++        .compiler_options = {.defines = sort_kernel_defines(is_row_major, is_uint16_input, is_bf16_raw)},
+         .dfb_bindings = std::move(writer_dfb_bindings),
+         .semaphore_bindings =
+             {
+@@ -2091,7 +2113,7 @@
+         // Compute kernels build at O3; the compiler-options default is O2, so the level is stated
+         // explicitly rather than inherited.
+         .compiler_options =
+-            {.defines = sort_kernel_defines(is_row_major, is_uint16_input),
++            {.defines = sort_kernel_defines(is_row_major, is_uint16_input, is_bf16_raw),
+              .opt_level = KernelSpec::CompilerOptions::OptLevel::O3},
+         .dfb_bindings = std::move(compute_dfb_bindings),
+         .compile_time_args =
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_single_row_single_core.cpp
+@@ -232,6 +232,7 @@
+                         copy_init(dfb::input_tensor_transposed);
+                         copy_tile(dfb::input_tensor_transposed, left_tile_id, input_dest_start);
+                         copy_tile(dfb::input_tensor_transposed, right_tile_id, input_dest_end);
++                        prepare_value_tiles_after_load(input_dest_start, input_dest_end);
+ 
+                         uint32_t tile_input_low = input_dest_start;
+                         uint32_t tile_input_high = input_dest_end;
+diff --git ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/sort/device/kernels/compute/sort_cross_core_data_exchange.cpp
+@@ -158,6 +158,7 @@
+                             copy_tile_to_dst_init_with_cb_update(dfb::input_tensor_transposed, global_old_cb);
+                             copy_tile(dfb::input_tensor_transposed, left_tile_id, input_dest_start);
+                             copy_tile(dfb::input_tensor_transposed, right_tile_id, input_dest_end);
++                            prepare_value_tiles_after_load(input_dest_start, input_dest_end);
+ 
+                             // Copy index tiles to DST register
+                             copy_tile_to_dst_init_with_cb_update(dfb::index_tensor_transposed, global_old_cb);
+@@ -278,6 +279,7 @@
+                         // Prepare local value tiles for sorting with new tiles
+                         copy_tile_to_dst_init_with_cb_update(dfb::input_tensor_transposed, global_old_cb);
+                         copy_tile(dfb::input_tensor_transposed, tile_id, local_value_dest);
++                        prepare_value_tile_after_load(local_value_dest);
+ 
+                         index_tensor_peer_dfb.wait_front(one_tile);
+ 
+@@ -293,6 +295,7 @@
+                         // Load new value tile for sorting
+                         copy_tile_to_dst_init_with_cb_update(dfb::value_tensor_peer, global_old_cb);
+                         copy_tile(dfb::value_tensor_peer, FIRST_TILE, peer_value_dest);
++                        prepare_value_tile_after_load(peer_value_dest);
+ 
+                         value_tensor_peer_dfb.pop_front(one_tile);
+ 
