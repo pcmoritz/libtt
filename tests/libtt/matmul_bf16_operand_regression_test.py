@@ -12,9 +12,8 @@ one.
 At the highest precision the matmul runs on the vector unit, which reads FP32
 operands only, so tt-mlir keeps the cast of a BF16 operand next to an FP32 one.
 With both operands cast from BF16 it drops both casts and runs the matmul on
-the matrix unit at its FP32 fidelity, which multiplies BF16 values exactly, as
-a TPU does at the highest precision: the result equals that of an FP32 matmul
-of the same values at the default precision.
+the matrix unit at HiFi4, so the result equals that of an FP32 matmul of the
+same values at the default precision.
 """
 
 import jax

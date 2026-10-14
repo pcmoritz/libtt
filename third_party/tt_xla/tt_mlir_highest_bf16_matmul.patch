@@ -1,21 +1,19 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -546,6 +546,13 @@ public:
+@@ -546,6 +546,11 @@ public:
  // cast is exact and the matmul unpacks each operand from its own format. TTNN
  // picks the same fidelity for an FP32 input with a BF16 one as for two FP32
  // inputs, so the result is the same without the cast's program.
 +//
 +// At the highest precision, a matmul of two BF16 tensors cast up to FP32, such
-+// as a BF16 router gate applied to BF16 hidden states, reads both directly:
-+// the matrix unit at full fidelity multiplies BF16 values exactly, as a TPU
-+// does at the highest precision, and TTNNSetComputeKernelConfig runs it there
-+// with FP32 accumulation instead of on the vector unit. With one FP32
-+// operand, the vector unit's FP32 products need both operands in FP32.
++// as a BF16 router gate applied to BF16 hidden states, reads both directly too,
++// and TTNNSetComputeKernelConfig runs it on the matrix unit at HiFi4 instead of
++// on the vector unit. With one FP32 operand it stays on the vector unit.
  class MatmulBF16OperandCastPattern : public mlir::OpRewritePattern<MatmulOp> {
    using mlir::OpRewritePattern<MatmulOp>::OpRewritePattern;
  
-@@ -553,10 +560,6 @@ public:
+@@ -553,10 +558,6 @@ public:
    mlir::LogicalResult
    matchAndRewrite(MatmulOp matmulOp,
                    mlir::PatternRewriter &rewriter) const final {
@@ -26,7 +24,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
      auto isF32 = [](mlir::Value value) {
        return mlir::cast<mlir::RankedTensorType>(value.getType())
            .getElementType()
-@@ -578,6 +581,16 @@ public:
+@@ -578,6 +579,16 @@ public:
      };
      mlir::Value a = bf16Source(matmulOp.getA());
      mlir::Value b = bf16Source(matmulOp.getB());
@@ -46,18 +44,17 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp b/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
-@@ -45,6 +45,36 @@ void applyLargeInnerDimBf16MatmulConfig(OpTy op,
+@@ -45,6 +45,35 @@ void applyLargeInnerDimBf16MatmulConfig(OpTy op,
    config = config.withPackerL1Acc(true);
  }
  
 +// A matmul at the highest precision (ttcore.fp32_exact) runs on the vector
-+// unit, ttnn::experimental::matmul_fp32, which reads FP32 operands only. Once
-+// an operand is narrower, a BF16 tensor whose cast to FP32 was dropped or a
-+// weight converted to a narrower dtype on request, it runs on the matrix unit
-+// at full fidelity with FP32 accumulation instead. The matrix unit then
-+// multiplies BF16 values exactly, as a TPU does at the highest precision.
-+// This runs after the weight dtype conversion and before the analysis passes,
-+// so it sees the final operand dtypes and the optimizer sees the config.
++// unit, ttnn::experimental::matmul_fp32, which reads FP32 operands only. With
++// a narrower operand (a BF16 tensor whose cast was dropped, or a weight
++// converted on request) it runs on the matrix unit at HiFi4 with an FP32 Dst
++// instead: its BF16 products are exact, but its sums keep fewer bits than
++// FP32. This runs after the weight dtype conversion, so it sees the final
++// operand dtypes.
 +void applyNarrowedExactMatmulConfig(MatmulOp op,
 +                                    DeviceComputeKernelConfigAttr &config) {
 +  if (!op->hasAttr("ttcore.fp32_exact")) {
@@ -83,7 +80,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp b/lib/Di
  } // namespace
  
  #define GEN_PASS_DEF_TTNNSETCOMPUTEKERNELCONFIG
-@@ -160,6 +190,7 @@ public:
+@@ -160,6 +189,7 @@ public:
        // This fix is required for correctness of large matmuls/linears.
        if (auto matmulOp = dyn_cast<MatmulOp>(op)) {
          applyLargeInnerDimBf16MatmulConfig(matmulOp, config);

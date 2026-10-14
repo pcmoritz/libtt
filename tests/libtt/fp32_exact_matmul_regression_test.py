@@ -139,7 +139,7 @@ def test_exact_matmul_layouts_at_o2(tmp_path):
 
 
 def test_exact_matmul_with_narrowed_weight(tmp_path):
-    """A weight converted to a narrower dtype on request runs on the matrix unit at its FP32 fidelity.
+    """A weight converted to a narrower dtype on request runs on the matrix unit at HiFi4.
 
     The vector-unit kernel reads FP32 operands only, so an FP32 router gate marked BF16 by the
     serving backend and applied at the highest precision used to stop in matmul_fp32.
