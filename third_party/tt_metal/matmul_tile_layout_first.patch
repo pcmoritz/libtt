@@ -1,0 +1,16 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
+--- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
++++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
+@@ -247,6 +247,12 @@
+             bias);
+     }
+ 
++    // The device operation's validation requires this too, but it runs after the program config below, whose
++    // heuristics count rows in tiles: a row-major operand of fewer than 32 rows would divide by zero tiles.
++    TT_FATAL(
++        input_tensor_a.layout() == Layout::TILE && input_tensor_b.layout() == Layout::TILE,
++        "Inputs to matmul must be tilized");
++
+     //----------------------------------------------------------------------------------------------
+     // The following code is replicated from matmul_op.cpp and helps determine the program config
+     auto matmul_struct =
