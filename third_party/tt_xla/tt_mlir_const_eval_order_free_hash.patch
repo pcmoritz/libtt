@@ -1,0 +1,102 @@
+diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher.h
+--- a/include/ttmlir/Support/IRHasher.h
++++ b/include/ttmlir/Support/IRHasher.h
+@@ -7,7 +7,10 @@
+ 
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/IR/BuiltinOps.h"
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/ScopeExit.h"
++#include "llvm/ADT/SmallVector.h"
+ #include "llvm/ADT/StringExtras.h"
+ #include "llvm/Support/SHA256.h"
+ #include "llvm/Support/raw_ostream.h"
+@@ -68,6 +71,64 @@ inline std::string hashFuncOp(func::FuncOp func) {
+   return llvm::toHex(digest, /*LowerCase=*/true);
+ }
+ 
++// A hash of a function that does not depend on the order of its independent
++// ops: the function type and the sorted keys of its ops, an op's key being a
++// hash of its name, attributes, result types and operands (a block argument by
++// its number, an op result by its op's key). Functions that compute the same
++// results from the same arguments get the same hash however their ops are
++// ordered. Falls back to hashFuncOp for a function with nested regions.
++inline std::string hashFuncOpStructure(func::FuncOp func) {
++  auto sha = [](llvm::StringRef bytes) {
++    return llvm::toHex(
++        llvm::SHA256::hash(llvm::ArrayRef<uint8_t>(
++            reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size())),
++        /*LowerCase=*/true);
++  };
++  if (!func.getBody().hasOneBlock()) {
++    return hashFuncOp(func);
++  }
++  llvm::DenseMap<mlir::Operation *, std::string> keys;
++  llvm::SmallVector<std::string> opKeys;
++  for (mlir::Operation &op : func.getBody().front()) {
++    if (op.getNumRegions() != 0) {
++      return hashFuncOp(func);
++    }
++    std::string text;
++    llvm::raw_string_ostream os(text);
++    os << op.getName() << op.getAttrDictionary();
++    if (mlir::Attribute properties = op.getPropertiesAsAttribute()) {
++      os << properties;
++    }
++    if (auto call = mlir::dyn_cast<func::CallOp>(op)) {
++      if (auto callee = func->getParentOfType<mlir::ModuleOp>()
++                            .lookupSymbol<func::FuncOp>(call.getCallee())) {
++        os << " callee " << hashFuncOp(callee);
++      }
++    }
++    for (mlir::Type type : op.getResultTypes()) {
++      os << ' ' << type;
++    }
++    for (mlir::Value operand : op.getOperands()) {
++      if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(operand)) {
++        os << " arg" << arg.getArgNumber();
++      } else {
++        os << ' ' << keys[operand.getDefiningOp()] << '#'
++           << mlir::cast<mlir::OpResult>(operand).getResultNumber();
++      }
++    }
++    keys[&op] = sha(os.str());
++    opKeys.push_back(keys[&op]);
++  }
++  llvm::sort(opKeys);
++  std::string text;
++  llvm::raw_string_ostream os(text);
++  os << func.getFunctionType();
++  for (const std::string &key : opKeys) {
++    os << ' ' << key;
++  }
++  return sha(os.str());
++}
++
+ } // namespace mlir::tt
+ 
+ #endif // TTMLIR_SUPPORT_IRHASHER_H
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -3521,7 +3521,9 @@ createDeallocateOp(FlatbufferObjectCache &cache, DeallocateOp op) {
+ // functions).
+ //
+ // NOTE: the goal for this hashing is not to identify functions which are
+-// mathematically equivalent, but the completely identical ones.
++// mathematically equivalent, but the completely identical ones, up to the
++// order of independent ops: passes may order those differently from one
++// program to the next, and the programs must still share the results.
+ llvm::StringMap<std::string>
+ computeConstEvalFuncHashesSHA256(mlir::ModuleOp moduleOp) {
+   llvm::StringMap<std::string> constEvalHashes;
+@@ -3530,7 +3532,7 @@ computeConstEvalFuncHashesSHA256(mlir::ModuleOp moduleOp) {
+     if (!ttmlir::utils::isConstEvalFunc(func)) {
+       return;
+     }
+-    constEvalHashes[func.getSymName()] = hashFuncOp(func);
++    constEvalHashes[func.getSymName()] = hashFuncOpStructure(func);
+   });
+ 
+   return constEvalHashes;
