@@ -214,10 +214,10 @@ index f10b652..a072678 100644
      }
  
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp b/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
-index c4be522..96c9c40 100644
+index c4be522..478e7ea 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
-@@ -45,6 +45,45 @@ void applyLargeInnerDimBf16MatmulConfig(OpTy op,
+@@ -45,6 +45,47 @@ void applyLargeInnerDimBf16MatmulConfig(OpTy op,
    config = config.withPackerL1Acc(true);
  }
  
@@ -229,8 +229,9 @@ index c4be522..96c9c40 100644
 +// it sees the final operand dtypes.
 +//
 +// The matrix unit reads each operand in its own format, so an operand cast up
-+// from BF16, such as the hidden states of a router gate whose weight was
-+// converted, is then read in BF16 without the cast's program.
++// from BF16 to FP32, such as the hidden states of a router gate whose weight
++// was converted, is then read in BF16 without the cast's program. Narrowing
++// casts, such as a weight's to BFP8, stay.
 +void applyNarrowedExactMatmulConfig(MatmulOp op,
 +                                    DeviceComputeKernelConfigAttr &config) {
 +  if (!op->hasAttr("ttcore.fp32_exact")) {
@@ -250,6 +251,7 @@ index c4be522..96c9c40 100644
 +  for (mlir::OpOperand *operand : {&op.getAMutable(), &op.getBMutable()}) {
 +    auto typecast = operand->get().getDefiningOp<TypecastOp>();
 +    if (!typecast ||
++        dataType(operand->get()) != ttcore::DataType::Float32 ||
 +        dataType(typecast.getInput()) != ttcore::DataType::BFloat16) {
 +      continue;
 +    }
@@ -263,7 +265,7 @@ index c4be522..96c9c40 100644
  } // namespace
  
  #define GEN_PASS_DEF_TTNNSETCOMPUTEKERNELCONFIG
-@@ -160,6 +199,7 @@ public:
+@@ -160,6 +201,7 @@ public:
        // This fix is required for correctness of large matmuls/linears.
        if (auto matmulOp = dyn_cast<MatmulOp>(op)) {
          applyLargeInnerDimBf16MatmulConfig(matmulOp, config);
