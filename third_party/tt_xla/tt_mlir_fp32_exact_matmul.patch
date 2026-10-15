@@ -105,31 +105,21 @@ index e885db7..00c253f 100644
      return mlir::success();
    });
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-index 2b58082..2b10d35 100644
+index 2b58082..083fd74 100644
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -574,6 +574,20 @@ public:
-     };
-     mlir::Value a = bf16Source(matmulOp.getA());
-     mlir::Value b = bf16Source(matmulOp.getB());
-+    // An exact FP32 matmul runs on the vector unit, whose kernel reads FP32
-+    // operands only. With both operands BF16 tensors cast up to FP32, such as a
-+    // BF16 router gate applied to BF16 hidden states, it reads both directly,
-+    // and TTNNSetComputeKernelConfig runs it on the matrix unit at HiFi4.
+@@ -553,6 +553,10 @@ public:
+   mlir::LogicalResult
+   matchAndRewrite(MatmulOp matmulOp,
+                   mlir::PatternRewriter &rewriter) const final {
++    // The vector-unit kernel of an exact FP32 matmul reads FP32 operands only.
 +    if (matmulOp->hasAttr("ttcore.fp32_exact")) {
-+      if (!a || !b) {
-+        return mlir::failure();
-+      }
-+      rewriter.modifyOpInPlace(matmulOp, [&] {
-+        matmulOp.getAMutable().assign(a);
-+        matmulOp.getBMutable().assign(b);
-+      });
-+      return mlir::success();
++      return mlir::failure();
 +    }
-     // Exactly one: with both cast, the matmul would run in BF16.
-     if (bool(a) == bool(b)) {
-       return mlir::failure();
-@@ -1560,6 +1574,10 @@ public:
+     auto isF32 = [](mlir::Value value) {
+       return mlir::cast<mlir::RankedTensorType>(value.getType())
+           .getElementType()
+@@ -1560,6 +1564,10 @@ public:
      }
  
      MatmulOp matmulOp = lhsMatmul ? lhsMatmul : rhsMatmul;
@@ -140,7 +130,7 @@ index 2b58082..2b10d35 100644
      ReshapeOp matmulReshape = lhsMatmul ? lhsReshape : rhsReshape;
      TypedValue<RankedTensorType> rawBias =
          lhsMatmul ? addOp.getRhs() : addOp.getLhs();
-@@ -1940,6 +1958,11 @@ public:
+@@ -1940,6 +1948,11 @@ public:
                                         newMatmulAVal, newMatmulBVal, newBias,
                                         transposeA, transposeB)
                       .getResult();
@@ -152,7 +142,7 @@ index 2b58082..2b10d35 100644
  
      // The narrowed output already has the slice's shape, so it replaces it.
      rewriter.replaceOp(slice, narrowedResult);
-@@ -2219,6 +2242,10 @@ private:
+@@ -2219,6 +2232,10 @@ private:
    // for fusion.
    static FusionCandidates collectCandidates(OpType rootOp) {
      FusionCandidates result;
@@ -163,7 +153,7 @@ index 2b58082..2b10d35 100644
      Value sharedLHS = rootOp.getA();
      result.firstTransposeB = rootOp.getTransposeB();
  
-@@ -2231,7 +2258,8 @@ private:
+@@ -2231,7 +2248,8 @@ private:
      for (Operation *user : sharedLHS.getUsers()) {
        auto op = dyn_cast<OpType>(user);
        if (!op || op.getA() != sharedLHS ||
@@ -173,7 +163,7 @@ index 2b58082..2b10d35 100644
          continue;
        }
  
-@@ -3711,6 +3739,11 @@ class PermuteMatmulFusionPattern : public mlir::OpRewritePattern<OpType> {
+@@ -3711,6 +3729,11 @@ class PermuteMatmulFusionPattern : public mlir::OpRewritePattern<OpType> {
  public:
    mlir::LogicalResult
    matchAndRewrite(OpType op, mlir::PatternRewriter &rewriter) const override {
@@ -224,20 +214,19 @@ index f10b652..a072678 100644
      }
  
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp b/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
-index c4be522..2889b38 100644
+index c4be522..96c9c40 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
-@@ -45,6 +45,46 @@ void applyLargeInnerDimBf16MatmulConfig(OpTy op,
+@@ -45,6 +45,45 @@ void applyLargeInnerDimBf16MatmulConfig(OpTy op,
    config = config.withPackerL1Acc(true);
  }
  
 +// A matmul at the highest precision (ttcore.fp32_exact) runs on the vector
 +// unit, ttnn::experimental::matmul_fp32, which reads FP32 operands only. With
-+// a narrower operand (a BF16 tensor whose cast was dropped, or a weight
-+// converted on request) it runs on the matrix unit at HiFi4 with an FP32 Dst
-+// instead: its BF16 products are exact, but its sums keep fewer bits than
-+// FP32. This runs after the weight dtype conversion, so it sees the final
-+// operand dtypes.
++// a weight converted to a narrower dtype on request, it runs on the matrix
++// unit at HiFi4 with an FP32 Dst instead: its products are exact, but its sums
++// keep fewer bits than FP32. This runs after the weight dtype conversion, so
++// it sees the final operand dtypes.
 +//
 +// The matrix unit reads each operand in its own format, so an operand cast up
 +// from BF16, such as the hidden states of a router gate whose weight was
@@ -274,7 +263,7 @@ index c4be522..2889b38 100644
  } // namespace
  
  #define GEN_PASS_DEF_TTNNSETCOMPUTEKERNELCONFIG
-@@ -160,6 +200,7 @@ public:
+@@ -160,6 +199,7 @@ public:
        // This fix is required for correctness of large matmuls/linears.
        if (auto matmulOp = dyn_cast<MatmulOp>(op)) {
          applyLargeInnerDimBf16MatmulConfig(matmulOp, config);
