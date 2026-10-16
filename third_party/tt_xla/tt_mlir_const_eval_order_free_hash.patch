@@ -12,17 +12,24 @@ diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher
  #include "llvm/ADT/StringExtras.h"
  #include "llvm/Support/SHA256.h"
  #include "llvm/Support/raw_ostream.h"
-@@ -68,6 +71,64 @@ inline std::string hashFuncOp(func::FuncOp func) {
+@@ -68,6 +71,71 @@ inline std::string hashFuncOp(func::FuncOp func) {
    return llvm::toHex(digest, /*LowerCase=*/true);
  }
  
-+// A hash of a function that does not depend on the order of its independent
-+// ops: the function type and the sorted keys of its ops, an op's key being a
-+// hash of its name, attributes, result types and operands (a block argument by
-+// its number, an op result by its op's key). Functions that compute the same
-+// results from the same arguments get the same hash however their ops are
-+// ordered. Falls back to hashFuncOp for a function with nested regions.
-+inline std::string hashFuncOpStructure(func::FuncOp func) {
++// The hash of a const-eval function that keys its cached results
++// (computeConstEvalFuncHashesSHA256). Unlike hashFuncOp, it ignores the order
++// of independent ops: passes may order a const-eval function's ops differently
++// from one program to the next, and those programs must still share the
++// cached results. That is sound only because the hash stands for the values
++// the function returns, which for a const-eval function do not depend on the
++// order of its ops. Use hashFuncOp where the hash must identify the code
++// itself, such as a compile cache.
++//
++// The hash covers the function type and the sorted keys of its ops. An op's key
++// hashes its name, attributes, result types and operands (a block argument by
++// its number, an op result by its op's key). A function with nested regions
++// falls back to hashFuncOp.
++inline std::string hashConstEvalFuncOp(func::FuncOp func) {
 +  auto sha = [](llvm::StringRef bytes) {
 +    return llvm::toHex(
 +        llvm::SHA256::hash(llvm::ArrayRef<uint8_t>(
@@ -96,7 +103,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
        return;
      }
 -    constEvalHashes[func.getSymName()] = hashFuncOp(func);
-+    constEvalHashes[func.getSymName()] = hashFuncOpStructure(func);
++    constEvalHashes[func.getSymName()] = hashConstEvalFuncOp(func);
    });
  
    return constEvalHashes;
