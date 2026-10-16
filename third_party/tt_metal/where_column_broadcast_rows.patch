@@ -1,0 +1,138 @@
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
+@@ -423,9 +423,24 @@
+ // Reads the very first column of the CB and fills the entire tile with the same column.
+ // Tile is assumed to have 16-bit elements. A row of the tile is a row of faces 0 and 1 (rows 0 to
+ // 15) or 2 and 3: the left faces' rows are filled from their first elements and copied right.
+-FORCE_INLINE void fill_tile_with_first_column_bfloat16(uint32_t l1_write_ptr) {
++FORCE_INLINE void fill_tile_with_first_column_bfloat16(uint32_t l1_write_ptr, uint32_t rows = 32) {
+     auto* ptr = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(l1_write_ptr);
+     auto* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_write_ptr);
++    // Rows past `rows` are padding whose results are dropped. When the rest fit in the top faces,
++    // write each row into both of them instead of filling 32 rows and copying the faces.
++    if (rows <= 16) {
++        for (uint32_t row_offset = 0; row_offset < rows * 16; row_offset += 16) {
++            const uint32_t first = ptr[row_offset];
++            const uint32_t packed = (first << 16) | first;
++            const uint32_t word = row_offset / 2;
++#pragma GCC unroll 8
++            for (uint32_t i = 0; i < 8; ++i) {
++                words[word + i] = packed;
++                words[128 + word + i] = packed;
++            }
++        }
++        return;
++    }
+     for (uint32_t face_offset = 0; face_offset < 1024; face_offset += 512) {
+         for (uint32_t row_offset = 0; row_offset < 256; row_offset += 16) {
+             const uint32_t first = ptr[face_offset + row_offset];
+@@ -442,8 +457,23 @@
+ 
+ // Reads the very first column of the CB and fills the entire tile with the same column.
+ // Tile is assumed to have 32-bit elements (float32/int32), filled as the 16-bit case.
+-FORCE_INLINE void fill_tile_with_first_column(uint32_t l1_write_ptr) {
++FORCE_INLINE void fill_tile_with_first_column(uint32_t l1_write_ptr, uint32_t rows = 32) {
+     auto* ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_write_ptr);
++    // As in fill_tile_with_first_column_bfloat16.
++    if (rows <= 16) {
++        for (uint32_t row_offset = 0; row_offset < rows * 16; row_offset += 16) {
++            const uint32_t first = ptr[row_offset];
++#pragma GCC unroll 15
++            for (uint32_t col = 1; col < 16; ++col) {
++                ptr[row_offset + col] = first;
++            }
++#pragma GCC unroll 16
++            for (uint32_t col = 0; col < 16; ++col) {
++                ptr[256 + row_offset + col] = first;
++            }
++        }
++        return;
++    }
+     for (uint32_t face_offset = 0; face_offset < 1024; face_offset += 512) {
+         for (uint32_t row_offset = 0; row_offset < 256; row_offset += 16) {
+             const uint32_t first = ptr[face_offset + row_offset];
+diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/kernels/dataflow/ternary_reader_colbcast_ttt.cpp ttnn/cpp/ttnn/operations/eltwise/ternary/device/kernels/dataflow/ternary_reader_colbcast_ttt.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/ternary/device/kernels/dataflow/ternary_reader_colbcast_ttt.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/ternary/device/kernels/dataflow/ternary_reader_colbcast_ttt.cpp
+@@ -41,6 +41,8 @@
+     const uint32_t false_num_tiles = get_arg_val<uint32_t>(24);
+     const uint32_t dst_shard_width = get_arg_val<uint32_t>(25);
+     const uint32_t src_num_tiles = get_arg_val<uint32_t>(26);  // moved to end
++    // Rows of the last tile row that hold data: the broadcast fills skip the padding rows.
++    const uint32_t last_tile_rows = get_arg_val<uint32_t>(27);
+ 
+     // For compatibility, map to old variable names
+     const uint32_t src_addr = src0_addr;       // predicate address
+@@ -143,36 +145,40 @@
+             for (uint32_t n = start_n; n < N && num_tiles_read < dst_num_tiles; ++n, start_c = 0) {
+                 for (uint32_t c = start_c; c < C && num_tiles_read < dst_num_tiles; ++c, start_th = 0) {
+                     for (uint32_t th = start_th; th < Ht && num_tiles_read < dst_num_tiles; ++th) {
++                        const uint32_t rows = th == Ht - 1 ? last_tile_rows : 32;
++                        // Read the broadcast operands together, then wait once and fill them.
+ #if SRC_BCAST_A
+                         cb_pred.reserve_back(onetile);
+ #if !SRC_SHARDED_A
+                         noc.async_read(
+                             s0, cb_pred, src0_tile_bytes, {.page_id = tile_offset + th}, {.offset_bytes = 0});
+-                        noc.async_read_barrier();
+ #endif
+-                        FILL_TILE_WITH_FIRST_COLUMN(cb_pred.get_write_ptr());
+-                        cb_pred.push_back(onetile);
+ #endif
+ #if SRC_BCAST_B
+                         cb_true.reserve_back(onetile);
+ #if !SRC_SHARDED_B
+                         noc.async_read(
+                             s1, cb_true, src1_tile_bytes, {.page_id = true_tile_offset + th}, {.offset_bytes = 0});
+-                        noc.async_read_barrier();
+ #endif
+-                        FILL_TILE_WITH_FIRST_COLUMN_B(cb_true.get_write_ptr());
+-                        cb_true.push_back(onetile);
+ #endif
+-
+-                        // False tensor broadcast (same as true tensor)
+ #if SRC_BCAST_C
+                         cb_false.reserve_back(onetile);
+ #if !SRC_SHARDED_C
+                         noc.async_read(
+                             s2, cb_false, src2_tile_bytes, {.page_id = false_tile_offset + th}, {.offset_bytes = 0});
++#endif
++#endif
+                         noc.async_read_barrier();
++#if SRC_BCAST_A
++                        FILL_TILE_WITH_FIRST_COLUMN(cb_pred.get_write_ptr(), rows);
++                        cb_pred.push_back(onetile);
++#endif
++#if SRC_BCAST_B
++                        FILL_TILE_WITH_FIRST_COLUMN_B(cb_true.get_write_ptr(), rows);
++                        cb_true.push_back(onetile);
+ #endif
+-                        FILL_TILE_WITH_FIRST_COLUMN_C(cb_false.get_write_ptr());
++#if SRC_BCAST_C
++                        FILL_TILE_WITH_FIRST_COLUMN_C(cb_false.get_write_ptr(), rows);
+                         cb_false.push_back(onetile);
+ #endif
+                         for (uint32_t tw = start_tw; tw < end_tw && num_tiles_read < dst_num_tiles;
+diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
+@@ -638,7 +638,7 @@
+ 
+ // Per-kernel runtime-arg counts.  Both the cache-miss and cache-hit paths fill exactly this many
+ // slots for every core, which is what lets the hit path copy a fixed-width row per core.
+-constexpr size_t kNumReaderArgs = 27;
++constexpr size_t kNumReaderArgs = 28;
+ constexpr size_t kNumWriterArgs = 11;
+ constexpr size_t kNumComputeArgs = 4;
+ 
+@@ -882,6 +882,9 @@
+             reader_runtime_args[24] = f_num_tiles;              // 24: false_num_tiles
+             reader_runtime_args[25] = c_current_shard_width;    // 25: dst_shard_width
+             reader_runtime_args[26] = a_num_tiles;              // 26: src_num_tiles (predicate)
++            // 27: rows of the last tile row that hold data (ternary_reader_colbcast_ttt.cpp)
++            const uint32_t height = out_rank >= 2 ? output.logical_shape()[-2] : 1;
++            reader_runtime_args[27] = height % tile_h == 0 ? tile_h : height % tile_h;
+ 
+             // Slots 0,1,2 already hold the three CURRENT buffer base addresses (set above);
+             // reader_buffer_slots records them for create_descriptor()'s bindings.

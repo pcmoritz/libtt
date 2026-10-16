@@ -213,6 +213,66 @@ index f10b652..a072678 100644
        return failure();
      }
  
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp b/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
+index c4be522..478e7ea 100644
+--- a/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
+@@ -45,6 +45,47 @@ void applyLargeInnerDimBf16MatmulConfig(OpTy op,
+   config = config.withPackerL1Acc(true);
+ }
+ 
++// A matmul at the highest precision (ttcore.fp32_exact) runs on the vector
++// unit, ttnn::experimental::matmul_fp32, which reads FP32 operands only. With
++// a weight converted to a narrower dtype on request, it runs on the matrix
++// unit at HiFi4 with an FP32 Dst instead: its products are exact, but its sums
++// keep fewer bits than FP32. This runs after the weight dtype conversion, so
++// it sees the final operand dtypes.
++//
++// The matrix unit reads each operand in its own format, so an operand cast up
++// from BF16 to FP32, such as the hidden states of a router gate whose weight
++// was converted, is then read in BF16 without the cast's program. Narrowing
++// casts, such as a weight's to BFP8, stay.
++void applyNarrowedExactMatmulConfig(MatmulOp op,
++                                    DeviceComputeKernelConfigAttr &config) {
++  if (!op->hasAttr("ttcore.fp32_exact")) {
++    return;
++  }
++  auto dataType = [](mlir::Value value) {
++    return getDtypeFromValue(value).getValue();
++  };
++  if (dataType(op.getA()) == ttcore::DataType::Float32 &&
++      dataType(op.getB()) == ttcore::DataType::Float32) {
++    return;
++  }
++  op->removeAttr("ttcore.fp32_exact");
++  config = config.withMathFidelity(MathFidelity::HiFi4)
++               .withFp32DestAccEn(true)
++               .withMathApproxMode(false);
++  for (mlir::OpOperand *operand : {&op.getAMutable(), &op.getBMutable()}) {
++    auto typecast = operand->get().getDefiningOp<TypecastOp>();
++    if (!typecast ||
++        dataType(operand->get()) != ttcore::DataType::Float32 ||
++        dataType(typecast.getInput()) != ttcore::DataType::BFloat16) {
++      continue;
++    }
++    operand->set(typecast.getInput());
++    if (typecast->use_empty()) {
++      typecast->erase();
++    }
++  }
++}
++
+ } // namespace
+ 
+ #define GEN_PASS_DEF_TTNNSETCOMPUTEKERNELCONFIG
+@@ -160,6 +201,7 @@ public:
+       // This fix is required for correctness of large matmuls/linears.
+       if (auto matmulOp = dyn_cast<MatmulOp>(op)) {
+         applyLargeInnerDimBf16MatmulConfig(matmulOp, config);
++        applyNarrowedExactMatmulConfig(matmulOp, config);
+       } else if (auto linearOp = dyn_cast<LinearOp>(op)) {
+         applyLargeInnerDimBf16MatmulConfig(linearOp, config);
+       }
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 index 6d98b51..da78f90 100644
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp

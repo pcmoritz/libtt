@@ -1,4 +1,4 @@
-module(name = "libtt", version = "0.1.1")
+module(name = "libtt", version = "0.1.2")
 
 bazel_dep(name = "bazel_skylib", version = "1.8.2")
 bazel_dep(name = "googletest", version = "1.17.0.bcr.2", dev_dependency = True)
@@ -311,6 +311,8 @@ http_archive(
         "//third_party/tt_metal:conv_single_channel_not_depthwise.patch",
         "//third_party/tt_metal:single_host_all_reduce.patch",
         "//third_party/tt_metal:topk_multicore_router_width.patch",
+        "//third_party/tt_metal:topk_last_dim_logical_k.patch",
+        "//third_party/tt_metal:topk_select.patch",
         "//third_party/tt_metal:index_tile_32bit_row_copies.patch",
         "//third_party/tt_metal:moe_compute_local_output.patch",
         "//third_party/tt_metal:moe_compute_local_output_unlabeled_replicas.patch",
@@ -335,6 +337,16 @@ http_archive(
         "//third_party/tt_metal:reduce_precision_kernel.patch",
         "//third_party/tt_metal:arange_uint8.patch",
         "//third_party/tt_metal:reduce_uint32_max_min.patch",
+        "//third_party/tt_metal:sort_nan.patch",
+        "//third_party/tt_metal:packer_identity_nan.patch",
+        "//third_party/tt_metal:mulhi_uint32.patch",
+        "//third_party/tt_metal:blackhole_kernel_config_ring.patch",
+        "//third_party/tt_metal:softmax_pad_mask_row.patch",
+        "//third_party/tt_metal:where_column_broadcast_rows.patch",
+        "//third_party/tt_metal:topk_int32_indices.patch",
+        "//third_party/tt_metal:matmul_tile_layout_first.patch",
+        "//third_party/tt_metal:matmul_decode_fp32_accumulation.patch",
+        "//third_party/tt_metal:tilize_pad_fill.patch",
     ],
     sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
     strip_prefix = "tt-metal-eb97711f4be2a30cfbff05266faf90bf9780d0c2",
@@ -561,6 +573,9 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_reduce_precision_op.patch",
         "//third_party/tt_xla:tt_mlir_reduce_uint32_max_min.patch",
         "//third_party/tt_xla:tt_mlir_indexed_rows.patch",
+        "//third_party/tt_xla:tt_mlir_chlo_mulhi.patch",
+        "//third_party/tt_xla:tt_mlir_topk_int32_indices.patch",
+        "//third_party/tt_xla:tt_mlir_const_eval_order_free_hash.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

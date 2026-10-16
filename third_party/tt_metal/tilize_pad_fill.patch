@@ -1,0 +1,63 @@
+diff --git ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp
+--- ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp
++++ ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp
+@@ -121,12 +121,27 @@ FORCE_INLINE void fill_l1_range(uint32_t start_addr, uint32_t n_bytes, uint32_t
+         val_4B = (uint32_t(short_val) << 16) | uint32_t(short_val);
+     }
+ 
+-    // Bulk 4-byte-aligned writes.
++    // Bulk 4-byte-aligned writes. A store per word costs several cycles on the data-movement
++    // cores, so a long zero fill zeroes its 16-byte-aligned middle with NoC loopback reads.
+     {
+-        auto* p = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(start_addr_4B);
+-        auto* e = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(end_addr_4B);
+-        for (; p < e; ++p) {
+-            *p = val_4B;
++        auto store = [val_4B](uint32_t begin, uint32_t end) {
++            auto* p = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(begin);
++            auto* e = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(end);
++            for (; p < e; ++p) {
++                *p = val_4B;
++            }
++        };
++        constexpr uint32_t zero_align = NOC_L1_READ_ALIGNMENT_BYTES;
++        const uint32_t zero_start = (start_addr_4B + zero_align - 1) & ~(zero_align - 1);
++        const uint32_t zero_end = end_addr_4B & ~(zero_align - 1);
++        if (val_4B == 0 && zero_end >= zero_start + 256) {
++            Noc noc;
++            noc.async_write_zeros(CoreLocalMem<uint32_t>(zero_start), zero_end - zero_start);
++            store(start_addr_4B, zero_start);
++            store(zero_end, end_addr_4B);
++            noc.write_zeros_l1_barrier();
++        } else {
++            store(start_addr_4B, end_addr_4B);
+         }
+     }
+ 
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp
+@@ -65,12 +65,12 @@ void kernel_main() {
+                 noc.async_read(
+                     s, dst, width_size, {.page_id = size_2d + k, .offset_bytes = start_column_id}, {.offset_bytes = 0});
+ 
+-                // Block before copying data from tmp to cb buffer
+-                noc.async_read_barrier();
+-
+                 uint32_t prev_size = start_column_id;
+                 uint32_t this_block_size = unpadded_X_size - prev_size;
+                 if (this_block_size < width_size) {
++                    // The read also lands past the valid bytes: pad after it completes. Rows
++                    // without padding share the barrier before the push.
++                    noc.async_read_barrier();
+                     uint32_t to_pad = width_size - this_block_size;
+                     dataflow_kernel_lib::fill_l1_range<element_size>(
+                         l1_write_addr + this_block_size, to_pad, pad_value);
+@@ -115,6 +115,7 @@ void kernel_main() {
+         dataflow_kernel_lib::fill_l1_range<element_size>(l1_write_addr, row_pad_bytes, pad_value);
+         l1_write_addr += row_pad_bytes;
+ 
++        noc.async_read_barrier();
+         dfb_in0.push_back(single_block_size * has_rows);
+     };
+ 

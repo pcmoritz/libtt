@@ -1,0 +1,123 @@
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.hpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.hpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.hpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.hpp
+@@ -37,7 +37,16 @@
+             tensor_return_value_t& tensor_return_value);
+     };
+ 
+-    using program_factory_t = std::variant<TopKSingleCoreProgramFactory, TopKMultiCoreProgramFactory>;
++    // Up to two tile rows and wide rows: a selection on the data-movement cores (topk_select.hpp).
++    struct TopKSelectProgramFactory {
++        static tt::tt_metal::ProgramDescriptor create_descriptor(
++            const operation_attributes_t& operation_attributes,
++            const tensor_args_t& tensor_args,
++            tensor_return_value_t& tensor_return_value);
++    };
++
++    using program_factory_t =
++        std::variant<TopKSingleCoreProgramFactory, TopKMultiCoreProgramFactory, TopKSelectProgramFactory>;
+ 
+     static program_factory_t select_program_factory(const operation_attributes_t&, const tensor_args_t&);
+     static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "ttnn/operations/reduction/topk/device/topk_device_operation_types.hpp"
+ #include "ttnn/operations/reduction/topk/device/topk_constants.hpp"
++#include "ttnn/operations/reduction/topk/device/topk_select.hpp"
+ #include "ttnn/operations/reduction/topk/device/topk_utils.hpp"
+ 
+ #include "ttnn/device_operation.hpp"
+@@ -23,6 +24,19 @@
+ namespace ttnn::prim {
+ 
+ namespace {
++// Whether the selection factory runs the call (topk_select.hpp).
++bool runs_topk_select(
++    const TopKDeviceOperation::operation_attributes_t& args, const TopKDeviceOperation::tensor_args_t& tensor_args) {
++    return topk_select_plan(
++               tensor_args.input,
++               args.k,
++               tensor_args.indices.has_value(),
++               tensor_args.preallocated_outputs.has_value(),
++               args.output_memory_config,
++               args.sub_core_grids)
++        .has_value();
++}
++
+ // The index dtype the op runs at: index CB, generated iota and output tensor all follow it.
+ // A preallocated indices output pins it; a 32-bit indices_tensor widens it. A UINT16
+ // indices_tensor never narrows it -- validate rejects one narrower than the input requires.
+@@ -98,6 +112,10 @@
+     const operation_attributes_t& args, const tensor_args_t& tensor_args) {
+     const auto& input_tensor = tensor_args.input;
+ 
++    if (runs_topk_select(args, tensor_args)) {
++        return TopKSelectProgramFactory{};
++    }
++
+     const ttnn::Shape input_shape = input_tensor.padded_shape();
+ 
+     // Requirements #1-#3 (shape/K structure) via the shared eligibility helper — the
+@@ -163,12 +181,14 @@
+     const auto& input_tensor = tensor_args.input;
+     const auto& indices_tensor = tensor_args.indices;
+     const auto& preallocated_outputs = tensor_args.preallocated_outputs;
++    // The selection path reads only the logical width and runs on the grid it was planned for.
++    const bool select = runs_topk_select(args, tensor_args);
+ 
+     // Tensor shape validation
+     const auto input_shape = input_tensor.padded_shape();
+     TT_FATAL(input_shape.rank() == 4, "Input shape must be 4D, got {}", input_shape.rank());
+     TT_FATAL(
+-        input_shape[-1] >= ttnn::prim::constants::min_dim_per_core,
++        select || input_shape[-1] >= ttnn::prim::constants::min_dim_per_core,
+         "Input shape inner dim {} must be >= {}, pad with +/-infinity if necessary",
+         input_shape[-1],
+         ttnn::prim::constants::min_dim_per_core);
+@@ -314,6 +334,9 @@
+         validate_reduce_op_tensor(std::get<0>(preallocated_outputs.value()), "TopK", "preallocated_values");
+         validate_reduce_op_tensor(std::get<1>(preallocated_outputs.value()), "TopK", "preallocated_indices");
+     }
++    if (select) {
++        return;
++    }
+     // Execution feasibility validation
+     // Verify that the operation can be executed with available hardware resources
+     bool can_run = false;
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
+@@ -23,6 +23,7 @@
+ #include "ttnn/operations/reduction/topk/device/topk_utils.hpp"
+ #include "ttnn/operations/reduction/topk/device/topk_route_prep_device_operation.hpp"
+ #include "ttnn/operations/reduction/topk/device/topk_route_finish_device_operation.hpp"
++#include "ttnn/operations/reduction/topk/device/topk_select.hpp"
+ 
+ #include <cstdint>
+ #include <limits>
+@@ -631,6 +632,22 @@
+         return routed_final;
+     }
+ 
++    // Up to two tile rows and wide rows select their top k on the data-movement cores (topk_select.hpp). That
++    // path reads only the logical width and takes k as it is: no padding, no fill and no k rounded to a tile.
++    if (ttnn::prim::topk_select_plan(
++            transformed_tensor,
++            k,
++            indices_tensor.has_value(),
++            preallocated_output_tensors.has_value(),
++            input_memory_config,
++            used_sub_core_grids)) {
++        auto [values, indices] = ttnn::prim::topk(
++            transformed_tensor, k, -1, largest, sorted, stable, input_memory_config, used_sub_core_grids);
++        std::vector<Tensor> result{std::move(values), std::move(indices)};
++        return operations::reduction::topk::CMAKE_UNIQUE_NAMESPACE::post_topk_transform_tensor(
++            transposed_tensor, result, dim, is_dim_last_idx, k, k, original_lshape, input_memory_config);
++    }
++
+     // Dimension size padding - ensure minimum dimension size for efficient processing
+     auto padded_tensor = transformed_tensor;
+     const auto current_dim_size = static_cast<int>(transformed_tensor.logical_shape()[-1]);

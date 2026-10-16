@@ -1,0 +1,96 @@
+"""Float sorts order like stablehlo's comparators: -0.0 and +0.0 tie, and every
+NaN (of either sign) sorts after +inf. NaNs used to be dropped behind the +inf
+row padding or sorted first when negative. Results must match XLA on the CPU.
+"""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from jax import lax
+
+SPECIAL = [np.nan, -np.nan, np.inf, -np.inf, 0.0, -0.0, 1.0, -1.0]
+
+
+def on(device, f, *args):
+    return np.asarray(jax.jit(f)(*(jax.device_put(a, jax.devices(device)[0]) for a in args)))
+
+
+def assert_matches_cpu(f, x):
+    got, expected = on("tt", f, x), on("cpu", f, x)
+    # numpy treats NaNs as equal only for its own float types, so compare bfloat16 as float32.
+    if got.dtype == jnp.bfloat16:
+        got, expected = got.astype(np.float32), expected.astype(np.float32)
+    np.testing.assert_array_equal(got, expected)
+
+
+def values(n, dtype, seed=0):
+    x = np.random.default_rng(seed).normal(size=n).astype(np.float32)
+    special = np.array(SPECIAL, np.float32)
+    x[np.random.default_rng(seed + 1).choice(n, size=min(n, 3 * len(SPECIAL)), replace=False)] = np.resize(
+        special, min(n, 3 * len(SPECIAL))
+    )
+    return x.astype(dtype)
+
+
+DTYPES = [np.float32, np.float16, jnp.bfloat16]
+DTYPE_IDS = ["f32", "f16", "bf16"]
+
+
+# Row lengths that need padding, including more than one tile row.
+@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+@pytest.mark.parametrize("n", [6, 40, 100], ids=["n6", "n40", "n100"])
+@pytest.mark.parametrize("descending", [False, True], ids=["asc", "desc"])
+def test_sort_special_values(dtype, n, descending):
+    assert_matches_cpu(lambda v: jnp.sort(v, descending=descending), values(n, dtype))
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+@pytest.mark.parametrize("descending", [False, True], ids=["asc", "desc"])
+def test_stable_argsort_special_values(dtype, descending):
+    x = values(40, dtype, seed=3)
+    assert_matches_cpu(lambda v: jnp.argsort(v, stable=True, descending=descending), x)
+
+
+# The case from JAX's lax_test: stable argsort of special values is the identity.
+def test_sort_key_val_special_values_identity():
+    x = np.array([-np.inf, 0.0, -0.0, np.inf, np.nan, -np.nan], np.float32)
+    got = on("tt", lambda v: lax.sort_key_val(v, lax.iota(np.int32, v.size), is_stable=True)[1], x)
+    np.testing.assert_array_equal(got, np.arange(x.size))
+
+
+@pytest.mark.parametrize("axis", [0, 1], ids=["d0", "d1"])
+def test_sort_2d_special_values(axis):
+    x = values(5 * 37, np.float32, seed=5).reshape(5, 37)
+    assert_matches_cpu(lambda v: jnp.sort(v, axis=axis), x)
+
+
+# Rows of more than 32768 elements pad to 65536 and use UINT32 indices, which
+# switches bfloat16 sorts to 32-bit DEST.
+def test_long_row_bfloat16_sort():
+    x = values(32769, jnp.bfloat16, seed=7)
+    assert_matches_cpu(jnp.sort, x)
+    assert_matches_cpu(lambda v: jnp.argsort(v, stable=True), x)
+
+
+def assert_is_sorting_permutation(x, indices, descending):
+    n = x.shape[-1]
+    assert indices.min() >= 0 and indices.max() < n
+    np.testing.assert_array_equal(np.sort(indices), np.arange(n))
+    expected = np.sort(x.astype(np.float32))
+    if descending:
+        expected = expected[::-1]
+    np.testing.assert_array_equal(x.astype(np.float32)[indices], expected)
+
+
+# Unstable sorts may order ties differently from the CPU, so check the values and
+# that the indices form a permutation that sorts them. bfloat16 padding equals the
+# canonical NaN, so it must not take the place of a real NaN.
+@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+@pytest.mark.parametrize("n", [6, 40], ids=["n6", "n40"])
+@pytest.mark.parametrize("descending", [False, True], ids=["asc", "desc"])
+def test_unstable_sort_special_values(dtype, n, descending):
+    x = values(n, dtype, seed=9)
+    assert_matches_cpu(lambda v: jnp.sort(v, stable=False, descending=descending), x)
+    indices = on("tt", lambda v: jnp.argsort(v, stable=False, descending=descending), x)
+    assert_is_sorting_permutation(x, indices, descending)
