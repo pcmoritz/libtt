@@ -349,6 +349,7 @@ http_archive(
         "//third_party/tt_metal:where_column_broadcast_rows.patch",
         "//third_party/tt_metal:topk_int32_indices.patch",
         "//third_party/tt_metal:matmul_tile_layout_first.patch",
+        "//third_party/tt_metal:matmul_decode_fp32_accumulation.patch",
         "//third_party/tt_metal:tilize_pad_fill.patch",
     ],
     sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
