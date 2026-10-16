@@ -13,7 +13,7 @@ diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher
  #include "llvm/ADT/StringExtras.h"
  #include "llvm/Support/SHA256.h"
  #include "llvm/Support/raw_ostream.h"
-@@ -68,6 +72,83 @@ inline std::string hashFuncOp(func::FuncOp func) {
+@@ -68,6 +72,78 @@ inline std::string hashFuncOp(func::FuncOp func) {
    return llvm::toHex(digest, /*LowerCase=*/true);
  }
  
@@ -29,9 +29,10 @@ diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher
 +// The hash covers the function type and the sorted keys of its ops. An op's key
 +// hashes its name, attributes, result types and operands (a block argument by
 +// its number, an op result by its op's key). A function with nested regions,
-+// or with an op that writes memory (into an operand in place, like
-+// ttnn.update_cache, or anywhere, like ttnn.generic), falls back to hashFuncOp:
-+// reordering such ops can change the results.
++// or with an op that might write memory, falls back to hashFuncOp: reordering
++// such ops can change the results. That covers writes into an operand in place
++// (ttnn.update_cache), writes elsewhere (ttnn.generic), and ops whose effects
++// are unknown, such as a func.call, whose callee may write its arguments.
 +inline std::string hashConstEvalFuncOp(func::FuncOp func) {
 +  auto sha = [](llvm::StringRef bytes) {
 +    return llvm::toHex(
@@ -45,23 +46,17 @@ diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher
 +  llvm::DenseMap<mlir::Operation *, std::string> keys;
 +  llvm::SmallVector<std::string> opKeys;
 +  for (mlir::Operation &op : func.getBody().front()) {
-+    auto memoryEffects = mlir::dyn_cast<mlir::MemoryEffectOpInterface>(op);
 +    if (op.getNumRegions() != 0 ||
-+        (memoryEffects &&
-+         memoryEffects.hasEffect<mlir::MemoryEffects::Write>())) {
++        mlir::mightHaveEffect<mlir::MemoryEffects::Write>(&op)) {
 +      return hashFuncOp(func);
 +    }
 +    std::string text;
 +    llvm::raw_string_ostream os(text);
-+    os << op.getName() << op.getAttrDictionary();
++    // The stored attributes, then an op's properties (its inherent attributes,
++    // which getAttrDictionary merges in and would print a second time).
++    os << op.getName() << op.getRawDictionaryAttrs();
 +    if (mlir::Attribute properties = op.getPropertiesAsAttribute()) {
 +      os << properties;
-+    }
-+    if (auto call = mlir::dyn_cast<func::CallOp>(op)) {
-+      if (auto callee = func->getParentOfType<mlir::ModuleOp>()
-+                            .lookupSymbol<func::FuncOp>(call.getCallee())) {
-+        os << " callee " << hashFuncOp(callee);
-+      }
 +    }
 +    for (mlir::Type type : op.getResultTypes()) {
 +      os << ' ' << type;
