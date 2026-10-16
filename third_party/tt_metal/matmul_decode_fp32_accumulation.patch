@@ -28,13 +28,14 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
-@@ -2909,12 +2909,19 @@ MatmulParams create_matmul_attributes(
+@@ -2909,12 +2909,20 @@ MatmulParams create_matmul_attributes(
          }
      }
      bool is_float_32 = output_dtype == DataType::FLOAT32;
 +    // A decode matmul (one tile row of activations) accumulates in FP32 on Blackhole. At one tile row it takes no
 +    // longer, its error is about 2.4x smaller (the BF16 Dst sums lose bits), and the K block no longer changes the
-+    // result, so the 1D planner may size the block for DRAM bandwidth (get_mcast_1d_config).
++    // result, so the 1D planner may size the block for DRAM bandwidth (get_mcast_1d_config). A caller's program
++    // config keeps the BF16 default: FP32 halves the Dst tiles its output subblocks may use.
 +    const auto a_padded_shape =
 +        operations::matmul::utilities::get_matmul_tensor_padded_shape(input_tensor_a, parameters.transpose_a);
 +    const bool decode_rows = arch == tt::ARCH::BLACKHOLE && output_dtype == DataType::BFLOAT16 &&
@@ -45,7 +46,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
          math_fidelity,
          /*default_approx_mode=*/false,
 -        /*default_fp32_acc=*/is_float_32,
-+        /*default_fp32_acc=*/is_float_32 || decode_rows,
++        /*default_fp32_acc=*/is_float_32 || (!has_program_config && decode_rows),
          /*default_l1_acc=*/!is_float_32);
      ttnn::verify_numerical_configuration(arch, parameters.compute_kernel_config);
      auto in0_tile = operations::matmul::utilities::get_matmul_tile(input_tensor_a, parameters.transpose_a);
