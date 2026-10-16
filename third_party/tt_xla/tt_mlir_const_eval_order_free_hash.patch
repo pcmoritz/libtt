@@ -1,0 +1,117 @@
+diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher.h
+--- a/include/ttmlir/Support/IRHasher.h
++++ b/include/ttmlir/Support/IRHasher.h
+@@ -7,7 +7,11 @@
+ 
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/IR/BuiltinOps.h"
++#include "mlir/Interfaces/SideEffectInterfaces.h"
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/ScopeExit.h"
++#include "llvm/ADT/SmallVector.h"
+ #include "llvm/ADT/StringExtras.h"
+ #include "llvm/Support/SHA256.h"
+ #include "llvm/Support/raw_ostream.h"
+@@ -68,6 +72,78 @@ inline std::string hashFuncOp(func::FuncOp func) {
+   return llvm::toHex(digest, /*LowerCase=*/true);
+ }
+ 
++// The hash of a const-eval function that keys its cached results
++// (computeConstEvalFuncHashesSHA256). Unlike hashFuncOp, it ignores the order
++// of independent ops: passes may order a const-eval function's ops differently
++// from one program to the next, and those programs must still share the
++// cached results. That is sound only because the hash stands for the values
++// the function returns, which do not depend on the order of ops that only
++// read their operands. Use hashFuncOp where the hash must identify the code
++// itself, such as a compile cache.
++//
++// The hash covers the function type and the sorted keys of its ops. An op's key
++// hashes its name, attributes, result types and operands (a block argument by
++// its number, an op result by its op's key). A function with nested regions,
++// or with an op that might write memory, falls back to hashFuncOp: reordering
++// such ops can change the results. That covers writes into an operand in place
++// (ttnn.update_cache), writes elsewhere (ttnn.generic), and ops whose effects
++// are unknown, such as a func.call, whose callee may write its arguments.
++inline std::string hashConstEvalFuncOp(func::FuncOp func) {
++  auto sha = [](llvm::StringRef bytes) {
++    return llvm::toHex(
++        llvm::SHA256::hash(llvm::ArrayRef<uint8_t>(
++            reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size())),
++        /*LowerCase=*/true);
++  };
++  if (!func.getBody().hasOneBlock()) {
++    return hashFuncOp(func);
++  }
++  llvm::DenseMap<mlir::Operation *, std::string> keys;
++  llvm::SmallVector<std::string> opKeys;
++  for (mlir::Operation &op : func.getBody().front()) {
++    if (op.getNumRegions() != 0 ||
++        mlir::mightHaveEffect<mlir::MemoryEffects::Write>(&op)) {
++      return hashFuncOp(func);
++    }
++    std::string text;
++    llvm::raw_string_ostream os(text);
++    // The stored attributes, then an op's properties (its inherent attributes,
++    // which getAttrDictionary merges in and would print a second time).
++    os << op.getName() << op.getRawDictionaryAttrs();
++    if (mlir::Attribute properties = op.getPropertiesAsAttribute()) {
++      os << properties;
++    }
++    for (mlir::Type type : op.getResultTypes()) {
++      os << ' ' << type;
++    }
++    for (mlir::Value operand : op.getOperands()) {
++      if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(operand)) {
++        os << " arg" << arg.getArgNumber();
++      } else {
++        // A producer outside the body has no key; rather than hash it as an
++        // empty one, keep the exact hash.
++        auto producer = keys.find(operand.getDefiningOp());
++        if (producer == keys.end()) {
++          return hashFuncOp(func);
++        }
++        os << ' ' << producer->second << '#'
++           << mlir::cast<mlir::OpResult>(operand).getResultNumber();
++      }
++    }
++    std::string key = sha(text);
++    keys[&op] = key;
++    opKeys.push_back(std::move(key));
++  }
++  llvm::sort(opKeys);
++  std::string text;
++  llvm::raw_string_ostream os(text);
++  os << func.getFunctionType();
++  for (const std::string &key : opKeys) {
++    os << ' ' << key;
++  }
++  return sha(text);
++}
++
+ } // namespace mlir::tt
+ 
+ #endif // TTMLIR_SUPPORT_IRHASHER_H
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -3521,7 +3521,9 @@ createDeallocateOp(FlatbufferObjectCache &cache, DeallocateOp op) {
+ // functions).
+ //
+ // NOTE: the goal for this hashing is not to identify functions which are
+-// mathematically equivalent, but the completely identical ones.
++// mathematically equivalent, but the completely identical ones, up to the
++// order of independent ops: passes may order those differently from one
++// program to the next, and the programs must still share the results.
+ llvm::StringMap<std::string>
+ computeConstEvalFuncHashesSHA256(mlir::ModuleOp moduleOp) {
+   llvm::StringMap<std::string> constEvalHashes;
+@@ -3530,7 +3532,7 @@ computeConstEvalFuncHashesSHA256(mlir::ModuleOp moduleOp) {
+     if (!ttmlir::utils::isConstEvalFunc(func)) {
+       return;
+     }
+-    constEvalHashes[func.getSymName()] = hashFuncOp(func);
++    constEvalHashes[func.getSymName()] = hashConstEvalFuncOp(func);
+   });
+ 
+   return constEvalHashes;
