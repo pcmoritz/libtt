@@ -1,10 +1,11 @@
 diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher.h
 --- a/include/ttmlir/Support/IRHasher.h
 +++ b/include/ttmlir/Support/IRHasher.h
-@@ -7,7 +7,10 @@
+@@ -7,7 +7,11 @@
  
  #include "mlir/Dialect/Func/IR/FuncOps.h"
  #include "mlir/IR/BuiltinOps.h"
++#include "mlir/Interfaces/SideEffectInterfaces.h"
 +#include "llvm/ADT/DenseMap.h"
 +#include "llvm/ADT/STLExtras.h"
  #include "llvm/ADT/ScopeExit.h"
@@ -12,7 +13,7 @@ diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher
  #include "llvm/ADT/StringExtras.h"
  #include "llvm/Support/SHA256.h"
  #include "llvm/Support/raw_ostream.h"
-@@ -68,6 +71,72 @@ inline std::string hashFuncOp(func::FuncOp func) {
+@@ -68,6 +72,77 @@ inline std::string hashFuncOp(func::FuncOp func) {
    return llvm::toHex(digest, /*LowerCase=*/true);
  }
  
@@ -21,14 +22,16 @@ diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher
 +// of independent ops: passes may order a const-eval function's ops differently
 +// from one program to the next, and those programs must still share the
 +// cached results. That is sound only because the hash stands for the values
-+// the function returns, which for a const-eval function do not depend on the
-+// order of its ops. Use hashFuncOp where the hash must identify the code
++// the function returns, which do not depend on the order of ops that only
++// read their operands. Use hashFuncOp where the hash must identify the code
 +// itself, such as a compile cache.
 +//
 +// The hash covers the function type and the sorted keys of its ops. An op's key
 +// hashes its name, attributes, result types and operands (a block argument by
-+// its number, an op result by its op's key). A function with nested regions
-+// falls back to hashFuncOp.
++// its number, an op result by its op's key). A function with nested regions,
++// or with an op that writes memory (into an operand in place, like
++// ttnn.update_cache, or anywhere, like ttnn.generic), falls back to hashFuncOp:
++// reordering such ops can change the results.
 +inline std::string hashConstEvalFuncOp(func::FuncOp func) {
 +  auto sha = [](llvm::StringRef bytes) {
 +    return llvm::toHex(
@@ -42,7 +45,10 @@ diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher
 +  llvm::DenseMap<mlir::Operation *, std::string> keys;
 +  llvm::SmallVector<std::string> opKeys;
 +  for (mlir::Operation &op : func.getBody().front()) {
-+    if (op.getNumRegions() != 0) {
++    auto memoryEffects = mlir::dyn_cast<mlir::MemoryEffectOpInterface>(op);
++    if (op.getNumRegions() != 0 ||
++        (memoryEffects &&
++         memoryEffects.hasEffect<mlir::MemoryEffects::Write>())) {
 +      return hashFuncOp(func);
 +    }
 +    std::string text;
