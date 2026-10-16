@@ -13,7 +13,7 @@ diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher
  #include "llvm/ADT/StringExtras.h"
  #include "llvm/Support/SHA256.h"
  #include "llvm/Support/raw_ostream.h"
-@@ -68,6 +72,77 @@ inline std::string hashFuncOp(func::FuncOp func) {
+@@ -68,6 +72,83 @@ inline std::string hashFuncOp(func::FuncOp func) {
    return llvm::toHex(digest, /*LowerCase=*/true);
  }
  
@@ -70,7 +70,13 @@ diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher
 +      if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(operand)) {
 +        os << " arg" << arg.getArgNumber();
 +      } else {
-+        os << ' ' << keys[operand.getDefiningOp()] << '#'
++        // A producer outside the body has no key; rather than hash it as an
++        // empty one, keep the exact hash.
++        auto producer = keys.find(operand.getDefiningOp());
++        if (producer == keys.end()) {
++          return hashFuncOp(func);
++        }
++        os << ' ' << producer->second << '#'
 +           << mlir::cast<mlir::OpResult>(operand).getResultNumber();
 +      }
 +    }
