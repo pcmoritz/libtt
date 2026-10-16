@@ -12,7 +12,7 @@ diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher
  #include "llvm/ADT/StringExtras.h"
  #include "llvm/Support/SHA256.h"
  #include "llvm/Support/raw_ostream.h"
-@@ -68,6 +71,71 @@ inline std::string hashFuncOp(func::FuncOp func) {
+@@ -68,6 +71,72 @@ inline std::string hashFuncOp(func::FuncOp func) {
    return llvm::toHex(digest, /*LowerCase=*/true);
  }
  
@@ -68,8 +68,9 @@ diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher
 +           << mlir::cast<mlir::OpResult>(operand).getResultNumber();
 +      }
 +    }
-+    keys[&op] = sha(os.str());
-+    opKeys.push_back(keys[&op]);
++    std::string key = sha(text);
++    keys[&op] = key;
++    opKeys.push_back(std::move(key));
 +  }
 +  llvm::sort(opKeys);
 +  std::string text;
@@ -78,7 +79,7 @@ diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher
 +  for (const std::string &key : opKeys) {
 +    os << ' ' << key;
 +  }
-+  return sha(os.str());
++  return sha(text);
 +}
 +
  } // namespace mlir::tt
