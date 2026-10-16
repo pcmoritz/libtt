@@ -65,6 +65,33 @@ def test_decode_matmul(rows, inner_size, width, residual, transposed, weight_dty
         )
 
 
+@pytest.mark.parametrize(
+    "inner_size,width",
+    [
+        # Narrow decode projections take the 1D matmul instead of the decode
+        # one: the 4-chip Qwen3-30B-A3B qkv (40 output tiles, read in larger K
+        # blocks) and o_proj, and a router-sized width.
+        (2048, 1280),
+        (1024, 2048),
+        (2048, 128),
+    ],
+)
+def test_narrow_decode_matmul_accumulates_in_fp32(inner_size, width):
+    def project(x, weights):
+        return x @ _bfp8(weights)
+
+    run = jax.jit(project, compiler_options={"optimization_level": "O1"})
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(11)
+    # Exactly representable inputs: with FP32 accumulation, only the BF16
+    # output rounds; BF16 sums in Dst would lose bits of these long sums.
+    x = (rng.integers(-4, 5, (1, inner_size)) / 16).astype(jnp.bfloat16)
+    weights = (rng.integers(-4, 5, (inner_size, width)) / 16).astype(jnp.bfloat16)
+    actual = run(*(jax.device_put(v, device) for v in (x, weights)))
+    expected = x.astype(np.float32) @ weights.astype(np.float32)
+    np.testing.assert_allclose(np.asarray(actual).astype(np.float32), expected, atol=1 / 64, rtol=1 / 128)
+
+
 def test_large_reduction_is_left_to_the_other_matmuls():
     """A reduction whose activation row alone (1.5 MiB of tiles) does not fit
     a core's L1 must not pick the decode matmul. The other matmuls round

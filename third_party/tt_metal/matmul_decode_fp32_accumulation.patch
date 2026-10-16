@@ -1,0 +1,51 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
+@@ -394,9 +394,22 @@ MatmulMultiCoreReuseMultiCast1DProgramConfig get_mcast_1d_config(
+     while (k_tiles % in0_block_w != 0) {
+         in0_block_w /= 2;
+     }
++    bool fp32_dest_acc_en = get_fp32_dest_acc_en(compute_kernel_config);
++    // Each core of a decode matmul reads one K block of its weight columns at a time, so the block bounds the
++    // weight reads in flight. On few cores (a narrow N) blocks of 8 tiles leave DRAM idle: the block doubles until
++    // the cores read about 512 KB at once (the 4-chip Qwen3-30B-A3B qkv projection, 40 cores of BFP8 weights:
++    // 12.2 -> 9.4 us). Only with FP32 accumulation, under which the block does not change the result.
++    if (decode_matmul && fp32_dest_acc_en) {
++        constexpr uint32_t target_bytes_in_flight = 512 * 1024;
++        const uint32_t bytes_per_k_tile =
++            div_up(n_tiles, per_core_N) * per_core_N *
++            in1_tile.get_tile_size(tt::tt_metal::datatype_to_dataformat_converter(input_tensor_b.dtype()));
++        while (in0_block_w * bytes_per_k_tile < target_bytes_in_flight && k_tiles % (2 * in0_block_w) == 0) {
++            in0_block_w *= 2;
++        }
++    }
+     bool per_core_N_equals_subblock_w_constraint = out_sharded && !mcast_in0;
+     bool per_core_M_equals_subblock_h_constraint = out_sharded && mcast_in0;
+-    bool fp32_dest_acc_en = get_fp32_dest_acc_en(compute_kernel_config);
+ 
+     auto mutlti_dim_per_core_factor = get_multi_dim_per_core_factor(
+         input_tensor_a,
+diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+@@ -2909,12 +2909,19 @@ MatmulParams create_matmul_attributes(
+         }
+     }
+     bool is_float_32 = output_dtype == DataType::FLOAT32;
++    // A decode matmul (one tile row of activations) accumulates in FP32 on Blackhole. At one tile row it takes no
++    // longer, its error is about 2.4x smaller (the BF16 Dst sums lose bits), and the K block no longer changes the
++    // result, so the 1D planner may size the block for DRAM bandwidth (get_mcast_1d_config).
++    const auto a_padded_shape =
++        operations::matmul::utilities::get_matmul_tensor_padded_shape(input_tensor_a, parameters.transpose_a);
++    const bool decode_rows = arch == tt::ARCH::BLACKHOLE && output_dtype == DataType::BFLOAT16 &&
++                             a_padded_shape.volume() == static_cast<uint64_t>(TILE_HEIGHT) * a_padded_shape[-1];
+     auto kernel_config_val = init_device_compute_kernel_config(
+         arch,
+         parameters.compute_kernel_config,
+         math_fidelity,
+         /*default_approx_mode=*/false,
+-        /*default_fp32_acc=*/is_float_32,
++        /*default_fp32_acc=*/is_float_32 || decode_rows,
+         /*default_l1_acc=*/!is_float_32);
+     ttnn::verify_numerical_configuration(arch, parameters.compute_kernel_config);
+     auto in0_tile = operations::matmul::utilities::get_matmul_tile(input_tensor_a, parameters.transpose_a);
