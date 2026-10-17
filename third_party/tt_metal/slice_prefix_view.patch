@@ -1,0 +1,56 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
+@@ -219,6 +219,31 @@ ttnn::Tensor slice(
+         }
+     }
+ 
++    // A prefix of the last dim of an interleaved TILE tensor of a single tile row, ending on a tile boundary, is
++    // the tensor's first pages in their banks: a view of the input, no program. (Decode slices the outputs of
++    // fused projections like this, [1, 4120] -> [1, 4096], hundreds of times a step.) The output's padding rows
++    // are the input's, as a copy would have them.
++    {
++        const auto& padded = input_tensor.padded_shape();
++        const uint32_t end = modified_ends[input_rank - 1];
++        bool prefix_of_last_dim = input_layout == Layout::TILE && input_tensor.storage_type() == StorageType::DEVICE &&
++                                  !optional_output_tensor.has_value() && !input_tensor.memory_config().is_sharded() &&
++                                  memory_config == input_tensor.memory_config() && end > 0 &&
++                                  end < input_shape[-1] && end % tile_shape[1] == 0 &&
++                                  padded.volume() / padded[-1] == tile_shape[0];
++        for (size_t i = 0; i < input_rank && prefix_of_last_dim; ++i) {
++            prefix_of_last_dim = modified_begins[i] == 0 && modified_step[i] == 1 &&
++                                 (i + 1 == input_rank || modified_ends[i] == input_shape[i]);
++        }
++        if (prefix_of_last_dim) {
++            ttsl::SmallVector<uint32_t> logical(input_shape.cbegin(), input_shape.cend());
++            ttsl::SmallVector<uint32_t> view_padded(padded.cbegin(), padded.cend());
++            logical.back() = end;
++            view_padded.back() = end;
++            return ttnn::experimental::view(input_tensor, ttnn::Shape(logical), ttnn::Shape(view_padded));
++        }
++    }
++
+     auto output_dim_i = [&modified_begins, &modified_step](size_t i, const ttsl::SmallVector<uint32_t>& modified_ends) {
+         return (modified_ends[i] - modified_begins[i] + modified_step[i] - 1) / modified_step[i];
+     };
+diff --git ttnn/core/tensor/tensor_ops.cpp ttnn/core/tensor/tensor_ops.cpp
+--- ttnn/core/tensor/tensor_ops.cpp
++++ ttnn/core/tensor/tensor_ops.cpp
+@@ -398,8 +398,16 @@
+     if (input_tensor.layout() != Layout::ROW_MAJOR || !changing_last_dim) {
+         const auto& input_buffer = input_tensor.device_storage().get_mesh_buffer();
+ 
++        // A view of fewer pages than the input (a prefix of its pages, as ttnn::slice makes of a one-tile-row
++        // tensor) gets a buffer of just those pages: ops that size their work by the buffer, like typecast, must
++        // not run over the rest of the input's.
++        auto global_config = input_buffer.global_config();
++        if (auto* replicated = std::get_if<tt::tt_metal::distributed::ReplicatedBufferConfig>(&global_config);
++            replicated != nullptr && !output_memory_config.is_sharded()) {
++            replicated->size = std::min<DeviceAddr>(replicated->size, new_spec.compute_packed_buffer_size_bytes());
++        }
+         auto view_mesh_buffer = tt::tt_metal::distributed::MeshBuffer::create(
+-            input_buffer.global_config(),
++            global_config,
+             input_buffer.device_local_config(),
+             input_buffer.device(),
+             input_buffer.address());
