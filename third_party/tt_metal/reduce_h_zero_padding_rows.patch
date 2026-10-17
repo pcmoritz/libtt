@@ -1,0 +1,122 @@
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_transpose_wh_universal_input_cols_partitioned.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_transpose_wh_universal_input_cols_partitioned.cpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_transpose_wh_universal_input_cols_partitioned.cpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_transpose_wh_universal_input_cols_partitioned.cpp
+@@ -61,6 +61,25 @@
+ 
+     auto tensor_accessor = TensorAccessor(tensor::src);
+ 
++    // Zeroes the rows past the first valid_rows of the tile at `offset` in the reserved space, once its read
++    // has landed: one face row is 16 elements, a 32x32 tile 64 face rows (faces 0 and 1 hold rows 0-15).
++    constexpr uint32_t valid_rows = get_arg(args::valid_rows);
++    auto zero_padding_rows = [&](uint32_t offset) {
++        const uint32_t row_bytes = tile_bytes / 64;
++        if constexpr (valid_rows < 16) {
++            noc.async_write_zeros(
++                dfb_in0, (16 - valid_rows) * row_bytes, {.offset_bytes = offset + valid_rows * row_bytes});
++            noc.async_write_zeros(
++                dfb_in0, (16 - valid_rows) * row_bytes, {.offset_bytes = offset + (16 + valid_rows) * row_bytes});
++            noc.async_write_zeros(dfb_in0, 32 * row_bytes, {.offset_bytes = offset + 32 * row_bytes});
++        } else {
++            noc.async_write_zeros(
++                dfb_in0, (32 - valid_rows) * row_bytes, {.offset_bytes = offset + (16 + valid_rows) * row_bytes});
++            noc.async_write_zeros(
++                dfb_in0, (32 - valid_rows) * row_bytes, {.offset_bytes = offset + (32 + valid_rows) * row_bytes});
++        }
++    };
++
+     if constexpr (num_h_slices > 1) {
+         // Work units are (nc, slice, wt) in wt-fastest order. col_start_tile_id is the global id
+         // (curr_col_in_batch unused). Nesting matches the un-split DEST_AUTO_LIMIT chunking.
+@@ -92,6 +111,11 @@
+                             tile_bytes,
+                             {.page_id = nc * HtWt + ht * Wt + wt},
+                             {.offset_bytes = filled * tile_bytes});
++                        if (valid_rows != 0 && ht == Ht - 1) {
++                            noc.async_read_barrier();
++                            zero_padding_rows(filled * tile_bytes);
++                            padded = true;
++                        }
+                     } else {
+                         // slice_Ht is rounded up; pad past Ht with the SUM identity.
+                         noc.async_write_zeros(dfb_in0, tile_bytes, {.offset_bytes = filled * tile_bytes});
+@@ -166,6 +190,10 @@
+                     dfb_in0.reserve_back(onetile);
+                     noc.async_read(tensor_accessor, dfb_in0, tile_bytes, {.page_id = curr_id}, {.offset_bytes = 0});
+                     noc.async_read_barrier();
++                    if (valid_rows != 0 && j == Ht - 1) {
++                        zero_padding_rows(0);
++                        noc.write_zeros_l1_barrier();
++                    }
+                     dfb_in0.push_back(onetile);
+                 }
+ 
+@@ -182,6 +210,12 @@
+             }
+             if (batch_chunk) {
+                 noc.async_read_barrier();
++                if (valid_rows != 0 && j == Ht - 1) {
++                    for (uint32_t s = 0; s < row_chunk; ++s) {
++                        zero_padding_rows(s * tile_bytes);
++                    }
++                    noc.write_zeros_l1_barrier();
++                }
+                 dfb_in0.push_back(row_chunk);
+             }
+             curr_id = reset_curr_id + (j + 1) * Wt;  // stride in H
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op_multi_core_h_program_factory.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op_multi_core_h_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op_multi_core_h_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op_multi_core_h_program_factory.cpp
+@@ -470,6 +470,16 @@
+             // {1, Ht} is the un-split reduce.
+             {"num_h_slices", tile_h_split ? num_h_slices : 1u},
+             {"slice_Ht", tile_h_split ? slice_Ht : Ht},
++            // The data rows of the last tile row of a sum or mean over BF16 or FP32 32x32 tiles; the reader
++            // zeroes the rest, so padding never needs a fill_pad (0: no rows to zero).
++            {"valid_rows",
++             (operation_attributes.math_op == ReduceOpMath::SUM || operation_attributes.math_op == ReduceOpMath::AVG) &&
++                     tile_height == 32 && tile_width == 32 &&
++                     (src0_cb_data_format == tt::DataFormat::Float16_b ||
++                      src0_cb_data_format == tt::DataFormat::Float32) &&
++                     H == tt::round_up(logical_shape[2], tile_height)
++                 ? logical_shape[2] % tile_height
++                 : 0u},
+         };
+         reader_rta_names = {"col_start_tile_id", "curr_col_in_batch", "num_cols"};
+         // Pass DEST config so reader can compute DEST_AUTO_LIMIT
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
+@@ -19,6 +19,8 @@
+ #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+ 
+ #include <tt_stl/small_vector.hpp>
++#include <tt-metalium/constants.hpp>
++#include <tt-metalium/math.hpp>
+ 
+ #include <algorithm>
+ #include <bit>
+@@ -614,8 +616,22 @@
+                                                   is_bitwise_reduce_type(reduce_type)
+                                               ? ttnn::PadValue{std::bit_cast<uint32_t>(pad_value)}
+                                               : ttnn::PadValue{pad_value};
+-    auto input_tensor =
+-        is_tiled ? ttnn::fill_implicit_tile_padding(input_tensor_arg, fill_pad_value) : input_tensor_arg;
++    // An H sum or mean of an interleaved BF16 or FP32 tensor padded only below its last rows zeroes those
++    // rows as its reader fetches the last tile row (reduce_op_multi_core_h), so it needs no fill_pad first.
++    const auto& in_logical = input_tensor_arg.logical_shape();
++    const auto& in_padded = input_tensor_arg.padded_shape();
++    const auto in_tile = input_tensor_arg.tensor_spec().tile();
++    const int in_rank = static_cast<int>(in_logical.rank());
++    const bool reader_zeroes_padding =
++        (reduce_type == reduction_common::ReduceType::Sum || reduce_type == reduction_common::ReduceType::Mean) &&
++        is_tiled && in_rank >= 2 && dim.size() == 1 && dim[0] == in_rank - 2 &&
++        (input_tensor_arg.dtype() == DataType::BFLOAT16 || input_tensor_arg.dtype() == DataType::FLOAT32) &&
++        in_tile.get_height() == tt::constants::TILE_HEIGHT && in_tile.get_width() == tt::constants::TILE_WIDTH &&
++        !input_tensor_arg.is_sharded() && in_padded[-1] == in_logical[-1] &&
++        in_padded[-2] == tt::round_up(in_logical[-2], tt::constants::TILE_HEIGHT);
++    auto input_tensor = is_tiled && !reader_zeroes_padding
++                            ? ttnn::fill_implicit_tile_padding(input_tensor_arg, fill_pad_value)
++                            : input_tensor_arg;
+ 
+     // bf16 multi-axis Sum precision chain: carry FP32 between stages and pack bf16
+     // only on the final stage. Skipped for full-tensor reductions (dim covers every
