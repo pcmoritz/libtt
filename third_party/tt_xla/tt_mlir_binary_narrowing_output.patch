@@ -1,0 +1,53 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -424,6 +424,40 @@ public:
+   }
+ };
+ 
++// An FP32 add, subtract, multiply or divide whose only use casts it to BF16
++// produces BF16 itself: binary_ng computes in FP32 DST whenever an operand is
++// FP32 and rounds once as it packs the result, which saves the typecast
++// program. (The packer rounds exact ties away from zero where the typecast
++// rounds them to even.)
++class TTNNBinaryOpNarrowingOutput : public mlir::OpRewritePattern<TypecastOp> {
++public:
++  using mlir::OpRewritePattern<TypecastOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(TypecastOp cast,
++                  mlir::PatternRewriter &rewriter) const final {
++    Operation *producer = cast.getInput().getDefiningOp();
++    if (!producer || !isa<AddOp, SubtractOp, MultiplyOp, DivideOp>(producer) ||
++        !cast.getInput().hasOneUse()) {
++      return failure();
++    }
++    auto elementType = [](Value v) {
++      return mlir::cast<mlir::RankedTensorType>(v.getType()).getElementType();
++    };
++    if (!elementType(cast.getInput()).isF32() || !elementType(cast.getResult()).isBF16() ||
++        !llvm::all_of(producer->getOperands(), [&](Value v) {
++          return elementType(v).isF32() || elementType(v).isBF16();
++        })) {
++      return failure();
++    }
++    rewriter.modifyOpInPlace(producer, [&]() {
++      producer->getResult(0).setType(cast.getResult().getType());
++    });
++    rewriter.replaceOp(cast, producer->getResult(0));
++    return success();
++  }
++};
++
+ // Fold the decode MLP's concatenated [up | gate] projection and SwiGLU into a
+ // single half-width matmul.  The runtime implements this marker with a
+ // two-weight matmul that keeps matching up/gate accumulators on the same core.
+@@ -880,7 +914,7 @@ public:
+     }
+     // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
+     // https://github.com/tenstorrent/tt-metal/issues/30973
+-    patterns.add<TTNNBF16MeanOfUpcast>(&getContext());
++    patterns.add<TTNNBF16MeanOfUpcast, TTNNBinaryOpNarrowingOutput>(&getContext());
+     patterns.add<TTNNMatmulWithSwiGLUEpilogue,
+         TTNNConv2dWithActivation<ReluOp>, TTNNConv2dWithActivation<Relu6Op>,
+         TTNNConv2dWithActivation<SiluOp>, TTNNConv2dWithActivation<SigmoidOp>,

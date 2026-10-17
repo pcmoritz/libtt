@@ -41,6 +41,7 @@ def test_multiply_and_typecast_after_a_reshape_run_before_it(tmp_path):
 
     actual, ir = compile_and_run(fn, tmp_path, v)
     assert result_shapes(ir, "multiply") == ["1x4x2560"]
-    assert result_shapes(ir, "typecast") == ["1x4x2560"]
+    # The cast to BF16 folds into the multiply's output.
+    assert result_shapes(ir, "typecast") == []
     want = (np.exp(v).reshape(1, 10240) * w).astype(jnp.bfloat16).astype(np.float32)
     np.testing.assert_allclose(actual, want, rtol=1e-2, atol=1e-2)
