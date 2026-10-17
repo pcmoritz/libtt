@@ -267,6 +267,43 @@ def test_while_loop_body_reading_a_shared_input_tiled():
     assert_equal(lengths, (cu[1:] - cu[:-1]).astype(np.float32))
 
 
+def test_gather_in_case_branch_from_shared_input():
+    # The same for a ttcore.case, whose branches gather from the input and so
+    # read it row-major. Its selector, an integer input too, is not a branch
+    # argument: row-major propagation used to stop the compile there.
+    cu = np.array([0, 5, 12], np.int32)
+    t = np.arange(16, dtype=np.int32)
+
+    def fn(i, cu, t):
+        branches = [lambda cu, t: jnp.take(cu, t % 3).astype(jnp.float32),
+                    lambda cu, t: jnp.take(cu, (t + 1) % 3).astype(jnp.float32)]
+        return jax.lax.switch(i, branches, cu, t), (cu[1:] - cu[:-1]).astype(jnp.float32)
+
+    device = jax.devices("tt")[0]
+    compiled = jax.jit(fn, compiler_options=OPTIONS)
+    for i in (0, 1):
+        out, lengths = compiled(*[jax.device_put(a, device) for a in (np.int32(i), cu, t)])
+        assert_equal(out, np.take(cu, (t + i) % 3).astype(np.float32))
+        assert_equal(lengths, (cu[1:] - cu[:-1]).astype(np.float32))
+
+
+def test_case_branch_reading_a_shared_input_tiled():
+    # The opposite: the branches read the input in elementwise ops, so its
+    # argument is tiled, and the conversion in front of the case must survive.
+    cu = np.array([0, 5, 12], np.int32)
+
+    def fn(i, cu):
+        branches = [lambda cu: (cu * 2).astype(jnp.float32), lambda cu: (cu * 3).astype(jnp.float32)]
+        return jax.lax.switch(i, branches, cu), (cu[1:] - cu[:-1]).astype(jnp.float32)
+
+    device = jax.devices("tt")[0]
+    compiled = jax.jit(fn, compiler_options=OPTIONS)
+    for i in (0, 1):
+        out, lengths = compiled(*[jax.device_put(a, device) for a in (np.int32(i), cu)])
+        assert_equal(out, (cu * (i + 2)).astype(np.float32))
+        assert_equal(lengths, (cu[1:] - cu[:-1]).astype(np.float32))
+
+
 @pytest.mark.parametrize("trace", [False, True])
 def test_dynamic_update_slice_cache(trace):
     # A KV-cache style write: one position in the batch and sequence dims,
