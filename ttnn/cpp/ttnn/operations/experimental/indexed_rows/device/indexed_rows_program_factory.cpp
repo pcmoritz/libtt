@@ -67,6 +67,7 @@ struct Geometry {
     uint32_t index_entry_bytes;   // a chunk of index positions: K components
     uint32_t source_entry_bytes;  // a chunk of column-mode source, with slack
     uint32_t pages;               // table pages per batch
+    uint32_t transfers_per_item;  // rows_gather reads per position (see its reader)
     KernelSpec::CompileTimeArgs compile_time_args;
     KernelSpec::CompilerOptions compiler_options;
 };
@@ -83,6 +84,9 @@ Geometry geometry(const IndexedRowsParams& params, const IndexedRowsInputs& in) 
     g.pages = g.table.N * g.table.S;
     constexpr uint32_t kMaxChunk = 64 * 1024;
     g.chunk_bytes = std::min(g.page_bytes, kMaxChunk);
+    g.transfers_per_item = params.column ? indexed_rows_window(params)
+                                         : indexed_rows_window(params) * g.table.S *
+                                               ((g.page_bytes + g.chunk_bytes - 1) / g.chunk_bytes);
     // A column window lands at its source offset within a 64-byte granule and
     // is moved to its destination offset, so its entry has a granule of slack.
     const uint32_t column_entry = params.column ? g.table.column_window * g.elem_bytes + kEntryAlign : 0;
@@ -197,7 +201,7 @@ ttnn::device_operation::ProgramArtifacts RowsGatherProgramFactory::create_progra
                 TensorBinding{.tensor_parameter_name = INDICES, .accessor_name = "indices"},
             },
         .compile_time_args = g.compile_time_args,
-        .runtime_arg_schema = {.runtime_arg_names = {"first_item", "num_items"}},
+        .runtime_arg_schema = {.runtime_arg_names = {"first_transfer", "num_transfers"}},
         .hw_config = ttnn::create_reader_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
     KernelSpec writer{
@@ -210,17 +214,19 @@ ttnn::device_operation::ProgramArtifacts RowsGatherProgramFactory::create_progra
             },
         .tensor_bindings = {TensorBinding{.tensor_parameter_name = OUTPUT, .accessor_name = "output"}},
         .compile_time_args = g.compile_time_args,
-        .runtime_arg_schema = {.runtime_arg_names = {"first_item", "num_items"}},
+        .runtime_arg_schema = {.runtime_arg_names = {"first_transfer", "num_transfers"}},
         .hw_config = ttnn::create_writer_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
 
-    const Split s = split(device, g.table.B * g.M);
+    // Cores take ranges of the transfers rather than of the positions: a position of a row of many small
+    // pages (a [slots, 2560, 9] row-major state) would otherwise be read by one core, 16 pages at a time.
+    const Split s = split(device, g.table.B * g.M * g.transfers_per_item);
     KernelRunArgs reader_run_args{.kernel = READER};
     KernelRunArgs writer_run_args{.kernel = WRITER};
     for (const auto& [core, range] : s.ranges) {
         for (auto* run_args : {&reader_run_args, &writer_run_args}) {
             AddRuntimeArgsForNode(
-                run_args->runtime_arg_values, core, {{"first_item", range.first}, {"num_items", range.second}});
+                run_args->runtime_arg_values, core, {{"first_transfer", range.first}, {"num_transfers", range.second}});
         }
     }
 
