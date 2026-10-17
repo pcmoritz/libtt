@@ -19,8 +19,10 @@ namespace ttnn::prim {
 namespace {
 
 constexpr uint32_t max_k = 64;
-// Narrower segments leave the scan shorter than the merge and the dispatch.
-constexpr uint32_t min_segment_tiles = 16;
+// A segment may be a single tile: on Blackhole the parallel scans of narrower segments save more than the merge of
+// their candidates costs (one row, k = 10: 512 wide 11.7 -> 5.5 us, 4096 wide 13.6 -> 8.2 us; k = 64, 4096 wide
+// 95 -> 82 us, against 16-tile segments).
+constexpr uint32_t min_segment_tiles = 1;
 // L1 for one core's face rows of input and for the candidates a group's
 // first-segment core gathers. Unlike the sort networks' factories this path
 // does not check the free L1, so its buffers stay small.
