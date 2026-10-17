@@ -12,7 +12,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
  
      Value lhs = adaptor.getLhs();
      auto lhsType = mlir::cast<RankedTensorType>(lhs.getType());
-@@ -379,6 +383,142 @@ struct DotGeneralToMatmulConversionPattern
+@@ -379,6 +383,132 @@ struct DotGeneralToMatmulConversionPattern
    }
  
  private:
@@ -71,15 +71,6 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +
 +    Location loc = op.getLoc();
 +    Type f32 = rewriter.getF32Type();
-+    auto toF32 = [&](Value value, StringRef suffix) -> Value {
-+      auto type = mlir::cast<RankedTensorType>(value.getType());
-+      if (type.getElementType() == f32) {
-+        return value;
-+      }
-+      return rewriter.create<ttir::TypecastOp>(
-+          ttmlir::utils::appendLocationSuffix(loc, suffix),
-+          RankedTensorType::get(type.getShape(), f32), value);
-+    };
 +
 +    // V's dimensions in A's order, with a unit dimension at each of A's free
 +    // dimensions, so that it broadcasts over them.
@@ -102,16 +93,17 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +          rewriter, ttmlir::utils::appendLocationSuffix(loc, "_permuteVector"),
 +          v, vType, vPermutation);
 +    }
-+    if (static_cast<int64_t>(vShape.size()) != vType.getRank()) {
-+      v = ttir::utils::createReshapeOp(
-+          rewriter, ttmlir::utils::appendLocationSuffix(loc, "_reshapeVector"),
-+          v, vShape);
-+    }
 +
++    auto productType = RankedTensorType::get(aShape, f32);
++    a = ttir::utils::reshapeAndCastToType(
++        rewriter, ttmlir::utils::appendLocationSuffix(loc, "_operandF32"), a,
++        productType);
++    v = ttir::utils::reshapeAndCastToType(
++        rewriter, ttmlir::utils::appendLocationSuffix(loc, "_vectorF32"), v,
++        RankedTensorType::get(vShape, f32));
 +    Value product = rewriter.create<ttir::MultiplyOp>(
-+        ttmlir::utils::appendLocationSuffix(loc, "_product"),
-+        RankedTensorType::get(aShape, f32), toF32(a, "_operandF32"),
-+        toF32(v, "_vectorF32"));
++        ttmlir::utils::appendLocationSuffix(loc, "_product"), productType, a,
++        v);
 +    // The sum keeps A's other dimensions in A's order.
 +    SmallVector<int64_t> keptDims;
 +    SmallVector<int64_t> keptShape;
@@ -126,11 +118,9 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +        ttmlir::utils::appendLocationSuffix(loc, "_sum"),
 +        RankedTensorType::get(keptShape, f32), product, /*keepDim=*/false,
 +        rewriter.getI32ArrayAttr(sumDims));
-+    if (elementType != f32) {
-+      result = rewriter.create<ttir::TypecastOp>(
-+          ttmlir::utils::appendLocationSuffix(loc, "_result"),
-+          RankedTensorType::get(keptShape, elementType), result);
-+    }
++    result = ttir::utils::reshapeAndCastToType(
++        rewriter, ttmlir::utils::appendLocationSuffix(loc, "_result"), result,
++        RankedTensorType::get(keptShape, elementType));
 +
 +    // The dot's result is [batch dims in pairing order, free dims].
 +    SmallVector<int64_t> resultDims(aBatchDims);

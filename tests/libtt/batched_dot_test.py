@@ -68,6 +68,27 @@ def test_batched_dot_matches_cpu(tmp_path, case, dtype):
         assert "matmul_multi_core_reuse_program_config" in ir, spec
 
 
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, np.float32])
+def test_vector_on_the_left_with_free_dim_before_batch(tmp_path, dtype):
+    # lhs [B, K] has only batch and contracting dims; rhs [N, B, K] has its
+    # free dim before its batch dim, so the vector broadcasts over N and the
+    # [N, B] sum is permuted to the dot's [B, N] result.
+    rng = np.random.default_rng(2)
+    lhs = rng.normal(size=(64, 8)).astype(dtype)
+    rhs = rng.normal(size=(5, 64, 8)).astype(dtype)
+    dnums = (((1,), (2,)), ((0,), (1,)))
+
+    def fn(x, y):
+        return jax.lax.dot_general(x, y, dnums)
+
+    got, ir = _compile(tmp_path, fn, lhs, rhs)
+    want = np.einsum("bk,nbk->bn", lhs.astype(np.float32), rhs.astype(np.float32))
+    assert got.shape == (64, 5)
+    np.testing.assert_allclose(got.astype(np.float32), want, rtol=2e-2, atol=5e-2)
+    assert '"ttnn.matmul"' not in ir
+    assert '"ttnn.sum"' in ir
+
+
 @pytest.mark.parametrize(
     "lhs_shape,rhs_shape",
     [
