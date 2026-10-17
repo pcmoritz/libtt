@@ -229,6 +229,25 @@ def test_scatter_middle_axis():
     assert_equal(got, want)
 
 
+def test_gather_in_while_loop_body_from_shared_input():
+    # jnp.searchsorted's scan becomes a ttcore.while_loop whose body gathers
+    # from the sorted array, so the body reads that argument row-major. The
+    # same input also feeds an elementwise op through a tiling conversion; row
+    # major propagation then bypassed that conversion and put a tiled one in
+    # front of the loop, handing the body a tiled table.
+    cu = np.array([0, 5, 12], np.int32)
+    t = np.arange(16, dtype=np.int32)
+
+    def fn(cu, t):
+        seq = jnp.searchsorted(cu, t, side="right") - 1
+        return seq, (cu[1:] - cu[:-1]).astype(jnp.float32) * 0.5
+
+    device = jax.devices("tt")[0]
+    seq, lengths = jax.jit(fn, compiler_options=OPTIONS)(*[jax.device_put(a, device) for a in (cu, t)])
+    assert_equal(seq, np.searchsorted(cu, t, side="right") - 1)
+    assert_equal(lengths, (cu[1:] - cu[:-1]).astype(np.float32) * 0.5)
+
+
 @pytest.mark.parametrize("trace", [False, True])
 def test_dynamic_update_slice_cache(trace):
     # A KV-cache style write: one position in the batch and sequence dims,

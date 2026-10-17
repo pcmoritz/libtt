@@ -1,0 +1,92 @@
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "SingletonDeviceContext.h"
++#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+ #include "ttmlir/Dialect/TTCore/IR/Utils.h"
+ #include "ttmlir/Dialect/TTNN/Analysis/OpConfig.h"
+@@ -27,6 +28,7 @@
+ #include "mlir/IR/Visitors.h"
+ #include "mlir/Support/LLVM.h"
+ #include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/DenseSet.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/ADT/TypeSwitch.h"
+ #include "llvm/Support/Error.h"
+@@ -75,16 +77,50 @@ public:
+       llvm::SmallVector<ttnn::ToTensorSpecOp> toRemoveToTensorSpecOps =
+           findRedundantToTensorSpecOps(funcInputArguments);
+ 
++      // A while loop's or case's operand must keep its callee argument's
++      // type. One that already reads a row-major argument directly was typed
++      // so by the layout pass (the callee reads it row-major, e.g. through
++      // rows_gather); a tiled fixup in front of it would hand the callee a
++      // tiled tensor its signature calls row-major.
++      DirectUses directUses = collectDirectControlFlowUses(
++          funcInputArguments, toRemoveToTensorSpecOps);
++
+       llvm::SmallVector<Value> rowMajorArgs =
+           bypassRedundantToTensorSpecOps(toRemoveToTensorSpecOps);
+ 
+       llvm::DenseMap<Operation *, Layout> opLayoutConstraints;
+-      propagateRowMajorLayout(func, rowMajorArgs, opLayoutConstraints);
++      propagateRowMajorLayout(func, rowMajorArgs, directUses,
++                              opLayoutConstraints);
+     });
+ #endif // TTMLIR_ENABLE_OPMODEL
+   }
+ 
+ private:
++  // (user, operand number) pairs that propagation must leave as they are.
++  using DirectUses = llvm::DenseSet<std::pair<Operation *, unsigned>>;
++
++  // The control-flow operands that read one of `args` directly, before the
++  // redundant ToTensorSpecOps are bypassed.
++  DirectUses collectDirectControlFlowUses(
++      const llvm::SmallVector<Value> &args,
++      const llvm::SmallVector<ttnn::ToTensorSpecOp> &toRemove) {
++    llvm::DenseSet<Operation *> removed;
++    for (ttnn::ToTensorSpecOp op : toRemove) {
++      removed.insert(op.getOperation());
++    }
++    DirectUses uses;
++    for (Value arg : args) {
++      for (OpOperand &use : arg.getUses()) {
++        Operation *owner = use.getOwner();
++        if (!removed.contains(owner) &&
++            mlir::isa<ttcore::WhileLoopOp, ttcore::CaseOp>(owner)) {
++          uses.insert({owner, use.getOperandNumber()});
++        }
++      }
++    }
++    return uses;
++  }
++
+   // Returns true if block argument is an input argument of the function.
+   // KV cache arguments are excluded even though they have Input argument type.
+   bool isInputArgument(BlockArgument arg, func::FuncOp func) {
+@@ -256,6 +292,7 @@ private:
+   void
+   propagateRowMajorLayout(func::FuncOp func,
+                           const llvm::SmallVector<Value> &rowMajorArgs,
++                          const DirectUses &directUses,
+                           llvm::DenseMap<Operation *, Layout> &constraints) {
+     IRRewriter rewriter(func.getContext());
+     FunctionType funcType = func.getFunctionType();
+@@ -279,6 +316,12 @@ private:
+         OpOperand &use = *usePtr;
+         Operation *user = use.getOwner();
+ 
++        // A control-flow operand already typed row-major by the layout pass:
++        // its callee reads it so; nothing to propagate or fix up.
++        if (directUses.contains({user, use.getOperandNumber()})) {
++          continue;
++        }
++
+         if (auto returnOp = mlir::dyn_cast<func::ReturnOp>(user)) {
+           handleReturnOp(rewriter, funcType, returnOp, use.getOperandNumber(),
+                          current);
