@@ -1,0 +1,116 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp b/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp
+@@ -17,6 +17,7 @@
+ #include "ttmlir/OpModel/TTNN/SingletonDeviceContext.h"
+ #endif
+ 
++#include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/Support/MathExtras.h"
+ 
+@@ -35,6 +36,8 @@ namespace {
+ constexpr int64_t kTileDim = 32;
+ constexpr int64_t kNarrowShapeRatioThreshold = 8;
+ constexpr int64_t kMcastInputBufferingDepth = 2;
++// The reuse factory rejects larger subblocks when accumulating in FP32.
++constexpr int64_t kReuseMaxFp32SubblockArea = 4;
+ constexpr int64_t kFp32TileBytes = 4096;
+ constexpr int64_t kBf16TileBytes = 2048;
+ 
+@@ -45,7 +48,7 @@ constexpr std::array<std::pair<int64_t, int64_t>, 20> kSubblockChoices = {{
+     {1, 4}, {3, 1}, {1, 3}, {2, 1}, {1, 2}, {1, 1},
+ }};
+ 
+-enum class MatmulKernel { Mcast2D, Mcast1DIn0, Mcast1DIn1 };
++enum class MatmulKernel { Mcast2D, Mcast1DIn0, Mcast1DIn1, ReuseBatched };
+ 
+ struct Blocking {
+   int64_t in0BlockW = 0;
+@@ -130,8 +133,11 @@ MatmulKernel route(int64_t mt, int64_t nt) {
+ // kernel transposes A tiles into.
+ int64_t cbBytes(const MatmulProblem &p, int64_t outBlockH, int64_t outBlockW,
+                 int64_t in0BlockW) {
+-  const int64_t depth =
+-      p.kt / in0BlockW > 1 ? kMcastInputBufferingDepth : int64_t{1};
++  // The mcast factories double buffer the inputs only when K takes more than
++  // one block; the reuse factory always does.
++  const bool doubleBuffered =
++      p.kernel == MatmulKernel::ReuseBatched || p.kt / in0BlockW > 1;
++  const int64_t depth = doubleBuffered ? kMcastInputBufferingDepth : int64_t{1};
+   const int64_t area = outBlockH * outBlockW;
+   const int64_t in0Bytes = depth * outBlockH * in0BlockW * p.aTileBytes;
+   return (p.transposeA ? 2 : 1) * in0Bytes +
+@@ -213,6 +219,19 @@ Blocking pick1D(const MatmulProblem &p, int64_t maxIn0BlockW, int64_t l1Budget,
+   return best;
+ }
+ 
++// Reuse over batches: one whole [Mt, Nt] output block per batch, with the
++// largest in0_block_w that fits.
++Blocking pickReuse(const MatmulProblem &p, int64_t maxIn0BlockW,
++                   int64_t l1Budget) {
++  llvm::SmallVector<int64_t> candidates = in0BlockWCandidates(p, maxIn0BlockW);
++  for (int64_t bw : llvm::reverse(candidates)) {
++    if (cbBytes(p, p.perCoreM, p.perCoreN, bw) <= l1Budget) {
++      return Blocking{bw, p.perCoreM, p.perCoreN};
++    }
++  }
++  return {};
++}
++
+ // get_matmul_subblock_params without the sharded-output constraints.
+ std::pair<int64_t, int64_t> pickSubblock(int64_t outBlockH, int64_t outBlockW,
+                                          int64_t maxArea) {
+@@ -297,8 +316,28 @@ std::optional<MatmulProblem> analyze(MatmulOpTy op, Value bias) {
+ 
+   const int64_t mt = llvm::divideCeil(m, kTileDim);
+   const int64_t nt = llvm::divideCeil(n, kTileDim);
+-  p.kernel = route(mt, nt);
+   const int64_t numCores = p.gridX * p.gridY;
++  // A batched B whose per-batch output cannot fill the grid. The mcast
++  // factories split one batch's [Mt, Nt] output over the cores and loop over
++  // every batch on each of them (2560 single-tile batches took 3.1 ms on one
++  // core); the reuse factory spreads whole batches over the cores instead, one
++  // [Mt, Nt] block each, as tt-metal's create_matmul_program_config does when
++  // given a core grid. With at least as many batches as output tiles per
++  // batch, that keeps at least as many cores busy.
++  const int64_t batchTiles = mt * nt;
++  if (batchB > 1 && batchTiles < numCores && batchTiles <= batchB &&
++      !transposeA && !op.getTransposeB() && !bias) {
++    p.kernel = MatmulKernel::ReuseBatched;
++    p.fuseBatch = false;
++    p.perCoreM = mt;
++    p.perCoreN = nt;
++    if (fp32DestAccEn) {
++      p.maxSubblockArea =
++          std::min(p.maxSubblockArea, kReuseMaxFp32SubblockArea);
++    }
++    return p;
++  }
++  p.kernel = route(mt, nt);
+   if (p.kernel == MatmulKernel::Mcast2D) {
+     if (p.gridX < 2 || p.gridY < 2) {
+       return std::nullopt;
+@@ -326,6 +365,11 @@ Attribute buildConfig(MLIRContext *context, const MatmulProblem &p,
+   auto [subblockH, subblockW] =
+       pickSubblock(b.outBlockH, b.outBlockW, p.maxSubblockArea);
+   auto grid = CoreCoordAttr::get(context, p.gridX, p.gridY);
++  if (p.kernel == MatmulKernel::ReuseBatched) {
++    return MatmulMultiCoreReuseProgramConfigAttr::get(
++        context, grid, b.in0BlockW, subblockH, subblockW, p.perCoreM,
++        p.perCoreN);
++  }
+   if (p.kernel == MatmulKernel::Mcast2D) {
+     return MatmulMultiCoreReuseMultiCastProgramConfigAttr::get(
+         context, grid, b.in0BlockW, subblockH, subblockW, b.outBlockH,
+@@ -394,7 +438,9 @@ private:
+     const int64_t l1Budget =
+         std::min<int64_t>(l1BudgetBytes, utils::getUsableL1PerCore(op));
+     Blocking blocking =
+-        problem->kernel == MatmulKernel::Mcast2D
++        problem->kernel == MatmulKernel::ReuseBatched
++            ? pickReuse(*problem, maxIn0BlockW, l1Budget)
++        : problem->kernel == MatmulKernel::Mcast2D
+             ? pick2D(*problem, maxIn0BlockW, l1Budget)
+             : pick1D(*problem, maxIn0BlockW, l1Budget, splitMinDim);
+     if (!blocking.valid()) {
