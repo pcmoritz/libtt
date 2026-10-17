@@ -1,7 +1,25 @@
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp b/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp
-@@ -45,7 +45,7 @@ constexpr std::array<std::pair<int64_t, int64_t>, 20> kSubblockChoices = {{
+@@ -17,6 +17,7 @@
+ #include "ttmlir/OpModel/TTNN/SingletonDeviceContext.h"
+ #endif
+ 
++#include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/Support/MathExtras.h"
+ 
+@@ -35,6 +36,9 @@ namespace {
+ constexpr int64_t kTileDim = 32;
+ constexpr int64_t kNarrowShapeRatioThreshold = 8;
+ constexpr int64_t kMcastInputBufferingDepth = 2;
++constexpr int64_t kReuseInputBufferingDepth = 2;
++// The reuse factory rejects larger subblocks when accumulating in FP32.
++constexpr int64_t kReuseMaxFp32SubblockArea = 4;
+ constexpr int64_t kFp32TileBytes = 4096;
+ constexpr int64_t kBf16TileBytes = 2048;
+ 
+@@ -45,7 +49,7 @@ constexpr std::array<std::pair<int64_t, int64_t>, 20> kSubblockChoices = {{
      {1, 4}, {3, 1}, {1, 3}, {2, 1}, {1, 2}, {1, 1},
  }};
  
@@ -10,7 +28,22 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp b/lib/Di
  
  struct Blocking {
    int64_t in0BlockW = 0;
-@@ -213,6 +213,19 @@ Blocking pick1D(const MatmulProblem &p, int64_t maxIn0BlockW, int64_t l1Budget,
+@@ -130,8 +134,12 @@ MatmulKernel route(int64_t mt, int64_t nt) {
+ // kernel transposes A tiles into.
+ int64_t cbBytes(const MatmulProblem &p, int64_t outBlockH, int64_t outBlockW,
+                 int64_t in0BlockW) {
+-  const int64_t depth =
+-      p.kt / in0BlockW > 1 ? kMcastInputBufferingDepth : int64_t{1};
++  // The mcast factories double buffer the inputs only when K takes more than
++  // one block; the reuse factory always does.
++  const int64_t depth = p.kernel == MatmulKernel::ReuseBatched
++                            ? kReuseInputBufferingDepth
++                        : p.kt / in0BlockW > 1 ? kMcastInputBufferingDepth
++                                               : int64_t{1};
+   const int64_t area = outBlockH * outBlockW;
+   const int64_t in0Bytes = depth * outBlockH * in0BlockW * p.aTileBytes;
+   return (p.transposeA ? 2 : 1) * in0Bytes +
+@@ -213,6 +221,19 @@ Blocking pick1D(const MatmulProblem &p, int64_t maxIn0BlockW, int64_t l1Budget,
    return best;
  }
  
@@ -18,19 +51,19 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp b/lib/Di
 +// largest in0_block_w that fits.
 +Blocking pickReuse(const MatmulProblem &p, int64_t maxIn0BlockW,
 +                   int64_t l1Budget) {
-+  Blocking best;
-+  for (int64_t bw : in0BlockWCandidates(p, maxIn0BlockW)) {
++  llvm::SmallVector<int64_t> candidates = in0BlockWCandidates(p, maxIn0BlockW);
++  for (int64_t bw : llvm::reverse(candidates)) {
 +    if (cbBytes(p, p.perCoreM, p.perCoreN, bw) <= l1Budget) {
-+      best = Blocking{bw, p.perCoreM, p.perCoreN};
++      return Blocking{bw, p.perCoreM, p.perCoreN};
 +    }
 +  }
-+  return best;
++  return {};
 +}
 +
  // get_matmul_subblock_params without the sharded-output constraints.
  std::pair<int64_t, int64_t> pickSubblock(int64_t outBlockH, int64_t outBlockW,
                                           int64_t maxArea) {
-@@ -297,8 +310,24 @@ std::optional<MatmulProblem> analyze(MatmulOpTy op, Value bias) {
+@@ -297,8 +318,28 @@ std::optional<MatmulProblem> analyze(MatmulOpTy op, Value bias) {
  
    const int64_t mt = llvm::divideCeil(m, kTileDim);
    const int64_t nt = llvm::divideCeil(n, kTileDim);
@@ -50,13 +83,17 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp b/lib/Di
 +    p.fuseBatch = false;
 +    p.perCoreM = mt;
 +    p.perCoreN = nt;
++    if (fp32DestAccEn) {
++      p.maxSubblockArea =
++          std::min(p.maxSubblockArea, kReuseMaxFp32SubblockArea);
++    }
 +    return p;
 +  }
 +  p.kernel = route(mt, nt);
    if (p.kernel == MatmulKernel::Mcast2D) {
      if (p.gridX < 2 || p.gridY < 2) {
        return std::nullopt;
-@@ -326,6 +355,11 @@ Attribute buildConfig(MLIRContext *context, const MatmulProblem &p,
+@@ -326,6 +367,11 @@ Attribute buildConfig(MLIRContext *context, const MatmulProblem &p,
    auto [subblockH, subblockW] =
        pickSubblock(b.outBlockH, b.outBlockW, p.maxSubblockArea);
    auto grid = CoreCoordAttr::get(context, p.gridX, p.gridY);
@@ -68,7 +105,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp b/lib/Di
    if (p.kernel == MatmulKernel::Mcast2D) {
      return MatmulMultiCoreReuseMultiCastProgramConfigAttr::get(
          context, grid, b.in0BlockW, subblockH, subblockW, b.outBlockH,
-@@ -394,7 +428,9 @@ private:
+@@ -394,7 +440,9 @@ private:
      const int64_t l1Budget =
          std::min<int64_t>(l1BudgetBytes, utils::getUsableL1PerCore(op));
      Blocking blocking =
