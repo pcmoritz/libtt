@@ -1,0 +1,165 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "ttmlir/Asserts.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
++#include "ttmlir/Dialect/TTCore/IR/Utils.h"
+ #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Fusing/SDPAFusingPattern.h"
+@@ -4165,6 +4166,139 @@ public:
+   }
+ };
+ 
++// TTNN lays out the last two dims of a tensor as 32x32 tiles, so a [1, 10240]
++// view takes 320 tiles where [1, 4, 2560] takes 80. An elementwise op next to
++// a reshape between two such views is cheaper on the side with fewer tiles;
++// the two patterns below move it there.
++static int64_t tileCount(RankedTensorType type) {
++  ArrayRef<int64_t> shape = type.getShape();
++  const int64_t rank = shape.size();
++  int64_t tiles = 1;
++  for (int64_t d = 0; d + 2 < rank; ++d) {
++    tiles *= shape[d];
++  }
++  tiles *= llvm::divideCeil(rank >= 2 ? shape[rank - 2] : 1, 32);
++  return tiles * llvm::divideCeil(rank >= 1 ? shape[rank - 1] : 1, 32);
++}
++
++// The index of the one operand of elementwise `op` (of result type `type`)
++// that is a runtime value of the op's shape, when every other operand is free
++// to reshape: a constant or parameter (its reshape runs in const-eval) that
++// is a scalar or has the op's shape. nullopt otherwise.
++static std::optional<unsigned> findReshapedOperand(Operation *op,
++                                                   RankedTensorType type) {
++  std::optional<unsigned> data;
++  for (auto [i, operand] : llvm::enumerate(op->getOperands())) {
++    auto operandType = mlir::cast<RankedTensorType>(operand.getType());
++    Operation *source = utils::lookThroughLayoutOps(operand).getDefiningOp();
++    bool constant =
++        (source && source->hasTrait<mlir::OpTrait::ConstantLike>()) ||
++        mlir::isa_and_present<FullOp, ZerosOp, OnesOp>(source) ||
++        ttcore::valueTracesToConstantArgs(operand);
++    bool free = constant && (operandType.getNumElements() == 1 ||
++                             operandType.getShape() == type.getShape());
++    if (free) {
++      continue;
++    }
++    if (data || operandType.getShape() != type.getShape()) {
++      return std::nullopt;
++    }
++    data = i;
++  }
++  return data;
++}
++
++// `op` rebuilt with result shape `shape`: operand `data` becomes `value` and
++// the others are reshaped to `shape` (or to ones of its rank if scalars).
++static Value rebuildWithShape(PatternRewriter &rewriter, Operation *op,
++                              unsigned data, Value value,
++                              ArrayRef<int64_t> shape) {
++  SmallVector<Value> operands;
++  for (auto [i, operand] : llvm::enumerate(op->getOperands())) {
++    if (i == data) {
++      operands.push_back(value);
++      continue;
++    }
++    auto operandType = mlir::cast<RankedTensorType>(operand.getType());
++    SmallVector<int64_t> operandShape(shape);
++    if (operandType.getNumElements() == 1) {
++      operandShape.assign(shape.size(), 1);
++    }
++    operands.push_back(
++        utils::createReshapeOp(rewriter, op->getLoc(), operand, operandShape));
++  }
++  auto type = mlir::cast<RankedTensorType>(op->getResult(0).getType());
++  StringAttr name = rewriter.getStringAttr(op->getName().getStringRef());
++  auto resultType = RankedTensorType::get(shape, type.getElementType());
++  return rewriter
++      .create(op->getLoc(), name, operands, resultType, op->getAttrs())
++      ->getResult(0);
++}
++
++// reshape(op(x, c)) -> op(reshape(x), reshape(c)) when the reshape's result
++// has fewer tiles than op's.
++class HoistReshapeToFewerTilesPattern
++    : public mlir::OpRewritePattern<ReshapeOp> {
++  using mlir::OpRewritePattern<ReshapeOp>::OpRewritePattern;
++
++public:
++  mlir::LogicalResult
++  matchAndRewrite(ReshapeOp reshape,
++                  mlir::PatternRewriter &rewriter) const final {
++    Operation *op = reshape.getInput().getDefiningOp();
++    if (!op || !op->hasOneUse() ||
++        !mlir::isa<ElementwiseUnary, ElementwiseBinary>(op)) {
++      return mlir::failure();
++    }
++    auto type = mlir::cast<RankedTensorType>(op->getResult(0).getType());
++    if (tileCount(reshape.getType()) >= tileCount(type)) {
++      return mlir::failure();
++    }
++    std::optional<unsigned> data = findReshapedOperand(op, type);
++    if (!data) {
++      return mlir::failure();
++    }
++    ArrayRef<int64_t> shape = reshape.getType().getShape();
++    Value value = utils::createReshapeOp(rewriter, reshape.getLoc(),
++                                         op->getOperand(*data), shape);
++    rewriter.replaceOp(reshape,
++                       rebuildWithShape(rewriter, op, *data, value, shape));
++    return mlir::success();
++  }
++};
++
++// op(reshape(x), c) -> reshape(op(x, reshape(c))) when x has fewer tiles than
++// op's result.
++class SinkReshapeToFewerTilesPattern : public mlir::RewritePattern {
++public:
++  SinkReshapeToFewerTilesPattern(MLIRContext *context)
++      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, context) {}
++
++  mlir::LogicalResult
++  matchAndRewrite(Operation *op, mlir::PatternRewriter &rewriter) const final {
++    if (!mlir::isa<ElementwiseUnary, ElementwiseBinary>(op) ||
++        op->getNumResults() != 1) {
++      return mlir::failure();
++    }
++    auto type = mlir::cast<RankedTensorType>(op->getResult(0).getType());
++    std::optional<unsigned> data = findReshapedOperand(op, type);
++    if (!data) {
++      return mlir::failure();
++    }
++    auto reshape = op->getOperand(*data).getDefiningOp<ReshapeOp>();
++    if (!reshape || !reshape->hasOneUse() ||
++        tileCount(reshape.getInput().getType()) >= tileCount(type)) {
++      return mlir::failure();
++    }
++    ArrayRef<int64_t> shape = reshape.getInput().getType().getShape();
++    Value result =
++        rebuildWithShape(rewriter, op, *data, reshape.getInput(), shape);
++    rewriter.replaceOp(op, utils::createReshapeOp(rewriter, op->getLoc(),
++                                                  result, type.getShape()));
++    return mlir::success();
++  }
++};
++
+ class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
+ public:
+   using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
+@@ -4249,6 +4383,13 @@ public:
+       config.setUseTopDownTraversal(true);
+       (void)applyPatternsGreedily(getOperation(), std::move(patterns), config);
+     }
++    {
++      // After the fusions, which match the graph as the frontend wrote it.
++      RewritePatternSet patterns(&getContext());
++      patterns.add<HoistReshapeToFewerTilesPattern,
++                   SinkReshapeToFewerTilesPattern>(&getContext());
++      (void)applyPatternsGreedily(getOperation(), std::move(patterns));
++    }
+   }
+ };
+ } // namespace

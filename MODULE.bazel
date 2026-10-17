@@ -582,6 +582,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_fuse_expanded_sigmoid.patch",
         "//third_party/tt_xla:tt_mlir_rms_norm_without_weight.patch",
         "//third_party/tt_xla:tt_mlir_divided_sum_to_mean.patch",
+        "//third_party/tt_xla:tt_mlir_elementwise_on_fewer_tiles.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
