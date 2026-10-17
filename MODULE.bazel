@@ -348,6 +348,7 @@ http_archive(
         "//third_party/tt_metal:matmul_decode_fp32_accumulation.patch",
         "//third_party/tt_metal:tilize_pad_fill.patch",
         "//third_party/tt_metal:trace_overlap_sorted_regions.patch",
+        "//third_party/tt_metal:matmul_decode_split_k.patch",
         "//third_party/tt_metal:eltwise_working_cores.patch",
     ],
     sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
