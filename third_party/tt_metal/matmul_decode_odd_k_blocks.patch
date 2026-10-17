@@ -1,0 +1,17 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
+@@ -390,9 +390,12 @@ MatmulMultiCoreReuseMultiCast1DProgramConfig get_mcast_1d_config(
+         per_core_N = N / in1_tile.get_width();
+     }
+     const uint32_t k_tiles = K / in0_tile.get_width();
++    // A decode matmul's K block is the largest divisor of its K tiles up to 8: halving from 8 left an odd K
++    // one tile per block (the five K tiles of Qwen3.8-Flash-Next's shared-expert down projection: 8.4 us
++    // with blocks of one tile, ~4 us with one block).
+     uint32_t in0_block_w = decode_matmul ? 8 : 2;
+     while (k_tiles % in0_block_w != 0) {
+-        in0_block_w /= 2;
++        in0_block_w = decode_matmul ? in0_block_w - 1 : in0_block_w / 2;
+     }
+     bool fp32_dest_acc_en = get_fp32_dest_acc_en(compute_kernel_config);
+     // Each core of a decode matmul reads one K block of its weight columns at a time, so the block bounds the
