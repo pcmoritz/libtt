@@ -137,6 +137,41 @@ def test_scatter_set_drops_out_of_bounds(dtype):
     assert_equal(got, want)
 
 
+
+# uint32 ids past INT32_MAX: unsigned indices stay unsigned through the
+# lowering (read as int32 they would be negative).
+UNSIGNED_IDS = np.array([3, 49, 60, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF], np.uint32)
+
+
+def test_gather_unsigned_indices_clamp_high():
+    # They clamp to the last row, not the first: as a single index, with a
+    # zero component (the slice of the unindexed last axis), and as one of two
+    # concatenated components. (JAX's own indexing converts several index
+    # arrays, or one next to a static start, to int32 first.)
+    rng = np.random.default_rng(16)
+    table = rng.normal(size=(50, 9)).astype(np.float32)
+    cols = np.array([0, 8, 9, 0xFFFFFFFF, 2, 0x80000000], np.uint32)
+    rows = np.minimum(UNSIGNED_IDS, 49)
+    got = run(lambda t, i: jnp.take(t, i, axis=0, mode="clip"), table, UNSIGNED_IDS)
+    assert_equal(got, table[rows])
+    one = jax.lax.GatherDimensionNumbers(offset_dims=(1,), collapsed_slice_dims=(0,), start_index_map=(0,))
+    got = run(lambda t, i: jax.lax.gather(t, i[:, None], one, (1, 3), mode="clip"), table, UNSIGNED_IDS)
+    assert_equal(got, table[rows, :3])
+    two = jax.lax.GatherDimensionNumbers(offset_dims=(), collapsed_slice_dims=(0, 1), start_index_map=(0, 1))
+    got = run(lambda t, i, j: jax.lax.gather(t, jnp.stack([i, j], 1), two, (1, 1), mode="clip"),
+              table, UNSIGNED_IDS, cols)
+    assert_equal(got, table[rows, np.minimum(cols, 8)])
+
+
+def test_scatter_unsigned_indices_drop_out_of_bounds():
+    rng = np.random.default_rng(17)
+    x = rng.normal(size=(50, 9)).astype(np.float32)
+    v = rng.normal(size=(len(UNSIGNED_IDS), 9)).astype(np.float32)
+    got = run(lambda x, i, v: x.at[i].set(v), x, UNSIGNED_IDS, v)
+    want = np.array(x)
+    want[3], want[49] = v[0], v[1]
+    assert_equal(got, want)
+
 @pytest.mark.parametrize(
     "reduce,combine",
     [("add", np.add), ("multiply", np.multiply), ("max", np.maximum), ("min", np.minimum)],
@@ -322,6 +357,22 @@ def test_dynamic_update_slice_cache(trace):
         want[:, bb, ss] = update[:, 0, 0]
         assert_equal(got, want)
 
+
+
+def test_dynamic_update_slice_unsigned_starts():
+    # Unsigned starts past INT32_MAX clamp to the last position that fits.
+    rng = np.random.default_rng(18)
+    cache = rng.normal(size=(4, 16, 8)).astype(np.float32)
+    update = rng.normal(size=(1, 1, 8)).astype(np.float32)
+
+    def write(cache, update, b, s):
+        return jax.lax.dynamic_update_slice(cache, update, (b, s, np.uint32(0)))
+
+    for b, s in ((1, 5), (0xFFFFFFFF, 0x80000000), (2, 0x7FFFFFFF)):
+        got = run(write, cache, update, np.uint32(b), np.uint32(s))
+        want = np.array(cache)
+        want[min(b, 3), min(s, 15)] = update[0, 0]
+        assert_equal(got, want)
 
 def test_state_pool_update():
     # sglang's recurrent state pool: states.at[slots].set(new_states).

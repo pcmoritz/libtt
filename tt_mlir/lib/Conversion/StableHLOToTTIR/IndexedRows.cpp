@@ -21,7 +21,8 @@
 //
 // Out-of-bounds handling is the kernel's: gathers clamp each component into
 // the operand, scatters drop the update, exactly as StableHLO specifies, so no
-// index arithmetic is emitted here beyond casting indices to int32.
+// index arithmetic is emitted here beyond casting indices to int32 (uint32
+// indices stay unsigned, see rowsIndexType).
 
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
@@ -30,6 +31,7 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/STLExtras.h"
@@ -54,6 +56,14 @@ int64_t product(ArrayRef<int64_t> values) {
 
 bool isIdentity(ArrayRef<int64_t> permutation) {
   return llvm::equal(permutation, llvm::seq<int64_t>(0, permutation.size()));
+}
+
+// The element type the rows ops read indices of `elementType` as: uint32 stays
+// unsigned (the kernels compare it as unsigned, so values past INT32_MAX clamp
+// high instead of reading as negative), every other integer type is int32.
+Type rowsIndexType(Builder &builder, Type elementType) {
+  return builder.getIntegerType(
+      32, /*isSigned=*/!elementType.isUnsignedInteger(32));
 }
 
 // What an operand dimension is to the rows ops.
@@ -287,8 +297,9 @@ SmallVector<Value> concatenatedAlong(ConversionPatternRewriter &rewriter,
   return {};
 }
 
-// The index tensor as [Bi, K, M] int32: for each batch, one page per
-// component (the kernels stream positions in chunks, one read per component).
+// The index tensor as [Bi, K, M] int32 (uint32 for uint32 indices, see
+// rowsIndexType): for each batch, one page per component (the kernels stream
+// positions in chunks, one read per component).
 // StableHLO keeps the components innermost, and JAX assembles that index
 // vector by concatenating one [..., 1] piece per component; the pages are
 // built from those pieces, so no intermediate has K-element rows (which tile
@@ -325,7 +336,7 @@ IndexLayout buildIndices(ConversionPatternRewriter &rewriter, Location loc,
   }
   const bool hasVector = indexVectorDim < rank;
   const int64_t K = hasVector ? shape[indexVectorDim] : 1;
-  Type i32 = rewriter.getIntegerType(32, /*isSigned=*/true);
+  Type indexType = rowsIndexType(rewriter, type.getElementType());
 
   // [batch..., components, positions...], per piece of the component dim.
   SmallVector<int64_t> permutation(layout.batchDims);
@@ -348,14 +359,15 @@ IndexLayout buildIndices(ConversionPatternRewriter &rewriter, Location loc,
     page = ttir::utils::createReshapeOp(
         rewriter, ttmlir::utils::appendLocationSuffix(loc, "_index_pages"),
         page, {layout.Bi, components, layout.M});
-    if (pieceType.getElementType() != i32) {
+    if (pieceType.getElementType() != indexType) {
       page = rewriter.create<ttir::TypecastOp>(
           ttmlir::utils::appendLocationSuffix(loc, "_indices_i32"),
-          RankedTensorType::get({layout.Bi, components, layout.M}, i32), page);
+          RankedTensorType::get({layout.Bi, components, layout.M}, indexType),
+          page);
     }
     pages.push_back(page);
   }
-  auto pageType = RankedTensorType::get({layout.Bi, 1, layout.M}, i32);
+  auto pageType = RankedTensorType::get({layout.Bi, 1, layout.M}, indexType);
   auto concatPages = [&](ArrayRef<Value> values, StringRef suffix) -> Value {
     if (values.size() == 1) {
       return values.front();
@@ -1110,6 +1122,11 @@ public:
       return success();
     }
 
+    // StableHLO gives every start index the same type.
+    Type startElementType =
+        getElementTypeOrSelf(adaptor.getStartIndices().front());
+    auto columnType = RankedTensorType::get(
+        {1, 1}, rowsIndexType(rewriter, startElementType));
     // Dimensions the update does not cover are indexed; the rest are free.
     SmallVector<OperandDim> dims(operandShape.size());
     SmallVector<Value> columns;
@@ -1133,7 +1150,6 @@ public:
         start = ttir::utils::createReshapeOp(
             rewriter, ttmlir::utils::appendLocationSuffix(loc, "_start"), start,
             {1, 1});
-        auto columnType = RankedTensorType::get({1, 1}, rewriter.getIntegerType(32, /*isSigned=*/true));
         if (!startType.getElementType().isInteger(32)) {
           start = rewriter.create<ttir::TypecastOp>(loc, columnType, start);
         }
@@ -1155,9 +1171,8 @@ public:
         indexColumns.push_back(columns[column]);
       } else {
         if (!zeros) {
-          zeros = rewriter.create<ttir::FullOp>(
-              loc, RankedTensorType::get({1, 1}, rewriter.getIntegerType(32, /*isSigned=*/true)),
-              rewriter.getI32IntegerAttr(0));
+          zeros = rewriter.create<ttir::FullOp>(loc, columnType,
+                                                rewriter.getI32IntegerAttr(0));
         }
         indexColumns.push_back(zeros);
       }
@@ -1166,8 +1181,7 @@ public:
     if (indexColumns.size() > 1) {
       indices = rewriter.create<ttir::ConcatOp>(
           ttmlir::utils::appendLocationSuffix(loc, "_starts"),
-          RankedTensorType::get({1, static_cast<int64_t>(indexColumns.size())},
-                                rewriter.getIntegerType(32, /*isSigned=*/true)),
+          columnType.clone({1, static_cast<int64_t>(indexColumns.size())}),
           indexColumns, rewriter.getSI32IntegerAttr(1));
     }
     // One position: [Bi, K, M] = [1, K, 1].
