@@ -17,15 +17,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagati
  #include "mlir/IR/Value.h"
  #include "mlir/IR/Visitors.h"
  #include "mlir/Support/LLVM.h"
-@@ -32,6 +34,7 @@
- #include "llvm/Support/Error.h"
- 
- #include <cassert>
-+#include <optional>
- #include <queue>
- #include <utility>
- #include <vector>
-@@ -279,9 +282,11 @@ private:
+@@ -279,9 +281,11 @@ private:
          OpOperand &use = *usePtr;
          Operation *user = use.getOwner();
  
@@ -35,12 +27,12 @@ diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagati
 +        // A returned value keeps the layout of the function signature, and a
 +        // while loop's or case's input, an argument of its callee, the layout
 +        // the callee declares; propagation stops there.
-+        if (std::optional<Type> expectedType = getExpectedType(use, funcType)) {
-+          restoreExpectedLayout(rewriter, use, *expectedType);
++        if (Type expectedType = getExpectedType(use, funcType)) {
++          restoreExpectedLayout(rewriter, use, expectedType);
            continue;
          }
  
-@@ -425,13 +430,49 @@ private:
+@@ -425,13 +429,50 @@ private:
      consumerOperand.set(toTensorSpecOp.getResult());
    }
  
@@ -52,37 +44,38 @@ diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagati
 +  // The type a signature fixes for `use`: the function's result type for a
 +  // returned value, the callee's argument type for a while loop's or case's
 +  // input. Every case branch has one signature (see CaseLayoutPattern), so the
-+  // first branch speaks for all of them. nullopt for any other use, a case's
++  // first branch speaks for all of them. Null for any other use, a case's
 +  // selector included.
-+  static std::optional<Type> getExpectedType(OpOperand &use,
-+                                             FunctionType funcType) {
++  static Type getExpectedType(OpOperand &use, FunctionType funcType) {
 +    Operation *owner = use.getOwner();
++    unsigned index = use.getOperandNumber();
++
 +    if (mlir::isa<func::ReturnOp>(owner)) {
-+      return funcType.getResult(use.getOperandNumber());
++      return funcType.getResult(index);
 +    }
-+    auto calleeArgType = [&](OperandRange inputs,
-+                             FlatSymbolRefAttr callee) -> std::optional<Type> {
-+      unsigned begin = inputs.getBeginOperandIndex();
-+      unsigned operand = use.getOperandNumber();
-+      auto function =
-+          SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(owner, callee);
-+      if (!function || operand < begin || operand >= begin + inputs.size()) {
-+        return std::nullopt;
-+      }
-+      return function.getArgumentTypes()[operand - begin];
-+    };
++
++    FlatSymbolRefAttr callee;
 +    if (auto loop = mlir::dyn_cast<ttcore::WhileLoopOp>(owner)) {
-+      return calleeArgType(loop.getInputs(), loop.getBodyProgramAttr());
-+    }
-+    if (auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(owner)) {
++      callee = loop.getBodyProgramAttr();
++    } else if (auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(owner)) {
++      // The selector precedes the inputs and has no branch argument.
++      unsigned begin = caseOp.getInputs().getBeginOperandIndex();
 +      ArrayAttr branches = caseOp.getBranchPrograms();
-+      if (branches.empty()) {
-+        return std::nullopt;
++      if (index < begin || branches.empty()) {
++        return {};
 +      }
-+      return calleeArgType(caseOp.getInputs(),
-+                           mlir::cast<FlatSymbolRefAttr>(branches[0]));
++      index -= begin;
++      callee = mlir::cast<FlatSymbolRefAttr>(branches[0]);
++    } else {
++      return {};
 +    }
-+    return std::nullopt;
++
++    auto function =
++        SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(owner, callee);
++    if (!function || index >= function.getNumArguments()) {
++      return {};
++    }
++    return function.getArgumentTypes()[index];
 +  }
 +
 +  // Converts the row-major value of `use` back to `expectedType` when that is
