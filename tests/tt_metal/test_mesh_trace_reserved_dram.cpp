@@ -153,5 +153,41 @@ TEST_F(MeshTraceReservedDramTest, BufferThatOnlyFitsInTransientsTakesThem) {
     mesh_device_->release_mesh_trace(trace_id);
 }
 
+TEST_F(MeshTraceReservedDramTest, BufferInALaterTransientRegionMakesTheTraceUnsafe) {
+    // A live buffer between the trace's two transients keeps their regions apart.
+    auto hole = create_dram_buffer(mesh_device_.get(), kTransientSize);
+    auto separator = create_dram_buffer(mesh_device_.get(), kTransientSize);
+    const DeviceAddr hole_address = hole->address();
+    hole.reset();
+
+    const DeviceAddr num_banks = mesh_device_->allocator()->get_num_banks(BufferType::DRAM);
+    const DeviceAddr largest_free = mesh_device_->allocator()->get_statistics(BufferType::DRAM).largest_free_block_bytes;
+    const DeviceAddr size = largest_free * 6 / 10 / kPageSize * kPageSize * num_banks;
+
+    auto& cq = mesh_device_->mesh_command_queue();
+    const MeshTraceId trace_id = BeginTraceCapture(mesh_device_.get(), cq.id());
+    DeviceAddr first = 0;
+    DeviceAddr second = 0;
+    {
+        auto small = create_dram_buffer(mesh_device_.get(), kTransientSize);
+        auto large = create_dram_buffer(mesh_device_.get(), size);
+        first = small->address();
+        second = large->address();
+        EnqueueMeshWorkload(cq, blank_, false);
+    }
+    mesh_device_->end_mesh_trace(cq.id(), trace_id);
+    ASSERT_EQ(first, hole_address);
+    ASSERT_GT(second, separator->address());
+    EXPECT_TRUE(mesh_device_->is_mesh_trace_replay_safe(trace_id));
+
+    // Only the second, larger region can hold this buffer.
+    std::shared_ptr<MeshBuffer> buffer;
+    ASSERT_NO_THROW(buffer = create_dram_buffer(mesh_device_.get(), size));
+    EXPECT_FALSE(allocated_range(*buffer).overlaps(bank_range(mesh_device_.get(), first, kTransientSize)));
+    EXPECT_TRUE(allocated_range(*buffer).overlaps(bank_range(mesh_device_.get(), second, size)));
+    EXPECT_FALSE(mesh_device_->is_mesh_trace_replay_safe(trace_id));
+    mesh_device_->release_mesh_trace(trace_id);
+}
+
 }  // namespace
 }  // namespace tt::tt_metal::distributed::test

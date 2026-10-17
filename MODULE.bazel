@@ -347,6 +347,7 @@ http_archive(
         "//third_party/tt_metal:matmul_tile_layout_first.patch",
         "//third_party/tt_metal:matmul_decode_fp32_accumulation.patch",
         "//third_party/tt_metal:tilize_pad_fill.patch",
+        "//third_party/tt_metal:trace_overlap_sorted_regions.patch",
     ],
     sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
     strip_prefix = "tt-metal-eb97711f4be2a30cfbff05266faf90bf9780d0c2",
@@ -436,6 +437,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_merge_meshes.patch",
         "//third_party/tt_xla:tt_xla_submesh.patch",
         "//third_party/tt_xla:tt_xla_report_error_causes.patch",
+        "//third_party/tt_xla:tt_xla_cached_input_layouts.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -583,6 +585,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_rms_norm_without_weight.patch",
         "//third_party/tt_xla:tt_mlir_divided_sum_to_mean.patch",
         "//third_party/tt_xla:tt_mlir_elementwise_on_fewer_tiles.patch",
+        "//third_party/tt_xla:tt_mlir_cache_staged_trace_input.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

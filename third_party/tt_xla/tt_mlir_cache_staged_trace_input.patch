@@ -1,0 +1,34 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/include/tt/runtime/detail/ttnn/types/types.h
+--- a/runtime/include/tt/runtime/detail/ttnn/types/types.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/types.h
+@@ -131,6 +131,10 @@ struct LayoutDesc {
+   std::optional<::tt::runtime::Binary> binary;
+   std::uint32_t programIndex = 0;
+   std::uint32_t inputIndex = 0;
++  // Whether that input only feeds a trace input slot, found by scanning the
++  // program on first use. Callers keep their layouts across executions, which
++  // the PJRT plugin serializes.
++  mutable std::optional<bool> hostStagedTraceInput;
+ 
+   static std::shared_ptr<LayoutDesc>
+   fromTensor(const ::tt::runtime::Tensor &tensor);
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -1149,9 +1149,13 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
+ 
+   if (desiredLayoutDesc.binary && tensorLayoutDesc->isOnDevice() &&
+       tensorLayoutDesc->dataType == desiredLayoutDesc.dataType) {
+-    return isHostStagedTraceInput(*desiredLayoutDesc.binary,
+-                                  desiredLayoutDesc.programIndex,
+-                                  desiredLayoutDesc.inputIndex);
++    if (!desiredLayoutDesc.hostStagedTraceInput) {
++      desiredLayoutDesc.hostStagedTraceInput =
++          isHostStagedTraceInput(*desiredLayoutDesc.binary,
++                                 desiredLayoutDesc.programIndex,
++                                 desiredLayoutDesc.inputIndex);
++    }
++    return *desiredLayoutDesc.hostStagedTraceInput;
+   }
+   return *tensorLayoutDesc == desiredLayoutDesc;
+ }

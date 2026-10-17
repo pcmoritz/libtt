@@ -1,0 +1,111 @@
+diff --git a/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h b/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h
+--- a/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h
++++ b/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h
+@@ -9,6 +9,7 @@
+ // c++ standard library includes
+ #include <cstdint>
+ #include <memory>
++#include <mutex>
+ #include <optional>
+ #include <vector>
+ 
+@@ -64,6 +65,15 @@ private:
+   void
+   materializeShellTensors(const std::vector<BufferInstance *> &arg_buffers);
+ 
++  // Returns the layout program 0 expects for the given input. Built once per
++  // executable instead of from the flatbuffer for every argument of every
++  // execution; the stable layout objects also let input tensors skip layout
++  // checks they already passed.
++  const tt::runtime::Layout &getInputLayout(size_t arg_index);
++
++  std::once_flag m_input_layouts_once;
++  std::vector<tt::runtime::Layout> m_input_layouts;
++
+   // Creates flatbuffer loaded executable instance from the executable image.
+   FlatbufferLoadedExecutableInstance(
+       std::shared_ptr<FlatbufferExecutableImage> executable_image,
+diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/tensor.h
+--- a/pjrt_implementation/inc/api/tensor.h
++++ b/pjrt_implementation/inc/api/tensor.h
+@@ -157,6 +157,10 @@ private:
+   // runtime materialization in prepareInputTensor.
+   std::optional<tt::runtime::Tensor> m_runtime_tensor;
+ 
++  // Global id of the last layout m_runtime_tensor was found to have, so that
++  // ensure_layout does not compare the same pair again on every execution.
++  std::optional<std::uint64_t> m_checked_layout_id;
++
+   // Optional metadata for host-submitted tensors used to recreate worker-local
+   // runtime tensors without depending on the initial runtime tensor descriptor.
+   std::optional<HostTensorShell> m_host_tensor_shell;
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -59,8 +59,11 @@ FlatbufferLoadedExecutableInstance::prepareInputTensor(
+   FlatbufferExecutableImage *executable_image =
+       static_cast<FlatbufferExecutableImage *>(m_executable_image.get());
+ 
+-  tt::runtime::Layout expected_layout = tt::runtime::getLayout(
+-      executable_image->getFlatbufferBinary(), program_index, arg_index);
++  tt::runtime::Layout expected_layout =
++      program_index == 0
++          ? getInputLayout(arg_index)
++          : tt::runtime::getLayout(executable_image->getFlatbufferBinary(),
++                                   program_index, arg_index);
+ 
+   bool is_distributed = ::tt::runtime::getCurrentHostRuntime() ==
+                         tt::runtime::HostRuntime::Distributed;
+@@ -89,6 +92,21 @@ FlatbufferLoadedExecutableInstance::prepareInputTensor(
+   return tensor.runtime_tensor();
+ }
+ 
++const tt::runtime::Layout &
++FlatbufferLoadedExecutableInstance::getInputLayout(size_t arg_index) {
++  std::call_once(m_input_layouts_once, [this] {
++    FlatbufferExecutableImage *executable_image =
++        static_cast<FlatbufferExecutableImage *>(m_executable_image.get());
++    const size_t num_inputs = m_executable_image->getNumInputs();
++    m_input_layouts.reserve(num_inputs);
++    for (size_t i = 0; i < num_inputs; ++i) {
++      m_input_layouts.push_back(tt::runtime::getLayout(
++          executable_image->getFlatbufferBinary(), /*programIndex=*/0, i));
++    }
++  });
++  return m_input_layouts[arg_index];
++}
++
+ void FlatbufferLoadedExecutableInstance::materializeShellTensors(
+     const std::vector<BufferInstance *> &arg_buffers) {
+   // Group arg buffers by their borrowed host base pointer for grouped transfer
+diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api/tensor.cc
+--- a/pjrt_implementation/src/api/tensor.cc
++++ b/pjrt_implementation/src/api/tensor.cc
+@@ -95,12 +95,18 @@ void PjrtTensor::ensure_layout(const tt::runtime::Device &device,
+   TT_FATAL(m_runtime_tensor.has_value(),
+            "Cannot ensure layout for shell-only PjrtTensor");
+ 
+-  if (tt::runtime::hasLayout(*m_runtime_tensor, layout))
++  if (m_checked_layout_id == layout.getGlobalId())
+     return;
+ 
++  if (tt::runtime::hasLayout(*m_runtime_tensor, layout)) {
++    m_checked_layout_id = layout.getGlobalId();
++    return;
++  }
++
+   const bool retain = tt::runtime::getTensorRetain(*m_runtime_tensor);
+   m_runtime_tensor =
+       tt::runtime::toLayout(*m_runtime_tensor, device, layout, retain);
++  m_checked_layout_id.reset();
+ 
+   // Notify each shard so the host-buffer-done event fires now and the
+   // framework releases its source reference, instead of holding it for
+@@ -156,6 +162,7 @@ void PjrtTensor::move_to_host() noexcept {
+            "tensors.size()={}, m_shards.size()={}",
+            tensors.size(), m_shards.size());
+   m_runtime_tensor = std::move(tensors[0]);
++  m_checked_layout_id.reset();
+ 
+   for (std::size_t i = 1; i < m_shards.size(); ++i) {
+     if (m_shards[i] == nullptr) {
