@@ -1,0 +1,150 @@
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "SingletonDeviceContext.h"
++#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+ #include "ttmlir/Dialect/TTCore/IR/Utils.h"
+ #include "ttmlir/Dialect/TTNN/Analysis/OpConfig.h"
+@@ -23,6 +24,7 @@
+ #include "mlir/IR/BuiltinTypes.h"
+ #include "mlir/IR/Operation.h"
+ #include "mlir/IR/PatternMatch.h"
++#include "mlir/IR/SymbolTable.h"
+ #include "mlir/IR/Value.h"
+ #include "mlir/IR/Visitors.h"
+ #include "mlir/Support/LLVM.h"
+@@ -279,9 +281,11 @@ private:
+         OpOperand &use = *usePtr;
+         Operation *user = use.getOwner();
+ 
+-        if (auto returnOp = mlir::dyn_cast<func::ReturnOp>(user)) {
+-          handleReturnOp(rewriter, funcType, returnOp, use.getOperandNumber(),
+-                         current);
++        // A returned value keeps the layout of the function signature, and a
++        // while loop's or case's input, an argument of its callee, the layout
++        // the callee declares; propagation stops there.
++        if (Type expectedType = getExpectedType(use, funcType)) {
++          restoreExpectedLayout(rewriter, use, expectedType);
+           continue;
+         }
+ 
+@@ -425,13 +429,50 @@ private:
+     consumerOperand.set(toTensorSpecOp.getResult());
+   }
+ 
+-  // Handles ReturnOp during propagation. Checks if actual layout matches
+-  // expected function signature and inserts ToLayoutOp if needed for tilizing.
+-  void handleReturnOp(IRRewriter &rewriter, FunctionType funcType,
+-                      func::ReturnOp returnOp, unsigned operandIdx,
+-                      Value previousOp) {
++  // The type a signature fixes for `use`: the function's result type for a
++  // returned value, the callee's argument type for a while loop's or case's
++  // input. Every case branch has one signature (see CaseLayoutPattern), so the
++  // first branch speaks for all of them. Null for any other use, a case's
++  // selector included.
++  static Type getExpectedType(OpOperand &use, FunctionType funcType) {
++    Operation *owner = use.getOwner();
++    unsigned index = use.getOperandNumber();
++
++    if (mlir::isa<func::ReturnOp>(owner)) {
++      return funcType.getResult(index);
++    }
++
++    FlatSymbolRefAttr callee;
++    if (auto loop = mlir::dyn_cast<ttcore::WhileLoopOp>(owner)) {
++      callee = loop.getBodyProgramAttr();
++    } else if (auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(owner)) {
++      // The selector precedes the inputs and has no branch argument.
++      unsigned begin = caseOp.getInputs().getBeginOperandIndex();
++      ArrayAttr branches = caseOp.getBranchPrograms();
++      if (index < begin || branches.empty()) {
++        return {};
++      }
++      index -= begin;
++      callee = mlir::cast<FlatSymbolRefAttr>(branches[0]);
++    } else {
++      return {};
++    }
++
++    auto function =
++        SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(owner, callee);
++    if (!function || index >= function.getNumArguments()) {
++      return {};
++    }
++    return function.getArgumentTypes()[index];
++  }
++
++  // Converts the row-major value of `use` back to `expectedType` when that is
++  // tiled; a row-major expectation needs nothing.
++  void restoreExpectedLayout(IRRewriter &rewriter, OpOperand &use,
++                             Type expectedType) {
++    Operation *consumer = use.getOwner();
+     auto actualTensorType =
+-        mlir::dyn_cast<RankedTensorType>(previousOp.getType());
++        mlir::dyn_cast<RankedTensorType>(use.get().getType());
+     assert(actualTensorType && "Expected ranked tensor type");
+ 
+     auto actualLayout =
+@@ -440,11 +481,7 @@ private:
+     assert(!actualLayout.isTiled() &&
+            "Expected row major as propagation result");
+ 
+-    // Extract expected layout from function signature and check if conversion
+-    // needed
+-    Type expectedReturnType = funcType.getResult(operandIdx);
+-    auto expectedTensorType =
+-        mlir::dyn_cast<RankedTensorType>(expectedReturnType);
++    auto expectedTensorType = mlir::dyn_cast<RankedTensorType>(expectedType);
+     if (!expectedTensorType) {
+       return;
+     }
+@@ -455,19 +492,22 @@ private:
+     }
+ 
+     TTMLIR_DEBUG(ttmlir::LogComponent::RMPropagation,
+-                 "Inserting ToLayoutOp before return for operand {}: "
++                 "Inserting ToLayoutOp before {} for operand {}: "
+                  "actual layout {} -> expected layout {}",
+-                 operandIdx, actualLayout, expectedLayout);
++                 consumer->getName(), use.getOperandNumber(), actualLayout,
++                 expectedLayout);
+ 
+-    rewriter.setInsertionPoint(returnOp);
++    rewriter.setInsertionPoint(consumer);
+ 
++    // Named after the consumer, "_return_conversion" for a return.
++    std::string locSuffix =
++        "_" + consumer->getName().stripDialect().str() + "_conversion";
+     auto toTensorSpecOp = utils::createToTensorSpecOp(
+-        returnOp, mlir::cast<mlir::TypedValue<RankedTensorType>>(previousOp),
++        consumer, mlir::cast<mlir::TypedValue<RankedTensorType>>(use.get()),
+         rewriter, expectedLayout.getLayout(), expectedLayout.getBufferType(),
+-        expectedLayout.getMemLayout(), expectedLayout.getDataType(),
+-        "_return_conversion");
++        expectedLayout.getMemLayout(), expectedLayout.getDataType(), locSuffix);
+ 
+-    returnOp.setOperand(operandIdx, toTensorSpecOp.getResult());
++    use.set(toTensorSpecOp.getResult());
+   }
+ 
+   // Extract OpConfig from operation's IR
+diff --git a/lib/Dialect/TTNN/Validation/OpConstraintValidation.cpp b/lib/Dialect/TTNN/Validation/OpConstraintValidation.cpp
+--- a/lib/Dialect/TTNN/Validation/OpConstraintValidation.cpp
++++ b/lib/Dialect/TTNN/Validation/OpConstraintValidation.cpp
+@@ -237,8 +237,10 @@ static ValidationResult validateConstraints(
+     // ops without a metal-side definition). The optimizer relies on observing
+     // a NotImplemented result for such ops so it can fall back gracefully
+     // (e.g. evict L1 state) instead of treating the op as analyzable.
+-    // Outlined loops invoke separately optimized programs, not a metal kernel.
+-    if (op->hasTrait<OpModelExempt>() || isa<ttcore::WhileLoopOp>(op)) {
++    // Outlined loops and cases invoke separately optimized programs, not a
++    // metal kernel.
++    if (op->hasTrait<OpModelExempt>() ||
++        isa<ttcore::WhileLoopOp, ttcore::CaseOp>(op)) {
+       return ValidationResult::notImplemented(
+           (llvm::Twine("OpModel interface not implemented for op ") +
+            op->getName().getStringRef())
