@@ -440,6 +440,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_submesh.patch",
         "//third_party/tt_xla:tt_xla_report_error_causes.patch",
         "//third_party/tt_xla:tt_xla_cached_input_layouts.patch",
+        "//third_party/tt_xla:tt_xla_enable_eltwise_activation_fusion.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -588,6 +589,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_divided_sum_to_mean.patch",
         "//third_party/tt_xla:tt_mlir_elementwise_on_fewer_tiles.patch",
         "//third_party/tt_xla:tt_mlir_cache_staged_trace_input.patch",
+        "//third_party/tt_xla:tt_mlir_eltwise_activation_fusion_guards.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

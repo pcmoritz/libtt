@@ -1,0 +1,14 @@
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -1163,6 +1163,10 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+       compile_options.experimental_enable_fusing_conv2d_with_multiply_pattern;
+   options.enablePermuteMatmulFusion =
+       compile_options.experimental_enable_permute_matmul_fusion;
++  // Fold unary ops into neighbouring binary ops' input and output activations:
++  // decode's many small elementwise programs each cost device and dispatch
++  // time.
++  options.enableEltwiseActivationFusion = true;
+ 
+   if (compile_options.experimental_kv_cache_dtype.has_value()) {
+     const std::string &dtype_str =

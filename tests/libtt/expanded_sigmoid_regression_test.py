@@ -1,5 +1,6 @@
 """An expanded sigmoid, 1 / (1 + exp(-x)), as jax.nn.sigmoid reaches the
-compiler under explicit sharding, becomes one sigmoid op."""
+compiler under explicit sharding, becomes one sigmoid op (which may then run as
+a fused activation of a neighbouring binary op)."""
 
 import jax
 import jax.numpy as jnp
@@ -26,7 +27,7 @@ def test_gated_output(tmp_path, dtype):
     out = rng.normal(0, 1, (1, 6, 256)).astype(dtype)
     gate = rng.normal(0, 2, (1, 6, 256)).astype(dtype)
     actual, ir = compile_and_run(lambda o, g: o * expanded_sigmoid(g), tmp_path, out, gate)
-    assert "ttnn.sigmoid" in ir
+    assert "ttnn.sigmoid" in ir or "unary_with_param<op_type = sigmoid>" in ir
     assert "ttnn.exp" not in ir and "ttnn.divide" not in ir
     o, g = out.astype(np.float32), gate.astype(np.float32)
     np.testing.assert_allclose(actual, o / (1 + np.exp(-g)), atol=2e-2, rtol=2e-2)
