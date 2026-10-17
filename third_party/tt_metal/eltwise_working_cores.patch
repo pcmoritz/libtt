@@ -1,0 +1,260 @@
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+@@ -319,7 +319,12 @@ ttsl::hash::hash_t BinaryNgDeviceOperation::tensor_args_t::to_hash() const {
+                                    : std::nullopt,
+         input_tensor_b.has_value() ? std::optional{input_tensor_b->tensor_spec().tile()} : std::nullopt,
+         sharded_tensor_shape_in_pages(input_tensor_a),
+-        input_tensor_b.has_value() ? sharded_tensor_shape_in_pages(*input_tensor_b) : std::nullopt);
++        input_tensor_b.has_value() ? sharded_tensor_shape_in_pages(*input_tensor_b) : std::nullopt,
++        // An interleaved program runs on the cores its output tiles split over.
++        input_tensor_a.memory_config().is_sharded() ? std::nullopt : std::optional{input_tensor_a.padded_shape()},
++        input_tensor_b.has_value() && !input_tensor_b->memory_config().is_sharded()
++            ? std::optional{input_tensor_b->padded_shape()}
++            : std::nullopt);
+ }
+ 
+ void BinaryNgDeviceOperation::validate_on_program_cache_miss(
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+@@ -398,6 +398,7 @@ namespace {
+ // are buffer base addresses (bindings), uint32_t entries are plain values.
+ struct BinaryNgPerCoreArgs {
+     std::vector<CoreCoord> cores;
++    std::vector<bool> noop;  // parallel to cores
+     std::vector<std::vector<std::variant<uint32_t, Buffer*>>> reader;
+     std::vector<std::vector<std::variant<uint32_t, Buffer*>>> writer;
+     std::vector<std::vector<std::variant<uint32_t, Buffer*>>> compute;
+@@ -619,6 +620,7 @@ BinaryNgPerCoreArgs build_per_core_runtime_args(
+             writer_runtime_args.assign(writer_len, std::variant<uint32_t, Buffer*>{uint32_t{0}});
+             compute_runtime_args.assign(compute_len, std::variant<uint32_t, Buffer*>{uint32_t{0}});
+             result.cores.push_back(core);
++            result.noop.push_back(true);
+             result.reader.push_back(std::move(reader_runtime_args));
+             result.writer.push_back(std::move(writer_runtime_args));
+             result.compute.push_back(std::move(compute_runtime_args));
+@@ -814,6 +816,7 @@ BinaryNgPerCoreArgs build_per_core_runtime_args(
+         }
+ 
+         result.cores.push_back(core);
++        result.noop.push_back(false);
+         result.reader.push_back(std::move(reader_runtime_args));
+         result.writer.push_back(std::move(writer_runtime_args));
+         result.compute.push_back(std::move(compute_runtime_args));
+@@ -904,8 +907,23 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+     uint32_t b_single_tile_size = tt::tile_size(b_data_format);
+     uint32_t c_single_tile_size = tt::tile_size(c_pack_data_format);
+ 
+-    // we parallelize the computation across the output tiles
+-    const auto& all_device_cores = operation_attributes.worker_grid;
++    // we parallelize the computation across the output tiles. An interleaved
++    // program runs only on the cores with output tiles: every core of the
++    // program costs dispatch time (runtime arguments, launch and completion),
++    // which a decode step's many small elementwise ops otherwise spend on idle
++    // cores. The program hash includes the operand shapes, which fix this core
++    // set. Sharded programs keep the whole worker grid.
++    const auto per_core = build_per_core_runtime_args(operation_attributes, a, b, c);
++    CoreRangeSet all_device_cores = operation_attributes.worker_grid;
++    if (!has_sharding) {
++        std::vector<CoreRange> active;
++        for (size_t i = 0; i < per_core.cores.size(); ++i) {
++            if (!per_core.noop[i]) {
++                active.emplace_back(per_core.cores[i], per_core.cores[i]);
++            }
++        }
++        all_device_cores = CoreRangeSet(active).merge_ranges();
++    }
+ 
+     Buffer* a_buffer = a.buffer();
+     Buffer* b_buffer = b.has_value() ? b->buffer() : nullptr;
+@@ -1442,8 +1460,10 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+     // Built via the shared single-source-of-truth builder so create_descriptor() (cache miss, here)
+     // and BinaryNgDeviceOperation::override_runtime_arguments() (cache hit) stay byte-identical.
+     {
+-        auto per_core = build_per_core_runtime_args(operation_attributes, a, b, c);
+         for (size_t i = 0; i < per_core.cores.size(); ++i) {
++            if (per_core.noop[i] && !has_sharding) {
++                continue;
++            }
+             reader_desc.emplace_runtime_args(per_core.cores[i], per_core.reader[i]);
+             writer_desc.emplace_runtime_args(per_core.cores[i], per_core.writer[i]);
+             compute_desc.emplace_runtime_args(per_core.cores[i], per_core.compute[i]);
+@@ -1499,7 +1519,16 @@ void BinaryNgDeviceOperation::ProgramFactory::override_runtime_arguments(
+         }
+     };
+ 
++    // An interleaved program has no kernels on noop cores.
++    const bool has_sharding = get_shard_volumes(
++                                  a.tensor_spec(),
++                                  b.has_value() ? b->tensor_spec() : std::optional<tt::tt_metal::TensorSpec>{},
++                                  c.tensor_spec())
++                                  .has_value();
+     for (size_t i = 0; i < per_core.cores.size(); ++i) {
++        if (per_core.noop[i] && !has_sharding) {
++            continue;
++        }
+         const auto& core = per_core.cores[i];
+         apply(kReaderKernelIdx, core, per_core.reader[i]);
+         apply(kWriterKernelIdx, core, per_core.writer[i]);
+diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_device_operation.cpp
+@@ -624,7 +624,10 @@ ttsl::hash::hash_t TernaryDeviceOperation::compute_program_hash(
+         sharded_tensor_shape_in_pages(input_a),
+         input_b.has_value() ? sharded_tensor_shape_in_pages(*input_b) : std::nullopt,
+         input_c.has_value() ? sharded_tensor_shape_in_pages(*input_c) : std::nullopt,
+-        sharded_tensor_shape_in_pages(output_spec));
++        sharded_tensor_shape_in_pages(output_spec),
++        // An interleaved program runs on the cores its output tiles split over.
++        shard_volumes.has_value() ? std::nullopt : std::optional<uint64_t>{output_spec.physical_shape().height() *
++                                                                            output_spec.physical_shape().width()});
+ }
+ 
+ bool TernaryDeviceOperation::skip_launch(
+diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
+@@ -663,6 +663,8 @@ struct TernaryPerCoreArgs {
+ 
+     std::vector<CoreCoord> cores;
+     std::vector<uint8_t> is_work_core;  // parallel to cores; noop cores are zero-filled
++    // An interleaved program has kernels only on work cores.
++    bool has_sharding = false;
+     std::vector<uint32_t> reader;       // flat, kNumReaderArgs per core
+     std::vector<uint32_t> writer;       // flat, kNumWriterArgs per core
+     std::vector<uint32_t> compute;      // flat, kNumComputeArgs per core
+@@ -720,6 +722,7 @@ TernaryPerCoreArgs build_per_core_runtime_args(
+     const auto& core_group_2 = partition.core_group_2;
+     const uint32_t num_cores_total = partition.num_cores_total;
+     const bool has_sharding = partition.has_sharding;
++    result.has_sharding = has_sharding;
+     const uint32_t num_tiles_per_core_group_1 = partition.num_tiles_per_core_group_1;
+     const uint32_t num_tiles_per_core_group_2 = partition.num_tiles_per_core_group_2;
+ 
+@@ -1072,7 +1075,23 @@ tt::tt_metal::ProgramDescriptor TernaryDeviceOperation::TernaryProgramFactory::c
+     const auto false_num_tiles_per_shard = has_sharding ? shard_volumes->false_shard_volume : std::nullopt;
+     const auto output_num_tiles_per_shard = has_sharding ? shard_volumes->output_shard_volume : std::nullopt;
+ 
+-    const auto& all_device_cores = operation_attributes.worker_grid;
++    // An interleaved program runs only on the cores with output tiles: every
++    // core of the program costs dispatch time (runtime arguments, launch and
++    // completion), which a decode step's many small elementwise ops otherwise
++    // spend on idle cores. The program hash includes the output volume, which
++    // fixes this core set. Sharded programs keep the whole worker grid.
++    const auto per_core = CMAKE_UNIQUE_NAMESPACE::build_per_core_runtime_args(
++        operation_attributes, tensor_args, output, broadcast_type);
++    CoreRangeSet all_device_cores = operation_attributes.worker_grid;
++    if (!has_sharding) {
++        std::vector<CoreRange> active;
++        for (size_t i = 0; i < per_core.cores.size(); ++i) {
++            if (per_core.is_work_core[i]) {
++                active.emplace_back(per_core.cores[i], per_core.cores[i]);
++            }
++        }
++        all_device_cores = CoreRangeSet(active).merge_ranges();
++    }
+ 
+     constexpr uint32_t num_tiles_per_cb = 2;
+ 
+@@ -1482,9 +1501,6 @@ tt::tt_metal::ProgramDescriptor TernaryDeviceOperation::TernaryProgramFactory::c
+     // emplace_runtime_args() registers them as bindings and the framework keeps its O(1) address
+     // patching.  Noop cores hold no buffers, so they take the plain path.
+     {
+-        auto per_core = CMAKE_UNIQUE_NAMESPACE::build_per_core_runtime_args(
+-            operation_attributes, tensor_args, output, broadcast_type);
+-
+         std::vector<std::variant<uint32_t, Buffer*>> slots;  // reused across cores
+         auto emplace_with_buffers =
+             [&slots](
+@@ -1503,6 +1519,9 @@ tt::tt_metal::ProgramDescriptor TernaryDeviceOperation::TernaryProgramFactory::c
+ 
+         for (size_t i = 0; i < per_core.cores.size(); ++i) {
+             const auto& core = per_core.cores[i];
++            if (!per_core.is_work_core[i] && !has_sharding) {
++                continue;
++            }
+             if (per_core.is_work_core[i]) {
+                 emplace_with_buffers(
+                     reader_desc,
+@@ -1598,6 +1617,9 @@ void TernaryDeviceOperation::TernaryProgramFactory::override_runtime_arguments(
+     };
+ 
+     for (size_t i = 0; i < per_core.cores.size(); ++i) {
++        if (!per_core.is_work_core[i] && !per_core.has_sharding) {
++            continue;  // the program has no kernels on this core
++        }
+         const auto& core = per_core.cores[i];
+         apply(kReaderKernelIdx, core, per_core.reader_row(i), CMAKE_UNIQUE_NAMESPACE::kNumReaderArgs);
+         apply(kWriterKernelIdx, core, per_core.writer_row(i), CMAKE_UNIQUE_NAMESPACE::kNumWriterArgs);
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
+@@ -321,13 +321,19 @@ ttsl::hash::hash_t UnaryDeviceOperation::compute_program_hash(
+             dst_shard_vol);
+     }
+ 
++    // An interleaved program runs on the cores its tile count splits over.
++    const std::optional<uint64_t> interleaved_tiles =
++        shard_specs.has_value()
++            ? std::nullopt
++            : std::optional<uint64_t>(input_tensor.physical_volume() / input_tensor.tensor_spec().tile().get_tile_hw());
+     return operation::hash_operation<UnaryDeviceOperation>(
+         attributes,
+         input_tensor.dtype(),
+         input_tensor.layout(),
+         input_tensor.memory_config(),
+         src_shard_vol,
+-        dst_shard_vol);
++        dst_shard_vol,
++        interleaved_tiles);
+ }
+ 
+ bool UnaryDeviceOperation::skip_launch(
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
+@@ -431,7 +431,22 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+         dst_sharded ? std::optional<uint32_t>(shard_pages(shard_specs->output_shard_spec, output, is_row_major))
+                     : std::nullopt;
+ 
+-    const auto& all_device_cores = operation_attributes.worker_grid;
++    // An interleaved tensor's program runs only on the cores with tiles to
++    // process: every core of the program costs dispatch time (runtime
++    // arguments, launch and completion), which a decode step's many small
++    // elementwise ops otherwise spend on idle cores. The program hash includes
++    // the tile count, which fixes this core set. Sharded programs keep the
++    // whole worker grid.
++    CoreRangeSet all_device_cores = operation_attributes.worker_grid;
++    if (!has_sharding) {
++        std::vector<CoreRange> active;
++        enumerate_core_rt_args(operation_attributes, tensor_args, output, [&](const CoreRtArgs& w, const RmChunkConstants&) {
++            if (!w.noop) {
++                active.emplace_back(w.core, w.core);
++            }
++        });
++        all_device_cores = CoreRangeSet(active).merge_ranges();
++    }
+ 
+     std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(
+         NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
+@@ -558,6 +573,9 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+     constexpr uint32_t kShardedDataMovementArgs = 3, kInterleavedDataMovementArgs = 8, kComputeArgs = 3;
+     enumerate_core_rt_args(
+         operation_attributes, tensor_args, output, [&](const CoreRtArgs& w, const RmChunkConstants& kc) {
++            if (w.noop && !has_sharding) {
++                return;
++            }
+             if (w.noop) {
+                 const uint32_t n = has_sharding ? kShardedDataMovementArgs : kInterleavedDataMovementArgs;
+                 reader_desc.runtime_args.emplace_back(w.core, KernelDescriptor::CoreRuntimeArgs(n, 0));
+@@ -633,6 +651,9 @@ void UnaryDeviceOperation::ProgramFactory::override_runtime_arguments(
+ 
+     enumerate_core_rt_args(
+         operation_attributes, tensor_args, output, [&](const CoreRtArgs& w, const RmChunkConstants& kc) {
++            if (w.noop && !has_sharding) {
++                return;  // the program has no kernels on this core
++            }
+             auto& r = GetRuntimeArgs(program, kReaderKernelIdx, w.core);
+             auto& wr = GetRuntimeArgs(program, kWriterKernelIdx, w.core);
+             auto& c = GetRuntimeArgs(program, kComputeKernelIdx, w.core);
