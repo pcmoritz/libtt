@@ -1,0 +1,23 @@
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+@@ -898,10 +898,17 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+     const auto c_data_format = promote_narrow_float || exact_fp16_binary_output
+                                    ? unary::utils::raw_16bit_sfpu_format
+                                    : datatype_to_dataformat_converter(c_dtype);
++    // An FP32 result narrowed to BF16 goes through the TYPECAST post-activation
++    // added below, which, as in the typecast op, leaves the round-to-nearest-even
++    // BF16 bits in the low half of each DST word for a raw 16-bit pack; the
++    // BF16 packer would read that word as an FP32 value.
++    const bool raw_bfloat16_output = binary::utils::is_typecast(a_dtype, c_dtype) && !is_quant_op &&
++                                     a_dtype == DataType::FLOAT32 && c_dtype == DataType::BFLOAT16;
+     // Int8 output is packed through the UInt8 packer path, and promoted FP16
+     // output as its raw 16 bits.
+-    const auto c_pack_data_format =
+-        promote_narrow_float || exact_fp16_binary_output ? c_data_format : cb_dataformat_for(c_dtype);
++    const auto c_pack_data_format = promote_narrow_float || exact_fp16_binary_output ? c_data_format
++                                    : raw_bfloat16_output ? unary::utils::raw_16bit_sfpu_format
++                                                          : cb_dataformat_for(c_dtype);
+ 
+     uint32_t a_single_tile_size = tt::tile_size(a_data_format);
+     uint32_t b_single_tile_size = tt::tile_size(b_data_format);
