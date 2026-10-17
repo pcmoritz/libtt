@@ -248,6 +248,25 @@ def test_gather_in_while_loop_body_from_shared_input():
     assert_equal(lengths, (cu[1:] - cu[:-1]).astype(np.float32) * 0.5)
 
 
+def test_while_loop_body_reading_a_shared_input_tiled():
+    # The opposite: the loop body reads the input in elementwise ops, so its
+    # argument is tiled, and the conversion in front of the loop must survive
+    # row-major propagation.
+    cu = np.array([0, 5, 12], np.int32)
+
+    def fn(cu):
+        def body(i, acc):
+            return acc + (cu * (i + 1)).astype(jnp.float32)
+
+        out = jax.lax.fori_loop(0, 3, body, jnp.zeros(cu.shape, jnp.float32))
+        return out, (cu[1:] - cu[:-1]).astype(jnp.float32)
+
+    device = jax.devices("tt")[0]
+    out, lengths = jax.jit(fn, compiler_options=OPTIONS)(jax.device_put(cu, device))
+    assert_equal(out, (cu * 6).astype(np.float32))
+    assert_equal(lengths, (cu[1:] - cu[:-1]).astype(np.float32))
+
+
 @pytest.mark.parametrize("trace", [False, True])
 def test_dynamic_update_slice_cache(trace):
     # A KV-cache style write: one position in the batch and sequence dims,

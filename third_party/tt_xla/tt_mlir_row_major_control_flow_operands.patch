@@ -9,84 +9,134 @@ diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagati
  #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
  #include "ttmlir/Dialect/TTCore/IR/Utils.h"
  #include "ttmlir/Dialect/TTNN/Analysis/OpConfig.h"
-@@ -27,6 +28,7 @@
+@@ -23,6 +24,7 @@
+ #include "mlir/IR/BuiltinTypes.h"
+ #include "mlir/IR/Operation.h"
+ #include "mlir/IR/PatternMatch.h"
++#include "mlir/IR/SymbolTable.h"
+ #include "mlir/IR/Value.h"
  #include "mlir/IR/Visitors.h"
  #include "mlir/Support/LLVM.h"
- #include "llvm/ADT/DenseMap.h"
-+#include "llvm/ADT/DenseSet.h"
- #include "llvm/ADT/SmallVector.h"
- #include "llvm/ADT/TypeSwitch.h"
+@@ -32,6 +34,7 @@
  #include "llvm/Support/Error.h"
-@@ -75,16 +77,50 @@ public:
-       llvm::SmallVector<ttnn::ToTensorSpecOp> toRemoveToTensorSpecOps =
-           findRedundantToTensorSpecOps(funcInputArguments);
  
-+      // A while loop's or case's operand must keep its callee argument's
-+      // type. One that already reads a row-major argument directly was typed
-+      // so by the layout pass (the callee reads it row-major, e.g. through
-+      // rows_gather); a tiled fixup in front of it would hand the callee a
-+      // tiled tensor its signature calls row-major.
-+      DirectUses directUses = collectDirectControlFlowUses(
-+          funcInputArguments, toRemoveToTensorSpecOps);
-+
-       llvm::SmallVector<Value> rowMajorArgs =
-           bypassRedundantToTensorSpecOps(toRemoveToTensorSpecOps);
+ #include <cassert>
++#include <optional>
+ #include <queue>
+ #include <utility>
+ #include <vector>
+@@ -285,6 +288,16 @@ private:
+           continue;
+         }
  
-       llvm::DenseMap<Operation *, Layout> opLayoutConstraints;
--      propagateRowMajorLayout(func, rowMajorArgs, opLayoutConstraints);
-+      propagateRowMajorLayout(func, rowMajorArgs, directUses,
-+                              opLayoutConstraints);
-     });
- #endif // TTMLIR_ENABLE_OPMODEL
-   }
- 
- private:
-+  // (user, operand number) pairs that propagation must leave as they are.
-+  using DirectUses = llvm::DenseSet<std::pair<Operation *, unsigned>>;
-+
-+  // The control-flow operands that read one of `args` directly, before the
-+  // redundant ToTensorSpecOps are bypassed.
-+  DirectUses collectDirectControlFlowUses(
-+      const llvm::SmallVector<Value> &args,
-+      const llvm::SmallVector<ttnn::ToTensorSpecOp> &toRemove) {
-+    llvm::DenseSet<Operation *> removed;
-+    for (ttnn::ToTensorSpecOp op : toRemove) {
-+      removed.insert(op.getOperation());
-+    }
-+    DirectUses uses;
-+    for (Value arg : args) {
-+      for (OpOperand &use : arg.getUses()) {
-+        Operation *owner = use.getOwner();
-+        if (!removed.contains(owner) &&
-+            mlir::isa<ttcore::WhileLoopOp, ttcore::CaseOp>(owner)) {
-+          uses.insert({owner, use.getOperandNumber()});
-+        }
-+      }
-+    }
-+    return uses;
-+  }
-+
-   // Returns true if block argument is an input argument of the function.
-   // KV cache arguments are excluded even though they have Input argument type.
-   bool isInputArgument(BlockArgument arg, func::FuncOp func) {
-@@ -256,6 +292,7 @@ private:
-   void
-   propagateRowMajorLayout(func::FuncOp func,
-                           const llvm::SmallVector<Value> &rowMajorArgs,
-+                          const DirectUses &directUses,
-                           llvm::DenseMap<Operation *, Layout> &constraints) {
-     IRRewriter rewriter(func.getContext());
-     FunctionType funcType = func.getFunctionType();
-@@ -279,6 +316,12 @@ private:
-         OpOperand &use = *usePtr;
-         Operation *user = use.getOwner();
- 
-+        // A control-flow operand already typed row-major by the layout pass:
-+        // its callee reads it so; nothing to propagate or fix up.
-+        if (directUses.contains({user, use.getOperandNumber()})) {
++        // A while loop's or case's operand is an argument of its callee, so it
++        // keeps the layout the callee declares, as a returned value keeps the
++        // function signature's; propagation stops there.
++        if (std::optional<Type> expectedType = getControlFlowOperandType(use)) {
++          restoreExpectedLayout(rewriter, user, use.getOperandNumber(),
++                                current, *expectedType,
++                                "_control_flow_conversion");
 +          continue;
 +        }
 +
-         if (auto returnOp = mlir::dyn_cast<func::ReturnOp>(user)) {
-           handleReturnOp(rewriter, funcType, returnOp, use.getOperandNumber(),
-                          current);
+         // The rows ops (libtt's rows_gather and rows_scatter) already read
+         // row-major operands and write a row-major result, typed by the
+         // layout pass: nothing to propagate through them, and no tiled
+@@ -425,13 +438,53 @@ private:
+     consumerOperand.set(toTensorSpecOp.getResult());
+   }
+ 
+-  // Handles ReturnOp during propagation. Checks if actual layout matches
+-  // expected function signature and inserts ToLayoutOp if needed for tilizing.
++  // Handles ReturnOp during propagation: the returned value keeps the layout
++  // of the function signature.
+   void handleReturnOp(IRRewriter &rewriter, FunctionType funcType,
+                       func::ReturnOp returnOp, unsigned operandIdx,
+                       Value previousOp) {
+-    auto actualTensorType =
+-        mlir::dyn_cast<RankedTensorType>(previousOp.getType());
++    restoreExpectedLayout(rewriter, returnOp, operandIdx, previousOp,
++                          funcType.getResult(operandIdx), "_return_conversion");
++  }
++
++  // The type the callee of a while loop or case declares for `use`, or
++  // nullopt when `use` is not a callee argument (a case's selector, say).
++  // Every case branch has one signature (see CaseLayoutPattern), so the
++  // first branch speaks for all of them.
++  static std::optional<Type> getControlFlowOperandType(OpOperand &use) {
++    Operation *owner = use.getOwner();
++    auto calleeArgType = [&](OperandRange inputs,
++                             FlatSymbolRefAttr callee) -> std::optional<Type> {
++      unsigned begin = inputs.getBeginOperandIndex();
++      unsigned operand = use.getOperandNumber();
++      auto function =
++          SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(owner, callee);
++      if (!function || operand < begin || operand >= begin + inputs.size()) {
++        return std::nullopt;
++      }
++      return function.getArgumentTypes()[operand - begin];
++    };
++    if (auto loop = mlir::dyn_cast<ttcore::WhileLoopOp>(owner)) {
++      return calleeArgType(loop.getInputs(), loop.getBodyProgramAttr());
++    }
++    if (auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(owner)) {
++      ArrayAttr branches = caseOp.getBranchPrograms();
++      if (branches.empty()) {
++        return std::nullopt;
++      }
++      return calleeArgType(caseOp.getInputs(),
++                           mlir::cast<FlatSymbolRefAttr>(branches[0]));
++    }
++    return std::nullopt;
++  }
++
++  // Converts operand `operandIdx` of `consumer`, the row-major `value`, back
++  // to `expectedType` when that is tiled; a row-major expectation needs
++  // nothing.
++  void restoreExpectedLayout(IRRewriter &rewriter, Operation *consumer,
++                             unsigned operandIdx, Value value,
++                             Type expectedType, StringRef suffix) {
++    auto actualTensorType = mlir::dyn_cast<RankedTensorType>(value.getType());
+     assert(actualTensorType && "Expected ranked tensor type");
+ 
+     auto actualLayout =
+@@ -440,11 +493,7 @@ private:
+     assert(!actualLayout.isTiled() &&
+            "Expected row major as propagation result");
+ 
+-    // Extract expected layout from function signature and check if conversion
+-    // needed
+-    Type expectedReturnType = funcType.getResult(operandIdx);
+-    auto expectedTensorType =
+-        mlir::dyn_cast<RankedTensorType>(expectedReturnType);
++    auto expectedTensorType = mlir::dyn_cast<RankedTensorType>(expectedType);
+     if (!expectedTensorType) {
+       return;
+     }
+@@ -455,19 +504,19 @@ private:
+     }
+ 
+     TTMLIR_DEBUG(ttmlir::LogComponent::RMPropagation,
+-                 "Inserting ToLayoutOp before return for operand {}: "
++                 "Inserting ToLayoutOp before {} for operand {}: "
+                  "actual layout {} -> expected layout {}",
+-                 operandIdx, actualLayout, expectedLayout);
++                 consumer->getName(), operandIdx, actualLayout,
++                 expectedLayout);
+ 
+-    rewriter.setInsertionPoint(returnOp);
++    rewriter.setInsertionPoint(consumer);
+ 
+     auto toTensorSpecOp = utils::createToTensorSpecOp(
+-        returnOp, mlir::cast<mlir::TypedValue<RankedTensorType>>(previousOp),
++        consumer, mlir::cast<mlir::TypedValue<RankedTensorType>>(value),
+         rewriter, expectedLayout.getLayout(), expectedLayout.getBufferType(),
+-        expectedLayout.getMemLayout(), expectedLayout.getDataType(),
+-        "_return_conversion");
++        expectedLayout.getMemLayout(), expectedLayout.getDataType(), suffix);
+ 
+-    returnOp.setOperand(operandIdx, toTensorSpecOp.getResult());
++    consumer->setOperand(operandIdx, toTensorSpecOp.getResult());
+   }
+ 
+   // Extract OpConfig from operation's IR
