@@ -578,6 +578,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_const_eval_order_free_hash.patch",
         "//third_party/tt_xla:tt_mlir_row_major_control_flow_operands.patch",
         "//third_party/tt_xla:tt_mlir_batched_matmul_reuse_config.patch",
+        "//third_party/tt_xla:tt_mlir_dot_strength_reduction.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

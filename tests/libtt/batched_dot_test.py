@@ -1,8 +1,9 @@
 """Batched dots with little work per batch.
 
 A batched matmul whose per-batch output cannot fill the core grid spreads whole
-batches over the cores (MatmulMultiCoreReuseProgramConfig) and must match the
-CPU.
+batches over the cores (MatmulMultiCoreReuseProgramConfig), and a batched
+matrix-vector product whose per-batch output is a single tile becomes an f32
+multiply and sum (XLA's dot strength reduction). Both must match the CPU.
 """
 
 import jax
@@ -10,18 +11,22 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-# (einsum spec, lhs shape, rhs shape).
+# (einsum spec, lhs shape, rhs shape, lowering): "sum" for a multiply and sum,
+# "batched" for a matmul spread over the batches.
 CASES = [
     # The N-gram short conv at decode: 2560 channels of 4 taps.
-    ("bck,ck->bc", (1, 2560, 4), (2560, 4)),
+    ("bck,ck->bc", (1, 2560, 4), (2560, 4), "sum"),
+    ("bck,ck->bc", (8, 256, 4), (256, 4), "sum"),
     # Per-row dot products.
-    ("bk,bk->b", (300, 128), (300, 128)),
-    # The same conv at prefill: 40 tokens per channel.
-    ("ctk,ck->ct", (256, 40, 4), (256, 4)),
+    ("bk,bk->b", (300, 128), (300, 128), "sum"),
+    # Several contracting dims, the vector on the left, batch dims not leading.
+    ("kbj,jbk->b", (3, 40, 5), (5, 40, 3), "sum"),
+    # The same conv at prefill: 40 tokens per channel, more than one tile.
+    ("ctk,ck->ct", (256, 40, 4), (256, 4), "batched"),
     # One query per head against its keys.
-    ("hsd,hd->hs", (8, 100, 64), (8, 64)),
+    ("hsd,hd->hs", (8, 100, 64), (8, 64), "batched"),
     # Small batched matmuls.
-    ("bij,bjk->bik", (64, 8, 16), (64, 16, 8)),
+    ("bij,bjk->bik", (64, 8, 16), (64, 16, 8), "batched"),
 ]
 
 
@@ -41,7 +46,7 @@ def _compile(tmp_path, fn, *args):
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, np.float32])
 @pytest.mark.parametrize("case", CASES, ids=_ids)
 def test_batched_dot_matches_cpu(tmp_path, case, dtype):
-    spec, lhs_shape, rhs_shape = case
+    spec, lhs_shape, rhs_shape, lowering = case
     rng = np.random.default_rng(0)
     lhs = rng.normal(size=lhs_shape).astype(dtype)
     rhs = rng.normal(size=rhs_shape).astype(dtype)
@@ -55,7 +60,12 @@ def test_batched_dot_matches_cpu(tmp_path, case, dtype):
         *[jax.device_put(a, cpu) for a in (lhs, rhs)]
     )
     np.testing.assert_allclose(got.astype(np.float32), np.asarray(want), rtol=2e-2, atol=5e-2)
-    assert "matmul_multi_core_reuse_program_config" in ir, spec
+
+    if lowering == "sum":
+        assert '"ttnn.matmul"' not in ir, spec
+        assert '"ttnn.sum"' in ir, spec
+    else:
+        assert "matmul_multi_core_reuse_program_config" in ir, spec
 
 
 @pytest.mark.parametrize(

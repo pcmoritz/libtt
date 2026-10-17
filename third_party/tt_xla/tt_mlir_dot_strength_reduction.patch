@@ -1,0 +1,157 @@
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -228,6 +228,10 @@ struct DotGeneralToMatmulConversionPattern
+   LogicalResult
+   matchAndRewrite(ttir::DotGeneralOp op, OpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
++    if (Value reduced = strengthReduce(op, adaptor, rewriter)) {
++      rewriter.replaceOp(op, reduced);
++      return success();
++    }
+ 
+     Value lhs = adaptor.getLhs();
+     auto lhsType = mlir::cast<RankedTensorType>(lhs.getType());
+@@ -379,6 +383,142 @@ struct DotGeneralToMatmulConversionPattern
+   }
+ 
+ private:
++  // XLA's dot strength reduction (AlgebraicSimplifier::HandleDot): when one
++  // operand, V, has only batch and contracting dimensions, the dot is V
++  // broadcast over the other operand A, multiplied and summed over the
++  // contraction. As a matmul it is a batched matrix-vector product, with a
++  // block of its own for every batch; when A's free dimensions fit in one
++  // tile, each block is a single, mostly padded tile (2560 such batches took
++  // 112 us as a matmul against 27 us as a multiply and a sum). Larger
++  // per-batch outputs stay matmuls, which are faster there. The multiply and
++  // the sum run in f32 and round once, as the matmul accumulates in f32.
++  // Returns the result, or null when the dot is not reduced.
++  Value strengthReduce(ttir::DotGeneralOp op, OpAdaptor adaptor,
++                       ConversionPatternRewriter &rewriter) const {
++    constexpr int64_t kTileDim = 32;
++    auto resultType = mlir::cast<RankedTensorType>(op.getType());
++    Type elementType = resultType.getElementType();
++    if (!isa<FloatType>(elementType) || op->hasAttr("ttcore.fp32_exact")) {
++      return nullptr;
++    }
++
++    Value lhs = adaptor.getLhs();
++    Value rhs = adaptor.getRhs();
++    auto lhsType = mlir::cast<RankedTensorType>(lhs.getType());
++    auto rhsType = mlir::cast<RankedTensorType>(rhs.getType());
++    SmallVector<int64_t> lhsBatchDims(op.getBatchDimsLhs());
++    SmallVector<int64_t> rhsBatchDims(op.getBatchDimsRhs());
++    SmallVector<int64_t> lhsContractDims(op.getContractDimsLhs());
++    SmallVector<int64_t> rhsContractDims(op.getContractDimsRhs());
++    SmallVector<int64_t> lhsFreeDims =
++        getResultDims(lhsBatchDims, lhsContractDims, lhsType.getRank());
++    SmallVector<int64_t> rhsFreeDims =
++        getResultDims(rhsBatchDims, rhsContractDims, rhsType.getRank());
++    const bool vIsLhs = lhsFreeDims.empty();
++    if (!vIsLhs && !rhsFreeDims.empty()) {
++      return nullptr;
++    }
++    Value a = vIsLhs ? rhs : lhs;
++    Value v = vIsLhs ? lhs : rhs;
++    auto aType = vIsLhs ? rhsType : lhsType;
++    auto vType = vIsLhs ? lhsType : rhsType;
++    ArrayRef<int64_t> aBatchDims = vIsLhs ? rhsBatchDims : lhsBatchDims;
++    ArrayRef<int64_t> vBatchDims = vIsLhs ? lhsBatchDims : rhsBatchDims;
++    ArrayRef<int64_t> aContractDims =
++        vIsLhs ? rhsContractDims : lhsContractDims;
++    ArrayRef<int64_t> vContractDims =
++        vIsLhs ? lhsContractDims : rhsContractDims;
++    ArrayRef<int64_t> aFreeDims = vIsLhs ? rhsFreeDims : lhsFreeDims;
++    ArrayRef<int64_t> aShape = aType.getShape();
++    if (computeProductOfDims(aShape, aBatchDims) <= 1 ||
++        computeProductOfDims(aShape, aFreeDims) > kTileDim ||
++        computeProductOfDims(aShape, aContractDims) <= 1) {
++      return nullptr;
++    }
++
++    Location loc = op.getLoc();
++    Type f32 = rewriter.getF32Type();
++    auto toF32 = [&](Value value, StringRef suffix) -> Value {
++      auto type = mlir::cast<RankedTensorType>(value.getType());
++      if (type.getElementType() == f32) {
++        return value;
++      }
++      return rewriter.create<ttir::TypecastOp>(
++          ttmlir::utils::appendLocationSuffix(loc, suffix),
++          RankedTensorType::get(type.getShape(), f32), value);
++    };
++
++    // V's dimensions in A's order, with a unit dimension at each of A's free
++    // dimensions, so that it broadcasts over them.
++    SmallVector<int64_t> vPermutation;
++    SmallVector<int64_t> vShape;
++    for (int64_t d = 0; d < aType.getRank(); ++d) {
++      if (const auto *it = llvm::find(aBatchDims, d); it != aBatchDims.end()) {
++        vPermutation.push_back(vBatchDims[it - aBatchDims.begin()]);
++      } else if (const auto *it = llvm::find(aContractDims, d);
++                 it != aContractDims.end()) {
++        vPermutation.push_back(vContractDims[it - aContractDims.begin()]);
++      } else {
++        vShape.push_back(1);
++        continue;
++      }
++      vShape.push_back(vType.getDimSize(vPermutation.back()));
++    }
++    if (!llvm::equal(vPermutation, llvm::seq<int64_t>(0, vType.getRank()))) {
++      v = createPermuteOp(
++          rewriter, ttmlir::utils::appendLocationSuffix(loc, "_permuteVector"),
++          v, vType, vPermutation);
++    }
++    if (static_cast<int64_t>(vShape.size()) != vType.getRank()) {
++      v = ttir::utils::createReshapeOp(
++          rewriter, ttmlir::utils::appendLocationSuffix(loc, "_reshapeVector"),
++          v, vShape);
++    }
++
++    Value product = rewriter.create<ttir::MultiplyOp>(
++        ttmlir::utils::appendLocationSuffix(loc, "_product"),
++        RankedTensorType::get(aShape, f32), toF32(a, "_operandF32"),
++        toF32(v, "_vectorF32"));
++    // The sum keeps A's other dimensions in A's order.
++    SmallVector<int64_t> keptDims;
++    SmallVector<int64_t> keptShape;
++    for (int64_t d = 0; d < aType.getRank(); ++d) {
++      if (!llvm::is_contained(aContractDims, d)) {
++        keptDims.push_back(d);
++        keptShape.push_back(aShape[d]);
++      }
++    }
++    SmallVector<int32_t> sumDims(aContractDims.begin(), aContractDims.end());
++    Value result = rewriter.create<ttir::SumOp>(
++        ttmlir::utils::appendLocationSuffix(loc, "_sum"),
++        RankedTensorType::get(keptShape, f32), product, /*keepDim=*/false,
++        rewriter.getI32ArrayAttr(sumDims));
++    if (elementType != f32) {
++      result = rewriter.create<ttir::TypecastOp>(
++          ttmlir::utils::appendLocationSuffix(loc, "_result"),
++          RankedTensorType::get(keptShape, elementType), result);
++    }
++
++    // The dot's result is [batch dims in pairing order, free dims].
++    SmallVector<int64_t> resultDims(aBatchDims);
++    llvm::append_range(resultDims, aFreeDims);
++    SmallVector<int64_t> resultPermutation = llvm::to_vector(
++        llvm::map_range(resultDims, [&](int64_t d) -> int64_t {
++          return llvm::find(keptDims, d) - keptDims.begin();
++        }));
++    if (!llvm::equal(resultPermutation,
++                     llvm::seq<int64_t>(0, resultPermutation.size()))) {
++      result = createPermuteOp(
++          rewriter, ttmlir::utils::appendLocationSuffix(loc, "_permuteResult"),
++          result, mlir::cast<RankedTensorType>(result.getType()),
++          resultPermutation);
++    }
++    assert(mlir::cast<RankedTensorType>(result.getType()).getShape() ==
++               resultType.getShape() &&
++           "strength-reduced dot must keep the dot's result shape");
++    return result;
++  }
++
+   SmallVector<int64_t> getResultDims(const SmallVector<int64_t> &batchDims,
+                                      const SmallVector<int64_t> &contractDims,
+                                      int64_t rank) const {
