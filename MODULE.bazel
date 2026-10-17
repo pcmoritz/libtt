@@ -593,6 +593,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_eltwise_activation_fusion_guards.patch",
         "//third_party/tt_xla:tt_mlir_bf16_mean_of_upcast.patch",
         "//third_party/tt_xla:tt_mlir_binary_narrowing_output.patch",
+        "//third_party/tt_xla:tt_mlir_dedupe_to_layout.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
