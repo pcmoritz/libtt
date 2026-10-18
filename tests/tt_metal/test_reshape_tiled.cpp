@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// The tiled reshape reads a batch of mapping pages and keeps several input
-// tiles in flight per core. Reshapes with one or many input tiles per output
-// page, many output pages per core and odd shapes must still move every
-// element to its place.
+// A tiled reshape with few output pages per core runs on a host plan: one
+// aligned window read per segment, then only the windows of each output page
+// that its segments touch are written. Larger ones take the mapping-driven
+// reader and writer. Both must move every element to its place, with one or
+// many input tiles per output page and odd shapes.
 
 #include <gtest/gtest.h>
 
@@ -19,7 +20,7 @@
 namespace tt::tt_metal::distributed::test {
 namespace {
 
-class ReshapeTiledBatchedTest : public ::testing::Test {
+class ReshapeTiledTest : public ::testing::Test {
 protected:
     void SetUp() override { mesh_device_ = MeshDevice::create(MeshDeviceConfig(MeshShape{1, 1})); }
 
@@ -53,23 +54,28 @@ protected:
     std::shared_ptr<MeshDevice> mesh_device_;
 };
 
-TEST_F(ReshapeTiledBatchedTest, OneTilePerOutputPage) {
+TEST_F(ReshapeTiledTest, OneTilePerOutputPage) {
     expect_reshape(ttnn::Shape({1, 4, 2560}), ttnn::Shape({1, 10240}), DataType::BFLOAT16);
     expect_reshape(ttnn::Shape({1, 12, 128}), ttnn::Shape({1, 1536}), DataType::BFLOAT16);
 }
 
-TEST_F(ReshapeTiledBatchedTest, SeveralTilesPerOutputPage) {
+TEST_F(ReshapeTiledTest, SeveralTilesPerOutputPage) {
     expect_reshape(ttnn::Shape({1, 10240}), ttnn::Shape({1, 4, 2560}), DataType::BFLOAT16);
     expect_reshape(ttnn::Shape({1, 10240}), ttnn::Shape({1, 4, 2560}), DataType::FLOAT32);
     expect_reshape(ttnn::Shape({1, 2560}), ttnn::Shape({1, 2560, 1}), DataType::BFLOAT16);
     expect_reshape(ttnn::Shape({1, 4}), ttnn::Shape({1, 4, 1}), DataType::BFLOAT16);
 }
 
-TEST_F(ReshapeTiledBatchedTest, ManyOutputPagesPerCore) {
-    // More output pages per core than mapping entries and input tiles in flight.
+TEST_F(ReshapeTiledTest, SeveralOutputPagesPerCore) {
     expect_reshape(ttnn::Shape({64, 4096}), ttnn::Shape({4, 16, 4096}), DataType::BFLOAT16);
     expect_reshape(ttnn::Shape({96, 2560}), ttnn::Shape({3, 320, 256}), DataType::BFLOAT16);
     expect_reshape(ttnn::Shape({3, 50, 96}), ttnn::Shape({150, 96}), DataType::FLOAT32);
+}
+
+TEST_F(ReshapeTiledTest, MoreOutputPagesPerCoreThanAPlanTakes) {
+    // 2048 output pages: more than eight per core.
+    expect_reshape(ttnn::Shape({1, 256, 8192}), ttnn::Shape({1, 2048, 1024}), DataType::BFLOAT16);
+    expect_reshape(ttnn::Shape({8, 64, 4096}), ttnn::Shape({1, 512, 4096}), DataType::FLOAT32);
 }
 
 }  // namespace

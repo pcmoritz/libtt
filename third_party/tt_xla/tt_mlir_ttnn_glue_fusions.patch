@@ -45,7 +45,7 @@ diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -212,6 +212,20 @@ bool hasInterveningWrite(Value value, Operation *from, Operation *to) {
+@@ -212,6 +212,24 @@ bool hasInterveningWrite(Value value, Operation *from, Operation *to) {
    return false;
  }
  
@@ -63,10 +63,14 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +         llvm::all_of(op->getResults(), hasActivationFusibleType);
 +}
 +
++static mlir::Type elementTypeOf(Value value) {
++  return mlir::cast<mlir::RankedTensorType>(value.getType()).getElementType();
++}
++
  class TTNNBinaryOpInputsActivation
      : public mlir::OpInterfaceRewritePattern<ElementwiseBinaryActivations> {
  public:
-@@ -261,6 +275,16 @@ private:
+@@ -261,6 +279,16 @@ private:
      if (!unaryOp) {
        return {};
      }
@@ -83,7 +87,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
      if (restrictToMatmulProducer &&
          !unaryOp.getInput().getDefiningOp<MatmulOp>() &&
          !unaryOp.getInput().getDefiningOp<LinearOp>()) {
-@@ -294,6 +318,48 @@ private:
+@@ -294,6 +322,45 @@ private:
  };
  } // namespace
  
@@ -100,14 +104,11 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +  mlir::LogicalResult
 +  matchAndRewrite(RMSNormOp norm, mlir::PatternRewriter &rewriter) const final {
 +    auto cast = norm.getInput().getDefiningOp<TypecastOp>();
-+    auto elementType = [](Value v) {
-+      return mlir::cast<mlir::RankedTensorType>(v.getType()).getElementType();
-+    };
 +    DeviceComputeKernelConfigAttr config = norm.getComputeConfigAttr();
 +    if (!cast || !cast.getResult().hasOneUse() ||
-+        !elementType(cast.getInput()).isBF16() ||
-+        !elementType(cast.getResult()).isF32() ||
-+        !elementType(norm.getResult()).isF32() ||
++        !elementTypeOf(cast.getInput()).isBF16() ||
++        !elementTypeOf(cast.getResult()).isF32() ||
++        !elementTypeOf(norm.getResult()).isF32() ||
 +        (config && (!config.getFp32DestAccEn() ||
 +                    !config.getFp32DestAccEn().getValue()))) {
 +      return mlir::failure();
@@ -132,7 +133,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  namespace {
  class TTNNBinaryOpOutputActivation
      : public mlir::OpInterfaceRewritePattern<ElementwiseUnary> {
-@@ -324,7 +390,8 @@ public:
+@@ -324,7 +391,8 @@ public:
  
  private:
    bool isFusable(ElementwiseUnary unaryOp) const {
@@ -142,7 +143,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
    }
  
    ElementwiseBinaryActivations getFusableBinaryOp(Value operand) const {
-@@ -333,11 +400,106 @@ private:
+@@ -333,11 +401,100 @@ private:
        return {};
      }
  
@@ -178,11 +179,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +    if (!up) {
 +      return failure();
 +    }
-+    auto elementType = [](Value v) {
-+      return mlir::cast<mlir::RankedTensorType>(v.getType()).getElementType();
-+    };
-+    if (!elementType(up.getInput()).isBF16() || !elementType(up.getResult()).isF32() ||
-+        !elementType(mean.getResult()).isF32() || !elementType(down.getResult()).isBF16()) {
++    if (!elementTypeOf(up.getInput()).isBF16() || !elementTypeOf(up.getResult()).isF32() ||
++        !elementTypeOf(mean.getResult()).isF32() || !elementTypeOf(down.getResult()).isBF16()) {
 +      return failure();
 +    }
 +    // The number of elements each mean adds up.
@@ -230,12 +228,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +        !cast.getInput().hasOneUse()) {
 +      return failure();
 +    }
-+    auto elementType = [](Value v) {
-+      return mlir::cast<mlir::RankedTensorType>(v.getType()).getElementType();
-+    };
-+    if (!elementType(cast.getInput()).isF32() || !elementType(cast.getResult()).isBF16() ||
++    if (!elementTypeOf(cast.getInput()).isF32() || !elementTypeOf(cast.getResult()).isBF16() ||
 +        !llvm::all_of(producer->getOperands(), [&](Value v) {
-+          return elementType(v).isF32() || elementType(v).isBF16();
++          return elementTypeOf(v).isF32() || elementTypeOf(v).isBF16();
 +        })) {
 +      return failure();
 +    }
@@ -250,7 +245,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  // Fold the decode MLP's concatenated [up | gate] projection and SwiGLU into a
  // single half-width matmul.  The runtime implements this marker with a
  // two-weight matmul that keeps matching up/gate accumulators on the same core.
-@@ -794,6 +956,7 @@ public:
+@@ -794,6 +951,7 @@ public:
      }
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973

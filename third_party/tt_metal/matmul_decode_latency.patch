@@ -1,17 +1,11 @@
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
-@@ -1050,6 +1050,59 @@ MatmulDecodeProgramConfig create_matmul_decode_program_config(
+@@ -1050,6 +1050,53 @@ MatmulDecodeProgramConfig create_matmul_decode_program_config(
      };
  }
  
 +namespace {
-+
-+// The decode program reads its activation and bias and writes its output
-+// through tensor accessors, so either interleaved buffer type serves.
-+bool is_interleaved(const tt::tt_metal::MemoryConfig& memory_config) {
-+    return memory_config.memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED;
-+}
 +
 +// A narrow decode matmul splits K when its output tiles leave most worker
 +// cores idle: one core per output tile and K share, each output tile's shares
@@ -61,19 +55,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
  std::optional<std::string> matmul_decode_unsupported_reason(
      const Tensor& input_tensor_a,
      const Tensor& input_tensor_b,
-@@ -1087,9 +1140,9 @@ std::optional<std::string> matmul_decode_unsupported_reason(
-     const uint32_t K = a_shape_padded[-1];
-     const uint32_t N = b_shape_padded[-1];
-     if (input_tensor_a.dtype() != DataType::BFLOAT16 || input_tensor_a.layout() != Layout::TILE ||
--        !utilities::is_dram_interleaved(input_tensor_a.memory_config())) {
-+        !is_interleaved(input_tensor_a.memory_config())) {
-         return fmt::format(
--            "input A must be a tiled BFLOAT16 tensor in interleaved DRAM, got dtype {}, layout {}, memory config {}",
-+            "input A must be a tiled BFLOAT16 tensor in interleaved memory, got dtype {}, layout {}, memory config {}",
-             input_tensor_a.dtype(),
-             input_tensor_a.layout(),
-             input_tensor_a.memory_config());
-@@ -1115,15 +1168,36 @@ std::optional<std::string> matmul_decode_unsupported_reason(
+@@ -1115,8 +1162,29 @@ std::optional<std::string> matmul_decode_unsupported_reason(
          return fmt::format("K of input B ({}) must be a multiple of the tile width {}", b_logical_K, TILE_WIDTH);
      }
      const uint32_t Kt = K / TILE_WIDTH;
@@ -105,28 +87,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
      }
  
      const auto output_dtype = attributes.output_dtype.value_or(input_tensor_a.dtype());
-     if ((output_dtype != DataType::BFLOAT16 && output_dtype != DataType::FLOAT32) ||
--        !utilities::is_dram_interleaved(attributes.output_mem_config)) {
-+        !is_interleaved(attributes.output_mem_config)) {
-         return fmt::format(
--            "the output must be BFLOAT16 or FLOAT32 in interleaved DRAM, got dtype {}, memory config {}",
-+            "the output must be BFLOAT16 or FLOAT32 in interleaved memory, got dtype {}, memory config {}",
-             output_dtype,
-             attributes.output_mem_config);
-     }
-@@ -1142,9 +1216,9 @@ std::optional<std::string> matmul_decode_unsupported_reason(
-     }
-     if (bias.has_value()) {
-         if ((bias->dtype() != DataType::BFLOAT16 && bias->dtype() != DataType::FLOAT32) ||
--            bias->layout() != Layout::TILE || !utilities::is_dram_interleaved(bias->memory_config())) {
-+            bias->layout() != Layout::TILE || !is_interleaved(bias->memory_config())) {
-             return fmt::format(
--                "the bias must be a tiled BFLOAT16 or FLOAT32 tensor in interleaved DRAM, got dtype {}, layout {}, "
-+                "the bias must be a tiled BFLOAT16 or FLOAT32 tensor in interleaved memory, got dtype {}, layout {}, "
-                 "memory config {}",
-                 bias->dtype(),
-                 bias->layout(),
-@@ -1177,17 +1251,56 @@ MatmulProgramConfig get_program_config(
+@@ -1177,17 +1245,56 @@ MatmulProgramConfig get_program_config(
          return attributes.program_config.value();
      }
      // The decode program when it can run the matmul and there is at least one
@@ -269,11 +230,11 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
             2 * in1_buffers * weight_block_tiles * tile_bytes(input_tensor_b.dtype()) +
 -           plan.count_of(0) * tile_bytes(output_dtype) +
 +           plan.count_of(0) * out_tile_bytes +
-+           (plan.k_splits - 1) * plan.count_of(0) * tile_bytes(tt::tt_metal::DataType::FLOAT32) +
++           (plan.k_splits - 1) * tile_bytes(tt::tt_metal::DataType::FLOAT32) +
             (bias.has_value() ? plan.count_of(0) * tile_bytes(bias->dtype()) : 0);
  }
  
-@@ -116,53 +132,114 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -116,53 +132,115 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
                                                                       : tensor_args.optional_input_tensors[0];
      const auto grid = config.compute_with_storage_grid_size;
      const uint32_t in0_block_w = config.in0_block_w;
@@ -383,12 +344,13 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +            all_cores);
 +    }
 +    if (split) {
-+        // The other shares pack FP32 partial sums into c_5, which their
-+        // writers place in the owner's partials buffer, slot share - 1. Every
-+        // core has both, so that one kernel binary serves either role and the
-+        // partials buffer has the same address on all cores.
-+        add_cb(tt::CBIndex::c_5, plan.count_of(0), tt::DataFormat::Float32, all_cores);
-+        add_cb(tt::CBIndex::c_4, (k_splits - 1) * plan.count_of(0), tt::DataFormat::Float32, all_cores);
++        // The other shares pack their FP32 partial sum (one output tile a
++        // core) into c_5, which their writers place in the owner's partials
++        // buffer, tile share - 1. Every core has both, so that one kernel
++        // binary serves either role and the partials buffer has the same
++        // address on all cores.
++        add_cb(tt::CBIndex::c_5, 1, tt::DataFormat::Float32, all_cores);
++        add_cb(tt::CBIndex::c_4, k_splits - 1, tt::DataFormat::Float32, all_cores);
      }
  
      constexpr uint32_t sender_sem_id = 0;
@@ -414,7 +376,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
      const auto in0_noc = tt::tt_metal::detail::preferred_noc_for_dram_write(device->arch());
      const auto in1_noc = tt::tt_metal::detail::preferred_noc_for_dram_read(device->arch());
      const std::vector<std::pair<std::string, uint32_t>> common_args = {
-@@ -171,16 +248,24 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -171,16 +249,24 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
          {"cb_weights2", tt::CBIndex::c_2},
          {"cb_out", tt::CBIndex::c_16},
          {"cb_bias", tt::CBIndex::c_3},
@@ -439,7 +401,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
      };
      auto make_kernel = [&](const char* name, std::vector<uint32_t> compile_args,
                             tt_metal::DataMovementProcessor processor, tt::tt_metal::NOC noc) {
-@@ -200,8 +285,7 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -200,8 +286,7 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
      if (bias_tensor.has_value()) {
          tt::tt_metal::TensorAccessorArgs(bias_tensor->mesh_tensor()).append_to(reader_args);
      }
@@ -449,7 +411,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
      reader.core_ranges = all_cores;
      std::vector<uint32_t> sender_args;
      tt::tt_metal::TensorAccessorArgs(a).append_to(sender_args);
-@@ -215,36 +299,41 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -215,36 +300,41 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
  
      std::vector<CoreRange> sender_ranges;
      std::vector<CoreRange> receiver_ranges;
@@ -520,7 +482,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
          }
      }
      for (uint32_t i = 0; i < num_cores; ++i) {
-@@ -253,9 +342,32 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -253,9 +343,32 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
          if (bias_tensor.has_value()) {
              args.emplace_back(bias_tensor->mesh_tensor());
          }
@@ -555,7 +517,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
      desc.kernels.push_back(std::move(reader));
      desc.kernels.push_back(std::move(sender));
      if (!receiver_ranges.empty()) {
-@@ -271,15 +383,23 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -271,15 +384,23 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
      compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
      compute.core_ranges = all_cores;
      compute.named_compile_time_args = common_args;
@@ -587,7 +549,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
-@@ -7,13 +7,18 @@
+@@ -7,13 +7,17 @@
  #include "api/compute/eltwise_binary_sfpu.h"
  #include "api/compute/matmul.h"
  #include "api/compute/reconfig_data_format.h"
@@ -600,14 +562,13 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
  // FP32 DST, starting from the bias if there is one; the activation stays
 -// resident, so later groups reuse it.
 +// resident, so later groups reuse it. In a matmul split over K, each core
-+// reduces its share of K: producers (role 2) pack FP32 partial sums into
-+// cb_partial_out, and an owner (role 1) adds the other shares' partials (slot
-+// share - 1 of cb_partials, `count` tiles each) to its own before packing the
-+// outputs.
++// reduces its share of K for its one output tile: producers (role 2) pack the
++// FP32 partial sum into cb_partial_out, and an owner (role 1) adds the other
++// shares' (tile share - 1 of cb_partials) to its own before packing the output.
  void kernel_main() {
      const uint32_t count = get_arg_val<uint32_t>(0);
  
-@@ -28,10 +33,24 @@ void kernel_main() {
+@@ -28,10 +32,24 @@ void kernel_main() {
      constexpr uint32_t cb_bias = get_named_compile_time_arg_val("cb_bias");
      constexpr bool has_bias = get_named_compile_time_arg_val("has_bias");
      constexpr uint32_t transpose_b = get_named_compile_time_arg_val("transpose_b");
@@ -620,7 +581,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
 +    const bool producer = role == 2;
      constexpr uint32_t block_tiles = kblock * halves * group;
      static_assert(group > 0 && halves * group <= 8, "a group's accumulators must fit in FP32 DST");
-+    static_assert(!split || (halves == 1 && 2 * group <= 8), "an owner adds partial sums next to its accumulators");
++    static_assert(!split || (halves == 1 && group == 1), "a split matmul has one output tile per core");
  
      compute_kernel_hw_startup<SrcOrder::Reverse>(cb_in0, cb_weights, cb_out);
 +    const uint32_t cb_result = producer ? cb_partial_out : cb_out;
@@ -632,24 +593,19 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
      if constexpr (has_bias) {
          cb_wait_front(cb_bias, count);
      }
-@@ -77,16 +96,36 @@ void kernel_main() {
+@@ -77,16 +95,31 @@ void kernel_main() {
                  mul_binary_tile(i, width + i, i);
              }
          }
 +        if (split && owner) {
-+            if (group_start == 0) {
-+                cb_wait_front(cb_partials, (k_splits - 1) * count);
-+            }
++            // The other shares' partial sums are added to DST 0 through DST 1.
++            cb_wait_front(cb_partials, k_splits - 1);
 +            reconfig_data_format_srca(cb_partials);
 +            for (uint32_t share = 1; share < k_splits; ++share) {
 +                copy_init(cb_partials);
-+                for (uint32_t i = 0; i < width; ++i) {
-+                    copy_tile(cb_partials, (share - 1) * count + group_start + i, width + i);
-+                }
++                copy_tile(cb_partials, share - 1, 1);
 +                add_binary_tile_init();
-+                for (uint32_t i = 0; i < width; ++i) {
-+                    add_binary_tile(i, width + i, i);
-+                }
++                add_binary_tile(0, 1, 0);
 +            }
 +            reconfig_data_format<SrcOrder::Reverse>(cb_in0, cb_weights);
 +        }
@@ -667,7 +623,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
      }
      cb_pop_front(cb_in0, Kt);
 +    if (split && owner) {
-+        cb_pop_front(cb_partials, (k_splits - 1) * count);
++        cb_pop_front(cb_partials, k_splits - 1);
 +    }
      if constexpr (has_bias) {
          cb_pop_front(cb_bias, count);
@@ -719,15 +675,15 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +//
 +// In a matmul split over K (runtime arguments 4 on: the role, the share's
 +// first K tile, the owner's NOC x and y and the slot of a producer, then the
-+// number of producers of an owner and their NOC x and y), the cores of share
-+// 0 own the output tiles: an owner reserves its partials buffer, tells its
-+// producers that they may fill it, and hands the buffer to compute once all
-+// of them have counted in. A producer sends its FP32 partial sums to the
-+// owner instead of writing outputs.
++// number of producers of an owner and their NOC x and y), each core has one
++// output tile and the cores of share 0 own them: an owner reserves its
++// partials buffer, tells its producers that they may fill it, and hands the
++// buffer to compute once all of them have counted in. A producer sends its
++// FP32 partial sum to the owner instead of writing an output.
  void kernel_main() {
      const uint32_t weight_addr = get_arg_val<uint32_t>(0);
      const uint32_t output_addr = get_arg_val<uint32_t>(1);
-@@ -36,21 +45,85 @@ void kernel_main() {
+@@ -36,21 +45,82 @@ void kernel_main() {
      constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
      constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
      constexpr uint32_t cb_bias = get_named_compile_time_arg_val("cb_bias");
@@ -751,7 +707,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 -
      Noc noc;
 +    if (owner) {
-+        cb_reserve_back(cb_partials, (k_splits - 1) * count);
++        cb_reserve_back(cb_partials, k_splits - 1);
 +        Semaphore<> ready_sem(ready_sem_id);
 +        const uint32_t num_producers = get_arg_val<uint32_t>(9);
 +        for (uint32_t i = 0; i < num_producers; ++i) {
@@ -768,18 +724,15 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +        const uint32_t slot = get_arg_val<uint32_t>(8);
 +        const uint32_t tile_bytes = get_tile_size(cb_partial_out);
 +        // Partials buffers have the same address on every core.
-+        const uint32_t remote = get_write_ptr(cb_partials) + slot * count * tile_bytes;
++        const uint32_t remote = get_write_ptr(cb_partials) + slot * tile_bytes;
 +        Semaphore<> ready_sem(ready_sem_id);
 +        ready_sem.wait(1);
 +        ready_sem.set(0);
 +        CircularBuffer partial_cb(cb_partial_out);
-+        for (uint32_t n = 0; n < count; ++n) {
-+            partial_cb.wait_front(1);
-+            noc_async_write(
-+                get_read_ptr(cb_partial_out), get_noc_addr(owner_x, owner_y, remote + n * tile_bytes), tile_bytes);
-+            noc_async_write_barrier();
-+            partial_cb.pop_front(1);
-+        }
++        partial_cb.wait_front(1);
++        noc_async_write(get_read_ptr(cb_partial_out), get_noc_addr(owner_x, owner_y, remote), tile_bytes);
++        noc_async_write_barrier();
++        partial_cb.pop_front(1);
 +        Semaphore<> partial_sem(partial_sem_id);
 +        partial_sem.up(noc, owner_x, owner_y, 1);
 +        noc_async_atomic_barrier();
@@ -789,7 +742,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +        Semaphore<> partial_sem(partial_sem_id);
 +        partial_sem.wait(k_splits - 1);
 +        partial_sem.set(0);
-+        cb_push_back(cb_partials, (k_splits - 1) * count);
++        cb_push_back(cb_partials, k_splits - 1);
 +    }
 +
      CircularBuffer out_cb(cb_out);

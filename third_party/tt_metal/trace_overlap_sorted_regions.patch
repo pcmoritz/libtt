@@ -1,61 +1,55 @@
 diff --git tt_metal/impl/allocator/bank_manager.cpp tt_metal/impl/allocator/bank_manager.cpp
 --- tt_metal/impl/allocator/bank_manager.cpp
 +++ tt_metal/impl/allocator/bank_manager.cpp
-@@ -724,25 +724,43 @@ BankManager::AllocationFootprint BankManager::take_allocation_footprint() {
+@@ -724,28 +724,45 @@ BankManager::AllocationFootprint BankManager::take_allocation_footprint() {
  }
  
  bool BankManager::has_live_allocation_overlap(const AllocationFootprint& footprint) const {
 -    auto allocator_overlaps = [&](uint32_t allocator_id, const AllocationRegion& region) {
-+    // A region conflicts with live buffers of its own allocator and of the allocators sharing its memory. Collect,
-+    // per allocator, the regions it must stay clear of as sorted disjoint ranges, then look each live buffer up once
-+    // by binary search instead of scanning every buffer for every region.
-+    using Range = std::pair<DeviceAddr, DeviceAddr>;
-+    ttsl::SmallVector<std::vector<Range>> ranges(allocator_dependencies_.num_allocators());
-+    for (const AllocationRegion& region : footprint) {
-+        ranges[region.allocator_id].emplace_back(region.begin, region.end);
-+        for (const auto dependent_id : allocator_dependencies_.dependencies[region.allocator_id]) {
-+            ranges[dependent_id.get()].emplace_back(region.begin, region.end);
-+        }
-+    }
-+
-+    for (uint32_t allocator_id = 0; allocator_id < ranges.size(); ++allocator_id) {
-+        std::vector<Range>& merged = ranges[allocator_id];
-+        if (merged.empty()) {
-+            continue;
-+        }
-+        std::sort(merged.begin(), merged.end());
-+        size_t count = 0;
-+        for (const Range& range : merged) {
-+            if (count > 0 && range.first <= merged[count - 1].second) {
-+                merged[count - 1].second = std::max(merged[count - 1].second, range.second);
-+            } else {
-+                merged[count++] = range;
-+            }
-+        }
-+        merged.resize(count);
-+
++    // end_high_water_mark_tracking leaves the footprint sorted by allocator and address with each allocator's
++    // regions merged, so an allocator's regions are one run of sorted disjoint ranges. Each live buffer is looked up
++    // in a run by binary search instead of compared with every region.
++    using Run = std::pair<AllocationFootprint::const_iterator, AllocationFootprint::const_iterator>;
++    auto allocator_overlaps = [&](uint32_t allocator_id, const Run& run) {
          const auto* alloc = this->get_allocator_from_id(AllocatorDependencies::AllocatorID{allocator_id});
          TT_FATAL(alloc, "Allocator not initialized for ID {}", allocator_id);
          for (DeviceAddr address : allocated_buffers_[allocator_id]) {
              const auto size = alloc->get_allocation_size(address);
              TT_FATAL(size.has_value(), "Missing allocation size for address {}", address);
 -            if (region.begin < address + *size && address < region.end) {
--                return true;
--            }
--        }
--        return false;
--    };
--
--    for (const AllocationRegion& region : footprint) {
--        if (allocator_overlaps(region.allocator_id, region)) {
--            return true;
--        }
--        for (const auto dependent_id : allocator_dependencies_.dependencies[region.allocator_id]) {
--            if (allocator_overlaps(dependent_id.get(), region)) {
-+            // The first range ending after the buffer starts is the only candidate: later ones start later.
-+            auto it = std::upper_bound(
-+                merged.begin(), merged.end(), address, [](DeviceAddr a, const Range& range) { return a < range.second; });
-+            if (it != merged.end() && it->first < address + *size) {
++            // The first region ending after the buffer starts is the only candidate: later ones start later.
++            const auto region = std::upper_bound(
++                run.first, run.second, address, [](DeviceAddr a, const AllocationRegion& r) { return a < r.end; });
++            if (region != run.second && region->begin < address + *size) {
                  return true;
              }
          }
+         return false;
+     };
+ 
+-    for (const AllocationRegion& region : footprint) {
+-        if (allocator_overlaps(region.allocator_id, region)) {
++    for (auto first = footprint.begin(); first != footprint.end();) {
++        const uint32_t region_allocator = first->allocator_id;
++        const auto last = std::find_if(
++            first, footprint.end(), [&](const AllocationRegion& r) { return r.allocator_id != region_allocator; });
++        TT_ASSERT(
++            std::adjacent_find(first, last, [](const AllocationRegion& lhs, const AllocationRegion& rhs) {
++                return rhs.begin < lhs.end;
++            }) == last,
++            "Allocation footprint is not sorted and merged");
++        const Run run{first, last};
++        if (allocator_overlaps(region_allocator, run)) {
+             return true;
+         }
+-        for (const auto dependent_id : allocator_dependencies_.dependencies[region.allocator_id]) {
+-            if (allocator_overlaps(dependent_id.get(), region)) {
++        for (const auto dependent_id : allocator_dependencies_.dependencies[region_allocator]) {
++            if (allocator_overlaps(dependent_id.get(), run)) {
+                 return true;
+             }
+         }
++        first = last;
+     }
+     return false;
+ }
