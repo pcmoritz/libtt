@@ -446,6 +446,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_report_error_causes.patch",
         "//third_party/tt_xla:tt_xla_cached_input_layouts.patch",
         "//third_party/tt_xla:tt_xla_enable_eltwise_activation_fusion.patch",
+        "//third_party/tt_xla:tt_xla_strided_borrowed_host_buffers.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -591,6 +592,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_dot_strength_reduction.patch",
         "//third_party/tt_xla:tt_mlir_ttir_glue_fusions.patch",
         "//third_party/tt_xla:tt_mlir_ttnn_glue_fusions.patch",
+        "//third_party/tt_xla:tt_mlir_strided_borrowed_host_tensors.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
