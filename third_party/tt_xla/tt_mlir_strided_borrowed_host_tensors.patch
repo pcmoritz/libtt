@@ -1,0 +1,371 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/utils.h b/runtime/include/tt/runtime/detail/ttnn/utils.h
+--- a/runtime/include/tt/runtime/detail/ttnn/utils.h
++++ b/runtime/include/tt/runtime/detail/ttnn/utils.h
+@@ -144,6 +144,11 @@ createRuntimeTensorRefFromTTNN(const ::tt::target::ttnn::TensorRef *tensorRef);
+ 
+ void *getRawHostDataPtr(const ::ttnn::Tensor &tensor);
+ 
++// Returns `tensor` with each host shard that stands for caller memory without
++// aliasing it (createBorrowedHostTensor) gathered into a contiguous buffer, or
++// `tensor` itself when it has none.
++::ttnn::Tensor materializeStridedHostTensor(const ::ttnn::Tensor &tensor);
++
+ ::tt::tt_metal::TensorSpec createTensorSpec(
+     const ::ttnn::Shape &shape, const ::ttnn::DataType &dataType,
+     const ::ttnn::Layout &layout = ::ttnn::Layout::ROW_MAJOR,
+diff --git a/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp b/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
+--- a/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
++++ b/runtime/lib/ttnn/operations/ccl/distribute_tensor.cpp
+@@ -16,7 +16,9 @@ void run(const ::tt::target::ttnn::DistributeTensorOp *op,
+          ProgramContext &context) {
+   ProgramTensorPool &tensorPool = context.getTensorPool();
+ 
+-  const ::ttnn::Tensor &input = tensorPool.getTTNNTensorAndValidate(op->in());
++  const ::ttnn::Tensor input =
++      ::tt::runtime::ttnn::utils::materializeStridedHostTensor(
++          tensorPool.getTTNNTensorAndValidate(op->in()));
+ 
+   LOG_ASSERT(
+       ttnn::utils::isOnHost(input.storage_type()),
+diff --git a/runtime/lib/ttnn/operations/cpu/cpu.cpp b/runtime/lib/ttnn/operations/cpu/cpu.cpp
+--- a/runtime/lib/ttnn/operations/cpu/cpu.cpp
++++ b/runtime/lib/ttnn/operations/cpu/cpu.cpp
+@@ -224,8 +224,8 @@ void run(const ::tt::target::ttnn::CpuOp *op, ProgramContext &context) {
+   std::vector<::ttnn::Tensor> inputs;
+   inputs.reserve(fbInputs->size());
+   for (size_t i = 0; i < fbInputs->size(); ++i) {
+-    inputs.push_back(
+-        context.getTensorPool().getTTNNTensorAndValidate(fbInputs->Get(i)));
++    inputs.push_back(::tt::runtime::ttnn::utils::materializeStridedHostTensor(
++        context.getTensorPool().getTTNNTensorAndValidate(fbInputs->Get(i))));
+   }
+ 
+   std::vector<::ttnn::Tensor> outputs = dispatchCPUHoistedOp(
+diff --git a/runtime/lib/ttnn/operations/data_movement/write_tensor.cpp b/runtime/lib/ttnn/operations/data_movement/write_tensor.cpp
+--- a/runtime/lib/ttnn/operations/data_movement/write_tensor.cpp
++++ b/runtime/lib/ttnn/operations/data_movement/write_tensor.cpp
+@@ -14,8 +14,8 @@ void run(const ::tt::target::ttnn::WriteTensorOp *op, ProgramContext &context) {
+              "Device tensor must be in device memory");
+ 
+   ProgramTensorPool &tensorPool = context.getTensorPool();
+-  const ::ttnn::Tensor &hostTensor =
+-      tensorPool.getTTNNTensorAndValidate(op->host_tensor());
++  const ::ttnn::Tensor hostTensor = ::tt::runtime::ttnn::utils::materializeStridedHostTensor(
++      tensorPool.getTTNNTensorAndValidate(op->host_tensor()));
+   ::ttnn::Tensor &deviceTensor =
+       tensorPool.getTTNNTensorAndValidate(op->device_tensor());
+   ::ttnn::QueueId ttnnCqId = ::ttnn::QueueId(op->cq_id());
+diff --git a/runtime/lib/ttnn/operations/layout/to_device.cpp b/runtime/lib/ttnn/operations/layout/to_device.cpp
+--- a/runtime/lib/ttnn/operations/layout/to_device.cpp
++++ b/runtime/lib/ttnn/operations/layout/to_device.cpp
+@@ -14,8 +14,10 @@ namespace tt::runtime::ttnn::operations::layout {
+ void run(const ::tt::target::ttnn::ToDeviceOp *op, ProgramContext &context) {
+   LOG_ASSERT(op->device(), "ToDeviceOp must have a device");
+   ProgramTensorPool &tensorPool = context.getTensorPool();
+-  const ::ttnn::Tensor &inputTensor =
+-      tensorPool.getTTNNTensorAndValidate(op->in());
++  // Weights are read here: a borrowed strided view is gathered for the copy.
++  const ::ttnn::Tensor inputTensor =
++      ::tt::runtime::ttnn::utils::materializeStridedHostTensor(
++          tensorPool.getTTNNTensorAndValidate(op->in()));
+   DEBUG_ASSERT(::tt::runtime::ttnn::utils::inSystemMemory(op->in()),
+                "Calling ttnn::to_device on a device tensor");
+ 
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -82,7 +82,8 @@ static void copyTensorFromHostToDevice(const ::ttnn::Tensor &srcTensor,
+                  dstTensor.storage_type() == ::ttnn::StorageType::DEVICE,
+              "srcTensor must be on host and dstTensor must be on device");
+ 
+-  ::ttnn::copy_to_device(srcTensor, dstTensor);
++  ::ttnn::copy_to_device(::tt::runtime::ttnn::utils::materializeStridedHostTensor(srcTensor),
++                         dstTensor);
+ }
+ 
+ static void copyTensorFromDeviceToDevice(const ::ttnn::Tensor &srcTensor,
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -31,7 +31,10 @@
+ #include <algorithm>
+ #include <cstring>
+ #include <memory>
++#include <mutex>
++#include <sys/mman.h>
+ #include <thread>
++#include <unordered_map>
+ 
+ #include "hwy/highway.h"
+ #include <numeric>
+@@ -183,16 +186,42 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
+   }
+   const size_t runBytes = runElements * itemsize;
+ 
+-  // A transposed 16-bit matrix (e.g. `w.T` of a bf16 weight, possibly with
+-  // size-one dimensions) would take one memcpy per element.
++  // Transposed 16-bit matrices (e.g. `w.T` of a bf16 weight, or stacked
++  // experts' `w.transpose(0, 2, 1)`) would take one memcpy per element:
++  // transpose each matrix, a stack of them spread over threads.
+   if (itemsize == 2 && runElements == 1 && numDims >= 2 &&
+       stride[numDims - 2] == 1 && shape[numDims - 2] % 8 == 0 &&
+-      shape[numDims - 1] % 8 == 0 &&
+-      std::all_of(shape.begin(), shape.begin() + numDims - 2,
+-                  [](std::uint32_t n) { return n == 1; })) {
+-    transpose16(static_cast<const std::uint16_t *>(data), stride[numDims - 1],
+-                reinterpret_cast<std::uint16_t *>(out.get()),
+-                shape[numDims - 2], shape[numDims - 1]);
++      shape[numDims - 1] % 8 == 0) {
++    const std::int64_t rows = shape[numDims - 2];
++    const std::int64_t cols = shape[numDims - 1];
++    const std::uint64_t matrices = size / itemsize / (rows * cols);
++    const auto transposeMatrices = [&](std::uint64_t begin, std::uint64_t end) {
++      for (std::uint64_t m = begin; m < end; ++m) {
++        std::int64_t offset = 0;
++        for (std::uint64_t rest = m, d = numDims - 2; d-- > 0;) {
++          offset += static_cast<std::int64_t>(rest % shape[d]) * stride[d];
++          rest /= shape[d];
++        }
++        transpose16(static_cast<const std::uint16_t *>(data) + offset,
++                    stride[numDims - 1],
++                    reinterpret_cast<std::uint16_t *>(out.get()) +
++                        m * rows * cols,
++                    rows, cols);
++      }
++    };
++    const std::uint64_t numThreads = std::min<std::uint64_t>(matrices, 16);
++    if (numThreads == 1) {
++      transposeMatrices(0, matrices);
++      return out;
++    }
++    std::vector<std::thread> threads;
++    for (std::uint64_t t = 0; t < numThreads; ++t) {
++      threads.emplace_back(transposeMatrices, matrices * t / numThreads,
++                           matrices * (t + 1) / numThreads);
++    }
++    for (std::thread &thread : threads) {
++      thread.join();
++    }
+     return out;
+   }
+ 
+@@ -376,6 +405,124 @@ toHostSingleTensor(const ::tt::runtime::ttnn::TTNNTensorWrapper &tensorWrapper,
+                                             shouldRetain);
+ }
+ 
++namespace {
++// Caller memory that a borrowed host tensor stands for without aliasing it: a
++// non-contiguous view or a large buffer (createBorrowedHostTensor).
++struct StridedHostView {
++  const void *data; // The first logical element.
++  std::vector<std::uint32_t> shape;
++  std::vector<std::int64_t> stride; // In elements.
++  std::uint32_t itemsize;
++};
++
++// Strided views by the address reservation their tensor aliases.
++std::mutex stridedHostViewsMutex;
++std::unordered_map<const void *, StridedHostView> stridedHostViews;
++
++std::optional<StridedHostView>
++findStridedHostView(const ::tt::tt_metal::HostBuffer &buffer) {
++  std::lock_guard<std::mutex> lock(stridedHostViewsMutex);
++  auto it = stridedHostViews.find(buffer.view_bytes().data());
++  if (it == stridedHostViews.end()) {
++    return std::nullopt;
++  }
++  return it->second;
++}
++
++template <typename T>
++::tt::tt_metal::HostBuffer hostBufferOver(std::shared_ptr<std::byte[]> bytes,
++                                          std::uint64_t numElements) {
++  T *data = reinterpret_cast<T *>(bytes.get());
++  return ::tt::tt_metal::HostBuffer(
++      ::ttsl::Span<T>(data, data + numElements),
++      ::tt::tt_metal::MemoryPin(std::shared_ptr<void>(bytes, bytes.get())));
++}
++} // namespace
++
++// Reserves inaccessible address space the size of a view for its tensor to
++// alias, registered with the view until the tensor is gone. The ops
++// and APIs that read host tensors (to_device, the layout converter,
++// write_tensor, distribute_tensor, trace inputs, CPU ops and memcpy) gather
++// the view first (utils::materializeStridedHostTensor); a reader that does not
++// faults rather than reading the wrong bytes.
++static std::shared_ptr<void>
++reserveStridedHostView(void *data, const std::vector<std::uint32_t> &shape,
++                       const std::vector<std::int64_t> &stride,
++                       std::uint32_t itemsize) {
++  const std::size_t bytes =
++      std::max<std::uint64_t>(getNumElements(shape) * itemsize, 1);
++  void *reservation = mmap(nullptr, bytes, PROT_NONE,
++                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++  LOG_ASSERT(reservation != MAP_FAILED,
++             "Cannot reserve address space for a strided host view");
++  // A complex tensor's trailing (real, imaginary) dimension has no stride: it
++  // is dense, as in isContiguous().
++  std::vector<std::int64_t> viewStride = stride;
++  if (viewStride.size() != shape.size()) {
++    viewStride.assign(shape.size(), 1);
++    for (size_t d = shape.size(); d-- > 1;) {
++      viewStride[d - 1] = viewStride[d] * shape[d];
++    }
++  }
++  {
++    std::lock_guard<std::mutex> lock(stridedHostViewsMutex);
++    stridedHostViews.emplace(
++        reservation, StridedHostView{data, shape, viewStride, itemsize});
++  }
++  return std::shared_ptr<void>(reservation, [bytes](void *address) {
++    {
++      std::lock_guard<std::mutex> lock(stridedHostViewsMutex);
++      stridedHostViews.erase(address);
++    }
++    munmap(address, bytes);
++  });
++}
++
++namespace utils {
++::ttnn::Tensor materializeStridedHostTensor(const ::ttnn::Tensor &tensor) {
++  if (!isOnHost(tensor.storage_type())) {
++    return tensor;
++  }
++  const ::tt::tt_metal::HostTensor &hostTensor =
++      tensor.host_storage().host_tensor();
++  bool strided = false;
++  hostTensor.buffer().apply([&](const ::tt::tt_metal::HostBuffer &shard) {
++    strided |= findStridedHostView(shard).has_value();
++  });
++  if (!strided) {
++    return tensor;
++  }
++  return ::ttnn::Tensor(hostTensor.transform(
++      [&](const ::tt::tt_metal::HostBuffer &shard) {
++        std::optional<StridedHostView> view = findStridedHostView(shard);
++        if (!view) {
++          return shard;
++        }
++        std::shared_ptr<std::byte[]> bytes = gatherContiguousBytes(
++            view->data, view->shape, view->stride, view->itemsize);
++        const std::uint64_t numElements = getNumElements(view->shape);
++        switch (tensor.dtype()) {
++        case ::ttnn::DataType::FLOAT32:
++          return hostBufferOver<float>(bytes, numElements);
++        case ::ttnn::DataType::FLOAT16:
++          return hostBufferOver<::tt::tt_metal::float16>(bytes, numElements);
++        case ::ttnn::DataType::BFLOAT16:
++          return hostBufferOver<bfloat16>(bytes, numElements);
++        case ::ttnn::DataType::UINT32:
++          return hostBufferOver<uint32_t>(bytes, numElements);
++        case ::ttnn::DataType::UINT16:
++          return hostBufferOver<uint16_t>(bytes, numElements);
++        case ::ttnn::DataType::UINT8:
++          return hostBufferOver<uint8_t>(bytes, numElements);
++        case ::ttnn::DataType::INT32:
++          return hostBufferOver<int32_t>(bytes, numElements);
++        default:
++          LOG_FATAL("Unsupported data type for a strided host view");
++        }
++      }));
++}
++} // namespace utils
++
+ ::tt::runtime::Tensor
+ createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
+                          const std::vector<std::int64_t> &stride,
+@@ -389,37 +536,46 @@ createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
+       "Cannot create borrowed tensor with null data unless the volume is 0.");
+   LOG_ASSERT(::tt::runtime::utils::isSupportedDataType(dataType),
+              "Cannot create borrowed tensor with unsupported data type");
+-  // A borrowed tensor aliases the caller's buffer and reads it as dense
+-  // row-major, so it cannot represent a non-contiguous (e.g. transposed or
+-  // sliced) layout. Such input must go through an owned tensor, which gathers
+-  // the data into a contiguous buffer.
+-  LOG_ASSERT(isContiguous(shape, stride),
+-             "Cannot create borrowed tensor from a non-contiguous host buffer; "
+-             "non-contiguous input must use an owned host tensor.");
++  // A borrowed tensor aliases the caller's buffer as dense row-major only up
++  // to 1 MiB. A non-contiguous (e.g. transposed or sliced) view, or a larger
++  // buffer, stays where it is and is gathered when read: the tensor aliases a
++  // reservation standing for it (reserveStridedHostView). A memory-mapped
++  // checkpoint's weights are thus not copied into RAM, and a DMA never pins
++  // the caller's memory: tt-metal pins writes of over 32 MiB in total, shard
++  // by shard, and pinning a writable private file mapping (a copy-on-write
++  // numpy.memmap or safetensors mapping) breaks its copy-on-write page by page,
++  // which has livelocked the kernel. Up to 32 devices of 1 MiB shards stay
++  // below that.
++  constexpr std::uint64_t kMaxAliasedBytes = 1 << 20;
++  std::shared_ptr<void> borrowed =
++      isContiguous(shape, stride) &&
++              getNumElements(shape) * itemsize <= kMaxAliasedBytes
++          ? std::shared_ptr<void>(data, [](void *) {})
++          : reserveStridedHostView(data, shape, stride, itemsize);
+   ::ttnn::Shape ttnnShape(shape);
+ 
+   switch (dataType) {
+   case ::tt::target::DataType::Float32:
+     return utils::createRuntimeTensorFromTTNN(
+-        utils::createBorrowedTTNNTensor<float>(data, ttnnShape));
++        utils::createBorrowedTTNNTensor<float>(borrowed, ttnnShape));
+   case ::tt::target::DataType::Float16:
+     return utils::createRuntimeTensorFromTTNN(
+-        utils::createBorrowedTTNNTensor<::tt::tt_metal::float16>(data, ttnnShape));
++        utils::createBorrowedTTNNTensor<::tt::tt_metal::float16>(borrowed, ttnnShape));
+   case ::tt::target::DataType::BFloat16:
+     return utils::createRuntimeTensorFromTTNN(
+-        utils::createBorrowedTTNNTensor<bfloat16>(data, ttnnShape));
++        utils::createBorrowedTTNNTensor<bfloat16>(borrowed, ttnnShape));
+   case ::tt::target::DataType::UInt32:
+     return utils::createRuntimeTensorFromTTNN(
+-        utils::createBorrowedTTNNTensor<uint32_t>(data, ttnnShape));
++        utils::createBorrowedTTNNTensor<uint32_t>(borrowed, ttnnShape));
+   case ::tt::target::DataType::UInt16:
+     return utils::createRuntimeTensorFromTTNN(
+-        utils::createBorrowedTTNNTensor<uint16_t>(data, ttnnShape));
++        utils::createBorrowedTTNNTensor<uint16_t>(borrowed, ttnnShape));
+   case ::tt::target::DataType::UInt8:
+     return utils::createRuntimeTensorFromTTNN(
+-        utils::createBorrowedTTNNTensor<uint8_t>(data, ttnnShape));
++        utils::createBorrowedTTNNTensor<uint8_t>(borrowed, ttnnShape));
+   case ::tt::target::DataType::Int32:
+     return utils::createRuntimeTensorFromTTNN(
+-        utils::createBorrowedTTNNTensor<int32_t>(data, ttnnShape));
++        utils::createBorrowedTTNNTensor<int32_t>(borrowed, ttnnShape));
+   default:
+     LOG_FATAL("Unsupported data type");
+   }
+@@ -1212,7 +1368,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
+         "source data type or be an unsupported data type.");
+   }
+ 
+-  const ::ttnn::Tensor &srcTensor = utils::getTTNNTensorFromRuntimeTensor(src);
++  const ::ttnn::Tensor srcTensor = utils::materializeStridedHostTensor(
++      utils::getTTNNTensorFromRuntimeTensor(src));
+ 
+   // Handle cast and copy
+   if (dstDataType.has_value() &&
+@@ -1272,7 +1429,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
+ 
+ void memcpy(::tt::runtime::Tensor dst, ::tt::runtime::Tensor src) {
+   ::ttnn::Tensor &dstTensor = utils::getTTNNTensorFromRuntimeTensor(dst);
+-  const ::ttnn::Tensor &srcTensor = utils::getTTNNTensorFromRuntimeTensor(src);
++  const ::ttnn::Tensor srcTensor = utils::materializeStridedHostTensor(
++      utils::getTTNNTensorFromRuntimeTensor(src));
+   LOG_ASSERT(srcTensor.physical_volume() * srcTensor.element_size() ==
+                  dstTensor.physical_volume() * dstTensor.element_size(),
+              "Input output tensor size mismatch in memcpy: ",
+diff --git a/runtime/lib/ttnn/types/layout_converter.cpp b/runtime/lib/ttnn/types/layout_converter.cpp
+--- a/runtime/lib/ttnn/types/layout_converter.cpp
++++ b/runtime/lib/ttnn/types/layout_converter.cpp
+@@ -71,7 +71,9 @@ LayoutConverter::LayoutConverter(const LayoutDesc &inputDesc,
+ LayoutConverter::convertTensorLayout(const ::ttnn::Tensor &input,
+                                      OptionalMeshDeviceRef targetDevice) {
+   if (inputDesc.isOnHost()) {
+-    return convertHostTensorLayout(input, targetDevice);
++    // A borrowed strided view of host memory is gathered before it is read.
++    return convertHostTensorLayout(::tt::runtime::ttnn::utils::materializeStridedHostTensor(input),
++                                   targetDevice);
+   }
+   return convertDeviceTensorLayout(input);
+ }
