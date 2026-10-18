@@ -1,0 +1,848 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
+@@ -1050,6 +1050,53 @@ MatmulDecodeProgramConfig create_matmul_decode_program_config(
+     };
+ }
+ 
++namespace {
++
++// A narrow decode matmul splits K when its output tiles leave most worker
++// cores idle: one core per output tile and K share, each output tile's shares
++// stacked in grid rows. On Blackhole, five shares were fastest or close to it
++// for 0.5 to 4 MB of weights; shares of at least four K tiles keep the
++// reduction a small part of the work. Each core reads its share of the weight
++// as one block, on RISCV_0's NOC, clear of the activation multicast on
++// RISCV_1's.
++std::optional<MatmulDecodeProgramConfig> create_matmul_decode_split_k_program_config(
++    const Tensor& input_tensor_a,
++    const Tensor& input_tensor_b,
++    const bool transpose_b,
++    const tt::tt_metal::CoreCoord& grid) {
++    constexpr uint32_t min_share_tiles = 4;
++    constexpr uint32_t max_splits = 5;
++    constexpr uint32_t max_block_tiles = 64;
++    const uint32_t Kt = utilities::get_matmul_tensor_padded_shape(input_tensor_a, /*transpose_a=*/false)[-1] /
++                        tt::constants::TILE_WIDTH;
++    const uint32_t out_Nt =
++        utilities::get_matmul_tensor_padded_shape(input_tensor_b, transpose_b)[-1] / tt::constants::TILE_WIDTH;
++    if (out_Nt == 0 || Kt < 2 * min_share_tiles) {
++        return std::nullopt;
++    }
++    const uint32_t rows_per_share = tt::div_up(out_Nt, static_cast<uint32_t>(grid.x));
++    uint32_t k_splits = std::min({static_cast<uint32_t>(grid.y) / rows_per_share, Kt / min_share_tiles, max_splits});
++    while (k_splits > 1 && Kt % k_splits != 0) {
++        --k_splits;
++    }
++    if (k_splits < 2) {
++        return std::nullopt;
++    }
++    const uint32_t share = Kt / k_splits;
++    uint32_t in0_block_w = std::min(share, max_block_tiles);
++    while (share % in0_block_w != 0) {
++        --in0_block_w;
++    }
++    return MatmulDecodeProgramConfig{
++        .compute_with_storage_grid_size = grid,
++        .in0_block_w = in0_block_w,
++        .fuse_swiglu = false,
++        .k_splits = k_splits,
++    };
++}
++
++}  // namespace
++
+ std::optional<std::string> matmul_decode_unsupported_reason(
+     const Tensor& input_tensor_a,
+     const Tensor& input_tensor_b,
+@@ -1115,8 +1162,29 @@ std::optional<std::string> matmul_decode_unsupported_reason(
+         return fmt::format("K of input B ({}) must be a multiple of the tile width {}", b_logical_K, TILE_WIDTH);
+     }
+     const uint32_t Kt = K / TILE_WIDTH;
+-    if (config.in0_block_w == 0 || Kt % config.in0_block_w != 0) {
+-        return fmt::format("Kt ({}) must be divisible by in0_block_w ({})", Kt, config.in0_block_w);
++    if (config.k_splits == 0 || Kt % config.k_splits != 0) {
++        return fmt::format("Kt ({}) must be divisible by k_splits ({})", Kt, config.k_splits);
++    }
++    if (config.in0_block_w == 0 || (Kt / config.k_splits) % config.in0_block_w != 0) {
++        return fmt::format(
++            "Kt / k_splits ({}) must be divisible by in0_block_w ({})", Kt / config.k_splits, config.in0_block_w);
++    }
++    if (config.k_splits > 1) {
++        // One output tile per core, each output tile's K shares in their own
++        // grid rows.
++        const uint32_t out_Nt = N / TILE_WIDTH;
++        const uint32_t rows_per_share = tt::div_up(out_Nt, static_cast<uint32_t>(grid.x));
++        if (rows_per_share * config.k_splits > grid.y) {
++            return fmt::format(
++                "{} output tiles split {} ways over K need {} grid rows, more than the {} available",
++                out_Nt,
++                config.k_splits,
++                rows_per_share * config.k_splits,
++                grid.y);
++        }
++        if (config.fuse_swiglu || bias.has_value()) {
++            return "a matmul split over K takes neither a bias nor SwiGLU";
++        }
+     }
+ 
+     const auto output_dtype = attributes.output_dtype.value_or(input_tensor_a.dtype());
+@@ -1177,17 +1245,56 @@ MatmulProgramConfig get_program_config(
+         return attributes.program_config.value();
+     }
+     // The decode program when it can run the matmul and there is at least one
+-    // output tile per worker core; with fewer, the 1D matmul keeps more cores
+-    // busy by splitting K.
++    // output tile per worker core, or its K-split form for fewer output tiles;
++    // otherwise the 1D matmul.
+     if (!attributes.user_core_coord.has_value()) {
+         const auto grid = input_tensor_a.device()->compute_with_storage_grid_size();
+-        const auto decode_config = create_matmul_decode_program_config(input_tensor_a, grid, /*fuse_swiglu=*/false);
++        auto decode_config = create_matmul_decode_program_config(input_tensor_a, grid, /*fuse_swiglu=*/false);
+         const uint32_t N = utilities::get_matmul_tensor_padded_shape(input_tensor_b, transpose_b)[-1];
+-        if (N / tt::constants::TILE_WIDTH >= grid.x * grid.y &&
++        const uint32_t out_Nt = N / tt::constants::TILE_WIDTH;
++        const uint32_t worker_cores = grid.x * grid.y;
++        // A core streams in0_block_w K rows of each output tile of its pass per
++        // weight block, one block per round trip on each NOC: blocks of up to
++        // 16 tiles, and at least four blocks once a core streams 16 tiles or
++        // more, so that reads stay in flight (the GDN qkv projection of
++        // Qwen3.8-Flash-Next, two output tiles a core and K = 80 tiles, 28.1 us
++        // with blocks of 2 K tiles, 25.6 with 8; its hyper-connection up
++        // projection, three tiles of K = 10, is fastest at 2).
++        {
++            const uint32_t Kt =
++                utilities::get_matmul_tensor_padded_shape(input_tensor_a, /*transpose_a=*/false)[-1] /
++                tt::constants::TILE_WIDTH;
++            const uint32_t per_core = tt::div_up(out_Nt, std::max(1u, std::min(out_Nt, worker_cores)));
++            const uint32_t group = tt::div_up(per_core, tt::div_up(per_core, 8u));
++            for (uint32_t w = 1; w <= Kt; ++w) {
++                if (Kt % w == 0 && w * group <= 16 && (group * Kt < 16 || Kt / w >= 4)) {
++                    decode_config.in0_block_w = w;
++                }
++            }
++        }
++        // Only for BF16 outputs: matmul_decode reads BF16 activations only, so an
++        // FP32 matmul of a BF16 activation keeps summing in the order of one of
++        // the activation cast to FP32.
++        const bool bf16_output =
++            attributes.output_dtype.value_or(input_tensor_a.dtype()) == tt::tt_metal::DataType::BFLOAT16;
++        // The decode program once its output tiles fill at least half of the
++        // worker cores (one output tile each) for a BF16 output, all of them for
++        // FP32; the 1D matmul's K loop is slower per core: Qwen3.8-Flash-Next's
++        // out projection [1536, 2560] 13.4 -> 11.2 us, its shared-expert down
++        // projection [160, 2560] 3.4 -> 2.5 us.
++        if ((bf16_output ? 2 * out_Nt : out_Nt) >= worker_cores &&
+             !matmul_decode_unsupported_reason(input_tensor_a, input_tensor_b, bias, attributes, decode_config)
+                  .has_value()) {
+             return decode_config;
+         }
++        if (const auto split_config =
++                bf16_output ? create_matmul_decode_split_k_program_config(input_tensor_a, input_tensor_b, transpose_b, grid)
++                            : std::nullopt;
++            split_config.has_value() &&
++            !matmul_decode_unsupported_reason(input_tensor_a, input_tensor_b, bias, attributes, *split_config)
++                 .has_value()) {
++            return *split_config;
++        }
+     }
+     auto config = generate_matmul_program_config(
+         input_tensor_a,
+diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
+--- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
++++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
+@@ -107,6 +107,9 @@ struct MatmulDecodeProgramConfig {
+     tt::tt_metal::CoreCoord compute_with_storage_grid_size;
+     std::size_t in0_block_w{};
+     bool fuse_swiglu{};
++    // Cores per output tile, each reducing a 1 / k_splits share of K. The
++    // shares' FP32 partial sums are added on the core of the first share.
++    std::size_t k_splits = 1;
+ };
+ 
+ using MatmulProgramConfig = std::variant<
+diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
+@@ -10,6 +10,7 @@
+ #include <vector>
+ 
+ #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
++#include <tt-metalium/circular_buffer_constants.h>
+ #include <tt-metalium/constants.hpp>
+ #include <tt-metalium/host_api.hpp>
+ #include <tt-metalium/math.hpp>
+@@ -30,9 +31,15 @@ namespace {
+ // Per-core schedule of a decode matmul: the output tiles are split as evenly
+ // as possible over num_cores cores, the first `extra` cores taking one more,
+ // and each core processes its tiles in passes of up to `group`. The
+-// activation row is multicast in chunks of in0_mcast_w tiles.
++// activation row is multicast in chunks of in0_mcast_w tiles. With k_splits
++// shares of K, every share repeats that schedule over its own Kt tiles of K
++// on the next rows_per_share grid rows, and the cores of share 0 own the
++// output tiles.
+ struct DecodePlan {
+     uint32_t Kt;
++    uint32_t Kt_total;
++    uint32_t k_splits;
++    uint32_t rows_per_share;
+     uint32_t halves;
+     uint32_t out_Nt;
+     uint32_t num_cores;
+@@ -49,7 +56,9 @@ DecodePlan plan_decode(
+     const ttnn::Shape& b_padded_shape,
+     bool transpose_b,
+     const operations::matmul::MatmulDecodeProgramConfig& config) {
+-    const uint32_t Kt = a_padded_shape[-1] / TILE_WIDTH;
++    const uint32_t Kt_total = a_padded_shape[-1] / TILE_WIDTH;
++    const uint32_t k_splits = config.k_splits;
++    const uint32_t Kt = Kt_total / k_splits;
+     // SwiGLU's weight holds an up and a gate half for every output tile.
+     const uint32_t halves = config.fuse_swiglu ? 2 : 1;
+     const uint32_t out_Nt = b_padded_shape[transpose_b ? -2 : -1] / TILE_WIDTH / halves;
+@@ -57,7 +66,8 @@ DecodePlan plan_decode(
+     // The accumulators of every weight half for one pass share the eight FP32
+     // DST tiles.
+     const uint32_t max_group = 8 / halves;
+-    const uint32_t num_cores = std::min(out_Nt, num_worker_cores);
++    // A split matmul's shares each have one core per output tile.
++    const uint32_t num_cores = k_splits > 1 ? out_Nt : std::min(out_Nt, num_worker_cores);
+     const uint32_t max_per_core = tt::div_up(out_Nt, num_cores);
+     const uint32_t passes = tt::div_up(max_per_core, max_group);
+     uint32_t in0_mcast_w = 8;
+@@ -66,6 +76,9 @@ DecodePlan plan_decode(
+     }
+     return DecodePlan{
+         .Kt = Kt,
++        .Kt_total = Kt_total,
++        .k_splits = k_splits,
++        .rows_per_share = tt::div_up(num_cores, static_cast<uint32_t>(config.compute_with_storage_grid_size.x)),
+         .halves = halves,
+         .out_Nt = out_Nt,
+         .num_cores = num_cores,
+@@ -92,9 +105,12 @@ uint32_t matmul_decode_cb_bytes(
+         return tt::tile_size(tt_metal::datatype_to_dataformat_converter(dtype));
+     };
+     const uint32_t weight_block_tiles = config.in0_block_w * plan.halves * plan.group;
++    const uint32_t out_tile_bytes = plan.k_splits > 1 ? tile_bytes(tt::tt_metal::DataType::FLOAT32)
++                                                     : tile_bytes(output_dtype);
+     return plan.Kt * tile_bytes(input_tensor_a.dtype()) +
+            2 * in1_buffers * weight_block_tiles * tile_bytes(input_tensor_b.dtype()) +
+-           plan.count_of(0) * tile_bytes(output_dtype) +
++           plan.count_of(0) * out_tile_bytes +
++           (plan.k_splits - 1) * tile_bytes(tt::tt_metal::DataType::FLOAT32) +
+            (bias.has_value() ? plan.count_of(0) * tile_bytes(bias->dtype()) : 0);
+ }
+ 
+@@ -116,53 +132,115 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+                                                                      : tensor_args.optional_input_tensors[0];
+     const auto grid = config.compute_with_storage_grid_size;
+     const uint32_t in0_block_w = config.in0_block_w;
+-    const DecodePlan plan = plan_decode(a.padded_shape(), b.padded_shape(), transpose_b, config);
++    DecodePlan plan = plan_decode(a.padded_shape(), b.padded_shape(), transpose_b, config);
++    // An activation of up to 16 rows (decode) travels in tiles of the fewest rows that hold it, 2, 4, 8 or 16:
++    // the sender reads just those rows of each tile's top faces from DRAM and the multicast carries them alone,
++    // a sixteenth of a full tile for one row; the matmul unpacks the partial faces into srcB. The output tiles
++    // take the same rows unless the matmul is split over K, whose owners reload partial sums through srcA,
++    // which takes whole faces; either way only the activation's rows of an output tile are written, the others
++    // being padding that the program leaves as it finds it. The row is small enough to multicast in one chunk.
++    const uint32_t a_rows = a.logical_volume() / a.logical_shape()[-1];
++    uint32_t rows_tile_h = TILE_HEIGHT;
++    if (!config.fuse_swiglu && !bias_tensor.has_value()) {
++        for (const uint32_t h : {2u, 4u, 8u, 16u}) {
++            if (a_rows <= h) {
++                rows_tile_h = h;
++                break;
++            }
++        }
++    }
++    const std::optional<tt::tt_metal::Tile> rows_tile =
++        rows_tile_h < TILE_HEIGHT ? std::optional(tt::tt_metal::Tile({rows_tile_h, TILE_WIDTH})) : std::nullopt;
++    const std::optional<tt::tt_metal::Tile> out_tile = config.k_splits == 1 ? rows_tile : std::nullopt;
++    if (rows_tile.has_value()) {
++        plan.in0_mcast_w = plan.Kt;
++    }
+     const uint32_t num_cores = plan.num_cores;
++    const uint32_t k_splits = plan.k_splits;
++    const bool split = k_splits > 1;
+     const uint32_t in1_block_num_tiles = in0_block_w * plan.halves * plan.group;
+ 
+-    // Cores are numbered row-major over the worker grid. Full rows form one
+-    // multicast group and a partial last row forms another; the first core
+-    // of each group multicasts the activation to the rest of it.
++    // Cores are numbered row-major over the worker grid, each K share on its
++    // own rows. A share's full rows form one multicast group and a partial
++    // last row forms another; the first core of each group multicasts the
++    // share's activation tiles to the rest of it.
+     const uint32_t grid_x = grid.x;
+-    auto core_at = [&](uint32_t i) { return CoreCoord(i % grid_x, i / grid_x); };
+-    std::vector<CoreRange> groups;
+-    if (num_cores >= grid_x) {
+-        groups.emplace_back(CoreCoord(0, 0), core_at(num_cores / grid_x * grid_x - 1));
+-    }
+-    if (num_cores % grid_x != 0) {
+-        groups.emplace_back(core_at(num_cores / grid_x * grid_x), core_at(num_cores - 1));
++    auto core_at = [&](uint32_t share, uint32_t i) {
++        return CoreCoord(i % grid_x, share * plan.rows_per_share + i / grid_x);
++    };
++    std::vector<std::vector<CoreRange>> share_groups(k_splits);
++    std::vector<CoreRange> all_ranges;
++    for (uint32_t share = 0; share < k_splits; ++share) {
++        auto& groups = share_groups[share];
++        if (num_cores >= grid_x) {
++            groups.emplace_back(core_at(share, 0), core_at(share, num_cores / grid_x * grid_x - 1));
++        }
++        if (num_cores % grid_x != 0) {
++            groups.emplace_back(core_at(share, num_cores / grid_x * grid_x), core_at(share, num_cores - 1));
++        }
++        all_ranges.insert(all_ranges.end(), groups.begin(), groups.end());
+     }
+-    const CoreRangeSet all_cores(groups);
++    // Fewer ranges mean fewer dispatch writes of kernel binaries and configs.
++    const CoreRangeSet all_cores = CoreRangeSet(all_ranges).merge_ranges();
+ 
+     const auto in0_format = tt_metal::datatype_to_dataformat_converter(a.dtype());
+     const auto in1_format = tt_metal::datatype_to_dataformat_converter(b.dtype());
+     const auto output_format = tt_metal::datatype_to_dataformat_converter(output.dtype());
+     ProgramDescriptor desc;
+-    auto add_cb = [&](uint32_t index, uint32_t tiles, tt::DataFormat format) {
+-        const uint32_t page_size = tt::tile_size(format);
++    auto add_cb = [&](uint32_t index,
++                      uint32_t tiles,
++                      tt::DataFormat format,
++                      const CoreRangeSet& cores,
++                      const std::optional<tt::tt_metal::Tile>& tile = std::nullopt) {
++        const uint32_t page_size = tile.has_value() ? tile->get_tile_size(format) : tt::tile_size(format);
++        CBFormatDescriptor format_descriptor{.buffer_index = index, .data_format = format, .page_size = page_size};
++        if (tile.has_value()) {
++            format_descriptor.tile = tt::tt_metal::TileDescriptor(*tile);
++        }
+         desc.cbs.push_back(CBDescriptor{
+             .total_size = tiles * page_size,
+-            .core_ranges = all_cores,
+-            .format_descriptors = {{CBFormatDescriptor{
+-                .buffer_index = index, .data_format = format, .page_size = page_size}}},
++            .core_ranges = cores,
++            .format_descriptors = {{format_descriptor}},
+         });
+     };
+-    add_cb(tt::CBIndex::c_0, plan.Kt, in0_format);
++    add_cb(tt::CBIndex::c_0, plan.Kt, in0_format, all_cores, rows_tile);
+     // Even weight K blocks arrive on RISCV_0's NOC and odd blocks on RISCV_1's.
+-    add_cb(tt::CBIndex::c_1, in1_buffers * in1_block_num_tiles, in1_format);
+-    add_cb(tt::CBIndex::c_2, in1_buffers * in1_block_num_tiles, in1_format);
+-    add_cb(tt::CBIndex::c_16, plan.count_of(0), output_format);
++    add_cb(tt::CBIndex::c_1, in1_buffers * in1_block_num_tiles, in1_format, all_cores);
++    add_cb(tt::CBIndex::c_2, in1_buffers * in1_block_num_tiles, in1_format, all_cores);
++    add_cb(tt::CBIndex::c_16, plan.count_of(0), output_format, all_cores, out_tile);
+     if (bias_tensor.has_value()) {
+-        add_cb(tt::CBIndex::c_3, plan.count_of(0), tt_metal::datatype_to_dataformat_converter(bias_tensor->dtype()));
++        add_cb(
++            tt::CBIndex::c_3,
++            plan.count_of(0),
++            tt_metal::datatype_to_dataformat_converter(bias_tensor->dtype()),
++            all_cores);
++    }
++    if (split) {
++        // The other shares pack their FP32 partial sum (one output tile a
++        // core) into c_5, which their writers place in the owner's partials
++        // buffer, tile share - 1. Every core has both, so that one kernel
++        // binary serves either role and the partials buffer has the same
++        // address on all cores.
++        add_cb(tt::CBIndex::c_5, 1, tt::DataFormat::Float32, all_cores);
++        add_cb(tt::CBIndex::c_4, k_splits - 1, tt::DataFormat::Float32, all_cores);
+     }
+ 
+     constexpr uint32_t sender_sem_id = 0;
+     constexpr uint32_t receiver_sem_id = 1;
+-    desc.semaphores.push_back(tt::tt_metal::SemaphoreDescriptor{
+-        .id = sender_sem_id, .core_ranges = all_cores, .initial_value = 0});
+-    desc.semaphores.push_back(tt::tt_metal::SemaphoreDescriptor{
+-        .id = receiver_sem_id, .core_ranges = all_cores, .initial_value = 0});
++    // Owners count the shares whose partial sums have landed; producers wait
++    // for their owner to have reserved its partials buffer.
++    constexpr uint32_t partial_sem_id = 2;
++    constexpr uint32_t ready_sem_id = 3;
++    for (const uint32_t id : {sender_sem_id, receiver_sem_id, partial_sem_id, ready_sem_id}) {
++        if (id >= 2 && !split) {
++            break;
++        }
++        desc.semaphores.push_back(
++            tt::tt_metal::SemaphoreDescriptor{.id = id, .core_ranges = all_cores, .initial_value = 0});
++    }
+ 
++    // A split matmul's cores take their role from a runtime argument.
++    enum SplitRole : uint32_t { kOwner = 1, kProducer = 2 };
+     const auto in0_noc = tt::tt_metal::detail::preferred_noc_for_dram_write(device->arch());
+     const auto in1_noc = tt::tt_metal::detail::preferred_noc_for_dram_read(device->arch());
+     const std::vector<std::pair<std::string, uint32_t>> common_args = {
+@@ -171,16 +249,24 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+         {"cb_weights2", tt::CBIndex::c_2},
+         {"cb_out", tt::CBIndex::c_16},
+         {"cb_bias", tt::CBIndex::c_3},
++        {"cb_partials", tt::CBIndex::c_4},
++        {"cb_partial_out", tt::CBIndex::c_5},
+         {"has_bias", bias_tensor.has_value()},
+         {"transpose_b", transpose_b},
+         {"Kt", plan.Kt},
++        {"Kt_total", plan.Kt_total},
++        {"k_splits", k_splits},
+         {"halves", plan.halves},
+         {"out_Nt", plan.out_Nt},
+         {"group", plan.group},
+         {"in0_block_w", in0_block_w},
+         {"in0_mcast_w", plan.in0_mcast_w},
++        {"rows_tile_h", rows_tile_h},
++        {"out_tile_h", out_tile.has_value() ? rows_tile_h : TILE_HEIGHT},
+         {"sender_sem", sender_sem_id},
+         {"receiver_sem", receiver_sem_id},
++        {"partial_sem", partial_sem_id},
++        {"ready_sem", ready_sem_id},
+     };
+     auto make_kernel = [&](const char* name, std::vector<uint32_t> compile_args,
+                            tt_metal::DataMovementProcessor processor, tt::tt_metal::NOC noc) {
+@@ -200,8 +286,7 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+     if (bias_tensor.has_value()) {
+         tt::tt_metal::TensorAccessorArgs(bias_tensor->mesh_tensor()).append_to(reader_args);
+     }
+-    auto reader = make_kernel(
+-        "reader_matmul_decode.cpp", reader_args, tt_metal::DataMovementProcessor::RISCV_0, in1_noc);
++    auto reader = make_kernel("reader_matmul_decode.cpp", reader_args, tt_metal::DataMovementProcessor::RISCV_0, in1_noc);
+     reader.core_ranges = all_cores;
+     std::vector<uint32_t> sender_args;
+     tt::tt_metal::TensorAccessorArgs(a).append_to(sender_args);
+@@ -215,36 +300,41 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+ 
+     std::vector<CoreRange> sender_ranges;
+     std::vector<CoreRange> receiver_ranges;
+-    for (const auto& group : groups) {
+-        sender_ranges.emplace_back(group.start_coord, group.start_coord);
+-        const uint32_t first = group.start_coord.y * grid_x + group.start_coord.x;
+-        const uint32_t last = group.end_coord.y * grid_x + group.end_coord.x;
+-        auto start = device->worker_core_from_logical_core(group.start_coord);
+-        auto end = device->worker_core_from_logical_core(group.end_coord);
+-        const auto sender_physical = start;
+-        if (in0_noc == tt::tt_metal::NOC::NOC_1) {
+-            std::swap(start, end);
+-        }
+-        sender.emplace_runtime_args(
+-            group.start_coord,
+-            {a,
+-             static_cast<uint32_t>(start.x),
+-             static_cast<uint32_t>(start.y),
+-             static_cast<uint32_t>(end.x),
+-             static_cast<uint32_t>(end.y),
+-             last - first,
+-             b,
+-             plan.start_of(first),
+-             plan.count_of(first)});
+-        for (uint32_t i = first + 1; i <= last; ++i) {
+-            receiver_ranges.emplace_back(core_at(i), core_at(i));
+-            receiver.emplace_runtime_args(
+-                core_at(i),
+-                {static_cast<uint32_t>(sender_physical.x),
+-                 static_cast<uint32_t>(sender_physical.y),
++    for (uint32_t share = 0; share < k_splits; ++share) {
++        const uint32_t k_start = share * plan.Kt;
++        for (const auto& group : share_groups[share]) {
++            sender_ranges.emplace_back(group.start_coord, group.start_coord);
++            const uint32_t first = (group.start_coord.y - share * plan.rows_per_share) * grid_x + group.start_coord.x;
++            const uint32_t last = (group.end_coord.y - share * plan.rows_per_share) * grid_x + group.end_coord.x;
++            auto start = device->worker_core_from_logical_core(group.start_coord);
++            auto end = device->worker_core_from_logical_core(group.end_coord);
++            const auto sender_physical = start;
++            if (in0_noc == tt::tt_metal::NOC::NOC_1) {
++                std::swap(start, end);
++            }
++            sender.emplace_runtime_args(
++                group.start_coord,
++                {a,
++                 static_cast<uint32_t>(start.x),
++                 static_cast<uint32_t>(start.y),
++                 static_cast<uint32_t>(end.x),
++                 static_cast<uint32_t>(end.y),
++                 last - first,
+                  b,
+-                 plan.start_of(i),
+-                 plan.count_of(i)});
++                 plan.start_of(first),
++                 plan.count_of(first),
++                 k_start});
++            for (uint32_t i = first + 1; i <= last; ++i) {
++                receiver_ranges.emplace_back(core_at(share, i), core_at(share, i));
++                receiver.emplace_runtime_args(
++                    core_at(share, i),
++                    {static_cast<uint32_t>(sender_physical.x),
++                     static_cast<uint32_t>(sender_physical.y),
++                     b,
++                     plan.start_of(i),
++                     plan.count_of(i),
++                     k_start});
++            }
+         }
+     }
+     for (uint32_t i = 0; i < num_cores; ++i) {
+@@ -253,9 +343,32 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+         if (bias_tensor.has_value()) {
+             args.emplace_back(bias_tensor->mesh_tensor());
+         }
+-        reader.emplace_runtime_args(core_at(i), args);
++        if (!split) {
++            reader.emplace_runtime_args(core_at(0, i), args);
++            continue;
++        }
++        // Split: role, first K tile, then for a producer its owner's NOC x
++        // and y and its slot, and for an owner its producers' NOC x and y.
++        const auto owner = device->worker_core_from_logical_core(core_at(0, i));
++        auto owner_args = args;
++        owner_args.insert(owner_args.end(), {kOwner, 0u, 0u, 0u, 0u, k_splits - 1});
++        for (uint32_t share = 1; share < k_splits; ++share) {
++            const auto producer = device->worker_core_from_logical_core(core_at(share, i));
++            owner_args.emplace_back(static_cast<uint32_t>(producer.x));
++            owner_args.emplace_back(static_cast<uint32_t>(producer.y));
++            auto producer_args = args;
++            producer_args.insert(
++                producer_args.end(),
++                {kProducer,
++                 share * plan.Kt,
++                 static_cast<uint32_t>(owner.x),
++                 static_cast<uint32_t>(owner.y),
++                 share - 1});
++            reader.emplace_runtime_args(core_at(share, i), producer_args);
++        }
++        reader.emplace_runtime_args(core_at(0, i), owner_args);
+     }
+-    sender.core_ranges = CoreRangeSet(sender_ranges);
++    sender.core_ranges = CoreRangeSet(sender_ranges).merge_ranges();
+     desc.kernels.push_back(std::move(reader));
+     desc.kernels.push_back(std::move(sender));
+     if (!receiver_ranges.empty()) {
+@@ -271,15 +384,23 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+     compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
+     compute.core_ranges = all_cores;
+     compute.named_compile_time_args = common_args;
+-    for (uint32_t i = 0; i < num_cores; ++i) {
+-        compute.emplace_runtime_args(core_at(i), {plan.count_of(i)});
+-    }
+-    // The kernel accumulates every output tile over all of K in FP32 DST.
+-    compute.config = ComputeConfigDescriptor{
++    // The kernel accumulates every output tile over all of its K in FP32 DST;
++    // an owner adds the other shares' FP32 partial sums to it there.
++    ComputeConfigDescriptor compute_config{
+         .math_fidelity = math_fidelity,
+         .fp32_dest_acc_en = true,
+         .dst_full_sync_en = true,
+         .math_approx_mode = math_approx_mode};
++    if (split) {
++        compute_config.unpack_to_dest_mode.assign(NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
++        compute_config.unpack_to_dest_mode[tt::CBIndex::c_4] = tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
++    }
++    compute.config = std::move(compute_config);
++    for (uint32_t share = 0; share < k_splits; ++share) {
++        for (uint32_t i = 0; i < num_cores; ++i) {
++            compute.emplace_runtime_args(core_at(share, i), {plan.count_of(i), share == 0 ? kOwner : kProducer});
++        }
++    }
+     desc.kernels.push_back(std::move(compute));
+     return desc;
+ }
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
+@@ -7,13 +7,17 @@
+ #include "api/compute/eltwise_binary_sfpu.h"
+ #include "api/compute/matmul.h"
+ #include "api/compute/reconfig_data_format.h"
++#include "api/compute/tile_move_copy.h"
+ #include "api/dataflow/circular_buffer.h"
+ #include "api/compute/compute_kernel_api.h"
+ 
+ // This core's output tiles, or silu(gate) * up for SwiGLU's two weight halves.
+ // Each group of up to `group` output tiles accumulates the full K reduction in
+ // FP32 DST, starting from the bias if there is one; the activation stays
+-// resident, so later groups reuse it.
++// resident, so later groups reuse it. In a matmul split over K, each core
++// reduces its share of K for its one output tile: producers (role 2) pack the
++// FP32 partial sum into cb_partial_out, and an owner (role 1) adds the other
++// shares' (tile share - 1 of cb_partials) to its own before packing the output.
+ void kernel_main() {
+     const uint32_t count = get_arg_val<uint32_t>(0);
+ 
+@@ -28,10 +32,24 @@ void kernel_main() {
+     constexpr uint32_t cb_bias = get_named_compile_time_arg_val("cb_bias");
+     constexpr bool has_bias = get_named_compile_time_arg_val("has_bias");
+     constexpr uint32_t transpose_b = get_named_compile_time_arg_val("transpose_b");
++    constexpr uint32_t cb_partials = get_named_compile_time_arg_val("cb_partials");
++    constexpr uint32_t cb_partial_out = get_named_compile_time_arg_val("cb_partial_out");
++    constexpr uint32_t k_splits = get_named_compile_time_arg_val("k_splits");
++    constexpr bool split = k_splits > 1;
++    const uint32_t role = split ? get_arg_val<uint32_t>(1) : 0;
++    const bool owner = role == 1;
++    const bool producer = role == 2;
+     constexpr uint32_t block_tiles = kblock * halves * group;
+     static_assert(group > 0 && halves * group <= 8, "a group's accumulators must fit in FP32 DST");
++    static_assert(!split || (halves == 1 && group == 1), "a split matmul has one output tile per core");
+ 
+     compute_kernel_hw_startup<SrcOrder::Reverse>(cb_in0, cb_weights, cb_out);
++    const uint32_t cb_result = producer ? cb_partial_out : cb_out;
++    if constexpr (split) {
++        if (producer) {
++            pack_reconfig_data_format(cb_out, cb_partial_out);
++        }
++    }
+     if constexpr (has_bias) {
+         cb_wait_front(cb_bias, count);
+     }
+@@ -77,16 +95,31 @@ void kernel_main() {
+                 mul_binary_tile(i, width + i, i);
+             }
+         }
++        if (split && owner) {
++            // The other shares' partial sums are added to DST 0 through DST 1.
++            cb_wait_front(cb_partials, k_splits - 1);
++            reconfig_data_format_srca(cb_partials);
++            for (uint32_t share = 1; share < k_splits; ++share) {
++                copy_init(cb_partials);
++                copy_tile(cb_partials, share - 1, 1);
++                add_binary_tile_init();
++                add_binary_tile(0, 1, 0);
++            }
++            reconfig_data_format<SrcOrder::Reverse>(cb_in0, cb_weights);
++        }
+         tile_regs_commit();
+         tile_regs_wait();
+-        cb_reserve_back(cb_out, width);
++        cb_reserve_back(cb_result, width);
+         for (uint32_t i = 0; i < width; ++i) {
+-            pack_tile(i, cb_out);
++            pack_tile(i, cb_result);
+         }
+-        cb_push_back(cb_out, width);
++        cb_push_back(cb_result, width);
+         tile_regs_release();
+     }
+     cb_pop_front(cb_in0, Kt);
++    if (split && owner) {
++        cb_pop_front(cb_partials, k_splits - 1);
++    }
+     if constexpr (has_bias) {
+         cb_pop_front(cb_bias, count);
+     }
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp
+--- ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp
+@@ -15,11 +15,13 @@
+ // SwiGLU's [up | gate] weight has two, read gate first. A transposed weight
+ // is stored [N, K]. Every block occupies the same CB space, so a narrower last
+ // group keeps the block size constant. `poll` runs while waiting for CB space,
+-// so the caller can make other progress.
++// so the caller can make other progress. A core of a matmul split over K
++// reads the Kt rows of its share, from k_start of the weight's Kt_total.
+ template <uint32_t parity, typename Accessor, typename Poll>
+ FORCE_INLINE void stream_decode_weights(
+-    const Accessor& weight, uint32_t n_start, uint32_t count, uint32_t cb, Poll poll) {
++    const Accessor& weight, uint32_t n_start, uint32_t count, uint32_t cb, Poll poll, uint32_t k_start = 0) {
+     constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
++    constexpr uint32_t Kt_total = get_named_compile_time_arg_val("Kt_total");
+     constexpr uint32_t halves = get_named_compile_time_arg_val("halves");
+     constexpr uint32_t out_Nt = get_named_compile_time_arg_val("out_Nt");
+     constexpr uint32_t kblock = get_named_compile_time_arg_val("in0_block_w");
+@@ -43,7 +45,8 @@ FORCE_INLINE void stream_decode_weights(
+                 for (uint32_t half = 0; half < halves; ++half) {
+                     const uint32_t first = (halves - 1 - half) * out_Nt + n_start + group_start;
+                     for (uint32_t n = first; n < first + width; ++n, local += tile_bytes) {
+-                        const uint32_t tile = transpose_b ? n * Kt + k0 + k : (k0 + k) * halves * out_Nt + n;
++                        const uint32_t row = k_start + k0 + k;
++                        const uint32_t tile = transpose_b ? n * Kt_total + row : row * halves * out_Nt + n;
+                         noc_async_read_tile(tile, weight, local);
+                     }
+                 }
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
+@@ -5,6 +5,7 @@
+ #include "api/dataflow/dataflow_api.h"
+ #include "api/dataflow/noc.h"
+ #include "api/dataflow/circular_buffer.h"
++#include "api/dataflow/noc_semaphore.h"
+ #include "matmul_decode_weights.hpp"
+ 
+ // Reads the bias tiles of this core's output columns. The bias address is
+@@ -27,6 +28,14 @@ FORCE_INLINE void read_bias(uint32_t n_start, uint32_t count, uint32_t cb_bias)
+ 
+ // Reads this core's bias tiles, streams its even weight blocks on RISCV_0's
+ // NOC, then writes its output tiles.
++//
++// In a matmul split over K (runtime arguments 4 on: the role, the share's
++// first K tile, the owner's NOC x and y and the slot of a producer, then the
++// number of producers of an owner and their NOC x and y), each core has one
++// output tile and the cores of share 0 own them: an owner reserves its
++// partials buffer, tells its producers that they may fill it, and hands the
++// buffer to compute once all of them have counted in. A producer sends its
++// FP32 partial sum to the owner instead of writing an output.
+ void kernel_main() {
+     const uint32_t weight_addr = get_arg_val<uint32_t>(0);
+     const uint32_t output_addr = get_arg_val<uint32_t>(1);
+@@ -36,21 +45,82 @@ void kernel_main() {
+     constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
+     constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
+     constexpr uint32_t cb_bias = get_named_compile_time_arg_val("cb_bias");
++    constexpr uint32_t cb_partials = get_named_compile_time_arg_val("cb_partials");
++    constexpr uint32_t cb_partial_out = get_named_compile_time_arg_val("cb_partial_out");
+     constexpr bool has_bias = get_named_compile_time_arg_val("has_bias");
++    constexpr uint32_t k_splits = get_named_compile_time_arg_val("k_splits");
++    constexpr uint32_t partial_sem_id = get_named_compile_time_arg_val("partial_sem");
++    constexpr uint32_t ready_sem_id = get_named_compile_time_arg_val("ready_sem");
++    constexpr bool split = k_splits > 1;
++    const uint32_t role = split ? get_arg_val<uint32_t>(4) : 0;
++    const bool owner = role == 1;
++    const bool producer = role == 2;
+     constexpr auto weight_args = TensorAccessorArgs<0>();
+     constexpr auto output_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
+     const auto weight = TensorAccessor(weight_args, weight_addr);
+     const auto output = TensorAccessor(output_args, output_addr);
+     read_bias<has_bias, output_args.next_compile_time_args_offset()>(n_start, count, cb_bias);
+ 
+-    stream_decode_weights<0>(weight, n_start, count, cb_weights, [] {});
+-
+     Noc noc;
++    if (owner) {
++        cb_reserve_back(cb_partials, k_splits - 1);
++        Semaphore<> ready_sem(ready_sem_id);
++        const uint32_t num_producers = get_arg_val<uint32_t>(9);
++        for (uint32_t i = 0; i < num_producers; ++i) {
++            ready_sem.up(noc, get_arg_val<uint32_t>(10 + 2 * i), get_arg_val<uint32_t>(11 + 2 * i), 1);
++        }
++        noc_async_atomic_barrier();
++    }
++    const uint32_t k_start = split ? get_arg_val<uint32_t>(5) : 0;
++    stream_decode_weights<0>(weight, n_start, count, cb_weights, [] {}, k_start);
++
++    if (producer) {
++        const uint32_t owner_x = get_arg_val<uint32_t>(6);
++        const uint32_t owner_y = get_arg_val<uint32_t>(7);
++        const uint32_t slot = get_arg_val<uint32_t>(8);
++        const uint32_t tile_bytes = get_tile_size(cb_partial_out);
++        // Partials buffers have the same address on every core.
++        const uint32_t remote = get_write_ptr(cb_partials) + slot * tile_bytes;
++        Semaphore<> ready_sem(ready_sem_id);
++        ready_sem.wait(1);
++        ready_sem.set(0);
++        CircularBuffer partial_cb(cb_partial_out);
++        partial_cb.wait_front(1);
++        noc_async_write(get_read_ptr(cb_partial_out), get_noc_addr(owner_x, owner_y, remote), tile_bytes);
++        noc_async_write_barrier();
++        partial_cb.pop_front(1);
++        Semaphore<> partial_sem(partial_sem_id);
++        partial_sem.up(noc, owner_x, owner_y, 1);
++        noc_async_atomic_barrier();
++        return;
++    }
++    if (owner) {
++        Semaphore<> partial_sem(partial_sem_id);
++        partial_sem.wait(k_splits - 1);
++        partial_sem.set(0);
++        cb_push_back(cb_partials, k_splits - 1);
++    }
++
+     CircularBuffer out_cb(cb_out);
+     const uint32_t page_bytes = get_local_cb_interface(cb_out).fifo_page_size;
++    // Of an activation of rows_tile_h < 32 rows only the top rows_tile_h rows of faces 0 and 1 of each output
++    // tile are written; the output tile in L1 has out_tile_h rows (rows_tile_h, or 32 for a split over K), the
++    // output's tiles in DRAM faces of 256 elements.
++    constexpr uint32_t rows_tile_h = get_named_compile_time_arg_val("rows_tile_h");
++    constexpr uint32_t out_tile_h = get_named_compile_time_arg_val("out_tile_h");
+     for (uint32_t n = 0; n < count; ++n) {
+         out_cb.wait_front(1);
+-        noc.async_write(out_cb, output, page_bytes, {}, {.page_id = n_start + n});
++        if constexpr (rows_tile_h < 32) {
++            const uint32_t element_bytes = page_bytes / (out_tile_h * 32);
++            const uint32_t rows_bytes = rows_tile_h * 16 * element_bytes;
++            const uint32_t full_face_bytes = 256 * element_bytes;
++            const uint32_t local = get_read_ptr(cb_out);
++            const uint32_t local_face = out_tile_h < 32 ? rows_bytes : full_face_bytes;
++            noc_async_write(local, output.get_noc_addr(n_start + n), rows_bytes);
++            noc_async_write(local + local_face, output.get_noc_addr(n_start + n, full_face_bytes), rows_bytes);
++        } else {
++            noc.async_write(out_cb, output, page_bytes, {}, {.page_id = n_start + n});
++        }
+         noc.async_writes_flushed();
+         out_cb.pop_front(1);
+     }
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp
+@@ -16,6 +16,7 @@ void kernel_main() {
+     const uint32_t weight_addr = get_arg_val<uint32_t>(2);
+     const uint32_t n_start = get_arg_val<uint32_t>(3);
+     const uint32_t count = get_arg_val<uint32_t>(4);
++    const uint32_t k_start = get_arg_val<uint32_t>(5);
+ 
+     constexpr uint32_t cb_in0_id = get_named_compile_time_arg_val("cb_in0");
+     constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights2");
+@@ -45,7 +46,7 @@ void kernel_main() {
+             cb_in0.push_back(in0_mcast_w);
+         }
+     };
+-    stream_decode_weights<1>(weight, n_start, count, cb_weights, publish_landed);
++    stream_decode_weights<1>(weight, n_start, count, cb_weights, publish_landed, k_start);
+     for (; chunks < num_chunks; ++chunks) {
+         receiver_sem.wait_min(chunks + 1);
+         cb_in0.push_back(in0_mcast_w);
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_sender.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_sender.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_sender.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_sender.cpp
+@@ -11,10 +11,11 @@
+ #include "matmul_decode_weights.hpp"
+ 
+ // RISCV_1 on the first core of a multicast group. The activation row block
+-// stays resident in every core's L1: after one readiness handshake, stream it
+-// in chunks, overlapping the DRAM read of the next chunk with the multicast
+-// of the current one; a counting semaphore tells receivers how many chunks
+-// have landed. This core's odd weight blocks follow.
++// (the group's K share of it, from tile k_start) stays resident in every
++// core's L1: after one readiness handshake, stream it in chunks, overlapping
++// the DRAM read of the next chunk with the multicast of the current one; a
++// counting semaphore tells receivers how many chunks have landed. This core's
++// odd weight blocks follow.
+ void kernel_main() {
+     const uint32_t input_addr = get_arg_val<uint32_t>(0);
+     const uint32_t dest_start_x = get_arg_val<uint32_t>(1);
+@@ -25,6 +26,7 @@ void kernel_main() {
+     const uint32_t weight_addr = get_arg_val<uint32_t>(6);
+     const uint32_t n_start = get_arg_val<uint32_t>(7);
+     const uint32_t count = get_arg_val<uint32_t>(8);
++    const uint32_t k_start = get_arg_val<uint32_t>(9);
+ 
+     constexpr uint32_t cb_in0_id = get_named_compile_time_arg_val("cb_in0");
+     constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights2");
+@@ -48,10 +50,20 @@ void kernel_main() {
+ 
+     cb_in0.reserve_back(Kt);
+     const uint32_t base = cb_in0.get_write_ptr();
++    // Tiles of rows_tile_h < 32 rows hold just the top rows of faces 0 and 1 of the activation's BF16 tiles
++    // in DRAM (512 bytes a face), 32 bytes a row.
++    constexpr uint32_t rows_tile_h = get_named_compile_time_arg_val("rows_tile_h");
+     auto read_chunk = [&](uint32_t chunk) {
+         for (uint32_t k = 0; k < in0_mcast_w; ++k) {
+             const uint32_t tile = chunk * in0_mcast_w + k;
+-            noc_async_read_tile(tile, input, base + tile * tile_bytes);
++            if constexpr (rows_tile_h < 32) {
++                constexpr uint32_t face_bytes = rows_tile_h * 32;
++                const uint32_t local = base + tile * tile_bytes;
++                noc_async_read(input.get_noc_addr(k_start + tile), local, face_bytes);
++                noc_async_read(input.get_noc_addr(k_start + tile, 512), local + face_bytes, face_bytes);
++            } else {
++                noc_async_read_tile(k_start + tile, input, base + tile * tile_bytes);
++            }
+         }
+     };
+ 
+@@ -81,6 +93,6 @@ void kernel_main() {
+         noc.async_read_barrier();
+     }
+ 
+-    stream_decode_weights<1>(weight, n_start, count, cb_weights, [] {});
++    stream_decode_weights<1>(weight, n_start, count, cb_weights, [] {}, k_start);
+     noc.async_write_barrier();
+ }

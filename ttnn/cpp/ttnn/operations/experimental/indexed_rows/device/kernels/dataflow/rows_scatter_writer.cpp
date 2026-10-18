@@ -70,6 +70,9 @@ void kernel_main() {
         const uint32_t count = total - q0 < batch ? total - q0 : batch;
         rows.wait_front(count);
         const uint32_t batch_l1 = rows.get_read_ptr();
+        // The pages with a chunk in this batch.
+        const uint32_t batch_page_lo = first_page + q0 / C;
+        const uint32_t batch_page_hi = first_page + (q0 + count + C - 1) / C;
 
         // The L1 address of (page, offset) when its chunk is in this batch.
         auto in_batch = [&](uint32_t page, uint32_t offset, uint32_t& l1) {
@@ -134,8 +137,13 @@ void kernel_main() {
                             }
                             continue;
                         }
-                        for (uint32_t s = 0; s < S; ++s) {
-                            const uint32_t page = row * S + s;
+                        // Only the row's pages in this batch; an overwrite reads them straight
+                        // into the copy and waits once per position (the pages of one position are
+                        // distinct, and positions apply in order).
+                        const uint32_t page_lo = batch_page_lo > row * S ? batch_page_lo : row * S;
+                        const uint32_t page_hi = batch_page_hi < (row + 1) * S ? batch_page_hi : (row + 1) * S;
+                        for (uint32_t page = page_lo; page < page_hi; ++page) {
+                            const uint32_t s = page - row * S;
                             const uint32_t src_page = ((b * M + m) * W + j) * S + s;
                             for (uint32_t offset = 0; offset < page_bytes; offset += chunk_bytes) {
                                 if (!in_batch(page, offset, dst)) {
@@ -151,12 +159,15 @@ void kernel_main() {
                                     bytes,
                                     {.noc_addr = source.get_noc_addr(src_page, offset)},
                                     {.offset_bytes = 0});
-                                noc.async_read_barrier();
                                 if constexpr (reduce != kNone) {
+                                    noc.async_read_barrier();
                                     apply(dst, src_addr, bytes);
                                 }
                             }
                         }
+                    }
+                    if constexpr (reduce == kNone) {
+                        noc.async_read_barrier();
                     }
                 }
                 if constexpr (column) {

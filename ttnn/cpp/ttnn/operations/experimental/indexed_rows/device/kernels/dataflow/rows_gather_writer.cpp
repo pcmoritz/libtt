@@ -4,7 +4,7 @@
 // rows_gather writer: stores the pages the reader gathered. Item i = b * M + m
 // and window offset j write output row i * W + j (its S pages, chunk by chunk),
 // or, with a column component, output page b at column (m * W + j) * w. The
-// transfer sequence and its grouping match the reader's.
+// transfer range, sequence and grouping match the reader's.
 
 #include <array>
 #include <cstdint>
@@ -30,21 +30,21 @@ void kernel_main() {
     constexpr std::array<uint32_t, K> windows{ROWS_WINDOWS};
     constexpr uint32_t column_bytes = column ? windows[K - 1] * elem_bytes : 0;
 
-    const uint32_t first_item = get_arg(args::first_item);
-    const uint32_t num_items = get_arg(args::num_items);
+    const uint32_t first_transfer = get_arg(args::first_transfer);
+    const uint32_t num_transfers = get_arg(args::num_transfers);
 
     DataflowBuffer rows(dfb::rows);
     const auto output = TensorAccessor(tensor::output);
     Noc noc;
 
     const uint32_t entry = rows.get_entry_size();
-    const uint32_t total = num_items * transfers_per_item;
+    const uint32_t total = num_transfers;
     for (uint32_t q = 0; q < total;) {
         const uint32_t count = total - q < group ? total - q : group;
         rows.wait_front(count);
         for (uint32_t i = 0; i < count; ++i, ++q) {
-            const uint32_t item = first_item + q / transfers_per_item;
-            const uint32_t t = q % transfers_per_item;
+            const uint32_t item = (first_transfer + q) / transfers_per_item;
+            const uint32_t t = (first_transfer + q) % transfers_per_item;
             uint32_t bytes, page, offset, l1_offset = 0;
             if constexpr (column) {
                 page = item / M;

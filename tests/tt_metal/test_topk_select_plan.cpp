@@ -49,5 +49,13 @@ TEST_F(TopKSelectPlanTest, RowsGetTheirOwnCoresFirst) {
     EXPECT_EQ(split->rows_per_core, 1u);
 }
 
+TEST_F(TopKSelectPlanTest, NarrowRowSplitsIntoTileSegments) {
+    // A MoE router's 512 expert scores, top 10: each of the 16 tiles is a segment scanned by its own core.
+    const auto split = plan(1, 512, 10, 64);
+    ASSERT_TRUE(split.has_value());
+    EXPECT_EQ(split->segments, 16u);
+    EXPECT_EQ(split->segment_tiles, 1u);
+}
+
 }  // namespace
 }  // namespace tt::tt_metal::distributed::test

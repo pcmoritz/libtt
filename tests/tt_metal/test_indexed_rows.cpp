@@ -370,6 +370,40 @@ TEST_F(IndexedRowsTest, GatherAndScatterRowsOfSeveralPages) {
     }
 }
 
+TEST_F(IndexedRowsTest, GatherAndScatterRowsOfManySmallPages) {
+    // A short-convolution state [slots, 2560, 9] row-major: one slot is 2560 pages of 18 bytes, read by
+    // many cores (each a range of the transfers). Then several positions, whose transfers straddle the
+    // cores' ranges.
+    for (uint32_t M : {1u, 3u}) {
+        Ref ref(/*B=*/1, /*R=*/2560 * 9, /*Bi=*/1, M, {3}, {1});
+        std::mt19937 rng(11 + M);
+        auto table = iota_values<bfloat16>(ref.B * ref.N * ref.R, 0.25f);
+        auto idx = random_indices(ref.Bi * ref.M, 0, 3, rng);
+        auto out = ttnn::experimental::rows_gather(
+            to_device(table, {1, 3, 2560, 9}, DataType::BFLOAT16), index_tensor(ref, idx, DataType::INT32),
+            IndexedRowsSpec{{3}, {1}});
+        EXPECT_EQ(out.logical_shape(), ttnn::Shape({1, M, 2560, 9}));
+        auto got = out.cpu().to_vector<bfloat16>();
+        auto want = ref.gather(table, idx, false);
+        ASSERT_EQ(got.size(), want.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            ASSERT_EQ(static_cast<float>(got[i]), static_cast<float>(want[i])) << "M " << M << " at " << i;
+        }
+        // Writing the slots back: each core reads the source pages of a position together, and
+        // duplicate positions still apply in order.
+        auto source = iota_values<bfloat16>(ref.B * ref.M * ref.R, -0.5f);
+        out = ttnn::experimental::rows_scatter(
+            to_device(table, {1, 3, 2560, 9}, DataType::BFLOAT16), index_tensor(ref, idx, DataType::INT32),
+            to_device(source, {1, M, 2560, 9}, DataType::BFLOAT16), IndexedRowsSpec{{3}, {1}});
+        got = out.cpu().to_vector<bfloat16>();
+        want = ref.scatter(table, idx, source, [](bfloat16, bfloat16 s) { return s; });
+        ASSERT_EQ(got.size(), want.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            ASSERT_EQ(static_cast<float>(got[i]), static_cast<float>(want[i])) << "scatter M " << M << " at " << i;
+        }
+    }
+}
+
 TEST_F(IndexedRowsTest, ColumnWindowGatherAndScatterAdd) {
     // The last component picks a window of 3 elements inside a row of 100:
     // a sampler's logprobs[row, label] with window 1 would be the same with w=1.

@@ -1,14 +1,16 @@
 // SPDX-FileCopyrightText: © 2026 libtt authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// rows_gather reader: for this core's positions, decodes their coordinates and
-// reads the addressed table pages, chunk by chunk, into the rows DFB; the writer
-// stores them in the output. Positions are numbered item = b * M + m over the
-// index tensor's batch and position dimensions. Each item makes W * S *
-// chunks_per_page transfers (window offset j, page s of the row, chunk c), or W
-// transfers of one column window when the last component addresses columns.
-// Chunks are pushed in groups of up to `group` entries so several reads are in
-// flight at once.
+// rows_gather reader: for this core's transfers, decodes their positions'
+// coordinates and reads the addressed table pages, chunk by chunk, into the rows
+// DFB; the writer stores them in the output. Positions are numbered
+// item = b * M + m over the index tensor's batch and position dimensions. Each
+// item makes W * S * chunks_per_page transfers (window offset j, page s of the
+// row, chunk c), or W transfers of one column window when the last component
+// addresses columns; transfer q of the program is transfer q % that of item
+// q / that, and a core's range may start or end inside an item. Chunks are
+// pushed in groups of up to `group` entries so several reads are in flight at
+// once.
 
 #include <array>
 #include <cstdint>
@@ -45,8 +47,10 @@ void kernel_main() {
     constexpr std::array<uint32_t, K> strides{ROWS_STRIDES};
     constexpr uint32_t column_bytes = column ? windows[K - 1] * elem_bytes : 0;
 
-    const uint32_t first_item = get_arg(args::first_item);
-    const uint32_t num_items = get_arg(args::num_items);
+    const uint32_t first_transfer = get_arg(args::first_transfer);
+    const uint32_t num_transfers = get_arg(args::num_transfers);
+    const uint32_t first_item = first_transfer / transfers_per_item;
+    const uint32_t end_item = num_transfers == 0 ? first_item : (first_transfer + num_transfers - 1) / transfers_per_item + 1;
 
     DataflowBuffer rows(dfb::rows);
     DataflowBuffer index(dfb::index);
@@ -55,7 +59,7 @@ void kernel_main() {
     Noc noc;
 
     const uint32_t entry = rows.get_entry_size();
-    const uint32_t total = num_items * transfers_per_item;
+    const uint32_t total = num_transfers;
 
     // The index chunk loaded so far: items [chunk_begin, loaded_end), at
     // `chunk_addr` in L1.
@@ -75,8 +79,8 @@ void kernel_main() {
         rows.reserve_back(count);
         const uint32_t write_ptr = rows.get_write_ptr();
         for (uint32_t i = 0; i < count; ++i, ++q) {
-            const uint32_t item = first_item + q / transfers_per_item;
-            const uint32_t t = q % transfers_per_item;
+            const uint32_t item = (first_transfer + q) / transfers_per_item;
+            const uint32_t t = (first_transfer + q) % transfers_per_item;
             if (item != coords_item) {
                 if (item >= loaded_end) {
                     // Stream the next chunk of positions of this item's batch
@@ -85,7 +89,7 @@ void kernel_main() {
                         index.pop_front(1);
                     }
                     const uint32_t m = item % M;
-                    uint32_t n = first_item + num_items - item;
+                    uint32_t n = end_item - item;
                     if (n > index_batch) {
                         n = index_batch;
                     }
