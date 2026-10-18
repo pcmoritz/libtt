@@ -237,7 +237,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_u
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.cpp
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,233 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -269,7 +269,13 @@ new file mode 100644
 +    Tensor weight;
 +    Tensor state_indices;
 +    Tensor has_initial_state;
++    std::optional<Tensor> state_slots;
 +};
++
++// T, the steps each state takes, with a row of input each.
++uint32_t steps(const ConvInputs& in) {
++    return in.state_slots.has_value() ? in.state_slots->logical_shape()[-1] : 1;
++}
 +
 +struct ConvOperation {
 +    using operation_attributes_t = ConvParams;
@@ -316,9 +322,11 @@ new file mode 100644
 +    const auto& input_shape = in.input.logical_shape();
 +    const auto& state_shape = in.state.logical_shape();
 +    TT_FATAL(input_shape.rank() == 2, "input must have rank 2");
-+    const uint32_t batch_size = input_shape[0];
++    const uint32_t tokens = steps(in);
++    TT_FATAL(input_shape[0] > 0 && input_shape[0] <= 32, "input must have 1 to 32 rows");
++    TT_FATAL(input_shape[0] % tokens == 0, "each state needs a row per step");
++    const uint32_t batch_size = input_shape[0] / tokens;
 +    const uint32_t channels = input_shape[1];
-+    TT_FATAL(batch_size > 0 && batch_size <= 32, "batch size must be in [1, 32]");
 +    TT_FATAL(channels > 0 && channels % 32 == 0, "channels must be tile aligned");
 +    TT_FATAL(
 +        state_shape.rank() == 3 && state_shape[0] >= 2 &&
@@ -327,6 +335,10 @@ new file mode 100644
 +    check_shape(in.weight, {channels, 4}, "weight");
 +    check_shape(in.state_indices, {batch_size}, "state indices");
 +    check_shape(in.has_initial_state, {batch_size}, "initial-state mask");
++    if (in.state_slots.has_value()) {
++        validate_tensor(*in.state_slots, DataType::INT32, "state slots");
++        check_shape(*in.state_slots, {batch_size, tokens}, "state slots");
++    }
 +}
 +
 +ConvOperation::spec_return_value_t ConvOperation::compute_output_specs(
@@ -344,8 +356,11 @@ new file mode 100644
 +ProgramDescriptor ConvOperation::create_descriptor(
 +    const operation_attributes_t& params, const tensor_args_t& in,
 +    tensor_return_value_t& outputs) {
-+    const uint32_t batch_size = in.input.logical_shape()[0];
++    const uint32_t tokens = steps(in);
++    const uint32_t batch_size = in.input.logical_shape()[0] / tokens;
 +    const uint32_t channels = in.input.logical_shape()[1];
++    // Without state slots, each window goes back to its own slot.
++    const Tensor& state_slots = in.state_slots.value_or(in.state_indices);
 +    const uint32_t channel_tiles = channels / 32;
 +    ProgramDescriptor program;
 +
@@ -369,17 +384,22 @@ new file mode 100644
 +    make_cb(2, 1, tt::DataFormat::Float16_b);  // reader weight scratch
 +    make_cb(3, 1, tt::DataFormat::Int32);      // reader indices
 +    make_cb(4, 1, tt::DataFormat::Float16_b);  // reader flags
++    if (in.state_slots.has_value()) {
++        make_cb(6, 1, tt::DataFormat::Int32);              // reader state slots
++        make_cb(7, tokens, tt::DataFormat::Float16_b);     // reader windows after each step
++    }
 +    make_cb(
 +        5, (channel_tiles + num_workers - 1) / num_workers,
 +        datatype_to_dataformat_converter(params.output_dtype));  // output
 +
 +    std::vector<uint32_t> reader_args = {
-+        channel_tiles, batch_size, num_workers};
++        channel_tiles, batch_size, num_workers, tokens, in.state_slots.has_value()};
 +    TensorAccessorArgs(in.input.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.state.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.weight.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.state_indices.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.has_initial_state.buffer()).append_to(reader_args);
++    TensorAccessorArgs(state_slots.buffer()).append_to(reader_args);
 +
 +    std::vector<uint32_t> writer_args = {channel_tiles, num_workers};
 +    TensorAccessorArgs(outputs.buffer()).append_to(writer_args);
@@ -415,7 +435,7 @@ new file mode 100644
 +            core,
 +            {worker, in.input.buffer(), in.state.buffer(),
 +             in.weight.buffer(), in.state_indices.buffer(),
-+             in.has_initial_state.buffer()});
++             in.has_initial_state.buffer(), state_slots.buffer()});
 +        writer.emplace_runtime_args(core, {worker, outputs.buffer()});
 +        compute.emplace_runtime_args(core, {worker});
 +    }
@@ -437,7 +457,8 @@ new file mode 100644
 +    const Tensor& weight,
 +    const Tensor& state_indices,
 +    const Tensor& has_initial_state,
-+    DataType output_dtype) {
++    DataType output_dtype,
++    const std::optional<Tensor>& state_slots) {
 +    using Op = prim::ConvOperation;
 +    return device_operation::launch<Op>(
 +        {.output_dtype = output_dtype},
@@ -445,7 +466,8 @@ new file mode 100644
 +         .state = state,
 +         .weight = weight,
 +         .state_indices = state_indices,
-+         .has_initial_state = has_initial_state});
++         .has_initial_state = has_initial_state,
++         .state_slots = state_slots});
 +}
 +
 +}  // namespace ttnn::transformer
@@ -453,12 +475,13 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_u
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,29 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#pragma once
 +
++#include <optional>
 +
 +#include "ttnn/tensor/tensor.hpp"
 +
@@ -467,13 +490,19 @@ new file mode 100644
 +// One four-tap depthwise causal convolution decode step. The operation
 +// gathers and updates request state in place, and returns silu(conv) in
 +// output_dtype, BFLOAT16 or FLOAT32.
++//
++// With state_slots, an int32 [B, T], each of the B states takes T steps, as
++// in a speculative verify of T draft tokens: input holds T rows per state,
++// and the window after step t goes to slot state_slots[b, t] instead of back
++// to state_indices[b]. Slot 0 is never written.
 +Tensor causal_conv1d_update(
 +    const Tensor& input,
 +    const Tensor& state,
 +    const Tensor& weight,
 +    const Tensor& state_indices,
 +    const Tensor& has_initial_state,
-+    tt::tt_metal::DataType output_dtype = tt::tt_metal::DataType::BFLOAT16);
++    tt::tt_metal::DataType output_dtype = tt::tt_metal::DataType::BFLOAT16,
++    const std::optional<Tensor>& state_slots = std::nullopt);
 +
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
@@ -540,7 +569,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,278 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -568,6 +597,7 @@ new file mode 100644
 +    constexpr uint32_t num_workers = get_compile_time_arg_val(5);
 +    constexpr uint32_t eps = get_compile_time_arg_val(6);
 +    constexpr uint32_t query_scale = get_compile_time_arg_val(7);
++    constexpr uint32_t tokens = get_compile_time_arg_val(8);
 +    const uint32_t worker = get_arg_val<uint32_t>(0);
 +    constexpr uint32_t state_tiles = kt * vt;
 +
@@ -590,6 +620,8 @@ new file mode 100644
 +    constexpr uint32_t squared_norm = tt::CBIndex::c_21;
 +    constexpr uint32_t key_factor = tt::CBIndex::c_22;
 +    constexpr uint32_t query_factor = tt::CBIndex::c_23;
++    // The state after a step, which the next step starts from.
++    constexpr uint32_t state_carry = tt::CBIndex::c_24;
 +
 +    // factor = scale / sqrt(x x^T + eps) in every element of a tile, where x
 +    // is a row vector in row 0 of kt tiles and x^T holds it in column 0.
@@ -633,6 +665,8 @@ new file mode 100644
 +    // Configure the FP32 unpack/pack paths before the first compute API call.
 +    compute_kernel_hw_startup<SrcOrder::Reverse>(key, state, scaled_delta);
 +    for (uint32_t work = worker; work < batch_size * num_heads * workers_per_head; work += num_workers) {
++    for (uint32_t token = 0; token < tokens; ++token) {
++    const uint32_t state_in = token == 0 ? state : state_carry;
 +    // The kernel works with the unnormalized q and k and scales the products
 +    // they take part in.
 +    normalization_factor(key, key_transposed, key_factor, 0x3F800000u);
@@ -688,20 +722,20 @@ new file mode 100644
 +    cb_pop_front(dt_bias, 1);
 +
 +    // state_mid = decay * state
-+    mul_tiles_bcast_scalar_init_short(state, decay);
-+    cb_wait_front(state, state_tiles);
++    mul_tiles_bcast_scalar_init_short(state_in, decay);
++    cb_wait_front(state_in, state_tiles);
 +    cb_wait_front(decay, 1);
 +    cb_reserve_back(state_mid, state_tiles);
 +    for (uint32_t tile = 0; tile < state_tiles; ++tile) {
 +        tile_regs_acquire();
-+        mul_tiles_bcast_scalar(state, decay, tile, 0, 0);
++        mul_tiles_bcast_scalar(state_in, decay, tile, 0, 0);
 +        tile_regs_commit();
 +        tile_regs_wait();
 +        pack_tile(0, state_mid, tile);
 +        tile_regs_release();
 +    }
 +    cb_push_back(state_mid, state_tiles);
-+    cb_pop_front(state, state_tiles);
++    cb_pop_front(state_in, state_tiles);
 +
 +    // scaled_delta = beta * (value - key * state_mid), all before packing.
 +    pack_reconfig_data_format(scaled_delta);
@@ -785,6 +819,22 @@ new file mode 100644
 +        pack_tile(0, output, column);
 +        tile_regs_release();
 +    }
++    // Keep the state for the next step. The writer pops state_new only after
++    // the output, so it is still in place here.
++    if (token + 1 < tokens) {
++        cb_reserve_back(state_carry, state_tiles);
++        copy_tile_to_dst_init_short(state_new);
++        pack_reconfig_data_format(state_carry);
++        for (uint32_t tile = 0; tile < state_tiles; ++tile) {
++            tile_regs_acquire();
++            copy_tile(state_new, tile, 0);
++            tile_regs_commit();
++            tile_regs_wait();
++            pack_tile(0, state_carry, tile);
++            tile_regs_release();
++        }
++        cb_push_back(state_carry, state_tiles);
++    }
 +    cb_push_back(output, vt);
 +
 +    cb_pop_front(query, kt);
@@ -796,12 +846,13 @@ new file mode 100644
 +    cb_pop_front(key_factor, 1);
 +    cb_pop_front(query_factor, 1);
 +    }
++    }
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,217 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -848,12 +899,52 @@ new file mode 100644
 +    }
 +}
 +
++// The multi-step form: each state's tokens follow one another in the rows
++// of the input tile, row = batch * tokens + token. Token t of a state reads
++// taps h[t], h[t + 1], h[t + 2] and its own input, where h is the state's
++// three saved inputs followed by its tokens' inputs, and leaves the window
++// h[t + 1], h[t + 2], h[t + 3] behind it.
++FORCE_INLINE uint16_t history(
++    const volatile tt_l1_ptr uint16_t* state, const volatile tt_l1_ptr uint16_t* input,
++    uint32_t channel, uint32_t first_row, uint32_t index) {
++    return index < 3 ? state[tile_offset(channel, index)]
++                     : input[tile_offset(first_row + index - 3, channel)];
++}
++
++FORCE_INLINE void gather_steps(
++    uint32_t state_address, uint32_t operands_address, uint32_t batch, uint32_t tokens,
++    uint32_t windows_address) {
++    const volatile tt_l1_ptr uint16_t* state =
++        reinterpret_cast<const volatile tt_l1_ptr uint16_t*>(state_address);
++    volatile tt_l1_ptr uint16_t* operands =
++        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(operands_address);
++    const volatile tt_l1_ptr uint16_t* input = operands + 6 * 1024;
++    const uint32_t first_row = batch * tokens;
++    for (uint32_t token = 0; token < tokens; ++token) {
++        volatile tt_l1_ptr uint16_t* window =
++            reinterpret_cast<volatile tt_l1_ptr uint16_t*>(windows_address) + token * 1024;
++        for (uint32_t channel = 0; channel < 32; ++channel) {
++            const uint32_t row = tile_offset(first_row + token, channel);
++            for (uint32_t tap = 0; tap < 3; ++tap) {
++                operands[2 * tap * 1024 + row] =
++                    history(state, input, channel, first_row, token + tap);
++                window[tile_offset(channel, tap)] =
++                    history(state, input, channel, first_row, token + tap + 1);
++            }
++        }
++    }
++}
++
 +}  // namespace
 +
 +void kernel_main() {
 +    constexpr uint32_t channel_tiles = get_compile_time_arg_val(0);
 +    constexpr uint32_t batch_size = get_compile_time_arg_val(1);
 +    constexpr uint32_t num_workers = get_compile_time_arg_val(2);
++    // The steps each state takes, and whether the window after step t of
++    // state b goes to slot state_slots[b, t] rather than back to its slot.
++    constexpr uint32_t tokens = get_compile_time_arg_val(3);
++    constexpr bool has_slots = get_compile_time_arg_val(4);
 +    constexpr uint32_t tile_bytes = 2048;
 +    const uint32_t worker = get_arg_val<uint32_t>(0);
 +    const uint32_t input_address = get_arg_val<uint32_t>(1);
@@ -861,23 +952,28 @@ new file mode 100644
 +    const uint32_t weight_address = get_arg_val<uint32_t>(3);
 +    const uint32_t indices_address = get_arg_val<uint32_t>(4);
 +    const uint32_t flags_address = get_arg_val<uint32_t>(5);
++    const uint32_t slots_address = get_arg_val<uint32_t>(6);
 +
-+    constexpr auto input_args = TensorAccessorArgs<3>();
++    constexpr auto input_args = TensorAccessorArgs<5>();
 +    constexpr auto state_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
 +    constexpr auto weight_args = TensorAccessorArgs<state_args.next_compile_time_args_offset()>();
 +    constexpr auto indices_args = TensorAccessorArgs<weight_args.next_compile_time_args_offset()>();
 +    constexpr auto flags_args = TensorAccessorArgs<indices_args.next_compile_time_args_offset()>();
++    constexpr auto slots_args = TensorAccessorArgs<flags_args.next_compile_time_args_offset()>();
 +    const auto input = TensorAccessor(input_args, input_address, tile_bytes);
 +    const auto state = TensorAccessor(state_args, state_address, tile_bytes);
 +    const auto weight = TensorAccessor(weight_args, weight_address, tile_bytes);
 +    const auto indices = TensorAccessor(indices_args, indices_address, 4096);
 +    const auto flags = TensorAccessor(flags_args, flags_address, tile_bytes);
++    const auto slots = TensorAccessor(slots_args, slots_address, 4096);
 +
 +    CircularBuffer operands_cb(tt::CBIndex::c_0);
 +    CircularBuffer state_scratch(tt::CBIndex::c_1);
 +    CircularBuffer weight_scratch(tt::CBIndex::c_2);
 +    CircularBuffer indices_scratch(tt::CBIndex::c_3);
 +    CircularBuffer flags_scratch(tt::CBIndex::c_4);
++    CircularBuffer slots_scratch(tt::CBIndex::c_6);
++    CircularBuffer windows_scratch(tt::CBIndex::c_7);
 +    Noc noc;
 +
 +    state_scratch.reserve_back(batch_size);
@@ -886,6 +982,14 @@ new file mode 100644
 +    flags_scratch.reserve_back(1);
 +    noc.async_read(indices, indices_scratch, 4096, {.page_id = 0}, {.offset_bytes = 0});
 +    noc.async_read(flags, flags_scratch, tile_bytes, {.page_id = 0}, {.offset_bytes = 0});
++    if constexpr (has_slots) {
++        slots_scratch.reserve_back(1);
++        windows_scratch.reserve_back(tokens);
++        noc.async_read(slots, slots_scratch, 4096, {.page_id = 0}, {.offset_bytes = 0});
++        // Only the window's three columns are written; keep the padding zero.
++        noc.async_write_zeros(windows_scratch, tokens * tile_bytes);
++        noc.write_zeros_l1_barrier();
++    }
 +    noc.async_read_barrier();
 +
 +    for (uint32_t channel_tile = worker; channel_tile < channel_tiles;
@@ -911,10 +1015,12 @@ new file mode 100644
 +            if (slot == 0) {
 +                continue;
 +            }
-+            for (uint32_t tap = 0; tap < 4; ++tap) {
-+                copy_channel_to_row(
-+                    weight_scratch.get_write_ptr(), tap,
-+                    operands_address + (2 * tap + 1) * tile_bytes, batch);
++            for (uint32_t token = 0; token < tokens; ++token) {
++                for (uint32_t tap = 0; tap < 4; ++tap) {
++                    copy_channel_to_row(
++                        weight_scratch.get_write_ptr(), tap,
++                        operands_address + (2 * tap + 1) * tile_bytes, batch * tokens + token);
++                }
 +            }
 +            if (read_flag(flags_scratch.get_write_ptr(), batch)) {
 +                noc.async_read(
@@ -937,6 +1043,24 @@ new file mode 100644
 +            }
 +            const uint32_t state_address =
 +                state_scratch.get_write_ptr() + batch * tile_bytes;
++            if constexpr (has_slots) {
++                // The previous state's windows must have left before reuse.
++                noc.async_write_barrier();
++                const uint32_t windows = windows_scratch.get_write_ptr();
++                gather_steps(state_address, operands_address, batch, tokens, windows);
++                const volatile tt_l1_ptr uint32_t* slot_tile =
++                    reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(
++                        slots_scratch.get_write_ptr());
++                for (uint32_t token = 0; token < tokens; ++token) {
++                    const uint32_t target = slot_tile[tile_offset(batch, token)];
++                    if (target != 0) {
++                        noc.async_write(
++                            CoreLocalMem<uint32_t>(windows + token * tile_bytes), state,
++                            tile_bytes, {}, {.page_id = target * channel_tiles + channel_tile});
++                    }
++                }
++                continue;
++            }
 +            gather_and_update_state_tile(state_address, operands_address, batch);
 +            noc.async_write(
 +                CoreLocalMem<uint32_t>(state_address), state, tile_bytes, {},
@@ -950,7 +1074,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,231 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1038,6 +1162,8 @@ new file mode 100644
 +    constexpr uint32_t qkv_heads = get_compile_time_arg_val(7);
 +    // The gate logits' element type: the raw bits of BFLOAT16 or FLOAT32.
 +    using GateLogits = std::conditional_t<get_compile_time_arg_val(8) == 4, uint32_t, uint16_t>;
++    // The steps each state takes; step t of state b reads row b * tokens + t.
++    constexpr uint32_t tokens = get_compile_time_arg_val(9);
 +    constexpr uint32_t vt = full_vt / workers_per_head;
 +    constexpr uint32_t state_tiles = kt * vt;
 +    constexpr uint32_t tile_bytes = 4096;
@@ -1052,7 +1178,7 @@ new file mode 100644
 +    const uint32_t state_indices_address = get_arg_val<uint32_t>(7);
 +    const uint32_t has_initial_state_address = get_arg_val<uint32_t>(8);
 +
-+    constexpr auto qkv_args = TensorAccessorArgs<9>();
++    constexpr auto qkv_args = TensorAccessorArgs<10>();
 +    constexpr auto beta_logits_args = TensorAccessorArgs<qkv_args.next_compile_time_args_offset()>();
 +    constexpr auto delta_time_args = TensorAccessorArgs<beta_logits_args.next_compile_time_args_offset()>();
 +    constexpr auto a_log_args = TensorAccessorArgs<delta_time_args.next_compile_time_args_offset()>();
@@ -1109,6 +1235,7 @@ new file mode 100644
 +        read_flag(has_initial_state_cb.get_write_ptr(), batch);
 +
 +    const uint32_t state_base = (state_slot * num_heads + head) * kt * full_vt;
++    // The compute kernel carries the state between steps.
 +    state_cb.reserve_back(state_tiles);
 +    if (has_state) {
 +        for (uint32_t row = 0; row < kt; ++row) {
@@ -1126,22 +1253,24 @@ new file mode 100644
 +        noc.async_write_zeros(state_cb, state_tiles * tile_bytes);
 +    }
 +
++    for (uint32_t token = 0; token < tokens; ++token) {
++    const uint32_t step = batch * tokens + token;
 +    // Query head g, key head K + g and value head 2 * K + head of the flat
 +    // qkv tensor, where g = head / (H / K); a head spans kt == full_vt tiles.
-+    auto page = [&](uint32_t qkv_head) { return ((batch / 32) * qkv_heads + qkv_head) * kt; };
++    auto page = [&](uint32_t qkv_head) { return ((step / 32) * qkv_heads + qkv_head) * kt; };
 +    const uint32_t group_head = head / (num_heads / key_heads);
-+    read_vector(noc, qkv, query_cb, page(group_head), batch % 32, kt);
++    read_vector(noc, qkv, query_cb, page(group_head), step % 32, kt);
 +
 +    key_transposed_cb.reserve_back(kt);
-+    read_vector(noc, qkv, key_cb, page(key_heads + group_head), batch % 32, kt);
++    read_vector(noc, qkv, key_cb, page(key_heads + group_head), step % 32, kt);
 +    query_transposed_cb.reserve_back(kt);
 +    noc.async_write_zeros(query_transposed_cb, kt * tile_bytes);
 +
-+    read_vector(noc, qkv, value_cb, page(2 * key_heads + head) + column_start, batch % 32, vt);
++    read_vector(noc, qkv, value_cb, page(2 * key_heads + head) + column_start, step % 32, vt);
 +
 +    const uint32_t scalar_page =
-+        (batch / 32) * ((num_heads + 31) / 32) + head / 32;
-+    const uint32_t scalar_row = batch % 32;
++        (step / 32) * ((num_heads + 31) / 32) + head / 32;
++    const uint32_t scalar_row = step % 32;
 +    const uint32_t scalar_column = head % 32;
 +    read_scalar<GateLogits>(noc, beta_logits, beta_logits_cb, scalar_page, scalar_row, scalar_column);
 +    read_scalar<GateLogits>(noc, delta_time, delta_time_cb, scalar_page, scalar_row, scalar_column);
@@ -1150,7 +1279,9 @@ new file mode 100644
 +    noc.async_write_zeros(key_transposed_cb, kt * tile_bytes);
 +    noc.async_read_barrier();
 +    noc.write_zeros_l1_barrier();
-+    state_cb.push_back(state_tiles);
++    if (token == 0) {
++        state_cb.push_back(state_tiles);
++    }
 +    for (uint32_t tile = 0; tile < kt; ++tile) {
 +        transpose_row_tile(
 +            query_cb.get_write_ptr() + tile * tile_bytes,
@@ -1172,6 +1303,7 @@ new file mode 100644
 +    a_log_cb.push_back(1);
 +    make_scalar_tile<uint32_t>(noc, dt_bias_cb, 0, scalar_column);
 +    dt_bias_cb.push_back(1);
++    }
 +    }
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp
@@ -1316,7 +1448,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,99 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1334,6 +1466,10 @@ new file mode 100644
 +    constexpr uint32_t num_heads = get_compile_time_arg_val(3);
 +    constexpr uint32_t workers_per_head = get_compile_time_arg_val(4);
 +    constexpr uint32_t num_workers = get_compile_time_arg_val(5);
++    // The steps each state takes, and whether the state after step t of state
++    // b goes to slot state_slots[b, t] rather than back to state_indices[b].
++    constexpr uint32_t tokens = get_compile_time_arg_val(6);
++    constexpr bool has_slots = get_compile_time_arg_val(7);
 +    constexpr uint32_t vt = full_vt / workers_per_head;
 +    constexpr uint32_t state_tiles = kt * vt;
 +    constexpr uint32_t state_tile_bytes = 4096;
@@ -1344,7 +1480,7 @@ new file mode 100644
 +    const uint32_t state_address = get_arg_val<uint32_t>(2);
 +    const uint32_t state_indices_address = get_arg_val<uint32_t>(3);
 +
-+    constexpr auto output_args = TensorAccessorArgs<6>();
++    constexpr auto output_args = TensorAccessorArgs<8>();
 +    constexpr auto state_args =
 +        TensorAccessorArgs<output_args.next_compile_time_args_offset()>();
 +    constexpr auto state_indices_args =
@@ -1371,12 +1507,16 @@ new file mode 100644
 +        const uint32_t column_start = (work % workers_per_head) * vt;
 +        const uint32_t batch = head_work / num_heads;
 +        const uint32_t head = head_work % num_heads;
-+        const uint32_t head_tile = batch * ((num_heads + 31) / 32) + head / 32;
++        for (uint32_t token = 0; token < tokens; ++token) {
++        const uint32_t step = batch * tokens + token;
++        const uint32_t head_tile = step * ((num_heads + 31) / 32) + head / 32;
 +        const uint32_t vector_base = head_tile * full_vt + column_start;
 +        const uint32_t row_offset = tile_offset(head % 32, 0) * sizeof(uint32_t);
 +
-+        const uint32_t state_slot =
-+            read_index(state_indices_cb.get_write_ptr(), batch);
++        const uint32_t state_slot = has_slots
++            ? reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(
++                  state_indices_cb.get_write_ptr())[tile_offset(batch, token)]
++            : read_index(state_indices_cb.get_write_ptr(), batch);
 +
 +        const uint32_t state_base =
 +            (state_slot * num_heads + head) * kt * full_vt;
@@ -1405,13 +1545,14 @@ new file mode 100644
 +        noc.async_write_barrier();
 +        output_cb.pop_front(vt);
 +        state_cb.pop_front(state_tiles);
++        }
 +    }
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,301 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1447,6 +1588,7 @@ new file mode 100644
 +    Tensor state;
 +    Tensor state_indices;
 +    Tensor has_initial_state;
++    std::optional<Tensor> state_slots;
 +};
 +
 +struct DecodeOperation {
@@ -1485,13 +1627,22 @@ new file mode 100644
 +    return (qkv_heads(in) - in.beta_logits.logical_shape()[1]) / 2;
 +}
 +
++// T, the steps each state takes, with a row of qkv and gates each.
++uint32_t steps(const DecodeInputs& in) {
++    return in.state_slots.has_value() ? in.state_slots->logical_shape()[-1] : 1;
++}
++
 +void DecodeOperation::validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t& in) {
 +    TT_FATAL(in.beta_logits.logical_shape().rank() == 2, "beta logits must have rank 2");
-+    const uint32_t batch_size = in.beta_logits.logical_shape()[0];
++    const uint32_t rows = in.beta_logits.logical_shape()[0];
 +    const uint32_t num_heads = in.beta_logits.logical_shape()[1];
++    const uint32_t tokens = steps(in);
++    TT_FATAL(tokens > 0 && tokens <= 32, "each state takes 1 to 32 steps");
++    TT_FATAL(rows % tokens == 0, "each state needs a row per step");
++    const uint32_t batch_size = rows / tokens;
 +    const auto& qkv_shape = in.qkv.logical_shape();
 +    TT_FATAL(
-+        qkv_shape.rank() == 2 && qkv_shape[0] == batch_size && qkv_shape[1] % head_dim == 0,
++        qkv_shape.rank() == 2 && qkv_shape[0] == rows && qkv_shape[1] % head_dim == 0,
 +        "qkv must be the flat [B, (2 * K + H) * {}] causal convolution output", head_dim);
 +    TT_FATAL(batch_size > 0 && batch_size <= 32, "batch size must be in [1, 32]");
 +    TT_FATAL(num_heads > 0, "number of heads must be positive");
@@ -1512,7 +1663,7 @@ new file mode 100644
 +    validate_tensor(in.has_initial_state, {DataType::BFLOAT16}, "initial-state mask");
 +
 +    constexpr uint32_t dim = head_dim;
-+    check_shape(in.delta_time, {batch_size, num_heads}, "delta time");
++    check_shape(in.delta_time, {rows, num_heads}, "delta time");
 +    check_shape(in.a_log, {num_heads}, "A log");
 +    check_shape(in.dt_bias, {num_heads}, "delta-time bias");
 +    const auto& state_shape = in.state.logical_shape();
@@ -1523,6 +1674,10 @@ new file mode 100644
 +        "state shape mismatch");
 +    check_shape(in.state_indices, {batch_size}, "state indices");
 +    check_shape(in.has_initial_state, {batch_size}, "initial-state mask");
++    if (in.state_slots.has_value()) {
++        validate_tensor(*in.state_slots, {DataType::INT32}, "state slots");
++        check_shape(*in.state_slots, {batch_size, tokens}, "state slots");
++    }
 +}
 +
 +DecodeOperation::spec_return_value_t DecodeOperation::compute_output_specs(
@@ -1545,9 +1700,12 @@ new file mode 100644
 +    constexpr uint32_t workers_per_head = 2;
 +    constexpr uint32_t worker_vt = vt / workers_per_head;
 +    constexpr uint32_t state_tiles = kt * worker_vt;
-+    const uint32_t batch_size = in.beta_logits.logical_shape()[0];
++    const uint32_t tokens = steps(in);
++    const uint32_t batch_size = in.beta_logits.logical_shape()[0] / tokens;
 +    const uint32_t num_heads = in.beta_logits.logical_shape()[1];
 +    const uint32_t num_key_heads = key_heads(in);
++    // Without state slots, each state goes back to its own slot.
++    const Tensor& state_slots = in.state_slots.value_or(in.state_indices);
 +    ProgramDescriptor program;
 +
 +    auto* device = in.qkv.device();
@@ -1588,11 +1746,14 @@ new file mode 100644
 +    make_cb(21, 1);           // squared norm
 +    make_cb(22, 1);           // key normalization factor
 +    make_cb(23, 1);           // query normalization factor
-+    make_cb(29, 1, tt::DataFormat::Int32);      // state index (writer)
++    if (tokens > 1) {
++        make_cb(24, state_tiles);  // state carried to the next step
++    }
++    make_cb(29, 1, tt::DataFormat::Int32);      // state slots (writer)
 +
 +    std::vector<uint32_t> reader_args = {
 +        kt, vt, batch_size, num_heads, workers_per_head, num_workers, num_key_heads, qkv_heads(in),
-+        in.beta_logits.element_size()};
++        in.beta_logits.element_size(), tokens};
 +    TensorAccessorArgs(in.qkv.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.beta_logits.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.delta_time.buffer()).append_to(reader_args);
@@ -1603,10 +1764,11 @@ new file mode 100644
 +    TensorAccessorArgs(in.has_initial_state.buffer()).append_to(reader_args);
 +
 +    std::vector<uint32_t> writer_args = {
-+        kt, vt, batch_size, num_heads, workers_per_head, num_workers};
++        kt, vt, batch_size, num_heads, workers_per_head, num_workers, tokens,
++        in.state_slots.has_value()};
 +    TensorAccessorArgs(output.buffer()).append_to(writer_args);
 +    TensorAccessorArgs(in.state.buffer()).append_to(writer_args);
-+    TensorAccessorArgs(in.state_indices.buffer()).append_to(writer_args);
++    TensorAccessorArgs(state_slots.buffer()).append_to(writer_args);
 +
 +    const std::string kernel_dir =
 +        "ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/";
@@ -1630,7 +1792,8 @@ new file mode 100644
 +        .compile_time_args = {
 +            kt, worker_vt, batch_size, num_heads, workers_per_head, num_workers,
 +            std::bit_cast<uint32_t>(1e-6f),  // normalization eps
-+            std::bit_cast<uint32_t>(1.0f / std::sqrt(static_cast<float>(head_dim)))},  // query scale
++            std::bit_cast<uint32_t>(1.0f / std::sqrt(static_cast<float>(head_dim))),  // query scale
++            tokens},
 +        .config = ComputeConfigDescriptor{
 +            .math_fidelity = tt::tt_metal::MathFidelity::HiFi4,
 +            .fp32_dest_acc_en = true,
@@ -1651,8 +1814,7 @@ new file mode 100644
 +             in.has_initial_state.buffer()});
 +        writer.emplace_runtime_args(
 +            core,
-+            {worker, output.buffer(), in.state.buffer(),
-+             in.state_indices.buffer()});
++            {worker, output.buffer(), in.state.buffer(), state_slots.buffer()});
 +        compute.emplace_runtime_args(core, {worker});
 +    }
 +
@@ -1675,7 +1837,8 @@ new file mode 100644
 +    const Tensor& dt_bias,
 +    const Tensor& state,
 +    const Tensor& state_indices,
-+    const Tensor& has_initial_state) {
++    const Tensor& has_initial_state,
++    const std::optional<Tensor>& state_slots) {
 +    using Op = prim::DecodeOperation;
 +    return device_operation::launch<Op>(
 +        {},
@@ -1686,7 +1849,8 @@ new file mode 100644
 +         .dt_bias = dt_bias,
 +         .state = state,
 +         .state_indices = state_indices,
-+         .has_initial_state = has_initial_state});
++         .has_initial_state = has_initial_state,
++         .state_slots = state_slots});
 +}
 +
 +}  // namespace ttnn::transformer
@@ -1694,11 +1858,13 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_dec
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,40 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#pragma once
++
++#include <optional>
 +
 +#include "ttnn/tensor/tensor.hpp"
 +
@@ -1715,6 +1881,12 @@ new file mode 100644
 +// state' = state_mid + k^T * (beta * (v - k * state_mid))
 +// output = q * state'
 +// The output is [B, H, D].
++//
++// With state_slots, an int32 [B, T], each of the B states takes T steps, as
++// in a speculative verify of T draft tokens: qkv, beta_logits and
++// delta_time hold T rows per state, the output is [B * T, H, D], and the
++// state after step t goes to slot state_slots[b, t] instead of back to
++// state_indices[b]. Slot 0 is never written.
 +Tensor gated_delta_decode(
 +    const Tensor& qkv,
 +    const Tensor& beta_logits,
@@ -1723,7 +1895,8 @@ new file mode 100644
 +    const Tensor& dt_bias,
 +    const Tensor& state,
 +    const Tensor& state_indices,
-+    const Tensor& has_initial_state);
++    const Tensor& has_initial_state,
++    const std::optional<Tensor>& state_slots = std::nullopt);
 +
 +}  // namespace ttnn::transformer
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/state_pool_update.cpp
