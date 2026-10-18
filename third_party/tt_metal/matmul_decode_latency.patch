@@ -126,7 +126,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
                  "memory config {}",
                  bias->dtype(),
                  bias->layout(),
-@@ -1177,8 +1251,8 @@ MatmulProgramConfig get_program_config(
+@@ -1177,17 +1251,56 @@ MatmulProgramConfig get_program_config(
          return attributes.program_config.value();
      }
      // The decode program when it can run the matmul and there is at least one
@@ -136,16 +136,46 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +    // otherwise the 1D matmul.
      if (!attributes.user_core_coord.has_value()) {
          const auto grid = input_tensor_a.device()->compute_with_storage_grid_size();
-         const auto decode_config = create_matmul_decode_program_config(input_tensor_a, grid, /*fuse_swiglu=*/false);
-@@ -1188,6 +1262,19 @@ MatmulProgramConfig get_program_config(
-                  .has_value()) {
-             return decode_config;
-         }
+-        const auto decode_config = create_matmul_decode_program_config(input_tensor_a, grid, /*fuse_swiglu=*/false);
++        auto decode_config = create_matmul_decode_program_config(input_tensor_a, grid, /*fuse_swiglu=*/false);
+         const uint32_t N = utilities::get_matmul_tensor_padded_shape(input_tensor_b, transpose_b)[-1];
+-        if (N / tt::constants::TILE_WIDTH >= grid.x * grid.y &&
++        const uint32_t out_Nt = N / tt::constants::TILE_WIDTH;
++        const uint32_t worker_cores = grid.x * grid.y;
++        // A core streams in0_block_w K rows of each output tile of its pass per
++        // weight block, one block per round trip on each NOC: blocks of up to
++        // 16 tiles, and at least four blocks once a core streams 16 tiles or
++        // more, so that reads stay in flight (the GDN qkv projection of
++        // Qwen3.8-Flash-Next, two output tiles a core and K = 80 tiles, 28.1 us
++        // with blocks of 2 K tiles, 25.6 with 8; its hyper-connection up
++        // projection, three tiles of K = 10, is fastest at 2).
++        {
++            const uint32_t Kt =
++                utilities::get_matmul_tensor_padded_shape(input_tensor_a, /*transpose_a=*/false)[-1] /
++                tt::constants::TILE_WIDTH;
++            const uint32_t per_core = tt::div_up(out_Nt, std::max(1u, std::min(out_Nt, worker_cores)));
++            const uint32_t group = tt::div_up(per_core, tt::div_up(per_core, 8u));
++            for (uint32_t w = 1; w <= Kt; ++w) {
++                if (Kt % w == 0 && w * group <= 16 && (group * Kt < 16 || Kt / w >= 4)) {
++                    decode_config.in0_block_w = w;
++                }
++            }
++        }
 +        // Only for BF16 outputs: matmul_decode reads BF16 activations only, so an
 +        // FP32 matmul of a BF16 activation keeps summing in the order of one of
 +        // the activation cast to FP32.
 +        const bool bf16_output =
 +            attributes.output_dtype.value_or(input_tensor_a.dtype()) == tt::tt_metal::DataType::BFLOAT16;
++        // The decode program once its output tiles fill at least half of the
++        // worker cores (one output tile each) for a BF16 output, all of them for
++        // FP32; the 1D matmul's K loop is slower per core: Qwen3.8-Flash-Next's
++        // out projection [1536, 2560] 13.4 -> 11.2 us, its shared-expert down
++        // projection [160, 2560] 3.4 -> 2.5 us.
++        if ((bf16_output ? 2 * out_Nt : out_Nt) >= worker_cores &&
+             !matmul_decode_unsupported_reason(input_tensor_a, input_tensor_b, bias, attributes, decode_config)
+                  .has_value()) {
+             return decode_config;
+         }
 +        if (const auto split_config =
 +                bf16_output ? create_matmul_decode_split_k_program_config(input_tensor_a, input_tensor_b, transpose_b, grid)
 +                            : std::nullopt;
@@ -243,9 +273,34 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
             (bias.has_value() ? plan.count_of(0) * tile_bytes(bias->dtype()) : 0);
  }
  
-@@ -118,51 +134,83 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -116,53 +132,114 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+                                                                      : tensor_args.optional_input_tensors[0];
+     const auto grid = config.compute_with_storage_grid_size;
      const uint32_t in0_block_w = config.in0_block_w;
-     const DecodePlan plan = plan_decode(a.padded_shape(), b.padded_shape(), transpose_b, config);
+-    const DecodePlan plan = plan_decode(a.padded_shape(), b.padded_shape(), transpose_b, config);
++    DecodePlan plan = plan_decode(a.padded_shape(), b.padded_shape(), transpose_b, config);
++    // An activation of up to 16 rows (decode) travels in tiles of the fewest rows that hold it, 2, 4, 8 or 16:
++    // the sender reads just those rows of each tile's top faces from DRAM and the multicast carries them alone,
++    // a sixteenth of a full tile for one row; the matmul unpacks the partial faces into srcB. The output tiles
++    // take the same rows unless the matmul is split over K, whose owners reload partial sums through srcA,
++    // which takes whole faces; either way only the activation's rows of an output tile are written, the others
++    // being padding that the program leaves as it finds it. The row is small enough to multicast in one chunk.
++    const uint32_t a_rows = a.logical_volume() / a.logical_shape()[-1];
++    uint32_t rows_tile_h = TILE_HEIGHT;
++    if (!config.fuse_swiglu && !bias_tensor.has_value()) {
++        for (const uint32_t h : {2u, 4u, 8u, 16u}) {
++            if (a_rows <= h) {
++                rows_tile_h = h;
++                break;
++            }
++        }
++    }
++    const std::optional<tt::tt_metal::Tile> rows_tile =
++        rows_tile_h < TILE_HEIGHT ? std::optional(tt::tt_metal::Tile({rows_tile_h, TILE_WIDTH})) : std::nullopt;
++    const std::optional<tt::tt_metal::Tile> out_tile = config.k_splits == 1 ? rows_tile : std::nullopt;
++    if (rows_tile.has_value()) {
++        plan.in0_mcast_w = plan.Kt;
++    }
      const uint32_t num_cores = plan.num_cores;
 +    const uint32_t k_splits = plan.k_splits;
 +    const bool split = k_splits > 1;
@@ -290,25 +345,35 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
      const auto output_format = tt_metal::datatype_to_dataformat_converter(output.dtype());
      ProgramDescriptor desc;
 -    auto add_cb = [&](uint32_t index, uint32_t tiles, tt::DataFormat format) {
-+    auto add_cb = [&](uint32_t index, uint32_t tiles, tt::DataFormat format, const CoreRangeSet& cores) {
-         const uint32_t page_size = tt::tile_size(format);
+-        const uint32_t page_size = tt::tile_size(format);
++    auto add_cb = [&](uint32_t index,
++                      uint32_t tiles,
++                      tt::DataFormat format,
++                      const CoreRangeSet& cores,
++                      const std::optional<tt::tt_metal::Tile>& tile = std::nullopt) {
++        const uint32_t page_size = tile.has_value() ? tile->get_tile_size(format) : tt::tile_size(format);
++        CBFormatDescriptor format_descriptor{.buffer_index = index, .data_format = format, .page_size = page_size};
++        if (tile.has_value()) {
++            format_descriptor.tile = tt::tt_metal::TileDescriptor(*tile);
++        }
          desc.cbs.push_back(CBDescriptor{
              .total_size = tiles * page_size,
 -            .core_ranges = all_cores,
+-            .format_descriptors = {{CBFormatDescriptor{
+-                .buffer_index = index, .data_format = format, .page_size = page_size}}},
 +            .core_ranges = cores,
-             .format_descriptors = {{CBFormatDescriptor{
-                 .buffer_index = index, .data_format = format, .page_size = page_size}}},
++            .format_descriptors = {{format_descriptor}},
          });
      };
 -    add_cb(tt::CBIndex::c_0, plan.Kt, in0_format);
-+    add_cb(tt::CBIndex::c_0, plan.Kt, in0_format, all_cores);
++    add_cb(tt::CBIndex::c_0, plan.Kt, in0_format, all_cores, rows_tile);
      // Even weight K blocks arrive on RISCV_0's NOC and odd blocks on RISCV_1's.
 -    add_cb(tt::CBIndex::c_1, in1_buffers * in1_block_num_tiles, in1_format);
 -    add_cb(tt::CBIndex::c_2, in1_buffers * in1_block_num_tiles, in1_format);
 -    add_cb(tt::CBIndex::c_16, plan.count_of(0), output_format);
 +    add_cb(tt::CBIndex::c_1, in1_buffers * in1_block_num_tiles, in1_format, all_cores);
 +    add_cb(tt::CBIndex::c_2, in1_buffers * in1_block_num_tiles, in1_format, all_cores);
-+    add_cb(tt::CBIndex::c_16, plan.count_of(0), output_format, all_cores);
++    add_cb(tt::CBIndex::c_16, plan.count_of(0), output_format, all_cores, out_tile);
      if (bias_tensor.has_value()) {
 -        add_cb(tt::CBIndex::c_3, plan.count_of(0), tt_metal::datatype_to_dataformat_converter(bias_tensor->dtype()));
 +        add_cb(
@@ -349,7 +414,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
      const auto in0_noc = tt::tt_metal::detail::preferred_noc_for_dram_write(device->arch());
      const auto in1_noc = tt::tt_metal::detail::preferred_noc_for_dram_read(device->arch());
      const std::vector<std::pair<std::string, uint32_t>> common_args = {
-@@ -171,9 +219,13 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -171,16 +248,24 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
          {"cb_weights2", tt::CBIndex::c_2},
          {"cb_out", tt::CBIndex::c_16},
          {"cb_bias", tt::CBIndex::c_3},
@@ -363,8 +428,10 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
          {"halves", plan.halves},
          {"out_Nt", plan.out_Nt},
          {"group", plan.group},
-@@ -181,6 +233,8 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+         {"in0_block_w", in0_block_w},
          {"in0_mcast_w", plan.in0_mcast_w},
++        {"rows_tile_h", rows_tile_h},
++        {"out_tile_h", out_tile.has_value() ? rows_tile_h : TILE_HEIGHT},
          {"sender_sem", sender_sem_id},
          {"receiver_sem", receiver_sem_id},
 +        {"partial_sem", partial_sem_id},
@@ -372,7 +439,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
      };
      auto make_kernel = [&](const char* name, std::vector<uint32_t> compile_args,
                             tt_metal::DataMovementProcessor processor, tt::tt_metal::NOC noc) {
-@@ -200,8 +254,7 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -200,8 +285,7 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
      if (bias_tensor.has_value()) {
          tt::tt_metal::TensorAccessorArgs(bias_tensor->mesh_tensor()).append_to(reader_args);
      }
@@ -382,7 +449,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
      reader.core_ranges = all_cores;
      std::vector<uint32_t> sender_args;
      tt::tt_metal::TensorAccessorArgs(a).append_to(sender_args);
-@@ -215,36 +268,41 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -215,36 +299,41 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
  
      std::vector<CoreRange> sender_ranges;
      std::vector<CoreRange> receiver_ranges;
@@ -453,7 +520,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
          }
      }
      for (uint32_t i = 0; i < num_cores; ++i) {
-@@ -253,9 +311,32 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -253,9 +342,32 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
          if (bias_tensor.has_value()) {
              args.emplace_back(bias_tensor->mesh_tensor());
          }
@@ -488,7 +555,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
      desc.kernels.push_back(std::move(reader));
      desc.kernels.push_back(std::move(sender));
      if (!receiver_ranges.empty()) {
-@@ -271,15 +352,23 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -271,15 +383,23 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
      compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
      compute.core_ranges = all_cores;
      compute.named_compile_time_args = common_args;
@@ -660,7 +727,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
  void kernel_main() {
      const uint32_t weight_addr = get_arg_val<uint32_t>(0);
      const uint32_t output_addr = get_arg_val<uint32_t>(1);
-@@ -36,16 +45,65 @@ void kernel_main() {
+@@ -36,21 +45,85 @@ void kernel_main() {
      constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights");
      constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
      constexpr uint32_t cb_bias = get_named_compile_time_arg_val("cb_bias");
@@ -727,7 +794,28 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +
      CircularBuffer out_cb(cb_out);
      const uint32_t page_bytes = get_local_cb_interface(cb_out).fifo_page_size;
++    // Of an activation of rows_tile_h < 32 rows only the top rows_tile_h rows of faces 0 and 1 of each output
++    // tile are written; the output tile in L1 has out_tile_h rows (rows_tile_h, or 32 for a split over K), the
++    // output's tiles in DRAM faces of 256 elements.
++    constexpr uint32_t rows_tile_h = get_named_compile_time_arg_val("rows_tile_h");
++    constexpr uint32_t out_tile_h = get_named_compile_time_arg_val("out_tile_h");
      for (uint32_t n = 0; n < count; ++n) {
+         out_cb.wait_front(1);
+-        noc.async_write(out_cb, output, page_bytes, {}, {.page_id = n_start + n});
++        if constexpr (rows_tile_h < 32) {
++            const uint32_t element_bytes = page_bytes / (out_tile_h * 32);
++            const uint32_t rows_bytes = rows_tile_h * 16 * element_bytes;
++            const uint32_t full_face_bytes = 256 * element_bytes;
++            const uint32_t local = get_read_ptr(cb_out);
++            const uint32_t local_face = out_tile_h < 32 ? rows_bytes : full_face_bytes;
++            noc_async_write(local, output.get_noc_addr(n_start + n), rows_bytes);
++            noc_async_write(local + local_face, output.get_noc_addr(n_start + n, full_face_bytes), rows_bytes);
++        } else {
++            noc.async_write(out_cb, output, page_bytes, {}, {.page_id = n_start + n});
++        }
+         noc.async_writes_flushed();
+         out_cb.pop_front(1);
+     }
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_receiver.cpp
@@ -775,16 +863,29 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
  
      constexpr uint32_t cb_in0_id = get_named_compile_time_arg_val("cb_in0");
      constexpr uint32_t cb_weights = get_named_compile_time_arg_val("cb_weights2");
-@@ -51,7 +53,7 @@ void kernel_main() {
+@@ -48,10 +50,20 @@ void kernel_main() {
+ 
+     cb_in0.reserve_back(Kt);
+     const uint32_t base = cb_in0.get_write_ptr();
++    // Tiles of rows_tile_h < 32 rows hold just the top rows of faces 0 and 1 of the activation's BF16 tiles
++    // in DRAM (512 bytes a face), 32 bytes a row.
++    constexpr uint32_t rows_tile_h = get_named_compile_time_arg_val("rows_tile_h");
      auto read_chunk = [&](uint32_t chunk) {
          for (uint32_t k = 0; k < in0_mcast_w; ++k) {
              const uint32_t tile = chunk * in0_mcast_w + k;
 -            noc_async_read_tile(tile, input, base + tile * tile_bytes);
-+            noc_async_read_tile(k_start + tile, input, base + tile * tile_bytes);
++            if constexpr (rows_tile_h < 32) {
++                constexpr uint32_t face_bytes = rows_tile_h * 32;
++                const uint32_t local = base + tile * tile_bytes;
++                noc_async_read(input.get_noc_addr(k_start + tile), local, face_bytes);
++                noc_async_read(input.get_noc_addr(k_start + tile, 512), local + face_bytes, face_bytes);
++            } else {
++                noc_async_read_tile(k_start + tile, input, base + tile * tile_bytes);
++            }
          }
      };
  
-@@ -81,6 +83,6 @@ void kernel_main() {
+@@ -81,6 +93,6 @@ void kernel_main() {
          noc.async_read_barrier();
      }
  

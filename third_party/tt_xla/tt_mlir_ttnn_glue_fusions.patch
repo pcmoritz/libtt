@@ -1,0 +1,320 @@
+diff --git a/include/ttmlir/OpModel/TTNN/TTNNOpModel.h b/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
+--- a/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
++++ b/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
+@@ -1863,6 +1863,7 @@ struct OpModel<RMSNormOp> {
+       TTNNLayoutAttr outputLayout,
+       std::optional<DeviceComputeKernelConfigAttr> computeKernelConfig =
+           std::nullopt,
++      std::optional<ttcore::DataType> outputDtype = std::nullopt,
+       const MockAllocatorState *initialState = nullptr);
+ 
+   static llvm::Expected<size_t> getOpRuntime(
+@@ -1873,7 +1874,8 @@ struct OpModel<RMSNormOp> {
+       std::optional<TTNNLayoutAttr> biasLayout, llvm::APFloat epsilon,
+       TTNNLayoutAttr outputLayout,
+       std::optional<DeviceComputeKernelConfigAttr> computeKernelConfig =
+-          std::nullopt);
++          std::nullopt,
++      std::optional<ttcore::DataType> outputDtype = std::nullopt);
+ };
+ 
+ //===----------------------------------------------------------------------===//
+diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+--- a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
++++ b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+@@ -4476,7 +4476,8 @@ llvm::Expected<op_model::OpConstraints> RMSNormOp::getOpConstraints(
+       *this, liveRecords, inputShape, inputs[0], optionalArgs.weightShape,
+       optionalArgs.weightLayout, optionalArgs.biasShape,
+       optionalArgs.biasLayout, getEpsilon(), opConfig.outputLayout,
+-      computeKernelConfig);
++      computeKernelConfig,
++      ttcore::elementTypeToDataType(getResult().getType().getElementType()));
+ }
+ 
+ llvm::Expected<size_t>
+@@ -4495,7 +4496,8 @@ RMSNormOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
+       op_model::OpModel<RMSNormOp>::getOpRuntime, *this, inputShape, inputs[0],
+       optionalArgs.weightShape, optionalArgs.weightLayout,
+       optionalArgs.biasShape, optionalArgs.biasLayout, getEpsilon(),
+-      opConfig.outputLayout, computeKernelConfig);
++      opConfig.outputLayout, computeKernelConfig,
++      ttcore::elementTypeToDataType(getResult().getType().getElementType()));
+ }
+ 
+ //===----------------------------------------------------------------------===//
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -212,6 +212,20 @@ bool hasInterveningWrite(Value value, Operation *from, Operation *to) {
+   return false;
+ }
+ 
++// A binary op applies fused activations to its operands as they are unpacked,
++// which for an activation of an input requires that operand's format to share
++// its exponent format with the others: keep the fusion to BF16 and FP32
++// tensors.
++static bool hasActivationFusibleType(Value value) {
++  auto type = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
++  return type && (type.getElementType().isBF16() || type.getElementType().isF32());
++}
++
++static bool allActivationFusibleTypes(Operation *op) {
++  return llvm::all_of(op->getOperands(), hasActivationFusibleType) &&
++         llvm::all_of(op->getResults(), hasActivationFusibleType);
++}
++
+ class TTNNBinaryOpInputsActivation
+     : public mlir::OpInterfaceRewritePattern<ElementwiseBinaryActivations> {
+ public:
+@@ -261,6 +275,16 @@ private:
+     if (!unaryOp) {
+       return {};
+     }
++    if (!allActivationFusibleTypes(unaryOp) || !allActivationFusibleTypes(binaryOp)) {
++      return {};
++    }
++    // Leave silu(slice(matmul)) * slice(matmul) to the SwiGLU matmul epilogue.
++    if (isa<MultiplyOp>(binaryOp) && isa<SiluOp>(unaryOp.getOperation())) {
++      if (auto slice = unaryOp.getInput().getDefiningOp<SliceStaticOp>();
++          slice && slice.getInput().getDefiningOp<MatmulOp>()) {
++        return {};
++      }
++    }
+     if (restrictToMatmulProducer &&
+         !unaryOp.getInput().getDefiningOp<MatmulOp>() &&
+         !unaryOp.getInput().getDefiningOp<LinearOp>()) {
+@@ -294,6 +318,48 @@ private:
+ };
+ } // namespace
+ 
++namespace {
++// An FP32 RMS norm of a BF16 tensor cast to FP32 normalizes the BF16 tensor and
++// produces FP32 itself: with FP32 accumulation the norm unpacks BF16 exactly
++// into FP32 DST and keeps its intermediates in FP32, so only the typecast
++// program goes. A norm without a compute config gets the maximum-precision
++// one RMSNormConfigRewritePattern would give it later.
++class TTNNRMSNormOfUpcast : public mlir::OpRewritePattern<RMSNormOp> {
++public:
++  using mlir::OpRewritePattern<RMSNormOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(RMSNormOp norm, mlir::PatternRewriter &rewriter) const final {
++    auto cast = norm.getInput().getDefiningOp<TypecastOp>();
++    auto elementType = [](Value v) {
++      return mlir::cast<mlir::RankedTensorType>(v.getType()).getElementType();
++    };
++    DeviceComputeKernelConfigAttr config = norm.getComputeConfigAttr();
++    if (!cast || !cast.getResult().hasOneUse() ||
++        !elementType(cast.getInput()).isBF16() ||
++        !elementType(cast.getResult()).isF32() ||
++        !elementType(norm.getResult()).isF32() ||
++        (config && (!config.getFp32DestAccEn() ||
++                    !config.getFp32DestAccEn().getValue()))) {
++      return mlir::failure();
++    }
++    MLIRContext *context = norm.getContext();
++    if (!config) {
++      config = DeviceComputeKernelConfigAttr::get(
++          context, MathFidelity::HiFi4, BoolAttr::get(context, false),
++          BoolAttr::get(context, true), BoolAttr::get(context, true),
++          /*dstFullSyncEn=*/nullptr);
++    }
++    rewriter.modifyOpInPlace(norm, [&]() {
++      norm.getInputMutable().assign(cast.getInput());
++      norm.setComputeConfigAttr(config);
++    });
++    rewriter.eraseOp(cast);
++    return mlir::success();
++  }
++};
++} // namespace
++
+ namespace {
+ class TTNNBinaryOpOutputActivation
+     : public mlir::OpInterfaceRewritePattern<ElementwiseUnary> {
+@@ -324,7 +390,8 @@ public:
+ 
+ private:
+   bool isFusable(ElementwiseUnary unaryOp) const {
+-    return unaryOp.getUnaryOpType() != UnaryOpType::Unknown;
++    return unaryOp.getUnaryOpType() != UnaryOpType::Unknown &&
++           allActivationFusibleTypes(unaryOp);
+   }
+ 
+   ElementwiseBinaryActivations getFusableBinaryOp(Value operand) const {
+@@ -333,11 +400,106 @@ private:
+       return {};
+     }
+ 
+-    return operand.getDefiningOp<ElementwiseBinaryActivations>();
++    auto binaryOp = operand.getDefiningOp<ElementwiseBinaryActivations>();
++    if (!binaryOp || !allActivationFusibleTypes(binaryOp.getOperation())) {
++      return {};
++    }
++    return binaryOp;
+   }
+ };
+ } // namespace
+ 
++// jnp.mean of a BF16 tensor reaches TTNN as a cast to FP32, an FP32 mean and a
++// cast back. A BF16 mean into FP32 DST skips the two typecast programs. The FPU
++// sums with a narrower adder than the FP32 mean's SFPU path (errors of about
++// 2^-15 of the inputs' magnitude, well under their own BF16 rounding, when it
++// adds a tile's rows), so this is kept to means over the second-to-last
++// dimension of at most a tile's rows, such as Qwen3.8-Flash-Next's mean over 4
++// streams. Means along rows and over several dimensions lose more.
++class TTNNBF16MeanOfUpcast : public mlir::OpRewritePattern<TypecastOp> {
++public:
++  using mlir::OpRewritePattern<TypecastOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(TypecastOp down,
++                  mlir::PatternRewriter &rewriter) const final {
++    auto mean = down.getInput().getDefiningOp<MeanOp>();
++    if (!mean || !mean.getResult().hasOneUse()) {
++      return failure();
++    }
++    auto up = mean.getInput().getDefiningOp<TypecastOp>();
++    if (!up) {
++      return failure();
++    }
++    auto elementType = [](Value v) {
++      return mlir::cast<mlir::RankedTensorType>(v.getType()).getElementType();
++    };
++    if (!elementType(up.getInput()).isBF16() || !elementType(up.getResult()).isF32() ||
++        !elementType(mean.getResult()).isF32() || !elementType(down.getResult()).isBF16()) {
++      return failure();
++    }
++    // The number of elements each mean adds up.
++    llvm::ArrayRef<int64_t> shape =
++        mlir::cast<mlir::RankedTensorType>(up.getInput().getType()).getShape();
++    auto dims = mean.getDimArg();
++    if (!dims || dims->size() != 1) {
++      return failure();
++    }
++    const int64_t rank = static_cast<int64_t>(shape.size());
++    int64_t dim = mlir::cast<mlir::IntegerAttr>((*dims)[0]).getInt();
++    dim = dim < 0 ? dim + rank : dim;
++    auto [tileHeight, tileWidth] = ttcore::TileType::getDefaultShape();
++    if (rank < 2 || dim != rank - 2 || shape[dim] > tileHeight) {
++      return failure();
++    }
++
++    mlir::MLIRContext *context = rewriter.getContext();
++    auto computeConfig = DeviceComputeKernelConfigAttr::get(
++        context, /*mathFidelity=*/MathFidelity::HiFi4,
++        /*mathApproxMode=*/BoolAttr::get(context, false),
++        /*fp32DestAccEn=*/BoolAttr::get(context, true),
++        /*packerL1Acc=*/nullptr, /*dstFullSyncEn=*/nullptr);
++    rewriter.replaceOpWithNewOp<MeanOp>(down, down.getType(), up.getInput(),
++                                        mean.getKeepDimAttr(),
++                                        mean.getDimArgAttr(), computeConfig);
++    return success();
++  }
++};
++
++// An FP32 add, subtract, multiply or divide whose only use casts it to BF16
++// produces BF16 itself: binary_ng computes in FP32 DST whenever an operand is
++// FP32 and rounds once as it packs the result, which saves the typecast
++// program. (The packer rounds exact ties away from zero where the typecast
++// rounds them to even.)
++class TTNNBinaryOpNarrowingOutput : public mlir::OpRewritePattern<TypecastOp> {
++public:
++  using mlir::OpRewritePattern<TypecastOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(TypecastOp cast,
++                  mlir::PatternRewriter &rewriter) const final {
++    Operation *producer = cast.getInput().getDefiningOp();
++    if (!producer || !isa<AddOp, SubtractOp, MultiplyOp, DivideOp>(producer) ||
++        !cast.getInput().hasOneUse()) {
++      return failure();
++    }
++    auto elementType = [](Value v) {
++      return mlir::cast<mlir::RankedTensorType>(v.getType()).getElementType();
++    };
++    if (!elementType(cast.getInput()).isF32() || !elementType(cast.getResult()).isBF16() ||
++        !llvm::all_of(producer->getOperands(), [&](Value v) {
++          return elementType(v).isF32() || elementType(v).isBF16();
++        })) {
++      return failure();
++    }
++    rewriter.modifyOpInPlace(producer, [&]() {
++      producer->getResult(0).setType(cast.getResult().getType());
++    });
++    rewriter.replaceOp(cast, producer->getResult(0));
++    return success();
++  }
++};
++
+ // Fold the decode MLP's concatenated [up | gate] projection and SwiGLU into a
+ // single half-width matmul.  The runtime implements this marker with a
+ // two-weight matmul that keeps matching up/gate accumulators on the same core.
+@@ -794,6 +956,7 @@ public:
+     }
+     // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
+     // https://github.com/tenstorrent/tt-metal/issues/30973
++    patterns.add<TTNNBF16MeanOfUpcast, TTNNBinaryOpNarrowingOutput, TTNNRMSNormOfUpcast>(&getContext());
+     patterns.add<TTNNMatmulWithSwiGLUEpilogue,
+         TTNNConv2dWithActivation<ReluOp>, TTNNConv2dWithActivation<Relu6Op>,
+         TTNNConv2dWithActivation<SiluOp>, TTNNConv2dWithActivation<SigmoidOp>,
+diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
+--- a/lib/OpModel/TTNN/TTNNOpModel.cpp
++++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
+@@ -7603,6 +7603,7 @@ llvm::Expected<OpConstraints> OpModel<RMSNormOp>::getOpConstraints(
+     std::optional<TTNNLayoutAttr> biasLayout, llvm::APFloat epsilon,
+     TTNNLayoutAttr outputLayout,
+     std::optional<DeviceComputeKernelConfigAttr> computeKernelConfig,
++    std::optional<ttcore::DataType> outputDtype,
+     const MockAllocatorState *initialState) {
+ #ifdef TTMLIR_ENABLE_OPMODEL
+   ::tt::tt_metal::distributed::MeshDevice *device =
+@@ -7634,7 +7635,9 @@ llvm::Expected<OpConstraints> OpModel<RMSNormOp>::getOpConstraints(
+         ::ttnn::rms_norm, device, initialStateOpt, inputSpec,
+         epsilon.convertToFloat(), weightSpec, biasSpec, residualInputSpec,
+         detail::getNullableMemoryConfig(outputLayout),
+-        /*program_config=*/std::nullopt, computeKernelConfigConverted);
++        /*program_config=*/std::nullopt, computeKernelConfigConverted,
++        outputDtype ? std::optional(conversion::getDataType(*outputDtype))
++                    : detail::getNullableDataType(outputLayout));
+   };
+ 
+   return operation::getOpConstraintsWithState(inputLayout.getContext(),
+@@ -7651,7 +7654,8 @@ llvm::Expected<size_t> OpModel<RMSNormOp>::getOpRuntime(
+     std::optional<llvm::ArrayRef<int64_t>> biasShape,
+     std::optional<TTNNLayoutAttr> biasLayout, llvm::APFloat epsilon,
+     TTNNLayoutAttr outputLayout,
+-    std::optional<DeviceComputeKernelConfigAttr> computeKernelConfig) {
++    std::optional<DeviceComputeKernelConfigAttr> computeKernelConfig,
++    std::optional<ttcore::DataType> outputDtype) {
+ #ifdef TTMLIR_ENABLE_OPMODEL
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+@@ -7678,7 +7682,9 @@ llvm::Expected<size_t> OpModel<RMSNormOp>::getOpRuntime(
+         ::ttnn::rms_norm, device, inputSpec, epsilon.convertToFloat(),
+         weightSpec, biasSpec, residualInputSpec,
+         detail::getNullableMemoryConfig(outputLayout),
+-        /*program_config=*/std::nullopt, computeKernelConfigConverted);
++        /*program_config=*/std::nullopt, computeKernelConfigConverted,
++        outputDtype ? std::optional(conversion::getDataType(*outputDtype))
++                    : detail::getNullableDataType(outputLayout));
+   };
+ 
+   return operation::getOpRuntime(rmsNormQuery);
+diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
+--- a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
++++ b/runtime/lib/ttnn/operations/normalization/rms_norm.cpp
+@@ -78,10 +78,12 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
+     }
+   }
+ 
++  // The output's dtype, which a norm of a BF16 input with FP32 accumulation
++  // may widen to FP32 (TTNNRMSNormOfUpcast).
+   ::ttnn::Tensor output = ::ttnn::rms_norm(
+       rmsInput, epsilon, weight, bias,
+       /*residual_input_tensor=*/std::nullopt, rmsMemoryConfig, programConfig,
+-      computeConfig);
++      computeConfig, utils::getDataType(op->out()));
+   if (useShardedRMSNorm) {
+     const auto outMemCfg = memoryConfig.value_or(input.memory_config());
+     if (inputShape.rank() > 2) {
