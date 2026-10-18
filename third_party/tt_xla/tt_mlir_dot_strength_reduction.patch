@@ -12,7 +12,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
  
      Value lhs = adaptor.getLhs();
      auto lhsType = mlir::cast<RankedTensorType>(lhs.getType());
-@@ -379,6 +383,132 @@ struct DotGeneralToMatmulConversionPattern
+@@ -379,6 +383,130 @@ struct DotGeneralToMatmulConversionPattern
    }
  
  private:
@@ -125,10 +125,8 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +    // The dot's result is [batch dims in pairing order, free dims].
 +    SmallVector<int64_t> resultDims(aBatchDims);
 +    llvm::append_range(resultDims, aFreeDims);
-+    SmallVector<int64_t> resultPermutation = llvm::to_vector(
-+        llvm::map_range(resultDims, [&](int64_t d) -> int64_t {
-+          return llvm::find(keptDims, d) - keptDims.begin();
-+        }));
++    auto resultPermutation =
++        ttmlir::utils::generatePermutation<int64_t>(keptDims, resultDims);
 +    if (!llvm::equal(resultPermutation,
 +                     llvm::seq<int64_t>(0, resultPermutation.size()))) {
 +      result = createPermuteOp(
