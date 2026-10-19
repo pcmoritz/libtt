@@ -1,0 +1,78 @@
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
+@@ -1103,5 +1103,58 @@ inline void init_typecast_int8_to_fp32() {
+ #endif
+ }
+ 
++// A bfloat16 rounded to nearest even at Bfp4_b precision against the shared
++// exponent of its face row, as the host packer (pack_as_bfp4_tiles) does: the
++// mantissa with its hidden bit (0x80 | m) shifted right by 5 plus the
++// exponent's distance below the shared one, capped at 7. x << (4 - distance)
++// puts the kept bits above bit 9 for any distance up to 4, past which the
++// value is 0. The result is exactly representable, so the packer's truncation
++// keeps it. (Shared exponents below 3 would need subnormal results.)
++sfpi_inline sfpi::vFloat round_fp16b_to_bfp4b(sfpi::vFloat value, sfpi::vInt shared_exp) {
++    const sfpi::vInt exp = sfpi::exexp(value, sfpi::ExponentMode::Biased);
++    sfpi::vInt distance = shared_exp - exp;
++    v_if(distance > 4) { distance = 4; }
++    v_endif;
++    const sfpi::vUInt x = (sfpi::shft(sfpi::as<sfpi::vUInt>(value), -16) & 0x7f) | 0x80;
++    const sfpi::vUInt y = sfpi::shft(x, sfpi::vInt(4) - distance);
++    sfpi::vInt q = sfpi::as<sfpi::vInt>(sfpi::shft(y + 0xff + (sfpi::shft(y, -9) & 1), -9));
++    v_if(q > 7) { q = 7; }
++    v_endif;
++    sfpi::vFloat result = 0.0f;
++    v_if(q != 0 && exp != 0) {
++        const sfpi::vFloat magnitude = sfpi::convert<sfpi::vFloat>(q, sfpi::RoundMode::Nearest);
++        result = sfpi::setexp(magnitude, sfpi::exexp(magnitude, sfpi::ExponentMode::Biased) + shared_exp - 129);
++        v_if(value < 0.0f) { result = -result; }
++        v_endif;
++    }
++    v_endif;
++    return result;
++}
++
++// Float16_b -> Bfp4_b: the packer truncates, so round one face first. Each
++// 4-row band is two loads of 8 columns; a face row's shared exponent is its
++// largest exponent over the 16 columns: a max over the two loads, then over
++// the 8 lanes of each row (rotations by 1, 2 and 4).
++inline void calculate_typecast_fp16b_to_bfp4b() {
++#pragma GCC unroll 0
++    for (int band = 0; band < 4; ++band) {
++        const sfpi::vFloat lo = sfpi::dst_reg[2 * band];
++        const sfpi::vFloat hi = sfpi::dst_reg[2 * band + 1];
++        sfpi::vFloat row_max = sfpi::max(
++            sfpi::as<sfpi::vFloat>(sfpi::as<sfpi::vUInt>(lo) & 0x7f800000u),
++            sfpi::as<sfpi::vFloat>(sfpi::as<sfpi::vUInt>(hi) & 0x7f800000u));
++        sfpi::vFloat rotated = sfpi::subvec_shflror1(row_max);
++        row_max = sfpi::max(row_max, rotated);
++        rotated = sfpi::subvec_shflror1(sfpi::subvec_shflror1(row_max));
++        row_max = sfpi::max(row_max, rotated);
++        rotated = sfpi::subvec_shflror1(
++            sfpi::subvec_shflror1(sfpi::subvec_shflror1(sfpi::subvec_shflror1(row_max))));
++        row_max = sfpi::max(row_max, rotated);
++        const sfpi::vInt shared_exp = sfpi::exexp(row_max, sfpi::ExponentMode::Biased);
++        sfpi::dst_reg[2 * band] = round_fp16b_to_bfp4b(lo, shared_exp);
++        sfpi::dst_reg[2 * band + 1] = round_fp16b_to_bfp4b(hi, shared_exp);
++    }
++}
++
+ }  // namespace sfpu
+ }  // namespace ckernel
+diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
+--- tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
++++ tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
+@@ -413,7 +413,11 @@ ALWI void typecast_tile(uint32_t idst) {
+     } else if constexpr (in_format == DataFormat::Bfp4_b && out_format == DataFormat::Float16_b) {
+         // no SFPU kernel needed, handled by unpacker
+     } else if constexpr (in_format == DataFormat::Float16_b && out_format == DataFormat::Bfp4_b) {
+-        // no SFPU kernel needed, handled by packer
++#ifdef ARCH_BLACKHOLE
++        // The packer truncates to Bfp4_b: round to nearest even first, like the host packer.
++        MATH(SFPU_UNARY_CALL_NO_TEMPLATE_ARGS(
++            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_typecast_fp16b_to_bfp4b, idst, VectorMode::RC));
++#endif
+     } else if constexpr (in_format == DataFormat::Bfp4_b && out_format == DataFormat::Bfp8_b) {
+         // no SFPU kernel needed, handled by unpacker
+     } else if constexpr (in_format == DataFormat::Bfp8_b && out_format == DataFormat::Bfp4_b) {
