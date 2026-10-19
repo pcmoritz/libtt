@@ -18,7 +18,7 @@ diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_fo
  #include <tt_stl/assert.hpp>
  #include "blockfloat_common.hpp"
  #include "common/executor.hpp"
-@@ -332,6 +336,116 @@ uint8_t convert_u32_to_bfp(uint32_t input, uint32_t shared_exp, bool is_exp_a) {
+@@ -332,6 +336,128 @@ uint8_t convert_u32_to_bfp(uint32_t input, uint32_t shared_exp, bool is_exp_a) {
      return mantissa;
  }
  
@@ -34,8 +34,13 @@ diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_fo
 +           face_shape[0] == tt::constants::FACE_HEIGHT && face_shape[1] == tt::constants::FACE_WIDTH;
 +}
 +
-+const std::array<uint8_t, 256 * 256>& bfloat16_to_bfp8_b_lut() {
++// A bfloat16's conversion to a _b block float depends only on its sign, its
++// mantissa and how far its exponent is below the shared one
++// (convert_u32_to_bfp), so one table holds every conversion.
++template <tt::DataFormat BfpFormat>
++const std::array<uint8_t, 256 * 256>& bfloat16_to_bfp_b_lut() {
 +    static const auto table = [] {
++        constexpr uint32_t mask = BfpFormat == tt::DataFormat::Bfp4_b ? 0xf : 0xff;
 +        std::array<uint8_t, 256 * 256> result{};
 +        constexpr uint32_t exp = 1;
 +        for (uint32_t exp_diff = 0; exp_diff < 255; ++exp_diff) {
@@ -45,7 +50,7 @@ diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_fo
 +                const uint32_t mantissa = sign_mantissa & 0x7f;
 +                const uint32_t bits = sign | (exp << 7) | mantissa;
 +                result[(exp_diff << 8) | sign_mantissa] =
-+                    convert_u32_to_bfp<tt::DataFormat::Bfp8_b, false>(bits << 16, shared_exp, false);
++                    convert_u32_to_bfp<BfpFormat, false>(bits << 16, shared_exp, false) & mask;
 +            }
 +        }
 +        return result;
@@ -53,16 +58,22 @@ diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_fo
 +    return table;
 +}
 +
-+uint8_t pack_bfloat16_as_bfp8_b(uint16_t bits, uint32_t shared_exp) {
++template <tt::DataFormat BfpFormat>
++uint8_t pack_bfloat16_as_bfp_b(uint16_t bits, uint32_t shared_exp) {
 +    const uint32_t exp = (bits & 0x7f80) >> 7;
 +    if (exp == 0) {
 +        return 0;
 +    }
 +    const uint32_t sign_mantissa = ((bits & 0x8000) >> 8) | (bits & 0x007f);
-+    return bfloat16_to_bfp8_b_lut()[((shared_exp - exp) << 8) | sign_mantissa];
++    return bfloat16_to_bfp_b_lut<BfpFormat>()[((shared_exp - exp) << 8) | sign_mantissa];
 +}
 +
-+std::vector<uint32_t> pack_tiled_bfloat16_as_bfp8_b(ttsl::Span<const bfloat16> input_data) {
++// Packs tiled bfloat16 as Bfp8_b or Bfp4_b tiles, as pack_as_bfp_tiles does.
++template <tt::DataFormat BfpFormat>
++std::vector<uint32_t> pack_tiled_bfloat16_as_bfp_b(ttsl::Span<const bfloat16> input_data) {
++    static_assert(BfpFormat == tt::DataFormat::Bfp8_b || BfpFormat == tt::DataFormat::Bfp4_b);
++    constexpr uint32_t bits_per_value = BfpFormat == tt::DataFormat::Bfp4_b ? 4 : 8;
++    constexpr uint32_t values_per_word = 32 / bits_per_value;
 +    constexpr uint32_t tile_height = tt::constants::TILE_HEIGHT;
 +    constexpr uint32_t tile_width = tt::constants::TILE_WIDTH;
 +    constexpr uint32_t face_height = tt::constants::FACE_HEIGHT;
@@ -70,7 +81,7 @@ diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_fo
 +    constexpr uint32_t tile_elements = tile_height * tile_width;
 +    constexpr uint32_t rows_per_tile = (tile_height / face_height) * (tile_width / face_width) * face_height;
 +    constexpr uint32_t exponent_words_per_tile = rows_per_tile / 4;
-+    constexpr uint32_t data_words_per_tile = tile_elements / 4;
++    constexpr uint32_t data_words_per_tile = tile_elements / values_per_word;
 +    constexpr uint32_t words_per_tile = exponent_words_per_tile + data_words_per_tile;
 +
 +    TT_ASSERT(input_data.size() % tile_elements == 0);
@@ -91,13 +102,14 @@ diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_fo
 +            }
 +
 +            tile_output[row / 4] |= shared_exp << ((row % 4) * 8);
-+            for (uint32_t group = 0; group < face_width / 4; ++group) {
++            for (uint32_t group = 0; group < face_width / values_per_word; ++group) {
 +                uint32_t packed_word = 0;
-+                for (uint32_t i = 0; i < 4; ++i) {
-+                    const uint16_t bits = std::bit_cast<uint16_t>(row_input[group * 4 + i]);
-+                    packed_word |= static_cast<uint32_t>(pack_bfloat16_as_bfp8_b(bits, shared_exp)) << (i * 8);
++                for (uint32_t i = 0; i < values_per_word; ++i) {
++                    const uint16_t bits = std::bit_cast<uint16_t>(row_input[group * values_per_word + i]);
++                    packed_word |= static_cast<uint32_t>(pack_bfloat16_as_bfp_b<BfpFormat>(bits, shared_exp))
++                                   << (i * bits_per_value);
 +                }
-+                data_output[row * (face_width / 4) + group] = packed_word;
++                data_output[row * (face_width / values_per_word) + group] = packed_word;
 +            }
 +        }
 +    };
@@ -114,7 +126,7 @@ diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_fo
 +        return packed_result;
 +    }
 +
-+    (void)bfloat16_to_bfp8_b_lut();
++    (void)bfloat16_to_bfp_b_lut<BfpFormat>();
 +    std::vector<std::thread> threads;
 +    threads.reserve(thread_count);
 +    for (uint32_t thread_index = 0; thread_index < thread_count; ++thread_index) {
@@ -135,13 +147,15 @@ diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_fo
  template <tt::DataFormat BfpFormat>
  std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles(
      ttsl::Span<const float> fp32_vec,
-@@ -353,6 +467,11 @@ std::vector<uint32_t> pack_as_bfp_tiles(
+@@ -353,6 +479,13 @@ std::vector<uint32_t> pack_as_bfp_tiles(
          BfpFormat == tt::DataFormat::Bfp2 || BfpFormat == tt::DataFormat::Bfp4 || BfpFormat == tt::DataFormat::Bfp8 ||
          BfpFormat == tt::DataFormat::Bfp2_b || BfpFormat == tt::DataFormat::Bfp4_b ||
          BfpFormat == tt::DataFormat::Bfp8_b);
-+    if constexpr (BfpFormat == tt::DataFormat::Bfp8_b && std::is_same_v<T, bfloat16>) {
++    if constexpr (
++        (BfpFormat == tt::DataFormat::Bfp8_b || BfpFormat == tt::DataFormat::Bfp4_b) &&
++        std::is_same_v<T, bfloat16>) {
 +        if (!row_major_input && !is_exp_a && is_standard_32x32_tile(tile)) {
-+            return pack_tiled_bfloat16_as_bfp8_b(input_data);
++            return pack_tiled_bfloat16_as_bfp_b<BfpFormat>(input_data);
 +        }
 +    }
  
