@@ -98,7 +98,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  
  #include "hwy/highway.h"
  #include <numeric>
-@@ -183,16 +186,42 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
+@@ -183,16 +186,44 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
    }
    const size_t runBytes = runElements * itemsize;
  
@@ -133,7 +133,9 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +                    rows, cols);
 +      }
 +    };
-+    const std::uint64_t numThreads = std::min<std::uint64_t>(matrices, 16);
++    // transpose16 splits matrices of 8M+ elements itself.
++    const std::uint64_t numThreads =
++        rows * cols >= (8 << 20) ? 1 : std::min<std::uint64_t>(matrices, 16);
 +    if (numThreads == 1) {
 +      transposeMatrices(0, matrices);
 +      return out;
@@ -149,7 +151,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
      return out;
    }
  
-@@ -376,6 +405,124 @@ toHostSingleTensor(const ::tt::runtime::ttnn::TTNNTensorWrapper &tensorWrapper,
+@@ -376,6 +407,124 @@ toHostSingleTensor(const ::tt::runtime::ttnn::TTNNTensorWrapper &tensorWrapper,
                                              shouldRetain);
  }
  
@@ -274,7 +276,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  ::tt::runtime::Tensor
  createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
                           const std::vector<std::int64_t> &stride,
-@@ -389,37 +536,46 @@ createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
+@@ -389,37 +538,46 @@ createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
        "Cannot create borrowed tensor with null data unless the volume is 0.");
    LOG_ASSERT(::tt::runtime::utils::isSupportedDataType(dataType),
               "Cannot create borrowed tensor with unsupported data type");
@@ -335,7 +337,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    default:
      LOG_FATAL("Unsupported data type");
    }
-@@ -1212,7 +1368,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
+@@ -1212,7 +1370,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
          "source data type or be an unsupported data type.");
    }
  
@@ -345,7 +347,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  
    // Handle cast and copy
    if (dstDataType.has_value() &&
-@@ -1272,7 +1429,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
+@@ -1272,7 +1431,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
  
  void memcpy(::tt::runtime::Tensor dst, ::tt::runtime::Tensor src) {
    ::ttnn::Tensor &dstTensor = utils::getTTNNTensorFromRuntimeTensor(dst);
