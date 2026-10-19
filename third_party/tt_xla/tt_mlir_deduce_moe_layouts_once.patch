@@ -1,0 +1,46 @@
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/TTNNDeduceMoEComputeLayouts.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/TTNNDeduceMoEComputeLayouts.cpp
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/TTNNDeduceMoEComputeLayouts.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/TTNNDeduceMoEComputeLayouts.cpp
+@@ -111,15 +111,38 @@ public:
+     op_model::ScopedSingletonDeviceGuard deviceGuard(getOperation());
+     ModuleOp moduleOp = getOperation();
+ 
++    // Each query replays the weight preparation in tt-metal, and every layer's
++    // weights usually share one signature (attributes and operand types): query
++    // each signature once.
++    llvm::DenseMap<std::pair<mlir::Attribute, mlir::Attribute>,
++                   mlir::RankedTensorType>
++        deducedTypes;
++    auto deduce = [&](mlir::Operation *op, auto query) {
++      llvm::SmallVector<mlir::Attribute> operandTypes;
++      for (mlir::Type type : op->getOperandTypes()) {
++        operandTypes.push_back(mlir::TypeAttr::get(type));
++      }
++      auto [it, inserted] = deducedTypes.try_emplace(
++          {op->getAttrDictionary(),
++           mlir::ArrayAttr::get(op->getContext(), operandTypes)});
++      if (inserted) {
++        it->second = query();
++      }
++      return it->second;
++    };
++
+     moduleOp.walk([&](ttnn::PrepareMoEComputeW0W1WeightsOp op) {
+-      op.getResult().setType(
+-          op_model::getPreparedMoEComputeW0W1WeightsOutputType(&op));
++      op.getResult().setType(deduce(op, [&] {
++        return op_model::getPreparedMoEComputeW0W1WeightsOutputType(&op);
++      }));
+       refreshEnclosingFuncReturnType(op.getResult());
+     });
+ 
++    deducedTypes.clear();
+     moduleOp.walk([&](ttnn::PrepareMoEComputeW2WeightsOp op) {
+-      op.getResult().setType(
+-          op_model::getPreparedMoEComputeW2WeightsOutputType(&op));
++      op.getResult().setType(deduce(op, [&] {
++        return op_model::getPreparedMoEComputeW2WeightsOutputType(&op);
++      }));
+       refreshEnclosingFuncReturnType(op.getResult());
+     });
+ 
