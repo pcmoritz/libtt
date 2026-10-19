@@ -87,18 +87,15 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -31,7 +31,10 @@
+@@ -31,6 +31,7 @@
  #include <algorithm>
  #include <cstring>
  #include <memory>
-+#include <mutex>
 +#include <sys/mman.h>
  #include <thread>
-+#include <unordered_map>
  
  #include "hwy/highway.h"
- #include <numeric>
-@@ -183,16 +186,44 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
+@@ -183,16 +184,44 @@ gatherContiguousBytes(const void *data, const std::vector<std::uint32_t> &shape,
    }
    const size_t runBytes = runElements * itemsize;
  
@@ -151,32 +148,30 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
      return out;
    }
  
-@@ -376,6 +407,119 @@ toHostSingleTensor(const ::tt::runtime::ttnn::TTNNTensorWrapper &tensorWrapper,
+@@ -376,6 +405,107 @@ toHostSingleTensor(const ::tt::runtime::ttnn::TTNNTensorWrapper &tensorWrapper,
                                              shouldRetain);
  }
  
 +namespace {
 +// Caller memory that a borrowed host tensor stands for without aliasing it: a
-+// non-contiguous view or a large buffer (createBorrowedHostTensor).
++// non-contiguous view or a large buffer (createBorrowedHostTensor). It is the
++// deleter of the inaccessible address reservation that the tensor aliases.
 +struct StridedHostView {
 +  const void *data; // The first logical element.
 +  std::vector<std::uint32_t> shape;
 +  std::vector<std::int64_t> stride; // In elements.
 +  std::uint32_t itemsize;
++  std::size_t reservedBytes;
++
++  void operator()(void *reservation) const {
++    munmap(reservation, reservedBytes);
++  }
 +};
 +
-+// Strided views by the address reservation their tensor aliases.
-+std::mutex stridedHostViewsMutex;
-+std::unordered_map<const void *, StridedHostView> stridedHostViews;
-+
-+std::optional<StridedHostView>
++// The view a host buffer stands for, or nullptr: its pin holds the reservation.
++const StridedHostView *
 +findStridedHostView(const ::tt::tt_metal::HostBuffer &buffer) {
-+  std::lock_guard<std::mutex> lock(stridedHostViewsMutex);
-+  auto it = stridedHostViews.find(buffer.view_bytes().data());
-+  if (it == stridedHostViews.end()) {
-+    return std::nullopt;
-+  }
-+  return it->second;
++  return std::get_deleter<StridedHostView>(buffer.pin().resource());
 +}
 +
 +template <typename T>
@@ -190,9 +185,9 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +} // namespace
 +
 +// Reserves inaccessible address space the size of a view for its tensor to
-+// alias, registered with the view until the tensor is gone. Readers of host
-+// tensors gather the view first (utils::materializeStridedHostTensor); a
-+// reader that does not faults rather than reading the wrong bytes.
++// alias, until the tensor is gone. Readers of host tensors gather the view
++// first (utils::materializeStridedHostTensor); a reader that does not faults
++// rather than reading the wrong bytes.
 +static std::shared_ptr<void>
 +reserveStridedHostView(void *data, const std::vector<std::uint32_t> &shape,
 +                       const std::vector<std::int64_t> &stride,
@@ -209,18 +204,8 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +      stride.size() == shape.size()
 +          ? stride
 +          : ::tt::runtime::utils::calculateStride(shape);
-+  {
-+    std::lock_guard<std::mutex> lock(stridedHostViewsMutex);
-+    stridedHostViews.emplace(
-+        reservation, StridedHostView{data, shape, viewStride, itemsize});
-+  }
-+  return std::shared_ptr<void>(reservation, [bytes](void *address) {
-+    {
-+      std::lock_guard<std::mutex> lock(stridedHostViewsMutex);
-+      stridedHostViews.erase(address);
-+    }
-+    munmap(address, bytes);
-+  });
++  return std::shared_ptr<void>(
++      reservation, StridedHostView{data, shape, viewStride, itemsize, bytes});
 +}
 +
 +namespace utils {
@@ -232,14 +217,14 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +      tensor.host_storage().host_tensor();
 +  bool strided = false;
 +  hostTensor.buffer().apply([&](const ::tt::tt_metal::HostBuffer &shard) {
-+    strided |= findStridedHostView(shard).has_value();
++    strided |= findStridedHostView(shard) != nullptr;
 +  });
 +  if (!strided) {
 +    return tensor;
 +  }
 +  return ::ttnn::Tensor(hostTensor.transform(
 +      [&](const ::tt::tt_metal::HostBuffer &shard) {
-+        std::optional<StridedHostView> view = findStridedHostView(shard);
++        const StridedHostView *view = findStridedHostView(shard);
 +        if (!view) {
 +          return shard;
 +        }
@@ -271,7 +256,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  ::tt::runtime::Tensor
  createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
                           const std::vector<std::int64_t> &stride,
-@@ -389,37 +533,43 @@ createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
+@@ -389,37 +519,43 @@ createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
        "Cannot create borrowed tensor with null data unless the volume is 0.");
    LOG_ASSERT(::tt::runtime::utils::isSupportedDataType(dataType),
               "Cannot create borrowed tensor with unsupported data type");
@@ -329,7 +314,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    default:
      LOG_FATAL("Unsupported data type");
    }
-@@ -1212,7 +1362,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
+@@ -1212,7 +1348,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
          "source data type or be an unsupported data type.");
    }
  
@@ -339,7 +324,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  
    // Handle cast and copy
    if (dstDataType.has_value() &&
-@@ -1272,7 +1423,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
+@@ -1272,7 +1409,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
  
  void memcpy(::tt::runtime::Tensor dst, ::tt::runtime::Tensor src) {
    ::ttnn::Tensor &dstTensor = utils::getTTNNTensorFromRuntimeTensor(dst);
