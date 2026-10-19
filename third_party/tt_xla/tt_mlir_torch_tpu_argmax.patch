@@ -1,0 +1,100 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -122,6 +122,8 @@
+   POS_INF, // It is also used for maximum integer value.
+   ZERO,
+   ONE, // Used for cumulative product operations.
++  LOWEST_FINITE,  // Lowest finite float, e.g. torch_tpu's argmax init.
++  HIGHEST_FINITE, // Highest finite float, e.g. torch_tpu's argmin init.
+ };
+ 
+ // Check if the constant op is initialized with the desired init value.
+@@ -131,6 +133,16 @@
+     return false;
+   }
+ 
++  if (desired == TypicalInitReductionValue::LOWEST_FINITE ||
++      desired == TypicalInitReductionValue::HIGHEST_FINITE) {
++    auto floatType = mlir::dyn_cast<FloatType>(elementType);
++    return floatType &&
++           *initValue.value_begin<llvm::APFloat>() ==
++               llvm::APFloat::getLargest(
++                   floatType.getFloatSemantics(),
++                   desired == TypicalInitReductionValue::LOWEST_FINITE);
++  }
++
+   float desiredF32;
+   double desiredF64;
+   if (desired == TypicalInitReductionValue::NEG_INF) {
+@@ -730,7 +742,9 @@
+     }
+ 
+     if (!verifyInitValue(initValues.front(),
+-                         TypicalInitReductionValue::NEG_INF)) {
++                         TypicalInitReductionValue::NEG_INF) &&
++        !verifyInitValue(initValues.front(),
++                         TypicalInitReductionValue::LOWEST_FINITE)) {
+       return false;
+     }
+ 
+@@ -746,7 +760,9 @@
+     }
+ 
+     if (!verifyInitValue(initValues.front(),
+-                         TypicalInitReductionValue::POS_INF)) {
++                         TypicalInitReductionValue::POS_INF) &&
++        !verifyInitValue(initValues.front(),
++                         TypicalInitReductionValue::HIGHEST_FINITE)) {
+       return false;
+     }
+ 
+@@ -778,6 +794,10 @@
+             firstOp, mlir::stablehlo::ComparisonDirection::GT)) {
+       return true;
+     }
++    if (verifyTorchTpuArgExtremePattern(
++            blocks.front(), mlir::stablehlo::ComparisonDirection::GE)) {
++      return true;
++    }
+ 
+     return false;
+   }
+@@ -794,7 +814,36 @@
+     }
+ 
+     return verifyJaxOpArgExtremePattern(
+-        operations.front(), mlir::stablehlo::ComparisonDirection::LT);
++               operations.front(), mlir::stablehlo::ComparisonDirection::LT) ||
++           verifyTorchTpuArgExtremePattern(
++               blocks.front(), mlir::stablehlo::ComparisonDirection::LE);
++  }
++
++  // Pattern match torch_tpu's ArgMax (GE) and ArgMin (LE) ops. Its body starts
++  // with the comparison, propagates NaNs and breaks ties towards the smaller
++  // index, and returns the maximum (minimum) value and a selected index:
++  //  stablehlo.compare (GE / LE)
++  //  ...
++  //  stablehlo.return %max_or_min, %select
++  bool verifyTorchTpuArgExtremePattern(
++      mlir::Block &block,
++      mlir::stablehlo::ComparisonDirection expectedDirection) const {
++    auto compareOp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(block.front());
++    auto returnOp =
++        mlir::dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
++    if (!compareOp ||
++        compareOp.getComparisonDirection() != expectedDirection ||
++        !returnOp || returnOp.getNumOperands() != 2) {
++      return false;
++    }
++    mlir::Operation *value = returnOp.getOperand(0).getDefiningOp();
++    bool isMax = expectedDirection == mlir::stablehlo::ComparisonDirection::GE;
++    if (isMax ? !isa_and_nonnull<mlir::stablehlo::MaxOp>(value)
++              : !isa_and_nonnull<mlir::stablehlo::MinOp>(value)) {
++      return false;
++    }
++    return isa_and_nonnull<mlir::stablehlo::SelectOp>(
++        returnOp.getOperand(1).getDefiningOp());
+   }
+ 
+   // Pattern match the ops for tt-torch ArgMax op.

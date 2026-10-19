@@ -1,0 +1,15 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -9082,7 +9082,10 @@
+     auto keyElemType = dyn_cast<IntegerType>(
+         cast<RankedTensorType>(srcOp.getInputs().front().getType())
+             .getElementType());
+-    if (keyElemType && keyElemType.getWidth() == 32) {
++    // 64-bit integers are 32-bit on device, so their keys sort the same way,
++    // e.g. the random uint64 keys of PyTorch's randperm.
++    if (keyElemType &&
++        (keyElemType.getWidth() == 32 || keyElemType.getWidth() == 64)) {
+       auto indicesType = cast<RankedTensorType>(outputTypes[1]);
+       Value keyRows;
+       std::tie(keyRows, indices2D) = sortInt32KeyRows(

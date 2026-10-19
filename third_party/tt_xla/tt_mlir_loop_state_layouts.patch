@@ -1,0 +1,19 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+@@ -802,9 +802,12 @@
+     // The rows ops (ttnn::experimental::rows_gather and rows_scatter) read
+     // their table and source as row-major sticks too, usually through the
+     // reshapes that view the argument as a [B, N, R] table.
+-    if (!arg.use_empty() && llvm::all_of(arg.getUses(), [](OpOperand &use) {
+-          return feedsRowMajorReader(use);
+-        })) {
++    // Only for the entry function: the arguments of a private function, such
++    // as a while loop body, take the layouts of the values its caller passes,
++    // e.g. the loop state that the body itself returns.
++    if (owningFunc.isPublic() && !arg.use_empty() &&
++        llvm::all_of(arg.getUses(),
++                     [](OpOperand &use) { return feedsRowMajorReader(use); })) {
+       return true;
+     }
+ 

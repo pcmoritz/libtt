@@ -40,3 +40,11 @@ def test_silu_still_fuses(tmp_path):
     assert "ttnn.silu" in ir and "ttnn.sigmoid" not in ir
     v = x.astype(np.float32)
     np.testing.assert_allclose(actual, v / (1 + np.exp(-v)), atol=3e-2, rtol=2e-2)
+
+
+def test_sigmoid_of_integers():
+    # The fused sigmoid must take the float values, not the integer tensor that
+    # was cast to float.
+    x = np.arange(-3, 4, dtype=np.int32)
+    out = jax.jit(lambda x: jax.nn.sigmoid(x.astype(jnp.float32)))(x)
+    np.testing.assert_allclose(out, 1 / (1 + np.exp(-x.astype(np.float32))), rtol=1e-2)

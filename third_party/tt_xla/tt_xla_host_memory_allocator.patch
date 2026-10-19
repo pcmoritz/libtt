@@ -1,0 +1,68 @@
+diff --git a/pjrt_implementation/src/api_bindings.cc b/pjrt_implementation/src/api_bindings.cc
+--- a/pjrt_implementation/src/api_bindings.cc
++++ b/pjrt_implementation/src/api_bindings.cc
+@@ -10,6 +10,10 @@
+ 
+ #include "api_bindings.h"
+ 
++#include <algorithm>
++#include <cstdint>
++#include <cstdlib>
++
+ #include "api/buffer_instance.h"
+ #include "api/client_instance.h"
+ #include "api/device_description.h"
+@@ -63,10 +67,52 @@
+     .collect_data = collectProfilerData,
+ };
+ 
++// Host memory allocator extension, as in XLA's
++// xla/pjrt/extensions/host_memory_allocator/host_memory_allocator_extension.h,
++// which the vendored C API headers don't include. PyTorch frontends use it for
++// pinned host tensors and non-blocking device-to-host copies.
++struct PJRT_HostMemoryAllocator_Allocate_Args {
++  size_t struct_size;
++  PJRT_Extension_Base *extension_start;
++  PJRT_Client *client;
++  size_t size;
++  int numa_node;
++  uint8_t *ptr;
++  void (*deleter)(void *ptr, void *arg);
++  void *deleter_arg;
++};
++
++struct PJRT_HostMemoryAllocator_Extension {
++  PJRT_Extension_Base base;
++  PJRT_Error *(*allocate)(PJRT_HostMemoryAllocator_Allocate_Args *args);
++};
++
++PJRT_Error *allocateHostMemory(PJRT_HostMemoryAllocator_Allocate_Args *args) {
++  void *ptr = nullptr;
++  if (posix_memalign(&ptr, 4096, std::max<size_t>(args->size, 1)) != 0) {
++    return *ErrorInstance::makeError(tt_pjrt_status::kResourceExhausted)
++                .release();
++  }
++  args->ptr = static_cast<uint8_t *>(ptr);
++  args->deleter = [](void *ptr, void *) { std::free(ptr); };
++  args->deleter_arg = nullptr;
++  return nullptr;
++}
++
++PJRT_HostMemoryAllocator_Extension hostMemoryAllocatorExtension{
++    .base =
++        {
++            .struct_size = sizeof(PJRT_HostMemoryAllocator_Extension),
++            .type = PJRT_Extension_Type_HostMemoryAllocator,
++            .next = nullptr,
++        },
++    .allocate = allocateHostMemory,
++};
++
+ PJRT_Profiler_Extension profilerExtension{
+     .struct_size = PJRT_Profiler_Extension_STRUCT_SIZE,
+     .type = PJRT_Extension_Type_Profiler,
+-    .next = nullptr,
++    .next = &hostMemoryAllocatorExtension.base,
+     .profiler_api = &profilerApi,
+     .traceme_context_id = 0,
+ };

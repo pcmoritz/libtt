@@ -1,0 +1,19 @@
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -301,9 +301,12 @@
+ }
+ 
+ GlobalClientInstanceSingleton &GlobalClientInstanceSingleton::getInstance() {
+-  static thread_local GlobalClientInstanceSingleton singleton =
+-      GlobalClientInstanceSingleton(nullptr);
+-  return singleton;
++  // Process-wide, since a framework may create and destroy the client on
++  // different threads. Never destroyed: a client that is still alive at exit
++  // must not close the device after tt-metal's thread-local state is gone.
++  static GlobalClientInstanceSingleton *singleton =
++      new GlobalClientInstanceSingleton(nullptr);
++  return *singleton;
+ }
+ 
+ ClientInstance *GlobalClientInstanceSingleton::getClientInstance() {

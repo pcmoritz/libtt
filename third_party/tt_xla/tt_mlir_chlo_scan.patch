@@ -1,0 +1,195 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
+@@ -2372,6 +2372,168 @@
+   }
+ };
+ 
++// A chlo.scan whose body only combines its two arguments (recorded as
++// "tt.scan_combiner" when the composite was deserialized) is a running
++// reduction. Rewrites it to the reduce_window form that JAX uses for cumsum,
++// cumprod, cummax and cummin, which lowers to TTNN's cumulative ops, instead
++// of the decomposition's while loop over every position:
++//   output = combiner(reduce_window(input, identity), broadcast(init))
++//   carry = output at the last scanned position
++class ChloScanConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::CompositeOp> {
++public:
++  using OpConversionPattern<mlir::stablehlo::CompositeOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::CompositeOp srcOp,
++                  mlir::stablehlo::CompositeOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    if (srcOp.getName() != "chlo.scan") {
++      return failure();
++    }
++    DictionaryAttr attrs = srcOp.getCompositeAttributes();
++    auto combiner =
++        attrs ? attrs.getAs<StringAttr>("tt.scan_combiner") : StringAttr();
++    auto dimAttr = attrs ? attrs.getAs<IntegerAttr>("dimension") : nullptr;
++    auto reverseAttr = attrs ? attrs.getAs<BoolAttr>("is_reverse") : nullptr;
++    if (!combiner || !dimAttr || srcOp.getNumOperands() != 2 ||
++        srcOp.getNumResults() != 2) {
++      return rewriter.notifyMatchFailure(srcOp,
++                                         "not a single running reduction");
++    }
++    Value input = adaptor.getOperands()[0];
++    Value init = adaptor.getOperands()[1];
++    auto inputType = mlir::dyn_cast<RankedTensorType>(input.getType());
++    if (!inputType || !inputType.hasStaticShape() ||
++        srcOp.getResult(0).getType() != inputType) {
++      return rewriter.notifyMatchFailure(srcOp, "expected a static input");
++    }
++    int64_t dim = dimAttr.getInt();
++    int64_t rank = inputType.getRank();
++    int64_t size = inputType.getDimSize(dim);
++    bool reverse = reverseAttr && reverseAttr.getValue();
++    Type elementType = inputType.getElementType();
++    Location loc = srcOp.getLoc();
++
++    // A scan of length 1 only combines with the init value.
++    Value scanned = input;
++    if (size > 1) {
++      std::optional<TypedAttr> identity =
++          getIdentity(combiner.getValue(), elementType);
++      if (!identity) {
++        return rewriter.notifyMatchFailure(srcOp, "unsupported combiner");
++      }
++      auto scalarType = RankedTensorType::get({}, elementType);
++      Value identityValue = rewriter.create<mlir::stablehlo::ConstantOp>(
++          loc,
++          DenseElementsAttr::get(scalarType, ArrayRef<Attribute>{*identity}));
++
++      SmallVector<int64_t> windowDimensions(rank, 1);
++      windowDimensions[dim] = size;
++      SmallVector<int64_t> padding(rank * 2, 0);
++      padding[dim * 2 + (reverse ? 1 : 0)] = size - 1;
++      auto reduceWindow = rewriter.create<mlir::stablehlo::ReduceWindowOp>(
++          loc, TypeRange{inputType}, ValueRange{input},
++          ValueRange{identityValue},
++          rewriter.getDenseI64ArrayAttr(windowDimensions),
++          /*window_strides=*/nullptr, /*base_dilations=*/nullptr,
++          /*window_dilations=*/nullptr,
++          DenseIntElementsAttr::get(
++              RankedTensorType::get({rank, 2}, rewriter.getI64Type()),
++              padding));
++      Block *body = rewriter.createBlock(&reduceWindow.getBody(), {},
++                                         {scalarType, scalarType}, {loc, loc});
++      Operation *combine =
++          createCombiner(rewriter, loc, combiner.getValue(),
++                         body->getArgument(0), body->getArgument(1));
++      rewriter.create<mlir::stablehlo::ReturnOp>(loc, combine->getResults());
++      rewriter.setInsertionPointAfter(reduceWindow);
++      scanned = reduceWindow.getResult(0);
++    }
++
++    SmallVector<int64_t> initDimensions;
++    for (int64_t d = 0; d < rank; ++d) {
++      if (d != dim) {
++        initDimensions.push_back(d);
++      }
++    }
++    Value initBroadcast = rewriter.create<mlir::stablehlo::BroadcastInDimOp>(
++        loc, inputType, init, initDimensions);
++    Value output = createCombiner(rewriter, loc, combiner.getValue(), scanned,
++                                  initBroadcast)
++                       ->getResult(0);
++
++    SmallVector<int64_t> start(rank, 0);
++    SmallVector<int64_t> limit(inputType.getShape());
++    SmallVector<int64_t> strides(rank, 1);
++    start[dim] = reverse ? 0 : size - 1;
++    limit[dim] = start[dim] + 1;
++    Value last = rewriter.create<mlir::stablehlo::SliceOp>(loc, output, start,
++                                                           limit, strides);
++    Value carry = rewriter.create<mlir::stablehlo::ReshapeOp>(
++        loc, srcOp.getResult(1).getType(), last);
++    rewriter.replaceOp(srcOp, {output, carry});
++    return success();
++  }
++
++private:
++  static std::optional<TypedAttr> getIdentity(StringRef combiner,
++                                              Type elementType) {
++    if (auto floatType = mlir::dyn_cast<FloatType>(elementType)) {
++      const llvm::fltSemantics &semantics = floatType.getFloatSemantics();
++      if (combiner == "add") {
++        return FloatAttr::get(floatType, llvm::APFloat::getZero(semantics));
++      }
++      if (combiner == "multiply") {
++        return FloatAttr::get(floatType, llvm::APFloat::getOne(semantics));
++      }
++      if (combiner == "maximum" || combiner == "minimum") {
++        return FloatAttr::get(
++            floatType, llvm::APFloat::getInf(semantics, /*Negative=*/combiner ==
++                                                            "maximum"));
++      }
++      return std::nullopt;
++    }
++    auto intType = mlir::dyn_cast<IntegerType>(elementType);
++    if (!intType || intType.getWidth() == 1) {
++      return std::nullopt;
++    }
++    unsigned width = intType.getWidth();
++    bool isUnsigned = intType.isUnsigned();
++    if (combiner == "add") {
++      return IntegerAttr::get(intType, llvm::APInt::getZero(width));
++    }
++    if (combiner == "multiply") {
++      return IntegerAttr::get(intType, llvm::APInt(width, 1));
++    }
++    if (combiner == "maximum") {
++      return IntegerAttr::get(
++          intType, isUnsigned ? llvm::APInt::getMinValue(width)
++                              : llvm::APInt::getSignedMinValue(width));
++    }
++    if (combiner == "minimum") {
++      return IntegerAttr::get(
++          intType, isUnsigned ? llvm::APInt::getMaxValue(width)
++                              : llvm::APInt::getSignedMaxValue(width));
++    }
++    return std::nullopt;
++  }
++
++  static Operation *createCombiner(OpBuilder &builder, Location loc,
++                                   StringRef combiner, Value lhs, Value rhs) {
++    if (combiner == "add") {
++      return builder.create<mlir::stablehlo::AddOp>(loc, lhs, rhs);
++    }
++    if (combiner == "multiply") {
++      return builder.create<mlir::stablehlo::MulOp>(loc, lhs, rhs);
++    }
++    if (combiner == "maximum") {
++      return builder.create<mlir::stablehlo::MaxOp>(loc, lhs, rhs);
++    }
++    return builder.create<mlir::stablehlo::MinOp>(loc, lhs, rhs);
++  }
++};
++
+ struct LegalizeStableHLOCompositeToTTIR
+     : public ttir::impl::LegalizeStableHLOCompositeToTTIRBase<
+           LegalizeStableHLOCompositeToTTIR> {
+@@ -2382,6 +2544,14 @@
+     target.addLegalDialect<ttir::TTIRDialect>();
+     target.addLegalDialect<ttcore::TTCoreDialect>();
+     // StableHLO is intentionally not marked as either legal or illegal.
++    // ChloScanConversionPattern rewrites into these StableHLO ops, which the
++    // StableHLO to TTIR conversion lowers later.
++    target
++        .addLegalOp<mlir::stablehlo::AddOp, mlir::stablehlo::BroadcastInDimOp,
++                    mlir::stablehlo::ConstantOp, mlir::stablehlo::MaxOp,
++                    mlir::stablehlo::MinOp, mlir::stablehlo::MulOp,
++                    mlir::stablehlo::ReduceWindowOp, mlir::stablehlo::ReshapeOp,
++                    mlir::stablehlo::ReturnOp, mlir::stablehlo::SliceOp>();
+ 
+     RewritePatternSet patterns(context);
+     populateStableHLOCompositeLegalizationPatterns(context, patterns);
+@@ -2408,6 +2578,7 @@
+   patterns.add<StableHLOToTTIRCompositeOpConversionPattern<ttir::GeluOp>>(
+       context, "tenstorrent.gelu_tanh");
+   patterns.add<ChloMulHiConversionPattern>(context);
++  patterns.add<ChloScanConversionPattern>(context);
+   patterns.add<TenstorrentAdamWConversionPattern>(context);
+   patterns.add<TenstorrentSDPAForwardConversionPattern>(context);
+   patterns.add<TenstorrentSDPABackwardConversionPattern>(context);

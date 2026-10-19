@@ -1,0 +1,25 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -779,8 +779,19 @@
+         expOp ? ttmlir::utils::lookThrough<TypecastOp>(expOp.getInput())
+                     .getDefiningOp<NegOp>()
+               : nullptr;
+-    return negOp ? ttmlir::utils::lookThrough<TypecastOp>(negOp.getInput())
+-                 : mlir::Value();
++    if (!negOp) {
++      return {};
++    }
++    // Look through float casts only: the sigmoid of an integer tensor has to
++    // run on its float values.
++    mlir::Value input = negOp.getInput();
++    while (auto cast = input.getDefiningOp<TypecastOp>()) {
++      if (!mlir::isa<FloatType>(cast.getInput().getType().getElementType())) {
++        break;
++      }
++      input = cast.getInput();
++    }
++    return input;
+   }
+ 
+ public:

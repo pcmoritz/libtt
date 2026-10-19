@@ -1,0 +1,34 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -1643,6 +1643,30 @@
+   matchAndRewrite(mlir::stablehlo::ConstantOp srcOp,
+                   mlir::stablehlo::ConstantOp::Adaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
++    // TTNN has no f64. Frontends such as PyTorch use f64 scalars, so build an
++    // f64 constant as an f32 one plus a typecast, which folds away once the
++    // element type normalization narrows the graph's f64 to f32.
++    auto denseAttr = dyn_cast<mlir::DenseFPElementsAttr>(srcOp.getValue());
++    if (denseAttr && denseAttr.getElementType().isF64()) {
++      auto f32Type = denseAttr.getType().clone(rewriter.getF32Type());
++      auto f32Attr = denseAttr.mapValues(
++          rewriter.getF32Type(), [](const llvm::APFloat &value) {
++            llvm::APFloat narrowed = value;
++            bool losesInfo = false;
++            narrowed.convert(llvm::APFloat::IEEEsingle(),
++                             llvm::APFloat::rmNearestTiesToEven, &losesInfo);
++            return narrowed.bitcastToAPInt();
++          });
++      auto f32Constant = rewriter.create<mlir::tt::ttir::ConstantOp>(
++          srcOp.getLoc(), mlir::cast<RankedTensorType>(f32Type),
++          getValueAttr(f32Attr));
++      auto outputType = mlir::cast<RankedTensorType>(
++          getTypeConverter()->convertType(srcOp.getResult().getType()));
++      rewriter.replaceOpWithNewOp<mlir::tt::ttir::TypecastOp>(srcOp, outputType,
++                                                              f32Constant);
++      return success();
++    }
++
+     // Check legality of the conversion.
+     if (failed(checkConversionLegality(srcOp, rewriter))) {
+       return failure();

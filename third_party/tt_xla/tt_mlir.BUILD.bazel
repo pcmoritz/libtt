@@ -1311,7 +1311,6 @@ cc_library(
             "runtime/lib/ttnn/operations/normalization/layer_norm_pre_all_gather.cpp",
             "runtime/lib/ttnn/operations/normalization/rms_norm_pre_all_gather.cpp",
             "runtime/lib/ttnn/operations/pool/**",
-            "runtime/lib/ttnn/operations/rand/**",
             "runtime/lib/ttnn/operations/tensor_serialization/**",
             "runtime/lib/ttnn/operations/ttml/**",
         ],

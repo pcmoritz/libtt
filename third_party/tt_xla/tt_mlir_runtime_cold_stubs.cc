@@ -20,7 +20,6 @@
 #include "operations/normalization/layer_norm_pre_all_gather.h"
 #include "operations/normalization/rms_norm_pre_all_gather.h"
 #include "operations/pool/upsample.h"
-#include "operations/rand/rand.h"
 #include "operations/tensor_serialization/dump_tensor.h"
 #include "operations/tensor_serialization/load_tensor.h"
 #include "operations/ttml/adamw.h"
@@ -160,14 +159,6 @@ void run(const ::tt::target::ttnn::UpsampleOp *, ProgramContext &) {
 }
 
 } // namespace tt::runtime::ttnn::operations::pool
-
-namespace tt::runtime::ttnn::operations::rand {
-
-void run(const ::tt::target::ttnn::RandOp *, ProgramContext &) {
-  unsupported("ttnn.rand");
-}
-
-} // namespace tt::runtime::ttnn::operations::rand
 
 namespace tt::runtime::ttnn::operations::tensor_serialization {
 

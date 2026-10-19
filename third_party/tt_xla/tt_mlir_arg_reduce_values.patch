@@ -1,0 +1,53 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -314,10 +314,12 @@
+ 
+     if (srcOp.getInputs().size() > 1) {
+       if (isArgMax(srcOp, adaptor, rewriter)) {
++        replaceUsedValues<ttir::MaxOp>(srcOp, adaptor, rewriter);
+         return matchAndRewriteInternalArgMax(
+             srcOp, adaptor.getInputs().front(), rewriter);
+       }
+       if (isArgMin(srcOp, adaptor, rewriter)) {
++        replaceUsedValues<ttir::MinOp>(srcOp, adaptor, rewriter);
+         return matchAndRewriteInternalArgMin(srcOp, adaptor, rewriter);
+       }
+       return matchAndRewriteSeparable(srcOp, adaptor, rewriter);
+@@ -559,6 +561,25 @@
+     return success();
+   }
+ 
++  // ttir.argmax and ttir.argmin return only the indices. When the reduced
++  // values are used too, e.g. by torch.max(x, dim), reduce them separately.
++  template <typename ReductionOp>
++  void replaceUsedValues(mlir::stablehlo::ReduceOp &srcOp,
++                         mlir::stablehlo::ReduceOp::Adaptor &adaptor,
++                         ConversionPatternRewriter &rewriter) const {
++    if (srcOp.getResult(0).use_empty()) {
++      return;
++    }
++    auto outputType = mlir::cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getResult(0).getType()));
++    mlir::Value values = rewriter.create<ReductionOp>(
++        srcOp.getLoc(), outputType, adaptor.getInputs().front(),
++        /*keep_dim=*/false,
++        rewriter.getI32ArrayAttr(
++            llvm::SmallVector<int32_t>(srcOp.getDimensions())));
++    srcOp.getResult(0).replaceAllUsesWith(values);
++  }
++
+   LogicalResult
+   matchAndRewriteInternalArgMax(mlir::stablehlo::ReduceOp &srcOp,
+                                 mlir::Value input,
+@@ -728,8 +749,8 @@
+       return false;
+     }
+ 
+-    if (!results.front().getUsers().empty() ||
+-        results.back().getUsers().empty()) {
++    // The values result may be used too; see replaceUsedValues.
++    if (results.back().getUsers().empty()) {
+       return false;
+     }
+     return true;
