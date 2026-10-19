@@ -1,0 +1,50 @@
+diff --git a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w0_w1_weights.cpp b/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w0_w1_weights.cpp
+--- a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w0_w1_weights.cpp
++++ b/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w0_w1_weights.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include "operations/ccl/prepare_moe_compute_w0_w1_weights.h"
+ 
++#include "ttnn/operations/copy/typecast/typecast.hpp"
++#include "ttnn/operations/core/core.hpp"
+ #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.hpp"
+ 
+ namespace tt::runtime::ttnn::operations::ccl {
+@@ -38,8 +40,10 @@ void run(const ::tt::target::ttnn::PrepareMoEComputeW0W1WeightsOp *op,
+               : ::ttnn::experimental::prepare_w0_w1_tensor_for_moe_compute(
+                     w0, w1, L, E, op->hidden_size(), op->intermediate_size());
+ 
+-  ::ttnn::Tensor out = ::ttnn::experimental::quantize_weights_via_host(
+-      packed, ::tt::tt_metal::DataType::BFLOAT4_B,
++  // Bfp4_b on the device, whose typecast rounds like the host packer
++  // (bfp4_typecast_rounding.patch): the weights need not go through the host.
++  ::ttnn::Tensor out = ::ttnn::to_memory_config(
++      ::ttnn::typecast(packed, ::tt::tt_metal::DataType::BFLOAT4_B),
+       ::ttnn::experimental::get_weight_mem_configs(
+           &meshDevice, L, E, op->hidden_size(), op->intermediate_size(),
+           hasBias)
+diff --git a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w2_weights.cpp b/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w2_weights.cpp
+--- a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w2_weights.cpp
++++ b/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w2_weights.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include "operations/ccl/prepare_moe_compute_w2_weights.h"
+ 
++#include "ttnn/operations/copy/typecast/typecast.hpp"
++#include "ttnn/operations/core/core.hpp"
+ #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.hpp"
+ 
+ namespace tt::runtime::ttnn::operations::ccl {
+@@ -33,8 +35,10 @@ void run(const ::tt::target::ttnn::PrepareMoEComputeW2WeightsOp *op,
+           : ::ttnn::experimental::prepare_w2_tensor_for_moe_compute(
+                 w2, L, E, op->intermediate_size(), op->hidden_size());
+ 
+-  ::ttnn::Tensor out = ::ttnn::experimental::quantize_weights_via_host(
+-      packed, ::tt::tt_metal::DataType::BFLOAT4_B,
++  // Bfp4_b on the device, whose typecast rounds like the host packer
++  // (bfp4_typecast_rounding.patch): the weights need not go through the host.
++  ::ttnn::Tensor out = ::ttnn::to_memory_config(
++      ::ttnn::typecast(packed, ::tt::tt_metal::DataType::BFLOAT4_B),
+       ::ttnn::experimental::get_weight_mem_configs(
+           &meshDevice, L, E, op->hidden_size(), op->intermediate_size(),
+           hasBias)

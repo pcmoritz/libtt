@@ -595,6 +595,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_ttnn_glue_fusions.patch",
         "//third_party/tt_xla:tt_mlir_strided_borrowed_host_tensors.patch",
         "//third_party/tt_xla:tt_mlir_deduce_moe_layouts_once.patch",
+        "//third_party/tt_xla:tt_mlir_moe_weights_bfp4_on_device.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
