@@ -391,6 +391,24 @@ def test_dynamic_update_slice_wide_constant_window():
     assert_equal(got, want)
 
 
+@pytest.mark.parametrize("dtype", [np.uint8, np.int32])
+def test_dynamic_update_slice_wide_unsplittable_window(dtype):
+    # torch.distributed's object collectives resize a pickled vector: a window
+    # of 668,001 elements into a row of 668,140 at offset 0. No row size divides
+    # both, so the window streams through L1 in pieces.
+    rng = np.random.default_rng(20)
+    base = np.full((1, 668_140), 7, dtype)
+    update = rng.integers(0, 120, (1, 668_001)).astype(dtype)
+
+    def write(base, update):
+        return jax.lax.dynamic_update_slice(base, update, (0, 0))
+
+    got = run(write, base, update)
+    want = np.array(base)
+    want[:, :668_001] = update
+    assert_equal(got, want)
+
+
 def test_state_pool_update():
     # sglang's recurrent state pool: states.at[slots].set(new_states).
     rng = np.random.default_rng(15)

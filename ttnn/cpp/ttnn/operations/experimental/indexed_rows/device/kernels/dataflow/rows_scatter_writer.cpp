@@ -45,6 +45,10 @@ void kernel_main() {
     constexpr std::array<uint32_t, K> strides{ROWS_STRIDES};
     constexpr uint32_t column_bytes = column ? windows[K - 1] * elem_bytes : 0;
     constexpr uint32_t source_bytes = column ? W * column_bytes : 0;  // per position
+    // A column window wider than a piece streams through the stream DFB a piece
+    // at a time (the program factory sizes the entry to kStreamPiece).
+    constexpr uint32_t kStreamPiece = 64 * 1024;
+    constexpr bool stream_window = column && column_bytes > kStreamPiece;
 
     const uint32_t first_page = get_arg(args::first_page);
     const uint32_t num_pages = get_arg(args::num_pages);
@@ -98,7 +102,7 @@ void kernel_main() {
                 const uint32_t index_l1 =
                     stream_index(noc, index, indices, K, index_stride * sizeof(uint32_t), index_shared ? 0 : b, m0, n);
                 uint32_t source_l1 = 0;
-                if constexpr (column) {
+                if constexpr (column && !stream_window) {
                     source_l1 = stream_chunk(noc, stream, source, b, m0 * source_bytes, n * source_bytes);
                 }
                 for (uint32_t i = 0; i < n; ++i) {
@@ -122,18 +126,41 @@ void kernel_main() {
                         uint32_t dst;
                         if constexpr (column) {
                             // A window may straddle chunks (and so batches):
-                            // each chunk takes its part.
+                            // each chunk takes its part. A streamed window has
+                            // [piece_lo, piece_hi) at piece_l1, and only pieces
+                            // that land in this batch are read.
                             uint32_t offset = static_cast<uint32_t>(coords.c[K - 1]) * elem_bytes;
-                            uint32_t src = source_l1 + (i * W + j) * column_bytes;
-                            for (uint32_t left = column_bytes; left > 0;) {
+                            const uint32_t src = source_l1 + (i * W + j) * column_bytes;
+                            uint32_t piece_lo = 0;
+                            uint32_t piece_hi = 0;
+                            uint32_t piece_l1 = 0;
+                            for (uint32_t w = 0; w < column_bytes;) {
                                 const uint32_t room = chunk_bytes - offset % chunk_bytes;
-                                const uint32_t bytes = left < room ? left : room;
+                                const uint32_t bytes = column_bytes - w < room ? column_bytes - w : room;
                                 if (in_batch(row, offset, dst)) {
-                                    apply(dst, src, bytes);
+                                    if constexpr (stream_window) {
+                                        if (w < piece_lo || w + bytes > piece_hi) {
+                                            if (piece_hi != 0) {
+                                                stream.pop_front(1);
+                                            }
+                                            piece_lo = w;
+                                            piece_hi =
+                                                column_bytes - w < kStreamPiece ? column_bytes : w + kStreamPiece;
+                                            piece_l1 = stream_chunk(
+                                                noc, stream, source, b, (m * W + j) * column_bytes + w, piece_hi - w);
+                                        }
+                                        apply(dst, piece_l1 + (w - piece_lo), bytes);
+                                    } else {
+                                        apply(dst, src + w, bytes);
+                                    }
                                 }
                                 offset += bytes;
-                                src += bytes;
-                                left -= bytes;
+                                w += bytes;
+                            }
+                            if constexpr (stream_window) {
+                                if (piece_hi != 0) {
+                                    stream.pop_front(1);
+                                }
                             }
                             continue;
                         }
@@ -170,7 +197,7 @@ void kernel_main() {
                         noc.async_read_barrier();
                     }
                 }
-                if constexpr (column) {
+                if constexpr (column && !stream_window) {
                     stream.pop_front(1);
                 }
                 index.pop_front(1);

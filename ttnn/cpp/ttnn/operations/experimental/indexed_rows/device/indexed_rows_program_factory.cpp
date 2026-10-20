@@ -265,8 +265,16 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
     // the batch is a multiple of the group: a partial group at the end of the
     // buffer would wait for space the writer only frees after the full batch.
     const Split s = split(device, g.table.B * g.pages);
+    // Entries hold chunks of table pages: a column window is copied in from the
+    // stream DFB, so it needs no slack here. A window wider than kStreamPiece
+    // streams through the stream DFB a piece at a time (rows_scatter_writer.cpp).
+    constexpr uint32_t kStreamPiece = 64 * 1024;
+    const uint32_t entry_bytes = align_entry(g.chunk_bytes);
+    const uint32_t window_bytes = params.column ? g.table.column_window * g.elem_bytes : 0;
+    const uint32_t source_entry_bytes =
+        window_bytes > kStreamPiece ? align_entry(kStreamPiece + kEntryAlign) : g.source_entry_bytes;
     constexpr uint32_t kBatchBudget = 512 * 1024;
-    uint32_t batch = std::max<uint32_t>(1, kBatchBudget / g.entry_bytes);
+    uint32_t batch = std::max<uint32_t>(1, kBatchBudget / entry_bytes);
     const uint32_t group = std::min(g.group, batch);
     batch -= batch % group;
     g.compile_time_args["batch"] = batch;
@@ -284,10 +292,10 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
     const TensorParamName OUTPUT{"output"};
 
     Group<DataflowBufferSpec> dataflow_buffers = {
-        {.unique_id = ROWS_DFB, .entry_size = g.entry_bytes, .num_entries = batch},
+        {.unique_id = ROWS_DFB, .entry_size = entry_bytes, .num_entries = batch},
         {.unique_id = INDEX_DFB, .entry_size = g.index_entry_bytes, .num_entries = 1},
-        {.unique_id = STREAM_DFB, .entry_size = g.source_entry_bytes, .num_entries = 1},
-        {.unique_id = SCRATCH_DFB, .entry_size = g.entry_bytes, .num_entries = 1},
+        {.unique_id = STREAM_DFB, .entry_size = source_entry_bytes, .num_entries = 1},
+        {.unique_id = SCRATCH_DFB, .entry_size = entry_bytes, .num_entries = 1},
     };
 
     KernelSpec reader{
