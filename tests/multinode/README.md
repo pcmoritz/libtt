@@ -67,6 +67,10 @@ python "$TEST_DIR/jax_distributed.py" \
   --coordinator "$COORDINATOR" --rank "$RANK"
 ```
 
+To run both processes on one host with several chips, also give each process
+its own chip, for example with `TT_VISIBLE_DEVICES="$RANK"`, and use
+`localhost` and an unused port as `COORDINATOR`.
+
 Use `--enumeration-only` to stop after checking global device IDs and local
 ownership. The full test checks independent local JIT execution, a sharded
 pointwise operation, `psum`, `all_gather`, and `psum_scatter` against NumPy. It
