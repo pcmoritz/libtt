@@ -1,9 +1,8 @@
-"""tt-mlir computes uint8 tensor clamp as int32: ttnn's tensor clamp doesn't
-take uint8. uint8 transposes (at O1 row-major, e.g. before an argmax over axis
-0), pads and argmax run natively; see uint8_permute_regression_test.py,
-uint8_pad_regression_test.py and uint8_argmax_regression_test.py. torch_tpu's
-clamp and hardtanh take this path; the other tests check values around the
-native ones."""
+"""uint8 values through ops tt-mlir used to compute as int32. Transposes (at
+O1 row-major, e.g. before an argmax over axis 0), pads, argmax and tensor
+clamp run natively now; see uint8_permute_regression_test.py,
+uint8_pad_regression_test.py, uint8_argmax_regression_test.py and
+uint8_min_max_regression_test.py."""
 
 import jax
 import jax.numpy as jnp
@@ -27,17 +26,6 @@ def test_transpose_uint8(level, shape):
     x = np.random.default_rng(0).integers(0, 256, shape, dtype=np.uint8)
     got = run(lambda x: jnp.swapaxes(x, -1, -2), level, x)
     np.testing.assert_array_equal(got, np.swapaxes(x, -1, -2))
-
-
-@OPTIMIZATION_LEVELS
-def test_clamp_tensor_bounds_uint8(level):
-    low = np.full_like(X, 2)
-    low[0] = 5
-    high = np.full_like(X, 250)
-    high[1] = 6
-    got = run(lambda low, x, high: jax.lax.clamp(low, x, high), level, low, X, high)
-    assert got.dtype == np.uint8
-    np.testing.assert_array_equal(got, np.minimum(np.maximum(X, low), high))
 
 
 @OPTIMIZATION_LEVELS

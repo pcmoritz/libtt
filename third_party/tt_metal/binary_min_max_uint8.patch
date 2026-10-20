@@ -1,0 +1,146 @@
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp
+@@ -28,9 +28,9 @@
+         case BinaryOpType::GE:
+         case BinaryOpType::EQ:
+         case BinaryOpType::NE: return relational;
+-        case BinaryOpType::REMAINDER:
++        case BinaryOpType::REMAINDER: return float_and_int32_uint32;
+         case BinaryOpType::MAXIMUM:
+-        case BinaryOpType::MINIMUM: return float_and_int32_uint32;
++        case BinaryOpType::MINIMUM: return float_and_int32_uint32_uint8;
+         case BinaryOpType::DIV:
+         case BinaryOpType::FMOD:
+         case BinaryOpType::ISCLOSE: return float_and_int32;
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
+@@ -29,6 +29,9 @@
+ inline constexpr std::array float_and_int32_uint32{
+     DT::BFLOAT16, DT::FLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::INT32, DT::UINT32};
+ 
++inline constexpr std::array float_and_int32_uint32_uint8{
++    DT::BFLOAT16, DT::FLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::INT32, DT::UINT32, DT::UINT8};
++
+ inline constexpr std::array int32_only{DT::INT32};
+ inline constexpr std::array uint32_only{DT::UINT32};
+ 
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
+@@ -1095,6 +1095,7 @@
+         b_data_format == tt::DataFormat::Float32 ||
+         (a_data_format == tt::DataFormat::Int32 && b_data_format == tt::DataFormat::Int32) ||
+         (a_data_format == tt::DataFormat::UInt32 && b_data_format == tt::DataFormat::UInt32) ||
++        (a_data_format == tt::DataFormat::UInt8 && b_data_format == tt::DataFormat::UInt8) ||
+         // Quant and promoted narrow-float SFPU kernels compute on fp32 values in DST.
+         operation_attributes.is_quant_op || promote_narrow_float_inputs;
+ 
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
+@@ -503,7 +503,8 @@
+         case MAXIMUM:
+             if (dtype == DataType::INT32) {
+                 return {"binary_max_int32_tile_init();", "binary_max_int32_tile"};
+-            } else if (dtype == DataType::UINT32) {
++            } else if (dtype == DataType::UINT32 || dtype == DataType::UINT8) {
++                // uint8 is zero-extended in the 32-bit DST.
+                 return {"binary_max_uint32_tile_init();", "binary_max_uint32_tile"};
+             } else {
+                 return {"binary_max_tile_init();", "binary_max_tile"};
+@@ -511,7 +512,7 @@
+         case MINIMUM:
+             if (dtype == DataType::INT32) {
+                 return {"binary_min_int32_tile_init();", "binary_min_int32_tile"};
+-            } else if (dtype == DataType::UINT32) {
++            } else if (dtype == DataType::UINT32 || dtype == DataType::UINT8) {
+                 return {"binary_min_uint32_tile_init();", "binary_min_uint32_tile"};
+             } else {
+                 return {"binary_min_tile_init();", "binary_min_tile"};
+@@ -672,6 +673,12 @@
+         defines["FILL_TILE_WITH_FIRST_ROW"] = "fill_tile_with_first_row";
+         defines["FILL_TILE_WITH_FIRST_ELEMENT"] = "fill_tile_with_first_element<uint32_t>";
+         defines["FILL_WITH_VALUE"] = "fill_with_val<1024, uint32_t>";
++    } else if (dtype == DataType::UINT8) {
++        defines["FILL_TILE_WITH_FIRST_COLUMN_RM"] = "fill_tile_with_first_column_rm_uint8";
++        defines["FILL_TILE_WITH_FIRST_ROW_RM"] = "fill_tile_with_first_row_rm_uint8";
++        defines["FILL_TILE_WITH_FIRST_COLUMN"] = "fill_tile_with_first_column_uint8";
++        defines["FILL_TILE_WITH_FIRST_ROW"] = "fill_tile_with_first_row_uint8";
++        defines["FILL_TILE_WITH_FIRST_ELEMENT"] = "fill_tile_with_first_element_uint8";
+     } else if (dtype == DataType::BFLOAT8_B) {
+         defines["FILL_TILE_WITH_FIRST_COLUMN"] = "fill_tile_with_first_column_bfp8";
+         defines["FILL_TILE_WITH_FIRST_ROW"] = "fill_tile_with_first_row_bfp8";
+@@ -706,6 +713,10 @@
+         defines["FILL_TILE_WITH_FIRST_ROW_B"] = "fill_tile_with_first_row";
+         defines["FILL_TILE_WITH_FIRST_ELEMENT_B"] = "fill_tile_with_first_element<uint32_t>";
+         defines["FILL_WITH_VALUE_B"] = "fill_with_val<1024, uint32_t>";
++    } else if (b_dtype == DataType::UINT8) {
++        defines["FILL_TILE_WITH_FIRST_COLUMN_B"] = "fill_tile_with_first_column_uint8";
++        defines["FILL_TILE_WITH_FIRST_ROW_B"] = "fill_tile_with_first_row_uint8";
++        defines["FILL_TILE_WITH_FIRST_ELEMENT_B"] = "fill_tile_with_first_element_uint8";
+     } else if (b_dtype == DataType::BFLOAT8_B) {
+         defines["FILL_TILE_WITH_FIRST_COLUMN_B"] = "fill_tile_with_first_column_bfp8";
+         defines["FILL_TILE_WITH_FIRST_ROW_B"] = "fill_tile_with_first_row_bfp8";
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
+@@ -518,6 +518,57 @@
+     }
+ }
+ 
++// uint8 tiles: a face row is 16 bytes (4 words), a face 256 bytes.
++FORCE_INLINE void fill_tile_with_first_element_uint8(uint32_t l1_write_ptr) {
++    auto* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_write_ptr);
++    const uint32_t packed = (words[0] & 0xFF) * 0x01010101u;
++    for (uint32_t i = 0; i < 4; ++i) {
++        words[i] = packed;
++    }
++    fill_tile_from_first_face_row(l1_write_ptr, 16);
++}
++
++FORCE_INLINE void fill_tile_with_first_row_uint8(uint32_t l1_write_ptr) {
++    auto* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_write_ptr);
++    // The first rows of faces 0 and 1 down their faces, then faces 0 and 1 over faces 2 and 3.
++    for (uint32_t i = 4; i < 64; ++i) {
++        words[i] = words[i % 4];
++        words[64 + i] = words[64 + i % 4];
++    }
++    for (uint32_t i = 0; i < 128; ++i) {
++        words[128 + i] = words[i];
++    }
++}
++
++FORCE_INLINE void fill_tile_with_first_column_uint8(uint32_t l1_write_ptr, [[maybe_unused]] uint32_t rows = 32) {
++    auto* ptr = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(l1_write_ptr);
++    auto* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_write_ptr);
++    // The left faces' rows from their first bytes, then the left faces copied right.
++    for (uint32_t face_offset = 0; face_offset < 1024; face_offset += 512) {
++        for (uint32_t row_offset = 0; row_offset < 256; row_offset += 16) {
++            const uint32_t packed = ptr[face_offset + row_offset] * 0x01010101u;
++            for (uint32_t i = 0; i < 4; ++i) {
++                words[(face_offset + row_offset) / 4 + i] = packed;
++            }
++        }
++    }
++    copy_left_faces_right(l1_write_ptr, 256);
++}
++
++FORCE_INLINE void fill_tile_with_first_column_rm_uint8(uint32_t ptr_arg, uint32_t row_width) {
++    auto* ptr = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(ptr_arg);
++    for (uint32_t i = 1; i < row_width; i++) {
++        ptr[i] = ptr[0];
++    }
++}
++
++FORCE_INLINE void fill_tile_with_first_row_rm_uint8(uint32_t ptr_arg, uint32_t row_width, uint32_t num_rows) {
++    auto* ptr = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(ptr_arg);
++    for (uint32_t i = row_width; i < num_rows * row_width; i++) {
++        ptr[i] = ptr[i % row_width];
++    }
++}
++
+ FORCE_INLINE void fill_tile_with_first_row_rm_bfloat16(uint32_t ptr_arg, uint32_t row_width, uint32_t num_rows) {
+     const uint32_t row_width_words = row_width >> 1;
+     auto* ptr32 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ptr_arg);
