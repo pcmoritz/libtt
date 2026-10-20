@@ -1,5 +1,9 @@
 #include "cpp/key_value_context.h"
 
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -112,18 +116,38 @@ void RunRank(const mh::ContextPtr &context) {
   context->duplicate()->barrier();
   context->barrier();
 }
+
+void RunRanks(libtt::KeyValueStore first, libtt::KeyValueStore second) {
+  auto task = std::async(std::launch::async, RunRank,
+                         libtt::MakeKeyValueContext(std::move(first), 0, 2));
+  RunRank(libtt::MakeKeyValueContext(std::move(second), 1, 2));
+  task.get();
+}
+
+std::string FreeLocalAddress() {
+  const int fd = socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t size = sizeof(address);
+  Check(bind(fd, reinterpret_cast<sockaddr *>(&address), size) == 0 &&
+        getsockname(fd, reinterpret_cast<sockaddr *>(&address), &size) == 0);
+  close(fd);
+  return "localhost:" + std::to_string(ntohs(address.sin_port));
+}
 } // namespace
 
 int main() {
   try {
     Store store;
-    auto first = libtt::MakeKeyValueContext(store.callbacks(), 0, 2);
-    auto second = libtt::MakeKeyValueContext(store.callbacks(), 1, 2);
-    auto task = std::async(std::launch::async, RunRank, first);
-    RunRank(second);
-    task.get();
+    RunRanks(store.callbacks(), store.callbacks());
     std::cout << "PASS: host coordination, repeated messages, subgroups, and "
                  "context isolation\n";
+    // The client may start before the server listens.
+    const std::string address = FreeLocalAddress();
+    auto client = libtt::MakeTcpKeyValueStore(address, false);
+    RunRanks(libtt::MakeTcpKeyValueStore(address, true), client);
+    std::cout << "PASS: the same over the TCP key-value store\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
