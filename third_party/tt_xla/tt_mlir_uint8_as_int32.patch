@@ -1,15 +1,6 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -1166,7 +1166,7 @@
-   let extraClassDeclaration = [{
-     wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
-       return wa::TTNNOperandsWorkaroundsFactory::
--          createArgMaxOpOperandsWorkarounds();
-+          createArgMaxOpOperandsWorkarounds(getInput().getType());
-     }
- 
-   }];
 @@ -3675,6 +3675,13 @@
  
    let results = (outs AnyRankedTensor:$result);
@@ -37,16 +28,6 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttml
    static TTNNOperandsWorkarounds createConcatOpOperandsWorkarounds(
        mlir::Operation::operand_range inputs, int64_t dim);
  
-@@ -345,7 +348,8 @@
-   createUnaryBitwiseOpOperandsWorkarounds(mlir::Operation *op);
- 
-   // Create workarounds for ArgMax op operands.
--  static TTNNOperandsWorkarounds createArgMaxOpOperandsWorkarounds();
-+  static TTNNOperandsWorkarounds
-+  createArgMaxOpOperandsWorkarounds(RankedTensorType inputType);
- 
-   // Create workarounds for pad op operands.
-   static TTNNOperandsWorkarounds
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
@@ -76,31 +57,6 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
  TTNNOperandsWorkarounds
  TTNNOperandsWorkaroundsFactory::createConcatOpOperandsWorkarounds(
      mlir::Operation::operand_range inputs, int64_t dim) {
-@@ -975,15 +994,22 @@
- }
- 
- // Factory method to create a set of workarounds for ArgMax op operands.
--// Input tensor must have ROW_MAJOR layout.
-+// Input tensor must have ROW_MAJOR layout. Of the integer types, ttnn argmax
-+// only takes int32, uint32 and uint16 inputs, so uint8 is compared as int32.
- // No need for data type workaround for output tensor; only layout workaround is
- // required to match original layout.
- // tt-metal specs:
- // https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/api/ttnn.argmax.html
- TTNNOperandsWorkarounds
--TTNNOperandsWorkaroundsFactory::createArgMaxOpOperandsWorkarounds() {
-+TTNNOperandsWorkaroundsFactory::createArgMaxOpOperandsWorkarounds(
-+    RankedTensorType inputType) {
-   wa::TTNNOperandWorkarounds rowMajorLayoutWorkaround;
-   rowMajorLayoutWorkaround.tensorLayoutWorkaround = Layout::RowMajor;
-+  if (mlir::tt::ttcore::elementTypeToDataType(inputType.getElementType()) ==
-+      mlir::tt::ttcore::DataType::UInt8) {
-+    rowMajorLayoutWorkaround.tensorDataTypeWorkaround =
-+        mlir::tt::ttcore::DataType::Int32;
-+  }
- 
-   wa::TTNNOperandWorkarounds rowMajorLayoutUint32Workaround;
-   rowMajorLayoutUint32Workaround.tensorLayoutWorkaround = Layout::RowMajor;
 diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp

@@ -1,9 +1,9 @@
-"""tt-mlir computes uint8 argmax and tensor clamp as int32: ttnn argmax and the
-tensor clamp don't take uint8. uint8 transposes (at O1 row-major, e.g. before
-an argmax over axis 0) and pads run natively; see
-uint8_permute_regression_test.py and uint8_pad_regression_test.py. torch_tpu's
-argmax, argmin, max/min with dim, clamp, hardtanh and padded uint8 pooling take
-these paths."""
+"""tt-mlir computes uint8 tensor clamp as int32: ttnn's tensor clamp doesn't
+take uint8. uint8 transposes (at O1 row-major, e.g. before an argmax over axis
+0), pads and argmax run natively; see uint8_permute_regression_test.py,
+uint8_pad_regression_test.py and uint8_argmax_regression_test.py. torch_tpu's
+clamp and hardtanh take this path; the other tests check values around the
+native ones."""
 
 import jax
 import jax.numpy as jnp
@@ -19,15 +19,6 @@ def run(f, level, *args):
     device = jax.devices("tt")[0]
     run = jax.jit(f, compiler_options={"optimization_level": level})
     return np.asarray(run(*(jax.device_put(a, device) for a in args)))
-
-
-@OPTIMIZATION_LEVELS
-@pytest.mark.parametrize("axis", [None, 0, 1])
-def test_argmax_argmin_uint8(level, axis):
-    got = run(lambda x: jnp.argmax(x, axis=axis), level, X)
-    np.testing.assert_array_equal(got, np.argmax(X, axis=axis))
-    got = run(lambda x: jnp.argmin(x, axis=axis), level, X)
-    np.testing.assert_array_equal(got, np.argmin(X, axis=axis))
 
 
 @OPTIMIZATION_LEVELS
