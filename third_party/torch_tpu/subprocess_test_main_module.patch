@@ -1,0 +1,14 @@
+diff --git a/tests/subprocess_test_utils.py b/tests/subprocess_test_utils.py
+--- a/tests/subprocess_test_utils.py
++++ b/tests/subprocess_test_utils.py
+@@ -174,7 +174,9 @@
+   if flags.FLAGS.is_parsed():
+     flags.FLAGS(sys.argv)
+ 
+-  absltest.main()
++  # The tests are in the module that defines `mode`: `__main__` when the test
++  # file runs as a script, or the test file's own module when pytest runs it.
++  absltest.main(module=sys.modules[type(mode).__module__])
+ 
+ 
+ class SubprocessTestMixin:

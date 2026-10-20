@@ -109,8 +109,10 @@ bazel test //tests:torch_tpu_test_suite \
 
 Each test file runs in its own pytest process, with its log and JUnit XML in
 `bazel-testlogs/tests/torch_tpu_test_suite/test.outputs/`. The op tests compare
-with CPU instead of GPU golden files, on three samples per op and dtype. Select
-test files or directories with `--test_arg`; other arguments go to pytest:
+with CPU instead of GPU golden files, on three samples per op and dtype. Four
+tests are left out, since their dependencies (torchcomms and tsl's protos) aren't
+on PyPI. Select test files or directories with `--test_arg`; other arguments go
+to pytest:
 
 ```bash
 bazel test //tests:torch_tpu_test_suite --test_arg=tests/compile --test_arg=-x

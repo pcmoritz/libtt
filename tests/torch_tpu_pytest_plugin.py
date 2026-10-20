@@ -1,8 +1,10 @@
 """Pytest plugin that parses absl flags for torch_tpu's tests.
 
 absltest.main() would otherwise do this. Extra flags come from
-$ABSL_TEST_FLAGS. They are parsed again after collection, since test modules
-define their flags when they are imported.
+$TORCH_TPU_ABSL_FLAGS as MODULE:FLAG items, each for the module that defines
+the flag: several modules define flags of the same name, e.g. --test_mode. The
+flags are set again after collection, since test modules define their flags
+when they are imported.
 """
 
 import os
@@ -11,23 +13,24 @@ import shlex
 from absl import flags
 
 
-def _parse_extra_flags():
-    # The flags are for torch_tpu's op tests. A module that defines a flag of
-    # the same name with other values keeps its default.
-    for flag in shlex.split(os.environ.get("ABSL_TEST_FLAGS", "")):
-        try:
-            flags.FLAGS(["pytest", flag], known_only=True)
-        except flags.IllegalFlagValueError:
-            pass
+def _set_module_flags():
+    for item in shlex.split(os.environ.get("TORCH_TPU_ABSL_FLAGS", "")):
+        module, _, flag = item.partition(":")
+        name = flag.lstrip("-").partition("=")[0]
+        if name not in flags.FLAGS:
+            continue
+        defining = flags.FLAGS.find_module_defining_flag(name)
+        if defining == module or defining.endswith("." + module):
+            flags.FLAGS(["pytest", flag])
 
 
 def pytest_configure(config):
     del config
     if not flags.FLAGS.is_parsed():
         flags.FLAGS(["pytest"], known_only=True)
-    _parse_extra_flags()
+    _set_module_flags()
 
 
 def pytest_collection_finish(session):
     del session
-    _parse_extra_flags()
+    _set_module_flags()

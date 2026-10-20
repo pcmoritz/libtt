@@ -11,7 +11,6 @@ JUnit XML are written to the test's undeclared outputs.
 
 import argparse
 import collections
-import fnmatch
 import importlib.util
 import os
 from pathlib import Path
@@ -54,14 +53,13 @@ def _overlay_test_modules(root: Path, overlay: Path) -> None:
             mirrored.symlink_to(path)
 
 
-def _select(root: Path, selections: list[str]) -> list[str]:
+def _select(root: Path, selections: list[str], excludes: list[str]) -> list[str]:
     targets = []
     for selection in selections or ["tests", "src/torch_tpu"]:
         path = root / selection.split("::")[0]
         if path.is_dir():
-            targets += sorted(
-                str(test.relative_to(root)) for test in path.rglob("*_test.py")
-            )
+            tests = (str(test.relative_to(root)) for test in path.rglob("*_test.py"))
+            targets += sorted(test for test in tests if test not in excludes)
         else:
             targets.append(selection)
     return targets
@@ -92,14 +90,14 @@ def main() -> int:
         "--absl-flag",
         action="append",
         default=[],
-        help="absl flag for the tests, e.g. of torch_tpu's op tests; repeatable.",
+        metavar="MODULE:FLAG",
+        help="absl flag for the tests whose MODULE defines it; repeatable.",
     )
     parser.add_argument(
-        "--absl-flag-for",
+        "--exclude",
         action="append",
         default=[],
-        metavar="GLOB:FLAG",
-        help="absl flag for the test files that match GLOB, after the others.",
+        help="Test file to leave out of the directories it is in; repeatable.",
     )
     parser.add_argument(
         "--file-timeout",
@@ -114,7 +112,7 @@ def main() -> int:
     plugin_root = extract_plugin_wheel(plugin_wheel)
     selections = [arg for arg in rest if (root / arg.split("::")[0]).exists()]
     pytest_args = [arg for arg in rest if arg not in selections]
-    targets = _select(root, selections)
+    targets = _select(root, selections, args.exclude)
 
     tmp = Path(os.environ.get("TEST_TMPDIR") or tempfile.mkdtemp())
     out = Path(os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR") or tmp / "outputs")
@@ -134,6 +132,10 @@ def main() -> int:
         + sys.path
     )
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["TORCH_TPU_ABSL_FLAGS"] = shlex.join(args.absl_flag)
+    # Some tests use JAX for Pallas kernels or shardings; keep it off the
+    # device that torch_tpu uses.
+    env["JAX_PLATFORMS"] = "cpu"
 
     print(f"Running {len(targets)} torch_tpu test files on {plugin_wheel.name}")
     totals = collections.Counter()
@@ -141,14 +143,7 @@ def main() -> int:
     for index, target in enumerate(targets, 1):
         name = re.sub(r"[^A-Za-z0-9_.-]", "_", target)
         log_path = out / f"{name}.log"
-        absl_flags = list(args.absl_flag)
-        for item in args.absl_flag_for:
-            pattern, _, flag = item.partition(":")
-            if fnmatch.fnmatch(target.split("::")[0], pattern):
-                absl_flags.append(flag)
-        file_env = dict(
-            env, TEST_TMPDIR=str(tmp / name), ABSL_TEST_FLAGS=shlex.join(absl_flags)
-        )
+        file_env = dict(env, TEST_TMPDIR=str(tmp / name))
         Path(file_env["TEST_TMPDIR"]).mkdir(parents=True, exist_ok=True)
         command = [
             sys.executable,

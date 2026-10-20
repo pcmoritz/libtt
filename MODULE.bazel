@@ -84,10 +84,12 @@ http_archive(
 http_archive(
     name = "torch_tpu_src",
     build_file = "//third_party/torch_tpu:BUILD.overlay.bazel",
+    patch_args = ["-p1"],
     patch_cmds = [
-        "find docs examples src tests \\( -name BUILD -o -name BUILD.bazel \\) -delete",
+        "find docs examples perflab src tests \\( -name BUILD -o -name BUILD.bazel \\) -delete",
         "rm REPO.bazel",
     ],
+    patches = ["//third_party/torch_tpu:subprocess_test_main_module.patch"],
     sha256 = "a2b630a5a7ae1fbb27aac732f16a14f60173b6e927711dca5b91259052a1b81f",
     strip_prefix = "torch_tpu-0.2.0",
     urls = [
