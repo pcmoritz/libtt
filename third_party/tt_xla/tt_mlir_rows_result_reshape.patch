@@ -1,0 +1,21 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+@@ -266,6 +266,17 @@ static bool keepsRowMajor(Operation *op) {
+       keepAllGatherRowMajor(op)) {
+     return true;
+   }
++  // A rows op's result can be single rows, e.g. [Bi, M, R] with M = 1, which
++  // tiles would pad 32 times: reshape it before tiling instead. A returned
++  // reshape keeps the output layout, which a traced program needs on device.
++  if (auto reshape = mlir::dyn_cast<ttir::ReshapeOp>(op)) {
++    Operation *input = reshape.getInput().getDefiningOp();
++    if (mlir::isa_and_present<ttir::RowsGatherOp, ttir::RowsScatterOp>(input) &&
++        llvm::none_of(reshape->getUsers(),
++                      [](Operation *user) { return isa<func::ReturnOp>(user); })) {
++      return true;
++    }
++  }
+   if (mlir::isa<ttir::ReshapeOp, ttir::PermuteOp, ttir::ConcatOp>(op)) {
+     return !op->use_empty() && llvm::all_of(op->getUses(), feedsRowsOp);
+   }

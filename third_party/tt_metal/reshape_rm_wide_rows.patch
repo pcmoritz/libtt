@@ -1,0 +1,49 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
+@@ -106,13 +106,24 @@
+     // Split wide input rows across cores. Each chunk must contain whole output
+     // rows and start at a 64-byte boundary so the existing copy kernel can read
+     // it independently without sharing output pages with another core.
++    auto valid_chunks = [&](uint32_t chunks) {
++        return source_page_size_bytes % chunks == 0 && (source_page_size_bytes / chunks) % 64 == 0 &&
++               (source_page_size_bytes / chunks) % dest_page_size_bytes == 0;
++    };
+     uint32_t source_chunks = std::max(1u, num_cores_total / input_log_shape[-2]);
+-    while (source_chunks > 1 &&
+-           (source_page_size_bytes % source_chunks != 0 ||
+-            (source_page_size_bytes / source_chunks) % 64 != 0 ||
+-            (source_page_size_bytes / source_chunks) % dest_page_size_bytes != 0)) {
++    while (source_chunks > 1 && !valid_chunks(source_chunks)) {
+         --source_chunks;
+     }
++    // A chunk is staged whole in L1, twice per kernel, so rows that are still too wide (a flattened
++    // [1, N] buffer) are split further and each core copies several chunks.
++    constexpr uint32_t max_chunk_bytes = 64 * 1024;
++    for (uint32_t chunks = source_chunks + 1;
++         source_page_size_bytes / source_chunks > max_chunk_bytes && chunks <= source_page_size_bytes / 64;
++         ++chunks) {
++        if (valid_chunks(chunks)) {
++            source_chunks = chunks;
++        }
++    }
+     source_page_size_bytes /= source_chunks;
+     const uint32_t input_pages = input_log_shape[-2] * source_chunks;
+     uint32_t source_read_size_bytes = ((source_page_size_bytes - 1) & MASK_64) + 128;
+@@ -139,9 +150,14 @@
+     // but doesn't affect the size of writes hitting DRAM.
+     const bool can_use_dual_kernel = pages_divisible && (dest_noc_aligned || !dst_buffer->is_dram());
+ 
++    // With 16-byte aligned pages the kernel writes straight from the source DFB and never touches the dest
++    // staging DFB, which would otherwise hold a whole, possibly huge, destination page.
++    const bool can_be_clean = source_page_size_bytes % 16 == 0 && dest_page_size_bytes % 16 == 0;
+     const uint32_t num_dest_write_slots =
+-        choose_num_dest_write_slots(device, pages_noc_aligned, can_use_dual_kernel, dfb_size0, dest_slot_size_bytes);
+-    const uint32_t dfb_size1 = dest_slot_size_bytes * num_dest_write_slots;
++        can_be_clean ? 1u
++                     : choose_num_dest_write_slots(
++                           device, pages_noc_aligned, can_use_dual_kernel, dfb_size0, dest_slot_size_bytes);
++    const uint32_t dfb_size1 = can_be_clean ? 64u : dest_slot_size_bytes * num_dest_write_slots;
+ 
+     const uint32_t write_alignment =
+         dst_buffer->is_dram() ? tt::tt_metal::hal::get_dram_alignment() : tt::tt_metal::hal::get_l1_alignment();
