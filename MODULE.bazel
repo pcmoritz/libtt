@@ -644,6 +644,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_conv_window_reversal.patch",
         "//third_party/tt_xla:tt_mlir_pool_base_dilation.patch",
         "//third_party/tt_xla:tt_mlir_pool_large_padding.patch",
+        "//third_party/tt_xla:tt_mlir_avg_pool_float_divisor.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
