@@ -1,0 +1,16 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -137,7 +137,11 @@
+ 
+ UnaryOpType RoundOp::getUnaryOpType() { return UnaryOpType::Round; }
+ 
+-llvm::SmallVector<mlir::FloatAttr> RoundOp::getParams() { return {}; }
++// A fused ROUND activation takes the number of decimals, and ttnn.round rounds
++// to integers.
++llvm::SmallVector<mlir::FloatAttr> RoundOp::getParams() {
++  return {mlir::FloatAttr::get(mlir::Float32Type::get(getContext()), 0.0)};
++}
+ 
+ UnaryOpType GeluOp::getUnaryOpType() { return UnaryOpType::Gelu; }
+ 
