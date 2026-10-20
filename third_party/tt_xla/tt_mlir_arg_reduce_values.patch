@@ -1,0 +1,101 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -314,11 +314,22 @@
+ 
+     if (srcOp.getInputs().size() > 1) {
+       if (isArgMax(srcOp, adaptor, rewriter)) {
+-        return matchAndRewriteInternalArgMax(
+-            srcOp, adaptor.getInputs().front(), rewriter);
++        FailureOr<mlir::Value> input = combineInitIntoInput<ttir::MaximumOp>(
++            srcOp, adaptor, TypicalInitReductionValue::NEG_INF, rewriter);
++        if (failed(input)) {
++          return failure();
++        }
++        replaceUsedValues<ttir::MaxOp>(srcOp, *input, rewriter);
++        return matchAndRewriteInternalArgMax(srcOp, *input, rewriter);
+       }
+       if (isArgMin(srcOp, adaptor, rewriter)) {
+-        return matchAndRewriteInternalArgMin(srcOp, adaptor, rewriter);
++        FailureOr<mlir::Value> input = combineInitIntoInput<ttir::MinimumOp>(
++            srcOp, adaptor, TypicalInitReductionValue::POS_INF, rewriter);
++        if (failed(input)) {
++          return failure();
++        }
++        replaceUsedValues<ttir::MinOp>(srcOp, *input, rewriter);
++        return matchAndRewriteInternalArgMin(srcOp, *input, rewriter);
+       }
+       return matchAndRewriteSeparable(srcOp, adaptor, rewriter);
+     }
+@@ -559,6 +570,49 @@
+     return success();
+   }
+ 
++  // The init value takes part in the reduction. Unless it is the identity
++  // (e.g. torch_tpu's lowest finite float instead of -inf), combine it into
++  // every input element: the maximum (minimum) then includes it, and where the
++  // init would win, every element equals it, so the smaller index 0 wins as it
++  // does in the reduce.
++  template <typename CombineOp>
++  FailureOr<mlir::Value>
++  combineInitIntoInput(mlir::stablehlo::ReduceOp &srcOp,
++                       mlir::stablehlo::ReduceOp::Adaptor &adaptor,
++                       TypicalInitReductionValue identity,
++                       ConversionPatternRewriter &rewriter) const {
++    mlir::Value input = adaptor.getInputs().front();
++    if (verifyInitValue(srcOp.getInitValues().front(), identity)) {
++      return input;
++    }
++    auto inputType = mlir::cast<RankedTensorType>(input.getType());
++    mlir::Value init;
++    if (failed(ttir::utils::broadcastValue(
++            rewriter, adaptor.getInitValues().front(), inputType, init,
++            srcOp.getLoc(), /*frontUnsqueeze=*/false))) {
++      return rewriter.notifyMatchFailure(
++          srcOp, "reduce init value is not broadcastable");
++    }
++    return rewriter.create<CombineOp>(srcOp.getLoc(), inputType, input, init)
++        .getResult();
++  }
++
++  // ttir.argmax and ttir.argmin return only the indices. When the reduced
++  // values are used too, e.g. by torch.max(x, dim), reduce them separately.
++  template <typename ReductionOp>
++  void replaceUsedValues(mlir::stablehlo::ReduceOp &srcOp, mlir::Value input,
++                         ConversionPatternRewriter &rewriter) const {
++    if (srcOp.getResult(0).use_empty()) {
++      return;
++    }
++    auto outputType = mlir::cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getResult(0).getType()));
++    mlir::ArrayAttr dimArg = rewriter.getI32ArrayAttr(
++        llvm::SmallVector<int32_t>(srcOp.getDimensions()));
++    srcOp.getResult(0).replaceAllUsesWith(rewriter.create<ReductionOp>(
++        srcOp.getLoc(), outputType, input, /*keep_dim=*/false, dimArg));
++  }
++
+   LogicalResult
+   matchAndRewriteInternalArgMax(mlir::stablehlo::ReduceOp &srcOp,
+                                 mlir::Value input,
+@@ -591,9 +645,8 @@
+ 
+   LogicalResult
+   matchAndRewriteInternalArgMin(mlir::stablehlo::ReduceOp &srcOp,
+-                                mlir::stablehlo::ReduceOp::Adaptor &adaptor,
++                                mlir::Value input,
+                                 ConversionPatternRewriter &rewriter) const {
+-    mlir::Value input = adaptor.getInputs().front();
+     auto inputType = mlir::cast<RankedTensorType>(input.getType());
+     mlir::Type elementType = inputType.getElementType();
+     mlir::Value reversedInput;
+@@ -728,8 +781,8 @@
+       return false;
+     }
+ 
+-    if (!results.front().getUsers().empty() ||
+-        results.back().getUsers().empty()) {
++    // The values result may be used too; see replaceUsedValues.
++    if (results.back().getUsers().empty()) {
+       return false;
+     }
+     return true;

@@ -1,0 +1,87 @@
+diff --git a/pjrt_implementation/inc/api/buffer_instance.h b/pjrt_implementation/inc/api/buffer_instance.h
+--- a/pjrt_implementation/inc/api/buffer_instance.h
++++ b/pjrt_implementation/inc/api/buffer_instance.h
+@@ -208,8 +208,9 @@
+ 
+   // Calculates required tensor strides.
+   static std::vector<std::int64_t>
+-  calculateStrides(size_t num_dims, const std::int64_t *byte_strides,
+-                   size_t num_byte_strides, std::uint32_t element_size);
++  calculateStrides(const std::int64_t *dims, size_t num_dims,
++                   const std::int64_t *byte_strides, size_t num_byte_strides,
++                   std::uint32_t element_size);
+ 
+   // Gets next UID for buffer instances, used in buffer instance constructor
+   // to assign unique identifier to each buffer instance.
+diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
+--- a/pjrt_implementation/src/api/buffer_instance.cc
++++ b/pjrt_implementation/src/api/buffer_instance.cc
+@@ -250,7 +250,8 @@
+   std::vector<std::uint32_t> shape =
+       calculateShape(dims, num_dims, m_data_type);
+   std::vector<std::int64_t> strides =
+-      calculateStrides(num_dims, byte_strides, num_byte_strides, element_size);
++      calculateStrides(dims, num_dims, byte_strides, num_byte_strides,
++                       element_size);
+ 
+   // A buffer is treated as contiguous if it is a complex dtype (its `shape`
+   // carries an extra trailing dim with no matching `byte_strides` entry) or
+@@ -357,8 +358,10 @@
+   std::vector<std::uint32_t> shape = calculateShape(
+       src_buffer->getDimensionsRaw(), src_buffer->getNumberOfDimensions(),
+       src_buffer->getDataType());
+-  std::vector<std::int64_t> strides = calculateStrides(
+-      src_buffer->getNumberOfDimensions(), nullptr, 0, element_size);
++  std::vector<std::int64_t> strides =
++      calculateStrides(src_buffer->getDimensionsRaw(),
++                       src_buffer->getNumberOfDimensions(), nullptr, 0,
++                       element_size);
+ 
+   tt::runtime::Tensor runtime_tensor = tt::runtime::createOwnedHostTensor(
+       /* data= */ nullptr, shape, strides, element_size, runtime_data_type);
+@@ -381,8 +384,9 @@
+       tt::runtime::utils::dataTypeElementSize(runtime_data_type);
+   std::vector<std::uint32_t> shape =
+       calculateShape(getDimensionsRaw(), getNumberOfDimensions(), m_data_type);
+-  std::vector<std::int64_t> strides = calculateStrides(
+-      getNumberOfDimensions(), byte_strides, num_byte_strides, element_size);
++  std::vector<std::int64_t> strides =
++      calculateStrides(getDimensionsRaw(), getNumberOfDimensions(),
++                       byte_strides, num_byte_strides, element_size);
+ 
+   // Allocate an owned host tensor without copying any data in. The contents are
+   // written later by a compiled program (the runtime transfers it to device
+@@ -413,23 +417,24 @@
+ }
+ 
+ std::vector<std::int64_t> BufferInstance::calculateStrides(
+-    size_t num_dims, const std::int64_t *byte_strides, size_t num_byte_strides,
+-    std::uint32_t element_size) {
++    const std::int64_t *dims, size_t num_dims, const std::int64_t *byte_strides,
++    size_t num_byte_strides, std::uint32_t element_size) {
+ 
+   TT_FATAL(num_byte_strides == 0 || num_byte_strides == num_dims,
+            "num_byte_strides must be 0 or equal to num_dims: "
+            "num_byte_strides={}, num_dims={}",
+            num_byte_strides, num_dims);
+ 
+-  std::vector<std::int64_t> strides;
+-  for (size_t i = 0; i < num_dims; ++i) {
+-    // If no strides are given the array is assumed to have a dense layout with
+-    // dimensions in major-to-minor order.
+-    std::int64_t stride =
++  std::vector<std::int64_t> strides(num_dims);
++  // If no strides are given the array is assumed to have a dense layout with
++  // dimensions in major-to-minor order.
++  std::int64_t dense_stride = 1;
++  for (size_t i = num_dims; i-- > 0;) {
++    strides[i] =
+         num_byte_strides == 0
+-            ? 1
++            ? dense_stride
+             : (byte_strides[i] / static_cast<std::int64_t>(element_size));
+-    strides.push_back(stride);
++    dense_stride *= dims[i];
+   }
+ 
+   return strides;

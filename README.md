@@ -26,6 +26,11 @@ The wheel contains `libtt.so` and libtt's JAX initialization hook.
 See [Qwen3-8B on two QuietBox chips](docs/qwen3-8b-quietbox-tp2.md) for the
 single-process TP2 launch recipe and multi-chip regression tests.
 
+## PyTorch
+
+See [PyTorch with torch_tpu](docs/torch-tpu.md): with `LIBTT_TPU_COMPAT=1`,
+torch_tpu runs on Tenstorrent devices through `libtt.so`.
+
 ## JAX tests
 
 Run the upstream JAX smoke tests against this checkout's plugin wheel:

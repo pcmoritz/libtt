@@ -1,0 +1,18 @@
+diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+--- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
++++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+@@ -53,6 +53,14 @@
+ 
+ void createStableHLOToTTIRPipeline(
+     OpPassManager &pm, const StableHLOToTTIRPipelineOptions &options) {
++  // Older frontends, such as torch_tpu, emit deprecated ops that have direct
++  // replacements, e.g. stablehlo.broadcast and stablehlo.dot.
++  ::mlir::stablehlo::StablehloLegalizeDeprecatedOpsPassOptions
++      deprecatedOpsOptions;
++  deprecatedOpsOptions.failOnUnusedOps = false;
++  pm.addNestedPass<func::FuncOp>(
++      ::mlir::stablehlo::createStablehloLegalizeDeprecatedOpsPass(
++          deprecatedOpsOptions));
+   if (options.arithDialectConversionsEnabled) {
+     pm.addPass(createConvertArithToStableHLOPass());
+   }

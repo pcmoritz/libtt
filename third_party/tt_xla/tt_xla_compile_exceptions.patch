@@ -1,0 +1,27 @@
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -967,10 +967,19 @@
+ 
+   // A bare status code would not say why compilation failed.
+   ScopedErrorCollector compile_errors;
+-  tt_pjrt_status compile_status = client_instance->compileMlirProgram(
+-      args->program,
+-      reinterpret_cast<LoadedExecutableInstance **>(&args->executable),
+-      compile_options_map, replica_device_ids, target_num_devices);
++  tt_pjrt_status compile_status;
++  // Unsupported programs (e.g. with dynamic shapes) fail with an exception,
++  // which must not escape the C API: frameworks often compile on their own
++  // threads, where it would terminate the process.
++  try {
++    compile_status = client_instance->compileMlirProgram(
++        args->program,
++        reinterpret_cast<LoadedExecutableInstance **>(&args->executable),
++        compile_options_map, replica_device_ids, target_num_devices);
++  } catch (const std::exception &error) {
++    return *ErrorInstance::makeError(tt_pjrt_status::kInternal, error.what())
++                .release();
++  }
+   if (!tt_pjrt_status_is_ok(compile_status) && !compile_errors.errors.empty()) {
+     return *ErrorInstance::makeError(compile_status, compile_errors.errors)
+                 .release();

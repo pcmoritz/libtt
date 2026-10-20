@@ -404,6 +404,8 @@ http_archive(
 http_archive(
     name = "stablehlo",
     sha256 = "f1620aafc2b6d730e2ee9c33b35a59a2656a11eed10b1ef8049f175eb4fbdd9c",
+    patch_args = ["-p1"],
+    patches = ["//third_party/stablehlo:stablehlo_composite_v2.patch"],
     strip_prefix = "stablehlo-0a4440a5c8de45c4f9649bf3eb4913bf3f97da0d",
     urls = [
         "https://github.com/openxla/stablehlo/archive/0a4440a5c8de45c4f9649bf3eb4913bf3f97da0d.zip",
@@ -449,6 +451,11 @@ git_repository(
         "//third_party/tt_xla:tt_xla_cached_input_layouts.patch",
         "//third_party/tt_xla:tt_xla_enable_eltwise_activation_fusion.patch",
         "//third_party/tt_xla:tt_xla_strided_borrowed_host_buffers.patch",
+        "//third_party/tt_xla:tt_xla_dense_default_strides.patch",
+        "//third_party/tt_xla:tt_xla_process_wide_client.patch",
+        "//third_party/tt_xla:tt_xla_copy_until_transfer_completes.patch",
+        "//third_party/tt_xla:tt_xla_host_memory_allocator.patch",
+        "//third_party/tt_xla:tt_xla_compile_exceptions.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -597,6 +604,14 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_strided_borrowed_host_tensors.patch",
         "//third_party/tt_xla:tt_mlir_deduce_moe_layouts_once.patch",
         "//third_party/tt_xla:tt_mlir_moe_weights_bfp4_on_device.patch",
+        "//third_party/tt_xla:tt_mlir_legalize_deprecated_ops.patch",
+        "//third_party/tt_xla:tt_mlir_chlo_scan.patch",
+        "//third_party/tt_xla:tt_mlir_loop_state_layouts.patch",
+        "//third_party/tt_xla:tt_mlir_torch_tpu_argmax.patch",
+        "//third_party/tt_xla:tt_mlir_f64_constants.patch",
+        "//third_party/tt_xla:tt_mlir_sort_int64_keys.patch",
+        "//third_party/tt_xla:tt_mlir_arg_reduce_values.patch",
+        "//third_party/tt_xla:tt_mlir_sigmoid_integer_input.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

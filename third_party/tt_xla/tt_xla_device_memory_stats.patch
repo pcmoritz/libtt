@@ -62,7 +62,25 @@ diff --git a/pjrt_implementation/inc/api/memory_instance.h b/pjrt_implementation
 diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementation/src/api/device_instance.cc
 --- a/pjrt_implementation/src/api/device_instance.cc
 +++ b/pjrt_implementation/src/api/device_instance.cc
-@@ -41,6 +41,9 @@ void DeviceInstance::bindApi(PJRT_Api *api) {
+@@ -10,10 +10,17 @@
+ 
+ #include "api/device_instance.h"
+ 
++// c++ standard library includes
++#include <optional>
++
++// tt-mlir includes
++#include "tt/runtime/runtime.h"
++
+ // tracy includes
+ #include "tracy/Tracy.hpp"
+ 
+ // tt-xla includes
++#include "api/client_instance.h"
+ #include "api/memory_instance.h"
+ #include "utils/logging.h"
+ 
+@@ -41,6 +48,9 @@ void DeviceInstance::bindApi(PJRT_Api *api) {
    api->PJRT_Device_LocalHardwareId = internal::onDeviceLocalHardwareId;
    api->PJRT_Device_AddressableMemories = internal::onDeviceAddressableMemories;
    api->PJRT_Device_DefaultMemory = internal::onDeviceDefaultMemory;
@@ -72,7 +90,7 @@ diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementatio
  }
  
  namespace internal {
-@@ -96,6 +99,58 @@ PJRT_Error *onDeviceDefaultMemory(PJRT_Device_DefaultMemory_Args *args) {
+@@ -96,6 +106,77 @@ PJRT_Error *onDeviceDefaultMemory(PJRT_Device_DefaultMemory_Args *args) {
    return nullptr;
  };
  
@@ -97,7 +115,24 @@ diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementatio
 +  const uint64_t dram_size_bytes =
 +      DeviceInstance::unwrap(args->device)->getDramSizeBytes();
 +
-+  args->bytes_in_use = 0;
++  // DRAM allocated on the open mesh. Tensors stay on the host until a program
++  // uses them, so this counts device-resident tensors only. The allocator
++  // keeps no peaks, so those stay unset.
++  int64_t bytes_in_use = 0;
++  std::optional<int64_t> largest_free_block_bytes;
++  ClientInstance *client = GlobalClientInstanceSingleton::getClientInstance();
++  if (client && client->parentMesh()) {
++    auto views = tt::runtime::getMemoryView(*client->parentMesh());
++    auto dram = views.find(tt::runtime::MemoryBufferType::DRAM);
++    if (dram != views.end()) {
++      const tt::runtime::MemoryView &view = dram->second;
++      bytes_in_use = view.numBanks * view.totalBytesAllocatedPerBank;
++      largest_free_block_bytes =
++          view.numBanks * view.largestContiguousBytesFreePerBank;
++    }
++  }
++
++  args->bytes_in_use = bytes_in_use;
 +  args->peak_bytes_in_use = 0;
 +  args->peak_bytes_in_use_is_set = false;
 +  args->num_allocs = 0;
@@ -107,17 +142,19 @@ diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementatio
 +  args->bytes_limit = static_cast<int64_t>(dram_size_bytes);
 +  args->bytes_limit_is_set = dram_size_bytes > 0;
 +  args->bytes_reserved = 0;
-+  args->bytes_reserved_is_set = false;
++  args->bytes_reserved_is_set = true;
 +  args->peak_bytes_reserved = 0;
 +  args->peak_bytes_reserved_is_set = false;
 +  args->bytes_reservable_limit = 0;
 +  args->bytes_reservable_limit_is_set = false;
-+  args->largest_free_block_bytes = 0;
-+  args->largest_free_block_bytes_is_set = false;
++  args->largest_free_block_bytes = largest_free_block_bytes.value_or(0);
++  args->largest_free_block_bytes_is_set = largest_free_block_bytes.has_value();
 +  args->pool_bytes = 0;
 +  args->pool_bytes_is_set = false;
 +  args->peak_pool_bytes = 0;
 +  args->peak_pool_bytes_is_set = false;
++  args->peak_allocated_bytes = 0;
++  args->peak_allocated_bytes_is_set = false;
 +
 +  return nullptr;
 +}

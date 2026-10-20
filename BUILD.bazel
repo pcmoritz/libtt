@@ -13,8 +13,18 @@ exports_files([
 
 py_library(
     name = "jax_plugin",
-    srcs = ["python/jax_plugins/libtt/__init__.py"],
+    srcs = [
+        "python/jax_plugins/libtt/__init__.py",
+        "python/jax_plugins/libtt/tpu_compat.py",
+    ],
     imports = ["python"],
+)
+
+# Imports jax_plugins.libtt.tpu_compat at interpreter startup when
+# LIBTT_TPU_COMPAT is set, so that torch_tpu runs on libtt.
+filegroup(
+    name = "tpu_compat_pth",
+    srcs = ["python/libtt_tpu_compat.pth"],
 )
 
 cc_library(
@@ -100,5 +110,6 @@ py_wheel(
     deps = [
         ":jax_plugin",
         ":jax_plugin_shared_library",
+        ":tpu_compat_pth",
     ],
 )

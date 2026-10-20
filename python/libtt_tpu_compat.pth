@@ -1,0 +1,1 @@
+import os; os.environ.get("LIBTT_TPU_COMPAT", "0") not in ("", "0") and __import__("jax_plugins.libtt.tpu_compat")

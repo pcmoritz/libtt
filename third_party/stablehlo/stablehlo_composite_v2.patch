@@ -1,0 +1,129 @@
+diff --git a/stablehlo/dialect/Version.h b/stablehlo/dialect/Version.h
+--- a/stablehlo/dialect/Version.h
++++ b/stablehlo/dialect/Version.h
+@@ -38,7 +38,7 @@
+   static FailureOr<Version> fromString(llvm::StringRef versionRef);
+ 
+   /// Return a Version representing the current VHLO dialect version.
+-  static Version getCurrentVersion() { return Version(1, 13, 1); }
++  static Version getCurrentVersion() { return Version(1, 14, 0); }
+ 
+   /// Return a Version representing the minimum supported VHLO dialect version.
+   static Version getMinimumVersion() { return Version(0, 9, 0); }
+diff --git a/stablehlo/dialect/VhloDialect.td b/stablehlo/dialect/VhloDialect.td
+--- a/stablehlo/dialect/VhloDialect.td
++++ b/stablehlo/dialect/VhloDialect.td
+@@ -52,6 +52,7 @@
+       1.11.0: Allow (de)serializing VHLO programs mixed with potentially unstable dialects.
+       1.12.0: Add `source_target_pairs` attribute to `send` and `recv` ops.
+       1.13.0: Extend `custom_call` op to support `buffer` types.
++      1.14.0: Introduce `composite` op with regions.
+   }];
+ 
+   let useDefaultAttributePrinterParser = 0;
+diff --git a/stablehlo/dialect/VhloOps.td b/stablehlo/dialect/VhloOps.td
+--- a/stablehlo/dialect/VhloOps.td
++++ b/stablehlo/dialect/VhloOps.td
+@@ -337,6 +337,21 @@
+   let results = (outs Variadic<VHLO_AnyType>:$results);
+ }
+ 
++// Read-only backport: newer frameworks serialize composites as composite_v2.
++// VhloLegalizeToStablehlo turns it back into composite_v1, dropping the
++// regions; the decomposition function still holds the implementation.
++def VHLO_CompositeOpV2 : VHLO_Op<"composite_v2", "1.14.0", "current"> {
++  let arguments = (ins
++    Variadic<VHLO_AnyType>:$inputs,
++    VHLO_AnyAttr:$name,
++    VHLO_AnyAttr:$composite_attributes,
++    VHLO_AnyAttr:$decomposition,
++    VHLO_AnyAttr:$version
++  );
++  let regions = (region VariadicRegion<VHLO_AnyRegion>:$composite_regions);
++  let results = (outs Variadic<VHLO_AnyType>:$results);
++}
++
+ def VHLO_ConcatenateOpV1 : VHLO_Op<"concatenate_v1", "0.9.0", "current"> {
+   let arguments = (ins
+     Variadic<VHLO_AnyType>:$inputs,
+diff --git a/stablehlo/transforms/VhloLegalizeToStablehlo.cpp b/stablehlo/transforms/VhloLegalizeToStablehlo.cpp
+--- a/stablehlo/transforms/VhloLegalizeToStablehlo.cpp
++++ b/stablehlo/transforms/VhloLegalizeToStablehlo.cpp
+@@ -20,6 +20,7 @@
+ #include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/ADT/StringSet.h"
++#include "llvm/ADT/StringSwitch.h"
+ #include "llvm/Support/AllocatorBase.h"
+ #include "llvm/Support/Casting.h"
+ #include "llvm/Support/Debug.h"
+@@ -1072,6 +1073,30 @@
+ 
+ }  // namespace
+ 
++// Returns the op of a scan body that only combines its two arguments, e.g.
++// "add" for `^bb0(%a, %b): %r = vhlo.add_v1(%b, %a); vhlo.return_v1(%r, %r)`,
++// or an empty string for any other body.
++static StringRef getScanCombiner(Region& body) {
++  if (!body.hasOneBlock()) return {};
++  Block& block = body.front();
++  if (block.getNumArguments() != 2 || !llvm::hasNItems(block, 2)) return {};
++  Operation& combine = block.front();
++  if (combine.getNumOperands() != 2 || combine.getNumResults() != 1 ||
++      !llvm::is_contained(combine.getOperands(), block.getArgument(0)) ||
++      !llvm::is_contained(combine.getOperands(), block.getArgument(1)))
++    return {};
++  if (!llvm::all_of(block.getTerminator()->getOperands(), [&](Value value) {
++        return value == combine.getResult(0);
++      }))
++    return {};
++  return llvm::StringSwitch<StringRef>(combine.getName().getStringRef())
++      .Case("vhlo.add_v1", "add")
++      .Case("vhlo.multiply_v1", "multiply")
++      .Case("vhlo.maximum_v1", "maximum")
++      .Case("vhlo.minimum_v1", "minimum")
++      .Default({});
++}
++
+ struct VhloLegalizeToStablehloPass
+     : public impl::VhloLegalizeToStablehloPassBase<
+           VhloLegalizeToStablehloPass> {
+@@ -1090,6 +1115,38 @@
+   }
+ 
+   void runOnOperation() override {
++    // StableHLO composites have no regions yet, so drop the regions of
++    // composite_v2 and keep its decomposition function. A chlo.scan body that
++    // just combines its two arguments is kept as the composite attribute
++    // "tt.scan_combiner", so that it can still run as a cumulative op.
++    SmallVector<vhlo::CompositeOpV2> compositesV2;
++    getOperation()->walk(
++        [&](vhlo::CompositeOpV2 op) { compositesV2.push_back(op); });
++    IRRewriter rewriter(&getContext());
++    for (vhlo::CompositeOpV2 op : compositesV2) {
++      Attribute compositeAttrs = op.getCompositeAttributes();
++      auto name = dyn_cast<vhlo::StringV1Attr>(op.getName());
++      auto attrs = dyn_cast<vhlo::DictionaryV1Attr>(compositeAttrs);
++      if (name && name.getValue() == "chlo.scan" && attrs &&
++          op.getCompositeRegions().size() == 1) {
++        StringRef combiner = getScanCombiner(op.getCompositeRegions().front());
++        if (!combiner.empty()) {
++          SmallVector<std::pair<Attribute, Attribute>> entries(
++              attrs.getValue());
++          entries.push_back(
++              {vhlo::StringV1Attr::get(&getContext(), "tt.scan_combiner"),
++               vhlo::StringV1Attr::get(&getContext(), combiner)});
++          compositeAttrs = vhlo::DictionaryV1Attr::get(&getContext(), entries);
++        }
++      }
++      rewriter.setInsertionPoint(op);
++      DictionaryAttr discardableAttrs = op->getDiscardableAttrDictionary();
++      auto newOp = rewriter.replaceOpWithNewOp<vhlo::CompositeOpV1>(
++          op, op->getResultTypes(), op.getInputs(), op.getName(),
++          compositeAttrs, op.getDecomposition(), op.getVersion());
++      newOp->setDiscardableAttrs(discardableAttrs);
++    }
++
+     // Upgraded VHLO should always be convertible to StableHLO.
+     // Arbitrary VHLO might not be convertible if it uses deprecated features
+     // which are no longer available in StableHLO.

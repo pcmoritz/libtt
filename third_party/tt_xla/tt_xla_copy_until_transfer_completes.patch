@@ -1,0 +1,22 @@
+diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
+--- a/pjrt_implementation/src/api/buffer_instance.cc
++++ b/pjrt_implementation/src/api/buffer_instance.cc
+@@ -276,6 +276,9 @@
+   //   host buffer directly, so we create an owned host tensor which copies
+   //   buffer data. In JAX this semantic is used only for copying scalars and
+   //   numpy arrays, so the copy shouldn't take long.
++  // - For `ImmutableUntilTransferCompletes` semantics the caller may free the
++  //   host buffer once the device buffer is ready, which is immediately, since
++  //   the data only moves to the device at execution. So we copy it too.
+   // - For unsupported runtime dtypes, we must create an owned tensor as runtime
+   //   must cast the data into a supported data type; the buffer cannot be
+   //   borrowed.
+@@ -286,6 +289,8 @@
+   bool cannot_borrow_host_buffer =
+       host_buffer_semantics ==
+           PJRT_HostBufferSemantics_kImmutableOnlyDuringCall ||
++      host_buffer_semantics ==
++          PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes ||
+       !::tt::runtime::utils::isSupportedDataType(runtime_data_type);
+ 
+   if (is_distributed) {

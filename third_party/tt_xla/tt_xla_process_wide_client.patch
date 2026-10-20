@@ -1,0 +1,56 @@
+diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
+--- a/pjrt_implementation/inc/api/client_instance.h
++++ b/pjrt_implementation/inc/api/client_instance.h
+@@ -67,6 +67,10 @@
+   // create a new client before destroying the old one (e.g. after
+   // `jax.clear_backends()`), so they share one instance, which owns the device.
+   int m_ref_count = 0;
++
++  // Guards `m_client_instance` and `m_ref_count`: frameworks may create and
++  // destroy clients on different threads.
++  std::mutex m_mutex;
+ };
+ 
+ // Represents PJRT_Client structure and the functionality around it.
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -275,6 +275,9 @@
+ 
+ PJRT_Error *GlobalClientInstanceSingleton::initClient() {
+   GlobalClientInstanceSingleton &singleton_instance = getInstance();
++  // Held while the first client initializes, so that a concurrent creator
++  // waits for it instead of opening the device again.
++  std::lock_guard<std::mutex> lock(singleton_instance.m_mutex);
+   if (singleton_instance.isInitialized()) {
+     ++singleton_instance.m_ref_count;
+     return nullptr;
+@@ -294,6 +297,7 @@
+ 
+ void GlobalClientInstanceSingleton::destroyClient() {
+   GlobalClientInstanceSingleton &singleton_instance = getInstance();
++  std::lock_guard<std::mutex> lock(singleton_instance.m_mutex);
+   if (singleton_instance.isInitialized() &&
+       --singleton_instance.m_ref_count == 0) {
+     singleton_instance.m_client_instance.reset();
+@@ -301,13 +305,17 @@
+ }
+ 
+ GlobalClientInstanceSingleton &GlobalClientInstanceSingleton::getInstance() {
+-  static thread_local GlobalClientInstanceSingleton singleton =
+-      GlobalClientInstanceSingleton(nullptr);
+-  return singleton;
++  // Process-wide, since a framework may create and destroy the client on
++  // different threads. Never destroyed: a client that is still alive at exit
++  // must not close the device after tt-metal's thread-local state is gone.
++  static GlobalClientInstanceSingleton *singleton =
++      new GlobalClientInstanceSingleton(nullptr);
++  return *singleton;
+ }
+ 
+ ClientInstance *GlobalClientInstanceSingleton::getClientInstance() {
+   auto &singleton = GlobalClientInstanceSingleton::getInstance();
++  std::lock_guard<std::mutex> lock(singleton.m_mutex);
+   return singleton.m_client_instance.get();
+ }
+ 
