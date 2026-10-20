@@ -86,20 +86,47 @@ def test_integer_pow(dtype, level):
 
 @LEVELS
 @pytest.mark.parametrize("dtype", DTYPES, ids=lambda d: np.dtype(d).name)
-def test_integer_pow_constant_exponent(dtype, level):
-    """A constant exponent takes the scalar kernel."""
+def test_integer_pow_constant_exponent(tmp_path, dtype, level):
+    """A constant exponent whose 32-bit sign bit is clear takes the scalar
+    kernel (ttnn.pow_scalar), and one whose sign bit is set takes the tensor
+    kernel (ttnn.pow_tensor). There negative signed exponents follow the
+    negative-exponent rule, while uint32 exponents from 2^31 stay unsigned."""
     x, _ = samples(dtype)
+    x.flat[:3] = np.array([0, 1, -1]).astype(dtype)
     info = np.iinfo(dtype)
     exponents = [0, 1, 2, 3, 9, info.bits - 1, info.bits, info.max]
     if info.bits == 32:
         exponents += [1 << 30, (1 << 30) + 3]
+    if np.issubdtype(dtype, np.signedinteger):
+        exponents += [-1, -2, info.min]
+    if dtype == np.uint32:
+        exponents += [1 << 31, (1 << 31) + 3]
     for exponent in exponents:
+        export_path = tmp_path / str(exponent)
         run = jax.jit(
             lambda x: integer_pow_p.bind(x, jnp.full_like(x, exponent)),
-            compiler_options={"optimization_level": level},
+            compiler_options={"optimization_level": level, "export_path": str(export_path)},
         )
         got = np.asarray(run(device_put(x)))
         np.testing.assert_array_equal(got, reference(x, np.full_like(x, exponent)), err_msg=f"exponent {exponent}")
+        (ir,) = [path.read_text() for path in (export_path / "irs").glob("ttnn_[0-9]*.mlir")]
+        if exponent in (0, 1):
+            continue  # x**0 and x**1 may fold away.
+        tensor = exponent < 0 or exponent >= 1 << 31
+        routing = (ir.count("ttnn.pow_tensor"), ir.count("ttnn.pow_scalar"))
+        assert routing == ((1, 0) if tensor else (0, 1)), f"exponent {exponent}: {ir}"
+
+
+@pytest.mark.parametrize("level", ["O0", "O1"])
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16], ids=lambda d: np.dtype(d).name)
+def test_unsigned_narrow_integer_pow_masks(tmp_path, dtype, level):
+    """uint8 and uint16 powers widen to int32 and mask back to their width.
+    (int8 and int16 are int32 on the device before the power is lowered.)"""
+    x, y = samples(dtype)
+    run = jax.jit(integer_pow_p.bind, compiler_options={"optimization_level": level, "export_path": str(tmp_path)})
+    np.testing.assert_array_equal(np.asarray(run(device_put(x), device_put(y))), reference(x, y))
+    (ir,) = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert ir.count("ttnn.pow_tensor") == 1 and "ttnn.bitwise_and" in ir, ir
 
 
 @pytest.mark.parametrize(
