@@ -1,0 +1,82 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/slice/device/kernels/dataflow/slice_reader_unary_unpad_dims_rm_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/data_movement/slice/device/kernels/dataflow/slice_reader_unary_unpad_dims_rm_interleaved_start_id.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/slice/device/kernels/dataflow/slice_reader_unary_unpad_dims_rm_interleaved_start_id.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/slice/device/kernels/dataflow/slice_reader_unary_unpad_dims_rm_interleaved_start_id.cpp
+@@ -70,9 +70,16 @@ void kernel_main() {
+                     const uint32_t cur = c + k;
+                     const uint32_t offset = src_offset_bytes + cur * chunk_size;
+                     const uint32_t sz = (cur == num_chunks_per_stick - 1) ? last_chunk_size : chunk_size;
++                    // A misaligned chunk is read from the aligned offset before it, with its leading bytes,
++                    // into an entry `stick_size_offset` long, and moved to the entry's start.
+                     tt::data_movement::common::noc_async_read_sharded(
+-                        noc, src_buffer_l1_addr, s0, src_stick_id, offset, sz);
+-                    src_buffer_l1_addr += chunk_size;
++                        noc, src_buffer_l1_addr, s0, src_stick_id, offset, sz + misalignment);
++                    if (misalignment != 0) {
++                        noc.async_read_barrier();
++                        tt::data_movement::common::tt_memmove<false, false, false, 0>(
++                            noc, src_buffer_l1_addr, src_buffer_l1_addr + misalignment, sz);
++                    }
++                    src_buffer_l1_addr += stick_size_offset;
+                 }
+                 noc.async_read_barrier();
+                 dfb_in0.push_back(batch);
+diff --git ttnn/cpp/ttnn/operations/data_movement/slice/device/kernels/dataflow/slice_writer_unary_stick_layout_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/data_movement/slice/device/kernels/dataflow/slice_writer_unary_stick_layout_interleaved_start_id.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/slice/device/kernels/dataflow/slice_writer_unary_stick_layout_interleaved_start_id.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/slice/device/kernels/dataflow/slice_writer_unary_stick_layout_interleaved_start_id.cpp
+@@ -48,7 +48,7 @@ void kernel_main() {
+                     const uint32_t offset = cur * chunk_size;
+                     const uint32_t sz = (cur == num_chunks_per_stick - 1) ? last_chunk_size : chunk_size;
+                     tt::data_movement::common::noc_async_write_sharded(noc, l1_read_addr, s0, i_stick, offset, sz);
+-                    l1_read_addr += chunk_size;
++                    l1_read_addr += stick_size_offset;
+                 }
+                 noc.async_write_barrier();
+                 dfb_out0.pop_front(batch);
+diff --git ttnn/cpp/ttnn/operations/data_movement/slice/device/slice_program_factory_rm.cpp ttnn/cpp/ttnn/operations/data_movement/slice/device/slice_program_factory_rm.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/slice/device/slice_program_factory_rm.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/slice/device/slice_program_factory_rm.cpp
+@@ -81,7 +81,11 @@ inline std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> get_
+     auto alignment = std::max(src_buffer_alignment, dst_buffer_alignment);
+     uint32_t begins_bytes = output_tensor_start[-1] * input_tensor.element_size();
+     uint32_t misalignment = begins_bytes % src_buffer_alignment;
+-    uint32_t unpadded_row_size_bytes_offset = tt::round_up(unpadded_row_size_bytes, alignment);
++    // Chunked rows step through their DFB entries by the entry size, which holds a misaligned chunk's
++    // leading bytes too (see compute_dfb_size).
++    uint32_t unpadded_row_size_bytes_offset =
++        chunking.num_chunks_per_stick > 1 ? chunking.chunk_size + (misalignment != 0 ? 2 * alignment : 0)
++                                          : tt::round_up(unpadded_row_size_bytes, alignment);
+ 
+     // The input base address is a tensor binding, not an argument, so this list is scalars only.
+     std::vector<uint32_t> common_reader_kernel_args = {
+@@ -177,8 +181,8 @@ struct SliceDfbSizing {
+     ChunkingParams chunking;
+ };
+ 
+-// Chunks sub-row when double-buffered row page overflows L1; gated on misalignment==0
+-// (misalign path uses a whole-stick memmove that doesn't compose with chunk boundaries).
++// Chunks sub-row when double-buffered row page overflows L1. A misaligned row reads each chunk with
++// its leading bytes into an entry that much larger and moves it into place.
+ SliceDfbSizing compute_dfb_size(
+     const Tensor& input,
+     const Tensor& output,
+@@ -212,8 +216,8 @@ SliceDfbSizing compute_dfb_size(
+         .chunking = {stick_size_aligned, 1, stick_size_aligned},
+     };
+ 
+-    const bool needs_chunking = (misalignment == 0) && (static_cast<uint64_t>(2u) * stick_size_aligned > l1_budget) &&
+-                                (stick_size_aligned > alignment);
++    const bool needs_chunking =
++        (static_cast<uint64_t>(2u) * stick_size_aligned > l1_budget) && (stick_size_aligned > alignment);
+     uint32_t stride_for_merge = tt::round_up(unpadded_row_size_bytes, single_alignment);
+ 
+     if (needs_chunking) {
+@@ -248,7 +252,8 @@ SliceDfbSizing compute_dfb_size(
+             .num_chunks_per_stick = num_chunks,
+             .last_chunk_size = (remainder == 0) ? max_chunk : remainder,
+         };
+-        s.dfb_entry_size = max_chunk;
++        // `alignment` is twice the buffer alignment for a misaligned row, as in the runtime args.
++        s.dfb_entry_size = max_chunk + (misalignment != 0 ? alignment : 0);
+         stride_for_merge = max_chunk;
+     }
+ 

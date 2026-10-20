@@ -1,0 +1,50 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
+@@ -7,6 +7,7 @@
+ #include "ttnn/operations/data_movement/common/common.hpp"
+ #include "ttnn/operations/data_movement/copy/copy.hpp"
+ #include "ttnn/operations/experimental/reshape/view.hpp"
++#include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
+ #include "ttnn/operations/data_movement/fill_pad/fill_pad.hpp"
+ #include "ttnn/operations/data_movement/transpose/device/transpose_utils.hpp"
+ #include "ttnn/operations/creation/creation.hpp"
+@@ -126,6 +127,38 @@ ttnn::Tensor slice(
+         step.size(),
+         begins.size());
+ 
++    // A tiled vector is one row of tiles. From a tile-aligned start, slice it as [1, N] on the tile path
++    // instead of untilizing it into a single row-major page, which has to fit in L1.
++    if (input_rank == 1 && input_layout == Layout::TILE && input_tensor.storage_type() == StorageType::DEVICE &&
++        !optional_output_tensor.has_value() && !input_tensor.is_sharded()) {
++        const uint32_t size = input_shape[0];
++        uint32_t begin = 0;
++        uint32_t end = 0;
++        if constexpr (std::is_signed_v<T>) {
++            begin = operations::data_movement::wrap_index(begins[0], size);
++            end = operations::data_movement::wrap_index(ends[0], size);
++        } else {
++            begin = begins[0];
++            end = ends[0];
++        }
++        const uint32_t tile_width = input_tensor.tensor_spec().tile().get_tile_shape()[1];
++        if (step[0] == 1 && begin % tile_width == 0 && begin < end && end <= size && (begin > 0 || end < size)) {
++            const std::array<T, 2> row_begins{0, static_cast<T>(begin)};
++            const std::array<T, 2> row_ends{1, static_cast<T>(end)};
++            const std::array<T, 2> row_step{1, 1};
++            const ttnn::Tensor sliced = ttnn::slice<T>(
++                ttnn::reshape(input_tensor, ttnn::Shape({1, size})),
++                ttsl::Span<const T>(row_begins.data(), 2),
++                ttsl::Span<const T>(row_ends.data(), 2),
++                ttsl::Span<const T>(row_step.data(), 2),
++                memory_config_arg,
++                std::nullopt,
++                pad_value,
++                sub_core_grids);
++            return ttnn::reshape(sliced, ttnn::Shape({end - begin}));
++        }
++    }
++
+     bool no_step = std::ranges::all_of(step, [](uint32_t s) { return s == 1; });
+     bool starts_zero = std::ranges::all_of(begins, [](uint32_t s) { return s == 0; });
+     bool ends_max = true;

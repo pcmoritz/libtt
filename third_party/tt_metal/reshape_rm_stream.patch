@@ -1,0 +1,214 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_interleaved.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_interleaved.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_interleaved.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_reshape_interleaved.cpp
+@@ -62,6 +62,8 @@ void kernel_main() {
+     constexpr uint32_t num_dest_write_slots = get_arg(args::num_dest_write_slots);
+     constexpr uint32_t dest_slot_size_bytes = get_arg(args::dest_slot_size_bytes);
+     constexpr uint32_t dest_write_size_bytes = get_arg(args::dest_write_size_bytes);
++    constexpr uint32_t stream_chunk_bytes = get_arg(args::stream_chunk_bytes);
++    constexpr uint32_t stream_write_alignment = get_arg(args::stream_write_alignment);
+ 
+     // Since we need to operate on a grid of cores but sometimes pages don't split properly, if nop then don't use this
+     // core
+@@ -73,6 +75,52 @@ void kernel_main() {
+     const auto d = TensorAccessor(tensor::dst);
+ 
+     Noc noc;
++    if constexpr (stream_chunk_bytes != 0) {
++        // Pages too wide to stage whole in L1: read_start_page..read_end_page count chunks of
++        // stream_chunk_bytes of the destination pages. Each chunk is assembled from the source bytes
++        // at the same offset of the byte stream, read 64-byte aligned and moved into place, then
++        // written back at its aligned offset in the destination page.
++        // kernel_main is not a template, so this block is evaluated even when it is discarded.
++        constexpr uint32_t chunk_bytes = stream_chunk_bytes != 0 ? stream_chunk_bytes : 64;
++        constexpr uint32_t write_alignment = stream_write_alignment != 0 ? stream_write_alignment : 16;
++        constexpr uint32_t chunks_per_page = (dest_page_size_bytes + chunk_bytes - 1) / chunk_bytes;
++        DataflowBuffer dfb_read(dfb::in0);
++        DataflowBuffer dfb_chunk(dfb::in1);
++        dfb_read.reserve_back(1);
++        dfb_chunk.reserve_back(1);
++        const uint32_t read_buffer = dfb_read.get_write_ptr();
++        const uint32_t chunk_buffer = dfb_chunk.get_write_ptr();
++        dfb_chunk.push_back(1);
++        dfb_read.push_back(1);
++        for (uint32_t unit = read_start_page; unit < read_end_page; ++unit) {
++            const uint32_t page = unit / chunks_per_page;
++            const uint32_t chunk_offset = (unit % chunks_per_page) * chunk_bytes;
++            const uint32_t chunk_left = dest_page_size_bytes - chunk_offset;
++            const uint32_t chunk_size = chunk_left < chunk_bytes ? chunk_left : chunk_bytes;
++            uint64_t byte = static_cast<uint64_t>(page) * dest_page_size_bytes + chunk_offset;
++            for (uint32_t filled = 0; filled < chunk_size;) {
++                const uint32_t source_page = byte / source_page_size_bytes;
++                const uint32_t source_offset = byte % source_page_size_bytes;
++                const uint32_t source_left = source_page_size_bytes - source_offset;
++                const uint32_t take = chunk_size - filled < source_left ? chunk_size - filled : source_left;
++                const uint64_t src_noc_addr = s.get_noc_addr(source_page, source_offset);
++                const uint32_t misalignment = src_noc_addr & OFFSET_64;
++                tt::data_movement::common::enhanced_noc_async_read<chunk_bytes + 128, false>(
++                    noc, src_noc_addr - misalignment, read_buffer, (misalignment + take + 63) & ~63u);
++                noc.async_read_barrier();
++                tt::data_movement::common::tt_memmove<false, false, true, chunk_bytes>(
++                    noc, chunk_buffer + filled, read_buffer + misalignment, take);
++                filled += take;
++                byte += take;
++            }
++            const uint32_t write_size =
++                (chunk_size + write_alignment - 1) / write_alignment * write_alignment;
++            tt::data_movement::common::enhanced_noc_async_write<chunk_bytes, false>(
++                noc, chunk_buffer, d.get_noc_addr(page, chunk_offset), write_size);
++            noc.async_write_barrier();
++        }
++        return;
++    } else {
+     uint32_t read_offset = 0;
+     uint32_t write_page = write_start_page;
+     uint32_t readable = 0;
+@@ -213,4 +261,5 @@ void kernel_main() {
+     }
+     noc.async_write_barrier();
+     return;
++    }
+ }
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
+@@ -71,6 +71,15 @@ uint32_t choose_num_dest_write_slots(
+     const uint32_t max_slots = (l1_available - source_dfb_bytes) / (dest_slot_size_bytes * num_kernel_copies);
+     return std::max(1u, std::min(small_dest_write_slots, max_slots));
+ }
++
++// L1 bytes per core that DFBs can use, as in choose_num_dest_write_slots.
++uint32_t available_l1_bytes(IDevice* device) {
++    const uint32_t l1_base = device->allocator()->get_base_allocator_addr(HalMemType::L1);
++    const std::optional<DeviceAddr> lowest_occupied = device->lowest_occupied_compute_l1_address();
++    const uint32_t l1_ceiling =
++        lowest_occupied.has_value() ? static_cast<uint32_t>(lowest_occupied.value()) : device->l1_size_per_core();
++    return l1_ceiling > l1_base ? l1_ceiling - l1_base : 0;
++}
+ }  // namespace
+ 
+ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_program_artifacts(
+@@ -153,11 +162,22 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+     // With 16-byte aligned pages the kernel writes straight from the source DFB and never touches the dest
+     // staging DFB, which would otherwise hold a whole, possibly huge, destination page.
+     const bool can_be_clean = source_page_size_bytes % 16 == 0 && dest_page_size_bytes % 16 == 0;
++    // Otherwise pages are staged whole in L1, the source twice per kernel. When they don't fit (a
++    // flattened buffer of unaligned rows), the kernel streams instead: it assembles 16 KiB chunks of
++    // the destination pages from the source bytes at the same offsets.
++    constexpr uint32_t stream_chunk_bytes = 16 * 1024;
++    const bool stream = !can_be_clean && (dfb_size0 * 2u + dest_slot_size_bytes) * (can_use_dual_kernel ? 2u : 1u) >
++                                             available_l1_bytes(device);
++    const bool use_dual_kernel = can_use_dual_kernel && !stream;
+     const uint32_t num_dest_write_slots =
+-        can_be_clean ? 1u
+-                     : choose_num_dest_write_slots(
+-                           device, pages_noc_aligned, can_use_dual_kernel, dfb_size0, dest_slot_size_bytes);
+-    const uint32_t dfb_size1 = can_be_clean ? 64u : dest_slot_size_bytes * num_dest_write_slots;
++        can_be_clean || stream
++            ? 1u
++            : choose_num_dest_write_slots(
++                  device, pages_noc_aligned, can_use_dual_kernel, dfb_size0, dest_slot_size_bytes);
++    const uint32_t dfb_size1 =
++        can_be_clean ? 64u : (stream ? stream_chunk_bytes : dest_slot_size_bytes * num_dest_write_slots);
++    const uint32_t stream_source_page_bytes = input_log_shape[-1] * data_size;
++    const uint32_t stream_dest_page_bytes = output_log_shape[-1] * data_size;
+ 
+     const uint32_t write_alignment =
+         dst_buffer->is_dram() ? tt::tt_metal::hal::get_dram_alignment() : tt::tt_metal::hal::get_l1_alignment();
+@@ -184,12 +204,14 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+     const KernelSpec::CompileTimeArgs cta = {
+         {"src_aligned_to_64", (source_page_size_bytes % 64 == 0) ? 1u : 0u},
+         {"src_aligned_to_16", (source_page_size_bytes % 16 == 0) ? 1u : 0u},
+-        {"source_page_size_bytes", source_page_size_bytes},
+-        {"dest_page_size_bytes", dest_page_size_bytes},
++        {"source_page_size_bytes", stream ? stream_source_page_bytes : source_page_size_bytes},
++        {"dest_page_size_bytes", stream ? stream_dest_page_bytes : dest_page_size_bytes},
+         {"num_dest_write_slots", num_dest_write_slots},
+         {"dest_slot_size_bytes", dest_slot_size_bytes},
+         {"dest_write_size_bytes", dest_write_size_bytes},
+         {"source_chunks", source_chunks},
++        {"stream_chunk_bytes", stream ? stream_chunk_bytes : 0u},
++        {"stream_write_alignment", dst_buffer->alignment()},
+     };
+ 
+     const KernelSpec::RuntimeArgSchema rta_schema = {
+@@ -241,9 +263,9 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+     ProgramSpec spec;
+     spec.name = "reshape_view_rm";
+     spec.kernels.push_back(make_rm_kernel(READER, create_reader_datamovement_config(device->arch()), SRC0, SRC1));
+-    spec.dataflow_buffers.push_back(make_scratch_dfb(SRC0, dfb_size0, 2));
++    spec.dataflow_buffers.push_back(make_scratch_dfb(SRC0, stream ? stream_chunk_bytes + 128 : dfb_size0, 2));
+     spec.dataflow_buffers.push_back(make_scratch_dfb(SRC1, dfb_size1, 1));
+-    if (can_use_dual_kernel) {
++    if (use_dual_kernel) {
+         spec.kernels.push_back(make_rm_kernel(WRITER, create_writer_datamovement_config(device->arch()), SRC2, SRC3));
+         spec.dataflow_buffers.push_back(make_scratch_dfb(SRC2, dfb_size0, 2));
+         spec.dataflow_buffers.push_back(make_scratch_dfb(SRC3, dfb_size1, 1));
+@@ -253,7 +275,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+         TensorParameter{.unique_id = DST, .spec = output_mt.tensor_spec()},
+     };
+     WorkUnitSpec work_unit{.name = "main", .kernels = {READER}, .target_nodes = total_cores};
+-    if (can_use_dual_kernel) {
++    if (use_dual_kernel) {
+         work_unit.kernels.push_back(WRITER);
+     }
+     spec.work_units = {work_unit};
+@@ -264,7 +286,31 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+     KernelRunArgs writer_kra{.kernel = WRITER};
+ 
+     uint32_t done = 0;
++    if (stream) {
++        // Split the destination pages' chunks evenly; read_start_page..read_end_page count chunks.
++        const uint32_t chunks_per_page = (stream_dest_page_bytes + stream_chunk_bytes - 1) / stream_chunk_bytes;
++        const uint32_t num_chunks = (output.physical_volume() / output_log_shape[-1]) * chunks_per_page;
++        const auto cores = corerange_to_cores(total_cores, std::nullopt);
++        const uint32_t per_core = (num_chunks + cores.size() - 1) / cores.size();
++        uint32_t start = 0;
++        for (const auto& core : cores) {
++            const uint32_t end = std::min(num_chunks, start + per_core);
++            AddRuntimeArgsForNode(
++                reader_kra.runtime_arg_values,
++                core,
++                {{"source_read_size_bytes", 0u},
++                 {"read_start_page", start},
++                 {"read_end_page", end},
++                 {"write_start_page", 0u},
++                 {"write_start_offset", 0u},
++                 {"nop", start < end ? 0u : 1u}});
++            start = end;
++        }
++    }
+     for (auto core : corerange_to_cores(total_cores, std::nullopt)) {
++        if (stream) {
++            break;
++        }
+         if (done == 1) {
+             // Idle core: the kernel short-circuits on nop==1 before building any TensorAccessor, so
+             // the framework-delivered src/dst base addresses are never used here — harmless.
+@@ -277,7 +323,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+                  {"write_start_page", 0u},
+                  {"write_start_offset", 0u},
+                  {"nop", 1u}});
+-            if (can_use_dual_kernel) {
++            if (use_dual_kernel) {
+                 AddRuntimeArgsForNode(
+                     writer_kra.runtime_arg_values,
+                     core,
+@@ -295,7 +341,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+             uint32_t pages_for_this_core = end_of_read - start_of_read;
+             uint32_t write_jump = (pages_for_this_core * source_page_size_bytes) / dest_page_size_bytes;
+ 
+-            if (can_use_dual_kernel) {
++            if (use_dual_kernel) {
+                 // Split work in half - determine split point and second write position
+                 uint32_t mid_read, second_write_pos;
+                 if (source_page_size_bytes >= dest_page_size_bytes) {
+@@ -350,7 +396,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+ 
+     ProgramRunArgs run_args;
+     run_args.kernel_run_args.push_back(std::move(reader_kra));
+-    if (can_use_dual_kernel) {
++    if (use_dual_kernel) {
+         run_args.kernel_run_args.push_back(std::move(writer_kra));
+     }
+     run_args.tensor_args = {
