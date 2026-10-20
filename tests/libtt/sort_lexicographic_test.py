@@ -226,3 +226,46 @@ def test_narrow_integer_payloads(dtype):
         order = np.argsort(keys, axis=-1, kind="stable")
         np.testing.assert_array_equal(got_keys, np.take_along_axis(keys, order, -1))
         np.testing.assert_array_equal(got_values, np.take_along_axis(values, order, -1))
+
+
+@pytest.mark.parametrize("shape", [(1,), (5, 1), (3, 1, 1)])
+def test_singleton_sort_dimension_keeps_payloads(shape):
+    """Along a sort dimension of size 1 the sort changes nothing: an integer
+    payload isn't an iota there, even an iota along another dimension."""
+    rng = np.random.default_rng(16)
+    keys = rng.standard_normal(shape).astype(np.float32)
+    payload = rng.integers(10, 1000, size=shape).astype(np.int32)
+    other_iota = np.broadcast_to(np.arange(shape[0], dtype=np.int32).reshape((-1,) + (1,) * (len(shape) - 1)), shape)
+    dimension = len(shape) - 1
+    for values in (payload, np.ascontiguousarray(other_iota)):
+        got_keys, got_values = jax.jit(
+            lambda k, v: lax.sort((k, v), dimension=dimension, num_keys=1)
+        )(keys, values)
+        np.testing.assert_array_equal(got_keys, keys)
+        np.testing.assert_array_equal(got_values, values)
+    got_keys, got_values = sort((keys, payload), partial(select_comparator, directions=("LT", "LT")))
+    np.testing.assert_array_equal(got_values, payload)
+
+
+@pytest.mark.parametrize("shape", [(1,), (5, 1)])
+def test_singleton_sort_dimension_iota(shape):
+    """A genuine iota along a sort dimension of size 1 is all zeros."""
+    keys = np.random.default_rng(17).standard_normal(shape).astype(np.float32)
+    dimension = len(shape) - 1
+    got_keys, got_indices = jax.jit(
+        lambda k: lax.sort((k, lax.broadcasted_iota(np.int32, shape, dimension)), dimension=dimension, num_keys=1)
+    )(keys)
+    np.testing.assert_array_equal(got_keys, keys)
+    np.testing.assert_array_equal(got_indices, np.zeros(shape, np.int32))
+
+
+@pytest.mark.parametrize("columns", [1, 3])
+def test_iota_along_another_dimension_is_a_payload(columns):
+    """An iota along another dimension than the sort's isn't the sort's
+    indices: it is constant along the sort dimension and stays as it is."""
+    keys = np.random.default_rng(18).standard_normal((5, columns)).astype(np.float32)
+    got_keys, got_rows = jax.jit(
+        lambda k: lax.sort((k, lax.broadcasted_iota(np.int32, k.shape, 0)), dimension=1, num_keys=1)
+    )(keys)
+    np.testing.assert_array_equal(got_keys, np.sort(keys, axis=1))
+    np.testing.assert_array_equal(got_rows, np.broadcast_to(np.arange(5, dtype=np.int32)[:, None], (5, columns)))
