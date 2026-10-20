@@ -386,6 +386,7 @@ http_archive(
         "//third_party/tt_metal:top_half_tiles.patch",
         "//third_party/tt_metal:accumulation_width_scan.patch",
         "//third_party/tt_metal:chunked_sdpa_aligned_page_table.patch",
+        "//third_party/tt_metal:fp8_tile_layout.patch",
     ],
     sha256 = "f87dc8d21a6ec02280643543dde9a2633d771ceaad819b00ff493922f1e139c8",
     strip_prefix = "tt-metal-614f605ffe2977715adc198156c72bea14c2bae6",
