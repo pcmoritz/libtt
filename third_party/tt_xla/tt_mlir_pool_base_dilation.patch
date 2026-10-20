@@ -1,0 +1,201 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -3812,9 +3812,20 @@
+ 
+     BoolAttr countIncludesPad = rewriter.getBoolAttr(true);
+ 
+-    // TTIR pooling ops do not support base dilations.
++    // TTIR pooling ops do not support base dilations, but sum and max windows
++    // (e.g. torch_tpu's avg_pool backward) reduce slices of the dilated input.
+     if (!llvm::all_of(baseDilations.asArrayRef(),
+                       [](int64_t d) { return d == 1; })) {
++      if (srcOp.getInputs().size() == 1) {
++        if (std::optional<Value> result = trySliceReduction(
++                srcOp, adaptor.getInputs().front(), (*initValues)[0],
++                reductionOps[0], windowDimensions, windowStrides,
++                windowDilations, baseDilations, padding,
++                /*withoutPooling=*/true, rewriter)) {
++          rewriter.replaceOp(srcOp, *result);
++          return success();
++        }
++      }
+       return rewriter.notifyMatchFailure(
+           srcOp, "Base dilations other than 1 are not supported.");
+     }
+@@ -3845,48 +3856,13 @@
+         return success();
+       }
+ 
+-      // ttnn pooling runs in bfloat16: float32 and float16 sum pooling (and
+-      // average pooling, which divides the sum) adds window slices in its own
+-      // type instead, and max pooling takes their maximum. Max pooling of
+-      // bfloat16 and 8-bit integers, which bfloat16 holds exactly, stays on
+-      // ttnn when its init is -inf (or the lowest integer).
+-      Value input = adaptor.getInputs().front();
+-      Type elementType =
+-          mlir::cast<RankedTensorType>(input.getType()).getElementType();
+-      TypicalInitReductionValue init = (*initValues)[0];
+-      bool exactInBF16 = elementType.isBF16() ||
+-                         (elementType.isInteger() &&
+-                          elementType.getIntOrFloatBitWidth() <= 8);
+-      bool isSum = isa<mlir::stablehlo::AddOp>(reductionOps[0]) &&
+-                   init == ZERO && (elementType.isF32() || elementType.isF16());
+-      bool isMax = isa<mlir::stablehlo::MaxOp>(reductionOps[0]) &&
+-                   (init == LOWEST_FINITE ||
+-                    (init == NEG_INF && !exactInBF16));
+-      if (isSum || isMax) {
+-        // Pad with the init value: the lowest value of the type for a max,
+-        // or -inf.
+-        double padValue = 0.0;
+-        if (isMax) {
+-          if (auto floatType = mlir::dyn_cast<FloatType>(elementType)) {
+-            padValue = llvm::APFloat::getLargest(floatType.getFloatSemantics(),
+-                                                 /*Negative=*/true)
+-                           .convertToDouble();
+-            if (init == NEG_INF) {
+-              padValue = -std::numeric_limits<double>::infinity();
+-            }
+-          } else if (auto intType = mlir::dyn_cast<IntegerType>(elementType);
+-                     intType && !intType.isUnsigned()) {
+-            padValue = static_cast<double>(
+-                llvm::APInt::getSignedMinValue(intType.getWidth())
+-                    .getSExtValue());
+-          }
+-        }
+-        if (std::optional<Value> result = reduceWindowSlices(
+-                srcOp, input, /*max=*/isMax, padValue, windowDimensions,
+-                windowStrides, windowDilations, padding, rewriter)) {
+-          rewriter.replaceOp(srcOp, *result);
+-          return success();
+-        }
++      if (std::optional<Value> result = trySliceReduction(
++              srcOp, adaptor.getInputs().front(), (*initValues)[0],
++              reductionOps[0], windowDimensions, windowStrides,
++              windowDilations, baseDilations, padding,
++              /*withoutPooling=*/false, rewriter)) {
++        rewriter.replaceOp(srcOp, *result);
++        return success();
+       }
+     }
+ 
+@@ -4073,6 +4049,59 @@
+   }
+ 
+ private:
++  // ttnn pooling runs in bfloat16: float32 and float16 sum pooling (and
++  // average pooling, which divides the sum) adds window slices in its own
++  // type instead, and max pooling takes their maximum. Max pooling of
++  // bfloat16 and 8-bit integers, which bfloat16 holds exactly, stays on ttnn
++  // when its init is -inf (or the lowest integer). Without ttnn pooling (base
++  // dilations), every sum and max window reduces slices.
++  std::optional<Value>
++  trySliceReduction(mlir::stablehlo::ReduceWindowOp srcOp, Value input,
++                    TypicalInitReductionValue init, Operation *reductionOp,
++                    DenseI64ArrayAttr windowDimensions,
++                    DenseI64ArrayAttr windowStrides,
++                    DenseI64ArrayAttr windowDilations,
++                    DenseI64ArrayAttr baseDilations, DenseI64ArrayAttr padding,
++                    bool withoutPooling,
++                    ConversionPatternRewriter &rewriter) const {
++    using TypicalInitReductionValue::LOWEST_FINITE;
++    using TypicalInitReductionValue::NEG_INF;
++    using TypicalInitReductionValue::ZERO;
++    Type elementType =
++        mlir::cast<RankedTensorType>(input.getType()).getElementType();
++    bool exactInBF16 = elementType.isBF16() ||
++                       (elementType.isInteger() &&
++                        elementType.getIntOrFloatBitWidth() <= 8);
++    bool isSum = isa<mlir::stablehlo::AddOp>(reductionOp) && init == ZERO &&
++                 (withoutPooling || elementType.isF32() || elementType.isF16());
++    bool isMax = isa<mlir::stablehlo::MaxOp>(reductionOp) &&
++                 (init == LOWEST_FINITE ||
++                  (init == NEG_INF && (withoutPooling || !exactInBF16)));
++    if (!isSum && !isMax) {
++      return std::nullopt;
++    }
++    // Pad with the init value: the lowest value of the type for a max, or
++    // -inf.
++    double padValue = 0.0;
++    if (isMax) {
++      if (auto floatType = mlir::dyn_cast<FloatType>(elementType)) {
++        padValue = llvm::APFloat::getLargest(floatType.getFloatSemantics(),
++                                             /*Negative=*/true)
++                       .convertToDouble();
++        if (init == NEG_INF) {
++          padValue = -std::numeric_limits<double>::infinity();
++        }
++      } else if (auto intType = mlir::dyn_cast<IntegerType>(elementType);
++                 intType && !intType.isUnsigned()) {
++        padValue = static_cast<double>(
++            llvm::APInt::getSignedMinValue(intType.getWidth()).getSExtValue());
++      }
++    }
++    return reduceWindowSlices(srcOp, input, /*max=*/isMax, padValue,
++                              windowDimensions, windowStrides, windowDilations,
++                              baseDilations, padding, rewriter);
++  }
++
+   // Reduces a window one dimension at a time: each window dimension combines
+   // its strided slices of the input, padded with `padValue`, with an add (sum
+   // pooling) or a maximum (max pooling), so a window takes
+@@ -4084,6 +4113,7 @@
+                                           DenseI64ArrayAttr windowDimensions,
+                                           DenseI64ArrayAttr windowStrides,
+                                           DenseI64ArrayAttr windowDilations,
++                                          DenseI64ArrayAttr baseDilations,
+                                           DenseI64ArrayAttr padding,
+                                           ConversionPatternRewriter &rewriter) const {
+     constexpr int64_t kMaxSlices = 64;
+@@ -4107,6 +4137,51 @@
+ 
+     Location loc = srcOp.getLoc();
+     SmallVector<int64_t> shape(inputType.getShape());
++    // A base dilation puts b - 1 init values between neighbours: [A, n, B]
++    // reshapes to [A, n, 1, B], pads to [A, n, b, B], reshapes to
++    // [A, n * b, B] and drops the trailing b - 1.
++    ArrayRef<int64_t> bases = baseDilations.asArrayRef();
++    for (int64_t d = 0; d < rank; ++d) {
++      if (bases[d] == 1 || shape[d] == 0) {
++        continue;
++      }
++      auto prodOf = [&](int64_t begin, int64_t end) {
++        return std::accumulate(shape.begin() + begin, shape.begin() + end,
++                               int64_t{1}, std::multiplies<>());
++      };
++      int64_t outer = prodOf(0, d), inner = prodOf(d + 1, rank);
++      auto reshape = [&](Value value, ArrayRef<int64_t> newShape) -> Value {
++        return rewriter.create<ttir::ReshapeOp>(
++            loc,
++            RankedTensorType::get(newShape, elementType,
++                                  inputType.getEncoding()),
++            value,
++            rewriter.getI32ArrayAttr(
++                SmallVector<int32_t>(newShape.begin(), newShape.end())));
++      };
++      Value value = reshape(input, {outer, shape[d], 1, inner});
++      value = rewriter.create<ttir::PadOp>(
++          loc,
++          RankedTensorType::get({outer, shape[d], bases[d], inner},
++                                elementType, inputType.getEncoding()),
++          value,
++          rewriter.getDenseI32ArrayAttr(
++              {0, 0, 0, 0, 0, static_cast<int32_t>(bases[d] - 1), 0, 0}),
++          rewriter.getF32FloatAttr(padValue));
++      value = reshape(value, {outer, shape[d] * bases[d], inner});
++      int64_t dilated = (shape[d] - 1) * bases[d] + 1;
++      value = rewriter.create<ttir::SliceStaticOp>(
++          loc,
++          RankedTensorType::get({outer, dilated, inner}, elementType,
++                                inputType.getEncoding()),
++          value, rewriter.getI32ArrayAttr({0, 0, 0}),
++          rewriter.getI32ArrayAttr({static_cast<int32_t>(outer),
++                                    static_cast<int32_t>(dilated),
++                                    static_cast<int32_t>(inner)}),
++          rewriter.getI32ArrayAttr({1, 1, 1}));
++      shape[d] = dilated;
++      input = reshape(value, shape);
++    }
+     if (llvm::any_of(pads, [](int64_t pad) { return pad != 0; })) {
+       for (int64_t d = 0; d < rank; ++d) {
+         shape[d] += pads[2 * d] + pads[2 * d + 1];
