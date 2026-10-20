@@ -78,6 +78,21 @@ def _select(
     return files
 
 
+def _monorepo_runfiles(root: Path, runfiles: Path, mirror: Path) -> Path:
+    """Mirrors the runfiles and adds the repository at its path in Google's
+    monorepo, google3/third_party/py/torch_tpu.
+
+    torch_tpu's lint and API tests look for the repository there.
+    """
+    mirror.mkdir(parents=True)
+    for entry in runfiles.iterdir():
+        (mirror / entry.name).symlink_to(entry)
+    repo = mirror / "google3" / "third_party" / "py" / "torch_tpu"
+    repo.parent.mkdir(parents=True)
+    repo.symlink_to(root)
+    return mirror
+
+
 def _counts(log: str) -> collections.Counter:
     counts = collections.Counter()
     for line in reversed(log.splitlines()):
@@ -144,6 +159,10 @@ def main() -> int:
     env = dict(os.environ)
     for name in ("TT_METAL_RUNTIME_ROOT", "PJRT_NAMES_AND_LIBRARY_PATHS"):
         env.pop(name, None)
+    if "TEST_SRCDIR" in env:
+        env["TEST_SRCDIR"] = str(
+            _monorepo_runfiles(root, Path(env["TEST_SRCDIR"]), tmp / "runfiles")
+        )
     # The plugin wheel, torch_tpu_pytest_plugin, a sitecustomize that runs
     # torch_tpu on libtt, and torch_tpu with its test modules.
     here = Path(__file__).parent
