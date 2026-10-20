@@ -1,10 +1,95 @@
 diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
 --- a/pjrt_implementation/src/api/module_builder/module_builder.cc
 +++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
-@@ -157,6 +157,71 @@
+@@ -157,6 +157,156 @@ static bool anyShardedAcrossDevices(
        });
  }
  
++// TT-NN's collectives move 8- and 16-bit integers wrongly (all_gather returns
++// zeros) and its reductions reject them, while torch.distributed's object
++// collectives send pickled bytes as uint8 and torch_tpu's broadcast sums them.
++// Run such collectives and reductions on 32-bit integers and convert back; a
++// gather is exact and a sum wraps as the narrow type would.
++static void widenNarrowIntegerCollectives(mlir::ModuleOp module) {
++  llvm::SmallVector<mlir::Operation *> collectives;
++  module.walk([&](mlir::Operation *op) {
++    if (!mlir::isa<mlir::stablehlo::AllReduceOp, mlir::stablehlo::AllGatherOp,
++                   mlir::stablehlo::ReduceScatterOp,
++                   mlir::stablehlo::AllToAllOp,
++                   mlir::stablehlo::CollectivePermuteOp,
++                   mlir::stablehlo::CollectiveBroadcastOp,
++                   mlir::stablehlo::ReduceOp>(op)) {
++      return;
++    }
++    if (!llvm::any_of(op->getOperandTypes(), [](mlir::Type type) {
++          auto integer = mlir::dyn_cast<mlir::IntegerType>(
++              mlir::getElementTypeOrSelf(type));
++          return integer && integer.getWidth() < 32;
++        })) {
++      return;
++    }
++    // Only plain sums and the like: a comparison in a reduction body must
++    // keep its i1 result.
++    if (mlir::isa<mlir::stablehlo::ReduceOp>(op) &&
++        op->walk([](mlir::Operation *inner) {
++            return mlir::isa<mlir::stablehlo::CompareOp,
++                             mlir::stablehlo::SelectOp>(inner)
++                       ? mlir::WalkResult::interrupt()
++                       : mlir::WalkResult::advance();
++          }).wasInterrupted()) {
++      return;
++    }
++    collectives.push_back(op);
++  });
++  for (mlir::Operation *op : collectives) {
++    mlir::OpBuilder builder(op);
++    auto wide = [&](mlir::Type type) -> mlir::Type {
++      auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type);
++      auto integer = tensor ? mlir::dyn_cast<mlir::IntegerType>(
++                                  tensor.getElementType())
++                            : nullptr;
++      if (!integer || integer.getWidth() >= 32) {
++        return type;
++      }
++      // Signless: TT-NN's integer reductions take int32, not uint32.
++      return tensor.clone(mlir::IntegerType::get(op->getContext(), 32));
++    };
++    for (mlir::OpOperand &operand : op->getOpOperands()) {
++      mlir::Type type = wide(operand.get().getType());
++      if (type != operand.get().getType()) {
++        operand.set(builder.create<mlir::stablehlo::ConvertOp>(
++            op->getLoc(), type, operand.get()));
++      }
++    }
++    // Reduction bodies work on scalars of the element type.
++    op->walk([&](mlir::Operation *inner) {
++      if (inner == op) {
++        return;
++      }
++      for (mlir::Value result : inner->getResults()) {
++        result.setType(wide(result.getType()));
++      }
++    });
++    for (mlir::Region &region : op->getRegions()) {
++      for (mlir::BlockArgument arg : region.getArguments()) {
++        arg.setType(wide(arg.getType()));
++      }
++    }
++    builder.setInsertionPointAfter(op);
++    for (mlir::Value result : op->getResults()) {
++      mlir::Type narrow = result.getType();
++      mlir::Type type = wide(narrow);
++      if (type == narrow) {
++        continue;
++      }
++      result.setType(type);
++      auto convert = builder.create<mlir::stablehlo::ConvertOp>(op->getLoc(),
++                                                                narrow, result);
++      result.replaceAllUsesExcept(convert, convert);
++    }
++  }
++}
++
 +// torch_tpu compiles each program for all devices and writes out its
 +// collectives, without sharding annotations: every device runs the whole
 +// program on its own values, as in the body of a shard_map. Wraps such a
@@ -73,10 +158,11 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
  // Maps per-axis fabric config to TTNN mesh topology for CCL operations.
  static std::vector<mlir::tt::ttcore::Topology>
  fabricConfigToMeshTopology(const tt::runtime::MeshFabricConfig &fabricConfig) {
-@@ -432,6 +497,7 @@
+@@ -432,6 +582,8 @@ ModuleBuilder::buildModule(
    if (!tt_pjrt_status_is_ok(status)) {
      return {status, nullptr};
    }
++  widenNarrowIntegerCollectives(*mlir_module);
 +  wrapUnshardedCollectives(*mlir_module, target_num_devices);
  
    // Stable identity of the graph (hash of the SHLO module text), used by the
