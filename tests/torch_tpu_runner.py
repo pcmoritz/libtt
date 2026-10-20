@@ -53,6 +53,13 @@ def _overlay_test_modules(root: Path, overlay: Path) -> None:
         elif not mirrored.exists() and not path.name.endswith("_test.py"):
             mirrored.parent.mkdir(parents=True, exist_ok=True)
             mirrored.symlink_to(path)
+    # Tests read their data as torch_tpu resources, e.g.
+    # torch_tpu/tests/compile/data/goldfish.jpg, their path in Google's monorepo.
+    for data in (root / "tests").rglob("data"):
+        if data.is_dir():
+            mirrored = overlay / "torch_tpu" / data.relative_to(root)
+            mirrored.parent.mkdir(parents=True, exist_ok=True)
+            mirrored.symlink_to(data)
 
 
 def _select(
