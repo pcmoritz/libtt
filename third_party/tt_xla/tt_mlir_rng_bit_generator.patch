@@ -1,342 +1,335 @@
-diff --git a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td b/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
---- a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
-+++ b/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
-@@ -367,6 +367,27 @@
-   ];
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -5787,6 +5787,26 @@ def TTIR_RandOp : TTIR_CreationOp<"rand", [TTCore_NonCacheableTrait]> {
+   let hasVerifier = 1;
  }
  
-+def StableHLOExpandRngBitGeneratorPass : Pass<"stablehlo-expand-rng-bit-generator", "::mlir::ModuleOp"> {
-+  let summary = "Compute stablehlo.rng_bit_generator's bits from its state.";
++def TTIR_RngBitGeneratorOp : TTIR_NamedOp<"rng_bit_generator"> {
++  let summary = "Counter-based random bits from a state.";
 +  let description = [{
-+    This pass expands stablehlo.rng_bit_generator into counter-based
-+    generators of 32-bit integer arithmetic: Threefry-2x32 with 20 rounds for
-+    DEFAULT and THREE_FRY, Philox-4x32 with 10 rounds for PHILOX. The key is
-+    the state's first word, and element i (in row-major order) is the first
-+    word of counter (i, second word) for Threefry and (i, second word, third
-+    word or 0, 0) for Philox, so the same state gives the same bits
-+    (torch.manual_seed reproduces random numbers). The output state advances
-+    the second word by one per four elements.
-+
-+    The device computes 64-bit integers in 32 bits: the state's words count
-+    modulo 2^32, and 64-bit outputs have 32 random low bits. Outputs other
-+    than unsigned integers, of 2^32 elements or more, and states of fewer
-+    than two words, are errors.
++    stablehlo.rng_bit_generator on the device. The state is a vector of at
++    least two words w0, w1, ...; the key is (w0, 0), and element i of `output`
++    (in row-major order) is the low `width` bits of the first word of
++    Threefry-2x32 with 20 rounds of counter (i, w1), or with `philox`, of
++    Philox-4x32 with 10 rounds of counter (i, w1, w2 or 0, 0).
++    `output_state` is the state with w1 advanced by ceil(elements / 4), so the
++    next call uses other counters. The words count modulo 2^32.
 +  }];
-+  let dependentDialects = ["::mlir::func::FuncDialect",
-+                           "::mlir::stablehlo::StablehloDialect"];
++
++  let arguments = (ins AnyRankedTensor:$initial_state,
++                       DefaultValuedAttr<BoolAttr, "false">:$philox,
++                       DefaultValuedAttr<UI32Attr, "32">:$width);
++
++  let results = (outs AnyRankedTensor:$output_state,
++                      AnyRankedTensor:$output);
 +}
 +
- def FlattenOrConvertCompositesPass : Pass<"flatten-or-convert-composites", "::mlir::ModuleOp"> {
-   let summary = "Flatten or convert stablehlo.composite ops depending on whether they have custom sharding rules.";
+ def TTIR_DropoutOp : TTIR_Op<"dropout", [TTCore_NonCacheableTrait]> {
+   let summary = "Dropout operation.";
    let description = [{
-diff --git a/lib/Dialect/StableHLO/Transforms/ExpandRngBitGenerator.cpp b/lib/Dialect/StableHLO/Transforms/ExpandRngBitGenerator.cpp
-new file mode 100644
---- /dev/null
-+++ b/lib/Dialect/StableHLO/Transforms/ExpandRngBitGenerator.cpp
-@@ -0,0 +1,294 @@
-+// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
-+//
-+// SPDX-License-Identifier: Apache-2.0
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -3749,6 +3749,27 @@ def TTNN_RandOp : TTNN_CreationOp<"rand", [TTCore_NonCacheableTrait]> {
+   let hasVerifier = 1;
+ }
+ 
++def TTNN_RngBitGeneratorOp : TTNN_Op<"rng_bit_generator", [OpModelExempt]> {
++    let summary = "Counter-based random bits from a state.";
++    let description = [{
++      ttnn::experimental::rng_bits: see ttir.rng_bit_generator. The kernels
++      read the state on the device. The state and both results are tiled.
++    }];
 +
-+#include "ttmlir/Dialect/StableHLO/Transforms/Passes.h"
++    let arguments = (ins AnyRankedTensor:$initial_state,
++                         DefaultValuedAttr<BoolAttr, "false">:$philox,
++                         DefaultValuedAttr<UI32Attr, "32">:$width);
 +
-+#include "mlir/Dialect/Func/IR/FuncOps.h"
-+#include "mlir/IR/Builders.h"
-+#include "mlir/IR/BuiltinTypes.h"
-+#include "mlir/IR/SymbolTable.h"
-+#include "stablehlo/dialect/StablehloOps.h"
++    let results = (outs AnyRankedTensor:$output_state,
++                        AnyRankedTensor:$output);
 +
-+using namespace mlir;
-+
-+namespace mlir::tt::stablehlo {
-+#define GEN_PASS_DEF_STABLEHLOEXPANDRNGBITGENERATORPASS
-+#include "ttmlir/Dialect/StableHLO/Transforms/Passes.h.inc"
-+
-+//===----------------------------------------------------------------------===//
-+// ExpandRngBitGenerator overview
-+//===----------------------------------------------------------------------===//
-+// stablehlo.rng_bit_generator returns random bits that are a function of its
-+// state: the same state gives the same bits, which is what makes
-+// torch.manual_seed reproducible. This pass computes them on the device with
-+// the requested algorithm, from 32-bit integer arithmetic:
-+//
-+//   DEFAULT, THREE_FRY: Threefry-2x32 with 20 rounds (JAX's threefry2x32)
-+//   PHILOX:             Philox-4x32 with 10 rounds (Random123's philox4x32_10)
-+//
-+// Both are counter-based. With the state's words w0, w1 (and w2, for a
-+// three-word Philox state; torch_tpu's state is [seed, offset]), the key is
-+// (w0, 0), and element i (in row-major order) is the first word of counter
-+// (i, w1) for Threefry and (i, w1, w2, 0) for Philox. The arithmetic is on
-+// tensors of the output's shape: one-dimensional tensors would take 32 times
-+// their size in tiles. The output state advances w1 by one per four elements,
-+// so the next call uses other counters.
-+//
-+// DEFAULT and THREE_FRY use the state's first two words. The device computes
-+// 64-bit integers in 32 bits: the state's words count modulo 2^32, and 64-bit
-+// outputs have 32 random low bits. Outputs other than unsigned integers, of
-+// 2^32 elements or more, and states of fewer than two words, are errors.
-+//===----------------------------------------------------------------------===//
-+
-+namespace {
-+
-+// Unsigned 32-bit arithmetic on tensors of one shape; the keys are
-+// tensor<1xui32>s, which are broadcast to it.
-+class Arith {
-+public:
-+  Arith(OpBuilder &builder, Location loc, ArrayRef<int64_t> shape,
-+        SymbolTable &symbols)
-+      : b(builder), loc(loc), symbols(symbols),
-+        type(RankedTensorType::get(shape, builder.getIntegerType(32, false))),
-+        keyType(type.clone({1})) {}
-+
-+  Value constant(uint32_t value, RankedTensorType type) {
-+    return b.create<mlir::stablehlo::ConstantOp>(
-+        loc, DenseElementsAttr::get(type, ArrayRef<uint32_t>{value}));
-+  }
-+  Value constant(uint32_t value) { return constant(value, type); }
-+  Value key(uint32_t value) { return constant(value, keyType); }
-+  Value broadcast(Value key) {
-+    return b.create<mlir::stablehlo::BroadcastInDimOp>(
-+        loc, type, key, b.getDenseI64ArrayAttr({type.getRank() - 1}));
-+  }
-+  // The elements' row-major indices.
-+  Value index() {
-+    Value index;
-+    uint32_t stride = 1;
-+    for (int64_t d = type.getRank() - 1; d >= 0; --d) {
-+      Value i = b.create<mlir::stablehlo::IotaOp>(loc, type, d);
-+      if (stride != 1) {
-+        i = b.create<mlir::stablehlo::MulOp>(loc, i, constant(stride));
++    let extraClassDeclaration = [{
++      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
++        return wa::TTNNOperandsWorkaroundsFactory::createRngBitGeneratorOpOperandsWorkarounds();
 +      }
-+      index = index ? add(index, i) : i;
-+      stride *= type.getDimSize(d);
-+    }
-+    return index;
-+  }
-+  Value add(Value x, Value y) {
-+    return b.create<mlir::stablehlo::AddOp>(loc, x, y);
-+  }
-+  Value xorOp(Value x, Value y) {
-+    return b.create<mlir::stablehlo::XorOp>(loc, x, y);
-+  }
-+  Value rotateLeft(Value x, int r) {
-+    return b.create<mlir::stablehlo::OrOp>(
-+        loc, b.create<mlir::stablehlo::ShiftLeftOp>(loc, x, constant(r)),
-+        b.create<mlir::stablehlo::ShiftRightLogicalOp>(loc, x,
-+                                                       constant(32 - r)));
-+  }
-+  // The low and high halves of the 64-bit product. The high half is a
-+  // chlo.mulhi composite, as JAX emits for lax.mulhi, which runs as ttir.mulhi.
-+  std::pair<Value, Value> multiply(uint32_t x, Value y) {
-+    Value low = b.create<mlir::stablehlo::MulOp>(loc, constant(x), y);
-+    Value high =
-+        b.create<mlir::stablehlo::CompositeOp>(
-+             loc, TypeRange{type}, ValueRange{constant(x), y}, "chlo.mulhi",
-+             b.getDictionaryAttr({}), mulhiDecomposition().getSymName())
-+            .getResult(0);
-+    return {low, high};
-+  }
-+
-+  // The first word of Threefry-2x32 with 20 rounds of the counters x under
-+  // the key (k0, 0).
-+  Value threefry(Value k0, std::array<Value, 2> x) {
-+    static constexpr int kRotations[2][4] = {{13, 15, 26, 6},
-+                                             {17, 29, 16, 24}};
-+    Value ks[3] = {k0, key(0), xorOp(k0, key(0x1BD11BDA))};
-+    x[0] = add(x[0], broadcast(ks[0]));
-+    for (int i = 0; i < 5; ++i) {
-+      for (int r : kRotations[i % 2]) {
-+        x[0] = add(x[0], x[1]);
-+        x[1] = xorOp(rotateLeft(x[1], r), x[0]);
-+      }
-+      x[0] = add(x[0], broadcast(ks[(i + 1) % 3]));
-+      x[1] = add(x[1], broadcast(add(ks[(i + 2) % 3], key(i + 1))));
-+    }
-+    return x[0];
-+  }
-+
-+  // The first word of Philox-4x32 with 10 rounds of the counters x under the
-+  // key (k0, 0).
-+  Value philox(Value k0, std::array<Value, 4> x) {
-+    uint32_t k1 = 0;
-+    for (int round = 0; round < 10; ++round) {
-+      if (round > 0) {
-+        k0 = add(k0, key(0x9E3779B9));
-+        k1 += 0xBB67AE85;
-+      }
-+      auto [low0, high0] = multiply(0xD2511F53, x[0]);
-+      auto [low1, high1] = multiply(0xCD9E8D57, x[2]);
-+      x = {xorOp(xorOp(high1, x[1]), broadcast(k0)), low1,
-+           xorOp(xorOp(high0, x[3]), constant(k1)), low0};
-+    }
-+    return x[0];
-+  }
-+
-+private:
-+  // The chlo.mulhi composite's decomposition: the 64-bit product's high half.
-+  func::FuncOp mulhiDecomposition() {
-+    if (decomposition) {
-+      return decomposition;
-+    }
-+    OpBuilder::InsertionGuard guard(b);
-+    b.setInsertionPointToEnd(&symbols.getOp()->getRegion(0).front());
-+    decomposition = b.create<func::FuncOp>(
-+        loc, "rng_bit_generator_mulhi", b.getFunctionType({type, type}, type));
-+    decomposition.setPrivate();
-+    symbols.insert(decomposition);
-+    b.setInsertionPointToStart(decomposition.addEntryBlock());
-+    auto wide = type.clone(b.getIntegerType(64, false));
-+    Value x = b.create<mlir::stablehlo::ConvertOp>(
-+        loc, wide, decomposition.getArgument(0));
-+    Value y = b.create<mlir::stablehlo::ConvertOp>(
-+        loc, wide, decomposition.getArgument(1));
-+    Value high = b.create<mlir::stablehlo::ShiftRightLogicalOp>(
-+        loc, b.create<mlir::stablehlo::MulOp>(loc, x, y),
-+        b.create<mlir::stablehlo::ConstantOp>(
-+            loc, DenseElementsAttr::get(wide, ArrayRef<uint64_t>{32})));
-+    b.create<func::ReturnOp>(
-+        loc, ValueRange{b.create<mlir::stablehlo::ConvertOp>(loc, type, high)});
-+    return decomposition;
-+  }
-+
-+  OpBuilder &b;
-+  Location loc;
-+  SymbolTable &symbols;
-+  func::FuncOp decomposition;
-+
-+public:
-+  RankedTensorType type;
-+  RankedTensorType keyType;
-+};
-+
-+// Word `index` of the state as a tensor<1xui32> (its low 32 bits).
-+Value stateWord(OpBuilder &b, Location loc, Value state, int64_t index) {
-+  Value word = b.create<mlir::stablehlo::SliceOp>(
-+      loc, state, b.getDenseI64ArrayAttr({index}),
-+      b.getDenseI64ArrayAttr({index + 1}), b.getDenseI64ArrayAttr({1}));
-+  auto ui32 = b.getIntegerType(32, false);
-+  if (cast<RankedTensorType>(word.getType()).getElementType() != ui32) {
-+    word = b.create<mlir::stablehlo::ConvertOp>(loc, word, ui32);
-+  }
-+  return word;
++    }];
 +}
 +
-+LogicalResult expand(mlir::stablehlo::RngBitGeneratorOp op,
-+                     SymbolTable &symbols) {
-+  Value state = op.getInitialState();
-+  auto stateType = cast<RankedTensorType>(state.getType());
-+  auto outputType = cast<RankedTensorType>(op.getOutput().getType());
-+  auto stateElementType = dyn_cast<IntegerType>(stateType.getElementType());
-+  auto elementType = dyn_cast<IntegerType>(outputType.getElementType());
-+  if (!outputType.hasStaticShape() || !stateType.hasStaticShape()) {
-+    return op.emitOpError("with a dynamic shape isn't supported");
-+  }
-+  if (!elementType || !elementType.isUnsigned() ||
-+      elementType.getWidth() > 64) {
-+    return op.emitOpError("generates unsigned integers of up to 64 bits, not ")
-+           << outputType.getElementType();
-+  }
-+  if (outputType.getNumElements() >= (int64_t{1} << 32)) {
-+    return op.emitOpError("generates fewer than 2^32 elements");
-+  }
-+  if (stateType.getRank() != 1 || stateType.getDimSize(0) < 2 ||
-+      !stateElementType ||
-+      (stateElementType.getWidth() != 32 &&
-+       stateElementType.getWidth() != 64)) {
-+    return op.emitOpError("needs a state of at least two 32- or 64-bit "
-+                          "integers, not ")
-+           << stateType;
-+  }
+ def TTNN_DropoutOp : TTNN_Op<"dropout", [TTCore_NonCacheableTrait]> {
+   let summary = "Dropout operation.";
+   let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -281,6 +281,10 @@ public:
+   static TTNNOperandsWorkarounds
+   createRowsScatterOpOperandsWorkarounds(mlir::Operation *op);
+ 
++  // Create workarounds for rng_bit_generator: its new state has the state's
++  // layout, so both are tiled, like the bits.
++  static TTNNOperandsWorkarounds createRngBitGeneratorOpOperandsWorkarounds();
 +
-+  OpBuilder b(op);
-+  Location loc = op.getLoc();
-+  const int64_t elements = outputType.getNumElements();
-+  if (elements == 0) {
-+    op->replaceAllUsesWith(ValueRange{
-+        state, b.create<mlir::stablehlo::ConstantOp>(
-+                   loc, DenseElementsAttr::get(outputType, ArrayRef<APInt>{}))});
-+    op->erase();
+   // Create workarounds for scatter op operands.
+   static TTNNOperandsWorkarounds
+   createScatterOpOperandsWorkarounds(mlir::Operation *op);
+diff --git a/include/ttmlir/Target/TTNN/operations/rand.fbs b/include/ttmlir/Target/TTNN/operations/rand.fbs
+--- a/include/ttmlir/Target/TTNN/operations/rand.fbs
++++ b/include/ttmlir/Target/TTNN/operations/rand.fbs
+@@ -14,3 +14,14 @@ table RandOp {
+   memcfg: tt.target.ttnn.MemoryConfig;
+   out: tt.target.ttnn.TensorRef;
+ }
++
++// ttnn::experimental::rng_bits: bits of shape `size` drawn from the state on
++// the device (see ttir.rng_bit_generator).
++table RngBitGeneratorOp {
++  initial_state: tt.target.ttnn.TensorRef;
++  size: [int64];
++  philox: bool;
++  width: uint32;
++  output_state: tt.target.ttnn.TensorRef;
++  out: tt.target.ttnn.TensorRef;
++}
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -140,6 +140,7 @@ union OpType {
+   PrepareConvTranspose2dBiasOp,
+   PrepareConvTranspose2dWeightsOp,
+   RandOp,
++  RngBitGeneratorOp,
+   ReductionArgMaxOp,
+   ReductionOp,
+   ReductionProdOp,
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -9771,40 +9771,69 @@ public:
+   matchAndRewrite(mlir::stablehlo::RngBitGeneratorOp srcOp,
+                   mlir::stablehlo::RngBitGeneratorOp::Adaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
++    // The bits are a function of the state, computed on the device by
++    // ttir.rng_bit_generator: Threefry for DEFAULT and THREE_FRY, Philox for
++    // PHILOX. The device's words are 32 bits: narrower elements are their low
++    // bits, and 64-bit integers are 32-bit on the device.
++    Value state = adaptor.getInitialState();
++    auto stateType = mlir::cast<RankedTensorType>(state.getType());
+     auto outputType = mlir::cast<RankedTensorType>(
+         getTypeConverter()->convertType(srcOp.getOutput().getType()));
++    auto stateElementType =
++        mlir::dyn_cast<IntegerType>(stateType.getElementType());
++    auto elementType = mlir::dyn_cast<IntegerType>(outputType.getElementType());
++    if (!outputType.hasStaticShape() || !stateType.hasStaticShape()) {
++      return srcOp.emitOpError("with a dynamic shape isn't supported");
++    }
++    if (!elementType || !elementType.isUnsigned() ||
++        elementType.getWidth() > 64) {
++      return srcOp.emitOpError(
++                 "generates unsigned integers of up to 64 bits, not ")
++             << outputType.getElementType();
++    }
++    if (outputType.getNumElements() >= (int64_t{1} << 32)) {
++      return srcOp.emitOpError("generates fewer than 2^32 elements");
++    }
++    if (stateType.getRank() != 1 || stateType.getDimSize(0) < 2 ||
++        !stateElementType ||
++        (stateElementType.getWidth() != 32 &&
++         stateElementType.getWidth() != 64)) {
++      return srcOp.emitOpError("needs a state of at least two 32- or 64-bit "
++                               "integers, not ")
++             << stateType;
++    }
++    if (outputType.getNumElements() == 0) {
++      rewriter.replaceOp(
++          srcOp, {state, rewriter.create<ttir::ConstantOp>(
++                             srcOp.getLoc(), outputType,
++                             DenseElementsAttr::get(outputType,
++                                                    ArrayRef<APInt>{}))});
++      return success();
++    }
+ 
+-    llvm::SmallVector<int32_t> size(outputType.getShape());
+-
+-    auto floatElementType = rewriter.getF32Type();
+-    auto floatOutputType = mlir::RankedTensorType::get(
+-        outputType.getShape(), floatElementType, outputType.getEncoding());
+-
+-    // Use min and max unsigned int value to cover most of the range of uint32.
+-    auto fromFloat = rewriter.getF32FloatAttr(
+-        static_cast<float>(std::numeric_limits<unsigned int>::min()));
+-    auto toFloat = rewriter.getF32FloatAttr(
+-        static_cast<float>(std::numeric_limits<unsigned int>::max()));
+-
+-    // Seed set to 0 is a special case that is equivalent to no seed.
+-    // Using any other value would make every flatbuffer run deterministic.
+-    auto seed = rewriter.getUI32IntegerAttr(0);
+-
+-    auto randOp = rewriter.create<mlir::tt::ttir::RandOp>(
+-        srcOp.getLoc(), floatOutputType, rewriter.getI32ArrayAttr(size),
+-        fromFloat, toFloat, seed);
+-
+-    // TODO (pglusac): Change to bit cast once we support it or remove if
+-    // rand starts supporting uint32.
+-    // See https://github.com/tenstorrent/tt-mlir/issues/5078
+-    auto typecastOp = rewriter.create<mlir::tt::ttir::TypecastOp>(
+-        srcOp.getLoc(), outputType, randOp.getResult());
+-
+-    // HACK (pglusac): Output state is discarded, initial state is returned as
+-    // a result. https://github.com/tenstorrent/tt-mlir/issues/5101
+-    rewriter.replaceOp(srcOp,
+-                       {adaptor.getInitialState(), typecastOp.getResult()});
+-
++    // A scalar is drawn as a vector of one element.
++    SmallVector<int64_t> shape(outputType.getShape());
++    if (shape.empty()) {
++      shape.push_back(1);
++    }
++    const uint32_t width = std::min<uint32_t>(elementType.getWidth(), 32);
++    auto bitsType = RankedTensorType::get(
++        shape, width < 32 ? rewriter.getIntegerType(32, false) : elementType);
++    auto rng = rewriter.create<ttir::RngBitGeneratorOp>(
++        srcOp.getLoc(), stateType, bitsType, state,
++        rewriter.getBoolAttr(srcOp.getRngAlgorithm() ==
++                             mlir::stablehlo::RngAlgorithm::PHILOX),
++        rewriter.getUI32IntegerAttr(width));
++    Value bits = rng.getOutput();
++    if (width < 32) {
++      bits = rewriter.create<ttir::TypecastOp>(
++          srcOp.getLoc(), bitsType.clone(elementType), bits);
++    }
++    if (outputType.getRank() == 0) {
++      bits = rewriter.create<ttir::ReshapeOp>(srcOp.getLoc(), outputType, bits,
++                                              rewriter.getI32ArrayAttr({}));
++    }
++    rewriter.replaceOp(srcOp, {rng.getOutputState(), bits});
+     return success();
+   }
+ };
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -594,6 +594,28 @@ public:
+ };
+ } // namespace
+ 
++namespace {
++class RngBitGeneratorOpConversionPattern
++    : public OpConversionPattern<ttir::RngBitGeneratorOp> {
++public:
++  using OpConversionPattern<ttir::RngBitGeneratorOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(ttir::RngBitGeneratorOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    SmallVector<Type> resultTypes;
++    if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
++                                                      resultTypes))) {
++      return failure();
++    }
++    rewriter.replaceOpWithNewOp<ttnn::RngBitGeneratorOp>(
++        op, resultTypes[0], resultTypes[1], adaptor.getInitialState(),
++        adaptor.getPhilox(), adaptor.getWidth());
 +    return success();
 +  }
++};
++} // namespace
 +
-+  // A scalar output is computed as a tensor<1xui32>.
-+  SmallVector<int64_t> shape(outputType.getShape());
-+  if (shape.empty()) {
-+    shape.push_back(1);
-+  }
-+  Arith arith(b, loc, shape, symbols);
-+  Value seed = stateWord(b, loc, state, 0);
-+  Value offset = arith.broadcast(stateWord(b, loc, state, 1));
-+  Value bits;
-+  if (op.getRngAlgorithm() == mlir::stablehlo::RngAlgorithm::PHILOX) {
-+    Value high = stateType.getDimSize(0) > 2
-+                     ? arith.broadcast(stateWord(b, loc, state, 2))
-+                     : arith.constant(0);
-+    bits = arith.philox(seed, {arith.index(), offset, high, arith.constant(0)});
-+  } else {
-+    bits = arith.threefry(seed, {arith.index(), offset});
-+  }
-+
-+  if (elementType.getWidth() < 32) {
-+    // The low bits of each word.
-+    bits = b.create<mlir::stablehlo::AndOp>(
-+        loc, bits,
-+        arith.constant(static_cast<uint32_t>(
-+            (uint64_t{1} << elementType.getWidth()) - 1)));
-+  }
-+  if (elementType.getWidth() != 32) {
-+    bits = b.create<mlir::stablehlo::ConvertOp>(
-+        loc, arith.type.clone(elementType), bits);
-+  }
-+  if (outputType.getRank() == 0) {
-+    bits = b.create<mlir::stablehlo::ReshapeOp>(loc, outputType, bits);
-+  }
-+
-+  // The state's second word advances by one per four elements.
-+  SmallVector<APInt> advance(stateType.getDimSize(0),
-+                             APInt(stateElementType.getWidth(), 0));
-+  advance[1] = APInt(stateElementType.getWidth(), (elements + 3) / 4);
-+  Value outputState = b.create<mlir::stablehlo::AddOp>(
-+      loc, state,
-+      b.create<mlir::stablehlo::ConstantOp>(
-+          loc, DenseElementsAttr::get(stateType, advance)));
-+
-+  op->replaceAllUsesWith(ValueRange{outputState, bits});
-+  op->erase();
-+  return success();
+ namespace {
+ template <typename TTIROpTy, typename TTNNOpTy>
+ class ClampOpConversionPattern : public OpConversionPattern<TTIROpTy> {
+@@ -4191,6 +4213,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            FillCacheOpConversionPattern,
+            RowsGatherOpConversionPattern,
+            RowsScatterOpConversionPattern,
++           RngBitGeneratorOpConversionPattern,
+            PermuteOpConversionPattern,
+            UpsampleOpConversionPattern,
+            AllToAllOpConversionPattern,
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -350,6 +350,16 @@ TTNNOperandsWorkaroundsFactory::createRowsScatterOpOperandsWorkarounds(
+       .addOutputOperandWorkaround(rowMajor);
+ }
+ 
++TTNNOperandsWorkarounds
++TTNNOperandsWorkaroundsFactory::createRngBitGeneratorOpOperandsWorkarounds() {
++  TTNNOperandWorkarounds tile;
++  tile.tensorLayoutWorkaround = Layout::Tile;
++  return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
++      .addInputOperandWorkaround(tile)   // initial_state
++      .addOutputOperandWorkaround(tile)  // output_state
++      .addOutputOperandWorkaround(tile); // output
 +}
 +
-+struct StableHLOExpandRngBitGeneratorPass
-+    : public impl::StableHLOExpandRngBitGeneratorPassBase<
-+          StableHLOExpandRngBitGeneratorPass> {
-+  using impl::StableHLOExpandRngBitGeneratorPassBase<
-+      StableHLOExpandRngBitGeneratorPass>::
-+      StableHLOExpandRngBitGeneratorPassBase;
-+
-+  void runOnOperation() override {
-+    SymbolTable symbols(getOperation());
-+    SmallVector<mlir::stablehlo::RngBitGeneratorOp> ops;
-+    getOperation().walk(
-+        [&](mlir::stablehlo::RngBitGeneratorOp op) { ops.push_back(op); });
-+    for (auto op : ops) {
-+      if (failed(expand(op, symbols))) {
-+        return signalPassFailure();
-+      }
-+    }
-+  }
-+};
-+
-+} // namespace
-+} // namespace mlir::tt::stablehlo
-diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
---- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
-+++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
-@@ -78,6 +78,8 @@
-   pm.addPass(
-       mlir::tt::stablehlo::createStableHLOComplexDataTypeConversionPass());
+ // Factory method to create a set of workarounds for ScatterOp. The ScatterOp
+ // expects the input to be in row-major layout if using f32, bf16, or int32.
+ TTNNOperandsWorkarounds
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+@@ -651,6 +651,7 @@ const std::set<mlir::StringRef>
+         ttnn::ScatterOp::getOperationName(),
+         ttnn::RowsGatherOp::getOperationName(),
+         ttnn::RowsScatterOp::getOperationName(),
++        ttnn::RngBitGeneratorOp::getOperationName(),
+         ttnn::ConcatOp::getOperationName(),
+         // ttnn clamp TT_FATALs on uint8/uint16 inputs; its operands
+         // workaround clamps them as int32.
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -3278,6 +3278,19 @@ createRandOp(FlatbufferObjectCache &cache, RandOp op) {
+       seed, dtype, layout, memoryConfig, out);
+ }
  
-+  // Before composites become TTIR ops: Philox uses chlo.mulhi composites.
-+  pm.addPass(mlir::tt::stablehlo::createStableHLOExpandRngBitGeneratorPass());
-   pm.addPass(createLegalizeStableHLOCompositeToTTIRPass());
-   if (options.legalizeCompositeToCallEnabled) {
-     pm.addPass(::mlir::stablehlo::createStablehloLegalizeCompositeToCallPass());
++::flatbuffers::Offset<::tt::target::ttnn::RngBitGeneratorOp>
++createRngBitGeneratorOp(FlatbufferObjectCache &cache, RngBitGeneratorOp op) {
++  auto state = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getInitialState()));
++  auto size = cache.fbb->CreateVector<int64_t>(op.getOutput().getType().getShape());
++  auto outputState = cache.getOrCreateNoSharding(
++      op.getOutputState(), tensorValueToFlatbuffer, /*local_shape*/ std::nullopt);
++  auto out = cache.getOrCreateNoSharding(
++      op.getOutput(), tensorValueToFlatbuffer, /*local_shape*/ std::nullopt);
++  return ::tt::target::ttnn::CreateRngBitGeneratorOp(
++      *cache.fbb, state, size, op.getPhilox(), op.getWidth(), outputState, out);
++}
++
+ ::flatbuffers::Offset<::tt::target::ttnn::DropoutOp>
+ createDropoutOp(FlatbufferObjectCache &cache, DropoutOp op) {
+   auto in = cache.at<::tt::target::ttnn::TensorRef>(
+@@ -5554,6 +5567,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createRandOp(cache, randOp), debugString,
+                            locInfo);
+   }
++  if (auto rngOp = dyn_cast<RngBitGeneratorOp>(op); rngOp) {
++    return createOperation(cache, createRngBitGeneratorOp(cache, rngOp),
++                           debugString, locInfo);
++  }
+   if (auto dropoutOp = dyn_cast<DropoutOp>(op); dropoutOp) {
+     return createOperation(cache, createDropoutOp(cache, dropoutOp),
+                            debugString, locInfo);
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -101,6 +101,7 @@
+ #include "operations/pool/pool2d.h"
+ #include "operations/pool/upsample.h"
+ #include "operations/rand/rand.h"
++#include "operations/rand/rng_bit_generator.h"
+ #include "operations/reduction/argmax.h"
+ #include "operations/reduction/cumprod.h"
+ #include "operations/reduction/cumulative.h"
+@@ -504,6 +505,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+   case ::tt::target::ttnn::OpType::RandOp: {
+     return operations::rand::run(op->type_as_RandOp(), getContext());
+   }
++  case ::tt::target::ttnn::OpType::RngBitGeneratorOp: {
++    return operations::rand::run(op->type_as_RngBitGeneratorOp(),
++                                 getContext());
++  }
+   case ::tt::target::ttnn::OpType::ReshapeOp: {
+     return operations::data_movement::run(op->type_as_ReshapeOp(),
+                                           getContext());
