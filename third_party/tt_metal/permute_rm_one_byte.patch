@@ -1,18 +1,17 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflow/reader_permute_interleaved_rm_blocked_generic.cpp ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflow/reader_permute_interleaved_rm_blocked_generic.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflow/reader_permute_interleaved_rm_blocked_generic.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflow/reader_permute_interleaved_rm_blocked_generic.cpp
-@@ -8,6 +8,10 @@
+@@ -8,6 +8,9 @@
  #include "ttnn/operations/data_movement/common/kernels/common.hpp"
  #include "api/dataflow/noc.h"
  #include "api/dataflow/dataflow_buffer.h"
 +#ifdef PERMUTE_REALIGN
-+#include "api/dataflow/endpoints.h"
 +#include "api/scratchpad.h"
 +#endif
  #include "api/core_local_mem.h"
  #include "api/tensor/noc_traits.h"
  #include "experimental/kernel_args.h"
-@@ -23,6 +27,8 @@
+@@ -23,6 +26,8 @@
      constexpr uint32_t x_block_size = get_arg(args::x_block_size);
      constexpr uint32_t w_block_size = get_arg(args::w_block_size);
      constexpr uint32_t element_size = get_arg(args::element_size);
@@ -21,7 +20,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflo
  
      // Precomputed constants: size of a 32 element block along the W dimension (measured in bytes)
      constexpr uint32_t w_block_size_bytes = w_block_size * element_size;
-@@ -57,6 +63,13 @@
+@@ -57,6 +62,13 @@
      const auto s0 = TensorAccessor(tensor::input);
      Noc noc;
  
@@ -35,7 +34,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflo
      uint32_t idxs[N];
      idxs[N - 1] = 0;
      uint32_t non_x_rows = num_rows / X;
-@@ -111,17 +124,44 @@
+@@ -111,17 +123,38 @@
  
          // We read in 'x_block_len' chunks along the X dimension
          uint32_t page_offset = 0;
@@ -61,17 +60,11 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflo
          // Wait for all async reads to complete before proceeding
          noc.async_read_barrier();
 +#ifdef PERMUTE_REALIGN
++        // Staged rows and block rows both start at multiples of 16 bytes.
 +        staged_row = realign_base + misalignment;
 +        for (uint32_t x = x_start; x < x_end; ++x) {
-+            CoreLocalMem<uint32_t> dst(src_buffer_l1_addr + page_offset);
-+            noc.async_read(
-+                UnicastEndpoint{},
-+                dst,
-+                w_read_size_bytes,
-+                {.noc_x = (uint32_t)my_x[noc.get_noc_id()],
-+                 .noc_y = (uint32_t)my_y[noc.get_noc_id()],
-+                 .addr = staged_row},
-+                {.offset_bytes = 0});
++            tt::data_movement::common::tt_memmove<true, true, true, w_block_size_bytes>(
++                noc, src_buffer_l1_addr + page_offset, staged_row, w_read_size_bytes);
 +            staged_row += realign_row_size;
 +            page_offset += input_cb_page_size;
 +        }
