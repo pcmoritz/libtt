@@ -381,6 +381,7 @@ http_archive(
         "//third_party/tt_metal:memory_pin_resource.patch",
         "//third_party/tt_metal:pad_rm_float32_value.patch",
         "//third_party/tt_metal:pad_rm_float16_value.patch",
+        "//third_party/tt_metal:pool2d_float16.patch",
     ],
     sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
     strip_prefix = "tt-metal-eb97711f4be2a30cfbff05266faf90bf9780d0c2",
@@ -646,6 +647,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_pool_large_padding.patch",
         "//third_party/tt_xla:tt_mlir_avg_pool_float_divisor.patch",
         "//third_party/tt_xla:tt_mlir_to_layout_unaligned_shards.patch",
+        "//third_party/tt_xla:tt_mlir_pool_float16.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
