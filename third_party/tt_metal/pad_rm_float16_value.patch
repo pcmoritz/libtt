@@ -1,0 +1,13 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_reader_writer_multi_core_default_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_reader_writer_multi_core_default_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_reader_writer_multi_core_default_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_reader_writer_multi_core_default_program_factory.cpp
+@@ -113,6 +113,9 @@
+     } else if (a.dtype() == DataType::FLOAT32) {
+         // The reader fills 32-bit words; two bfloat16 copies of 1.0 read back as 1.0019379.
+         packed_pad_value = std::bit_cast<uint32_t>(pad_value);
++    } else if (a.dtype() == DataType::FLOAT16) {
++        uint16_t value = tt::tt_metal::float16(pad_value).bits;
++        packed_pad_value = pack_two_uint16_into_uint32({value, value});
+     } else {
+         packed_pad_value = pack_two_bfloat16_into_uint32({bfloat16(pad_value), bfloat16(pad_value)});
+     }
