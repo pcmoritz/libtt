@@ -1,11 +1,11 @@
 """stablehlo.rng_bit_generator: the bits are a function of the state.
 
 libtt computes them with Threefry-2x32 (20 rounds) for DEFAULT and THREE_FRY,
-and with Philox-4x32 (10 rounds) for PHILOX. The key is (state[0], 0), and the
-i-th counter is (i, state[1]) for Threefry and (i, state[1], state[2] or 0, 0)
-for Philox. The output takes the counters' first words, then their second
-words, and so on. The output state advances state[1] by one per four elements,
-so the next call uses other counters.
+and with Philox-4x32 (10 rounds) for PHILOX. The key is (state[0], 0), and
+element i (in row-major order) is the first word of counter (i, state[1]) for
+Threefry and (i, state[1], state[2] or 0, 0) for Philox. The output state
+advances state[1] by one per four elements, so the next call uses other
+counters.
 
 The states are u64[2], as torch_tpu passes them. (JAX's u32[4] keys need a
 width-changing bitcast to u64[2], which libtt doesn't compile.) The device's
@@ -105,16 +105,13 @@ def philox4x32(key, counters):
 
 
 def expected(algorithm, state, elements):
-    """The 32-bit words that libtt draws from a state."""
+    """The 32-bit words that libtt draws from a state, in row-major order."""
     seed, offset, *rest = (int(word) & M32 for word in state)
+    i, n = np.arange(elements), elements
     if algorithm == "PHILOX":
-        n = -(-elements // 4)
         high = rest[0] if rest else 0
-        words = philox4x32((seed, 0), [np.arange(n), np.full(n, offset), np.full(n, high), np.zeros(n)])
-    else:
-        n = -(-elements // 2)
-        words = threefry2x32((seed, 0), [np.arange(n), np.full(n, offset)])
-    return np.concatenate(words)[:elements]
+        return philox4x32((seed, 0), [i, np.full(n, offset), np.full(n, high), np.zeros(n)])[0]
+    return threefry2x32((seed, 0), [i, np.full(n, offset)])[0]
 
 
 def advanced(old, elements):
@@ -148,14 +145,32 @@ def test_references_match_known_answers(generator, key, counters, words):
 @pytest.mark.parametrize("algorithm", ALGORITHMS)
 @pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.uint32, np.uint64])
 def test_bits_match_reference(algorithm, dtype):
-    """35 elements, which don't fill the last counter. 8- and 16-bit elements
-    are the words' low bits; 64-bit elements are the words, as the device's
-    64-bit integers hold 32 bits."""
+    """8- and 16-bit elements are the words' low bits; 64-bit elements are the
+    words, as the device's 64-bit integers hold 32 bits."""
     old = state(0xDEADBEEF, 3)
     new, values = bits(old, (5, 7), dtype, algorithm)
     np.testing.assert_array_equal(values, expected(algorithm, old, 35).astype(dtype).reshape(5, 7))
     assert values.dtype == np.dtype(dtype)
     np.testing.assert_array_equal(new, advanced(old, 35))
+
+
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+@pytest.mark.parametrize("shape", [(), (1,), (3, 5, 7), (2, 1, 33)])
+def test_shapes(algorithm, shape):
+    old = state(0xDEADBEEF, 3)
+    elements = int(np.prod(shape))
+    new, values = bits(old, shape, np.uint32, algorithm)
+    np.testing.assert_array_equal(values, expected(algorithm, old, elements).reshape(shape))
+    np.testing.assert_array_equal(new, advanced(old, elements))
+
+
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+def test_large_output(algorithm):
+    """16M elements, as torch.rand(4096, 4096) draws."""
+    old = state(7, 1)
+    new, values = bits(old, (4096, 4096), np.uint32, algorithm)
+    np.testing.assert_array_equal(values.ravel(), expected(algorithm, old, 4096 * 4096))
+    np.testing.assert_array_equal(new, advanced(old, 4096 * 4096))
 
 
 def test_philox_three_word_state():

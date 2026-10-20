@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td b/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
 --- a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
 +++ b/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
-@@ -367,6 +367,25 @@
+@@ -367,6 +367,27 @@
    ];
  }
  
@@ -11,14 +11,16 @@ diff --git a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td b/include/ttm
 +    This pass expands stablehlo.rng_bit_generator into counter-based
 +    generators of 32-bit integer arithmetic: Threefry-2x32 with 20 rounds for
 +    DEFAULT and THREE_FRY, Philox-4x32 with 10 rounds for PHILOX. The key is
-+    the state's first word, and the i-th counter is (i, second word) for
-+    Threefry and (i, second word, third word or 0, 0) for Philox, so the same
-+    state gives the same bits (torch.manual_seed reproduces random numbers).
-+    The output state advances the second word by one per four elements.
++    the state's first word, and element i (in row-major order) is the first
++    word of counter (i, second word) for Threefry and (i, second word, third
++    word or 0, 0) for Philox, so the same state gives the same bits
++    (torch.manual_seed reproduces random numbers). The output state advances
++    the second word by one per four elements.
 +
 +    The device computes 64-bit integers in 32 bits: the state's words count
 +    modulo 2^32, and 64-bit outputs have 32 random low bits. Outputs other
-+    than unsigned integers, and states of fewer than two words, are errors.
++    than unsigned integers, of 2^32 elements or more, and states of fewer
++    than two words, are errors.
 +  }];
 +  let dependentDialects = ["::mlir::func::FuncDialect",
 +                           "::mlir::stablehlo::StablehloDialect"];
@@ -31,7 +33,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ExpandRngBitGenerator.cpp b/lib/Di
 new file mode 100644
 --- /dev/null
 +++ b/lib/Dialect/StableHLO/Transforms/ExpandRngBitGenerator.cpp
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,294 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -63,42 +65,57 @@ new file mode 100644
 +//
 +// Both are counter-based. With the state's words w0, w1 (and w2, for a
 +// three-word Philox state; torch_tpu's state is [seed, offset]), the key is
-+// (w0, 0) and the i-th counter is (i, w1) for Threefry and (i, w1, w2, 0) for
-+// Philox. Each counter gives two (Threefry) or four (Philox) 32-bit words; the
-+// output takes the first words of all counters, then the second words, and so
-+// on. The output state advances w1 by one per four output elements, so the
-+// next call uses other counters.
++// (w0, 0), and element i (in row-major order) is the first word of counter
++// (i, w1) for Threefry and (i, w1, w2, 0) for Philox. The arithmetic is on
++// tensors of the output's shape: one-dimensional tensors would take 32 times
++// their size in tiles. The output state advances w1 by one per four elements,
++// so the next call uses other counters.
 +//
 +// DEFAULT and THREE_FRY use the state's first two words. The device computes
 +// 64-bit integers in 32 bits: the state's words count modulo 2^32, and 64-bit
-+// outputs have 32 random low bits. Outputs other than unsigned integers, and
-+// states of fewer than two words, are errors.
++// outputs have 32 random low bits. Outputs other than unsigned integers, of
++// 2^32 elements or more, and states of fewer than two words, are errors.
 +//===----------------------------------------------------------------------===//
 +
 +namespace {
 +
-+// Unsigned 32-bit arithmetic on tensor<size x ui32>.
++// Unsigned 32-bit arithmetic on tensors of one shape; the keys are
++// tensor<1xui32>s, which are broadcast to it.
 +class Arith {
 +public:
-+  Arith(OpBuilder &builder, Location loc, int64_t size, SymbolTable &symbols)
++  Arith(OpBuilder &builder, Location loc, ArrayRef<int64_t> shape,
++        SymbolTable &symbols)
 +      : b(builder), loc(loc), symbols(symbols),
-+        type(RankedTensorType::get({size},
-+                                   builder.getIntegerType(32, false))) {}
++        type(RankedTensorType::get(shape, builder.getIntegerType(32, false))),
++        keyType(type.clone({1})) {}
 +
-+  Value constant(uint32_t value) {
++  Value constant(uint32_t value, RankedTensorType type) {
 +    return b.create<mlir::stablehlo::ConstantOp>(
 +        loc, DenseElementsAttr::get(type, ArrayRef<uint32_t>{value}));
 +  }
-+  // A tensor<1xui32>, broadcast to this shape.
-+  Value broadcast(Value word) {
++  Value constant(uint32_t value) { return constant(value, type); }
++  Value key(uint32_t value) { return constant(value, keyType); }
++  Value broadcast(Value key) {
 +    return b.create<mlir::stablehlo::BroadcastInDimOp>(
-+        loc, type, word, b.getDenseI64ArrayAttr({0}));
++        loc, type, key, b.getDenseI64ArrayAttr({type.getRank() - 1}));
 +  }
-+  Value iota() { return b.create<mlir::stablehlo::IotaOp>(loc, type, 0); }
++  // The elements' row-major indices.
++  Value index() {
++    Value index;
++    uint32_t stride = 1;
++    for (int64_t d = type.getRank() - 1; d >= 0; --d) {
++      Value i = b.create<mlir::stablehlo::IotaOp>(loc, type, d);
++      if (stride != 1) {
++        i = b.create<mlir::stablehlo::MulOp>(loc, i, constant(stride));
++      }
++      index = index ? add(index, i) : i;
++      stride *= type.getDimSize(d);
++    }
++    return index;
++  }
 +  Value add(Value x, Value y) {
 +    return b.create<mlir::stablehlo::AddOp>(loc, x, y);
 +  }
-+  Value add(Value x, uint32_t y) { return add(x, constant(y)); }
 +  Value xorOp(Value x, Value y) {
 +    return b.create<mlir::stablehlo::XorOp>(loc, x, y);
 +  }
@@ -120,37 +137,39 @@ new file mode 100644
 +    return {low, high};
 +  }
 +
-+  // Threefry-2x32 with 20 rounds of the counters x under the key k.
-+  std::array<Value, 2> threefry(std::array<Value, 2> k,
-+                                std::array<Value, 2> x) {
++  // The first word of Threefry-2x32 with 20 rounds of the counters x under
++  // the key (k0, 0).
++  Value threefry(Value k0, std::array<Value, 2> x) {
 +    static constexpr int kRotations[2][4] = {{13, 15, 26, 6},
 +                                             {17, 29, 16, 24}};
-+    Value ks[3] = {k[0], k[1], xorOp(xorOp(k[0], k[1]), constant(0x1BD11BDA))};
-+    x[0] = add(x[0], ks[0]);
-+    x[1] = add(x[1], ks[1]);
++    Value ks[3] = {k0, key(0), xorOp(k0, key(0x1BD11BDA))};
++    x[0] = add(x[0], broadcast(ks[0]));
 +    for (int i = 0; i < 5; ++i) {
 +      for (int r : kRotations[i % 2]) {
 +        x[0] = add(x[0], x[1]);
 +        x[1] = xorOp(rotateLeft(x[1], r), x[0]);
 +      }
-+      x[0] = add(x[0], ks[(i + 1) % 3]);
-+      x[1] = add(add(x[1], ks[(i + 2) % 3]), i + 1);
++      x[0] = add(x[0], broadcast(ks[(i + 1) % 3]));
++      x[1] = add(x[1], broadcast(add(ks[(i + 2) % 3], key(i + 1))));
 +    }
-+    return x;
++    return x[0];
 +  }
 +
-+  // Philox-4x32 with 10 rounds of the counters x under the key k.
-+  std::array<Value, 4> philox(std::array<Value, 2> k, std::array<Value, 4> x) {
++  // The first word of Philox-4x32 with 10 rounds of the counters x under the
++  // key (k0, 0).
++  Value philox(Value k0, std::array<Value, 4> x) {
++    uint32_t k1 = 0;
 +    for (int round = 0; round < 10; ++round) {
 +      if (round > 0) {
-+        k = {add(k[0], 0x9E3779B9), add(k[1], 0xBB67AE85)};
++        k0 = add(k0, key(0x9E3779B9));
++        k1 += 0xBB67AE85;
 +      }
 +      auto [low0, high0] = multiply(0xD2511F53, x[0]);
 +      auto [low1, high1] = multiply(0xCD9E8D57, x[2]);
-+      x = {xorOp(xorOp(high1, x[1]), k[0]), low1,
-+           xorOp(xorOp(high0, x[3]), k[1]), low0};
++      x = {xorOp(xorOp(high1, x[1]), broadcast(k0)), low1,
++           xorOp(xorOp(high0, x[3]), constant(k1)), low0};
 +    }
-+    return x;
++    return x[0];
 +  }
 +
 +private:
@@ -187,6 +206,7 @@ new file mode 100644
 +
 +public:
 +  RankedTensorType type;
++  RankedTensorType keyType;
 +};
 +
 +// Word `index` of the state as a tensor<1xui32> (its low 32 bits).
@@ -216,6 +236,9 @@ new file mode 100644
 +    return op.emitOpError("generates unsigned integers of up to 64 bits, not ")
 +           << outputType.getElementType();
 +  }
++  if (outputType.getNumElements() >= (int64_t{1} << 32)) {
++    return op.emitOpError("generates fewer than 2^32 elements");
++  }
 +  if (stateType.getRank() != 1 || stateType.getDimSize(0) < 2 ||
 +      !stateElementType ||
 +      (stateElementType.getWidth() != 32 &&
@@ -224,8 +247,6 @@ new file mode 100644
 +                          "integers, not ")
 +           << stateType;
 +  }
-+  bool philox =
-+      op.getRngAlgorithm() == mlir::stablehlo::RngAlgorithm::PHILOX;
 +
 +  OpBuilder b(op);
 +  Location loc = op.getLoc();
@@ -237,46 +258,38 @@ new file mode 100644
 +    op->erase();
 +    return success();
 +  }
-+  // One counter per two (Threefry) or four (Philox) elements.
-+  const int64_t width = philox ? 4 : 2;
-+  const int64_t counters = (elements + width - 1) / width;
-+  Arith arith(b, loc, counters, symbols);
-+  std::array<Value, 2> key = {arith.broadcast(stateWord(b, loc, state, 0)),
-+                              arith.constant(0)};
++
++  // A scalar output is computed as a tensor<1xui32>.
++  SmallVector<int64_t> shape(outputType.getShape());
++  if (shape.empty()) {
++    shape.push_back(1);
++  }
++  Arith arith(b, loc, shape, symbols);
++  Value seed = stateWord(b, loc, state, 0);
 +  Value offset = arith.broadcast(stateWord(b, loc, state, 1));
-+  SmallVector<Value> words;
-+  if (philox) {
++  Value bits;
++  if (op.getRngAlgorithm() == mlir::stablehlo::RngAlgorithm::PHILOX) {
 +    Value high = stateType.getDimSize(0) > 2
 +                     ? arith.broadcast(stateWord(b, loc, state, 2))
 +                     : arith.constant(0);
-+    auto x = arith.philox(key, {arith.iota(), offset, high, arith.constant(0)});
-+    words.assign(x.begin(), x.end());
++    bits = arith.philox(seed, {arith.index(), offset, high, arith.constant(0)});
 +  } else {
-+    auto x = arith.threefry(key, {arith.iota(), offset});
-+    words.assign(x.begin(), x.end());
++    bits = arith.threefry(seed, {arith.index(), offset});
 +  }
 +
-+  Value bits = b.create<mlir::stablehlo::ConcatenateOp>(loc, words, 0);
-+  auto ui32 = b.getIntegerType(32, false);
-+  if (width * counters != elements) {
-+    bits = b.create<mlir::stablehlo::SliceOp>(
-+        loc, bits, b.getDenseI64ArrayAttr({0}),
-+        b.getDenseI64ArrayAttr({elements}), b.getDenseI64ArrayAttr({1}));
-+  }
 +  if (elementType.getWidth() < 32) {
 +    // The low bits of each word.
 +    bits = b.create<mlir::stablehlo::AndOp>(
 +        loc, bits,
-+        b.create<mlir::stablehlo::ConstantOp>(
-+            loc, DenseElementsAttr::get(
-+                     cast<RankedTensorType>(bits.getType()),
-+                     ArrayRef<uint32_t>{static_cast<uint32_t>(
-+                         (uint64_t{1} << elementType.getWidth()) - 1)})));
++        arith.constant(static_cast<uint32_t>(
++            (uint64_t{1} << elementType.getWidth()) - 1)));
 +  }
-+  Value output = b.create<mlir::stablehlo::ReshapeOp>(
-+      loc, outputType.clone(ui32), bits);
 +  if (elementType.getWidth() != 32) {
-+    output = b.create<mlir::stablehlo::ConvertOp>(loc, outputType, output);
++    bits = b.create<mlir::stablehlo::ConvertOp>(
++        loc, arith.type.clone(elementType), bits);
++  }
++  if (outputType.getRank() == 0) {
++    bits = b.create<mlir::stablehlo::ReshapeOp>(loc, outputType, bits);
 +  }
 +
 +  // The state's second word advances by one per four elements.
@@ -288,7 +301,7 @@ new file mode 100644
 +      b.create<mlir::stablehlo::ConstantOp>(
 +          loc, DenseElementsAttr::get(stateType, advance)));
 +
-+  op->replaceAllUsesWith(ValueRange{outputState, output});
++  op->replaceAllUsesWith(ValueRange{outputState, bits});
 +  op->erase();
 +  return success();
 +}
