@@ -67,3 +67,23 @@ def test_pmax_pmin_2d_mesh(collective, reduce, cols):
     out = np.asarray(jax.jit(f)(jax.device_put(x, NamedSharding(mesh, P("x", "y")))))
     expected = reduce(x.reshape(2, 2, 256, cols), axis=1)
     np.testing.assert_array_equal(out, np.tile(expected, (1, 2, 1)))
+
+
+# torch.distributed's all_gather_object: every device's pickle, padded to the
+# longest, is gathered and split back into the devices' pieces. A piece that
+# tiles don't divide is gathered padded to whole tiles and sliced out, since
+# TT-NN would concatenate the 908 KB rows in L1.
+@pytest.mark.parametrize("dtype", [np.uint8, np.int32])
+def test_all_gather_split_unaligned_pieces(dtype):
+    mesh = _mesh()
+    n = mesh.devices.size
+    width = 227_093
+    x = np.random.default_rng(0).integers(0, 120, (n, width)).astype(dtype)
+
+    def body(b):
+        gathered = jax.lax.all_gather(b[0], "x", tiled=True)
+        return jnp.stack([gathered[i * width : (i + 1) * width] for i in range(n)])[None]
+
+    f = jax.shard_map(body, mesh=mesh, in_specs=P("x"), out_specs=P("x"))
+    out = np.asarray(jax.jit(f)(jax.device_put(x, NamedSharding(mesh, P("x")))))
+    np.testing.assert_array_equal(out, np.broadcast_to(x, (n, n, width)))

@@ -1,7 +1,15 @@
 diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
 --- a/pjrt_implementation/src/api/module_builder/module_builder.cc
 +++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
-@@ -157,6 +157,156 @@ static bool anyShardedAcrossDevices(
+@@ -12,6 +12,7 @@
+ #include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
++#include <functional>
+ #include <numeric>
+ 
+ // POSIX includes
+@@ -157,6 +158,281 @@ static bool anyShardedAcrossDevices(
        });
  }
  
@@ -96,6 +104,131 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
 +// program in a manual computation over a mesh of all devices, so that its
 +// collectives lower as JAX's do. The replicated boundary keeps each device's
 +// buffers and the program's signature as they are.
++// torch.distributed's all_gather into a list, which its object collectives
++// use for pickled bytes, gathers a vector and slices the devices' pieces back
++// out. TT-NN gathers a last dimension that tiles don't divide by concatenating
++// whole rows in L1, which fails for rows of megabytes. When every use is such
++// a piece (after converts), gather pieces padded to whole tiles and slice them
++// out of that instead.
++static void padUnalignedAllGathers(mlir::ModuleOp module) {
++  constexpr int64_t kTileWidth = 32;
++  constexpr int64_t kMaxRowBytes = 64 * 1024;
++  llvm::SmallVector<mlir::stablehlo::AllGatherOp> gathers;
++  module.walk([&](mlir::stablehlo::AllGatherOp gather) {
++    if (gather->getNumOperands() == 1) {
++      gathers.push_back(gather);
++    }
++  });
++  for (mlir::stablehlo::AllGatherOp gather : gathers) {
++    auto inputType =
++        mlir::cast<mlir::RankedTensorType>(gather->getOperand(0).getType());
++    auto resultType =
++        mlir::cast<mlir::RankedTensorType>(gather->getResult(0).getType());
++    const int64_t rank = inputType.getRank();
++    const int64_t dim = gather.getAllGatherDim();
++    if (dim != rank - 1 || !inputType.getElementType().isIntOrFloat()) {
++      continue;
++    }
++    const int64_t size = inputType.getDimSize(dim);
++    const int64_t elementBytes =
++        std::max<int64_t>(1, inputType.getElementTypeBitWidth() / 8);
++    if (size % kTileWidth == 0 ||
++        resultType.getDimSize(dim) * elementBytes <= kMaxRowBytes) {
++      continue;
++    }
++    // The slices of whole pieces, each with the converts between it and the
++    // gather.
++    llvm::SmallVector<std::pair<mlir::stablehlo::SliceOp,
++                                llvm::SmallVector<mlir::stablehlo::ConvertOp>>>
++        pieces;
++    llvm::SmallVector<mlir::stablehlo::ConvertOp> chain;
++    std::function<bool(mlir::Value)> collect = [&](mlir::Value value) {
++      for (mlir::Operation *user : value.getUsers()) {
++        if (auto convert = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(user)) {
++          chain.push_back(convert);
++          bool ok = collect(convert.getResult());
++          chain.pop_back();
++          if (!ok) {
++            return false;
++          }
++          continue;
++        }
++        auto slice = mlir::dyn_cast<mlir::stablehlo::SliceOp>(user);
++        if (!slice) {
++          return false;
++        }
++        for (int64_t d = 0; d < rank; ++d) {
++          const int64_t start = slice.getStartIndices()[d];
++          const int64_t limit = slice.getLimitIndices()[d];
++          const bool whole =
++              d == dim ? start % size == 0 && limit - start == size
++                       : start == 0 && limit == resultType.getDimSize(d);
++          if (!whole || slice.getStrides()[d] != 1) {
++            return false;
++          }
++        }
++        pieces.emplace_back(slice, chain);
++      }
++      return true;
++    };
++    if (!collect(gather->getResult(0)) || pieces.empty()) {
++      continue;
++    }
++
++    mlir::OpBuilder builder(gather);
++    mlir::Location loc = gather.getLoc();
++    const int64_t padded = (size + kTileWidth - 1) / kTileWidth * kTileWidth;
++    llvm::SmallVector<int64_t> low(rank, 0), high(rank, 0), interior(rank, 0);
++    high[dim] = padded - size;
++    auto zero = builder.create<mlir::stablehlo::ConstantOp>(
++        loc, builder.getZeroAttr(
++                 mlir::RankedTensorType::get({}, inputType.getElementType())));
++    llvm::SmallVector<int64_t> paddedShape(inputType.getShape());
++    paddedShape[dim] = padded;
++    auto pad = builder.create<mlir::stablehlo::PadOp>(
++        loc, inputType.clone(paddedShape), gather->getOperand(0), zero, low,
++        high, interior);
++    auto paddedGather =
++        mlir::cast<mlir::stablehlo::AllGatherOp>(builder.clone(*gather));
++    paddedGather->setOperand(0, pad);
++    llvm::SmallVector<int64_t> gatheredShape(resultType.getShape());
++    gatheredShape[dim] = resultType.getDimSize(dim) / size * padded;
++    paddedGather->getResult(0).setType(resultType.clone(gatheredShape));
++
++    for (auto &[slice, converts] : pieces) {
++      builder.setInsertionPoint(slice);
++      llvm::SmallVector<int64_t> starts(rank, 0);
++      llvm::SmallVector<int64_t> limits(resultType.getShape());
++      starts[dim] = slice.getStartIndices()[dim] / size * padded;
++      limits[dim] = starts[dim] + size;
++      mlir::Value piece = builder.create<mlir::stablehlo::SliceOp>(
++          slice.getLoc(), paddedGather->getResult(0), starts, limits,
++          llvm::SmallVector<int64_t>(rank, 1));
++      for (mlir::stablehlo::ConvertOp convert : converts) {
++        piece = builder.create<mlir::stablehlo::ConvertOp>(
++            convert.getLoc(),
++            mlir::cast<mlir::RankedTensorType>(piece.getType())
++                .clone(mlir::getElementTypeOrSelf(convert.getType())),
++            piece);
++      }
++      slice.replaceAllUsesWith(piece);
++      slice.erase();
++    }
++    // The converts between the old gather and its slices are dead now.
++    llvm::SmallVector<mlir::Operation *> dead{gather};
++    for (size_t i = 0; i < dead.size(); ++i) {
++      for (mlir::Operation *user : dead[i]->getUsers()) {
++        dead.push_back(user);
++      }
++    }
++    for (mlir::Operation *op : llvm::reverse(dead)) {
++      if (op->use_empty()) {
++        op->erase();
++      }
++    }
++  }
++}
++
 +static void wrapUnshardedCollectives(mlir::ModuleOp module,
 +                                     size_t num_devices) {
 +  auto main = module.lookupSymbol<mlir::func::FuncOp>("main");
@@ -158,11 +291,12 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
  // Maps per-axis fabric config to TTNN mesh topology for CCL operations.
  static std::vector<mlir::tt::ttcore::Topology>
  fabricConfigToMeshTopology(const tt::runtime::MeshFabricConfig &fabricConfig) {
-@@ -432,6 +582,8 @@ ModuleBuilder::buildModule(
+@@ -432,6 +708,9 @@ ModuleBuilder::buildModule(
    if (!tt_pjrt_status_is_ok(status)) {
      return {status, nullptr};
    }
 +  widenNarrowIntegerCollectives(*mlir_module);
++  padUnalignedAllGathers(*mlir_module);
 +  wrapUnshardedCollectives(*mlir_module, target_num_devices);
  
    // Stable identity of the graph (hash of the SHLO module text), used by the
