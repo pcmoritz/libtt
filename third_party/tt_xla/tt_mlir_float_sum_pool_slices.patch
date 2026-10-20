@@ -1,0 +1,138 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -3655,6 +3655,19 @@
+                                        extremum->second, rewriter);
+         return success();
+       }
++
++      // ttnn pooling runs in bfloat16, so float32 and float16 sum pooling
++      // (and average pooling, which divides the sum) adds window slices in
++      // its own type instead.
++      if (isa<mlir::stablehlo::AddOp>(reductionOps[0]) &&
++          (*initValues)[0] == ZERO) {
++        if (std::optional<Value> sum = sumWindowSlices(
++                srcOp, adaptor.getInputs().front(), windowDimensions,
++                windowStrides, windowDilations, padding, rewriter)) {
++          rewriter.replaceOp(srcOp, *sum);
++          return success();
++        }
++      }
+     }
+ 
+     // Handle 5D input with three non-trivial window dimensions (3D max
+@@ -3704,7 +3717,8 @@
+       // effective padding.
+       SmallVector<int64_t> effectivePadding(padding.asArrayRef());
+       if (mlir::stablehlo::PadOp padOp =
+-              getFusablePadOp(srcOp.getInputs()[i], spatialDimIndices)) {
++              getFusablePadOp(srcOp.getInputs()[i], srcOp.getInitValues()[i],
++                              spatialDimIndices)) {
+         effectivePadding = combinePaddingFromPadOp(padOp, padding.asArrayRef(),
+                                                    spatialDimIndices);
+ 
+@@ -3839,6 +3853,79 @@
+   }
+ 
+ private:
++  // Sums a float32 or float16 window one dimension at a time: each window
++  // dimension adds its strided slices of the zero-padded input, so a window
++  // takes the sum of its sizes in slices rather than their product. Returns
++  // nullopt for other inputs and for windows of more than 64 slices, which
++  // take the ttnn pooling path.
++  std::optional<Value> sumWindowSlices(mlir::stablehlo::ReduceWindowOp srcOp,
++                                       Value input,
++                                       DenseI64ArrayAttr windowDimensions,
++                                       DenseI64ArrayAttr windowStrides,
++                                       DenseI64ArrayAttr windowDilations,
++                                       DenseI64ArrayAttr padding,
++                                       ConversionPatternRewriter &rewriter) const {
++    constexpr int64_t kMaxSlices = 64;
++    auto inputType = mlir::cast<RankedTensorType>(input.getType());
++    auto resultType = mlir::cast<RankedTensorType>(
++        getTypeConverter()->convertType(srcOp.getResult(0).getType()));
++    Type elementType = inputType.getElementType();
++    ArrayRef<int64_t> window = windowDimensions.asArrayRef();
++    ArrayRef<int64_t> strides = windowStrides.asArrayRef();
++    ArrayRef<int64_t> dilations = windowDilations.asArrayRef();
++    ArrayRef<int64_t> pads = padding.asArrayRef();
++    int64_t rank = inputType.getRank();
++    int64_t numSlices =
++        std::accumulate(window.begin(), window.end(), int64_t{0});
++    if (!(elementType.isF32() || elementType.isF16()) ||
++        numSlices > kMaxSlices || !inputType.hasStaticShape() ||
++        !resultType.hasStaticShape() || resultType.getNumElements() == 0 ||
++        llvm::any_of(pads, [](int64_t pad) { return pad < 0; })) {
++      return std::nullopt;
++    }
++
++    Location loc = srcOp.getLoc();
++    SmallVector<int64_t> shape(inputType.getShape());
++    if (llvm::any_of(pads, [](int64_t pad) { return pad != 0; })) {
++      for (int64_t d = 0; d < rank; ++d) {
++        shape[d] += pads[2 * d] + pads[2 * d + 1];
++      }
++      input = rewriter.create<ttir::PadOp>(
++          loc, RankedTensorType::get(shape, elementType,
++                                     inputType.getEncoding()),
++          input,
++          rewriter.getDenseI32ArrayAttr(
++              SmallVector<int32_t>(pads.begin(), pads.end())),
++          rewriter.getF32FloatAttr(0.0));
++    }
++
++    for (int64_t d = 0; d < rank; ++d) {
++      int64_t outputSize = resultType.getDimSize(d);
++      if (window[d] == 1 && strides[d] == 1 && shape[d] == outputSize) {
++        continue;
++      }
++      SmallVector<int32_t> begins(rank, 0), ends(shape.begin(), shape.end()),
++          steps(rank, 1);
++      shape[d] = outputSize;
++      auto sliceType = RankedTensorType::get(shape, elementType,
++                                             resultType.getEncoding());
++      Value sum;
++      for (int64_t offset = 0; offset < window[d]; ++offset) {
++        begins[d] = offset * dilations[d];
++        ends[d] = begins[d] + (outputSize - 1) * strides[d] + 1;
++        steps[d] = strides[d];
++        Value slice = rewriter.create<ttir::SliceStaticOp>(
++            loc, sliceType, input, rewriter.getI32ArrayAttr(begins),
++            rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
++        sum = sum ? rewriter.create<ttir::AddOp>(loc, sliceType, sum, slice)
++                        .getResult()
++                  : slice;
++      }
++      input = sum;
++    }
++    return input;
++  }
++
+   // Decompose a 5D reduce_window (3D pooling) into two sequential 2D max pool
+   // operations. The 3D pooling window [kD, kH, kW] is factored as:
+   //   Pass 1: Permute to [N,D,H,W,C], reshape to [N*D,H,W,C], MaxPool2d [kH,kW]
+@@ -4592,13 +4679,22 @@
+   // Check if the given Value comes from a stablehlo::PadOp that can be fused
+   // into the pooling operation. Returns the PadOp if fusable, nullptr
+   // otherwise.
+-  mlir::stablehlo::PadOp
+-  getFusablePadOp(Value input, ArrayRef<size_t> spatialDimIndices) const {
++  mlir::stablehlo::PadOp getFusablePadOp(Value input, Value initValue,
++                                         ArrayRef<size_t> spatialDimIndices) const {
+     auto padOp = input.getDefiningOp<mlir::stablehlo::PadOp>();
+     if (!padOp) {
+       return nullptr;
+     }
+ 
++    // The pooling op pads with the reduction's init value, so only a pad with
++    // that same value folds into it (an average pool's divisor pads ones).
++    auto padValue =
++        padOp.getPaddingValue().getDefiningOp<mlir::stablehlo::ConstantOp>();
++    auto init = initValue.getDefiningOp<mlir::stablehlo::ConstantOp>();
++    if (!padValue || !init || padValue.getValue() != init.getValue()) {
++      return nullptr;
++    }
++
+     // Interior padding is not supported for this fusion.
+     for (int64_t interiorPad : padOp.getInteriorPadding()) {
+       if (interiorPad != 0) {
