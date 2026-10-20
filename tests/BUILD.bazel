@@ -51,6 +51,10 @@ TORCH_TPU_TEST_ARGS = PLUGIN_TEST_ARGS + [
     "--absl-flag=op_testing:--dtypes=float32,bfloat16,float16,int64,int32,int16,int8,uint8,bool",
     "--absl-flag=ops_test:--test_categories=-foreach,-nonzero,-searchsorted",
     "--absl-flag=error_testing:--test_mode=tpu",
+    # The error tests also run with torch_tpu's debug checks, and without C++
+    # stack traces in the error messages.
+    "--env=*errors_test.py:TORCH_TPU_ENABLE_DEBUG_CHECKS=1",
+    "--env=*errors_test.py:TORCH_SHOW_CPP_STACKTRACES=0",
     # torchcomms isn't on PyPI (torch_tpu's open source build leaves these out
     # too), and the profiler tests import tsl's protos, which torch_tpu builds
     # from the tsl repository and no package provides.
@@ -60,9 +64,6 @@ TORCH_TPU_TEST_ARGS = PLUGIN_TEST_ARGS + [
     "--exclude=tests/profiler/profiler_integration_test.py",
     # Seconds per test (pytest-timeout), so that a hang only fails its test.
     "--timeout=600",
-    # The device sync after this test aborts the process, which would lose the
-    # results of the file's other tests.
-    "--deselect=tests/errors_test.py::TpuVsGpuErrorTest::test_empty_tensor_in_take",
     # Count passed subtests too; the op tests run each sample as a subtest.
     "-o",
     "verbosity_subtests=1",
@@ -153,6 +154,10 @@ py_test(
         "tests/optimizers/sgd_test.py",
         "tests/scan_test.py",
         "tests/untyped_storage_test.py",
+        # unique and unique_consecutive sort with a non-strict comparator,
+        # with duplicates, returned inverse indices and counts.
+        "tests/ops_unit_test.py::OpsGradUnitTest::test_unique2_distributions",
+        "tests/ops_unit_test.py::OpsUnitTest::test_unique_consecutive_distributions",
     ],
     data = TORCH_TPU_TEST_DATA,
     deps = TORCH_TPU_TEST_DEPS,

@@ -1,0 +1,29 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -9326,6 +9326,25 @@
+       return cmpOp.getComparisonDirection() ==
+              mlir::stablehlo::ComparisonDirection::GT;
+     }
++    // A comparator that is only a non-strict comparison of the keys, e.g.
++    // torch_tpu's `GE` that moves unique's boolean flags first, sorts the same
++    // way and only leaves the order of equal keys open.
++    auto returnOp = dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
++    auto cmpOp =
++        returnOp && returnOp.getNumOperands() == 1
++            ? returnOp.getOperand(0).getDefiningOp<mlir::stablehlo::CompareOp>()
++            : nullptr;
++    if (cmpOp && cmpOp.getLhs() == block.getArgument(0) &&
++        cmpOp.getRhs() == block.getArgument(1)) {
++      if (cmpOp.getComparisonDirection() ==
++          mlir::stablehlo::ComparisonDirection::GE) {
++        return true;
++      }
++      if (cmpOp.getComparisonDirection() ==
++          mlir::stablehlo::ComparisonDirection::LE) {
++        return false;
++      }
++    }
+     return mlir::failure();
+   }
+ };

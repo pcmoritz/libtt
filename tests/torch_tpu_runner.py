@@ -4,13 +4,15 @@
 Every test file runs in its own pytest process, as in torch_tpu's own Bazel
 setup: test modules define conflicting absl flags, and a few tests abort the
 process. Positional arguments that are paths in the torch_tpu repository, such
-as `tests/scan_test.py` or `tests/compile`, select the tests (by default all of
-`tests` and `src/torch_tpu`); other arguments go to pytest. Each file's log and
+as `tests/scan_test.py`, `tests/compile` or a test's node ID, select the tests
+(by default all of `tests` and `src/torch_tpu`); the tests selected in one file
+run in one process. Other arguments go to pytest. Each file's log and
 JUnit XML are written to the test's undeclared outputs.
 """
 
 import argparse
 import collections
+import fnmatch
 import importlib.util
 import os
 from pathlib import Path
@@ -53,16 +55,27 @@ def _overlay_test_modules(root: Path, overlay: Path) -> None:
             mirrored.symlink_to(path)
 
 
-def _select(root: Path, selections: list[str], excludes: list[str]) -> list[str]:
-    targets = []
+def _select(
+    root: Path, selections: list[str], excludes: list[str]
+) -> dict[str, list[str]]:
+    """Returns the test files to run, each with the tests selected in it.
+
+    An empty list selects the whole file.
+    """
+    files: dict[str, list[str]] = {}
     for selection in selections or ["tests", "src/torch_tpu"]:
-        path = root / selection.split("::")[0]
-        if path.is_dir():
-            tests = (str(test.relative_to(root)) for test in path.rglob("*_test.py"))
-            targets += sorted(test for test in tests if test not in excludes)
-        else:
-            targets.append(selection)
-    return targets
+        file, _, test = selection.partition("::")
+        if (root / file).is_dir():
+            tests = (
+                str(path.relative_to(root)) for path in (root / file).rglob("*_test.py")
+            )
+            for path in sorted(path for path in tests if path not in excludes):
+                files[path] = []
+        elif not test:
+            files[file] = []
+        elif files.get(file) != []:
+            files.setdefault(file, []).append(selection)
+    return files
 
 
 def _counts(log: str) -> collections.Counter:
@@ -92,6 +105,13 @@ def main() -> int:
         default=[],
         metavar="MODULE:FLAG",
         help="absl flag for the tests whose MODULE defines it; repeatable.",
+    )
+    parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="GLOB:NAME=VALUE",
+        help="Environment variable for the test files that match GLOB.",
     )
     parser.add_argument(
         "--exclude",
@@ -140,16 +160,21 @@ def main() -> int:
     print(f"Running {len(targets)} torch_tpu test files on {plugin_wheel.name}")
     totals = collections.Counter()
     failed = []
-    for index, target in enumerate(targets, 1):
+    for index, (target, tests) in enumerate(targets.items(), 1):
         name = re.sub(r"[^A-Za-z0-9_.-]", "_", target)
         log_path = out / f"{name}.log"
         file_env = dict(env, TEST_TMPDIR=str(tmp / name))
+        for item in args.env:
+            pattern, _, assignment = item.partition(":")
+            if fnmatch.fnmatch(target, pattern):
+                variable, _, value = assignment.partition("=")
+                file_env[variable] = value
         Path(file_env["TEST_TMPDIR"]).mkdir(parents=True, exist_ok=True)
         command = [
             sys.executable,
             "-m",
             "pytest",
-            target,
+            *(tests or [target]),
             "-p",
             "torch_tpu_pytest_plugin",
             "-p",
@@ -193,11 +218,13 @@ def main() -> int:
             failed.append(target)
         seconds = time.monotonic() - start
         print(
-            f"[{index}/{len(targets)}] {target}: {status} ({seconds:.0f}s)", flush=True
+            f"[{index}/{len(targets)}] {target}"
+            f"{f' ({len(tests)} selected)' if tests else ''}: {status} ({seconds:.0f}s)",
+            flush=True,
         )
         if any(marker in text for marker in DEVICE_HANG_MARKERS):
             print(f"The device hung in {target}; stopping.")
-            failed += targets[index:]
+            failed += list(targets)[index:]
             break
 
     kinds = ("passed", "failed", "error", "skipped", "subtests passed")
