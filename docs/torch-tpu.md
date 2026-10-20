@@ -3,7 +3,8 @@
 [torch_tpu](https://github.com/google-pytorch/torch_tpu) is a PyTorch backend
 for TPUs that drives its device through the PJRT C API. It loads the plugin
 named by `TPU_LIBRARY_PATH`, so it runs on Tenstorrent devices with `libtt.so`.
-Validated with torch_tpu 0.2.0 and torch 2.14.1 on one Blackhole.
+Validated with torch_tpu 0.2.0 and torch 2.14.1 on one Blackhole and on the
+four chips of a QuietBox 2.
 
 ## Setup
 
@@ -35,6 +36,59 @@ and then loads `jax_plugins/libtt/tpu_compat.py`, which runs before torch_tpu:
   implementation.
 
 Without the variable, nothing changes.
+
+## Several chips
+
+torch_tpu runs one process per chip and launches them as on a TPU VM.
+`python -m torch.tpu.distributed` prints the environment that `torchrun`'s
+processes need:
+
+```bash
+export LIBTT_TPU_COMPAT=1
+eval $(python -m torch.tpu.distributed | sed 's/^/export /')
+tt-smi -r
+torchrun --nproc_per_node=4 train.py
+```
+
+Reset the chips before every such run: after one process per chip has run,
+even to a normal exit, the chips' ethernet cores don't come back up for the
+next run ("Timed out while waiting for active ethernet core").
+
+libtt reads the environment that torch_tpu gives each process: its chip
+(`TPU_VISIBLE_CHIPS`), its index (`CLOUD_TPU_TASK_ID`) and the addresses of all
+processes (`TPU_PROCESS_ADDRESSES`). Each process opens its chip as part of a
+1xN mesh, and process 0 serves the processes' key-value store at the first
+address. Collectives run over TT-Fabric. TT-NN's collectives expect their
+buffers at the same address on every chip, so each process reserves
+`LIBTT_SYMMETRIC_DRAM_MB` (2048 by default) of DRAM for them when it opens its
+chip.
+
+### TorchTitan
+
+[TorchTitan's TPU trainer](https://github.com/google-pytorch/torchtitan/tree/61bdf4c2/torchtitan/experiments/tpu)
+runs unmodified. Qwen3-1.7B with FSDP on four chips, 2,048-token sequences,
+full activation checkpointing and AdamW:
+
+```bash
+torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train \
+  --module=torchtitan.experiments.tpu.qwen3 --config=qwen3_1_7b \
+  --splash_attention_kernel.no_use_splash_attention_kernel \
+  --hf_assets_path=<Qwen3 tokenizer directory> --dataloader.dataset=c4
+```
+
+It trains at 2.66 s per step, 770 tokens/s per chip, after a first step that
+compiles each process's programs. Splash attention is a Pallas kernel, so
+attention runs through `scaled_dot_product_attention`.
+
+Checkpoints save and load with `--checkpoint.enable` (PyTorch's distributed
+checkpointing): a Qwen3-1.7B checkpoint takes 23 GB and 13 s, and a run
+resumed from step 3 reproduces the following steps and the step-6 checkpoint
+bit for bit. A streamed dataset such as C4 needs
+`--checkpoint.exclude_from_loading dataloader` to resume, since TorchTitan
+can't load its data loader's position (also on the CPU). From a seed
+checkpoint (`--checkpoint.create_seed_checkpoint`, then
+`--checkpoint.load_only`), losses and gradient norms match a 4-process CPU run
+to 3-4 digits.
 
 ## What runs
 
