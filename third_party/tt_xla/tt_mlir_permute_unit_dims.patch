@@ -1,0 +1,59 @@
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -2928,6 +2928,55 @@ void mlir::tt::ttir::ReshapeOp::getCanonicalizationPatterns(
+     rewriter.replaceOp(trailingReshape, newPermute.getResult());
+     return success();
+   });
++  // A permute that moves size-1 dimensions runs on the others alone: tiles pad
++  // a trailing size-1 dimension 32 times (TorchTitan's attention permutes
++  // [S, H, D, 1] views of [S, H, D]). The reshapes around the smaller permute
++  // fold into neighbouring reshapes or are views.
++  patterns.add(+[](mlir::tt::ttir::PermuteOp permute,
++                   mlir::PatternRewriter &rewriter) -> LogicalResult {
++    auto inputType = permute.getInput().getType();
++    ArrayRef<int64_t> shape = inputType.getShape();
++    SmallVector<int64_t> kept;
++    SmallVector<int64_t> position(shape.size(), -1);
++    for (auto [dim, size] : llvm::enumerate(shape)) {
++      if (size != 1) {
++        position[dim] = kept.size();
++        kept.push_back(dim);
++      }
++    }
++    if (kept.size() == shape.size() || kept.empty()) {
++      return failure();
++    }
++    SmallVector<int64_t> squeezed;
++    for (int64_t dim : kept) {
++      squeezed.push_back(shape[dim]);
++    }
++    SmallVector<int64_t> permutation;
++    for (int64_t dim : permute.getPermutation()) {
++      if (position[dim] >= 0) {
++        permutation.push_back(position[dim]);
++      }
++    }
++    Value result = ttir::utils::createReshapeOp(rewriter, permute.getLoc(),
++                                                permute.getInput(), squeezed);
++    if (!llvm::equal(permutation,
++                     llvm::seq<int64_t>(0, permutation.size()))) {
++      SmallVector<int64_t> permutedShape;
++      for (int64_t dim : permutation) {
++        permutedShape.push_back(squeezed[dim]);
++      }
++      result = rewriter.create<mlir::tt::ttir::PermuteOp>(
++          permute.getLoc(),
++          RankedTensorType::get(permutedShape, inputType.getElementType(),
++                                inputType.getEncoding()),
++          result, permutation);
++    }
++    rewriter.replaceOp(permute,
++                       ttir::utils::createReshapeOp(rewriter, permute.getLoc(),
++                                                    result,
++                                                    permute.getType().getShape()));
++    return success();
++  });
+ }
+ 
+ //===----------------------------------------------------------------------===//

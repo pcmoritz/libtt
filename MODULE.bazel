@@ -622,6 +622,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_rows_result_reshape.patch",
         "//third_party/tt_xla:tt_mlir_symmetric_collectives.patch",
         "//third_party/tt_xla:tt_mlir_dot_general_transposed_operands.patch",
+        "//third_party/tt_xla:tt_mlir_permute_unit_dims.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
