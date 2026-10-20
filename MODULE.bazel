@@ -604,7 +604,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_strided_borrowed_host_tensors.patch",
         "//third_party/tt_xla:tt_mlir_deduce_moe_layouts_once.patch",
         "//third_party/tt_xla:tt_mlir_moe_weights_bfp4_on_device.patch",
-        "//third_party/tt_xla:tt_mlir_legacy_stablehlo_ops.patch",
+        "//third_party/tt_xla:tt_mlir_legalize_deprecated_ops.patch",
         "//third_party/tt_xla:tt_mlir_chlo_scan.patch",
         "//third_party/tt_xla:tt_mlir_loop_state_layouts.patch",
         "//third_party/tt_xla:tt_mlir_torch_tpu_argmax.patch",

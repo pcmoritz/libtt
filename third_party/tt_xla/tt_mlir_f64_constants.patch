@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -1689,6 +1689,30 @@
+@@ -1663,6 +1663,30 @@
    matchAndRewrite(mlir::stablehlo::ConstantOp srcOp,
                    mlir::stablehlo::ConstantOp::Adaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {

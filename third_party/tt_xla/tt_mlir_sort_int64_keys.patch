@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -9126,7 +9126,10 @@
+@@ -9077,7 +9077,10 @@
      auto keyElemType = dyn_cast<IntegerType>(
          cast<RankedTensorType>(srcOp.getInputs().front().getType())
              .getElementType());
