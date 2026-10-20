@@ -1,0 +1,40 @@
+diff --git a/pjrt_implementation/inc/api/compile_options.h b/pjrt_implementation/inc/api/compile_options.h
+--- a/pjrt_implementation/inc/api/compile_options.h
++++ b/pjrt_implementation/inc/api/compile_options.h
+@@ -86,6 +86,12 @@ struct CompileOptions {
+   // that are repeated multiple times.
+   bool enable_trace = false;
+ 
++  // Take arguments of type input tiled rather than row-major, so that device
++  // tensors that programs pass to each other need no conversion. Defaults to
++  // LIBTT_TILED_INPUTS for frameworks without options of their own, such as
++  // torch_tpu.
++  bool tiled_inputs = false;
++
+   // Enables saving graph inputs to disk whenever Execute() is called.
+   // This is useful for chisel and codegen.
+   bool export_tensors = false;
+diff --git a/pjrt_implementation/src/api/compile_options.cc b/pjrt_implementation/src/api/compile_options.cc
+--- a/pjrt_implementation/src/api/compile_options.cc
++++ b/pjrt_implementation/src/api/compile_options.cc
+@@ -17,6 +17,9 @@ namespace tt::pjrt {
+ CompileOptions CompileOptions::parse(
+     const std::unordered_map<std::string, std::string> &compile_options) {
+   CompileOptions options;
++  if (const char *tiled = std::getenv("LIBTT_TILED_INPUTS")) {
++    options.tiled_inputs = std::string_view(tiled) != "0";
++  }
+ 
+   options.optimization_level =
+       internal::parseIntOption(compile_options, optimization_level_key)
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -1257,6 +1257,7 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+   options.enableActivationDtypeLowering =
+       compile_options.enable_activation_dtype_lowering;
+   options.enableTrace = compile_options.enable_trace;
++  options.rowMajorInputs = !compile_options.tiled_inputs;
+   options.systemDescPath = system_descriptor_path.data();
+   options.enableConstEval = compile_options.enable_const_eval;
+   options.enableCPUHoistedConstEval = compile_options.enable_const_eval_on_cpu;

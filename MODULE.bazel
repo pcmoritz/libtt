@@ -461,6 +461,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_jax_distributed.patch",
         "//third_party/tt_xla:tt_xla_libtpu_processes.patch",
         "//third_party/tt_xla:tt_xla_manual_collectives.patch",
+        "//third_party/tt_xla:tt_xla_tiled_inputs.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -623,6 +624,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_symmetric_collectives.patch",
         "//third_party/tt_xla:tt_mlir_dot_general_transposed_operands.patch",
         "//third_party/tt_xla:tt_mlir_permute_unit_dims.patch",
+        "//third_party/tt_xla:tt_mlir_tiled_inputs.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

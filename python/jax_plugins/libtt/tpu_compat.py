@@ -11,6 +11,9 @@
   uses it to set up the launch environment for `torchrun`.
 - torch_tpu's flash attention is a Pallas kernel that only TPUs run, so
   `scaled_dot_product_attention` takes its StableHLO implementation instead.
+- torch_tpu passes the tensors of a training step between many programs, so
+  programs take their arguments tiled (`LIBTT_TILED_INPUTS`) instead of
+  converting them from and back to row-major at every program boundary.
 """
 
 import importlib.abc
@@ -62,4 +65,5 @@ class _PatchTorchTpu(importlib.abc.MetaPathFinder):
 
 
 os.environ.setdefault("TPU_LIBRARY_PATH", str(pathlib.Path(__file__).with_name("libtt.so")))
+os.environ.setdefault("LIBTT_TILED_INPUTS", "1")
 sys.meta_path.insert(0, _PatchTorchTpu())
