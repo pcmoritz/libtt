@@ -52,6 +52,12 @@ float32 matmuls use the matrix unit's TF32 precision by default, like TPUs.
 relative error) on the vector unit, at a large cost in speed. float64 runs as
 float32.
 
+`torch.manual_seed` and generators make random draws repeat, eager and
+compiled. The device draws with Threefry-2x32 (Philox-4x32 for
+`torch.randperm`), so the numbers differ from CPU, CUDA and TPU ones. 64-bit
+integers are 32-bit on the device: seeds count modulo 2^32, and 64-bit random
+integers have 32 random bits.
+
 ## Not supported
 
 - Dynamic shapes (`torch_tpu.dynamism.mark_dynamic`, ops with data-dependent
@@ -59,8 +65,6 @@ float32.
   `dim != mlir::ShapedType::kDynamic`.
 - Complex numbers and FFTs.
 - Max and average pooling (`stablehlo.reduce_window` beyond cumulative sums).
-- Reproducible random numbers: `torch.manual_seed` does not make draws
-  repeat.
 - Width-changing bitcasts (`tensor.view(torch.uint8)` of a float32 tensor).
 - Host offloading, executable serialization (torch_tpu's persistent
   compilation cache), and TPU-only features such as SparseCore ops and Pallas
