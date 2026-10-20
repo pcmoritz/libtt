@@ -53,10 +53,10 @@ relative error) on the vector unit, at a large cost in speed. float64 runs as
 float32.
 
 float8_e4m3fn and float8_e5m2 tensors take one byte per element, and
-conversions to and from them round like PyTorch's. A matmul of two
-float8_e4m3fn matrices, as in `torch._scaled_mm`, reads them natively on the
-matrix unit, which treats subnormal operands as zero. Matmuls with
-float8_e5m2 or mixed operands compute on bfloat16 values.
+conversions to and from them round like PyTorch's. A matmul of two float8
+matrices of either format, as in `torch._scaled_mm`, reads them natively on
+the matrix unit, which treats subnormal operands as zero. A matmul of a float8
+matrix and a bfloat16 one computes on bfloat16 values.
 
 ## Not supported
 

@@ -3,7 +3,7 @@
 float8 tensors are stored as their bits. Conversions to and from float8 are
 exact integer arithmetic on the device, so they match ml_dtypes (and
 PyTorch): rounding to nearest even, subnormals, NaN on e4m3fn overflow and
-infinity on e5m2 overflow. A matmul of two float8_e4m3fn matrices reads them
+infinity on e5m2 overflow. A matmul of two float8 matrices reads them
 natively on the matrix unit, which flushes subnormal operands to zero.
 """
 
@@ -83,22 +83,33 @@ def test_arithmetic_on_float8(dtype):
     np.testing.assert_array_equal(larger, x.astype(np.float32) > y.astype(np.float32))
 
 
-def random_e4m3(shape, rng):
-    """Random finite float8_e4m3fn values, subnormals included."""
-    codes = rng.integers(0, 254, size=shape).astype(np.uint8)
-    codes[codes == 0x7F] = 0x7E
-    return codes.view(jnp.float8_e4m3fn)
+def random_float8(shape, dtype, rng):
+    """Random finite float8 values, subnormals included."""
+    codes = rng.integers(0, 256, size=shape).astype(np.uint8)
+    values = codes.view(dtype)
+    finite = np.isfinite(values.astype(np.float32))
+    values[~finite] = np.array(1.0, dtype)
+    return values
 
 
 def flush_subnormals(x):
     values = x.astype(np.float32)
-    return np.where(np.abs(values) < 2.0**-6, 0.0, values).astype(np.float32)
+    smallest_normal = float(ml_dtypes.finfo(x.dtype).smallest_normal)
+    return np.where(np.abs(values) < smallest_normal, 0.0, values).astype(np.float32)
 
 
+@pytest.mark.parametrize(
+    "lhs_dtype,rhs_dtype",
+    [
+        (jnp.float8_e4m3fn, jnp.float8_e4m3fn),
+        (jnp.float8_e5m2, jnp.float8_e5m2),
+        (jnp.float8_e4m3fn, jnp.float8_e5m2),
+    ],
+)
 @pytest.mark.parametrize("m,k,n", [(32, 32, 32), (64, 256, 96), (256, 1024, 128)])
-def test_native_float8_matmul(m, k, n):
+def test_native_float8_matmul(m, k, n, lhs_dtype, rhs_dtype):
     rng = np.random.default_rng(m + k + n)
-    a, b = random_e4m3((m, k), rng), random_e4m3((k, n), rng)
+    a, b = random_float8((m, k), lhs_dtype, rng), random_float8((k, n), rhs_dtype, rng)
     product = jax.jit(
         lambda a, b: jnp.dot(a, b, preferred_element_type=jnp.float32)
     )(a, b)
@@ -109,24 +120,22 @@ def test_native_float8_matmul(m, k, n):
     assert np.max(np.abs(product - expected) / np.maximum(scale, 1e-30)) < 2.0**-9
 
 
-def test_native_float8_matmul_flushes_subnormal_operands():
+@pytest.mark.parametrize(
+    "dtype,subnormal,one", [(jnp.float8_e4m3fn, 0x07, 0x38), (jnp.float8_e5m2, 0x03, 0x3C)]
+)
+def test_native_float8_matmul_flushes_subnormal_operands(dtype, subnormal, one):
     """The matrix unit reads the operands natively: subnormals count as zero."""
-    a = np.full((32, 32), 0x07, np.uint8).view(jnp.float8_e4m3fn)  # 7 * 2^-9
-    b = np.full((32, 32), 0x38, np.uint8).view(jnp.float8_e4m3fn)  # 1.0
+    a = np.full((32, 32), subnormal, np.uint8).view(dtype)
+    b = np.full((32, 32), one, np.uint8).view(dtype)
     product = jax.jit(lambda a, b: jnp.dot(a, b, preferred_element_type=jnp.float32))(a, b)
     np.testing.assert_array_equal(product, np.zeros((32, 32), np.float32))
 
 
 @pytest.mark.parametrize(
-    "lhs_dtype,rhs_dtype",
-    [
-        (jnp.float8_e5m2, jnp.float8_e5m2),
-        (jnp.float8_e4m3fn, jnp.float8_e5m2),
-        (jnp.float8_e4m3fn, jnp.bfloat16),
-    ],
+    "lhs_dtype,rhs_dtype", [(jnp.float8_e4m3fn, jnp.bfloat16), (jnp.bfloat16, jnp.float8_e5m2)]
 )
 def test_float8_matmul_on_decoded_values(lhs_dtype, rhs_dtype):
-    """Other float8 matmuls compute on the exactly decoded values."""
+    """A float8 matrix times a bfloat16 one computes on the exactly decoded values."""
     rng = np.random.default_rng(3)
     a = rng.normal(size=(64, 128)).astype(np.float32).astype(lhs_dtype)
     b = rng.normal(size=(128, 32)).astype(np.float32).astype(rhs_dtype)

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// ttnn::matmul on FP8_E4M3 tiles: the unpacker reads the operands as Fp8_e4m3,
-// one byte per element. It decodes normal values exactly and flushes
-// subnormals to zero, so the products match a reference with flushed
-// subnormals up to the accumulation's rounding.
+// ttnn::matmul on FP8_E4M3 and FP8_E5M2 tiles: the unpacker reads the
+// operands as Fp8_e4m3 and Lf8, one byte per element. It decodes normal values
+// exactly and flushes subnormals to zero, so the products match a reference
+// with flushed subnormals up to the accumulation's rounding.
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -40,14 +41,18 @@ protected:
         }
     }
 
-    // A tile-layout FP8_E4M3 tensor on the device with the given codes in row-major order.
-    ttnn::Tensor fp8_device(const std::vector<uint8_t>& codes, uint32_t rows, uint32_t cols) {
-        const TensorSpec spec(
-            ttnn::Shape({rows, cols}), TensorLayout(DataType::FP8_E4M3, PageConfig(Layout::ROW_MAJOR), {}));
+    // A tile-layout FP8_E4M3 or FP8_E5M2 tensor on the device with the given codes in row-major order.
+    ttnn::Tensor fp8_device(
+        const std::vector<uint8_t>& codes, uint32_t rows, uint32_t cols, DataType dtype = DataType::FP8_E4M3) {
+        const TensorSpec spec(ttnn::Shape({rows, cols}), TensorLayout(dtype, PageConfig(Layout::ROW_MAJOR), {}));
         const HostTensor row_major = HostTensor::allocate_for_overwrite(spec).transform([&](const HostBuffer&) {
-            std::vector<float8_e4m3> buffer(codes.size());
-            std::memcpy(buffer.data(), codes.data(), codes.size());
-            return HostBuffer(std::move(buffer));
+            auto bytes = [&]<typename T>() {
+                std::vector<T> buffer(codes.size());
+                std::memcpy(buffer.data(), codes.data(), codes.size());
+                return HostBuffer(std::move(buffer));
+            };
+            return dtype == DataType::FP8_E5M2 ? bytes.template operator()<float8_e5m2>()
+                                               : bytes.template operator()<float8_e4m3>();
         });
         return ttnn::Tensor(to_tile_layout(row_major, Tile())).to_device(mesh_device_.get());
     }
@@ -73,6 +78,32 @@ float decode(uint8_t bits, bool flush) {
         value = std::ldexp(static_cast<float>(8 + mantissa), exponent - 10);
     }
     return bits & 0x80 ? -value : value;
+}
+
+// float8_e5m2 to float; subnormals flushed to zero when `flush` is set.
+float decode_e5m2(uint8_t bits, bool flush) {
+    const int exponent = (bits >> 2) & 0x1F;
+    const int mantissa = bits & 0x3;
+    float value;
+    if (exponent == 31) {
+        value = mantissa != 0 ? std::nanf("") : INFINITY;
+    } else if (exponent == 0) {
+        value = flush ? 0.0f : std::ldexp(static_cast<float>(mantissa), -16);
+    } else {
+        value = std::ldexp(static_cast<float>(4 + mantissa), exponent - 17);
+    }
+    return bits & 0x80 ? -value : value;
+}
+
+// Random finite e5m2 codes, subnormals included.
+std::vector<uint8_t> random_e5m2_codes(size_t count, std::mt19937& rng) {
+    std::uniform_int_distribution<int> code(0, 247);
+    std::vector<uint8_t> codes(count);
+    for (uint8_t& c : codes) {
+        const int v = code(rng);
+        c = static_cast<uint8_t>(v < 124 ? v : v + 4);  // skip 0x7C-0x7F; 0xFC-0xFF are out of range
+    }
+    return codes;
 }
 
 // Random e4m3 codes without NaN: every finite code, subnormals included.
@@ -111,10 +142,10 @@ Errors compare(
     return errors;
 }
 
-std::vector<float> decode_all(const std::vector<uint8_t>& codes, bool flush) {
+std::vector<float> decode_all(const std::vector<uint8_t>& codes, bool flush, bool e5m2 = false) {
     std::vector<float> values(codes.size());
     for (size_t i = 0; i < codes.size(); ++i) {
-        values[i] = decode(codes[i], flush);
+        values[i] = e5m2 ? decode_e5m2(codes[i], flush) : decode(codes[i], flush);
     }
     return values;
 }
@@ -158,6 +189,43 @@ TEST_F(Fp8MatmulTest, MatchesFlushedReference) {
         const Errors bf16_errors =
             compare(c_bf16.cpu().to_vector<float>(), a_exact, a_flushed, b_exact, b_flushed, M, K, N);
         std::printf("bf16 x bf16 %ux%ux%u HiFi4: worst error %.3g vs exact\n", M, K, N, bf16_errors.exact);
+    }
+}
+
+// FP8_E5M2 operands, and one of each format: both unpack to Float16.
+TEST_F(Fp8MatmulTest, E5m2AndMixedOperands) {
+    // The larger shape's program also has a BFLOAT16 buffer for partial sums.
+    for (const auto& [M, K, N] : {std::array<uint32_t, 3>{64, 256, 96}, std::array<uint32_t, 3>{1024, 1024, 256}}) {
+        std::mt19937 rng(11);
+        const std::vector<uint8_t> a4 = random_codes(M * K, rng), b4 = random_codes(K * N, rng);
+        const std::vector<uint8_t> a5 = random_e5m2_codes(M * K, rng), b5 = random_e5m2_codes(K * N, rng);
+        struct Case {
+            const char* name;
+            const std::vector<uint8_t>& a;
+            bool a_e5m2;
+            const std::vector<uint8_t>& b;
+            bool b_e5m2;
+        };
+        for (const Case& c : {Case{"e5m2 x e5m2", a5, true, b5, true}, Case{"e4m3 x e5m2", a4, false, b5, true},
+                              Case{"e5m2 x e4m3", a5, true, b4, false}}) {
+            const auto dtype = [](bool e5m2) { return e5m2 ? DataType::FP8_E5M2 : DataType::FP8_E4M3; };
+            const ttnn::Tensor product = ttnn::matmul(
+                fp8_device(c.a, M, K, dtype(c.a_e5m2)), fp8_device(c.b, K, N, dtype(c.b_e5m2)), false, false,
+                std::nullopt, DataType::FLOAT32, std::nullopt, std::nullopt,
+                ttnn::DeviceComputeKernelConfig{.math_fidelity = MathFidelity::LoFi, .fp32_dest_acc_en = true});
+            const Errors errors = compare(
+                product.cpu().to_vector<float>(), decode_all(c.a, false, c.a_e5m2), decode_all(c.a, true, c.a_e5m2),
+                decode_all(c.b, false, c.b_e5m2), decode_all(c.b, true, c.b_e5m2), M, K, N);
+            std::printf(
+                "%s %ux%ux%u LoFi: worst error %.3g vs exact, %.3g vs flushed subnormals\n",
+                c.name,
+                M,
+                K,
+                N,
+                errors.exact,
+                errors.flushed);
+            EXPECT_LE(std::min(errors.exact, errors.flushed), std::ldexp(1.0, -9)) << c.name;
+        }
     }
 }
 
@@ -206,6 +274,8 @@ TEST_F(Fp8MatmulTest, Performance) {
         std::mt19937 rng(1);
         const ttnn::Tensor a8 = fp8_device(random_codes(M * K, rng), M, K);
         const ttnn::Tensor b8 = fp8_device(random_codes(K * N, rng), K, N);
+        const ttnn::Tensor a5 = fp8_device(random_e5m2_codes(M * K, rng), M, K, DataType::FP8_E5M2);
+        const ttnn::Tensor b5 = fp8_device(random_e5m2_codes(K * N, rng), K, N, DataType::FP8_E5M2);
         std::vector<float> a(M * K, 0.5f), b(K * N, 0.25f);
         const ttnn::Tensor a16 = float_device(a, M, K, DataType::BFLOAT16);
         const ttnn::Tensor b16 = float_device(b, K, N, DataType::BFLOAT16);
@@ -221,6 +291,7 @@ TEST_F(Fp8MatmulTest, Performance) {
         const double flops = 2.0 * M * K * N;
         for (const auto& [name, us] : std::vector<std::pair<std::string, double>>{
                  {"fp8 x fp8 LoFi", time(mm(a8, b8, lofi))},
+                 {"e5m2 x e5m2 LoFi", time(mm(a5, b5, lofi))},
                  {"bf16 x bf16 LoFi", time(mm(a16, b16, lofi))},
                  {"bf16 x bf16 HiFi2", time(mm(a16, b16, hifi2))},
                  {"bf16 x bfp8 LoFi", time(mm(a16, b_bfp8, lofi))},

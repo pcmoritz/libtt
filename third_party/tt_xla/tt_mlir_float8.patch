@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td b/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
 --- a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
 +++ b/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
-@@ -36,6 +36,29 @@
+@@ -36,6 +36,30 @@
                             "::mlir::sdy::SdyDialect"];
  }
  
@@ -10,9 +10,9 @@ diff --git a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td b/include/ttm
 +  let description = [{
 +    This pass stores tensors of type tensor<...xf8E4M3FN> and
 +    tensor<...xf8E5M2> as tensor<...xui8> of their bits, the bytes of the
-+    hardware's Fp8_e4m3 format. Ops that only move values (reshape,
++    hardware's Fp8_e4m3 and Lf8 formats. Ops that only move values (reshape,
 +    transpose, slice, select, ...) move the bits, and a dot_general of two
-+    f8E4M3FN matrices, [batch..., M, K] x [batch..., K, N], keeps its float8
++    float8 matrices, [batch..., M, K] x [batch..., K, N], keeps its float8
 +    operands, which the matrix unit reads natively: they are
 +    stablehlo.bitcast_convert views of the bits.
 +
@@ -20,8 +20,9 @@ diff --git a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td b/include/ttm
 +    bits: exact decoding, and encoding with rounding to nearest even,
 +    subnormals, and each format's overflow (NaN for f8E4M3FN, infinity for
 +    f8E5M2), like XLA and PyTorch. Other dot_generals with float8 operands
-+    compute on the decoded values, and other ops on float8 values without
-+    regions compute in f32.
++    (with an operand of another type, or another layout) compute on the
++    decoded values, and other ops on float8 values without regions compute in
++    f32.
 +  }];
 +  let dependentDialects = ["mlir::func::FuncDialect",
 +                           "::mlir::stablehlo::StablehloDialect",
@@ -34,28 +35,30 @@ diff --git a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td b/include/ttm
 diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
 --- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
 +++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
-@@ -21,6 +21,7 @@
+@@ -21,6 +21,8 @@
  def TTCore_UInt8 : I32EnumAttrCase<"UInt8", 11, "u8">;
  def TTCore_Int32: I32EnumAttrCase<"Int32", 12, "si32">;
  def TTCore_Bool : I32EnumAttrCase<"Bool", 13, "i1">;
 +def TTCore_Float8E4M3FN : I32EnumAttrCase<"Float8E4M3FN", 14, "f8e4m3fn">;
++def TTCore_Float8E5M2 : I32EnumAttrCase<"Float8E5M2", 15, "f8e5m2">;
  
  def TTCore_DataType : I32EnumAttr<"DataType", "TT DataTypes",
                             [
-@@ -37,7 +38,8 @@
+@@ -37,7 +39,9 @@
                              TTCore_UInt16,
                              TTCore_UInt8,
                              TTCore_Int32,
 -                            TTCore_Bool
 +                            TTCore_Bool,
-+                            TTCore_Float8E4M3FN
++                            TTCore_Float8E4M3FN,
++                            TTCore_Float8E5M2
                             ]> {
    let genSpecializedAttr = 0;
    let cppNamespace = "::mlir::tt::ttcore";
 diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
 --- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
 +++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h
-@@ -171,6 +171,10 @@
+@@ -171,6 +171,14 @@
      return DataType::BFloat16;
    }
  
@@ -63,35 +66,43 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h b/include/ttmlir/
 +    return DataType::Float8E4M3FN;
 +  }
 +
++  if (isa<Float8E5M2Type>(elementType)) {
++    return DataType::Float8E5M2;
++  }
++
    if (auto tileType = dyn_cast<TileType>(elementType)) {
      switch (tileType.getDataType()) {
      case DataType::BFP_BFloat8:
-@@ -182,6 +186,7 @@
+@@ -182,6 +190,8 @@
      case DataType::Float32:
      case DataType::BFloat16:
      case DataType::Int32:
 +    case DataType::Float8E4M3FN:
++    case DataType::Float8E5M2:
        return tileType.getDataType();
      default:
        assert(false && "Unsupported tile type in elementTypeToDataTypeImpl");
-@@ -268,6 +273,8 @@
+@@ -268,6 +278,10 @@
                              IntegerType::SignednessSemantics::Signed);
    case DataType::Bool:
      return IntegerType::get(context, 1);
 +  case DataType::Float8E4M3FN:
 +    return Float8E4M3FNType::get(context);
++  case DataType::Float8E5M2:
++    return Float8E5M2Type::get(context);
    }
  }
  
-@@ -315,6 +322,7 @@
+@@ -315,6 +329,8 @@
    case DataType::BFP_BFloat4:
    case DataType::BFP_Float2:
    case DataType::BFP_BFloat2:
 +  case DataType::Float8E4M3FN:
++  case DataType::Float8E5M2:
      return true;
    default:
      return false;
-@@ -324,6 +332,8 @@
+@@ -324,10 +340,13 @@
  inline uint8_t getExponentSize(const DataType dtype) {
    assert(isFloat(dtype));
    switch (dtype) {
@@ -100,7 +111,12 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h b/include/ttmlir/
    case DataType::Float16:
    case DataType::BFP_Float8:
    case DataType::BFP_Float4:
-@@ -354,6 +364,7 @@
+   case DataType::BFP_Float2:
++  case DataType::Float8E5M2:
+     return 5;
+   case DataType::Float32:
+   case DataType::BFloat16:
+@@ -354,10 +373,13 @@
      return 7;
    case DataType::BFP_Float4:
    case DataType::BFP_BFloat4:
@@ -108,63 +124,74 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h b/include/ttmlir/
      return 3;
    case DataType::BFP_Float2:
    case DataType::BFP_BFloat2:
-@@ -376,6 +387,7 @@
+     return 1;
++  case DataType::Float8E5M2:
++    return 2;
+   default:
+     return 0;
+   }
+@@ -376,6 +398,8 @@
    case DataType::BFP_Float8:
    case DataType::BFP_BFloat8:
    case DataType::UInt8:
 +  case DataType::Float8E4M3FN:
++  case DataType::Float8E5M2:
      return 8;
    case DataType::BFP_Float4:
    case DataType::BFP_BFloat4:
 diff --git a/include/ttmlir/Target/Common/types.fbs b/include/ttmlir/Target/Common/types.fbs
 --- a/include/ttmlir/Target/Common/types.fbs
 +++ b/include/ttmlir/Target/Common/types.fbs
-@@ -38,7 +38,10 @@
+@@ -38,7 +38,12 @@
    UInt64,
    Int16,
    Int8,
 -  Bool
 +  Bool,
 +
-+  // float8_e4m3fn; the matrix unit reads it as an operand (Fp8_e4m3).
-+  Float8E4M3FN
++  // float8_e4m3fn and float8_e5m2; the matrix unit reads them as operands
++  // (Fp8_e4m3 and Lf8).
++  Float8E4M3FN,
++  Float8E5M2
  }
  
  enum OOBVal: ushort {
 diff --git a/include/ttmlir/Target/Utils/MLIRToFlatbuffer.h b/include/ttmlir/Target/Utils/MLIRToFlatbuffer.h
 --- a/include/ttmlir/Target/Utils/MLIRToFlatbuffer.h
 +++ b/include/ttmlir/Target/Utils/MLIRToFlatbuffer.h
-@@ -154,6 +154,7 @@
+@@ -154,6 +154,8 @@
    case ttcore::DataType::UInt16:
      return 2;
    case ttcore::DataType::UInt8:
 +  case ttcore::DataType::Float8E4M3FN:
++  case ttcore::DataType::Float8E5M2:
      return 1;
    default:
      assert(false && "unsupported data type");
-@@ -194,6 +195,8 @@
+@@ -194,6 +196,10 @@
      return ::tt::target::DataType::Int32;
    case ttcore::DataType::Bool:
      return ::tt::target::DataType::Bool;
 +  case ttcore::DataType::Float8E4M3FN:
 +    return ::tt::target::DataType::Float8E4M3FN;
++  case ttcore::DataType::Float8E5M2:
++    return ::tt::target::DataType::Float8E5M2;
    }
  }
  
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -1218,8 +1218,13 @@
+@@ -1218,8 +1218,12 @@
                    ConversionPatternRewriter &rewriter) const override {
      Type lhsType = getElementTypeOrSelf(srcOp.getLhs());
      Type rhsType = getElementTypeOrSelf(srcOp.getRhs());
 -    if (hasUnsupportedFloatType(lhsType) ||
 -        hasUnsupportedFloatType(rhsType)) {
-+    // The matrix unit reads float8_e4m3fn operands natively (the StableHLO
-+    // float8 data type conversion leaves only such dot_generals with float8
-+    // inputs).
-+    bool float8Operands = isa<Float8E4M3FNType>(lhsType) &&
-+                          isa<Float8E4M3FNType>(rhsType);
++    // The matrix unit reads float8 operands natively (the StableHLO float8
++    // data type conversion leaves only such dot_generals with float8 inputs).
++    bool float8Operands = isa<Float8E4M3FNType, Float8E5M2Type>(lhsType) &&
++                          isa<Float8E4M3FNType, Float8E5M2Type>(rhsType);
 +    if (!float8Operands && (hasUnsupportedFloatType(lhsType) ||
 +                            hasUnsupportedFloatType(rhsType))) {
        return rewriter.notifyMatchFailure(
@@ -174,7 +201,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
 new file mode 100644
 --- /dev/null
 +++ b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
-@@ -0,0 +1,557 @@
+@@ -0,0 +1,555 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -204,11 +231,11 @@ new file mode 100644
 +//===----------------------------------------------------------------------===//
 +// Float8 tensors are stored as their bits, in ui8 tensors:
 +//   tensor<4x8xf8E4M3FN>  -->  tensor<4x8xui8>
-+// The bytes are the same as in the hardware's Fp8_e4m3 format, so data
-+// movement (reshape, transpose, slice, ...) moves them unchanged, and a
-+// dot_general of two float8_e4m3fn matrices keeps its float8 operands:
-+// a stablehlo.bitcast_convert from the ui8 bits, which the runtime makes a
-+// view, feeds the matrix unit, which reads Fp8_e4m3 natively.
++// The bytes are the same as in the hardware's Fp8_e4m3 and Lf8 formats, so
++// data movement (reshape, transpose, slice, ...) moves them unchanged, and a
++// dot_general of two float8 matrices keeps its float8 operands: a
++// stablehlo.bitcast_convert from the ui8 bits, which the runtime makes a
++// view, feeds the matrix unit, which reads Fp8_e4m3 and Lf8 natively.
 +//
 +// The hardware's own conversions don't round like PyTorch and XLA (its
 +// packer truncates and flushes subnormals), so stablehlo.convert to and from
@@ -251,13 +278,12 @@ new file mode 100644
 +                               elementType);
 +}
 +
-+// A dot_general whose float8_e4m3fn operands the matrix unit can read as
-+// they are: [batch..., M, K] x [batch..., K, N].
++// A dot_general whose float8 operands the matrix unit can read as they are:
++// [batch..., M, K] x [batch..., K, N].
 +bool hasNativeFloat8Operands(mlir::stablehlo::DotGeneralOp op) {
 +  auto lhsType = cast<RankedTensorType>(op.getLhs().getType());
 +  auto rhsType = cast<RankedTensorType>(op.getRhs().getType());
-+  if (!isa<Float8E4M3FNType>(lhsType.getElementType()) ||
-+      !isa<Float8E4M3FNType>(rhsType.getElementType())) {
++  if (!isFloat8(lhsType) || !isFloat8(rhsType)) {
 +    return false;
 +  }
 +  auto dims = op.getDotDimensionNumbers();
@@ -512,8 +538,8 @@ new file mode 100644
 +};
 +
 +// A dot_general with a float8 result accumulates in f32 and rounds to the
-+// result type. One that the matrix unit can't run on its float8 operands (an
-+// e5m2 or mixed operand, or a layout other than [batch..., M, K] x
++// result type. One that the matrix unit can't run on its float8 operands (a
++// float8 operand with another type, or a layout other than [batch..., M, K] x
 +// [batch..., K, N]) computes on the decoded values.
 +class Float8DotGeneralOpConversionPattern
 +    : public OpConversionPattern<mlir::stablehlo::DotGeneralOp> {
@@ -687,8 +713,7 @@ new file mode 100644
 +        [](mlir::stablehlo::BitcastConvertOp op) {
 +          auto operand = getElementTypeOrSelf(op.getOperand().getType());
 +          return !hasFloat8(op) ||
-+                 (operand.isUnsignedInteger(8) &&
-+                  isa<Float8E4M3FNType>(getElementTypeOrSelf(op.getType())));
++                 (operand.isUnsignedInteger(8) && isFloat8(op.getType()));
 +        });
 +    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
 +      return typeConverter.isSignatureLegal(op.getFunctionType()) &&
@@ -735,7 +760,7 @@ new file mode 100644
 diff --git a/lib/Dialect/TTCore/IR/TTCoreOpsTypes.cpp b/lib/Dialect/TTCore/IR/TTCoreOpsTypes.cpp
 --- a/lib/Dialect/TTCore/IR/TTCoreOpsTypes.cpp
 +++ b/lib/Dialect/TTCore/IR/TTCoreOpsTypes.cpp
-@@ -563,6 +563,10 @@
+@@ -563,6 +563,14 @@
          supportedDataTypesAttr.push_back(
              DataTypeAttr::get(context, DataType::Int32));
          break;
@@ -743,23 +768,30 @@ diff --git a/lib/Dialect/TTCore/IR/TTCoreOpsTypes.cpp b/lib/Dialect/TTCore/IR/TT
 +        supportedDataTypesAttr.push_back(
 +            DataTypeAttr::get(context, DataType::Float8E4M3FN));
 +        break;
++      case ::tt::target::DataType::Float8E5M2:
++        supportedDataTypesAttr.push_back(
++            DataTypeAttr::get(context, DataType::Float8E5M2));
++        break;
        // Unsupported data types
        // We will list the cases here (rather than use `default`) so that
        // if new supported data types are added, we will get a compile error.
-@@ -1998,6 +2002,7 @@
+@@ -1998,6 +2006,8 @@
      return height * width * 2;
    case DataType::UInt8:
    case DataType::Bool:
 +  case DataType::Float8E4M3FN:
++  case DataType::Float8E5M2:
      return height * width;
    }
  }
-@@ -2024,6 +2029,8 @@
+@@ -2024,6 +2034,10 @@
    case DataType::BFP_BFloat4:
    case DataType::BFP_BFloat2:
      return llvm::APFloat::BFloat();
 +  case DataType::Float8E4M3FN:
 +    return llvm::APFloat::Float8E4M3FN();
++  case DataType::Float8E5M2:
++    return llvm::APFloat::Float8E5M2();
    case DataType::UInt32:
    case DataType::UInt16:
    case DataType::UInt8:
@@ -778,52 +810,60 @@ diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pip
 diff --git a/lib/OpModel/TTNN/Conversion.cpp b/lib/OpModel/TTNN/Conversion.cpp
 --- a/lib/OpModel/TTNN/Conversion.cpp
 +++ b/lib/OpModel/TTNN/Conversion.cpp
-@@ -39,6 +39,8 @@
+@@ -39,6 +39,10 @@
      return ::tt::tt_metal::DataType::UINT8;
    case ttcore::DataType::Int32:
      return ::tt::tt_metal::DataType::INT32;
 +  case ttcore::DataType::Float8E4M3FN:
 +    return ::tt::tt_metal::DataType::FP8_E4M3;
++  case ttcore::DataType::Float8E5M2:
++    return ::tt::tt_metal::DataType::FP8_E5M2;
    default:
      throw std::runtime_error("Invalid element type");
    }
-@@ -64,6 +66,8 @@
+@@ -64,6 +68,10 @@
      return ttcore::DataType::UInt8;
    case ::tt::tt_metal::DataType::INT32:
      return ttcore::DataType::Int32;
 +  case ::tt::tt_metal::DataType::FP8_E4M3:
 +    return ttcore::DataType::Float8E4M3FN;
++  case ::tt::tt_metal::DataType::FP8_E5M2:
++    return ttcore::DataType::Float8E5M2;
    default:
      throw std::runtime_error("Invalid element type");
    }
 diff --git a/runtime/include/tt/runtime/detail/common/common.h b/runtime/include/tt/runtime/detail/common/common.h
 --- a/runtime/include/tt/runtime/detail/common/common.h
 +++ b/runtime/include/tt/runtime/detail/common/common.h
-@@ -108,6 +108,8 @@
+@@ -108,6 +108,10 @@
      return ::tt::DataFormat::Int32;
    case ::tt::target::DataType::BFP_BFloat8:
      return ::tt::DataFormat::Bfp8_b;
 +  case ::tt::target::DataType::Float8E4M3FN:
 +    return ::tt::DataFormat::Fp8_e4m3;
++  case ::tt::target::DataType::Float8E5M2:
++    return ::tt::DataFormat::Lf8;
    default:
      LOG_FATAL("Unsupported data type");
    }
 diff --git a/runtime/lib/common/utils.cpp b/runtime/lib/common/utils.cpp
 --- a/runtime/lib/common/utils.cpp
 +++ b/runtime/lib/common/utils.cpp
-@@ -162,6 +162,7 @@
+@@ -162,6 +162,8 @@
    case ::tt::target::DataType::UInt8:
    case ::tt::target::DataType::Int8:
    case ::tt::target::DataType::Bool:
 +  case ::tt::target::DataType::Float8E4M3FN:
++  case ::tt::target::DataType::Float8E5M2:
      return 1;
    default:
      LOG_FATAL("Unsupported element size for data type");
-@@ -224,6 +225,7 @@
+@@ -224,6 +226,8 @@
    case ::tt::target::DataType::UInt16:
    case ::tt::target::DataType::UInt8:
    case ::tt::target::DataType::Int32:
 +  case ::tt::target::DataType::Float8E4M3FN:
++  case ::tt::target::DataType::Float8E5M2:
      return true;
    case ::tt::target::DataType::Float64:
    case ::tt::target::DataType::Int64:
@@ -838,18 +878,19 @@ diff --git a/runtime/lib/ttnn/operations/layout/bitcast_convert.cpp b/runtime/li
  
  namespace tt::runtime::ttnn::operations::layout {
  void run(const ::tt::target::ttnn::BitcastConvertOp *op,
-@@ -22,8 +23,20 @@
+@@ -22,8 +23,21 @@
    std::optional<::ttnn::MemoryConfig> memoryConfig =
        ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(op->memcfg());
  
 -  ::ttnn::Tensor out =
 -      ::ttnn::bitcast(inputTensor, targetDataType, memoryConfig);
-+  // UInt8 and Float8E4M3FN tiles hold the same bytes: the bitcast is a view
-+  // (ttnn::bitcast would convert, since the unpacker reads Fp8_e4m3 as
-+  // numbers).
++  // UInt8 and float8 tiles hold the same bytes: the bitcast is a view
++  // (ttnn::bitcast would convert, since the unpacker reads Fp8_e4m3 and Lf8
++  // as numbers).
 +  auto isByteType = [](::ttnn::DataType dtype) {
 +    return dtype == ::ttnn::DataType::UINT8 ||
-+           dtype == ::ttnn::DataType::FP8_E4M3;
++           dtype == ::ttnn::DataType::FP8_E4M3 ||
++           dtype == ::ttnn::DataType::FP8_E5M2;
 +  };
 +  ::ttnn::Tensor out;
 +  if (isByteType(inputTensor.dtype()) && isByteType(targetDataType) &&
@@ -864,14 +905,17 @@ diff --git a/runtime/lib/ttnn/operations/layout/bitcast_convert.cpp b/runtime/li
 diff --git a/runtime/lib/ttnn/operations/matmul/matmul.cpp b/runtime/lib/ttnn/operations/matmul/matmul.cpp
 --- a/runtime/lib/ttnn/operations/matmul/matmul.cpp
 +++ b/runtime/lib/ttnn/operations/matmul/matmul.cpp
-@@ -72,6 +72,16 @@
+@@ -72,6 +72,19 @@
      computeConfig =
          utils::createDeviceComputeKernelConfig(op->compute_config());
    }
-+  // The DEST register has to be in 32-bit mode for Fp8_e4m3 operands. Their
++  // The DEST register has to be in 32-bit mode for float8 operands. Their
 +  // products are exact at LoFi.
-+  if (lhs.dtype() == ::ttnn::DataType::FP8_E4M3 ||
-+      rhs.dtype() == ::ttnn::DataType::FP8_E4M3) {
++  auto isFloat8 = [](const ::ttnn::Tensor &tensor) {
++    return tensor.dtype() == ::ttnn::DataType::FP8_E4M3 ||
++           tensor.dtype() == ::ttnn::DataType::FP8_E5M2;
++  };
++  if (isFloat8(lhs) || isFloat8(rhs)) {
 +    if (!computeConfig) {
 +      computeConfig = ::ttnn::DeviceComputeKernelConfig{
 +          .math_fidelity = ::tt::tt_metal::MathFidelity::LoFi};
@@ -884,21 +928,25 @@ diff --git a/runtime/lib/ttnn/operations/matmul/matmul.cpp b/runtime/lib/ttnn/op
 diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
 --- a/runtime/lib/ttnn/utils/utils.cpp
 +++ b/runtime/lib/ttnn/utils/utils.cpp
-@@ -188,6 +188,8 @@
+@@ -188,6 +188,10 @@
      return ::ttnn::DataType::UINT8;
    case ::tt::target::DataType::Int32:
      return ::ttnn::DataType::INT32;
 +  case ::tt::target::DataType::Float8E4M3FN:
 +    return ::ttnn::DataType::FP8_E4M3;
++  case ::tt::target::DataType::Float8E5M2:
++    return ::ttnn::DataType::FP8_E5M2;
  
    default:
      LOG_FATAL("Unsupported data type");
-@@ -214,6 +216,8 @@
+@@ -214,6 +218,10 @@
      return ::tt::target::DataType::UInt8;
    case ::ttnn::DataType::INT32:
      return ::tt::target::DataType::Int32;
 +  case ::ttnn::DataType::FP8_E4M3:
 +    return ::tt::target::DataType::Float8E4M3FN;
++  case ::ttnn::DataType::FP8_E5M2:
++    return ::tt::target::DataType::Float8E5M2;
  
    default:
      LOG_FATAL("Unsupported data type");
