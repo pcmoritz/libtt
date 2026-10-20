@@ -154,6 +154,10 @@ py_test(
         "tests/optimizers/sgd_test.py",
         "tests/scan_test.py",
         "tests/untyped_storage_test.py",
+        # unique and unique_consecutive sort with a non-strict comparator,
+        # with duplicates, returned inverse indices and counts.
+        "tests/ops_unit_test.py::OpsGradUnitTest::test_unique2_distributions",
+        "tests/ops_unit_test.py::OpsUnitTest::test_unique_consecutive_distributions",
     ],
     data = TORCH_TPU_TEST_DATA,
     deps = TORCH_TPU_TEST_DEPS,
