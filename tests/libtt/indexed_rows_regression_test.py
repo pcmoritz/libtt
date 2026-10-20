@@ -409,6 +409,21 @@ def test_dynamic_update_slice_wide_unsplittable_window(dtype):
     assert_equal(got, want)
 
 
+def test_scatter_add_concentrated_rows():
+    # An embedding gradient: 2048 token rows added into a large vocabulary,
+    # most of them to a few frequent tokens with small ids. Table pages
+    # interleave over the cores, and each page's updates still apply in
+    # position order. Integer values keep float32 sums exact.
+    rng = np.random.default_rng(21)
+    table = np.zeros((151_936, 64), np.float32)
+    ids = np.minimum(rng.zipf(1.3, 2048) - 1, 151_935).astype(np.int32)
+    rows = rng.integers(-8, 8, (2048, 64)).astype(np.float32)
+    got = run(lambda t, i, r: t.at[i].add(r), table, ids, rows)
+    want = np.array(table)
+    np.add.at(want, ids, rows)
+    assert_equal(got, want)
+
+
 def test_state_pool_update():
     # sglang's recurrent state pool: states.at[slots].set(new_states).
     rng = np.random.default_rng(15)

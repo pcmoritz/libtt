@@ -50,8 +50,20 @@ void kernel_main() {
     constexpr uint32_t kStreamPiece = 64 * 1024;
     constexpr bool stream_window = column && column_bytes > kStreamPiece;
 
+    // This core owns pages first_page + i * page_stride for i < num_pages (the
+    // pages may interleave over the cores, so that the rows most updates go to,
+    // an embedding's frequent tokens, don't all land on one core).
     const uint32_t first_page = get_arg(args::first_page);
     const uint32_t num_pages = get_arg(args::num_pages);
+    const uint32_t page_stride = get_arg(args::page_stride);
+    // Whether this core owns `page`, and if so as its owned page `i`.
+    auto owned = [&](uint32_t page, uint32_t& i) {
+        if (page < first_page || (page - first_page) % page_stride != 0) {
+            return false;
+        }
+        i = (page - first_page) / page_stride;
+        return i < num_pages;
+    };
 
     DataflowBuffer rows(dfb::rows);
     DataflowBuffer index(dfb::index);
@@ -63,8 +75,6 @@ void kernel_main() {
     Noc noc;
 
     const uint32_t entry = rows.get_entry_size();
-    const uint32_t b_lo = first_page / (N * S);
-    const uint32_t b_hi = num_pages == 0 ? 0 : (first_page + num_pages - 1) / (N * S);
     // Row-mode reductions read the source row chunk here before combining it.
     scratch.reserve_back(1);
     const uint32_t src_addr = scratch.get_write_ptr();
@@ -74,14 +84,14 @@ void kernel_main() {
         const uint32_t count = total - q0 < batch ? total - q0 : batch;
         rows.wait_front(count);
         const uint32_t batch_l1 = rows.get_read_ptr();
-        // The pages with a chunk in this batch.
-        const uint32_t batch_page_lo = first_page + q0 / C;
-        const uint32_t batch_page_hi = first_page + (q0 + count + C - 1) / C;
-
         // The L1 address of (page, offset) when its chunk is in this batch.
         auto in_batch = [&](uint32_t page, uint32_t offset, uint32_t& l1) {
-            const uint32_t q = (page - first_page) * C + offset / chunk_bytes;
-            if (page < first_page || page >= first_page + num_pages || q < q0 || q >= q0 + count) {
+            uint32_t i;
+            if (!owned(page, i)) {
+                return false;
+            }
+            const uint32_t q = i * C + offset / chunk_bytes;
+            if (q < q0 || q >= q0 + count) {
                 return false;
             }
             l1 = batch_l1 + (q - q0) * entry + offset % chunk_bytes;
@@ -96,7 +106,15 @@ void kernel_main() {
             }
         };
 
-        for (uint32_t b = b_lo; b <= b_hi; ++b) {
+        // The batches of the owned pages with a chunk in this batch, each once
+        // (owned pages, and so their batches, increase).
+        uint32_t last_b = 0xFFFFFFFF;
+        for (uint32_t owned_page = q0 / C; owned_page <= (q0 + count - 1) / C; ++owned_page) {
+            const uint32_t b = (first_page + owned_page * page_stride) / (N * S);
+            if (b == last_b) {
+                continue;
+            }
+            last_b = b;
             for (uint32_t m0 = 0; m0 < M; m0 += index_batch) {
                 const uint32_t n = M - m0 < index_batch ? M - m0 : index_batch;
                 const uint32_t index_l1 =
@@ -112,7 +130,8 @@ void kernel_main() {
                         // row components alone before decoding the column.
                         const Coords<KR> rows_only = decode<KR, index_unsigned>(position, index_stride, sizes, windows);
                         const uint32_t row = b * N + window_row<KR>(rows_only, 0, windows, strides);
-                        if (rows_only.out_of_bounds || row - first_page >= num_pages) {
+                        uint32_t owned_page;
+                        if (rows_only.out_of_bounds || !owned(row, owned_page)) {
                             continue;
                         }
                     }
@@ -164,12 +183,10 @@ void kernel_main() {
                             }
                             continue;
                         }
-                        // Only the row's pages in this batch; an overwrite reads them straight
-                        // into the copy and waits once per position (the pages of one position are
-                        // distinct, and positions apply in order).
-                        const uint32_t page_lo = batch_page_lo > row * S ? batch_page_lo : row * S;
-                        const uint32_t page_hi = batch_page_hi < (row + 1) * S ? batch_page_hi : (row + 1) * S;
-                        for (uint32_t page = page_lo; page < page_hi; ++page) {
+                        // Only the row's pages in this batch (in_batch); an overwrite reads them
+                        // straight into the copy and waits once per position (the pages of one
+                        // position are distinct, and positions apply in order).
+                        for (uint32_t page = row * S; page < (row + 1) * S; ++page) {
                             const uint32_t s = page - row * S;
                             const uint32_t src_page = ((b * M + m) * W + j) * S + s;
                             for (uint32_t offset = 0; offset < page_bytes; offset += chunk_bytes) {
@@ -207,7 +224,7 @@ void kernel_main() {
         // The batch goes out once.
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t q = q0 + i;
-            const uint32_t page = first_page + q / C;
+            const uint32_t page = first_page + q / C * page_stride;
             const uint32_t offset = (q % C) * chunk_bytes;
             const uint32_t bytes = page_bytes - offset < chunk_bytes ? page_bytes - offset : chunk_bytes;
             noc.async_write(rows, output, bytes, {.offset_bytes = i * entry}, {.page_id = page, .offset_bytes = offset});

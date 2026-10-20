@@ -140,11 +140,13 @@ Geometry geometry(const IndexedRowsParams& params, const IndexedRowsInputs& in) 
     return g;
 }
 
-// Assigns [first, first + count) of `work` items to the cores, evenly.
+// Assigns [first, first + count) of `work` items to the cores, evenly (items
+// first + i * stride, i < count, for an interleaved split).
 struct Split {
     uint32_t num_cores;
     CoreRangeSet all_cores;
     std::vector<std::pair<CoreCoord, std::pair<uint32_t, uint32_t>>> ranges;
+    uint32_t stride = 1;
 };
 
 Split split(const tt::tt_metal::distributed::MeshDevice& device, uint32_t work) {
@@ -158,6 +160,23 @@ Split split(const tt::tt_metal::distributed::MeshDevice& device, uint32_t work) 
         const uint32_t count = core_group_1.contains(core) ? per_core_1 : per_core_2;
         s.ranges.emplace_back(core, std::make_pair(first, count));
         first += count;
+    }
+    return s;
+}
+
+// Interleaves `work` items over the cores: core c takes items c, c + n, ...
+// (stride n = num_cores).
+Split split_interleaved(const tt::tt_metal::distributed::MeshDevice& device, uint32_t work) {
+    const auto grid = device.compute_with_storage_grid_size();
+    const uint32_t num_cores = std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, work));
+    const auto cores = tt::tt_metal::corerange_to_cores(
+        CoreRangeSet(CoreRange({0, 0}, {grid.x - 1, grid.y - 1})), num_cores, /*row_wise=*/false);
+    Split s{
+        .num_cores = num_cores,
+        .all_cores = CoreRangeSet(std::vector<CoreRange>(cores.begin(), cores.end())),
+        .stride = num_cores};
+    for (uint32_t c = 0; c < num_cores; ++c) {
+        s.ranges.emplace_back(cores[c], std::make_pair(c, work > c ? (work - c + num_cores - 1) / num_cores : 0u));
     }
     return s;
 }
@@ -264,7 +283,14 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
     // goes out once. The reader fills the batch `group` chunks at a time, so
     // the batch is a multiple of the group: a partial group at the end of the
     // buffer would wait for space the writer only frees after the full batch.
-    const Split s = split(device, g.table.B * g.pages);
+    // Pages interleave over the cores, so that the rows most updates go to (an
+    // embedding gradient's frequent tokens) don't all land on one core. Several
+    // batches with more pages than cores keep contiguous ranges: interleaved,
+    // every core would read every batch's indices.
+    const auto grid = device.compute_with_storage_grid_size();
+    const uint32_t work = g.table.B * g.pages;
+    const bool interleave = g.table.B == 1 || g.pages <= grid.x * grid.y;
+    const Split s = interleave ? split_interleaved(device, work) : split(device, work);
     // Entries hold chunks of table pages: a column window is copied in from the
     // stream DFB, so it needs no slack here. A window wider than kStreamPiece
     // streams through the stream DFB a piece at a time (rows_scatter_writer.cpp).
@@ -308,7 +334,7 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
             },
         .tensor_bindings = {TensorBinding{.tensor_parameter_name = TABLE, .accessor_name = "table"}},
         .compile_time_args = g.compile_time_args,
-        .runtime_arg_schema = {.runtime_arg_names = {"first_page", "num_pages"}},
+        .runtime_arg_schema = {.runtime_arg_names = {"first_page", "num_pages", "page_stride"}},
         .hw_config = ttnn::create_reader_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
     KernelSpec writer{
@@ -336,7 +362,7 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
                 TensorBinding{.tensor_parameter_name = OUTPUT, .accessor_name = "output"},
             },
         .compile_time_args = g.compile_time_args,
-        .runtime_arg_schema = {.runtime_arg_names = {"first_page", "num_pages"}},
+        .runtime_arg_schema = {.runtime_arg_names = {"first_page", "num_pages", "page_stride"}},
         .hw_config = ttnn::create_writer_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
 
@@ -345,7 +371,9 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
     for (const auto& [core, range] : s.ranges) {
         for (auto* run_args : {&reader_run_args, &writer_run_args}) {
             AddRuntimeArgsForNode(
-                run_args->runtime_arg_values, core, {{"first_page", range.first}, {"num_pages", range.second}});
+                run_args->runtime_arg_values,
+                core,
+                {{"first_page", range.first}, {"num_pages", range.second}, {"page_stride", s.stride}});
         }
     }
 

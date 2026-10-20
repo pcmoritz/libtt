@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // rows_scatter reader: streams this core's table pages (pages
-// [first_page, first_page + num_pages) of the [B, N, S, R] table) into the rows
-// DFB, chunk by chunk, for the writer to update in L1 and write out.
+// first_page + i * page_stride, i < num_pages, of the [B, N, S, R] table) into
+// the rows DFB, chunk by chunk, for the writer to update in L1 and write out.
 
 #include <cstdint>
 
@@ -21,6 +21,7 @@ void kernel_main() {
 
     const uint32_t first_page = get_arg(args::first_page);
     const uint32_t num_pages = get_arg(args::num_pages);
+    const uint32_t page_stride = get_arg(args::page_stride);
 
     DataflowBuffer rows(dfb::rows);
     const auto table = TensorAccessor(tensor::table);
@@ -32,7 +33,7 @@ void kernel_main() {
         const uint32_t count = total - q < group ? total - q : group;
         rows.reserve_back(count);
         for (uint32_t i = 0; i < count; ++i, ++q) {
-            const uint32_t page = first_page + q / C;
+            const uint32_t page = first_page + q / C * page_stride;
             const uint32_t offset = (q % C) * chunk_bytes;
             const uint32_t bytes = page_bytes - offset < chunk_bytes ? page_bytes - offset : chunk_bytes;
             noc.async_read(table, rows, bytes, {.page_id = page, .offset_bytes = offset}, {.offset_bytes = i * entry});
