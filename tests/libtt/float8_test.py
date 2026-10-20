@@ -1,9 +1,10 @@
 """float8 tensors: storage, conversions and native matmuls.
 
-float8 tensors are stored as their bits. Conversions to and from float8 are
-exact integer arithmetic on the device, so they match ml_dtypes (and
+float8 tensors are stored as their bits. Conversions between float8 and f32
+are exact on the device (ttnn's typecast), so they match ml_dtypes (and
 PyTorch): rounding to nearest even, subnormals, NaN on e4m3fn overflow and
-infinity on e5m2 overflow. A matmul of two float8 matrices reads them
+infinity on e5m2 overflow, at O0 and O1 (where casts through float8 must not
+fold). A matmul of two float8 matrices reads them
 natively on the matrix unit, which flushes subnormal operands to zero.
 """
 
@@ -14,6 +15,11 @@ import numpy as np
 import pytest
 
 FORMATS = [jnp.float8_e4m3fn, jnp.float8_e5m2]
+LEVELS = pytest.mark.parametrize("level", ["O0", "O1"])
+
+
+def jit(f, level):
+    return jax.jit(f, compiler_options={"optimization_level": level})
 
 
 def all_codes(dtype):
@@ -39,17 +45,29 @@ def test_float8_buffers_round_trip(dtype):
     assert_same_bits(moved, np.concatenate([codes.T, codes[::-1]], axis=0))
 
 
+@LEVELS
 @pytest.mark.parametrize("dtype", FORMATS)
-def test_decode_every_code(dtype):
+def test_decode_every_code(dtype, level):
     codes = all_codes(dtype)
-    decoded = jax.jit(lambda x: x.astype(jnp.float32))(codes)
+    decoded = jit(lambda x: x.astype(jnp.float32), level)(codes)
     assert_same_bits(decoded, codes.astype(np.float32))
-    to_bf16 = jax.jit(lambda x: x.astype(jnp.bfloat16))(codes)
+    to_bf16 = jit(lambda x: x.astype(jnp.bfloat16), level)(codes)
     assert_same_bits(to_bf16, codes.astype(jnp.bfloat16))
 
 
+def midpoints(dtype):
+    """Each rounding midpoint between neighboring values of the format (and past its largest),
+    with its float32 neighbors."""
+    values = np.arange(256, dtype=np.uint8).view(dtype).astype(np.float64)
+    finite = np.unique(np.abs(values[np.isfinite(values)]))
+    finite = np.append(finite, 2 * finite[-1] - finite[-2])
+    mid = ((finite[:-1] + finite[1:]) / 2).astype(np.float32)
+    return np.concatenate([mid, np.nextafter(mid, np.float32(0)), np.nextafter(mid, np.float32(np.inf))])
+
+
 def encode_inputs():
-    """Every bfloat16, random float32 values over the formats' ranges, and edges."""
+    """Every bfloat16, random float32 values over the formats' ranges and random float32 bit
+    patterns, both formats' rounding midpoints with their neighbors, and edges."""
     bf16 = (np.arange(1 << 16, dtype=np.uint32) << 16).view(np.float32)
     rng = np.random.default_rng(0)
     scales = np.ldexp(1.0, rng.integers(-20, 18, size=1 << 15)).astype(np.float32)
@@ -62,15 +80,27 @@ def encode_inputs():
          2.0**-10, 1.5 * 2.0**-10, 2.0**-9, 2.5 * 2.0**-9, 2.0**-17, 3 * 2.0**-17, 0.0, -0.0],
         np.float32,
     )
-    values = np.concatenate([bf16, random, edges, -edges])
+    bits = rng.integers(0, 1 << 32, size=1 << 14, dtype=np.uint32).view(np.float32)
+    mids = np.concatenate([midpoints(dtype) for dtype in FORMATS])
+    values = np.concatenate([bf16, random, bits, mids, -mids, edges, -edges])
     return np.pad(values, (0, -len(values) % 1024)).reshape(-1, 32)
 
 
+@LEVELS
 @pytest.mark.parametrize("dtype", FORMATS)
-def test_encode_rounds_like_ml_dtypes(dtype):
+def test_encode_rounds_like_ml_dtypes(dtype, level):
     values = encode_inputs()
-    encoded = jax.jit(lambda x: x.astype(dtype))(values)
+    encoded = jit(lambda x: x.astype(dtype), level)(values)
     assert_same_bits(encoded, values.astype(dtype))
+
+
+@LEVELS
+@pytest.mark.parametrize("dtype", FORMATS)
+def test_encode_rounding_survives_a_following_cast(dtype, level):
+    """f32 -> float8 -> bfloat16 keeps the float8 rounding."""
+    values = encode_inputs()
+    rounded = jit(lambda x: x.astype(dtype).astype(jnp.bfloat16), level)(values)
+    assert_same_bits(rounded, values.astype(dtype).astype(jnp.bfloat16))
 
 
 @pytest.mark.parametrize("dtype", FORMATS)
