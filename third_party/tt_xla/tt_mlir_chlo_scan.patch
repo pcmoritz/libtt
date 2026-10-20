@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
-@@ -2372,6 +2372,168 @@
+@@ -2372,6 +2372,174 @@
    }
  };
  
@@ -47,6 +47,12 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp b
 +    bool reverse = reverseAttr && reverseAttr.getValue();
 +    Type elementType = inputType.getElementType();
 +    Location loc = srcOp.getLoc();
++
++    // An empty scan has no last position: the carry is the init value.
++    if (size == 0) {
++      rewriter.replaceOp(srcOp, {input, init});
++      return success();
++    }
 +
 +    // A scan of length 1 only combines with the init value.
 +    Value scanned = input;
@@ -170,7 +176,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp b
  struct LegalizeStableHLOCompositeToTTIR
      : public ttir::impl::LegalizeStableHLOCompositeToTTIRBase<
            LegalizeStableHLOCompositeToTTIR> {
-@@ -2382,6 +2544,14 @@
+@@ -2382,6 +2550,14 @@
      target.addLegalDialect<ttir::TTIRDialect>();
      target.addLegalDialect<ttcore::TTCoreDialect>();
      // StableHLO is intentionally not marked as either legal or illegal.
@@ -185,7 +191,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp b
  
      RewritePatternSet patterns(context);
      populateStableHLOCompositeLegalizationPatterns(context, patterns);
-@@ -2408,6 +2578,7 @@
+@@ -2408,6 +2584,7 @@
    patterns.add<StableHLOToTTIRCompositeOpConversionPattern<ttir::GeluOp>>(
        context, "tenstorrent.gelu_tanh");
    patterns.add<ChloMulHiConversionPattern>(context);

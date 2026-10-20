@@ -3,7 +3,8 @@
 PyTorch's torch.max(x, dim) is a (value, index) reduce whose body compares with
 >= (<= for min), keeps the maximum, and breaks ties towards the smaller index,
 with the lowest (highest) finite value as init. Both results are used, and the
-init takes part in the values: a row of -inf has the maximum finfo.min.
+init takes part in them: a row of -inf has the maximum finfo.min, and its
+index 0 wins wherever it ties the maximum, as in [-inf, finfo.min].
 
 Only that reducer may become an argmax (argmin), which picks the smaller index on
 ties. A reducer that picks the larger one must not.
@@ -38,22 +39,27 @@ def _arg_reduce(x, is_max, init_value, nan_aware=False, tie_break=jnp.minimum):
 @pytest.mark.parametrize("nan_aware", [True, False])
 def test_values_and_indices(is_max, finite_init, nan_aware):
     x = np.random.default_rng(0).standard_normal((4, 6)).astype(np.float32)
-    # A row of the reduction's identity and a row that reaches it once.
+    # A row of the reduction's identity, a row that reaches it once, and a row
+    # whose extreme is the finite init value.
     extreme = -np.inf if is_max else np.inf
+    info = np.finfo(np.float32)
+    finite = info.min if is_max else info.max
     x[1] = extreme
     x[2, 3] = extreme
-    info = np.finfo(np.float32)
-    if finite_init:
-        init = info.min if is_max else info.max
-    else:
-        init = extreme
+    x[3] = extreme
+    x[3, 2] = finite
+    init = finite if finite_init else extreme
     values, indices = jax.jit(lambda x: _arg_reduce(x, is_max, init, nan_aware))(x)
+    # The init (value, index 0) wins ties, so its index wins wherever it is at
+    # least the maximum (at most the minimum).
     if is_max:
         expected_values = np.maximum(np.max(x, axis=1), init)
-        expected_indices = np.argmax(x, axis=1)
+        init_wins = init >= np.max(x, axis=1)
+        expected_indices = np.where(init_wins, 0, np.argmax(x, axis=1))
     else:
         expected_values = np.minimum(np.min(x, axis=1), init)
-        expected_indices = np.argmin(x, axis=1)
+        init_wins = init <= np.min(x, axis=1)
+        expected_indices = np.where(init_wins, 0, np.argmin(x, axis=1))
     np.testing.assert_array_equal(values, expected_values)
     np.testing.assert_array_equal(indices, expected_indices)
 
