@@ -1,0 +1,136 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1166,7 +1166,7 @@
+   let extraClassDeclaration = [{
+     wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+       return wa::TTNNOperandsWorkaroundsFactory::
+-          createArgMaxOpOperandsWorkarounds();
++          createArgMaxOpOperandsWorkarounds(getInput().getType());
+     }
+ 
+   }];
+@@ -3675,6 +3675,13 @@
+ 
+   let results = (outs AnyRankedTensor:$result);
+ 
++  let extraClassDeclaration = [{
++    wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
++      return wa::TTNNOperandsWorkaroundsFactory::
++          createClampTensorOpOperandsWorkarounds(getInput().getType());
++    }
++  }];
++
+ }
+ 
+ class TTNN_CreationOp<string mnemonic, list<Trait> traits = []> :
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -307,6 +307,9 @@
+   static TTNNOperandsWorkarounds
+   createClampScalarOpOperandsWorkarounds(RankedTensorType inputType);
+ 
++  static TTNNOperandsWorkarounds
++  createClampTensorOpOperandsWorkarounds(RankedTensorType inputType);
++
+   static TTNNOperandsWorkarounds createConcatOpOperandsWorkarounds(
+       mlir::Operation::operand_range inputs, int64_t dim);
+ 
+@@ -345,7 +348,8 @@
+   createUnaryBitwiseOpOperandsWorkarounds(mlir::Operation *op);
+ 
+   // Create workarounds for ArgMax op operands.
+-  static TTNNOperandsWorkarounds createArgMaxOpOperandsWorkarounds();
++  static TTNNOperandsWorkarounds
++  createArgMaxOpOperandsWorkarounds(RankedTensorType inputType);
+ 
+   // Create workarounds for pad op operands.
+   static TTNNOperandsWorkarounds
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -585,6 +585,25 @@
+       .addOutputOperandWorkaround(typeWorkarounds);
+ }
+ 
++// Factory method to create a set of workarounds for clamp tensor operation
++// operands. ttnn's tensor clamp is a maximum followed by a minimum, so like
++// those binary ops (see binaryOpDTypeWorkaround), it clamps uint8 as int32.
++TTNNOperandsWorkarounds
++TTNNOperandsWorkaroundsFactory::createClampTensorOpOperandsWorkarounds(
++    RankedTensorType inputType) {
++  TTNNOperandWorkarounds typeWorkarounds;
++  if (mlir::tt::ttcore::elementTypeToDataType(inputType.getElementType()) ==
++      mlir::tt::ttcore::DataType::UInt8) {
++    typeWorkarounds.tensorDataTypeWorkaround =
++        mlir::tt::ttcore::DataType::Int32;
++  }
++  return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
++      .addInputOperandWorkaround(typeWorkarounds)
++      .addInputOperandWorkaround(typeWorkarounds)
++      .addInputOperandWorkaround(typeWorkarounds)
++      .addOutputOperandWorkaround(typeWorkarounds);
++}
++
+ TTNNOperandsWorkarounds
+ TTNNOperandsWorkaroundsFactory::createConcatOpOperandsWorkarounds(
+     mlir::Operation::operand_range inputs, int64_t dim) {
+@@ -975,15 +994,22 @@
+ }
+ 
+ // Factory method to create a set of workarounds for ArgMax op operands.
+-// Input tensor must have ROW_MAJOR layout.
++// Input tensor must have ROW_MAJOR layout. Of the integer types, ttnn argmax
++// only takes int32, uint32 and uint16 inputs, so uint8 is compared as int32.
+ // No need for data type workaround for output tensor; only layout workaround is
+ // required to match original layout.
+ // tt-metal specs:
+ // https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/api/ttnn.argmax.html
+ TTNNOperandsWorkarounds
+-TTNNOperandsWorkaroundsFactory::createArgMaxOpOperandsWorkarounds() {
++TTNNOperandsWorkaroundsFactory::createArgMaxOpOperandsWorkarounds(
++    RankedTensorType inputType) {
+   wa::TTNNOperandWorkarounds rowMajorLayoutWorkaround;
+   rowMajorLayoutWorkaround.tensorLayoutWorkaround = Layout::RowMajor;
++  if (mlir::tt::ttcore::elementTypeToDataType(inputType.getElementType()) ==
++      mlir::tt::ttcore::DataType::UInt8) {
++    rowMajorLayoutWorkaround.tensorDataTypeWorkaround =
++        mlir::tt::ttcore::DataType::Int32;
++  }
+ 
+   wa::TTNNOperandWorkarounds rowMajorLayoutUint32Workaround;
+   rowMajorLayoutUint32Workaround.tensorLayoutWorkaround = Layout::RowMajor;
+@@ -1025,10 +1051,19 @@
+ // typecast to float32, which rounds values beyond 2^24. tt-metal fixed this
+ // (https://github.com/tenstorrent/tt-metal/issues/19950), so 32-bit integers
+ // are now permuted directly.
++// Row-major uint8 permutes that move the last dimension come out as zeros
++// (tt-metal's blocked row-major transpose doesn't handle 1-byte elements), so
++// uint8 is permuted as int32 at every layout; at O1 the optimizer can still
++// pick the layout after this pass.
+ TTNNOperandsWorkarounds
+ TTNNOperandsWorkaroundsFactory::createPermuteOpOperandWorkaround(
+     mlir::RankedTensorType inputType) {
+   TTNNOperandWorkarounds operandWorkaround;
++  if (mlir::tt::ttcore::elementTypeToDataType(inputType.getElementType()) ==
++      mlir::tt::ttcore::DataType::UInt8) {
++    operandWorkaround.tensorDataTypeWorkaround =
++        mlir::tt::ttcore::DataType::Int32;
++  }
+ 
+   return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+       .addInputOperandWorkaround(operandWorkaround)
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+@@ -655,6 +655,9 @@
+         // ttnn clamp TT_FATALs on uint8/uint16 inputs; its operands
+         // workaround clamps them as int32.
+         ttnn::ClampScalarOp::getOperationName(),
++        ttnn::ClampTensorOp::getOperationName(),
++        // Permute computes uint8 as int32; the optimizer keeps uint8 row-major.
++        ttnn::PermuteOp::getOperationName(),
+         // TopK's operands workaround forces input bf16 + indices ui16/ui32;
+         // without it, opt_level>=1 dtype propagation picks f32. See #8141.
+         ttnn::TopKOp::getOperationName(),
