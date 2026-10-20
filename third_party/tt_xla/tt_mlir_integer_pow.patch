@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 --- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 +++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
-@@ -110,6 +110,52 @@
+@@ -110,6 +110,48 @@
  // As soon as tenstorrent/tt-metal#16618 is finished, this decomposition can be
  // removed.
  namespace {
@@ -31,20 +31,16 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +      return rewriter.create<ttir::FullOp>(loc, i32Type,
 +                                           rewriter.getI32IntegerAttr(value));
 +    };
-+    // Wrap to the width: mask unsigned types, and sign-extend signed ones by
-+    // shifting their low bits to the top and arithmetically back.
++    // Wrap to the width: mask, and sign-extend signed types.
 +    unsigned width = intType.getWidth();
-+    if (intType.isUnsigned()) {
-+      result = rewriter.create<ttir::BitwiseAndOp>(
-+          loc, i32Type, result,
-+          constant(static_cast<int32_t>((1u << width) - 1)));
-+    } else {
-+      mlir::Value shift = constant(32 - width);
-+      result = rewriter.create<ttir::RightShiftOp>(
++    result = rewriter.create<ttir::BitwiseAndOp>(
++        loc, i32Type, result, constant(static_cast<int32_t>((1u << width) - 1)));
++    if (!intType.isUnsigned()) {
++      mlir::Value signBit = constant(1 << (width - 1));
++      result = rewriter.create<ttir::SubtractOp>(
 +          loc, i32Type,
-+          rewriter.create<ttir::LogicalLeftShiftOp>(loc, i32Type, result,
-+                                                    shift),
-+          shift);
++          rewriter.create<ttir::BitwiseXorOp>(loc, i32Type, result, signBit),
++          signBit);
 +    }
 +    rewriter.replaceOpWithNewOp<ttir::TypecastOp>(op, type, result);
 +    return success();
@@ -54,7 +50,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
  struct ReverseOpConversionPattern
      : public OpConversionPattern<ttir::ReverseOp> {
    using OpConversionPattern<ttir::ReverseOp>::OpConversionPattern;
-@@ -2620,6 +2666,7 @@
+@@ -2707,6 +2749,7 @@
    patterns.add<RequantizeOpPattern>(typeConverter, ctx);
    patterns.add<ReductionProdPattern>(typeConverter, ctx);
    patterns.add<ReverseOpConversionPattern>(typeConverter, ctx);
