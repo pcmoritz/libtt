@@ -1,0 +1,147 @@
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -2977,6 +2977,143 @@ void mlir::tt::ttir::ReshapeOp::getCanonicalizationPatterns(
+                                                     permute.getType().getShape()));
+     return success();
+   });
++
++  // TorchTitan's fused QKV projection splits [S, G * R * D] into [S, G, R, D]
++  // and slices R (or [S, G, R * D] and slices that). Tiles pad R or G there,
++  // so the reshape, the slice and the per-head norm move padded tiles. These
++  // patterns keep such tensors as [S * G, R * D] rows instead: slices and
++  // concatenations of those groups become column slices and concatenations,
++  // and RMS norms over D run on [N, D]. The reshapes around them fold. Only
++  // groups of fewer than a tile's 32 rows qualify.
++  patterns.add(+[](mlir::tt::ttir::SliceStaticOp slice,
++                   mlir::PatternRewriter &rewriter) -> LogicalResult {
++    auto padded = [](int64_t size) { return size % 32 != 0; };
++    auto product = [](ArrayRef<int64_t> dims) {
++      return std::accumulate(dims.begin(), dims.end(), int64_t{1},
++                             std::multiplies<int64_t>());
++    };
++    auto reshape = slice.getInput().getDefiningOp<mlir::tt::ttir::ReshapeOp>();
++    if (!reshape) {
++      return failure();
++    }
++    ArrayRef<int64_t> in = reshape.getInput().getType().getShape();
++    ArrayRef<int64_t> out = reshape.getType().getShape();
++    const size_t lead = in.size() - 1;
++    if (in.empty() || out.size() <= in.size() ||
++        !llvm::equal(in.take_front(lead), out.take_front(lead)) ||
++        out[out.size() - 2] >= 32) {
++      return failure();
++    }
++    auto attrValues = [](ArrayAttr attr) {
++      return llvm::to_vector(llvm::map_range(attr, [](Attribute a) {
++        return static_cast<int64_t>(mlir::cast<IntegerAttr>(a).getInt());
++      }));
++    };
++    SmallVector<int64_t> begins = attrValues(slice.getBegins());
++    SmallVector<int64_t> ends = attrValues(slice.getEnds());
++    SmallVector<int64_t> steps = attrValues(slice.getStep());
++    // One sliced dimension d of the split part; the others are whole.
++    int64_t d = -1;
++    for (size_t i = 0; i < out.size(); ++i) {
++      if (steps[i] != 1) {
++        return failure();
++      }
++      if (begins[i] != 0 || ends[i] != out[i]) {
++        if (d >= 0 || i <= lead) {
++          return failure();
++        }
++        d = i;
++      }
++    }
++    if (d < 0) {
++      return failure();
++    }
++    const int64_t rows = product(out.take_front(d));
++    const int64_t columns = product(out.drop_front(d));
++    const int64_t inner = product(out.drop_front(d + 1));
++    if (padded(rows) || padded(columns) || padded(begins[d] * inner) ||
++        padded((ends[d] - begins[d]) * inner)) {
++      return failure();
++    }
++    Location loc = slice.getLoc();
++    Value matrix = ttir::utils::createReshapeOp(rewriter, loc,
++                                                reshape.getInput(),
++                                                {rows, columns});
++    auto type = mlir::cast<RankedTensorType>(matrix.getType());
++    const int64_t width = (ends[d] - begins[d]) * inner;
++    Value sliced = rewriter.create<mlir::tt::ttir::SliceStaticOp>(
++        loc, type.clone({rows, width}), matrix,
++        rewriter.getI32ArrayAttr({0, static_cast<int32_t>(begins[d] * inner)}),
++        rewriter.getI32ArrayAttr(
++            {static_cast<int32_t>(rows), static_cast<int32_t>(ends[d] * inner)}),
++        rewriter.getI32ArrayAttr({1, 1}));
++    rewriter.replaceOp(slice, ttir::utils::createReshapeOp(
++                                  rewriter, loc, sliced,
++                                  slice.getType().getShape()));
++    return success();
++  });
++  patterns.add(+[](mlir::tt::ttir::RMSNormOp norm,
++                   mlir::PatternRewriter &rewriter) -> LogicalResult {
++    auto type = norm.getInput().getType();
++    ArrayRef<int64_t> shape = type.getShape();
++    const int64_t rank = shape.size();
++    if (rank < 3 || norm.getNormalizedShape().size() != 1 ||
++        shape[rank - 2] >= 32) {
++      return failure();
++    }
++    const int64_t rows = std::accumulate(shape.begin(), shape.end() - 1,
++                                         int64_t{1}, std::multiplies<int64_t>());
++    if (rows % 32 != 0) {
++      return failure();
++    }
++    Location loc = norm.getLoc();
++    Value matrix = ttir::utils::createReshapeOp(rewriter, loc, norm.getInput(),
++                                                {rows, shape.back()});
++    Value normed = rewriter.create<mlir::tt::ttir::RMSNormOp>(
++        loc, mlir::cast<RankedTensorType>(matrix.getType()), matrix,
++        norm.getWeight(), norm.getBias(), norm.getNormalizedShapeAttr(),
++        norm.getEpsilonAttr());
++    rewriter.replaceOp(norm, ttir::utils::createReshapeOp(rewriter, loc,
++                                                          normed, shape));
++    return success();
++  });
++  patterns.add(+[](mlir::tt::ttir::ConcatOp concat,
++                   mlir::PatternRewriter &rewriter) -> LogicalResult {
++    auto type = concat.getType();
++    ArrayRef<int64_t> shape = type.getShape();
++    const int64_t rank = shape.size();
++    int64_t d = concat.getDim();
++    d = d < 0 ? d + rank : d;
++    if (rank < 3 || d == rank - 1 || shape[rank - 2] >= 32 || shape[d] >= 32) {
++      return failure();
++    }
++    auto product = [](ArrayRef<int64_t> dims) {
++      return std::accumulate(dims.begin(), dims.end(), int64_t{1},
++                             std::multiplies<int64_t>());
++    };
++    const int64_t rows = product(shape.take_front(d));
++    const int64_t inner = product(shape.drop_front(d + 1));
++    if (rows % 32 != 0) {
++      return failure();
++    }
++    Location loc = concat.getLoc();
++    SmallVector<Value> matrices;
++    for (Value input : concat.getInputs()) {
++      const int64_t width =
++          mlir::cast<RankedTensorType>(input.getType()).getDimSize(d) * inner;
++      if (width % 32 != 0) {
++        return failure();
++      }
++      matrices.push_back(
++          ttir::utils::createReshapeOp(rewriter, loc, input, {rows, width}));
++    }
++    Value joined = rewriter.create<mlir::tt::ttir::ConcatOp>(
++        loc, type.clone({rows, shape[d] * inner}), matrices,
++        static_cast<int32_t>(1));
++    rewriter.replaceOp(concat,
++                       ttir::utils::createReshapeOp(rewriter, loc, joined, shape));
++    return success();
++  });
+ }
+ 
+ //===----------------------------------------------------------------------===//
