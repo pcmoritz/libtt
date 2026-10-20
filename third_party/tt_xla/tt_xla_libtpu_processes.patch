@@ -1,0 +1,25 @@
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -485,6 +485,12 @@
+   }
+   if (m_process_count < 1 || m_process_index >= m_process_count)
+     throw std::invalid_argument("Invalid distributed process configuration");
++  // torch_tpu passes no coordinator callbacks; it sets libtpu's environment.
++  std::optional<libtt::LibtpuProcesses> libtpu;
++  if (!isMultiProcess() && (libtpu = libtt::ConfigureLibtpuProcesses())) {
++    m_process_index = libtpu->index;
++    m_process_count = libtpu->count;
++  }
+   if (isMultiProcess()) {
+     if (const char *mpi = std::getenv("TT_RUNTIME_ENABLE_DISTRIBUTED");
+         mpi && std::string_view(mpi) != "0")
+@@ -493,7 +499,7 @@
+     if (std::getenv("TT_COMPILE_ONLY_SYSTEM_DESC"))
+       throw std::invalid_argument(
+           "Multi-process compile-only mode is not supported");
+-    m_key_value_store = createKeyValueStore(*args);
++    m_key_value_store = libtpu ? libtpu->store : createKeyValueStore(*args);
+     tt::tt_metal::distributed::multihost::DistributedContext::set_current_world(
+         libtt::MakeKeyValueContext(*m_key_value_store, m_process_index,
+                                    m_process_count));

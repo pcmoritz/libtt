@@ -1,0 +1,83 @@
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -157,6 +157,71 @@
+       });
+ }
+ 
++// torch_tpu compiles each program for all devices and writes out its
++// collectives, without sharding annotations: every device runs the whole
++// program on its own values, as in the body of a shard_map. Wraps such a
++// program in a manual computation over a mesh of all devices, so that its
++// collectives lower as JAX's do. The replicated boundary keeps each device's
++// buffers and the program's signature as they are.
++static void wrapUnshardedCollectives(mlir::ModuleOp module,
++                                     size_t num_devices) {
++  auto main = module.lookupSymbol<mlir::func::FuncOp>("main");
++  if (!main || num_devices < 2 || !module.getOps<mlir::sdy::MeshOp>().empty())
++    return;
++  for (unsigned i = 0; i < main.getNumArguments(); ++i)
++    if (main.getArgAttr(i, "mhlo.sharding") ||
++        main.getArgAttr(i, mlir::sdy::kShardingAttr))
++      return;
++  bool has_collective = false;
++  main.walk([&](mlir::Operation *op) {
++    has_collective |=
++        mlir::isa<mlir::stablehlo::AllReduceOp, mlir::stablehlo::AllGatherOp,
++                  mlir::stablehlo::ReduceScatterOp,
++                  mlir::stablehlo::AllToAllOp,
++                  mlir::stablehlo::CollectivePermuteOp,
++                  mlir::stablehlo::CollectiveBroadcastOp>(op);
++  });
++  if (!has_collective)
++    return;
++
++  mlir::MLIRContext *context = module.getContext();
++  context->getOrLoadDialect<mlir::sdy::SdyDialect>();
++  mlir::OpBuilder builder(context);
++  builder.setInsertionPointToStart(module.getBody());
++  builder.create<mlir::sdy::MeshOp>(
++      module.getLoc(), "mesh",
++      mlir::sdy::MeshAttr::get(
++          context, mlir::sdy::MeshAxisAttr::get(context, "x", num_devices)));
++  auto replicated = [&](mlir::TypeRange types) {
++    llvm::SmallVector<mlir::sdy::TensorShardingAttr> shardings;
++    for (mlir::Type type : types)
++      shardings.push_back(mlir::sdy::TensorShardingAttr::getFullyClosed(
++          context, mlir::cast<mlir::RankedTensorType>(type).getRank(), "mesh"));
++    return shardings;
++  };
++
++  mlir::Block &entry = main.getBody().front();
++  auto ret = mlir::cast<mlir::func::ReturnOp>(entry.getTerminator());
++  builder.setInsertionPointToStart(&entry);
++  auto manual = builder.create<mlir::sdy::ManualComputationOp>(
++      main.getLoc(), main.getResultTypes(), main.getArguments(),
++      replicated(main.getArgumentTypes()), replicated(main.getResultTypes()),
++      llvm::ArrayRef<mlir::StringAttr>{builder.getStringAttr("x")});
++  llvm::SmallVector<mlir::Location> locs(main.getNumArguments(), main.getLoc());
++  mlir::Block *body = builder.createBlock(&manual.getBody(), {},
++                                          main.getArgumentTypes(), locs);
++  body->getOperations().splice(body->end(), entry.getOperations(),
++                               std::next(manual->getIterator()),
++                               ret->getIterator());
++  builder.setInsertionPointToEnd(body);
++  builder.create<mlir::sdy::ReturnOp>(ret.getLoc(), ret.getOperands());
++  ret->setOperands(manual.getResults());
++  for (auto [outer, inner] : llvm::zip(main.getArguments(), body->getArguments()))
++    outer.replaceUsesWithIf(inner, [&](mlir::OpOperand &use) {
++      return manual->isProperAncestor(use.getOwner());
++    });
++}
++
+ // Maps per-axis fabric config to TTNN mesh topology for CCL operations.
+ static std::vector<mlir::tt::ttcore::Topology>
+ fabricConfigToMeshTopology(const tt::runtime::MeshFabricConfig &fabricConfig) {
+@@ -432,6 +497,7 @@
+   if (!tt_pjrt_status_is_ok(status)) {
+     return {status, nullptr};
+   }
++  wrapUnshardedCollectives(*mlir_module, target_num_devices);
+ 
+   // Stable identity of the graph (hash of the SHLO module text), used by the
+   // codegen emit/load helpers to key the saved graph directory.

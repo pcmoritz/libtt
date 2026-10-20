@@ -1,0 +1,220 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/utils.h b/runtime/include/tt/runtime/detail/ttnn/utils.h
+--- a/runtime/include/tt/runtime/detail/ttnn/utils.h
++++ b/runtime/include/tt/runtime/detail/ttnn/utils.h
+@@ -11,6 +11,8 @@
+ #include "ttmlir/Target/TTNN/Target.h"
+ #include "ttnn/events.hpp"
+ 
++#include <functional>
++
+ namespace tt::runtime::ttnn::utils {
+ 
+ bool isOnHost(const ::ttnn::StorageType &storageType);
+@@ -234,6 +236,15 @@ inline std::vector<T> getReplicatedValues(const ::ttnn::Tensor &tensor) {
+   return std::move(*values);
+ }
+ 
++// Collectives between processes write to their peers at the addresses of
++// their own buffers, which the processes' allocators need not keep equal.
++// With a symmetric DRAM region (reserved when the mesh opened), runs
++// `collective` with its buffers there and copies its result out before the
++// next collective reuses the region.
++::ttnn::Tensor
++runSymmetricCollective(::ttnn::MeshDevice &device,
++                       const std::function<::ttnn::Tensor()> &collective);
++
+ template <typename T>
+ inline T getScalarFromTensor(const ::ttnn::Tensor &tensor) {
+   std::vector<T> data = getReplicatedValues<T>(tensor);
+diff --git a/runtime/lib/ttnn/operations/ccl/all_gather.cpp b/runtime/lib/ttnn/operations/ccl/all_gather.cpp
+--- a/runtime/lib/ttnn/operations/ccl/all_gather.cpp
++++ b/runtime/lib/ttnn/operations/ccl/all_gather.cpp
+@@ -35,10 +35,13 @@ void run(const ::tt::target::ttnn::AllGatherOp *op, ProgramContext &context) {
+         ::tt::runtime::common::toMetalTopology(op->topology().value()));
+   }
+ 
+-  ::ttnn::Tensor out =
+-      ::ttnn::all_gather(input, allGatherDim, clusterAxis, outputMemoryConfig,
+-                         persistentOutputTensor, subDeviceId,
+-                         /*sub_core_grid=*/std::nullopt, numLinks, topology);
++  ::ttnn::Tensor out = ::tt::runtime::ttnn::utils::runSymmetricCollective(
++      *input.device(), [&] {
++    return ::ttnn::all_gather(input, allGatherDim, clusterAxis,
++                              outputMemoryConfig, persistentOutputTensor,
++                              subDeviceId, /*sub_core_grid=*/std::nullopt,
++                              numLinks, topology);
++  });
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+diff --git a/runtime/lib/ttnn/operations/ccl/all_reduce.cpp b/runtime/lib/ttnn/operations/ccl/all_reduce.cpp
+--- a/runtime/lib/ttnn/operations/ccl/all_reduce.cpp
++++ b/runtime/lib/ttnn/operations/ccl/all_reduce.cpp
+@@ -33,9 +33,12 @@ void run(const ::tt::target::ttnn::AllReduceOp *op, ProgramContext &context) {
+         ::tt::runtime::common::toMetalTopology(op->topology().value()));
+   }
+ 
+-  ::ttnn::Tensor out = ::ttnn::all_reduce(
+-      input, clusterAxis, subDeviceId, outputMemoryConfig, numLinks, topology,
+-      ::tt::runtime::ttnn::utils::getReduceType(op->reduce_type()));
++  ::ttnn::Tensor out = ::tt::runtime::ttnn::utils::runSymmetricCollective(
++      *input.device(), [&] {
++    return ::ttnn::all_reduce(
++        input, clusterAxis, subDeviceId, outputMemoryConfig, numLinks, topology,
++        ::tt::runtime::ttnn::utils::getReduceType(op->reduce_type()));
++  });
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+ } // namespace tt::runtime::ttnn::operations::ccl
+diff --git a/runtime/lib/ttnn/operations/ccl/all_reduce_async.cpp b/runtime/lib/ttnn/operations/ccl/all_reduce_async.cpp
+--- a/runtime/lib/ttnn/operations/ccl/all_reduce_async.cpp
++++ b/runtime/lib/ttnn/operations/ccl/all_reduce_async.cpp
+@@ -38,9 +38,13 @@ void run(const ::tt::target::ttnn::AllReduceAsyncOp *op,
+   auto reduceType =
+       ::tt::runtime::ttnn::utils::getReduceType(op->reduce_type());
+ 
+-  ::ttnn::Tensor out = ::ttnn::experimental::all_reduce_async(
+-      input, clusterAxis, reduceType, subDeviceId, outputMemoryConfig, numLinks,
+-      topology);
++  ::ttnn::Tensor out = ::tt::runtime::ttnn::utils::runSymmetricCollective(
++      *input.device(), [&] {
++    return ::ttnn::experimental::all_reduce_async(input, clusterAxis,
++                                                  reduceType, subDeviceId,
++                                                  outputMemoryConfig, numLinks,
++                                                  topology);
++  });
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+ } // namespace tt::runtime::ttnn::operations::ccl
+diff --git a/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp b/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp
+--- a/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp
++++ b/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp
+@@ -57,14 +57,17 @@ void run(const ::tt::target::ttnn::ReduceScatterOp *op,
+         utils::createDeviceComputeKernelConfig(op->compute_config());
+   }
+ 
+-  ::ttnn::Tensor out = ::ttnn::reduce_scatter(
+-      input, scatterDimension, clusterAxis, subDeviceId, outputMemoryConfig,
+-      /*intermediate_memory_config=*/std::nullopt, optionalOutputTensor,
+-      numLinks, topology,
+-      /*chunks_per_sync=*/std::nullopt,
+-      /*num_workers_per_link=*/std::nullopt,
+-      /*num_buffers_per_channel=*/std::nullopt,
+-      /*compute_kernel_config=*/computeConfig);
++  ::ttnn::Tensor out = ::tt::runtime::ttnn::utils::runSymmetricCollective(
++      *input.device(), [&] {
++    return ::ttnn::reduce_scatter(
++        input, scatterDimension, clusterAxis, subDeviceId, outputMemoryConfig,
++        /*intermediate_memory_config=*/std::nullopt, optionalOutputTensor,
++        numLinks, topology,
++        /*chunks_per_sync=*/std::nullopt,
++        /*num_workers_per_link=*/std::nullopt,
++        /*num_buffers_per_channel=*/std::nullopt,
++        /*compute_kernel_config=*/computeConfig);
++  });
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -30,7 +30,10 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <map>
+ #include <memory>
++#include <tt-metalium/distributed_context.hpp>
++#include <tt-metalium/mesh_buffer.hpp>
+ #include <sys/mman.h>
+ #include <thread>
+ 
+@@ -867,6 +870,33 @@ size_t getNumAvailableDevices() {
+   return ::tt::tt_metal::GetNumAvailableDevices();
+ }
+ 
++// Collectives between processes need their buffers at equal addresses on
++// every chip (see utils::runSymmetricCollective). Reserve a DRAM region for
++// them while the allocators of all processes are still identical. Leaked so
++// that it outlives static destruction.
++static auto &symmetricDram = *new std::map<
++    const ::ttnn::MeshDevice *,
++    std::shared_ptr<::tt::tt_metal::distributed::MeshBuffer>>();
++
++static void reserveSymmetricDram(::ttnn::MeshDevice &meshDevice) {
++  using namespace ::tt::tt_metal::distributed;
++  if (*multihost::DistributedContext::get_current_world()->size() <= 1) {
++    return;
++  }
++  const char *megabytes = std::getenv("LIBTT_SYMMETRIC_DRAM_MB");
++  const uint64_t size = (megabytes ? std::stoull(megabytes) : 2048) << 20;
++  constexpr uint64_t pageSize = 1 << 20;
++  auto buffer = MeshBuffer::create(
++      ReplicatedBufferConfig{.size = size},
++      DeviceLocalBufferConfig{.page_size = pageSize,
++                              .buffer_type = ::ttnn::BufferType::DRAM,
++                              .bottom_up = false},
++      &meshDevice);
++  meshDevice.allocator()->set_symmetric_dram(
++      buffer->address(), buffer->get_reference_buffer()->aligned_size_per_bank());
++  symmetricDram[&meshDevice] = std::move(buffer);
++}
++
+ Device openMeshDevice(const MeshDeviceOptions &options) {
+   std::optional<::ttnn::MeshShape> meshShape = std::nullopt;
+   if (options.meshShape.has_value()) {
+@@ -896,6 +926,7 @@ Device openMeshDevice(const MeshDeviceOptions &options) {
+   } else {
+     meshDevice->disable_and_clear_program_cache();
+   }
++  reserveSymmetricDram(*meshDevice);
+ 
+   LOG_DEBUG("Device grid size = { ",
+             meshDevice->compute_with_storage_grid_size().x, ", ",
+@@ -936,6 +967,10 @@ void closeMeshDevice(Device parentMesh) {
+ #if defined(TT_RUNTIME_ENABLE_PERF_TRACE) && TT_RUNTIME_ENABLE_PERF_TRACE == 1
+   ::tt::tt_metal::ReadMeshDeviceProfilerResults(ttnnMeshDevice);
+ #endif
++  if (symmetricDram.count(&ttnnMeshDevice)) {
++    ttnnMeshDevice.allocator()->set_symmetric_dram(0, 0);
++    symmetricDram.erase(&ttnnMeshDevice);
++  }
+   ttnnMeshDevice.close();
+ }
+ 
+diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
+--- a/runtime/lib/ttnn/utils/utils.cpp
++++ b/runtime/lib/ttnn/utils/utils.cpp
+@@ -9,6 +9,8 @@
+ #include "tt/runtime/types.h"
+ #include "tt/runtime/utils.h"
+ 
++#include "ttnn/operations/data_movement/clone/clone.hpp"
++
+ #include <memory>
+ #include <vector>
+ 
+@@ -662,4 +664,23 @@ getMemoryView(Device deviceHandle) {
+   return memoryMap;
+ }
+ 
++::ttnn::Tensor
++runSymmetricCollective(::ttnn::MeshDevice &device,
++                       const std::function<::ttnn::Tensor()> &collective) {
++  const auto &allocator = device.allocator();
++  if (!allocator->has_symmetric_dram()) {
++    return collective();
++  }
++  ::ttnn::Tensor result;
++  allocator->begin_symmetric_dram();
++  try {
++    result = collective();
++  } catch (...) {
++    allocator->end_symmetric_dram();
++    throw;
++  }
++  allocator->end_symmetric_dram();
++  return ::ttnn::clone(result, std::nullopt, std::nullopt, std::nullopt);
++}
++
+ } // namespace tt::runtime::ttnn::utils
