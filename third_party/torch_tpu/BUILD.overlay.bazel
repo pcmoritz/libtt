@@ -1,0 +1,17 @@
+package(default_visibility = ["//visibility:public"])
+
+# The tests import `tests`, `src` and `examples` from the repository root, and
+# the API tests read the public API listing.
+filegroup(
+    name = "torch_tpu_tests",
+    srcs = glob([
+        "examples/**",
+        "src/**",
+        "tests/**",
+    ]) + ["docs/markdown/public_apis.md"],
+)
+
+filegroup(
+    name = "torch_tpu_tests_anchor",
+    srcs = ["pyproject.toml"],
+)

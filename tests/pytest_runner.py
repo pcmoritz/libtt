@@ -20,6 +20,15 @@ def _rlocation(path: str) -> Path:
     return Path(resolved)
 
 
+def extract_plugin_wheel(plugin_wheel: Path) -> Path:
+    # A wheel is a zip archive, but libtt.so must be a real file for dlopen.
+    # Extracting it also exercises the exact artifact users install.
+    plugin_root = Path(os.environ.get("TEST_TMPDIR", "/tmp")) / "jax_tt_plugin"
+    with zipfile.ZipFile(plugin_wheel) as wheel:
+        wheel.extractall(plugin_root)
+    return plugin_root
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -34,11 +43,7 @@ def main() -> int:
     plugin_wheel = _rlocation(args.jax_plugin_wheel).resolve(strict=True)
     test_root = _rlocation(args.tests_anchor).resolve(strict=True).parent
 
-    # A wheel is a zip archive, but libtt.so must be a real file for dlopen.
-    # Extracting it also exercises the exact artifact users install.
-    plugin_root = Path(os.environ.get("TEST_TMPDIR", "/tmp")) / "jax_tt_plugin"
-    with zipfile.ZipFile(plugin_wheel) as wheel:
-        wheel.extractall(plugin_root)
+    plugin_root = extract_plugin_wheel(plugin_wheel)
     sys.path.insert(0, str(plugin_root))
 
     os.environ.pop("TT_METAL_RUNTIME_ROOT", None)
