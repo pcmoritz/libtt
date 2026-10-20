@@ -76,7 +76,7 @@ torchrun --nproc_per_node=4 -m torchtitan.experiments.tpu.train \
   --hf_assets_path=<Qwen3 tokenizer directory> --dataloader.dataset=c4
 ```
 
-It trains at 2.66 s per step, 770 tokens/s per chip, after a first step that
+It trains at 2.55 s per step, 804 tokens/s per chip, after a first step that
 compiles each process's programs. Splash attention is a Pallas kernel, so
 attention runs through `scaled_dot_product_attention`.
 
