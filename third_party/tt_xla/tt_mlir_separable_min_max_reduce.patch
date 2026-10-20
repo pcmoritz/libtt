@@ -1,0 +1,40 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -527,10 +527,12 @@
+     for (size_t i = 0; i < numInputs; ++i) {
+       mlir::Operation *combiner = returnOp.getOperand(i).getDefiningOp();
+       if (!combiner || combiner->getBlock() != &body ||
+-          !mlir::isa<mlir::stablehlo::AddOp, mlir::stablehlo::MulOp>(
++          !mlir::isa<mlir::stablehlo::AddOp, mlir::stablehlo::MulOp,
++                     mlir::stablehlo::MaxOp, mlir::stablehlo::MinOp>(
+               combiner)) {
+         return rewriter.notifyMatchFailure(
+-            srcOp, "separable reduce requires direct add or multiply lanes");
++            srcOp, "separable reduce requires direct add, multiply, maximum "
++                   "or minimum lanes");
+       }
+ 
+       mlir::Value lhs = combiner->getOperand(0);
+@@ -558,11 +560,20 @@
+             createReductionWithInit<ttir::SumOp, ttir::AddOp>(
+                 srcOp.getLoc(), outputType, adaptor.getInputs()[i], init,
+                 dimensions, rewriter));
+-      } else {
++      } else if (mlir::isa<mlir::stablehlo::MulOp>(combiner)) {
+         results.push_back(
+             createReductionWithInit<ttir::ProdOp, ttir::MultiplyOp>(
+                 srcOp.getLoc(), outputType, adaptor.getInputs()[i], init,
+                 dimensions, rewriter));
++      } else if (mlir::isa<mlir::stablehlo::MaxOp>(combiner)) {
++        // E.g. torch_tpu's fused aminmax, a (minimum, maximum) reduce.
++        results.push_back(createReductionWithInit<ttir::MaxOp, ttir::MaximumOp>(
++            srcOp.getLoc(), outputType, adaptor.getInputs()[i], init,
++            dimensions, rewriter));
++      } else {
++        results.push_back(createReductionWithInit<ttir::MinOp, ttir::MinimumOp>(
++            srcOp.getLoc(), outputType, adaptor.getInputs()[i], init,
++            dimensions, rewriter));
+       }
+     }
+ 
