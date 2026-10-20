@@ -60,7 +60,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  
      return false;
    }
-@@ -794,7 +814,36 @@
+@@ -794,7 +814,82 @@
      }
  
      return verifyJaxOpArgExtremePattern(
@@ -70,31 +70,77 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +               blocks.front(), mlir::stablehlo::ComparisonDirection::LE);
 +  }
 +
-+  // Pattern match torch_tpu's ArgMax (GE) and ArgMin (LE) ops. Its body starts
-+  // with the comparison, propagates NaNs and breaks ties towards the smaller
-+  // index, and returns the maximum (minimum) value and a selected index:
-+  //  stablehlo.compare (GE / LE)
-+  //  ...
-+  //  stablehlo.return %max_or_min, %select
++  // Pattern match torch_tpu's ArgMax (GE) and ArgMin (LE) reducer. It keeps
++  // the maximum (minimum) value and breaks ties towards the smaller index, as
++  // ttir.argmax (argmin) does:
++  //  ^bb0(%v0, %i0, %v1, %i1):
++  //    %better = stablehlo.compare GE (LE), %v0, %v1
++  //    %value = stablehlo.maximum (minimum) %v0, %v1
++  //    %tie = stablehlo.compare EQ, %v0, %v1
++  //    %pick = stablehlo.select %better, %i0, %i1
++  //    %smaller = stablehlo.minimum %i0, %i1
++  //    %index = stablehlo.select %tie, %smaller, %pick
++  //    stablehlo.return %value, %index
++  // Float reducers also prefer NaNs: %better is or'ed with
++  // (%v0 != %v0) & (%v1 == %v1) and %tie with (%v0 != %v0) & (%v1 != %v1).
 +  bool verifyTorchTpuArgExtremePattern(
 +      mlir::Block &block,
 +      mlir::stablehlo::ComparisonDirection expectedDirection) const {
-+    auto compareOp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(block.front());
++    using mlir::stablehlo::ComparisonDirection;
 +    auto returnOp =
 +        mlir::dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
-+    if (!compareOp ||
-+        compareOp.getComparisonDirection() != expectedDirection ||
-+        !returnOp || returnOp.getNumOperands() != 2) {
++    if (block.getNumArguments() != 4 || !returnOp ||
++        returnOp.getNumOperands() != 2) {
 +      return false;
 +    }
++    mlir::Value v0 = block.getArgument(0), i0 = block.getArgument(1);
++    mlir::Value v1 = block.getArgument(2), i1 = block.getArgument(3);
++
++    auto isCompare = [](mlir::Value value, ComparisonDirection direction,
++                        mlir::Value lhs, mlir::Value rhs) {
++      auto op = value.getDefiningOp<mlir::stablehlo::CompareOp>();
++      return op && op.getComparisonDirection() == direction &&
++             op.getLhs() == lhs && op.getRhs() == rhs;
++    };
++    // Matches %v0 `direction` %v1, optionally or'ed with the NaN term
++    // (%v0 != %v0) & (%v1 `rhsNanDirection` %v1).
++    auto isNanAwareCompare = [&](mlir::Value value,
++                                 ComparisonDirection direction,
++                                 ComparisonDirection rhsNanDirection) {
++      if (auto orOp = value.getDefiningOp<mlir::stablehlo::OrOp>()) {
++        auto andOp = orOp.getRhs().getDefiningOp<mlir::stablehlo::AndOp>();
++        if (!andOp ||
++            !isCompare(andOp.getLhs(), ComparisonDirection::NE, v0, v0) ||
++            !isCompare(andOp.getRhs(), rhsNanDirection, v1, v1)) {
++          return false;
++        }
++        value = orOp.getLhs();
++      }
++      return isCompare(value, direction, v0, v1);
++    };
++
 +    mlir::Operation *value = returnOp.getOperand(0).getDefiningOp();
-+    bool isMax = expectedDirection == mlir::stablehlo::ComparisonDirection::GE;
++    bool isMax = expectedDirection == ComparisonDirection::GE;
 +    if (isMax ? !isa_and_nonnull<mlir::stablehlo::MaxOp>(value)
 +              : !isa_and_nonnull<mlir::stablehlo::MinOp>(value)) {
 +      return false;
 +    }
-+    return isa_and_nonnull<mlir::stablehlo::SelectOp>(
-+        returnOp.getOperand(1).getDefiningOp());
++    if (value->getOperand(0) != v0 || value->getOperand(1) != v1) {
++      return false;
++    }
++
++    auto index =
++        returnOp.getOperand(1).getDefiningOp<mlir::stablehlo::SelectOp>();
++    if (!index || !isNanAwareCompare(index.getPred(), ComparisonDirection::EQ,
++                                     ComparisonDirection::NE)) {
++      return false;
++    }
++    auto smaller = index.getOnTrue().getDefiningOp<mlir::stablehlo::MinOp>();
++    auto pick = index.getOnFalse().getDefiningOp<mlir::stablehlo::SelectOp>();
++    return smaller && smaller.getLhs() == i0 && smaller.getRhs() == i1 &&
++           pick && pick.getOnTrue() == i0 && pick.getOnFalse() == i1 &&
++           isNanAwareCompare(pick.getPred(), expectedDirection,
++                             ComparisonDirection::EQ);
    }
  
    // Pattern match the ops for tt-torch ArgMax op.
