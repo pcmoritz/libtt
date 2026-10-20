@@ -1,0 +1,136 @@
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -1155,6 +1155,53 @@
+                             target1DType.getEncoding()),
+       input4D, rewriter.getI32ArrayAttr(shape1D));
+ }
++
++// float32 batch norm runs as reductions and elementwise ops: ttnn's
++// batch_norm is off by about 1e-3 relative, while ttnn's float32 sums,
++// divisions and rsqrt are accurate to about 1e-7.
++static bool decomposesBatchNorm(RankedTensorType operandType) {
++  return operandType.getElementType().isF32();
++}
++
++// The mean of an NCHW tensor over all but the channel dimension, as
++// [1, C, 1, 1].
++static mlir::Value channelMean(ConversionPatternRewriter &rewriter,
++                               Location loc, mlir::Value input) {
++  auto type = mlir::cast<RankedTensorType>(input.getType());
++  llvm::ArrayRef<int64_t> shape = type.getShape();
++  auto statType = RankedTensorType::get({1, shape[1], 1, 1},
++                                        type.getElementType(),
++                                        type.getEncoding());
++  mlir::Value sum = rewriter.create<ttir::SumOp>(
++      loc, statType, input, /*keepDim=*/true,
++      rewriter.getI32ArrayAttr({0, 2, 3}));
++  mlir::Value count = rewriter.create<ttir::FullOp>(
++      loc, statType,
++      rewriter.getF32FloatAttr(static_cast<float>(shape[0] * shape[2] *
++                                                  shape[3])));
++  return rewriter.create<ttir::DivOp>(loc, statType, sum, count);
++}
++
++// (x - mean) * rsqrt(variance + epsilon) * scale + offset, given x - mean
++// and [1, C, 1, 1] statistics and parameters.
++static mlir::Value normalizeBatch(ConversionPatternRewriter &rewriter,
++                                  Location loc, mlir::Value centered,
++                                  mlir::Value variance, mlir::Value scale,
++                                  mlir::Value offset, FloatAttr epsilon) {
++  auto type = mlir::cast<RankedTensorType>(centered.getType());
++  auto statType = mlir::cast<RankedTensorType>(variance.getType());
++  mlir::Value eps = rewriter.create<ttir::FullOp>(
++      loc, statType,
++      rewriter.getF32FloatAttr(
++          static_cast<float>(epsilon.getValueAsDouble())));
++  mlir::Value invStd = rewriter.create<ttir::RsqrtOp>(
++      loc, statType,
++      rewriter.create<ttir::AddOp>(loc, statType, variance, eps));
++  mlir::Value result =
++      rewriter.create<ttir::MultiplyOp>(loc, type, centered, invStd);
++  result = rewriter.create<ttir::MultiplyOp>(loc, type, result, scale);
++  return rewriter.create<ttir::AddOp>(loc, type, result, offset);
++}
+ } // namespace
+ 
+ //===----------------------------------------------------------------------===//
+@@ -1635,6 +1682,18 @@
+     mlir::Value offset4D =
+         getBatchNorm4DTensor(rewriter, loc, adaptor.getOffset());
+ 
++    if (decomposesBatchNorm(inputType)) {
++      mlir::Value centered = rewriter.create<ttir::SubtractOp>(
++          loc, normalizedInput.getType(), normalizedInput, mean4D);
++      mlir::Value output =
++          normalizeBatch(rewriter, loc, centered, variance4D, scale4D,
++                         offset4D, adaptor.getEpsilonAttr());
++      rewriter.replaceOp(op, denormalizeFromNCHW(output, originalShape,
++                                                 normalizedShape, featureIndex,
++                                                 rewriter, loc));
++      return success();
++    }
++
+     // Create output type with normalized shape
+     auto originalOutputType = mlir::cast<RankedTensorType>(
+         getTypeConverter()->convertType(op.getResult().getType()));
+@@ -1723,6 +1782,34 @@
+     mlir::Value variance4D =
+         getBatchNorm4DTensor(rewriter, loc, adaptor.getRunningVariance());
+ 
++    if (decomposesBatchNorm(inputType)) {
++      // The results are the normalized batch and its (biased) statistics;
++      // the running statistics don't affect them.
++      mlir::Value mean = channelMean(rewriter, loc, normalizedInput);
++      mlir::Value centered = rewriter.create<ttir::SubtractOp>(
++          loc, normalizedInput.getType(), normalizedInput, mean);
++      mlir::Value variance = channelMean(
++          rewriter, loc,
++          rewriter.create<ttir::MultiplyOp>(loc, centered.getType(), centered,
++                                            centered));
++      mlir::Value output =
++          normalizeBatch(rewriter, loc, centered, variance, scale4D, offset4D,
++                         adaptor.getEpsilonAttr());
++      rewriter.replaceOp(
++          op, ValueRange{denormalizeFromNCHW(output, originalShape,
++                                             normalizedShape, featureIndex,
++                                             rewriter, loc),
++                         reshapeBatchNorm4DTo1D(
++                             rewriter, loc, mean,
++                             mlir::cast<RankedTensorType>(
++                                 op.getBatchMean().getType())),
++                         reshapeBatchNorm4DTo1D(
++                             rewriter, loc, variance,
++                             mlir::cast<RankedTensorType>(
++                                 op.getBatchVariance().getType()))});
++      return success();
++    }
++
+     // Create output types with normalized shape and 4D weight tensors
+     auto originalOutputType = mlir::cast<RankedTensorType>(
+         getTypeConverter()->convertType(op.getResult().getType()));
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
+@@ -112,8 +112,10 @@
+           auto offsetType = op.getOffset().getType();
+           auto meanType = op.getMean().getType();
+           auto varType = op.getVariance().getType();
++          // float32 batch norm decomposes into reductions and elementwise ops.
+           return (scaleType.getRank() == 4 && offsetType.getRank() == 4 &&
+-                  meanType.getRank() == 4 && varType.getRank() == 4);
++                  meanType.getRank() == 4 && varType.getRank() == 4) &&
++                 !op.getOperand().getType().getElementType().isF32();
+         });
+ 
+     target.addDynamicallyLegalOp<ttir::BatchNormTrainingOp>(
+@@ -123,7 +125,8 @@
+           auto meanType = op.getRunningMean().getType();
+           auto varType = op.getRunningVariance().getType();
+           return (scaleType.getRank() == 4 && offsetType.getRank() == 4 &&
+-                  meanType.getRank() == 4 && varType.getRank() == 4);
++                  meanType.getRank() == 4 && varType.getRank() == 4) &&
++                 !op.getOperand().getType().getElementType().isF32();
+         });
+ 
+     // ttml::metal::adamw only accepts 4D tensors.

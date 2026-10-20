@@ -637,6 +637,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_sort_non_strict_comparator.patch",
         "//third_party/tt_xla:tt_mlir_separable_min_max_reduce.patch",
         "//third_party/tt_xla:tt_mlir_fused_round_decimals.patch",
+        "//third_party/tt_xla:tt_mlir_float32_batch_norm.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
