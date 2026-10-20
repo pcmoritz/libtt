@@ -456,6 +456,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_copy_until_transfer_completes.patch",
         "//third_party/tt_xla:tt_xla_host_memory_allocator.patch",
         "//third_party/tt_xla:tt_xla_compile_exceptions.patch",
+        "//third_party/tt_xla:tt_xla_jax_distributed.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -612,6 +613,8 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_sort_int64_keys.patch",
         "//third_party/tt_xla:tt_mlir_arg_reduce_values.patch",
         "//third_party/tt_xla:tt_mlir_sigmoid_integer_input.patch",
+        "//third_party/tt_xla:tt_mlir_jax_distributed.patch",
+        "//third_party/tt_xla:tt_mlir_row_major_all_gather.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

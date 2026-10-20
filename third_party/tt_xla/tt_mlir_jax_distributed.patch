@@ -1,0 +1,54 @@
+diff --git a/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h b/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
+--- a/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
++++ b/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
+@@ -31,6 +31,7 @@ inline const llvm::SmallVector<llvm::SmallVector<int64_t, 2>> SupportedMeshes =
+       {1, 16},
+       {1, 32},
+       {1, 64},
++      {2, 1},
+       {2, 2},
+       {2, 4},
+       {2, 8},
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
+@@ -51,12 +51,15 @@ public:
+     // Disable tt-metal backtrace generation.
+     setenv("TT_METAL_DISABLE_BACKTRACE", "1", 1);
+ 
++    // Refresh the descriptor before attaching an external device: a prior
++    // compilation's MLIR context may already have been destroyed.
++    op_model::SingletonDeviceContext::setSystemDesc(
++        ttcore::getCurrentScopeSystemDesc(getOperation()));
++
+     // Open device if not externally provided.
+     if (externalDevice) {
+       op_model::SingletonDeviceContext::setExternalDevice(externalDevice);
+     } else {
+-      op_model::SingletonDeviceContext::setSystemDesc(
+-          ttcore::getCurrentScopeSystemDesc(getOperation()));
+       op_model::SingletonDeviceContext::getInstance().openMockDevice();
+     }
+ 
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -1173,9 +1173,15 @@ std::vector<::tt::runtime::Tensor> toHost(::tt::runtime::Tensor tensor,
+       ::tt::runtime::ttnn::toHostSingleTensor(tensorWrapper, untilize,
+                                               blocking);
+ 
+-  std::vector<::ttnn::Tensor> singleTensors =
+-      ::ttnn::distributed::get_device_tensors(
+-          utils::getTTNNTensorFromRuntimeTensor(multiDeviceHostTensor));
++  // PJRT copies only addressable shards. get_device_tensors() performs a
++  // host all-gather, which would also return shards owned by other processes.
++  const ::ttnn::Tensor &hostTensor =
++      utils::getTTNNTensorFromRuntimeTensor(multiDeviceHostTensor);
++  std::vector<::ttnn::Tensor> singleTensors;
++  hostTensor.host_storage().buffer().apply(
++      [&](const ::tt::tt_metal::HostBuffer &buffer) {
++        singleTensors.emplace_back(buffer, hostTensor.tensor_spec());
++      });
+ 
+   const std::optional<::ttnn::MeshEvent> &meshEvent =
+       tensorWrapper.getMeshEvent();
