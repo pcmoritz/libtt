@@ -101,7 +101,22 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
  
    wa::TTNNOperandWorkarounds rowMajorLayoutUint32Workaround;
    rowMajorLayoutUint32Workaround.tensorLayoutWorkaround = Layout::RowMajor;
-@@ -1025,10 +1051,19 @@
+@@ -1016,6 +1042,14 @@
+   if (isFrontPadding && layoutAttr.isTiled()) {
+     operandWorkaround.tensorLayoutWorkaround = Layout::RowMajor;
+   }
++  // ttnn pad takes no uint8 ("Cannot pad RM tensor with specified format"),
++  // so uint8 is padded as int32.
++  if (mlir::tt::ttcore::elementTypeToDataType(
++          input.getType().getElementType()) ==
++      mlir::tt::ttcore::DataType::UInt8) {
++    operandWorkaround.tensorDataTypeWorkaround =
++        mlir::tt::ttcore::DataType::Int32;
++  }
+   return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+       .addInputOperandWorkaround(operandWorkaround)
+       .addOutputOperandWorkaround(operandWorkaround);
+@@ -1025,10 +1059,19 @@
  // typecast to float32, which rounds values beyond 2^24. tt-metal fixed this
  // (https://github.com/tenstorrent/tt-metal/issues/19950), so 32-bit integers
  // are now permuted directly.

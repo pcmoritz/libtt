@@ -1,7 +1,8 @@
-"""tt-mlir computes uint8 argmax, tensor clamp and permute as int32: ttnn argmax
-and the tensor clamp don't take uint8, and row-major uint8 transposes (at O1,
-e.g. before an argmax over axis 0) came out as zeros. torch_tpu's argmax,
-argmin, max/min with dim, clamp and hardtanh take these paths."""
+"""tt-mlir computes uint8 argmax, tensor clamp, permute and pad as int32: ttnn
+argmax, the tensor clamp and pad don't take uint8, and row-major uint8
+transposes (at O1, e.g. before an argmax over axis 0) came out as zeros.
+torch_tpu's argmax, argmin, max/min with dim, clamp, hardtanh and padded uint8
+pooling take these paths."""
 
 import jax
 import jax.numpy as jnp
@@ -45,3 +46,14 @@ def test_clamp_tensor_bounds_uint8(level):
     got = run(lambda low, x, high: jax.lax.clamp(low, x, high), level, low, X, high)
     assert got.dtype == np.uint8
     np.testing.assert_array_equal(got, np.minimum(np.maximum(X, low), high))
+
+
+@OPTIMIZATION_LEVELS
+@pytest.mark.parametrize(
+    "padding", [((1, 0), (2, 3)), ((0, 2), (0, 1))], ids=["front", "back_only"]
+)
+def test_pad_uint8(level, padding):
+    # ttnn pad takes no uint8 ("Cannot pad RM tensor with specified format").
+    got = run(lambda x: jnp.pad(x, padding, constant_values=np.uint8(7)), level, X)
+    assert got.dtype == np.uint8
+    np.testing.assert_array_equal(got, np.pad(X, padding, constant_values=7))
