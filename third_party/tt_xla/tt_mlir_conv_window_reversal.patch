@@ -1,0 +1,58 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -3347,6 +3347,46 @@
+ };
+ } // namespace
+ namespace {
++// torch_tpu writes a transposed convolution with window_reversal, where JAX
++// reverses the kernel with stablehlo.reverse; the convolution conversions
++// only take the latter. This reverses the kernel's spatial dimensions
++// explicitly and converts the same convolution without window_reversal.
++class ConvolutionWindowReversalPattern
++    : public OpConversionPattern<mlir::stablehlo::ConvolutionOp> {
++public:
++  ConvolutionWindowReversalPattern(TypeConverter &typeConverter,
++                                   MLIRContext *ctx, PatternBenefit benefit = 3)
++      : OpConversionPattern<mlir::stablehlo::ConvolutionOp>(typeConverter, ctx,
++                                                            benefit) {}
++
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::ConvolutionOp srcOp,
++                  mlir::stablehlo::ConvolutionOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    std::optional<ArrayRef<bool>> reversal = srcOp.getWindowReversal();
++    if (!reversal || llvm::none_of(*reversal, [](bool r) { return r; })) {
++      return rewriter.notifyMatchFailure(srcOp, "no window reversal");
++    }
++    ArrayRef<int64_t> kernelSpatialDims =
++        srcOp.getDimensionNumbers().getKernelSpatialDimensions();
++    SmallVector<int64_t> reversedDims;
++    for (auto [i, reversed] : llvm::enumerate(*reversal)) {
++      if (reversed) {
++        reversedDims.push_back(kernelSpatialDims[i]);
++      }
++    }
++    Value kernel = rewriter.create<mlir::stablehlo::ReverseOp>(
++        srcOp.getLoc(), adaptor.getRhs(),
++        rewriter.getDenseI64ArrayAttr(reversedDims));
++    auto conv = mlir::cast<mlir::stablehlo::ConvolutionOp>(
++        rewriter.clone(*srcOp.getOperation()));
++    conv->setOperands({adaptor.getLhs(), kernel});
++    conv.removeWindowReversalAttr();
++    rewriter.replaceOp(srcOp, conv.getResult());
++    return success();
++  }
++};
++
+ class StableHLOToTTIRConvolutionOpConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::ConvolutionOp> {
+ public:
+@@ -12483,6 +12523,7 @@
+                                          TypeConverter &typeConverter) {
+   patterns.add<StableHLOToTTIRConvolutionOpConversionPattern>(typeConverter,
+                                                               ctx);
++  patterns.add<ConvolutionWindowReversalPattern>(typeConverter, ctx);
+   patterns.add<Convolution0DToDotGeneralPattern>(typeConverter, ctx);
+   patterns.add<ConvolutionInputDilationPattern>(typeConverter, ctx);
+   patterns.add<Legalize1DConvolutionPattern>(typeConverter, ctx);

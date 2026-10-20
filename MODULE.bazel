@@ -641,6 +641,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_fused_round_decimals.patch",
         "//third_party/tt_xla:tt_mlir_float_sum_pool_slices.patch",
         "//third_party/tt_xla:tt_mlir_max_pool_slices.patch",
+        "//third_party/tt_xla:tt_mlir_conv_window_reversal.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
