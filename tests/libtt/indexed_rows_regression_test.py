@@ -374,6 +374,23 @@ def test_dynamic_update_slice_unsigned_starts():
         want[min(b, 3), min(s, 15)] = update[0, 0]
         assert_equal(got, want)
 
+def test_dynamic_update_slice_wide_constant_window():
+    # FSDP writes a parameter into its flat [1, N] buffer at a constant offset.
+    # A window wider than L1 moves as rows of gcd(start, window, size) = 4096
+    # elements.
+    rng = np.random.default_rng(19)
+    flat = rng.normal(size=(1, 3 * 1024 * 1024)).astype(np.float32)
+    update = rng.normal(size=(1, 1024 * 1024)).astype(np.float32)
+
+    def write(flat, update):
+        return jax.lax.dynamic_update_slice(flat, update, (0, 1536 * 1024 + 4096))
+
+    got = run(write, flat, update)
+    want = np.array(flat)
+    want[:, 1536 * 1024 + 4096 : 2560 * 1024 + 4096] = update
+    assert_equal(got, want)
+
+
 def test_state_pool_update():
     # sglang's recurrent state pool: states.at[slots].set(new_states).
     rng = np.random.default_rng(15)

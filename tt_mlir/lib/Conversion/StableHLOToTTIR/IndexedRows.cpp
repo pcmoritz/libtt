@@ -1240,13 +1240,94 @@ public:
   }
 };
 
+//===----------------------------------------------------------------------===//
+// Concatenate: rows wider than L1 stages.
+//===----------------------------------------------------------------------===//
+
+// A concatenation along a last dimension that tiles don't divide, or of
+// vectors, runs row-major, and TT-NN stages every output row whole in L1.
+// torch.distributed's object collectives concatenate megabytes of pickled
+// bytes in one row. Concatenate rows of g elements instead, g dividing every
+// input's last dimension.
+class WideRowConcatenateConversionPattern
+    : public OpConversionPattern<mlir::stablehlo::ConcatenateOp> {
+public:
+  WideRowConcatenateConversionPattern(TypeConverter &typeConverter,
+                                      MLIRContext *ctx)
+      : OpConversionPattern(typeConverter, ctx, /*benefit=*/2) {}
+
+  LogicalResult
+  matchAndRewrite(mlir::stablehlo::ConcatenateOp srcOp,
+                  mlir::stablehlo::ConcatenateOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    constexpr int64_t kMaxRowBytes = 64 * 1024;
+    constexpr int64_t kTileWidth = 32;
+    auto resultType = mlir::dyn_cast_or_null<RankedTensorType>(
+        getTypeConverter()->convertType(srcOp.getType()));
+    if (!resultType || resultType.getRank() == 0 ||
+        !resultType.getElementType().isIntOrFloat() ||
+        static_cast<int64_t>(adaptor.getDimension()) !=
+            resultType.getRank() - 1) {
+      return failure();
+    }
+    const int64_t elementBytes =
+        std::max<int64_t>(1, resultType.getElementTypeBitWidth() / 8);
+    if (resultType.getShape().back() * elementBytes <= kMaxRowBytes) {
+      return failure();
+    }
+    int64_t g = 0;
+    bool partialTile = false;
+    for (Value input : adaptor.getInputs()) {
+      const int64_t size =
+          mlir::cast<RankedTensorType>(input.getType()).getShape().back();
+      g = std::gcd(g, size);
+      partialTile |= size % kTileWidth != 0;
+    }
+    // Tiled concatenations move tiles, not rows.
+    if (!partialTile && resultType.getRank() > 1) {
+      return failure();
+    }
+    int64_t rowElements = 1;
+    for (int64_t d = 1; d * d <= g; ++d) {
+      for (int64_t divisor : {d, g / d}) {
+        if (g % divisor == 0 && divisor * elementBytes <= kMaxRowBytes) {
+          rowElements = std::max(rowElements, divisor);
+        }
+      }
+    }
+    if (rowElements == 1) {
+      return failure();
+    }
+    Location loc = srcOp.getLoc();
+    auto rows = [&](ArrayRef<int64_t> shape) {
+      SmallVector<int64_t> split(shape);
+      split.back() /= rowElements;
+      split.push_back(rowElements);
+      return split;
+    };
+    SmallVector<Value> inputs;
+    for (Value input : adaptor.getInputs()) {
+      inputs.push_back(ttir::utils::createReshapeOp(
+          rewriter, ttmlir::utils::appendLocationSuffix(loc, "_rows"), input,
+          rows(mlir::cast<RankedTensorType>(input.getType()).getShape())));
+    }
+    Value result = rewriter.create<ttir::ConcatOp>(
+        loc, resultType.clone(rows(resultType.getShape())), inputs,
+        static_cast<int32_t>(resultType.getRank() - 1));
+    rewriter.replaceOp(srcOp, ttir::utils::createReshapeOp(
+                                  rewriter, loc, result, resultType.getShape()));
+    return success();
+  }
+};
+
 } // namespace
 
 void populateIndexedRowsToTTIRPatterns(MLIRContext *ctx,
                                        RewritePatternSet &patterns,
                                        TypeConverter &typeConverter) {
   patterns.add<GatherConversionPattern, ScatterConversionPattern,
-               DynamicUpdateSliceConversionPattern>(typeConverter, ctx);
+               DynamicUpdateSliceConversionPattern,
+               WideRowConcatenateConversionPattern>(typeConverter, ctx);
 }
 
 } // namespace mlir::tt
