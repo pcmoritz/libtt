@@ -1,8 +1,8 @@
-"""tt-mlir computes uint8 argmax, tensor clamp, permute and pad as int32: ttnn
-argmax, the tensor clamp and pad don't take uint8, and row-major uint8
-transposes (at O1, e.g. before an argmax over axis 0) came out as zeros.
-torch_tpu's argmax, argmin, max/min with dim, clamp, hardtanh and padded uint8
-pooling take these paths."""
+"""tt-mlir computes uint8 argmax, tensor clamp and pad as int32: ttnn argmax,
+the tensor clamp and pad don't take uint8. uint8 transposes run natively (at
+O1 row-major, e.g. before an argmax over axis 0; see
+uint8_permute_regression_test.py). torch_tpu's argmax, argmin, max/min with
+dim, clamp, hardtanh and padded uint8 pooling take these paths."""
 
 import jax
 import jax.numpy as jnp

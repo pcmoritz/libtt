@@ -116,36 +116,14 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
    return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
        .addInputOperandWorkaround(operandWorkaround)
        .addOutputOperandWorkaround(operandWorkaround);
-@@ -1025,10 +1059,19 @@
- // typecast to float32, which rounds values beyond 2^24. tt-metal fixed this
- // (https://github.com/tenstorrent/tt-metal/issues/19950), so 32-bit integers
- // are now permuted directly.
-+// Row-major uint8 permutes that move the last dimension come out as zeros
-+// (tt-metal's blocked row-major transpose doesn't handle 1-byte elements), so
-+// uint8 is permuted as int32 at every layout; at O1 the optimizer can still
-+// pick the layout after this pass.
- TTNNOperandsWorkarounds
- TTNNOperandsWorkaroundsFactory::createPermuteOpOperandWorkaround(
-     mlir::RankedTensorType inputType) {
-   TTNNOperandWorkarounds operandWorkaround;
-+  if (mlir::tt::ttcore::elementTypeToDataType(inputType.getElementType()) ==
-+      mlir::tt::ttcore::DataType::UInt8) {
-+    operandWorkaround.tensorDataTypeWorkaround =
-+        mlir::tt::ttcore::DataType::Int32;
-+  }
- 
-   return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
-       .addInputOperandWorkaround(operandWorkaround)
 diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
-@@ -655,6 +655,9 @@
+@@ -655,6 +655,7 @@
          // ttnn clamp TT_FATALs on uint8/uint16 inputs; its operands
          // workaround clamps them as int32.
          ttnn::ClampScalarOp::getOperationName(),
 +        ttnn::ClampTensorOp::getOperationName(),
-+        // Permute computes uint8 as int32; the optimizer keeps uint8 row-major.
-+        ttnn::PermuteOp::getOperationName(),
          // TopK's operands workaround forces input bf16 + indices ui16/ui32;
          // without it, opt_level>=1 dtype propagation picks f32. See #8141.
          ttnn::TopKOp::getOperationName(),
