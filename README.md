@@ -88,6 +88,45 @@ bazel test //tests:jax_test_suite \
 
 Baseline (October 2026, main 7f8a4d8): **2316 failed, 25458 passed, 6736 skipped.**
 
+## torch_tpu tests
+
+Run a few of [torch_tpu](docs/torch-tpu.md)'s tests against this checkout's
+plugin wheel:
+
+```bash
+bazel test //tests:torch_tpu_smoke_tests --test_output=streamed
+```
+
+Run all of torch_tpu's tests, from its v0.2.0 release with the matching wheel
+from PyPI:
+
+```bash
+bazel test //tests:torch_tpu_test_suite \
+  --test_output=streamed \
+  --nocache_test_results \
+  --test_timeout=7200
+```
+
+Each test file runs in its own pytest process, with its log and JUnit XML in
+`bazel-testlogs/tests/torch_tpu_test_suite/test.outputs/`. The op tests compare
+with CPU instead of GPU golden files, on three samples per op and dtype. Four
+tests are left out, since their dependencies (torchcomms and tsl's protos) aren't
+on PyPI. Select test files or directories with `--test_arg`; other arguments go
+to pytest:
+
+```bash
+bazel test //tests:torch_tpu_test_suite --test_arg=tests/compile --test_arg=-x
+```
+
+Bazel gives tests a fresh home directory, so tt-metal rebuilds its kernel cache
+in every run. Add `--test_env=TT_METAL_CACHE=$HOME/.cache` to reuse
+`~/.cache/tt-metal-cache` instead.
+
+Baseline (October 2026, main ffc8122, one Blackhole p150a): **101 of 192 files
+passed; 6052 passed, 2963 failed, 14 errors, 240 skipped, 12900 subtests
+passed**, in about an hour. Most failures are multi-device, TPU-only or
+dynamic-shape tests.
+
 ## libtt tests
 
 Run libtt's regression tests against this checkout's plugin wheel:

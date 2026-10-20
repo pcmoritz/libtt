@@ -1,0 +1,19 @@
+package(default_visibility = ["//visibility:public"])
+
+# The tests import `tests`, `src` and `examples` from the repository root, the
+# module registry reads model configurations from `perflab`, and the API tests
+# read the public API listing.
+filegroup(
+    name = "torch_tpu_tests",
+    srcs = glob([
+        "examples/**",
+        "perflab/**",
+        "src/**",
+        "tests/**",
+    ]) + ["docs/markdown/public_apis.md"],
+)
+
+filegroup(
+    name = "torch_tpu_tests_anchor",
+    srcs = ["pyproject.toml"],
+)

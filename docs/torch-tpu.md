@@ -44,7 +44,8 @@ Without the variable, nothing changes.
   compiled. The first call of each shape compiles.
 - Training steps with SGD and AdamW, eager and compiled.
 - torch_tpu's op tests (`tests/ops_test.py`, CPU goldens, float32, bfloat16,
-  float16 and integer dtypes): 11,963 of 12,493 sampled cases pass.
+  float16 and integer dtypes): 11,963 of 12,493 sampled cases pass. To run
+  torch_tpu's tests, see [torch_tpu tests](../README.md#torch_tpu-tests).
 
 float32 matmuls use the matrix unit's TF32 precision by default, like TPUs.
 `torch.set_float32_matmul_precision("highest")` makes them exact (about 5e-7

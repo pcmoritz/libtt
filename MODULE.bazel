@@ -24,7 +24,13 @@ pip.parse(
     python_version = "3.13",
     requirements_lock = "//:requirements-jax-tests.txt",
 )
-use_repo(pip, "jax_test_pip")
+pip.parse(
+    extra_pip_args = ["--extra-index-url=https://download.pytorch.org/whl/cpu"],
+    hub_name = "torch_tpu_test_pip",
+    python_version = "3.13",
+    requirements_lock = "//:requirements-torch-tpu-tests.txt",
+)
+use_repo(pip, "jax_test_pip", "torch_tpu_test_pip")
 
 http_archive(
     name = "hwloc",
@@ -72,6 +78,22 @@ http_archive(
     strip_prefix = "jax-jax-v0.11.2",
     urls = [
         "https://github.com/jax-ml/jax/archive/refs/tags/jax-v0.11.2.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "torch_tpu_src",
+    build_file = "//third_party/torch_tpu:BUILD.overlay.bazel",
+    patch_args = ["-p1"],
+    patch_cmds = [
+        "find docs examples perflab src tests \\( -name BUILD -o -name BUILD.bazel \\) -delete",
+        "rm REPO.bazel",
+    ],
+    patches = ["//third_party/torch_tpu:subprocess_test_main_module.patch"],
+    sha256 = "a2b630a5a7ae1fbb27aac732f16a14f60173b6e927711dca5b91259052a1b81f",
+    strip_prefix = "torch_tpu-0.2.0",
+    urls = [
+        "https://github.com/google-pytorch/torch_tpu/archive/refs/tags/v0.2.0.tar.gz",
     ],
 )
 

@@ -1,6 +1,7 @@
 load("@jax_test_pip//:requirements.bzl", "requirement")
 load("@rules_cc//cc:defs.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_test")
+load("@torch_tpu_test_pip//:requirements.bzl", torch_tpu_test_requirements = "all_requirements")
 
 PLUGIN_TEST_ARGS = [
     "--jax-plugin-wheel=$(rlocationpath //:jax_tt_plugin_wheel)",
@@ -37,6 +38,50 @@ JAX_TEST_DEPS = PLUGIN_TEST_DEPS + [
     requirement("pillow"),
     requirement("portpicker"),
     requirement("scipy"),
+]
+
+TORCH_TPU_TEST_ARGS = PLUGIN_TEST_ARGS + [
+    "--tests-anchor=$(rlocationpath @torch_tpu_src//:torch_tpu_tests_anchor)",
+    # absl flags for the modules that define them. The op tests compare with
+    # CPU instead of GPU golden files, on a few samples per op, and the error
+    # tests check the error messages on the device, as in torch_tpu's own
+    # Bazel setup.
+    "--absl-flag=op_testing:--test_mode=torch_tpu_vs_cpu",
+    "--absl-flag=op_testing:--max_samples_per_op_dtype=3",
+    "--absl-flag=op_testing:--dtypes=float32,bfloat16,float16,int64,int32,int16,int8,uint8,bool",
+    "--absl-flag=ops_test:--test_categories=-foreach,-nonzero,-searchsorted",
+    "--absl-flag=error_testing:--test_mode=tpu",
+    # torchcomms isn't on PyPI (torch_tpu's open source build leaves these out
+    # too), and the profiler tests import tsl's protos, which torch_tpu builds
+    # from the tsl repository and no package provides.
+    "--exclude=tests/distributed/torchcomm_multi_tpu_test.py",
+    "--exclude=tests/distributed/torchcomm_tpu_test.py",
+    "--exclude=tests/profiler/profiler_api_test.py",
+    "--exclude=tests/profiler/profiler_integration_test.py",
+    # Seconds per test (pytest-timeout), so that a hang only fails its test.
+    "--timeout=600",
+    # The device sync after this test aborts the process, which would lose the
+    # results of the file's other tests.
+    "--deselect=tests/errors_test.py::TpuVsGpuErrorTest::test_empty_tensor_in_take",
+    # Count passed subtests too; the op tests run each sample as a subtest.
+    "-o",
+    "verbosity_subtests=1",
+]
+
+TORCH_TPU_TEST_DATA = PLUGIN_TEST_DATA + [
+    "@torch_tpu_src//:torch_tpu_tests",
+    "@torch_tpu_src//:torch_tpu_tests_anchor",
+]
+
+TORCH_TPU_TEST_SRCS = [
+    "pytest_runner.py",
+    "torch_tpu_pytest_plugin.py",
+    "torch_tpu_runner.py",
+    "torch_tpu_site/sitecustomize.py",
+]
+
+TORCH_TPU_TEST_DEPS = torch_tpu_test_requirements + [
+    "@rules_python//python/runfiles",
 ]
 
 DEVICE_TEST_TAGS = [
@@ -94,6 +139,35 @@ py_test(
     data = JAX_TEST_DATA,
     deps = JAX_TEST_DEPS,
     main = "pytest_runner.py",
+    tags = DEVICE_TEST_TAGS,
+    timeout = "eternal",
+)
+
+py_test(
+    name = "torch_tpu_smoke_tests",
+    srcs = TORCH_TPU_TEST_SRCS,
+    args = TORCH_TPU_TEST_ARGS + [
+        "tests/booleans_test.py",
+        "tests/compile/stablehlo_compile_test.py",
+        "tests/fused_adam_test.py",
+        "tests/optimizers/sgd_test.py",
+        "tests/scan_test.py",
+        "tests/untyped_storage_test.py",
+    ],
+    data = TORCH_TPU_TEST_DATA,
+    deps = TORCH_TPU_TEST_DEPS,
+    main = "torch_tpu_runner.py",
+    tags = DEVICE_TEST_TAGS,
+    timeout = "long",
+)
+
+py_test(
+    name = "torch_tpu_test_suite",
+    srcs = TORCH_TPU_TEST_SRCS,
+    args = TORCH_TPU_TEST_ARGS,
+    data = TORCH_TPU_TEST_DATA,
+    deps = TORCH_TPU_TEST_DEPS,
+    main = "torch_tpu_runner.py",
     tags = DEVICE_TEST_TAGS,
     timeout = "eternal",
 )
