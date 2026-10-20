@@ -1,0 +1,71 @@
+diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
+--- a/pjrt_implementation/inc/api/client_instance.h
++++ b/pjrt_implementation/inc/api/client_instance.h
+@@ -54,6 +54,8 @@ public:
+   static ClientInstance *getClientInstance();
+   static PJRT_Error *initClient(const PJRT_Client_Create_Args *args);
+   static void destroyClient();
++  // Closes a client that is still alive when the process exits.
++  static void closeAtExit();
+ 
+ private:
+   GlobalClientInstanceSingleton(std::unique_ptr<ClientInstance> client_instance)
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -14,6 +14,7 @@
+ #include <cerrno>
+ #include <climits>
+ #include <cstddef>
++#include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
+ #include <map>
+@@ -22,6 +23,7 @@
+ #include <optional>
+ #include <sstream>
+ #include <stdexcept>
++#include <thread>
+ #include <tt-metalium/system_mesh.hpp>
+ 
+ // system includes
+@@ -433,6 +435,19 @@ void GlobalClientInstanceSingleton::destroyClient() {
+   }
+ }
+ 
++// torch_tpu never destroys its client, so its device stayed open at exit, and
++// with the fabric's routers still running, the chips' ethernet cores didn't
++// come up for the next process without a board reset.
++void GlobalClientInstanceSingleton::closeAtExit() {
++  GlobalClientInstanceSingleton &singleton_instance = getInstance();
++  std::lock_guard<std::mutex> lock(singleton_instance.m_mutex);
++  if (singleton_instance.isInitialized()) {
++    DLOG_F(LOG_DEBUG, "Closing a client that is still alive at exit");
++    singleton_instance.m_client_instance.reset();
++    singleton_instance.m_ref_count = 0;
++  }
++}
++
+ GlobalClientInstanceSingleton &GlobalClientInstanceSingleton::getInstance() {
+   // Process-wide, since a framework may create and destroy the client on
+   // different threads. Never destroyed: a client that is still alive at exit
+@@ -885,7 +900,18 @@ ClientInstance::openMeshDevice(const std::vector<uint32_t> &mesh_shape) {
+       .traceRegionSize = traceRegionSize,
+   };
+ 
+-  return tt::runtime::openMeshDevice(options);
++  tt::runtime::Device device = tt::runtime::openMeshDevice(options);
++  // Registered once the device is open, so that it runs before tt-metal's
++  // statics are destroyed.
++  static std::once_flag close_at_exit;
++  std::call_once(close_at_exit, [] {
++    std::atexit([] {
++      // A new thread: the exiting thread's tt-metal thread-local state may
++      // already be gone.
++      std::thread(GlobalClientInstanceSingleton::closeAtExit).join();
++    });
++  });
++  return device;
+ }
+ 
+ std::optional<tt::runtime::Device> ClientInstance::getOrCreateSubMesh(

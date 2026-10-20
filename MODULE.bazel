@@ -465,6 +465,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_libtpu_processes.patch",
         "//third_party/tt_xla:tt_xla_manual_collectives.patch",
         "//third_party/tt_xla:tt_xla_tiled_inputs.patch",
+        "//third_party/tt_xla:tt_xla_close_client_at_exit.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
