@@ -48,8 +48,14 @@ TORCH_TPU_TEST_ARGS = PLUGIN_TEST_ARGS + [
     "--absl-flag=--max_samples_per_op_dtype=3",
     "--absl-flag=--test_categories=-foreach,-nonzero,-searchsorted",
     "--absl-flag=--dtypes=float32,bfloat16,float16,int64,int32,int16,int8,uint8,bool",
+    # The error tests check the error messages on the device, as in
+    # torch_tpu's own Bazel setup.
+    "--absl-flag-for=*errors_test.py:--test_mode=tpu",
     # Seconds per test (pytest-timeout), so that a hang only fails its test.
     "--timeout=600",
+    # The device sync after this test aborts the process, which would lose the
+    # results of the file's other tests.
+    "--deselect=tests/errors_test.py::TpuVsGpuErrorTest::test_empty_tensor_in_take",
     # Count passed subtests too; the op tests run each sample as a subtest.
     "-o",
     "verbosity_subtests=1",

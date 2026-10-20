@@ -11,6 +11,7 @@ JUnit XML are written to the test's undeclared outputs.
 
 import argparse
 import collections
+import fnmatch
 import importlib.util
 import os
 from pathlib import Path
@@ -94,6 +95,13 @@ def main() -> int:
         help="absl flag for the tests, e.g. of torch_tpu's op tests; repeatable.",
     )
     parser.add_argument(
+        "--absl-flag-for",
+        action="append",
+        default=[],
+        metavar="GLOB:FLAG",
+        help="absl flag for the test files that match GLOB, after the others.",
+    )
+    parser.add_argument(
         "--file-timeout",
         type=float,
         default=3600,
@@ -126,7 +134,6 @@ def main() -> int:
         + sys.path
     )
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["ABSL_TEST_FLAGS"] = shlex.join(args.absl_flag)
 
     print(f"Running {len(targets)} torch_tpu test files on {plugin_wheel.name}")
     totals = collections.Counter()
@@ -134,7 +141,14 @@ def main() -> int:
     for index, target in enumerate(targets, 1):
         name = re.sub(r"[^A-Za-z0-9_.-]", "_", target)
         log_path = out / f"{name}.log"
-        file_env = dict(env, TEST_TMPDIR=str(tmp / name))
+        absl_flags = list(args.absl_flag)
+        for item in args.absl_flag_for:
+            pattern, _, flag = item.partition(":")
+            if fnmatch.fnmatch(target.split("::")[0], pattern):
+                absl_flags.append(flag)
+        file_env = dict(
+            env, TEST_TMPDIR=str(tmp / name), ABSL_TEST_FLAGS=shlex.join(absl_flags)
+        )
         Path(file_env["TEST_TMPDIR"]).mkdir(parents=True, exist_ok=True)
         command = [
             sys.executable,
@@ -148,6 +162,10 @@ def main() -> int:
             f"--junitxml={out / name}.xml",
             *pytest_args,
         ]
+        if target.startswith("src/"):
+            # Keep the test's directory off the path: modules there, such as
+            # torch_tpu's multiprocessing.py, would shadow the standard library.
+            command.append("--import-mode=importlib")
         start = time.monotonic()
         with open(log_path, "w") as log:
             process = subprocess.Popen(
