@@ -1,7 +1,10 @@
-"""float32 stablehlo.batch_norm_training/inference decompose into reductions
-and elementwise ops: ttnn's batch_norm was off by about 1e-3 relative, and
-torch_tpu's float16/bfloat16 training batch norms, which it computes in
-float32, came out wrong."""
+"""float32 stablehlo.batch_norm_training/inference against float64.
+
+ttnn's batch_norm normalizes exactly, but ran with approximate math (off by
+about 1e-3) when the program's compute config left it unset, and its training
+op returns running statistics with Bessel's correction, not StableHLO's
+biased batch variance. Inference runs on ttnn's batch_norm; training computes
+the centered batch statistics with reductions and normalizes with it."""
 
 import jax
 import numpy as np
@@ -111,3 +114,61 @@ def test_batch_norm_inference(shape, feature_index):
         offset, shape, feature_index
     )
     np.testing.assert_allclose(np.asarray(got), expected, rtol=1e-5, atol=1e-5)
+
+
+def run_training(x, scale, offset, epsilon, feature_index):
+    device = jax.devices("tt")[0]
+    run = jax.jit(
+        lambda *args: bn_training_p.bind(*args, epsilon=epsilon, feature_index=feature_index)
+    )
+    return [np.asarray(v) for v in run(*(jax.device_put(a, device) for a in (x, scale, offset)))]
+
+
+def test_batch_norm_training_one_element_per_channel():
+    """Each channel reduces one element: the variance is 0 and the output is the
+    offset, with nothing divided by zero."""
+    x, scale, offset = inputs((1, 3), 1)
+    output, mean, variance = run_training(x, scale, offset, EPSILON, 1)
+    for value in (output, mean, variance):
+        assert np.all(np.isfinite(value))
+    np.testing.assert_array_equal(mean, x[0])
+    np.testing.assert_array_equal(variance, np.zeros(3, np.float32))
+    np.testing.assert_allclose(output[0], offset, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("training", [True, False])
+def test_batch_norm_small_epsilon(training):
+    shape, epsilon = (4, 5, 6, 7), 1e-12
+    x, scale, offset = inputs(shape, 1)
+    x = x * np.float32(1e-3)
+    x64 = x.astype(np.float64)
+    mean, variance = x64.mean(axis=(0, 2, 3)), x64.var(axis=(0, 2, 3))
+    if training:
+        output = run_training(x, scale, offset, epsilon, 1)[0]
+    else:
+        device = jax.devices("tt")[0]
+        run = jax.jit(lambda *args: bn_inference_p.bind(*args, epsilon=epsilon, feature_index=1))
+        mean, variance = mean.astype(np.float32), variance.astype(np.float32)
+        output = np.asarray(run(*(jax.device_put(a, device) for a in (x, scale, offset, mean, variance))))
+    normalized = (x64 - per_channel(mean, shape, 1)) / np.sqrt(per_channel(variance, shape, 1) + epsilon)
+    expected = normalized * per_channel(scale, shape, 1) + per_channel(offset, shape, 1)
+    assert np.all(np.isfinite(output))
+    np.testing.assert_allclose(output, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_batch_norm_training_high_offset():
+    """x = 1000 + 0.01 * noise: float32 resolves x to 6e-5, so the mean and the
+    output are only that accurate, while the centered variance stays close."""
+    rng = np.random.default_rng(2)
+    shape = (4, 5, 6, 7)
+    x = (1000 + 0.01 * rng.standard_normal(shape)).astype(np.float32)
+    scale, offset = np.ones(5, np.float32), np.zeros(5, np.float32)
+    output, mean, variance = run_training(x, scale, offset, EPSILON, 1)
+    x64 = x.astype(np.float64)
+    for value in (output, mean, variance):
+        assert np.all(np.isfinite(value))
+    mean64, variance64 = x64.mean(axis=(0, 2, 3)), x64.var(axis=(0, 2, 3))
+    np.testing.assert_allclose(mean, mean64, rtol=1e-7)
+    np.testing.assert_allclose(variance, variance64, rtol=1e-3)
+    expected = (x64 - per_channel(mean64, shape, 1)) / np.sqrt(per_channel(variance64, shape, 1) + EPSILON)
+    np.testing.assert_allclose(output, expected, atol=1e-2)

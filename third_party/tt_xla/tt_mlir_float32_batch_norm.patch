@@ -1,14 +1,14 @@
 diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 --- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 +++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
-@@ -1155,6 +1155,53 @@
+@@ -1155,6 +1155,32 @@
                              target1DType.getEncoding()),
        input4D, rewriter.getI32ArrayAttr(shape1D));
  }
 +
-+// float32 batch norm runs as reductions and elementwise ops: ttnn's
-+// batch_norm is off by about 1e-3 relative, while ttnn's float32 sums,
-+// divisions and rsqrt are accurate to about 1e-7.
++// float32 batch norm training computes the batch's statistics with
++// reductions: StableHLO returns the mean and the biased variance, while ttnn's
++// batch_norm only returns running statistics, with Bessel's correction.
 +static bool decomposesBatchNorm(RankedTensorType operandType) {
 +  return operandType.getElementType().isF32();
 +}
@@ -31,56 +31,17 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +                                                  shape[3])));
 +  return rewriter.create<ttir::DivOp>(loc, statType, sum, count);
 +}
-+
-+// (x - mean) * rsqrt(variance + epsilon) * scale + offset, given x - mean
-+// and [1, C, 1, 1] statistics and parameters.
-+static mlir::Value normalizeBatch(ConversionPatternRewriter &rewriter,
-+                                  Location loc, mlir::Value centered,
-+                                  mlir::Value variance, mlir::Value scale,
-+                                  mlir::Value offset, FloatAttr epsilon) {
-+  auto type = mlir::cast<RankedTensorType>(centered.getType());
-+  auto statType = mlir::cast<RankedTensorType>(variance.getType());
-+  mlir::Value eps = rewriter.create<ttir::FullOp>(
-+      loc, statType,
-+      rewriter.getF32FloatAttr(
-+          static_cast<float>(epsilon.getValueAsDouble())));
-+  mlir::Value invStd = rewriter.create<ttir::RsqrtOp>(
-+      loc, statType,
-+      rewriter.create<ttir::AddOp>(loc, statType, variance, eps));
-+  mlir::Value result =
-+      rewriter.create<ttir::MultiplyOp>(loc, type, centered, invStd);
-+  result = rewriter.create<ttir::MultiplyOp>(loc, type, result, scale);
-+  return rewriter.create<ttir::AddOp>(loc, type, result, offset);
-+}
  } // namespace
  
  //===----------------------------------------------------------------------===//
-@@ -1635,6 +1682,18 @@
-     mlir::Value offset4D =
-         getBatchNorm4DTensor(rewriter, loc, adaptor.getOffset());
- 
-+    if (decomposesBatchNorm(inputType)) {
-+      mlir::Value centered = rewriter.create<ttir::SubtractOp>(
-+          loc, normalizedInput.getType(), normalizedInput, mean4D);
-+      mlir::Value output =
-+          normalizeBatch(rewriter, loc, centered, variance4D, scale4D,
-+                         offset4D, adaptor.getEpsilonAttr());
-+      rewriter.replaceOp(op, denormalizeFromNCHW(output, originalShape,
-+                                                 normalizedShape, featureIndex,
-+                                                 rewriter, loc));
-+      return success();
-+    }
-+
-     // Create output type with normalized shape
-     auto originalOutputType = mlir::cast<RankedTensorType>(
-         getTypeConverter()->convertType(op.getResult().getType()));
-@@ -1723,6 +1782,34 @@
+@@ -1723,6 +1749,36 @@
      mlir::Value variance4D =
          getBatchNorm4DTensor(rewriter, loc, adaptor.getRunningVariance());
  
 +    if (decomposesBatchNorm(inputType)) {
-+      // The results are the normalized batch and its (biased) statistics;
-+      // the running statistics don't affect them.
++      // The results are the batch normalized with its statistics, the mean
++      // and the (biased) variance of the centered batch; the running
++      // statistics don't affect them.
 +      mlir::Value mean = channelMean(rewriter, loc, normalizedInput);
 +      mlir::Value centered = rewriter.create<ttir::SubtractOp>(
 +          loc, normalizedInput.getType(), normalizedInput, mean);
@@ -88,9 +49,10 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +          rewriter, loc,
 +          rewriter.create<ttir::MultiplyOp>(loc, centered.getType(), centered,
 +                                            centered));
-+      mlir::Value output =
-+          normalizeBatch(rewriter, loc, centered, variance, scale4D, offset4D,
-+                         adaptor.getEpsilonAttr());
++      mlir::Value output = rewriter.create<ttir::BatchNormInferenceOp>(
++          loc, normalizedInput.getType(), normalizedInput, scale4D, offset4D,
++          mean, variance, adaptor.getEpsilonAttr(),
++          rewriter.getI32IntegerAttr(1));
 +      rewriter.replaceOp(
 +          op, ValueRange{denormalizeFromNCHW(output, originalShape,
 +                                             normalizedShape, featureIndex,
@@ -112,21 +74,12 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
 --- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
 +++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
-@@ -112,8 +112,10 @@
+@@ -122,8 +122,11 @@
            auto offsetType = op.getOffset().getType();
-           auto meanType = op.getMean().getType();
-           auto varType = op.getVariance().getType();
-+          // float32 batch norm decomposes into reductions and elementwise ops.
-           return (scaleType.getRank() == 4 && offsetType.getRank() == 4 &&
--                  meanType.getRank() == 4 && varType.getRank() == 4);
-+                  meanType.getRank() == 4 && varType.getRank() == 4) &&
-+                 !op.getOperand().getType().getElementType().isF32();
-         });
- 
-     target.addDynamicallyLegalOp<ttir::BatchNormTrainingOp>(
-@@ -123,7 +125,8 @@
            auto meanType = op.getRunningMean().getType();
            auto varType = op.getRunningVariance().getType();
++          // float32 batch norm training computes its statistics with
++          // reductions.
            return (scaleType.getRank() == 4 && offsetType.getRank() == 4 &&
 -                  meanType.getRank() == 4 && varType.getRank() == 4);
 +                  meanType.getRank() == 4 && varType.getRank() == 4) &&
@@ -134,3 +87,70 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.
          });
  
      // ttml::metal::adamw only accepts 4D tensors.
+diff --git a/runtime/lib/ttnn/operations/normalization/batch_norm.cpp b/runtime/lib/ttnn/operations/normalization/batch_norm.cpp
+--- a/runtime/lib/ttnn/operations/normalization/batch_norm.cpp
++++ b/runtime/lib/ttnn/operations/normalization/batch_norm.cpp
+@@ -6,6 +6,25 @@
+ #include "tt/runtime/detail/ttnn/operations/utils.h"
+ 
+ namespace tt::runtime::ttnn::operations::batch_norm {
++namespace {
++// The program's compute config, with math_approx_mode off unless the program
++// sets it: ttnn's batch_norm is exact by default, while
++// createDeviceComputeKernelConfig starts from approximate math, which is off
++// by about 1e-3.
++std::optional<::ttnn::DeviceComputeKernelConfig>
++computeConfig(const ::tt::target::ttnn::DeviceComputeKernelConfig *config) {
++  if (!config) {
++    return std::nullopt;
++  }
++  ::ttnn::DeviceComputeKernelConfig result =
++      utils::createDeviceComputeKernelConfig(config);
++  if (!config->math_approx_mode()) {
++    result.math_approx_mode = false;
++  }
++  return result;
++}
++} // namespace
++
+ void run(const ::tt::target::ttnn::BatchNormInferenceOp *op,
+          ProgramContext &context) {
+   ProgramTensorPool &tensorPool = context.getTensorPool();
+@@ -21,17 +40,13 @@
+   const ::ttnn::Tensor &bias = tensorPool.getTTNNTensorAndValidate(op->bias());
+ 
+   float epsilon = op->epsilon();
+-  std::optional<::ttnn::DeviceComputeKernelConfig> computeConfig;
+-  if (op->compute_config()) {
+-    computeConfig =
+-        utils::createDeviceComputeKernelConfig(op->compute_config());
+-  }
+ 
+   // For inference: training=false, momentum=0.1 (default, not used in
+   // inference)
+   ::ttnn::Tensor output = ::ttnn::batch_norm(
+       input, runningMean, runningVar, false, epsilon, 0.1f, weight, bias,
+-      /*output=*/std::nullopt, /*memory_config=*/std::nullopt, computeConfig);
++      /*output=*/std::nullopt, /*memory_config=*/std::nullopt,
++      computeConfig(op->compute_config()));
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), output);
+ }
+@@ -54,15 +69,10 @@
+   float momentum = op->momentum();
+ 
+   // For training: training=true
+-  std::optional<::ttnn::DeviceComputeKernelConfig> computeConfig;
+-  if (op->compute_config()) {
+-    computeConfig =
+-        utils::createDeviceComputeKernelConfig(op->compute_config());
+-  }
+-
+   ::ttnn::Tensor output = ::ttnn::batch_norm(
+       input, runningMean, runningVar, true, epsilon, momentum, weight, bias,
+-      /*output=*/std::nullopt, /*memory_config=*/std::nullopt, computeConfig);
++      /*output=*/std::nullopt, /*memory_config=*/std::nullopt,
++      computeConfig(op->compute_config()));
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), output);
+ }
