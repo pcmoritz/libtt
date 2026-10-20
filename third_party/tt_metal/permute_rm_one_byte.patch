@@ -1,0 +1,154 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflow/reader_permute_interleaved_rm_blocked_generic.cpp ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflow/reader_permute_interleaved_rm_blocked_generic.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflow/reader_permute_interleaved_rm_blocked_generic.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflow/reader_permute_interleaved_rm_blocked_generic.cpp
+@@ -8,6 +8,10 @@
+ #include "ttnn/operations/data_movement/common/kernels/common.hpp"
+ #include "api/dataflow/noc.h"
+ #include "api/dataflow/dataflow_buffer.h"
++#ifdef PERMUTE_REALIGN
++#include "api/dataflow/endpoints.h"
++#include "api/scratchpad.h"
++#endif
+ #include "api/core_local_mem.h"
+ #include "api/tensor/noc_traits.h"
+ #include "experimental/kernel_args.h"
+@@ -23,6 +27,8 @@
+     constexpr uint32_t x_block_size = get_arg(args::x_block_size);
+     constexpr uint32_t w_block_size = get_arg(args::w_block_size);
+     constexpr uint32_t element_size = get_arg(args::element_size);
++    constexpr uint32_t alignment = get_arg(args::alignment);
++    constexpr uint32_t realign_row_size = get_arg(args::realign_row_size);
+ 
+     // Precomputed constants: size of a 32 element block along the W dimension (measured in bytes)
+     constexpr uint32_t w_block_size_bytes = w_block_size * element_size;
+@@ -57,6 +63,13 @@
+     const auto s0 = TensorAccessor(tensor::input);
+     Noc noc;
+ 
++#ifdef PERMUTE_REALIGN
++    // Rows whose source isn't aligned (1-byte elements) are read to rows of this staging area that start
++    // at aligned addresses, then copied into place within L1.
++    Scratchpad<uint32_t> realign(scratch::realign);
++    const uint32_t realign_base = (realign.get_base_address() + alignment - 1) & ~(alignment - 1);
++#endif
++
+     uint32_t idxs[N];
+     idxs[N - 1] = 0;
+     uint32_t non_x_rows = num_rows / X;
+@@ -111,17 +124,44 @@
+ 
+         // We read in 'x_block_len' chunks along the X dimension
+         uint32_t page_offset = 0;
++#ifdef PERMUTE_REALIGN
++        const uint32_t misalignment = w_offset % alignment;
++        uint32_t staged_row = realign_base;
++#endif
+         // Read along the X dimension
+         for (uint32_t x = x_start; x < x_end; ++x) {
+             uint64_t addr_offset = base_addr_offset + x * X_stride;
++#ifdef PERMUTE_REALIGN
++            tt::data_movement::common::noc_async_read_sharded(
++                noc, staged_row, s0, addr_offset, w_offset - misalignment, misalignment + w_read_size_bytes);
++            staged_row += realign_row_size;
++#else
+             tt::data_movement::common::noc_async_read_sharded(
+                 noc, src_buffer_l1_addr + page_offset, s0, addr_offset, w_offset, w_read_size_bytes);
+ 
+             // Advance output pointer by one page size for next row
+             page_offset += input_cb_page_size;
++#endif
+         }
+         // Wait for all async reads to complete before proceeding
+         noc.async_read_barrier();
++#ifdef PERMUTE_REALIGN
++        staged_row = realign_base + misalignment;
++        for (uint32_t x = x_start; x < x_end; ++x) {
++            CoreLocalMem<uint32_t> dst(src_buffer_l1_addr + page_offset);
++            noc.async_read(
++                UnicastEndpoint{},
++                dst,
++                w_read_size_bytes,
++                {.noc_x = (uint32_t)my_x[noc.get_noc_id()],
++                 .noc_y = (uint32_t)my_y[noc.get_noc_id()],
++                 .addr = staged_row},
++                {.offset_bytes = 0});
++            staged_row += realign_row_size;
++            page_offset += input_cb_page_size;
++        }
++        noc.async_read_barrier();
++#endif
+         // Push the filled block into the circular buffer
+         dfb.push_back(x_block_size);
+     }
+diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp
+@@ -247,14 +247,39 @@
+     TensorParameter input_param{.unique_id = INPUT, .spec = input_mesh_tensor.tensor_spec()};
+     TensorParameter output_param{.unique_id = OUTPUT, .spec = output_mesh_tensor.tensor_spec()};
+ 
++    // A block row is w_block_size elements, which for 1-byte elements is less than the DRAM alignment
++    // (32 of 64 bytes on Blackhole): the rows of a block, and the W blocks after the first, start at
++    // misaligned addresses. A NoC read from DRAM keeps the source address's offset within the
++    // alignment, so it would land rows in the wrong place. The reader then stages each row at an
++    // address aligned like its source and copies it into place within L1, which only needs L1
++    // alignment.
++    const uint32_t input_alignment = input_tensor.buffer()->buffer_type() == BufferType::DRAM
++                                         ? hal::get_dram_alignment()
++                                         : hal::get_l1_alignment();
++    const bool realign = input_cb_page_size % input_alignment != 0;
++    const uint32_t realign_row_size = tt::round_up(input_alignment + input_cb_page_size, input_alignment);
++    const ScratchpadSpecName REALIGN{"realign"};
++    Group<ScratchpadSpec> scratchpads;
++    Group<ScratchpadBinding> reader_scratchpad_bindings;
++    KernelSpec::CompilerOptions::Defines reader_defines;
++    if (realign) {
++        scratchpads.push_back(ScratchpadSpec{
++            .unique_id = REALIGN, .size_per_node = x_block_size * realign_row_size + input_alignment});
++        reader_scratchpad_bindings.push_back(
++            ScratchpadBinding{.scratchpad_spec_name = REALIGN, .accessor_name = "realign"});
++        reader_defines.emplace("PERMUTE_REALIGN", "1");
++    }
++
+     // ---- Kernels ----
+     KernelSpec reader{
+         .unique_id = READER,
+         .source =
+             "ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflow/"
+             "reader_permute_interleaved_rm_blocked_generic.cpp",
++        .compiler_options = {.defines = std::move(reader_defines)},
+         .dfb_bindings = {DFBBinding{
+             .dfb_spec_name = SRC_CB, .accessor_name = "cb_in", .endpoint_type = DFBEndpointType::PRODUCER}},
++        .scratchpad_bindings = std::move(reader_scratchpad_bindings),
+         .tensor_bindings = {TensorBinding{.tensor_parameter_name = INPUT, .accessor_name = "input"}},
+         .compile_time_args =
+             {{"N", N},
+@@ -266,7 +291,9 @@
+              {"w_blocks", w_blocks},
+              {"x_block_size", x_block_size},
+              {"w_block_size", w_block_size},
+-             {"element_size", input_tensor.element_size()}},
++             {"element_size", input_tensor.element_size()},
++             {"alignment", input_alignment},
++             {"realign_row_size", realign_row_size}},
+         .runtime_arg_schema = {.runtime_arg_names = {"start_block", "end_block"}},
+         .hw_config = ttnn::create_reader_datamovement_config(input_tensor.device()->arch()),
+         .advanced_options = {.num_runtime_varargs = 2 * N},
+@@ -303,7 +330,8 @@
+ 
+     bool fp32_dest_acc_en = cb_data_format_output == tt::DataFormat::Float32 ||
+                             cb_data_format_output == tt::DataFormat::Int32 ||
+-                            cb_data_format_output == tt::DataFormat::UInt32;
++                            cb_data_format_output == tt::DataFormat::UInt32 ||
++                            cb_data_format_output == tt::DataFormat::UInt8;
+     // Style B compute config: build ComputeGen1Config directly, matching the legacy
+     // ComputeConfigDescriptor{.fp32_dest_acc_en=...} (all other fields at legacy defaults).
+     ComputeGen1Config compute_cfg{.enable_32_bit_dest = fp32_dest_acc_en};
+@@ -386,6 +414,7 @@
+     spec.name = "permute_rm_blocked_generic";
+     spec.kernels = {std::move(reader), std::move(writer), std::move(compute)};
+     spec.dataflow_buffers = {std::move(src_cb), std::move(out_cb), std::move(tilize_cb)};
++    spec.scratchpads = std::move(scratchpads);
+     spec.tensor_parameters = {std::move(input_param), std::move(output_param)};
+     spec.work_units = {WorkUnitSpec{.name = "main", .kernels = {READER, WRITER, COMPUTE}, .target_nodes = all_cores}};
+ 
