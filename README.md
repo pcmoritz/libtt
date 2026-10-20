@@ -122,8 +122,8 @@ Bazel gives tests a fresh home directory, so tt-metal rebuilds its kernel cache
 in every run. Add `--test_env=TT_METAL_CACHE=$HOME/.cache` to reuse
 `~/.cache/tt-metal-cache` instead.
 
-Baseline (October 2026, main ffc8122, one Blackhole p150a): **92 of 196 files
-passed; 5891 passed, 2803 failed, 32 errors, 186 skipped, 12898 subtests
+Baseline (October 2026, main ffc8122, one Blackhole p150a): **101 of 192 files
+passed; 6052 passed, 2963 failed, 14 errors, 240 skipped, 12900 subtests
 passed**, in about an hour. Most failures are multi-device, TPU-only or
 dynamic-shape tests.
 

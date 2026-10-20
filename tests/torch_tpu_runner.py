@@ -186,7 +186,8 @@ def main() -> int:
             status = f"crashed ({signal.Signals(-returncode).name})"
         else:
             status = ", ".join(f"{n} {kind}" for kind, n in counts.items())
-            status = status or f"exit code {returncode}"
+            if returncode not in (0, 5) and not counts["failed"] + counts["error"]:
+                status += f"{', ' if status else ''}exit code {returncode}"
         # 5 means that pytest collected no tests.
         if returncode not in (0, 5):
             failed.append(target)
