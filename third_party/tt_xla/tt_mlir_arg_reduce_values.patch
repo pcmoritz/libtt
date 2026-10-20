@@ -1,46 +1,71 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -314,10 +314,12 @@
+@@ -314,10 +314,20 @@
  
      if (srcOp.getInputs().size() > 1) {
        if (isArgMax(srcOp, adaptor, rewriter)) {
-+        replaceUsedValues<ttir::MaxOp>(srcOp, adaptor, rewriter);
++        if (failed(replaceUsedValues<ttir::MaxOp, ttir::MaximumOp>(
++                srcOp, adaptor, TypicalInitReductionValue::NEG_INF,
++                rewriter))) {
++          return failure();
++        }
          return matchAndRewriteInternalArgMax(
              srcOp, adaptor.getInputs().front(), rewriter);
        }
        if (isArgMin(srcOp, adaptor, rewriter)) {
-+        replaceUsedValues<ttir::MinOp>(srcOp, adaptor, rewriter);
++        if (failed(replaceUsedValues<ttir::MinOp, ttir::MinimumOp>(
++                srcOp, adaptor, TypicalInitReductionValue::POS_INF,
++                rewriter))) {
++          return failure();
++        }
          return matchAndRewriteInternalArgMin(srcOp, adaptor, rewriter);
        }
        return matchAndRewriteSeparable(srcOp, adaptor, rewriter);
-@@ -559,6 +561,25 @@
+@@ -559,6 +569,42 @@
      return success();
    }
  
 +  // ttir.argmax and ttir.argmin return only the indices. When the reduced
 +  // values are used too, e.g. by torch.max(x, dim), reduce them separately.
-+  template <typename ReductionOp>
-+  void replaceUsedValues(mlir::stablehlo::ReduceOp &srcOp,
-+                         mlir::stablehlo::ReduceOp::Adaptor &adaptor,
-+                         ConversionPatternRewriter &rewriter) const {
++  // An init value other than the identity (e.g. torch_tpu's lowest finite
++  // float) takes part in the reduction too.
++  template <typename ReductionOp, typename CombineOp>
++  LogicalResult replaceUsedValues(mlir::stablehlo::ReduceOp &srcOp,
++                                  mlir::stablehlo::ReduceOp::Adaptor &adaptor,
++                                  TypicalInitReductionValue identity,
++                                  ConversionPatternRewriter &rewriter) const {
 +    if (srcOp.getResult(0).use_empty()) {
-+      return;
++      return success();
 +    }
 +    auto outputType = mlir::cast<RankedTensorType>(
 +        getTypeConverter()->convertType(srcOp.getResult(0).getType()));
-+    mlir::Value values = rewriter.create<ReductionOp>(
-+        srcOp.getLoc(), outputType, adaptor.getInputs().front(),
-+        /*keep_dim=*/false,
-+        rewriter.getI32ArrayAttr(
-+            llvm::SmallVector<int32_t>(srcOp.getDimensions())));
++    mlir::ArrayAttr dimArg = rewriter.getI32ArrayAttr(
++        llvm::SmallVector<int32_t>(srcOp.getDimensions()));
++    mlir::Value input = adaptor.getInputs().front();
++    mlir::Value values;
++    if (verifyInitValue(srcOp.getInitValues().front(), identity)) {
++      values = rewriter.create<ReductionOp>(srcOp.getLoc(), outputType, input,
++                                            /*keep_dim=*/false, dimArg);
++    } else {
++      mlir::Value init;
++      if (failed(ttir::utils::broadcastValue(
++              rewriter, adaptor.getInitValues().front(), outputType, init,
++              srcOp.getLoc(), /*frontUnsqueeze=*/false))) {
++        return rewriter.notifyMatchFailure(
++            srcOp, "reduce init value is not broadcastable");
++      }
++      values = createReductionWithInit<ReductionOp, CombineOp>(
++          srcOp.getLoc(), outputType, input, init, dimArg, rewriter);
++    }
 +    srcOp.getResult(0).replaceAllUsesWith(values);
++    return success();
 +  }
 +
    LogicalResult
    matchAndRewriteInternalArgMax(mlir::stablehlo::ReduceOp &srcOp,
                                  mlir::Value input,
-@@ -728,8 +749,8 @@
+@@ -728,8 +774,8 @@
        return false;
      }
  
