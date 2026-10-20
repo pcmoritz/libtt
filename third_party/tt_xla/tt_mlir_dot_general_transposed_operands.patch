@@ -1,0 +1,92 @@
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -261,25 +261,57 @@ struct DotGeneralToMatmulConversionPattern
+     SmallVector<int64_t> rhsPermutation =
+         getPermutation(rhsBatchDims, rhsContractDims, rhsResultDims);
+ 
++    // A matmul reads an lhs stored as (batch dims, contract dims, result dims)
++    // or an rhs stored as (batch dims, result dims, contract dims) transposed,
++    // so such an operand is not permuted: in attention's backward, that
++    // permute moved the whole [heads, queries, keys] score tensor.
++    int64_t contractionSize =
++        computeProductOfDims(lhsType.getShape(), lhsContractDims);
++    const bool useMatmul =
++        contractionSize != 1 && !isa<IntegerType>(elementType);
++    auto isIdentity = [](ArrayRef<int64_t> permutation) {
++      return llvm::equal(permutation,
++                         llvm::seq<int64_t>(0, permutation.size()));
++    };
++    const bool transposeA =
++        useMatmul && !isIdentity(lhsPermutation) &&
++        isIdentity(
++            getPermutation(lhsBatchDims, lhsContractDims, lhsResultDims));
++    const bool transposeB =
++        useMatmul && !isIdentity(rhsPermutation) &&
++        isIdentity(
++            getPermutation(rhsBatchDims, rhsResultDims, rhsContractDims));
++
+     // Apply these permutations to lhs and rhs.
+ 
+-    ttir::PermuteOp lhsPermute = createPermuteOp(
+-        rewriter,
+-        ttmlir::utils::appendLocationSuffix(op.getLoc(), "_permuteLhs"), lhs,
+-        lhsType, lhsPermutation);
+-    ttir::PermuteOp rhsPermute = createPermuteOp(
+-        rewriter,
+-        ttmlir::utils::appendLocationSuffix(op.getLoc(), "_permuteRhs"), rhs,
+-        rhsType, rhsPermutation);
++    Value lhsPermute =
++        transposeA ? lhs
++                   : createPermuteOp(rewriter,
++                                     ttmlir::utils::appendLocationSuffix(
++                                         op.getLoc(), "_permuteLhs"),
++                                     lhs, lhsType, lhsPermutation);
++    Value rhsPermute =
++        transposeB ? rhs
++                   : createPermuteOp(rewriter,
++                                     ttmlir::utils::appendLocationSuffix(
++                                         op.getLoc(), "_permuteRhs"),
++                                     rhs, rhsType, rhsPermutation);
+ 
+     // Compute final shape for lhs and rhs.
+     // for lhs (batch dims, prod(result dims), prod(contract dims))
+     // for rhs (batch dims, prod(contract dims), prod(result dims))
+-
+-    SmallVector<int64_t> lhsMatmulInputShape = computeMatmulInputShape(
+-        rewriter, lhsType, lhsBatchDims, lhsResultDims, lhsContractDims);
+-    SmallVector<int64_t> rhsMatmulInputShape = computeMatmulInputShape(
+-        rewriter, rhsType, rhsBatchDims, rhsContractDims, rhsResultDims);
++    // or the other way around for a transposed operand.
++
++    SmallVector<int64_t> lhsMatmulInputShape =
++        transposeA ? computeMatmulInputShape(rewriter, lhsType, lhsBatchDims,
++                                             lhsContractDims, lhsResultDims)
++                   : computeMatmulInputShape(rewriter, lhsType, lhsBatchDims,
++                                             lhsResultDims, lhsContractDims);
++    SmallVector<int64_t> rhsMatmulInputShape =
++        transposeB ? computeMatmulInputShape(rewriter, rhsType, rhsBatchDims,
++                                             rhsResultDims, rhsContractDims)
++                   : computeMatmulInputShape(rewriter, rhsType, rhsBatchDims,
++                                             rhsContractDims, rhsResultDims);
+ 
+     // Apply this reshape to lhs and rhs to adapt to matmul op.
+     // For lhs: (batch dims, prod(result dims), prod(contract dims))
+@@ -309,8 +341,6 @@ struct DotGeneralToMatmulConversionPattern
+     // elementwise multiply to keep full f32 precision. lhsMatmulInput is
+     // [..., M, 1] and rhsMatmulInput is [..., 1, N], so they broadcast-multiply
+     // to the matmul destination shape [..., M, N].
+-    int64_t contractionSize =
+-        computeProductOfDims(lhsType.getShape(), lhsContractDims);
+     Value contractionResult;
+     if (contractionSize == 1) {
+       contractionResult = rewriter.create<ttir::MultiplyOp>(
+@@ -348,7 +378,7 @@ struct DotGeneralToMatmulConversionPattern
+       auto matmul = rewriter.create<ttir::MatmulOp>(
+           op.getLoc(),
+           RankedTensorType::get(matmulDestinationShape, elementType),
+-          lhsMatmulInput, rhsMatmulInput);
++          lhsMatmulInput, rhsMatmulInput, transposeA, transposeB);
+       if (auto attr = op->getAttr("ttcore.fp32_exact")) {
+         matmul->setAttr("ttcore.fp32_exact", attr);
+       }
