@@ -1,0 +1,195 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/common/common.cpp ttnn/cpp/ttnn/operations/data_movement/common/common.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/common/common.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/common/common.cpp
+@@ -858,7 +858,8 @@
+     uint32_t output_single_tile_size,
+     uint32_t tile_height,
+     uint32_t tile_width,
+-    const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids) {
++    const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids,
++    uint32_t num_matrices) {
+     const bool has_staging = (direction == BlockDirection::Tilize);
+ 
+     TT_FATAL(
+@@ -873,9 +874,10 @@
+     // coincide when nothing is padded away -- see BlockDirection.
+     const auto& padded =
+         (direction == BlockDirection::Tilize) ? output_tensor.padded_shape() : input_tensor.padded_shape();
+-    const uint32_t num_tiles_per_col = padded[-2] / tile_height;
++    // `num_matrices` stacks that many [padded[-2], padded[-1]] matrices into the rows.
++    const uint32_t num_tiles_per_col = num_matrices * padded[-2] / tile_height;
+     const uint32_t num_tiles_per_row = padded[-1] / tile_width;
+-    const uint32_t num_blocks = (padded[-1] * padded[-2]) / (tile_height * tile_width);
++    const uint32_t num_blocks = num_tiles_per_col * num_tiles_per_row;
+ 
+     // Fold the staging buffer (bytes/tile + fixed) into the limit or the region overruns L1. Only
+     // the tilize direction has one, so untilize budgets the input/output pair alone.
+diff --git ttnn/cpp/ttnn/operations/data_movement/common/common.hpp ttnn/cpp/ttnn/operations/data_movement/common/common.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/common/common.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/common/common.hpp
+@@ -173,7 +173,8 @@
+     uint32_t output_single_tile_size,
+     uint32_t tile_height,
+     uint32_t tile_width,
+-    const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids);
++    const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids,
++    uint32_t num_matrices = 1);
+ 
+ // The buffer set whose block width this core was assigned. Asserts the core belongs to exactly one
+ // set: an unmatched core silently defaulting to `full_set` would bind the wrong-width buffers, and
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
+@@ -61,6 +61,21 @@
+     const uint32_t tile_hw = operation_attributes.tile.get_tile_hw();
+     const uint32_t dram_alignment = tt::tt_metal::hal::get_dram_alignment();
+ 
++    auto log_shape = output.logical_shape();
++    uint32_t third_dim = 1;
++    if (log_shape.rank() == 3) {
++        third_dim = log_shape[-3];
++    } else if (log_shape.rank() >= 4) {
++        third_dim = log_shape[-3] * log_shape[-4];
++    }
++    // Split the work over the tiles of all the matrices, not of one: stack them into the rows,
++    // which the reader maps back to matrices. Only when each matrix pads its rows to a tile.
++    const uint32_t num_matrices =
++        output.padded_shape()[-2] == tt::round_up(a.logical_shape()[-2], tile_height) ? third_dim : 1;
++    if (num_matrices > 1) {
++        third_dim = 1;
++    }
++
+     const BlockPlan plan = make_block_plan(
+         BlockDirection::Tilize,
+         BlockCoreOrder::ColumnMajor,
+@@ -70,7 +85,8 @@
+         output_single_tile_size,
+         tile_height,
+         tile_width,
+-        operation_attributes.sub_core_grids);
++        operation_attributes.sub_core_grids,
++        num_matrices);
+     const BlockBufferSet& full_set = plan.full;
+     const BlockBufferSet& cliffrow_set = plan.cliffrow;
+     const auto& [ncores, all_cores, core_range, cliff_row_core_range, cliff_col_core_range, cliff_col_row_core_range, nblocks_per_core, single_block_size, single_block_size_cliff_row, single_block_size_cliff_col, has_cliff_row, has_cliff_col, full_cores_per_row, full_cores_per_col, single_sub_block_size] =
+@@ -122,14 +138,6 @@
+     // reader
+     uint32_t num_tiles_2d = output.padded_shape()[-1] * output.padded_shape()[-2] / tile_hw;
+ 
+-    auto log_shape = output.logical_shape();
+-    uint32_t third_dim = 1;
+-    if (log_shape.rank() == 3) {
+-        third_dim = log_shape[-3];
+-    } else if (log_shape.rank() >= 4) {
+-        third_dim = log_shape[-3] * log_shape[-4];
+-    }
+-
+     uint32_t total_num_rows = a.logical_shape()[-2];
+ 
+     if (output.padded_shape()[-2] > tt::round_up(total_num_rows, tile_height)) {
+@@ -158,6 +166,9 @@
+         reader_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
+         reader_desc.core_ranges = set.core_ranges;
+         reader_desc.compile_time_args = std::move(reader_compile_time_args);
++        if (num_matrices > 1) {
++            reader_desc.defines = {{"ROWS_PER_MATRIX", std::to_string(output.padded_shape()[-2])}};
++        }
+         reader_desc.config = ReaderConfigDescriptor{};
+         return reader_desc;
+     };
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
+@@ -58,6 +58,21 @@
+ 
+     const uint32_t dram_alignment = tt::tt_metal::hal::get_dram_alignment();
+ 
++    auto log_shape = output.logical_shape();
++    uint32_t third_dim = 1;
++    if (log_shape.rank() == 3) {
++        third_dim = log_shape[-3];
++    } else if (log_shape.rank() >= 4) {
++        third_dim = log_shape[-3] * log_shape[-4];
++    }
++    // Split the work over the tiles of all the matrices, not of one: stack them into the rows,
++    // which the reader maps back to matrices. Only when each matrix pads its rows to a tile.
++    const uint32_t num_matrices =
++        output.padded_shape()[-2] == tt::round_up(a.logical_shape()[-2], TILE_HEIGHT) ? third_dim : 1;
++    if (num_matrices > 1) {
++        third_dim = 1;
++    }
++
+     const BlockPlan plan = make_block_plan(
+         BlockDirection::Tilize,
+         BlockCoreOrder::ColumnMajor,
+@@ -67,7 +82,8 @@
+         output_single_tile_size,
+         TILE_HEIGHT,
+         TILE_WIDTH,
+-        sub_core_grids);
++        sub_core_grids,
++        num_matrices);
+     const BlockBufferSet& full_set = plan.full;
+     const BlockBufferSet& cliffrow_set = plan.cliffrow;
+     const auto& [ncores, all_cores, core_range, cliff_row_core_range, cliff_col_core_range, cliff_col_row_core_range, nblocks_per_core, single_block_size, single_block_size_cliff_row, single_block_size_cliff_col, has_cliff_row, has_cliff_col, full_cores_per_row, full_cores_per_col, single_sub_block_size] =
+@@ -114,14 +130,6 @@
+ 
+     uint32_t num_tiles_2d = output.padded_shape()[-1] * output.padded_shape()[-2] / TILE_HW;
+ 
+-    auto log_shape = output.logical_shape();
+-    uint32_t third_dim = 1;
+-    if (log_shape.rank() == 3) {
+-        third_dim = log_shape[-3];
+-    } else if (log_shape.rank() >= 4) {
+-        third_dim = log_shape[-3] * log_shape[-4];
+-    }
+-
+     uint32_t tile_height = output.tensor_spec().tile().get_height();
+ 
+     uint32_t total_num_rows = a.logical_shape()[-2];
+@@ -152,6 +160,9 @@
+         reader_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
+         reader_desc.core_ranges = set.core_ranges;
+         reader_desc.compile_time_args = std::move(reader_compile_time_args);
++        if (num_matrices > 1) {
++            reader_desc.defines = {{"ROWS_PER_MATRIX", std::to_string(output.padded_shape()[-2])}};
++        }
+         reader_desc.config = ReaderConfigDescriptor{};
+         return reader_desc;
+     };
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp
+@@ -131,19 +131,28 @@
+         uint32_t single_sub_block_size_row_arg = get_arg_val<uint32_t>(8);
+ 
+         for (uint32_t b = 0; b < single_block_size_col_arg; b++) {
++#ifdef ROWS_PER_MATRIX
++            // The rows stack the matrices of the leading dimensions, each padded to
++            // ROWS_PER_MATRIX rows, so a tile row lies within one matrix.
++            const uint32_t row_id = start_row_id % ROWS_PER_MATRIX;
++            const uint32_t matrix_start = (start_row_id / ROWS_PER_MATRIX) * total_num_rows;
++#else
++            const uint32_t row_id = start_row_id;
++            const uint32_t matrix_start = size_2d;
++#endif
+             uint32_t this_block_num_rows = tile_height;
+-            if (start_row_id + tile_height > total_num_rows) {
+-                this_block_num_rows = total_num_rows - start_row_id;
++            if (row_id + tile_height > total_num_rows) {
++                this_block_num_rows = total_num_rows - row_id;
+             }
+             if (this_block_num_rows > 0) {
+                 for (uint32_t m = 0; m < width_size; m += sub_block_width_size) {
+                     uint32_t start_column_id_u = start_column_id + m;
+                     read_block(
+                         this_block_num_rows,
+-                        start_row_id,
++                        row_id,
+                         start_column_id_u,
+                         sub_block_width_size,
+-                        size_2d,
++                        matrix_start,
+                         single_sub_block_size_row_arg);
+                 }
+             }

@@ -1,0 +1,16 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+@@ -509,6 +509,12 @@
+     if (!hasLayoutChange(input, output)) {
+       return false;
+     }
++    // uint8 (un)tilizes on device too. A layout change with a typecast still
++    // runs on the other dtype, so this only keeps uint8 -> uint8 on device.
++    if (input.getDataType() == ttcore::DataType::UInt8 &&
++        output.getDataType() == ttcore::DataType::UInt8) {
++      return false;
++    }
+     return !isOnDeviceLayoutChangeSupportedForDataType(input.getDataType()) &&
+            !isOnDeviceLayoutChangeSupportedForDataType(output.getDataType());
+   }
