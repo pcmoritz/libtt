@@ -46,13 +46,13 @@ processes need:
 ```bash
 export LIBTT_TPU_COMPAT=1
 eval $(python -m torch.tpu.distributed | sed 's/^/export /')
-tt-smi -r
 torchrun --nproc_per_node=4 train.py
 ```
 
-Reset the chips before every such run: after one process per chip has run,
-even to a normal exit, the chips' ethernet cores don't come back up for the
-next run ("Timed out while waiting for active ethernet core").
+torch_tpu never destroys its client, so libtt closes the chips when the
+process exits. A process that crashes or is killed leaves their ethernet cores
+down, and the next run stops with "Timed out while waiting for active ethernet
+core" until the chips are reset with `tt-smi -r`.
 
 libtt reads the environment that torch_tpu gives each process: its chip
 (`TPU_VISIBLE_CHIPS`), its index (`CLOUD_TPU_TASK_ID`) and the addresses of all
