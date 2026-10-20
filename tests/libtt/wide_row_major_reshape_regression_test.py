@@ -3,7 +3,8 @@ rows in L1 unless both are 16-byte aligned. torch.distributed's object
 collectives flatten rows of pickled bytes that are neither aligned nor small
 enough (gather_object writes four 227,093-byte pickles into the rows of a
 buffer and flattens it), so such reshapes stream 16 KiB chunks of the
-destination rows instead.
+destination rows instead. So do aligned rows too wide to stage (791,000 int32
+values, 3.16 MB, as in a Qwen3-1.7B checkpoint plan).
 """
 
 import jax
@@ -13,7 +14,7 @@ import pytest
 
 
 @pytest.mark.parametrize(
-    "width,dtype", [(227_093, np.uint8), (227_093, np.int32), (1_000_003, np.int32)]
+    "width,dtype", [(227_093, np.uint8), (227_093, np.int32), (1_000_003, np.int32), (791_000, np.int32)]
 )
 def test_flatten_written_rows(width, dtype):
     rng = np.random.default_rng(0)
