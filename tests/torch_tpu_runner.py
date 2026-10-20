@@ -11,6 +11,7 @@ JUnit XML are written to the test's undeclared outputs.
 
 import argparse
 import collections
+import fnmatch
 import importlib.util
 import os
 from pathlib import Path
@@ -94,6 +95,13 @@ def main() -> int:
         help="absl flag for the tests whose MODULE defines it; repeatable.",
     )
     parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="GLOB:NAME=VALUE",
+        help="Environment variable for the test files that match GLOB.",
+    )
+    parser.add_argument(
         "--exclude",
         action="append",
         default=[],
@@ -144,6 +152,11 @@ def main() -> int:
         name = re.sub(r"[^A-Za-z0-9_.-]", "_", target)
         log_path = out / f"{name}.log"
         file_env = dict(env, TEST_TMPDIR=str(tmp / name))
+        for item in args.env:
+            pattern, _, assignment = item.partition(":")
+            if fnmatch.fnmatch(target.split("::")[0], pattern):
+                variable, _, value = assignment.partition("=")
+                file_env[variable] = value
         Path(file_env["TEST_TMPDIR"]).mkdir(parents=True, exist_ok=True)
         command = [
             sys.executable,
