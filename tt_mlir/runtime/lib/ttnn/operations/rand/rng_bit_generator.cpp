@@ -19,7 +19,9 @@ void run(const ::tt::target::ttnn::RngBitGeneratorOp *op,
       ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(
           ::tt::runtime::ttnn::utils::getTensorRefMemoryConfig(op->out()));
   std::vector<::ttnn::Tensor> outputs = ::ttnn::experimental::rng_bits(
-      state, ::tt::runtime::ttnn::operations::utils::toTTNNShape(*op->size()),
+      state,
+      ::tt::runtime::ttnn::operations::utils::toTTNNShape(
+          *op->out()->desc()->shape()),
       op->philox() ? ::ttnn::experimental::RngAlgorithm::Philox
                    : ::ttnn::experimental::RngAlgorithm::Threefry,
       op->width(), outputMemoryConfig);

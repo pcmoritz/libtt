@@ -76,16 +76,15 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttml
 diff --git a/include/ttmlir/Target/TTNN/operations/rand.fbs b/include/ttmlir/Target/TTNN/operations/rand.fbs
 --- a/include/ttmlir/Target/TTNN/operations/rand.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/rand.fbs
-@@ -14,3 +14,14 @@ table RandOp {
+@@ -14,3 +14,13 @@ table RandOp {
    memcfg: tt.target.ttnn.MemoryConfig;
    out: tt.target.ttnn.TensorRef;
  }
 +
-+// ttnn::experimental::rng_bits: bits of shape `size` drawn from the state on
-+// the device (see ttir.rng_bit_generator).
++// ttnn::experimental::rng_bits: the bits of `out` drawn from the state on the
++// device (see ttir.rng_bit_generator).
 +table RngBitGeneratorOp {
 +  initial_state: tt.target.ttnn.TensorRef;
-+  size: [int64];
 +  philox: bool;
 +  width: uint32;
 +  output_state: tt.target.ttnn.TensorRef;
@@ -280,7 +279,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -3278,6 +3278,19 @@ createRandOp(FlatbufferObjectCache &cache, RandOp op) {
+@@ -3278,6 +3278,18 @@ createRandOp(FlatbufferObjectCache &cache, RandOp op) {
        seed, dtype, layout, memoryConfig, out);
  }
  
@@ -288,19 +287,18 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +createRngBitGeneratorOp(FlatbufferObjectCache &cache, RngBitGeneratorOp op) {
 +  auto state = cache.at<::tt::target::ttnn::TensorRef>(
 +      getOperandThroughDPSOps(op.getInitialState()));
-+  auto size = cache.fbb->CreateVector<int64_t>(op.getOutput().getType().getShape());
 +  auto outputState = cache.getOrCreateNoSharding(
 +      op.getOutputState(), tensorValueToFlatbuffer, /*local_shape*/ std::nullopt);
 +  auto out = cache.getOrCreateNoSharding(
 +      op.getOutput(), tensorValueToFlatbuffer, /*local_shape*/ std::nullopt);
 +  return ::tt::target::ttnn::CreateRngBitGeneratorOp(
-+      *cache.fbb, state, size, op.getPhilox(), op.getWidth(), outputState, out);
++      *cache.fbb, state, op.getPhilox(), op.getWidth(), outputState, out);
 +}
 +
  ::flatbuffers::Offset<::tt::target::ttnn::DropoutOp>
  createDropoutOp(FlatbufferObjectCache &cache, DropoutOp op) {
    auto in = cache.at<::tt::target::ttnn::TensorRef>(
-@@ -5554,6 +5567,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -5554,6 +5566,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createRandOp(cache, randOp), debugString,
                             locInfo);
    }

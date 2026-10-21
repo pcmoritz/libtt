@@ -9,7 +9,7 @@
 // Threefry runs one 32-lane vector at a time, all in registers. Philox works on
 // whole tiles in DST with the existing 32-bit multiply kernels (mul_int32 for
 // the low and mulhi_uint32 for the high half of the product), so it holds its
-// four words, the multiplier and both high halves in seven DST tiles.
+// four words, both multipliers and both high halves in eight DST tiles.
 
 #include <cstdint>
 
@@ -170,10 +170,11 @@ void kernel_main() {
             MATH((rng::threefry_tile<width>(0, base, W, rows_valid, w0, w0 ^ 0x1BD11BDA, w1)));
         } else {
             // DST tiles: the counter words x[0..3] (renamed each round), the
-            // multiplier, and the two products' high halves.
-            constexpr uint32_t kMultiplier = 4;
-            constexpr uint32_t kHigh0 = 5;
-            constexpr uint32_t kHigh1 = 6;
+            // multipliers, and the two products' high halves.
+            constexpr uint32_t kMultiplier0 = 4;
+            constexpr uint32_t kMultiplier1 = 5;
+            constexpr uint32_t kHigh0 = 6;
+            constexpr uint32_t kHigh1 = 7;
             uint32_t x[4] = {0, 1, 2, 3};
             MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>()));
             MATH((rng::index_tile(x[0], base, W)));
@@ -181,32 +182,26 @@ void kernel_main() {
             fill_tile_int<DataFormat::UInt32>(x[1], w1);
             fill_tile_int<DataFormat::UInt32>(x[2], w2);
             fill_tile_int<DataFormat::UInt32>(x[3], 0);
+            fill_tile_int<DataFormat::UInt32>(kMultiplier0, 0xD2511F53);
+            fill_tile_int<DataFormat::UInt32>(kMultiplier1, 0xCD9E8D57);
             uint32_t k0 = w0;
             uint32_t k1 = 0;
             for (uint32_t round = 0; round < 10; ++round) {
-                if (round > 0) {
-                    k0 += 0x9E3779B9;
-                    k1 += 0xBB67AE85;
-                }
                 // (x0, x1, x2, x3) = (hi(x2 * M1) ^ x1 ^ k0, lo(x2 * M1), hi(x0 * M0) ^ x3 ^ k1, lo(x0 * M0))
-                fill_tile_init();
-                fill_tile_int<DataFormat::UInt32>(kMultiplier, 0xD2511F53);
                 mulhi_uint32_tile_init();
-                mulhi_uint32_tile(x[0], kMultiplier, kHigh0);
+                mulhi_uint32_tile(x[0], kMultiplier0, kHigh0);
+                mulhi_uint32_tile(x[2], kMultiplier1, kHigh1);
                 mul_int_tile_init<DataFormat::UInt32>();
-                mul_int_tile<DataFormat::UInt32>(x[0], kMultiplier, x[0]);
-                fill_tile_init();
-                fill_tile_int<DataFormat::UInt32>(kMultiplier, 0xCD9E8D57);
-                mulhi_uint32_tile_init();
-                mulhi_uint32_tile(x[2], kMultiplier, kHigh1);
-                mul_int_tile_init<DataFormat::UInt32>();
-                mul_int_tile<DataFormat::UInt32>(x[2], kMultiplier, x[2]);
+                mul_int_tile<DataFormat::UInt32>(x[0], kMultiplier0, x[0]);
+                mul_int_tile<DataFormat::UInt32>(x[2], kMultiplier1, x[2]);
                 binary_bitwise_tile_init();
                 bitwise_xor_binary_tile<DataFormat::UInt32>(kHigh1, x[1], x[1]);
                 bitwise_xor_binary_tile<DataFormat::UInt32>(kHigh0, x[3], x[3]);
                 bitwise_xor_tile_init();
                 bitwise_xor_tile<DataFormat::UInt32>(x[1], k0);
                 bitwise_xor_tile<DataFormat::UInt32>(x[3], k1);
+                k0 += 0x9E3779B9;
+                k1 += 0xBB67AE85;
                 const uint32_t low0 = x[0];
                 x[0] = x[1];
                 x[1] = x[2];
