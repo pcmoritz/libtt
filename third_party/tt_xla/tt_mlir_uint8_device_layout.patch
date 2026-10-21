@@ -1,6 +1,19 @@
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+@@ -480,8 +480,10 @@
+     // device-capable, keeping the typecast on device too.
+     if (input.isTiled()) {
+       // Untilize on the output dtype (typecast first) when it can run on
+-      // device.
+-      if (isOnDeviceLayoutChangeSupportedForDataType(output.getDataType())) {
++      // device. UInt8 untilize is supported, and a TILE typecast is cheaper
++      // than a ROW_MAJOR typecast.
++      if (isOnDeviceLayoutChangeSupportedForDataType(output.getDataType()) ||
++          output.getDataType() == ttcore::DataType::UInt8) {
+         current = createTypecastOp(rewriter, current, output.getDataType());
+         return createLayoutStep(rewriter, current, output, padWorkaround);
+       }
 @@ -509,6 +509,12 @@
      if (!hasLayoutChange(input, output)) {
        return false;
