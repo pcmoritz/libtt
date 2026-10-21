@@ -1,0 +1,140 @@
+diff --git ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp
+@@ -100,8 +100,7 @@
+             if (!scalars.empty()) {
+                 scalars.back().end = i;
+             }
+-            // TODO: #27672: Truncation should be removed once we figure a root cause of regression without it
+-            scalars.push_back({i, std::bit_cast<uint16_t>(bfloat16::truncate(value)), i});
++            scalars.push_back({i, get_pool_value_bits(value, config.dtype), i});
+             first_scalar = false;
+         }
+         last_pool_area = static_cast<uint32_t>(pool_area);
+@@ -321,7 +320,7 @@
+         "as uint16_t",
+         max_in_nhw_per_core);
+ 
+-    const uint32_t bf16_scalar = get_bf16_pool_scalar(pool_type, kernel_h, kernel_w, divisor_override);
++    const uint32_t bf16_scalar = get_bf16_pool_scalar(pool_type, kernel_h, kernel_w, divisor_override, input.dtype());
+     const uint32_t bf16_init_value = get_bf16_pool_init_value(pool_type);
+     FactoryParameters params = get_factory_parameters(
+         num_shards_c,
+@@ -1193,7 +1192,8 @@
+             .pad_l = setup.pad_l,
+             .pad_r = setup.pad_r,
+             .max_out_nhw_per_core = max_out_nhw_per_core,
+-            .divisor_override = op_attr.divisor_override_};
++            .divisor_override = op_attr.divisor_override_,
++            .dtype = input.dtype()};
+         Tensor config_tensor = create_scalar_config_tensor(
+             avg_pool_config,
+             input.memory_config().memory_layout(),
+diff --git ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp
+--- ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp
++++ ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp
+@@ -27,7 +27,11 @@
+     // check the input tensor
+     TT_FATAL(input.storage_type() == StorageType::DEVICE, "Pool2D input must be on device!");
+     TT_FATAL(input.buffer() != nullptr, "Pool2D input must be allocated in buffers on device!");
+-    TT_FATAL(input.dtype() == DataType::BFLOAT16, "Only BFLOAT16 supported for now");
++    // Max pooling clears unused SrcA rows to -inf, which reads as NaN in SrcA's float16 format.
++    TT_FATAL(
++        input.dtype() == DataType::BFLOAT16 ||
++            (input.dtype() == DataType::FLOAT16 && pool_type == Pool2DType::AVG_POOL2D),
++        "Only BFLOAT16, and FLOAT16 average pooling, supported for now");
+     TT_FATAL(input.layout() == Layout::ROW_MAJOR, "Only ROW_MAJOR supported for now. Tracked by issue #23338");
+ 
+     TT_FATAL(input.memory_config().is_sharded(), "Input needs to be sharded");
+diff --git ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp
+--- ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp
++++ ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp
+@@ -149,8 +149,10 @@
+     bool is_out_tiled = output_layout == Layout::TILE;
+     bool is_in_tiled = input_tensor.layout() == ttnn::TILE_LAYOUT;
+     TT_FATAL(
+-        dtype == DataType::BFLOAT16 || dtype == DataType::BFLOAT8_B || dtype == DataType::BFLOAT4_B,
+-        "Currently only BFLOAT16, BFLOAT8_B, and BFLOAT4_B output data formats are supported");
++        dtype == DataType::BFLOAT16 || dtype == DataType::BFLOAT8_B || dtype == DataType::BFLOAT4_B ||
++            (dtype == DataType::FLOAT16 && input_tensor.dtype() == DataType::FLOAT16),
++        "Currently only BFLOAT16, BFLOAT8_B, and BFLOAT4_B output data formats, and FLOAT16 of FLOAT16 inputs, are "
++        "supported");
+     TT_FATAL(
+         !((dtype == DataType::BFLOAT8_B || dtype == DataType::BFLOAT4_B) && output_layout == Layout::ROW_MAJOR),
+         "BFLOAT8_B/BFLOAT4_B output data format is not supported with ROW_MAJOR layout");
+@@ -1067,7 +1069,9 @@
+         (kernel_size[0] == input_h && kernel_size[1] == input_w) &&
+         (padding_check[0] == 0 && padding_check[1] == 0 && padding_check[2] == 0 && padding_check[3] == 0) &&
+         (dilation_h == 1 && dilation_w == 1) && !applied_shard_scheme.has_value() && batch_divisible_for_fast_path &&
+-        block_float_tile_safe;
++        block_float_tile_safe &&
++        // The reduction of the fast path does not take FLOAT16; the pool kernel does.
++        input_tensor_4d.dtype() != DataType::FLOAT16;
+ 
+     if (is_global_pool && pool_type == Pool2DType::AVG_POOL2D) {
+         // Reduction needs interleaved input/output. The output is a tiny (1×1 spatial) tensor;
+diff --git ttnn/cpp/ttnn/operations/pool/pool_utils.cpp ttnn/cpp/ttnn/operations/pool/pool_utils.cpp
+--- ttnn/cpp/ttnn/operations/pool/pool_utils.cpp
++++ ttnn/cpp/ttnn/operations/pool/pool_utils.cpp
+@@ -11,11 +11,23 @@
+ 
+ #include "ttnn/operations/conv/conv2d/conv2d_utils.hpp"
+ namespace ttnn::operations::pool {
++uint16_t get_pool_value_bits(float value, DataType dtype) {
++    if (dtype == DataType::FLOAT16) {
++        return tt::tt_metal::float16(value).bits;
++    }
++    // TODO: #27672: Truncation should be removed once we figure a root cause of regression without it
++    return std::bit_cast<uint16_t>(bfloat16::truncate(value));
++}
++
+ // Return a single bf16 scalar for the pool type in u32 (packed in the least 16 bits)
+ // For the maxpool it is 1, for the avg pool it is 1/kernel_size or the divisor override used to initialize compile
+ // time argument sent to kernels. If there are multiple scalars needed call get_bf16_avg_pool_config_scalars
+ uint32_t get_bf16_pool_scalar(
+-    Pool2DType pool_type, uint32_t kernel_h, uint32_t kernel_w, std::optional<int32_t> divisor_override) {
++    Pool2DType pool_type,
++    uint32_t kernel_h,
++    uint32_t kernel_w,
++    std::optional<int32_t> divisor_override,
++    DataType dtype) {
+     float value;
+ 
+     switch (pool_type) {
+@@ -29,8 +41,7 @@
+             break;
+         default: TT_FATAL(false, "Unsupported pool operation type");
+     }
+-    // TODO: #27672: Truncation should be removed once we figure a root cause of regression without it
+-    return std::bit_cast<uint16_t>(bfloat16::truncate(value)) << 16;
++    return get_pool_value_bits(value, dtype) << 16;
+ }
+ 
+ // Return a single bf16 init value for the pool type in u32 (packed in the least 16 bits)
+diff --git ttnn/cpp/ttnn/operations/pool/pool_utils.hpp ttnn/cpp/ttnn/operations/pool/pool_utils.hpp
+--- ttnn/cpp/ttnn/operations/pool/pool_utils.hpp
++++ ttnn/cpp/ttnn/operations/pool/pool_utils.hpp
+@@ -39,6 +39,7 @@
+     uint32_t pad_r{};
+     uint32_t max_out_nhw_per_core{};
+     std::optional<int32_t> divisor_override;
++    DataType dtype = DataType::BFLOAT16;
+ };
+ 
+ struct FactoryParameters {
+@@ -128,8 +129,14 @@
+     uint32_t total() const { return local_cb_size + global_cb_size; }
+ };
+ 
++// The 16-bit encoding of a pool scalar in the input's format: float16 for FLOAT16 inputs, bfloat16 otherwise.
++uint16_t get_pool_value_bits(float value, DataType dtype);
+ uint32_t get_bf16_pool_scalar(
+-    Pool2DType pool_type, uint32_t kernel_h, uint32_t kernel_w, std::optional<int32_t> divisor_override);
++    Pool2DType pool_type,
++    uint32_t kernel_h,
++    uint32_t kernel_w,
++    std::optional<int32_t> divisor_override,
++    DataType dtype = DataType::BFLOAT16);
+ uint32_t get_bf16_pool_init_value(Pool2DType pool_type);
+ std::map<std::string, std::string> get_defines(Pool2DType pool_type);
+ 

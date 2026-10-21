@@ -1,0 +1,25 @@
+diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+--- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
++++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+@@ -44,6 +44,11 @@
+ bool requires_padding_change(const ttnn::Tensor& tensor, ttnn::Layout layout) {
+     if (layout == Layout::ROW_MAJOR) {
+         // There shouldn't be extra paddings for Row Major layout
+         return tensor.logical_shape() != tensor.padded_shape();
+     }
++    // Unaligned row-major shards need padded tilize, not a TILE TensorLayout
++    // constructed from their input shard spec.
++    if (!tt::tt_metal::can_shard_align(tensor.memory_config(), layout)) {
++        return true;
++    }
+     // It's okay for conversion to tile layout to preserve arbitrary padding as long as it satisfies the alignment
+@@ -216,5 +221,6 @@
+         if (layout == ttnn::TILE_LAYOUT) {
+-            if (tensor.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED) {
+-                // ttnn::tilize_with_val_padding doesn't support height sharded tensors
+-                // workaround by applying padding and then tilizing
++            if (tensor.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED &&
++                tt::tt_metal::can_shard_align(tensor.memory_config(), layout)) {
++                // Keep the existing path for aligned height shards. Unaligned shards
++                // need padded tilize so padding can cross shard boundaries.
+                 // Pad only the last two dims (height/width), sized to the tensor's rank.

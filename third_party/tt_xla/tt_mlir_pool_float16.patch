@@ -1,0 +1,118 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -2735,10 +2735,13 @@
+                          DefaultValuedAttr<BoolAttr, "true">:$count_include_pad,
+                          OptionalAttr<BoolAttr>:$config_tensors_in_dram);
+ 
+     let results = (outs AnyRankedTensor:$result);
+ 
+     let extraClassDeclaration = [{
+       wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+-        return wa::TTNNOperandsWorkaroundsFactory::createPool2DOpOperandsWorkarounds();
++        return wa::TTNNOperandsWorkaroundsFactory::createPool2DOpOperandsWorkarounds(
++            getInput().getType().getElementType().isF16()
++                ? ttcore::DataType::Float16
++                : ttcore::DataType::BFloat16);
+       }
+     }];
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -243,7 +243,9 @@
+ class TTNNOperandsWorkaroundsFactory {
+ public:
+   // Create workarounds for pooling 2d ops (max_pool2d, avg_pool2d) operands.
+-  static TTNNOperandsWorkarounds createPool2DOpOperandsWorkarounds();
++  static TTNNOperandsWorkarounds
++  createPool2DOpOperandsWorkarounds(
++      ttcore::DataType dataType = ttcore::DataType::BFloat16);
+ 
+   // Create workarounds for pooling 2d with indices op operands.
+   static TTNNOperandsWorkarounds createPool2DWithIndicesOpOperandsWorkarounds();
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -4552,8 +4552,15 @@
+     for (int64_t element : kernel) {
+       kernelSize *= element;
+     }
+-    int64_t divisor =
+-        constantOp.getValueAttr().getSplatValue<llvm::APInt>().getZExtValue();
++    // Average pooling divides a float sum by a float constant.
++    mlir::Attribute value =
++        constantOp.getValueAttr().getSplatValue<mlir::Attribute>();
++    double divisor = 0;
++    if (auto floatValue = mlir::dyn_cast<mlir::FloatAttr>(value)) {
++      divisor = floatValue.getValueAsDouble();
++    } else if (auto intValue = mlir::dyn_cast<mlir::IntegerAttr>(value)) {
++      divisor = intValue.getValue().getZExtValue();
++    }
+     if (divisor == kernelSize) {
+       return divOp;
+     }
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -91,18 +91,16 @@
+ // input in both row-major and tile layout, but the output of the operation is
+ // strictly in row-major layout. In order to keep the output consistent with the
+ // input, the row-major workaround is applied to both the input and output
+-// operands. The input and output operands are expected to use the bf16 data
+-// type, so the bf16 workaround is applied to both the input and output
+-// operands.
+-TTNNOperandsWorkarounds
+-TTNNOperandsWorkaroundsFactory::createPool2DOpOperandsWorkarounds() {
+-  wa::TTNNOperandWorkarounds rowMajorLayoutBF16Workaround;
+-  rowMajorLayoutBF16Workaround.tensorLayoutWorkaround = Layout::RowMajor;
+-  rowMajorLayoutBF16Workaround.tensorDataTypeWorkaround =
+-      ttcore::DataType::BFloat16;
++// operands. Both use the computation dtype selected by the pooling op.
++TTNNOperandsWorkarounds
++TTNNOperandsWorkaroundsFactory::createPool2DOpOperandsWorkarounds(
++    ttcore::DataType dataType) {
++  wa::TTNNOperandWorkarounds workaround;
++  workaround.tensorLayoutWorkaround = Layout::RowMajor;
++  workaround.tensorDataTypeWorkaround = dataType;
+   return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+-      .addInputOperandWorkaround(rowMajorLayoutBF16Workaround)
+-      .addOutputOperandWorkaround(rowMajorLayoutBF16Workaround);
++      .addInputOperandWorkaround(workaround)
++      .addOutputOperandWorkaround(workaround);
+ }
+ 
+ // Factory method to create a set of workarounds for 2d max pooling with
+diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
+--- a/lib/OpModel/TTNN/TTNNOpModel.cpp
++++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
+@@ -7065,7 +7065,7 @@
+         std::nullopt /* dram_slice_config */,
+         std::nullopt /* applied_shard_scheme */, computeKernelConfig,
+         false /* deallocate_input */, reallocateHaloOutput,
+-        ::ttnn::DataType::BFLOAT16, ::ttnn::Layout::ROW_MAJOR,
++        inputSpec.data_type(), ::ttnn::Layout::ROW_MAJOR,
+         configTensorsInDram.value_or(false) /* config_tensors_in_dram */);
+   };
+ 
+@@ -7118,7 +7118,7 @@
+         std::nullopt /* dram_slice_config */,
+         std::nullopt /* applied_shard_scheme */, computeKernelConfig,
+         false /* deallocate_input */, reallocateHaloOutput,
+-        ::ttnn::DataType::BFLOAT16, ::ttnn::Layout::ROW_MAJOR,
++        inputSpec.data_type(), ::ttnn::Layout::ROW_MAJOR,
+         configTensorsInDram.value_or(false) /* config_tensors_in_dram */);
+   };
+ 
+diff --git a/runtime/lib/ttnn/operations/pool/pool2d.cpp b/runtime/lib/ttnn/operations/pool/pool2d.cpp
+--- a/runtime/lib/ttnn/operations/pool/pool2d.cpp
++++ b/runtime/lib/ttnn/operations/pool/pool2d.cpp
+@@ -74,7 +74,8 @@
+              computeKernelConfig,
+              /*deallocate_input=*/false,
+              /*reallocate_halo_output=*/op->reallocate_halo_output(),
+-             ::ttnn::DataType::BFLOAT16, ::ttnn::Layout::ROW_MAJOR,
++             ::tt::runtime::ttnn::operations::utils::getDataType(op->out()),
++             ::ttnn::Layout::ROW_MAJOR,
+              /*config_tensor_in_dram=*/op->config_tensors_in_dram());
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
