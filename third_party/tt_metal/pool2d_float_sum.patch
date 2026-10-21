@@ -1,0 +1,356 @@
+diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/compute_sum_pool_2d.cpp b/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/compute_sum_pool_2d.cpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/compute_sum_pool_2d.cpp
+@@ -0,0 +1,44 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++#include "api/compute/tile_move_copy.h"
++#include "api/compute/eltwise_binary_sfpu.h"
++#include "api/compute/eltwise_unary/typecast.h"
++#include "api/compute/eltwise_unary/eltwise_unary.h"
++#include "api/dataflow/dataflow_buffer.h"
++
++void kernel_main() {
++    constexpr uint32_t window = get_compile_time_arg_val(0), channels = get_compile_time_arg_val(1);
++    constexpr bool fp16 = get_compile_time_arg_val(2);
++    constexpr uint32_t tile_rows = channels <= 16 ? 64 : 32;
++    const uint32_t count = get_arg_val<uint32_t>(0);
++    DataflowBuffer input(0), output(16);
++    init_sfpu(0, 16);
++    for (uint32_t block = 0; block < (count + tile_rows - 1) / tile_rows * ((channels + 31) / 32); ++block) {
++        tile_regs_acquire();
++        for (uint32_t k = 0; k < window; ++k) {
++            input.wait_front(1);
++            const uint32_t dst = k == 0 ? 0 : 1;
++            copy_tile(0, 0, dst);
++            if constexpr (fp16) {
++                typecast_tile_init<(uint32_t)DataFormat::Float16, (uint32_t)DataFormat::Float32>();
++                typecast_tile<(uint32_t)DataFormat::Float16, (uint32_t)DataFormat::Float32>(dst);
++            }
++            if (k != 0) {
++                add_binary_tile_init();
++                add_binary_tile(0, 1, 0);
++            }
++            input.pop_front(1);
++        }
++        if constexpr (fp16) {
++            typecast_tile_init<(uint32_t)DataFormat::Float32, (uint32_t)DataFormat::Float16>();
++            typecast_tile<(uint32_t)DataFormat::Float32, (uint32_t)DataFormat::Float16>(0);
++        }
++        tile_regs_commit();
++        output.reserve_back(1);
++        tile_regs_wait();
++        pack_tile(0, 16);
++        tile_regs_release();
++        output.push_back(1);
++    }
++}
+diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reader_sum_pool_2d.cpp b/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reader_sum_pool_2d.cpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reader_sum_pool_2d.cpp
+@@ -0,0 +1,80 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++#include "api/dataflow/dataflow_api.h"
++#include "ttnn/cpp/ttnn/operations/pool/device/kernels/pool_kernels_common.hpp"
++
++void kernel_main() {
++    constexpr uint32_t kh = get_compile_time_arg_val(0), kw = get_compile_time_arg_val(1);
++    constexpr uint32_t stride = get_compile_time_arg_val(2);
++    constexpr uint32_t dh = get_compile_time_arg_val(3), dw = get_compile_time_arg_val(4);
++    constexpr uint32_t padded_w = get_compile_time_arg_val(5);
++    constexpr uint32_t in_c = get_compile_time_arg_val(6), out_c = get_compile_time_arg_val(7);
++    constexpr uint32_t bytes = get_compile_time_arg_val(8);
++    // SFPU addition is elementwise: fill all four faces even with only 16 channels.
++    constexpr uint32_t tile_channels = out_c <= 16 ? 16 : 32;
++    constexpr uint32_t tile_rows = 1024 / tile_channels;
++    constexpr bool indices_in_dram = get_compile_time_arg_val(9);
++    constexpr uint32_t indices_addr = get_compile_time_arg_val(10), indices_page = get_compile_time_arg_val(11);
++    const uint32_t count = get_arg_val<uint32_t>(0), nhw_core = get_arg_val<uint32_t>(1);
++    DataflowBuffer staged(0), input(1), output(2), indices(3), result(16);
++    Noc noc;
++    if constexpr (indices_in_dram) {
++        load_config_tensor_if_in_dram<indices_addr, indices_page, 12, 3>(noc, indices, nhw_core);
++    }
++    auto config = reinterpret_cast<volatile tt_l1_ptr uint32_t *>(indices.get_read_ptr());
++    // Config word 0 is the segment count; each following word packs inclusive uint16 start/end indices.
++    uint32_t segment = 1, next = 0, end = 0;
++    bool new_segment = true;
++    uint32_t origins[tile_rows];
++    for (uint32_t base = 0; base < count; base += tile_rows) {
++        const uint32_t rows = std::min<uint32_t>(tile_rows, count - base);
++        for (uint32_t row = 0; row < rows; ++row) {
++            if (new_segment || next > end) {
++                const uint32_t packed = config[segment++];
++                next = packed & 0xffff;
++                end = packed >> 16;
++                new_segment = false;
++            }
++            origins[row] = next;
++            next += stride;
++        }
++        for (uint32_t channel = 0; channel < out_c; channel += tile_channels) {
++            for (uint32_t h = 0; h < kh; ++h) {
++                for (uint32_t w = 0; w < kw; ++w) {
++                    staged.reserve_back(1);
++                    if (rows < tile_rows || channel + tile_channels > in_c) {
++                        noc.async_write_zeros(staged, 1024 * bytes);
++                        noc.write_zeros_l1_barrier();
++                    }
++                    for (uint32_t row = 0; row < rows; ++row) {
++                        const uint32_t origin = origins[row] + h * dh * padded_w + w * dw;
++                        for (uint32_t half = 0; half < tile_channels / 16 && channel + half * 16 < in_c; ++half) {
++                            const uint32_t width = std::min<uint32_t>(16u, in_c - channel - half * 16);
++                            // Four 16x16 faces, with spatial outputs in rows and channels in columns.
++                            const uint32_t dst = ((row / 16) * tile_channels * 16 + half * 256 + (row % 16) * 16) * bytes;
++                            const uint32_t src = input.get_read_ptr() + (origin * in_c + channel + half * 16) * bytes;
++                            noc.async_read(UnicastEndpoint(), staged, width * bytes, experimental::local_addr(src),
++                                           {.offset_bytes = dst});
++                        }
++                    }
++                    noc.async_read_barrier();
++                    staged.push_back(1);
++                }
++            }
++            result.wait_front(1);
++            for (uint32_t row = 0; row < rows; ++row) {
++                for (uint32_t half = 0; half < tile_channels / 16 && channel + half * 16 < out_c; ++half) {
++                    const uint32_t width = std::min<uint32_t>(16u, out_c - channel - half * 16);
++                    const uint32_t src =
++                        result.get_read_ptr() + ((row / 16) * tile_channels * 16 + half * 256 + (row % 16) * 16) * bytes;
++                    const uint32_t dst = ((base + row) * out_c + channel + half * 16) * bytes;
++                    noc.async_read(UnicastEndpoint(), output, width * bytes, experimental::local_addr(src),
++                                   {.offset_bytes = dst});
++                }
++            }
++            noc.async_read_barrier();
++            result.pop_front(1);
++        }
++    }
++}
+diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp b/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp
+@@ -260,6 +260,72 @@
+     }
+ 
+     return starting_indices;
++}
++
++// Gather directly into tiles and add on the SFPU. No BF16/TF32 conversion or reciprocal is involved.
++static tt::tt_metal::ProgramDescriptor sum_pool_program(const Tensor &input, tt::tt_metal::Buffer *indices,
++                                                        Tensor &output, uint32_t kernel_h, uint32_t kernel_w,
++                                                        uint32_t stride_w, uint32_t dilation_h, uint32_t dilation_w,
++                                                        uint32_t padded_w, uint32_t total_outputs,
++                                                        bool indices_in_dram) {
++    using namespace tt::tt_metal;
++    const auto grid = input.shard_spec()->grid;
++    const auto in_shape = input.shard_spec()->shape;
++    const auto out_shape = output.shard_spec()->shape;
++    const bool fp16 = input.dtype() == DataType::FLOAT16;
++    // Load FP16 bits unchanged; convert in SFPU registers to avoid the FPU input precision limit.
++    const auto format = fp16 ? tt::DataFormat::UInt16 : tt::DataFormat::Float32;
++    const uint32_t bytes = fp16 ? 2 : 4;
++    const uint32_t tile_bytes = 1024 * bytes;
++    ProgramDescriptor desc;
++    auto cb = [&](uint8_t id, uint32_t page, uint32_t count, tt::DataFormat df, Buffer *buffer = nullptr) {
++        desc.cbs.push_back(CBDescriptor{
++            .total_size = page * count,
++            .core_ranges = grid,
++            .format_descriptors = {{CBFormatDescriptor{.buffer_index = id, .data_format = df, .page_size = page}}},
++            .buffer = buffer});
++    };
++    cb(0, tile_bytes, 2, format);
++    cb(16, tile_bytes, 2, format);
++    cb(1, in_shape[1] * bytes, in_shape[0], format, input.buffer());
++    cb(2, out_shape[1] * bytes, out_shape[0], format, output.buffer());
++    cb(3, indices->page_size(), 1, tt::DataFormat::UInt16, indices_in_dram ? nullptr : indices);
++    KernelDescriptor reader;
++    reader.kernel_source = "ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reader_sum_pool_2d.cpp";
++    reader.source_type = KernelDescriptor::SourceType::FILE_PATH;
++    reader.core_ranges = grid;
++    reader.compile_time_args = {kernel_h,   kernel_w,        stride_w,           dilation_h,
++                                dilation_w, padded_w,        in_shape[1],        out_shape[1],
++                                bytes,      indices_in_dram, indices->address(), indices->page_size()};
++    TensorAccessorArgs(indices).append_to(reader.compile_time_args);
++    reader.config =
++        DataMovementConfigDescriptor{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default};
++    KernelDescriptor compute;
++    compute.kernel_source = "ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/compute_sum_pool_2d.cpp";
++    compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
++    compute.core_ranges = grid;
++    compute.compile_time_args = {kernel_h * kernel_w, out_shape[1], fp16};
++    std::vector<UnpackToDestMode> unpack_modes(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
++    if (!fp16) {
++        unpack_modes[0] = UnpackToDestMode::UnpackToDestFp32;
++    }
++    auto compute_config = ComputeConfigDescriptor{
++        .math_fidelity = MathFidelity::HiFi4, .fp32_dest_acc_en = true, .math_approx_mode = false};
++    compute_config.unpack_to_dest_mode = unpack_modes;
++    compute.config = std::move(compute_config);
++    const bool block = input.memory_config().memory_layout() == TensorMemoryLayout::BLOCK_SHARDED;
++    const bool width = input.memory_config().memory_layout() == TensorMemoryLayout::WIDTH_SHARDED;
++    const uint32_t cores_x = grid.bounding_box().grid_size().x;
++    for (uint32_t i = 0; i < grid.num_cores(); ++i) {
++        const CoreCoord core(i % cores_x, i / cores_x);
++        const uint32_t nhw_core = width ? 0 : block ? i / cores_x : i;
++        const uint32_t start = nhw_core * out_shape[0];
++        const uint32_t count = start < total_outputs ? std::min(out_shape[0], total_outputs - start) : 0;
++        reader.runtime_args.emplace_back(core, KernelDescriptor::CoreRuntimeArgs{count, nhw_core});
++        compute.runtime_args.emplace_back(core, KernelDescriptor::CoreRuntimeArgs{count});
++    }
++    desc.kernels = {std::move(reader), std::move(compute)};
++    return desc;
+ }
+ 
+ static tt::tt_metal::ProgramDescriptor pool2d_multi_core_sharded_with_halo_v2_impl_new(
+@@ -320,6 +386,12 @@
+         "Input nhw per core {} exceeds uint16_t limit, this will cause overflow because the reader indices are stored "
+         "as uint16_t",
+         max_in_nhw_per_core);
++
++    if (input.dtype() == DataType::FLOAT32 || input.dtype() == DataType::FLOAT16) {
++        return sum_pool_program(input, reader_indices_buffer, outputs[0], kernel_h, kernel_w, stride_w, dilation_h,
++                                dilation_w, in_w + pad_l + pad_r + ceil_pad_w, in_n * out_h * out_w,
++                                config_tensor_in_dram);
++    }
+ 
+     const uint32_t bf16_scalar = get_bf16_pool_scalar(pool_type, kernel_h, kernel_w, divisor_override);
+     const uint32_t bf16_init_value = get_bf16_pool_init_value(pool_type);
+diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp b/ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp
+--- ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp
++++ ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp
+@@ -21,13 +21,16 @@
+     const Pool2DType pool_type,
+     const sliding_window::SlidingWindowConfig& sliding_window_config,
+     const MemoryConfig& out_mem_config,
+-    const std::optional<const int32_t> /*divisor_override*/,
++    const std::optional<const int32_t> divisor_override,
+     const bool return_indices,
+     const Layout& output_layout) {
+     // check the input tensor
+     TT_FATAL(input.storage_type() == StorageType::DEVICE, "Pool2D input must be on device!");
+     TT_FATAL(input.buffer() != nullptr, "Pool2D input must be allocated in buffers on device!");
+-    TT_FATAL(input.dtype() == DataType::BFLOAT16, "Only BFLOAT16 supported for now");
++    TT_FATAL(input.dtype() == DataType::BFLOAT16 ||
++                 ((input.dtype() == DataType::FLOAT32 || input.dtype() == DataType::FLOAT16) &&
++                  pool_type == Pool2DType::AVG_POOL2D && divisor_override == 1 && output_layout == Layout::ROW_MAJOR),
++             "FLOAT32/FLOAT16 pooling requires divisor_override=1 and ROW_MAJOR output");
+     TT_FATAL(input.layout() == Layout::ROW_MAJOR, "Only ROW_MAJOR supported for now. Tracked by issue #23338");
+ 
+     TT_FATAL(input.memory_config().is_sharded(), "Input needs to be sharded");
+@@ -66,6 +69,9 @@
+ // Validation is the same for both cache hit and miss
+ static void validate_pool2d_operation(
+     const Pool2D::operation_attributes_t& op_attr, const Pool2D::tensor_args_t& tensor) {
++    if (tensor.input_tensor_.dtype() == DataType::FLOAT32 || tensor.input_tensor_.dtype() == DataType::FLOAT16) {
++        TT_FATAL(op_attr.output_dtype_ == tensor.input_tensor_.dtype(), "Sum pooling preserves the input dtype");
++    }
+     validate_pool2d(
+         tensor.input_tensor_,
+         op_attr.pool_type_,
+diff --git a/ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp b/ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp
+--- ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp
++++ ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp
+@@ -148,9 +148,9 @@
+     std::array<uint32_t, 4> padding_4d = sliding_window::get_pair_n4_padding(padding);
+     bool is_out_tiled = output_layout == Layout::TILE;
+     bool is_in_tiled = input_tensor.layout() == ttnn::TILE_LAYOUT;
+-    TT_FATAL(
+-        dtype == DataType::BFLOAT16 || dtype == DataType::BFLOAT8_B || dtype == DataType::BFLOAT4_B,
+-        "Currently only BFLOAT16, BFLOAT8_B, and BFLOAT4_B output data formats are supported");
++    TT_FATAL(dtype == DataType::BFLOAT16 || dtype == DataType::BFLOAT8_B || dtype == DataType::BFLOAT4_B ||
++                 ((dtype == DataType::FLOAT32 || dtype == DataType::FLOAT16) && dtype == input_tensor.dtype()),
++             "Unsupported pooling output dtype");
+     TT_FATAL(
+         !((dtype == DataType::BFLOAT8_B || dtype == DataType::BFLOAT4_B) && output_layout == Layout::ROW_MAJOR),
+         "BFLOAT8_B/BFLOAT4_B output data format is not supported with ROW_MAJOR layout");
+@@ -1067,7 +1067,8 @@
+         (kernel_size[0] == input_h && kernel_size[1] == input_w) &&
+         (padding_check[0] == 0 && padding_check[1] == 0 && padding_check[2] == 0 && padding_check[3] == 0) &&
+         (dilation_h == 1 && dilation_w == 1) && !applied_shard_scheme.has_value() && batch_divisible_for_fast_path &&
+-        block_float_tile_safe;
++        block_float_tile_safe && input_tensor_4d.dtype() != DataType::FLOAT32 &&
++        input_tensor_4d.dtype() != DataType::FLOAT16;
+ 
+     if (is_global_pool && pool_type == Pool2DType::AVG_POOL2D) {
+         // Reduction needs interleaved input/output. The output is a tiny (1×1 spatial) tensor;
+@@ -1291,7 +1292,8 @@
+     bool reallocate_halo_output,
+     const DataType dtype,
+     const Layout output_layout,
+-    bool config_tensor_in_dram) {
++    bool config_tensor_in_dram,
++    std::array<uint32_t, 2> dilation) {
+     auto result = pool2d(
+         input_tensor,
+         Pool2DType::AVG_POOL2D,
+@@ -1302,7 +1304,7 @@
+         kernel_size,
+         stride,
+         padding,
+-        std::nullopt,  // dilation
++        dilation,
+         ceil_mode,
+         count_include_pad,
+         divisor_override,
+diff --git a/ttnn/cpp/ttnn/operations/pool/generic/generic_pools.hpp b/ttnn/cpp/ttnn/operations/pool/generic/generic_pools.hpp
+--- ttnn/cpp/ttnn/operations/pool/generic/generic_pools.hpp
++++ ttnn/cpp/ttnn/operations/pool/generic/generic_pools.hpp
+@@ -62,7 +62,8 @@
+     bool reallocate_halo_output = true,
+     DataType dtype = DataType::BFLOAT16,
+     Layout output_layout = Layout::ROW_MAJOR,
+-    bool config_tensor_in_dram = false);
++    bool config_tensor_in_dram = false,
++    std::array<uint32_t, 2> dilation = {1, 1});
+ 
+ }  // namespace ttnn::operations::pool
+ 
+diff --git a/ttnn/cpp/ttnn/operations/pool/pool_utils.cpp b/ttnn/cpp/ttnn/operations/pool/pool_utils.cpp
+--- ttnn/cpp/ttnn/operations/pool/pool_utils.cpp
++++ ttnn/cpp/ttnn/operations/pool/pool_utils.cpp
+@@ -221,6 +221,7 @@
+     if (has_split_reader) {
+         total += in_cb_pagesize * in_cb_npages;
+     }
++    total += sum_pool_cb_size;
+     total += mpwi_total_size;
+     total += pre_tilize_cb_pagesize * pre_tilize_cb_npages;
+     total += config_tensor_l1_size;
+@@ -249,6 +250,18 @@
+     std::optional<uint32_t> scalar_config_actual_page_size) {
+     PoolCBSizes sizes;
+     const bool is_output_tiled = output_layout == Layout::TILE;
++
++    if (params.is_avg_pool &&
++        (params.data_format == tt::DataFormat::Float32 || params.data_format == tt::DataFormat::Float16)) {
++        sizes.sum_pool_cb_size = 4 * tt::tile_size(params.data_format);
++        sizes.out_cb_pagesize = output_shard_shape[1] * params.nbytes;
++        sizes.out_cb_npages = output_shard_shape[0];
++        if (config_tensor_in_dram) {
++            sizes.config_tensor_l1_size =
++                reader_indices_actual_page_size.value_or((output_shard_shape[0] * 3 * sizeof(uint16_t)) + 2);
++        }
++        return sizes;
++    }
+ 
+     // Scalar CB (coefficient of reduce)
+     sizes.scalar_cb_pagesize = tt::tile_size(params.data_format);
+diff --git a/ttnn/cpp/ttnn/operations/pool/pool_utils.hpp b/ttnn/cpp/ttnn/operations/pool/pool_utils.hpp
+--- ttnn/cpp/ttnn/operations/pool/pool_utils.hpp
++++ ttnn/cpp/ttnn/operations/pool/pool_utils.hpp
+@@ -81,6 +81,9 @@
+     uint32_t in_cb_raw_size{};  // raw element count before padding (used by factory for in_nblocks_c)
+     bool has_split_reader{};
+ 
++    // Accurate sum pooling stages two input and two result tiles.
++    uint32_t sum_pool_cb_size{};
++
+     // MPWI CBs (return_indices only)
+     uint32_t mpwi_total_size{};
+ 

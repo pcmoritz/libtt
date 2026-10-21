@@ -1,0 +1,533 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -4457,6 +4457,8 @@
+     - `ceil_mode` (Boolean): When true, uses ceil instead of floor for output shape calculation.
+     - `count_include_pad` (Boolean): When true, include padding in the average calculation (default: True)
+ 
++    `divisor_override = 0` uses the usual average divisor; `1` computes a window sum.
++
+     Output:
+     - `result` (Tensor): Output tensor after average pooling.
+   }];
+@@ -4468,7 +4470,8 @@
+                        AnyAttrOf<[I32Attr, DenseI32ArrayAttr]>:$padding,
+                        BoolAttr:$ceil_mode,
+                        DefaultValuedAttr<BoolAttr, "true">:$count_include_pad,
+-                       DefaultValuedAttr<TTIR_FlattenedCompatInfoAttr, "nullptr">:$flattened_compat_info);
++                       DefaultValuedAttr<TTIR_FlattenedCompatInfoAttr, "nullptr">:$flattened_compat_info,
++                       DefaultValuedAttr<I32Attr, "0">:$divisor_override);
+ 
+   let results = (outs AnyRankedTensor:$result);
+ 
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -2705,6 +2705,8 @@
+   let description = [{
+     It is a downsampling operation to reduce the spatial dimensions (height and width) of a input tensor by computing averages with in a window.
+ 
++    `divisor_override = 0` uses the usual average divisor; `1` computes a window sum.
++
+     Example:
+       // 3x3 input tensor
+       input: [[1, 2, 3],
+@@ -2733,13 +2735,20 @@
+                          BoolAttr:$ceil_mode,
+                          DefaultValuedAttr<BoolAttr, "true">:$reallocate_halo_output,
+                          DefaultValuedAttr<BoolAttr, "true">:$count_include_pad,
+-                         OptionalAttr<BoolAttr>:$config_tensors_in_dram);
++                         OptionalAttr<BoolAttr>:$config_tensors_in_dram,
++                         DefaultValuedAttr<I32Attr, "0">:$divisor_override);
+ 
+     let results = (outs AnyRankedTensor:$result);
+ 
+     let extraClassDeclaration = [{
+       wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+-        return wa::TTNNOperandsWorkaroundsFactory::createPool2DOpOperandsWorkarounds();
++        auto elementType = getInput().getType().getElementType();
++        auto dtype = getDivisorOverride() == 1 && elementType.isF32()
++                         ? ttcore::DataType::Float32
++                     : getDivisorOverride() == 1 && elementType.isF16()
++                         ? ttcore::DataType::Float16
++                         : ttcore::DataType::BFloat16;
++        return wa::TTNNOperandsWorkaroundsFactory::createPool2DOpOperandsWorkarounds(dtype);
+       }
+     }];
+ 
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -243,7 +243,8 @@
+ class TTNNOperandsWorkaroundsFactory {
+ public:
+   // Create workarounds for pooling 2d ops (max_pool2d, avg_pool2d) operands.
+-  static TTNNOperandsWorkarounds createPool2DOpOperandsWorkarounds();
++  static TTNNOperandsWorkarounds createPool2DOpOperandsWorkarounds(
++      ttcore::DataType dataType = ttcore::DataType::BFloat16);
+ 
+   // Create workarounds for pooling 2d with indices op operands.
+   static TTNNOperandsWorkarounds createPool2DWithIndicesOpOperandsWorkarounds();
+diff --git a/include/ttmlir/OpModel/TTNN/TTNNOpModel.h b/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
+--- a/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
++++ b/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
+@@ -1752,7 +1752,7 @@
+       llvm::ArrayRef<int32_t> stride, llvm::ArrayRef<int32_t> padding,
+       llvm::ArrayRef<int32_t> dilation, bool ceilMode,
+       bool reallocateHaloOutput, std::optional<bool> configTensorsInDram,
+-      TTNNLayoutAttr outputLayout,
++      int32_t divisorOverrideValue, TTNNLayoutAttr outputLayout,
+       const MockAllocatorState *initialState = nullptr);
+ 
+   static llvm::Expected<size_t>
+@@ -1763,7 +1763,7 @@
+                llvm::ArrayRef<int32_t> dilation, bool ceilMode,
+                bool reallocateHaloOutput,
+                std::optional<bool> configTensorsInDram,
+-               TTNNLayoutAttr outputLayout);
++               int32_t divisorOverrideValue, TTNNLayoutAttr outputLayout);
+ };
+ 
+ //===----------------------------------------------------------------------===//
+diff --git a/include/ttmlir/Target/TTNN/operations/pool.fbs b/include/ttmlir/Target/TTNN/operations/pool.fbs
+--- a/include/ttmlir/Target/TTNN/operations/pool.fbs
++++ b/include/ttmlir/Target/TTNN/operations/pool.fbs
+@@ -10,6 +10,7 @@
+ 
+ table AvgPool2dExtraParams {
+   count_include_pad: bool;
++  divisor_override: int32 = 0;
+ }
+ 
+ table MaxPool2dExtraParams {}
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -3677,8 +3677,8 @@
+       }
+     }
+ 
+-    // Handle 5D input with three non-trivial window dimensions (3D max
+-    // pooling) by decomposing it into two 2D max pool passes. A rank-5 input
++    // Handle 5D input with three non-trivial window dimensions (3D
++    // pooling) by decomposing it into two 2D pooling passes. A rank-5 input
+     // with at most two active dimensions is normalized to rank 4 below.
+     if (inputRank == 5 &&
+         indicesOfValuesGreaterThanOne(windowDimensions.asArrayRef()).size() ==
+@@ -3814,6 +3814,16 @@
+         result = rewriter.create<ttir::NegOp>(srcOp.getLoc(), resultType,
+                                                result);
+       } else if (isa<mlir::stablehlo::AddOp>(reductionOp) && initVal == ZERO) {
++        if (inputType.getElementType().isF32() ||
++            inputType.getElementType().isF16()) {
++          auto pool = rewriter.create<ttir::AvgPool2dOp>(
++              srcOp.getLoc(), resultType, input, kernelForTTIROps,
++              strideForTTIROps, dilationForTTIROps, paddingForTTIROps, ceilMode,
++              countIncludesPad);
++          pool->setAttr("divisor_override", rewriter.getI32IntegerAttr(1));
++          resultVals.push_back(restoreOriginalLayout(pool.getResult()));
++          continue;
++        }
+         // Special case of sum pooling followed by a convenient div op.
+         // TODO(acicovic): Check why was i == 0 originally added as a condition.
+         std::optional<mlir::Operation *> divOp = extractDivisor(srcOp);
+@@ -3860,11 +3870,11 @@
+   }
+ 
+ private:
+-  // Decompose a 5D reduce_window (3D pooling) into two sequential 2D max pool
++  // Decompose a 5D reduce_window (3D pooling) into two sequential 2D pool
+   // operations. The 3D pooling window [kD, kH, kW] is factored as:
+-  //   Pass 1: Permute to [N,D,H,W,C], reshape to [N*D,H,W,C], MaxPool2d [kH,kW]
+-  //   Pass 2: Reshape to [N,D,Hout*Wout,C], MaxPool2d [kD,1]
+-  // This is valid because max is associative: max(d,h,w) = max_d(max(h,w)).
++  //   Pass 1: Permute to [N,D,H,W,C], reshape to [N*D,H,W,C], pool [kH,kW]
++  //   Pass 2: Reshape to [N,D,Hout*Wout,C], pool [kD,1]
++  // Max and sum can both be factored across the spatial dimensions.
+   LogicalResult
+   lowerReduceWindow5D(mlir::stablehlo::ReduceWindowOp srcOp,
+                       mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
+@@ -3876,6 +3886,7 @@
+                       DenseI64ArrayAttr windowDilations,
+                       DenseI64ArrayAttr padding, BoolAttr ceilMode) const {
+     using TypicalInitReductionValue::NEG_INF;
++    using TypicalInitReductionValue::ZERO;
+ 
+     // Identify spatial dimensions (window_dim > 1). Expect exactly 3 for 5D.
+     SmallVector<size_t> spatialDims =
+@@ -3885,12 +3896,16 @@
+           srcOp, "5D reduce_window requires exactly 3 spatial dimensions.");
+     }
+ 
+-    // Only max pooling is supported for 5D decomposition.
+     for (size_t i = 0; i < reductionOps.size(); ++i) {
+-      if (!isa<mlir::stablehlo::MaxOp>(reductionOps[i]) ||
+-          initValues[i] != NEG_INF) {
++      auto type = cast<RankedTensorType>(adaptor.getInputs()[i].getType())
++                      .getElementType();
++      bool sum = isa<mlir::stablehlo::AddOp>(reductionOps[i]) &&
++                 initValues[i] == ZERO && (type.isF32() || type.isF16());
++      if (!sum && (!isa<mlir::stablehlo::MaxOp>(reductionOps[i]) ||
++                   initValues[i] != NEG_INF)) {
+         return rewriter.notifyMatchFailure(
+-            srcOp, "5D reduce_window decomposition only supports max pooling.");
++            srcOp, "5D reduce_window decomposition supports max pooling and "
++                   "floating sums.");
+       }
+     }
+ 
+@@ -3977,6 +3992,22 @@
+       RankedTensorType inputType =
+           mlir::cast<RankedTensorType>(input.getType());
+       Type elemType = inputType.getElementType();
++      auto pool = [&](RankedTensorType type, Value value,
++                      DenseI32ArrayAttr kernel, DenseI32ArrayAttr stride,
++                      DenseI32ArrayAttr dilation,
++                      DenseI32ArrayAttr pad) -> Value {
++        if (isa<mlir::stablehlo::AddOp>(reductionOps[i])) {
++          auto sum = rewriter.create<ttir::AvgPool2dOp>(
++              srcOp.getLoc(), type, value, kernel, stride, dilation, pad,
++              ceilMode, rewriter.getBoolAttr(true));
++          sum->setAttr("divisor_override", rewriter.getI32IntegerAttr(1));
++          return sum.getResult();
++        }
++        return rewriter
++            .create<ttir::MaxPool2dOp>(srcOp.getLoc(), type, value, kernel,
++                                       stride, dilation, pad, ceilMode)
++            .getResult();
++      };
+       auto encoding = inputType.getEncoding();
+ 
+       RankedTensorType originalResultType = cast<RankedTensorType>(
+@@ -4043,13 +4074,8 @@
+ 
+       SmallVector<int64_t> resultShapeHW = {batchND, Hout, Wout, C};
+       Value pooledHW =
+-          rewriter
+-              .create<ttir::MaxPool2dOp>(
+-                  srcOp.getLoc(),
+-                  RankedTensorType::get(resultShapeHW, elemType, encoding),
+-                  reshapedHW, kernelHW, strideHW, dilationHW, paddingHW,
+-                  ceilMode)
+-              .getResult();
++          pool(RankedTensorType::get(resultShapeHW, elemType, encoding),
++               reshapedHW, kernelHW, strideHW, dilationHW, paddingHW);
+ 
+       // Pass 2: Pool over D.
+       // [N*D, Hout, Wout, C] -> [N, D, Hout*Wout, C].
+@@ -4062,12 +4088,8 @@
+ 
+       SmallVector<int64_t> resultShapeD = {N, Dout, flatHW, C};
+       Value pooledD =
+-          rewriter
+-              .create<ttir::MaxPool2dOp>(
+-                  srcOp.getLoc(),
+-                  RankedTensorType::get(resultShapeD, elemType, encoding),
+-                  reshapedD, kernelD, strideD, dilationD, paddingD, ceilMode)
+-              .getResult();
++          pool(RankedTensorType::get(resultShapeD, elemType, encoding),
++               reshapedD, kernelD, strideD, dilationD, paddingD);
+ 
+       // [N, Dout, Hout*Wout, C] (NHWC) -> permute -> [N, C, Dout, Hout*Wout] ->
+       // reshape -> canonical [N, C, Dout, Hout, Wout].
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -672,6 +672,11 @@
+   matchAndRewrite(Pool2dOp op, typename Pool2dOp::Adaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+ 
++    if constexpr (std::is_same_v<Pool2dOp, ttir::AvgPool2dOp>) {
++      if (op.getDivisorOverride() != 0) {
++        return failure();
++      }
++    }
+     ttir::FullOp fullOp =
+         dyn_cast_or_null<ttir::FullOp>(op.getInput().getDefiningOp());
+     if (!fullOp) {
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
+@@ -207,7 +207,8 @@
+ 
+     target.addDynamicallyLegalOp<ttir::AvgPool2dOp>([&](ttir::AvgPool2dOp op) {
+       // Illegal if input is a FullOp (will be decomposed to FullOp).
+-      return !isa_and_nonnull<ttir::FullOp>(op.getInput().getDefiningOp());
++      return op.getDivisorOverride() != 0 ||
++             !isa_and_nonnull<ttir::FullOp>(op.getInput().getDefiningOp());
+     });
+ 
+     // ttnn's argmax reduces all dimensions or the last one.
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -2503,7 +2503,9 @@
+ 
+     // TTNN only supports lowering of AvgPool2dOp with dilation of (1, 1).
+     if constexpr (std::is_same_v<TTIROpTy, ttir::AvgPool2dOp>) {
+-      if (dilationPairOrError->first != 1 || dilationPairOrError->second != 1) {
++      if (adaptor.getDivisorOverride() != 1 &&
++          (dilationPairOrError->first != 1 ||
++           dilationPairOrError->second != 1)) {
+         return op.emitOpError()
+                << "only supports lowering to TTNN for dilation of (1, 1)";
+       }
+@@ -2583,7 +2585,8 @@
+           strideAttr, paddingAttr, dilationAttr,
+           /* applied_shard_scheme=*/nullptr, adaptor.getCeilMode(),
+           /* in_place_halo=*/false, adaptor.getCountIncludePad(),
+-          /*config_tensors_in_dram=*/rewriter.getBoolAttr(true));
++          /*config_tensors_in_dram=*/rewriter.getBoolAttr(true),
++          adaptor.getDivisorOverride());
+     } else if constexpr (std::is_same_v<TTIROpTy, ttir::MaxPool2dOp>) {
+       rewriter.replaceOpWithNewOp<TTNNOpTy>(
+           op, this->getTypeConverter()->convertType(op.getResult().getType()),
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -2469,7 +2469,7 @@
+ 
+ // Folds AvgPool2dOp when it is an identity operation.
+ ::mlir::OpFoldResult mlir::tt::ttir::AvgPool2dOp::fold(FoldAdaptor adaptor) {
+-  if (isIdentityPool2d(*this)) {
++  if (getDivisorOverride() <= 1 && isIdentityPool2d(*this)) {
+     return getInput();
+   }
+   return {};
+diff --git a/lib/Dialect/TTIR/Transforms/FlattenSlidingWindow.cpp b/lib/Dialect/TTIR/Transforms/FlattenSlidingWindow.cpp
+--- a/lib/Dialect/TTIR/Transforms/FlattenSlidingWindow.cpp
++++ b/lib/Dialect/TTIR/Transforms/FlattenSlidingWindow.cpp
+@@ -126,7 +126,8 @@
+           op.getLoc(), getNHWFlattenedType(outputType), flattenedInput,
+           adaptor.getKernel(), adaptor.getStride(), adaptor.getDilation(),
+           adaptor.getPadding(), adaptor.getCeilMode(),
+-          adaptor.getCountIncludePad(), flattenedCompatInfoAttr);
++          adaptor.getCountIncludePad(), flattenedCompatInfoAttr,
++          adaptor.getDivisorOverride());
+     } else if constexpr (std::is_same_v<Pooling2dOp,
+                                         ttir::MaxPool2dWithIndicesOp>) {
+       // Handle MaxPool2dWithIndicesOp separately since it has two outputs
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -91,18 +91,16 @@
+ // input in both row-major and tile layout, but the output of the operation is
+ // strictly in row-major layout. In order to keep the output consistent with the
+ // input, the row-major workaround is applied to both the input and output
+-// operands. The input and output operands are expected to use the bf16 data
+-// type, so the bf16 workaround is applied to both the input and output
+-// operands.
+-TTNNOperandsWorkarounds
+-TTNNOperandsWorkaroundsFactory::createPool2DOpOperandsWorkarounds() {
+-  wa::TTNNOperandWorkarounds rowMajorLayoutBF16Workaround;
+-  rowMajorLayoutBF16Workaround.tensorLayoutWorkaround = Layout::RowMajor;
+-  rowMajorLayoutBF16Workaround.tensorDataTypeWorkaround =
+-      ttcore::DataType::BFloat16;
++// operands, using the computation dtype selected by the pooling op.
++TTNNOperandsWorkarounds
++TTNNOperandsWorkaroundsFactory::createPool2DOpOperandsWorkarounds(
++    ttcore::DataType dataType) {
++  wa::TTNNOperandWorkarounds workaround;
++  workaround.tensorLayoutWorkaround = Layout::RowMajor;
++  workaround.tensorDataTypeWorkaround = dataType;
+   return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+-      .addInputOperandWorkaround(rowMajorLayoutBF16Workaround)
+-      .addOutputOperandWorkaround(rowMajorLayoutBF16Workaround);
++      .addInputOperandWorkaround(workaround)
++      .addOutputOperandWorkaround(workaround);
+ }
+ 
+ // Factory method to create a set of workarounds for 2d max pooling with
+diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+--- a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
++++ b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+@@ -334,12 +334,22 @@
+ 
+   const auto inputShape = op.getInput().getType().getShape();
+ 
+-  return constraintsDispatch(
+-      op, liveRecords, inputShape, inputs[0], op.getBatchSize(),
+-      op.getInputHeight(), op.getInputWidth(), op.getChannels(),
+-      op.getKernelSize(), op.getStride(), op.getPadding(), op.getDilation(),
+-      op.getCeilMode(), op.getReallocateHaloOutput(),
+-      op.getConfigTensorsInDram(), opConfig.outputLayout);
++  if constexpr (std::is_same_v<OpT, AvgPool2dOp>) {
++    return constraintsDispatch(
++        op, liveRecords, inputShape, inputs[0], op.getBatchSize(),
++        op.getInputHeight(), op.getInputWidth(), op.getChannels(),
++        op.getKernelSize(), op.getStride(), op.getPadding(), op.getDilation(),
++        op.getCeilMode(), op.getReallocateHaloOutput(),
++        op.getConfigTensorsInDram(),
++        static_cast<int32_t>(op.getDivisorOverride()), opConfig.outputLayout);
++  } else {
++    return constraintsDispatch(
++        op, liveRecords, inputShape, inputs[0], op.getBatchSize(),
++        op.getInputHeight(), op.getInputWidth(), op.getChannels(),
++        op.getKernelSize(), op.getStride(), op.getPadding(), op.getDilation(),
++        op.getCeilMode(), op.getReallocateHaloOutput(),
++        op.getConfigTensorsInDram(), opConfig.outputLayout);
++  }
+ }
+ 
+ template <typename OpT>
+@@ -350,12 +360,22 @@
+ 
+   const auto inputShape = op.getInput().getType().getShape();
+ 
+-  return opRuntimeCache().getOrCompute(
+-      op_model::OpModel<OpT>::getOpRuntime, op, inputShape, inputs[0],
+-      op.getBatchSize(), op.getInputHeight(), op.getInputWidth(),
+-      op.getChannels(), op.getKernelSize(), op.getStride(), op.getPadding(),
+-      op.getDilation(), op.getCeilMode(), op.getReallocateHaloOutput(),
+-      op.getConfigTensorsInDram(), opConfig.outputLayout);
++  if constexpr (std::is_same_v<OpT, AvgPool2dOp>) {
++    return opRuntimeCache().getOrCompute(
++        op_model::OpModel<OpT>::getOpRuntime, op, inputShape, inputs[0],
++        op.getBatchSize(), op.getInputHeight(), op.getInputWidth(),
++        op.getChannels(), op.getKernelSize(), op.getStride(), op.getPadding(),
++        op.getDilation(), op.getCeilMode(), op.getReallocateHaloOutput(),
++        op.getConfigTensorsInDram(),
++        static_cast<int32_t>(op.getDivisorOverride()), opConfig.outputLayout);
++  } else {
++    return opRuntimeCache().getOrCompute(
++        op_model::OpModel<OpT>::getOpRuntime, op, inputShape, inputs[0],
++        op.getBatchSize(), op.getInputHeight(), op.getInputWidth(),
++        op.getChannels(), op.getKernelSize(), op.getStride(), op.getPadding(),
++        op.getDilation(), op.getCeilMode(), op.getReallocateHaloOutput(),
++        op.getConfigTensorsInDram(), opConfig.outputLayout);
++  }
+ }
+ 
+ template <typename OpT>
+diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
+--- a/lib/OpModel/TTNN/TTNNOpModel.cpp
++++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
+@@ -7023,8 +7023,8 @@
+     int32_t inputChannels, llvm::ArrayRef<int32_t> kernelSize,
+     llvm::ArrayRef<int32_t> stride, llvm::ArrayRef<int32_t> padding,
+     llvm::ArrayRef<int32_t> dilation, bool ceilMode, bool reallocateHaloOutput,
+-    std::optional<bool> configTensorsInDram, TTNNLayoutAttr outputLayout,
+-    const MockAllocatorState *initialState) {
++    std::optional<bool> configTensorsInDram, int32_t divisorOverrideValue,
++    TTNNLayoutAttr outputLayout, const MockAllocatorState *initialState) {
+ 
+ #ifdef TTMLIR_ENABLE_OPMODEL
+   ::tt::tt_metal::distributed::MeshDevice *device =
+@@ -7045,7 +7045,9 @@
+   // default values for the variables that are received by the op's invoke
+   // method in tt-metal but do not exist in the op's definition in TTNNOps.td:
+   bool countIncludePad = true;
+-  std::optional<int32_t> divisorOverride = std::nullopt;
++  std::optional<int32_t> divisorOverride =
++      divisorOverrideValue ? std::optional<int32_t>(divisorOverrideValue)
++                           : std::nullopt;
+   std::optional<::ttnn::DeviceComputeKernelConfig> computeKernelConfig =
+       std::nullopt;
+ 
+@@ -7065,8 +7067,9 @@
+         std::nullopt /* dram_slice_config */,
+         std::nullopt /* applied_shard_scheme */, computeKernelConfig,
+         false /* deallocate_input */, reallocateHaloOutput,
+-        ::ttnn::DataType::BFLOAT16, ::ttnn::Layout::ROW_MAJOR,
+-        configTensorsInDram.value_or(false) /* config_tensors_in_dram */);
++        inputSpec.data_type(), ::ttnn::Layout::ROW_MAJOR,
++        configTensorsInDram.value_or(false) /* config_tensors_in_dram */,
++        conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(dilation));
+   };
+ 
+   return operation::getOpConstraintsWithState(inputLayout.getContext(),
+@@ -7082,7 +7085,8 @@
+     int32_t inputChannels, llvm::ArrayRef<int32_t> kernelSize,
+     llvm::ArrayRef<int32_t> stride, llvm::ArrayRef<int32_t> padding,
+     llvm::ArrayRef<int32_t> dilation, bool ceilMode, bool reallocateHaloOutput,
+-    std::optional<bool> configTensorsInDram, TTNNLayoutAttr outputLayout) {
++    std::optional<bool> configTensorsInDram, int32_t divisorOverrideValue,
++    TTNNLayoutAttr outputLayout) {
+ #ifdef TTMLIR_ENABLE_OPMODEL
+   ::tt::tt_metal::distributed::MeshDevice *device =
+       SingletonDeviceContext::getInstance().getDevice();
+@@ -7102,7 +7106,9 @@
+   // default values for the variables that are received by the op's invoke
+   // method in tt-metal but do not exist in the op's definition in TTNNOps.td:
+   bool countIncludePad = true;
+-  std::optional<int32_t> divisorOverride = std::nullopt;
++  std::optional<int32_t> divisorOverride =
++      divisorOverrideValue ? std::optional<int32_t>(divisorOverrideValue)
++                           : std::nullopt;
+   std::optional<::ttnn::DeviceComputeKernelConfig> computeKernelConfig =
+       std::nullopt;
+ 
+@@ -7118,8 +7124,9 @@
+         std::nullopt /* dram_slice_config */,
+         std::nullopt /* applied_shard_scheme */, computeKernelConfig,
+         false /* deallocate_input */, reallocateHaloOutput,
+-        ::ttnn::DataType::BFLOAT16, ::ttnn::Layout::ROW_MAJOR,
+-        configTensorsInDram.value_or(false) /* config_tensors_in_dram */);
++        inputSpec.data_type(), ::ttnn::Layout::ROW_MAJOR,
++        configTensorsInDram.value_or(false) /* config_tensors_in_dram */,
++        conversion::convertLLVMArrayRefToStdArray<uint32_t, 2>(dilation));
+   };
+ 
+   return operation::getOpRuntime(avgPool2DQuery);
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -3443,9 +3443,10 @@
+   if constexpr (std::is_same_v<Pool2dOp, AvgPool2dOp>) {
+     extraParamsType =
+         ::tt::target::ttnn::Pool2dExtraParams::AvgPool2dExtraParams;
+-    extraParams = ::tt::target::ttnn::CreateAvgPool2dExtraParams(
+-                      *cache.fbb, op.getCountIncludePad())
+-                      .Union();
++    extraParams =
++        ::tt::target::ttnn::CreateAvgPool2dExtraParams(
++            *cache.fbb, op.getCountIncludePad(), op.getDivisorOverride())
++            .Union();
+   } else if constexpr (std::is_same_v<Pool2dOp, MaxPool2dOp>) {
+     extraParamsType =
+         ::tt::target::ttnn::Pool2dExtraParams::MaxPool2dExtraParams;
+diff --git a/runtime/lib/ttnn/operations/pool/pool2d.cpp b/runtime/lib/ttnn/operations/pool/pool2d.cpp
+--- a/runtime/lib/ttnn/operations/pool/pool2d.cpp
++++ b/runtime/lib/ttnn/operations/pool/pool2d.cpp
+@@ -29,7 +29,8 @@
+         const std::optional<::ttnn::operations::pool::Op2DSliceConfig> &,
+         const std::optional<const ::ttnn::TensorMemoryLayout>,
+         const std::optional<::ttnn::DeviceComputeKernelConfig> &, bool, bool,
+-        ::ttnn::DataType, ::ttnn::Layout, bool)> &ttnnOp) {
++        ::ttnn::DataType, ::ttnn::Layout, bool, std::array<uint32_t, 2>)>
++        &ttnnOp) {
+   const ::ttnn::Tensor &input = tensorPool.getTTNNTensorAndValidate(op->in());
+ 
+   std::optional<::ttnn::MemoryConfig> outputMemoryConfig =
+@@ -39,9 +40,11 @@
+                  outputMemoryConfig.has_value(),
+              "Memory config must exist for device tensors");
+ 
+-  std::array<uint32_t, 2> kernelSize, stride;
++  std::array<uint32_t, 2> kernelSize, stride, dilation;
+   std::copy_n(op->kernel_size()->begin(), 2, kernelSize.begin());
+   std::copy_n(op->stride()->begin(), 2, stride.begin());
++  std::copy_n(op->dilation()->begin(), 2, dilation.begin());
++  auto divisor = op->extra_params_as_AvgPool2dExtraParams()->divisor_override();
+ 
+   std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>> padding;
+   if (op->padding()->size() == 2) {
+@@ -69,13 +72,15 @@
+       ttnnOp(input, op->batch_size(), op->input_height(), op->input_width(),
+              op->channels(), kernelSize, stride, padding, op->ceil_mode(),
+              op->extra_params_as_AvgPool2dExtraParams()->count_include_pad(),
+-             /*divisor_override=*/std::nullopt, outputMemoryConfig,
++             divisor ? std::optional<int32_t>(divisor) : std::nullopt,
++             outputMemoryConfig,
+              /*dram_slice_config=*/std::nullopt, appliedShardScheme,
+              computeKernelConfig,
+              /*deallocate_input=*/false,
+              /*reallocate_halo_output=*/op->reallocate_halo_output(),
+-             ::ttnn::DataType::BFLOAT16, ::ttnn::Layout::ROW_MAJOR,
+-             /*config_tensor_in_dram=*/op->config_tensors_in_dram());
++             ::tt::runtime::ttnn::operations::utils::getDataType(op->out()),
++             ::ttnn::Layout::ROW_MAJOR,
++             /*config_tensor_in_dram=*/op->config_tensors_in_dram(), dilation);
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
