@@ -207,6 +207,24 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_progra
      const uint32_t bf16_scalar = get_bf16_pool_scalar(pool_type, kernel_h, kernel_w, divisor_override);
      const uint32_t bf16_init_value = get_bf16_pool_init_value(pool_type);
      FactoryParameters params = get_factory_parameters(
+@@ -371,7 +372,7 @@
+                                              ? (in_c - (in_c % shard_width)) / (num_shards_c - 1)
+                                              : in_c / num_shards_c;
+     const uint32_t in_nbytes_c = in_c_per_shard_ceil * params.nbytes;  // row of input (channels)
+-    const uint32_t shard_width_bytes = input_shape[3] / num_shards_c * params.nbytes;
++    const uint32_t shard_width_bytes = input.buffer()->aligned_page_size();
+ 
+     TT_FATAL(
+         input_shape[3] % num_shards_c == 0,
+@@ -456,7 +457,7 @@
+     // incoming data is the input cb instead of raw l1/dram addr
+     // this input shard has halo and padding inserted.
+     const uint32_t raw_in_cb_npages = input.shard_spec().value().shape[0];
+-    const uint32_t raw_in_cb_pagesize = in_nbytes_c;
++    const uint32_t raw_in_cb_pagesize = shard_width_bytes;
+     const uint32_t raw_in_cb_id = next_cb_index++;
+     add_sharded_cb(raw_in_cb_id, raw_in_cb_pagesize, raw_in_cb_npages, params.data_format, input.buffer());
+ 
 @@ -516,9 +517,10 @@
      const uint32_t in_cb_npages = cb_sizes.in_cb_npages;
  
