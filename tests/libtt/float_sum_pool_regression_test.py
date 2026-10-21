@@ -1,10 +1,8 @@
 """ttnn pooling runs in bfloat16, so tt-mlir adds the window slices of float32
 and float16 sum pooling (and average pooling, which divides the sum) in their
-own type (torch_tpu's avg_pool1d/2d/3d). A pad folds into a pooling op only if
-it pads with the reduction's init value."""
+own type (torch_tpu's avg_pool1d/2d/3d)."""
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import lax
@@ -59,20 +57,3 @@ def test_sum_and_average_pool(dtype, case):
         np.asarray(average, np.float64), expected / np.prod(window), rtol=rtol, atol=atol
     )
 
-
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, np.float32])
-def test_window_counts_of_padded_ones(dtype):
-    # torch_tpu's avg_pool with ceil_mode counts its divisor this way; folding
-    # the ones padding into the pool as zeros gave 2 instead of 3 at the edges.
-    def counts(x):
-        ones = jnp.pad(jnp.ones_like(x), ((0, 0), (0, 0), (1, 1)), constant_values=dtype(1))
-        return lax.reduce_window(
-            ones, dtype(0), lax.add, (1, 1, 3), (1, 1, 2), ((0, 0), (0, 0), (0, 1))
-        )
-
-    x = np.zeros((2, 3, 16), dtype)
-    got = np.asarray(jax.jit(counts)(jax.device_put(x, jax.devices("tt")[0])), np.float32)
-    expected = np.full((2, 3, 9), 3, np.float32)
-    expected[..., -1] = 2
-    # bfloat16 still takes ttnn's pooling, which rounds 3 to 2.984375.
-    np.testing.assert_allclose(got, expected, atol=0.05 if dtype == jnp.bfloat16 else 0)

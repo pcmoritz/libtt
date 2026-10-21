@@ -1,0 +1,42 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -3219,12 +3219,37 @@
+                                                 MLIRContext *ctx,
+                                                 PatternBenefit benefit = 2)
+       : OpConversionPattern<mlir::stablehlo::ConvolutionOp>(typeConverter, ctx,
+-                                                            benefit) {}
++                                                            benefit) {
++    // Reversal and negative padding may need successive normalizations.
++    setHasBoundedRewriteRecursion();
++  }
+ 
+   LogicalResult
+   matchAndRewrite(mlir::stablehlo::ConvolutionOp srcOp,
+                   mlir::stablehlo::ConvolutionOp::Adaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
++
++    // Normalize kernel reversal before the existing convolution lowerings.
++    if (auto reversal = srcOp.getWindowReversal()) {
++      SmallVector<int64_t> reversedDims;
++      for (auto [dim, reversed] : llvm::zip(
++               srcOp.getDimensionNumbers().getKernelSpatialDimensions(),
++               *reversal)) {
++        if (reversed) {
++          reversedDims.push_back(dim);
++        }
++      }
++      if (!reversedDims.empty()) {
++        Value kernel = rewriter.create<mlir::stablehlo::ReverseOp>(
++            srcOp.getLoc(), adaptor.getRhs(),
++            rewriter.getDenseI64ArrayAttr(reversedDims));
++        rewriter.modifyOpInPlace(srcOp, [&] {
++          srcOp->setOperands({adaptor.getLhs(), kernel});
++          srcOp.removeWindowReversalAttr();
++        });
++        return success();
++      }
++    }
+ 
+     RankedTensorType outputType = mlir::cast<RankedTensorType>(
+         getTypeConverter()->convertType(srcOp.getResult().getType()));
