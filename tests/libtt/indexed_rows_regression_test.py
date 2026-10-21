@@ -376,8 +376,7 @@ def test_dynamic_update_slice_unsigned_starts():
 
 def test_dynamic_update_slice_wide_constant_window():
     # FSDP writes a parameter into its flat [1, N] buffer at a constant offset.
-    # A window wider than L1 moves as rows of gcd(start, window, size) = 4096
-    # elements.
+    # The window, wider than L1, streams through rows_scatter in pieces.
     rng = np.random.default_rng(19)
     flat = rng.normal(size=(1, 3 * 1024 * 1024)).astype(np.float32)
     update = rng.normal(size=(1, 1024 * 1024)).astype(np.float32)

@@ -1129,38 +1129,6 @@ public:
     auto columnType = RankedTensorType::get(
         {1, 1}, rowsIndexType(rewriter, startElementType));
     SmallVector<Value> starts(adaptor.getStartIndices());
-    // The rows kernels stage a window of the last dimension whole in L1. With
-    // a constant start, a wide one moves as rows of g elements instead, g
-    // dividing the start, the window and the dimension.
-    constexpr int64_t kMaxColumnWindowBytes = 64 * 1024;
-    const size_t last = operandShape.size() - 1;
-    const int64_t elementBytes =
-        std::max<int64_t>(1, operandType.getElementTypeBitWidth() / 8);
-    APInt constantStart;
-    if (last < starts.size() && updateShape[last] != operandShape[last] &&
-        updateShape[last] * elementBytes > kMaxColumnWindowBytes &&
-        matchPattern(srcOp.getStartIndices()[last],
-                     m_ConstantInt(&constantStart))) {
-      const int64_t start =
-          std::clamp<int64_t>(constantStart.getSExtValue(), 0,
-                              operandShape[last] - updateShape[last]);
-      const int64_t g =
-          std::gcd(std::gcd(start, updateShape[last]), operandShape[last]);
-      if (g > 1) {
-        for (auto *shape : {&operandShape, &updateShape}) {
-          shape->back() /= g;
-          shape->push_back(g);
-        }
-        operand = ttir::utils::createReshapeOp(
-            rewriter, ttmlir::utils::appendLocationSuffix(loc, "_rows"),
-            operand, operandShape);
-        update = ttir::utils::createReshapeOp(
-            rewriter, ttmlir::utils::appendLocationSuffix(loc, "_update_rows"),
-            update, updateShape);
-        starts[last] = rewriter.create<ttir::FullOp>(
-            loc, columnType, rewriter.getI32IntegerAttr(start / g));
-      }
-    }
     // Dimensions the update does not cover are indexed; the rest are free.
     SmallVector<OperandDim> dims(operandShape.size());
     SmallVector<Value> columns;
@@ -1169,8 +1137,7 @@ public:
       dim.size = size;
       dim.window = updateShape[d];
       dim.kind = DimKind::Free;
-      // A complex operand's trailing dimension of 2, and the rows of a split
-      // last dimension, have no start index.
+      // A complex operand's trailing dimension of 2 has no start index.
       if (static_cast<int64_t>(d) >= starts.size()) {
         continue;
       }
