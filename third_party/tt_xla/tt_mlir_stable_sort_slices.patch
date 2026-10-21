@@ -1,15 +1,15 @@
 diff --git a/lib/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.cpp b/lib/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.cpp
 --- a/lib/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.cpp
 +++ b/lib/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.cpp
-@@ -104,6 +104,11 @@
+@@ -160,7 +160,10 @@
+   SliceStaticOp activeSlice = valuesSlice ? valuesSlice : indicesSlice;
+   auto sliceResult =
+       validateAndExtractK(activeSlice, sortDim, inputShape, rank);
+-  if (!sliceResult.has_value()) {
++  // Keep fusion within the selection kernel's 64-result limit. Larger
++  // selections can exceed TopK's sorting-network workspace. Suffix slices
++  // also need the original order, which inverting `largest` would reverse.
++  if (!sliceResult.has_value() || sliceResult->fromEnd || sliceResult->k > 64) {
      return failure();
    }
- 
-+  // TopK does not promise the original index order for equal keys.
-+  if (srcOp.getStable()) {
-+    return failure();
-+  }
-+
-   Value sortValues = srcOp.getValues();
-   Value sortIndices = srcOp.getIndices();
  
