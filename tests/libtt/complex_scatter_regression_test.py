@@ -17,7 +17,8 @@ def test_complex_scatter_assignment(case, level):
     update_shape = (len(indices),) if case in ("vector", "elements") else (
         len(indices), shape[1]
     )
-    updates = np.full(update_shape, -3 + 17j, dtype=np.complex64)
+    values = np.arange(np.prod(update_shape), dtype=np.float32).reshape(update_shape)
+    updates = ((values - 3) + 1j * (17 + 2 * values)).astype(np.complex64)
     expected = x.copy()
     if case == "elements":
         expected[indices, indices] = updates

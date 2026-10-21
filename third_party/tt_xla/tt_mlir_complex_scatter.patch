@@ -4,7 +4,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 @@ -1012,6 +1012,53 @@
    }
  };
- 
+
 +// Scatter assignment copies the trailing real/imag dimension as a window.
 +// Keep the update body scalar: assignment acts independently on each component.
 +class ComplexScatterOpConversionPattern
