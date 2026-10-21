@@ -23,7 +23,9 @@ def test_float64_contraction(op, level):
         else:
             shape = (1, 5, 2) if op == "conv1d" else (1, 4, 5, 2)
             kernel = (2, 2, 3) if op == "conv1d" else (2, 2, 2, 3)
-            dims = ("NWC", "WIO", "NWC") if op == "conv1d" else ("NHWC", "HWIO", "NHWC")
+            dims = ("NWC", "WIO", "NWC") if op == "conv1d" else (
+                "NHWC", "HWIO", "NHWC"
+            )
             x = np.arange(np.prod(shape), dtype=np.float64).reshape(shape) / 8
             w = np.ones(kernel, dtype=np.float64) / 4
             run = lambda x, w: jax.lax.conv_general_dilated(
@@ -33,6 +35,7 @@ def test_float64_contraction(op, level):
         actual = jax.jit(run, compiler_options={"optimization_level": level})(
             *[jax.device_put(a, jax.devices("tt")[0]) for a in (x, w)]
         )
+        assert actual.dtype == np.float64
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
