@@ -1,0 +1,222 @@
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mul_int32.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mul_int32.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mul_int32.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mul_int32.h
+@@ -232,4 +232,81 @@
+     }
+ }
+ 
++// a * b modulo 2^32, as in mul_int32: with a = a1 * 2^23 + a0,
++// a * b = a0 * b0 + ((a1 * b0 + a0 * b1) << 23) modulo 2^32, where SFPMUL24
++// gives the low and high halves of the 46-bit product a0 * b0.
++sfpi_inline sfpi::vUInt mul_uint32_wrapping(sfpi::vUInt a, sfpi::vUInt b) {
++    sfpi::vUInt high = sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(a >> 23, b));
++    high += sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(a, b >> 23));
++    high += sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(a, b, sfpi::FractionalHalf::High));
++    return sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(a, b)) + (high << 23);
++}
++
++// a * a modulo 2^32, whose two cross terms are equal: one SFPMUL24 fewer.
++sfpi_inline sfpi::vUInt square_uint32_wrapping(sfpi::vUInt a) {
++    sfpi::vUInt cross = sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(a >> 23, a));
++    sfpi::vUInt high = sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(a, a, sfpi::FractionalHalf::High));
++    high += cross + cross;
++    return sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(a, a)) + (high << 23);
++}
++
++// base**exponent of two Int32 or UInt32 tiles, wrapping like their
++// multiplication: square-and-multiply over the exponent's 32 bits from the
++// highest. A negative Int32 exponent gives 1 for a base of 1, +-1 for -1 and
++// 0 otherwise, as in StableHLO.
++template <bool APPROXIMATION_MODE, bool UNSIGNED, int ITERATIONS = 8>
++inline void pow_int32(const uint dst_index_in0, const uint dst_index_in1, const uint dst_index_out) {
++    constexpr uint dst_tile_size_sfpi = 32;
++    for (int d = 0; d < ITERATIONS; d++) {
++        sfpi::vUInt base = sfpi::dst_reg[dst_index_in0 * dst_tile_size_sfpi];
++        sfpi::vInt exponent = sfpi::dst_reg[dst_index_in1 * dst_tile_size_sfpi];
++        sfpi::vUInt result = 1;
++        sfpi::vInt bits = exponent;
++        for (int i = 0; i < 32; i++) {
++            result = square_uint32_wrapping(result);
++            v_if(bits < 0) { result = mul_uint32_wrapping(result, base); }
++            v_endif;
++            bits <<= 1;
++        }
++        if constexpr (!UNSIGNED) {
++            v_if(exponent < 0) {
++                sfpi::vInt signed_base = sfpi::as<sfpi::vInt>(base);
++                sfpi::vInt negative = 0;
++                v_if(signed_base == 1) { negative = 1; }
++                v_elseif(signed_base == -1) {
++                    negative = 1;
++                    v_if((exponent & 1) != 0) { negative = -1; }
++                    v_endif;
++                }
++                v_endif;
++                result = sfpi::as<sfpi::vUInt>(negative);
++            }
++            v_endif;
++        }
++        sfpi::dst_reg[dst_index_out * dst_tile_size_sfpi] = result;
++        sfpi::dst_reg++;
++    }
++}
++
++// base**exponent of a tile and a scalar exponent: the same multiplications,
++// chosen by the exponent's bits from its highest set bit on.
++template <bool APPROXIMATION_MODE, int ITERATIONS = 8>
++inline void power_int32(const uint32_t exponent) {
++    for (int d = 0; d < ITERATIONS; d++) {
++        sfpi::vUInt base = sfpi::dst_reg[0];
++        sfpi::vUInt result = 1;
++        if (exponent != 0) {
++            result = base;
++            for (int bit = 30 - __builtin_clz(exponent); bit >= 0; bit--) {
++                result = square_uint32_wrapping(result);
++                if ((exponent >> bit) & 1) {
++                    result = mul_uint32_wrapping(result, base);
++                }
++            }
++        }
++        sfpi::dst_reg[0] = result;
++        sfpi::dst_reg++;
++    }
++}
++
+ }  // namespace ckernel::sfpu
+diff --git tt_metal/hw/inc/api/compute/compute_kernel_api.h tt_metal/hw/inc/api/compute/compute_kernel_api.h
+--- tt_metal/hw/inc/api/compute/compute_kernel_api.h
++++ tt_metal/hw/inc/api/compute/compute_kernel_api.h
+@@ -50,6 +50,9 @@
+ #include "ckernel_sfpu_unary_max_min.h"
+ #include "ckernel_sfpu_reduce.h"
+ #include "ckernel_sfpu_alt_complex_rotate90.h"
++#ifdef ARCH_BLACKHOLE
++#include "ckernel_sfpu_mul_int32.h"
++#endif
+ #else
+ #include "ckernel_sfpu_sigmoid.h"
+ #include "ckernel_sfpu_silu.h"
+@@ -586,6 +589,17 @@
+  */
+ ALWI void power_iterative_tile_init() { MATH(SFPU_UNARY_INIT(power)); }
+ 
++#ifdef ARCH_BLACKHOLE
++// POWER_INT : y = x^(const exponent) for Int32 and UInt32 tiles, wrapping like
++// their multiplication.
++ALWI void power_int_tile(uint32_t idst, uint32_t exponent) {
++    MATH(SFPU_UNARY_CALL(
++        DST_SYNC_MODE, DST_ACCUM_MODE, power_int32, (APPROX, 8 /* ITERATIONS */), idst, VectorMode::RC, exponent));
++}
++
++ALWI void power_int_tile_init() { MATH(SFPU_UNARY_INIT(power)); }
++#endif
++
+ // clang-format off
+ // exp2 : y = 2 ^ x  ==> [y = exp(x * log(2))]
+ /**
+diff --git tt_metal/hw/inc/api/compute/mul_int_sfpu.h tt_metal/hw/inc/api/compute/mul_int_sfpu.h
+--- tt_metal/hw/inc/api/compute/mul_int_sfpu.h
++++ tt_metal/hw/inc/api/compute/mul_int_sfpu.h
+@@ -95,6 +95,27 @@
+ }
+ 
+ ALWI void mulhi_uint32_tile_init() { MATH((SFPU_BINARY_INIT(mul_int32))); }
++
++// base**exponent of an Int32 or UInt32 base tile and exponent tile, wrapping
++// like their multiplication. A negative Int32 exponent gives 1 for a base of
++// 1, +-1 for -1 and 0 otherwise.
++template <DataFormat data_format>
++ALWI void pow_int_tile(uint32_t idst0, uint32_t idst1, uint32_t odst) {
++    static_assert(
++        data_format == DataFormat::Int32 || data_format == DataFormat::UInt32,
++        "Unsupported data format for pow_int. Supported data formats are: Int32, UInt32");
++    MATH((SFPU_BINARY_CALL(
++        DST_SYNC_MODE,
++        DST_ACCUM_MODE,
++        pow_int32,
++        (APPROX, data_format == DataFormat::UInt32),
++        idst0,
++        idst1,
++        odst,
++        VectorMode::RC)));
++}
++
++ALWI void pow_int_tile_init() { MATH((SFPU_BINARY_INIT(mul_int32))); }
+ #endif
+ 
+ }  // namespace ckernel
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp
+@@ -29,6 +29,7 @@
+         case BinaryOpType::EQ:
+         case BinaryOpType::NE: return relational;
+         case BinaryOpType::REMAINDER:
++        case BinaryOpType::POWER:
+         case BinaryOpType::MAXIMUM:
+         case BinaryOpType::MINIMUM: return float_and_int32_uint32;
+         case BinaryOpType::DIV:
+@@ -52,7 +53,6 @@
+         case BinaryOpType::LDEXP:
+         case BinaryOpType::BIAS_GELU:
+         case BinaryOpType::QUANT:
+-        case BinaryOpType::POWER:
+         case BinaryOpType::XLOGY:
+         case BinaryOpType::ATAN2:
+         case BinaryOpType::HYPOT: return float_only;
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
+@@ -1121,6 +1121,10 @@
+     std::int32_t exponent,
+     const std::optional<MemoryConfig>& output_mem_config,
+     const std::optional<Tensor>& output_tensor) {
++    // Integer tiles multiply exactly for any non-negative exponent.
++    if ((input.dtype() == DataType::INT32 || input.dtype() == DataType::UINT32) && exponent >= 0) {
++        return ttnn::power_iterative(input, exponent, output_mem_config, output_tensor);
++    }
+     // For exponents 0, 1, 2, 3: use iterative approach
+     if (exponent == 0 || exponent == 1 || exponent == 2 || exponent == 3) {
+         std::uint32_t exp = exponent;
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
+@@ -467,7 +467,11 @@
+             } else {
+                 return {"fmod_binary_tile_init();", "fmod_binary_tile"};
+             }
+-        case POWER: return {"power_binary_tile_init();", "power_binary_tile"};
++        case POWER:
++            if (dtype == DataType::INT32 || dtype == DataType::UINT32) {
++                return {"pow_int_tile_init();", fmt::format("pow_int_tile<DataFormat::{}>", *int_data_format)};
++            }
++            return {"power_binary_tile_init();", "power_binary_tile"};
+         case RSUB:
+             if (int_data_format) {
+                 return {"rsub_int_tile_init();", fmt::format("rsub_int_tile<DataFormat::{}>", *int_data_format)};
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
+@@ -268,6 +268,11 @@
+                 param0 >= 0.0f && param0 == std::floor(param0),
+                 "POWER_ITERATIVE requires non-negative integer exponent, got {}",
+                 param0);
++            if (input_dtype == DataType::INT32 || input_dtype == DataType::UINT32) {
++                return {
++                    "power_int_tile_init();",
++                    fmt::format("power_int_tile({}, {}u);", idst, static_cast<uint32_t>(param0_raw))};
++            }
+             return {"power_iterative_tile_init();", fmt::format("power_iterative_tile({}, {});", idst, param0_raw)};
+         case UnaryOpType::LEAKY_RELU:
+             // For unsigned inputs, leaky_relu is the identity. Emit an empty op so the tile is just copied.
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
+@@ -58,6 +58,7 @@
+         case UnaryOpType::UNARY_LE:
+         case UnaryOpType::UNARY_LT:
+         case UnaryOpType::UNARY_NE:
++        case UnaryOpType::POWER_ITERATIVE:
+         case UnaryOpType::WHERE_TSS: return is_int32_uint32(dtype);
+ 
+         case UnaryOpType::BITWISE_AND:

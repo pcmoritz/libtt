@@ -1,0 +1,111 @@
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -110,6 +110,48 @@
+ // As soon as tenstorrent/tt-metal#16618 is finished, this decomposition can be
+ // removed.
+ namespace {
++// The device computes integer powers exactly on 32-bit tiles, wrapping like
++// int32 multiplication. A narrower integer power widens to int32 and wraps the
++// result to its width: the low bits of the 32-bit power are the narrow one.
++struct NarrowIntegerPowPattern : public OpConversionPattern<ttir::PowOp> {
++  using OpConversionPattern<ttir::PowOp>::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(ttir::PowOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto type = mlir::cast<RankedTensorType>(op.getType());
++    auto intType = mlir::dyn_cast<IntegerType>(type.getElementType());
++    if (!intType || intType.getWidth() == 1 || intType.getWidth() >= 32) {
++      return rewriter.notifyMatchFailure(op, "not a narrow integer power");
++    }
++    Location loc = op.getLoc();
++    auto widen = [&](mlir::Value value) -> mlir::Value {
++      auto valueType = mlir::cast<RankedTensorType>(value.getType());
++      return rewriter.create<ttir::TypecastOp>(
++          loc, valueType.clone(rewriter.getIntegerType(32)), value);
++    };
++    auto i32Type = type.clone(rewriter.getIntegerType(32));
++    mlir::Value result = rewriter.create<ttir::PowOp>(
++        loc, i32Type, widen(adaptor.getLhs()), widen(adaptor.getRhs()));
++    auto constant = [&](int32_t value) -> mlir::Value {
++      return rewriter.create<ttir::FullOp>(loc, i32Type,
++                                           rewriter.getI32IntegerAttr(value));
++    };
++    // Wrap to the width: mask, and sign-extend signed types.
++    unsigned width = intType.getWidth();
++    result = rewriter.create<ttir::BitwiseAndOp>(
++        loc, i32Type, result, constant(static_cast<int32_t>((1u << width) - 1)));
++    if (!intType.isUnsigned()) {
++      mlir::Value signBit = constant(1 << (width - 1));
++      result = rewriter.create<ttir::SubtractOp>(
++          loc, i32Type,
++          rewriter.create<ttir::BitwiseXorOp>(loc, i32Type, result, signBit),
++          signBit);
++    }
++    rewriter.replaceOpWithNewOp<ttir::TypecastOp>(op, type, result);
++    return success();
++  }
++};
++
+ struct ReverseOpConversionPattern
+     : public OpConversionPattern<ttir::ReverseOp> {
+   using OpConversionPattern<ttir::ReverseOp>::OpConversionPattern;
+@@ -2707,6 +2749,7 @@
+   patterns.add<RequantizeOpPattern>(typeConverter, ctx);
+   patterns.add<ReductionProdPattern>(typeConverter, ctx);
+   patterns.add<ReverseOpConversionPattern>(typeConverter, ctx);
++  patterns.add<NarrowIntegerPowPattern>(typeConverter, ctx);
+   patterns.add<ArgMaxPattern>(typeConverter, ctx);
+   patterns.add<SplitQueryKeyValueAndSplitHeadsDecompositionPattern>(
+       typeConverter, ctx);
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
+@@ -106,6 +106,12 @@
+               shape.size() == 1);
+     });
+ 
++    // Narrow integer powers widen to int32.
++    target.addDynamicallyLegalOp<ttir::PowOp>([&](ttir::PowOp op) {
++      auto intType = mlir::dyn_cast<IntegerType>(op.getType().getElementType());
++      return !intType || intType.getWidth() == 1 || intType.getWidth() >= 32;
++    });
++
+     target.addDynamicallyLegalOp<ttir::BatchNormInferenceOp>(
+         [&](ttir::BatchNormInferenceOp op) {
+           auto scaleType = op.getScale().getType();
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -762,6 +762,12 @@
+   // Tracked in :
+   // https://github.com/issues/created?issue=tenstorrent%7Ctt-metal%7C25112
+   if (isa<ttnn::DivideOp, ttnn::PowTensorOp>(op)) {
++    // Integer powers are exact on Int32 and UInt32 tiles.
++    if (isa<ttnn::PowTensorOp>(op) &&
++        (dType == mlir::tt::ttcore::DataType::Int32 ||
++         dType == mlir::tt::ttcore::DataType::UInt32)) {
++      return {};
++    }
+     if (dType == mlir::tt::ttcore::DataType::Float32 ||
+         dType == mlir::tt::ttcore::DataType::BFloat16 ||
+         dType == mlir::tt::ttcore::DataType::BFP_BFloat8 ||
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+@@ -19,7 +19,6 @@
+ #include "ttmlir/Dialect/TTNN/Transforms/Workarounds/Decomposition/GatherOpRank1RewritePattern.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Workarounds/Decomposition/GroupNormAffineReshapeRewritePattern.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Workarounds/Decomposition/GroupNormChannelPadRewritePattern.h"
+-#include "ttmlir/Dialect/TTNN/Transforms/Workarounds/Decomposition/IntegerPowScalarOpRewritePattern.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Workarounds/Decomposition/IntegerProdOpRewritePattern.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Workarounds/Decomposition/LinearOpRewritePattern.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Workarounds/Decomposition/MoeGptLayoutRewritePattern.h"
+@@ -545,7 +544,6 @@
+           workarounds::decomposition::EmbeddingOpSqueezeWeightRewritePattern,
+           workarounds::decomposition::GroupNormChannelPadRewritePattern,
+           workarounds::decomposition::GroupNormAffineReshapeRewritePattern,
+-          workarounds::decomposition::IntegerPowScalarOpRewritePattern,
+           workarounds::decomposition::IntegerProdOpRewritePattern,
+           workarounds::decomposition::UpsampleOpBilinearPaddingRewritePattern,
+           workarounds::decomposition::RotaryEmbeddingOpRewritePattern,

@@ -380,6 +380,9 @@ http_archive(
         "//third_party/tt_metal:bfp4_typecast_rounding.patch",
         "//third_party/tt_metal:memory_pin_resource.patch",
         "//third_party/tt_metal:pad_rm_float32_value.patch",
+        "//third_party/tt_metal:permute_rm_one_byte.patch",
+        "//third_party/tt_metal:pow_int32.patch",
+        "//third_party/tt_metal:batch_norm_training_statistics.patch",
     ],
     sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
     strip_prefix = "tt-metal-eb97711f4be2a30cfbff05266faf90bf9780d0c2",
@@ -640,6 +643,8 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_fused_round_decimals.patch",
         "//third_party/tt_xla:tt_mlir_float_sum_pool_slices.patch",
         "//third_party/tt_xla:tt_mlir_avg_pool_float_divisor.patch",
+        "//third_party/tt_xla:tt_mlir_batch_norm_statistics.patch",
+        "//third_party/tt_xla:tt_mlir_integer_pow.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
