@@ -331,6 +331,7 @@ http_archive(
         "//third_party/tt_metal:all_gather_alt_route_completion.patch",
         "//third_party/tt_metal:graph_tracking_program_context.patch",
         "//third_party/tt_metal:conv_single_channel_not_depthwise.patch",
+        "//third_party/tt_metal:depthwise_conv_dilation.patch",
         "//third_party/tt_metal:single_host_all_reduce.patch",
         "//third_party/tt_metal:topk_multicore_router_width.patch",
         "//third_party/tt_metal:topk_last_dim_logical_k.patch",
