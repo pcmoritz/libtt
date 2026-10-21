@@ -1,0 +1,459 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -9046,11 +9046,24 @@
+     // Get sorting metadata.
+     int64_t sortDim = srcOp.getDimension();
+     bool isStable = srcOp.getIsStable();
+-    mlir::FailureOr<bool> isDescending = getSortDirection(srcOp);
+-    if (mlir::failed(isDescending)) {
+-      return rewriter.notifyMatchFailure(srcOp,
+-                                         "Cannot determine sort direction");
+-    }
++
++    // The comparator must order lexicographically by some of the inputs. An
++    // ascending iota along the sort dimension as the least significant key
++    // only makes the sort stable. Sorts by any other keys than the first input
++    // alone are multi-key sorts.
++    SmallVector<SortKey> keys = getComparatorKeys(srcOp);
++    if (keys.empty()) {
++      srcOp.emitOpError(
++          "has a comparator that isn't a lexicographic order of its inputs");
++      return failure();
++    }
++    while (keys.size() > 1 && !keys.back().isDescending &&
++           isIotaAlong(srcOp.getInputs()[keys.back().input], sortDim)) {
++      keys.pop_back();
++      isStable = true;
++    }
++    bool isMultiKey = keys.size() > 1 || keys.front().input != 0;
++    std::optional<bool> isDescending = keys.front().isDescending;
+ 
+     // Step 1: Type conversion and output tensor preparation for 'values'.
+ 
+@@ -9061,7 +9074,7 @@
+     // Step 2: Determine Sort Type and output tensor preparation for 'indices'.
+ 
+     SortType sortType;
+-    if (isValueIndexSort(srcOp.getInputs())) {
++    if (!isMultiKey && isValueIndexSort(srcOp.getInputs(), sortDim)) {
+       sortType = SortType::kValueIndex;
+ 
+       auto indicesType = cast<RankedTensorType>(
+@@ -9091,7 +9104,6 @@
+     ArrayRef<int64_t> origShape = keyType.getShape();
+     int64_t dSort = origShape[sortDim];
+     int64_t prePost = keyType.getNumElements() / dSort;
+-    int64_t total = prePost * dSort;
+ 
+     // Build permutation: all dims except sortDim, then sortDim last.
+     SmallVector<int64_t> perm;
+@@ -9136,10 +9148,37 @@
+     auto keyElemType = dyn_cast<IntegerType>(
+         cast<RankedTensorType>(srcOp.getInputs().front().getType())
+             .getElementType());
+-    // 64-bit integers are 32-bit on device, so their keys sort the same way,
+-    // e.g. the random uint64 keys of PyTorch's randperm.
+-    if (keyElemType &&
+-        (keyElemType.getWidth() == 32 || keyElemType.getWidth() == 64)) {
++    if (isMultiKey) {
++      // Least significant key first: each stable sort keeps the order of the
++      // previous ones among its ties, so the permutation orders by all keys.
++      for (const SortKey &key : llvm::reverse(keys)) {
++        Value rows = toRows(adaptor.getInputs()[key.input]);
++        Type elemType =
++            cast<RankedTensorType>(srcOp.getInputs()[key.input].getType())
++                .getElementType();
++        if (elemType.isInteger(1)) {
++          elemType = rewriter.getF32Type();
++          rows = rewriter.create<ttir::TypecastOp>(
++              loc, cast<RankedTensorType>(rows.getType()).clone(elemType),
++              rows);
++        }
++        if (indices2D) {
++          rows = reorderRows(rewriter, loc, rows, indices2D, prePost, dSort);
++        }
++        Value order =
++            stableSortIndexRows(rewriter, loc, rows, elemType, key.isDescending);
++        indices2D = indices2D ? reorderRows(rewriter, loc, indices2D, order,
++                                            prePost, dSort)
++                              : order;
++      }
++      sortedKeys = fromRows(reorderRows(rewriter, loc,
++                                        toRows(adaptor.getInputs().front()),
++                                        indices2D, prePost, dSort),
++                            valueType);
++    } else if (keyElemType &&
++               (keyElemType.getWidth() == 32 || keyElemType.getWidth() == 64)) {
++      // 64-bit integers are 32-bit on device, so their keys sort the same way,
++      // e.g. the random uint64 keys of PyTorch's randperm.
+       auto indicesType = cast<RankedTensorType>(outputTypes[1]);
+       Value keyRows;
+       std::tie(keyRows, indices2D) = sortInt32KeyRows(
+@@ -9188,59 +9227,17 @@
+       return success();
+     }
+ 
+-    // SortType::kKeyValue - reorder each value tensor according to the sort
+-    // order. In rows, the sort indices index along dimension 1. Integer values
+-    // are gathered along it. ttnn.embedding only takes bf16 or f32 tables, so
+-    // other values use EmbeddingOp, which looks up flat indices into a
+-    // [total, 1] table:
+-    //   flat[i, j] = i * dSort + indices2D[i, j]
+-    // The row offsets i * dSort are exactly what ArangeOp(0, total, step=dSort,
+-    // dim=0) produces - one entry per row, broadcast across columns.
++    // SortType::kKeyValue - apply the permutation to each payload.
+     if (!indices2D) {
+       indices2D = toRows(indices);
+     }
+-    auto indices2DType = cast<RankedTensorType>(indices2D.getType());
+-    Value flatIndices;
+-    auto getFlatIndices = [&]() -> Value {
+-      if (!flatIndices) {
+-        auto rowOffsets = rewriter.create<ttir::ArangeOp>(
+-            loc, indices2DType, /*start=*/0, /*end=*/total,
+-            /*step=*/dSort, /*arange_dimension=*/0);
+-        flatIndices = rewriter.create<ttir::AddOp>(loc, indices2DType,
+-                                                   rowOffsets, indices2D);
+-      }
+-      return flatIndices;
+-    };
+-
+     SmallVector<Value> results{sortedKeys};
+-
+     for (size_t i = 1; i < srcOp.getInputs().size(); ++i) {
+       auto valType = cast<RankedTensorType>(
+           getTypeConverter()->convertType(srcOp.getResultTypes()[i]));
+-      Type elemType = valType.getElementType();
+-      Value val = toRows(srcOp.getInputs()[i]);
+-
+-      // Gathering integer rows is exact and avoids ttnn.gather's mishandling
+-      // of tensors above rank 4.
+-      if (auto intType = dyn_cast<IntegerType>(elemType);
+-          intType && intType.getWidth() >= 16) {
+-        val = rewriter.create<ttir::GatherOp>(loc, val.getType(), val,
+-                                              indices2D,
+-                                              rewriter.getI32IntegerAttr(1));
+-      } else {
+-        // Flatten to [total, 1] - EmbeddingOp requires 2D weights.
+-        val = rewriter.create<ttir::ReshapeOp>(
+-            loc, RankedTensorType::get({total, 1}, elemType), val,
+-            rewriter.getI32ArrayAttr({static_cast<int32_t>(total), 1}));
+-
+-        // EmbeddingOp: indices [prePost, dSort] * weights [total, 1]
+-        //   -> output [prePost, dSort, 1].
+-        val = rewriter.create<ttir::EmbeddingOp>(
+-            loc, RankedTensorType::get({prePost, dSort, 1}, elemType),
+-            getFlatIndices(), val);
+-      }
+-
+-      results.push_back(fromRows(val, valType));
++      Value rows = reorderRows(rewriter, loc, toRows(srcOp.getInputs()[i]),
++                               indices2D, prePost, dSort);
++      results.push_back(fromRows(rows, valType));
+     }
+ 
+     rewriter.replaceOp(srcOp, results);
+@@ -9250,19 +9247,250 @@
+ private:
+   enum SortType { kValueOnly = 0, kValueIndex = 1, kKeyValue = 2 };
+ 
+-  bool isValueIndexSort(mlir::OperandRange inputs) const {
++  struct SortKey {
++    unsigned input;
++    bool isDescending;
++  };
++
++  static std::optional<unsigned> getBlockArgument(Block &block, Value value) {
++    auto argument = dyn_cast<BlockArgument>(value);
++    if (!argument || argument.getOwner() != &block) {
++      return std::nullopt;
++    }
++    return argument.getArgNumber();
++  }
++
++  static bool isFloatSplat(Value value,
++                           llvm::function_ref<bool(const APFloat &)> accept) {
++    DenseFPElementsAttr attr;
++    return matchPattern(value, m_Constant(&attr)) && attr.isSplat() &&
++           accept(attr.getSplatValue<APFloat>());
++  }
++
++  // The block argument that a key operand is: the argument x itself, or JAX's
++  // canonical form of a float key, which makes -0 equal 0 and NaNs equal:
++  //   select(compare(x, x, NE), NaN, select(compare(x, 0, EQ), 0, x))
++  static std::optional<unsigned> getKeyArgument(Block &block, Value value) {
++    if (auto argument = getBlockArgument(block, value)) {
++      return argument;
++    }
++    auto nanSelect = value.getDefiningOp<mlir::stablehlo::SelectOp>();
++    if (!nanSelect) {
++      return std::nullopt;
++    }
++    auto isNan = nanSelect.getPred().getDefiningOp<mlir::stablehlo::CompareOp>();
++    auto zeroSelect =
++        nanSelect.getOnFalse().getDefiningOp<mlir::stablehlo::SelectOp>();
++    if (!isNan || !zeroSelect ||
++        isNan.getComparisonDirection() !=
++            mlir::stablehlo::ComparisonDirection::NE ||
++        isNan.getLhs() != isNan.getRhs() ||
++        !isFloatSplat(nanSelect.getOnTrue(),
++                      [](const APFloat &v) { return v.isNaN(); })) {
++      return std::nullopt;
++    }
++    Value x = isNan.getLhs();
++    auto isZero = zeroSelect.getPred().getDefiningOp<mlir::stablehlo::CompareOp>();
++    auto zero = [](const APFloat &v) { return v.isZero(); };
++    if (!isZero ||
++        isZero.getComparisonDirection() !=
++            mlir::stablehlo::ComparisonDirection::EQ ||
++        isZero.getLhs() != x || !isFloatSplat(isZero.getRhs(), zero) ||
++        !isFloatSplat(zeroSelect.getOnTrue(), zero) ||
++        zeroSelect.getOnFalse() != x) {
++      return std::nullopt;
++    }
++    return getBlockArgument(block, x);
++  }
++
++  // The input that `value` compares with `direction`, if it compares the
++  // input's two arguments (2i and 2i + 1).
++  static std::optional<SortKey>
++  getComparedKey(Block &block, Value value,
++                 mlir::stablehlo::ComparisonDirection direction) {
++    auto compareOp = value.getDefiningOp<mlir::stablehlo::CompareOp>();
++    if (!compareOp || compareOp.getComparisonDirection() != direction) {
++      return std::nullopt;
++    }
++    std::optional<unsigned> lhs = getKeyArgument(block, compareOp.getLhs());
++    std::optional<unsigned> rhs = getKeyArgument(block, compareOp.getRhs());
++    if (!lhs || !rhs || *lhs / 2 != *rhs / 2 || *lhs == *rhs) {
++      return std::nullopt;
++    }
++    // compare(rhs, lhs, LT) orders descending.
++    bool greater = direction == mlir::stablehlo::ComparisonDirection::GT ||
++                   direction == mlir::stablehlo::ComparisonDirection::GE;
++    return SortKey{*lhs / 2, greater != (*lhs % 2 == 1)};
++  }
++
++  static std::optional<SortKey> getStrictKey(Block &block, Value value) {
++    if (auto key = getComparedKey(block, value,
++                                  mlir::stablehlo::ComparisonDirection::LT)) {
++      return key;
++    }
++    return getComparedKey(block, value,
++                          mlir::stablehlo::ComparisonDirection::GT);
++  }
++
++  static bool isKeyEquality(Block &block, Value value, unsigned input) {
++    auto key =
++        getComparedKey(block, value, mlir::stablehlo::ComparisonDirection::EQ);
++    return key && key->input == input;
++  }
++
++  // The keys of a lexicographic comparator, most significant first; empty if
++  // the comparator isn't one. Each key compares the arguments of one input
++  // with LT or GT, and the less significant keys decide its ties:
++  //   select(compare(lhs, rhs, EQ), <less significant>, compare(lhs, rhs, LT))
++  //   or(compare(lhs, rhs, LT), and(compare(lhs, rhs, EQ), <less significant>))
++  // as torch_tpu (sparse coalesce) and JAX (lax.sort with num_keys > 1) build
++  // them. The last key is a single compare. A comparator that is a single
++  // non-strict compare, e.g. torch_tpu's GE that moves unique's boolean flags
++  // first, sorts the same way and only leaves the order of equal keys open.
++  SmallVector<SortKey> getComparatorKeys(mlir::stablehlo::SortOp &srcOp) const {
++    Block &block = srcOp.getComparator().front();
++    auto returnOp = dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
++    if (!returnOp || returnOp.getNumOperands() != 1) {
++      return {};
++    }
++    Value value = returnOp.getOperand(0);
++    for (auto direction : {mlir::stablehlo::ComparisonDirection::GE,
++                           mlir::stablehlo::ComparisonDirection::LE}) {
++      if (auto key = getComparedKey(block, value, direction)) {
++        return {*key};
++      }
++    }
++    SmallVector<SortKey> keys;
++    while (true) {
++      if (auto key = getStrictKey(block, value)) {
++        keys.push_back(*key);
++        break;
++      }
++      std::optional<SortKey> key;
++      Value lessSignificant;
++      if (auto selectOp = value.getDefiningOp<mlir::stablehlo::SelectOp>()) {
++        key = getStrictKey(block, selectOp.getOnFalse());
++        if (key && isKeyEquality(block, selectOp.getPred(), key->input)) {
++          lessSignificant = selectOp.getOnTrue();
++        }
++      } else if (auto orOp = value.getDefiningOp<mlir::stablehlo::OrOp>()) {
++        for (auto [strict, other] : {std::pair(orOp.getLhs(), orOp.getRhs()),
++                                     std::pair(orOp.getRhs(), orOp.getLhs())}) {
++          key = getStrictKey(block, strict);
++          auto andOp = other.getDefiningOp<mlir::stablehlo::AndOp>();
++          if (!key || !andOp) {
++            continue;
++          }
++          if (isKeyEquality(block, andOp.getLhs(), key->input)) {
++            lessSignificant = andOp.getRhs();
++          } else if (isKeyEquality(block, andOp.getRhs(), key->input)) {
++            lessSignificant = andOp.getLhs();
++          }
++          if (lessSignificant) {
++            break;
++          }
++        }
++      }
++      if (!lessSignificant) {
++        return {};
++      }
++      keys.push_back(*key);
++      value = lessSignificant;
++    }
++    return keys;
++  }
++
++  // Whether elements of type `type` hold 0, 1, ..., n - 1 exactly.
++  static bool holdsIndices(Type type, int64_t n) {
++    if (auto intType = dyn_cast<IntegerType>(type)) {
++      unsigned bits = intType.getWidth() - (intType.isUnsigned() ? 0 : 1);
++      return intType.getWidth() == 1 ? n <= 2
++                                     : bits >= 63 || n - 1 < (int64_t{1} << bits);
++    }
++    if (auto floatType = dyn_cast<FloatType>(type)) {
++      return n - 1 <= (int64_t{1} << floatType.getFPMantissaWidth());
++    }
++    return false;
++  }
++
++  // Only elide a directly recognizable iota. Converted, broadcast or
++  // reshaped values can still be sorted and gathered through the general path.
++  static bool isIotaAlong(Value value, int64_t dim) {
++    auto iota = value.getDefiningOp<mlir::stablehlo::IotaOp>();
++    auto type = cast<RankedTensorType>(value.getType());
++    return iota && static_cast<int64_t>(iota.getIotaDimension()) == dim &&
++           holdsIndices(type.getElementType(), type.getDimSize(dim));
++  }
++
++  // Reorders [prePost, dSort] rows along dimension 1 by index rows. Integers
++  // are gathered exactly. ttnn.embedding, which takes bf16 or f32 tables, looks
++  // up the others by flat indices in a [prePost * dSort, 1] table.
++  static Value reorderRows(ConversionPatternRewriter &rewriter, Location loc,
++                           Value rows, Value index, int64_t prePost,
++                           int64_t dSort) {
++    auto rowsType = cast<RankedTensorType>(rows.getType());
++    Type elemType = rowsType.getElementType();
++    if (auto intType = dyn_cast<IntegerType>(elemType);
++        intType && intType.getWidth() >= 16) {
++      return rewriter.create<ttir::GatherOp>(loc, rowsType, rows, index,
++                                             rewriter.getI32IntegerAttr(1));
++    }
++    auto indexType = cast<RankedTensorType>(index.getType());
++    int64_t total = prePost * dSort;
++    Value rowOffsets = rewriter.create<ttir::ArangeOp>(
++        loc, indexType, /*start=*/0, /*end=*/total, /*step=*/dSort,
++        /*arange_dimension=*/0);
++    Value flatIndices =
++        rewriter.create<ttir::AddOp>(loc, indexType, rowOffsets, index);
++    Value table = rewriter.create<ttir::ReshapeOp>(
++        loc, RankedTensorType::get({total, 1}, elemType), rows,
++        rewriter.getI32ArrayAttr({static_cast<int32_t>(total), 1}));
++    Value values = rewriter.create<ttir::EmbeddingOp>(
++        loc, RankedTensorType::get({prePost, dSort, 1}, elemType), flatIndices,
++        table);
++    return rewriter.create<ttir::ReshapeOp>(
++        loc, rowsType, values,
++        rewriter.getI32ArrayAttr(
++            {static_cast<int32_t>(prePost), static_cast<int32_t>(dSort)}));
++  }
++
++  // The indices of a stable sort of [prePost, dSort] key rows along
++  // dimension 1, as int32 rows. `elemType` is the keys' StableHLO type.
++  Value stableSortIndexRows(ConversionPatternRewriter &rewriter, Location loc,
++                            Value rows, Type elemType,
++                            bool isDescending) const {
++    auto rowsType = cast<RankedTensorType>(rows.getType());
++    auto intType = dyn_cast<IntegerType>(elemType);
++    if (intType && (intType.getWidth() == 32 || intType.getWidth() == 64)) {
++      return sortInt32KeyRows(rewriter, loc, rows, intType.isUnsigned(),
++                              rewriter.getI32Type(), isDescending)
++          .second;
++    }
++    // Signed 8- and 16-bit keys are int32 tensors on device, which ttnn.sort
++    // rejects. Their values are exact in float32.
++    if (intType && !intType.isUnsigned() &&
++        (intType.getWidth() == 8 || intType.getWidth() == 16)) {
++      rowsType = rowsType.clone(rewriter.getF32Type());
++      rows = rewriter.create<ttir::TypecastOp>(loc, rowsType, rows);
++    }
++    return rewriter
++        .create<ttir::SortOp>(
++            loc, TypeRange{rowsType, rowsType.clone(rewriter.getI32Type())},
++            rows, rewriter.getSI32IntegerAttr(1),
++            rewriter.getBoolAttr(isDescending), rewriter.getBoolAttr(true))
++        .getIndices();
++  }
++
++  // Whether the second of two inputs is an iota along the sort dimension of
++  // an integer type that the sort's indices can be.
++  bool isValueIndexSort(mlir::OperandRange inputs, int64_t sortDim) const {
+     if (inputs.size() != 2) {
+       return false;
+     }
+-
+-    Operation *op = inputs.back().getDefiningOp();
+-    while (
+-        isa_and_nonnull<mlir::stablehlo::BroadcastInDimOp,
+-                        mlir::stablehlo::ReshapeOp, mlir::stablehlo::ConvertOp>(
+-            op)) {
+-      op = op->getOperand(0).getDefiningOp();
+-    }
+-    return isa_and_nonnull<mlir::stablehlo::IotaOp>(op);
++    auto indexType = dyn_cast<IntegerType>(
++        cast<RankedTensorType>(inputs.back().getType()).getElementType());
++    return indexType && indexType.getWidth() >= 16 &&
++           isIotaAlong(inputs.back(), sortDim);
+   }
+ 
+   // ttnn.sort has no 32-bit integer path, and float32 cannot hold every
+@@ -9317,41 +9545,6 @@
+     Value highOrder = stableSort(gather(high, lowOrder));
+     Value indices = gather(lowOrder, highOrder);
+     return {gather(rows, indices), indices};
+-  }
+-
+-  mlir::FailureOr<bool> getSortDirection(mlir::stablehlo::SortOp &srcOp) const {
+-    Block &block = srcOp.getComparator().front();
+-    for (auto &op : block.getOperations()) {
+-      auto cmpOp = dyn_cast<mlir::stablehlo::CompareOp>(op);
+-      if (!cmpOp || !(cmpOp.getComparisonDirection() ==
+-                          mlir::stablehlo::ComparisonDirection::LT ||
+-                      cmpOp.getComparisonDirection() ==
+-                          mlir::stablehlo::ComparisonDirection::GT)) {
+-        continue;
+-      }
+-      return cmpOp.getComparisonDirection() ==
+-             mlir::stablehlo::ComparisonDirection::GT;
+-    }
+-    // A comparator that is only a non-strict comparison of the keys, e.g.
+-    // torch_tpu's `GE` that moves unique's boolean flags first, sorts the same
+-    // way and only leaves the order of equal keys open.
+-    auto returnOp = dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
+-    auto cmpOp =
+-        returnOp && returnOp.getNumOperands() == 1
+-            ? returnOp.getOperand(0).getDefiningOp<mlir::stablehlo::CompareOp>()
+-            : nullptr;
+-    if (cmpOp && cmpOp.getLhs() == block.getArgument(0) &&
+-        cmpOp.getRhs() == block.getArgument(1)) {
+-      if (cmpOp.getComparisonDirection() ==
+-          mlir::stablehlo::ComparisonDirection::GE) {
+-        return true;
+-      }
+-      if (cmpOp.getComparisonDirection() ==
+-          mlir::stablehlo::ComparisonDirection::LE) {
+-        return false;
+-      }
+-    }
+-    return mlir::failure();
+   }
+ };
+ 

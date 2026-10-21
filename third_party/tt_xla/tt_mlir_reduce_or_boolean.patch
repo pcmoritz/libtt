@@ -1,0 +1,55 @@
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -899,31 +899,6 @@ public:
+ };
+ } // namespace
+ 
+-// TTNN does not support reduction operation for logical or. So this reduction
+-// is performed by decomposing/converting into reduction sum (ttnn.sum op).
+-// If ttnn.sum output is zero then reduce_or output is false; otherwise the
+-// output is true.
+-// This is a performance optimization specific to TTNN backend.
+-namespace {
+-struct ReductionOrTTNNPattern : public OpConversionPattern<ttir::ReduceOrOp> {
+-public:
+-  using OpConversionPattern<ttir::ReduceOrOp>::OpConversionPattern;
+-
+-  LogicalResult
+-  matchAndRewrite(ttir::ReduceOrOp op, OpAdaptor adaptor,
+-                  ConversionPatternRewriter &rewriter) const override {
+-    RankedTensorType reduceOutputType = mlir::cast<RankedTensorType>(
+-        getTypeConverter()->convertType(op.getResult().getType()));
+-
+-    rewriter.replaceOpWithNewOp<ttir::SumOp>(
+-        op, reduceOutputType, adaptor.getInput(), op.getKeepDim(),
+-        op.getDimArgAttr());
+-
+-    return success();
+-  }
+-};
+-} // namespace
+-
+ // TTNN complete Decomposition for reduce_or Op.
+ namespace {
+ struct ReductionOrPattern : public OpConversionPattern<ttir::ReduceOrOp> {
+@@ -2625,16 +2600,9 @@ void populateTTIRToTTIRDecompositionPatterns(MLIRContext *ctx,
+       typeConverter, ctx);
+   patterns.add<NegativePadOpDecompositionPattern>(typeConverter, ctx);
+ 
+-  // Configure which ReductionPattern to add base on the configuration
+-  switch (decompConfig) {
+-  case DecompMode::CPUFallback:
+-    patterns.add<ReductionOrPattern>(typeConverter, ctx);
+-    break;
+-  case DecompMode::TTNN:
+-  case DecompMode::TTMetal:
+-    patterns.add<ReductionOrTTNNPattern>(typeConverter, ctx);
+-    break;
+-  }
++  // A boolean reduce_or is a sum compared with zero: the sum alone would
++  // store true as the number of true inputs.
++  patterns.add<ReductionOrPattern>(typeConverter, ctx);
+   patterns.add<ConvChannelLastDecompositionPattern<ttir::Conv2dOp>>(
+       typeConverter, ctx);
+   patterns.add<ConvChannelLastDecompositionPattern<ttir::ConvTranspose2dOp>>(
