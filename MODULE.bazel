@@ -509,6 +509,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_complex_reduce.patch",
         "//third_party/tt_xla:tt_mlir_complex_divide.patch",
         "//third_party/tt_xla:tt_mlir_complex_abs.patch",
+        "//third_party/tt_xla:tt_mlir_complex_transpose.patch",
         "//third_party/tt_xla:tt_mlir_empty_convolution.patch",
         "//third_party/tt_xla:tt_mlir_convolution.patch",
         "//third_party/tt_xla:tt_mlir_convolution_negative_padding.patch",
