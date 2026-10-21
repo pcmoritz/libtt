@@ -1,7 +1,7 @@
 """At O1 the optimizer can give a small pooling output a width-sharded L1
 layout whose shards are not whole tiles, and tilizing it for the next op
 failed ("Physical shard shape (30, 32) must be tile {32, 32} sized"). It is
-now tilized from DRAM."""
+now tilized directly by TTNN's padded tilize path."""
 
 import jax
 import jax.numpy as jnp

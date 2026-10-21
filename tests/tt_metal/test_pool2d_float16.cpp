@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -16,6 +17,8 @@
 #include <tt-metalium/mesh_device.hpp>
 
 #include "ttnn/operations/copy/typecast/typecast.hpp"
+#include "ttnn/operations/core/to_layout/to_layout_op.hpp"
+#include "ttnn/operations/core/to_memory_config/to_memory_config_op.hpp"
 #include "ttnn/operations/pool/generic/generic_pools.hpp"
 #include "ttnn/tensor/tensor.hpp"
 
@@ -137,6 +140,38 @@ TEST_F(Pool2dFloat16Test, AvgPoolIsWithinFloat16Rounding) { check_avg_pool(true,
 TEST_F(Pool2dFloat16Test, AvgPoolWithoutPaddingInCount) { check_avg_pool(false, std::nullopt); }
 
 TEST_F(Pool2dFloat16Test, AvgPoolWithDivisorOverride) { check_avg_pool(true, 7); }
+
+TEST_F(Pool2dFloat16Test, UnalignedOutputTilizesDirectly) {
+    // Float16 and bfloat16 layout conversions use a UINT16 storage view.
+    // Include a tile-aligned tensor whose individual shards are not aligned.
+    for (const auto [height, width, cores] :
+         {std::array<uint32_t, 3>{30, 32, 1}, {32, 48, 2}, {2, 64, 2}, {32, 64, 4}, {32, 64, 2}}) {
+        SCOPED_TRACE(::testing::Message() << height << "x" << width << " across " << cores << " cores");
+        std::vector<uint16_t> values(height * width);
+        for (size_t i = 0; i < values.size(); ++i) {
+            values[i] = static_cast<uint16_t>(i * 977 + 5);
+        }
+        const TensorSpec spec(
+            ttnn::Shape({1, 1, height, width}), TensorLayout(DataType::UINT16, PageConfig(Layout::ROW_MAJOR), {}));
+        for (const auto memory_layout : {TensorMemoryLayout::WIDTH_SHARDED, TensorMemoryLayout::HEIGHT_SHARDED}) {
+            SCOPED_TRACE(::testing::Message() << "memory layout " << static_cast<int>(memory_layout));
+            std::array<uint32_t, 2> shard_shape{height, width};
+            shard_shape[memory_layout == TensorMemoryLayout::HEIGHT_SHARDED ? 0 : 1] /= cores;
+            const MemoryConfig sharded(
+                memory_layout, BufferType::L1,
+                ShardSpec(CoreRangeSet({CoreRange({0, 0}, {cores - 1, 0})}), shard_shape, ShardOrientation::ROW_MAJOR));
+            const auto input = ttnn::to_memory_config(
+                ttnn::Tensor::from_vector(values, spec).to_device(mesh_device_.get()), sharded);
+            for (const auto& memory_config : {ttnn::L1_MEMORY_CONFIG, ttnn::DRAM_MEMORY_CONFIG}) {
+                const auto output = ttnn::to_layout(input, Layout::TILE, std::nullopt, memory_config);
+                EXPECT_EQ(output.layout(), Layout::TILE);
+                EXPECT_EQ(output.memory_config(), memory_config);
+                EXPECT_EQ(output.logical_shape(), input.logical_shape());
+                EXPECT_EQ(output.cpu().to_vector<uint16_t>(), values);
+            }
+        }
+    }
+}
 
 }  // namespace
 }  // namespace tt::tt_metal::distributed::test
