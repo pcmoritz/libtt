@@ -1,0 +1,33 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -3699,7 +3699,8 @@
+       // effective padding.
+       SmallVector<int64_t> effectivePadding(padding.asArrayRef());
+       if (mlir::stablehlo::PadOp padOp =
+-              getFusablePadOp(srcOp.getInputs()[i], spatialDimIndices)) {
++              getFusablePadOp(srcOp.getInputs()[i], srcOp.getInitValues()[i],
++                              spatialDimIndices)) {
+         effectivePadding = combinePaddingFromPadOp(padOp, padding.asArrayRef(),
+                                                    spatialDimIndices);
+ 
+@@ -4588,9 +4589,18 @@
+   // into the pooling operation. Returns the PadOp if fusable, nullptr
+   // otherwise.
+   mlir::stablehlo::PadOp
+-  getFusablePadOp(Value input, ArrayRef<size_t> spatialDimIndices) const {
++  getFusablePadOp(Value input, Value initValue,
++                  ArrayRef<size_t> spatialDimIndices) const {
+     auto padOp = input.getDefiningOp<mlir::stablehlo::PadOp>();
+     if (!padOp) {
++      return nullptr;
++    }
++
++    // Pooling supplies the reduction's init value at the border, so folding
++    // an explicit pad is valid only when it supplies that same value.
++    Attribute padValue, init;
++    if (!matchPattern(padOp.getPaddingValue(), m_Constant(&padValue)) ||
++        !matchPattern(initValue, m_Constant(&init)) || padValue != init) {
+       return nullptr;
+     }
+ 
