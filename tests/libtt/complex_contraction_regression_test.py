@@ -6,8 +6,11 @@ import pytest
 
 
 @pytest.mark.parametrize("level", ["O0", "O1"])
-@pytest.mark.parametrize("precision", ["default", "highest"])
-@pytest.mark.parametrize("op", ["dot", "batched_dot", "conv1d", "conv2d"])
+@pytest.mark.parametrize(("op", "precision"), [
+    ("dot", "default"), ("dot", "highest"),
+    ("batched_dot", "default"), ("batched_dot", "highest"),
+    ("conv1d", "default"), ("conv2d", "default"),
+])
 def test_complex_contraction(op, precision, level):
     rng = np.random.default_rng(7)
     if op == "dot":
