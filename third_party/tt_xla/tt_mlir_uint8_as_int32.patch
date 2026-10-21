@@ -75,11 +75,13 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
-@@ -655,6 +655,7 @@
+@@ -655,6 +655,9 @@
          // ttnn clamp TT_FATALs on uint8/uint16 inputs; its operands
          // workaround clamps them as int32.
          ttnn::ClampScalarOp::getOperationName(),
 +        ttnn::ClampTensorOp::getOperationName(),
++        ttnn::MaximumOp::getOperationName(),
++        ttnn::MinimumOp::getOperationName(),
          // TopK's operands workaround forces input bf16 + indices ui16/ui32;
          // without it, opt_level>=1 dtype propagation picks f32. See #8141.
          ttnn::TopKOp::getOperationName(),
