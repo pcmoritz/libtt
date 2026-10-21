@@ -14,7 +14,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    LogicalResult
    matchAndRewrite(mlir::stablehlo::ReduceWindowOp srcOp,
                    mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
-@@ -3643,11 +3649,36 @@
+@@ -3643,11 +3649,27 @@
  
      BoolAttr countIncludesPad = rewriter.getBoolAttr(true);
  
@@ -33,28 +33,19 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      SmallVector<Value> paddedInputs;
 +      for (auto [input, init] :
 +           llvm::zip(adaptor.getInputs(), adaptor.getInitValues())) {
-+        auto inputType = cast<RankedTensorType>(input.getType());
-+        SmallVector<int64_t> shape(inputType.getShape());
-+        for (int64_t dim = 0; dim < inputRank; ++dim) {
-+          if (shape[dim] != 0) {
-+            shape[dim] += (shape[dim] - 1) * interior[dim];
-+          }
-+        }
-+        paddedInputs.push_back(rewriter.create<mlir::stablehlo::PadOp>(
-+            srcOp.getLoc(), inputType.clone(shape), input, init,
++        paddedInputs.push_back(mlir::stablehlo::PadOp::create(
++            rewriter, srcOp.getLoc(), input, init,
 +            zeroPadding, zeroPadding, interior));
 +      }
-+      auto undilated = cast<mlir::stablehlo::ReduceWindowOp>(
-+          rewriter.clone(*srcOp.getOperation()));
-+      undilated.getInputsMutable().assign(paddedInputs);
-+      undilated.setBaseDilationsAttr(rewriter.getDenseI64ArrayAttr(
-+          SmallVector<int64_t>(inputRank, 1)));
-+      rewriter.replaceOp(srcOp, undilated.getResults());
++      rewriter.modifyOpInPlace(srcOp, [&] {
++        srcOp.getInputsMutable().assign(paddedInputs);
++        srcOp.removeBaseDilationsAttr();
++      });
 +      return success();
      }
  
      // Handle the special case of lowering to CumSumOp.
-@@ -4550,6 +4581,9 @@
+@@ -4550,6 +4572,9 @@
    std::optional<mlir::Operation *>
    extractDivisor(mlir::stablehlo::ReduceWindowOp &srcOp) const {
 +    if (srcOp->use_empty()) {
