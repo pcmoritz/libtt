@@ -63,11 +63,11 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
          mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
          mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
          mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp, mlir::stablehlo::DivOp,
-@@ -1272,6 +1320,7 @@
+@@ -1271,6 +1319,7 @@
+         ComplexBroadcastInDimOpConversionPattern,
          ComplexCompareOpConversionPattern,
          ComplexConstantOpConversionPattern, ComplexConvertOpConversionPattern,
-         ComplexGatherOpConversionPattern,
 +        ComplexScatterOpConversionPattern,
+         ComplexGatherOpConversionPattern,
          ComplexIotaOpConversionPattern,
          ComplexDivOpConversionPattern,
-         ComplexMulOpConversionPattern,
