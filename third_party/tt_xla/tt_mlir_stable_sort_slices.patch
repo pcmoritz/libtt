@@ -1,15 +1,32 @@
 diff --git a/lib/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.cpp b/lib/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.cpp
 --- a/lib/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.cpp
 +++ b/lib/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.cpp
-@@ -160,7 +160,10 @@
-   SliceStaticOp activeSlice = valuesSlice ? valuesSlice : indicesSlice;
-   auto sliceResult =
-       validateAndExtractK(activeSlice, sortDim, inputShape, rank);
--  if (!sliceResult.has_value()) {
-+  // Keep fusion within the selection kernel's 64-result limit. Larger
-+  // selections can exceed TopK's sorting-network workspace. Suffix slices
-+  // also need the original order, which inverting `largest` would reverse.
-+  if (!sliceResult.has_value() || sliceResult->fromEnd || sliceResult->k > 64) {
+@@ -164,6 +164,14 @@
      return failure();
    }
  
++  // Preserve boolean key metadata across type normalization. Keep TopK's
++  // large-K route (up to 2048); larger selections need the full sort's
++  // workspace. Suffixes must also retain the original sort/tie order.
++  if (srcOp->hasAttr("ttir.boolean_sort_keys") &&
++      (sliceResult->fromEnd || sliceResult->k > 2048)) {
++    return failure();
++  }
++
+   // Map sort's descending attribute to topk's largest attribute.
+   // When slicing from the end, the relationship is inverted.
+   bool largest =
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -9201,6 +9201,10 @@
+       auto sortOp = rewriter.create<ttir::SortOp>(
+           loc, sortTypes, keys, rewriter.getSI32IntegerAttr(sortDim),
+           rewriter.getBoolAttr(*isDescending), rewriter.getBoolAttr(isStable));
++      // Preserve the source key domain when boolean types are normalized.
++      if (keyElemType && keyElemType.getWidth() == 1) {
++        sortOp->setAttr("ttir.boolean_sort_keys", rewriter.getUnitAttr());
++      }
+       sortedKeys = sortOp.getValues();
+       if (isNarrowSignedKey) {
+         sortedKeys =
