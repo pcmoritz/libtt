@@ -18,7 +18,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
    static mlir::Value matchExpandedSigmoidInput(mlir::Value value) {
      auto divOp =
          ttmlir::utils::lookThrough<TypecastOp>(value).getDefiningOp<DivOp>();
-@@ -826,6 +829,35 @@ public:
+@@ -826,6 +829,42 @@ public:
    }
  };
  
@@ -42,11 +42,18 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    if (inputType.getShape() != outputType.getShape()) {
 +      return mlir::failure();
 +    }
-+    // Preserve the expanded computation's precision when its input was promoted.
-+    if (inputType != outputType) {
++    // Keep a promotion before the fused computation, not after its rounded result.
++    if (inputType.getElementTypeBitWidth() < outputType.getElementTypeBitWidth()) {
 +      input = rewriter.create<TypecastOp>(divOp->getLoc(), outputType, input);
++      inputType = outputType;
 +    }
-+    rewriter.replaceOpWithNewOp<SigmoidOp>(divOp, outputType, input);
++    mlir::Value sigmoid =
++        rewriter.create<SigmoidOp>(divOp->getLoc(), inputType, input);
++    if (inputType != outputType) {
++      sigmoid =
++          rewriter.create<TypecastOp>(divOp->getLoc(), outputType, sigmoid);
++    }
++    rewriter.replaceOp(divOp, sigmoid);
 +    return mlir::success();
 +  }
 +};
@@ -54,7 +61,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  std::optional<mlir::Value> matchNumericallyStableSoftplus(mlir::Value op) {
    // common utility to match the numerically stable softplus
    // NumericallyStableSoftplus = where[cond, x, ln(1 + e^x)]
-@@ -2392,21 +2424,24 @@ private:
+@@ -2392,21 +2431,24 @@ private:
  
  // Scaled sum to mean pattern matcher that transforms:
  //   multiply(sum<dim=[...]>(act), 1/(dim1*dim2*...))
@@ -84,7 +91,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
      if (!sumOp || !sumOp.getDimArg() || !sumOp->hasOneUse()) {
        return mlir::failure();
      }
-@@ -2414,14 +2449,15 @@ public:
+@@ -2414,14 +2456,15 @@ public:
      auto reduceDims = *sumOp.getDimArg();
      auto inputShape = sumOp.getInput().getType().getShape();
  
@@ -102,7 +109,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  
      return mlir::success();
    }
-@@ -2447,7 +2483,9 @@ private:
+@@ -2447,7 +2490,9 @@ private:
        product *= inputShape[dim];
      }
  
@@ -113,7 +120,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
      float tolerance =
          std::max(FLOAT_TOLERANCE, std::abs(expectedValue) * FLOAT_TOLERANCE);
      return isFullOpWithValue(fullOp, expectedValue, tolerance);
-@@ -3148,7 +3186,10 @@ private:
+@@ -3148,7 +3193,10 @@ private:
  
  namespace {
  
@@ -125,7 +132,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  class RMSNormFusionPattern : public mlir::OpRewritePattern<MultiplyOp> {
    using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
  
-@@ -3206,7 +3247,18 @@ public:
+@@ -3206,7 +3254,18 @@ public:
        gammaRaw = outerMul.getLhs();
      }
      if (!innerMul) {
@@ -145,7 +152,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
      }
  
      RsqrtOp rsqrtOp =
-@@ -3282,6 +3334,9 @@ public:
+@@ -3282,6 +3341,9 @@ public:
      }
  
      if (!squareInput || squareInput != x) {
@@ -155,7 +162,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
        mlir::Value swappedX = dropSubtractZero(gammaRaw);
        if (squareInput != swappedX) {
          return mlir::failure();
-@@ -3299,10 +3354,21 @@ public:
+@@ -3299,10 +3361,21 @@ public:
        return mlir::failure();
      }
  
@@ -179,7 +186,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
      auto gammaType = mlir::cast<RankedTensorType>(gamma.getType());
      // Gamma must be [D] or [1, ..., 1, D]. Validate before creating any ops.
      auto gammaShape = gammaType.getShape();
-@@ -4098,6 +4164,139 @@ public:
+@@ -4098,6 +4171,139 @@ public:
    }
  };
  
@@ -319,7 +326,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -4147,7 +4346,8 @@ public:
+@@ -4147,7 +4353,8 @@ public:
        }
        patterns.add<RepVGGConvSumFusionPattern>(&getContext());
        patterns.add<ConcatenateHeadsUpdatePattern>(&getContext());
@@ -329,7 +336,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
        patterns.add<SpatialMeanOptimizationPattern>(&getContext());
        patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
        patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
-@@ -4162,6 +4362,7 @@ public:
+@@ -4162,6 +4369,7 @@ public:
        patterns.add<GeluFusionPattern>(&getContext());
        patterns.add<Relu6FusionPattern>(&getContext());
        patterns.add<SiluFusionPattern>(&getContext());
@@ -337,7 +344,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
        patterns.add<HardsigmoidFusionPattern>(&getContext());
        patterns.add<MishFusingPattern>(&getContext());
        patterns.add<ReshapeBroadcastReshapeToRepeatPattern>(&getContext());
-@@ -4180,6 +4381,13 @@ public:
+@@ -4180,6 +4388,13 @@ public:
        config.setUseTopDownTraversal(true);
        (void)applyPatternsGreedily(getOperation(), std::move(patterns), config);
      }
