@@ -1,12 +1,13 @@
 diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 --- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 +++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
-@@ -359,6 +359,20 @@
+@@ -359,6 +359,21 @@
            op.getLoc(),
            RankedTensorType::get(matmulDestinationShape, elementType),
            lhsMatmulInput, rhsMatmulInput);
-+    } else if (elementType.isF32() && lhsResultDims.empty() &&
-+               rhsResultDims.empty()) {
++    } else if (elementType.isF32() && lhsType.getElementType().isF32() &&
++               rhsType.getElementType().isF32() &&
++               lhsResultDims.empty() && rhsResultDims.empty()) {
 +      // Inner products need no M/N expansion. Keep K in the last dimension
 +      // for a compact product and an accurate SFPU sum instead of TF32 matmul.
 +      Value rhsVector = createMatmulFinal(
