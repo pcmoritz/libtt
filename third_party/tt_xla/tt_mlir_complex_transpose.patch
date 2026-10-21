@@ -1,0 +1,48 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+@@ -939,6 +939,27 @@
+   }
+ };
+ 
++// Keep the trailing real/imaginary pair together when transposing complex data.
++class ComplexTransposeOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::TransposeOp> {
++  using OpConversionPattern::OpConversionPattern;
++
++public:
++  LogicalResult matchAndRewrite(
++      mlir::stablehlo::TransposeOp op,
++      mlir::stablehlo::TransposeOp::Adaptor adaptor,
++      ConversionPatternRewriter &rewriter) const override {
++    auto resultType = cast<RankedTensorType>(
++        getTypeConverter()->convertType(op.getType()));
++    SmallVector<int64_t> permutation(op.getPermutation());
++    permutation.push_back(resultType.getRank() - 1);
++    rewriter.replaceOpWithNewOp<mlir::stablehlo::TransposeOp>(
++        op, resultType, adaptor.getOperand(),
++        rewriter.getDenseI64ArrayAttr(permutation));
++    return success();
++  }
++};
++
+ // Rewrites stablehlo::BroadcastInDimOp with complex-typed tensor results
+ // by appending the trailing real/imag dimension to the broadcast dimensions
+ // and producing a new broadcast over the equivalent real tensor type.
+@@ -1233,6 +1254,8 @@
+     target.addIllegalOp<mlir::stablehlo::ComplexOp, mlir::stablehlo::RealOp,
+                         mlir::stablehlo::ImagOp>();
+ 
++    target.addDynamicallyLegalOp<mlir::stablehlo::TransposeOp>(isNotComplexType);
++
+     auto hasComplexType = [](TypeRange types) {
+       return llvm::any_of(types, [](Type t) {
+         auto rtt = mlir::dyn_cast<RankedTensorType>(t);
+@@ -1278,6 +1301,7 @@
+         ComplexReduceOpConversionPattern,
+         ComplexSelectOpConversionPattern,
+         ComplexSliceOpConversionPattern,
++        ComplexTransposeOpConversionPattern,
+         ComplexTypeDefaultConversionPattern<mlir::stablehlo::AddOp>,
+         ComplexTypeDefaultConversionPattern<mlir::stablehlo::ConcatenateOp>,
+         ComplexTypeDefaultConversionPattern<mlir::stablehlo::NegOp>,
