@@ -12,6 +12,8 @@ import pytest
 @pytest.mark.parametrize(
     "shape, padding, value",
     [
+        ((3, 5), ((1, 0), (2, 3)), 7),
+        ((3, 5), ((0, 2), (0, 1)), 7),
         ((5, 7), ((1, 0), (2, 3)), 7),
         ((5, 7), ((0, 2), (0, 1)), 255),
         ((3, 1), ((0, 0), (5, 0)), 9),
@@ -26,7 +28,9 @@ def test_uint8_pad(shape, padding, value, level, tmp_path):
         lambda a: jnp.pad(a, padding, constant_values=np.uint8(value)),
         compiler_options={"optimization_level": level, "export_path": str(tmp_path)},
     )
-    np.testing.assert_array_equal(f(jax.device_put(x, jax.devices("tt")[0])), np.pad(x, padding, constant_values=value))
+    got = f(jax.device_put(x, jax.devices("tt")[0]))
+    assert got.dtype == np.uint8
+    np.testing.assert_array_equal(got, np.pad(x, padding, constant_values=value))
     ir = "\n".join(path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir"))
     assert "ttnn.pad" in ir
     assert "ttnn.typecast" not in ir
