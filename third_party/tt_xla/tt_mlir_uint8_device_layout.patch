@@ -1,0 +1,16 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+@@ -509,6 +509,12 @@
+     if (!hasLayoutChange(input, output)) {
+       return false;
+     }
++    // UInt8 argmax consumes row-major input; untilize it on device without
++    // copying through the host. Keep the existing tilize/typecast ordering.
++    if (input.isTiled() && input.getDataType() == ttcore::DataType::UInt8 &&
++        output.getDataType() == ttcore::DataType::UInt8) {
++      return false;
++    }
+     return !isOnDeviceLayoutChangeSupportedForDataType(input.getDataType()) &&
+            !isOnDeviceLayoutChangeSupportedForDataType(output.getDataType());
+   }
