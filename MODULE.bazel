@@ -544,6 +544,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_count_leading_zeros.patch",
         "//third_party/tt_xla:tt_mlir_is_finite_bool_alias.patch",
         "//third_party/tt_xla:tt_mlir_scalar_reduce_window.patch",
+        "//third_party/tt_xla:tt_mlir_reduce_window_base_dilation.patch",
         "//third_party/tt_xla:tt_mlir_remove_bitwise_not_workaround.patch",
         "//third_party/tt_xla:tt_mlir_lower_jax_argmin.patch",
         "//third_party/tt_xla:tt_mlir_argmax_singleton_index.patch",
