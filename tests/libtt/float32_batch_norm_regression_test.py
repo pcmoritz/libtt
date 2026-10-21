@@ -1,12 +1,15 @@
 """float32 stablehlo.batch_norm_training/inference against float64.
 
 ttnn's batch_norm normalizes exactly, but ran with approximate math (off by
-about 1e-3) when the program's compute config left it unset, and its training
-op returns running statistics with Bessel's correction, not StableHLO's
-biased batch variance. Inference runs on ttnn's batch_norm; training computes
-the centered batch statistics with reductions and normalizes with it."""
+about 1e-3) when the program's compute config left it unset, and training
+returned the running statistics, with Bessel's correction, instead of
+StableHLO's biased batch variance. Training now returns the batch mean and
+variance that ttnn::batch_norm_training normalizes with."""
+
+import re
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax._src.core import ShapedArray
@@ -54,7 +57,14 @@ mlir.register_lowering(
     ],
 )
 
-SHAPES = [((4, 5, 6, 7), 1), ((3, 10), 1), ((2, 8, 33), 1), ((2, 6, 7, 5), 3), ((2, 3, 4, 5, 6), 1)]
+SHAPES = [
+    ((4, 5, 6, 7), 1),
+    ((3, 10), 1),
+    ((2, 8, 33), 1),
+    ((2, 6, 7, 5), 3),
+    ((2, 3, 4, 5, 6), 1),
+    ((8, 3, 56, 56), 1),  # 25088 elements per channel
+]
 EPSILON = 1e-5
 
 
@@ -71,14 +81,20 @@ def inputs(shape, feature_index):
     return x, scale, offset
 
 
+@pytest.mark.parametrize("optimization_level", ["O0", "O1"])
 @pytest.mark.parametrize("shape,feature_index", SHAPES)
-def test_batch_norm_training(shape, feature_index):
+def test_batch_norm_training(shape, feature_index, optimization_level, tmp_path):
     x, scale, offset = inputs(shape, feature_index)
     device = jax.devices("tt")[0]
     run = jax.jit(
-        lambda *args: bn_training_p.bind(*args, epsilon=EPSILON, feature_index=feature_index)
+        lambda *args: bn_training_p.bind(*args, epsilon=EPSILON, feature_index=feature_index),
+        compiler_options={"optimization_level": optimization_level, "export_path": str(tmp_path)},
     )
     output, mean, variance = run(*(jax.device_put(a, device) for a in (x, scale, offset)))
+    # One native op returns the output and the batch statistics.
+    (ir,) = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert len(re.findall(r'%\w+, %\w+, %\w+ = "ttnn\.batch_norm_training"', ir)) == 1
+    assert "ttnn.mean" not in ir
 
     axes = tuple(d for d in range(len(shape)) if d != feature_index)
     x64 = x.astype(np.float64)
@@ -172,3 +188,33 @@ def test_batch_norm_training_high_offset():
     np.testing.assert_allclose(variance, variance64, rtol=1e-3)
     expected = (x64 - per_channel(mean64, shape, 1)) / np.sqrt(per_channel(variance64, shape, 1) + EPSILON)
     np.testing.assert_allclose(output, expected, atol=1e-2)
+
+
+def nchw_training_reference(x64):
+    mean, variance = x64.mean(axis=(0, 2, 3)), x64.var(axis=(0, 2, 3))
+    output = (x64 - mean[None, :, None, None]) / np.sqrt(variance[None, :, None, None] + EPSILON)
+    return output, mean, variance
+
+
+@pytest.mark.parametrize("optimization_level", ["O0", "O1"])
+def test_batch_norm_training_constant_scale_and_offset(optimization_level):
+    """Scale 1 and offset 0 as constants, like the zero and one running
+    statistics that training used to update in place, so that later calls and
+    later batch norms read updated constants: two batch norms in one graph,
+    run on new inputs three times."""
+
+    def two_batch_norms(x):
+        ones, zeros = jnp.ones(x.shape[1], x.dtype), jnp.zeros(x.shape[1], x.dtype)
+        first = bn_training_p.bind(x, ones, zeros, epsilon=EPSILON, feature_index=1)
+        second = bn_training_p.bind(first[0] * 2 + 3, ones, zeros, epsilon=EPSILON, feature_index=1)
+        return *first, *second
+
+    run = jax.jit(two_batch_norms, compiler_options={"optimization_level": optimization_level})
+    device = jax.devices("tt")[0]
+    for call in range(3):
+        x = (np.random.default_rng(call).standard_normal((4, 5, 6, 7)) * (call + 1) + call).astype(np.float32)
+        first = nchw_training_reference(x.astype(np.float64))
+        expected = first + nchw_training_reference(first[0] * 2 + 3)
+        got = run(jax.device_put(x, device))
+        for value, want in zip(got, expected):
+            np.testing.assert_allclose(np.asarray(value), want, rtol=1e-5, atol=1e-5)

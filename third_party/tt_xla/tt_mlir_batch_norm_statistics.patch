@@ -1,0 +1,647 @@
+diff --git a/include/ttmlir/Conversion/TTNNToEmitC/EmitCConversion.h b/include/ttmlir/Conversion/TTNNToEmitC/EmitCConversion.h
+--- a/include/ttmlir/Conversion/TTNNToEmitC/EmitCConversion.h
++++ b/include/ttmlir/Conversion/TTNNToEmitC/EmitCConversion.h
+@@ -2528,12 +2528,16 @@
+     }
+ 
+     // SortOp and TopKOp returns a std::vector<ttnn::Tensor> containing two
+-    // elements: [0] = values tensor, [1] = corresponding indices. Extract both
+-    // elements to replace the original Op.
++    // elements: [0] = values tensor, [1] = corresponding indices;
++    // BatchNormTrainingOp one with the output, batch mean and batch variance.
++    // Extract the elements to replace the original Op.
+     if constexpr (std::is_same_v<TTNNOp, tt::ttnn::SortOp> ||
+-                  std::is_same_v<TTNNOp, tt::ttnn::TopKOp>) {
+-      assert(op.getNumResults() == 2 &&
+-             "Expected two outputs (values tensor and indices).");
++                  std::is_same_v<TTNNOp, tt::ttnn::TopKOp> ||
++                  std::is_same_v<TTNNOp, tt::ttnn::BatchNormTrainingOp>) {
++      assert(op.getNumResults() ==
++                 (std::is_same_v<TTNNOp, tt::ttnn::BatchNormTrainingOp> ? 3u
++                                                                         : 2u) &&
++             "Expected one result per returned tensor.");
+       using ReturnTy = std::vector<::ttnn::Tensor>;
+       auto callOp = rewriter.create<emitc::CallOpaqueOp>(
+           op.getLoc(), rewriter.getType<emitc::OpaqueType>(TypeNameV<ReturnTy>),
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -2378,19 +2378,20 @@
+   let hasVerifier = 1;
+ }
+ 
+-def TTIR_BatchNormTrainingOp : TTIR_NamedOp<"batch_norm_training"> {
++def TTIR_BatchNormTrainingOp : TTIR_NamedOp<"batch_norm_training", [AttrSizedOperandSegments]> {
+   let summary = "BatchNormTraining operation";
+   let description = [{
+     Performs batch normalization during training on the input tensor. Normalizes the `operand` tensor
+     across all dimensions except for the specified `dimension` (feature dimension) and
+-    produces the normalized result along with batch statistics. Updates the running mean and variance.
++    produces the normalized result along with batch statistics. Updates the running mean and variance,
++    if given.
+ 
+     Inputs:
+     - `operand` (Tensor): The input tensor to be normalized.
+     - `scale` (Tensor): The scale parameter (gamma).
+     - `offset` (Tensor): The offset parameter (beta).
+-    - `running_mean` (Tensor): The running mean (updated during training).
+-    - `running_variance` (Tensor): The running variance (updated during training).
++    - `running_mean` (Tensor, optional): The running mean (updated during training).
++    - `running_variance` (Tensor, optional): The running variance (updated during training).
+ 
+     Attributes:
+     - `epsilon` is a small constant added to variance for numerical stability.
+@@ -2425,8 +2426,8 @@
+   let arguments = (ins AnyRankedTensor:$operand,
+                        AnyRankedTensor:$scale,
+                        AnyRankedTensor:$offset,
+-                       AnyRankedTensor:$running_mean,
+-                       AnyRankedTensor:$running_variance,
++                       Optional<AnyRankedTensor>:$running_mean,
++                       Optional<AnyRankedTensor>:$running_variance,
+                        F32Attr:$epsilon,
+                        I32Attr:$dimension,
+                        F32Attr:$momentum);
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -2846,7 +2846,8 @@
+     let summary = "Batch normalization training op.";
+     let description = [{
+       Batch normalization operation for training over each channel on input tensor.
+-      Computes batch statistics and updates running mean and variance.
++      Returns the normalized input and the batch mean and (biased) batch variance
++      it normalizes with, and updates running mean and variance.
+     }];
+ 
+     let arguments = (ins AnyRankedTensor:$input,
+@@ -2858,16 +2859,20 @@
+                          Optional<AnyRankedTensor>:$bias,
+                          OptionalAttr<TTNN_DeviceComputeKernelConfig>:$compute_config);
+ 
+-    let results = (outs AnyRankedTensor:$result);
++    let results = (outs AnyRankedTensor:$result,
++                        AnyRankedTensor:$batch_mean,
++                        AnyRankedTensor:$batch_var);
+ 
+     let builders = [
+-      OpBuilder<(ins "Type":$result, "Value":$input,
++      OpBuilder<(ins "Type":$result, "Type":$batch_mean, "Type":$batch_var,
++                     "Value":$input,
+                      "Value":$running_mean, "Value":$running_var,
+                      "llvm::APFloat":$epsilon, "llvm::APFloat":$momentum,
+                      "Value":$weight, "Value":$bias),
+       [{
+-        build($_builder, $_state, result, input, running_mean, running_var,
+-              epsilon, momentum, weight, bias, /*compute_config=*/nullptr);
++        build($_builder, $_state, result, batch_mean, batch_var, input,
++              running_mean, running_var, epsilon, momentum, weight, bias,
++              /*compute_config=*/nullptr);
+       }]>
+     ];
+ 
+diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/ttmlir/Target/TTNN/operations/normalization.fbs
+--- a/include/ttmlir/Target/TTNN/operations/normalization.fbs
++++ b/include/ttmlir/Target/TTNN/operations/normalization.fbs
+@@ -35,6 +35,8 @@
+   memory_config: tt.target.ttnn.MemoryConfig;
+   out: tt.target.ttnn.TensorRef;
+   compute_config: tt.target.ttnn.DeviceComputeKernelConfig;
++  batch_mean: tt.target.ttnn.TensorRef;
++  batch_var: tt.target.ttnn.TensorRef;
+ }
+ 
+ table RMSNormOp {
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -1387,17 +1387,12 @@
+     // Default momentum for batch norm training
+     FloatAttr momentumAttr = rewriter.getF32FloatAttr(1.0f);
+ 
+-    auto runningMean = rewriter.create<ttir::ZerosOp>(
+-        loc, meanType, llvm::to_vector_of<int32_t>(meanType.getShape()));
+-    auto runningVariance = rewriter.create<ttir::OnesOp>(
+-        loc, varianceType,
+-        llvm::to_vector_of<int32_t>(varianceType.getShape()));
+-
++    // StableHLO's batch norm has no running statistics to update.
+     rewriter.replaceOpWithNewOp<mlir::tt::ttir::BatchNormTrainingOp>(
+         srcOp, TypeRange{outputType, meanType, varianceType},
+         adaptor.getOperand(), adaptor.getScale(), adaptor.getOffset(),
+-        runningMean, runningVariance, adaptor.getEpsilonAttr(), dimensionAttr,
+-        momentumAttr);
++        /*running_mean=*/nullptr, /*running_variance=*/nullptr,
++        adaptor.getEpsilonAttr(), dimensionAttr, momentumAttr);
+ 
+     return success();
+   }
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -1695,16 +1695,17 @@
+           op, "BatchNormTrainingOp offset must be 1D or 4D tensor");
+     }
+ 
+-    auto meanType =
+-        mlir::cast<RankedTensorType>(adaptor.getRunningMean().getType());
+-    if (!isValidBatchNormWeightType(meanType)) {
++    // The running statistics are optional.
++    if (adaptor.getRunningMean() &&
++        !isValidBatchNormWeightType(mlir::cast<RankedTensorType>(
++            adaptor.getRunningMean().getType()))) {
+       return rewriter.notifyMatchFailure(
+           op, "BatchNormTrainingOp running_mean must be 1D or 4D tensor");
+     }
+ 
+-    auto varType =
+-        mlir::cast<RankedTensorType>(adaptor.getRunningVariance().getType());
+-    if (!isValidBatchNormWeightType(varType)) {
++    if (adaptor.getRunningVariance() &&
++        !isValidBatchNormWeightType(mlir::cast<RankedTensorType>(
++            adaptor.getRunningVariance().getType()))) {
+       return rewriter.notifyMatchFailure(
+           op, "BatchNormTrainingOp running_variance must be 1D or 4D tensor");
+     }
+@@ -1719,9 +1720,13 @@
+     mlir::Value offset4D =
+         getBatchNorm4DTensor(rewriter, loc, adaptor.getOffset());
+     mlir::Value mean4D =
+-        getBatchNorm4DTensor(rewriter, loc, adaptor.getRunningMean());
++        adaptor.getRunningMean()
++            ? getBatchNorm4DTensor(rewriter, loc, adaptor.getRunningMean())
++            : nullptr;
+     mlir::Value variance4D =
+-        getBatchNorm4DTensor(rewriter, loc, adaptor.getRunningVariance());
++        adaptor.getRunningVariance()
++            ? getBatchNorm4DTensor(rewriter, loc, adaptor.getRunningVariance())
++            : nullptr;
+ 
+     // Create output types with normalized shape and 4D weight tensors
+     auto originalOutputType = mlir::cast<RankedTensorType>(
+@@ -1730,9 +1735,20 @@
+         normalizedShape, originalOutputType.getElementType(),
+         originalOutputType.getEncoding());
+ 
+-    // running_mean and running_variance results should be 4D [1, C, 1, 1]
+-    auto mean4DType = mlir::cast<RankedTensorType>(mean4D.getType());
+-    auto variance4DType = mlir::cast<RankedTensorType>(variance4D.getType());
++    // batch_mean and batch_variance results should be 4D [1, C, 1, 1], like
++    // the scale
++    auto originalMeanType =
++        mlir::cast<RankedTensorType>(op.getBatchMean().getType());
++    auto originalVarianceType =
++        mlir::cast<RankedTensorType>(op.getBatchVariance().getType());
++    llvm::ArrayRef<int64_t> stat4DShape =
++        mlir::cast<RankedTensorType>(scale4D.getType()).getShape();
++    auto mean4DType = RankedTensorType::get(
++        stat4DShape, originalMeanType.getElementType(),
++        originalMeanType.getEncoding());
++    auto variance4DType = RankedTensorType::get(
++        stat4DShape, originalVarianceType.getElementType(),
++        originalVarianceType.getEncoding());
+ 
+     // After normalization, feature dimension is always at index 1 (NCHW)
+     mlir::Type integerType = mlir::IntegerType::get(rewriter.getContext(), 32);
+@@ -1751,11 +1767,6 @@
+                             normalizedShape, featureIndex, rewriter, loc);
+ 
+     // Reshape batch_mean and batch_variance from 4D [1, C, 1, 1] back to 1D [C]
+-    auto originalMeanType =
+-        mlir::cast<RankedTensorType>(op.getBatchMean().getType());
+-    auto originalVarianceType =
+-        mlir::cast<RankedTensorType>(op.getBatchVariance().getType());
+-
+     mlir::Value reshapedMean = reshapeBatchNorm4DTo1D(
+         rewriter, loc, batchNormTrainingOp.getResults()[1], originalMeanType);
+     mlir::Value reshapedVariance = reshapeBatchNorm4DTo1D(
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecompositionPass.cpp
+@@ -120,10 +120,13 @@
+         [&](ttir::BatchNormTrainingOp op) {
+           auto scaleType = op.getScale().getType();
+           auto offsetType = op.getOffset().getType();
+-          auto meanType = op.getRunningMean().getType();
+-          auto varType = op.getRunningVariance().getType();
++          // The running statistics are optional.
++          auto isRank4 = [](mlir::TypedValue<RankedTensorType> stat) {
++            return !stat || stat.getType().getRank() == 4;
++          };
+           return (scaleType.getRank() == 4 && offsetType.getRank() == 4 &&
+-                  meanType.getRank() == 4 && varType.getRank() == 4);
++                  isRank4(op.getRunningMean()) &&
++                  isRank4(op.getRunningVariance()));
+         });
+ 
+     // ttml::metal::adamw only accepts 4D tensors.
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -1211,19 +1211,19 @@
+     }
+ 
+     // Convert result types
+-    auto resultType =
+-        this->getTypeConverter()->convertType(op.getResult().getType());
++    SmallVector<Type> resultTypes;
++    if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
++                                                      resultTypes))) {
++      return failure();
++    }
+ 
+     auto batchNormTrainingOp = rewriter.create<ttnn::BatchNormTrainingOp>(
+-        op.getLoc(), resultType, adaptor.getOperand(), adaptor.getRunningMean(),
++        op.getLoc(), resultTypes[0], resultTypes[1], resultTypes[2],
++        adaptor.getOperand(), adaptor.getRunningMean(),
+         adaptor.getRunningVariance(), adaptor.getEpsilon(),
+         adaptor.getMomentum(), adaptor.getScale(), adaptor.getOffset());
+ 
+-    // TTIR expects the running mean and variance to be returned as separate
+-    // results.
+-    rewriter.replaceOp(op, {batchNormTrainingOp.getResult(),
+-                            batchNormTrainingOp.getRunningMean(),
+-                            batchNormTrainingOp.getRunningVar()});
++    rewriter.replaceOp(op, batchNormTrainingOp.getResults());
+     return success();
+   }
+ };
+diff --git a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
+--- a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
++++ b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
+@@ -4282,12 +4282,12 @@
+     ttnn_to_emitc::EmitCTTNNEmitter<mlir::tt::ttnn::BatchNormTrainingOp>
+         emitter(srcOp, adaptor, rewriter);
+ 
+-    // For training BatchNormTrainingOp, training is true
++    // ttnn::batch_norm_training returns the output, batch mean and batch
++    // variance, and updates running_mean/running_var in-place
+     llvm::SmallVector<mlir::Attribute> args{
+         emitter.emit(srcOp.getInput()),
+         emitter.emit(srcOp.getRunningMean()),
+         emitter.emit(srcOp.getRunningVar()),
+-        emitter.emit(true), // training
+         emitter.emit(srcOp.getEpsilon()),
+         emitter.emit(srcOp.getMomentum()),
+         emitter.emit(srcOp.getWeight()),
+@@ -4297,18 +4297,7 @@
+         emitter.emit(srcOp.getComputeConfig()),
+     };
+ 
+-    // ttnn::batch_norm with training=true returns the output tensor and
+-    // updates running_mean/running_var in-place
+-    auto resultType =
+-        this->getTypeConverter()->convertType(srcOp.getResult().getType());
+-
+-    auto callOp = rewriter.create<emitc::CallOpaqueOp>(
+-        srcOp.getLoc(), resultType, "ttnn::batch_norm",
+-        rewriter.getArrayAttr(args), /*template_args=*/nullptr,
+-        adaptor.getOperands());
+-
+-    // The batch stats are the updated running_mean and running_var
+-    rewriter.replaceOp(srcOp, callOp.getResult(0));
++    emitter.replaceOp(*this, args);
+ 
+     return success();
+   }
+diff --git a/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp b/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
+--- a/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
++++ b/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
+@@ -3501,14 +3501,6 @@
+ class BatchNormTrainingOpConversionPattern
+     : public TTNNToEmitPyBaseOpConversionPattern<
+           mlir::tt::ttnn::BatchNormTrainingOp> {
+-private:
+-  std::string getPrefixSearchPattern() const override {
+-    return "ttnn.batch_norm_training";
+-  }
+-  std::string getPrefixSwapPattern() const override {
+-    return "ttnn.batch_norm";
+-  }
+-
+ public:
+   using TTNNToEmitPyBaseOpConversionPattern<
+       mlir::tt::ttnn::BatchNormTrainingOp>::TTNNToEmitPyBaseOpConversionPattern;
+@@ -3520,12 +3512,12 @@
+     ttnn_to_emitpy::EmitPyTTNNEmitter<mlir::tt::ttnn::BatchNormTrainingOp>
+         emitter(srcOp, adaptor, rewriter);
+ 
+-    // For training BatchNormTrainingOp, training is true
++    // ttnn.batch_norm_training returns the output, batch mean and batch
++    // variance, and updates running_mean/running_var in-place
+     llvm::SmallVector<mlir::Attribute> args{
+         emitter.emit(srcOp.getInput()),
+         emitter.emit(srcOp.getRunningMean(), "running_mean"),
+         emitter.emit(srcOp.getRunningVar(), "running_var"),
+-        emitter.emit(true, "training"),
+         emitter.emit(srcOp.getEpsilon(), "eps"),
+         emitter.emit(srcOp.getMomentum(), "momentum"),
+         emitter.emit(srcOp.getWeight(), "weight"),
+diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+--- a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
++++ b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+@@ -4240,15 +4240,26 @@
+ unpackBatchNormOptionalArgs(const std::vector<TTNNLayoutAttr> &inputs,
+                             BatchNormOpType op) {
+   BatchNormOptionalArgs ret;
+-  if (inputs.size() == 5) {
++  if (inputs.size() == 1) {
++    return ret;
++  }
++  // inputs has the layouts of the operands the op has, in operand order.
++  auto layout = inputs.begin() + 1;
++  if (op.getRunningMean()) {
+     ret.runningMeanShape = op.getRunningMean().getType().getShape();
++    ret.runningMeanLayout = *layout++;
++  }
++  if (op.getRunningVar()) {
+     ret.runningVarShape = op.getRunningVar().getType().getShape();
++    ret.runningVarLayout = *layout++;
++  }
++  if (op.getWeight()) {
+     ret.weightShape = op.getWeight().getType().getShape();
++    ret.weightLayout = *layout++;
++  }
++  if (op.getBias()) {
+     ret.biasShape = op.getBias().getType().getShape();
+-    ret.runningMeanLayout = inputs[1];
+-    ret.runningVarLayout = inputs[2];
+-    ret.weightLayout = inputs[3];
+-    ret.biasLayout = inputs[4];
++    ret.biasLayout = *layout++;
+   }
+   return ret;
+ }
+@@ -4303,12 +4314,10 @@
+     const std::vector<TTNNLayoutAttr> &inputs, const OpConfig &opConfig,
+     std::optional<llvm::ArrayRef<op_model::OpModelAllocationRecord>>
+         liveRecords) {
+-  assert((inputs.size() == 1 || inputs.size() == 5) &&
+-         "ttnn::batch_norm_training can either have 1 input tensor "
+-         "(representing the main input) or 5 input tensors (representing main "
+-         "input tensor, running_mean, running_var, weight and bias). The "
+-         "usage of this *this with 2-4 input tensors is discouraged as it's "
+-         "ambiguous.");
++  assert((inputs.size() == 1 || inputs.size() == (*this)->getNumOperands()) &&
++         "ttnn::batch_norm_training takes the main input's layout or one "
++         "layout per operand (input, and running_mean, running_var, weight "
++         "and bias where present).");
+ 
+   const auto inputShape = getInput().getType().getShape();
+ 
+@@ -4327,12 +4336,10 @@
+ llvm::Expected<size_t>
+ BatchNormTrainingOp::getOpRuntime(const std::vector<TTNNLayoutAttr> &inputs,
+                                   const OpConfig &opConfig) {
+-  assert((inputs.size() == 1 || inputs.size() == 5) &&
+-         "ttnn::batch_norm_training can either have 1 input tensor "
+-         "(representing the "
+-         "main input) or 5 input tensors (representing main input tensor, "
+-         "running_mean, running_var, weight and bias). The usage of this op "
+-         "with 2-4 input tensors is discouraged as it's ambiguous.");
++  assert((inputs.size() == 1 || inputs.size() == (*this)->getNumOperands()) &&
++         "ttnn::batch_norm_training takes the main input's layout or one "
++         "layout per operand (input, and running_mean, running_var, weight "
++         "and bias where present).");
+ 
+   const auto inputShape = getInput().getType().getShape();
+ 
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -3925,10 +3925,10 @@
+   if (op.getInput().getType().getRank() != 4) {
+     return op.emitOpError("Input tensor must have rank 4");
+   }
+-  if (op.getRunningMean().getType().getRank() != 4) {
++  if (op.getRunningMean() && op.getRunningMean().getType().getRank() != 4) {
+     return op.emitOpError("Running mean tensor must have rank 4");
+   }
+-  if (op.getRunningVar().getType().getRank() != 4) {
++  if (op.getRunningVar() && op.getRunningVar().getType().getRank() != 4) {
+     return op.emitOpError("Running variance tensor must have rank 4");
+   }
+   if (op.getWeight().getType().getRank() != 4) {
+diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
+--- a/lib/OpModel/TTNN/TTNNOpModel.cpp
++++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
+@@ -7400,17 +7400,15 @@
+   std::optional<::ttnn::DeviceComputeKernelConfig> computeKernelConfig =
+       std::nullopt;
+ 
+-  // For training mode
+-  bool training = true;
+-
+   std::optional<MockAllocatorState> initialStateOpt =
+       initialState ? std::optional<MockAllocatorState>(*initialState)
+                    : std::nullopt;
+ 
++  // The output, batch mean and batch variance, as the runtime runs it.
+   auto batchNormQuery = [=]() {
+     return QUERY_OP_CONSTRAINTS_WITH_STATE(
+-        ::ttnn::batch_norm, device, initialStateOpt, inputSpec, runningMeanSpec,
+-        runningVarSpec, training, epsilon.convertToFloat(),
++        ::ttnn::batch_norm_training, device, initialStateOpt, inputSpec,
++        runningMeanSpec, runningVarSpec, epsilon.convertToFloat(),
+         momentum.convertToFloat(), weightSpec, biasSpec, outputSpec,
+         detail::getNullableMemoryConfig(outputLayout), computeKernelConfig);
+   };
+@@ -7457,14 +7455,11 @@
+   std::optional<::ttnn::DeviceComputeKernelConfig> computeKernelConfig =
+       std::nullopt;
+ 
+-  // For training mode
+-  bool training = true;
+-
+   // Create query closure
+   auto batchNormQuery = [=]() {
+     return QUERY_OP_RUNTIME(
+-        ::ttnn::batch_norm, device, inputSpec, runningMeanSpec, runningVarSpec,
+-        training, epsilon.convertToFloat(), momentum.convertToFloat(),
++        ::ttnn::batch_norm_training, device, inputSpec, runningMeanSpec,
++        runningVarSpec, epsilon.convertToFloat(), momentum.convertToFloat(),
+         weightSpec, biasSpec, outputSpec,
+         detail::getNullableMemoryConfig(outputLayout), computeKernelConfig);
+   };
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -1678,12 +1678,15 @@
+   flatbuffers::Offset<::tt::target::ttnn::TensorRef> input =
+       cache.at<::tt::target::ttnn::TensorRef>(
+           getOperandThroughDPSOps(op.getInput()));
++  // The running statistics are optional.
+   ::flatbuffers::Offset<::tt::target::ttnn::TensorRef> runningMean =
+-      cache.at<::tt::target::ttnn::TensorRef>(
+-          getOperandThroughDPSOps(op.getRunningMean()));
++      op.getRunningMean() ? cache.at<::tt::target::ttnn::TensorRef>(
++                                getOperandThroughDPSOps(op.getRunningMean()))
++                          : 0;
+   ::flatbuffers::Offset<::tt::target::ttnn::TensorRef> runningVar =
+-      cache.at<::tt::target::ttnn::TensorRef>(
+-          getOperandThroughDPSOps(op.getRunningVar()));
++      op.getRunningVar() ? cache.at<::tt::target::ttnn::TensorRef>(
++                               getOperandThroughDPSOps(op.getRunningVar()))
++                         : 0;
+   ::flatbuffers::Offset<::tt::target::ttnn::TensorRef> weight =
+       cache.at<::tt::target::ttnn::TensorRef>(
+           getOperandThroughDPSOps(op.getWeight()));
+@@ -1696,6 +1699,12 @@
+       cache.getOrCreateNoSharding(op.getResult(), tensorValueToFlatbuffer,
+ 
+                                   /*local_shape*/ std::nullopt);
++  ::flatbuffers::Offset<::tt::target::ttnn::TensorRef> batchMean =
++      cache.getOrCreateNoSharding(op.getBatchMean(), tensorValueToFlatbuffer,
++                                  /*local_shape*/ std::nullopt);
++  ::flatbuffers::Offset<::tt::target::ttnn::TensorRef> batchVar =
++      cache.getOrCreateNoSharding(op.getBatchVar(), tensorValueToFlatbuffer,
++                                  /*local_shape*/ std::nullopt);
+ 
+   auto memoryConfig = toFlatbuffer(cache, op.getMemoryConfigAttr());
+ 
+@@ -1707,7 +1716,8 @@
+   return ::tt::target::ttnn::CreateBatchNormTrainingOp(
+       *cache.fbb, input, runningMean, runningVar,
+       op.getEpsilon().convertToFloat(), op.getMomentum().convertToFloat(),
+-      weight, bias, memoryConfig, output, computeConfig.value_or(0));
++      weight, bias, memoryConfig, output, computeConfig.value_or(0), batchMean,
++      batchVar);
+ }
+ 
+ ::flatbuffers::Offset<::tt::target::ttnn::AdamWOp>
+diff --git a/runtime/lib/ttnn/operations/normalization/batch_norm.cpp b/runtime/lib/ttnn/operations/normalization/batch_norm.cpp
+--- a/runtime/lib/ttnn/operations/normalization/batch_norm.cpp
++++ b/runtime/lib/ttnn/operations/normalization/batch_norm.cpp
+@@ -6,6 +6,25 @@
+ #include "tt/runtime/detail/ttnn/operations/utils.h"
+ 
+ namespace tt::runtime::ttnn::operations::batch_norm {
++namespace {
++// The program's compute config, with math_approx_mode off unless the program
++// sets it: ttnn's batch_norm is exact by default, while
++// createDeviceComputeKernelConfig starts from approximate math, which is off
++// by about 1e-3.
++std::optional<::ttnn::DeviceComputeKernelConfig>
++computeConfig(const ::tt::target::ttnn::DeviceComputeKernelConfig *config) {
++  if (!config) {
++    return std::nullopt;
++  }
++  ::ttnn::DeviceComputeKernelConfig result =
++      utils::createDeviceComputeKernelConfig(config);
++  if (!config->math_approx_mode()) {
++    result.math_approx_mode = false;
++  }
++  return result;
++}
++} // namespace
++
+ void run(const ::tt::target::ttnn::BatchNormInferenceOp *op,
+          ProgramContext &context) {
+   ProgramTensorPool &tensorPool = context.getTensorPool();
+@@ -21,17 +40,13 @@
+   const ::ttnn::Tensor &bias = tensorPool.getTTNNTensorAndValidate(op->bias());
+ 
+   float epsilon = op->epsilon();
+-  std::optional<::ttnn::DeviceComputeKernelConfig> computeConfig;
+-  if (op->compute_config()) {
+-    computeConfig =
+-        utils::createDeviceComputeKernelConfig(op->compute_config());
+-  }
+ 
+   // For inference: training=false, momentum=0.1 (default, not used in
+   // inference)
+   ::ttnn::Tensor output = ::ttnn::batch_norm(
+       input, runningMean, runningVar, false, epsilon, 0.1f, weight, bias,
+-      /*output=*/std::nullopt, /*memory_config=*/std::nullopt, computeConfig);
++      /*output=*/std::nullopt, /*memory_config=*/std::nullopt,
++      computeConfig(op->compute_config()));
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), output);
+ }
+@@ -42,10 +57,16 @@
+ 
+   const ::ttnn::Tensor &input =
+       tensorPool.getTTNNTensorAndValidate(op->input());
+-  ::ttnn::Tensor &runningMean =
+-      tensorPool.getTTNNTensorAndValidate(op->running_mean());
+-  ::ttnn::Tensor &runningVar =
+-      tensorPool.getTTNNTensorAndValidate(op->running_var());
++  // The running statistics are optional; given ones share their buffers with
++  // the pool's tensors, which are updated in place.
++  std::optional<::ttnn::Tensor> runningMean;
++  if (op->running_mean()) {
++    runningMean = tensorPool.getTTNNTensorAndValidate(op->running_mean());
++  }
++  std::optional<::ttnn::Tensor> runningVar;
++  if (op->running_var()) {
++    runningVar = tensorPool.getTTNNTensorAndValidate(op->running_var());
++  }
+   const ::ttnn::Tensor &weight =
+       tensorPool.getTTNNTensorAndValidate(op->weight());
+   const ::ttnn::Tensor &bias = tensorPool.getTTNNTensorAndValidate(op->bias());
+@@ -53,17 +74,15 @@
+   float epsilon = op->epsilon();
+   float momentum = op->momentum();
+ 
+-  // For training: training=true
+-  std::optional<::ttnn::DeviceComputeKernelConfig> computeConfig;
+-  if (op->compute_config()) {
+-    computeConfig =
+-        utils::createDeviceComputeKernelConfig(op->compute_config());
+-  }
+-
+-  ::ttnn::Tensor output = ::ttnn::batch_norm(
+-      input, runningMean, runningVar, true, epsilon, momentum, weight, bias,
+-      /*output=*/std::nullopt, /*memory_config=*/std::nullopt, computeConfig);
+-
+-  tensorPool.insertTTNNTensorAndValidate(op->out(), output);
++  // The output and the batch mean and (biased) variance it is normalized
++  // with; runningMean and runningVar, if given, are updated in place.
++  std::vector<::ttnn::Tensor> outputs = ::ttnn::batch_norm_training(
++      input, runningMean, runningVar, epsilon, momentum, weight, bias,
++      /*output=*/std::nullopt, /*memory_config=*/std::nullopt,
++      computeConfig(op->compute_config()));
++
++  tensorPool.insertTTNNTensorAndValidate(op->out(), outputs[0]);
++  tensorPool.insertTTNNTensorAndValidate(op->batch_mean(), outputs[1]);
++  tensorPool.insertTTNNTensorAndValidate(op->batch_var(), outputs[2]);
+ }
+ } // namespace tt::runtime::ttnn::operations::batch_norm
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -1878,7 +1878,9 @@
+     break;
+   }
+   case ::tt::target::ttnn::OpType::BatchNormTrainingOp: {
+-    tensorRefs = {opContext.type_as_BatchNormTrainingOp()->out()};
++    tensorRefs = {opContext.type_as_BatchNormTrainingOp()->out(),
++                  opContext.type_as_BatchNormTrainingOp()->batch_mean(),
++                  opContext.type_as_BatchNormTrainingOp()->batch_var()};
+     break;
+   }
+   case ::tt::target::ttnn::OpType::MaxPool2dWithIndicesOp: {
+@@ -2401,11 +2403,18 @@
+     break;
+   }
+   case ::tt::target::ttnn::OpType::BatchNormTrainingOp: {
+-    tensorRefs = {opContext.type_as_BatchNormTrainingOp()->input(),
+-                  opContext.type_as_BatchNormTrainingOp()->running_mean(),
+-                  opContext.type_as_BatchNormTrainingOp()->running_var(),
+-                  opContext.type_as_BatchNormTrainingOp()->weight(),
+-                  opContext.type_as_BatchNormTrainingOp()->bias()};
++    // The running statistics are optional.
++    tensorRefs = {opContext.type_as_BatchNormTrainingOp()->input()};
++    if (opContext.type_as_BatchNormTrainingOp()->running_mean()) {
++      tensorRefs.push_back(
++          opContext.type_as_BatchNormTrainingOp()->running_mean());
++    }
++    if (opContext.type_as_BatchNormTrainingOp()->running_var()) {
++      tensorRefs.push_back(
++          opContext.type_as_BatchNormTrainingOp()->running_var());
++    }
++    tensorRefs.push_back(opContext.type_as_BatchNormTrainingOp()->weight());
++    tensorRefs.push_back(opContext.type_as_BatchNormTrainingOp()->bias());
+     break;
+   }
+   case ::tt::target::ttnn::OpType::AdamWOp: {
