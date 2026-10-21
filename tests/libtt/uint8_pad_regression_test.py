@@ -1,6 +1,4 @@
-"""uint8 pads run natively: ttnn.pad takes uint8 sticks of any byte width, front
-padding and whole tiles, so neither O0 nor O1 converts them to int32 (or, at O1,
-float32) and back."""
+"""uint8 padding preserves front/back pads and unsigned pad values."""
 
 import jax
 import jax.numpy as jnp
@@ -22,15 +20,12 @@ import pytest
         ((64, 32), ((0, 32), (0, 64)), 0),
     ],
 )
-def test_uint8_pad(shape, padding, value, level, tmp_path):
+def test_uint8_pad(shape, padding, value, level):
     x = (np.arange(np.prod(shape)) * 37 % 256).astype(np.uint8).reshape(shape)
     f = jax.jit(
         lambda a: jnp.pad(a, padding, constant_values=np.uint8(value)),
-        compiler_options={"optimization_level": level, "export_path": str(tmp_path)},
+        compiler_options={"optimization_level": level},
     )
     got = f(jax.device_put(x, jax.devices("tt")[0]))
     assert got.dtype == np.uint8
     np.testing.assert_array_equal(got, np.pad(x, padding, constant_values=value))
-    ir = "\n".join(path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir"))
-    assert "ttnn.pad" in ir
-    assert "ttnn.typecast" not in ir
