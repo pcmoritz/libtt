@@ -101,6 +101,23 @@ def test_sparse_coalesce_order():
         np.testing.assert_array_equal(result, operand[order])
 
 
+def test_repeated_key():
+    """A key that comes again among the less significant ones is only reached
+    when it ties, so it changes nothing: (row, row descending, iota) sorts by
+    row and keeps ties in order."""
+    rows = ties(np.int32, (64,), 4, seed=19)
+    iota = np.arange(64, dtype=np.int32)
+
+    def comparator(lhs_row, rhs_row, lhs_iota, rhs_iota):
+        ties_by_iota = lax.select(lax.eq(lhs_row, rhs_row), lax.lt(lhs_iota, rhs_iota), lax.gt(lhs_row, rhs_row))
+        return lax.select(lax.eq(lhs_row, rhs_row), ties_by_iota, lax.lt(lhs_row, rhs_row))
+
+    got_rows, got_iota = sort((rows, iota), comparator)
+    order = lexsort_order([rows], ["LT"])
+    np.testing.assert_array_equal(got_iota, order)
+    np.testing.assert_array_equal(got_rows, rows[order])
+
+
 def flags_first(lhs_flag, rhs_flag, lhs_iota, rhs_iota):
     return lax.select(lax.eq(lhs_flag, rhs_flag), lax.lt(lhs_iota, rhs_iota), lax.gt(lhs_flag, rhs_flag))
 
