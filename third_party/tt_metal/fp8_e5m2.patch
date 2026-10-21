@@ -450,3 +450,15 @@ diff --git ttnn/core/tensor/xtensor/partition.cpp ttnn/core/tensor/xtensor/parti
  // NOLINTEND(bugprone-macro-parentheses)
  
  #undef EXPLICIT_INSTANTIATIONS_FOR_TYPE
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
+@@ -496,7 +496,7 @@
+     // UINT8 and float8 tiles hold the same bytes, so a bitcast between them is a view (a copy through the
+     // unpacker would read the float8 bytes as numbers).
+     auto is_byte_type = [](DataType dtype) {
+-        return dtype == DataType::UINT8 || dtype == DataType::FP8_E4M3;
++        return dtype == DataType::UINT8 || dtype == DataType::FP8_E4M3 || dtype == DataType::FP8_E5M2;
+     };
+     if (is_byte_type(input_tensor.dtype()) && is_byte_type(output_dtype)) {
+         TT_FATAL(

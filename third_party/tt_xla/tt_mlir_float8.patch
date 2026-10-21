@@ -742,69 +742,6 @@ diff --git a/lib/OpModel/TTNN/Conversion.cpp b/lib/OpModel/TTNN/Conversion.cpp
    default:
      throw std::runtime_error("Invalid element type");
    }
-diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
---- a/lib/OpModel/TTNN/TTNNOpModel.cpp
-+++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
-@@ -19,6 +19,7 @@
- #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute.hpp"
- #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.hpp"
- #include "ttnn/operations/experimental/transformer/dit_rms_norm_unary_fused/dit_rms_norm_unary_fused.hpp"
-+#include "ttnn/tensor/tensor_ops.hpp"
- 
- #include "mlir/IR/AttrTypeSubElements.h"
- #include "mlir/IR/Attributes.h"
-@@ -2649,6 +2650,17 @@
- // BitcastConvertOp
- //===----------------------------------------------------------------------===//
- 
-+// A bitcast between UInt8 and float8, which the runtime makes a view.
-+[[maybe_unused]] static bool isByteBitcast(ttcore::DataType input,
-+                                           ttcore::DataType output) {
-+  auto isByteType = [](ttcore::DataType dtype) {
-+    return dtype == ttcore::DataType::UInt8 ||
-+           dtype == ttcore::DataType::Float8E4M3FN ||
-+           dtype == ttcore::DataType::Float8E5M2;
-+  };
-+  return isByteType(input) && isByteType(output);
-+}
-+
- llvm::Expected<OpConstraints> OpModel<BitcastConvertOp>::getOpConstraints(
-     llvm::ArrayRef<int64_t> inputShape, TTNNLayoutAttr inputLayout,
-     ttcore::DataTypeAttr dtype, TTNNLayoutAttr outputLayout,
-@@ -2665,6 +2677,17 @@
-       initialState ? std::optional<MockAllocatorState>(*initialState)
-                    : std::nullopt;
- 
-+  // UInt8 and float8 hold the same bytes, and the runtime's bitcast is a view.
-+  if (isByteBitcast(inputLayout.getDataType(), dtype.getValue())) {
-+    auto viewQuery = [=]() {
-+      return QUERY_OP_CONSTRAINTS_WITH_STATE(
-+          ::ttnn::unchecked_reinterpret_dtype, device, initialStateOpt,
-+          inputSpec, conversion::getDataType(dtype.getValue()));
-+    };
-+    return operation::getOpConstraintsWithState(inputLayout.getContext(),
-+                                                viewQuery);
-+  }
-+
-   // Create query closure
-   auto bitcastOpQuery = [=]() {
-     return QUERY_OP_CONSTRAINTS_WITH_STATE(
-@@ -2691,6 +2714,15 @@
-       ::tt::tt_metal::TensorSpec inputSpec,
-       detail::convertToTensorSpec(device, inputShape, inputLayout));
- 
-+  if (isByteBitcast(inputLayout.getDataType(), dtype.getValue())) {
-+    auto viewQuery = [=]() {
-+      return QUERY_OP_RUNTIME(::ttnn::unchecked_reinterpret_dtype, device,
-+                              inputSpec,
-+                              conversion::getDataType(dtype.getValue()));
-+    };
-+    return operation::getOpRuntime(viewQuery);
-+  }
-+
-   // Create query closure
-   auto bitcastOpQuery = [=]() {
-     return QUERY_OP_RUNTIME(::ttnn::bitcast, device, inputSpec,
 diff --git a/runtime/include/tt/runtime/detail/common/common.h b/runtime/include/tt/runtime/detail/common/common.h
 --- a/runtime/include/tt/runtime/detail/common/common.h
 +++ b/runtime/include/tt/runtime/detail/common/common.h
@@ -840,41 +777,6 @@ diff --git a/runtime/lib/common/utils.cpp b/runtime/lib/common/utils.cpp
      return true;
    case ::tt::target::DataType::Float64:
    case ::tt::target::DataType::Int64:
-diff --git a/runtime/lib/ttnn/operations/layout/bitcast_convert.cpp b/runtime/lib/ttnn/operations/layout/bitcast_convert.cpp
---- a/runtime/lib/ttnn/operations/layout/bitcast_convert.cpp
-+++ b/runtime/lib/ttnn/operations/layout/bitcast_convert.cpp
-@@ -8,6 +8,7 @@
- 
- #include "tt/runtime/detail/ttnn/operations/utils.h"
- #include "tt/runtime/detail/ttnn/utils.h"
-+#include "ttnn/tensor/tensor_ops.hpp"
- 
- namespace tt::runtime::ttnn::operations::layout {
- void run(const ::tt::target::ttnn::BitcastConvertOp *op,
-@@ -22,8 +23,21 @@
-   std::optional<::ttnn::MemoryConfig> memoryConfig =
-       ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(op->memcfg());
- 
--  ::ttnn::Tensor out =
--      ::ttnn::bitcast(inputTensor, targetDataType, memoryConfig);
-+  // UInt8 and float8 tiles hold the same bytes: the bitcast is a view
-+  // (ttnn::bitcast would convert, since the unpacker reads Fp8_e4m3 and Lf8
-+  // as numbers).
-+  auto isByteType = [](::ttnn::DataType dtype) {
-+    return dtype == ::ttnn::DataType::UINT8 ||
-+           dtype == ::ttnn::DataType::FP8_E4M3 ||
-+           dtype == ::ttnn::DataType::FP8_E5M2;
-+  };
-+  ::ttnn::Tensor out;
-+  if (isByteType(inputTensor.dtype()) && isByteType(targetDataType) &&
-+      (!memoryConfig || *memoryConfig == inputTensor.memory_config())) {
-+    out = ::ttnn::unchecked_reinterpret_dtype(inputTensor, targetDataType);
-+  } else {
-+    out = ::ttnn::bitcast(inputTensor, targetDataType, memoryConfig);
-+  }
- 
-   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
- }
 diff --git a/runtime/lib/ttnn/operations/matmul/matmul.cpp b/runtime/lib/ttnn/operations/matmul/matmul.cpp
 --- a/runtime/lib/ttnn/operations/matmul/matmul.cpp
 +++ b/runtime/lib/ttnn/operations/matmul/matmul.cpp
