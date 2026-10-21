@@ -1,6 +1,6 @@
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/reshape_tiled_windows.cpp b/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/reshape_tiled_windows.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/reshape_tiled_windows.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/reshape_tiled_windows.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/reshape_tiled_windows.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/reshape_tiled_windows.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/reshape_tiled_windows.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/reshape_tiled_windows.cpp
 @@ -4,8 +4,7 @@
  
  // A tiled reshape planned on the host (ReshapeViewTiledProgramFactory): every segment of this core's
@@ -67,9 +67,9 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/d
      }
      noc.async_write_barrier();
  }
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/writer_reshape_tiled.cpp b/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/writer_reshape_tiled.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/writer_reshape_tiled.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/writer_reshape_tiled.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/writer_reshape_tiled.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/writer_reshape_tiled.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/writer_reshape_tiled.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/writer_reshape_tiled.cpp
 @@ -32,6 +32,9 @@
      bool first = true;
      const uint32_t working_write_addr = working.get_base_address();
@@ -80,9 +80,9 @@ diff --git a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/d
          dfb_mapping.wait_front(1);
          const uint32_t map_addr = dfb_mapping.get_read_ptr();
          auto map_ptr = reinterpret_cast<volatile tt_l1_ptr SegmentMapData*>(map_addr);
-diff --git a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_tiled_program_factory.cpp b/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_tiled_program_factory.cpp
---- a/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_tiled_program_factory.cpp
-+++ b/ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_tiled_program_factory.cpp
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_tiled_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_tiled_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_tiled_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_tiled_program_factory.cpp
 @@ -281,7 +281,6 @@
      const uint32_t element_size = tt::datum_size(data_format);
      const uint32_t alignment = std::max(hal::get_dram_alignment(), hal::get_l1_alignment());
