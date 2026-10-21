@@ -1,14 +1,17 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -110,6 +110,12 @@ getPaddingOrDefault(mlir::DenseIntElementsAttr attr, size_t numSpatialDims) {
+@@ -110,6 +110,15 @@ getPaddingOrDefault(mlir::DenseIntElementsAttr attr, size_t numSpatialDims) {
    return llvm::SmallVector<int64_t>(numSpatialDims * 2, 0);
  }
  
 +static bool hasUnsupportedFloatType(Type type) {
++  // The later element-type normalization pass narrows f64 to f32, as for
++  // the other TTIR operations. Reject formats that it cannot normalize.
 +  return mlir::isa<FloatType>(type) &&
 +         type.getIntOrFloatBitWidth() != 16 &&
-+         type.getIntOrFloatBitWidth() != 32;
++         type.getIntOrFloatBitWidth() != 32 &&
++         type.getIntOrFloatBitWidth() != 64;
 +}
 +
  // Typical initialization values for reduction ops.
@@ -103,7 +106,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    if (hasUnsupportedFloatType(lhsType) ||
 +        hasUnsupportedFloatType(rhsType)) {
 +      return rewriter.notifyMatchFailure(
-+          srcOp, "only 16- and 32-bit float inputs are supported");
++          srcOp, "unsupported floating-point input type");
 +    }
  
      auto outputType = mlir::cast<RankedTensorType>(
@@ -114,7 +117,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
                            ConversionPatternRewriter &rewriter) const {
 +    if (hasUnsupportedFloatType(srcOp.getValue().getElementType())) {
 +      return rewriter.notifyMatchFailure(
-+          srcOp, "only 16- and 32-bit float constants are supported");
++          srcOp, "unsupported floating-point constant type");
 +    }
 +
      if (isa<DenseElementsAttr, DenseResourceElementsAttr>(srcOp.getValue()) &&

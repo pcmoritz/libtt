@@ -8,6 +8,35 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 import numpy as np
+import pytest
+
+
+@pytest.mark.parametrize("level", ["O0", "O1"])
+@pytest.mark.parametrize("op", ["matmul", "conv1d", "conv2d"])
+def test_float64_contraction(op, level):
+    """f64 contractions reach the same f32 normalization as elementwise ops."""
+    with jax.enable_x64(True):
+        if op == "matmul":
+            x = np.arange(12, dtype=np.float64).reshape(3, 4) / 8
+            w = np.arange(8, dtype=np.float64).reshape(4, 2) / 8
+            run = lambda x, w: x @ w
+        else:
+            shape = (1, 5, 2) if op == "conv1d" else (1, 4, 5, 2)
+            kernel = (2, 2, 3) if op == "conv1d" else (2, 2, 2, 3)
+            dims = ("NWC", "WIO", "NWC") if op == "conv1d" else (
+                "NHWC", "HWIO", "NHWC"
+            )
+            x = np.arange(np.prod(shape), dtype=np.float64).reshape(shape) / 8
+            w = np.ones(kernel, dtype=np.float64) / 4
+            run = lambda x, w: jax.lax.conv_general_dilated(
+                x, w, (1,) * (len(shape) - 2), "VALID", dimension_numbers=dims
+            )
+        expected = jax.jit(run, device=jax.devices("cpu")[0])(x, w)
+        actual = jax.jit(run, compiler_options={"optimization_level": level})(
+            *[jax.device_put(a, jax.devices("tt")[0]) for a in (x, w)]
+        )
+        assert actual.dtype == np.float64
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 def test_float64_constant():
