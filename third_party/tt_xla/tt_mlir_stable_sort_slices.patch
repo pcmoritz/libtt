@@ -1,0 +1,15 @@
+diff --git a/lib/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.cpp b/lib/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.cpp
+--- a/lib/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.cpp
++++ b/lib/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.cpp
+@@ -104,6 +104,11 @@
+     return failure();
+   }
+ 
++  // TopK does not promise the original index order for equal keys.
++  if (srcOp.getStable()) {
++    return failure();
++  }
++
+   Value sortValues = srcOp.getValues();
+   Value sortIndices = srcOp.getIndices();
+ 
