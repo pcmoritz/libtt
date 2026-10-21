@@ -1,0 +1,77 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -3498,6 +3498,12 @@
+   };
+ 
+ public:
++  StableHLOToTTIRReduceWindowOpConversionPattern(TypeConverter &typeConverter,
++                                                MLIRContext *ctx)
++      : OpConversionPattern(typeConverter, ctx) {
++    setHasBoundedRewriteRecursion();
++  }
++
+   LogicalResult
+   matchAndRewrite(mlir::stablehlo::ReduceWindowOp srcOp,
+                   mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
+@@ -3643,11 +3649,27 @@
+ 
+     BoolAttr countIncludesPad = rewriter.getBoolAttr(true);
+ 
+-    // TTIR pooling ops do not support base dilations.
++    // Materialize holes between input elements with the reduction's init
++    // value, then reuse the ordinary pooling lowering.
+     if (!llvm::all_of(baseDilations.asArrayRef(),
+                       [](int64_t d) { return d == 1; })) {
+-      return rewriter.notifyMatchFailure(
+-          srcOp, "Base dilations other than 1 are not supported.");
++      SmallVector<int64_t> interior;
++      for (int64_t dilation : baseDilations.asArrayRef()) {
++        interior.push_back(dilation - 1);
++      }
++      SmallVector<int64_t> zeroPadding(inputRank, 0);
++      SmallVector<Value> paddedInputs;
++      for (auto [input, init] :
++           llvm::zip(adaptor.getInputs(), adaptor.getInitValues())) {
++        paddedInputs.push_back(mlir::stablehlo::PadOp::create(
++            rewriter, srcOp.getLoc(), input, init,
++            zeroPadding, zeroPadding, interior));
++      }
++      rewriter.modifyOpInPlace(srcOp, [&] {
++        srcOp.getInputsMutable().assign(paddedInputs);
++        srcOp.removeBaseDilationsAttr();
++      });
++      return success();
+     }
+ 
+     // Handle the special case of lowering to CumSumOp.
+@@ -4550,6 +4572,9 @@
+   std::optional<mlir::Operation *>
+   extractDivisor(mlir::stablehlo::ReduceWindowOp &srcOp) const {
++    if (srcOp->use_empty()) {
++      return std::nullopt;
++    }
+     mlir::Operation *op = *srcOp->getUsers().begin();
+     if (isa_and_nonnull<mlir::stablehlo::BroadcastInDimOp>(op)) {
+       op = *op->getUsers().begin();
+     }
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+@@ -182,11 +182,12 @@
+       return !input.isSystemBufferType();
+     }
+     if (hasLayoutChange(input, output)) {
+-      // Tilize (RM -> TILE): run the tilize first, then reshard. Tilizing a
+-      // tensor that was first resharded into the (sharded) output memory can
+-      // produce a non-tile-aligned physical shard that tt-metal rejects.
++      // When leaving sharded memory, deshard before tilizing: row-major
++      // shards need not be tile-aligned. When entering sharded memory,
++      // tilize first for the same reason.
+       if (output.isTiled()) {
+-        return true;
++        return !input.hasShardedTensorMemoryLayout() ||
++               output.hasShardedTensorMemoryLayout();
+       }
+       // Untilize (TILE -> RM): deshard first when the input is L1-sharded (or
+       // when moving L1 -> DRAM), then untilize the interleaved tensor;
