@@ -374,6 +374,7 @@ http_archive(
         "//third_party/tt_metal:eltwise_working_cores.patch",
         "//third_party/tt_metal:binary_ng_raw_bfloat16_output.patch",
         "//third_party/tt_metal:reshape_tiled_windows.patch",
+        "//third_party/tt_metal:reshape_zero_padding.patch",
         "//third_party/tt_metal:rms_norm_output_dtype.patch",
         "//third_party/tt_metal:slice_prefix_view.patch",
         "//third_party/tt_metal:reduce_h_zero_padding_rows.patch",
