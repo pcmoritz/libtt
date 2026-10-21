@@ -1,0 +1,78 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+@@ -635,18 +635,16 @@
+ };
+ } // namespace
+ 
+-// Decomposes (a + bi) * (c + di) into
+-//   real = ac - bd
+-//   imag = ad + bc
++// Multiplication, dot products, and convolution are bilinear: apply the same
++// real operation to ac, bd, ad, and bc, then combine ac - bd and ad + bc.
+ namespace {
+-class ComplexMulOpConversionPattern
+-    : public OpConversionPattern<mlir::stablehlo::MulOp> {
+-  using OpConversionPattern<mlir::stablehlo::MulOp>::OpConversionPattern;
++template <typename OpTy>
++class ComplexBilinearOpConversionPattern : public OpConversionPattern<OpTy> {
++  using OpConversionPattern<OpTy>::OpConversionPattern;
+ 
+ public:
+   LogicalResult matchAndRewrite(
+-      mlir::stablehlo::MulOp op,
+-      OpConversionPattern<mlir::stablehlo::MulOp>::OpAdaptor adaptor,
++      OpTy op, typename OpConversionPattern<OpTy>::OpAdaptor adaptor,
+       ConversionPatternRewriter &rewriter) const override {
+     Location loc = op.getLoc();
+     auto [lhsReal, lhsImag] =
+@@ -654,14 +652,20 @@
+     auto [rhsReal, rhsImag] =
+         unpackRealImag(loc, adaptor.getRhs(), rewriter);
+ 
+-    Value ac =
+-        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsReal, rhsReal);
+-    Value bd =
+-        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsImag, rhsImag);
+-    Value ad =
+-        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsReal, rhsImag);
+-    Value bc =
+-        rewriter.create<mlir::stablehlo::MulOp>(loc, lhsImag, rhsReal);
++    auto resultType = mlir::cast<RankedTensorType>(op.getType());
++    auto componentType = resultType.clone(
++        mlir::cast<ComplexType>(resultType.getElementType()).getElementType());
++    auto apply = [&](Value lhs, Value rhs) -> Value {
++      OperationState state(loc, OpTy::getOperationName());
++      state.addOperands({lhs, rhs});
++      state.addTypes(componentType);
++      state.addAttributes(op->getAttrs());
++      return rewriter.create(state)->getResult(0);
++    };
++    Value ac = apply(lhsReal, rhsReal);
++    Value bd = apply(lhsImag, rhsImag);
++    Value ad = apply(lhsReal, rhsImag);
++    Value bc = apply(lhsImag, rhsReal);
+     Value real = rewriter.create<mlir::stablehlo::SubtractOp>(loc, ac, bd);
+     Value imag = rewriter.create<mlir::stablehlo::AddOp>(loc, ad, bc);
+ 
+@@ -1210,7 +1214,8 @@
+         mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
+         mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
+         mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp, mlir::stablehlo::DivOp,
+-        mlir::stablehlo::MulOp,
++        mlir::stablehlo::MulOp, mlir::stablehlo::DotGeneralOp,
++        mlir::stablehlo::ConvolutionOp,
+         mlir::stablehlo::NegOp, mlir::stablehlo::SubtractOp,
+         mlir::stablehlo::ReduceOp,
+         mlir::stablehlo::SelectOp>(
+@@ -1274,7 +1279,9 @@
+         ComplexGatherOpConversionPattern,
+         ComplexIotaOpConversionPattern,
+         ComplexDivOpConversionPattern,
+-        ComplexMulOpConversionPattern,
++        ComplexBilinearOpConversionPattern<mlir::stablehlo::MulOp>,
++        ComplexBilinearOpConversionPattern<mlir::stablehlo::DotGeneralOp>,
++        ComplexBilinearOpConversionPattern<mlir::stablehlo::ConvolutionOp>,
+         ComplexReduceOpConversionPattern,
+         ComplexSelectOpConversionPattern,
+         ComplexSliceOpConversionPattern,
