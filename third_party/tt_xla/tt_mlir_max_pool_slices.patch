@@ -9,7 +9,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  #include "mlir/IR/PatternMatch.h"
  #include "mlir/IR/Region.h"
  #include "mlir/IR/Value.h"
-@@ -202,6 +203,63 @@
+@@ -202,6 +203,109 @@
    return false;
  }
  
@@ -70,10 +70,56 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +  return applyReductionBody(body, broadcastInits, results, shape, rewriter);
 +}
 +
++// Reduces windows one dimension at a time: each window dimension applies an
++// elementwise reduction body to its strided slices of the inputs, so a window
++// takes the sum of its sizes in slices rather than their product. The results
++// have `resultShape` and are not combined with init values.
++static SmallVector<Value> reduceSlices(Block &body, ValueRange inputs,
++                                       ArrayRef<int64_t> window,
++                                       ArrayRef<int64_t> strides,
++                                       ArrayRef<int64_t> dilations,
++                                       ArrayRef<int64_t> resultShape,
++                                       Location loc,
++                                       PatternRewriter &rewriter) {
++  SmallVector<Value> values(inputs.begin(), inputs.end());
++  SmallVector<int64_t> shape(
++      mlir::cast<RankedTensorType>(values.front().getType()).getShape());
++  int64_t rank = shape.size();
++  for (int64_t d = 0; d < rank; ++d) {
++    if (window[d] == 1 && strides[d] == 1 && shape[d] == resultShape[d]) {
++      continue;
++    }
++    SmallVector<int32_t> begins(rank, 0), ends(shape.begin(), shape.end()),
++        steps(rank, 1);
++    shape[d] = resultShape[d];
++    SmallVector<Value> reduced;
++    for (int64_t offset = 0; offset < window[d]; ++offset) {
++      begins[d] = offset * dilations[d];
++      ends[d] = begins[d] + (resultShape[d] - 1) * strides[d] + 1;
++      steps[d] = strides[d];
++      SmallVector<Value> slices;
++      for (Value value : values) {
++        auto type = mlir::cast<RankedTensorType>(value.getType());
++        slices.push_back(rewriter.create<ttir::SliceStaticOp>(
++            loc,
++            RankedTensorType::get(shape, type.getElementType(),
++                                  type.getEncoding()),
++            value, rewriter.getI32ArrayAttr(begins),
++            rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps)));
++      }
++      reduced = reduced.empty()
++                    ? slices
++                    : applyReductionBody(body, reduced, slices, shape, rewriter);
++    }
++    values = reduced;
++  }
++  return values;
++}
++
  // Helper function to find the TTIR constant defining op by traversing through
  // operations that preserve constant semantics (ReshapeOp, BroadcastOp, and
  // TypecastOp).
-@@ -331,7 +389,10 @@
+@@ -331,7 +435,10 @@
          replaceUsedValues<ttir::MinOp>(srcOp, *input, rewriter);
          return matchAndRewriteInternalArgMin(srcOp, *input, rewriter);
        }
@@ -85,14 +131,14 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
  
      const mlir::Operation &innerOp = srcOp.getBody().front().front();
-@@ -507,6 +568,75 @@
+@@ -507,6 +614,56 @@
      return rewriter.create<CombineOp>(loc, outputType, reduced, init);
    }
  
 +  // Reduces a variadic reduce with an elementwise body, e.g. torch_tpu's max
-+  // with index over gathered windows in adaptive_max_pool2d: the body combines
-+  // the slices along the reduced dimensions (at most 64 in all), and then the
-+  // init values.
++  // with index over gathered windows in adaptive_max_pool2d: each reduced
++  // dimension in turn is one window of slices (at most 64 in all), and then
++  // the body combines the result with the init values.
 +  LogicalResult matchAndRewriteVariadicSlices(
 +      mlir::stablehlo::ReduceOp &srcOp,
 +      mlir::stablehlo::ReduceOp::Adaptor &adaptor,
@@ -116,32 +162,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    }
 +
 +    Location loc = srcOp.getLoc();
-+    int64_t rank = inputType.getRank();
++    SmallVector<int64_t> ones(shape.size(), 1);
 +    for (int64_t d : dimensions) {
-+      SmallVector<int32_t> begins(rank, 0), ends(shape.begin(), shape.end()),
-+          steps(rank, 1);
-+      int64_t size = shape[d];
++      SmallVector<int64_t> window(ones);
++      window[d] = shape[d];
 +      shape[d] = 1;
-+      SmallVector<Value> reduced;
-+      for (int64_t index = 0; index < size; ++index) {
-+        begins[d] = index;
-+        ends[d] = index + 1;
-+        SmallVector<Value> slices;
-+        for (Value input : inputs) {
-+          auto type = mlir::cast<RankedTensorType>(input.getType());
-+          slices.push_back(rewriter.create<ttir::SliceStaticOp>(
-+              loc,
-+              RankedTensorType::get(shape, type.getElementType(),
-+                                    type.getEncoding()),
-+              input, rewriter.getI32ArrayAttr(begins),
-+              rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps)));
-+        }
-+        reduced = reduced.empty()
-+                      ? slices
-+                      : applyReductionBody(body, reduced, slices, shape,
-+                                           rewriter);
-+      }
-+      inputs = reduced;
++      inputs =
++          reduceSlices(body, inputs, window, ones, ones, shape, loc, rewriter);
 +    }
 +
 +    SmallVector<Value> results = applyReductionInit(
@@ -161,15 +188,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    LogicalResult matchAndRewriteSeparable(
        mlir::stablehlo::ReduceOp &srcOp,
        mlir::stablehlo::ReduceOp::Adaptor &adaptor,
-@@ -3482,6 +3612,7 @@
-   matchAndRewrite(mlir::stablehlo::ReduceWindowOp srcOp,
-                   mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
-                   ConversionPatternRewriter &rewriter) const override {
-+    using TypicalInitReductionValue::LOWEST_FINITE;
-     using TypicalInitReductionValue::NEG_INF;
-     using TypicalInitReductionValue::POS_INF;
-     using TypicalInitReductionValue::ZERO;
-@@ -3551,6 +3682,24 @@
+@@ -3551,6 +3708,29 @@
        return rewriter.notifyMatchFailure(srcOp, "Invalid input tensor rank.");
      }
  
@@ -185,8 +204,13 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +        });
 +    if (srcOp.getInputs().size() > 1 && !perInputReductions) {
 +      if (std::optional<SmallVector<Value>> results =
-+              reduceVariadicWindowSlices(srcOp, adaptor, rewriter)) {
-+        rewriter.replaceOp(srcOp, *results);
++              reduceWindowSlices(srcOp, adaptor, rewriter)) {
++        rewriter.replaceOp(
++            srcOp, applyReductionInit(
++                       windowBody, *results, adaptor.getInitValues(),
++                       mlir::cast<RankedTensorType>(results->front().getType())
++                           .getShape(),
++                       srcOp.getLoc(), rewriter));
 +        return success();
 +      }
 +    }
@@ -194,7 +218,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      // Validate init values.
      std::optional<llvm::SmallVector<TypicalInitReductionValue>> initValues =
          extractInitValues(srcOp);
-@@ -3656,15 +3805,46 @@
+@@ -3656,17 +3836,10 @@
          return success();
        }
  
@@ -205,51 +229,18 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -          (*initValues)[0] == ZERO) {
 -        if (std::optional<Value> sum = sumWindowSlices(
 -                srcOp, adaptor.getInputs().front(), windowDimensions,
-+      // ttnn pooling runs in bfloat16: float32 and float16 sum pooling (and
-+      // average pooling, which divides the sum) adds window slices in its own
-+      // type instead, and max pooling takes their maximum. Max pooling of
-+      // bfloat16 and 8-bit integers, which bfloat16 holds exactly, stays on
-+      // ttnn when its init is -inf (or the lowest integer).
-+      Value input = adaptor.getInputs().front();
-+      Type elementType =
-+          mlir::cast<RankedTensorType>(input.getType()).getElementType();
-+      TypicalInitReductionValue init = (*initValues)[0];
-+      bool exactInBF16 = elementType.isBF16() ||
-+                         (elementType.isInteger() &&
-+                          elementType.getIntOrFloatBitWidth() <= 8);
-+      bool isSum = isa<mlir::stablehlo::AddOp>(reductionOps[0]) &&
-+                   init == ZERO && (elementType.isF32() || elementType.isF16());
-+      bool isMax = isa<mlir::stablehlo::MaxOp>(reductionOps[0]) &&
-+                   (init == LOWEST_FINITE ||
-+                    (init == NEG_INF && !exactInBF16));
-+      if (isSum || isMax) {
-+        // Pad with the init value: the lowest value of the type for a max,
-+        // or -inf.
-+        double padValue = 0.0;
-+        if (isMax) {
-+          if (auto floatType = mlir::dyn_cast<FloatType>(elementType)) {
-+            padValue = llvm::APFloat::getLargest(floatType.getFloatSemantics(),
-+                                                 /*Negative=*/true)
-+                           .convertToDouble();
-+            if (init == NEG_INF) {
-+              padValue = -std::numeric_limits<double>::infinity();
-+            }
-+          } else if (auto intType = mlir::dyn_cast<IntegerType>(elementType);
-+                     intType && !intType.isUnsigned()) {
-+            padValue = static_cast<double>(
-+                llvm::APInt::getSignedMinValue(intType.getWidth())
-+                    .getSExtValue());
-+          }
-+        }
-+        if (std::optional<Value> result = reduceWindowSlices(
-+                srcOp, input, /*max=*/isMax, padValue, windowDimensions,
-                 windowStrides, windowDilations, padding, rewriter)) {
+-                windowStrides, windowDilations, padding, rewriter)) {
 -          rewriter.replaceOp(srcOp, *sum);
-+          rewriter.replaceOp(srcOp, *result);
-           return success();
-         }
+-          return success();
+-        }
++      if (std::optional<SmallVector<Value>> result = trySliceReduction(
++              srcOp, adaptor, (*initValues)[0], reductionOps[0], rewriter)) {
++        rewriter.replaceOp(srcOp, *result);
++        return success();
        }
-@@ -3853,18 +4033,19 @@
+     }
+ 
+@@ -3853,77 +4026,118 @@
    }
  
  private:
@@ -265,95 +256,64 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -                                       DenseI64ArrayAttr windowDilations,
 -                                       DenseI64ArrayAttr padding,
 -                                       ConversionPatternRewriter &rewriter) const {
-+  // Reduces a window one dimension at a time: each window dimension combines
-+  // its strided slices of the input, padded with `padValue`, with an add (sum
-+  // pooling) or a maximum (max pooling), so a window takes
-+  // the sum of its sizes in slices rather than their product. Returns nullopt
-+  // for windows of more than 64 slices, which take the ttnn pooling path.
-+  std::optional<Value> reduceWindowSlices(mlir::stablehlo::ReduceWindowOp srcOp,
-+                                          Value input, bool max,
-+                                          double padValue,
-+                                          DenseI64ArrayAttr windowDimensions,
-+                                          DenseI64ArrayAttr windowStrides,
-+                                          DenseI64ArrayAttr windowDilations,
-+                                          DenseI64ArrayAttr padding,
-+                                          ConversionPatternRewriter &rewriter) const {
-     constexpr int64_t kMaxSlices = 64;
-     auto inputType = mlir::cast<RankedTensorType>(input.getType());
-     auto resultType = mlir::cast<RankedTensorType>(
-@@ -3877,10 +4058,10 @@
-     int64_t rank = inputType.getRank();
-     int64_t numSlices =
-         std::accumulate(window.begin(), window.end(), int64_t{0});
--    if (!(elementType.isF32() || elementType.isF16()) ||
--        numSlices > kMaxSlices || !inputType.hasStaticShape() ||
-+    if (numSlices > kMaxSlices || !inputType.hasStaticShape() ||
-         !resultType.hasStaticShape() || resultType.getNumElements() == 0 ||
--        llvm::any_of(pads, [](int64_t pad) { return pad < 0; })) {
-+        llvm::any_of(pads, [](int64_t pad) { return pad < 0; }) ||
-+        elementType.isInteger(1)) {
-       return std::nullopt;
-     }
- 
-@@ -3896,7 +4077,7 @@
-           input,
-           rewriter.getDenseI32ArrayAttr(
-               SmallVector<int32_t>(pads.begin(), pads.end())),
--          rewriter.getF32FloatAttr(0.0));
-+          rewriter.getF32FloatAttr(padValue));
-     }
- 
-     for (int64_t d = 0; d < rank; ++d) {
-@@ -3909,7 +4090,7 @@
-       shape[d] = outputSize;
-       auto sliceType = RankedTensorType::get(shape, elementType,
-                                              resultType.getEncoding());
--      Value sum;
-+      Value reduced;
-       for (int64_t offset = 0; offset < window[d]; ++offset) {
-         begins[d] = offset * dilations[d];
-         ends[d] = begins[d] + (outputSize - 1) * strides[d] + 1;
-@@ -3917,15 +4098,139 @@
-         Value slice = rewriter.create<ttir::SliceStaticOp>(
-             loc, sliceType, input, rewriter.getI32ArrayAttr(begins),
-             rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
--        sum = sum ? rewriter.create<ttir::AddOp>(loc, sliceType, sum, slice)
--                        .getResult()
--                  : slice;
-+        if (!reduced) {
-+          reduced = slice;
-+        } else if (max) {
-+          reduced =
-+              rewriter.create<ttir::MaximumOp>(loc, sliceType, reduced, slice);
-+        } else {
-+          reduced = rewriter.create<ttir::AddOp>(loc, sliceType, reduced, slice);
-+        }
-       }
--      input = sum;
-+      input = reduced;
-     }
-     return input;
-   }
- 
-+  // Reduces a variadic window by applying its body to the strided slices of
-+  // the inputs, padded with their init values, one window dimension at a time
-+  // like reduceWindowSlices, and then to the init values. The body may only
-+  // contain elementwise ops.
-+  std::optional<SmallVector<Value>> reduceVariadicWindowSlices(
-+      mlir::stablehlo::ReduceWindowOp srcOp,
-+      mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
-+      ConversionPatternRewriter &rewriter) const {
-+    constexpr int64_t kMaxSlices = 64;
-+    Block &body = srcOp.getBody().front();
-+    if (!hasElementwiseBody(body)) {
++  // ttnn pooling runs in bfloat16: float32 and float16 sum pooling (and
++  // average pooling, which divides the sum) adds window slices in its own
++  // type instead, and max pooling takes their maximum. Max pooling of
++  // bfloat16 and 8-bit integers, which bfloat16 holds exactly, stays on ttnn
++  // when its init is -inf (or the lowest integer). These init values are
++  // identities, so the slices need not combine with them.
++  std::optional<SmallVector<Value>>
++  trySliceReduction(mlir::stablehlo::ReduceWindowOp srcOp,
++                    mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
++                    TypicalInitReductionValue init, Operation *reductionOp,
++                    ConversionPatternRewriter &rewriter) const {
++    using TypicalInitReductionValue::LOWEST_FINITE;
++    using TypicalInitReductionValue::NEG_INF;
++    using TypicalInitReductionValue::ZERO;
++    Type elementType =
++        mlir::cast<RankedTensorType>(adaptor.getInputs().front().getType())
++            .getElementType();
++    bool exactInBF16 = elementType.isBF16() ||
++                       (elementType.isInteger() &&
++                        elementType.getIntOrFloatBitWidth() <= 8);
++    bool isSum = isa<mlir::stablehlo::AddOp>(reductionOp) && init == ZERO &&
++                 (elementType.isF32() || elementType.isF16());
++    bool isMax = isa<mlir::stablehlo::MaxOp>(reductionOp) &&
++                 (init == LOWEST_FINITE || (init == NEG_INF && !exactInBF16));
++    if (!isSum && !isMax) {
 +      return std::nullopt;
 +    }
++    return reduceWindowSlices(srcOp, adaptor, rewriter);
++  }
 +
++  // Reduces a window with its body, which may only contain elementwise ops,
++  // applied to the window slices of the inputs padded with their init values
++  // (see reduceSlices). The result is not combined with the init values.
++  // Returns nullopt for windows of more than 64 slices, which take the ttnn
++  // pooling path.
++  std::optional<SmallVector<Value>>
++  reduceWindowSlices(mlir::stablehlo::ReduceWindowOp srcOp,
++                     mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
++                     ConversionPatternRewriter &rewriter) const {
+     constexpr int64_t kMaxSlices = 64;
+-    auto inputType = mlir::cast<RankedTensorType>(input.getType());
+-    auto resultType = mlir::cast<RankedTensorType>(
+-        getTypeConverter()->convertType(srcOp.getResult(0).getType()));
+-    Type elementType = inputType.getElementType();
+-    ArrayRef<int64_t> window = windowDimensions.asArrayRef();
+-    ArrayRef<int64_t> strides = windowStrides.asArrayRef();
+-    ArrayRef<int64_t> dilations = windowDilations.asArrayRef();
+-    ArrayRef<int64_t> pads = padding.asArrayRef();
++    Block &body = srcOp.getBody().front();
 +    SmallVector<Value> inputs(adaptor.getInputs().begin(),
 +                              adaptor.getInputs().end());
-+    size_t numInputs = inputs.size();
 +    auto inputType = mlir::cast<RankedTensorType>(inputs.front().getType());
-+    int64_t rank = inputType.getRank();
+     int64_t rank = inputType.getRank();
+-    int64_t numSlices =
+-        std::accumulate(window.begin(), window.end(), int64_t{0});
+-    if (!(elementType.isF32() || elementType.isF16()) ||
+-        numSlices > kMaxSlices || !inputType.hasStaticShape() ||
+-        !resultType.hasStaticShape() || resultType.getNumElements() == 0 ||
 +    auto orOnes = [&](DenseI64ArrayAttr attr) {
 +      return attr ? SmallVector<int64_t>(attr.asArrayRef())
 +                  : SmallVector<int64_t>(rank, 1);
@@ -367,18 +327,19 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      pads = SmallVector<int64_t>(adaptor.getPaddingAttr().getValues<int64_t>());
 +    }
 +    auto resultType = mlir::cast<RankedTensorType>(srcOp.getResult(0).getType());
-+    if (std::accumulate(window.begin(), window.end(), int64_t{0}) >
++    if (!hasElementwiseBody(body) ||
++        std::accumulate(window.begin(), window.end(), int64_t{0}) >
 +            kMaxSlices ||
 +        !inputType.hasStaticShape() || !resultType.hasStaticShape() ||
 +        resultType.getNumElements() == 0 ||
 +        llvm::any_of(baseDilations, [](int64_t d) { return d != 1; }) ||
-+        llvm::any_of(pads, [](int64_t pad) { return pad < 0; })) {
-+      return std::nullopt;
-+    }
-+
+         llvm::any_of(pads, [](int64_t pad) { return pad < 0; })) {
+       return std::nullopt;
+     }
+ 
 +    // Each input is padded with its init value.
 +    bool padded = llvm::any_of(pads, [](int64_t pad) { return pad != 0; });
-+    SmallVector<double> initValues;
++    SmallVector<double> padValues;
 +    for (Value init : srcOp.getInitValues()) {
 +      auto constant = getStableHLOConstantDefiningOp(init);
 +      if (!constant) {
@@ -387,11 +348,11 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      mlir::ElementsAttr value = constant.getValue();
 +      Type elementType = value.getElementType();
 +      if (mlir::isa<FloatType>(elementType)) {
-+        initValues.push_back(
++        padValues.push_back(
 +            (*value.value_begin<llvm::APFloat>()).convertToDouble());
 +      } else if (auto intType = mlir::dyn_cast<IntegerType>(elementType)) {
 +        llvm::APInt bits = *value.value_begin<llvm::APInt>();
-+        initValues.push_back(
++        padValues.push_back(
 +            intType.isUnsigned() || intType.getWidth() == 1
 +                ? static_cast<double>(bits.getZExtValue())
 +                : static_cast<double>(bits.getSExtValue()));
@@ -400,13 +361,44 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      }
 +    }
 +
-+    Location loc = srcOp.getLoc();
-+    SmallVector<int64_t> shape(inputType.getShape());
+     Location loc = srcOp.getLoc();
+     SmallVector<int64_t> shape(inputType.getShape());
+-    if (llvm::any_of(pads, [](int64_t pad) { return pad != 0; })) {
 +    if (padded) {
-+      for (int64_t d = 0; d < rank; ++d) {
-+        shape[d] += pads[2 * d] + pads[2 * d + 1];
-+      }
-+      for (size_t i = 0; i < numInputs; ++i) {
+       for (int64_t d = 0; d < rank; ++d) {
+         shape[d] += pads[2 * d] + pads[2 * d + 1];
+       }
+-      input = rewriter.create<ttir::PadOp>(
+-          loc, RankedTensorType::get(shape, elementType,
+-                                     inputType.getEncoding()),
+-          input,
+-          rewriter.getDenseI32ArrayAttr(
+-              SmallVector<int32_t>(pads.begin(), pads.end())),
+-          rewriter.getF32FloatAttr(0.0));
+-    }
+-
+-    for (int64_t d = 0; d < rank; ++d) {
+-      int64_t outputSize = resultType.getDimSize(d);
+-      if (window[d] == 1 && strides[d] == 1 && shape[d] == outputSize) {
+-        continue;
+-      }
+-      SmallVector<int32_t> begins(rank, 0), ends(shape.begin(), shape.end()),
+-          steps(rank, 1);
+-      shape[d] = outputSize;
+-      auto sliceType = RankedTensorType::get(shape, elementType,
+-                                             resultType.getEncoding());
+-      Value sum;
+-      for (int64_t offset = 0; offset < window[d]; ++offset) {
+-        begins[d] = offset * dilations[d];
+-        ends[d] = begins[d] + (outputSize - 1) * strides[d] + 1;
+-        steps[d] = strides[d];
+-        Value slice = rewriter.create<ttir::SliceStaticOp>(
+-            loc, sliceType, input, rewriter.getI32ArrayAttr(begins),
+-            rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
+-        sum = sum ? rewriter.create<ttir::AddOp>(loc, sliceType, sum, slice)
+-                        .getResult()
+-                  : slice;
++      for (size_t i = 0; i < inputs.size(); ++i) {
 +        auto type = mlir::cast<RankedTensorType>(inputs[i].getType());
 +        inputs[i] = rewriter.create<ttir::PadOp>(
 +            loc,
@@ -415,58 +407,23 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +            inputs[i],
 +            rewriter.getDenseI32ArrayAttr(
 +                SmallVector<int32_t>(pads.begin(), pads.end())),
-+            rewriter.getF32FloatAttr(initValues[i]));
-+      }
-+    }
-+
-+    for (int64_t d = 0; d < rank; ++d) {
-+      int64_t outputSize = resultType.getDimSize(d);
-+      if (window[d] == 1 && strides[d] == 1 && shape[d] == outputSize) {
-+        continue;
-+      }
-+      SmallVector<int32_t> begins(rank, 0), ends(shape.begin(), shape.end()),
-+          steps(rank, 1);
-+      shape[d] = outputSize;
-+      SmallVector<Value> reduced;
-+      for (int64_t offset = 0; offset < window[d]; ++offset) {
-+        begins[d] = offset * dilations[d];
-+        ends[d] = begins[d] + (outputSize - 1) * strides[d] + 1;
-+        steps[d] = strides[d];
-+        SmallVector<Value> slices;
-+        for (Value input : inputs) {
-+          auto type = mlir::cast<RankedTensorType>(input.getType());
-+          slices.push_back(rewriter.create<ttir::SliceStaticOp>(
-+              loc,
-+              RankedTensorType::get(shape, type.getElementType(),
-+                                    type.getEncoding()),
-+              input, rewriter.getI32ArrayAttr(begins),
-+              rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps)));
-+        }
-+        if (reduced.empty()) {
-+          reduced = slices;
-+          continue;
-+        }
-+        reduced = applyReductionBody(body, reduced, slices, shape, rewriter);
-+      }
-+      inputs = reduced;
-+    }
-+    return applyReductionInit(body, inputs, adaptor.getInitValues(), shape,
-+                              loc, rewriter);
-+  }
-+
++            rewriter.getF32FloatAttr(padValues[i]));
+       }
+-      input = sum;
+     }
+-    return input;
++    return reduceSlices(body, inputs, window, strides, dilations,
++                        resultType.getShape(), loc, rewriter);
+   }
+ 
    // Decompose a 5D reduce_window (3D pooling) into two sequential 2D max pool
-   // operations. The 3D pooling window [kD, kH, kW] is factored as:
-   //   Pass 1: Permute to [N,D,H,W,C], reshape to [N*D,H,W,C], MaxPool2d [kH,kW]
-@@ -4472,6 +4777,12 @@
+@@ -4472,6 +4686,9 @@
        } else if (checkInitValue(constantValue, elementType,
                                  TypicalInitReductionValue::ONE)) {
          initValues.push_back(TypicalInitReductionValue::ONE);
 +      } else if (checkInitValue(constantValue, elementType,
 +                                TypicalInitReductionValue::LOWEST_FINITE)) {
 +        initValues.push_back(TypicalInitReductionValue::LOWEST_FINITE);
-+      } else if (checkInitValue(constantValue, elementType,
-+                                TypicalInitReductionValue::HIGHEST_FINITE)) {
-+        initValues.push_back(TypicalInitReductionValue::HIGHEST_FINITE);
        } else {
          return std::nullopt;
        }
