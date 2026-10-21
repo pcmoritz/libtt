@@ -1,0 +1,16 @@
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -359,7 +359,11 @@
+           op.getLoc(),
+           RankedTensorType::get(matmulDestinationShape, elementType),
+           lhsMatmulInput, rhsMatmulInput);
+-    } else if (isa<IntegerType>(elementType)) {
++    } else if (isa<IntegerType>(elementType) ||
++               (elementType.isF32() && lhsResultDims.empty() &&
++                rhsResultDims.empty())) {
++      // Float32 inner products also use this path to avoid TF32 truncation.
++      // With no result dimensions, M=N=1 and the product is only input-sized.
+       // Materialize [..., M, K, N], multiply elementwise, and let Sum reduce K.
+       SmallVector<int64_t> lhsExpandedShape(lhsMatmulInputShape);
+       lhsExpandedShape.push_back(1);
