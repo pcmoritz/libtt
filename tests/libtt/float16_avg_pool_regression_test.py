@@ -48,11 +48,26 @@ def test_float16_avg_pool(shape, window, strides, padding, level):
     assert np.all(error <= bound), f"{np.sum(error > bound)} beyond the bound, worst {np.max(error - bound)}"
 
 
-def test_float16_avg_pool_stays_float16(tmp_path):
+@LEVELS
+@pytest.mark.parametrize(
+    "dtype,pool_dtype",
+    [(np.float16, "f16"), (jnp.bfloat16, "bf16"), (np.float32, "bf16")],
+    ids=["float16", "bfloat16", "float32-fallback"],
+)
+def test_avg_pool_dtype_routing(tmp_path, level, dtype, pool_dtype):
     shape, window, strides, padding = WINDOWS[0]
-    x = np.random.default_rng(3).standard_normal(shape).astype(np.float16)
-    run(lambda x: sum_pool(window, strides, padding)(x) / 9, "O1", x, export_path=tmp_path)
+    x = np.random.default_rng(3).standard_normal(shape).astype(dtype)
+    fn = lambda x: sum_pool(window, strides, padding)(x) / 9
+    got = run(fn, level, x, export_path=tmp_path)
+    assert got.dtype == x.dtype
+    expected = jax.jit(fn, backend="cpu")(x.astype(np.float32))
+    np.testing.assert_allclose(got.astype(np.float32), expected, rtol=2e-2, atol=2e-2)
     (ir,) = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
     pool = [line for line in ir.splitlines() if '"ttnn.avg_pool2d"' in line]
-    assert len(pool) == 1 and "xf16" in pool[0] and "bf16" not in pool[0], ir
-    assert "ttnn.typecast" not in ir, ir
+    assert len(pool) == 1 and f"x{pool_dtype}" in pool[0], ir
+    # Native float32 pooling is not supported yet; its existing bf16 fallback
+    # remains explicit while float16 and bfloat16 need no dtype conversions.
+    if dtype == np.float32:
+        assert "ttnn.typecast" in ir, ir
+    else:
+        assert "ttnn.typecast" not in ir, ir
