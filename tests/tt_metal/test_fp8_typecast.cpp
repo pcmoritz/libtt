@@ -4,7 +4,8 @@
 // every code decodes to its value (subnormals, NaN and -0 included), and
 // float32 values encode rounded to nearest even, with subnormal results kept,
 // NaN or infinity past the largest finite value and the sign of zero kept.
-// The references find the nearest code by brute force.
+// The references find the nearest code by brute force. ttnn.bitcast between
+// UINT8 and float8 is a view of the same bytes.
 
 #include <gtest/gtest.h>
 
@@ -18,8 +19,9 @@
 #include <tt-metalium/mesh_device.hpp>
 
 #include "ttnn/operations/copy/typecast/typecast.hpp"
+#include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/tensor/tensor.hpp"
-#include "ttnn/tensor/tensor_ops.hpp"
+#include "ttnn/types.hpp"
 
 namespace tt::tt_metal::distributed::test {
 namespace {
@@ -133,7 +135,7 @@ TEST_F(Fp8TypecastTest, DecodesEveryCode) {
     for (const Format& f : {kE4M3, kE5M2}) {
         const ttnn::Tensor bytes = ttnn::Tensor::from_vector(codes, spec).to_device(mesh_device_.get());
         const auto values =
-            ttnn::typecast(ttnn::unchecked_reinterpret_dtype(bytes, f.dtype), DataType::FLOAT32).cpu().to_vector<float>();
+            ttnn::typecast(ttnn::bitcast(bytes, f.dtype), DataType::FLOAT32).cpu().to_vector<float>();
         ASSERT_EQ(values.size(), codes.size());
         size_t wrong = 0;
         for (size_t i = 0; i < codes.size(); ++i) {
@@ -154,7 +156,7 @@ TEST_F(Fp8TypecastTest, EncodesRoundingToNearestEven) {
     const ttnn::Tensor input = ttnn::Tensor::from_vector(values, spec).to_device(mesh_device_.get());
     for (const Format& f : {kE4M3, kE5M2}) {
         const auto codes =
-            ttnn::unchecked_reinterpret_dtype(ttnn::typecast(input, f.dtype), DataType::UINT8).cpu().to_vector<uint8_t>();
+            ttnn::bitcast(ttnn::typecast(input, f.dtype), DataType::UINT8).cpu().to_vector<uint8_t>();
         ASSERT_EQ(codes.size(), values.size());
         size_t wrong = 0;
         for (size_t i = 0; i < values.size(); ++i) {
@@ -164,6 +166,31 @@ TEST_F(Fp8TypecastTest, EncodesRoundingToNearestEven) {
             }
         }
         EXPECT_EQ(wrong, 0u) << f.dtype;
+    }
+}
+
+// Both directions and layouts keep the bytes and the buffer. A bitcast that asks for a preallocated
+// output or another memory config, which a view can't give, fails.
+TEST_F(Fp8TypecastTest, BitcastsBytesAsViews) {
+    std::vector<uint8_t> codes(32 * 32);
+    for (size_t i = 0; i < codes.size(); ++i) {
+        codes[i] = static_cast<uint8_t>(i);
+    }
+    for (Layout layout : {Layout::TILE, Layout::ROW_MAJOR}) {
+        const TensorSpec spec(ttnn::Shape({32, 32}), TensorLayout(DataType::UINT8, PageConfig(layout), {}));
+        const ttnn::Tensor bytes = ttnn::Tensor::from_vector(codes, spec).to_device(mesh_device_.get());
+        for (const Format& f : {kE4M3, kE5M2}) {
+            const ttnn::Tensor view = ttnn::bitcast(bytes, f.dtype, bytes.memory_config());
+            const ttnn::Tensor back = ttnn::bitcast(view, DataType::UINT8);
+            EXPECT_EQ(view.dtype(), f.dtype);
+            EXPECT_EQ(view.buffer()->address(), bytes.buffer()->address());
+            EXPECT_EQ(back.buffer()->address(), bytes.buffer()->address());
+            EXPECT_EQ(back.cpu().to_vector<uint8_t>(), codes) << f.dtype << (layout == Layout::TILE ? " TILE" : " RM");
+            EXPECT_ANY_THROW((void)ttnn::bitcast(bytes, f.dtype, ttnn::L1_MEMORY_CONFIG));
+            EXPECT_ANY_THROW((void)ttnn::bitcast(view, DataType::UINT8, ttnn::L1_MEMORY_CONFIG));
+            EXPECT_ANY_THROW((void)ttnn::bitcast(bytes, f.dtype, std::nullopt, view));
+            EXPECT_ANY_THROW((void)ttnn::bitcast(view, DataType::UINT8, std::nullopt, bytes));
+        }
     }
 }
 
