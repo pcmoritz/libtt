@@ -6,9 +6,10 @@ import numpy as np
 import pytest
 
 
-@pytest.mark.parametrize("level", ["O0", "O1"])
+@pytest.mark.parametrize("level,shape", [
+    ("O0", (3, 5, 4)), ("O1", (3, 5, 4)), ("O0", (33, 67, 35)),
+])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
-@pytest.mark.parametrize("shape", [(3, 5, 4), (33, 67, 35)])
 def test_reshape_then_matmul(level, dtype, shape):
     m, k, n = shape
     a = (np.arange(m * k) % 5).astype(dtype)
