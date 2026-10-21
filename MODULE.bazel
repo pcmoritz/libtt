@@ -624,7 +624,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_float16_bits.patch",
         "//third_party/tt_xla:tt_mlir_cumulative_max_min.patch",
         "//third_party/tt_xla:tt_mlir_fp32_exact_matmul.patch",
-        "//third_party/tt_xla:tt_mlir_fp32_inner_product.patch",
         "//third_party/tt_xla:tt_mlir_reduce_bitwise.patch",
         "//third_party/tt_xla:tt_mlir_reduce_precision_op.patch",
         "//third_party/tt_xla:tt_mlir_reduce_uint32_max_min.patch",

@@ -12,7 +12,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
  
      Value lhs = adaptor.getLhs();
      auto lhsType = mlir::cast<RankedTensorType>(lhs.getType());
-@@ -379,6 +383,130 @@ struct DotGeneralToMatmulConversionPattern
+@@ -379,6 +383,129 @@ struct DotGeneralToMatmulConversionPattern
    }
  
  private:
@@ -63,8 +63,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +        vIsLhs ? lhsContractDims : rhsContractDims;
 +    ArrayRef<int64_t> aFreeDims = vIsLhs ? rhsFreeDims : lhsFreeDims;
 +    ArrayRef<int64_t> aShape = aType.getShape();
-+    if (computeProductOfDims(aShape, aBatchDims) <= 1 ||
-+        computeProductOfDims(aShape, aFreeDims) > kTileDim ||
++    if (computeProductOfDims(aShape, aFreeDims) > kTileDim ||
 +        computeProductOfDims(aShape, aContractDims) <= 1) {
 +      return nullptr;
 +    }
