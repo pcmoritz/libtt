@@ -29,15 +29,16 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
  // Rewrites stablehlo::BroadcastInDimOp with complex-typed tensor results
  // by appending the trailing real/imag dimension to the broadcast dimensions
  // and producing a new broadcast over the equivalent real tensor type.
-@@ -1207,6 +1228,7 @@
-     target.addDynamicallyLegalOp<
-         mlir::stablehlo::ConstantOp, mlir::stablehlo::ReshapeOp,
-         mlir::stablehlo::SliceOp, mlir::stablehlo::GatherOp,
-+        mlir::stablehlo::TransposeOp,
-         mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
-         mlir::stablehlo::AllToAllOp, mlir::stablehlo::CompositeOp,
-         mlir::stablehlo::IotaOp, mlir::stablehlo::AddOp, mlir::stablehlo::DivOp,
-@@ -1278,6 +1300,7 @@
+@@ -1233,6 +1254,8 @@
+     target.addIllegalOp<mlir::stablehlo::ComplexOp, mlir::stablehlo::RealOp,
+                         mlir::stablehlo::ImagOp>();
+ 
++    target.addDynamicallyLegalOp<mlir::stablehlo::TransposeOp>(isNotComplexType);
++
+     auto hasComplexType = [](TypeRange types) {
+       return llvm::any_of(types, [](Type t) {
+         auto rtt = mlir::dyn_cast<RankedTensorType>(t);
+@@ -1278,6 +1301,7 @@
          ComplexReduceOpConversionPattern,
          ComplexSelectOpConversionPattern,
          ComplexSliceOpConversionPattern,
