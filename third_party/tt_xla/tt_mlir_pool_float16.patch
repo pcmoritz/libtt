@@ -27,27 +27,62 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttml
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -4053,8 +4053,10 @@
+@@ -3850,7 +3850,9 @@
+       if (srcOp.getInputs().size() == 1) {
+         if (std::optional<SmallVector<Value>> result =
+                 trySliceReduction(srcOp, adaptor, (*initValues)[0],
+-                                  reductionOps[0], baseDilations, rewriter)) {
++                                  reductionOps[0], windowDimensions,
++                                  windowStrides, windowDilations,
++                                  baseDilations, padding, rewriter)) {
+           rewriter.replaceOp(srcOp, *result);
+           return success();
+         }
+@@ -3887,7 +3889,9 @@
+ 
+       if (std::optional<SmallVector<Value>> result =
+               trySliceReduction(srcOp, adaptor, (*initValues)[0],
+-                                reductionOps[0], baseDilations, rewriter)) {
++                                reductionOps[0], windowDimensions,
++                                windowStrides, windowDilations, baseDilations,
++                                padding, rewriter)) {
+         rewriter.replaceOp(srcOp, *result);
+         return success();
+       }
+@@ -4080,29 +4084,41 @@
    // average pooling, which divides the sum) adds window slices in its own
    // type instead, and max pooling takes their maximum. Max pooling of
    // bfloat16 and 8-bit integers, which bfloat16 holds exactly, stays on ttnn
 -  // when its init is -inf (or the lowest integer). Without ttnn pooling (base
--  // dilations), every sum and max window reduces slices.
+-  // dilations), every sum and max window but a boolean one reduces slices.
+-  // These init values are identities, so the slices need not combine with
+-  // them.
 +  // when its init is -inf (or the lowest integer), and so does float16
 +  // average pooling of the windows ttnn pools in float16 (at most two
 +  // dimensions, no dilation). Without ttnn pooling (base dilations), every sum
-+  // and max window reduces slices.
-   std::optional<Value>
-   trySliceReduction(mlir::stablehlo::ReduceWindowOp srcOp, Value input,
++  // and max window but a boolean one reduces slices. These init values are
++  // identities, so the slices need not combine with them.
+   std::optional<SmallVector<Value>>
+   trySliceReduction(mlir::stablehlo::ReduceWindowOp srcOp,
+                     mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
                      TypicalInitReductionValue init, Operation *reductionOp,
-@@ -4067,13 +4069,21 @@
+-                    DenseI64ArrayAttr baseDilations,
++                    DenseI64ArrayAttr windowDimensions,
++                    DenseI64ArrayAttr windowStrides,
++                    DenseI64ArrayAttr windowDilations,
++                    DenseI64ArrayAttr baseDilations, DenseI64ArrayAttr padding,
+                     ConversionPatternRewriter &rewriter) const {
      using TypicalInitReductionValue::LOWEST_FINITE;
      using TypicalInitReductionValue::NEG_INF;
      using TypicalInitReductionValue::ZERO;
 -    Type elementType =
--        mlir::cast<RankedTensorType>(input.getType()).getElementType();
-+    auto inputType = mlir::cast<RankedTensorType>(input.getType());
+-        mlir::cast<RankedTensorType>(adaptor.getInputs().front().getType())
+-            .getElementType();
++    auto inputType =
++        mlir::cast<RankedTensorType>(adaptor.getInputs().front().getType());
 +    Type elementType = inputType.getElementType();
+     bool withoutPooling = !llvm::all_of(baseDilations.asArrayRef(),
+                                         [](int64_t d) { return d == 1; });
      bool exactInBF16 = elementType.isBF16() ||
                         (elementType.isInteger() &&
                          elementType.getIntOrFloatBitWidth() <= 8);

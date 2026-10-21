@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// ttnn::avg_pool2d takes FLOAT16 inputs and returns the FLOAT16 mean (counting
-// the padding); ttnn::max_pool2d rejects them.
+// ttnn::avg_pool2d takes FLOAT16 inputs and returns the FLOAT16 mean;
+// ttnn::max_pool2d rejects them.
 
 #include <gtest/gtest.h>
 
 #include <bit>
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
@@ -60,33 +59,27 @@ protected:
         return ttnn::Tensor::from_vector(values, spec).to_device(mesh_device_.get());
     }
 
-    // The pooled values over the padded window at (n, oh, ow, c), padding included.
-    template <typename Reduce>
-    static double pool(const std::vector<float>& x, uint32_t n, uint32_t oh, uint32_t ow, uint32_t c, double init,
-                       Reduce reduce) {
-        double result = init;
+    // The sum, the sum of magnitudes and the number of the values of the padded
+    // window at (n, oh, ow, c) that lie inside the input.
+    struct Window {
+        double sum = 0, magnitudes = 0;
+        uint32_t inside = 0;
+    };
+    static Window window(const std::vector<float>& x, uint32_t n, uint32_t oh, uint32_t ow, uint32_t c) {
+        Window window;
         for (uint32_t kh = 0; kh < K; ++kh) {
             for (uint32_t kw = 0; kw < K; ++kw) {
                 const int h = static_cast<int>(oh * S + kh) - static_cast<int>(P);
                 const int w = static_cast<int>(ow * S + kw) - static_cast<int>(P);
-                const bool inside = h >= 0 && h < static_cast<int>(H) && w >= 0 && w < static_cast<int>(W);
-                result = reduce(result, inside ? x[((n * H + h) * W + w) * C + c] : init);
+                if (h >= 0 && h < static_cast<int>(H) && w >= 0 && w < static_cast<int>(W)) {
+                    const double value = x[((n * H + h) * W + w) * C + c];
+                    window.sum += value;
+                    window.magnitudes += std::abs(value);
+                    ++window.inside;
+                }
             }
         }
-        return result;
-    }
-
-    // The number of the window's values at (oh, ow) inside the input.
-    static uint32_t inside(uint32_t oh, uint32_t ow) {
-        uint32_t count = 0;
-        for (uint32_t kh = 0; kh < K; ++kh) {
-            for (uint32_t kw = 0; kw < K; ++kw) {
-                const int h = static_cast<int>(oh * S + kh) - static_cast<int>(P);
-                const int w = static_cast<int>(ow * S + kw) - static_cast<int>(P);
-                count += h >= 0 && h < static_cast<int>(H) && w >= 0 && w < static_cast<int>(W);
-            }
-        }
-        return count;
+        return window;
     }
 
     void check_avg_pool(bool count_include_pad, std::optional<int32_t> divisor_override);
@@ -118,16 +111,14 @@ void Pool2dFloat16Test::check_avg_pool(bool count_include_pad, std::optional<int
         for (uint32_t oh = 0; oh < OH; ++oh) {
             for (uint32_t ow = 0; ow < OW; ++ow) {
                 for (uint32_t c = 0; c < C; ++c) {
-                    const double sum = pool(x, n, oh, ow, c, 0.0, [](double a, double b) { return a + b; });
+                    const Window pooled = window(x, n, oh, ow, c);
                     const double divisor = divisor_override ? *divisor_override
                                            : count_include_pad ? K * K
-                                                               : inside(oh, ow);
-                    const double expected = sum / divisor;
+                                                               : pooled.inside;
+                    const double expected = pooled.sum / divisor;
                     // Summing K * K float16 terms, with the scaling and output roundings, may err by
                     // K * K + 2 float16 unit roundoffs of the sum of magnitudes.
-                    const double magnitudes =
-                        pool(x, n, oh, ow, c, 0.0, [](double a, double b) { return a + std::abs(b); });
-                    const double tolerance = (K * K + 2) * std::ldexp(magnitudes / divisor, -11);
+                    const double tolerance = (K * K + 2) * std::ldexp(pooled.magnitudes / divisor, -11);
                     const float actual = got[((n * OH + oh) * OW + ow) * C + c];
                     if ((!std::isfinite(actual) || std::abs(actual - expected) > tolerance) && mismatches++ < 8) {
                         ADD_FAILURE() << "avg at " << n << "," << oh << "," << ow << "," << c << ": " << actual
