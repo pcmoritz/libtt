@@ -14,7 +14,7 @@ TEST(NativeFloatSumPool, PreservesInputPrecision) {
     device->enable_program_cache();
     constexpr uint32_t H = 17, W = 19, K = 3, S = 2, P = 1, OH = 9, OW = 10;
     for (auto dtype : {DataType::FLOAT32, DataType::FLOAT16}) {
-        for (uint32_t C : {1u, 16u, 32u, 48u}) {
+        for (uint32_t C : {1u, 16u, 32u, 48u, 144u}) {
             for (auto scheme : {TensorMemoryLayout::HEIGHT_SHARDED, TensorMemoryLayout::WIDTH_SHARDED,
                                 TensorMemoryLayout::BLOCK_SHARDED}) {
                 for (int trial = 0; trial < 2; ++trial) {
@@ -47,7 +47,8 @@ TEST(NativeFloatSumPool, PreservesInputPrecision) {
                                     }
                                 if (dtype == DataType::FLOAT16)
                                     expected = float(_Float16(expected));
-                                ASSERT_NEAR(actual[(y * OW + x) * C + c], expected, 1e-5f);
+                                ASSERT_NEAR(actual[(y * OW + x) * C + c], expected, 1e-5f)
+                                    << "y=" << y << " x=" << x << " c=" << c;
                             }
                         }
                 }
