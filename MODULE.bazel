@@ -646,6 +646,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_uint8_as_int32.patch",
         "//third_party/tt_xla:tt_mlir_uint8_device_layout.patch",
         "//third_party/tt_xla:tt_mlir_unsigned_pad_value.patch",
+        "//third_party/tt_xla:tt_mlir_conv_window_reversal.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
