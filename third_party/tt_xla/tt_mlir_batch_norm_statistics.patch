@@ -304,39 +304,6 @@ diff --git a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp b/lib/Conversion/TTNNToE
  
      return success();
    }
-diff --git a/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp b/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
---- a/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
-+++ b/lib/Conversion/TTNNToEmitPy/TTNNToEmitPy.cpp
-@@ -3501,14 +3501,6 @@
- class BatchNormTrainingOpConversionPattern
-     : public TTNNToEmitPyBaseOpConversionPattern<
-           mlir::tt::ttnn::BatchNormTrainingOp> {
--private:
--  std::string getPrefixSearchPattern() const override {
--    return "ttnn.batch_norm_training";
--  }
--  std::string getPrefixSwapPattern() const override {
--    return "ttnn.batch_norm";
--  }
--
- public:
-   using TTNNToEmitPyBaseOpConversionPattern<
-       mlir::tt::ttnn::BatchNormTrainingOp>::TTNNToEmitPyBaseOpConversionPattern;
-@@ -3520,12 +3512,12 @@
-     ttnn_to_emitpy::EmitPyTTNNEmitter<mlir::tt::ttnn::BatchNormTrainingOp>
-         emitter(srcOp, adaptor, rewriter);
- 
--    // For training BatchNormTrainingOp, training is true
-+    // ttnn.batch_norm_training returns the output, batch mean and batch
-+    // variance, and updates running_mean/running_var in-place
-     llvm::SmallVector<mlir::Attribute> args{
-         emitter.emit(srcOp.getInput()),
-         emitter.emit(srcOp.getRunningMean(), "running_mean"),
-         emitter.emit(srcOp.getRunningVar(), "running_var"),
--        emitter.emit(true, "training"),
-         emitter.emit(srcOp.getEpsilon(), "eps"),
-         emitter.emit(srcOp.getMomentum(), "momentum"),
-         emitter.emit(srcOp.getWeight(), "weight"),
 diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
 --- a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
 +++ b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp

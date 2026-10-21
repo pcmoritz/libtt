@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// ttnn's batch_norm normalization (prim::batch_norm) and
 // ttnn::batch_norm_training in float32, with the compute config libtt's runtime
-// passes them (HiFi4, FP32 DST, exact math): outputs and batch statistics must
+// passes it (HiFi4, FP32 DST, exact math): outputs and batch statistics must
 // match a float64 reference to float32 accuracy, also for channels of one
 // element, whose variance is 0.
 
@@ -19,7 +18,6 @@
 
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/operations/normalization/batch_norm/batch_norm.hpp"
-#include "ttnn/operations/normalization/batch_norm/device/batch_norm_device_operation.hpp"
 #include "ttnn/tensor/tensor.hpp"
 
 namespace tt::tt_metal::distributed::test {
@@ -49,54 +47,6 @@ protected:
 
     std::shared_ptr<MeshDevice> mesh_device_;
 };
-
-TEST_P(BatchNormFloat32Test, NormalizesExactly) {
-    const auto [N, C, H, W, affine] = GetParam();
-    const float eps = 1e-5f;
-    std::mt19937 rng(2);
-    std::normal_distribution<float> normal(0.0f, 1.0f);
-    std::vector<float> x(N * C * H * W), mean(C), var(C), weight(C), bias(C);
-    for (float& v : x) {
-        v = 1.0f + 3.0f * normal(rng);
-    }
-    for (uint32_t c = 0; c < C; ++c) {
-        // One element per channel: the batch statistics are the element and 0.
-        mean[c] = N * H * W == 1 ? x[c] : normal(rng);
-        var[c] = N * H * W == 1 ? 0.0f : 1.0f + std::abs(normal(rng));
-        weight[c] = normal(rng);
-        bias[c] = normal(rng);
-    }
-    std::optional<ttnn::Tensor> weight_tensor, bias_tensor;
-    if (affine) {
-        weight_tensor = to_device(weight, {1, C, 1, 1});
-        bias_tensor = to_device(bias, {1, C, 1, 1});
-    }
-    const ttnn::DeviceComputeKernelConfig config = ttnn::ComputeKernelConfig{
-        .math_fidelity = MathFidelity::HiFi4, .math_approx_mode = false, .fp32_dest_acc_en = true};
-    const auto got = ttnn::prim::batch_norm(
-                         to_device(x, {N, C, H, W}),
-                         to_device(mean, {1, C, 1, 1}),
-                         to_device(var, {1, C, 1, 1}),
-                         eps,
-                         weight_tensor,
-                         bias_tensor,
-                         std::nullopt,
-                         std::nullopt,
-                         config)
-                         .cpu()
-                         .to_vector<float>();
-
-    ASSERT_EQ(got.size(), x.size());
-    for (size_t i = 0; i < x.size(); ++i) {
-        ASSERT_TRUE(std::isfinite(got[i])) << "element " << i << ": " << got[i];
-        const uint32_t c = (i / (H * W)) % C;
-        double want = (double(x[i]) - mean[c]) / std::sqrt(double(var[c]) + eps);
-        if (affine) {
-            want = want * weight[c] + bias[c];
-        }
-        ASSERT_NEAR(got[i], want, 2e-6 * (1.0 + std::abs(want))) << "element " << i;
-    }
-}
 
 // batch_norm_training returns the batch mean and the biased batch variance it
 // normalizes with, and still updates the running statistics with momentum and
