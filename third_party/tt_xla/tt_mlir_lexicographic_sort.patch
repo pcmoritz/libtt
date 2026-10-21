@@ -154,7 +154,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      }
  
      rewriter.replaceOp(srcOp, results);
-@@ -9250,19 +9247,250 @@
+@@ -9250,19 +9247,309 @@
  private:
    enum SortType { kValueOnly = 0, kValueIndex = 1, kKeyValue = 2 };
  
@@ -325,13 +325,72 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    return false;
 +  }
 +
-+  // Only elide a directly recognizable iota. Converted, broadcast or
-+  // reshaped values can still be sorted and gathered through the general path.
++  // Whether `value` is an iota along `dim`: 0, 1, ..., n - 1, possibly
++  // broadcast, reshaped by unit dimensions, or converted to types that hold
++  // every index. It must be produced as one, even where `dim` has size 1.
 +  static bool isIotaAlong(Value value, int64_t dim) {
-+    auto iota = value.getDefiningOp<mlir::stablehlo::IotaOp>();
-+    auto type = cast<RankedTensorType>(value.getType());
-+    return iota && static_cast<int64_t>(iota.getIotaDimension()) == dim &&
-+           holdsIndices(type.getElementType(), type.getDimSize(dim));
++    int64_t n = cast<RankedTensorType>(value.getType()).getDimSize(dim);
++    while (true) {
++      if (!holdsIndices(cast<RankedTensorType>(value.getType()).getElementType(),
++                        n)) {
++        return false;
++      }
++      Operation *op = value.getDefiningOp();
++      if (auto convertOp = dyn_cast_or_null<mlir::stablehlo::ConvertOp>(op)) {
++        value = convertOp.getOperand();
++        continue;
++      }
++      if (auto reshapeOp = dyn_cast_or_null<mlir::stablehlo::ReshapeOp>(op)) {
++        // The non-unit dimensions must be the same, and `dim` one of them.
++        auto nonUnitDims = [](RankedTensorType type) {
++          SmallVector<int64_t> dims;
++          for (int64_t d = 0; d < type.getRank(); ++d) {
++            if (type.getDimSize(d) != 1) {
++              dims.push_back(d);
++            }
++          }
++          return dims;
++        };
++        auto resultType = reshapeOp.getType();
++        auto operandType =
++            cast<RankedTensorType>(reshapeOp.getOperand().getType());
++        SmallVector<int64_t> resultDims = nonUnitDims(resultType);
++        SmallVector<int64_t> operandDims = nonUnitDims(operandType);
++        if (resultDims.size() != operandDims.size()) {
++          return false;
++        }
++        for (auto [r, o] : llvm::zip(resultDims, operandDims)) {
++          if (resultType.getDimSize(r) != operandType.getDimSize(o)) {
++            return false;
++          }
++        }
++        auto it = llvm::find(resultDims, dim);
++        if (it == resultDims.end()) {
++          return false;
++        }
++        dim = operandDims[it - resultDims.begin()];
++        value = reshapeOp.getOperand();
++        continue;
++      }
++      if (auto broadcastOp =
++              dyn_cast_or_null<mlir::stablehlo::BroadcastInDimOp>(op)) {
++        ArrayRef<int64_t> dims = broadcastOp.getBroadcastDimensions();
++        auto it = llvm::find(dims, dim);
++        if (it == dims.end()) {
++          return false;
++        }
++        int64_t operandDim = it - dims.begin();
++        if (broadcastOp.getOperand().getType().getDimSize(operandDim) !=
++            broadcastOp.getType().getDimSize(dim)) {
++          return false;
++        }
++        dim = operandDim;
++        value = broadcastOp.getOperand();
++        continue;
++      }
++      auto iotaOp = dyn_cast_or_null<mlir::stablehlo::IotaOp>(op);
++      return iotaOp && static_cast<int64_t>(iotaOp.getIotaDimension()) == dim;
++    }
 +  }
 +
 +  // Reorders [prePost, dSort] rows along dimension 1 by index rows. Integers
@@ -415,7 +474,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    }
  
    // ttnn.sort has no 32-bit integer path, and float32 cannot hold every
-@@ -9317,41 +9545,6 @@
+@@ -9317,41 +9604,6 @@
      Value highOrder = stableSort(gather(high, lowOrder));
      Value indices = gather(lowOrder, highOrder);
      return {gather(rows, indices), indices};
