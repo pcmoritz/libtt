@@ -626,6 +626,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_batched_matmul_reuse_config.patch",
         "//third_party/tt_xla:tt_mlir_dot_strength_reduction.patch",
         "//third_party/tt_xla:tt_mlir_ttir_glue_fusions.patch",
+        "//third_party/tt_xla:tt_mlir_exact_fusion_constants.patch",
         "//third_party/tt_xla:tt_mlir_ttnn_glue_fusions.patch",
         "//third_party/tt_xla:tt_mlir_strided_borrowed_host_tensors.patch",
         "//third_party/tt_xla:tt_mlir_deduce_moe_layouts_once.patch",

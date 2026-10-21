@@ -1,0 +1,13 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -443,8 +443,8 @@
+ static bool isFullOpWithValue(Value value, float expectedValue,
+-                              float tolerance = 1e-6f) {
++                              float tolerance = 0.0f) {
+   Operation *op = value.getDefiningOp();
+   if (!op) {
+     return false;
+   }
+ 
+   // Check if it's a ZerosOp and expected value is 0
