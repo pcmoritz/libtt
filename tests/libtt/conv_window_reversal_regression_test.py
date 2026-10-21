@@ -12,15 +12,15 @@ from jax.interpreters import mlir
 conv_p = Primitive("libtt_conv_window_reversal")
 
 
-def _abstract(x, w, *, stride, padding, reversal):
+def _abstract(x, w, *, lhs_dilation, padding, reversal):
     out = [
-        (size - 1) * stride + low + high - k + 2
+        (size - 1) * lhs_dilation + low + high - k + 2
         for size, (low, high), k in zip(x.shape[2:], padding, w.shape[2:])
     ]
     return ShapedArray((x.shape[0], w.shape[0], *out), x.dtype)
 
 
-def _lower(ctx, x, w, *, stride, padding, reversal):
+def _lower(ctx, x, w, *, lhs_dilation, padding, reversal):
     rank = len(padding)
     spatial = list(range(2, 2 + rank))
     i64 = ir.IntegerType.get_signless(64)
@@ -31,7 +31,7 @@ def _lower(ctx, x, w, *, stride, padding, reversal):
             x,
             w,
             padding=ir.DenseIntElementsAttr.get(np.array(padding, np.int64), type=i64),
-            lhs_dilation=ir.DenseI64ArrayAttr.get([stride] * rank),
+            lhs_dilation=ir.DenseI64ArrayAttr.get([lhs_dilation] * rank),
             window_reversal=None if reversal is None else ir.DenseBoolArrayAttr.get(reversal),
             dimension_numbers=hlo.ConvDimensionNumbers.get(
                 input_batch_dimension=0,
@@ -56,7 +56,7 @@ mlir.register_lowering(conv_p, _lower)
 
 @pytest.mark.parametrize("level", ["O0", "O1"])
 @pytest.mark.parametrize(
-    "x_shape,w_shape,stride,padding,reversal",
+    "x_shape,w_shape,lhs_dilation,padding,reversal",
     [
         ((1, 2, 5, 6), (3, 2, 3, 3), 2, ((1, 1), (1, 1)), (True, True)),
         ((2, 4, 7), (3, 4, 3), 2, ((2, 2),), (True,)),
@@ -68,7 +68,7 @@ mlir.register_lowering(conv_p, _lower)
     ],
     ids=["transpose-2d", "transpose-1d", "reverse-height", "reverse-width", "negative-padding", "no-reversal", "no-attribute"],
 )
-def test_conv_window_reversal(x_shape, w_shape, stride, padding, reversal, level):
+def test_conv_window_reversal(x_shape, w_shape, lhs_dilation, padding, reversal, level):
     # Small integer-valued floats make the orientation check exact even with
     # the device convolution's reduced floating-point precision.
     rng = np.random.default_rng(0)
@@ -76,7 +76,7 @@ def test_conv_window_reversal(x_shape, w_shape, stride, padding, reversal, level
     w = rng.integers(-2, 3, w_shape).astype(np.float32)
 
     def run(x, w):
-        return conv_p.bind(x, w, stride=stride, padding=padding, reversal=reversal)
+        return conv_p.bind(x, w, lhs_dilation=lhs_dilation, padding=padding, reversal=reversal)
 
     device = jax.devices("tt")[0]
     got = np.asarray(jax.jit(run, compiler_options={"optimization_level": level})(
