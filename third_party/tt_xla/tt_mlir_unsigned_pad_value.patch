@@ -1,16 +1,14 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -9452,7 +9452,11 @@
+@@ -9452,7 +9452,9 @@
  
      float value;
      if (paddingValueAttr.getElementType().isInteger()) {
 -      value = paddingValueAttr.getSplatValue<APInt>().signedRoundToDouble();
 +      // Unsigned values keep their value: a uint8 255 is 255, not -1.
-+      const APInt bits = paddingValueAttr.getSplatValue<APInt>();
-+      value = paddingValueAttr.getElementType().isUnsignedInteger()
-+                  ? bits.roundToDouble()
-+                  : bits.signedRoundToDouble();
++      value = paddingValueAttr.getSplatValue<APInt>().roundToDouble(
++          !paddingValueAttr.getElementType().isUnsignedInteger());
      } else {
        value = paddingValueAttr.getSplatValue<APFloat>().convertToDouble();
      }

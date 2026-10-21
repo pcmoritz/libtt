@@ -2,8 +2,9 @@
 
 // ttnn.pad pads uint8 tensors natively: row-major sticks of any byte width,
 // with front padding, and whole tiles. Pad values are the type's own: bytes up
-// to 255, and negative int32 values down to INT32_MIN in every pad factory
-// (multi-core and single-core row-major, height- and width-sharded, tiled).
+// to 255, and negative int32 values down to INT32_MIN and uint32 values past
+// INT32_MAX in every pad factory (multi-core and single-core row-major, height-
+// and width-sharded, tiled).
 
 #include <gtest/gtest.h>
 
@@ -126,24 +127,31 @@ TEST_F(PadUint8Test, ShardedUint8) {
         true, height_sharded(32, 16), height_sharded(40, 16));
 }
 
-TEST_F(PadUint8Test, NegativeInt32PadValue) {
-    // INT32_MIN is the -inf sentinel of integer max pooling.
-    for (float value : {-3.0f, -1000.0f, -2147483648.0f}) {
+TEST_F(PadUint8Test, Int32AndUint32PadValues) {
+    auto expect_pads = [&]<typename T>(float value, DataType dtype) {
         // The single-core row-major factory pads only the back, with 16-bit values, so these
         // single-core pads take the multi-core one.
         const Padding hw = {{0, 0}, {0, 0}, {1, 2}, {2, 3}};
-        expect_pad<int32_t>(ttnn::Shape({1, 1, 5, 7}), hw, value, DataType::INT32, Layout::ROW_MAJOR);
-        expect_pad<int32_t>(ttnn::Shape({1, 1, 5, 7}), hw, value, DataType::INT32, Layout::ROW_MAJOR, false);
+        expect_pad<T>(ttnn::Shape({1, 1, 5, 7}), hw, value, dtype, Layout::ROW_MAJOR);
+        expect_pad<T>(ttnn::Shape({1, 1, 5, 7}), hw, value, dtype, Layout::ROW_MAJOR, false);
         const Padding tiles = {{0, 0}, {0, 0}, {0, 32}, {0, 32}};
-        expect_pad<int32_t>(ttnn::Shape({1, 1, 32, 32}), tiles, value, DataType::INT32, Layout::TILE);
-        expect_pad<int32_t>(ttnn::Shape({1, 1, 32, 32}), tiles, value, DataType::INT32, Layout::TILE, false);
+        expect_pad<T>(ttnn::Shape({1, 1, 32, 32}), tiles, value, dtype, Layout::TILE);
+        expect_pad<T>(ttnn::Shape({1, 1, 32, 32}), tiles, value, dtype, Layout::TILE, false);
         // Height- and width-only padding of sharded tensors take their own factories.
-        expect_pad<int32_t>(
-            ttnn::Shape({1, 1, 32, 16}), {{0, 0}, {0, 0}, {2, 6}, {0, 0}}, value, DataType::INT32, Layout::ROW_MAJOR,
+        expect_pad<T>(
+            ttnn::Shape({1, 1, 32, 16}), {{0, 0}, {0, 0}, {2, 6}, {0, 0}}, value, dtype, Layout::ROW_MAJOR,
             true, height_sharded(32, 16), height_sharded(40, 16));
-        expect_pad<int32_t>(
-            ttnn::Shape({1, 1, 32, 16}), {{0, 0}, {0, 0}, {0, 0}, {4, 12}}, value, DataType::INT32, Layout::ROW_MAJOR,
+        expect_pad<T>(
+            ttnn::Shape({1, 1, 32, 16}), {{0, 0}, {0, 0}, {0, 0}, {4, 12}}, value, dtype, Layout::ROW_MAJOR,
             true, height_sharded(32, 16), height_sharded(32, 32));
+    };
+    // INT32_MIN is the -inf sentinel of integer max pooling.
+    for (float value : {-3.0f, -1000.0f, -2147483648.0f}) {
+        expect_pads.template operator()<int32_t>(value, DataType::INT32);
+    }
+    // Past INT32_MAX: 2^31 and the largest float below 2^32.
+    for (float value : {2147483648.0f, 4294967040.0f}) {
+        expect_pads.template operator()<uint32_t>(value, DataType::UINT32);
     }
     // Front padding, and zeros at the back, which the single-core factory pads itself.
     expect_pad<int32_t>(ttnn::Shape({1, 1, 5, 7}), {{0, 0}, {0, 0}, {1, 2}, {2, 3}}, 0.0f, DataType::INT32, Layout::ROW_MAJOR, false);
