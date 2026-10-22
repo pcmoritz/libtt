@@ -284,6 +284,12 @@ class WhileOpConversionPattern
 public:
   using OpConversionPattern<stablehlo::WhileOp>::OpConversionPattern;
 
+  // The control flow nested in the outlined programs is converted as part of
+  // this rewrite, with the same pattern for a loop in a loop or a case in a
+  // case. Each application outlines one level of a finite nesting, so the
+  // recursion is bounded.
+  void initialize() { setHasBoundedRewriteRecursion(); }
+
   LogicalResult
   matchAndRewrite(stablehlo::WhileOp whileOp,
                   stablehlo::WhileOp::Adaptor adaptor,
@@ -376,6 +382,12 @@ public:
 class CaseOpConversionPattern : public OpConversionPattern<stablehlo::CaseOp> {
 public:
   using OpConversionPattern<stablehlo::CaseOp>::OpConversionPattern;
+
+  // The control flow nested in the outlined programs is converted as part of
+  // this rewrite, with the same pattern for a loop in a loop or a case in a
+  // case. Each application outlines one level of a finite nesting, so the
+  // recursion is bounded.
+  void initialize() { setHasBoundedRewriteRecursion(); }
 
   LogicalResult
   matchAndRewrite(stablehlo::CaseOp caseOp,

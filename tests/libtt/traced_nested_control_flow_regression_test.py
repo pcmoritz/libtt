@@ -66,3 +66,26 @@ def test_nested_conditional(trace):
         expected = SOURCE + 1 if outer else (SOURCE * 2 if inner else np.cumsum(SOURCE, axis=-1))
         result = run(_put(outer), _put(inner), x)
         np.testing.assert_array_equal(np.asarray(result), expected)
+
+
+@pytest.mark.parametrize("trace", [False, True])
+def test_doubly_nested_conditional(trace):
+    # Each predicate is forwarded unchanged to the conditional it selects, two
+    # levels deep for the innermost one.
+    def run(outer, first, second, x):
+        innermost = lambda v: jax.lax.cond(second, lambda w: w * 2, lambda w: w - 1, v)
+        middle = lambda v: jax.lax.cond(first, lambda w: w + 3, innermost, v)
+        return jax.lax.cond(outer, lambda v: v + 1, middle, x)
+
+    run = _jit(run, trace)
+    x = _put(SOURCE)
+    for outer, first, second in [(False, False, True), (False, False, False), (True, False, True),
+                                 (False, True, False), (False, False, True)] * 2:
+        result = run(_put(outer), _put(first), _put(second), x)
+        if outer:
+            expected = SOURCE + 1
+        elif first:
+            expected = SOURCE + 3
+        else:
+            expected = SOURCE * 2 if second else SOURCE - 1
+        np.testing.assert_array_equal(np.asarray(result), expected)
