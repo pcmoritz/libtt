@@ -66,6 +66,8 @@ struct CountedLoopInfo {
   LoopBound initial;
   LoopBound limit;
   LoopBound step;
+  // The state slot that holds the counter.
+  unsigned counterIndex = 0;
 };
 
 struct LoopOutputs {
@@ -188,7 +190,8 @@ analyzeCountedLoop(stablehlo::WhileOp whileOp,
   }
   return CountedLoopInfo{.initial = *initial,
                          .limit = *limit,
-                         .step = *resolvedStep};
+                         .step = *resolvedStep,
+                         .counterIndex = counterIndex};
 }
 
 // Dialect conversion can leave operands referring to a detached block until
@@ -319,10 +322,12 @@ public:
     ttcore::LoopBoundAttr initial;
     ttcore::LoopBoundAttr limit;
     ttcore::LoopBoundAttr step;
+    IntegerAttr counterIndex;
     if (succeeded(countedLoop)) {
       initial = getLoopBoundAttr(rewriter, countedLoop->initial);
       limit = getLoopBoundAttr(rewriter, countedLoop->limit);
       step = getLoopBoundAttr(rewriter, countedLoop->step);
+      counterIndex = rewriter.getI32IntegerAttr(countedLoop->counterIndex);
     } else {
       SmallVector<Type> conditionResultTypes{conditionResultType};
       SmallVector<int32_t> conditionResultIndices{0};
@@ -337,7 +342,7 @@ public:
     auto loop = rewriter.create<ttcore::WhileLoopOp>(
         whileOp.getLoc(), outputs->types,
         FlatSymbolRefAttr::get(rewriter.getContext(), bodyFunction.getSymName()),
-        conditionProgram, initial, limit, step,
+        conditionProgram, initial, limit, step, counterIndex,
         rewriter.getI32IntegerAttr(whileOp.getNumOperands()),
         rewriter.getDenseI32ArrayAttr(outputs->indices), loopOperands);
     SmallVector<Value> replacements(adaptor.getOperands());
@@ -640,9 +645,13 @@ createWhileLoopOperation(
   for (int32_t index : loop.getOutputIndicesAttr().asArrayRef()) {
     outputIndices.push_back(static_cast<uint32_t>(index));
   }
+  int32_t counterIndex = -1;
+  if (IntegerAttr attr = loop.getCounterIndexAttr()) {
+    counterIndex = static_cast<int32_t>(attr.getInt());
+  }
   auto serializedLoop = ::tt::target::ttnn::CreateWhileLoopOpDirect(
       *cache.fbb, bodyIt->second, conditionProgram, initial, limit, step,
-      stateCount, &outputIndices, &inputs, &outputs);
+      stateCount, &outputIndices, &inputs, &outputs, counterIndex);
   return ::tt::target::ttnn::CreateOperationDirect(
       *cache.fbb,
       ::tt::target::ttnn::OpTypeTraits<

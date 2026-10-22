@@ -62,7 +62,30 @@ reserve/write/push API like a workload's: the manager reserves space ahead
 and tracks its own write offset, so appending to the end of its vector
 corrupts the stream.
 
-Branches do not nest, and loops are not covered yet (a backward jump).
+## Loops
+
+`TraceLoopBegin(cq)`, `TraceLoopCondition(cq, predicate)` and
+`TraceLoopEnd(cq)` record a loop: the workloads between the first two markers
+compute the predicate, the workloads between the last two are the body. The
+assembly emits:
+
+    wait(all) + clear counters
+    start: predicate workloads
+    wait(all) + prefetch stall; jump if zero -> exit
+    body, padded with dummy go signals to a multiple of the launch message ring
+    wait(all) + clear counters
+    jump -> start
+    exit:
+
+Since the trip count is unknown, every iteration has to leave the device
+where it found it: the launches of an iteration are padded to a multiple of
+the workers' launch-message ring, so their read pointers return to the same
+slot, and the completion counters are cleared after the body (and before the
+loop), so counts restart from zero. The state at the exit is then that of the
+predicate workloads alone, whatever the trip count, and host bookkeeping is
+restored to it. A loop costs two drains per iteration.
+
+Branches and loops do not nest.
 
 ## Test
 
@@ -93,12 +116,23 @@ them with alternating predicate values.
 The branch programs must be free of side effects the other branch would not
 perform, since both execute during capture.
 
+- A loop the runtime would control by reading device values (a condition
+  program, or a counted loop with a bound held by an input) takes the loop
+  markers in the same way: the state the body rewrites moves into buffers of
+  its own so every iteration reads and writes the same addresses, the
+  predicate is the condition program's result or `counter < limit` computed
+  on device (the lowered loop now records which state slot holds the counter),
+  and the body's outputs are copied back into the state buffers. Counted loops
+  with constant bounds are unrolled at capture as before.
+
 `tests/libtt/traced_device_branch_regression_test.py` checks a conditional
 on a value computed from the data, branches of unequal size, and a device
-predicate combined with a host predicate, and reads the exported IR to show
+predicate combined with a host predicate; `traced_device_loop_regression_test.py`
+a `while_loop` with a device condition, a `fori_loop` with an argument as its
+bound, and a loop followed by a conditional. Both read the exported IR to show
 the function stays one trace.
 
 ## Not covered yet
 
-Nested device-selected conditionals, cases with more than two branches, and
-loops with device-dependent trip counts (a backward jump).
+Nested device-controlled conditionals and loops, and cases with more than
+two branches.

@@ -1,28 +1,90 @@
+diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
+--- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
++++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOps.td
+@@ -200,6 +200,7 @@
+     OptionalAttr<TTCore_LoopBoundAttr>:$initial,
+     OptionalAttr<TTCore_LoopBoundAttr>:$limit,
+     OptionalAttr<TTCore_LoopBoundAttr>:$step,
++    OptionalAttr<I32Attr>:$counter_index,
+     I32Attr:$state_count,
+     DenseI32ArrayAttr:$output_indices,
+     Variadic<AnyRankedTensor>:$inputs
+diff --git a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
+--- a/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
++++ b/include/ttmlir/Target/TTNN/operations/mlir_native.fbs
+@@ -27,6 +27,8 @@
+   output_indices: [uint32];
+   inputs: [tt.target.ttnn.TensorRef];
+   outputs: [tt.target.ttnn.TensorRef];
++  // The state slot that holds a counted loop's counter.
++  counter_index: int32 = -1;
+ }
+ 
+ table CaseOp {
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -23,6 +23,34 @@
+@@ -23,6 +23,73 @@
  #define GEN_PASS_DEF_TTNNTRACEHOISTTRANSFORM
  #include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
  
-+// Rejects a case with a device-resident selector in the branch programs of
-+// `caseOp`, at any depth: the runtime branches a trace on one such selector
-+// at a time.
-+static LogicalResult verifyNoNestedDeviceSelectedCase(ttcore::CaseOp caseOp) {
-+  for (Attribute branch : caseOp.getBranchPrograms()) {
-+    auto program = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
-+        caseOp, mlir::cast<FlatSymbolRefAttr>(branch));
++// Whether the runtime has to read a device value to run `loop`: a loop with a
++// condition program, or a counted loop with a bound held by an input. Inside
++// a trace, the trace loops on the value instead (see the WhileLoopOp runtime).
++static bool loopNeedsTraceControl(ttcore::WhileLoopOp loop) {
++  if (loop.getConditionProgramAttr()) {
++    return true;
++  }
++  for (ttcore::LoopBoundAttr bound :
++       {loop.getInitialAttr(), loop.getLimitAttr(), loop.getStepAttr()}) {
++    if (bound && bound.getInputIndex()) {
++      return true;
++    }
++  }
++  return false;
++}
++
++static bool caseNeedsTraceControl(ttcore::CaseOp caseOp) {
++  auto type = mlir::dyn_cast<RankedTensorType>(caseOp.getIndex().getType());
++  return type && utils::isTensorOnDevice(type);
++}
++
++// Rejects control flow that would make the trace branch or loop on a device
++// value inside the programs `programs` name, at any depth: a trace branches
++// or loops on one value at a time.
++static LogicalResult
++verifyNoNestedTraceControl(Operation *op, ArrayRef<FlatSymbolRefAttr> programs) {
++  for (FlatSymbolRefAttr symbol : programs) {
++    if (!symbol) {
++      continue;
++    }
++    auto program = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(op, symbol);
 +    if (!program) {
 +      continue;
 +    }
-+    WalkResult result = program.walk([&](ttcore::CaseOp nested) {
-+      auto type = mlir::dyn_cast<RankedTensorType>(nested.getIndex().getType());
-+      if (type && utils::isTensorOnDevice(type)) {
-+        nested.emitError("a traced case with a device-resident selector "
-+                         "cannot hold another one in its branches");
-+        return WalkResult::interrupt();
++    WalkResult result = program.walk([&](Operation *nested) {
++      llvm::SmallVector<FlatSymbolRefAttr> nestedPrograms;
++      if (auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(nested)) {
++        if (caseNeedsTraceControl(caseOp)) {
++          caseOp.emitError("a traced case or loop controlled by a device value "
++                           "cannot hold another one in its programs");
++          return WalkResult::interrupt();
++        }
++        for (Attribute branch : caseOp.getBranchPrograms()) {
++          nestedPrograms.push_back(mlir::cast<FlatSymbolRefAttr>(branch));
++        }
++      } else if (auto loop = mlir::dyn_cast<ttcore::WhileLoopOp>(nested)) {
++        if (loopNeedsTraceControl(loop)) {
++          loop.emitError("a traced case or loop controlled by a device value "
++                         "cannot hold another one in its programs");
++          return WalkResult::interrupt();
++        }
++        nestedPrograms.push_back(loop.getBodyProgramAttr());
++        nestedPrograms.push_back(loop.getConditionProgramAttr());
++      } else {
++        return WalkResult::advance();
 +      }
-+      return failed(verifyNoNestedDeviceSelectedCase(nested))
++      return failed(verifyNoNestedTraceControl(nested, nestedPrograms))
 +                 ? WalkResult::interrupt()
 +                 : WalkResult::advance();
 +    });
@@ -36,7 +98,21 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
  using TraceSmallString = llvm::SmallString<64>;
  
  namespace {
-@@ -397,11 +425,23 @@
+@@ -391,17 +458,41 @@
+     // reject that shape instead of silently replaying the wrong branch.
+     llvm::SmallVector<int32_t> traceKeyInputIndices;
+     for (Operation *op : opsToHoist) {
++      if (auto loop = mlir::dyn_cast<ttcore::WhileLoopOp>(op)) {
++        if (loopNeedsTraceControl(loop) &&
++            failed(verifyNoNestedTraceControl(
++                loop, {loop.getBodyProgramAttr(), loop.getConditionProgramAttr()}))) {
++          return failure();
++        }
++        continue;
++      }
+       auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(op);
+       if (!caseOp) {
+         continue;
        }
        mlir::Value selector = caseOp.getIndex();
        auto selectorType = mlir::dyn_cast<RankedTensorType>(selector.getType());
@@ -57,7 +133,11 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +              "a traced case with a device-resident selector needs exactly "
 +              "two branches");
 +        }
-+        if (failed(verifyNoNestedDeviceSelectedCase(caseOp))) {
++        llvm::SmallVector<FlatSymbolRefAttr> branches;
++        for (Attribute branch : caseOp.getBranchPrograms()) {
++          branches.push_back(mlir::cast<FlatSymbolRefAttr>(branch));
++        }
++        if (failed(verifyNoNestedTraceControl(caseOp, branches))) {
 +          return failure();
 +        }
 +        continue;

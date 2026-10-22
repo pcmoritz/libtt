@@ -4,7 +4,8 @@
 // predicate once the workloads before the branch have completed and skips the
 // arm that is not taken. Replays alternate between the arms, the arms may hold
 // different numbers of workloads, and workloads before and after the branch
-// run on every replay.
+// run on every replay. A trace can also loop while a predicate the device
+// recomputes every iteration holds.
 
 #include <gtest/gtest.h>
 
@@ -170,6 +171,45 @@ TEST_F(TraceBranchTest, BranchesAtBothEndsOfTheTrace) {
         mesh_device_->replay_mesh_trace(cq, trace, true);
         expected += predicate ? 1 + 100 + 2 : 10 + 100;
         expect_out(expected);
+    }
+    mesh_device_->release_mesh_trace(trace);
+}
+
+TEST_F(TraceBranchTest, LoopsWhileTheDevicePredicateHolds) {
+    auto& cq = mesh_device_->mesh_command_queue();
+    std::shared_ptr<MeshBuffer> counter = dram_buffer();
+    MeshWorkload start = write(100);
+    MeshWorkload count_down = single_core_workload(
+        "count_down.cpp",
+        {static_cast<uint32_t>(counter->address()),
+         static_cast<uint32_t>(predicate_->address()),
+         static_cast<uint32_t>(scratch_->address())});
+    MeshWorkload add_one = add(1);
+    MeshWorkload add_ten = add(10);
+    MeshWorkload finish = add(1000);
+    for (MeshWorkload* workload : {&start, &count_down, &add_one, &add_ten, &finish}) {
+        warm(*workload);
+    }
+
+    // The predicate workload decrements the counter and reports whether it was
+    // positive; the body adds 11 per iteration; two launches per iteration
+    // against a ring of eight slots, so the padding is exercised.
+    const MeshTraceId trace = mesh_device_->begin_mesh_trace(cq);
+    EnqueueMeshWorkload(cq, start, false);
+    TraceLoopBegin(cq);
+    EnqueueMeshWorkload(cq, count_down, false);
+    TraceLoopCondition(cq, *predicate_);
+    EnqueueMeshWorkload(cq, add_one, false);
+    EnqueueMeshWorkload(cq, add_ten, false);
+    TraceLoopEnd(cq);
+    EnqueueMeshWorkload(cq, finish, false);
+    mesh_device_->end_mesh_trace(cq, trace);
+
+    for (uint32_t iterations : {3u, 0u, 1u, 11u, 2u}) {
+        std::vector<uint32_t> words(kPageSize / sizeof(uint32_t), iterations);
+        EnqueueWriteMeshBuffer(cq, counter, words, true);
+        mesh_device_->replay_mesh_trace(cq, trace, true);
+        expect_out(1100 + 11 * iterations);
     }
     mesh_device_->release_mesh_trace(trace);
 }

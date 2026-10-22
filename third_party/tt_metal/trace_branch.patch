@@ -1,7 +1,7 @@
 diff --git tt_metal/api/tt-metalium/distributed.hpp tt_metal/api/tt-metalium/distributed.hpp
 --- tt_metal/api/tt-metalium/distributed.hpp
 +++ tt_metal/api/tt-metalium/distributed.hpp
-@@ -126,6 +126,12 @@
+@@ -126,6 +126,18 @@
  
  void Finish(MeshCommandQueue& mesh_cq, ttsl::Span<const SubDeviceId> sub_device_ids = {});
  
@@ -11,13 +11,19 @@ diff --git tt_metal/api/tt-metalium/distributed.hpp tt_metal/api/tt-metalium/dis
 +void TraceBranchElse(MeshCommandQueue& mesh_cq);
 +void TraceBranchEnd(MeshCommandQueue& mesh_cq);
 +
++// A loop inside the trace being captured on `mesh_cq`: see
++// MeshCommandQueue::trace_loop_begin.
++void TraceLoopBegin(MeshCommandQueue& mesh_cq);
++void TraceLoopCondition(MeshCommandQueue& mesh_cq, const MeshBuffer& predicate, bool predicate_is_16bit = false);
++void TraceLoopEnd(MeshCommandQueue& mesh_cq);
++
  // Returns true if the distributed environment is initialized and world_size > 1.
  bool UsingDistributedEnvironment();
  
 diff --git tt_metal/api/tt-metalium/mesh_command_queue.hpp tt_metal/api/tt-metalium/mesh_command_queue.hpp
 --- tt_metal/api/tt-metalium/mesh_command_queue.hpp
 +++ tt_metal/api/tt-metalium/mesh_command_queue.hpp
-@@ -136,6 +136,16 @@
+@@ -136,6 +136,24 @@
      virtual void finish(ttsl::Span<const SubDeviceId> sub_device_ids = {}) = 0;
      virtual void record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) = 0;
      virtual void record_end() = 0;
@@ -31,13 +37,21 @@ diff --git tt_metal/api/tt-metalium/mesh_command_queue.hpp tt_metal/api/tt-metal
 +    virtual void trace_branch_begin(const MeshBuffer& predicate, bool predicate_is_16bit) = 0;
 +    virtual void trace_branch_else() = 0;
 +    virtual void trace_branch_end() = 0;
++    // A loop inside the trace being recorded. The workloads enqueued between
++    // trace_loop_begin and trace_loop_condition compute the predicate; the
++    // loop exits when it is zero, otherwise the workloads between
++    // trace_loop_condition and trace_loop_end run and the loop repeats from
++    // the predicate workloads. Loops and branches do not nest.
++    virtual void trace_loop_begin() = 0;
++    virtual void trace_loop_condition(const MeshBuffer& predicate, bool predicate_is_16bit) = 0;
++    virtual void trace_loop_end() = 0;
      virtual void enqueue_trace(const MeshTraceId& trace_id, bool blocking) = 0;
  };
  
 diff --git tt_metal/distributed/distributed.cpp tt_metal/distributed/distributed.cpp
 --- tt_metal/distributed/distributed.cpp
 +++ tt_metal/distributed/distributed.cpp
-@@ -189,6 +189,14 @@
+@@ -189,6 +189,22 @@
      mesh_cq.finish(sub_device_ids);
  }
  
@@ -49,13 +63,21 @@ diff --git tt_metal/distributed/distributed.cpp tt_metal/distributed/distributed
 +
 +void TraceBranchEnd(MeshCommandQueue& mesh_cq) { mesh_cq.trace_branch_end(); }
 +
++void TraceLoopBegin(MeshCommandQueue& mesh_cq) { mesh_cq.trace_loop_begin(); }
++
++void TraceLoopCondition(MeshCommandQueue& mesh_cq, const MeshBuffer& predicate, bool predicate_is_16bit) {
++    mesh_cq.trace_loop_condition(predicate, predicate_is_16bit);
++}
++
++void TraceLoopEnd(MeshCommandQueue& mesh_cq) { mesh_cq.trace_loop_end(); }
++
  bool UsingDistributedEnvironment() {
      using multihost::DistributedContext;
      const auto& distributed_context = tt::tt_metal::MetalContext::instance().global_distributed_context();
 diff --git tt_metal/distributed/dummy_mesh_command_queue.cpp tt_metal/distributed/dummy_mesh_command_queue.cpp
 --- tt_metal/distributed/dummy_mesh_command_queue.cpp
 +++ tt_metal/distributed/dummy_mesh_command_queue.cpp
-@@ -115,6 +115,12 @@
+@@ -115,6 +115,18 @@
      TT_THROW("Trace operations not supported for DummyMeshCommandQueue (inactive rank)");
  }
  
@@ -65,19 +87,28 @@ diff --git tt_metal/distributed/dummy_mesh_command_queue.cpp tt_metal/distribute
 +
 +void DummyMeshCommandQueue::trace_branch_end() {}
 +
++void DummyMeshCommandQueue::trace_loop_begin() {}
++
++void DummyMeshCommandQueue::trace_loop_condition(const MeshBuffer& /*predicate*/, bool /*predicate_is_16bit*/) {}
++
++void DummyMeshCommandQueue::trace_loop_end() {}
++
  void DummyMeshCommandQueue::enqueue_trace(const MeshTraceId& /*trace_id*/, bool /*blocking*/) {
      TT_THROW("Trace operations not supported for DummyMeshCommandQueue (inactive rank)");
  }
 diff --git tt_metal/distributed/dummy_mesh_command_queue.hpp tt_metal/distributed/dummy_mesh_command_queue.hpp
 --- tt_metal/distributed/dummy_mesh_command_queue.hpp
 +++ tt_metal/distributed/dummy_mesh_command_queue.hpp
-@@ -66,6 +66,9 @@
+@@ -66,6 +66,12 @@
          ttsl::Span<const uint32_t> workers_per_sub_device) override;
      void record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) override;
      void record_end() override;
 +    void trace_branch_begin(const MeshBuffer& predicate, bool predicate_is_16bit) override;
 +    void trace_branch_else() override;
 +    void trace_branch_end() override;
++    void trace_loop_begin() override;
++    void trace_loop_condition(const MeshBuffer& predicate, bool predicate_is_16bit) override;
++    void trace_loop_end() override;
      void enqueue_trace(const MeshTraceId& trace_id, bool blocking) override;
  };
  
@@ -93,7 +124,16 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  #include <functional>
  #include <mutex>
  #include <optional>
-@@ -43,6 +45,7 @@
+@@ -28,6 +30,8 @@
+ #include "device.hpp"
+ #include "impl/device/device_impl.hpp"
+ #include "llrt.hpp"
++#include "llrt/hal.hpp"
++#include <tt-metalium/math.hpp>
+ #include "impl/context/metal_context.hpp"
+ #include "impl/dispatch/dispatch_core_common.hpp"
+ #include "dispatch/dispatch_settings.hpp"
+@@ -43,6 +47,7 @@
  #include "shape2d.hpp"
  #include <tt_stl/strong_type.hpp>
  #include "dispatch/system_memory_manager.hpp"
@@ -101,7 +141,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  #include "trace/trace_buffer.hpp"
  #include "tt_metal/impl/threading/thread_pool.hpp"
  #include "tt_metal/common/multi_producer_single_consumer_queue.hpp"
-@@ -1426,7 +1429,51 @@
+@@ -1426,7 +1431,84 @@
      });
  }
  
@@ -113,23 +153,55 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 +    trace_nodes_.push_back(std::move(marker));
 +}
 +
-+void FDMeshCommandQueue::trace_branch_begin(const MeshBuffer& predicate, bool predicate_is_16bit) {
-+    TT_FATAL(trace_branch_state_ == TraceBranchState::None, "Trace branches do not nest");
++void FDMeshCommandQueue::set_trace_predicate(
++    MeshTraceNode& marker, const MeshBuffer& predicate, bool predicate_is_16bit) {
 +    TT_FATAL(
 +        predicate.device_local_config().buffer_type == BufferType::DRAM,
-+        "A trace branch predicate must live in an interleaved DRAM buffer");
++        "A trace predicate must live in an interleaved DRAM buffer");
 +    const uint32_t page_size = predicate.page_size();
 +    TT_FATAL(
 +        page_size != 0 && (page_size & (page_size - 1)) == 0,
-+        "A trace branch predicate buffer needs a power-of-two page size, got {}",
++        "A trace predicate buffer needs a power-of-two page size, got {}",
 +        page_size);
-+    MeshTraceNode marker;
-+    marker.branch = MeshTraceNode::Branch::Begin;
 +    marker.predicate_base_addr = static_cast<uint32_t>(predicate.address());
 +    marker.predicate_log2_page_size = static_cast<uint8_t>(std::bit_width(page_size) - 1);
 +    marker.predicate_flags = predicate_is_16bit ? CQ_PREFETCH_EXEC_BUF_JUMP_FLAG_16BIT : 0;
++}
++
++void FDMeshCommandQueue::trace_branch_begin(const MeshBuffer& predicate, bool predicate_is_16bit) {
++    TT_FATAL(trace_branch_state_ == TraceBranchState::None, "Trace branches and loops do not nest");
++    MeshTraceNode marker;
++    marker.branch = MeshTraceNode::Branch::Begin;
++    set_trace_predicate(marker, predicate, predicate_is_16bit);
 +    this->push_trace_branch_marker(std::move(marker));
 +    trace_branch_state_ = TraceBranchState::InThen;
++}
++
++void FDMeshCommandQueue::trace_loop_begin() {
++    TT_FATAL(trace_branch_state_ == TraceBranchState::None, "Trace branches and loops do not nest");
++    MeshTraceNode marker;
++    marker.branch = MeshTraceNode::Branch::LoopBegin;
++    this->push_trace_branch_marker(std::move(marker));
++    trace_branch_state_ = TraceBranchState::InLoopCondition;
++}
++
++void FDMeshCommandQueue::trace_loop_condition(const MeshBuffer& predicate, bool predicate_is_16bit) {
++    TT_FATAL(
++        trace_branch_state_ == TraceBranchState::InLoopCondition,
++        "trace_loop_condition needs an open trace_loop_begin");
++    MeshTraceNode marker;
++    marker.branch = MeshTraceNode::Branch::LoopCondition;
++    set_trace_predicate(marker, predicate, predicate_is_16bit);
++    this->push_trace_branch_marker(std::move(marker));
++    trace_branch_state_ = TraceBranchState::InLoopBody;
++}
++
++void FDMeshCommandQueue::trace_loop_end() {
++    TT_FATAL(trace_branch_state_ == TraceBranchState::InLoopBody, "trace_loop_end needs an open trace_loop_condition");
++    MeshTraceNode marker;
++    marker.branch = MeshTraceNode::Branch::LoopEnd;
++    this->push_trace_branch_marker(std::move(marker));
++    trace_branch_state_ = TraceBranchState::None;
 +}
 +
 +void FDMeshCommandQueue::trace_branch_else() {
@@ -149,11 +221,12 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 +}
 +
  void FDMeshCommandQueue::record_end() {
-+    TT_FATAL(trace_branch_state_ == TraceBranchState::None, "A trace branch is still open at the end of the capture");
++    TT_FATAL(
++        trace_branch_state_ == TraceBranchState::None, "A trace branch or loop is still open at the end of the capture");
      MetalContext& metal_ctx = MetalContext::instance(mesh_device_->impl().get_context_id());
      const auto& hal = metal_ctx.hal();
  
-@@ -1501,10 +1548,13 @@
+@@ -1501,10 +1583,13 @@
          // node.dispatch_metadata (sync_count, prefetcher_cache_info, etc.) on shared nodes. This is
          // safe because allocate_trace_programs() reinitializes dispatch_metadata at the start of
          // each range's processing, overwriting any stale mutations from a previous range.
@@ -171,7 +244,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
          // Records the number of MeshTraceNodes that had no relevant program.
          struct UnusedNodeData {
              uint32_t unused_nodes_both_multicast_and_unicast = 0;
-@@ -1514,14 +1564,17 @@
+@@ -1514,14 +1599,17 @@
          DispatchArray<UnusedNodeData> unused_nodes;
  
          for (auto& mesh_node : trace_nodes_) {
@@ -191,7 +264,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  
                  used = true;
                  break;
-@@ -1550,9 +1603,6 @@
+@@ -1550,9 +1638,6 @@
              }
              ringbuffer_configs.push_back({start, size});
          }
@@ -201,7 +274,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
          // Each device range produces an independent trace byte stream, so reset the prefetcher
          // cache manager to give each range a clean slate.
          this->reset_prefetcher_cache_manager();
-@@ -1563,6 +1613,38 @@
+@@ -1563,6 +1648,38 @@
              worker_launch_message_buffer_state[sub_device_id].reset();
          }
          std::unordered_map<SubDeviceId, TraceWorkerDescriptor> trace_worker_descriptors;
@@ -240,7 +313,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
          // Output a GO signal for each unused mesh node, to ensure that the launch message buffer write pointer and
          // number of expected workers matches across all devices. We do this at the beginning of the trace, becaue the
          // last program in the trace may continue running after the trace ends, so we can't do adjustments after it.
-@@ -1576,48 +1658,39 @@
+@@ -1576,48 +1693,39 @@
                  bool multicast = i < unused_nodes[sub_device_id].unused_nodes_both_multicast_and_unicast +
                                           unused_nodes[sub_device_id].unused_nodes_multicast;
                  bool unicast = i < unused_nodes[sub_device_id].unused_nodes_both_multicast_and_unicast || !multicast;
@@ -316,7 +389,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  
              sub_device_ids.insert(sub_device_id);
  
-@@ -1709,9 +1782,188 @@
+@@ -1709,9 +1817,258 @@
                  trace_worker_descriptors[sub_device_id].num_traced_programs_needing_go_signal_unicast++;
              }
              trace_worker_descriptors[sub_device_id].num_completion_worker_cores += num_workers;
@@ -339,8 +412,9 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 +
 +        // Waits for every worker launched so far on each sub-device the trace has used, and with
 +        // stall_prefetcher holds the prefetcher there too, so that a jump reads its predicate after
-+        // the workload that computed it has finished.
-+        auto emit_wait_for_all = [&](bool stall_prefetcher) {
++        // the workload that computed it has finished. With clear_counts, the completion counters
++        // restart from zero afterwards, on device and in the host's bookkeeping.
++        auto emit_wait_for_all = [&](bool stall_prefetcher, bool clear_counts = false) {
 +            if (trace_worker_descriptors.empty()) {
 +                return;
 +            }
@@ -360,16 +434,18 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 +            for (const auto& [sub_device_id, trace_worker_descriptor] : trace_worker_descriptors) {
 +                const uint32_t stream = metal_ctx.dispatch_mem_map().get_dispatch_stream_index(*sub_device_id);
 +                const uint32_t count = trace_worker_descriptor.num_completion_worker_cores;
++                const uint32_t clear = clear_counts ? CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM : 0;
 +                if (distributed_dispatcher) {
 +                    commands.add_dispatch_wait(
-+                        CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM,
++                        CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | clear,
 +                        0,
 +                        stream,
 +                        count,
 +                        this->id_,
 +                        DispatcherSelect::DISPATCH_SUBORDINATE);
 +                }
-+                const uint32_t flags = CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | CQ_DISPATCH_CMD_WAIT_FLAG_BARRIER;
++                const uint32_t flags =
++                    CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | CQ_DISPATCH_CMD_WAIT_FLAG_BARRIER | clear;
 +                if (stall_prefetcher && ++index == trace_worker_descriptors.size()) {
 +                    commands.add_dispatch_wait_with_prefetch_stall(flags, 0, stream, count, this->id_);
 +                } else {
@@ -377,6 +453,11 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 +                }
 +            }
 +            append_command_sequence(commands);
++            if (clear_counts) {
++                for (auto& [sub_device_id, trace_worker_descriptor] : trace_worker_descriptors) {
++                    trace_worker_descriptor.num_completion_worker_cores = 0;
++                }
++            }
 +        };
 +
 +        // Appends a jump whose target is patched in later; returns the word index of the command.
@@ -470,10 +551,72 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 +            emit_wait_for_all(/*stall_prefetcher=*/false);
 +        };
 +
++        // A loop: the predicate workloads, a drain and a jump out when the predicate is zero, the
++        // body, and a jump back. Every iteration leaves the device where it found it: the launches
++        // of an iteration are padded to a multiple of the launch message ring, and the completion
++        // counters are cleared after the body (and before the loop), so the state at the exit is
++        // that of the predicate workloads alone, whatever the trip count.
++        //   wait(all)+clear; start: cond; wait(all)+stall; jump-if-zero -> exit; body; padding;
++        //   wait(all)+clear; jump -> start; exit:
++        auto emit_loop = [&](const MeshTraceNode& condition, std::vector<Item>& cond, std::vector<Item>& body) {
++            emit_wait_for_all(/*stall_prefetcher=*/false, /*clear_counts=*/true);
++            const uint32_t loop_start = stream_offset();
++            emit_segment(cond);
++            emit_wait_for_all(/*stall_prefetcher=*/true);
++            const size_t jump_to_exit =
++                emit_jump(CQ_PREFETCH_EXEC_BUF_JUMP_IF_ZERO | condition.predicate_flags, condition);
++            const auto descriptors_at_exit = trace_worker_descriptors;
++            const auto launch_state_at_exit = worker_launch_message_buffer_state;
++
++            emit_segment(body);
++            DispatchArray<Launches> launches_iteration = count_launches(cond);
++            const DispatchArray<Launches> launches_body = count_launches(body);
++            DispatchArray<Launches> launches_wanted{};
++            constexpr uint32_t ring = dev_msgs::launch_msg_buffer_num_entries;
++            for (uint32_t sub_device_id = 0; sub_device_id < mesh_device_->num_sub_devices(); sub_device_id++) {
++                launches_iteration[sub_device_id].multicast += launches_body[sub_device_id].multicast;
++                launches_iteration[sub_device_id].unicast += launches_body[sub_device_id].unicast;
++                launches_wanted[sub_device_id].multicast =
++                    round_up(launches_iteration[sub_device_id].multicast, ring);
++                launches_wanted[sub_device_id].unicast = round_up(launches_iteration[sub_device_id].unicast, ring);
++            }
++            pad_launches(launches_iteration, launches_wanted);
++            emit_wait_for_all(/*stall_prefetcher=*/false, /*clear_counts=*/true);
++            const size_t jump_back = emit_jump(CQ_PREFETCH_EXEC_BUF_JUMP_ALWAYS, condition);
++            patch_jump_target(jump_back, loop_start);
++            patch_jump_target(jump_to_exit, stream_offset());
++
++            trace_worker_descriptors = descriptors_at_exit;
++            worker_launch_message_buffer_state = launch_state_at_exit;
++        };
++
 +        std::vector<Item> segment;
 +        for (size_t i = 0; i < items.size();) {
 +            if (items[i].node != nullptr) {
 +                segment.push_back(items[i++]);
++                continue;
++            }
++            if (items[i].mesh_node->branch == MeshTraceNode::Branch::LoopBegin) {
++                i++;
++                std::vector<Item> cond;
++                while (i < items.size() && items[i].node != nullptr) {
++                    cond.push_back(items[i++]);
++                }
++                TT_FATAL(
++                    i < items.size() && items[i].mesh_node->branch == MeshTraceNode::Branch::LoopCondition,
++                    "Trace loop markers out of order: expected trace_loop_condition");
++                const MeshTraceNode& condition = *items[i++].mesh_node;
++                std::vector<Item> body;
++                while (i < items.size() && items[i].node != nullptr) {
++                    body.push_back(items[i++]);
++                }
++                TT_FATAL(
++                    i < items.size() && items[i].mesh_node->branch == MeshTraceNode::Branch::LoopEnd,
++                    "Trace loop markers out of order: expected trace_loop_end");
++                i++;
++                emit_segment(segment);
++                segment.clear();
++                emit_loop(condition, cond, body);
 +                continue;
 +            }
 +            TT_FATAL(
@@ -509,40 +652,45 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 diff --git tt_metal/distributed/fd_mesh_command_queue.hpp tt_metal/distributed/fd_mesh_command_queue.hpp
 --- tt_metal/distributed/fd_mesh_command_queue.hpp
 +++ tt_metal/distributed/fd_mesh_command_queue.hpp
-@@ -104,7 +104,18 @@
+@@ -104,7 +104,19 @@
          bool multicast_go_signals{false};
          bool unicast_go_signals{false};
          SubDeviceId sub_device_id;
-+        // A branch marker instead of a workload (trace_nodes is then empty).
-+        enum class Branch : uint8_t { None, Begin, Else, End };
++        // A branch or loop marker instead of a workload (trace_nodes is then empty).
++        enum class Branch : uint8_t { None, Begin, Else, End, LoopBegin, LoopCondition, LoopEnd };
 +        Branch branch{Branch::None};
-+        // The predicate of a Begin marker: an interleaved DRAM buffer whose
-+        // page 0 holds the value, and its width flag for the jump command.
++        // The predicate of a Begin or LoopCondition marker: an interleaved DRAM
++        // buffer whose page 0 holds the value, and its width flag for the jump
++        // command.
 +        uint32_t predicate_base_addr{0};
 +        uint8_t predicate_log2_page_size{0};
 +        uint8_t predicate_flags{0};
      };
 +    // Where trace_branch_* calls stand while recording.
-+    enum class TraceBranchState : uint8_t { None, InThen, InElse };
++    enum class TraceBranchState : uint8_t { None, InThen, InElse, InLoopCondition, InLoopBody };
 +    TraceBranchState trace_branch_state_{TraceBranchState::None};
  
      // The following data structures are only popiulated when the MeshCQ is being used to trace workloads
      // i.e. between record_begin() and record_end() being called
-@@ -270,6 +281,10 @@
+@@ -270,6 +282,14 @@
          ttsl::Span<const uint32_t> workers_per_sub_device) override;
      void record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) override;
      void record_end() override;
 +    void trace_branch_begin(const MeshBuffer& predicate, bool predicate_is_16bit) override;
 +    void trace_branch_else() override;
 +    void trace_branch_end() override;
++    void trace_loop_begin() override;
++    void trace_loop_condition(const MeshBuffer& predicate, bool predicate_is_16bit) override;
++    void trace_loop_end() override;
 +    void push_trace_branch_marker(MeshTraceNode&& marker);
++    static void set_trace_predicate(MeshTraceNode& marker, const MeshBuffer& predicate, bool predicate_is_16bit);
      void enqueue_trace(const MeshTraceId& trace_id, bool blocking) override;
      // Main function (event loop) for the Completion Queue Reader
      void read_completion_queue();
 diff --git tt_metal/distributed/sd_mesh_command_queue.cpp tt_metal/distributed/sd_mesh_command_queue.cpp
 --- tt_metal/distributed/sd_mesh_command_queue.cpp
 +++ tt_metal/distributed/sd_mesh_command_queue.cpp
-@@ -461,6 +461,12 @@
+@@ -461,6 +461,18 @@
  
  void SDMeshCommandQueue::record_end() { TT_THROW("Not supported for slow dispatch"); }
  
@@ -552,19 +700,28 @@ diff --git tt_metal/distributed/sd_mesh_command_queue.cpp tt_metal/distributed/s
 +
 +void SDMeshCommandQueue::trace_branch_end() { TT_THROW("Not supported for slow dispatch"); }
 +
++void SDMeshCommandQueue::trace_loop_begin() { TT_THROW("Not supported for slow dispatch"); }
++
++void SDMeshCommandQueue::trace_loop_condition(const MeshBuffer&, bool) { TT_THROW("Not supported for slow dispatch"); }
++
++void SDMeshCommandQueue::trace_loop_end() { TT_THROW("Not supported for slow dispatch"); }
++
  void SDMeshCommandQueue::enqueue_trace(const MeshTraceId&, bool) { TT_THROW("Not supported for slow dispatch"); }
  
  void SDMeshCommandQueue::enable_asynchronous_slow_dispatch() { asynchronous_slow_dispatch_enabled_ = true; }
 diff --git tt_metal/distributed/sd_mesh_command_queue.hpp tt_metal/distributed/sd_mesh_command_queue.hpp
 --- tt_metal/distributed/sd_mesh_command_queue.hpp
 +++ tt_metal/distributed/sd_mesh_command_queue.hpp
-@@ -73,6 +73,9 @@
+@@ -73,6 +73,12 @@
          ttsl::Span<const uint32_t> workers_per_sub_device) override;
      void record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) override;
      void record_end() override;
 +    void trace_branch_begin(const MeshBuffer& predicate, bool predicate_is_16bit) override;
 +    void trace_branch_else() override;
 +    void trace_branch_end() override;
++    void trace_loop_begin() override;
++    void trace_loop_condition(const MeshBuffer& predicate, bool predicate_is_16bit) override;
++    void trace_loop_end() override;
      void enqueue_trace(const MeshTraceId& trace_id, bool blocking) override;
  
      void enable_asynchronous_slow_dispatch();

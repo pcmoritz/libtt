@@ -145,8 +145,162 @@ bool readConditionScalar(const ::tt::runtime::Tensor &tensor) {
 
 } // namespace
 
+// The form the prefetcher reads a predicate in: element 0 of an interleaved
+// DRAM tensor, as a 32-bit word or its low 16 bits.
+struct TracePredicate {
+  ::ttnn::Tensor tensor;
+  bool is16Bit;
+};
+
+TracePredicate prepareTracePredicate(::ttnn::Tensor predicate) {
+  switch (predicate.dtype()) {
+  case ::ttnn::DataType::BFLOAT16:
+  case ::ttnn::DataType::UINT16:
+  case ::ttnn::DataType::FLOAT16:
+  case ::ttnn::DataType::INT32:
+  case ::ttnn::DataType::UINT32:
+  case ::ttnn::DataType::FLOAT32:
+    break;
+  default:
+    predicate = ::ttnn::typecast(predicate, ::ttnn::DataType::UINT32);
+  }
+  if (!predicate.memory_config().is_dram() ||
+      predicate.memory_config().is_sharded()) {
+    predicate = ::ttnn::to_memory_config(
+        predicate, ::ttnn::MemoryConfig{::ttnn::TensorMemoryLayout::INTERLEAVED,
+                                        ::ttnn::BufferType::DRAM});
+  }
+  const bool is16Bit = predicate.dtype() == ::ttnn::DataType::BFLOAT16 ||
+                       predicate.dtype() == ::ttnn::DataType::UINT16 ||
+                       predicate.dtype() == ::ttnn::DataType::FLOAT16;
+  return TracePredicate{std::move(predicate), is16Bit};
+}
+
+const ::ttnn::Tensor &ttnnTensor(const ::tt::runtime::Tensor &tensor) {
+  return tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
+}
+
+// A copy of `tensor` in a buffer of its own.
+::tt::runtime::Tensor copyToNewBuffer(const ::ttnn::Tensor &tensor,
+                                      ::ttnn::MeshDevice &meshDevice) {
+  ::ttnn::Tensor copy =
+      ::ttnn::create_device_tensor(tensor.tensor_spec(), &meshDevice);
+  ::ttnn::copy(tensor, copy);
+  return utils::createRuntimeTensorFromTTNN(copy);
+}
+
+// Whether the runtime has to read a device value to run `op`: a loop with a
+// condition program, or a counted loop with a bound held by an input.
+bool loopNeedsTraceControl(const ::tt::target::ttnn::WhileLoopOp *op) {
+  if (op->condition_program_id() >= 0) {
+    return true;
+  }
+  for (const ::tt::target::ttnn::LoopBound *bound :
+       {op->initial(), op->limit(), op->step()}) {
+    if (bound && bound->input_index()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// A loop the runtime would control by reading device values, inside a trace's
+// run-and-capture program. The trace loops on the value instead: the
+// predicate workloads and the body are captured once, between markers
+// (TraceLoopBegin/Condition/End), and the state the body rewrites lives in
+// buffers of its own so that every iteration reads and writes the same
+// addresses. The warmup run and the captured run execute one iteration.
+void runTraceLoop(const ::tt::target::ttnn::WhileLoopOp *op,
+                  ProgramContext &context) {
+  const size_t stateSize = op->state_count();
+  ::ttnn::MeshDevice &meshDevice =
+      context.getDeviceHandle().as<::ttnn::MeshDevice>(DeviceRuntime::TTNN);
+  ::tt::tt_metal::distributed::MeshCommandQueue &cq =
+      meshDevice.mesh_command_queue(0);
+  const bool capturing = cq.trace_id().has_value();
+
+  std::vector<::tt::runtime::Tensor> inputs;
+  inputs.reserve(op->inputs()->size());
+  for (const auto *input : *op->inputs()) {
+    inputs.emplace_back(
+        context.getTensorPool().getRuntimeTensorAndValidate(input));
+  }
+  NestedProgramTensorRetention retention(inputs);
+  for (uint32_t stateIndex : *op->output_indices()) {
+    LOG_ASSERT(stateIndex < stateSize, "While loop output index is out of range");
+    inputs[stateIndex] = copyToNewBuffer(ttnnTensor(inputs[stateIndex]), meshDevice);
+    retention.retain(inputs[stateIndex]);
+  }
+
+  auto execute = [&](uint32_t programId) {
+    ProgramExecutor program(context.getDeviceHandle(),
+                            context.getExecutableHandle(), programId, inputs,
+                            /*constEvalProgram=*/false);
+    program.execute();
+    return program.gatherOutputTensors();
+  };
+
+  if (capturing) {
+    ::tt::tt_metal::distributed::TraceLoopBegin(cq);
+  }
+  ::ttnn::Tensor condition;
+  if (op->condition_program_id() >= 0) {
+    std::vector<::tt::runtime::Tensor> conditionOutputs =
+        execute(static_cast<uint32_t>(op->condition_program_id()));
+    LOG_ASSERT(conditionOutputs.size() == 1, "Loop condition must return one value");
+    condition = ttnnTensor(conditionOutputs.front());
+  } else {
+    // counter < limit, compared in float32 (exact for the counts in question).
+    LOG_ASSERT(op->counter_index() >= 0, "Counted loop without a counter index");
+    auto asFloat = [](const ::ttnn::Tensor &tensor) {
+      return tensor.dtype() == ::ttnn::DataType::FLOAT32
+                 ? tensor
+                 : ::ttnn::typecast(tensor, ::ttnn::DataType::FLOAT32);
+    };
+    ::ttnn::Tensor counter =
+        asFloat(ttnnTensor(inputs[static_cast<size_t>(op->counter_index())]));
+    ::ttnn::Tensor limit;
+    if (op->limit()->input_index()) {
+      limit = asFloat(ttnnTensor(inputs[static_cast<size_t>(*op->limit()->input_index())]));
+    } else {
+      limit = ::ttnn::full(counter.logical_shape(),
+                           static_cast<float>(op->limit()->constant()),
+                           ::ttnn::DataType::FLOAT32, counter.layout(),
+                           std::ref(meshDevice), counter.memory_config());
+    }
+    condition = ::ttnn::lt(counter, limit);
+  }
+  TracePredicate predicate = prepareTracePredicate(condition);
+  if (capturing) {
+    ::tt::tt_metal::distributed::TraceLoopCondition(
+        cq, predicate.tensor.mesh_buffer(), predicate.is16Bit);
+  }
+
+  std::vector<::tt::runtime::Tensor> bodyOutputs = execute(op->program_id());
+  LOG_ASSERT(bodyOutputs.size() == op->output_indices()->size(),
+             "While loop body output arity mismatch");
+  for (size_t i = 0; i < bodyOutputs.size(); ++i) {
+    ::ttnn::copy(ttnnTensor(bodyOutputs[i]),
+                 ttnnTensor(inputs[op->output_indices()->Get(i)]));
+  }
+  bodyOutputs.clear();
+  if (capturing) {
+    ::tt::tt_metal::distributed::TraceLoopEnd(cq);
+  }
+
+  retention.restore();
+  for (size_t i = 0; i < op->outputs()->size(); ++i) {
+    context.getTensorPool().insertRuntimeTensorAndValidate(
+        op->outputs()->Get(i), inputs[op->output_indices()->Get(i)]);
+  }
+}
+
 void run(const ::tt::target::ttnn::WhileLoopOp *op,
          ProgramContext &context) {
+  if (trace::inTraceCaptureProgram() && loopNeedsTraceControl(op)) {
+    runTraceLoop(op, context);
+    return;
+  }
   const size_t stateSize = op->state_count();
   LOG_ASSERT(op->inputs()->size() >= stateSize,
              "While loop has fewer inputs than state values");
@@ -254,30 +408,7 @@ void runTraceBranch(const ::tt::target::ttnn::CaseOp *op,
       meshDevice.mesh_command_queue(0);
   const bool capturing = cq.trace_id().has_value();
 
-  // The prefetcher reads the predicate from page 0 of an interleaved DRAM
-  // buffer, as a 32-bit word or its low 16 bits.
-  ::ttnn::Tensor predicate =
-      index.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
-  switch (predicate.dtype()) {
-  case ::ttnn::DataType::BFLOAT16:
-  case ::ttnn::DataType::UINT16:
-  case ::ttnn::DataType::FLOAT16:
-  case ::ttnn::DataType::INT32:
-  case ::ttnn::DataType::UINT32:
-  case ::ttnn::DataType::FLOAT32:
-    break;
-  default:
-    predicate = ::ttnn::typecast(predicate, ::ttnn::DataType::UINT32);
-  }
-  if (!predicate.memory_config().is_dram() ||
-      predicate.memory_config().is_sharded()) {
-    predicate = ::ttnn::to_memory_config(
-        predicate, ::ttnn::MemoryConfig{::ttnn::TensorMemoryLayout::INTERLEAVED,
-                                        ::ttnn::BufferType::DRAM});
-  }
-  const bool predicateIs16Bit = predicate.dtype() == ::ttnn::DataType::BFLOAT16 ||
-                                predicate.dtype() == ::ttnn::DataType::UINT16 ||
-                                predicate.dtype() == ::ttnn::DataType::FLOAT16;
+  TracePredicate predicate = prepareTracePredicate(ttnnTensor(index));
 
   std::vector<::tt::runtime::Tensor> inputs;
   inputs.reserve(op->inputs()->size());
@@ -302,19 +433,14 @@ void runTraceBranch(const ::tt::target::ttnn::CaseOp *op,
   // The branch for a nonzero predicate first; its outputs give the result
   // buffers their specs.
   if (capturing) {
-    ::tt::tt_metal::distributed::TraceBranchBegin(cq, predicate.mesh_buffer(),
-                                                  predicateIs16Bit);
+    ::tt::tt_metal::distributed::TraceBranchBegin(
+        cq, predicate.tensor.mesh_buffer(), predicate.is16Bit);
   }
   std::vector<::tt::runtime::Tensor> taken = runBranch(1);
   std::vector<::tt::runtime::Tensor> results;
   results.reserve(taken.size());
   for (const ::tt::runtime::Tensor &output : taken) {
-    const ::ttnn::Tensor &tensor =
-        output.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
-    ::ttnn::Tensor result =
-        ::ttnn::create_device_tensor(tensor.tensor_spec(), &meshDevice);
-    ::ttnn::copy(tensor, result);
-    results.push_back(utils::createRuntimeTensorFromTTNN(result));
+    results.push_back(copyToNewBuffer(ttnnTensor(output), meshDevice));
   }
   taken.clear();
 
@@ -323,8 +449,7 @@ void runTraceBranch(const ::tt::target::ttnn::CaseOp *op,
   }
   std::vector<::tt::runtime::Tensor> other = runBranch(0);
   for (size_t i = 0; i < other.size(); ++i) {
-    ::ttnn::copy(other[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor(),
-                 results[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor());
+    ::ttnn::copy(ttnnTensor(other[i]), ttnnTensor(results[i]));
   }
   other.clear();
   if (capturing) {
