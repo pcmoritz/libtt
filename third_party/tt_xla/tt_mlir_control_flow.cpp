@@ -191,6 +191,19 @@ analyzeCountedLoop(stablehlo::WhileOp whileOp,
                          .step = *resolvedStep};
 }
 
+bool isExternalOperand(Region &region, Value operand) {
+  Region *parent = operand.getParentRegion();
+  return !parent || !region.isAncestor(parent);
+}
+
+// Canonicalization hoists constants out of control-flow regions. Outlined
+// programs clone scalar integer constants back instead of taking them as
+// inputs, so a loop nested in an outlined region keeps constant bounds rather
+// than reading them from device (which a trace capture cannot do).
+bool isClonedConstant(Value value) {
+  return value.getDefiningOp<stablehlo::ConstantOp>() && isScalarInteger(value);
+}
+
 // Dialect conversion can leave operands referring to a detached block until
 // its replacements are committed (for example when inlining shard_map).
 // Include every external operand, not only values in ancestor regions.
@@ -199,8 +212,7 @@ void collectCaptures(MutableArrayRef<Region> regions,
   for (Region &region : regions) {
     region.walk([&](Operation *op) {
       for (Value operand : op->getOperands()) {
-        Region *parent = operand.getParentRegion();
-        if (!parent || !region.isAncestor(parent)) {
+        if (isExternalOperand(region, operand) && !isClonedConstant(operand)) {
           captures.insert(operand);
         }
       }
@@ -240,6 +252,15 @@ func::FuncOp outlineRegion(ConversionPatternRewriter &rewriter,
     mapping.map(source, target);
   }
   rewriter.setInsertionPointToEnd(entry);
+  region.walk([&](Operation *op) {
+    for (Value operand : op->getOperands()) {
+      if (isExternalOperand(region, operand) && isClonedConstant(operand) &&
+          !mapping.contains(operand)) {
+        mapping.map(operand,
+                    rewriter.clone(*operand.getDefiningOp())->getResult(0));
+      }
+    }
+  });
   for (Operation &op : region.front()) {
     rewriter.clone(op, mapping);
   }
@@ -457,6 +478,60 @@ static SmallVector<func::FuncOp> getCaseBranches(ttcore::CaseOp caseOp) {
     branches.push_back(function);
   }
   return branches;
+}
+
+static bool isCaseSelector(Value value);
+
+// Whether the branch programs of `caseOp` use their argument `inputIndex` to
+// select a branch of a nested case.
+bool isForwardedCaseSelector(ttcore::CaseOp caseOp, unsigned inputIndex) {
+  return llvm::any_of(getCaseBranches(caseOp), [&](func::FuncOp branch) {
+    return inputIndex < branch.getNumArguments() &&
+           isCaseSelector(branch.getArgument(inputIndex));
+  });
+}
+
+static bool isCaseSelector(Value value) {
+  for (Operation *user : value.getUsers()) {
+    auto caseOp = dyn_cast<ttcore::CaseOp>(user);
+    if (!caseOp) {
+      continue;
+    }
+    if (caseOp.getIndex() == value) {
+      return true;
+    }
+    for (auto [index, input] : llvm::enumerate(caseOp.getInputs())) {
+      if (input == value && isForwardedCaseSelector(caseOp, index)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Whether a program argument selects a case branch, directly or through the
+// inputs of the cases it feeds. A case's branch programs share one signature,
+// so a branch argument also selects when a sibling branch uses it that way.
+bool isCaseSelectorArgument(BlockArgument argument) {
+  auto type = dyn_cast<RankedTensorType>(argument.getType());
+  if (!type || type.getNumElements() != 1) {
+    return false;
+  }
+  if (isCaseSelector(argument)) {
+    return true;
+  }
+  auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
+  auto module = function ? function->getParentOfType<ModuleOp>() : ModuleOp();
+  if (!module || !function.isPrivate()) {
+    return false;
+  }
+  std::optional<SymbolTable::UseRange> uses =
+      SymbolTable::getSymbolUses(function, module);
+  return uses && llvm::any_of(*uses, [&](const SymbolTable::SymbolUse &use) {
+           auto caseOp = dyn_cast<ttcore::CaseOp>(use.getUser());
+           return caseOp &&
+                  isForwardedCaseSelector(caseOp, argument.getArgNumber());
+         });
 }
 
 namespace {
