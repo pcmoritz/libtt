@@ -1,0 +1,102 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -23,6 +23,34 @@
+ #define GEN_PASS_DEF_TTNNTRACEHOISTTRANSFORM
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
+ 
++// Rejects a case with a device-resident selector in the branch programs of
++// `caseOp`, at any depth: the runtime branches a trace on one such selector
++// at a time.
++static LogicalResult verifyNoNestedDeviceSelectedCase(ttcore::CaseOp caseOp) {
++  for (Attribute branch : caseOp.getBranchPrograms()) {
++    auto program = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
++        caseOp, mlir::cast<FlatSymbolRefAttr>(branch));
++    if (!program) {
++      continue;
++    }
++    WalkResult result = program.walk([&](ttcore::CaseOp nested) {
++      auto type = mlir::dyn_cast<RankedTensorType>(nested.getIndex().getType());
++      if (type && utils::isTensorOnDevice(type)) {
++        nested.emitError("a traced case with a device-resident selector "
++                         "cannot hold another one in its branches");
++        return WalkResult::interrupt();
++      }
++      return failed(verifyNoNestedDeviceSelectedCase(nested))
++                 ? WalkResult::interrupt()
++                 : WalkResult::advance();
++    });
++    if (result.wasInterrupted()) {
++      return failure();
++    }
++  }
++  return success();
++}
++
+ using TraceSmallString = llvm::SmallString<64>;
+ 
+ namespace {
+@@ -397,11 +425,23 @@
+       }
+       mlir::Value selector = caseOp.getIndex();
+       auto selectorType = mlir::dyn_cast<RankedTensorType>(selector.getType());
+-      if (!selectorType ||
+-          selectorType.getNumElements() != 1 ||
+-          utils::isTensorOnDevice(selectorType)) {
++      if (!selectorType || selectorType.getNumElements() != 1) {
+         return caseOp.emitError(
+-            "tracing requires a host-resident scalar CaseOp selector");
++            "tracing requires a scalar CaseOp selector");
++      }
++      if (utils::isTensorOnDevice(selectorType)) {
++        // The runtime captures both branches and the trace branches on the
++        // selector at replay. That needs two branches and no device-selected
++        // case nested in them: trace branches do not nest.
++        if (caseOp.getBranchPrograms().size() != 2) {
++          return caseOp.emitError(
++              "a traced case with a device-resident selector needs exactly "
++              "two branches");
++        }
++        if (failed(verifyNoNestedDeviceSelectedCase(caseOp))) {
++          return failure();
++        }
++        continue;
+       }
+       auto it = llvm::find(inputs, selector);
+       size_t inputIndex = std::distance(inputs.begin(), it);
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -18,6 +18,20 @@
+ 
+ namespace tt::runtime::ttnn::operations::trace {
+ 
++// Depth of run-and-capture programs executing on this thread. A case with a
++// device selector inside one runs both of its branches, between the markers
++// that make the trace branch at replay (see the CaseOp runtime).
++static thread_local int traceCaptureProgramDepth = 0;
++
++bool inTraceCaptureProgram() { return traceCaptureProgramDepth > 0; }
++
++namespace {
++struct TraceCaptureProgramScope {
++  TraceCaptureProgramScope() { ++traceCaptureProgramDepth; }
++  ~TraceCaptureProgramScope() { --traceCaptureProgramDepth; }
++};
++} // namespace
++
+ static std::pair<MainProgramKey, CaptureExecuteProgramKey>
+ getTraceCacheKeys(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+                   ProgramContext &context) {
+@@ -309,7 +323,10 @@
+   ProgramExecutor executor(deviceHandle, context.getExecutableHandle(),
+                            op->capture_program_id(), captureInputs,
+                            /*constEvalProgram=*/false, semaphoreInputs);
+-  executor.execute();
++  {
++    TraceCaptureProgramScope scope;
++    executor.execute();
++  }
+   std::vector<::tt::runtime::Tensor> outputTensors =
+       executor.gatherOutputTensors();
+ 

@@ -7,11 +7,21 @@
 #include "tt/runtime/detail/ttnn/program_executor.h"
 #include "tt/runtime/detail/ttnn/ttnn.h"
 #include "tt/runtime/detail/ttnn/utils.h"
+#include "ttnn/operations/core/to_memory_config/to_memory_config_op.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
+
+#include <tt-metalium/distributed.hpp>
 
 #include <algorithm>
 #include <cstdint>
 #include <utility>
 #include <vector>
+
+namespace tt::runtime::ttnn::operations::trace {
+// Whether a trace's run-and-capture program is executing (the uncaptured
+// warmup run or the captured run); see capture_or_execute_trace.cpp.
+bool inTraceCaptureProgram();
+} // namespace tt::runtime::ttnn::operations::trace
 
 namespace tt::runtime::ttnn::operations::mlir_native {
 namespace {
@@ -225,6 +235,109 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
   }
 }
 
+// A case whose selector lives on device, inside a trace's run-and-capture
+// program. A trace cannot read the selector, so both branch programs run,
+// between markers that make the captured trace branch on the selector at
+// replay (TraceBranchBegin/Else/End). Each branch copies its results into one
+// result buffer, so the case has a single result whichever branch replays.
+// The warmup run takes the same path, so both programs compile. The branch
+// programs must be free of side effects that the other branch would not
+// perform.
+void runTraceBranch(const ::tt::target::ttnn::CaseOp *op,
+                    ProgramContext &context,
+                    const ::tt::runtime::Tensor &index) {
+  LOG_ASSERT(op->branch_program_ids()->size() == 2,
+             "A trace can branch on a device value between two programs only");
+  ::ttnn::MeshDevice &meshDevice =
+      context.getDeviceHandle().as<::ttnn::MeshDevice>(DeviceRuntime::TTNN);
+  ::tt::tt_metal::distributed::MeshCommandQueue &cq =
+      meshDevice.mesh_command_queue(0);
+  const bool capturing = cq.trace_id().has_value();
+
+  // The prefetcher reads the predicate from page 0 of an interleaved DRAM
+  // buffer, as a 32-bit word or its low 16 bits.
+  ::ttnn::Tensor predicate =
+      index.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
+  switch (predicate.dtype()) {
+  case ::ttnn::DataType::BFLOAT16:
+  case ::ttnn::DataType::UINT16:
+  case ::ttnn::DataType::FLOAT16:
+  case ::ttnn::DataType::INT32:
+  case ::ttnn::DataType::UINT32:
+  case ::ttnn::DataType::FLOAT32:
+    break;
+  default:
+    predicate = ::ttnn::typecast(predicate, ::ttnn::DataType::UINT32);
+  }
+  if (!predicate.memory_config().is_dram() ||
+      predicate.memory_config().is_sharded()) {
+    predicate = ::ttnn::to_memory_config(
+        predicate, ::ttnn::MemoryConfig{::ttnn::TensorMemoryLayout::INTERLEAVED,
+                                        ::ttnn::BufferType::DRAM});
+  }
+  const bool predicateIs16Bit = predicate.dtype() == ::ttnn::DataType::BFLOAT16 ||
+                                predicate.dtype() == ::ttnn::DataType::UINT16 ||
+                                predicate.dtype() == ::ttnn::DataType::FLOAT16;
+
+  std::vector<::tt::runtime::Tensor> inputs;
+  inputs.reserve(op->inputs()->size());
+  for (const auto *input : *op->inputs()) {
+    inputs.emplace_back(
+        context.getTensorPool().getRuntimeTensorAndValidate(input));
+  }
+  NestedProgramTensorRetention retention(inputs);
+
+  auto runBranch = [&](size_t branch) {
+    ProgramExecutor program(
+        context.getDeviceHandle(), context.getExecutableHandle(),
+        op->branch_program_ids()->Get(branch), inputs,
+        /*constEvalProgram=*/false);
+    program.execute();
+    std::vector<::tt::runtime::Tensor> outputs = program.gatherOutputTensors();
+    LOG_ASSERT(outputs.size() == op->outputs()->size(),
+               "Case branch output arity mismatch");
+    return outputs;
+  };
+
+  // The branch for a nonzero predicate first; its outputs give the result
+  // buffers their specs.
+  if (capturing) {
+    ::tt::tt_metal::distributed::TraceBranchBegin(cq, predicate.mesh_buffer(),
+                                                  predicateIs16Bit);
+  }
+  std::vector<::tt::runtime::Tensor> taken = runBranch(1);
+  std::vector<::tt::runtime::Tensor> results;
+  results.reserve(taken.size());
+  for (const ::tt::runtime::Tensor &output : taken) {
+    const ::ttnn::Tensor &tensor =
+        output.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
+    ::ttnn::Tensor result =
+        ::ttnn::create_device_tensor(tensor.tensor_spec(), &meshDevice);
+    ::ttnn::copy(tensor, result);
+    results.push_back(utils::createRuntimeTensorFromTTNN(result));
+  }
+  taken.clear();
+
+  if (capturing) {
+    ::tt::tt_metal::distributed::TraceBranchElse(cq);
+  }
+  std::vector<::tt::runtime::Tensor> other = runBranch(0);
+  for (size_t i = 0; i < other.size(); ++i) {
+    ::ttnn::copy(other[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor(),
+                 results[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor());
+  }
+  other.clear();
+  if (capturing) {
+    ::tt::tt_metal::distributed::TraceBranchEnd(cq);
+  }
+
+  retention.restore();
+  for (size_t i = 0; i < results.size(); ++i) {
+    context.getTensorPool().insertRuntimeTensorAndValidate(
+        op->outputs()->Get(i), results[i]);
+  }
+}
+
 void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context) {
   LOG_ASSERT(op->branch_program_ids() &&
                  op->branch_program_ids()->size() != 0,
@@ -232,6 +345,12 @@ void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context) {
 
   ::tt::runtime::Tensor index =
       context.getTensorPool().getRuntimeTensorAndValidate(op->index());
+  if (trace::inTraceCaptureProgram() &&
+      index.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor().storage_type() ==
+          ::ttnn::StorageType::DEVICE) {
+    runTraceBranch(op, context, index);
+    return;
+  }
   int64_t branchIndex = op->branch_program_ids()->size() == 2
                             ? static_cast<int64_t>(readConditionScalar(index))
                             : readIntegerScalar(index);

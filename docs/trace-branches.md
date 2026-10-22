@@ -72,9 +72,33 @@ of unequal length, workloads before and after the branch, a branch that reads
 a predicate no traced workload wrote and one that ends the trace, and replays
 them with alternating predicate values.
 
-## Next
+## Up the stack
 
-ttnn operations that take a tensor as the predicate, and the tt-mlir runtime
-running both branch programs of a `ttcore.case` with a device selector while
-a trace is captured, so the compiler no longer has to split traces around such
-conditionals.
+`tt_mlir_trace_branch.patch` wires the mechanism into compiled programs:
+
+- The trace hoist keeps a two-way `ttcore.case` with a device-resident
+  selector inside the trace instead of rejecting it (a host-resident selector
+  still becomes a trace key, which costs no drain). A device-selected case
+  may not hold another one in its branches, since trace branches do not nest.
+- The runtime marks the thread while a trace's run-and-capture program
+  executes. In that state the case handler (`tt_mlir_control_flow_runtime.cpp`)
+  runs both branch programs, between `TraceBranchBegin/Else/End` when the
+  queue is capturing, and copies each branch's results into one result
+  buffer allocated from the first branch's outputs, so the case has a single
+  result whichever branch replays. The uncaptured warmup takes the same path,
+  which is what compiles both branches. The predicate is the selector's first
+  element, moved to interleaved DRAM (and widened to 32 bits for narrow
+  integer types) if needed, as captured ops.
+
+The branch programs must be free of side effects the other branch would not
+perform, since both execute during capture.
+
+`tests/libtt/traced_device_branch_regression_test.py` checks a conditional
+on a value computed from the data, branches of unequal size, and a device
+predicate combined with a host predicate, and reads the exported IR to show
+the function stays one trace.
+
+## Not covered yet
+
+Nested device-selected conditionals, cases with more than two branches, and
+loops with device-dependent trip counts (a backward jump).
