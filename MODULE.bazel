@@ -388,6 +388,9 @@ http_archive(
         "//third_party/tt_metal:pow_int32.patch",
         "//third_party/tt_metal:argmax_uint8.patch",
         "//third_party/tt_metal:batch_norm_training_statistics.patch",
+        "//third_party/tt_metal:fp8_tile_layout.patch",
+        "//third_party/tt_metal:fp8_e5m2.patch",
+        "//third_party/tt_metal:fp8_exact_typecast.patch",
     ],
     sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
     strip_prefix = "tt-metal-eb97711f4be2a30cfbff05266faf90bf9780d0c2",
@@ -487,6 +490,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_copy_until_transfer_completes.patch",
         "//third_party/tt_xla:tt_xla_host_memory_allocator.patch",
         "//third_party/tt_xla:tt_xla_compile_exceptions.patch",
+        "//third_party/tt_xla:tt_xla_float8_buffers.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -659,6 +663,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_unsigned_pad_value.patch",
         "//third_party/tt_xla:tt_mlir_conv_window_reversal.patch",
         "//third_party/tt_xla:tt_mlir_pool_pad_fusion.patch",
+        "//third_party/tt_xla:tt_mlir_float8.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
