@@ -197,11 +197,13 @@ bool isExternalOperand(Region &region, Value operand) {
 }
 
 // Canonicalization hoists constants out of control-flow regions. Outlined
-// programs clone scalar integer constants back instead of taking them as
-// inputs, so a loop nested in an outlined region keeps constant bounds rather
-// than reading them from device (which a trace capture cannot do).
+// programs clone scalar constants back instead of taking them as inputs, so a
+// loop nested in an outlined region keeps constant bounds rather than reading
+// them from device (which a trace capture cannot do), and an op that needs a
+// constant operand, like a reduce_window's initial value, still sees one.
 bool isClonedConstant(Value value) {
-  return value.getDefiningOp<stablehlo::ConstantOp>() && isScalarInteger(value);
+  auto constant = value.getDefiningOp<stablehlo::ConstantOp>();
+  return constant && constant.getValue().getNumElements() == 1;
 }
 
 // Dialect conversion can leave operands referring to a detached block until

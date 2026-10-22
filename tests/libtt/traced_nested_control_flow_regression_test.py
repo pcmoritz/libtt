@@ -8,6 +8,7 @@ fori_loop searches and applies min-p under a nested cond.
 """
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -46,11 +47,13 @@ def test_counted_loop_inside_conditional(trace):
 
 @pytest.mark.parametrize("trace", [False, True])
 def test_nested_conditional(trace):
+    # cumsum lowers to a reduce_window, whose initial value has to stay a
+    # constant two conditionals deep.
     def run(outer, inner, x):
         return jax.lax.cond(
             outer,
             lambda v: v + 1,
-            lambda v: jax.lax.cond(inner, lambda w: w * 2, lambda w: w - 3, v),
+            lambda v: jax.lax.cond(inner, lambda w: w * 2, lambda w: jnp.cumsum(w, axis=-1), v),
             x,
         )
 
@@ -60,6 +63,6 @@ def test_nested_conditional(trace):
     # produces the wrong answer.
     for outer, inner in [(False, False), (False, True), (True, False), (False, True),
                          (True, True), (False, False)] * 2:
-        expected = SOURCE + 1 if outer else (SOURCE * 2 if inner else SOURCE - 3)
+        expected = SOURCE + 1 if outer else (SOURCE * 2 if inner else np.cumsum(SOURCE, axis=-1))
         result = run(_put(outer), _put(inner), x)
         np.testing.assert_array_equal(np.asarray(result), expected)
