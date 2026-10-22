@@ -1,0 +1,98 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -5899,12 +5899,6 @@
+       }
+     }
+ 
+-    auto fullTensorOp = rewriter.create<ttir::FullOp>(
+-        loc, operandType, rewriter.getF32FloatAttr(fillValue));
+-
+-    // Tensor which we scatter into
+-    Value fullTensor = fullTensorOp.getResult();
+-
+     Block &selectBlock = srcOp.getSelect().front();
+     auto selectReturn =
+         mlir::dyn_cast<mlir::stablehlo::ReturnOp>(selectBlock.getTerminator());
+@@ -5946,6 +5940,36 @@
+                  : rewriter.getDenseI64ArrayAttr(
+                        SmallVector<int64_t>(windowDims.size() * 2, 0));
+ 
++    // TTNN pooling pads its input explicitly for padding beyond half the
++    // window and then returns indices into the padded input. Pad here instead,
++    // scatter into the padded shape and slice the result back.
++    RankedTensorType resultType = operandType;
++    SmallVector<int64_t> explicitPadding(padding.asArrayRef());
++    bool padExplicitly = false;
++    for (size_t d = 0; d < windowDims.size(); ++d) {
++      padExplicitly |= explicitPadding[2 * d] > windowDims[d] / 2 ||
++                       explicitPadding[2 * d + 1] > windowDims[d] / 2;
++    }
++    if (padExplicitly) {
++      SmallVector<int64_t> paddedShape(operandType.getShape());
++      for (size_t d = 0; d < paddedShape.size(); ++d) {
++        paddedShape[d] += explicitPadding[2 * d] + explicitPadding[2 * d + 1];
++      }
++      operandType = RankedTensorType::get(
++          paddedShape, operandType.getElementType(), operandType.getEncoding());
++      operand = rewriter.create<ttir::PadOp>(
++          loc, operandType, operand,
++          rewriter.getDenseI32ArrayAttr(SmallVector<int32_t>(
++              explicitPadding.begin(), explicitPadding.end())),
++          rewriter.getF32FloatAttr(-std::numeric_limits<float>::infinity()));
++      padding = rewriter.getDenseI64ArrayAttr(
++          SmallVector<int64_t>(explicitPadding.size(), 0));
++    }
++
++    // Tensor which we scatter into
++    Value fullTensor = rewriter.create<ttir::FullOp>(
++        loc, operandType, rewriter.getF32FloatAttr(fillValue));
++
+     SmallVector<int64_t> unitDilations(windowDims.size(), 1);
+     std::optional<Pool2DLayout> layout =
+         getPool2DLayout(operandType.getShape(), windowDims.asArrayRef(),
+@@ -6085,6 +6109,18 @@
+           mlir::cast<RankedTensorType>(result.getType()),
+           layout->inversePermutation, "_restoreLayout");
+     }
++    if (padExplicitly) {
++      SmallVector<int32_t> begins, ends;
++      for (int64_t d = 0; d < resultType.getRank(); ++d) {
++        begins.push_back(static_cast<int32_t>(explicitPadding[2 * d]));
++        ends.push_back(
++            static_cast<int32_t>(begins.back() + resultType.getDimSize(d)));
++      }
++      result = rewriter.create<ttir::SliceStaticOp>(
++          loc, resultType, result, rewriter.getI32ArrayAttr(begins),
++          rewriter.getI32ArrayAttr(ends),
++          rewriter.getI32ArrayAttr(SmallVector<int32_t>(begins.size(), 1)));
++    }
+ 
+     rewriter.replaceOp(srcOp, result);
+     return success();
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -33,6 +33,7 @@
+ #include "llvm/Support/MathExtras.h"
+ #include <cmath>
+ #include <cstdint>
++#include <limits>
+ #include <numeric>
+ #include <optional>
+ 
+@@ -2546,6 +2547,14 @@
+           mlir::cast<mlir::TypedValue<mlir::RankedTensorType>>(
+               unflattenedInput.getResult()),
+           nhwcPadding, rewriter, op.getLoc());
++      // generatePad pads with zeros, which max pooling would select over
++      // negative values.
++      if constexpr (!std::is_same_v<TTIROpTy, ttir::AvgPool2dOp>) {
++        if (isa<FloatType>(op.getInput().getType().getElementType())) {
++          paddedInput.setValueAttr(rewriter.getF32FloatAttr(
++              -std::numeric_limits<float>::infinity()));
++        }
++      }
+ 
+       // Flatten back to (1, 1, N*H'*W', C).
+       int64_t paddedHeight = inputHeight + paddingTop + paddingBottom;
