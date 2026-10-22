@@ -196,19 +196,17 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    if (!float8Operands && (hasUnsupportedFloatType(lhsType) ||
 +                            hasUnsupportedFloatType(rhsType))) {
        return rewriter.notifyMatchFailure(
-           srcOp, "only 16- and 32-bit float inputs are supported");
+           srcOp, "unsupported floating-point input type");
      }
 diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
 new file mode 100644
 --- /dev/null
 +++ b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
-@@ -0,0 +1,422 @@
+@@ -0,0 +1,413 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
 +
-+#include <cmath>
-+#include <limits>
 +#include <optional>
 +
 +#include "ttmlir/Dialect/StableHLO/Transforms/Passes.h"
@@ -249,15 +247,15 @@ new file mode 100644
 +namespace {
 +
 +// The float8 element type of a type, if it has one.
-+std::optional<Type> getFloat8Type(Type type) {
++Type getFloat8Type(Type type) {
 +  Type elementType = getElementTypeOrSelf(type);
 +  if (isa<Float8E4M3FNType, Float8E5M2Type>(elementType)) {
 +    return elementType;
 +  }
-+  return std::nullopt;
++  return {};
 +}
 +
-+bool isFloat8(Type type) { return getFloat8Type(type).has_value(); }
++bool isFloat8(Type type) { return static_cast<bool>(getFloat8Type(type)); }
 +
 +bool hasFloat8(TypeRange types) { return llvm::any_of(types, isFloat8); }
 +
@@ -266,8 +264,7 @@ new file mode 100644
 +}
 +
 +RankedTensorType withElementType(Type type, Type elementType) {
-+  return RankedTensorType::get(cast<RankedTensorType>(type).getShape(),
-+                               elementType);
++  return cast<RankedTensorType>(type).clone(elementType);
 +}
 +
 +// A dot_general whose float8 operands the matrix unit can read as they are:
@@ -321,7 +318,7 @@ new file mode 100644
 +              Type originalType, Type elementType) {
 +  Value value = converted;
 +  if (auto float8Type = getFloat8Type(originalType)) {
-+    value = decodeFloat8(builder, loc, converted, *float8Type);
++    value = decodeFloat8(builder, loc, converted, float8Type);
 +  }
 +  if (getElementTypeOrSelf(value.getType()) != elementType) {
 +    value = builder.create<mlir::stablehlo::ConvertOp>(loc, value, elementType);
@@ -350,7 +347,7 @@ new file mode 100644
 +    Value value = toFloat(rewriter, op.getLoc(), adaptor.getOperand(),
 +                          inputType, computeType);
 +    if (resultFloat8) {
-+      value = encodeFloat8(rewriter, op.getLoc(), value, *resultFloat8);
++      value = encodeFloat8(rewriter, op.getLoc(), value, resultFloat8);
 +    }
 +    rewriter.replaceOp(op, value);
 +    return success();
@@ -408,33 +405,27 @@ new file mode 100644
 +  matchAndRewrite(mlir::stablehlo::DotGeneralOp op, OpAdaptor adaptor,
 +                  ConversionPatternRewriter &rewriter) const override {
 +    auto resultFloat8 = getFloat8Type(op.getType());
++    Value lhs, rhs;
 +    if (hasNativeFloat8Operands(op)) {
-+      Value lhs = rewriter.create<mlir::stablehlo::BitcastConvertOp>(
++      lhs = rewriter.create<mlir::stablehlo::BitcastConvertOp>(
 +          op.getLoc(), op.getLhs().getType(), adaptor.getLhs());
-+      Value rhs = rewriter.create<mlir::stablehlo::BitcastConvertOp>(
++      rhs = rewriter.create<mlir::stablehlo::BitcastConvertOp>(
 +          op.getLoc(), op.getRhs().getType(), adaptor.getRhs());
-+      Value result = rewriter.create<mlir::stablehlo::DotGeneralOp>(
-+          op.getLoc(), withElementType(op.getType(), rewriter.getF32Type()),
-+          lhs, rhs, op.getDotDimensionNumbersAttr(),
-+          op.getPrecisionConfigAttr(), op.getAlgorithmAttr());
-+      rewriter.replaceOp(
-+          op, encodeFloat8(rewriter, op.getLoc(), result, *resultFloat8));
-+      return success();
-+    }
-+    // Float8 values are exact in bfloat16; an f32 operand keeps the other
-+    // in f32.
-+    Type lhsElement = getElementTypeOrSelf(op.getLhs().getType());
-+    Type rhsElement = getElementTypeOrSelf(op.getRhs().getType());
-+    Type computeType = rewriter.getBF16Type();
-+    for (Type element : {lhsElement, rhsElement}) {
-+      if (!isFloat8(element) && element != computeType) {
-+        computeType = rewriter.getF32Type();
++    } else {
++      // Float8 values are exact in bfloat16; an f32 operand keeps the other
++      // in f32.
++      Type computeType = rewriter.getBF16Type();
++      for (Type operandType : op->getOperandTypes()) {
++        Type element = getElementTypeOrSelf(operandType);
++        if (!isFloat8(element) && element != computeType) {
++          computeType = rewriter.getF32Type();
++        }
 +      }
++      lhs = toFloat(rewriter, op.getLoc(), adaptor.getLhs(),
++                    op.getLhs().getType(), computeType);
++      rhs = toFloat(rewriter, op.getLoc(), adaptor.getRhs(),
++                    op.getRhs().getType(), computeType);
 +    }
-+    Value lhs = toFloat(rewriter, op.getLoc(), adaptor.getLhs(),
-+                        op.getLhs().getType(), computeType);
-+    Value rhs = toFloat(rewriter, op.getLoc(), adaptor.getRhs(),
-+                        op.getRhs().getType(), computeType);
 +    Type resultType = resultFloat8
 +                          ? withElementType(op.getType(), rewriter.getF32Type())
 +                          : op.getType();
@@ -442,7 +433,7 @@ new file mode 100644
 +        op.getLoc(), resultType, lhs, rhs, op.getDotDimensionNumbersAttr(),
 +        op.getPrecisionConfigAttr(), op.getAlgorithmAttr());
 +    if (resultFloat8) {
-+      result = encodeFloat8(rewriter, op.getLoc(), result, *resultFloat8);
++      result = encodeFloat8(rewriter, op.getLoc(), result, resultFloat8);
 +    }
 +    rewriter.replaceOp(op, result);
 +    return success();
@@ -493,7 +484,7 @@ new file mode 100644
 +      newOperands.push_back(
 +          isFloat8(original.getType())
 +              ? decodeFloat8(rewriter, op->getLoc(), converted,
-+                             *getFloat8Type(original.getType()))
++                             getFloat8Type(original.getType()))
 +              : converted);
 +    }
 +    SmallVector<Type> resultTypes;
@@ -511,7 +502,7 @@ new file mode 100644
 +         llvm::zip_equal(op->getResults(), newOp->getResults())) {
 +      results.push_back(isFloat8(original.getType())
 +                            ? encodeFloat8(rewriter, op->getLoc(), result,
-+                                           *getFloat8Type(original.getType()))
++                                           getFloat8Type(original.getType()))
 +                            : result);
 +    }
 +    rewriter.replaceOp(op, results);
