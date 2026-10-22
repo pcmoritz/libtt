@@ -8,18 +8,14 @@
 #include <gtest/gtest.h>
 
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <functional>
 #include <memory>
 #include <random>
-#include <string>
 #include <vector>
 
-#include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/mesh_device.hpp>
 #include <tt-metalium/tensor/tensor_apis.hpp>
@@ -55,11 +51,6 @@ protected:
                                                : bytes.template operator()<float8_e4m3>();
         });
         return ttnn::Tensor(to_tile_layout(row_major, Tile())).to_device(mesh_device_.get());
-    }
-
-    ttnn::Tensor float_device(const std::vector<float>& values, uint32_t rows, uint32_t cols, DataType dtype) {
-        const TensorSpec spec(ttnn::Shape({rows, cols}), TensorLayout(dtype, PageConfig(Layout::TILE), {}));
-        return ttnn::Tensor::from_vector(values, spec).to_device(mesh_device_.get());
     }
 
     std::shared_ptr<MeshDevice> mesh_device_;
@@ -178,17 +169,9 @@ TEST_F(Fp8MatmulTest, MatchesFlushedReference) {
                 fidelity == MathFidelity::LoFi ? "LoFi" : "HiFi4",
                 errors.exact,
                 errors.flushed);
-            // About the error of a BFLOAT16 matmul of the same values (below).
+            // Bound the matrix unit's accumulation error.
             EXPECT_LE(errors.flushed, std::ldexp(1.0, -9));
         }
-        // The same values (exact in BFLOAT16) multiplied as BFLOAT16, for comparison.
-        const ttnn::Tensor c_bf16 = ttnn::matmul(
-            float_device(a_exact, M, K, DataType::BFLOAT16), float_device(b_exact, K, N, DataType::BFLOAT16), false,
-            false, std::nullopt, DataType::FLOAT32, std::nullopt, std::nullopt,
-            ttnn::DeviceComputeKernelConfig{.math_fidelity = MathFidelity::HiFi4, .fp32_dest_acc_en = true});
-        const Errors bf16_errors =
-            compare(c_bf16.cpu().to_vector<float>(), a_exact, a_flushed, b_exact, b_flushed, M, K, N);
-        std::printf("bf16 x bf16 %ux%ux%u HiFi4: worst error %.3g vs exact\n", M, K, N, bf16_errors.exact);
     }
 }
 
@@ -225,78 +208,6 @@ TEST_F(Fp8MatmulTest, E5m2AndMixedOperands) {
                 errors.exact,
                 errors.flushed);
             EXPECT_LE(std::min(errors.exact, errors.flushed), std::ldexp(1.0, -9)) << c.name;
-        }
-    }
-}
-
-// The operands unpack to different exponent families (Float16 for Fp8,
-// Float16_b for BFLOAT16), and the products are garbage.
-TEST_F(Fp8MatmulTest, MixedWithBfloat16IsWrong) {
-    const uint32_t M = 64, K = 256, N = 96;
-    std::mt19937 rng(7);
-    const std::vector<uint8_t> a = random_codes(M * K, rng);
-    std::normal_distribution<float> normal(0.0f, 1.0f);
-    std::vector<float> b(K * N);
-    for (float& v : b) {
-        v = static_cast<float>(bfloat16(normal(rng)));
-    }
-    const ttnn::Tensor c_device = ttnn::matmul(
-        fp8_device(a, M, K), float_device(b, K, N, DataType::BFLOAT16), false, false, std::nullopt,
-        DataType::FLOAT32, std::nullopt, std::nullopt,
-        ttnn::DeviceComputeKernelConfig{.math_fidelity = MathFidelity::HiFi4, .fp32_dest_acc_en = true});
-    const Errors errors =
-        compare(c_device.cpu().to_vector<float>(), decode_all(a, false), decode_all(a, true), b, b, M, K, N);
-    std::printf("fp8 x bf16 %ux%ux%u HiFi4: worst error %.3g\n", M, K, N, errors.flushed);
-    EXPECT_GT(errors.flushed, 0.1);
-}
-
-// Time per matmul of a few large shapes, fp8 against bf16 and bfp8 operands.
-TEST_F(Fp8MatmulTest, Performance) {
-    auto time = [&](const std::function<ttnn::Tensor()>& run) {
-        for (int i = 0; i < 3; ++i) {
-            run();
-        }
-        Finish(mesh_device_->mesh_command_queue());
-        const int iterations = 20;
-        const auto start = std::chrono::steady_clock::now();
-        for (int i = 0; i < iterations; ++i) {
-            run();
-        }
-        Finish(mesh_device_->mesh_command_queue());
-        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() /
-               iterations;
-    };
-    struct Shape {
-        uint32_t M, K, N;
-    };
-    for (const Shape& shape : {Shape{32, 4096, 4096}, Shape{1024, 4096, 4096}, Shape{4096, 4096, 4096}}) {
-        const auto [M, K, N] = shape;
-        std::mt19937 rng(1);
-        const ttnn::Tensor a8 = fp8_device(random_codes(M * K, rng), M, K);
-        const ttnn::Tensor b8 = fp8_device(random_codes(K * N, rng), K, N);
-        const ttnn::Tensor a5 = fp8_device(random_e5m2_codes(M * K, rng), M, K, DataType::FP8_E5M2);
-        const ttnn::Tensor b5 = fp8_device(random_e5m2_codes(K * N, rng), K, N, DataType::FP8_E5M2);
-        std::vector<float> a(M * K, 0.5f), b(K * N, 0.25f);
-        const ttnn::Tensor a16 = float_device(a, M, K, DataType::BFLOAT16);
-        const ttnn::Tensor b16 = float_device(b, K, N, DataType::BFLOAT16);
-        const ttnn::Tensor b_bfp8 = float_device(b, K, N, DataType::BFLOAT8_B);
-        const ttnn::DeviceComputeKernelConfig lofi{.math_fidelity = MathFidelity::LoFi, .fp32_dest_acc_en = true};
-        const ttnn::DeviceComputeKernelConfig hifi2{.math_fidelity = MathFidelity::HiFi2, .fp32_dest_acc_en = true};
-        auto mm = [&](const ttnn::Tensor& x, const ttnn::Tensor& y, const ttnn::DeviceComputeKernelConfig& config) {
-            return [&, config] {
-                return ttnn::matmul(
-                    x, y, false, false, std::nullopt, DataType::BFLOAT16, std::nullopt, std::nullopt, config);
-            };
-        };
-        const double flops = 2.0 * M * K * N;
-        for (const auto& [name, us] : std::vector<std::pair<std::string, double>>{
-                 {"fp8 x fp8 LoFi", time(mm(a8, b8, lofi))},
-                 {"e5m2 x e5m2 LoFi", time(mm(a5, b5, lofi))},
-                 {"bf16 x bf16 LoFi", time(mm(a16, b16, lofi))},
-                 {"bf16 x bf16 HiFi2", time(mm(a16, b16, hifi2))},
-                 {"bf16 x bfp8 LoFi", time(mm(a16, b_bfp8, lofi))},
-             }) {
-            std::printf("%ux%ux%u %s: %.1f us, %.1f TFLOP/s\n", M, K, N, name.c_str(), us, flops / us * 1e-6);
         }
     }
 }

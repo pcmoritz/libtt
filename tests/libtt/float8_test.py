@@ -150,6 +150,18 @@ def test_native_float8_matmul(m, k, n, lhs_dtype, rhs_dtype):
     assert np.max(np.abs(product - expected) / np.maximum(scale, 1e-30)) < 2.0**-9
 
 
+@LEVELS
+@pytest.mark.parametrize("dtype", FORMATS)
+def test_native_float8_matmul_rounds_output(dtype, level):
+    """Exact integer products isolate rounding of the final float8 result."""
+    rng = np.random.default_rng(7)
+    a = rng.integers(-2, 3, (32, 64)).astype(dtype)
+    b = rng.integers(-2, 3, (64, 32)).astype(dtype)
+    product = jit(lambda a, b: jnp.dot(a, b), level)(a, b)
+    expected = (a.astype(np.float32) @ b.astype(np.float32)).astype(dtype)
+    assert_same_bits(product, expected)
+
+
 @pytest.mark.parametrize(
     "dtype,subnormal,one", [(jnp.float8_e4m3fn, 0x07, 0x38), (jnp.float8_e5m2, 0x03, 0x3C)]
 )
