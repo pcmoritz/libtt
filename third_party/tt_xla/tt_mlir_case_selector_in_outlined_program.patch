@@ -1,0 +1,18 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+@@ -751,8 +751,13 @@
+       if (mlir::isa<ttir::MeshShardOp>(user)) {
+         return true;
+       }
++      // The runtime reads a case selector on host. Keep an entry function's
++      // selector there; an outlined control-flow program (a branch or loop
++      // body, which is private) receives its arguments from the op that
++      // calls it, and forcing a selector to host only there would give the
++      // program a signature its sibling programs do not share.
+       if (auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(user);
+-          caseOp && caseOp.getIndex() == arg) {
++          caseOp && caseOp.getIndex() == arg && !owningFunc.isPrivate()) {
+         return true;
+       }
+     }
