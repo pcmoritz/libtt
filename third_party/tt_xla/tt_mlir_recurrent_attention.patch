@@ -13,7 +13,7 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/Utils.h b/include/ttmlir/Dialect/T
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -6489,6 +6489,47 @@ def TTIR_ScaledDotProductAttentionOp : TTIR_NamedOp<"scaled_dot_product_attentio
+@@ -6489,6 +6489,60 @@ def TTIR_ScaledDotProductAttentionOp : TTIR_NamedOp<"scaled_dot_product_attentio
    let hasVerifier = 1;
  }
  
@@ -37,7 +37,8 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$a_log,
 +                       AnyRankedTensor:$dt_bias,
 +                       AnyRankedTensor:$state_indices,
-+                       AnyRankedTensor:$has_initial_state);
++                       AnyRankedTensor:$has_initial_state,
++                       Optional<AnyRankedTensor>:$state_slots);
 +  let results = (outs AnyRankedTensor:$output);
 +}
 +
@@ -47,7 +48,8 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$input,
 +                       AnyRankedTensor:$weight,
 +                       AnyRankedTensor:$state_indices,
-+                       AnyRankedTensor:$has_initial_state);
++                       AnyRankedTensor:$has_initial_state,
++                       Optional<AnyRankedTensor>:$state_slots);
 +  let results = (outs AnyRankedTensor:$output);
 +}
 +
@@ -58,13 +60,24 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$updates);
 +}
 +
++def TTIR_StatePoolCopyOp : TTIR_InplaceOp<"state_pool_copy", [TTIR_CacheOpInterface]> {
++  let summary = "state pool copy.";
++  let description = [{
++    Copies slot sources[i] of the pool to slot targets[i], in place, skipping
++    pairs with slot 0 on either side.
++  }];
++  let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
++                       AnyRankedTensor:$sources,
++                       AnyRankedTensor:$targets);
++}
++
  def TTIR_GlobalAvgPool2dOp: TTIR_NamedOp<"global_avg_pool2d">{
    let summary = "A global average pooling 2d operation";
    let description = [{
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4806,6 +4806,51 @@ def TTNN_ScaledDotProductAttentionOp : TTNN_Op<"scaled_dot_product_attention", [
+@@ -4806,6 +4806,64 @@ def TTNN_ScaledDotProductAttentionOp : TTNN_Op<"scaled_dot_product_attention", [
      let hasVerifier = 1;
  }
  
@@ -92,7 +105,8 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$a_log,
 +                       AnyRankedTensor:$dt_bias,
 +                       AnyRankedTensor:$state_indices,
-+                       AnyRankedTensor:$has_initial_state);
++                       AnyRankedTensor:$has_initial_state,
++                       Optional<AnyRankedTensor>:$state_slots);
 +  let results = (outs AnyRankedTensor:$output);
 +}
 +
@@ -102,7 +116,8 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$input,
 +                       AnyRankedTensor:$weight,
 +                       AnyRankedTensor:$state_indices,
-+                       AnyRankedTensor:$has_initial_state);
++                       AnyRankedTensor:$has_initial_state,
++                       Optional<AnyRankedTensor>:$state_slots);
 +  let results = (outs AnyRankedTensor:$output);
 +}
 +
@@ -113,13 +128,24 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$updates);
 +}
 +
++def TTNN_StatePoolCopyOp : TTNN_InplaceOp<"state_pool_copy", [OpModelExempt]> {
++  let summary = "state pool copy.";
++  let description = [{
++    Copies slot sources[i] of the pool to slot targets[i], in place, skipping
++    pairs with slot 0 on either side.
++  }];
++  let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
++                       AnyRankedTensor:$sources,
++                       AnyRankedTensor:$targets);
++}
++
  def TTNN_FlashMlaPrefillOp : TTNN_Op<"flash_mla_prefill", [AttrSizedOperandSegments]> {
      let summary = "Flash Multi-head Latent Attention prefill operation.";
      let description = [{
 diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
 --- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
-@@ -81,6 +81,48 @@ table ScaledDotProductAttentionOp {
+@@ -81,6 +81,58 @@ table ScaledDotProductAttentionOp {
    memcfg: tt.target.ttnn.MemoryConfig;
  }
  
@@ -148,6 +174,8 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 +  state_indices: tt.target.ttnn.TensorRef;
 +  has_initial_state: tt.target.ttnn.TensorRef;
 +  output: tt.target.ttnn.TensorRef;
++  // Optional [B, T] slots for the state after each of T steps per state.
++  state_slots: tt.target.ttnn.TensorRef;
 +}
 +
 +table CausalConv1dUpdateOp {
@@ -157,6 +185,8 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 +  state_indices: tt.target.ttnn.TensorRef;
 +  has_initial_state: tt.target.ttnn.TensorRef;
 +  output: tt.target.ttnn.TensorRef;
++  // Optional [B, T] slots for the window after each of T steps per state.
++  state_slots: tt.target.ttnn.TensorRef;
 +}
 +
 +table StatePoolUpdateOp {
@@ -165,13 +195,19 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 +  updates: tt.target.ttnn.TensorRef;
 +}
 +
++table StatePoolCopyOp {
++  cache: tt.target.ttnn.TensorRef;
++  sources: tt.target.ttnn.TensorRef;
++  targets: tt.target.ttnn.TensorRef;
++}
++
  table FlashMlaPrefillOp {
    query: tt.target.ttnn.TensorRef;
    key: tt.target.ttnn.TensorRef;
 diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
 --- a/include/ttmlir/Target/TTNN/program.fbs
 +++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -93,6 +93,10 @@ union OpType {
+@@ -93,6 +93,11 @@ union OpType {
    FuncCallOp,
    GatherOp,
    GenericOp,
@@ -179,13 +215,14 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 +  GatedDeltaDecodeOp,
 +  CausalConv1dUpdateOp,
 +  StatePoolUpdateOp,
++  StatePoolCopyOp,
    GetDeviceOp,
    GlobalAvgPool2dOp,
    GroupNormOp,
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10123,6 +10123,72 @@ public:
+@@ -10123,6 +10123,88 @@ public:
  } // namespace
  
  namespace {
@@ -214,7 +251,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      return success();
 +    }
 +    if (name == "tt.gated_delta_decode") {
-+      if (op.getNumOperands() != 8 || op.getNumResults() != 2) {
++      // An optional ninth operand holds the state slots of a multi-step call.
++      if ((op.getNumOperands() != 8 && op.getNumOperands() != 9) ||
++          op.getNumResults() != 2) {
 +        return op.emitOpError("invalid recurrent call arity");
 +      }
 +      if (failed(requireOutputOperandAlias(op, 0, 0))) {
@@ -227,7 +266,9 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      return success();
 +    }
 +    if (name == "tt.causal_conv1d_update") {
-+      if (op.getNumOperands() != 5 || op.getNumResults() != 2) {
++      // An optional sixth operand holds the state slots of a multi-step call.
++      if ((op.getNumOperands() != 5 && op.getNumOperands() != 6) ||
++          op.getNumResults() != 2) {
 +        return op.emitOpError("invalid recurrent call arity");
 +      }
 +      if (failed(requireOutputOperandAlias(op, 0, 0))) {
@@ -251,6 +292,18 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      rewriter.replaceOp(op, adaptor.getOperands()[0]);
 +      return success();
 +    }
++    if (name == "tt.state_pool_copy") {
++      if (op.getNumOperands() != 3 || op.getNumResults() != 1) {
++        return op.emitOpError("invalid recurrent call arity");
++      }
++      if (failed(requireOutputOperandAlias(op, 0, 0))) {
++        return failure();
++      }
++      rewriter.create<ttir::StatePoolCopyOp>(op.getLoc(), TypeRange{},
++                                             adaptor.getOperands());
++      rewriter.replaceOp(op, adaptor.getOperands()[0]);
++      return success();
++    }
 +    return failure();
 +  }
 +};
@@ -258,7 +311,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  class StableHLOPagedFillCacheConversionPattern
      : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
    using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
-@@ -12108,6 +12174,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
+@@ -12108,6 +12190,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
                                                                  ctx);
    patterns.add<StableHLOToTTIRCollectivePermuteOpConversionPattern>(
        typeConverter, ctx);
@@ -270,7 +323,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -3443,6 +3443,86 @@ public:
+@@ -3443,6 +3443,88 @@ public:
  } // namespace
  
  namespace {
@@ -353,11 +406,13 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +using StatePoolUpdateOpConversionPattern =
 +    RecurrentOpConversionPattern<ttir::StatePoolUpdateOp,
 +                                 ttnn::StatePoolUpdateOp>;
++using StatePoolCopyOpConversionPattern =
++    RecurrentOpConversionPattern<ttir::StatePoolCopyOp, ttnn::StatePoolCopyOp>;
 +
  class PagedFlashMultiLatentAttentionDecodeOpConversionPattern
      : public OpConversionPattern<ttir::PagedFlashMultiLatentAttentionDecodeOp> {
  public:
-@@ -4012,6 +4092,10 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -4012,6 +4094,11 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
             ScaledDotProductAttentionDecodeOpConversionPattern,
             PagedScaledDotProductAttentionDecodeOpConversionPattern,
             ChunkedScaledDotProductAttentionOpConversionPattern,
@@ -365,6 +420,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +           GatedDeltaDecodeOpConversionPattern,
 +           CausalConv1dUpdateOpConversionPattern,
 +           StatePoolUpdateOpConversionPattern,
++           StatePoolCopyOpConversionPattern,
             PagedFlashMultiLatentAttentionDecodeOpConversionPattern,
             SplitQueryKeyValueAndSplitHeadsOpConversionPattern,
             GeluBackwardOpConversionPattern,
@@ -380,7 +436,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp b/lib/Dia
  
  namespace mlir::tt::ttir {
  #define GEN_PASS_DEF_TTIRINFERKVCACHEARGUMENTTYPES
-@@ -26,15 +26,18 @@ public:
+@@ -26,15 +26,19 @@ public:
      MLIRContext *context = moduleOp.getContext();
  
      moduleOp.walk([&](func::FuncOp funcOp) {
@@ -390,7 +446,8 @@ diff --git a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp b/lib/Dia
        funcOp.walk([&](CacheOpInterface cacheOp) {
          mlir::Value cacheValue = cacheOp.getCache();
 +        bool isRecurrent =
-+            mlir::isa<GatedDeltaDecodeOp, CausalConv1dUpdateOp, StatePoolUpdateOp>(
++            mlir::isa<GatedDeltaDecodeOp, CausalConv1dUpdateOp, StatePoolUpdateOp,
++                      StatePoolCopyOp>(
 +                cacheOp.getOperation());
  
          // Direct BlockArgument → CacheOp connection.
@@ -401,7 +458,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp b/lib/Dia
            }
            return;
          }
-@@ -47,16 +50,23 @@ public:
+@@ -47,16 +51,23 @@ public:
              if (auto blockArg =
                      llvm::dyn_cast<BlockArgument>(meshShardOp.getInput())) {
                if (blockArg.getOwner()->getParentOp() == funcOp) {
@@ -500,7 +557,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -3895,6 +3895,63 @@ createOp(FlatbufferObjectCache &cache, ScaledDotProductAttentionOp op) {
+@@ -3895,6 +3895,76 @@ createOp(FlatbufferObjectCache &cache, ScaledDotProductAttentionOp op) {
        slidingWindowSize, attentionSink, out, memoryConfig);
  }
  
@@ -533,7 +590,8 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +      tensor(op.getALog()), tensor(op.getDtBias()),
 +      tensor(op.getStateIndices()), tensor(op.getHasInitialState()),
 +      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
-+                                  std::nullopt));
++                                  std::nullopt),
++      op.getStateSlots() ? tensor(op.getStateSlots()) : 0);
 +}
 +
 +::flatbuffers::Offset<::tt::target::ttnn::CausalConv1dUpdateOp>
@@ -547,7 +605,8 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +      tensor(op.getWeight()), tensor(op.getStateIndices()),
 +      tensor(op.getHasInitialState()),
 +      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
-+                                  std::nullopt));
++                                  std::nullopt),
++      op.getStateSlots() ? tensor(op.getStateSlots()) : 0);
 +}
 +
 +::flatbuffers::Offset<::tt::target::ttnn::StatePoolUpdateOp>
@@ -561,10 +620,21 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +      tensor(op.getUpdates()));
 +}
 +
++::flatbuffers::Offset<::tt::target::ttnn::StatePoolCopyOp>
++createOp(FlatbufferObjectCache &cache, StatePoolCopyOp op) {
++  auto tensor = [&](Value value) {
++    return cache.at<::tt::target::ttnn::TensorRef>(
++        getOperandThroughDPSOps(value));
++  };
++  return ::tt::target::ttnn::CreateStatePoolCopyOp(
++      *cache.fbb, tensor(op.getCache()), tensor(op.getSources()),
++      tensor(op.getTargets()));
++}
++
  ::flatbuffers::Offset<::tt::target::ttnn::FlashMlaPrefillOp>
  createOp(FlatbufferObjectCache &cache, FlashMlaPrefillOp op) {
    auto query = cache.at<::tt::target::ttnn::TensorRef>(
-@@ -5617,6 +5674,22 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -5617,6 +5687,26 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, scaledDotProductAttentionOp),
                             debugString, locInfo);
    }
@@ -584,6 +654,10 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +    return createOperation(cache, createOp(cache, recurrentOp), debugString,
 +                           locInfo);
 +  }
++  if (auto recurrentOp = dyn_cast<StatePoolCopyOp>(op)) {
++    return createOperation(cache, createOp(cache, recurrentOp), debugString,
++                           locInfo);
++  }
    if (auto flashMlaPrefillOp = dyn_cast<FlashMlaPrefillOp>(op);
        flashMlaPrefillOp) {
      return createOperation(cache, createOp(cache, flashMlaPrefillOp),
@@ -591,7 +665,7 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 new file mode 100644
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,121 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +#include "operations/transformer/recurrent.h"
@@ -602,6 +676,7 @@ new file mode 100644
 +#include "ttnn/operations/transformer/gated_delta_attn/causal_conv1d_update.hpp"
 +#include "ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.hpp"
 +#include "ttnn/operations/transformer/gated_delta_attn/state_pool_update.hpp"
++#include "ttnn/operations/transformer/state_pool_copy/state_pool_copy.hpp"
 +
 +namespace tt::runtime::ttnn::operations::transformer {
 +namespace {
@@ -665,7 +740,10 @@ new file mode 100644
 +      tiled(get(op->a_log()), ::ttnn::DataType::FLOAT32),
 +      tiled(get(op->dt_bias()), ::ttnn::DataType::FLOAT32), get(op->cache()),
 +      tiled(get(op->state_indices()), ::ttnn::DataType::INT32),
-+      tiled(get(op->has_initial_state()), ::ttnn::DataType::BFLOAT16));
++      tiled(get(op->has_initial_state()), ::ttnn::DataType::BFLOAT16),
++      op->state_slots() ? std::optional<::ttnn::Tensor>(tiled(
++                              get(op->state_slots()), ::ttnn::DataType::INT32))
++                        : std::nullopt);
 +  put(pool, op->output(), output);
 +}
 +
@@ -680,7 +758,10 @@ new file mode 100644
 +      tiled(get(op->weight()), ::ttnn::DataType::BFLOAT16),
 +      tiled(get(op->state_indices()), ::ttnn::DataType::INT32),
 +      tiled(get(op->has_initial_state()), ::ttnn::DataType::BFLOAT16),
-+      utils::getDataType(op->output()));
++      utils::getDataType(op->output()),
++      op->state_slots() ? std::optional<::ttnn::Tensor>(tiled(
++                              get(op->state_slots()), ::ttnn::DataType::INT32))
++                        : std::nullopt);
 +  put(pool, op->output(), output);
 +}
 +
@@ -694,12 +775,23 @@ new file mode 100644
 +            ::ttnn::DataType::INT32),
 +      tiled(pool.getTTNNTensorAndValidate(op->updates()), cache.dtype()));
 +}
++
++void run(const ::tt::target::ttnn::StatePoolCopyOp *op,
++         ProgramContext &context) {
++  auto &pool = context.getTensorPool();
++  auto index = [&](const auto *ref) {
++    return tiled(pool.getTTNNTensorAndValidate(ref), ::ttnn::DataType::INT32);
++  };
++  ::ttnn::transformer::state_pool_copy(
++      pool.getTTNNTensorAndValidate(op->cache()), index(op->sources()),
++      index(op->targets()));
++}
 +} // namespace tt::runtime::ttnn::operations::transformer
 diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.h b/runtime/lib/ttnn/operations/transformer/recurrent.h
 new file mode 100644
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.h
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,16 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +#pragma once
@@ -713,6 +805,8 @@ new file mode 100644
 +         ProgramContext &context);
 +void run(const ::tt::target::ttnn::StatePoolUpdateOp *op,
 +         ProgramContext &context);
++void run(const ::tt::target::ttnn::StatePoolCopyOp *op,
++         ProgramContext &context);
 +} // namespace tt::runtime::ttnn::operations::transformer
 diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
 --- a/runtime/lib/ttnn/program_executor.cpp
@@ -725,7 +819,7 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
  #include "operations/transformer/rotary_embedding.h"
  #include "operations/transformer/rotary_embedding_llama.h"
  #include "operations/transformer/scaled_dot_product_attention.h"
-@@ -752,6 +753,18 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+@@ -752,6 +753,21 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
      return operations::transformer::run(
          op->type_as_ScaledDotProductAttentionOp(), getContext());
    }
@@ -740,6 +834,9 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
 +                                        getContext());
 +  case ::tt::target::ttnn::OpType::StatePoolUpdateOp:
 +    return operations::transformer::run(op->type_as_StatePoolUpdateOp(),
++                                        getContext());
++  case ::tt::target::ttnn::OpType::StatePoolCopyOp:
++    return operations::transformer::run(op->type_as_StatePoolCopyOp(),
 +                                        getContext());
    case ::tt::target::ttnn::OpType::FlashMlaPrefillOp: {
      return operations::transformer::run(op->type_as_FlashMlaPrefillOp(),
