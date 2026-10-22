@@ -6,6 +6,8 @@
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 #include "ttmlir/Dialect/TTIR/Utils/Utils.h"
+#include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+#include "ttmlir/Dialect/TTNN/Utils/Utils.h"
 #include "ttmlir/FunctionTypes.h"
 #include "ttmlir/Target/TTNN/program_generated.h"
 #include "ttmlir/Target/Utils/FlatbufferObjectCache.h"
@@ -19,7 +21,6 @@
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -498,6 +499,9 @@ static SmallVector<func::FuncOp> getCaseBranches(ttcore::CaseOp caseOp) {
 
 static bool isCaseSelector(Value value);
 
+bool isCapturableInTrace(Operation *op, llvm::function_ref<bool(Value)> isHostKey,
+                         llvm::function_ref<void(Value)> markKey);
+
 // Whether the branch programs of `caseOp` use their argument `inputIndex` to
 // select a branch of a nested case.
 bool isForwardedCaseSelector(ttcore::CaseOp caseOp, unsigned inputIndex) {
@@ -550,57 +554,172 @@ bool isCaseSelectorArgument(BlockArgument argument) {
          });
 }
 
-static LogicalResult verifyNestedCaseSelectors(ttcore::CaseOp caseOp,
-                                               const llvm::BitVector &keyInputs,
-                                               unsigned depth) {
-  for (func::FuncOp branch : getCaseBranches(caseOp)) {
-    auto isKey = [&](Value value) {
-      auto argument = dyn_cast<BlockArgument>(value);
-      return argument && argument.getOwner() == &branch.front() &&
-             argument.getArgNumber() < keyInputs.size() &&
-             keyInputs.test(argument.getArgNumber());
-    };
-    WalkResult result = branch.walk([&](ttcore::CaseOp nested) {
-      if (!isKey(nested.getIndex())) {
-        nested.emitError(
-            "tracing requires a host-resident scalar CaseOp selector")
-            << "; this case is nested " << depth
-            << (depth == 1 ? " level" : " levels")
-            << " deep in a traced case, and its selector is not forwarded "
-               "unchanged from a host input of the trace";
-        return WalkResult::interrupt();
-      }
-      llvm::BitVector nestedKeyInputs(nested.getInputs().size());
-      for (auto [index, input] : llvm::enumerate(nested.getInputs())) {
-        if (isKey(input)) {
-          nestedKeyInputs.set(index);
-        }
-      }
-      return failed(verifyNestedCaseSelectors(nested, nestedKeyInputs,
-                                              depth + 1))
-                 ? WalkResult::interrupt()
-                 : WalkResult::advance();
-    });
-    if (result.wasInterrupted()) {
-      return failure();
-    }
-  }
-  return success();
+// A trace replays one fixed command sequence, so the runtime must never read
+// a device value to run the control flow a trace captures: every case
+// selector is a host trace key, forwarded unchanged through the programs that
+// enclose it, and every loop is counted with constant bounds. A host key may
+// only be forwarded to control flow; every other op needs its tensors on
+// device, as the trace verifier requires of the trace function itself.
+namespace {
+
+using HostKeyFn = llvm::function_ref<bool(Value)>;
+using MarkKeyFn = llvm::function_ref<void(Value)>;
+
+bool isOnDevice(Type type) {
+  auto tensorType = dyn_cast<RankedTensorType>(type);
+  return !tensorType || utils::isTensorOnDevice(tensorType);
 }
 
-// Checks that every case nested in the branch programs of a traced case selects
-// its branch with a trace key, forwarded through each enclosing case from one
-// of `caseOp`'s forwarded selector inputs. The runtime reads every selector on
-// host, so a selector a branch program computes on device would fail the trace
-// capture at run time.
-LogicalResult verifyNestedCaseSelectors(ttcore::CaseOp caseOp) {
-  llvm::BitVector keyInputs(caseOp.getInputs().size());
-  for (unsigned index : llvm::seq<unsigned>(0, caseOp.getInputs().size())) {
-    if (isForwardedCaseSelector(caseOp, index)) {
-      keyInputs.set(index);
+bool isHostTensor(Value value) { return !isOnDevice(value.getType()); }
+
+// Ops other than control flow the runtime can replay from a trace. A
+// const-eval load inside a program is one: the uncaptured warmup run fills
+// the cache, and the capture then finds every load a hit.
+bool isCapturableOp(Operation *op) {
+  if (isa<AdamWOp, CaptureOrExecuteTraceOp>(op)) {
+    return false;
+  }
+  return llvm::all_of(op->getOperandTypes(), isOnDevice) &&
+         llvm::all_of(op->getResultTypes(), isOnDevice);
+}
+
+bool isCapturableProgram(func::FuncOp program, const llvm::BitVector &hostArgs,
+                         llvm::BitVector &selectorArgs);
+
+// Whether `program`, called with `inputs`, can run inside a trace capture.
+// An input `isHostKey` accepts, bound to an `isInvariant` argument, is a host
+// key inside the program. Sets in `selected` every input the program uses to
+// select a case branch.
+bool isCapturableCallee(func::FuncOp program, ValueRange inputs,
+                        HostKeyFn isHostKey,
+                        llvm::function_ref<bool(unsigned)> isInvariant,
+                        llvm::BitVector &selected) {
+  if (!program || !program.getBody().hasOneBlock() ||
+      program.getNumArguments() != inputs.size()) {
+    return false;
+  }
+  llvm::BitVector hostArgs(inputs.size());
+  for (auto [index, input] : llvm::enumerate(inputs)) {
+    if (isHostKey(input) && isInvariant(index)) {
+      hostArgs.set(index);
     }
   }
-  return verifyNestedCaseSelectors(caseOp, keyInputs, 1);
+  llvm::BitVector selectorArgs(inputs.size());
+  if (!isCapturableProgram(program, hostArgs, selectorArgs)) {
+    return false;
+  }
+  selected |= selectorArgs;
+  return true;
+}
+
+// Marks the inputs a callee selects with as keys. Any other host input would
+// be read on device inside the callee, so it blocks the capture.
+bool forwardKeys(ValueRange inputs, const llvm::BitVector &selected,
+                 MarkKeyFn markKey) {
+  for (auto [index, input] : llvm::enumerate(inputs)) {
+    if (selected.test(index)) {
+      markKey(input);
+    } else if (isHostTensor(input)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool isCapturableCase(ttcore::CaseOp caseOp, HostKeyFn isHostKey,
+                      MarkKeyFn markKey) {
+  if (!isHostKey(caseOp.getIndex())) {
+    return false;
+  }
+  markKey(caseOp.getIndex());
+  SmallVector<func::FuncOp> branches = getCaseBranches(caseOp);
+  if (branches.empty()) {
+    return false;
+  }
+  llvm::BitVector selected(caseOp.getInputs().size());
+  for (func::FuncOp branch : branches) {
+    if (!isCapturableCallee(
+            branch, caseOp.getInputs(), isHostKey,
+            [](unsigned) { return true; }, selected)) {
+      return false;
+    }
+  }
+  return forwardKeys(caseOp.getInputs(), selected, markKey);
+}
+
+bool isCapturableLoop(ttcore::WhileLoopOp loop, HostKeyFn isHostKey,
+                      MarkKeyFn markKey) {
+  // The runtime reads a loop condition, and a bound held by an input, from
+  // device before each iteration.
+  if (loop.getConditionProgramAttr()) {
+    return false;
+  }
+  for (ttcore::LoopBoundAttr bound :
+       {loop.getInitialAttr(), loop.getLimitAttr(), loop.getStepAttr()}) {
+    if (!bound || bound.getInputIndex()) {
+      return false;
+    }
+  }
+  // Only a loop-invariant input holds the same key on every iteration.
+  unsigned stateCount = loop.getStateCount();
+  ArrayRef<int32_t> outputIndices = loop.getOutputIndicesAttr().asArrayRef();
+  auto isInvariant = [&](unsigned index) {
+    return index >= stateCount ||
+           !llvm::is_contained(outputIndices, static_cast<int32_t>(index));
+  };
+  llvm::BitVector selected(loop.getInputs().size());
+  if (!isCapturableCallee(getWhileLoopBody(loop), loop.getInputs(), isHostKey,
+                          isInvariant, selected)) {
+    return false;
+  }
+  return forwardKeys(loop.getInputs(), selected, markKey);
+}
+
+bool isCapturableProgram(func::FuncOp program, const llvm::BitVector &hostArgs,
+                         llvm::BitVector &selectorArgs) {
+  Block &body = program.front();
+  auto isHostKey = [&](Value value) {
+    auto argument = dyn_cast<BlockArgument>(value);
+    return argument && argument.getOwner() == &body &&
+           hostArgs.test(argument.getArgNumber());
+  };
+  auto markKey = [&](Value value) {
+    selectorArgs.set(cast<BlockArgument>(value).getArgNumber());
+  };
+  return llvm::all_of(body, [&](Operation &op) {
+    return isCapturableInTrace(&op, isHostKey, markKey);
+  });
+}
+
+} // namespace
+
+// Whether the runtime can replay `op` from a trace whose host keys `isHostKey`
+// accepts. `markKey` receives every accepted value that selects a case branch,
+// directly or forwarded into the programs of nested control flow; a trace of
+// `op` must take those values as its keys. The marks of a failed check are
+// meaningless.
+bool isCapturableInTrace(Operation *op, HostKeyFn isHostKey,
+                         MarkKeyFn markKey) {
+  if (auto caseOp = dyn_cast<ttcore::CaseOp>(op)) {
+    return isCapturableCase(caseOp, isHostKey, markKey);
+  }
+  if (auto loop = dyn_cast<ttcore::WhileLoopOp>(op)) {
+    return isCapturableLoop(loop, isHostKey, markKey);
+  }
+  if (auto call = dyn_cast<func::CallOp>(op)) {
+    // A called program runs inside the capture like a branch program does,
+    // but the trace verifier admits a host operand only on a case.
+    if (!isCapturableOp(op)) {
+      return false;
+    }
+    auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+        op, call.getCalleeAttr());
+    llvm::BitVector selected(call.getArgOperands().size());
+    return isCapturableCallee(
+        callee, call.getArgOperands(), [](Value) { return false; },
+        [](unsigned) { return true; }, selected);
+  }
+  return isCapturableOp(op);
 }
 
 namespace {
