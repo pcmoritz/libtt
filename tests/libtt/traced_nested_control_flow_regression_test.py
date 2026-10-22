@@ -4,8 +4,12 @@ A trace capture cannot read device values. A counted loop inside a branch has
 to keep its constant bounds, and a predicate forwarded to a nested conditional
 has to select the replayed trace like a top-level predicate does. SGLang-JAX's
 traced sampler needs both: its non-greedy branch masks top-k and top-p with
-fori_loop searches and applies min-p under a nested cond.
+fori_loop searches and applies min-p under a nested cond. A nested predicate
+that a branch computes on device cannot select a trace, so tracing rejects it
+at compile time.
 """
+
+import itertools
 
 import jax
 import jax.numpy as jnp
@@ -88,4 +92,33 @@ def test_doubly_nested_conditional(trace):
             expected = SOURCE + 3
         else:
             expected = SOURCE * 2 if second else SOURCE - 1
+        np.testing.assert_array_equal(np.asarray(result), expected)
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+@pytest.mark.parametrize("trace", [False, True])
+def test_nested_predicate_computed_in_a_branch(trace, depth):
+    # The predicate at `depth` combines two forwarded flags instead of being
+    # forwarded itself. Without trace the runtime reads it back from device. A
+    # trace capture cannot, so tracing rejects the program when it compiles.
+    def run(outer, first, second, x):
+        computed = lambda v: jax.lax.cond(first ^ second, lambda w: w * 2, lambda w: w - 1, v)
+        middle = lambda v: jax.lax.cond(first, lambda w: w + 3, computed, v)
+        return jax.lax.cond(outer, lambda v: v + 1, middle if depth == 2 else computed, x)
+
+    run = _jit(run, trace)
+    x = _put(SOURCE)
+    if trace:
+        message = f"host-resident scalar CaseOp selector; this case is nested {depth} level"
+        with pytest.raises(jax.errors.JaxRuntimeError, match=message):
+            run(_put(False), _put(False), _put(True), x)
+        return
+    for outer, first, second in itertools.product([False, True], repeat=3):
+        result = run(_put(outer), _put(first), _put(second), x)
+        if outer:
+            expected = SOURCE + 1
+        elif depth == 2 and first:
+            expected = SOURCE + 3
+        else:
+            expected = SOURCE * 2 if first != second else SOURCE - 1
         np.testing.assert_array_equal(np.asarray(result), expected)

@@ -1,7 +1,28 @@
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-@@ -6617,9 +6617,11 @@
+@@ -41,6 +41,20 @@
+ namespace mlir::tt::ttnn {
+ using mlir::RankedTensorType;
+ 
++bool isForwardedCaseSelector(ttcore::CaseOp caseOp, unsigned inputIndex);
++
++// Whether `value` selects a branch of `caseOp`: as its index, or as an input
++// forwarded to a case nested in its branch programs.
++static bool selectsCaseBranch(ttcore::CaseOp caseOp, Value value) {
++  if (caseOp.getIndex() == value) {
++    return true;
++  }
++  return llvm::any_of(llvm::enumerate(caseOp.getInputs()), [&](auto input) {
++    return input.value() == value &&
++           isForwardedCaseSelector(caseOp, input.index());
++  });
++}
++
+ //===----------------------------------------------------------------------===//
+ // Utils
+ //===----------------------------------------------------------------------===//
+@@ -6617,9 +6631,11 @@
                auto tensorType =
                    ::mlir::cast<RankedTensorType>(operand.getType());
                if (!utils::isTensorOnDevice(tensorType)) {
@@ -10,7 +31,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
                  auto blockArg = mlir::dyn_cast<BlockArgument>(operand);
                  auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(op);
 -                if (blockArg && caseOp && operand == caseOp.getIndex() &&
-+                if (blockArg && caseOp &&
++                if (blockArg && caseOp && selectsCaseBranch(caseOp, operand) &&
                      blockArg.getOwner() == &traceFuncOp.getBody().front() &&
                      llvm::is_contained(getTraceKeyInputIndices(),
                                         blockArg.getArgNumber())) {
@@ -45,16 +66,17 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -20,6 +20,8 @@
+@@ -20,6 +20,9 @@
  #include <atomic>
  
  namespace mlir::tt::ttnn {
 +bool isForwardedCaseSelector(ttcore::CaseOp caseOp, unsigned inputIndex);
++LogicalResult verifyNestedCaseSelectors(ttcore::CaseOp caseOp);
 +
  #define GEN_PASS_DEF_TTNNTRACEHOISTTRANSFORM
  #include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
  
-@@ -386,16 +388,13 @@
+@@ -386,16 +389,14 @@
          inputs.begin();
  
      // A trace captures one fixed command sequence. Case selectors that come
@@ -62,7 +84,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +    // from host scalar inputs therefore form part of the trace cache key,
 +    // including selectors forwarded to cases nested in branch programs. A
      // device-computed selector cannot be inspected without synchronizing, so
-     // reject that shape instead of silently replaying the wrong branch.
+-    // reject that shape instead of silently replaying the wrong branch.
++    // reject that shape, at any depth, instead of silently replaying the wrong
++    // branch or failing the capture.
      llvm::SmallVector<int32_t> traceKeyInputIndices;
 -    for (Operation *op : opsToHoist) {
 -      auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(op);
@@ -75,7 +99,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
        auto selectorType = mlir::dyn_cast<RankedTensorType>(selector.getType());
        if (!selectorType ||
            selectorType.getNumElements() != 1 ||
-@@ -411,6 +410,22 @@
+@@ -411,6 +412,25 @@
        if (!llvm::is_contained(traceKeyInputIndices, inputIndex)) {
          traceKeyInputIndices.push_back(static_cast<int32_t>(inputIndex));
        }
@@ -94,6 +118,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +            failed(addTraceKey(caseOp, input))) {
 +          return failure();
 +        }
++      }
++      if (failed(verifyNestedCaseSelectors(caseOp))) {
++        return failure();
 +      }
      }
  

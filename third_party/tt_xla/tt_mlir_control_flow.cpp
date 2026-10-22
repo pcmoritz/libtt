@@ -17,7 +17,9 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "stablehlo/dialect/StablehloOps.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -546,6 +548,59 @@ bool isCaseSelectorArgument(BlockArgument argument) {
            return caseOp &&
                   isForwardedCaseSelector(caseOp, argument.getArgNumber());
          });
+}
+
+static LogicalResult verifyNestedCaseSelectors(ttcore::CaseOp caseOp,
+                                               const llvm::BitVector &keyInputs,
+                                               unsigned depth) {
+  for (func::FuncOp branch : getCaseBranches(caseOp)) {
+    auto isKey = [&](Value value) {
+      auto argument = dyn_cast<BlockArgument>(value);
+      return argument && argument.getOwner() == &branch.front() &&
+             argument.getArgNumber() < keyInputs.size() &&
+             keyInputs.test(argument.getArgNumber());
+    };
+    WalkResult result = branch.walk([&](ttcore::CaseOp nested) {
+      if (!isKey(nested.getIndex())) {
+        nested.emitError(
+            "tracing requires a host-resident scalar CaseOp selector")
+            << "; this case is nested " << depth
+            << (depth == 1 ? " level" : " levels")
+            << " deep in a traced case, and its selector is not forwarded "
+               "unchanged from a host input of the trace";
+        return WalkResult::interrupt();
+      }
+      llvm::BitVector nestedKeyInputs(nested.getInputs().size());
+      for (auto [index, input] : llvm::enumerate(nested.getInputs())) {
+        if (isKey(input)) {
+          nestedKeyInputs.set(index);
+        }
+      }
+      return failed(verifyNestedCaseSelectors(nested, nestedKeyInputs,
+                                              depth + 1))
+                 ? WalkResult::interrupt()
+                 : WalkResult::advance();
+    });
+    if (result.wasInterrupted()) {
+      return failure();
+    }
+  }
+  return success();
+}
+
+// Checks that every case nested in the branch programs of a traced case selects
+// its branch with a trace key, forwarded through each enclosing case from one
+// of `caseOp`'s forwarded selector inputs. The runtime reads every selector on
+// host, so a selector a branch program computes on device would fail the trace
+// capture at run time.
+LogicalResult verifyNestedCaseSelectors(ttcore::CaseOp caseOp) {
+  llvm::BitVector keyInputs(caseOp.getInputs().size());
+  for (unsigned index : llvm::seq<unsigned>(0, caseOp.getInputs().size())) {
+    if (isForwardedCaseSelector(caseOp, index)) {
+      keyInputs.set(index);
+    }
+  }
+  return verifyNestedCaseSelectors(caseOp, keyInputs, 1);
 }
 
 namespace {
