@@ -191,6 +191,21 @@ analyzeCountedLoop(stablehlo::WhileOp whileOp,
                          .step = *resolvedStep};
 }
 
+bool isExternalOperand(Region &region, Value operand) {
+  Region *parent = operand.getParentRegion();
+  return !parent || !region.isAncestor(parent);
+}
+
+// Canonicalization hoists constants out of control-flow regions. Outlined
+// programs clone scalar constants back instead of taking them as inputs, so a
+// counted loop nested in an outlined region keeps its constant bounds, and an
+// op that needs a constant operand (a reduce_window's initial value, for
+// example) still sees one.
+bool isClonedConstant(Value value) {
+  auto constant = value.getDefiningOp<stablehlo::ConstantOp>();
+  return constant && constant.getValue().getNumElements() == 1;
+}
+
 // Dialect conversion can leave operands referring to a detached block until
 // its replacements are committed (for example when inlining shard_map).
 // Include every external operand, not only values in ancestor regions.
@@ -199,8 +214,7 @@ void collectCaptures(MutableArrayRef<Region> regions,
   for (Region &region : regions) {
     region.walk([&](Operation *op) {
       for (Value operand : op->getOperands()) {
-        Region *parent = operand.getParentRegion();
-        if (!parent || !region.isAncestor(parent)) {
+        if (isExternalOperand(region, operand) && !isClonedConstant(operand)) {
           captures.insert(operand);
         }
       }
@@ -240,6 +254,15 @@ func::FuncOp outlineRegion(ConversionPatternRewriter &rewriter,
     mapping.map(source, target);
   }
   rewriter.setInsertionPointToEnd(entry);
+  region.walk([&](Operation *op) {
+    for (Value operand : op->getOperands()) {
+      if (isExternalOperand(region, operand) && isClonedConstant(operand) &&
+          !mapping.contains(operand)) {
+        mapping.map(operand,
+                    rewriter.clone(*operand.getDefiningOp())->getResult(0));
+      }
+    }
+  });
   for (Operation &op : region.front()) {
     rewriter.clone(op, mapping);
   }
@@ -260,6 +283,13 @@ class WhileOpConversionPattern
     : public OpConversionPattern<stablehlo::WhileOp> {
 public:
   using OpConversionPattern<stablehlo::WhileOp>::OpConversionPattern;
+
+  // The control flow nested in the outlined programs is converted by the same
+  // pattern as part of this rewrite (a loop in a loop, a case in a case).
+  // Each application outlines one level of a finite nesting, so the recursion
+  // is bounded; without the declaration, dialect conversion leaves the nested
+  // clones unconverted.
+  void initialize() { setHasBoundedRewriteRecursion(); }
 
   LogicalResult
   matchAndRewrite(stablehlo::WhileOp whileOp,
@@ -353,6 +383,13 @@ public:
 class CaseOpConversionPattern : public OpConversionPattern<stablehlo::CaseOp> {
 public:
   using OpConversionPattern<stablehlo::CaseOp>::OpConversionPattern;
+
+  // The control flow nested in the outlined programs is converted by the same
+  // pattern as part of this rewrite (a loop in a loop, a case in a case).
+  // Each application outlines one level of a finite nesting, so the recursion
+  // is bounded; without the declaration, dialect conversion leaves the nested
+  // clones unconverted.
+  void initialize() { setHasBoundedRewriteRecursion(); }
 
   LogicalResult
   matchAndRewrite(stablehlo::CaseOp caseOp,
