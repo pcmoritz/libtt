@@ -225,7 +225,15 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
    }
  
  private:
-@@ -385,32 +405,28 @@
+@@ -355,6 +375,7 @@
+   ::mlir::FailureOr<TraceMainFuncInfo>
+   createTraceFunction(func::FuncOp funcOp,
+                       llvm::ArrayRef<Operation *> opsToHoist,
++                      llvm::ArrayRef<mlir::Value> keys,
+                       uint64_t traceFuncIndex) {
+     mlir::MLIRContext *context = &this->getContext();
+     mlir::OpBuilder builder(context);
+@@ -385,32 +406,19 @@
              [&](mlir::Value input) { return isDeviceResidentValue(input); }) -
          inputs.begin();
  
@@ -233,23 +241,17 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 -    // from host scalar inputs therefore form part of the trace cache key. A
 -    // device-computed selector cannot be inspected without synchronizing, so
 -    // reject that shape instead of silently replaying the wrong branch.
--    llvm::SmallVector<int32_t> traceKeyInputIndices;
 +    // A trace captures one fixed command sequence. The host scalars that
 +    // select case branches, directly or forwarded into the programs of nested
 +    // control flow, form the trace key, so a trace is captured per
-+    // combination of their values. processFuncOp hoists only ops the runtime
-+    // can replay, so every key is a host scalar argument of the function and
-+    // a boundary input of the trace.
-+    llvm::SetVector<mlir::Value> keys;
-     for (Operation *op : opsToHoist) {
++    // combination of their values. Every key is a host scalar argument of the
++    // function that a hoisted op uses, hence a boundary input of the trace.
+     llvm::SmallVector<int32_t> traceKeyInputIndices;
+-    for (Operation *op : opsToHoist) {
 -      auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(op);
 -      if (!caseOp) {
 -        continue;
-+      if (!isCapturableInTrace(
-+              op, [&](mlir::Value value) { return isHostKey(funcOp, value); },
-+              [&](mlir::Value key) { keys.insert(key); })) {
-+        return op->emitError("cannot be captured in a trace");
-       }
+-      }
 -      mlir::Value selector = caseOp.getIndex();
 -      auto selectorType = mlir::dyn_cast<RankedTensorType>(selector.getType());
 -      if (!selectorType ||
@@ -259,8 +261,6 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 -            "tracing requires a host-resident scalar CaseOp selector");
 -      }
 -      auto it = llvm::find(inputs, selector);
-+    }
-+    llvm::SmallVector<int32_t> traceKeyInputIndices;
 +    for (mlir::Value key : keys) {
 +      auto it = llvm::find(inputs, key);
        size_t inputIndex = std::distance(inputs.begin(), it);
@@ -275,7 +275,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
      }
  
      for (mlir::Value output : outputs) {
-@@ -974,31 +990,45 @@
+@@ -974,31 +982,45 @@
        }
        tensorInputs[argIndex] = input;
      }
@@ -327,7 +327,23 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
          semaphoreInputs);
  
      // Replace uses of original outputs with the output of the trace op function
-@@ -1098,94 +1128,166 @@
+@@ -1021,12 +1043,13 @@
+ 
+   mlir::LogicalResult
+   performHoistTransform(func::FuncOp funcOp,
+-                        llvm::ArrayRef<Operation *> opsToHoist) {
++                        llvm::ArrayRef<Operation *> opsToHoist,
++                        llvm::ArrayRef<mlir::Value> keys) {
+     uint64_t traceFuncIndex = getUniqueTraceFuncIndex();
+     // Create the trace function. Everything the downstream builders need to
+     // know about it is computed here, once.
+     mlir::FailureOr<TraceMainFuncInfo> info =
+-        createTraceFunction(funcOp, opsToHoist, traceFuncIndex);
++        createTraceFunction(funcOp, opsToHoist, keys, traceFuncIndex);
+     if (failed(info)) {
+       return mlir::failure();
+     }
+@@ -1098,94 +1121,181 @@
      }
    }
  
@@ -348,12 +364,18 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +  // flow can when it selects with host keys all the way down and every loop
 +  // in it is counted with constant bounds; anything else it runs eagerly,
 +  // reading what it needs from device, and the traces move into its programs.
-+  bool isCapturable(func::FuncOp funcOp, Operation *op) {
-+    return shouldHoistOp(op) &&
-+           isCapturableInTrace(
-+               op,
-+               [&](mlir::Value value) { return isHostKey(funcOp, value); },
-+               [](mlir::Value) {});
++  // The host keys `op` selects with are added to `keys` when it can.
++  bool isCapturable(func::FuncOp funcOp, Operation *op,
++                    llvm::SetVector<mlir::Value> &keys) {
++    llvm::SetVector<mlir::Value> opKeys;
++    if (!shouldHoistOp(op) ||
++        !isCapturableInTrace(
++            op, [&](mlir::Value value) { return isHostKey(funcOp, value); },
++            [&](mlir::Value key) { opKeys.insert(key); })) {
++      return false;
++    }
++    keys.insert(opKeys.begin(), opKeys.end());
++    return true;
 +  }
 +
 +  // Ops that depend on nothing a trace computes: the device handle,
@@ -464,11 +486,19 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 -    for (mlir::Operation &op : block.getOperations()) {
 -      if (!::mlir::isa<func::ReturnOp>(op)) {
 -        allOps.push_back(&op);
++    // A maximal run of capturable ops and the host keys its traces select
++    // with.
++    struct Run {
++      llvm::SmallVector<Operation *> ops;
++      llvm::SetVector<mlir::Value> keys;
++    };
++
 +    Operation *firstHoistable = nullptr;
 +    llvm::SmallVector<Operation *> independentOps;
 +    for (mlir::Operation &op : block.without_terminator()) {
 +      if (!firstHoistable) {
-+        if (isCapturable(funcOp, &op)) {
++        llvm::SetVector<mlir::Value> keys;
++        if (isCapturable(funcOp, &op, keys)) {
 +          firstHoistable = &op;
 +        }
 +      } else if (isIndependentOp(&op)) {
@@ -520,11 +550,11 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 -          return allOps[i]->emitError(
 -              "Non-hoistable op found in the middle of hoistable ops");
 -        }
-+    llvm::SmallVector<llvm::SmallVector<Operation *>> runs;
-+    llvm::SmallVector<Operation *> run;
++    llvm::SmallVector<Run> runs;
++    Run run;
 +    for (mlir::Operation &op : block.without_terminator()) {
-+      if (isCapturable(funcOp, &op)) {
-+        run.push_back(&op);
++      if (isCapturable(funcOp, &op, run.keys)) {
++        run.ops.push_back(&op);
 +        continue;
        }
 -
@@ -532,24 +562,25 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 -      // trace op (inserted at the first hoistable op) dominates its operands.
 -      for (Operation *creationOp : creationOpsToSink) {
 -        creationOp->moveBefore(allOps[firstHoistable]);
-+      if (!run.empty()) {
++      if (!run.ops.empty()) {
 +        runs.push_back(std::move(run));
-+        run.clear();
++        run = Run();
        }
 +      collectEagerCallees(&op, callees);
      }
 -
 -    if (opsToHoist.empty()) {
 -      return mlir::success();
-+    if (!run.empty()) {
++    if (!run.ops.empty()) {
 +      runs.push_back(std::move(run));
      }
  
 -    // Perform the hoist transform
 -    if (failed(performHoistTransform(funcOp, opsToHoist))) {
 -      return mlir::failure();
-+    for (llvm::ArrayRef<Operation *> opsToHoist : runs) {
-+      if (failed(performHoistTransform(funcOp, opsToHoist))) {
++    for (const Run &hoisted : runs) {
++      if (failed(performHoistTransform(funcOp, hoisted.ops,
++                                       hoisted.keys.getArrayRef()))) {
 +        return mlir::failure();
 +      }
      }
