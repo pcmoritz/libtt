@@ -1,20 +1,20 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -5787,6 +5787,25 @@ def TTIR_RandOp : TTIR_CreationOp<"rand", [TTCore_NonCacheableTrait]> {
+@@ -5791,6 +5791,25 @@
    let hasVerifier = 1;
  }
  
 +def TTIR_RngBitGeneratorOp : TTIR_NamedOp<"rng_bit_generator"> {
 +  let summary = "Counter-based random bits from a state.";
 +  let description = [{
-+    stablehlo.rng_bit_generator with uint64 state represented as uint32[n, 2]
-+    low/high pairs, for 2 <= n <= 16. For low words w0, w1, w2 and high words
-+    h0, h1, h2, element i of `output` is the first word of Threefry-2x32-20
-+    with counter (i, w1) and key Threefry((w0, h0), (h1, 0x1BD11BDA)), or
-+    with `philox`, Philox-4x32-10 key (w0, h0 ^ h2), counter (i, w1, w2, h1).
-+    Missing w2/h2 are zero. `output_state` increments the second uint64
-+    element by one modulo 2^64. `output` contains uint32 words.
++    stablehlo.rng_bit_generator with a state of two uint64 values represented
++    as uint32[2, 2] low/high pairs. For low words w0, w1 and high words h0, h1,
++    element i of `output` is the first word of Threefry-2x32-20 with counter
++    (i, w1) and key Threefry((w0, h0), (h1, 0x1BD11BDA)), or with `philox`,
++    Philox-4x32-10 with key (w0, h0) and counter (i, w1, 0, h1).
++    `output_state` increments the second uint64 element by one modulo 2^64.
++    `output` contains uint32 words.
 +  }];
 +
 +  let arguments = (ins AnyRankedTensor:$initial_state,
@@ -331,7 +331,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
  
      // Build via OperationState so no implicit block is auto-created;
      // we then inline the original region and convert its block arg types.
-@@ -1342,4 +1345,259 @@
+@@ -1342,4 +1345,273 @@
    }
  };
  } // namespace
@@ -403,14 +403,26 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +  LogicalResult
 +  matchAndRewrite(mlir::stablehlo::DynamicUpdateSliceOp op, OpAdaptor adaptor,
 +                  ConversionPatternRewriter &rewriter) const override {
-+    SmallVector<Value> indices(adaptor.getStartIndices());
-+    auto indexType = indices.empty()
-+                         ? RankedTensorType::get({}, rewriter.getI64Type())
-+                         : cast<RankedTensorType>(indices.front().getType());
-+    indices.push_back(rewriter.create<mlir::stablehlo::ConstantOp>(
-+        op.getLoc(),
-+        DenseElementsAttr::get(indexType, rewriter.getIntegerAttr(
-+                                              indexType.getElementType(), 0))));
++    // A uint64 start index keeps its low word, as uint64 values do outside
++    // the converted operations. Only uint64 data gains the pair dimension and
++    // its zero start index.
++    SmallVector<Value> indices;
++    for (auto [index, converted] :
++         llvm::zip_equal(op.getStartIndices(), adaptor.getStartIndices())) {
++      indices.push_back(isUInt64(index.getType())
++                            ? unpackRealImag(op.getLoc(), converted, rewriter)
++                                  .first
++                            : converted);
++    }
++    if (isUInt64(op.getOperand().getType())) {
++      auto indexType = indices.empty()
++                           ? RankedTensorType::get({}, rewriter.getI64Type())
++                           : cast<RankedTensorType>(indices.front().getType());
++      indices.push_back(rewriter.create<mlir::stablehlo::ConstantOp>(
++          op.getLoc(), DenseElementsAttr::get(
++                           indexType, rewriter.getIntegerAttr(
++                                          indexType.getElementType(), 0))));
++    }
 +    rewriter.replaceOpWithNewOp<mlir::stablehlo::DynamicUpdateSliceOp>(
 +        op, adaptor.getOperand(), adaptor.getUpdate(), indices);
 +    return success();
@@ -445,9 +457,11 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +    if (!stateType.hasStaticShape() || !outType.hasStaticShape()) {
 +      return op.emitOpError("with a dynamic shape isn't supported");
 +    }
++    // Two words fill the key and the counter beside the element index. A
++    // third word could only change the bits by aliasing another state.
 +    if (!isUInt64(stateType) || stateType.getRank() != 1 ||
-+        stateType.getNumElements() < 2 || stateType.getNumElements() > 16) {
-+      return op.emitOpError("needs a state of 2 to 16 unsigned 64-bit integers");
++        stateType.getDimSize(0) != 2) {
++      return op.emitOpError("needs a state of two unsigned 64-bit integers");
 +    }
 +    if (!elementType || !elementType.isUnsigned() ||
 +        elementType.getWidth() > 64) {

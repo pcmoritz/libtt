@@ -100,13 +100,11 @@ def philox4x32(key, counters):
 
 def expected(algorithm, state, elements):
     """The 32-bit words that libtt draws from a state, in row-major order."""
-    seed, offset, *rest = map(int, state)
+    seed, offset = map(int, state)
     i, n = np.arange(elements), elements
     if algorithm == "PHILOX":
-        extra = rest[0] if rest else 0
         return philox4x32(
-            (seed & M32, (seed >> 32) ^ (extra >> 32)),
-            [i, np.full(n, offset & M32), np.full(n, extra & M32), np.full(n, offset >> 32)],
+            (seed & M32, seed >> 32), [i, np.full(n, offset & M32), np.zeros(n), np.full(n, offset >> 32)]
         )[0]
     key = threefry2x32((seed & M32, seed >> 32), [offset >> 32, 0x1BD11BDA])
     return threefry2x32(key, [i, np.full(n, offset & M32)])[0]
@@ -170,11 +168,13 @@ def test_large_output(algorithm):
     np.testing.assert_array_equal(new, advanced(old, 4096 * 4096))
 
 
-def test_philox_three_word_state():
-    old = state(0x12345678DEADBEEF, 2**32 + 3, 2**33 + 5)
-    new, values = raw_bits(old, (9,), np.uint32, "PHILOX")
-    np.testing.assert_array_equal(values, expected("PHILOX", old, 9))
-    np.testing.assert_array_equal(new, advanced(old, 9))
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+def test_three_word_states_are_errors(algorithm):
+    # A third word has no room in the key or counter: Philox XORed its high
+    # word into the key, so [42, 0, 2**32] drew the stream of [42 + 2**32, 0, 0],
+    # and Threefry ignored it.
+    with pytest.raises(jax.errors.JaxRuntimeError, match="needs a state of two unsigned 64-bit integers"):
+        raw_bits(state(42, 0, 2**32), (4,), np.uint32, algorithm)
 
 
 @pytest.mark.parametrize("algorithm", ALGORITHMS)
@@ -314,8 +314,8 @@ def test_empty_output_keeps_the_state():
     [
         (state(1, 2), np.float32, "generates unsigned integers of up to 64 bits, not 'f32'"),
         (state(1, 2), np.int32, "generates unsigned integers of up to 64 bits, not 'i32'"),
-        (state(1), np.uint32, "needs a state of 2 to 16 unsigned 64-bit integers"),
-        (np.array([1, 2], np.uint32), np.uint32, "needs a state of 2 to 16 unsigned 64-bit integers"),
+        (state(1), np.uint32, "needs a state of two unsigned 64-bit integers"),
+        (np.array([1, 2], np.uint32), np.uint32, "needs a state of two unsigned 64-bit integers"),
     ],
 )
 def test_unsupported_types_are_errors(old, dtype, message):
@@ -344,6 +344,20 @@ def test_uint64_state_buffers_and_addition():
         want = a.copy()
         want[0] = M64
         np.testing.assert_array_equal(np.asarray(updated), want)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.uint64])
+def test_dynamic_update_slice_with_uint64_indices(dtype):
+    # uint64 indices become low/high pairs too. Only uint64 data gains the
+    # pair dimension and its zero start index: float32 data got three indices
+    # for its two dimensions, which aborted the compiler.
+    x = (np.arange(32, dtype=np.uint64) * (2**32 + 3)).astype(dtype).reshape(4, 8)
+    update = np.full((2, 3), 7, dtype)
+    want = x.copy()
+    want[1:3, 2:5] = update
+    with jax.enable_x64(True):
+        update_slice = jax.jit(lambda x, u, i, j: jax.lax.dynamic_update_slice(x, u, (i, j)))
+        np.testing.assert_array_equal(np.asarray(update_slice(x, update, np.uint64(1), np.uint64(2))), want)
 
 
 def test_uint64_strided_buffers_and_bitcasts():

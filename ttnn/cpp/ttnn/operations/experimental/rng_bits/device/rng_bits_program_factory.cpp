@@ -104,9 +104,7 @@ ttnn::device_operation::ProgramArtifacts RngBitsProgramFactory::create_program_a
                     .dfb_spec_name = STATE_DFB, .accessor_name = "state", .endpoint_type = DFBEndpointType::CONSUMER},
                 DFBBinding{.dfb_spec_name = OUT_DFB, .accessor_name = "out", .endpoint_type = DFBEndpointType::PRODUCER},
             },
-        .compile_time_args =
-            {{"philox", static_cast<uint32_t>(philox)},
-             {"state_words", state.logical_shape()[-2]}},
+        .compile_time_args = {{"philox", static_cast<uint32_t>(philox)}},
         .runtime_arg_schema =
             {.runtime_arg_names = {"first_tile", "num_tiles"}, .common_runtime_arg_names = common_arg_names},
         .hw_config = ttnn::to_compute_hardware_config(device.arch(), compute_kernel_config),

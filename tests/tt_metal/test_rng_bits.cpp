@@ -66,9 +66,8 @@ std::vector<uint32_t> expected(
         const uint32_t word =
             algorithm == RngAlgorithm::Philox
                 ? philox(static_cast<uint32_t>(state[0]),
-                         static_cast<uint32_t>((state[0] >> 32) ^ (state.size() > 2 ? state[2] >> 32 : 0)),
-                         {static_cast<uint32_t>(i), static_cast<uint32_t>(state[1]),
-                          state.size() > 2 ? static_cast<uint32_t>(state[2]) : 0u,
+                         static_cast<uint32_t>(state[0] >> 32),
+                         {static_cast<uint32_t>(i), static_cast<uint32_t>(state[1]), 0u,
                           static_cast<uint32_t>(state[1] >> 32)})
                 : threefry(key[0], key[1], static_cast<uint32_t>(i), static_cast<uint32_t>(state[1]))[0];
         words[i] = word;
@@ -103,7 +102,6 @@ std::string case_name(const ::testing::TestParamInfo<Case>& info) {
     for (uint32_t d : info.param.shape) {
         name += "_" + std::to_string(d);
     }
-    name += "_s" + std::to_string(info.param.state.size());
     return name;
 }
 
@@ -175,7 +173,7 @@ INSTANTIATE_TEST_SUITE_P(
         Case{{64, 128}, RngAlgorithm::Threefry},
         Case{{64, 128}, RngAlgorithm::Philox},
         Case{{9}, RngAlgorithm::Threefry, {0x12345678DEADBEEFull, 0xABCDEF0000000003ull}},
-        Case{{9}, RngAlgorithm::Philox, {0x12345678DEADBEEFull, 0xABCDEF0000000003ull, 0x100000005ull}},
+        Case{{9}, RngAlgorithm::Philox, {0x12345678DEADBEEFull, 0xABCDEF0000000003ull}},
         Case{{64}, RngAlgorithm::Threefry, {0xFFFFFFFFu, 0xFFFFFFFFu}},
         Case{{64}, RngAlgorithm::Philox, {0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull}},
         Case{{1000, 999}, RngAlgorithm::Threefry},

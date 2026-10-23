@@ -174,7 +174,6 @@ inline void philox_half_round(uint32_t word, uint32_t other, uint32_t key, uint3
 
 void kernel_main() {
     constexpr bool philox = get_arg(args::philox) != 0;
-    constexpr uint32_t state_words = get_arg(args::state_words);
     const uint32_t W = get_arg(args::W);
     const uint32_t H = get_arg(args::H);
     const uint32_t Wt = get_arg(args::Wt);
@@ -191,16 +190,14 @@ void kernel_main() {
     // these reads after its temporary update and the new-state write barrier.
     state_dfb.wait_front(1);
     const uint32_t state_address = state_dfb.get_tile_address(0);
-    uint32_t w0 = 0, w1 = 0, w2 = 0, key_high = 0, counter_high = 0, extra_high = 0;
+    uint32_t w0 = 0, w1 = 0, key_high = 0, counter_high = 0;
     uint32_t ks0 = 0, ks1 = 0;
     MATH({
         const volatile uint32_t* words = reinterpret_cast<const volatile uint32_t*>(state_address);
         w0 = words[0];
         w1 = words[16];
-        w2 = philox && state_words > 2 ? words[32] : 0;
         key_high = words[1];
         counter_high = words[17];
-        extra_high = philox && state_words > 2 ? words[33] : 0;
         if constexpr (!philox) {
             // Hash the counter high word under the seed once per core. XORing
             // it into the seed would alias neighboring seeds after 2^32 units.
@@ -230,10 +227,10 @@ void kernel_main() {
             MATH((rng::index_tile(x[0], base, W)));
             fill_tile_init();
             fill_tile_int<DataFormat::UInt32>(x[1], w1);
-            fill_tile_int<DataFormat::UInt32>(x[2], w2);
+            fill_tile_int<DataFormat::UInt32>(x[2], 0);
             fill_tile_int<DataFormat::UInt32>(x[3], counter_high);
             uint32_t k0 = w0;
-            uint32_t k1 = key_high ^ extra_high;
+            uint32_t k1 = key_high;
             for (uint32_t round = 0; round < 9; ++round) {
                 // (x0, x1, x2, x3) = (hi(x2 * M1) ^ x1 ^ k0, lo(x2 * M1), hi(x0 * M0) ^ x3 ^ k1, lo(x0 * M0))
                 MATH((rng::philox_half_round<0xD2511F53>(x[0], x[3], k1, rows_valid)));

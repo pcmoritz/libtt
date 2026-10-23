@@ -36,9 +36,8 @@ void RngBitsOperation::validate_on_program_cache_miss(const operation_attributes
     const auto& shape = state.logical_shape();
     TT_FATAL(state.layout() == Layout::TILE, "rng_bits: the state must be tiled");
     TT_FATAL(
-        shape.rank() >= 2 && shape[-1] == 2 && shape[-2] >= 2 && shape[-2] <= 16 &&
-            shape.volume() == 2 * shape[-2],
-        "rng_bits: expected [2..16, 2] low/high pairs, got {}",
+        shape.rank() >= 2 && shape[-1] == 2 && shape[-2] == 2 && shape.volume() == 4,
+        "rng_bits: expected [2, 2] low/high pairs, got {}",
         shape);
     TT_FATAL(
         state.buffer()->num_pages() == 1, "rng_bits: the state must be one page, got {}", state.buffer()->num_pages());
