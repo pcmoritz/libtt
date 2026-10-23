@@ -87,15 +87,14 @@ ttnn::device_operation::ProgramArtifacts RngBitsProgramFactory::create_program_a
         .hw_config = ttnn::create_reader_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
 
-    // 32-bit DST for the integer words. Philox keeps eight tiles in DST, all of
-    // it with full sync.
+    // 32-bit DST for the integer words. Four tiles fit in each half of DST.
     const bool philox = params.algorithm == RngAlgorithm::Philox;
     const DeviceComputeKernelConfig compute_kernel_config = ttnn::ComputeKernelConfig{
         .math_fidelity = MathFidelity::HiFi4,
         .math_approx_mode = false,
         .fp32_dest_acc_en = true,
         .packer_l1_acc = false,
-        .dst_full_sync_en = philox,
+        .dst_full_sync_en = false,
     };
     KernelSpec compute{
         .unique_id = COMPUTE,

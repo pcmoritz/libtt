@@ -6,18 +6,15 @@
 // (row-major) is the first word of Threefry-2x32-20 of counter (i, w1), or of
 // Philox-4x32-10 of counter (i, w1, w2, 0).
 //
-// Threefry runs one 32-lane vector at a time, all in registers. Philox works on
-// whole tiles in DST with the existing 32-bit multiply kernels (mul_int32 for
-// the low and mulhi_uint32 for the high half of the product), so it holds its
-// four words, both multipliers and both high halves in eight DST tiles.
+// Threefry runs one 32-lane vector at a time, all in registers. Philox keeps
+// its four counter words in DST and fuses each multiply and XOR into one
+// vector pass, sharing the partial products for the low and high halves.
 
 #include <cstdint>
 
-#include "api/compute/binary_bitwise_sfpu.h"
 #include "api/compute/compute_kernel_hw_startup.h"
 #include "api/compute/eltwise_unary/bitwise.h"
 #include "api/compute/eltwise_unary/fill.h"
-#include "api/compute/mul_int_sfpu.h"
 #include "api/compute/pack.h"
 #include "api/compute/reg_api.h"
 #include "api/dataflow/dataflow_buffer.h"
@@ -126,6 +123,51 @@ inline void index_tile(uint32_t dst, uint32_t base, uint32_t W) {
     _llk_math_eltwise_sfpu_done_();
 }
 
+// Multiply a 32-bit word by a constant, sharing the 23-bit partial products
+// used by the existing mul_int32 and mulhi_uint32 kernels. SFPMUL24 returns
+// 23-bit halves; middle is the sum of the three terms at bit 23, so its low
+// nine bits contribute to lo and the rest to hi.
+template <uint32_t multiplier>
+sfpi_inline void mulhilo(sfpi::vUInt x, sfpi::vUInt& hi, sfpi::vUInt& lo) {
+    const sfpi::vUInt y = sfpi::vUInt(multiplier);
+    const sfpi::vUInt xh = x >> 23;
+    const sfpi::vUInt yh = sfpi::vUInt(multiplier >> 23);
+    sfpi::vUInt middle = sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(x, y, sfpi::FractionalHalf::High));
+    middle += sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(xh, y));
+    middle += sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(x, yh));
+    hi = sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(xh, yh));
+    hi += sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(xh, y, sfpi::FractionalHalf::High));
+    hi += sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(x, yh, sfpi::FractionalHalf::High));
+    hi = (hi << 14) + (middle >> 9);
+    lo = sfpi::as<sfpi::vUInt>(sfpi::fractional_mul(x, y)) + (middle << 23);
+}
+
+// One half of a Philox round: multiply one counter word and mix its high
+// half with another word and the key. Keep the four counter words in DST so
+// the multiply's temporaries fit in the eight SFPU registers.
+template <uint32_t multiplier, bool last_round = false>
+inline void philox_half_round(uint32_t word, uint32_t other, uint32_t key, uint32_t rows_valid) {
+    _llk_math_eltwise_sfpu_start_(0);
+    for (uint32_t face = 0; face < 4; ++face) {
+#pragma GCC unroll 8
+        for (uint32_t d = 0; d < 8; ++d) {
+            if (16 * (face >> 1) + 4 * (d >> 1) < rows_valid) {
+                sfpi::vUInt hi, lo;
+                mulhilo<multiplier>(sfpi::vUInt(sfpi::dst_reg[32 * word]), hi, lo);
+                if constexpr (!last_round) {
+                    sfpi::dst_reg[32 * word].mode<sfpi::DataLayout::I32>() = sfpi::vInt(lo);
+                }
+                hi ^= sfpi::vUInt(sfpi::dst_reg[32 * other]);
+                hi ^= sfpi::vUInt(key);
+                sfpi::dst_reg[32 * other].mode<sfpi::DataLayout::I32>() = sfpi::vInt(hi);
+            }
+            sfpi::dst_reg++;
+        }
+        _llk_math_eltwise_sfpu_inc_dst_face_addr_();
+    }
+    _llk_math_eltwise_sfpu_done_();
+}
+
 }  // namespace rng
 #endif
 
@@ -162,19 +204,14 @@ void kernel_main() {
         const uint32_t b = tile / (Wt * Ht);
         const uint32_t base = (b * H + tr * 32) * W + tc * 32;
         uint32_t out_dst = 0;
+        const uint32_t rows_valid = H - tr * 32 < 32 ? H - tr * 32 : 32;
 
         tile_regs_acquire();
         if constexpr (!philox) {
-            const uint32_t rows_valid = H - tr * 32 < 32 ? H - tr * 32 : 32;
             MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>()));
             MATH((rng::threefry_tile<width>(0, base, W, rows_valid, w0, w0 ^ 0x1BD11BDA, w1)));
         } else {
-            // DST tiles: the counter words x[0..3] (renamed each round), the
-            // multipliers, and the two products' high halves.
-            constexpr uint32_t kMultiplier0 = 4;
-            constexpr uint32_t kMultiplier1 = 5;
-            constexpr uint32_t kHigh0 = 6;
-            constexpr uint32_t kHigh1 = 7;
+            // The four counter words, renamed after each round.
             uint32_t x[4] = {0, 1, 2, 3};
             MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>()));
             MATH((rng::index_tile(x[0], base, W)));
@@ -182,24 +219,12 @@ void kernel_main() {
             fill_tile_int<DataFormat::UInt32>(x[1], w1);
             fill_tile_int<DataFormat::UInt32>(x[2], w2);
             fill_tile_int<DataFormat::UInt32>(x[3], 0);
-            fill_tile_int<DataFormat::UInt32>(kMultiplier0, 0xD2511F53);
-            fill_tile_int<DataFormat::UInt32>(kMultiplier1, 0xCD9E8D57);
             uint32_t k0 = w0;
             uint32_t k1 = 0;
-            for (uint32_t round = 0; round < 10; ++round) {
+            for (uint32_t round = 0; round < 9; ++round) {
                 // (x0, x1, x2, x3) = (hi(x2 * M1) ^ x1 ^ k0, lo(x2 * M1), hi(x0 * M0) ^ x3 ^ k1, lo(x0 * M0))
-                mulhi_uint32_tile_init();
-                mulhi_uint32_tile(x[0], kMultiplier0, kHigh0);
-                mulhi_uint32_tile(x[2], kMultiplier1, kHigh1);
-                mul_int_tile_init<DataFormat::UInt32>();
-                mul_int_tile<DataFormat::UInt32>(x[0], kMultiplier0, x[0]);
-                mul_int_tile<DataFormat::UInt32>(x[2], kMultiplier1, x[2]);
-                binary_bitwise_tile_init();
-                bitwise_xor_binary_tile<DataFormat::UInt32>(kHigh1, x[1], x[1]);
-                bitwise_xor_binary_tile<DataFormat::UInt32>(kHigh0, x[3], x[3]);
-                bitwise_xor_tile_init();
-                bitwise_xor_tile<DataFormat::UInt32>(x[1], k0);
-                bitwise_xor_tile<DataFormat::UInt32>(x[3], k1);
+                MATH((rng::philox_half_round<0xD2511F53>(x[0], x[3], k1, rows_valid)));
+                MATH((rng::philox_half_round<0xCD9E8D57>(x[2], x[1], k0, rows_valid)));
                 k0 += 0x9E3779B9;
                 k1 += 0xBB67AE85;
                 const uint32_t low0 = x[0];
@@ -208,6 +233,9 @@ void kernel_main() {
                 x[2] = x[3];
                 x[3] = low0;
             }
+            // Only the first word of the final Philox round is returned.
+            MATH((rng::philox_half_round<0xCD9E8D57, true>(x[2], x[1], k0, rows_valid)));
+            x[0] = x[1];
             if constexpr (width < 32) {
                 bitwise_and_tile_init();
                 bitwise_and_tile<DataFormat::UInt32>(x[0], (1u << width) - 1);
