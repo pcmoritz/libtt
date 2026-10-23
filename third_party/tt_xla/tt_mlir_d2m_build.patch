@@ -108,7 +108,44 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
  #include "mlir/IR/BuiltinTypes.h"
  #include "mlir/IR/MLIRContext.h"
  #include "mlir/IR/Operation.h"
-@@ -1198,6 +1199,9 @@
+@@ -962,7 +963,16 @@
+   std::pair<d2m::TileSubOp,        std::pair<ttkernel::SubIntTileInitOp,          ttkernel::SubIntTileOp>>,
+   std::pair<d2m::TileMulOp,        std::pair<ttkernel::MulIntTileInitOp,          ttkernel::MulIntTileOp>>,
+   std::pair<d2m::TileMaximumOp,    std::pair<ttkernel::BinaryMaxInt32TileInitOp,  ttkernel::BinaryMaxInt32TileOp>>,
+-  std::pair<d2m::TileMinimumOp,    std::pair<ttkernel::BinaryMinInt32TileInitOp,  ttkernel::BinaryMinInt32TileOp>>
++  std::pair<d2m::TileMinimumOp,    std::pair<ttkernel::BinaryMinInt32TileInitOp,  ttkernel::BinaryMinInt32TileOp>>,
++
++  // Binary SFPU comparisons (the float variants would compare int32 bit
++  // patterns as floats).
++  std::pair<d2m::TileEqOp,         std::pair<ttkernel::EqIntTileInitOp,            ttkernel::EqIntTileOp>>,
++  std::pair<d2m::TileNeOp,         std::pair<ttkernel::NeIntTileInitOp,            ttkernel::NeIntTileOp>>,
++  std::pair<d2m::TileGtOp,         std::pair<ttkernel::GtIntTileInitOp,            ttkernel::GtIntTileOp>>,
++  std::pair<d2m::TileLtOp,         std::pair<ttkernel::LtIntTileInitOp,            ttkernel::LtIntTileOp>>,
++  std::pair<d2m::TileGeOp,         std::pair<ttkernel::GeIntTileInitOp,            ttkernel::GeIntTileOp>>,
++  std::pair<d2m::TileLeOp,         std::pair<ttkernel::LeIntTileInitOp,            ttkernel::LeIntTileOp>>
+ >;
+ // clang-format on
+ 
+@@ -993,6 +1003,18 @@
+ constexpr bool needsDtypeArg = std::is_same_v<Op, ttkernel::MulIntTileInitOp> ||
+                                std::is_same_v<Op, ttkernel::AddIntTileOp> ||
+                                std::is_same_v<Op, ttkernel::SubIntTileOp> ||
++                               std::is_same_v<Op, ttkernel::EqIntTileInitOp> ||
++                               std::is_same_v<Op, ttkernel::EqIntTileOp> ||
++                               std::is_same_v<Op, ttkernel::NeIntTileInitOp> ||
++                               std::is_same_v<Op, ttkernel::NeIntTileOp> ||
++                               std::is_same_v<Op, ttkernel::GtIntTileInitOp> ||
++                               std::is_same_v<Op, ttkernel::GtIntTileOp> ||
++                               std::is_same_v<Op, ttkernel::LtIntTileInitOp> ||
++                               std::is_same_v<Op, ttkernel::LtIntTileOp> ||
++                               std::is_same_v<Op, ttkernel::GeIntTileInitOp> ||
++                               std::is_same_v<Op, ttkernel::GeIntTileOp> ||
++                               std::is_same_v<Op, ttkernel::LeIntTileInitOp> ||
++                               std::is_same_v<Op, ttkernel::LeIntTileOp> ||
+                                std::is_same_v<Op, ttkernel::MulIntTileOp>;
+ 
+ namespace {
+@@ -1198,6 +1220,9 @@
        auto cb = getCB(rewriter, op.getInput());
        auto dstIdx = getDstIdxFromResult(op.getResult());
        ensureDominatesInsertionPoint(rewriter, dstIdx);
@@ -118,7 +155,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
        rewriter.create<ttkernel::UnaryBcastInitOp>(op->getLoc(), cb, cb,
                                                    bcastType);
        rewriter.create<ttkernel::UnaryBcastTileOp>(
-@@ -1629,6 +1633,17 @@
+@@ -1629,6 +1654,17 @@
        return emitFPUTiles(rewriter, op, adaptor, loc);
      }
  
@@ -136,13 +173,10 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      if (lhsFromDst) {
        // LHS from Dst, RHS from Cb (FPU - DEST_TO_SRCA)
        return emitFPUBinaryDestReuse(rewriter, op, adaptor, loc,
-@@ -1731,6 +1746,61 @@
-       rewriter.create<IntSFPUOp>(loc, dst0, dst1, dst0, dtype);
-     } else {
-       rewriter.create<IntSFPUOp>(loc, dst0, dst1, dst0);
-+    }
-+
-+    rewriter.eraseOp(op);
+@@ -1734,6 +1770,61 @@
+     }
+ 
+     rewriter.eraseOp(op);
 +    return success();
 +  }
 +
@@ -195,6 +229,496 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
 +      rewriter.create<IntSFPUOp>(loc, lhsIdx, rhsIdx, dstIdx, dtype);
 +    } else {
 +      rewriter.create<IntSFPUOp>(loc, lhsIdx, rhsIdx, dstIdx);
-     }
++    }
++
++    rewriter.eraseOp(op);
+     return success();
+   }
  
-     rewriter.eraseOp(op);
+diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp
+--- a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp
++++ b/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp
+@@ -11,6 +11,7 @@
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+ #include "ttmlir/Dialect/TTCore/IR/Utils.h"
+ #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
++#include "ttmlir/Dialect/TTKernel/IR/TTKernelOps.h"
+ #include "ttmlir/Dialect/TTKernel/IR/TTKernelOpsTypes.h"
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
+@@ -302,7 +303,56 @@
+     const llvm::DenseMap<size_t, size_t> &semIndexMap,
+     const DenseMap<uint32_t, uint32_t> &additionalArgMapping,
+     const DenseMap<size_t, size_t> &cbOperandIndexToPortMapping,
+-    const ttcore::Arch arch) {
++    const ttcore::Arch arch, ArrayRef<ttnn::KernelCBAttr> cbDescriptors) {
++  // 32-bit circular buffers need a 32-bit DST (the DST allocation already
++  // assumes it, see getDstLogicalSizeTiles) and must be unpacked straight to
++  // DST: through SrcA/SrcB they keep about 19 bits. FPU ops that read a CB
++  // through SrcA/SrcB cannot take an unpack-to-DST Float32 CB, so those keep
++  // the default.
++  auto is32Bit = [](ttcore::DataType dtype) {
++    return dtype == ttcore::DataType::Float32 ||
++           dtype == ttcore::DataType::Int32 ||
++           dtype == ttcore::DataType::UInt32;
++  };
++  bool hasSrcRegisterFPUOps = false;
++  for (Attribute thread : threads) {
++    auto threadAttr = mlir::cast<d2m::ThreadAttr>(thread);
++    if (threadAttr.getThreadType() != d2m::ThreadType::Compute) {
++      continue;
++    }
++    auto kernelFunc = symbolTable.lookup<mlir::func::FuncOp>(
++        threadAttr.getKernelSymbol().getRootReference());
++    kernelFunc.walk([&](Operation *op) {
++      if (op->hasTrait<ttkernel::TTKernelFPUOpTrait>() &&
++          !mlir::isa<ttkernel::UnaryBcastTileOp>(op)) {
++        hasSrcRegisterFPUOps = true;
++      }
++    });
++  }
++  bool fp32DestAccum = false;
++  SmallVector<ttnn::ComputeKernelUnpackToDestMode> unpackToDestModes;
++  for (ttnn::KernelCBAttr cb : cbDescriptors) {
++    for (ttnn::KernelCBFormatAttr format : cb.getFormats()) {
++      ttcore::DataType dtype = format.getDtype();
++      if (!is32Bit(dtype)) {
++        continue;
++      }
++      fp32DestAccum = true;
++      if (dtype == ttcore::DataType::Float32 && hasSrcRegisterFPUOps) {
++        continue;
++      }
++      uint32_t port = format.getBufferIndex();
++      if (unpackToDestModes.size() <= port) {
++        unpackToDestModes.resize(port + 1,
++                                 ttnn::ComputeKernelUnpackToDestMode::Default);
++      }
++      unpackToDestModes[port] = ttnn::ComputeKernelUnpackToDestMode::Fp32;
++    }
++  }
++  if (unpackToDestModes.empty()) {
++    unpackToDestModes.push_back(ttnn::ComputeKernelUnpackToDestMode::Default);
++  }
++
+   SmallVector<mlir::Attribute> kernelConfigs(threads.size());
+   for (const auto [i, thread] : llvm::enumerate(threads)) {
+     const d2m::ThreadAttr threadAttr = mlir::cast<d2m::ThreadAttr>(thread);
+@@ -338,11 +388,9 @@
+       kernelConfigs[i] = builder.getAttr<ttnn::ComputeKernelAttr>(
+           kernelSymbol, coreRangeSet,
+           /*math_fidelity*/ convertMathFidelity(mathFidelity),
+-          /*fp32DestAccum*/ false,
++          fp32DestAccum,
+           /*dst_full_sync_en*/ false,
+-          /*unpack_to_dest_mode*/
+-          ArrayRef<ttnn::ComputeKernelUnpackToDestMode>{
+-              ttnn::ComputeKernelUnpackToDestMode::Default},
++          /*unpack_to_dest_mode*/ unpackToDestModes,
+           /*bfp8_pack_precise*/ false,
+           /*math_approx_mode*/ false, kernelCRTArgs, kernelCTArgs);
+       break;
+@@ -729,7 +777,8 @@
+   const auto arch = ttcore::getOpChipDescAttr(op).getArch().getValue();
+   SmallVector<mlir::Attribute> kernelDescriptors = createKernelDescriptors(
+       rewriter, op.getThreads(), coreRangeSet, opSymTable, mathFidelity,
+-      semIndexMap, additionalArgMapping, cbOperandIndexToPortMapping, arch);
++      semIndexMap, additionalArgMapping, cbOperandIndexToPortMapping, arch,
++      cbDescriptors);
+ 
+   ttnn::ProgramAttr program = ttnn::ProgramAttr::get(
+       ctx, kernelDescriptors, cbDescriptors, semaphoreDescriptors);
+diff --git a/lib/Dialect/TTIR/Transforms/PredicateTypeAlignment.cpp b/lib/Dialect/TTIR/Transforms/PredicateTypeAlignment.cpp
+--- a/lib/Dialect/TTIR/Transforms/PredicateTypeAlignment.cpp
++++ b/lib/Dialect/TTIR/Transforms/PredicateTypeAlignment.cpp
+@@ -126,6 +126,25 @@
+                       agreesWith(rhsElemType, firstNonI1) &&
+                       agreesWith(resultElemType, firstNonI1);
+ 
++    // A comparison of two same-typed operands with a differently typed result
++    // (ttnn.gt(f32, f32) -> bf16) compares in the operand type and casts the
++    // 0/1 result: casting the operands to the result type would round them
++    // first and change the comparison.
++    if (!typesAgree && lhsElemType == rhsElemType &&
++        !lhsElemType.isInteger(1) && !resultElemType.isInteger(1) &&
++        mlir::isa<EqualOp, NotEqualOp, GreaterThanOp, GreaterEqualOp,
++                  LessThanOp, LessEqualOp>(op)) {
++      auto compareType = buildTensorWithElementType(resultType, lhsElemType);
++      mlir::OperationState state(op->getLoc(), op->getName().getStringRef());
++      state.addOperands(op->getOperands());
++      state.addAttributes(op->getAttrs());
++      state.addTypes(compareType);
++      mlir::Operation *compare = rewriter.create(state);
++      rewriter.replaceOpWithNewOp<TypecastOp>(op, resultType,
++                                              compare->getResult(0));
++      return mlir::success();
++    }
++
+     Type targetElemType;
+     if (typesAgree) {
+       targetElemType = firstNonI1;
+diff --git a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td b/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
+--- a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
++++ b/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
+@@ -1428,6 +1428,192 @@
+     }];
+ }
+ 
++def TTKernel_EqIntTileInitOp : TTKernel_InitOp<"eq_int_tile_init"> {
++    let summary = "Short init function";
++    let description = [{
++      Must be run before eq_int_tile.
++    }];
++
++    let arguments = (ins TTCore_DataTypeAttr:$dtype);
++
++    let assemblyFormat = [{
++      `(` $dtype `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
++def TTKernel_EqIntTileOp : TTKernel_SFPUOp<"eq_int_tile", [TTKernel_BinaryOpTrait]> {
++    let summary = "Integer equal comparison between two tiles";
++    let description = [{
++      Performs element-wise integer comparison
++      DST[odst_index] <- DST[dst0_index] == DST[dst1_index]
++      on DST register operands, exact over the whole integer range. The DST
++      register buffer must be in acquired state via *tile_regs_acquire* call.
++      Supported data formats are: Int32, UInt32, UInt16.
++    }];
++
++    let arguments = (ins IndexLike:$dst0_index, IndexLike:$dst1_index, IndexLike:$odst_index,
++                         TTCore_DataTypeAttr:$dtype);
++
++    let assemblyFormat = [{
++      `(` $dst0_index `,` $dst1_index `,` $odst_index `,` $dtype `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
++def TTKernel_NeIntTileInitOp : TTKernel_InitOp<"ne_int_tile_init"> {
++    let summary = "Short init function";
++    let description = [{
++      Must be run before ne_int_tile.
++    }];
++
++    let arguments = (ins TTCore_DataTypeAttr:$dtype);
++
++    let assemblyFormat = [{
++      `(` $dtype `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
++def TTKernel_NeIntTileOp : TTKernel_SFPUOp<"ne_int_tile", [TTKernel_BinaryOpTrait]> {
++    let summary = "Integer not-equal comparison between two tiles";
++    let description = [{
++      Performs element-wise integer comparison
++      DST[odst_index] <- DST[dst0_index] != DST[dst1_index]
++      on DST register operands, exact over the whole integer range. The DST
++      register buffer must be in acquired state via *tile_regs_acquire* call.
++      Supported data formats are: Int32, UInt32, UInt16.
++    }];
++
++    let arguments = (ins IndexLike:$dst0_index, IndexLike:$dst1_index, IndexLike:$odst_index,
++                         TTCore_DataTypeAttr:$dtype);
++
++    let assemblyFormat = [{
++      `(` $dst0_index `,` $dst1_index `,` $odst_index `,` $dtype `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
++def TTKernel_GtIntTileInitOp : TTKernel_InitOp<"gt_int_tile_init"> {
++    let summary = "Short init function";
++    let description = [{
++      Must be run before gt_int_tile.
++    }];
++
++    let arguments = (ins TTCore_DataTypeAttr:$dtype);
++
++    let assemblyFormat = [{
++      `(` $dtype `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
++def TTKernel_GtIntTileOp : TTKernel_SFPUOp<"gt_int_tile", [TTKernel_BinaryOpTrait]> {
++    let summary = "Integer greater-than comparison between two tiles";
++    let description = [{
++      Performs element-wise integer comparison
++      DST[odst_index] <- DST[dst0_index] > DST[dst1_index]
++      on DST register operands, exact over the whole integer range. The DST
++      register buffer must be in acquired state via *tile_regs_acquire* call.
++      Supported data formats are: Int32, UInt32, UInt16.
++    }];
++
++    let arguments = (ins IndexLike:$dst0_index, IndexLike:$dst1_index, IndexLike:$odst_index,
++                         TTCore_DataTypeAttr:$dtype);
++
++    let assemblyFormat = [{
++      `(` $dst0_index `,` $dst1_index `,` $odst_index `,` $dtype `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
++def TTKernel_LtIntTileInitOp : TTKernel_InitOp<"lt_int_tile_init"> {
++    let summary = "Short init function";
++    let description = [{
++      Must be run before lt_int_tile.
++    }];
++
++    let arguments = (ins TTCore_DataTypeAttr:$dtype);
++
++    let assemblyFormat = [{
++      `(` $dtype `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
++def TTKernel_LtIntTileOp : TTKernel_SFPUOp<"lt_int_tile", [TTKernel_BinaryOpTrait]> {
++    let summary = "Integer less-than comparison between two tiles";
++    let description = [{
++      Performs element-wise integer comparison
++      DST[odst_index] <- DST[dst0_index] < DST[dst1_index]
++      on DST register operands, exact over the whole integer range. The DST
++      register buffer must be in acquired state via *tile_regs_acquire* call.
++      Supported data formats are: Int32, UInt32, UInt16.
++    }];
++
++    let arguments = (ins IndexLike:$dst0_index, IndexLike:$dst1_index, IndexLike:$odst_index,
++                         TTCore_DataTypeAttr:$dtype);
++
++    let assemblyFormat = [{
++      `(` $dst0_index `,` $dst1_index `,` $odst_index `,` $dtype `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
++def TTKernel_GeIntTileInitOp : TTKernel_InitOp<"ge_int_tile_init"> {
++    let summary = "Short init function";
++    let description = [{
++      Must be run before ge_int_tile.
++    }];
++
++    let arguments = (ins TTCore_DataTypeAttr:$dtype);
++
++    let assemblyFormat = [{
++      `(` $dtype `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
++def TTKernel_GeIntTileOp : TTKernel_SFPUOp<"ge_int_tile", [TTKernel_BinaryOpTrait]> {
++    let summary = "Integer greater-than-or-equal comparison between two tiles";
++    let description = [{
++      Performs element-wise integer comparison
++      DST[odst_index] <- DST[dst0_index] >= DST[dst1_index]
++      on DST register operands, exact over the whole integer range. The DST
++      register buffer must be in acquired state via *tile_regs_acquire* call.
++      Supported data formats are: Int32, UInt32, UInt16.
++    }];
++
++    let arguments = (ins IndexLike:$dst0_index, IndexLike:$dst1_index, IndexLike:$odst_index,
++                         TTCore_DataTypeAttr:$dtype);
++
++    let assemblyFormat = [{
++      `(` $dst0_index `,` $dst1_index `,` $odst_index `,` $dtype `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
++def TTKernel_LeIntTileInitOp : TTKernel_InitOp<"le_int_tile_init"> {
++    let summary = "Short init function";
++    let description = [{
++      Must be run before le_int_tile.
++    }];
++
++    let arguments = (ins TTCore_DataTypeAttr:$dtype);
++
++    let assemblyFormat = [{
++      `(` $dtype `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
++def TTKernel_LeIntTileOp : TTKernel_SFPUOp<"le_int_tile", [TTKernel_BinaryOpTrait]> {
++    let summary = "Integer less-than-or-equal comparison between two tiles";
++    let description = [{
++      Performs element-wise integer comparison
++      DST[odst_index] <- DST[dst0_index] <= DST[dst1_index]
++      on DST register operands, exact over the whole integer range. The DST
++      register buffer must be in acquired state via *tile_regs_acquire* call.
++      Supported data formats are: Int32, UInt32, UInt16.
++    }];
++
++    let arguments = (ins IndexLike:$dst0_index, IndexLike:$dst1_index, IndexLike:$odst_index,
++                         TTCore_DataTypeAttr:$dtype);
++
++    let assemblyFormat = [{
++      `(` $dst0_index `,` $dst1_index `,` $odst_index `,` $dtype `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
+ def TTKernel_BinaryBitwiseTileInitOp : TTKernel_InitOp<"binary_bitwise_tile_init"> {
+     let summary = "Init function for binary bitwise operations (AND, OR, XOR). Refer to documentation for any init function.";
+     let description = [{
+diff --git a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp b/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp
+--- a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp
++++ b/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp
+@@ -880,6 +880,18 @@
+       return ArrayAttr::get(op.getContext(), template_args);
+     } else if constexpr (std::is_same_v<SourceOp, ttkernel::AddIntTileOp> ||
+                          std::is_same_v<SourceOp, ttkernel::SubIntTileOp> ||
++                         std::is_same_v<SourceOp, ttkernel::EqIntTileInitOp> ||
++                         std::is_same_v<SourceOp, ttkernel::EqIntTileOp> ||
++                         std::is_same_v<SourceOp, ttkernel::NeIntTileInitOp> ||
++                         std::is_same_v<SourceOp, ttkernel::NeIntTileOp> ||
++                         std::is_same_v<SourceOp, ttkernel::GtIntTileInitOp> ||
++                         std::is_same_v<SourceOp, ttkernel::GtIntTileOp> ||
++                         std::is_same_v<SourceOp, ttkernel::LtIntTileInitOp> ||
++                         std::is_same_v<SourceOp, ttkernel::LtIntTileOp> ||
++                         std::is_same_v<SourceOp, ttkernel::GeIntTileInitOp> ||
++                         std::is_same_v<SourceOp, ttkernel::GeIntTileOp> ||
++                         std::is_same_v<SourceOp, ttkernel::LeIntTileInitOp> ||
++                         std::is_same_v<SourceOp, ttkernel::LeIntTileOp> ||
+                          std::is_same_v<SourceOp, ttkernel::MulIntTileInitOp> ||
+                          std::is_same_v<SourceOp, ttkernel::MulIntTileOp>) {
+       SmallVector<Attribute, 1> template_args;
+@@ -2756,6 +2768,18 @@
+         TTKernelToEmitCOpaqueRewriter<ttkernel::AddBinaryTilesOp>,
+         TTKernelToEmitCOpaqueRewriter<ttkernel::AddIntTileInitOp>,
+         TTKernelToEmitCOpaqueRewriter<ttkernel::AddIntTileOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::EqIntTileInitOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::EqIntTileOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::NeIntTileInitOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::NeIntTileOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::GtIntTileInitOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::GtIntTileOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::LtIntTileInitOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::LtIntTileOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::GeIntTileInitOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::GeIntTileOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::LeIntTileInitOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::LeIntTileOp>,
+         TTKernelScalarUnaryTileOpRewriter<ttkernel::AddUnaryTileOp>,
+         TTKernelScalarUnaryTileOpRewriter<ttkernel::AddUnaryTileInt32Op>,
+         TTKernelToEmitCOpaqueRewriter<ttkernel::DivBinaryTilesInitOp>,
+diff --git a/include/ttmlir/Target/TTKernel/TTKernelIncludesMap.h b/include/ttmlir/Target/TTKernel/TTKernelIncludesMap.h
+--- a/include/ttmlir/Target/TTKernel/TTKernelIncludesMap.h
++++ b/include/ttmlir/Target/TTKernel/TTKernelIncludesMap.h
+@@ -104,6 +104,8 @@
+         {"div_binary_tile",                                {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"div_binary_tile_init",                           {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"div_unary_tile",                                 {"api/compute/eltwise_unary/binop_with_scalar.h", ""}},
++        {"eq_int_tile",                                    {"api/compute/binary_comp.h", ""}},
++        {"eq_int_tile_init",                               {"api/compute/binary_comp.h", ""}},
+         {"eq_binary_tile",                                 {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"eq_binary_tile_init",                            {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"eqz_tile",                                       {"api/compute/eltwise_unary/comp.h", ""}},
+@@ -124,6 +126,8 @@
+         {"fill_tile_int",                                  {"api/compute/eltwise_unary/fill.h", ""}},
+         {"floor_tile",                                     {"api/compute/eltwise_unary/rounding.h", ""}},
+         {"frac_tile",                                      {"api/compute/eltwise_unary/rounding.h", ""}},
++        {"ge_int_tile",                                    {"api/compute/binary_comp.h", ""}},
++        {"ge_int_tile_init",                               {"api/compute/binary_comp.h", ""}},
+         {"ge_binary_tile",                                 {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"ge_binary_tile_init",                            {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"gelu_tile",                                      {"api/compute/eltwise_unary/gelu.h", ""}},
+@@ -131,6 +135,8 @@
+         {"gez_tile",                                       {"api/compute/eltwise_unary/comp.h", ""}},
+         {"gez_tile_init",                                  {"api/compute/eltwise_unary/comp.h", ""}},
+         {"gez_tile_int32",                                 {"api/compute/eltwise_unary/comp.h", ""}},
++        {"gt_int_tile",                                    {"api/compute/binary_comp.h", ""}},
++        {"gt_int_tile_init",                               {"api/compute/binary_comp.h", ""}},
+         {"gt_binary_tile",                                 {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"gt_binary_tile_init",                            {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"gtz_tile",                                       {"api/compute/eltwise_unary/comp.h", ""}},
+@@ -141,6 +147,8 @@
+         {"lez_tile",                                       {"api/compute/eltwise_unary/comp.h", ""}},
+         {"lez_tile_init",                                  {"api/compute/eltwise_unary/comp.h", ""}},
+         {"lez_tile_int32",                                 {"api/compute/eltwise_unary/comp.h", ""}},
++        {"le_int_tile",                                    {"api/compute/binary_comp.h", ""}},
++        {"le_int_tile_init",                               {"api/compute/binary_comp.h", ""}},
+         {"le_binary_tile",                                 {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"le_binary_tile_init",                            {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"log1p_tile",                                     {"api/compute/eltwise_unary/log1p.h", ""}},
+@@ -149,6 +157,8 @@
+         {"log_tile_init",                                  {"api/compute/compute_kernel_api.h", ""}},
+         {"logical_not_tile",                               {"api/compute/eltwise_unary/logical_not.h", ""}},
+         {"logical_not_tile_init",                          {"api/compute/eltwise_unary/logical_not.h", ""}},
++        {"lt_int_tile",                                    {"api/compute/binary_comp.h", ""}},
++        {"lt_int_tile_init",                               {"api/compute/binary_comp.h", ""}},
+         {"lt_binary_tile",                                 {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"lt_binary_tile_init",                            {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"ltz_tile",                                       {"api/compute/eltwise_unary/comp.h", ""}},
+@@ -176,6 +186,8 @@
+         {"negative_tile",                                  {"api/compute/eltwise_unary/negative.h", ""}},
+         {"negative_tile_init",                             {"api/compute/eltwise_unary/negative.h", ""}},
+         {"negative_tile_int32",                            {"api/compute/eltwise_unary/negative.h", ""}},
++        {"ne_int_tile",                                    {"api/compute/binary_comp.h", ""}},
++        {"ne_int_tile_init",                               {"api/compute/binary_comp.h", ""}},
+         {"ne_binary_tile",                                 {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"ne_binary_tile_init",                            {"api/compute/eltwise_binary_sfpu.h", ""}},
+         {"nez_tile",                                       {"api/compute/eltwise_unary/comp.h", ""}},
+diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
+--- a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
++++ b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
+@@ -880,45 +880,6 @@
+ } // namespace
+ 
+ namespace {
+-// Maps a binary tile comparison op (used for floating-point lowering via the
+-// SFPU `*_binary_tile` API) to the corresponding unary compare-with-zero op
+-// (used for the integer fallback via `(a - b)` followed by `*z_int32`).
+-template <typename T>
+-struct ComparisonZTileOp;
+-template <>
+-struct ComparisonZTileOp<d2m::TileEqOp> {
+-  using type = d2m::TileEqzOp;
+-};
+-template <>
+-struct ComparisonZTileOp<d2m::TileNeOp> {
+-  using type = d2m::TileNezOp;
+-};
+-template <>
+-struct ComparisonZTileOp<d2m::TileGtOp> {
+-  using type = d2m::TileGtzOp;
+-};
+-template <>
+-struct ComparisonZTileOp<d2m::TileLtOp> {
+-  using type = d2m::TileLtzOp;
+-};
+-template <>
+-struct ComparisonZTileOp<d2m::TileGeOp> {
+-  using type = d2m::TileGezOp;
+-};
+-template <>
+-struct ComparisonZTileOp<d2m::TileLeOp> {
+-  using type = d2m::TileLezOp;
+-};
+-
+-template <typename TileOp>
+-inline constexpr bool isBinaryComparisonTileOp =
+-    std::is_same_v<TileOp, d2m::TileEqOp> ||
+-    std::is_same_v<TileOp, d2m::TileNeOp> ||
+-    std::is_same_v<TileOp, d2m::TileGtOp> ||
+-    std::is_same_v<TileOp, d2m::TileLtOp> ||
+-    std::is_same_v<TileOp, d2m::TileGeOp> ||
+-    std::is_same_v<TileOp, d2m::TileLeOp>;
+-
+ // ----------------------------------------------------------------------------
+ //
+ // Rewrite elementwise ops by emitting a matching D2M tile version of the op
+@@ -1186,21 +1147,6 @@
+       auto diff = bbBuilder.create<d2m::TileSubOp>(loc, resultTypes,
+                                                    ValueRange{nezA, nezB});
+       yield = bbBuilder.create<d2m::TileNezOp>(loc, resultTypes, diff);
+-    } else if constexpr (isBinaryComparisonTileOp<TileOp>) {
+-      // The SFPU `*_binary_tile` API always writes fp32 1.0/0.0 into dst.
+-      // For floating-point operands that is the correct answer, but for
+-      // integer operands the result tensor's element type is an integer and
+-      // the fp32 bytes would be reinterpreted (1.0f -> 0x3F800000). Fall back
+-      // to the (sub + *z_int32) decomposition for integer-typed operands so
+-      // the kernel produces integer 0/1 directly.
+-      auto operandTileTy = mlir::cast<ttcore::TileType>(operands[0].getType());
+-      if (operandTileTy.getElementType().isInteger()) {
+-        auto sub = bbBuilder.create<d2m::TileSubOp>(loc, resultTypes, operands);
+-        yield = bbBuilder.create<typename ComparisonZTileOp<TileOp>::type>(
+-            loc, resultTypes, sub.getResult());
+-      } else {
+-        yield = bbBuilder.create<TileOp>(loc, resultTypes, operands);
+-      }
+     } else {
+       yield = bbBuilder.create<TileOp>(loc, resultTypes, operands);
+     }
