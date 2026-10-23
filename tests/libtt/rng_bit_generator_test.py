@@ -1,16 +1,8 @@
-"""stablehlo.rng_bit_generator: the bits are a function of the state.
-
-libtt computes them with Threefry-2x32 (20 rounds) for DEFAULT and THREE_FRY,
-and with Philox-4x32 (10 rounds) for PHILOX. The key is (state[0], 0), and
-element i (in row-major order) is the first word of counter (i, state[1]) for
-Threefry and (i, state[1], state[2] or 0, 0) for Philox. The output state
-advances state[1] by one per nonempty call, so the next call uses other
-counters.
-
-The states are u64[2], as torch_tpu passes them. (JAX's u32[4] keys need a
-width-changing bitcast to u64[2], which libtt doesn't compile.) The device's
-64-bit integers hold 32 bits: the state's words count modulo 2^32, and 64-bit
-outputs have 32 random low bits.
+"""stablehlo.rng_bit_generator draws Threefry-2x32-20 (DEFAULT/THREE_FRY)
+or Philox-4x32-10 (PHILOX) words from uint64 state represented as low/high
+uint32 pairs. The references below specify libtt's key/counter mapping.
+The second state element advances once per nonempty call, modulo 2^64.
+Narrow outputs keep the low bits; uint64 outputs have 32 random low bits.
 """
 
 import jax
@@ -23,6 +15,7 @@ import numpy as np
 import pytest
 
 M32 = 0xFFFFFFFF
+M64 = 0xFFFFFFFFFFFFFFFF
 ALGORITHMS = {
     "DEFAULT": jax.lax.RandomAlgorithm.RNG_DEFAULT,
     "THREE_FRY": jax.lax.RandomAlgorithm.RNG_THREE_FRY,
@@ -106,17 +99,20 @@ def philox4x32(key, counters):
 
 def expected(algorithm, state, elements):
     """The 32-bit words that libtt draws from a state, in row-major order."""
-    seed, offset, *rest = (int(word) & M32 for word in state)
+    seed, offset, *rest = map(int, state)
     i, n = np.arange(elements), elements
     if algorithm == "PHILOX":
-        high = rest[0] if rest else 0
-        return philox4x32((seed, 0), [i, np.full(n, offset), np.full(n, high), np.zeros(n)])[0]
-    return threefry2x32((seed, 0), [i, np.full(n, offset)])[0]
+        extra = rest[0] if rest else 0
+        return philox4x32(
+            (seed & M32, (seed >> 32) ^ (extra >> 32)),
+            [i, np.full(n, offset & M32), np.full(n, extra & M32), np.full(n, offset >> 32)],
+        )[0]
+    return threefry2x32(((seed & M32) ^ (offset >> 32), seed >> 32), [i, np.full(n, offset & M32)])[0]
 
 
 def advanced(old, elements):
     new = old.copy()
-    new[1] = (int(old[1]) + bool(elements)) & M32
+    new[1] = (int(old[1]) + bool(elements)) & M64
     return new
 
 
@@ -145,8 +141,7 @@ def test_references_match_known_answers(generator, key, counters, words):
 @pytest.mark.parametrize("algorithm", ALGORITHMS)
 @pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.uint32, np.uint64])
 def test_bits_match_reference(algorithm, dtype):
-    """8- and 16-bit elements are the words' low bits; 64-bit elements are the
-    words, as the device's 64-bit integers hold 32 bits."""
+    """Narrow outputs keep the low bits; uint64 outputs zero-extend the words."""
     old = state(0xDEADBEEF, 3)
     new, values = bits(old, (5, 7), dtype, algorithm)
     np.testing.assert_array_equal(values, expected(algorithm, old, 35).astype(dtype).reshape(5, 7))
@@ -174,7 +169,7 @@ def test_large_output(algorithm):
 
 
 def test_philox_three_word_state():
-    old = state(0xDEADBEEF, 3, 5)
+    old = state(0x12345678DEADBEEF, 2**32 + 3, 2**33 + 5)
     new, values = raw_bits(old, (9,), np.uint32, "PHILOX")
     np.testing.assert_array_equal(values, expected("PHILOX", old, 9))
     np.testing.assert_array_equal(new, advanced(old, 9))
@@ -212,19 +207,21 @@ def test_other_states_give_other_bits(algorithm):
         assert np.mean(base == other) < 0.01
 
 
-def test_state_words_count_modulo_2_32():
-    """The device's 64-bit integers hold 32 bits, so states that differ only
-    above bit 31 give the same bits."""
-    _, base = bits(state(5, 1), (64,), np.uint32)
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+def test_high_state_words_affect_bits(algorithm):
+    _, base = bits(state(5, 1), (64,), np.uint32, algorithm)
     for other in (state(5 + 2**32, 1), state(5, 1 + 2**32)):
-        np.testing.assert_array_equal(bits(other, (64,), np.uint32)[1], base)
+        new, values = bits(other, (64,), np.uint32, algorithm)
+        np.testing.assert_array_equal(values, expected(algorithm, other, 64))
+        np.testing.assert_array_equal(new, advanced(other, 64))
+        assert not np.array_equal(values, base)
 
 
 @pytest.mark.parametrize("algorithm", ALGORITHMS)
 def test_counter_wraps(algorithm):
     old = state(5, M32)
     new, values = bits(old, (35,), np.uint32, algorithm)
-    np.testing.assert_array_equal(new, state(5, 0))
+    np.testing.assert_array_equal(new, state(5, 2**32))
     np.testing.assert_array_equal(values, expected(algorithm, old, 35))
 
 
@@ -272,3 +269,50 @@ def test_empty_output_keeps_the_state():
 def test_unsupported_types_are_errors(old, dtype, message):
     with pytest.raises(jax.errors.JaxRuntimeError, match=message):
         raw_bits(old, (4,), dtype, "DEFAULT")
+
+
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+def test_full_counter_wraps(algorithm):
+    old = state(5 + 2**32, M64)
+    new, values = bits(old, (35,), np.uint32, algorithm)
+    np.testing.assert_array_equal(new, state(int(old[0]), 0))
+    np.testing.assert_array_equal(values, expected(algorithm, old, 35))
+
+
+def test_uint64_state_buffers_and_addition():
+    a = np.array([0, M32, 2**32, M64, 2**63, 2**63 - 1], np.uint64)
+    b = np.array([M64, 1, M32, 1, 2**63, 2**63 + 1], np.uint64)
+    with jax.enable_x64(True):
+        x = jax.device_put(a)
+        np.testing.assert_array_equal(np.asarray(x), a)
+        np.testing.assert_array_equal(np.asarray(jax.jit(lambda x, y: x + y)(x, b)), a + b)
+        np.testing.assert_array_equal(np.asarray(jax.jit(lambda: jnp.asarray(a))()), a)
+        # Both halves must survive reordering and selecting a new seed.
+        updated = jax.jit(lambda x: jax.lax.dynamic_update_slice(x, jnp.array([M64], jnp.uint64), (0,)))(x)
+        want = a.copy()
+        want[0] = M64
+        np.testing.assert_array_equal(np.asarray(updated), want)
+
+
+def test_uint64_strided_buffers_and_bitcasts():
+    values = (np.arange(6 * 19, dtype=np.uint64) * (2**32 + 7)).reshape(6, 19)[::2].T
+    with jax.enable_x64(True):
+        x = jax.device_put(values, jax.devices("tt")[0])
+        np.testing.assert_array_equal(np.asarray(x), values)
+        np.testing.assert_array_equal(np.asarray(jax.jit(lambda a: a + a)(x)), values + values)
+        words = jax.jit(lambda a: jax.lax.bitcast_convert_type(a, jnp.uint32))(x)
+        expected_words = np.ascontiguousarray(values).view(np.uint32).reshape(*values.shape, 2)
+        np.testing.assert_array_equal(np.asarray(words), expected_words)
+        restored = jax.jit(lambda a: jax.lax.bitcast_convert_type(a, jnp.uint64))(words)
+        np.testing.assert_array_equal(np.asarray(restored), values)
+
+
+def test_jax_rbg_key_bitcasts():
+    # JAX stores RBG state as u32[4], bitcasting to/from u64[2]. Its initial
+    # state duplicates the key words: high seed and counter bits must not cancel.
+    draw = jax.jit(lambda k: jax.random.bits(k, shape=(64,), dtype=jnp.uint32))
+    first = np.asarray(draw(jax.random.key(42, impl="rbg")))
+    again = np.asarray(draw(jax.random.key(42, impl="rbg")))
+    other = np.asarray(draw(jax.random.key(43, impl="rbg")))
+    np.testing.assert_array_equal(first, again)
+    assert not np.array_equal(first, other)

@@ -487,6 +487,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_copy_until_transfer_completes.patch",
         "//third_party/tt_xla:tt_xla_host_memory_allocator.patch",
         "//third_party/tt_xla:tt_xla_compile_exceptions.patch",
+        "//third_party/tt_xla:tt_xla_uint64_buffers.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -661,6 +662,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_pool_pad_fusion.patch",
         "//third_party/tt_xla:tt_mlir_case_selector_in_outlined_program.patch",
         "//third_party/tt_xla:tt_mlir_rng_bit_generator.patch",
+        "//third_party/tt_xla:tt_mlir_uint64_rng_state.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

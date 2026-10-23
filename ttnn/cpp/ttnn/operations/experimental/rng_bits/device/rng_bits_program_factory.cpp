@@ -53,6 +53,9 @@ ttnn::device_operation::ProgramArtifacts RngBitsProgramFactory::create_program_a
     // DRAM pages read into L1 need 64-byte aligned entries.
     const uint32_t state_page_bytes = state.tensor_spec().compute_page_size_bytes();
     const uint32_t tile_bytes = tt::tile_size(tt::DataFormat::UInt32);
+    // uint64 state is [words, 2] in the first tile face; legacy uint32 state is a vector.
+    const bool paired = state.logical_shape().volume() != state.logical_shape()[-1];
+    const uint32_t state_stride = paired ? 16 : 1;
     Group<DataflowBufferSpec> dataflow_buffers = {
         {.unique_id = STATE_DFB,
          .entry_size = (state_page_bytes + 63) / 64 * 64,
@@ -78,7 +81,7 @@ ttnn::device_operation::ProgramArtifacts RngBitsProgramFactory::create_program_a
                 TensorBinding{.tensor_parameter_name = BITS, .accessor_name = "bits"},
                 TensorBinding{.tensor_parameter_name = NEW_STATE, .accessor_name = "new_state"},
             },
-        .compile_time_args = {{"state_page_bytes", state_page_bytes}},
+        .compile_time_args = {{"state_page_bytes", state_page_bytes}, {"state_stride", state_stride}},
         .runtime_arg_schema =
             {.runtime_arg_names = {"first_tile", "num_tiles", "write_state"},
              .common_runtime_arg_names = common_arg_names},
@@ -106,7 +109,8 @@ ttnn::device_operation::ProgramArtifacts RngBitsProgramFactory::create_program_a
             },
         .compile_time_args =
             {{"philox", static_cast<uint32_t>(philox)},
-             {"state_words", static_cast<uint32_t>(state.logical_shape()[-1])}},
+             {"state_words", static_cast<uint32_t>(state.logical_shape().volume() / (paired ? 2 : 1))},
+             {"state_stride", state_stride}},
         .runtime_arg_schema =
             {.runtime_arg_names = {"first_tile", "num_tiles"}, .common_runtime_arg_names = common_arg_names},
         .hw_config = ttnn::to_compute_hardware_config(device.arch(), compute_kernel_config),

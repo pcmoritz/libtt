@@ -32,12 +32,14 @@ void RngBitsOperation::validate_on_program_cache_miss(const operation_attributes
     TT_FATAL(
         state.memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED,
         "rng_bits: the state must be interleaved");
-    // The words must be the first elements of the state's only page: a vector,
-    // as all its other dimensions are 1.
+    // A vector, or low/high pairs in the first face of a tile.
     const auto& shape = state.logical_shape();
     TT_FATAL(
-        shape.rank() >= 1 && shape[-1] >= 2 && shape.volume() == shape[-1],
-        "rng_bits: the state must be a vector of at least two words, got {}",
+        shape.rank() >= 1 && shape[-1] >= 2 &&
+            (shape.volume() == shape[-1] ||
+             (shape.rank() >= 2 && shape[-1] == 2 && shape[-2] >= 2 && shape[-2] <= 16 &&
+              shape.volume() == 2 * shape[-2] && state.layout() == Layout::TILE)),
+        "rng_bits: expected a vector of at least two words or tiled [2..16, 2] pairs, got {}",
         shape);
     TT_FATAL(
         state.buffer()->num_pages() == 1, "rng_bits: the state must be one page, got {}", state.buffer()->num_pages());

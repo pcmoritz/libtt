@@ -167,6 +167,21 @@ py_test(
 )
 
 py_test(
+    name = "torch_tpu_rng_tests",
+    srcs = TORCH_TPU_TEST_SRCS,
+    args = TORCH_TPU_TEST_ARGS + [
+        "--local-test=$(rlocationpath :torch_tpu/rng_state_test.py)",
+        "tests/rng_test.py",
+        "tests/compile/random_ops_test.py",
+    ],
+    data = TORCH_TPU_TEST_DATA + ["torch_tpu/rng_state_test.py"],
+    deps = TORCH_TPU_TEST_DEPS,
+    main = "torch_tpu_runner.py",
+    tags = DEVICE_TEST_TAGS,
+    timeout = "long",
+)
+
+py_test(
     name = "torch_tpu_test_suite",
     srcs = TORCH_TPU_TEST_SRCS,
     args = TORCH_TPU_TEST_ARGS,

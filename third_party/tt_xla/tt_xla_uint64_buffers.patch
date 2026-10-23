@@ -1,0 +1,123 @@
+diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
+--- a/pjrt_implementation/src/api/buffer_instance.cc
++++ b/pjrt_implementation/src/api/buffer_instance.cc
+@@ -123,6 +123,10 @@
+   size_t dtype_element_size = tt::runtime::utils::dataTypeElementSize(
+       data_type_utils::convertPJRTToRuntimeDataType(m_data_type));
+ 
++  if (m_data_type == PJRT_Buffer_Type_U64) {
++    dtype_element_size *= 2;
++  }
++
+   return std::accumulate(m_dimensions.begin(), m_dimensions.end(),
+                          dtype_element_size, [](size_t acc, std::int64_t dim) {
+                            return acc * static_cast<size_t>(dim);
+@@ -251,7 +255,7 @@
+       calculateShape(dims, num_dims, m_data_type);
+   std::vector<std::int64_t> strides =
+       calculateStrides(dims, num_dims, byte_strides, num_byte_strides,
+-                       element_size);
++                       element_size, m_data_type);
+ 
+   // A buffer is treated as contiguous if it is a complex dtype (its `shape`
+   // carries an extra trailing dim with no matching `byte_strides` entry) or
+@@ -259,9 +263,10 @@
+   // is borrowed with its strides like a contiguous one: the runtime gathers it
+   // when it is read (createBorrowedHostTensor), so the weights of a
+   // memory-mapped checkpoint are not copied into RAM.
+-  bool is_contiguous = data_type_utils::isComplexPJRTType(m_data_type) ||
+-                       isDenseRowMajor(dims, num_dims, byte_strides,
+-                                       num_byte_strides, element_size);
++  bool is_contiguous =
++      data_type_utils::isComplexPJRTType(m_data_type) ||
++      isDenseRowMajor(dims, num_dims, byte_strides, num_byte_strides,
++                      m_data_type == PJRT_Buffer_Type_U64 ? 8 : element_size);
+ 
+   std::unique_ptr<EventInstance> done_with_host_buffer_event =
+       EventInstance::createInstance();
+@@ -363,10 +368,9 @@
+   std::vector<std::uint32_t> shape = calculateShape(
+       src_buffer->getDimensionsRaw(), src_buffer->getNumberOfDimensions(),
+       src_buffer->getDataType());
+-  std::vector<std::int64_t> strides =
+-      calculateStrides(src_buffer->getDimensionsRaw(),
+-                       src_buffer->getNumberOfDimensions(), nullptr, 0,
+-                       element_size);
++  std::vector<std::int64_t> strides = calculateStrides(
++      src_buffer->getDimensionsRaw(), src_buffer->getNumberOfDimensions(),
++      nullptr, 0, element_size, src_buffer->m_data_type);
+ 
+   tt::runtime::Tensor runtime_tensor = tt::runtime::createOwnedHostTensor(
+       /* data= */ nullptr, shape, strides, element_size, runtime_data_type);
+@@ -389,9 +393,9 @@
+       tt::runtime::utils::dataTypeElementSize(runtime_data_type);
+   std::vector<std::uint32_t> shape =
+       calculateShape(getDimensionsRaw(), getNumberOfDimensions(), m_data_type);
+-  std::vector<std::int64_t> strides =
+-      calculateStrides(getDimensionsRaw(), getNumberOfDimensions(),
+-                       byte_strides, num_byte_strides, element_size);
++  std::vector<std::int64_t> strides = calculateStrides(
++      getDimensionsRaw(), getNumberOfDimensions(), byte_strides,
++      num_byte_strides, element_size, m_data_type);
+ 
+   // Allocate an owned host tensor without copying any data in. The contents are
+   // written later by a compiled program (the runtime transfers it to device
+@@ -414,7 +418,9 @@
+ 
+   // Complex tensors have no runtime equivalent dtype, so they are stored as
+   // float tensors with a trailing dimension of 2 for interleaved real/imag.
+-  if (data_type_utils::isComplexPJRTType(data_type)) {
++  // uint64 uses the same layout for interleaved low/high uint32 words.
++  if (data_type_utils::isComplexPJRTType(data_type) ||
++      data_type == PJRT_Buffer_Type_U64) {
+     shape.push_back(2);
+   }
+ 
+@@ -423,17 +429,19 @@
+ 
+ std::vector<std::int64_t> BufferInstance::calculateStrides(
+     const std::int64_t *dims, size_t num_dims, const std::int64_t *byte_strides,
+-    size_t num_byte_strides, std::uint32_t element_size) {
++    size_t num_byte_strides, std::uint32_t element_size,
++    PJRT_Buffer_Type data_type) {
+ 
+   TT_FATAL(num_byte_strides == 0 || num_byte_strides == num_dims,
+            "num_byte_strides must be 0 or equal to num_dims: "
+            "num_byte_strides={}, num_dims={}",
+            num_byte_strides, num_dims);
+ 
+-  std::vector<std::int64_t> strides(num_dims);
++  const bool paired = data_type == PJRT_Buffer_Type_U64;
++  std::vector<std::int64_t> strides(num_dims + paired, 1);
+   // If no strides are given the array is assumed to have a dense layout with
+   // dimensions in major-to-minor order.
+-  std::int64_t dense_stride = 1;
++  std::int64_t dense_stride = paired ? 2 : 1;
+   for (size_t i = num_dims; i-- > 0;) {
+     strides[i] =
+         num_byte_strides == 0
+diff --git a/pjrt_implementation/inc/api/buffer_instance.h b/pjrt_implementation/inc/api/buffer_instance.h
+--- a/pjrt_implementation/inc/api/buffer_instance.h
++++ b/pjrt_implementation/inc/api/buffer_instance.h
+@@ -210,7 +210,7 @@
+   static std::vector<std::int64_t>
+   calculateStrides(const std::int64_t *dims, size_t num_dims,
+                    const std::int64_t *byte_strides, size_t num_byte_strides,
+-                   std::uint32_t element_size);
++                   std::uint32_t element_size, PJRT_Buffer_Type data_type);
+ 
+   // Gets next UID for buffer instances, used in buffer instance constructor
+   // to assign unique identifier to each buffer instance.
+diff --git a/pjrt_implementation/src/utils/data_type_utils.cc b/pjrt_implementation/src/utils/data_type_utils.cc
+--- a/pjrt_implementation/src/utils/data_type_utils.cc
++++ b/pjrt_implementation/src/utils/data_type_utils.cc
+@@ -113,7 +113,8 @@
+   case PJRT_Buffer_Type_S8:
+     return tt::target::DataType::Int8;
+   case PJRT_Buffer_Type_U64:
+-    return tt::target::DataType::UInt64;
++    // uint64 buffers retain both words in a trailing low/high dimension.
++    return tt::target::DataType::UInt32;
+   case PJRT_Buffer_Type_PRED:
+     return tt::target::DataType::Bool;
+   // Complex types have no runtime equivalent. They are stored as float tensors

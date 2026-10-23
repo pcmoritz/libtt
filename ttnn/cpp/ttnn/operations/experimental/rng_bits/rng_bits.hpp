@@ -13,19 +13,19 @@ namespace ttnn::experimental {
 
 enum class RngAlgorithm : uint32_t { Threefry = 0, Philox = 1 };
 
-// StableHLO's rng_bit_generator with the state on the device: returns
-// {bits, new_state}. state is a UINT32 (or INT32) tensor of at least two
-// elements along its last dimension, [w0, w1, w2, ...]; the key is (w0, 0), and
-// element i of bits (in row-major order) is the first word of
+// StableHLO's rng_bit_generator with device state: returns {bits, new_state}.
+// The state is UINT32 (or INT32), either a vector [w0, w1, w2, ...] or a tiled
+// [words, 2] tensor of uint64 low/high pairs (2 <= words <= 16). In the latter
+// case h0, h1, h2 are the high words; otherwise they are zero. Element i of
+// bits, in row-major order, is the first word of:
 //
-//   Threefry-2x32, 20 rounds:  counter (i, w1)
-//   Philox-4x32, 10 rounds:    counter (i, w1, w2 or 0, 0)
+//   Threefry-2x32-20: key (w0 ^ h1, h0), counter (i, w1)
+//   Philox-4x32-10:   key (w0, h0 ^ h2), counter (i, w1, w2, h1)
 //
-// so the same state gives the same bits. bits is a UINT32 TILE tensor of
-// `shape` (rank 1 or more) holding full 32-bit words.
-// new_state is state with w1 advanced by one, modulo 2^32, so
-// the next call uses other counters. The kernels read the state on the device,
-// so a cached program draws new bits from each new state.
+// Missing w2/h2 are zero. bits is a UINT32 TILE tensor of `shape` (rank >= 1).
+// new_state increments the second state element by one, carrying into h1 for
+// paired state. The kernels read state on the device, so a cached program
+// draws new bits from each new state.
 std::vector<ttnn::Tensor> rng_bits(
     const ttnn::Tensor& state,
     const ttnn::Shape& shape,
