@@ -31,7 +31,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -3749,6 +3749,27 @@ def TTNN_RandOp : TTNN_CreationOp<"rand", [TTCore_NonCacheableTrait]> {
+@@ -3749,6 +3749,32 @@ def TTNN_RandOp : TTNN_CreationOp<"rand", [TTCore_NonCacheableTrait]> {
    let hasVerifier = 1;
  }
  
@@ -51,7 +51,12 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +
 +    let extraClassDeclaration = [{
 +      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
-+        return wa::TTNNOperandsWorkaroundsFactory::createRngBitGeneratorOpOperandsWorkarounds();
++        wa::TTNNOperandWorkarounds tile;
++        tile.tensorLayoutWorkaround = Layout::Tile;
++        return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
++            .addInputOperandWorkaround(tile)
++            .addOutputOperandWorkaround(tile)
++            .addOutputOperandWorkaround(tile);
 +      }
 +    }];
 +}
@@ -59,20 +64,6 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
  def TTNN_DropoutOp : TTNN_Op<"dropout", [TTCore_NonCacheableTrait]> {
    let summary = "Dropout operation.";
    let description = [{
-diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
---- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
-+++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
-@@ -281,6 +281,10 @@ public:
-   static TTNNOperandsWorkarounds
-   createRowsScatterOpOperandsWorkarounds(mlir::Operation *op);
- 
-+  // Create workarounds for rng_bit_generator: its new state has the state's
-+  // layout, so both are tiled, like the bits.
-+  static TTNNOperandsWorkarounds createRngBitGeneratorOpOperandsWorkarounds();
-+
-   // Create workarounds for scatter op operands.
-   static TTNNOperandsWorkarounds
-   createScatterOpOperandsWorkarounds(mlir::Operation *op);
 diff --git a/include/ttmlir/Target/TTNN/operations/rand.fbs b/include/ttmlir/Target/TTNN/operations/rand.fbs
 --- a/include/ttmlir/Target/TTNN/operations/rand.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/rand.fbs
@@ -245,26 +236,6 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
             PermuteOpConversionPattern,
             UpsampleOpConversionPattern,
             AllToAllOpConversionPattern,
-diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
---- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-+++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -350,6 +350,16 @@ TTNNOperandsWorkaroundsFactory::createRowsScatterOpOperandsWorkarounds(
-       .addOutputOperandWorkaround(rowMajor);
- }
- 
-+TTNNOperandsWorkarounds
-+TTNNOperandsWorkaroundsFactory::createRngBitGeneratorOpOperandsWorkarounds() {
-+  TTNNOperandWorkarounds tile;
-+  tile.tensorLayoutWorkaround = Layout::Tile;
-+  return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
-+      .addInputOperandWorkaround(tile)   // initial_state
-+      .addOutputOperandWorkaround(tile)  // output_state
-+      .addOutputOperandWorkaround(tile); // output
-+}
-+
- // Factory method to create a set of workarounds for ScatterOp. The ScatterOp
- // expects the input to be in row-major layout if using f32, bf16, or int32.
- TTNNOperandsWorkarounds
 diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 --- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
 +++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
