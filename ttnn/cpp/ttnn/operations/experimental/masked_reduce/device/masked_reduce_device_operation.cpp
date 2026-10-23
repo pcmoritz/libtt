@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include <tt-metalium/constants.hpp>
+#include <tt-metalium/math.hpp>
 #include "ttnn/device_operation.hpp"
 
 namespace ttnn::experimental::prim {
@@ -12,6 +13,12 @@ namespace ttnn::experimental::prim {
 using tt::tt_metal::DataType;
 using tt::tt_metal::Layout;
 using tt::tt_metal::TensorMemoryLayout;
+
+// Every core owns a 16-byte slot per row of the partials (its row sums, in the
+// first of four columns), so a tile row of C cores spans 4 * C columns.
+uint32_t masked_reduce_partial_columns(uint32_t cores_per_row) {
+    return tt::round_up(4 * cores_per_row, tt::constants::TILE_WIDTH);
+}
 
 uint32_t masked_reduce_tile_rows(const Tensor& input) {
     const auto& padded = input.padded_shape();
@@ -60,7 +67,7 @@ MaskedReduceOperation::spec_return_value_t MaskedReduceOperation::compute_output
     const operation_attributes_t& params, const tensor_args_t& in) {
     const auto& shape = in.input.logical_shape();
     ttsl::SmallVector<uint32_t> dims(shape.cbegin(), shape.cend());
-    dims.back() = params.cores_per_row * tt::constants::TILE_WIDTH;
+    dims.back() = masked_reduce_partial_columns(params.cores_per_row);
     return {tt::tt_metal::TensorSpec(
         ttnn::Shape(dims),
         tt::tt_metal::TensorLayout(

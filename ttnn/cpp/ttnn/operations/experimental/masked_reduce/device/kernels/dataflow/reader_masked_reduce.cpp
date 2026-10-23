@@ -1,10 +1,19 @@
 // SPDX-FileCopyrightText: © 2026 libtt authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Reads this core's threshold tile and spreads each row's threshold (column 0)
-// across the tile's 32 columns, so the compute kernel can subtract it
-// elementwise; then reads the core's run of input tiles in batches of
-// batch_tiles with one barrier per batch, so the reads of a batch overlap.
+// Reads this core's thresholds, then its run of input tiles as dense tiles.
+//
+// A tile row with `rows` rows of data (at most 16) is read `pack` = 32 / stride
+// input tiles at a time: input tile jj's first `stride` rows (the data rows,
+// plus one padding row when 16-bit rows need an even stride for 64-byte
+// aligned chunks) become rows jj * stride .. jj * stride + stride - 1 of one
+// dense tile, so the kernel reads next to no padding. With more than 16 data
+// rows every input tile is read whole (pack = 1).
+//
+// The threshold tile reaches the compute kernel with the dense tile's row k
+// threshold, t[k % stride], in column 0 of row k; the compute kernel spreads
+// that column across the tile. Reads of a batch of dense tiles share one
+// barrier, so they overlap.
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -16,31 +25,17 @@
 namespace {
 // A 32 x 32 tile is four 16 x 16 faces: rows 0-15 in faces 0 (columns 0-15)
 // and 1 (columns 16-31), rows 16-31 in faces 2 and 3.
+constexpr uint32_t face_rows = 16;
 constexpr uint32_t face_elems = 256;
-// 1.0 for the first `valid` columns of a tile, 0.0 after them.
-template <typename T, T one>
-inline void write_validity(uint32_t base, uint32_t valid) {
-    auto* tile = reinterpret_cast<volatile tt_l1_ptr T*>(base);
-    for (uint32_t r = 0; r < 32; ++r) {
-        for (uint32_t c = 0; c < 32; ++c) {
-            const uint32_t at = ((r / 16) * 2 + c / 16) * face_elems + (r % 16) * 16 + c % 16;
-            tile[at] = c < valid ? one : T(0);
-        }
-    }
-}
 
+// Column 0 of dense row k gets the threshold of data row k % stride.
 template <typename T>
-inline void spread_column(uint32_t base) {
+inline void dense_threshold_column(uint32_t base, uint32_t rows, uint32_t stride) {
     auto* tile = reinterpret_cast<volatile tt_l1_ptr T*>(base);
-    for (uint32_t r = 0; r < 32; ++r) {
-        const uint32_t left = (r / 16) * 2 * face_elems + (r % 16) * 16;
-        const T value = tile[left];
-        for (uint32_t c = 1; c < 16; ++c) {
-            tile[left + c] = value;
-        }
-        for (uint32_t c = 0; c < 16; ++c) {
-            tile[left + face_elems + c] = value;
-        }
+    for (uint32_t k = 0; k < 32; ++k) {
+        const uint32_t m = k % stride < rows ? k % stride : 0;
+        const T value = tile[m * face_rows];  // face 0, row m, column 0
+        tile[(k / face_rows) * 2 * face_elems + (k % face_rows) * face_rows] = value;
     }
 }
 }  // namespace
@@ -49,15 +44,17 @@ void kernel_main() {
     const uint32_t tile_row = get_arg(args::tile_row);
     const uint32_t first_tile = get_arg(args::first_tile);
     const uint32_t num_tiles = get_arg(args::num_tiles);
+    const uint32_t rows = get_arg(args::rows);
+    const uint32_t stride = get_arg(args::stride);
+    const uint32_t pack = get_arg(args::pack);
     constexpr uint32_t batch_tiles = get_arg(args::batch_tiles);
     constexpr uint32_t elem_bytes = get_arg(args::elem_bytes);
-    constexpr uint32_t last_valid = get_arg(args::last_valid);
-    const uint32_t has_last = get_arg(args::has_last);
+    constexpr uint32_t row_bytes = face_rows * elem_bytes;
+    constexpr uint32_t face_bytes = face_elems * elem_bytes;
+    constexpr uint32_t tile_bytes = 4 * face_bytes;
 
     DataflowBuffer in_dfb(dfb::in);
     DataflowBuffer t_dfb(dfb::t);
-    DataflowBuffer v_dfb(dfb::v);
-    const uint32_t tile_bytes = in_dfb.get_tile_size();
     const auto input = TensorAccessor(tensor::input);
     const auto threshold = TensorAccessor(tensor::threshold);
     Noc noc;
@@ -66,32 +63,60 @@ void kernel_main() {
     // row's thresholds in its first column.
     t_dfb.reserve_back(1);
     const uint32_t t_addr = t_dfb.get_write_ptr();
-    noc.async_read(threshold, t_dfb, tile_bytes, {.page_id = tile_row}, {.offset_bytes = 0});
-    noc.async_read_barrier();
-    if constexpr (elem_bytes == 4) {
-        spread_column<uint32_t>(t_addr);
+    if (pack == 1) {
+        noc.async_read(threshold, t_dfb, tile_bytes, {.page_id = tile_row}, {.offset_bytes = 0});
+        noc.async_read_barrier();
     } else {
-        spread_column<uint16_t>(t_addr);
+        // The data rows' thresholds sit in face 0; spread them over the dense rows.
+        noc.async_read(threshold, t_dfb, stride * row_bytes, {.page_id = tile_row}, {.offset_bytes = 0});
+        noc.async_read_barrier();
+        if constexpr (elem_bytes == 4) {
+            dense_threshold_column<uint32_t>(t_addr, rows, stride);
+        } else {
+            dense_threshold_column<uint16_t>(t_addr, rows, stride);
+        }
     }
     t_dfb.push_back(1);
 
-    if constexpr (last_valid != 0) {
-        if (has_last) {
-            v_dfb.reserve_back(1);
-            if constexpr (elem_bytes == 4) {
-                write_validity<uint32_t, 0x3F800000u>(v_dfb.get_write_ptr(), last_valid);
-            } else {
-                write_validity<uint16_t, 0x3F80u>(v_dfb.get_write_ptr(), last_valid);
-            }
-            v_dfb.push_back(1);
-        }
-    }
-
-    for (uint32_t done = 0; done < num_tiles;) {
-        const uint32_t count = num_tiles - done < batch_tiles ? num_tiles - done : batch_tiles;
+    const uint32_t dense_tiles = (num_tiles + pack - 1) / pack;
+    for (uint32_t done = 0; done < dense_tiles;) {
+        const uint32_t count = dense_tiles - done < batch_tiles ? dense_tiles - done : batch_tiles;
         in_dfb.reserve_back(count);
         for (uint32_t i = 0; i < count; ++i) {
-            noc.async_read(input, in_dfb, tile_bytes, {.page_id = first_tile + done + i}, {.offset_bytes = i * tile_bytes});
+            const uint32_t dense = done + i;
+            const uint32_t dst_tile = i * tile_bytes;
+            const uint32_t in_dense = num_tiles - dense * pack < pack ? num_tiles - dense * pack : pack;
+            for (uint32_t jj = 0; jj < in_dense; ++jj) {
+                const uint32_t page = first_tile + dense * pack + jj;
+                if (pack == 1) {
+                    noc.async_read(input, in_dfb, tile_bytes, {.page_id = page}, {.offset_bytes = dst_tile});
+                    continue;
+                }
+                // Rows 0 .. stride - 1 of faces 0 and 1 go to dense rows
+                // r0 .. r1 - 1, split where those cross into faces 2 and 3.
+                const uint32_t r0 = jj * stride;
+                const uint32_t r1 = r0 + stride;
+                for (uint32_t f = 0; f < 2; ++f) {
+                    if (r0 < face_rows) {
+                        const uint32_t n = (r1 < face_rows ? r1 : face_rows) - r0;
+                        noc.async_read(
+                            input,
+                            in_dfb,
+                            n * row_bytes,
+                            {.page_id = page, .offset_bytes = f * face_bytes},
+                            {.offset_bytes = dst_tile + f * face_bytes + r0 * row_bytes});
+                    }
+                    if (r1 > face_rows) {
+                        const uint32_t r2 = r0 > face_rows ? r0 : face_rows;
+                        noc.async_read(
+                            input,
+                            in_dfb,
+                            (r1 - r2) * row_bytes,
+                            {.page_id = page, .offset_bytes = f * face_bytes + (r2 - r0) * row_bytes},
+                            {.offset_bytes = dst_tile + (f + 2) * face_bytes + (r2 - face_rows) * row_bytes});
+                    }
+                }
+            }
         }
         noc.async_read_barrier();
         in_dfb.push_back(count);

@@ -128,6 +128,17 @@ TEST_F(MaskedReduceTest, PartialTileWidthAndManyRows) {
     check<float>(40, 1000, DataType::FLOAT32);
 }
 
+TEST_F(MaskedReduceTest, DenseRowPacking) {
+    // 3 rows pack 10 input tiles per dense tile and straddle the face boundary;
+    // 16 rows pack two; 17 rows read whole tiles; one row packs 32; a width of
+    // one tile leaves most of the dense tile empty.
+    check<float>(3, 1000, DataType::FLOAT32);
+    check<float>(16, 4096, DataType::FLOAT32);
+    check<float>(17, 2048, DataType::FLOAT32);
+    check<bfloat16>(1, 100000, DataType::BFLOAT16);
+    check<float>(2, 16, DataType::FLOAT32);
+}
+
 TEST_F(MaskedReduceTest, MaskedInfinitiesAddNothing) {
     check<float>(4, 3000, DataType::FLOAT32, /*timed=*/false, /*infinities=*/true);
     check<bfloat16>(4, 3000, DataType::BFLOAT16, /*timed=*/false, /*infinities=*/true);

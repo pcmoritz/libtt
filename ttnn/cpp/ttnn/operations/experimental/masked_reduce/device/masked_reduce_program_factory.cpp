@@ -18,8 +18,18 @@ using namespace tt::tt_metal::experimental;
 
 namespace ttnn::experimental::prim {
 
-// Tiles a core reads per NoC barrier; the input buffer holds two batches.
+// Dense tiles a core reads per NoC barrier; the input buffer holds two batches.
 constexpr uint32_t batch_tiles = 8;
+
+// A tile row holds `rows` rows of data (the rest is tile padding). With at most
+// 16 of them, the reader packs the data rows of `pack` input tiles into one
+// dense tile, so the kernel reads and masks only data: dense row
+// jj * stride + m holds row m of the dense tile's jj-th input tile. The stride
+// is the row count, rounded up to an even number for 16-bit elements so that
+// every chunk the reader moves starts 64 bytes aligned (the DRAM read
+// alignment).
+static uint32_t stride_of(uint32_t rows, uint32_t elem_bytes) { return elem_bytes == 2 ? rows + (rows & 1) : rows; }
+static uint32_t pack_of(uint32_t stride) { return stride <= TILE_HEIGHT / 2 ? TILE_HEIGHT / stride : 1; }
 
 ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_program_artifacts(
     const MaskedReduceParams& params, const MaskedReduceInputs& tensor_args, std::vector<Tensor>& outputs) {
@@ -29,9 +39,13 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     const auto& device = input.device();
 
     const uint32_t tile_rows = masked_reduce_tile_rows(tensor_args.input);
+    const uint32_t H = input.logical_shape()[-2];
+    const uint32_t Ht = (H + TILE_HEIGHT - 1) / TILE_HEIGHT;
     const uint32_t Wt = input.padded_shape()[-1] / TILE_WIDTH;
     const uint32_t cores_per_row = params.cores_per_row;
     const uint32_t num_cores = tile_rows * cores_per_row;
+    const uint32_t partial_cols = masked_reduce_partial_columns(cores_per_row);
+    const uint32_t partial_tiles_per_row = partial_cols / TILE_WIDTH;
     const auto grid = device.compute_with_storage_grid_size();
     TT_FATAL(num_cores <= grid.x * grid.y, "masked_reduce: {} cores do not fit the grid", num_cores);
     const auto cores = tt::tt_metal::corerange_to_cores(
@@ -47,13 +61,14 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     const tt::DataFormat in_format = tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
     const uint32_t in_tile_bytes = tt::tile_size(in_format);
     const uint32_t f32_tile_bytes = tt::tile_size(tt::DataFormat::Float32);
+    // Columns of the last tile that hold data; 0 when the width is whole tiles.
+    const uint32_t last_valid = input.logical_shape()[-1] % TILE_WIDTH;
 
     const KernelSpecName READER{"reader"};
     const KernelSpecName WRITER{"writer"};
     const KernelSpecName COMPUTE{"compute"};
     const DFBSpecName IN_DFB{"in"};
     const DFBSpecName T_DFB{"t"};
-    const DFBSpecName V_DFB{"v"};
     const DFBSpecName OUT_DFB{"out"};
     const TensorParamName INPUT{"input"};
     const TensorParamName THRESHOLD{"threshold"};
@@ -64,16 +79,13 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
          .num_entries = 2 * batch_tiles,
          .data_format_metadata = in_format},
         {.unique_id = T_DFB, .entry_size = in_tile_bytes, .num_entries = 1, .data_format_metadata = in_format},
-        {.unique_id = V_DFB, .entry_size = in_tile_bytes, .num_entries = 1, .data_format_metadata = in_format},
         {.unique_id = OUT_DFB,
          .entry_size = f32_tile_bytes,
          .num_entries = 1,
          .data_format_metadata = tt::DataFormat::Float32},
     };
     const std::vector<std::string> runtime_arg_names = {
-        "tile_row", "first_tile", "num_tiles", "partial_tile", "has_last"};
-    // Columns of the last tile that hold data; 0 when the width is whole tiles.
-    const uint32_t last_valid = input.logical_shape()[-1] % TILE_WIDTH;
+        "tile_row", "first_tile", "num_tiles", "rows", "stride", "pack", "has_last", "out_tile", "col", "last_worker"};
     const std::string kernel_dir = "ttnn/cpp/ttnn/operations/experimental/masked_reduce/device/kernels/";
     KernelSpec reader{
         .unique_id = READER,
@@ -82,7 +94,6 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
             {
                 DFBBinding{.dfb_spec_name = IN_DFB, .accessor_name = "in", .endpoint_type = DFBEndpointType::PRODUCER},
                 DFBBinding{.dfb_spec_name = T_DFB, .accessor_name = "t", .endpoint_type = DFBEndpointType::PRODUCER},
-                DFBBinding{.dfb_spec_name = V_DFB, .accessor_name = "v", .endpoint_type = DFBEndpointType::PRODUCER},
             },
         .tensor_bindings =
             {
@@ -90,10 +101,7 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
                 TensorBinding{.tensor_parameter_name = THRESHOLD, .accessor_name = "threshold"},
             },
         .compile_time_args =
-            {{"Wt", Wt},
-             {"batch_tiles", batch_tiles},
-             {"elem_bytes", in_tile_bytes / (TILE_HEIGHT * TILE_WIDTH)},
-             {"last_valid", last_valid}},
+            {{"batch_tiles", batch_tiles}, {"elem_bytes", in_tile_bytes / (TILE_HEIGHT * TILE_WIDTH)}},
         .runtime_arg_schema = {.runtime_arg_names = runtime_arg_names},
         .hw_config = ttnn::create_reader_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
@@ -105,6 +113,7 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
                 DFBBinding{.dfb_spec_name = OUT_DFB, .accessor_name = "out", .endpoint_type = DFBEndpointType::CONSUMER},
             },
         .tensor_bindings = {TensorBinding{.tensor_parameter_name = PARTIALS, .accessor_name = "partials"}},
+        .compile_time_args = {{"cols", partial_cols}},
         .runtime_arg_schema = {.runtime_arg_names = runtime_arg_names},
         .hw_config = ttnn::create_writer_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
@@ -120,7 +129,6 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
         unpack_modes(compute_hw) = {
             {IN_DFB, tt::tt_metal::UnpackMode::UnpackToDest},
             {T_DFB, tt::tt_metal::UnpackMode::UnpackToDest},
-            {V_DFB, tt::tt_metal::UnpackMode::UnpackToDest},
         };
     }
     KernelSpec compute{
@@ -131,7 +139,6 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
             {
                 DFBBinding{.dfb_spec_name = IN_DFB, .accessor_name = "in", .endpoint_type = DFBEndpointType::CONSUMER},
                 DFBBinding{.dfb_spec_name = T_DFB, .accessor_name = "t", .endpoint_type = DFBEndpointType::CONSUMER},
-                DFBBinding{.dfb_spec_name = V_DFB, .accessor_name = "v", .endpoint_type = DFBEndpointType::CONSUMER},
                 DFBBinding{.dfb_spec_name = OUT_DFB, .accessor_name = "out", .endpoint_type = DFBEndpointType::PRODUCER},
             },
         .compile_time_args =
@@ -145,14 +152,23 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     KernelRunArgs reader_run_args{.kernel = READER};
     KernelRunArgs writer_run_args{.kernel = WRITER};
     KernelRunArgs compute_run_args{.kernel = COMPUTE};
-    // A tile row's tiles split evenly over its cores, the first ones a tile longer.
-    const uint32_t base = Wt / cores_per_row;
-    const uint32_t extra = Wt % cores_per_row;
     for (uint32_t i = 0; i < num_cores; ++i) {
         const uint32_t tile_row = i / cores_per_row;
         const uint32_t worker = i % cores_per_row;
-        const uint32_t count = base + (worker < extra ? 1 : 0);
-        const uint32_t first = worker * base + std::min(worker, extra);
+        // Data rows of this tile row: the last tile row of a [..., H, W] batch
+        // holds H's remainder.
+        const uint32_t rows = (tile_row % Ht == Ht - 1 && H % TILE_HEIGHT != 0) ? H % TILE_HEIGHT : TILE_HEIGHT;
+        const uint32_t stride = stride_of(rows, in_tile_bytes / (TILE_HEIGHT * TILE_WIDTH));
+        const uint32_t pack = pack_of(stride);
+        // The row's dense tiles split evenly over its cores, the first ones one
+        // dense tile longer; only the row's last dense tile can be partial.
+        const uint32_t dense_tiles = (Wt + pack - 1) / pack;
+        const uint32_t base = dense_tiles / cores_per_row;
+        const uint32_t extra = dense_tiles % cores_per_row;
+        const uint32_t dense_count = base + (worker < extra ? 1 : 0);
+        const uint32_t dense_first = worker * base + std::min(worker, extra);
+        const uint32_t first = dense_first * pack;
+        const uint32_t count = dense_count == 0 ? 0 : std::min(dense_count * pack, Wt - first);
         for (auto* run_args : {&reader_run_args, &writer_run_args, &compute_run_args}) {
             AddRuntimeArgsForNode(
                 run_args->runtime_arg_values,
@@ -160,8 +176,13 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
                 {{"tile_row", tile_row},
                  {"first_tile", tile_row * Wt + first},
                  {"num_tiles", count},
-                 {"partial_tile", tile_row * cores_per_row + worker},
-                 {"has_last", first + count == Wt ? 1u : 0u}});
+                 {"rows", rows},
+                 {"stride", stride},
+                 {"pack", pack},
+                 {"has_last", count != 0 && first + count == Wt ? 1u : 0u},
+                 {"out_tile", tile_row * partial_tiles_per_row},
+                 {"col", 4 * worker},
+                 {"last_worker", worker + 1 == cores_per_row ? 1u : 0u}});
         }
     }
     ProgramSpec spec{
