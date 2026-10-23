@@ -659,7 +659,6 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_unsigned_pad_value.patch",
         "//third_party/tt_xla:tt_mlir_conv_window_reversal.patch",
         "//third_party/tt_xla:tt_mlir_pool_pad_fusion.patch",
-        "//third_party/tt_xla:tt_mlir_case_selector_in_outlined_program.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

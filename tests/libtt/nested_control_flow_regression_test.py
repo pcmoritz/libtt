@@ -12,7 +12,15 @@ program that reads it but not in its sibling, and a case whose branch programs
 disagree gets no layout conversions on its inputs at all; a selector argument
 of an outlined program now stays on device like its siblings' and the runtime
 reads it from there. SGLang-JAX's sampler hits all of these at temperature > 0.
+
+Under tracing, a predicate forwarded unchanged to a nested conditional selects
+the replayed trace like a top-level predicate does: it stays on host and joins
+the trace key, so a trace is captured per combination of predicate values. A
+nested predicate that a branch computes on device cannot select a trace, so
+tracing rejects it at compile time.
 """
+
+import itertools
 
 import jax
 import jax.numpy as jnp
@@ -52,7 +60,8 @@ def test_counted_loop_inside_conditional(trace):
         np.testing.assert_array_equal(np.asarray(result), SOURCE + 1 if predicate else looped)
 
 
-def test_nested_conditional():
+@pytest.mark.parametrize("trace", [False, True])
+def test_nested_conditional(trace):
     # cumsum lowers to a reduce_window, whose initial value has to stay a
     # constant two conditionals deep.
     def run(outer, inner, x):
@@ -63,7 +72,7 @@ def test_nested_conditional():
             x,
         )
 
-    run = _jit(run, trace=False)
+    run = _jit(run, trace)
     x = _put(SOURCE)
     for outer, inner in [(False, False), (False, True), (True, False), (True, True)] * 2:
         expected = SOURCE + 1 if outer else (SOURCE * 2 if inner else np.cumsum(SOURCE, axis=-1))
@@ -71,13 +80,14 @@ def test_nested_conditional():
         np.testing.assert_array_equal(np.asarray(result), expected)
 
 
-def test_doubly_nested_conditional():
+@pytest.mark.parametrize("trace", [False, True])
+def test_doubly_nested_conditional(trace):
     def run(outer, first, second, x):
         innermost = lambda v: jax.lax.cond(second, lambda w: w * 2, lambda w: w - 1, v)
         middle = lambda v: jax.lax.cond(first, lambda w: w + 3, innermost, v)
         return jax.lax.cond(outer, lambda v: v + 1, middle, x)
 
-    run = _jit(run, trace=False)
+    run = _jit(run, trace)
     x = _put(SOURCE)
     for outer, first, second in [(False, False, True), (False, False, False), (True, False, True),
                                  (False, True, False), (False, False, True)] * 2:
@@ -88,4 +98,34 @@ def test_doubly_nested_conditional():
             expected = SOURCE + 3
         else:
             expected = SOURCE * 2 if second else SOURCE - 1
+        np.testing.assert_array_equal(np.asarray(result), expected)
+
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+@pytest.mark.parametrize("trace", [False, True])
+def test_nested_predicate_computed_in_a_branch(trace, depth):
+    # The predicate at `depth` combines two forwarded flags instead of being
+    # forwarded itself. Without trace the runtime reads it back from device. A
+    # trace capture cannot, so tracing rejects the program when it compiles.
+    def run(outer, first, second, x):
+        computed = lambda v: jax.lax.cond(first ^ second, lambda w: w * 2, lambda w: w - 1, v)
+        middle = lambda v: jax.lax.cond(first, lambda w: w + 3, computed, v)
+        return jax.lax.cond(outer, lambda v: v + 1, middle if depth == 2 else computed, x)
+
+    run = _jit(run, trace)
+    x = _put(SOURCE)
+    if trace:
+        message = "host-resident scalar CaseOp selector; a case nested in a branch program"
+        with pytest.raises(jax.errors.JaxRuntimeError, match=message):
+            run(_put(False), _put(False), _put(True), x)
+        return
+    for outer, first, second in itertools.product([False, True], repeat=3):
+        result = run(_put(outer), _put(first), _put(second), x)
+        if outer:
+            expected = SOURCE + 1
+        elif depth == 2 and first:
+            expected = SOURCE + 3
+        else:
+            expected = SOURCE * 2 if first != second else SOURCE - 1
         np.testing.assert_array_equal(np.asarray(result), expected)

@@ -496,6 +496,72 @@ static SmallVector<func::FuncOp> getCaseBranches(ttcore::CaseOp caseOp) {
   return branches;
 }
 
+// Collects the selectors `caseOp` depends on, in the scope of `caseOp`: its
+// own index, and the selectors of the cases nested in its branch programs,
+// mapped back to the operand of `caseOp` that the branch program receives
+// them through. A nested selector that a branch program computes cannot be
+// mapped back and is collected as the value inside the branch program, so a
+// caller that needs selectors it can inspect (the trace hoist) rejects it.
+void collectCaseSelectors(ttcore::CaseOp caseOp,
+                          SmallVectorImpl<Value> &selectors) {
+  selectors.push_back(caseOp.getIndex());
+  for (func::FuncOp branch : getCaseBranches(caseOp)) {
+    branch.walk([&](ttcore::CaseOp nested) {
+      SmallVector<Value> nestedSelectors;
+      collectCaseSelectors(nested, nestedSelectors);
+      for (Value selector : nestedSelectors) {
+        auto argument = dyn_cast<BlockArgument>(selector);
+        if (argument && argument.getOwner() == &branch.front()) {
+          selectors.push_back(caseOp.getInputs()[argument.getArgNumber()]);
+        } else {
+          selectors.push_back(selector);
+        }
+      }
+    });
+  }
+}
+
+static bool selectsCase(ttcore::CaseOp caseOp, Value value) {
+  SmallVector<Value> selectors;
+  collectCaseSelectors(caseOp, selectors);
+  return llvm::is_contained(selectors, value);
+}
+
+// Whether a program argument is a case selector, which the runtime reads on
+// host: a case in the program depends on it, directly or through the cases
+// nested in its branch programs, or the case that calls this outlined program
+// does. The latter keeps the branch programs of one case in agreement, since
+// they share a signature.
+bool isCaseSelectorArgument(BlockArgument argument) {
+  auto type = dyn_cast<RankedTensorType>(argument.getType());
+  if (!type || type.getNumElements() != 1) {
+    return false;
+  }
+  auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
+  if (!function) {
+    return false;
+  }
+  WalkResult walk = function.walk([&](ttcore::CaseOp caseOp) {
+    return selectsCase(caseOp, argument) ? WalkResult::interrupt()
+                                         : WalkResult::advance();
+  });
+  if (walk.wasInterrupted()) {
+    return true;
+  }
+  auto module = function->getParentOfType<ModuleOp>();
+  if (!module || !function.isPrivate()) {
+    return false;
+  }
+  std::optional<SymbolTable::UseRange> uses =
+      SymbolTable::getSymbolUses(function, module);
+  unsigned index = argument.getArgNumber();
+  return uses && llvm::any_of(*uses, [&](const SymbolTable::SymbolUse &use) {
+           auto caseOp = dyn_cast<ttcore::CaseOp>(use.getUser());
+           return caseOp && index < caseOp.getInputs().size() &&
+                  selectsCase(caseOp, caseOp.getInputs()[index]);
+         });
+}
+
 namespace {
 class OptimizationBarrierLayoutPattern
     : public OpRewritePattern<ttcore::OptimizationBarrierOp> {

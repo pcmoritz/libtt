@@ -29,7 +29,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/trace.fbs b/include/ttmlir/Ta
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
-@@ -6311,6 +6311,22 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
+@@ -6311,6 +6311,22 @@
    auto opInputs = this->getInputs();
    auto opSemaphoreInputs = this->getSemaphoreInputs();
    auto opOutputs = this->getResults();
@@ -52,7 +52,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
  
    // An input already on device acts as its own persistent slot and is handed
    // to the allocation program, while an input in system memory is staged into
-@@ -6475,7 +6491,7 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
+@@ -6475,7 +6491,7 @@
                              "into the output slot arguments";
    }
  
@@ -61,7 +61,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
      auto tensorType = ::mlir::dyn_cast<RankedTensorType>(arg.getType());
      if (!tensorType) {
        if (::mlir::isa<ttnn::GlobalSemaphoreType>(arg.getType())) {
-@@ -6484,10 +6500,11 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
+@@ -6484,10 +6500,11 @@
        return emitOpError() << "All input arguments of trace function must be "
                             << "ranked tensors or global semaphores";
      }
@@ -76,13 +76,15 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
      }
    }
  
-@@ -6533,6 +6550,14 @@ CaptureOrExecuteTraceOp::partitionInputIndices() {
+@@ -6533,6 +6550,16 @@
                auto tensorType =
                    ::mlir::cast<RankedTensorType>(operand.getType());
                if (!utils::isTensorOnDevice(tensorType)) {
++                // A trace key stays on host: it selects a case branch,
++                // directly or forwarded to a case nested in a branch program.
 +                auto blockArg = mlir::dyn_cast<BlockArgument>(operand);
 +                auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(op);
-+                if (blockArg && caseOp && operand == caseOp.getIndex() &&
++                if (blockArg && caseOp &&
 +                    blockArg.getOwner() == &traceFuncOp.getBody().front() &&
 +                    llvm::is_contained(getTraceKeyInputIndices(),
 +                                       blockArg.getArgNumber())) {
@@ -94,21 +96,43 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-@@ -710,6 +710,10 @@ private:
-       if (mlir::isa<ttir::MeshShardOp>(user)) {
-         return true;
+@@ -22,6 +22,7 @@
+ 
+ namespace mlir::tt::ttnn {
+ void populateControlFlowLayoutPatterns(RewritePatternSet &patterns);
++bool isCaseSelectorArgument(BlockArgument argument);
+ 
+ #define GEN_PASS_DEF_TTNNLAYOUT
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
+@@ -712,6 +713,14 @@
        }
-+      if (auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(user);
-+          caseOp && caseOp.getIndex() == arg) {
-+        return true;
-+      }
      }
  
++    // The runtime reads case selectors on host, including selectors forwarded
++    // to cases nested in branch programs. The branch programs of one case
++    // share a signature, so an argument that selects in any of them is kept
++    // on host in all of them.
++    if (isCaseSelectorArgument(arg)) {
++      return true;
++    }
++
      return false;
+   }
+ 
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -317,6 +317,9 @@ private:
+@@ -20,6 +20,9 @@
+ #include <atomic>
+ 
+ namespace mlir::tt::ttnn {
++void collectCaseSelectors(ttcore::CaseOp caseOp,
++                          llvm::SmallVectorImpl<mlir::Value> &selectors);
++
+ #define GEN_PASS_DEF_TTNNTRACEHOISTTRANSFORM
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
+ 
+@@ -317,6 +320,9 @@
      llvm::SmallVector<mlir::Type> outputSlotTypes;
      // Types of the trailing semaphore arguments.
      llvm::SmallVector<mlir::Type> semaphoreTypes;
@@ -118,7 +142,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
  
      // Contiguous views over the two halves of the tensor-input partition.
      auto deviceResidentIndices() const {
-@@ -337,6 +340,9 @@ private:
+@@ -337,6 +343,9 @@
        return llvm::ArrayRef<mlir::DictionaryAttr>(inputArgAttrs)
            .take_front(numDeviceResident);
      }
@@ -128,13 +152,15 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
    };
  
    // Creates the trace-main function and returns the TraceMainFuncInfo
-@@ -379,6 +385,34 @@ private:
+@@ -379,6 +388,46 @@
              [&](mlir::Value input) { return isDeviceResidentValue(input); }) -
          inputs.begin();
  
-+    // A trace captures one fixed command sequence. Case selectors that come
-+    // from host scalar inputs therefore form part of the trace cache key. A
-+    // device-computed selector cannot be inspected without synchronizing, so
++    // A trace captures one fixed command sequence. The selectors a case
++    // depends on, including those of the cases nested in its branch programs,
++    // therefore have to be host scalar inputs of the trace, and they form
++    // part of the trace cache key. A selector computed on the device, or
++    // inside a branch program, cannot be inspected without synchronizing, so
 +    // reject that shape instead of silently replaying the wrong branch.
 +    llvm::SmallVector<int32_t> traceKeyInputIndices;
 +    for (Operation *op : opsToHoist) {
@@ -142,28 +168,38 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +      if (!caseOp) {
 +        continue;
 +      }
-+      mlir::Value selector = caseOp.getIndex();
-+      auto selectorType = mlir::dyn_cast<RankedTensorType>(selector.getType());
-+      if (!selectorType ||
-+          selectorType.getNumElements() != 1 ||
-+          utils::isTensorOnDevice(selectorType)) {
-+        return caseOp.emitError(
-+            "tracing requires a host-resident scalar CaseOp selector");
-+      }
-+      auto it = llvm::find(inputs, selector);
-+      size_t inputIndex = std::distance(inputs.begin(), it);
-+      if (it == inputs.end() || inputIndex >= numTensorInputs) {
-+        return funcOp.emitError("trace CaseOp selector is not a boundary input");
-+      }
-+      if (!llvm::is_contained(traceKeyInputIndices, inputIndex)) {
-+        traceKeyInputIndices.push_back(static_cast<int32_t>(inputIndex));
++      llvm::SmallVector<mlir::Value> selectors;
++      collectCaseSelectors(caseOp, selectors);
++      for (mlir::Value selector : selectors) {
++        auto selectorType =
++            mlir::dyn_cast<RankedTensorType>(selector.getType());
++        if (selector.getParentRegion() != &funcOp.getBody()) {
++          return caseOp.emitError("tracing requires a host-resident scalar "
++                                  "CaseOp selector; a case nested in a branch "
++                                  "program of this case selects on a value "
++                                  "the branch program computes");
++        }
++        if (!selectorType || selectorType.getNumElements() != 1 ||
++            utils::isTensorOnDevice(selectorType)) {
++          return caseOp.emitError(
++              "tracing requires a host-resident scalar CaseOp selector");
++        }
++        auto it = llvm::find(inputs, selector);
++        size_t inputIndex = std::distance(inputs.begin(), it);
++        if (it == inputs.end() || inputIndex >= numTensorInputs) {
++          return funcOp.emitError(
++              "trace CaseOp selector is not a boundary input");
++        }
++        if (!llvm::is_contained(traceKeyInputIndices, inputIndex)) {
++          traceKeyInputIndices.push_back(static_cast<int32_t>(inputIndex));
++        }
 +      }
 +    }
 +
      for (mlir::Value output : outputs) {
        outputTypes.push_back(output.getType());
      }
-@@ -481,12 +515,22 @@ private:
+@@ -481,12 +530,22 @@
      info.traceFunc = traceFuncOp;
      info.numTensorInputs = numTensorInputs;
      info.numDeviceResident = numDeviceResident;
@@ -186,7 +222,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
        } else {
          info.inputSlotTypes.push_back(utils::RankedTensorTypeFactory::create(
              tensorType, BufferType::DRAM));
-@@ -654,18 +698,21 @@ private:
+@@ -654,18 +713,21 @@
        traceOutputSlots.push_back(captureFunc.getArgument(outputSlotBase + i));
      }
  
@@ -213,7 +249,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
      llvm::append_range(traceCallArgs, traceOutputSlots);
      for (size_t i = 0; i < info.semaphoreTypes.size(); i++) {
        traceCallArgs.push_back(captureFunc.getArgument(semaphoreBase + i));
-@@ -935,7 +982,9 @@ private:
+@@ -935,7 +997,9 @@
      auto traceOp = builder.create<ttnn::CaptureOrExecuteTraceOp>(
          funcOp.getLoc(), info.outputSlotTypes, device,
          allocateSlotsTraceSymbolAttr, captureTraceSymbolAttr,
@@ -224,7 +260,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
  
      // Replace uses of original outputs with the output of the trace op function
      for (size_t i = 0; i < info.boundaryOutputs.size(); i++) {
-@@ -1035,8 +1084,8 @@ private:
+@@ -1035,8 +1099,8 @@
    }
  
    mlir::LogicalResult processFuncOp(func::FuncOp funcOp) {
