@@ -185,20 +185,24 @@ def test_nested_predicate_computed_in_a_branch(trace, depth):
 def test_predicate_computed_from_data(trace, tmp_path):
     # A predicate computed on device splits the function into a trace before
     # the conditional, the eager conditional whose branches hold their own
-    # traces, and a trace after it.
+    # traces, and a trace after it. The offsets put the sum on both sides of
+    # zero, so both branches run.
     def run(x):
-        y = jnp.sin(x) * 3 + 1
+        y = jnp.sin(x) * 3 + x
         z = jax.lax.cond(jnp.sum(y) > 0, lambda v: jnp.cos(v) + 1, lambda v: v * v - 1, y)
         return jnp.exp(z / 8) + 2
 
     run = _jit(run, trace, tmp_path)
-    for scale in (1.0, -1.0, 1.0, 1.0, -1.0):
-        x = SOURCE * scale
-        y = np.sin(x) * 3 + 1
+    taken = set()
+    for offset in (1.0, -1.0, 1.0, 1.0, -1.0):
+        x = SOURCE + offset
+        y = np.sin(x) * 3 + x
+        taken.add(bool(y.sum() > 0))
         z = np.cos(y) + 1 if y.sum() > 0 else y * y - 1
         expected = np.exp(z / 8) + 2
         result = run(_put(x))
         np.testing.assert_allclose(np.asarray(result), expected, rtol=1e-2, atol=1e-2)
+    assert taken == {True, False}
     if trace:
         traces, cases = _ops_per_function(tmp_path)
         assert cases["main"] == 1
@@ -246,3 +250,22 @@ def test_selector_also_used_as_data(trace):
         result = run(_put(predicate), x)
         expected = SOURCE + 2 if predicate else SOURCE - 1
         np.testing.assert_array_equal(np.asarray(result), expected)
+
+
+@pytest.mark.parametrize("trace", [False, True])
+def test_loop_carries_the_previous_value(trace):
+    # The body forwards the value it computed the previous iteration: after
+    # the first iteration `a` is the trace's output, and the next replay
+    # must not overwrite it while `b` still refers to it.
+    def run(count, x):
+        a, b = jax.lax.fori_loop(0, count, lambda i, s: (s[0] + s[1], s[0]), (x, x * 2))
+        return a - b
+
+    run = _jit(run, trace)
+    x = _put(SOURCE)
+    for count in (3, 1, 4, 0, 2):
+        a, b = SOURCE, SOURCE * 2
+        for _ in range(count):
+            a, b = a + b, a
+        result = run(_put(np.int32(count)), x)
+        np.testing.assert_array_equal(np.asarray(result), a - b)
