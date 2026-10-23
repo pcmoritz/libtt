@@ -106,6 +106,8 @@ def main() -> int:
         help="Runfile in the root of the torch_tpu repository.",
     )
     parser.add_argument("--jax-plugin-wheel", required=True)
+    parser.add_argument("--local-test", action="append", default=[],
+                        help="Additional libtt test runfile; repeatable.")
     parser.add_argument(
         "--absl-flag",
         action="append",
@@ -140,6 +142,8 @@ def main() -> int:
     selections = [arg for arg in rest if (root / arg.split("::")[0]).exists()]
     pytest_args = [arg for arg in rest if arg not in selections]
     targets = _select(root, selections, args.exclude)
+    for path in args.local_test:
+        targets[str(_rlocation(path).resolve(strict=True))] = []
 
     tmp = Path(os.environ.get("TEST_TMPDIR") or tempfile.mkdtemp())
     out = Path(os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR") or tmp / "outputs")

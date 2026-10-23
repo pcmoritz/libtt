@@ -1,0 +1,683 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -5791,6 +5791,25 @@
+   let hasVerifier = 1;
+ }
+ 
++def TTIR_RngBitGeneratorOp : TTIR_NamedOp<"rng_bit_generator"> {
++  let summary = "Counter-based random bits from a state.";
++  let description = [{
++    stablehlo.rng_bit_generator with a state of two uint64 values represented
++    as uint32[2, 2] low/high pairs. For low words w0, w1 and high words h0, h1,
++    element i of `output` is the first word of Threefry-2x32-20 with counter
++    (i, w1) and key Threefry((w0, h0), (h1, 0x1BD11BDA)), or with `philox`,
++    Philox-4x32-10 with key (w0, h0) and counter (i, w1, 0, h1).
++    `output_state` increments the second uint64 element by one modulo 2^64.
++    `output` contains uint32 words.
++  }];
++
++  let arguments = (ins AnyRankedTensor:$initial_state,
++                       DefaultValuedAttr<BoolAttr, "false">:$philox);
++
++  let results = (outs AnyRankedTensor:$output_state,
++                      AnyRankedTensor:$output);
++}
++
+ def TTIR_DropoutOp : TTIR_Op<"dropout", [TTCore_NonCacheableTrait]> {
+   let summary = "Dropout operation.";
+   let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -3749,6 +3749,31 @@ def TTNN_RandOp : TTNN_CreationOp<"rand", [TTCore_NonCacheableTrait]> {
+   let hasVerifier = 1;
+ }
+ 
++def TTNN_RngBitGeneratorOp : TTNN_Op<"rng_bit_generator", [OpModelExempt]> {
++    let summary = "Counter-based random bits from a state.";
++    let description = [{
++      ttnn::experimental::rng_bits: see ttir.rng_bit_generator. The kernels
++      read the state on the device. The state and both results are tiled.
++    }];
++
++    let arguments = (ins AnyRankedTensor:$initial_state,
++                         DefaultValuedAttr<BoolAttr, "false">:$philox);
++
++    let results = (outs AnyRankedTensor:$output_state,
++                        AnyRankedTensor:$output);
++
++    let extraClassDeclaration = [{
++      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
++        wa::TTNNOperandWorkarounds tile;
++        tile.tensorLayoutWorkaround = Layout::Tile;
++        return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
++            .addInputOperandWorkaround(tile)
++            .addOutputOperandWorkaround(tile)
++            .addOutputOperandWorkaround(tile);
++      }
++    }];
++}
++
+ def TTNN_DropoutOp : TTNN_Op<"dropout", [TTCore_NonCacheableTrait]> {
+   let summary = "Dropout operation.";
+   let description = [{
+diff --git a/include/ttmlir/Target/TTNN/operations/rand.fbs b/include/ttmlir/Target/TTNN/operations/rand.fbs
+--- a/include/ttmlir/Target/TTNN/operations/rand.fbs
++++ b/include/ttmlir/Target/TTNN/operations/rand.fbs
+@@ -14,3 +14,12 @@ table RandOp {
+   memcfg: tt.target.ttnn.MemoryConfig;
+   out: tt.target.ttnn.TensorRef;
+ }
++
++// ttnn::experimental::rng_bits: the bits of `out` drawn from the state on the
++// device (see ttir.rng_bit_generator).
++table RngBitGeneratorOp {
++  initial_state: tt.target.ttnn.TensorRef;
++  philox: bool;
++  output_state: tt.target.ttnn.TensorRef;
++  out: tt.target.ttnn.TensorRef;
++}
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -140,6 +140,7 @@ union OpType {
+   PrepareConvTranspose2dBiasOp,
+   PrepareConvTranspose2dWeightsOp,
+   RandOp,
++  RngBitGeneratorOp,
+   ReductionArgMaxOp,
+   ReductionOp,
+   ReductionProdOp,
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -9849,56 +9849,6 @@
+ } // namespace
+ 
+ namespace {
+-class StableHLOToTTIRRngBitGeneratorOpConversionPattern
+-    : public OpConversionPattern<mlir::stablehlo::RngBitGeneratorOp> {
+-  using OpConversionPattern<
+-      mlir::stablehlo::RngBitGeneratorOp>::OpConversionPattern;
+-
+-public:
+-  LogicalResult
+-  matchAndRewrite(mlir::stablehlo::RngBitGeneratorOp srcOp,
+-                  mlir::stablehlo::RngBitGeneratorOp::Adaptor adaptor,
+-                  ConversionPatternRewriter &rewriter) const override {
+-    auto outputType = mlir::cast<RankedTensorType>(
+-        getTypeConverter()->convertType(srcOp.getOutput().getType()));
+-
+-    llvm::SmallVector<int32_t> size(outputType.getShape());
+-
+-    auto floatElementType = rewriter.getF32Type();
+-    auto floatOutputType = mlir::RankedTensorType::get(
+-        outputType.getShape(), floatElementType, outputType.getEncoding());
+-
+-    // Use min and max unsigned int value to cover most of the range of uint32.
+-    auto fromFloat = rewriter.getF32FloatAttr(
+-        static_cast<float>(std::numeric_limits<unsigned int>::min()));
+-    auto toFloat = rewriter.getF32FloatAttr(
+-        static_cast<float>(std::numeric_limits<unsigned int>::max()));
+-
+-    // Seed set to 0 is a special case that is equivalent to no seed.
+-    // Using any other value would make every flatbuffer run deterministic.
+-    auto seed = rewriter.getUI32IntegerAttr(0);
+-
+-    auto randOp = rewriter.create<mlir::tt::ttir::RandOp>(
+-        srcOp.getLoc(), floatOutputType, rewriter.getI32ArrayAttr(size),
+-        fromFloat, toFloat, seed);
+-
+-    // TODO (pglusac): Change to bit cast once we support it or remove if
+-    // rand starts supporting uint32.
+-    // See https://github.com/tenstorrent/tt-mlir/issues/5078
+-    auto typecastOp = rewriter.create<mlir::tt::ttir::TypecastOp>(
+-        srcOp.getLoc(), outputType, randOp.getResult());
+-
+-    // HACK (pglusac): Output state is discarded, initial state is returned as
+-    // a result. https://github.com/tenstorrent/tt-mlir/issues/5101
+-    rewriter.replaceOp(srcOp,
+-                       {adaptor.getInitialState(), typecastOp.getResult()});
+-
+-    return success();
+-  }
+-};
+-} // namespace
+-
+-namespace {
+ // This pattern recognizes and converts stablehlo.custom_call @tt.fill_cache
+ // to ttir.fill_cache.
+ class StableHLOFillCacheConversionPattern
+@@ -12329,14 +12279,6 @@
+   patterns.add<StableHLOToTTIRRngOpConversionPattern>(typeConverter, ctx);
+ }
+
+-static void
+-addRngBitGeneratorOpConversionPattern(MLIRContext *ctx,
+-                                      RewritePatternSet &patterns,
+-                                      TypeConverter &typeConverter) {
+-  patterns.add<StableHLOToTTIRRngBitGeneratorOpConversionPattern>(typeConverter,
+-                                                                  ctx);
+-}
+-
+ static void addErfOpConversionPattern(MLIRContext *ctx,
+                                       RewritePatternSet &patterns,
+                                       TypeConverter &typeConverter) {
+@@ -13256,7 +13198,6 @@
+   addSelectAndScatterOpConversionPatterns(ctx, patterns, typeConverter);
+   addBatchNormOpConversionPattern(ctx, patterns, typeConverter);
+   addRngOpConversionPattern(ctx, patterns, typeConverter);
+-  addRngBitGeneratorOpConversionPattern(ctx, patterns, typeConverter);
+   addErfOpConversionPattern(ctx, patterns, typeConverter);
+   addAsinhOpConversionPattern(ctx, patterns, typeConverter);
+   addSortOpConversionPattern(ctx, patterns, typeConverter);
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -594,6 +594,28 @@ public:
+ };
+ } // namespace
+ 
++namespace {
++class RngBitGeneratorOpConversionPattern
++    : public OpConversionPattern<ttir::RngBitGeneratorOp> {
++public:
++  using OpConversionPattern<ttir::RngBitGeneratorOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(ttir::RngBitGeneratorOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    SmallVector<Type> resultTypes;
++    if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
++                                                      resultTypes))) {
++      return failure();
++    }
++    rewriter.replaceOpWithNewOp<ttnn::RngBitGeneratorOp>(
++        op, resultTypes[0], resultTypes[1], adaptor.getInitialState(),
++        adaptor.getPhilox());
++    return success();
++  }
++};
++} // namespace
++
+ namespace {
+ template <typename TTIROpTy, typename TTNNOpTy>
+ class ClampOpConversionPattern : public OpConversionPattern<TTIROpTy> {
+@@ -4191,6 +4213,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            FillCacheOpConversionPattern,
+            RowsGatherOpConversionPattern,
+            RowsScatterOpConversionPattern,
++           RngBitGeneratorOpConversionPattern,
+            PermuteOpConversionPattern,
+            UpsampleOpConversionPattern,
+            AllToAllOpConversionPattern,
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+@@ -651,6 +651,7 @@ const std::set<mlir::StringRef>
+         ttnn::ScatterOp::getOperationName(),
+         ttnn::RowsGatherOp::getOperationName(),
+         ttnn::RowsScatterOp::getOperationName(),
++        ttnn::RngBitGeneratorOp::getOperationName(),
+         ttnn::ConcatOp::getOperationName(),
+         // ttnn clamp TT_FATALs on uint8/uint16 inputs; its operands
+         // workaround clamps them as int32.
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -3278,6 +3278,18 @@ createRandOp(FlatbufferObjectCache &cache, RandOp op) {
+       seed, dtype, layout, memoryConfig, out);
+ }
+ 
++::flatbuffers::Offset<::tt::target::ttnn::RngBitGeneratorOp>
++createRngBitGeneratorOp(FlatbufferObjectCache &cache, RngBitGeneratorOp op) {
++  auto state = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getInitialState()));
++  auto outputState = cache.getOrCreateNoSharding(
++      op.getOutputState(), tensorValueToFlatbuffer, /*local_shape*/ std::nullopt);
++  auto out = cache.getOrCreateNoSharding(
++      op.getOutput(), tensorValueToFlatbuffer, /*local_shape*/ std::nullopt);
++  return ::tt::target::ttnn::CreateRngBitGeneratorOp(
++      *cache.fbb, state, op.getPhilox(), outputState, out);
++}
++
+ ::flatbuffers::Offset<::tt::target::ttnn::DropoutOp>
+ createDropoutOp(FlatbufferObjectCache &cache, DropoutOp op) {
+   auto in = cache.at<::tt::target::ttnn::TensorRef>(
+@@ -5554,6 +5566,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createRandOp(cache, randOp), debugString,
+                            locInfo);
+   }
++  if (auto rngOp = dyn_cast<RngBitGeneratorOp>(op); rngOp) {
++    return createOperation(cache, createRngBitGeneratorOp(cache, rngOp),
++                           debugString, locInfo);
++  }
+   if (auto dropoutOp = dyn_cast<DropoutOp>(op); dropoutOp) {
+     return createOperation(cache, createDropoutOp(cache, dropoutOp),
+                            debugString, locInfo);
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -101,6 +101,7 @@
+ #include "operations/pool/pool2d.h"
+ #include "operations/pool/upsample.h"
+ #include "operations/rand/rand.h"
++#include "operations/rand/rng_bit_generator.h"
+ #include "operations/reduction/argmax.h"
+ #include "operations/reduction/cumprod.h"
+ #include "operations/reduction/cumulative.h"
+@@ -504,6 +505,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+   case ::tt::target::ttnn::OpType::RandOp: {
+     return operations::rand::run(op->type_as_RandOp(), getContext());
+   }
++  case ::tt::target::ttnn::OpType::RngBitGeneratorOp: {
++    return operations::rand::run(op->type_as_RngBitGeneratorOp(),
++                                 getContext());
++  }
+   case ::tt::target::ttnn::OpType::ReshapeOp: {
+     return operations::data_movement::run(op->type_as_ReshapeOp(),
+                                           getContext());
+diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+@@ -5,6 +5,7 @@
+ #include <limits>
+ #include <utility>
+ 
++#include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
+ #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h"
+ #include "ttmlir/Dialect/StableHLO/Utils/Utils.h"
+ 
+@@ -23,6 +24,7 @@
+ 
+ namespace mlir::tt::stablehlo {
+ #define GEN_PASS_DEF_STABLEHLOCOMPLEXDATATYPECONVERSIONPASS
++#define GEN_PASS_DEF_STABLEHLOUINT64DATATYPECONVERSIONPASS
+ #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h.inc"
+ static bool hasComplexElementType(Type type) {
+   auto tensorType = mlir::dyn_cast<RankedTensorType>(type);
+@@ -1105,15 +1107,14 @@
+ // annotation needs an extra dimension entry: closed, unsharded.
+ // Example: tensor<16x16xcomplex<f32>> with sharding [{}, {}]
+ //       -> tensor<16x16x2xf32>       with sharding [{}, {}, {}]
+-static mlir::sdy::TensorShardingPerValueAttr
+-convertShardingsForComplexTypes(MLIRContext *ctx,
+-                                mlir::sdy::TensorShardingPerValueAttr shardings,
+-                                TypeRange originalTypes) {
++static mlir::sdy::TensorShardingPerValueAttr convertShardingsForComplexTypes(
++    MLIRContext *ctx, mlir::sdy::TensorShardingPerValueAttr shardings,
++    TypeRange originalTypes, const TypeConverter &converter) {
+   SmallVector<mlir::sdy::TensorShardingAttr> newShardings;
+   for (auto [sharding, type] :
+        llvm::zip_equal(shardings.getShardings(), originalTypes)) {
+     auto rtt = mlir::dyn_cast<RankedTensorType>(type);
+-    if (rtt && mlir::isa<ComplexType>(rtt.getElementType())) {
++    if (rtt && converter.convertType(rtt) != rtt) {
+       // Append "{}" to sharding spec
+       SmallVector<mlir::sdy::DimensionShardingAttr> dims(
+           sharding.getDimShardings().begin(), sharding.getDimShardings().end());
+@@ -1159,9 +1160,11 @@
+     }
+ 
+     auto newInShardings = convertShardingsForComplexTypes(
+-        op.getContext(), op.getInShardings(), op.getBody().getArgumentTypes());
++        op.getContext(), op.getInShardings(), op.getBody().getArgumentTypes(),
++        *getTypeConverter());
+     auto newOutShardings = convertShardingsForComplexTypes(
+-        op.getContext(), op.getOutShardings(), op.getResultTypes());
++        op.getContext(), op.getOutShardings(), op.getResultTypes(),
++        *getTypeConverter());
+ 
+     // Build via OperationState so no implicit block is auto-created;
+     // we then inline the original region and convert its block arg types.
+@@ -1342,4 +1345,273 @@
+   }
+ };
+ } // namespace
++
++// uint64 RNG state uses the same trailing pair dimension as complex values.
++// Keep buffers, constants, data movement and addition exact; other arithmetic
++// retains the existing low-word behavior through conversion materializations.
++namespace {
++bool isUInt64(Type type) {
++  auto tensor = dyn_cast<RankedTensorType>(type);
++  return tensor && tensor.getElementType().isUnsignedInteger(64);
++}
++
++Value uint32Constant(Location loc, RankedTensorType type, uint32_t value,
++                     OpBuilder &builder) {
++  return builder.create<mlir::stablehlo::ConstantOp>(
++      loc, DenseElementsAttr::get(type, APInt(32, value)));
++}
++
++class UInt64ConstantPattern
++    : public OpConversionPattern<mlir::stablehlo::ConstantOp> {
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::ConstantOp op, OpAdaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto type =
++        cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
++    SmallVector<APInt> words;
++    for (APInt value :
++         cast<DenseElementsAttr>(op.getValue()).getValues<APInt>()) {
++      words.push_back(value.trunc(32));
++      words.push_back(value.lshr(32).trunc(32));
++    }
++    rewriter.replaceOpWithNewOp<mlir::stablehlo::ConstantOp>(
++        op, DenseElementsAttr::get(type, words));
++    return success();
++  }
++};
++
++class UInt64AddPattern : public OpConversionPattern<mlir::stablehlo::AddOp> {
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::AddOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto [a, ah] = unpackRealImag(op.getLoc(), adaptor.getLhs(), rewriter);
++    auto [b, bh] = unpackRealImag(op.getLoc(), adaptor.getRhs(), rewriter);
++    auto type = cast<RankedTensorType>(a.getType());
++    Value lo = rewriter.create<mlir::stablehlo::AddOp>(op.getLoc(), a, b);
++    // The sign bit of (a & b) | ((a | b) & ~sum) is the unsigned carry.
++    // Use integer bitwise ops so this does not depend on uint32 comparisons.
++    Value ab = rewriter.create<mlir::stablehlo::AndOp>(op.getLoc(), a, b);
++    Value either = rewriter.create<mlir::stablehlo::OrOp>(op.getLoc(), a, b);
++    Value inverted = rewriter.create<mlir::stablehlo::NotOp>(op.getLoc(), lo);
++    Value carry =
++        rewriter.create<mlir::stablehlo::AndOp>(op.getLoc(), either, inverted);
++    carry = rewriter.create<mlir::stablehlo::OrOp>(op.getLoc(), ab, carry);
++    carry = rewriter.create<mlir::stablehlo::ShiftRightLogicalOp>(
++        op.getLoc(), carry, uint32Constant(op.getLoc(), type, 31, rewriter));
++    Value hi = rewriter.create<mlir::stablehlo::AddOp>(op.getLoc(), ah, bh);
++    hi = rewriter.create<mlir::stablehlo::AddOp>(op.getLoc(), hi, carry);
++    rewriter.replaceOp(op, packRealImag(op.getLoc(), lo, hi, rewriter));
++    return success();
++  }
++};
++
++class UInt64DynamicUpdateSlicePattern
++    : public OpConversionPattern<mlir::stablehlo::DynamicUpdateSliceOp> {
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::DynamicUpdateSliceOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    // A uint64 start index keeps its low word, as uint64 values do outside
++    // the converted operations. Only uint64 data gains the pair dimension and
++    // its zero start index.
++    SmallVector<Value> indices;
++    for (auto [index, converted] :
++         llvm::zip_equal(op.getStartIndices(), adaptor.getStartIndices())) {
++      indices.push_back(isUInt64(index.getType())
++                            ? unpackRealImag(op.getLoc(), converted, rewriter)
++                                  .first
++                            : converted);
++    }
++    if (isUInt64(op.getOperand().getType())) {
++      auto indexType = indices.empty()
++                           ? RankedTensorType::get({}, rewriter.getI64Type())
++                           : cast<RankedTensorType>(indices.front().getType());
++      indices.push_back(rewriter.create<mlir::stablehlo::ConstantOp>(
++          op.getLoc(), DenseElementsAttr::get(
++                           indexType, rewriter.getIntegerAttr(
++                                          indexType.getElementType(), 0))));
++    }
++    rewriter.replaceOpWithNewOp<mlir::stablehlo::DynamicUpdateSliceOp>(
++        op, adaptor.getOperand(), adaptor.getUpdate(), indices);
++    return success();
++  }
++};
++
++// A width-changing bitcast already describes the low/high word layout.
++class UInt64BitcastPattern
++    : public OpConversionPattern<mlir::stablehlo::BitcastConvertOp> {
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::BitcastConvertOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto type = getTypeConverter()->convertType(op.getType());
++    if (adaptor.getOperand().getType() != type) {
++      return failure();
++    }
++    rewriter.replaceOp(op, adaptor.getOperand());
++    return success();
++  }
++};
++
++class UInt64RngPattern
++    : public OpConversionPattern<mlir::stablehlo::RngBitGeneratorOp> {
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::RngBitGeneratorOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto stateType = cast<RankedTensorType>(op.getInitialState().getType());
++    auto outType = cast<RankedTensorType>(op.getOutput().getType());
++    auto elementType = dyn_cast<IntegerType>(outType.getElementType());
++    if (!stateType.hasStaticShape() || !outType.hasStaticShape()) {
++      return op.emitOpError("with a dynamic shape isn't supported");
++    }
++    // Two words fill the key and the counter beside the element index. A
++    // third word could only change the bits by aliasing another state.
++    if (!isUInt64(stateType) || stateType.getRank() != 1 ||
++        stateType.getDimSize(0) != 2) {
++      return op.emitOpError("needs a state of two unsigned 64-bit integers");
++    }
++    if (!elementType || !elementType.isUnsigned() ||
++        elementType.getWidth() > 64) {
++      return op.emitOpError(
++                 "generates unsigned integers of up to 64 bits, not ")
++             << outType.getElementType();
++    }
++    if (outType.getNumElements() >= (int64_t{1} << 32)) {
++      return op.emitOpError("generates fewer than 2^32 elements");
++    }
++    Value state = adaptor.getInitialState();
++    Value bits;
++    if (outType.getNumElements() == 0) {
++      auto type =
++          cast<RankedTensorType>(getTypeConverter()->convertType(outType));
++      bits = rewriter.create<mlir::stablehlo::ConstantOp>(
++          op.getLoc(), DenseElementsAttr::get(type, ArrayRef<APInt>{}));
++    } else {
++      SmallVector<int64_t> shape(outType.getShape());
++      if (shape.empty())
++        shape.push_back(1);
++      auto bitsType =
++          RankedTensorType::get(shape, rewriter.getIntegerType(32, false));
++      auto rng = rewriter.create<ttir::RngBitGeneratorOp>(
++          op.getLoc(), state.getType(), bitsType, state,
++          rewriter.getBoolAttr(op.getRngAlgorithm() ==
++                               mlir::stablehlo::RngAlgorithm::PHILOX));
++      state = rng.getOutputState();
++      bits = rng.getOutput();
++      if (outType.getRank() == 0) {
++        bits = rewriter.create<mlir::stablehlo::ReshapeOp>(
++            op.getLoc(), RankedTensorType::get({}, bitsType.getElementType()),
++            bits);
++      }
++      if (elementType.getWidth() == 64) {
++        bits = packRealImag(
++            op.getLoc(), bits,
++            uint32Constant(op.getLoc(), cast<RankedTensorType>(bits.getType()),
++                           0, rewriter),
++            rewriter);
++      } else if (elementType.getWidth() < 32) {
++        bits = rewriter.create<mlir::stablehlo::ConvertOp>(op.getLoc(), outType,
++                                                           bits);
++      }
++    }
++    rewriter.replaceOp(op, {state, bits});
++    return success();
++  }
++};
++
++struct StableHLOUInt64DataTypeConversionPass
++    : public impl::StableHLOUInt64DataTypeConversionPassBase<
++          StableHLOUInt64DataTypeConversionPass> {
++  void runOnOperation() override {
++    TypeConverter converter;
++    converter.addConversion([](Type type) { return type; });
++    converter.addConversion([](RankedTensorType type) -> std::optional<Type> {
++      if (!isUInt64(type))
++        return std::nullopt;
++      SmallVector<int64_t> shape(type.getShape());
++      shape.push_back(2);
++      return RankedTensorType::get(
++          shape,
++          IntegerType::get(type.getContext(), 32, IntegerType::Unsigned));
++    });
++    // Unsupported uint64 operations still use the existing 32-bit lowering.
++    converter.addSourceMaterialization(
++        [](OpBuilder &b, Type type, ValueRange inputs, Location loc) -> Value {
++          if (!isUInt64(type) || inputs.size() != 1)
++            return {};
++          return b.create<mlir::stablehlo::ConvertOp>(
++              loc, type, unpackRealImag(loc, inputs[0], b).first);
++        });
++    converter.addTargetMaterialization(
++        [](OpBuilder &b, Type type, ValueRange inputs, Location loc) -> Value {
++          if (inputs.size() != 1 || !isUInt64(inputs[0].getType()))
++            return {};
++          auto inputType = cast<RankedTensorType>(inputs[0].getType());
++          auto lowType = inputType.clone(b.getIntegerType(32, false));
++          Value lo =
++              b.create<mlir::stablehlo::ConvertOp>(loc, lowType, inputs[0]);
++          return packRealImag(loc, lo, uint32Constant(loc, lowType, 0, b), b);
++        });
++    ConversionTarget target(getContext());
++    target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
++    auto legal = [&](Operation *op) { return converter.isLegal(op); };
++    target.addDynamicallyLegalOp<
++        mlir::stablehlo::ConstantOp, mlir::stablehlo::AddOp,
++        mlir::stablehlo::ReshapeOp, mlir::stablehlo::SliceOp,
++        mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
++        mlir::stablehlo::TransposeOp, mlir::stablehlo::SelectOp,
++        mlir::stablehlo::DynamicUpdateSliceOp, mlir::stablehlo::AllGatherOp,
++        mlir::stablehlo::AllToAllOp, mlir::stablehlo::CollectivePermuteOp,
++        mlir::stablehlo::CompositeOp>(legal);
++    target.addIllegalOp<mlir::stablehlo::RngBitGeneratorOp>();
++    target.addDynamicallyLegalOp<mlir::stablehlo::BitcastConvertOp>(
++        [&](mlir::stablehlo::BitcastConvertOp op) {
++          // Only the bitcasts between uint64 and its two uint32 words are
++          // exact.
++          return converter.convertType(op.getOperand().getType()) !=
++                     converter.convertType(op.getType()) ||
++                 legal(op);
++        });
++    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
++      return converter.isSignatureLegal(op.getFunctionType()) &&
++             converter.isLegal(&op.getBody());
++    });
++    target.addDynamicallyLegalOp<func::ReturnOp, func::CallOp,
++                                 mlir::sdy::ReturnOp>(legal);
++    target.addDynamicallyLegalOp<mlir::sdy::ManualComputationOp>(
++        [&](mlir::sdy::ManualComputationOp op) {
++          return legal(op) && converter.isLegal(&op.getBody());
++        });
++    RewritePatternSet patterns(&getContext());
++    patterns.add<
++        UInt64ConstantPattern, UInt64AddPattern, UInt64RngPattern,
++        UInt64DynamicUpdateSlicePattern, UInt64BitcastPattern,
++        ComplexTypeDefaultConversionPattern<mlir::stablehlo::ReshapeOp>,
++        ComplexTypeDefaultConversionPattern<mlir::stablehlo::ConcatenateOp>,
++        ComplexSliceOpConversionPattern,
++        ComplexBroadcastInDimOpConversionPattern,
++        ComplexTransposeOpConversionPattern, ComplexSelectOpConversionPattern,
++        // Shardy's collectives and reshard composites only move data. A
++        // composite's decomposition is converted with the other functions.
++        ComplexPassthroughConversionPattern<mlir::stablehlo::AllGatherOp>,
++        ComplexPassthroughConversionPattern<mlir::stablehlo::AllToAllOp>,
++        ComplexPassthroughConversionPattern<
++            mlir::stablehlo::CollectivePermuteOp>,
++        ComplexPassthroughConversionPattern<mlir::stablehlo::CompositeOp>,
++        ShardyManualComputationComplexConversionPattern,
++        ShardyReturnOpTypeConversionPattern>(converter, &getContext());
++    populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(patterns,
++                                                                   converter);
++    populateReturnOpTypeConversionPattern(patterns, converter);
++    populateCallOpTypeConversionPattern(patterns, converter);
++    if (failed(applyPartialConversion(getOperation(), target,
++                                      std::move(patterns))))
++      signalPassFailure();
++  }
++};
++} // namespace
++
+ } // namespace mlir::tt::stablehlo
+diff --git a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td b/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
+--- a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
++++ b/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
+@@ -34,6 +34,13 @@
+   let dependentDialects = ["mlir::func::FuncDialect",
+                            "::mlir::stablehlo::StablehloDialect",
+                            "::mlir::sdy::SdyDialect"];
++}
++
++def StableHLOUInt64DataTypeConversionPass : Pass<"stablehlo-uint64-data-type-conversion", "::mlir::ModuleOp"> {
++  let summary = "Preserve uint64 RNG state as low/high uint32 pairs.";
++  let dependentDialects = ["::mlir::func::FuncDialect",
++                          "::mlir::stablehlo::StablehloDialect",
++                          "::mlir::tt::ttir::TTIRDialect"];
+ }
+ 
+ def RegisterCustomShardingRulePass : Pass<"register-custom-sharding-rule", "::mlir::ModuleOp">
+diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+--- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
++++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+@@ -77,6 +77,7 @@
+   pm.addPass(::mlir::stablehlo::createStablehloComplexMathExpanderPass());
+   pm.addPass(
+       mlir::tt::stablehlo::createStableHLOComplexDataTypeConversionPass());
++  pm.addPass(mlir::tt::stablehlo::createStableHLOUInt64DataTypeConversionPass());
+ 
+   pm.addPass(createLegalizeStableHLOCompositeToTTIRPass());
+   if (options.legalizeCompositeToCallEnabled) {
+diff --git a/lib/Dialect/StableHLO/Transforms/ReplicateNonSplittableValues.cpp b/lib/Dialect/StableHLO/Transforms/ReplicateNonSplittableValues.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ReplicateNonSplittableValues.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ReplicateNonSplittableValues.cpp
+@@ -5,6 +5,7 @@
+ #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h"
+ #include "ttmlir/Dialect/StableHLO/Utils/ShardyUtils.h"
+ 
++#include "shardy/dialect/sdy/ir/utils.h"
+ #include "stablehlo/dialect/StablehloOps.h"
+ 
+ namespace mlir::tt::stablehlo {
+@@ -28,6 +29,10 @@
+ // shard_id*local + 0..local-1. To avoid that, we also replicate such iotas here
+ // so the full global iota is materialized and Shardy inserts a reshard that
+ // slices out the correct local range per shard.
++//
++// `stablehlo.rng_bit_generator` draws each output element from the state and
++// the element's index, so a sharded output has the iota problem: every shard
++// would repeat the first shard's bits. Its results are replicated too.
+ class ReplicateNonSplittableValuesPass
+     : public impl::ReplicateNonSplittableValuesPassBase<
+           ReplicateNonSplittableValuesPass> {
+@@ -147,6 +152,25 @@
+           iotaOp, context, globalMeshOp.getSymName(), oldType.getRank());
+     });
+ 
++    rootModule.walk([&](mlir::stablehlo::RngBitGeneratorOp rngOp) {
++      auto shardings =
++          rngOp->getAttrOfType<mlir::sdy::TensorShardingPerValueAttr>(
++              mlir::sdy::TensorShardingAttr::name);
++      if (!shardings ||
++          llvm::all_of(shardings.getShardings(),
++                       [&](mlir::sdy::TensorShardingAttr sharding) {
++                         return shardy_utils::isFullyReplicatedTensor(
++                             sharding, globalMeshOp);
++                       })) {
++        return;
++      }
++      rngOp->setAttr(mlir::sdy::TensorShardingAttr::name,
++                     mlir::sdy::TensorShardingPerValueAttr::get(
++                         context, mlir::sdy::getFullyClosedShardings(
++                                      context, rngOp->getResultTypes(),
++                                      globalMeshOp.getSymName())));
++    });
++
+     rootModule.walk([&](mlir::stablehlo::SliceOp sliceOp) {
+       mlir::sdy::TensorShardingAttr sharding =
+           shardy_utils::getFirstSharding(sliceOp);
