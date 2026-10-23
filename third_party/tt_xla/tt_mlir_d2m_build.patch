@@ -100,18 +100,101 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp
 --- a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp
 +++ b/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp
-@@ -1615,6 +1615,14 @@
-       return failure();
+@@ -22,6 +22,7 @@
+ #include "mlir/Dialect/MemRef/IR/MemRef.h"
+ #include "mlir/Dialect/SCF/IR/SCF.h"
+ #include "mlir/IR/Builders.h"
++#include "mlir/Dialect/Utils/StaticValueUtils.h"
+ #include "mlir/IR/BuiltinTypes.h"
+ #include "mlir/IR/MLIRContext.h"
+ #include "mlir/IR/Operation.h"
+@@ -1198,6 +1199,9 @@
+       auto cb = getCB(rewriter, op.getInput());
+       auto dstIdx = getDstIdxFromResult(op.getResult());
+       ensureDominatesInsertionPoint(rewriter, dstIdx);
++      // An Int32 buffer broadcasts through unpack-to-dest exactly; what
++      // truncated integers was the FPU binary op after it (see
++      // emitIntegerBinaryDestReuse).
+       rewriter.create<ttkernel::UnaryBcastInitOp>(op->getLoc(), cb, cb,
+                                                   bcastType);
+       rewriter.create<ttkernel::UnaryBcastTileOp>(
+@@ -1629,6 +1633,17 @@
+       return emitFPUTiles(rewriter, op, adaptor, loc);
      }
  
-+    // The FPU carries about 19 bits of a 32-bit integer: integer tiles take
-+    // the SFPU path, which has exact int32 add, subtract and multiply.
-+    if (llvm::isa<IntegerType>(
-+            mlir::cast<ttcore::TileType>(op.getLhs().getType())
-+                .getElementType())) {
-+      return failure();
++    // The FPU's dest-reuse path carries about 19 bits of a 32-bit integer:
++    // integer tiles copy the CB operand into DST and use the int32 SFPU op.
++    if constexpr (hasMapping<ConcreteOp, IntComputeOpMap>) {
++      if (llvm::isa<IntegerType>(
++              mlir::cast<ttcore::TileType>(op.getLhs().getType())
++                  .getElementType())) {
++        return emitIntegerBinaryDestReuse(rewriter, op, adaptor, loc,
++                                          lhsFromDst);
++      }
 +    }
 +
-     auto loc = op->getLoc();
-     bool lhsFromDst = operandFromDst(op.getLhs());
-     bool rhsFromDst = operandFromDst(op.getRhs());
+     if (lhsFromDst) {
+       // LHS from Dst, RHS from Cb (FPU - DEST_TO_SRCA)
+       return emitFPUBinaryDestReuse(rewriter, op, adaptor, loc,
+@@ -1731,6 +1746,61 @@
+       rewriter.create<IntSFPUOp>(loc, dst0, dst1, dst0, dtype);
+     } else {
+       rewriter.create<IntSFPUOp>(loc, dst0, dst1, dst0);
++    }
++
++    rewriter.eraseOp(op);
++    return success();
++  }
++
++  // Integer binary with one operand already in DST (a broadcast, say): the
++  // CB operand is copied into the result's DST slot, or the next one when the
++  // DST operand lives there, and the int32 SFPU op writes the result.
++  LogicalResult emitIntegerBinaryDestReuse(ConversionPatternRewriter &rewriter,
++                                           ConcreteOp op,
++                                           typename ConcreteOp::Adaptor adaptor,
++                                           Location loc,
++                                           bool lhsFromDst) const {
++    using IntPair = TTKernelOpPair<ConcreteOp, IntComputeOpMap>;
++    using IntInit = typename IntPair::first_type;
++    using IntSFPUOp = typename IntPair::second_type;
++
++    Value cb = getCB(rewriter, lhsFromDst ? op.getRhs() : op.getLhs());
++    Value cbTileIdx = lhsFromDst ? adaptor.getRhs() : adaptor.getLhs();
++    Value dstOperandIdx = lhsFromDst ? adaptor.getLhs() : adaptor.getRhs();
++    auto outCB = getOutCB(rewriter, op);
++    auto dstIdx = getDstIdxFromResult(op.getResult());
++    ensureDominatesInsertionPoint(rewriter, dstIdx);
++
++    auto insertionPoint = rewriter.getInsertionPoint();
++    setInsertionPointAfterOperands(rewriter, {cb, outCB},
++                                   /*allowHoisting*/ true);
++    rewriter.create<ttkernel::InitSFPUOp>(loc, cb, outCB);
++    rewriter.setInsertionPoint(insertionPoint->getBlock(), insertionPoint);
++
++    Value scratch = dstIdx;
++    std::optional<int64_t> dstConst = mlir::getConstantIntValue(dstIdx);
++    std::optional<int64_t> operandConst =
++        mlir::getConstantIntValue(dstOperandIdx);
++    if (!dstConst || !operandConst || *dstConst == *operandConst) {
++      scratch = index(rewriter, loc, dstConst ? *dstConst + 1 : 1);
++    }
++
++    rewriter.create<ttkernel::CopyTileInitOp>(loc, cb);
++    rewriter.create<ttkernel::CopyTileOp>(loc, cb, cbTileIdx, scratch);
++
++    const auto dtype =
++        mlir::cast<ttcore::TileType>(op.getLhs().getType()).getDataType();
++    if constexpr (needsDtypeArg<IntInit>) {
++      rewriter.create<IntInit>(loc, dtype);
++    } else {
++      rewriter.create<IntInit>(loc);
++    }
++    Value lhsIdx = lhsFromDst ? dstOperandIdx : scratch;
++    Value rhsIdx = lhsFromDst ? scratch : dstOperandIdx;
++    if constexpr (needsDtypeArg<IntSFPUOp>) {
++      rewriter.create<IntSFPUOp>(loc, lhsIdx, rhsIdx, dstIdx, dtype);
++    } else {
++      rewriter.create<IntSFPUOp>(loc, lhsIdx, rhsIdx, dstIdx);
+     }
+ 
+     rewriter.eraseOp(op);
