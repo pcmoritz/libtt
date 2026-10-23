@@ -1,0 +1,23 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/StableHLOFusing.cpp b/lib/Dialect/StableHLO/Transforms/StableHLOFusing.cpp
+--- a/lib/Dialect/StableHLO/Transforms/StableHLOFusing.cpp
++++ b/lib/Dialect/StableHLO/Transforms/StableHLOFusing.cpp
+@@ -9,6 +9,11 @@
+ #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h"
+ #include "ttmlir/Dialect/StableHLO/Utils/ShardyUtils.h"
+ 
++namespace mlir::tt {
++// Defined in libtt's tt_mlir/lib/Dialect/StableHLO/Transforms/WideReductions.cpp.
++void populateWideReductionPatterns(RewritePatternSet &patterns);
++} // namespace mlir::tt
++
+ namespace mlir::tt::stablehlo {
+ #define GEN_PASS_DEF_STABLEHLOFUSINGPASS
+ #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h.inc"
+@@ -432,6 +437,7 @@
+     patterns.add<ConcatenateToBroadcastInDimFusionPattern>(&getContext());
+     patterns.add<ReshapeGatherFusionPattern>(&getContext());
+     patterns.add<CollapseRowScatterPattern>(&getContext());
++    mlir::tt::populateWideReductionPatterns(patterns);
+ 
+     GreedyRewriteConfig config;
+     config.setUseTopDownTraversal(true);
