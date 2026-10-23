@@ -10,6 +10,7 @@
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/experimental/metal2_host_api/program_run_args.hpp>
 #include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
+#include <tt-metalium/experimental/metal2_host_api/semaphore_spec.hpp>
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
 
@@ -35,7 +36,7 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     const MaskedReduceParams& params, const MaskedReduceInputs& tensor_args, std::vector<Tensor>& outputs) {
     const auto& input = tensor_args.input.mesh_tensor();
     const auto& threshold = tensor_args.threshold.mesh_tensor();
-    const auto& partials = outputs.at(0).mesh_tensor();
+    const auto& output = outputs.at(0).mesh_tensor();
     const auto& device = input.device();
 
     const uint32_t tile_rows = masked_reduce_tile_rows(tensor_args.input);
@@ -44,8 +45,10 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     const uint32_t Wt = input.padded_shape()[-1] / TILE_WIDTH;
     const uint32_t cores_per_row = params.cores_per_row;
     const uint32_t num_cores = tile_rows * cores_per_row;
+    // The partials a tile row's cores send to its master core: a 16-byte slot
+    // per core and row, in partial_tiles FP32 tiles of the master's L1.
     const uint32_t partial_cols = masked_reduce_partial_columns(cores_per_row);
-    const uint32_t partial_tiles_per_row = partial_cols / TILE_WIDTH;
+    const uint32_t partial_tiles = partial_cols / TILE_WIDTH;
     const auto grid = device.compute_with_storage_grid_size();
     TT_FATAL(num_cores <= grid.x * grid.y, "masked_reduce: {} cores do not fit the grid", num_cores);
     const auto cores = tt::tt_metal::corerange_to_cores(
@@ -70,9 +73,11 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     const DFBSpecName IN_DFB{"in"};
     const DFBSpecName T_DFB{"t"};
     const DFBSpecName OUT_DFB{"out"};
+    const DFBSpecName PART_DFB{"part"};
+    const SemaphoreSpecName DONE_SEM{"done"};
     const TensorParamName INPUT{"input"};
     const TensorParamName THRESHOLD{"threshold"};
-    const TensorParamName PARTIALS{"partials"};
+    const TensorParamName OUTPUT{"output"};
     Group<DataflowBufferSpec> dataflow_buffers = {
         {.unique_id = IN_DFB,
          .entry_size = in_tile_bytes,
@@ -83,9 +88,26 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
          .entry_size = f32_tile_bytes,
          .num_entries = 1,
          .data_format_metadata = tt::DataFormat::Float32},
+        {.unique_id = PART_DFB,
+         .entry_size = f32_tile_bytes,
+         .num_entries = partial_tiles,
+         .data_format_metadata = tt::DataFormat::Float32},
     };
+    // Every core counts the row's partials that arrived at its master.
+    Group<SemaphoreSpec> semaphores = {{.unique_id = DONE_SEM, .target_nodes = all_cores}};
     const std::vector<std::string> runtime_arg_names = {
-        "tile_row", "first_tile", "num_tiles", "rows", "stride", "pack", "has_last", "out_tile", "col", "last_worker"};
+        "tile_row",
+        "first_tile",
+        "num_tiles",
+        "rows",
+        "stride",
+        "pack",
+        "has_last",
+        "col",
+        "is_master",
+        "master_x",
+        "master_y",
+        "remote_workers"};
     const std::string kernel_dir = "ttnn/cpp/ttnn/operations/experimental/masked_reduce/device/kernels/";
     KernelSpec reader{
         .unique_id = READER,
@@ -111,9 +133,11 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
         .dfb_bindings =
             {
                 DFBBinding{.dfb_spec_name = OUT_DFB, .accessor_name = "out", .endpoint_type = DFBEndpointType::CONSUMER},
+                DFBBinding{.dfb_spec_name = PART_DFB, .accessor_name = "part", .endpoint_type = DFBEndpointType::PRODUCER},
             },
-        .tensor_bindings = {TensorBinding{.tensor_parameter_name = PARTIALS, .accessor_name = "partials"}},
-        .compile_time_args = {{"cols", partial_cols}},
+        .semaphore_bindings = {SemaphoreBinding{.semaphore_spec_name = DONE_SEM, .accessor_name = "done"}},
+        .tensor_bindings = {TensorBinding{.tensor_parameter_name = OUTPUT, .accessor_name = "output"}},
+        .compile_time_args = {{"cols", partial_cols}, {"partial_tiles", partial_tiles}},
         .runtime_arg_schema = {.runtime_arg_names = runtime_arg_names},
         .hw_config = ttnn::create_writer_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
@@ -129,7 +153,11 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
         unpack_modes(compute_hw) = {
             {IN_DFB, tt::tt_metal::UnpackMode::UnpackToDest},
             {T_DFB, tt::tt_metal::UnpackMode::UnpackToDest},
+            {PART_DFB, tt::tt_metal::UnpackMode::UnpackToDest},
         };
+    } else {
+        // The partials are FP32 whatever the input: sum them exactly.
+        unpack_modes(compute_hw) = {{PART_DFB, tt::tt_metal::UnpackMode::UnpackToDest}};
     }
     KernelSpec compute{
         .unique_id = COMPUTE,
@@ -140,11 +168,13 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
                 DFBBinding{.dfb_spec_name = IN_DFB, .accessor_name = "in", .endpoint_type = DFBEndpointType::CONSUMER},
                 DFBBinding{.dfb_spec_name = T_DFB, .accessor_name = "t", .endpoint_type = DFBEndpointType::CONSUMER},
                 DFBBinding{.dfb_spec_name = OUT_DFB, .accessor_name = "out", .endpoint_type = DFBEndpointType::PRODUCER},
+                DFBBinding{.dfb_spec_name = PART_DFB, .accessor_name = "part", .endpoint_type = DFBEndpointType::CONSUMER},
             },
         .compile_time_args =
             {{"compare", static_cast<uint32_t>(params.compare)},
              {"mode", static_cast<uint32_t>(params.mode)},
-             {"last_valid", last_valid}},
+             {"last_valid", last_valid},
+             {"partial_tiles", partial_tiles}},
         .runtime_arg_schema = {.runtime_arg_names = runtime_arg_names},
         .hw_config = compute_hw,
     };
@@ -155,6 +185,8 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     for (uint32_t i = 0; i < num_cores; ++i) {
         const uint32_t tile_row = i / cores_per_row;
         const uint32_t worker = i % cores_per_row;
+        // The row's first core gathers the partials and writes the result.
+        const auto master = device.worker_core_from_logical_core(cores[tile_row * cores_per_row]);
         // Data rows of this tile row: the last tile row of a [..., H, W] batch
         // holds H's remainder.
         const uint32_t rows = (tile_row % Ht == Ht - 1 && H % TILE_HEIGHT != 0) ? H % TILE_HEIGHT : TILE_HEIGHT;
@@ -180,20 +212,23 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
                  {"stride", stride},
                  {"pack", pack},
                  {"has_last", count != 0 && first + count == Wt ? 1u : 0u},
-                 {"out_tile", tile_row * partial_tiles_per_row},
                  {"col", 4 * worker},
-                 {"last_worker", worker + 1 == cores_per_row ? 1u : 0u}});
+                 {"is_master", worker == 0 ? 1u : 0u},
+                 {"master_x", static_cast<uint32_t>(master.x)},
+                 {"master_y", static_cast<uint32_t>(master.y)},
+                 {"remote_workers", cores_per_row - 1}});
         }
     }
     ProgramSpec spec{
         .name = "masked_reduce",
         .kernels = {std::move(reader), std::move(writer), std::move(compute)},
         .dataflow_buffers = std::move(dataflow_buffers),
+        .semaphores = std::move(semaphores),
         .tensor_parameters =
             {
                 TensorParameter{.unique_id = INPUT, .spec = input.tensor_spec()},
                 TensorParameter{.unique_id = THRESHOLD, .spec = threshold.tensor_spec()},
-                TensorParameter{.unique_id = PARTIALS, .spec = partials.tensor_spec()},
+                TensorParameter{.unique_id = OUTPUT, .spec = output.tensor_spec()},
             },
         .work_units = {{.name = "main", .kernels = {READER, WRITER, COMPUTE}, .target_nodes = all_cores}},
     };
@@ -201,7 +236,7 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     run_args.kernel_run_args.push_back(std::move(reader_run_args));
     run_args.kernel_run_args.push_back(std::move(writer_run_args));
     run_args.kernel_run_args.push_back(std::move(compute_run_args));
-    run_args.tensor_args = {{INPUT, input}, {THRESHOLD, threshold}, {PARTIALS, partials}};
+    run_args.tensor_args = {{INPUT, input}, {THRESHOLD, threshold}, {OUTPUT, output}};
     return ttnn::device_operation::ProgramArtifacts{.spec = std::move(spec), .run_params = std::move(run_args)};
 }
 

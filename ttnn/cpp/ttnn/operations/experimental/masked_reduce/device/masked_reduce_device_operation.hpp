@@ -14,7 +14,7 @@ namespace ttnn::experimental::prim {
 struct MaskedReduceParams {
     MaskedCompare compare = MaskedCompare::GT;
     MaskedMode mode = MaskedMode::Count;
-    // Cores that share a tile row; the partials output is [..., H, masked_reduce_partial_columns(cores_per_row)].
+    // Cores that share a tile row.
     uint32_t cores_per_row = 0;
     tt::tt_metal::MemoryConfig output_mem_config;
 };
@@ -24,7 +24,8 @@ struct MaskedReduceInputs {
     Tensor threshold;
 };
 
-// The partials: per tile row and core, the core's row sums in column 4 * core (kernels/).
+// The result, [..., H, 1] FP32: each tile row's cores send their row sums to
+// the row's first core, which adds them up (kernels/).
 struct MaskedReduceProgramFactory {
     static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
         const MaskedReduceParams&, const MaskedReduceInputs&, std::vector<Tensor>&);
@@ -46,7 +47,7 @@ struct MaskedReduceOperation {
 // Tile rows of the input over all its leading dimensions.
 uint32_t masked_reduce_tile_rows(const Tensor& input);
 
-// Width of the partials for a tile row shared by cores_per_row cores.
+// Columns of the partials a tile row's master core gathers from cores_per_row cores.
 uint32_t masked_reduce_partial_columns(uint32_t cores_per_row);
 
 }  // namespace ttnn::experimental::prim

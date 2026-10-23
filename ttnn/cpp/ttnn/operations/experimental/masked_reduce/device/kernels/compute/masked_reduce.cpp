@@ -11,7 +11,9 @@
 // columns: those lanes of its mask are zeroed. The whole run accumulates in one
 // DST tile within one register acquire; at the end each row of the
 // accumulator is summed into its column 16, and the tile is packed once for
-// the writer.
+// the writer. A tile row's master core then adds up the partial tiles the
+// row's cores sent (their row sums in 16-byte slots, see the writer), sums
+// each row of the total into its column 16 and packs it for the writer.
 //
 // SFPU lane layout (fp32 DST): vector d (0..7) of a face holds, in lane l
 // (0..31), the face's element at row 4 * (d / 2) + l / 8, column
@@ -23,6 +25,7 @@
 #include "api/compute/eltwise_unary/comp.h"
 #include "api/compute/eltwise_unary/where.h"
 #include "api/compute/pack.h"
+#include "api/compute/reconfig_data_format.h"
 #include "api/compute/tile_move_copy.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "experimental/kernel_args.h"
@@ -184,13 +187,16 @@ void kernel_main() {
     const uint32_t stride = get_arg(args::stride);
     const uint32_t pack = get_arg(args::pack);
     const uint32_t has_last = get_arg(args::has_last);
+    const uint32_t is_master = get_arg(args::is_master);
     constexpr uint32_t compare = get_arg(args::compare);
     constexpr uint32_t mode = get_arg(args::mode);
     constexpr uint32_t last_valid = get_arg(args::last_valid);
+    constexpr uint32_t partial_tiles = get_arg(args::partial_tiles);
 
     DataflowBuffer in_dfb(dfb::in);
     DataflowBuffer t_dfb(dfb::t);
     DataflowBuffer out_dfb(dfb::out);
+    DataflowBuffer part_dfb(dfb::part);
 
     compute_kernel_hw_startup(dfb::in, dfb::t, dfb::out);
     copy_init(dfb::in);
@@ -243,6 +249,32 @@ void kernel_main() {
             add_binary_tile(dst_acc, dst_mask, dst_acc);
         }
     }
+    custom_sfpu_init();
+    MATH((mr::sum_rows(dst_acc)));
+    tile_regs_commit();
+
+    out_dfb.reserve_back(1);
+    tile_regs_wait();
+    pack_tile(dst_acc, dfb::out);
+    tile_regs_release();
+    out_dfb.push_back(1);
+    if (!is_master) {
+        return;
+    }
+
+    // The row's partials, FP32 tiles added exactly on the SFPU.
+    part_dfb.wait_front(partial_tiles);
+    tile_regs_acquire();
+    // The partials are FP32 whatever the input: switch the unpacker over.
+    reconfig_data_format_srca(dfb::in, dfb::part);
+    copy_init(dfb::part);
+    copy_tile(dfb::part, 0, dst_acc);
+    add_binary_tile_init();
+    for (uint32_t i = 1; i < partial_tiles; ++i) {
+        copy_tile(dfb::part, i, dst_x);
+        add_binary_tile(dst_acc, dst_x, dst_acc);
+    }
+    part_dfb.pop_front(partial_tiles);
     custom_sfpu_init();
     MATH((mr::sum_rows(dst_acc)));
     tile_regs_commit();

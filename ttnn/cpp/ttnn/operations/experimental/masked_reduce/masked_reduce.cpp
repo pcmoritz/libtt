@@ -7,7 +7,6 @@
 #include <tt-metalium/constants.hpp>
 #include "ttnn/device_operation.hpp"
 #include "ttnn/operations/experimental/masked_reduce/device/masked_reduce_device_operation.hpp"
-#include "ttnn/operations/reduction/generic/generic_reductions.hpp"
 
 namespace ttnn::experimental {
 
@@ -29,8 +28,7 @@ ttnn::Tensor masked_reduce(
         .cores_per_row = std::max(1u, std::min(cores / tile_rows, Wt)),
         .output_mem_config = memory_config.value_or(input.memory_config())};
     prim::MaskedReduceInputs inputs{.input = input, .threshold = threshold};
-    ttnn::Tensor partials = ttnn::device_operation::launch<Op>(params, inputs)[0];
-    return ttnn::sum(partials, /*dim=*/-1, /*keepdim=*/true, params.output_mem_config);
+    return ttnn::device_operation::launch<Op>(params, inputs)[0];
 }
 
 }  // namespace ttnn::experimental
