@@ -263,7 +263,8 @@ def test_bits_are_balanced(algorithm, dtype, width):
 
 
 @pytest.mark.parametrize("algorithm", ALGORITHMS)
-def test_sharded_output_matches_unsharded(algorithm):
+@pytest.mark.parametrize("dtype", [np.uint32, np.uint64])
+def test_sharded_output_matches_unsharded(algorithm, dtype):
     """Each device draws the whole output and keeps its shard, as XLA does by
     default. Drawing only the shard repeated the first shard on every device:
     a device sees its shard's local element indices."""
@@ -276,13 +277,30 @@ def test_sharded_output_matches_unsharded(algorithm):
     shape = (32 * len(devices), 40)
     with jax.enable_x64(True):
         draw = jax.jit(
-            lambda s: jax.lax.rng_bit_generator(s, shape, jnp.uint32, algorithm=ALGORITHMS[algorithm]),
+            lambda s: jax.lax.rng_bit_generator(s, shape, dtype, algorithm=ALGORITHMS[algorithm]),
             out_shardings=(replicated, NamedSharding(mesh, P("x"))),
         )
         new, values = draw(jax.device_put(jnp.asarray(old), replicated))
         new, values = np.asarray(new), np.asarray(values)
-    np.testing.assert_array_equal(values.ravel(), expected(algorithm, old, values.size))
+    np.testing.assert_array_equal(values.ravel(), expected(algorithm, old, values.size).astype(dtype))
     np.testing.assert_array_equal(new, advanced(old, values.size))
+
+
+@pytest.mark.parametrize("to_sharded", [True, False])
+def test_uint64_reshards(to_sharded):
+    """Shardy's collectives and reshard composites move uint64 values as
+    low/high pairs: slicing a replicated value didn't compile, and gathering
+    shards lost the high words."""
+    devices = jax.devices("tt")
+    if len(devices) < 2:
+        pytest.skip("needs at least two devices")
+    mesh = jax.make_mesh((len(devices),), ("x",), devices=devices)
+    replicated, rows = NamedSharding(mesh, P()), NamedSharding(mesh, P("x"))
+    source, target = (replicated, rows) if to_sharded else (rows, replicated)
+    x = (np.arange(32 * len(devices) * 8, dtype=np.uint64) * (2**32 + 7)).reshape(-1, 8)
+    with jax.enable_x64(True):
+        doubled = jax.jit(lambda a: a + a, in_shardings=source, out_shardings=target)(jax.device_put(x, source))
+        np.testing.assert_array_equal(np.asarray(doubled), x + x)
 
 
 def test_empty_output_keeps_the_state():

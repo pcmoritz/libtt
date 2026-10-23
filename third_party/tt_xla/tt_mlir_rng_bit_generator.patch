@@ -331,7 +331,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
  
      // Build via OperationState so no implicit block is auto-created;
      // we then inline the original region and convert its block arg types.
-@@ -1342,4 +1345,250 @@
+@@ -1342,4 +1345,259 @@
    }
  };
  } // namespace
@@ -539,7 +539,9 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +        mlir::stablehlo::ReshapeOp, mlir::stablehlo::SliceOp,
 +        mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
 +        mlir::stablehlo::TransposeOp, mlir::stablehlo::SelectOp,
-+        mlir::stablehlo::DynamicUpdateSliceOp>(legal);
++        mlir::stablehlo::DynamicUpdateSliceOp, mlir::stablehlo::AllGatherOp,
++        mlir::stablehlo::AllToAllOp, mlir::stablehlo::CollectivePermuteOp,
++        mlir::stablehlo::CompositeOp>(legal);
 +    target.addIllegalOp<mlir::stablehlo::RngBitGeneratorOp>();
 +    target.addDynamicallyLegalOp<mlir::stablehlo::BitcastConvertOp>(
 +        [&](mlir::stablehlo::BitcastConvertOp op) {
@@ -568,6 +570,13 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +        ComplexSliceOpConversionPattern,
 +        ComplexBroadcastInDimOpConversionPattern,
 +        ComplexTransposeOpConversionPattern, ComplexSelectOpConversionPattern,
++        // Shardy's collectives and reshard composites only move data. A
++        // composite's decomposition is converted with the other functions.
++        ComplexPassthroughConversionPattern<mlir::stablehlo::AllGatherOp>,
++        ComplexPassthroughConversionPattern<mlir::stablehlo::AllToAllOp>,
++        ComplexPassthroughConversionPattern<
++            mlir::stablehlo::CollectivePermuteOp>,
++        ComplexPassthroughConversionPattern<mlir::stablehlo::CompositeOp>,
 +        ShardyManualComputationComplexConversionPattern,
 +        ShardyReturnOpTypeConversionPattern>(converter, &getContext());
 +    populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(patterns,
