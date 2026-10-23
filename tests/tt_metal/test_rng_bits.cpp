@@ -26,10 +26,10 @@ using ttnn::experimental::RngAlgorithm;
 
 uint32_t rotate_left(uint32_t x, int r) { return (x << r) | (x >> (32 - r)); }
 
-// The first word of Threefry-2x32 with 20 rounds of counter (c0, c1) under key (k0, 0).
-uint32_t threefry(uint32_t k0, uint32_t c0, uint32_t c1) {
+// The first word of Threefry-2x32 with 20 rounds of counter (c0, c1) under key (k0, k1).
+uint32_t threefry(uint32_t k0, uint32_t k1, uint32_t c0, uint32_t c1) {
     static constexpr int kRotations[2][4] = {{13, 15, 26, 6}, {17, 29, 16, 24}};
-    const uint32_t ks[3] = {k0, 0, k0 ^ 0x1BD11BDAu};
+    const uint32_t ks[3] = {k0, k1, k0 ^ k1 ^ 0x1BD11BDAu};
     uint32_t x0 = c0 + ks[0], x1 = c1 + ks[1];
     for (int i = 0; i < 5; ++i) {
         for (int r : kRotations[i % 2]) {
@@ -42,9 +42,8 @@ uint32_t threefry(uint32_t k0, uint32_t c0, uint32_t c1) {
     return x0;
 }
 
-// The first word of Philox-4x32 with 10 rounds of counter c under key (k0, 0).
-uint32_t philox(uint32_t k0, std::array<uint32_t, 4> c) {
-    uint32_t k1 = 0;
+// The first word of Philox-4x32 with 10 rounds of counter c under key (k0, k1).
+uint32_t philox(uint32_t k0, uint32_t k1, std::array<uint32_t, 4> c) {
     for (int round = 0; round < 10; ++round) {
         if (round > 0) {
             k0 += 0x9E3779B9u;
@@ -59,13 +58,19 @@ uint32_t philox(uint32_t k0, std::array<uint32_t, 4> c) {
 }
 
 std::vector<uint32_t> expected(
-    RngAlgorithm algorithm, const std::vector<uint32_t>& state, size_t elements) {
+    RngAlgorithm algorithm, const std::vector<uint64_t>& state, size_t elements) {
     std::vector<uint32_t> words(elements);
     for (size_t i = 0; i < elements; ++i) {
         const uint32_t word =
             algorithm == RngAlgorithm::Philox
-                ? philox(state[0], {static_cast<uint32_t>(i), state[1], state.size() > 2 ? state[2] : 0u, 0u})
-                : threefry(state[0], static_cast<uint32_t>(i), state[1]);
+                ? philox(static_cast<uint32_t>(state[0]),
+                         static_cast<uint32_t>((state[0] >> 32) ^ (state.size() > 2 ? state[2] >> 32 : 0)),
+                         {static_cast<uint32_t>(i), static_cast<uint32_t>(state[1]),
+                          state.size() > 2 ? static_cast<uint32_t>(state[2]) : 0u,
+                          static_cast<uint32_t>(state[1] >> 32)})
+                : threefry(static_cast<uint32_t>(state[0] ^ (state[1] >> 32)),
+                           static_cast<uint32_t>(state[0] >> 32), static_cast<uint32_t>(i),
+                           static_cast<uint32_t>(state[1]));
         words[i] = word;
     }
     return words;
@@ -73,15 +78,23 @@ std::vector<uint32_t> expected(
 
 TEST(RngBitsReference, KnownAnswers) {
     // Random123's known-answer vectors (first words; the key's second word is 0).
-    EXPECT_EQ(threefry(0, 0, 0), 0x6B200159u);
-    EXPECT_EQ(philox(0, {0, 0, 0, 0}), 0x6627E8D5u);
+    EXPECT_EQ(threefry(0, 0, 0, 0), 0x6B200159u);
+    EXPECT_EQ(philox(0, 0, {0, 0, 0, 0}), 0x6627E8D5u);
+}
+
+std::vector<uint32_t> pack_state(const std::vector<uint64_t>& words) {
+    std::vector<uint32_t> pairs;
+    for (uint64_t word : words) {
+        pairs.push_back(static_cast<uint32_t>(word));
+        pairs.push_back(static_cast<uint32_t>(word >> 32));
+    }
+    return pairs;
 }
 
 struct Case {
     std::vector<uint32_t> shape;
     RngAlgorithm algorithm;
-    Layout state_layout = Layout::ROW_MAJOR;
-    std::vector<uint32_t> state = {0xDEADBEEFu, 3};
+    std::vector<uint64_t> state = {0xDEADBEEFu, 3};
 };
 
 std::string case_name(const ::testing::TestParamInfo<Case>& info) {
@@ -89,7 +102,6 @@ std::string case_name(const ::testing::TestParamInfo<Case>& info) {
     for (uint32_t d : info.param.shape) {
         name += "_" + std::to_string(d);
     }
-    name += info.param.state_layout == Layout::TILE ? "_tile" : "_rm";
     name += "_s" + std::to_string(info.param.state.size());
     return name;
 }
@@ -105,11 +117,11 @@ protected:
         }
     }
 
-    ttnn::Tensor state_tensor(const std::vector<uint32_t>& words, Layout layout) {
+    ttnn::Tensor state_tensor(const std::vector<uint64_t>& words) {
         const TensorSpec spec(
-            ttnn::Shape({static_cast<uint32_t>(words.size())}),
-            TensorLayout(DataType::UINT32, PageConfig(layout), MemoryConfig{}));
-        return ttnn::Tensor::from_vector(words, spec).to_device(mesh_device_.get());
+            ttnn::Shape({static_cast<uint32_t>(words.size()), 2}),
+            TensorLayout(DataType::UINT32, PageConfig(Layout::TILE), MemoryConfig{}));
+        return ttnn::Tensor::from_vector(pack_state(words), spec).to_device(mesh_device_.get());
     }
 
     std::shared_ptr<MeshDevice> mesh_device_;
@@ -126,7 +138,7 @@ size_t volume(const std::vector<uint32_t>& shape) {
 TEST_P(RngBitsTest, MatchesReference) {
     const Case& c = GetParam();
     const auto outputs =
-        ttnn::experimental::rng_bits(state_tensor(c.state, c.state_layout), ttnn::Shape(c.shape), c.algorithm);
+        ttnn::experimental::rng_bits(state_tensor(c.state), ttnn::Shape(c.shape), c.algorithm);
     ASSERT_EQ(outputs.size(), 2u);
     EXPECT_EQ(outputs[0].logical_shape(), ttnn::Shape(c.shape));
     EXPECT_EQ(outputs[0].dtype(), DataType::UINT32);
@@ -143,7 +155,7 @@ TEST_P(RngBitsTest, MatchesReference) {
 
     auto new_state = c.state;
     new_state[1] += 1;
-    EXPECT_EQ(outputs[1].cpu().to_vector<uint32_t>(), new_state);
+    EXPECT_EQ(outputs[1].cpu().to_vector<uint32_t>(), pack_state(new_state));
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -161,10 +173,10 @@ INSTANTIATE_TEST_SUITE_P(
         Case{{2, 40, 70}, RngAlgorithm::Philox},
         Case{{64, 128}, RngAlgorithm::Threefry},
         Case{{64, 128}, RngAlgorithm::Philox},
-        Case{{5, 7}, RngAlgorithm::Threefry, Layout::TILE},
-        Case{{9}, RngAlgorithm::Philox, Layout::ROW_MAJOR, {0xDEADBEEFu, 3, 5}},
-        Case{{9}, RngAlgorithm::Philox, Layout::TILE, {0xDEADBEEFu, 3, 5}},
-        Case{{64}, RngAlgorithm::Threefry, Layout::ROW_MAJOR, {0xFFFFFFFFu, 0xFFFFFFFFu}},
+        Case{{9}, RngAlgorithm::Threefry, {0x12345678DEADBEEFull, 0xABCDEF0000000003ull}},
+        Case{{9}, RngAlgorithm::Philox, {0x12345678DEADBEEFull, 0xABCDEF0000000003ull, 0x100000005ull}},
+        Case{{64}, RngAlgorithm::Threefry, {0xFFFFFFFFu, 0xFFFFFFFFu}},
+        Case{{64}, RngAlgorithm::Philox, {0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull}},
         Case{{1000, 999}, RngAlgorithm::Threefry},
         Case{{1000, 999}, RngAlgorithm::Philox},
         Case{{4096, 4096}, RngAlgorithm::Threefry},
@@ -175,8 +187,8 @@ INSTANTIATE_TEST_SUITE_P(
 // through the new states draws the reference sequence, from one program.
 TEST_F(RngBitsTest, CachedProgramFollowsTheState) {
     for (const RngAlgorithm algorithm : {RngAlgorithm::Threefry, RngAlgorithm::Philox}) {
-        std::vector<uint32_t> words = {11, 0};
-        ttnn::Tensor state = state_tensor(words, Layout::ROW_MAJOR);
+        std::vector<uint64_t> words = {11, 0};
+        ttnn::Tensor state = state_tensor(words);
         const size_t entries_before = mesh_device_->num_program_cache_entries();
         for (int call = 0; call < 4; ++call) {
             auto outputs = ttnn::experimental::rng_bits(state, ttnn::Shape({3, 50}), algorithm);

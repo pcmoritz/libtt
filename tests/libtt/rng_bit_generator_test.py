@@ -263,7 +263,8 @@ def test_empty_output_keeps_the_state():
     [
         (state(1, 2), np.float32, "generates unsigned integers of up to 64 bits, not 'f32'"),
         (state(1, 2), np.int32, "generates unsigned integers of up to 64 bits, not 'i32'"),
-        (state(1), np.uint32, "needs a state of at least two 32- or 64-bit integers"),
+        (state(1), np.uint32, "needs a state of 2 to 16 unsigned 64-bit integers"),
+        (np.array([1, 2], np.uint32), np.uint32, "needs a state of 2 to 16 unsigned 64-bit integers"),
     ],
 )
 def test_unsupported_types_are_errors(old, dtype, message):

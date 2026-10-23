@@ -167,7 +167,6 @@ inline void philox_half_round(uint32_t word, uint32_t other, uint32_t key, uint3
 void kernel_main() {
     constexpr bool philox = get_arg(args::philox) != 0;
     constexpr uint32_t state_words = get_arg(args::state_words);
-    constexpr uint32_t stride = get_arg(args::state_stride);
     const uint32_t W = get_arg(args::W);
     const uint32_t H = get_arg(args::H);
     const uint32_t Wt = get_arg(args::Wt);
@@ -179,20 +178,18 @@ void kernel_main() {
     DataflowBuffer out_dfb(dfb::out);
     compute_kernel_hw_startup(dfb::state, dfb::out);
 
-    // The state's words, read in place by the math thread.
+    // Low/high pairs occupy the first two columns of the tile's 16-wide first face.
     state_dfb.wait_front(1);
     const uint32_t state_address = state_dfb.get_tile_address(0);
     uint32_t w0 = 0, w1 = 0, w2 = 0, key_high = 0, counter_high = 0, extra_high = 0;
     MATH({
         const volatile uint32_t* words = reinterpret_cast<const volatile uint32_t*>(state_address);
         w0 = words[0];
-        w1 = words[stride];
-        w2 = philox && state_words > 2 ? words[2 * stride] : 0;
-        if constexpr (stride > 1) {
-            key_high = words[1];
-            counter_high = words[stride + 1];
-            extra_high = philox && state_words > 2 ? words[2 * stride + 1] : 0;
-        }
+        w1 = words[16];
+        w2 = philox && state_words > 2 ? words[32] : 0;
+        key_high = words[1];
+        counter_high = words[17];
+        extra_high = philox && state_words > 2 ? words[33] : 0;
     });
 
     for (uint32_t tile = first_tile; tile < first_tile + num_tiles; ++tile) {

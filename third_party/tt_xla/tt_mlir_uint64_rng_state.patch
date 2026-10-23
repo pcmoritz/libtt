@@ -165,9 +165,9 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +    if (!stateType.hasStaticShape() || !outType.hasStaticShape()) {
 +      return op.emitOpError("with a dynamic shape isn't supported");
 +    }
-+    if (stateType.getRank() != 1 || stateType.getNumElements() < 2) {
-+      return op.emitOpError(
-+          "needs a state of at least two 32- or 64-bit integers");
++    if (!isUInt64(stateType) || stateType.getRank() != 1 ||
++        stateType.getNumElements() < 2 || stateType.getNumElements() > 16) {
++      return op.emitOpError("needs a state of 2 to 16 unsigned 64-bit integers");
 +    }
 +    if (!elementType || !elementType.isUnsigned() ||
 +        elementType.getWidth() > 64) {
@@ -259,8 +259,8 @@ diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/li
 +        mlir::stablehlo::ReshapeOp, mlir::stablehlo::SliceOp,
 +        mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
 +        mlir::stablehlo::TransposeOp, mlir::stablehlo::SelectOp,
-+        mlir::stablehlo::DynamicUpdateSliceOp,
-+        mlir::stablehlo::RngBitGeneratorOp>(legal);
++        mlir::stablehlo::DynamicUpdateSliceOp>(legal);
++    target.addIllegalOp<mlir::stablehlo::RngBitGeneratorOp>();
 +    target.addDynamicallyLegalOp<mlir::stablehlo::BitcastConvertOp>(
 +        [&](mlir::stablehlo::BitcastConvertOp op) {
 +          // Only the bitcasts between uint64 and its two uint32 words are

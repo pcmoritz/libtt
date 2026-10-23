@@ -8,13 +8,13 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +def TTIR_RngBitGeneratorOp : TTIR_NamedOp<"rng_bit_generator"> {
 +  let summary = "Counter-based random bits from a state.";
 +  let description = [{
-+    stablehlo.rng_bit_generator on the device. The state is a vector of at
-+    least two words w0, w1, ...; the key is (w0, 0), and element i of `output`
-+    (in row-major order) is the first word of
-+    Threefry-2x32 with 20 rounds of counter (i, w1), or with `philox`, of
-+    Philox-4x32 with 10 rounds of counter (i, w1, w2 or 0, 0).
-+    `output_state` is the state with w1 advanced by one, so the
-+    next call uses other counters. The words count modulo 2^32.
++    stablehlo.rng_bit_generator with uint64 state represented as uint32[n, 2]
++    low/high pairs, for 2 <= n <= 16. For low words w0, w1, w2 and high words
++    h0, h1, h2, element i of `output` is the first word of Threefry-2x32-20
++    with key (w0 ^ h1, h0), counter (i, w1), or with `philox`, of
++    Philox-4x32-10 with key (w0, h0 ^ h2), counter (i, w1, w2, h1).
++    Missing w2/h2 are zero. `output_state` increments the second uint64
++    element by one modulo 2^64. `output` contains uint32 words.
 +  }];
 +
 +  let arguments = (ins AnyRankedTensor:$initial_state,
@@ -92,50 +92,23 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -9771,40 +9771,68 @@ public:
-   matchAndRewrite(mlir::stablehlo::RngBitGeneratorOp srcOp,
-                   mlir::stablehlo::RngBitGeneratorOp::Adaptor adaptor,
-                   ConversionPatternRewriter &rewriter) const override {
-+    // The bits are a function of the state, computed on the device by
-+    // ttir.rng_bit_generator: Threefry for DEFAULT and THREE_FRY, Philox for
-+    // PHILOX. The device's words are 32 bits: narrower elements are their low
-+    // bits, and 64-bit integers are 32-bit on the device.
-+    Value state = adaptor.getInitialState();
-+    auto stateType = mlir::cast<RankedTensorType>(state.getType());
-     auto outputType = mlir::cast<RankedTensorType>(
-         getTypeConverter()->convertType(srcOp.getOutput().getType()));
-+    auto stateElementType =
-+        mlir::dyn_cast<IntegerType>(stateType.getElementType());
-+    auto elementType = mlir::dyn_cast<IntegerType>(outputType.getElementType());
-+    if (!outputType.hasStaticShape() || !stateType.hasStaticShape()) {
-+      return srcOp.emitOpError("with a dynamic shape isn't supported");
-+    }
-+    if (!elementType || !elementType.isUnsigned() ||
-+        elementType.getWidth() > 64) {
-+      return srcOp.emitOpError(
-+                 "generates unsigned integers of up to 64 bits, not ")
-+             << outputType.getElementType();
-+    }
-+    if (outputType.getNumElements() >= (int64_t{1} << 32)) {
-+      return srcOp.emitOpError("generates fewer than 2^32 elements");
-+    }
-+    if (stateType.getRank() != 1 || stateType.getDimSize(0) < 2 ||
-+        !stateElementType ||
-+        (stateElementType.getWidth() != 32 &&
-+         stateElementType.getWidth() != 64)) {
-+      return srcOp.emitOpError("needs a state of at least two 32- or 64-bit "
-+                               "integers, not ")
-+             << stateType;
-+    }
-+    if (outputType.getNumElements() == 0) {
-+      rewriter.replaceOp(
-+          srcOp, {state, rewriter.create<ttir::ConstantOp>(
-+                             srcOp.getLoc(), outputType,
-+                             DenseElementsAttr::get(outputType,
-+                                                    ArrayRef<APInt>{}))});
-+      return success();
-+    }
+@@ -9849,56 +9849,6 @@
+ } // namespace
  
+ namespace {
+-class StableHLOToTTIRRngBitGeneratorOpConversionPattern
+-    : public OpConversionPattern<mlir::stablehlo::RngBitGeneratorOp> {
+-  using OpConversionPattern<
+-      mlir::stablehlo::RngBitGeneratorOp>::OpConversionPattern;
+-
+-public:
+-  LogicalResult
+-  matchAndRewrite(mlir::stablehlo::RngBitGeneratorOp srcOp,
+-                  mlir::stablehlo::RngBitGeneratorOp::Adaptor adaptor,
+-                  ConversionPatternRewriter &rewriter) const override {
+-    auto outputType = mlir::cast<RankedTensorType>(
+-        getTypeConverter()->convertType(srcOp.getOutput().getType()));
+-
 -    llvm::SmallVector<int32_t> size(outputType.getShape());
 -
 -    auto floatElementType = rewriter.getF32Type();
@@ -167,31 +140,38 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 -    rewriter.replaceOp(srcOp,
 -                       {adaptor.getInitialState(), typecastOp.getResult()});
 -
-+    // A scalar is drawn as a vector of one element.
-+    SmallVector<int64_t> shape(outputType.getShape());
-+    if (shape.empty()) {
-+      shape.push_back(1);
-+    }
-+    auto bitsType = RankedTensorType::get(
-+        shape, elementType.getWidth() < 32 ? rewriter.getIntegerType(32, false)
-+                                         : elementType);
-+    auto rng = rewriter.create<ttir::RngBitGeneratorOp>(
-+        srcOp.getLoc(), stateType, bitsType, state,
-+        rewriter.getBoolAttr(srcOp.getRngAlgorithm() ==
-+                             mlir::stablehlo::RngAlgorithm::PHILOX));
-+    Value bits = rng.getOutput();
-+    if (elementType.getWidth() < 32) {
-+      bits = rewriter.create<ttir::TypecastOp>(
-+          srcOp.getLoc(), bitsType.clone(elementType), bits);
-+    }
-+    if (outputType.getRank() == 0) {
-+      bits = rewriter.create<ttir::ReshapeOp>(srcOp.getLoc(), outputType, bits,
-+                                              rewriter.getI32ArrayAttr({}));
-+    }
-+    rewriter.replaceOp(srcOp, {rng.getOutputState(), bits});
-     return success();
-   }
- };
+-    return success();
+-  }
+-};
+-} // namespace
+-
+-namespace {
+ // This pattern recognizes and converts stablehlo.custom_call @tt.fill_cache
+ // to ttir.fill_cache.
+ class StableHLOFillCacheConversionPattern
+@@ -12329,14 +12279,6 @@
+   patterns.add<StableHLOToTTIRRngOpConversionPattern>(typeConverter, ctx);
+ }
+
+-static void
+-addRngBitGeneratorOpConversionPattern(MLIRContext *ctx,
+-                                      RewritePatternSet &patterns,
+-                                      TypeConverter &typeConverter) {
+-  patterns.add<StableHLOToTTIRRngBitGeneratorOpConversionPattern>(typeConverter,
+-                                                                  ctx);
+-}
+-
+ static void addErfOpConversionPattern(MLIRContext *ctx,
+                                       RewritePatternSet &patterns,
+                                       TypeConverter &typeConverter) {
+@@ -13256,7 +13198,6 @@
+   addSelectAndScatterOpConversionPatterns(ctx, patterns, typeConverter);
+   addBatchNormOpConversionPattern(ctx, patterns, typeConverter);
+   addRngOpConversionPattern(ctx, patterns, typeConverter);
+-  addRngBitGeneratorOpConversionPattern(ctx, patterns, typeConverter);
+   addErfOpConversionPattern(ctx, patterns, typeConverter);
+   addAsinhOpConversionPattern(ctx, patterns, typeConverter);
+   addSortOpConversionPattern(ctx, patterns, typeConverter);
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
