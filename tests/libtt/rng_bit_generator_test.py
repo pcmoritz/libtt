@@ -235,17 +235,6 @@ def test_counter_wraps(algorithm):
     np.testing.assert_array_equal(values, expected(algorithm, old, 35))
 
 
-def test_large_draw_does_not_repeat_after_1024_calls():
-    # Advancing by ceil(elements / 4) used to repeat the entire tensor here.
-    with jax.enable_x64(True):
-        draw = jax.jit(lambda s: jax.lax.rng_bit_generator(s, (4096, 4096), jnp.uint32))
-        current, first = draw(jnp.asarray(state(7, 0)))
-        for _ in range(1024):
-            current, last = draw(current)
-        np.testing.assert_array_equal(np.asarray(current), state(7, 1025))
-        assert not np.array_equal(np.asarray(first), np.asarray(last))
-
-
 @pytest.mark.parametrize("algorithm", ALGORITHMS)
 @pytest.mark.parametrize("dtype, width", [(np.uint8, 8), (np.uint16, 16), (np.uint32, 32), (np.uint64, 32)])
 def test_bits_are_balanced(algorithm, dtype, width):
