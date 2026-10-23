@@ -26,8 +26,8 @@ using ttnn::experimental::RngAlgorithm;
 
 uint32_t rotate_left(uint32_t x, int r) { return (x << r) | (x >> (32 - r)); }
 
-// The first word of Threefry-2x32 with 20 rounds of counter (c0, c1) under key (k0, k1).
-uint32_t threefry(uint32_t k0, uint32_t k1, uint32_t c0, uint32_t c1) {
+// Both words of Threefry-2x32 with 20 rounds of counter (c0, c1) under key (k0, k1).
+std::array<uint32_t, 2> threefry(uint32_t k0, uint32_t k1, uint32_t c0, uint32_t c1) {
     static constexpr int kRotations[2][4] = {{13, 15, 26, 6}, {17, 29, 16, 24}};
     const uint32_t ks[3] = {k0, k1, k0 ^ k1 ^ 0x1BD11BDAu};
     uint32_t x0 = c0 + ks[0], x1 = c1 + ks[1];
@@ -39,7 +39,7 @@ uint32_t threefry(uint32_t k0, uint32_t k1, uint32_t c0, uint32_t c1) {
         x0 += ks[(i + 1) % 3];
         x1 += ks[(i + 2) % 3] + i + 1;
     }
-    return x0;
+    return {x0, x1};
 }
 
 // The first word of Philox-4x32 with 10 rounds of counter c under key (k0, k1).
@@ -60,6 +60,8 @@ uint32_t philox(uint32_t k0, uint32_t k1, std::array<uint32_t, 4> c) {
 std::vector<uint32_t> expected(
     RngAlgorithm algorithm, const std::vector<uint64_t>& state, size_t elements) {
     std::vector<uint32_t> words(elements);
+    const auto key = threefry(static_cast<uint32_t>(state[0]), static_cast<uint32_t>(state[0] >> 32),
+                             static_cast<uint32_t>(state[1] >> 32), 0x1BD11BDAu);
     for (size_t i = 0; i < elements; ++i) {
         const uint32_t word =
             algorithm == RngAlgorithm::Philox
@@ -68,17 +70,16 @@ std::vector<uint32_t> expected(
                          {static_cast<uint32_t>(i), static_cast<uint32_t>(state[1]),
                           state.size() > 2 ? static_cast<uint32_t>(state[2]) : 0u,
                           static_cast<uint32_t>(state[1] >> 32)})
-                : threefry(static_cast<uint32_t>(state[0] ^ (state[1] >> 32)),
-                           static_cast<uint32_t>(state[0] >> 32), static_cast<uint32_t>(i),
-                           static_cast<uint32_t>(state[1]));
+                : threefry(key[0], key[1], static_cast<uint32_t>(i), static_cast<uint32_t>(state[1]))[0];
         words[i] = word;
     }
     return words;
 }
 
 TEST(RngBitsReference, KnownAnswers) {
-    // Random123's known-answer vectors (first words; the key's second word is 0).
-    EXPECT_EQ(threefry(0, 0, 0, 0), 0x6B200159u);
+    // Random123's known-answer vectors; the key's second word is 0.
+    EXPECT_EQ(threefry(0, 0, 0, 0)[0], 0x6B200159u);
+    EXPECT_EQ(threefry(0, 0, 0, 0)[1], 0x99BA4EFEu);
     EXPECT_EQ(philox(0, 0, {0, 0, 0, 0}), 0x6627E8D5u);
 }
 

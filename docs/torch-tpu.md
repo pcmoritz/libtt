@@ -54,9 +54,11 @@ float32.
 
 `torch.manual_seed` and generators make random draws repeat, eager and
 compiled. The device draws with Threefry-2x32 (Philox-4x32 for
-`torch.randperm`), so the numbers differ from CPU, CUDA and TPU ones. 64-bit
-integers are 32-bit on the device: seeds count modulo 2^32, and 64-bit random
-integers have 32 random bits.
+`torch.randperm`), so the numbers differ from CPU, CUDA and TPU ones. Seeds
+and RNG counters preserve all 64 bits; 64-bit random integers have 32 random
+bits. This is not general uint64 support: high words are lost across
+unconverted operations, including `while`, `case`, `optimization_barrier`
+and `custom_call`. Do not carry uint64 RNG state through those operations.
 
 ## Not supported
 

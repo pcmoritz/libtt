@@ -50,6 +50,17 @@ def test_high_seed_bits(compiled):
 
 
 @pytest.mark.parametrize("compiled", [False, True])
+def test_counter_high_word_does_not_alias_another_seed(compiled):
+    draw = lambda: torch.rand(64, device="tpu")
+    if compiled:
+        draw = torch.compile(draw, fullgraph=True)
+    torch.tpu.set_rng_state(state(42, 2**32))
+    carried = draw().cpu()
+    torch.manual_seed(43)
+    assert not torch.equal(carried, draw().cpu())
+
+
+@pytest.mark.parametrize("compiled", [False, True])
 def test_large_draw_does_not_repeat_after_1024_calls(compiled):
     # torch_tpu advances by 2**22 for this shape. Truncating its uint64
     # counter made the entire tensor repeat after only 1024 draws.

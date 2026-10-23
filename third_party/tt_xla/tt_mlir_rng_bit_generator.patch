@@ -11,8 +11,8 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +    stablehlo.rng_bit_generator with uint64 state represented as uint32[n, 2]
 +    low/high pairs, for 2 <= n <= 16. For low words w0, w1, w2 and high words
 +    h0, h1, h2, element i of `output` is the first word of Threefry-2x32-20
-+    with key (w0 ^ h1, h0), counter (i, w1), or with `philox`, of
-+    Philox-4x32-10 with key (w0, h0 ^ h2), counter (i, w1, w2, h1).
++    with counter (i, w1) and key Threefry((w0, h0), (h1, 0x1BD11BDA)), or
++    with `philox`, Philox-4x32-10 key (w0, h0 ^ h2), counter (i, w1, w2, h1).
 +    Missing w2/h2 are zero. `output_state` increments the second uint64
 +    element by one modulo 2^64. `output` contains uint32 words.
 +  }];

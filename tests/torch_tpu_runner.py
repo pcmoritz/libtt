@@ -141,8 +141,9 @@ def main() -> int:
     plugin_root = extract_plugin_wheel(plugin_wheel)
     selections = [arg for arg in rest if (root / arg.split("::")[0]).exists()]
     pytest_args = [arg for arg in rest if arg not in selections]
-    selections += [str(_rlocation(path).resolve(strict=True)) for path in args.local_test]
     targets = _select(root, selections, args.exclude)
+    for path in args.local_test:
+        targets[str(_rlocation(path).resolve(strict=True))] = []
 
     tmp = Path(os.environ.get("TEST_TMPDIR") or tempfile.mkdtemp())
     out = Path(os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR") or tmp / "outputs")

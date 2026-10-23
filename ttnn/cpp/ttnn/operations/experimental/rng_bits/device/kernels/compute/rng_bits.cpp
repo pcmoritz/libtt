@@ -44,14 +44,14 @@ inline uint32_t vector_index(uint32_t face_index, uint32_t W, uint32_t d) {
     return face_index + 4 * (d >> 1) * W + (d & 1);
 }
 
-template <int r>
-sfpi_inline sfpi::vUInt rotate_left(sfpi::vUInt x) {
+template <int r, typename T>
+sfpi_inline T rotate_left(T x) {
     return (x << r) | (x >> (32 - r));
 }
 
 // Four Threefry-2x32 rounds with rotations r0..r3.
-template <int r0, int r1, int r2, int r3>
-sfpi_inline void threefry_rounds(sfpi::vUInt& x0, sfpi::vUInt& x1) {
+template <int r0, int r1, int r2, int r3, typename T>
+sfpi_inline void threefry_rounds(T& x0, T& x1) {
     x0 += x1;
     x1 = rotate_left<r0>(x1) ^ x0;
     x0 += x1;
@@ -60,6 +60,27 @@ sfpi_inline void threefry_rounds(sfpi::vUInt& x0, sfpi::vUInt& x1) {
     x1 = rotate_left<r2>(x1) ^ x0;
     x0 += x1;
     x1 = rotate_left<r3>(x1) ^ x0;
+}
+
+// Shared by scalar stream-key derivation and vector output generation.
+// x0/x1 already include the initial key addition.
+template <typename T>
+sfpi_inline void threefry(T& x0, T& x1, uint32_t ks0, uint32_t ks1, uint32_t ks2) {
+    threefry_rounds<13, 15, 26, 6>(x0, x1);
+    x0 += T(ks1);
+    x1 += T(ks2 + 1);
+    threefry_rounds<17, 29, 16, 24>(x0, x1);
+    x0 += T(ks2);
+    x1 += T(ks0 + 2);
+    threefry_rounds<13, 15, 26, 6>(x0, x1);
+    x0 += T(ks0);
+    x1 += T(ks1 + 3);
+    threefry_rounds<17, 29, 16, 24>(x0, x1);
+    x0 += T(ks1);
+    x1 += T(ks2 + 4);
+    threefry_rounds<13, 15, 26, 6>(x0, x1);
+    x0 += T(ks2);
+    x1 += T(ks0 + 5);
 }
 
 // One tile of Threefry-2x32-20 words into DST tile `dst`: the tile's element
@@ -77,20 +98,7 @@ inline void threefry_tile(
                 // Counter (i, w1) plus the first key words (ks0, ks1).
                 sfpi::vUInt x0 = lanes + sfpi::vUInt(vector_index(face_index, W, d) + ks0);
                 sfpi::vUInt x1 = sfpi::vUInt(w1 + ks1);
-                threefry_rounds<13, 15, 26, 6>(x0, x1);
-                x0 += sfpi::vUInt(ks1);
-                x1 += sfpi::vUInt(ks2 + 1);
-                threefry_rounds<17, 29, 16, 24>(x0, x1);
-                x0 += sfpi::vUInt(ks2);
-                x1 += sfpi::vUInt(ks0 + 2);
-                threefry_rounds<13, 15, 26, 6>(x0, x1);
-                x0 += sfpi::vUInt(ks0);
-                x1 += sfpi::vUInt(ks1 + 3u);
-                threefry_rounds<17, 29, 16, 24>(x0, x1);
-                x0 += sfpi::vUInt(ks1);
-                x1 += sfpi::vUInt(ks2 + 4);
-                threefry_rounds<13, 15, 26, 6>(x0, x1);
-                x0 += sfpi::vUInt(ks2);
+                threefry(x0, x1, ks0, ks1, ks2);
                 sfpi::dst_reg[0].mode<sfpi::DataLayout::I32>() = sfpi::vInt(x0);
             }
             sfpi::dst_reg++;
@@ -179,9 +187,12 @@ void kernel_main() {
     compute_kernel_hw_startup(dfb::state, dfb::out);
 
     // Low/high pairs occupy the first two columns of the tile's 16-wide first face.
+    // The mover restores the original state before push_back; wait_front keeps
+    // these reads after its temporary update and the new-state write barrier.
     state_dfb.wait_front(1);
     const uint32_t state_address = state_dfb.get_tile_address(0);
     uint32_t w0 = 0, w1 = 0, w2 = 0, key_high = 0, counter_high = 0, extra_high = 0;
+    uint32_t ks0 = 0, ks1 = 0;
     MATH({
         const volatile uint32_t* words = reinterpret_cast<const volatile uint32_t*>(state_address);
         w0 = words[0];
@@ -190,6 +201,13 @@ void kernel_main() {
         key_high = words[1];
         counter_high = words[17];
         extra_high = philox && state_words > 2 ? words[33] : 0;
+        if constexpr (!philox) {
+            // Hash the counter high word under the seed once per core. XORing
+            // it into the seed would alias neighboring seeds after 2^32 units.
+            ks0 = counter_high + w0;
+            ks1 = 0x1BD11BDAu + key_high;
+            rng::threefry(ks0, ks1, w0, key_high, w0 ^ key_high ^ 0x1BD11BDAu);
+        }
     });
 
     for (uint32_t tile = first_tile; tile < first_tile + num_tiles; ++tile) {
@@ -204,8 +222,6 @@ void kernel_main() {
         tile_regs_acquire();
         if constexpr (!philox) {
             MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>()));
-            const uint32_t ks0 = w0 ^ counter_high;
-            const uint32_t ks1 = key_high;
             MATH((rng::threefry_tile(0, base, W, rows_valid, ks0, ks1, ks0 ^ ks1 ^ 0x1BD11BDA, w1)));
         } else {
             // The four counter words, renamed after each round.

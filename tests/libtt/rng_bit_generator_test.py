@@ -107,7 +107,8 @@ def expected(algorithm, state, elements):
             (seed & M32, (seed >> 32) ^ (extra >> 32)),
             [i, np.full(n, offset & M32), np.full(n, extra & M32), np.full(n, offset >> 32)],
         )[0]
-    return threefry2x32(((seed & M32) ^ (offset >> 32), seed >> 32), [i, np.full(n, offset & M32)])[0]
+    key = threefry2x32((seed & M32, seed >> 32), [offset >> 32, 0x1BD11BDA])
+    return threefry2x32(key, [i, np.full(n, offset & M32)])[0]
 
 
 def advanced(old, elements):
@@ -215,6 +216,14 @@ def test_high_state_words_affect_bits(algorithm):
         np.testing.assert_array_equal(values, expected(algorithm, other, 64))
         np.testing.assert_array_equal(new, advanced(other, 64))
         assert not np.array_equal(values, base)
+
+
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+def test_counter_high_word_does_not_alias_another_seed(algorithm):
+    # XORing the counter high word into the seed makes these streams identical.
+    _, carried = bits(state(42, 2**32), (64,), np.uint32, algorithm)
+    _, neighboring_seed = bits(state(43, 0), (64,), np.uint32, algorithm)
+    assert not np.array_equal(carried, neighboring_seed)
 
 
 @pytest.mark.parametrize("algorithm", ALGORITHMS)
