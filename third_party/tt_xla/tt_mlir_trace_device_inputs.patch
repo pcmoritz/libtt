@@ -27,7 +27,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
  
  namespace tt::runtime::ttnn::operations::trace {
  
-@@ -41,6 +43,19 @@ static void copyTensorFromDeviceToDevice(const ::ttnn::Tensor &srcTensor,
+@@ -41,6 +43,19 @@
    ::ttnn::copy_to_device(hostSrcTensor, dstTensor);
  }
  
@@ -47,7 +47,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
  // Runs the slot allocation program, which allocates the persistent device
  // buffers this trace will read from and write to. Runs exactly once per trace.
  //
-@@ -122,7 +137,14 @@ updateTraceInputSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -122,7 +137,14 @@
      // across trace executions, so their versions are expected to match.
      // Regular inputs live on host and change between executions, so a version
      // mismatch is the expected case — we copy them from host to device below.
@@ -63,7 +63,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
        continue;
      }
  
-@@ -136,6 +158,9 @@ updateTraceInputSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -136,6 +158,9 @@
                  i, ", expected version: ", inputSlotWrapper.getVersion());
        copyTensorFromDeviceToDevice(inputTensorWrapper.getTensor(),
                                     inputSlotWrapper.getTensor());
@@ -73,7 +73,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
      } else {
        // Regular inputs reside on host and are copied into their trace input
        // slots on device. A version mismatch is expected here since the host
-@@ -192,7 +217,21 @@ static TraceData captureTrace(
+@@ -192,7 +217,21 @@
                          outputSlots.size());
    for (const ::tt::target::ttnn::TensorRef *input : *op->inputs()) {
      if (!::tt::runtime::ttnn::utils::inDeviceMemory(input)) {
@@ -99,7 +99,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -954,6 +954,44 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+@@ -954,6 +954,43 @@
    return result;
  }
  
@@ -119,7 +119,6 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +      continue;
 +    }
 +    const auto *trace = op->type_as_CaptureOrExecuteTraceOp();
-+    const auto *keys = trace ? trace->trace_key_input_indices() : nullptr;
 +    auto opHandle = ::tt::runtime::utils::unsafeBorrowShared(
 +        const_cast<::tt::target::ttnn::Operation *>(op));
 +    std::vector<TensorRef> refs =
@@ -130,9 +129,9 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +      if (ref.global_id() != id) {
 +        continue;
 +      }
-+      const bool isKey =
-+          keys && std::find(keys->begin(), keys->end(), i) != keys->end();
-+      if (!trace || isKey || utils::inDeviceMemory(&ref)) {
++      const bool isDeviceResident =
++          trace && i < trace->device_resident_input_count();
++      if (!trace || isDeviceResident) {
 +        return false;
 +      }
 +      stagedUse = true;
@@ -144,7 +143,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
    const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
        LayoutDesc::fromTensor(tensor);
-@@ -961,6 +999,12 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
+@@ -961,6 +998,12 @@
    const LayoutDesc &desiredLayoutDesc =
        layout.as<LayoutDesc>(DeviceRuntime::TTNN);
  
@@ -157,7 +156,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    return *tensorLayoutDesc == desiredLayoutDesc;
  }
  
-@@ -999,6 +1043,11 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
+@@ -999,6 +1042,11 @@
  
    std::shared_ptr<LayoutDesc> layoutDesc = std::make_shared<LayoutDesc>(
        inputStorageType, inputLayout, inputDataType, inputMemoryConfig);
