@@ -1,0 +1,117 @@
+diff --git a/lib/Dialect/D2M/IR/D2MDialect.cpp b/lib/Dialect/D2M/IR/D2MDialect.cpp
+--- a/lib/Dialect/D2M/IR/D2MDialect.cpp
++++ b/lib/Dialect/D2M/IR/D2MDialect.cpp
+@@ -14,7 +14,6 @@
+ #include "mlir/Dialect/Tensor/IR/Tensor.h"
+ #include "mlir/IR/DialectImplementation.h"
+ #include "mlir/IR/OpImplementation.h"
+-#include "mlir/InitAllDialects.h"
+ #include "mlir/Interfaces/FoldInterfaces.h"
+ #include "llvm/ADT/TypeSwitch.h"
+ 
+diff --git a/lib/Dialect/SFPI/IR/SFPIDialect.cpp b/lib/Dialect/SFPI/IR/SFPIDialect.cpp
+--- a/lib/Dialect/SFPI/IR/SFPIDialect.cpp
++++ b/lib/Dialect/SFPI/IR/SFPIDialect.cpp
+@@ -7,7 +7,6 @@
+ #include "mlir/Dialect/Arith/IR/Arith.h"
+ #include "mlir/Dialect/Vector/IR/VectorOps.h"
+ #include "mlir/IR/DialectImplementation.h"
+-#include "mlir/InitAllDialects.h"
+ #include "ttmlir/Dialect/SFPI/IR/SFPIOps.h"
+ #include "ttmlir/Dialect/SFPI/IR/SFPIOpsTypes.h"
+ #include "llvm/ADT/StringRef.h"
+diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
+--- a/lib/Dialect/D2M/Utils/Utils.cpp
++++ b/lib/Dialect/D2M/Utils/Utils.cpp
+@@ -910,9 +910,9 @@
+     // Break the map into respective gridY, gridX, offset "single result"
+     // parts. AffineApply only supports single result affine maps.
+     map = map.dropResults(0); // Drop the device index.
+-    auto gridY = map.dropResults({1, 2});
+-    auto gridX = map.dropResults({0, 2});
+-    auto offset = map.dropResults({0, 1});
++    auto gridY = map.dropResults(llvm::ArrayRef<int64_t>({1, 2}));
++    auto gridX = map.dropResults(llvm::ArrayRef<int64_t>({0, 2}));
++    auto offset = map.dropResults(llvm::ArrayRef<int64_t>({0, 1}));
+     return {affineApply(gridY, index), affineApply(gridX, index),
+             affineApply(offset, index)};
+   }
+diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+--- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
++++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagation.cpp
+@@ -383,7 +383,9 @@
+     }
+ 
+     auto actualFirstOutputLayout = result.checkAndGetFirstActualOutputLayout();
+-    if (actualFirstOutputLayout.isTiled()) {
++    // Ops without an op model (a ttnn.d2m_subgraph, say) report no layout:
++    // stop there rather than assume a row-major result.
++    if (!actualFirstOutputLayout || actualFirstOutputLayout.isTiled()) {
+       TTMLIR_DEBUG(ttmlir::LogComponent::RMPropagation,
+                    "Stopping RM propagation at op {} as it returns tile "
+                    "layout,\n\t output layout: {}",
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
+@@ -44,6 +44,15 @@
+     if (!op) {
+       return false;
+     }
++    // The D2M elementwise lowering indexes tile broadcast info by rank and
++    // crashes on rank-0 tensors: leave scalars to TTNN. Large tensors are
++    // left too, for now: the generic keeps whole operands in L1 on one core.
++    for (Value v : llvm::concat<Value>(op->getOperands(), op->getResults())) {
++      auto type = mlir::dyn_cast<RankedTensorType>(v.getType());
++      if (type && (type.getRank() == 0 || type.getNumElements() > 4096)) {
++        return false;
++      }
++    }
+     // Eltwise unary ops.
+     if (mlir::isa<AbsOp, CbrtOp, CeilOp, SignOp, CosOp, ExpOp, ErfOp, ErfcOp,
+                   FloorOp, GeluOp, IsFiniteOp, LogicalNotOp, BitwiseNotOp,
+@@ -61,7 +70,7 @@
+       return true;
+     }
+ 
+-    if (mlir::isa<ClampTensorOp>(op)) {
++    if (mlir::isa<ClampTensorOp, WhereOp, TypecastOp>(op)) {
+       return true;
+     }
+ 
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -75,6 +75,15 @@
+   // transfers and preparation run eagerly between traces, and the device
+   // programs of eager control flow are partitioned by the same rule.
+   bool shouldHoistOp(Operation *op) {
++    // A generic writes its result into an empty it is given: that empty is
++    // the generic's result allocation and is traced like any op's result,
++    // whatever else then reads it.
++    if (auto empty = ::mlir::dyn_cast<ttnn::EmptyOp>(op)) {
++      return llvm::any_of(empty->getUsers(), [](Operation *user) {
++               return ::mlir::isa<ttnn::GenericOp>(user);
++             }) &&
++             isOnDeviceType(empty.getResult().getType());
++    }
+     if (::mlir::isa<func::ReturnOp, func::CallOp, ttcore::CaseOp,
+                     ttcore::WhileLoopOp, ttnn::WhileOp, ttcore::LoadCachedOp,
+                     ttnn::GetDeviceOp, ttnn::AdamWOp, ttnn::DeallocateOp,
+diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp
+--- a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp
++++ b/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp
+@@ -1615,6 +1615,14 @@
+       return failure();
+     }
+ 
++    // The FPU carries about 19 bits of a 32-bit integer: integer tiles take
++    // the SFPU path, which has exact int32 add, subtract and multiply.
++    if (llvm::isa<IntegerType>(
++            mlir::cast<ttcore::TileType>(op.getLhs().getType())
++                .getElementType())) {
++      return failure();
++    }
++
+     auto loc = op->getLoc();
+     bool lhsFromDst = operandFromDst(op.getLhs());
+     bool rhsFromDst = operandFromDst(op.getRhs());

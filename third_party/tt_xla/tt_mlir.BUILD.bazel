@@ -1035,8 +1035,7 @@ cc_library(
         "@llvm-project//mlir:MathDialect",
         "@llvm-project//mlir:SideEffectInterfaces",
         "@llvm-project//mlir:Support",
-        "@llvm-project//mlir:TensorDialect",
-        "@llvm-project//mlir:TosaDialect",
+            "@llvm-project//mlir:TosaDialect",
         "@com_github_google_flatbuffers//:runtime_cc",
         "@llvm-project//mlir:CAPIIR",
         "@shardy//shardy/dialect/sdy/ir:dialect",
@@ -1142,6 +1141,21 @@ _TTMLIR_COMMON_COPTS = [
 ]
 
 _TTMLIR_COMMON_DEPS = [
+    "@llvm-project//mlir:AffineAnalysis",
+    "@llvm-project//mlir:AffineUtils",
+    "@llvm-project//mlir:Analysis",
+    "@llvm-project//mlir:ArithToEmitC",
+    "@llvm-project//mlir:ArithTransforms",
+    "@llvm-project//mlir:ArithUtils",
+    "@llvm-project//mlir:DialectUtils",
+    "@llvm-project//mlir:FuncToEmitC",
+    "@llvm-project//mlir:LinalgUtils",
+    "@llvm-project//mlir:MathTransforms",
+    "@llvm-project//mlir:MemRefToEmitC",
+    "@llvm-project//mlir:MemRefUtils",
+    "@llvm-project//mlir:SCFToEmitC",
+    "@llvm-project//mlir:SCFUtils",
+    "@llvm-project//mlir:TransformUtils",
     ":flatbuffer_generated_headers",
     ":public_headers",
 ] + _EXTRA_TABLEGEN_DEPS + [
@@ -1228,6 +1242,57 @@ _TTMLIR_COMMON_DEPS = [
     "@stablehlo//:stablehlo_passes",
 ]
 
+
+# The LLK headers the TTKernel C++ emitter pastes into generated kernels, as
+# raw string constants (cmake/modules/GenerateRawStringHeader.cmake).
+genrule(
+    name = "ttkernel_llk_headers",
+    srcs = [
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_tilize_llks.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_untilize_llks.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_pack_untilize_llks.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_invoke_sfpi_llks.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_matmul_llks.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_padding_llks.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_coord_translation.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_fabric_topology_info.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_fabric_1d_routing.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_fabric_2d_routing.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_fabric_api.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_reg_api.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_semaphore.h",
+    ],
+    outs = [
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_tilize_llks_generated.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_untilize_llks_generated.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_pack_untilize_llks_generated.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_invoke_sfpi_llks_generated.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_matmul_llks_generated.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_padding_llks_generated.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_coord_translation_generated.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_fabric_topology_info_generated.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_fabric_1d_routing_generated.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_fabric_2d_routing_generated.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_fabric_api_generated.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_reg_api_generated.h",
+        "include/ttmlir/Target/TTKernel/LLKs/experimental_semaphore_generated.h",
+    ],
+    cmd = """
+set -euo pipefail
+for src in $(SRCS); do
+  name=$$(basename "$$src" .h)
+  out="$(RULEDIR)/include/ttmlir/Target/TTKernel/LLKs/$${name}_generated.h"
+  {
+    echo "// Auto-generated from $$src - Do not edit directly"
+    printf 'static constexpr char %s_generated[] = R"TTMLIR_STR_DELIM(\n' "$$name"
+    cat "$$src"
+    printf ')TTMLIR_STR_DELIM";\n'
+    printf 'static constexpr unsigned int %s_generated_len = sizeof(%s_generated) - 1;\n' "$$name" "$$name"
+  } > "$$out"
+done
+""",
+)
+
 cc_library(
     name = "ttmlir_compiler",
     srcs = [
@@ -1251,9 +1316,21 @@ cc_library(
             "lib/Dialect/StableHLO/**/*.cpp",
             "lib/Dialect/TTCore/**/*.cpp",
             "lib/Dialect/TTIR/**/*.cpp",
-            "lib/Dialect/TTKernel/IR/**/*.cpp",
-            "lib/Dialect/TTMetal/IR/**/*.cpp",
+            "lib/Dialect/TTKernel/**/*.cpp",
+            "lib/Dialect/TTMetal/**/*.cpp",
             "lib/Dialect/TTNN/**/*.cpp",
+            # The D2M stack, for ttnn.d2m_subgraph (enable_create_d2m_subgraphs):
+            # elementwise chains compiled to generated kernels.
+            "lib/Dialect/D2M/**/*.cpp",
+            "lib/Dialect/SFPI/**/*.cpp",
+            "lib/Conversion/TTIRToD2M/**/*.cpp",
+            "lib/Conversion/D2MToTTKernel/**/*.cpp",
+            "lib/Conversion/D2MToTTNN/**/*.cpp",
+            "lib/Conversion/D2MToTTMetal/**/*.cpp",
+            "lib/Conversion/TTKernelToEmitC/**/*.cpp",
+            "lib/Conversion/ArithToD2MTileOps/**/*.cpp",
+            "lib/Conversion/MathToD2MTileOps/**/*.cpp",
+            "lib/Target/TTKernel/**/*.cpp",
             "lib/OpModel/TTNN/**/*.cpp",
             "lib/Scheduler/**/*.cpp",
             "lib/Support/**/*.cpp",
@@ -1266,6 +1343,7 @@ cc_library(
             "lib/Dialect/TTNN/Transforms/TTNNResolveTTLangKernelsPython.cpp",
             "lib/Dialect/TTNN/Transforms/TTNNToPython.cpp",
             "lib/Target/Python/**",
+            "lib/Target/TTKernel/TTKernelToCppRegistration.cpp",
         ],
         allow_empty = True,
     ),
@@ -1277,7 +1355,7 @@ cc_library(
             "lib/**/*.hpp",
         ],
         allow_empty = True,
-    ),
+    ) + [":ttkernel_llk_headers"],
     copts = _TTMLIR_COMMON_COPTS,
     includes = [
         "include",
