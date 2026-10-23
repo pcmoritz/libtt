@@ -1,0 +1,339 @@
+diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
+--- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
++++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
+@@ -146,6 +146,36 @@
+   let cppNamespace = "::mlir::tt::ttcore";
+ }
+ 
++def TTCore_MaskedCompare_GT : I32EnumAttrCase<"GT", 0, "gt">;
++def TTCore_MaskedCompare_GE : I32EnumAttrCase<"GE", 1, "ge">;
++def TTCore_MaskedCompare_LT : I32EnumAttrCase<"LT", 2, "lt">;
++def TTCore_MaskedCompare_LE : I32EnumAttrCase<"LE", 3, "le">;
++
++// How a masked reduction compares each element against its row's threshold.
++def TTCore_MaskedCompare : I32EnumAttr<"MaskedCompare", "TT Masked Reduction Compare",
++                          [
++                           TTCore_MaskedCompare_GT,
++                           TTCore_MaskedCompare_GE,
++                           TTCore_MaskedCompare_LT,
++                           TTCore_MaskedCompare_LE,
++                          ]> {
++  let genSpecializedAttr = 0;
++  let cppNamespace = "::mlir::tt::ttcore";
++}
++
++def TTCore_MaskedMode_Count : I32EnumAttrCase<"Count", 0, "count">;
++def TTCore_MaskedMode_Sum : I32EnumAttrCase<"Sum", 1, "sum">;
++
++// What a masked reduction accumulates: the mask, or the elements it keeps.
++def TTCore_MaskedMode : I32EnumAttr<"MaskedMode", "TT Masked Reduction Mode",
++                          [
++                           TTCore_MaskedMode_Count,
++                           TTCore_MaskedMode_Sum,
++                          ]> {
++  let genSpecializedAttr = 0;
++  let cppNamespace = "::mlir::tt::ttcore";
++}
++
+ def TTCore_MeshShardDirection_FullToShard : I32EnumAttrCase<"FullToShard",  0, "full_to_shard">;
+ def TTCore_MeshShardDirection_ShardToFull : I32EnumAttrCase<"ShardToFull",  1, "shard_to_full">;
+ 
+diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td
+--- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td
++++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.td
+@@ -616,6 +616,14 @@
+ 
+ def TTCore_ReduceTypeArrayAttr : TypedArrayAttrBase<TTCore_ReduceTypeAttr, "">;
+ 
++def TTCore_MaskedCompareAttr : EnumAttr<TTCore_Dialect, TTCore_MaskedCompare, "masked_compare"> {
++  let assemblyFormat = "`<` $value `>`";
++}
++
++def TTCore_MaskedModeAttr : EnumAttr<TTCore_Dialect, TTCore_MaskedMode, "masked_mode"> {
++  let assemblyFormat = "`<` $value `>`";
++}
++
+ def TTCore_MeshShardDirectionAttr : EnumAttr<TTCore_Dialect, TTCore_MeshShardDirection, "shard_direction"> {
+   let assemblyFormat = "`<` $value `>`";
+ }
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -2841,6 +2841,28 @@
+   }];
+ }
+ 
++def TTIR_MaskedReduceOp : TTIR_NamedOp<"masked_reduce"> {
++  let summary = "Count, or sum, the elements of each row that compare true against the row's threshold";
++  let description = [{
++    `input` is [..., H, W] and `threshold` [..., H, 1] or [..., H], FP32 or
++    BF16 of one type. Per row, the result, shaped like the threshold, holds how
++    many elements satisfy `input <compare> threshold` (mode count, FP32 or
++    I32), or their sum (mode sum, FP32):
++
++      result[..., h] = sum_w (input[..., h, w] <cmp> threshold[..., h]) ? (count ? 1 : input[..., h, w]) : 0
++
++    One pass over the input, where a reduction of a compare, or of a select on
++    one, reads the input and two intermediates of its size.
++  }];
++
++  let arguments = (ins AnyRankedTensor:$input,
++                       AnyRankedTensor:$threshold,
++                       TTCore_MaskedCompareAttr:$compare,
++                       TTCore_MaskedModeAttr:$mode);
++
++  let results = (outs AnyRankedTensor:$result);
++}
++
+ def TTIR_SumOp : TTIR_ReductionOp<"sum"> {
+     let summary = "Sum reduction operation.";
+     let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1128,6 +1128,28 @@
+   }];
+ }
+ 
++def TTNN_MaskedReduceOp : TTNN_Op<"masked_reduce", [OpModelExempt]> {
++    let summary = "Count, or sum, the elements of each row that compare true against the row's threshold.";
++    let description = [{
++      ttnn::experimental::masked_reduce, see ttir.masked_reduce. The input
++      ([..., H, W]) and threshold ([..., H, 1] or [..., H]) are tiled FP32 or
++      BF16 of one type; the result is tiled FP32, or I32 for counts, shaped like the threshold.
++    }];
++
++    let arguments = (ins AnyRankedTensor:$input,
++                         AnyRankedTensor:$threshold,
++                         TTCore_MaskedCompareAttr:$compare,
++                         TTCore_MaskedModeAttr:$mode);
++
++    let results = (outs AnyRankedTensor:$result);
++
++    let extraClassDeclaration = [{
++      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
++        return wa::TTNNOperandsWorkaroundsFactory::createMaskedReduceOpOperandsWorkarounds(*this);
++      }
++    }];
++}
++
+ def TTNN_ArgMaxOp : TTNN_Op<"argmax"> {
+   let summary = "Argmax reduction op.";
+   let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -351,6 +351,11 @@
+   // Create workarounds for ArgMax op operands.
+   static TTNNOperandsWorkarounds createArgMaxOpOperandsWorkarounds();
+ 
++  // Create workarounds for masked_reduce: tiled FP32 or BF16 input and
++  // threshold of one type, tiled FP32 result.
++  static TTNNOperandsWorkarounds
++  createMaskedReduceOpOperandsWorkarounds(mlir::Operation *op);
++
+   // Create workarounds for pad op operands.
+   static TTNNOperandsWorkarounds
+   createPadOpOperandsWorkarounds(mlir::TypedValue<mlir::RankedTensorType> input,
+diff --git a/include/ttmlir/Target/TTNN/operations/reduction.fbs b/include/ttmlir/Target/TTNN/operations/reduction.fbs
+--- a/include/ttmlir/Target/TTNN/operations/reduction.fbs
++++ b/include/ttmlir/Target/TTNN/operations/reduction.fbs
+@@ -38,6 +38,29 @@
+   memcfg: tt.target.ttnn.MemoryConfig;
+ }
+ 
++// ttnn::experimental::masked_reduce: per row of the [..., H, W] input, the
++// count or sum of the elements that compare true against the [..., H, 1] or
++// [..., H] threshold, shaped like it, FP32 or (counts) I32 as the output's type.
++enum MaskedCompareType: uint32 {
++  GT,
++  GE,
++  LT,
++  LE,
++}
++
++enum MaskedModeType: uint32 {
++  Count,
++  Sum,
++}
++
++table MaskedReduceOp {
++  input: tt.target.ttnn.TensorRef;
++  threshold: tt.target.ttnn.TensorRef;
++  out: tt.target.ttnn.TensorRef;
++  compare: MaskedCompareType;
++  mode: MaskedModeType;
++}
++
+ table TopKOp {
+   input_tensor: tt.target.ttnn.TensorRef;
+   k: int32;
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -143,6 +143,7 @@
+   ReductionArgMaxOp,
+   ReductionOp,
+   ReductionProdOp,
++  MaskedReduceOp,
+   ReduceScatterOp,
+   RepeatInterleaveOp,
+   RepeatOp,
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -281,6 +281,24 @@
+ } // namespace
+ 
+ namespace {
++class MaskedReduceOpConversionPattern
++    : public OpConversionPattern<ttir::MaskedReduceOp> {
++public:
++  using OpConversionPattern<ttir::MaskedReduceOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(ttir::MaskedReduceOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    rewriter.replaceOpWithNewOp<ttnn::MaskedReduceOp>(
++        op, this->getTypeConverter()->convertType(op.getType()),
++        adaptor.getInput(), adaptor.getThreshold(), adaptor.getCompareAttr(),
++        adaptor.getModeAttr());
++    return success();
++  }
++};
++} // namespace
++
++namespace {
+ class ReductionArgMaxOpConversionPattern
+     : public OpConversionPattern<ttir::ArgMaxOp> {
+ public:
+@@ -4132,6 +4150,7 @@
+                                         ttnn::ReduceBitwiseXorOp>,
+            ReductionProdOpConversionPattern,
+            ReductionArgMaxOpConversionPattern,
++           MaskedReduceOpConversionPattern,
+            ElementwiseUnaryWithFloatParameterOpConversionPattern<ttir::LeakyReluOp, ttnn::LeakyReluOp>,
+            ReducePrecisionOpConversionPattern,
+            BroadcastOpConversionPattern,
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -30,6 +30,8 @@
+ #include <type_traits>
+ 
+ namespace mlir::tt::ttir {
++// Defined in libtt's tt_mlir/lib/Dialect/TTIR/Transforms/MaskedReduceFusion.cpp.
++void populateMaskedReduceFusionPatterns(RewritePatternSet &patterns);
+ #define GEN_PASS_DEF_TTIRFUSING
+ #include "ttmlir/Dialect/TTIR/Transforms/Passes.h.inc"
+ 
+@@ -4404,6 +4406,7 @@
+       patterns.add<Relu6FusionPattern>(&getContext());
+       patterns.add<SiluFusionPattern>(&getContext());
+       patterns.add<ExpandedSigmoidFusionPattern>(&getContext());
++      populateMaskedReduceFusionPatterns(patterns);
+       patterns.add<HardsigmoidFusionPattern>(&getContext());
+       patterns.add<MishFusingPattern>(&getContext());
+       patterns.add<ReshapeBroadcastReshapeToRepeatPattern>(&getContext());
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -1018,6 +1018,27 @@
+       .addOutputOperandWorkaround(rowMajorLayoutUint32Workaround);
+ }
+ 
++// masked_reduce (ttnn::experimental) reads tiled FP32 or BF16 tiles, the
++// threshold in the input's type, and writes a tiled FP32 or I32 result.
++TTNNOperandsWorkarounds
++TTNNOperandsWorkaroundsFactory::createMaskedReduceOpOperandsWorkarounds(
++    mlir::Operation *op) {
++  auto masked = mlir::cast<ttnn::MaskedReduceOp>(op);
++  Type inputType = masked.getInput().getType().getElementType();
++  TTNNOperandWorkarounds operand;
++  operand.tensorLayoutWorkaround = Layout::Tile;
++  operand.tensorDataTypeWorkaround = inputType.isBF16()
++                                         ? ttcore::DataType::BFloat16
++                                         : ttcore::DataType::Float32;
++  TTNNOperandWorkarounds result;
++  result.tensorLayoutWorkaround = Layout::Tile;
++  result.tensorDataTypeWorkaround = masked.getResult().getType().getElementType().isInteger(32) ? ttcore::DataType::Int32 : ttcore::DataType::Float32;
++  return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
++      .addInputOperandWorkaround(operand) // input
++      .addInputOperandWorkaround(operand) // threshold
++      .addOutputOperandWorkaround(result);
++}
++
+ // Factory method to create a set of workarounds for Pad op operands.
+ // tt-metal does not support front padding for tile layout.
+ // https://github.com/tenstorrent/tt-metal/issues/10987
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+@@ -702,5 +702,8 @@
+         // Preserve ArgMax's row-major requirement at every optimization level.
+         // Tiled inputs select tt-metal's single-core implementation.
+         ttnn::ArgMaxOp::getOperationName(),
++        // masked_reduce reads tiled FP32/BF16 and writes FP32 at every
++        // optimization level.
++        ttnn::MaskedReduceOp::getOperationName(),
+ };
+ } // namespace mlir::tt::ttnn
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -3163,6 +3163,22 @@
+       *cache.fbb, in, output, dim, op.getKeepDim(), memoryConfig);
+ }
+ 
++::flatbuffers::Offset<::tt::target::ttnn::MaskedReduceOp>
++createOp(FlatbufferObjectCache &cache, MaskedReduceOp op) {
++  auto input = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getInput()));
++  auto threshold = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getThreshold()));
++  auto output =
++      cache.getOrCreateNoSharding(op.getResult(), tensorValueToFlatbuffer,
++                                  /*local_shape*/ std::nullopt);
++  // The flatbuffer enums list the cases in the dialect enums' order.
++  return ::tt::target::ttnn::CreateMaskedReduceOp(
++      *cache.fbb, input, threshold, output,
++      static_cast<::tt::target::ttnn::MaskedCompareType>(op.getCompare()),
++      static_cast<::tt::target::ttnn::MaskedModeType>(op.getMode()));
++}
++
+ template <typename ReductionOp>
+ ::flatbuffers::Offset<::tt::target::ttnn::ReductionProdOp>
+ createReductionProdOp(FlatbufferObjectCache &cache, ReductionOp op) {
+@@ -5408,6 +5424,10 @@
+     return createOperation(cache, createReductionProdOp(cache, prodOp),
+                            debugString, locInfo);
+   }
++  if (auto maskedReduceOp = dyn_cast<MaskedReduceOp>(op); maskedReduceOp) {
++    return createOperation(cache, createOp(cache, maskedReduceOp), debugString,
++                           locInfo);
++  }
+   if (auto embeddingOp = dyn_cast<EmbeddingOp>(op); embeddingOp) {
+     return createOperation(cache, createEmbeddingOp(cache, embeddingOp),
+                            debugString, locInfo);
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -105,6 +105,7 @@
+ #include "operations/reduction/cumprod.h"
+ #include "operations/reduction/cumulative.h"
+ #include "operations/reduction/cumsum.h"
++#include "operations/reduction/masked_reduce.h"
+ #include "operations/reduction/prod.h"
+ #include "operations/reduction/reduction.h"
+ #include "operations/reduction/sampling.h"
+@@ -419,6 +420,10 @@
+     return operations::reduction::run(op->type_as_ReductionProdOp(),
+                                       getContext());
+   }
++  case ::tt::target::ttnn::OpType::MaskedReduceOp: {
++    return operations::reduction::run(op->type_as_MaskedReduceOp(),
++                                      getContext());
++  }
+   case ::tt::target::ttnn::OpType::ReductionOp: {
+     return operations::reduction::run(op->type_as_ReductionOp(), getContext());
+   }
