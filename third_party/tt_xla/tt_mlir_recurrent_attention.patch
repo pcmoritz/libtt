@@ -591,7 +591,7 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 new file mode 100644
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,104 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +#include "operations/transformer/recurrent.h"
@@ -645,7 +645,8 @@ new file mode 100644
 +      get(op->query()), get(op->key()), get(op->value()), get(op->gate()),
 +      get(op->beta()), 1.0f,
 +      tiled(get(op->initial_state()), ::ttnn::DataType::FLOAT32), true, 32,
-+      false, false, /*use_mcast=*/true,
++      false, false, ::ttnn::transformer::ChunkGdnPhasedProgramConfig{},
++      ::ttnn::transformer::ChunkGdnWyInverse::HORNER,
 +      ::ttnn::DRAM_MEMORY_CONFIG, std::nullopt, get(op->eye()), get(op->tril()),
 +      get(op->ones()), get(op->masks()));
 +  put(pool, op->final_state(), state.value());
