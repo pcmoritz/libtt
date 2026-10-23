@@ -1,21 +1,19 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4296,6 +4296,9 @@
+@@ -4296,6 +4296,8 @@
        - `execute_callee` FlatSymbolRefAttr: The symbol of the execute trace function.
        - `inputs` Variadic<AnyRankedTensor>: The input tensors to the trace function.
        - `semaphore_inputs` Variadic<TTNN_GlobalSemaphore>: Global semaphores forwarded into the capture/execute programs.
-+      - `trace_key_input_indices` DenseI32ArrayAttr: Host scalar input indices whose values select the captured control-flow path.
 +      - `device_resident_input_indices` DenseI32ArrayAttr: Inputs captured by address, acting as their own persistent
 +        slots. Every other input is host-staged: copied into a slot before each replay, from host or from device.
      Outputs:
        - `results` Variadic<AnyRankedTensor>: The output tensors from the trace function.
    }];
-@@ -4304,16 +4307,18 @@
+@@ -4304,16 +4306,17 @@
                         FlatSymbolRefAttr:$allocate_slots_callee,
                         FlatSymbolRefAttr:$capture_callee,
                         FlatSymbolRefAttr:$execute_callee,
-+                       DenseI32ArrayAttr:$trace_key_input_indices,
 +                       DenseI32ArrayAttr:$device_resident_input_indices,
                         Variadic<AnyRankedTensor>:$inputs,
                         Variadic<TTNN_GlobalSemaphore>:$semaphore_inputs);
@@ -37,11 +35,10 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/trace.fbs b/include/ttmlir/Target/TTNN/operations/trace.fbs
 --- a/include/ttmlir/Target/TTNN/operations/trace.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/trace.fbs
-@@ -30,4 +30,6 @@
+@@ -30,4 +30,5 @@
    inputs: [tt.target.ttnn.TensorRef];
    outputs: [tt.target.ttnn.TensorRef];
    semaphore_inputs: [tt.target.ttnn.GlobalSemaphoreRef];
-+  trace_key_input_indices: [uint32];
 +  device_resident_input_indices: [uint32];
  }
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
@@ -60,7 +57,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
        deviceResidentIndices.push_back(i);
      } else {
        hostStagedIndices.push_back(i);
-@@ -6311,10 +6311,46 @@
+@@ -6311,10 +6311,28 @@
    auto opInputs = this->getInputs();
    auto opSemaphoreInputs = this->getSemaphoreInputs();
    auto opOutputs = this->getResults();
@@ -81,24 +78,6 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +                           << " must reside on device";
 +    }
 +  }
-+
-+  llvm::SmallVector<int32_t> seenTraceKeyInputIndices;
-+  for (int32_t index : getTraceKeyInputIndices()) {
-+    if (llvm::is_contained(seenTraceKeyInputIndices, index)) {
-+      return emitOpError() << "Duplicate trace-key input index " << index;
-+    }
-+    seenTraceKeyInputIndices.push_back(index);
-+    if (index < 0 || static_cast<size_t>(index) >= opInputs.size()) {
-+      return emitOpError() << "Trace-key input index " << index
-+                           << " is out of range";
-+    }
-+    auto inputType = mlir::cast<RankedTensorType>(opInputs[index].getType());
-+    if (utils::isTensorOnDevice(inputType) ||
-+        llvm::is_contained(seenDeviceResidentInputIndices, index)) {
-+      return emitOpError() << "Trace-key input " << index
-+                           << " must reside in system memory";
-+    }
-+  }
  
 -  // An input already on device acts as its own persistent slot and is handed
 -  // to the allocation program, while an input in system memory is staged into
@@ -110,7 +89,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
    auto [deviceResidentIndices, hostStagedIndices] = partitionInputIndices();
    llvm::SmallVector<mlir::Type> deviceResidentInputTypes;
    llvm::SmallVector<mlir::Type> hostStagedInputTypes;
-@@ -6322,7 +6358,9 @@
+@@ -6322,7 +6340,9 @@
      deviceResidentInputTypes.push_back(opInputs[i].getType());
    }
    for (size_t i : hostStagedIndices) {
@@ -121,45 +100,6 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
    }
  
    // Verify the slot allocation function: it takes the device-resident inputs
-@@ -6475,7 +6513,7 @@
-                             "into the output slot arguments";
-   }
- 
--  for (BlockArgument arg : traceFuncOp.getArguments()) {
-+  for (auto [argIndex, arg] : llvm::enumerate(traceFuncOp.getArguments())) {
-     auto tensorType = ::mlir::dyn_cast<RankedTensorType>(arg.getType());
-     if (!tensorType) {
-       if (::mlir::isa<ttnn::GlobalSemaphoreType>(arg.getType())) {
-@@ -6484,10 +6522,11 @@
-       return emitOpError() << "All input arguments of trace function must be "
-                            << "ranked tensors or global semaphores";
-     }
--    if (!utils::isTensorOnDevice(tensorType)) {
-+    if (!utils::isTensorOnDevice(tensorType) &&
-+        !llvm::is_contained(getTraceKeyInputIndices(), argIndex)) {
-       return emitOpError()
--             << "All input arguments of trace function must be on device."
--             << arg << " is not on device.";
-+             << "Trace function argument " << argIndex
-+             << " is not on device and is not a trace-key input";
-     }
-   }
- 
-@@ -6533,6 +6572,14 @@
-               auto tensorType =
-                   ::mlir::cast<RankedTensorType>(operand.getType());
-               if (!utils::isTensorOnDevice(tensorType)) {
-+                auto blockArg = mlir::dyn_cast<BlockArgument>(operand);
-+                auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(op);
-+                if (blockArg && caseOp && operand == caseOp.getIndex() &&
-+                    blockArg.getOwner() == &traceFuncOp.getBody().front() &&
-+                    llvm::is_contained(getTraceKeyInputIndices(),
-+                                       blockArg.getArgNumber())) {
-+                  continue;
-+                }
-                 emitOpError()
-                     << "All input tensors of trace function must be on device."
-                     << operand << " is not on device.";
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
@@ -177,16 +117,15 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -16,6 +16,8 @@
+@@ -16,6 +16,7 @@
  #include "ttmlir/FunctionTypes.h"
  #include "ttmlir/Utils.h"
  #include "llvm/ADT/Sequence.h"
-+#include "llvm/ADT/SetVector.h"
 +#include "llvm/ADT/SmallPtrSet.h"
  #include <algorithm>
  #include <atomic>
  
-@@ -48,24 +50,51 @@
+@@ -48,24 +49,51 @@
  
    void runOnOperation() final {
      mlir::ModuleOp moduleOp = this->getOperation();
@@ -249,107 +188,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
    }
  
    std::uint64_t getUniqueTraceFuncIndex() {
-@@ -317,6 +346,9 @@
-     llvm::SmallVector<mlir::Type> outputSlotTypes;
-     // Types of the trailing semaphore arguments.
-     llvm::SmallVector<mlir::Type> semaphoreTypes;
-+    // Host scalar tensor inputs whose values identify the captured control-flow
-+    // path. Indices use trace-main's tensor input argument order.
-+    llvm::SmallVector<int32_t> traceKeyInputIndices;
- 
-     // Contiguous views over the two halves of the tensor-input partition.
-     auto deviceResidentIndices() const {
-@@ -337,6 +369,9 @@
-       return llvm::ArrayRef<mlir::DictionaryAttr>(inputArgAttrs)
-           .take_front(numDeviceResident);
-     }
-+    bool isTraceKeyInput(size_t index) const {
-+      return llvm::is_contained(traceKeyInputIndices, index);
-+    }
-   };
- 
-   // Creates the trace-main function and returns the TraceMainFuncInfo
-@@ -349,6 +384,7 @@
-   ::mlir::FailureOr<TraceMainFuncInfo>
-   createTraceFunction(func::FuncOp funcOp,
-                       llvm::ArrayRef<Operation *> opsToHoist,
-+                      llvm::ArrayRef<mlir::Value> keys,
-                       uint64_t traceFuncIndex) {
-     mlir::MLIRContext *context = &this->getContext();
-     mlir::OpBuilder builder(context);
-@@ -379,6 +415,21 @@
-             [&](mlir::Value input) { return isDeviceResidentValue(input); }) -
-         inputs.begin();
- 
-+    // A trace captures one fixed command sequence. The host scalars that
-+    // select the case branches it holds form the trace key, so a trace is
-+    // captured per combination of their values. Every key is a host scalar
-+    // argument of the function that a hoisted case uses, hence a boundary
-+    // input of the trace.
-+    llvm::SmallVector<int32_t> traceKeyInputIndices;
-+    for (mlir::Value key : keys) {
-+      auto it = llvm::find(inputs, key);
-+      size_t inputIndex = std::distance(inputs.begin(), it);
-+      if (it == inputs.end() || inputIndex >= numTensorInputs) {
-+        return funcOp.emitError("trace key is not a boundary input");
-+      }
-+      traceKeyInputIndices.push_back(static_cast<int32_t>(inputIndex));
-+    }
-+
-     for (mlir::Value output : outputs) {
-       outputTypes.push_back(output.getType());
-     }
-@@ -481,12 +532,22 @@
-     info.traceFunc = traceFuncOp;
-     info.numTensorInputs = numTensorInputs;
-     info.numDeviceResident = numDeviceResident;
-+    info.traceKeyInputIndices = std::move(traceKeyInputIndices);
-     for (size_t i = 0; i < numTensorInputs; i++) {
-       auto tensorType = mlir::cast<RankedTensorType>(inputs[i].getType());
-       info.inputArgAttrs.push_back(
-           inputAttrs[i] ? inputAttrs[i] : mlir::DictionaryAttr::get(context));
-       if (i < numDeviceResident) {
-         info.inputSlotTypes.push_back(tensorType);
-+      } else if (info.isTraceKeyInput(i)) {
-+        // The key's ordinary slot is only a positional placeholder. Use a
-+        // supported device dtype; Boolean tensors cannot be device-resident.
-+        auto slotElementType = builder.getI32Type();
-+        auto slotEncoding = ttnn::TTNNLayoutAttr::Builder(
-+                                context, tensorType.getShape(), slotElementType)
-+                                .build();
-+        info.inputSlotTypes.push_back(RankedTensorType::get(
-+            tensorType.getShape(), slotElementType, slotEncoding));
-       } else {
-         info.inputSlotTypes.push_back(utils::RankedTensorTypeFactory::create(
-             tensorType, BufferType::DRAM));
-@@ -654,18 +715,21 @@
-       traceOutputSlots.push_back(captureFunc.getArgument(outputSlotBase + i));
-     }
- 
--    // Transfer the host-staged inputs into their device slots. This has to
--    // happen before the capture window opens: tt-metal rejects host writes
-+    // Start with input slots, forwarding trace keys directly from host.
-+    // Stage other host inputs before capture: tt-metal rejects host writes
-     // while a capture is active.
-+    llvm::SmallVector<mlir::Value> traceCallArgs(inputSlots);
-     for (auto [h, argIndex] : llvm::enumerate(info.hostStagedIndices())) {
-+      if (info.isTraceKeyInput(argIndex)) {
-+        traceCallArgs[argIndex] = captureFunc.getArgument(h);
-+        continue;
-+      }
-       builder.create<ttnn::WriteTensorOp>(
-           captureFunc.getLoc(), captureFunc.getArgument(h),
-           inputSlots[argIndex], /*blocking=*/false, /*cq_id=*/0);
-     }
- 
--    // Rebuild the trace function's call arguments in its own argument order:
--    // [tensor inputs from their slots][output slots][semaphores].
--    llvm::SmallVector<mlir::Value> traceCallArgs(inputSlots);
-+    // Append output slots and semaphores in trace function argument order.
-     llvm::append_range(traceCallArgs, traceOutputSlots);
-     for (size_t i = 0; i < info.semaphoreTypes.size(); i++) {
-       traceCallArgs.push_back(captureFunc.getArgument(semaphoreBase + i));
-@@ -912,30 +976,46 @@
+@@ -912,30 +940,45 @@
        }
        tensorInputs[argIndex] = input;
      }
@@ -396,29 +235,12 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
          allocateSlotsTraceSymbolAttr, captureTraceSymbolAttr,
 -        executeTraceSymbolAttr, tensorInputs, semaphoreInputs);
 +        executeTraceSymbolAttr,
-+        builder.getDenseI32ArrayAttr(info.traceKeyInputIndices),
 +        builder.getDenseI32ArrayAttr(deviceResidentInputIndices), tensorInputs,
 +        semaphoreInputs);
  
      // Replace uses of original outputs with the output of the trace op function
      for (size_t i = 0; i < info.boundaryOutputs.size(); i++) {
-@@ -957,12 +1037,13 @@
- 
-   mlir::LogicalResult
-   performHoistTransform(func::FuncOp funcOp,
--                        llvm::ArrayRef<Operation *> opsToHoist) {
-+                        llvm::ArrayRef<Operation *> opsToHoist,
-+                        llvm::ArrayRef<mlir::Value> keys) {
-     uint64_t traceFuncIndex = getUniqueTraceFuncIndex();
-     // Create the trace function. Everything the downstream builders need to
-     // know about it is computed here, once.
-     mlir::FailureOr<TraceMainFuncInfo> info =
--        createTraceFunction(funcOp, opsToHoist, traceFuncIndex);
-+        createTraceFunction(funcOp, opsToHoist, keys, traceFuncIndex);
-     if (failed(info)) {
-       return mlir::failure();
-     }
-@@ -1034,94 +1115,189 @@
+@@ -1034,94 +1077,179 @@
      }
    }
  
@@ -460,10 +282,8 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 -    mlir::Block &block = funcOp.getBlocks().front();
 +  // Whether the runtime can replay `op` from a trace: straight-line device
 +  // work, or a counted loop of it. Anything else runs eagerly, reading what
-+  // it needs from device, and the traces move into its programs. No trace
-+  // specializes on a host control-flow key any more; `keys` stays empty.
-+  bool isCapturable(func::FuncOp funcOp, Operation *op,
-+                    llvm::SetVector<mlir::Value> &keys) {
++  // it needs from device, and the traces move into its programs.
++  bool isCapturable(Operation *op) {
 +    return shouldHoistOp(op) || isCapturableCountedLoop(op);
 +  }
  
@@ -607,28 +427,20 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +    if (funcOp.getBlocks().size() != 1) {
 +      return funcOp.emitError("FuncOp should have exactly one block");
 +    }
++
++    mlir::Block &block = funcOp.getBlocks().front();
  
 -      // Move the mid-graph creation ops above the first hoistable op so the
 -      // trace op (inserted at the first hoistable op) dominates its operands.
 -      for (Operation *creationOp : creationOpsToSink) {
 -        creationOp->moveBefore(allOps[firstHoistable]);
-+    mlir::Block &block = funcOp.getBlocks().front();
-+
 +    sinkAdamWOpsToEnd(block);
-+
-+    // A maximal run of capturable ops and the host keys its traces select
-+    // with.
-+    struct Run {
-+      llvm::SmallVector<Operation *> ops;
-+      llvm::SetVector<mlir::Value> keys;
-+    };
 +
 +    Operation *firstHoistable = nullptr;
 +    llvm::SmallVector<Operation *> independentOps;
 +    for (mlir::Operation &op : block.without_terminator()) {
 +      if (!firstHoistable) {
-+        llvm::SetVector<mlir::Value> keys;
-+        if (isCapturable(funcOp, &op, keys)) {
++        if (isCapturable(&op)) {
 +          firstHoistable = &op;
 +        }
 +      } else if (isIndependentOp(&op)) {
@@ -641,29 +453,29 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
  
 -    if (opsToHoist.empty()) {
 -      return mlir::success();
-+    llvm::SmallVector<Run> runs;
-+    Run run;
++    // Each maximal run of capturable ops becomes a trace of its own.
++    llvm::SmallVector<llvm::SmallVector<Operation *>> runs;
++    llvm::SmallVector<Operation *> run;
 +    for (mlir::Operation &op : block.without_terminator()) {
-+      if (isCapturable(funcOp, &op, run.keys)) {
-+        run.ops.push_back(&op);
++      if (isCapturable(&op)) {
++        run.push_back(&op);
 +        continue;
 +      }
-+      if (!run.ops.empty()) {
++      if (!run.empty()) {
 +        runs.push_back(std::move(run));
-+        run = Run();
++        run.clear();
 +      }
 +      collectEagerCallees(&op, callees);
 +    }
-+    if (!run.ops.empty()) {
++    if (!run.empty()) {
 +      runs.push_back(std::move(run));
      }
  
 -    // Perform the hoist transform
 -    if (failed(performHoistTransform(funcOp, opsToHoist))) {
 -      return mlir::failure();
-+    for (const Run &hoisted : runs) {
-+      if (failed(performHoistTransform(funcOp, hoisted.ops,
-+                                       hoisted.keys.getArrayRef()))) {
++    for (const auto &hoisted : runs) {
++      if (failed(performHoistTransform(funcOp, hoisted))) {
 +        return mlir::failure();
 +      }
      }
@@ -678,15 +490,10 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -3593,6 +3593,17 @@
+@@ -3593,6 +3593,12 @@
          getOperandThroughDPSOps(input)));
    }
  
-+  std::vector<uint32_t> traceKeyInputIndices;
-+  for (int32_t index : op.getTraceKeyInputIndices()) {
-+    assert(index >= 0 && static_cast<size_t>(index) < inputs.size());
-+    traceKeyInputIndices.push_back(static_cast<uint32_t>(index));
-+  }
 +  std::vector<uint32_t> deviceResidentInputIndices;
 +  for (int32_t index : op.getDeviceResidentInputIndices()) {
 +    assert(index >= 0 && static_cast<size_t>(index) < inputs.size());
@@ -696,58 +503,22 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
    std::vector<::flatbuffers::Offset<::tt::target::ttnn::TensorRef>> outputs;
    for (auto result : op.getResults()) {
      outputs.push_back(
-@@ -3627,7 +3638,7 @@
+@@ -3627,7 +3633,7 @@
    return ::tt::target::ttnn::CreateCaptureOrExecuteTraceOpDirect(
        *cache.fbb, cache.at<::tt::target::DeviceRef>(device), captureProgramIdx,
        executeProgramIdx, allocateSlotsProgramIdx, &inputs, &outputs,
 -      &semaphoreInputs);
-+      &semaphoreInputs, &traceKeyInputIndices, &deviceResidentInputIndices);
++      &semaphoreInputs, &deviceResidentInputIndices);
  }
  
  ::flatbuffers::Offset<::tt::target::ttnn::ConcatenateHeadsOp>
-diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
---- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
-+++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
-@@ -5,6 +5,7 @@
- #ifndef TT_RUNTIME_DETAIL_TTNN_TYPES_TRACE_CACHE_H
- #define TT_RUNTIME_DETAIL_TTNN_TYPES_TRACE_CACHE_H
- 
-+#include <cstdint>
- #include <vector>
- 
- #include "tt/runtime/detail/common/logger.h"
-@@ -15,6 +16,8 @@ namespace tt::runtime::ttnn {
- 
- struct TraceVariant {
-   ::ttnn::MeshTraceId traceId;
-+  /// Host scalar values that selected the command path captured by this trace.
-+  std::vector<std::int64_t> traceKey;
-   /// Persistent input slots this trace was captured against. Device-resident
-   /// inputs are the caller's buffers, so they also identify which invocations
-   /// can replay this variant.
 diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 --- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 +++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
-@@ -3,6 +3,7 @@
- // SPDX-License-Identifier: Apache-2.0
- 
- #include <algorithm>
-+#include <cstdint>
- 
- #include "operations/trace/capture_or_execute_trace.h"
- #include "tt/runtime/detail/common/logger.h"
-@@ -26,6 +27,68 @@
+@@ -26,6 +26,20 @@
                                     op->execute_program_id())};
  }
  
-+static bool isTraceKeyInput(
-+    const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op, size_t inputIndex) {
-+  const auto *indices = op->trace_key_input_indices();
-+  return indices &&
-+         std::find(indices->begin(), indices->end(), inputIndex) !=
-+             indices->end();
-+}
-+
 +// Whether input `inputIndex` is captured by address rather than copied into
 +// a slot. Binaries that predate the explicit partition record it in the
 +// input's storage type.
@@ -762,50 +533,10 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
 +         indices->end();
 +}
 +
-+static std::int64_t readTraceKeyScalar(const ::ttnn::Tensor &tensor) {
-+  LOG_ASSERT(tensor.storage_type() == ::ttnn::StorageType::HOST,
-+             "Trace-key inputs must reside on host");
-+  switch (tensor.dtype()) {
-+  case ::ttnn::DataType::INT32:
-+    return ::tt::runtime::ttnn::utils::getScalarFromTensor<int32_t>(tensor);
-+  case ::ttnn::DataType::UINT32:
-+    return ::tt::runtime::ttnn::utils::getScalarFromTensor<uint32_t>(tensor);
-+  case ::ttnn::DataType::UINT16:
-+    return ::tt::runtime::ttnn::utils::getScalarFromTensor<uint16_t>(tensor);
-+  case ::ttnn::DataType::UINT8:
-+    return ::tt::runtime::ttnn::utils::getScalarFromTensor<uint8_t>(tensor);
-+  case ::ttnn::DataType::BFLOAT16:
-+    return static_cast<float>(
-+               ::tt::runtime::ttnn::utils::getScalarFromTensor<bfloat16>(tensor)) !=
-+           0;
-+  default:
-+    LOG_FATAL("Unsupported integer trace-key scalar data type");
-+  }
-+}
-+
-+static std::vector<std::int64_t>
-+getTraceKey(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
-+            ProgramContext &context) {
-+  std::vector<std::int64_t> key;
-+  const auto *indices = op->trace_key_input_indices();
-+  if (!indices) {
-+    return key;
-+  }
-+  key.reserve(indices->size());
-+  for (uint32_t inputIndex : *indices) {
-+    LOG_ASSERT(inputIndex < op->inputs()->size(),
-+               "Trace-key input index is out of range");
-+    const auto &tensor = context.getTensorPool().getTTNNTensorAndValidate(
-+        op->inputs()->Get(inputIndex));
-+    key.push_back(readTraceKeyScalar(tensor));
-+  }
-+  return key;
-+}
-+
  static void copyTensorFromHostToDevice(const ::ttnn::Tensor &srcTensor,
                                         ::ttnn::Tensor &dstTensor) {
  
-@@ -71,10 +134,10 @@
+@@ -71,10 +85,10 @@
    ::tt::runtime::Device deviceHandle = context.getDeviceHandle();
  
    std::vector<::tt::runtime::Tensor> deviceResidentInputs;
@@ -819,7 +550,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
      }
    }
  
-@@ -98,8 +161,7 @@
+@@ -98,8 +112,7 @@
    // the trace cache.
    for (size_t i = 0; i < slots.size(); ++i) {
      const bool callerOwnedDeviceInput =
@@ -829,13 +560,9 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
      if (!callerOwnedDeviceInput) {
        slots[i]
            .as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN)
-@@ -130,9 +192,11 @@
-              " got: ", inputSlots.size());
+@@ -131,8 +144,7 @@
  
    for (size_t i = 0; i < op->inputs()->size(); i++) {
-+    if (isTraceKeyInput(op, i)) {
-+      continue;
-+    }
      const ::tt::target::ttnn::TensorRef *input = op->inputs()->Get(i);
 -    const bool deviceResident =
 -        ::tt::runtime::ttnn::utils::inDeviceMemory(input);
@@ -843,17 +570,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
      if (deviceResidentOnly && !deviceResident) {
        continue;
      }
-@@ -215,7 +279,8 @@
-     const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
-     ProgramContext &context,
-     std::vector<::tt::runtime::Tensor> &inputSlots,
--    std::vector<::tt::runtime::Tensor> &outputSlots) {
-+    std::vector<::tt::runtime::Tensor> &outputSlots,
-+    const std::vector<std::int64_t> &traceKey) {
-   ProgramTensorPool &tensorPool = context.getTensorPool();
-   ::tt::runtime::Device deviceHandle = context.getDeviceHandle();
-   // Program inputs are, in order: the host-staged inputs, the trace input
-@@ -225,8 +290,9 @@
+@@ -225,8 +237,9 @@
    std::vector<::tt::runtime::Tensor> captureInputs;
    captureInputs.reserve(op->inputs()->size() + inputSlots.size() +
                          outputSlots.size());
@@ -865,7 +582,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
        const ::tt::runtime::Tensor &tensor =
            tensorPool.getRuntimeTensorAndValidate(input);
        const ::ttnn::Tensor &ttnnTensor =
-@@ -271,7 +337,7 @@
+@@ -271,7 +284,7 @@
  
    std::vector<::tt::runtime::Tensor> ownedTensors;
    for (size_t i = 0; i < op->inputs()->size(); ++i) {
@@ -874,15 +591,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
        ownedTensors.push_back(inputSlots[i]);
      }
    }
-@@ -282,6 +348,7 @@
-       .traceId = ::ttnn::MeshTraceId(
-           ::tt::runtime::ttnn::utils::getScalarFromTensor<uint32_t>(
-               traceIdTensor)),
-+      .traceKey = traceKey,
-       .inputTensors = inputSlots,
-       .outputTensors = outputSlots,
-       .ownedTensors = std::move(ownedTensors)};
-@@ -334,7 +401,7 @@
+@@ -334,7 +347,7 @@
               "Mismatched number of trace inputs");
    for (size_t i = 0; i < op->inputs()->size(); ++i) {
      const ::tt::target::ttnn::TensorRef *input = op->inputs()->Get(i);
@@ -891,39 +600,3 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
        continue;
      }
      const ::ttnn::Tensor &current =
-@@ -367,6 +434,7 @@
-           ->asSharedPtr<::tt::runtime::ttnn::TraceCache>(DeviceRuntime::TTNN);
-   LOG_ASSERT(traceCache, "TraceCache must be initialized in DeviceHandle");
- 
-+  std::vector<std::int64_t> traceKey = getTraceKey(op, context);
-   auto [mainProgramKey, captureExecuteKey] = getTraceCacheKeys(op, context);
- 
-   if (!traceCache->contains(mainProgramKey, captureExecuteKey)) {
-@@ -394,7 +462,7 @@
-                           /*deviceResidentOnly=*/true);
-     TraceData traceData;
-     traceData.variants.push_back(
--        captureTrace(op, context, inputSlots, outputSlots));
-+        captureTrace(op, context, inputSlots, outputSlots, traceKey));
-     traceCache->insert(mainProgramKey, captureExecuteKey, std::move(traceData));
- 
-     debug::Stats::get().incrementStat("TraceCacheMiss");
-@@ -408,7 +476,8 @@
-   auto variantIt = std::find_if(
-       traceData->variants.rbegin(), traceData->variants.rend(),
-       [&](const TraceVariant &variant) {
--        return deviceInputsMatch(op, context, variant) &&
-+        return variant.traceKey == traceKey &&
-+               deviceInputsMatch(op, context, variant) &&
-                meshDevice.is_mesh_trace_replay_safe(variant.traceId);
-       });
- 
-@@ -462,7 +531,7 @@
-   updateTraceInputSlots(op, context, inputSlots,
-                         /*deviceResidentOnly=*/true);
-   traceData->variants.push_back(
--      captureTrace(op, context, inputSlots, outputSlots));
-+      captureTrace(op, context, inputSlots, outputSlots, traceKey));
- 
-   debug::Stats::get().incrementStat("TraceStaleRecapture");
- }

@@ -99,7 +99,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -954,6 +954,51 @@
+@@ -954,6 +954,48 @@
    return result;
  }
  
@@ -119,7 +119,6 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +      continue;
 +    }
 +    const auto *trace = op->type_as_CaptureOrExecuteTraceOp();
-+    const auto *keys = trace ? trace->trace_key_input_indices() : nullptr;
 +    const auto *deviceResident =
 +        trace ? trace->device_resident_input_indices() : nullptr;
 +    auto opHandle = ::tt::runtime::utils::unsafeBorrowShared(
@@ -132,14 +131,12 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +      if (ref.global_id() != id) {
 +        continue;
 +      }
-+      const bool isKey =
-+          keys && std::find(keys->begin(), keys->end(), i) != keys->end();
 +      const bool isDeviceResident =
 +          deviceResident ? std::find(deviceResident->begin(),
 +                                     deviceResident->end(),
 +                                     i) != deviceResident->end()
 +                         : utils::inDeviceMemory(&ref);
-+      if (!trace || isKey || isDeviceResident) {
++      if (!trace || isDeviceResident) {
 +        return false;
 +      }
 +      stagedUse = true;
@@ -151,7 +148,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
    const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
        LayoutDesc::fromTensor(tensor);
-@@ -961,6 +1006,12 @@
+@@ -961,6 +1003,12 @@
    const LayoutDesc &desiredLayoutDesc =
        layout.as<LayoutDesc>(DeviceRuntime::TTNN);
  
@@ -164,7 +161,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    return *tensorLayoutDesc == desiredLayoutDesc;
  }
  
-@@ -999,6 +1050,11 @@
+@@ -999,6 +1047,11 @@
  
    std::shared_ptr<LayoutDesc> layoutDesc = std::make_shared<LayoutDesc>(
        inputStorageType, inputLayout, inputDataType, inputMemoryConfig);
