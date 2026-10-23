@@ -13,7 +13,6 @@
 #include <cstdint>
 
 #include "api/compute/compute_kernel_hw_startup.h"
-#include "api/compute/eltwise_unary/bitwise.h"
 #include "api/compute/eltwise_unary/fill.h"
 #include "api/compute/pack.h"
 #include "api/compute/reg_api.h"
@@ -68,7 +67,6 @@ sfpi_inline void threefry_rounds(sfpi::vUInt& x0, sfpi::vUInt& x1) {
 // One tile of Threefry-2x32-20 words into DST tile `dst`: the tile's element
 // (0, 0) has index `base`, its rows are W elements apart, and rows from
 // `rows_valid` on are padding, which is left as it is. ks = (w0, 0, w0 ^ C240).
-template <uint32_t width>
 inline void threefry_tile(
     uint32_t dst, uint32_t base, uint32_t W, uint32_t rows_valid, uint32_t ks0, uint32_t ks2, uint32_t w1) {
     _llk_math_eltwise_sfpu_start_(dst);
@@ -95,9 +93,6 @@ inline void threefry_tile(
                 x1 += sfpi::vUInt(ks2 + 4);
                 threefry_rounds<13, 15, 26, 6>(x0, x1);
                 x0 += sfpi::vUInt(ks2);
-                if constexpr (width < 32) {
-                    x0 &= sfpi::vUInt((1u << width) - 1);
-                }
                 sfpi::dst_reg[0].mode<sfpi::DataLayout::I32>() = sfpi::vInt(x0);
             }
             sfpi::dst_reg++;
@@ -173,7 +168,6 @@ inline void philox_half_round(uint32_t word, uint32_t other, uint32_t key, uint3
 
 void kernel_main() {
     constexpr bool philox = get_arg(args::philox) != 0;
-    constexpr uint32_t width = get_arg(args::width);
     constexpr uint32_t state_words = get_arg(args::state_words);
     const uint32_t W = get_arg(args::W);
     const uint32_t H = get_arg(args::H);
@@ -209,7 +203,7 @@ void kernel_main() {
         tile_regs_acquire();
         if constexpr (!philox) {
             MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>()));
-            MATH((rng::threefry_tile<width>(0, base, W, rows_valid, w0, w0 ^ 0x1BD11BDA, w1)));
+            MATH((rng::threefry_tile(0, base, W, rows_valid, w0, w0 ^ 0x1BD11BDA, w1)));
         } else {
             // The four counter words, renamed after each round.
             uint32_t x[4] = {0, 1, 2, 3};
@@ -236,10 +230,6 @@ void kernel_main() {
             // Only the first word of the final Philox round is returned.
             MATH((rng::philox_half_round<0xCD9E8D57, true>(x[2], x[1], k0, rows_valid)));
             x[0] = x[1];
-            if constexpr (width < 32) {
-                bitwise_and_tile_init();
-                bitwise_and_tile<DataFormat::UInt32>(x[0], (1u << width) - 1);
-            }
             out_dst = x[0];
         }
         tile_regs_commit();

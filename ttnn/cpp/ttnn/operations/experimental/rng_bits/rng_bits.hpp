@@ -22,15 +22,14 @@ enum class RngAlgorithm : uint32_t { Threefry = 0, Philox = 1 };
 //   Philox-4x32, 10 rounds:    counter (i, w1, w2 or 0, 0)
 //
 // so the same state gives the same bits. bits is a UINT32 TILE tensor of
-// `shape` (rank 1 or more) holding each word's low `width` bits (8, 16 or 32).
-// new_state is state with w1 advanced by ceil(elements / 4), modulo 2^32, so
+// `shape` (rank 1 or more) holding full 32-bit words.
+// new_state is state with w1 advanced by one, modulo 2^32, so
 // the next call uses other counters. The kernels read the state on the device,
 // so a cached program draws new bits from each new state.
 std::vector<ttnn::Tensor> rng_bits(
     const ttnn::Tensor& state,
     const ttnn::Shape& shape,
     RngAlgorithm algorithm,
-    uint32_t width = 32,
     const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt);
 
 }  // namespace ttnn::experimental

@@ -24,7 +24,7 @@ void run(const ::tt::target::ttnn::RngBitGeneratorOp *op,
           *op->out()->desc()->shape()),
       op->philox() ? ::ttnn::experimental::RngAlgorithm::Philox
                    : ::ttnn::experimental::RngAlgorithm::Threefry,
-      op->width(), outputMemoryConfig);
+      outputMemoryConfig);
   tensorPool.insertTTNNTensorAndValidate(op->output_state(), outputs[1]);
   tensorPool.insertTTNNTensorAndValidate(op->out(), outputs[0]);
 }

@@ -12,13 +12,11 @@ std::vector<ttnn::Tensor> rng_bits(
     const ttnn::Tensor& state,
     const ttnn::Shape& shape,
     RngAlgorithm algorithm,
-    uint32_t width,
     const std::optional<ttnn::MemoryConfig>& memory_config) {
     using Op = prim::RngBitsOperation;
     return ttnn::device_operation::launch<Op>(
         {.shape = shape,
          .algorithm = algorithm,
-         .width = width,
          .output_mem_config = memory_config.value_or(ttnn::DRAM_MEMORY_CONFIG)},
         {.state = state});
 }

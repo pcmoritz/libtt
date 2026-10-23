@@ -16,7 +16,6 @@
 
 void kernel_main() {
     constexpr uint32_t state_page_bytes = get_arg(args::state_page_bytes);
-    const uint32_t advance = get_arg(args::advance);
     const uint32_t first_tile = get_arg(args::first_tile);
     const uint32_t num_tiles = get_arg(args::num_tiles);
     const uint32_t write_state = get_arg(args::write_state);
@@ -36,7 +35,7 @@ void kernel_main() {
         // sees it, with w1 restored after the write.
         volatile uint32_t* words = reinterpret_cast<volatile uint32_t*>(state_dfb.get_write_ptr());
         const uint32_t w1 = words[1];
-        words[1] = w1 + advance;
+        words[1] = w1 + 1;
         const uint32_t entry_offset = state_dfb.get_write_ptr() - state_dfb.get_read_ptr();
         noc.async_write(state_dfb, new_state, state_page_bytes, {.offset_bytes = entry_offset}, {.page_id = 0});
         noc.async_write_barrier();

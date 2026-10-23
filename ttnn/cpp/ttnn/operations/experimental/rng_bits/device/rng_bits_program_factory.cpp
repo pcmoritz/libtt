@@ -37,8 +37,6 @@ ttnn::device_operation::ProgramArtifacts RngBitsProgramFactory::create_program_a
     const uint32_t Wt = padded[-1] / TILE_WIDTH;
     const uint32_t Ht = padded[-2] / TILE_HEIGHT;
     const uint32_t num_tiles = bits.physical_volume() / (TILE_HEIGHT * TILE_WIDTH);
-    // w1 advances by one per four elements.
-    const uint32_t advance = static_cast<uint32_t>((logical.volume() + 3) / 4);
 
     const auto grid = device.compute_with_storage_grid_size();
     const auto [num_cores, all_cores, core_group_1, core_group_2, tiles_per_core_1, tiles_per_core_2] =
@@ -63,7 +61,7 @@ ttnn::device_operation::ProgramArtifacts RngBitsProgramFactory::create_program_a
         {.unique_id = OUT_DFB, .entry_size = tile_bytes, .num_entries = 2, .data_format_metadata = tt::DataFormat::UInt32},
     };
 
-    const std::vector<std::string> common_arg_names = {"W", "H", "Wt", "Ht", "advance"};
+    const std::vector<std::string> common_arg_names = {"W", "H", "Wt", "Ht"};
     const std::string kernel_dir = "ttnn/cpp/ttnn/operations/experimental/rng_bits/device/kernels/";
     KernelSpec mover{
         .unique_id = MOVER,
@@ -108,7 +106,6 @@ ttnn::device_operation::ProgramArtifacts RngBitsProgramFactory::create_program_a
             },
         .compile_time_args =
             {{"philox", static_cast<uint32_t>(philox)},
-             {"width", params.width},
              {"state_words", static_cast<uint32_t>(state.logical_shape()[-1])}},
         .runtime_arg_schema =
             {.runtime_arg_names = {"first_tile", "num_tiles"}, .common_runtime_arg_names = common_arg_names},
@@ -118,7 +115,7 @@ ttnn::device_operation::ProgramArtifacts RngBitsProgramFactory::create_program_a
     KernelRunArgs mover_run_args{.kernel = MOVER};
     KernelRunArgs compute_run_args{.kernel = COMPUTE};
     for (auto* run_args : {&mover_run_args, &compute_run_args}) {
-        run_args->common_runtime_arg_values = {{"W", W}, {"H", H}, {"Wt", Wt}, {"Ht", Ht}, {"advance", advance}};
+        run_args->common_runtime_arg_values = {{"W", W}, {"H", H}, {"Wt", Wt}, {"Ht", Ht}};
     }
     const auto cores = tt::tt_metal::corerange_to_cores(all_cores, num_cores, /*row_wise=*/false);
     for (uint32_t i = 0, first = 0; i < num_cores; ++i) {

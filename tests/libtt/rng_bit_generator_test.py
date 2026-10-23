@@ -4,7 +4,7 @@ libtt computes them with Threefry-2x32 (20 rounds) for DEFAULT and THREE_FRY,
 and with Philox-4x32 (10 rounds) for PHILOX. The key is (state[0], 0), and
 element i (in row-major order) is the first word of counter (i, state[1]) for
 Threefry and (i, state[1], state[2] or 0, 0) for Philox. The output state
-advances state[1] by one per four elements, so the next call uses other
+advances state[1] by one per nonempty call, so the next call uses other
 counters.
 
 The states are u64[2], as torch_tpu passes them. (JAX's u32[4] keys need a
@@ -116,7 +116,7 @@ def expected(algorithm, state, elements):
 
 def advanced(old, elements):
     new = old.copy()
-    new[1] += (elements + 3) // 4
+    new[1] = (int(old[1]) + bool(elements)) & M32
     return new
 
 
@@ -218,6 +218,25 @@ def test_state_words_count_modulo_2_32():
     _, base = bits(state(5, 1), (64,), np.uint32)
     for other in (state(5 + 2**32, 1), state(5, 1 + 2**32)):
         np.testing.assert_array_equal(bits(other, (64,), np.uint32)[1], base)
+
+
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+def test_counter_wraps(algorithm):
+    old = state(5, M32)
+    new, values = bits(old, (35,), np.uint32, algorithm)
+    np.testing.assert_array_equal(new, state(5, 0))
+    np.testing.assert_array_equal(values, expected(algorithm, old, 35))
+
+
+def test_large_draw_does_not_repeat_after_1024_calls():
+    # Advancing by ceil(elements / 4) used to repeat the entire tensor here.
+    with jax.enable_x64(True):
+        draw = jax.jit(lambda s: jax.lax.rng_bit_generator(s, (4096, 4096), jnp.uint32))
+        current, first = draw(jnp.asarray(state(7, 0)))
+        for _ in range(1024):
+            current, last = draw(current)
+        np.testing.assert_array_equal(np.asarray(current), state(7, 1025))
+        assert not np.array_equal(np.asarray(first), np.asarray(last))
 
 
 @pytest.mark.parametrize("algorithm", ALGORITHMS)

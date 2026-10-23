@@ -11,7 +11,6 @@ namespace ttnn::experimental::prim {
 struct RngBitsParams {
     ttnn::Shape shape;
     RngAlgorithm algorithm;
-    uint32_t width;
     tt::tt_metal::MemoryConfig output_mem_config;
 };
 

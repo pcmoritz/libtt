@@ -48,9 +48,6 @@ void RngBitsOperation::validate_on_program_cache_miss(const operation_attributes
         attrs.shape.volume() < (uint64_t{1} << 32), "rng_bits: the bits must be fewer than 2^32 elements, got {}",
         attrs.shape);
     TT_FATAL(
-        attrs.width == 8 || attrs.width == 16 || attrs.width == 32, "rng_bits: width must be 8, 16 or 32, got {}",
-        attrs.width);
-    TT_FATAL(
         attrs.output_mem_config.memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED,
         "rng_bits: the bits must be interleaved");
 }
