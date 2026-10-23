@@ -16,6 +16,7 @@ struct MaskedReduceParams {
     MaskedMode mode = MaskedMode::Count;
     // Cores that share a tile row.
     uint32_t cores_per_row = 0;
+    tt::tt_metal::DataType output_dtype = tt::tt_metal::DataType::FLOAT32;
     tt::tt_metal::MemoryConfig output_mem_config;
 };
 
@@ -24,8 +25,8 @@ struct MaskedReduceInputs {
     Tensor threshold;
 };
 
-// The result, [..., H, 1] FP32: each tile row's cores send their row sums to
-// the row's first core, which adds them up (kernels/).
+// The result, shaped like the threshold: each tile row's cores send their row
+// sums to the row's first core, which adds them up (kernels/).
 struct MaskedReduceProgramFactory {
     static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
         const MaskedReduceParams&, const MaskedReduceInputs&, std::vector<Tensor>&);
@@ -46,6 +47,9 @@ struct MaskedReduceOperation {
 
 // Tile rows of the input over all its leading dimensions.
 uint32_t masked_reduce_tile_rows(const Tensor& input);
+
+// Whether the threshold is [..., H] rather than [..., H, 1].
+bool masked_reduce_row_form(const Tensor& input, const Tensor& threshold);
 
 // Columns of the partials a tile row's master core gathers from cores_per_row cores.
 uint32_t masked_reduce_partial_columns(uint32_t cores_per_row);

@@ -15,6 +15,7 @@ ttnn::Tensor masked_reduce(
     const ttnn::Tensor& threshold,
     MaskedCompare compare,
     MaskedMode mode,
+    tt::tt_metal::DataType dtype,
     const std::optional<ttnn::MemoryConfig>& memory_config) {
     using Op = prim::MaskedReduceOperation;
     const uint32_t tile_rows = prim::masked_reduce_tile_rows(input);
@@ -26,6 +27,7 @@ ttnn::Tensor masked_reduce(
         .compare = compare,
         .mode = mode,
         .cores_per_row = std::max(1u, std::min(cores / tile_rows, Wt)),
+        .output_dtype = dtype,
         .output_mem_config = memory_config.value_or(input.memory_config())};
     prim::MaskedReduceInputs inputs{.input = input, .threshold = threshold};
     return ttnn::device_operation::launch<Op>(params, inputs)[0];

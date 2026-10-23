@@ -12,8 +12,10 @@
 // tiles are a dataflow buffer every core allocates alike, so the master's
 // buffer sits at this core's own address for it. The master zeroes the
 // partials' padding columns, waits for the row's other cores, hands the
-// partials to its compute kernel, and writes the summed tile, column 0 holding
-// the row sums, as the result's tile.
+// partials to its compute kernel, and writes the summed rows as the result:
+// a [..., H, 1] result's tile t_page with the sums in column 0 and zeros
+// elsewhere, or row t_row of a [..., H] result's tile t_page. Counts can go
+// out as int32.
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -35,7 +37,8 @@ constexpr uint32_t elem_offset(uint32_t r, uint32_t c) {
 }  // namespace
 
 void kernel_main() {
-    const uint32_t tile_row = get_arg(args::tile_row);
+    const uint32_t t_page = get_arg(args::t_page);
+    const uint32_t t_row = get_arg(args::t_row);
     const uint32_t num_tiles = get_arg(args::num_tiles);
     const uint32_t rows = get_arg(args::rows);
     const uint32_t stride = get_arg(args::stride);
@@ -47,6 +50,8 @@ void kernel_main() {
     const uint32_t remote_workers = get_arg(args::remote_workers);
     constexpr uint32_t cols = get_arg(args::cols);
     constexpr uint32_t partial_tiles = get_arg(args::partial_tiles);
+    constexpr uint32_t row_form = get_arg(args::row_form);
+    constexpr uint32_t int_output = get_arg(args::int_output);
 
     DataflowBuffer out_dfb(dfb::out);
     DataflowBuffer part_dfb(dfb::part);
@@ -127,21 +132,38 @@ void kernel_main() {
     done.set(0);
     part_dfb.push_back(partial_tiles);
 
-    // The summed partials: row m's total in column 16. Write it as the
-    // result tile, the total in column 0 and zeros elsewhere.
+    // The summed partials: row m's total in column 16.
     out_dfb.wait_front(1);
     const uint32_t result = out_dfb.get_read_ptr();
     auto* res = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(result);
+    uint32_t totals[32];
     for (uint32_t m = 0; m < 32; ++m) {
-        sums[m] = __builtin_bit_cast(float, res[elem_offset(m, face_rows) / 4]);
+        const float total = __builtin_bit_cast(float, res[elem_offset(m, face_rows) / 4]);
+        if constexpr (int_output) {
+            totals[m] = static_cast<uint32_t>(static_cast<int32_t>(total));
+        } else {
+            totals[m] = __builtin_bit_cast(uint32_t, total);
+        }
     }
-    for (uint32_t i = 0; i < tile_bytes / 4; ++i) {
-        res[i] = 0;
+    if constexpr (row_form) {
+        // Row t_row of the result's tile, a face's run of columns at a time.
+        for (uint32_t m = 0; m < 32; ++m) {
+            res[elem_offset(t_row, m) / 4] = totals[m];
+        }
+        for (uint32_t f = 0; f < 2; ++f) {
+            const uint32_t at = elem_offset(t_row, f * face_rows);
+            noc.async_write(out_dfb, output, face_rows * 4, {.offset_bytes = at}, {.page_id = t_page, .offset_bytes = at});
+        }
+    } else {
+        // The result's tile: the totals in column 0 and zeros elsewhere.
+        for (uint32_t i = 0; i < tile_bytes / 4; ++i) {
+            res[i] = 0;
+        }
+        for (uint32_t m = 0; m < 32; ++m) {
+            res[elem_offset(m, 0) / 4] = totals[m];
+        }
+        noc.async_write(out_dfb, output, tile_bytes, {.offset_bytes = 0}, {.page_id = t_page, .offset_bytes = 0});
     }
-    for (uint32_t m = 0; m < 32; ++m) {
-        res[elem_offset(m, 0) / 4] = __builtin_bit_cast(uint32_t, sums[m]);
-    }
-    noc.async_write(out_dfb, output, tile_bytes, {.offset_bytes = 0}, {.page_id = tile_row, .offset_bytes = 0});
     noc.async_write_barrier();
     out_dfb.pop_front(1);
 }

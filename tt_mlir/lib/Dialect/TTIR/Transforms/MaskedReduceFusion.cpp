@@ -7,11 +7,14 @@
 //   sum(where(x <cmp> t, 1, 0), dim = last)   count of the x <cmp> t per row
 //   sum(where(x <cmp> t, x, 0), dim = last)   sum of those x per row
 //
-// with t a [..., H, 1] value broadcast over the row. The binary searches
-// behind SGLang-JAX's top-k and top-p masks run such a reduction 31 times per
-// step over the vocabulary: the compare, the select and the sum each pass over
-// the [batch, vocab] input or an intermediate of its size, and each pass is
-// latency-bound on its tiles. The fused kernel reads the input once.
+// with t a [..., H, 1] value broadcast over the row, or a [..., H] value
+// reshaped to that. The binary searches behind SGLang-JAX's top-k and top-p
+// masks run such a reduction 31 times per step over the vocabulary: the
+// compare, the select and the sum each pass over the [batch, vocab] input or
+// an intermediate of its size, and each pass is latency-bound on its tiles.
+// The fused kernel reads the input once. Its result takes the threshold's
+// shape and, for a count summed as i32, that type, so the search's glue
+// around it (a reshape in, a reshape and a typecast out) goes too.
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 
@@ -63,7 +66,8 @@ bool isSplatOf(Value value, double expected) {
 
 // The per-row threshold behind a compare operand: a [..., H, 1] value of the
 // input's type that reaches the compare as is or through a broadcast over the
-// last dimension. Null when the operand is something else.
+// last dimension, or the [..., H] value such a one is a reshape of. Null when
+// the operand is something else.
 Value rowThreshold(Value operand, RankedTensorType inputType) {
   Value source = operand;
   if (auto broadcast = operand.getDefiningOp<BroadcastOp>()) {
@@ -75,6 +79,12 @@ Value rowThreshold(Value operand, RankedTensorType inputType) {
       type.getShape().drop_back() != inputType.getShape().drop_back() ||
       type.getElementType() != inputType.getElementType()) {
     return nullptr;
+  }
+  if (auto reshape = source.getDefiningOp<ReshapeOp>()) {
+    auto rowType = cast<RankedTensorType>(reshape.getInput().getType());
+    if (rowType.getShape() == inputType.getShape().drop_back()) {
+      return reshape.getInput();
+    }
   }
   return source;
 }
@@ -203,21 +213,28 @@ public:
       return failure();
     }
 
+    // The result is shaped like the threshold, in FP32 or, for a count the
+    // program sums as i32, in i32.
     Location loc = sum.getLoc();
-    SmallVector<int64_t> reducedShape(inputType.getShape());
-    reducedShape.back() = 1;
+    RankedTensorType sumType = sum.getResult().getType();
+    ArrayRef<int64_t> reducedShape =
+        cast<RankedTensorType>(rowCompare->threshold.getType()).getShape();
+    const bool countsAsI32 = mode == ttcore::MaskedMode::Count &&
+                             sumType.getElementType().isInteger(32);
     Value result = rewriter.create<MaskedReduceOp>(
-        loc, RankedTensorType::get(reducedShape, rewriter.getF32Type()),
+        loc,
+        RankedTensorType::get(reducedShape, countsAsI32
+                                                ? sumType.getElementType()
+                                                : rewriter.getF32Type()),
         rowCompare->input, rowCompare->threshold,
         ttcore::MaskedCompareAttr::get(getContext(), rowCompare->compare),
         ttcore::MaskedModeAttr::get(getContext(), mode));
-    RankedTensorType sumType = sum.getResult().getType();
-    if (!sumType.getElementType().isF32()) {
+    if (!sumType.getElementType().isF32() && !countsAsI32) {
       result = rewriter.create<TypecastOp>(
           loc, RankedTensorType::get(reducedShape, sumType.getElementType()),
           result);
     }
-    if (sumType.getShape() != ArrayRef<int64_t>(reducedShape)) {
+    if (sumType.getShape() != reducedShape) {
       result = rewriter.create<ReshapeOp>(
           loc, sumType, result,
           rewriter.getI32ArrayAttr(SmallVector<int32_t>(

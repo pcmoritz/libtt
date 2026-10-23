@@ -12,8 +12,10 @@
 //
 // The threshold tile reaches the compute kernel with the dense tile's row k
 // threshold, t[k % stride], in column 0 of row k; the compute kernel spreads
-// that column across the tile. Reads of a batch of dense tiles share one
-// barrier, so they overlap.
+// that column across the tile. A [..., H, 1] threshold holds the tile row's
+// thresholds in column 0 of its tile t_page; a [..., H] one holds them in row
+// t_row of tile t_page, which is copied into column 0 first. Reads of a batch
+// of dense tiles share one barrier, so they overlap.
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -28,6 +30,11 @@ namespace {
 constexpr uint32_t face_rows = 16;
 constexpr uint32_t face_elems = 256;
 
+// Element (r, c) of a tile, in elements.
+constexpr uint32_t elem_index(uint32_t r, uint32_t c) {
+    return ((r / face_rows) * 2 + c / face_rows) * face_elems + (r % face_rows) * face_rows + c % face_rows;
+}
+
 // Column 0 of dense row k gets the threshold of data row k % stride.
 template <typename T>
 inline void dense_threshold_column(uint32_t base, uint32_t rows, uint32_t stride) {
@@ -35,13 +42,28 @@ inline void dense_threshold_column(uint32_t base, uint32_t rows, uint32_t stride
     for (uint32_t k = 0; k < 32; ++k) {
         const uint32_t m = k % stride < rows ? k % stride : 0;
         const T value = tile[m * face_rows];  // face 0, row m, column 0
-        tile[(k / face_rows) * 2 * face_elems + (k % face_rows) * face_rows] = value;
+        tile[elem_index(k, 0)] = value;
+    }
+}
+
+// The thresholds of a [..., H] tensor's row, read as two 64-byte chunks into
+// the tile's last face (chunk f holds row t_row's columns 16 f .. 16 f + 15,
+// at an offset of a row when 16-bit rows made the chunk start a row early),
+// copied to column 0 of rows 0 .. 31.
+template <typename T>
+inline void row_threshold_column(uint32_t base, uint32_t t_row) {
+    auto* tile = reinterpret_cast<volatile tt_l1_ptr T*>(base);
+    constexpr uint32_t scratch = 3 * face_elems;
+    const uint32_t skip = sizeof(T) == 2 ? (t_row & 1) * face_rows : 0;
+    for (uint32_t m = 0; m < 32; ++m) {
+        tile[elem_index(m, 0)] = tile[scratch + (m / face_rows) * (64 / sizeof(T)) + skip + m % face_rows];
     }
 }
 }  // namespace
 
 void kernel_main() {
-    const uint32_t tile_row = get_arg(args::tile_row);
+    const uint32_t t_page = get_arg(args::t_page);
+    const uint32_t t_row = get_arg(args::t_row);
     const uint32_t first_tile = get_arg(args::first_tile);
     const uint32_t num_tiles = get_arg(args::num_tiles);
     const uint32_t rows = get_arg(args::rows);
@@ -49,6 +71,7 @@ void kernel_main() {
     const uint32_t pack = get_arg(args::pack);
     constexpr uint32_t batch_tiles = get_arg(args::batch_tiles);
     constexpr uint32_t elem_bytes = get_arg(args::elem_bytes);
+    constexpr uint32_t row_form = get_arg(args::row_form);
     constexpr uint32_t row_bytes = face_rows * elem_bytes;
     constexpr uint32_t face_bytes = face_elems * elem_bytes;
     constexpr uint32_t tile_bytes = 4 * face_bytes;
@@ -59,17 +82,36 @@ void kernel_main() {
     const auto threshold = TensorAccessor(tensor::threshold);
     Noc noc;
 
-    // The threshold tensor has one tile column: tile `tile_row` holds the
-    // row's thresholds in its first column.
     t_dfb.reserve_back(1);
     const uint32_t t_addr = t_dfb.get_write_ptr();
-    if (pack == 1) {
-        noc.async_read(threshold, t_dfb, tile_bytes, {.page_id = tile_row}, {.offset_bytes = 0});
+    if constexpr (row_form) {
+        // Row t_row of tile t_page, a 64-byte aligned chunk per face.
+        const uint32_t chunk_row = elem_bytes == 2 ? t_row & ~1u : t_row;
+        for (uint32_t f = 0; f < 2; ++f) {
+            noc.async_read(
+                threshold,
+                t_dfb,
+                64,
+                {.page_id = t_page, .offset_bytes = f * face_bytes + chunk_row * row_bytes},
+                {.offset_bytes = 3 * face_bytes + f * 64});
+        }
+        noc.async_read_barrier();
+        if constexpr (elem_bytes == 4) {
+            row_threshold_column<uint32_t>(t_addr, t_row);
+        } else {
+            row_threshold_column<uint16_t>(t_addr, t_row);
+        }
+    } else if (pack == 1) {
+        // Tile t_page holds the row's thresholds in its first column.
+        noc.async_read(threshold, t_dfb, tile_bytes, {.page_id = t_page}, {.offset_bytes = 0});
         noc.async_read_barrier();
     } else {
-        // The data rows' thresholds sit in face 0; spread them over the dense rows.
-        noc.async_read(threshold, t_dfb, stride * row_bytes, {.page_id = tile_row}, {.offset_bytes = 0});
+        // The data rows' thresholds sit in face 0.
+        noc.async_read(threshold, t_dfb, stride * row_bytes, {.page_id = t_page}, {.offset_bytes = 0});
         noc.async_read_barrier();
+    }
+    if (pack != 1) {
+        // Spread the data rows' thresholds over the dense rows.
         if constexpr (elem_bytes == 4) {
             dense_threshold_column<uint32_t>(t_addr, rows, stride);
         } else {

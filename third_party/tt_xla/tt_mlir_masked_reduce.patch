@@ -66,12 +66,12 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +def TTIR_MaskedReduceOp : TTIR_NamedOp<"masked_reduce"> {
 +  let summary = "Count, or sum, the elements of each row that compare true against the row's threshold";
 +  let description = [{
-+    `input` is [..., H, W] and `threshold` [..., H, 1], FP32 or BF16 of one
-+    type. Per row, the result holds how many elements satisfy
-+    `input <compare> threshold` (mode count), or their sum (mode sum), as
-+    [..., H, 1] FP32:
++    `input` is [..., H, W] and `threshold` [..., H, 1] or [..., H], FP32 or
++    BF16 of one type. Per row, the result, shaped like the threshold, holds how
++    many elements satisfy `input <compare> threshold` (mode count, FP32 or
++    I32), or their sum (mode sum, FP32):
 +
-+      result[..., h, 0] = sum_w (input[..., h, w] <cmp> threshold[..., h, 0]) ? (count ? 1 : input[..., h, w]) : 0
++      result[..., h] = sum_w (input[..., h, w] <cmp> threshold[..., h]) ? (count ? 1 : input[..., h, w]) : 0
 +
 +    One pass over the input, where a reduction of a compare, or of a select on
 +    one, reads the input and two intermediates of its size.
@@ -99,8 +99,8 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +    let summary = "Count, or sum, the elements of each row that compare true against the row's threshold.";
 +    let description = [{
 +      ttnn::experimental::masked_reduce, see ttir.masked_reduce. The input
-+      ([..., H, W]) and threshold ([..., H, 1]) are tiled FP32 or BF16 of one
-+      type; the result is tiled FP32 [..., H, 1].
++      ([..., H, W]) and threshold ([..., H, 1] or [..., H]) are tiled FP32 or
++      BF16 of one type; the result is tiled FP32, or I32 for counts, shaped like the threshold.
 +    }];
 +
 +    let arguments = (ins AnyRankedTensor:$input,
@@ -143,8 +143,8 @@ diff --git a/include/ttmlir/Target/TTNN/operations/reduction.fbs b/include/ttmli
  }
  
 +// ttnn::experimental::masked_reduce: per row of the [..., H, W] input, the
-+// count or sum of the elements that compare true against the [..., H, 1]
-+// threshold, as [..., H, 1] FP32.
++// count or sum of the elements that compare true against the [..., H, 1] or
++// [..., H] threshold, shaped like it, FP32 or (counts) I32 as the output's type.
 +enum MaskedCompareType: uint32 {
 +  GT,
 +  GE,
@@ -243,7 +243,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
  }
  
 +// masked_reduce (ttnn::experimental) reads tiled FP32 or BF16 tiles, the
-+// threshold in the input's type, and writes tiled FP32 partials.
++// threshold in the input's type, and writes a tiled FP32 or I32 result.
 +TTNNOperandsWorkarounds
 +TTNNOperandsWorkaroundsFactory::createMaskedReduceOpOperandsWorkarounds(
 +    mlir::Operation *op) {
@@ -256,7 +256,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 +                                         : ttcore::DataType::Float32;
 +  TTNNOperandWorkarounds result;
 +  result.tensorLayoutWorkaround = Layout::Tile;
-+  result.tensorDataTypeWorkaround = ttcore::DataType::Float32;
++  result.tensorDataTypeWorkaround = masked.getResult().getType().getElementType().isInteger(32) ? ttcore::DataType::Int32 : ttcore::DataType::Float32;
 +  return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
 +      .addInputOperandWorkaround(operand) // input
 +      .addInputOperandWorkaround(operand) // threshold

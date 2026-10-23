@@ -42,6 +42,13 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     const uint32_t tile_rows = masked_reduce_tile_rows(tensor_args.input);
     const uint32_t H = input.logical_shape()[-2];
     const uint32_t Ht = (H + TILE_HEIGHT - 1) / TILE_HEIGHT;
+    // A [..., H] threshold (and result) tiles H with the dimension before it:
+    // tile row b * Ht + tr of the input has its thresholds in row b % D1 of
+    // tile (b / D1 * D1t + (b % D1) / 32) * Ht + tr.
+    const bool row_form = masked_reduce_row_form(tensor_args.input, tensor_args.threshold);
+    const auto& tshape = threshold.logical_shape();
+    const uint32_t D1 = row_form && tshape.rank() >= 2 ? tshape[-2] : 1;
+    const uint32_t D1t = (D1 + TILE_HEIGHT - 1) / TILE_HEIGHT;
     const uint32_t Wt = input.padded_shape()[-1] / TILE_WIDTH;
     const uint32_t cores_per_row = params.cores_per_row;
     const uint32_t num_cores = tile_rows * cores_per_row;
@@ -96,7 +103,8 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     // Every core counts the row's partials that arrived at its master.
     Group<SemaphoreSpec> semaphores = {{.unique_id = DONE_SEM, .target_nodes = all_cores}};
     const std::vector<std::string> runtime_arg_names = {
-        "tile_row",
+        "t_page",
+        "t_row",
         "first_tile",
         "num_tiles",
         "rows",
@@ -123,7 +131,9 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
                 TensorBinding{.tensor_parameter_name = THRESHOLD, .accessor_name = "threshold"},
             },
         .compile_time_args =
-            {{"batch_tiles", batch_tiles}, {"elem_bytes", in_tile_bytes / (TILE_HEIGHT * TILE_WIDTH)}},
+            {{"batch_tiles", batch_tiles},
+             {"elem_bytes", in_tile_bytes / (TILE_HEIGHT * TILE_WIDTH)},
+             {"row_form", row_form ? 1u : 0u}},
         .runtime_arg_schema = {.runtime_arg_names = runtime_arg_names},
         .hw_config = ttnn::create_reader_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
@@ -137,7 +147,11 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
             },
         .semaphore_bindings = {SemaphoreBinding{.semaphore_spec_name = DONE_SEM, .accessor_name = "done"}},
         .tensor_bindings = {TensorBinding{.tensor_parameter_name = OUTPUT, .accessor_name = "output"}},
-        .compile_time_args = {{"cols", partial_cols}, {"partial_tiles", partial_tiles}},
+        .compile_time_args =
+            {{"cols", partial_cols},
+             {"partial_tiles", partial_tiles},
+             {"row_form", row_form ? 1u : 0u},
+             {"int_output", output.dtype() == tt::tt_metal::DataType::INT32 ? 1u : 0u}},
         .runtime_arg_schema = {.runtime_arg_names = runtime_arg_names},
         .hw_config = ttnn::create_writer_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
@@ -185,6 +199,9 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     for (uint32_t i = 0; i < num_cores; ++i) {
         const uint32_t tile_row = i / cores_per_row;
         const uint32_t worker = i % cores_per_row;
+        const uint32_t b = tile_row / Ht;
+        const uint32_t t_page = row_form ? (b / D1 * D1t + (b % D1) / TILE_HEIGHT) * Ht + tile_row % Ht : tile_row;
+        const uint32_t t_row = row_form ? (b % D1) % TILE_HEIGHT : 0;
         // The row's first core gathers the partials and writes the result.
         const auto master = device.worker_core_from_logical_core(cores[tile_row * cores_per_row]);
         // Data rows of this tile row: the last tile row of a [..., H, W] batch
@@ -205,7 +222,8 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
             AddRuntimeArgsForNode(
                 run_args->runtime_arg_values,
                 cores[i],
-                {{"tile_row", tile_row},
+                {{"t_page", t_page},
+                 {"t_row", t_row},
                  {"first_tile", tile_row * Wt + first},
                  {"num_tiles", count},
                  {"rows", rows},

@@ -30,6 +30,10 @@ uint32_t masked_reduce_tile_rows(const Tensor& input) {
     return rows / tt::constants::TILE_HEIGHT;
 }
 
+bool masked_reduce_row_form(const Tensor& input, const Tensor& threshold) {
+    return threshold.logical_shape().rank() + 1 == input.logical_shape().rank();
+}
+
 MaskedReduceOperation::program_factory_t MaskedReduceOperation::select_program_factory(
     const operation_attributes_t&, const tensor_args_t&) {
     return MaskedReduceProgramFactory{};
@@ -56,23 +60,27 @@ void MaskedReduceOperation::validate_on_program_cache_miss(const operation_attri
     TT_FATAL(in.input.dtype() == in.threshold.dtype(), "masked_reduce: input and threshold must have one data type");
     const auto& shape = in.input.logical_shape();
     const auto& tshape = in.threshold.logical_shape();
-    TT_FATAL(shape.rank() >= 2 && shape.rank() == tshape.rank(), "masked_reduce: input and threshold ranks differ");
+    const bool row_form = masked_reduce_row_form(in.input, in.threshold);
+    TT_FATAL(
+        shape.rank() >= 2 && (row_form || shape.rank() == tshape.rank()),
+        "masked_reduce: the threshold must be [..., H, 1] or [..., H] for a [..., H, W] input");
     for (int d = 0; d < static_cast<int>(shape.rank()) - 1; ++d) {
         TT_FATAL(shape[d] == tshape[d], "masked_reduce: threshold dimension {} differs from the input's", d);
     }
-    TT_FATAL(tshape[-1] == 1, "masked_reduce: threshold must have one column");
+    TT_FATAL(row_form || tshape[-1] == 1, "masked_reduce: threshold must have one column");
+    TT_FATAL(
+        params.output_dtype == DataType::FLOAT32 ||
+            (params.output_dtype == DataType::INT32 && params.mode == MaskedMode::Count),
+        "masked_reduce: the result is FP32, or INT32 for counts");
     TT_FATAL(params.cores_per_row >= 1, "masked_reduce: no cores");
 }
 
 MaskedReduceOperation::spec_return_value_t MaskedReduceOperation::compute_output_specs(
     const operation_attributes_t& params, const tensor_args_t& in) {
-    const auto& shape = in.input.logical_shape();
-    ttsl::SmallVector<uint32_t> dims(shape.cbegin(), shape.cend());
-    dims.back() = 1;
     return {tt::tt_metal::TensorSpec(
-        ttnn::Shape(dims),
+        in.threshold.logical_shape(),
         tt::tt_metal::TensorLayout(
-            DataType::FLOAT32, tt::tt_metal::PageConfig(Layout::TILE), params.output_mem_config))};
+            params.output_dtype, tt::tt_metal::PageConfig(Layout::TILE), params.output_mem_config))};
 }
 
 MaskedReduceOperation::tensor_return_value_t MaskedReduceOperation::create_output_tensors(

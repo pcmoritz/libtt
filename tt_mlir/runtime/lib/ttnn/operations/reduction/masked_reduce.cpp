@@ -34,9 +34,11 @@ void run(const ::tt::target::ttnn::MaskedReduceOp *op, ProgramContext &context) 
   std::optional<::ttnn::MemoryConfig> outputMemoryConfig =
       ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(
           ::tt::runtime::ttnn::utils::getTensorRefMemoryConfig(op->out()));
+  const ::ttnn::DataType dtype = ::tt::runtime::ttnn::utils::toTTNNDataType(
+      op->out()->desc()->layout()->memory_desc()->data_type());
   ::ttnn::Tensor out = ::ttnn::experimental::masked_reduce(
       input, threshold, static_cast<MaskedCompare>(op->compare()),
-      static_cast<MaskedMode>(op->mode()), outputMemoryConfig);
+      static_cast<MaskedMode>(op->mode()), dtype, outputMemoryConfig);
   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
 }
 

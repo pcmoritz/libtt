@@ -49,13 +49,27 @@ protected:
         return false;
     }
 
+    struct Options {
+        bool timed = false;
+        // Every seventh value is -inf: a masked one must add nothing to a
+        // sum, an unmasked one makes the sum -inf.
+        bool infinities = false;
+        // Leading dimension of a [batch, rows, width] input.
+        uint32_t batch = 1;
+        // A [..., rows] threshold and result rather than [..., rows, 1].
+        bool row_form = false;
+        // Counts as INT32.
+        bool int_counts = false;
+    };
+
     // rows x width values, one threshold per row; checks every compare and mode.
-    // With `infinities`, every seventh value is -inf: a masked one must add
-    // nothing to a sum, an unmasked one makes the sum -inf.
     template <typename T>
-    void check(uint32_t rows, uint32_t width, DataType dtype, bool timed = false, bool infinities = false) {
+    void check(uint32_t rows, uint32_t width, DataType dtype, Options options = {}) {
+        const bool timed = options.timed;
+        const bool infinities = options.infinities;
         std::mt19937 rng(7);
         std::normal_distribution<float> dist(0.0f, 4.0f);
+        rows *= options.batch;
         std::vector<T> values(static_cast<size_t>(rows) * width);
         std::vector<float> ref(values.size());
         for (size_t i = 0; i < values.size(); ++i) {
@@ -72,13 +86,29 @@ protected:
             }
             tref[r] = static_cast<float>(thresholds[r]);
         }
-        auto input = to_device(values, {rows, width}, dtype);
-        auto threshold = to_device(thresholds, {rows, 1}, dtype);
+        std::vector<uint32_t> in_shape = {rows, width};
+        std::vector<uint32_t> t_shape = options.row_form ? std::vector<uint32_t>{rows} : std::vector<uint32_t>{rows, 1};
+        if (options.batch > 1) {
+            in_shape = {options.batch, rows / options.batch, width};
+            t_shape = options.row_form ? std::vector<uint32_t>{options.batch, rows / options.batch}
+                                       : std::vector<uint32_t>{options.batch, rows / options.batch, 1};
+        }
+        auto input = to_device(values, in_shape, dtype);
+        auto threshold = to_device(thresholds, t_shape, dtype);
         for (MaskedCompare compare : {MaskedCompare::GT, MaskedCompare::GE, MaskedCompare::LT, MaskedCompare::LE}) {
             for (MaskedMode mode : {MaskedMode::Count, MaskedMode::Sum}) {
-                auto out = ttnn::experimental::masked_reduce(input, threshold, compare, mode);
-                EXPECT_EQ(out.logical_shape(), ttnn::Shape({rows, 1}));
-                auto got = out.cpu().template to_vector<float>();
+                const bool ints = options.int_counts && mode == MaskedMode::Count;
+                auto out = ttnn::experimental::masked_reduce(
+                    input, threshold, compare, mode, ints ? DataType::INT32 : DataType::FLOAT32);
+                EXPECT_EQ(out.logical_shape(), ttnn::Shape(t_shape));
+                std::vector<float> got;
+                if (ints) {
+                    for (int32_t v : out.cpu().template to_vector<int32_t>()) {
+                        got.push_back(static_cast<float>(v));
+                    }
+                } else {
+                    got = out.cpu().template to_vector<float>();
+                }
                 ASSERT_EQ(got.size(), rows);
                 for (uint32_t r = 0; r < rows; ++r) {
                     double want = 0;
@@ -119,7 +149,7 @@ protected:
     std::shared_ptr<MeshDevice> mesh_device_;
 };
 
-TEST_F(MaskedReduceTest, F32VocabularyRows) { check<float>(2, 151936, DataType::FLOAT32, /*timed=*/true); }
+TEST_F(MaskedReduceTest, F32VocabularyRows) { check<float>(2, 151936, DataType::FLOAT32, {.timed = true}); }
 
 TEST_F(MaskedReduceTest, Bf16Rows) { check<bfloat16>(4, 4096, DataType::BFLOAT16); }
 
@@ -140,8 +170,19 @@ TEST_F(MaskedReduceTest, DenseRowPacking) {
 }
 
 TEST_F(MaskedReduceTest, MaskedInfinitiesAddNothing) {
-    check<float>(4, 3000, DataType::FLOAT32, /*timed=*/false, /*infinities=*/true);
-    check<bfloat16>(4, 3000, DataType::BFLOAT16, /*timed=*/false, /*infinities=*/true);
+    check<float>(4, 3000, DataType::FLOAT32, {.infinities = true});
+    check<bfloat16>(4, 3000, DataType::BFLOAT16, {.infinities = true});
+}
+
+TEST_F(MaskedReduceTest, RowThresholdsAndIntCounts) {
+    // The sampler's form: [2] thresholds, [2] results, counts as int32; then
+    // batches whose thresholds share a tile (rows 0 and 1 of it, the odd row
+    // off the 64-byte alignment for bf16), and a many-row batch.
+    check<float>(2, 151936, DataType::FLOAT32, {.row_form = true, .int_counts = true});
+    check<float>(2, 1000, DataType::FLOAT32, {.batch = 3, .row_form = true, .int_counts = true});
+    check<bfloat16>(2, 1000, DataType::BFLOAT16, {.batch = 3, .row_form = true});
+    check<float>(40, 1000, DataType::FLOAT32, {.batch = 2, .row_form = true});
+    check<float>(40, 1000, DataType::FLOAT32, {.batch = 2, .int_counts = true});
 }
 
 }  // namespace

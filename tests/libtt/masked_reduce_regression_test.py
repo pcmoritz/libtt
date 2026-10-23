@@ -73,7 +73,10 @@ def test_count_search_runs_fused(trace, tmp_path):
     assert np.all((SOURCE > threshold[:, None]).sum(axis=1) >= k)
     assert np.all((SOURCE > np.nextafter(threshold, np.inf)[:, None]).sum(axis=1) < k)
     ir = _runtime_ir(tmp_path)
-    assert "ttnn.masked_reduce" in ir
+    # The step's [2] thresholds go in and its [2] int32 counts come out as
+    # they are: no reshape to and from [2, 1], no typecast of the counts.
+    assert re.search(r'"ttnn\.masked_reduce".*tensor<2xf32.*-> tensor<2xsi32', ir)
+    assert re.search(r'"ttnn\.reshape".*-> tensor<2x1x', ir) is None
     # No compare or select over the vocabulary survives.
     assert re.search(r'"ttnn\.(gt|ge|lt|le|where)".*tensor<2x2048x', ir) is None
 
@@ -88,7 +91,9 @@ def test_mass_search_runs_fused(trace, tmp_path):
     assert np.all(kept >= p - 1e-3)
     dropped = np.where(probs >= np.nextafter(threshold, np.inf)[:, None], probs, 0.0).sum(axis=1)
     assert np.all(dropped < p + 1e-3)
-    assert "ttnn.masked_reduce" in _runtime_ir(tmp_path)
+    ir = _runtime_ir(tmp_path)
+    assert re.search(r'"ttnn\.masked_reduce".*tensor<2xf32.*-> tensor<2xf32', ir)
+    assert re.search(r'"ttnn\.reshape".*-> tensor<2x1x', ir) is None
 
 
 @pytest.mark.parametrize(
