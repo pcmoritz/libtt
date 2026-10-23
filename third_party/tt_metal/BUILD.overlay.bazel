@@ -109,6 +109,20 @@ genrule(
     ],
 )
 
+# A few sources include generated and UMD headers by their CMake source-tree paths. Forward those paths to the
+# headers this build provides instead of patching the includes.
+genrule(
+    name = "tt_metal_source_path_forwarding_headers",
+    outs = [
+        "tt_metal/llrt/hal/generated/fabric_telemetry.hpp",
+        "tt_metal/third_party/umd/device/api/umd/device/types/core_coordinates.hpp",
+        "tt_metal/third_party/umd/device/api/umd/device/types/xy_pair.hpp",
+    ],
+    cmd = "printf '%s\\n' '#pragma once' '#include \"hal/generated/fabric_telemetry.hpp\"' > $(location tt_metal/llrt/hal/generated/fabric_telemetry.hpp); " +
+          "printf '%s\\n' '#pragma once' '#include <umd/device/types/core_coordinates.hpp>' > $(location tt_metal/third_party/umd/device/api/umd/device/types/core_coordinates.hpp); " +
+          "printf '%s\\n' '#pragma once' '#include <umd/device/types/xy_pair.hpp>' > $(location tt_metal/third_party/umd/device/api/umd/device/types/xy_pair.hpp)",
+)
+
 # CMake generates tt_metal/impl/version.hpp from this template at configure time.
 # Fill it in for the pinned tt-metal revision so the build stays reproducible.
 genrule(
@@ -731,6 +745,7 @@ TT_METAL_RUNTIME_HDRS = glob(
     ":tt_metal_hal_generated_headers",
     ":tt_metal_inspector_stub_headers",
     ":tt_metal_jit_server_stub_headers",
+    ":tt_metal_source_path_forwarding_headers",
 ]
 
 TT_METAL_RUNTIME_INCLUDE_DIRS = ["inspector_stubs"] + TT_METAL_INCLUDE_DIRS + [

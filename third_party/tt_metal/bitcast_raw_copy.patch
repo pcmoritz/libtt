@@ -33,17 +33,16 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
      auto compute_ops_chain = ops_chain;
      const bool promote_narrow_float =
          uses_raw_16bit_sfpu_path(input.dtype()) && ops_chain[0].type() != UnaryOpType::TYPECAST &&
-@@ -383,8 +384,11 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+@@ -383,6 +384,12 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
      DataFormat cb_data_format_output =
          promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format
                                                        : cb_dataformat_for(output.dtype());
--    if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
--        cb_data_format_output = DataFormat::UInt16;
 +    if (is_bitcast) {
 +        // For BITCAST, cb_data_format_for_input below inherits this format.
 +        // Unsigned semantics therefore apply to both unpacking and packing.
 +        cb_data_format_output =
 +            input.element_size() == sizeof(uint16_t) ? DataFormat::UInt16 : DataFormat::UInt32;
-     }
++    }
      uint32_t single_tile_size_output = tile_size(cb_data_format_output);
  
+     Buffer* src_buffer = input.buffer();
