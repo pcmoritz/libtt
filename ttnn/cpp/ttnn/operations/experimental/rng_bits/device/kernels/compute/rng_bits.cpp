@@ -248,8 +248,7 @@ void kernel_main() {
             }
             // Only the first word of the final Philox round is returned.
             MATH((rng::philox_half_round<0xCD9E8D57, true>(x[2], x[1], k0, rows_valid)));
-            x[0] = x[1];
-            out_dst = x[0];
+            out_dst = x[1];
         }
         tile_regs_commit();
 

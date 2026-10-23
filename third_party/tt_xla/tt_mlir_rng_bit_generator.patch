@@ -278,3 +278,383 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
    case ::tt::target::ttnn::OpType::ReshapeOp: {
      return operations::data_movement::run(op->type_as_ReshapeOp(),
                                            getContext());
+diff --git a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ComplexDataTypeConversion.cpp
+@@ -5,6 +5,7 @@
+ #include <limits>
+ #include <utility>
+ 
++#include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
+ #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h"
+ #include "ttmlir/Dialect/StableHLO/Utils/Utils.h"
+ 
+@@ -23,6 +24,7 @@
+ 
+ namespace mlir::tt::stablehlo {
+ #define GEN_PASS_DEF_STABLEHLOCOMPLEXDATATYPECONVERSIONPASS
++#define GEN_PASS_DEF_STABLEHLOUINT64DATATYPECONVERSIONPASS
+ #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h.inc"
+ static bool hasComplexElementType(Type type) {
+   auto tensorType = mlir::dyn_cast<RankedTensorType>(type);
+@@ -1105,15 +1107,14 @@
+ // annotation needs an extra dimension entry: closed, unsharded.
+ // Example: tensor<16x16xcomplex<f32>> with sharding [{}, {}]
+ //       -> tensor<16x16x2xf32>       with sharding [{}, {}, {}]
+-static mlir::sdy::TensorShardingPerValueAttr
+-convertShardingsForComplexTypes(MLIRContext *ctx,
+-                                mlir::sdy::TensorShardingPerValueAttr shardings,
+-                                TypeRange originalTypes) {
++static mlir::sdy::TensorShardingPerValueAttr convertShardingsForComplexTypes(
++    MLIRContext *ctx, mlir::sdy::TensorShardingPerValueAttr shardings,
++    TypeRange originalTypes, const TypeConverter &converter) {
+   SmallVector<mlir::sdy::TensorShardingAttr> newShardings;
+   for (auto [sharding, type] :
+        llvm::zip_equal(shardings.getShardings(), originalTypes)) {
+     auto rtt = mlir::dyn_cast<RankedTensorType>(type);
+-    if (rtt && mlir::isa<ComplexType>(rtt.getElementType())) {
++    if (rtt && converter.convertType(rtt) != rtt) {
+       // Append "{}" to sharding spec
+       SmallVector<mlir::sdy::DimensionShardingAttr> dims(
+           sharding.getDimShardings().begin(), sharding.getDimShardings().end());
+@@ -1159,9 +1160,11 @@
+     }
+ 
+     auto newInShardings = convertShardingsForComplexTypes(
+-        op.getContext(), op.getInShardings(), op.getBody().getArgumentTypes());
++        op.getContext(), op.getInShardings(), op.getBody().getArgumentTypes(),
++        *getTypeConverter());
+     auto newOutShardings = convertShardingsForComplexTypes(
+-        op.getContext(), op.getOutShardings(), op.getResultTypes());
++        op.getContext(), op.getOutShardings(), op.getResultTypes(),
++        *getTypeConverter());
+ 
+     // Build via OperationState so no implicit block is auto-created;
+     // we then inline the original region and convert its block arg types.
+@@ -1342,4 +1345,250 @@
+   }
+ };
+ } // namespace
++
++// uint64 RNG state uses the same trailing pair dimension as complex values.
++// Keep buffers, constants, data movement and addition exact; other arithmetic
++// retains the existing low-word behavior through conversion materializations.
++namespace {
++bool isUInt64(Type type) {
++  auto tensor = dyn_cast<RankedTensorType>(type);
++  return tensor && tensor.getElementType().isUnsignedInteger(64);
++}
++
++Value uint32Constant(Location loc, RankedTensorType type, uint32_t value,
++                     OpBuilder &builder) {
++  return builder.create<mlir::stablehlo::ConstantOp>(
++      loc, DenseElementsAttr::get(type, APInt(32, value)));
++}
++
++class UInt64ConstantPattern
++    : public OpConversionPattern<mlir::stablehlo::ConstantOp> {
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::ConstantOp op, OpAdaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto type =
++        cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
++    SmallVector<APInt> words;
++    for (APInt value :
++         cast<DenseElementsAttr>(op.getValue()).getValues<APInt>()) {
++      words.push_back(value.trunc(32));
++      words.push_back(value.lshr(32).trunc(32));
++    }
++    rewriter.replaceOpWithNewOp<mlir::stablehlo::ConstantOp>(
++        op, DenseElementsAttr::get(type, words));
++    return success();
++  }
++};
++
++class UInt64AddPattern : public OpConversionPattern<mlir::stablehlo::AddOp> {
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::AddOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto [a, ah] = unpackRealImag(op.getLoc(), adaptor.getLhs(), rewriter);
++    auto [b, bh] = unpackRealImag(op.getLoc(), adaptor.getRhs(), rewriter);
++    auto type = cast<RankedTensorType>(a.getType());
++    Value lo = rewriter.create<mlir::stablehlo::AddOp>(op.getLoc(), a, b);
++    // The sign bit of (a & b) | ((a | b) & ~sum) is the unsigned carry.
++    // Use integer bitwise ops so this does not depend on uint32 comparisons.
++    Value ab = rewriter.create<mlir::stablehlo::AndOp>(op.getLoc(), a, b);
++    Value either = rewriter.create<mlir::stablehlo::OrOp>(op.getLoc(), a, b);
++    Value inverted = rewriter.create<mlir::stablehlo::NotOp>(op.getLoc(), lo);
++    Value carry =
++        rewriter.create<mlir::stablehlo::AndOp>(op.getLoc(), either, inverted);
++    carry = rewriter.create<mlir::stablehlo::OrOp>(op.getLoc(), ab, carry);
++    carry = rewriter.create<mlir::stablehlo::ShiftRightLogicalOp>(
++        op.getLoc(), carry, uint32Constant(op.getLoc(), type, 31, rewriter));
++    Value hi = rewriter.create<mlir::stablehlo::AddOp>(op.getLoc(), ah, bh);
++    hi = rewriter.create<mlir::stablehlo::AddOp>(op.getLoc(), hi, carry);
++    rewriter.replaceOp(op, packRealImag(op.getLoc(), lo, hi, rewriter));
++    return success();
++  }
++};
++
++class UInt64DynamicUpdateSlicePattern
++    : public OpConversionPattern<mlir::stablehlo::DynamicUpdateSliceOp> {
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::DynamicUpdateSliceOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    SmallVector<Value> indices(adaptor.getStartIndices());
++    auto indexType = indices.empty()
++                         ? RankedTensorType::get({}, rewriter.getI64Type())
++                         : cast<RankedTensorType>(indices.front().getType());
++    indices.push_back(rewriter.create<mlir::stablehlo::ConstantOp>(
++        op.getLoc(),
++        DenseElementsAttr::get(indexType, rewriter.getIntegerAttr(
++                                              indexType.getElementType(), 0))));
++    rewriter.replaceOpWithNewOp<mlir::stablehlo::DynamicUpdateSliceOp>(
++        op, adaptor.getOperand(), adaptor.getUpdate(), indices);
++    return success();
++  }
++};
++
++// A width-changing bitcast already describes the low/high word layout.
++class UInt64BitcastPattern
++    : public OpConversionPattern<mlir::stablehlo::BitcastConvertOp> {
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::BitcastConvertOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto type = getTypeConverter()->convertType(op.getType());
++    if (adaptor.getOperand().getType() != type) {
++      return failure();
++    }
++    rewriter.replaceOp(op, adaptor.getOperand());
++    return success();
++  }
++};
++
++class UInt64RngPattern
++    : public OpConversionPattern<mlir::stablehlo::RngBitGeneratorOp> {
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::RngBitGeneratorOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    auto stateType = cast<RankedTensorType>(op.getInitialState().getType());
++    auto outType = cast<RankedTensorType>(op.getOutput().getType());
++    auto elementType = dyn_cast<IntegerType>(outType.getElementType());
++    if (!stateType.hasStaticShape() || !outType.hasStaticShape()) {
++      return op.emitOpError("with a dynamic shape isn't supported");
++    }
++    if (!isUInt64(stateType) || stateType.getRank() != 1 ||
++        stateType.getNumElements() < 2 || stateType.getNumElements() > 16) {
++      return op.emitOpError("needs a state of 2 to 16 unsigned 64-bit integers");
++    }
++    if (!elementType || !elementType.isUnsigned() ||
++        elementType.getWidth() > 64) {
++      return op.emitOpError(
++                 "generates unsigned integers of up to 64 bits, not ")
++             << outType.getElementType();
++    }
++    if (outType.getNumElements() >= (int64_t{1} << 32)) {
++      return op.emitOpError("generates fewer than 2^32 elements");
++    }
++    Value state = adaptor.getInitialState();
++    Value bits;
++    if (outType.getNumElements() == 0) {
++      auto type =
++          cast<RankedTensorType>(getTypeConverter()->convertType(outType));
++      bits = rewriter.create<mlir::stablehlo::ConstantOp>(
++          op.getLoc(), DenseElementsAttr::get(type, ArrayRef<APInt>{}));
++    } else {
++      SmallVector<int64_t> shape(outType.getShape());
++      if (shape.empty())
++        shape.push_back(1);
++      auto bitsType =
++          RankedTensorType::get(shape, rewriter.getIntegerType(32, false));
++      auto rng = rewriter.create<ttir::RngBitGeneratorOp>(
++          op.getLoc(), state.getType(), bitsType, state,
++          rewriter.getBoolAttr(op.getRngAlgorithm() ==
++                               mlir::stablehlo::RngAlgorithm::PHILOX));
++      state = rng.getOutputState();
++      bits = rng.getOutput();
++      if (outType.getRank() == 0) {
++        bits = rewriter.create<mlir::stablehlo::ReshapeOp>(
++            op.getLoc(), RankedTensorType::get({}, bitsType.getElementType()),
++            bits);
++      }
++      if (elementType.getWidth() == 64) {
++        bits = packRealImag(
++            op.getLoc(), bits,
++            uint32Constant(op.getLoc(), cast<RankedTensorType>(bits.getType()),
++                           0, rewriter),
++            rewriter);
++      } else if (elementType.getWidth() < 32) {
++        bits = rewriter.create<mlir::stablehlo::ConvertOp>(op.getLoc(), outType,
++                                                           bits);
++      }
++    }
++    rewriter.replaceOp(op, {state, bits});
++    return success();
++  }
++};
++
++struct StableHLOUInt64DataTypeConversionPass
++    : public impl::StableHLOUInt64DataTypeConversionPassBase<
++          StableHLOUInt64DataTypeConversionPass> {
++  void runOnOperation() override {
++    TypeConverter converter;
++    converter.addConversion([](Type type) { return type; });
++    converter.addConversion([](RankedTensorType type) -> std::optional<Type> {
++      if (!isUInt64(type))
++        return std::nullopt;
++      SmallVector<int64_t> shape(type.getShape());
++      shape.push_back(2);
++      return RankedTensorType::get(
++          shape,
++          IntegerType::get(type.getContext(), 32, IntegerType::Unsigned));
++    });
++    // Unsupported uint64 operations still use the existing 32-bit lowering.
++    converter.addSourceMaterialization(
++        [](OpBuilder &b, Type type, ValueRange inputs, Location loc) -> Value {
++          if (!isUInt64(type) || inputs.size() != 1)
++            return {};
++          return b.create<mlir::stablehlo::ConvertOp>(
++              loc, type, unpackRealImag(loc, inputs[0], b).first);
++        });
++    converter.addTargetMaterialization(
++        [](OpBuilder &b, Type type, ValueRange inputs, Location loc) -> Value {
++          if (inputs.size() != 1 || !isUInt64(inputs[0].getType()))
++            return {};
++          auto inputType = cast<RankedTensorType>(inputs[0].getType());
++          auto lowType = inputType.clone(b.getIntegerType(32, false));
++          Value lo =
++              b.create<mlir::stablehlo::ConvertOp>(loc, lowType, inputs[0]);
++          return packRealImag(loc, lo, uint32Constant(loc, lowType, 0, b), b);
++        });
++    ConversionTarget target(getContext());
++    target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
++    auto legal = [&](Operation *op) { return converter.isLegal(op); };
++    target.addDynamicallyLegalOp<
++        mlir::stablehlo::ConstantOp, mlir::stablehlo::AddOp,
++        mlir::stablehlo::ReshapeOp, mlir::stablehlo::SliceOp,
++        mlir::stablehlo::ConcatenateOp, mlir::stablehlo::BroadcastInDimOp,
++        mlir::stablehlo::TransposeOp, mlir::stablehlo::SelectOp,
++        mlir::stablehlo::DynamicUpdateSliceOp>(legal);
++    target.addIllegalOp<mlir::stablehlo::RngBitGeneratorOp>();
++    target.addDynamicallyLegalOp<mlir::stablehlo::BitcastConvertOp>(
++        [&](mlir::stablehlo::BitcastConvertOp op) {
++          // Only the bitcasts between uint64 and its two uint32 words are
++          // exact.
++          return converter.convertType(op.getOperand().getType()) !=
++                     converter.convertType(op.getType()) ||
++                 legal(op);
++        });
++    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
++      return converter.isSignatureLegal(op.getFunctionType()) &&
++             converter.isLegal(&op.getBody());
++    });
++    target.addDynamicallyLegalOp<func::ReturnOp, func::CallOp,
++                                 mlir::sdy::ReturnOp>(legal);
++    target.addDynamicallyLegalOp<mlir::sdy::ManualComputationOp>(
++        [&](mlir::sdy::ManualComputationOp op) {
++          return legal(op) && converter.isLegal(&op.getBody());
++        });
++    RewritePatternSet patterns(&getContext());
++    patterns.add<
++        UInt64ConstantPattern, UInt64AddPattern, UInt64RngPattern,
++        UInt64DynamicUpdateSlicePattern, UInt64BitcastPattern,
++        ComplexTypeDefaultConversionPattern<mlir::stablehlo::ReshapeOp>,
++        ComplexTypeDefaultConversionPattern<mlir::stablehlo::ConcatenateOp>,
++        ComplexSliceOpConversionPattern,
++        ComplexBroadcastInDimOpConversionPattern,
++        ComplexTransposeOpConversionPattern, ComplexSelectOpConversionPattern,
++        ShardyManualComputationComplexConversionPattern,
++        ShardyReturnOpTypeConversionPattern>(converter, &getContext());
++    populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(patterns,
++                                                                   converter);
++    populateReturnOpTypeConversionPattern(patterns, converter);
++    populateCallOpTypeConversionPattern(patterns, converter);
++    if (failed(applyPartialConversion(getOperation(), target,
++                                      std::move(patterns))))
++      signalPassFailure();
++  }
++};
++} // namespace
++
+ } // namespace mlir::tt::stablehlo
+diff --git a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td b/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
+--- a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
++++ b/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
+@@ -34,6 +34,13 @@
+   let dependentDialects = ["mlir::func::FuncDialect",
+                            "::mlir::stablehlo::StablehloDialect",
+                            "::mlir::sdy::SdyDialect"];
++}
++
++def StableHLOUInt64DataTypeConversionPass : Pass<"stablehlo-uint64-data-type-conversion", "::mlir::ModuleOp"> {
++  let summary = "Preserve uint64 RNG state as low/high uint32 pairs.";
++  let dependentDialects = ["::mlir::func::FuncDialect",
++                          "::mlir::stablehlo::StablehloDialect",
++                          "::mlir::tt::ttir::TTIRDialect"];
+ }
+ 
+ def RegisterCustomShardingRulePass : Pass<"register-custom-sharding-rule", "::mlir::ModuleOp">
+diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+--- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
++++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
+@@ -77,6 +77,7 @@
+   pm.addPass(::mlir::stablehlo::createStablehloComplexMathExpanderPass());
+   pm.addPass(
+       mlir::tt::stablehlo::createStableHLOComplexDataTypeConversionPass());
++  pm.addPass(mlir::tt::stablehlo::createStableHLOUInt64DataTypeConversionPass());
+ 
+   pm.addPass(createLegalizeStableHLOCompositeToTTIRPass());
+   if (options.legalizeCompositeToCallEnabled) {
+diff --git a/lib/Dialect/StableHLO/Transforms/ReplicateNonSplittableValues.cpp b/lib/Dialect/StableHLO/Transforms/ReplicateNonSplittableValues.cpp
+--- a/lib/Dialect/StableHLO/Transforms/ReplicateNonSplittableValues.cpp
++++ b/lib/Dialect/StableHLO/Transforms/ReplicateNonSplittableValues.cpp
+@@ -5,6 +5,7 @@
+ #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h"
+ #include "ttmlir/Dialect/StableHLO/Utils/ShardyUtils.h"
+ 
++#include "shardy/dialect/sdy/ir/utils.h"
+ #include "stablehlo/dialect/StablehloOps.h"
+ 
+ namespace mlir::tt::stablehlo {
+@@ -28,6 +29,10 @@
+ // shard_id*local + 0..local-1. To avoid that, we also replicate such iotas here
+ // so the full global iota is materialized and Shardy inserts a reshard that
+ // slices out the correct local range per shard.
++//
++// `stablehlo.rng_bit_generator` draws each output element from the state and
++// the element's index, so a sharded output has the iota problem: every shard
++// would repeat the first shard's bits. Its results are replicated too.
+ class ReplicateNonSplittableValuesPass
+     : public impl::ReplicateNonSplittableValuesPassBase<
+           ReplicateNonSplittableValuesPass> {
+@@ -147,6 +152,25 @@
+           iotaOp, context, globalMeshOp.getSymName(), oldType.getRank());
+     });
+ 
++    rootModule.walk([&](mlir::stablehlo::RngBitGeneratorOp rngOp) {
++      auto shardings =
++          rngOp->getAttrOfType<mlir::sdy::TensorShardingPerValueAttr>(
++              mlir::sdy::TensorShardingAttr::name);
++      if (!shardings ||
++          llvm::all_of(shardings.getShardings(),
++                       [&](mlir::sdy::TensorShardingAttr sharding) {
++                         return shardy_utils::isFullyReplicatedTensor(
++                             sharding, globalMeshOp);
++                       })) {
++        return;
++      }
++      rngOp->setAttr(mlir::sdy::TensorShardingAttr::name,
++                     mlir::sdy::TensorShardingPerValueAttr::get(
++                         context, mlir::sdy::getFullyClosedShardings(
++                                      context, rngOp->getResultTypes(),
++                                      globalMeshOp.getSymName())));
++    });
++
+     rootModule.walk([&](mlir::stablehlo::SliceOp sliceOp) {
+       mlir::sdy::TensorShardingAttr sharding =
+           shardy_utils::getFirstSharding(sliceOp);

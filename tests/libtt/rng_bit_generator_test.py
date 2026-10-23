@@ -10,6 +10,7 @@ from jax import core
 from jax._src.lib.mlir.dialects import hlo
 from jax.extend.core import Primitive
 from jax.interpreters import mlir
+from jax.sharding import NamedSharding, PartitionSpec as P
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -259,6 +260,29 @@ def test_bits_are_balanced(algorithm, dtype, width):
     # About as many distinct values as random draws give.
     distinct = 2.0**width * -np.expm1(values.size * np.log1p(-(2.0**-width)))
     assert len(np.unique(values)) > 0.95 * distinct
+
+
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+def test_sharded_output_matches_unsharded(algorithm):
+    """Each device draws the whole output and keeps its shard, as XLA does by
+    default. Drawing only the shard repeated the first shard on every device:
+    a device sees its shard's local element indices."""
+    devices = jax.devices("tt")
+    if len(devices) < 2:
+        pytest.skip("needs at least two devices")
+    mesh = jax.make_mesh((len(devices),), ("x",), devices=devices)
+    replicated = NamedSharding(mesh, P())
+    old = state(0xDEADBEEF, 3)
+    shape = (32 * len(devices), 40)
+    with jax.enable_x64(True):
+        draw = jax.jit(
+            lambda s: jax.lax.rng_bit_generator(s, shape, jnp.uint32, algorithm=ALGORITHMS[algorithm]),
+            out_shardings=(replicated, NamedSharding(mesh, P("x"))),
+        )
+        new, values = draw(jax.device_put(jnp.asarray(old), replicated))
+        new, values = np.asarray(new), np.asarray(values)
+    np.testing.assert_array_equal(values.ravel(), expected(algorithm, old, values.size))
+    np.testing.assert_array_equal(new, advanced(old, values.size))
 
 
 def test_empty_output_keeps_the_state():
