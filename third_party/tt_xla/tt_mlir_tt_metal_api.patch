@@ -1,0 +1,148 @@
+diff --git a/runtime/include/tt/runtime/detail/ttmetal/ttmetal.h b/runtime/include/tt/runtime/detail/ttmetal/ttmetal.h
+--- a/runtime/include/tt/runtime/detail/ttmetal/ttmetal.h
++++ b/runtime/include/tt/runtime/detail/ttmetal/ttmetal.h
+@@ -12,6 +12,7 @@
+ #include "tt-metalium/hal.hpp"
+ #include "tt-metalium/host_api.hpp"
+ #include "tt-metalium/memory_reporter.hpp"
++#include "tt-metalium/mesh_buffer.hpp"
+ #include "tt-metalium/mesh_device.hpp"
+ #include "tt-metalium/program_cache.hpp"
+ #include "tt-metalium/tt_metal.hpp"
+diff --git a/runtime/lib/common/fabric_config.cpp b/runtime/lib/common/fabric_config.cpp
+--- a/runtime/lib/common/fabric_config.cpp
++++ b/runtime/lib/common/fabric_config.cpp
+@@ -87,7 +87,7 @@
+       auto forwardCoord = deviceCoord;
+       forwardCoord[dim] = (forwardCoord[dim] + 1) % meshDevice->shape()[dim];
+       auto forward_directions = tt_fabric::get_neighbor_eth_directions(
+-          meshDevice->get_fabric_node_id(deviceCoord),
++          *meshDevice, meshDevice->get_fabric_node_id(deviceCoord),
+           meshDevice->get_fabric_node_id(forwardCoord));
+ 
+       // edge case: if dim size is 1, then neither forward nor backward exist
+@@ -140,7 +140,7 @@
+       backwardCoord[dim] = (backwardCoord[dim] + meshDevice->shape()[dim] - 1) %
+                            meshDevice->shape()[dim];
+       auto backward_directions = tt_fabric::get_neighbor_eth_directions(
+-          meshDevice->get_fabric_node_id(deviceCoord),
++          *meshDevice, meshDevice->get_fabric_node_id(deviceCoord),
+           meshDevice->get_fabric_node_id(backwardCoord));
+       ;
+ 
+diff --git a/lib/OpModel/TTNN/SingletonDeviceContext.cpp b/lib/OpModel/TTNN/SingletonDeviceContext.cpp
+--- a/lib/OpModel/TTNN/SingletonDeviceContext.cpp
++++ b/lib/OpModel/TTNN/SingletonDeviceContext.cpp
+@@ -102,14 +102,9 @@
+     return ::tt::tt_metal::MetalEnvDescriptor{discovered->path};
+   }
+ 
+-  auto mockClusterPath =
++  return ::tt::tt_metal::MetalEnvDescriptor{
+       ::tt::tt_metal::experimental::get_mock_cluster_desc_name(
+-          toMetalArch(arch), numChips);
+-  if (!mockClusterPath) {
+-    llvm::report_fatal_error(
+-        "Unsupported (arch, numChips) for mock cluster descriptor");
+-  }
+-  return ::tt::tt_metal::MetalEnvDescriptor{*mockClusterPath};
++          toMetalArch(arch), numChips)};
+ }
+ 
+ // Pick the dispatch core type for a device opened on this env. When every
+@@ -293,9 +288,12 @@
+ 
+   auto device = env->create_mesh_device(
+       ::tt::tt_metal::distributed::MeshDeviceConfig{shape},
+-      ::tt::constants::L1_SMALL_SIZE, traceRegionSize,
+-      /*num_command_queues=*/1,
+-      ::tt::tt_metal::DispatchCoreConfig{selectDispatchCoreType(*env)});
++      ::tt::tt_metal::CreateMeshDeviceOptions{
++          .l1_small_size = ::tt::constants::L1_SMALL_SIZE,
++          .trace_region_size = traceRegionSize,
++          .num_command_queues = 1,
++          .dispatch_core_config =
++              ::tt::tt_metal::DispatchCoreConfig{selectDispatchCoreType(*env)}});
+ 
+   device->disable_and_clear_program_cache();
+ 
+@@ -339,9 +337,12 @@
+ 
+   m_device = m_env->create_mesh_device(
+       ::tt::tt_metal::distributed::MeshDeviceConfig{shape},
+-      ::tt::constants::L1_SMALL_SIZE, traceRegionSize,
+-      /*num_command_queues=*/1,
+-      ::tt::tt_metal::DispatchCoreConfig{dispatchCoreType});
++      ::tt::tt_metal::CreateMeshDeviceOptions{
++          .l1_small_size = ::tt::constants::L1_SMALL_SIZE,
++          .trace_region_size = traceRegionSize,
++          .num_command_queues = 1,
++          .dispatch_core_config =
++              ::tt::tt_metal::DispatchCoreConfig{dispatchCoreType}});
+ 
+   m_device->disable_and_clear_program_cache();
+ 
+diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
+--- a/lib/OpModel/TTNN/TTNNOpModel.cpp
++++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
+@@ -8098,7 +8098,6 @@
+     return QUERY_OP_CONSTRAINTS_WITH_STATE(
+         ::ttnn::group_norm, device, initialStateOpt, inputSpec, numGroupsInt,
+         epsilonFloat, inputMaskSpec, weightSpec, biasSpec,
+-        /*reciprocals=*/std::nullopt,
+         detail::getNullableMemoryConfig(outputLayout),
+         /*dtype=*/std::nullopt,
+         /*core_grid=*/std::nullopt,
+@@ -8148,7 +8147,6 @@
+   auto groupNormQuery = [=]() {
+     return QUERY_OP_RUNTIME(::ttnn::group_norm, device, inputSpec, numGroupsInt,
+                             epsilonFloat, inputMaskSpec, weightSpec, biasSpec,
+-                            /*reciprocals=*/std::nullopt,
+                             detail::getNullableMemoryConfig(outputLayout),
+                             /*dtype=*/std::nullopt,
+                             /*core_grid=*/std::nullopt,
+diff --git a/runtime/lib/ttnn/operations/normalization/group_norm.cpp b/runtime/lib/ttnn/operations/normalization/group_norm.cpp
+--- a/runtime/lib/ttnn/operations/normalization/group_norm.cpp
++++ b/runtime/lib/ttnn/operations/normalization/group_norm.cpp
+@@ -39,7 +39,7 @@
+   // Call TTNN group norm operation
+   ::ttnn::Tensor output = ::ttnn::group_norm(
+       input, num_groups, epsilon, input_mask, weight, bias,
+-      /*reciprocals=*/std::nullopt, memoryConfig,
++      memoryConfig,
+       /*dtype=*/std::nullopt, /*core_grid=*/std::nullopt,
+       /*inplace=*/std::nullopt, /*output_layout=*/std::nullopt,
+       /*num_out_blocks=*/std::nullopt,
+diff --git a/runtime/lib/ttnn/operations/transformer/chunk_gated_delta_rule.cpp b/runtime/lib/ttnn/operations/transformer/chunk_gated_delta_rule.cpp
+--- a/runtime/lib/ttnn/operations/transformer/chunk_gated_delta_rule.cpp
++++ b/runtime/lib/ttnn/operations/transformer/chunk_gated_delta_rule.cpp
+@@ -35,10 +35,16 @@
+       tensor(op->g()), tensor(op->beta()), op->scale(),
+       optionalTensor(op->initial_state()), op->output_final_state(),
+       op->chunk_size(), op->use_qk_l2norm(), op->output_head_major(),
+-      /*use_mcast=*/true, memoryConfig, computeConfig,
++      ::ttnn::transformer::ChunkGdnPhasedProgramConfig{},
++      ::ttnn::transformer::ChunkGdnWyInverse::HORNER, memoryConfig, computeConfig,
+       optionalTensor(op->eye()), optionalTensor(op->tril()),
+       optionalTensor(op->ones()), optionalTensor(op->masks()));
+ 
++  // The new Metal implementation returns FP32; retain the declared result type.
++  const auto outputDtype = utils::getDataType(op->out());
++  if (output.dtype() != outputDtype) {
++    output = ::ttnn::typecast(output, outputDtype, memoryConfig);
++  }
+   tensorPool.insertTTNNTensorAndValidate(op->out(), output);
+   if (op->final_state()) {
+     TT_FATAL(finalState.has_value(),
+diff --git a/runtime/lib/ttnn/operations/transformer/indexer_score_dsa.cpp b/runtime/lib/ttnn/operations/transformer/indexer_score_dsa.cpp
+--- a/runtime/lib/ttnn/operations/transformer/indexer_score_dsa.cpp
++++ b/runtime/lib/ttnn/operations/transformer/indexer_score_dsa.cpp
+@@ -32,7 +32,7 @@
+ 
+   // program_config and compute_kernel_config fall back to the ttnn defaults.
+   ::ttnn::Tensor out = ::ttnn::experimental::indexer_score_dsa(
+-      query, key, weights, op->chunk_start_idx(),
++      query, key, weights, op->chunk_start_idx(), /*key_compression_ratio=*/1,
+       /*program_config=*/{}, /*compute_kernel_config=*/std::nullopt,
+       /*cache_batch_idx=*/std::nullopt, /*kv_len=*/std::nullopt, seqShardAxes);
+ 

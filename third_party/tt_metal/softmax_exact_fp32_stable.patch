@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
  #include "api/compute/softmax.h"
  #include "api/compute/reduce.h"
  #include "api/dataflow/dataflow_buffer.h"
-@@ -64,6 +65,111 @@ void calc_numeric_stable(std::uint32_t Wt, std::uint32_t ndst) {
+@@ -62,6 +63,111 @@ void calc_numeric_stable(std::uint32_t Wt, std::uint32_t ndst) {
      dfb_out_obj.wait_front(static_cast<uint16_t>(Wt));
  }
  
@@ -131,9 +131,9 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
 +        calc_numeric_stable_exact<dfb_x, dfb_max_scaler, dfb_max, dfb_exps>(Wt, ndst);
 +#elif defined(MASK_PADDED_DATA)
          {
-             for (std::uint32_t wt = 0; wt < Wt; wt += ndst) {
-                 const std::uint32_t rem = (wt + ndst > Wt) ? (Wt - wt) : ndst;  // clamped final block
-@@ -308,7 +417,9 @@ void kernel_main() {
+             if (Wt > 1) {
+                 ckl::eltwise_chain(
+@@ -312,7 +421,9 @@ void kernel_main() {
          {
  // add numeric_stable
  // fuse exp with sub tiles
@@ -143,30 +143,11 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
 +#elif defined(NUMERIC_STABLE)
              calc_numeric_stable<dfb_in0, dfb_max_scaler, dfb_max, dfb_exps>(Wt, ndst);
  #else
-             for (std::uint32_t wt = 0; wt < Wt; wt += ndst) {
-diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_device_operation.cpp ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_device_operation.cpp
---- ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_device_operation.cpp
-@@ -378,12 +378,14 @@ SoftmaxDeviceOperation::create_op_performance_model(
- 
- // hw bug (#38306): on Wormhole B0, HiFi4 with fp32 accumulation can produce less accurate
- // results than HiFi3 for some inputs. Use HiFi3 as the safe default when fp32 acc is enabled.
-+// FP32 inputs default to the exact exp: the approximate one leaves FP32 probabilities about 3% off,
-+// against 0.3% (Blackhole, softmax over 128 values).
- static DeviceComputeKernelConfig softmax_init_compute_kernel_config(
-     tt::ARCH arch, const std::optional<const DeviceComputeKernelConfig>& compute_kernel_config, bool is_fp32) {
-     const auto is_wormhole = arch == tt::ARCH::WORMHOLE_B0;
-     const auto default_fidelity = (is_wormhole && is_fp32) ? tt::tt_metal::MathFidelity::HiFi3 : tt::tt_metal::MathFidelity::HiFi4;
-     verify_numerical_configuration(arch, compute_kernel_config);
--    return init_device_compute_kernel_config(arch, compute_kernel_config, default_fidelity, true, is_fp32, false);
-+    return init_device_compute_kernel_config(arch, compute_kernel_config, default_fidelity, !is_fp32, is_fp32, false);
- }
- 
- Tensor softmax(
+             ckl::unary<
 diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp
 --- ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp
 +++ ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp
-@@ -298,6 +298,12 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
+@@ -328,6 +328,12 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
      // cb_x: only needed when calc_numeric_stable consumes a separate post-mask buffer (mask or
      // mask-padded path), or when the streaming large kernel is selected. In the no-mask
      // numeric_stable path softmax.cpp aliases cb_x to cb_exps, so we skip the allocation.
@@ -179,7 +160,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program
      const bool alloc_cb_x = small_kernel_numeric_stable_uses_cb_x_at_wt || use_large_kernel;
      if (alloc_cb_x) {
          dfbs.push_back(DataflowBufferSpec{
-@@ -327,6 +333,14 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
+@@ -357,6 +363,14 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
      if (!use_large_kernel && mask_padded_data) {
          compute_defines["MASK_PADDED_DATA"] = "1";
      }
@@ -194,10 +175,10 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program
  
      // ---- Reader kernel ----
      Group<DFBBinding> reader_bindings = {
-@@ -461,12 +475,16 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
-     auto compute_hw = ttnn::to_compute_hardware_config(arch, attributes.compute_kernel_config);
+@@ -491,15 +505,19 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
+     auto compute_hw = ttnn::to_compute_hardware_config(attributes.compute_kernel_config);
      if (fp32_dest_acc_en) {
-         auto& gen1 = std::get<ComputeGen1Config>(compute_hw);
+         auto& gen1 = compute_hw;
 -        auto add_unpack = [&](const DFBSpecName& name, tt::DataFormat fmt) {
 +        auto add_unpack = [&](const DFBSpecName& name,
 +                              tt::DataFormat fmt,
@@ -207,14 +188,17 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program
 +                gen1.unpack_modes.insert({name, mode});
              }
          };
+         // Each DFB registers under the format it was declared with. The sum accumulators
+         // follow acc_cb_data_format, the bulk buffers follow im_cb_data_format, and the two
+         // differ for a non-fp32 input.
 -        add_unpack(IN0, in0_cb_data_format);
 +        const auto exact_mode =
 +            exact_fp32_stable_kernel ? tt::tt_metal::UnpackMode::UnpackToDest : tt::tt_metal::UnpackMode::UnpackToSrc;
 +        add_unpack(IN0, in0_cb_data_format, exact_mode);
          add_unpack(MAX_SCALER, max_scaler_cb_data_format);
          add_unpack(SUM_SCALER, sum_scaler_cb_data_format);
-         add_unpack(MASK_PADDED, mask_cb_data_format);
-@@ -478,10 +496,10 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
+         add_unpack(MASK_PADDED, tt::DataFormat::Float16_b);
+@@ -511,10 +529,10 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
              add_unpack(SCALE_MASK, im_cb_data_format);
          }
          if (attributes.numeric_stable) {
@@ -226,4 +210,4 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program
 +            add_unpack(X, im_cb_data_format, exact_mode);
          }
          if (use_large_kernel) {
-             add_unpack(PREV_REDUCE, im_cb_data_format);
+             add_unpack(PREV_REDUCE, acc_cb_data_format);

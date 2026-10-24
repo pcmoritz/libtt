@@ -1,21 +1,3 @@
-diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
---- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
-@@ -350,7 +350,13 @@ TilizeDeviceOperation::program_factory_t TilizeDeviceOperation::select_program_f
-     size_t grid_area = available_grid.num_cores();
-     auto [ncores, nblocks_per_core] = compute_ncores(grid_area, nblocks);
-     constexpr uint32_t threshold_row_block = 32;
--    if (num_tiles_per_row > threshold_row_block &&
-+    // Wide interleaved rows go to the default factory, which splits a few tile rows by width over the cores
-+    // itself (tilize_width_slices). The block factory's narrow pieces were slower at every shape measured on
-+    // Blackhole, bf16: 64 x 2048 26 us against 4.2 us, 64 x 2144 (67 tiles, no slices, 2 cores) 26 us against
-+    // 14 us, 3552 x 2048 133 us against 81 us.
-+    const bool interleaved_rows = !input_tensor_a.memory_config().is_sharded() &&
-+                                  input_tensor_a.logical_shape()[-1] % tile_width == 0;
-+    if (!interleaved_rows && num_tiles_per_row > threshold_row_block &&
-         (num_tiles_per_col > threshold_row_block || num_tiles_per_row > num_tiles_per_col)) {
-         uint32_t num_blocks_block =
-             (input_tensor_a.padded_shape()[-1] * input_tensor_a.padded_shape()[-2]) / (tile_height * tile_width);
 diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/kernels/dataflow/reader_unary_stick_layout_split_rows_multicore.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/kernels/dataflow/reader_unary_stick_layout_split_rows_multicore.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/tilize/device/kernels/dataflow/reader_unary_stick_layout_split_rows_multicore.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/kernels/dataflow/reader_unary_stick_layout_split_rows_multicore.cpp
@@ -38,6 +20,48 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/kernels/dataflow
                  page_id++;
                  l1_write_addr += width_size;
              }
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
+@@ -368,7 +368,13 @@ TilizeDeviceOperation::program_factory_t TilizeDeviceOperation::select_program_f
+     size_t grid_area = available_grid.num_cores();
+     auto [ncores, nblocks_per_core] = compute_ncores(grid_area, nblocks);
+     constexpr uint32_t threshold_row_block = WIDE_ROW_TILE_THRESHOLD;
+-    if (num_tiles_per_row > threshold_row_block &&
++    // Wide interleaved rows go to the default factory, which splits a few tile rows by width over the cores
++    // itself (tilize_width_slices). The block factory's narrow pieces were slower at every shape measured on
++    // Blackhole, bf16: 64 x 2048 26 us against 4.2 us, 64 x 2144 (67 tiles, no slices, 2 cores) 26 us against
++    // 14 us, 3552 x 2048 133 us against 81 us.
++    const bool interleaved_rows = !input_tensor_a.memory_config().is_sharded() &&
++                                  input_tensor_a.logical_shape()[-1] % tile_width == 0;
++    if (!interleaved_rows && num_tiles_per_row > threshold_row_block &&
+         (num_tiles_per_col > threshold_row_block || num_tiles_per_row > num_tiles_per_col)) {
+         uint32_t num_blocks_block =
+             (input_tensor_a.padded_shape()[-1] * input_tensor_a.padded_shape()[-2]) / (tile_height * tile_width);
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.hpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.hpp
+@@ -17,6 +17,20 @@
+ 
+ namespace ttnn::prim {
+ 
++// How many width slices the default factory splits each tile row of an interleaved input into: the most that
++// divide a tile row, each at least 4 tiles wide, with every slice on a core of its own. One slice means that
++// cores take whole tile rows.
++inline uint32_t tilize_width_slices(uint32_t tiles_per_row, uint32_t tile_rows, uint32_t cores) {
++    constexpr uint32_t min_slice_tiles = 4;
++    uint32_t slices = 1;
++    for (uint32_t s = 2; tiles_per_row / s >= min_slice_tiles; ++s) {
++        if (tiles_per_row % s == 0 && tile_rows * s <= cores) {
++            slices = s;
++        }
++    }
++    return slices;
++}
++
+ struct TilizeDeviceOperation {
+     using operation_attributes_t = ttnn::prim::TilizeParams;
+     using tensor_args_t = ttnn::prim::TilizeInputs;
 diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
@@ -94,19 +118,19 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_cor
 +                  "num_full_blocks_in_row",
 +                  "start_page_id",
 +                  "start_offset_bytes"}},
-         .hw_config = ttnn::create_reader_datamovement_config(device->arch()),
+         .hw_config = ttnn::create_reader_datamovement_config(/*disable_dfb_implicit_sync_for_all=*/true),
      };
  
-@@ -165,7 +179,7 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
+@@ -173,7 +187,7 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
                       .endpoint_type = DFBEndpointType::PRODUCER,
                   }},
              .compile_time_args =
 -                {{"per_core_block_cnt", nblocks_per_core_arg}, {"per_core_block_tile_cnt", ntiles_per_block}},
 +                {{"per_core_block_cnt", nblocks_per_core_arg}, {"per_core_block_tile_cnt", slice_tiles}},
-             .hw_config = ComputeHardwareConfig{compute_cfg},
+             .hw_config = std::move(compute_hw),
          };
      };
-@@ -214,43 +228,29 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
+@@ -222,43 +236,29 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
      KernelRunArgs reader_ra{.kernel = READER};
      KernelRunArgs writer_ra{.kernel = WRITER};
  
@@ -167,27 +191,3 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_cor
      }
  
      run_args.kernel_run_args = {std::move(reader_ra), std::move(writer_ra)};
-diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.hpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.hpp
---- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.hpp
-+++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.hpp
-@@ -17,6 +17,20 @@
- 
- namespace ttnn::prim {
- 
-+// How many width slices the default factory splits each tile row of an interleaved input into: the most that
-+// divide a tile row, each at least 4 tiles wide, with every slice on a core of its own. One slice means that
-+// cores take whole tile rows.
-+inline uint32_t tilize_width_slices(uint32_t tiles_per_row, uint32_t tile_rows, uint32_t cores) {
-+    constexpr uint32_t min_slice_tiles = 4;
-+    uint32_t slices = 1;
-+    for (uint32_t s = 2; tiles_per_row / s >= min_slice_tiles; ++s) {
-+        if (tiles_per_row % s == 0 && tile_rows * s <= cores) {
-+            slices = s;
-+        }
-+    }
-+    return slices;
-+}
-+
- struct TilizeDeviceOperation {
-     using operation_attributes_t = ttnn::prim::TilizeParams;
-     using tensor_args_t = ttnn::prim::TilizeInputs;

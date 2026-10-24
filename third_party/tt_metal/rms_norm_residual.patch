@@ -137,7 +137,7 @@ new file mode 100644
 +        rsqrt_tile_init();
 +        MATH(SFPU_UNARY_CALL(
 +            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_rsqrt,
-+            (APPROX, sfpu_iterations, DST_ACCUM_MODE, false, false), 0, VectorMode::C));
++            (APPROX, sfpu_iterations, DST_ACCUM_MODE, false), 0, VectorMode::C));
 +        // Once for this core, once for the writer to multicast.
 +        tile_regs_commit();
 +        tile_regs_wait();

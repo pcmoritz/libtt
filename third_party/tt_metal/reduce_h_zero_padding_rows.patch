@@ -37,10 +37,11 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp ttnn/cpp
 diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_transpose_wh_universal_input_cols_partitioned.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_transpose_wh_universal_input_cols_partitioned.cpp
 --- ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_transpose_wh_universal_input_cols_partitioned.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_transpose_wh_universal_input_cols_partitioned.cpp
-@@ -61,6 +61,25 @@ void kernel_main() {
- 
-     auto tensor_accessor = TensorAccessor(tensor::src);
- 
+@@ -70,6 +70,26 @@ void kernel_main() {
+     // Batch only when row_chunk matches the host's tiles_per_batch; SFPU shortens the chunk.
+     constexpr bool batch_reads = (row_chunk == tiles_per_batch);
+ #endif
++
 +    // Zeroes the rows past the first valid_rows of the tile at `offset` in the reserved space, once its read
 +    // has landed: one face row is 16 elements, a 32x32 tile 64 face rows (faces 0 and 1 hold rows 0-15).
 +    constexpr uint32_t valid_rows = get_arg(args::valid_rows);
@@ -63,7 +64,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/re
      if constexpr (num_h_slices > 1) {
          // Work units are (nc, slice, wt) in wt-fastest order. col_start_tile_id is the global id
          // (curr_col_in_batch unused). Nesting matches the un-split DEST_AUTO_LIMIT chunking.
-@@ -92,6 +111,11 @@ void kernel_main() {
+@@ -103,6 +123,11 @@ void kernel_main() {
                              tile_bytes,
                              {.page_id = nc * HtWt + ht * Wt + wt},
                              {.offset_bytes = filled * tile_bytes});
@@ -72,37 +73,37 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/re
 +                            zero_padding_rows(filled * tile_bytes);
 +                            padded = true;
 +                        }
-                     } else {
-                         // slice_Ht is rounded up; pad past Ht with the SUM identity.
-                         noc.async_write_zeros(dfb_in0, tile_bytes, {.offset_bytes = filled * tile_bytes});
-@@ -166,6 +190,10 @@ void kernel_main() {
-                     dfb_in0.reserve_back(onetile);
-                     noc.async_read(tensor_accessor, dfb_in0, tile_bytes, {.page_id = curr_id}, {.offset_bytes = 0});
+                     } else if constexpr (reduce_selects) {
+                         noc.async_read(
+                             tensor_accessor,
+@@ -243,6 +268,10 @@ void kernel_main() {
+                         dfb_in0.reserve_back(onetile);
+                         noc.async_read(tensor_accessor, dfb_in0, tile_bytes, {.page_id = curr_id}, {.offset_bytes = 0});
+                         noc.async_read_barrier();
++                        if (valid_rows != 0 && j == Ht - 1) {
++                            zero_padding_rows(0);
++                            noc.write_zeros_l1_barrier();
++                        }
+                         dfb_in0.push_back(onetile);
+                     }
+ 
+@@ -259,6 +288,12 @@ void kernel_main() {
+                 }
+                 if (batch_chunk) {
                      noc.async_read_barrier();
 +                    if (valid_rows != 0 && j == Ht - 1) {
-+                        zero_padding_rows(0);
++                        for (uint32_t s = 0; s < row_chunk; ++s) {
++                            zero_padding_rows(s * tile_bytes);
++                        }
 +                        noc.write_zeros_l1_barrier();
 +                    }
-                     dfb_in0.push_back(onetile);
+                     dfb_in0.push_back(row_chunk);
                  }
- 
-@@ -182,6 +210,12 @@ void kernel_main() {
-             }
-             if (batch_chunk) {
-                 noc.async_read_barrier();
-+                if (valid_rows != 0 && j == Ht - 1) {
-+                    for (uint32_t s = 0; s < row_chunk; ++s) {
-+                        zero_padding_rows(s * tile_bytes);
-+                    }
-+                    noc.write_zeros_l1_barrier();
-+                }
-                 dfb_in0.push_back(row_chunk);
-             }
-             curr_id = reset_curr_id + (j + 1) * Wt;  // stride in H
+                 curr_id = reset_curr_id + (j + 1) * Wt;  // stride in H
 diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op_multi_core_h_program_factory.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op_multi_core_h_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op_multi_core_h_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op_multi_core_h_program_factory.cpp
-@@ -470,6 +470,13 @@ ReduceDeviceOperation::ReduceMultiCoreHProgramFactory::create_program_artifacts(
+@@ -518,6 +518,13 @@ ReduceDeviceOperation::ReduceMultiCoreHProgramFactory::create_program_artifacts(
              // {1, Ht} is the un-split reduce.
              {"num_h_slices", tile_h_split ? num_h_slices : 1u},
              {"slice_Ht", tile_h_split ? slice_Ht : Ht},
@@ -116,6 +117,18 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op_multi_cor
          };
          reader_rta_names = {"col_start_tile_id", "curr_col_in_batch", "num_cols"};
          // Pass DEST config so reader can compute DEST_AUTO_LIMIT
+diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/welford_reduce_program_factory.cpp ttnn/cpp/ttnn/operations/reduction/generic/device/welford_reduce_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/reduction/generic/device/welford_reduce_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/reduction/generic/device/welford_reduce_program_factory.cpp
+@@ -360,6 +360,8 @@ WelfordReduceDeviceOperation::WelfordReduceProgramFactory::create_program_artifa
+             // Two-pass never splits the H axis; {1, Ht} selects the reader's un-split path.
+             {"num_h_slices", 1u},
+             {"slice_Ht", Ht},
++            // The two-pass reader zeroes no padding rows (reduce_h_reader_valid_rows applies to SUM/AVG).
++            {"valid_rows", 0u},
+         };
+         reader_rta_names = {"col_start_tile_id", "curr_col_in_batch", "num_cols"};
+     } else {
 diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
 --- ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
@@ -137,5 +150,5 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
 +                            ? ttnn::fill_implicit_tile_padding(input_tensor_arg, fill_pad_value)
 +                            : input_tensor_arg;
  
-     // bf16 multi-axis Sum precision chain: carry FP32 between stages and pack bf16
+     // bf16 multi-axis Sum/Mean precision chain: carry FP32 between stages and pack bf16
      // only on the final stage. Skipped for full-tensor reductions (dim covers every

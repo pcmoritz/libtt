@@ -1,4 +1,4 @@
-diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/compute_pool_2d.cpp b/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/compute_pool_2d.cpp
+diff --git ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/compute_pool_2d.cpp ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/compute_pool_2d.cpp
 --- ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/compute_pool_2d.cpp
 +++ ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/compute_pool_2d.cpp
 @@ -11,6 +11,8 @@
@@ -10,20 +10,20 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/comput
  #include "api/dataflow/dataflow_buffer.h"
  #include <ttnn/operations/pool/device/kernels/experimental_device_api.hpp>
  
-@@ -29,6 +31,12 @@
- #define FACE_WIDTH 16
+@@ -30,6 +32,12 @@
  #define TILE_HEIGHT 32
  #define TILE_WIDTH 32
-+
+ 
 +// The accurate sum path uses full tiles and preserves the input's 16/32-bit representation.
 +#ifndef SFPU_SUM_POOL
 +#define SFPU_SUM_POOL 0
 +#endif
 +constexpr bool sfpu_sum = SFPU_SUM_POOL != 0;
- 
++
  void kernel_main() {
      // NOTE: here it is assumed that in_ntiles_hw == 1. General cases not handled yet. When ntiles_hw > 1 the large
-@@ -82,7 +90,7 @@
+     // kernel is called
+@@ -82,7 +90,7 @@ void kernel_main() {
      constexpr bool is_large_kernel = window_size_hw > max_sticks_for_reduction;
      constexpr bool force_max_tiles_per_reduction_4 = get_compile_time_arg_val(16);
      constexpr uint32_t MAX_TILES_PER_REDUCTION =
@@ -32,7 +32,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/comput
      constexpr uint32_t max_tiles_per_iter =
          in_ntiles_c < MAX_TILES_PER_REDUCTION ? in_ntiles_c : MAX_TILES_PER_REDUCTION;
      constexpr uint32_t partial_iter_output_tiles =
-@@ -96,7 +104,7 @@
+@@ -96,7 +104,7 @@ void kernel_main() {
      // C tiles, but we only use it when the window size fits within a face such that the tilize can be done only on the
      // rows populated with data, otherwise we need to call clear_out_tiles between reconfigs to avoid untilizing junk
      // data which is much slower than just untilizing the entire MAX_TILES_PER_REDUCTION
@@ -41,26 +41,25 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/comput
                                       window_size_hw <= FACE_HEIGHT && !last_tile_is_partial;
  
      constexpr uint32_t tilize_untilize_cb = is_output_tiled ? pre_tilize_cb_id : out_cb_id;
-@@ -110,9 +118,15 @@
+@@ -110,9 +118,15 @@ void kernel_main() {
      DataflowBuffer fast_tilize_dfb(fast_tilize_cb_id);
  
      compute_kernel_hw_startup(in_cb_id_0, in_scalar_cb_id_0, tilize_untilize_cb);
 -    tilizeA_B_reduce_init<neginf_srca_maxpool, zero_srca_avgpool>(in_cb_id_0, in_scalar_cb_id_0, max_tiles_per_iter);
--
--    pack_untilize_dest_init<max_tiles_per_iter>(tilize_untilize_cb);
 +    if constexpr (sfpu_sum) {
 +        init_sfpu(in_cb_id_0, tilize_untilize_cb);
 +    } else {
 +        tilizeA_B_reduce_init<neginf_srca_maxpool, zero_srca_avgpool>(in_cb_id_0, in_scalar_cb_id_0, max_tiles_per_iter);
 +    }
-+
+ 
+-    pack_untilize_dest_init<max_tiles_per_iter>(tilize_untilize_cb);
 +    // SFPU reductions already use the ordinary DST layout, without the FPU tilize remap.
 +    pack_untilize_dest_init<max_tiles_per_iter, max_tiles_per_iter, false, TILE_WIDTH, false, !sfpu_sum>(
 +        tilize_untilize_cb);
  
      constexpr uint32_t remaining_elems = window_size_hw % max_sticks_for_reduction;
      constexpr uint32_t interm_reduction_chunks =
-@@ -168,15 +182,32 @@
+@@ -171,16 +185,33 @@ void kernel_main() {
              tile_regs_acquire();
              for (uint32_t chunk = 0; chunk < interm_reduction_chunks; chunk++) {
                  curr_in_dfb.wait_front(1);
@@ -93,30 +92,31 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/comput
 +                    }
                  }
                  curr_in_dfb.pop_front(1);
-+            }
+             }
 +            if constexpr (SFPU_SUM_POOL == 16) {
 +                typecast_tile_init<(uint32_t)DataFormat::Float32, (uint32_t)DataFormat::Float16>();
 +                typecast_tile<(uint32_t)DataFormat::Float32, (uint32_t)DataFormat::Float16>(0);
-             }
++            }
              tile_regs_commit();
              tile_regs_wait();
-diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reader_pool_2d.cpp b/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reader_pool_2d.cpp
+             if constexpr (is_output_tiled) {
+diff --git ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reader_pool_2d.cpp ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reader_pool_2d.cpp
 --- ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reader_pool_2d.cpp
 +++ ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reader_pool_2d.cpp
-@@ -13,6 +13,12 @@
- #include "api/debug/dprint.h"
+@@ -14,6 +14,12 @@
  #include "api/debug/dprint_pages.h"
  #endif
-+
+ 
 +// The accurate sum path uses full tiles and preserves the input's 16/32-bit representation.
 +#ifndef SFPU_SUM_POOL
 +#define SFPU_SUM_POOL 0
 +#endif
 +constexpr bool sfpu_sum = SFPU_SUM_POOL != 0;
- 
++
  // Read kernel data for normal max/average pooling (without indices)
  template <
-@@ -39,15 +45,15 @@
+     uint32_t in_nblocks_c,
+@@ -39,15 +45,15 @@ template <
      uint32_t in_cb_sz,
      uint32_t bf16_init_value>
  ALWI void read_kernel_with_top_left_index(uint32_t ind, uint32_t in_l1_read_base_addr) {
@@ -135,7 +135,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reade
                                       (kernel_h * kernel_w) <= 16 && !last_tile_is_partial;
  
      DataflowBuffer in_dfb(in_cb_id);
-@@ -78,14 +84,14 @@
+@@ -78,14 +84,14 @@ ALWI void read_kernel_with_top_left_index(uint32_t ind, uint32_t in_l1_read_base
          // [total_elems_to_reduce, num_tilized_rows) are never overwritten by the async_reads
          // below and would otherwise contribute junk to the reduce. Fill only that tail region
          // with the init value -- the leading rows will be fully overwritten by process_h().
@@ -152,7 +152,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reade
              }
          }
          for (uint32_t h = 0; h < kernel_h; ++h) {
-@@ -93,12 +99,26 @@
+@@ -93,12 +99,26 @@ ALWI void read_kernel_with_top_left_index(uint32_t ind, uint32_t in_l1_read_base
                  const uint32_t stick_offset = ind + w_offset + h * dilation_h * in_w_padded;
                  const uint32_t read_offset =
                      in_l1_read_base_addr + (stick_offset * shard_width_bytes + c_i * MAX_BYTES_PER_REDUCTION);
@@ -185,7 +185,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reade
                  // if compute is using tilize_reconfig we will only untilize the needed number of tiles rather
                  // than the entire MAX_TILES_PER_REDUCTION, thus we use a different offset for the write address
                  if constexpr (tilize_reconfig) {
-@@ -242,7 +262,9 @@
+@@ -246,7 +266,9 @@ void kernel_main() {
      // fill the clear cb
      if constexpr (is_avg_pool || need_to_initialize_in_cb) {
          if constexpr (reader_id == 0) {
@@ -196,10 +196,10 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/kernels/dataflow/reade
              clear_value_dfb.push_back(1);
          }
          if constexpr (reader_id == 1) {
-diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp b/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp
+diff --git ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_program_factory.cpp
-@@ -321,6 +321,7 @@
+@@ -322,6 +322,7 @@ static tt::tt_metal::ProgramDescriptor pool2d_multi_core_sharded_with_halo_v2_im
          "as uint16_t",
          max_in_nhw_per_core);
  
@@ -207,7 +207,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_progra
      const uint32_t bf16_scalar = get_bf16_pool_scalar(pool_type, kernel_h, kernel_w, divisor_override);
      const uint32_t bf16_init_value = get_bf16_pool_init_value(pool_type);
      FactoryParameters params = get_factory_parameters(
-@@ -371,7 +372,7 @@
+@@ -372,7 +373,7 @@ static tt::tt_metal::ProgramDescriptor pool2d_multi_core_sharded_with_halo_v2_im
                                               ? (in_c - (in_c % shard_width)) / (num_shards_c - 1)
                                               : in_c / num_shards_c;
      const uint32_t in_nbytes_c = in_c_per_shard_ceil * params.nbytes;  // row of input (channels)
@@ -216,7 +216,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_progra
  
      TT_FATAL(
          input_shape[3] % num_shards_c == 0,
-@@ -456,7 +457,7 @@
+@@ -457,7 +458,7 @@ static tt::tt_metal::ProgramDescriptor pool2d_multi_core_sharded_with_halo_v2_im
      // incoming data is the input cb instead of raw l1/dram addr
      // this input shard has halo and padding inserted.
      const uint32_t raw_in_cb_npages = input.shard_spec().value().shape[0];
@@ -225,7 +225,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_progra
      const uint32_t raw_in_cb_id = next_cb_index++;
      add_sharded_cb(raw_in_cb_id, raw_in_cb_pagesize, raw_in_cb_npages, params.data_format, input.buffer());
  
-@@ -516,9 +517,10 @@
+@@ -517,9 +518,10 @@ static tt::tt_metal::ProgramDescriptor pool2d_multi_core_sharded_with_halo_v2_im
      const uint32_t in_cb_npages = cb_sizes.in_cb_npages;
  
      const uint32_t window_size_hw = kernel_h * kernel_w;
@@ -238,7 +238,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_progra
              ? 2u
              : 4u;
      const std::optional<FaceGeometry> input_face_geometry =
-@@ -835,6 +837,9 @@
+@@ -836,6 +838,9 @@ static tt::tt_metal::ProgramDescriptor pool2d_multi_core_sharded_with_halo_v2_im
      reader0_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
      reader0_desc.core_ranges = all_cores;
      reader0_desc.compile_time_args = std::move(reader0_ct_args);
@@ -248,7 +248,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_progra
      reader0_desc.config = DataMovementConfigDescriptor{
          .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
          .noc = tt::tt_metal::NOC::RISCV_0_default,
-@@ -847,6 +852,7 @@
+@@ -848,6 +853,7 @@ static tt::tt_metal::ProgramDescriptor pool2d_multi_core_sharded_with_halo_v2_im
          rd.source_type = KernelDescriptor::SourceType::FILE_PATH;
          rd.core_ranges = all_cores;
          rd.compile_time_args = std::move(reader1_ct_args);
@@ -256,7 +256,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_progra
          rd.config = DataMovementConfigDescriptor{
              .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
              .noc = tt::tt_metal::NOC::RISCV_1_default,
-@@ -912,13 +918,16 @@
+@@ -913,13 +919,16 @@ static tt::tt_metal::ProgramDescriptor pool2d_multi_core_sharded_with_halo_v2_im
          compute_kernel_config,
          tt::tt_metal::MathFidelity::HiFi4,
          false,                                                             // math_approx_mode
@@ -274,7 +274,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_progra
  
      std::string compute_kernel_fname =
          return_indices ? "ttnn/cpp/ttnn/operations/pool/generic/device/kernels/compute/compute_mpwi.cpp"
-@@ -930,12 +939,22 @@
+@@ -931,13 +940,23 @@ static tt::tt_metal::ProgramDescriptor pool2d_multi_core_sharded_with_halo_v2_im
      compute_desc.core_ranges = all_cores;
      compute_desc.compile_time_args = std::move(compute_ct_args);
      compute_desc.defines = std::move(compute_defines);
@@ -285,7 +285,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_progra
          .dst_full_sync_en = get_dst_full_sync_en(device_compute_kernel_config),
          .math_approx_mode = false,
      };
-+
+ 
 +    if (sfpu_sum && input.dtype() == DataType::FLOAT32) {
 +        std::vector<UnpackToDestMode> modes(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
 +        modes[in_cb_id_0] = UnpackToDestMode::UnpackToDestFp32;
@@ -295,13 +295,14 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_multi_core_progra
 +        compute_config.unpack_to_dest_mode = std::move(modes);
 +    }
 +    compute_desc.config = std::move(compute_config);
- 
++
      // set the starting indices for each core as runtime args
      uint32_t total_out_nhw = in_n * out_h * out_w;
-diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp b/ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp
+     for (uint32_t core_i = 0; core_i < ncores; core_i++) {
+diff --git ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp
 --- ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp
 +++ ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp
-@@ -21,13 +21,16 @@
+@@ -21,13 +21,16 @@ void validate_pool2d(
      const Pool2DType pool_type,
      const sliding_window::SlidingWindowConfig& sliding_window_config,
      const MemoryConfig& out_mem_config,
@@ -320,7 +321,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp b/ttnn/cpp
      TT_FATAL(input.layout() == Layout::ROW_MAJOR, "Only ROW_MAJOR supported for now. Tracked by issue #23338");
  
      TT_FATAL(input.memory_config().is_sharded(), "Input needs to be sharded");
-@@ -66,6 +69,9 @@
+@@ -66,6 +69,9 @@ void validate_pool2d(
  // Validation is the same for both cache hit and miss
  static void validate_pool2d_operation(
      const Pool2D::operation_attributes_t& op_attr, const Pool2D::tensor_args_t& tensor) {
@@ -330,10 +331,10 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/device/pool_op.cpp b/ttnn/cpp
      validate_pool2d(
          tensor.input_tensor_,
          op_attr.pool_type_,
-diff --git a/ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp b/ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp
+diff --git ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp
 --- ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp
 +++ ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp
-@@ -148,9 +148,9 @@
+@@ -149,9 +149,9 @@ static std::vector<Tensor> pool2d_L1(
      std::array<uint32_t, 4> padding_4d = sliding_window::get_pair_n4_padding(padding);
      bool is_out_tiled = output_layout == Layout::TILE;
      bool is_in_tiled = input_tensor.layout() == ttnn::TILE_LAYOUT;
@@ -346,7 +347,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp b/ttnn/cpp/
      TT_FATAL(
          !((dtype == DataType::BFLOAT8_B || dtype == DataType::BFLOAT4_B) && output_layout == Layout::ROW_MAJOR),
          "BFLOAT8_B/BFLOAT4_B output data format is not supported with ROW_MAJOR layout");
-@@ -1067,7 +1067,8 @@
+@@ -1068,7 +1068,8 @@ static std::vector<Tensor> pool2d(
          (kernel_size[0] == input_h && kernel_size[1] == input_w) &&
          (padding_check[0] == 0 && padding_check[1] == 0 && padding_check[2] == 0 && padding_check[3] == 0) &&
          (dilation_h == 1 && dilation_w == 1) && !applied_shard_scheme.has_value() && batch_divisible_for_fast_path &&
@@ -356,7 +357,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp b/ttnn/cpp/
  
      if (is_global_pool && pool_type == Pool2DType::AVG_POOL2D) {
          // Reduction needs interleaved input/output. The output is a tiny (1×1 spatial) tensor;
-@@ -1291,7 +1292,8 @@
+@@ -1312,7 +1313,8 @@ Tensor avg_pool2d(
      bool reallocate_halo_output,
      const DataType dtype,
      const Layout output_layout,
@@ -366,7 +367,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp b/ttnn/cpp/
      auto result = pool2d(
          input_tensor,
          Pool2DType::AVG_POOL2D,
-@@ -1302,7 +1304,7 @@
+@@ -1323,7 +1325,7 @@ Tensor avg_pool2d(
          kernel_size,
          stride,
          padding,
@@ -375,10 +376,10 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/generic_pools.cpp b/ttnn/cpp/
          ceil_mode,
          count_include_pad,
          divisor_override,
-diff --git a/ttnn/cpp/ttnn/operations/pool/generic/generic_pools.hpp b/ttnn/cpp/ttnn/operations/pool/generic/generic_pools.hpp
+diff --git ttnn/cpp/ttnn/operations/pool/generic/generic_pools.hpp ttnn/cpp/ttnn/operations/pool/generic/generic_pools.hpp
 --- ttnn/cpp/ttnn/operations/pool/generic/generic_pools.hpp
 +++ ttnn/cpp/ttnn/operations/pool/generic/generic_pools.hpp
-@@ -62,7 +62,8 @@
+@@ -62,7 +62,8 @@ Tensor avg_pool2d(
      bool reallocate_halo_output = true,
      DataType dtype = DataType::BFLOAT16,
      Layout output_layout = Layout::ROW_MAJOR,
@@ -388,10 +389,10 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/generic/generic_pools.hpp b/ttnn/cpp/
  
  }  // namespace ttnn::operations::pool
  
-diff --git a/ttnn/cpp/ttnn/operations/pool/pool_utils.cpp b/ttnn/cpp/ttnn/operations/pool/pool_utils.cpp
+diff --git ttnn/cpp/ttnn/operations/pool/pool_utils.cpp ttnn/cpp/ttnn/operations/pool/pool_utils.cpp
 --- ttnn/cpp/ttnn/operations/pool/pool_utils.cpp
 +++ ttnn/cpp/ttnn/operations/pool/pool_utils.cpp
-@@ -154,6 +154,12 @@
+@@ -155,6 +155,12 @@ FactoryParameters get_factory_parameters(
      tt::DataFormat index_format = datatype_to_dataformat_converter(index_dtype);
      tt::DataFormat output_data_format = datatype_to_dataformat_converter(output_dtype);
  
@@ -404,7 +405,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/pool_utils.cpp b/ttnn/cpp/ttnn/operat
      uint32_t nbytes = datum_size(data_format);
      uint32_t index_nbytes = datum_size(index_format);
  
-@@ -162,7 +168,7 @@
+@@ -163,7 +169,7 @@ FactoryParameters get_factory_parameters(
      // so the in_cb height must be equal to the TILE_HEIGHT, but for kernels spanning only one face we set the
      // face_r_dim to only tilize the necessary number of rows, thus we can make the in_cb height smaller
      uint32_t num_tilized_rows =
@@ -413,7 +414,7 @@ diff --git a/ttnn/cpp/ttnn/operations/pool/pool_utils.cpp b/ttnn/cpp/ttnn/operat
      uint32_t in_ntiles_c = (uint32_t)std::ceil((float)in_channels / num_shards_c / tt::constants::TILE_WIDTH);
      // Use ceiling division so WIDTH/BLOCK sharding with non-integer channels/core is handled
      // correctly — avoids false partial-tile detection when floor(channels/cores) < FACE_WIDTH.
-@@ -183,12 +189,13 @@
+@@ -184,12 +190,13 @@ FactoryParameters get_factory_parameters(
          (in_channels / num_shards_c) % tt::constants::TILE_WIDTH != 0 &&
          (in_channels / num_shards_c) % tt::constants::TILE_WIDTH <= tt::constants::FACE_WIDTH;
      const uint32_t max_rows_for_reduction =

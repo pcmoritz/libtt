@@ -25,7 +25,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-@@ -344,6 +344,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+@@ -439,6 +439,7 @@ ttnn::device_operation::ProgramArtifacts UnaryDeviceOperation::ProgramFactory::c
      const auto& input = tensor_args.input;
      const auto& ops_chain = operation_attributes.op_chain;
      TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
@@ -33,17 +33,15 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
      auto compute_ops_chain = ops_chain;
      const bool promote_narrow_float =
          uses_raw_16bit_sfpu_path(input.dtype()) && ops_chain[0].type() != UnaryOpType::TYPECAST &&
-@@ -383,8 +384,11 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
-     DataFormat cb_data_format_output =
-         promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format
-                                                       : cb_dataformat_for(output.dtype());
--    if (ops_chain[0].type() == unary::UnaryOpType::BITCAST && output.dtype() == DataType::FLOAT16) {
--        cb_data_format_output = DataFormat::UInt16;
+@@ -474,6 +475,11 @@ ttnn::device_operation::ProgramArtifacts UnaryDeviceOperation::ProgramFactory::c
+     uint32_t single_tile_size = tile_size(dfb_data_format);
+     DataFormat dfb_data_format_output =
+         promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format : cb_dataformat_for(output.dtype());
 +    if (is_bitcast) {
-+        // For BITCAST, cb_data_format_for_input below inherits this format.
++        // For BITCAST, dfb_data_format_for_input below inherits this format.
 +        // Unsigned semantics therefore apply to both unpacking and packing.
-+        cb_data_format_output =
-+            input.element_size() == sizeof(uint16_t) ? DataFormat::UInt16 : DataFormat::UInt32;
-     }
-     uint32_t single_tile_size_output = tile_size(cb_data_format_output);
++        dfb_data_format_output = input.element_size() == sizeof(uint16_t) ? DataFormat::UInt16 : DataFormat::UInt32;
++    }
+     uint32_t single_tile_size_output = tile_size(dfb_data_format_output);
  
+     const auto shard_specs = get_shard_specs(input.tensor_spec(), output.tensor_spec());

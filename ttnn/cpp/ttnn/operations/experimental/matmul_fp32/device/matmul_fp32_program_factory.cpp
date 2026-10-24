@@ -99,7 +99,7 @@ ttnn::device_operation::ProgramArtifacts MatmulFp32ProgramFactory::create_progra
         .compile_time_args = {{"last_ktile_k", static_cast<uint32_t>(a.logical_shape()[-1] % TILE_WIDTH)}},
         .runtime_arg_schema =
             {.runtime_arg_names = {"first_tile", "num_tiles"}, .common_runtime_arg_names = common_arg_names},
-        .hw_config = ttnn::create_reader_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
+        .hw_config = ttnn::create_reader_datamovement_config(/*disable_dfb_implicit_sync_for_all=*/true),
     };
     KernelSpec writer{
         .unique_id = WRITER,
@@ -111,18 +111,18 @@ ttnn::device_operation::ProgramArtifacts MatmulFp32ProgramFactory::create_progra
         .tensor_bindings = {TensorBinding{.tensor_parameter_name = OUTPUT, .accessor_name = "output"}},
         .runtime_arg_schema =
             {.runtime_arg_names = {"first_tile", "num_tiles"}, .common_runtime_arg_names = common_arg_names},
-        .hw_config = ttnn::create_writer_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
+        .hw_config = ttnn::create_writer_datamovement_config(/*disable_dfb_implicit_sync_for_all=*/true),
     };
 
     // FP32 DST, with the inputs unpacked straight to DST so they stay FP32.
     const DeviceComputeKernelConfig compute_kernel_config = ttnn::WormholeComputeKernelConfig{
-        .math_fidelity = MathFidelity::HiFi4,
+        .math_fidelity = tt::tt_metal::MathFidelity::HiFi4,
         .math_approx_mode = false,
         .fp32_dest_acc_en = true,
         .packer_l1_acc = false,
     };
-    auto compute_hw = ttnn::to_compute_hardware_config(device.arch(), compute_kernel_config);
-    unpack_modes(compute_hw) = {
+    auto compute_hw = ttnn::to_compute_hardware_config(compute_kernel_config);
+    compute_hw.unpack_modes = {
         {IN0_DFB, tt::tt_metal::UnpackMode::UnpackToDest},
         {IN1_DFB, tt::tt_metal::UnpackMode::UnpackToDest},
     };

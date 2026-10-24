@@ -1,7 +1,28 @@
+diff --git ttnn/core/tensor/tensor_ops.cpp ttnn/core/tensor/tensor_ops.cpp
+--- ttnn/core/tensor/tensor_ops.cpp
++++ ttnn/core/tensor/tensor_ops.cpp
+@@ -455,8 +455,16 @@ Tensor view_device(const Tensor& input_tensor, const Shape& new_logical_shape, c
+     if (input_tensor.layout() != Layout::ROW_MAJOR || !changing_last_dim) {
+         const auto& input_buffer = input_tensor.device_storage().get_mesh_buffer();
+ 
++        // A view of fewer pages than the input (a prefix of its pages, as ttnn::slice makes of a one-tile-row
++        // tensor) gets a buffer of just those pages: ops that size their work by the buffer, like typecast, must
++        // not run over the rest of the input's.
++        auto global_config = input_buffer.global_config();
++        if (auto* replicated = std::get_if<tt::tt_metal::distributed::ReplicatedBufferConfig>(&global_config);
++            replicated != nullptr && !output_memory_config.is_sharded()) {
++            replicated->size = std::min<DeviceAddr>(replicated->size, new_spec.compute_packed_buffer_size_bytes());
++        }
+         auto view_mesh_buffer = tt::tt_metal::distributed::MeshBuffer::create(
+-            input_buffer.global_config(),
++            global_config,
+             input_buffer.device_local_config(),
+             input_buffer.device(),
+             input_buffer.address());
 diff --git ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
-@@ -219,6 +219,31 @@ ttnn::Tensor slice(
+@@ -228,6 +228,31 @@ ttnn::Tensor slice(
          }
      }
  
@@ -33,24 +54,3 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp ttnn/cpp/ttnn/
      auto output_dim_i = [&modified_begins, &modified_step](size_t i, const ttsl::SmallVector<uint32_t>& modified_ends) {
          return (modified_ends[i] - modified_begins[i] + modified_step[i] - 1) / modified_step[i];
      };
-diff --git ttnn/core/tensor/tensor_ops.cpp ttnn/core/tensor/tensor_ops.cpp
---- ttnn/core/tensor/tensor_ops.cpp
-+++ ttnn/core/tensor/tensor_ops.cpp
-@@ -398,8 +398,16 @@
-     if (input_tensor.layout() != Layout::ROW_MAJOR || !changing_last_dim) {
-         const auto& input_buffer = input_tensor.device_storage().get_mesh_buffer();
- 
-+        // A view of fewer pages than the input (a prefix of its pages, as ttnn::slice makes of a one-tile-row
-+        // tensor) gets a buffer of just those pages: ops that size their work by the buffer, like typecast, must
-+        // not run over the rest of the input's.
-+        auto global_config = input_buffer.global_config();
-+        if (auto* replicated = std::get_if<tt::tt_metal::distributed::ReplicatedBufferConfig>(&global_config);
-+            replicated != nullptr && !output_memory_config.is_sharded()) {
-+            replicated->size = std::min<DeviceAddr>(replicated->size, new_spec.compute_packed_buffer_size_bytes());
-+        }
-         auto view_mesh_buffer = tt::tt_metal::distributed::MeshBuffer::create(
--            input_buffer.global_config(),
-+            global_config,
-             input_buffer.device_local_config(),
-             input_buffer.device(),
-             input_buffer.address());
