@@ -59,7 +59,10 @@ void kernel_main() {
     const auto output = TensorAccessor(tensor::output);
     Noc noc;
 
-    // The partials' address, the same on every core of the program.
+    // Only logical rows participate in the exchange and final result.
+    // Padding rows in the partial tiles are ignored by the row-wise compute
+    // reduction; the final output padding is explicitly zeroed below.
+    // The partials' address is the same on every core of the program.
     const uint32_t part_base = part_dfb.get_write_ptr();
     const uint32_t slot_addr = part_base + (col / 32) * tile_bytes;
     const uint32_t c = col % 32;
@@ -69,7 +72,7 @@ void kernel_main() {
         // written: zero them before counting the others' slots.
         if (cols > col + 4 * (remote_workers + 1)) {
             auto* last = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(part_base + (partial_tiles - 1) * tile_bytes);
-            for (uint32_t m = 0; m < 32; ++m) {
+            for (uint32_t m = 0; m < rows; ++m) {
                 for (uint32_t cc = 4 * (remote_workers + 1) % 32; cc < 32; ++cc) {
                     last[elem_offset(m, cc) / 4] = 0;
                 }
@@ -83,9 +86,9 @@ void kernel_main() {
 
     // Row sums, read before the staging area (face 0's first rows) is reused.
     float sums[32];
-    for (uint32_t m = 0; m < 32; ++m) {
+    for (uint32_t m = 0; m < rows; ++m) {
         float s = 0.0f;
-        if (num_tiles != 0 && m < rows) {
+        if (num_tiles != 0) {
             for (uint32_t jj = 0; jj < pack; ++jj) {
                 const uint32_t bits = tile[elem_offset(jj * stride + m, face_rows) / 4];
                 s += __builtin_bit_cast(float, bits);
@@ -96,7 +99,7 @@ void kernel_main() {
     if (is_master) {
         // This core's own slots go straight into its partials.
         auto* part = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot_addr);
-        for (uint32_t m = 0; m < 32; ++m) {
+        for (uint32_t m = 0; m < rows; ++m) {
             const uint32_t at = elem_offset(m, c) / 4;
             part[at] = __builtin_bit_cast(uint32_t, sums[m]);
             part[at + 1] = 0;
@@ -105,13 +108,13 @@ void kernel_main() {
         }
     } else {
         // Staging: row m's 16-byte slot at m * 16, written to the master.
-        for (uint32_t m = 0; m < 32; ++m) {
+        for (uint32_t m = 0; m < rows; ++m) {
             tile[4 * m] = __builtin_bit_cast(uint32_t, sums[m]);
             tile[4 * m + 1] = 0;
             tile[4 * m + 2] = 0;
             tile[4 * m + 3] = 0;
         }
-        for (uint32_t m = 0; m < 32; ++m) {
+        for (uint32_t m = 0; m < rows; ++m) {
             noc.async_write(
                 out_dfb,
                 UnicastEndpoint{},
@@ -136,8 +139,8 @@ void kernel_main() {
     out_dfb.wait_front(1);
     const uint32_t result = out_dfb.get_read_ptr();
     auto* res = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(result);
-    uint32_t totals[32];
-    for (uint32_t m = 0; m < 32; ++m) {
+    uint32_t totals[32] = {};
+    for (uint32_t m = 0; m < rows; ++m) {
         const float total = __builtin_bit_cast(float, res[elem_offset(m, face_rows) / 4]);
         if constexpr (int_output) {
             totals[m] = static_cast<uint32_t>(static_cast<int32_t>(total));
@@ -146,7 +149,7 @@ void kernel_main() {
         }
     }
     if constexpr (row_form) {
-        // Row t_row of the result's tile, a face's run of columns at a time.
+        // Row t_row of the result's tile, including its zero padding.
         for (uint32_t m = 0; m < 32; ++m) {
             res[elem_offset(t_row, m) / 4] = totals[m];
         }
@@ -159,7 +162,7 @@ void kernel_main() {
         for (uint32_t i = 0; i < tile_bytes / 4; ++i) {
             res[i] = 0;
         }
-        for (uint32_t m = 0; m < 32; ++m) {
+        for (uint32_t m = 0; m < rows; ++m) {
             res[elem_offset(m, 0) / 4] = totals[m];
         }
         noc.async_write(out_dfb, output, tile_bytes, {.offset_bytes = 0}, {.page_id = t_page, .offset_bytes = 0});

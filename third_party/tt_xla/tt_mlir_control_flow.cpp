@@ -66,6 +66,7 @@ struct CountedLoopInfo {
   LoopBound initial;
   LoopBound limit;
   LoopBound step;
+  unsigned counterIndex;
 };
 
 struct LoopOutputs {
@@ -74,13 +75,13 @@ struct LoopOutputs {
 };
 
 FailureOr<LoopOutputs>
-computeLoopOutputs(stablehlo::WhileOp whileOp,
-                   stablehlo::ReturnOp bodyReturn,
-                   const TypeConverter &typeConverter) {
+computeLoopOutputs(stablehlo::WhileOp whileOp, stablehlo::ReturnOp bodyReturn,
+                   const TypeConverter &typeConverter,
+                   std::optional<unsigned> deadCounterIndex) {
   LoopOutputs outputs;
   Block &bodyBlock = whileOp.getBody().front();
   for (auto [index, result] : llvm::enumerate(bodyReturn.getOperands())) {
-    if (result == bodyBlock.getArgument(index)) {
+    if (result == bodyBlock.getArgument(index) || deadCounterIndex == index) {
       continue;
     }
     Type resultType =
@@ -188,7 +189,8 @@ analyzeCountedLoop(stablehlo::WhileOp whileOp,
   }
   return CountedLoopInfo{.initial = *initial,
                          .limit = *limit,
-                         .step = *resolvedStep};
+                         .step = *resolvedStep,
+                         .counterIndex = counterIndex};
 }
 
 bool isExternalOperand(Region &region, Value operand) {
@@ -315,12 +317,6 @@ public:
       return failure();
     }
 
-    FailureOr<LoopOutputs> outputs =
-        computeLoopOutputs(whileOp, bodyReturn, *getTypeConverter());
-    if (failed(outputs)) {
-      return failure();
-    }
-
     llvm::SetVector<Value> captures;
     collectCaptures(whileOp->getRegions(), captures);
     SmallVector<Value> convertedCaptures;
@@ -333,6 +329,26 @@ public:
 
     FailureOr<CountedLoopInfo> countedLoop = analyzeCountedLoop(
         whileOp, condReturn, bodyReturn, captures.getArrayRef());
+    // The runtime advances a counted loop using host bounds. If the device
+    // counter only feeds its own increment and has no escaping result, it
+    // need not be carried back by the body program. Dropping that output lets
+    // ordinary dead-code elimination remove one device add per iteration.
+    std::optional<unsigned> deadCounterIndex;
+    if (succeeded(countedLoop)) {
+      unsigned index = countedLoop->counterIndex;
+      Value counter = body.front().getArgument(index);
+      Value increment = bodyReturn.getOperand(index);
+      if (whileOp.getResult(index).use_empty() && counter.hasOneUse() &&
+          increment.hasOneUse()) {
+        deadCounterIndex = index;
+      }
+    }
+    FailureOr<LoopOutputs> outputs = computeLoopOutputs(
+        whileOp, bodyReturn, *getTypeConverter(), deadCounterIndex);
+    if (failed(outputs)) {
+      return failure();
+    }
+
     Type conditionResultType;
     if (failed(countedLoop)) {
       conditionResultType = getTypeConverter()->convertType(conditionType);
