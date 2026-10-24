@@ -54,6 +54,8 @@ protected:
         // Every seventh value is -inf: a masked one must add nothing to a
         // sum, an unmasked one makes the sum -inf.
         bool infinities = false;
+        // Signed zeros, adjacent FP32 values, infinities, and FP32 NaNs.
+        bool comparison_edges = false;
         // Leading dimension of a [batch, rows, width] input.
         uint32_t batch = 1;
         // A [..., rows] threshold and result rather than [..., rows, 1].
@@ -74,6 +76,25 @@ protected:
         std::vector<float> ref(values.size());
         for (size_t i = 0; i < values.size(); ++i) {
             values[i] = T(infinities && i % 7 == 3 ? -std::numeric_limits<float>::infinity() : dist(rng));
+            if (options.comparison_edges) {
+                const float inf = std::numeric_limits<float>::infinity();
+                const float nan = std::numeric_limits<float>::quiet_NaN();
+                const float edges[] = {
+                    -inf,
+                    -4.0f,
+                    -1.0f,
+                    -0.0f,
+                    0.0f,
+                    1.0f,
+                    std::nextafter(1.0f, 0.0f),
+                    std::nextafter(1.0f, inf),
+                    4.0f,
+                    inf,
+                    nan,
+                    -nan};
+                // Cover NaN masking with FP32, zeros/infinities with both dtypes.
+                values[i] = T(edges[i % (dtype == DataType::BFLOAT16 ? 10 : 12)]);
+            }
             ref[i] = static_cast<float>(values[i]);
         }
         std::vector<T> thresholds(rows);
@@ -83,6 +104,10 @@ protected:
             thresholds[r] = values[static_cast<size_t>(r) * width + (r * 97) % width];
             if (std::isinf(static_cast<float>(thresholds[r]))) {
                 thresholds[r] = values[static_cast<size_t>(r) * width + (r * 97 + 1) % width];
+            }
+            if (options.comparison_edges) {
+                const float edges[] = {-1.0f, -0.0f, 0.0f, 1.0f};
+                thresholds[r] = T(edges[r % 4]);
             }
             tref[r] = static_cast<float>(thresholds[r]);
         }
@@ -172,6 +197,14 @@ TEST_F(MaskedReduceTest, DenseRowPacking) {
 TEST_F(MaskedReduceTest, MaskedInfinitiesAddNothing) {
     check<float>(4, 3000, DataType::FLOAT32, {.infinities = true});
     check<bfloat16>(4, 3000, DataType::BFLOAT16, {.infinities = true});
+}
+
+TEST_F(MaskedReduceTest, ComparisonEdges) {
+    // Signed zero, adjacent FP32 values, and masked NaNs/infinities. Partial
+    // rows and columns exercise trimming in both the first and later tiles.
+    check<float>(4, 16, DataType::FLOAT32, {.comparison_edges = true});
+    check<float>(4, 40003, DataType::FLOAT32, {.comparison_edges = true});
+    check<bfloat16>(4, 40003, DataType::BFLOAT16, {.comparison_edges = true});
 }
 
 TEST_F(MaskedReduceTest, RowThresholdsAndIntCounts) {
