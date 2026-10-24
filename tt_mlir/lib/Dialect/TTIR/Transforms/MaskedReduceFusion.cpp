@@ -245,10 +245,58 @@ public:
   }
 };
 
+// A threshold that is the bit pattern of 32-bit integers (a binary search's
+// candidate) reaches masked_reduce as those integers: the kernel copies the
+// threshold's bits as the input's FP32 values anyway, so the bitcast, a
+// program of its own, goes. A negated one becomes the integers with their sign
+// bit flipped (-x and x ^ 0x80000000 are one bit pattern, NaNs and zeros
+// included), which elementwise integer fusion folds into the integers' own
+// producer.
+class MaskedReduceIntegerThresholdPattern
+    : public OpRewritePattern<MaskedReduceOp> {
+  using OpRewritePattern<MaskedReduceOp>::OpRewritePattern;
+
+public:
+  LogicalResult matchAndRewrite(MaskedReduceOp op,
+                                PatternRewriter &rewriter) const final {
+    auto inputType = cast<RankedTensorType>(op.getInput().getType());
+    auto thresholdType = cast<RankedTensorType>(op.getThreshold().getType());
+    if (!inputType.getElementType().isF32() ||
+        !thresholdType.getElementType().isF32()) {
+      return failure();
+    }
+    Value threshold = op.getThreshold();
+    bool negated = false;
+    if (auto neg = threshold.getDefiningOp<NegOp>()) {
+      threshold = neg.getInput();
+      negated = true;
+    }
+    auto bitcast = threshold.getDefiningOp<BitcastConvertOp>();
+    if (!bitcast) {
+      return failure();
+    }
+    Value bits = bitcast.getInput();
+    auto bitsType = cast<RankedTensorType>(bits.getType());
+    if (!bitsType.getElementType().isInteger(32) ||
+        bitsType.getShape() != thresholdType.getShape()) {
+      return failure();
+    }
+    if (negated) {
+      Value sign = rewriter.create<FullOp>(
+          op.getLoc(), bitsType,
+          rewriter.getI32IntegerAttr(static_cast<int32_t>(0x80000000u)));
+      bits = rewriter.create<BitwiseXorOp>(op.getLoc(), bitsType, bits, sign);
+    }
+    rewriter.modifyOpInPlace(op, [&] { op.getThresholdMutable().set(bits); });
+    return success();
+  }
+};
+
 } // namespace
 
 void populateMaskedReduceFusionPatterns(RewritePatternSet &patterns) {
   patterns.add<MaskedReduceFusionPattern>(patterns.getContext());
+  patterns.add<MaskedReduceIntegerThresholdPattern>(patterns.getContext());
 }
 
 } // namespace mlir::tt::ttir
