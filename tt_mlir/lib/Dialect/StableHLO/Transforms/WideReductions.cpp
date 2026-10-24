@@ -92,8 +92,7 @@ bool isReplicatedConstraint(sdy::ShardingConstraintOp constraint) {
 // constants, closed replicated sharding constraints (JAX leaves one after most
 // ops under a shard_map), and elementwise ops over such values. Returns false
 // for anything else.
-bool collectChain(Value value, unsigned depth,
-                  llvm::SetVector<Value> &chain) {
+bool collectChain(Value value, unsigned depth, llvm::SetVector<Value> &chain) {
   if (chain.contains(value)) {
     return true;
   }
