@@ -61,3 +61,26 @@ diff --git a/include/ttmlir/Target/TTNN/operations/reduction.fbs b/include/ttmli
  }
  
  table MaskedReduceOp {
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -1033,9 +1033,18 @@ TTNNOperandsWorkaroundsFactory::createMaskedReduceOpOperandsWorkarounds(
+   TTNNOperandWorkarounds result;
+   result.tensorLayoutWorkaround = Layout::Tile;
+   result.tensorDataTypeWorkaround = masked.getResult().getType().getElementType().isInteger(32) ? ttcore::DataType::Int32 : ttcore::DataType::Float32;
++  // An FP32 input's threshold may be its values' 32-bit integer bits (libtt
++  // dense-rows): keep them, a cast would convert the values.
++  TTNNOperandWorkarounds threshold = operand;
++  Type thresholdType = masked.getThreshold().getType().getElementType();
++  if (inputType.isF32() && thresholdType.isInteger(32)) {
++    threshold.tensorDataTypeWorkaround = thresholdType.isUnsignedInteger()
++                                             ? ttcore::DataType::UInt32
++                                             : ttcore::DataType::Int32;
++  }
+   return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+       .addInputOperandWorkaround(operand) // input
+-      .addInputOperandWorkaround(operand) // threshold
++      .addInputOperandWorkaround(threshold) // threshold
+       .addOutputOperandWorkaround(result);
+ }
+ 

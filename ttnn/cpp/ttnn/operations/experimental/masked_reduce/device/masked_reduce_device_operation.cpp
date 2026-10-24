@@ -69,8 +69,18 @@ void MaskedReduceOperation::validate_on_program_cache_miss(const operation_attri
             what);
     };
     check(in.input, "input");
-    check(in.threshold, "threshold");
-    TT_FATAL(in.input.dtype() == in.threshold.dtype(), "masked_reduce: input and threshold must have one data type");
+    TT_FATAL(
+        in.threshold.storage_type() == ttnn::StorageType::DEVICE && in.threshold.buffer() != nullptr &&
+            in.threshold.layout() == Layout::TILE &&
+            in.threshold.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
+        "masked_reduce: threshold must be an allocated, tiled, interleaved device tensor");
+    // An FP32 input's threshold may come as the INT32 or UINT32 bits of its
+    // values (the kernel reads it as the input's type).
+    const bool threshold_bits = in.input.dtype() == DataType::FLOAT32 &&
+                                (in.threshold.dtype() == DataType::INT32 || in.threshold.dtype() == DataType::UINT32);
+    TT_FATAL(
+        in.input.dtype() == in.threshold.dtype() || threshold_bits,
+        "masked_reduce: the threshold must have the input's data type, or be an FP32 input's integer bits");
     const auto& shape = in.input.logical_shape();
     const auto& tshape = in.threshold.logical_shape();
     const bool row_form = masked_reduce_row_form(in.input, in.threshold);
