@@ -34,6 +34,19 @@ bool masked_reduce_row_form(const Tensor& input, const Tensor& threshold) {
     return threshold.logical_shape().rank() + 1 == input.logical_shape().rank();
 }
 
+bool masked_reduce_chunked(const Tensor& input, const Tensor& threshold) {
+    return threshold.logical_shape().rank() + 2 == input.logical_shape().rank();
+}
+
+uint32_t masked_reduce_matrices(const Tensor& input) {
+    const auto& shape = input.logical_shape();
+    uint32_t matrices = 1;
+    for (int d = 0; d + 2 < static_cast<int>(shape.rank()); ++d) {
+        matrices *= shape[d];
+    }
+    return matrices;
+}
+
 MaskedReduceOperation::program_factory_t MaskedReduceOperation::select_program_factory(
     const operation_attributes_t&, const tensor_args_t&) {
     return MaskedReduceProgramFactory{};
@@ -61,13 +74,23 @@ void MaskedReduceOperation::validate_on_program_cache_miss(const operation_attri
     const auto& shape = in.input.logical_shape();
     const auto& tshape = in.threshold.logical_shape();
     const bool row_form = masked_reduce_row_form(in.input, in.threshold);
-    TT_FATAL(
-        shape.rank() >= 2 && (row_form || shape.rank() == tshape.rank()),
-        "masked_reduce: the threshold must be [..., H, 1] or [..., H] for a [..., H, W] input");
-    for (int d = 0; d < static_cast<int>(shape.rank()) - 1; ++d) {
-        TT_FATAL(shape[d] == tshape[d], "masked_reduce: threshold dimension {} differs from the input's", d);
+    if (masked_reduce_chunked(in.input, in.threshold)) {
+        TT_FATAL(
+            shape.rank() >= 3 && shape[-1] == tt::constants::TILE_WIDTH,
+            "masked_reduce: a [..., H] threshold reduces a [..., H, N, 32] input, not {}",
+            shape);
+        for (int d = 0; d < static_cast<int>(tshape.rank()); ++d) {
+            TT_FATAL(shape[d] == tshape[d], "masked_reduce: threshold dimension {} differs from the input's", d);
+        }
+    } else {
+        TT_FATAL(
+            shape.rank() >= 2 && (row_form || shape.rank() == tshape.rank()),
+            "masked_reduce: the threshold must be [..., H, 1] or [..., H] for a [..., H, W] input");
+        for (int d = 0; d < static_cast<int>(shape.rank()) - 1; ++d) {
+            TT_FATAL(shape[d] == tshape[d], "masked_reduce: threshold dimension {} differs from the input's", d);
+        }
+        TT_FATAL(row_form || tshape[-1] == 1, "masked_reduce: threshold must have one column");
     }
-    TT_FATAL(row_form || tshape[-1] == 1, "masked_reduce: threshold must have one column");
     TT_FATAL(
         params.output_dtype == DataType::FLOAT32 ||
             (params.output_dtype == DataType::INT32 && params.mode == MaskedMode::Count),

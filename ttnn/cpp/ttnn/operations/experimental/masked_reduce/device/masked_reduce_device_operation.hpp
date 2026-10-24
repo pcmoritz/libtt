@@ -51,6 +51,11 @@ uint32_t masked_reduce_tile_rows(const Tensor& input);
 // Whether the threshold is [..., H] rather than [..., H, 1].
 bool masked_reduce_row_form(const Tensor& input, const Tensor& threshold);
 
+// Whether the threshold [..., H] reduces each [N, 32] matrix of a
+// [..., H, N, 32] input, and how many such matrices it has.
+bool masked_reduce_chunked(const Tensor& input, const Tensor& threshold);
+uint32_t masked_reduce_matrices(const Tensor& input);
+
 // Columns of the partials a tile row's master core gathers from cores_per_row cores.
 uint32_t masked_reduce_partial_columns(uint32_t cores_per_row);
 

@@ -10,7 +10,9 @@
 // The pass groups such values into regions joined by the ops that can work on
 // the chunked shape: elementwise ops (a per-row operand [..., h, 1] becomes
 // [..., h, 1, 1]), broadcasts, constants, reductions over the last dimension
-// (which reduce the last two), case operands and results with the branches'
+// (which reduce the last two), masked reductions with per-row thresholds
+// (libtt's masked_reduce reduces each chunked row's [W / 32, 32] matrix), the
+// native generator's bits, case operands and results with the branches''
 // arguments and results, and loop-invariant loop operands with the body's
 // arguments. A region is rewritten in the chunked shape when it saves more
 // passes over wide tensors than the reshapes at its edges cost:
@@ -170,6 +172,19 @@ bool isChunkableReduction(Operation *op) {
   return dim == input.getRank() - 1 || dim == -1;
 }
 
+// A masked reduction with a [..., H] threshold for its [..., H, W] input:
+// libtt's masked_reduce reduces a [..., H, W / 32, 32] input with the same
+// threshold per [W / 32, 32] matrix.
+bool isChunkableMaskedReduce(Operation *op) {
+  auto masked = dyn_cast<MaskedReduceOp>(op);
+  if (!masked || !isWide(masked.getInput().getType())) {
+    return false;
+  }
+  auto input = cast<RankedTensorType>(masked.getInput().getType());
+  auto threshold = cast<RankedTensorType>(masked.getThreshold().getType());
+  return threshold.getShape() == input.getShape().drop_back();
+}
+
 bool isChunkableConstant(Operation *op) {
   if (!isa<ConstantOp, FullOp, ZerosOp, OnesOp>(op) ||
       !isWide(op->getResult(0).getType())) {
@@ -182,7 +197,7 @@ bool isChunkableConstant(Operation *op) {
 // Whether `user` takes a chunked operand without a reshape.
 bool takesChunked(Operation *user) {
   return isChunkableElementwise(user) || isChunkableBroadcast(user) ||
-         isChunkableReduction(user);
+         isChunkableReduction(user) || isChunkableMaskedReduce(user);
 }
 
 // How a region produces or consumes a value: unknown uses count as edges.
@@ -357,7 +372,7 @@ private:
       markEdgeResults(op);
       return;
     }
-    if (isChunkableReduction(op)) {
+    if (isChunkableReduction(op) || isChunkableMaskedReduce(op)) {
       addValue(op->getOperand(0));
       setConsumer(op->getOpOperand(0), Role::Chunked);
       computeOps.push_back(op);

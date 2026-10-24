@@ -22,6 +22,7 @@
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/dataflow/noc.h"
 #include "api/dataflow/noc_semaphore.h"
+#include "api/scratchpad.h"
 #include "api/tensor/noc_traits.h"
 #include "experimental/kernel_args.h"
 
@@ -48,14 +49,21 @@ void kernel_main() {
     const uint32_t master_x = get_arg(args::master_x);
     const uint32_t master_y = get_arg(args::master_y);
     const uint32_t remote_workers = get_arg(args::remote_workers);
+    const uint32_t row_slot = get_arg(args::row_slot);
+    const uint32_t row_count = get_arg(args::row_count);
+    const uint32_t row_master_x = get_arg(args::row_master_x);
+    const uint32_t row_master_y = get_arg(args::row_master_y);
     constexpr uint32_t cols = get_arg(args::cols);
     constexpr uint32_t partial_tiles = get_arg(args::partial_tiles);
     constexpr uint32_t row_form = get_arg(args::row_form);
+    constexpr uint32_t chunked = get_arg(args::chunked);
     constexpr uint32_t int_output = get_arg(args::int_output);
 
     DataflowBuffer out_dfb(dfb::out);
     DataflowBuffer part_dfb(dfb::part);
     Semaphore done(sem::done);
+    Semaphore row_done(sem::row_done);
+    Scratchpad<uint32_t> row_slots(scratch::row);
     const auto output = TensorAccessor(tensor::output);
     Noc noc;
 
@@ -148,7 +156,46 @@ void kernel_main() {
             totals[m] = __builtin_bit_cast(uint32_t, total);
         }
     }
-    if constexpr (row_form) {
+    if constexpr (chunked) {
+        // The matrix's total is its rows' sum. The first matrix of a result
+        // row collects the others' in 16-byte slots and writes the row.
+        float total = 0.0f;
+        for (uint32_t m = 0; m < rows; ++m) {
+            total += __builtin_bit_cast(float, res[elem_offset(m, face_rows) / 4]);
+        }
+        const uint32_t value =
+            int_output ? static_cast<uint32_t>(static_cast<int32_t>(total)) : __builtin_bit_cast(uint32_t, total);
+        const uint32_t slots = row_slots.get_base_address();
+        if (row_slot != 0) {
+            res[0] = value;
+            res[1] = 0;
+            res[2] = 0;
+            res[3] = 0;
+            noc.async_write(
+                out_dfb,
+                UnicastEndpoint{},
+                slot_bytes,
+                {.offset_bytes = 0},
+                {.noc_x = row_master_x, .noc_y = row_master_y, .addr = slots + row_slot * slot_bytes});
+            noc.async_write_barrier();
+            row_done.up(noc, row_master_x, row_master_y, 1);
+            noc_async_atomic_barrier();
+            out_dfb.pop_front(1);
+            return;
+        }
+        if (row_count > 1) {
+            row_done.wait(row_count - 1);
+            row_done.set(0);
+        }
+        auto* slot = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slots);
+        for (uint32_t m = 0; m < 32; ++m) {
+            res[elem_offset(t_row, m) / 4] = m == 0 ? value : m < row_count ? slot[4 * m] : 0;
+        }
+        for (uint32_t f = 0; f < 2; ++f) {
+            const uint32_t at = elem_offset(t_row, f * face_rows);
+            noc.async_write(out_dfb, output, face_rows * 4, {.offset_bytes = at}, {.page_id = t_page, .offset_bytes = at});
+        }
+    } else if constexpr (row_form) {
         // Row t_row of the result's tile, including its zero padding.
         for (uint32_t m = 0; m < 32; ++m) {
             res[elem_offset(t_row, m) / 4] = totals[m];
