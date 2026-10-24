@@ -23,10 +23,16 @@ ttnn::Tensor masked_reduce(
     const auto grid = input.device()->compute_with_storage_grid_size();
     const uint32_t cores = grid.x * grid.y;
     TT_FATAL(tile_rows >= 1 && tile_rows <= cores, "masked_reduce: {} tile rows for {} cores", tile_rows, cores);
+    // Match the reader's dense packing. Otherwise thin, short rows launch
+    // workers with no input tiles and still gather their zero partials.
+    const uint32_t rows = std::min(input.logical_shape()[-2], tt::constants::TILE_HEIGHT);
+    const uint32_t stride = input.dtype() == tt::tt_metal::DataType::BFLOAT16 ? rows + (rows & 1) : rows;
+    const uint32_t pack = stride <= tt::constants::TILE_HEIGHT / 2 ? tt::constants::TILE_HEIGHT / stride : 1;
+    const uint32_t dense_tiles = (Wt + pack - 1) / pack;
     prim::MaskedReduceParams params{
         .compare = compare,
         .mode = mode,
-        .cores_per_row = std::max(1u, std::min(cores / tile_rows, Wt)),
+        .cores_per_row = std::max(1u, std::min(cores / tile_rows, dense_tiles)),
         .output_dtype = dtype,
         .output_mem_config = memory_config.value_or(input.memory_config())};
     prim::MaskedReduceInputs inputs{.input = input, .threshold = threshold};
