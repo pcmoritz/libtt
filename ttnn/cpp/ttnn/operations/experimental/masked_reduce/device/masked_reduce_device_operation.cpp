@@ -91,10 +91,16 @@ void MaskedReduceOperation::validate_on_program_cache_miss(const operation_attri
         }
         TT_FATAL(row_form || tshape[-1] == 1, "masked_reduce: threshold must have one column");
     }
+    const bool chunked = masked_reduce_chunked(in.input, in.threshold);
     TT_FATAL(
-        params.output_dtype == DataType::FLOAT32 ||
-            (params.output_dtype == DataType::INT32 && params.mode == MaskedMode::Count),
-        "masked_reduce: the result is FP32, or INT32 for counts");
+        chunked || params.mode == MaskedMode::Count || params.mode == MaskedMode::Sum,
+        "masked_reduce: Total, Max and ArgFirst take chunked inputs");
+    TT_FATAL(
+        params.mode == MaskedMode::ArgFirst
+            ? params.output_dtype == DataType::INT32
+            : params.output_dtype == DataType::FLOAT32 ||
+                  (params.output_dtype == DataType::INT32 && params.mode == MaskedMode::Count),
+        "masked_reduce: the result is FP32, or INT32 for counts and indices");
     TT_FATAL(params.cores_per_row >= 1, "masked_reduce: no cores");
 }
 

@@ -23,6 +23,9 @@ static_assert(static_cast<uint32_t>(MaskedCompare::LT) == static_cast<uint32_t>(
 static_assert(static_cast<uint32_t>(MaskedCompare::LE) == static_cast<uint32_t>(MaskedCompareType::LE));
 static_assert(static_cast<uint32_t>(MaskedMode::Count) == static_cast<uint32_t>(MaskedModeType::Count));
 static_assert(static_cast<uint32_t>(MaskedMode::Sum) == static_cast<uint32_t>(MaskedModeType::Sum));
+static_assert(static_cast<uint32_t>(MaskedMode::Total) == static_cast<uint32_t>(MaskedModeType::Total));
+static_assert(static_cast<uint32_t>(MaskedMode::Max) == static_cast<uint32_t>(MaskedModeType::Max));
+static_assert(static_cast<uint32_t>(MaskedMode::ArgFirst) == static_cast<uint32_t>(MaskedModeType::ArgFirst));
 
 } // namespace
 

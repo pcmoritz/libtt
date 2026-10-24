@@ -23,3 +23,41 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
    pm.addPass(mlir::tt::ttir::createTTIRWhileTripCount());
    pm.addPass(mlir::tt::ttir::createTTIRFoldFullToScalar());
    pm.addPass(mlir::tt::ttir::createTTIRConsolidateStaticCacheUpdates());
+diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
+--- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
++++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
+@@ -165,12 +165,20 @@ def TTCore_MaskedCompare : I32EnumAttr<"MaskedCompare", "TT Masked Reduction Com
+ 
+ def TTCore_MaskedMode_Count : I32EnumAttrCase<"Count", 0, "count">;
+ def TTCore_MaskedMode_Sum : I32EnumAttrCase<"Sum", 1, "sum">;
++def TTCore_MaskedMode_Total : I32EnumAttrCase<"Total", 2, "total">;
++def TTCore_MaskedMode_Max : I32EnumAttrCase<"Max", 3, "max">;
++def TTCore_MaskedMode_ArgFirst : I32EnumAttrCase<"ArgFirst", 4, "arg_first">;
+ 
+-// What a masked reduction accumulates: the mask, or the elements it keeps.
++// What a masked reduction accumulates: the mask, or the elements it keeps;
++// for chunked rows (libtt), also every element's sum or maximum, or the first
++// index whose element compares true.
+ def TTCore_MaskedMode : I32EnumAttr<"MaskedMode", "TT Masked Reduction Mode",
+                           [
+                            TTCore_MaskedMode_Count,
+                            TTCore_MaskedMode_Sum,
++                           TTCore_MaskedMode_Total,
++                           TTCore_MaskedMode_Max,
++                           TTCore_MaskedMode_ArgFirst,
+                           ]> {
+   let genSpecializedAttr = 0;
+   let cppNamespace = "::mlir::tt::ttcore";
+diff --git a/include/ttmlir/Target/TTNN/operations/reduction.fbs b/include/ttmlir/Target/TTNN/operations/reduction.fbs
+--- a/include/ttmlir/Target/TTNN/operations/reduction.fbs
++++ b/include/ttmlir/Target/TTNN/operations/reduction.fbs
+@@ -51,6 +51,9 @@ enum MaskedCompareType: uint32 {
+ enum MaskedModeType: uint32 {
+   Count,
+   Sum,
++  Total,
++  Max,
++  ArgFirst,
+ }
+ 
+ table MaskedReduceOp {

@@ -57,6 +57,20 @@ void kernel_main() {
     constexpr uint32_t partial_tiles = get_arg(args::partial_tiles);
     constexpr uint32_t row_form = get_arg(args::row_form);
     constexpr uint32_t chunked = get_arg(args::chunked);
+    constexpr uint32_t mode = get_arg(args::mode);
+    // Unused partial words hold the identity of the mode's combination: 0 for
+    // sums, -inf for Max, 2^24 (no index) for ArgFirst.
+    constexpr uint32_t mode_max = 3, mode_arg_first = 4;
+    constexpr uint32_t fill = mode == mode_max ? 0xff800000u : mode == mode_arg_first ? 0x4b800000u : 0u;
+    auto combine = [](float a, float b) {
+        if constexpr (mode == mode_max) {
+            return b > a ? b : a;
+        } else if constexpr (mode == mode_arg_first) {
+            return b < a ? b : a;
+        } else {
+            return a + b;
+        }
+    };
     constexpr uint32_t int_output = get_arg(args::int_output);
 
     DataflowBuffer out_dfb(dfb::out);
@@ -82,7 +96,7 @@ void kernel_main() {
             auto* last = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(part_base + (partial_tiles - 1) * tile_bytes);
             for (uint32_t m = 0; m < rows; ++m) {
                 for (uint32_t cc = 4 * (remote_workers + 1) % 32; cc < 32; ++cc) {
-                    last[elem_offset(m, cc) / 4] = 0;
+                    last[elem_offset(m, cc) / 4] = fill;
                 }
             }
         }
@@ -110,17 +124,17 @@ void kernel_main() {
         for (uint32_t m = 0; m < rows; ++m) {
             const uint32_t at = elem_offset(m, c) / 4;
             part[at] = __builtin_bit_cast(uint32_t, sums[m]);
-            part[at + 1] = 0;
-            part[at + 2] = 0;
-            part[at + 3] = 0;
+            part[at + 1] = fill;
+            part[at + 2] = fill;
+            part[at + 3] = fill;
         }
     } else {
         // Staging: row m's 16-byte slot at m * 16, written to the master.
         for (uint32_t m = 0; m < rows; ++m) {
             tile[4 * m] = __builtin_bit_cast(uint32_t, sums[m]);
-            tile[4 * m + 1] = 0;
-            tile[4 * m + 2] = 0;
-            tile[4 * m + 3] = 0;
+            tile[4 * m + 1] = fill;
+            tile[4 * m + 2] = fill;
+            tile[4 * m + 3] = fill;
         }
         for (uint32_t m = 0; m < rows; ++m) {
             noc.async_write(
@@ -159,9 +173,13 @@ void kernel_main() {
     if constexpr (chunked) {
         // The matrix's total is its rows' sum. The first matrix of a result
         // row collects the others' in 16-byte slots and writes the row.
-        float total = 0.0f;
-        for (uint32_t m = 0; m < rows; ++m) {
-            total += __builtin_bit_cast(float, res[elem_offset(m, face_rows) / 4]);
+        float total = __builtin_bit_cast(float, res[elem_offset(0, face_rows) / 4]);
+        for (uint32_t m = 1; m < rows; ++m) {
+            total = combine(total, __builtin_bit_cast(float, res[elem_offset(m, face_rows) / 4]));
+        }
+        // An index past the matrix (nothing compared true) reads as 0.
+        if constexpr (mode == mode_arg_first) {
+            total = total < 16777216.0f ? total : 0.0f;
         }
         const uint32_t value =
             int_output ? static_cast<uint32_t>(static_cast<int32_t>(total)) : __builtin_bit_cast(uint32_t, total);
