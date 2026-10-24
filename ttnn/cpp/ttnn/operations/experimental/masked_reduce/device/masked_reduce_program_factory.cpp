@@ -39,15 +39,24 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     const auto& output = outputs.at(0).mesh_tensor();
     const auto& device = input.device();
 
-    const uint32_t tile_rows = masked_reduce_tile_rows(tensor_args.input);
+    // A chunked input ([..., Hm, N, 32] with a [..., Hm] threshold) reduces
+    // each [N, 32] matrix: its Nt tiles take the place of a tile row's, every
+    // row of them is data but the last tile's past N, and the matrix's total
+    // is the sum of its rows. The matrices whose results share a row of the
+    // result's tile hand them to the first of them, which writes the row.
+    const bool chunked = masked_reduce_chunked(tensor_args.input, tensor_args.threshold);
+    const uint32_t tile_rows =
+        chunked ? masked_reduce_matrices(tensor_args.input) : masked_reduce_tile_rows(tensor_args.input);
     const uint32_t H = input.logical_shape()[-2];
     const uint32_t Ht = (H + TILE_HEIGHT - 1) / TILE_HEIGHT;
+    const uint32_t Hm = chunked ? input.logical_shape()[-3] : 1;
+    const uint32_t Hmt = (Hm + TILE_HEIGHT - 1) / TILE_HEIGHT;
     // A [..., H] threshold (and result) tiles H with the dimension before it:
     // tile row b * Ht + tr of the input has its thresholds in row b % D1 of
     // tile (b / D1 * D1t + (b % D1) / 32) * Ht + tr.
     const bool row_form = masked_reduce_row_form(tensor_args.input, tensor_args.threshold);
     const auto& tshape = threshold.logical_shape();
-    const uint32_t D1 = row_form && tshape.rank() >= 2 ? tshape[-2] : 1;
+    const uint32_t D1 = (row_form || chunked) && tshape.rank() >= 2 ? tshape[-2] : 1;
     const uint32_t D1t = (D1 + TILE_HEIGHT - 1) / TILE_HEIGHT;
     const uint32_t Wt = input.padded_shape()[-1] / TILE_WIDTH;
     const uint32_t cores_per_row = params.cores_per_row;
@@ -82,6 +91,8 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     const DFBSpecName OUT_DFB{"out"};
     const DFBSpecName PART_DFB{"part"};
     const SemaphoreSpecName DONE_SEM{"done"};
+    const SemaphoreSpecName ROW_SEM{"row_done"};
+    const ScratchpadSpecName ROW_SLOTS{"row"};
     const TensorParamName INPUT{"input"};
     const TensorParamName THRESHOLD{"threshold"};
     const TensorParamName OUTPUT{"output"};
@@ -100,8 +111,10 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
          .num_entries = partial_tiles,
          .data_format_metadata = tt::DataFormat::Float32},
     };
-    // Every core counts the row's partials that arrived at its master.
-    Group<SemaphoreSpec> semaphores = {{.unique_id = DONE_SEM, .target_nodes = all_cores}};
+    // Every core counts the row's partials that arrived at its master, and the
+    // results of chunked matrices that arrived at their result row's writer.
+    Group<SemaphoreSpec> semaphores = {
+        {.unique_id = DONE_SEM, .target_nodes = all_cores}, {.unique_id = ROW_SEM, .target_nodes = all_cores}};
     const std::vector<std::string> runtime_arg_names = {
         "t_page",
         "t_row",
@@ -115,7 +128,13 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
         "is_master",
         "master_x",
         "master_y",
-        "remote_workers"};
+        "remote_workers",
+        "t_col",
+        "last_rows",
+        "row_slot",
+        "row_count",
+        "row_master_x",
+        "row_master_y"};
     const std::string kernel_dir = "ttnn/cpp/ttnn/operations/experimental/masked_reduce/device/kernels/";
     KernelSpec reader{
         .unique_id = READER,
@@ -133,7 +152,8 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
         .compile_time_args =
             {{"batch_tiles", batch_tiles},
              {"elem_bytes", in_tile_bytes / (TILE_HEIGHT * TILE_WIDTH)},
-             {"row_form", row_form ? 1u : 0u}},
+             {"row_form", row_form ? 1u : 0u},
+             {"chunked", chunked ? 1u : 0u}},
         .runtime_arg_schema = {.runtime_arg_names = runtime_arg_names},
         .hw_config = ttnn::create_reader_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
     };
@@ -145,12 +165,16 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
                 DFBBinding{.dfb_spec_name = OUT_DFB, .accessor_name = "out", .endpoint_type = DFBEndpointType::CONSUMER},
                 DFBBinding{.dfb_spec_name = PART_DFB, .accessor_name = "part", .endpoint_type = DFBEndpointType::PRODUCER},
             },
-        .semaphore_bindings = {SemaphoreBinding{.semaphore_spec_name = DONE_SEM, .accessor_name = "done"}},
+        .semaphore_bindings =
+            {SemaphoreBinding{.semaphore_spec_name = DONE_SEM, .accessor_name = "done"},
+             SemaphoreBinding{.semaphore_spec_name = ROW_SEM, .accessor_name = "row_done"}},
+        .scratchpad_bindings = {ScratchpadBinding{.scratchpad_spec_name = ROW_SLOTS, .accessor_name = "row"}},
         .tensor_bindings = {TensorBinding{.tensor_parameter_name = OUTPUT, .accessor_name = "output"}},
         .compile_time_args =
             {{"cols", partial_cols},
              {"partial_tiles", partial_tiles},
              {"row_form", row_form ? 1u : 0u},
+             {"chunked", chunked ? 1u : 0u},
              {"int_output", output.dtype() == tt::tt_metal::DataType::INT32 ? 1u : 0u}},
         .runtime_arg_schema = {.runtime_arg_names = runtime_arg_names},
         .hw_config = ttnn::create_writer_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
@@ -199,42 +223,58 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     for (uint32_t i = 0; i < num_cores; ++i) {
         const uint32_t tile_row = i / cores_per_row;
         const uint32_t worker = i % cores_per_row;
-        const uint32_t b = tile_row / Ht;
-        const uint32_t t_page = row_form ? (b / D1 * D1t + (b % D1) / TILE_HEIGHT) * Ht + tile_row % Ht : tile_row;
-        const uint32_t t_row = row_form ? (b % D1) % TILE_HEIGHT : 0;
+        // Chunked: matrix tile_row = b * Hm + h, its result in column h % 32.
+        const uint32_t b = chunked ? tile_row / Hm : tile_row / Ht;
+        const uint32_t h = chunked ? tile_row % Hm : 0;
+        const uint32_t t_page = chunked    ? (b / D1 * D1t + (b % D1) / TILE_HEIGHT) * Hmt + h / TILE_HEIGHT
+                                : row_form ? (b / D1 * D1t + (b % D1) / TILE_HEIGHT) * Ht + tile_row % Ht
+                                           : tile_row;
+        const uint32_t t_row = row_form || chunked ? (b % D1) % TILE_HEIGHT : 0;
         // The row's first core gathers the partials and writes the result.
         const auto master = device.worker_core_from_logical_core(cores[tile_row * cores_per_row]);
+        const uint32_t row_first = chunked ? tile_row - h % TILE_HEIGHT : tile_row;
+        const auto row_master = device.worker_core_from_logical_core(cores[row_first * cores_per_row]);
+        const uint32_t row_count = chunked ? std::min(TILE_HEIGHT, Hm - h / TILE_HEIGHT * TILE_HEIGHT) : 1;
         // Data rows of this tile row: the last tile row of a [..., H, W] batch
         // holds H's remainder.
-        const uint32_t rows = (tile_row % Ht == Ht - 1 && H % TILE_HEIGHT != 0) ? H % TILE_HEIGHT : TILE_HEIGHT;
+        const uint32_t rows = chunked ? TILE_HEIGHT
+                              : (tile_row % Ht == Ht - 1 && H % TILE_HEIGHT != 0) ? H % TILE_HEIGHT
+                                                                                    : TILE_HEIGHT;
         const uint32_t stride = stride_of(rows, in_tile_bytes / (TILE_HEIGHT * TILE_WIDTH));
         const uint32_t pack = pack_of(stride);
         // The row's dense tiles split evenly over its cores, the first ones one
         // dense tile longer; only the row's last dense tile can be partial.
-        const uint32_t dense_tiles = (Wt + pack - 1) / pack;
+        const uint32_t row_tiles = chunked ? Ht : Wt;
+        const uint32_t dense_tiles = (row_tiles + pack - 1) / pack;
         const uint32_t base = dense_tiles / cores_per_row;
         const uint32_t extra = dense_tiles % cores_per_row;
         const uint32_t dense_count = base + (worker < extra ? 1 : 0);
         const uint32_t dense_first = worker * base + std::min(worker, extra);
         const uint32_t first = dense_first * pack;
-        const uint32_t count = dense_count == 0 ? 0 : std::min(dense_count * pack, Wt - first);
+        const uint32_t count = dense_count == 0 ? 0 : std::min(dense_count * pack, row_tiles - first);
         for (auto* run_args : {&reader_run_args, &writer_run_args, &compute_run_args}) {
             AddRuntimeArgsForNode(
                 run_args->runtime_arg_values,
                 cores[i],
                 {{"t_page", t_page},
                  {"t_row", t_row},
-                 {"first_tile", tile_row * Wt + first},
+                 {"first_tile", tile_row * row_tiles + first},
                  {"num_tiles", count},
                  {"rows", rows},
                  {"stride", stride},
                  {"pack", pack},
-                 {"has_last", count != 0 && first + count == Wt ? 1u : 0u},
+                 {"has_last", count != 0 && first + count == row_tiles ? 1u : 0u},
                  {"col", 4 * worker},
                  {"is_master", worker == 0 ? 1u : 0u},
                  {"master_x", static_cast<uint32_t>(master.x)},
                  {"master_y", static_cast<uint32_t>(master.y)},
-                 {"remote_workers", cores_per_row - 1}});
+                 {"remote_workers", cores_per_row - 1},
+                 {"t_col", h % TILE_HEIGHT},
+                 {"last_rows", chunked && H % TILE_HEIGHT != 0 ? H % TILE_HEIGHT : TILE_HEIGHT},
+                 {"row_slot", h % TILE_HEIGHT},
+                 {"row_count", row_count},
+                 {"row_master_x", static_cast<uint32_t>(row_master.x)},
+                 {"row_master_y", static_cast<uint32_t>(row_master.y)}});
         }
     }
     ProgramSpec spec{
@@ -242,6 +282,8 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
         .kernels = {std::move(reader), std::move(writer), std::move(compute)},
         .dataflow_buffers = std::move(dataflow_buffers),
         .semaphores = std::move(semaphores),
+        // A 16-byte slot per matrix of a result row.
+        .scratchpads = {ScratchpadSpec{.unique_id = ROW_SLOTS, .size_per_node = TILE_HEIGHT * 16}},
         .tensor_parameters =
             {
                 TensorParameter{.unique_id = INPUT, .spec = input.tensor_spec()},

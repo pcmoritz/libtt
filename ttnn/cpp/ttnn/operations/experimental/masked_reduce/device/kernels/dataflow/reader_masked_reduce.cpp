@@ -14,8 +14,10 @@
 // threshold, t[k % stride], in column 0 of row k; the compute kernel spreads
 // that column across the tile. A [..., H, 1] threshold holds the tile row's
 // thresholds in column 0 of its tile t_page; a [..., H] one holds them in row
-// t_row of tile t_page, which is copied into column 0 first. Reads of a batch
-// of dense tiles share one barrier, so they overlap.
+// t_row of tile t_page, which is copied into column 0 first. A chunked input's
+// [N, 32] matrix has one threshold, column t_col of that row, copied into
+// column 0 of every row. Reads of a batch of dense tiles share one barrier,
+// so they overlap.
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -59,6 +61,18 @@ inline void row_threshold_column(uint32_t base, uint32_t t_row) {
         tile[elem_index(m, 0)] = tile[scratch + (m / face_rows) * (64 / sizeof(T)) + skip + m % face_rows];
     }
 }
+
+// Column t_col of the row read as above, copied to column 0 of rows 0 .. 31.
+template <typename T>
+inline void scalar_threshold_column(uint32_t base, uint32_t t_row, uint32_t t_col) {
+    auto* tile = reinterpret_cast<volatile tt_l1_ptr T*>(base);
+    constexpr uint32_t scratch = 3 * face_elems;
+    const uint32_t skip = sizeof(T) == 2 ? (t_row & 1) * face_rows : 0;
+    const T value = tile[scratch + (t_col / face_rows) * (64 / sizeof(T)) + skip + t_col % face_rows];
+    for (uint32_t m = 0; m < 32; ++m) {
+        tile[elem_index(m, 0)] = value;
+    }
+}
 }  // namespace
 
 void kernel_main() {
@@ -69,9 +83,11 @@ void kernel_main() {
     const uint32_t rows = get_arg(args::rows);
     const uint32_t stride = get_arg(args::stride);
     const uint32_t pack = get_arg(args::pack);
+    const uint32_t t_col = get_arg(args::t_col);
     constexpr uint32_t batch_tiles = get_arg(args::batch_tiles);
     constexpr uint32_t elem_bytes = get_arg(args::elem_bytes);
     constexpr uint32_t row_form = get_arg(args::row_form);
+    constexpr uint32_t chunked = get_arg(args::chunked);
     constexpr uint32_t row_bytes = face_rows * elem_bytes;
     constexpr uint32_t face_bytes = face_elems * elem_bytes;
     constexpr uint32_t tile_bytes = 4 * face_bytes;
@@ -84,7 +100,7 @@ void kernel_main() {
 
     t_dfb.reserve_back(1);
     const uint32_t t_addr = t_dfb.get_write_ptr();
-    if constexpr (row_form) {
+    if constexpr (row_form || chunked) {
         // Row t_row of tile t_page, a 64-byte aligned chunk per face.
         const uint32_t chunk_row = elem_bytes == 2 ? t_row & ~1u : t_row;
         for (uint32_t f = 0; f < 2; ++f) {
@@ -96,7 +112,13 @@ void kernel_main() {
                 {.offset_bytes = 3 * face_bytes + f * 64});
         }
         noc.async_read_barrier();
-        if constexpr (elem_bytes == 4) {
+        if constexpr (chunked) {
+            if constexpr (elem_bytes == 4) {
+                scalar_threshold_column<uint32_t>(t_addr, t_row, t_col);
+            } else {
+                scalar_threshold_column<uint16_t>(t_addr, t_row, t_col);
+            }
+        } else if constexpr (elem_bytes == 4) {
             row_threshold_column<uint32_t>(t_addr, t_row);
         } else {
             row_threshold_column<uint16_t>(t_addr, t_row);

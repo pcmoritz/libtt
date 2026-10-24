@@ -19,7 +19,13 @@ enum class MaskedMode : uint32_t { Count = 0, Sum = 1 };
 //
 //   out[..., h] = sum_w (input[..., h, w] <cmp> threshold[..., h]) ? (Count ? 1 : input[..., h, w]) : 0
 //
-// shaped like the threshold, in FP32 or (counts) INT32. One pass over the
+// shaped like the threshold, in FP32 or (counts) INT32. A [..., H] threshold
+// for a [..., H, N, 32] input (a [..., H, N * 32] one in 32-element chunks, see
+// dense_rows) reduces each [N, 32] matrix instead:
+//
+//   out[..., h] = sum_{n, c} (input[..., h, n, c] <cmp> threshold[..., h]) ? ... : 0
+//
+// One pass over the
 // input: every core masks and accumulates a run of a tile row's tiles on the
 // compute engine, and the row's first core adds up the cores' row sums. This
 // is what a reduction of a compare, or of a select on one, costs with one

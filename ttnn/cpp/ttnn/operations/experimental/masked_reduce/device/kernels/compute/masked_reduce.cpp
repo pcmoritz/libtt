@@ -187,6 +187,9 @@ void kernel_main() {
     const uint32_t stride = get_arg(args::stride);
     const uint32_t pack = get_arg(args::pack);
     const uint32_t has_last = get_arg(args::has_last);
+    // Data rows of the run's last whole tile: fewer only at a chunked
+    // matrix's end.
+    const uint32_t last_rows = get_arg(args::last_rows);
     const uint32_t is_master = get_arg(args::is_master);
     constexpr uint32_t compare = get_arg(args::compare);
     constexpr uint32_t mode = get_arg(args::mode);
@@ -204,7 +207,7 @@ void kernel_main() {
     const uint32_t dense_tiles = (num_tiles + pack - 1) / pack;
     // Input tiles in the last dense tile, and the rows of the row's last tile.
     const uint32_t in_last = num_tiles - (dense_tiles - 1) * pack;
-    const uint32_t rows_valid = pack == 1 ? 32 : in_last * stride;
+    const uint32_t rows_valid = pack == 1 ? (has_last ? last_rows : 32) : in_last * stride;
     const uint32_t last_lo = (in_last - 1) * stride;
     const uint32_t last_hi = last_lo + rows;
     const uint32_t cols_valid = has_last && last_valid != 0 ? last_valid : 32;

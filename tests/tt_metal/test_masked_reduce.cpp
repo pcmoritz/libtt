@@ -62,6 +62,8 @@ protected:
         bool row_form = false;
         // Counts as INT32.
         bool int_counts = false;
+        // The rows as [..., rows, width / 32, 32] with a [..., rows] threshold.
+        bool chunked = false;
     };
 
     // rows x width values, one threshold per row; checks every compare and mode.
@@ -118,6 +120,12 @@ protected:
             t_shape = options.row_form ? std::vector<uint32_t>{options.batch, rows / options.batch}
                                        : std::vector<uint32_t>{options.batch, rows / options.batch, 1};
         }
+        if (options.chunked) {
+            in_shape.back() /= 32;
+            in_shape.push_back(32);
+            t_shape = options.batch > 1 ? std::vector<uint32_t>{options.batch, rows / options.batch}
+                                        : std::vector<uint32_t>{rows};
+        }
         auto input = to_device(values, in_shape, dtype);
         auto threshold = to_device(thresholds, t_shape, dtype);
         for (MaskedCompare compare : {MaskedCompare::GT, MaskedCompare::GE, MaskedCompare::LT, MaskedCompare::LE}) {
@@ -166,8 +174,8 @@ protected:
             out.cpu();
             const double ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() / reps;
-            printf("masked_reduce count [%u x %u] %s: %.3f ms per call (host-timed, 20 calls)\n",
-                   rows, width, dtype == DataType::FLOAT32 ? "f32" : "bf16", ms);
+            printf("masked_reduce count [%u x %u]%s %s: %.3f ms per call (host-timed, 20 calls)\n",
+                   rows, width, options.chunked ? " chunked" : "", dtype == DataType::FLOAT32 ? "f32" : "bf16", ms);
         }
     }
 
@@ -216,6 +224,19 @@ TEST_F(MaskedReduceTest, RowThresholdsAndIntCounts) {
     check<bfloat16>(2, 1000, DataType::BFLOAT16, {.batch = 3, .row_form = true});
     check<float>(40, 1000, DataType::FLOAT32, {.batch = 2, .row_form = true});
     check<float>(40, 1000, DataType::FLOAT32, {.batch = 2, .int_counts = true});
+}
+
+TEST_F(MaskedReduceTest, ChunkedRows) {
+    // [rows, width / 32, 32] inputs: each row's [N, 32] matrix reduces to one
+    // value. 4748 and 268 chunks end in a partial tile; 33 rows put two
+    // matrices' results in the second row of the result; a batch puts
+    // results in two rows of a [2, rows] tile.
+    check<float>(2, 151936, DataType::FLOAT32, {.timed = true, .chunked = true});
+    check<float>(3, 8576, DataType::FLOAT32, {.chunked = true});
+    check<float>(33, 1024, DataType::FLOAT32, {.chunked = true});
+    check<float>(5, 2048, DataType::FLOAT32, {.batch = 2, .int_counts = true, .chunked = true});
+    check<bfloat16>(2, 4096, DataType::BFLOAT16, {.chunked = true});
+    check<float>(2, 8576, DataType::FLOAT32, {.infinities = true, .chunked = true});
 }
 
 }  // namespace

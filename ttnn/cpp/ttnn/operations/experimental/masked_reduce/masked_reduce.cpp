@@ -18,7 +18,10 @@ ttnn::Tensor masked_reduce(
     tt::tt_metal::DataType dtype,
     const std::optional<ttnn::MemoryConfig>& memory_config) {
     using Op = prim::MaskedReduceOperation;
-    const uint32_t tile_rows = prim::masked_reduce_tile_rows(input);
+    // The units of work: tile rows, or the [N, 32] matrices of a chunked input.
+    const bool chunked = prim::masked_reduce_chunked(input, threshold);
+    const uint32_t tile_rows =
+        chunked ? prim::masked_reduce_matrices(input) : prim::masked_reduce_tile_rows(input);
     const uint32_t Wt = input.padded_shape()[-1] / tt::constants::TILE_WIDTH;
     const auto grid = input.device()->compute_with_storage_grid_size();
     const uint32_t cores = grid.x * grid.y;
@@ -28,7 +31,8 @@ ttnn::Tensor masked_reduce(
     const uint32_t rows = std::min(input.logical_shape()[-2], tt::constants::TILE_HEIGHT);
     const uint32_t stride = input.dtype() == tt::tt_metal::DataType::BFLOAT16 ? rows + (rows & 1) : rows;
     const uint32_t pack = stride <= tt::constants::TILE_HEIGHT / 2 ? tt::constants::TILE_HEIGHT / stride : 1;
-    const uint32_t dense_tiles = (Wt + pack - 1) / pack;
+    const uint32_t dense_tiles =
+        chunked ? input.padded_shape()[-2] / tt::constants::TILE_HEIGHT : (Wt + pack - 1) / pack;
     prim::MaskedReduceParams params{
         .compare = compare,
         .mode = mode,
