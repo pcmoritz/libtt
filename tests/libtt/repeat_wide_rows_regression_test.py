@@ -62,10 +62,10 @@ def test_vocab_sharded_argmax(rows, trace, tmp_path):
     out = np.asarray(run(jax.device_put(x, NamedSharding(mesh, P(None, "tensor")))))
     np.testing.assert_array_equal(out, x.argmax(-1))
 
-    # Each shard picks its maximum's value with a sum over the shard, which
-    # tt-mlir splits into groups of 32 (wide_row_reduction_regression_test).
+    # Each shard picks its maximum, and that maximum's value with a sum over
+    # the shard, by masked reductions of the shard in dense rows
+    # (dense_rows_test.py): [rows, shard / 32, 32].
     irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_runtime_*.mlir")]
     assert irs, "no IR was exported"
-    sums = re.findall(r'"ttnn\.sum"\(%\w+\).*?: \(tensor<([0-9x]+)x[a-z]', "\n".join(irs))
-    assert f"{rows}x{shard // 32}x32" in sums, sums
-    assert f"{rows}x{shard // 32}" in sums, sums
+    reduced = re.findall(r'"ttnn\.masked_reduce"\(%\w+, %\w+\).*?: \(tensor<([0-9x]+)x[a-z]', "\n".join(irs))
+    assert f"{rows}x{shard // 32}x32" in reduced, reduced
