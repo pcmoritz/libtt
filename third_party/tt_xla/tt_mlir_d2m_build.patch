@@ -53,23 +53,174 @@ diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/RowMajorLayoutPropagati
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp
-@@ -44,6 +44,15 @@
+@@ -26,12 +26,25 @@
+ 
+ namespace {
+ 
+-// 1. Find exit ops: eltwise ops where all consumers are non-eltwise
+-// 2. From each exit, DFS backward through eltwise producers
+-// 3. Include producer P only if ALL of P's consumers are already in the fusion
+-//    group (this ensures no escaping from middle of a fusion group)
+-// 4. Stop at non-eltwise producers (these are entry points)
+-// 5. Multiple entry points allowed
++// D2M's tile broadcast analysis needs at least two dimensions. Promote only
++// inside the outlined function and use shape-only views at its boundary, so
++// the dispatch and function signatures still match exactly.
++static RankedTensorType normalizeSubgraphType(RankedTensorType type) {
++  if (type.getRank() >= 2) {
++    return type;
++  }
++  SmallVector<int64_t> shape(2 - type.getRank(), 1);
++  llvm::append_range(shape, type.getShape());
++  auto layout =
++      TTNNLayoutAttr::Builder(cast<TTNNLayoutAttr>(type.getEncoding()), shape)
++          .build();
++  return RankedTensorType::get(shape, type.getElementType(), layout);
++}
++
++// Grow schedulable elementwise groups backwards. Intermediate values may
++// escape through additional results, but all inputs must dominate every
++// external consumer. This also prevents fusing across a path that leaves
++// the group and re-enters it (for example through a reduction).
+ class ElementwiseFusionAnalysis {
+ public:
+   using FusionGroup = llvm::SmallVector<Operation *>;
+@@ -44,12 +57,123 @@
      if (!op) {
        return false;
      }
-+    // The D2M elementwise lowering indexes tile broadcast info by rank and
-+    // crashes on rank-0 tensors: leave scalars to TTNN. Large tensors are
-+    // left too, for now: the generic keeps whole operands in L1 on one core.
-+    for (Value v : llvm::concat<Value>(op->getOperands(), op->getResults())) {
-+      auto type = mlir::dyn_cast<RankedTensorType>(v.getType());
-+      if (type && (type.getRank() == 0 || type.getNumElements() > 4096)) {
+-    // Eltwise unary ops.
+-    if (mlir::isa<AbsOp, CbrtOp, CeilOp, SignOp, CosOp, ExpOp, ErfOp, ErfcOp,
+-                  FloorOp, GeluOp, IsFiniteOp, LogicalNotOp, BitwiseNotOp,
+-                  NegOp, TanOp, TanhOp, ReciprocalOp, ReluOp, SinOp, SqrtOp,
+-                  RsqrtOp, SigmoidOp, HardsigmoidOp, SiluOp, MishOp, LogOp,
+-                  Log1pOp, Expm1Op>(op)) {
++    // The TTNN->TTIR conversion does not translate fused activation lists.
++    // Moving such an op into D2M would silently drop its extra computation.
++    for (StringRef name : {"activations", "input_tensor_a_activations",
++                           "input_tensor_b_activations"}) {
++      if (auto activations = op->getAttrOfType<ArrayAttr>(name);
++          activations && !activations.empty()) {
 +        return false;
 +      }
 +    }
-     // Eltwise unary ops.
-     if (mlir::isa<AbsOp, CbrtOp, CeilOp, SignOp, CosOp, ExpOp, ErfOp, ErfcOp,
-                   FloorOp, GeluOp, IsFiniteOp, LogicalNotOp, BitwiseNotOp,
-@@ -61,7 +70,7 @@
++    // Keep large tensors on TTNN: the generic currently stages whole
++    // operands in L1 on one core.
++    for (Value v : llvm::concat<Value>(op->getOperands(), op->getResults())) {
++      auto type = mlir::dyn_cast<RankedTensorType>(v.getType());
++      if (!type) {
++        continue;
++      }
++      if (type.getNumElements() == 0 || type.getNumElements() > 4096) {
++        return false;
++      }
++      // Logical volume alone underestimates storage for thin tensors. Leave
++      // room for double-buffered operands and per-dtype scratch in L1.
++      auto tileShape = ttcore::TileType::getDefaultShape();
++      int64_t tiles = 1;
++      for (int64_t dim = 0; dim < type.getRank(); ++dim) {
++        int64_t trailing = type.getRank() - dim;
++        int64_t size = type.getDimSize(dim);
++        tiles *= trailing <= 2 ? llvm::divideCeil(size, tileShape[2 - trailing])
++                               : size;
++      }
++      if (tiles > 8) {
++        return false;
++      }
++    }
++    // Narrow integer and FP16 kernels require different raw CB formats and
++    // conversion semantics; keep them on the TTNN path.
++    for (Value value :
++         llvm::concat<Value>(op->getOperands(), op->getResults())) {
++      if (auto type = dyn_cast<RankedTensorType>(value.getType())) {
++        Type element = type.getElementType();
++        if (!element.isF32() && !element.isBF16() && !element.isInteger(32)) {
++          return false;
++        }
++        if (auto integer = dyn_cast<IntegerType>(element);
++            integer && integer.isSignless()) {
++          // D2M's element normalization changes signless to signed i32 and
++          // would change the outlined function's dispatch signature.
++          return false;
++        }
++      }
++    }
++    // Collapsing leading dimensions currently loses broadcast boundaries.
++    // Retain those broadcasts on TTNN until D2M preserves that indexing.
++    if (op->getNumResults() == 1) {
++      auto output = dyn_cast<RankedTensorType>(op->getResult(0).getType());
++      if (output && output.getRank() > 2) {
++        for (Value value : op->getOperands()) {
++          auto input = dyn_cast<RankedTensorType>(value.getType());
++          if (!input || input.getRank() > output.getRank()) {
++            continue;
++          }
++          int64_t padding = output.getRank() - input.getRank();
++          for (int64_t dim = 0; dim < output.getRank() - 2; ++dim) {
++            int64_t size = dim < padding ? 1 : input.getDimSize(dim - padding);
++            if (size != output.getDimSize(dim)) {
++              return false;
++            }
++          }
++        }
++      }
++    }
++    if (op->getNumOperands() > 0) {
++      auto input = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
++      auto integer =
++          input ? dyn_cast<IntegerType>(input.getElementType()) : IntegerType{};
++      // TileDiv only has a floating-point implementation. The available
++      // min/max/abs integer kernels implement signed ordering.
++      if (integer && (isa<DivideOp>(op) ||
++                      (integer.isUnsigned() &&
++                       isa<MinimumOp, MaximumOp, ClampTensorOp, AbsOp>(op)))) {
++        return false;
++      }
++    }
++    if (isa<TypecastOp, ToTensorSpecOp>(op)) {
++      auto input = cast<RankedTensorType>(op->getOperand(0).getType());
++      auto output = cast<RankedTensorType>(op->getResult(0).getType());
++      // Explicit narrowing uses TTNN's raw UInt16 pack path to preserve
++      // rounding and signed zero. D2M currently packs ordinary BF16 CBs.
++      if (input.getElementType().isF32() && output.getElementType().isBF16()) {
++        return false;
++      }
++    }
++    if (isa<AddOp, SubtractOp, MultiplyOp, DivideOp>(op) &&
++        cast<RankedTensorType>(op->getResult(0).getType())
++            .getElementType()
++            .isBF16()) {
++      // The FPU destination-reuse path does not preserve mixed register
++      // state across a following widening cast.
++      return false;
++    }
++    if (auto reshape = dyn_cast<ReshapeOp>(op)) {
++      return reshape.getInput().getType().getNumElements() == 1 &&
++             normalizeSubgraphType(reshape.getInput().getType()) ==
++                 normalizeSubgraphType(reshape.getResult().getType());
++    }
++    if (auto spec = dyn_cast<ToTensorSpecOp>(op)) {
++      auto input = spec.getInput().getType();
++      auto output = spec.getResult().getType();
++      return input.getShape() == output.getShape() &&
++             TTNNLayoutAttr::Builder(input)
++                     .setElementType(output.getElementType())
++                     .setLayout(
++                         cast<TTNNLayoutAttr>(input.getEncoding()).getLayout())
++                     .build() == output.getEncoding();
++    }
++    // Keep activation/transcendental kernels on TTNN until their SFPU
++    // initialization and register state are modeled by generic fusion.
++    if (mlir::isa<AbsOp, LogicalNotOp, BitwiseNotOp, NegOp>(op)) {
+       return true;
+     }
+     // Eltwise binary ops.
+@@ -57,11 +181,11 @@
+                   GreaterEqualOp, LessEqualOp, LessThanOp, GreaterThanOp,
+                   LogicalAndOp, LogicalOrOp, LogicalXorOp, LogicalRightShiftOp,
+                   BitwiseAndOp, BitwiseOrOp, BitwiseXorOp, MaximumOp, MinimumOp,
+-                  RemainderOp, LogicalLeftShiftOp, Atan2Op, PowTensorOp>(op)) {
++                  LogicalLeftShiftOp>(op)) {
        return true;
      }
  
@@ -78,10 +229,270 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNCreateD2MSubgraphs.cpp b/lib/Dialec
        return true;
      }
  
+@@ -69,13 +193,28 @@
+   }
+ 
+ private:
+-  static bool isFusionGroupExit(Operation *op) {
+-    if (!isAllowedToBeFused(op)) {
+-      return false;
++  // Keep the existing order of outside operations. A legal insertion point
++  // exists after the last input and before the first escaping use.
++  static bool isSchedulable(const llvm::DenseSet<Operation *> &group,
++                            Block *block) {
++    Operation *lastInput = nullptr;
++    for (Operation *op : group) {
++      for (Value input : op->getOperands()) {
++        Operation *def = input.getDefiningOp();
++        if (def && def->getBlock() == block && !group.contains(def) &&
++            (!lastInput || lastInput->isBeforeInBlock(def))) {
++          lastInput = def;
++        }
++      }
++    }
++    if (!lastInput) {
++      return true;
+     }
+-    for (Value result : op->getResults()) {
+-      for (Operation *user : result.getUsers()) {
+-        if (isAllowedToBeFused(user)) {
++    for (Operation *op : group) {
++      for (Operation *user : op->getUsers()) {
++        Operation *ancestor = block->findAncestorOpInBlock(*user);
++        if (!ancestor || (!group.contains(ancestor) &&
++                          !lastInput->isBeforeInBlock(ancestor))) {
+           return false;
+         }
+       }
+@@ -89,13 +228,16 @@
+     llvm::SmallVector<Operation *> exitOps;
+     rootOp->walk([&](Block *block) {
+       for (Operation &op : llvm::reverse(*block)) {
+-        if (isFusionGroupExit(&op) && !visitedOps.contains(&op)) {
++        if (isAllowedToBeFused(&op) && !visitedOps.contains(&op)) {
+           exitOps.push_back(&op);
+         }
+       }
+     });
+ 
+     for (Operation *exitOp : exitOps) {
++      if (visitedOps.contains(exitOp)) {
++        continue;
++      }
+       FusionGroup group = buildFusionGroup(exitOp);
+ 
+       if (group.size() >= 2) {
+@@ -119,41 +261,40 @@
+     }
+   }
+ 
+-  // DFS backward from exit op and include producer only if all its consumers
+-  // are in the fusion set.
+   FusionGroup buildFusionGroup(Operation *exitOp) {
+-    llvm::DenseSet<Operation *> fusionSet;
+-    llvm::SmallVector<Operation *> stack;
+-
+-    fusionSet.insert(exitOp);
+-    stack.push_back(exitOp);
+-
+-    while (!stack.empty()) {
+-      Operation *cur = stack.pop_back_val();
+-
+-      for (Value operand : cur->getOperands()) {
+-        Operation *producer = operand.getDefiningOp();
+-        if (!producer || !isAllowedToBeFused(producer) ||
+-            visitedOps.contains(producer) || fusionSet.contains(producer)) {
++    llvm::DenseSet<Operation *> fusionSet{exitOp};
++    Block *block = exitOp->getBlock();
++    bool changed;
++    do {
++      changed = false;
++      for (Operation &candidate : *block) {
++        Operation *op = &candidate;
++        if (!isAllowedToBeFused(op) || visitedOps.contains(op) ||
++            fusionSet.contains(op)) {
+           continue;
+         }
+-
+-        // All consumers of producers must be in the fusion group set
+-        bool allConsumersInSet =
+-            llvm::all_of(producer->getUsers(), [&](Operation *user) {
++        bool connected =
++            llvm::any_of(op->getOperands(),
++                         [&](Value input) {
++                           return fusionSet.contains(input.getDefiningOp());
++                         }) ||
++            llvm::any_of(op->getUsers(), [&](Operation *user) {
+               return fusionSet.contains(user);
+             });
+-
+-        if (allConsumersInSet) {
+-          fusionSet.insert(producer);
+-          stack.push_back(producer);
++        if (!connected) {
++          continue;
++        }
++        fusionSet.insert(op);
++        if (isSchedulable(fusionSet, block)) {
++          changed = true;
++        } else {
++          fusionSet.erase(op);
+         }
+       }
+-    }
++    } while (changed);
+ 
+     // Return ordered fusion group.
+     FusionGroup fusionGroup;
+-    Block *block = exitOp->getBlock();
+     for (Operation &op : *block) {
+       if (fusionSet.contains(&op)) {
+         fusionGroup.push_back(&op);
+@@ -216,8 +357,16 @@
+       }
+     }
+ 
+-    Operation *exitOp = fusionGroup.back();
+-    llvm::SmallVector<Value> outputs(exitOp->getResults());
++    llvm::SmallVector<Value> outputs;
++    for (Operation *op : fusionGroup) {
++      for (Value result : op->getResults()) {
++        if (llvm::any_of(result.getUsers(), [&](Operation *user) {
++              return !fusionGroupSet.contains(user);
++            })) {
++          outputs.push_back(result);
++        }
++      }
++    }
+     if (outputs.empty()) {
+       TTMLIR_DEBUG(ttmlir::LogComponent::D2MFusion,
+                    "Fusion group {} has no external outputs", groupIdx);
+@@ -229,7 +378,7 @@
+     Operation *lastInputDefiner = nullptr;
+     for (Value v : inputs) {
+       Operation *defOp = v.getDefiningOp();
+-      if (defOp &&
++      if (defOp && defOp->getBlock() == firstOp->getBlock() &&
+           (!lastInputDefiner || lastInputDefiner->isBeforeInBlock(defOp))) {
+         lastInputDefiner = defOp;
+       }
+@@ -244,14 +393,27 @@
+     // Get device for creating empty output buffers for DPS.
+     auto device = utils::getOrInsertDevice(rewriter, firstOp);
+     llvm::SmallVector<Type> inputTypes;
+-    llvm::transform(inputs, std::back_inserter(inputTypes),
+-                    [](Value v) { return v.getType(); });
++    llvm::SmallVector<Value> dispatchInputs;
++    for (Value input : inputs) {
++      auto type =
++          normalizeSubgraphType(cast<RankedTensorType>(input.getType()));
++      inputTypes.push_back(type);
++      Value normalized = input;
++      if (type != input.getType()) {
++        normalized = rewriter.create<ReshapeOp>(
++            loc, type, input,
++            rewriter.getI32ArrayAttr(
++                llvm::to_vector_of<int32_t>(type.getShape())));
++      }
++      dispatchInputs.push_back(normalized);
++    }
+ 
+     llvm::SmallVector<Type> outputTypes;
+     llvm::SmallVector<Value> outputBuffers;
+     Operation *lastEmptyOp = nullptr;
+     for (Value v : outputs) {
+-      auto tensorType = mlir::cast<RankedTensorType>(v.getType());
++      auto tensorType =
++          normalizeSubgraphType(cast<RankedTensorType>(v.getType()));
+       outputTypes.push_back(tensorType);
+ 
+       auto shapeAttr =
+@@ -289,7 +451,21 @@
+     mapping.map(inputs.getArrayRef(), funcOp.getArguments());
+ 
+     for (Operation *op : fusionGroup) {
+-      rewriter.clone(*op, mapping);
++      if (auto spec = dyn_cast<ToTensorSpecOp>(op)) {
++        // A dtype-only spec is computation, not a D2M layout boundary.
++        auto cast = rewriter.create<TypecastOp>(
++            op->getLoc(), normalizeSubgraphType(spec.getResult().getType()),
++            mapping.lookup(spec.getInput()));
++        mapping.map(spec.getResult(), cast.getResult());
++      } else if (auto reshape = dyn_cast<ReshapeOp>(op)) {
++        mapping.map(reshape.getResult(), mapping.lookup(reshape.getInput()));
++      } else {
++        Operation *clone = rewriter.clone(*op, mapping);
++        for (Value result : clone->getResults()) {
++          result.setType(
++              normalizeSubgraphType(cast<RankedTensorType>(result.getType())));
++        }
++      }
+     }
+     llvm::SmallVector<Value> returnValues;
+     llvm::transform(outputs, std::back_inserter(returnValues),
+@@ -306,12 +482,20 @@
+       rewriter.setInsertionPoint(firstOp);
+     }
+     auto dispatchOp = rewriter.create<D2MSubgraphOp>(
+-        loc, outputTypes, inputs.getArrayRef(), outputBuffers,
++        loc, outputTypes, dispatchInputs, outputBuffers,
+         SymbolRefAttr::get(rewriter.getContext(), funcName));
+ 
+     for (auto [origOutput, dispatchResult] :
+          llvm::zip(outputs, dispatchOp.getResults())) {
+-      rewriter.replaceAllUsesExcept(origOutput, dispatchResult, dispatchOp);
++      Value result = dispatchResult;
++      if (origOutput.getType() != result.getType()) {
++        auto type = cast<RankedTensorType>(origOutput.getType());
++        result = rewriter.create<ReshapeOp>(
++            loc, type, result,
++            rewriter.getI32ArrayAttr(
++                llvm::to_vector_of<int32_t>(type.getShape())));
++      }
++      rewriter.replaceAllUsesExcept(origOutput, result, dispatchOp);
+     }
+ 
+     for (auto it = fusionGroup.rbegin(); it != fusionGroup.rend(); ++it) {
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -75,6 +75,15 @@
+@@ -49,6 +49,35 @@
+ 
+   void runOnOperation() final {
+     mlir::ModuleOp moduleOp = this->getOperation();
++    // Keep a generic's output allocation next to its first use. If preparation
++    // splits an empty from its writer into separate traces, the later trace
++    // copies that empty into an input slot and mutates the copy; callers still
++    // see the uninitialized original allocation.
++    llvm::SmallVector<ttnn::EmptyOp> genericOutputs;
++    moduleOp.walk([&](ttnn::EmptyOp empty) {
++      if (llvm::any_of(empty->getUsers(), [](Operation *user) {
++            return isa<ttnn::GenericOp>(user);
++          })) {
++        genericOutputs.push_back(empty);
++      }
++    });
++    for (auto empty : genericOutputs) {
++      Block *block = empty->getBlock();
++      Operation *firstUser = nullptr;
++      for (Operation *user : empty->getUsers()) {
++        Operation *ancestor = block->findAncestorOpInBlock(*user);
++        if (!ancestor) {
++          firstUser = nullptr;
++          break;
++        }
++        if (!firstUser || ancestor->isBeforeInBlock(firstUser)) {
++          firstUser = ancestor;
++        }
++      }
++      if (firstUser) {
++        empty->moveBefore(firstUser);
++      }
++    }
+     // Entry functions first. The programs of control flow that stays outside
+     // their traces are hoisted in turn, once their callers are done.
+     llvm::SmallVector<func::FuncOp> worklist;
+@@ -75,6 +104,16 @@
    // transfers and preparation run eagerly between traces, and the device
    // programs of eager control flow are partitioned by the same rule.
    bool shouldHoistOp(Operation *op) {
@@ -89,26 +500,163 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +    // the generic's result allocation and is traced like any op's result,
 +    // whatever else then reads it.
 +    if (auto empty = ::mlir::dyn_cast<ttnn::EmptyOp>(op)) {
-+      return llvm::any_of(empty->getUsers(), [](Operation *user) {
-+               return ::mlir::isa<ttnn::GenericOp>(user);
-+             }) &&
++      return llvm::any_of(empty->getUsers(),
++                          [](Operation *user) {
++                            return ::mlir::isa<ttnn::GenericOp>(user);
++                          }) &&
 +             isOnDeviceType(empty.getResult().getType());
 +    }
      if (::mlir::isa<func::ReturnOp, func::CallOp, ttcore::CaseOp,
                      ttcore::WhileLoopOp, ttnn::WhileOp, ttcore::LoadCachedOp,
                      ttnn::GetDeviceOp, ttnn::AdamWOp, ttnn::DeallocateOp,
+@@ -183,10 +222,12 @@
+   // Optimization-barrier results that pass a boundary input through are
+   // recorded separately: they preserve ordering inside the trace but do not
+   // need a persistent output slot or a device copy.
+-  void collectFunctionBoundary(llvm::ArrayRef<Operation *> opsToHoist,
+-                               llvm::SmallVector<mlir::Value> &inputs,
+-                               llvm::SmallVector<mlir::Value> &outputs,
+-                               llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> &passthroughOutputs) {
++  void
++  collectFunctionBoundary(llvm::ArrayRef<Operation *> opsToHoist,
++                          llvm::SmallVector<mlir::Value> &inputs,
++                          llvm::SmallVector<mlir::Value> &outputs,
++                          llvm::SmallVector<std::pair<mlir::Value, mlir::Value>>
++                              &passthroughOutputs) {
+ 
+     // Create set for quick lookup
+     llvm::SmallPtrSet<Operation *, 16> opSet(opsToHoist.begin(),
+@@ -249,8 +290,9 @@
+           if (!opSet.contains(user)) {
+             if (auto barrier =
+                     mlir::dyn_cast<ttcore::OptimizationBarrierOp>(op)) {
+-              mlir::Value input = barrier.getInputs()[
+-                  mlir::cast<OpResult>(result).getResultNumber()];
++              mlir::Value input =
++                  barrier.getInputs()[mlir::cast<OpResult>(result)
++                                          .getResultNumber()];
+               Operation *definingOp = input.getDefiningOp();
+               if (!definingOp || !opSet.contains(definingOp)) {
+                 passthroughOutputs.emplace_back(result, input);
+@@ -385,8 +427,7 @@
+     llvm::SmallVector<mlir::Value> inputs;
+     llvm::SmallVector<mlir::Value> outputs;
+     llvm::SmallVector<mlir::Type> outputTypes;
+-    llvm::SmallVector<std::pair<mlir::Value, mlir::Value>>
+-        passthroughOutputs;
++    llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> passthroughOutputs;
+ 
+     collectFunctionBoundary(opsToHoist, inputs, outputs, passthroughOutputs);
+ 
+@@ -970,9 +1011,8 @@
+       auto argument = mlir::dyn_cast<BlockArgument>(input);
+       bool usedByThisTraceOnly =
+           argument && funcOp.isPublic() &&
+-          llvm::all_of(argument.getUsers(), [&](Operation *user) {
+-            return opSet.contains(user);
+-          });
++          llvm::all_of(argument.getUsers(),
++                       [&](Operation *user) { return opSet.contains(user); });
+       if (layout.getBufferType() != ttnn::BufferType::SystemMemory &&
+           usedByThisTraceOnly) {
+         RankedTensorType systemMemoryTileType =
+@@ -1141,9 +1181,9 @@
+   // of its caller, keep on device what the caller keeps on device: the
+   // arguments bound to constants, parameters and caches, provided they hold
+   // the same buffer on every call (`isInvariant`).
+-  void markDeviceResidentArguments(
+-      func::FuncOp callee, ValueRange inputs,
+-      llvm::function_ref<bool(unsigned)> isInvariant) {
++  void
++  markDeviceResidentArguments(func::FuncOp callee, ValueRange inputs,
++                              llvm::function_ref<bool(unsigned)> isInvariant) {
+     mlir::MLIRContext *context = &this->getContext();
+     for (auto [index, input] : llvm::enumerate(inputs)) {
+       if (index >= callee.getNumArguments() || !isInvariant(index) ||
+@@ -1157,15 +1197,15 @@
+              {llvm::StringRef(ttcore::ArgumentTypeAttr::name),
+               llvm::StringRef(ttcore::g_kvCacheAttrName),
+               llvm::StringRef(ttcore::g_recurrentCacheAttrName)}) {
+-          if (Attribute attr = caller.getArgAttr(argument.getArgNumber(), name)) {
++          if (Attribute attr =
++                  caller.getArgAttr(argument.getArgNumber(), name)) {
+             callee.setArgAttr(index, name, attr);
+           }
+         }
+       } else {
+-        callee.setArgAttr(
+-            index, ttcore::ArgumentTypeAttr::name,
+-            ttcore::ArgumentTypeAttr::get(context,
+-                                          ttcore::ArgumentType::Constant));
++        callee.setArgAttr(index, ttcore::ArgumentTypeAttr::name,
++                          ttcore::ArgumentTypeAttr::get(
++                              context, ttcore::ArgumentType::Constant));
+       }
+     }
+   }
+@@ -1232,7 +1272,7 @@
+         if (isCapturable(&op)) {
+           firstHoistable = &op;
+         }
+-      } else if (isIndependentOp(&op)) {
++      } else if (isIndependentOp(&op) && !isCapturable(&op)) {
+         independentOps.push_back(&op);
+       }
+     }
 diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp
 --- a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp
 +++ b/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp
-@@ -22,6 +22,7 @@
+@@ -21,6 +21,7 @@
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
  #include "mlir/Dialect/MemRef/IR/MemRef.h"
  #include "mlir/Dialect/SCF/IR/SCF.h"
- #include "mlir/IR/Builders.h"
 +#include "mlir/Dialect/Utils/StaticValueUtils.h"
+ #include "mlir/IR/Builders.h"
  #include "mlir/IR/BuiltinTypes.h"
  #include "mlir/IR/MLIRContext.h"
- #include "mlir/IR/Operation.h"
-@@ -962,7 +963,16 @@
+@@ -501,8 +502,41 @@
+   return getRemappedFirstL1Cb(rewriter, op, /*forInput=*/false);
+ }
+ 
++// The accumulator mode is kernel-wide, even when individual DST allocations
++// retain a narrower logical type. Match D2MToTTNN's CB-based mode selection.
++static bool kernelUses32BitCB(Operation *op) {
++  auto func = op->getParentOfType<func::FuncOp>();
++  return func
++      .walk([&](Operation *nested) {
++        for (Type type : nested->getResultTypes()) {
++          Type elementType;
++          if (auto cb = dyn_cast<ttkernel::CBType>(type)) {
++            elementType = cb.getElementType();
++          } else {
++            if (auto cb = dyn_cast<d2m::CBType>(type)) {
++              type = cb.getUnderlyingAs<MemRefType>();
++            }
++            if (auto memref = dyn_cast<MemRefType>(type);
++                memref && ttcore::getMemorySpace(memref) ==
++                              ttcore::MemorySpace::DeviceL1) {
++              elementType = memref.getElementType();
++            }
++          }
++          if (auto tile = dyn_cast_if_present<ttcore::TileType>(elementType);
++              tile && tile.getElementType().getIntOrFloatBitWidth() == 32) {
++            return WalkResult::interrupt();
++          }
++        }
++        return WalkResult::advance();
++      })
++      .wasInterrupted();
++}
++
+ // Check if an operand comes from DST.
+ static bool operandFromDst(Value operand) {
++  while (auto cast = operand.getDefiningOp<d2m::DstReinterpretCastOp>()) {
++    operand = cast.getInput();
++  }
+   if (auto affineLoad = operand.getDefiningOp<affine::AffineLoadOp>()) {
+     return ttcore::getMemorySpace(affineLoad.getMemRef()) ==
+            ttcore::MemorySpace::RegisterDst;
+@@ -962,7 +996,16 @@
    std::pair<d2m::TileSubOp,        std::pair<ttkernel::SubIntTileInitOp,          ttkernel::SubIntTileOp>>,
    std::pair<d2m::TileMulOp,        std::pair<ttkernel::MulIntTileInitOp,          ttkernel::MulIntTileOp>>,
    std::pair<d2m::TileMaximumOp,    std::pair<ttkernel::BinaryMaxInt32TileInitOp,  ttkernel::BinaryMaxInt32TileOp>>,
@@ -126,7 +674,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
  >;
  // clang-format on
  
-@@ -993,6 +1003,18 @@
+@@ -993,6 +1036,18 @@
  constexpr bool needsDtypeArg = std::is_same_v<Op, ttkernel::MulIntTileInitOp> ||
                                 std::is_same_v<Op, ttkernel::AddIntTileOp> ||
                                 std::is_same_v<Op, ttkernel::SubIntTileOp> ||
@@ -145,17 +693,78 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
                                 std::is_same_v<Op, ttkernel::MulIntTileOp>;
  
  namespace {
-@@ -1198,6 +1220,9 @@
+@@ -1198,10 +1253,22 @@
        auto cb = getCB(rewriter, op.getInput());
        auto dstIdx = getDstIdxFromResult(op.getResult());
        ensureDominatesInsertionPoint(rewriter, dstIdx);
-+      // An Int32 buffer broadcasts through unpack-to-dest exactly; what
-+      // truncated integers was the FPU binary op after it (see
-+      // emitIntegerBinaryDestReuse).
-       rewriter.create<ttkernel::UnaryBcastInitOp>(op->getLoc(), cb, cb,
+-      rewriter.create<ttkernel::UnaryBcastInitOp>(op->getLoc(), cb, cb,
++      // Hardware startup resets the DST half-buffer synchronization. It
++      // must precede all live register values, never run between their loads.
++      auto insertionPoint = rewriter.getInsertionPoint();
++      auto outCB = getOutCB(rewriter, op);
++      setInsertionPointAfterOperands(rewriter, {cb, outCB},
++                                     /*allowHoisting=*/true);
++      rewriter.create<ttkernel::ComputeKernelHWStartupOp>(op->getLoc(), cb,
++                                                          nullptr, outCB);
++      rewriter.setInsertionPoint(insertionPoint->getBlock(), insertionPoint);
++      rewriter.create<ttkernel::ReconfigDataFormatSrcAOp>(op->getLoc(), cb);
++      rewriter.create<ttkernel::UnaryBcastInitOp>(op->getLoc(), cb, nullptr,
                                                    bcastType);
        rewriter.create<ttkernel::UnaryBcastTileOp>(
-@@ -1629,6 +1654,17 @@
+           op->getLoc(), cb, adaptor.getInput(), dstIdx, bcastType);
++      rewriter.create<ttkernel::UnaryBcastUninitOp>(op->getLoc(), cb,
++                                                    bcastType);
+     } else if constexpr (arity == 2) {
+       auto dstIdx = getDstIdxFromResult(op.getResult());
+       ensureDominatesInsertionPoint(rewriter, dstIdx);
+@@ -1423,8 +1490,13 @@
+           mlir::cast<ttcore::TileType>(op.getInput().getType()).getDataType();
+       const auto outDtype =
+           mlir::cast<ttcore::TileType>(op.getResult().getType()).getDataType();
+-      rewriter.create<ttkernel::TypecastTileInitOp>(op->getLoc(), inDtype,
+-                                                    outDtype);
++      // D2M uses a normal BF16 CB, so unpack has already widened this tile.
++      // The patched TTNN BF16->FP32 helper expects raw UInt16 CB data instead.
++      if (inDtype != ttcore::DataType::BFloat16 ||
++          outDtype != ttcore::DataType::Float32) {
++        rewriter.create<ttkernel::TypecastTileInitOp>(op->getLoc(), inDtype,
++                                                      outDtype);
++      }
+     } else {
+       rewriter.create<InitOp>(op->getLoc());
+     }
+@@ -1439,8 +1511,11 @@
+           mlir::cast<ttcore::TileType>(op.getInput().getType()).getDataType();
+       const auto outDtype =
+           mlir::cast<ttcore::TileType>(op.getResult().getType()).getDataType();
+-      rewriter.create<ttkernel::TypecastTileOp>(
+-          op->getLoc(), adaptor.getInput(), inDtype, outDtype);
++      if (inDtype != ttcore::DataType::BFloat16 ||
++          outDtype != ttcore::DataType::Float32) {
++        rewriter.create<ttkernel::TypecastTileOp>(
++            op->getLoc(), adaptor.getInput(), inDtype, outDtype);
++      }
+     } else if constexpr (std::is_same_v<SFPUOp, ttkernel::ClampScalarTileOp>) {
+       auto loc = op->getLoc();
+       // The hardware clamp API takes i32 params for both int and float clamps.
+@@ -1577,9 +1652,13 @@
+                                       adaptor.getFalseValue(), dstIdx},
+                                      /*allowHoisting*/ false);
+       if constexpr (std::is_same_v<ConcreteOp, d2m::TileWhereOp>) {
+-        const auto dtype =
+-            mlir::cast<ttcore::TileType>(op.getTrueValue().getType())
+-                .getDataType();
++        auto dtype = mlir::cast<ttcore::TileType>(op.getTrueValue().getType())
++                         .getDataType();
++        // BF16 values occupy FP32 registers in a 32-bit kernel. Reading
++        // only the low 16 bits makes a true condition (1.0) look like zero.
++        if (dtype == ttcore::DataType::BFloat16 && kernelUses32BitCB(op)) {
++          dtype = ttcore::DataType::Float32;
++        }
+         rewriter.create<ttkernel::WhereTileOp>(
+             op->getLoc(), adaptor.getCondition(), adaptor.getTrueValue(),
+             adaptor.getFalseValue(), dstIdx, dtype);
+@@ -1629,6 +1708,17 @@
        return emitFPUTiles(rewriter, op, adaptor, loc);
      }
  
@@ -173,7 +782,7 @@ diff --git a/lib/Conversion/D2MToTTKernel/D2MToTTKernel.cpp b/lib/Conversion/D2M
      if (lhsFromDst) {
        // LHS from Dst, RHS from Cb (FPU - DEST_TO_SRCA)
        return emitFPUBinaryDestReuse(rewriter, op, adaptor, loc,
-@@ -1734,6 +1770,61 @@
+@@ -1734,6 +1824,61 @@
      }
  
      rewriter.eraseOp(op);
@@ -304,12 +913,13 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
    SmallVector<mlir::Attribute> kernelConfigs(threads.size());
    for (const auto [i, thread] : llvm::enumerate(threads)) {
      const d2m::ThreadAttr threadAttr = mlir::cast<d2m::ThreadAttr>(thread);
-@@ -338,11 +388,9 @@
+@@ -337,12 +387,9 @@
+       // TODO (vtangTT) #5032: support lowering to different compute configs.
        kernelConfigs[i] = builder.getAttr<ttnn::ComputeKernelAttr>(
            kernelSymbol, coreRangeSet,
-           /*math_fidelity*/ convertMathFidelity(mathFidelity),
+-          /*math_fidelity*/ convertMathFidelity(mathFidelity),
 -          /*fp32DestAccum*/ false,
-+          fp32DestAccum,
++          /*math_fidelity*/ convertMathFidelity(mathFidelity), fp32DestAccum,
            /*dst_full_sync_en*/ false,
 -          /*unpack_to_dest_mode*/
 -          ArrayRef<ttnn::ComputeKernelUnpackToDestMode>{
@@ -318,7 +928,7 @@ diff --git a/lib/Conversion/D2MToTTNN/D2MToTTNN.cpp b/lib/Conversion/D2MToTTNN/D
            /*bfp8_pack_precise*/ false,
            /*math_approx_mode*/ false, kernelCRTArgs, kernelCTArgs);
        break;
-@@ -729,7 +777,8 @@
+@@ -729,7 +776,8 @@
    const auto arch = ttcore::getOpChipDescAttr(op).getArch().getValue();
    SmallVector<mlir::Attribute> kernelDescriptors = createKernelDescriptors(
        rewriter, op.getThreads(), coreRangeSet, opSymTable, mathFidelity,
@@ -360,7 +970,31 @@ diff --git a/lib/Dialect/TTIR/Transforms/PredicateTypeAlignment.cpp b/lib/Dialec
 diff --git a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td b/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
 --- a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
 +++ b/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td
-@@ -1428,6 +1428,192 @@
+@@ -623,12 +623,21 @@
+     }];
+ 
+     let arguments = (ins TTKernel_CB:$in_cb,
+-                         TTKernel_CB:$out_cb,
++                         Optional<TTKernel_CB>:$out_cb,
+                          TTKernel_BcastTypeAttr:$bcast_type
+                         );
+ 
+     let assemblyFormat = [{
+-      `(` $in_cb `,` $out_cb `,` $bcast_type `)` attr-dict `:` functional-type(operands, results)
++      `(` $in_cb `,` ($out_cb^ `,`)? $bcast_type `)` attr-dict `:` functional-type(operands, results)
++    }];
++}
++
++def TTKernel_UnaryBcastUninitOp : TTKernel_InitOp<"unary_bcast_uninit"> {
++    let summary = "Restore unpack/math state after a unary broadcast";
++    let arguments = (ins TTKernel_CB:$in_cb,
++                         TTKernel_BcastTypeAttr:$bcast_type);
++    let assemblyFormat = [{
++      `(` $in_cb `,` $bcast_type `)` attr-dict `:` functional-type(operands, results)
+     }];
+ }
+ 
+@@ -1428,6 +1437,192 @@
      }];
  }
  
@@ -556,7 +1190,16 @@ diff --git a/include/ttmlir/Dialect/TTKernel/IR/TTKernelOps.td b/include/ttmlir/
 diff --git a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp b/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp
 --- a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp
 +++ b/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp
-@@ -880,6 +880,18 @@
+@@ -859,6 +859,8 @@
+           datatypeToDataformatEnumNameOpaqueAttr(builder, op.getDataFormat()));
+       return ArrayAttr::get(op.getContext(), template_args);
+     } else if constexpr (std::is_same_v<SourceOp, ttkernel::UnaryBcastInitOp> ||
++                         std::is_same_v<SourceOp,
++                                        ttkernel::UnaryBcastUninitOp> ||
+                          std::is_same_v<SourceOp, ttkernel::UnaryBcastTileOp>) {
+       SmallVector<Attribute, 1> template_args;
+       template_args.push_back(emitc::OpaqueAttr::get(
+@@ -880,6 +882,18 @@
        return ArrayAttr::get(op.getContext(), template_args);
      } else if constexpr (std::is_same_v<SourceOp, ttkernel::AddIntTileOp> ||
                           std::is_same_v<SourceOp, ttkernel::SubIntTileOp> ||
@@ -575,7 +1218,7 @@ diff --git a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp b/lib/Conversion
                           std::is_same_v<SourceOp, ttkernel::MulIntTileInitOp> ||
                           std::is_same_v<SourceOp, ttkernel::MulIntTileOp>) {
        SmallVector<Attribute, 1> template_args;
-@@ -2756,6 +2768,18 @@
+@@ -2756,6 +2770,18 @@
          TTKernelToEmitCOpaqueRewriter<ttkernel::AddBinaryTilesOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::AddIntTileInitOp>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::AddIntTileOp>,
@@ -594,6 +1237,14 @@ diff --git a/lib/Conversion/TTKernelToEmitC/TTKernelToEmitC.cpp b/lib/Conversion
          TTKernelScalarUnaryTileOpRewriter<ttkernel::AddUnaryTileOp>,
          TTKernelScalarUnaryTileOpRewriter<ttkernel::AddUnaryTileInt32Op>,
          TTKernelToEmitCOpaqueRewriter<ttkernel::DivBinaryTilesInitOp>,
+@@ -2889,6 +2915,7 @@
+         TTKernelToEmitCOpaqueRewriter<ttkernel::ExperimentalWriteColMaskTileOp>,
+         TTKernelToEmitCOpaqueRewriter<ttkernel::ExperimentalFillArangeTileOp>,
+         TTKernelToEmitCOpaqueRewriter<ttkernel::UnaryBcastInitOp>,
++        TTKernelToEmitCOpaqueRewriter<ttkernel::UnaryBcastUninitOp>,
+         TTKernelToEmitCOpaqueRewriter<ttkernel::UnaryBcastTileOp>,
+         TTKernelToEmitCOpaqueRewriter<ttkernel::WhereTileInitOp>,
+         TTKernelToEmitCOpaqueRewriter<ttkernel::WhereTileOp>,
 diff --git a/include/ttmlir/Target/TTKernel/TTKernelIncludesMap.h b/include/ttmlir/Target/TTKernel/TTKernelIncludesMap.h
 --- a/include/ttmlir/Target/TTKernel/TTKernelIncludesMap.h
 +++ b/include/ttmlir/Target/TTKernel/TTKernelIncludesMap.h
@@ -651,6 +1302,14 @@ diff --git a/include/ttmlir/Target/TTKernel/TTKernelIncludesMap.h b/include/ttml
          {"ne_binary_tile",                                 {"api/compute/eltwise_binary_sfpu.h", ""}},
          {"ne_binary_tile_init",                            {"api/compute/eltwise_binary_sfpu.h", ""}},
          {"nez_tile",                                       {"api/compute/eltwise_unary/comp.h", ""}},
+@@ -251,6 +263,7 @@
+         {"typecast_tile_init",                             {"api/compute/eltwise_unary/typecast.h", ""}},
+         {"unary_bcast",                                    {"api/compute/bcast.h", ""}},
+         {"unary_bcast_init",                               {"api/compute/bcast.h", ""}},
++        {"unary_bcast_uninit",                               {"api/compute/bcast.h", ""}},
+         {"untilize_block",                                 {"api/compute/untilize.h", ""}},
+         {"untilize_init",                                  {"api/compute/untilize.h", ""}},
+         {"untilize_uninit",                                {"api/compute/untilize.h", ""}},
 diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 --- a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
 +++ b/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp
@@ -700,7 +1359,25 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
  // ----------------------------------------------------------------------------
  //
  // Rewrite elementwise ops by emitting a matching D2M tile version of the op
-@@ -1186,21 +1147,6 @@
+@@ -929,11 +890,12 @@
+       D2MNamedRewriterCommon {
+ 
+ public:
+-  D2MNamedElementwiseRewriter(
+-      const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
+-      ttcore::MemorySpace defaultInputMemSpace,
+-      ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
+-      bool collapseTensors, bool enableMulticastInference)
++  D2MNamedElementwiseRewriter(const TypeConverter &typeConverter,
++                              mlir::MLIRContext *ctx,
++                              ttcore::MemorySpace defaultInputMemSpace,
++                              ttcore::MemorySpace defaultOutputMemSpace,
++                              bool ttnnMode, bool collapseTensors,
++                              bool enableMulticastInference)
+       : OpConversionPattern<ConcreteOp>(typeConverter, ctx),
+         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
+                                ttnnMode, collapseTensors,
+@@ -1186,21 +1148,6 @@
        auto diff = bbBuilder.create<d2m::TileSubOp>(loc, resultTypes,
                                                     ValueRange{nezA, nezB});
        yield = bbBuilder.create<d2m::TileNezOp>(loc, resultTypes, diff);
@@ -722,3 +1399,1095 @@ diff --git a/lib/Conversion/TTIRToD2M/TTIRToD2M.cpp b/lib/Conversion/TTIRToD2M/T
      } else {
        yield = bbBuilder.create<TileOp>(loc, resultTypes, operands);
      }
+@@ -2091,11 +2038,12 @@
+       D2MNamedRewriterCommon {
+ 
+ public:
+-  D2MNamedTileReduceRewriter(
+-      const TypeConverter &typeConverter, mlir::MLIRContext *ctx,
+-      ttcore::MemorySpace defaultInputMemSpace,
+-      ttcore::MemorySpace defaultOutputMemSpace, bool ttnnMode,
+-      bool collapseTensors, bool enableMulticastInference)
++  D2MNamedTileReduceRewriter(const TypeConverter &typeConverter,
++                             mlir::MLIRContext *ctx,
++                             ttcore::MemorySpace defaultInputMemSpace,
++                             ttcore::MemorySpace defaultOutputMemSpace,
++                             bool ttnnMode, bool collapseTensors,
++                             bool enableMulticastInference)
+       : OpConversionPattern<ConcreteOp>(typeConverter, ctx),
+         D2MNamedRewriterCommon(defaultInputMemSpace, defaultOutputMemSpace,
+                                ttnnMode, collapseTensors,
+diff --git a/lib/Dialect/TTNN/Utils/D2MOptimizerUtils.cpp b/lib/Dialect/TTNN/Utils/D2MOptimizerUtils.cpp
+--- a/lib/Dialect/TTNN/Utils/D2MOptimizerUtils.cpp
++++ b/lib/Dialect/TTNN/Utils/D2MOptimizerUtils.cpp
+@@ -18,16 +18,22 @@
+                                       RankedTensorType newTensorType,
+                                       TTNNLayoutAttr layoutAttr,
+                                       ttcore::GridAttr deviceGrid) {
+-  assert(dispatchOp.getNumResults() <= 1 &&
+-         "D2MSubgraphOp with multiple results not yet supported");
+-
+-  for (unsigned i = 0; i < dispatchOp.getNumResults(); ++i) {
+-    dispatchOp.getResult(i).setType(newTensorType);
+-  }
+-
+-  for (Value output : dispatchOp.getOutputs()) {
++  SmallVector<Type> resultTypes;
++  for (auto [i, result] : llvm::enumerate(dispatchOp.getResults())) {
++    auto oldType = cast<RankedTensorType>(result.getType());
++    auto layout = TTNNLayoutAttr::Builder(layoutAttr, oldType.getShape())
++                      .setElementType(oldType.getElementType())
++                      .setLayout(layoutAttr.getLayout())
++                      .build();
++    auto resultType =
++        i == 0 ? newTensorType
++               : RankedTensorType::get(oldType.getShape(),
++                                       oldType.getElementType(), layout);
++    result.setType(resultType);
++    resultTypes.push_back(resultType);
++    Value output = dispatchOp.getOutputs()[i];
+     if (EmptyOp emptyOp = output.getDefiningOp<EmptyOp>()) {
+-      emptyOp.getResult().setType(newTensorType);
++      emptyOp.getResult().setType(resultType);
+     } else {
+       dispatchOp.emitOpError(
+           "Expected EmptyOp for D2MSubgraphOp output buffer");
+@@ -51,15 +57,15 @@
+     Block &block = mainFunc.getBody().front();
+     Operation *terminator = block.getTerminator();
+     if (func::ReturnOp returnOp = dyn_cast<func::ReturnOp>(terminator)) {
+-      if (returnOp.getNumOperands() > 0) {
+-        Value currentResultValue = returnOp.getOperand(0);
+-        if (currentResultValue.getType() != newTensorType) {
++      for (auto [i, resultType] : llvm::enumerate(resultTypes)) {
++        Value currentResultValue = returnOp.getOperand(i);
++        if (currentResultValue.getType() != resultType) {
+           OpBuilder builder(dispatchOp.getContext());
+           builder.setInsertionPoint(returnOp);
+           Location loc = mainFunc.getLoc();
+           ToTensorSpecOp toTensorSpecOp = builder.create<ToTensorSpecOp>(
+-              loc, newTensorType, currentResultValue);
+-          returnOp.setOperand(0, toTensorSpecOp.getResult());
++              loc, resultType, currentResultValue);
++          returnOp.setOperand(i, toTensorSpecOp.getResult());
+         }
+       }
+     }
+@@ -67,17 +73,15 @@
+     for (Value input : dispatchOp.getInputs()) {
+       newInputTypes.push_back(input.getType());
+     }
+-    SmallVector<Type> newResultTypes(dispatchOp.getNumResults(), newTensorType);
+-    mainFunc.setType(FunctionType::get(dispatchOp.getContext(), newInputTypes,
+-                                       newResultTypes));
++    mainFunc.setType(
++        FunctionType::get(dispatchOp.getContext(), newInputTypes, resultTypes));
+   }
+ }
+ 
+ void applyChosenLayoutToD2MSubgraphOp(D2MSubgraphOp dispatchOp,
+                                       TTNNLayoutAttr chosenLayout,
+                                       ttcore::GridAttr deviceGrid) {
+-  assert(dispatchOp.getNumResults() == 1 &&
+-         "D2MSubgraphOp with one result is supported");
++  assert(dispatchOp.getNumResults() > 0 && "Expected a D2M result");
+   auto tensorType =
+       mlir::cast<RankedTensorType>(dispatchOp->getResult(0).getType());
+   llvm::ArrayRef<int64_t> tensorShape = tensorType.getShape();
+diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+--- a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
++++ b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
+@@ -1629,7 +1629,8 @@
+     std::optional<llvm::ArrayRef<op_model::OpModelAllocationRecord>>
+         liveRecords) {
+   // The where kernels read every operand as tiles, including both payloads.
+-  if (llvm::any_of(inputs, [](TTNNLayoutAttr layout) { return !layout.isTiled(); })) {
++  if (llvm::any_of(inputs,
++                   [](TTNNLayoutAttr layout) { return !layout.isTiled(); })) {
+     return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                    "Where requires tiled inputs");
+   }
+@@ -5796,7 +5797,18 @@
+   ValueToLayoutMap valueToLayout =
+       buildValueToLayoutMap(inputs, block, opConfig);
+ 
+-  op_model::OpConstraints ret(0, 0, 0, 0, {opConfig.outputLayout});
++  SmallVector<TTNNLayoutAttr> outputLayouts;
++  for (auto [i, result] : llvm::enumerate(getResults())) {
++    auto type = cast<RankedTensorType>(result.getType());
++    outputLayouts.push_back(
++        (i == 0 || !opConfig.outputLayout)
++            ? opConfig.outputLayout
++            : TTNNLayoutAttr::Builder(opConfig.outputLayout, type.getShape())
++                  .setElementType(type.getElementType())
++                  .setLayout(opConfig.outputLayout.getLayout())
++                  .build());
++  }
++  op_model::OpConstraints ret(0, 0, 0, 0, outputLayouts);
+ 
+   for (mlir::Operation &op : block.getOperations()) {
+     auto backend = mlir::dyn_cast<OpModel>(&op);
+diff --git a/lib/Dialect/D2M/Transforms/GenericFusion.cpp b/lib/Dialect/D2M/Transforms/GenericFusion.cpp
+--- a/lib/Dialect/D2M/Transforms/GenericFusion.cpp
++++ b/lib/Dialect/D2M/Transforms/GenericFusion.cpp
+@@ -9,6 +9,7 @@
+ #include "ttmlir/Dialect/D2M/Utils/Utils.h"
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+ #include "ttmlir/Dialect/TTCore/IR/Utils.h"
++#include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
+ 
+ #include "mlir/Dialect/Affine/IR/AffineOps.h"
+ #include "mlir/Dialect/Linalg/IR/Linalg.h"
+@@ -115,6 +116,11 @@
+   if (gOp.hasMultiUseInputOperand()) {
+     return false;
+   }
++  for (unsigned i = 0; i < gOp->getNumOperands(); ++i) {
++    if (!GenericOp::getOperandAlloc(gOp.getRegion(0), i)) {
++      return false;
++    }
++  }
+ 
+   return true;
+ }
+@@ -629,6 +635,11 @@
+   if (gOp.hasMultiUseInputOperand()) {
+     return false;
+   }
++  for (unsigned i = 0; i < gOp->getNumOperands(); ++i) {
++    if (!GenericOp::getOperandAlloc(gOp.getRegion(0), i)) {
++      return false;
++    }
++  }
+ 
+   return true;
+ }
+@@ -715,35 +726,321 @@
+ };
+ } // namespace
+ 
+-namespace {
+-struct FuseD2MElementwiseOpsPattern : public OpRewritePattern<GenericOp> {
+-  using OpRewritePattern<GenericOp>::OpRewritePattern;
++// Elementwise DAG fusion keeps escaping producer results as additional outputs.
++// Unlike tree fusion, shared inputs have one operand/CB and one remote load.
++struct ElementwiseFusionPlan {
++  SmallVector<Value> inputs;
++  SmallVector<Value> outputs;
++  SmallVector<AffineMap> maps;
++  SmallVector<OpOperand *> sources;
++  SmallVector<unsigned> keptProducerResults;
++};
+ 
+-  LogicalResult matchAndRewrite(GenericOp consumer,
+-                                PatternRewriter &rewriter) const final {
+-    if (!isValidElementwiseFusionTarget(consumer)) {
++static bool isSimpleElementwiseGeneric(GenericOp op) {
++  if (!op.isComputeOnlyForm() || !op.hasPureTensorSemantics() ||
++      !op.isAllParallel() || op.getNumRegions() != 1 ||
++      !op.getRegion(0).hasOneBlock() || !op.getAdditionalArgs().empty()) {
++    return false;
++  }
++  bool skip = false;
++  op.walk([&](Operation *nested) {
++    skip |= nested->hasTrait<D2MSkipOpEltwiseFusionTrait>() &&
++            !isa<TileTypecastOp>(nested);
++  });
++  if (skip) {
++    return false;
++  }
++  for (unsigned i = 0; i < op->getNumOperands(); ++i) {
++    if (!GenericOp::getOperandAlloc(op.getRegion(0),
++                                    op.getOperandIndex(op->getOperand(i)))) {
++      return false;
++    }
++  }
++  return llvm::all_of(op.getRegion(0).front(), [](Operation &nested) {
++    return isa<tensor::EmptyOp, RemoteLoadOp, RemoteStoreOp, BlockIndexOp,
++               linalg::GenericOp, YieldOp>(nested);
++  });
++}
++
++static FailureOr<ElementwiseFusionPlan>
++planElementwiseFusion(GenericOp producer, GenericOp consumer) {
++  if (!isSimpleElementwiseGeneric(producer) ||
++      !isSimpleElementwiseGeneric(consumer) ||
++      producer->getBlock() != consumer->getBlock() ||
++      !producer->isBeforeInBlock(consumer) ||
++      !producer.hasCompatibleBlocking(consumer) ||
++      producer.getIteratorTypes() != consumer.getIteratorTypes()) {
++    return failure();
++  }
++
++  // Use a common iteration space. Reductions/permutations retain the existing
++  // specialized fusion path below.
++  AffineMap outputMap = consumer.getIndexingMap(
++      consumer.getDpsInitOperand(0)->getOperandNumber());
++  for (OpOperand *input : consumer.getDpsInputOperands()) {
++    auto result = dyn_cast<OpResult>(input->get());
++    if (!result || result.getOwner() != producer.getOperation()) {
++      continue;
++    }
++    if (consumer.getIndexingMap(input->getOperandNumber()) != outputMap ||
++        producer.getIndexingMap(
++            producer.getDpsInitOperand(result.getResultNumber())
++                ->getOperandNumber()) != outputMap) {
+       return failure();
+     }
++  }
+ 
+-    assert(consumer.getNumRegions() == 1u);
+-
+-    // Consumer was already validated above; only re-check the producer.
+-    OpOperand *fusedOperand = nullptr;
+-    for (OpOperand *use : consumer.getDpsInputOperands()) {
+-      if (isElementwiseFusable(use, /*checkConsumer=*/false,
+-                               /*checkProducer=*/true)) {
+-        fusedOperand = use;
+-        break;
++  ElementwiseFusionPlan plan;
++  for (auto result : producer.getResults()) {
++    bool keep = false;
++    for (Operation *user : result.getUsers()) {
++      if (user == consumer || producer->isProperAncestor(user) ||
++          consumer->isProperAncestor(user)) {
++        continue;
++      }
++      Operation *ancestor = consumer->getBlock()->findAncestorOpInBlock(*user);
++      // Inserting at the consumer must still dominate every escaping use.
++      // This rejects paths through an outside operation back into the group.
++      if (!ancestor || !consumer->isBeforeInBlock(ancestor)) {
++        return failure();
+       }
++      keep = true;
+     }
+-    if (!fusedOperand) {
+-      return failure();
++    if (keep) {
++      plan.keptProducerResults.push_back(result.getResultNumber());
+     }
++  }
+ 
+-    auto producer = fusedOperand->get().getDefiningOp<GenericOp>();
+-    assert(producer);
+-    fuseOverOperand(fusedOperand, producer, consumer, rewriter);
++  auto addInput = [&](OpOperand *input, GenericOp owner) {
++    Value value = input->get();
++    AffineMap map = owner.getIndexingMap(input->getOperandNumber());
++    auto it = llvm::find(plan.inputs, value);
++    if (it != plan.inputs.end()) {
++      return success(plan.maps[it - plan.inputs.begin()] == map);
++    }
++    plan.inputs.push_back(value);
++    plan.maps.push_back(map);
++    plan.sources.push_back(input);
++    return success();
++  };
++  for (OpOperand *input : producer.getDpsInputOperands()) {
++    if (failed(addInput(input, producer))) {
++      return failure();
++    }
++  }
++  for (OpOperand *input : consumer.getDpsInputOperands()) {
++    if (input->get().getDefiningOp() != producer &&
++        failed(addInput(input, consumer))) {
++      return failure();
++    }
++  }
++  auto addOutput = [&](OpOperand *output, GenericOp owner) {
++    if (owner.getIndexingMap(output->getOperandNumber()) != outputMap) {
++      return failure();
++    }
++    plan.outputs.push_back(output->get());
++    plan.maps.push_back(outputMap);
++    plan.sources.push_back(output);
+     return success();
++  };
++  for (OpOperand &output : consumer.getDpsInitsMutable()) {
++    if (failed(addOutput(&output, consumer))) {
++      return failure();
++    }
++  }
++  for (unsigned i : plan.keptProducerResults) {
++    if (failed(addOutput(producer.getDpsInitOperand(i), producer))) {
++      return failure();
++    }
++  }
++  size_t numOperands = plan.inputs.size() + plan.outputs.size();
++  if (numOperands > 32) {
++    return failure();
++  }
++  bool has32bit = utils::getRegionLargestDstElemType(producer.getRegion(0))
++                          .getIntOrFloatBitWidth() > 16 ||
++                  utils::getRegionLargestDstElemType(consumer.getRegion(0))
++                          .getIntOrFloatBitWidth() > 16;
++  if (has32bit && numOperands > 8) {
++    return failure();
++  }
++  return plan;
++}
++
++static void fuseElementwiseDAG(GenericOp producer, GenericOp consumer,
++                               const ElementwiseFusionPlan &plan,
++                               PatternRewriter &rewriter) {
++  auto fused = rewriter.create<GenericOp>(
++      consumer.getLoc(), TypeRange(plan.outputs), plan.inputs, plan.outputs,
++      ValueRange{}, consumer.getGrid(), consumer.getBlockFactors(),
++      rewriter.getAffineMapArrayAttr(plan.maps), consumer.getIteratorTypes(),
++      consumer.getThreads(), consumer.getFabricConnectionConfigAttr(),
++      /*regions=*/1);
++  Block &block = fused.getRegion(0).emplaceBlock();
++  rewriter.setInsertionPointToStart(&block);
++  IRMapping mapping;
++  DenseMap<Value, Value> operandAllocs;
++  auto makeEmpty = [&](Type type) -> Value {
++    auto shaped = cast<ShapedType>(type);
++    return rewriter.create<tensor::EmptyOp>(fused.getLoc(), shaped.getShape(),
++                                            shaped.getElementType());
++  };
++  // Declare operand allocations first, in operand order. Intermediate
++  // allocations follow and remain distinct from the output buffers.
++  for (OpOperand *source : plan.sources) {
++    auto owner = cast<GenericOp>(source->getOwner());
++    Value alloc = GenericOp::getOperandAlloc(
++        owner.getRegion(0), owner.getOperandIndex(source->get()));
++    operandAllocs[source->get()] = makeEmpty(alloc.getType());
++  }
++  llvm::DenseSet<Value> associatedAllocs;
++  for (GenericOp original : {producer, consumer}) {
++    for (OpOperand &operand : original->getOpOperands()) {
++      Value alloc = GenericOp::getOperandAlloc(
++          original.getRegion(0), original.getOperandIndex(operand.get()));
++      associatedAllocs.insert(alloc);
++      auto it = operandAllocs.find(operand.get());
++      if (it != operandAllocs.end()) {
++        mapping.map(alloc, it->second);
++      } else if (original == producer && original.isDpsInit(&operand)) {
++        mapping.map(alloc, makeEmpty(alloc.getType()));
++      }
++    }
++  }
++
++  // A generic may read the same input more than once, with separate local
++  // load buffers. Map every such buffer to the one deduplicated input CB.
++  for (GenericOp original : {producer, consumer}) {
++    for (auto load : original.getRegion(0).front().getOps<RemoteLoadOp>()) {
++      Value alloc = load.getLocalBuffer();
++      if (!alloc.getDefiningOp<tensor::EmptyOp>()) {
++        continue;
++      }
++      associatedAllocs.insert(alloc);
++      if (auto it = operandAllocs.find(load.getMemref());
++          it != operandAllocs.end()) {
++        mapping.map(alloc, it->second);
++      }
++    }
++  }
++
++  DenseMap<Value, Value> loadedInputs;
++  DenseMap<Value, Value> producerLocalResults;
++  SmallVector<Value> consumerYields;
++  SmallVector<Value> producerYields(producer.getNumResults());
++  auto cloneBody = [&](GenericOp original) {
++    for (Operation &op : original.getRegion(0).front()) {
++      if (auto empty = dyn_cast<tensor::EmptyOp>(op);
++          empty && associatedAllocs.contains(empty.getResult())) {
++        continue;
++      }
++      if (auto yield = dyn_cast<YieldOp>(op)) {
++        if (original == consumer) {
++          for (Value value : yield.getOperands()) {
++            consumerYields.push_back(mapping.lookupOrDefault(value));
++          }
++        }
++        continue;
++      }
++      if (auto load = dyn_cast<RemoteLoadOp>(op)) {
++        Value source = load.getMemref();
++        if (auto it = producerLocalResults.find(source);
++            it != producerLocalResults.end()) {
++          mapping.map(load.getResult(), it->second);
++          continue;
++        }
++        if (auto it = loadedInputs.find(source); it != loadedInputs.end()) {
++          mapping.map(load.getResult(), it->second);
++          continue;
++        }
++        auto cloned = cast<RemoteLoadOp>(rewriter.clone(op, mapping));
++        loadedInputs[source] = cloned.getResult();
++        continue;
++      }
++      if (auto store = dyn_cast<RemoteStoreOp>(op);
++          store && original == producer) {
++        unsigned i = producer.getOperandIndex(store.getMemref()) -
++                     producer.getInputs().size();
++        Value local = mapping.lookupOrDefault(store.getLocalBuffer());
++        producerLocalResults[producer.getResult(i)] = local;
++        if (llvm::is_contained(plan.keptProducerResults, i)) {
++          auto cloned = cast<RemoteStoreOp>(rewriter.clone(op, mapping));
++          producerYields[i] = cloned.getResult();
++        } else {
++          mapping.map(store.getResult(), local);
++        }
++        continue;
++      }
++      rewriter.clone(op, mapping);
++    }
++  };
++  cloneBody(producer);
++  cloneBody(consumer);
++  for (unsigned i : plan.keptProducerResults) {
++    consumerYields.push_back(producerYields[i]);
++  }
++  auto yield = rewriter.create<YieldOp>(fused.getLoc(), consumerYields);
++  // All input transfers must precede output transfers. Compute may wait for
++  // every input before producing an escaping intermediate; an earlier remote
++  // store on the same data-movement thread would deadlock that wait.
++  SmallVector<RemoteStoreOp> stores;
++  for (auto store : block.getOps<RemoteStoreOp>()) {
++    stores.push_back(store);
++  }
++  for (auto store : stores) {
++    for (Value index : store.getIndices()) {
++      if (auto blockIndex = index.getDefiningOp<BlockIndexOp>()) {
++        blockIndex->moveBefore(yield);
++      }
++    }
++    store->moveBefore(yield);
++  }
++  for (Operation &op : block) {
++    if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
++      op.setAttr("d2m.blocking_map",
++                 AffineMapAttr::get(linalgOp.getIndexingMapsArray().back()));
++    }
++  }
++  for (auto [i, result] : llvm::enumerate(consumer.getResults())) {
++    rewriter.replaceAllUsesWith(result, fused.getResult(i));
++  }
++  for (auto [i, resultNumber] : llvm::enumerate(plan.keptProducerResults)) {
++    rewriter.replaceAllUsesWith(producer.getResult(resultNumber),
++                                fused.getResult(consumer.getNumResults() + i));
++  }
++  rewriter.eraseOp(consumer);
++  rewriter.eraseOp(producer);
++}
++
++namespace {
++struct FuseD2MElementwiseOpsPattern : public OpRewritePattern<GenericOp> {
++  using OpRewritePattern<GenericOp>::OpRewritePattern;
++
++  LogicalResult matchAndRewrite(GenericOp consumer,
++                                PatternRewriter &rewriter) const final {
++    if (isSimpleElementwiseGeneric(consumer)) {
++      for (Value input : consumer.getInputs()) {
++        auto producer = input.getDefiningOp<GenericOp>();
++        if (!producer) {
++          continue;
++        }
++        auto plan = planElementwiseFusion(producer, consumer);
++        if (failed(plan)) {
++          continue;
++        }
++        fuseElementwiseDAG(producer, consumer, *plan, rewriter);
++        return success();
++      }
++    }
++    // Preserve the existing tree/permutation path for other generic forms.
++    for (OpOperand *input : consumer.getDpsInputOperands()) {
++      if (isElementwiseFusable(input)) {
++        fuseOverOperand(input, input->get().getDefiningOp<GenericOp>(),
++                        consumer, rewriter);
++        return success();
++      }
++    }
++    return failure();
+   }
+ };
+ } // namespace
+@@ -754,6 +1051,50 @@
+   using D2MGenericFusionBase::D2MGenericFusionBase;
+ 
+   void runOnOperation() override {
++    // Deduplicate layout views without CSE'ing the operand tensor.empty
++    // allocations inside generic regions: those must stay distinct CBs.
++    SmallVector<ttir::TTNNMetalLayoutCastOp> layoutViews;
++    getOperation()->walk(
++        [&](ttir::TTNNMetalLayoutCastOp cast) { layoutViews.push_back(cast); });
++    DenseMap<std::pair<Value, Type>, Value> seenViews;
++    IRRewriter viewRewriter(&getContext());
++    for (auto cast : layoutViews) {
++      auto key = std::make_pair(cast.getInput(), cast.getResult().getType());
++      auto it = seenViews.find(key);
++      if (it != seenViews.end() &&
++          it->second.getDefiningOp()->getBlock() == cast->getBlock()) {
++        viewRewriter.replaceOp(cast, it->second);
++      } else {
++        seenViews[key] = cast.getResult();
++      }
++    }
++    // Layout casts of escaping results are shape-only views. Sink them to
++    // their first use so they do not artificially pin a producer before the
++    // consumer into which it can fuse.
++    SmallVector<ttir::TTNNMetalLayoutCastOp> outputViews;
++    getOperation()->walk([&](ttir::TTNNMetalLayoutCastOp cast) {
++      if (cast.getInput().getDefiningOp<GenericOp>() && !cast->use_empty()) {
++        outputViews.push_back(cast);
++      }
++    });
++    for (auto cast : outputViews) {
++      Block *block = cast->getBlock();
++      Operation *firstUser = nullptr;
++      bool canSink = true;
++      for (Operation *user : cast->getUsers()) {
++        Operation *ancestor = block->findAncestorOpInBlock(*user);
++        if (!ancestor) {
++          canSink = false;
++          break;
++        }
++        if (!firstUser || ancestor->isBeforeInBlock(firstUser)) {
++          firstUser = ancestor;
++        }
++      }
++      if (canSink) {
++        cast->moveBefore(firstUser);
++      }
++    }
+     MLIRContext *ctx = &getContext();
+     RewritePatternSet patterns(ctx);
+     patterns.add<FuseD2MElementwiseOpsPattern>(ctx);
+diff --git a/lib/Dialect/D2M/Transforms/InsertSpillAndScratch.cpp b/lib/Dialect/D2M/Transforms/InsertSpillAndScratch.cpp
+--- a/lib/Dialect/D2M/Transforms/InsertSpillAndScratch.cpp
++++ b/lib/Dialect/D2M/Transforms/InsertSpillAndScratch.cpp
+@@ -1020,6 +1020,16 @@
+       auto [producerMap, producerOperands] =
+           getScratchAccessMapAndOperands(producer, &getContext());
+ 
++      // A fused intermediate can also escape through a remote_store. Keep its
++      // original output write as well as the scratch copy used by later compute
++      // loops; otherwise the data-movement kernel waits forever for that
++      // output.
++      bool isExported = false;
++      genericOp.walk([&](RemoteStoreOp remoteStore) {
++        isExported |= tracesToAlloc(remoteStore.getLocalBuffer(),
++                                    allocInfo.allocOp.getResult());
++      });
++
+       for (auto storeOp : allocInfo.stores) {
+         rewriter.setInsertionPoint(storeOp);
+         Value storedValue = storeOp.getValue();
+@@ -1028,7 +1038,9 @@
+                                                scratchBuf, producerMap,
+                                                producerOperands);
+ 
+-        rewriter.eraseOp(storeOp);
++        if (!isExported) {
++          rewriter.eraseOp(storeOp);
++        }
+       }
+ 
+       // Rewrite loads in all consumer loops. Loads within the
+diff --git a/lib/Dialect/D2M/IR/D2MGenericRegionOps.cpp b/lib/Dialect/D2M/IR/D2MGenericRegionOps.cpp
+--- a/lib/Dialect/D2M/IR/D2MGenericRegionOps.cpp
++++ b/lib/Dialect/D2M/IR/D2MGenericRegionOps.cpp
+@@ -2300,12 +2300,15 @@
+   auto lhsType = op->getOperand(0).getType();
+   auto rhsType = op->getOperand(1).getType();
+ 
+-  // If either operand is a float32, use SFPU to maintain accuracy. Load both
+-  // operands from DST.
+-  if (mlir::tt::ttcore::getDataType(lhsType) ==
+-          mlir::tt::ttcore::DataType::Float32 ||
+-      mlir::tt::ttcore::getDataType(rhsType) ==
+-          mlir::tt::ttcore::DataType::Float32) {
++  // 32-bit arithmetic uses SFPU, including integers. Let the DST allocator
++  // reserve both inputs instead of copying into an untracked scratch register.
++  auto needsSFPU = [](Type type) {
++    auto dtype = mlir::tt::ttcore::getDataType(type);
++    return dtype == mlir::tt::ttcore::DataType::Float32 ||
++           dtype == mlir::tt::ttcore::DataType::Int32 ||
++           dtype == mlir::tt::ttcore::DataType::UInt32;
++  };
++  if (needsSFPU(lhsType) || needsSFPU(rhsType)) {
+     return {0, 1};
+   }
+ 
+diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Scheduled.cpp b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Scheduled.cpp
+--- a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Scheduled.cpp
++++ b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Scheduled.cpp
+@@ -103,6 +103,9 @@
+     const bool multiResultInPlace =
+         computeOp.getDstRegInPlace() && computeOp->getNumResults() > 1u;
+ 
++    // An escaping intermediate is packed both to an output CB and to scratch.
++    // Both stores must read the same result register, allocated only once.
++    DenseMap<Value, int64_t> storedResultSlices;
+     for (auto *user : computeOp->getUsers()) {
+       auto affineStore = mlir::dyn_cast<affine::AffineStoreOp>(user);
+       auto memrefStore = mlir::dyn_cast<memref::StoreOp>(user);
+@@ -113,8 +116,13 @@
+         bool dstRegInPlace = computeOp.getDstRegInPlace();
+         bool rhsIsScalar = computeOp.isScalarOperand(1);
+ 
++        Value stored =
++            isAffineStore ? affineStore.getValue() : memrefStore.getValue();
+         int64_t dstSliceIndex = -1;
+-        if (multiResultInPlace) {
++        if (auto it = storedResultSlices.find(stored);
++            it != storedResultSlices.end()) {
++          dstSliceIndex = it->second;
++        } else if (multiResultInPlace) {
+           // Identify which result of the compute op this store consumes and
+           // map it to that result's in-place DST slot.
+           Value stored =
+@@ -158,6 +166,7 @@
+           dstAllocator.setStoreToDst();
+         }
+ 
++        storedResultSlices[stored] = dstSliceIndex;
+         if (isAffineStore) {
+           collectDstStoreAccess(affineStore, copyInfos, dstSliceIndex,
+                                 outermostInnerComputeLoop);
+diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp
+--- a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp
++++ b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Shared.cpp
+@@ -1177,27 +1177,34 @@
+ void replaceLoadWithDst(PatternRewriter &rewriter, const DstAccess &access,
+                         Value dst, AffineMap dstAccessMap,
+                         ValueRange dstAccessIndices) {
++  // The physical DST allocation can use a wider or differently signed tile
++  // type. Preserve each operand's logical type for LLK and typecast selection.
++  auto loadLogical = [&](Type type) -> Value {
++    Value value = rewriter.create<affine::AffineLoadOp>(
++        access.getLoc(), dst, dstAccessMap, dstAccessIndices);
++    if (value.getType() != type) {
++      value = rewriter.create<d2m::DstReinterpretCastOp>(access.getLoc(), type,
++                                                         value);
++    }
++    return value;
++  };
+   switch (access.kind) {
+   case DstAccessKind::AffineLoad: {
+-    auto dstLoad = rewriter.create<affine::AffineLoadOp>(
+-        access.getLoc(), dst, dstAccessMap, dstAccessIndices);
+     if (access.bcast.has_value()) {
+-      // Rewrites IR only; `access` is not mutated (bcast op is erased).
+       Operation *bcastOp = *access.bcast;
+-      cast<d2m::TileBcastOp>(bcastOp).getResult().replaceAllUsesWith(
+-          dstLoad.getResult());
++      Value result = cast<d2m::TileBcastOp>(bcastOp).getResult();
++      result.replaceAllUsesWith(loadLogical(result.getType()));
+       rewriter.eraseOp(bcastOp);
+     } else {
+-      rewriter.replaceOp(access.op, dstLoad.getResult());
++      rewriter.replaceOp(access.op,
++                         loadLogical(access.op->getResult(0).getType()));
+     }
+     break;
+   }
+-  case DstAccessKind::MemrefLoad: {
+-    auto dstLoad = rewriter.create<affine::AffineLoadOp>(
+-        access.getLoc(), dst, dstAccessMap, dstAccessIndices);
+-    rewriter.replaceOp(access.op, dstLoad.getResult());
++  case DstAccessKind::MemrefLoad:
++    rewriter.replaceOp(access.op,
++                       loadLogical(access.op->getResult(0).getType()));
+     break;
+-  }
+   default:
+     llvm_unreachable("replaceLoadWithDst expects a load access");
+   }
+@@ -1210,13 +1217,28 @@
+   case DstAccessKind::AffineStore: {
+     auto storeOp = cast<affine::AffineStoreOp>(access.op);
+     Value valueToStore = storeOp.getValue();
++    // Packing one result to multiple CBs must not recompute it in place for
++    // each destination. Check before inserting a physical-type reinterpret,
++    // which would otherwise hide the preceding store.
++    auto previous =
++        dyn_cast_or_null<affine::AffineStoreOp>(storeOp->getPrevNode());
++    Value previousValue = previous ? previous.getValue() : Value{};
++    if (auto cast = previousValue
++                        ? previousValue.getDefiningOp<DstReinterpretCastOp>()
++                        : DstReinterpretCastOp{}) {
++      previousValue = cast.getInput();
++    }
++    if (previous && previousValue == valueToStore &&
++        previous.getMemRef() == dst &&
++        previous.getAffineMap() == dstAccessMap &&
++        llvm::equal(previous.getMapOperands(), dstAccessIndices)) {
++      rewriter.eraseOp(storeOp);
++      break;
++    }
+     auto dstType = cast<MemRefType>(dst.getType());
+     if (valueToStore.getType() != dstType.getElementType()) {
+-      valueToStore =
+-          rewriter
+-              .create<d2m::DstReinterpretCastOp>(
+-                  storeOp.getLoc(), dstType.getElementType(), valueToStore)
+-              .getResult();
++      valueToStore = rewriter.create<DstReinterpretCastOp>(
++          storeOp.getLoc(), dstType.getElementType(), valueToStore);
+     }
+     rewriter.replaceOpWithNewOp<affine::AffineStoreOp>(
+         storeOp, valueToStore, dst, dstAccessMap, dstAccessIndices);
+diff --git a/lib/Dialect/D2M/Transforms/InsertScratchBuffers.cpp b/lib/Dialect/D2M/Transforms/InsertScratchBuffers.cpp
+--- a/lib/Dialect/D2M/Transforms/InsertScratchBuffers.cpp
++++ b/lib/Dialect/D2M/Transforms/InsertScratchBuffers.cpp
+@@ -115,33 +115,38 @@
+     return;
+   }
+ 
+-  MemRefType refMemRefType = findTiledReferenceType(genericOp);
+-  if (!refMemRefType) {
+-    return;
++  // Intermediate tiles may have different data formats after typecast fusion.
++  // A circular buffer has one format, so allocate separate scratch per type.
++  SmallVector<ttcore::TileType> tileTypes;
++  genericOp.getRegion(0).walk([&](linalg::GenericOp op) {
++    for (Value output : op.getDpsInits()) {
++      auto tile = getTileType(cast<MemRefType>(output.getType()));
++      if (tile && !llvm::is_contained(tileTypes, tile)) {
++        tileTypes.push_back(tile);
++      }
++    }
++  });
++  if (tileTypes.empty()) {
++    MemRefType reference = findTiledReferenceType(genericOp);
++    if (!reference) {
++      return;
++    }
++    tileTypes.push_back(getTileType(reference));
+   }
+ 
+-  ttcore::TileType tileType = getTileType(refMemRefType);
+-
+-  size_t numTiles = computeScratchNumTiles(tileType);
+-
+-  // Build scratch shard shape: [1, numTiles].
+-  SmallVector<int64_t> scratchShardShape = {1, static_cast<int64_t>(numTiles)};
+-
+   auto l1MemorySpace = ttcore::MemorySpaceAttr::get(
+       genericOp.getContext(), ttcore::MemorySpace::DeviceL1);
+-
+-  // Shard memref type for the scratch buffer inside the region.
+-  MemRefType scratchShardMemRefType = MemRefType::get(
+-      scratchShardShape, tileType, MemRefLayoutAttrInterface{}, l1MemorySpace);
+-
+-  // Insert memref.alloc + scratch_init at the start of the region body.
+   Block &block = genericOp.getRegion(0).front();
+   OpBuilder builder(&block, block.begin());
+-
+-  auto scratchAlloc = builder.create<memref::AllocOp>(genericOp.getLoc(),
+-                                                      scratchShardMemRefType);
+-  scratchAlloc->setAttr("d2m.scratch_buffer", builder.getUnitAttr());
+-  builder.create<ScratchInitOp>(genericOp.getLoc(), scratchAlloc.getResult());
++  for (auto tileType : tileTypes) {
++    SmallVector<int64_t> shape = {
++        1, static_cast<int64_t>(computeScratchNumTiles(tileType))};
++    auto type = MemRefType::get(shape, tileType, MemRefLayoutAttrInterface{},
++                                l1MemorySpace);
++    auto alloc = builder.create<memref::AllocOp>(genericOp.getLoc(), type);
++    alloc->setAttr("d2m.scratch_buffer", builder.getUnitAttr());
++    builder.create<ScratchInitOp>(genericOp.getLoc(), alloc.getResult());
++  }
+ }
+ 
+ static void addTopkIndexBuffers(GenericOp genericOp) {
+diff --git a/lib/Dialect/D2M/Transforms/LowerScratchAllocate.cpp b/lib/Dialect/D2M/Transforms/LowerScratchAllocate.cpp
+--- a/lib/Dialect/D2M/Transforms/LowerScratchAllocate.cpp
++++ b/lib/Dialect/D2M/Transforms/LowerScratchAllocate.cpp
+@@ -75,14 +75,24 @@
+       return success();
+     }
+ 
+-    // Find the scratch_init op in the region.
+-    ScratchInitOp scratchInit = nullptr;
+-    region.walk([&](ScratchInitOp op) { scratchInit = op; });
+-
+-    if (!scratchInit) {
+-      return success();
++    SmallVector<ScratchInitOp> scratchInits;
++    region.walk([&](ScratchInitOp op) { scratchInits.push_back(op); });
++    for (ScratchInitOp init : scratchInits) {
++      if (failed(processScratch(genericOp, region, init))) {
++        return failure();
++      }
++    }
++    bool unallocated = false;
++    region.walk([&](ScratchAllocateOp) { unallocated = true; });
++    if (unallocated) {
++      return genericOp.emitOpError(
++          "missing scratch buffer for intermediate type");
+     }
++    return success();
++  }
+ 
++  LogicalResult processScratch(GenericOp genericOp, Region &region,
++                               ScratchInitOp scratchInit) {
+     Value scratchMemRef = scratchInit.getScratch();
+     auto scratchMemRefType = mlir::cast<MemRefType>(scratchMemRef.getType());
+ 
+@@ -90,6 +100,9 @@
+     SmallVector<ScratchAllocationInfo> allocations;
+     region.walk([&](ScratchAllocateOp allocOp) {
+       auto memrefType = mlir::cast<MemRefType>(allocOp.getResult().getType());
++      if (memrefType.getElementType() != scratchMemRefType.getElementType()) {
++        return;
++      }
+       assert(!llvm::is_contained(memrefType.getShape(), ShapedType::kDynamic) &&
+              "scratch memrefs must be static");
+       allocations.push_back(
+diff --git a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp
+--- a/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp
++++ b/lib/Dialect/D2M/Transforms/InsertDstRegisterAccess/Unscheduled.cpp
+@@ -185,13 +185,16 @@
+     for (auto *user : computeOp->getUsers()) {
+       if (auto potentialStore = mlir::dyn_cast<affine::AffineStoreOp>(user);
+           notDstMemspace(potentialStore)) {
+-        TT_assertv(!dstAllocator.didStoreToDst(),
+-                   "Multiple stores from last op to dst not supported");
++        TT_assertv(!dstAllocator.didStoreToDst() ||
++                       producedDstSlice.has_value(),
++                   "Expected an allocated result for repeated stores");
+ 
+         const bool rhsIsScalar = computeOp.isScalarOperand(1);
+ 
+         int dstSlice = -1;
+-        if (dstRegInPlace || rhsIsScalar) {
++        if (producedDstSlice) {
++          dstSlice = *producedDstSlice;
++        } else if (dstRegInPlace || rhsIsScalar) {
+           bool isUnaryOp = computeOp->getNumOperands() == 1;
+           bool isTileMatmul = mlir::isa<d2m::TileMatmulOp>(computeOp);
+           bool isReduction = isTileReductionOp(computeOp);
+@@ -210,13 +213,16 @@
+         collectDstStoreAccess(potentialStore, copyInfos, dstSlice,
+                               outermostInnerComputeLoop);
+       } else if (auto scratchStore = mlir::dyn_cast<memref::StoreOp>(user)) {
+-        TT_assertv(!dstAllocator.didStoreToDst(),
+-                   "Multiple stores from last op to dst not supported");
++        TT_assertv(!dstAllocator.didStoreToDst() ||
++                       producedDstSlice.has_value(),
++                   "Expected an allocated result for repeated stores");
+ 
+         const bool rhsIsScalar = computeOp.isScalarOperand(1);
+ 
+         int dstSlice = -1;
+-        if (dstRegInPlace || rhsIsScalar) {
++        if (producedDstSlice) {
++          dstSlice = *producedDstSlice;
++        } else if (dstRegInPlace || rhsIsScalar) {
+           bool isUnaryOp = computeOp->getNumOperands() == 1;
+           bool isTileMatmul = mlir::isa<d2m::TileMatmulOp>(computeOp);
+           bool isReduction = isTileReductionOp(computeOp);
+@@ -355,9 +361,18 @@
+           return WalkResult::advance();
+         }
+ 
+-        // Skip scheduled loops -- those are handled by the scheduled pass.
++        // Tile broadcasts produce DST intermediates, not ordinary CB loads.
++        // Use this allocator's intermediate lifetime tracking even when the
++        // loop scheduler marked the surrounding elementwise loop scheduled.
++        // The scheduled allocator assumes binary operands have input slots.
++        bool hasBroadcast =
++            loopOp->walk([](TileBcastOp) { return WalkResult::interrupt(); })
++                .wasInterrupted();
+         if (loopOp->hasAttr("d2m.scheduled")) {
+-          return WalkResult::advance();
++          if (!hasBroadcast) {
++            return WalkResult::advance();
++          }
++          loopOp->removeAttr("d2m.scheduled");
+         }
+ 
+         if (loopOp->hasAttr("d2m.dst_access_inserted")) {
+diff --git a/lib/Dialect/TTIR/Transforms/MultiDeviceTensorAnnotation.cpp b/lib/Dialect/TTIR/Transforms/MultiDeviceTensorAnnotation.cpp
+--- a/lib/Dialect/TTIR/Transforms/MultiDeviceTensorAnnotation.cpp
++++ b/lib/Dialect/TTIR/Transforms/MultiDeviceTensorAnnotation.cpp
+@@ -30,6 +30,12 @@
+     assert(valueTensorMeshAttr == tensorMeshAttr && "MeshAttr mismatch");
+     return;
+   }
++  // The D2M frontend also runs on mixed TTNN/TTIR modules. Existing concrete
++  // layouts already encode device placement; replacing them here would change
++  // a host function's block arguments without changing its signature.
++  if (type.getEncoding()) {
++    return;
++  }
+   mlir::Type elementType = type.getElementType();
+   llvm::ArrayRef<int64_t> shape = type.getShape();
+   value.setType(
+diff --git a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
+--- a/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
++++ b/lib/Conversion/TTNNToTTIR/TTNNToTTIRPatterns.cpp
+@@ -17,6 +17,8 @@
+ #include "mlir/Transforms/DialectConversion.h"
+ #include "llvm/ADT/STLExtras.h"
+ 
++#include <type_traits>
++
+ namespace {
+ 
+ template <typename SrcOp, typename DestOp>
+@@ -31,8 +33,13 @@
+     auto outputType = mlir::cast<mlir::RankedTensorType>(
+         this->getTypeConverter()->convertType(srcOp.getResult().getType()));
+ 
+-    rewriter.replaceOpWithNewOp<DestOp>(srcOp, outputType,
+-                                        adaptor.getOperands());
++    auto converted = rewriter.replaceOpWithNewOp<DestOp>(srcOp, outputType,
++                                                         adaptor.getOperands());
++    if constexpr (std::is_same_v<DestOp, mlir::tt::ttir::TypecastOp>) {
++      // These casts have already passed TTNN's semantic checks. Do not lose
++      // truncation or narrowing when the D2M frontend canonicalizes them again.
++      converted.setConservativeFolding(true);
++    }
+ 
+     return mlir::success();
+   }
+@@ -242,12 +249,29 @@
+     auto outputType = mlir::cast<mlir::RankedTensorType>(
+         this->getTypeConverter()->convertType(srcOp.getResult().getType()));
+ 
++    // Optimizer-inserted specs can change both dtype and layout. A layout
++    // view cannot implement a numeric conversion; materialize that first.
++    mlir::Value input = adaptor.getInput();
++    auto inputType = mlir::cast<mlir::RankedTensorType>(input.getType());
++    if (inputType.getElementType() != outputType.getElementType()) {
++      auto layout = mlir::tt::ttnn::TTNNLayoutAttr::Builder(inputType)
++                        .setElementType(outputType.getElementType())
++                        .setLayout(mlir::cast<mlir::tt::ttnn::TTNNLayoutAttr>(
++                                       inputType.getEncoding())
++                                       .getLayout())
++                        .build();
++      auto castType = mlir::RankedTensorType::get(
++          inputType.getShape(), outputType.getElementType(), layout);
++      input = rewriter.create<mlir::tt::ttir::TypecastOp>(
++          srcOp.getLoc(), castType, input, /*conservativeFolding=*/true);
++    }
++
+     auto emptyOp = rewriter.create<mlir::tt::ttir::EmptyOp>(
+         srcOp.getLoc(), outputType.getShape(), outputType.getElementType(),
+         outputType.getEncoding());
+ 
+     rewriter.replaceOpWithNewOp<mlir::tt::ttir::ToLayoutOp>(
+-        srcOp, mlir::TypeRange{outputType}, adaptor.getInput(), emptyOp,
++        srcOp, mlir::TypeRange{outputType}, input, emptyOp,
+         /*layout=*/mlir::tt::ttcore::MetalLayoutAttr{});
+ 
+     return mlir::success();
+@@ -398,8 +422,7 @@
+       TTNNToTTIRElementwiseConversionPattern<mlir::tt::ttnn::BitwiseXorOp,
+                                              mlir::tt::ttir::BitwiseXorOp>,
+       TTNNToTTIRElementwiseConversionPattern<
+-          mlir::tt::ttnn::BitwiseRightShiftOp,
+-          mlir::tt::ttir::RightShiftOp>,
++          mlir::tt::ttnn::BitwiseRightShiftOp, mlir::tt::ttir::RightShiftOp>,
+       TTNNToTTIRElementwiseConversionPattern<
+           mlir::tt::ttnn::LogicalRightShiftOp,
+           mlir::tt::ttir::LogicalRightShiftOp>,
+diff --git a/lib/Dialect/TTNN/Analysis/LegalTensorLayoutAnalysis.cpp b/lib/Dialect/TTNN/Analysis/LegalTensorLayoutAnalysis.cpp
+--- a/lib/Dialect/TTNN/Analysis/LegalTensorLayoutAnalysis.cpp
++++ b/lib/Dialect/TTNN/Analysis/LegalTensorLayoutAnalysis.cpp
+@@ -36,6 +36,11 @@
+     return true;
+   }
+ 
++  // Empty tensors have no nonempty shard grid. Metal's shard validation
++  // divides by the shard extent, so reject these before querying the model.
++  if (tensorType.getNumElements() == 0) {
++    return false;
++  }
+   llvm::ArrayRef<int64_t> tensorShape = tensorType.getShape();
+ 
+   if (!op_model::isLayoutLegalForTensorShape(tensorShape, layout, maxGrid)) {
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -493,13 +493,9 @@
+     devicePm.addPass(createTTNNSetComputeKernelConfig(setConfigOptions));
+ 
+     if (options.enableCreateD2MSubgraphs) {
+-      if (!options.optimizerPassEnabled) {
+-        llvm::errs()
+-            << "WARNING: D2M subgraph creation pass only supported with "
+-               "Optimizer "
+-               "enabled. Automatically enabling Optimizer as a dependency.\n";
+-      }
+-      options.optimizerPassEnabled = true;
++      // D2M can lower the default TTNN layouts as well as optimized ones.
++      // Preserve the caller's optimization level: enabling global layout
++      // propagation here also changes unrelated TTNN operations.
+       devicePm.addPass(tt::ttnn::createTTNNCreateD2MSubgraphs());
+     }
+ 
+diff --git a/lib/Dialect/TTNN/Utils/TransformUtils.cpp b/lib/Dialect/TTNN/Utils/TransformUtils.cpp
+--- a/lib/Dialect/TTNN/Utils/TransformUtils.cpp
++++ b/lib/Dialect/TTNN/Utils/TransformUtils.cpp
+@@ -39,6 +39,15 @@
+   Block *block = op->getBlock();
+   for (auto &op : block->getOperations()) {
+     if (auto deviceOp = dyn_cast<ttnn::GetDeviceOp>(op)) {
++      // Inlining a D2M subgraph can leave this handle after earlier layout
++      // conversions. Keep it at the block entry so every caller is dominated.
++      if (rewriter.getInsertionBlock() == block &&
++          rewriter.getInsertionPoint() == deviceOp->getIterator()) {
++        rewriter.setInsertionPointAfter(deviceOp);
++      }
++      if (&block->front() != deviceOp.getOperation()) {
++        rewriter.moveOpBefore(deviceOp, &block->front());
++      }
+       return deviceOp;
+     }
+   }
+@@ -54,6 +63,15 @@
+   mlir::Operation *parentOp = block->getParentOp();
+   for (auto &op : block->getOperations()) {
+     if (auto deviceOp = dyn_cast<ttnn::GetDeviceOp>(op)) {
++      // Inlining a D2M subgraph can leave this handle after earlier layout
++      // conversions. Keep it at the block entry so every caller is dominated.
++      if (rewriter.getInsertionBlock() == block &&
++          rewriter.getInsertionPoint() == deviceOp->getIterator()) {
++        rewriter.setInsertionPointAfter(deviceOp);
++      }
++      if (&block->front() != deviceOp.getOperation()) {
++        rewriter.moveOpBefore(deviceOp, &block->front());
++      }
+       return deviceOp;
+     }
+   }
+diff --git a/include/ttmlir/Support/IRHasher.h b/include/ttmlir/Support/IRHasher.h
+--- a/include/ttmlir/Support/IRHasher.h
++++ b/include/ttmlir/Support/IRHasher.h
+@@ -7,6 +7,7 @@
+ 
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/IR/BuiltinOps.h"
++#include "mlir/IR/SymbolTable.h"
+ #include "mlir/Interfaces/SideEffectInterfaces.h"
+ #include "llvm/ADT/DenseMap.h"
+ #include "llvm/ADT/STLExtras.h"
+@@ -66,6 +67,23 @@
+ 
+   func.print(os, flags);
+ 
++  // Generic programs reference kernel functions through attributes rather
++  // than func.call. Their bodies must participate in the cache key too:
++  // generated symbol names can be identical for different computations.
++  if (auto uses = SymbolTable::getSymbolUses(func)) {
++    for (const SymbolTable::SymbolUse &use : *uses) {
++      if (isa<func::CallOp>(use.getUser())) {
++        continue; // Already included through callee_hash above.
++      }
++      if (auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
++              use.getUser(), use.getSymbolRef());
++          callee && callee != func) {
++        os << "\nreferenced_function " << use.getSymbolRef() << ' '
++           << hashFuncOp(callee);
++      }
++    }
++  }
++
+   auto digest = llvm::SHA256::hash(llvm::ArrayRef<uint8_t>(
+       reinterpret_cast<const uint8_t *>(irBuffer.data()), irBuffer.size()));
+ 
