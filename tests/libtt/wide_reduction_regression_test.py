@@ -5,11 +5,9 @@ axis to the front and reduce over it 32 times per mask. On TT a [vocab, batch]
 tensor has one tile column, so that reduction, and even the elementwise ops
 feeding it, run on one core: 2.9 ms per search step against 0.5 ms on
 [batch, vocab]. The compiler rebuilds such a reduction chain on the transposed
-shape (tt_mlir_wide_reductions.patch), consuming the transpose that produced
-the operand instead of adding one. [batch, vocab] still fills only `batch` of
-each tile's 32 rows, so when the vocab splits into chunks of C columns the
-chain runs on [batch, vocab / C, C] (full tiles) and reduces the last two
-dimensions; C is the widest multiple of 32 up to about sqrt(vocab).
+data in full tiles, [batch, vocab / C, C], and reduces the last two dimensions
+(tt_mlir_wide_reductions.patch); C is the widest 32 * 2^k that divides the
+vocab up to about sqrt(vocab). Vocabs that do not split are left alone.
 
 Wide softmax rows are the other sampler cost: TTNN's softmax parallelizes over
 rows, so two rows of a vocabulary take 12 ms where the decomposition takes 1 ms.
@@ -25,7 +23,8 @@ import pytest
 from jax import lax
 
 # Vocab sizes and the chunked shape the search reduces: 2048 splits into 32
-# columns (64 > sqrt(2048)), 16384 into 128, and 2000 does not split.
+# columns (64 > sqrt(2048)), 16384 into 128, and 2000 does not split (the
+# search runs as written).
 WIDTHS = {2048: "2x64x32", 16384: "2x128x128", 2000: None}
 
 
@@ -88,17 +87,14 @@ def test_search_reduces_over_wide_rows(trace, width, tmp_path):
     # larger float.
     assert np.all((source > threshold[:, None]).sum(axis=1) >= k)
     assert np.all((source > np.nextafter(threshold, np.inf)[:, None]).sum(axis=1) < k)
+    chunked = WIDTHS[width]
+    if chunked is None:
+        return
     ir = _runtime_ir(tmp_path)
-    # The vocab axis stays last: no transpose survives, and every reduction
-    # over it is a last-dim reduction.
+    # No transpose survives, and the search sums full tiles.
     assert "ttnn.permute" not in ir and "ttnn.transpose" not in ir
     assert re.search(r'"ttnn\.sum".*dim_arg = \[0 : i32\]', ir) is None
-    # The search sums full tiles when the vocab splits into chunks.
-    chunked = WIDTHS[width]
-    if chunked is not None:
-        assert chunked in _search_sums(ir)
-    else:
-        assert f"2x{width}" in _search_sums(ir)
+    assert chunked in _search_sums(ir)
 
 
 @pytest.mark.parametrize("width", WIDTHS)

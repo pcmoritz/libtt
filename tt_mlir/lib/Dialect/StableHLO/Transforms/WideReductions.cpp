@@ -1,47 +1,45 @@
 // SPDX-FileCopyrightText: © 2026 libtt authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Reductions over the rows of a tall, thin tensor become reductions over the
-// columns of its transpose.
+// Reductions over the rows of a tall, thin tensor become reductions over full
+// tiles of its transpose.
 //
 // A [H, W] tensor with W within one tile column has H / 32 tile rows and a
 // single tile column. Reducing it over H serializes on that column (one core
 // walks every tile row), and even the elementwise ops that feed the reduction
-// run about three times slower on that layout than on [W, H]. JAX code that
-// reduces repeatedly, such as the binary searches behind top-k and top-p
-// masking, swaps the axes up front precisely to put the reduction on the
-// leading axis, which is the right call on TPU and the wrong one here.
+// run on that one column. JAX code that reduces repeatedly, such as the binary
+// searches behind top-k and top-p masking, swaps the axes up front precisely
+// to put the reduction on the leading axis, which is the right call on TPU and
+// the wrong one here.
 //
-// The rewrite transposes the reduction's operand chain back: the chain of
-// elementwise ops, broadcasts and constants feeding the reduce is rebuilt on
-// [W, H], and the reduce goes over the last dimension. It applies only when
-// every tensor at the leaves of that chain is itself a transpose, which the
-// rebuilt chain then consumes directly, so no transpose is ever added, only
-// removed. A leaf that is a loop-carried value the loop never changes is first
-// replaced by the value the loop was entered with, which exposes the transpose
-// behind it.
+// The rewrite rebuilds the chain of elementwise ops, broadcasts and constants
+// feeding such a reduce on [W, H / C, C]: the transposed data, row-major, in
+// full tiles (plain [W, H] would fill only W of each tile's 32 rows). The
+// reduce goes over the last two dimensions. Each transpose at a leaf of the
+// chain becomes a reshape of its operand where the transpose was, so a
+// loop-invariant leaf is reshaped once before the loop. C is the widest
+// 32 * 2^k that divides H up to about sqrt(H): TTNN reduces the two dimensions
+// in turn, and each stage walks one of them on few cores. For [2, 151936]
+// (C = 128) a search step's elementwise ops take about 13 us each instead of
+// 105, and its reduction about 26 us. Chains whose H does not split are left
+// alone.
 //
-// [W, H] still fills only W of each tile's 32 rows. When H splits into chunks
-// of C columns (C a multiple of 32), the chain is rebuilt on [W, H / C, C]
-// instead, the same row-major data in full tiles, and the reduce goes over the
-// last two dimensions. Each transpose at a leaf becomes a reshape of its
-// operand where the transpose was, so a loop-invariant leaf is reshaped once
-// before the loop. C is the widest such chunk up to about sqrt(H): TTNN
-// reduces the two dimensions in turn, and each stage walks one of them on few
-// cores. For [2, 151936] (C = 128) a search step's elementwise ops take about
-// 13 us each instead of 105, and its reduction about 26 us.
+// StableHLO's import canonicalizations run alongside: they turn a loop carry
+// that the body returns unchanged into a capture of the value the loop was
+// entered with, which is what exposes the transpose behind a loop-invariant
+// leaf.
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "shardy/dialect/sdy/ir/dialect.h"
 #include "stablehlo/dialect/StablehloOps.h"
+#include "stablehlo/transforms/optimization/Passes.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/SetVector.h"
 
 #include <cstdint>
-#include <optional>
 
 namespace mlir::tt {
 namespace {
@@ -52,9 +50,9 @@ namespace shlo = mlir::stablehlo;
 // enough for the column to matter.
 constexpr int64_t kThinWidth = 32;
 constexpr int64_t kTallHeight = 1024;
-// How far up the operand chain the rebuild follows elementwise ops.
+// How far up the operand chain the rewrite follows elementwise ops.
 constexpr unsigned kMaxChainDepth = 12;
-// Dense chunks are multiples of a tile's width.
+// Chunks are multiples of a tile's width.
 constexpr int64_t kTileWidth = 32;
 
 bool isTallThin(RankedTensorType type) {
@@ -62,8 +60,8 @@ bool isTallThin(RankedTensorType type) {
          type.getDimSize(1) <= kThinWidth && type.getDimSize(0) >= kTallHeight;
 }
 
-// The chunk width for rebuilding a [H, W] chain on [W, H / chunk, chunk], or
-// 0 when H does not split into tile-wide chunks.
+// The chunk width C for [W, H / C, C], or 0 when H does not split into
+// tile-wide chunks.
 int64_t denseChunk(int64_t height) {
   int64_t chunk = 0;
   for (int64_t candidate = kTileWidth; candidate * candidate <= height;
@@ -75,160 +73,126 @@ int64_t denseChunk(int64_t height) {
   return chunk;
 }
 
-// [H, W] -> [W, H], or [W, H / chunk, chunk] for a nonzero chunk.
-RankedTensorType transposedType(RankedTensorType type, int64_t chunk) {
-  int64_t height = type.getDimSize(0);
-  int64_t width = type.getDimSize(1);
-  if (chunk == 0) {
-    return RankedTensorType::get({width, height}, type.getElementType());
+// [H, W] -> [W, H / chunk, chunk].
+RankedTensorType chunkedType(RankedTensorType type, int64_t chunk) {
+  return RankedTensorType::get(
+      {type.getDimSize(1), type.getDimSize(0) / chunk, chunk},
+      type.getElementType());
+}
+
+bool isReplicatedConstraint(sdy::ShardingConstraintOp constraint) {
+  sdy::TensorShardingAttr sharding = constraint.getSharding();
+  return sharding.isFullyReplicated() && sharding.isFullyClosed() &&
+         sharding.getUnreducedAxes().empty();
+}
+
+// Collects the values of the chain feeding a reduce, operands before users,
+// each once. The chain may hold swap-transposes (its leaves), broadcasts that
+// are constant along H (a per-row threshold, say, since H is split), splat
+// constants, closed replicated sharding constraints (JAX leaves one after most
+// ops under a shard_map), and elementwise ops over such values. Returns false
+// for anything else.
+bool collectChain(Value value, unsigned depth,
+                  llvm::SetVector<Value> &chain) {
+  if (chain.contains(value)) {
+    return true;
   }
-  return RankedTensorType::get({width, height / chunk, chunk},
-                               type.getElementType());
-}
-
-bool isSwap(shlo::TransposeOp transpose) {
-  auto permutation = transpose.getPermutation();
-  return permutation.size() == 2 && permutation[0] == 1 && permutation[1] == 0;
-}
-
-// Whether `value` can be rebuilt on the transposed shape without adding a
-// transpose: it is a transpose (consumed directly), a broadcast of something
-// no larger than rank 2 (re-broadcast), a splat constant, a replicated
-// sharding constraint on such a value (JAX leaves one after most ops under a
-// shard_map; the constraint is kept, since replication is the same on either
-// shape), or an elementwise op over such values. The chunked shape also needs
-// every broadcast to be constant along H (a per-row threshold, say), since H
-// is split there.
-bool isRebuildable(Value value, unsigned depth, bool chunked) {
   auto type = dyn_cast<RankedTensorType>(value.getType());
-  if (!type || type.getRank() != 2) {
-    return false;
-  }
   Operation *op = value.getDefiningOp();
-  if (!op) {
+  if (!type || type.getRank() != 2 || !op) {
     return false;
   }
   if (auto transpose = dyn_cast<shlo::TransposeOp>(op)) {
-    return isSwap(transpose);
-  }
-  if (auto broadcast = dyn_cast<shlo::BroadcastInDimOp>(op)) {
-    if (chunked) {
-      auto operandType = cast<RankedTensorType>(broadcast.getOperand().getType());
-      return llvm::all_of(
-          llvm::enumerate(broadcast.getBroadcastDimensions()), [&](auto dim) {
-            return dim.value() == 1 ||
-                   operandType.getDimSize(dim.index()) == 1;
-          });
+    if (!llvm::equal(transpose.getPermutation(), ArrayRef<int64_t>{1, 0})) {
+      return false;
     }
-    return cast<RankedTensorType>(broadcast.getOperand().getType()).getRank() <=
-           2;
-  }
-  if (auto constant = dyn_cast<shlo::ConstantOp>(op)) {
-    return constant.getValue().isSplat();
-  }
-  if (auto constraint = dyn_cast<sdy::ShardingConstraintOp>(op)) {
-    return constraint.getSharding().isFullyReplicated() &&
-           isRebuildable(constraint.getInput(), depth, chunked);
-  }
-  if (depth == 0) {
-    return false;
-  }
-  bool elementwise = op->hasTrait<OpTrait::Elementwise>() ||
-                     isa<shlo::CompareOp, shlo::SelectOp>(op);
-  if (!elementwise || op->getNumResults() != 1 || op->getNumRegions() != 0) {
-    return false;
-  }
-  return llvm::all_of(op->getOperands(), [&](Value operand) {
-    return cast<RankedTensorType>(operand.getType()).getShape() ==
-               type.getShape() &&
-           isRebuildable(operand, depth - 1, chunked);
-  });
-}
-
-// `input` reshaped to `type` right after `transpose`, reusing such a reshape
-// that every use of the transpose already sees.
-Value chunkedLeaf(PatternRewriter &rewriter, shlo::TransposeOp transpose,
-                  RankedTensorType type) {
-  Value input = transpose.getOperand();
-  for (Operation *user : input.getUsers()) {
-    auto reshape = dyn_cast<shlo::ReshapeOp>(user);
-    if (reshape && reshape.getType() == type &&
-        reshape->getBlock() == transpose->getBlock() &&
-        (reshape->isBeforeInBlock(transpose) ||
-         reshape == transpose->getNextNode())) {
-      return reshape;
+  } else if (auto broadcast = dyn_cast<shlo::BroadcastInDimOp>(op)) {
+    auto operandType = cast<RankedTensorType>(broadcast.getOperand().getType());
+    for (auto [index, dim] :
+         llvm::enumerate(broadcast.getBroadcastDimensions())) {
+      if (dim == 0 && operandType.getDimSize(index) != 1) {
+        return false;
+      }
+    }
+  } else if (auto constant = dyn_cast<shlo::ConstantOp>(op)) {
+    if (!constant.getValue().isSplat()) {
+      return false;
+    }
+  } else if (auto constraint = dyn_cast<sdy::ShardingConstraintOp>(op)) {
+    if (!isReplicatedConstraint(constraint) ||
+        !collectChain(constraint.getInput(), depth, chain)) {
+      return false;
+    }
+  } else {
+    bool elementwise = op->hasTrait<OpTrait::Elementwise>() ||
+                       isa<shlo::CompareOp, shlo::SelectOp>(op);
+    if (depth == 0 || !elementwise || op->getNumResults() != 1 ||
+        op->getNumRegions() != 0) {
+      return false;
+    }
+    for (Value operand : op->getOperands()) {
+      if (cast<RankedTensorType>(operand.getType()).getShape() !=
+              type.getShape() ||
+          !collectChain(operand, depth - 1, chain)) {
+        return false;
+      }
     }
   }
-  OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointAfter(transpose);
-  return rewriter.create<shlo::ReshapeOp>(transpose.getLoc(), type, input);
+  chain.insert(value);
+  return true;
 }
 
-// Builds `value` on the transposed shape, chunked when `chunk` is nonzero;
-// see isRebuildable for the cases.
-Value rebuildTransposed(PatternRewriter &rewriter, Value value, int64_t chunk) {
+// Builds `value` on the chunked shape, its operands already in `mapping`.
+Value rebuildChunked(PatternRewriter &rewriter, Value value, int64_t chunk,
+                     IRMapping &mapping) {
   Operation *op = value.getDefiningOp();
-  auto type = cast<RankedTensorType>(value.getType());
-  RankedTensorType rebuiltType = transposedType(type, chunk);
+  RankedTensorType type =
+      chunkedType(cast<RankedTensorType>(value.getType()), chunk);
   if (auto transpose = dyn_cast<shlo::TransposeOp>(op)) {
-    if (chunk == 0) {
-      return transpose.getOperand();
-    }
-    return chunkedLeaf(rewriter, transpose, rebuiltType);
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointAfter(transpose);
+    return rewriter.create<shlo::ReshapeOp>(transpose.getLoc(), type,
+                                            transpose.getOperand());
   }
   if (auto broadcast = dyn_cast<shlo::BroadcastInDimOp>(op)) {
-    // W is dimension 1 of [H, W] and 0 of either rebuilt shape, H is 0 and 1
-    // (when chunked, only operand dimensions of size 1 map to H).
+    // W is dimension 1 of [H, W] and 0 of [W, H / C, C]; operand dimensions
+    // of size 1 that went to H go to H / C.
     SmallVector<int64_t> dims;
     for (int64_t dim : broadcast.getBroadcastDimensions()) {
       dims.push_back(1 - dim);
     }
     return rewriter.create<shlo::BroadcastInDimOp>(
-        op->getLoc(), rebuiltType, broadcast.getOperand(),
+        op->getLoc(), type, broadcast.getOperand(),
         rewriter.getDenseI64ArrayAttr(dims));
   }
   if (auto constant = dyn_cast<shlo::ConstantOp>(op)) {
     auto splat = cast<SplatElementsAttr>(constant.getValue());
     return rewriter.create<shlo::ConstantOp>(
         op->getLoc(),
-        SplatElementsAttr::get(rebuiltType, splat.getSplatValue<Attribute>()));
+        SplatElementsAttr::get(type, splat.getSplatValue<Attribute>()));
   }
   if (auto constraint = dyn_cast<sdy::ShardingConstraintOp>(op)) {
-    sdy::TensorShardingAttr sharding = constraint.getSharding();
-    if (chunk != 0) {
-      bool closed = llvm::all_of(sharding.getDimShardings(),
-                                 [](sdy::DimensionShardingAttr dim) {
-                                   return dim.getIsClosed();
-                                 });
-      sharding = sdy::TensorShardingAttr::getFullyReplicated(
-          op->getContext(), rebuiltType.getRank(), sharding.getMeshOrRef(),
-          closed);
-    }
     return rewriter.create<sdy::ShardingConstraintOp>(
-        op->getLoc(), rebuildTransposed(rewriter, constraint.getInput(), chunk),
-        sharding);
+        op->getLoc(), mapping.lookup(constraint.getInput()),
+        sdy::TensorShardingAttr::getFullyReplicated(
+            op->getContext(), type.getRank(),
+            constraint.getSharding().getMeshOrRef(), /*isClosed=*/true));
   }
-  SmallVector<Value> operands;
-  for (Value operand : op->getOperands()) {
-    operands.push_back(rebuildTransposed(rewriter, operand, chunk));
-  }
-  Operation *rebuilt = rewriter.clone(*op);
-  rebuilt->setOperands(operands);
-  rebuilt->getResult(0).setType(rebuiltType);
+  Operation *rebuilt = rewriter.clone(*op, mapping);
+  rebuilt->getResult(0).setType(type);
   return rebuilt->getResult(0);
 }
 
-// reduce(dims = [0]) of a tall, thin chain -> reduce(dims = [1, 2]) of the
-// chain rebuilt on the chunked transposed shape, or reduce(dims = [1]) of it
-// rebuilt on the transposed shape.
+// reduce(dims = [0]) of a [H, W] chain -> reduce(dims = [1, 2]) of the chain
+// rebuilt on [W, H / C, C].
 class TallReductionToWide : public OpRewritePattern<shlo::ReduceOp> {
 public:
   using OpRewritePattern<shlo::ReduceOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(shlo::ReduceOp reduceOp,
                                 PatternRewriter &rewriter) const override {
-    if (reduceOp.getInputs().size() != 1 || reduceOp.getDimensions().size() != 1 ||
-        reduceOp.getDimensions()[0] != 0) {
+    if (reduceOp.getInputs().size() != 1 ||
+        !llvm::equal(reduceOp.getDimensions(), ArrayRef<int64_t>{0})) {
       return failure();
     }
     Value input = reduceOp.getInputs().front();
@@ -237,20 +201,18 @@ public:
       return failure();
     }
     int64_t chunk = denseChunk(inputType.getDimSize(0));
-    if (chunk != 0 && !isRebuildable(input, kMaxChainDepth, true)) {
-      chunk = 0;
-    }
-    if (chunk == 0 && !isRebuildable(input, kMaxChainDepth, false)) {
+    llvm::SetVector<Value> chain;
+    if (chunk == 0 || !collectChain(input, kMaxChainDepth, chain)) {
       return failure();
     }
-    Value transposed = rebuildTransposed(rewriter, input, chunk);
-    SmallVector<int64_t> dims = {1};
-    if (chunk != 0) {
-      dims.push_back(2);
+    IRMapping mapping;
+    for (Value value : chain) {
+      mapping.map(value, rebuildChunked(rewriter, value, chunk, mapping));
     }
     auto rebuilt = rewriter.create<shlo::ReduceOp>(
-        reduceOp.getLoc(), reduceOp.getResultTypes(), ValueRange{transposed},
-        reduceOp.getInitValues(), rewriter.getDenseI64ArrayAttr(dims));
+        reduceOp.getLoc(), reduceOp.getResultTypes(),
+        ValueRange{mapping.lookup(input)}, reduceOp.getInitValues(),
+        rewriter.getDenseI64ArrayAttr({1, 2}));
     rewriter.inlineRegionBefore(reduceOp.getBody(), rebuilt.getBody(),
                                 rebuilt.getBody().end());
     rewriter.replaceOp(reduceOp, rebuilt.getResults());
@@ -258,40 +220,12 @@ public:
   }
 };
 
-// A loop operand that the body returns unchanged is the same value on every
-// iteration. Uses of its block arguments become uses of the value the loop was
-// entered with, so what feeds it (for example a transpose) is visible inside
-// the body.
-class ReplaceInvariantCarries : public OpRewritePattern<shlo::WhileOp> {
-public:
-  using OpRewritePattern<shlo::WhileOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(shlo::WhileOp whileOp,
-                                PatternRewriter &rewriter) const override {
-    Block &body = whileOp.getBody().front();
-    Block &cond = whileOp.getCond().front();
-    auto returnOp = cast<shlo::ReturnOp>(body.getTerminator());
-    bool changed = false;
-    for (auto [index, init] : llvm::enumerate(whileOp.getOperands())) {
-      BlockArgument bodyArg = body.getArgument(index);
-      BlockArgument condArg = cond.getArgument(index);
-      if (returnOp.getOperand(index) != bodyArg ||
-          (bodyArg.use_empty() && condArg.use_empty())) {
-        continue;
-      }
-      rewriter.replaceAllUsesExcept(bodyArg, init, returnOp);
-      rewriter.replaceAllUsesWith(condArg, init);
-      changed = true;
-    }
-    return success(changed);
-  }
-};
-
 } // namespace
 
 void populateWideReductionPatterns(RewritePatternSet &patterns) {
-  patterns.add<TallReductionToWide, ReplaceInvariantCarries>(
-      patterns.getContext());
+  patterns.add<TallReductionToWide>(patterns.getContext());
+  mlir::stablehlo::populateStablehloHloImportCanonicalizationPatterns(
+      patterns.getContext(), &patterns);
 }
 
 } // namespace mlir::tt
