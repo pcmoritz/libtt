@@ -40,7 +40,9 @@ def test_multiply_and_typecast_after_a_reshape_run_before_it(tmp_path):
         return (jnp.exp(v).reshape(1, 10240) * jnp.asarray(w)).astype(jnp.bfloat16)
 
     actual, ir = compile_and_run(fn, tmp_path, v)
-    assert result_shapes(ir, "multiply") == ["1x4x2560"]
+    # In [1, 4, 2560]'s 80 tiles, or in dense rows ([1, 4, 80, 32], 12 tiles;
+    # dense_rows_test.py), not [1, 10240]'s 320.
+    assert result_shapes(ir, "multiply") in (["1x4x2560"], ["1x4x80x32"])
     # The cast to BF16 folds into the multiply's output.
     assert result_shapes(ir, "typecast") == []
     want = (np.exp(v).reshape(1, 10240) * w).astype(jnp.bfloat16).astype(np.float32)
