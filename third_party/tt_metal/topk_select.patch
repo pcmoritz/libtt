@@ -1,24 +1,3 @@
-diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.hpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.hpp
---- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.hpp
-+++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.hpp
-@@ -37,7 +37,16 @@
-             tensor_return_value_t& tensor_return_value);
-     };
- 
--    using program_factory_t = std::variant<TopKSingleCoreProgramFactory, TopKMultiCoreProgramFactory>;
-+    // Up to two tile rows and wide rows: a selection on the data-movement cores (topk_select.hpp).
-+    struct TopKSelectProgramFactory {
-+        static tt::tt_metal::ProgramDescriptor create_descriptor(
-+            const operation_attributes_t& operation_attributes,
-+            const tensor_args_t& tensor_args,
-+            tensor_return_value_t& tensor_return_value);
-+    };
-+
-+    using program_factory_t =
-+        std::variant<TopKSingleCoreProgramFactory, TopKMultiCoreProgramFactory, TopKSelectProgramFactory>;
- 
-     static program_factory_t select_program_factory(const operation_attributes_t&, const tensor_args_t&);
-     static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
@@ -30,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.
  #include "ttnn/operations/reduction/topk/device/topk_utils.hpp"
  
  #include "ttnn/device_operation.hpp"
-@@ -23,6 +24,19 @@
+@@ -23,6 +24,19 @@ using namespace tt::tt_metal;
  namespace ttnn::prim {
  
  namespace {
@@ -50,7 +29,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.
  // The index dtype the op runs at: index CB, generated iota and output tensor all follow it.
  // A preallocated indices output pins it; a 32-bit indices_tensor widens it. A UINT16
  // indices_tensor never narrows it -- validate rejects one narrower than the input requires.
-@@ -98,6 +112,10 @@
+@@ -98,6 +112,10 @@ TopKDeviceOperation::program_factory_t TopKDeviceOperation::select_program_facto
      const operation_attributes_t& args, const tensor_args_t& tensor_args) {
      const auto& input_tensor = tensor_args.input;
  
@@ -61,7 +40,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.
      const ttnn::Shape input_shape = input_tensor.padded_shape();
  
      // Requirements #1-#3 (shape/K structure) via the shared eligibility helper — the
-@@ -163,12 +181,14 @@
+@@ -163,12 +181,14 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
      const auto& input_tensor = tensor_args.input;
      const auto& indices_tensor = tensor_args.indices;
      const auto& preallocated_outputs = tensor_args.preallocated_outputs;
@@ -77,7 +56,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.
          "Input shape inner dim {} must be >= {}, pad with +/-infinity if necessary",
          input_shape[-1],
          ttnn::prim::constants::min_dim_per_core);
-@@ -314,6 +334,9 @@
+@@ -314,6 +334,9 @@ void TopKDeviceOperation::validate_on_program_cache_miss(
          validate_reduce_op_tensor(std::get<0>(preallocated_outputs.value()), "TopK", "preallocated_values");
          validate_reduce_op_tensor(std::get<1>(preallocated_outputs.value()), "TopK", "preallocated_indices");
      }
@@ -87,6 +66,27 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.
      // Execution feasibility validation
      // Verify that the operation can be executed with available hardware resources
      bool can_run = false;
+diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.hpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.hpp
+--- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.hpp
++++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.hpp
+@@ -37,7 +37,16 @@ struct TopKDeviceOperation {
+             tensor_return_value_t& tensor_return_value);
+     };
+ 
+-    using program_factory_t = std::variant<TopKSingleCoreProgramFactory, TopKMultiCoreProgramFactory>;
++    // Up to two tile rows and wide rows: a selection on the data-movement cores (topk_select.hpp).
++    struct TopKSelectProgramFactory {
++        static tt::tt_metal::ProgramDescriptor create_descriptor(
++            const operation_attributes_t& operation_attributes,
++            const tensor_args_t& tensor_args,
++            tensor_return_value_t& tensor_return_value);
++    };
++
++    using program_factory_t =
++        std::variant<TopKSingleCoreProgramFactory, TopKMultiCoreProgramFactory, TopKSelectProgramFactory>;
+ 
+     static program_factory_t select_program_factory(const operation_attributes_t&, const tensor_args_t&);
+     static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
 --- ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
@@ -98,7 +98,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp ttnn/cpp/ttnn/operat
  
  #include <cstdint>
  #include <limits>
-@@ -631,6 +632,22 @@
+@@ -631,6 +632,22 @@ std::vector<Tensor> topk(
          return routed_final;
      }
  

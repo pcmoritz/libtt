@@ -116,7 +116,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
 +    }
 +
      TT_FATAL(
-         (tt::tt_metal::hal::get_arch_name() != "blackhole") ||
+         (input_tensor.device()->arch() != tt::ARCH::BLACKHOLE) ||
              (input_tensor.memory_config().buffer_type() != BufferType::DRAM),
 @@ -258,7 +315,7 @@ ttnn::experimental::prim::AllReduceAsyncDeviceOperation::tensor_return_value_t a
      uint32_t cluster_axis,
@@ -176,15 +176,15 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
-@@ -5,6 +5,7 @@
- #include "all_reduce_async_program_factory.hpp"
+@@ -6,6 +6,7 @@
+ #include "ttnn/operations/ccl/shared_with_host/ccl_runtime_args.hpp"
  
  #include <algorithm>
 +#include <tt-metalium/tensor_accessor_args.hpp>
  
  #include <tt-metalium/core_coord.hpp>
  #include <tt-metalium/buffer.hpp>
-@@ -18,6 +19,7 @@
+@@ -19,6 +20,7 @@
  #include "ttnn/operations/math.hpp"
  #include <tt-metalium/work_split.hpp>
  #include <tt-metalium/constants.hpp>
@@ -192,7 +192,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  #include <tt-metalium/host_api.hpp>
  #include "ttnn/operations/ccl/common/types/ccl_types_args_emitters.hpp"
  #include "ttnn/operations/ccl/common/host/ccl_command_stream_builders.hpp"
-@@ -86,6 +88,14 @@ std::tuple<CoreRangeSet, std::vector<CoreCoord>> ar_choose_worker_cores(
+@@ -87,6 +89,14 @@ std::tuple<CoreRangeSet, std::vector<CoreCoord>> ar_choose_worker_cores(
  
  namespace ttnn::experimental::prim {
  
@@ -207,7 +207,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  AllReduceAsyncMeshWorkloadFactory::cached_mesh_workload_t AllReduceAsyncMeshWorkloadFactory::create_mesh_workload(
      const AllReduceAsyncParams& operation_attributes,
      const ttnn::MeshCoordinateRangeSet& tensor_coords,
-@@ -93,8 +103,21 @@ AllReduceAsyncMeshWorkloadFactory::cached_mesh_workload_t AllReduceAsyncMeshWork
+@@ -94,8 +104,21 @@ AllReduceAsyncMeshWorkloadFactory::cached_mesh_workload_t AllReduceAsyncMeshWork
      Tensor& tensor_return_value) {
      tt::tt_metal::distributed::MeshWorkload workload;
      std::unordered_map<ttnn::MeshCoordinateRange, shared_variables_t> shared_variables;
@@ -228,9 +228,9 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
 +        auto cached_program = create_at(attributes, coord, tensor_args, tensor_return_value);
 +        cached_program.shared_variables.owned_semaphore = attributes.semaphore;
          workload.add_program(ttnn::MeshCoordinateRange(coord), std::move(cached_program.program));
-         shared_variables.emplace(ttnn::MeshCoordinateRange(coord), std::move(cached_program.shared_variables));
+         shared_variables.emplace(ttnn::MeshCoordinateRange(coord), cached_program.shared_variables);
      }
-@@ -124,22 +147,10 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -125,22 +148,10 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
  
      auto input_tensor_memory_config = input_tensor.memory_config();
      auto output_tensor_memory_config = output_tensor.memory_config();
@@ -257,7 +257,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  
      log_debug(tt::LogOp, "Running TG Llama specific all_reduce_async_minimal_multi_core_with_workers");
      // previously parameters from all_reduce_async_minimal_multi_core_with_workers
-@@ -147,7 +158,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -148,7 +159,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
      const auto& num_links = operation_attributes.num_links;
      const auto& ring_size = operation_attributes.ring_size;
      const auto& topology = operation_attributes.topology;
@@ -266,7 +266,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      const auto& sub_device_id = operation_attributes.sub_device_id;
      const auto& use_noc1_only = operation_attributes.use_noc1_only;
      const auto& use_optimal_ccl_for_llama = operation_attributes.use_optimal_ccl_for_llama;
-@@ -174,14 +185,15 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -175,14 +186,15 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
  
      // Tensor Info
      [[maybe_unused]] const auto input_tensor_num_pages = input_tensor.buffer()->num_pages();
@@ -286,7 +286,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  
      // filter output_tensor_cores to only include cores that have data and preserve original order
      CoreRangeSet output_tensor_cores;
-@@ -195,7 +207,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -196,7 +208,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
          }
          output_tensor_cores = CoreRangeSet(output_core_ranges);
      }
@@ -295,7 +295,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      const auto output_tensor_shard_num_pages = output_tensor_shard_shape[0] * output_tensor_shard_shape[1] / TILE_HW;
      const auto num_output_cores = output_tensor_cores.num_cores();
  
-@@ -358,6 +370,23 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -359,6 +371,23 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
      /* reduction cb */
      uint32_t reduction_CB_single_tile_size = output_tensor.tensor_spec().tile().get_tile_size(df);
      uint32_t reduction_CB_tiles = output_tensor_shard_num_pages * ring_size;
@@ -319,7 +319,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      uint32_t reduction_CB_size = reduction_CB_tiles * reduction_CB_single_tile_size;
  
      uint32_t reduction_cb_index = tt::CBIndex::c_1;
-@@ -375,11 +404,27 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -376,11 +405,30 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
      uint32_t out_cb_index = tt::CBIndex::c_2;
      tt::tt_metal::CircularBufferConfig out_cb_config =
          tt::tt_metal::CircularBufferConfig(out_CB_size, {{out_cb_index, output_df}})
@@ -330,26 +330,29 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      auto cb_out = tt::tt_metal::CreateCircularBuffer(
          program, output_tensor_cores, out_cb_config);  // TODO: This should be the output cores instead
  
-+    std::optional<tt::tt_metal::KernelHandle> output_writer;
++    std::optional<std::reference_wrapper<tt::tt_metal::RuntimeArgsData>> output_writer_args;
 +    if (direct) {
 +        std::vector<uint32_t> args = {out_cb_index, output_tensor_shard_num_pages};
 +        tt::tt_metal::TensorAccessorArgs(output_tensor.buffer()).append_to(args);
-+        output_writer = tt::tt_metal::CreateKernel(program,
++        const auto output_writer = tt::tt_metal::CreateKernel(program,
 +            "ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_writer.cpp",
 +            output_tensor_cores, tt::tt_metal::DataMovementConfig{
 +                .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
 +                .noc = tt::tt_metal::NOC::NOC_0, .compile_args = args, .defines = packing_defines});
++        // Common arg 0: output address (the only one a cache hit updates). Per-core arg 0: first output page.
++        tt::tt_metal::SetCommonRuntimeArgs(program, output_writer, {output_tensor.buffer()->address()});
 +        uint32_t start = 0;
 +        for (const auto& core : corerange_to_cores(output_tensor_cores, std::nullopt, true)) {
-+            tt::tt_metal::SetRuntimeArgs(program, *output_writer, core, {output_tensor.buffer()->address(), start});
++            tt::tt_metal::SetRuntimeArgs(program, output_writer, core, {start});
 +            start += output_tensor_shard_num_pages;
 +        }
++        output_writer_args = std::ref(tt::tt_metal::GetCommonRuntimeArgs(program, output_writer));
 +    }
 +
      // Create reduction dataflow kernel
      auto reduction_reader_kernel_config = tt::tt_metal::DataMovementConfig{
          .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
-@@ -406,6 +451,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -407,6 +455,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
          reduction_kernel_config.fp32_dest_acc_en = true;
          reduction_kernel_config.dst_full_sync_en = true;
      }
@@ -357,7 +360,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      reduction_kernel_config.compile_args = {
          reduction_cb_index,  // reduction_cb_index
          out_cb_index,        // out_cb_index
-@@ -428,18 +474,20 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -429,18 +478,20 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
          src0_cb_index,              // cb0_id
          op_config.get_page_size(),  // tensor0_page_size
      };
@@ -380,7 +383,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  
      // Writer
      std::vector<uint32_t> writer_compile_args = {
-@@ -455,6 +503,12 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -456,6 +507,12 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
      writer_compile_args.insert(writer_compile_args.end(), forward_args.begin(), forward_args.end());
      writer_compile_args.insert(writer_compile_args.end(), backward_args.begin(), backward_args.end());
      log_trace(tt::LogOp, "Writer Compile Args:");
@@ -393,7 +396,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      auto worker_sender_writer_kernel_id = tt::tt_metal::CreateKernel(
          program,
          "ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/"
-@@ -465,7 +519,8 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -466,7 +523,8 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
              .noc = writer_noc,
              .noc_mode =
                  use_noc1_only ? tt::tt_metal::NOC_MODE::DM_DYNAMIC_NOC : tt::tt_metal::NOC_MODE::DM_DEDICATED_NOC,
@@ -403,7 +406,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  
      // Kernel Runtime Args
      for (uint32_t link = 0; link < num_links; link++) {
-@@ -509,6 +564,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+@@ -509,6 +567,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
          };
          reader_rt_args.insert(reader_rt_args.end(), input_tensor_cores_x.begin(), input_tensor_cores_x.end());
          reader_rt_args.insert(reader_rt_args.end(), input_tensor_cores_y.begin(), input_tensor_cores_y.end());
@@ -411,41 +414,42 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
          log_trace(tt::LogOp, "Reader Runtime Args:");
          for ([[maybe_unused]] const auto& arg : reader_rt_args) {
              log_trace(tt::LogOp, "\t{}", arg);
-@@ -611,6 +667,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
-             .reduction_reader_kernel_id = reduction_reader_kernel_id,
-             .sender_worker_cores = sender_worker_cores,
-             .output_tensor_cores = output_tensor_cores,
-+            .output_writer = output_writer,
+@@ -610,6 +669,7 @@ AllReduceAsyncMeshWorkloadFactory::cached_program_t AllReduceAsyncMeshWorkloadFa
+             .reader_args = GetCommonRuntimeArgs(program, worker_sender_reader_kernel_id),
+             .writer_args = GetCommonRuntimeArgs(program, worker_sender_writer_kernel_id),
+             .reduction_args = GetCommonRuntimeArgs(program, reduction_reader_kernel_id),
++            .output_writer_args = output_writer_args,
              .cb_out = cb_out,
-             .cb_reduction = cb_reduction}};
- }
-@@ -627,7 +684,7 @@ void AllReduceAsyncMeshWorkloadFactory::override_runtime_arguments(
-         const auto& input_tensor = tensor_args.input_tensor;
-         const auto& buffer_tensor = tensor_args.buffer_tensor;
- 
--        auto semaphore = operation_attributes.semaphore;
-+        const auto& semaphore = operation_attributes.semaphore ? *operation_attributes.semaphore : *shared_vars.owned_semaphore;
- 
-         // update senders
-         auto& worker_reader_sender_runtime_args_by_core =
-@@ -643,7 +700,12 @@ void AllReduceAsyncMeshWorkloadFactory::override_runtime_arguments(
-             auto& worker_writer_sender_runtime_args = worker_writer_sender_runtime_args_by_core[core.x][core.y];
-             worker_writer_sender_runtime_args[1] = semaphore.address();
-         }
--        UpdateDynamicCircularBufferAddress(program, shared_vars.cb_out, *output_tensor.buffer());
-+        if (shared_vars.output_writer) {
-+            for (const auto& core : corerange_to_cores(shared_vars.output_tensor_cores, std::nullopt, true))
-+                GetRuntimeArgs(program, *shared_vars.output_writer, core)[0] = output_tensor.buffer()->address();
+             .cb_reduction = cb_reduction,
+         }};
+@@ -621,15 +681,21 @@ void AllReduceAsyncMeshWorkloadFactory::override_runtime_arguments(
+     const AllReduceAsyncInputs& tensor_args,
+     Tensor& output_tensor) {
+     const auto input_address = tensor_args.input_tensor.buffer()->address();
+-    const auto semaphore_address = operation_attributes.semaphore.address();
+     const auto& output_buffer = *output_tensor.buffer();
+     const auto& reduction_buffer = *tensor_args.buffer_tensor.buffer();
+     for (auto& [coordinate_range, program] : cached_workload.workload.get_programs()) {
+         const auto& shared = cached_workload.shared_variables.at(coordinate_range);
++        const auto semaphore_address = operation_attributes.semaphore ? operation_attributes.semaphore->address()
++                                                                      : shared.owned_semaphore->address();
+         shared.reader_args.get()[ttnn::ccl::AllReduceReaderCommonArgs::input] = input_address;
+         shared.writer_args.get()[ttnn::ccl::AllReduceSemaphoreCommonArgs::semaphore] = semaphore_address;
+         shared.reduction_args.get()[ttnn::ccl::AllReduceSemaphoreCommonArgs::semaphore] = semaphore_address;
+-        UpdateDynamicCircularBufferAddress(program, shared.cb_out, output_buffer);
++        if (shared.output_writer_args) {
++            // The direct path writes the output with dram_writer (common arg 0: output address).
++            shared.output_writer_args->get()[0] = output_buffer.address();
 +        } else {
-+            UpdateDynamicCircularBufferAddress(program, shared_vars.cb_out, *output_tensor.buffer());
++            UpdateDynamicCircularBufferAddress(program, shared.cb_out, output_buffer);
 +        }
-         UpdateDynamicCircularBufferAddress(program, shared_vars.cb_reduction, *buffer_tensor.buffer());
-         for (const auto& cr : shared_vars.output_tensor_cores.ranges()) {
-             for (const auto& core : corerange_to_cores(cr, std::nullopt, true)) {
+         UpdateDynamicCircularBufferAddress(program, shared.cb_reduction, reduction_buffer);
+     }
+ }
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.hpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.hpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.hpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.hpp
-@@ -9,12 +9,19 @@
+@@ -13,11 +13,20 @@
  
  namespace ttnn::experimental::prim {
  
@@ -455,13 +459,14 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
 +std::optional<uint32_t> direct_all_reduce_packed_tile_bytes(uint32_t logical_rows, uint32_t element_size);
 +
  struct AllReduceAsyncSharedVariables {
++    // The semaphore the workload was built with; created by the factory when the caller passes none.
 +    std::optional<GlobalSemaphore> owned_semaphore;
-     tt::tt_metal::KernelHandle worker_sender_reader_kernel_id{};
-     tt::tt_metal::KernelHandle worker_sender_writer_kernel_id{};
-     tt::tt_metal::KernelHandle reduction_reader_kernel_id{};
-     std::vector<tt::tt_metal::CoreCoord> sender_worker_cores;
-     CoreRangeSet output_tensor_cores;
-+    std::optional<tt::tt_metal::KernelHandle> output_writer;
+     // Cache binding objects; data() follows dispatch/trace payload relocation.
+     std::reference_wrapper<tt::tt_metal::RuntimeArgsData> reader_args;
+     std::reference_wrapper<tt::tt_metal::RuntimeArgsData> writer_args;
+     std::reference_wrapper<tt::tt_metal::RuntimeArgsData> reduction_args;
++    // The direct path's dram_writer common args (output address); empty otherwise.
++    std::optional<std::reference_wrapper<tt::tt_metal::RuntimeArgsData>> output_writer_args;
      tt::tt_metal::CBHandle cb_out{};
      tt::tt_metal::CBHandle cb_reduction{};
  };
@@ -493,18 +498,22 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_reader.cpp
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,42 @@
 +// SPDX-License-Identifier: Apache-2.0
++#include "ttnn/operations/ccl/shared_with_host/ccl_runtime_args.hpp"
 +#include "api/dataflow/dataflow_api.h"
 +void kernel_main() {
 +    constexpr uint32_t cb = get_compile_time_arg_val(1);
 +    constexpr uint32_t page = get_compile_time_arg_val(2);
 +    constexpr auto spec = TensorAccessorArgs<3>();
-+    const auto src = TensorAccessor(spec, get_arg_val<uint32_t>(0), page);
-+    const uint32_t chunk = get_arg_val<uint32_t>(1);
-+    const uint32_t total = get_arg_val<uint32_t>(2);
-+    const uint32_t cores = get_arg_val<uint32_t>(4);
-+    const uint32_t start = get_arg_val<uint32_t>(5 + 2 * cores);
++    // The input address is a common arg, as in worker_reader; the per-core args are worker_reader's
++    // (num_tiles_per_core, num_tiles_to_read, first_core_tile_start_offset, num_cores, xs, ys) plus the start page.
++    const auto src =
++        TensorAccessor(spec, get_common_arg_val<uint32_t>(ttnn::ccl::AllReduceReaderCommonArgs::input), page);
++    const uint32_t chunk = get_arg_val<uint32_t>(0);
++    const uint32_t total = get_arg_val<uint32_t>(1);
++    const uint32_t cores = get_arg_val<uint32_t>(3);
++    const uint32_t start = get_arg_val<uint32_t>(4 + 2 * cores);
 +#ifdef PACKED_TILE_BYTES
 +    // Read just the first rows of each tile, at the start of its two upper
 +    // faces, and pack them back to back.
@@ -536,7 +545,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/dram_writer.cpp
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,32 @@
 +// SPDX-License-Identifier: Apache-2.0
 +#include "api/dataflow/dataflow_api.h"
 +void kernel_main() {
@@ -544,8 +553,9 @@ new file mode 100644
 +    constexpr uint32_t count = get_compile_time_arg_val(1);
 +    constexpr auto spec = TensorAccessorArgs<2>();
 +    const uint32_t page = get_tile_size(cb);
-+    const auto dst = TensorAccessor(spec, get_arg_val<uint32_t>(0), page);
-+    const uint32_t start = get_arg_val<uint32_t>(1);
++    // Common arg 0: output address (updated on cache hits). Per-core arg 0: first output page.
++    const auto dst = TensorAccessor(spec, get_common_arg_val<uint32_t>(0), page);
++    const uint32_t start = get_arg_val<uint32_t>(0);
 +#ifdef PACKED_TILE_BYTES
 +    // The sums are packed at the start of the reduced pages (see dram_reader);
 +    // put each tile's rows back at the start of its two upper faces.
@@ -571,7 +581,7 @@ new file mode 100644
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/worker_writer.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/worker_writer.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/worker_writer.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/kernels/dataflow/worker_writer.cpp
-@@ -34,6 +34,13 @@ constexpr ccl_routing_utils::line_multicast_route_info_t forward_multicast_route
+@@ -35,6 +35,13 @@ constexpr ccl_routing_utils::line_multicast_route_info_t forward_multicast_route
  constexpr ccl_routing_utils::line_multicast_route_info_t backward_multicast_route_info =
      ccl_routing_utils::get_line_multicast_route_info_from_args<8 + ccl_routing_utils::num_line_multicast_args>();
  
@@ -585,7 +595,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
  void kernel_main() {
      ///////////////////////////////////////////////////
      // ARGS
-@@ -108,17 +115,58 @@ void kernel_main() {
+@@ -110,17 +117,58 @@ void kernel_main() {
          fabric_connection.open_finish();
      }
  
@@ -645,7 +655,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
  
          uint64_t noc0_dest_noc_addr =
              safe_get_noc_addr(core_noc_x[core_id], core_noc_y[core_id], reduction_input_addr + writer_chip_offset);
-@@ -126,7 +174,7 @@ void kernel_main() {
+@@ -128,7 +176,7 @@ void kernel_main() {
          uint64_t sema_noc_addr = safe_get_noc_addr(core_noc_x[core_id], core_noc_y[core_id], out_ready_sem_bank_addr);
  
          // Within-shard offset
@@ -654,7 +664,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
  
          // This issues a flush barrier
          if (shard_tile_id + num_tiles_to_read_this_core >= num_tiles_per_core ||
-@@ -137,7 +185,7 @@ void kernel_main() {
+@@ -139,7 +187,7 @@ void kernel_main() {
                  pkt_hdr_backward,
                  fabric_connection,
                  l1_read_addr,
@@ -663,7 +673,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
                  sema_noc_addr,
                  static_cast<uint32_t>(1),
                  false);
-@@ -149,7 +197,7 @@ void kernel_main() {
+@@ -151,7 +199,7 @@ void kernel_main() {
                  pkt_hdr_backward,
                  fabric_connection,
                  l1_read_addr,
@@ -672,7 +682,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/ker
          }
  
          tiles_read += num_tiles_to_read_this_core;
-@@ -158,8 +206,13 @@ void kernel_main() {
+@@ -160,8 +208,13 @@ void kernel_main() {
              shard_tile_id = 0;
              core_id++;
          }

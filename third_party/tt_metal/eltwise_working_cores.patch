@@ -1,12 +1,12 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-@@ -319,7 +319,12 @@ ttsl::hash::hash_t BinaryNgDeviceOperation::tensor_args_t::to_hash() const {
-                                    : std::nullopt,
-         input_tensor_b.has_value() ? std::optional{input_tensor_b->tensor_spec().tile()} : std::nullopt,
+@@ -309,7 +309,12 @@ ttsl::hash::hash_t BinaryNgDeviceOperation::tensor_args_t::to_hash() const {
          sharded_tensor_shape_in_pages(input_tensor_a),
--        input_tensor_b.has_value() ? sharded_tensor_shape_in_pages(*input_tensor_b) : std::nullopt);
-+        input_tensor_b.has_value() ? sharded_tensor_shape_in_pages(*input_tensor_b) : std::nullopt,
+         input_tensor_b.has_value() ? sharded_tensor_shape_in_pages(*input_tensor_b) : std::nullopt,
+         // Output dtype can change the program (fp32 DEST). Falls back to a's dtype so in-place calls still share.
+-        output_tensor.has_value() ? output_tensor->dtype() : input_tensor_a.dtype());
++        output_tensor.has_value() ? output_tensor->dtype() : input_tensor_a.dtype(),
 +        // An interleaved program runs on the cores its output tiles split over.
 +        input_tensor_a.memory_config().is_sharded() ? std::nullopt : std::optional{input_tensor_a.padded_shape()},
 +        input_tensor_b.has_value() && !input_tensor_b->memory_config().is_sharded()
@@ -18,7 +18,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_op
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
-@@ -393,10 +393,13 @@ std::optional<AllShardVolumes> get_shard_volumes(
+@@ -399,10 +399,13 @@ std::optional<AllShardVolumes> get_shard_volumes(
  
  namespace {
  
@@ -34,7 +34,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
      std::vector<CoreCoord> cores;
      std::vector<std::vector<std::variant<uint32_t, Buffer*>>> reader;
      std::vector<std::vector<std::variant<uint32_t, Buffer*>>> writer;
-@@ -415,7 +418,8 @@ struct BinaryNgPerCoreArgs {
+@@ -421,7 +424,8 @@ struct BinaryNgPerCoreArgs {
  // volume (a core can flip between work and noop across hits), the builder emits args for ALL
  // num_cores_total cores -- noop cores get zero-filled lists sized to match the work-core layout -- and
  // override_runtime_arguments re-applies every slot (buffer slots via their current address), so nothing
@@ -44,7 +44,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
  BinaryNgPerCoreArgs build_per_core_runtime_args(
      const BinaryNgDeviceOperation::operation_attributes_t& operation_attributes,
      const Tensor& a,
-@@ -609,6 +613,9 @@ BinaryNgPerCoreArgs build_per_core_runtime_args(
+@@ -616,6 +620,9 @@ BinaryNgPerCoreArgs build_per_core_runtime_args(
          } else if (core_group_2.contains(core)) {
              c_num_tiles_core = num_tiles_per_core_group_2;
          } else {
@@ -54,7 +54,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
              // Noop core: zero-filled runtime args, sized to match the active kernel variant so unused
              // cores neither inflate the per-kernel max runtime-arg allocation nor change slot count when a
              // core flips between noop and work across differently-shaped cache hits.
-@@ -824,6 +831,7 @@ BinaryNgPerCoreArgs build_per_core_runtime_args(
+@@ -836,6 +843,7 @@ BinaryNgPerCoreArgs build_per_core_runtime_args(
          }
      }
  
@@ -62,7 +62,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
      return result;
  }
  
-@@ -905,7 +913,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -917,7 +925,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
      uint32_t c_single_tile_size = tt::tile_size(c_pack_data_format);
  
      // we parallelize the computation across the output tiles
@@ -72,7 +72,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
  
      Buffer* a_buffer = a.buffer();
      Buffer* b_buffer = b.has_value() ? b->buffer() : nullptr;
-@@ -1442,7 +1451,6 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1457,7 +1466,6 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
      // Built via the shared single-source-of-truth builder so create_descriptor() (cache miss, here)
      // and BinaryNgDeviceOperation::override_runtime_arguments() (cache hit) stay byte-identical.
      {
@@ -83,7 +83,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
 diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_device_operation.cpp
-@@ -624,7 +624,10 @@ ttsl::hash::hash_t TernaryDeviceOperation::compute_program_hash(
+@@ -622,7 +622,10 @@ ttsl::hash::hash_t TernaryDeviceOperation::compute_program_hash(
          sharded_tensor_shape_in_pages(input_a),
          input_b.has_value() ? sharded_tensor_shape_in_pages(*input_b) : std::nullopt,
          input_c.has_value() ? sharded_tensor_shape_in_pages(*input_c) : std::nullopt,
@@ -98,7 +98,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_device_operat
 diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
-@@ -528,6 +528,9 @@ void setup_ts_reader_args_and_dims(
+@@ -534,6 +534,9 @@ void setup_ts_reader_args_and_dims(
  
  // Shared work-split so create_descriptor() (cache miss + cache-hit re-apply) partitions the same cores.
  struct TernaryCorePartition {
@@ -108,7 +108,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_facto
      std::vector<CoreCoord> cores;
      CoreRangeSet core_group_1;
      CoreRangeSet core_group_2;
-@@ -618,6 +621,7 @@ TernaryCorePartition compute_core_partition(
+@@ -625,6 +628,7 @@ TernaryCorePartition compute_core_partition(
              tt::tt_metal::split_work_to_cores(all_device_cores, num_output_tiles, p.row_major);
          p.cores = corerange_to_cores(all_device_cores, {}, p.row_major);
      }
@@ -116,7 +116,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_facto
      return p;
  }
  
-@@ -661,6 +665,7 @@ struct TernaryPerCoreArgs {
+@@ -668,6 +672,7 @@ struct TernaryPerCoreArgs {
          tt::tt_metal::Buffer* buffer = nullptr;
      };
  
@@ -124,7 +124,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_facto
      std::vector<CoreCoord> cores;
      std::vector<uint8_t> is_work_core;  // parallel to cores; noop cores are zero-filled
      std::vector<uint32_t> reader;       // flat, kNumReaderArgs per core
-@@ -690,7 +695,9 @@ struct TernaryPerCoreArgs {
+@@ -697,7 +702,9 @@ struct TernaryPerCoreArgs {
  // The work-core partition itself shifts with the output volume (a core can flip between work and
  // noop across hits), so the builder emits args for ALL num_cores_total cores -- noop cores get
  // zero-filled lists sized to match the work-core layout -- and the caller re-applies every slot,
@@ -135,7 +135,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_facto
  TernaryPerCoreArgs build_per_core_runtime_args(
      const TernaryDeviceOperation::operation_attributes_t& operation_attributes,
      const TernaryDeviceOperation::tensor_args_t& tensor_args,
-@@ -720,6 +727,7 @@ TernaryPerCoreArgs build_per_core_runtime_args(
+@@ -727,6 +734,7 @@ TernaryPerCoreArgs build_per_core_runtime_args(
      const auto& core_group_2 = partition.core_group_2;
      const uint32_t num_cores_total = partition.num_cores_total;
      const bool has_sharding = partition.has_sharding;
@@ -143,7 +143,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_facto
      const uint32_t num_tiles_per_core_group_1 = partition.num_tiles_per_core_group_1;
      const uint32_t num_tiles_per_core_group_2 = partition.num_tiles_per_core_group_2;
  
-@@ -775,6 +783,9 @@ TernaryPerCoreArgs build_per_core_runtime_args(
+@@ -782,6 +790,9 @@ TernaryPerCoreArgs build_per_core_runtime_args(
          } else if (core_group_2.contains(core)) {
              num_tiles_per_core = num_tiles_per_core_group_2;
          } else {
@@ -153,7 +153,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_facto
              result.cores.push_back(core);
              result.is_work_core.push_back(0);
              result.reader.resize(result.reader.size() + num_reader_args, 0u);
-@@ -1072,7 +1083,9 @@ tt::tt_metal::ProgramDescriptor TernaryDeviceOperation::TernaryProgramFactory::c
+@@ -1079,7 +1090,9 @@ tt::tt_metal::ProgramDescriptor TernaryDeviceOperation::TernaryProgramFactory::c
      const auto false_num_tiles_per_shard = has_sharding ? shard_volumes->false_shard_volume : std::nullopt;
      const auto output_num_tiles_per_shard = has_sharding ? shard_volumes->output_shard_volume : std::nullopt;
  
@@ -164,7 +164,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_facto
  
      constexpr uint32_t num_tiles_per_cb = 2;
  
-@@ -1482,9 +1495,6 @@ tt::tt_metal::ProgramDescriptor TernaryDeviceOperation::TernaryProgramFactory::c
+@@ -1500,9 +1513,6 @@ tt::tt_metal::ProgramDescriptor TernaryDeviceOperation::TernaryProgramFactory::c
      // emplace_runtime_args() registers them as bindings and the framework keeps its O(1) address
      // patching.  Noop cores hold no buffers, so they take the plain path.
      {
@@ -177,9 +177,9 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_facto
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
-@@ -321,13 +321,19 @@ ttsl::hash::hash_t UnaryDeviceOperation::compute_program_hash(
-             dst_shard_vol);
-     }
+@@ -368,6 +368,11 @@ ttsl::hash::hash_t UnaryDeviceOperation::compute_program_hash(
+         return std::pair{distribution->shard_shape_in_pages(), distribution->cores()};
+     };
  
 +    // An interleaved program runs on the cores its tile count splits over.
 +    const std::optional<uint64_t> interleaved_tiles =
@@ -188,9 +188,10 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.
 +            : std::optional<uint64_t>(input_tensor.physical_volume() / input_tensor.tensor_spec().tile().get_tile_hw());
      return operation::hash_operation<UnaryDeviceOperation>(
          attributes,
-         input_tensor.dtype(),
-         input_tensor.layout(),
-         input_tensor.memory_config(),
+         input_tensor.tensor_spec().tensor_layout(),
+@@ -382,7 +387,8 @@ ttsl::hash::hash_t UnaryDeviceOperation::compute_program_hash(
+         distribution_key(
+             output_spec, tensor_args.output_tensor.has_value() ? &*tensor_args.output_tensor : nullptr, "output"),
          src_shard_vol,
 -        dst_shard_vol);
 +        dst_shard_vol,
@@ -201,18 +202,18 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-@@ -100,7 +100,7 @@ namespace {
- // Per-core runtime-arg values, in the slot order create_descriptor writes them.
+@@ -109,7 +109,7 @@ namespace {
+ // Per-core runtime-arg values, as create_program_artifacts writes them.
  struct CoreRtArgs {
      tt::tt_metal::CoreCoord core;
--    bool noop = false;  // outside both work groups: create_descriptor zero-fills its args
-+    bool noop = false;  // a sharded program's core outside the shard grid: create_descriptor zero-fills its args
+-    bool noop = false;  // outside both work groups: create_program_artifacts zero-fills its args
++    bool noop = false;  // a sharded program's core outside the shard grid: create_program_artifacts zero-fills its args
      uint32_t in_units = 0;
      uint32_t out_units = 0;
      uint32_t start_id = 0;
-@@ -123,9 +123,11 @@ struct RmChunkConstants {
+@@ -133,9 +133,11 @@ struct RmChunkConstants {
  // override_runtime_arguments both go through this, so a cache-hit patch cannot drift from the layout
- // the miss path built. Cheap next to create_descriptor (no kernel sources, CBs, or descriptor
+ // the miss path built. Cheap next to create_program_artifacts (no kernel sources, DFBs, or spec
  // allocation) but deliberately not O(1): the TILE-layout hash omits shape, so the split really does
 -// change between hits on the same cached program.
 +// change between hits on the same cached program. Returns the program's cores: the worker grid when
@@ -224,7 +225,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
      const UnaryDeviceOperation::operation_attributes_t& operation_attributes,
      const UnaryDeviceOperation::tensor_args_t& tensor_args,
      const Tensor& output,
-@@ -291,7 +293,7 @@ void enumerate_core_rt_args(
+@@ -301,7 +303,7 @@ void enumerate_core_rt_args(
                      .compute_units = o_tiles},
                  k);
          }
@@ -233,7 +234,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
      }
  
      uint32_t num_tiles_per_core_group_1{}, num_tiles_per_core_group_2{};
-@@ -317,7 +319,6 @@ void enumerate_core_rt_args(
+@@ -327,7 +329,6 @@ void enumerate_core_rt_args(
          } else if (core_group_2.contains(core)) {
              npc = num_tiles_per_core_group_2;
          } else {
@@ -241,21 +242,21 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
              continue;
          }
          fn(
-@@ -330,6 +331,7 @@ void enumerate_core_rt_args(
+@@ -340,6 +341,7 @@ void enumerate_core_rt_args(
              k);
          start_tile_id += npc;
      }
 +    return all_cores;
  }
  
- }  // namespace
-@@ -431,7 +433,8 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+ // The per-dispatch run args: every runtime arg on every core, plus both tensor bindings.
+@@ -527,7 +529,8 @@ ttnn::device_operation::ProgramArtifacts UnaryDeviceOperation::ProgramFactory::c
          dst_sharded ? std::optional<uint32_t>(shard_pages(shard_specs->output_shard_spec, output, is_row_major))
                      : std::nullopt;
  
 -    const auto& all_device_cores = operation_attributes.worker_grid;
 +    const CoreRangeSet all_device_cores = enumerate_core_rt_args(
 +        operation_attributes, tensor_args, output, [](const CoreRtArgs&, const RmChunkConstants&) {});
+     const bool needs_tmp0 = needs_tmp0_dfb(ops_chain[0].type());
  
-     std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(
-         NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
+     const bool math_approx_mode = false;

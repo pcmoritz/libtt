@@ -1,12 +1,12 @@
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
-@@ -232,31 +232,11 @@ void MoEComputeDeviceOperation::validate_on_program_cache_miss(
+@@ -192,31 +192,11 @@ void MoEComputeDeviceOperation::validate_on_program_cache_miss(
              "cluster_axis {} is out of range for a mesh with {} axes",
              args.combine_params->axis,
              mesh_shape.dims());
 -        if (mesh_device->num_devices() > 1 &&
--            (args.path == MoEComputePath::FullLocal || args.path == MoEComputePath::LocalOutput)) {
+-            (args.path == MoEComputePath::SingleDevice || args.path == MoEComputePath::SingleCluster)) {
 -            // Every coordinate runs the tilize stage over the whole token set: the input rows,
 -            // the expert indices and scores that route them and the expert mapping are all
 -            // read as the full set, and dm1 addresses page k * T + t of the output by the
@@ -35,6 +35,6 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
 +        // same values on every coordinate. They need not be labeled replicated: a caller that
 +        // computes them on each device (such as a compiler running one program per device) has
 +        // the values without the label.
-         if (args.path == MoEComputePath::FullLocal) {
+         if (args.path == MoEComputePath::SingleDevice) {
              TT_FATAL(
-                 args.combine_params->local_combine, "path=FullLocal requires combine_params->local_combine to be true");
+                 args.combine_params->local_combine,

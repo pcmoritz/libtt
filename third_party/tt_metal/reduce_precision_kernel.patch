@@ -150,7 +150,7 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/sfpu_split_includes.h tt_me
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_types.hpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_types.hpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_types.hpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_types.hpp
-@@ -93,6 +93,7 @@
+@@ -93,6 +93,7 @@ enum class UnaryOpType {
      TILED_PROD,
      TYPECAST,
      BITCAST,
@@ -161,7 +161,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_types.hpp ttnn
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
-@@ -15,6 +15,16 @@
+@@ -15,6 +15,16 @@ namespace ttnn::operations::unary::utils {
  
  namespace {
  
@@ -178,7 +178,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn
  std::string get_macro_definition(UnaryOpType op_type) {
      switch (op_type) {
          case UnaryOpType::EXP: return "SFPU_OP_EXP_INCLUDE";
-@@ -73,6 +83,7 @@
+@@ -73,6 +83,7 @@ std::string get_macro_definition(UnaryOpType op_type) {
          case UnaryOpType::BITWISE_OR:
          case UnaryOpType::BITWISE_XOR: return "SFPU_OP_BITWISE_INCLUDE";
          case UnaryOpType::BITWISE_NOT: return "SFPU_OP_BITWISE_NOT_INCLUDE";
@@ -186,7 +186,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn
          case UnaryOpType::LEFT_SHIFT:
          case UnaryOpType::RIGHT_SHIFT: return "SFPU_OP_SHIFT_INCLUDE";
          case UnaryOpType::REMAINDER: return "SFPU_OP_REMAINDER_INCLUDE";
-@@ -294,6 +305,20 @@
+@@ -299,6 +310,20 @@ std::pair<std::string, std::string> get_op_init_and_func_parameterized(
              return {
                  fmt::format("tanh_tile_init<{}u>();", (uint32_t)param0),
                  fmt::format("tanh_tile<{1}u>({0});", idst, (uint32_t)param0)};
@@ -210,7 +210,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
-@@ -83,6 +83,7 @@
+@@ -84,6 +84,7 @@ bool is_parametrized_type(T val) {
          case UnaryOpType::UNARY_LE:
          case UnaryOpType::TYPECAST:
          case UnaryOpType::BITCAST:
@@ -221,7 +221,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp ttnn
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-@@ -345,10 +345,13 @@
+@@ -440,10 +440,13 @@ ttnn::device_operation::ProgramArtifacts UnaryDeviceOperation::ProgramFactory::c
      const auto& ops_chain = operation_attributes.op_chain;
      TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
      const bool is_bitcast = ops_chain.size() == 1 && ops_chain[0].type() == UnaryOpType::BITCAST;
@@ -235,44 +235,43 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
 +        ops_chain[0].type() != UnaryOpType::BITCAST && !is_reduce_precision &&
          (input.dtype() == DataType::FLOAT16 || ops_chain[0].type() == UnaryOpType::NEG ||
           ops_chain[0].type() == UnaryOpType::ABS || ops_chain[0].type() == UnaryOpType::LOG1P) &&
-         get_compute_kernel_path(ops_chain[0].type(), input.dtype()) == "eltwise_sfpu.cpp";
-@@ -368,8 +371,9 @@
-         }
+         get_compute_kernel_path(ops_chain[0].type(), input.dtype()) == "eltwise_sfpu_metal2.cpp";
+@@ -464,7 +467,9 @@ ttnn::device_operation::ProgramArtifacts UnaryDeviceOperation::ProgramFactory::c
      }
  
--    const bool fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en ||
--                                  input.dtype() == DataType::FLOAT16 ||
+     // Drives both enable_32_bit_dest and the unpack modes below, which must agree with it.
+-    const bool fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en || input.dtype() == DataType::FLOAT16 ||
 +    const bool fp32_dest_acc_en =
 +        is_reduce_precision ? input.element_size() == sizeof(uint32_t)
 +                            : operation_attributes.fp32_dest_acc_en || input.dtype() == DataType::FLOAT16 ||
                                    output.dtype() == DataType::FLOAT16 || promote_narrow_float;
      uint32_t packed_scalar1 = 0;
      uint32_t packed_scalar2 = 0;
-@@ -384,8 +388,8 @@
-     DataFormat cb_data_format_output =
-         promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format
-                                                       : cb_dataformat_for(output.dtype());
+@@ -475,8 +480,8 @@ ttnn::device_operation::ProgramArtifacts UnaryDeviceOperation::ProgramFactory::c
+     uint32_t single_tile_size = tile_size(dfb_data_format);
+     DataFormat dfb_data_format_output =
+         promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format : cb_dataformat_for(output.dtype());
 -    if (is_bitcast) {
--        // For BITCAST, cb_data_format_for_input below inherits this format.
+-        // For BITCAST, dfb_data_format_for_input below inherits this format.
 +    if (uses_raw_bits) {
-+        // cb_data_format_for_input below inherits this format.
++        // dfb_data_format_for_input below inherits this format.
          // Unsigned semantics therefore apply to both unpacking and packing.
-         cb_data_format_output =
-             input.element_size() == sizeof(uint16_t) ? DataFormat::UInt16 : DataFormat::UInt32;
-@@ -448,8 +452,7 @@
+         dfb_data_format_output = input.element_size() == sizeof(uint16_t) ? DataFormat::UInt16 : DataFormat::UInt32;
+     }
+@@ -534,8 +539,7 @@ ttnn::device_operation::ProgramArtifacts UnaryDeviceOperation::ProgramFactory::c
          "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/compute/{}",
          get_compute_kernel_path(ops_chain[0].type(), input.dtype()));
  
--    DataFormat cb_data_format_for_input =
--        (ops_chain[0].type() == unary::UnaryOpType::BITCAST) ? cb_data_format_output : cb_data_format;
-+    DataFormat cb_data_format_for_input = uses_raw_bits ? cb_data_format_output : cb_data_format;
+-    DataFormat dfb_data_format_for_input =
+-        (ops_chain[0].type() == unary::UnaryOpType::BITCAST) ? dfb_data_format_output : dfb_data_format;
++    DataFormat dfb_data_format_for_input = uses_raw_bits ? dfb_data_format_output : dfb_data_format;
  
-     // --- Circular Buffers ---
-     desc.cbs.push_back(CBDescriptor{
+     // --- Dataflow Buffers ---
+     // On the native-sharded path the input / output DFBs are built on the tensors' own L1 shards.
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
-@@ -498,6 +498,23 @@
+@@ -498,6 +498,23 @@ Tensor bitcast(
          input_tensor, {bitcast_op}, memory_config, optional_output_tensor, sub_core_grids);
  }
  
@@ -299,7 +298,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp ttnn/cpp/ttnn/operat
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/unary.hpp ttnn/cpp/ttnn/operations/eltwise/unary/unary.hpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/unary.hpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/unary.hpp
-@@ -320,6 +320,15 @@
+@@ -320,6 +320,15 @@ Tensor bitcast(
      const std::optional<Tensor>& optional_output_tensor = std::nullopt,
      const std::optional<CoreRangeSet>& sub_core_grids = std::nullopt);
  

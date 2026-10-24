@@ -72,7 +72,7 @@ genrule(
     name = "tt_metal_hal_generated_headers",
     srcs = [
         "tt_metal/hw/inc/hostdev/dev_msgs.h",
-        "tt_metal/hw/inc/hostdev/fabric_telemetry_msgs.h",
+        "tt_metal/hostdevcommon/api/hostdevcommon/fabric_telemetry_msgs.h",
         "tt_metal/hw/inc/hostdev/realtime_profiler_msgs.h",
         "tt_metal/llrt/hal/codegen/codegen.py",
         "tt_metal/llrt/hal/codegen/codegen.sh",
@@ -129,9 +129,9 @@ genrule(
     name = "tt_metal_version_hpp",
     srcs = ["cmake/tt_metal_version.hpp.in"],
     outs = ["tt_metal/impl/version.hpp"],
-    cmd = "sed -e 's/@VERSION_SHA@/eb97711f4be2a30cfbff05266faf90bf9780d0c2/' " +
-          "-e 's/@VERSION_HASH@/eb97711f/' " +
-          "-e 's/@VERSION_FULL@/eb97711f/' " +
+    cmd = "sed -e 's/@VERSION_SHA@/614f605ffe2977715adc198156c72bea14c2bae6/' " +
+          "-e 's/@VERSION_HASH@/614f605f/' " +
+          "-e 's/@VERSION_FULL@/614f605f/' " +
           "-e 's/@VERSION_DIRTY_CPP@/false/' $< > $@",
 )
 
@@ -221,6 +221,7 @@ BLACKHOLE_RUNTIME_INCLUDES = [
     "tt_metal/hw/ckernels/blackhole/metal/llk_io",
     "tt_metal/tt-llk/tt_llk_blackhole/common/inc",
     "tt_metal/tt-llk/tt_llk_blackhole/llk_lib",
+    "tt_metal/tt-llk/tt_llk_blackhole/llk_lib/hal",
 ]
 
 sfpi_cc_objects(
@@ -354,7 +355,7 @@ genrule(
         "inspector_stubs/tt_metal/impl/debug/inspector/data.hpp",
         "inspector_stubs/tt_metal/impl/debug/inspector/inspector.hpp",
         # The streaming profiler needs Tracy, which libtt does not build.
-        "inspector_stubs/impl/streaming_profiler/streaming_profiler_receiver.hpp",
+        "inspector_stubs/impl/streaming_profiler/receiver.hpp",
     ],
     cmd = "mkdir -p $(@D)/inspector_stubs/debug/inspector " +
           "$(@D)/inspector_stubs/impl/streaming_profiler " +
@@ -391,6 +392,8 @@ genrule(
           "'    template <typename... Args> static void mesh_device_initialized(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void mesh_buffer_allocated(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void mesh_buffer_deallocated(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void global_semaphore_created(Args&&...) noexcept {}' " +
+          "'    template <typename... Args> static void global_semaphore_reset(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void mesh_workload_created(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void mesh_workload_destroyed(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void mesh_workload_add_program(Args&&...) noexcept {}' " +
@@ -428,7 +431,7 @@ genrule(
           "'    }' " +
           "'};' " +
           "'}  // namespace tt::tt_metal::streaming_profiler' " +
-          "> $(@D)/inspector_stubs/impl/streaming_profiler/streaming_profiler_receiver.hpp",
+          "> $(@D)/inspector_stubs/impl/streaming_profiler/receiver.hpp",
 )
 
 genrule(
@@ -739,6 +742,8 @@ TT_METAL_RUNTIME_HDRS = glob(
         "tt_metal/llrt/**/*.hpp",
         "tt_metal/tools/profiler/**/*.h",
         "tt_metal/tools/profiler/**/*.hpp",
+        "tt_metal/tt-llk/tools/include/**/*.h",
+        "tt_metal/tt-llk/tools/include/**/*.hpp",
     ],
     allow_empty = True,
 ) + [
@@ -772,6 +777,8 @@ TT_METAL_RUNTIME_INCLUDE_DIRS = ["inspector_stubs"] + TT_METAL_INCLUDE_DIRS + [
     "tt_metal/impl/tensor",
     "tt_metal/llrt",
     "tt_metal/llrt/hal",
+    # internal/profiler/perf_counters.hpp includes tt-llk's shared counter headers.
+    "tt_metal/tt-llk/tools/include",
 ]
 
 TTNN_RUNTIME_HDRS = glob(
@@ -784,6 +791,7 @@ TTNN_RUNTIME_HDRS = glob(
         "ttnn/core/**/*.tpp",
         "ttnn/cpp/ttnn/**/*.h",
         "ttnn/cpp/ttnn/**/*.hpp",
+        "ttnn/cpp/ttnn/**/*.inl",
         "ttnn/cpp/ttnn/**/*.tpp",
     ],
     allow_empty = True,
@@ -1071,21 +1079,26 @@ TT_FABRIC_SRCS = [
     "tt_metal/fabric/control_plane.cpp",
     "tt_metal/fabric/mesh_graph_descriptor.cpp",
     "tt_metal/fabric/routing_table_generator.cpp",
+    "tt_metal/fabric/axis_route_topology.cpp",
+    "tt_metal/fabric/mcast_reverse_tree.cpp",
     "tt_metal/fabric/mesh_graph.cpp",
     "tt_metal/fabric/erisc_datamover_builder.cpp",
-    "tt_metal/fabric/fabric_router_channel_mapping.cpp",
     "tt_metal/fabric/fabric_router_builder.cpp",
     "tt_metal/fabric/compute_mesh_router_builder.cpp",
     "tt_metal/fabric/fabric_builder.cpp",
     "tt_metal/fabric/builder/fabric_builder_config.cpp",
     "tt_metal/fabric/builder/fabric_builder_helpers.cpp",
+    "tt_metal/fabric/builder/fabric_edge_capability.cpp",
+    "tt_metal/fabric/builder/protected_domain_effect.cpp",
+    "tt_metal/fabric/builder/injection_policy.cpp",
+    "tt_metal/fabric/builder/fabric_stream_assignment.cpp",
     "tt_metal/fabric/builder/fabric_core_placement.cpp",
     "tt_metal/fabric/builder/fabric_channel_allocator.cpp",
     "tt_metal/fabric/builder/fabric_static_sized_channels_allocator.cpp",
     "tt_metal/fabric/builder/fabric_remote_channels_allocator.cpp",
     "tt_metal/fabric/builder/static_sized_channel_connection_writer_adapter.cpp",
     "tt_metal/fabric/builder/connection_registry.cpp",
-    "tt_metal/fabric/builder/router_connection_mapping.cpp",
+    "tt_metal/fabric/builder/router_wiring_rules.cpp",
     "tt_metal/fabric/channel_trimming_export.cpp",
     "tt_metal/fabric/channel_trimming_import.cpp",
     "tt_metal/fabric/channel_trimming_io.cpp",
@@ -1110,8 +1123,13 @@ TT_FABRIC_SRCS = [
     "tt_metal/fabric/serialization/intermesh_connections_serialization.cpp",
     "tt_metal/fabric/serialization/port_descriptor_serialization.cpp",
     "tt_metal/fabric/ccl/ccl_common.cpp",
+    "tt_metal/fabric/link_health.cpp",
+    "tt_metal/fabric/fsd_host_filter.cpp",
+    "tt_metal/fabric/physical_node_id.cpp",
     "tt_metal/fabric/physical_system_discovery.cpp",
     "tt_metal/fabric/physical_system_descriptor.cpp",
+    "tt_metal/fabric/physical_descriptor_builder.cpp",
+    "tt_metal/fabric/physical_system_descriptor_diff.cpp",
     "tt_metal/fabric/topology_mapper.cpp",
     "tt_metal/fabric/topology_mapper_utils.cpp",
     "tt_metal/fabric/topology_solver.cpp",
@@ -1142,8 +1160,10 @@ cc_library(
         "tt_metal/distributed/h2d_socket.cpp",
         "tt_metal/distributed/h2d_stream_service_descriptor.cpp",
         "tt_metal/distributed/hd_socket_descriptor.cpp",
+        "tt_metal/distributed/host_region.cpp",
         "tt_metal/distributed/inter_process_counter_channel.cpp",
         "tt_metal/distributed/mesh_buffer.cpp",
+        "tt_metal/distributed/mesh_socket_utils.cpp",
         "tt_metal/distributed/mesh_command_queue_base.cpp",
         "tt_metal/distributed/mesh_device.cpp",
         "tt_metal/distributed/mesh_device_view.cpp",
@@ -1181,7 +1201,9 @@ cc_library(
         "tt_metal/impl/buffers/cross_node_dfb.cpp",
         "tt_metal/impl/buffers/dispatch.cpp",
         "tt_metal/impl/buffers/prefetcher_pipe.cpp",
+        "tt_metal/impl/buffers/prefetcher_pipe_dram_sender.cpp",
         "tt_metal/impl/buffers/drisc_l1_arena.cpp",
+        "tt_metal/impl/buffers/dram_sender_topology.cpp",
         "tt_metal/impl/buffers/global_circular_buffer.cpp",
         "tt_metal/impl/buffers/global_semaphore.cpp",
         "tt_metal/impl/buffers/semaphore.cpp",
@@ -1196,6 +1218,7 @@ cc_library(
         "tt_metal/impl/data_format/bfloat16_utils.cpp",
         "tt_metal/impl/data_format/blockfloat_common.cpp",
         "tt_metal/impl/data_format/float8.cpp",
+        "tt_metal/impl/data_format/hw_data_format.cpp",
         "tt_metal/impl/data_format/int8.cpp",
         "tt_metal/impl/data_format/mx_common.cpp",
         "tt_metal/impl/data_format/mxint.cpp",
@@ -1234,6 +1257,7 @@ cc_library(
         "tt_metal/impl/dispatch/dispatch_query_manager.cpp",
         "tt_metal/impl/dispatch/dispatch_telemetry.cpp",
         "tt_metal/impl/dispatch/hardware_command_queue.cpp",
+        "tt_metal/impl/dispatch/host_device_transfer.cpp",
         "tt_metal/impl/dispatch/host_runtime_commands.cpp",
         "tt_metal/impl/dispatch/kernel_config/dispatch.cpp",
         "tt_metal/impl/dispatch/kernel_config/dispatch_s.cpp",
@@ -1265,8 +1289,34 @@ cc_library(
         "tt_metal/impl/memory_tracking/memory_stats_shm.cpp",
         "tt_metal/impl/memory_tracking/shm_tracking_processor.cpp",
         "tt_metal/impl/memory_tracking/update_allocator_stats.cpp",
+        "tt_metal/impl/metal2_host_api/llk_metadata.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/collection/collect_metadata.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/program_spec.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/validate_spec.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/hardware_config.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/kernel_spec.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/placement/dfb.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/placement/kernel.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/placement/placement.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/placement/scratchpad.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/placement/work_unit.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/program_spec.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/resource/dfb.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/resource/prefetcher_pipe.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/resource/resource.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/resource/scratchpad.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/resource/semaphore.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/validation/resource/tensor.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/construction/construct_program.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/construction/kernel_lowering.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/construction/resource/dfb.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/construction/resource/prefetcher_pipe.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/construction/resource/resource.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/construction/resource/scratchpad.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/construction/resource/semaphore.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/construction/resource/tensor.cpp",
+        "tt_metal/impl/metal2_host_api/program_spec/construction/processor_assignment/processor_assignment.cpp",
         "tt_metal/impl/metal2_host_api/program_run_args.cpp",
-        "tt_metal/impl/metal2_host_api/program_spec.cpp",
         "tt_metal/impl/metal2_host_api/tensor_spec_relaxations.cpp",
         "tt_metal/impl/per_core_allocation/buffer.cpp",
         "tt_metal/impl/per_core_allocation/memory_config.cpp",
@@ -1280,6 +1330,7 @@ cc_library(
         "tt_metal/impl/program/dispatch.cpp",
         "tt_metal/impl/program/kernel_compile_utils.cpp",
         "tt_metal/impl/program/program.cpp",
+        "tt_metal/impl/program/slow_dispatch.cpp",
         "tt_metal/impl/program/program_descriptor_patching.cpp",
         "tt_metal/impl/program/program_descriptors.cpp",
         "tt_metal/impl/program/program_device_map.cpp",
@@ -1296,6 +1347,7 @@ cc_library(
         "tt_metal/impl/trace/dispatch.cpp",
         "tt_metal/impl/trace/trace_buffer.cpp",
         "tt_metal/detail/reports/memory_reporter.cpp",
+        "tt_metal/llrt/binary_metadata.cpp",
         "tt_metal/llrt/core_descriptor.cpp",
         "tt_metal/llrt/firmware_capability.cpp",
         "tt_metal/llrt/hal.cpp",
@@ -1339,6 +1391,7 @@ cc_library(
         "ttnn/core/distributed/host_ccl.cpp",
         "ttnn/core/events.cpp",
         "ttnn/core/global_circular_buffer.cpp",
+        "ttnn/core/prefetcher_pipe.cpp",
         "ttnn/core/global_semaphore.cpp",
         "ttnn/core/graph/graph_processor.cpp",
         "ttnn/core/graph/graph_trace_utils.cpp",
@@ -1356,6 +1409,11 @@ cc_library(
         "ttnn/core/tensor/unit_mesh/unit_mesh_utils.cpp",
         "ttnn/cpp/tools/profiler/op_profiler_json.cpp",
         "ttnn/cpp/ttnn/graph/capture_program_config_registry.cpp",
+        "ttnn/cpp/ttnn/kernel_lib/mcast/host/mcast.cpp",
+        "ttnn/cpp/ttnn/kernel_lib/mcast/host/mcast_impl.cpp",
+        "ttnn/cpp/ttnn/kernel_lib/mcast/host/program_adapters/mcast_descriptor_adapter.cpp",
+        "ttnn/cpp/ttnn/kernel_lib/mcast/host/program_adapters/mcast_legacy_program_adapter.cpp",
+        "ttnn/cpp/ttnn/kernel_lib/mcast/host/program_adapters/mcast_spec_adapter.cpp",
         "ttnn/cpp/ttnn/operations/core/compute_kernel/compute_kernel_config.cpp",
         "ttnn/cpp/ttnn/operations/core/core.cpp",
         "ttnn/cpp/ttnn/operations/core/to_dtype/to_dtype_op.cpp",

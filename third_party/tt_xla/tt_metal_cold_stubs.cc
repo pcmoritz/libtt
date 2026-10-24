@@ -116,7 +116,7 @@ ttnn::Tensor conv3d(
     const std::optional<MemoryConfig> &,
     std::optional<DeviceComputeKernelConfig>, const std::optional<ttnn::Tensor> &,
     uint32_t, uint32_t, const std::optional<ttnn::Tensor> &, uint32_t,
-    uint32_t) {
+    uint32_t, const std::optional<ttnn::Tensor> &) {
   unsupported("ttnn::conv3d");
 }
 

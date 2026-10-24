@@ -82,13 +82,13 @@ ttnn::device_operation::ProgramArtifacts RngBitsProgramFactory::create_program_a
         .runtime_arg_schema =
             {.runtime_arg_names = {"first_tile", "num_tiles", "write_state"},
              .common_runtime_arg_names = common_arg_names},
-        .hw_config = ttnn::create_reader_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
+        .hw_config = ttnn::create_reader_datamovement_config(/*disable_dfb_implicit_sync_for_all=*/true),
     };
 
     // 32-bit DST for the integer words. Four tiles fit in each half of DST.
     const bool philox = params.algorithm == RngAlgorithm::Philox;
     const DeviceComputeKernelConfig compute_kernel_config = ttnn::ComputeKernelConfig{
-        .math_fidelity = MathFidelity::HiFi4,
+        .math_fidelity = tt::tt_metal::MathFidelity::HiFi4,
         .math_approx_mode = false,
         .fp32_dest_acc_en = true,
         .packer_l1_acc = false,
@@ -107,7 +107,7 @@ ttnn::device_operation::ProgramArtifacts RngBitsProgramFactory::create_program_a
         .compile_time_args = {{"philox", static_cast<uint32_t>(philox)}},
         .runtime_arg_schema =
             {.runtime_arg_names = {"first_tile", "num_tiles"}, .common_runtime_arg_names = common_arg_names},
-        .hw_config = ttnn::to_compute_hardware_config(device.arch(), compute_kernel_config),
+        .hw_config = ttnn::to_compute_hardware_config(compute_kernel_config),
     };
 
     KernelRunArgs mover_run_args{.kernel = MOVER};

@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_reader.cpp ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_reader.cpp
 --- ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_reader.cpp
 +++ ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_reader.cpp
-@@ -144,6 +144,27 @@ void kernel_main() {
+@@ -145,6 +145,27 @@ void kernel_main() {
                  1u});  // increment 1
      }
  
@@ -29,32 +29,30 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_read
      // Initialization barrier:
      // In some cases we don't have a guarantee that the output tensor has been allocated
      // on remote devices (every device's command queue executes asynchronously). So we wait
-@@ -312,12 +333,19 @@ void kernel_main() {
+@@ -312,9 +333,17 @@ void kernel_main() {
              fabric_connection,
              sem_route_id,
-             tt::tt_fabric::NocUnicastAtomicIncCommandHeader{barrier_sem_noc_addr_in_pkt, 0});
+             tt::tt_fabric::NocUnicastAtomicIncCommandHeader{done_sem_noc_addr_in_pkt, 0});
 +        if constexpr (load_balance_across_alt_routes) {
 +            fabric_api::fabric_multicast_noc_unicast_atomic_inc_with_state<UnicastAtomicIncUpdateMask::DstAddr>(
 +                fabric_connection,
 +                sem_route_id_alt,
-+                tt::tt_fabric::NocUnicastAtomicIncCommandHeader{barrier_sem_noc_addr_in_pkt, 0});
++                tt::tt_fabric::NocUnicastAtomicIncCommandHeader{done_sem_noc_addr_in_pkt, 0});
 +        }
      }
--    noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(barrier_sem), barrier_wait_value);
+-    noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(done_sem), barrier_wait_value);
+-    noc_semaphore_inc(safe_get_noc_addr(sem_noc0_x, sem_noc0_y, done_sem), (uint32_t)(-(int32_t)barrier_wait_value));
 +    const uint32_t completion_wait_value = barrier_wait_value * (load_balance_across_alt_routes ? 2 : 1);
-+    noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(barrier_sem), completion_wait_value);
-     // Atomic decrement (add -value), not reset to 0, so any increments from other phases are preserved.
-     noc_semaphore_inc(
-         safe_get_noc_addr(barrier_sem_noc0_x, barrier_sem_noc0_y, barrier_sem),
--        (uint32_t)(-(int32_t)barrier_wait_value));
-+        (uint32_t)(-(int32_t)completion_wait_value));
++    noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(done_sem), completion_wait_value);
++    noc_semaphore_inc(
++        safe_get_noc_addr(sem_noc0_x, sem_noc0_y, done_sem), (uint32_t)(-(int32_t)completion_wait_value));
+     noc.async_atomic_barrier();
  
      if constexpr (enable_fabric) {
-         close_connections(fabric_connection);
 diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_writer.cpp ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_writer.cpp
 --- ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_writer.cpp
 +++ ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_writer.cpp
-@@ -136,6 +136,27 @@ void kernel_main() {
+@@ -137,6 +137,27 @@ void kernel_main() {
                  1u});  // increment 1
      }
  
@@ -82,15 +80,15 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_writ
      // Initialization barrier:
      // In some cases we don't have a guarantee that the output tensor has been allocated
      // on remote devices (every device's command queue executes asynchronously). So we wait
-@@ -239,6 +260,12 @@ void kernel_main() {
+@@ -238,6 +259,12 @@ void kernel_main() {
              fabric_connection,
              sem_route_id,
-             tt::tt_fabric::NocUnicastAtomicIncCommandHeader{barrier_sem_noc_addr_in_pkt, 0});
+             tt::tt_fabric::NocUnicastAtomicIncCommandHeader{done_sem_noc_addr_in_pkt, 0});
 +        if constexpr (load_balance_across_alt_routes) {
 +            fabric_api::fabric_multicast_noc_unicast_atomic_inc_with_state<UnicastAtomicIncUpdateMask::DstAddr>(
 +                fabric_connection,
 +                sem_route_id_alt,
-+                tt::tt_fabric::NocUnicastAtomicIncCommandHeader{barrier_sem_noc_addr_in_pkt, 0});
++                tt::tt_fabric::NocUnicastAtomicIncCommandHeader{done_sem_noc_addr_in_pkt, 0});
 +        }
      }
  
