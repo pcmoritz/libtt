@@ -239,5 +239,81 @@ TEST_F(MaskedReduceTest, ChunkedRows) {
     check<float>(2, 8576, DataType::FLOAT32, {.infinities = true, .chunked = true});
 }
 
+// Total, Max and ArgFirst on chunked rows: argmax is ArgFirst(x >= Max(x)).
+class MaskedReduceModesTest : public MaskedReduceTest {
+protected:
+    void check_modes(uint32_t batch, uint32_t rows, uint32_t width) {
+        const uint32_t total_rows = batch * rows;
+        std::mt19937 rng(11);
+        std::normal_distribution<float> dist(0.0f, 4.0f);
+        std::vector<float> values(static_cast<size_t>(total_rows) * width);
+        for (auto& v : values) {
+            v = dist(rng) - 20.0f;  // all negative: zero padding must not win a max
+        }
+        std::vector<uint32_t> in_shape = {total_rows, width / 32, 32};
+        std::vector<uint32_t> t_shape = {total_rows};
+        if (batch > 1) {
+            in_shape = {batch, rows, width / 32, 32};
+            t_shape = {batch, rows};
+        }
+        auto input = to_device(values, in_shape, DataType::FLOAT32);
+        auto zeros = to_device(std::vector<float>(total_rows, 0.0f), t_shape, DataType::FLOAT32);
+        auto total = ttnn::experimental::masked_reduce(input, zeros, MaskedCompare::GE, MaskedMode::Total)
+                         .cpu()
+                         .to_vector<float>();
+        auto max_t = ttnn::experimental::masked_reduce(input, zeros, MaskedCompare::GE, MaskedMode::Max);
+        auto max = max_t.cpu().to_vector<float>();
+        auto arg = ttnn::experimental::masked_reduce(
+                       input, max_t, MaskedCompare::GE, MaskedMode::ArgFirst, DataType::INT32)
+                       .cpu()
+                       .to_vector<int32_t>();
+        // The first element above the row's 0.99 quantile-ish threshold, and none above +inf.
+        std::vector<float> above(total_rows);
+        for (uint32_t r = 0; r < total_rows; ++r) {
+            above[r] = values[static_cast<size_t>(r) * width + (r * 131) % width] + 0.5f;
+        }
+        auto above_t = to_device(above, t_shape, DataType::FLOAT32);
+        auto first = ttnn::experimental::masked_reduce(
+                         input, above_t, MaskedCompare::GT, MaskedMode::ArgFirst, DataType::INT32)
+                         .cpu()
+                         .to_vector<int32_t>();
+        auto inf_t = to_device(
+            std::vector<float>(total_rows, std::numeric_limits<float>::infinity()), t_shape, DataType::FLOAT32);
+        auto none = ttnn::experimental::masked_reduce(
+                        input, inf_t, MaskedCompare::GT, MaskedMode::ArgFirst, DataType::INT32)
+                        .cpu()
+                        .to_vector<int32_t>();
+        for (uint32_t r = 0; r < total_rows; ++r) {
+            const float* row = &values[static_cast<size_t>(r) * width];
+            double sum = 0;
+            uint32_t best = 0;
+            int32_t first_above = 0;
+            bool found = false;
+            for (uint32_t w = 0; w < width; ++w) {
+                sum += row[w];
+                if (row[w] > row[best]) {
+                    best = w;
+                }
+                if (!found && row[w] > above[r]) {
+                    first_above = static_cast<int32_t>(w);
+                    found = true;
+                }
+            }
+            EXPECT_NEAR(total[r], sum, 1e-5 * std::abs(sum)) << "row " << r;
+            EXPECT_EQ(max[r], row[best]) << "row " << r;
+            EXPECT_EQ(arg[r], static_cast<int32_t>(best)) << "row " << r;
+            EXPECT_EQ(first[r], first_above) << "row " << r;
+            EXPECT_EQ(none[r], 0) << "row " << r;
+        }
+    }
+};
+
+TEST_F(MaskedReduceModesTest, ChunkedTotalMaxArgFirst) {
+    check_modes(1, 2, 151936);
+    check_modes(1, 3, 8576);
+    check_modes(1, 33, 1024);
+    check_modes(2, 5, 2048);
+}
+
 }  // namespace
 }  // namespace tt::tt_metal::distributed::test

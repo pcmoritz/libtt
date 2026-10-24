@@ -55,6 +55,9 @@ constexpr int64_t kMaxRows = 16;
 constexpr int64_t kMinWidth = 2048;
 // A loop body runs many times; weigh it by about a search's trip count.
 constexpr double kLoopWeight = 32;
+// A region must save more than its edges cost (a reshape costs about what a
+// wide op saves).
+constexpr double kMinGain = 1;
 
 bool isWide(Type type) {
   auto tensor = dyn_cast<RankedTensorType>(type);
@@ -157,6 +160,38 @@ bool isChunkableBroadcast(Operation *op) {
            isWide(input)));
 }
 
+// An argmax over the last dimension of a wide FP32 tensor: masked_reduce
+// finds it in the chunked shape as the first element at the maximum.
+bool isChunkableArgMax(Operation *op) {
+  auto argmax = dyn_cast<ArgMaxOp>(op);
+  if (!argmax || !isWide(argmax.getInput().getType()) ||
+      !cast<RankedTensorType>(argmax.getInput().getType())
+           .getElementType()
+           .isF32()) {
+    return false;
+  }
+  auto dims = argmax.getDimArgAttr();
+  auto input = cast<RankedTensorType>(argmax.getInput().getType());
+  if (!dims || dims.size() != 1) {
+    return false;
+  }
+  const int64_t dim = cast<IntegerAttr>(dims[0]).getInt();
+  return dim == input.getRank() - 1 || dim == -1;
+}
+
+// A mesh partition of a wide tensor's rows into wide shards whose chunks
+// split evenly: the chunked tensor partitions along its chunks.
+bool isChunkableMeshPartition(Operation *op) {
+  auto partition = dyn_cast<MeshPartitionOp>(op);
+  if (!partition || !isWide(partition.getInput().getType()) ||
+      !isWide(partition.getResult().getType())) {
+    return false;
+  }
+  auto input = cast<RankedTensorType>(partition.getInput().getType());
+  const int64_t dim = partition.getDim();
+  return dim == input.getRank() - 1 || dim == -1;
+}
+
 // The reductions TTNN runs over two dimensions (not prod).
 bool isChunkableReduction(Operation *op) {
   if (!isa<SumOp, MaxOp, MinOp, MeanOp>(op) ||
@@ -197,7 +232,8 @@ bool isChunkableConstant(Operation *op) {
 // Whether `user` takes a chunked operand without a reshape.
 bool takesChunked(Operation *user) {
   return isChunkableElementwise(user) || isChunkableBroadcast(user) ||
-         isChunkableReduction(user) || isChunkableMaskedReduce(user);
+         isChunkableReduction(user) || isChunkableMaskedReduce(user) ||
+         isChunkableArgMax(user) || isChunkableMeshPartition(user);
 }
 
 // How a region produces or consumes a value: unknown uses count as edges.
@@ -362,6 +398,15 @@ private:
       setProducer(op->getResult(0), Role::Chunked);
       return;
     }
+    if (isChunkableMeshPartition(op)) {
+      Value out = op->getResult(0);
+      addValue(out);
+      setProducer(out, Role::Chunked);
+      unite(out, op->getOperand(0));
+      setConsumer(op->getOpOperand(0), Role::Chunked);
+      computeOps.push_back(op);
+      return;
+    }
     // libtt's native generator numbers the bits by their row-major index, so
     // any shape of the same elements holds the same bits.
     if (auto rng = dyn_cast<RngBitGeneratorOp>(op);
@@ -372,43 +417,18 @@ private:
       markEdgeResults(op);
       return;
     }
-    if (isChunkableReduction(op) || isChunkableMaskedReduce(op)) {
+    if (isChunkableReduction(op) || isChunkableMaskedReduce(op) ||
+        isChunkableArgMax(op)) {
       addValue(op->getOperand(0));
       setConsumer(op->getOpOperand(0), Role::Chunked);
       computeOps.push_back(op);
       return;
     }
     if (auto caseOp = dyn_cast<ttcore::CaseOp>(op)) {
-      auto it = caseBranches.find(op);
-      if (it != caseBranches.end()) {
-        for (OpOperand &use : caseOp.getInputsMutable()) {
-          if (!isWide(use.get().getType())) {
-            continue;
-          }
-          const unsigned index =
-              use.getOperandNumber() - caseOp.getInputs().getBeginOperandIndex();
-          setConsumer(use, Role::Chunked);
-          for (func::FuncOp branch : it->second) {
-            BlockArgument arg = branch.getArgument(index);
-            unite(use.get(), arg);
-            linkedArgs.insert(arg);
-            setProducer(arg, Role::Chunked);
-          }
-        }
-        for (OpResult result : caseOp->getResults()) {
-          if (!isWide(result.getType())) {
-            continue;
-          }
-          addValue(result);
-          setProducer(result, Role::Chunked);
-          for (func::FuncOp branch : it->second) {
-            auto ret = cast<func::ReturnOp>(branch.front().getTerminator());
-            OpOperand &operand = ret->getOpOperand(result.getResultNumber());
-            unite(result, operand.get());
-            setConsumer(operand, Role::Chunked);
-          }
-        }
-        return;
+      // Edges for now: linkCases joins a case to its branches where both
+      // sides of a link are chunked anyway.
+      if (caseBranches.contains(op)) {
+        cases.push_back(op);
       }
     }
     if (auto loop = dyn_cast<ttcore::WhileLoopOp>(op)) {
@@ -450,6 +470,66 @@ private:
     markEdgeResults(op);
   }
 
+  bool isChunked(Value value) { return chunkedRoots.contains(find(value)); }
+  void uniteChunked(Value a, Value b) {
+    const bool chunk = isChunked(a) || isChunked(b);
+    unite(a, b);
+    if (chunk) {
+      chunkedRoots.insert(find(a));
+    }
+  }
+
+  // A case passes a chunked operand on chunked (its branches' arguments join
+  // the operand's region), and returns a result chunked when every branch
+  // returns it chunked. Chunking flows only from a side that chose it, so an
+  // unlikely branch's ops never pull reshapes onto the path around them.
+  void linkCases() {
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (Operation *op : cases) {
+        auto caseOp = cast<ttcore::CaseOp>(op);
+        ArrayRef<func::FuncOp> branches = caseBranches[op];
+        for (OpOperand &use : caseOp.getInputsMutable()) {
+          if (!isWide(use.get().getType()) || isChunkedUse(use) ||
+              !isChunked(use.get())) {
+            continue;
+          }
+          const unsigned index =
+              use.getOperandNumber() - caseOp.getInputs().getBeginOperandIndex();
+          for (func::FuncOp branch : branches) {
+            BlockArgument arg = branch.getArgument(index);
+            uniteChunked(use.get(), arg);
+            setProducer(arg, Role::Chunked);
+          }
+          setConsumer(use, Role::Chunked);
+          changed = true;
+        }
+        for (OpResult result : caseOp->getResults()) {
+          if (!isWide(result.getType()) ||
+              producers.lookup(result) == Role::Chunked) {
+            continue;
+          }
+          auto operandOf = [&](func::FuncOp branch) -> OpOperand & {
+            auto ret = cast<func::ReturnOp>(branch.front().getTerminator());
+            return ret->getOpOperand(result.getResultNumber());
+          };
+          if (!llvm::all_of(branches, [&](func::FuncOp branch) {
+                return isChunked(operandOf(branch).get());
+              })) {
+            continue;
+          }
+          for (func::FuncOp branch : branches) {
+            OpOperand &operand = operandOf(branch);
+            uniteChunked(result, operand.get());
+            setConsumer(operand, Role::Chunked);
+          }
+          setProducer(result, Role::Chunked);
+          changed = true;
+        }
+      }
+    }
+  }
+
   void markEdgeResults(Operation *op) {
     for (Value result : op->getResults()) {
       if (isWide(result.getType())) {
@@ -489,11 +569,31 @@ private:
       regions[find(anchor)].benefit += weightOf(op);
     }
 
-    llvm::SetVector<func::FuncOp> retyped;
+    const char *debug = std::getenv("LIBTT_DENSE_ROWS_DEBUG");
     for (auto &[root, region] : regions) {
-      if (region.benefit > region.cost) {
-        chunkRegion(region.values, retyped);
+      const bool chunk = region.benefit > kMinGain * region.cost;
+      if (debug && region.benefit > 0) {
+        llvm::errs() << "ttir-dense-rows: region of " << region.values.size()
+                     << " values at " << root.getLoc() << ": benefit "
+                     << region.benefit << ", cost " << region.cost
+                     << (chunk ? ", chunked\n" : ", kept\n");
       }
+      if (chunk) {
+        chunkedRoots.insert(root);
+      }
+    }
+    linkCases();
+
+    llvm::MapVector<Value, SmallVector<Value>> chunked;
+    for (Value value : all) {
+      Value root = find(value);
+      if (chunkedRoots.contains(root)) {
+        chunked[root].push_back(value);
+      }
+    }
+    llvm::SetVector<func::FuncOp> retyped;
+    for (auto &[root, values] : chunked) {
+      chunkRegion(values, retyped);
     }
     for (func::FuncOp func : retyped) {
       auto ret = cast<func::ReturnOp>(func.front().getTerminator());
@@ -600,6 +700,11 @@ private:
                                 .reshape(cast<ShapedType>(constant.getType())));
       return;
     }
+    if (auto partition = dyn_cast<MeshPartitionOp>(def)) {
+      // Along the chunks, at the same (positive) index.
+      partition.setDim(wide.getRank() - 1);
+      return;
+    }
     if (isa<FullOp, ZerosOp, OnesOp>(def)) {
       auto type = cast<RankedTensorType>(def->getResult(0).getType());
       SmallVector<int32_t> shape(type.getShape().begin(), type.getShape().end());
@@ -625,12 +730,22 @@ private:
       retyped.insert(ret->getParentOfType<func::FuncOp>());
       return;
     }
-    if (!isa<SumOp, MaxOp, MinOp, MeanOp>(
-            user)) {
+    if (isa<ArgMaxOp>(user)) {
+      rewriteArgMax(cast<ArgMaxOp>(user));
+      return;
+    }
+    if (!isa<SumOp, MaxOp, MinOp, MeanOp>(user)) {
+      return;
+    }
+    auto input = cast<RankedTensorType>(user->getOperand(0).getType());
+    if (isa<SumOp, MaxOp>(user) && input.getElementType().isF32()) {
+      // masked_reduce reduces each row's [N, 32] matrix in one pass on all
+      // cores; TTNN's two-dimensional reduction does not parallelize these.
+      rewriteAsMaskedReduce(user, isa<SumOp>(user) ? ttcore::MaskedMode::Total
+                                                   : ttcore::MaskedMode::Max);
       return;
     }
     // A reduction over the last dimension now reduces the last two.
-    auto input = cast<RankedTensorType>(user->getOperand(0).getType());
     OpBuilder builder(user->getContext());
     const int32_t rank = input.getRank();
     user->setAttr("dim_arg", builder.getI32ArrayAttr({rank - 2, rank - 1}));
@@ -644,6 +759,66 @@ private:
     }
   }
 
+  // masked_reduce of the chunked `input` [..., H, N, 32] in `mode`, against
+  // `threshold` ([..., H], or zeros for the modes that read none), as
+  // [..., H] values of `elementType` (FP32 or I32).
+  Value maskedReduce(OpBuilder &builder, Location loc, Value input,
+                     Value threshold, ttcore::MaskedCompare compare,
+                     ttcore::MaskedMode mode, Type elementType) {
+    auto type = cast<RankedTensorType>(input.getType());
+    ArrayRef<int64_t> rows = type.getShape().drop_back(2);
+    if (!threshold) {
+      threshold = builder.create<FullOp>(
+          loc, RankedTensorType::get(rows, type.getElementType()),
+          builder.getF32FloatAttr(0.0f));
+    }
+    return builder.create<MaskedReduceOp>(
+        loc, RankedTensorType::get(rows, elementType), input, threshold,
+        ttcore::MaskedCompareAttr::get(builder.getContext(), compare),
+        ttcore::MaskedModeAttr::get(builder.getContext(), mode));
+  }
+
+  // `value` [..., H] in `op`'s result type (keep_dim: [..., H, 1]).
+  Value asResult(OpBuilder &builder, Operation *op, Value value) {
+    auto type = cast<RankedTensorType>(op->getResult(0).getType());
+    auto valueType = cast<RankedTensorType>(value.getType());
+    if (valueType.getElementType() != type.getElementType()) {
+      value = builder.create<TypecastOp>(
+          op->getLoc(),
+          RankedTensorType::get(valueType.getShape(), type.getElementType()),
+          value);
+    }
+    if (valueType.getShape() != type.getShape()) {
+      value = createReshape(builder, op->getLoc(), value, type);
+    }
+    return value;
+  }
+
+  void rewriteAsMaskedReduce(Operation *op, ttcore::MaskedMode mode) {
+    OpBuilder builder(op);
+    Value result =
+        maskedReduce(builder, op->getLoc(), op->getOperand(0), nullptr,
+                     ttcore::MaskedCompare::GE, mode, builder.getF32Type());
+    op->getResult(0).replaceAllUsesWith(asResult(builder, op, result));
+    op->erase();
+  }
+
+  // argmax = the first index whose element is at least the maximum.
+  void rewriteArgMax(ArgMaxOp argmax) {
+    OpBuilder builder(argmax);
+    Location loc = argmax.getLoc();
+    Value input = argmax.getInput();
+    Value max = maskedReduce(builder, loc, input, nullptr,
+                             ttcore::MaskedCompare::GE, ttcore::MaskedMode::Max,
+                             builder.getF32Type());
+    Value index = maskedReduce(builder, loc, input, max,
+                               ttcore::MaskedCompare::GE,
+                               ttcore::MaskedMode::ArgFirst,
+                               builder.getIntegerType(32));
+    argmax.getResult().replaceAllUsesWith(asResult(builder, argmax, index));
+    argmax->erase();
+  }
+
   ModuleOp module;
   llvm::MapVector<Value, Value> parent;
   llvm::DenseMap<Value, Role> producers;
@@ -651,6 +826,8 @@ private:
   SmallVector<Operation *> computeOps;
   llvm::DenseSet<Value> linkedArgs;
   llvm::DenseMap<Operation *, SmallVector<func::FuncOp>> caseBranches;
+  SmallVector<Operation *> cases;
+  llvm::DenseSet<Value> chunkedRoots;
   llvm::DenseMap<Operation *, func::FuncOp> loopBody;
   // A callee's caller op and how often the callee runs per caller run.
   llvm::DenseMap<func::FuncOp, std::pair<Operation *, double>> callers;

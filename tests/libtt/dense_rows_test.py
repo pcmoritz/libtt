@@ -88,6 +88,8 @@ def test_softmax_and_log_probs(trace, tmp_path):
         return p, jnp.log(p).clip(min=jnp.finfo(jnp.float32).min), jnp.sum(p, axis=-1)
 
     p, logp, total = _compare(fn, (X, T), trace, tmp_path)
+    # Its max and sums run as masked reductions of the chunked rows.
+    assert "ttnn.masked_reduce" in _runtime_ir(tmp_path)
     z = X / T[:, None]
     ref = np.exp(z - z.max(-1, keepdims=True))
     ref /= ref.sum(-1, keepdims=True)
@@ -134,15 +136,28 @@ def test_row_and_column_operands(trace, tmp_path):
 
 @pytest.mark.parametrize("trace", [False, True])
 def test_cond_branches(trace, tmp_path):
+    # Chunked before the cond for its own sake, then in both branches and
+    # after: the chunked value flows through the case.
     def fn(x, t, b):
-        return lax.cond(b, lambda y: y * 2.0 + 1.0, lambda y: y - jnp.max(y, axis=-1, keepdims=True), x / t[:, None])
+        z = jnp.exp(x / t[:, None]) * 2.0 - 1.0
+        y = lax.cond(b, lambda y: y * 2.0 + 1.0, lambda y: y - jnp.max(y, axis=-1, keepdims=True), z)
+        return jnp.abs(y) * 0.5
 
     for b in (True, False):
-        out = _compare(fn, (X, T, np.bool_(b)), trace, tmp_path / str(b), exact=True)
-        z = X / T[:, None]
-        ref = z * 2 + 1 if b else z - z.max(-1, keepdims=True)
-        # TT's divide is within an ulp.
-        np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5)
+        out = _compare(fn, (X, T, np.bool_(b)), trace, tmp_path / str(b))
+        z = np.exp(X / T[:, None]) * 2 - 1
+        ref = np.abs(z * 2 + 1 if b else z - z.max(-1, keepdims=True)) * 0.5
+        np.testing.assert_allclose(out, ref, rtol=3e-2, atol=1e-3)
+
+
+def test_unlikely_branch_stays_wide(tmp_path):
+    # A penalty-like branch alone is not worth reshaping its input and output
+    # on the path around it.
+    def fn(x, penalty, b):
+        return lax.cond(b, lambda y: y - penalty * 2.0, lambda y: y, x)
+
+    penalty = np.abs(X)
+    _compare(fn, (X, penalty, np.bool_(False)), False, tmp_path, exact=True, chunked=False)
 
 
 @pytest.mark.parametrize("trace", [False, True])
@@ -168,6 +183,7 @@ def test_gumbel_argmax(trace, tmp_path):
         return jnp.argmax(x / t[:, None] - jnp.log(-jnp.log(u)), axis=-1)
 
     out = _compare(fn, (X, T, bits), trace, tmp_path)
+    assert "ttnn.argmax" not in _runtime_ir(tmp_path)
     u = ((bits >> 9) | np.uint32(0x3F800000)).view(np.float32) - 1.0
     u = np.maximum(u, np.finfo(np.float32).tiny)
     noisy = X / T[:, None] - np.log(-np.log(u))
@@ -181,3 +197,14 @@ def test_narrow_rows_stay(tmp_path):
     dense = _run(lambda x: jnp.exp(x) * 2.0, (x,), False, tmp_path, dense=True)
     np.testing.assert_array_equal(dense, plain)
     assert "x32x32x" not in _runtime_ir(tmp_path)
+
+
+@pytest.mark.parametrize("trace", [False, True])
+def test_argmax_ties_take_the_first(trace, tmp_path):
+    x = np.zeros((2, W), np.float32)
+    x[0, [17, 4000, 8000]] = 3.0  # three maxima: the first wins
+    # row 1: all equal, index 0
+
+    out = _compare(lambda x: jnp.argmax(x * 2.0, axis=-1), (x,), trace, tmp_path)
+    np.testing.assert_array_equal(out, [17, 0])
+

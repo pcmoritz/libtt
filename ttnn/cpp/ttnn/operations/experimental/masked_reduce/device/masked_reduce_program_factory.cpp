@@ -134,7 +134,8 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
         "row_slot",
         "row_count",
         "row_master_x",
-        "row_master_y"};
+        "row_master_y",
+        "first_in_row"};
     const std::string kernel_dir = "ttnn/cpp/ttnn/operations/experimental/masked_reduce/device/kernels/";
     KernelSpec reader{
         .unique_id = READER,
@@ -175,6 +176,7 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
              {"partial_tiles", partial_tiles},
              {"row_form", row_form ? 1u : 0u},
              {"chunked", chunked ? 1u : 0u},
+             {"mode", static_cast<uint32_t>(params.mode)},
              {"int_output", output.dtype() == tt::tt_metal::DataType::INT32 ? 1u : 0u}},
         .runtime_arg_schema = {.runtime_arg_names = runtime_arg_names},
         .hw_config = ttnn::create_writer_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
@@ -274,7 +276,8 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
                  {"row_slot", h % TILE_HEIGHT},
                  {"row_count", row_count},
                  {"row_master_x", static_cast<uint32_t>(row_master.x)},
-                 {"row_master_y", static_cast<uint32_t>(row_master.y)}});
+                 {"row_master_y", static_cast<uint32_t>(row_master.y)},
+                 {"first_in_row", first}});
         }
     }
     ProgramSpec spec{
