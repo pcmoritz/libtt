@@ -22,7 +22,6 @@
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/dataflow/noc.h"
 #include "api/dataflow/noc_semaphore.h"
-#include "api/scratchpad.h"
 #include "api/tensor/noc_traits.h"
 #include "experimental/kernel_args.h"
 
@@ -51,8 +50,7 @@ void kernel_main() {
     const uint32_t remote_workers = get_arg(args::remote_workers);
     const uint32_t row_slot = get_arg(args::row_slot);
     const uint32_t row_count = get_arg(args::row_count);
-    const uint32_t row_master_x = get_arg(args::row_master_x);
-    const uint32_t row_master_y = get_arg(args::row_master_y);
+    const uint32_t workers_per_row = get_arg(args::workers_per_row);
     constexpr uint32_t cols = get_arg(args::cols);
     constexpr uint32_t partial_tiles = get_arg(args::partial_tiles);
     constexpr uint32_t row_form = get_arg(args::row_form);
@@ -76,8 +74,6 @@ void kernel_main() {
     DataflowBuffer out_dfb(dfb::out);
     DataflowBuffer part_dfb(dfb::part);
     Semaphore done(sem::done);
-    Semaphore row_done(sem::row_done);
-    Scratchpad<uint32_t> row_slots(scratch::row);
     const auto output = TensorAccessor(tensor::output);
     Noc noc;
 
@@ -88,14 +84,19 @@ void kernel_main() {
     const uint32_t part_base = part_dfb.get_write_ptr();
     const uint32_t slot_addr = part_base + (col / 32) * tile_bytes;
     const uint32_t c = col % 32;
+    // A chunked input's cores send one slot each, their matrix's value, into
+    // row row_slot of the partials of the result row's writer (the master):
+    // partial row m collects matrix m of the row, and the master's compute
+    // pass totals every matrix of the row at once.
+    const uint32_t part_rows = chunked ? row_count : rows;
     if (is_master) {
         part_dfb.reserve_back(partial_tiles);
         // Columns past the row's cores in the last partial tile are never
-        // written: zero them before counting the others' slots.
-        if (cols > col + 4 * (remote_workers + 1)) {
+        // written: fill them before counting the others' slots.
+        if (cols > 4 * workers_per_row) {
             auto* last = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(part_base + (partial_tiles - 1) * tile_bytes);
-            for (uint32_t m = 0; m < rows; ++m) {
-                for (uint32_t cc = 4 * (remote_workers + 1) % 32; cc < 32; ++cc) {
+            for (uint32_t m = 0; m < part_rows; ++m) {
+                for (uint32_t cc = 4 * workers_per_row % 32; cc < 32; ++cc) {
                     last[elem_offset(m, cc) / 4] = fill;
                 }
             }
@@ -108,41 +109,53 @@ void kernel_main() {
 
     // Row sums, read before the staging area (face 0's first rows) is reused.
     float sums[32];
-    for (uint32_t m = 0; m < rows; ++m) {
-        float s = 0.0f;
-        if (num_tiles != 0) {
-            for (uint32_t jj = 0; jj < pack; ++jj) {
-                const uint32_t bits = tile[elem_offset(jj * stride + m, face_rows) / 4];
-                s += __builtin_bit_cast(float, bits);
-            }
+    if constexpr (chunked) {
+        // The matrix's value over this core's tiles: its rows combined.
+        float v = __builtin_bit_cast(float, tile[elem_offset(0, face_rows) / 4]);
+        for (uint32_t m = 1; m < rows; ++m) {
+            v = combine(v, __builtin_bit_cast(float, tile[elem_offset(m, face_rows) / 4]));
         }
-        sums[m] = s;
+        sums[0] = v;
+    } else {
+        for (uint32_t m = 0; m < rows; ++m) {
+            float s = 0.0f;
+            if (num_tiles != 0) {
+                for (uint32_t jj = 0; jj < pack; ++jj) {
+                    const uint32_t bits = tile[elem_offset(jj * stride + m, face_rows) / 4];
+                    s += __builtin_bit_cast(float, bits);
+                }
+            }
+            sums[m] = s;
+        }
     }
+    // The slots this core sends: one per row, or its matrix's at row row_slot.
+    const uint32_t slot_first = chunked ? row_slot : 0;
+    const uint32_t slot_count = chunked ? 1 : rows;
     if (is_master) {
         // This core's own slots go straight into its partials.
         auto* part = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot_addr);
-        for (uint32_t m = 0; m < rows; ++m) {
-            const uint32_t at = elem_offset(m, c) / 4;
-            part[at] = __builtin_bit_cast(uint32_t, sums[m]);
+        for (uint32_t i = 0; i < slot_count; ++i) {
+            const uint32_t at = elem_offset(slot_first + i, c) / 4;
+            part[at] = __builtin_bit_cast(uint32_t, sums[i]);
             part[at + 1] = fill;
             part[at + 2] = fill;
             part[at + 3] = fill;
         }
     } else {
         // Staging: row m's 16-byte slot at m * 16, written to the master.
-        for (uint32_t m = 0; m < rows; ++m) {
-            tile[4 * m] = __builtin_bit_cast(uint32_t, sums[m]);
-            tile[4 * m + 1] = fill;
-            tile[4 * m + 2] = fill;
-            tile[4 * m + 3] = fill;
+        for (uint32_t i = 0; i < slot_count; ++i) {
+            tile[4 * i] = __builtin_bit_cast(uint32_t, sums[i]);
+            tile[4 * i + 1] = fill;
+            tile[4 * i + 2] = fill;
+            tile[4 * i + 3] = fill;
         }
-        for (uint32_t m = 0; m < rows; ++m) {
+        for (uint32_t i = 0; i < slot_count; ++i) {
             noc.async_write(
                 out_dfb,
                 UnicastEndpoint{},
                 slot_bytes,
-                {.offset_bytes = m * slot_bytes},
-                {.noc_x = master_x, .noc_y = master_y, .addr = slot_addr + elem_offset(m, c)});
+                {.offset_bytes = i * slot_bytes},
+                {.noc_x = master_x, .noc_y = master_y, .addr = slot_addr + elem_offset(slot_first + i, c)});
         }
         noc.async_write_barrier();
         done.up(noc, master_x, master_y, 1);
@@ -171,43 +184,22 @@ void kernel_main() {
         }
     }
     if constexpr (chunked) {
-        // The matrix's total is its rows' sum. The first matrix of a result
-        // row collects the others' in 16-byte slots and writes the row.
-        float total = __builtin_bit_cast(float, res[elem_offset(0, face_rows) / 4]);
-        for (uint32_t m = 1; m < rows; ++m) {
-            total = combine(total, __builtin_bit_cast(float, res[elem_offset(m, face_rows) / 4]));
-        }
-        // An index past the matrix (nothing compared true) reads as 0.
-        if constexpr (mode == mode_arg_first) {
-            total = total < 16777216.0f ? total : 0.0f;
-        }
-        const uint32_t value =
-            int_output ? static_cast<uint32_t>(static_cast<int32_t>(total)) : __builtin_bit_cast(uint32_t, total);
-        const uint32_t slots = row_slots.get_base_address();
-        if (row_slot != 0) {
-            res[0] = value;
-            res[1] = 0;
-            res[2] = 0;
-            res[3] = 0;
-            noc.async_write(
-                out_dfb,
-                UnicastEndpoint{},
-                slot_bytes,
-                {.offset_bytes = 0},
-                {.noc_x = row_master_x, .noc_y = row_master_y, .addr = slots + row_slot * slot_bytes});
-            noc.async_write_barrier();
-            row_done.up(noc, row_master_x, row_master_y, 1);
-            noc_async_atomic_barrier();
-            out_dfb.pop_front(1);
-            return;
-        }
-        if (row_count > 1) {
-            row_done.wait(row_count - 1);
-            row_done.set(0);
-        }
-        auto* slot = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slots);
+        // Partial row m totals matrix m of the result row.
         for (uint32_t m = 0; m < 32; ++m) {
-            res[elem_offset(t_row, m) / 4] = m == 0 ? value : m < row_count ? slot[4 * m] : 0;
+            uint32_t value = 0;
+            if (m < row_count) {
+                float total = __builtin_bit_cast(float, res[elem_offset(m, face_rows) / 4]);
+                // An index past the matrix (nothing compared true) reads as 0.
+                if constexpr (mode == mode_arg_first) {
+                    total = total < 16777216.0f ? total : 0.0f;
+                }
+                value = int_output ? static_cast<uint32_t>(static_cast<int32_t>(total))
+                                   : __builtin_bit_cast(uint32_t, total);
+            }
+            totals[m] = value;
+        }
+        for (uint32_t m = 0; m < 32; ++m) {
+            res[elem_offset(t_row, m) / 4] = totals[m];
         }
         for (uint32_t f = 0; f < 2; ++f) {
             const uint32_t at = elem_offset(t_row, f * face_rows);

@@ -41,9 +41,11 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
 
     // A chunked input ([..., Hm, N, 32] with a [..., Hm] threshold) reduces
     // each [N, 32] matrix: its Nt tiles take the place of a tile row's, every
-    // row of them is data but the last tile's past N, and the matrix's total
-    // is the sum of its rows. The matrices whose results share a row of the
-    // result's tile hand them to the first of them, which writes the row.
+    // row of them is data but the last tile's past N, and a core's share of
+    // the matrix is the sum of its rows. All cores of the matrices whose
+    // results share a row of the result's tile send their shares to one
+    // master, the first core of the first of them, which writes the row
+    // (16-byte DRAM writes cannot target single elements).
     const bool chunked = masked_reduce_chunked(tensor_args.input, tensor_args.threshold);
     const uint32_t tile_rows =
         chunked ? masked_reduce_matrices(tensor_args.input) : masked_reduce_tile_rows(tensor_args.input);
@@ -91,8 +93,6 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
     const DFBSpecName OUT_DFB{"out"};
     const DFBSpecName PART_DFB{"part"};
     const SemaphoreSpecName DONE_SEM{"done"};
-    const SemaphoreSpecName ROW_SEM{"row_done"};
-    const ScratchpadSpecName ROW_SLOTS{"row"};
     const TensorParamName INPUT{"input"};
     const TensorParamName THRESHOLD{"threshold"};
     const TensorParamName OUTPUT{"output"};
@@ -111,10 +111,8 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
          .num_entries = partial_tiles,
          .data_format_metadata = tt::DataFormat::Float32},
     };
-    // Every core counts the row's partials that arrived at its master, and the
-    // results of chunked matrices that arrived at their result row's writer.
-    Group<SemaphoreSpec> semaphores = {
-        {.unique_id = DONE_SEM, .target_nodes = all_cores}, {.unique_id = ROW_SEM, .target_nodes = all_cores}};
+    // Every core counts the row's partials that arrived at its master.
+    Group<SemaphoreSpec> semaphores = {{.unique_id = DONE_SEM, .target_nodes = all_cores}};
     const std::vector<std::string> runtime_arg_names = {
         "t_page",
         "t_row",
@@ -133,8 +131,7 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
         "last_rows",
         "row_slot",
         "row_count",
-        "row_master_x",
-        "row_master_y",
+        "workers_per_row",
         "first_in_row"};
     const std::string kernel_dir = "ttnn/cpp/ttnn/operations/experimental/masked_reduce/device/kernels/";
     KernelSpec reader{
@@ -166,10 +163,7 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
                 DFBBinding{.dfb_spec_name = OUT_DFB, .accessor_name = "out", .endpoint_type = DFBEndpointType::CONSUMER},
                 DFBBinding{.dfb_spec_name = PART_DFB, .accessor_name = "part", .endpoint_type = DFBEndpointType::PRODUCER},
             },
-        .semaphore_bindings =
-            {SemaphoreBinding{.semaphore_spec_name = DONE_SEM, .accessor_name = "done"},
-             SemaphoreBinding{.semaphore_spec_name = ROW_SEM, .accessor_name = "row_done"}},
-        .scratchpad_bindings = {ScratchpadBinding{.scratchpad_spec_name = ROW_SLOTS, .accessor_name = "row"}},
+        .semaphore_bindings = {SemaphoreBinding{.semaphore_spec_name = DONE_SEM, .accessor_name = "done"}},
         .tensor_bindings = {TensorBinding{.tensor_parameter_name = OUTPUT, .accessor_name = "output"}},
         .compile_time_args =
             {{"cols", partial_cols},
@@ -232,10 +226,10 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
                                 : row_form ? (b / D1 * D1t + (b % D1) / TILE_HEIGHT) * Ht + tile_row % Ht
                                            : tile_row;
         const uint32_t t_row = row_form || chunked ? (b % D1) % TILE_HEIGHT : 0;
-        // The row's first core gathers the partials and writes the result.
-        const auto master = device.worker_core_from_logical_core(cores[tile_row * cores_per_row]);
+        // The row's first core gathers the partials and writes the result; for
+        // a chunked input, the first core of the result row's first matrix.
         const uint32_t row_first = chunked ? tile_row - h % TILE_HEIGHT : tile_row;
-        const auto row_master = device.worker_core_from_logical_core(cores[row_first * cores_per_row]);
+        const auto master = device.worker_core_from_logical_core(cores[row_first * cores_per_row]);
         const uint32_t row_count = chunked ? std::min(TILE_HEIGHT, Hm - h / TILE_HEIGHT * TILE_HEIGHT) : 1;
         // Data rows of this tile row: the last tile row of a [..., H, W] batch
         // holds H's remainder.
@@ -267,16 +261,15 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
                  {"pack", pack},
                  {"has_last", count != 0 && first + count == row_tiles ? 1u : 0u},
                  {"col", 4 * worker},
-                 {"is_master", worker == 0 ? 1u : 0u},
+                 {"is_master", worker == 0 && tile_row == row_first ? 1u : 0u},
                  {"master_x", static_cast<uint32_t>(master.x)},
                  {"master_y", static_cast<uint32_t>(master.y)},
-                 {"remote_workers", cores_per_row - 1},
+                 {"remote_workers", row_count * cores_per_row - 1},
                  {"t_col", h % TILE_HEIGHT},
                  {"last_rows", chunked && H % TILE_HEIGHT != 0 ? H % TILE_HEIGHT : TILE_HEIGHT},
                  {"row_slot", h % TILE_HEIGHT},
                  {"row_count", row_count},
-                 {"row_master_x", static_cast<uint32_t>(row_master.x)},
-                 {"row_master_y", static_cast<uint32_t>(row_master.y)},
+                 {"workers_per_row", cores_per_row},
                  {"first_in_row", first}});
         }
     }
@@ -285,8 +278,6 @@ ttnn::device_operation::ProgramArtifacts MaskedReduceProgramFactory::create_prog
         .kernels = {std::move(reader), std::move(writer), std::move(compute)},
         .dataflow_buffers = std::move(dataflow_buffers),
         .semaphores = std::move(semaphores),
-        // A 16-byte slot per matrix of a result row.
-        .scratchpads = {ScratchpadSpec{.unique_id = ROW_SLOTS, .size_per_node = TILE_HEIGHT * 16}},
         .tensor_parameters =
             {
                 TensorParameter{.unique_id = INPUT, .spec = input.tensor_spec()},
