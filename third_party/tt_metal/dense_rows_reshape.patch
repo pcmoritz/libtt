@@ -1,0 +1,25 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp
+@@ -22,6 +22,7 @@
+ #include "ttnn/operations/data_movement/sharded/interleaved_to_sharded/interleaved_to_sharded.hpp"
+ #include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
+ #include "ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.hpp"
++#include "ttnn/operations/experimental/dense_rows/dense_rows.hpp"
+ #include "ttnn/operations/experimental/reshape/view.hpp"
+ #include "ttnn/operations/functions.hpp"
+ #include "ttnn/operation.hpp"
+@@ -373,6 +374,13 @@ ttnn::Tensor reshape_tiled(
+     const bool pad_value_explicit) {
+     // fill_implicit_tile_padding takes float; integer pad is not bit-exact for all dtypes/values.
+     const float fill_value = detail::pad_value_as_float(pad_value, tensor.dtype());
++    // Splitting the last dimension into rows of 32 ([..., H, W] -> [..., H, W / 32, 32]) or merging
++    // such rows back moves whole tile rows: libtt's dense_rows copies them, zero-filling padding.
++    if (!sub_core_grid.has_value() && !memory_config.is_sharded() && (!pad_value_explicit || fill_value == 0.0f)) {
++        if (auto direction = ttnn::experimental::dense_rows_direction(tensor, logical_shape)) {
++            return ttnn::experimental::dense_rows(tensor, *direction, memory_config);
++        }
++    }
+     // squeeze input tensor and requested shape to 3D
+     auto transform_to_3d = [](const auto& shape) -> ttnn::Shape {
+         if (shape.rank() > 3) {
