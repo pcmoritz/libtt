@@ -1,0 +1,25 @@
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -24,6 +24,11 @@
+ #include "mlir/Pass/PassManager.h"
+ #include "mlir/Transforms/Passes.h"
+ 
++namespace mlir::tt::ttir {
++// Defined in libtt's tt_mlir/lib/Dialect/TTIR/Transforms/DenseRows.cpp.
++std::unique_ptr<Pass> createTTIRDenseRowsPass();
++} // namespace mlir::tt::ttir
++
+ namespace mlir::tt::ttnn {
+ //===----------------------------------------------------------------------===//
+ // Helper functions which combine multiple passes into logical groupings.
+@@ -92,6 +97,9 @@ void createTTNNPipelineTTIRPasses(
+   if (options.enableFusing) {
+     pm.addPass(mlir::tt::ttir::createTTIRFusing(fusingOptions));
+   }
++  // Wide, short tensors in chunked, dense tiles (libtt), after the fusions
++  // that match their original shapes.
++  pm.addPass(mlir::tt::ttir::createTTIRDenseRowsPass());
+   pm.addPass(mlir::tt::ttir::createTTIRWhileTripCount());
+   pm.addPass(mlir::tt::ttir::createTTIRFoldFullToScalar());
+   pm.addPass(mlir::tt::ttir::createTTIRConsolidateStaticCacheUpdates());
