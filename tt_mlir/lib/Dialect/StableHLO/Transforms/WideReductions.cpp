@@ -24,10 +24,9 @@
 // 105, and its reduction about 26 us. Chains whose H does not split are left
 // alone.
 //
-// StableHLO's import canonicalizations run alongside: they turn a loop carry
-// that the body returns unchanged into a capture of the value the loop was
-// entered with, which is what exposes the transpose behind a loop-invariant
-// leaf.
+// A loop carry that the body returns unchanged is first read as the value the
+// loop was entered with, which is what exposes the transpose behind a
+// loop-invariant leaf.
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
@@ -35,7 +34,6 @@
 #include "mlir/IR/PatternMatch.h"
 #include "shardy/dialect/sdy/ir/dialect.h"
 #include "stablehlo/dialect/StablehloOps.h"
-#include "stablehlo/transforms/optimization/Passes.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 
@@ -91,14 +89,15 @@ bool isReplicatedConstraint(sdy::ShardingConstraintOp constraint) {
 // are constant along H (a per-row threshold, say, since H is split), splat
 // constants, closed replicated sharding constraints (JAX leaves one after most
 // ops under a shard_map), and elementwise ops over such values. Returns false
-// for anything else.
+// for anything else, and for ops with their own sharding annotation, which
+// would not fit the rebuilt shape.
 bool collectChain(Value value, unsigned depth, llvm::SetVector<Value> &chain) {
   if (chain.contains(value)) {
     return true;
   }
   auto type = dyn_cast<RankedTensorType>(value.getType());
   Operation *op = value.getDefiningOp();
-  if (!type || type.getRank() != 2 || !op) {
+  if (!type || type.getRank() != 2 || !op || op->hasAttr(sdy::kShardingAttr)) {
     return false;
   }
   if (auto transpose = dyn_cast<shlo::TransposeOp>(op)) {
@@ -219,12 +218,47 @@ public:
   }
 };
 
+// A loop operand that the body returns unchanged is the same value on every
+// iteration. Uses of its block arguments become uses of the value the loop was
+// entered with, so what feeds it (for example a transpose) is visible inside
+// the body. The loop keeps its operands and results, and so any per-result
+// annotations on it.
+class ReplaceInvariantCarries : public OpRewritePattern<shlo::WhileOp> {
+public:
+  using OpRewritePattern<shlo::WhileOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(shlo::WhileOp whileOp,
+                                PatternRewriter &rewriter) const override {
+    Block &body = whileOp.getBody().front();
+    Block &cond = whileOp.getCond().front();
+    auto returnOp = cast<shlo::ReturnOp>(body.getTerminator());
+    bool changed = false;
+    for (auto [index, init] : llvm::enumerate(whileOp.getOperands())) {
+      BlockArgument bodyArg = body.getArgument(index);
+      BlockArgument condArg = cond.getArgument(index);
+      if (returnOp.getOperand(index) != bodyArg) {
+        continue;
+      }
+      // Only the return reads the argument once its other uses are replaced.
+      bool readInBody = llvm::any_of(bodyArg.getUsers(), [&](Operation *user) {
+        return user != returnOp.getOperation();
+      });
+      if (!readInBody && condArg.use_empty()) {
+        continue;
+      }
+      rewriter.replaceAllUsesExcept(bodyArg, init, returnOp);
+      rewriter.replaceAllUsesWith(condArg, init);
+      changed = true;
+    }
+    return success(changed);
+  }
+};
+
 } // namespace
 
 void populateWideReductionPatterns(RewritePatternSet &patterns) {
-  patterns.add<TallReductionToWide>(patterns.getContext());
-  mlir::stablehlo::populateStablehloHloImportCanonicalizationPatterns(
-      patterns.getContext(), &patterns);
+  patterns.add<TallReductionToWide, ReplaceInvariantCarries>(
+      patterns.getContext());
 }
 
 } // namespace mlir::tt
