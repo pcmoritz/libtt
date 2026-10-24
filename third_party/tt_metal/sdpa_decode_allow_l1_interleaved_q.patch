@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp
-@@ -88,9 +88,9 @@ void SdpaDecodeDeviceOperation::validate_on_program_cache_miss(
+@@ -144,9 +144,9 @@ void SdpaDecodeDeviceOperation::validate_on_program_cache_miss(
              Q_memcfg.memory_layout());
      } else {
          TT_FATAL(
@@ -13,4 +13,4 @@ diff --git ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_d
 +            Q_memcfg.memory_layout());
      }
  
-     for (std::size_t i = 1; i < input_tensors.size(); i++) {
+     // ROW_MAJOR Q is only supported when Q is height-sharded in L1. The interleaved reader path always

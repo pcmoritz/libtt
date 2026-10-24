@@ -202,7 +202,7 @@ ttnn::device_operation::ProgramArtifacts RowsGatherProgramFactory::create_progra
             },
         .compile_time_args = g.compile_time_args,
         .runtime_arg_schema = {.runtime_arg_names = {"first_transfer", "num_transfers"}},
-        .hw_config = ttnn::create_reader_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
+        .hw_config = ttnn::create_reader_datamovement_config(/*disable_dfb_implicit_sync_for_all=*/true),
     };
     KernelSpec writer{
         .unique_id = WRITER,
@@ -215,7 +215,7 @@ ttnn::device_operation::ProgramArtifacts RowsGatherProgramFactory::create_progra
         .tensor_bindings = {TensorBinding{.tensor_parameter_name = OUTPUT, .accessor_name = "output"}},
         .compile_time_args = g.compile_time_args,
         .runtime_arg_schema = {.runtime_arg_names = {"first_transfer", "num_transfers"}},
-        .hw_config = ttnn::create_writer_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
+        .hw_config = ttnn::create_writer_datamovement_config(/*disable_dfb_implicit_sync_for_all=*/true),
     };
 
     // Cores take ranges of the transfers rather than of the positions: a position of a row of many small
@@ -301,7 +301,7 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
         .tensor_bindings = {TensorBinding{.tensor_parameter_name = TABLE, .accessor_name = "table"}},
         .compile_time_args = g.compile_time_args,
         .runtime_arg_schema = {.runtime_arg_names = {"first_page", "num_pages"}},
-        .hw_config = ttnn::create_reader_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
+        .hw_config = ttnn::create_reader_datamovement_config(/*disable_dfb_implicit_sync_for_all=*/true),
     };
     KernelSpec writer{
         .unique_id = WRITER,
@@ -329,7 +329,7 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
             },
         .compile_time_args = g.compile_time_args,
         .runtime_arg_schema = {.runtime_arg_names = {"first_page", "num_pages"}},
-        .hw_config = ttnn::create_writer_datamovement_config(device.arch(), /*disable_dfb_implicit_sync_for_all=*/true),
+        .hw_config = ttnn::create_writer_datamovement_config(/*disable_dfb_implicit_sync_for_all=*/true),
     };
 
     KernelRunArgs reader_run_args{.kernel = READER};

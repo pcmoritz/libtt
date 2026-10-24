@@ -41,9 +41,9 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/
  std::map<std::string, std::string> get_defines(
      tt::tt_metal::ReduceOpMath reduce_op, tt::tt_metal::ReduceOpDim reduce_dim) {
      std::map<std::string, std::string> defines;
-@@ -213,6 +243,45 @@ Tensor reduce(
- 
-     const bool use_sfpu_fp32_reduce = use_sfpu_fp32_sum || use_sfpu_fp32_mean || use_sfpu_fp32_max || use_sfpu_fp32_min;
+@@ -215,6 +245,46 @@ Tensor reduce(
+     const bool use_sfpu_reduce =
+         use_sfpu_fp32_sum || use_sfpu_fp32_mean || use_sfpu_fp32_max || use_sfpu_fp32_min || use_sfpu_bf16_min;
  
 +    // Split contiguous width tiles into batches without moving data. Tile rows
 +    // remain independent, including padding rows, which the final view hides again.
@@ -70,8 +70,9 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/
 +            auto partials = ttnn::prim::reduce(
 +                split, reduce_math, tt::tt_metal::ReduceOpDim::W, 1.0f, output_mem_config,
 +                partial_dtype, config, sub_core_grids, /*negate=*/false, /*post_mul_scaler=*/1.0f,
++                /*scaler_mode=*/ttnn::prim::ScalerMode::None,
 +                /*row_major_w_dense_path=*/false, /*row_major_h_dense_path=*/false,
-+                /*use_sfpu_reduce=*/use_sfpu_fp32_reduce);
++                /*use_sfpu_reduce=*/use_sfpu_reduce);
 +            // Make the chunk axis a height axis for the existing H reduction kernel.
 +            partials = ttnn::transpose(partials, 1, 2, output_mem_config, ttnn::prim::get_reduce_pad_value(reduce_math));
 +            auto result = detail::reduce(
@@ -84,6 +85,6 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/
 +        }
 +    }
 +
-     // The FPU has no float/bf16 MIN primitive, so fast-mode MIN lowers to -MAX(-x) via the fused
-     // negate kernels. Accurate fp32 MIN drives the LLK MIN reduce directly (like Int32 MIN) and must
-     // skip that lowering.
+     // The FPU has no MIN primitive, so remaining MIN lowers to -MAX(-x) via the fused negate kernels:
+     // bfloat8_b and fast-mode fp32. Accurate fp32 MIN and bf16 MIN drive the LLK MIN
+     // reduce directly (like Int32 MIN) and must skip that lowering.

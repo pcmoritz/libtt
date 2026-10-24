@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
-@@ -96,9 +96,11 @@ ttnn::device_operation::ProgramArtifacts FillPadProgramFactory::create_program_a
+@@ -97,9 +97,11 @@ ttnn::device_operation::ProgramArtifacts FillPadProgramFactory::create_program_a
      const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
      const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
      const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
@@ -15,7 +15,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
      // Float types: raw bit pattern of fill_value for fill_tile_bitcast.
      // Integer types: packed native bit pattern for fill_tile_int.
      const std::uint32_t fill_bits = detail::pack_fill_value_for_dtype(input_tensor.dtype(), fill_value);
-@@ -495,7 +497,8 @@ ttnn::device_operation::ProgramArtifacts FillPadL1ShardedProgramFactory::create_
+@@ -496,7 +498,8 @@ ttnn::device_operation::ProgramArtifacts FillPadL1ShardedProgramFactory::create_
      const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
      const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
      const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
@@ -54,7 +54,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_p
 -                                cb_data_format == tt::DataFormat::UInt32;
 +                                cb_data_format == tt::DataFormat::UInt32 ||
 +                                cb_data_format == tt::DataFormat::UInt8;
-         ComputeGen1Config compute_cfg{.enable_32_bit_dest = fp32_dest_acc_en};
+         ComputeHardwareConfig compute_cfg{.enable_32_bit_dest = fp32_dest_acc_en};
          // Legacy set unpack_to_dest_mode[c_0] = UnpackToDestFp32 for Float32 → UnpackMode::UnpackToDest.
          // Compute consumes SRC0 (c_0); the required-entry rule fires only for Float32.
 @@ -475,7 +476,8 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreTileRo
@@ -64,7 +64,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_p
 -                                cb_data_format == tt::DataFormat::UInt32;
 +                                cb_data_format == tt::DataFormat::UInt32 ||
 +                                cb_data_format == tt::DataFormat::UInt8;
-         ComputeGen1Config compute_cfg{.enable_32_bit_dest = fp32_dest_acc_en};
+         ComputeHardwareConfig compute_cfg{.enable_32_bit_dest = fp32_dest_acc_en};
          // Legacy set unpack_to_dest_mode[c_0] = UnpackToDestFp32 for Float32 → UnpackMode::UnpackToDest.
          // Compute consumes SRC0 (c_0); the required-entry rule fires only for Float32.
 @@ -701,12 +703,15 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreTiledG
@@ -86,18 +86,18 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_p
  
 @@ -787,7 +792,8 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreTiledG
  
-     // ---- Compute config (Style B: build ComputeGen1Config directly, mirroring legacy) ----
+     // ---- Compute config (Style B: build ComputeHardwareConfig directly, mirroring legacy) ----
      bool fp32_dest_acc_en = cb_data_format == tt::DataFormat::Float32 || cb_data_format == tt::DataFormat::Int32 ||
 -                            cb_data_format == tt::DataFormat::UInt32;
 +                            cb_data_format == tt::DataFormat::UInt32 ||
 +                            cb_data_format == tt::DataFormat::UInt8;
-     ComputeGen1Config compute_cfg{.enable_32_bit_dest = fp32_dest_acc_en};
+     ComputeHardwareConfig compute_cfg{.enable_32_bit_dest = fp32_dest_acc_en};
      // Metal 2.0 requires an explicit unpack_modes entry for each Float32 DFB the compute kernel consumes
      // when enable_32_bit_dest = true. Compute consumes SRC_CB (via tilize) and TILIZE_CB (self-loop).
 diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
-@@ -54,7 +54,8 @@ ttnn::device_operation::ProgramArtifacts TransposeWHProgramFactory::create_progr
+@@ -55,7 +55,8 @@ ttnn::device_operation::ProgramArtifacts TransposeWHProgramFactory::create_progr
  
      bool fp32_dest_acc_en = src0_dfb_data_format == tt::DataFormat::Float32 ||
                              src0_dfb_data_format == tt::DataFormat::Int32 ||

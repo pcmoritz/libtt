@@ -90,7 +90,7 @@ void kernel_main() {
             (APPROX, ckernel::sfpu::ADD, 8, DST_ACCUM_MODE), 0, VectorMode::C, eps));
         rsqrt_tile_init();
         MATH(SFPU_UNARY_CALL(
-            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_rsqrt, (APPROX, 8, DST_ACCUM_MODE, false, false), 0,
+            DST_SYNC_MODE, DST_ACCUM_MODE, calculate_rsqrt, (APPROX, 8, DST_ACCUM_MODE, false), 0,
             VectorMode::C));
         tile_regs_commit();
         tile_regs_wait();

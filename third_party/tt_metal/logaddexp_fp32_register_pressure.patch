@@ -1,0 +1,36 @@
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp.h
+@@ -84,8 +84,13 @@
+         if constexpr (is_fp32_dest_acc_en) {
+             // Guarded against the large negative values -|a-b| reaches, which the unguarded
+             // _sfpu_exp_fp32_accurate_unsafe_ is not.
++            // Keep the maximum in DST while exp/log1p use the SFPU registers.
++            // Both inputs are already loaded, so output may alias either input.
++            sfpi::dst_reg[dst_index_out * dst_tile_size_sfpi] = result;
+             b = _sfpu_exp_fp32_accurate_(-a);
+-            result = result + calculate_log1p_fp32<true>(b);
++            b = calculate_log1p_fp32<true>(b);
++            result = sfpi::dst_reg[dst_index_out * dst_tile_size_sfpi];
++            result = result + b;
+         } else {
+             // exp_21f, the exponential exp itself uses for a bfloat16 result. Its argument
+             // is -|a-b| <= 0, so the only bound it needs is the lower one: capping the gap at
+diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp2.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp2.h
+--- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp2.h
++++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp2.h
+@@ -66,8 +66,13 @@
+         // approximate body is not usable: its 255/256 at zero lands on the correction term
+         // whose exact value at |a - b| = 0 is 1.
+         if constexpr (is_fp32_dest_acc_en) {
++            // Keep the maximum in DST while exp/log1p use the SFPU registers.
++            // Both inputs are already loaded, so output may alias either input.
++            sfpi::dst_reg[dst_index_out * dst_tile_size_sfpi] = result;
+             b = _sfpu_exp_fp32_accurate_(a * -LN_TWO);
+-            result = result + calculate_log1p_fp32<true>(b) * LOG2_E;
++            b = calculate_log1p_fp32<true>(b) * LOG2_E;
++            result = sfpi::dst_reg[dst_index_out * dst_tile_size_sfpi];
++            result = result + b;
+         } else {
+             b = _sfpu_exp2_bf16_(-a, exp_c0, exp_c1, EXP_21F_BF16_C2);
+             result = result + _sfpu_logaddexp_log1p_unit_bf16_(b) * LOG2_E;

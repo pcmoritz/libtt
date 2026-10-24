@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.cpp
-@@ -40,6 +40,7 @@
+@@ -40,6 +40,7 @@ bool runs_topk_select(
  // The index dtype the op runs at: index CB, generated iota and output tensor all follow it.
  // A preallocated indices output pins it; a 32-bit indices_tensor widens it. A UINT16
  // indices_tensor never narrows it -- validate rejects one narrower than the input requires.
@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.
  DataType resolve_index_dtype(
      const TopKDeviceOperation::operation_attributes_t& args, const TopKDeviceOperation::tensor_args_t& tensor_args) {
      if (tensor_args.preallocated_outputs.has_value()) {
-@@ -51,7 +52,7 @@
+@@ -51,7 +52,7 @@ DataType resolve_index_dtype(
              return indices_dtype;
          }
      }
@@ -21,15 +21,15 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_device_operation.
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_route_finish_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/topk/device/topk_route_finish_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/reduction/topk/device/topk_route_finish_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/device/topk_route_finish_device_operation.cpp
-@@ -134,9 +134,9 @@
+@@ -135,9 +135,9 @@ spec_return_value_t TopkRouteFinishDeviceOperation::compute_output_specs(
      output_shape[-1] = indices.logical_shape()[-1];
  
      // Stock device-op index dtype contract (topk_device_operation.cpp compute_output_specs):
 -    // UINT16 iff the TILE-PADDED source width fits 16 bits, else UINT32.
 +    // UINT16 iff the TILE-PADDED source width fits 16 bits, else INT32.
      const DataType index_dtype =
--        input.padded_shape()[-1] <= std::numeric_limits<uint16_t>::max() ? DataType::UINT16 : DataType::UINT32;
-+        input.padded_shape()[-1] <= std::numeric_limits<uint16_t>::max() ? DataType::UINT16 : DataType::INT32;
+-        ttnn::prim::padded_width_needs_uint32_indices(input.padded_shape()[-1]) ? DataType::UINT32 : DataType::UINT16;
++        ttnn::prim::padded_width_needs_uint32_indices(input.padded_shape()[-1]) ? DataType::INT32 : DataType::UINT16;
  
      return {
          tt::tt_metal::TensorSpec(

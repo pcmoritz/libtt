@@ -18,7 +18,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/common/common.hpp ttnn/cpp/ttn
 diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
-@@ -12,6 +12,7 @@
+@@ -13,6 +13,7 @@
  #include "ttnn/metal_v2_artifacts.hpp"
  #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
  #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
@@ -26,7 +26,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
  #include <algorithm>
  #include <bit>
  #include <map>
-@@ -34,9 +35,10 @@ namespace CMAKE_UNIQUE_NAMESPACE {
+@@ -35,9 +36,10 @@ namespace CMAKE_UNIQUE_NAMESPACE {
  KernelSpec::CompilerOptions::Defines build_kernel_defines(
      const Tensor& input_tensor,
      tt::DataFormat cb_data_format,
@@ -40,16 +40,16 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
      KernelSpec::CompilerOptions::Defines d;
      d.insert(
          {"MASK_ELEM_UINT",
-@@ -71,7 +73,7 @@ ttnn::device_operation::ProgramArtifacts FillPadProgramFactory::create_program_a
+@@ -72,7 +74,7 @@ ttnn::device_operation::ProgramArtifacts FillPadProgramFactory::create_program_a
      const ttnn::PadValue& fill_value = operation_attributes.fill_value;
-     tt::tt_metal::IDevice* device = input_tensor.device();
+     tt::tt_metal::distributed::MeshDevice* device = input_tensor.device();
  
 -    const tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
 +    const tt::DataFormat cb_data_format = operations::data_movement::data_movement_format(input_tensor.dtype());
      TT_FATAL(input_tensor.buffer() != nullptr, "Input buffer should be allocated on device!");
  
      const std::uint32_t input_element_size_bytes = detail::data_type_to_size.at(input_tensor.dtype());
-@@ -91,8 +93,6 @@ ttnn::device_operation::ProgramArtifacts FillPadProgramFactory::create_program_a
+@@ -92,8 +94,6 @@ ttnn::device_operation::ProgramArtifacts FillPadProgramFactory::create_program_a
      const bool has_right_pad = W_mod32 != 0;
      const bool has_bottom_pad = H_mod32 != 0;
  
@@ -58,7 +58,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
      const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
      const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
      const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
-@@ -166,7 +166,7 @@ ttnn::device_operation::ProgramArtifacts FillPadProgramFactory::create_program_a
+@@ -167,7 +167,7 @@ ttnn::device_operation::ProgramArtifacts FillPadProgramFactory::create_program_a
  
      // ---- Defines ----
      const auto fill_defines = CMAKE_UNIQUE_NAMESPACE::build_kernel_defines(
@@ -67,7 +67,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
      // has_right_pad / has_bottom_pad are promoted to preprocessor defines on the writer and
      // compute kernels (they gate the conditionally-bound right / bottom mask DFBs).
      auto mask_defines = fill_defines;
-@@ -363,7 +363,7 @@ ttnn::device_operation::ProgramArtifacts FillPadL1ShardedProgramFactory::create_
+@@ -364,7 +364,7 @@ ttnn::device_operation::ProgramArtifacts FillPadL1ShardedProgramFactory::create_
  
      const ttnn::PadValue& fill_value = operation_attributes.fill_value;
  
@@ -76,7 +76,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
      tt::tt_metal::Buffer* tens_buffer = input_tensor.buffer();
      TT_FATAL(tens_buffer != nullptr, "Input buffer should be allocated on device!");
  
-@@ -492,8 +492,6 @@ ttnn::device_operation::ProgramArtifacts FillPadL1ShardedProgramFactory::create_
+@@ -493,8 +493,6 @@ ttnn::device_operation::ProgramArtifacts FillPadL1ShardedProgramFactory::create_
          group_ranges[key_of(ci)].emplace_back(ci.coord, ci.coord);
      }
  
@@ -85,7 +85,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
      const bool is_fp32 = (input_tensor.dtype() == DataType::FLOAT32);
      const bool is_uint32 = (input_tensor.dtype() == DataType::UINT32);
      const bool is_int32 = (input_tensor.dtype() == DataType::INT32);
-@@ -535,7 +533,7 @@ ttnn::device_operation::ProgramArtifacts FillPadL1ShardedProgramFactory::create_
+@@ -536,7 +534,7 @@ ttnn::device_operation::ProgramArtifacts FillPadL1ShardedProgramFactory::create_
          "ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/kernels/compute/fill_pad_compute.cpp";
  
      const auto fill_defines = CMAKE_UNIQUE_NAMESPACE::build_kernel_defines(
@@ -97,15 +97,15 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_progr
 diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_rm_program_factory.cpp
-@@ -9,6 +9,7 @@
- #include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
+@@ -10,6 +10,7 @@
  #include <tt-metalium/experimental/metal2_host_api/program_run_args.hpp>
+ #include <tt-metalium/math.hpp>
  #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
 +#include "ttnn/operations/data_movement/common/common.hpp"
  
  namespace ttnn::operations::data_movement {
  
-@@ -174,11 +175,11 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreBlocke
+@@ -175,11 +176,11 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreBlocke
      const auto& input_mesh_tensor = input_tensor.mesh_tensor();
      const auto& output_mesh_tensor = output_tensor.mesh_tensor();
  
@@ -179,15 +179,15 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_hc_
 diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_program_factory.cpp
-@@ -11,6 +11,7 @@
- #include <tt-metalium/constants.hpp>
+@@ -12,6 +12,7 @@
  #include <tt-metalium/host_api.hpp>
  #include <tt-metalium/work_split.hpp>
+ #include <tt-metalium/math.hpp>
 +#include "ttnn/operations/data_movement/common/common.hpp"
  
  using namespace tt::constants;
  using namespace tt::tt_metal;
-@@ -45,9 +46,9 @@ ttnn::device_operation::ProgramArtifacts TransposeWHProgramFactory::create_progr
+@@ -46,9 +47,9 @@ ttnn::device_operation::ProgramArtifacts TransposeWHProgramFactory::create_progr
      uint32_t ht = (H + TILE_HEIGHT - 1) / TILE_HEIGHT;
      uint32_t wt = (W + TILE_WIDTH - 1) / TILE_WIDTH;
  
@@ -198,7 +198,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_
 +    tt::DataFormat dst_dfb_data_format = operations::data_movement::data_movement_format(output_tensor.dtype());
      uint32_t dst_single_tile_size = tt::tile_size(dst_dfb_data_format);
  
-     IDevice* device = input_tensor.device();
+     MeshDevice* device = input_tensor.device();
 diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_sharded_program_factory.cpp
@@ -248,7 +248,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/transpose/device/transpose_wh_
 diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
-@@ -1032,6 +1032,22 @@ tt::tt_metal::ProgramDescriptor TernaryDeviceOperation::TernaryProgramFactory::c
+@@ -1039,6 +1039,22 @@ tt::tt_metal::ProgramDescriptor TernaryDeviceOperation::TernaryProgramFactory::c
      }
      auto output_data_format = datatype_to_dataformat_converter(output.dtype());
  

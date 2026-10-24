@@ -1,36 +1,12 @@
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
-@@ -253,7 +253,9 @@ inline void calculate_sfpu_binary_div(
-             v_if(in0 == 0) { result = std::numeric_limits<float>::quiet_NaN(); }
-             v_else {
-                 result = std::numeric_limits<float>::infinity();
--                result = sfpi::copysgn(result, in0);
-+                sfpi::vUInt quotient_sign =
-+                    sfpi::as<sfpi::vUInt>(in0) ^ sfpi::as<sfpi::vUInt>(in1);
-+                result = sfpi::copysgn(result, sfpi::as<sfpi::vFloat>(quotient_sign));
-             }
-             v_endif;
-         }
-diff --git tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
---- tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
-+++ tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
-@@ -50,7 +50,7 @@ sfpi_inline sfpi::vFloat float32_to_bf16_rne(sfpi::vFloat in) {
-  *
-  * @note DIV special cases (matching BH semantics):
-  *   - 0 / 0 -> NaN
-- *   - x / 0 -> ±inf, sign of x
-+ *   - x / ±0 -> ±inf, sign is the XOR of the operand signs
-  *   - x / x -> 1.0 (forced exact, regardless of reciprocal rounding)
-  *
-  * @tparam APPROXIMATION_MODE: unused, preserved to match the BH metal signature
-@@ -97,7 +97,9 @@ inline void calculate_sfpu_binary(
+@@ -288,7 +288,8 @@ inline void calculate_sfpu_binary_div(
                  v_if(in0 == 0) { result = std::numeric_limits<float>::quiet_NaN(); }
                  v_else {
                      result = std::numeric_limits<float>::infinity();
 -                    result = sfpi::copysgn(result, in0);
-+                    sfpi::vUInt quotient_sign =
-+                        sfpi::as<sfpi::vUInt>(in0) ^ sfpi::as<sfpi::vUInt>(in1);
++                    sfpi::vUInt quotient_sign = sfpi::as<sfpi::vUInt>(in0) ^ sfpi::as<sfpi::vUInt>(in1);
 +                    result = sfpi::copysgn(result, sfpi::as<sfpi::vFloat>(quotient_sign));
                  }
                  v_endif;
@@ -38,14 +14,13 @@ diff --git tt_metal/hw/ckernels/quasar/metal/llk_api/llk_sfpu/ckernel_sfpu_binar
 diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 --- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 +++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
-@@ -252,7 +252,9 @@ inline void calculate_sfpu_binary_div(
-             v_if(in0 == 0) { result = std::numeric_limits<float>::quiet_NaN(); }
-             v_else {
-                 result = std::numeric_limits<float>::infinity();
--                result = sfpi::copysgn(result, in0);
-+                sfpi::vUInt quotient_sign =
-+                    sfpi::as<sfpi::vUInt>(in0) ^ sfpi::as<sfpi::vUInt>(in1);
-+                result = sfpi::copysgn(result, sfpi::as<sfpi::vFloat>(quotient_sign));
+@@ -279,7 +279,8 @@ inline void calculate_sfpu_binary_div(
+                 v_if(in0 == 0) { result = std::numeric_limits<float>::quiet_NaN(); }
+                 v_else {
+                     result = std::numeric_limits<float>::infinity();
+-                    result = sfpi::copysgn(result, in0);
++                    sfpi::vUInt quotient_sign = sfpi::as<sfpi::vUInt>(in0) ^ sfpi::as<sfpi::vUInt>(in1);
++                    result = sfpi::copysgn(result, sfpi::as<sfpi::vFloat>(quotient_sign));
+                 }
+                 v_endif;
              }
-             v_endif;
-         }

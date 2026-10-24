@@ -184,7 +184,7 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
  bool requires_padding_change(const ttnn::Tensor& tensor, ttnn::Layout layout) {
      if (layout == Layout::ROW_MAJOR) {
          // There shouldn't be extra paddings for Row Major layout
-@@ -77,6 +96,22 @@ Tensor to_layout_impl(
+@@ -80,6 +99,22 @@ Tensor to_layout_impl(
          return tensor_arg;
      }
  
@@ -210,7 +210,7 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-@@ -61,7 +61,9 @@ bool is_binary_sfpu_op(
+@@ -63,7 +63,9 @@ bool is_binary_sfpu_op(
          case SQUARED_DIFFERENCE: return a == b && (a == FLOAT32 || a == INT32 || a == UINT32 || a == UINT16);
          case MUL:
              return !fast_and_approximate_mode || (a == b && (a == FLOAT32 || a == INT32 || a == UINT32 || a == UINT16));
@@ -218,13 +218,13 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_op
 +        case DIV:
 +            return !fast_and_approximate_mode || (a == FLOAT32 && b == FLOAT32) || (a == INT32 && b == INT32) ||
 +                   (a == b && (a == FLOAT16 || a == BFLOAT16) && output == a);
-         case LOGADDEXP:
-         case LOGADDEXP2:
-         case LDEXP:
+         // logaddexp and logaddexp2 are fused SFPU kernels templated on the destination
+         // precision, so the 16-bit formats route to them as well as float32. Which body they
+         // get is decided by fp32_dest_acc_en, and binary_ng_program_factory.cpp derives that
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
-@@ -877,12 +877,28 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -889,12 +889,28 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
           operation_attributes.binary_op_type == BinaryOpType::GT ||
           operation_attributes.binary_op_type == BinaryOpType::LE ||
           operation_attributes.binary_op_type == BinaryOpType::GE);
@@ -258,16 +258,16 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
  
      uint32_t a_single_tile_size = tt::tile_size(a_data_format);
      uint32_t b_single_tile_size = tt::tile_size(b_data_format);
-@@ -902,7 +918,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
-     const auto op_config = is_sfpu_op ? OpConfig(op_type, std::in_place_type<OpConfig::SfpuBinaryOp>, a_dtype)
-                                       : OpConfig(op_type, std::in_place_type<OpConfig::FpuBinaryOp>, a_dtype);
+@@ -916,7 +932,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+                                ? OpConfig(op_type, std::in_place_type<OpConfig::SfpuBinaryOp>, a_dtype, op_params)
+                                : OpConfig(op_type, std::in_place_type<OpConfig::FpuBinaryOp>, a_dtype, op_params);
  
 -    auto compute_kernel_defines = op_config.as_defines(a_dtype);
 +    auto compute_kernel_defines = op_config.as_defines(is_fp16_comparison ? DataType::FLOAT32 : a_dtype);
  
      // Quant/requant rounding depends on the output dtype. For uint8, we need fp32->uint8 rounding instead
      // of the default fp32->int8. The packer narrows the int32 SFPU result to uint8.
-@@ -952,6 +968,12 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -966,6 +982,12 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
          ttsl::SmallVector<unary::EltwiseUnaryWithParam> rhs_activations = operation_attributes.rhs_activations;
          ttsl::SmallVector<unary::EltwiseUnaryWithParam> post_activations = operation_attributes.post_activations;
  
@@ -280,7 +280,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
          // Under a left-hand scalar the kernel evaluates op(c_1, c_0), so the mathematical
          // operands are swapped relative to the physical CBs. The caller's per-operand
          // activation lists and the op-derived preprocess steps are both stated against the
-@@ -1000,6 +1022,9 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1014,6 +1036,9 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
          if (op_config.postprocess.has_value()) {
              post_activations.insert(post_activations.begin(), *op_config.postprocess);
          }
@@ -290,7 +290,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
  
          bool is_integer_division =
              (operation_attributes.binary_op_type == BinaryOpType::DIV && a_dtype == DataType::INT32 &&
-@@ -1054,9 +1079,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1068,9 +1093,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
          b_data_format == tt::DataFormat::Float32 ||
          (a_data_format == tt::DataFormat::Int32 && b_data_format == tt::DataFormat::Int32) ||
          (a_data_format == tt::DataFormat::UInt32 && b_data_format == tt::DataFormat::UInt32) ||
@@ -302,7 +302,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
  
      // Determine max tiles per cycle based on sharding and output data type
      // Multi-tile processing only enabled when all tensors are sharded
-@@ -1108,9 +1132,10 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1122,9 +1146,10 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
      }
  
      if (not compute_kernel_defines["PROCESS_LHS_ACTIVATIONS(i)"].empty()) {
@@ -316,7 +316,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
          uint32_t a_intermediate_single_tile_size = tt::tile_size(a_intermediate_format);
          desc.cbs.push_back(CBDescriptor{
              .total_size = a_intermediate_single_tile_size * num_tiles_per_cycle,
-@@ -1139,9 +1164,10 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1153,9 +1178,10 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
      }
  
      if (not compute_kernel_defines["PROCESS_RHS_ACTIVATIONS(i)"].empty()) {
@@ -330,7 +330,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
          uint32_t b_intermediate_single_tile_size = tt::tile_size(b_intermediate_format);
          desc.cbs.push_back(CBDescriptor{
              .total_size = b_intermediate_single_tile_size * num_tiles_per_cycle,
-@@ -1256,14 +1282,16 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1270,14 +1296,16 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
  
      std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
  
@@ -352,7 +352,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
          } else {
              unpack_to_dest_mode[src0_cb_index] =
                  (a_dtype == DataType::FLOAT32) ? tt::tt_metal::UnpackToDestMode::UnpackToDestFp32 : tt::tt_metal::UnpackToDestMode::Default;
-@@ -1311,7 +1339,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1326,7 +1354,7 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
      // Fall back to software broadcast for this combination - non-broadcast u16
      // relational ops and broadcasted arithmetic u16 ops (no postprocess) are
      // unaffected.
@@ -361,36 +361,6 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
          (op_config.postprocess.has_value() ||
           (std::holds_alternative<OpConfig::SfpuBinaryOp>(op_config.binary_op) &&
            (std::get<OpConfig::SfpuBinaryOp>(op_config.binary_op) == OpConfig::SfpuBinaryOp::LT ||
-diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_utils_sfpu.hpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_utils_sfpu.hpp
---- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_utils_sfpu.hpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_utils_sfpu.hpp
-@@ -12,9 +12,7 @@
- // on each tile in DST, and writes the results into cb_post — i.e. produces the
- // "activated" input that the downstream binary op consumes. cb_out is passed in only
- // so we can briefly retarget the packer at cb_post and then restore it to cb_out's
--// data format on the way out. SFPU variant: no unpacker srca reconfigure is needed —
--// the downstream binary SFPU op uses copy_tile_to_dst_init_short_with_dt to switch
--// formats itself.
-+// data format on the way out.
- template <typename ActivationFn>
- ALWI void preprocess_sfpu_impl(
-     CircularBuffer cb_pre,
-@@ -23,6 +21,7 @@ ALWI void preprocess_sfpu_impl(
-     uint32_t per_core_block_size,
-     ActivationFn&& process_activations) {
-     using namespace ckernel;
-+    reconfig_data_format_srca(/*old*/ cb_post.get_cb_id(), /*new*/ cb_pre.get_cb_id());
- 
-     pack_reconfig_data_format(/*old*/ cb_out.get_cb_id(), /*new*/ cb_post.get_cb_id());
- 
-@@ -47,6 +46,7 @@ ALWI void preprocess_sfpu_impl(
-     cb_post.push_back(per_core_block_size);
- 
-     pack_reconfig_data_format(/*old*/ cb_post.get_cb_id(), /*new*/ cb_out.get_cb_id());
-+    reconfig_data_format_srca(/*old*/ cb_pre.get_cb_id(), /*new*/ cb_post.get_cb_id());
- }
- 
- // Dispatcher: per-operand activation lists are configured at compile time via host-side
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp
@@ -417,7 +387,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.hpp ttnn
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.cpp
-@@ -344,7 +344,32 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
+@@ -439,15 +439,41 @@ ttnn::device_operation::ProgramArtifacts UnaryDeviceOperation::ProgramFactory::c
      const auto& input = tensor_args.input;
      const auto& ops_chain = operation_attributes.op_chain;
      TT_FATAL(!ops_chain.empty(), "Unary: op_chain must not be empty");
@@ -427,7 +397,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
 +        ops_chain[0].type() != UnaryOpType::BITCAST &&
 +        (input.dtype() == DataType::FLOAT16 || ops_chain[0].type() == UnaryOpType::NEG ||
 +         ops_chain[0].type() == UnaryOpType::ABS || ops_chain[0].type() == UnaryOpType::LOG1P) &&
-+        get_compute_kernel_path(ops_chain[0].type(), input.dtype()) == "eltwise_sfpu.cpp";
++        get_compute_kernel_path(ops_chain[0].type(), input.dtype()) == "eltwise_sfpu_metal2.cpp";
 +    const auto op_type = ops_chain[0].type();
 +    const bool use_native_fp16_pack =
 +        input.dtype() == DataType::FLOAT16 && op_type != UnaryOpType::NEG && op_type != UnaryOpType::ABS &&
@@ -444,42 +414,50 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
 +        }
 +    }
  
-+    const bool fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en ||
-+                                  input.dtype() == DataType::FLOAT16 ||
++    // Drives both enable_32_bit_dest and the unpack modes below, which must agree with it.
++    const bool fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en || input.dtype() == DataType::FLOAT16 ||
 +                                  output.dtype() == DataType::FLOAT16 || promote_narrow_float;
      uint32_t packed_scalar1 = 0;
      uint32_t packed_scalar2 = 0;
  
-@@ -352,9 +377,12 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
- 
      const bool is_row_major = input.layout() == Layout::ROW_MAJOR;
  
--    DataFormat cb_data_format = cb_dataformat_for(input.dtype());
-+    DataFormat cb_data_format =
-+        promote_narrow_float ? raw_16bit_sfpu_format : cb_dataformat_for(input.dtype());
-     uint32_t single_tile_size = tile_size(cb_data_format);
--    DataFormat cb_data_format_output = cb_dataformat_for(output.dtype());
-+    DataFormat cb_data_format_output =
-+        promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format
-+                                                      : cb_dataformat_for(output.dtype());
-     uint32_t single_tile_size_output = tile_size(cb_data_format_output);
+-    DataFormat dfb_data_format = cb_dataformat_for(input.dtype());
++    DataFormat dfb_data_format = promote_narrow_float ? raw_16bit_sfpu_format : cb_dataformat_for(input.dtype());
+     uint32_t single_tile_size = tile_size(dfb_data_format);
+-    DataFormat dfb_data_format_output = cb_dataformat_for(output.dtype());
++    DataFormat dfb_data_format_output =
++        promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format : cb_dataformat_for(output.dtype());
+     uint32_t single_tile_size_output = tile_size(dfb_data_format_output);
  
-     Buffer* src_buffer = input.buffer();
-@@ -404,7 +432,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
-     }
+     const auto shard_specs = get_shard_specs(input.tensor_spec(), output.tensor_spec());
+@@ -494,7 +520,7 @@ ttnn::device_operation::ProgramArtifacts UnaryDeviceOperation::ProgramFactory::c
+     const bool needs_tmp0 = needs_tmp0_dfb(ops_chain[0].type());
  
      const bool math_approx_mode = false;
 -    std::map<std::string, std::string> unary_defines = get_block_defines(ops_chain, "0", "0", input.dtype());
 +    std::map<std::string, std::string> unary_defines = get_block_defines(compute_ops_chain, "0", "0", input.dtype());
      add_input_dtype_defines(input.dtype(), unary_defines);
-     const bool logit_clamp_enabled =
-         CMAKE_UNIQUE_NAMESPACE::pack_first_op_scalars(ops_chain[0], input.dtype(), packed_scalar1, packed_scalar2);
-@@ -507,7 +535,7 @@ tt::tt_metal::ProgramDescriptor UnaryDeviceOperation::ProgramFactory::create_des
-     compute_desc.defines = {unary_defines.begin(), unary_defines.end()};
-     compute_desc.config = ComputeConfigDescriptor{
-         .math_fidelity = tt::tt_metal::MathFidelity::HiFi4,
--        .fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en,
-+        .fp32_dest_acc_en = fp32_dest_acc_en,
-         .unpack_to_dest_mode = {unpack_to_dest_mode.begin(), unpack_to_dest_mode.end()},
-         .bfp8_pack_precise = operation_attributes.bfp8_pack_precise,
-         .math_approx_mode = math_approx_mode,
+     const bool logit_clamp_enabled = pack_first_op_scalars(ops_chain[0], input.dtype(), packed_scalar1, packed_scalar2);
+ 
+@@ -645,9 +671,9 @@ ttnn::device_operation::ProgramArtifacts UnaryDeviceOperation::ProgramFactory::c
+     // legacy's silent UnpackToSrc instead of a TT_FATAL.
+     ComputeHardwareConfig::ComputeUnpackModes unpack_modes;
+     auto set_unpack_mode = [&](const DFBSpecName& dfb, DataFormat df) {
+-        if (operation_attributes.preserve_fp32_precision && operation_attributes.fp32_dest_acc_en) {
++        if (operation_attributes.preserve_fp32_precision && fp32_dest_acc_en) {
+             unpack_modes.emplace(dfb, UnpackMode::UnpackToDest);
+-        } else if (operation_attributes.fp32_dest_acc_en && df == DataFormat::Float32) {
++        } else if (fp32_dest_acc_en && df == DataFormat::Float32) {
+             unpack_modes.emplace(dfb, UnpackMode::UnpackToSrc);
+         }
+     };
+@@ -665,7 +691,7 @@ ttnn::device_operation::ProgramArtifacts UnaryDeviceOperation::ProgramFactory::c
+     ComputeHardwareConfig compute_hw_config{
+         .fpu_math_fidelity = tt::tt_metal::MathFidelity::HiFi4,
+         .sfpu_precision_mode = math_approx_mode ? Precision::Approximate : Precision::Precise,
+-        .enable_32_bit_dest = operation_attributes.fp32_dest_acc_en,
++        .enable_32_bit_dest = fp32_dest_acc_en,
+         .unpack_modes = std::move(unpack_modes),
+     };
+     if (arch != tt::ARCH::QUASAR) {

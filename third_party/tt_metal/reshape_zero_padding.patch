@@ -11,7 +11,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dat
  
  #include <stdint.h>
  
-@@ -27,7 +26,6 @@
+@@ -27,7 +26,6 @@ void kernel_main() {
      constexpr uint32_t Alignment = get_arg(args::Alignment);
      constexpr uint32_t Max_Segments = get_arg(args::Max_Segments);
      constexpr uint32_t Windows_Per_Page = Tile_size_bytes / Alignment;
@@ -19,18 +19,18 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dat
  
      const auto input = TensorAccessor(tensor::input);
      const auto output = TensorAccessor(tensor::output);
-@@ -36,6 +34,10 @@
-     Scratchpad<uint8_t> staging(scratch::staging);
+@@ -37,6 +35,10 @@ void kernel_main() {
      const uint32_t windows_base = round_up(staging.get_base_address(), Alignment);
      const uint32_t pages_base = windows_base + Max_Segments * Alignment;
-+
+ 
 +    // Matmul reads the full padded K dimension; never leave padding as stale scratch data.
 +    noc.async_write_zeros(staging, num_pages * Tile_size_bytes,
 +                          {.offset_bytes = pages_base - staging.get_base_address()});
- 
++
      // Segment s: vararg 2s is its window (input page * Windows_Per_Page + window in the page); vararg
      // 2s + 1 packs its offset in the window (bits 0-5), its byte offset in this core's output pages
-@@ -49,6 +51,7 @@
+     // (bits 6-21) and its size in bytes (bits 22-29).
+@@ -49,6 +51,7 @@ void kernel_main() {
              Alignment);
      }
      noc.async_read_barrier();
@@ -38,7 +38,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dat
  
      for (uint32_t s = 0; s < num_segments; ++s) {
          const uint32_t packed = get_vararg(2 * s + 1);
-@@ -57,26 +60,9 @@
+@@ -57,26 +60,9 @@ void kernel_main() {
      }
      noc.async_read_barrier();
  
@@ -70,7 +70,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dat
 diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/writer_reshape_tiled.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/writer_reshape_tiled.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/writer_reshape_tiled.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/writer_reshape_tiled.cpp
-@@ -32,6 +32,9 @@
+@@ -32,6 +32,9 @@ void kernel_main() {
      bool first = true;
      const uint32_t working_write_addr = working.get_base_address();
      for (uint32_t output_page_idx = start_output_page; output_page_idx < end_output_page; ++output_page_idx) {
@@ -83,7 +83,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dat
 diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_tiled_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_tiled_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_tiled_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_tiled_program_factory.cpp
-@@ -281,7 +281,6 @@
+@@ -281,7 +281,6 @@ std::optional<ttnn::device_operation::ProgramArtifacts> create_windowed_program_
      const uint32_t element_size = tt::datum_size(data_format);
      const uint32_t alignment = std::max(hal::get_dram_alignment(), hal::get_l1_alignment());
      const uint32_t windows_per_page = tile_bytes / alignment;
@@ -91,7 +91,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_ti
      const uint32_t max_pages = std::max(num_tiles_per_core_group_1, num_tiles_per_core_group_2);
      const uint64_t num_input_pages = tt::div_up(input_tensor.physical_volume(), tile_shape[0] * tile_shape[1]);
      // The kernel's packing of a segment: its window as one word, and its offset in the window, its
-@@ -296,7 +295,6 @@
+@@ -296,7 +295,6 @@ std::optional<ttnn::device_operation::ProgramArtifacts> create_windowed_program_
          uint32_t start_page = 0;
          uint32_t num_pages = 0;
          std::vector<uint32_t> segments;  // two words per segment
@@ -99,7 +99,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_ti
      };
      const Dims tile_dims_input(input_shape, tile_shape), tile_dims_output(output_shape, tile_shape);
      std::vector<CorePlan> plans;
-@@ -310,7 +308,6 @@
+@@ -310,7 +308,6 @@ std::optional<ttnn::device_operation::ProgramArtifacts> create_windowed_program_
              continue;
          }
          auto& plan = plans.emplace_back(CorePlan{.core = core, .start_page = page, .num_pages = num_pages});
@@ -107,7 +107,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_ti
          for (uint32_t j = 0; j < num_pages; ++j, ++page) {
              for (const auto& segment : reshape_map_output_page(
                       page, input_shape, output_shape, tile_dims_input, tile_dims_output, tile_shape, face_shape)) {
-@@ -325,9 +322,6 @@
+@@ -325,9 +322,6 @@ std::optional<ttnn::device_operation::ProgramArtifacts> create_windowed_program_
                  }
                  plan.segments.push_back(segment.input_page_index * windows_per_page + in_begin / alignment);
                  plan.segments.push_back(in_begin % alignment | (j * tile_bytes + out_begin) << 6 | size << 22);
@@ -117,7 +117,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_ti
              }
          }
          if (plan.segments.size() / 2 > kMaxSegmentsPerCore) {
-@@ -345,7 +339,7 @@
+@@ -345,7 +339,7 @@ std::optional<ttnn::device_operation::ProgramArtifacts> create_windowed_program_
      const TensorParamName OUTPUT_T{"output"};
      const auto& input_mt = input_tensor.mesh_tensor();
      const auto& output_mt = output_tensor.mesh_tensor();
@@ -126,7 +126,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_ti
  
      ProgramSpec spec;
      spec.name = "reshape_view_tiled_windows";
-@@ -393,8 +387,6 @@
+@@ -393,8 +387,6 @@ std::optional<ttnn::device_operation::ProgramArtifacts> create_windowed_program_
               {"num_pages", plan.num_pages},
               {"num_segments", static_cast<uint32_t>(plan.segments.size() / 2)}});
          std::vector<uint32_t> varargs = std::move(plan.segments);
