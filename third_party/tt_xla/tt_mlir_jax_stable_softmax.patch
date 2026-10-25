@@ -1,7 +1,39 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -290,6 +290,56 @@ public:
+@@ -218,6 +218,20 @@
+ // 2. sum reduce(exp(x)) along a dimension with keep_dim=true
+ // 3. (optional) broadcast the sum reduce
+ // 4. divide exp(x) by the (broadcasted) sum reduce
++// TTNN's softmax kernels split their work across cores by tile rows, so each
++// row runs on one core. With the exact exp and FP32 accumulation that FP32
++// probabilities need, rows wider than 1024 take longer than the exp / sum /
++// divide decomposition, which reduces each row across cores: 64 rows of 16384
++// take 1.3 ms against 0.15 ms, two rows of 4096 0.14 ms against 0.08 ms. Such
++// rows keep the decomposition.
++static bool isWideSoftmax(mlir::RankedTensorType type, int64_t dim) {
++  constexpr int64_t maxFusedWidth = 1024;
++  if (dim < 0) {
++    dim += type.getRank();
++  }
++  return !type.isDynamicDim(dim) && type.getDimSize(dim) > maxFusedWidth;
++}
++
+ class SoftmaxFusionPattern : public mlir::OpRewritePattern<DivOp> {
+   using mlir::OpRewritePattern<DivOp>::OpRewritePattern;
+ 
+@@ -280,6 +294,10 @@
+     }
+ 
+     int64_t reduceDim = mlir::cast<mlir::IntegerAttr>(reduceDims[0]).getInt();
++    if (isWideSoftmax(mlir::cast<mlir::RankedTensorType>(divOp.getType()),
++                      reduceDim)) {
++      return mlir::failure();
++    }
+ 
+     // Replace div op with new softmax op.
+     rewriter.replaceOpWithNewOp<SoftmaxOp>(divOp, divOp.getType(),
+@@ -290,6 +308,56 @@
    }
  };
  
@@ -58,7 +90,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  // This pattern detects and fuses numerically stable softmax operations:
  // softmax(x - max(x)) -> softmax(x, numericStable=true).
  //
-@@ -326,6 +376,26 @@ public:
+@@ -326,6 +394,26 @@
      // Check if we have a max operation.
      auto maxOp =
          ttmlir::utils::findOpThrough<MaxOp, BroadcastOp>(subtractedValue);
@@ -85,7 +117,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
      if (!maxOp) {
        return mlir::failure();
      }
-@@ -335,9 +405,8 @@ public:
+@@ -335,9 +423,8 @@
        return mlir::failure();
      }
  
@@ -100,16 +132,21 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -524,9 +524,18 @@ public:
+@@ -524,9 +524,23 @@ public:
    LogicalResult
    matchAndRewrite(ttir::SoftmaxOp op, OpAdaptor adaptor,
                    ConversionPatternRewriter &rewriter) const override {
-+    // TTNN's softmax uses the approximate exp unless asked otherwise, which
-+    // leaves FP32 probabilities about 3% off; FP32 inputs ask for the exact one.
++    // An FP32 softmax needs the exact exp and FP32 sums: the approximate exp
++    // alone leaves its probabilities about 3% off. TTNN's defaults give both,
++    // but the runtime fills a config's unset fields with the approximate exp,
++    // LoFi and BF16 sums, and at O0 the pipeline sets HiFi4 and FP32 sums on
++    // every op, so FP32 inputs spell out all three.
 +    ttnn::DeviceComputeKernelConfigAttr computeConfig;
 +    if (op.getInput().getType().getElementType().isF32()) {
 +      computeConfig =
 +          ttnn::DeviceComputeKernelConfigAttr::get(rewriter.getContext())
++              .withMathFidelity(ttnn::MathFidelity::HiFi4)
++              .withFp32DestAccEn(true)
 +              .withMathApproxMode(false);
 +    }
      rewriter.replaceOpWithNewOp<ttnn::SoftmaxOp>(
