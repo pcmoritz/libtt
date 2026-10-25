@@ -4,14 +4,15 @@ softmax, and every FP32 softmax uses the exact exp.
 JAX subtracts the row maximum first, as maximum(-inf, max(x)) reduced without
 keeping the dim and reshaped back. tt-mlir folds that into
 softmax(numericStable=true) instead of running the max reduction and the
-subtraction as programs of their own, and asks for the exact exp on FP32
-inputs. TTNN subtracts the row maximum of an FP32 input in FP32 and masks the
-padding of a row that does not fill its last tile the same way. Logits around a
-thousand overflow a softmax that does not subtract the maximum, and lose their
-low bits where the subtraction runs at the matrix unit's 19 bits. BF16 softmax
-(JAX sums its exponentials in FP32), softmax over other dims and rows longer
-than 4096, which TTNN may stream through a kernel without the FP32 subtraction,
-keep JAX's ops.
+subtraction as programs of their own, and asks for the exact exp and FP32 sums
+on FP32 inputs at every optimization level. TTNN subtracts the row maximum of an
+FP32 input in FP32 and masks the padding of a row that does not fill its last
+tile the same way. Logits around a thousand overflow a softmax that does not
+subtract the maximum, and lose their low bits where the subtraction runs at the
+matrix unit's 19 bits. BF16 softmax (JAX sums its exponentials in FP32) and
+rows longer than 1024, for which the decomposition is faster
+(wide_softmax_regression_test.py), keep JAX's ops; a softmax over another dim
+keeps JAX's subtraction.
 """
 
 import jax
@@ -36,9 +37,10 @@ def reference(x, axis):
         ((33, 70), -1),  # rows that do not fill their last tile
         ((3, 8), -1),  # a padded row in one tile, such as a router's top 8 renormalized
         ((2, 289), -1),  # padded rows streamed through the input buffer in several blocks
-        ((2, 4095), -1),
-        ((2, 4096), -1),  # the longest fused row
-        ((2, 8192), -1),  # unfused: TTNN may stream it
+        ((2, 1023), -1),
+        ((2, 1024), -1),  # the longest fused row
+        ((2, 4096), -1),  # unfused
+        ((2, 8192), -1),
         ((2, 3, 40), -1),
         ((40, 6), 0),
     ],
@@ -55,7 +57,7 @@ def test_softmax_is_one_accurate_stable_program(dtype, offset, shape, axis, tmp_
     else:
         np.testing.assert_allclose(got, want, rtol=6e-2, atol=4e-3)
 
-    if dtype != np.float32 or shape[-1] > 4096:
+    if dtype != np.float32 or shape[-1] > 1024:
         return
     irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
     assert irs, "no IR was exported"
