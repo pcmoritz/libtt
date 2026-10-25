@@ -1,13 +1,13 @@
-"""Values crossing a trace boundary are not copied, and stay correct.
+"""Values crossing a trace boundary are copied once, and stay correct.
 
 An eager conditional splits a traced program into a trace before it and a
 trace after it. The runtime published every trace output as a copy of its slot
 and copied every staged trace input into a slot of its own, so a value crossing
 a boundary cost two passes over it; the sampler's vocabulary-sized logits cross
 several per decode step (2-4% of decode). Traces now publish their output slots
-as they are, and a trace fed from another trace's slot reads it in place. A
-value that outlives the invocation is copied where it escapes: a program output,
-and a loop carry (tt_mlir_trace_slot_aliasing.patch, tt_mlir_control_flow_runtime.cpp).
+as they are, so only the copy into the next trace's input slot remains. A value
+that outlives the invocation is copied where it escapes: a program output, and
+a loop carry (tt_mlir_trace_publish_slots.patch, tt_mlir_control_flow_runtime.cpp).
 """
 
 import time
@@ -69,9 +69,9 @@ def test_conditionals_between_traces_take_either_branch():
     step = _jit(_step)
     x, w, scale = _put(rng.standard_normal((1, 1024)).astype(np.float32)), _put(WEIGHT), _put(SCALE)
     bools = {value: _put(np.bool_(value)) for value in (False, True)}
-    # Alternating predicates exercise both branch programs and both of the
-    # following trace's variants: one fed from the pass-through branch's
-    # aliased slot, one from the penalty branch's fresh output.
+    # Alternating predicates exercise both branch programs, and the following
+    # trace is fed from either the pass-through branch's published slot or the
+    # penalty branch's fresh output.
     for pred, penalize in [
         (True, False),
         (False, False),
@@ -125,9 +125,10 @@ def test_loop_body_with_a_conditional_carries_its_values():
         np.testing.assert_array_equal(np.asarray(result_b), b)
 
 
-def test_conditionals_cost_no_pass_over_the_logits():
-    # Per step, a conditional over the logits cost two copies of [1, 151936]
-    # (about 300 us) before; now it costs a trace launch (tens of us).
+def test_conditionals_cost_one_pass_over_the_logits():
+    # Per step, two conditionals over the logits cost about 300 us when each
+    # boundary copied the logits twice, and about 200 us with the one copy
+    # into the next trace's input slot that remains.
     def with_conds(x, w, scale, pred, penalize):
         return _step(x, w, scale, pred, penalize)
 
@@ -153,5 +154,5 @@ def test_conditionals_cost_no_pass_over_the_logits():
 
     overhead = per_step(with_conds) - per_step(without)
     assert (
-        overhead < 150e-6
+        overhead < 255e-6
     ), f"two conditionals over the logits cost {overhead * 1e6:.0f} us per step"
