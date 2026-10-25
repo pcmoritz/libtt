@@ -1,0 +1,148 @@
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -305,11 +305,11 @@
+ 
+     // Apply these permutations to lhs and rhs.
+ 
+-    ttir::PermuteOp lhsPermute = createPermuteOp(
++    Value lhsPermute = permuteOperand(
+         rewriter,
+         ttmlir::utils::appendLocationSuffix(op.getLoc(), "_permuteLhs"), lhs,
+         lhsType, lhsPermutation);
+-    ttir::PermuteOp rhsPermute = createPermuteOp(
++    Value rhsPermute = permuteOperand(
+         rewriter,
+         ttmlir::utils::appendLocationSuffix(op.getLoc(), "_permuteRhs"), rhs,
+         rhsType, rhsPermutation);
+@@ -610,6 +610,40 @@
+     return permuteOp;
+   }
+ 
++  // An operand in the order the matmul reshape reads, without the permute's
++  // size-1 dims: those do not change the order of elements, but TTNN pads a
++  // size-1 second-to-last dim to a whole tile. jax.nn.dot_product_attention's
++  // query, [B, T, N, 1, H] with groups of one head, is permuted as [B, T, N, H]
++  // to [B, N, T, H] instead of to [B, N, T, 1, H], 32 times its size.
++  Value permuteOperand(PatternRewriter &rewriter, Location loc, Value input,
++                       RankedTensorType inputType,
++                       ArrayRef<int64_t> permutation) const {
++    SmallVector<int64_t> compactShape;
++    SmallVector<int64_t> compactIndex(inputType.getRank(), -1);
++    for (int64_t d = 0; d < inputType.getRank(); ++d) {
++      if (inputType.getDimSize(d) != 1) {
++        compactIndex[d] = compactShape.size();
++        compactShape.push_back(inputType.getDimSize(d));
++      }
++    }
++    SmallVector<int64_t> compactPermutation;
++    for (int64_t d : permutation) {
++      if (compactIndex[d] >= 0) {
++        compactPermutation.push_back(compactIndex[d]);
++      }
++    }
++    // The matmul reshape alone puts the elements in this order.
++    if (llvm::is_sorted(compactPermutation)) {
++      return input;
++    }
++    if (compactShape.size() != static_cast<size_t>(inputType.getRank())) {
++      input = ttir::utils::createReshapeOp(rewriter, loc, input, compactShape);
++    }
++    return createPermuteOp(
++        rewriter, loc, input, mlir::cast<RankedTensorType>(input.getType()),
++        compactPermutation);
++  }
++
+   SmallVector<int64_t>
+   computeMatmulInputShape(ConversionPatternRewriter &rewriter,
+                           RankedTensorType tensorType,
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -4333,6 +4333,76 @@
+   }
+ };
+ 
++// permute(reshape(x)) -> reshape(permute(x)) when the reshape only inserts or
++// removes size-1 dims and x has fewer tiles than the reshape's result, such as
++// a matmul's [B, N, T, H] result restored to [B, N, T, 1, H]: the permute then
++// moves x's tiles instead of the padded ones. x's own size-1 dims go first.
++class SinkReshapeThroughPermutePattern
++    : public mlir::OpRewritePattern<PermuteOp> {
++  using mlir::OpRewritePattern<PermuteOp>::OpRewritePattern;
++
++public:
++  mlir::LogicalResult
++  matchAndRewrite(PermuteOp permute,
++                  mlir::PatternRewriter &rewriter) const final {
++    auto reshape = permute.getInput().getDefiningOp<ReshapeOp>();
++    if (!reshape || !reshape->hasOneUse()) {
++      return mlir::failure();
++    }
++    Value input = reshape.getInput();
++    auto inputType = mlir::cast<RankedTensorType>(input.getType());
++    auto reshapedType = mlir::cast<RankedTensorType>(reshape.getType());
++    if (tileCount(inputType) >= tileCount(reshapedType)) {
++      return mlir::failure();
++    }
++    auto nonUnitDims = [](RankedTensorType type) {
++      SmallVector<int64_t> dims;
++      for (int64_t d = 0; d < type.getRank(); ++d) {
++        if (type.getDimSize(d) != 1) {
++          dims.push_back(d);
++        }
++      }
++      return dims;
++    };
++    SmallVector<int64_t> inputDims = nonUnitDims(inputType);
++    SmallVector<int64_t> reshapedDims = nonUnitDims(reshapedType);
++    if (!llvm::equal(
++            llvm::map_range(inputDims,
++                            [&](int64_t d) { return inputType.getDimSize(d); }),
++            llvm::map_range(reshapedDims, [&](int64_t d) {
++              return reshapedType.getDimSize(d);
++            }))) {
++      return mlir::failure();
++    }
++
++    SmallVector<int64_t> permutation;
++    for (int64_t d = 0; d < inputType.getRank(); ++d) {
++      if (inputType.getDimSize(d) == 1) {
++        permutation.push_back(d);
++      }
++    }
++    for (int64_t d : permute.getPermutation()) {
++      if (const auto *it = llvm::find(reshapedDims, d);
++          it != reshapedDims.end()) {
++        permutation.push_back(inputDims[it - reshapedDims.begin()]);
++      }
++    }
++    if (!llvm::is_sorted(permutation)) {
++      input = rewriter.create<PermuteOp>(
++          permute.getLoc(),
++          RankedTensorType::get(
++              ttmlir::utils::applyPermutation(inputType.getShape(),
++                                              permutation),
++              inputType.getElementType(), inputType.getEncoding()),
++          input, permutation);
++    }
++    rewriter.replaceOp(permute,
++                       utils::createReshapeOp(rewriter, permute.getLoc(), input,
++                                              permute.getType().getShape()));
++    return mlir::success();
++  }
++};
++
+ class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
+ public:
+   using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
+@@ -4421,7 +4491,8 @@
+       // After the fusions, which match the graph as the frontend wrote it.
+       RewritePatternSet patterns(&getContext());
+       patterns.add<HoistReshapeToFewerTilesPattern,
+-                   SinkReshapeToFewerTilesPattern>(&getContext());
++                   SinkReshapeToFewerTilesPattern,
++                   SinkReshapeThroughPermutePattern>(&getContext());
+       (void)applyPatternsGreedily(getOperation(), std::move(patterns));
+     }
+   }
