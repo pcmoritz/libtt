@@ -69,6 +69,22 @@ private:
   bool restored = false;
 };
 
+// A branch or loop body can return one tensor for several results, such as a
+// one-step scan whose stacked output is its carry. The caller deallocates each
+// result on its own, and the first deallocation would free the buffer the other
+// results still name, so a tensor returned more than once is retained. It is
+// freed with its last handle.
+void retainRepeatedTensors(std::vector<::tt::runtime::Tensor> &tensors) {
+  for (size_t i = 1; i < tensors.size(); ++i) {
+    for (size_t j = 0; j < i; ++j) {
+      if (tensors[i].handle.get() == tensors[j].handle.get()) {
+        tensors[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).setRetain(true);
+        break;
+      }
+    }
+  }
+}
+
 template <typename ReadScalar>
 auto readHostScalar(const ::tt::runtime::Tensor &tensor, ReadScalar read) {
   auto hostTensors = ::tt::runtime::ttnn::toHost(
@@ -215,15 +231,21 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
 
   retention.restore();
 
+  std::vector<::tt::runtime::Tensor> outputs;
+  outputs.reserve(op->outputs()->size());
   for (size_t i = 0; i < op->outputs()->size(); ++i) {
     uint32_t stateIndex = op->output_indices()->Get(i);
     LOG_ASSERT(stateIndex < stateSize,
                "While loop output index is out of range");
+    outputs.push_back(inputs[stateIndex]);
+  }
+  retainRepeatedTensors(outputs);
+  for (size_t i = 0; i < outputs.size(); ++i) {
     // A loop output may directly alias an input even after the body ran. Keep
     // that shared tensor alive when the caller deallocates the input.
-    retention.retainIfInputAlias(inputs[stateIndex]);
+    retention.retainIfInputAlias(outputs[i]);
     context.getTensorPool().insertRuntimeTensorAndValidate(
-        op->outputs()->Get(i), inputs[stateIndex]);
+        op->outputs()->Get(i), outputs[i]);
   }
 }
 
@@ -264,6 +286,7 @@ void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context) {
   // Restore original input flags first, then re-pin aliases that escape as
   // outputs. The retention destructor sees `restored` and is therefore a no-op.
   retention.restore();
+  retainRepeatedTensors(outputs);
   for (size_t i = 0; i < outputs.size(); ++i) {
     retention.retainIfInputAlias(outputs[i]);
     context.getTensorPool().insertRuntimeTensorAndValidate(
