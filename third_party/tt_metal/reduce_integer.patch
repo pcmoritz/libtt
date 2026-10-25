@@ -27,7 +27,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
  // Tile-layout address tables for the manual column MAX/MIN reduce path (calculate_reduce_max_min_uint16).
  // Hoisted to file scope alongside the other reduce kernels for consistency.
  //   COL_REDUCE_ODD_COLUMNS:    dest-word offset between the even- and odd-column halves of a face.
-@@ -290,7 +309,7 @@ inline void perform_reduce_col_sum_avg() {
+@@ -245,7 +264,7 @@ inline void perform_reduce_col_sum_avg() {
          // Step 2: Cross-face addition. Unlike the old approach where only position 0 of the
          // cross-face sum was meaningful, here ALL 4 positions carry useful partial sums.
          if constexpr (is_integer_mode) {
@@ -36,49 +36,41 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
          } else {
              TTI_SFPADD(
                  p_sfpu::LREG0, p_sfpu::LCONST_1, p_sfpu::LREG4, p_sfpu::LREG0, 0);  // LREG0 = upper + lower (float)
-@@ -352,7 +371,7 @@ inline void perform_reduce_col_sum_avg() {
+@@ -343,11 +362,11 @@ inline void horizontal_reduce_rotate() {
   *
   * @tparam is_integer_mode True for integer types (uses SFPIADD), false for float (uses SFPADD)
   */
 -template <bool is_integer_mode>
 +template <bool is_integer_mode, PoolType pool_type = PoolType::SUM>
+ inline void horizontal_reduce_add() {
+     if constexpr (is_integer_mode) {
+-        TTI_SFPIADD(0, p_sfpu::LREG1, p_sfpu::LREG0, 4);
+-        TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG4, 4);
++        integer_combine<pool_type, p_sfpu::LREG1, p_sfpu::LREG0>();
++        integer_combine<pool_type, p_sfpu::LREG5, p_sfpu::LREG4>();
+     } else {
+         TTI_SFPADD(
+             p_sfpu::LREG0, p_sfpu::LCONST_1, p_sfpu::LREG1, p_sfpu::LREG0, 0);  // lreg0 = lreg0 * 1.0 + lreg1 (float)
+@@ -378,14 +397,14 @@ inline void horizontal_reduce_swap() {
+  *
+  * @tparam is_integer_mode True for integer types (SFPIADD), false for float (SFPADD).
+  */
+-template <bool is_integer_mode>
++template <bool is_integer_mode, PoolType pool_type = PoolType::SUM>
  inline void horizontal_reduce() {
-     // Phase 1: Rotate by 4 and add -> 8 partial sums (cols 0-7) become 4 duplicated pair sums.
-     TTI_SFPMOV(0, p_sfpu::LREG0, p_sfpu::LREG1, 0);
-@@ -369,8 +388,8 @@ inline void horizontal_reduce() {
-     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
+     horizontal_reduce_rotate<4 /*shift*/>();
+-    horizontal_reduce_add<is_integer_mode>();
++    horizontal_reduce_add<is_integer_mode, pool_type>();
+     horizontal_reduce_rotate<2 /*shift*/>();
+-    horizontal_reduce_add<is_integer_mode>();
++    horizontal_reduce_add<is_integer_mode, pool_type>();
+     horizontal_reduce_rotate<1 /*shift*/>();
+-    horizontal_reduce_add<is_integer_mode>();
++    horizontal_reduce_add<is_integer_mode, pool_type>();
+ }
  
-     if constexpr (is_integer_mode) {
--        TTI_SFPIADD(0, p_sfpu::LREG1, p_sfpu::LREG0, 4);
--        TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG4, 4);
-+        integer_combine<pool_type, p_sfpu::LREG1, p_sfpu::LREG0>();
-+        integer_combine<pool_type, p_sfpu::LREG5, p_sfpu::LREG4>();
-     } else {
-         TTI_SFPADD(
-             p_sfpu::LREG0, p_sfpu::LCONST_1, p_sfpu::LREG1, p_sfpu::LREG0, 0);  // lreg0 = lreg0 * 1.0 + lreg1 (float)
-@@ -386,8 +405,8 @@ inline void horizontal_reduce() {
-     TTI_SFPSHFT2(0, p_sfpu::LREG1, p_sfpu::LREG1, 3);
-     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
-     if constexpr (is_integer_mode) {
--        TTI_SFPIADD(0, p_sfpu::LREG1, p_sfpu::LREG0, 4);
--        TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG4, 4);
-+        integer_combine<pool_type, p_sfpu::LREG1, p_sfpu::LREG0>();
-+        integer_combine<pool_type, p_sfpu::LREG5, p_sfpu::LREG4>();
-     } else {
-         TTI_SFPADD(p_sfpu::LREG0, p_sfpu::LCONST_1, p_sfpu::LREG1, p_sfpu::LREG0, 0);
-         TTI_SFPADD(p_sfpu::LREG4, p_sfpu::LCONST_1, p_sfpu::LREG5, p_sfpu::LREG4, 0);
-@@ -399,8 +418,8 @@ inline void horizontal_reduce() {
-     TTI_SFPSHFT2(0, p_sfpu::LREG1, p_sfpu::LREG1, 3);
-     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
-     if constexpr (is_integer_mode) {
--        TTI_SFPIADD(0, p_sfpu::LREG1, p_sfpu::LREG0, 4);
--        TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG4, 4);
-+        integer_combine<pool_type, p_sfpu::LREG1, p_sfpu::LREG0>();
-+        integer_combine<pool_type, p_sfpu::LREG5, p_sfpu::LREG4>();
-     } else {
-         TTI_SFPADD(
-             p_sfpu::LREG0, p_sfpu::LCONST_1, p_sfpu::LREG1, p_sfpu::LREG0, 0);  // lreg0 = lreg0 * 1.0 + lreg1 (float)
-@@ -861,7 +880,11 @@ inline void load_row_avg_reciprocal_into(std::uint32_t scratch_lreg, RowAvgRecip
+ /**
+@@ -808,7 +827,11 @@ inline void load_row_avg_reciprocal_into(std::uint32_t scratch_lreg, RowAvgRecip
      TT_SFPLOADI(scratch_lreg, sfpi::SFPLOADI_MOD0_LOWER, recip.low16);
  }
  
@@ -91,16 +83,16 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
  inline void perform_reduce_row_sum_tile(
      std::uint32_t tile_row_offset,
      std::uint32_t result_store_mode,
-@@ -951,7 +974,7 @@ inline void perform_reduce_row_sum_tile(
-             }
+@@ -856,7 +879,7 @@ inline void perform_reduce_row_sum_tile(
  
-             // Horizontal reduction: consolidate all 8 SFPU columns into column 0 (interleaved for latency hiding)
+             // Horizontal reduction, inline (see the horizontal-reduce section): every column of LREG0 / LREG4
+             // then holds its 4-row group's full row sum.
 -            horizontal_reduce<is_integer_mode>();
 +            horizontal_reduce<is_integer_mode, pool_type>();
  
-             // Int32: convert the two's-complement partial sums back to sign-magnitude before storing.
-             // Only LREG0 and LREG4 hold results, so LREG1/LREG5 are free GPR scratch.
-@@ -1006,7 +1029,12 @@ inline void perform_reduce_row_sum_tile(
+             // For a single-column-tile AVG the per-tile sum is already the full row sum, so divide it
+             // here (float-only path; row AVG is restricted to float formats). When block_ct_dim > 1 the
+@@ -904,7 +927,12 @@ inline void perform_reduce_row_sum_tile(
   * @param tile_row_base Base address of the first tile in this row of tiles
   * @param block_ct_dim Number of tiles along x axis of tensor (column tiles)
   */
@@ -114,22 +106,22 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
  inline void sum_first_columns_across_tiles(
      std::uint32_t tile_row_base, std::uint32_t block_ct_dim, RowAvgReciprocal recip = {}) {
      constexpr bool is_integer_mode =
-@@ -1067,10 +1095,10 @@ inline void sum_first_columns_across_tiles(
+@@ -942,10 +970,10 @@ inline void sum_first_columns_across_tiles(
  
-                 // Add LREG4-7 into LREG0-3
-                 if constexpr (is_integer_mode) {
--                    TTI_SFPIADD(0, p_sfpu::LREG4, p_sfpu::LREG0, 4);
--                    TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG1, 4);
--                    TTI_SFPIADD(0, p_sfpu::LREG6, p_sfpu::LREG2, 4);
--                    TTI_SFPIADD(0, p_sfpu::LREG7, p_sfpu::LREG3, 4);
-+                    integer_combine<pool_type, p_sfpu::LREG4, p_sfpu::LREG0>();
-+                    integer_combine<pool_type, p_sfpu::LREG5, p_sfpu::LREG1>();
-+                    integer_combine<pool_type, p_sfpu::LREG6, p_sfpu::LREG2>();
-+                    integer_combine<pool_type, p_sfpu::LREG7, p_sfpu::LREG3>();
-                 } else {
-                     TTI_SFPADD(p_sfpu::LREG0, p_sfpu::LCONST_1, p_sfpu::LREG4, p_sfpu::LREG0, 0);
-                     TTI_SFPADD(p_sfpu::LREG1, p_sfpu::LCONST_1, p_sfpu::LREG5, p_sfpu::LREG1, 0);
-@@ -1118,8 +1146,8 @@ inline void sum_first_columns_across_tiles(
+             // Add LREG4-7 into LREG0-3
+             if constexpr (is_integer_mode) {
+-                TTI_SFPIADD(0, p_sfpu::LREG4, p_sfpu::LREG0, 4);
+-                TTI_SFPIADD(0, p_sfpu::LREG5, p_sfpu::LREG1, 4);
+-                TTI_SFPIADD(0, p_sfpu::LREG6, p_sfpu::LREG2, 4);
+-                TTI_SFPIADD(0, p_sfpu::LREG7, p_sfpu::LREG3, 4);
++                integer_combine<pool_type, p_sfpu::LREG4, p_sfpu::LREG0>();
++                integer_combine<pool_type, p_sfpu::LREG5, p_sfpu::LREG1>();
++                integer_combine<pool_type, p_sfpu::LREG6, p_sfpu::LREG2>();
++                integer_combine<pool_type, p_sfpu::LREG7, p_sfpu::LREG3>();
+             } else {
+                 TTI_SFPADD(p_sfpu::LREG0, p_sfpu::LCONST_1, p_sfpu::LREG4, p_sfpu::LREG0, 0);
+                 TTI_SFPADD(p_sfpu::LREG1, p_sfpu::LCONST_1, p_sfpu::LREG5, p_sfpu::LREG1, 0);
+@@ -983,8 +1011,8 @@ inline void sum_first_columns_across_tiles(
  template <PoolType pool_type, InstrModLoadStore INSTRUCTION_MODE, bool clear_high_bits, bool pack_low16>
  inline void perform_reduce_row_sum_avg(std::uint32_t block_ct_dim, std::uint32_t block_rt_dim) {
      static_assert(
@@ -140,7 +132,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
  
      // AVG divides each row sum by the number of reduced columns (32 per tile * block_ct_dim tiles).
      // The reciprocal is computed once and passed down to whichever step performs the final store.
-@@ -1144,13 +1172,13 @@ inline void perform_reduce_row_sum_avg(std::uint32_t block_ct_dim, std::uint32_t
+@@ -1009,13 +1037,13 @@ inline void perform_reduce_row_sum_avg(std::uint32_t block_ct_dim, std::uint32_t
          // Step 1: Reduce each tile individually (horizontal reduction within each tile)
          for (std::uint32_t j = 0; j < block_ct_dim; j++) {
              std::uint32_t tile_offset = tile_row_offset + (ROWS_PER_TILE * j);
@@ -156,7 +148,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
                  tile_row_offset, block_ct_dim, recip);
          }
      }
-@@ -1325,17 +1353,17 @@ inline void init_reduce_sum_avg() {
+@@ -1178,17 +1206,17 @@ inline void init_reduce_sum_avg() {
          lltt::record(0, 9);
  
          // Full reduce (positions 0-5): interleaved upper/lower face summation
@@ -183,7 +175,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
      } else {
          lltt::record(0, 9);
  
-@@ -1583,11 +1611,13 @@ inline void calculate_reduce_sum_avg(std::uint32_t block_ct_dim, std::uint32_t b
+@@ -1443,11 +1471,13 @@ inline void calculate_reduce_sum_avg(std::uint32_t block_ct_dim, std::uint32_t b
      static_assert(
          reduce_dim == ReduceDim::REDUCE_COL ||
              (reduce_dim == ReduceDim::REDUCE_ROW &&
@@ -201,227 +193,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
  
      // Supported instruction modes for SFPU reduce sum/avg (integer and float)
      constexpr bool is_supported_reduce_instr_mode =
-@@ -1634,14 +1664,22 @@ constexpr std::uint32_t INT32_SIGNED_CSWAP_LEN = 5;
-  * config, and being a symmetric exchange it leaves the corrected extreme in whichever register the
-  * caller reads next. Mirrors calculate_binary_max_min_int32 in ckernel_sfpu_binary_max_min.h.
-  *
-+ * For UInt32 (IS_UNSIGNED) the caller reverses the MAX/MIN direction: sign-magnitude order then ranks
-+ * unsigned values correctly whenever either top bit is set, and the pair is re-exchanged on lanes where
-+ * both top bits are clear (as in calculate_binary_max_min_int32's unsigned path).
-+ *
-  * @tparam HIGH_LREG The srcC register of the compare-and-swap.
-  * @tparam LOW_LREG  The dest register of the compare-and-swap.
-+ * @tparam IS_UNSIGNED Compare as UInt32 instead of two's-complement Int32.
-  */
--template <std::uint32_t HIGH_LREG, std::uint32_t LOW_LREG>
-+template <std::uint32_t HIGH_LREG, std::uint32_t LOW_LREG, bool IS_UNSIGNED = false>
- inline void _emit_int32_signed_cswap_() {
-+    // Signed: re-exchange where both operands are negative. Unsigned: where both top bits are clear.
-+    constexpr std::uint32_t RESWAP_CONDITION =
-+        IS_UNSIGNED ? sfpi::SFPSETCC_MOD1_LREG_GTE0 : sfpi::SFPSETCC_MOD1_LREG_LT0;
-     TTI_SFPSWAP(0, HIGH_LREG, LOW_LREG, sfpi::SFPSWAP_MOD1_VEC_MIN_MAX);
--    TTI_SFPSETCC(0, LOW_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_LT0);   // cc: LOW_LREG < 0
--    TTI_SFPSETCC(0, HIGH_LREG, 0, sfpi::SFPSETCC_MOD1_LREG_LT0);  // cc &= HIGH_LREG < 0 (both negative)
-+    TTI_SFPSETCC(0, LOW_LREG, 0, RESWAP_CONDITION);   // cc: LOW_LREG condition
-+    TTI_SFPSETCC(0, HIGH_LREG, 0, RESWAP_CONDITION);  // cc &= HIGH_LREG condition (both)
-     TTI_SFPSWAP(0, HIGH_LREG, LOW_LREG, sfpi::SFPSWAP_MOD1_SWAP);
-     TTI_SFPENCC(0, 0, 0, 0);
- }
-@@ -1654,6 +1692,7 @@ inline void _emit_int32_signed_cswap_() {
-  * are emitted sequentially rather than interleaved because each signed compare-and-swap manages its own
-  * condition-code state (SFPSETCC/SFPENCC) and must not be interleaved with another.
-  */
-+template <bool IS_UNSIGNED = false>
- inline void horizontal_reduce_max_int32() {
-     // Phase 1: rotate by 4 and compare -> 8 values become 4 duplicated pair extrema.
-     TTI_SFPMOV(0, p_sfpu::LREG0, p_sfpu::LREG1, 0);
-@@ -1666,8 +1705,8 @@ inline void horizontal_reduce_max_int32() {
-     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
-     TTI_SFPSHFT2(0, p_sfpu::LREG1, p_sfpu::LREG1, 3);
-     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
--    _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1>();
--    _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5>();
-+    _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1, IS_UNSIGNED>();
-+    _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5, IS_UNSIGNED>();
- 
-     // Phase 2: rotate by 2 and compare -> pair extrema become duplicated quad extrema.
-     TTI_SFPMOV(0, p_sfpu::LREG0, p_sfpu::LREG1, 0);
-@@ -1676,8 +1715,8 @@ inline void horizontal_reduce_max_int32() {
-     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
-     TTI_SFPSHFT2(0, p_sfpu::LREG1, p_sfpu::LREG1, 3);
-     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
--    _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1>();
--    _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5>();
-+    _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1, IS_UNSIGNED>();
-+    _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5, IS_UNSIGNED>();
- 
-     // Phase 3: rotate by 1 and compare -> quad extrema become the full 8-column extreme in every column.
-     // The rotate butterfly replicates the extreme across all 8 columns, so no final "move to col 0"
-@@ -1686,14 +1725,15 @@ inline void horizontal_reduce_max_int32() {
-     TTI_SFPMOV(0, p_sfpu::LREG4, p_sfpu::LREG5, 0);
-     TTI_SFPSHFT2(0, p_sfpu::LREG1, p_sfpu::LREG1, 3);
-     TTI_SFPSHFT2(0, p_sfpu::LREG5, p_sfpu::LREG5, 3);
--    _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1>();
--    _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5>();
-+    _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1, IS_UNSIGNED>();
-+    _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5, IS_UNSIGNED>();
- }
- 
- /**
-  * @brief Signed-Int32 per-tile row MAX/MIN reduction. Mirrors perform_reduce_row_max_tile but loads
-  *        plain INT32 (bits preserved) and uses the signed compare-and-swap so INT32_MIN is handled.
-  */
-+template <bool IS_UNSIGNED = false>
- inline void perform_reduce_row_max_tile_int32(std::uint32_t tile_row_offset, std::uint32_t result_store_mode) {
-     constexpr InstrModLoadStore INSTRUCTION_MODE = InstrModLoadStore::INT32;
- #pragma GCC unroll 2
-@@ -1737,15 +1777,15 @@ inline void perform_reduce_row_max_tile_int32(std::uint32_t tile_row_offset, std
- 
-             // Vertical reduce via signed compare-and-swap (each is self-contained w.r.t. condition codes,
-             // so unlike the float path they are emitted sequentially rather than interleaved).
--            _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG2>();
--            _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG6>();
--            _emit_int32_signed_cswap_<p_sfpu::LREG1, p_sfpu::LREG3>();
--            _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG7>();
--            _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1>();
--            _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5>();
-+            _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG2, IS_UNSIGNED>();
-+            _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG6, IS_UNSIGNED>();
-+            _emit_int32_signed_cswap_<p_sfpu::LREG1, p_sfpu::LREG3, IS_UNSIGNED>();
-+            _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG7, IS_UNSIGNED>();
-+            _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG1, IS_UNSIGNED>();
-+            _emit_int32_signed_cswap_<p_sfpu::LREG4, p_sfpu::LREG5, IS_UNSIGNED>();
- 
-             // Horizontal reduce: consolidate 8 SFPU columns into column 0.
--            horizontal_reduce_max_int32();
-+            horizontal_reduce_max_int32<IS_UNSIGNED>();
- 
-             TT_SFPSTORE(
-                 p_sfpu::LREG0, result_store_mode, ADDR_MOD_7, tile_row_offset + face_pair_base + row_offset_first);
-@@ -1760,6 +1800,7 @@ inline void perform_reduce_row_max_tile_int32(std::uint32_t tile_row_offset, std
-  *        plain INT32 and uses the signed compare-and-swap. Named _signed to avoid colliding with the
-  *        sign-magnitude max_first_columns_across_tiles_int32 above (still used by the UInt16/UInt32 path).
-  */
-+template <bool IS_UNSIGNED = false>
- inline void max_first_columns_across_tiles_int32_signed(std::uint32_t tile_row_base, std::uint32_t block_ct_dim) {
-     constexpr InstrModLoadStore INSTRUCTION_MODE = InstrModLoadStore::INT32;
-     constexpr std::uint32_t RESULT_ROWS[8] = {0, 4, 8, 12, 32, 36, 40, 44};
-@@ -1780,10 +1821,10 @@ inline void max_first_columns_across_tiles_int32_signed(std::uint32_t tile_row_b
-             TT_SFPLOAD(p_sfpu::LREG6, INSTRUCTION_MODE, ADDR_MOD_7, tile_offset + RESULT_ROWS[base_idx + 2]);
-             TT_SFPLOAD(p_sfpu::LREG7, INSTRUCTION_MODE, ADDR_MOD_7, tile_offset + RESULT_ROWS[base_idx + 3]);
- 
--            _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG4>();
--            _emit_int32_signed_cswap_<p_sfpu::LREG1, p_sfpu::LREG5>();
--            _emit_int32_signed_cswap_<p_sfpu::LREG2, p_sfpu::LREG6>();
--            _emit_int32_signed_cswap_<p_sfpu::LREG3, p_sfpu::LREG7>();
-+            _emit_int32_signed_cswap_<p_sfpu::LREG0, p_sfpu::LREG4, IS_UNSIGNED>();
-+            _emit_int32_signed_cswap_<p_sfpu::LREG1, p_sfpu::LREG5, IS_UNSIGNED>();
-+            _emit_int32_signed_cswap_<p_sfpu::LREG2, p_sfpu::LREG6, IS_UNSIGNED>();
-+            _emit_int32_signed_cswap_<p_sfpu::LREG3, p_sfpu::LREG7, IS_UNSIGNED>();
-         }
- 
-         TT_SFPSTORE(p_sfpu::LREG0, INSTRUCTION_MODE, ADDR_MOD_7, tile_row_base + RESULT_ROWS[base_idx + 0]);
-@@ -1798,7 +1839,7 @@ inline void max_first_columns_across_tiles_int32_signed(std::uint32_t tile_row_b
-  *        but routes through the signed-Int32 per-tile and cross-tile helpers (horizontal_reduce_max_int32
-  *        is fully inline, no recorded buffer). Correct over the full Int32 range.
-  */
--template <PoolType pool_type>
-+template <PoolType pool_type, bool IS_UNSIGNED = false>
- inline void perform_reduce_row_max_min_int32(std::uint32_t block_ct_dim, std::uint32_t block_rt_dim) {
-     static_assert(
-         pool_type == PoolType::MAX || pool_type == PoolType::MIN,
-@@ -1810,7 +1851,8 @@ inline void perform_reduce_row_max_min_int32(std::uint32_t block_ct_dim, std::ui
-     // MIN sets bit 8. The signed compare-and-swap's VEC_MIN_MAX obeys this bit; its both-negative fix is a
-     // direction-independent unconditional exchange.
-     _init_sfpu_config_reg();
--    if constexpr (pool_type == PoolType::MIN) {
-+    // UInt32 reverses the direction (see _emit_int32_signed_cswap_).
-+    if constexpr ((pool_type == PoolType::MIN) != IS_UNSIGNED) {
-         TTI_SFPLOADI(ckernel::p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_LOWER, 0x0100);  // bit 8
-         TTI_SFPLOADI(ckernel::p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_UPPER, 0x0000);
-         TTI_SFPCONFIG(0, 0xF, 0);
-@@ -1824,11 +1866,11 @@ inline void perform_reduce_row_max_min_int32(std::uint32_t block_ct_dim, std::ui
- 
-         for (std::uint32_t j = 0; j < block_ct_dim; j++) {
-             std::uint32_t tile_offset = tile_row_offset + (ROWS_PER_TILE * j);
--            perform_reduce_row_max_tile_int32(tile_offset, tile_store_mode);
-+            perform_reduce_row_max_tile_int32<IS_UNSIGNED>(tile_offset, tile_store_mode);
-         }
- 
-         if (block_ct_dim > 1) {
--            max_first_columns_across_tiles_int32_signed(tile_row_offset, block_ct_dim);
-+            max_first_columns_across_tiles_int32_signed<IS_UNSIGNED>(tile_row_offset, block_ct_dim);
-         }
-     }
- }
-@@ -1840,19 +1882,20 @@ inline void perform_reduce_row_max_min_int32(std::uint32_t block_ct_dim, std::ui
-  *
-  * @tparam pool_type The PoolType enum value (MAX or MIN). MAX inverts the swap direction here.
-  */
--template <PoolType pool_type>
-+template <PoolType pool_type, bool IS_UNSIGNED = false>
- inline void init_reduce_max_min_int32_signed() {
-     _init_sfpu_config_reg();
--    if constexpr (pool_type == PoolType::MAX) {
-+    // UInt32 reverses the direction (see _emit_int32_signed_cswap_).
-+    if constexpr ((pool_type == PoolType::MAX) != IS_UNSIGNED) {
-         TTI_SFPLOADI(ckernel::p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_LOWER, 0x0100);  // Load lower 16 bits (bit 8)
-         TTI_SFPLOADI(ckernel::p_sfpu::LREG0, sfpi::SFPLOADI_MOD0_UPPER, 0x0000);  // Load upper 16 bits
-         TTI_SFPCONFIG(0, 0xF, 0);
-     }
- 
-     lltt::record(0, 3 * INT32_SIGNED_CSWAP_LEN);
--    _emit_int32_signed_cswap_<p_sfpu::LREG7, p_sfpu::LREG6>();
--    _emit_int32_signed_cswap_<p_sfpu::LREG6, p_sfpu::LREG5>();
--    _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG4>();
-+    _emit_int32_signed_cswap_<p_sfpu::LREG7, p_sfpu::LREG6, IS_UNSIGNED>();
-+    _emit_int32_signed_cswap_<p_sfpu::LREG6, p_sfpu::LREG5, IS_UNSIGNED>();
-+    _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG4, IS_UNSIGNED>();
- }
- 
- /**
-@@ -1866,7 +1909,7 @@ inline void init_reduce_max_min_int32_signed() {
-  * @tparam pool_type The PoolType enum value (MAX or MIN). MIN inverts the swap direction (set during init).
-  * @tparam reduce_dim The reduction dimension; must be REDUCE_COL for this helper.
-  */
--template <PoolType pool_type, ReduceDim reduce_dim>
-+template <PoolType pool_type, ReduceDim reduce_dim, bool IS_UNSIGNED = false>
- inline void calculate_reduce_max_min_int32_col() {
-     static_assert(reduce_dim == ReduceDim::REDUCE_COL, "Only column reduction (REDUCE_COL) is supported here");
-     static_assert(
-@@ -1913,8 +1956,8 @@ inline void calculate_reduce_max_min_int32_col() {
-         TTI_SFPTRANSP(0, 0, 0, 0);
- 
-         // Signed compare-and-swap to combine the two vertically adjacent faces (even and odd columns).
--        _emit_int32_signed_cswap_<p_sfpu::LREG7, p_sfpu::LREG6>();  // odd columns of face pair
--        _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG4>();  // even columns of face pair
-+        _emit_int32_signed_cswap_<p_sfpu::LREG7, p_sfpu::LREG6, IS_UNSIGNED>();  // odd columns of face pair
-+        _emit_int32_signed_cswap_<p_sfpu::LREG5, p_sfpu::LREG4, IS_UNSIGNED>();  // even columns of face pair
- 
-         TTI_SFPMOV(0, p_sfpu::LREG4, p_sfpu::LREG0, 0);
-         TTI_SFPMOV(0, p_sfpu::LREG6, p_sfpu::LREG1, 0);
-@@ -1951,8 +1994,10 @@ inline void init_reduce(std::uint32_t block_ct_dim = 1) {
-     // AVG keeps INT32_2S_COMP; its divide-by-32 step assumes that mode. init_reduce has no reduce_dim, so
-     // the column reduce consumes the LREG4-7 -> LREG4 replay buffer recorded by init_reduce_max_min_int32_signed
-     // while the row reduce re-records its own config regardless.
-+    // UInt32 MAX/MIN takes the same path with the unsigned compare-and-swap.
-+    constexpr bool is_uint32 = format == DataFormat::UInt32;
-     constexpr bool int32_max_min =
--        (format == DataFormat::Int32 && (pool_type == PoolType::MAX || pool_type == PoolType::MIN));
-+        ((format == DataFormat::Int32 || is_uint32) && (pool_type == PoolType::MAX || pool_type == PoolType::MIN));
-     constexpr bool int32_2s_comp = (format == DataFormat::Int32 && pool_type == PoolType::AVG);
-     constexpr InstrModLoadStore INSTRUCTION_MODE =
-         int32_2s_comp ? InstrModLoadStore::INT32_2S_COMP : GetSfpLoadStoreInstrMod<format, is_fp32_dest_acc_en>();
-@@ -1970,7 +2015,7 @@ inline void init_reduce(std::uint32_t block_ct_dim = 1) {
-         if constexpr (int32_max_min) {
-             // Signed Int32 MAX/MIN: records the LREG4-7 -> LREG4 signed compare-and-swap replay buffer
-             // (consumed by the column reduce) and the swap direction. Handles INT32_MIN correctly.
--            init_reduce_max_min_int32_signed<pool_type>();
-+            init_reduce_max_min_int32_signed<pool_type, is_uint32>();
-         } else if constexpr (clear_high_bits) {
-             // UInt16 in 32-bit dest uses the manual (non-LOADMACRO) compare-and-swap path so the
-             // garbage high bits can be masked before each swap. It reuses the Int32 path's 3-swap
-@@ -1982,7 +2027,7 @@ inline void init_reduce(std::uint32_t block_ct_dim = 1) {
+@@ -1838,7 +1868,7 @@ inline void init_reduce(std::uint32_t block_ct_dim = 1) {
              // above, for both column and row reduce.
              init_reduce_max_min<INSTRUCTION_MODE, pool_type, false>(block_ct_dim);
          }
@@ -430,7 +202,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
          init_reduce_sum_avg<INSTRUCTION_MODE, pool_type>();
      } else {
          static_assert(
-@@ -2025,8 +2070,8 @@ inline void calculate_reduce(
+@@ -1882,8 +1912,8 @@ inline void calculate_reduce(
          reduce_dim == ReduceDim::REDUCE_COL ||
              (reduce_dim == ReduceDim::REDUCE_ROW &&
               (pool_type == PoolType::SUM || pool_type == PoolType::MAX || pool_type == PoolType::MIN ||
@@ -441,44 +213,19 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_re
      static_assert(
          is_supported_reduce_format(format),
          "Unsupported data format. Supported formats: Int32, UInt32, UInt16, Float32, Float16_b");
-@@ -2045,8 +2090,10 @@ inline void calculate_reduce(
-     //        SFPIADD accumulate and back before the store, and perform_int_average's divide-by-32 is wired
-     //        for this mode, so the DEST word stays sign-magnitude (unlike SUM).
-     constexpr bool int32_avg = (format == DataFormat::Int32 && pool_type == PoolType::AVG);
-+    // UInt32 MAX/MIN takes the same path with the unsigned compare-and-swap.
-+    constexpr bool is_uint32 = format == DataFormat::UInt32;
-     constexpr bool int32_max_min =
--        (format == DataFormat::Int32 && (pool_type == PoolType::MAX || pool_type == PoolType::MIN));
-+        ((format == DataFormat::Int32 || is_uint32) && (pool_type == PoolType::MAX || pool_type == PoolType::MIN));
-     constexpr bool int32_max_min_col = int32_max_min && (reduce_dim == ReduceDim::REDUCE_COL);
-     constexpr bool int32_max_min_row = int32_max_min && (reduce_dim == ReduceDim::REDUCE_ROW);
-     constexpr InstrModLoadStore INSTRUCTION_MODE = int32_max_min ? InstrModLoadStore::INT32
-@@ -2070,10 +2117,10 @@ inline void calculate_reduce(
-             LLK_ASSERT(
-                 block_ct_dim == 1 && block_rt_dim == 1,
-                 "Int32 column MAX/MIN reduce only supports a single tile (block_ct_dim == block_rt_dim == 1)");
--            calculate_reduce_max_min_int32_col<pool_type, reduce_dim>();
-+            calculate_reduce_max_min_int32_col<pool_type, reduce_dim, is_uint32>();
-         } else if constexpr (int32_max_min_row) {
-             // Signed Int32 row MAX/MIN: two's-complement compare-and-swap path (handles INT32_MIN).
--            perform_reduce_row_max_min_int32<pool_type>(block_ct_dim, block_rt_dim);
-+            perform_reduce_row_max_min_int32<pool_type, is_uint32>(block_ct_dim, block_rt_dim);
-         } else if constexpr (reduce_dim == ReduceDim::REDUCE_ROW) {
-             static_assert(
-                 INSTRUCTION_MODE == InstrModLoadStore::FP32 || INSTRUCTION_MODE == InstrModLoadStore::INT32 ||
-@@ -2095,7 +2142,7 @@ inline void calculate_reduce(
+@@ -1971,7 +2001,7 @@ inline void calculate_reduce(
              calculate_reduce_max_min<pool_type, reduce_dim, INSTRUCTION_MODE, false, pack_low16>(block_rt_dim);
  #endif
          }
 -    } else if constexpr (pool_type == PoolType::SUM || pool_type == PoolType::AVG) {
 +    } else if constexpr (pool_type == PoolType::SUM || pool_type == PoolType::AVG || is_bitwise_pool_type(pool_type)) {
-         calculate_reduce_sum_avg<pool_type, reduce_dim, INSTRUCTION_MODE, clear_high_bits, pack_low16>(
+         calculate_reduce_sum_avg<pool_type, reduce_dim, INSTRUCTION_MODE, clear_high_bits, pack_low16, is_signed_int>(
              block_ct_dim, block_rt_dim);
      } else {
 diff --git tt_metal/hw/inc/api/compute/compute_kernel_api.h tt_metal/hw/inc/api/compute/compute_kernel_api.h
 --- tt_metal/hw/inc/api/compute/compute_kernel_api.h
 +++ tt_metal/hw/inc/api/compute/compute_kernel_api.h
-@@ -741,16 +741,24 @@ ALWI void sfpu_reduce(uint32_t idst, uint32_t ct_dim = 1, uint32_t rt_dim = 1) {
+@@ -758,16 +758,24 @@ ALWI void sfpu_reduce(uint32_t idst, uint32_t ct_dim = 1, uint32_t rt_dim = 1) {
      static_assert(
          reduce_dim == ReduceDim::REDUCE_COL ||
              (reduce_dim == ReduceDim::REDUCE_ROW &&
@@ -507,7 +254,7 @@ diff --git tt_metal/hw/inc/api/compute/compute_kernel_api.h tt_metal/hw/inc/api/
  
      // This kernel is optimized for 32x32 tiles and uses RC_custom vector mode for custom reduction
  #ifdef ARCH_QUASAR
-@@ -790,8 +798,12 @@ template <PoolType pool_type, DataFormat format, bool is_fp32_dest_acc_en = DST_
+@@ -807,8 +815,12 @@ template <PoolType pool_type, DataFormat format, bool is_fp32_dest_acc_en = DST_
  ALWI void sfpu_reduce_init() {
      static_assert(
          pool_type == PoolType::SUM || pool_type == PoolType::AVG || pool_type == PoolType::MAX ||
@@ -553,9 +300,9 @@ diff --git tt_metal/tt-llk/tt_llk_wormhole_b0/llk_lib/llk_defs.h tt_metal/tt-llk
 diff --git ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
 --- ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
 +++ ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp
-@@ -50,12 +50,23 @@ constexpr bool is_sfpu_reduce_path() {
-     static_assert(!requires_sfpu, "SFPU reduce path is not supported on Quasar");
-     return false;
+@@ -51,12 +51,23 @@ constexpr bool is_sfpu_reduce_path() {
+     return (reduce_dim == ckernel::ReduceDim::REDUCE_ROW || reduce_dim == ckernel::ReduceDim::REDUCE_COL) &&
+            data_format == DataFormat::Float16_b && pool_type == ckernel::PoolType::MIN;
  #else
 +    if constexpr (
 +        pool_type == ckernel::PoolType::AND || pool_type == ckernel::PoolType::OR ||
@@ -572,12 +319,12 @@ diff --git ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp ttnn/cpp/ttnn/kern
          return false;
      }
 -    if constexpr (data_format != DataFormat::Int32) {
-+    // UInt32 MAX/MIN use the Int32 kernels with the unsigned compare-and-swap.
++    // UInt32 MAX/MIN use the Int32 kernels, which order UInt32 as unsigned by flipping bit 31.
 +    constexpr bool uint32_max_min = data_format == DataFormat::UInt32 && pool_type != ckernel::PoolType::SUM;
 +    if constexpr (data_format != DataFormat::Int32 && !uint32_max_min) {
-         // pool_type is already narrowed to MAX/SUM/MIN above and all three have an SFPU fold, so
-         // Float32 only has to opt in via Accurate mode. Everything else non-Int32 stays on the FPU.
-         if constexpr (fp32_mode != ReduceFp32Mode::Accurate || data_format != DataFormat::Float32) {
+         // pool_type is already narrowed to MAX/SUM/MIN above and all three have an SFPU fold.
+         if constexpr (data_format == DataFormat::Float16_b) {
+             if constexpr (pool_type != ckernel::PoolType::MIN) {
 diff --git ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
 --- ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
 +++ ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl
@@ -589,43 +336,51 @@ diff --git ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl ttnn/cpp/ttnn/ker
  #include "api/compute/eltwise_binary_sfpu.h"
  #include "api/compute/binary_max_min.h"
  #include "api/compute/compute_kernel_api.h"
-@@ -30,6 +31,8 @@ template <DataFormat format>
+@@ -30,6 +31,10 @@ template <DataFormat format>
  ALWI void sfpu_reduce_max_fold_init() {
      if constexpr (format == DataFormat::Int32) {
          binary_max_int32_tile_init();
++#ifndef ARCH_QUASAR  // Quasar's DataFormat has no UInt32
 +    } else if constexpr (format == DataFormat::UInt32) {
 +        binary_max_uint32_tile_init();
++#endif
      } else {
          binary_max_tile_init();
      }
-@@ -39,6 +42,8 @@ template <DataFormat format>
+@@ -39,6 +44,10 @@ template <DataFormat format>
  ALWI void sfpu_reduce_max_fold_tile(uint32_t a, uint32_t b, uint32_t out) {
      if constexpr (format == DataFormat::Int32) {
          binary_max_int32_tile(a, b, out);
++#ifndef ARCH_QUASAR  // Quasar's DataFormat has no UInt32
 +    } else if constexpr (format == DataFormat::UInt32) {
 +        binary_max_uint32_tile(a, b, out);
++#endif
      } else {
          binary_max_tile(a, b, out);
      }
-@@ -49,6 +54,8 @@ template <DataFormat format>
+@@ -49,6 +58,10 @@ template <DataFormat format>
  ALWI void sfpu_reduce_min_fold_init() {
      if constexpr (format == DataFormat::Int32) {
          binary_min_int32_tile_init();
++#ifndef ARCH_QUASAR  // Quasar's DataFormat has no UInt32
 +    } else if constexpr (format == DataFormat::UInt32) {
 +        binary_min_uint32_tile_init();
++#endif
      } else {
          binary_min_tile_init();
      }
-@@ -58,6 +65,8 @@ template <DataFormat format>
+@@ -58,6 +71,10 @@ template <DataFormat format>
  ALWI void sfpu_reduce_min_fold_tile(uint32_t a, uint32_t b, uint32_t out) {
      if constexpr (format == DataFormat::Int32) {
          binary_min_int32_tile(a, b, out);
++#ifndef ARCH_QUASAR  // Quasar's DataFormat has no UInt32
 +    } else if constexpr (format == DataFormat::UInt32) {
 +        binary_min_uint32_tile(a, b, out);
++#endif
      } else {
          binary_min_tile(a, b, out);
      }
-@@ -92,8 +101,9 @@ ALWI void sfpu_reduce_sum_fold_tile(uint32_t a, uint32_t b, uint32_t out) {
+@@ -92,14 +109,20 @@ ALWI void sfpu_reduce_sum_fold_tile(uint32_t a, uint32_t b, uint32_t out) {
      }
  }
  
@@ -637,29 +392,32 @@ diff --git ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.inl ttnn/cpp/ttnn/ker
  template <PoolType pool_type, DataFormat format>
  ALWI void sfpu_reduce_fold_init() {
      if constexpr (pool_type == PoolType::SUM) {
-@@ -101,6 +111,9 @@ ALWI void sfpu_reduce_fold_init() {
- #ifndef ARCH_QUASAR  // Quasar's ckernel::PoolType has no MIN (and no SFPU reduce path)
+         sfpu_reduce_sum_fold_init<format>();
      } else if constexpr (pool_type == PoolType::MIN) {
          sfpu_reduce_min_fold_init<format>();
++#ifndef ARCH_QUASAR  // Quasar's ckernel::PoolType has no AND/OR/XOR
 +    } else if constexpr (
 +        pool_type == PoolType::AND || pool_type == PoolType::OR || pool_type == PoolType::XOR) {
 +        binary_bitwise_tile_init();
- #endif
++#endif
      } else {
          sfpu_reduce_max_fold_init<format>();
-@@ -121,6 +134,12 @@ ALWI void sfpu_copy_and_fold(
- #ifndef ARCH_QUASAR  // Quasar's ckernel::PoolType has no MIN (and no SFPU reduce path)
+     }
+@@ -118,6 +141,14 @@ ALWI void sfpu_copy_and_fold(
+             sfpu_reduce_sum_fold_tile<format>(dst_idx, work_dst, dst_idx);
          } else if constexpr (pool_type == PoolType::MIN) {
              sfpu_reduce_min_fold_tile<format>(dst_idx, work_dst, dst_idx);
++#ifndef ARCH_QUASAR  // Quasar's ckernel::PoolType has no AND/OR/XOR
 +        } else if constexpr (pool_type == PoolType::AND) {
 +            bitwise_and_binary_tile<format>(dst_idx, work_dst, dst_idx);
 +        } else if constexpr (pool_type == PoolType::OR) {
 +            bitwise_or_binary_tile<format>(dst_idx, work_dst, dst_idx);
 +        } else if constexpr (pool_type == PoolType::XOR) {
 +            bitwise_xor_binary_tile<format>(dst_idx, work_dst, dst_idx);
- #endif
++#endif
          } else {
              sfpu_reduce_max_fold_tile<format>(dst_idx, work_dst, dst_idx);
+         }
 diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
 --- ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp
@@ -677,7 +435,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp ttnn/cpp
  
  enum class ReduceOpDim { H, W, HW };
  
-@@ -70,9 +75,15 @@ inline uint32_t dense_rm_padding_identity_bits(tt::DataFormat df, tt::tt_metal::
+@@ -72,12 +77,18 @@ inline uint32_t dense_rm_padding_identity_bits(tt::DataFormat df, tt::tt_metal::
  inline bool use_sfpu_reduce_path(
      tt::tt_metal::DataType dtype, tt::tt_metal::ReduceOpMath math_op, bool use_sfpu_reduce = false) {
      using tt::tt_metal::ReduceOpMath;
@@ -686,6 +444,9 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/common.hpp ttnn/cpp
 +    }
      if (dtype == tt::tt_metal::DataType::INT32) {
          return math_op == ReduceOpMath::MAX || math_op == ReduceOpMath::SUM || math_op == ReduceOpMath::MIN;
+     }
+     if (dtype == tt::tt_metal::DataType::BFLOAT16) {
+         return math_op == ReduceOpMath::MIN;
      }
 +    if (dtype == tt::tt_metal::DataType::UINT32) {
 +        return math_op == ReduceOpMath::MAX || math_op == ReduceOpMath::MIN;
@@ -727,25 +488,26 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/
      return ttnn::PadValue{ttnn::prim::get_reduce_pad_value(reduce_math)};
  }
  
-@@ -286,6 +295,7 @@ Tensor reduce(
-     // negate kernels. Accurate fp32 MIN drives the LLK MIN reduce directly (like Int32 MIN) and must
-     // skip that lowering.
+@@ -289,7 +298,7 @@ Tensor reduce(
+     // bfloat8_b and fast-mode fp32. Accurate fp32 MIN and bf16 MIN drive the LLK MIN
+     // reduce directly (like Int32 MIN) and must skip that lowering.
      if (reduce_math == tt::tt_metal::ReduceOpMath::MIN && input_tensor.dtype() != tt::tt_metal::DataType::INT32 &&
-+        input_tensor.dtype() != tt::tt_metal::DataType::UINT32 &&
-         !use_sfpu_fp32_min) {
+-        !use_sfpu_fp32_min && !use_sfpu_bf16_min) {
++        input_tensor.dtype() != tt::tt_metal::DataType::UINT32 && !use_sfpu_fp32_min && !use_sfpu_bf16_min) {
          return reduce_min(input_tensor, reduce_dim, scaler, output_mem_config, compute_kernel_config, sub_core_grids);
      }
-@@ -362,7 +372,9 @@ Tensor reduce(
+ 
+@@ -322,7 +331,9 @@ Tensor reduce(
          ((prepared_input.dtype() == tt::tt_metal::DataType::INT32 &&
            (reduce_math == tt::tt_metal::ReduceOpMath::MAX || reduce_math == tt::tt_metal::ReduceOpMath::SUM ||
             reduce_math == tt::tt_metal::ReduceOpMath::MIN)) ||
--         use_sfpu_fp32_reduce);
+-         use_sfpu_reduce);
 +         (prepared_input.dtype() == tt::tt_metal::DataType::UINT32 &&
 +          (reduce_math == tt::tt_metal::ReduceOpMath::MAX || reduce_math == tt::tt_metal::ReduceOpMath::MIN)) ||
-+         tt::tt_metal::is_bitwise_reduce_math(reduce_math) || use_sfpu_fp32_reduce);
++         tt::tt_metal::is_bitwise_reduce_math(reduce_math) || use_sfpu_reduce);
+     const bool decomposes_hw = is_multicore_hw || use_two_step_hw_sfpu_reduce;
  
-     if (is_multicore_hw || use_two_step_hw_sfpu_reduce ||
-         (reduce_dim == tt::tt_metal::ReduceOpDim::HW && reduce_scaler < 0)) {
+     // A decomposed HW reduce applies the scalar on its H half, so derive the mode for H.
 diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
 --- ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
@@ -865,7 +627,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
                                                ? ttnn::PadValue{std::bit_cast<uint32_t>(pad_value)}
                                                : ttnn::PadValue{pad_value};
      auto input_tensor =
-@@ -795,6 +837,36 @@ Tensor min(
+@@ -801,6 +843,36 @@ Tensor min(
          fast_and_approximate_mode);
  }
  

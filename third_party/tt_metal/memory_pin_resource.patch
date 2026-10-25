@@ -1,9 +1,9 @@
 diff --git tt_metal/api/tt-metalium/memory_pin.hpp tt_metal/api/tt-metalium/memory_pin.hpp
 --- tt_metal/api/tt-metalium/memory_pin.hpp
 +++ tt_metal/api/tt-metalium/memory_pin.hpp
-@@ -27,6 +27,9 @@ public:
-     // The callback runs once when the last MemoryPin sharing this state is released, before decrementing the pin.
-     void add_final_release_callback(std::function<void()> callback);
+@@ -30,6 +30,9 @@ public:
+     const MemoryPinImpl& impl() const;
+     MemoryPinImpl& impl();
  
 +    // The resource that a pin made from one keeps alive, or nullptr.
 +    std::shared_ptr<void> resource() const;
@@ -11,21 +11,13 @@ diff --git tt_metal/api/tt-metalium/memory_pin.hpp tt_metal/api/tt-metalium/memo
      friend bool operator==(const MemoryPin& pin, std::nullptr_t) noexcept;
      friend bool operator==(std::nullptr_t, const MemoryPin& pin) noexcept;
      friend bool operator!=(const MemoryPin& pin, std::nullptr_t) noexcept;
-@@ -36,6 +39,7 @@ private:
-     struct FinalReleaseState {
-         std::vector<std::function<void()>> callbacks;
-         bool ran = false;
-+        std::shared_ptr<void> resource;
-     };
- 
-     void maybe_increment();
 diff --git tt_metal/common/memory_pin.cpp tt_metal/common/memory_pin.cpp
 --- tt_metal/common/memory_pin.cpp
 +++ tt_metal/common/memory_pin.cpp
-@@ -19,9 +19,9 @@ MemoryPin::MemoryPin(std::function<void()> increment_ref_count, std::function<vo
+@@ -22,9 +22,9 @@ MemoryPinImpl::MemoryPinImpl(std::function<void()> increment_ref_count, std::fun
  }
  
- MemoryPin::MemoryPin(std::shared_ptr<void> resource) :
+ MemoryPinImpl::MemoryPinImpl(std::shared_ptr<void> resource) :
 -    inc_([]() {}),
 -    dec_([ref = std::move(resource)]() mutable { ref.reset(); }),
 -    final_release_state_(std::make_shared<FinalReleaseState>()) {}
@@ -33,16 +25,44 @@ diff --git tt_metal/common/memory_pin.cpp tt_metal/common/memory_pin.cpp
 +    final_release_state_->resource = std::move(resource);
 +}
  
- MemoryPin::~MemoryPin() { maybe_decrement(); }
+ void MemoryPinImpl::add_final_release_callback(std::function<void()> callback) {
+     if (!final_release_state_) {
+@@ -58,6 +58,10 @@ void MemoryPinImpl::maybe_run_final_release_callbacks() {
  
-@@ -68,6 +68,10 @@ void MemoryPin::add_final_release_callback(std::function<void()> callback) {
-     final_release_state_->callbacks.push_back(std::move(callback));
- }
+ bool MemoryPinImpl::is_empty() const noexcept { return !inc_ && !dec_; }
  
-+std::shared_ptr<void> MemoryPin::resource() const {
++std::shared_ptr<void> MemoryPinImpl::resource() const {
 +    return final_release_state_ ? final_release_state_->resource : nullptr;
 +}
 +
- void MemoryPin::maybe_increment() {
-     if (inc_) {
-         inc_();
+ MemoryPin::MemoryPin() = default;
+ 
+ MemoryPin::MemoryPin(MemoryPinImpl impl) : impl_(std::make_unique<MemoryPinImpl>(std::move(impl))) {}
+@@ -117,6 +121,8 @@ MemoryPinImpl& MemoryPin::impl() {
+     return *impl_;
+ }
+ 
++std::shared_ptr<void> MemoryPin::resource() const { return impl_ ? impl_->resource() : nullptr; }
++
+ bool operator==(const MemoryPin& pin, std::nullptr_t) noexcept { return pin.impl_ == nullptr || pin.impl_->is_empty(); }
+ bool operator==(std::nullptr_t, const MemoryPin& pin) noexcept { return pin == nullptr; }
+ bool operator!=(const MemoryPin& pin, std::nullptr_t) noexcept { return !(pin == nullptr); }
+diff --git tt_metal/common/memory_pin_impl.hpp tt_metal/common/memory_pin_impl.hpp
+--- tt_metal/common/memory_pin_impl.hpp
++++ tt_metal/common/memory_pin_impl.hpp
+@@ -23,10 +23,15 @@ public:
+ 
+     bool is_empty() const noexcept;
+ 
++    // The resource that a pin made from one keeps alive, or nullptr.
++    std::shared_ptr<void> resource() const;
++
+ private:
+     struct FinalReleaseState {
+         std::vector<std::function<void()>> callbacks;
+         bool ran = false;
++        // Shared by every copy, so it lives until the last one is gone.
++        std::shared_ptr<void> resource;
+     };
+ 
+     void maybe_run_final_release_callbacks();

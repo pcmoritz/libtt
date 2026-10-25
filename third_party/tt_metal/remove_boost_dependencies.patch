@@ -8,7 +8,7 @@ diff --git tt_metal/common/mesh_coord.cpp tt_metal/common/mesh_coord.cpp
 -#include <boost/move/utility_core.hpp>
  #include <fmt/format.h>
  #include <mesh_coord.hpp>
- #include <tt_stl/span.hpp>
+ #include "distributed/mesh_coord_utils.hpp"
 diff --git ttnn/core/graph/graph_processor.cpp ttnn/core/graph/graph_processor.cpp
 --- ttnn/core/graph/graph_processor.cpp
 +++ ttnn/core/graph/graph_processor.cpp
@@ -28,7 +28,7 @@ diff --git ttnn/core/graph/graph_processor.cpp ttnn/core/graph/graph_processor.c
  #include <tt-metalium/allocator.hpp>
  #include <tt-metalium/circular_buffer.hpp>
  #include <tt-metalium/hal_types.hpp>
-@@ -507,9 +507,13 @@ void GraphProcessor::track_function_start(
+@@ -789,9 +789,13 @@ void GraphProcessor::track_function_start(
  
      std::vector<std::string> serialized_arguments;
      serialized_arguments.reserve(input_parameters.size());

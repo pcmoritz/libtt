@@ -233,20 +233,20 @@ http_archive(
     name = "tt_umd",
     build_file = "//third_party/tt_umd:BUILD.overlay.bazel",
     patches = ["//third_party/tt_umd:remove_initial_exec_tls.patch"],
-    sha256 = "a3455b4f1dcde937649f8291fa3c2a43e80ba8e0a7d41506d2c8ca717d74a522",
-    strip_prefix = "tt-umd-f70cc57f7f8fc8d7a900d38bd0a8bebc03694a0e",
+    sha256 = "1627b345fb4f7f660142bdc7fd91cc911542beee4bbee9f4794e2c5e7903fa56",
+    strip_prefix = "tt-umd-5437fe380fcc2702ee5bf3350ce9bf3c00dee72c",
     urls = [
-        "https://github.com/tenstorrent/tt-umd/archive/f70cc57f7f8fc8d7a900d38bd0a8bebc03694a0e.tar.gz",
+        "https://github.com/tenstorrent/tt-umd/archive/5437fe380fcc2702ee5bf3350ce9bf3c00dee72c.tar.gz",
     ],
 )
 
 http_archive(
     name = "sfpi",
     build_file = "//third_party/sfpi:BUILD.overlay.bazel",
-    sha256 = "7acee167421f8ecdc7e06dc6783f92956793f44e88498d1bf3f56e263cd3c2c1",
+    sha256 = "d28d77aa0727268164ddc1db698943e965e798168757862624bb05e7bc54c76b",
     strip_prefix = "sfpi",
     urls = [
-        "https://github.com/tenstorrent/sfpi/releases/download/7.80.0/sfpi_7.80.0_x86_64_debian.txz",
+        "https://github.com/tenstorrent/sfpi/releases/download/7.87.0/sfpi_7.87.0_x86_64_debian.txz",
     ],
 )
 
@@ -266,9 +266,9 @@ http_archive(
 http_archive(
     name = "tt_metal",
     build_file = "//third_party/tt_metal:BUILD.overlay.bazel",
-    # tt-mlir selects cffd175; this is 26 commits later, for the program-cache fix that binds a tensor passed
-    # as two inputs to distinct slots (eb97711, tenstorrent/tt-metal#55670). Return to tt-mlir's revision
-    # once tt-mlir moves past it.
+    # tt-mlir selects cffd175; use 614f605 for mixed BF16/FP32 ternary operations
+    # (tenstorrent/tt-metal#60282), including the program-cache aliasing fix #55670.
+    # Return to tt-mlir's revision once it includes these fixes.
     patches = [
         "//third_party/tt_metal:wormhole_build_empty_sources.patch",
         "//third_party/tt_metal:reduce_static_tls.patch",
@@ -293,7 +293,6 @@ http_archive(
         "//third_party/tt_metal:permute_float32.patch",
         "//third_party/tt_metal:layout_zero_volume.patch",
         "//third_party/tt_metal:copy_row_major_partial_page.patch",
-        "//third_party/tt_metal:divide_by_infinity.patch",
         "//third_party/tt_metal:divide_signed_zero.patch",
         "//third_party/tt_metal:negative_signed_zero.patch",
         "//third_party/tt_metal:log1p_signed_zero.patch",
@@ -330,10 +329,8 @@ http_archive(
         "//third_party/tt_metal:unlocked_blocking_reads.patch",
         "//third_party/tt_metal:ccl_semaphores_l1_small.patch",
         "//third_party/tt_metal:all_gather_alt_route_completion.patch",
-        "//third_party/tt_metal:graph_tracking_program_context.patch",
         "//third_party/tt_metal:conv_single_channel_not_depthwise.patch",
         "//third_party/tt_metal:depthwise_conv_dilation.patch",
-        "//third_party/tt_metal:single_host_all_reduce.patch",
         "//third_party/tt_metal:topk_multicore_router_width.patch",
         "//third_party/tt_metal:topk_last_dim_logical_k.patch",
         "//third_party/tt_metal:topk_select.patch",
@@ -357,6 +354,7 @@ http_archive(
         "//third_party/tt_metal:binary_float16_add_sub_sfpu.patch",
         "//third_party/tt_metal:float16_data_movement_bits.patch",
         "//third_party/tt_metal:accumulation_max_min.patch",
+        "//third_party/tt_metal:logaddexp_fp32_register_pressure.patch",
         "//third_party/tt_metal:reduce_integer.patch",
         "//third_party/tt_metal:reduce_precision_kernel.patch",
         "//third_party/tt_metal:arange_uint8.patch",
@@ -384,10 +382,10 @@ http_archive(
         "//third_party/tt_metal:pow_int32.patch",
         "//third_party/tt_metal:batch_norm_training_statistics.patch",
     ],
-    sha256 = "f2946ef82c65123e7cc3cf403778357035689ddf74275834c7b8db08539d217d",
-    strip_prefix = "tt-metal-eb97711f4be2a30cfbff05266faf90bf9780d0c2",
+    sha256 = "f87dc8d21a6ec02280643543dde9a2633d771ceaad819b00ff493922f1e139c8",
+    strip_prefix = "tt-metal-614f605ffe2977715adc198156c72bea14c2bae6",
     urls = [
-        "https://github.com/tenstorrent/tt-metal/archive/eb97711f4be2a30cfbff05266faf90bf9780d0c2.tar.gz",
+        "https://github.com/tenstorrent/tt-metal/archive/614f605ffe2977715adc198156c72bea14c2bae6.tar.gz",
     ],
 )
 
@@ -494,6 +492,7 @@ git_repository(
     patch_args = ["-p1"],
     patches = [
         "//third_party/tt_xla:tt_mlir_string_map_include.patch",
+        "//third_party/tt_xla:tt_mlir_tt_metal_api.patch",
         "//third_party/tt_xla:tt_mlir_op_model_dependent_static_assert.patch",
         "//third_party/tt_xla:tt_mlir_ttir_to_d2m_constructor_names.patch",
         "//third_party/tt_xla:tt_mlir_broadcast_shape_side_effect.patch",

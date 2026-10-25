@@ -1,7 +1,7 @@
 diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_format/blockfloat_common.cpp
 --- tt_metal/impl/data_format/blockfloat_common.cpp
 +++ tt_metal/impl/data_format/blockfloat_common.cpp
-@@ -4,12 +4,16 @@
+@@ -4,8 +4,11 @@
  
  #include <algorithm>
  #include <tt-logger/tt-logger.hpp>
@@ -13,12 +13,7 @@ diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_fo
  #include <vector>
  #include <thread>
  #include <future>
- 
-+#include <tt-metalium/bfloat16.hpp>
- #include <tt_stl/assert.hpp>
- #include "blockfloat_common.hpp"
- #include "common/executor.hpp"
-@@ -332,6 +336,116 @@ uint8_t convert_u32_to_bfp(uint32_t input, uint32_t shared_exp, bool is_exp_a) {
+@@ -333,6 +336,116 @@ uint8_t convert_u32_to_bfp(uint32_t input, uint32_t shared_exp, bool is_exp_a) {
      return mantissa;
  }
  
@@ -135,7 +130,7 @@ diff --git tt_metal/impl/data_format/blockfloat_common.cpp tt_metal/impl/data_fo
  template <tt::DataFormat BfpFormat>
  std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles(
      ttsl::Span<const float> fp32_vec,
-@@ -353,6 +467,11 @@ std::vector<uint32_t> pack_as_bfp_tiles(
+@@ -354,6 +467,11 @@ std::vector<uint32_t> pack_as_bfp_tiles(
          BfpFormat == tt::DataFormat::Bfp2 || BfpFormat == tt::DataFormat::Bfp4 || BfpFormat == tt::DataFormat::Bfp8 ||
          BfpFormat == tt::DataFormat::Bfp2_b || BfpFormat == tt::DataFormat::Bfp4_b ||
          BfpFormat == tt::DataFormat::Bfp8_b);

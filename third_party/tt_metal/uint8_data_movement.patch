@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/device/fill_pad_program_factory.cpp
-@@ -38,11 +38,16 @@ KernelSpec::CompilerOptions::Defines build_kernel_defines(
+@@ -39,11 +39,16 @@ KernelSpec::CompilerOptions::Defines build_kernel_defines(
      bool is_float_type,
      bool is_fp32) {
      KernelSpec::CompilerOptions::Defines d;
@@ -113,7 +113,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device
 diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
-@@ -91,9 +91,9 @@ void TilizeWithValPaddingDeviceOperation::validate_on_program_cache_miss(
+@@ -92,9 +92,9 @@ void TilizeWithValPaddingDeviceOperation::validate_on_program_cache_miss(
      TT_FATAL(
          input_tensor.dtype() == DataType::BFLOAT16 or input_tensor.dtype() == DataType::INT32 or
              input_tensor.dtype() == DataType::UINT32 or input_tensor.dtype() == DataType::FLOAT32 or
@@ -142,61 +142,60 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/unti
 diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
-@@ -70,6 +70,7 @@ ttnn::Tensor untilize_native(
+@@ -59,6 +59,7 @@ ttnn::Tensor untilize_native(
              input_tensor, output_tensor_end, memory_config, use_multicore, sub_core_grids);
      }
      bool fp32_dest_acc_en = input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||
 +                            input_tensor.dtype() == DataType::UINT8 ||
                              input_tensor.dtype() == DataType::FLOAT32;
-     auto input_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
-     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
+     // The native prim emits BFLOAT16 for a BFLOAT8_B input (UntilizeDeviceOperation::compute_output_specs),
+     // so size the output CB estimate and the pending output buffer by the output dtype: sizing them by the
 diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp
-@@ -118,8 +118,7 @@ tt::tt_metal::ProgramDescriptor UntilizeWithUnpaddingMultiCoreInterleavedProgram
-         }
-     }
-     std::vector<uint32_t> writer_ct_args = {
--        (input_cb_data_format == tt::DataFormat::Float32 or input_cb_data_format == tt::DataFormat::UInt32 or
--         input_cb_data_format == tt::DataFormat::Int32),
-+        num_tiles_per_row,
-         unpadded_row_size_bytes,
-         writer_page_size};
-     TensorAccessorArgs(*dst_buffer).append_to(writer_ct_args);
-@@ -136,7 +135,7 @@ tt::tt_metal::ProgramDescriptor UntilizeWithUnpaddingMultiCoreInterleavedProgram
+@@ -134,12 +134,7 @@ UntilizeWithUnpaddingMultiCoreInterleavedProgramFactory::create_program_artifact
+             .tensor_parameter_name = MCI_OUTPUT,
+             .accessor_name = "dst",
+         }},
+-        .compile_time_args =
+-            {{"float32_dtype",
+-              (uint32_t)(input_dfb_data_format == tt::DataFormat::Float32 or
+-                         input_dfb_data_format == tt::DataFormat::UInt32 or
+-                         input_dfb_data_format == tt::DataFormat::Int32)},
+-             {"unpadded_X_size", unpadded_row_size_bytes}},
++        .compile_time_args = {{"num_tiles_per_row", num_tiles_per_row}, {"unpadded_X_size", unpadded_row_size_bytes}},
+         .runtime_arg_schema = {.runtime_arg_names = {"padded_X_size", "start_stick_id", "n_block_reps"}},
+         .hw_config = ttnn::create_writer_datamovement_config(),
+     };
+@@ -148,7 +143,7 @@ UntilizeWithUnpaddingMultiCoreInterleavedProgramFactory::create_program_artifact
       */
-     KernelDescriptor::Defines compute_kernel_defines;
-     if (input_cb_data_format == tt::DataFormat::Int32 || input_cb_data_format == tt::DataFormat::UInt32 ||
--        input_cb_data_format == tt::DataFormat::Float32) {
-+        input_cb_data_format == tt::DataFormat::Float32 || input_cb_data_format == tt::DataFormat::UInt8) {
-         compute_kernel_defines.emplace_back("DST_ACCUM_MODE", "1");
+     KernelSpec::CompilerOptions::Defines compute_kernel_defines;
+     if (input_dfb_data_format == tt::DataFormat::Int32 || input_dfb_data_format == tt::DataFormat::UInt32 ||
+-        input_dfb_data_format == tt::DataFormat::Float32) {
++        input_dfb_data_format == tt::DataFormat::Float32 || input_dfb_data_format == tt::DataFormat::UInt8) {
+         compute_kernel_defines.emplace("DST_ACCUM_MODE", "1");
      }
-     std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(
+     ComputeHardwareConfig compute_hw_config{.enable_32_bit_dest = fp32_dest_acc_en};
 diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/kernels/dataflow/writer_unary_stick_layout_split_rows_multicore.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/kernels/dataflow/writer_unary_stick_layout_split_rows_multicore.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/kernels/dataflow/writer_unary_stick_layout_split_rows_multicore.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/kernels/dataflow/writer_unary_stick_layout_split_rows_multicore.cpp
-@@ -21,7 +21,7 @@ void kernel_main() {
-     const uint32_t start_stick_id = get_arg_val<uint32_t>(2);
-     const uint32_t n_block_reps = get_arg_val<uint32_t>(3);
+@@ -20,11 +20,9 @@ void kernel_main() {
+     const auto start_stick_id = get_arg(args::start_stick_id);
+     const auto n_block_reps = get_arg(args::n_block_reps);
  
--    constexpr bool FLOAT32_DTYPE = get_compile_time_arg_val(0) == 1;
-+    constexpr uint32_t num_tiles_per_row = get_compile_time_arg_val(0);
-     constexpr uint32_t unpadded_X_size = get_compile_time_arg_val(1);
-     // Per-shard page size in bytes: shard width for BLOCK/WIDTH-sharded output (a logical row
-     // spans multiple shards), the destination buffer's aligned page size for HEIGHT-sharded output
-@@ -31,8 +31,6 @@ void kernel_main() {
-     constexpr uint32_t writer_page_size = get_compile_time_arg_val(2);
-     constexpr auto dst_args = TensorAccessorArgs<3>();
+-    constexpr bool FLOAT32_DTYPE = get_arg(args::float32_dtype) == 1;
++    constexpr auto num_tiles_per_row = get_arg(args::num_tiles_per_row);
+     constexpr auto unpadded_X_size = get_arg(args::unpadded_X_size);
  
 -    const uint32_t num_tiles_per_row = padded_X_size >> (FLOAT32_DTYPE ? 7 : 6);
 -
-     const auto s = TensorAccessor(dst_args, dst_addr, writer_page_size);
- 
-     Noc noc;
+     // The destination's per-shard page size — the shard width for BLOCK/WIDTH-sharded output (a
+     // logical row spans multiple shards), the aligned page size for HEIGHT-sharded output (one row
+     // per page, padded up to the buffer alignment), the full unpadded row for interleaved — comes
 diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp
-@@ -77,6 +77,7 @@ Tensor untilize_with_unpadding(
+@@ -78,6 +78,7 @@ Tensor untilize_with_unpadding(
      bool use_multicore,
      const std::optional<CoreRangeSet>& sub_core_grids) {
      bool fp32_dest_acc_en = input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||

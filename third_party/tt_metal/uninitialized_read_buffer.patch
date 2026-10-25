@@ -1,7 +1,7 @@
 diff --git tt_metal/impl/tensor/distributed_tensor_apis.cpp tt_metal/impl/tensor/distributed_tensor_apis.cpp
 --- tt_metal/impl/tensor/distributed_tensor_apis.cpp
 +++ tt_metal/impl/tensor/distributed_tensor_apis.cpp
-@@ -116,7 +116,7 @@ HostTensor enqueue_read_tensor(
+@@ -115,7 +115,7 @@ HostTensor enqueue_read_tensor(
      distributed_host_buffer.emplace_shards(
          {coords.begin(), coords.end()},
          [&](const distributed::MeshCoordinate&) {
@@ -25,7 +25,7 @@ diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis
 diff --git tt_metal/impl/tensor/tensor_impl.cpp tt_metal/impl/tensor/tensor_impl.cpp
 --- tt_metal/impl/tensor/tensor_impl.cpp
 +++ tt_metal/impl/tensor/tensor_impl.cpp
-@@ -57,6 +57,33 @@ HostBuffer allocate_host_buffer(const TensorSpec& tensor_spec) {
+@@ -75,6 +75,34 @@ HostBuffer allocate_host_buffer(const TensorSpec& tensor_spec) {
      TT_THROW("Unreachable");
  }
  
@@ -44,6 +44,7 @@ diff --git tt_metal/impl/tensor/tensor_impl.cpp tt_metal/impl/tensor/tensor_impl
 +        case DataType::BFLOAT16: return uninitialized_host_buffer<bfloat16>(size_bytes);
 +        case DataType::FLOAT16: return uninitialized_host_buffer<float16>(size_bytes);
 +        case DataType::FLOAT32: return uninitialized_host_buffer<float>(size_bytes);
++        case DataType::INT8: return uninitialized_host_buffer<int8_t>(size_bytes);
 +        case DataType::INT32: return uninitialized_host_buffer<int32_t>(size_bytes);
 +        case DataType::FP8_E4M3: return uninitialized_host_buffer<float8_e4m3>(size_bytes);
 +        case DataType::UINT8: return uninitialized_host_buffer<uint8_t>(size_bytes);
@@ -62,7 +63,7 @@ diff --git tt_metal/impl/tensor/tensor_impl.cpp tt_metal/impl/tensor/tensor_impl
 diff --git tt_metal/impl/tensor/tensor_impl.hpp tt_metal/impl/tensor/tensor_impl.hpp
 --- tt_metal/impl/tensor/tensor_impl.hpp
 +++ tt_metal/impl/tensor/tensor_impl.hpp
-@@ -25,6 +25,10 @@ std::shared_ptr<distributed::MeshBuffer> allocate_device_buffer(
+@@ -27,6 +27,10 @@ std::shared_ptr<distributed::MeshBuffer> allocate_device_buffer(
  
  HostBuffer allocate_host_buffer(const TensorSpec& tensor_spec);
  
@@ -70,6 +71,6 @@ diff --git tt_metal/impl/tensor/tensor_impl.hpp tt_metal/impl/tensor/tensor_impl
 +// that are fully overwritten, e.g. by a device read.
 +HostBuffer allocate_uninitialized_host_buffer(const TensorSpec& tensor_spec);
 +
- // Converts logical data into physical data based on tensor spec
- // - Logical data: Flat container of row major data corresponding to some ND logical shape
- // - Physical data: Flat container of physical data corresponding to tensor spec. It takes into account:
+ struct LocalHostShard {
+     distributed::MeshCoordinate coord;
+     HostBuffer buffer;

@@ -1,7 +1,7 @@
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mul_int32.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mul_int32.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mul_int32.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mul_int32.h
-@@ -201,4 +201,35 @@
+@@ -201,4 +201,35 @@ inline void mul_int32_init() {
  #endif
  }
  
@@ -40,7 +40,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_mu
 diff --git tt_metal/hw/inc/api/compute/mul_int_sfpu.h tt_metal/hw/inc/api/compute/mul_int_sfpu.h
 --- tt_metal/hw/inc/api/compute/mul_int_sfpu.h
 +++ tt_metal/hw/inc/api/compute/mul_int_sfpu.h
-@@ -88,4 +88,13 @@
+@@ -88,4 +88,13 @@ ALWI void mul_int_tile_init() {
  #endif
  }
  
@@ -54,32 +54,32 @@ diff --git tt_metal/hw/inc/api/compute/mul_int_sfpu.h tt_metal/hw/inc/api/comput
 +#endif
 +
  }  // namespace ckernel
-diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_types.hpp ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_types.hpp
---- ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_types.hpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_types.hpp
-@@ -44,6 +44,7 @@
-     MINIMUM,
-     GCD,
-     LCM,
-+    MULHI,
-     ADDALPHA,
-     SUBALPHA,
-     XLOGY,
-diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
---- ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
-@@ -30,6 +30,7 @@
-     DT::BFLOAT16, DT::FLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::INT32, DT::UINT32};
- 
- inline constexpr std::array int32_only{DT::INT32};
-+inline constexpr std::array uint32_only{DT::UINT32};
- 
- // Allowed input (tensor A) dtypes for REQUANT/DEQUANT: an int32 quantized tile, or a
- // uint8/int8 quantized tile that reaches DST as a zero-extended byte before the SFPU casts it
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/binary.cpp ttnn/cpp/ttnn/operations/eltwise/binary/binary.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/binary.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/binary.cpp
+@@ -1260,6 +1260,7 @@ TTNN_BINARY_OP_TENSOR_TENSOR_IMPL(squared_difference, SQUARED_DIFFERENCE)
+ TTNN_BINARY_OP_TENSOR_SCALAR_IMPL(squared_difference, SQUARED_DIFFERENCE)
+ TTNN_BINARY_OP_INPLACE_IMPL(squared_difference_, SQUARED_DIFFERENCE)
+ TTNN_BINARY_OP_TENSOR_TENSOR_IMPL(logical_right_shift, LOGICAL_RIGHT_SHIFT)
++TTNN_BINARY_OP_TENSOR_TENSOR_IMPL(mulhi, MULHI)
+ TTNN_BINARY_OP_TENSOR_SCALAR_IMPL(logical_right_shift, LOGICAL_RIGHT_SHIFT)
+ TTNN_BINARY_OP_TENSOR_TENSOR_BITWISE_IMPL(bitwise_and, BITWISE_AND)
+ TTNN_BINARY_OP_TENSOR_INT32_BITWISE_IMPL(bitwise_and, BITWISE_AND)
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/binary.hpp ttnn/cpp/ttnn/operations/eltwise/binary/binary.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/binary.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/binary.hpp
+@@ -510,6 +510,7 @@ Tensor subalpha(
+     const std::optional<MemoryConfig>& memory_config = std::nullopt,
+     const std::optional<Tensor>& output = std::nullopt);
+ TTNN_BINARY_OP_TENSOR_TENSOR(logical_right_shift, LOGICAL_RIGHT_SHIFT)
++TTNN_BINARY_OP_TENSOR_TENSOR(mulhi, MULHI)
+ TTNN_BINARY_OP_TENSOR_SCALAR(logical_right_shift, LOGICAL_RIGHT_SHIFT)
+ TTNN_BINARY_OP_TENSOR_TENSOR_BITWISE(bitwise_and, BITWISE_AND)
+ TTNN_BINARY_OP_TENSOR_INT32_BITWISE(bitwise_and, BITWISE_AND)
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.cpp
-@@ -44,6 +44,7 @@
+@@ -45,6 +45,7 @@ std::span<const DataType> supported_tensor_a_dtypes(BinaryOpType op) {
          case BinaryOpType::LCM:
          case BinaryOpType::DIV_FLOOR:
          case BinaryOpType::DIV_TRUNC: return int32_only;
@@ -87,21 +87,43 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy
          case BinaryOpType::REQUANT:
          case BinaryOpType::DEQUANT: return requant_dequant;
          case BinaryOpType::LOGADDEXP:
-diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp
---- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp
-@@ -66,6 +66,7 @@
-         RSUB,
-         GCD,
-         LCM,
-+        MULHI,
-         LEFT_SHIFT,
-         RIGHT_SHIFT,
-         LOGICAL_RIGHT_SHIFT,
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy.hpp
+@@ -30,6 +30,7 @@ inline constexpr std::array float_and_int32_uint32{
+     DT::BFLOAT16, DT::FLOAT16, DT::FLOAT32, DT::BFLOAT8_B, DT::BFLOAT4_B, DT::INT32, DT::UINT32};
+ 
+ inline constexpr std::array int32_only{DT::INT32};
++inline constexpr std::array uint32_only{DT::UINT32};
+ 
+ // Allowed input (tensor A) dtypes for REQUANT/DEQUANT: an int32 quantized tile, or a
+ // uint8/int8 quantized tile that reaches DST as a zero-extended byte before the SFPU casts it
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_types.hpp ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_types.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_types.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_types.hpp
+@@ -46,6 +46,7 @@ enum class BinaryOpType {
+     MINIMUM,
+     GCD,
+     LCM,
++    MULHI,
+     ADDALPHA,
+     SUBALPHA,
+     XLOGY,
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
+@@ -91,6 +91,7 @@ bool is_binary_sfpu_op(
+                    (a != FLOAT16 || (output != FLOAT32 && output != INT32 && output != UINT32));
+         case LCM:
+         case GCD: return (a == INT32 && b == INT32);
++        case MULHI: return (a == UINT32 && b == UINT32);
+         case LEFT_SHIFT:
+         case RIGHT_SHIFT:
+             return ((a == INT32 || a == UINT32 || a == UINT16) && (b == INT32 || b == UINT32 || b == UINT16));
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
-@@ -359,6 +359,13 @@
+@@ -376,6 +376,13 @@ OpConfig::OpConfig(
                  TT_THROW("Unsupported binary op for FPU {}", binary_op_type);
              }
              break;
@@ -115,44 +137,22 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
          case BinaryOpType::XLOGY:
              if (is_sfpu_op()) {
                  binary_op = SfpuBinaryOp::XLOGY;
-@@ -468,6 +475,7 @@
-             return {"rsub_binary_tile_init();", fmt::format("rsub_binary_tile<{}>", kRneDstRoundingMode)};
-         case GCD: return {"gcd_tile_init();", "gcd_tile"};
+@@ -487,6 +494,7 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
          case LCM: return {"lcm_tile_init();", "lcm_tile"};
+         case LOGADDEXP: return {"logaddexp_binary_tile_init();", "logaddexp_binary_tile"};
+         case LOGADDEXP2: return {"logaddexp2_binary_tile_init();", "logaddexp2_binary_tile"};
 +        case MULHI: return {"mulhi_uint32_tile_init();", "mulhi_uint32_tile"};
          case LEFT_SHIFT:
              return {
                  "binary_shift_tile_init();",
-diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
---- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-@@ -83,6 +83,7 @@
-                    (a != FLOAT16 || (output != FLOAT32 && output != INT32 && output != UINT32));
-         case LCM:
-         case GCD: return (a == INT32 && b == INT32);
-+        case MULHI: return (a == UINT32 && b == UINT32);
-         case LEFT_SHIFT:
-         case RIGHT_SHIFT:
-             return ((a == INT32 || a == UINT32 || a == UINT16) && (b == INT32 || b == UINT32 || b == UINT16));
-diff --git ttnn/cpp/ttnn/operations/eltwise/binary/binary.hpp ttnn/cpp/ttnn/operations/eltwise/binary/binary.hpp
---- ttnn/cpp/ttnn/operations/eltwise/binary/binary.hpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary/binary.hpp
-@@ -510,6 +510,7 @@
-     const std::optional<MemoryConfig>& memory_config = std::nullopt,
-     const std::optional<Tensor>& output = std::nullopt);
- TTNN_BINARY_OP_TENSOR_TENSOR(logical_right_shift, LOGICAL_RIGHT_SHIFT)
-+TTNN_BINARY_OP_TENSOR_TENSOR(mulhi, MULHI)
- TTNN_BINARY_OP_TENSOR_SCALAR(logical_right_shift, LOGICAL_RIGHT_SHIFT)
- TTNN_BINARY_OP_TENSOR_TENSOR_BITWISE(bitwise_and, BITWISE_AND)
- TTNN_BINARY_OP_TENSOR_INT32_BITWISE(bitwise_and, BITWISE_AND)
-diff --git ttnn/cpp/ttnn/operations/eltwise/binary/binary.cpp ttnn/cpp/ttnn/operations/eltwise/binary/binary.cpp
---- ttnn/cpp/ttnn/operations/eltwise/binary/binary.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary/binary.cpp
-@@ -1260,6 +1260,7 @@
- TTNN_BINARY_OP_TENSOR_SCALAR_IMPL(squared_difference, SQUARED_DIFFERENCE)
- TTNN_BINARY_OP_INPLACE_IMPL(squared_difference_, SQUARED_DIFFERENCE)
- TTNN_BINARY_OP_TENSOR_TENSOR_IMPL(logical_right_shift, LOGICAL_RIGHT_SHIFT)
-+TTNN_BINARY_OP_TENSOR_TENSOR_IMPL(mulhi, MULHI)
- TTNN_BINARY_OP_TENSOR_SCALAR_IMPL(logical_right_shift, LOGICAL_RIGHT_SHIFT)
- TTNN_BINARY_OP_TENSOR_TENSOR_BITWISE_IMPL(bitwise_and, BITWISE_AND)
- TTNN_BINARY_OP_TENSOR_INT32_BITWISE_IMPL(bitwise_and, BITWISE_AND)
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp
+@@ -68,6 +68,7 @@ struct OpConfig {
+         LCM,
+         LOGADDEXP,
+         LOGADDEXP2,
++        MULHI,
+         LEFT_SHIFT,
+         RIGHT_SHIFT,
+         LOGICAL_RIGHT_SHIFT,

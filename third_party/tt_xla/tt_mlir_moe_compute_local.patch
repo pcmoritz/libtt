@@ -267,7 +267,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
  
  namespace tt::runtime::ttnn::operations::ccl {
  
-@@ -27,9 +31,134 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
+@@ -27,9 +31,128 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
    return ::ttnn::experimental::prim::detail::MoEActivationFunction::SILU;
  }
  
@@ -279,16 +279,10 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
 +  ::ttnn::MeshDevice *meshDevice = input.device();
 +  uint32_t hiddenSize = input.logical_shape()[-1];
 +  // As the op picks its data-parallel combine cores: the largest divisor of
-+  // the hidden tiles, at most 4, that also divides the matmul ring.
-+  uint32_t ringSize = meshDevice->arch() == ::tt::ARCH::BLACKHOLE
-+                          ? meshDevice
-+                                ->get_optimal_dram_bank_to_logical_worker_assignment(
-+                                    ::tt::tt_metal::NOC::RISCV_0_default)
-+                                .size()
-+                          : 12;
++  // the hidden tiles, at most 4.
 +  uint32_t dataParallelCores = 1;
 +  for (uint32_t d = 4; d >= 1; --d) {
-+    if ((hiddenSize / 32) % d == 0 && ringSize % d == 0) {
++    if ((hiddenSize / 32) % d == 0) {
 +      dataParallelCores = d;
 +      break;
 +    }

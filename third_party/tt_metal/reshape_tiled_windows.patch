@@ -1,4 +1,5 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/reshape_tiled_windows.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/reshape_tiled_windows.cpp
+new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/dataflow/reshape_tiled_windows.cpp
 @@ -0,0 +1,82 @@
@@ -224,7 +225,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_ti
 +                {"Max_Segments", max_segments},
 +            },
 +        .runtime_arg_schema = {.runtime_arg_names = {"start_output_page", "num_pages", "num_segments"}},
-+        .hw_config = create_reader_datamovement_config(input_tensor.device()->arch()),
++        .hw_config = create_reader_datamovement_config(),
 +        .advanced_options = {.num_runtime_varargs = num_varargs},
 +    };
 +    spec.kernels = {mover};
@@ -298,7 +299,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_ti
      // Host-compute and upload the input->output page-mapping tensor.
      Tensor mapping_tensor = detail::compute_reshape_mapping_host_tensor(
                                  num_input_pages, num_output_pages, input_shape, output_shape, tile_shape, face_shape)
-@@ -316,8 +497,6 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewTiledProgramFactory::create_
+@@ -322,8 +503,6 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewTiledProgramFactory::create_
      op_owned.push_back(mapping_tensor.device_storage().release_mesh_tensor());
      const auto& mapping_owned = op_owned.back();
  
@@ -307,7 +308,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_ti
      // PCC fails when this is greater than 1. TODO figure out why.
      constexpr auto reader_dfb_len = 1;
  
-@@ -328,14 +507,6 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewTiledProgramFactory::create_
+@@ -334,14 +513,6 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewTiledProgramFactory::create_
      const auto output_dfb_data_format = datatype_to_dataformat_converter(output_tensor.dtype());
      const auto output_tile_size_bytes = tt::tile_size(output_dfb_data_format);
  

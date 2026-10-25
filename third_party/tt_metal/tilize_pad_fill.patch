@@ -37,11 +37,11 @@ diff --git ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp ttnn/cpp/ttnn/kernel_lib/l1_h
 diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp
-@@ -65,12 +65,12 @@ void kernel_main() {
+@@ -62,12 +62,12 @@ void kernel_main() {
                  noc.async_read(
                      s, dst, width_size, {.page_id = size_2d + k, .offset_bytes = start_column_id}, {.offset_bytes = 0});
  
--                // Block before copying data from tmp to cb buffer
+-                // Block before copying data from tmp to the input buffer
 -                noc.async_read_barrier();
 -
                  uint32_t prev_size = start_column_id;
