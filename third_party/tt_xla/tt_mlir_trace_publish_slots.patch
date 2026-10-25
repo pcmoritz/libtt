@@ -1,0 +1,103 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/include/tt/runtime/detail/ttnn/types/types.h
+--- a/runtime/include/tt/runtime/detail/ttnn/types/types.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/types.h
+@@ -79,6 +79,15 @@ public:
+     constEvalOutput.store(true, std::memory_order_relaxed);
+   }
+ 
++  // An output slot of a captured trace, which every replay of that trace
++  // overwrites. Traces publish their output slots as they are; a value that
++  // outlives the invocation (a program output, a loop carry) is copied where
++  // it escapes.
++  bool isTraceOutput() const {
++    return traceOutput.load(std::memory_order_relaxed);
++  }
++  void markTraceOutput() { traceOutput.store(true, std::memory_order_relaxed); }
++
+   uint64_t getVersion() const {
+     return version.load(std::memory_order_relaxed);
+   }
+@@ -110,6 +119,8 @@ private:
+   // Constant-cache storage must be copied before returning it to the caller.
+   std::atomic<bool> constEvalOutput{false};
+ 
++  std::atomic<bool> traceOutput{false};
++
+   static uint64_t getLatestVersion();
+ 
+   // Callbacks to be called on destruction of the tensor.
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -114,6 +114,13 @@ allocateTraceSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+           .setRetain(true);
+     }
+   }
++  // Output slots are published as they are (publishTraceOutputs); the flag
++  // tells the places a value escapes to copy it.
++  for (size_t i = op->inputs()->size(); i < slots.size(); ++i) {
++    slots[i]
++        .as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN)
++        .markTraceOutput();
++  }
+ 
+   return slots;
+ }
+@@ -193,11 +200,13 @@ updateTraceInputSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+   }
+ }
+ 
+-// Trace output slots are scratch storage overwritten by every replay. Give
+-// each invocation its own results so a later replay cannot change a value
+-// still used by the caller: a loop body that forwards a value it computed the
+-// previous iteration, say (a, b) -> (a + b, a), would otherwise see the sum
+-// slot overwritten while b still refers to it.
++// Trace output slots are scratch storage overwritten by every replay. They
++// are published as they are: within one invocation every consumer runs, in
++// order on one command queue, before this trace replays again. A value that
++// outlives the invocation is copied where it escapes: a program output in
++// submit(), and a loop carry in the while-loop runtime (a body that forwards a
++// value it computed the previous iteration, say (a, b) -> (a + b, a), would
++// otherwise see the sum slot overwritten while b still refers to it).
+ static void
+ publishTraceOutputs(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+                     ProgramContext &context,
+@@ -206,13 +215,8 @@ publishTraceOutputs(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+              "Mismatched number of outputs, expected: ", op->outputs()->size(),
+              " got: ", outputSlots.size());
+   for (size_t i = 0; i < op->outputs()->size(); i++) {
+-    const ::tt::target::ttnn::TensorRef *output = op->outputs()->Get(i);
+-    const ::ttnn::Tensor &slot =
+-        ::tt::runtime::ttnn::utils::getTTNNTensorFromRuntimeTensor(
+-            outputSlots[i]);
+-    auto result = ::tt::runtime::ttnn::utils::createRuntimeTensorFromTTNN(
+-        ::ttnn::clone(slot, std::nullopt, std::nullopt, std::nullopt));
+-    context.getTensorPool().insertRuntimeTensorAndValidate(output, result);
++    context.getTensorPool().insertRuntimeTensorAndValidate(
++        op->outputs()->Get(i), outputSlots[i]);
+   }
+ }
+ 
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -3014,13 +3014,15 @@ submit(Device deviceHandle, Binary executableHandle, std::uint32_t programIndex,
+       executor->gatherOutputTensors();
+   executor.reset();
+ 
+-  // Cached constants remain shared inside programs. Give each returned device
+-  // output its own storage so later in-place updates cannot mutate the cache
+-  // or another output, including repeated results from this same invocation.
++  // Cached constants remain shared inside programs, and a trace's output slot
++  // is rewritten by its next replay. Give each such returned device output its
++  // own storage so later in-place updates cannot mutate the cache or another
++  // output, including repeated results from this same invocation, and so the
++  // next invocation's replays leave it alone.
+   for (auto &output : outputTensors) {
+     const auto &wrapper = output.as<TTNNTensorWrapper>(DeviceRuntime::TTNN);
+     const auto &tensor = wrapper.getTensor();
+-    if (wrapper.isConstEvalOutput() &&
++    if ((wrapper.isConstEvalOutput() || wrapper.isTraceOutput()) &&
+         tensor.storage_type() == ::ttnn::StorageType::DEVICE) {
+       output = utils::createRuntimeTensorFromTTNN(
+           ::ttnn::clone(tensor, std::nullopt, std::nullopt, std::nullopt));

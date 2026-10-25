@@ -7,6 +7,7 @@
 #include "tt/runtime/detail/ttnn/program_executor.h"
 #include "tt/runtime/detail/ttnn/ttnn.h"
 #include "tt/runtime/detail/ttnn/utils.h"
+#include "ttnn/operations/data_movement/clone/clone.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -197,6 +198,18 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
       uint32_t stateIndex = op->output_indices()->Get(i);
       LOG_ASSERT(stateIndex < stateSize,
                  "While loop output index is out of range");
+      // A trace in the body publishes its output slots as they are, and its
+      // next replay rewrites them. A carry outlives that replay, so it gets
+      // its own copy; a body that forwards a value it computed the previous
+      // iteration, (a, b) -> (a + b, a), would otherwise read the sum slot
+      // as b after the next iteration overwrote it.
+      auto &wrapper =
+          bodyOutputs[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN);
+      if (wrapper.isTraceOutput()) {
+        bodyOutputs[i] = ::tt::runtime::ttnn::utils::createRuntimeTensorFromTTNN(
+            ::ttnn::clone(wrapper.getTensor(), std::nullopt, std::nullopt,
+                          std::nullopt));
+      }
       inputs[stateIndex] = std::move(bodyOutputs[i]);
     }
   };
