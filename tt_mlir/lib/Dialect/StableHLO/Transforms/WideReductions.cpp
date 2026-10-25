@@ -16,28 +16,30 @@
 // feeding such a reduce on [W, H / C, C]: the transposed data, row-major, in
 // full tiles (plain [W, H] would fill only W of each tile's 32 rows). The
 // reduce goes over the last two dimensions. Each transpose at a leaf of the
-// chain becomes a reshape of its operand where the transpose was, so a
-// loop-invariant leaf is reshaped once before the loop. C is the widest
-// 32 * 2^k that divides H up to about sqrt(H): TTNN reduces the two dimensions
-// in turn, and each stage walks one of them on few cores. For [2, 151936]
-// (C = 128) a search step's elementwise ops take about 13 us each instead of
-// 105, and its reduction about 26 us. Chains whose H does not split are left
-// alone.
+// chain becomes a reshape of its operand where the transpose was. A leaf can
+// also be a loop carry that the body returns unchanged, entered with such a
+// transpose; it becomes the same reshape, made once before the loop. C is the
+// widest 32 * 2^k that divides H up to about sqrt(H): TTNN reduces the two
+// dimensions in turn, and each stage walks one of them on few cores. For
+// [2, 151936] (C = 128) a search step's elementwise ops take about 13 us each
+// instead of 105, and its reduction about 26 us. Chains whose H does not split
+// are left alone.
 //
-// A loop carry that the body returns unchanged is first read as the value the
-// loop was entered with, which is what exposes the transpose behind a
-// loop-invariant leaf.
+// The pass runs at the end of the StableHLO pipeline, on device-local shapes,
+// after sharding is decided and its annotations are gone.
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
-#include "shardy/dialect/sdy/ir/dialect.h"
+#include "mlir/Pass/Pass.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 
 #include <cstdint>
+#include <memory>
 
 namespace mlir::tt {
 namespace {
@@ -78,32 +80,43 @@ RankedTensorType chunkedType(RankedTensorType type, int64_t chunk) {
       type.getElementType());
 }
 
-bool isReplicatedConstraint(sdy::ShardingConstraintOp constraint) {
-  sdy::TensorShardingAttr sharding = constraint.getSharding();
-  return sharding.isFullyReplicated() && sharding.isFullyClosed() &&
-         sharding.getUnreducedAxes().empty();
+// The swap-transpose a leaf of the chain is: the value itself, or, for a loop
+// carry that the body returns unchanged, the value the loop was entered with.
+shlo::TransposeOp leafTranspose(Value value) {
+  if (auto arg = dyn_cast<BlockArgument>(value)) {
+    auto whileOp = dyn_cast<shlo::WhileOp>(arg.getOwner()->getParentOp());
+    unsigned index = arg.getArgNumber();
+    if (!whileOp || whileOp.getBody().front().getTerminator()->getOperand(
+                        index) != whileOp.getBody().getArgument(index)) {
+      return nullptr;
+    }
+    return leafTranspose(whileOp->getOperand(index));
+  }
+  auto transpose = value.getDefiningOp<shlo::TransposeOp>();
+  if (!transpose ||
+      !llvm::equal(transpose.getPermutation(), ArrayRef<int64_t>{1, 0})) {
+    return nullptr;
+  }
+  return transpose;
 }
 
 // Collects the values of the chain feeding a reduce, operands before users,
-// each once. The chain may hold swap-transposes (its leaves), broadcasts that
-// are constant along H (a per-row threshold, say, since H is split), splat
-// constants, closed replicated sharding constraints (JAX leaves one after most
-// ops under a shard_map), and elementwise ops over such values. Returns false
-// for anything else, and for ops with their own sharding annotation, which
-// would not fit the rebuilt shape.
+// each once. The chain may hold transposed leaves, broadcasts that are constant
+// along H (a per-row threshold, say, since H is split), splat constants, and
+// elementwise ops over such values. Returns false for anything else.
 bool collectChain(Value value, unsigned depth, llvm::SetVector<Value> &chain) {
   if (chain.contains(value)) {
     return true;
   }
   auto type = dyn_cast<RankedTensorType>(value.getType());
-  Operation *op = value.getDefiningOp();
-  if (!type || type.getRank() != 2 || !op || op->hasAttr(sdy::kShardingAttr)) {
+  if (!type || type.getRank() != 2) {
     return false;
   }
-  if (auto transpose = dyn_cast<shlo::TransposeOp>(op)) {
-    if (!llvm::equal(transpose.getPermutation(), ArrayRef<int64_t>{1, 0})) {
-      return false;
-    }
+  Operation *op = value.getDefiningOp();
+  if (leafTranspose(value)) {
+    // A leaf.
+  } else if (!op) {
+    return false;
   } else if (auto broadcast = dyn_cast<shlo::BroadcastInDimOp>(op)) {
     auto operandType = cast<RankedTensorType>(broadcast.getOperand().getType());
     for (auto [index, dim] :
@@ -114,11 +127,6 @@ bool collectChain(Value value, unsigned depth, llvm::SetVector<Value> &chain) {
     }
   } else if (auto constant = dyn_cast<shlo::ConstantOp>(op)) {
     if (!constant.getValue().isSplat()) {
-      return false;
-    }
-  } else if (auto constraint = dyn_cast<sdy::ShardingConstraintOp>(op)) {
-    if (!isReplicatedConstraint(constraint) ||
-        !collectChain(constraint.getInput(), depth, chain)) {
       return false;
     }
   } else {
@@ -140,18 +148,20 @@ bool collectChain(Value value, unsigned depth, llvm::SetVector<Value> &chain) {
   return true;
 }
 
-// Builds `value` on the chunked shape, its operands already in `mapping`.
-Value rebuildChunked(PatternRewriter &rewriter, Value value, int64_t chunk,
+// Builds `value` on the chunked shape, next to where it was defined, its
+// operands already in `mapping`.
+Value rebuildChunked(RewriterBase &rewriter, Value value, int64_t chunk,
                      IRMapping &mapping) {
-  Operation *op = value.getDefiningOp();
+  OpBuilder::InsertionGuard guard(rewriter);
   RankedTensorType type =
       chunkedType(cast<RankedTensorType>(value.getType()), chunk);
-  if (auto transpose = dyn_cast<shlo::TransposeOp>(op)) {
-    OpBuilder::InsertionGuard guard(rewriter);
+  if (shlo::TransposeOp transpose = leafTranspose(value)) {
     rewriter.setInsertionPointAfter(transpose);
     return rewriter.create<shlo::ReshapeOp>(transpose.getLoc(), type,
                                             transpose.getOperand());
   }
+  Operation *op = value.getDefiningOp();
+  rewriter.setInsertionPointAfter(op);
   if (auto broadcast = dyn_cast<shlo::BroadcastInDimOp>(op)) {
     // W is dimension 1 of [H, W] and 0 of [W, H / C, C]; operand dimensions
     // of size 1 that went to H go to H / C.
@@ -169,96 +179,61 @@ Value rebuildChunked(PatternRewriter &rewriter, Value value, int64_t chunk,
         op->getLoc(),
         SplatElementsAttr::get(type, splat.getSplatValue<Attribute>()));
   }
-  if (auto constraint = dyn_cast<sdy::ShardingConstraintOp>(op)) {
-    return rewriter.create<sdy::ShardingConstraintOp>(
-        op->getLoc(), mapping.lookup(constraint.getInput()),
-        sdy::TensorShardingAttr::getFullyReplicated(
-            op->getContext(), type.getRank(),
-            constraint.getSharding().getMeshOrRef(), /*isClosed=*/true));
-  }
   Operation *rebuilt = rewriter.clone(*op, mapping);
   rebuilt->getResult(0).setType(type);
   return rebuilt->getResult(0);
 }
 
 // reduce(dims = [0]) of a [H, W] chain -> reduce(dims = [1, 2]) of the chain
-// rebuilt on [W, H / C, C].
-class TallReductionToWide : public OpRewritePattern<shlo::ReduceOp> {
-public:
-  using OpRewritePattern<shlo::ReduceOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(shlo::ReduceOp reduceOp,
-                                PatternRewriter &rewriter) const override {
-    if (reduceOp.getInputs().size() != 1 ||
-        !llvm::equal(reduceOp.getDimensions(), ArrayRef<int64_t>{0})) {
-      return failure();
-    }
-    Value input = reduceOp.getInputs().front();
-    auto inputType = dyn_cast<RankedTensorType>(input.getType());
-    if (!isTallThin(inputType)) {
-      return failure();
-    }
-    int64_t chunk = denseChunk(inputType.getDimSize(0));
-    llvm::SetVector<Value> chain;
-    if (chunk == 0 || !collectChain(input, kMaxChainDepth, chain)) {
-      return failure();
-    }
-    IRMapping mapping;
-    for (Value value : chain) {
-      mapping.map(value, rebuildChunked(rewriter, value, chunk, mapping));
-    }
-    auto rebuilt = rewriter.create<shlo::ReduceOp>(
-        reduceOp.getLoc(), reduceOp.getResultTypes(),
-        ValueRange{mapping.lookup(input)}, reduceOp.getInitValues(),
-        rewriter.getDenseI64ArrayAttr({1, 2}));
-    rewriter.inlineRegionBefore(reduceOp.getBody(), rebuilt.getBody(),
-                                rebuilt.getBody().end());
-    rewriter.replaceOp(reduceOp, rebuilt.getResults());
-    return success();
+// rebuilt on [W, H / C, C]. The reduce keeps its result, reducer and
+// attributes.
+void rewriteTallReduction(RewriterBase &rewriter, shlo::ReduceOp reduceOp) {
+  if (reduceOp.getInputs().size() != 1 ||
+      !llvm::equal(reduceOp.getDimensions(), ArrayRef<int64_t>{0})) {
+    return;
   }
-};
+  Value input = reduceOp.getInputs().front();
+  auto inputType = dyn_cast<RankedTensorType>(input.getType());
+  if (!isTallThin(inputType)) {
+    return;
+  }
+  int64_t chunk = denseChunk(inputType.getDimSize(0));
+  llvm::SetVector<Value> chain;
+  if (chunk == 0 || !collectChain(input, kMaxChainDepth, chain)) {
+    return;
+  }
+  IRMapping mapping;
+  for (Value value : chain) {
+    mapping.map(value, rebuildChunked(rewriter, value, chunk, mapping));
+  }
+  rewriter.modifyOpInPlace(reduceOp, [&] {
+    reduceOp.getInputsMutable().assign(mapping.lookup(input));
+    reduceOp.setDimensionsAttr(rewriter.getDenseI64ArrayAttr({1, 2}));
+  });
+}
 
-// A loop operand that the body returns unchanged is the same value on every
-// iteration. Uses of its block arguments become uses of the value the loop was
-// entered with, so what feeds it (for example a transpose) is visible inside
-// the body. The loop keeps its operands and results, and so any per-result
-// annotations on it.
-class ReplaceInvariantCarries : public OpRewritePattern<shlo::WhileOp> {
+// The replaced chains are left for the canonicalizer that follows.
+class WideReductionsPass
+    : public PassWrapper<WideReductionsPass, OperationPass<ModuleOp>> {
 public:
-  using OpRewritePattern<shlo::WhileOp>::OpRewritePattern;
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(WideReductionsPass)
 
-  LogicalResult matchAndRewrite(shlo::WhileOp whileOp,
-                                PatternRewriter &rewriter) const override {
-    Block &body = whileOp.getBody().front();
-    Block &cond = whileOp.getCond().front();
-    auto returnOp = cast<shlo::ReturnOp>(body.getTerminator());
-    bool changed = false;
-    for (auto [index, init] : llvm::enumerate(whileOp.getOperands())) {
-      BlockArgument bodyArg = body.getArgument(index);
-      BlockArgument condArg = cond.getArgument(index);
-      if (returnOp.getOperand(index) != bodyArg) {
-        continue;
-      }
-      // Only the return reads the argument once its other uses are replaced.
-      bool readInBody = llvm::any_of(bodyArg.getUsers(), [&](Operation *user) {
-        return user != returnOp.getOperation();
-      });
-      if (!readInBody && condArg.use_empty()) {
-        continue;
-      }
-      rewriter.replaceAllUsesExcept(bodyArg, init, returnOp);
-      rewriter.replaceAllUsesWith(condArg, init);
-      changed = true;
+  StringRef getArgument() const final { return "tt-wide-reductions"; }
+
+  void runOnOperation() final {
+    SmallVector<shlo::ReduceOp> reduces;
+    getOperation().walk([&](shlo::ReduceOp op) { reduces.push_back(op); });
+    IRRewriter rewriter(&getContext());
+    for (shlo::ReduceOp reduceOp : reduces) {
+      rewriteTallReduction(rewriter, reduceOp);
     }
-    return success(changed);
   }
 };
 
 } // namespace
 
-void populateWideReductionPatterns(RewritePatternSet &patterns) {
-  patterns.add<TallReductionToWide, ReplaceInvariantCarries>(
-      patterns.getContext());
+std::unique_ptr<Pass> createWideReductionsPass() {
+  return std::make_unique<WideReductionsPass>();
 }
 
 } // namespace mlir::tt

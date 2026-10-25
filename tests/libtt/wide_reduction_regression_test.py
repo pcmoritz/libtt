@@ -12,6 +12,9 @@ vocab up to about sqrt(vocab). Vocabs that do not split are left alone.
 Wide softmax rows are the other sampler cost: TTNN's softmax parallelizes over
 rows, so two rows of a vocabulary take 12 ms where the decomposition takes 1 ms.
 The softmax fusion skips that shape.
+
+The rewrite runs at the end of the StableHLO pipeline, on device-local shapes,
+so the program's sharding is already decided and stays as it is.
 """
 
 import re
@@ -21,6 +24,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import lax
+from jax._src.lib.mlir import ir
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 # Vocab sizes and the chunked shape the search reduces: 2048 splits into 32
 # columns (64 > sqrt(2048)), 16384 into 128, and 2000 does not split (the
@@ -122,8 +128,59 @@ def test_mass_search_reduces_over_wide_rows(trace, width):
     threshold, probs = (np.asarray(v) for v in run(_put(_source(width))))
     kept = np.where(probs >= threshold[:, None], probs, 0.0).sum(axis=1)
     assert np.all(kept >= p - 1e-3)
-    dropped = np.where(probs >= np.nextafter(threshold, np.inf)[:, None], probs, 0.0).sum(axis=1)
+    dropped = np.where(
+        probs >= np.nextafter(threshold, np.inf)[:, None], probs, 0.0
+    ).sum(axis=1)
     assert np.all(dropped < p + 1e-3)
+
+
+def _mesh(rows):
+    devices = jax.devices("tt")
+    if len(devices) < 2 or rows % len(devices):
+        pytest.skip(f"needs a mesh that splits {rows} rows")
+    return Mesh(np.array(devices), ("x",))
+
+
+def _walk(op):
+    for region in op.regions:
+        for block in region.blocks:
+            for inner in block.operations:
+                yield inner
+                yield from _walk(inner)
+
+
+@pytest.mark.parametrize("spec", [P(), P("x", None)], ids=["replicated", "batch"])
+def test_search_on_a_mesh(spec, tmp_path):
+    # The sampler's logits are replicated under tensor parallelism, and their
+    # search is rewritten on each device. A batch-sharded source reaches the
+    # loop gathered and is searched as written.
+    k = 20
+    source = np.random.default_rng(2).standard_normal((8, 2048), dtype=np.float32) * 4
+    x = jax.device_put(source, NamedSharding(_mesh(8), spec))
+    threshold = np.asarray(_jit(lambda v: _count_threshold(v, k), False, tmp_path)(x))
+    assert np.all((source > threshold[:, None]).sum(axis=1) >= k)
+    assert np.all((source > np.nextafter(threshold, np.inf)[:, None]).sum(axis=1) < k)
+    if spec == P():
+        assert "8x64x32" in _search_sums(_runtime_ir(tmp_path))
+
+
+def test_reduce_keeps_its_own_sharding(tmp_path):
+    # Imported XLA programs can pin a reduce's result. Pinned to "x", the
+    # rewritten reduce runs on each device's rows.
+    source = (np.arange(8 * 2048, dtype=np.float32).reshape(8, 2048) % 5) - 2
+    mesh = _mesh(8)
+    x = jax.device_put(source, NamedSharding(mesh, P()))
+    run = _jit(lambda v: jnp.sum(jnp.swapaxes(v, 0, 1) * 2.0, axis=0), False, tmp_path)
+    lowered = run.lower(x)
+    module = lowered.compiler_ir("stablehlo")
+    (reduce,) = [op for op in _walk(module.operation) if op.name == "stablehlo.reduce"]
+    with module.context:
+        reduce.attributes["sdy.sharding"] = ir.Attribute.parse(
+            '#sdy.sharding_per_value<[<@mesh, [{"x"}]>]>'
+        )
+    result = np.asarray(lowered.compile()(x))
+    np.testing.assert_array_equal(result, (source.T * 2.0).sum(axis=0))
+    assert _search_sums(_runtime_ir(tmp_path)) == [f"{8 // mesh.size}x64x32"]
 
 
 @pytest.mark.parametrize("trace", [False, True])

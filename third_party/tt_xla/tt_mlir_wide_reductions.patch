@@ -1,23 +1,26 @@
-diff --git a/lib/Dialect/StableHLO/Transforms/StableHLOFusing.cpp b/lib/Dialect/StableHLO/Transforms/StableHLOFusing.cpp
---- a/lib/Dialect/StableHLO/Transforms/StableHLOFusing.cpp
-+++ b/lib/Dialect/StableHLO/Transforms/StableHLOFusing.cpp
-@@ -9,6 +9,11 @@
- #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h"
- #include "ttmlir/Dialect/StableHLO/Utils/ShardyUtils.h"
+diff --git a/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp b/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp
+--- a/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp
++++ b/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp
+@@ -10,6 +10,11 @@
+ #include "mlir/Transforms/Passes.h"
+ #include "stablehlo/transforms/optimization/Passes.h"
  
 +namespace mlir::tt {
 +// Defined in libtt's tt_mlir/lib/Dialect/StableHLO/Transforms/WideReductions.cpp.
-+void populateWideReductionPatterns(RewritePatternSet &patterns);
++std::unique_ptr<Pass> createWideReductionsPass();
 +} // namespace mlir::tt
 +
  namespace mlir::tt::stablehlo {
- #define GEN_PASS_DEF_STABLEHLOFUSINGPASS
- #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h.inc"
-@@ -432,6 +437,7 @@
-     patterns.add<ConcatenateToBroadcastInDimFusionPattern>(&getContext());
-     patterns.add<ReshapeGatherFusionPattern>(&getContext());
-     patterns.add<CollapseRowScatterPattern>(&getContext());
-+    mlir::tt::populateWideReductionPatterns(patterns);
+ //===----------------------------------------------------------------------===//
+ // Pipeline implementation.
+@@ -146,6 +151,10 @@
+   // Close tensor shardings as analysis is complete.
+   pm.addPass(mlir::sdy::createCloseShardingsPass());
  
-     GreedyRewriteConfig config;
-     config.setUseTopDownTraversal(true);
++  // Reduce tall, thin tensors over full tiles of their transpose, on the
++  // device-local shapes sharding settled on.
++  pm.addPass(mlir::tt::createWideReductionsPass());
++
+   // Run canonicalizer pass.
+   pm.addPass(mlir::createCanonicalizerPass());
+ }
