@@ -1,0 +1,247 @@
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -265,11 +265,20 @@
+ namespace {
+ struct DotGeneralToMatmulConversionPattern
+     : public OpConversionPattern<ttir::DotGeneralOp> {
+-  using OpConversionPattern<ttir::DotGeneralOp>::OpConversionPattern;
++  DotGeneralToMatmulConversionPattern(const TypeConverter &typeConverter,
++                                      MLIRContext *context)
++      : OpConversionPattern<ttir::DotGeneralOp>(typeConverter, context) {
++    // dropUnitDims leaves a dot without size-1 dims for this pattern.
++    setHasBoundedRewriteRecursion();
++  }
+ 
+   LogicalResult
+   matchAndRewrite(ttir::DotGeneralOp op, OpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
++    if (Value squeezed = dropUnitDims(op, adaptor, rewriter)) {
++      rewriter.replaceOp(op, squeezed);
++      return success();
++    }
+     if (Value reduced = strengthReduce(op, adaptor, rewriter)) {
+       rewriter.replaceOp(op, reduced);
+       return success();
+@@ -425,6 +434,130 @@
+   }
+ 
+ private:
++  // A size-1 dimension that the dot keeps or contracts takes no part in the
++  // matmul, but an operand's permute moves it with the others, and TTNN pads
++  // a size-1 second-to-last dimension to a whole tile: the query of
++  // jax.nn.dot_product_attention, [B, T, N, 1, H] with groups of one head, is
++  // permuted to [B, N, T, 1, H], 32 times its size. When a permuted operand
++  // has such dimensions, the dot is rebuilt without them, between reshapes
++  // that drop and restore them. Each operand keeps at least one of its kept
++  // and contracted dimensions, so the rebuilt dot is the same kind of
++  // product. Returns the result, or null when the dot is not rebuilt.
++  Value dropUnitDims(ttir::DotGeneralOp op, OpAdaptor adaptor,
++                     ConversionPatternRewriter &rewriter) const {
++    Value lhs = adaptor.getLhs();
++    Value rhs = adaptor.getRhs();
++    auto lhsType = mlir::cast<RankedTensorType>(lhs.getType());
++    auto rhsType = mlir::cast<RankedTensorType>(rhs.getType());
++    SmallVector<int64_t> lhsBatchDims(op.getBatchDimsLhs());
++    SmallVector<int64_t> rhsBatchDims(op.getBatchDimsRhs());
++    SmallVector<int64_t> lhsContractDims(op.getContractDimsLhs());
++    SmallVector<int64_t> rhsContractDims(op.getContractDimsRhs());
++    SmallVector<int64_t> lhsFreeDims =
++        getResultDims(lhsBatchDims, lhsContractDims, lhsType.getRank());
++    SmallVector<int64_t> rhsFreeDims =
++        getResultDims(rhsBatchDims, rhsContractDims, rhsType.getRank());
++
++    auto isUnit = [](RankedTensorType type) {
++      return [type](int64_t d) { return type.getDimSize(d) == 1; };
++    };
++    SmallVector<int64_t> lhsDropped;
++    SmallVector<int64_t> rhsDropped;
++    if (!llvm::all_of(lhsFreeDims, isUnit(lhsType))) {
++      llvm::copy_if(lhsFreeDims, std::back_inserter(lhsDropped),
++                    isUnit(lhsType));
++    }
++    if (!llvm::all_of(rhsFreeDims, isUnit(rhsType))) {
++      llvm::copy_if(rhsFreeDims, std::back_inserter(rhsDropped),
++                    isUnit(rhsType));
++    }
++    if (!llvm::all_of(lhsContractDims, isUnit(lhsType))) {
++      for (auto [l, r] : llvm::zip_equal(lhsContractDims, rhsContractDims)) {
++        if (lhsType.getDimSize(l) == 1) {
++          lhsDropped.push_back(l);
++          rhsDropped.push_back(r);
++        }
++      }
++    }
++    auto isPermuted = [](ArrayRef<int64_t> permutation) {
++      return !llvm::equal(permutation,
++                          llvm::seq<int64_t>(0, permutation.size()));
++    };
++    const bool lhsPermuted =
++        !lhsDropped.empty() &&
++        isPermuted(getPermutation(lhsBatchDims, lhsFreeDims, lhsContractDims));
++    const bool rhsPermuted =
++        !rhsDropped.empty() &&
++        isPermuted(getPermutation(rhsBatchDims, rhsContractDims, rhsFreeDims));
++    if (!lhsPermuted && !rhsPermuted) {
++      return nullptr;
++    }
++
++    // An operand's shape without its dropped dimensions, and the new index
++    // of each of the others.
++    auto squeeze = [&](Value value, RankedTensorType type,
++                       ArrayRef<int64_t> dropped,
++                       SmallVector<int64_t> &newIndex) -> Value {
++      SmallVector<int64_t> shape;
++      for (int64_t d = 0; d < type.getRank(); ++d) {
++        newIndex.push_back(shape.size());
++        if (!llvm::is_contained(dropped, d)) {
++          shape.push_back(type.getDimSize(d));
++        }
++      }
++      if (dropped.empty()) {
++        return value;
++      }
++      return ttir::utils::createReshapeOp(
++          rewriter,
++          ttmlir::utils::appendLocationSuffix(op.getLoc(), "_dropUnitDims"),
++          value, shape);
++    };
++    SmallVector<int64_t> lhsIndex;
++    SmallVector<int64_t> rhsIndex;
++    Value newLhs = squeeze(lhs, lhsType, lhsDropped, lhsIndex);
++    Value newRhs = squeeze(rhs, rhsType, rhsDropped, rhsIndex);
++    auto remap = [](ArrayRef<int64_t> dims, ArrayRef<int64_t> index) {
++      return llvm::map_to_vector(dims, [&](int64_t d) { return index[d]; });
++    };
++    SmallVector<int64_t> newLhsContractDims;
++    SmallVector<int64_t> newRhsContractDims;
++    for (auto [l, r] : llvm::zip_equal(lhsContractDims, rhsContractDims)) {
++      if (!llvm::is_contained(lhsDropped, l)) {
++        newLhsContractDims.push_back(lhsIndex[l]);
++        newRhsContractDims.push_back(rhsIndex[r]);
++      }
++    }
++
++    // The dot's result is [batch dims, lhs's kept dims, rhs's kept dims].
++    auto resultType = mlir::cast<RankedTensorType>(op.getType());
++    SmallVector<int64_t> newShape;
++    for (int64_t d : lhsBatchDims) {
++      newShape.push_back(lhsType.getDimSize(d));
++    }
++    for (int64_t d : lhsFreeDims) {
++      if (!llvm::is_contained(lhsDropped, d)) {
++        newShape.push_back(lhsType.getDimSize(d));
++      }
++    }
++    for (int64_t d : rhsFreeDims) {
++      if (!llvm::is_contained(rhsDropped, d)) {
++        newShape.push_back(rhsType.getDimSize(d));
++      }
++    }
++    auto newDot = rewriter.create<ttir::DotGeneralOp>(
++        op.getLoc(),
++        RankedTensorType::get(newShape, resultType.getElementType(),
++                              resultType.getEncoding()),
++        newLhs, newRhs, remap(lhsBatchDims, lhsIndex), newLhsContractDims,
++        remap(rhsBatchDims, rhsIndex), newRhsContractDims);
++    newDot->setDiscardableAttrs(op->getDiscardableAttrDictionary());
++    return ttir::utils::createReshapeOp(
++        rewriter,
++        ttmlir::utils::appendLocationSuffix(op.getLoc(), "_restoreUnitDims"),
++        newDot, resultType.getShape());
++  }
++
+   // XLA's dot strength reduction (AlgebraicSimplifier::HandleDot): when one
+   // operand, V, has only batch and contracting dimensions, the dot is V
+   // broadcast over the other operand A, multiplied and summed over the
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -4333,6 +4333,77 @@
+   }
+ };
+ 
++// permute(reshape(x)) -> reshape(permute(x)) when the reshape only inserts or
++// removes size-1 dims and x has fewer tiles than the reshape's result, such as
++// a matmul's [B, N, T, H] result restored to [B, N, T, 1, H]: the permute then
++// moves x's tiles instead of the padded ones. x's own size-1 dims go first.
++class SinkReshapeThroughPermutePattern
++    : public mlir::OpRewritePattern<PermuteOp> {
++  using mlir::OpRewritePattern<PermuteOp>::OpRewritePattern;
++
++public:
++  mlir::LogicalResult
++  matchAndRewrite(PermuteOp permute,
++                  mlir::PatternRewriter &rewriter) const final {
++    auto reshape = permute.getInput().getDefiningOp<ReshapeOp>();
++    if (!reshape || !reshape->hasOneUse()) {
++      return mlir::failure();
++    }
++    Value input = reshape.getInput();
++    auto inputType = mlir::cast<RankedTensorType>(input.getType());
++    auto reshapedType = mlir::cast<RankedTensorType>(reshape.getType());
++    if (tileCount(inputType) >= tileCount(reshapedType)) {
++      return mlir::failure();
++    }
++    auto nonUnitDims = [](RankedTensorType type) {
++      SmallVector<int64_t> dims;
++      for (int64_t d = 0; d < type.getRank(); ++d) {
++        if (type.getDimSize(d) != 1) {
++          dims.push_back(d);
++        }
++      }
++      return dims;
++    };
++    SmallVector<int64_t> inputDims = nonUnitDims(inputType);
++    SmallVector<int64_t> reshapedDims = nonUnitDims(reshapedType);
++    if (!llvm::equal(
++            llvm::map_range(inputDims,
++                            [&](int64_t d) { return inputType.getDimSize(d); }),
++            llvm::map_range(reshapedDims, [&](int64_t d) {
++              return reshapedType.getDimSize(d);
++            }))) {
++      return mlir::failure();
++    }
++
++    SmallVector<int64_t> permutation;
++    for (int64_t d = 0; d < inputType.getRank(); ++d) {
++      if (inputType.getDimSize(d) == 1) {
++        permutation.push_back(d);
++      }
++    }
++    for (int64_t d : permute.getPermutation()) {
++      if (const auto *it = llvm::find(reshapedDims, d);
++          it != reshapedDims.end()) {
++        permutation.push_back(inputDims[it - reshapedDims.begin()]);
++      }
++    }
++    if (!llvm::equal(permutation,
++                     llvm::seq<int64_t>(0, inputType.getRank()))) {
++      input = rewriter.create<PermuteOp>(
++          permute.getLoc(),
++          RankedTensorType::get(
++              ttmlir::utils::applyPermutation(inputType.getShape(),
++                                              permutation),
++              inputType.getElementType(), inputType.getEncoding()),
++          input, permutation);
++    }
++    rewriter.replaceOp(permute,
++                       utils::createReshapeOp(rewriter, permute.getLoc(), input,
++                                              permute.getType().getShape()));
++    return mlir::success();
++  }
++};
++
+ class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
+ public:
+   using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
+@@ -4421,7 +4492,8 @@
+       // After the fusions, which match the graph as the frontend wrote it.
+       RewritePatternSet patterns(&getContext());
+       patterns.add<HoistReshapeToFewerTilesPattern,
+-                   SinkReshapeToFewerTilesPattern>(&getContext());
++                   SinkReshapeToFewerTilesPattern,
++                   SinkReshapeThroughPermutePattern>(&getContext());
+       (void)applyPatternsGreedily(getOperation(), std::move(patterns));
+     }
+   }
