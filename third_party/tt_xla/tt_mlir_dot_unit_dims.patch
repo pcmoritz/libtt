@@ -15,7 +15,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
          rewriter,
          ttmlir::utils::appendLocationSuffix(op.getLoc(), "_permuteRhs"), rhs,
          rhsType, rhsPermutation);
-@@ -610,6 +610,41 @@
+@@ -610,6 +610,40 @@
      return permuteOp;
    }
  
@@ -42,8 +42,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +      }
 +    }
 +    // The matmul reshape alone puts the elements in this order.
-+    if (llvm::equal(compactPermutation,
-+                    llvm::seq<int64_t>(0, compactPermutation.size()))) {
++    if (llvm::is_sorted(compactPermutation)) {
 +      return input;
 +    }
 +    if (compactShape.size() != static_cast<size_t>(inputType.getRank())) {
@@ -60,7 +59,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -4333,6 +4333,77 @@
+@@ -4333,6 +4333,76 @@
    }
  };
  
@@ -118,8 +117,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +        permutation.push_back(inputDims[it - reshapedDims.begin()]);
 +      }
 +    }
-+    if (!llvm::equal(permutation,
-+                     llvm::seq<int64_t>(0, inputType.getRank()))) {
++    if (!llvm::is_sorted(permutation)) {
 +      input = rewriter.create<PermuteOp>(
 +          permute.getLoc(),
 +          RankedTensorType::get(
@@ -138,7 +136,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -4421,7 +4492,8 @@
+@@ -4421,7 +4491,8 @@
        // After the fusions, which match the graph as the frontend wrote it.
        RewritePatternSet patterns(&getContext());
        patterns.add<HoistReshapeToFewerTilesPattern,
