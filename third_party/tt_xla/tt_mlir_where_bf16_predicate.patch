@@ -1,0 +1,18 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -537,6 +537,14 @@
+     }
+   }
+ 
++  // A BFloat16 predicate needs no cast: beside 32-bit values, where switches
++  // Dest to 32 bits and runs its Float32 variant (tenstorrent/tt-metal#60282),
++  // which tests the predicate and moves the values as raw bits. Casting cost a
++  // pass over the predicate, as wide as the values, per where.
++  if (predicateElementType.isBF16()) {
++    predicateTypeWorkaround = TTNNOperandWorkarounds();
++  }
++
+   return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+       .addInputOperandWorkaround(predicateTypeWorkaround)
+       .addInputOperandWorkaround(inputTypeWorkaround)
