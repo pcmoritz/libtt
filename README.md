@@ -122,10 +122,13 @@ Bazel gives tests a fresh home directory, so tt-metal rebuilds its kernel cache
 in every run. Add `--test_env=TT_METAL_CACHE=$HOME/.cache` to reuse
 `~/.cache/tt-metal-cache` instead.
 
-Baseline (October 2026, main ffc8122, one Blackhole p150a): **101 of 192 files
-passed; 6052 passed, 2963 failed, 14 errors, 240 skipped, 12900 subtests
+Baseline (October 2026, main 089f386, one Blackhole p150a): **106 of 193 files
+passed; 3964 passed, 1112 failed, 14 errors, 163 skipped, 12542 subtests
 passed**, in about an hour. Most failures are multi-device, TPU-only or
-dynamic-shape tests.
+dynamic-shape tests. Three files abort, which loses the results of their
+remaining tests: `ops_unit_test.py` runs out of device memory in
+`test_random_distribution`, and `dynamism/compile_test.py` and
+`dynamism/dynamic_slice_test.py` hit an LLVM error.
 
 ## libtt tests
 
