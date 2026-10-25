@@ -662,6 +662,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_rng_bit_generator.patch",
         "//third_party/tt_xla:tt_mlir_where_bf16_predicate.patch",
         "//third_party/tt_xla:tt_mlir_dot_unit_dims.patch",
+        "//third_party/tt_xla:tt_mlir_permute_matmul_transposes.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
