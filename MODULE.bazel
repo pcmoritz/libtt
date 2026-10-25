@@ -429,7 +429,10 @@ http_archive(
     name = "stablehlo",
     sha256 = "f1620aafc2b6d730e2ee9c33b35a59a2656a11eed10b1ef8049f175eb4fbdd9c",
     patch_args = ["-p1"],
-    patches = ["//third_party/stablehlo:stablehlo_composite_v2.patch"],
+    patches = [
+        "//third_party/stablehlo:stablehlo_composite_v2.patch",
+        "//third_party/stablehlo:stablehlo_concatenate_bounds.patch",
+    ],
     strip_prefix = "stablehlo-0a4440a5c8de45c4f9649bf3eb4913bf3f97da0d",
     urls = [
         "https://github.com/openxla/stablehlo/archive/0a4440a5c8de45c4f9649bf3eb4913bf3f97da0d.zip",
@@ -481,6 +484,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_host_memory_allocator.patch",
         "//third_party/tt_xla:tt_xla_compile_exceptions.patch",
         "//third_party/tt_xla:tt_xla_uint64_buffers.patch",
+        "//third_party/tt_xla:tt_xla_execute_exceptions.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )

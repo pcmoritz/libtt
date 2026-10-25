@@ -1,0 +1,21 @@
+diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
+@@ -591,7 +591,16 @@
+   static std::mutex execution_mutex;
+   const std::lock_guard<std::mutex> lock(execution_mutex);
+ 
+-  tt_pjrt_status status = instance->execute(args);
++  tt_pjrt_status status;
++  // Execution can fail with an exception, e.g. when the device runs out of
++  // memory while converting an input's layout. As for compilation, it must not
++  // escape the C API, where it would terminate the process.
++  try {
++    status = instance->execute(args);
++  } catch (const std::exception &error) {
++    return *ErrorInstance::makeError(tt_pjrt_status::kInternal, error.what())
++                .release();
++  }
+   if (auto error = ErrorInstance::makeError(status)) {
+     return *error.release();
+   }
