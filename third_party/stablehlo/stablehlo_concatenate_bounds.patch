@@ -1,0 +1,32 @@
+diff --git a/stablehlo/dialect/TypeInference.cpp b/stablehlo/dialect/TypeInference.cpp
+--- a/stablehlo/dialect/TypeInference.cpp
++++ b/stablehlo/dialect/TypeInference.cpp
+@@ -2071,12 +2071,18 @@
+   // Any dim size can keep unchanged when concatenated with 0
+   inferredSizes[dimension] = 0;
+   bool anyInputHaveBounds = false;
++  Attribute prototype = witnessType.getEncoding();
+ 
+   for (const auto& it : llvm::enumerate(inputTypes)) {
+     RankedTensorType rankedType = cast<RankedTensorType>(it.value());
+     SmallVector<int64_t> bounds;
+     bounds = to_vector(encodingToBounds(rankedType.getEncoding()));
+-    if (!bounds.empty()) anyInputHaveBounds = true;
++    if (!bounds.empty() && !anyInputHaveBounds) {
++      // The result's bounds take their dialect from this operand's encoding:
++      // a static first operand has none.
++      prototype = rankedType.getEncoding();
++      anyInputHaveBounds = true;
++    }
+ 
+     for (int dim = 0; dim < rank; ++dim) {
+       std::pair<int64_t, int64_t> inferredDimAndBound;
+@@ -2102,7 +2108,7 @@
+   inferredReturnTypes.push_back(RankedTensorType::get(
+       inferredSizes, witnessType.getElementType(),
+       boundsToEncoding(
+-          witnessType.getEncoding(),
++          prototype,
+           // Empty array as argument is an indicator to boundsToEncoding() that
+           // there are no bounds at all in inputs, thus sparsity attributes will
+           // be included in the return type
