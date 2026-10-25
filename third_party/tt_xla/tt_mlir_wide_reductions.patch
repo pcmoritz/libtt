@@ -1,0 +1,26 @@
+diff --git a/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp b/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp
+--- a/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp
++++ b/lib/Dialect/StableHLO/Pipelines/StableHLOPipelines.cpp
+@@ -10,6 +10,11 @@
+ #include "mlir/Transforms/Passes.h"
+ #include "stablehlo/transforms/optimization/Passes.h"
+ 
++namespace mlir::tt {
++// Defined in libtt's tt_mlir/lib/Dialect/StableHLO/Transforms/WideReductions.cpp.
++std::unique_ptr<Pass> createWideReductionsPass();
++} // namespace mlir::tt
++
+ namespace mlir::tt::stablehlo {
+ //===----------------------------------------------------------------------===//
+ // Pipeline implementation.
+@@ -146,6 +151,10 @@
+   // Close tensor shardings as analysis is complete.
+   pm.addPass(mlir::sdy::createCloseShardingsPass());
+ 
++  // Reduce tall, thin tensors over full tiles of their transpose, on the
++  // device-local shapes sharding settled on.
++  pm.addPass(mlir::tt::createWideReductionsPass());
++
+   // Run canonicalizer pass.
+   pm.addPass(mlir::createCanonicalizerPass());
+ }
