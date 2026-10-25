@@ -205,7 +205,7 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
       // as b after the next iteration overwrote it.
       auto &wrapper =
           bodyOutputs[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN);
-      if (wrapper.isTraceSlot()) {
+      if (wrapper.isTraceOutput()) {
         bodyOutputs[i] = ::tt::runtime::ttnn::utils::createRuntimeTensorFromTTNN(
             ::ttnn::clone(wrapper.getTensor(), std::nullopt, std::nullopt,
                           std::nullopt));

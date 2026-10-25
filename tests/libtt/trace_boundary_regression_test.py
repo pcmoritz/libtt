@@ -17,10 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
-VOCAB = 151936
-rng = np.random.default_rng(0)
-WEIGHT = (rng.standard_normal((1024, 1024)) * 0.03).astype(np.float32)
-SCALE = rng.standard_normal((1, VOCAB)).astype(np.float32)
+SOURCE = (np.arange(64 * 32, dtype=np.float32).reshape(64, 32) % 7) - 3
 
 
 def _jit(fn):
@@ -31,73 +28,27 @@ def _put(value):
     return jax.device_put(np.asarray(value), jax.devices("tt")[0])
 
 
-def _model(x, w):
-    h = x
-    for _ in range(4):
-        h = jnp.tanh(h @ w)
-    return h
+def test_values_cross_conditionals_between_traces():
+    # A trace before the conditional, whose result is also a program output,
+    # an eager conditional whose false branch passes its operand through, and
+    # a trace after it.
+    def step(x, pred):
+        y = x * 2 + 1
+        z = lax.cond(pred, lambda v: -v, lambda v: v, y)
+        return y, z + 3
 
-
-def _logits(h, scale):
-    return h[:, :1] * scale
-
-
-def _reference(x, pred, penalize):
-    h = x
-    for _ in range(4):
-        h = np.tanh(h @ WEIGHT)
-    logits = h[:, :1] * SCALE
-    if penalize:
-        logits = logits - 1.0
-    token = np.argmax(logits, axis=-1) if pred else np.argmin(logits, axis=-1)
-    return h, token
-
-
-def _step(x, w, scale, pred, penalize):
-    # The sampler's shape: traced model work, then conditionals over the
-    # vocabulary-sized logits (the first passes them through unchanged when
-    # off), then traced work after them.
-    h = _model(x, w)
-    logits = lax.cond(penalize, lambda l: l - 1.0, lambda l: l, _logits(h, scale))
-    token = lax.cond(
-        pred, lambda l: jnp.argmax(l, axis=-1), lambda l: jnp.argmin(l, axis=-1), logits
-    )
-    return h, token
-
-
-def test_conditionals_between_traces_take_either_branch():
-    step = _jit(_step)
-    x, w, scale = _put(rng.standard_normal((1, 1024)).astype(np.float32)), _put(WEIGHT), _put(SCALE)
+    step = _jit(step)
     bools = {value: _put(np.bool_(value)) for value in (False, True)}
-    # Alternating predicates exercise both branch programs, and the following
-    # trace is fed from either the pass-through branch's published slot or the
-    # penalty branch's fresh output.
-    for pred, penalize in [
-        (True, False),
-        (False, False),
-        (True, True),
-        (False, True),
-        (True, False),
-        (False, True),
-    ]:
-        h, token = step(x, w, scale, bools[pred], bools[penalize])
-        h_ref, token_ref = _reference(np.asarray(x), pred, penalize)
-        np.testing.assert_allclose(np.asarray(h), h_ref, rtol=1e-2, atol=5e-3)
-        assert int(np.asarray(token)[0]) == int(token_ref[0])
-
-
-def test_outputs_outlive_the_next_call():
-    # A program output that is a trace's output slot is copied on the way out,
-    # so the next invocation's replay (which rewrites the slot) leaves it alone.
-    step = _jit(_step)
-    w, scale, true = _put(WEIGHT), _put(SCALE), _put(np.bool_(True))
-    false = _put(np.bool_(False))
-    xs = [rng.standard_normal((1, 1024)).astype(np.float32) for _ in range(3)]
-    results = [step(_put(x), w, scale, true, false) for x in xs]
-    for x, (h, token) in zip(xs, results):
-        h_ref, token_ref = _reference(x, True, False)
-        np.testing.assert_allclose(np.asarray(h), h_ref, rtol=1e-2, atol=5e-3)
-        assert int(np.asarray(token)[0]) == int(token_ref[0])
+    calls = []
+    for k, pred in enumerate([True, False, False, True, True, False]):
+        x = SOURCE + k
+        calls.append((x, pred, step(_put(x), bools[pred])))
+    # Checked only after the last call: every result must have outlived the
+    # later replays that rewrote the slots it was published from.
+    for x, pred, (y, z) in calls:
+        expected = x * 2 + 1
+        np.testing.assert_array_equal(np.asarray(y), expected)
+        np.testing.assert_array_equal(np.asarray(z), (-expected if pred else expected) + 3)
 
 
 def test_loop_body_with_a_conditional_carries_its_values():
@@ -113,10 +64,9 @@ def test_loop_body_with_a_conditional_carries_its_values():
         return lax.fori_loop(0, count, body, (x, x * 2))
 
     run = _jit(run)
-    source = (np.arange(64 * 32, dtype=np.float32).reshape(64, 32) % 7) - 3
-    x = _put(source)
+    x = _put(SOURCE)
     for count in (3, 1, 4, 0, 2):
-        a, b = source, source * 2
+        a, b = SOURCE, SOURCE * 2
         for i in range(count):
             a = a * 2.0 if i % 2 == 0 else a + 1.0
             a, b = a + b, a
@@ -126,17 +76,35 @@ def test_loop_body_with_a_conditional_carries_its_values():
 
 
 def test_conditionals_cost_one_pass_over_the_logits():
-    # Per step, two conditionals over the logits cost about 300 us when each
-    # boundary copied the logits twice, and about 200 us with the one copy
-    # into the next trace's input slot that remains.
+    # The sampler's shape: traced model work, then conditionals over the
+    # vocabulary-sized logits (the first passes them through unchanged when
+    # off), then traced work after them. Per step, two such conditionals cost
+    # about 300 us when each boundary copied the logits twice, and about
+    # 200 us with the one copy into the next trace's input slot that remains.
+    vocab = 151936
+    rng = np.random.default_rng(0)
+    weight = (rng.standard_normal((1024, 1024)) * 0.03).astype(np.float32)
+    scale = rng.standard_normal((1, vocab)).astype(np.float32)
+
+    def model(x, w):
+        for _ in range(4):
+            x = jnp.tanh(x @ w)
+        return x
+
     def with_conds(x, w, scale, pred, penalize):
-        return _step(x, w, scale, pred, penalize)
+        h = model(x, w)
+        logits = lax.cond(penalize, lambda l: l - 1.0, lambda l: l, h[:, :1] * scale)
+        token = lax.cond(
+            pred, lambda l: jnp.argmax(l, axis=-1), lambda l: jnp.argmin(l, axis=-1), logits
+        )
+        return h, token
 
     def without(x, w, scale, pred, penalize):
-        h = _model(x, w)
-        return h, jnp.argmax(_logits(h, scale), axis=-1)
+        h = model(x, w)
+        return h, jnp.argmax(h[:, :1] * scale, axis=-1)
 
-    x, w, scale = _put(rng.standard_normal((1, 1024)).astype(np.float32)), _put(WEIGHT), _put(SCALE)
+    x = _put(rng.standard_normal((1, 1024)).astype(np.float32))
+    w, scale = _put(weight), _put(scale)
     true, false = _put(np.bool_(True)), _put(np.bool_(False))
 
     def per_step(fn, steps=50):

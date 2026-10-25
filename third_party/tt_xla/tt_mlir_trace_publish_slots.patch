@@ -1,25 +1,27 @@
 diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/include/tt/runtime/detail/ttnn/types/types.h
 --- a/runtime/include/tt/runtime/detail/ttnn/types/types.h
 +++ b/runtime/include/tt/runtime/detail/ttnn/types/types.h
-@@ -79,6 +79,13 @@ public:
+@@ -79,6 +79,15 @@ public:
      constEvalOutput.store(true, std::memory_order_relaxed);
    }
  
-+  // A persistent slot of a captured trace, which every replay of that trace
++  // An output slot of a captured trace, which every replay of that trace
 +  // overwrites. Traces publish their output slots as they are; a value that
 +  // outlives the invocation (a program output, a loop carry) is copied where
 +  // it escapes.
-+  bool isTraceSlot() const { return traceSlot.load(std::memory_order_relaxed); }
-+  void markTraceSlot() { traceSlot.store(true, std::memory_order_relaxed); }
++  bool isTraceOutput() const {
++    return traceOutput.load(std::memory_order_relaxed);
++  }
++  void markTraceOutput() { traceOutput.store(true, std::memory_order_relaxed); }
 +
    uint64_t getVersion() const {
      return version.load(std::memory_order_relaxed);
    }
-@@ -110,6 +117,8 @@ private:
+@@ -110,6 +119,8 @@ private:
    // Constant-cache storage must be copied before returning it to the caller.
    std::atomic<bool> constEvalOutput{false};
  
-+  std::atomic<bool> traceSlot{false};
++  std::atomic<bool> traceOutput{false};
 +
    static uint64_t getLatestVersion();
  
@@ -27,21 +29,21 @@ diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/incl
 diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 --- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 +++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
-@@ -109,9 +109,10 @@ allocateTraceSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
-     const bool callerOwnedDeviceInput =
-         i < op->inputs()->size() && isDeviceResidentInput(op, i);
-     if (!callerOwnedDeviceInput) {
--      slots[i]
--          .as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN)
--          .setRetain(true);
-+      auto &wrapper =
-+          slots[i].as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN);
-+      wrapper.setRetain(true);
-+      wrapper.markTraceSlot();
+@@ -114,6 +114,13 @@ allocateTraceSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+           .setRetain(true);
      }
    }
++  // Output slots are published as they are (publishTraceOutputs); the flag
++  // tells the places a value escapes to copy it.
++  for (size_t i = op->inputs()->size(); i < slots.size(); ++i) {
++    slots[i]
++        .as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN)
++        .markTraceOutput();
++  }
  
-@@ -193,11 +194,13 @@ updateTraceInputSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+   return slots;
+ }
+@@ -193,11 +200,13 @@ updateTraceInputSlots(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
    }
  }
  
@@ -60,7 +62,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
  static void
  publishTraceOutputs(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
                      ProgramContext &context,
-@@ -206,13 +209,8 @@ publishTraceOutputs(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -206,13 +215,8 @@ publishTraceOutputs(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
               "Mismatched number of outputs, expected: ", op->outputs()->size(),
               " got: ", outputSlots.size());
    for (size_t i = 0; i < op->outputs()->size(); i++) {
@@ -95,7 +97,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
      const auto &wrapper = output.as<TTNNTensorWrapper>(DeviceRuntime::TTNN);
      const auto &tensor = wrapper.getTensor();
 -    if (wrapper.isConstEvalOutput() &&
-+    if ((wrapper.isConstEvalOutput() || wrapper.isTraceSlot()) &&
++    if ((wrapper.isConstEvalOutput() || wrapper.isTraceOutput()) &&
          tensor.storage_type() == ::ttnn::StorageType::DEVICE) {
        output = utils::createRuntimeTensorFromTTNN(
            ::ttnn::clone(tensor, std::nullopt, std::nullopt, std::nullopt));
