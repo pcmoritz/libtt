@@ -661,6 +661,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_case_selector_in_outlined_program.patch",
         "//third_party/tt_xla:tt_mlir_rng_bit_generator.patch",
         "//third_party/tt_xla:tt_mlir_where_bf16_predicate.patch",
+        "//third_party/tt_xla:tt_mlir_dot_unit_dims.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
