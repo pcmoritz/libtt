@@ -21,14 +21,14 @@ namespace {
 class NestedProgramTensorRetention {
 public:
   explicit NestedProgramTensorRetention(
-      std::vector<::tt::runtime::Tensor> &tensors)
-      : tensors(tensors), originalTensors(tensors) {
+      const std::vector<::tt::runtime::Tensor> &tensors)
+      : originalTensors(tensors) {
     originalRetain.reserve(tensors.size());
     for (const auto &tensor : tensors) {
       originalRetain.push_back(
           tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).shouldRetain());
     }
-    for (auto &tensor : tensors) {
+    for (auto &tensor : originalTensors) {
       retain(tensor);
     }
   }
@@ -52,9 +52,10 @@ public:
     if (restored) {
       return;
     }
-    for (size_t i = 0; i < tensors.size(); ++i) {
-      tensors[i].as<TTNNTensorWrapper>(DeviceRuntime::TTNN).setRetain(
-          originalRetain[i]);
+    // Loop state slots can be replaced by different tensors, including cached
+    // constants. Restore flags on the tensors we retained, never on whatever
+    // now occupies their old slots.
+    for (size_t i = 0; i < originalTensors.size(); ++i) {
       originalTensors[i]
           .as<TTNNTensorWrapper>(DeviceRuntime::TTNN)
           .setRetain(originalRetain[i]);
@@ -63,7 +64,6 @@ public:
   }
 
 private:
-  std::vector<::tt::runtime::Tensor> &tensors;
   std::vector<::tt::runtime::Tensor> originalTensors;
   std::vector<bool> originalRetain;
   bool restored = false;
@@ -164,6 +164,9 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
   };
 
   auto execute = [&](uint32_t programId) {
+    // Protect the current iteration's values only for the nested call. This
+    // also preserves the ownership flags of constants returned by the body.
+    NestedProgramTensorRetention iterationRetention(inputs);
     ProgramExecutor program(context.getDeviceHandle(),
                             context.getExecutableHandle(), programId, inputs,
                             /*constEvalProgram=*/false);
@@ -178,7 +181,6 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
       uint32_t stateIndex = op->output_indices()->Get(i);
       LOG_ASSERT(stateIndex < stateSize,
                  "While loop output index is out of range");
-      retention.retain(bodyOutputs[i]);
       inputs[stateIndex] = std::move(bodyOutputs[i]);
     }
   };
