@@ -221,12 +221,11 @@ public:
   StringRef getArgument() const final { return "tt-wide-reductions"; }
 
   void runOnOperation() final {
-    SmallVector<shlo::ReduceOp> reduces;
-    getOperation().walk([&](shlo::ReduceOp op) { reduces.push_back(op); });
+    // The rewrite neither moves nor erases reductions, and creates none.
     IRRewriter rewriter(&getContext());
-    for (shlo::ReduceOp reduceOp : reduces) {
+    getOperation().walk([&](shlo::ReduceOp reduceOp) {
       rewriteTallReduction(rewriter, reduceOp);
-    }
+    });
   }
 };
 
