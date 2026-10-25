@@ -49,17 +49,3 @@ diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_
              }
              v_endif;
          }
-diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
---- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-@@ -60,7 +60,9 @@ bool is_binary_sfpu_op(BinaryOpType val, DataType a, DataType b, bool fast_and_a
-         case SQUARED_DIFFERENCE: return a == b && (a == FLOAT32 || a == INT32 || a == UINT32 || a == UINT16);
-         case MUL:
-             return !fast_and_approximate_mode || (a == b && (a == FLOAT32 || a == INT32 || a == UINT32 || a == UINT16));
--        case DIV: return !fast_and_approximate_mode || (a == FLOAT32 && b == FLOAT32) || (a == INT32 && b == INT32);
-+        case DIV:
-+            return !fast_and_approximate_mode || (a == FLOAT32 && b == FLOAT32) || (a == INT32 && b == INT32) ||
-+                   (a == b && (a == FLOAT16 || a == BFLOAT16) && output == a);
-         case LOGADDEXP:
-         case LOGADDEXP2:
-         case LDEXP:
