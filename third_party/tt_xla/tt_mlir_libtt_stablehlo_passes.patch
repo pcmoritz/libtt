@@ -1,25 +1,28 @@
 diff --git a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
 --- a/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
 +++ b/lib/Dialect/TTIR/Pipelines/TTIRPipelines.cpp
-@@ -44,6 +44,11 @@
+@@ -44,6 +44,13 @@
  #include "mlir/Dialect/MemRef/Transforms/Passes.h"
  #include "ttmlir/Conversion/TTIRToLinalg/TTIRToLinalg.h"
  
 +namespace mlir::tt {
 +// libtt's third_party/tt_xla/tt_mlir_control_flow.cpp.
 +std::unique_ptr<Pass> createExpandSwitchesOverFlagsPass();
++// libtt's tt_mlir/lib/Dialect/StableHLO/Transforms/DenseWideRows.cpp.
++std::unique_ptr<Pass> createDenseWideRowsPass();
 +} // namespace mlir::tt
 +
  namespace mlir::tt::ttir {
  //===----------------------------------------------------------------------===//
  // Pipeline implementation.
-@@ -85,6 +90,10 @@
+@@ -85,6 +92,11 @@
    }
    pm.addPass(mlir::createInlinerPass());
  
 +  // While conditionals are still regions: a switch over flags as conditionals
-+  // on them.
++  // on them, and a few vocabulary-sized rows as [..., H, W / 32, 32].
 +  pm.addPass(mlir::tt::createExpandSwitchesOverFlagsPass());
++  pm.addPass(mlir::tt::createDenseWideRowsPass());
 +
    ttir::ConvertStableHLOToTTIROptions passOptions;
    passOptions.enablePartialConversion = options.enableCPUFallback;
