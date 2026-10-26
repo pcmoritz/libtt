@@ -381,6 +381,7 @@ http_archive(
         "//third_party/tt_metal:permute_rm_one_byte.patch",
         "//third_party/tt_metal:pow_int32.patch",
         "//third_party/tt_metal:batch_norm_training_statistics.patch",
+        "//third_party/tt_metal:matmul_float16_fp32_accumulation.patch",
     ],
     sha256 = "f87dc8d21a6ec02280643543dde9a2633d771ceaad819b00ff493922f1e139c8",
     strip_prefix = "tt-metal-614f605ffe2977715adc198156c72bea14c2bae6",

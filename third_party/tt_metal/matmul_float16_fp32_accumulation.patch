@@ -1,0 +1,24 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+@@ -3208,6 +3208,11 @@ MatmulParams create_matmul_attributes(
+         }
+     }
+     bool is_float_32 = output_dtype == DataType::FLOAT32;
++    // Without FP32 accumulation, the factories spill partials between K blocks as Float16_b, whose exponent is
++    // wider than Float16's: Float16 inputs then fail the kernel's exponent-format check, and a Float16 output is
++    // packed from a Float16_b Dst as if it held Float16. Accumulate float16 matmuls in FP32, like XLA on GPU.
++    const bool float16 = output_dtype == DataType::FLOAT16 || input_tensor_a.dtype() == DataType::FLOAT16 ||
++                         input_tensor_b.dtype() == DataType::FLOAT16;
+     // A decode matmul (one tile row of activations) accumulates in FP32 on Blackhole. At one tile row it takes no
+     // longer, its error is about 2.4x smaller (the BF16 Dst sums lose bits), and the K block no longer changes the
+     // result, so the 1D planner may size the block for DRAM bandwidth (get_mcast_1d_config). A caller's program
+@@ -3221,7 +3226,7 @@ MatmulParams create_matmul_attributes(
+         parameters.compute_kernel_config,
+         math_fidelity,
+         /*default_approx_mode=*/false,
+-        /*default_fp32_acc=*/is_float_32 || (!has_program_config && decode_rows),
++        /*default_fp32_acc=*/is_float_32 || float16 || (!has_program_config && decode_rows),
+         /*default_l1_acc=*/!is_float_32);
+     ttnn::verify_numerical_configuration(arch, parameters.compute_kernel_config);
+     auto in0_tile = operations::matmul::utilities::get_matmul_tile(input_tensor_a, parameters.transpose_a);
