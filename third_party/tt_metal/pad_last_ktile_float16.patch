@@ -1,0 +1,30 @@
+diff --git ttnn/cpp/ttnn/operations/kernel_helper_functions/pad_tile.hpp ttnn/cpp/ttnn/operations/kernel_helper_functions/pad_tile.hpp
+--- ttnn/cpp/ttnn/operations/kernel_helper_functions/pad_tile.hpp
++++ ttnn/cpp/ttnn/operations/kernel_helper_functions/pad_tile.hpp
+@@ -419,7 +419,7 @@ inline void drain_pad_stores(uint32_t l1_tile_ptr) {
+  * @brief Pads the last K tile in a matrix multiplication operation.
+  *
+  * This function handles padding for the last K tile in a matrix multiplication operation.
+- * It applies zero padding based on the specified data format (Float32, Float16_b, or any of the
++ * It applies zero padding based on the specified data format (Float32, Float16_b, Float16 or any of the
+  * block-float formats) and the unpadded width of the last K tile.
+  *
+  * @tparam in0_data_format The data format of the input tensor
+@@ -435,7 +435,7 @@ void pad_last_ktile(uint32_t l1_write_addr_in0) {
+     if constexpr (in0_data_format == DataFormat::Float32) {
+         fill_pad_tile<uint32_t, in0_last_ktile_w, /*num_elements_unpadded_h=*/TILE_HEIGHT>(
+             l1_write_addr_in0, /*pad_value=*/0);
+-    } else if constexpr (in0_data_format == DataFormat::Float16_b) {
++    } else if constexpr (in0_data_format == DataFormat::Float16_b || in0_data_format == DataFormat::Float16) {
+         fill_pad_tile<uint16_t, in0_last_ktile_w, /*num_elements_unpadded_h=*/TILE_HEIGHT>(
+             l1_write_addr_in0, /*pad_value=*/0);
+     } else if constexpr (is_blockfloat) {
+@@ -465,7 +465,7 @@ void pad_last_transposed_ktile(uint32_t l1_write_addr_in0) {
+     if constexpr (in0_data_format == DataFormat::Float32) {
+         fill_pad_tile<uint32_t, /*num_elements_unpadded_w=*/TILE_WIDTH, in0_last_ktile_h>(
+             l1_write_addr_in0, /*pad_value=*/0);
+-    } else if constexpr (in0_data_format == DataFormat::Float16_b) {
++    } else if constexpr (in0_data_format == DataFormat::Float16_b || in0_data_format == DataFormat::Float16) {
+         fill_pad_tile<uint16_t, /*num_elements_unpadded_w=*/TILE_WIDTH, in0_last_ktile_h>(
+             l1_write_addr_in0, /*pad_value=*/0);
+     } else if constexpr (is_blockfloat) {
