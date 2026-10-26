@@ -1,0 +1,119 @@
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -1325,13 +1325,16 @@
+ // Create workarounds for the ttml sdpa_fw op. The backing metal op
+ // (ttml::metal::sdpa_fw) requires Q/K/V, the optional mask and the output to be
+ // bf16, and the optional log-sum-exp intermediates to be f32 (see the TT_FATALs
+-// in sdpa_fw_device_operation.cpp).
++// in sdpa_fw_device_operation.cpp), all tiled: a composite promoted after
++// layout assignment can still read a function argument's row-major layout.
+ TTNNOperandsWorkarounds
+ TTNNOperandsWorkaroundsFactory::createSDPAForwardOpOperandsWorkarounds(
+     Operation *op) {
+   TTNNOperandWorkarounds bf16Workaround;
++  bf16Workaround.tensorLayoutWorkaround = Layout::Tile;
+   bf16Workaround.tensorDataTypeWorkaround = ttcore::DataType::BFloat16;
+   TTNNOperandWorkarounds f32Workaround;
++  f32Workaround.tensorLayoutWorkaround = Layout::Tile;
+   f32Workaround.tensorDataTypeWorkaround = ttcore::DataType::Float32;
+ 
+   auto sdpaForwardOp = cast<SDPAForwardOp>(op);
+@@ -1369,13 +1372,15 @@
+ // Create workarounds for the ttml sdpa_bw op. The backing metal op
+ // (ttml::metal::sdpa_bw) requires the gradient, forward output, Q/K/V, the
+ // optional mask and the gradient outputs to be bf16, and the log-sum-exp
+-// intermediates to be f32.
++// intermediates to be f32, all tiled (see the sdpa_fw workarounds).
+ TTNNOperandsWorkarounds
+ TTNNOperandsWorkaroundsFactory::createSDPABackwardOpOperandsWorkarounds(
+     Operation *op) {
+   TTNNOperandWorkarounds bf16Workaround;
++  bf16Workaround.tensorLayoutWorkaround = Layout::Tile;
+   bf16Workaround.tensorDataTypeWorkaround = ttcore::DataType::BFloat16;
+   TTNNOperandWorkarounds f32Workaround;
++  f32Workaround.tensorLayoutWorkaround = Layout::Tile;
+   f32Workaround.tensorDataTypeWorkaround = ttcore::DataType::Float32;
+ 
+   auto sdpaBackwardOp = cast<SDPABackwardOp>(op);
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -180,7 +180,8 @@
+ // Resolve composite ops into typed ops or inline their decompositions.
+ //
+ // Auto (the default) upgrades to Validate when the optimizer and OpModel are
+-// available, otherwise falls back to Inline. Inline and ForcePromote are always
++// available. Otherwise it stays Auto, which promotes only the composites that
++// need no validation and inlines the rest. Inline and ForcePromote are always
+ // respected. Validate warns and falls back to Inline when prerequisites are
+ // absent.
+ void createTTNNResolveCompositesPass(
+@@ -194,9 +195,8 @@
+ #endif
+ 
+   // Resolve Auto to a concrete mode.
+-  if (resolution == CompositeResolution::Auto) {
+-    resolution = canValidate ? CompositeResolution::Validate
+-                             : CompositeResolution::Inline;
++  if (resolution == CompositeResolution::Auto && canValidate) {
++    resolution = CompositeResolution::Validate;
+   }
+ 
+   // Warn if Validate was explicitly requested but prerequisites are absent.
+@@ -229,7 +229,7 @@
+   }
+ #endif
+ 
+-  // ForcePromote or Inline.
++  // Auto, ForcePromote or Inline.
+   TTNNResolveCompositesOptions resolveOptions;
+   resolveOptions.compositeResolution = resolution;
+   pm.addPass(createTTNNResolveComposites(resolveOptions));
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
+@@ -44,6 +44,11 @@
+   CompositeValidatorFn validate;
+   CompositeBuilderFn build;
+   CompositePromotionGuardFn promotionGuard; // may be empty
++  // Promoted in Auto mode, which has no OpModel to validate composites: the
++  // typed op's verifier and operand workarounds cover what its kernel needs,
++  // and its decomposition is far slower, such as attention's [B, H, S, S]
++  // scores. Validate mode still validates it.
++  bool promoteUnvalidated = false;
+ };
+ 
+ static llvm::StringMap<CompositeEntry> &getCompositeRegistry() {
+@@ -593,7 +598,8 @@
+                                                  : Value(),
+             maskType, dropoutProbability, returnIntermediates);
+       },
+-      /*promotionGuard=*/nullptr};
++      /*promotionGuard=*/nullptr,
++      /*promoteUnvalidated=*/true};
+ 
+   registry["sdpa_bw"] = CompositeEntry{
+       // Validate
+@@ -643,7 +649,8 @@
+                                                  : Value(),
+             maskType, dropoutProbability);
+       },
+-      /*promotionGuard=*/nullptr};
++      /*promotionGuard=*/nullptr,
++      /*promoteUnvalidated=*/true};
+ 
+   registry["cross_entropy_fw"] = CompositeEntry{
+       // Validate
+@@ -779,6 +786,11 @@
+ 
+   auto &entry = it->second;
+ 
++  // Auto, without OpModel to validate, promotes only what needs no validation.
++  if (resolution == CompositeResolution::Auto && !entry.promoteUnvalidated) {
++    return nullptr;
++  }
++
+   // A promotion guard can veto promotion.
+   // When it fails, fall back to inlining the decomposition.
+   if (entry.promotionGuard && mlir::failed(entry.promotionGuard(compositeOp))) {

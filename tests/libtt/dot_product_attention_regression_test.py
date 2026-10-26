@@ -17,8 +17,10 @@ import pytest
 B, T, N, H = 2, 128, 4, 64
 
 
+# JAX's implementation, which supported calls on the tt backend otherwise
+# leave for the fused kernels (fused_attention_regression_test.py).
 def attention(q, k, v):
-    return jax.nn.dot_product_attention(q, k, v, is_causal=True)
+    return jax.nn.dot_product_attention(q, k, v, is_causal=True, implementation="xla")
 
 
 def attention_grads(q, k, v):

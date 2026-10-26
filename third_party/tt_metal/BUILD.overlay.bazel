@@ -292,6 +292,9 @@ filegroup(
     srcs = glob([
         "tt_metal/**",
         "ttnn/**",
+        "tt-train/sources/ttml/metal/common/**",
+        "tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/**",
+        "tt-train/sources/ttml/metal/ops/sdpa_fw/device/kernels/**",
     ]),
 )
 
@@ -1587,6 +1590,50 @@ cc_library(
         ":tt_metal_version_header",
         ":tt_metal_device_tensor_upstream",
         "@//ttnn:operation_headers",
+    ],
+    linkstatic = True,
+)
+
+# The ttml ops that tt-mlir's OpModel queries (MetalHeaders.h).
+TTML_OPS = [
+    "ops/cross_entropy_bw",
+    "ops/cross_entropy_fw",
+    "ops/layernorm_bw",
+    "ops/layernorm_fw",
+    "ops/rmsnorm_bw",
+    "ops/rmsnorm_fw",
+    "ops/sdpa_bw",
+    "ops/sdpa_fw",
+    "ops/softmax_backward",
+    "ops/swiglu_elemwise_bw",
+    "optimizers/adamw",
+]
+
+# tt-train's training ops (ttml::metal), behind tt-mlir's sdpa_fw, sdpa_bw,
+# rmsnorm_fw and the other ttml ops. The runtime runs sdpa_fw and sdpa_bw, whose
+# device kernels compile at run time from tt_metal_runtime_sources; tt-mlir's
+# OpModel queries all of them.
+cc_library(
+    name = "ttml_ops",
+    srcs = glob(
+        ["tt-train/sources/ttml/core/compute_kernel_config.cpp"] +
+        ["tt-train/sources/ttml/metal/%s/**/*.cpp" % op for op in TTML_OPS],
+        exclude = ["tt-train/sources/ttml/metal/**/kernels/**"],
+    ),
+    hdrs = glob(
+        [
+            "tt-train/sources/ttml/core/compute_kernel_config.hpp",
+            "tt-train/sources/ttml/core/ttnn_all_includes.hpp",
+            "tt-train/sources/ttml/metal/common/*.hpp",
+            "tt-train/sources/ttml/metal/ttnn_all_includes.hpp",
+        ] + ["tt-train/sources/ttml/metal/%s/**/*.hpp" % op for op in TTML_OPS],
+        exclude = ["tt-train/sources/ttml/metal/**/kernels/**"],
+    ),
+    copts = TT_METAL_RUNTIME_COPTS,
+    includes = TTNN_RUNTIME_INCLUDE_DIRS + ["tt-train/sources/ttml"],
+    deps = [
+        ":ttnn_tensor_upstream",
+        "@xtensor//:xtensor",
     ],
     linkstatic = True,
 )

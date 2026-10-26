@@ -178,14 +178,6 @@ void run(const ::tt::target::ttnn::AdamWOp *, ProgramContext &) {
   unsupported("ttnn.adamw");
 }
 
-void run(const ::tt::target::ttnn::SDPAForwardOp *, ProgramContext &) {
-  unsupported("ttnn.sdpa_forward");
-}
-
-void run(const ::tt::target::ttnn::SDPABackwardOp *, ProgramContext &) {
-  unsupported("ttnn.sdpa_backward");
-}
-
 void run(const ::tt::target::ttnn::LayerNormForwardOp *, ProgramContext &) {
   unsupported("ttnn.layernorm_forward");
 }

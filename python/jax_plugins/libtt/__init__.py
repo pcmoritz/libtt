@@ -4,7 +4,8 @@ from pathlib import Path
 
 
 def initialize() -> None:
-    """Register the bundled PJRT plugin and enable input donation.
+    """Register the bundled PJRT plugin, enable input donation and route
+    jax.nn.dot_product_attention to the fused attention kernels.
 
     JAX currently gates donation with an internal platform allowlist before a
     PJRT plugin is loaded. Registering this namespace plugin lets libtt opt in
@@ -27,3 +28,7 @@ def initialize() -> None:
         library_path=str(library_path),
         options=None,
     )
+
+    from jax_plugins.libtt import attention
+
+    attention.install()
