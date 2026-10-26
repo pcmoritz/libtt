@@ -31,6 +31,16 @@ single-process TP2 launch recipe and multi-chip regression tests.
 See [PyTorch with torch_tpu](docs/torch-tpu.md): with `LIBTT_TPU_COMPAT=1`,
 torch_tpu runs on Tenstorrent devices through `libtt.so`.
 
+## Fused attention
+
+On Tenstorrent devices, `jax.nn.dot_product_attention` runs tt-train's fused
+attention kernels, forward and backward, without materializing the attention
+scores: bf16 self-attention in `[B, T, N, D]` with `T` and `D` multiples of
+32, with or without `is_causal` or grouped key/value heads, and the default
+scale. Other calls, and calls traced before JAX has initialized its backends
+(for example, before the first array is created), take JAX's own
+implementation. Set `LIBTT_FUSED_ATTENTION=0` to turn the fused path off.
+
 ## JAX tests
 
 Run the upstream JAX smoke tests against this checkout's plugin wheel:
