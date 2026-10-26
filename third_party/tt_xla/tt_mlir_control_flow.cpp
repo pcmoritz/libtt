@@ -13,16 +13,22 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "stablehlo/dialect/StablehloOps.h"
+#include "stablehlo/transforms/optimization/Passes.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/ErrorHandling.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -467,7 +473,118 @@ public:
   }
 };
 
+// lax.switch over flags, such as an index `a + 2 * b`, becomes nested
+// conditionals on the flags themselves. The runtime reads a case index on
+// host; a computed one is on device, and reading it waits for all the work
+// queued before it, so the host stops running ahead of the device. The flags
+// stay on host down to the nested cases (isHostFlagArgument). Runs on
+// StableHLO before any case is outlined, while the flags are still the entry
+// function's arguments.
+
+bool isEntryFlag(Value value) {
+  auto argument = dyn_cast<BlockArgument>(value);
+  auto function = argument ? dyn_cast<func::FuncOp>(
+                                 argument.getOwner()->getParentOp())
+                           : func::FuncOp();
+  return function && function.isPublic() && isScalarI1(argument);
+}
+
+// case(f(a, b)) -> case(a) { case(f(false, b)) } { case(f(true, b)) }, for an
+// index computed with scalar ops from at most three entry flags. StableHLO's
+// folder then folds an index of constants and inlines the branch it selects.
+class PeelSwitchFlagPattern : public OpRewritePattern<stablehlo::CaseOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(stablehlo::CaseOp op,
+                                PatternRewriter &rewriter) const override {
+    Operation *index = op.getIndex().getDefiningOp();
+    if (!index || (isa<stablehlo::ConvertOp>(index) &&
+                   isEntryFlag(index->getOperand(0)))) {
+      return failure();
+    }
+    llvm::SetVector<Operation *> slice;
+    BackwardSliceOptions options;
+    options.inclusive = true;
+    if (failed(getBackwardSlice(index, &slice, options))) {
+      return failure();
+    }
+    llvm::SetVector<Value> flags;
+    for (Operation *sliceOp : slice) {
+      if (sliceOp->getNumRegions() != 0 ||
+          !llvm::all_of(sliceOp->getResults(), isScalarInteger)) {
+        return failure();
+      }
+      for (Value operand : sliceOp->getOperands()) {
+        if (!isa<BlockArgument>(operand)) {
+          continue;
+        }
+        if (!isEntryFlag(operand)) {
+          return failure();
+        }
+        flags.insert(operand);
+      }
+    }
+    if (flags.empty() || flags.size() > 3) {
+      return failure();
+    }
+    Location loc = op.getLoc();
+    Value flag = flags.front();
+    Value flagIndex = rewriter.create<stablehlo::ConvertOp>(
+        loc, RankedTensorType::get({}, rewriter.getI32Type()), flag);
+    auto peeled = rewriter.create<stablehlo::CaseOp>(
+        loc, op.getResultTypes(), flagIndex, /*branchesCount=*/2);
+    for (bool value : {false, true}) {
+      rewriter.createBlock(&peeled.getBranches()[value]);
+      IRMapping mapping;
+      mapping.map(flag, rewriter.create<stablehlo::ConstantOp>(
+                            loc, DenseElementsAttr::get(
+                                     cast<ShapedType>(flag.getType()),
+                                     rewriter.getBoolAttr(value))));
+      for (Operation *sliceOp : slice) {
+        rewriter.clone(*sliceOp, mapping);
+      }
+      rewriter.create<stablehlo::ReturnOp>(
+          loc, rewriter.clone(*op, mapping)->getResults());
+    }
+    rewriter.replaceOp(op, peeled.getResults());
+    return success();
+  }
+};
+
+struct ExpandSwitchesOverFlagsPass
+    : public PassWrapper<ExpandSwitchesOverFlagsPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ExpandSwitchesOverFlagsPass)
+
+  StringRef getArgument() const final { return "libtt-expand-switches"; }
+
+  void runOnOperation() override {
+    MLIRContext *context = &getContext();
+    RewritePatternSet patterns(context);
+    patterns.add<PeelSwitchFlagPattern>(context);
+    // Scalar folds only, without float rewrites, on the cases and what
+    // peeling them creates.
+    static const stablehlo::StablehloAggressiveFolderPassOptions folding = [] {
+      stablehlo::StablehloAggressiveFolderPassOptions options;
+      options.optimizeFloat = false;
+      return options;
+    }();
+    stablehlo::populateStablehloAggressiveFolderPatterns(context, &patterns,
+                                                         folding);
+    SmallVector<Operation *> cases;
+    getOperation().walk(
+        [&](stablehlo::CaseOp caseOp) { cases.push_back(caseOp); });
+    GreedyRewriteConfig config;
+    config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
+    (void)applyOpPatternsGreedily(cases, std::move(patterns), config);
+  }
+};
+
 } // namespace
+
+std::unique_ptr<Pass> createExpandSwitchesOverFlagsPass() {
+  return std::make_unique<ExpandSwitchesOverFlagsPass>();
+}
 
 void populateStableHLOControlFlowToTTIRPatterns(
     MLIRContext *context, RewritePatternSet &patterns,
@@ -494,6 +611,45 @@ static SmallVector<func::FuncOp> getCaseBranches(ttcore::CaseOp caseOp) {
     branches.push_back(function);
   }
   return branches;
+}
+
+// Whether a branch program's argument is a flag the runtime has on host:
+// every case that runs the program passes it an entry argument, or such a flag
+// of its own program, and the branch programs only pass it on to cases, as an
+// index or an input. A conditional nested in the program then reads it
+// without waiting for the device. The rule looks only at the cases that run
+// the program and their branches, so sibling programs agree on it.
+bool isHostFlagArgument(BlockArgument argument) {
+  auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
+  auto type = dyn_cast<RankedTensorType>(argument.getType());
+  if (!function || !type || type.getNumElements() != 1) {
+    return false;
+  }
+  auto module = function->getParentOfType<ModuleOp>();
+  if (function.isPublic() || !module) {
+    return function.isPublic();
+  }
+  std::optional<SymbolTable::UseRange> uses =
+      SymbolTable::getSymbolUses(function, module);
+  unsigned index = argument.getArgNumber();
+  return uses && !uses->empty() &&
+         llvm::all_of(*uses, [&](const SymbolTable::SymbolUse &use) {
+           auto caseOp = dyn_cast<ttcore::CaseOp>(use.getUser());
+           if (!caseOp || index >= caseOp.getInputs().size()) {
+             return false;
+           }
+           Value input = caseOp.getInputs()[index];
+           while (auto toLayout = input.getDefiningOp<ttir::ToLayoutOp>()) {
+             input = toLayout.getInput();
+           }
+           auto flag = dyn_cast<BlockArgument>(input);
+           return flag && isHostFlagArgument(flag) &&
+                  llvm::all_of(getCaseBranches(caseOp), [&](func::FuncOp branch) {
+                    return llvm::all_of(
+                        branch.getArgument(index).getUsers(),
+                        [](Operation *user) { return isa<ttcore::CaseOp>(user); });
+                  });
+         });
 }
 
 namespace {

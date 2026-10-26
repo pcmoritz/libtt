@@ -1,7 +1,15 @@
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-@@ -751,8 +751,13 @@
+@@ -22,6 +22,7 @@
+ 
+ namespace mlir::tt::ttnn {
+ void populateControlFlowLayoutPatterns(RewritePatternSet &patterns);
++bool isHostFlagArgument(BlockArgument argument);
+ 
+ #define GEN_PASS_DEF_TTNNLAYOUT
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h.inc"
+@@ -751,13 +752,21 @@
        if (mlir::isa<ttir::MeshShardOp>(user)) {
          return true;
        }
@@ -16,3 +24,12 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
          return true;
        }
      }
+ 
+-    return false;
++    // A flag that the conditionals running a branch program pass on from host
++    // stays there, so that conditionals nested in the program read it without
++    // waiting for the device; the sibling programs agree on it.
++    return owningFunc.isPrivate() && isHostFlagArgument(arg);
+   }
+ 
+   static bool feedsRowMajorReader(OpOperand &use) {
