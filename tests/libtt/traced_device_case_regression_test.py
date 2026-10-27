@@ -231,3 +231,18 @@ def test_constants_a_branch_computes(tmp_path):
         np.testing.assert_array_equal(np.asarray(run(_put(SOURCE), _put(np.bool_(take)))), expected, err_msg=str(take))
     traces, cases = _ops_per_function(tmp_path)
     assert traces["main"] == 1 and cases["main"] == 0, (traces, cases)
+
+
+def test_a_branch_returning_a_cached_constant(tmp_path):
+    # Branch 0 returns a constant the program caches. The other branch copies
+    # its result into the case's result, so that must not be the constant's
+    # buffer: a later call taking branch 0 runs no work that would restore it.
+    def run(x, flag):
+        return lax.cond(flag, lambda v: v * 2, lambda v: jnp.full_like(v, 7.0), x)
+
+    run = _jit(run, export_path=tmp_path)
+    for take in [False, True, False, True, False]:
+        expected = SOURCE * 2 if take else np.full_like(SOURCE, 7.0)
+        np.testing.assert_array_equal(np.asarray(run(_put(SOURCE), _put(np.bool_(take)))), expected, err_msg=str(take))
+    traces, cases = _ops_per_function(tmp_path)
+    assert traces["main"] == 1 and cases["main"] == 0, (traces, cases)

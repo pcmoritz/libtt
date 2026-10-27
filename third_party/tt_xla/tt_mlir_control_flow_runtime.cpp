@@ -198,8 +198,8 @@ std::pair<::ttnn::Tensor, uint8_t> prepareCaseIndex(::ttnn::Tensor index,
   return {std::move(index), bits};
 }
 
-// Runs a case inside a trace's capture program: every branch runs and leaves
-// its results in the same buffers, and while the queue records, between
+// Runs a case inside a trace's capture program: every branch runs and copies
+// its results into the same buffers, and while the queue records, between
 // markers that make a replay run only the branch the index selects. The host
 // never reads the index while the trace replays. The warmup before the capture
 // runs every branch too, which compiles them; it runs no workload
@@ -238,27 +238,14 @@ void runCaseInTrace(const ::tt::target::ttnn::CaseOp *op,
     LOG_ASSERT(outputs.size() == op->outputs()->size(),
                "Case branch output arity mismatch");
     for (size_t i = 0; i < outputs.size(); ++i) {
-      if (branch != 0) {
-        ::ttnn::copy(ttnnTensor(outputs[i]), ttnnTensor(results[i]));
-        continue;
+      // Every branch copies its results into buffers of the case's own, which
+      // share nothing with an input or a cached constant a branch returns.
+      if (branch == 0) {
+        results.push_back(utils::createRuntimeTensorFromTTNN(
+            ::ttnn::create_device_tensor(ttnnTensor(outputs[i]).tensor_spec(),
+                                         &meshDevice)));
       }
-      // The first branch's results become the case's, unless they are
-      // buffers another branch reads or returns twice.
-      auto sameBuffer = [&](const ::tt::runtime::Tensor &tensor) {
-        const ::ttnn::Tensor &other = ttnnTensor(tensor);
-        return other.storage_type() == ::ttnn::StorageType::DEVICE &&
-               other.mesh_buffer().address() ==
-                   ttnnTensor(outputs[i]).mesh_buffer().address();
-      };
-      if (std::none_of(inputs.begin(), inputs.end(), sameBuffer) &&
-          std::none_of(outputs.begin(), outputs.begin() + i, sameBuffer)) {
-        results.push_back(outputs[i]);
-      } else {
-        ::ttnn::Tensor copy = ::ttnn::create_device_tensor(
-            ttnnTensor(outputs[i]).tensor_spec(), &meshDevice);
-        ::ttnn::copy(ttnnTensor(outputs[i]), copy);
-        results.push_back(utils::createRuntimeTensorFromTTNN(copy));
-      }
+      ::ttnn::copy(ttnnTensor(outputs[i]), ttnnTensor(results[i]));
     }
   }
   if (recording) {

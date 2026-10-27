@@ -63,10 +63,9 @@ command buffer, masked indices, and workloads that were only prepared.
   other host input.
 - During a trace's capture program (the uncaptured warmup, the captured run and
   the first replay), the case handler runs every branch, between the markers
-  while the queue records, and leaves their results in the same buffers. The
-  first branch's results become the case's, and the other branches copy their
-  results into them; so does the first for a result that is not a fresh buffer
-  of its own, such as an input it passes through.
+  while the queue records. Every branch copies its results into buffers the
+  case allocates, so a result never shares a buffer with an input it passes
+  through or a constant the program caches.
 - tt-metal captures only workloads whose kernel binaries are on device, so the
   warmup compiles every branch. It runs nothing: while it runs, the command
   queue only prepares the workloads enqueued to it (compiles them and writes
