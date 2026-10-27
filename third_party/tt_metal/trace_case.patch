@@ -467,7 +467,7 @@ diff --git tt_metal/impl/dispatch/kernels/cq_commands.hpp tt_metal/impl/dispatch
 diff --git tt_metal/impl/dispatch/kernels/cq_prefetch.cpp tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
 --- tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
 +++ tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
-@@ -2196,6 +2196,50 @@
+@@ -2196,6 +2196,43 @@
      return stride;
  }
  
@@ -487,21 +487,14 @@ diff --git tt_metal/impl/dispatch/kernels/cq_prefetch.cpp tt_metal/impl/dispatch
 +            load_aligned<uint32_t>(&cmd->exec_buf_skip.base_addr),
 +            page_size);
 +        // Read the start of page 0 over this command, which is consumed, the way the exec_buf reads its own pages
-+        // (L1 the NoC can write, aligned like the page). Wait for the data to overwrite a stamp: the
-+        // transaction-id barrier alone was seen to pass before a single read had landed.
-+        constexpr uint32_t kUnread = 0xA5A5A5A5;
-+        volatile tt_l1_ptr uint32_t* landing = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cmd_ptr);
-+        landing[0] = kUnread;
-+        landing[1] = kUnread;
-+        noc_async_read_set_trid(1);
++        // (L1 the NoC can write, aligned like the page). The read is counted before it is issued, so the barrier
++        // cannot pass before it lands, unlike the transaction-id barrier; it also waits for the exec_buf's read-ahead.
 +        noc_read_with_state<DM_DEDICATED_NOC, read_cmd_buf, CQ_NOC_SNDL, CQ_NOC_SEND, CQ_NOC_WAIT>(
 +            noc_index, addr_gen.get_noc_addr(0), cmd_ptr, CQ_PREFETCH_CMD_BARE_MIN_SIZE);
-+        noc_async_read_barrier_with_trid(1);
-+        noc_async_read_set_trid(0);
-+        do {
-+            invalidate_l1_cache();
-+        } while (landing[0] == kUnread && landing[1] == kUnread);
-+        if (((landing[0] & mask) == value) != (mode == CQ_PREFETCH_EXEC_BUF_SKIP_IF_EQUAL)) {
++        noc_async_read_barrier();
++        invalidate_l1_cache();
++        uint32_t index = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cmd_ptr);
++        if (((index & mask) == value) != (mode == CQ_PREFETCH_EXEC_BUF_SKIP_IF_EQUAL)) {
 +            return CQ_PREFETCH_CMD_BARE_MIN_SIZE;
 +        }
 +    }
@@ -518,7 +511,7 @@ diff --git tt_metal/impl/dispatch/kernels/cq_prefetch.cpp tt_metal/impl/dispatch
  uint32_t process_exec_buf_cmd(
      uintptr_t cmd_ptr_outer, uint32_t& downstream_data_ptr, uint32_t* l1_cache, PrefetchExecBufState& exec_buf_state) {
      // dispatch on eth cores is memory constrained, so exec_buf reuses the cmddat_q
-@@ -2608,6 +2652,11 @@
+@@ -2608,6 +2645,11 @@
              stall_state = StallState::NOT_STALLED;  // Stall is no longer required after ExecBuf finished.
              break;
  
