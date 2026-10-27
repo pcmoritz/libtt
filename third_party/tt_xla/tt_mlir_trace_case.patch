@@ -58,22 +58,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
        }
      }
      for (size_t i = numTensorInputs; i < inputs.size(); i++) {
-@@ -731,6 +754,14 @@
-                                             beginTraceCaptureOp,
-                                             /*cq_id=*/0);
- 
-+    // The warmup ran every branch of the traced cases, and a branch may write
-+    // into an input slot donated to it (donatePassedThroughInputs).
-+    for (auto [h, argIndex] : llvm::enumerate(info.hostStagedIndices())) {
-+      builder.create<ttnn::WriteTensorOp>(
-+          captureFunc.getLoc(), captureFunc.getArgument(h),
-+          inputSlots[argIndex], /*blocking=*/false, /*cq_id=*/0);
-+    }
-+
-     // Replay once so the output slots hold valid results for this invocation.
-     builder.create<ttnn::ExecuteTraceOp>(captureFunc.getLoc(), deviceOp,
-                                          beginTraceCaptureOp,
-@@ -1106,25 +1137,176 @@
+@@ -1106,25 +1129,84 @@
      }
      auto body = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
          op, loop.getBodyProgramAttr());
@@ -108,44 +93,14 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +      auto program = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
 +          op, mlir::cast<FlatSymbolRefAttr>(branch));
 +      return program && isCapturableProgram(program) &&
-+             writesOnlyItsOwn(program, [&](unsigned index) {
-+               return isDonatableInput(caseOp, index);
-+             });
++             writesOnlyItsOwn(program);
      });
    }
  
-+  // Whether the case is the last to read input `index` and may overwrite its
-+  // buffer: an intermediate, or an argument the trace stages into a slot.
-+  bool isDonatableInput(ttcore::CaseOp caseOp, unsigned index) {
-+    mlir::Value input = caseOp.getInputs()[index];
-+    auto argument = mlir::dyn_cast<BlockArgument>(input);
-+    return llvm::count(caseOp.getInputs(), input) == 1 &&
-+           !(argument &&
-+             (!isHostArgument(argument) || isDeviceResidentValue(argument))) &&
-+           llvm::none_of(input.getUsers(), [&](Operation *user) {
-+             return user != caseOp.getOperation() &&
-+                    (user->getBlock() != caseOp->getBlock() ||
-+                     !user->isBeforeInBlock(caseOp));
-+           });
-+  }
-+
 +  // Whether `program`, a branch of a traced case or a loop body it runs,
-+  // leaves alone what another branch reads: the warmup before a capture runs
-+  // every branch. It may write into its own values, and into an argument it
-+  // returns that `mayWrite` admits, as donatePassedThroughInputs makes it do.
-+  bool writesOnlyItsOwn(
-+      func::FuncOp program,
-+      llvm::function_ref<bool(unsigned)> mayWrite = [](unsigned) {
-+        return false;
-+      }) {
-+    auto returned = mlir::cast<func::ReturnOp>(program.front().getTerminator());
-+    auto shared = [&](mlir::Value value) {
-+      auto argument = mlir::dyn_cast_or_null<BlockArgument>(value);
-+      return !value ||
-+             (argument &&
-+              !(llvm::is_contained(returned.getOperands(), value) &&
-+                mayWrite(argument.getArgNumber())));
-+    };
++  // writes only into values of its own: the warmup before a capture runs
++  // every branch, so a branch must leave alone what another one reads.
++  bool writesOnlyItsOwn(func::FuncOp program) {
 +    return llvm::all_of(
 +        program.front().without_terminator(), [&](Operation &op) {
 +          if (auto loop = mlir::dyn_cast<ttcore::WhileLoopOp>(&op)) {
@@ -168,72 +123,10 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +          bool named = llvm::any_of(
 +              writes, [](auto &write) { return write.getValue() != nullptr; });
 +          return llvm::none_of(writes, [&](auto &write) {
-+            return named ? write.getValue() && shared(write.getValue())
-+                         : true;
++            return !named ||
++                   mlir::isa_and_present<BlockArgument>(write.getValue());
 +          });
 +        });
-+  }
-+
-+  // A result that a branch of a traced case passes through from an input the
-+  // case is the last to read takes over that input's buffer: the other
-+  // branches copy their result into it and return it as well. The runtime then
-+  // finds every branch returning the input, and copies nothing for the branch
-+  // that passes it through; it otherwise gives the case result buffers of its
-+  // own, which that branch has to copy into.
-+  void donatePassedThroughInputs(ttcore::CaseOp caseOp) {
-+    auto module = caseOp->getParentOfType<ModuleOp>();
-+    llvm::SmallVector<func::FuncOp> branches;
-+    for (Attribute branch : caseOp.getBranchPrograms()) {
-+      auto program = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
-+          caseOp, mlir::cast<FlatSymbolRefAttr>(branch));
-+      std::optional<SymbolTable::UseRange> uses =
-+          program ? SymbolTable::getSymbolUses(program, module) : std::nullopt;
-+      // The branches are rewritten, so they must belong to this case alone.
-+      if (!uses || !llvm::hasSingleElement(*uses)) {
-+        return;
-+      }
-+      branches.push_back(program);
-+    }
-+    auto returned = [](func::FuncOp branch) {
-+      return mlir::cast<func::ReturnOp>(branch.front().getTerminator());
-+    };
-+    for (auto [i, result] : llvm::enumerate(caseOp.getResults())) {
-+      std::optional<unsigned> donor;
-+      for (func::FuncOp branch : branches) {
-+        if (auto argument =
-+                mlir::dyn_cast<BlockArgument>(returned(branch).getOperand(i))) {
-+          donor = argument.getArgNumber();
-+          break;
-+        }
-+      }
-+      if (!donor) {
-+        continue;
-+      }
-+      if (caseOp.getInputs()[*donor].getType() != result.getType() ||
-+          !isDonatableInput(caseOp, *donor)) {
-+        continue;
-+      }
-+      // No branch may return it elsewhere, since its value changes.
-+      if (llvm::any_of(branches, [&](func::FuncOp branch) {
-+            return llvm::any_of(
-+                llvm::enumerate(returned(branch).getOperands()),
-+                [&](auto operand) {
-+                  return operand.index() != i &&
-+                         operand.value() == branch.getArgument(*donor);
-+                });
-+          })) {
-+        continue;
-+      }
-+      for (func::FuncOp branch : branches) {
-+        func::ReturnOp ret = returned(branch);
-+        BlockArgument donated = branch.getArgument(*donor);
-+        if (ret.getOperand(i) != donated) {
-+          mlir::OpBuilder builder(ret);
-+          builder.create<ttnn::CopyOp>(ret.getLoc(), ret.getOperand(i), donated);
-+          ret.setOperand(i, donated);
-+        }
-+      }
-+    }
 +  }
 +
 +  // Whether a program that a traced op runs replays from the trace too. The
@@ -262,19 +155,6 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
    }
  
    // Ops that depend on nothing a trace computes: the device handle,
-@@ -1240,6 +1422,12 @@
-       op->moveBefore(firstHoistable);
-     }
- 
-+    for (mlir::Operation &op : block.without_terminator()) {
-+      if (isCapturableCase(&op)) {
-+        donatePassedThroughInputs(mlir::cast<ttcore::CaseOp>(op));
-+      }
-+    }
-+
-     // Each maximal run of capturable ops becomes a trace of its own.
-     llvm::SmallVector<llvm::SmallVector<Operation *>> runs;
-     llvm::SmallVector<Operation *> run;
 diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 --- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 +++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp

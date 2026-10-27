@@ -1,18 +1,17 @@
 diff --git tt_metal/api/tt-metalium/mesh_command_queue.hpp tt_metal/api/tt-metalium/mesh_command_queue.hpp
 --- tt_metal/api/tt-metalium/mesh_command_queue.hpp
 +++ tt_metal/api/tt-metalium/mesh_command_queue.hpp
-@@ -129,6 +129,15 @@
+@@ -129,6 +129,14 @@
      virtual void finish(ttsl::Span<const SubDeviceId> sub_device_ids = {}) = 0;
      virtual void record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) = 0;
      virtual void record_end() = 0;
 +    // A case inside the trace being recorded: the workloads enqueued after each record_case_branch(), until the
-+    // next one or record_case_end(), form one branch. A replay runs the first branch whose test passes, or the last
-+    // branch if none does: branch k's test is whether the index equals `value` (differs from it, with equal false).
-+    // The index is the low `index_bits` bits of the 32-bit word that page 0 of `index` (an interleaved DRAM buffer)
-+    // starts with when the replay gets there; the host never reads it. Branches may hold cases of their own; each
-+    // case drains the device before and after it.
++    // next one or record_case_end(), form one branch. A replay runs only branch i, where i is the low `index_bits`
++    // bits of the 32-bit word that page 0 of `index` (an interleaved DRAM buffer) starts with when the replay gets
++    // there, or the last branch if i is out of range. The host never reads the index. Branches may hold cases of
++    // their own; each case drains the device before and after it.
 +    virtual void record_case_begin(const MeshBuffer& index, uint8_t index_bits = 32) = 0;
-+    virtual void record_case_branch(uint32_t value, bool equal = true) = 0;
++    virtual void record_case_branch() = 0;
 +    virtual void record_case_end() = 0;
      virtual void enqueue_trace(const MeshTraceId& trace_id, bool blocking) = 0;
  };
@@ -37,46 +36,39 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  #if defined(TT_UMD_BUILD_SIMULATION)
  #include "buffers/simulator_direct_write.hpp"
  #endif
-@@ -1460,6 +1463,38 @@
+@@ -1460,6 +1463,31 @@
      swap(this->dummy_prefetcher_cache_manager_, this->prefetcher_cache_manager_);
  }
  
-+void FDMeshCommandQueue::push_case_marker(MeshTraceNode&& marker) {
++void FDMeshCommandQueue::record_case_marker(
++    MeshTraceNode::CaseMarker marker, const MeshBuffer* index, uint8_t index_bits) {
 +    auto lock = lock_api_function_();
 +    TT_FATAL(trace_id_.has_value(), "Trace cases can only be recorded while a trace is being captured");
-+    trace_nodes_.push_back(std::move(marker));
++    MeshTraceNode node;
++    node.case_marker = marker;
++    if (index) {
++        TT_FATAL(
++            index->device_local_config().buffer_type == BufferType::DRAM && std::has_single_bit(index->page_size()),
++            "A trace case index must be in an interleaved DRAM buffer with a power-of-two page size");
++        node.case_index_address = static_cast<uint32_t>(index->address());
++        node.case_index_log2_page_size = static_cast<uint8_t>(std::countr_zero(index->page_size()));
++        node.case_index_bits = index_bits;
++    }
++    trace_nodes_.push_back(std::move(node));
 +}
 +
 +void FDMeshCommandQueue::record_case_begin(const MeshBuffer& index, uint8_t index_bits) {
-+    TT_FATAL(
-+        index.device_local_config().buffer_type == BufferType::DRAM && std::has_single_bit(index.page_size()),
-+        "A trace case index must be in an interleaved DRAM buffer with a power-of-two page size");
-+    MeshTraceNode marker;
-+    marker.case_marker = MeshTraceNode::CaseMarker::Begin;
-+    marker.case_index_address = static_cast<uint32_t>(index.address());
-+    marker.case_index_log2_page_size = static_cast<uint8_t>(std::countr_zero(index.page_size()));
-+    marker.case_index_bits = index_bits;
-+    this->push_case_marker(std::move(marker));
++    this->record_case_marker(MeshTraceNode::CaseMarker::Begin, &index, index_bits);
 +}
 +
-+void FDMeshCommandQueue::record_case_branch(uint32_t value, bool equal) {
-+    MeshTraceNode marker;
-+    marker.case_marker = MeshTraceNode::CaseMarker::Branch;
-+    marker.case_branch_value = value;
-+    marker.case_branch_equal = equal;
-+    this->push_case_marker(std::move(marker));
-+}
++void FDMeshCommandQueue::record_case_branch() { this->record_case_marker(MeshTraceNode::CaseMarker::Branch); }
 +
-+void FDMeshCommandQueue::record_case_end() {
-+    MeshTraceNode marker;
-+    marker.case_marker = MeshTraceNode::CaseMarker::End;
-+    this->push_case_marker(std::move(marker));
-+}
++void FDMeshCommandQueue::record_case_end() { this->record_case_marker(MeshTraceNode::CaseMarker::End); }
 +
  void FDMeshCommandQueue::record_end() {
      MetalContext& metal_ctx = MetalContext::instance(mesh_device_->impl().get_context_id());
      const auto& hal = metal_ctx.hal();
-@@ -1495,6 +1530,29 @@
+@@ -1495,6 +1523,29 @@
      size_t max_trace_size = 0;
      std::set<SubDeviceId> sub_device_ids;
      std::optional<std::unordered_map<SubDeviceId, TraceWorkerDescriptor>> overall_trace_worker_descriptors;
@@ -106,7 +98,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
      for (const auto& range : device_ranges) {
          // NOTE: TraceNode objects may be shared across device ranges (when a program's device range
          // spans multiple partition ranges). Each iteration of this loop mutates
-@@ -1512,6 +1570,11 @@
+@@ -1512,6 +1563,11 @@
          DispatchArray<UnusedNodeData> unused_nodes;
  
          for (auto& mesh_node : trace_nodes_) {
@@ -118,7 +110,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
              bool used = false;
              for (auto& [device_range, node] : mesh_node.trace_nodes) {
                  if (!device_range.intersects(range)) {
-@@ -1524,7 +1587,7 @@
+@@ -1524,7 +1580,7 @@
                  used = true;
                  break;
              }
@@ -127,7 +119,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
                  auto& unused_node = unused_nodes[*mesh_node.sub_device_id];
                  if (mesh_node.multicast_go_signals) {
                      unused_node.unused_nodes_multicast++;
-@@ -1544,8 +1607,15 @@
+@@ -1544,8 +1600,15 @@
              }
              ringbuffer_configs.push_back({start, size});
          }
@@ -145,7 +137,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  
          // Each device range produces an independent trace byte stream, so reset the prefetcher
          // cache manager to give each range a clean slate.
-@@ -1557,41 +1627,170 @@
+@@ -1557,41 +1620,166 @@
              worker_launch_message_buffer_state[sub_device_id].reset();
          }
          std::unordered_map<SubDeviceId, TraceWorkerDescriptor> trace_worker_descriptors;
@@ -279,14 +271,14 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 +        };
 +        auto land_skip = [&](uint32_t offset) { skip_at(offset).bytes = write_ptr() - offset - skip_size; };
 +
-+        // A case runs one branch: after a boundary, each branch is entered if its test passes and skips to the end
-+        // of the case once done; the last branch runs if no test passes. With tests "index == k":
++        // A case runs one branch: after a boundary, branch k is entered unless the index differs from k, and skips
++        // to the end of the case once done; the last branch runs for any index the others do not take.
 +        //   boundary + stall; skip if index != 0 -> b1; branch 0; boundary; skip -> end;
 +        //   b1: skip if index != 1 -> b2; branch 1; boundary; skip -> end; ... branch N-1; boundary; end:
 +        // A case nested in a branch is laid out the same way.
 +        struct OpenCase {
 +            const MeshTraceNode* begin;
-+            bool has_branch = false;
++            uint32_t branches = 0;
 +            uint32_t skip_to_next_branch = 0;
 +            std::vector<uint32_t> skips_to_end;
 +        };
@@ -300,22 +292,18 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 +                case MeshTraceNode::CaseMarker::Branch: {
 +                    TT_FATAL(!open_cases.empty(), "record_case_branch needs an open record_case_begin");
 +                    OpenCase& open = open_cases.back();
-+                    if (open.has_branch) {
++                    if (open.branches != 0) {
 +                        emit_boundary(/*stall_prefetcher=*/false);
 +                        open.skips_to_end.push_back(emit_skip(CQ_PREFETCH_EXEC_BUF_SKIP_ALWAYS, *open.begin, 0));
 +                        land_skip(open.skip_to_next_branch);
 +                    }
-+                    open.skip_to_next_branch = emit_skip(
-+                        marker.case_branch_equal ? CQ_PREFETCH_EXEC_BUF_SKIP_IF_NOT_EQUAL
-+                                                 : CQ_PREFETCH_EXEC_BUF_SKIP_IF_EQUAL,
-+                        *open.begin,
-+                        marker.case_branch_value);
-+                    open.has_branch = true;
++                    open.skip_to_next_branch =
++                        emit_skip(CQ_PREFETCH_EXEC_BUF_SKIP_IF_NOT_EQUAL, *open.begin, open.branches++);
 +                    break;
 +                }
 +                case MeshTraceNode::CaseMarker::End: {
 +                    TT_FATAL(
-+                        !open_cases.empty() && open_cases.back().has_branch,
++                        !open_cases.empty() && open_cases.back().branches != 0,
 +                        "record_case_end needs an open record_case_begin with a branch");
 +                    OpenCase& open = open_cases.back();
 +                    emit_boundary(/*stall_prefetcher=*/false);
@@ -348,29 +336,27 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 diff --git tt_metal/distributed/fd_mesh_command_queue.hpp tt_metal/distributed/fd_mesh_command_queue.hpp
 --- tt_metal/distributed/fd_mesh_command_queue.hpp
 +++ tt_metal/distributed/fd_mesh_command_queue.hpp
-@@ -123,7 +123,16 @@
+@@ -123,7 +123,14 @@
          std::vector<std::pair<MeshCoordinateRange, TraceNode>> trace_nodes;
          bool multicast_go_signals{false};
          SubDeviceId sub_device_id;
 +        // Instead of a workload, a marker of a trace case (record_case_begin); a Begin marker holds the interleaved
-+        // DRAM buffer whose page 0 starts with the index, a Branch marker its test.
++        // DRAM buffer whose page 0 starts with the index.
 +        enum class CaseMarker : uint8_t { None, Begin, Branch, End } case_marker{CaseMarker::None};
 +        uint32_t case_index_address{0};
 +        uint8_t case_index_log2_page_size{0};
 +        uint8_t case_index_bits{32};
-+        uint32_t case_branch_value{0};
-+        bool case_branch_equal{true};
      };
-+    void push_case_marker(MeshTraceNode&& marker);
++    void record_case_marker(MeshTraceNode::CaseMarker marker, const MeshBuffer* index = nullptr, uint8_t index_bits = 32);
  
      // The following data structures are only popiulated when the MeshCQ is being used to trace workloads
      // i.e. between record_begin() and record_end() being called
-@@ -288,6 +297,9 @@
+@@ -288,6 +295,9 @@
          ttsl::Span<const uint32_t> workers_per_sub_device) override;
      void record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) override;
      void record_end() override;
 +    void record_case_begin(const MeshBuffer& index, uint8_t index_bits) override;
-+    void record_case_branch(uint32_t value, bool equal) override;
++    void record_case_branch() override;
 +    void record_case_end() override;
      void enqueue_trace(const MeshTraceId& trace_id, bool blocking) override;
      // Enqueue a command list without entering the mesh-trace lifecycle.
@@ -378,16 +364,14 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.hpp tt_metal/distributed/f
 diff --git tt_metal/distributed/mesh_command_queue_base.hpp tt_metal/distributed/mesh_command_queue_base.hpp
 --- tt_metal/distributed/mesh_command_queue_base.hpp
 +++ tt_metal/distributed/mesh_command_queue_base.hpp
-@@ -138,6 +138,14 @@
+@@ -138,6 +138,12 @@
          const std::optional<std::unordered_set<MeshCoordinate>>& shards,
          bool blocking) override;
  
 +    void record_case_begin(const MeshBuffer& /*index*/, uint8_t /*index_bits*/) override {
 +        TT_THROW("Trace cases need a fast dispatch command queue");
 +    }
-+    void record_case_branch(uint32_t /*value*/, bool /*equal*/) override {
-+        TT_THROW("Trace cases need a fast dispatch command queue");
-+    }
++    void record_case_branch() override { TT_THROW("Trace cases need a fast dispatch command queue"); }
 +    void record_case_end() override { TT_THROW("Trace cases need a fast dispatch command queue"); }
 +
      // Returns true if the CQ is in use (has had commands enqueued).

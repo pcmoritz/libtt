@@ -112,10 +112,10 @@ TEST_F(TraceCaseTest, ReplaysTheBranchTheIndexSelects) {
     const MeshTraceId trace = mesh_device_->begin_mesh_trace(cq());
     enqueue(start);
     cq().record_case_begin(*index_);
-    cq().record_case_branch(0);
+    cq().record_case_branch();
     // Three launches in one branch against one in the other.
     enqueue(add_one, 3);
-    cq().record_case_branch(1);
+    cq().record_case_branch();
     enqueue(add_ten);
     cq().record_case_end();
     enqueue(finish);
@@ -138,9 +138,9 @@ TEST_F(TraceCaseTest, TestsTheLowBitsOfTheIndex) {
     const MeshTraceId trace = mesh_device_->begin_mesh_trace(cq());
     enqueue(start);
     cq().record_case_begin(*index_, /*index_bits=*/15);
-    cq().record_case_branch(0);
+    cq().record_case_branch();
     enqueue(add_one);
-    cq().record_case_branch(1);
+    cq().record_case_branch();
     enqueue(add_ten);
     cq().record_case_end();
     mesh_device_->end_mesh_trace(cq(), trace);
@@ -153,32 +153,6 @@ TEST_F(TraceCaseTest, TestsTheLowBitsOfTheIndex) {
     mesh_device_->release_mesh_trace(trace);
 }
 
-TEST_F(TraceCaseTest, RecordsBranchesInAnyOrder) {
-    MeshWorkload& start = write(0);
-    MeshWorkload& add_one = add(1);
-    MeshWorkload& add_ten = add(10);
-    MeshWorkload& add_hundred = add(100);
-    // Branch 2 first, then the branch for any nonzero index but 2, then the one for 0.
-    const MeshTraceId trace = mesh_device_->begin_mesh_trace(cq());
-    enqueue(start);
-    cq().record_case_begin(*index_);
-    cq().record_case_branch(2);
-    enqueue(add_hundred);
-    cq().record_case_branch(0, /*equal=*/false);
-    enqueue(add_ten);
-    cq().record_case_branch(0);
-    enqueue(add_one);
-    cq().record_case_end();
-    mesh_device_->end_mesh_trace(cq(), trace);
-
-    for (uint32_t index : {0u, 2u, 1u, 7u, 2u, 0u}) {
-        set(index_, index);
-        mesh_device_->replay_mesh_trace(cq(), trace, true);
-        expect_out(index == 2 ? 100 : index != 0 ? 10 : 1);
-    }
-    mesh_device_->release_mesh_trace(trace);
-}
-
 TEST_F(TraceCaseTest, SelectsOneOfManyBranches) {
     MeshWorkload& start = write(0);
     MeshWorkload& add_one = add(1);
@@ -187,12 +161,12 @@ TEST_F(TraceCaseTest, SelectsOneOfManyBranches) {
     const MeshTraceId trace = mesh_device_->begin_mesh_trace(cq());
     enqueue(start);
     cq().record_case_begin(*index_);
-    cq().record_case_branch(0);
+    cq().record_case_branch();
     enqueue(add_one);
-    cq().record_case_branch(1);
+    cq().record_case_branch();
     enqueue(add_ten, 2);
-    cq().record_case_branch(2);
-    cq().record_case_branch(3);
+    cq().record_case_branch();
+    cq().record_case_branch();
     enqueue(add_hundred, 3);
     cq().record_case_end();
     mesh_device_->end_mesh_trace(cq(), trace);
@@ -217,16 +191,16 @@ TEST_F(TraceCaseTest, CasesStartAndEndTheTrace) {
     // trace is still running when it ends.
     const MeshTraceId trace = mesh_device_->begin_mesh_trace(cq());
     cq().record_case_begin(*index_);
-    cq().record_case_branch(0);
+    cq().record_case_branch();
     enqueue(add_one);
-    cq().record_case_branch(1);
+    cq().record_case_branch();
     enqueue(add_ten);
     cq().record_case_end();
     enqueue(add_hundred);
     cq().record_case_begin(*index_);
-    cq().record_case_branch(0);
+    cq().record_case_branch();
     enqueue(add_one, 2);
-    cq().record_case_branch(1);
+    cq().record_case_branch();
     cq().record_case_end();
     mesh_device_->end_mesh_trace(cq(), trace);
 
@@ -252,20 +226,20 @@ TEST_F(TraceCaseTest, CasesNest) {
     const MeshTraceId trace = mesh_device_->begin_mesh_trace(cq());
     enqueue(start);
     cq().record_case_begin(*index_);
-    cq().record_case_branch(0);
+    cq().record_case_branch();
     enqueue(add_one);
     cq().record_case_begin(*inner);
-    cq().record_case_branch(0);
+    cq().record_case_branch();
     enqueue(add_ten);
-    cq().record_case_branch(1);
+    cq().record_case_branch();
     enqueue(add_hundred, 2);
     cq().record_case_end();
     enqueue(add_thousand);
-    cq().record_case_branch(1);
+    cq().record_case_branch();
     // A case at the start of a branch, with an empty branch.
     cq().record_case_begin(*inner);
-    cq().record_case_branch(0);
-    cq().record_case_branch(1);
+    cq().record_case_branch();
+    cq().record_case_branch();
     enqueue(add_ten, 3);
     cq().record_case_end();
     cq().record_case_end();
@@ -294,9 +268,9 @@ TEST_F(TraceCaseTest, ReadsAnIndexTheTraceJustWrote) {
     enqueue(start);
     enqueue(compute_index);
     cq().record_case_begin(*index_);
-    cq().record_case_branch(0);
+    cq().record_case_branch();
     enqueue(add_one);
-    cq().record_case_branch(1);
+    cq().record_case_branch();
     enqueue(add_ten);
     cq().record_case_end();
     mesh_device_->end_mesh_trace(cq(), trace);
@@ -321,11 +295,11 @@ TEST_F(TraceCaseTest, SkipsBranchesLargerThanThePrefetchBuffer) {
     const MeshTraceId trace = mesh_device_->begin_mesh_trace(cq());
     enqueue(start);
     cq().record_case_begin(*index_);
-    cq().record_case_branch(0);
+    cq().record_case_branch();
     enqueue(add_one, kLaunches);
-    cq().record_case_branch(1);
+    cq().record_case_branch();
     enqueue(add_ten);
-    cq().record_case_branch(2);
+    cq().record_case_branch();
     enqueue(add_ten, kLaunches);
     cq().record_case_end();
     enqueue(add_one);

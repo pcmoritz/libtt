@@ -145,10 +145,9 @@ def test_host_runs_ahead_of_the_device():
 
 @pytest.mark.parametrize("computed", [False, True])
 def test_results_passed_through_from_dead_and_live_inputs(computed):
-    # A branch that returns its input unchanged hands the case the input's
-    # buffer when nothing reads the input after the case; the other branch then
-    # writes its result into that buffer. An input still read after the case,
-    # or one the caller passed, keeps its value.
+    # A branch that returns its input unchanged, whether nothing reads the
+    # input after the case, it is still read, or the caller passed it: the
+    # case's result must take the input's value, and the input keep it.
     def run(x, flag):
         pred = (x.sum() > 0) if computed else flag
         y = x * 2

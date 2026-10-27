@@ -20,14 +20,15 @@ nothing and fetch none of the data they would relay; their bytes are still read
 from DRAM.
 
 During capture, `MeshCommandQueue::record_case_begin(index, index_bits)`,
-`record_case_branch(value, equal)` and `record_case_end()` record markers
-among the workloads. `record_end` lays out a case as
+`record_case_branch()` and `record_case_end()` record markers among the
+workloads; the k-th branch runs for index k, and the last one for any index
+the others do not take. `record_end` lays out a case as
 
     boundary + prefetcher stall
-    skip if branch 0's test fails -> b1; branch 0; boundary; skip -> end
-    b1: skip if branch 1's test fails -> b2; branch 1; boundary; skip -> end
+    skip if index != 0 -> b1; branch 0; boundary; skip -> end
+    b1: skip if index != 1 -> b2; branch 1; boundary; skip -> end
     ...
-    last branch (taken when no test passes); boundary
+    last branch; boundary
     end:
 
 A boundary returns the device to the state a replay starts in, with the
@@ -49,7 +50,7 @@ replay resets its launch state first.
 `tests/tt_metal/test_trace_case.cpp` replays traces with two-way and many-way
 cases, empty and nested branches, cases at both ends of a trace, an index a
 slow kernel writes just before the case, branches larger than the prefetcher's
-command buffer, masked indices and branches recorded out of order.
+command buffer and masked indices.
 
 ## Up the stack
 
@@ -63,23 +64,17 @@ command buffer, masked indices and branches recorded out of order.
 - During a trace's capture program (the uncaptured warmup, the captured run and
   the first replay), the case handler runs every branch, between the markers
   while the queue records, and leaves their results in the same buffers. The
-  warmup compiles every branch and reads the index on host, and the capture
-  lays out the branch it took first: that branch's results become the case's,
-  so the replays that take it copy nothing. The other branches copy their
-  results into them.
-- A result a branch passes through from an input the case is the last to read
-  takes over that input's buffer: the hoist makes the other branches copy their
-  result into the input and return it, and no branch copies anything for the
-  one that passes it through. The capture program writes host-staged inputs
-  again after the warmup, which may have written into a donated slot.
+  warmup compiles every branch. The first branch's results become the case's,
+  and the other branches copy their results into them; so does the first for
+  a result that is not a fresh buffer of its own, such as an input it passes
+  through.
 - The index is tested in place where its type allows (32-bit integers, and the
   bits of a floating-point predicate but its sign); other types are converted
   first.
 
 Since the warmup runs every branch, a case stays out of the trace if a branch
-(or a loop body it runs) writes into anything but its own values and the input
-it was donated, such as a cache it updates in place; it then runs eagerly as
-before. Loops whose trip count the device decides still run eagerly too.
+(or a loop body it runs) writes into anything but its own values, such as a
+cache it updates in place; it then runs eagerly as before. Loops whose trip count the device decides still run eagerly too.
 
 `tests/libtt/traced_device_case_regression_test.py` checks conditionals on
 computed values, through counted loops, results passed through from dead and
