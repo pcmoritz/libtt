@@ -1,15 +1,7 @@
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -3,6 +3,7 @@
- // SPDX-License-Identifier: Apache-2.0
- 
- #include "mlir/IR/BuiltinTypes.h"
-+#include "mlir/Interfaces/SideEffectInterfaces.h"
- #include "mlir/Support/LLVM.h"
- #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
- #include "ttmlir/Dialect/TTCore/IR/Utils.h"
-@@ -91,6 +92,26 @@
+@@ -91,6 +91,26 @@
             llvm::all_of(op->getResultTypes(), isOnDeviceType);
    }
  
@@ -36,7 +28,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
    static bool isOnDeviceType(Type type) {
      auto tensor = mlir::dyn_cast<RankedTensorType>(type);
      return !tensor || utils::isTensorOnDevice(tensor);
-@@ -419,7 +440,10 @@
+@@ -419,7 +439,10 @@
      llvm::SmallVector<mlir::DictionaryAttr> newArgAttrs;
  
      for (size_t i = 0; i < numTensorInputs; i++) {
@@ -48,7 +40,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
        newArgAttrs.push_back(inputAttrs[i]);
      }
      for (mlir::Type outputType : outputTypes) {
-@@ -516,8 +540,7 @@
+@@ -516,8 +539,7 @@
        if (i < numDeviceResident) {
          info.inputSlotTypes.push_back(tensorType);
        } else {
@@ -58,7 +50,39 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
        }
      }
      for (size_t i = numTensorInputs; i < inputs.size(); i++) {
-@@ -1106,25 +1129,84 @@
+@@ -699,25 +721,12 @@
+       traceCallArgs.push_back(captureFunc.getArgument(semaphoreBase + i));
+     }
+ 
+-    // Warmup must not advance caller-owned recurrent state. Compile against
+-    // temporary cache copies; capture and replay use the original slots.
+-    // The deallocation pass releases these copies after the warmup call.
+-    llvm::SmallVector<mlir::Value> warmupArgs(traceCallArgs);
+-    for (size_t i : info.deviceResidentIndices()) {
+-      if (!info.inputArgAttrs[i].contains(ttcore::g_recurrentCacheAttrName)) {
+-        continue;
+-      }
+-      auto scratch =
+-          createSlot(builder, captureFunc.getLoc(), deviceOp,
+-                     mlir::cast<RankedTensorType>(inputSlots[i].getType()));
+-      builder.create<ttnn::CopyOp>(captureFunc.getLoc(), inputSlots[i],
+-                                   scratch);
+-      warmupArgs[i] = scratch;
+-    }
+-
+-    // Execute the trace function once without capture to compile programs and
+-    // populate program cache.
+-    builder.create<func::CallOp>(captureFunc.getLoc(), traceFunc, warmupArgs);
++    // Run the trace function once without capture to compile its programs and
++    // write their binaries. The runtime only prepares the workloads here
++    // (MeshCommandQueue::set_prepare_only), so the warmup changes nothing on
++    // device, such as a cache the function updates in place.
++    builder.create<func::CallOp>(captureFunc.getLoc(), traceFunc,
++                                 traceCallArgs);
+ 
+     auto beginTraceCaptureOp = builder.create<ttnn::BeginTraceCaptureOp>(
+         captureFunc.getLoc(), utils::getTraceIdType(context), deviceOp,
+@@ -1106,25 +1115,51 @@
      }
      auto body = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
          op, loop.getBodyProgramAttr());
@@ -92,43 +116,10 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +    return llvm::all_of(caseOp.getBranchPrograms(), [&](Attribute branch) {
 +      auto program = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
 +          op, mlir::cast<FlatSymbolRefAttr>(branch));
-+      return program && isCapturableProgram(program) &&
-+             writesOnlyItsOwn(program);
++      return program && isCapturableProgram(program);
      });
    }
  
-+  // Whether `program`, a branch of a traced case or a loop body it runs,
-+  // writes only into values of its own: the warmup before a capture runs
-+  // every branch, so a branch must leave alone what another one reads.
-+  bool writesOnlyItsOwn(func::FuncOp program) {
-+    return llvm::all_of(
-+        program.front().without_terminator(), [&](Operation &op) {
-+          if (auto loop = mlir::dyn_cast<ttcore::WhileLoopOp>(&op)) {
-+            auto body = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
-+                &op, loop.getBodyProgramAttr());
-+            return body && writesOnlyItsOwn(body);
-+          }
-+          // A nested case is traced only if its own branches pass this check.
-+          if (mlir::isa<ttcore::CaseOp>(&op)) {
-+            return true;
-+          }
-+          auto effects = mlir::dyn_cast<MemoryEffectOpInterface>(&op);
-+          if (!effects) {
-+            return true;
-+          }
-+          // An in-place op declares a write of its own besides the writes
-+          // into its operands; one that names no operand writes anything.
-+          llvm::SmallVector<MemoryEffects::EffectInstance> writes;
-+          effects.getEffects<MemoryEffects::Write>(writes);
-+          bool named = llvm::any_of(
-+              writes, [](auto &write) { return write.getValue() != nullptr; });
-+          return llvm::none_of(writes, [&](auto &write) {
-+            return !named ||
-+                   mlir::isa_and_present<BlockArgument>(write.getValue());
-+          });
-+        });
-+  }
-+
 +  // Whether a program that a traced op runs replays from the trace too. The
 +  // device handle and const-eval loads are harmless inside the capture (a
 +  // load is a cache hit after the uncaptured warmup); a creation op is not,
@@ -155,24 +146,70 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
    }
  
    // Ops that depend on nothing a trace computes: the device handle,
+diff --git a/runtime/lib/ttnn/operations/cache/load_cached.cpp b/runtime/lib/ttnn/operations/cache/load_cached.cpp
+--- a/runtime/lib/ttnn/operations/cache/load_cached.cpp
++++ b/runtime/lib/ttnn/operations/cache/load_cached.cpp
+@@ -69,7 +69,13 @@
+   const size_t programIndex = op->program_idx();
+   ProgramExecutor exec(context.getDeviceHandle(), context.getExecutableHandle(),
+                        programIndex, inputs, /*constEvalProgram=*/true);
++  // Constants are computed even while a trace's warmup only prepares its
++  // workloads.
++  auto &cq = context.getMeshDevice().mesh_command_queue();
++  const bool preparing = cq.prepare_only();
++  cq.set_prepare_only(false);
+   exec.execute();
++  cq.set_prepare_only(preparing);
+   LOG_DEBUG("executed sub-func: ", constEvalFuncname);
+   std::vector<::tt::runtime::Tensor> outputs = exec.gatherOutputTensors();
+ 
+diff --git a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
+--- a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
++++ b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
+@@ -17,9 +17,11 @@
+   LOG_ASSERT(meshDevice.get_program_cache().is_enabled(),
+              "Program cache must be enabled");
+ 
+-  // The capture program first executes the workload uncaptured to populate the
+-  // program cache. Drain that work before switching the command queue into
+-  // bypass mode; otherwise outstanding commands can race trace capture.
++  // The capture program first prepares the workloads, uncaptured, to compile
++  // them and write their binaries without running them. Drain those writes
++  // before switching the command queue into bypass mode; otherwise outstanding
++  // commands can race trace capture.
++  meshDevice.mesh_command_queue(op->cq_id()).set_prepare_only(false);
+   meshDevice.mesh_command_queue(op->cq_id()).finish();
+ 
+   ::ttnn::MeshTraceId traceId =
 diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 --- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 +++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
-@@ -230,6 +230,23 @@
+@@ -230,6 +230,34 @@
  // It therefore cannot move a buffer that a sibling cached trace baked into its
  // command stream; TT-Metal's footprint-overlap check is the replay-safety
  // signal.
 +static thread_local bool tlsInTraceCaptureProgram = false;
 +
 +namespace {
++// While a capture program runs. Its warmup before the capture compiles the
++// workloads and writes their binaries without running them (begin_trace_capture
++// ends that), so it changes nothing on device; tt-metal can capture only
++// workloads whose binaries are on device.
 +class InTraceCaptureProgram {
 +public:
-+  InTraceCaptureProgram() : previous(tlsInTraceCaptureProgram) {
++  explicit InTraceCaptureProgram(
++      ::tt::tt_metal::distributed::MeshCommandQueue &cq)
++      : cq(cq), previous(tlsInTraceCaptureProgram) {
 +    tlsInTraceCaptureProgram = true;
++    cq.set_prepare_only(true);
 +  }
-+  ~InTraceCaptureProgram() { tlsInTraceCaptureProgram = previous; }
++  ~InTraceCaptureProgram() {
++    tlsInTraceCaptureProgram = previous;
++    cq.set_prepare_only(false);
++  }
 +
 +private:
++  ::tt::tt_metal::distributed::MeshCommandQueue &cq;
 +  bool previous;
 +};
 +} // namespace
@@ -182,13 +219,14 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
  static TraceVariant captureTrace(
      const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
      ProgramContext &context,
-@@ -275,7 +292,10 @@
+@@ -275,7 +303,11 @@
    ProgramExecutor executor(deviceHandle, context.getExecutableHandle(),
                             op->capture_program_id(), captureInputs,
                             /*constEvalProgram=*/false, semaphoreInputs);
 -  executor.execute();
 +  {
-+    InTraceCaptureProgram inCaptureProgram;
++    InTraceCaptureProgram inCaptureProgram(
++        context.getMeshDevice().mesh_command_queue());
 +    executor.execute();
 +  }
    std::vector<::tt::runtime::Tensor> outputTensors =

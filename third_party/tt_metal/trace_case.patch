@@ -1,7 +1,34 @@
 diff --git tt_metal/api/tt-metalium/mesh_command_queue.hpp tt_metal/api/tt-metalium/mesh_command_queue.hpp
 --- tt_metal/api/tt-metalium/mesh_command_queue.hpp
 +++ tt_metal/api/tt-metalium/mesh_command_queue.hpp
-@@ -129,6 +129,14 @@
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <stdint.h>
+ #include <memory>
+ #include <optional>
+@@ -53,6 +54,7 @@
+ protected:
+     MeshDevice* mesh_device_ = nullptr;
+     uint32_t id_ = 0;
++    std::atomic<bool> prepare_only_ = false;
+ 
+     MeshCommandQueue(MeshDevice* mesh_device, uint32_t id) : mesh_device_(mesh_device), id_(id) {}
+ 
+@@ -64,6 +66,10 @@
+ 
+     MeshDevice* device() const { return mesh_device_; }
+     uint32_t id() const { return id_; }
++    // While set, EnqueueMeshWorkload on a fast dispatch queue compiles a workload and writes its kernel binaries to
++    // the device, but does not run it: a trace captured afterwards can record a workload that never ran.
++    void set_prepare_only(bool prepare_only) { prepare_only_ = prepare_only; }
++    bool prepare_only() const { return prepare_only_; }
+     virtual std::optional<MeshTraceId> trace_id() const = 0;
+     virtual WorkerConfigBufferMgr& get_config_buffer_mgr(uint32_t index) = 0;
+     virtual void enqueue_mesh_workload(MeshWorkload& mesh_workload, bool blocking) = 0;
+@@ -129,6 +135,14 @@
      virtual void finish(ttsl::Span<const SubDeviceId> sub_device_ids = {}) = 0;
      virtual void record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) = 0;
      virtual void record_end() = 0;
@@ -16,6 +43,21 @@ diff --git tt_metal/api/tt-metalium/mesh_command_queue.hpp tt_metal/api/tt-metal
      virtual void enqueue_trace(const MeshTraceId& trace_id, bool blocking) = 0;
  };
  
+diff --git tt_metal/distributed/distributed.cpp tt_metal/distributed/distributed.cpp
+--- tt_metal/distributed/distributed.cpp
++++ tt_metal/distributed/distributed.cpp
+@@ -121,6 +121,11 @@
+         mesh_workload.impl().compile(mesh_cq.device());
+         mesh_workload.impl().load_binaries(mesh_cq);
+         mesh_workload.impl().generate_dispatch_commands(mesh_cq);
++        if (mesh_cq.prepare_only()) {
++            // Whatever the queue runs later reads the binaries after they are written.
++            mesh_workload.impl().set_program_binary_status(mesh_cq.device()->id(), ProgramBinaryStatus::Committed);
++            return;
++        }
+     } else if (env.get_cluster().get_target_device_type() == tt::TargetDevice::Mock) {
+         // Slow dispatch normally JIT-compiles inside LaunchProgram, but the SD mesh CQ
+         // short-circuits for mock devices (no hardware to dispatch to). Compile here so
 diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/fd_mesh_command_queue.cpp
 --- tt_metal/distributed/fd_mesh_command_queue.cpp
 +++ tt_metal/distributed/fd_mesh_command_queue.cpp

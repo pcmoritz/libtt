@@ -201,9 +201,9 @@ std::pair<::ttnn::Tensor, uint8_t> prepareCaseIndex(::ttnn::Tensor index,
 // Runs a case inside a trace's capture program: every branch runs and leaves
 // its results in the same buffers, and while the queue records, between
 // markers that make a replay run only the branch the index selects. The host
-// never reads the index while the trace replays. The uncaptured warmup before
-// the capture runs every branch too, which compiles them; a branch therefore
-// must not change state that another branch reads.
+// never reads the index while the trace replays. The warmup before the capture
+// runs every branch too, which compiles them; it runs no workload
+// (MeshCommandQueue::set_prepare_only), so a branch may write into its inputs.
 void runCaseInTrace(const ::tt::target::ttnn::CaseOp *op,
                     ProgramContext &context, const ::ttnn::Tensor &index) {
   ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();

@@ -50,7 +50,7 @@ replay resets its launch state first.
 `tests/tt_metal/test_trace_case.cpp` replays traces with two-way and many-way
 cases, empty and nested branches, cases at both ends of a trace, an index a
 slow kernel writes just before the case, branches larger than the prefetcher's
-command buffer and masked indices.
+command buffer, masked indices, and workloads that were only prepared.
 
 ## Up the stack
 
@@ -64,19 +64,25 @@ command buffer and masked indices.
 - During a trace's capture program (the uncaptured warmup, the captured run and
   the first replay), the case handler runs every branch, between the markers
   while the queue records, and leaves their results in the same buffers. The
-  warmup compiles every branch. The first branch's results become the case's,
-  and the other branches copy their results into them; so does the first for
-  a result that is not a fresh buffer of its own, such as an input it passes
-  through.
+  first branch's results become the case's, and the other branches copy their
+  results into them; so does the first for a result that is not a fresh buffer
+  of its own, such as an input it passes through.
+- tt-metal captures only workloads whose kernel binaries are on device, so the
+  warmup compiles every branch. It runs nothing: while it runs, the command
+  queue only prepares the workloads enqueued to it (compiles them and writes
+  their binaries; `MeshCommandQueue::set_prepare_only` in `trace_case.patch`),
+  and `begin_trace_capture` ends that. A branch may therefore write into what
+  another branch reads, such as a cache it updates in place, and the warmup
+  advances no state of the traced function. Constants a branch loads are still
+  computed for real.
 - The index is tested in place where its type allows (32-bit integers, and the
   bits of a floating-point predicate but its sign); other types are converted
   first.
 
-Since the warmup runs every branch, a case stays out of the trace if a branch
-(or a loop body it runs) writes into anything but its own values, such as a
-cache it updates in place; it then runs eagerly as before. Loops whose trip count the device decides still run eagerly too.
+Loops whose trip count the device decides still run eagerly.
 
 `tests/libtt/traced_device_case_regression_test.py` checks conditionals on
 computed values, through counted loops, results passed through from dead and
-live inputs, that the function stays one trace, and that the call returns
-before the device finishes the work queued ahead of it.
+live inputs, a branch that writes a cache in place, that the function stays
+one trace, and that the call returns before the device finishes the work
+queued ahead of it.

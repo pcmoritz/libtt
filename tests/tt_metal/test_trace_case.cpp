@@ -5,7 +5,8 @@
 // does not select, and every branch ends by returning the device to the state a
 // replay starts in. Replays alternate between branches of different lengths,
 // cases nest, a case may start or end the trace, and eager work after a replay
-// sees consistent dispatch state.
+// sees consistent dispatch state. A trace can record workloads that were only
+// prepared and never ran.
 
 #include <gtest/gtest.h>
 
@@ -62,6 +63,16 @@ protected:
     MeshWorkload& warmed(const std::string& kernel, const std::vector<uint32_t>& args) {
         workloads_.push_back(std::make_unique<MeshWorkload>(single_core_workload(kernel, args)));
         EnqueueMeshWorkload(cq(), *workloads_.back(), true);
+        return *workloads_.back();
+    }
+
+    // A workload on out_ that is compiled and has its binaries on device, but never ran.
+    MeshWorkload& prepared(const std::string& kernel, uint32_t value) {
+        workloads_.push_back(
+            std::make_unique<MeshWorkload>(single_core_workload(kernel, {address(*out_), value, address(*scratch_)})));
+        cq().set_prepare_only(true);
+        EnqueueMeshWorkload(cq(), *workloads_.back(), false);
+        cq().set_prepare_only(false);
         return *workloads_.back();
     }
 
@@ -311,6 +322,34 @@ TEST_F(TraceCaseTest, SkipsBranchesLargerThanThePrefetchBuffer) {
         expect_out((index == 0 ? kLaunches : index == 1 ? 10 : 10 * kLaunches) + 1);
     }
     mesh_device_->release_mesh_trace(trace);
+}
+
+TEST_F(TraceCaseTest, RecordsWorkloadsThatWereOnlyPrepared) {
+    set(out_, 5);
+    MeshWorkload& start = prepared("write_value.cpp", 100);
+    MeshWorkload& add_one = prepared("add_value.cpp", 1);
+    MeshWorkload& add_ten = prepared("add_value.cpp", 10);
+    expect_out(5);
+    const MeshTraceId trace = mesh_device_->begin_mesh_trace(cq());
+    enqueue(start);
+    cq().record_case_begin(*index_);
+    cq().record_case_branch();
+    enqueue(add_one);
+    cq().record_case_branch();
+    enqueue(add_ten);
+    cq().record_case_end();
+    mesh_device_->end_mesh_trace(cq(), trace);
+
+    for (uint32_t index : {1u, 0u, 1u}) {
+        set(index_, index);
+        mesh_device_->replay_mesh_trace(cq(), trace, true);
+        expect_out(index == 0 ? 101 : 110);
+    }
+    mesh_device_->release_mesh_trace(trace);
+    // They run eagerly as well.
+    enqueue(add_one);
+    cq().finish();
+    expect_out(111);
 }
 
 }  // namespace

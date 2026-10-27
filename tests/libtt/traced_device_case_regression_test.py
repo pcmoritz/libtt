@@ -170,3 +170,44 @@ def test_results_passed_through_from_dead_and_live_inputs(computed):
         np.testing.assert_array_equal(np.asarray(dead), (x * 6 if take else x * 2) + 1)
         np.testing.assert_array_equal(np.asarray(live), (x + 9 if take else x - 1) + x - 1)
         np.testing.assert_array_equal(np.asarray(passed), x * 5 if take else x)
+
+
+def test_only_the_selected_branch_writes_in_place(tmp_path):
+    # A branch that writes into the cache in place. The call that captures the
+    # trace prepares every branch first, to compile it; the ones the flag does
+    # not select must not write into the cache then. The write before the case
+    # keeps the cache in its own buffer on device, as a model's KV cache,
+    # rather than staging it into a slot.
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(0)
+    pages = np.tile(np.arange(16, dtype=np.int32)[::-1], (16, 1))
+    first, second = np.arange(16, dtype=np.int32) + 24, np.arange(16, dtype=np.int32) + 64
+
+    def write(cache, values, positions):
+        return jax.ffi.ffi_call(
+            "tt.paged_update_cache",
+            jax.ShapeDtypeStruct(cache.shape, cache.dtype),
+            input_output_aliases={0: 0},
+        )(cache, values, _put(positions), _put(pages), share_cache=True)
+
+    def step(cache, values, flag):
+        cache = write(cache, values, first)
+        return lax.cond(flag, lambda c: write(c, values * 2, second), lambda c: c, cache)
+
+    step = jax.jit(
+        step,
+        donate_argnums=(0,),
+        compiler_options={"optimization_level": "O1", "enable_trace": "true", "export_path": str(tmp_path)},
+    )
+    flags = {value: _put(np.bool_(value)) for value in (False, True)}
+    expected = np.asarray(rng.normal(size=(17, 8, 32, 128)), dtype=jnp.bfloat16)
+    cache = _put(expected.copy())
+    for take in [False, True, False, True]:
+        values = np.asarray(rng.normal(size=(1, 16, 8, 128)), dtype=jnp.bfloat16)
+        cache = step(cache, _put(values), flags[take])
+        for positions, scale in [(first, 1)] + [(second, 2)] * take:
+            for row, index in enumerate(positions):
+                expected[pages[row, index // 32], :, index % 32, :] = values[0, row] * scale
+        np.testing.assert_array_equal(np.asarray(cache), expected, err_msg=str(take))
+    traces, cases = _ops_per_function(tmp_path)
+    assert traces["main"] == 1 and cases["main"] == 0, (traces, cases)
