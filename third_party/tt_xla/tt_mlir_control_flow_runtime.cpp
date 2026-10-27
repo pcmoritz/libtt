@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "operations/mlir_native/func_call.h"
+#include "operations/trace/capture_or_execute_trace.h"
 #include "tt/runtime/detail/common/logger.h"
 #include "tt/runtime/detail/ttnn/program_executor.h"
 #include "tt/runtime/detail/ttnn/ttnn.h"
@@ -11,6 +12,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <numeric>
+#include <optional>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -150,6 +154,211 @@ bool readConditionScalar(const ::tt::runtime::Tensor &tensor) {
   });
 }
 
+// The branch a case runs for the index, read on host.
+size_t selectBranch(const ::tt::target::ttnn::CaseOp *op,
+                    const ::tt::runtime::Tensor &index) {
+  int64_t branchIndex = op->branch_program_ids()->size() == 2
+                            ? static_cast<int64_t>(readConditionScalar(index))
+                            : readIntegerScalar(index);
+  // StableHLO selects the last branch for any out-of-range index, including a
+  // negative index.
+  if (branchIndex >= 0 &&
+      static_cast<uint64_t>(branchIndex) < op->branch_program_ids()->size()) {
+    return static_cast<size_t>(branchIndex);
+  }
+  return op->branch_program_ids()->size() - 1;
+}
+
+// The branch each trace case ran in the warmup before its capture.
+thread_local std::unordered_map<const ::tt::target::ttnn::CaseOp *, size_t>
+    warmupBranches;
+
+const ::ttnn::Tensor &ttnnTensor(const ::tt::runtime::Tensor &tensor) {
+  return tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
+}
+
+// The index a trace case tests, in page 0 of an interleaved DRAM buffer, and
+// the number of low bits of the page's first word that hold it. Element 0 is
+// at the start of the page in either layout. A floating-point index is a
+// predicate (an i1), so a two-way case tests all its bits but the sign.
+std::pair<::ttnn::Tensor, uint8_t> prepareCaseIndex(::ttnn::Tensor index,
+                                                    size_t branches) {
+  uint8_t bits = 0;
+  switch (index.dtype()) {
+  case ::ttnn::DataType::INT32:
+  case ::ttnn::DataType::UINT32:
+    bits = 32;
+    break;
+  case ::ttnn::DataType::UINT16:
+    bits = 16;
+    break;
+  case ::ttnn::DataType::UINT8:
+    bits = 8;
+    break;
+  case ::ttnn::DataType::FLOAT32:
+    bits = branches == 2 ? 31 : 0;
+    break;
+  case ::ttnn::DataType::BFLOAT16:
+  case ::ttnn::DataType::FLOAT16:
+    bits = branches == 2 ? 15 : 0;
+    break;
+  default:
+    break;
+  }
+  if (bits == 0) {
+    if (index.layout() != ::ttnn::Layout::TILE) {
+      index = ::ttnn::to_layout(index, ::ttnn::Layout::TILE);
+    }
+    index = ::ttnn::typecast(index, ::ttnn::DataType::INT32);
+    bits = 32;
+  }
+  if (!index.memory_config().is_dram() || index.memory_config().is_sharded()) {
+    index = ::ttnn::to_memory_config(
+        index, ::ttnn::MemoryConfig{::ttnn::TensorMemoryLayout::INTERLEAVED,
+                                    ::ttnn::BufferType::DRAM});
+  }
+  return {std::move(index), bits};
+}
+
+// For each output of a case, the input that every branch returns unchanged
+// there, if any. The trace hoist makes the branches return an input the case
+// is the last to read in place of a result some branch passes through, so its
+// buffer holds the result whichever branch runs.
+std::vector<std::optional<size_t>>
+passedThroughInputs(const ::tt::target::ttnn::CaseOp *op,
+                    ProgramContext &context) {
+  std::vector<std::optional<size_t>> passed(op->outputs()->size());
+  for (size_t i = 0; i < passed.size(); ++i) {
+    for (size_t branch = 0; branch < op->branch_program_ids()->size();
+         ++branch) {
+      const auto *program = utils::getProgram(
+          context.getExecutableHandle(), op->branch_program_ids()->Get(branch));
+      std::optional<size_t> input;
+      for (size_t j = 0; j < program->inputs()->size(); ++j) {
+        if (program->inputs()->Get(j)->global_id() ==
+            program->outputs()->Get(i)->global_id()) {
+          input = j;
+        }
+      }
+      if (!input || (branch != 0 && input != passed[i])) {
+        passed[i] = std::nullopt;
+        break;
+      }
+      passed[i] = input;
+    }
+  }
+  return passed;
+}
+
+// Runs a case inside a trace's capture program: every branch runs and leaves
+// its results in the same buffers, and while the queue records, between
+// markers that make a replay run only the branch the index selects. The host
+// never reads the index while the trace replays. The uncaptured warmup before
+// the capture runs every branch too, which compiles them; a branch therefore
+// must not change state that another branch reads.
+void runCaseInTrace(const ::tt::target::ttnn::CaseOp *op,
+                    ProgramContext &context,
+                    const ::tt::runtime::Tensor &indexTensor) {
+  const ::ttnn::Tensor &index = ttnnTensor(indexTensor);
+  ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();
+  ::tt::tt_metal::distributed::MeshCommandQueue &cq =
+      meshDevice.mesh_command_queue(0);
+  const bool recording = cq.trace_id().has_value();
+  const size_t branches = op->branch_program_ids()->size();
+  auto [caseIndex, indexBits] = prepareCaseIndex(index, branches);
+  std::vector<std::optional<size_t>> passed = passedThroughInputs(op, context);
+
+  std::vector<::tt::runtime::Tensor> inputs;
+  inputs.reserve(op->inputs()->size());
+  for (const auto *input : *op->inputs()) {
+    inputs.emplace_back(
+        context.getTensorPool().getRuntimeTensorAndValidate(input));
+  }
+  NestedProgramTensorRetention retention(inputs);
+
+  // The branch the warmup ran comes first and owns the result buffers, so
+  // the replays that take it copy nothing. The last branch runs for any index
+  // the others do not take, so StableHLO's last branch has to stay last, but
+  // in a two-way case, whose first test can be the condition itself.
+  size_t first = 0;
+  if (!recording) {
+    first = selectBranch(op, indexTensor);
+    warmupBranches[op] = first;
+  } else if (auto it = warmupBranches.find(op); it != warmupBranches.end()) {
+    first = it->second;
+  }
+  std::vector<size_t> order(branches);
+  std::iota(order.begin(), order.end(), 0);
+  if (first != 0 && (first + 1 < branches || branches == 2)) {
+    std::rotate(order.begin(), order.begin() + first,
+                order.begin() + first + 1);
+  }
+
+  if (recording) {
+    cq.record_case_begin(caseIndex.mesh_buffer(), indexBits);
+  }
+  std::vector<::tt::runtime::Tensor> results;
+  for (size_t position = 0; position < branches; ++position) {
+    const size_t branch = order[position];
+    if (recording) {
+      if (branches == 2 && branch == 1) {
+        cq.record_case_branch(0, /*equal=*/false);
+      } else {
+        cq.record_case_branch(static_cast<uint32_t>(branch));
+      }
+    }
+    ProgramExecutor program(context.getDeviceHandle(),
+                            context.getExecutableHandle(),
+                            op->branch_program_ids()->Get(branch), inputs,
+                            /*constEvalProgram=*/false);
+    program.execute();
+    std::vector<::tt::runtime::Tensor> outputs = program.gatherOutputTensors();
+    LOG_ASSERT(outputs.size() == op->outputs()->size(),
+               "Case branch output arity mismatch");
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      if (passed[i]) {
+        if (position == 0) {
+          results.push_back(inputs[*passed[i]]);
+        }
+        continue;
+      }
+      if (position != 0) {
+        ::ttnn::copy(ttnnTensor(outputs[i]), ttnnTensor(results[i]));
+        continue;
+      }
+      // The first branch's results become the case's, unless they are
+      // buffers another branch reads or returns twice.
+      auto sameBuffer = [&](const ::tt::runtime::Tensor &tensor) {
+        const ::ttnn::Tensor &other = ttnnTensor(tensor);
+        return other.storage_type() == ::ttnn::StorageType::DEVICE &&
+               other.mesh_buffer().address() ==
+                   ttnnTensor(outputs[i]).mesh_buffer().address();
+      };
+      if (std::none_of(inputs.begin(), inputs.end(), sameBuffer) &&
+          std::none_of(outputs.begin(), outputs.begin() + i, sameBuffer)) {
+        results.push_back(outputs[i]);
+      } else {
+        ::ttnn::Tensor copy = ::ttnn::create_device_tensor(
+            ttnnTensor(outputs[i]).tensor_spec(), &meshDevice);
+        ::ttnn::copy(ttnnTensor(outputs[i]), copy);
+        results.push_back(utils::createRuntimeTensorFromTTNN(copy));
+      }
+    }
+  }
+  if (recording) {
+    cq.record_case_end();
+  }
+
+  retention.restore();
+  for (size_t i = 0; i < results.size(); ++i) {
+    if (passed[i]) {
+      retention.retainIfInputAlias(results[i]);
+    }
+    context.getTensorPool().insertRuntimeTensorAndValidate(
+        op->outputs()->Get(i), results[i]);
+  }
+}
+
 } // namespace
 
 void run(const ::tt::target::ttnn::WhileLoopOp *op,
@@ -269,16 +478,12 @@ void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context) {
 
   ::tt::runtime::Tensor index =
       context.getTensorPool().getRuntimeTensorAndValidate(op->index());
-  int64_t branchIndex = op->branch_program_ids()->size() == 2
-                            ? static_cast<int64_t>(readConditionScalar(index))
-                            : readIntegerScalar(index);
-  // StableHLO selects the last branch for any out-of-range index, including a
-  // negative index.
-  size_t selectedBranch = op->branch_program_ids()->size() - 1;
-  if (branchIndex >= 0 &&
-      static_cast<uint64_t>(branchIndex) < op->branch_program_ids()->size()) {
-    selectedBranch = static_cast<size_t>(branchIndex);
+  if (trace::inTraceCaptureProgram() &&
+      ttnnTensor(index).storage_type() == ::ttnn::StorageType::DEVICE) {
+    runCaseInTrace(op, context, index);
+    return;
   }
+  size_t selectedBranch = selectBranch(op, index);
 
   std::vector<::tt::runtime::Tensor> inputs;
   inputs.reserve(op->inputs()->size());
