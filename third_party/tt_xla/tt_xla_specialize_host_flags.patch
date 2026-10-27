@@ -1,0 +1,260 @@
+diff --git a/pjrt_implementation/inc/api/buffer_instance.h b/pjrt_implementation/inc/api/buffer_instance.h
+--- a/pjrt_implementation/inc/api/buffer_instance.h
++++ b/pjrt_implementation/inc/api/buffer_instance.h
+@@ -86,6 +86,10 @@
+   // Returns number of buffer's dimensions.
+   size_t getNumberOfDimensions() const { return m_dimensions.size(); }
+ 
++  // Returns the value of a scalar bool copied from host. A buffer does not
++  // change, so executables can specialize on it without reading the device.
++  std::optional<bool> getHostFlag() const { return m_host_flag; }
++
+   // Returns device instance on which this buffer resides.
+   DeviceInstance *getDevice() { return m_device; }
+ 
+@@ -229,6 +233,9 @@
+   // might depend on the raw pointer to these dimensions.
+   const std::vector<std::int64_t> m_dimensions;
+ 
++  // Value of a scalar bool copied from host (getHostFlag).
++  std::optional<bool> m_host_flag;
++
+   // Device instance on which this buffer resides.
+   DeviceInstance *m_device;
+ 
+diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
+--- a/pjrt_implementation/inc/api/client_instance.h
++++ b/pjrt_implementation/inc/api/client_instance.h
+@@ -168,7 +168,8 @@
+       LoadedExecutableInstance **out_executable,
+       const std::unordered_map<std::string, std::string> &compile_options,
+       const std::optional<std::vector<int64_t>> &replica_device_ids,
+-      size_t target_num_devices = 1);
++      size_t target_num_devices = 1,
++      const std::vector<std::pair<size_t, bool>> &constant_arguments = {});
+ 
+ private:
+   tt_pjrt_status populateDevices();
+diff --git a/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h b/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h
+--- a/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h
++++ b/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h
+@@ -8,6 +8,8 @@
+ 
+ // c++ standard library includes
+ #include <cstdint>
++#include <functional>
++#include <map>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -47,6 +49,13 @@
+   // Runs execution of this loaded executable.
+   tt_pjrt_status execute(PJRT_LoadedExecutable_Execute_Args *args) override;
+ 
++  // Compiles this executable again with arguments, by index, as constants.
++  using Specializer = std::function<std::unique_ptr<LoadedExecutableInstance>(
++      const std::vector<std::pair<size_t, bool>> &)>;
++  void setSpecializer(Specializer specializer) {
++    m_specializer = std::move(specializer);
++  }
++
+ private:
+   // Returns an input tensor constructed from the provided buffer instances,
+   // prepared for execution. If we cannot reuse the already prepared tensor
+@@ -74,6 +83,16 @@
+   std::once_flag m_input_layouts_once;
+   std::vector<tt::runtime::Layout> m_input_layouts;
+ 
++  // Executions with the same host flags (BufferInstance::getHostFlag) run
++  // this executable compiled with them as constants: what depends on them,
++  // conditionals in particular, is gone, so nothing waits to read them from
++  // device. nullptr runs this executable.
++  Specializer m_specializer;
++  std::mutex m_specializations_mutex;
++  std::map<std::vector<std::pair<size_t, bool>>,
++           std::unique_ptr<LoadedExecutableInstance>>
++      m_specializations;
++
+   // Creates flatbuffer loaded executable instance from the executable image.
+   FlatbufferLoadedExecutableInstance(
+       std::shared_ptr<FlatbufferExecutableImage> executable_image,
+diff --git a/pjrt_implementation/inc/api/module_builder/module_builder.h b/pjrt_implementation/inc/api/module_builder/module_builder.h
+--- a/pjrt_implementation/inc/api/module_builder/module_builder.h
++++ b/pjrt_implementation/inc/api/module_builder/module_builder.h
+@@ -129,7 +129,8 @@
+       const std::string_view &mlir_code,
+       const std::string &system_descriptor_path,
+       const std::unordered_map<std::string, std::string> &compile_options,
+-      tt::pjrt::ClientInstance *client_instance, size_t target_num_devices = 1);
++      tt::pjrt::ClientInstance *client_instance, size_t target_num_devices = 1,
++      const std::vector<std::pair<size_t, bool>> &constant_arguments = {});
+ 
+   // Gets the first sdy.Mesh op of a mlir module with shardy dialect enbaled.
+   // Could be used to extract mesh attribute from the module so we can use it as
+diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
+--- a/pjrt_implementation/src/api/buffer_instance.cc
++++ b/pjrt_implementation/src/api/buffer_instance.cc
+@@ -13,6 +13,7 @@
+ // c++ standard library includes
+ #include <cstddef>
+ #include <cstring>
++#include <functional>
+ #include <memory>
+ #include <numeric>
+ #include <optional>
+@@ -247,6 +248,12 @@
+ 
+   m_pjrt_tensor.reset();
+ 
++  if (m_data_type == PJRT_Buffer_Type_PRED &&
++      std::accumulate(dims, dims + num_dims, std::int64_t{1},
++                      std::multiplies<>()) == 1) {
++    m_host_flag = *static_cast<const bool *>(host_buffer);
++  }
++
+   ::tt::target::DataType runtime_data_type =
+       tt::pjrt::data_type_utils::convertPJRTToRuntimeDataType(m_data_type);
+   std::uint32_t element_size =
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -36,6 +36,7 @@
+ #include "api/error_instance.h"
+ #include "api/event_instance.h"
+ #include "api/executable_image.h"
++#include "api/flatbuffer_loaded_executable_instance.h"
+ #include "api/memory_instance.h"
+ #include "api/module_builder/module_builder.h"
+ #include "api/tensor_pool.h"
+@@ -513,7 +514,8 @@
+     const PJRT_Program *mlir_program, LoadedExecutableInstance **out_executable,
+     const std::unordered_map<std::string, std::string> &compile_options,
+     const std::optional<std::vector<int64_t>> &replica_device_ids,
+-    size_t target_num_devices) {
++    size_t target_num_devices,
++    const std::vector<std::pair<size_t, bool>> &constant_arguments) {
+ 
+   static std::mutex compile_mutex;
+   const std::lock_guard<std::mutex> lock(compile_mutex);
+@@ -522,7 +524,8 @@
+ 
+   std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>> compile_result =
+       m_module_builder->buildModule(mlir_code, m_cached_system_descriptor_path,
+-                                    compile_options, this, target_num_devices);
++                                    compile_options, this, target_num_devices,
++                                    constant_arguments);
+   tt_pjrt_status status = std::get<tt_pjrt_status>(compile_result);
+   if (!tt_pjrt_status_is_ok(status)) {
+     return status;
+@@ -553,6 +556,23 @@
+       executable_image->toExecutableInstance(std::move(addressable_devices),
+                                              this);
+ 
++  // An execution with host flags among its arguments runs this program
++  // compiled again with their values as constants.
++  if (constant_arguments.empty() &&
++      executable_image->getCompileOptions().backend ==
++          BackendRuntime::TTNNFlatbuffer) {
++    static_cast<FlatbufferLoadedExecutableInstance *>(executable.get())
++        ->setSpecializer([=, this](const auto &flags) {
++          const std::string &code = executable_image->getOriginalMlirCode();
++          PJRT_Program program{.code = const_cast<char *>(code.data()),
++                               .code_size = code.size()};
++          LoadedExecutableInstance *specialized = nullptr;
++          compileMlirProgram(&program, &specialized, compile_options,
++                             replica_device_ids, target_num_devices, flags);
++          return std::unique_ptr<LoadedExecutableInstance>(specialized);
++        });
++  }
++
+   // Releasing the ownership to the PJRT API caller since the caller is
+   // responsible for calling `PJRT_LoadedExecutable_Destroy` on the executable.
+   *out_executable = executable.release();
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -189,6 +189,32 @@
+   DLOG_F(LOG_DEBUG, "FlatbufferLoadedExecutableInstance::Execute");
+   LOG_BRINGUP_STAGE("RUNTIME_EXECUTION_START");
+ 
++  std::vector<std::pair<size_t, bool>> flags;
++  for (size_t arg = 0; m_specializer && arg < args->num_args; ++arg) {
++    std::optional<bool> flag =
++        BufferInstance::unwrap(args->argument_lists[0][arg])->getHostFlag();
++    for (size_t device = 1; flag && device < args->num_devices; ++device) {
++      if (BufferInstance::unwrap(args->argument_lists[device][arg])
++              ->getHostFlag() != flag) {
++        flag.reset();
++      }
++    }
++    if (flag) {
++      flags.emplace_back(arg, *flag);
++    }
++  }
++  if (!flags.empty()) {
++    std::unique_lock<std::mutex> lock(m_specializations_mutex);
++    auto [specialization, inserted] = m_specializations.try_emplace(flags);
++    if (inserted) {
++      specialization->second = m_specializer(flags);
++    }
++    if (LoadedExecutableInstance *specialized = specialization->second.get()) {
++      lock.unlock();
++      return specialized->execute(args);
++    }
++  }
++
+   if (args->num_devices != m_executable_image->getNumDevicesToUtilize()) {
+     LOG_F(ERROR, "Device count mismatch: %zu vs %zu", args->num_devices,
+           m_executable_image->getNumDevicesToUtilize());
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -45,6 +45,7 @@
+ #include "stablehlo/dialect/Register.h"
+ #include "stablehlo/dialect/StablehloOps.h"
+ #include "stablehlo/transforms/Passes.h"
++#include "stablehlo/transforms/optimization/Passes.h"
+ 
+ // shardy includes
+ #include "shardy/dialect/sdy/ir/constants.h"
+@@ -368,7 +369,8 @@
+     const std::string_view &mlir_code,
+     const std::string &system_descriptor_path,
+     const std::unordered_map<std::string, std::string> &compile_options_map,
+-    ClientInstance *client_instance, size_t target_num_devices) {
++    ClientInstance *client_instance, size_t target_num_devices,
++    const std::vector<std::pair<size_t, bool>> &constant_arguments) {
+   DLOG_F(LOG_DEBUG, "ModuleBuilder::buildModule");
+ 
+   auto context = createMlirContext();
+@@ -520,6 +522,30 @@
+     return {status, nullptr};
+   }
+ 
++  // Compiles arguments with given values as constants, after the pipeline has
++  // dropped the sharding constraints that would hide them. The folder then
++  // inlines the branch a conditional on them selects.
++  if (!constant_arguments.empty()) {
++    auto main = mlir_module->lookupSymbol<mlir::func::FuncOp>("main");
++    mlir::OpBuilder builder(&main.getBody().front(),
++                            main.getBody().front().begin());
++    for (auto [index, value] : constant_arguments) {
++      mlir::BlockArgument argument = main.getArgument(index);
++      argument.replaceAllUsesWith(builder.create<mlir::stablehlo::ConstantOp>(
++          argument.getLoc(),
++          mlir::DenseElementsAttr::get(
++              mlir::cast<mlir::ShapedType>(argument.getType()), value)));
++    }
++    mlir::stablehlo::StablehloAggressiveFolderPassOptions folding;
++    folding.optimizeFloat = false;
++    mlir::PassManager pm(mlir_module.get()->getName());
++    pm.addNestedPass<mlir::func::FuncOp>(
++        mlir::stablehlo::createStablehloAggressiveFolderPass(folding));
++    if (mlir::failed(pm.run(mlir_module.get()))) {
++      return {tt_pjrt_status::kInternal, nullptr};
++    }
++  }
++
+   // Sanitize the module for XLA ingestion operating on a clone of the base
+   // module.
+   mlir::OwningOpRef<mlir::ModuleOp> sanitized_module = mlir_module->clone();
