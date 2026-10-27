@@ -3,14 +3,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "operations/mlir_native/func_call.h"
+#include "operations/trace/capture_or_execute_trace.h"
 #include "tt/runtime/detail/common/logger.h"
 #include "tt/runtime/detail/ttnn/program_executor.h"
 #include "tt/runtime/detail/ttnn/ttnn.h"
 #include "tt/runtime/detail/ttnn/utils.h"
+#include "ttnn/operations/copy/typecast/typecast.hpp"
+#include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/data_movement/clone/clone.hpp"
+#include "ttnn/operations/eltwise/unary/unary.hpp"
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -262,6 +267,72 @@ void run(const ::tt::target::ttnn::WhileLoopOp *op,
   }
 }
 
+// Whether a branch program is one trace and returns the trace's results in
+// order, so that the branch can run as a conditional trace.
+static bool isSingleTraceProgram(const ::tt::target::ttnn::Program *program) {
+  const ::tt::target::ttnn::CaptureOrExecuteTraceOp *trace = nullptr;
+  for (const auto *operation : *program->operations()) {
+    switch (operation->type_type()) {
+    case ::tt::target::ttnn::OpType::GetDeviceOp:
+    case ::tt::target::ttnn::OpType::DeallocateOp:
+      break;
+    case ::tt::target::ttnn::OpType::CaptureOrExecuteTraceOp:
+      if (trace) {
+        return false;
+      }
+      trace = operation->type_as_CaptureOrExecuteTraceOp();
+      break;
+    default:
+      return false;
+    }
+  }
+  if (!trace || trace->outputs()->size() != program->outputs()->size()) {
+    return false;
+  }
+  for (size_t i = 0; i < program->outputs()->size(); ++i) {
+    if (trace->outputs()->Get(i)->global_id() !=
+        program->outputs()->Get(i)->global_id()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Whether a conditional runs without reading its selector on host: a two-way
+// conditional whose selector is on device and whose branches are single
+// traces. Each branch then runs as a conditional trace on a predicate computed
+// from the selector, so only the branch it selects runs on device, and both
+// publish their results in the same slots.
+static bool runsAsConditionalTraces(const ::tt::target::ttnn::CaseOp *op,
+                                    ProgramContext &context,
+                                    const ::ttnn::Tensor &selector) {
+  if (selector.storage_type() != ::ttnn::StorageType::DEVICE ||
+      op->branch_program_ids()->size() != 2) {
+    return false;
+  }
+  return std::all_of(op->branch_program_ids()->begin(),
+                     op->branch_program_ids()->end(), [&](uint32_t programId) {
+                       return isSingleTraceProgram(
+                           ::tt::runtime::ttnn::utils::getProgram(
+                               context.getExecutableHandle(), programId));
+                     });
+}
+
+// The predicate of the conditional traces of a two-way conditional: 1 for a
+// nonzero selector, which selects the second branch, as a uint32 in
+// interleaved DRAM, where the prefetcher reads it.
+static ::ttnn::Tensor conditionalTracePredicate(const ::ttnn::Tensor &selector) {
+  ::ttnn::Tensor predicate = selector;
+  if (predicate.layout() != ::ttnn::Layout::TILE) {
+    predicate = ::ttnn::to_layout(predicate, ::ttnn::Layout::TILE);
+  }
+  if (predicate.dtype() != ::ttnn::DataType::FLOAT32) {
+    predicate = ::ttnn::typecast(predicate, ::ttnn::DataType::FLOAT32);
+  }
+  return ::ttnn::typecast(::ttnn::nez(predicate), ::ttnn::DataType::UINT32,
+                          ::ttnn::DRAM_MEMORY_CONFIG);
+}
+
 void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context) {
   LOG_ASSERT(op->branch_program_ids() &&
                  op->branch_program_ids()->size() != 0,
@@ -269,15 +340,25 @@ void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context) {
 
   ::tt::runtime::Tensor index =
       context.getTensorPool().getRuntimeTensorAndValidate(op->index());
-  int64_t branchIndex = op->branch_program_ids()->size() == 2
-                            ? static_cast<int64_t>(readConditionScalar(index))
-                            : readIntegerScalar(index);
-  // StableHLO selects the last branch for any out-of-range index, including a
-  // negative index.
-  size_t selectedBranch = op->branch_program_ids()->size() - 1;
-  if (branchIndex >= 0 &&
-      static_cast<uint64_t>(branchIndex) < op->branch_program_ids()->size()) {
-    selectedBranch = static_cast<size_t>(branchIndex);
+  const ::ttnn::Tensor &selector =
+      ::tt::runtime::ttnn::utils::getTTNNTensorFromRuntimeTensor(index);
+  std::optional<::ttnn::Tensor> predicate;
+  std::vector<uint32_t> branches;
+  if (runsAsConditionalTraces(op, context, selector)) {
+    predicate = conditionalTracePredicate(selector);
+    branches = {0, 1};
+  } else {
+    int64_t branchIndex = op->branch_program_ids()->size() == 2
+                              ? static_cast<int64_t>(readConditionScalar(index))
+                              : readIntegerScalar(index);
+    // StableHLO selects the last branch for any out-of-range index, including
+    // a negative index.
+    size_t selectedBranch = op->branch_program_ids()->size() - 1;
+    if (branchIndex >= 0 &&
+        static_cast<uint64_t>(branchIndex) < op->branch_program_ids()->size()) {
+      selectedBranch = static_cast<size_t>(branchIndex);
+    }
+    branches = {static_cast<uint32_t>(selectedBranch)};
   }
 
   std::vector<::tt::runtime::Tensor> inputs;
@@ -288,12 +369,23 @@ void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context) {
   }
   NestedProgramTensorRetention retention(inputs);
 
-  ProgramExecutor program(
-      context.getDeviceHandle(), context.getExecutableHandle(),
-      op->branch_program_ids()->Get(selectedBranch), inputs,
-      /*constEvalProgram=*/false);
-  program.execute();
-  std::vector<::tt::runtime::Tensor> outputs = program.gatherOutputTensors();
+  std::vector<::tt::runtime::Tensor> outputSlots;
+  std::vector<::tt::runtime::Tensor> outputs;
+  for (uint32_t branch : branches) {
+    std::optional<trace::ConditionalTrace> conditional;
+    std::optional<trace::ConditionalTraceScope> scope;
+    if (predicate) {
+      conditional.emplace(
+          trace::ConditionalTrace{*predicate, branch, outputSlots});
+      scope.emplace(*conditional);
+    }
+    ProgramExecutor program(context.getDeviceHandle(),
+                            context.getExecutableHandle(),
+                            op->branch_program_ids()->Get(branch), inputs,
+                            /*constEvalProgram=*/false);
+    program.execute();
+    outputs = program.gatherOutputTensors();
+  }
   LOG_ASSERT(outputs.size() == op->outputs()->size(),
              "Case branch output arity mismatch");
   // Restore original input flags first, then re-pin aliases that escape as

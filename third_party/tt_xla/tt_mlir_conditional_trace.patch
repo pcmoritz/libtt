@@ -1,0 +1,329 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+--- a/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/trace_cache.h
+@@ -24,6 +24,9 @@
+   /// Slots allocated exclusively for this trace. Caller-owned device inputs
+   /// are intentionally excluded.
+   std::vector<::tt::runtime::Tensor> ownedTensors;
++  /// Captured in the branch of a conditional on a device value
++  /// (operations::trace::ConditionalTrace).
++  bool conditional = false;
+ };
+ 
+ struct TraceData {
+diff --git a/runtime/lib/ttnn/operations/cache/load_cached.cpp b/runtime/lib/ttnn/operations/cache/load_cached.cpp
+--- a/runtime/lib/ttnn/operations/cache/load_cached.cpp
++++ b/runtime/lib/ttnn/operations/cache/load_cached.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "operations/cache/load_cached.h"
++#include "operations/trace/capture_or_execute_trace.h"
+ 
+ #include "tt/runtime/detail/common/logger.h"
+ #include "tt/runtime/detail/ttnn/program_executor.h"
+@@ -69,7 +70,17 @@
+   const size_t programIndex = op->program_idx();
+   ProgramExecutor exec(context.getDeviceHandle(), context.getExecutableHandle(),
+                        programIndex, inputs, /*constEvalProgram=*/true);
++  // The values it caches must be computed, even in the dry warmup of a
++  // conditional trace.
++  trace::ConditionalTrace *conditional = trace::currentConditionalTrace();
++  const bool dry = conditional && conditional->dryLaunches;
++  if (dry) {
++    trace::setDryLaunches(context.getMeshDevice(), false);
++  }
+   exec.execute();
++  if (dry) {
++    trace::setDryLaunches(context.getMeshDevice(), true);
++  }
+   LOG_DEBUG("executed sub-func: ", constEvalFuncname);
+   std::vector<::tt::runtime::Tensor> outputs = exec.gatherOutputTensors();
+ 
+diff --git a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
+--- a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
++++ b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "operations/trace/begin_trace_capture.h"
++#include "operations/trace/capture_or_execute_trace.h"
+ #include "tt/runtime/detail/common/logger.h"
+ #include "tt/runtime/detail/ttnn/types/types.h"
+ #include "tt/runtime/detail/ttnn/utils.h"
+@@ -21,6 +22,12 @@
+   // program cache. Drain that work before switching the command queue into
+   // bypass mode; otherwise outstanding commands can race trace capture.
+   meshDevice.mesh_command_queue(op->cq_id()).finish();
++  // The warmup of a conditional trace ran dry; its capture records the
++  // programs as they run, as a conditional trace.
++  if (currentConditionalTrace()) {
++    setDryLaunches(meshDevice, false);
++    meshDevice.mesh_command_queue(op->cq_id()).set_conditional_capture(true);
++  }
+ 
+   ::ttnn::MeshTraceId traceId =
+       ::ttnn::operations::trace::begin_trace_capture(&meshDevice, ttnnCqId);
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -18,6 +18,81 @@
+ 
+ namespace tt::runtime::ttnn::operations::trace {
+ 
++namespace {
++thread_local ConditionalTrace *conditionalTrace = nullptr;
++} // namespace
++
++ConditionalTrace *currentConditionalTrace() { return conditionalTrace; }
++
++ConditionalTraceScope::ConditionalTraceScope(ConditionalTrace &trace)
++    : previous(conditionalTrace) {
++  conditionalTrace = &trace;
++}
++
++ConditionalTraceScope::~ConditionalTraceScope() {
++  conditionalTrace = previous;
++}
++
++void setDryLaunches(::ttnn::MeshDevice &meshDevice, bool dry) {
++  if (!conditionalTrace || conditionalTrace->dryLaunches == dry) {
++    return;
++  }
++  meshDevice.mesh_command_queue(0).set_dry_launches(dry);
++  conditionalTrace->dryLaunches = dry;
++}
++
++// Replays a trace; under a conditional trace, only if its predicate holds.
++static void replayTrace(::ttnn::MeshDevice &meshDevice,
++                        ::ttnn::MeshTraceId traceId) {
++  if (conditionalTrace) {
++    meshDevice.mesh_command_queue(0).enqueue_trace_if(
++        traceId, conditionalTrace->predicate.mesh_buffer(),
++        conditionalTrace->value);
++    return;
++  }
++  ::ttnn::operations::trace::execute_trace(&meshDevice, traceId,
++                                           ::ttnn::QueueId(0),
++                                           /*blocking=*/false);
++}
++
++// Under a conditional trace, the branches share their output slots: a trace
++// takes the slots of the branch before it, or gives its own to the branches
++// after it.
++static void shareOutputSlots(std::vector<::tt::runtime::Tensor> &outputSlots) {
++  if (!conditionalTrace) {
++    return;
++  }
++  if (conditionalTrace->outputSlots.empty()) {
++    conditionalTrace->outputSlots = outputSlots;
++    return;
++  }
++  LOG_ASSERT(conditionalTrace->outputSlots.size() == outputSlots.size(),
++             "The branches of a conditional trace must have the same results");
++  outputSlots = conditionalTrace->outputSlots;
++}
++
++// Whether a cached variant was captured the way this invocation runs: as a
++// conditional trace exactly when one is current, writing the slots the other
++// branches write.
++static bool matchesConditional(const TraceVariant &variant) {
++  if (variant.conditional != (conditionalTrace != nullptr)) {
++    return false;
++  }
++  if (!conditionalTrace || conditionalTrace->outputSlots.empty()) {
++    return true;
++  }
++  if (variant.outputTensors.size() != conditionalTrace->outputSlots.size()) {
++    return false;
++  }
++  for (size_t i = 0; i < variant.outputTensors.size(); ++i) {
++    if (variant.outputTensors[i].handle.get() !=
++        conditionalTrace->outputSlots[i].handle.get()) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ static std::pair<MainProgramKey, CaptureExecuteProgramKey>
+ getTraceCacheKeys(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+                   ProgramContext &context) {
+@@ -275,7 +350,13 @@
+   ProgramExecutor executor(deviceHandle, context.getExecutableHandle(),
+                            op->capture_program_id(), captureInputs,
+                            /*constEvalProgram=*/false, semaphoreInputs);
++  // The warmup of a conditional trace compiles and loads its programs without
++  // running them, since its branch may not be the one to run; the capture
++  // launches them again (begin_trace_capture).
++  ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();
++  setDryLaunches(meshDevice, true);
+   executor.execute();
++  setDryLaunches(meshDevice, false);
+   std::vector<::tt::runtime::Tensor> outputTensors =
+       executor.gatherOutputTensors();
+ 
+@@ -295,8 +376,13 @@
+       ownedTensors.push_back(inputSlots[i]);
+     }
+   }
+-  ownedTensors.insert(ownedTensors.end(), outputSlots.begin(),
+-                      outputSlots.end());
++  // The output slots of a conditional trace are shared with the other branches
++  // of its conditional, whose variants live in other cache entries; they are
++  // released with the last variant that holds them.
++  if (!conditionalTrace) {
++    ownedTensors.insert(ownedTensors.end(), outputSlots.begin(),
++                        outputSlots.end());
++  }
+ 
+   TraceVariant variant{
+       .traceId = ::ttnn::MeshTraceId(
+@@ -304,10 +390,15 @@
+               traceIdTensor)),
+       .inputTensors = inputSlots,
+       .outputTensors = outputSlots,
+-      .ownedTensors = std::move(ownedTensors)};
++      .ownedTensors = std::move(ownedTensors),
++      .conditional = conditionalTrace != nullptr};
+ 
+   // The capture program replays the trace once, so the output slots already
+-  // hold this invocation's results.
++  // hold this invocation's results. A conditional trace is replayed here
++  // instead, if its predicate holds (execute_trace).
++  if (conditionalTrace) {
++    replayTrace(meshDevice, variant.traceId);
++  }
+   publishTraceOutputs(op, context, outputSlots);
+ 
+   return variant;
+@@ -320,8 +411,7 @@
+ 
+   updateTraceInputSlots(op, context, variant.inputTensors);
+ 
+-  ::ttnn::operations::trace::execute_trace(
+-      &meshDevice, variant.traceId, ::ttnn::QueueId(0), /*blocking=*/false);
++  replayTrace(meshDevice, variant.traceId);
+ 
+   publishTraceOutputs(op, context, variant.outputTensors);
+ }
+@@ -389,6 +479,7 @@
+         slots.begin(), slots.begin() + numInputSlots);
+     std::vector<::tt::runtime::Tensor> outputSlots(
+         slots.begin() + numInputSlots, slots.end());
++    shareOutputSlots(outputSlots);
+ 
+     // Fill the input slots before capturing; writes are rejected once the
+     // capture window is open. The capture program does this itself for the
+@@ -415,11 +506,13 @@
+       traceData->variants.rbegin(), traceData->variants.rend(),
+       [&](const TraceVariant &variant) {
+         return deviceInputsMatch(op, context, variant) &&
++               matchesConditional(variant) &&
+                meshDevice.is_mesh_trace_replay_safe(variant.traceId);
+       });
+ 
+   if (variantIt != traceData->variants.rend()) {
+     LOG_DEBUG("Trace variant cache hit, executing trace directly");
++    shareOutputSlots(variantIt->outputTensors);
+     executeTrace(op, context, *variantIt);
+     // Keep variants ordered from least- to most-recently used so front
+     // eviction removes the coldest trace.
+@@ -464,6 +557,7 @@
+     inputSlots.assign(slots.begin(), slots.begin() + numInputSlots);
+     outputSlots.assign(slots.begin() + numInputSlots, slots.end());
+   }
++  shareOutputSlots(outputSlots);
+ 
+   updateTraceInputSlots(op, context, inputSlots,
+                         /*deviceResidentOnly=*/true);
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.h b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.h
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.h
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.h
+@@ -13,6 +13,42 @@
+ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+          ProgramContext &context);
+ 
++// The branch of a conditional whose selector is on device, while its program
++// runs. Its trace is captured as a conditional trace after a dry warmup, which
++// compiles its programs without running them, and replayed with
++// enqueue_trace_if: it runs only if the first word of `predicate` (a uint32
++// tensor in interleaved DRAM) is `value`, and nothing reads the predicate on
++// host. The branches of a conditional publish their results in the same output
++// slots, the first branch's, so that they are the conditional's results
++// whichever branch ran.
++struct ConditionalTrace {
++  const ::ttnn::Tensor &predicate;
++  uint32_t value;
++  // Empty until the trace of a branch has slots.
++  std::vector<::tt::runtime::Tensor> &outputSlots;
++  // Whether workloads are launched dry: during the warmup of a capture.
++  bool dryLaunches = false;
++};
++
++// The conditional trace of this thread, if a branch program runs as one.
++ConditionalTrace *currentConditionalTrace();
++
++// Makes a conditional trace current while a branch program runs.
++class ConditionalTraceScope {
++public:
++  explicit ConditionalTraceScope(ConditionalTrace &trace);
++  ~ConditionalTraceScope();
++  ConditionalTraceScope(const ConditionalTraceScope &) = delete;
++  ConditionalTraceScope &operator=(const ConditionalTraceScope &) = delete;
++
++private:
++  ConditionalTrace *previous;
++};
++
++// Launches workloads dry or not while a conditional trace is current; does
++// nothing otherwise.
++void setDryLaunches(::ttnn::MeshDevice &meshDevice, bool dry);
++
+ } // namespace tt::runtime::ttnn::operations::trace
+ 
+ #endif // TT_RUNTIME_TTNN_OPERATIONS_TRACE_CAPTURE_OR_EXECUTE_TRACE_H
+diff --git a/runtime/lib/ttnn/operations/trace/end_trace_capture.cpp b/runtime/lib/ttnn/operations/trace/end_trace_capture.cpp
+--- a/runtime/lib/ttnn/operations/trace/end_trace_capture.cpp
++++ b/runtime/lib/ttnn/operations/trace/end_trace_capture.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "operations/trace/end_trace_capture.h"
++#include "operations/trace/capture_or_execute_trace.h"
+ #include "tt/runtime/detail/common/logger.h"
+ #include "tt/runtime/detail/ttnn/types/trace_cache.h"
+ #include "tt/runtime/detail/ttnn/types/types.h"
+@@ -29,6 +30,9 @@
+ 
+   ::ttnn::operations::trace::end_trace_capture(&meshDevice, meshTraceId,
+                                                ttnnCqId);
++  if (currentConditionalTrace()) {
++    meshDevice.mesh_command_queue(op->cq_id()).set_conditional_capture(false);
++  }
+ }
+ 
+ } // namespace tt::runtime::ttnn::operations::trace
+diff --git a/runtime/lib/ttnn/operations/trace/execute_trace.cpp b/runtime/lib/ttnn/operations/trace/execute_trace.cpp
+--- a/runtime/lib/ttnn/operations/trace/execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/execute_trace.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "operations/trace/execute_trace.h"
++#include "operations/trace/capture_or_execute_trace.h"
+ #include "tt/runtime/detail/common/logger.h"
+ #include "tt/runtime/detail/ttnn/types/trace_cache.h"
+ #include "tt/runtime/detail/ttnn/types/types.h"
+@@ -13,6 +14,11 @@
+ 
+ void run(const ::tt::target::ttnn::ExecuteTraceOp *op,
+          ProgramContext &context) {
++  // The capture program of a conditional trace does not replay it: the trace
++  // op does, if its predicate holds.
++  if (currentConditionalTrace()) {
++    return;
++  }
+   ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();
+   ::ttnn::QueueId ttnnCqId = ::ttnn::QueueId(op->cq_id());
+ 

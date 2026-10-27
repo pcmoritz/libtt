@@ -1,0 +1,754 @@
+diff --git tt_metal/api/tt-metalium/mesh_command_queue.hpp tt_metal/api/tt-metalium/mesh_command_queue.hpp
+--- tt_metal/api/tt-metalium/mesh_command_queue.hpp
++++ tt_metal/api/tt-metalium/mesh_command_queue.hpp
+@@ -11,6 +11,7 @@
+ #include <variant>
+ #include <vector>
+ 
++#include <tt_stl/assert.hpp>
+ #include <tt_stl/span.hpp>
+ #include <tt-metalium/buffer.hpp>
+ #include <tt-metalium/mesh_buffer.hpp>
+@@ -130,6 +131,20 @@
+     virtual void record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) = 0;
+     virtual void record_end() = 0;
+     virtual void enqueue_trace(const MeshTraceId& trace_id, bool blocking) = 0;
++
++    // Conditional traces. A trace recorded while conditional capture is set ends by leaving the device as a skipped
++    // trace leaves it, so enqueue_trace_if can replay it or skip it on a value the device computed: it runs only if
++    // the first 32-bit word of page 0 of `predicate`, an interleaved DRAM buffer with a power-of-two page size,
++    // equals `value` once the work enqueued before it has finished.
++    virtual void set_conditional_capture(bool /*conditional*/) {
++        TT_THROW("Conditional traces are not supported by this command queue");
++    }
++    virtual void enqueue_trace_if(const MeshTraceId& /*trace_id*/, const MeshBuffer& /*predicate*/, uint32_t /*value*/) {
++        TT_THROW("Conditional traces are not supported by this command queue");
++    }
++    // While set, enqueued workloads are dispatched with no kernel enabled: their programs are compiled and their
++    // binaries and configuration written, but nothing runs. A trace capture records them as usual.
++    virtual void set_dry_launches(bool /*dry*/) { TT_THROW("Dry launches are not supported by this command queue"); }
+ };
+ 
+ }  // namespace tt::tt_metal::distributed
+diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/fd_mesh_command_queue.cpp
+--- tt_metal/distributed/fd_mesh_command_queue.cpp
++++ tt_metal/distributed/fd_mesh_command_queue.cpp
+@@ -558,6 +558,11 @@
+             dispatch_metadata,
+             program_binary_status,
+             static_cast<uint8_t>(this->id()));
++        // A dry launch enables no kernel (set_dry_launches); a later launch enables them again.
++        for (auto& launch_message : program_cmd_seq.launch_messages) {
++            launch_message.msg_ptr.kernel_config().enables() =
++                dry_launches_ ? 0 : launch_message.original_msg.view().kernel_config().enables();
++        }
+ 
+         const auto& local_devices = mesh_device_->impl().get_local_devices(device_range);
+         sub_device_recorder.record(local_devices, program.get_runtime_id(), sub_device_id);
+@@ -1374,12 +1379,49 @@
+     auto lock = lock_api_function_();
+     in_use_ = true;
+     auto trace_inst = mesh_device_->get_mesh_trace(trace_id);
+-    submit_replay_buffer(trace_inst->desc->descriptors, trace_inst->desc->sub_device_ids, *trace_inst->mesh_buffer);
++    submit_replay_buffer(
++        trace_inst->desc->descriptors,
++        trace_inst->desc->sub_device_ids,
++        *trace_inst->mesh_buffer,
++        trace_inst->desc->conditional);
+     if (blocking) {
+         this->finish_nolock();
+     }
+ }
+ 
++void FDMeshCommandQueue::set_conditional_capture(bool conditional) {
++    auto lock = lock_api_function_();
++    conditional_capture_ = conditional;
++}
++
++void FDMeshCommandQueue::enqueue_trace_if(const MeshTraceId& trace_id, const MeshBuffer& predicate, uint32_t value) {
++    auto lock = lock_api_function_();
++    TT_FATAL(!trace_id_.has_value(), "A conditional trace cannot be replayed during trace capture.");
++    auto trace_inst = mesh_device_->get_mesh_trace(trace_id);
++    TT_FATAL(trace_inst->desc->conditional, "Trace {} was not captured as a conditional trace", *trace_id);
++    TT_FATAL(
++        predicate.device_local_config().buffer_type == BufferType::DRAM &&
++            predicate.device_local_config().sharding_args.buffer_layout() == TensorMemoryLayout::INTERLEAVED,
++        "A trace predicate must be an interleaved DRAM buffer");
++    const uint32_t page_size = predicate.page_size();
++    TT_FATAL(page_size != 0 && (page_size & (page_size - 1)) == 0, "A trace predicate needs a power-of-two page size");
++    in_use_ = true;
++    submit_replay_buffer(
++        trace_inst->desc->descriptors,
++        trace_inst->desc->sub_device_ids,
++        *trace_inst->mesh_buffer,
++        /*ends_with_reset=*/true,
++        trace_dispatch::TracePredicate{
++            .address = static_cast<uint32_t>(predicate.address()),
++            .log2_page_size = static_cast<uint8_t>(__builtin_ctz(page_size)),
++            .value = value});
++}
++
++void FDMeshCommandQueue::set_dry_launches(bool dry) {
++    auto lock = lock_api_function_();
++    dry_launches_ = dry;
++}
++
+ void FDMeshCommandQueue::enqueue_command_list(
+     const std::unordered_map<SubDeviceId, TraceWorkerDescriptor>& worker_descriptors,
+     const std::vector<SubDeviceId>& sub_device_ids,
+@@ -1406,7 +1448,9 @@
+ void FDMeshCommandQueue::submit_replay_buffer(
+     const std::unordered_map<SubDeviceId, TraceWorkerDescriptor>& worker_descriptors,
+     const std::vector<SubDeviceId>& sub_device_ids,
+-    const MeshBuffer& buffer) {
++    const MeshBuffer& buffer,
++    bool ends_with_reset,
++    const std::optional<trace_dispatch::TracePredicate>& predicate) {
+     const auto num_sub_devices = static_cast<uint32_t>(sub_device_ids.size());
+     auto& sub_device_cq_owner = cq_shared_state_->sub_device_cq_owner;
+     for (auto sub_device_id : sub_device_ids) {
+@@ -1415,6 +1459,9 @@
+     }
+ 
+     auto cmd_sequence_sizeB = trace_dispatch::compute_trace_cmd_size(extract_context_id(mesh_device_), num_sub_devices);
++    if (predicate.has_value()) {
++        cmd_sequence_sizeB += trace_dispatch::compute_trace_predicate_cmd_size(extract_context_id(mesh_device_));
++    }
+ 
+     trace_dispatch::TraceDispatchMetadata dispatch_md(
+         cmd_sequence_sizeB,
+@@ -1426,18 +1473,32 @@
+ 
+     for (auto* device : mesh_device_->get_devices()) {
+         trace_dispatch::issue_trace_commands(
+-            mesh_device_, device->sysmem_manager(), dispatch_md, id_, expected_num_workers_completed_, dispatch_core_);
++            mesh_device_,
++            device->sysmem_manager(),
++            dispatch_md,
++            id_,
++            expected_num_workers_completed_,
++            dispatch_core_,
++            predicate);
+     }
+ 
+     // The replayed exec buffer bypasses normal host cache tracking, so subsequent program enqueues must start from an
+     // empty host-side view of the prefetcher cache.
+     this->reset_prefetcher_cache_manager();
+ 
+-    trace_dispatch::update_worker_state_post_trace_execution(
+-        worker_descriptors,
+-        cq_shared_state_->worker_launch_message_buffer_state,
+-        config_buffer_mgr_,
+-        expected_num_workers_completed_);
++    if (ends_with_reset) {
++        trace_dispatch::reset_worker_state_post_conditional_trace(
++            worker_descriptors,
++            cq_shared_state_->worker_launch_message_buffer_state,
++            config_buffer_mgr_,
++            expected_num_workers_completed_);
++    } else {
++        trace_dispatch::update_worker_state_post_trace_execution(
++            worker_descriptors,
++            cq_shared_state_->worker_launch_message_buffer_state,
++            config_buffer_mgr_,
++            expected_num_workers_completed_);
++    }
+ }
+ 
+ void FDMeshCommandQueue::record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) {
+@@ -1453,6 +1514,7 @@
+ 
+     trace_id_ = trace_id;
+     trace_ctx_ = ctx;
++    trace_ctx_->conditional = conditional_capture_;
+     for (auto* device : mesh_device_->get_devices()) {
+         device->sysmem_manager().set_bypass_mode(/*enable*/ true, /*clear*/ true);
+     }
+@@ -1678,6 +1740,34 @@
+         }
+ 
+         auto& bypass_data = sysmem_manager_for_trace.get_bypass_data();
++        if (trace_ctx_->conditional) {
++            // A conditional trace ends with the reset a replay starts with, waiting for its own workers, so that it
++            // leaves the device as a skipped trace leaves it.
++            DispatchArray<uint32_t> trace_workers_completed{};
++            std::vector<SubDeviceId> trace_sub_device_ids;
++            for (const auto& [sub_device_id, trace_worker_descriptor] : trace_worker_descriptors) {
++                TT_FATAL(
++                    trace_worker_descriptor.num_traced_programs_needing_go_signal_unicast == 0,
++                    "A conditional trace cannot launch programs that need unicast go signals");
++                trace_workers_completed[*sub_device_id] = trace_worker_descriptor.num_completion_worker_cores;
++                trace_sub_device_ids.push_back(sub_device_id);
++            }
++            HostMemDeviceCommand reset_commands(
++                metal_ctx,
++                trace_dispatch::compute_trace_reset_cmd_size(
++                    mesh_device_->impl().get_context_id(), trace_worker_descriptors.size()));
++            trace_dispatch::add_trace_reset_commands(
++                reset_commands,
++                mesh_device_,
++                trace_worker_descriptors,
++                trace_sub_device_ids,
++                trace_workers_completed,
++                this->id_,
++                dispatch_core_);
++            const auto* reset_words = static_cast<const uint32_t*>(reset_commands.data());
++            bypass_data.insert(
++                bypass_data.end(), reset_words, reset_words + reset_commands.size_bytes() / sizeof(uint32_t));
++        }
+         bypass_data.insert(bypass_data.end(), exec_buf_end.begin(), exec_buf_end.end());
+ 
+         max_trace_size = std::max(max_trace_size, bypass_data.size());
+diff --git tt_metal/distributed/fd_mesh_command_queue.hpp tt_metal/distributed/fd_mesh_command_queue.hpp
+--- tt_metal/distributed/fd_mesh_command_queue.hpp
++++ tt_metal/distributed/fd_mesh_command_queue.hpp
+@@ -14,6 +14,7 @@
+ #include "dispatch/launch_message_ring_buffer_state.hpp"
+ #include "dispatch/worker_config_buffer.hpp"
+ #include "mesh_trace.hpp"
++#include "tt_metal/impl/trace/dispatch.hpp"
+ #include "tt_metal/impl/buffers/dispatch.hpp"
+ #include "tt_metal/impl/dispatch/ringbuffer_cache.hpp"
+ #include "tt_metal/impl/program/dispatch.hpp"
+@@ -49,10 +50,13 @@
+     CoreCoord virtual_program_dispatch_core() const;
+     CoreType dispatch_core_type() const;
+ 
++    // `ends_with_reset`: the buffer holds a conditional trace (MeshTraceDescriptor::conditional).
+     void submit_replay_buffer(
+         const std::unordered_map<SubDeviceId, TraceWorkerDescriptor>& worker_descriptors,
+         const std::vector<SubDeviceId>& sub_device_ids,
+-        const MeshBuffer& buffer);
++        const MeshBuffer& buffer,
++        bool ends_with_reset = false,
++        const std::optional<trace_dispatch::TracePredicate>& predicate = std::nullopt);
+ 
+     void increment_num_entries_in_completion_queue();
+     MeshEvent enqueue_record_event_helper(
+@@ -130,6 +134,9 @@
+     std::optional<MeshTraceId> trace_id_;
+     std::shared_ptr<MeshTraceDescriptor> trace_ctx_;
+     std::vector<MeshTraceNode> trace_nodes_;
++    // See set_conditional_capture and set_dry_launches.
++    bool conditional_capture_ = false;
++    bool dry_launches_ = false;
+ 
+     CoreCoord dispatch_core_;
+     const CoreType dispatch_core_type_;
+@@ -289,6 +296,9 @@
+     void record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) override;
+     void record_end() override;
+     void enqueue_trace(const MeshTraceId& trace_id, bool blocking) override;
++    void set_conditional_capture(bool conditional) override;
++    void enqueue_trace_if(const MeshTraceId& trace_id, const MeshBuffer& predicate, uint32_t value) override;
++    void set_dry_launches(bool dry) override;
+     // Enqueue a command list without entering the mesh-trace lifecycle.
+     void enqueue_command_list(
+         const std::unordered_map<SubDeviceId, TraceWorkerDescriptor>& worker_descriptors,
+diff --git tt_metal/distributed/mesh_trace.hpp tt_metal/distributed/mesh_trace.hpp
+--- tt_metal/distributed/mesh_trace.hpp
++++ tt_metal/distributed/mesh_trace.hpp
+@@ -37,6 +37,9 @@
+     // Trace data per logical Device in a Mesh.
+     std::vector<MeshTraceData> ordered_trace_data;
+     uint32_t total_trace_size = 0;
++    // Recorded with conditional capture: the trace ends with the reset a replay starts with (see
++    // MeshCommandQueue::enqueue_trace_if).
++    bool conditional = false;
+ };
+ 
+ // Ties a MeshTraceDescriptor (host side state) to a MeshBuffer (device side state)
+diff --git tt_metal/impl/dispatch/command_queue_common.hpp tt_metal/impl/dispatch/command_queue_common.hpp
+--- tt_metal/impl/dispatch/command_queue_common.hpp
++++ tt_metal/impl/dispatch/command_queue_common.hpp
+@@ -33,7 +33,10 @@
+     // Quasar L1 worker-done counters; unused on WH/BH. Incremented by worker NOC, or by dispatch_s from FDS group
+     // counts when FDS signalling is enabled.
+     WORKER_COMPLETION_SEMAPHORES = 12,
+-    UNRESERVED = 13,
++    // Landing zone of the predicate CQ_PREFETCH_CMD_EXEC_BUF_PREDICATE reads from DRAM: the
++    // prefetcher's stack and statics are in its local memory, which the NoC cannot write.
++    EXEC_BUF_PREDICATE_SCRATCH = 13,
++    UNRESERVED = 14,
+ };
+ 
+ // likely only used in impl
+diff --git tt_metal/impl/dispatch/device_command_calculator.hpp tt_metal/impl/dispatch/device_command_calculator.hpp
+--- tt_metal/impl/dispatch/device_command_calculator.hpp
++++ tt_metal/impl/dispatch/device_command_calculator.hpp
+@@ -218,6 +218,10 @@
+ 
+     void add_prefetch_exec_buf() { this->cmd_write_offsetB += tt::align(sizeof(CQPrefetchCmd), this->pcie_alignment); }
+ 
++    void add_prefetch_exec_buf_predicate() {
++        this->cmd_write_offsetB += tt::align(sizeof(CQPrefetchCmd), this->pcie_alignment);
++    }
++
+     void add_prefetch_exec_buf_end() {
+         this->cmd_write_offsetB += tt::align(sizeof(CQPrefetchCmd) + sizeof(CQDispatchCmd), this->pcie_alignment);
+     }
+diff --git tt_metal/impl/dispatch/device_command.cpp tt_metal/impl/dispatch/device_command.cpp
+--- tt_metal/impl/dispatch/device_command.cpp
++++ tt_metal/impl/dispatch/device_command.cpp
+@@ -753,6 +753,28 @@
+ }
+ 
+ template <bool hugepage_write>
++void DeviceCommand<hugepage_write>::add_prefetch_exec_buf_predicate(
++    uint32_t base_addr, uint8_t log2_page_size, uint32_t value) {
++    uint32_t increment_sizeB = tt::align(sizeof(CQPrefetchCmd), this->pcie_alignment);
++    auto initialize_predicate_cmd = [&](CQPrefetchCmd* predicate_cmd) {
++        *predicate_cmd = {};
++        predicate_cmd->base.cmd_id = CQ_PREFETCH_CMD_EXEC_BUF_PREDICATE;
++        predicate_cmd->exec_buf_predicate.log2_page_size = log2_page_size;
++        predicate_cmd->exec_buf_predicate.base_addr = base_addr;
++        predicate_cmd->exec_buf_predicate.value = value;
++    };
++    CQPrefetchCmd* predicate_cmd_dst = this->reserve_space<CQPrefetchCmd*>(increment_sizeB);
++
++    if constexpr (hugepage_write) {
++        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd predicate_cmd{};
++        initialize_predicate_cmd(&predicate_cmd);
++        this->memcpy(predicate_cmd_dst, &predicate_cmd, sizeof(CQPrefetchCmd));
++    } else {
++        initialize_predicate_cmd(predicate_cmd_dst);
++    }
++}
++
++template <bool hugepage_write>
+ void DeviceCommand<hugepage_write>::add_dispatch_set_num_worker_sems(
+     const uint32_t num_worker_sems, DispatcherSelect dispatcher_type) {
+     this->add_prefetch_relay_inline(true, sizeof(CQDispatchCmd), dispatcher_type);
+diff --git tt_metal/impl/dispatch/device_command.hpp tt_metal/impl/dispatch/device_command.hpp
+--- tt_metal/impl/dispatch/device_command.hpp
++++ tt_metal/impl/dispatch/device_command.hpp
+@@ -154,6 +154,10 @@
+ 
+     void add_prefetch_exec_buf(uint32_t base_addr, uint32_t log_page_size, uint32_t pages);
+ 
++    // Skips the next exec_buf unless page 0 of an interleaved DRAM buffer starts with `value`; see
++    // CQPrefetchExecBufPredicateCmd.
++    void add_prefetch_exec_buf_predicate(uint32_t base_addr, uint8_t log2_page_size, uint32_t value);
++
+     void add_dispatch_set_num_worker_sems(uint32_t num_worker_sems, DispatcherSelect dispatcher_type);
+ 
+     void add_dispatch_set_sub_device_worker_counts(
+diff --git tt_metal/impl/dispatch/dispatch_mem_map.cpp tt_metal/impl/dispatch/dispatch_mem_map.cpp
+--- tt_metal/impl/dispatch/dispatch_mem_map.cpp
++++ tt_metal/impl/dispatch/dispatch_mem_map.cpp
+@@ -122,6 +122,9 @@
+                 has_stream_registers_
+                     ? 0
+                     : cq_layout.num_cqs_per_core * DispatchSettings::DISPATCH_MESSAGE_ENTRIES * l1_alignment;
++        } else if (dev_addr_type == CommandQueueDeviceAddrType::EXEC_BUF_PREDICATE_SCRATCH) {
++            // The prefetcher reads 64 bytes of the predicate's page.
++            device_cq_addr_sizes_[dev_addr_idx] = std::max<uint32_t>(64, pcie_alignment);
+         } else if (
+             dev_addr_type == CommandQueueDeviceAddrType::FABRIC_SYNC_STATUS ||
+             dev_addr_type == CommandQueueDeviceAddrType::DISPATCH_PROGRESS) {
+@@ -136,7 +139,8 @@
+     for (auto dev_addr_idx = 1; dev_addr_idx < num_dev_cq_addrs; dev_addr_idx++) {
+         device_cq_addrs_[dev_addr_idx] = device_cq_addrs_[dev_addr_idx - 1] + device_cq_addr_sizes_[dev_addr_idx - 1];
+         auto dev_addr_type = *enchantum::index_to_enum<CommandQueueDeviceAddrType>(dev_addr_idx);
+-        if (dev_addr_type == CommandQueueDeviceAddrType::UNRESERVED) {
++        if (dev_addr_type == CommandQueueDeviceAddrType::UNRESERVED ||
++            dev_addr_type == CommandQueueDeviceAddrType::EXEC_BUF_PREDICATE_SCRATCH) {
+             device_cq_addrs_[dev_addr_idx] = align(device_cq_addrs_[dev_addr_idx], pcie_alignment);
+         } else if (
+             dev_addr_type == CommandQueueDeviceAddrType::DISPATCH_PROGRESS ||
+diff --git tt_metal/impl/dispatch/kernel_config/prefetch.cpp tt_metal/impl/dispatch/kernel_config/prefetch.cpp
+--- tt_metal/impl/dispatch/kernel_config/prefetch.cpp
++++ tt_metal/impl/dispatch/kernel_config/prefetch.cpp
+@@ -131,6 +131,8 @@
+ 
+         static_config_.scratch_db_base = my_dispatch_constants.scratch_db_base(cq_id_);
+         static_config_.scratch_db_size = my_dispatch_constants.scratch_db_size();
++        static_config_.exec_buf_predicate_scratch_addr = my_dispatch_constants.get_device_command_queue_addr(
++            CommandQueueDeviceAddrType::EXEC_BUF_PREDICATE_SCRATCH, cq_id_);
+         static_config_.downstream_sync_sem_id =
+             tt::tt_metal::CreateSemaphore(*program_, logical_core_, 0, GetCoreType());
+         static_config_.ringbuffer_size = my_dispatch_constants.ringbuffer_size();
+@@ -186,6 +188,8 @@
+ 
+         static_config_.scratch_db_base = my_dispatch_constants.scratch_db_base(cq_id_);
+         static_config_.scratch_db_size = my_dispatch_constants.scratch_db_size();
++        static_config_.exec_buf_predicate_scratch_addr = my_dispatch_constants.get_device_command_queue_addr(
++            CommandQueueDeviceAddrType::EXEC_BUF_PREDICATE_SCRATCH, cq_id_);
+         static_config_.downstream_sync_sem_id = 0;  // Unused for prefetch_h
+         static_config_.ringbuffer_size = my_dispatch_constants.ringbuffer_size();
+ 
+@@ -222,6 +226,8 @@
+                                           my_dispatch_constants.prefetch_d_buffer_size() + pcie_alignment - 1) &
+                                          (~(pcie_alignment - 1));
+         static_config_.scratch_db_size = my_dispatch_constants.scratch_db_size();
++        static_config_.exec_buf_predicate_scratch_addr = my_dispatch_constants.get_device_command_queue_addr(
++            CommandQueueDeviceAddrType::EXEC_BUF_PREDICATE_SCRATCH, cq_id_);
+         static_config_.downstream_sync_sem_id =
+             tt::tt_metal::CreateSemaphore(*program_, logical_core_, 0, GetCoreType());
+         static_config_.ringbuffer_size = my_dispatch_constants.ringbuffer_size();
+@@ -478,6 +484,7 @@
+         {"CMDDAT_Q_SIZE", std::to_string(static_config_.cmddat_q_size.value())},
+         {"SCRATCH_DB_BASE", std::to_string(static_config_.scratch_db_base.value())},
+         {"SCRATCH_DB_SIZE", std::to_string(static_config_.scratch_db_size.value())},
++        {"EXEC_BUF_PREDICATE_SCRATCH_ADDR", std::to_string(static_config_.exec_buf_predicate_scratch_addr.value())},
+         {"DOWNSTREAM_SYNC_SEM_ID", std::to_string(static_config_.downstream_sync_sem_id.value())},
+         {"CMDDAT_Q_PAGES", std::to_string(static_config_.cmddat_q_pages.value())},
+         {"MY_UPSTREAM_CB_SEM_ID", std::to_string(static_config_.my_upstream_cb_sem_id.value())},
+diff --git tt_metal/impl/dispatch/kernel_config/prefetch.hpp tt_metal/impl/dispatch/kernel_config/prefetch.hpp
+--- tt_metal/impl/dispatch/kernel_config/prefetch.hpp
++++ tt_metal/impl/dispatch/kernel_config/prefetch.hpp
+@@ -32,6 +32,7 @@
+     // Used for prefetch_h
+     std::optional<uint32_t> scratch_db_base;
+     std::optional<uint32_t> scratch_db_size;
++    std::optional<uint32_t> exec_buf_predicate_scratch_addr;
+     std::optional<uint32_t> downstream_sync_sem_id;
+     std::optional<uint32_t> ringbuffer_size;
+ 
+diff --git tt_metal/impl/dispatch/kernels/cq_commands.hpp tt_metal/impl/dispatch/kernels/cq_commands.hpp
+--- tt_metal/impl/dispatch/kernels/cq_commands.hpp
++++ tt_metal/impl/dispatch/kernels/cq_commands.hpp
+@@ -35,6 +35,7 @@
+     CQ_PREFETCH_CMD_RELAY_LINEAR_PACKED = 15,    // relay linear data from multiple srcs to dispatcher
+     CQ_PREFETCH_CMD_RELAY_LINEAR_PACKED_H = 16,  // relay linear data from multiple srcs on prefetch_h chip to
+                                                  // dispatcher. Must be only command in fetchq entry.
++    CQ_PREFETCH_CMD_EXEC_BUF_PREDICATE = 17,     // run the next exec_buf only if a device value matches
+     CQ_PREFETCH_CMD_MAX_COUNT,                   // for checking legal IDs
+ };
+ 
+@@ -153,6 +154,17 @@
+     uint32_t pages;
+ } __attribute__((packed));
+ 
++// Skips the next exec_buf unless the first 32-bit word of page 0 of an
++// interleaved DRAM buffer equals `value`. The host drains the dispatcher ahead of
++// it (a wait with a prefetch stall), so the word is final when it is read.
++struct CQPrefetchExecBufPredicateCmd {
++    uint8_t log2_page_size;  // of the predicate buffer
++    uint16_t pad1;
++    uint32_t base_addr;  // predicate buffer; page 0 holds the value
++    uint32_t value;
++    uint32_t pad2;
++} __attribute__((packed));
++
+ // Reset the write pointer to the start of the ring buffer. If this isn't set,
+ // the ringbuffer will never wrap around.
+ constexpr uint32_t CQ_PREFETCH_PAGED_TO_RING_BUFFER_FLAG_RESET_TO_START = 1;
+@@ -210,6 +222,7 @@
+         CQPrefetchRelayPagedPackedCmd relay_paged_packed;
+         CQPrefetchRelayInlineCmd relay_inline;
+         CQPrefetchExecBufCmd exec_buf;
++        CQPrefetchExecBufPredicateCmd exec_buf_predicate;
+         CQGenericDebugCmd debug;
+         CQPrefetchPagedToRingbufferCmd paged_to_ringbuffer;
+         CQPrefetchSetRingbufferOffsetCmd set_ringbuffer_offset;
+diff --git tt_metal/impl/dispatch/kernels/cq_prefetch.cpp tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+--- tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
++++ tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+@@ -83,6 +83,7 @@
+ // unused for prefetch_h
+ constexpr uint32_t scratch_db_base = SCRATCH_DB_BASE;
+ constexpr uint32_t scratch_db_size = SCRATCH_DB_SIZE;
++constexpr uint32_t exec_buf_predicate_scratch = EXEC_BUF_PREDICATE_SCRATCH_ADDR;
+ constexpr uint32_t my_downstream_sync_sem_id = DOWNSTREAM_SYNC_SEM_ID;
+ 
+ // prefetch_d specific
+@@ -2196,6 +2197,39 @@
+     return stride;
+ }
+ 
++// Whether CQ_PREFETCH_CMD_EXEC_BUF_PREDICATE has ruled out the next exec_buf.
++static bool skip_next_exec_buf = false;
++
++// Reads the predicate of the next exec_buf, the first 32-bit word of page 0 of
++// an interleaved DRAM buffer, the way an exec_buf reads its pages: tagged and
++// retired by transaction id 1, into a landing zone in L1 (the prefetcher's
++// stack and statics are in local memory, which the NoC cannot write). The
++// landing zone is stamped and polled, since the id barrier alone has been seen
++// to pass before a single read had landed.
++static uint32_t process_exec_buf_predicate_cmd(uintptr_t cmd_ptr) {
++    volatile CQPrefetchCmd tt_l1_ptr* cmd = reinterpret_cast<volatile CQPrefetchCmd tt_l1_ptr*>(cmd_ptr);
++    uint32_t base_addr = load_aligned<uint32_t>(&cmd->exec_buf_predicate.base_addr);
++    uint32_t page_size = 1u << cmd->exec_buf_predicate.log2_page_size;
++    uint32_t expected = load_aligned<uint32_t>(&cmd->exec_buf_predicate.value);
++    auto addr_gen = TensorAccessor(tensor_accessor::make_interleaved_dspec</*is_dram=*/true>(), base_addr, page_size);
++    uint64_t noc_addr = addr_gen.get_noc_addr(0);
++    constexpr uint32_t kUnread = 0xA5A5A5A5;
++    volatile tt_l1_ptr uint32_t* landing = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(exec_buf_predicate_scratch);
++    landing[0] = kUnread;
++    landing[1] = kUnread;
++    noc_async_read_set_trid(1);
++    noc_read_with_state<DM_DEDICATED_NOC, read_cmd_buf, CQ_NOC_SNDL, CQ_NOC_SEND, CQ_NOC_WAIT>(
++        noc_index, noc_addr, exec_buf_predicate_scratch, 64);
++    noc_async_read_barrier_with_trid(1);
++    noc_async_read_set_trid(0);
++    invalidate_l1_cache();
++    while (landing[0] == kUnread && landing[1] == kUnread) {
++        invalidate_l1_cache();
++    }
++    skip_next_exec_buf = landing[0] != expected;
++    return CQ_PREFETCH_CMD_BARE_MIN_SIZE;
++}
++
+ uint32_t process_exec_buf_cmd(
+     uintptr_t cmd_ptr_outer, uint32_t& downstream_data_ptr, uint32_t* l1_cache, PrefetchExecBufState& exec_buf_state) {
+     // dispatch on eth cores is memory constrained, so exec_buf reuses the cmddat_q
+@@ -2598,13 +2632,23 @@
+             }
+             break;
+ 
++        case CQ_PREFETCH_CMD_EXEC_BUF_PREDICATE:
++            ASSERT(!exec_buf);
++            stride = process_exec_buf_predicate_cmd(cmd_ptr);
++            break;
++
+         case CQ_PREFETCH_CMD_EXEC_BUF:
+             // DPRINT("exec_buf: {}\n", cmd_ptr);
+             ASSERT(!exec_buf);
+             if (is_h_variant) {
+                 ASSERT(stall_state == StallState::STALLED);  // ExecBuf must be preceded by a prefetcher stall
+             }
+-            stride = process_exec_buf_cmd(cmd_ptr, downstream_data_ptr, l1_cache, exec_buf_state);
++            if (skip_next_exec_buf) {
++                skip_next_exec_buf = false;
++                stride = CQ_PREFETCH_CMD_BARE_MIN_SIZE;
++            } else {
++                stride = process_exec_buf_cmd(cmd_ptr, downstream_data_ptr, l1_cache, exec_buf_state);
++            }
+             stall_state = StallState::NOT_STALLED;  // Stall is no longer required after ExecBuf finished.
+             break;
+ 
+diff --git tt_metal/impl/trace/dispatch.cpp tt_metal/impl/trace/dispatch.cpp
+--- tt_metal/impl/trace/dispatch.cpp
++++ tt_metal/impl/trace/dispatch.cpp
+@@ -19,6 +19,7 @@
+ #include "tt_align.hpp"
+ #include "tt_metal/impl/dispatch/device_command.hpp"
+ #include "tt_metal/impl/trace/dispatch.hpp"
++#include "tt_metal/impl/dispatch/device_command_calculator.hpp"
+ #include "dispatch/worker_config_buffer.hpp"
+ #include <impl/dispatch/dispatch_query_manager.hpp>
+ #include <impl/dispatch/dispatch_mem_map.hpp>
+@@ -78,31 +79,27 @@
+         config_buffer_mgr_reset.begin(), config_buffer_mgr_reset.begin() + num_sub_devices, config_buffer_mgr.begin());
+ }
+ 
+-void issue_trace_commands(
++template <bool hugepage_write>
++void add_trace_reset_commands(
++    DeviceCommand<hugepage_write>& command_sequence,
+     distributed::MeshDevice* mesh_device,
+-    SystemMemoryManager& sysmem_manager,
+-    const TraceDispatchMetadata& dispatch_md,
+-    uint8_t cq_id,
++    const std::unordered_map<SubDeviceId, TraceWorkerDescriptor>& trace_worker_descriptors,
++    const std::vector<SubDeviceId>& sub_device_ids,
+     const DispatchArray<uint32_t>& expected_num_workers_completed,
++    uint8_t cq_id,
+     CoreCoord dispatch_core) {
+-    MetalContext& metal_ctx = MetalContext::instance(sysmem_manager.get_context_id());
+-    void* cmd_region = sysmem_manager.issue_queue_reserve(dispatch_md.cmd_sequence_sizeB, cq_id);
+-
+-    HugepageDeviceCommand command_sequence(metal_ctx, cmd_region, dispatch_md.cmd_sequence_sizeB);
+-
++    MetalContext& metal_ctx = MetalContext::instance(mesh_device->impl().get_context_id());
+     DispatcherSelect dispatcher_for_go_signal = DispatcherSelect::DISPATCH_MASTER;
+     if (metal_ctx.get_dispatch_query_manager().dispatch_s_enabled()) {
+         uint16_t index_bitmask = 0;
+-        for (const auto& id : dispatch_md.sub_device_ids) {
++        for (const auto& id : sub_device_ids) {
+             index_bitmask |= 1 << *id;
+         }
+         command_sequence.add_notify_dispatch_s_go_signal_cmd(false, index_bitmask);
+         dispatcher_for_go_signal = DispatcherSelect::DISPATCH_SUBORDINATE;
+     }
+-
+-    for (const auto& [id, desc] : dispatch_md.trace_worker_descriptors) {
++    for (const auto& [id, desc] : trace_worker_descriptors) {
+         auto index = *id;
+-
+         // Wait to ensure that all kernels have completed. Then send the reset_rd_ptr go_signal.
+         command_sequence.add_dispatch_go_signal_mcast(
+             expected_num_workers_completed[index],
+@@ -118,17 +115,15 @@
+                 : CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET,
+             dispatcher_for_go_signal);
+     }
+-
+     // Wait to ensure that all workers have reset their read_ptr. dispatch_d will stall until all workers have completed
+     // this step, before sending kernel config data to workers or notifying dispatch_s that its safe to send the
+     // go_signal. Clear the dispatch <--> worker semaphore, since trace starts at 0.
+-    for (const auto& [id, desc] : dispatch_md.trace_worker_descriptors) {
++    for (const auto& [id, desc] : trace_worker_descriptors) {
+         auto index = *id;
+         uint32_t expected_num_workers = expected_num_workers_completed[index];
+         if (desc.num_traced_programs_needing_go_signal_multicast) {
+             expected_num_workers += mesh_device->num_worker_cores(HalProgrammableCoreType::TENSIX, id);
+         }
+-
+         if (metal_ctx.get_dispatch_query_manager().distributed_dispatcher()) {
+             command_sequence.add_dispatch_wait(
+                 CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM,
+@@ -145,7 +140,75 @@
+             expected_num_workers,
+             cq_id);
+     }
++}
++
++template void add_trace_reset_commands<true>(
++    DeviceCommand<true>&,
++    distributed::MeshDevice*,
++    const std::unordered_map<SubDeviceId, TraceWorkerDescriptor>&,
++    const std::vector<SubDeviceId>&,
++    const DispatchArray<uint32_t>&,
++    uint8_t,
++    CoreCoord);
++template void add_trace_reset_commands<false>(
++    DeviceCommand<false>&,
++    distributed::MeshDevice*,
++    const std::unordered_map<SubDeviceId, TraceWorkerDescriptor>&,
++    const std::vector<SubDeviceId>&,
++    const DispatchArray<uint32_t>&,
++    uint8_t,
++    CoreCoord);
++
++uint32_t compute_trace_reset_cmd_size(ContextId context_id, uint32_t num_sub_devices) {
++    MetalContext& metal_ctx = MetalContext::instance(context_id);
++    DeviceCommandCalculator calculator(metal_ctx);
++    if (metal_ctx.get_dispatch_query_manager().dispatch_s_enabled()) {
++        calculator.add_notify_dispatch_s_go_signal_cmd();
++    }
++    for (uint32_t i = 0; i < num_sub_devices; ++i) {
++        calculator.add_dispatch_go_signal_mcast();
++        if (metal_ctx.get_dispatch_query_manager().distributed_dispatcher()) {
++            calculator.add_dispatch_wait();
++        }
++        calculator.add_dispatch_wait();
++    }
++    return calculator.write_offset_bytes();
++}
++
++uint32_t compute_trace_predicate_cmd_size(ContextId context_id) {
++    DeviceCommandCalculator calculator(MetalContext::instance(context_id));
++    calculator.add_dispatch_wait_with_prefetch_stall();
++    calculator.add_prefetch_exec_buf_predicate();
++    return calculator.write_offset_bytes();
++}
++
++void issue_trace_commands(
++    distributed::MeshDevice* mesh_device,
++    SystemMemoryManager& sysmem_manager,
++    const TraceDispatchMetadata& dispatch_md,
++    uint8_t cq_id,
++    const DispatchArray<uint32_t>& expected_num_workers_completed,
++    CoreCoord dispatch_core,
++    const std::optional<TracePredicate>& predicate) {
++    MetalContext& metal_ctx = MetalContext::instance(sysmem_manager.get_context_id());
++    void* cmd_region = sysmem_manager.issue_queue_reserve(dispatch_md.cmd_sequence_sizeB, cq_id);
+ 
++    HugepageDeviceCommand command_sequence(metal_ctx, cmd_region, dispatch_md.cmd_sequence_sizeB);
++    add_trace_reset_commands(
++        command_sequence,
++        mesh_device,
++        dispatch_md.trace_worker_descriptors,
++        dispatch_md.sub_device_ids,
++        expected_num_workers_completed,
++        cq_id,
++        dispatch_core);
++    if (predicate.has_value()) {
++        // Drain the dispatcher and hold the prefetcher until it has, so that the work which computed the predicate
++        // has finished when the prefetcher reads it.
++        command_sequence.add_dispatch_wait_with_prefetch_stall(CQ_DISPATCH_CMD_WAIT_FLAG_BARRIER, 0, 0, 0, cq_id);
++        command_sequence.add_prefetch_exec_buf_predicate(
++            predicate->address, predicate->log2_page_size, predicate->value);
++    }
+     uint32_t page_size_log2 = __builtin_ctz(dispatch_md.trace_buffer_page_size);
+     TT_ASSERT(
+         (dispatch_md.trace_buffer_page_size & (dispatch_md.trace_buffer_page_size - 1)) == 0,
+@@ -211,6 +274,22 @@
+     }
+ }
+ 
++void reset_worker_state_post_conditional_trace(
++    const std::unordered_map<SubDeviceId, TraceWorkerDescriptor>& trace_worker_descriptors,
++    DispatchArray<LaunchMessageRingBufferState>& worker_launch_message_buffer_state,
++    DispatchArray<WorkerConfigBufferMgr>& config_buffer_mgr,
++    DispatchArray<uint32_t>& expected_num_workers_completed) {
++    for (const auto& [id, desc] : trace_worker_descriptors) {
++        auto index = *id;
++        // The trace ends with the reset a replay starts with, and a skipped trace leaves the state of that reset.
++        expected_num_workers_completed[index] = 0;
++        if (desc.num_traced_programs_needing_go_signal_multicast) {
++            worker_launch_message_buffer_state[index].set_mcast_wptr(0);
++        }
++        config_buffer_mgr[index].mark_completely_full(0);
++    }
++}
++
+ // Assumes pages are interleaved across all banks starting at 0
+ std::size_t compute_interleaved_trace_buf_page_size(uint32_t buf_size, const uint32_t num_banks) {
+     // Tuneable parameters for the trace buffer - heavily affect prefetcher
+diff --git tt_metal/impl/trace/dispatch.hpp tt_metal/impl/trace/dispatch.hpp
+--- tt_metal/impl/trace/dispatch.hpp
++++ tt_metal/impl/trace/dispatch.hpp
+@@ -7,10 +7,12 @@
+ #include <device.hpp>
+ #include <stdint.h>
+ #include <cstddef>
++#include <optional>
+ #include <unordered_map>
+ #include <vector>
+ 
+ #include "core_coord.hpp"
++#include "dispatch/device_command.hpp"
+ #include "dispatch/dispatch_settings.hpp"
+ #include "dispatch/worker_config_buffer.hpp"
+ #include "impl/context/context_types.hpp"
+@@ -69,13 +71,46 @@
+     DispatchArray<uint32_t>& expected_num_workers_completed_reset,
+     DispatchArray<WorkerConfigBufferMgr>& config_buffer_mgr_reset);
+ 
++// A trace runs only if the first 32-bit word of page 0 of an interleaved DRAM buffer equals `value`.
++struct TracePredicate {
++    uint32_t address = 0;
++    uint8_t log2_page_size = 0;
++    uint32_t value = 0;
++};
++
++// Waits for the workers each sub-device expects to have completed, resets their launch-message read pointers and
++// clears their completion counters. A replay starts with these commands; a conditional trace also ends with them,
++// so the device is left in the same state whether it ran or was skipped.
++template <bool hugepage_write>
++void add_trace_reset_commands(
++    DeviceCommand<hugepage_write>& command_sequence,
++    distributed::MeshDevice* mesh_device,
++    const std::unordered_map<SubDeviceId, TraceWorkerDescriptor>& trace_worker_descriptors,
++    const std::vector<SubDeviceId>& sub_device_ids,
++    const DispatchArray<uint32_t>& expected_num_workers_completed,
++    uint8_t cq_id,
++    CoreCoord dispatch_core);
++
++uint32_t compute_trace_reset_cmd_size(ContextId context_id, uint32_t num_sub_devices);
++
++// The size of what a predicate adds to a replay (compute_trace_cmd_size).
++uint32_t compute_trace_predicate_cmd_size(ContextId context_id);
++
+ void issue_trace_commands(
+     distributed::MeshDevice* mesh_device,
+     SystemMemoryManager& sysmem_manager,
+     const TraceDispatchMetadata& dispatch_md,
+     uint8_t cq_id,
+     const DispatchArray<uint32_t>& expected_num_workers_completed,
+-    CoreCoord dispatch_core);
++    CoreCoord dispatch_core,
++    const std::optional<TracePredicate>& predicate = std::nullopt);
++
++// The host dispatch state after a conditional trace, whether it ran or was skipped.
++void reset_worker_state_post_conditional_trace(
++    const std::unordered_map<SubDeviceId, TraceWorkerDescriptor>& trace_worker_descriptors,
++    DispatchArray<LaunchMessageRingBufferState>& worker_launch_message_buffer_state,
++    DispatchArray<WorkerConfigBufferMgr>& config_buffer_mgr,
++    DispatchArray<uint32_t>& expected_num_workers_completed);
+ 
+ uint32_t compute_trace_cmd_size(ContextId context_id, uint32_t num_sub_devices);
+ 
