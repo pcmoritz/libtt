@@ -83,6 +83,6 @@ Loops whose trip count the device decides still run eagerly.
 
 `tests/libtt/traced_device_case_regression_test.py` checks conditionals on
 computed values, through counted loops, results passed through from dead and
-live inputs, a branch that writes a cache in place, that the function stays
-one trace, and that the call returns before the device finishes the work
-queued ahead of it.
+live inputs, a branch that writes a cache in place, constants a branch
+computes, that the function stays one trace, and that the call returns before
+the device finishes the work queued ahead of it.

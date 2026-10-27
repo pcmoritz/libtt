@@ -211,3 +211,23 @@ def test_only_the_selected_branch_writes_in_place(tmp_path):
         np.testing.assert_array_equal(np.asarray(cache), expected, err_msg=str(take))
     traces, cases = _ops_per_function(tmp_path)
     assert traces["main"] == 1 and cases["main"] == 0, (traces, cases)
+
+
+def test_constants_a_branch_computes(tmp_path):
+    # A branch computes a mask from constants on device. The warmup before
+    # the capture only prepares the branch's workloads, but the constants it
+    # loads are computed for real, on the call that captures the trace.
+    def run(x, flag):
+        def masked(v):
+            columns = jnp.arange(v.shape[-1], dtype=jnp.int32)
+            return jnp.where((columns % 3 == 0) | (columns > 27), v, -v)
+
+        return lax.cond(flag, masked, lambda v: v + 1, x)
+
+    run = _jit(run, export_path=tmp_path)
+    columns = np.arange(SOURCE.shape[-1])
+    for take in [True, False, True]:
+        expected = np.where((columns % 3 == 0) | (columns > 27), SOURCE, -SOURCE) if take else SOURCE + 1
+        np.testing.assert_array_equal(np.asarray(run(_put(SOURCE), _put(np.bool_(take)))), expected, err_msg=str(take))
+    traces, cases = _ops_per_function(tmp_path)
+    assert traces["main"] == 1 and cases["main"] == 0, (traces, cases)
