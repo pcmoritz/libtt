@@ -1,0 +1,506 @@
+diff --git tt_metal/api/tt-metalium/mesh_command_queue.hpp tt_metal/api/tt-metalium/mesh_command_queue.hpp
+--- tt_metal/api/tt-metalium/mesh_command_queue.hpp
++++ tt_metal/api/tt-metalium/mesh_command_queue.hpp
+@@ -129,6 +129,15 @@
+     virtual void finish(ttsl::Span<const SubDeviceId> sub_device_ids = {}) = 0;
+     virtual void record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) = 0;
+     virtual void record_end() = 0;
++    // A case inside the trace being recorded: the workloads enqueued after each record_case_branch(), until the
++    // next one or record_case_end(), form one branch. A replay runs the first branch whose test passes, or the last
++    // branch if none does: branch k's test is whether the index equals `value` (differs from it, with equal false).
++    // The index is the low `index_bits` bits of the 32-bit word that page 0 of `index` (an interleaved DRAM buffer)
++    // starts with when the replay gets there; the host never reads it. Branches may hold cases of their own; each
++    // case drains the device before and after it.
++    virtual void record_case_begin(const MeshBuffer& index, uint8_t index_bits = 32) = 0;
++    virtual void record_case_branch(uint32_t value, bool equal = true) = 0;
++    virtual void record_case_end() = 0;
+     virtual void enqueue_trace(const MeshTraceId& trace_id, bool blocking) = 0;
+ };
+ 
+diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/fd_mesh_command_queue.cpp
+--- tt_metal/distributed/fd_mesh_command_queue.cpp
++++ tt_metal/distributed/fd_mesh_command_queue.cpp
+@@ -17,6 +17,8 @@
+ #include <tt-metalium/tt_metal.hpp>
+ #include <algorithm>
+ #include <array>
++#include <bit>
++#include <cstddef>
+ #include <functional>
+ #include <mutex>
+ #include <optional>
+@@ -62,6 +64,7 @@
+ #include <impl/dispatch/dispatch_mem_map.hpp>
+ #include <distributed/mesh_device_impl.hpp>
+ #include "dispatch/simple_trace_allocator.hpp"
++#include "tt_metal/impl/dispatch/device_command_calculator.hpp"
+ #if defined(TT_UMD_BUILD_SIMULATION)
+ #include "buffers/simulator_direct_write.hpp"
+ #endif
+@@ -1460,6 +1463,38 @@
+     swap(this->dummy_prefetcher_cache_manager_, this->prefetcher_cache_manager_);
+ }
+ 
++void FDMeshCommandQueue::push_case_marker(MeshTraceNode&& marker) {
++    auto lock = lock_api_function_();
++    TT_FATAL(trace_id_.has_value(), "Trace cases can only be recorded while a trace is being captured");
++    trace_nodes_.push_back(std::move(marker));
++}
++
++void FDMeshCommandQueue::record_case_begin(const MeshBuffer& index, uint8_t index_bits) {
++    TT_FATAL(
++        index.device_local_config().buffer_type == BufferType::DRAM && std::has_single_bit(index.page_size()),
++        "A trace case index must be in an interleaved DRAM buffer with a power-of-two page size");
++    MeshTraceNode marker;
++    marker.case_marker = MeshTraceNode::CaseMarker::Begin;
++    marker.case_index_address = static_cast<uint32_t>(index.address());
++    marker.case_index_log2_page_size = static_cast<uint8_t>(std::countr_zero(index.page_size()));
++    marker.case_index_bits = index_bits;
++    this->push_case_marker(std::move(marker));
++}
++
++void FDMeshCommandQueue::record_case_branch(uint32_t value, bool equal) {
++    MeshTraceNode marker;
++    marker.case_marker = MeshTraceNode::CaseMarker::Branch;
++    marker.case_branch_value = value;
++    marker.case_branch_equal = equal;
++    this->push_case_marker(std::move(marker));
++}
++
++void FDMeshCommandQueue::record_case_end() {
++    MeshTraceNode marker;
++    marker.case_marker = MeshTraceNode::CaseMarker::End;
++    this->push_case_marker(std::move(marker));
++}
++
+ void FDMeshCommandQueue::record_end() {
+     MetalContext& metal_ctx = MetalContext::instance(mesh_device_->impl().get_context_id());
+     const auto& hal = metal_ctx.hal();
+@@ -1495,6 +1530,29 @@
+     size_t max_trace_size = 0;
+     std::set<SubDeviceId> sub_device_ids;
+     std::optional<std::unordered_map<SubDeviceId, TraceWorkerDescriptor>> overall_trace_worker_descriptors;
++    // A trace with cases (record_case_begin) is laid out in regions: each run of workloads between case markers as
++    // a trace of its own, since every case marker returns the device to the state a replay starts in. Only the
++    // final region, after the last case, still runs when the trace ends, so only it is equalized across device
++    // ranges below and described by the trace descriptors. A sub-device that runs programs before the final region
++    // but not in it gets a dummy GO signal there, so that a replay resets its launch state first.
++    size_t final_region_begin = 0;
++    uint32_t case_depth = 0;
++    for (size_t i = 0; i < trace_nodes_.size(); i++) {
++        if (trace_nodes_[i].case_marker == MeshTraceNode::CaseMarker::Begin) {
++            case_depth++;
++        } else if (trace_nodes_[i].case_marker == MeshTraceNode::CaseMarker::End && --case_depth == 0) {
++            final_region_begin = i + 1;
++        }
++    }
++    TT_FATAL(case_depth == 0, "A trace case is still open at the end of the capture");
++    DispatchArray<bool> multicast_before_final_region{};
++    DispatchArray<bool> multicast_in_final_region{};
++    for (size_t i = 0; i < trace_nodes_.size(); i++) {
++        if (trace_nodes_[i].multicast_go_signals) {
++            (i < final_region_begin ? multicast_before_final_region
++                                    : multicast_in_final_region)[*trace_nodes_[i].sub_device_id] = true;
++        }
++    }
+     for (const auto& range : device_ranges) {
+         // NOTE: TraceNode objects may be shared across device ranges (when a program's device range
+         // spans multiple partition ranges). Each iteration of this loop mutates
+@@ -1512,6 +1570,11 @@
+         DispatchArray<UnusedNodeData> unused_nodes;
+ 
+         for (auto& mesh_node : trace_nodes_) {
++            if (mesh_node.case_marker != MeshTraceNode::CaseMarker::None) {
++                trace_nodes.push_back(nullptr);
++                mesh_trace_nodes.push_back(&mesh_node);
++                continue;
++            }
+             bool used = false;
+             for (auto& [device_range, node] : mesh_node.trace_nodes) {
+                 if (!device_range.intersects(range)) {
+@@ -1524,7 +1587,7 @@
+                 used = true;
+                 break;
+             }
+-            if (!used) {
++            if (!used && &mesh_node - trace_nodes_.data() >= static_cast<std::ptrdiff_t>(final_region_begin)) {
+                 auto& unused_node = unused_nodes[*mesh_node.sub_device_id];
+                 if (mesh_node.multicast_go_signals) {
+                     unused_node.unused_nodes_multicast++;
+@@ -1544,8 +1607,15 @@
+             }
+             ringbuffer_configs.push_back({start, size});
+         }
+-        SimpleTraceAllocator allocator{ringbuffer_configs};
+-        allocator.allocate_trace_programs(hal, trace_nodes);
++        for (auto run_begin = trace_nodes.begin(); run_begin != trace_nodes.end();) {
++            auto run_end = std::find(run_begin, trace_nodes.end(), nullptr);
++            if (run_begin != run_end) {
++                std::vector<TraceNode*> run(run_begin, run_end);
++                SimpleTraceAllocator allocator{ringbuffer_configs};
++                allocator.allocate_trace_programs(hal, run);
++            }
++            run_begin = run_end == trace_nodes.end() ? run_end : run_end + 1;
++        }
+ 
+         // Each device range produces an independent trace byte stream, so reset the prefetcher
+         // cache manager to give each range a clean slate.
+@@ -1557,41 +1627,170 @@
+             worker_launch_message_buffer_state[sub_device_id].reset();
+         }
+         std::unordered_map<SubDeviceId, TraceWorkerDescriptor> trace_worker_descriptors;
+-        // Output a GO signal for each unused mesh node, to ensure that the launch message buffer write pointer and
+-        // number of expected workers matches across all devices. We do this at the beginning of the trace, becaue the
+-        // last program in the trace may continue running after the trace ends, so we can't do adjustments after it.
+-        // TODO: Use a single command to update the expected number of workers, rather than repeated commands.
+-        for (uint32_t sub_device_id = 0; sub_device_id < mesh_device_->num_sub_devices(); sub_device_id++) {
+-            for (uint32_t i = 0; i < unused_nodes[sub_device_id].unused_nodes_multicast; i++) {
+-                SubDeviceId sub_device{static_cast<uint8_t>(sub_device_id)};
+-                auto& trace_worker_descriptor = trace_worker_descriptors[sub_device];
+-                program_dispatch::ProgramDispatchMetadata go_signal_md;
+-                go_signal_md.prefetcher_cache_info.is_cached = true;
+-                write_go_signal_sequence(
+-                    this->id_,
+-                    this->mesh_device_,
+-                    sub_device,
++        DispatchArray<uint32_t> starting_workers_completed{};
++        auto start_final_region = [&]() {
++            // Output a GO signal for each unused mesh node, to ensure that the launch message buffer write pointer and
++            // number of expected workers matches across all devices. We do this at the beginning of the final region,
++            // because the last program in the trace may continue running after the trace ends, so we can't do adjustments
++            // after it.
++            // TODO: Use a single command to update the expected number of workers, rather than repeated commands.
++            for (uint32_t sub_device_id = 0; sub_device_id < mesh_device_->num_sub_devices(); sub_device_id++) {
++                uint32_t dummy_go_signals = unused_nodes[sub_device_id].unused_nodes_multicast;
++                if (multicast_before_final_region[sub_device_id] && !multicast_in_final_region[sub_device_id]) {
++                    dummy_go_signals++;
++                }
++                for (uint32_t i = 0; i < dummy_go_signals; i++) {
++                    SubDeviceId sub_device{static_cast<uint8_t>(sub_device_id)};
++                    auto& trace_worker_descriptor = trace_worker_descriptors[sub_device];
++                    program_dispatch::ProgramDispatchMetadata go_signal_md;
++                    go_signal_md.prefetcher_cache_info.is_cached = true;
++                    write_go_signal_sequence(
++                        this->id_,
++                        this->mesh_device_,
++                        sub_device,
++                        sysmem_manager_for_trace,
++                        trace_worker_descriptor.num_completion_worker_cores,
++                        this->virtual_program_dispatch_core(),
++                        /*send_mcast=*/true,
++                        go_signal_md,
++                        std::nullopt);
++
++                    auto& worker_launch_msg_state = worker_launch_message_buffer_state[sub_device_id];
++                    trace_worker_descriptor.num_completion_worker_cores +=
++                        mesh_device_->num_worker_cores(HalProgrammableCoreType::TENSIX, sub_device);
++                    worker_launch_msg_state.inc_mcast_wptr(1);
++                    trace_worker_descriptor.num_traced_programs_needing_go_signal_multicast++;
++                }
++            }
++            // SimpleTraceAllocator assumes the sync starts at 0, so keep track of the number of allocations to add.
++            for (auto& [sub_device_id, trace_worker_descriptor] : trace_worker_descriptors) {
++                starting_workers_completed[*sub_device_id] = trace_worker_descriptor.num_completion_worker_cores;
++            }
++        };
++
++        // Commands between workloads are written through the manager like a workload's: it tracks its own offset.
++        auto write_ptr = [&]() { return sysmem_manager_for_trace.get_issue_queue_write_ptr(this->id_); };
++        auto append = [&](const void* data, uint32_t size) {
++            const uint32_t offset = write_ptr();
++            sysmem_manager_for_trace.issue_queue_reserve(size, this->id_);
++            sysmem_manager_for_trace.cq_write(data, size, offset);
++            sysmem_manager_for_trace.issue_queue_push_back(size, this->id_);
++            return offset;
++        };
++        // Returns the device to the state a replay starts in: waits for the programs since the last boundary, resets
++        // the workers' launch message read pointers and clears the completion counters. With stall_prefetcher, the
++        // prefetcher waits for the dispatcher to get there, so that a skip after it reads what the drained programs
++        // wrote.
++        auto emit_boundary = [&](bool stall_prefetcher) {
++            if (!trace_worker_descriptors.empty()) {
++                DispatchArray<uint32_t> workers_completed{};
++                for (auto& [sub_device_id, trace_worker_descriptor] : trace_worker_descriptors) {
++                    workers_completed[*sub_device_id] = trace_worker_descriptor.num_completion_worker_cores;
++                }
++                program_dispatch::reset_worker_dispatch_state_on_device(
++                    mesh_device_,
+                     sysmem_manager_for_trace,
+-                    trace_worker_descriptor.num_completion_worker_cores,
++                    this->id_,
+                     this->virtual_program_dispatch_core(),
+-                    /*send_mcast=*/true,
+-                    go_signal_md,
+-                    std::nullopt);
+-
+-                auto& worker_launch_msg_state = worker_launch_message_buffer_state[sub_device_id];
+-                trace_worker_descriptor.num_completion_worker_cores +=
+-                    mesh_device_->num_worker_cores(HalProgrammableCoreType::TENSIX, sub_device);
+-                worker_launch_msg_state.inc_mcast_wptr(1);
+-                trace_worker_descriptor.num_traced_programs_needing_go_signal_multicast++;
++                    workers_completed,
++                    /*reset_launch_msg_state=*/true,
++                    {});
+             }
+-        }
+-        DispatchArray<uint32_t> starting_workers_completed{};
+-        // SimpleTraceAllocator assumes the sync starts at 0, so keep track of the number of allocations to add.
+-        for (auto& [sub_device_id, trace_worker_descriptor] : trace_worker_descriptors) {
+-            starting_workers_completed[*sub_device_id] = trace_worker_descriptor.num_completion_worker_cores;
++            if (stall_prefetcher) {
++                DeviceCommandCalculator calculator(metal_ctx);
++                calculator.add_dispatch_wait_with_prefetch_stall();
++                HostMemDeviceCommand stall(metal_ctx, calculator.write_offset_bytes());
++                stall.add_dispatch_wait_with_prefetch_stall(CQ_DISPATCH_CMD_WAIT_FLAG_BARRIER, 0, 0, 0, this->id_);
++                append(stall.data(), stall.size_bytes());
++            }
++            trace_worker_descriptors.clear();
++            for (uint32_t sub_device_id = 0; sub_device_id < mesh_device_->num_sub_devices(); sub_device_id++) {
++                worker_launch_message_buffer_state[sub_device_id].reset();
++            }
++            starting_workers_completed = {};
++            this->reset_prefetcher_cache_manager();
++        };
++        const uint32_t skip_size = tt::align(sizeof(CQPrefetchCmd), hal.get_alignment(HalMemType::HOST));
++        auto emit_skip = [&](uint8_t mode, const MeshTraceNode& begin, uint32_t value) {
++            std::vector<uint32_t> words(skip_size / sizeof(uint32_t), 0);
++            auto* skip = reinterpret_cast<CQPrefetchCmd*>(words.data());
++            skip->base.cmd_id = CQ_PREFETCH_CMD_EXEC_BUF_SKIP;
++            skip->exec_buf_skip.mode = mode;
++            skip->exec_buf_skip.log2_page_size = begin.case_index_log2_page_size;
++            skip->exec_buf_skip.value_bits = begin.case_index_bits;
++            skip->exec_buf_skip.base_addr = begin.case_index_address;
++            skip->exec_buf_skip.value = value;
++            return append(words.data(), skip_size);
++        };
++        auto skip_at = [&](uint32_t offset) -> CQPrefetchExecBufSkipCmd& {
++            auto& data = sysmem_manager_for_trace.get_bypass_data();
++            return reinterpret_cast<CQPrefetchCmd*>(data.data() + (offset / sizeof(uint32_t)))->exec_buf_skip;
++        };
++        auto land_skip = [&](uint32_t offset) { skip_at(offset).bytes = write_ptr() - offset - skip_size; };
++
++        // A case runs one branch: after a boundary, each branch is entered if its test passes and skips to the end
++        // of the case once done; the last branch runs if no test passes. With tests "index == k":
++        //   boundary + stall; skip if index != 0 -> b1; branch 0; boundary; skip -> end;
++        //   b1: skip if index != 1 -> b2; branch 1; boundary; skip -> end; ... branch N-1; boundary; end:
++        // A case nested in a branch is laid out the same way.
++        struct OpenCase {
++            const MeshTraceNode* begin;
++            bool has_branch = false;
++            uint32_t skip_to_next_branch = 0;
++            std::vector<uint32_t> skips_to_end;
++        };
++        std::vector<OpenCase> open_cases;
++        auto emit_case_marker = [&](const MeshTraceNode& marker) {
++            switch (marker.case_marker) {
++                case MeshTraceNode::CaseMarker::Begin:
++                    emit_boundary(/*stall_prefetcher=*/true);
++                    open_cases.push_back(OpenCase{&marker});
++                    break;
++                case MeshTraceNode::CaseMarker::Branch: {
++                    TT_FATAL(!open_cases.empty(), "record_case_branch needs an open record_case_begin");
++                    OpenCase& open = open_cases.back();
++                    if (open.has_branch) {
++                        emit_boundary(/*stall_prefetcher=*/false);
++                        open.skips_to_end.push_back(emit_skip(CQ_PREFETCH_EXEC_BUF_SKIP_ALWAYS, *open.begin, 0));
++                        land_skip(open.skip_to_next_branch);
++                    }
++                    open.skip_to_next_branch = emit_skip(
++                        marker.case_branch_equal ? CQ_PREFETCH_EXEC_BUF_SKIP_IF_NOT_EQUAL
++                                                 : CQ_PREFETCH_EXEC_BUF_SKIP_IF_EQUAL,
++                        *open.begin,
++                        marker.case_branch_value);
++                    open.has_branch = true;
++                    break;
++                }
++                case MeshTraceNode::CaseMarker::End: {
++                    TT_FATAL(
++                        !open_cases.empty() && open_cases.back().has_branch,
++                        "record_case_end needs an open record_case_begin with a branch");
++                    OpenCase& open = open_cases.back();
++                    emit_boundary(/*stall_prefetcher=*/false);
++                    // The last branch takes every other index: its test becomes a skip of nothing.
++                    skip_at(open.skip_to_next_branch).mode = CQ_PREFETCH_EXEC_BUF_SKIP_ALWAYS;
++                    for (uint32_t skip : open.skips_to_end) {
++                        land_skip(skip);
++                    }
++                    open_cases.pop_back();
++                    if (&marker - trace_nodes_.data() + 1 == static_cast<std::ptrdiff_t>(final_region_begin)) {
++                        start_final_region();
++                    }
++                    break;
++                }
++                case MeshTraceNode::CaseMarker::None: break;
++            }
++        };
++        if (final_region_begin == 0) {
++            start_final_region();
+         }
+ 
+         for (uint32_t node_idx = 0; node_idx < trace_nodes.size(); node_idx++) {
++            if (!trace_nodes[node_idx]) {
++                emit_case_marker(*mesh_trace_nodes[node_idx]);
++                continue;
++            }
+             auto& node = *trace_nodes[node_idx];
+             auto sub_device_id = node.sub_device_id;
+             auto& program = *node.program;
+diff --git tt_metal/distributed/fd_mesh_command_queue.hpp tt_metal/distributed/fd_mesh_command_queue.hpp
+--- tt_metal/distributed/fd_mesh_command_queue.hpp
++++ tt_metal/distributed/fd_mesh_command_queue.hpp
+@@ -123,7 +123,16 @@
+         std::vector<std::pair<MeshCoordinateRange, TraceNode>> trace_nodes;
+         bool multicast_go_signals{false};
+         SubDeviceId sub_device_id;
++        // Instead of a workload, a marker of a trace case (record_case_begin); a Begin marker holds the interleaved
++        // DRAM buffer whose page 0 starts with the index, a Branch marker its test.
++        enum class CaseMarker : uint8_t { None, Begin, Branch, End } case_marker{CaseMarker::None};
++        uint32_t case_index_address{0};
++        uint8_t case_index_log2_page_size{0};
++        uint8_t case_index_bits{32};
++        uint32_t case_branch_value{0};
++        bool case_branch_equal{true};
+     };
++    void push_case_marker(MeshTraceNode&& marker);
+ 
+     // The following data structures are only popiulated when the MeshCQ is being used to trace workloads
+     // i.e. between record_begin() and record_end() being called
+@@ -288,6 +297,9 @@
+         ttsl::Span<const uint32_t> workers_per_sub_device) override;
+     void record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) override;
+     void record_end() override;
++    void record_case_begin(const MeshBuffer& index, uint8_t index_bits) override;
++    void record_case_branch(uint32_t value, bool equal) override;
++    void record_case_end() override;
+     void enqueue_trace(const MeshTraceId& trace_id, bool blocking) override;
+     // Enqueue a command list without entering the mesh-trace lifecycle.
+     void enqueue_command_list(
+diff --git tt_metal/distributed/mesh_command_queue_base.hpp tt_metal/distributed/mesh_command_queue_base.hpp
+--- tt_metal/distributed/mesh_command_queue_base.hpp
++++ tt_metal/distributed/mesh_command_queue_base.hpp
+@@ -138,6 +138,14 @@
+         const std::optional<std::unordered_set<MeshCoordinate>>& shards,
+         bool blocking) override;
+ 
++    void record_case_begin(const MeshBuffer& /*index*/, uint8_t /*index_bits*/) override {
++        TT_THROW("Trace cases need a fast dispatch command queue");
++    }
++    void record_case_branch(uint32_t /*value*/, bool /*equal*/) override {
++        TT_THROW("Trace cases need a fast dispatch command queue");
++    }
++    void record_case_end() override { TT_THROW("Trace cases need a fast dispatch command queue"); }
++
+     // Returns true if the CQ is in use (has had commands enqueued).
+     virtual bool in_use() { return false; }
+ 
+diff --git tt_metal/impl/dispatch/kernels/cq_commands.hpp tt_metal/impl/dispatch/kernels/cq_commands.hpp
+--- tt_metal/impl/dispatch/kernels/cq_commands.hpp
++++ tt_metal/impl/dispatch/kernels/cq_commands.hpp
+@@ -35,6 +35,7 @@
+     CQ_PREFETCH_CMD_RELAY_LINEAR_PACKED = 15,    // relay linear data from multiple srcs to dispatcher
+     CQ_PREFETCH_CMD_RELAY_LINEAR_PACKED_H = 16,  // relay linear data from multiple srcs on prefetch_h chip to
+                                                  // dispatcher. Must be only command in fetchq entry.
++    CQ_PREFETCH_CMD_EXEC_BUF_SKIP = 17,          // skip forward in an exec_buf, optionally on a device value
+     CQ_PREFETCH_CMD_MAX_COUNT,                   // for checking legal IDs
+ };
+ 
+@@ -153,6 +154,25 @@
+     uint32_t pages;
+ } __attribute__((packed));
+ 
++// Skips the next `bytes` bytes of the exec_buf (whole commands), always or
++// depending on a device value: the low `value_bits` bits of the first 32-bit
++// word of page 0 of an interleaved DRAM buffer, compared with `value`. The
++// prefetcher reads the value when it reaches the command, so the host has the
++// dispatcher drain the work that computes it first (a wait that stalls the
++// prefetcher). Only valid in an exec_buf.
++constexpr uint8_t CQ_PREFETCH_EXEC_BUF_SKIP_ALWAYS = 0;
++constexpr uint8_t CQ_PREFETCH_EXEC_BUF_SKIP_IF_EQUAL = 1;
++constexpr uint8_t CQ_PREFETCH_EXEC_BUF_SKIP_IF_NOT_EQUAL = 2;
++
++struct CQPrefetchExecBufSkipCmd {
++    uint8_t mode;
++    uint8_t log2_page_size;  // of the buffer holding the value
++    uint8_t value_bits;
++    uint32_t base_addr;  // of the buffer holding the value
++    uint32_t value;
++    uint32_t bytes;
++} __attribute__((packed));
++
+ // Reset the write pointer to the start of the ring buffer. If this isn't set,
+ // the ringbuffer will never wrap around.
+ constexpr uint32_t CQ_PREFETCH_PAGED_TO_RING_BUFFER_FLAG_RESET_TO_START = 1;
+@@ -210,6 +230,7 @@
+         CQPrefetchRelayPagedPackedCmd relay_paged_packed;
+         CQPrefetchRelayInlineCmd relay_inline;
+         CQPrefetchExecBufCmd exec_buf;
++        CQPrefetchExecBufSkipCmd exec_buf_skip;
+         CQGenericDebugCmd debug;
+         CQPrefetchPagedToRingbufferCmd paged_to_ringbuffer;
+         CQPrefetchSetRingbufferOffsetCmd set_ringbuffer_offset;
+diff --git tt_metal/impl/dispatch/kernels/cq_prefetch.cpp tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+--- tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
++++ tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+@@ -2196,6 +2196,50 @@
+     return stride;
+ }
+ 
++// Skips forward in the exec_buf, always or depending on a device value. The skipped commands are paged in like any
++// others but consumed unread: they launch nothing, and the data they would relay is never fetched.
++static uint32_t process_exec_buf_skip_cmd(uintptr_t& cmd_ptr, PrefetchExecBufState& exec_buf_state) {
++    volatile CQPrefetchCmd tt_l1_ptr* cmd = reinterpret_cast<volatile CQPrefetchCmd tt_l1_ptr*>(cmd_ptr);
++    uint8_t mode = cmd->exec_buf_skip.mode;
++    uint32_t stride = CQ_PREFETCH_CMD_BARE_MIN_SIZE + load_aligned<uint32_t>(&cmd->exec_buf_skip.bytes);
++    if (mode != CQ_PREFETCH_EXEC_BUF_SKIP_ALWAYS) {
++        uint32_t value = load_aligned<uint32_t>(&cmd->exec_buf_skip.value);
++        uint32_t value_bits = cmd->exec_buf_skip.value_bits;
++        uint32_t mask = value_bits >= 32 ? 0xFFFFFFFF : (1u << value_bits) - 1;
++        uint32_t page_size = 1u << cmd->exec_buf_skip.log2_page_size;
++        auto addr_gen = TensorAccessor(
++            tensor_accessor::make_interleaved_dspec</*is_dram=*/true>(),
++            load_aligned<uint32_t>(&cmd->exec_buf_skip.base_addr),
++            page_size);
++        // Read the start of page 0 over this command, which is consumed, the way the exec_buf reads its own pages
++        // (L1 the NoC can write, aligned like the page). Wait for the data to overwrite a stamp: the
++        // transaction-id barrier alone was seen to pass before a single read had landed.
++        constexpr uint32_t kUnread = 0xA5A5A5A5;
++        volatile tt_l1_ptr uint32_t* landing = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cmd_ptr);
++        landing[0] = kUnread;
++        landing[1] = kUnread;
++        noc_async_read_set_trid(1);
++        noc_read_with_state<DM_DEDICATED_NOC, read_cmd_buf, CQ_NOC_SNDL, CQ_NOC_SEND, CQ_NOC_WAIT>(
++            noc_index, addr_gen.get_noc_addr(0), cmd_ptr, CQ_PREFETCH_CMD_BARE_MIN_SIZE);
++        noc_async_read_barrier_with_trid(1);
++        noc_async_read_set_trid(0);
++        do {
++            invalidate_l1_cache();
++        } while (landing[0] == kUnread && landing[1] == kUnread);
++        if (((landing[0] & mask) == value) != (mode == CQ_PREFETCH_EXEC_BUF_SKIP_IF_EQUAL)) {
++            return CQ_PREFETCH_CMD_BARE_MIN_SIZE;
++        }
++    }
++    // Like a command that spans refills: consume whole chunks, and return the stride left in the last one.
++    while (stride > exec_buf_state.length) {
++        stride -= exec_buf_state.length;
++        cmd_ptr += exec_buf_state.length;
++        exec_buf_state.length = 0;
++        paged_read_into_cmddat_q(cmd_ptr, exec_buf_state);
++    }
++    return stride;
++}
++
+ uint32_t process_exec_buf_cmd(
+     uintptr_t cmd_ptr_outer, uint32_t& downstream_data_ptr, uint32_t* l1_cache, PrefetchExecBufState& exec_buf_state) {
+     // dispatch on eth cores is memory constrained, so exec_buf reuses the cmddat_q
+@@ -2608,6 +2652,11 @@
+             stall_state = StallState::NOT_STALLED;  // Stall is no longer required after ExecBuf finished.
+             break;
+ 
++        case CQ_PREFETCH_CMD_EXEC_BUF_SKIP:
++            ASSERT(exec_buf);
++            stride = exec_buf ? process_exec_buf_skip_cmd(cmd_ptr, exec_buf_state) : CQ_PREFETCH_CMD_BARE_MIN_SIZE;
++            break;
++
+         case CQ_PREFETCH_CMD_EXEC_BUF_END:
+             // DPRINT("exec_buf_end: {}\n", cmd_ptr);
+             ASSERT(exec_buf);
