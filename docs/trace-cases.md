@@ -57,9 +57,8 @@ command buffer, masked indices, and workloads that were only prepared.
 `tt_mlir_control_flow_runtime.cpp`:
 
 - The trace hoist keeps a `ttcore.case` in the trace when its branch programs
-  replay from a trace too. Its index may be a device value or an argument the
-  caller passes from host, which the trace stages into a DRAM slot like any
-  other host input.
+  replay from a trace too. Its index may be on device or on host; the trace
+  stages a host index into a DRAM slot like any other host input.
 - While the warmup prepares a trace's workloads and while the queue records
   them, the case handler runs every branch, between markers when it records.
   Every branch copies its results into buffers the case allocates, so a result
