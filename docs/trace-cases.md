@@ -11,15 +11,14 @@ its trace, and the device picks the branch.
 
 `third_party/tt_metal/trace_case.patch` adds one prefetcher command,
 `CQ_PREFETCH_CMD_EXEC_BUF_SKIP`, valid inside an exec_buf. It skips the next
-`bytes` bytes of the trace, always or depending on a device value: the low
-`value_bits` bits of the first word of page 0 of an interleaved DRAM buffer,
-compared with `value`. The prefetcher reads the word into the command's own
-slot in its command buffer, and skips by consuming the bytes through the same
-refill loop that relays commands spanning refills. Skipped commands launch
-nothing and fetch none of the data they would relay; their bytes are still read
-from DRAM.
+`bytes` bytes of the trace, always or depending on a device value: the first
+32-bit word of page 0 of an interleaved DRAM buffer, compared with `value`.
+The prefetcher reads the word into the command's own slot in its command
+buffer, and skips by consuming the bytes through the same refill loop that
+relays commands spanning refills. Skipped commands launch nothing and fetch
+none of the data they would relay; their bytes are still read from DRAM.
 
-During capture, `MeshCommandQueue::record_case_begin(index, index_bits)`,
+During capture, `MeshCommandQueue::record_case_begin(index)`,
 `record_case_branch()` and `record_case_end()` record markers among the
 workloads; the k-th branch runs for index k, and the last one for any index
 the others do not take. `record_end` lays out a case as
@@ -49,7 +48,7 @@ mesh device with a single sub-device, since the reset covers every sub-device.
 `tests/tt_metal/test_trace_case.cpp` replays traces with two-way and many-way
 cases, empty and nested branches, cases at both ends of a trace, an index a
 slow kernel writes just before the case, branches larger than the prefetcher's
-command buffer, masked indices, and workloads that were only prepared.
+command buffer, and workloads that were only prepared.
 
 ## Up the stack
 
@@ -72,9 +71,8 @@ command buffer, masked indices, and workloads that were only prepared.
   another branch reads, such as a cache it updates in place, and the warmup
   advances no state of the traced function. Constants a branch loads are still
   computed for real.
-- The index is tested in place where its type allows (32-bit integers, and the
-  bits of a floating-point predicate but its sign); other types are converted
-  first.
+- A 32-bit integer index is tested in place. Any other index, such as a
+  predicate, is first converted to one in the trace.
 
 Loops whose trip count the device decides still run eagerly.
 

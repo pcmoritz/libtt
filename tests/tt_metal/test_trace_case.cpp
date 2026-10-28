@@ -141,29 +141,6 @@ TEST_F(TraceCaseTest, ReplaysTheBranchTheIndexSelects) {
     mesh_device_->release_mesh_trace(trace);
 }
 
-TEST_F(TraceCaseTest, TestsTheLowBitsOfTheIndex) {
-    MeshWorkload& start = write(0);
-    MeshWorkload& add_one = add(1);
-    MeshWorkload& add_ten = add(10);
-    // A bfloat16 predicate in the low half of the word, without its sign bit.
-    const MeshTraceId trace = mesh_device_->begin_mesh_trace(cq());
-    enqueue(start);
-    cq().record_case_begin(*index_, /*index_bits=*/15);
-    cq().record_case_branch();
-    enqueue(add_one);
-    cq().record_case_branch();
-    enqueue(add_ten);
-    cq().record_case_end();
-    mesh_device_->end_mesh_trace(cq(), trace);
-
-    for (uint32_t index : {0x12343F80u, 0xFFFF0000u, 0x00008000u, 0xABCD3F80u, 0x00000000u}) {
-        set(index_, index);
-        mesh_device_->replay_mesh_trace(cq(), trace, true);
-        expect_out((index & 0x7FFF) == 0 ? 1 : 10);
-    }
-    mesh_device_->release_mesh_trace(trace);
-}
-
 TEST_F(TraceCaseTest, SelectsOneOfManyBranches) {
     MeshWorkload& start = write(0);
     MeshWorkload& add_one = add(1);

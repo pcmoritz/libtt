@@ -154,47 +154,23 @@ const ::ttnn::Tensor &ttnnTensor(const ::tt::runtime::Tensor &tensor) {
   return tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
 }
 
-// The index a trace case tests, in page 0 of an interleaved DRAM buffer, and
-// the number of low bits of the page's first word that hold it. Element 0 is
-// at the start of the page in either layout. A floating-point index is a
-// predicate (an i1), so a two-way case tests all its bits but the sign.
-std::pair<::ttnn::Tensor, uint8_t> prepareCaseIndex(::ttnn::Tensor index,
-                                                    size_t branches) {
-  uint8_t bits = 0;
-  switch (index.dtype()) {
-  case ::ttnn::DataType::INT32:
-  case ::ttnn::DataType::UINT32:
-    bits = 32;
-    break;
-  case ::ttnn::DataType::UINT16:
-    bits = 16;
-    break;
-  case ::ttnn::DataType::UINT8:
-    bits = 8;
-    break;
-  case ::ttnn::DataType::FLOAT32:
-    bits = branches == 2 ? 31 : 0;
-    break;
-  case ::ttnn::DataType::BFLOAT16:
-  case ::ttnn::DataType::FLOAT16:
-    bits = branches == 2 ? 15 : 0;
-    break;
-  default:
-    break;
-  }
-  if (bits == 0) {
+// The index a trace case tests: a 32-bit integer in page 0 of an interleaved
+// DRAM buffer, where element 0 starts in either layout. Other types, such as a
+// predicate, are converted first.
+::ttnn::Tensor prepareCaseIndex(::ttnn::Tensor index) {
+  if (index.dtype() != ::ttnn::DataType::INT32 &&
+      index.dtype() != ::ttnn::DataType::UINT32) {
     if (index.layout() != ::ttnn::Layout::TILE) {
       index = ::ttnn::to_layout(index, ::ttnn::Layout::TILE);
     }
     index = ::ttnn::typecast(index, ::ttnn::DataType::INT32);
-    bits = 32;
   }
   if (!index.memory_config().is_dram() || index.memory_config().is_sharded()) {
     index = ::ttnn::to_memory_config(
         index, ::ttnn::MemoryConfig{::ttnn::TensorMemoryLayout::INTERLEAVED,
                                     ::ttnn::BufferType::DRAM});
   }
-  return {std::move(index), bits};
+  return index;
 }
 
 // Runs a case while its trace is recorded, or prepared by the warmup before the
@@ -210,7 +186,7 @@ void runCaseInTrace(const ::tt::target::ttnn::CaseOp *op,
       meshDevice.mesh_command_queue(0);
   const bool recording = cq.trace_id().has_value();
   const size_t branches = op->branch_program_ids()->size();
-  auto [caseIndex, indexBits] = prepareCaseIndex(index, branches);
+  ::ttnn::Tensor caseIndex = prepareCaseIndex(index);
 
   std::vector<::tt::runtime::Tensor> inputs;
   inputs.reserve(op->inputs()->size());
@@ -221,7 +197,7 @@ void runCaseInTrace(const ::tt::target::ttnn::CaseOp *op,
   NestedProgramTensorRetention retention(inputs);
 
   if (recording) {
-    cq.record_case_begin(caseIndex.mesh_buffer(), indexBits);
+    cq.record_case_begin(caseIndex.mesh_buffer());
   }
   std::vector<::tt::runtime::Tensor> results;
   for (size_t branch = 0; branch < branches; ++branch) {
