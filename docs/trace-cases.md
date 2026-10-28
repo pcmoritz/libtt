@@ -41,11 +41,10 @@ markers is laid out as a trace of its own (kernel config ring, prefetcher
 cache), so no command depends on which branch led to it. Cases nest; a case
 costs two drains of the device.
 
-Only the workloads after the last case can still run when the trace ends, so
-only they are equalized across device ranges with dummy go signals and
-described by the trace's worker descriptors. A sub-device that runs programs
-before the last case but not after it gets one dummy go signal there, so a
-replay resets its launch state first.
+A trace with cases ends the way a case does: it drains the workloads after
+its last case and resets, so that every device range ends alike, then sends
+one go signal, which the trace's worker descriptors describe. Cases need a
+mesh device with a single sub-device, since the reset covers every sub-device.
 
 `tests/tt_metal/test_trace_case.cpp` replays traces with two-way and many-way
 cases, empty and nested branches, cases at both ends of a trace, an index a

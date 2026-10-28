@@ -113,37 +113,20 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  void FDMeshCommandQueue::record_end() {
      MetalContext& metal_ctx = MetalContext::instance(mesh_device_->impl().get_context_id());
      const auto& hal = metal_ctx.hal();
-@@ -1495,6 +1526,29 @@
+@@ -1495,6 +1526,12 @@
      size_t max_trace_size = 0;
      std::set<SubDeviceId> sub_device_ids;
      std::optional<std::unordered_map<SubDeviceId, TraceWorkerDescriptor>> overall_trace_worker_descriptors;
 +    // A trace with cases (record_case_begin) is laid out in regions: each run of workloads between case markers as
-+    // a trace of its own, since every case marker returns the device to the state a replay starts in. Only the
-+    // final region, after the last case, still runs when the trace ends, so only it is equalized across device
-+    // ranges below and described by the trace descriptors. A sub-device that runs programs before the final region
-+    // but not in it gets a dummy GO signal there, so that a replay resets its launch state first.
-+    size_t final_region_begin = 0;
-+    uint32_t case_depth = 0;
-+    for (size_t i = 0; i < trace_nodes_.size(); i++) {
-+        if (trace_nodes_[i].case_marker == MeshTraceNode::CaseMarker::Begin) {
-+            case_depth++;
-+        } else if (trace_nodes_[i].case_marker == MeshTraceNode::CaseMarker::End && --case_depth == 0) {
-+            final_region_begin = i + 1;
-+        }
-+    }
-+    TT_FATAL(case_depth == 0, "A trace case is still open at the end of the capture");
-+    DispatchArray<bool> multicast_before_final_region{};
-+    DispatchArray<bool> multicast_in_final_region{};
-+    for (size_t i = 0; i < trace_nodes_.size(); i++) {
-+        if (trace_nodes_[i].multicast_go_signals) {
-+            (i < final_region_begin ? multicast_before_final_region
-+                                    : multicast_in_final_region)[*trace_nodes_[i].sub_device_id] = true;
-+        }
-+    }
++    // a trace of its own, since every case marker returns the device to the state a replay starts in. Such a trace
++    // ends in that state too, so that every device range ends alike after the GO signal that it then sends.
++    const bool has_cases = std::any_of(trace_nodes_.begin(), trace_nodes_.end(), [](const MeshTraceNode& node) {
++        return node.case_marker != MeshTraceNode::CaseMarker::None;
++    });
      for (const auto& range : device_ranges) {
          // NOTE: TraceNode objects may be shared across device ranges (when a program's device range
          // spans multiple partition ranges). Each iteration of this loop mutates
-@@ -1512,6 +1566,11 @@
+@@ -1512,6 +1549,11 @@
          DispatchArray<UnusedNodeData> unused_nodes;
  
          for (auto& mesh_node : trace_nodes_) {
@@ -155,16 +138,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
              bool used = false;
              for (auto& [device_range, node] : mesh_node.trace_nodes) {
                  if (!device_range.intersects(range)) {
-@@ -1524,7 +1583,7 @@
-                 used = true;
-                 break;
-             }
--            if (!used) {
-+            if (!used && &mesh_node - trace_nodes_.data() >= static_cast<std::ptrdiff_t>(final_region_begin)) {
-                 auto& unused_node = unused_nodes[*mesh_node.sub_device_id];
-                 if (mesh_node.multicast_go_signals) {
-                     unused_node.unused_nodes_multicast++;
-@@ -1544,8 +1603,15 @@
+@@ -1544,8 +1586,15 @@
              }
              ringbuffer_configs.push_back({start, size});
          }
@@ -182,65 +156,10 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  
          // Each device range produces an independent trace byte stream, so reset the prefetcher
          // cache manager to give each range a clean slate.
-@@ -1557,41 +1623,166 @@
-             worker_launch_message_buffer_state[sub_device_id].reset();
+@@ -1591,7 +1640,118 @@
+             starting_workers_completed[*sub_device_id] = trace_worker_descriptor.num_completion_worker_cores;
          }
-         std::unordered_map<SubDeviceId, TraceWorkerDescriptor> trace_worker_descriptors;
--        // Output a GO signal for each unused mesh node, to ensure that the launch message buffer write pointer and
--        // number of expected workers matches across all devices. We do this at the beginning of the trace, becaue the
--        // last program in the trace may continue running after the trace ends, so we can't do adjustments after it.
--        // TODO: Use a single command to update the expected number of workers, rather than repeated commands.
--        for (uint32_t sub_device_id = 0; sub_device_id < mesh_device_->num_sub_devices(); sub_device_id++) {
--            for (uint32_t i = 0; i < unused_nodes[sub_device_id].unused_nodes_multicast; i++) {
--                SubDeviceId sub_device{static_cast<uint8_t>(sub_device_id)};
--                auto& trace_worker_descriptor = trace_worker_descriptors[sub_device];
--                program_dispatch::ProgramDispatchMetadata go_signal_md;
--                go_signal_md.prefetcher_cache_info.is_cached = true;
--                write_go_signal_sequence(
--                    this->id_,
--                    this->mesh_device_,
--                    sub_device,
-+        DispatchArray<uint32_t> starting_workers_completed{};
-+        auto start_final_region = [&]() {
-+            // Output a GO signal for each unused mesh node, to ensure that the launch message buffer write pointer and
-+            // number of expected workers matches across all devices. We do this at the beginning of the final region,
-+            // because the last program in the trace may continue running after the trace ends, so we can't do adjustments
-+            // after it.
-+            // TODO: Use a single command to update the expected number of workers, rather than repeated commands.
-+            for (uint32_t sub_device_id = 0; sub_device_id < mesh_device_->num_sub_devices(); sub_device_id++) {
-+                uint32_t dummy_go_signals = unused_nodes[sub_device_id].unused_nodes_multicast;
-+                if (multicast_before_final_region[sub_device_id] && !multicast_in_final_region[sub_device_id]) {
-+                    dummy_go_signals++;
-+                }
-+                for (uint32_t i = 0; i < dummy_go_signals; i++) {
-+                    SubDeviceId sub_device{static_cast<uint8_t>(sub_device_id)};
-+                    auto& trace_worker_descriptor = trace_worker_descriptors[sub_device];
-+                    program_dispatch::ProgramDispatchMetadata go_signal_md;
-+                    go_signal_md.prefetcher_cache_info.is_cached = true;
-+                    write_go_signal_sequence(
-+                        this->id_,
-+                        this->mesh_device_,
-+                        sub_device,
-+                        sysmem_manager_for_trace,
-+                        trace_worker_descriptor.num_completion_worker_cores,
-+                        this->virtual_program_dispatch_core(),
-+                        /*send_mcast=*/true,
-+                        go_signal_md,
-+                        std::nullopt);
-+
-+                    auto& worker_launch_msg_state = worker_launch_message_buffer_state[sub_device_id];
-+                    trace_worker_descriptor.num_completion_worker_cores +=
-+                        mesh_device_->num_worker_cores(HalProgrammableCoreType::TENSIX, sub_device);
-+                    worker_launch_msg_state.inc_mcast_wptr(1);
-+                    trace_worker_descriptor.num_traced_programs_needing_go_signal_multicast++;
-+                }
-+            }
-+            // SimpleTraceAllocator assumes the sync starts at 0, so keep track of the number of allocations to add.
-+            for (auto& [sub_device_id, trace_worker_descriptor] : trace_worker_descriptors) {
-+                starting_workers_completed[*sub_device_id] = trace_worker_descriptor.num_completion_worker_cores;
-+            }
-+        };
-+
+ 
 +        // Commands between workloads are written through the manager like a workload's: it tracks its own offset.
 +        auto write_ptr = [&]() { return sysmem_manager_for_trace.get_issue_queue_write_ptr(this->id_); };
 +        auto append = [&](const void* data, uint32_t size) {
@@ -262,28 +181,13 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 +                }
 +                program_dispatch::reset_worker_dispatch_state_on_device(
 +                    mesh_device_,
-                     sysmem_manager_for_trace,
--                    trace_worker_descriptor.num_completion_worker_cores,
++                    sysmem_manager_for_trace,
 +                    this->id_,
-                     this->virtual_program_dispatch_core(),
--                    /*send_mcast=*/true,
--                    go_signal_md,
--                    std::nullopt);
--
--                auto& worker_launch_msg_state = worker_launch_message_buffer_state[sub_device_id];
--                trace_worker_descriptor.num_completion_worker_cores +=
--                    mesh_device_->num_worker_cores(HalProgrammableCoreType::TENSIX, sub_device);
--                worker_launch_msg_state.inc_mcast_wptr(1);
--                trace_worker_descriptor.num_traced_programs_needing_go_signal_multicast++;
++                    this->virtual_program_dispatch_core(),
 +                    workers_completed,
 +                    /*reset_launch_msg_state=*/true,
 +                    {});
-             }
--        }
--        DispatchArray<uint32_t> starting_workers_completed{};
--        // SimpleTraceAllocator assumes the sync starts at 0, so keep track of the number of allocations to add.
--        for (auto& [sub_device_id, trace_worker_descriptor] : trace_worker_descriptors) {
--            starting_workers_completed[*sub_device_id] = trace_worker_descriptor.num_completion_worker_cores;
++            }
 +            if (stall_prefetcher) {
 +                DeviceCommandCalculator calculator(metal_ctx);
 +                calculator.add_dispatch_wait_with_prefetch_stall();
@@ -358,18 +262,11 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 +                        land_skip(skip);
 +                    }
 +                    open_cases.pop_back();
-+                    if (&marker - trace_nodes_.data() + 1 == static_cast<std::ptrdiff_t>(final_region_begin)) {
-+                        start_final_region();
-+                    }
 +                    break;
 +                }
 +                case MeshTraceNode::CaseMarker::None: break;
 +            }
 +        };
-+        if (final_region_begin == 0) {
-+            start_final_region();
-         }
- 
          for (uint32_t node_idx = 0; node_idx < trace_nodes.size(); node_idx++) {
 +            if (!trace_nodes[node_idx]) {
 +                emit_case_marker(*mesh_trace_nodes[node_idx]);
@@ -378,6 +275,38 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
              auto& node = *trace_nodes[node_idx];
              auto sub_device_id = node.sub_device_id;
              auto& program = *node.program;
+@@ -1676,6 +1836,31 @@
+             }
+             trace_worker_descriptors[sub_device_id].num_completion_worker_cores += num_workers;
+         }
++        TT_FATAL(open_cases.empty(), "A trace case is still open at the end of the capture");
++        if (has_cases) {
++            // The workloads after the last case may still run when the trace ends, and differ between device
++            // ranges. Drain them, and send one GO signal so that the trace leaves the launch state its descriptors
++            // describe (a replay leaves the launch state alone for a descriptor without programs). Trace cases run on
++            // a single sub-device (record_case_marker).
++            emit_boundary(/*stall_prefetcher=*/false);
++            const SubDeviceId sub_device{0};
++            program_dispatch::ProgramDispatchMetadata go_signal_md;
++            go_signal_md.prefetcher_cache_info.is_cached = true;
++            write_go_signal_sequence(
++                this->id_,
++                this->mesh_device_,
++                sub_device,
++                sysmem_manager_for_trace,
++                /*expected_num_workers_completed=*/0,
++                this->virtual_program_dispatch_core(),
++                /*send_mcast=*/true,
++                go_signal_md,
++                std::nullopt);
++            worker_launch_message_buffer_state[*sub_device].inc_mcast_wptr(1);
++            trace_worker_descriptors[sub_device] = {
++                .num_completion_worker_cores = mesh_device_->num_worker_cores(HalProgrammableCoreType::TENSIX, sub_device),
++                .num_traced_programs_needing_go_signal_multicast = 1};
++        }
+ 
+         auto& bypass_data = sysmem_manager_for_trace.get_bypass_data();
+         bypass_data.insert(bypass_data.end(), exec_buf_end.begin(), exec_buf_end.end());
 diff --git tt_metal/distributed/fd_mesh_command_queue.hpp tt_metal/distributed/fd_mesh_command_queue.hpp
 --- tt_metal/distributed/fd_mesh_command_queue.hpp
 +++ tt_metal/distributed/fd_mesh_command_queue.hpp
