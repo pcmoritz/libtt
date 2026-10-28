@@ -362,19 +362,18 @@ diff --git tt_metal/impl/dispatch/kernels/cq_commands.hpp tt_metal/impl/dispatch
      CQ_PREFETCH_CMD_MAX_COUNT,                   // for checking legal IDs
  };
  
-@@ -153,6 +154,25 @@
+@@ -153,6 +154,24 @@
      uint32_t pages;
  } __attribute__((packed));
  
 +// Skips the next `bytes` bytes of the exec_buf (whole commands), always or
-+// depending on a device value: the low `value_bits` bits of the first 32-bit
-+// word of page 0 of an interleaved DRAM buffer, compared with `value`. The
++// unless a device value equals `value`: the low `value_bits` bits of the first
++// 32-bit word of page 0 of an interleaved DRAM buffer. The
 +// prefetcher reads the value when it reaches the command, so the host has the
 +// dispatcher drain the work that computes it first (a wait that stalls the
 +// prefetcher). Only valid in an exec_buf.
 +constexpr uint8_t CQ_PREFETCH_EXEC_BUF_SKIP_ALWAYS = 0;
-+constexpr uint8_t CQ_PREFETCH_EXEC_BUF_SKIP_IF_EQUAL = 1;
-+constexpr uint8_t CQ_PREFETCH_EXEC_BUF_SKIP_IF_NOT_EQUAL = 2;
++constexpr uint8_t CQ_PREFETCH_EXEC_BUF_SKIP_IF_NOT_EQUAL = 1;
 +
 +struct CQPrefetchExecBufSkipCmd {
 +    uint8_t mode;
@@ -388,7 +387,7 @@ diff --git tt_metal/impl/dispatch/kernels/cq_commands.hpp tt_metal/impl/dispatch
  // Reset the write pointer to the start of the ring buffer. If this isn't set,
  // the ringbuffer will never wrap around.
  constexpr uint32_t CQ_PREFETCH_PAGED_TO_RING_BUFFER_FLAG_RESET_TO_START = 1;
-@@ -210,6 +230,7 @@
+@@ -210,6 +229,7 @@
          CQPrefetchRelayPagedPackedCmd relay_paged_packed;
          CQPrefetchRelayInlineCmd relay_inline;
          CQPrefetchExecBufCmd exec_buf;
@@ -399,11 +398,11 @@ diff --git tt_metal/impl/dispatch/kernels/cq_commands.hpp tt_metal/impl/dispatch
 diff --git tt_metal/impl/dispatch/kernels/cq_prefetch.cpp tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
 --- tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
 +++ tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
-@@ -2196,6 +2196,43 @@
+@@ -2196,6 +2196,44 @@
      return stride;
  }
  
-+// Skips forward in the exec_buf, always or depending on a device value. The skipped commands are paged in like any
++// Skips forward in the exec_buf, always or unless a device value matches. The skipped commands are paged in like any
 +// others but consumed unread: they launch nothing, and the data they would relay is never fetched.
 +static uint32_t process_exec_buf_skip_cmd(uintptr_t& cmd_ptr, PrefetchExecBufState& exec_buf_state) {
 +    volatile CQPrefetchCmd tt_l1_ptr* cmd = reinterpret_cast<volatile CQPrefetchCmd tt_l1_ptr*>(cmd_ptr);
@@ -426,7 +425,8 @@ diff --git tt_metal/impl/dispatch/kernels/cq_prefetch.cpp tt_metal/impl/dispatch
 +        noc_async_read_barrier();
 +        invalidate_l1_cache();
 +        uint32_t index = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cmd_ptr);
-+        if (((index & mask) == value) != (mode == CQ_PREFETCH_EXEC_BUF_SKIP_IF_EQUAL)) {
++        if ((index & mask) == value) {
++            // The index selects the branch that follows: continue into it.
 +            return CQ_PREFETCH_CMD_BARE_MIN_SIZE;
 +        }
 +    }
@@ -443,7 +443,7 @@ diff --git tt_metal/impl/dispatch/kernels/cq_prefetch.cpp tt_metal/impl/dispatch
  uint32_t process_exec_buf_cmd(
      uintptr_t cmd_ptr_outer, uint32_t& downstream_data_ptr, uint32_t* l1_cache, PrefetchExecBufState& exec_buf_state) {
      // dispatch on eth cores is memory constrained, so exec_buf reuses the cmddat_q
-@@ -2608,6 +2645,11 @@
+@@ -2608,6 +2646,11 @@
              stall_state = StallState::NOT_STALLED;  // Stall is no longer required after ExecBuf finished.
              break;
  
