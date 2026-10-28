@@ -3,6 +3,7 @@
 
 #include "ttnn/operations/experimental/rng_bits/device/rng_bits_program_factory.hpp"
 
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -14,6 +15,7 @@
 
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+#include "ttnn/operations/top_half_tile.hpp"
 
 using namespace tt::constants;
 using namespace tt::tt_metal::experimental;
@@ -52,13 +54,19 @@ ttnn::device_operation::ProgramArtifacts RngBitsProgramFactory::create_program_a
 
     // DRAM pages read into L1 need 64-byte aligned entries.
     const uint32_t state_page_bytes = state.tensor_spec().compute_page_size_bytes();
-    const uint32_t tile_bytes = tt::tile_size(tt::DataFormat::UInt32);
+    // Rows in the top halves of their tiles are packed and written as 16x32 tiles (see top_half_tile).
+    const std::optional<tt::tt_metal::Tile> half_tile = ttnn::operations::top_half_tile(bits.tensor_spec());
+    const uint32_t tile_bytes = ttnn::operations::tile_size_of(half_tile, tt::DataFormat::UInt32);
     Group<DataflowBufferSpec> dataflow_buffers = {
         {.unique_id = STATE_DFB,
          .entry_size = (state_page_bytes + 63) / 64 * 64,
          .num_entries = 1,
          .data_format_metadata = tt::DataFormat::UInt32},
-        {.unique_id = OUT_DFB, .entry_size = tile_bytes, .num_entries = 2, .data_format_metadata = tt::DataFormat::UInt32},
+        {.unique_id = OUT_DFB,
+         .entry_size = tile_bytes,
+         .num_entries = 2,
+         .data_format_metadata = tt::DataFormat::UInt32,
+         .tile_format_metadata = half_tile},
     };
 
     const std::vector<std::string> common_arg_names = {"W", "H", "Wt", "Ht"};
