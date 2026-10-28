@@ -27,25 +27,23 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factor
  
  namespace ttnn::prim {
  
-@@ -88,9 +89,15 @@
+@@ -87,10 +88,13 @@
+     const Tensor& input = tensor_args.input;
      const bool is_row_major = input.layout() == Layout::ROW_MAJOR;
  
-     const tt::DataFormat cb_data_format_input = typecast_input_format(args.input_dtype, args.output_dtype);
--    const uint32_t single_tile_size_input = tt::tile_size(cb_data_format_input);
-     const tt::DataFormat cb_data_format_output = typecast_output_format(args.input_dtype, args.output_dtype);
--    const uint32_t single_tile_size_output = tt::tile_size(cb_data_format_output);
 +    // libtt: rows in the top halves of their tiles move and compute as 16x32 tiles (see top_half_tile).
 +    const std::optional<tt::tt_metal::Tile> half_tile =
-+        ttnn::operations::top_half_tile(input.tensor_spec()) ? ttnn::operations::top_half_tile(output.tensor_spec())
-+                                                             : std::nullopt;
-+    const uint32_t single_tile_size_input =
-+        half_tile ? half_tile->get_tile_size(cb_data_format_input) : tt::tile_size(cb_data_format_input);
-+    const uint32_t single_tile_size_output =
-+        half_tile ? half_tile->get_tile_size(cb_data_format_output) : tt::tile_size(cb_data_format_output);
++        ttnn::operations::top_half_tile(input.tensor_spec(), output.tensor_spec());
+     const tt::DataFormat cb_data_format_input = typecast_input_format(args.input_dtype, args.output_dtype);
+-    const uint32_t single_tile_size_input = tt::tile_size(cb_data_format_input);
++    const uint32_t single_tile_size_input = ttnn::operations::tile_size_of(half_tile, cb_data_format_input);
+     const tt::DataFormat cb_data_format_output = typecast_output_format(args.input_dtype, args.output_dtype);
+-    const uint32_t single_tile_size_output = tt::tile_size(cb_data_format_output);
++    const uint32_t single_tile_size_output = ttnn::operations::tile_size_of(half_tile, cb_data_format_output);
  
      const auto* device = input.device();
  
-@@ -140,12 +147,14 @@
+@@ -140,12 +144,14 @@
          .entry_size = single_tile_size_input,
          .num_entries = num_input_pages * entries_per_page,
          .data_format_metadata = cb_data_format_input,
@@ -60,7 +58,7 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_program_factor
      };
  
      const TensorParameter input_param{.unique_id = INPUT, .spec = input.tensor_spec()};
-@@ -179,11 +188,16 @@
+@@ -179,11 +185,16 @@
          .hw_config = ttnn::create_writer_datamovement_config(),
      };
  
@@ -90,46 +88,42 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_same_memory_c
  namespace ttnn::prim {
  
  using namespace tt::constants;
-@@ -60,15 +62,24 @@
+@@ -60,15 +62,18 @@
      // Both the tilized and the row-major (stick) reader/writer kernels use the unified
      // TensorAccessor, which addresses interleaved and sharded tensors transparently.
      const tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(input.dtype());
+-    uint32_t input_unit_size =
+-        tilized ? tt::tile_size(input_cb_data_format) : input.padded_shape()[-1] * input.element_size();
 +    // libtt: rows in the top halves of their tiles move as 16x32 tiles (see top_half_tile).
 +    const std::optional<tt::tt_metal::Tile> half_tile =
-+        ttnn::operations::top_half_tile(input.tensor_spec()) ? ttnn::operations::top_half_tile(output.tensor_spec())
-+                                                             : std::nullopt;
-+    const std::optional<TileDescriptor> cb_tile =
-+        half_tile ? std::optional<TileDescriptor>(TileDescriptor(*half_tile)) : std::nullopt;
-+    const auto tile_size_for = [&](tt::DataFormat format) {
-+        return half_tile ? half_tile->get_tile_size(format) : tt::tile_size(format);
-+    };
-     uint32_t input_unit_size =
--        tilized ? tt::tile_size(input_cb_data_format) : input.padded_shape()[-1] * input.element_size();
-+        tilized ? tile_size_for(input_cb_data_format) : input.padded_shape()[-1] * input.element_size();
++        ttnn::operations::top_half_tile(input.tensor_spec(), output.tensor_spec());
++    uint32_t input_unit_size = tilized ? ttnn::operations::tile_size_of(half_tile, input_cb_data_format)
++                                       : input.padded_shape()[-1] * input.element_size();
      const uint32_t full_input_row = input_unit_size;
      if (sharded && !tilized) {
          input_unit_size = input.memory_config().shard_spec()->shape[1] * input.element_size();
      }
      const tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
-     uint32_t output_unit_size =
+-    uint32_t output_unit_size =
 -        tilized ? tt::tile_size(output_cb_data_format) : output.padded_shape()[-1] * output.element_size();
-+        tilized ? tile_size_for(output_cb_data_format) : output.padded_shape()[-1] * output.element_size();
++    uint32_t output_unit_size = tilized ? ttnn::operations::tile_size_of(half_tile, output_cb_data_format)
++                                        : output.padded_shape()[-1] * output.element_size();
      const uint32_t full_output_row = output_unit_size;
      if (sharded && !tilized) {
          output_unit_size = output.memory_config().shard_spec()->shape[1] * output.element_size();
-@@ -99,6 +110,7 @@
+@@ -99,6 +104,7 @@
              .buffer_index = static_cast<uint8_t>(src0_cb_index),
              .data_format = input_cb_data_format,
              .page_size = aligned_input_unit_size,
-+            .tile = cb_tile,
++            .tile = half_tile,
          }}},
      });
  
-@@ -115,6 +127,7 @@
+@@ -115,6 +121,7 @@
                  .buffer_index = static_cast<uint8_t>(output_cb_index),
                  .data_format = output_cb_data_format,
                  .page_size = aligned_output_unit_size,
-+                .tile = cb_tile,
++                .tile = half_tile,
              }}},
          });
      }
@@ -167,7 +161,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
  #include <tt-metalium/tensor_accessor_args.hpp>
  #include "ttnn/operations/eltwise/binary/common/binary_op_utils.hpp"
  #include "ttnn/operations/eltwise/unary/common/unary_op_utils.hpp"
-@@ -927,9 +928,28 @@
+@@ -927,9 +928,22 @@
                                      : raw_bfloat16_output ? unary::utils::raw_16bit_sfpu_format
                                                            : cb_dataformat_for(c_dtype);
  
@@ -184,22 +178,16 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
 +                      (broadcast == SubtileBroadcastType::NONE || a_broadcast || b_broadcast) &&
 +                      (a_broadcast || ttnn::operations::top_half_tile(a.tensor_spec())) &&
 +                      (b_broadcast || ttnn::operations::top_half_tile(b->tensor_spec()));
-+    const auto tile_for = [&](bool operand) -> std::optional<TileDescriptor> {
-+        return half && operand ? std::optional<TileDescriptor>(TileDescriptor(*half_tile)) : std::nullopt;
-+    };
-+    const std::optional<TileDescriptor> a_tile = tile_for(!a_broadcast);
-+    const std::optional<TileDescriptor> b_tile = tile_for(!b_broadcast);
-+    const std::optional<TileDescriptor> c_tile = tile_for(true);
-+    const auto tile_size_for = [&](const std::optional<TileDescriptor>& tile, tt::DataFormat format) {
-+        return tile ? half_tile->get_tile_size(format) : tt::tile_size(format);
-+    };
-+    uint32_t a_single_tile_size = tile_size_for(a_tile, a_data_format);
-+    uint32_t b_single_tile_size = tile_size_for(b_tile, b_data_format);
-+    uint32_t c_single_tile_size = tile_size_for(c_tile, c_pack_data_format);
++    const std::optional<tt::tt_metal::Tile> c_tile = half ? half_tile : std::nullopt;
++    const std::optional<tt::tt_metal::Tile> a_tile = a_broadcast ? std::nullopt : c_tile;
++    const std::optional<tt::tt_metal::Tile> b_tile = b_broadcast ? std::nullopt : c_tile;
++    uint32_t a_single_tile_size = ttnn::operations::tile_size_of(a_tile, a_data_format);
++    uint32_t b_single_tile_size = ttnn::operations::tile_size_of(b_tile, b_data_format);
++    uint32_t c_single_tile_size = ttnn::operations::tile_size_of(c_tile, c_pack_data_format);
  
      // we parallelize the computation across the output tiles
      const auto per_core = build_per_core_runtime_args(operation_attributes, a, b, c);
-@@ -949,6 +969,10 @@
+@@ -949,6 +963,10 @@
                                 : OpConfig(op_type, std::in_place_type<OpConfig::FpuBinaryOp>, a_dtype, op_params);
  
      auto compute_kernel_defines = op_config.as_defines(is_fp16_comparison ? DataType::FLOAT32 : a_dtype);
@@ -210,7 +198,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
  
      // Quant/requant rounding depends on the output dtype. For uint8, we need fp32->uint8 rounding instead
      // of the default fp32->int8. The packer narrows the int32 SFPU result to uint8.
-@@ -1156,6 +1180,7 @@
+@@ -1156,6 +1174,7 @@
                  .buffer_index = static_cast<uint8_t>(tt::CBIndex::c_0),
                  .data_format = a_data_format,
                  .page_size = a_single_tile_size,
@@ -218,16 +206,16 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
              }}},
              .buffer = a_sharded ? a_buffer : nullptr,
          });
-@@ -1166,7 +1191,7 @@
+@@ -1166,7 +1185,7 @@
              is_sfpu_op
                  ? (promote_narrow_float_inputs && a_dtype == DataType::FLOAT16 ? tt::DataFormat::Float32 : a_data_format)
                         : (op_has_exp ? tt::DataFormat::Float16_b : a_data_format);
 -        uint32_t a_intermediate_single_tile_size = tt::tile_size(a_intermediate_format);
-+        uint32_t a_intermediate_single_tile_size = tile_size_for(a_tile, a_intermediate_format);
++        uint32_t a_intermediate_single_tile_size = ttnn::operations::tile_size_of(a_tile, a_intermediate_format);
          desc.cbs.push_back(CBDescriptor{
              .total_size = a_intermediate_single_tile_size * num_tiles_per_cycle,
              .core_ranges = all_device_cores,
-@@ -1174,6 +1199,7 @@
+@@ -1174,6 +1193,7 @@
                  .buffer_index = static_cast<uint8_t>(tt::CBIndex::c_3),
                  .data_format = a_intermediate_format,
                  .page_size = a_intermediate_single_tile_size,
@@ -235,7 +223,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
              }}},
          });
      }
-@@ -1188,6 +1214,7 @@
+@@ -1188,6 +1208,7 @@
                  .buffer_index = static_cast<uint8_t>(tt::CBIndex::c_1),
                  .data_format = b_data_format,
                  .page_size = b_single_tile_size,
@@ -243,16 +231,16 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
              }}},
              .buffer = b_sharded ? b_buffer : nullptr,
          });
-@@ -1198,7 +1225,7 @@
+@@ -1198,7 +1219,7 @@
              is_sfpu_op
                  ? (promote_narrow_float_inputs && b_dtype == DataType::FLOAT16 ? tt::DataFormat::Float32 : b_data_format)
                         : (op_has_exp ? tt::DataFormat::Float16_b : b_data_format);
 -        uint32_t b_intermediate_single_tile_size = tt::tile_size(b_intermediate_format);
-+        uint32_t b_intermediate_single_tile_size = tile_size_for(b_tile, b_intermediate_format);
++        uint32_t b_intermediate_single_tile_size = ttnn::operations::tile_size_of(b_tile, b_intermediate_format);
          desc.cbs.push_back(CBDescriptor{
              .total_size = b_intermediate_single_tile_size * num_tiles_per_cycle,
              .core_ranges = all_device_cores,
-@@ -1206,6 +1233,7 @@
+@@ -1206,6 +1227,7 @@
                  .buffer_index = static_cast<uint8_t>(tt::CBIndex::c_4),
                  .data_format = b_intermediate_format,
                  .page_size = b_intermediate_single_tile_size,
@@ -260,7 +248,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
              }}},
          });
      }
-@@ -1249,6 +1277,7 @@
+@@ -1249,6 +1271,7 @@
                  .buffer_index = static_cast<uint8_t>(tt::CBIndex::c_16),
                  .data_format = c_pack_data_format,
                  .page_size = c_single_tile_size,
@@ -279,15 +267,14 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.
  #include "ttnn/device_operation.hpp"
  #include "ttnn/operation.hpp"
  #include "ttnn/tensor/tensor_utils.hpp"
-@@ -388,7 +389,10 @@
+@@ -388,7 +389,9 @@
              output_spec, tensor_args.output_tensor.has_value() ? &*tensor_args.output_tensor : nullptr, "output"),
          src_shard_vol,
          dst_shard_vol,
 -        interleaved_tiles);
 +        interleaved_tiles,
 +        // libtt: rows in the top halves of their tiles take 16x32 tiles.
-+        ttnn::operations::top_half_tile(input_tensor.tensor_spec()) ? ttnn::operations::top_half_tile(output_spec)
-+                                                                     : std::nullopt);
++        ttnn::operations::top_half_tile(input_tensor.tensor_spec(), output_spec));
  }
  
  bool UnaryDeviceOperation::skip_launch(
@@ -302,22 +289,29 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
  #include <algorithm>
  #include <tt-metalium/bfloat16.hpp>
  #include <tt-metalium/host_api.hpp>
-@@ -488,6 +489,14 @@
-         dfb_data_format_output = input.element_size() == sizeof(uint16_t) ? DataFormat::UInt16 : DataFormat::UInt32;
-     }
-     uint32_t single_tile_size_output = tile_size(dfb_data_format_output);
+@@ -478,8 +479,11 @@
+ 
+     const bool is_row_major = input.layout() == Layout::ROW_MAJOR;
+ 
 +    // libtt: rows in the top halves of their tiles move and compute as 16x32 tiles (see top_half_tile).
 +    const std::optional<tt::tt_metal::Tile> half_tile =
-+        ttnn::operations::top_half_tile(input.tensor_spec()) ? ttnn::operations::top_half_tile(output.tensor_spec())
-+                                                             : std::nullopt;
-+    if (half_tile) {
-+        single_tile_size = half_tile->get_tile_size(dfb_data_format);
-+        single_tile_size_output = half_tile->get_tile_size(dfb_data_format_output);
-+    }
++        ttnn::operations::top_half_tile(input.tensor_spec(), output.tensor_spec());
+     DataFormat dfb_data_format = promote_narrow_float ? raw_16bit_sfpu_format : cb_dataformat_for(input.dtype());
+-    uint32_t single_tile_size = tile_size(dfb_data_format);
++    uint32_t single_tile_size = ttnn::operations::tile_size_of(half_tile, dfb_data_format);
+     DataFormat dfb_data_format_output =
+         promote_narrow_float && !use_native_fp16_pack ? raw_16bit_sfpu_format : cb_dataformat_for(output.dtype());
+     if (uses_raw_bits) {
+@@ -487,7 +491,7 @@
+         // Unsigned semantics therefore apply to both unpacking and packing.
+         dfb_data_format_output = input.element_size() == sizeof(uint16_t) ? DataFormat::UInt16 : DataFormat::UInt32;
+     }
+-    uint32_t single_tile_size_output = tile_size(dfb_data_format_output);
++    uint32_t single_tile_size_output = ttnn::operations::tile_size_of(half_tile, dfb_data_format_output);
  
      const auto shard_specs = get_shard_specs(input.tensor_spec(), output.tensor_spec());
      const bool has_sharding = shard_specs.has_value();
-@@ -536,6 +545,10 @@
+@@ -536,6 +540,10 @@
      const bool math_approx_mode = false;
      std::map<std::string, std::string> unary_defines = get_block_defines(compute_ops_chain, "0", "0", input.dtype());
      add_input_dtype_defines(input.dtype(), unary_defines);
@@ -328,7 +322,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
      const bool logit_clamp_enabled = pack_first_op_scalars(ops_chain[0], input.dtype(), packed_scalar1, packed_scalar2);
  
      const std::string compute_path = fmt::format(
-@@ -552,6 +565,7 @@
+@@ -552,6 +560,7 @@
          .entry_size = input_dfb_page_size,
          .num_entries = src_num_tiles_per_shard.value_or(2),
          .data_format_metadata = dfb_data_format_for_input,
@@ -336,7 +330,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
          .borrowed_from = src_sharded ? std::optional<TensorParamName>(INPUT) : std::nullopt,
      });
  
-@@ -561,6 +575,7 @@
+@@ -561,6 +570,7 @@
              .entry_size = input_dfb_page_size,
              .num_entries = 2,
              .data_format_metadata = dfb_data_format,
@@ -344,7 +338,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_program_factory.c
          });
      }
  
-@@ -569,6 +584,7 @@
+@@ -569,6 +579,7 @@
          .entry_size = output_dfb_page_size,
          .num_entries = dst_num_tiles_per_shard.value_or(2),
          .data_format_metadata = dfb_data_format_output,
@@ -356,7 +350,7 @@ diff --git ttnn/cpp/ttnn/operations/top_half_tile.hpp ttnn/cpp/ttnn/operations/t
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/top_half_tile.hpp
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,41 @@
 +// SPDX-FileCopyrightText: © 2026 libtt authors
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -367,6 +361,7 @@ new file mode 100644
 +#include <tt-metalium/tensor/spec/tensor_spec.hpp>
 +#include <tt-metalium/tensor/tensor_types.hpp>
 +#include <tt-metalium/tile.hpp>
++#include <tt-metalium/tt_backend_api_types.hpp>
 +
 +namespace ttnn::operations {
 +
@@ -383,6 +378,17 @@ new file mode 100644
 +        return std::nullopt;
 +    }
 +    return tt::tt_metal::Tile({16, 32});
++}
++
++// The tile an op that computes `output` from `input` takes: 16x32 when both have their values in top halves.
++inline std::optional<tt::tt_metal::Tile> top_half_tile(
++    const tt::tt_metal::TensorSpec& input, const tt::tt_metal::TensorSpec& output) {
++    return top_half_tile(input) ? top_half_tile(output) : std::nullopt;
++}
++
++// The bytes of one `tile`, or of a 32x32 tile when there is none.
++inline uint32_t tile_size_of(const std::optional<tt::tt_metal::Tile>& tile, tt::DataFormat format) {
++    return tile ? tile->get_tile_size(format) : tt::tile_size(format);
 +}
 +
 +}  // namespace ttnn::operations

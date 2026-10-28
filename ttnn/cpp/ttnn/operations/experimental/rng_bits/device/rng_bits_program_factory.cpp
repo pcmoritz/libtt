@@ -56,8 +56,7 @@ ttnn::device_operation::ProgramArtifacts RngBitsProgramFactory::create_program_a
     const uint32_t state_page_bytes = state.tensor_spec().compute_page_size_bytes();
     // Rows in the top halves of their tiles are packed and written as 16x32 tiles (see top_half_tile).
     const std::optional<tt::tt_metal::Tile> half_tile = ttnn::operations::top_half_tile(bits.tensor_spec());
-    const uint32_t tile_bytes = half_tile ? half_tile->get_tile_size(tt::DataFormat::UInt32)
-                                          : tt::tile_size(tt::DataFormat::UInt32);
+    const uint32_t tile_bytes = ttnn::operations::tile_size_of(half_tile, tt::DataFormat::UInt32);
     Group<DataflowBufferSpec> dataflow_buffers = {
         {.unique_id = STATE_DFB,
          .entry_size = (state_page_bytes + 63) / 64 * 64,
