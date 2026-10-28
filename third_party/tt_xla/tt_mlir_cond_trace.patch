@@ -236,7 +236,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
  
      // Replace uses of original outputs with the output of the trace op function
      for (size_t i = 0; i < info.boundaryOutputs.size(); i++) {
-@@ -1034,94 +1075,183 @@
+@@ -1034,94 +1075,182 @@
      }
    }
  
@@ -333,8 +333,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +            mlir::cast<func::FuncOp>(argument.getOwner()->getParentOp());
 +        for (llvm::StringRef name :
 +             {llvm::StringRef(ttcore::ArgumentTypeAttr::name),
-+              llvm::StringRef(ttcore::g_kvCacheAttrName),
-+              llvm::StringRef(ttcore::g_recurrentCacheAttrName)}) {
++              llvm::StringRef(ttcore::g_kvCacheAttrName)}) {
 +          if (Attribute attr = caller.getArgAttr(argument.getArgNumber(), name)) {
 +            callee.setArgAttr(index, name, attr);
 +          }

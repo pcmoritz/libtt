@@ -1,11 +1,11 @@
 """Tracing never fails on control flow; it traces around what it cannot replay.
 
-A trace holds straight-line device work and counted loops of it with constant
-bounds. Every conditional, and every other loop, runs eagerly, and the trace
-hoist traces around it instead of failing: the ops before and after it in the
-same function, and the programs of its own branches or body, which are hoisted
-in turn. Every
-program here must therefore run correctly with tracing enabled, and the
+A trace holds straight-line device work, counted loops of it with constant
+bounds, and conditionals of it, whose branches the trace holds too
+(traced_device_case_regression_test). Every other loop runs eagerly, and the
+trace hoist traces around it instead of failing: the ops before and after it in
+the same function, and the programs of its own body, which are hoisted in turn.
+Every program here must therefore run correctly with tracing enabled, and the
 exported IR shows where the traces went.
 """
 
@@ -53,8 +53,9 @@ def _ops_per_function(export_path):
 
 @pytest.mark.parametrize("trace", [False, True])
 def test_counted_loop_inside_conditional(trace, tmp_path):
-    # The conditional runs eagerly; the branch with the counted loop is one
-    # trace, since a loop with constant bounds replays from a capture.
+    # The conditional and the counted loop in its branch replay from the
+    # function's trace, since a loop with constant bounds replays from a
+    # capture.
     def run(predicate, x):
         return jax.lax.cond(
             predicate,
@@ -73,18 +74,18 @@ def test_counted_loop_inside_conditional(trace, tmp_path):
         np.testing.assert_array_equal(np.asarray(result), SOURCE + 1 if predicate else looped)
     if trace:
         traces, cases = _ops_per_function(tmp_path)
-        assert cases["main"] == 1
-        # Each branch program is one trace; the loop body runs inside the
-        # capture of its branch and has no trace of its own.
-        assert traces["main_case_branch_0"] == 1
-        assert traces["main_case_branch_1"] == 1
+        assert cases["main"] == 0
+        assert traces["main"] == 1
+        # The branches and the loop body run inside the capture and have no
+        # trace of their own.
+        assert sum(count for name, count in traces.items() if name != "main") == 0
         assert traces["main_case_branch_0_counted_loop"] == 0
 
 
 @pytest.mark.parametrize("trace", [False, True])
 def test_nested_conditional(trace, tmp_path):
-    # The nested conditional reads its predicate inside the branch, so the
-    # outer conditional runs eagerly and its branches hold the traces.
+    # The nested conditional reads its predicate inside the branch; both
+    # replay from the function's trace.
     def run(outer, inner, x):
         return jax.lax.cond(
             outer,
@@ -102,8 +103,9 @@ def test_nested_conditional(trace, tmp_path):
         np.testing.assert_array_equal(np.asarray(result), expected)
     if trace:
         traces, cases = _ops_per_function(tmp_path)
-        assert cases["main"] == 1
-        assert sum(count for name, count in traces.items() if name != "main") >= 2
+        assert cases["main"] == 0
+        assert traces["main"] == 1
+        assert sum(count for name, count in traces.items() if name != "main") == 0
 
 
 @pytest.mark.parametrize("trace", [False, True])
@@ -161,8 +163,8 @@ def test_conditional_inside_loop_inside_conditional(trace):
 @pytest.mark.parametrize("depth", [1, 2])
 @pytest.mark.parametrize("trace", [False, True])
 def test_nested_predicate_computed_in_a_branch(trace, depth):
-    # The predicate at `depth` combines two forwarded flags, so the runtime
-    # reads it from device; the conditional that holds it runs eagerly.
+    # The predicate at `depth` combines two forwarded flags, so the device
+    # computes it and reads it when the trace gets there.
     def run(outer, first, second, x):
         computed = lambda v: jax.lax.cond(first ^ second, lambda w: w * 2, lambda w: w - 1, v)
         middle = lambda v: jax.lax.cond(first, lambda w: w + 3, computed, v)
@@ -183,10 +185,10 @@ def test_nested_predicate_computed_in_a_branch(trace, depth):
 
 @pytest.mark.parametrize("trace", [False, True])
 def test_predicate_computed_from_data(trace, tmp_path):
-    # A predicate computed on device splits the function into a trace before
-    # the conditional, the eager conditional whose branches hold their own
-    # traces, and a trace after it. The offsets put the sum on both sides of
-    # zero, so both branches run.
+    # A predicate computed on device keeps the conditional inside the
+    # function's one trace, which holds both branches and runs the one the
+    # device selects (traced_device_case_regression_test). The offsets put the
+    # sum on both sides of zero, so both branches run.
     def run(x):
         y = jnp.sin(x) * 3 + x
         z = jax.lax.cond(jnp.sum(y) > 0, lambda v: jnp.cos(v) + 1, lambda v: v * v - 1, y)
@@ -205,9 +207,9 @@ def test_predicate_computed_from_data(trace, tmp_path):
     assert taken == {True, False}
     if trace:
         traces, cases = _ops_per_function(tmp_path)
-        assert cases["main"] == 1
-        assert traces["main"] == 2
-        assert sum(count for name, count in traces.items() if name != "main") == 2
+        assert cases["main"] == 0
+        assert traces["main"] == 1
+        assert sum(count for name, count in traces.items() if name != "main") == 0
 
 
 @pytest.mark.parametrize("trace", [False, True])
@@ -238,8 +240,8 @@ def test_data_dependent_loops(trace):
 @pytest.mark.parametrize("trace", [False, True])
 def test_selector_also_used_as_data(trace):
     # The host predicate selects a branch and is also added to the data. The
-    # arithmetic on it runs eagerly; the conditional still replays from a
-    # trace per predicate value.
+    # conditional replays from the trace, which reads the predicate from its
+    # slot; the arithmetic on the host value runs eagerly.
     def run(predicate, x):
         y = jax.lax.cond(predicate, lambda v: v + 1, lambda v: v - 1, x)
         return y + predicate.astype(jnp.float32)

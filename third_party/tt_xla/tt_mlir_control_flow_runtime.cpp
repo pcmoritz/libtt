@@ -150,6 +150,90 @@ bool readConditionScalar(const ::tt::runtime::Tensor &tensor) {
   });
 }
 
+const ::ttnn::Tensor &ttnnTensor(const ::tt::runtime::Tensor &tensor) {
+  return tensor.as<TTNNTensorWrapper>(DeviceRuntime::TTNN).getTensor();
+}
+
+// The index a trace case tests: a 32-bit integer in page 0 of an interleaved
+// DRAM buffer, where element 0 starts in either layout. Other types, such as a
+// predicate, are converted first.
+::ttnn::Tensor prepareCaseIndex(::ttnn::Tensor index) {
+  if (index.dtype() != ::ttnn::DataType::INT32 &&
+      index.dtype() != ::ttnn::DataType::UINT32) {
+    if (index.layout() != ::ttnn::Layout::TILE) {
+      index = ::ttnn::to_layout(index, ::ttnn::Layout::TILE);
+    }
+    index = ::ttnn::typecast(index, ::ttnn::DataType::INT32);
+  }
+  if (!index.memory_config().is_dram() || index.memory_config().is_sharded()) {
+    index = ::ttnn::to_memory_config(
+        index, ::ttnn::MemoryConfig{::ttnn::TensorMemoryLayout::INTERLEAVED,
+                                    ::ttnn::BufferType::DRAM});
+  }
+  return index;
+}
+
+// Runs a case while its trace is recorded, or prepared by the warmup before the
+// capture: every branch runs and copies its results into the same buffers.
+// While the queue records, markers between the branches make a replay run only
+// the branch the index selects, and the host never reads the index. The warmup
+// compiles every branch but runs no workload (MeshCommandQueue::
+// set_prepare_only), so a branch may write into its inputs.
+void runCaseInTrace(const ::tt::target::ttnn::CaseOp *op,
+                    ProgramContext &context, const ::ttnn::Tensor &index) {
+  ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();
+  ::tt::tt_metal::distributed::MeshCommandQueue &cq =
+      meshDevice.mesh_command_queue(0);
+  const bool recording = cq.trace_id().has_value();
+  const size_t branches = op->branch_program_ids()->size();
+  ::ttnn::Tensor caseIndex = prepareCaseIndex(index);
+
+  std::vector<::tt::runtime::Tensor> inputs;
+  inputs.reserve(op->inputs()->size());
+  for (const auto *input : *op->inputs()) {
+    inputs.emplace_back(
+        context.getTensorPool().getRuntimeTensorAndValidate(input));
+  }
+  NestedProgramTensorRetention retention(inputs);
+
+  if (recording) {
+    cq.record_case_begin(caseIndex.mesh_buffer());
+  }
+  std::vector<::tt::runtime::Tensor> results;
+  for (size_t branch = 0; branch < branches; ++branch) {
+    if (recording) {
+      cq.record_case_branch();
+    }
+    ProgramExecutor program(context.getDeviceHandle(),
+                            context.getExecutableHandle(),
+                            op->branch_program_ids()->Get(branch), inputs,
+                            /*constEvalProgram=*/false);
+    program.execute();
+    std::vector<::tt::runtime::Tensor> outputs = program.gatherOutputTensors();
+    LOG_ASSERT(outputs.size() == op->outputs()->size(),
+               "Case branch output arity mismatch");
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      // Every branch copies its results into buffers of the case's own, which
+      // share nothing with an input or a cached constant a branch returns.
+      if (branch == 0) {
+        results.push_back(utils::createRuntimeTensorFromTTNN(
+            ::ttnn::create_device_tensor(ttnnTensor(outputs[i]).tensor_spec(),
+                                         &meshDevice)));
+      }
+      ::ttnn::copy(ttnnTensor(outputs[i]), ttnnTensor(results[i]));
+    }
+  }
+  if (recording) {
+    cq.record_case_end();
+  }
+
+  retention.restore();
+  for (size_t i = 0; i < results.size(); ++i) {
+    context.getTensorPool().insertRuntimeTensorAndValidate(
+        op->outputs()->Get(i), results[i]);
+  }
+}
+
 } // namespace
 
 void run(const ::tt::target::ttnn::WhileLoopOp *op,
@@ -269,6 +353,14 @@ void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context) {
 
   ::tt::runtime::Tensor index =
       context.getTensorPool().getRuntimeTensorAndValidate(op->index());
+  // A replay runs the case from its trace without interpreting it.
+  ::tt::tt_metal::distributed::MeshCommandQueue &cq =
+      context.getMeshDevice().mesh_command_queue();
+  if ((cq.prepare_only() || cq.trace_id().has_value()) &&
+      ttnnTensor(index).storage_type() == ::ttnn::StorageType::DEVICE) {
+    runCaseInTrace(op, context, ttnnTensor(index));
+    return;
+  }
   int64_t branchIndex = op->branch_program_ids()->size() == 2
                             ? static_cast<int64_t>(readConditionScalar(index))
                             : readIntegerScalar(index);

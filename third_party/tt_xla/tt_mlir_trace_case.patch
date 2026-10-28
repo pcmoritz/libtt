@@ -1,0 +1,163 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
+@@ -91,6 +91,16 @@
+            llvm::all_of(op->getResultTypes(), isOnDeviceType);
+   }
+ 
++  // The DRAM slot a host-staged input is written into.
++  static RankedTensorType getSlotType(RankedTensorType type) {
++    TTNNLayoutAttr::Builder layout(type);
++    layout.setBufferType(BufferType::DRAM);
++    if (!utils::isTensorOnDevice(type)) {
++      layout.setMemoryLayout(TensorMemoryLayout::Interleaved);
++    }
++    return utils::RankedTensorTypeFactory::create(type, layout.build());
++  }
++
+   static bool isOnDeviceType(Type type) {
+     auto tensor = mlir::dyn_cast<RankedTensorType>(type);
+     return !tensor || utils::isTensorOnDevice(tensor);
+@@ -419,7 +429,10 @@
+     llvm::SmallVector<mlir::DictionaryAttr> newArgAttrs;
+ 
+     for (size_t i = 0; i < numTensorInputs; i++) {
+-      argTypes.push_back(inputs[i].getType());
++      // A host input arrives in its DRAM slot.
++      auto type = mlir::cast<RankedTensorType>(inputs[i].getType());
++      argTypes.push_back(utils::isTensorOnDevice(type) ? type
++                                                       : getSlotType(type));
+       newArgAttrs.push_back(inputAttrs[i]);
+     }
+     for (mlir::Type outputType : outputTypes) {
+@@ -516,8 +529,7 @@
+       if (i < numDeviceResident) {
+         info.inputSlotTypes.push_back(tensorType);
+       } else {
+-        info.inputSlotTypes.push_back(utils::RankedTensorTypeFactory::create(
+-            tensorType, BufferType::DRAM));
++        info.inputSlotTypes.push_back(getSlotType(tensorType));
+       }
+     }
+     for (size_t i = numTensorInputs; i < inputs.size(); i++) {
+@@ -700,7 +712,8 @@
+     }
+ 
+     // Execute the trace function once without capture to compile programs and
+-    // populate program cache.
++    // populate program cache. The runtime only prepares its workloads
++    // (MeshCommandQueue::set_prepare_only), so this changes nothing on device.
+     builder.create<func::CallOp>(captureFunc.getLoc(), traceFunc,
+                                  traceCallArgs);
+ 
+@@ -1091,25 +1104,51 @@
+     }
+     auto body = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+         op, loop.getBodyProgramAttr());
+-    if (!body || !body.getBody().hasOneBlock() ||
+-        !llvm::all_of(loop.getOperandTypes(), isOnDeviceType) ||
++    if (!body || !llvm::all_of(loop.getOperandTypes(), isOnDeviceType) ||
+         !llvm::all_of(loop.getResultTypes(), isOnDeviceType)) {
+       return false;
+     }
++    return isCapturableProgram(body);
++  }
++
++  // A case replays from a trace: the trace holds every branch, and the device
++  // reads the index and skips the branches it does not select (tt-metal's
++  // record_case_begin). A host index is staged into a slot like any other
++  // host input.
++  bool isCapturableCase(Operation *op) {
++    auto caseOp = mlir::dyn_cast<ttcore::CaseOp>(op);
++    if (!caseOp ||
++        !llvm::all_of(caseOp.getInputs().getTypes(), isOnDeviceType) ||
++        !llvm::all_of(op->getResultTypes(), isOnDeviceType)) {
++      return false;
++    }
++    return llvm::all_of(caseOp.getBranchPrograms(), [&](Attribute branch) {
++      auto program = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
++          op, mlir::cast<FlatSymbolRefAttr>(branch));
++      return program && isCapturableProgram(program);
++    });
++  }
++
++  // Whether a program that a traced op runs replays from the trace too.
++  bool isCapturableProgram(func::FuncOp body) {
++    if (!body.getBody().hasOneBlock()) {
++      return false;
++    }
+     // The device handle and const-eval loads are harmless inside the capture
+     // (a load is a cache hit after the uncaptured warmup); a creation op is
+     // not, since it writes from host.
+     return llvm::all_of(body.front().without_terminator(), [&](Operation &op) {
+-      return shouldHoistOp(&op) ||
++      return isCapturable(&op) ||
+              ::mlir::isa<ttnn::GetDeviceOp, ttcore::LoadCachedOp>(&op);
+     });
+   }
+ 
+   // Whether the runtime can replay `op` from a trace: straight-line device
+-  // work, or a counted loop of it. Anything else runs eagerly, reading what
+-  // it needs from device, and the traces move into its programs.
++  // work, or a counted loop or a case of it. Anything else runs eagerly,
++  // reading what it needs from device, and the traces move into its programs.
+   bool isCapturable(Operation *op) {
+-    return shouldHoistOp(op) || isCapturableCountedLoop(op);
++    return shouldHoistOp(op) || isCapturableCountedLoop(op) ||
++           isCapturableCase(op);
+   }
+ 
+   // Ops that depend on nothing a trace computes: the device handle,
+diff --git a/runtime/lib/ttnn/operations/cache/load_cached.cpp b/runtime/lib/ttnn/operations/cache/load_cached.cpp
+--- a/runtime/lib/ttnn/operations/cache/load_cached.cpp
++++ b/runtime/lib/ttnn/operations/cache/load_cached.cpp
+@@ -69,7 +69,13 @@
+   const size_t programIndex = op->program_idx();
+   ProgramExecutor exec(context.getDeviceHandle(), context.getExecutableHandle(),
+                        programIndex, inputs, /*constEvalProgram=*/true);
++  // Constants are computed even while a trace's warmup only prepares its
++  // workloads.
++  auto &cq = context.getMeshDevice().mesh_command_queue();
++  const bool preparing = cq.prepare_only();
++  cq.set_prepare_only(false);
+   exec.execute();
++  cq.set_prepare_only(preparing);
+   LOG_DEBUG("executed sub-func: ", constEvalFuncname);
+   std::vector<::tt::runtime::Tensor> outputs = exec.gatherOutputTensors();
+ 
+diff --git a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
+--- a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
++++ b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
+@@ -17,9 +17,10 @@
+   LOG_ASSERT(meshDevice.get_program_cache().is_enabled(),
+              "Program cache must be enabled");
+ 
+-  // The capture program first executes the workload uncaptured to populate the
++  // The capture program first prepares the workload uncaptured to populate the
+   // program cache. Drain that work before switching the command queue into
+   // bypass mode; otherwise outstanding commands can race trace capture.
++  meshDevice.mesh_command_queue(op->cq_id()).set_prepare_only(false);
+   meshDevice.mesh_command_queue(op->cq_id()).finish();
+ 
+   ::ttnn::MeshTraceId traceId =
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -275,7 +275,16 @@
+   ProgramExecutor executor(deviceHandle, context.getExecutableHandle(),
+                            op->capture_program_id(), captureInputs,
+                            /*constEvalProgram=*/false, semaphoreInputs);
+-  executor.execute();
++  // The warmup only prepares its workloads, writing their binaries for the
++  // capture, until begin_trace_capture.
++  auto &cq = context.getMeshDevice().mesh_command_queue();
++  cq.set_prepare_only(true);
++  try {
++    executor.execute();
++  } catch (...) {
++    cq.set_prepare_only(false);
++    throw;
++  }
+   std::vector<::tt::runtime::Tensor> outputTensors =
+       executor.gatherOutputTensors();
+ 
