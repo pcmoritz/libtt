@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "operations/mlir_native/func_call.h"
-#include "operations/trace/capture_or_execute_trace.h"
 #include "tt/runtime/detail/common/logger.h"
 #include "tt/runtime/detail/ttnn/program_executor.h"
 #include "tt/runtime/detail/ttnn/ttnn.h"
@@ -198,12 +197,12 @@ std::pair<::ttnn::Tensor, uint8_t> prepareCaseIndex(::ttnn::Tensor index,
   return {std::move(index), bits};
 }
 
-// Runs a case inside a trace's capture program: every branch runs and copies
-// its results into the same buffers, and while the queue records, between
-// markers that make a replay run only the branch the index selects. The host
-// never reads the index while the trace replays. The warmup before the capture
-// runs every branch too, which compiles them; it runs no workload
-// (MeshCommandQueue::set_prepare_only), so a branch may write into its inputs.
+// Runs a case while its trace is recorded, or prepared by the warmup before the
+// capture: every branch runs and copies its results into the same buffers.
+// While the queue records, markers between the branches make a replay run only
+// the branch the index selects, and the host never reads the index. The warmup
+// compiles every branch but runs no workload (MeshCommandQueue::
+// set_prepare_only), so a branch may write into its inputs.
 void runCaseInTrace(const ::tt::target::ttnn::CaseOp *op,
                     ProgramContext &context, const ::ttnn::Tensor &index) {
   ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();
@@ -378,7 +377,10 @@ void run(const ::tt::target::ttnn::CaseOp *op, ProgramContext &context) {
 
   ::tt::runtime::Tensor index =
       context.getTensorPool().getRuntimeTensorAndValidate(op->index());
-  if (trace::inTraceCaptureProgram() &&
+  // A replay runs the case from its trace without interpreting it.
+  ::tt::tt_metal::distributed::MeshCommandQueue &cq =
+      context.getMeshDevice().mesh_command_queue();
+  if ((cq.prepare_only() || cq.trace_id().has_value()) &&
       ttnnTensor(index).storage_type() == ::ttnn::StorageType::DEVICE) {
     runCaseInTrace(op, context, ttnnTensor(index));
     return;

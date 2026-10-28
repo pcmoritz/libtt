@@ -184,65 +184,41 @@ diff --git a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp b/runtime
 diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 --- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 +++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
-@@ -230,6 +230,34 @@
+@@ -230,6 +230,25 @@
  // It therefore cannot move a buffer that a sibling cached trace baked into its
  // command stream; TT-Metal's footprint-overlap check is the replay-safety
  // signal.
-+static thread_local bool tlsInTraceCaptureProgram = false;
-+
 +namespace {
-+// While a capture program runs. Its warmup before the capture compiles the
-+// workloads and writes their binaries without running them (begin_trace_capture
-+// ends that), so it changes nothing on device; tt-metal can capture only
-+// workloads whose binaries are on device.
-+class InTraceCaptureProgram {
++// While a capture program runs, the workloads its warmup enqueues before the
++// capture are compiled and have their binaries written, but do not run
++// (begin_trace_capture ends that), so the warmup changes nothing on device;
++// tt-metal can capture only workloads whose binaries are on device. Cleared
++// however the program ends.
++class PrepareWarmup {
 +public:
-+  explicit InTraceCaptureProgram(
-+      ::tt::tt_metal::distributed::MeshCommandQueue &cq)
-+      : cq(cq), previous(tlsInTraceCaptureProgram) {
-+    tlsInTraceCaptureProgram = true;
++  explicit PrepareWarmup(::tt::tt_metal::distributed::MeshCommandQueue &cq)
++      : cq(cq) {
 +    cq.set_prepare_only(true);
 +  }
-+  ~InTraceCaptureProgram() {
-+    tlsInTraceCaptureProgram = previous;
-+    cq.set_prepare_only(false);
-+  }
++  ~PrepareWarmup() { cq.set_prepare_only(false); }
 +
 +private:
 +  ::tt::tt_metal::distributed::MeshCommandQueue &cq;
-+  bool previous;
 +};
 +} // namespace
-+
-+bool inTraceCaptureProgram() { return tlsInTraceCaptureProgram; }
 +
  static TraceVariant captureTrace(
      const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
      ProgramContext &context,
-@@ -275,7 +303,11 @@
+@@ -275,7 +294,10 @@
    ProgramExecutor executor(deviceHandle, context.getExecutableHandle(),
                             op->capture_program_id(), captureInputs,
                             /*constEvalProgram=*/false, semaphoreInputs);
 -  executor.execute();
 +  {
-+    InTraceCaptureProgram inCaptureProgram(
-+        context.getMeshDevice().mesh_command_queue());
++    PrepareWarmup preparing(context.getMeshDevice().mesh_command_queue());
 +    executor.execute();
 +  }
    std::vector<::tt::runtime::Tensor> outputTensors =
        executor.gatherOutputTensors();
  
-diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.h b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.h
---- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.h
-+++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.h
-@@ -13,6 +13,10 @@
- void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
-          ProgramContext &context);
- 
-+// Whether the calling thread runs a trace's capture program: the uncaptured
-+// warmup, the captured run and the first replay.
-+bool inTraceCaptureProgram();
-+
- } // namespace tt::runtime::ttnn::operations::trace
- 
- #endif // TT_RUNTIME_TTNN_OPERATIONS_TRACE_CAPTURE_OR_EXECUTE_TRACE_H
