@@ -78,7 +78,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  #if defined(TT_UMD_BUILD_SIMULATION)
  #include "buffers/simulator_direct_write.hpp"
  #endif
-@@ -1460,6 +1463,31 @@
+@@ -1460,6 +1463,34 @@
      swap(this->dummy_prefetcher_cache_manager_, this->prefetcher_cache_manager_);
  }
  
@@ -86,6 +86,9 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
 +    MeshTraceNode::CaseMarker marker, const MeshBuffer* index, uint8_t index_bits) {
 +    auto lock = lock_api_function_();
 +    TT_FATAL(trace_id_.has_value(), "Trace cases can only be recorded while a trace is being captured");
++    // A case boundary resets every sub-device, as reset_worker_dispatch_state_on_device does, while a replay accounts
++    // only for the sub-devices its trace uses.
++    TT_FATAL(mesh_device_->num_sub_devices() == 1, "Trace cases need a mesh device with a single sub-device");
 +    MeshTraceNode node;
 +    node.case_marker = marker;
 +    if (index) {
@@ -110,7 +113,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  void FDMeshCommandQueue::record_end() {
      MetalContext& metal_ctx = MetalContext::instance(mesh_device_->impl().get_context_id());
      const auto& hal = metal_ctx.hal();
-@@ -1495,6 +1523,29 @@
+@@ -1495,6 +1526,29 @@
      size_t max_trace_size = 0;
      std::set<SubDeviceId> sub_device_ids;
      std::optional<std::unordered_map<SubDeviceId, TraceWorkerDescriptor>> overall_trace_worker_descriptors;
@@ -140,7 +143,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
      for (const auto& range : device_ranges) {
          // NOTE: TraceNode objects may be shared across device ranges (when a program's device range
          // spans multiple partition ranges). Each iteration of this loop mutates
-@@ -1512,6 +1563,11 @@
+@@ -1512,6 +1566,11 @@
          DispatchArray<UnusedNodeData> unused_nodes;
  
          for (auto& mesh_node : trace_nodes_) {
@@ -152,7 +155,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
              bool used = false;
              for (auto& [device_range, node] : mesh_node.trace_nodes) {
                  if (!device_range.intersects(range)) {
-@@ -1524,7 +1580,7 @@
+@@ -1524,7 +1583,7 @@
                  used = true;
                  break;
              }
@@ -161,7 +164,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
                  auto& unused_node = unused_nodes[*mesh_node.sub_device_id];
                  if (mesh_node.multicast_go_signals) {
                      unused_node.unused_nodes_multicast++;
-@@ -1544,8 +1600,15 @@
+@@ -1544,8 +1603,15 @@
              }
              ringbuffer_configs.push_back({start, size});
          }
@@ -179,7 +182,7 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.cpp tt_metal/distributed/f
  
          // Each device range produces an independent trace byte stream, so reset the prefetcher
          // cache manager to give each range a clean slate.
-@@ -1557,41 +1620,166 @@
+@@ -1557,41 +1623,166 @@
              worker_launch_message_buffer_state[sub_device_id].reset();
          }
          std::unordered_map<SubDeviceId, TraceWorkerDescriptor> trace_worker_descriptors;
