@@ -1,0 +1,110 @@
+diff --git a/pjrt_implementation/inc/api/loaded_executable_instance.h b/pjrt_implementation/inc/api/loaded_executable_instance.h
+--- a/pjrt_implementation/inc/api/loaded_executable_instance.h
++++ b/pjrt_implementation/inc/api/loaded_executable_instance.h
+@@ -128,10 +128,17 @@
+   // Opens devices on which input arguments are placed, which we assume are the
+   // the devices where computation will run, if their count is equal to the
+   // corresponding devices count in the mesh shape estimated by the compiler.
++  // With `one_device_on_mesh_in_use`, a program over one device gets the mesh
++  // in use, if any. Such a program has no collectives, so it runs on every chip
++  // of the mesh, each on the same data, and a buffer of one device holds the
++  // same data on every chip. Closing the mesh for one over a single chip would
++  // instead drop its programs, reinitialize the fabric and move every device
++  // tensor to the host.
+   std::optional<tt::runtime::Device>
+   getOrCreateMeshDevice(PJRT_Buffer *const *const *argument_lists,
+                         size_t num_args, size_t num_devices,
+-                        PJRT_Device *pjrt_device);
++                        PJRT_Device *pjrt_device,
++                        bool one_device_on_mesh_in_use = false);
+ 
+   // Collects device ids from the addressable devices.
+   std::unordered_set<int>
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -209,13 +209,27 @@
+ 
+   std::optional<tt::runtime::Device> runtime_device =
+       getOrCreateMeshDevice(args->argument_lists, args->num_args,
+-                            args->num_devices, args->execute_device);
++                            args->num_devices, args->execute_device,
++                            /*one_device_on_mesh_in_use=*/true);
+ 
+   if (!runtime_device) {
+     // Logging is done inside `getOrCreateMeshDevice`.
+     return tt_pjrt_status::kInternal;
+   }
+ 
++  // A program over one device runs on every chip of the mesh in use, each on
++  // the same data (getOrCreateMeshDevice), so a shard of a mesh tensor comes
++  // through the host.
++  if (args->num_devices == 1) {
++    for (size_t arg = 0; arg < args->num_args; ++arg) {
++      PjrtTensorRef &tensor =
++          BufferInstance::unwrap(args->argument_lists[0][arg])->getPjrtTensor();
++      if (tensor && tensor->shards().size() > 1) {
++        tensor->move_to_host();
++      }
++    }
++  }
++
+   // Assuming only one program per flatbuffer for now.
+   std::uint32_t program_index = 0;
+ 
+diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
+@@ -101,7 +101,8 @@
+ std::optional<tt::runtime::Device>
+ LoadedExecutableInstance::getOrCreateMeshDevice(
+     PJRT_Buffer *const *const *argument_lists, size_t num_args,
+-    size_t num_devices, PJRT_Device *pjrt_device) {
++    size_t num_devices, PJRT_Device *pjrt_device,
++    bool one_device_on_mesh_in_use) {
+   std::unordered_set<int> device_ids =
+       getDeviceIds(argument_lists, num_args, num_devices);
+ 
+@@ -134,6 +135,11 @@
+   // buffers devices to these devices.
+   // https://github.com/tenstorrent/tt-xla/issues/502
+ 
++  if (one_device_on_mesh_in_use && mesh_shape_num_devices == 1 &&
++      m_client_instance->parentMesh().has_value()) {
++    return *m_client_instance->parentMesh();
++  }
++
+   return m_client_instance->getOrCreateMeshDevice(devices_mesh_shape);
+ }
+ 
+diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api/tensor.cc
+--- a/pjrt_implementation/src/api/tensor.cc
++++ b/pjrt_implementation/src/api/tensor.cc
+@@ -154,6 +154,13 @@
+     return;
+   }
+ 
++  // A buffer of one device holds the same data on every chip of the mesh
++  // (LoadedExecutableInstance::getOrCreateMeshDevice); one chip's is read.
++  if (m_shards.size() == 1 &&
++      tt::runtime::detail::getNumShards(*m_runtime_tensor) > 1) {
++    m_runtime_tensor = tt::runtime::getDeviceTensors(*m_runtime_tensor)[0];
++  }
++
+   std::vector<tt::runtime::Tensor> tensors =
+       tt::runtime::toHost(*m_runtime_tensor, /*untilize=*/true);
+ 
+@@ -224,6 +231,13 @@
+     const std::unordered_map<std::string, std::string> &strategy,
+     const std::vector<std::uint32_t> &mesh_shape) {
+ 
++  // Device tensors among the shards, such as results of programs over one
++  // device, come through the host.
++  for (BufferInstance *shard : shards) {
++    if (shard->getPjrtTensor()->has_runtime_tensor()) {
++      shard->getPjrtTensor()->move_to_host();
++    }
++  }
+   if (strategy.at("strategy") == "identity") {
+     return shards.front()->runtimeTensor();
+   }
