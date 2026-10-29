@@ -7,6 +7,8 @@ must hand over the chips' command queues and leave nothing of the submesh being
 left on them, as each allocates device memory on its own.
 """
 
+import time
+
 import jax
 import numpy as np
 import pytest
@@ -79,3 +81,78 @@ def test_gather_on_the_whole_mesh_after_programs_on_both(devices):
         lambda v: jax.lax.with_sharding_constraint(v, NamedSharding(mesh, P("x"))) * 2
     )(jax.device_put(x, NamedSharding(mesh, P("x", "y"))))
     np.testing.assert_array_equal(np.asarray(gathered), x * 2)
+
+
+def test_one_chip_programs_run_on_the_mesh_in_use(devices):
+    """A program over one chip has no collectives, so it runs on the mesh in
+    use instead of on a mesh of its own: on the chip of a shard it takes, or on
+    every chip for inputs with the same data on every chip. Its inputs may be
+    shards of whole-mesh results or results of other one-chip programs, and its
+    results feed both kinds of program."""
+    mesh = Mesh(np.array(devices), ("x",))
+    n = len(devices)
+    x = np.arange(16 * n, dtype=np.float32).reshape(4 * n, 4)
+    rows = lambda k: x[4 * k : 4 * k + 4]
+    sharded = jax.device_put(x, NamedSharding(mesh, P("x")))
+    replicated = jax.device_put(x, NamedSharding(mesh, P()))
+    # A whole-mesh cache, updated in place between one-chip programs.
+    step = jax.jit(lambda cache, v: cache + v, donate_argnums=0)
+    cache = jax.device_put(np.zeros_like(x), NamedSharding(mesh, P("x")))
+    triple = jax.jit(lambda a: a * 3)
+    parts = []
+    for k, device in enumerate(devices):
+        cache = step(cache, sharded)
+        shard = triple(sharded.addressable_shards[k].data)
+        again = triple(shard)
+        whole = triple(replicated.addressable_shards[k].data)
+        host = triple(jax.device_put(x[k], device))
+        made = jnp.arange(4, dtype=jnp.float32) + k
+        np.testing.assert_allclose(np.asarray(again), rows(k) * 9)
+        np.testing.assert_allclose(np.asarray(shard), rows(k) * 3)
+        np.testing.assert_allclose(np.asarray(whole), x * 3)
+        np.testing.assert_allclose(np.asarray(host), x[k] * 3)
+        np.testing.assert_allclose(np.asarray(made), np.arange(4) + k)
+        parts.append(triple(sharded.addressable_shards[k].data))
+    np.testing.assert_allclose(np.asarray(cache), x * n)
+    # One-chip results, still on the mesh, as the shards of a whole-mesh input.
+    combined = jax.make_array_from_single_device_arrays(
+        x.shape, NamedSharding(mesh, P("x")), parts
+    )
+    np.testing.assert_allclose(np.asarray(jax.jit(lambda a: a + 1)(combined)), x * 3 + 1)
+    moved = jax.device_put(triple(sharded.addressable_shards[1].data), NamedSharding(mesh, P()))
+    np.testing.assert_allclose(np.asarray(jax.jit(lambda a: a * 2)(moved)), rows(1) * 6)
+
+
+def test_one_chip_programs_keep_the_mesh_open(devices):
+    """Alternating whole-mesh and one-chip programs neither reopens the mesh
+    nor moves the whole-mesh tensors to the host, which took about a second a
+    switch."""
+    mesh = Mesh(np.array(devices), ("x",))
+    x = np.ones((8 * len(devices), 128), np.float32)
+    step = jax.jit(lambda cache: cache * 2 - 1, donate_argnums=0)
+    cache = jax.device_put(x, NamedSharding(mesh, P("x")))
+    add = jax.jit(lambda a: a + 1)
+    for _ in range(2):
+        cache = step(cache)
+        np.asarray(add(jnp.zeros(4)))
+    start = time.monotonic()
+    for _ in range(20):
+        cache = step(cache)
+        np.asarray(add(jnp.zeros(4)))
+    elapsed = time.monotonic() - start
+    np.testing.assert_allclose(np.asarray(cache), x)
+    assert elapsed < 2, f"20 switches took {elapsed:.1f} s"
+
+
+def test_donated_shards_of_replicated_tensors(devices):
+    """A program over one chip may update a donated shard in place; the other
+    shards of a replicated tensor keep their data."""
+    mesh = Mesh(np.array(devices), ("x",))
+    x = np.arange(32, dtype=np.float32).reshape(8, 4)
+    replicated = jax.jit(lambda v: v * 2, out_shardings=NamedSharding(mesh, P()))(x)
+    shards = [shard.data for shard in replicated.addressable_shards]
+    bump = jax.jit(lambda a: a + 1, donate_argnums=0)
+    np.testing.assert_allclose(np.asarray(bump(shards[0])), x * 2 + 1)
+    for shard in shards[1:]:
+        np.testing.assert_allclose(np.asarray(jax.jit(lambda a: a * 3)(shard)), x * 6)
+        np.testing.assert_allclose(np.asarray(jax.device_put(shard, devices[0])), x * 2)
