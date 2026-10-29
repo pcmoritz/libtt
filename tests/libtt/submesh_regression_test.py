@@ -84,10 +84,11 @@ def test_gather_on_the_whole_mesh_after_programs_on_both(devices):
 
 
 def test_one_chip_programs_run_on_the_mesh_in_use(devices):
-    """A program over one chip has no collectives, so it runs on every chip of
-    the mesh in use, each chip on its own inputs, instead of on a mesh of its
-    own. Its inputs may be shards of whole-mesh results or results of other
-    one-chip programs, and its results feed both kinds of program."""
+    """A program over one chip has no collectives, so it runs on the mesh in
+    use instead of on a mesh of its own: on the chip of a shard it takes, or on
+    every chip for inputs with the same data on every chip. Its inputs may be
+    shards of whole-mesh results or results of other one-chip programs, and its
+    results feed both kinds of program."""
     mesh = Mesh(np.array(devices), ("x",))
     n = len(devices)
     x = np.arange(16 * n, dtype=np.float32).reshape(4 * n, 4)
@@ -141,3 +142,17 @@ def test_one_chip_programs_keep_the_mesh_open(devices):
     elapsed = time.monotonic() - start
     np.testing.assert_allclose(np.asarray(cache), x)
     assert elapsed < 2, f"20 switches took {elapsed:.1f} s"
+
+
+def test_donated_shards_of_replicated_tensors(devices):
+    """A program over one chip may update a donated shard in place; the other
+    shards of a replicated tensor keep their data."""
+    mesh = Mesh(np.array(devices), ("x",))
+    x = np.arange(32, dtype=np.float32).reshape(8, 4)
+    replicated = jax.jit(lambda v: v * 2, out_shardings=NamedSharding(mesh, P()))(x)
+    shards = [shard.data for shard in replicated.addressable_shards]
+    bump = jax.jit(lambda a: a + 1, donate_argnums=0)
+    np.testing.assert_allclose(np.asarray(bump(shards[0])), x * 2 + 1)
+    for shard in shards[1:]:
+        np.testing.assert_allclose(np.asarray(jax.jit(lambda a: a * 3)(shard)), x * 6)
+        np.testing.assert_allclose(np.asarray(jax.device_put(shard, devices[0])), x * 2)

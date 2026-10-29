@@ -1,15 +1,16 @@
 diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
 --- a/pjrt_implementation/inc/api/client_instance.h
 +++ b/pjrt_implementation/inc/api/client_instance.h
-@@ -138,6 +138,13 @@
+@@ -138,6 +138,14 @@
    tt::runtime::Device
    getOrCreateMeshDevice(const std::vector<uint32_t> &target_mesh_shape);
  
 +  // Returns the mesh device for a program over one chip: the mesh in use. Such
-+  // a program has no collectives, so it runs unchanged on every chip of the
-+  // mesh, each chip on its own inputs, and one chip's result is the program's.
-+  // Closing the mesh for one over a single chip would instead drop its
-+  // programs, reinitialize the fabric and move every device tensor to the host.
++  // a program has no collectives; ttnn runs it on the chip of its inputs held
++  // there only (views of that chip, see PjrtTensor::chip), or on every chip
++  // when its inputs hold their data on every chip or on the host. Closing the
++  // mesh for one over a single chip would instead drop its programs,
++  // reinitialize the fabric and move every device tensor to the host.
 +  tt::runtime::Device getMeshDeviceForOneChip();
 +
    // Returns the fabric config computed for the current mesh device.
@@ -36,30 +37,76 @@ diff --git a/pjrt_implementation/inc/api/loaded_executable_instance.h b/pjrt_imp
 diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/tensor.h
 --- a/pjrt_implementation/inc/api/tensor.h
 +++ b/pjrt_implementation/inc/api/tensor.h
-@@ -135,6 +135,13 @@
+@@ -135,6 +135,31 @@
    // Moves pjrt tensor to host.
    void move_to_host() noexcept;
  
-+  // A tensor of one shard whose runtime tensor spans a mesh of several chips,
-+  // as a program over one chip leaves its results (see
-+  // ClientInstance::getMeshDeviceForOneChip), holds its data on the chip at
-+  // this position in the mesh.
-+  std::size_t mesh_index() const noexcept { return m_mesh_index; }
-+  void set_mesh_index(std::size_t index) noexcept { m_mesh_index = index; }
++  // On a mesh of several chips, a device tensor of one shard holds its data
++  // either on every chip, with a runtime tensor spanning the mesh, or on one
++  // chip, with a view of the mesh tensor at that chip (see
++  // tt::runtime::getDeviceTensors). This returns that chip for a view. A
++  // program over one chip runs on the mesh in use, and ttnn runs each of its
++  // ops on the chips its inputs occupy.
++  std::optional<std::size_t> chip() const noexcept { return m_chip; }
++  void set_chip(std::size_t chip) noexcept { m_chip = chip; }
++
++  // Returns the view of the runtime tensor at the chip at `position` in the
++  // mesh.
++  tt::runtime::Tensor chip_view(std::size_t position) const;
++
++  // Whether the device tensor holds the same data on every chip: one of one
++  // shard spanning the mesh, or a replicated one of several shards. Copies of
++  // it to other devices, and replicated inputs made of such copies, share it.
++  bool on_every_chip() const;
++  void set_replicated(bool replicated) noexcept { m_replicated = replicated; }
++
++  // Whether another pjrt tensor shares this one's runtime tensor. A program
++  // may update a donated input in place, so such an input gets its own copy
++  // first.
++  bool aliased() const noexcept { return m_alias && m_alias.use_count() > 1; }
++  void share_runtime_tensor_with(PjrtTensor &other);
 +
  private:
    static PjrtTensor &from_shards(const std::vector<BufferInstance *> &shards);
    static uint64_t next_uid();
-@@ -164,6 +171,9 @@
+@@ -164,6 +189,13 @@
    // Optional metadata for host-submitted tensors used to recreate worker-local
    // runtime tensors without depending on the initial runtime tensor descriptor.
    std::optional<HostTensorShell> m_host_tensor_shell;
 +
-+  // See mesh_index().
-+  std::size_t m_mesh_index = 0;
++  // See chip().
++  std::optional<std::size_t> m_chip;
++
++  // See on_every_chip() and aliased().
++  bool m_replicated = false;
++  std::shared_ptr<int> m_alias;
  };
  
  // Shared pointer to pjrt tensor used by all shards that holds tensor.
+diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
+--- a/pjrt_implementation/src/api/buffer_instance.cc
++++ b/pjrt_implementation/src/api/buffer_instance.cc
+@@ -537,6 +537,20 @@
+           getDataType(), getDimensionsRaw(), getNumberOfDimensions(),
+           dst_device, dst_memory);
+ 
++  // A device tensor with the same data on every chip is already on the
++  // destination device too: the copy shares it, without a transfer through
++  // the host or a wait for the device. A donated copy gets its own data
++  // first (see PjrtTensor::aliased).
++  PjrtTensorRef &source = getPjrtTensor();
++  if (source && source->on_every_chip()) {
++    PjrtTensor &copy = PjrtTensor::from_runtime_tensor(
++        {dst_buffer_instance.get()}, source->runtime_tensor());
++    copy.share_runtime_tensor_with(*source.get());
++    dst_buffer_instance->markAsDataReady();
++    *dst_buffer = dst_buffer_instance.release();
++    return tt_pjrt_status::kSuccess;
++  }
++
+   dst_buffer_instance->copyFromBuffer(this);
+ 
+   *dst_buffer = dst_buffer_instance.release();
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
 --- a/pjrt_implementation/src/api/client_instance.cc
 +++ b/pjrt_implementation/src/api/client_instance.cc
@@ -94,17 +141,27 @@ diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.c
  // tracy includes
  #include "tracy/Tracy.hpp"
  #include "tt/runtime/runtime.h"
-@@ -22,6 +29,52 @@
+@@ -22,6 +29,72 @@
  
  namespace tt::pjrt {
  
 +namespace {
 +
-+// For a program over one chip on a mesh of several, returns the position of the
-+// chip whose result is the program's: that of its inputs already on the mesh.
-+// An input on another chip, and a donated input whose runtime tensor other
-+// buffers share, moves to the host and reaches every chip from there.
-+std::optional<std::size_t> oneChipMeshIndex(
++struct OneChipPlacement {
++  // The chip of the inputs held there only. Without one, the inputs hold their
++  // data on every chip or on the host, and so does each result.
++  std::optional<std::size_t> chip;
++  // Inputs that are shards of mesh tensors, given as views of those at `chip`.
++  std::vector<std::size_t> views;
++};
++
++// For a program over one chip on a mesh of several, returns where it runs:
++// ttnn runs each op on the chips its inputs occupy. A shard of a mesh tensor is
++// given as its view at its chip, unless the tensor is replicated and the shard
++// not donated. A program may update a donated input in place, after which the
++// shards of the tensor no longer all hold the same data. An input on another
++// chip than the others moves to the host and reaches every chip from there.
++std::optional<OneChipPlacement> oneChipPlacement(
 +    PJRT_LoadedExecutable_Execute_Args *args, const tt::runtime::Device &device,
 +    const std::unordered_set<size_t> &donated_indices) {
 +  if (args->num_devices != 1) {
@@ -116,30 +173,40 @@ diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.c
 +  if (chips <= 1) {
 +    return std::nullopt;
 +  }
-+  std::optional<std::size_t> index;
++  OneChipPlacement placement;
 +  for (size_t arg = 0; arg < args->num_args; ++arg) {
 +    BufferInstance *buffer =
 +        BufferInstance::unwrap(args->argument_lists[0][arg]);
 +    PjrtTensorRef &tensor = buffer->getPjrtTensor();
-+    if (!tensor->has_runtime_tensor() ||
-+        tt::runtime::detail::getNumShards(tensor->runtime_tensor()) != chips) {
++    if (!tensor->has_runtime_tensor()) {
 +      continue;
 +    }
 +    const std::vector<BufferInstance *> &shards = tensor->shards();
-+    const bool shared = shards.size() > 1;
-+    const std::size_t position =
-+        shared ? static_cast<std::size_t>(
-+                     std::find(shards.begin(), shards.end(), buffer) -
-+                     shards.begin())
-+               : tensor->mesh_index();
-+    if ((shared && donated_indices.count(arg)) ||
-+        (index.has_value() && *index != position)) {
++    std::optional<std::size_t> chip = tensor->chip();
++    const bool view =
++        shards.size() > 1 &&
++        tt::runtime::detail::getNumShards(tensor->runtime_tensor()) == chips &&
++        !(tensor->on_every_chip() && !donated_indices.count(arg));
++    if (view) {
++      chip = static_cast<std::size_t>(
++          std::find(shards.begin(), shards.end(), buffer) - shards.begin());
++    }
++    if (!chip.has_value()) {
++      continue;
++    }
++    if (placement.chip.has_value() && *placement.chip != *chip) {
 +      tensor->move_to_host();
 +      continue;
 +    }
-+    index = position;
++    placement.chip = chip;
++    if (view) {
++      if (donated_indices.count(arg)) {
++        tensor->set_replicated(false);
++      }
++      placement.views.push_back(arg);
++    }
 +  }
-+  return index.value_or(0);
++  return placement;
 +}
 +
 +} // namespace
@@ -147,7 +214,7 @@ diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.c
  std::unique_ptr<FlatbufferLoadedExecutableInstance>
  FlatbufferLoadedExecutableInstance::createInstance(
      std::shared_ptr<FlatbufferExecutableImage> executable_image,
-@@ -209,13 +262,17 @@
+@@ -209,13 +282,30 @@
  
    std::optional<tt::runtime::Device> runtime_device =
        getOrCreateMeshDevice(args->argument_lists, args->num_args,
@@ -160,21 +227,76 @@ diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.c
      return tt_pjrt_status::kInternal;
    }
  
-+  const std::optional<std::size_t> mesh_index =
-+      oneChipMeshIndex(args, *runtime_device, donated_indices);
++  // A program may update a donated input in place; one whose runtime tensor
++  // other buffers share gets its own copy first.
++  for (size_t arg : donated_indices) {
++    for (size_t device = 0; device < args->num_devices; ++device) {
++      PjrtTensorRef &tensor =
++          BufferInstance::unwrap(args->argument_lists[device][arg])
++              ->getPjrtTensor();
++      if (tensor && tensor->aliased()) {
++        tensor->move_to_host();
++      }
++    }
++  }
++
++  const std::optional<OneChipPlacement> placement =
++      oneChipPlacement(args, *runtime_device, donated_indices);
 +
    // Assuming only one program per flatbuffer for now.
    std::uint32_t program_index = 0;
  
-@@ -265,6 +322,13 @@
+@@ -227,6 +317,13 @@
+   if (!tt_pjrt_status_is_ok(status)) {
+     return status;
+   }
++  if (placement.has_value()) {
++    for (size_t arg : placement->views) {
++      input_tensors[arg] = BufferInstance::unwrap(args->argument_lists[0][arg])
++                               ->getPjrtTensor()
++                               ->chip_view(*placement->chip);
++    }
++  }
+ 
+   if (m_executable_image->getCompileOptions().export_tensors) {
+     dumpInputs(input_tensors);
+@@ -251,6 +348,16 @@
+ 
+     std::vector<tt::runtime::Tensor> &output_tensors = *r;
+ 
++    // A one-chip program's results are its chip's; one it computed on every
++    // chip regardless, such as from a constant, is left at that chip too.
++    if (placement.has_value() && placement->chip.has_value()) {
++      for (tt::runtime::Tensor &output : output_tensors) {
++        if (tt::runtime::detail::getNumShards(output) > 1) {
++          output = tt::runtime::getDeviceTensors(output)[*placement->chip];
++        }
++      }
++    }
++
+     if (output_tensors.size() != m_executable_image->getNumOutputs()) {
+       LOG_F(ERROR,
+             "Runtime produced different number of output tensors (%zu) than "
+@@ -265,6 +372,24 @@
      if (!tt_pjrt_status_is_ok(status)) {
        return status;
      }
-+    if (mesh_index.has_value()) {
-+      for (size_t output = 0; output < output_tensors.size(); ++output) {
-+        BufferInstance::unwrap(args->output_lists[0][output])
-+            ->getPjrtTensor()
-+            ->set_mesh_index(*mesh_index);
++    for (size_t output = 0; output < output_tensors.size(); ++output) {
++      PjrtTensorRef &tensor =
++          BufferInstance::unwrap(args->output_lists[0][output])
++              ->getPjrtTensor();
++      if (placement.has_value()) {
++        if (tt::runtime::detail::getNumShards(tensor->runtime_tensor()) == 1) {
++          tensor->set_chip(placement->chip.value_or(0));
++        }
++      } else if (args->num_devices > 1) {
++        // Replicated outputs hold the same data on every chip.
++        mlir::FailureOr<std::unordered_map<std::string, std::string>> kind =
++            fillStrategyMapFromSharding(
++                m_executable_image->getOutputSharding(output),
++                args->num_devices);
++        tensor->set_replicated(mlir::succeeded(kind) &&
++                               kind->at("strategy") == "replicate");
 +      }
 +    }
    }
@@ -208,32 +330,101 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
 diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api/tensor.cc
 --- a/pjrt_implementation/src/api/tensor.cc
 +++ b/pjrt_implementation/src/api/tensor.cc
-@@ -157,6 +157,15 @@
+@@ -11,6 +11,7 @@
+ #include "api/tensor.h"
+ 
+ // c++ standard library includes
++#include <algorithm>
+ #include <memory>
+ #include <optional>
+ #include <unordered_map>
+@@ -45,8 +46,50 @@
+   if (have_same_tensor(shards))
+     return from_shards(shards);
+ 
+-  return from_runtime_tensor(
++  const bool replicated = strategy.at("strategy") == "replicate";
++  // Buffers that each hold their data on every chip, such as copies of a
++  // one-chip program's result, already make a replicated input.
++  if (replicated &&
++      std::all_of(shards.begin(), shards.end(), [](BufferInstance *shard) {
++        return shard->getPjrtTensor()->on_every_chip();
++      })) {
++    PjrtTensor &front = *shards.front()->getPjrtTensor().get();
++    if (!front.m_alias) {
++      front.m_alias = std::make_shared<int>(0);
++    }
++    std::shared_ptr<int> alias = front.m_alias;
++    PjrtTensor &tensor = from_runtime_tensor(shards, front.runtime_tensor());
++    tensor.m_replicated = true;
++    tensor.m_alias = std::move(alias);
++    return tensor;
++  }
++
++  PjrtTensor &tensor = from_runtime_tensor(
+       shards, rt_tensor_from_strategy(shards, strategy, mesh_shape));
++  tensor.m_replicated = replicated;
++  return tensor;
++}
++
++void PjrtTensor::share_runtime_tensor_with(PjrtTensor &other) {
++  if (!other.m_alias) {
++    other.m_alias = std::make_shared<int>(0);
++  }
++  m_alias = other.m_alias;
++}
++
++tt::runtime::Tensor PjrtTensor::chip_view(std::size_t position) const {
++  std::vector<tt::runtime::Tensor> views =
++      tt::runtime::getDeviceTensors(runtime_tensor());
++  TT_FATAL(position < views.size(),
++           "Chip {} out of range for a tensor over {} chips", position,
++           views.size());
++  return std::move(views[position]);
++}
++
++bool PjrtTensor::on_every_chip() const {
++  return m_runtime_tensor.has_value() &&
++         tt::runtime::detail::getNumShards(*m_runtime_tensor) > 1 &&
++         (m_shards.size() == 1 || m_replicated);
+ }
+ 
+ // Creates new pjrt tensor for provided shards from an existing runtime tensor.
+@@ -154,6 +197,13 @@
+     return;
+   }
+ 
++  // A tensor of one shard spanning the mesh has the same data on every chip;
++  // one chip's is read.
++  if (m_shards.size() == 1 &&
++      tt::runtime::detail::getNumShards(*m_runtime_tensor) > 1) {
++    m_runtime_tensor = chip_view(0);
++  }
++
    std::vector<tt::runtime::Tensor> tensors =
        tt::runtime::toHost(*m_runtime_tensor, /*untilize=*/true);
  
-+  if (m_shards.size() == 1 && tensors.size() > 1) {
-+    TT_FATAL(m_mesh_index < tensors.size(),
-+             "Mesh index {} out of range for {} tensors after move to host",
-+             m_mesh_index, tensors.size());
-+    m_runtime_tensor = std::move(tensors[m_mesh_index]);
-+    m_mesh_index = 0;
-+    m_checked_layout_id.reset();
-+    return;
-+  }
-   TT_FATAL(tensors.size() == m_shards.size() || tensors.size() == 1,
-            "Unexpected number of tensors after move to host: "
-            "tensors.size()={}, m_shards.size()={}",
-@@ -224,6 +233,15 @@
+@@ -176,6 +226,9 @@
+   }
+ 
+   m_shards.resize(1);
++  m_chip.reset();
++  m_replicated = false;
++  m_alias.reset();
+ }
+ 
+ // Returns whether all shards share the same runtime tensor.
+@@ -224,6 +277,16 @@
      const std::unordered_map<std::string, std::string> &strategy,
      const std::vector<std::uint32_t> &mesh_shape) {
  
-+  // A shard of a one-chip program's result spans the mesh it ran on; take its
-+  // chip's part.
++  // Device tensors among the shards, such as one-chip programs' results, come
++  // through the host.
 +  for (BufferInstance *shard : shards) {
 +    PjrtTensorRef &tensor = shard->getPjrtTensor();
-+    if (tensor->shards().size() == 1 &&
-+        tt::runtime::detail::getNumShards(tensor->runtime_tensor()) > 1) {
++    if (tensor->has_runtime_tensor() &&
++        (tensor->chip().has_value() ||
++         tt::runtime::detail::getNumShards(tensor->runtime_tensor()) > 1)) {
 +      tensor->move_to_host();
 +    }
 +  }
