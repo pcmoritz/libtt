@@ -85,9 +85,9 @@ def test_gather_on_the_whole_mesh_after_programs_on_both(devices):
 
 def test_one_chip_programs_run_on_the_mesh_in_use(devices):
     """A program over one device has no collectives, so it runs on the mesh in
-    use instead of on a mesh of its own, at the chip holding its device's data.
-    Its inputs may be host data, shards of whole-mesh results or results of
-    other such programs, and its results feed both kinds of program."""
+    use instead of on a mesh of its own, on every chip of it. Its inputs may be
+    host data, shards of whole-mesh results or results of other such programs,
+    and its results feed both kinds of program."""
     mesh = Mesh(np.array(devices), ("x",))
     n = len(devices)
     x = np.arange(16 * n, dtype=np.float32).reshape(4 * n, 4)
@@ -161,10 +161,9 @@ def test_donated_shards_of_replicated_tensors(devices):
 
 
 def test_one_device_programs_after_a_mesh_over_other_devices(devices):
-    """Meshes of the same shape over different devices run on one submesh, whose
-    chips hold the data of the devices of the latest program over it; the
-    others' device tensors move to the host. A program over one device given
-    shards of arrays on both still computes on that device's data."""
+    """Meshes of the same shape over different devices run on one submesh, so one
+    device's shards of arrays on both sit at different chips of it. A program
+    over one device given both still computes on that device's data."""
     add = jax.jit(lambda p, q: p + q)
     # Compiled first, as compiling still opens a mesh of its own
     # (tenstorrent/tt-xla#4809).
