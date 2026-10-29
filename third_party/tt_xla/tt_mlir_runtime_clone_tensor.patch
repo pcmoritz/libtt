@@ -1,0 +1,68 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/ttnn.h b/runtime/include/tt/runtime/detail/ttnn/ttnn.h
+--- a/runtime/include/tt/runtime/detail/ttnn/ttnn.h
++++ b/runtime/include/tt/runtime/detail/ttnn/ttnn.h
+@@ -242,6 +242,8 @@
+ std::vector<::tt::runtime::Tensor>
+ getDeviceTensors(::tt::runtime::Tensor tensor);
+ 
++::tt::runtime::Tensor cloneTensor(::tt::runtime::Tensor tensor);
++
+ ::tt::runtime::Tensor toLayout(::tt::runtime::Tensor tensor, Device device,
+                                Layout layout,
+                                std::optional<bool> retain = std::nullopt);
+diff --git a/runtime/include/tt/runtime/runtime.h b/runtime/include/tt/runtime/runtime.h
+--- a/runtime/include/tt/runtime/runtime.h
++++ b/runtime/include/tt/runtime/runtime.h
+@@ -224,6 +224,10 @@
+ // Returns vector of device tensors from provided sharded tensor.
+ std::vector<Tensor> getDeviceTensors(Tensor tensor);
+ 
++// Returns a copy of a device tensor made on its device, on the same chips,
++// without a transfer through the host.
++Tensor cloneTensor(Tensor tensor);
++
+ Tensor toLayout(Tensor tensor, Device device, Layout layout,
+                 std::optional<bool> retain = std::nullopt);
+ 
+diff --git a/runtime/lib/runtime.cpp b/runtime/lib/runtime.cpp
+--- a/runtime/lib/runtime.cpp
++++ b/runtime/lib/runtime.cpp
+@@ -984,6 +984,19 @@
+       });
+ }
+ 
++Tensor cloneTensor(Tensor tensor) {
++  using RetType = Tensor;
++  return DISPATCH_TO_CURRENT_RUNTIME(
++      RetType,
++      [&]() -> RetType { return ::tt::runtime::ttnn::cloneTensor(tensor); },
++      [&]() -> RetType {
++        detail::fatalNotImplemented("cloneTensor", DeviceRuntime::TTMetal);
++      },
++      [&]() -> RetType {
++        detail::fatalNotImplemented("cloneTensor", HostRuntime::Distributed);
++      });
++}
++
+ Tensor toLayout(Tensor tensor, Device device, Layout layout,
+                 std::optional<bool> retain) {
+   using RetType = Tensor;
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -1209,6 +1209,15 @@
+   return runtime_tensors;
+ }
+ 
++::tt::runtime::Tensor cloneTensor(::tt::runtime::Tensor tensor) {
++  const ::tt::runtime::ttnn::TTNNTensorWrapper &tensorWrapper =
++      tensor.as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN);
++  return utils::createRuntimeTensorFromTTNN(
++      ::ttnn::clone(tensorWrapper.getTensor(), std::nullopt, std::nullopt,
++                    std::nullopt),
++      /*meshEvent=*/std::nullopt, tensorWrapper.shouldRetain());
++}
++
+ ::tt::runtime::Tensor toLayout(::tt::runtime::Tensor tensor, Device device,
+                                Layout layout, std::optional<bool> retain) {
+   const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
