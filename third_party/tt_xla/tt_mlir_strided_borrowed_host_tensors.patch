@@ -256,7 +256,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  ::tt::runtime::Tensor
  createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
                           const std::vector<std::int64_t> &stride,
-@@ -389,37 +519,43 @@ createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
+@@ -389,37 +519,44 @@ createBorrowedHostTensor(void *data, const std::vector<std::uint32_t> &shape,
        "Cannot create borrowed tensor with null data unless the volume is 0.");
    LOG_ASSERT(::tt::runtime::utils::isSupportedDataType(dataType),
               "Cannot create borrowed tensor with unsupported data type");
@@ -268,13 +268,14 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 -             "Cannot create borrowed tensor from a non-contiguous host buffer; "
 -             "non-contiguous input must use an owned host tensor.");
 +  // A borrowed tensor aliases the caller's buffer only if it is contiguous and
-+  // at most 1 MiB. Anything else is gathered when read (see
-+  // reserveStridedHostView), so a memory-mapped checkpoint is not copied into
-+  // RAM, and a DMA never pins the caller's memory: tt-metal pins writes of
-+  // over 32 MiB (32 devices of 1 MiB shards stay below that), and pinning a
-+  // copy-on-write file mapping breaks its copy-on-write page by page, which
-+  // has livelocked the kernel.
-+  constexpr std::uint64_t kMaxAliasedBytes = 1 << 20;
++  // at most 32 MiB divided by the number of devices. Anything else is gathered
++  // when read (see reserveStridedHostView), so a memory-mapped checkpoint is
++  // not copied into RAM, and a DMA never pins the caller's memory: tt-metal
++  // pins writes of over 32 MiB, a write has at most one shard per device, and
++  // pinning a copy-on-write file mapping breaks its copy-on-write page by
++  // page, which has livelocked the kernel.
++  static const std::uint64_t kMaxAliasedBytes =
++      (std::uint64_t{32} << 20) / std::max<size_t>(getNumAvailableDevices(), 1);
 +  std::shared_ptr<void> borrowed =
 +      isContiguous(shape, stride) &&
 +              getNumElements(shape) * itemsize <= kMaxAliasedBytes
@@ -314,7 +315,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    default:
      LOG_FATAL("Unsupported data type");
    }
-@@ -1212,7 +1348,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
+@@ -1212,7 +1349,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
          "source data type or be an unsupported data type.");
    }
  
@@ -324,7 +325,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  
    // Handle cast and copy
    if (dstDataType.has_value() &&
-@@ -1272,7 +1409,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
+@@ -1272,7 +1410,8 @@ void memcpy(void *dst, ::tt::runtime::Tensor src,
  
  void memcpy(::tt::runtime::Tensor dst, ::tt::runtime::Tensor src) {
    ::ttnn::Tensor &dstTensor = utils::getTTNNTensorFromRuntimeTensor(dst);
