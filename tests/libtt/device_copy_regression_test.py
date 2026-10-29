@@ -42,11 +42,6 @@ def test_copies_of_one_device_results(mesh):
         for shard in moved.addressable_shards:
             np.testing.assert_allclose(np.asarray(shard.data), np.arange(4) + k)
         np.testing.assert_allclose(np.asarray(scale(x, moved)), np.asarray(x) * (np.arange(4) + k))
-        # A replicated input whose first shard holds its data on every chip and
-        # whose other shards are host data.
-        others = [jax.device_put(np.arange(4, dtype=np.float32) + k, d) for d in mesh.devices.flat[1:]]
-        mixed = jax.make_array_from_single_device_arrays((4,), replicated, [made, *others])
-        np.testing.assert_allclose(np.asarray(scale(x, mixed)), np.asarray(x) * (np.arange(4) + k))
         on_last = jax.device_put(made, mesh.devices.flat[-1])
         np.testing.assert_allclose(np.asarray(on_last), np.arange(4) + k)
     # A replicated whole-mesh result copied to one device.
@@ -72,7 +67,7 @@ def test_donated_copies_keep_their_source(mesh):
     update = jax.jit(update, donate_argnums=(0,))
     make = jax.jit(lambda: jnp.full(shape, 3, dtype))
     step = jax.jit(lambda a: a + 1)
-    x = jax.device_put(np.zeros((8, 4), np.float32), NamedSharding(mesh, P("x")))
+    x = jax.device_put(np.zeros((2 * mesh.devices.size, 4), np.float32), NamedSharding(mesh, P("x")))
     indices = jax.device_put(np.array([1], np.int32), device)
     values = jax.device_put(np.full((1, *shape[1:]), 7, np.dtype(dtype)), device)
     expected = np.full(shape, 3, np.dtype(dtype))
@@ -87,7 +82,8 @@ def test_donated_copies_keep_their_source(mesh):
 
 def test_copies_do_not_wait_for_the_device(mesh):
     """Taking an eager result into a whole-mesh program while a long one runs
-    returns before that program finishes."""
+    returns before that program finishes, also as the first shard of a
+    replicated array whose other shards are host data."""
     replicated = NamedSharding(mesh, P())
     # Large enough for the device, not the host's dispatch, to take the time.
     w = jax.device_put(np.eye(4096, dtype=np.float32), NamedSharding(mesh, P(None, "x")))
@@ -101,18 +97,23 @@ def test_copies_do_not_wait_for_the_device(mesh):
     v = jax.device_put(np.ones((4096, 4096), np.float32), replicated)
     use = jax.jit(lambda a, s: a * s)
     two = lambda: jnp.ones(()) * 2  # an eager op, queued behind the long program
+    hosted = lambda s: jax.make_array_from_single_device_arrays(
+        (), replicated, [s, *(jax.device_put(np.float32(2), d) for d in mesh.devices.flat[1:])]
+    )
     for _ in range(2):
         np.asarray(use(long(v), two())[0, 0])
+        np.asarray(use(long(v), hosted(two()))[0, 0])
         np.asarray(long(v)[0, 0])
     start = time.monotonic()
     np.asarray(long(v)[0, 0])
     run = time.monotonic() - start
     out = long(v)
     start = time.monotonic()
-    s = two()
-    used = use(out, s)
+    copied = use(out, two())
+    partly_hosted = use(out, hosted(two()))
     queued = time.monotonic() - start
-    np.testing.assert_allclose(np.asarray(used[0, 0]), 2 * np.asarray(out[0, 0]))
+    for used in (copied, partly_hosted):
+        np.testing.assert_allclose(np.asarray(used[0, 0]), 2 * np.asarray(out[0, 0]))
     assert queued < run / 2, f"queueing took {queued * 1e3:.1f} ms behind a {run * 1e3:.1f} ms program"
 
 
