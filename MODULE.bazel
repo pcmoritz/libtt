@@ -489,6 +489,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_uint64_buffers.patch",
         "//third_party/tt_xla:tt_xla_execute_exceptions.patch",
         "//third_party/tt_xla:tt_xla_one_chip_on_mesh.patch",
+        "//third_party/tt_xla:tt_xla_share_one_device_copies.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
