@@ -156,3 +156,22 @@ def test_donated_shards_of_replicated_tensors(devices):
     for shard in shards[1:]:
         np.testing.assert_allclose(np.asarray(jax.jit(lambda a: a * 3)(shard)), x * 6)
         np.testing.assert_allclose(np.asarray(jax.device_put(shard, devices[0])), x * 2)
+
+
+def test_one_chip_programs_on_shards_at_different_chips(devices):
+    """Meshes of the same shape run on one submesh, so one device's shards of
+    their results can sit on different chips of it. A program over one chip
+    given both still computes on that device's data."""
+    first = Mesh(np.array(devices[0:2]), ("x",))
+    second = Mesh(np.array(devices[1:3]), ("x",))
+    x = np.arange(16, dtype=np.float32).reshape(4, 4)
+    a = jax.jit(lambda v: v * 2, out_shardings=NamedSharding(first, P("x")))(x)
+    b = jax.jit(lambda v: v * 3, out_shardings=NamedSharding(second, P("x")))(x)
+    shard = lambda array: next(s.data for s in array.addressable_shards if s.device == devices[1])
+    add = jax.jit(lambda p, q: p + q)
+    # devices[1] holds rows 2:4 of `a`, at the submesh's second chip, and rows
+    # 0:2 of `b`, at its first.
+    np.testing.assert_allclose(np.asarray(add(shard(a), shard(b))), x[2:4] * 2 + x[0:2] * 3)
+    np.testing.assert_allclose(np.asarray(add(shard(b), shard(a))), x[0:2] * 3 + x[2:4] * 2)
+    np.testing.assert_allclose(np.asarray(a), x * 2)
+    np.testing.assert_allclose(np.asarray(b), x * 3)
