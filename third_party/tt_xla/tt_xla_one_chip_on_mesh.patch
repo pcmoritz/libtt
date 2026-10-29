@@ -1,29 +1,16 @@
-diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
---- a/pjrt_implementation/inc/api/client_instance.h
-+++ b/pjrt_implementation/inc/api/client_instance.h
-@@ -138,6 +138,13 @@
-   tt::runtime::Device
-   getOrCreateMeshDevice(const std::vector<uint32_t> &target_mesh_shape);
- 
-+  // Returns the mesh device for a program over one device: the mesh in use. Such
-+  // a program has no collectives, so it runs on every chip of the mesh, each on
-+  // the same data, and a buffer of one device holds the same data on every
-+  // chip. Closing the mesh for a mesh over a single chip would instead drop its
-+  // programs, reinitialize the fabric and move every device tensor to the host.
-+  tt::runtime::Device getMeshDeviceForOneDevice();
-+
-   // Returns the fabric config computed for the current mesh device.
-   const std::optional<tt::runtime::MeshFabricConfig> &getFabricConfig() const {
-     return m_fabric_config;
 diff --git a/pjrt_implementation/inc/api/loaded_executable_instance.h b/pjrt_implementation/inc/api/loaded_executable_instance.h
 --- a/pjrt_implementation/inc/api/loaded_executable_instance.h
 +++ b/pjrt_implementation/inc/api/loaded_executable_instance.h
-@@ -128,10 +128,13 @@
+@@ -128,10 +128,17 @@
    // Opens devices on which input arguments are placed, which we assume are the
    // the devices where computation will run, if their count is equal to the
    // corresponding devices count in the mesh shape estimated by the compiler.
 +  // With `one_device_on_mesh_in_use`, a program over one device gets the mesh
-+  // in use (ClientInstance::getMeshDeviceForOneDevice).
++  // in use, if any. Such a program has no collectives, so it runs on every chip
++  // of the mesh, each on the same data, and a buffer of one device holds the
++  // same data on every chip. Closing the mesh for one over a single chip would
++  // instead drop its programs, reinitialize the fabric and move every device
++  // tensor to the host.
    std::optional<tt::runtime::Device>
    getOrCreateMeshDevice(PJRT_Buffer *const *const *argument_lists,
                          size_t num_args, size_t num_devices,
@@ -33,27 +20,10 @@ diff --git a/pjrt_implementation/inc/api/loaded_executable_instance.h b/pjrt_imp
  
    // Collects device ids from the addressable devices.
    std::unordered_set<int>
-diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
---- a/pjrt_implementation/src/api/client_instance.cc
-+++ b/pjrt_implementation/src/api/client_instance.cc
-@@ -657,6 +657,13 @@
-   return *m_parent_mesh;
- }
- 
-+tt::runtime::Device ClientInstance::getMeshDeviceForOneDevice() {
-+  if (m_parent_mesh.has_value()) {
-+    return *m_parent_mesh;
-+  }
-+  return getOrCreateMeshDevice({1, 1});
-+}
-+
- void ClientInstance::closeMeshDevice() {
-   closeParentMesh();
-   loguru::flush();
 diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
-@@ -209,13 +209,26 @@
+@@ -209,13 +209,27 @@
  
    std::optional<tt::runtime::Device> runtime_device =
        getOrCreateMeshDevice(args->argument_lists, args->num_args,
@@ -67,7 +37,8 @@ diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.c
    }
  
 +  // A program over one device runs on every chip of the mesh in use, each on
-+  // the same data, so a shard of a mesh tensor comes through the host.
++  // the same data (getOrCreateMeshDevice), so a shard of a mesh tensor comes
++  // through the host.
 +  if (args->num_devices == 1) {
 +    for (size_t arg = 0; arg < args->num_args; ++arg) {
 +      PjrtTensorRef &tensor =
@@ -99,8 +70,8 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
    // https://github.com/tenstorrent/tt-xla/issues/502
  
 +  if (one_device_on_mesh_in_use && mesh_shape_num_devices == 1 &&
-+      !m_client_instance->isCompileOnly()) {
-+    return m_client_instance->getMeshDeviceForOneDevice();
++      m_client_instance->parentMesh().has_value()) {
++    return *m_client_instance->parentMesh();
 +  }
 +
    return m_client_instance->getOrCreateMeshDevice(devices_mesh_shape);
@@ -114,7 +85,7 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
    }
  
 +  // A buffer of one device holds the same data on every chip of the mesh
-+  // (ClientInstance::getMeshDeviceForOneDevice); one chip's is read.
++  // (LoadedExecutableInstance::getOrCreateMeshDevice); one chip's is read.
 +  if (m_shards.size() == 1 &&
 +      tt::runtime::detail::getNumShards(*m_runtime_tensor) > 1) {
 +    m_runtime_tensor = tt::runtime::getDeviceTensors(*m_runtime_tensor)[0];
