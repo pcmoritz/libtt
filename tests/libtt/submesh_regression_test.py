@@ -84,11 +84,10 @@ def test_gather_on_the_whole_mesh_after_programs_on_both(devices):
 
 
 def test_one_chip_programs_run_on_the_mesh_in_use(devices):
-    """A program over one chip has no collectives, so it runs on the mesh in
-    use instead of on a mesh of its own: on the chip of a shard it takes, or on
-    every chip for inputs with the same data on every chip. Its inputs may be
-    shards of whole-mesh results or results of other one-chip programs, and its
-    results feed both kinds of program."""
+    """A program over one device has no collectives, so it runs on the mesh in
+    use instead of on a mesh of its own, at the chip holding its device's data.
+    Its inputs may be host data, shards of whole-mesh results or results of
+    other such programs, and its results feed both kinds of program."""
     mesh = Mesh(np.array(devices), ("x",))
     n = len(devices)
     x = np.arange(16 * n, dtype=np.float32).reshape(4 * n, 4)
@@ -99,21 +98,24 @@ def test_one_chip_programs_run_on_the_mesh_in_use(devices):
     step = jax.jit(lambda cache, v: cache + v, donate_argnums=0)
     cache = jax.device_put(np.zeros_like(x), NamedSharding(mesh, P("x")))
     triple = jax.jit(lambda a: a * 3)
-    parts = []
-    for k, device in enumerate(devices):
-        cache = step(cache, sharded)
-        shard = triple(sharded.addressable_shards[k].data)
-        again = triple(shard)
-        whole = triple(replicated.addressable_shards[k].data)
-        host = triple(jax.device_put(x[k], device))
-        made = jnp.arange(4, dtype=jnp.float32) + k
-        np.testing.assert_allclose(np.asarray(again), rows(k) * 9)
-        np.testing.assert_allclose(np.asarray(shard), rows(k) * 3)
-        np.testing.assert_allclose(np.asarray(whole), x * 3)
-        np.testing.assert_allclose(np.asarray(host), x[k] * 3)
-        np.testing.assert_allclose(np.asarray(made), np.arange(4) + k)
-        parts.append(triple(sharded.addressable_shards[k].data))
-    np.testing.assert_allclose(np.asarray(cache), x * n)
+    # The first round compiles the programs, which still opens a mesh of its
+    # own (tenstorrent/tt-xla#4809); the second runs them on the mesh in use.
+    for _ in range(2):
+        parts = []
+        for k, device in enumerate(devices):
+            cache = step(cache, sharded)
+            shard = triple(sharded.addressable_shards[k].data)
+            again = triple(shard)
+            whole = triple(replicated.addressable_shards[k].data)
+            host = triple(jax.device_put(x[k], device))
+            made = jnp.arange(4, dtype=jnp.float32) + k
+            np.testing.assert_allclose(np.asarray(again), rows(k) * 9)
+            np.testing.assert_allclose(np.asarray(shard), rows(k) * 3)
+            np.testing.assert_allclose(np.asarray(whole), x * 3)
+            np.testing.assert_allclose(np.asarray(host), x[k] * 3)
+            np.testing.assert_allclose(np.asarray(made), np.arange(4) + k)
+            parts.append(triple(sharded.addressable_shards[k].data))
+    np.testing.assert_allclose(np.asarray(cache), x * 2 * n)
     # One-chip results, still on the mesh, as the shards of a whole-mesh input.
     combined = jax.make_array_from_single_device_arrays(
         x.shape, NamedSharding(mesh, P("x")), parts
@@ -158,19 +160,23 @@ def test_donated_shards_of_replicated_tensors(devices):
         np.testing.assert_allclose(np.asarray(jax.device_put(shard, devices[0])), x * 2)
 
 
-def test_one_chip_programs_on_shards_at_different_chips(devices):
-    """Meshes of the same shape run on one submesh, so one device's shards of
-    their results can sit on different chips of it. A program over one chip
-    given both still computes on that device's data."""
+def test_one_device_programs_after_a_mesh_over_other_devices(devices):
+    """Meshes of the same shape over different devices run on one submesh, whose
+    chips hold the data of the devices of the latest program over it; the
+    others' device tensors move to the host. A program over one device given
+    shards of arrays on both still computes on that device's data."""
+    add = jax.jit(lambda p, q: p + q)
+    # Compiled first, as compiling still opens a mesh of its own
+    # (tenstorrent/tt-xla#4809).
+    warm = jax.device_put(np.zeros((2, 4), np.float32), devices[1])
+    np.testing.assert_allclose(np.asarray(add(warm, warm)), 0)
     first = Mesh(np.array(devices[0:2]), ("x",))
     second = Mesh(np.array(devices[1:3]), ("x",))
     x = np.arange(16, dtype=np.float32).reshape(4, 4)
     a = jax.jit(lambda v: v * 2, out_shardings=NamedSharding(first, P("x")))(x)
     b = jax.jit(lambda v: v * 3, out_shardings=NamedSharding(second, P("x")))(x)
     shard = lambda array: next(s.data for s in array.addressable_shards if s.device == devices[1])
-    add = jax.jit(lambda p, q: p + q)
-    # devices[1] holds rows 2:4 of `a`, at the submesh's second chip, and rows
-    # 0:2 of `b`, at its first.
+    # devices[1] holds rows 2:4 of `a` and rows 0:2 of `b`.
     np.testing.assert_allclose(np.asarray(add(shard(a), shard(b))), x[2:4] * 2 + x[0:2] * 3)
     np.testing.assert_allclose(np.asarray(add(shard(b), shard(a))), x[0:2] * 3 + x[2:4] * 2)
     np.testing.assert_allclose(np.asarray(a), x * 2)
