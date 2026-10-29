@@ -668,6 +668,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_dot_unit_dims.patch",
         "//third_party/tt_xla:tt_mlir_trace_publish_slots.patch",
         "//third_party/tt_xla:tt_mlir_trace_case.patch",
+        "//third_party/tt_xla:tt_mlir_untilize_readback_on_device.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
