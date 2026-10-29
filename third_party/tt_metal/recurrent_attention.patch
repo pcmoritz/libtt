@@ -559,7 +559,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,327 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -582,8 +582,11 @@ new file mode 100644
 +// The per-token scalars live in row 0 of their tiles: the norm factors and the
 +// decay at [0, 0], beta across row 0. Their SFPU math covers only rows 0-3 of
 +// the top faces, two of a face's eight SFPU iterations, rather than all of a
-+// tile; the rest of each such tile is unspecified. The compute API takes no
-+// vector mode for most of these functions, so the helpers call them directly.
++// tile. The rest of such a tile keeps its inputs, infinite logits included, so
++// the norm factors and the decay are read only through scalar broadcasts, and
++// beta, which multiplies whole tiles, goes into a tile that is finite
++// elsewhere. The compute API takes no vector mode for most of these functions,
++// so the helpers call them directly.
 +constexpr int row_iterations = 2;
 +
 +ALWI void row_add_unary(uint32_t idst, uint32_t value) {
@@ -712,7 +715,9 @@ new file mode 100644
 +    cb_wait_front(key_factor, 1);
 +    cb_wait_front(query_factor, 1);
 +
-+    // beta = sigmoid(beta_logits)
++    // beta = sigmoid(beta_logits) * key factor across row 0, and the key
++    // factor in the other rows. The update uses the unnormalized key^T, so its
++    // delta takes the key factor too.
 +    cb_wait_front(beta_logits, 1);
 +    cb_reserve_back(beta, 1);
 +    unary_bcast_init<BroadcastType::SCALAR>(beta_logits);
@@ -720,10 +725,14 @@ new file mode 100644
 +    tile_regs_acquire();
 +    unary_bcast<BroadcastType::SCALAR>(beta_logits, 0, 0);
 +    row_sigmoid(0);
++    copy_tile_to_dst_init_short(key_factor);
++    copy_tile(key_factor, 0, 1);
++    mul_binary_tile_init();
++    row_mul_binary(0, 1, 1);
 +    tile_regs_commit();
 +    tile_regs_wait();
 +    pack_reconfig_data_format(beta);
-+    pack_tile(0, beta, 0);
++    pack_tile(1, beta, 0);
 +    tile_regs_release();
 +    cb_push_back(beta, 1);
 +    cb_pop_front(beta_logits, 1);
@@ -800,11 +809,6 @@ new file mode 100644
 +            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(beta);
 +        binary_dest_reuse_tiles<
 +            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(beta, 0, 0);
-+        // The update uses the unnormalized key^T, so scale its delta.
-+        binary_dest_reuse_tiles_init<
-+            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(key_factor);
-+        binary_dest_reuse_tiles<
-+            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(key_factor, 0, 0);
 +        tile_regs_commit();
 +        tile_regs_wait();
 +        pack_tile(0, scaled_delta, column);
