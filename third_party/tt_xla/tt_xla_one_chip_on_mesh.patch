@@ -94,16 +94,15 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
    std::vector<tt::runtime::Tensor> tensors =
        tt::runtime::toHost(*m_runtime_tensor, /*untilize=*/true);
  
-@@ -224,6 +231,14 @@
+@@ -224,6 +231,13 @@
      const std::unordered_map<std::string, std::string> &strategy,
      const std::vector<std::uint32_t> &mesh_shape) {
  
-+  // Buffers of one device on a mesh of several chips come through the host.
++  // Device tensors among the shards, such as results of programs over one
++  // device, come through the host.
 +  for (BufferInstance *shard : shards) {
-+    PjrtTensorRef &tensor = shard->getPjrtTensor();
-+    if (tensor->shards().size() == 1 && tensor->has_runtime_tensor() &&
-+        tt::runtime::detail::getNumShards(tensor->runtime_tensor()) > 1) {
-+      tensor->move_to_host();
++    if (shard->getPjrtTensor()->has_runtime_tensor()) {
++      shard->getPjrtTensor()->move_to_host();
 +    }
 +  }
    if (strategy.at("strategy") == "identity") {
