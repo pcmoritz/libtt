@@ -489,6 +489,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_uint64_buffers.patch",
         "//third_party/tt_xla:tt_xla_execute_exceptions.patch",
         "//third_party/tt_xla:tt_xla_one_chip_on_mesh.patch",
+        "//third_party/tt_xla:tt_xla_clone_one_device_copies.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -668,6 +669,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_dot_unit_dims.patch",
         "//third_party/tt_xla:tt_mlir_trace_publish_slots.patch",
         "//third_party/tt_xla:tt_mlir_trace_case.patch",
+        "//third_party/tt_xla:tt_mlir_runtime_clone_tensor.patch",
         "//third_party/tt_xla:tt_mlir_untilize_readback_on_device.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
