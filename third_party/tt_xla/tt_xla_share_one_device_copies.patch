@@ -1,0 +1,141 @@
+diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/tensor.h
+--- a/pjrt_implementation/inc/api/tensor.h
++++ b/pjrt_implementation/inc/api/tensor.h
+@@ -135,6 +135,18 @@
+   // Moves pjrt tensor to host.
+   void move_to_host() noexcept;
+ 
++  // Whether this is a buffer of one device holding the same data on every chip
++  // of the mesh in use (LoadedExecutableInstance::getOrCreateMeshDevice). Copies
++  // of it to other devices, and replicated inputs made of such copies, share
++  // its runtime tensor.
++  bool on_every_chip() const;
++
++  // Whether another pjrt tensor shares this one's runtime tensor. A program
++  // may update a donated input in place, so such an input gets its own copy
++  // first.
++  bool aliased() const noexcept { return m_alias && m_alias.use_count() > 1; }
++  void share_runtime_tensor_with(PjrtTensor &other);
++
+ private:
+   static PjrtTensor &from_shards(const std::vector<BufferInstance *> &shards);
+   static uint64_t next_uid();
+@@ -164,6 +176,9 @@
+   // Optional metadata for host-submitted tensors used to recreate worker-local
+   // runtime tensors without depending on the initial runtime tensor descriptor.
+   std::optional<HostTensorShell> m_host_tensor_shell;
++
++  // See aliased(); one token per runtime tensor shared by pjrt tensors.
++  std::shared_ptr<int> m_alias;
+ };
+ 
+ // Shared pointer to pjrt tensor used by all shards that holds tensor.
+diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
+--- a/pjrt_implementation/src/api/buffer_instance.cc
++++ b/pjrt_implementation/src/api/buffer_instance.cc
+@@ -537,6 +537,20 @@
+           getDataType(), getDimensionsRaw(), getNumberOfDimensions(),
+           dst_device, dst_memory);
+ 
++  // A buffer of one device holding the same data on every chip is already on
++  // the destination device too: the copy shares it, without a transfer through
++  // the host or a wait for the device. A donated copy gets its own data first
++  // (PjrtTensor::aliased).
++  PjrtTensorRef &source = getPjrtTensor();
++  if (source && source->on_every_chip()) {
++    PjrtTensor::from_runtime_tensor({dst_buffer_instance.get()},
++                                    source->runtime_tensor())
++        .share_runtime_tensor_with(*source);
++    dst_buffer_instance->markAsDataReady();
++    *dst_buffer = dst_buffer_instance.release();
++    return tt_pjrt_status::kSuccess;
++  }
++
+   dst_buffer_instance->copyFromBuffer(this);
+ 
+   *dst_buffer = dst_buffer_instance.release();
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -217,6 +217,19 @@
+     return tt_pjrt_status::kInternal;
+   }
+ 
++  // A program may update a donated input in place; one whose runtime tensor
++  // other buffers share gets its own copy first.
++  for (size_t arg : donated_indices) {
++    for (size_t device = 0; device < args->num_devices; ++device) {
++      PjrtTensorRef &tensor =
++          BufferInstance::unwrap(args->argument_lists[device][arg])
++              ->getPjrtTensor();
++      if (tensor && tensor->aliased()) {
++        tensor->move_to_host();
++      }
++    }
++  }
++
+   // A program over one device runs on every chip of the mesh in use, each on
+   // the same data (getOrCreateMeshDevice), so a shard of a mesh tensor comes
+   // through the host.
+diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api/tensor.cc
+--- a/pjrt_implementation/src/api/tensor.cc
++++ b/pjrt_implementation/src/api/tensor.cc
+@@ -11,6 +11,7 @@
+ #include "api/tensor.h"
+ 
+ // c++ standard library includes
++#include <algorithm>
+ #include <memory>
+ #include <optional>
+ #include <unordered_map>
+@@ -45,10 +46,42 @@
+   if (have_same_tensor(shards))
+     return from_shards(shards);
+ 
++  // Buffers of one device that each hold their data on every chip, such as
++  // copies of a program over one device's result, already make a replicated
++  // input.
++  PjrtTensor &front = *shards.front()->getPjrtTensor();
++  if (strategy.at("strategy") == "replicate" &&
++      std::all_of(shards.begin(), shards.end(),
++                  [](BufferInstance *shard) {
++                    return shard->getPjrtTensor()->on_every_chip();
++                  }) &&
++      tt::runtime::detail::getNumShards(front.runtime_tensor()) ==
++          shards.size()) {
++    if (!front.m_alias) {
++      front.m_alias = std::make_shared<int>(0);
++    }
++    std::shared_ptr<int> alias = front.m_alias;
++    PjrtTensor &tensor = from_runtime_tensor(shards, front.runtime_tensor());
++    tensor.m_alias = std::move(alias);
++    return tensor;
++  }
++
+   return from_runtime_tensor(
+       shards, rt_tensor_from_strategy(shards, strategy, mesh_shape));
+ }
+ 
++bool PjrtTensor::on_every_chip() const {
++  return m_shards.size() == 1 && m_runtime_tensor.has_value() &&
++         tt::runtime::detail::getNumShards(*m_runtime_tensor) > 1;
++}
++
++void PjrtTensor::share_runtime_tensor_with(PjrtTensor &other) {
++  if (!other.m_alias) {
++    other.m_alias = std::make_shared<int>(0);
++  }
++  m_alias = other.m_alias;
++}
++
+ // Creates new pjrt tensor for provided shards from an existing runtime tensor.
+ PjrtTensor &
+ PjrtTensor::from_runtime_tensor(std::vector<BufferInstance *> shards,
+@@ -183,6 +216,7 @@
+   }
+ 
+   m_shards.resize(1);
++  m_alias.reset();
+ }
+ 
+ // Returns whether all shards share the same runtime tensor.
