@@ -559,7 +559,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,323 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -690,7 +690,7 @@ new file mode 100644
 +
 +        cb_wait_front(squared_norm, 1);
 +        cb_reserve_back(factor, 1);
-+        unary_bcast_init<BroadcastType::SCALAR>(squared_norm, factor);
++        unary_bcast_init<BroadcastType::SCALAR>(squared_norm);
 +        tile_regs_acquire();
 +        unary_bcast<BroadcastType::SCALAR>(squared_norm, 0, 0);
 +        tile_regs_commit();
@@ -715,7 +715,7 @@ new file mode 100644
 +    // beta = sigmoid(beta_logits)
 +    cb_wait_front(beta_logits, 1);
 +    cb_reserve_back(beta, 1);
-+    unary_bcast_init<BroadcastType::SCALAR>(beta_logits, beta);
++    unary_bcast_init<BroadcastType::SCALAR>(beta_logits);
 +    sigmoid_tile_init();
 +    tile_regs_acquire();
 +    unary_bcast<BroadcastType::SCALAR>(beta_logits, 0, 0);
@@ -733,7 +733,6 @@ new file mode 100644
 +    cb_wait_front(delta_time, 1);
 +    cb_wait_front(dt_bias, 1);
 +    cb_reserve_back(decay, 1);
-+    binary_op_init_common(delta_time, dt_bias, decay);
 +    add_tiles_init(delta_time, dt_bias);
 +    tile_regs_acquire();
 +    add_tiles(delta_time, dt_bias, 0, 0, 0);
