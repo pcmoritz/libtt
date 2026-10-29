@@ -63,6 +63,9 @@ def test_gdn_decode_grouped_heads(trace, batch, key_heads, groups, qk_scale, qkv
         qk = (rng.normal(0, 1, (batch, 2 * key_heads, dim)) * qk_scale).astype(qkv_dtype).astype(np.float32)
         v = rng.normal(0, 0.5, (batch, heads, dim)).astype(qkv_dtype).astype(np.float32)
         b = rng.normal(0, 1, (batch, heads)).astype(gate_dtype).astype(np.float32)
+        # Saturated beta: the kernel computes beta only in row 0 of its tile,
+        # and infinite logits must not reach the outputs through the rest.
+        b[:, 0], b[:, -1] = np.inf, -np.inf
         a = rng.normal(0, 1, (batch, heads)).astype(gate_dtype).astype(np.float32)
         A_log = rng.uniform(-1, 1, heads).astype(np.float32)
         dt_bias = rng.uniform(-1, 1, heads).astype(np.float32)

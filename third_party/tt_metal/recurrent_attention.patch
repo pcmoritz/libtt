@@ -559,7 +559,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,327 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -577,6 +577,64 @@ new file mode 100644
 +#include "api/compute/eltwise_unary/softplus.h"
 +#include "api/compute/matmul.h"
 +#include "api/compute/tile_move_copy.h"
++#include "api/compute/transpose.h"
++
++// The per-token scalars live in row 0 of their tiles: the norm factors and the
++// decay at [0, 0], beta across row 0. Their SFPU math covers only rows 0-3 of
++// the top faces, two of a face's eight SFPU iterations, rather than all of a
++// tile. The rest of such a tile keeps its inputs, infinite logits included, so
++// the norm factors and the decay are read only through scalar broadcasts, and
++// beta, which multiplies whole tiles, goes into a tile that is finite
++// elsewhere. The compute API takes no vector mode for most of these functions,
++// so the helpers call them directly.
++constexpr int row_iterations = 2;
++
++ALWI void row_add_unary(uint32_t idst, uint32_t value) {
++    MATH(SFPU_UNARY_CALL(
++        DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
++        (APPROX, ADD_UNARY, row_iterations, DST_ACCUM_MODE), idst, VectorMode::R, value));
++}
++
++ALWI void row_mul_unary(uint32_t idst, uint32_t value) {
++    MATH(SFPU_UNARY_CALL(
++        DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
++        (APPROX, MUL_UNARY, row_iterations, DST_ACCUM_MODE), idst, VectorMode::R, value));
++}
++
++ALWI void row_rsqrt(uint32_t idst) {
++    MATH(SFPU_UNARY_CALL(
++        DST_SYNC_MODE, DST_ACCUM_MODE, calculate_rsqrt,
++        (APPROX, row_iterations, DST_ACCUM_MODE, false), idst, VectorMode::R));
++}
++
++ALWI void row_sigmoid(uint32_t idst) {
++    MATH(SFPU_UNARY_CALL(
++        DST_SYNC_MODE, DST_ACCUM_MODE, calculate_sigmoid,
++        (false, DST_ACCUM_MODE, row_iterations), idst, VectorMode::R));
++}
++
++// softplus with beta 1 and threshold 20.
++ALWI void row_softplus(uint32_t idst) {
++    MATH(SFPU_UNARY_CALL(
++        DST_SYNC_MODE, DST_ACCUM_MODE, calculate_softplus,
++        (APPROX, DST_ACCUM_MODE, row_iterations), idst, VectorMode::R,
++        0x3F800000u, 0x3F800000u, 0x41A00000u));
++}
++
++ALWI void row_exp(uint32_t idst) {
++    exp_tile<false, false, InputClamping::ClampToNegative, row_iterations>(idst, VectorMode::R);
++}
++
++ALWI void row_negative(uint32_t idst) {
++    MATH(SFPU_UNARY_CALL(
++        DST_SYNC_MODE, DST_ACCUM_MODE, _calculate_negative_, (APPROX, row_iterations), idst, VectorMode::R));
++}
++
++ALWI void row_mul_binary(uint32_t idst0, uint32_t idst1, uint32_t odst) {
++    MATH((SFPU_BINARY_CALL(
++        DST_SYNC_MODE, DST_ACCUM_MODE, calculate_sfpu_binary_mul,
++        (APPROX, ckernel::BinaryOp::MUL, row_iterations, DST_ACCUM_MODE), idst0, idst1, odst, VectorMode::R)));
++}
 +
 +void kernel_main() {
 +    constexpr uint32_t kt = get_compile_time_arg_val(0);
@@ -605,29 +663,27 @@ new file mode 100644
 +    constexpr uint32_t dt_bias = tt::CBIndex::c_14;
 +    constexpr uint32_t beta = tt::CBIndex::c_16;
 +    constexpr uint32_t decay = tt::CBIndex::c_20;
-+    constexpr uint32_t query_transposed = tt::CBIndex::c_7;
 +    constexpr uint32_t squared_norm = tt::CBIndex::c_21;
 +    constexpr uint32_t key_factor = tt::CBIndex::c_22;
 +    constexpr uint32_t query_factor = tt::CBIndex::c_23;
 +
 +    // factor = scale / sqrt(x x^T + eps) in every element of a tile, where x
-+    // is a row vector in row 0 of kt tiles and x^T holds it in column 0.
-+    auto normalization_factor = [&](uint32_t x, uint32_t x_transposed, uint32_t factor, uint32_t scale) {
++    // is a row vector in row 0 of kt tiles; the matmul transposes its second x.
++    auto normalization_factor = [&](uint32_t x, uint32_t factor, uint32_t scale) {
 +        cb_wait_front(x, kt);
-+        cb_wait_front(x_transposed, kt);
 +        cb_reserve_back(squared_norm, 1);
-+        reconfig_data_format<SrcOrder::Reverse>(x, x_transposed);
-+        matmul_init(x, x_transposed);
++        reconfig_data_format<SrcOrder::Reverse>(x, x);
++        matmul_init(x, x, /*transpose=*/1);
 +        tile_regs_acquire();
 +        for (uint32_t inner = 0; inner < kt; ++inner) {
-+            matmul_tiles(x, x_transposed, inner, inner, 0);
++            matmul_tiles(x, x, inner, inner, 0);
 +        }
 +        binop_with_scalar_tile_init();
-+        add_unary_tile(0, eps);
++        row_add_unary(0, eps);
 +        rsqrt_tile_init();
-+        rsqrt_tile(0);
++        row_rsqrt(0);
 +        binop_with_scalar_tile_init();
-+        mul_unary_tile(0, scale);
++        row_mul_unary(0, scale);
 +        tile_regs_commit();
 +        tile_regs_wait();
 +        pack_reconfig_data_format(squared_norm);
@@ -637,7 +693,7 @@ new file mode 100644
 +
 +        cb_wait_front(squared_norm, 1);
 +        cb_reserve_back(factor, 1);
-+        unary_bcast_init<BroadcastType::SCALAR>(squared_norm, factor);
++        unary_bcast_init<BroadcastType::SCALAR>(squared_norm);
 +        tile_regs_acquire();
 +        unary_bcast<BroadcastType::SCALAR>(squared_norm, 0, 0);
 +        tile_regs_commit();
@@ -654,23 +710,29 @@ new file mode 100644
 +    for (uint32_t work = worker; work < batch_size * num_heads * workers_per_head; work += num_workers) {
 +    // The kernel works with the unnormalized q and k and scales the products
 +    // they take part in.
-+    normalization_factor(key, key_transposed, key_factor, 0x3F800000u);
-+    normalization_factor(query, query_transposed, query_factor, query_scale);
++    normalization_factor(key, key_factor, 0x3F800000u);
++    normalization_factor(query, query_factor, query_scale);
 +    cb_wait_front(key_factor, 1);
 +    cb_wait_front(query_factor, 1);
 +
-+    // beta = sigmoid(beta_logits)
++    // beta = sigmoid(beta_logits) * key factor across row 0, and the key
++    // factor in the other rows. The update uses the unnormalized key^T, so its
++    // delta takes the key factor too.
 +    cb_wait_front(beta_logits, 1);
 +    cb_reserve_back(beta, 1);
-+    unary_bcast_init<BroadcastType::SCALAR>(beta_logits, beta);
++    unary_bcast_init<BroadcastType::SCALAR>(beta_logits);
 +    sigmoid_tile_init();
 +    tile_regs_acquire();
 +    unary_bcast<BroadcastType::SCALAR>(beta_logits, 0, 0);
-+    sigmoid_tile(0);
++    row_sigmoid(0);
++    copy_tile_to_dst_init_short(key_factor);
++    copy_tile(key_factor, 0, 1);
++    mul_binary_tile_init();
++    row_mul_binary(0, 1, 1);
 +    tile_regs_commit();
 +    tile_regs_wait();
 +    pack_reconfig_data_format(beta);
-+    pack_tile(0, beta, 0);
++    pack_tile(1, beta, 0);
 +    tile_regs_release();
 +    cb_push_back(beta, 1);
 +    cb_pop_front(beta_logits, 1);
@@ -680,22 +742,21 @@ new file mode 100644
 +    cb_wait_front(delta_time, 1);
 +    cb_wait_front(dt_bias, 1);
 +    cb_reserve_back(decay, 1);
-+    binary_op_init_common(delta_time, dt_bias, decay);
 +    add_tiles_init(delta_time, dt_bias);
 +    tile_regs_acquire();
 +    add_tiles(delta_time, dt_bias, 0, 0, 0);
 +    softplus_tile_init();
-+    softplus_tile(0, 0x3F800000u, 0x3F800000u, 0x41A00000u);
++    row_softplus(0);
 +    copy_tile_to_dst_init_short(a_log);
 +    copy_tile(a_log, 0, 1);
 +    exp_tile_init();
-+    exp_tile(1);
++    row_exp(1);
 +    negative_tile_init();
-+    negative_tile(1);
++    row_negative(1);
 +    mul_binary_tile_init();
-+    mul_binary_tile(0, 1, 0);
++    row_mul_binary(0, 1, 0);
 +    exp_tile_init();
-+    exp_tile(0);
++    row_exp(0);
 +    tile_regs_commit();
 +    tile_regs_wait();
 +    pack_reconfig_data_format(decay);
@@ -748,17 +809,28 @@ new file mode 100644
 +            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(beta);
 +        binary_dest_reuse_tiles<
 +            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(beta, 0, 0);
-+        // The update uses the unnormalized key^T, so scale its delta.
-+        binary_dest_reuse_tiles_init<
-+            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(key_factor);
-+        binary_dest_reuse_tiles<
-+            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(key_factor, 0, 0);
 +        tile_regs_commit();
 +        tile_regs_wait();
 +        pack_tile(0, scaled_delta, column);
 +        tile_regs_release();
 +    }
 +    cb_push_back(scaled_delta, vt);
++
++    // key^T holds the key in column 0 of each tile.
++    cb_reserve_back(key_transposed, kt);
++    transpose_init(key);
++    tile_regs_acquire();
++    for (uint32_t tile = 0; tile < kt; ++tile) {
++        transpose_tile(key, tile, tile);
++    }
++    tile_regs_commit();
++    tile_regs_wait();
++    pack_reconfig_data_format(key_transposed);
++    for (uint32_t tile = 0; tile < kt; ++tile) {
++        pack_tile(tile, key_transposed, tile);
++    }
++    tile_regs_release();
++    cb_push_back(key_transposed, kt);
 +
 +    // state_new = state_mid + key^T * scaled_delta
 +    cb_wait_front(key_transposed, kt);
@@ -811,7 +883,6 @@ new file mode 100644
 +    cb_pop_front(value, vt);
 +    cb_pop_front(decay, 1);
 +    cb_pop_front(beta, 1);
-+    cb_pop_front(query_transposed, kt);
 +    cb_pop_front(key_factor, 1);
 +    cb_pop_front(query_factor, 1);
 +    }
@@ -969,7 +1040,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,197 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1034,16 +1105,6 @@ new file mode 100644
 +    tile[768] = element;
 +}
 +
-+FORCE_INLINE void transpose_row_tile(uint32_t source_address, uint32_t destination_address) {
-+    volatile tt_l1_ptr uint32_t* source = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(source_address);
-+    volatile tt_l1_ptr uint32_t* destination =
-+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(destination_address);
-+    for (uint32_t i = 0; i < 16; ++i) {
-+        destination[i * 16] = source[i];
-+        destination[512 + i * 16] = source[256 + i];
-+    }
-+}
-+
 +}  // namespace
 +
 +void kernel_main() {
@@ -1099,8 +1160,6 @@ new file mode 100644
 +    CircularBuffer value_cb(tt::CBIndex::c_3);
 +    CircularBuffer delta_time_cb(tt::CBIndex::c_4);
 +    CircularBuffer beta_logits_cb(tt::CBIndex::c_5);
-+    CircularBuffer query_transposed_cb(tt::CBIndex::c_7);
-+    CircularBuffer key_transposed_cb(tt::CBIndex::c_9);
 +    CircularBuffer a_log_cb(tt::CBIndex::c_13);
 +    CircularBuffer dt_bias_cb(tt::CBIndex::c_14);
 +    CircularBuffer state_indices_cb(tt::CBIndex::c_15);
@@ -1151,10 +1210,7 @@ new file mode 100644
 +    const uint32_t group_head = head / (num_heads / key_heads);
 +    read_vector(noc, qkv, query_cb, page(group_head), batch % 32, kt);
 +
-+    key_transposed_cb.reserve_back(kt);
 +    read_vector(noc, qkv, key_cb, page(key_heads + group_head), batch % 32, kt);
-+    query_transposed_cb.reserve_back(kt);
-+    noc.async_write_zeros(query_transposed_cb, kt * tile_bytes);
 +
 +    read_vector(noc, qkv, value_cb, page(2 * key_heads + head) + column_start, batch % 32, vt);
 +
@@ -1166,22 +1222,11 @@ new file mode 100644
 +    read_scalar<GateLogits>(noc, delta_time, delta_time_cb, scalar_page, scalar_row, scalar_column);
 +    read_scalar<uint32_t>(noc, a_log, a_log_cb, head / 32, 0, scalar_column);
 +    read_scalar<uint32_t>(noc, dt_bias, dt_bias_cb, head / 32, 0, scalar_column);
-+    noc.async_write_zeros(key_transposed_cb, kt * tile_bytes);
 +    noc.async_read_barrier();
 +    noc.write_zeros_l1_barrier();
 +    state_cb.push_back(state_tiles);
-+    for (uint32_t tile = 0; tile < kt; ++tile) {
-+        transpose_row_tile(
-+            query_cb.get_write_ptr() + tile * tile_bytes,
-+            query_transposed_cb.get_write_ptr() + tile * tile_bytes);
-+        transpose_row_tile(
-+            key_cb.get_write_ptr() + tile * tile_bytes,
-+            key_transposed_cb.get_write_ptr() + tile * tile_bytes);
-+    }
-+    query_transposed_cb.push_back(kt);
 +    query_cb.push_back(kt);
 +    key_cb.push_back(kt);
-+    key_transposed_cb.push_back(kt);
 +    value_cb.push_back(vt);
 +    make_scalar_tile<GateLogits>(noc, beta_logits_cb, scalar_row, scalar_column);
 +    beta_logits_cb.push_back(1);
@@ -1430,7 +1475,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_dec
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/gated_delta_decode.cpp
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,277 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1593,7 +1638,6 @@ new file mode 100644
 +    make_cb(4, 1);            // delta time
 +    make_cb(5, 1);            // beta logits
 +    make_cb(6, state_tiles);  // decayed state
-+    make_cb(7, kt);           // transposed query
 +    make_cb(9, kt);           // transposed key
 +    make_cb(10, worker_vt);   // scaled delta
 +    make_cb(11, state_tiles); // updated state
