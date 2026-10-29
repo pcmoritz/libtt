@@ -17,52 +17,26 @@ diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/
 diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
 --- a/pjrt_implementation/src/api/buffer_instance.cc
 +++ b/pjrt_implementation/src/api/buffer_instance.cc
-@@ -537,6 +537,18 @@
-           getDataType(), getDimensionsRaw(), getNumberOfDimensions(),
-           dst_device, dst_memory);
+@@ -359,6 +359,15 @@
+   DLOG_F(LOG_DEBUG, "BufferInstance::copyFromBuffer");
+   TT_FATAL(src_buffer->getPjrtTensor(), "Source buffer has no data.");
  
 +  // A buffer of one device holding the same data on every chip is copied on
 +  // the device, without a transfer through the host or a wait for the device.
-+  PjrtTensorRef &source = getPjrtTensor();
-+  if (source && source->on_every_chip()) {
++  if (src_buffer->getPjrtTensor()->on_every_chip()) {
 +    PjrtTensor::from_runtime_tensor(
-+        {dst_buffer_instance.get()},
-+        tt::runtime::cloneTensor(source->runtime_tensor()));
-+    dst_buffer_instance->markAsDataReady();
-+    *dst_buffer = dst_buffer_instance.release();
-+    return tt_pjrt_status::kSuccess;
++        {this}, tt::runtime::cloneTensor(src_buffer->runtimeTensor()));
++    markAsDataReady();
++    return;
 +  }
 +
-   dst_buffer_instance->copyFromBuffer(this);
- 
-   *dst_buffer = dst_buffer_instance.release();
+   ::tt::target::DataType runtime_data_type =
+       tt::pjrt::data_type_utils::convertPJRTToRuntimeDataType(
+           src_buffer->m_data_type);
 diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api/tensor.cc
 --- a/pjrt_implementation/src/api/tensor.cc
 +++ b/pjrt_implementation/src/api/tensor.cc
-@@ -11,6 +11,7 @@
- #include "api/tensor.h"
- 
- // c++ standard library includes
-+#include <algorithm>
- #include <memory>
- #include <optional>
- #include <unordered_map>
-@@ -45,10 +46,26 @@
-   if (have_same_tensor(shards))
-     return from_shards(shards);
- 
-+  // Buffers of one device that each hold their data on every chip, such as
-+  // copies of a program over one device's result, already make a replicated
-+  // input.
-+  if (strategy.at("strategy") == "replicate" &&
-+      std::all_of(shards.begin(), shards.end(), [](BufferInstance *shard) {
-+        return shard->getPjrtTensor()->on_every_chip();
-+      })) {
-+    return from_runtime_tensor(shards,
-+                               shards.front()->getPjrtTensor()->runtime_tensor());
-+  }
-+
-   return from_runtime_tensor(
+@@ -49,6 +49,11 @@
        shards, rt_tensor_from_strategy(shards, strategy, mesh_shape));
  }
  
@@ -74,3 +48,20 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
  // Creates new pjrt tensor for provided shards from an existing runtime tensor.
  PjrtTensor &
  PjrtTensor::from_runtime_tensor(std::vector<BufferInstance *> shards,
+@@ -231,6 +236,16 @@
+     const std::unordered_map<std::string, std::string> &strategy,
+     const std::vector<std::uint32_t> &mesh_shape) {
+ 
++  // Buffers of one device that each hold their data on every chip, such as
++  // copies of a program over one device's result, already make a replicated
++  // input.
++  if (strategy.at("strategy") == "replicate" &&
++      std::all_of(shards.begin(), shards.end(), [](BufferInstance *shard) {
++        return shard->getPjrtTensor()->on_every_chip();
++      })) {
++    return shards.front()->runtimeTensor();
++  }
++
+   // Device tensors among the shards, such as results of programs over one
+   // device, come through the host.
+   for (BufferInstance *shard : shards) {
