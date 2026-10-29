@@ -1,14 +1,15 @@
 diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/tensor.h
 --- a/pjrt_implementation/inc/api/tensor.h
 +++ b/pjrt_implementation/inc/api/tensor.h
-@@ -135,6 +135,12 @@
+@@ -135,6 +135,13 @@
    // Moves pjrt tensor to host.
    void move_to_host() noexcept;
  
 +  // Whether this is a buffer of one device holding the same data on every chip
 +  // of the mesh in use (LoadedExecutableInstance::getOrCreateMeshDevice).
-+  // Copies of it to other devices are made on the device, and a replicated
-+  // input made of such copies takes the first one's runtime tensor.
++  // Copies of it to other devices are made on the device, a replicated input
++  // whose first shard is one takes its runtime tensor, and moving it to the
++  // host reads one chip.
 +  bool on_every_chip() const;
 +
  private:
@@ -33,6 +34,47 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
    ::tt::target::DataType runtime_data_type =
        tt::pjrt::data_type_utils::convertPJRTToRuntimeDataType(
            src_buffer->m_data_type);
+@@ -699,9 +708,17 @@
+   DeviceInstance *dst_device = DeviceInstance::unwrap(args->dst_device);
+   MemoryInstance *dst_memory = dst_device->getDefaultMemory();
+ 
+-  tt_pjrt_status status = src_buffer->copyToDeviceMemory(
+-      dst_device, dst_memory,
+-      reinterpret_cast<BufferInstance **>(&args->dst_buffer));
++  // A copy can fail with an exception, e.g. when the device runs out of memory
++  // for an on-device copy. It must not escape the C API.
++  tt_pjrt_status status;
++  try {
++    status = src_buffer->copyToDeviceMemory(
++        dst_device, dst_memory,
++        reinterpret_cast<BufferInstance **>(&args->dst_buffer));
++  } catch (const std::exception &error) {
++    return *ErrorInstance::makeError(tt_pjrt_status::kInternal, error.what())
++                .release();
++  }
+   if (auto error = ErrorInstance::makeError(status)) {
+     return *error.release();
+   }
+@@ -723,9 +740,16 @@
+     return *ErrorInstance::makeError(tt_pjrt_status::kUnimplemented).release();
+   }
+ 
+-  tt_pjrt_status status = src_buffer->copyToDeviceMemory(
+-      dst_device, dst_memory,
+-      reinterpret_cast<BufferInstance **>(&args->dst_buffer));
++  // As in onBufferCopyToDevice, a failed copy must not escape the C API.
++  tt_pjrt_status status;
++  try {
++    status = src_buffer->copyToDeviceMemory(
++        dst_device, dst_memory,
++        reinterpret_cast<BufferInstance **>(&args->dst_buffer));
++  } catch (const std::exception &error) {
++    return *ErrorInstance::makeError(tt_pjrt_status::kInternal, error.what())
++                .release();
++  }
+   if (auto error = ErrorInstance::makeError(status)) {
+     return *error.release();
+   }
 diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api/tensor.cc
 --- a/pjrt_implementation/src/api/tensor.cc
 +++ b/pjrt_implementation/src/api/tensor.cc
@@ -48,17 +90,25 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
  // Creates new pjrt tensor for provided shards from an existing runtime tensor.
  PjrtTensor &
  PjrtTensor::from_runtime_tensor(std::vector<BufferInstance *> shards,
-@@ -231,6 +236,16 @@
+@@ -156,8 +161,7 @@
+ 
+   // A buffer of one device holds the same data on every chip of the mesh
+   // (LoadedExecutableInstance::getOrCreateMeshDevice); one chip's is read.
+-  if (m_shards.size() == 1 &&
+-      tt::runtime::detail::getNumShards(*m_runtime_tensor) > 1) {
++  if (on_every_chip()) {
+     m_runtime_tensor = tt::runtime::getDeviceTensors(*m_runtime_tensor)[0];
+   }
+ 
+@@ -231,6 +235,14 @@
      const std::unordered_map<std::string, std::string> &strategy,
      const std::vector<std::uint32_t> &mesh_shape) {
  
-+  // Buffers of one device that each hold their data on every chip, such as
-+  // copies of a program over one device's result, already make a replicated
-+  // input.
++  // The replicas of a replicated input hold the same values, so a buffer of
++  // one device holding its data on every chip, such as a copy of a program
++  // over one device's result, already makes the input.
 +  if (strategy.at("strategy") == "replicate" &&
-+      std::all_of(shards.begin(), shards.end(), [](BufferInstance *shard) {
-+        return shard->getPjrtTensor()->on_every_chip();
-+      })) {
++      shards.front()->getPjrtTensor()->on_every_chip()) {
 +    return shards.front()->runtimeTensor();
 +  }
 +

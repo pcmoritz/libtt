@@ -41,6 +41,12 @@ def test_copies_of_one_device_results(mesh):
         moved = jax.device_put(made, replicated)
         for shard in moved.addressable_shards:
             np.testing.assert_allclose(np.asarray(shard.data), np.arange(4) + k)
+        np.testing.assert_allclose(np.asarray(scale(x, moved)), np.asarray(x) * (np.arange(4) + k))
+        # A replicated input whose first shard holds its data on every chip and
+        # whose other shards are host data.
+        others = [jax.device_put(np.arange(4, dtype=np.float32) + k, d) for d in mesh.devices.flat[1:]]
+        mixed = jax.make_array_from_single_device_arrays((4,), replicated, [made, *others])
+        np.testing.assert_allclose(np.asarray(scale(x, mixed)), np.asarray(x) * (np.arange(4) + k))
         on_last = jax.device_put(made, mesh.devices.flat[-1])
         np.testing.assert_allclose(np.asarray(on_last), np.arange(4) + k)
     # A replicated whole-mesh result copied to one device.
@@ -102,9 +108,37 @@ def test_copies_do_not_wait_for_the_device(mesh):
     np.asarray(long(v)[0, 0])
     run = time.monotonic() - start
     out = long(v)
-    s = two()
     start = time.monotonic()
-    use(out, s)
+    s = two()
+    used = use(out, s)
     queued = time.monotonic() - start
-    np.asarray(out[0, 0])
+    np.testing.assert_allclose(np.asarray(used[0, 0]), 2 * np.asarray(out[0, 0]))
     assert queued < run / 2, f"queueing took {queued * 1e3:.1f} ms behind a {run * 1e3:.1f} ms program"
+
+
+def test_copies_that_fail_raise(mesh):
+    """A copy can fail, here for want of device memory, and returns its error
+    through PJRT: JAX raises a JaxRuntimeError rather than the plugin's own
+    exception passing through the C API."""
+    device, other = mesh.devices.flat[0], mesh.devices.flat[1]
+    x = jax.device_put(np.ones((mesh.devices.size, 4), np.float32), NamedSharding(mesh, P("x")))
+    step = jax.jit(lambda a: a + 1)
+    # n GiB on every chip.
+    fill = jax.jit(lambda s, n: jnp.broadcast_to(s, (4 * n, 8192, 8192)), static_argnums=1)
+    s = jax.device_put(np.float32(0.5), device)
+    for _ in range(2):
+        np.asarray(step(x))
+        jax.block_until_ready(fill(s, 4))
+        jax.block_until_ready(fill(s, 1))
+    np.asarray(step(x))
+
+    big = fill(s, 4)
+    held = []
+    with pytest.raises(Exception, match="Out of Memory"):
+        for _ in range(64):
+            held.append(fill(s, 1))
+    with pytest.raises(jax.errors.JaxRuntimeError, match="Out of Memory"):
+        jax.device_put(big, other)
+    del held, big
+    np.testing.assert_allclose(np.asarray(jax.device_put(s, other)), 0.5)
+    np.testing.assert_allclose(np.asarray(step(x)), 2.0)
