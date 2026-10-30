@@ -490,6 +490,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_execute_exceptions.patch",
         "//third_party/tt_xla:tt_xla_one_chip_on_mesh.patch",
         "//third_party/tt_xla:tt_xla_clone_one_device_copies.patch",
+        "//third_party/tt_xla:tt_xla_copy_to_host_in_stream_order.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -673,6 +674,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_untilize_readback_on_device.patch",
         "//third_party/tt_xla:tt_mlir_aliased_custom_call_local_types.patch",
         "//third_party/tt_xla:tt_mlir_reshard_host_layouts.patch",
+        "//third_party/tt_xla:tt_mlir_to_host_read_event.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
