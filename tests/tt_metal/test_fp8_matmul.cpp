@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <tt-metalium/distributed.hpp>
+#include <tt-metalium/float8.hpp>
 #include <tt-metalium/mesh_device.hpp>
 #include <tt-metalium/tensor/tensor_apis.hpp>
 
