@@ -797,7 +797,9 @@ new file mode 100644
 +    pack_tile(0, decay, 0);
 +    tile_regs_release();
 +    cb_push_back(decay, 1);
++    cb_pop_front(a_log, 1);
 +    cb_pop_front(delta_time, 1);
++    cb_pop_front(dt_bias, 1);
 +
 +    // state_mid = decay * state
 +    mul_tiles_bcast_scalar_init_short(state_in, decay);
@@ -929,8 +931,6 @@ new file mode 100644
 +    cb_pop_front(key_factor, 1);
 +    cb_pop_front(query_factor, 1);
 +    }
-+    cb_pop_front(a_log, 1);
-+    cb_pop_front(dt_bias, 1);
 +    }
 +}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
@@ -1159,7 +1159,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,205 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1344,12 +1344,8 @@ new file mode 100644
 +    const uint32_t scalar_column = head % 32;
 +    read_scalar<GateLogits>(noc, beta_logits, beta_logits_cb, scalar_page, scalar_row, scalar_column);
 +    read_scalar<GateLogits>(noc, delta_time, delta_time_cb, scalar_page, scalar_row, scalar_column);
-+    // A_log and dt_bias are the same for every step: one tile each, which the
-+    // compute kernel pops after the last step.
-+    if (token == 0) {
-+        read_scalar<uint32_t>(noc, a_log, a_log_cb, head / 32, 0, scalar_column);
-+        read_scalar<uint32_t>(noc, dt_bias, dt_bias_cb, head / 32, 0, scalar_column);
-+    }
++    read_scalar<uint32_t>(noc, a_log, a_log_cb, head / 32, 0, scalar_column);
++    read_scalar<uint32_t>(noc, dt_bias, dt_bias_cb, head / 32, 0, scalar_column);
 +    noc.async_read_barrier();
 +    noc.write_zeros_l1_barrier();
 +    if (token == 0) {
@@ -1362,12 +1358,10 @@ new file mode 100644
 +    beta_logits_cb.push_back(1);
 +    make_scalar_tile<GateLogits>(noc, delta_time_cb, scalar_row, scalar_column);
 +    delta_time_cb.push_back(1);
-+    if (token == 0) {
-+        make_scalar_tile<uint32_t>(noc, a_log_cb, 0, scalar_column);
-+        a_log_cb.push_back(1);
-+        make_scalar_tile<uint32_t>(noc, dt_bias_cb, 0, scalar_column);
-+        dt_bias_cb.push_back(1);
-+    }
++    make_scalar_tile<uint32_t>(noc, a_log_cb, 0, scalar_column);
++    a_log_cb.push_back(1);
++    make_scalar_tile<uint32_t>(noc, dt_bias_cb, 0, scalar_column);
++    dt_bias_cb.push_back(1);
 +    }
 +    }
 +}
