@@ -15,6 +15,7 @@ from jax._src.lib.mlir.dialects import hlo
 from jax.extend.core import Primitive
 from jax.interpreters import mlir
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
 import ml_dtypes
 import numpy as np
 import pytest
@@ -155,6 +156,67 @@ def test_custom_call_top_k_compares_values(dtype):
     expected = np.argsort(-x.astype(np.float32), axis=1)[:, :8]
     np.testing.assert_array_equal(indices, expected)
     assert_same_bits(values, np.take_along_axis(x, expected, axis=1))
+
+
+@pytest.mark.parametrize("dtype", FORMATS)
+def test_control_flow_carries_float8(dtype):
+    """cond, switch and while loops carry every float8 code as it is, and a loop body runs native
+    float8 matmuls on its carry."""
+    codes = all_codes(dtype)
+
+    def f(flag, x):
+        x = jax.lax.cond(flag, lambda x: x[::-1], lambda x: x, x)
+        x = jax.lax.switch(1, [lambda x: x, lambda x: x.T], x)
+        return jax.lax.fori_loop(0, 3, lambda i, x: x[:, ::-1].T, x)
+
+    flag = np.array(True)
+    assert_same_bits(jax.jit(f)(flag, codes), jax.jit(f, backend="cpu")(flag, codes))
+
+    w = random_float8((64, 64), dtype, np.random.default_rng(4))
+    step = lambda i, c: (c[0][::-1], c[1] + jnp.dot(c[0], c[0], preferred_element_type=jnp.float32))
+    product = jax.jit(
+        lambda w: jax.lax.fori_loop(0, 3, step, (w, jnp.zeros((64, 64), jnp.float32)))[1]
+    )(w)
+    w64 = flush_subnormals(w).astype(np.float64)
+    expected = 2 * (w64 @ w64) + w64[::-1] @ w64[::-1]
+    scale = 2 * (np.abs(w64) @ np.abs(w64)) + np.abs(w64[::-1]) @ np.abs(w64[::-1])
+    assert np.max(np.abs(product - expected) / np.maximum(scale, 1e-30)) < 2.0**-9
+
+
+@pytest.mark.parametrize("dtype", FORMATS)
+def test_reductions_sorts_and_scatters_compare_values(dtype):
+    """Ops whose regions compute (reduce, sort, scatter) compare and select values, not their
+    bits: a negative value's code is the larger one."""
+    codes = np.concatenate([np.arange(0x30, 0x50), np.arange(0xB0, 0xD0)]).astype(np.uint8)
+    x = np.random.default_rng(6).permuted(np.tile(codes, (4, 1)), axis=1).view(dtype)
+    f = lambda x: (
+        jnp.max(x, axis=1),
+        jnp.min(x, axis=0),
+        jnp.argmax(x, axis=1),
+        jnp.sort(x, axis=1),
+        jax.lax.top_k(x, 4)[0],
+        x.at[1].set(x[2]),
+    )
+    for actual, expected in zip(jax.jit(f)(x), jax.jit(f, backend="cpu")(x)):
+        assert_same_bits(actual, expected)
+
+
+@pytest.mark.parametrize("to_sharded", [True, False])
+@pytest.mark.parametrize("dtype", FORMATS)
+def test_float8_reshards(dtype, to_sharded):
+    """Shardy's reshards move the bits: slicing a replicated value (an sdy.all_slice composite,
+    legalized into ttir.mesh_partition) and gathering the shards of a sharded one."""
+    devices = jax.devices("tt")
+    if len(devices) < 2:
+        pytest.skip("needs at least two devices")
+    mesh = jax.make_mesh((len(devices),), ("x",), devices=devices)
+    replicated, rows = NamedSharding(mesh, P()), NamedSharding(mesh, P("x"))
+    source, target = (replicated, rows) if to_sharded else (rows, replicated)
+    codes = np.tile(all_codes(dtype), (len(devices), 1))
+    moved = jax.jit(lambda x: x[:, ::-1], in_shardings=source, out_shardings=target)(
+        jax.device_put(codes, source)
+    )
+    assert_same_bits(moved, codes[:, ::-1])
 
 
 def random_float8(shape, dtype, rng):
