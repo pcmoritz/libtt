@@ -1,0 +1,101 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/ttnn.h b/runtime/include/tt/runtime/detail/ttnn/ttnn.h
+--- a/runtime/include/tt/runtime/detail/ttnn/ttnn.h
++++ b/runtime/include/tt/runtime/detail/ttnn/ttnn.h
+@@ -108,6 +108,10 @@
+ ::tt::runtime::Tensor
+ createUnsafeBorrowedHostTensor(::tt::runtime::Tensor ownedHostTensor);
+ 
++std::optional<::tt::runtime::Tensor>
++permuteHostTensor(::tt::runtime::Tensor tensor,
++                  const std::vector<std::int64_t> &permutation);
++
+ // Creates multi-device host tensor with owned storage (buffers of the tensor
+ // are on the host and their allocation/deallocation is owned by this tensor
+ // instance).
+diff --git a/runtime/include/tt/runtime/runtime.h b/runtime/include/tt/runtime/runtime.h
+--- a/runtime/include/tt/runtime/runtime.h
++++ b/runtime/include/tt/runtime/runtime.h
+@@ -75,6 +75,12 @@
+ // TTNN device runtime; other runtimes report not implemented.
+ Tensor createUnsafeBorrowedHostTensor(Tensor ownedHostTensor);
+ 
++// Copies a single-device host tensor with its dimensions permuted (dimension i
++// of the result is dimension permutation[i] of `tensor`) into an owned host
++// tensor. Returns nullopt for any other tensor.
++std::optional<Tensor>
++permuteHostTensor(Tensor tensor, const std::vector<std::int64_t> &permutation);
++
+ // Creates multi-device host tensor with owned storage (buffers of the tensor
+ // are on the host and their allocation/deallocation is owned by this tensor
+ // instance).
+diff --git a/runtime/lib/runtime.cpp b/runtime/lib/runtime.cpp
+--- a/runtime/lib/runtime.cpp
++++ b/runtime/lib/runtime.cpp
+@@ -359,6 +359,19 @@
+       });
+ }
+ 
++std::optional<Tensor>
++permuteHostTensor(Tensor tensor, const std::vector<std::int64_t> &permutation) {
++  using RetType = std::optional<Tensor>;
++  return DISPATCH_TO_CURRENT_RUNTIME(
++      RetType,
++      [&]() -> RetType {
++        return ::tt::runtime::ttnn::permuteHostTensor(std::move(tensor),
++                                                      permutation);
++      },
++      [&]() -> RetType { return std::nullopt; },
++      [&]() -> RetType { return std::nullopt; });
++}
++
+ Tensor createMultiDeviceHostTensor(
+     const std::vector<const void *> &data,
+     const std::vector<std::uint32_t> &shape,
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -580,6 +580,44 @@
+                                   desc.elementSize(), desc.dataType);
+ }
+ 
++std::optional<::tt::runtime::Tensor>
++permuteHostTensor(::tt::runtime::Tensor tensor,
++                  const std::vector<std::int64_t> &permutation) {
++  const ::ttnn::Tensor &ttnnTensor =
++      utils::getTTNNTensorFromRuntimeTensor(tensor);
++  if (!utils::isOnHost(ttnnTensor.storage_type()) ||
++      ttnnTensor.layout() != ::ttnn::Layout::ROW_MAJOR) {
++    return std::nullopt;
++  }
++  std::vector<::ttnn::Tensor> hostShards =
++      ::ttnn::distributed::get_device_tensors(ttnnTensor);
++  const TensorDesc desc = getTensorDesc(tensor);
++  if (hostShards.size() != 1 || permutation.size() != desc.shape.size()) {
++    return std::nullopt;
++  }
++
++  // The caller's memory a strided view stands for, or the tensor's buffer.
++  const StridedHostView *view = nullptr;
++  ttnnTensor.host_storage().host_tensor().buffer().apply(
++      [&](const ::tt::tt_metal::HostBuffer &shard) {
++        view = findStridedHostView(shard);
++      });
++  const void *data =
++      view ? view->data : utils::getRawHostDataPtr(hostShards.front());
++  const std::vector<std::int64_t> &stride = view ? view->stride : desc.stride;
++
++  std::vector<std::uint32_t> shape(permutation.size());
++  std::vector<std::int64_t> permutedStride(permutation.size());
++  for (size_t i = 0; i < permutation.size(); ++i) {
++    shape[i] = desc.shape[permutation[i]];
++    permutedStride[i] = stride[permutation[i]];
++  }
++  // A permuted view is not contiguous: the copy gathers it, transposing
++  // 16-bit matrices in 8x8 blocks.
++  return createOwnedHostTensor(data, shape, permutedStride, desc.elementSize(),
++                               desc.dataType);
++}
++
+ ::tt::runtime::Tensor
+ createOwnedHostTensor(const void *data, const std::vector<std::uint32_t> &shape,
+                       const std::vector<std::int64_t> &stride,

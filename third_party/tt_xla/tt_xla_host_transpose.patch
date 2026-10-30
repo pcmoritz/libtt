@@ -1,0 +1,215 @@
+diff --git a/pjrt_implementation/inc/api/executable_image.h b/pjrt_implementation/inc/api/executable_image.h
+--- a/pjrt_implementation/inc/api/executable_image.h
++++ b/pjrt_implementation/inc/api/executable_image.h
+@@ -81,6 +81,17 @@
+     m_donatable_input_indices = std::move(indices);
+   }
+ 
++  // For a program that only transposes its argument on each device, the
++  // permutation; such a program runs on the host when the argument is in host
++  // memory (FlatbufferLoadedExecutableInstance::transposeOnHost).
++  const std::optional<std::vector<int64_t>> &getArgumentTranspose() const {
++    return m_argument_transpose;
++  }
++
++  void setArgumentTranspose(std::optional<std::vector<int64_t>> permutation) {
++    m_argument_transpose = std::move(permutation);
++  }
++
+   // Returns the vector of output data types.
+   std::vector<PJRT_Buffer_Type> &getOutputTypes() { return m_output_types; }
+ 
+@@ -212,6 +223,9 @@
+   // Input indices carrying JAX's tf.aliasing_output attribute.
+   std::vector<size_t> m_donatable_input_indices;
+ 
++  // See getArgumentTranspose().
++  std::optional<std::vector<int64_t>> m_argument_transpose;
++
+   // Holds data type for each output buffer.
+   std::vector<PJRT_Buffer_Type> m_output_types;
+ 
+diff --git a/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h b/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h
+--- a/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h
++++ b/pjrt_implementation/inc/api/flatbuffer_loaded_executable_instance.h
+@@ -48,6 +48,12 @@
+   tt_pjrt_status execute(PJRT_LoadedExecutable_Execute_Args *args) override;
+ 
+ private:
++  // Runs a program that only transposes its argument on the host when every
++  // shard of the argument is a host tensor, and fills the outputs with the
++  // transposed host tensors, as if the caller had put them. Returns whether it
++  // did; otherwise the program runs on the devices.
++  bool transposeOnHost(PJRT_LoadedExecutable_Execute_Args *args);
++
+   // Returns an input tensor constructed from the provided buffer instances,
+   // prepared for execution. If we cannot reuse the already prepared tensor
+   // contained within the buffer instances, this will involve calling
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -183,6 +183,65 @@
+ }
+ 
+ // TODO(mrakita): Make this method work in asynchronous fashion.
++// Signals the caller's per-device completion events: execution is synchronous.
++static void signalDeviceCompletion(PJRT_LoadedExecutable_Execute_Args *args) {
++  if (!args->device_complete_events) {
++    return;
++  }
++  for (int device_num = 0; device_num < args->num_devices; ++device_num) {
++    std::unique_ptr<EventInstance> device_complete_event =
++        EventInstance::createInstance();
++    EventInstance::markAsReadyAndCallback(device_complete_event.get(),
++                                          tt_pjrt_status::kSuccess);
++
++    // Releasing the ownership to the PJRT API caller since the caller is
++    // responsible for calling `PJRT_Event_Destroy` on the event.
++    args->device_complete_events[device_num] = *device_complete_event.release();
++  }
++}
++
++bool FlatbufferLoadedExecutableInstance::transposeOnHost(
++    PJRT_LoadedExecutable_Execute_Args *args) {
++  const std::optional<std::vector<int64_t>> &permutation =
++      m_executable_image->getArgumentTranspose();
++  if (!permutation) {
++    return false;
++  }
++  std::vector<tt::runtime::Tensor> transposed;
++  for (size_t device = 0; device < args->num_devices; ++device) {
++    const PjrtTensorRef &tensor =
++        BufferInstance::unwrap(args->argument_lists[device][0])
++            ->getPjrtTensor();
++    if (!tensor || !tensor->has_runtime_tensor() ||
++        tensor->shards().size() != 1) {
++      return false;
++    }
++    std::optional<tt::runtime::Tensor> result =
++        tt::runtime::permuteHostTensor(tensor->runtime_tensor(), *permutation);
++    if (!result) {
++      return false;
++    }
++    transposed.push_back(std::move(*result));
++  }
++
++  std::optional<std::vector<std::uint32_t>> shape = getOutputShape(0);
++  if (!shape) {
++    return false;
++  }
++  for (size_t device = 0; device < args->num_devices; ++device) {
++    std::unique_ptr<BufferInstance> output =
++        BufferInstance::createOutputBufferInstance(
++            std::vector<std::uint32_t>(*shape), m_addressable_devices[device],
++            m_addressable_devices[device]->getDefaultMemory(),
++            m_executable_image->getOutputTypes()[0], device);
++    output->markAsDataReady();
++    PjrtTensor::from_runtime_tensor({output.get()},
++                                    std::move(transposed[device]));
++    args->output_lists[device][0] = *output.release();
++  }
++  return true;
++}
++
+ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+     PJRT_LoadedExecutable_Execute_Args *args) {
+   ZoneScoped;
+@@ -207,6 +266,14 @@
+     return status;
+   }
+ 
++  // A transpose of host data stays on the host, e.g. a checkpoint weight being
++  // rearranged while it is loaded, which keeps it out of device memory.
++  if (transposeOnHost(args)) {
++    invalidateDonatedInputs(args, donated_indices);
++    signalDeviceCompletion(args);
++    return tt_pjrt_status::kSuccess;
++  }
++
+   std::optional<tt::runtime::Device> runtime_device =
+       getOrCreateMeshDevice(args->argument_lists, args->num_args,
+                             args->num_devices, args->execute_device,
+@@ -282,21 +349,7 @@
+   }
+ 
+   invalidateDonatedInputs(args, donated_indices);
+-
+-  if (args->device_complete_events) {
+-    for (int device_num = 0; device_num < args->num_devices; ++device_num) {
+-      std::unique_ptr<EventInstance> device_complete_event =
+-          EventInstance::createInstance();
+-      EventInstance::markAsReadyAndCallback(device_complete_event.get(),
+-                                            tt_pjrt_status::kSuccess);
+-
+-      // Releasing the ownership to the PJRT API caller since the caller is
+-      // responsible for calling `PJRT_Event_Destroy` on the event.
+-      args->device_complete_events[device_num] =
+-          *device_complete_event.release();
+-    }
+-  }
+-
++  signalDeviceCompletion(args);
+   return tt_pjrt_status::kSuccess;
+ }
+ 
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -128,6 +128,40 @@
+ 
+ // Collects inputs JAX marked for input/output aliasing. Only input indices are
+ // needed here to invalidate consumed buffers after successful execution.
++// The permutation of a partitioned program whose only work is transposing its
++// argument: one argument, one result, and one stablehlo.transpose of the
++// argument (in a manual computation or not) that is returned. Without other
++// ops there are no collectives, so each device transposes its own shard.
++static std::optional<std::vector<int64_t>>
++collectArgumentTranspose(mlir::ModuleOp module) {
++  std::optional<std::vector<int64_t>> permutation;
++  bool other = false;
++  size_t num_funcs = 0;
++  module.walk([&](mlir::Operation *op) {
++    if (mlir::isa<mlir::ModuleOp, mlir::sdy::MeshOp, mlir::func::ReturnOp,
++                  mlir::sdy::ManualComputationOp, mlir::sdy::ReturnOp>(op)) {
++      return;
++    }
++    if (auto func = mlir::dyn_cast<mlir::func::FuncOp>(op)) {
++      other |= ++num_funcs > 1 || func.getNumArguments() != 1 ||
++               func.getNumResults() != 1;
++      return;
++    }
++    auto transpose = mlir::dyn_cast<mlir::stablehlo::TransposeOp>(op);
++    if (!transpose || permutation ||
++        !mlir::isa<mlir::BlockArgument>(transpose.getOperand()) ||
++        !transpose->hasOneUse() ||
++        !mlir::isa<mlir::func::ReturnOp, mlir::sdy::ReturnOp>(
++            *transpose->user_begin())) {
++      other = true;
++      return;
++    }
++    llvm::ArrayRef<int64_t> dims = transpose.getPermutation();
++    permutation.emplace(dims.begin(), dims.end());
++  });
++  return other ? std::nullopt : permutation;
++}
++
+ static std::vector<size_t> collectDonatableInputIndices(
+     const mlir::OwningOpRef<mlir::ModuleOp> &module) {
+   std::vector<size_t> indices;
+@@ -519,6 +553,8 @@
+   if (!tt_pjrt_status_is_ok(status)) {
+     return {status, nullptr};
+   }
++  std::optional<std::vector<int64_t>> argument_transpose =
++      collectArgumentTranspose(mlir_module.get());
+ 
+   // Sanitize the module for XLA ingestion operating on a clone of the base
+   // module.
+@@ -624,6 +660,7 @@
+   if (std::get<1>(result)) {
+     std::get<1>(result)->setDonatableInputIndices(
+         std::move(donatable_input_indices));
++    std::get<1>(result)->setArgumentTranspose(std::move(argument_transpose));
+   }
+   return result;
+ }
