@@ -22,8 +22,8 @@ def _bfp8(weights):
         # A residual add fuses into the matmul as a bias.
         (1, 1024, 5120, True, False, "bfp_bf8"),
         (4, 1024, 5120, True, False, "bfp_bf8"),
-        # LM heads keep the embedding layout, [width, inner_size]; the kernel
-        # reads it transposed, with or without a bias.
+        # LM heads keep the embedding layout, [width, inner_size], which
+        # const-eval transposes once, with or without a bias.
         (1, 1024, 5120, False, True, "bfp_bf8"),
         (4, 1024, 5120, False, True, "bfp_bf8"),
         (1, 1024, 5120, True, True, "bfp_bf8"),
@@ -134,3 +134,26 @@ def test_transposed_weight_is_read_in_place(tmp_path):
     assert irs, "no IR was exported"
     assert any("transpose_b = true" in ir for ir in irs), "the matmul does not carry the transpose"
     assert not any("ttnn.permute" in ir or "ttnn.transpose" in ir for ir in irs), "a transpose was materialized"
+
+
+def test_transposed_parameter_is_transposed_once(tmp_path):
+    """A parameter weight in the embedding layout, as an LM head's, is
+    transposed once by const-eval: the decode kernel reads an untransposed
+    weight faster than a transposed one (a 248320-token LM head on four chips,
+    5120 x 62080 per chip: 695 vs 930 us)."""
+
+    def project(x, weights):
+        return x @ _bfp8(weights).T
+
+    run = jax.jit(project, compiler_options={"optimization_level": "O1", "export_path": str(tmp_path)})
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(13)
+    x = (rng.integers(-4, 5, (1, 1024)) / 16).astype(jnp.bfloat16)
+    weights = (rng.integers(-4, 5, (5120, 1024)) / 16).astype(jnp.bfloat16)
+    actual = run(*(jax.device_put(v, device) for v in (x, weights)))
+    expected = x.astype(np.float32) @ weights.astype(np.float32).T
+    np.testing.assert_allclose(np.asarray(actual).astype(np.float32), expected, atol=1 / 64, rtol=1 / 128)
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_runtime*.mlir")]
+    matmuls = [line for ir in irs for line in ir.splitlines() if '"ttnn.matmul"' in line]
+    assert matmuls, "no matmul in the exported IR"
+    assert all("transpose_b = false" in line for line in matmuls), matmuls
