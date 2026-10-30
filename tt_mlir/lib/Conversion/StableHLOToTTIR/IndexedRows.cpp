@@ -138,7 +138,9 @@ struct Canonical {
 // component region spans the first to the last dimension that is indexed or
 // partially covered; a Free dimension inside it becomes a zero component. The
 // operand keeps its order when its batching dimensions, if any, are exactly the
-// dimensions before that region; otherwise it is permuted to [Batch, Indexed
+// dimensions before that region, apart from size-1 dimensions, which sit
+// anywhere without moving data (unless nothing is indexed: then the last
+// dimension is the row); otherwise it is permuted to [Batch, Indexed
 // and partial Free, full Free].
 Canonical canonicalize(ArrayRef<OperandDim> operandDims) {
   const int64_t rank = operandDims.size();
@@ -159,10 +161,12 @@ Canonical canonicalize(ArrayRef<OperandDim> operandDims) {
   for (int64_t d = 0; d < rank; ++d) {
     bool leading = d < regionStart;
     bool isBatch = operandDims[d].kind == DimKind::Batch;
+    bool unit = regionEnd >= 0 && operandDims[d].kind == DimKind::Free &&
+                operandDims[d].size == 1;
     if (isBatch && !leading) {
       natural = false;
     }
-    if (hasBatch && leading && !isBatch) {
+    if (hasBatch && leading && !isBatch && !unit) {
       natural = false;
     }
   }
@@ -645,11 +649,12 @@ public:
         return rewriter.notifyMatchFailure(srcOp, "result rank mismatch");
       }
       int64_t d = indexDims[next++];
-      if (auto *it = llvm::find(layout.batchDims, d);
-          it != layout.batchDims.end()) {
-        // The table batch dims are the operand batching dims in order, and
-        // layout.batchDims pairs with them in that same order.
-        permutation[position] = r.batch[it - layout.batchDims.begin()];
+      if (auto *it = llvm::find(startIndicesBatchingDims, d);
+          it != startIndicesBatchingDims.end()) {
+        // Where the paired operand batching dim landed (the table's batch
+        // dims may also hold size-1 free dims).
+        permutation[position] = resultDimOfOperandDim(
+            operandBatchingDims[it - startIndicesBatchingDims.begin()]);
       } else {
         auto *other = llvm::find(layout.otherDims, d);
         permutation[position] = r.other[other - layout.otherDims.begin()];

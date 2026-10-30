@@ -111,6 +111,45 @@ def test_gather_with_batching_dims():
     assert_equal(got, np.take_along_axis(x, idx, axis=2))
 
 
+@pytest.mark.parametrize(
+    "shape,columns",
+    [
+        ((1, 5, 4096), 1),
+        # Size-1 axes between the batching axes, several columns per row.
+        ((1, 2, 1, 5, 4096), 3),
+    ],
+)
+def test_take_along_last_axis_with_unit_axes(tmp_path, shape, columns):
+    # Speculative sampling's draft token probabilities: JAX makes a size-1
+    # axis an offset dim rather than a batching dim. Size-1 dims move no data,
+    # so the operand keeps its order and each position reads a column of its
+    # row's page: no permute, no one-element rows.
+    rng = np.random.default_rng(13)
+    x = rng.normal(size=shape).astype(np.float32)
+    idx = rng.integers(0, shape[-1], size=shape[:-1] + (columns,)).astype(np.int32)
+    result, ir = _compile_ir(tmp_path, lambda x, i: jnp.take_along_axis(x, i, axis=-1), x, idx)
+    assert_equal(result, np.take_along_axis(x, idx, axis=-1))
+    gathers = [line for line in ir.splitlines() if '"ttnn.rows_gather"' in line]
+    assert gathers and all("column = true" in line for line in gathers), gathers
+    assert '"ttnn.permute"' not in ir
+
+
+def test_gather_batching_without_index_components():
+    # Nothing is indexed: the batching dim behind a size-1 dim must still be a
+    # table batch, with the last dim as the row.
+    x = np.arange(5, dtype=np.float32).reshape(1, 5)
+    idx = np.zeros((5, 0), np.int32)
+    numbers = jax.lax.GatherDimensionNumbers(
+        offset_dims=(0,),
+        collapsed_slice_dims=(),
+        start_index_map=(),
+        operand_batching_dims=(1,),
+        start_indices_batching_dims=(0,),
+    )
+    got = run(lambda x, i: jax.lax.gather(x, i, numbers, slice_sizes=(1, 1)), x, idx)
+    assert_equal(got, x)
+
+
 def test_gather_bool_and_wide_rows():
     rng = np.random.default_rng(8)
     mask = rng.integers(0, 2, size=(16, 40)).astype(bool)
