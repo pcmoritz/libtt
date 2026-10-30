@@ -202,7 +202,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
 new file mode 100644
 --- /dev/null
 +++ b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
-@@ -0,0 +1,413 @@
+@@ -0,0 +1,428 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -440,6 +440,16 @@ new file mode 100644
 +  }
 +};
 +
++// Custom calls that only move values, as sharding annotations do. Others, such
++// as mhlo.topk, mhlo.erf or tt.sampling, compute on them, so they decode
++// float8 operands like other ops instead of comparing or adding their bits.
++bool movesValues(mlir::stablehlo::CustomCallOp op) {
++  static constexpr StringLiteral targets[] = {
++      "Sharding", "SPMDFullToShardShape", "SPMDShardToFullShape",
++      "xla.sdy.FuncResultSharding"};
++  return llvm::is_contained(targets, op.getCallTargetName());
++}
++
 +// Ops that only move values: they move the bits.
 +template <typename OpTy>
 +class Float8BitsPassthroughPattern : public OpConversionPattern<OpTy> {
@@ -449,6 +459,11 @@ new file mode 100644
 +  LogicalResult
 +  matchAndRewrite(OpTy op, typename OpConversionPattern<OpTy>::OpAdaptor adaptor,
 +                  ConversionPatternRewriter &rewriter) const override {
++    if constexpr (std::is_same_v<OpTy, mlir::stablehlo::CustomCallOp>) {
++      if (!movesValues(op)) {
++        return failure();
++      }
++    }
 +    SmallVector<Type> resultTypes;
 +    if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
 +                                                      resultTypes))) {

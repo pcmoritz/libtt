@@ -9,6 +9,11 @@ natively on the matrix unit, which flushes subnormal operands to zero.
 """
 
 import jax
+from jax import core
+from jax._src.lib.mlir import ir
+from jax._src.lib.mlir.dialects import hlo
+from jax.extend.core import Primitive
+from jax.interpreters import mlir
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
@@ -111,6 +116,45 @@ def test_arithmetic_on_float8(dtype):
     total, larger = jax.jit(lambda x, y: (x + y, x > y))(x, y)
     assert_same_bits(total, (x.astype(np.float32) + y.astype(np.float32)).astype(dtype))
     np.testing.assert_array_equal(larger, x.astype(np.float32) > y.astype(np.float32))
+
+
+# stablehlo.custom_call @mhlo.topk, which tt-mlir lowers to ttir.topk. (JAX's lax.top_k is a
+# chlo.top_k composite of a sort instead.)
+mhlo_topk_p = Primitive("test_mhlo_topk")
+mhlo_topk_p.multiple_results = True
+mhlo_topk_p.def_abstract_eval(
+    lambda x, *, k: (
+        core.ShapedArray(x.shape[:-1] + (k,), x.dtype),
+        core.ShapedArray(x.shape[:-1] + (k,), np.int32),
+    )
+)
+
+
+def mhlo_topk_lowering(ctx, x, *, k):
+    op = hlo.CustomCallOp(
+        [mlir.aval_to_ir_type(ctx.module_context, aval) for aval in ctx.avals_out],
+        [x],
+        call_target_name=ir.StringAttr.get("mhlo.topk"),
+    )
+    op.attributes["mhlo.attributes"] = ir.DictAttr.get(
+        {"k": ir.IntegerAttr.get(ir.IntegerType.get_signless(64), k)}
+    )
+    return op.results
+
+
+mlir.register_lowering(mhlo_topk_p, mhlo_topk_lowering)
+
+
+@pytest.mark.parametrize("dtype", FORMATS)
+def test_custom_call_top_k_compares_values(dtype):
+    """A custom call that computes, such as mhlo.topk, gets values, not their bits: a negative
+    value's code is the larger one (-1 is 0xb8 in float8_e4m3fn, +1 is 0x38)."""
+    codes = np.concatenate([np.arange(0x30, 0x50), np.arange(0xB0, 0xD0)]).astype(np.uint8)
+    x = np.random.default_rng(5).permuted(np.tile(codes, (2, 1)), axis=1).view(dtype)
+    values, indices = jax.jit(lambda x: mhlo_topk_p.bind(x, k=8))(x)
+    expected = np.argsort(-x.astype(np.float32), axis=1)[:, :8]
+    np.testing.assert_array_equal(indices, expected)
+    assert_same_bits(values, np.take_along_axis(x, expected, axis=1))
 
 
 def random_float8(shape, dtype, rng):
