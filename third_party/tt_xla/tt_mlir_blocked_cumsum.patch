@@ -1,0 +1,117 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -4146,6 +4146,89 @@
+     return success();
+   }
+ 
++  // A forward cumulative sum along a long last dimension of FP32 values, as sums
++  // within blocks of the dimension (a matmul with a triangular matrix of ones,
++  // with FP32 sums) plus each block's offset (a short cumulative sum over the
++  // block totals). TTNN's cumulative sum walks the dimension one tile at a time:
++  // 300 ms over a vocabulary of 248K, against 4 ms in blocks. Returns null for
++  // other cumulative sums.
++  static Value blockedCumSum(ConversionPatternRewriter &rewriter, Location loc,
++                             Value input, int64_t dimension) {
++    auto type = mlir::cast<RankedTensorType>(input.getType());
++    int64_t rank = type.getRank();
++    if (dimension != rank - 1 || !type.getElementType().isF32() ||
++        type.getDimSize(dimension) < 4096) {
++      return {};
++    }
++    int64_t size = type.getDimSize(dimension);
++    int64_t block = 512;
++    while (block >= 32 && size % block != 0) {
++      block -= 32;
++    }
++    if (block < 32) {
++      return {};
++    }
++    int64_t blocks = size / block;
++
++    SmallVector<int64_t> outer(type.getShape().drop_back());
++    auto withTail = [&](ArrayRef<int64_t> tail) {
++      SmallVector<int64_t> shape(outer);
++      shape.append(tail.begin(), tail.end());
++      return RankedTensorType::get(shape, type.getElementType(),
++                                   type.getEncoding());
++    };
++    auto reshape = [&](Value value, RankedTensorType to) -> Value {
++      return rewriter.create<ttir::ReshapeOp>(
++          loc, to, value,
++          rewriter.getI32ArrayAttr(
++              llvm::to_vector_of<int32_t>(to.getShape())));
++    };
++
++    RankedTensorType blockedType = withTail({blocks, block});
++    Value blocked = reshape(input, blockedType);
++    SmallVector<float> ones(block * block, 0.0f);
++    for (int64_t row = 0; row < block; ++row) {
++      for (int64_t column = row; column < block; ++column) {
++        ones[row * block + column] = 1.0f;
++      }
++    }
++    auto triangleType =
++        RankedTensorType::get({block, block}, type.getElementType());
++    Value triangle = rewriter.create<ttir::ConstantOp>(
++        loc, triangleType,
++        DenseElementsAttr::get(triangleType, ArrayRef<float>(ones)));
++    auto within = rewriter.create<ttir::DotGeneralOp>(
++        loc, blockedType, blocked, triangle, SmallVector<int64_t>{},
++        SmallVector<int64_t>{rank}, SmallVector<int64_t>{},
++        SmallVector<int64_t>{0});
++    within->setAttr("ttcore.fp32_exact", rewriter.getUnitAttr());
++
++    // Exclusive offsets: the running sum of the block totals before each block.
++    SmallVector<int32_t> begins(rank + 1, 0), ends, steps(rank + 1, 1);
++    for (int64_t extent : blockedType.getShape()) {
++      ends.push_back(static_cast<int32_t>(extent));
++    }
++    begins[rank] = static_cast<int32_t>(block - 1);
++    RankedTensorType columnType = withTail({blocks, 1});
++    Value totals = rewriter.create<ttir::SliceStaticOp>(
++        loc, columnType, within, rewriter.getI32ArrayAttr(begins),
++        rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
++    RankedTensorType totalsType = withTail({blocks});
++    totals = reshape(totals, totalsType);
++    Value running = rewriter.create<ttir::CumSumOp>(
++        loc, totalsType, totals, rewriter.getI64IntegerAttr(rank - 1));
++    Value offsets =
++        rewriter.create<ttir::SubtractOp>(loc, totalsType, running, totals);
++    offsets = reshape(offsets, columnType);
++    SmallVector<int64_t> repeats(rank + 1, 1);
++    repeats[rank] = block;
++    offsets = rewriter.create<ttir::BroadcastOp>(
++        loc, blockedType, offsets, rewriter.getDenseI64ArrayAttr(repeats));
++    Value sums =
++        rewriter.create<ttir::AddOp>(loc, blockedType, within, offsets);
++    return reshape(sums, type);
++  }
++
+   template <typename CumulativeOp>
+   void replaceWithCumulativeOp(
+       mlir::stablehlo::ReduceWindowOp srcOp,
+@@ -4165,9 +4248,20 @@
+       input = rewriter.create<ttir::ReverseOp>(srcOp.getLoc(), computeType,
+                                                 input, dimensions);
+     }
+-    Value result = rewriter.create<CumulativeOp>(
+-        srcOp.getLoc(), computeType, input,
+-        rewriter.getI64IntegerAttr(match.dimension));
++    // Reverse scans keep TTNN's cumulative sum: the reversal of a blocked
++    // result can need more L1 than a core has.
++    Value result;
++    if constexpr (std::is_same_v<CumulativeOp, ttir::CumSumOp>) {
++      if (!match.reverse) {
++        result =
++            blockedCumSum(rewriter, srcOp.getLoc(), input, match.dimension);
++      }
++    }
++    if (!result) {
++      result = rewriter.create<CumulativeOp>(
++          srcOp.getLoc(), computeType, input,
++          rewriter.getI64IntegerAttr(match.dimension));
++    }
+     if (match.reverse) {
+       result = rewriter.create<ttir::ReverseOp>(srcOp.getLoc(), computeType,
+                                                  result, dimensions);
