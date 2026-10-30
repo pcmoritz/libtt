@@ -676,6 +676,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_aliased_custom_call_local_types.patch",
         "//third_party/tt_xla:tt_mlir_reshard_host_layouts.patch",
         "//third_party/tt_xla:tt_mlir_to_host_read_event.patch",
+        "//third_party/tt_xla:tt_mlir_keep_constant_weight_transposes.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

@@ -1,0 +1,45 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -3813,6 +3813,19 @@
+   return producerPermuteOp.getInput();
+ }
+ 
++// Whether `value` is an argument of its function marked as a constant or a
++// parameter (a weight that const-eval can transform ahead of time).
++static bool isConstantOrParameterArgument(Value value) {
++  auto argument = mlir::dyn_cast<BlockArgument>(value);
++  if (!argument) {
++    return false;
++  }
++  auto funcOp =
++      mlir::dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
++  return funcOp && ttcore::isConstantOrParameterArgumentType(
++                       funcOp, argument.getArgNumber());
++}
++
+ // Fuse permute ops into matmul/linear transpose attributes.
+ // Handles both input A and input B for MatmulOp and LinearOp.
+ //
+@@ -3824,6 +3837,8 @@
+ //   linear(a, b, bias, !transpose_a, transpose_b)
+ // linear(a, transpose(b), bias, transpose_a, transpose_b) ->
+ //   linear(a, b, bias, transpose_a, !transpose_b)
++// except for a transposed constant or parameter B, which const-eval
++// transposes once.
+ template <typename OpType>
+ class PermuteMatmulFusionPattern : public mlir::OpRewritePattern<OpType> {
+   using mlir::OpRewritePattern<OpType>::OpRewritePattern;
+@@ -3838,6 +3853,12 @@
+     }
+     auto inputACanonical = getPermuteOpOperand(op.getA());
+     auto inputBCanonical = getPermuteOpOperand(op.getB());
++    // A transposed constant or parameter weight stays a permute, which
++    // const-eval runs once: matmul kernels read a transposed B more slowly
++    // on every call (an LM head's decode matmul: 930 vs 695 us).
++    if (inputBCanonical && isConstantOrParameterArgument(*inputBCanonical)) {
++      inputBCanonical = std::nullopt;
++    }
+ 
+     if (!inputACanonical && !inputBCanonical) {
+       return mlir::failure();
