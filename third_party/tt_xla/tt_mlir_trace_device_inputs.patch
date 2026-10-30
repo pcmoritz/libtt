@@ -96,7 +96,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -1002,6 +1002,43 @@
+@@ -1002,6 +1002,47 @@
    return result;
  }
  
@@ -121,6 +121,10 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +    std::vector<TensorRef> refs =
 +        getOpInputRefs(OpContext(opHandle, DeviceRuntime::TTNN));
 +    for (std::uint32_t i = 0; i < refs.size(); ++i) {
++      // Absent optional operands (e.g. a paged attention mask) are null.
++      if (!refs[i].handle) {
++        continue;
++      }
 +      const auto &ref =
 +          refs[i].as<::tt::target::ttnn::TensorRef>(DeviceRuntime::TTNN);
 +      if (ref.global_id() != id) {
@@ -140,7 +144,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
    const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
        LayoutDesc::fromTensor(tensor);
-@@ -1009,6 +1046,11 @@
+@@ -1009,6 +1050,11 @@
    const LayoutDesc &desiredLayoutDesc =
        layout.as<LayoutDesc>(DeviceRuntime::TTNN);
  
@@ -152,7 +156,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    return *tensorLayoutDesc == desiredLayoutDesc;
  }
  
-@@ -1047,6 +1089,12 @@
+@@ -1047,6 +1093,12 @@
  
    std::shared_ptr<LayoutDesc> layoutDesc = std::make_shared<LayoutDesc>(
        inputStorageType, inputLayout, inputDataType, inputMemoryConfig);
