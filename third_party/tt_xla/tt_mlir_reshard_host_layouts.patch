@@ -1,0 +1,15 @@
+diff --git a/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp b/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
+--- a/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
++++ b/lib/Dialect/TTNN/Analysis/MemoryLayoutPropagation.cpp
+@@ -1595,8 +1595,10 @@
+         producerLayout.getLayout() == reshardLayout.getLayout();
+ 
+     if (sameBufferType && sameMemLayout && samePageLayout) {
+-      // For sharded layouts, also require matching grids.
++      // For sharded layouts, also require matching grids. Host layouts have
++      // no tensor memory layout.
+       bool bothSharded =
++          producerLayout.getMemLayout() && reshardLayout.getMemLayout() &&
+           isShardedMemoryLayout(producerLayout.getMemLayout().getValue()) &&
+           isShardedMemoryLayout(reshardLayout.getMemLayout().getValue());
+       if (!bothSharded ||
