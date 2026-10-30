@@ -1,0 +1,48 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
+--- a/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
++++ b/lib/Dialect/StableHLO/Transforms/UpdateGlobalToLocalShapes.cpp
+@@ -372,6 +372,32 @@ static void inlineNestedManualComputatio
+   }
+ }
+ 
++// A custom call result that aliases an operand is that operand's buffer, so it
++// has the operand's type. Shardy can leave such a result without a sharding,
++// for example a cache update whose result only feeds another update of the
++// same cache, and updateShapes then keeps its global type while the operand
++// became local. Give these results their operand's local type.
++static void alignAliasedCustomCallResults(func::FuncOp funcOp) {
++  funcOp.walk([](mlir::stablehlo::CustomCallOp op) {
++    for (mlir::Attribute attr : op.getOutputOperandAliases()) {
++      auto alias = mlir::cast<mlir::stablehlo::OutputOperandAliasAttr>(attr);
++      llvm::ArrayRef<int64_t> outputIndices = alias.getOutputTupleIndices();
++      if (!alias.getOperandTupleIndices().empty() || outputIndices.size() > 1) {
++        continue;
++      }
++      int64_t resultIndex = outputIndices.empty() ? 0 : outputIndices.front();
++      if (resultIndex >= static_cast<int64_t>(op->getNumResults())) {
++        continue;
++      }
++      mlir::Value result = op->getResult(resultIndex);
++      mlir::Type operandType = op->getOperand(alias.getOperandIndex()).getType();
++      if (result.getType() != operandType) {
++        result.setType(operandType);
++      }
++    }
++  });
++}
++
+ // Update all shapes in the module based on their sdy tensor sharding attribute.
+ static mlir::LogicalResult updateShapes(MLIRContext *context,
+                                         mlir::OpBuilder &builder,
+@@ -722,6 +748,11 @@ public:
+     rootModule.walk(
+         [&](func::FuncOp funcOp) { inlineNestedManualComputations(funcOp); });
+ 
++    // After inlining, when every operand has its local type: arguments of a
++    // nested manual computation are still global over its automatic axes.
++    rootModule.walk(
++        [&](func::FuncOp funcOp) { alignAliasedCustomCallResults(funcOp); });
++
+     // Shardy updates the operand shapes but not
+     // the feature_group_count attribute, so we fix it here from the local
+     // types.
