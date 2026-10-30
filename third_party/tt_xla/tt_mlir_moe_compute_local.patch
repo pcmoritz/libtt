@@ -267,7 +267,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
  
  namespace tt::runtime::ttnn::operations::ccl {
  
-@@ -27,9 +31,128 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
+@@ -27,9 +31,138 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
    return ::ttnn::experimental::prim::detail::MoEActivationFunction::SILU;
  }
  
@@ -343,6 +343,16 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
 +  }
 +  LOG_ASSERT(localAxis, "moe_compute without a cluster axis needs a mesh axis "
 +                        "of extent 1");
++  // The kernel waits for the mapping's row of every chip it runs on. A program
++  // over one device that runs on each chip of a larger mesh in use has only one
++  // row, and would hang.
++  const uint32_t mappingRows =
++      tilizeMapping.logical_volume() / tilizeMapping.logical_shape()[-1];
++  LOG_ASSERT(mappingRows == meshDevice.num_devices(),
++             "moe_compute's expert mapping has ", mappingRows,
++             " rows for a mesh of ", meshDevice.num_devices(),
++             " chips: run tt.fused_moe_ep per device in a shard_map over the "
++             "mesh in use");
 +
 +  // Several rings run a chip's experts side by side (an expert with fewer
 +  // chunks than rings goes whole to the least-loaded ring), but then the rows
