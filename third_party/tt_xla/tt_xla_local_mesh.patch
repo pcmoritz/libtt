@@ -129,12 +129,11 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
  
    const std::optional<tt::runtime::Device> &parent_mesh =
        client_instance->parentMesh();
-@@ -471,10 +494,17 @@ ModuleBuilder::buildModule(
+@@ -471,10 +494,16 @@ ModuleBuilder::buildModule(
        parent_mesh ? std::make_optional(tt::runtime::getMeshShape(*parent_mesh))
                    : std::nullopt;
  
 +  // A single-device executable must not inherit a previously opened TP mesh.
-+  // Keep the live shape separately so it can still be resized after compilation.
 +  auto compiler_mesh_shape = current_mesh_shape;
 +  if (target_num_devices == 1) {
 +    compiler_mesh_shape = std::vector<uint32_t>{1, 1};
@@ -148,3 +147,18 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
    if (!tt_pjrt_status_is_ok(status)) {
      return {status, nullptr};
    }
+@@ -623,14 +623,6 @@
+     return {status, nullptr};
+   }
+ 
+-  // tt-xla creates 1D mesh by default, so if compiler determines a different
+-  // mesh shape, we need to update the mesh in the client instance to match the
+-  // compiler determined mesh shape.
+-  if (current_mesh_shape.has_value() &&
+-      current_mesh_shape.value() != mesh_shape) {
+-    client_instance->getOrCreateMeshDevice(mesh_shape);
+-  }
+-
+   // TODO(mrakita): Use the VHLO module name from the module builder, if it has
+   // a name, otherwise some default string like the current one.
+   std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>> result;
