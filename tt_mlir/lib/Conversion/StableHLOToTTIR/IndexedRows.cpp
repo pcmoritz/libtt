@@ -139,7 +139,8 @@ struct Canonical {
 // partially covered; a Free dimension inside it becomes a zero component. The
 // operand keeps its order when its batching dimensions, if any, are exactly the
 // dimensions before that region, apart from size-1 dimensions, which sit
-// anywhere without moving data; otherwise it is permuted to [Batch, Indexed
+// anywhere without moving data (unless nothing is indexed: then the last
+// dimension is the row); otherwise it is permuted to [Batch, Indexed
 // and partial Free, full Free].
 Canonical canonicalize(ArrayRef<OperandDim> operandDims) {
   const int64_t rank = operandDims.size();
@@ -160,7 +161,8 @@ Canonical canonicalize(ArrayRef<OperandDim> operandDims) {
   for (int64_t d = 0; d < rank; ++d) {
     bool leading = d < regionStart;
     bool isBatch = operandDims[d].kind == DimKind::Batch;
-    bool unit = operandDims[d].kind == DimKind::Free && operandDims[d].size == 1;
+    bool unit = regionEnd >= 0 && operandDims[d].kind == DimKind::Free &&
+                operandDims[d].size == 1;
     if (isBatch && !leading) {
       natural = false;
     }
