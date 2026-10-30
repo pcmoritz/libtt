@@ -79,12 +79,12 @@ def check(out, want, padding):
 @pytest.mark.parametrize("tokens,padding", [(1, 0), (3, 1), (5, 2), (513, 0), (600, 7)])
 def test_mesh(tokens, padding):
     devices = jax.local_devices(backend="tt")
-    if len(devices) != 4:
-        pytest.skip("Requires four local TT devices")
-    mesh = Mesh(np.array(devices).reshape(1, 4), ("data", "tensor"))
+    if len(devices) not in (1, 4):
+        pytest.skip("Requires one or four local TT devices")
+    mesh = Mesh(np.array(devices).reshape(1, len(devices)), ("data", "tensor"))
     axes = ("data", "tensor")
     rng = np.random.default_rng(100 + tokens)
-    args = problem(rng, tokens, 4 * 8, padding)
+    args = problem(rng, tokens, len(devices) * 8, padding)
 
     def layer(x, weights, ids, w1, w3, w2):
         return jax.lax.psum(fused_moe_ep(x, weights, ids, w1, w3, w2), axes)
