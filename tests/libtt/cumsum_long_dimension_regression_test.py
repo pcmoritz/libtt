@@ -2,7 +2,9 @@
 its width, transposing every tile so that cumsum_tile runs down its columns,
 instead of permuting that dimension to the front: the permuted scan padded every
 element of a thin tensor out to its own tile, and took 300 ms over a 248K
-vocabulary (the CDF a sampler draws from), against 4 ms along the width.
+vocabulary (the CDF a sampler draws from). An FP32 row that long is scanned in
+chunks spread over cores, then each chunk gets the totals of the chunks before
+it: 0.9 ms.
 """
 
 import time
@@ -60,9 +62,10 @@ def test_sampling_from_a_cdf():
     cdf = np.cumsum(probs.astype(np.float64), axis=-1)
     got_cdf = np.asarray(jax.jit(lambda p: jnp.cumsum(p, axis=-1))(args[0]), np.float64)
     tolerance = np.abs(got_cdf - cdf).max()
-    # A sequential float32 sum over the row drifts by a few 1e-6, about one token's probability
-    # here: the draw is the token whose float64 CDF step holds the threshold, up to that drift.
-    assert tolerance < 2e-5, tolerance
+    # The float32 scan (chunks of at most 4096 elements, plus their offsets) drifts from the
+    # float64 sum by a few 1e-7, under a token's probability here: the draw is the token whose
+    # float64 CDF step holds the threshold, up to that drift.
+    assert tolerance < 2e-6, tolerance
     threshold = u * cdf[:, -1]
     lower = np.take_along_axis(np.pad(cdf, ((0, 0), (1, 0))), got[:, None], axis=-1)[:, 0]
     upper = np.take_along_axis(cdf, got[:, None], axis=-1)[:, 0]
