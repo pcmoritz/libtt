@@ -18,6 +18,15 @@ def gated_delta_decode(state, qkv, b, a, A_log, dt_bias, indices, initial, *slot
     )(state, qkv, b, a, A_log, dt_bias, indices, initial, *slots)
 
 
+def state_pool_copy(pool, sources, targets):
+    return jax.ffi.ffi_call(
+        "tt.state_pool_copy",
+        jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={0: 0},
+        vmap_method="sequential",
+    )(pool, sources, targets)
+
+
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize(
     "batch,key_heads,groups,qk_scale,qkv_dtype,gate_dtype",
@@ -277,18 +286,9 @@ def test_conv_update_steps(batch, tokens):
 )
 def test_state_pool_copy(trace, shape, dtype):
     """Slot copies within a state pool, in place; pairs with slot 0 are skipped."""
-
-    def copy(pool, sources, targets):
-        return jax.ffi.ffi_call(
-            "tt.state_pool_copy",
-            jax.ShapeDtypeStruct(pool.shape, pool.dtype),
-            input_output_aliases={0: 0},
-            vmap_method="sequential",
-        )(pool, sources, targets)
-
     device = jax.devices("tt")[0]
     run = jax.jit(
-        copy,
+        state_pool_copy,
         donate_argnums=0,
         compiler_options={"optimization_level": "O1", "enable_trace": str(trace).lower()},
     )
@@ -303,3 +303,13 @@ def test_state_pool_copy(trace, shape, dtype):
                 expected[target] = pool[source]
         actual = run(*(jax.device_put(x, device) for x in (pool, sources, targets)))
         np.testing.assert_array_equal(np.asarray(actual), expected)
+
+
+def test_state_pool_copy_rejects_rank_two_pools():
+    """In a rank-2 pool a tile holds rows of several slots, so slot copies
+    need the slots above the two tiled dimensions."""
+    device = jax.devices("tt")[0]
+    pool = np.arange(4 * 128, dtype=np.float32).reshape(4, 128)
+    args = (pool, np.array([1], np.int32), np.array([2], np.int32))
+    with pytest.raises(jax.errors.JaxRuntimeError, match="rank at least three"):
+        np.asarray(jax.jit(state_pool_copy)(*(jax.device_put(x, device) for x in args)))

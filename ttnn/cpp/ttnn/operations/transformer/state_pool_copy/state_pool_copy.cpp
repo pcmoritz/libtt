@@ -60,11 +60,11 @@ void StatePoolCopyOperation::validate_on_program_cache_miss(
     const auto& shape = inputs.sources.logical_shape();
     TT_FATAL(shape.rank() == 1 && shape[0] > 0 && shape[0] <= 32, "sources must be a [N <= 32] vector");
     TT_FATAL(inputs.targets.logical_shape() == shape, "sources and targets must have the same shape");
-    const auto& pool_shape = inputs.state_pool.logical_shape();
-    TT_FATAL(pool_shape.rank() >= 2, "the state pool must have rank at least two");
+    // The slots must lie above the two tiled dimensions, so that each slot is
+    // whole tiles; in a rank-2 pool a tile holds rows of several slots.
     TT_FATAL(
-        inputs.state_pool.buffer()->num_pages() % pool_shape[0] == 0,
-        "each slot of the state pool must span whole pages");
+        inputs.state_pool.logical_shape().rank() >= 3,
+        "the state pool must have rank at least three: [slots, ..., rows, columns]");
 }
 
 ProgramDescriptor StatePoolCopyOperation::create_descriptor(
