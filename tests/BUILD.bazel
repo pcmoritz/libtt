@@ -158,12 +158,27 @@ py_test(
         # with duplicates, returned inverse indices and counts.
         "tests/ops_unit_test.py::OpsGradUnitTest::test_unique2_distributions",
         "tests/ops_unit_test.py::OpsUnitTest::test_unique_consecutive_distributions",
+        # sdpa_kernel(FLASH_ATTENTION) runs torch_tpu's StableHLO
+        # implementation, or MATH for dropout and masks that need gradients.
+        "tests/ops_unit_test.py::OpsGradUnitTest::test_scaled_dot_product_attention_q_seq_len_128_kv_seq_len_128_q_num_heads_8_kv_num_heads_2_qk_head_dim_64_v_head_dim_64_is_causal_False_batch_size_2_enable_gqa_True_dtype_bfloat16_scale_None_attn_bias_type_None_backend_SDPBackend.FLASH_ATTENTION_requires_grad_True",
+        "tests/ops_unit_test.py::OpsGradUnitTest::test_scaled_dot_product_attention_q_seq_len_128_kv_seq_len_128_q_num_heads_8_kv_num_heads_8_qk_head_dim_64_v_head_dim_64_is_causal_True_batch_size_1_enable_gqa_True_dtype_float32_scale_None_attn_bias_type_None_backend_SDPBackend.FLASH_ATTENTION_requires_grad_True",
+        "tests/ops_unit_test.py::OpsGradUnitTest::test_scaled_dot_product_attention_compiled_backward0",
+        "tests/ops_unit_test.py::OpsGradUnitTest::test_scaled_dot_product_attention_dropout",
+        "tests/ops_unit_test.py::OpsGradUnitTest::test_scaled_dot_product_attention_with_mask_gradient0",
+        "tests/ops_unit_test.py::OpsGradUnitTest::test_sdpa_gqa_different_v_head_dim_flash",
     ],
     data = TORCH_TPU_TEST_DATA,
     deps = TORCH_TPU_TEST_DEPS,
     main = "torch_tpu_runner.py",
     tags = DEVICE_TEST_TAGS,
     timeout = "long",
+)
+
+# The compatibility mode's attention backend selection, on the CPU.
+py_test(
+    name = "tpu_compat_test",
+    srcs = ["tpu_compat_test.py"],
+    deps = TORCH_TPU_TEST_DEPS + ["//:jax_plugin"],
 )
 
 py_test(

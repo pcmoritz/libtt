@@ -32,7 +32,9 @@ and then loads `jax_plugins/libtt/tpu_compat.py`, which runs before torch_tpu:
   device count reports the Tenstorrent chips instead.
 - torch_tpu's flash attention is a Pallas kernel that only TPUs run, so it is
   turned off and `scaled_dot_product_attention` runs torch_tpu's StableHLO
-  implementation.
+  implementation. `sdpa_kernel(SDPBackend.FLASH_ATTENTION)` selects that
+  implementation and MATH (for dropout and masks that need gradients), not a
+  native flash attention.
 
 Without the variable, nothing changes.
 
