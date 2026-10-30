@@ -21,8 +21,8 @@ def device_put(x):
 
 @pytest.mark.parametrize(
     "shape",
-    [(3, 248320), (2, 4, 8192), (5, 4096), (2, 8200)],
-    ids=["vocabulary", "rank3", "shortest", "no-whole-tile-blocks"],
+    [(3, 248320), (2, 262112), (2, 4, 8192), (5, 4096), (2, 8200)],
+    ids=["vocabulary", "prime-tile-count", "rank3", "short", "partial-tile"],
 )
 @pytest.mark.parametrize("reverse", [False, True])
 def test_cumsum_along_a_long_dimension(shape, reverse):
