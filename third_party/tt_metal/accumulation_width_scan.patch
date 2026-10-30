@@ -1,0 +1,880 @@
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
+--- ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
+@@ -6,15 +6,31 @@
+ #include "ttnn/operations/data_movement/clone/clone.hpp"
+ #include "ttnn/operations/data_movement/copy/copy.hpp"
+ #include "ttnn/operations/copy/typecast/typecast.hpp"
++#include "ttnn/tensor/tensor_ops.hpp"
++
++#include <algorithm>
+ 
+ namespace ttnn::operations::reduction::accumulation::common {
+ 
++namespace {
++
++// Tiles per chunk of a width scan, each chunk scanned from zero on its own core: enough chunks for the
++// rows to cover the cores, chunks of at least 16 tiles, and at most 128 (4096 elements), which bounds
++// each sequential FP32 sum. The last chunk of a row may be shorter.
++uint32_t width_scan_chunk_tiles(uint32_t rows, uint32_t row_tiles, uint32_t cores) {
++    const uint32_t chunks_per_row = (cores + rows - 1) / rows;
++    return std::clamp<uint32_t>((row_tiles + chunks_per_row - 1) / chunks_per_row, 16, 128);
++}
++
++}  // namespace
++
+ Tensor preprocess_input_tensor(
+     const Tensor& input_tensor,
+     const int32_t& cum_axis,
+     permutation_t& permutation,
+     int32_t& accumulation_axis,
+-    std::optional<DataType>& dtype) {
++    std::optional<DataType>& dtype,
++    bool scan_width) {
+     Tensor processed_tensor = input_tensor;
+     const auto& input_dtype = input_tensor.dtype();
+     if (dtype.has_value() && (input_dtype != *dtype)) {
+@@ -40,6 +56,12 @@
+             final_cum_axis += (FOUR_DIMENSIONS - input_rank);
+         }
+ 
++        // The width path scans the last dimension where it is.
++        if (scan_width) {
++            accumulation_axis = final_cum_axis;
++            return processed_tensor;
++        }
++
+         // Create permutation that just swaps cumulation axis with the first dim
+         permutation = std::decay_t<decltype(permutation)>(final_rank);
+         std::iota(permutation.begin(), permutation.end(), FIRST_DIMENSION);
+@@ -63,7 +85,10 @@
+     Tensor processed_tensor = output_tensor;
+ 
+     if (original_rank - dim < FOUR_DIMENSIONS) {
+-        processed_tensor = ttnn::permute(processed_tensor, permutation, processed_tensor.memory_config());
++        // A width scan leaves the dimension where it is.
++        if (!permutation.empty()) {
++            processed_tensor = ttnn::permute(processed_tensor, permutation, processed_tensor.memory_config());
++        }
+         if (original_rank < FOUR_DIMENSIONS) {
+             processed_tensor = ttnn::reshape(processed_tensor, original_shape);
+         }
+@@ -135,19 +160,67 @@
+     // Normalize negative dim
+     const int32_t cum_axis = (dim < 0) ? (dim + input_rank) : dim;
+ 
++    // A forward floating-point cumsum along the last dimension scans along the width of the tiles
++    // (the program factory's width path) instead of permuting that dimension to the front, which pads
++    // every element of a thin tensor out to its own tile.
++    const DataType scan_dtype = dtype.value_or(input_tensor.dtype());
++    const bool scan_width = op == ttnn::prim::AccumulationOp::CUMSUM && !reverse_order &&
++                            cum_axis == input_rank - 1 &&
++                            (scan_dtype == DataType::FLOAT32 || scan_dtype == DataType::BFLOAT16);
++
+     Tensor wip_tensor = input_tensor;
+     ttsl::SmallVector<int64_t> permutation;
+     int32_t accumulation_axis;
+-    wip_tensor = common::preprocess_input_tensor(wip_tensor, cum_axis, permutation, accumulation_axis, dtype);
++    wip_tensor =
++        common::preprocess_input_tensor(wip_tensor, cum_axis, permutation, accumulation_axis, dtype, scan_width);
++    const MemoryConfig output_memory_config =
++        memory_config.has_value() ? memory_config.value() : wip_tensor.memory_config();
++
++    // An FP32 width scan of long rows spreads each row over cores in chunks: the scan runs every chunk
++    // from zero and writes its row totals, then the earlier chunks' totals are added in place.
++    uint32_t chunk_tiles = 0;
++    std::optional<Tensor> totals;
++    if (scan_width && wip_tensor.dtype() == DataType::FLOAT32 && scan_dtype == DataType::FLOAT32) {
++        const auto& tile = wip_tensor.tensor_spec().tile();
++        const uint32_t row_tiles = wip_tensor.padded_shape()[-1] / tile.get_width();
++        const uint32_t rows = wip_tensor.physical_volume() / tile.get_tile_hw() / row_tiles;
++        const auto grid = wip_tensor.device()->compute_with_storage_grid_size();
++        const uint32_t tiles = width_scan_chunk_tiles(rows, row_tiles, grid.x * grid.y);
++        const uint32_t chunks = (row_tiles + tiles - 1) / tiles;
++        if (chunks > 1) {
++            chunk_tiles = tiles;
++            totals = ttnn::create_device_tensor(
++                tt::tt_metal::TensorSpec(
++                    ttnn::Shape({rows * tile.get_height(), chunks * tile.get_width()}),
++                    tt::tt_metal::TensorLayout(DataType::FLOAT32, Layout::TILE, ttnn::DRAM_MEMORY_CONFIG)),
++                wip_tensor.device());
++        }
++    }
+     wip_tensor = ttnn::prim::accumulation(
+         wip_tensor,
+         accumulation_axis,
+         dtype,
+         reverse_order,
+         std::nullopt,
+-        memory_config.has_value() ? memory_config.value() : wip_tensor.memory_config(),
++        output_memory_config,
+         op,
+-        disable_compensation);
++        disable_compensation,
++        chunk_tiles,
++        totals);
++    if (totals.has_value()) {
++        wip_tensor = ttnn::prim::accumulation(
++            wip_tensor,
++            accumulation_axis,
++            wip_tensor.dtype(),
++            reverse_order,
++            wip_tensor,
++            wip_tensor.memory_config(),
++            op,
++            disable_compensation,
++            chunk_tiles,
++            totals,
++            /*add_chunk_offsets=*/true);
++    }
+     wip_tensor = common::postprocess_output_tensor(wip_tensor, cum_axis, permutation, input_shape, input_rank);
+     if (optional_out.has_value()) {
+         // TODO(#37807):
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.hpp ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.hpp
+--- ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.hpp
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.hpp
+@@ -25,7 +25,8 @@
+     const int32_t& cum_axis,
+     permutation_t& permutation,
+     int32_t& accumulation_axis,
+-    std::optional<DataType>& dtype);
++    std::optional<DataType>& dtype,
++    bool scan_width = false);
+ 
+ Tensor postprocess_output_tensor(
+     const Tensor& output_tensor,
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.cpp
+@@ -72,6 +72,16 @@
+     }
+ }
+ 
++AccumulationDeviceOperation::program_factory_t AccumulationDeviceOperation::select_program_factory(
++    const operation_attributes_t& attributes, const tensor_args_t& tensor_args) {
++    // Scans along the last dimension come from accumulation_invoke, which only sends forward
++    // floating-point cumsums there; it permutes the dimension of any other scan to the front.
++    if (attributes.dim == static_cast<int32_t>(tensor_args.input_tensor.padded_shape().rank()) - 1) {
++        return AccumulationWidthProgramFactory{};
++    }
++    return AccumulationProgramFactory{};
++}
++
+ AccumulationDeviceOperation::spec_return_value_t AccumulationDeviceOperation::compute_output_specs(
+     const operation_attributes_t& attributes, const tensor_args_t& tensor_args) {
+     if (tensor_args.opt_output.has_value()) {
+@@ -110,7 +120,10 @@
+     std::optional<Tensor> optional_out,
+     const std::optional<MemoryConfig>& memory_config,
+     AccumulationOp op,
+-    bool disable_compensation) {
++    bool disable_compensation,
++    uint32_t chunk_tiles,
++    std::optional<Tensor> chunk_totals,
++    bool add_chunk_offsets) {
+     using OperationType = AccumulationDeviceOperation;
+     return ttnn::device_operation::launch<OperationType>(
+         OperationType::operation_attributes_t{
+@@ -122,8 +135,10 @@
+                 : (optional_out.has_value() ? optional_out->memory_config() : input_tensor.memory_config()),
+             reverse_order,
+             op,
+-            disable_compensation},
+-        OperationType::tensor_args_t{input_tensor, std::move(optional_out)});
++            disable_compensation,
++            chunk_tiles,
++            add_chunk_offsets},
++        OperationType::tensor_args_t{input_tensor, std::move(optional_out), std::move(chunk_totals)});
+ }
+ 
+ }  // namespace ttnn::prim
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.hpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.hpp
+--- ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.hpp
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.hpp
+@@ -44,7 +44,27 @@
+             const Shape& input_shape, const int32_t& dim, uint32_t tile_height = 32, uint32_t tile_width = 32);
+     };
+ 
+-    using program_factory_t = std::variant<AccumulationProgramFactory>;
++    // A forward floating-point cumsum along the last dimension, scanned along the width of each row of
++    // tiles (accumulation_width_program_factory.cpp).
++    struct AccumulationWidthProgramFactory {
++        static constexpr std::array<const char*, 4> KERNEL_PATHS{
++            "ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/dataflow/"
++            "accumulation_width_reader.cpp",
++            "ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/compute/"
++            "accumulation_width_compute.cpp",
++            "ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/dataflow/"
++            "accumulation_width_writer.cpp",
++            "ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/compute/"
++            "accumulation_offsets_compute.cpp"};
++
++        static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
++            const operation_attributes_t& operation_attributes,
++            const tensor_args_t& tensor_args,
++            tensor_return_value_t& tensor_return_value);
++    };
++
++    using program_factory_t = std::variant<AccumulationProgramFactory, AccumulationWidthProgramFactory>;
++    static program_factory_t select_program_factory(const operation_attributes_t&, const tensor_args_t&);
+ 
+     using invocation_result_t = std::tuple<operation_attributes_t, tensor_args_t>;
+     static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
+@@ -62,6 +82,9 @@
+     std::optional<Tensor> optional_out,
+     const std::optional<MemoryConfig>& memory_config,
+     AccumulationOp op,
+-    bool disable_compensation = false);
++    bool disable_compensation = false,
++    uint32_t chunk_tiles = 0,
++    std::optional<Tensor> chunk_totals = std::nullopt,
++    bool add_chunk_offsets = false);
+ 
+ }  // namespace ttnn::prim
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation_types.hpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation_types.hpp
+--- ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation_types.hpp
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation_types.hpp
+@@ -25,11 +25,18 @@
+     // fall back to the plain sequential sum. An escape hatch for parity checks and debugging; it
+     // has no effect on cumprod or on integer formats, which never take the compensated path.
+     const bool disable_compensation = false;
++    // Width path only. Nonzero: each row of tiles is scanned in chunks of this many tiles, each from
++    // zero, so that one row's scan spreads over cores; the first pass writes every chunk's row totals
++    // to chunk_totals (one tile per chunk, each row's total in all its columns) and the second
++    // (add_chunk_offsets) adds the totals of the chunks before it to each chunk.
++    const uint32_t chunk_tiles = 0;
++    const bool add_chunk_offsets = false;
+ };
+ 
+ struct AccumulationInputs {
+     const Tensor& input_tensor;
+     std::optional<Tensor> opt_output;
++    std::optional<Tensor> chunk_totals;
+ };
+ 
+ }  // namespace ttnn::prim
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/accumulation_common.hpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/accumulation_common.hpp
+--- ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/accumulation_common.hpp
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/accumulation_common.hpp
+@@ -18,3 +18,15 @@
+     const uint32_t tileid = base_tileid + (j * input_tile_offset);
+     return tileid;
+ }
++
++// A width scan splits each row of row_tiles tiles into chunks_per_row chunks of chunk_tiles tiles,
++// the last of which may be shorter; chunk c is chunk c % chunks_per_row of row c / chunks_per_row.
++FORCE_INLINE uint32_t chunk_first_tile(
++    uint32_t chunk, uint32_t chunks_per_row, uint32_t chunk_tiles, uint32_t row_tiles) {
++    return (chunk / chunks_per_row) * row_tiles + (chunk % chunks_per_row) * chunk_tiles;
++}
++
++FORCE_INLINE uint32_t chunk_length(uint32_t chunk, uint32_t chunks_per_row, uint32_t chunk_tiles, uint32_t row_tiles) {
++    const uint32_t rest = row_tiles - (chunk % chunks_per_row) * chunk_tiles;
++    return rest < chunk_tiles ? rest : chunk_tiles;
++}
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/compute/accumulation_width_compute.cpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/compute/accumulation_width_compute.cpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/compute/accumulation_width_compute.cpp
+@@ -0,0 +1,87 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++// Cumulative sum along the width of each row of tiles. Each tile is transposed as it is unpacked,
++// so its rows become columns; cumsum_tile scans the columns top to bottom and carries their totals
++// to the next tile in SFPU registers; the result is transposed back in Dest and packed. The running
++// totals are FP32 in Dest; only the packed output is rounded.
++//
++// Each row of tiles is scanned in chunks (accumulation_common.hpp), each from zero. With
++// WRITE_TOTALS, after each chunk the kernel scans a tile of zeros: every row of the result is then the carried column totals, so the tile, transposed back,
++// holds each row's total of the chunk in all its columns. The program adds those to later chunks.
++
++#include "api/compute/compute_kernel_api.h"
++#include "api/compute/cumsum.h"
++#include "api/compute/pack.h"
++#include "api/compute/reconfig_data_format.h"
++#include "api/compute/transpose.h"
++#include "api/compute/transpose_dest.h"
++#include "api/compute/tile_move_copy.h"
++#define APPROX false
++#include "api/compute/common.h"
++#include "api/dataflow/dataflow_buffer.h"
++#include "experimental/kernel_args.h"
++#include "../accumulation_common.hpp"
++
++void kernel_main() {
++    const uint32_t num_chunks = get_arg(args::num_chunks);
++    const uint32_t start_chunk = get_arg(args::start_chunk);
++    const uint32_t row_tiles = get_arg(args::row_tiles);
++    const uint32_t chunks_per_row = get_arg(args::chunks_per_row);
++    const uint32_t chunk_tiles = get_arg(args::chunk_tiles);
++
++    DataflowBuffer dfb_in_obj(dfb::in);
++    DataflowBuffer dfb_out_obj(dfb::out);
++#ifdef WRITE_TOTALS
++    DataflowBuffer dfb_zero_obj(dfb::zero);
++    DataflowBuffer dfb_totals_obj(dfb::totals);
++    dfb_zero_obj.wait_front(ONE_TILE);
++#endif
++
++    compute_kernel_hw_startup(dfb::in, dfb::out);
++
++    for (uint32_t chunk = start_chunk; chunk < start_chunk + num_chunks; ++chunk) {
++        const uint32_t length = chunk_length(chunk, chunks_per_row, chunk_tiles, row_tiles);
++        for (uint32_t j = 0; j < length; ++j) {
++            dfb_in_obj.wait_front(ONE_TILE);
++            tile_regs_acquire();
++
++            transpose_init(dfb::in);
++            transpose_tile(dfb::in, FIRST_TILE, WORKING_REG);
++            // The transposes reprogram the replay buffer the scan runs from, not the SFPU
++            // registers that carry the column totals between tiles.
++            cumsum_tile_init();
++            cumsum_tile(WORKING_REG, /*first=*/j == 0);
++            transpose_dest_init</*is_32bit=*/true>();
++            transpose_dest</*is_32bit=*/true>(WORKING_REG);
++
++            tile_regs_commit();
++            dfb_in_obj.pop_front(ONE_TILE);
++
++            tile_regs_wait();
++            dfb_out_obj.reserve_back(ONE_TILE);
++            pack_tile(WORKING_REG, dfb::out);
++            dfb_out_obj.push_back(ONE_TILE);
++            tile_regs_release();
++        }
++#ifdef WRITE_TOTALS
++        tile_regs_acquire();
++        copy_init(dfb::zero);
++        copy_tile(dfb::zero, FIRST_TILE, WORKING_REG);
++        cumsum_tile_init();
++        cumsum_tile(WORKING_REG, /*first=*/false);
++        transpose_dest_init</*is_32bit=*/true>();
++        transpose_dest</*is_32bit=*/true>(WORKING_REG);
++        tile_regs_commit();
++        tile_regs_wait();
++        dfb_totals_obj.reserve_back(ONE_TILE);
++        pack_tile(WORKING_REG, dfb::totals);
++        dfb_totals_obj.push_back(ONE_TILE);
++        tile_regs_release();
++#endif
++    }
++#ifdef WRITE_TOTALS
++    dfb_zero_obj.pop_front(ONE_TILE);
++#endif
++}
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/compute/accumulation_offsets_compute.cpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/compute/accumulation_offsets_compute.cpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/compute/accumulation_offsets_compute.cpp
+@@ -0,0 +1,82 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++// Second pass of a chunked width scan: adds to each chunk the sum of the totals of the chunks before
++// it in its row of tiles. The totals tiles hold each row's total in all their columns, so their sum is
++// the offset tile itself. FP32 throughout, on the SFPU.
++
++#include "api/compute/compute_kernel_api.h"
++#include "api/compute/eltwise_binary_sfpu.h"
++#include "api/compute/pack.h"
++#include "api/compute/tile_move_copy.h"
++#define APPROX false
++#include "api/compute/common.h"
++#include "api/dataflow/dataflow_buffer.h"
++#include "experimental/kernel_args.h"
++#include "../accumulation_common.hpp"
++
++void kernel_main() {
++    const uint32_t num_chunks = get_arg(args::num_chunks);
++    const uint32_t start_chunk = get_arg(args::start_chunk);
++    const uint32_t row_tiles = get_arg(args::row_tiles);
++    const uint32_t chunks_per_row = get_arg(args::chunks_per_row);
++    const uint32_t chunk_tiles = get_arg(args::chunk_tiles);
++
++    DataflowBuffer dfb_in_obj(dfb::in);
++    DataflowBuffer dfb_out_obj(dfb::out);
++    DataflowBuffer dfb_totals_obj(dfb::totals);
++    DataflowBuffer dfb_offset_obj(dfb::offset);
++
++    constexpr uint32_t DST_IN = 0;
++    constexpr uint32_t DST_OFFSET = 1;
++
++    compute_kernel_hw_startup(dfb::in, dfb::out);
++
++    for (uint32_t chunk = start_chunk; chunk < start_chunk + num_chunks; ++chunk) {
++        const uint32_t before = chunk % chunks_per_row;
++        if (before > 0) {
++            tile_regs_acquire();
++            for (uint32_t k = 0; k < before; ++k) {
++                dfb_totals_obj.wait_front(ONE_TILE);
++                copy_init(dfb::totals);
++                copy_tile(dfb::totals, FIRST_TILE, k == 0 ? DST_OFFSET : DST_IN);
++                dfb_totals_obj.pop_front(ONE_TILE);
++                if (k > 0) {
++                    add_binary_tile_init();
++                    add_binary_tile(DST_OFFSET, DST_IN, DST_OFFSET);
++                }
++            }
++            tile_regs_commit();
++            tile_regs_wait();
++            dfb_offset_obj.reserve_back(ONE_TILE);
++            pack_tile(DST_OFFSET, dfb::offset);
++            dfb_offset_obj.push_back(ONE_TILE);
++            tile_regs_release();
++            dfb_offset_obj.wait_front(ONE_TILE);
++        }
++        const uint32_t length = chunk_length(chunk, chunks_per_row, chunk_tiles, row_tiles);
++        for (uint32_t j = 0; j < length; ++j) {
++            dfb_in_obj.wait_front(ONE_TILE);
++            tile_regs_acquire();
++            copy_init(dfb::in);
++            copy_tile(dfb::in, FIRST_TILE, DST_IN);
++            if (before > 0) {
++                copy_init(dfb::offset);
++                copy_tile(dfb::offset, FIRST_TILE, DST_OFFSET);
++                add_binary_tile_init();
++                add_binary_tile(DST_IN, DST_OFFSET, DST_IN);
++            }
++            tile_regs_commit();
++            dfb_in_obj.pop_front(ONE_TILE);
++            tile_regs_wait();
++            dfb_out_obj.reserve_back(ONE_TILE);
++            pack_tile(DST_IN, dfb::out);
++            dfb_out_obj.push_back(ONE_TILE);
++            tile_regs_release();
++        }
++        if (before > 0) {
++            dfb_offset_obj.pop_front(ONE_TILE);
++        }
++    }
++}
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/dataflow/accumulation_width_reader.cpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/dataflow/accumulation_width_reader.cpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/dataflow/accumulation_width_reader.cpp
+@@ -0,0 +1,60 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++// Width scan: the tiles of each chunk of a row of tiles, in order. The scan (WRITE_TOTALS) also
++// provides a tile of zeros; the offsets pass (ADD_CHUNK_OFFSETS) first reads the totals of the
++// chunks before each chunk in its row.
++
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++#include "api/dataflow/dataflow_buffer.h"
++#include "api/tensor/noc_traits.h"
++#include "experimental/kernel_args.h"
++
++#include "../accumulation_common.hpp"
++
++void kernel_main() {
++    const uint32_t num_chunks = get_arg(args::num_chunks);
++    const uint32_t start_chunk = get_arg(args::start_chunk);
++    const uint32_t row_tiles = get_arg(args::row_tiles);
++    const uint32_t chunks_per_row = get_arg(args::chunks_per_row);
++    const uint32_t chunk_tiles = get_arg(args::chunk_tiles);
++
++    const Noc noc;
++    DataflowBuffer dfb_in_obj(dfb::in);
++    const uint32_t tile_bytes = dfb_in_obj.get_tile_size();
++    const auto input_addrg = TensorAccessor(tensor::input);
++#ifdef ADD_CHUNK_OFFSETS
++    DataflowBuffer dfb_totals_obj(dfb::totals);
++    const auto totals_addrg = TensorAccessor(tensor::totals);
++#endif
++
++#ifdef WRITE_TOTALS
++    // The tile of zeros the scan runs through after each chunk to read out its totals.
++    DataflowBuffer dfb_zero_obj(dfb::zero);
++    dfb_zero_obj.reserve_back(ONE_TILE);
++    noc.async_write_zeros(dfb_zero_obj, dfb_zero_obj.get_tile_size());
++    noc.write_zeros_l1_barrier();
++    dfb_zero_obj.push_back(ONE_TILE);
++#endif
++
++    for (uint32_t chunk = start_chunk; chunk < start_chunk + num_chunks; ++chunk) {
++#ifdef ADD_CHUNK_OFFSETS
++        for (uint32_t before = chunk - chunk % chunks_per_row; before < chunk; ++before) {
++            dfb_totals_obj.reserve_back(ONE_TILE);
++            noc.async_read(totals_addrg, dfb_totals_obj, tile_bytes, {.page_id = before}, {.offset_bytes = 0});
++            noc.async_read_barrier();
++            dfb_totals_obj.push_back(ONE_TILE);
++        }
++#endif
++        const uint32_t first = chunk_first_tile(chunk, chunks_per_row, chunk_tiles, row_tiles);
++        const uint32_t length = chunk_length(chunk, chunks_per_row, chunk_tiles, row_tiles);
++        for (uint32_t j = 0; j < length; ++j) {
++            dfb_in_obj.reserve_back(ONE_TILE);
++            noc.async_read(input_addrg, dfb_in_obj, tile_bytes, {.page_id = first + j}, {.offset_bytes = 0});
++            noc.async_read_barrier();
++            dfb_in_obj.push_back(ONE_TILE);
++        }
++    }
++}
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/dataflow/accumulation_width_writer.cpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/dataflow/accumulation_width_writer.cpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/kernels/dataflow/accumulation_width_writer.cpp
+@@ -0,0 +1,49 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++// Width scan: the result tiles of each chunk of a row of tiles and, with WRITE_TOTALS, the chunk's
++// tile of row totals at the chunk's index.
++
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++#include "api/dataflow/dataflow_buffer.h"
++#include "api/tensor/noc_traits.h"
++#include "experimental/kernel_args.h"
++
++#include "../accumulation_common.hpp"
++
++void kernel_main() {
++    const uint32_t num_chunks = get_arg(args::num_chunks);
++    const uint32_t start_chunk = get_arg(args::start_chunk);
++    const uint32_t row_tiles = get_arg(args::row_tiles);
++    const uint32_t chunks_per_row = get_arg(args::chunks_per_row);
++    const uint32_t chunk_tiles = get_arg(args::chunk_tiles);
++
++    const Noc noc;
++    DataflowBuffer dfb_out_obj(dfb::out);
++    const uint32_t tile_bytes = dfb_out_obj.get_tile_size();
++    const auto output_addrg = TensorAccessor(tensor::output);
++#ifdef WRITE_TOTALS
++    DataflowBuffer dfb_totals_obj(dfb::totals);
++    const auto totals_addrg = TensorAccessor(tensor::totals);
++#endif
++
++    for (uint32_t chunk = start_chunk; chunk < start_chunk + num_chunks; ++chunk) {
++        const uint32_t first = chunk_first_tile(chunk, chunks_per_row, chunk_tiles, row_tiles);
++        const uint32_t length = chunk_length(chunk, chunks_per_row, chunk_tiles, row_tiles);
++        for (uint32_t j = 0; j < length; ++j) {
++            dfb_out_obj.wait_front(ONE_TILE);
++            noc.async_write(dfb_out_obj, output_addrg, tile_bytes, {.offset_bytes = 0}, {.page_id = first + j});
++            noc.async_write_barrier();
++            dfb_out_obj.pop_front(ONE_TILE);
++        }
++#ifdef WRITE_TOTALS
++        dfb_totals_obj.wait_front(ONE_TILE);
++        noc.async_write(
++            dfb_totals_obj, totals_addrg, dfb_totals_obj.get_tile_size(), {.offset_bytes = 0}, {.page_id = chunk});
++        noc.async_write_barrier();
++        dfb_totals_obj.pop_front(ONE_TILE);
++#endif
++    }
++}
+diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_width_program_factory.cpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_width_program_factory.cpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_width_program_factory.cpp
+@@ -0,0 +1,303 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++// The accumulation op's width path: a forward floating-point cumsum along the last dimension, scanned
++// along the width of each row of tiles (accumulation_width_compute.cpp) instead of after permuting
++// that dimension to the front.
++//
++// Each row of tiles is scanned in chunks of chunk_tiles tiles (the last may be shorter), each from
++// zero on its own core. With more than one chunk per row (FP32), this pass also writes every chunk's
++// row totals to the chunk_totals tensor, and a second pass (add_chunk_offsets) adds the totals of the
++// earlier chunks of the row to each chunk, in place.
++
++#include "accumulation/device/accumulation_device_operation_types.hpp"
++#include "accumulation_device_operation.hpp"
++#include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
++#include "ttnn/operations/reduction/reduce_op_validation.hpp"
++
++#include "tt-metalium/base_types.hpp"
++#include "tt-metalium/host_api.hpp"
++#include "tt-metalium/kernel_types.hpp"
++#include "tt-metalium/tt_backend_api_types.hpp"
++#include "ttnn/tensor/types.hpp"
++#include <tt-metalium/experimental/metal2_host_api/program_run_args.hpp>
++#include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
++#include <tt-metalium/work_split.hpp>
++
++#include <map>
++#include <string>
++
++namespace ttnn::prim {
++
++using AccumulationWidthProgramFactory = AccumulationDeviceOperation::AccumulationWidthProgramFactory;
++
++namespace {
++
++using namespace tt::tt_metal::experimental;
++
++// Prefixed like the other factories' constants, which may share a unity-built translation unit.
++const KernelSpecName WIDTH_READER{"reader"};
++const KernelSpecName WIDTH_WRITER{"writer"};
++const KernelSpecName WIDTH_COMPUTE{"compute"};
++
++// SRC and DST carry tiles from the reader to compute and on to the writer. The scan reads a tile of
++// ZERO after each chunk and sends the chunk's totals through TOTALS to the writer; the second pass
++// reads them back through TOTALS and keeps their sum, the chunk's offset, in OFFSET.
++const DFBSpecName WIDTH_SRC{"src"};
++const DFBSpecName WIDTH_DST{"dst"};
++const DFBSpecName WIDTH_ZERO{"zero"};
++const DFBSpecName WIDTH_TOTALS{"totals"};
++const DFBSpecName WIDTH_OFFSET{"offset"};
++
++const TensorParamName WIDTH_INPUT{"input"};
++const TensorParamName WIDTH_OUTPUT{"output"};
++const TensorParamName WIDTH_TOTALS_TENSOR{"totals"};
++
++}  // namespace
++
++ttnn::device_operation::ProgramArtifacts AccumulationWidthProgramFactory::create_program_artifacts(
++    const AccumulationParams& operation_attributes,
++    const AccumulationInputs& tensor_args,
++    Tensor& tensor_return_value) {
++    using namespace tt;
++    using namespace tt::tt_metal;
++    using namespace tt::tt_metal::experimental;
++
++    const auto& input_tensor{tensor_args.input_tensor.mesh_tensor()};
++    const auto& output_tensor{tensor_return_value.mesh_tensor()};
++    const tt::tt_metal::distributed::MeshDevice& device = input_tensor.device();
++    const auto& tile = input_tensor.tensor_spec().tile();
++
++    const auto input_dataformat = datatype_to_dataformat_converter(input_tensor.dtype());
++    const auto output_dataformat = datatype_to_dataformat_converter(output_tensor.dtype());
++    TT_FATAL(
++        operation_attributes.op == AccumulationOp::CUMSUM && !operation_attributes.flip &&
++            !is_integer_format(output_dataformat),
++        "Only a forward floating-point cumsum scans along the last dimension");
++
++    const uint32_t row_tiles = input_tensor.padded_shape()[-1] / tile.get_width();
++    const bool chunked = operation_attributes.chunk_tiles != 0;
++    const uint32_t chunk_tiles = chunked ? operation_attributes.chunk_tiles : row_tiles;
++    const uint32_t chunks_per_row = (row_tiles + chunk_tiles - 1) / chunk_tiles;
++    const bool add_chunk_offsets = chunked && operation_attributes.add_chunk_offsets;
++    const bool write_totals = chunked && !add_chunk_offsets;
++    TT_FATAL(
++        !chunked || (tensor_args.chunk_totals.has_value() && input_dataformat == DataFormat::Float32 &&
++                     output_dataformat == DataFormat::Float32),
++        "A chunked width scan needs FP32 tensors and a totals tensor");
++    const uint32_t num_chunks = input_tensor.physical_volume() / tile.get_tile_hw() / row_tiles * chunks_per_row;
++
++    const auto grid = device.compute_with_storage_grid_size();
++    const auto num_cores_y = grid.y;
++    const auto [num_cores, all_cores, core_group_1, core_group_2, chunks_per_core_group_1, chunks_per_core_group_2] =
++        tt::tt_metal::split_work_to_cores(grid, num_chunks);
++    validate_reduce_op_program_grid("Accumulation", all_cores, grid, nullptr, true, {{&tensor_return_value, "output"}});
++
++    auto make_dfb = [](const DFBSpecName& unique_id, const tt::DataFormat& data_format, uint32_t num_entries) {
++        return DataflowBufferSpec{
++            .unique_id = unique_id,
++            .entry_size = tt::tile_size(data_format),
++            .num_entries = num_entries,
++            .data_format_metadata = data_format,
++        };
++    };
++
++    // FP32 tiles are unpacked straight into Dest, which SrcA would read as TF32.
++    ComputeHardwareConfig::ComputeUnpackModes unpack_modes;
++    if (input_dataformat != DataFormat::Float16_b) {
++        unpack_modes[WIDTH_SRC] = UnpackMode::UnpackToDest;
++    }
++    if (write_totals) {
++        unpack_modes[WIDTH_ZERO] = UnpackMode::UnpackToDest;
++    }
++    if (add_chunk_offsets) {
++        unpack_modes[WIDTH_TOTALS] = UnpackMode::UnpackToDest;
++        unpack_modes[WIDTH_OFFSET] = UnpackMode::UnpackToDest;
++    }
++
++    std::map<std::string, std::string> defines;
++    if (write_totals) {
++        defines["WRITE_TOTALS"] = "1";
++    }
++    if (add_chunk_offsets) {
++        defines["ADD_CHUNK_OFFSETS"] = "1";
++    }
++    const KernelSpec::CompilerOptions::Defines kernel_defines(defines);
++    // Every kernel of the width path takes the same arguments.
++    const Group<std::string> rta_names{"num_chunks", "start_chunk", "row_tiles", "chunks_per_row", "chunk_tiles"};
++
++    KernelSpec reader{
++        .unique_id = WIDTH_READER,
++        .source = KERNEL_PATHS[0],
++        .compiler_options = {.defines = kernel_defines},
++        .dfb_bindings = {DFBBinding{
++            .dfb_spec_name = WIDTH_SRC,
++            .accessor_name = "in",
++            .endpoint_type = DFBEndpointType::PRODUCER,
++        }},
++        .tensor_bindings = {TensorBinding{
++            .tensor_parameter_name = WIDTH_INPUT,
++            .accessor_name = "input",
++        }},
++        .runtime_arg_schema = {.runtime_arg_names = rta_names},
++        .hw_config = ttnn::create_reader_datamovement_config(),
++    };
++    KernelSpec writer{
++        .unique_id = WIDTH_WRITER,
++        .source = KERNEL_PATHS[2],
++        .compiler_options = {.defines = kernel_defines},
++        .dfb_bindings = {DFBBinding{
++            .dfb_spec_name = WIDTH_DST,
++            .accessor_name = "out",
++            .endpoint_type = DFBEndpointType::CONSUMER,
++        }},
++        .tensor_bindings = {TensorBinding{
++            .tensor_parameter_name = WIDTH_OUTPUT,
++            .accessor_name = "output",
++        }},
++        .runtime_arg_schema = {.runtime_arg_names = rta_names},
++        .hw_config = ttnn::create_writer_datamovement_config(),
++    };
++    Group<DFBBinding> compute_bindings{
++        DFBBinding{
++            .dfb_spec_name = WIDTH_SRC,
++            .accessor_name = "in",
++            .endpoint_type = DFBEndpointType::CONSUMER,
++        },
++        DFBBinding{
++            .dfb_spec_name = WIDTH_DST,
++            .accessor_name = "out",
++            .endpoint_type = DFBEndpointType::PRODUCER,
++        }};
++    Group<DataflowBufferSpec> dataflow_buffers{
++        make_dfb(WIDTH_SRC, input_dataformat, 4), make_dfb(WIDTH_DST, output_dataformat, 4)};
++    Group<TensorParameter> tensor_parameters{
++        TensorParameter{.unique_id = WIDTH_INPUT, .spec = input_tensor.tensor_spec()},
++        TensorParameter{.unique_id = WIDTH_OUTPUT, .spec = output_tensor.tensor_spec()}};
++
++    if (write_totals) {
++        reader.dfb_bindings.push_back(DFBBinding{
++            .dfb_spec_name = WIDTH_ZERO,
++            .accessor_name = "zero",
++            .endpoint_type = DFBEndpointType::PRODUCER,
++        });
++        compute_bindings.push_back(DFBBinding{
++            .dfb_spec_name = WIDTH_ZERO,
++            .accessor_name = "zero",
++            .endpoint_type = DFBEndpointType::CONSUMER,
++        });
++        compute_bindings.push_back(DFBBinding{
++            .dfb_spec_name = WIDTH_TOTALS,
++            .accessor_name = "totals",
++            .endpoint_type = DFBEndpointType::PRODUCER,
++        });
++        writer.dfb_bindings.push_back(DFBBinding{
++            .dfb_spec_name = WIDTH_TOTALS,
++            .accessor_name = "totals",
++            .endpoint_type = DFBEndpointType::CONSUMER,
++        });
++        writer.tensor_bindings.push_back(TensorBinding{
++            .tensor_parameter_name = WIDTH_TOTALS_TENSOR,
++            .accessor_name = "totals",
++        });
++        dataflow_buffers.push_back(make_dfb(WIDTH_ZERO, DataFormat::Float32, 1));
++    }
++    if (add_chunk_offsets) {
++        reader.dfb_bindings.push_back(DFBBinding{
++            .dfb_spec_name = WIDTH_TOTALS,
++            .accessor_name = "totals",
++            .endpoint_type = DFBEndpointType::PRODUCER,
++        });
++        reader.tensor_bindings.push_back(TensorBinding{
++            .tensor_parameter_name = WIDTH_TOTALS_TENSOR,
++            .accessor_name = "totals",
++        });
++        compute_bindings.push_back(DFBBinding{
++            .dfb_spec_name = WIDTH_TOTALS,
++            .accessor_name = "totals",
++            .endpoint_type = DFBEndpointType::CONSUMER,
++        });
++        // Both ends of the offset FIFO belong to the compute kernel.
++        compute_bindings.push_back(DFBBinding{
++            .dfb_spec_name = WIDTH_OFFSET,
++            .accessor_name = "offset",
++            .endpoint_type = DFBEndpointType::PRODUCER,
++        });
++        compute_bindings.push_back(DFBBinding{
++            .dfb_spec_name = WIDTH_OFFSET,
++            .accessor_name = "offset",
++            .endpoint_type = DFBEndpointType::CONSUMER,
++        });
++        dataflow_buffers.push_back(make_dfb(WIDTH_OFFSET, DataFormat::Float32, 1));
++    }
++    if (chunked) {
++        dataflow_buffers.push_back(make_dfb(WIDTH_TOTALS, DataFormat::Float32, 2));
++        tensor_parameters.push_back(
++            TensorParameter{.unique_id = WIDTH_TOTALS_TENSOR, .spec = tensor_args.chunk_totals->tensor_spec()});
++    }
++
++    // As in AccumulationProgramFactory: HiFi4 with an FP32 Dest gives wrong results on Wormhole (#38306).
++    const auto default_math_fidelity =
++        (device.arch() == tt::ARCH::WORMHOLE_B0 && output_tensor.dtype() == DataType::FLOAT32) ? MathFidelity::HiFi3
++                                                                                               : MathFidelity::HiFi4;
++    const ComputeHardwareConfig compute_config{
++        .fpu_math_fidelity = default_math_fidelity,
++        .sfpu_precision_mode = Precision::Precise,
++        .enable_32_bit_dest = true,
++        .double_buffer_dest = true,
++        .unpack_modes = unpack_modes,
++    };
++    KernelSpec compute{
++        .unique_id = WIDTH_COMPUTE,
++        .source = KERNEL_PATHS[add_chunk_offsets ? 3 : 1],
++        .compiler_options = {.defines = kernel_defines, .opt_level = KernelBuildOptLevel::O3},
++        .dfb_bindings = compute_bindings,
++        .runtime_arg_schema = {.runtime_arg_names = rta_names},
++        .hw_config = ComputeHardwareConfig{compute_config},
++    };
++
++    // The work split's two core groups only differ in how many chunks a core scans.
++    KernelRunArgs reader_run_args{.kernel = WIDTH_READER};
++    KernelRunArgs writer_run_args{.kernel = WIDTH_WRITER};
++    KernelRunArgs compute_run_args{.kernel = WIDTH_COMPUTE};
++    for (uint32_t i = 0, start_chunk = 0; i < num_cores; ++i) {
++        const NodeCoord node{i / num_cores_y, i % num_cores_y};
++        const uint32_t core_chunks =
++            core_group_1.contains(node) ? chunks_per_core_group_1 : chunks_per_core_group_2;
++        for (auto* run_args : {&reader_run_args, &writer_run_args, &compute_run_args}) {
++            AddRuntimeArgsForNode(
++                run_args->runtime_arg_values,
++                node,
++                {{"num_chunks", core_chunks},
++                 {"start_chunk", start_chunk},
++                 {"row_tiles", row_tiles},
++                 {"chunks_per_row", chunks_per_row},
++                 {"chunk_tiles", chunk_tiles}});
++        }
++        start_chunk += core_chunks;
++    }
++
++    ProgramSpec spec{
++        .name = "accumulation_width",
++        .kernels = {std::move(reader), std::move(writer), std::move(compute)},
++        .dataflow_buffers = std::move(dataflow_buffers),
++        .tensor_parameters = std::move(tensor_parameters),
++        .work_units = {WorkUnitSpec{
++            .name = "accumulation_width",
++            .kernels = {WIDTH_READER, WIDTH_WRITER, WIDTH_COMPUTE},
++            .target_nodes = all_cores,
++        }},
++    };
++    ProgramRunArgs run_args{
++        .kernel_run_args = {std::move(reader_run_args), std::move(writer_run_args), std::move(compute_run_args)},
++        .tensor_args = {{WIDTH_INPUT, input_tensor}, {WIDTH_OUTPUT, output_tensor}},
++    };
++    if (chunked) {
++        run_args.tensor_args.insert({WIDTH_TOTALS_TENSOR, tensor_args.chunk_totals->mesh_tensor()});
++    }
++
++    return ttnn::device_operation::ProgramArtifacts{.spec = std::move(spec), .run_params = std::move(run_args)};
++}
++
++}  // namespace ttnn::prim
