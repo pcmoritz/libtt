@@ -1,0 +1,17 @@
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -1173,8 +1173,12 @@
+       ::ttnn::distributed::get_device_tensors(
+           utils::getTTNNTensorFromRuntimeTensor(multiDeviceHostTensor));
+ 
++  // A non-blocking read records its event on the host tensor it returns, which
++  // the per-device host tensors must carry for wait() to cover the read.
+   const std::optional<::ttnn::MeshEvent> &meshEvent =
+-      tensorWrapper.getMeshEvent();
++      multiDeviceHostTensor
++          .as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN)
++          .getMeshEvent();
+ 
+   std::vector<::tt::runtime::Tensor> hostTensors;
+   for (const ::ttnn::Tensor &tensor : singleTensors) {
