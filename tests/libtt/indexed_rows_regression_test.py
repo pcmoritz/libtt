@@ -111,6 +111,21 @@ def test_gather_with_batching_dims():
     assert_equal(got, np.take_along_axis(x, idx, axis=2))
 
 
+def test_take_along_last_axis_with_unit_leading_axis(tmp_path):
+    # Speculative sampling's draft token probabilities: with a size-1 leading
+    # axis, JAX makes it an offset dim rather than a batching dim. Size-1 dims
+    # move no data, so the operand keeps its order and each position reads a
+    # column of its row's page: no permute, no one-element rows.
+    rng = np.random.default_rng(13)
+    x = rng.normal(size=(1, 5, 4096)).astype(np.float32)
+    idx = rng.integers(0, 4096, size=(1, 5, 1)).astype(np.int32)
+    result, ir = _compile_ir(tmp_path, lambda x, i: jnp.take_along_axis(x, i, axis=-1), x, idx)
+    assert_equal(result, np.take_along_axis(x, idx, axis=-1))
+    gathers = [line for line in ir.splitlines() if '"ttnn.rows_gather"' in line]
+    assert gathers and all("column = true" in line for line in gathers), gathers
+    assert '"ttnn.permute"' not in ir
+
+
 def test_gather_bool_and_wide_rows():
     rng = np.random.default_rng(8)
     mask = rng.integers(0, 2, size=(16, 40)).astype(bool)
