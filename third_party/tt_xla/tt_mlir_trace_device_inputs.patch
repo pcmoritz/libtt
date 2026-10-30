@@ -1,17 +1,14 @@
 diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/include/tt/runtime/detail/ttnn/types/types.h
 --- a/runtime/include/tt/runtime/detail/ttnn/types/types.h
 +++ b/runtime/include/tt/runtime/detail/ttnn/types/types.h
-@@ -114,6 +114,13 @@ struct LayoutDesc {
+@@ -114,6 +114,10 @@
    ::ttnn::Layout layout;
    ::ttnn::DataType dataType;
    std::optional<::ttnn::MemoryConfig> memoryConfig;
-+  // For a host program input: the program it belongs to. A device tensor
-+  // of the same data type is accepted as is if a trace only copies the input
-+  // into its input slot (which then happens on device, instead of
-+  // round-tripping through the host).
-+  std::optional<::tt::runtime::Binary> binary;
-+  std::uint32_t programIndex = 0;
-+  std::uint32_t inputIndex = 0;
++  // For a host program input: whether a trace only copies the input into its
++  // input slot. A device tensor of the same data type is then accepted as is
++  // (the copy happens on device, instead of round-tripping through the host).
++  bool hostStagedTraceInput = false;
  
    static std::shared_ptr<LayoutDesc>
    fromTensor(const ::tt::runtime::Tensor &tensor);
@@ -99,7 +96,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -954,6 +954,43 @@
+@@ -1002,6 +1002,47 @@
    return result;
  }
  
@@ -124,6 +121,10 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +    std::vector<TensorRef> refs =
 +        getOpInputRefs(OpContext(opHandle, DeviceRuntime::TTNN));
 +    for (std::uint32_t i = 0; i < refs.size(); ++i) {
++      // Absent optional operands (e.g. a paged attention mask) are null.
++      if (!refs[i].handle) {
++        continue;
++      }
 +      const auto &ref =
 +          refs[i].as<::tt::target::ttnn::TensorRef>(DeviceRuntime::TTNN);
 +      if (ref.global_id() != id) {
@@ -143,27 +144,27 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
    const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
        LayoutDesc::fromTensor(tensor);
-@@ -961,6 +998,12 @@
+@@ -1009,6 +1050,11 @@
    const LayoutDesc &desiredLayoutDesc =
        layout.as<LayoutDesc>(DeviceRuntime::TTNN);
  
-+  if (desiredLayoutDesc.binary && tensorLayoutDesc->isOnDevice() &&
++  if (desiredLayoutDesc.hostStagedTraceInput &&
++      tensorLayoutDesc->isOnDevice() &&
 +      tensorLayoutDesc->dataType == desiredLayoutDesc.dataType) {
-+    return isHostStagedTraceInput(*desiredLayoutDesc.binary,
-+                                  desiredLayoutDesc.programIndex,
-+                                  desiredLayoutDesc.inputIndex);
++    return true;
 +  }
    return *tensorLayoutDesc == desiredLayoutDesc;
  }
  
-@@ -999,6 +1042,11 @@
+@@ -1047,6 +1093,12 @@
  
    std::shared_ptr<LayoutDesc> layoutDesc = std::make_shared<LayoutDesc>(
        inputStorageType, inputLayout, inputDataType, inputMemoryConfig);
 +  if (utils::isOnHost(inputStorageType)) {
-+    layoutDesc->binary = executableHandle;
-+    layoutDesc->programIndex = programIndex;
-+    layoutDesc->inputIndex = inputIndex;
++    // Scans the program's operations: done once here, as the executable
++    // caches its input layouts, not on every hasLayout check.
++    layoutDesc->hostStagedTraceInput =
++        isHostStagedTraceInput(executableHandle, programIndex, inputIndex);
 +  }
  
    return Layout(std::static_pointer_cast<void>(layoutDesc),
