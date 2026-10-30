@@ -13,7 +13,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
  #include "stablehlo/dialect/StablehloOps.h"
  
  #include <numeric>
-@@ -102,8 +104,221 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
+@@ -102,8 +104,218 @@ void addMeshToModule(mlir::ModuleOp &module, std::string meshName,
    addMeshToModule(module, meshName, meshMap);
  }
  
@@ -89,7 +89,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +// of one mesh is a run of whole axes of another when their spans of device
 +// strides tile its span, as both axes of a (2, 2) mesh tile the axis of a
 +// (1, 4) one. Rewrite every sharding and manual axis onto the first mesh that
-+// tiles every axis of every mesh, and drop the others.
++// tiles every axis of every mesh, and drop the others, empty ones included.
 +mlir::LogicalResult mergeMeshes(mlir::ModuleOp &module) {
 +  llvm::SmallVector<mlir::sdy::MeshOp> meshOps;
 +  for (mlir::sdy::MeshOp meshOp : getMeshOps(module)) {
@@ -98,7 +98,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +    }
 +  }
 +  if (meshOps.size() < 2) {
-+    return mlir::success();
++    return replaceEmptyMeshes(module);
 +  }
 +
 +  // An empty list of device ids means 0..n-1, so compare device counts too.
@@ -221,7 +221,7 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +      meshOp.erase();
 +    }
 +  }
-+  return mlir::success();
++  return replaceEmptyMeshes(module);
 +}
 +
  // Normalize a 0D or 1D mesh to 2D. 0D meshes get {1,1}, 1D meshes get {1,N}.
@@ -229,13 +229,10 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
 +  if (mlir::failed(mergeMeshes(module))) {
 +    return mlir::failure();
 +  }
-+  if (mlir::failed(replaceEmptyMeshes(module))) {
-+    return mlir::failure();
-+  }
    auto meshOps = getMeshOps(module);
    if (meshOps.empty()) {
      return mlir::success();
-@@ -132,6 +347,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
+@@ -132,6 +344,11 @@ mlir::LogicalResult normalizeMeshTo2D(mlir::ModuleOp &module) {
    if (meshRank == 1) {
      axisName = meshOps[0].getMeshAttr().getAxes()[0].getName().str();
      axisSize = meshShape[0];
