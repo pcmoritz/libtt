@@ -14,6 +14,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <sys/file.h>
 #include <unistd.h>
 
 namespace {
@@ -56,6 +57,29 @@ class ScopedCurrentDirectory {
 
  private:
   int original_fd_;
+};
+
+class ScopedFileLock {
+ public:
+  explicit ScopedFileLock(const std::string& path)
+      : fd_(open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666)) {
+    if (fd_ == -1 || flock(fd_, LOCK_EX) != 0) {
+      const std::string message = "failed to lock tt-metal runtime directory: " +
+                                  std::string(std::strerror(errno));
+      if (fd_ != -1) {
+        close(fd_);
+      }
+      throw std::runtime_error(message);
+    }
+  }
+
+  ScopedFileLock(const ScopedFileLock&) = delete;
+  ScopedFileLock& operator=(const ScopedFileLock&) = delete;
+
+  ~ScopedFileLock() { close(fd_); }
+
+ private:
+  int fd_;
 };
 
 void ExtractEmbeddedRuntimeArchive(const std::filesystem::path& root) {
@@ -121,7 +145,20 @@ std::filesystem::path MaterializeEmbeddedRuntimeRoot() {
       temp_root / ("libtt-tt-metal-runtime-assets-" +
                    std::string(embedded::kRuntimeArchiveFingerprint));
 
-  ExtractEmbeddedRuntimeArchive(root);
+  // Processes that start together, one per chip, extract the archive once:
+  // the first under the lock, and the others reuse the finished directory
+  // instead of rewriting files that a running process may be reading.
+  ScopedFileLock lock(root.string() + ".lock");
+  const std::filesystem::path marker = root / ".extracted";
+  if (!std::filesystem::exists(marker)) {
+    ExtractEmbeddedRuntimeArchive(root);
+    const int fd = open(marker.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+    if (fd == -1) {
+      throw std::runtime_error("failed to mark tt-metal runtime directory: " +
+                               std::string(std::strerror(errno)));
+    }
+    close(fd);
+  }
   return root;
 }
 
