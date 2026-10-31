@@ -81,7 +81,7 @@ diff --git tt_metal/impl/tensor/spec/tensor_spec.cpp tt_metal/impl/tensor/spec/t
 diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
 --- tt_metal/impl/tensor/tensor_apis.cpp
 +++ tt_metal/impl/tensor/tensor_apis.cpp
-@@ -299,43 +299,38 @@
+@@ -278,10 +278,7 @@
          return tensor;
      }
  
@@ -89,73 +89,11 @@ diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis
 -        // FP8_E4M3 is constrained to ROW_MAJOR, so tilizing it is a caller error.
 -        TT_THROW("to_layout: FP8_E4M3 only supports ROW_MAJOR layout (got target {})", Layout::TILE);
 -    } else {
--        TT_FATAL(tensor.layout() == Layout::ROW_MAJOR, "Converting from {} to Tile is unsupported.", tensor.layout());
--
--        auto output_spec = TensorSpec(
--            tensor.logical_shape(),
--            TensorLayout(
--                tensor.dtype(),
--                PageConfig(Layout::TILE, tile),
--                tensor.memory_config(),
--                tensor.tensor_spec().tensor_layout().get_alignment()));
--
--        TT_FATAL(
--            output_spec.physical_shape() == tensor.tensor_spec().physical_shape(),
--            "to_layout: Converting layout to {} implicitly changed physical shape from {} to {} due to alignment "
--            "constraints. This is currently unsupported. Please pad the tensor explicitly before conversion.",
--            Layout::TILE,
--            tensor.tensor_spec().physical_shape(),
--            output_spec.physical_shape());
--
--        auto physical_shape = tensor.tensor_spec().physical_shape();
--
--        auto transformed_buffer = tensor.buffer().transform(
--            [&](const HostBuffer& buffer) {
--                auto input_data = buffer.view_as<T>();
--                auto tilized_data = tensor_impl::to_tile_major_layout(physical_shape, tile, input_data);
--                return HostBuffer(std::move(tilized_data));
--            },
--            DistributedHostBuffer::ProcessShardExecutionPolicy::PARALLEL);
-+    TT_FATAL(tensor.layout() == Layout::ROW_MAJOR, "Converting from {} to Tile is unsupported.", tensor.layout());
++    {
+         TT_FATAL(tensor.layout() == Layout::ROW_MAJOR, "Converting from {} to Tile is unsupported.", tensor.layout());
  
--        assert_host_shards_match_packed_size(transformed_buffer, output_spec, "to_tile_layout");
-+    auto output_spec = TensorSpec(
-+        tensor.logical_shape(),
-+        TensorLayout(
-+            tensor.dtype(),
-+            PageConfig(Layout::TILE, tile),
-+            tensor.memory_config(),
-+            tensor.tensor_spec().tensor_layout().get_alignment()));
-+
-+    TT_FATAL(
-+        output_spec.physical_shape() == tensor.tensor_spec().physical_shape(),
-+        "to_layout: Converting layout to {} implicitly changed physical shape from {} to {} due to alignment "
-+        "constraints. This is currently unsupported. Please pad the tensor explicitly before conversion.",
-+        Layout::TILE,
-+        tensor.tensor_spec().physical_shape(),
-+        output_spec.physical_shape());
-+
-+    auto physical_shape = tensor.tensor_spec().physical_shape();
-+
-+    auto transformed_buffer = tensor.buffer().transform(
-+        [&](const HostBuffer& buffer) {
-+            auto input_data = buffer.view_as<T>();
-+            auto tilized_data = tensor_impl::to_tile_major_layout(physical_shape, tile, input_data);
-+            return HostBuffer(std::move(tilized_data));
-+        },
-+        DistributedHostBuffer::ProcessShardExecutionPolicy::PARALLEL);
- 
--        return host_tensor_from_buffer_with_topology(
--            std::move(transformed_buffer), output_spec, get_tensor_topology(tensor));
--    }
-+    assert_host_shards_match_packed_size(transformed_buffer, output_spec, "to_tile_layout");
-+
-+    return host_tensor_from_buffer_with_topology(
-+        std::move(transformed_buffer), output_spec, get_tensor_topology(tensor));
- }
- 
- }  // namespace CMAKE_UNIQUE_NAMESPACE
-@@ -343,17 +338,13 @@
+         auto output_spec = TensorSpec(
+@@ -322,17 +319,13 @@
  
  HostTensor to_row_major_layout(const HostTensor& tensor) {
      return tensor_impl::dispatch(tensor.dtype(), [&]<typename T>() {

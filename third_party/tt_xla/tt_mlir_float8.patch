@@ -205,7 +205,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
 new file mode 100644
 --- /dev/null
 +++ b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
-@@ -0,0 +1,630 @@
+@@ -0,0 +1,547 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -452,109 +452,58 @@ new file mode 100644
 +  }
 +};
 +
-+// Custom calls that only move values, as sharding annotations do. Others, such
-+// as mhlo.topk, mhlo.erf or tt.sampling, compute on them, so they decode
-+// float8 operands like other ops instead of comparing or adding their bits.
-+bool movesValues(mlir::stablehlo::CustomCallOp op) {
-+  static constexpr StringLiteral targets[] = {
-+      "Sharding", "SPMDFullToShardShape", "SPMDShardToFullShape",
-+      "xla.sdy.FuncResultSharding"};
-+  return llvm::is_contained(targets, op.getCallTargetName());
++// Ops that only move values, which move the bits: data movement, Shardy's
++// collectives and reshards (sdy.all_slice composites), and control flow (and
++// shard_map's sdy.manual_computation), which carries them through its regions.
++// Custom calls move them only as sharding annotations do: others, such as
++// mhlo.topk, mhlo.erf or tt.sampling, compute on the values instead of
++// comparing or adding their bits.
++bool movesBits(Operation *op) {
++  if (auto call = dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
++    static constexpr StringLiteral targets[] = {
++        "Sharding", "SPMDFullToShardShape", "SPMDShardToFullShape",
++        "xla.sdy.FuncResultSharding"};
++    return llvm::is_contained(targets, call.getCallTargetName());
++  }
++  if (auto composite = dyn_cast<mlir::stablehlo::CompositeOp>(op)) {
++    return composite.getName() == "sdy.all_slice";
++  }
++  return isa<mlir::stablehlo::AllGatherOp, mlir::stablehlo::AllToAllOp,
++             mlir::stablehlo::BroadcastInDimOp, mlir::stablehlo::CaseOp,
++             mlir::stablehlo::CollectivePermuteOp,
++             mlir::stablehlo::ConcatenateOp, mlir::stablehlo::DynamicSliceOp,
++             mlir::stablehlo::DynamicUpdateSliceOp, mlir::stablehlo::GatherOp,
++             mlir::stablehlo::GetTupleElementOp, mlir::stablehlo::IfOp,
++             mlir::stablehlo::OptimizationBarrierOp, mlir::stablehlo::PadOp,
++             mlir::stablehlo::ReshapeOp, mlir::stablehlo::ReturnOp,
++             mlir::stablehlo::ReverseOp, mlir::stablehlo::SelectOp,
++             mlir::stablehlo::SliceOp, mlir::stablehlo::TransposeOp,
++             mlir::stablehlo::TupleOp, mlir::stablehlo::WhileOp,
++             mlir::sdy::ManualComputationOp, mlir::sdy::ReturnOp,
++             mlir::sdy::ShardingConstraintOp>(op);
 +}
 +
-+// Ops that only move values: they move the bits.
-+template <typename OpTy>
-+class Float8BitsPassthroughPattern : public OpConversionPattern<OpTy> {
-+  using OpConversionPattern<OpTy>::OpConversionPattern;
-+
++// Such an op is rebuilt on the bits: its regions take and return ui8 tensors,
++// and the ops in them convert like any others.
++class Float8BitsPattern : public ConversionPattern {
 +public:
-+  LogicalResult
-+  matchAndRewrite(OpTy op, typename OpConversionPattern<OpTy>::OpAdaptor adaptor,
-+                  ConversionPatternRewriter &rewriter) const override {
-+    if constexpr (std::is_same_v<OpTy, mlir::stablehlo::CustomCallOp>) {
-+      if (!movesValues(op)) {
-+        return failure();
-+      }
-+    }
-+    SmallVector<Type> resultTypes;
-+    if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
-+                                                      resultTypes))) {
-+      return failure();
-+    }
-+    rewriter.replaceOpWithNewOp<OpTy>(
-+        op, resultTypes, adaptor.getOperands(), op.getProperties(),
-+        llvm::to_vector(op->getDiscardableAttrs()));
-+    return success();
-+  }
-+};
-+
-+// Other ops without regions compute on f32 values: float8 operands are
-+// decoded and float8 results encoded.
-+class Float8ComputeInFloat32Pattern : public ConversionPattern {
-+public:
-+  Float8ComputeInFloat32Pattern(const TypeConverter &typeConverter,
-+                                MLIRContext *context)
-+      : ConversionPattern(typeConverter, MatchAnyOpTypeTag(), /*benefit=*/0,
++  Float8BitsPattern(const TypeConverter &typeConverter, MLIRContext *context)
++      : ConversionPattern(typeConverter, MatchAnyOpTypeTag(), /*benefit=*/1,
 +                          context) {}
 +
 +  LogicalResult
 +  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
 +                  ConversionPatternRewriter &rewriter) const override {
-+    if (!isa<mlir::stablehlo::StablehloDialect>(op->getDialect()) ||
-+        isa<mlir::stablehlo::CompositeOp>(op) || op->getNumRegions() != 0 ||
-+        !hasFloat8(op)) {
++    if (!movesBits(op)) {
 +      return failure();
 +    }
-+    SmallVector<Value> newOperands;
-+    for (auto [original, converted] :
-+         llvm::zip_equal(op->getOperands(), operands)) {
-+      newOperands.push_back(
-+          isFloat8(original.getType())
-+              ? decodeFloat8(rewriter, op->getLoc(), converted,
-+                             getFloat8Type(original.getType()))
-+              : converted);
-+    }
 +    SmallVector<Type> resultTypes;
-+    for (Type type : op->getResultTypes()) {
-+      resultTypes.push_back(isFloat8(type)
-+                                ? withElementType(type, rewriter.getF32Type())
-+                                : type);
-+    }
-+    OperationState state(op->getLoc(), op->getName(), newOperands,
-+                         resultTypes, llvm::to_vector(op->getDiscardableAttrs()));
-+    state.propertiesAttr = op->getPropertiesAsAttribute();
-+    Operation *newOp = rewriter.create(state);
-+    SmallVector<Value> results;
-+    for (auto [original, result] :
-+         llvm::zip_equal(op->getResults(), newOp->getResults())) {
-+      results.push_back(isFloat8(original.getType())
-+                            ? encodeFloat8(rewriter, op->getLoc(), result,
-+                                           getFloat8Type(original.getType()))
-+                            : result);
-+    }
-+    rewriter.replaceOp(op, results);
-+    return success();
-+  }
-+};
-+
-+// Control flow (and shard_map's sdy.manual_computation) carries float8 values
-+// as their bits: its regions take and return ui8 tensors, and the ops in them
-+// convert like any others.
-+template <typename OpTy>
-+class Float8ControlFlowPattern : public OpConversionPattern<OpTy> {
-+  using OpConversionPattern<OpTy>::OpConversionPattern;
-+
-+public:
-+  LogicalResult
-+  matchAndRewrite(OpTy op, typename OpConversionPattern<OpTy>::OpAdaptor adaptor,
-+                  ConversionPatternRewriter &rewriter) const override {
-+    SmallVector<Type> resultTypes;
-+    if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
-+                                                      resultTypes))) {
++    if (failed(getTypeConverter()->convertTypes(op->getResultTypes(),
++                                                resultTypes))) {
 +      return failure();
 +    }
-+    OperationState state(op->getLoc(), op->getName(), adaptor.getOperands(),
-+                         resultTypes, llvm::to_vector(op->getDiscardableAttrs()));
++    OperationState state(op->getLoc(), op->getName(), operands, resultTypes,
++                         llvm::to_vector(op->getDiscardableAttrs()));
 +    state.propertiesAttr = op->getPropertiesAsAttribute();
 +    for (unsigned i = 0; i < op->getNumRegions(); ++i) {
 +      state.addRegion();
@@ -564,7 +513,7 @@ new file mode 100644
 +         llvm::zip_equal(op->getRegions(), newOp->getRegions())) {
 +      rewriter.inlineRegionBefore(region, newRegion, newRegion.end());
 +      if (failed(rewriter.convertRegionTypes(&newRegion,
-+                                             *this->getTypeConverter()))) {
++                                             *getTypeConverter()))) {
 +        return failure();
 +      }
 +    }
@@ -573,14 +522,14 @@ new file mode 100644
 +  }
 +};
 +
-+// An op whose regions compute on float8 values (reduce, sort, scatter, ...),
-+// rather than carry them as control flow does.
-+bool computesInRegions(Operation *op) {
++// The other StableHLO ops on float8 values compute on them, except those with
++// patterns of their own.
++bool computesOnFloat8(Operation *op) {
 +  return isa<mlir::stablehlo::StablehloDialect>(op->getDialect()) &&
-+         op->getNumRegions() != 0 &&
-+         !isa<mlir::stablehlo::WhileOp, mlir::stablehlo::CaseOp,
-+              mlir::stablehlo::IfOp>(op) &&
-+         hasFloat8(op);
++         !isa<mlir::stablehlo::BitcastConvertOp, mlir::stablehlo::CompositeOp,
++              mlir::stablehlo::ConstantOp, mlir::stablehlo::ConvertOp,
++              mlir::stablehlo::DotGeneralOp>(op) &&
++         !movesBits(op) && hasFloat8(op);
 +}
 +
 +// The f32 values of a float8 constant.
@@ -602,10 +551,11 @@ new file mode 100644
 +// Such an op computes on f32 values instead: the float8 values it uses, as
 +// operands or from above its regions (such as a comparator's constants that
 +// canonicalization hoisted), are decoded, the float8 values in its regions
-+// (scalars, such as a comparator's arguments and constants) become f32, and its
-+// float8 results are encoded again. A float8 constant becomes an f32 constant,
-+// which patterns for a reduction's initial value look for.
-+void computeRegionsInFloat32(Operation *op) {
++// (reduce, sort, scatter, ...: scalars, such as a comparator's arguments and
++// constants) become f32, and its float8 results are encoded again. A float8
++// constant becomes an f32 constant, which patterns for a reduction's initial
++// value look for.
++void computeInFloat32(Operation *op) {
 +  OpBuilder builder(op);
 +  Type f32 = builder.getF32Type();
 +  auto decode = [&](Value value) -> Value {
@@ -682,10 +632,9 @@ new file mode 100644
 +  }
 +}
 +
-+// Composites: Shardy's reshards (sdy.all_slice) only move values, so they
-+// move the bits, and their decompositions convert with the other functions.
-+// Others compute: they become calls of their decomposition, which computes like
-+// any other function, instead of reaching a TTIR lowering with the bits.
++// Composites other than Shardy's reshards compute: they become calls of their
++// decomposition, which computes like any other function, instead of reaching a
++// TTIR lowering with the bits.
 +class Float8CompositePattern
 +    : public OpConversionPattern<mlir::stablehlo::CompositeOp> {
 +  using OpConversionPattern::OpConversionPattern;
@@ -694,19 +643,16 @@ new file mode 100644
 +  LogicalResult
 +  matchAndRewrite(mlir::stablehlo::CompositeOp op, OpAdaptor adaptor,
 +                  ConversionPatternRewriter &rewriter) const override {
++    if (movesBits(op)) {
++      return failure();
++    }
 +    SmallVector<Type> resultTypes;
 +    if (failed(getTypeConverter()->convertTypes(op->getResultTypes(),
 +                                                resultTypes))) {
 +      return failure();
 +    }
-+    if (op.getName() == "sdy.all_slice") {
-+      rewriter.replaceOpWithNewOp<mlir::stablehlo::CompositeOp>(
-+          op, resultTypes, adaptor.getOperands(), op.getProperties(),
-+          llvm::to_vector(op->getDiscardableAttrs()));
-+    } else {
-+      rewriter.replaceOpWithNewOp<func::CallOp>(
-+          op, op.getDecomposition(), resultTypes, adaptor.getOperands());
-+    }
++    rewriter.replaceOpWithNewOp<func::CallOp>(
++        op, op.getDecomposition(), resultTypes, adaptor.getOperands());
 +    return success();
 +  }
 +};
@@ -719,26 +665,24 @@ new file mode 100644
 +      StableHLOFloat8DataTypeConversionPassBase;
 +
 +  void runOnOperation() override {
++    // Ops that compute on float8 values compute on f32 values first, and the
++    // conversion below stores the remaining float8 values as their bits.
 +    bool anyFloat8 = false;
-+    getOperation()->walk([&](Operation *op) {
-+      if (hasFloat8(op)) {
-+        anyFloat8 = true;
-+        return WalkResult::interrupt();
++    SmallVector<Operation *> computing;
++    getOperation()->walk<WalkOrder::PreOrder>([&](Operation *op) {
++      anyFloat8 |= hasFloat8(op);
++      if (computesOnFloat8(op)) {
++        computing.push_back(op);
++        // Its regions compute in f32 with it.
++        return WalkResult::skip();
 +      }
 +      return WalkResult::advance();
 +    });
 +    if (!anyFloat8) {
 +      return;
 +    }
-+
-+    SmallVector<Operation *> computing;
-+    getOperation()->walk([&](Operation *op) {
-+      if (computesInRegions(op)) {
-+        computing.push_back(op);
-+      }
-+    });
 +    for (Operation *op : computing) {
-+      computeRegionsInFloat32(op);
++      computeInFloat32(op);
 +    }
 +
 +    MLIRContext *context = &getContext();
@@ -791,37 +735,10 @@ new file mode 100644
 +    });
 +
 +    RewritePatternSet patterns(context);
-+    patterns.add<
-+        Float8BitcastConvertOpConversionPattern,
-+        Float8ConstantOpConversionPattern, Float8ConvertOpConversionPattern,
-+        Float8DotGeneralOpConversionPattern, Float8CompositePattern,
-+        Float8ControlFlowPattern<mlir::stablehlo::CaseOp>,
-+        Float8ControlFlowPattern<mlir::stablehlo::IfOp>,
-+        Float8ControlFlowPattern<mlir::stablehlo::WhileOp>,
-+        Float8ControlFlowPattern<mlir::sdy::ManualComputationOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::AllGatherOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::AllToAllOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::BroadcastInDimOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::CollectivePermuteOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::ConcatenateOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::CustomCallOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::DynamicSliceOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::DynamicUpdateSliceOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::GatherOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::GetTupleElementOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::OptimizationBarrierOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::PadOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::ReshapeOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::ReturnOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::ReverseOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::SelectOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::SliceOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::TransposeOp>,
-+        Float8BitsPassthroughPattern<mlir::stablehlo::TupleOp>,
-+        Float8BitsPassthroughPattern<mlir::sdy::ReturnOp>,
-+        Float8BitsPassthroughPattern<mlir::sdy::ShardingConstraintOp>>(
-+        typeConverter, context);
-+    patterns.add<Float8ComputeInFloat32Pattern>(typeConverter, context);
++    patterns.add<Float8BitcastConvertOpConversionPattern, Float8BitsPattern,
++                 Float8CompositePattern, Float8ConstantOpConversionPattern,
++                 Float8ConvertOpConversionPattern,
++                 Float8DotGeneralOpConversionPattern>(typeConverter, context);
 +    populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(
 +        patterns, typeConverter);
 +    populateReturnOpTypeConversionPattern(patterns, typeConverter);
