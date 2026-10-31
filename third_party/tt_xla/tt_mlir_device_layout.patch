@@ -1,0 +1,69 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/ttnn.h b/runtime/include/tt/runtime/detail/ttnn/ttnn.h
+--- a/runtime/include/tt/runtime/detail/ttnn/ttnn.h
++++ b/runtime/include/tt/runtime/detail/ttnn/ttnn.h
+@@ -252,6 +252,8 @@ bool hasLayout(Tensor tensor, Layout layout);
+ 
+ Layout getTensorLayout(Tensor tensor);
+ 
++Layout getDeviceLayout(::tt::target::DataType dataType);
++
+ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
+                  std::uint32_t inputIndex);
+ 
+diff --git a/runtime/include/tt/runtime/runtime.h b/runtime/include/tt/runtime/runtime.h
+--- a/runtime/include/tt/runtime/runtime.h
++++ b/runtime/include/tt/runtime/runtime.h
+@@ -235,6 +235,9 @@ bool hasLayout(Tensor tensor, Layout layout);
+ 
+ Layout getTensorLayout(Tensor tensor);
+ 
++// The layout of a program argument on device: tiled, interleaved in DRAM.
++Layout getDeviceLayout(::tt::target::DataType dataType);
++
+ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
+                  std::uint32_t inputIndex);
+ 
+diff --git a/runtime/lib/runtime.cpp b/runtime/lib/runtime.cpp
+--- a/runtime/lib/runtime.cpp
++++ b/runtime/lib/runtime.cpp
+@@ -111,6 +111,22 @@ uint32_t getNumShards(Tensor tensor) {
+       });
+ }
+ } // namespace detail
++Layout getDeviceLayout(::tt::target::DataType dataType) {
++  using RetType = Layout;
++  return DISPATCH_TO_CURRENT_RUNTIME(
++      RetType,
++      [&]() -> RetType {
++        return ::tt::runtime::ttnn::getDeviceLayout(dataType);
++      },
++      [&]() -> RetType {
++        detail::fatalNotImplemented("getDeviceLayout", DeviceRuntime::TTMetal);
++      },
++      [&]() -> RetType {
++        detail::fatalNotImplemented("getDeviceLayout",
++                                    HostRuntime::Distributed);
++      });
++}
++
+ Layout getTensorLayout(Tensor tensor) {
+   using RetType = Layout;
+   return DISPATCH_TO_CURRENT_RUNTIME(
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -1303,6 +1303,14 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
+   return *tensorLayoutDesc == desiredLayoutDesc;
+ }
+ 
++Layout getDeviceLayout(::tt::target::DataType dataType) {
++  auto layoutDesc = std::make_shared<LayoutDesc>(
++      ::ttnn::StorageType::DEVICE, ::ttnn::Layout::TILE,
++      utils::toTTNNDataType(dataType), ::ttnn::DRAM_MEMORY_CONFIG);
++  return Layout(std::static_pointer_cast<void>(layoutDesc),
++                DeviceRuntime::TTNN);
++}
++
+ // Return the layout of a given runtime Tensor as a Layout handle
+ Layout getTensorLayout(::tt::runtime::Tensor tensor) {
+   const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
