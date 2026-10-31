@@ -6,6 +6,7 @@
 #include <archive_entry.h>
 
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -118,10 +119,34 @@ std::filesystem::path MaterializeEmbeddedRuntimeRoot() {
                              error.message());
   }
   const std::filesystem::path root =
-      temp_root / ("libtt-tt-metal-runtime-assets-" +
+      temp_root / ("libtt-tt-metal-runtime-" +
                    std::string(embedded::kRuntimeArchiveFingerprint));
+  if (std::filesystem::is_directory(root)) {
+    return root;
+  }
 
-  ExtractEmbeddedRuntimeArchive(root);
+  // Processes that start together, such as a server's workers, share the
+  // root: each extracts into a directory of its own and renames it into place,
+  // so a root that exists is complete.
+  std::string staging = (temp_root / "libtt-tt-metal-runtime-XXXXXX").string();
+  if (mkdtemp(staging.data()) == nullptr) {
+    throw std::runtime_error("failed to create tt-metal runtime directory: " +
+                             std::string(std::strerror(errno)));
+  }
+  ExtractEmbeddedRuntimeArchive(staging);
+  std::filesystem::permissions(staging, std::filesystem::perms::owner_all |
+                                            std::filesystem::perms::group_read |
+                                            std::filesystem::perms::group_exec |
+                                            std::filesystem::perms::others_read |
+                                            std::filesystem::perms::others_exec);
+  if (rename(staging.c_str(), root.c_str()) != 0) {
+    const int rename_error = errno;
+    std::filesystem::remove_all(staging, error);
+    if (!std::filesystem::is_directory(root)) {
+      throw std::runtime_error("failed to install tt-metal runtime directory: " +
+                               std::string(std::strerror(rename_error)));
+    }
+  }
   return root;
 }
 
