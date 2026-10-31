@@ -1,0 +1,20 @@
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -338,12 +338,12 @@ ClientInstance::ClientInstance()
+   // always 0 in single-process settings.
+   m_process_index = 0;
+ 
+-  // TODO: Ensure this name is unique to prevent clashes between multiple
+-  // clients. Since we plan to remove the need for storing the descriptor on
+-  // disk soon, we’re keeping it simple for now.
++  // One per process: every compilation reads it, and processes on other
++  // chips, or with another build, describe another system. A process that
++  // exits removes its own.
+   m_cached_system_descriptor_path =
+       std::filesystem::temp_directory_path().concat(
+-          "/tt_pjrt_system_descriptor");
++          "/tt_pjrt_system_descriptor_" + std::to_string(getpid()));
+ }
+ 
+ ClientInstance::~ClientInstance() {

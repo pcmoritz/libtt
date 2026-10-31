@@ -1,13 +1,15 @@
 diff --git a/pjrt_implementation/inc/api/buffer_instance.h b/pjrt_implementation/inc/api/buffer_instance.h
 --- a/pjrt_implementation/inc/api/buffer_instance.h
 +++ b/pjrt_implementation/inc/api/buffer_instance.h
-@@ -185,6 +185,10 @@ public:
+@@ -185,6 +185,12 @@ public:
    }
  
  private:
-+  // Moves the data to the device in the layout of program arguments.
-+  void moveToDevice(::tt::target::DataType data_type,
-+                    const std::vector<std::uint32_t> &shape);
++  // Whether the data moves to the device when the buffer is created, and
++  // moving it there in the layout of program arguments.
++  bool movesToDeviceOnCreation(::tt::target::DataType data_type,
++                               const std::vector<std::uint32_t> &shape) const;
++  void moveToDevice(::tt::target::DataType data_type);
 +
    // Constructor used for the input buffers.
    BufferInstance(PJRT_Buffer_Type data_type, const std::int64_t *dims,
@@ -49,18 +51,49 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
    if (m_done_with_host_buffer_event) {
      // TODO(mrakita): Revert.
      // https://github.com/openxla/xla/issues/25172
-@@ -348,6 +354,10 @@ void BufferInstance::copyFromHost(
+@@ -310,6 +316,8 @@ void BufferInstance::copyFromHost(
+     m_done_with_host_buffer_event->setIndestructible();
+     PjrtTensor::from_host_tensor_shell({this}, std::move(host_tensor_shell));
+   } else {
++    const bool move_to_device =
++        movesToDeviceOnCreation(runtime_data_type, shape);
+     if (cannot_borrow_host_buffer) {
+       runtime_tensor = tt::runtime::createOwnedHostTensor(
+           host_buffer, shape, strides, element_size, runtime_data_type);
+@@ -319,6 +327,17 @@ void BufferInstance::copyFromHost(
+       PjrtTensor::from_runtime_tensor({this}, std::move(runtime_tensor));
      }
+ 
++    // A buffer that moves to the device now borrows the host buffer only until
++    // the copy to device, which ends before this returns. The event is the
++    // caller's from then on, so it is marked ready below, like the one of a
++    // copied buffer, instead of being kept to fire when the data moves.
++    else if (move_to_device) {
++      runtime_tensor = tt::runtime::createBorrowedHostTensor(
++          const_cast<void *>(host_buffer), shape, strides, element_size,
++          runtime_data_type);
++      PjrtTensor::from_runtime_tensor({this}, std::move(runtime_tensor));
++    }
++
+     // Otherwise when input host buffer has other semantic we are allowed to
+     // alias it, so we can create borrowed host which doesn't copy any data and
+     // instead uses direct pointer to existing data. Since we are holding a
+@@ -346,6 +365,14 @@ void BufferInstance::copyFromHost(
+ 
+       PjrtTensor::from_runtime_tensor({this}, std::move(runtime_tensor));
+     }
++
++    if (move_to_device) {
++      moveToDevice(runtime_data_type);
++      if (!cannot_borrow_host_buffer) {
++        EventInstance::markAsReadyAndCallback(
++            done_with_host_buffer_event.get(), tt_pjrt_status::kSuccess);
++      }
++    }
    }
  
-+  if (!is_distributed) {
-+    moveToDevice(runtime_data_type, shape);
-+  }
-+
    markAsDataReady();
- 
-   // Releasing the ownership to the PJRT API caller since the caller is
-@@ -355,6 +365,37 @@ void BufferInstance::copyFromHost(
+@@ -355,6 +382,40 @@ void BufferInstance::copyFromHost(
    *out_done_with_host_buffer_event = done_with_host_buffer_event.release();
  }
  
@@ -71,25 +104,28 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
 +// every chip of the mesh in use, so it moves when a program first runs.
 +// Data types without tiles of their own, such as booleans, move then too, and
 +// a buffer in host memory (pinned_host) stays there.
-+void BufferInstance::moveToDevice(::tt::target::DataType data_type,
-+                                  const std::vector<std::uint32_t> &shape) {
++bool BufferInstance::movesToDeviceOnCreation(
++    ::tt::target::DataType data_type,
++    const std::vector<std::uint32_t> &shape) const {
 +  if (m_memory != nullptr && m_memory->isHostMemory()) {
-+    return;
++    return false;
 +  }
 +  if (data_type != ::tt::target::DataType::BFloat16 &&
 +      data_type != ::tt::target::DataType::Float32 &&
 +      data_type != ::tt::target::DataType::Int32 &&
 +      data_type != ::tt::target::DataType::UInt32) {
-+    return;
++    return false;
 +  }
 +  if (std::find(shape.begin(), shape.end(), 0) != shape.end()) {
-+    return;
++    return false;
 +  }
 +  ClientInstance *client = GlobalClientInstanceSingleton::getClientInstance();
-+  if (client == nullptr || client->isCompileOnly() ||
-+      client->getDevicesRaw().size() != 1 || !client->parentMesh()) {
-+    return;
-+  }
++  return client != nullptr && !client->isCompileOnly() &&
++         client->getDevicesRaw().size() == 1 && client->parentMesh();
++}
++
++void BufferInstance::moveToDevice(::tt::target::DataType data_type) {
++  ClientInstance *client = GlobalClientInstanceSingleton::getClientInstance();
 +  const std::lock_guard<std::mutex> lock(deviceWorkMutex());
 +  m_pjrt_tensor->ensure_layout(*client->parentMesh(),
 +                               tt::runtime::getDeviceLayout(data_type));

@@ -1,0 +1,61 @@
+diff --git a/runtime/include/tt/runtime/runtime.h b/runtime/include/tt/runtime/runtime.h
+--- a/runtime/include/tt/runtime/runtime.h
++++ b/runtime/include/tt/runtime/runtime.h
+@@ -7,6 +7,7 @@
+ 
+ #include <cstdint>
+ #include <functional>
++#include <mutex>
+ #include <optional>
+ #include <vector>
+ 
+@@ -238,6 +239,11 @@ Layout getTensorLayout(Tensor tensor);
+ // The layout of a program argument on device: tiled, interleaved in DRAM.
+ Layout getDeviceLayout(::tt::target::DataType dataType);
+ 
++// Held while a trace is captured. Meanwhile the command queue skips the
++// programs it is given, or records them into the trace, so device work that
++// another thread enqueues, such as untilizing a tensor to read it, has to wait.
++std::recursive_mutex &getTraceCaptureMutex();
++
+ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
+                  std::uint32_t inputIndex);
+ 
+diff --git a/runtime/lib/runtime.cpp b/runtime/lib/runtime.cpp
+--- a/runtime/lib/runtime.cpp
++++ b/runtime/lib/runtime.cpp
+@@ -111,6 +111,11 @@ uint32_t getNumShards(Tensor tensor) {
+       });
+ }
+ } // namespace detail
++std::recursive_mutex &getTraceCaptureMutex() {
++  static std::recursive_mutex mutex;
++  return mutex;
++}
++
+ Layout getDeviceLayout(::tt::target::DataType dataType) {
+   using RetType = Layout;
+   return DISPATCH_TO_CURRENT_RUNTIME(
+diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+--- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
++++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
+@@ -11,6 +11,7 @@
+ #include "tt/runtime/detail/ttnn/types/trace_cache.h"
+ #include "tt/runtime/detail/ttnn/types/types.h"
+ #include "tt/runtime/detail/ttnn/utils.h"
++#include "tt/runtime/runtime.h"
+ #include "tt/runtime/types.h"
+ #include "ttnn/operations/core/core.hpp"
+ #include "ttnn/operations/data_movement/clone/clone.hpp"
+@@ -308,7 +309,10 @@ static TraceVariant captureTrace(
+                            op->capture_program_id(), captureInputs,
+                            /*constEvalProgram=*/false, semaphoreInputs);
+   // The warmup only prepares its workloads, writing their binaries for the
+-  // capture, until begin_trace_capture.
++  // capture, until begin_trace_capture. Another thread's device work waits
++  // until the capture ends (getTraceCaptureMutex).
++  const std::lock_guard<std::recursive_mutex> captureLock(
++      ::tt::runtime::getTraceCaptureMutex());
+   auto &cq = context.getMeshDevice().mesh_command_queue();
+   cq.set_prepare_only(true);
+   try {
