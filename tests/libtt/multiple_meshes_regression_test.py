@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax._src.sharding_impls import GSPMDSharding
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -144,3 +145,25 @@ def test_first_mesh_that_cannot_hold_the_others(devices, tmp_path):
     assert len(merged) == 1 and '"expert"=2, "model"=2' in merged[0]
     out = compiled(x_on_outer)
     np.testing.assert_allclose(np.asarray(out), np.tanh(x) * 2, rtol=2e-2, atol=2e-2)
+
+
+def test_sharded_argument_next_to_an_empty_mesh():
+    """JAX puts GSPMD shardings without axes on an empty mesh next to the
+    other one. Read against the empty mesh, the sharded argument looked
+    replicated, and once the programs copying a one-device array onto the
+    chips were cached, every chip got the first chip's rows."""
+    devices = jax.devices("tt")[:2]
+    if len(devices) < 2:
+        pytest.skip("needs two chips")
+    mesh = Mesh(np.array(devices).reshape(2, 1), ("x", "y"))
+    replicated, sharded = (
+        GSPMDSharding(devices, NamedSharding(mesh, spec)._to_xla_hlo_sharding(2))
+        for spec in (P(None), P("x"))
+    )
+    run = jax.jit(lambda a, b: (a, b))
+    expected = np.arange(16 * 4, dtype=np.float32).reshape(16, 4)
+    for _ in range(3):
+        x = jnp.arange(16 * 4, dtype=jnp.float32).reshape(16, 4)
+        for out in run(jax.device_put(x, replicated), jax.device_put(x, sharded)):
+            for shard in out.addressable_shards:
+                np.testing.assert_array_equal(np.asarray(shard.data), expected[shard.index])

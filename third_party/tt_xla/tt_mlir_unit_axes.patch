@@ -6,8 +6,9 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
      }
    }
 -  if (meshOps.size() < 2) {
+-    return replaceEmptyMeshes(module);
 +  if (meshOps.empty()) {
-     return mlir::success();
++    return mlir::success();
    }
  
 @@ -213,13 +213,22 @@ mlir::LogicalResult mergeMeshes(mlir::ModuleOp &module) {
@@ -47,6 +48,6 @@ diff --git a/lib/Dialect/StableHLO/Utils/ShardyUtils.cpp b/lib/Dialect/StableHLO
      }
    }
 +  targetOp.setMeshAttr(target);
-   return mlir::success();
+   return replaceEmptyMeshes(module);
  }
  
