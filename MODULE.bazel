@@ -496,6 +496,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_copy_to_host_in_stream_order.patch",
         "//third_party/tt_xla:tt_xla_client_topology.patch",
         "//third_party/tt_xla:tt_xla_device_buffers.patch",
+        "//third_party/tt_xla:tt_xla_tpu_compat_platform.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )

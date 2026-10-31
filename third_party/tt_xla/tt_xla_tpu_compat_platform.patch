@@ -1,0 +1,107 @@
+diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
+--- a/pjrt_implementation/inc/api/client_instance.h
++++ b/pjrt_implementation/inc/api/client_instance.h
+@@ -25,6 +25,7 @@
+ #include "tt/runtime/runtime.h"
+ 
+ // tt-xla includes
++#include "api/compile_options.h"
+ #include "api/device_instance.h"
+ #include "api/loaded_executable_instance.h"
+ #include "api/memory_instance.h"
+@@ -261,7 +262,9 @@ private:
+   std::optional<tt::runtime::MeshFabricConfig> m_fabric_config;
+ 
+   // Used to identify the platform.
+-  const std::string m_platform_name = "tt";
++  // In TPU compatibility mode, frameworks built for TPUs treat the client as
++  // one: torch_tpu then tells the compilations of its eager ops apart.
++  const std::string m_platform_name = isTpuCompatMode() ? "tpu" : "tt";
+ 
+   // We don't have a versioning system for our software stack yet.
+   const std::string m_platform_version = "0.0.0";
+diff --git a/pjrt_implementation/inc/api/compile_options.h b/pjrt_implementation/inc/api/compile_options.h
+--- a/pjrt_implementation/inc/api/compile_options.h
++++ b/pjrt_implementation/inc/api/compile_options.h
+@@ -36,6 +36,9 @@ struct CompileOptions {
+ 
+   // Map the key used to store and retrieve the optimization level
+   static inline const std::string optimization_level_key = "optimization_level";
++  // XLA's compilation effort level, in TPU compatibility mode.
++  static inline const std::string xla_optimization_level_key =
++      "xla_optimization_level";
+ 
+   // Optimization level (0, 1, or 2) that controls multiple optimization passes.
+   // See documentation for details on what each level enables.
+@@ -184,6 +187,10 @@ struct CompileOptions {
+   validate(const std::unordered_map<std::string, std::string> &compile_options);
+ };
+ 
++// Whether libtt runs in TPU compatibility mode (LIBTT_TPU_COMPAT), for a
++// framework built for TPUs such as torch_tpu.
++bool isTpuCompatMode();
++
+ namespace internal {
+ 
+ // Parse out the value of one specific boolean flag from the options map.
+diff --git a/pjrt_implementation/src/api/compile_options.cc b/pjrt_implementation/src/api/compile_options.cc
+--- a/pjrt_implementation/src/api/compile_options.cc
++++ b/pjrt_implementation/src/api/compile_options.cc
+@@ -14,6 +14,14 @@
+ 
+ namespace tt::pjrt {
+ 
++bool isTpuCompatMode() {
++  static const bool tpu_compat_mode = [] {
++    const char *value = std::getenv("LIBTT_TPU_COMPAT");
++    return value != nullptr && *value != '\0' && std::string(value) != "0";
++  }();
++  return tpu_compat_mode;
++}
++
+ CompileOptions CompileOptions::parse(
+     const std::unordered_map<std::string, std::string> &compile_options) {
+   CompileOptions options;
+@@ -69,6 +77,13 @@ CompileOptions CompileOptions::parse(
+   options.enable_trace =
+       internal::parseBoolOption(compile_options, "enable_trace")
+           .value_or(options.enable_trace);
++  // On a TPU, torch_tpu compiles its eager ops at XLA's O1 effort level and
++  // its graphs at the default. An eager op runs once, or on other buffers each
++  // time, as while a model loads, so a trace of it would only hold slots.
++  if (internal::parseIntOption(compile_options, xla_optimization_level_key) ==
++      1) {
++    options.enable_trace = false;
++  }
+   // By default, export tensors for codegen paths.
+   options.export_tensors =
+       internal::parseBoolOption(compile_options, "export_tensors")
+@@ -170,6 +185,10 @@ std::optional<std::string> CompileOptions::validate(
+       // XLA consumes these options. TT-XLA has no equivalent behavior, but
+       // accepts them for PJRT compatibility.
+       "xla_embed_ir_in_executable",
++      // torch_tpu's options for a TPU, in TPU compatibility mode.
++      CompileOptions::xla_optimization_level_key,
++      "xla_tpu_autofdo",
++      "xla_tpu_vmem_scavenging_mode",
+       "xla_dump_max_hlo_modules",
+       "xla_gpu_auto_spmd_partitioning_memory_budget_ratio",
+   };
+diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implementation/src/api/compile_options_parser.cc
+--- a/pjrt_implementation/src/api/compile_options_parser.cc
++++ b/pjrt_implementation/src/api/compile_options_parser.cc
+@@ -256,8 +256,12 @@ tt_pjrt_status CompileOptionsParser::extractCustomProtobufFields(
+             if (optimization_level > 2) {
+               return tt_pjrt_status::kInvalidArgument;
+             }
+-            out_compile_options.emplace(CompileOptions::optimization_level_key,
+-                                        std::to_string(optimization_level));
++            // XLA's effort level isn't tt-mlir's optimization level: torch_tpu
++            // asks a TPU for O1 to compile its eager ops quickly.
++            out_compile_options.emplace(
++                isTpuCompatMode() ? CompileOptions::xla_optimization_level_key
++                                  : CompileOptions::optimization_level_key,
++                std::to_string(optimization_level));
+           }
+         }
+       }
