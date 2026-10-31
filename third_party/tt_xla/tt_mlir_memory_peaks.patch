@@ -1,0 +1,152 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/ttnn.h b/runtime/include/tt/runtime/detail/ttnn/ttnn.h
+--- a/runtime/include/tt/runtime/detail/ttnn/ttnn.h
++++ b/runtime/include/tt/runtime/detail/ttnn/ttnn.h
+@@ -171,6 +171,7 @@
+ }
+ 
+ bool isTensorAllocated(::tt::runtime::Tensor tensor);
++bool isTensorOnHost(::tt::runtime::Tensor tensor);
+ tt::target::DataType getTensorDataType(::tt::runtime::Tensor tensor);
+ std::vector<std::byte> getTensorDataBuffer(::tt::runtime::Tensor tensor);
+ std::vector<std::uint32_t> getTensorShape(::tt::runtime::Tensor tensor);
+@@ -224,6 +225,8 @@
+ std::unordered_map<tt::runtime::MemoryBufferType, tt::runtime::MemoryView>
+ getMemoryView(Device device);
+ 
++void resetMemoryPeaks(Device device);
++
+ void setFabricConfig(tt::runtime::FabricConfig config);
+ 
+ void wait(Event event);
+diff --git a/runtime/include/tt/runtime/runtime.h b/runtime/include/tt/runtime/runtime.h
+--- a/runtime/include/tt/runtime/runtime.h
++++ b/runtime/include/tt/runtime/runtime.h
+@@ -137,6 +137,8 @@
+ }
+ 
+ bool isTensorAllocated(Tensor tensor);
++// Whether the tensor's data is in host memory rather than on a device.
++bool isTensorOnHost(Tensor tensor);
+ tt::target::DataType getTensorDataType(Tensor tensor);
+ std::vector<std::byte> getTensorDataBuffer(Tensor tensor);
+ std::uint32_t getTensorElementSize(Tensor tensor);
+@@ -198,6 +200,9 @@
+ std::unordered_map<tt::runtime::MemoryBufferType, tt::runtime::MemoryView>
+ getMemoryView(Device device);
+ 
++// Restarts the peaks of the device's memory views from what is allocated now.
++void resetMemoryPeaks(Device device);
++
+ struct MeshFabricConfig {
+   FabricConfig globalConfig;
+   std::vector<FabricConfig> perAxisConfig;
+diff --git a/runtime/include/tt/runtime/types.h b/runtime/include/tt/runtime/types.h
+--- a/runtime/include/tt/runtime/types.h
++++ b/runtime/include/tt/runtime/types.h
+@@ -209,6 +209,8 @@
+   std::uint64_t numBanks = 0;
+   size_t totalBytesPerBank = 0;
+   size_t totalBytesAllocatedPerBank = 0;
++  // The most allocated at once since the device opened or resetMemoryPeaks.
++  size_t peakBytesAllocatedPerBank = 0;
+   size_t totalBytesFreePerBank = 0;
+   size_t largestContiguousBytesFreePerBank = 0;
+   MemoryBlockTable blockTable;
+diff --git a/runtime/lib/common/types.cpp b/runtime/lib/common/types.cpp
+--- a/runtime/lib/common/types.cpp
++++ b/runtime/lib/common/types.cpp
+@@ -56,6 +56,8 @@
+       << " MB, ";
+   oss << "totalBytesAllocatedPerBank: "
+       << (static_cast<double>(totalBytesAllocatedPerBank) / MB) << " MB, ";
++  oss << "peakBytesAllocatedPerBank: "
++      << (static_cast<double>(peakBytesAllocatedPerBank) / MB) << " MB, ";
+   oss << "totalBytesFreePerBank: "
+       << (static_cast<double>(totalBytesFreePerBank) / MB) << " MB, ";
+   oss << "largestContiguousBytesFreePerBank: "
+diff --git a/runtime/lib/runtime.cpp b/runtime/lib/runtime.cpp
+--- a/runtime/lib/runtime.cpp
++++ b/runtime/lib/runtime.cpp
+@@ -485,6 +485,19 @@
+       });
+ }
+ 
++bool isTensorOnHost(Tensor tensor) {
++  using RetType = bool;
++  return DISPATCH_TO_CURRENT_RUNTIME(
++      RetType,
++      [&]() -> RetType { return ::tt::runtime::ttnn::isTensorOnHost(tensor); },
++      [&]() -> RetType {
++        detail::fatalNotImplemented("isTensorOnHost", DeviceRuntime::TTMetal);
++      },
++      [&]() -> RetType {
++        detail::fatalNotImplemented("isTensorOnHost", HostRuntime::Distributed);
++      });
++}
++
+ ::tt::target::DataType getTensorDataType(Tensor tensor) {
+   using RetType = ::tt::target::DataType;
+   return DISPATCH_TO_CURRENT_RUNTIME(
+@@ -929,6 +942,19 @@
+       });
+ }
+ 
++void resetMemoryPeaks(Device device) {
++  using RetType = void;
++  DISPATCH_TO_CURRENT_RUNTIME(
++      RetType, [&]() { ::tt::runtime::ttnn::resetMemoryPeaks(device); },
++      [&]() {
++        detail::fatalNotImplemented("resetMemoryPeaks", DeviceRuntime::TTMetal);
++      },
++      [&]() {
++        detail::fatalNotImplemented("resetMemoryPeaks",
++                                    HostRuntime::Distributed);
++      });
++}
++
+ void wait(Event event) {
+   using RetType = void;
+   DISPATCH_TO_CURRENT_RUNTIME(
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -823,6 +823,11 @@
+   return ttnnTensor.element_size();
+ }
+ 
++bool isTensorOnHost(::tt::runtime::Tensor tensor) {
++  return utils::isOnHost(
++      utils::getTTNNTensorFromRuntimeTensor(tensor).storage_type());
++}
++
+ std::uint32_t getTensorVolume(::tt::runtime::Tensor tensor) {
+   const ::ttnn::Tensor &ttnnTensor =
+       utils::getTTNNTensorFromRuntimeTensor(tensor);
+@@ -1107,6 +1112,16 @@
+   return utils::getMemoryView(deviceHandle);
+ }
+ 
++void resetMemoryPeaks(Device deviceHandle) {
++  ::ttnn::MeshDevice &meshDevice =
++      deviceHandle.as<::ttnn::MeshDevice>(DeviceRuntime::TTNN);
++  for (::ttnn::BufferType bufferType :
++       {::ttnn::BufferType::DRAM, ::ttnn::BufferType::L1,
++        ::ttnn::BufferType::L1_SMALL, ::ttnn::BufferType::TRACE}) {
++    meshDevice.allocator()->reset_peak_statistics(bufferType);
++  }
++}
++
+ void setFabricConfig(tt::runtime::FabricConfig config) {
+   // RELAXED reliability mode brings fabric up on the live links only, rather
+   // than requiring every link in the mesh graph descriptor to be healthy. The
+diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
+--- a/runtime/lib/ttnn/utils/utils.cpp
++++ b/runtime/lib/ttnn/utils/utils.cpp
+@@ -22,6 +22,7 @@
+       .numBanks = memoryView.num_banks,
+       .totalBytesPerBank = memoryView.total_bytes_per_bank,
+       .totalBytesAllocatedPerBank = memoryView.total_bytes_allocated_per_bank,
++      .peakBytesAllocatedPerBank = memoryView.peak_bytes_allocated_per_bank,
+       .totalBytesFreePerBank = memoryView.total_bytes_free_per_bank,
+       .largestContiguousBytesFreePerBank =
+           memoryView.largest_contiguous_bytes_free_per_bank,

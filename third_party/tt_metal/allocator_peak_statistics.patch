@@ -1,0 +1,174 @@
+diff --git tt_metal/api/tt-metalium/allocator.hpp tt_metal/api/tt-metalium/allocator.hpp
+--- tt_metal/api/tt-metalium/allocator.hpp
++++ tt_metal/api/tt-metalium/allocator.hpp
+@@ -19,6 +19,8 @@
+     size_t total_allocated_bytes = 0;
+     size_t total_free_bytes = 0;
+     size_t largest_free_block_bytes = 0;
++    // The most bytes allocated at once since the allocator started or its peak was last reset.
++    size_t peak_allocated_bytes = 0;
+ };
+ 
+ class Buffer;
+@@ -49,6 +51,8 @@
+     // this helper function is made for reports.cpp in TTNN and act as a transient member function.
+     size_t get_worker_l1_size() const;
+     Statistics get_statistics(const BufferType& buffer_type) const;
++    // Restarts peak_allocated_bytes from the bytes allocated now.
++    void reset_peak_statistics(const BufferType& buffer_type);
+ 
+     // debug/test/internal usage.
+     AllocatorImpl& impl() { return *impl_; }
+diff --git tt_metal/api/tt-metalium/memory_reporter.hpp tt_metal/api/tt-metalium/memory_reporter.hpp
+--- tt_metal/api/tt-metalium/memory_reporter.hpp
++++ tt_metal/api/tt-metalium/memory_reporter.hpp
+@@ -92,6 +92,7 @@
+     std::uint64_t num_banks = 0;
+     size_t total_bytes_per_bank = 0;
+     size_t total_bytes_allocated_per_bank = 0;
++    size_t peak_bytes_allocated_per_bank = 0;
+     size_t total_bytes_free_per_bank = 0;
+     size_t largest_contiguous_bytes_free_per_bank = 0;
+     MemoryBlockTable block_table;
+diff --git tt_metal/detail/reports/memory_reporter.cpp tt_metal/detail/reports/memory_reporter.cpp
+--- tt_metal/detail/reports/memory_reporter.cpp
++++ tt_metal/detail/reports/memory_reporter.cpp
+@@ -177,6 +177,7 @@
+         .num_banks = num_banks_,
+         .total_bytes_per_bank = stats.total_allocatable_size_bytes,
+         .total_bytes_allocated_per_bank = stats.total_allocated_bytes,
++        .peak_bytes_allocated_per_bank = stats.peak_allocated_bytes,
+         .total_bytes_free_per_bank = stats.total_free_bytes,
+         .largest_contiguous_bytes_free_per_bank = stats.largest_free_block_bytes,
+         .block_table = device->allocator_impl()->get_memory_block_table(buffer_type)};
+diff --git tt_metal/impl/allocator/algorithms/allocator_algorithm.hpp tt_metal/impl/allocator/algorithms/allocator_algorithm.hpp
+--- tt_metal/impl/allocator/algorithms/allocator_algorithm.hpp
++++ tt_metal/impl/allocator/algorithms/allocator_algorithm.hpp
+@@ -37,6 +37,9 @@
+ 
+     DeviceAddr max_size_bytes() const { return max_size_bytes_; }
+ 
++    // Restarts the peak that get_statistics reports from the bytes allocated now.
++    void reset_peak_allocated_bytes() { peak_allocated_bytes_ = allocated_bytes_; }
++
+     std::optional<DeviceAddr> lowest_occupied_address() const {
+         if (not this->lowest_occupied_address_.has_value()) {
+             return this->lowest_occupied_address_;
+@@ -85,6 +88,9 @@
+     DeviceAddr alignment_;
+     DeviceAddr shrink_size_ = 0;
+     std::optional<DeviceAddr> lowest_occupied_address_;
++    // Bytes in allocated blocks, and the most at once since init or reset_peak_allocated_bytes.
++    DeviceAddr allocated_bytes_ = 0;
++    DeviceAddr peak_allocated_bytes_ = 0;
+ };
+ 
+ }  // namespace tt::tt_metal::allocator
+diff --git tt_metal/impl/allocator/algorithms/free_list_opt.cpp tt_metal/impl/allocator/algorithms/free_list_opt.cpp
+--- tt_metal/impl/allocator/algorithms/free_list_opt.cpp
++++ tt_metal/impl/allocator/algorithms/free_list_opt.cpp
+@@ -71,6 +71,8 @@
+ void FreeListOpt::init() {
+     max_size_bytes_ += shrink_size_;
+     shrink_size_ = 0;
++    allocated_bytes_ = 0;
++    peak_allocated_bytes_ = 0;
+ 
+     block_address_.clear();
+     block_size_.clear();
+@@ -221,6 +223,8 @@
+ }
+ 
+ size_t FreeListOpt::allocate_in_block(size_t block_index, DeviceAddr alloc_size, size_t offset) {
++    allocated_bytes_ += alloc_size;
++    peak_allocated_bytes_ = std::max(peak_allocated_bytes_, allocated_bytes_);
+     if (block_size_[block_index] == alloc_size && offset == 0) {
+         block_is_allocated_[block_index] = true;
+         insert_block_to_alloc_table(block_address_[block_index], block_index);
+@@ -276,6 +280,7 @@
+         return;
+     }
+     size_t block_index = *block_index_opt;
++    allocated_bytes_ -= block_size_[block_index];
+     block_is_allocated_[block_index] = false;
+     size_t prev_block = block_prev_block_[block_index];
+     size_t next_block = block_next_block_[block_index];
+@@ -451,6 +456,7 @@
+         .total_allocated_bytes = total_allocated_bytes,
+         .total_free_bytes = total_free_bytes,
+         .largest_free_block_bytes = largest_free_block_bytes,
++        .peak_allocated_bytes = peak_allocated_bytes_,
+     };
+ }
+ 
+diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocator.cpp
+--- tt_metal/impl/allocator/allocator.cpp
++++ tt_metal/impl/allocator/allocator.cpp
+@@ -566,6 +566,19 @@
+     return stats;
+ }
+ 
++void AllocatorImpl::reset_peak_statistics(const BufferType& buffer_type) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    switch (buffer_type) {
++        case BufferType::DRAM: return dram_manager_->reset_peak_statistics();
++        case BufferType::L1: return l1_manager_->reset_peak_statistics();
++        case BufferType::L1_SMALL: return l1_small_manager_->reset_peak_statistics();
++        case BufferType::TRACE: return trace_buffer_manager_->reset_peak_statistics();
++        default: {
++            TT_THROW("Unsupported buffer type!");
++        }
++    }
++}
++
+ MemoryBlockTable AllocatorImpl::get_memory_block_table(const BufferType& buffer_type) const {
+     std::lock_guard<std::mutex> lock(mutex_);
+     switch (buffer_type) {
+@@ -881,6 +894,8 @@
+ 
+ Statistics Allocator::get_statistics(const BufferType& buffer_type) const { return impl_->get_statistics(buffer_type); }
+ 
++void Allocator::reset_peak_statistics(const BufferType& buffer_type) { impl_->reset_peak_statistics(buffer_type); }
++
+ size_t Allocator::get_worker_l1_size() const { return impl_->get_worker_l1_size(); }
+ 
+ }  // namespace tt::tt_metal
+diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocator.hpp
+--- tt_metal/impl/allocator/allocator.hpp
++++ tt_metal/impl/allocator/allocator.hpp
+@@ -122,6 +122,7 @@
+     size_t get_worker_l1_size() const;
+ 
+     Statistics get_statistics(const BufferType& buffer_type) const;
++    void reset_peak_statistics(const BufferType& buffer_type);
+     MemoryBlockTable get_memory_block_table(const BufferType& buffer_type) const;
+     void dump_memory_blocks(const BufferType& buffer_type, std::ostream& out) const;
+ 
+diff --git tt_metal/impl/allocator/bank_manager.cpp tt_metal/impl/allocator/bank_manager.cpp
+--- tt_metal/impl/allocator/bank_manager.cpp
++++ tt_metal/impl/allocator/bank_manager.cpp
+@@ -682,6 +682,12 @@
+     return alloc ? alloc->get_statistics() : Statistics();
+ }
+ 
++void BankManager::reset_peak_statistics(BankManager::AllocatorDependencies::AllocatorID allocator_id) {
++    if (auto* alloc = this->get_allocator_from_id(allocator_id)) {
++        alloc->reset_peak_allocated_bytes();
++    }
++}
++
+ void BankManager::begin_high_water_mark_tracking() {
+     tracking_high_water_mark_ = true;
+     allocation_high_water_mark_ = 0;
+diff --git tt_metal/impl/allocator/bank_manager.hpp tt_metal/impl/allocator/bank_manager.hpp
+--- tt_metal/impl/allocator/bank_manager.hpp
++++ tt_metal/impl/allocator/bank_manager.hpp
+@@ -127,6 +127,8 @@
+     Statistics get_statistics(
+         AllocatorDependencies::AllocatorID allocator_id = AllocatorDependencies::AllocatorID{0}) const;
+ 
++    void reset_peak_statistics(AllocatorDependencies::AllocatorID allocator_id = AllocatorDependencies::AllocatorID{0});
++
+     void dump_blocks(
+         std::ostream& out,
+         AllocatorDependencies::AllocatorID allocator_id = AllocatorDependencies::AllocatorID{0}) const;
