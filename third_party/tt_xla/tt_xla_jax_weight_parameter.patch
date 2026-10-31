@@ -1,7 +1,7 @@
 diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
 --- a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
 +++ b/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_input_role_propagation.cc
-@@ -318,23 +318,21 @@ struct PopulateWeightDtypeFromCustomCall final
+@@ -318,26 +318,19 @@
      TT_FATAL(op.getNumResults() == 1,
               "Expected one result from tt.weight_dtype_override");
  
@@ -24,26 +24,35 @@ diff --git a/pjrt_implementation/src/api/module_builder/frontend_passes/shlo_inp
 -    // Extract the weight dtype string attribute.
 -    auto weightDtypeAttr = frontendAttrs.get(c_weight_dtype_attr_name);
 -    if (!weightDtypeAttr) {
-+    if (!attributes) {
-       return mlir::failure();
-     }
-+    // Extract the weight dtype string attribute.
- 
+-      return mlir::failure();
+-    }
+-
++    // Without a weight dtype, the argument is a weight whose dtype the
++    // experimental_weight_dtype compile option decides.
      mlir::StringAttr weightDtypeStrAttr =
 -        mlir::dyn_cast<mlir::StringAttr>(weightDtypeAttr);
-+        attributes.getAs<mlir::StringAttr>(c_weight_dtype_attr_name);
-     if (!weightDtypeStrAttr) {
-       return mlir::failure();
-     }
-@@ -351,6 +349,11 @@ struct PopulateWeightDtypeFromCustomCall final
+-    if (!weightDtypeStrAttr) {
+-      return mlir::failure();
+-    }
++        attributes ? attributes.getAs<mlir::StringAttr>(c_weight_dtype_attr_name)
++                   : nullptr;
+ 
+     // Trace the input to its root block arguments and set the weight dtype
+     // attribute on each.
+@@ -351,7 +344,15 @@
        auto funcOp = mlir::dyn_cast<mlir::func::FuncOp>(parentOp);
        TT_FATAL(funcOp, "Expected function as parent of block argument");
  
+-      funcOp.setArgAttr(argIndex, c_weight_dtype_attr_name, weightDtypeStrAttr);
 +      funcOp.setArgAttr(
 +          argIndex, mlir::tt::ttcore::ArgumentTypeAttr::name,
 +          mlir::tt::ttcore::ArgumentTypeAttr::get(
 +              funcOp.getContext(),
 +              mlir::tt::ttcore::ArgumentType::Parameter));
-       funcOp.setArgAttr(argIndex, c_weight_dtype_attr_name, weightDtypeStrAttr);
++      if (weightDtypeStrAttr) {
++        funcOp.setArgAttr(argIndex, c_weight_dtype_attr_name,
++                          weightDtypeStrAttr);
++      }
      }
  
+     // Remove the custom call op and replace it with the input value.

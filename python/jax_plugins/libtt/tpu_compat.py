@@ -9,6 +9,9 @@
   device count reports the Tenstorrent chips instead.
 - torch_tpu's flash attention is a Pallas kernel that only TPUs run, so
   `scaled_dot_product_attention` takes its StableHLO implementation instead.
+- Inference graphs mark the module parameters they read as weights
+  (`torch_tpu_weights`), and SGLang-TorchTPU's attention kernel runs as JAX
+  (`sglang_tpu_kernels`).
 - torch_tpu destroys its PJRT client at exit only if it initialized its runtime
   options, which `torch.manual_seed` alone doesn't, and a device left open
   keeps the fabric routers of a multi-chip mesh running into the next process.
@@ -34,23 +37,32 @@ def _tenstorrent_device_count() -> int:
         return 0
 
 
-class _PatchTorchTpu(importlib.abc.MetaPathFinder):
-    """Patches torch_tpu's hardware module when it is imported."""
+def _patch_hardware(module):
+    module.get_tpu_device_count = _tenstorrent_device_count
+    # torch_tpu imports torch before its hardware module.
+    import torch
+
+    torch.backends.cuda.enable_flash_sdp(False)
+
+
+class _PatchModules(importlib.abc.MetaPathFinder):
+    """Runs `patches[name](module)` once module `name` is imported."""
+
+    def __init__(self, patches):
+        self._patches = dict(patches)
 
     def find_spec(self, name, path, target=None):
-        if name != _HARDWARE_MODULE:
+        patch = self._patches.pop(name, None)
+        if patch is None:
             return None
-        sys.meta_path.remove(self)
+        if not self._patches:
+            sys.meta_path.remove(self)
         spec = importlib.util.find_spec(name)
         exec_module = spec.loader.exec_module
 
         def patched_exec_module(module):
             exec_module(module)
-            module.get_tpu_device_count = _tenstorrent_device_count
-            # torch_tpu imports torch before its hardware module.
-            import torch
-
-            torch.backends.cuda.enable_flash_sdp(False)
+            patch(module)
 
         spec.loader.exec_module = patched_exec_module
         return spec
@@ -68,4 +80,16 @@ def _shutdown_plugin():
 os.environ.setdefault("TPU_LIBRARY_PATH", str(pathlib.Path(__file__).with_name("libtt.so")))
 # Registered before torch_tpu's own exit handlers, so it runs after them.
 atexit.register(_shutdown_plugin)
-sys.meta_path.insert(0, _PatchTorchTpu())
+
+from jax_plugins.libtt import sglang_tpu_kernels, torch_tpu_weights  # noqa: E402
+
+sys.meta_path.insert(
+    0,
+    _PatchModules(
+        {
+            _HARDWARE_MODULE: _patch_hardware,
+            **torch_tpu_weights.PATCHES,
+            **sglang_tpu_kernels.PATCHES,
+        }
+    ),
+)
