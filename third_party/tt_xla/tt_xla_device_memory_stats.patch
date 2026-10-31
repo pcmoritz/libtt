@@ -1,7 +1,7 @@
 diff --git a/pjrt_implementation/inc/api/device_instance.h b/pjrt_implementation/inc/api/device_instance.h
 --- a/pjrt_implementation/inc/api/device_instance.h
 +++ b/pjrt_implementation/inc/api/device_instance.h
-@@ -65,6 +65,9 @@ public:
+@@ -65,6 +65,9 @@
    // Returns global device ID.
    int getGlobalDeviceId() const { return m_description.getDeviceId(); }
  
@@ -11,7 +11,7 @@ diff --git a/pjrt_implementation/inc/api/device_instance.h b/pjrt_implementation
    // Sets process index from which this device is addressable.
    void setProcessIndex(int process_index) {
      m_description.setProcessIndex(process_index);
-@@ -94,7 +97,7 @@ private:
+@@ -94,7 +97,7 @@
        : m_client(client),
          m_description(global_device_id, arch, dram_size_bytes),
          m_is_addressable(is_addressable), m_local_device_id(local_device_id),
@@ -20,7 +20,7 @@ diff --git a/pjrt_implementation/inc/api/device_instance.h b/pjrt_implementation
  
    // back-reference to client.
    ClientInstance *m_client;
-@@ -115,6 +118,9 @@ private:
+@@ -115,6 +118,9 @@
    // Default addressable memory where the data processed by this device should
    // be stored.
    MemoryInstance *m_default_memory;
@@ -30,7 +30,7 @@ diff --git a/pjrt_implementation/inc/api/device_instance.h b/pjrt_implementation
  };
  
  namespace internal {
-@@ -135,6 +141,15 @@ onDeviceAddressableMemories(PJRT_Device_AddressableMemories_Args *args);
+@@ -135,6 +141,15 @@
  // Implements PJRT_Device_DefaultMemory API function.
  PJRT_Error *onDeviceDefaultMemory(PJRT_Device_DefaultMemory_Args *args);
  
@@ -49,7 +49,7 @@ diff --git a/pjrt_implementation/inc/api/device_instance.h b/pjrt_implementation
 diff --git a/pjrt_implementation/inc/api/memory_instance.h b/pjrt_implementation/inc/api/memory_instance.h
 --- a/pjrt_implementation/inc/api/memory_instance.h
 +++ b/pjrt_implementation/inc/api/memory_instance.h
-@@ -78,6 +78,9 @@ private:
+@@ -78,6 +78,9 @@
    MemoryInstance(std::vector<DeviceInstance *> &addressable_by_devices,
                   size_t id, bool is_host_memory);
  
@@ -59,10 +59,49 @@ diff --git a/pjrt_implementation/inc/api/memory_instance.h b/pjrt_implementation
    // List of devices that can access this memory.
    std::vector<DeviceInstance *> m_addressable_by_devices;
  
+diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/tensor.h
+--- a/pjrt_implementation/inc/api/tensor.h
++++ b/pjrt_implementation/inc/api/tensor.h
+@@ -12,6 +12,7 @@
+ #define TT_XLA_PJRT_IMPLEMENTATION_INC_API_TENSOR_H_
+ 
+ // c++ standard library includes
++#include <cstdint>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -150,6 +151,13 @@
+   // host reads one chip.
+   bool on_every_chip() const;
+ 
++  // Bytes of the device buffers whose data the host still holds: a program
++  // moves a buffer to the device when it first uses it (ensure_layout). Also
++  // the most at once since the start or the last reset_peak_host_staged_bytes.
++  static std::int64_t host_staged_bytes();
++  static std::int64_t peak_host_staged_bytes();
++  static void reset_peak_host_staged_bytes();
++
+ private:
+   static PjrtTensor &from_shards(const std::vector<BufferInstance *> &shards);
+   static uint64_t next_uid();
+@@ -185,6 +193,13 @@
+ 
+   // Whether m_runtime_tensor is a host tensor whose read is still in flight.
+   mutable bool m_read_pending = false;
++
++  // Recounts this tensor's part of host_staged_bytes() after m_runtime_tensor
++  // or m_host_tensor_shell changed.
++  void update_host_staged_bytes();
++
++  // This tensor's part of host_staged_bytes().
++  std::int64_t m_host_staged_bytes = 0;
+ };
+ 
+ // Shared pointer to pjrt tensor used by all shards that holds tensor.
 diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementation/src/api/device_instance.cc
 --- a/pjrt_implementation/src/api/device_instance.cc
 +++ b/pjrt_implementation/src/api/device_instance.cc
-@@ -10,10 +10,17 @@
+@@ -10,11 +10,19 @@
  
  #include "api/device_instance.h"
  
@@ -78,9 +117,11 @@ diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementatio
  // tt-xla includes
 +#include "api/client_instance.h"
  #include "api/memory_instance.h"
++#include "api/tensor.h"
  #include "utils/logging.h"
  
-@@ -41,6 +48,9 @@ void DeviceInstance::bindApi(PJRT_Api *api) {
+ namespace tt::pjrt {
+@@ -41,6 +49,9 @@
    api->PJRT_Device_LocalHardwareId = internal::onDeviceLocalHardwareId;
    api->PJRT_Device_AddressableMemories = internal::onDeviceAddressableMemories;
    api->PJRT_Device_DefaultMemory = internal::onDeviceDefaultMemory;
@@ -90,7 +131,7 @@ diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementatio
  }
  
  namespace internal {
-@@ -96,6 +106,77 @@ PJRT_Error *onDeviceDefaultMemory(PJRT_Device_DefaultMemory_Args *args) {
+@@ -96,6 +107,87 @@
    return nullptr;
  };
  
@@ -115,10 +156,12 @@ diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementatio
 +  const uint64_t dram_size_bytes =
 +      DeviceInstance::unwrap(args->device)->getDramSizeBytes();
 +
-+  // DRAM allocated on the open mesh. Tensors stay on the host until a program
-+  // uses them, so this counts device-resident tensors only. The allocator
-+  // keeps no peaks, so those stay unset.
-+  int64_t bytes_in_use = 0;
++  // DRAM allocated on the open mesh, plus the device buffers whose data stays
++  // on the host until a program uses them: they take that DRAM then. Their
++  // peaks add up to a bound of the peak of the sum. Nothing caches freed
++  // memory, so none is reserved beyond what is in use.
++  int64_t bytes_in_use = PjrtTensor::host_staged_bytes();
++  int64_t peak_bytes_in_use = PjrtTensor::peak_host_staged_bytes();
 +  std::optional<int64_t> largest_free_block_bytes;
 +  ClientInstance *client = GlobalClientInstanceSingleton::getClientInstance();
 +  if (client && client->parentMesh()) {
@@ -126,15 +169,16 @@ diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementatio
 +    auto dram = views.find(tt::runtime::MemoryBufferType::DRAM);
 +    if (dram != views.end()) {
 +      const tt::runtime::MemoryView &view = dram->second;
-+      bytes_in_use = view.numBanks * view.totalBytesAllocatedPerBank;
++      bytes_in_use += view.numBanks * view.totalBytesAllocatedPerBank;
++      peak_bytes_in_use += view.numBanks * view.peakBytesAllocatedPerBank;
 +      largest_free_block_bytes =
 +          view.numBanks * view.largestContiguousBytesFreePerBank;
 +    }
 +  }
 +
 +  args->bytes_in_use = bytes_in_use;
-+  args->peak_bytes_in_use = 0;
-+  args->peak_bytes_in_use_is_set = false;
++  args->peak_bytes_in_use = peak_bytes_in_use;
++  args->peak_bytes_in_use_is_set = true;
 +  args->num_allocs = 0;
 +  args->num_allocs_is_set = false;
 +  args->largest_alloc_size = 0;
@@ -144,7 +188,7 @@ diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementatio
 +  args->bytes_reserved = 0;
 +  args->bytes_reserved_is_set = true;
 +  args->peak_bytes_reserved = 0;
-+  args->peak_bytes_reserved_is_set = false;
++  args->peak_bytes_reserved_is_set = true;
 +  args->bytes_reservable_limit = 0;
 +  args->bytes_reservable_limit_is_set = false;
 +  args->largest_free_block_bytes = largest_free_block_bytes.value_or(0);
@@ -153,8 +197,8 @@ diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementatio
 +  args->pool_bytes_is_set = false;
 +  args->peak_pool_bytes = 0;
 +  args->peak_pool_bytes_is_set = false;
-+  args->peak_allocated_bytes = 0;
-+  args->peak_allocated_bytes_is_set = false;
++  args->peak_allocated_bytes = peak_bytes_in_use;
++  args->peak_allocated_bytes_is_set = true;
 +
 +  return nullptr;
 +}
@@ -162,9 +206,136 @@ diff --git a/pjrt_implementation/src/api/device_instance.cc b/pjrt_implementatio
 +PJRT_Error *onDeviceClearMemoryStats(PJRT_Device_ClearMemoryStats_Args *args) {
 +  ZoneScoped;
 +  DLOG_F(LOG_DEBUG, "DeviceInstance::PJRT_Device_ClearMemoryStats");
++
++  // The peaks restart from what is in use now.
++  PjrtTensor::reset_peak_host_staged_bytes();
++  ClientInstance *client = GlobalClientInstanceSingleton::getClientInstance();
++  if (client && client->parentMesh()) {
++    tt::runtime::resetMemoryPeaks(*client->parentMesh());
++  }
 +  return nullptr;
 +}
 +
  } // namespace internal
  
  } // namespace tt::pjrt
+diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api/tensor.cc
+--- a/pjrt_implementation/src/api/tensor.cc
++++ b/pjrt_implementation/src/api/tensor.cc
+@@ -11,7 +11,12 @@
+ #include "api/tensor.h"
+ 
+ // c++ standard library includes
++#include <algorithm>
++#include <atomic>
++#include <cstdint>
++#include <functional>
+ #include <memory>
++#include <numeric>
+ #include <optional>
+ #include <unordered_map>
+ #include <utility>
+@@ -26,12 +31,64 @@
+ 
+ // tt-xla includes
+ #include "api/buffer_instance.h"
++#include "api/memory_instance.h"
+ #include "api/tensor_pool.h"
+ #include "utils/assert.h"
+ #include "utils/logging.h"
+ 
+ namespace tt::pjrt {
+ 
++namespace {
++
++// PjrtTensor::host_staged_bytes() and its peak.
++std::atomic<std::int64_t> g_host_staged_bytes{0};
++std::atomic<std::int64_t> g_peak_host_staged_bytes{0};
++
++} // namespace
++
++std::int64_t PjrtTensor::host_staged_bytes() { return g_host_staged_bytes; }
++
++std::int64_t PjrtTensor::peak_host_staged_bytes() {
++  return g_peak_host_staged_bytes;
++}
++
++void PjrtTensor::reset_peak_host_staged_bytes() {
++  g_peak_host_staged_bytes = g_host_staged_bytes.load();
++}
++
++void PjrtTensor::update_host_staged_bytes() {
++  // Buffers in host memory are not device memory, wherever their data is.
++  auto shard = std::find_if(m_shards.begin(), m_shards.end(),
++                            [](BufferInstance *s) { return s != nullptr; });
++  const bool in_device_memory =
++      shard != m_shards.end() &&
++      ((*shard)->getMemory() == nullptr ||
++       !(*shard)->getMemory()->isHostMemory());
++
++  std::int64_t bytes = 0;
++  if (in_device_memory && m_runtime_tensor.has_value()) {
++    if (tt::runtime::isTensorOnHost(*m_runtime_tensor)) {
++      bytes = static_cast<std::int64_t>(
++                  tt::runtime::getTensorVolume(*m_runtime_tensor)) *
++              tt::runtime::getTensorElementSize(*m_runtime_tensor);
++    }
++  } else if (in_device_memory && m_host_tensor_shell.has_value()) {
++    bytes = std::accumulate(m_host_tensor_shell->shape.begin(),
++                            m_host_tensor_shell->shape.end(),
++                            std::int64_t{m_host_tensor_shell->element_size},
++                            std::multiplies<std::int64_t>());
++  }
++
++  const std::int64_t now =
++      g_host_staged_bytes.fetch_add(bytes - m_host_staged_bytes) + bytes -
++      m_host_staged_bytes;
++  m_host_staged_bytes = bytes;
++  std::int64_t peak = g_peak_host_staged_bytes;
++  while (now > peak &&
++         !g_peak_host_staged_bytes.compare_exchange_weak(peak, now)) {
++  }
++}
++
+ // Initializes pjrt tensor from pjrt buffers.
+ //
+ // If tensor already exists (shards already share same tensor) tensor will be
+@@ -77,6 +134,7 @@
+   auto tensor =
+       std::make_shared<PjrtTensor>(Private{}, std::move(shards), std::nullopt);
+   tensor->m_host_tensor_shell = std::move(shell);
++  tensor->update_host_staged_bytes();
+ 
+   for (BufferInstance *shard : tensor->shards()) {
+     shard->setPjrtTensor(tensor);
+@@ -91,9 +149,13 @@
+       m_runtime_tensor{std::move(rt_tensor)} {
+ 
+   TensorPool::insert(this);
++  update_host_staged_bytes();
+ }
+ 
+-PjrtTensor::~PjrtTensor() { TensorPool::erase(this); }
++PjrtTensor::~PjrtTensor() {
++  g_host_staged_bytes -= m_host_staged_bytes;
++  TensorPool::erase(this);
++}
+ 
+ void PjrtTensor::ensure_layout(const tt::runtime::Device &device,
+                                const tt::runtime::Layout &layout) {
+@@ -113,6 +175,7 @@
+   m_runtime_tensor =
+       tt::runtime::toLayout(*m_runtime_tensor, device, layout, retain);
+   m_checked_layout_id.reset();
++  update_host_staged_bytes();
+ 
+   // Notify each shard so the host-buffer-done event fires now and the
+   // framework releases its source reference, instead of holding it for
+@@ -191,6 +254,7 @@
+   m_runtime_tensor = std::move(tensors[0]);
+   m_read_pending = !blocking;
+   m_checked_layout_id.reset();
++  update_host_staged_bytes();
+ 
+   for (std::size_t i = 1; i < m_shards.size(); ++i) {
+     if (m_shards[i] == nullptr) {
