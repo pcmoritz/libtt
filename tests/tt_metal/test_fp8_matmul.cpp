@@ -1,0 +1,203 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// ttnn::matmul on FP8_E4M3 and FP8_E5M2 tiles: the unpacker reads the
+// operands as Fp8_e4m3 and Lf8, one byte per element. It decodes normal values
+// exactly and flushes subnormals to zero, so the products match a reference
+// with flushed subnormals up to the accumulation's rounding.
+
+#include <gtest/gtest.h>
+
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <random>
+#include <vector>
+
+#include <tt-metalium/distributed.hpp>
+#include <tt-metalium/float8.hpp>
+#include <tt-metalium/mesh_device.hpp>
+#include <tt-metalium/tensor/tensor_apis.hpp>
+
+#include "ttnn/operations/matmul/matmul.hpp"
+#include "ttnn/tensor/tensor.hpp"
+
+namespace tt::tt_metal::distributed::test {
+namespace {
+
+class Fp8MatmulTest : public ::testing::Test {
+protected:
+    void SetUp() override { mesh_device_ = MeshDevice::create(MeshDeviceConfig(MeshShape{1, 1})); }
+
+    void TearDown() override {
+        if (mesh_device_) {
+            mesh_device_->close();
+            mesh_device_.reset();
+        }
+    }
+
+    // A tile-layout FP8_E4M3 or FP8_E5M2 tensor on the device with the given codes in row-major order.
+    ttnn::Tensor fp8_device(
+        const std::vector<uint8_t>& codes, uint32_t rows, uint32_t cols, DataType dtype = DataType::FP8_E4M3) {
+        const TensorSpec spec(ttnn::Shape({rows, cols}), TensorLayout(dtype, PageConfig(Layout::ROW_MAJOR), {}));
+        const HostTensor row_major = HostTensor::allocate_for_overwrite(spec).transform([&](const HostBuffer&) {
+            auto bytes = [&]<typename T>() {
+                std::vector<T> buffer(codes.size());
+                std::memcpy(buffer.data(), codes.data(), codes.size());
+                return HostBuffer(std::move(buffer));
+            };
+            return dtype == DataType::FP8_E5M2 ? bytes.template operator()<float8_e5m2>()
+                                               : bytes.template operator()<float8_e4m3>();
+        });
+        return ttnn::Tensor(to_tile_layout(row_major, Tile())).to_device(mesh_device_.get());
+    }
+
+    std::shared_ptr<MeshDevice> mesh_device_;
+};
+
+// float8_e4m3fn to float, as the unpacker reads it: subnormals flushed to zero.
+float decode(uint8_t bits) {
+    const int exponent = (bits >> 3) & 0xF;
+    const int mantissa = bits & 0x7;
+    float value;
+    if (exponent == 15 && mantissa == 7) {
+        value = std::nanf("");
+    } else if (exponent == 0) {
+        value = 0.0f;
+    } else {
+        value = std::ldexp(static_cast<float>(8 + mantissa), exponent - 10);
+    }
+    return bits & 0x80 ? -value : value;
+}
+
+// float8_e5m2 to float, as the unpacker reads it: subnormals flushed to zero.
+float decode_e5m2(uint8_t bits) {
+    const int exponent = (bits >> 2) & 0x1F;
+    const int mantissa = bits & 0x3;
+    float value;
+    if (exponent == 31) {
+        value = mantissa != 0 ? std::nanf("") : INFINITY;
+    } else if (exponent == 0) {
+        value = 0.0f;
+    } else {
+        value = std::ldexp(static_cast<float>(4 + mantissa), exponent - 17);
+    }
+    return bits & 0x80 ? -value : value;
+}
+
+// Random finite e5m2 codes, subnormals included.
+std::vector<uint8_t> random_e5m2_codes(size_t count, std::mt19937& rng) {
+    std::uniform_int_distribution<int> code(0, 247);
+    std::vector<uint8_t> codes(count);
+    for (uint8_t& c : codes) {
+        const int v = code(rng);
+        c = static_cast<uint8_t>(v < 124 ? v : v + 4);  // skip 0x7C-0x7F; 0xFC-0xFF are out of range
+    }
+    return codes;
+}
+
+// Random e4m3 codes without NaN: every finite code, subnormals included.
+std::vector<uint8_t> random_codes(size_t count, std::mt19937& rng) {
+    std::uniform_int_distribution<int> code(0, 253);
+    std::vector<uint8_t> codes(count);
+    for (uint8_t& c : codes) {
+        const int v = code(rng);
+        c = static_cast<uint8_t>(v < 127 ? v : v + 1);  // skip 0x7F; 0xFF is out of range
+    }
+    return codes;
+}
+
+// The worst |c - ref| / sum |a_ik b_kj|, or infinity if an output is not finite (the inputs are).
+double worst_error(
+    const std::vector<float>& c, const std::vector<float>& a, const std::vector<float>& b, uint32_t M, uint32_t K,
+    uint32_t N) {
+    double worst = 0.0;
+    for (uint32_t i = 0; i < M; ++i) {
+        for (uint32_t j = 0; j < N; ++j) {
+            if (!std::isfinite(c[i * N + j])) {
+                return INFINITY;
+            }
+            double ref = 0.0, scale = 0.0;
+            for (uint32_t k = 0; k < K; ++k) {
+                const double product = static_cast<double>(a[i * K + k]) * b[k * N + j];
+                ref += product;
+                scale += std::abs(product);
+            }
+            worst = std::max(worst, std::abs(c[i * N + j] - ref) / std::max(scale, 1e-30));
+        }
+    }
+    return worst;
+}
+
+std::vector<float> decode_all(const std::vector<uint8_t>& codes, bool e5m2 = false) {
+    std::vector<float> values(codes.size());
+    for (size_t i = 0; i < codes.size(); ++i) {
+        values[i] = e5m2 ? decode_e5m2(codes[i]) : decode(codes[i]);
+    }
+    return values;
+}
+
+TEST_F(Fp8MatmulTest, MatchesFlushedReference) {
+    struct Shape {
+        uint32_t M, K, N;
+    };
+    for (const Shape& shape : {Shape{32, 32, 32}, Shape{64, 256, 96}, Shape{256, 1024, 128}}) {
+        const auto [M, K, N] = shape;
+        std::mt19937 rng(M * 131 + K * 7 + N);
+        const std::vector<uint8_t> a = random_codes(M * K, rng);
+        const std::vector<uint8_t> b = random_codes(K * N, rng);
+        const ttnn::Tensor a_device = fp8_device(a, M, K);
+        const ttnn::Tensor b_device = fp8_device(b, K, N);
+        // The DEST register has to be in 32-bit mode for Fp8 inputs.
+        for (const MathFidelity fidelity : {MathFidelity::LoFi, MathFidelity::HiFi4}) {
+            const ttnn::Tensor c_device = ttnn::matmul(
+                a_device, b_device, false, false, std::nullopt, DataType::FLOAT32, std::nullopt, std::nullopt,
+                ttnn::DeviceComputeKernelConfig{.math_fidelity = fidelity, .fp32_dest_acc_en = true});
+            const double error =
+                worst_error(c_device.cpu().to_vector<float>(), decode_all(a), decode_all(b), M, K, N);
+            std::printf(
+                "fp8 x fp8 %ux%ux%u %s: worst error %.3g\n",
+                M,
+                K,
+                N,
+                fidelity == MathFidelity::LoFi ? "LoFi" : "HiFi4",
+                error);
+            // Bound the matrix unit's accumulation error.
+            EXPECT_LE(error, std::ldexp(1.0, -9));
+        }
+    }
+}
+
+// FP8_E5M2 operands, and one of each format: both unpack to Float16.
+TEST_F(Fp8MatmulTest, E5m2AndMixedOperands) {
+    // The larger shape's program also has a BFLOAT16 buffer for partial sums.
+    for (const auto& [M, K, N] : {std::array<uint32_t, 3>{64, 256, 96}, std::array<uint32_t, 3>{1024, 1024, 256}}) {
+        std::mt19937 rng(11);
+        const std::vector<uint8_t> a4 = random_codes(M * K, rng), b4 = random_codes(K * N, rng);
+        const std::vector<uint8_t> a5 = random_e5m2_codes(M * K, rng), b5 = random_e5m2_codes(K * N, rng);
+        struct Case {
+            const char* name;
+            const std::vector<uint8_t>& a;
+            bool a_e5m2;
+            const std::vector<uint8_t>& b;
+            bool b_e5m2;
+        };
+        for (const Case& c : {Case{"e5m2 x e5m2", a5, true, b5, true}, Case{"e4m3 x e5m2", a4, false, b5, true},
+                              Case{"e5m2 x e4m3", a5, true, b4, false}}) {
+            const auto dtype = [](bool e5m2) { return e5m2 ? DataType::FP8_E5M2 : DataType::FP8_E4M3; };
+            const ttnn::Tensor product = ttnn::matmul(
+                fp8_device(c.a, M, K, dtype(c.a_e5m2)), fp8_device(c.b, K, N, dtype(c.b_e5m2)), false, false,
+                std::nullopt, DataType::FLOAT32, std::nullopt, std::nullopt,
+                ttnn::DeviceComputeKernelConfig{.math_fidelity = MathFidelity::LoFi, .fp32_dest_acc_en = true});
+            const double error = worst_error(
+                product.cpu().to_vector<float>(), decode_all(c.a, c.a_e5m2), decode_all(c.b, c.b_e5m2), M, K, N);
+            std::printf("%s %ux%ux%u LoFi: worst error %.3g\n", c.name, M, K, N, error);
+            EXPECT_LE(error, std::ldexp(1.0, -9)) << c.name;
+        }
+    }
+}
+
+}  // namespace
+}  // namespace tt::tt_metal::distributed::test

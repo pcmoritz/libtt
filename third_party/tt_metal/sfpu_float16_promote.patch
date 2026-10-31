@@ -108,6 +108,64 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/
      } else if constexpr (in_format == DataFormat::Float32 && out_format == DataFormat::Float16_b) {
          MATH(SFPU_UNARY_CALL(
              DST_SYNC_MODE,
+diff --git ttnn/api/ttnn/tensor/tensor_ops.hpp ttnn/api/ttnn/tensor/tensor_ops.hpp
+--- ttnn/api/ttnn/tensor/tensor_ops.hpp
++++ ttnn/api/ttnn/tensor/tensor_ops.hpp
+@@ -81,6 +81,15 @@ Tensor unpad_from_tile(const Tensor& input_tensor, const tt::tt_metal::Shape& ou
+  */
+ Tensor unchecked_reinterpret_layout(const Tensor& input_tensor, tt::tt_metal::Layout target_layout);
+ 
++/**
++ * Reinterpret the device memory of input_tensor as target_dtype, a data type with the same page size, without moving
++ * or converting data, e.g. BFLOAT16 or FLOAT16 tiles as UINT16 tiles.
++ *
++ * The result and input_tensor point to the same memory. The caller is responsible for ensuring that the
++ * reinterpretation is semantically valid.
++ */
++Tensor unchecked_reinterpret_dtype(const Tensor& input_tensor, tt::tt_metal::DataType target_dtype);
++
+ Tensor to_dtype(const Tensor& input_tensor, const tt::tt_metal::DataType& dtype);
+ 
+ }  // namespace ttnn
+diff --git ttnn/core/tensor/tensor_ops.cpp ttnn/core/tensor/tensor_ops.cpp
+--- ttnn/core/tensor/tensor_ops.cpp
++++ ttnn/core/tensor/tensor_ops.cpp
+@@ -568,6 +568,35 @@ Tensor unchecked_reinterpret_layout(const Tensor& input_tensor, Layout target_la
+     return Tensor(std::move(reinterpreted_storage));
+ }
+ 
++Tensor unchecked_reinterpret_dtype(const Tensor& input_tensor, DataType target_dtype) {
++    TT_FATAL(
++        input_tensor.storage_type() == StorageType::DEVICE,
++        "unchecked_reinterpret_dtype: only device tensors are supported");
++    const auto& old_spec = input_tensor.tensor_spec();
++    const auto& old_layout = old_spec.tensor_layout();
++    TensorSpec new_spec(
++        old_spec.logical_shape(),
++        TensorLayout(
++            target_dtype, old_layout.get_page_config(), old_layout.get_memory_config(), old_layout.get_alignment()));
++    TT_FATAL(
++        new_spec.compute_page_size_bytes() == old_spec.compute_page_size_bytes(),
++        "unchecked_reinterpret_dtype: {} and {} pages differ in size",
++        input_tensor.dtype(),
++        target_dtype);
++
++    const auto& input_buffer = input_tensor.device_storage().get_mesh_buffer();
++    auto new_mesh_buffer = tt::tt_metal::distributed::MeshBuffer::create(
++        input_buffer.global_config(),
++        input_buffer.device_local_config(),
++        input_buffer.device(),
++        input_buffer.address());
++
++    MeshTensor reinterpreted = mesh_tensor_from_buffer_with_topology(
++        std::move(*new_mesh_buffer), new_spec, input_tensor.tensor_topology());
++    DeviceStorage reinterpreted_storage(input_tensor.device_storage(), std::move(reinterpreted));
++    return Tensor(std::move(reinterpreted_storage));
++}
++
+ }  // namespace ttnn
+ 
+ namespace tt::tt_metal {
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
@@ -151,40 +209,15 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_sharded_progra
 diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
 --- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
 +++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
-@@ -8,6 +8,8 @@
- #include <limits>
- #include <string_view>
+@@ -17,6 +17,7 @@
+ #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
+ #include "ttnn/operations/experimental/reshape/view.hpp"
+ #include "ttnn/operations/core/core.hpp"
++#include "ttnn/tensor/tensor_ops.hpp"
+ #include "ttnn/types.hpp"
  
-+#include <tt-metalium/experimental/distributed_tensor/distributed_tensor_apis.hpp>
-+
- #include "ttnn/distributed/types.hpp"
- #include "ttnn/operations/data_movement/pad/pad.hpp"
- #include "ttnn/operations/data_movement/tilize/tilize.hpp"
-@@ -22,6 +24,23 @@
  namespace ttnn::operations::core::CMAKE_UNIQUE_NAMESPACE {
- namespace {
- 
-+// BF16, FP16 and UInt16 have identical storage. Keep the owning storage alive
-+// while viewing the same allocation with a format that does not canonicalize
-+// floats.
-+Tensor view_float16_bits(const Tensor& input, DataType dtype) {
-+    const auto& spec = input.tensor_spec();
-+    tt::tt_metal::TensorSpec view_spec(
-+        spec.logical_shape(),
-+        tt::tt_metal::TensorLayout(
-+            dtype, spec.page_config(), spec.memory_config(), spec.tensor_layout().get_alignment()));
-+    const auto& buffer = input.device_storage().get_mesh_buffer();
-+    auto view_buffer = tt::tt_metal::distributed::MeshBuffer::create(
-+        buffer.global_config(), buffer.device_local_config(), buffer.device(), buffer.address());
-+    auto view_tensor = tt::tt_metal::mesh_tensor_from_buffer_with_topology(
-+        std::move(*view_buffer), view_spec, input.tensor_topology());
-+    return Tensor(DeviceStorage(input.device_storage(), std::move(view_tensor)));
-+}
-+
- bool requires_padding_change(const ttnn::Tensor& tensor, ttnn::Layout layout) {
-     if (layout == Layout::ROW_MAJOR) {
-         // There shouldn't be extra paddings for Row Major layout
-@@ -80,6 +99,22 @@ Tensor to_layout_impl(
+@@ -80,6 +81,22 @@ Tensor to_layout_impl(
          return tensor_arg;
      }
  
@@ -198,10 +231,10 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
 +        const uint16_t pad_bits = float_dtype == DataType::FLOAT16
 +                                      ? tt::tt_metal::float16(pad_value).bits
 +                                      : std::bit_cast<uint16_t>(bfloat16(pad_value));
-+        auto raw = view_float16_bits(tensor_arg, DataType::UINT16);
++        auto raw = unchecked_reinterpret_dtype(tensor_arg, DataType::UINT16);
 +        auto converted = to_layout_impl(
 +            raw, layout, DataType::UINT16, memory_config, sub_core_grids, static_cast<float>(pad_bits));
-+        return view_float16_bits(converted, float_dtype);
++        return unchecked_reinterpret_dtype(converted, float_dtype);
 +    }
 +
      const std::set<ttnn::Layout> supported_layouts = {
