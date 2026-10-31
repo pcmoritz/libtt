@@ -1,0 +1,156 @@
+diff --git tt_metal/impl/data_format/tilize_utils.cpp tt_metal/impl/data_format/tilize_utils.cpp
+--- tt_metal/impl/data_format/tilize_utils.cpp
++++ tt_metal/impl/data_format/tilize_utils.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "tt_metal/tools/profiler/tracy_debug_zones.hpp"
+ #include <tt-metalium/bfloat16.hpp>
++#include <tt-metalium/float8.hpp>
+ #include <tt-metalium/tensor/tensor_types.hpp>
+ #include <tt-metalium/tilize_utils.hpp>
+ #include <cstddef>
+@@ -551,6 +552,7 @@
+ template std::vector<int8_t> convert_layout<int8_t>(ttsl::Span<const int8_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
+ template std::vector<tt::tt_metal::float16> convert_layout<tt::tt_metal::float16>(ttsl::Span<const tt::tt_metal::float16>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
+ template std::vector<uint8_t> convert_layout<uint8_t>(ttsl::Span<const uint8_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
++template std::vector<float8_e4m3> convert_layout<float8_e4m3>(ttsl::Span<const float8_e4m3>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
+ template std::vector<uint16_t> convert_layout<uint16_t>(ttsl::Span<const uint16_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
+ template std::vector<uint32_t> convert_layout<uint32_t>(ttsl::Span<const uint32_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
+ template std::vector<bfloat16> convert_layout<bfloat16>(ttsl::Span<const bfloat16>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
+diff --git tt_metal/impl/tensor/host_pad_apis.cpp tt_metal/impl/tensor/host_pad_apis.cpp
+--- tt_metal/impl/tensor/host_pad_apis.cpp
++++ tt_metal/impl/tensor/host_pad_apis.cpp
+@@ -326,14 +326,6 @@
+     return pad_bfloat4_b(tensor, output_padded_shape, input_tensor_start, pad_value);
+ }
+ 
+-template <>
+-HostTensor pad_impl<float8_e4m3>(const HostTensor&, const tt::tt_metal::Shape&, const tt::tt_metal::Shape&, float) {
+-    // FP8_E4M3 host-side pad is not wired up; no current op needs it. The generic body
+-    // would actually compile (float8_e4m3 is a 1-byte trivially-copyable type with a float
+-    // constructor), but leaving this as an explicit throw documents the intentional scope.
+-    TT_THROW("pad: FP8_E4M3 is not supported");
+-}
+-
+ template <typename T>
+ HostTensor unpad_impl(
+     const HostTensor& tensor,
+@@ -408,12 +400,6 @@
+     return unpad_bfloat4_b(tensor, output_tensor_start, output_tensor_end);
+ }
+ 
+-template <>
+-HostTensor unpad_impl<float8_e4m3>(const HostTensor&, const tt::tt_metal::Shape&, const tt::tt_metal::Shape&) {
+-    // See pad_impl<float8_e4m3>: not wired up, no current op needs it.
+-    TT_THROW("unpad: FP8_E4M3 is not supported");
+-}
+-
+ }  // namespace CMAKE_UNIQUE_NAMESPACE
+ }  // namespace
+ 
+diff --git tt_metal/impl/tensor/spec/tensor_spec.cpp tt_metal/impl/tensor/spec/tensor_spec.cpp
+--- tt_metal/impl/tensor/spec/tensor_spec.cpp
++++ tt_metal/impl/tensor/spec/tensor_spec.cpp
+@@ -117,21 +117,15 @@
+             case DataType::INT8:
+             case DataType::UINT16:
+             case DataType::FLOAT16:
+-            case DataType::BFLOAT16: break;
++            case DataType::BFLOAT16:
++            // FP8_E4M3 tiles hold one byte per element, like UINT8 tiles, which
++            // the unpacker reads as Fp8_e4m3, e.g. as matmul operands. Arch
++            // validation is each producer op's responsibility.
++            case DataType::FP8_E4M3: break;
+             case DataType::BFLOAT8_B:
+             case DataType::BFLOAT4_B:
+                 TT_FATAL(layout == Layout::TILE, "Only TILE layout is supported for BFLOAT8_B dtype!");
+                 break;
+-            case DataType::FP8_E4M3:
+-                // Arch validation is each producer op's responsibility (e.g., the combine op
+-                // validator at ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/combine/
+-                // device/combine_device_operation.cpp); this dtype/layout validator has no
+-                // MeshDevice handle and so stays arch-agnostic.
+-                // Layout note: ROW_MAJOR-only here because FP8_E4M3 is currently produced
+-                // exclusively as the row-major output of the DeepSeek V3 Prefill combine op
+-                // (ttnn/cpp/ttnn/operations/experimental/deepseek_prefill/combine).
+-                TT_FATAL(layout == Layout::ROW_MAJOR, "Only ROW_MAJOR layout is supported for FP8_E4M3 dtype!");
+-                break;
+             default:
+                 TT_FATAL(
+                     false,
+diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
+--- tt_metal/impl/tensor/tensor_apis.cpp
++++ tt_metal/impl/tensor/tensor_apis.cpp
+@@ -278,10 +278,7 @@
+         return tensor;
+     }
+ 
+-    if constexpr (std::is_same_v<T, float8_e4m3>) {
+-        // FP8_E4M3 is constrained to ROW_MAJOR, so tilizing it is a caller error.
+-        TT_THROW("to_layout: FP8_E4M3 only supports ROW_MAJOR layout (got target {})", Layout::TILE);
+-    } else {
++    {
+         TT_FATAL(tensor.layout() == Layout::ROW_MAJOR, "Converting from {} to Tile is unsupported.", tensor.layout());
+ 
+         auto output_spec = TensorSpec(
+@@ -322,17 +319,13 @@
+ 
+ HostTensor to_row_major_layout(const HostTensor& tensor) {
+     return tensor_impl::dispatch(tensor.dtype(), [&]<typename T>() {
+-        if constexpr (
+-            std::is_same_v<T, tensor_impl::bfloat4_b> || std::is_same_v<T, tensor_impl::bfloat8_b> ||
+-            std::is_same_v<T, float8_e4m3>) {
++        if constexpr (std::is_same_v<T, tensor_impl::bfloat4_b> || std::is_same_v<T, tensor_impl::bfloat8_b>) {
+             // bfloat4_b / bfloat8_b: TODO(#43763):
+             // Flipping this assert to TT_FATAL triggers multiple failures in **sanity** test suite.
+             // This silent fail has a high impact area and should be studied and addressed asap.
+             //
+             // Original comment:
+             // TODO: Flip to assert when we remove use cases in python and c++
+-            //
+-            // FP8_E4M3 is constrained to ROW_MAJOR at construction, so it is already row-major.
+             return tensor;
+         } else {
+             return CMAKE_UNIQUE_NAMESPACE::to_row_major_layout_impl<T>(tensor);
+diff --git tt_metal/impl/tensor/tensor_impl.cpp tt_metal/impl/tensor/tensor_impl.cpp
+--- tt_metal/impl/tensor/tensor_impl.cpp
++++ tt_metal/impl/tensor/tensor_impl.cpp
+@@ -319,6 +319,8 @@
+     const Shape2D& shape, const Tile& tile, ttsl::Span<const uint16_t> data_to_convert);
+ template std::vector<uint8_t> to_tile_major_layout<uint8_t>(
+     const Shape2D& shape, const Tile& tile, ttsl::Span<const uint8_t> data_to_convert);
++template std::vector<float8_e4m3> to_tile_major_layout<float8_e4m3>(
++    const Shape2D& shape, const Tile& tile, ttsl::Span<const float8_e4m3> data_to_convert);
+ 
+ template <typename T>
+ std::vector<T> decode_tensor_data(ttsl::Span<const T> physical_data, const TensorSpec& tensor_spec) {
+diff --git ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
+@@ -8,6 +8,7 @@
+ #include "ttnn/operations/eltwise/complex/complex.hpp"
+ #include "ttnn/operations/eltwise/binary/binary.hpp"
+ #include "ttnn/operations/copy/typecast/typecast.hpp"
++#include "ttnn/tensor/tensor_ops.hpp"
+ 
+ namespace ttnn::operations::unary::detail {
+ 
+@@ -492,6 +493,18 @@
+             output_dtype == optional_output_tensor.value().dtype(),
+             "If both output dtype and output tensor provided dtype should match");
+     }
++    // UINT8 and float8 tiles hold the same bytes, so a bitcast between them is a view (a copy through the
++    // unpacker would read the float8 bytes as numbers).
++    auto is_byte_type = [](DataType dtype) {
++        return dtype == DataType::UINT8 || dtype == DataType::FP8_E4M3;
++    };
++    if (is_byte_type(input_tensor.dtype()) && is_byte_type(output_dtype)) {
++        TT_FATAL(
++            !optional_output_tensor.has_value() &&
++                memory_config.value_or(input_tensor.memory_config()) == input_tensor.memory_config(),
++            "Bitcast between UINT8 and float8 is a view of the input: it takes no output tensor or other memory config");
++        return unchecked_reinterpret_dtype(input_tensor, output_dtype);
++    }
+     EltwiseUnaryWithParam bitcast_op(
+         UnaryOpType::BITCAST, {static_cast<float>(input_tensor.dtype()), static_cast<float>(output_dtype)});
+     return operations::unary::detail::unary_impl(

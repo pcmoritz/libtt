@@ -60,6 +60,12 @@ bits. This is not general uint64 support: high words are lost across
 unconverted operations, including `while`, `case`, `optimization_barrier`
 and `custom_call`. Do not carry uint64 RNG state through those operations.
 
+float8_e4m3fn and float8_e5m2 tensors take one byte per element, and
+conversions to and from them round like PyTorch's. A matmul of two float8
+matrices of either format, as in `torch._scaled_mm`, reads them natively on
+the matrix unit, which treats subnormal operands as zero. A matmul of a float8
+matrix and a bfloat16 one computes on bfloat16 values.
+
 ## Not supported
 
 - Dynamic shapes (`torch_tpu.dynamism.mark_dynamic`, ops with data-dependent

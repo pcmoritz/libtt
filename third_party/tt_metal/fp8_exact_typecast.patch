@@ -1,0 +1,183 @@
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/eltwise_typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/eltwise_typecast.cpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/eltwise_typecast.cpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/eltwise_typecast.cpp
+@@ -9,6 +9,107 @@
+ 
+ namespace ckl = compute_kernel_lib;
+ 
++#ifdef TRISC_MATH
++#include "llk_math_eltwise_unary_sfpu_macros.h"
++
++namespace ckernel::sfpu {
++
++// Float8 bytes (UInt8 tiles, zero-extended in the 32-bit DST) to float32, exactly: M mantissa bits,
++// exponent bias BIAS, and either infinities (e5m2) or only NaN at the top code (e4m3fn).
++template <int M, int BIAS, bool HAS_INF>
++inline void calculate_fp8_to_fp32() {
++    for (int d = 0; d < 8; d++) {
++        const sfpi::vUInt code = sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>();
++        const sfpi::vInt magnitude = sfpi::as<sfpi::vInt>(code & 0x7f);
++        // A normal value's exponent and mantissa, moved into float32's fields and rebiased.
++        sfpi::vUInt bits = sfpi::as<sfpi::vUInt>(sfpi::shft(magnitude, 23 - M) + ((127 - BIAS) << 23));
++        v_if(magnitude < (1 << M)) {
++            // A subnormal value: its mantissa times the smallest subnormal.
++            const sfpi::vFloat value = sfpi::convert<sfpi::vFloat>(magnitude, sfpi::RoundMode::Nearest) *
++                                       __builtin_ldexpf(1.0f, 1 - BIAS - M);
++            bits = sfpi::as<sfpi::vUInt>(value);
++        }
++        v_endif;
++        constexpr int top = HAS_INF ? 0x7f & ~((1 << M) - 1) : 0x7f;  // infinity (e5m2) or NaN (e4m3fn)
++        if constexpr (HAS_INF) {
++            v_if(magnitude == top) { bits = 0x7f800000; }
++            v_endif;
++        }
++        v_if(magnitude > top - (HAS_INF ? 0 : 1)) { bits = 0x7fc00000; }
++        v_endif;
++        // The sign goes on the bits, so that -0 stays negative zero.
++        sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>() = bits | sfpi::shft(code & 0x80, 24);
++        sfpi::dst_reg++;
++    }
++}
++
++// Float32 to float8 bytes, rounded to nearest even with subnormals kept, as PyTorch and XLA convert:
++// values past the largest finite one become NaN (e4m3fn) or infinity (e5m2).
++template <int M, int BIAS, bool HAS_INF>
++inline void calculate_fp32_to_fp8() {
++    for (int d = 0; d < 8; d++) {
++        const sfpi::vUInt input = sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>();
++        sfpi::vInt magnitude = sfpi::as<sfpi::vInt>(input & 0x7fffffff);
++        // NaNs as infinity, which keeps the sums below from overflowing.
++        v_if(magnitude > 0x7f800000) { magnitude = 0x7f800000; }
++        v_endif;
++        // Subnormal results: the significand in units of the smallest subnormal, 2^(1 - BIAS - M). Both
++        // results round to nearest even as x + (half - 1) + (the kept bits' last bit), shifted.
++        sfpi::vInt shift = (151 - BIAS - M) - sfpi::shft(magnitude, -23);
++        v_if(shift > 31) { shift = 31; }
++        v_endif;
++        const sfpi::vInt significand = (magnitude & 0x7fffff) | 0x800000;
++        const sfpi::vInt subnormal = sfpi::shft(
++            significand + (sfpi::shft(sfpi::vInt(1), shift - 1) - 1) + (sfpi::shft(significand, 0 - shift) & 1),
++            0 - shift);
++        // Normal results: the mantissa rounded to M bits and the exponent rebiased (a carry out of the
++        // mantissa increments it).
++        constexpr int dropped = 23 - M;
++        sfpi::vInt code = sfpi::shft(magnitude + (sfpi::shft(magnitude, -dropped) & 1) + ((1 << (dropped - 1)) - 1),
++                                     -dropped) -
++                          ((127 - BIAS) << M);
++        v_if(magnitude < ((128 - BIAS) << 23)) { code = subnormal; }
++        v_endif;
++        // Past the largest finite value: NaN (e4m3fn) or infinity (e5m2).
++        constexpr int top = HAS_INF ? 0x7f & ~((1 << M) - 1) : 0x7f;
++        v_if(code > top) { code = top; }
++        v_endif;
++        const sfpi::vUInt bits = sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>();
++        if constexpr (HAS_INF) {
++            v_if(sfpi::as<sfpi::vInt>(bits & 0x7fffffff) > 0x7f800000) { code = 0x7f; }
++            v_endif;
++        }
++        sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>() = sfpi::as<sfpi::vUInt>(code) | (sfpi::shft(bits, -24) & 0x80);
++        sfpi::dst_reg++;
++    }
++}
++
++}  // namespace ckernel::sfpu
++
++template <bool DECODE, int M, int BIAS, bool HAS_INF>
++inline void fp8_typecast_tile(uint32_t idst) {
++    if constexpr (DECODE) {
++        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_fp8_to_fp32, (M, BIAS, HAS_INF), idst, VectorMode::RC);
++    } else {
++        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_fp32_to_fp8, (M, BIAS, HAS_INF), idst, VectorMode::RC);
++    }
++}
++#endif
++
++// Float8 (Fp8_e4m3 or Lf8) <-> Float32, exactly.
++template <uint32_t InDF, uint32_t OutDF, ckl::Dst Slot>
++struct Float8Typecast : ckl::UnaryOp<Float8Typecast<InDF, OutDF, Slot>, Slot> {
++    static constexpr bool decode = InDF != static_cast<uint32_t>(DataFormat::Float32);
++    static constexpr bool e5m2 = (decode ? InDF : OutDF) == static_cast<uint32_t>(DataFormat::Lf8);
++    static ALWI void init() { MATH((SFPU_UNARY_INIT(typecast))); }
++    static ALWI void exec_impl(uint32_t slot_offset) {
++        MATH((fp8_typecast_tile<decode, e5m2 ? 2 : 3, e5m2 ? 15 : 7, e5m2>(ckl::to_u32(Slot) + slot_offset)));
++    }
++};
++
++template <uint32_t DF>
++constexpr bool is_float8 = DF == static_cast<uint32_t>(DataFormat::Fp8_e4m3) || DF == static_cast<uint32_t>(DataFormat::Lf8);
++
+ void kernel_main() {
+     constexpr uint32_t per_core_block_cnt = get_arg(args::per_core_block_cnt);
+     constexpr uint32_t per_core_block_dim = get_arg(args::per_core_block_dim);
+@@ -26,6 +127,13 @@
+         ckl::input(dfb::in, ckl::WaitPolicy::PerTile, ckl::PopPolicy::PerTile, ckl::DataFormatReconfig::Disabled);
+     constexpr auto output = ckl::output(
+         dfb::out, ckl::ReservePolicy::PerOuter, ckl::PushPolicy::PerOuter, ckl::DataFormatReconfig::Disabled);
+-    ckl::unary<ckl::Typecast<in_data_format, out_data_format>, input, output>(
+-        ckl::IterationShape::grid(per_core_block_cnt, per_core_block_dim));
++    constexpr bool float8_float32 = (is_float8<in_data_format> && out_data_format == (uint32_t)DataFormat::Float32) ||
++                                    (in_data_format == (uint32_t)DataFormat::Float32 && is_float8<out_data_format>);
++    if constexpr (float8_float32) {
++        ckl::unary<Float8Typecast<in_data_format, out_data_format, ckl::Dst::D0>, input, output>(
++            ckl::IterationShape::grid(per_core_block_cnt, per_core_block_dim));
++    } else {
++        ckl::unary<ckl::Typecast<in_data_format, out_data_format>, input, output>(
++            ckl::IterationShape::grid(per_core_block_cnt, per_core_block_dim));
++    }
+ }
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
+@@ -17,8 +17,21 @@
+            (input_dtype == tt::tt_metal::DataType::BFLOAT16 && output_dtype == tt::tt_metal::DataType::FLOAT16);
+ }
+ 
++// Float8 <-> Float32 typecasts convert the float8 bytes exactly in SFPU registers: the hardware's own
++// conversions truncate, flush subnormals and lose NaN.
++inline bool is_float8_float32_typecast(tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
++    auto is_float8 = [](tt::tt_metal::DataType dtype) {
++        return dtype == tt::tt_metal::DataType::FP8_E4M3 || dtype == tt::tt_metal::DataType::FP8_E5M2;
++    };
++    return (is_float8(input_dtype) && output_dtype == tt::tt_metal::DataType::FLOAT32) ||
++           (input_dtype == tt::tt_metal::DataType::FLOAT32 && is_float8(output_dtype));
++}
++
+ inline tt::DataFormat typecast_input_format(
+     tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
++    if (is_float8_float32_typecast(input_dtype, output_dtype) && input_dtype != tt::tt_metal::DataType::FLOAT32) {
++        return tt::DataFormat::UInt8;
++    }
+     return ((input_dtype == tt::tt_metal::DataType::FLOAT16 || input_dtype == tt::tt_metal::DataType::BFLOAT16) &&
+             output_dtype == tt::tt_metal::DataType::FLOAT32) ||
+                    is_float16_bfloat16_typecast(input_dtype, output_dtype)
+@@ -28,6 +41,9 @@
+ 
+ inline tt::DataFormat typecast_output_format(
+     tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
++    if (is_float8_float32_typecast(input_dtype, output_dtype) && output_dtype != tt::tt_metal::DataType::FLOAT32) {
++        return tt::DataFormat::UInt8;
++    }
+     const bool exact_float16_output =
+         output_dtype == tt::tt_metal::DataType::FLOAT16 &&
+         (input_dtype == tt::tt_metal::DataType::FLOAT32 || input_dtype == tt::tt_metal::DataType::UINT8 ||
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+@@ -58,13 +58,15 @@
+         (input_dtype == DataType::FLOAT32) or
+         (is_8_bit_int(output_dtype) and (input_dtype == DataType::BFLOAT16 or input_dtype == DataType::BFLOAT8_B or
+                                          input_dtype == DataType::BFLOAT4_B)) or
+-        (input_dtype == DataType::UINT16 and is_8_bit_int(output_dtype)) or is_8_bit_int(input_dtype);
++        (input_dtype == DataType::UINT16 and is_8_bit_int(output_dtype)) or is_8_bit_int(input_dtype) or
++        ttnn::prim::is_float8_float32_typecast(input_dtype, output_dtype);
+     bool fp32_dest_acc_en = preserve_fp32_precision or output_dtype == DataType::UINT32 or
+                             output_dtype == DataType::INT32 or output_dtype == DataType::FLOAT32 or
+                             (input_dtype == DataType::UINT16 and output_dtype == DataType::FLOAT16) or
+                             ttnn::prim::is_float16_bfloat16_typecast(input_dtype, output_dtype) or
+                             input_dtype == DataType::UINT32 or input_dtype == DataType::INT32 or
+-                            output_dtype == DataType::FP8_E4M3 or input_dtype == DataType::FP8_E4M3;
++                            output_dtype == DataType::FP8_E4M3 or input_dtype == DataType::FP8_E4M3 or
++                            output_dtype == DataType::FP8_E5M2 or input_dtype == DataType::FP8_E5M2;
+     bool bfp8_pack_precise = (output_dtype == DataType::BFLOAT8_B);
+     auto output_memory_config = optional_output_tensor.has_value()
+                                     ? optional_output_tensor.value().memory_config()

@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -314,11 +314,22 @@
+@@ -305,11 +305,22 @@
  
      if (srcOp.getInputs().size() > 1) {
        if (isArgMax(srcOp, adaptor, rewriter)) {
@@ -27,7 +27,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        }
        return matchAndRewriteSeparable(srcOp, adaptor, rewriter);
      }
-@@ -559,6 +570,49 @@
+@@ -550,6 +561,49 @@
      return success();
    }
  
@@ -77,7 +77,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    LogicalResult
    matchAndRewriteInternalArgMax(mlir::stablehlo::ReduceOp &srcOp,
                                  mlir::Value input,
-@@ -591,9 +645,8 @@
+@@ -582,9 +636,8 @@
  
    LogicalResult
    matchAndRewriteInternalArgMin(mlir::stablehlo::ReduceOp &srcOp,
@@ -88,7 +88,16 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto inputType = mlir::cast<RankedTensorType>(input.getType());
      mlir::Type elementType = inputType.getElementType();
      mlir::Value reversedInput;
-@@ -728,8 +781,8 @@
+@@ -667,7 +720,7 @@
+       return false;
+     }
+ 
+-    if (!hasValidArgMinInitValues(srcOp.getInitValues())) {
++    if (!hasValidArgMaxInitValues(srcOp.getInitValues())) {
+       return false;
+     }
+ 
+@@ -719,8 +772,8 @@
        return false;
      }
  
@@ -99,3 +108,33 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return false;
      }
      return true;
+@@ -732,27 +785,8 @@
+       return false;
+     }
+ 
+-    if (!verifyInitValue(initValues.front(),
+-                         TypicalInitReductionValue::NEG_INF)) {
+-      return false;
+-    }
+-
+-    if (!verifyInitValue(initValues.back(), TypicalInitReductionValue::ZERO)) {
+-      return false;
+-    }
+-    return true;
+-  }
+-
+-  bool hasValidArgMinInitValues(mlir::OperandRange initValues) const {
+-    if (initValues.size() != 2) {
+-      return false;
+-    }
+-
+-    if (!verifyInitValue(initValues.front(),
+-                         TypicalInitReductionValue::POS_INF)) {
+-      return false;
+-    }
+-
++    // Any init value: combineInitIntoInput takes it into the input. The index
++    // starts at 0, where the init wins.
+     if (!verifyInitValue(initValues.back(), TypicalInitReductionValue::ZERO)) {
+       return false;
+     }
