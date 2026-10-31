@@ -148,6 +148,19 @@ def test_one_device_programs_keep_the_mesh_open(devices):
     assert elapsed < 2, f"20 switches took {elapsed:.1f} s"
 
 
+def test_one_device_products_over_every_dim(devices):
+    """ttnn finishes a product over every dim, as in jnp.all, on the host, where
+    a program over one device on the mesh in use has a partial result per chip."""
+    mesh = Mesh(np.array(devices), ("x",))
+    ones = jax.device_put(np.ones((4 * len(devices), 4), np.float32), NamedSharding(mesh, P("x")))
+    np.testing.assert_allclose(np.asarray(jax.jit(lambda a: a * 2)(ones)), 2)
+    flags = np.ones(100, bool)
+    assert bool(jax.jit(jnp.all)(flags))
+    flags[42] = False
+    assert not bool(jax.jit(jnp.all)(flags))
+    np.testing.assert_allclose(np.asarray(jax.jit(jnp.prod)(np.full(16, 1.25, np.float32))), 1.25**16, rtol=1e-2)
+
+
 def test_donated_shards_of_replicated_tensors(devices):
     """A program over one device may update a donated shard in place; the other
     shards of a replicated tensor keep their data."""
