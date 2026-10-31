@@ -205,7 +205,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
 new file mode 100644
 --- /dev/null
 +++ b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
-@@ -0,0 +1,547 @@
+@@ -0,0 +1,521 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -534,18 +534,15 @@ new file mode 100644
 +
 +// The f32 values of a float8 constant.
 +DenseElementsAttr float32Values(mlir::stablehlo::ConstantOp constant) {
-+  auto values = llvm::map_to_vector(
-+      cast<DenseElementsAttr>(constant.getValue()).getValues<APFloat>(),
-+      [](APFloat value) {
-+        bool losesInfo;
-+        value.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven,
-+                      &losesInfo);
-+        return value;
-+      });
-+  return DenseElementsAttr::get(
-+      withElementType(constant.getType(),
-+                      Float32Type::get(constant.getContext())),
-+      values);
++  return cast<DenseFPElementsAttr>(constant.getValue())
++      .mapValues(Float32Type::get(constant.getContext()),
++                 [](const APFloat &value) {
++                   APFloat converted = value;
++                   bool losesInfo;
++                   converted.convert(APFloat::IEEEsingle(),
++                                     APFloat::rmNearestTiesToEven, &losesInfo);
++                   return converted.bitcastToAPInt();
++                 });
 +}
 +
 +// Such an op computes on f32 values instead: the float8 values it uses, as
@@ -565,29 +562,6 @@ new file mode 100644
 +    }
 +    return builder.create<mlir::stablehlo::ConvertOp>(op->getLoc(), value, f32);
 +  };
-+  // JAX starts an argmax (argmin) of float8_e4m3fn values, which has no
-+  // infinities, at the format's lowest (highest) finite value. When only the
-+  // index is used, an infinite start finds the same index, and it is the start
-+  // that TTIR's argmax lowering looks for.
-+  if (auto reduce = dyn_cast<mlir::stablehlo::ReduceOp>(op)) {
-+    for (auto [init, result] :
-+         llvm::zip_equal(reduce.getInitValuesMutable(), reduce.getResults())) {
-+      auto constant = init.get().getDefiningOp<mlir::stablehlo::ConstantOp>();
-+      if (!constant || !isFloat8(constant.getType()) || !result.use_empty()) {
-+        continue;
-+      }
-+      APFloat start = *cast<DenseElementsAttr>(constant.getValue())
-+                           .value_begin<APFloat>();
-+      if (start.bitwiseIsEqual(
-+              APFloat::getLargest(start.getSemantics(), start.isNegative()))) {
-+        init.set(builder.create<mlir::stablehlo::ConstantOp>(
-+            op->getLoc(),
-+            DenseElementsAttr::get(
-+                withElementType(constant.getType(), f32),
-+                APFloat::getInf(APFloat::IEEEsingle(), start.isNegative()))));
-+      }
-+    }
-+  }
 +  for (OpOperand &operand : op->getOpOperands()) {
 +    if (isFloat8(operand.get().getType())) {
 +      operand.set(decode(operand.get()));

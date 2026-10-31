@@ -57,30 +57,30 @@ protected:
     std::shared_ptr<MeshDevice> mesh_device_;
 };
 
-// float8_e4m3fn to float; subnormals flushed to zero when `flush` is set.
-float decode(uint8_t bits, bool flush) {
+// float8_e4m3fn to float, as the unpacker reads it: subnormals flushed to zero.
+float decode(uint8_t bits) {
     const int exponent = (bits >> 3) & 0xF;
     const int mantissa = bits & 0x7;
     float value;
     if (exponent == 15 && mantissa == 7) {
         value = std::nanf("");
     } else if (exponent == 0) {
-        value = flush ? 0.0f : std::ldexp(static_cast<float>(mantissa), -9);
+        value = 0.0f;
     } else {
         value = std::ldexp(static_cast<float>(8 + mantissa), exponent - 10);
     }
     return bits & 0x80 ? -value : value;
 }
 
-// float8_e5m2 to float; subnormals flushed to zero when `flush` is set.
-float decode_e5m2(uint8_t bits, bool flush) {
+// float8_e5m2 to float, as the unpacker reads it: subnormals flushed to zero.
+float decode_e5m2(uint8_t bits) {
     const int exponent = (bits >> 2) & 0x1F;
     const int mantissa = bits & 0x3;
     float value;
     if (exponent == 31) {
         value = mantissa != 0 ? std::nanf("") : INFINITY;
     } else if (exponent == 0) {
-        value = flush ? 0.0f : std::ldexp(static_cast<float>(mantissa), -16);
+        value = 0.0f;
     } else {
         value = std::ldexp(static_cast<float>(4 + mantissa), exponent - 17);
     }
@@ -109,35 +109,32 @@ std::vector<uint8_t> random_codes(size_t count, std::mt19937& rng) {
     return codes;
 }
 
-struct Errors {
-    double exact = 0.0;    // worst |c - ref| / sum |a_ik b_kj| against exact decoding
-    double flushed = 0.0;  // the same against decoding with subnormals flushed
-};
-
-Errors compare(
-    const std::vector<float>& c, const std::vector<float>& a_exact, const std::vector<float>& a_flushed,
-    const std::vector<float>& b_exact, const std::vector<float>& b_flushed, uint32_t M, uint32_t K, uint32_t N) {
-    Errors errors;
+// The worst |c - ref| / sum |a_ik b_kj|, or infinity if an output is not finite (the inputs are).
+double worst_error(
+    const std::vector<float>& c, const std::vector<float>& a, const std::vector<float>& b, uint32_t M, uint32_t K,
+    uint32_t N) {
+    double worst = 0.0;
     for (uint32_t i = 0; i < M; ++i) {
         for (uint32_t j = 0; j < N; ++j) {
-            double exact = 0.0, flushed = 0.0, scale = 0.0;
-            for (uint32_t k = 0; k < K; ++k) {
-                exact += static_cast<double>(a_exact[i * K + k]) * b_exact[k * N + j];
-                flushed += static_cast<double>(a_flushed[i * K + k]) * b_flushed[k * N + j];
-                scale += std::abs(static_cast<double>(a_exact[i * K + k]) * b_exact[k * N + j]);
+            if (!std::isfinite(c[i * N + j])) {
+                return INFINITY;
             }
-            scale = std::max(scale, 1e-30);
-            errors.exact = std::max(errors.exact, std::abs(c[i * N + j] - exact) / scale);
-            errors.flushed = std::max(errors.flushed, std::abs(c[i * N + j] - flushed) / scale);
+            double ref = 0.0, scale = 0.0;
+            for (uint32_t k = 0; k < K; ++k) {
+                const double product = static_cast<double>(a[i * K + k]) * b[k * N + j];
+                ref += product;
+                scale += std::abs(product);
+            }
+            worst = std::max(worst, std::abs(c[i * N + j] - ref) / std::max(scale, 1e-30));
         }
     }
-    return errors;
+    return worst;
 }
 
-std::vector<float> decode_all(const std::vector<uint8_t>& codes, bool flush, bool e5m2 = false) {
+std::vector<float> decode_all(const std::vector<uint8_t>& codes, bool e5m2 = false) {
     std::vector<float> values(codes.size());
     for (size_t i = 0; i < codes.size(); ++i) {
-        values[i] = e5m2 ? decode_e5m2(codes[i], flush) : decode(codes[i], flush);
+        values[i] = e5m2 ? decode_e5m2(codes[i]) : decode(codes[i]);
     }
     return values;
 }
@@ -151,8 +148,6 @@ TEST_F(Fp8MatmulTest, MatchesFlushedReference) {
         std::mt19937 rng(M * 131 + K * 7 + N);
         const std::vector<uint8_t> a = random_codes(M * K, rng);
         const std::vector<uint8_t> b = random_codes(K * N, rng);
-        const std::vector<float> a_exact = decode_all(a, false), a_flushed = decode_all(a, true);
-        const std::vector<float> b_exact = decode_all(b, false), b_flushed = decode_all(b, true);
         const ttnn::Tensor a_device = fp8_device(a, M, K);
         const ttnn::Tensor b_device = fp8_device(b, K, N);
         // The DEST register has to be in 32-bit mode for Fp8 inputs.
@@ -160,18 +155,17 @@ TEST_F(Fp8MatmulTest, MatchesFlushedReference) {
             const ttnn::Tensor c_device = ttnn::matmul(
                 a_device, b_device, false, false, std::nullopt, DataType::FLOAT32, std::nullopt, std::nullopt,
                 ttnn::DeviceComputeKernelConfig{.math_fidelity = fidelity, .fp32_dest_acc_en = true});
-            const Errors errors =
-                compare(c_device.cpu().to_vector<float>(), a_exact, a_flushed, b_exact, b_flushed, M, K, N);
+            const double error =
+                worst_error(c_device.cpu().to_vector<float>(), decode_all(a), decode_all(b), M, K, N);
             std::printf(
-                "fp8 x fp8 %ux%ux%u %s: worst error %.3g vs exact, %.3g vs flushed subnormals\n",
+                "fp8 x fp8 %ux%ux%u %s: worst error %.3g\n",
                 M,
                 K,
                 N,
                 fidelity == MathFidelity::LoFi ? "LoFi" : "HiFi4",
-                errors.exact,
-                errors.flushed);
+                error);
             // Bound the matrix unit's accumulation error.
-            EXPECT_LE(errors.flushed, std::ldexp(1.0, -9));
+            EXPECT_LE(error, std::ldexp(1.0, -9));
         }
     }
 }
@@ -197,18 +191,10 @@ TEST_F(Fp8MatmulTest, E5m2AndMixedOperands) {
                 fp8_device(c.a, M, K, dtype(c.a_e5m2)), fp8_device(c.b, K, N, dtype(c.b_e5m2)), false, false,
                 std::nullopt, DataType::FLOAT32, std::nullopt, std::nullopt,
                 ttnn::DeviceComputeKernelConfig{.math_fidelity = MathFidelity::LoFi, .fp32_dest_acc_en = true});
-            const Errors errors = compare(
-                product.cpu().to_vector<float>(), decode_all(c.a, false, c.a_e5m2), decode_all(c.a, true, c.a_e5m2),
-                decode_all(c.b, false, c.b_e5m2), decode_all(c.b, true, c.b_e5m2), M, K, N);
-            std::printf(
-                "%s %ux%ux%u LoFi: worst error %.3g vs exact, %.3g vs flushed subnormals\n",
-                c.name,
-                M,
-                K,
-                N,
-                errors.exact,
-                errors.flushed);
-            EXPECT_LE(std::min(errors.exact, errors.flushed), std::ldexp(1.0, -9)) << c.name;
+            const double error = worst_error(
+                product.cpu().to_vector<float>(), decode_all(c.a, c.a_e5m2), decode_all(c.b, c.b_e5m2), M, K, N);
+            std::printf("%s %ux%ux%u LoFi: worst error %.3g\n", c.name, M, K, N, error);
+            EXPECT_LE(error, std::ldexp(1.0, -9)) << c.name;
         }
     }
 }
