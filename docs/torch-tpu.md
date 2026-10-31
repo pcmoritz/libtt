@@ -10,7 +10,7 @@ Validated with torch_tpu 0.2.0 and torch 2.14.1 on one Blackhole.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install torch_tpu==0.2.0 --extra-index-url https://download.pytorch.org/whl/cpu
-pip install bazel-bin/jax_tt_plugin-0.1.4-py3-none-linux_x86_64.whl
+pip install bazel-bin/jax_tt_plugin-0.1.5-py3-none-linux_x86_64.whl
 ```
 
 Set `LIBTT_TPU_COMPAT=1` and use torch_tpu as usual:
