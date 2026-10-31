@@ -1,0 +1,44 @@
+diff --git ttnn/cpp/ttnn/operations/transformer/sdpa/device/sdpa_program_factory.cpp ttnn/cpp/ttnn/operations/transformer/sdpa/device/sdpa_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/transformer/sdpa/device/sdpa_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/transformer/sdpa/device/sdpa_program_factory.cpp
+@@ -138,7 +138,6 @@ struct ChunkedParams {
+ ChunkedParams compute_chunked_params(
+     bool is_chunked,
+     bool is_chunked_legacy,
+-    bool flexible_chunked,
+     const std::optional<int64_t>& chunk_start_idx,
+     const std::optional<Tensor>& page_table,
+     uint32_t k_seq_dim,
+@@ -153,17 +152,13 @@ ChunkedParams compute_chunked_params(
+     const auto& page_table_tensor = page_table.value();
+     p.block_size = k_seq_dim;
+     p.block_size_t = p.block_size / TILE_HEIGHT;
+-    if (flexible_chunked) {
+-        p.max_blocks_per_seq = page_table_tensor.padded_shape()[1];
+-        p.page_table_stick_size = p.max_blocks_per_seq * sizeof(int32_t);
+-        TT_FATAL(p.page_table_stick_size % 32 == 0, "page table stick size must be a multiple of 32");
+-    } else {
+-        p.max_blocks_per_seq = page_table_tensor.padded_shape()[1];
+-        p.page_table_stick_size = page_table_tensor.buffer()->aligned_page_size();
+-        TT_FATAL(
+-            p.page_table_stick_size % 32 == 0,
+-            "page table page size in bytes must be a multiple of 32 due to address alignment");
+-    }
++    // The reader copies whole aligned pages of the page table, so rows of any
++    // width work.
++    p.max_blocks_per_seq = page_table_tensor.padded_shape()[1];
++    p.page_table_stick_size = page_table_tensor.buffer()->aligned_page_size();
++    TT_FATAL(
++        p.page_table_stick_size % 32 == 0,
++        "page table page size in bytes must be a multiple of 32 due to address alignment");
+     return p;
+ }
+ 
+@@ -396,7 +391,6 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
+     const auto chunked = compute_chunked_params(
+         is_chunked,
+         is_chunked_legacy,
+-        flexible_chunked,
+         chunk_start_idx,
+         page_table,
+         effective_kv_block_size,
