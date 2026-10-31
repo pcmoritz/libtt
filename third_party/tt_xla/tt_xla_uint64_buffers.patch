@@ -1,18 +1,20 @@
 diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
 --- a/pjrt_implementation/src/api/buffer_instance.cc
 +++ b/pjrt_implementation/src/api/buffer_instance.cc
-@@ -123,6 +123,10 @@
+@@ -123,6 +123,12 @@
    size_t dtype_element_size = tt::runtime::utils::dataTypeElementSize(
        data_type_utils::convertPJRTToRuntimeDataType(m_data_type));
  
-+  if (m_data_type == PJRT_Buffer_Type_U64) {
++  // A uint64 or complex element is a pair of runtime elements (calculateShape).
++  if (m_data_type == PJRT_Buffer_Type_U64 ||
++      data_type_utils::isComplexPJRTType(m_data_type)) {
 +    dtype_element_size *= 2;
 +  }
 +
    return std::accumulate(m_dimensions.begin(), m_dimensions.end(),
                           dtype_element_size, [](size_t acc, std::int64_t dim) {
                             return acc * static_cast<size_t>(dim);
-@@ -251,7 +255,7 @@
+@@ -251,7 +257,7 @@
        calculateShape(dims, num_dims, m_data_type);
    std::vector<std::int64_t> strides =
        calculateStrides(dims, num_dims, byte_strides, num_byte_strides,
@@ -21,7 +23,7 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
  
    // A buffer is treated as contiguous if it is a complex dtype (its `shape`
    // carries an extra trailing dim with no matching `byte_strides` entry) or
-@@ -259,9 +263,10 @@
+@@ -259,9 +265,10 @@
    // is borrowed with its strides like a contiguous one: the runtime gathers it
    // when it is read (createBorrowedHostTensor), so the weights of a
    // memory-mapped checkpoint are not copied into RAM.
@@ -35,7 +37,7 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
  
    std::unique_ptr<EventInstance> done_with_host_buffer_event =
        EventInstance::createInstance();
-@@ -363,10 +368,9 @@
+@@ -363,10 +370,9 @@
    std::vector<std::uint32_t> shape = calculateShape(
        src_buffer->getDimensionsRaw(), src_buffer->getNumberOfDimensions(),
        src_buffer->getDataType());
@@ -49,7 +51,7 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
  
    tt::runtime::Tensor runtime_tensor = tt::runtime::createOwnedHostTensor(
        /* data= */ nullptr, shape, strides, element_size, runtime_data_type);
-@@ -389,9 +393,9 @@
+@@ -389,9 +395,9 @@
        tt::runtime::utils::dataTypeElementSize(runtime_data_type);
    std::vector<std::uint32_t> shape =
        calculateShape(getDimensionsRaw(), getNumberOfDimensions(), m_data_type);
@@ -62,7 +64,7 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
  
    // Allocate an owned host tensor without copying any data in. The contents are
    // written later by a compiled program (the runtime transfers it to device
-@@ -414,7 +418,9 @@
+@@ -414,7 +420,9 @@
  
    // Complex tensors have no runtime equivalent dtype, so they are stored as
    // float tensors with a trailing dimension of 2 for interleaved real/imag.
@@ -73,7 +75,7 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
      shape.push_back(2);
    }
  
-@@ -423,17 +429,19 @@
+@@ -423,17 +431,19 @@
  
  std::vector<std::int64_t> BufferInstance::calculateStrides(
      const std::int64_t *dims, size_t num_dims, const std::int64_t *byte_strides,

@@ -31,6 +31,15 @@ def test_bytes_in_use_counts_transferred_arrays():
     assert device.memory_stats()["bytes_in_use"] - before < 4 * MIB
 
 
+def test_complex_arrays_count_both_parts():
+    device = jax.devices()[0]
+    before = device.memory_stats()["bytes_in_use"]
+    array = jax.device_put(np.ones(1024 * 1024, np.complex64), device)
+    array.block_until_ready()
+    assert device.memory_stats()["bytes_in_use"] - before >= 8 * MIB
+    del array
+
+
 def test_peak_bytes_in_use_keeps_the_high_point():
     device = jax.devices()[0]
     array = jax.jit(lambda: jnp.ones((2048, 2048), jnp.float32))()

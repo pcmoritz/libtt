@@ -299,19 +299,26 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
  // Initializes pjrt tensor from pjrt buffers.
  //
  // If tensor already exists (shards already share same tensor) tensor will be
-@@ -77,6 +103,7 @@
-   auto tensor =
-       std::make_shared<PjrtTensor>(Private{}, std::move(shards), std::nullopt);
-   tensor->m_host_tensor_shell = std::move(shell);
-+  tensor->update_host_staged_bytes();
- 
+@@ -67,6 +93,9 @@
    for (BufferInstance *shard : tensor->shards()) {
      shard->setPjrtTensor(tensor);
-@@ -91,9 +118,15 @@
-       m_runtime_tensor{std::move(rt_tensor)} {
+   }
++  // Counted once the shards' previous tensors are gone, so that regrouping
++  // shards doesn't count them twice.
++  tensor->update_host_staged_bytes();
  
+   return *tensor;
+ }
+@@ -81,6 +110,7 @@
+   for (BufferInstance *shard : tensor->shards()) {
+     shard->setPjrtTensor(tensor);
+   }
++  tensor->update_host_staged_bytes();
+ 
+   return *tensor;
+ }
+@@ -93,7 +123,12 @@
    TensorPool::insert(this);
-+  update_host_staged_bytes();
  }
  
 -PjrtTensor::~PjrtTensor() { TensorPool::erase(this); }
@@ -324,7 +331,7 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
  
  void PjrtTensor::ensure_layout(const tt::runtime::Device &device,
                                 const tt::runtime::Layout &layout) {
-@@ -113,6 +146,7 @@
+@@ -113,6 +148,7 @@
    m_runtime_tensor =
        tt::runtime::toLayout(*m_runtime_tensor, device, layout, retain);
    m_checked_layout_id.reset();
@@ -332,7 +339,7 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
  
    // Notify each shard so the host-buffer-done event fires now and the
    // framework releases its source reference, instead of holding it for
-@@ -191,6 +225,7 @@
+@@ -191,6 +227,7 @@
    m_runtime_tensor = std::move(tensors[0]);
    m_read_pending = !blocking;
    m_checked_layout_id.reset();
@@ -340,7 +347,7 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
  
    for (std::size_t i = 1; i < m_shards.size(); ++i) {
      if (m_shards[i] == nullptr) {
-@@ -244,6 +279,7 @@
+@@ -244,6 +281,7 @@
    TT_FATAL(it != m_shards.end() && *it != nullptr,
             "Shard not found or already removed");
    *it = nullptr;
