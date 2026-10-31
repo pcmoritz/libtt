@@ -1,11 +1,12 @@
 """tt.fused_moe_ep runs a mixture-of-experts layer's experts on each device.
 
-Called per device with the tokens, their top-k routing weights and expert ids
-(negative for padding, which is skipped) and the device's experts, it returns
-each token's routing-weighted sum of the SiLU-gated experts that device holds,
-computed by TTNN's fused MoE kernel with the experts in BFP4. The experts are
-split evenly over the mesh in device order, so on a mesh the layer is the sum
-over devices. Batches of more than 512 tokens take several kernel calls.
+Called per device in a shard_map over the mesh, with the tokens, their top-k
+routing weights and expert ids (negative for padding, which is skipped) and the
+device's experts, it returns each token's routing-weighted sum of the
+SiLU-gated experts that device holds, computed by TTNN's fused MoE kernel with
+the experts in BFP4. The experts are split evenly over the mesh in device
+order, so the layer is the sum over devices. Batches of more than 512 tokens
+take several kernel calls.
 """
 
 import jax
@@ -75,25 +76,15 @@ def check(out, want, padding):
 
 
 # 513 tokens end in a one-token kernel call, 600 in a call of 88.
-@pytest.mark.parametrize("tokens,padding", [(1, 0), (3, 1), (513, 0), (600, 7)])
-def test_single_device(tokens, padding):
-    rng = np.random.default_rng(tokens)
-    args = problem(rng, tokens, 16, padding)
-    run = jax.jit(lambda x, w, i, a, b, c: fused_moe_ep(x, w, i, weight(a), weight(b), weight(c)))
-    out = run(*jax.device_put(args, jax.devices("tt")[0]))
-    assert out.shape == (tokens, HIDDEN) and out.dtype == jnp.bfloat16
-    check(out, reference(*args), padding)
-
-
-@pytest.mark.parametrize("tokens,padding", [(1, 0), (5, 2), (600, 7)])
+@pytest.mark.parametrize("tokens,padding", [(1, 0), (3, 1), (5, 2), (513, 0), (600, 7)])
 def test_mesh(tokens, padding):
     devices = jax.local_devices(backend="tt")
-    if len(devices) != 4:
-        pytest.skip("Requires four local TT devices")
-    mesh = Mesh(np.array(devices).reshape(1, 4), ("data", "tensor"))
+    if len(devices) not in (1, 4):
+        pytest.skip("Requires one or four local TT devices")
+    mesh = Mesh(np.array(devices).reshape(1, len(devices)), ("data", "tensor"))
     axes = ("data", "tensor")
     rng = np.random.default_rng(100 + tokens)
-    args = problem(rng, tokens, 4 * 8, padding)
+    args = problem(rng, tokens, len(devices) * 8, padding)
 
     def layer(x, weights, ids, w1, w3, w2):
         return jax.lax.psum(fused_moe_ep(x, weights, ids, w1, w3, w2), axes)
@@ -105,4 +96,5 @@ def test_mesh(tokens, padding):
     run = jax.jit(lambda x, w, i, a, b, c: sharded(x, w, i, weight(a), weight(b), weight(c)))
     shardings = [NamedSharding(mesh, P())] * 3 + [NamedSharding(mesh, split)] * 3
     out = run(*(jax.device_put(a, s) for a, s in zip(args, shardings)))
+    assert out.shape == (tokens, HIDDEN) and out.dtype == jnp.bfloat16
     check(out, reference(*args), padding)

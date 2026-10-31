@@ -80,10 +80,9 @@ def pcc(a, b):
     return np.corrcoef(a.ravel(), b.ravel())[0, 1]
 
 
-@pytest.mark.parametrize("rings", [0, 3])
-@pytest.mark.parametrize("tokens", [1, 3, 32])
-def test_single_chip(tokens, rings):
-    """32 of 128 experts on this chip; the token's others are elsewhere."""
+def single_chip(tokens, rings):
+    """32 of 128 experts on this chip; the token's others are elsewhere. Runs a
+    program over one device with a one-row mapping."""
     rng = np.random.default_rng(tokens)
     local = 32
     w0, w1, w2 = experts(rng, local)
@@ -100,9 +99,26 @@ def test_single_chip(tokens, rings):
     out = jax.jit(
         lambda x, s, i, m, a, b, c: moe_compute(x, s, i, m, weight(a), weight(b), weight(c), rings=rings)
     )(*args)
-    want = reference(x, scores, ids, w0, w1, w2, 0)
+    return np.asarray(out), reference(x, scores, ids, w0, w1, w2, 0)
+
+
+@pytest.mark.parametrize("rings", [0, 3])
+@pytest.mark.parametrize("tokens", [1, 3, 32])
+def test_single_chip(tokens, rings):
+    if len(jax.devices("tt")) != 1:
+        pytest.skip("needs a host with one chip")
+    out, want = single_chip(tokens, rings)
     # BFP4 weights: the outputs track a float64 reference to ~0.98.
-    assert pcc(np.asarray(out).astype(np.float64), want) > 0.97
+    assert pcc(out.astype(np.float64), want) > 0.97
+
+
+def test_one_row_mapping_on_a_larger_mesh_fails():
+    """A program over one device runs on every chip of a larger mesh in use,
+    where the kernel would wait for the mapping rows of the other chips."""
+    if len(jax.devices("tt")) == 1:
+        pytest.skip("needs a host with several chips")
+    with pytest.raises(jax.errors.JaxRuntimeError):
+        single_chip(1, 0)
 
 
 @pytest.mark.parametrize("rings", [0, 3])

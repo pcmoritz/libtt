@@ -98,24 +98,21 @@ def test_one_device_programs_run_on_the_mesh_in_use(devices):
     step = jax.jit(lambda cache, v: cache + v, donate_argnums=0)
     cache = jax.device_put(np.zeros_like(x), NamedSharding(mesh, P("x")))
     triple = jax.jit(lambda a: a * 3)
-    # The first round compiles the programs, which still opens a mesh of its
-    # own (tenstorrent/tt-xla#4809); the second runs them on the mesh in use.
-    for _ in range(2):
-        parts = []
-        for k, device in enumerate(devices):
-            cache = step(cache, sharded)
-            shard = triple(sharded.addressable_shards[k].data)
-            again = triple(shard)
-            whole = triple(replicated.addressable_shards[k].data)
-            host = triple(jax.device_put(x[k], device))
-            made = jnp.arange(4, dtype=jnp.float32) + k
-            np.testing.assert_allclose(np.asarray(again), rows(k) * 9)
-            np.testing.assert_allclose(np.asarray(shard), rows(k) * 3)
-            np.testing.assert_allclose(np.asarray(whole), x * 3)
-            np.testing.assert_allclose(np.asarray(host), x[k] * 3)
-            np.testing.assert_allclose(np.asarray(made), np.arange(4) + k)
-            parts.append(shard)
-    np.testing.assert_allclose(np.asarray(cache), x * 2 * n)
+    parts = []
+    for k, device in enumerate(devices):
+        cache = step(cache, sharded)
+        shard = triple(sharded.addressable_shards[k].data)
+        again = triple(shard)
+        whole = triple(replicated.addressable_shards[k].data)
+        host = triple(jax.device_put(x[k], device))
+        made = jnp.arange(4, dtype=jnp.float32) + k
+        np.testing.assert_allclose(np.asarray(again), rows(k) * 9)
+        np.testing.assert_allclose(np.asarray(shard), rows(k) * 3)
+        np.testing.assert_allclose(np.asarray(whole), x * 3)
+        np.testing.assert_allclose(np.asarray(host), x[k] * 3)
+        np.testing.assert_allclose(np.asarray(made), np.arange(4) + k)
+        parts.append(shard)
+    np.testing.assert_allclose(np.asarray(cache), x * n)
     # Results of programs over one device, still on the mesh, as the shards of a
     # whole-mesh input and moved to the whole mesh.
     combined = jax.make_array_from_single_device_arrays(
@@ -129,19 +126,19 @@ def test_one_device_programs_run_on_the_mesh_in_use(devices):
 def test_one_device_programs_keep_the_mesh_open(devices):
     """Whole-mesh programs alternating with programs over one device, on each
     device in turn, neither reopen the mesh nor move the whole-mesh tensors to
-    the host, which took about a second a switch."""
+    the host, which took about a second a switch. Neither does compiling a
+    program over one device."""
     mesh = Mesh(np.array(devices), ("x",))
     x = np.ones((8 * len(devices), 128), np.float32)
     step = jax.jit(lambda cache: cache * 2 - 1, donate_argnums=0)
-    cache = jax.device_put(x, NamedSharding(mesh, P("x")))
+    cache = step(jax.device_put(x, NamedSharding(mesh, P("x"))))
     add = jax.jit(lambda a: a + 1)
     inputs = [jax.device_put(np.zeros(4, np.float32), device) for device in devices]
-    # Compiling a program over one device still opens a mesh of its own
-    # (tenstorrent/tt-xla#4809).
-    for _ in range(2):
-        for v in inputs:
-            cache = step(cache)
-            np.asarray(add(v))
+    on_devices = lambda: [d.memory_stats()["bytes_in_use"] for d in devices]
+    before = on_devices()
+    for v in inputs:
+        np.asarray(add(v))
+    assert all(a >= b for a, b in zip(on_devices(), before)), "the cache left the devices"
     start = time.monotonic()
     for i in range(20):
         cache = step(cache)
