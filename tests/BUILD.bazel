@@ -185,9 +185,13 @@ py_test(
     name = "torch_tpu_test_suite",
     srcs = TORCH_TPU_TEST_SRCS,
     args = TORCH_TPU_TEST_ARGS + [
+        "--local-test=$(rlocationpath :libtt_torch_tpu/device_properties_test.py)",
         "--local-test=$(rlocationpath :libtt_torch_tpu/rng_state_test.py)",
     ],
-    data = TORCH_TPU_TEST_DATA + ["libtt_torch_tpu/rng_state_test.py"],
+    data = TORCH_TPU_TEST_DATA + [
+        "libtt_torch_tpu/device_properties_test.py",
+        "libtt_torch_tpu/rng_state_test.py",
+    ],
     deps = TORCH_TPU_TEST_DEPS,
     main = "torch_tpu_runner.py",
     tags = DEVICE_TEST_TAGS,

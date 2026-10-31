@@ -30,6 +30,11 @@ and then loads `jax_plugins/libtt/tpu_compat.py`, which runs before torch_tpu:
   as its PJRT plugin.
 - torch_tpu only opens a device when its PCI scan finds a Google TPU; its
   device count reports the Tenstorrent chips instead.
+- torch_tpu's other hardware helpers, and so
+  `torch.tpu.get_device_properties()`, describe the Tenstorrent chips too:
+  the device name (e.g. "Tenstorrent Blackhole p150a"), the board's DRAM per
+  chip, one device per chip, and the chips as a 1xN topology. They read the
+  card type from the kernel driver's sysfs entries, without opening a device.
 - torch_tpu's flash attention is a Pallas kernel that only TPUs run, so it is
   turned off and `scaled_dot_product_attention` runs torch_tpu's StableHLO
   implementation.
