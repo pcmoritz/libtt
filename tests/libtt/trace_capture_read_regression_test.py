@@ -8,6 +8,7 @@ and then the token of the step before) or aborted the process with "Reads are
 not supported during trace capture".
 """
 
+import concurrent.futures
 import threading
 import time
 
@@ -48,15 +49,16 @@ def test_reads_during_trace_captures():
                 f(x)
                 time.sleep(0.002)
 
-    thread = threading.Thread(target=capture)
-    thread.start()
-    wrong = []
-    try:
-        for i, result in enumerate(results[1:], 1):
-            y = np.asarray(result)
-            if not (y == i + 1).all():
-                wrong.append((i, np.unique(y)[:3].tolist()))
-    finally:
-        stop.set()
-        thread.join()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        captures = pool.submit(capture)
+        wrong = []
+        try:
+            for i, result in enumerate(results[1:], 1):
+                y = np.asarray(result)
+                if not (y == i + 1).all():
+                    wrong.append((i, np.unique(y)[:3].tolist()))
+        finally:
+            stop.set()
+        # Raises what the captures raised, which would leave nothing to race.
+        captures.result()
     assert not wrong, f"{len(wrong)} of 999 reads were wrong, e.g. {wrong[:5]}"
