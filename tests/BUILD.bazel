@@ -148,6 +148,7 @@ py_test(
     name = "torch_tpu_smoke_tests",
     srcs = TORCH_TPU_TEST_SRCS,
     args = TORCH_TPU_TEST_ARGS + [
+        "--local-test=$(rlocationpath :libtt_torch_tpu/process_exit_test.py)",
         "tests/booleans_test.py",
         "tests/compile/stablehlo_compile_test.py",
         "tests/fused_adam_test.py",
@@ -164,7 +165,7 @@ py_test(
         "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_mixed_mutable_and_immutable_arguments",
         "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_multiple_mutating_ops",
     ],
-    data = TORCH_TPU_TEST_DATA,
+    data = TORCH_TPU_TEST_DATA + ["libtt_torch_tpu/process_exit_test.py"],
     deps = TORCH_TPU_TEST_DEPS,
     main = "torch_tpu_runner.py",
     tags = DEVICE_TEST_TAGS,
@@ -190,9 +191,13 @@ py_test(
     name = "torch_tpu_test_suite",
     srcs = TORCH_TPU_TEST_SRCS,
     args = TORCH_TPU_TEST_ARGS + [
+        "--local-test=$(rlocationpath :libtt_torch_tpu/process_exit_test.py)",
         "--local-test=$(rlocationpath :libtt_torch_tpu/rng_state_test.py)",
     ],
-    data = TORCH_TPU_TEST_DATA + ["libtt_torch_tpu/rng_state_test.py"],
+    data = TORCH_TPU_TEST_DATA + [
+        "libtt_torch_tpu/process_exit_test.py",
+        "libtt_torch_tpu/rng_state_test.py",
+    ],
     deps = TORCH_TPU_TEST_DEPS,
     main = "torch_tpu_runner.py",
     tags = DEVICE_TEST_TAGS,

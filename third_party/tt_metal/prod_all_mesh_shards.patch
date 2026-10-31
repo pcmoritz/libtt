@@ -1,0 +1,65 @@
+diff --git ttnn/cpp/ttnn/operations/functions.hpp ttnn/cpp/ttnn/operations/functions.hpp
+--- ttnn/cpp/ttnn/operations/functions.hpp
++++ ttnn/cpp/ttnn/operations/functions.hpp
+@@ -7,6 +7,7 @@
+ #include <functional>
+ #include <iterator>
+ #include <tt-metalium/math.hpp>
++#include <tt-metalium/experimental/distributed_tensor/distributed_tensor_apis.hpp>
+ #include <tt-metalium/host_buffer.hpp>
+ #include <tt_stl/overloaded.hpp>
+ #include <optional>
+@@ -294,28 +295,34 @@ Tensor prod_result_computation_WH_B0(
+     const Layout layout,
+     MeshDevice* device = nullptr,
+     const MemoryConfig& output_mem_config = MemoryConfig{}) {
+-    auto output_buffer = std::vector<T>(tt::constants::TILE_HW);
+     auto input_cpu_tensor = input_tensor.cpu();
+-    ttsl::Span<const T> input_buffer = tt::tt_metal::host_buffer::get_as<T>(input_cpu_tensor);
+-    const ttnn::Shape input_tensor_strides = input_tensor.strides();
+-    T result = static_cast<T>(1.0f);
++    const tt::tt_metal::HostTensor& input_host_tensor = input_cpu_tensor.host_tensor();
+ 
+-    // Calculate the product of all elements in the last tile
+-    for (int i = 0; i < tt::constants::TILE_HW; ++i) {
+-        result = result * static_cast<T>(input_buffer[i]);
+-    }
+-    output_buffer[0] = result;
+-    auto output = Tensor(
+-                      tt::tt_metal::HostBuffer(std::move(output_buffer)),
+-                      tt::tt_metal::TensorSpec(
+-                          ttnn::Shape({}),
+-                          ttnn::detail::legacy_tensor_layout_from_padded_shape(
+-                              data_type,
+-                              PageConfig(Layout::ROW_MAJOR),
+-                              MemoryConfig{},
+-                              /*logical_shape=*/ttnn::Shape({}),
+-                              /*padded_shape=*/ttnn::Shape({tt::constants::TILE_HEIGHT, tt::constants::TILE_WIDTH}))))
++    // A tensor on a mesh has a buffer per chip, and each chip gets its own product.
++    auto output_buffer = input_host_tensor.buffer().transform([](const tt::tt_metal::HostBuffer& shard) {
++        auto input_buffer = shard.view_as<T>();
++        auto output_buffer = std::vector<T>(tt::constants::TILE_HW);
++        T result = static_cast<T>(1.0f);
+ 
++        // Calculate the product of all elements in the last tile
++        for (int i = 0; i < tt::constants::TILE_HW; ++i) {
++            result = result * static_cast<T>(input_buffer[i]);
++        }
++        output_buffer[0] = result;
++        return tt::tt_metal::HostBuffer(std::move(output_buffer));
++    });
++    auto output = Tensor(tt::tt_metal::host_tensor_from_buffer_with_topology(
++                             std::move(output_buffer),
++                             tt::tt_metal::TensorSpec(
++                                 ttnn::Shape({}),
++                                 ttnn::detail::legacy_tensor_layout_from_padded_shape(
++                                     data_type,
++                                     PageConfig(Layout::ROW_MAJOR),
++                                     MemoryConfig{},
++                                     /*logical_shape=*/ttnn::Shape({}),
++                                     /*padded_shape=*/
++                                     ttnn::Shape({tt::constants::TILE_HEIGHT, tt::constants::TILE_WIDTH}))),
++                             tt::tt_metal::get_tensor_topology(input_host_tensor)))
+                       .to_layout(layout);
+     if (device != nullptr) {
+         output = output.to_device(device, output_mem_config);

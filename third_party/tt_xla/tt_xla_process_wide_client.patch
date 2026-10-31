@@ -1,7 +1,16 @@
 diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
 --- a/pjrt_implementation/inc/api/client_instance.h
 +++ b/pjrt_implementation/inc/api/client_instance.h
-@@ -67,6 +67,10 @@
+@@ -53,6 +53,8 @@ public:
+   static ClientInstance *getClientInstance();
+   static PJRT_Error *initClient();
+   static void destroyClient();
++  // Closes the device of a client that is still alive at exit.
++  static void closeDeviceAtExit();
+ 
+ private:
+   GlobalClientInstanceSingleton(std::unique_ptr<ClientInstance> client_instance)
+@@ -67,6 +69,10 @@ private:
    // create a new client before destroying the old one (e.g. after
    // `jax.clear_backends()`), so they share one instance, which owns the device.
    int m_ref_count = 0;
@@ -15,7 +24,7 @@ diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
 --- a/pjrt_implementation/src/api/client_instance.cc
 +++ b/pjrt_implementation/src/api/client_instance.cc
-@@ -275,6 +275,9 @@
+@@ -275,6 +275,9 @@ static tt_pjrt_status setMemoryLogLevel() {
  
  PJRT_Error *GlobalClientInstanceSingleton::initClient() {
    GlobalClientInstanceSingleton &singleton_instance = getInstance();
@@ -25,7 +34,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    if (singleton_instance.isInitialized()) {
      ++singleton_instance.m_ref_count;
      return nullptr;
-@@ -294,6 +297,7 @@
+@@ -294,6 +297,7 @@ PJRT_Error *GlobalClientInstanceSingleton::initClient() {
  
  void GlobalClientInstanceSingleton::destroyClient() {
    GlobalClientInstanceSingleton &singleton_instance = getInstance();
@@ -33,7 +42,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    if (singleton_instance.isInitialized() &&
        --singleton_instance.m_ref_count == 0) {
      singleton_instance.m_client_instance.reset();
-@@ -301,13 +305,17 @@
+@@ -301,13 +305,26 @@ void GlobalClientInstanceSingleton::destroyClient() {
  }
  
  GlobalClientInstanceSingleton &GlobalClientInstanceSingleton::getInstance() {
@@ -42,10 +51,19 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 -  return singleton;
 +  // Process-wide, since a framework may create and destroy the client on
 +  // different threads. Never destroyed: a client that is still alive at exit
-+  // must not close the device after tt-metal's thread-local state is gone.
++  // must not close the device after tt-metal's thread-local state is gone, so
++  // tt_pjrt_shutdown closes it before.
 +  static GlobalClientInstanceSingleton *singleton =
 +      new GlobalClientInstanceSingleton(nullptr);
 +  return *singleton;
++}
++
++void GlobalClientInstanceSingleton::closeDeviceAtExit() {
++  GlobalClientInstanceSingleton &singleton_instance = getInstance();
++  std::lock_guard<std::mutex> lock(singleton_instance.m_mutex);
++  if (singleton_instance.isInitialized()) {
++    singleton_instance.m_client_instance->closeMeshDevice();
++  }
  }
  
  ClientInstance *GlobalClientInstanceSingleton::getClientInstance() {
@@ -54,3 +72,23 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    return singleton.m_client_instance.get();
  }
  
+diff --git a/pjrt_implementation/src/dylib_entry_point.cc b/pjrt_implementation/src/dylib_entry_point.cc
+--- a/pjrt_implementation/src/dylib_entry_point.cc
++++ b/pjrt_implementation/src/dylib_entry_point.cc
+@@ -7,6 +7,7 @@
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ // https://llvm.org/LICENSE.txt
+ 
++#include "api/client_instance.h"
+ #include "api/event_instance.h"
+ #include "api_bindings.h"
+ 
+@@ -26,4 +27,8 @@ void InitializeAPI(PJRT_Api *api) { bindApi(api); }
+ // down. Initiated by the host before shutdown.
+ extern "C" PJRT_PLUGIN_EXPORTED void tt_pjrt_shutdown() {
+   tt::pjrt::EventInstance::shutdownCallbackWorker();
++  // A framework that never destroys its client, such as torch_tpu after
++  // torch.manual_seed, would leave the device open, and on a multi-chip mesh
++  // its Ethernet cores running fabric routers, for the next process.
++  tt::pjrt::GlobalClientInstanceSingleton::closeDeviceAtExit();
+ }
