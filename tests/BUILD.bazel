@@ -158,6 +158,11 @@ py_test(
         # with duplicates, returned inverse indices and counts.
         "tests/ops_unit_test.py::OpsGradUnitTest::test_unique2_distributions",
         "tests/ops_unit_test.py::OpsUnitTest::test_unique_consecutive_distributions",
+        # Programs consume the inputs torch_tpu donates (jax.buffer_donor).
+        "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_async_with_mutable_custom_op",
+        "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_buffer_donation",
+        "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_mixed_mutable_and_immutable_arguments",
+        "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_multiple_mutating_ops",
     ],
     data = TORCH_TPU_TEST_DATA,
     deps = TORCH_TPU_TEST_DEPS,
