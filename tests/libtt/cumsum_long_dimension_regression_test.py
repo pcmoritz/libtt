@@ -4,7 +4,7 @@ instead of permuting that dimension to the front: the permuted scan padded every
 element of a thin tensor out to its own tile, and took 300 ms over a 248K
 vocabulary (the CDF a sampler draws from). An FP32 row that long is scanned in
 chunks spread over cores, then each chunk gets the totals of the chunks before
-it: 0.9 ms.
+it: 0.9 ms. 32-bit integers take the same path, with integer adds.
 """
 
 import time
@@ -35,6 +35,33 @@ def test_cumsum_along_a_long_dimension(shape, reverse):
         expected = np.flip(expected, -1)
     np.testing.assert_allclose(np.asarray(got, np.float64), expected, rtol=0, atol=1e-6)
 
+
+@pytest.mark.parametrize("dtype", [np.int32, np.uint32])
+@pytest.mark.parametrize(
+    "shape", [(2**24 + 50_000,), (3, 248320), (5, 4096)], ids=["past-float32", "vocabulary", "short"]
+)
+def test_32_bit_integers(shape, dtype):
+    # 32-bit integers are summed as integers, which float32 sums only to 2**24, and wrap around
+    # on overflow: SGLang-TorchTPU's masked_scatter numbers the mask's elements with an int32
+    # cumsum.
+    low = -1000 if dtype == np.int32 else 0
+    x = np.random.default_rng(0).integers(low, 1000, shape).astype(dtype)
+    got = jax.jit(lambda x: jax.lax.cumsum(x, axis=x.ndim - 1))(device_put(x))
+    np.testing.assert_array_equal(np.asarray(got), np.cumsum(x, axis=-1, dtype=dtype))
+
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.uint32])
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_32_bit_integers_along_either_axis(axis, reverse, dtype):
+    # Integers far past float32's precision, whose sums wrap around, along the first axis (which
+    # ttnn permutes to the front) and the last (the width scan), forward and in reverse.
+    info = np.iinfo(dtype)
+    x = np.random.default_rng(1).integers(info.min, info.max, (37, 300), dtype=dtype, endpoint=True)
+    got = jax.jit(lambda x: jax.lax.cumsum(x, axis=axis, reverse=reverse))(device_put(x))
+    expected = np.cumsum(np.flip(x, axis) if reverse else x, axis=axis, dtype=dtype)
+    np.testing.assert_array_equal(np.asarray(got), np.flip(expected, axis) if reverse else expected)
 
 def test_infinities_and_nan():
     # No compensation term: an infinity stays infinite, a NaN propagates forward only.
