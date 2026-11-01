@@ -82,13 +82,11 @@ def _ragged_paged_attention(module):
         live_seq = jnp.arange(seqs, dtype=jnp.int32) < num_seqs
         ends = (token[:, None] >= cu_q_lens[None, 1:]) & live_seq[None, :]
         seq = jnp.minimum(jnp.sum(ends.astype(jnp.int32), axis=1), seqs - 1)
-        # The live sequences' query count, without a dynamic slice: TT reads
-        # slice bounds on the host, which a traced program can't.
-        live = token < jnp.max(jnp.where(live_seq, cu_q_lens[1:], 0))
-        q_start = cu_q_lens[seq]
-        q_len = cu_q_lens[seq + 1] - q_start
-        position = kv_lens[seq] - q_len + (token - q_start)
-        live = live & (position >= 0)
+        # A gather rather than a dynamic slice: TT reads slice bounds on the
+        # host, which a traced program can't.
+        q_end = cu_q_lens[seq + 1]
+        position = kv_lens[seq] + token - q_end
+        live = (seq < num_seqs) & (token < q_end) & (position >= 0)
         table = page_indices.reshape(seqs, pages_per_seq)
 
         # Write each token's keys and values to its page slot, then read every
@@ -250,21 +248,14 @@ def patch_kv_pool(module):
         )
 
     def _logical_kv_view(self, layer_id):
-        """[tokens, heads, 2, head_dim]; a copy, since tokens aren't contiguous here."""
+        """[tokens, 2 * heads, head_dim], K and V of a head interleaved, as the pool's
+        own getters read it; a copy, since tokens aren't contiguous here."""
         buf = self.kv_buffer[layer_id - self.start_layer]
         n_blocks, heads, page_size, row = buf.shape
-        return buf.transpose(1, 2).reshape(n_blocks * page_size, heads, 2, row // 2)
-
-    def get_key_buffer(self, layer_id):
-        return self._logical_kv_view(layer_id)[:, : self.head_num, 0, : self.head_dim]
-
-    def get_value_buffer(self, layer_id):
-        return self._logical_kv_view(layer_id)[:, : self.head_num, 1, : self.head_dim]
+        return buf.transpose(1, 2).reshape(n_blocks * page_size, 2 * heads, row // 2)
 
     pool._create_buffers = _create_buffers
     pool._logical_kv_view = _logical_kv_view
-    pool.get_key_buffer = get_key_buffer
-    pool.get_value_buffer = get_value_buffer
     pool.KV_LAYOUT_NAME = "tt-head-major"
 
 
