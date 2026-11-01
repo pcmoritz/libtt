@@ -19,3 +19,10 @@ def run(code):
 def test_device_after_process_that_only_seeds():
     run("torch.manual_seed(0)")
     run("assert torch.ones(8, device='tpu').sum().item() == 8")
+
+
+def test_device_after_process_that_runs_programs():
+    """Closing the device at exit frees the programs it cached, which uses
+    tt-metal's thread-local state, already destroyed on the exiting thread."""
+    run("x = torch.randn(64, 64, device='tpu')\nassert torch.cumsum((x @ x).relu().sum(0), 0).shape == (64,)")
+    run("assert torch.ones(8, device='tpu').sum().item() == 8")

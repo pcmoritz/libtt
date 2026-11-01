@@ -24,7 +24,15 @@ diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
 --- a/pjrt_implementation/src/api/client_instance.cc
 +++ b/pjrt_implementation/src/api/client_instance.cc
-@@ -275,19 +275,29 @@ static tt_pjrt_status setMemoryLogLevel() {
+@@ -18,6 +18,7 @@
+ #include <map>
+ #include <mutex>
+ #include <optional>
++#include <thread>
+ 
+ // system includes
+ #include <unistd.h>
+@@ -275,6 +276,9 @@ static tt_pjrt_status setMemoryLogLevel() {
  
  PJRT_Error *GlobalClientInstanceSingleton::initClient() {
    GlobalClientInstanceSingleton &singleton_instance = getInstance();
@@ -34,13 +42,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    if (singleton_instance.isInitialized()) {
      ++singleton_instance.m_ref_count;
      return nullptr;
-   }
- 
-   std::unique_ptr<ClientInstance> client = std::make_unique<ClientInstance>();
-   PJRT_Error *error = client->initialize();
-   if (error) {
-     return error;
-   }
+@@ -288,12 +292,20 @@ PJRT_Error *GlobalClientInstanceSingleton::initClient() {
  
    singleton_instance.m_client_instance = std::move(client);
    singleton_instance.m_ref_count = 1;
@@ -54,7 +56,6 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
  
    return nullptr;
  }
-@@ -294,6 +304,7 @@ PJRT_Error *GlobalClientInstanceSingleton::initClient() {
  
  void GlobalClientInstanceSingleton::destroyClient() {
    GlobalClientInstanceSingleton &singleton_instance = getInstance();
@@ -62,7 +63,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    if (singleton_instance.isInitialized() &&
        --singleton_instance.m_ref_count == 0) {
      singleton_instance.m_client_instance.reset();
-@@ -301,13 +312,26 @@ void GlobalClientInstanceSingleton::destroyClient() {
+@@ -301,13 +313,32 @@ void GlobalClientInstanceSingleton::destroyClient() {
  }
  
  GlobalClientInstanceSingleton &GlobalClientInstanceSingleton::getInstance() {
@@ -82,7 +83,13 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 +  GlobalClientInstanceSingleton &singleton_instance = getInstance();
 +  std::lock_guard<std::mutex> lock(singleton_instance.m_mutex);
 +  if (singleton_instance.isInitialized()) {
-+    singleton_instance.m_client_instance->closeMeshDevice();
++    // On a thread of its own: the exiting thread's thread-local objects are
++    // destroyed before exit handlers run, and closing the device uses
++    // tt-metal's, such as the graph tracker's processors, which opening the
++    // device added a shared memory tracker to.
++    std::thread([&singleton_instance] {
++      singleton_instance.m_client_instance->closeMeshDevice();
++    }).join();
 +  }
  }
  
