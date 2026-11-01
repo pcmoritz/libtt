@@ -94,7 +94,10 @@ def _ragged_paged_attention(module):
         pad = ((0, 0), (0, cache_heads - kv_heads), (0, cache_head_dim - head_dim))
         new_kv = jnp.concatenate([jnp.pad(keys, pad), jnp.pad(values, pad)], axis=-1)
         new_kv = new_kv.astype(kv_cache_fused.dtype)
-        user_pages = table[seq]
+        # Page 0 is SGLang's padding page, so a sequence holds at most pages - 1
+        # pages, and TTNN's paged operations take a page table narrower than the
+        # pool.
+        user_pages = table[seq, : min(pages_per_seq, pages - 1)]
         user_positions = jnp.where(live, position, -1)
         if tokens == 1:
             cache = jax.ffi.ffi_call(
