@@ -24,7 +24,7 @@ diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
 --- a/pjrt_implementation/src/api/client_instance.cc
 +++ b/pjrt_implementation/src/api/client_instance.cc
-@@ -275,6 +275,9 @@ static tt_pjrt_status setMemoryLogLevel() {
+@@ -275,19 +275,29 @@ static tt_pjrt_status setMemoryLogLevel() {
  
  PJRT_Error *GlobalClientInstanceSingleton::initClient() {
    GlobalClientInstanceSingleton &singleton_instance = getInstance();
@@ -34,7 +34,27 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    if (singleton_instance.isInitialized()) {
      ++singleton_instance.m_ref_count;
      return nullptr;
-@@ -294,6 +297,7 @@ PJRT_Error *GlobalClientInstanceSingleton::initClient() {
+   }
+ 
+   std::unique_ptr<ClientInstance> client = std::make_unique<ClientInstance>();
+   PJRT_Error *error = client->initialize();
+   if (error) {
+     return error;
+   }
+ 
+   singleton_instance.m_client_instance = std::move(client);
+   singleton_instance.m_ref_count = 1;
++  // Closes the device of a client still alive at exit, such as torch_tpu's:
++  // left open, a multi-chip mesh keeps its fabric routers running into the
++  // next process. Opening the device registered tt-metal's exit handler, which
++  // tears down its context; exit handlers run in reverse order, so this one
++  // runs before it.
++  static const int close_at_exit = std::atexit(closeDeviceAtExit);
++  (void)close_at_exit;
+ 
+   return nullptr;
+ }
+@@ -294,6 +304,7 @@ PJRT_Error *GlobalClientInstanceSingleton::initClient() {
  
  void GlobalClientInstanceSingleton::destroyClient() {
    GlobalClientInstanceSingleton &singleton_instance = getInstance();
@@ -42,7 +62,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    if (singleton_instance.isInitialized() &&
        --singleton_instance.m_ref_count == 0) {
      singleton_instance.m_client_instance.reset();
-@@ -301,13 +305,26 @@ void GlobalClientInstanceSingleton::destroyClient() {
+@@ -301,13 +312,26 @@ void GlobalClientInstanceSingleton::destroyClient() {
  }
  
  GlobalClientInstanceSingleton &GlobalClientInstanceSingleton::getInstance() {
@@ -50,9 +70,9 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 -      GlobalClientInstanceSingleton(nullptr);
 -  return singleton;
 +  // Process-wide, since a framework may create and destroy the client on
-+  // different threads. Never destroyed: a client that is still alive at exit
-+  // must not close the device after tt-metal's thread-local state is gone, so
-+  // tt_pjrt_shutdown closes it before.
++  // different threads. Never destroyed: it exists before tt-metal does, so its
++  // destructor would run after tt-metal's exit handler tore down its context.
++  // `initClient` registers an exit handler that closes the device before.
 +  static GlobalClientInstanceSingleton *singleton =
 +      new GlobalClientInstanceSingleton(nullptr);
 +  return *singleton;
@@ -72,23 +92,3 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    return singleton.m_client_instance.get();
  }
  
-diff --git a/pjrt_implementation/src/dylib_entry_point.cc b/pjrt_implementation/src/dylib_entry_point.cc
---- a/pjrt_implementation/src/dylib_entry_point.cc
-+++ b/pjrt_implementation/src/dylib_entry_point.cc
-@@ -7,6 +7,7 @@
- // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
- // https://llvm.org/LICENSE.txt
- 
-+#include "api/client_instance.h"
- #include "api/event_instance.h"
- #include "api_bindings.h"
- 
-@@ -26,4 +27,8 @@ void InitializeAPI(PJRT_Api *api) { bindApi(api); }
- // down. Initiated by the host before shutdown.
- extern "C" PJRT_PLUGIN_EXPORTED void tt_pjrt_shutdown() {
-   tt::pjrt::EventInstance::shutdownCallbackWorker();
-+  // A framework that never destroys its client, such as torch_tpu after
-+  // torch.manual_seed, would leave the device open, and on a multi-chip mesh
-+  // its Ethernet cores running fabric routers, for the next process.
-+  tt::pjrt::GlobalClientInstanceSingleton::closeDeviceAtExit();
- }

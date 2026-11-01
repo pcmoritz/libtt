@@ -9,15 +9,8 @@
   device count reports the Tenstorrent chips instead.
 - torch_tpu's flash attention is a Pallas kernel that only TPUs run, so
   `scaled_dot_product_attention` takes its StableHLO implementation instead.
-- torch_tpu destroys its PJRT client at exit only if it initialized its runtime
-  options, which `torch.manual_seed` alone doesn't, and a device left open
-  keeps the fabric routers of a multi-chip mesh running into the next process.
-  So at exit `tt_pjrt_shutdown`, which tt-xla's own plugin package calls at
-  exit too, closes the device of a client that is still alive.
 """
 
-import atexit
-import ctypes
 import importlib.abc
 import importlib.util
 import os
@@ -56,16 +49,5 @@ class _PatchTorchTpu(importlib.abc.MetaPathFinder):
         return spec
 
 
-def _shutdown_plugin():
-    try:
-        # Only a process that loaded the plugin has a device to close.
-        plugin = ctypes.CDLL(os.environ["TPU_LIBRARY_PATH"], mode=os.RTLD_NOLOAD | os.RTLD_LAZY)
-    except (KeyError, OSError):
-        return
-    plugin.tt_pjrt_shutdown()
-
-
 os.environ.setdefault("TPU_LIBRARY_PATH", str(pathlib.Path(__file__).with_name("libtt.so")))
-# Registered before torch_tpu's own exit handlers, so it runs after them.
-atexit.register(_shutdown_plugin)
 sys.meta_path.insert(0, _PatchTorchTpu())
