@@ -499,6 +499,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_buffer_donor.patch",
         "//third_party/tt_xla:tt_xla_float8_buffers.patch",
         "//third_party/tt_xla:tt_xla_trace_capture_lock.patch",
+        "//third_party/tt_xla:tt_xla_system_descriptor_in_memory.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )

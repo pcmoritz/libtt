@@ -1,0 +1,143 @@
+diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
+--- a/pjrt_implementation/inc/api/client_instance.h
++++ b/pjrt_implementation/inc/api/client_instance.h
+@@ -213,10 +213,6 @@
+   // System descriptor (that TTIR to TTNN backend pipeline needs).
+   tt::runtime::SystemDesc m_system_descriptor;
+ 
+-  // TODO: Remove once tt-mlir supports passing the system descriptor object to
+-  // TTIR to TTNN backend pipeline.
+-  std::string m_cached_system_descriptor_path;
+-
+   // True when TT_COMPILE_ONLY_SYSTEM_DESC was set
+   bool m_compile_only = false;
+ 
+diff --git a/pjrt_implementation/inc/api/module_builder/module_builder.h b/pjrt_implementation/inc/api/module_builder/module_builder.h
+--- a/pjrt_implementation/inc/api/module_builder/module_builder.h
++++ b/pjrt_implementation/inc/api/module_builder/module_builder.h
+@@ -127,7 +127,7 @@
+   // for error checking.
+   std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>> buildModule(
+       const std::string_view &mlir_code,
+-      const std::string &system_descriptor_path,
++      const tt::runtime::SystemDesc &system_descriptor,
+       const std::unordered_map<std::string, std::string> &compile_options,
+       tt::pjrt::ClientInstance *client_instance, size_t target_num_devices = 1);
+ 
+@@ -235,7 +235,6 @@
+ 
+   // Converts TTIR module to TTNN module.
+   tt_pjrt_status convertFromTTIRToTTNN(
+-      const std::string &system_descriptor_path,
+       mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
+       const CompileOptions &compile_options, ClientInstance *client_instance,
+       std::vector<std::uint32_t> devices_mesh_shape, std::string &ttnn_code);
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -328,19 +328,11 @@
+   // TODO(mrakita): Add support for multi-process environment. Process index is
+   // always 0 in single-process settings.
+   m_process_index = 0;
+-
+-  // TODO: Ensure this name is unique to prevent clashes between multiple
+-  // clients. Since we plan to remove the need for storing the descriptor on
+-  // disk soon, we’re keeping it simple for now.
+-  m_cached_system_descriptor_path =
+-      std::filesystem::temp_directory_path().concat(
+-          "/tt_pjrt_system_descriptor");
+ }
+ 
+ ClientInstance::~ClientInstance() {
+   DLOG_F(LOG_DEBUG, "ClientInstance::~ClientInstance");
+   closeMeshDevice();
+-  std::remove(m_cached_system_descriptor_path.data());
+   loguru::flush();
+ }
+ 
+@@ -417,14 +409,6 @@
+     m_system_descriptor = tt::runtime::getCurrentSystemDesc();
+   }
+ 
+-  m_system_descriptor.store(m_cached_system_descriptor_path.data());
+-  if (std::filesystem::exists(m_cached_system_descriptor_path) == false) {
+-    LOG_F(ERROR,
+-          "Failed to store the system descriptor to the disk using path: %s",
+-          m_cached_system_descriptor_path.c_str());
+-    return tt_pjrt_status::kInternal;
+-  }
+-
+   size_t devices_count = m_system_descriptor->chip_desc_indices()->size();
+   m_devices.reserve(devices_count);
+   m_devices_raw.reserve(devices_count);
+@@ -521,7 +505,7 @@
+   std::string_view mlir_code(mlir_program->code, mlir_program->code_size);
+ 
+   std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>> compile_result =
+-      m_module_builder->buildModule(mlir_code, m_cached_system_descriptor_path,
++      m_module_builder->buildModule(mlir_code, m_system_descriptor,
+                                     compile_options, this, target_num_devices);
+   tt_pjrt_status status = std::get<tt_pjrt_status>(compile_result);
+   if (!tt_pjrt_status_is_ok(status)) {
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -370,7 +370,7 @@
+ std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>>
+ ModuleBuilder::buildModule(
+     const std::string_view &mlir_code,
+-    const std::string &system_descriptor_path,
++    const tt::runtime::SystemDesc &system_descriptor,
+     const std::unordered_map<std::string, std::string> &compile_options_map,
+     ClientInstance *client_instance, size_t target_num_devices) {
+   DLOG_F(LOG_DEBUG, "ModuleBuilder::buildModule");
+@@ -562,6 +562,21 @@
+   }
+ 
+   LOG_BRINGUP_STAGE("TTMLIR_COMPILATION_START");
++
++  // Given no path, the TTIR to TTNN pipeline registers the device from the
++  // system descriptor of the device module's module, which takes the root
++  // module's attributes when it is made, so the descriptor needs no file.
++  mlir::FailureOr<mlir::tt::ttcore::SystemDescAttr> system_desc =
++      mlir::tt::ttcore::SystemDescAttr::getFromBuffer(
++          mlir_module->getContext(), system_descriptor.handle.get(),
++          [&]() { return mlir_module->emitError(); });
++  if (mlir::failed(system_desc)) {
++    LOG_F(ERROR, "Failed to read the system descriptor");
++    return {tt_pjrt_status::kInternal, nullptr};
++  }
++  mlir_module.get()->setAttr(mlir::tt::ttcore::SystemDescAttr::name,
++                             *system_desc);
++
+   std::string ttir_mlir;
+   status =
+       convertFromSHLOToTTIR(mlir_module, ttir_mlir, compile_options.export_path,
+@@ -583,9 +598,8 @@
+                      output_memory_kinds_sizes);
+ 
+   std::string ttnn_mlir;
+-  status = convertFromTTIRToTTNN(system_descriptor_path, mlir_module,
+-                                 compile_options, client_instance, mesh_shape,
+-                                 ttnn_mlir);
++  status = convertFromTTIRToTTNN(mlir_module, compile_options, client_instance,
++                                 mesh_shape, ttnn_mlir);
+   if (!tt_pjrt_status_is_ok(status)) {
+     return {status, nullptr};
+   }
+@@ -1101,7 +1115,6 @@
+ }
+ 
+ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+-    const std::string &system_descriptor_path,
+     mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
+     const CompileOptions &compile_options, ClientInstance *client_instance,
+     std::vector<std::uint32_t> devices_mesh_shape, std::string &ttnn_mlir) {
+@@ -1180,7 +1193,6 @@
+   options.enableActivationDtypeLowering =
+       compile_options.enable_activation_dtype_lowering;
+   options.enableTrace = compile_options.enable_trace;
+-  options.systemDescPath = system_descriptor_path.data();
+   options.enableConstEval = compile_options.enable_const_eval;
+   options.enableCPUHoistedConstEval = compile_options.enable_const_eval_on_cpu;
+   options.enableConstEvalInputsToSystemMemory =
