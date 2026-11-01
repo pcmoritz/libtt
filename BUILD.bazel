@@ -15,6 +15,7 @@ py_library(
     name = "jax_plugin",
     srcs = [
         "python/jax_plugins/libtt/__init__.py",
+        "python/jax_plugins/libtt/sglang_tpu_kernels.py",
         "python/jax_plugins/libtt/tpu_compat.py",
     ],
     imports = ["python"],
