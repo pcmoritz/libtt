@@ -37,49 +37,25 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
    if (m_done_with_host_buffer_event) {
      // TODO(mrakita): Revert.
      // https://github.com/openxla/xla/issues/25172
-@@ -310,6 +316,8 @@ void BufferInstance::copyFromHost(
+@@ -309,6 +315,17 @@ void BufferInstance::copyFromHost(
+     m_done_with_host_buffer_event = done_with_host_buffer_event.get();
      m_done_with_host_buffer_event->setIndestructible();
      PjrtTensor::from_host_tensor_shell({this}, std::move(host_tensor_shell));
++  } else if (movesToDeviceOnCreation(runtime_data_type, shape)) {
++    // The data moves to the device now, and the copy ends before this returns:
++    // whatever the semantics, the host buffer is only borrowed for the copy,
++    // and the event is the caller's again, as for a copied buffer.
++    PjrtTensor::from_runtime_tensor(
++        {this}, tt::runtime::createBorrowedHostTensor(
++                    const_cast<void *>(host_buffer), shape, strides,
++                    element_size, runtime_data_type));
++    moveToDevice(runtime_data_type);
++    EventInstance::markAsReadyAndCallback(done_with_host_buffer_event.get(),
++                                          tt_pjrt_status::kSuccess);
    } else {
-+    const bool move_to_device =
-+        movesToDeviceOnCreation(runtime_data_type, shape);
      if (cannot_borrow_host_buffer) {
        runtime_tensor = tt::runtime::createOwnedHostTensor(
-           host_buffer, shape, strides, element_size, runtime_data_type);
-@@ -319,6 +327,17 @@ void BufferInstance::copyFromHost(
-       PjrtTensor::from_runtime_tensor({this}, std::move(runtime_tensor));
-     }
- 
-+    // A buffer that moves to the device now borrows the host buffer only until
-+    // the copy to device, which ends before this returns. The event is the
-+    // caller's from then on, so it is marked ready below, like the one of a
-+    // copied buffer, instead of being kept to fire when the data moves.
-+    else if (move_to_device) {
-+      runtime_tensor = tt::runtime::createBorrowedHostTensor(
-+          const_cast<void *>(host_buffer), shape, strides, element_size,
-+          runtime_data_type);
-+      PjrtTensor::from_runtime_tensor({this}, std::move(runtime_tensor));
-+    }
-+
-     // Otherwise when input host buffer has other semantic we are allowed to
-     // alias it, so we can create borrowed host which doesn't copy any data and
-     // instead uses direct pointer to existing data. Since we are holding a
-@@ -346,6 +365,14 @@ void BufferInstance::copyFromHost(
- 
-       PjrtTensor::from_runtime_tensor({this}, std::move(runtime_tensor));
-     }
-+
-+    if (move_to_device) {
-+      moveToDevice(runtime_data_type);
-+      if (!cannot_borrow_host_buffer) {
-+        EventInstance::markAsReadyAndCallback(
-+            done_with_host_buffer_event.get(), tt_pjrt_status::kSuccess);
-+      }
-+    }
-   }
- 
-   markAsDataReady();
-@@ -355,6 +382,49 @@ void BufferInstance::copyFromHost(
+@@ -355,6 +372,49 @@ void BufferInstance::copyFromHost(
    *out_done_with_host_buffer_event = done_with_host_buffer_event.release();
  }
  
