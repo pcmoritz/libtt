@@ -1,0 +1,51 @@
+diff --git a/lib/Dialect/D2M/IR/D2MDialect.cpp b/lib/Dialect/D2M/IR/D2MDialect.cpp
+--- a/lib/Dialect/D2M/IR/D2MDialect.cpp
++++ b/lib/Dialect/D2M/IR/D2MDialect.cpp
+@@ -14,7 +14,6 @@
+ #include "mlir/Dialect/Tensor/IR/Tensor.h"
+ #include "mlir/IR/DialectImplementation.h"
+ #include "mlir/IR/OpImplementation.h"
+-#include "mlir/InitAllDialects.h"
+ #include "mlir/Interfaces/FoldInterfaces.h"
+ #include "llvm/ADT/TypeSwitch.h"
+ 
+diff --git a/lib/Dialect/D2M/Utils/Utils.cpp b/lib/Dialect/D2M/Utils/Utils.cpp
+--- a/lib/Dialect/D2M/Utils/Utils.cpp
++++ b/lib/Dialect/D2M/Utils/Utils.cpp
+@@ -910,9 +910,9 @@
+     // Break the map into respective gridY, gridX, offset "single result"
+     // parts. AffineApply only supports single result affine maps.
+     map = map.dropResults(0); // Drop the device index.
+-    auto gridY = map.dropResults({1, 2});
+-    auto gridX = map.dropResults({0, 2});
+-    auto offset = map.dropResults({0, 1});
++    auto gridY = map.dropResults(ArrayRef<int64_t>{1, 2});
++    auto gridX = map.dropResults(ArrayRef<int64_t>{0, 2});
++    auto offset = map.dropResults(ArrayRef<int64_t>{0, 1});
+     return {affineApply(gridY, index), affineApply(gridX, index),
+             affineApply(offset, index)};
+   }
+diff --git a/lib/Dialect/SFPI/IR/SFPIDialect.cpp b/lib/Dialect/SFPI/IR/SFPIDialect.cpp
+--- a/lib/Dialect/SFPI/IR/SFPIDialect.cpp
++++ b/lib/Dialect/SFPI/IR/SFPIDialect.cpp
+@@ -7,7 +7,6 @@
+ #include "mlir/Dialect/Arith/IR/Arith.h"
+ #include "mlir/Dialect/Vector/IR/VectorOps.h"
+ #include "mlir/IR/DialectImplementation.h"
+-#include "mlir/InitAllDialects.h"
+ #include "ttmlir/Dialect/SFPI/IR/SFPIOps.h"
+ #include "ttmlir/Dialect/SFPI/IR/SFPIOpsTypes.h"
+ #include "llvm/ADT/StringRef.h"
+diff --git a/lib/Target/TTKernel/TTKernelToCpp.cpp b/lib/Target/TTKernel/TTKernelToCpp.cpp
+--- a/lib/Target/TTKernel/TTKernelToCpp.cpp
++++ b/lib/Target/TTKernel/TTKernelToCpp.cpp
+@@ -63,7 +63,8 @@
+     }
+ 
+     // TODO(wenbinlyuTT): make this conditional, originally from #4680.
+-    headers.insert("tools/profiler/kernel_profiler.hpp");
++    // tt-metal keeps the kernel profiler's API in api/debug.
++    headers.insert("api/debug/kernel_profiler.hpp");
+ 
+     const auto &headerMap = getCalleeToHeadersMap();
+ 

@@ -1154,6 +1154,7 @@ _TTMLIR_COMMON_DEPS = [
     "@llvm-project//mlir:AffineTransforms",
     "@llvm-project//mlir:ArithDialect",
     "@llvm-project//mlir:ArithToLLVM",
+    "@llvm-project//mlir:ArithToEmitC",
     "@llvm-project//mlir:BufferizationDialect",
     "@llvm-project//mlir:BufferizationInterfaces",
     "@llvm-project//mlir:BufferizationPipelines",
@@ -1191,12 +1192,14 @@ _TTMLIR_COMMON_DEPS = [
     "@llvm-project//mlir:MathToLibm",
     "@llvm-project//mlir:MemRefDialect",
     "@llvm-project//mlir:MemRefToLLVM",
+    "@llvm-project//mlir:MemRefToEmitC",
     "@llvm-project//mlir:MemRefTransforms",
     "@llvm-project//mlir:MLIRTargetCpp",
     "@llvm-project//mlir:Pass",
     "@llvm-project//mlir:Parser",
     "@llvm-project//mlir:QuantOps",
     "@llvm-project//mlir:SCFDialect",
+    "@llvm-project//mlir:SCFToEmitC",
     "@llvm-project//mlir:SCFToControlFlow",
     "@llvm-project//mlir:SCFTransforms",
     "@llvm-project//mlir:SideEffectInterfaces",
@@ -1228,6 +1231,41 @@ _TTMLIR_COMMON_DEPS = [
     "@stablehlo//:stablehlo_passes",
 ]
 
+# TTKernel's C++ emitter embeds these LLK headers as raw string literals, as
+# tt-mlir's cmake/modules/GenerateRawStringHeader.cmake does.
+_TTKERNEL_LLK_HEADERS = [
+    "experimental_coord_translation",
+    "experimental_fabric_1d_routing",
+    "experimental_fabric_2d_routing",
+    "experimental_fabric_api",
+    "experimental_fabric_topology_info",
+    "experimental_invoke_sfpi_llks",
+    "experimental_matmul_llks",
+    "experimental_pack_untilize_llks",
+    "experimental_padding_llks",
+    "experimental_reg_api",
+    "experimental_semaphore",
+    "experimental_tilize_llks",
+    "experimental_untilize_llks",
+]
+
+[genrule(
+    name = "ttkernel_llk_" + name + "_generated",
+    srcs = ["include/ttmlir/Target/TTKernel/LLKs/" + name + ".h"],
+    outs = ["include/ttmlir/Target/TTKernel/LLKs/" + name + "_generated.h"],
+    cmd = ("{ printf '%s\\n' '// Generated from " + name + ".h'; " +
+           "printf 'static constexpr char " + name + "_generated[] = R\"TTMLIR_STR_DELIM(\\n'; " +
+           "cat $<; " +
+           "printf ')TTMLIR_STR_DELIM\";\\nstatic constexpr unsigned int " + name +
+           "_generated_len = sizeof(" + name + "_generated) - 1;\\n'; } > $@"),
+) for name in _TTKERNEL_LLK_HEADERS]
+
+cc_library(
+    name = "ttkernel_llk_generated_headers",
+    hdrs = ["include/ttmlir/Target/TTKernel/LLKs/" + name + "_generated.h" for name in _TTKERNEL_LLK_HEADERS],
+    includes = ["include"],
+)
+
 cc_library(
     name = "ttmlir_compiler",
     srcs = [
@@ -1238,25 +1276,36 @@ cc_library(
         "@//tt_mlir:compiler_srcs",
     ] + glob(
         [
+            "lib/Conversion/ArithToD2MTileOps/**/*.cpp",
+            "lib/Conversion/D2MToTTKernel/**/*.cpp",
+            "lib/Conversion/D2MToTTMetal/**/*.cpp",
+            "lib/Conversion/D2MToTTNN/**/*.cpp",
+            "lib/Conversion/MathToD2MTileOps/**/*.cpp",
+            "lib/Conversion/SFPIToEmitC/**/*.cpp",
             "lib/Conversion/StableHLOToTTIR/**/*.cpp",
+            "lib/Conversion/TTIRToD2M/**/*.cpp",
+            "lib/Conversion/TTKernelToEmitC/**/*.cpp",
             "lib/Conversion/TTIRToLinalg/**/*.cpp",
             "lib/Conversion/TTIRToTTIRDecomposition/**/*.cpp",
             "lib/Conversion/TTIRToTTNN/**/*.cpp",
             "lib/Conversion/TTNNToEmitC/**/*.cpp",
             "lib/Conversion/TTNNToTTIR/**/*.cpp",
+            "lib/Dialect/D2M/**/*.cpp",
             "lib/Dialect/Debug/**/*.cpp",
             "lib/Dialect/EmitPy/**/*.cpp",
             "lib/Dialect/Linalg/**/*.cpp",
             "lib/Dialect/LLVM/**/*.cpp",
+            "lib/Dialect/SFPI/**/*.cpp",
             "lib/Dialect/StableHLO/**/*.cpp",
             "lib/Dialect/TTCore/**/*.cpp",
             "lib/Dialect/TTIR/**/*.cpp",
-            "lib/Dialect/TTKernel/IR/**/*.cpp",
+            "lib/Dialect/TTKernel/**/*.cpp",
             "lib/Dialect/TTMetal/IR/**/*.cpp",
             "lib/Dialect/TTNN/**/*.cpp",
             "lib/OpModel/TTNN/**/*.cpp",
             "lib/Scheduler/**/*.cpp",
             "lib/Support/**/*.cpp",
+            "lib/Target/TTKernel/**/*.cpp",
             "lib/Target/TTNN/**/*.cpp",
             "lib/Transforms/**/*.cpp",
         ],
@@ -1266,6 +1315,8 @@ cc_library(
             "lib/Dialect/TTNN/Transforms/TTNNResolveTTLangKernelsPython.cpp",
             "lib/Dialect/TTNN/Transforms/TTNNToPython.cpp",
             "lib/Target/Python/**",
+            # Registers the mlir-translate target, which only the tools use.
+            "lib/Target/TTKernel/TTKernelToCppRegistration.cpp",
         ],
         allow_empty = True,
     ),
@@ -1284,7 +1335,10 @@ cc_library(
         "include/ttmlir/OpModel/TTNN",
         "lib",
     ],
-    deps = _TTMLIR_COMMON_DEPS + ["@//tt_mlir:compiler_headers"],
+    deps = _TTMLIR_COMMON_DEPS + [
+        ":ttkernel_llk_generated_headers",
+        "@//tt_mlir:compiler_headers",
+    ],
     alwayslink = True,
 )
 
