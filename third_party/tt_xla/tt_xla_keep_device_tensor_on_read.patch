@@ -1,0 +1,70 @@
+diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/tensor.h
+--- a/pjrt_implementation/inc/api/tensor.h
++++ b/pjrt_implementation/inc/api/tensor.h
+@@ -195,6 +195,13 @@ private:
+   // Whether m_runtime_tensor is a host tensor whose read is still in flight.
+   mutable bool m_read_pending = false;
+ 
++  // The device tensor that a non-blocking move to host read. A buffer's data
++  // doesn't change, so a program takes it as an input in the layout it has,
++  // without waiting for the read and moving the host tensor back; the
++  // sampled tokens of a decode step are read and are the next step's input.
++  // A blocking move, which frees device memory, drops it.
++  std::optional<tt::runtime::Tensor> m_read_source;
++
+   // Guards m_runtime_tensor and m_read_pending: a framework may read a buffer
+   // on one thread while a program takes it as an input on another.
+   mutable std::mutex m_state_mutex;
+diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api/tensor.cc
+--- a/pjrt_implementation/src/api/tensor.cc
++++ b/pjrt_implementation/src/api/tensor.cc
+@@ -102,6 +102,10 @@ PjrtTensor::ensure_layout(const tt::runtime::Device &device,
+   TT_FATAL(m_runtime_tensor.has_value(),
+            "Cannot ensure layout for shell-only PjrtTensor");
+   const std::lock_guard<std::mutex> lock(m_state_mutex);
++  if (m_read_source.has_value() &&
++      tt::runtime::hasLayout(*m_read_source, layout)) {
++    return *m_read_source;
++  }
+   wait_for_read_locked();
+ 
+   if (m_checked_layout_id == layout.getGlobalId())
+@@ -116,6 +120,7 @@ PjrtTensor::ensure_layout(const tt::runtime::Device &device,
+   m_runtime_tensor =
+       tt::runtime::toLayout(*m_runtime_tensor, device, layout, retain);
+   m_checked_layout_id.reset();
++  m_read_source.reset();
+ 
+   // Notify each shard so the host-buffer-done event fires now and the
+   // framework releases its source reference, instead of holding it for
+@@ -195,6 +200,10 @@ PjrtTensor::move_to_host_locked(bool blocking) {
+     return {};
+   }
+ 
++  if (blocking) {
++    m_read_source.reset();
++  }
++
+   // A read in flight has already moved the tensor, and with it its shards.
+   if (m_read_pending) {
+     if (blocking) {
+@@ -203,6 +212,8 @@ PjrtTensor::move_to_host_locked(bool blocking) {
+     return {*m_runtime_tensor};
+   }
+ 
++  const tt::runtime::Tensor source = *m_runtime_tensor;
++
+   // A buffer of one device holds the same data on every chip of the mesh
+   // (LoadedExecutableInstance::getOrCreateMeshDevice); one chip's is read.
+   if (on_every_chip()) {
+@@ -219,6 +230,10 @@ PjrtTensor::move_to_host_locked(bool blocking) {
+   m_runtime_tensor = tensors[0];
+   m_read_pending = !blocking;
+   m_checked_layout_id.reset();
++  // Shards each get a tensor of their own below, and none keeps the source.
++  if (!blocking && m_shards.size() == 1) {
++    m_read_source = source;
++  }
+ 
+   for (std::size_t i = 1; i < m_shards.size(); ++i) {
+     if (m_shards[i] == nullptr) {
