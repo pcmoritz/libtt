@@ -1,7 +1,21 @@
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-@@ -816,10 +816,10 @@ private:
+@@ -792,13 +792,6 @@ private:
+       return false;
+     }
+ 
+-    for (Operation *user : arg.getUsers()) {
+-      // MeshShardOp inputs should be tiled.
+-      if (mlir::isa<ttir::MeshShardOp, ttir::TTLangOp>(user)) {
+-        return false;
+-      }
+-    }
+-
+     // ttnn.embedding reads the indices and the table as row-major sticks and
+     // rejects a tiled operand outright. If that is all the argument feeds,
+     // convert at the boundary instead: the runtime does it once at bind time
+@@ -816,10 +809,10 @@ private:
        return true;
      }
  
