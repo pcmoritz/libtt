@@ -24,12 +24,11 @@ diff --git a/pjrt_implementation/inc/api/module_builder/module_builder.h b/pjrt_
        const std::unordered_map<std::string, std::string> &compile_options,
        tt::pjrt::ClientInstance *client_instance, size_t target_num_devices = 1);
  
-@@ -235,7 +235,7 @@
+@@ -235,7 +235,6 @@
  
    // Converts TTIR module to TTNN module.
    tt_pjrt_status convertFromTTIRToTTNN(
 -      const std::string &system_descriptor_path,
-+      const tt::runtime::SystemDesc &system_descriptor,
        mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
        const CompileOptions &compile_options, ClientInstance *client_instance,
        std::vector<std::uint32_t> devices_mesh_shape, std::string &ttnn_code);
@@ -83,15 +82,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
 --- a/pjrt_implementation/src/api/module_builder/module_builder.cc
 +++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
-@@ -59,6 +59,7 @@
- #include "ttmlir/Dialect/StableHLO/Utils/GSPMDUtils.h"
- #include "ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h"
- #include "ttmlir/Dialect/StableHLO/Utils/ShardyUtils.h"
-+#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
- #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
- #include "ttmlir/Dialect/TTIR/Pipelines/TTIRPipelines.h"
- #include "ttmlir/Dialect/TTIR/Transforms/Passes.h"
-@@ -370,7 +371,7 @@
+@@ -370,7 +370,7 @@
  std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>>
  ModuleBuilder::buildModule(
      const std::string_view &mlir_code,
@@ -100,54 +91,53 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
      const std::unordered_map<std::string, std::string> &compile_options_map,
      ClientInstance *client_instance, size_t target_num_devices) {
    DLOG_F(LOG_DEBUG, "ModuleBuilder::buildModule");
-@@ -583,7 +584,7 @@
-                      output_memory_kinds_sizes);
+@@ -562,6 +562,21 @@
+   }
  
-   std::string ttnn_mlir;
--  status = convertFromTTIRToTTNN(system_descriptor_path, mlir_module,
-+  status = convertFromTTIRToTTNN(system_descriptor, mlir_module,
-                                  compile_options, client_instance, mesh_shape,
-                                  ttnn_mlir);
-   if (!tt_pjrt_status_is_ok(status)) {
-@@ -1101,7 +1102,7 @@
- }
- 
- tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
--    const std::string &system_descriptor_path,
-+    const tt::runtime::SystemDesc &system_descriptor,
-     mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
-     const CompileOptions &compile_options, ClientInstance *client_instance,
-     std::vector<std::uint32_t> devices_mesh_shape, std::string &ttnn_mlir) {
-@@ -1180,7 +1181,31 @@
-   options.enableActivationDtypeLowering =
-       compile_options.enable_activation_dtype_lowering;
-   options.enableTrace = compile_options.enable_trace;
--  options.systemDescPath = system_descriptor_path.data();
-+  // Given no path, the pipeline registers the device from the system
-+  // descriptor on the module it registers it in, so the descriptor needs no
-+  // file. That is the module of the device module, which the StableHLO to TTIR
-+  // pipeline has made; a program not wrapped in one yet takes the root
-+  // module's attributes into it when the pipeline wraps it.
+   LOG_BRINGUP_STAGE("TTMLIR_COMPILATION_START");
++
++  // Given no path, the TTIR to TTNN pipeline registers the device from the
++  // system descriptor of the device module's module, which takes the root
++  // module's attributes when it is made, so the descriptor needs no file.
 +  mlir::FailureOr<mlir::tt::ttcore::SystemDescAttr> system_desc =
 +      mlir::tt::ttcore::SystemDescAttr::getFromBuffer(
 +          mlir_module->getContext(), system_descriptor.handle.get(),
 +          [&]() { return mlir_module->emitError(); });
 +  if (mlir::failed(system_desc)) {
 +    LOG_F(ERROR, "Failed to read the system descriptor");
-+    return tt_pjrt_status::kInternal;
++    return {tt_pjrt_status::kInternal, nullptr};
 +  }
-+  bool wrapped = false;
-+  for (auto device_module :
-+       mlir_module->getOps<mlir::tt::ttcore::DeviceModuleOp>()) {
-+    for (auto module : device_module.getBodyRegion().getOps<mlir::ModuleOp>()) {
-+      module->setAttr(mlir::tt::ttcore::SystemDescAttr::name, *system_desc);
-+      wrapped = true;
-+    }
-+  }
-+  if (!wrapped) {
-+    mlir_module.get()->setAttr(mlir::tt::ttcore::SystemDescAttr::name,
-+                               *system_desc);
-+  }
++  mlir_module.get()->setAttr(mlir::tt::ttcore::SystemDescAttr::name,
++                             *system_desc);
++
+   std::string ttir_mlir;
+   status =
+       convertFromSHLOToTTIR(mlir_module, ttir_mlir, compile_options.export_path,
+@@ -583,9 +598,8 @@
+                      output_memory_kinds_sizes);
+ 
+   std::string ttnn_mlir;
+-  status = convertFromTTIRToTTNN(system_descriptor_path, mlir_module,
+-                                 compile_options, client_instance, mesh_shape,
+-                                 ttnn_mlir);
++  status = convertFromTTIRToTTNN(mlir_module, compile_options, client_instance,
++                                 mesh_shape, ttnn_mlir);
+   if (!tt_pjrt_status_is_ok(status)) {
+     return {status, nullptr};
+   }
+@@ -1101,7 +1115,6 @@
+ }
+ 
+ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+-    const std::string &system_descriptor_path,
+     mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
+     const CompileOptions &compile_options, ClientInstance *client_instance,
+     std::vector<std::uint32_t> devices_mesh_shape, std::string &ttnn_mlir) {
+@@ -1180,7 +1193,6 @@
+   options.enableActivationDtypeLowering =
+       compile_options.enable_activation_dtype_lowering;
+   options.enableTrace = compile_options.enable_trace;
+-  options.systemDescPath = system_descriptor_path.data();
    options.enableConstEval = compile_options.enable_const_eval;
    options.enableCPUHoistedConstEval = compile_options.enable_const_eval_on_cpu;
    options.enableConstEvalInputsToSystemMemory =
