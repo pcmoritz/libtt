@@ -42,3 +42,18 @@ def test_sharded_and_replicated_readback_is_exact():
         np.testing.assert_array_equal(np.asarray(out), x)
         for shard in out.addressable_shards:
             np.testing.assert_array_equal(np.asarray(shard.data), x[shard.index])
+
+
+def test_a_later_shard_read_first():
+    """Reading a shard moves the whole result to the host and gives the other
+    shards host tensors of their own: a read of a later shard first gets its
+    rows, not the first shard's."""
+    devices = jax.devices("tt")
+    if len(devices) < 2:
+        pytest.skip("needs at least two devices")
+    mesh = Mesh(np.array(devices), ("x",))
+    rows = NamedSharding(mesh, P("x"))
+    x = np.arange(len(devices) * 4 * 32, dtype=np.float32).reshape(len(devices) * 4, 32)
+    out = jax.jit(lambda a: a + 1, out_shardings=rows)(jax.device_put(x, rows))
+    np.testing.assert_array_equal(np.asarray(out.addressable_shards[1].data), x[4:8] + 1)
+    np.testing.assert_array_equal(np.asarray(out), x + 1)
