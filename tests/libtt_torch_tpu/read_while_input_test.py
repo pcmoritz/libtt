@@ -16,8 +16,9 @@ def test_read_while_a_queued_op_takes_it():
     wrong = []
     for i in range(1, 1001):
         t = t + 1
-        _ = t * 2
+        consumer = t * 2
         value = t.cpu()
-        if not (value == i).all():
-            wrong.append((i, value[0, 0].item()))
-    assert not wrong, f"{len(wrong)} of 1000 reads wrong, e.g. {wrong[:5]}"
+        doubled = consumer.cpu()
+        if not (value == i).all() or not (doubled == 2 * i).all():
+            wrong.append((i, value[0, 0].item(), doubled[0, 0].item()))
+    assert not wrong, f"{len(wrong)} of 1000 steps wrong, e.g. {wrong[:5]}"
