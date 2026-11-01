@@ -76,3 +76,16 @@ def test_ties_to_the_larger_index(is_max):
         return  # Variadic reduces in general don't lower; a wrong index would.
     np.testing.assert_array_equal(values, [2.0])
     np.testing.assert_array_equal(indices, [1])
+
+
+def test_sums_over_a_unit_dimension():
+    # Over a dimension of size 1, an argmin's inputs and reducer aren't checked.
+    # A reduce that sums x and x * x there, as layer_norm's backward does, is
+    # still not an argmin.
+    x = np.random.default_rng(0).standard_normal((3, 4, 1)).astype(np.float32)
+    zero = np.float32(0)
+    sums = lambda x: lax.reduce((x, x * x), (zero, zero), lambda a, b: (a[0] + b[0], a[1] + b[1]), (2,))
+    total, squares = jax.jit(sums)(x)
+    np.testing.assert_array_equal(total, x[..., 0])
+    np.testing.assert_allclose(squares, x[..., 0] ** 2, rtol=1e-6)
+    np.testing.assert_array_equal(jax.jit(lambda x: jnp.argmin(x, axis=2))(x), np.zeros((3, 4)))
