@@ -107,35 +107,18 @@ diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_im
  
    for (size_t input_index : donated_indices) {
      if (input_index >= args->num_args) {
-@@ -374,6 +373,19 @@ void LoadedExecutableInstance::invalidateDonatedInputs(
+@@ -374,12 +373,10 @@ void LoadedExecutableInstance::invalidateDonatedInputs(
  tt_pjrt_status LoadedExecutableInstance::validateInputBuffers(
      PJRT_LoadedExecutable_Execute_Args *args,
      DonationIndices &donated_indices) {
-+  // A deleted buffer has no data left (deleteData).
-+  for (size_t device_index = 0; device_index < args->num_devices;
-+       ++device_index) {
-+    for (size_t input_index = 0; input_index < args->num_args; ++input_index) {
-+      if (BufferInstance::unwrap(args->argument_lists[device_index][input_index])
-+              ->isDataDeleted()) {
-+        LOG_F(ERROR, "Input buffer %zu on device %zu was already deleted",
-+              input_index, device_index);
-+        return tt_pjrt_status::kInvalidArgument;
-+      }
-+    }
-+  }
-+
++  // Every input is checked, whether or not the program donates any: a deleted
++  // buffer has no data left (deleteData).
    const std::vector<size_t> &candidate_indices =
        m_executable_image->getDonatableInputIndices();
-   if (candidate_indices.empty()) {
-@@ -414,11 +426,6 @@ tt_pjrt_status LoadedExecutableInstance::validateInputBuffers(
-     for (size_t input_index = 0; input_index < args->num_args; ++input_index) {
-       BufferInstance *buffer = BufferInstance::unwrap(
-           args->argument_lists[device_index][input_index]);
--      if (buffer->isDataDeleted()) {
--        LOG_F(ERROR, "Input buffer %zu on device %zu was already deleted",
--              input_index, device_index);
--        return tt_pjrt_status::kInvalidArgument;
--      }
-       if (donated_buffers.contains(buffer) &&
-           !donated_indices.contains(input_index)) {
-         LOG_F(ERROR,
+-  if (candidate_indices.empty()) {
+-    return tt_pjrt_status::kSuccess;
+-  }
+-
+   donated_indices.insert(candidate_indices.begin(), candidate_indices.end());
+   if (args->options &&
+       args->options->struct_size >=

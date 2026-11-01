@@ -238,31 +238,30 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
  
    ::ttnn::operations::trace::execute_trace(
        &meshDevice, variant.traceId, ::ttnn::QueueId(0), /*blocking=*/false);
-@@ -348,7 +370,8 @@ static void executeTrace(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
- // new one.
+@@ -345,17 +367,17 @@ static void executeTrace(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+ // runtime tensor it was captured with. In particular, donated KV-cache calls
+ // may use the same executable with different cache buffers; replaying the old
+ // trace would mutate the old buffer while the enclosing program returns the
+-// new one.
++// new one. The stageable inputs, the last device-resident ones, are left to
++// stageMovedInputs, after which every variant reads them alike.
  static bool deviceInputsMatch(
      const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
--    ProgramContext &context, const TraceVariant &variant) {
-+    ProgramContext &context, const TraceData &traceData,
-+    const TraceVariant &variant) {
+     ProgramContext &context, const TraceVariant &variant) {
    LOG_ASSERT(op->inputs()->size() == variant.inputTensors.size(),
               "Mismatched number of trace inputs");
-   for (size_t i = 0; i < op->inputs()->size(); ++i) {
-@@ -356,6 +379,13 @@ static bool deviceInputsMatch(
-     if (!isDeviceResidentInput(op, i)) {
-       continue;
-     }
-+    if (isStaged(traceData, i)) {
-+      // Staging evicted the variants that read the input in place.
-+      LOG_ASSERT(variant.inputTensors[i].handle ==
-+                     traceData.stagedSlots[i]->handle,
-+                 "A variant reads staged trace input ", i, " in place");
-+      continue;
-+    }
+-  for (size_t i = 0; i < op->inputs()->size(); ++i) {
++  const size_t count =
++      op->device_resident_input_count() - op->stageable_input_count();
++  for (size_t i = 0; i < count; ++i) {
+     const ::tt::target::ttnn::TensorRef *input = op->inputs()->Get(i);
+-    if (!isDeviceResidentInput(op, i)) {
+-      continue;
+-    }
      const ::ttnn::Tensor &current =
          context.getTensorPool().getTTNNTensorAndValidate(input);
      const ::ttnn::Tensor &captured =
-@@ -372,6 +402,61 @@ static bool deviceInputsMatch(
+@@ -372,6 +394,61 @@ static bool deviceInputsMatch(
    return true;
  }
  
@@ -324,7 +323,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
  void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
           ProgramContext &context) {
    ::tt::runtime::Device deviceHandle = context.getDeviceHandle();
-@@ -409,9 +494,10 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -409,9 +486,10 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
      // device-resident slots, which alias their inputs and are therefore
      // version-matched no-ops. Keeping the call here means the capture path and
      // the execute path establish the slots identically.
@@ -337,7 +336,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
      traceData.variants.push_back(
          captureTrace(op, context, inputSlots, outputSlots));
      traceCache->insert(mainProgramKey, captureExecuteKey, std::move(traceData));
-@@ -423,17 +509,18 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -423,6 +501,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
  
    TraceData *traceData = traceCache->get(mainProgramKey, captureExecuteKey);
    LOG_ASSERT(traceData, "TraceData must be populated in TraceCache");
@@ -345,11 +344,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
  
    auto variantIt = std::find_if(
        traceData->variants.rbegin(), traceData->variants.rend(),
-       [&](const TraceVariant &variant) {
--        return deviceInputsMatch(op, context, variant) &&
-+        return deviceInputsMatch(op, context, *traceData, variant) &&
-                meshDevice.is_mesh_trace_replay_safe(variant.traceId);
-       });
+@@ -433,7 +512,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
  
    if (variantIt != traceData->variants.rend()) {
      LOG_DEBUG("Trace variant cache hit, executing trace directly");
@@ -358,16 +353,7 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
      // Keep variants ordered from least- to most-recently used so front
      // eviction removes the coldest trace.
      std::rotate(variantIt.base() - 1, variantIt.base(),
-@@ -450,7 +537,7 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
-   auto matchingIt = std::find_if(
-       traceData->variants.rbegin(), traceData->variants.rend(),
-       [&](const TraceVariant &variant) {
--        return deviceInputsMatch(op, context, variant);
-+        return deviceInputsMatch(op, context, *traceData, variant);
-       });
-   const bool reuseTraceSlots = matchingIt != traceData->variants.rend();
-   std::vector<::tt::runtime::Tensor> inputSlots;
-@@ -476,9 +563,10 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
+@@ -476,9 +555,10 @@ void run(const ::tt::target::ttnn::CaptureOrExecuteTraceOp *op,
      size_t numInputSlots = op->inputs()->size();
      inputSlots.assign(slots.begin(), slots.begin() + numInputSlots);
      outputSlots.assign(slots.begin() + numInputSlots, slots.end());
