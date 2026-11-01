@@ -89,7 +89,10 @@ http_archive(
         "find docs examples perflab src tests \\( -name BUILD -o -name BUILD.bazel \\) -delete",
         "rm REPO.bazel",
     ],
-    patches = ["//third_party/torch_tpu:subprocess_test_main_module.patch"],
+    patches = [
+        "//third_party/torch_tpu:subprocess_test_main_module.patch",
+        "//third_party/torch_tpu:float8_matmul_references.patch",
+    ],
     sha256 = "a2b630a5a7ae1fbb27aac732f16a14f60173b6e927711dca5b91259052a1b81f",
     strip_prefix = "torch_tpu-0.2.0",
     urls = [
@@ -695,6 +698,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_tiled_inputs.patch",
         "//third_party/tt_xla:tt_mlir_stageable_trace_inputs.patch",
         "//third_party/tt_xla:tt_mlir_device_layout.patch",
+        "//third_party/tt_xla:tt_mlir_float8_scaled_matmul.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

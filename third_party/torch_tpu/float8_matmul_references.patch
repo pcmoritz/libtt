@@ -1,0 +1,51 @@
+diff --git a/tests/ops_unit_test.py b/tests/ops_unit_test.py
+--- a/tests/ops_unit_test.py
++++ b/tests/ops_unit_test.py
+@@ -62,6 +62,14 @@
+ CheckValueMode = utils.CheckValueMode
+ 
+ 
++def _matrix_unit_float8_values(x):
++  """float8 values as libtt's matrix unit reads them: subnormals as zero."""
++  values = x.float()
++  return torch.where(
++      values.abs() < torch.finfo(x.dtype).smallest_normal, 0.0, values
++  )
++
++
+ class FakeSample:
+   """A fake test sample for an op. Used for testing op_testing.to()."""
+ 
+@@ -2843,8 +2851,8 @@
+     def compute(device):
+       if device == "cpu":
+         # Simulate in F32 on CPU
+-        s_f32 = self_fp8.float()
+-        m_f32 = mat2_fp8.float()
++        s_f32 = _matrix_unit_float8_values(self_fp8)
++        m_f32 = _matrix_unit_float8_values(mat2_fp8)
+         out_f32 = torch.mm(s_f32, m_f32)
+         return (out_f32 * scale_a * scale_b).to(dtype)
+       else:
+@@ -3046,8 +3054,8 @@
+     def compute(device):
+       if device == "cpu":
+         # Simulate in F32 on CPU
+-        s_f32 = self_fp8.float()
+-        m_f32 = mat2_fp8.float()
++        s_f32 = _matrix_unit_float8_values(self_fp8)
++        m_f32 = _matrix_unit_float8_values(mat2_fp8)
+         out_f32 = torch.mm(s_f32, m_f32)
+         res = (out_f32 * scale_a * scale_b) + bias
+         return (res * scale_result).to(dtype)
+@@ -10686,7 +10694,9 @@
+ 
+     a_cpu_fp8 = a_fp8.cpu()
+     b_cpu_fp8 = b_fp8.cpu()
+-    expected_cpu = torch.matmul(a_cpu_fp8.float(), b_cpu_fp8.float()).to(
++    expected_cpu = torch.matmul(
++        _matrix_unit_float8_values(a_cpu_fp8), _matrix_unit_float8_values(b_cpu_fp8)
++    ).to(
+         torch.bfloat16
+     )
+ 
