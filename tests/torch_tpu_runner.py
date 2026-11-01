@@ -26,7 +26,7 @@ import time
 
 # Bazel's Python bootstrap doesn't put this directory on the path.
 sys.path.insert(0, str(Path(__file__).parent))
-from pytest_runner import _rlocation, extract_plugin_wheel  # noqa: E402
+from pytest_runner import _rlocation, extract_plugin_wheel, use_one_chip  # noqa: E402
 
 # Once a process logs one of these, the device fails every later file.
 DEVICE_HANG_MARKERS = ("NOC0 is hung", "MMIO per-op timeout")
@@ -134,7 +134,14 @@ def main() -> int:
         default=3600,
         help="Seconds after which a test file's process is killed.",
     )
+    parser.add_argument(
+        "--one-chip-mesh",
+        help="Runfile of a mesh graph descriptor of one chip: the tests run on "
+        "the first chip only, as on a host with one.",
+    )
     args, rest = parser.parse_known_args()
+    if args.one_chip_mesh:
+        use_one_chip(args.one_chip_mesh)
 
     root = _rlocation(args.tests_anchor).resolve(strict=True).parent
     plugin_wheel = _rlocation(args.jax_plugin_wheel).resolve(strict=True)

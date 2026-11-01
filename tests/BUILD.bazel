@@ -105,6 +105,26 @@ py_test(
     timeout = "long",
 )
 
+# The libtt suite on one chip of a host with several, as a host with one runs
+# it: a client with one device runs a program over one device on that chip
+# alone.
+py_test(
+    name = "libtt_test_suite_one_chip",
+    srcs = ["pytest_runner.py"],
+    args = PLUGIN_TEST_ARGS + [
+        "--tests-anchor=$(rlocationpath :libtt/pytest.ini)",
+        "--one-chip-mesh=$(rlocationpath :one_chip_mesh_graph_descriptor.textproto)",
+    ],
+    data = PLUGIN_TEST_DATA + glob(["libtt/**/*.py"]) + [
+        "libtt/pytest.ini",
+        "one_chip_mesh_graph_descriptor.textproto",
+    ],
+    deps = PLUGIN_TEST_DEPS,
+    main = "pytest_runner.py",
+    tags = DEVICE_TEST_TAGS,
+    timeout = "long",
+)
+
 py_test(
     name = "jax_smoke_tests",
     srcs = ["pytest_runner.py"],
@@ -144,31 +164,53 @@ py_test(
     timeout = "eternal",
 )
 
+TORCH_TPU_SMOKE_TEST_ARGS = [
+    "--local-test=$(rlocationpath :libtt_torch_tpu/process_exit_test.py)",
+    "--local-test=$(rlocationpath :libtt_torch_tpu/read_while_input_test.py)",
+    "tests/booleans_test.py",
+    "tests/compile/stablehlo_compile_test.py",
+    "tests/fused_adam_test.py",
+    "tests/optimizers/sgd_test.py",
+    "tests/scan_test.py",
+    "tests/untyped_storage_test.py",
+    # unique and unique_consecutive sort with a non-strict comparator,
+    # with duplicates, returned inverse indices and counts.
+    "tests/ops_unit_test.py::OpsGradUnitTest::test_unique2_distributions",
+    "tests/ops_unit_test.py::OpsUnitTest::test_unique_consecutive_distributions",
+    # Programs consume the inputs torch_tpu donates (jax.buffer_donor).
+    "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_async_with_mutable_custom_op",
+    "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_buffer_donation",
+    "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_mixed_mutable_and_immutable_arguments",
+    "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_multiple_mutating_ops",
+]
+
+TORCH_TPU_SMOKE_TEST_DATA = [
+    "libtt_torch_tpu/process_exit_test.py",
+    "libtt_torch_tpu/read_while_input_test.py",
+]
+
 py_test(
     name = "torch_tpu_smoke_tests",
     srcs = TORCH_TPU_TEST_SRCS,
-    args = TORCH_TPU_TEST_ARGS + [
-        "--local-test=$(rlocationpath :libtt_torch_tpu/process_exit_test.py)",
-        "--local-test=$(rlocationpath :libtt_torch_tpu/read_while_input_test.py)",
-        "tests/booleans_test.py",
-        "tests/compile/stablehlo_compile_test.py",
-        "tests/fused_adam_test.py",
-        "tests/optimizers/sgd_test.py",
-        "tests/scan_test.py",
-        "tests/untyped_storage_test.py",
-        # unique and unique_consecutive sort with a non-strict comparator,
-        # with duplicates, returned inverse indices and counts.
-        "tests/ops_unit_test.py::OpsGradUnitTest::test_unique2_distributions",
-        "tests/ops_unit_test.py::OpsUnitTest::test_unique_consecutive_distributions",
-        # Programs consume the inputs torch_tpu donates (jax.buffer_donor).
-        "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_async_with_mutable_custom_op",
-        "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_buffer_donation",
-        "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_mixed_mutable_and_immutable_arguments",
-        "tests/compile/compile_api_test.py::CompileApiTest::test_static_compiler_multiple_mutating_ops",
+    args = TORCH_TPU_TEST_ARGS + TORCH_TPU_SMOKE_TEST_ARGS,
+    data = TORCH_TPU_TEST_DATA + TORCH_TPU_SMOKE_TEST_DATA,
+    deps = TORCH_TPU_TEST_DEPS,
+    main = "torch_tpu_runner.py",
+    tags = DEVICE_TEST_TAGS,
+    timeout = "long",
+)
+
+# The smoke tests on one chip of a host with several, as a host with one runs
+# them: in TPU compatibility mode, a client with one device moves buffers to it
+# when they are created.
+py_test(
+    name = "torch_tpu_smoke_tests_one_chip",
+    srcs = TORCH_TPU_TEST_SRCS,
+    args = TORCH_TPU_TEST_ARGS + TORCH_TPU_SMOKE_TEST_ARGS + [
+        "--one-chip-mesh=$(rlocationpath :one_chip_mesh_graph_descriptor.textproto)",
     ],
-    data = TORCH_TPU_TEST_DATA + [
-        "libtt_torch_tpu/process_exit_test.py",
-        "libtt_torch_tpu/read_while_input_test.py",
+    data = TORCH_TPU_TEST_DATA + TORCH_TPU_SMOKE_TEST_DATA + [
+        "one_chip_mesh_graph_descriptor.textproto",
     ],
     deps = TORCH_TPU_TEST_DEPS,
     main = "torch_tpu_runner.py",
