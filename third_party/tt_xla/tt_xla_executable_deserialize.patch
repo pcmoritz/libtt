@@ -1,0 +1,566 @@
+diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
+--- a/pjrt_implementation/inc/api/client_instance.h
++++ b/pjrt_implementation/inc/api/client_instance.h
+@@ -37,6 +37,7 @@ class BufferInstance;
+ 
+ namespace module_builder {
+ class ModuleBuilder;
++struct CompiledProgram;
+ }
+ 
+ // Singleton class that wraps the PJRT Client Instance.
+@@ -165,13 +166,15 @@ public:
+   // Closes currently opened parrent mesh device.
+   void closeParentMesh();
+ 
+-  // Compiles given mlir program.
++  // Compiles given mlir program, or with its compiled program, loads it.
+   tt_pjrt_status compileMlirProgram(
+       const PJRT_Program *mlir_program,
+       LoadedExecutableInstance **out_executable,
+       const std::unordered_map<std::string, std::string> &compile_options,
+       const std::optional<std::vector<int64_t>> &replica_device_ids,
+-      size_t target_num_devices = 1);
++      size_t target_num_devices = 1,
++      std::string_view serialized_compile_options = {},
++      const module_builder::CompiledProgram *compiled_program = nullptr);
+ 
+ private:
+   tt_pjrt_status populateDevices();
+@@ -294,6 +297,10 @@ onClientAddressableMemories(PJRT_Client_AddressableMemories_Args *args);
+ // Implements PJRT_Client_Compile API function.
+ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args);
+ 
++// Implements PJRT_Executable_DeserializeAndLoad API function.
++PJRT_Error *onExecutableDeserializeAndLoad(
++    PJRT_Executable_DeserializeAndLoad_Args *args);
++
+ // Implements PJRT_Client_DefaultDeviceAssignment API function.
+ PJRT_Error *
+ onClientDefaultDeviceAssignment(PJRT_Client_DefaultDeviceAssignment_Args *args);
+diff --git a/pjrt_implementation/inc/api/executable_image.h b/pjrt_implementation/inc/api/executable_image.h
+--- a/pjrt_implementation/inc/api/executable_image.h
++++ b/pjrt_implementation/inc/api/executable_image.h
+@@ -81,6 +81,16 @@ public:
+     m_donatable_input_indices = std::move(indices);
+   }
+ 
++  // Returns the serialized CompileOptionsProto the executable was compiled
++  // with, which a serialized executable keeps to be loaded with.
++  const std::string &getSerializedCompileOptions() const {
++    return m_serialized_compile_options;
++  }
++
++  void setSerializedCompileOptions(std::string &&options) {
++    m_serialized_compile_options = std::move(options);
++  }
++
+   // Returns the vector of output data types.
+   std::vector<PJRT_Buffer_Type> &getOutputTypes() { return m_output_types; }
+ 
+@@ -241,6 +251,9 @@ private:
+ 
+   // Compile options used to create this executable.
+   CompileOptions m_compile_options;
++
++  // The same options, as PJRT_Client_Compile got them.
++  std::string m_serialized_compile_options;
+ };
+ 
+ /*
+diff --git a/pjrt_implementation/inc/api/module_builder/module_builder.h b/pjrt_implementation/inc/api/module_builder/module_builder.h
+--- a/pjrt_implementation/inc/api/module_builder/module_builder.h
++++ b/pjrt_implementation/inc/api/module_builder/module_builder.h
+@@ -118,18 +118,27 @@ struct NumDevicesResult {
+   size_t num_devices_to_utilize;
+ };
+ 
++// The TTNN program and flatbuffer of a serialized executable, which loading it
++// takes instead of compiling them.
++struct CompiledProgram {
++  std::string ttnn_mlir;
++  tt::runtime::Binary flatbuffer;
++};
++
+ class ModuleBuilder {
+ public:
+   ModuleBuilder();
+ 
+   // Compiles given mlir module code and returns produced executable image
+   // for execution on a given system, together with the compilation status
+-  // for error checking.
++  // for error checking. Given the compiled program, it only compiles the
++  // module to TTIR, for the executable's arguments, outputs and shardings.
+   std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>> buildModule(
+       const std::string_view &mlir_code,
+       const tt::runtime::SystemDesc &system_descriptor,
+       const std::unordered_map<std::string, std::string> &compile_options,
+-      tt::pjrt::ClientInstance *client_instance, size_t target_num_devices = 1);
++      tt::pjrt::ClientInstance *client_instance, size_t target_num_devices = 1,
++      const CompiledProgram *compiled_program = nullptr);
+ 
+   // Gets the first sdy.Mesh op of a mlir module with shardy dialect enbaled.
+   // Could be used to extract mesh attribute from the module so we can use it as
+@@ -310,7 +319,8 @@ private:
+       const std::vector<PJRT_Buffer_Type> &output_types,
+       std::vector<const char *> &&output_memory_kinds,
+       std::vector<size_t> &&output_memory_kinds_sizes,
+-      std::string &&optimized_mlir_code, CompileOptions &&compile_options);
++      std::string &&optimized_mlir_code, CompileOptions &&compile_options,
++      const CompiledProgram *compiled_program);
+ 
+   // Builds module for TTNN Codegen C++ backend runtime.
+   std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>>
+diff --git a/pjrt_implementation/inc/api/serialized_executable_instance.h b/pjrt_implementation/inc/api/serialized_executable_instance.h
+--- a/pjrt_implementation/inc/api/serialized_executable_instance.h
++++ b/pjrt_implementation/inc/api/serialized_executable_instance.h
+@@ -13,6 +13,8 @@
+ 
+ // c++ standard library includes
+ #include <cstddef>
++#include <optional>
++#include <string_view>
+ 
+ // PJRT C API includes
+ #include "xla/pjrt/c/pjrt_c_api.h"
+@@ -29,22 +31,32 @@ namespace tt::pjrt {
+ 
+ struct SerializationHeader {
+   // Serialization format:
+-  //   1. Header, 56 bytes
+-  //    1.1. Magic string: "TTSERv00", 8 bytes
+-  //    1.2  (Offset, Size) pairs for each section in data, 48 bytes
++  //   1. Header, 88 bytes
++  //    1.1. Magic string: "TTSERv01", 8 bytes
++  //    1.2  (Offset, Size) pairs for each section in data, 80 bytes
+   //     1.2.1. Offset + size for TTIR, 2*sizeof(u64)
+   //     1.2.2. Offset + size for TTNN, 2*sizeof(u64)
+   //     1.2.3. Offset + size for Flatbuffer, 2*sizeof(u64)
++  //     1.2.4. Offset + size for the original MLIR program, 2*sizeof(u64)
++  //     1.2.5. Offset + size for the serialized compile options, 2*sizeof(u64)
+   //   2. Body: variable size
+   //     2.1. TTIR, variable size
+   //     2.2. TTNN, variable size
+   //     2.3. Flatbuffer, variable size
++  //     2.4. Original MLIR program, variable size
++  //     2.5. Serialized CompileOptionsProto, variable size
+   // The offsets are relative to the start of the body.
+   // Subsections in 2. are **NOT** assumed to be contiguous.
+   // However the current serializer does pack them contiguously.
+   // Subsections in 2. are assumed to be in the order defined above.
+-  // Total size: 56: + (flatbuffer_offset + flatbuffer_size)
++  // Total size: 88: + (options_offset + options_size)
+   // This struct contains only the header part.
++  //
++  // PJRT_Executable_DeserializeAndLoad compiles the original program with its
++  // compile options up to TTIR, which gives the executable's arguments,
++  // outputs and shardings, and takes its TTNN program and flatbuffer from here.
++
++  static constexpr char c_magic[8] = {'T', 'T', 'S', 'E', 'R', 'v', '0', '1'};
+ 
+   char magic[8];
+   uint64_t ttir_offset;
+@@ -53,24 +65,44 @@ struct SerializationHeader {
+   uint64_t ttnn_size;
+   uint64_t fb_offset;
+   uint64_t fb_size;
++  uint64_t mlir_offset;
++  uint64_t mlir_size;
++  uint64_t options_offset;
++  uint64_t options_size;
++
++  SerializationHeader() = default;
+ 
+   SerializationHeader(const std::string &ttir_code,
+                       const std::string &ttnn_code,
+-                      const std::vector<std::byte> &flatbuffer_data)
++                      const std::vector<std::byte> &flatbuffer_data,
++                      const std::string &mlir_code,
++                      const std::string &compile_options)
+       : ttir_offset(0), ttir_size(ttir_code.size()),
+         ttnn_offset(ttir_offset + ttir_size), ttnn_size(ttnn_code.size()),
+-        fb_offset(ttnn_offset + ttnn_size), fb_size(flatbuffer_data.size()) {
+-    std::memcpy(magic, "TTSERv00", sizeof(magic));
++        fb_offset(ttnn_offset + ttnn_size), fb_size(flatbuffer_data.size()),
++        mlir_offset(fb_offset + fb_size), mlir_size(mlir_code.size()),
++        options_offset(mlir_offset + mlir_size),
++        options_size(compile_options.size()) {
++    std::memcpy(magic, c_magic, sizeof(magic));
+   }
+ 
+   size_t getHeaderSize() const { return sizeof(*this); }
+ 
+   size_t getPayloadSize() const {
+-    return getHeaderSize() + ttir_size + ttnn_size +
+-           fb_size; // only correct because we pack them contiguously
++    return getHeaderSize() + ttir_size + ttnn_size + fb_size + mlir_size +
++           options_size; // only correct because we pack them contiguously
+   }
+ };
+ 
++// The sections of a serialized executable that loading it needs, as views of
++// its payload.
++struct SerializedExecutableSections {
++  std::string_view ttnn_mlir;
++  std::string_view flatbuffer;
++  std::string_view mlir_code;
++  std::string_view compile_options;
++};
++
+ class SerializedExecutableInstance {
+ public:
+   // Creates new serialized executable instance from the executable image.
+@@ -98,6 +130,11 @@ public:
+   // Gets the size of the serialized payload in bytes.
+   size_t getSerializedPayloadSizeInBytes() const { return m_payload.size(); }
+ 
++  // Reads the sections of a payload that PJRT_Executable_Serialize wrote, or
++  // returns nothing for other bytes, such as those of another version.
++  static std::optional<SerializedExecutableSections>
++  parse(std::string_view payload);
++
+ private:
+   // Creates serialized executable instance from the executable image.
+   SerializedExecutableInstance(const ExecutableImage *executable_image);
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -39,6 +39,7 @@
+ #include "api/executable_image.h"
+ #include "api/memory_instance.h"
+ #include "api/module_builder/module_builder.h"
++#include "api/serialized_executable_instance.h"
+ #include "api/tensor_pool.h"
+ #include "utils/assert.h"
+ #include "utils/logging.h"
+@@ -404,6 +405,8 @@ void ClientInstance::bindApi(PJRT_Api *api) {
+       internal::onClientLookupAddressableDevice;
+   api->PJRT_Client_AddressableMemories = internal::onClientAddressableMemories;
+   api->PJRT_Client_Compile = internal::onClientCompile;
++  api->PJRT_Executable_DeserializeAndLoad =
++      internal::onExecutableDeserializeAndLoad;
+   api->PJRT_Client_DefaultDeviceAssignment =
+       internal::onClientDefaultDeviceAssignment;
+   api->PJRT_Client_BufferFromHostBuffer = internal::onBufferFromHostBuffer;
+@@ -520,7 +523,8 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+     const PJRT_Program *mlir_program, LoadedExecutableInstance **out_executable,
+     const std::unordered_map<std::string, std::string> &compile_options,
+     const std::optional<std::vector<int64_t>> &replica_device_ids,
+-    size_t target_num_devices) {
++    size_t target_num_devices, std::string_view serialized_compile_options,
++    const module_builder::CompiledProgram *compiled_program) {
+ 
+   static std::mutex compile_mutex;
+   const std::lock_guard<std::mutex> lock(compile_mutex);
+@@ -529,7 +533,8 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+ 
+   std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>> compile_result =
+       m_module_builder->buildModule(mlir_code, m_system_descriptor,
+-                                    compile_options, this, target_num_devices);
++                                    compile_options, this, target_num_devices,
++                                    compiled_program);
+   tt_pjrt_status status = std::get<tt_pjrt_status>(compile_result);
+   if (!tt_pjrt_status_is_ok(status)) {
+     return status;
+@@ -537,6 +542,8 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+ 
+   auto executable_image =
+       std::get<std::shared_ptr<ExecutableImage>>(compile_result);
++  executable_image->setSerializedCompileOptions(
++      std::string(serialized_compile_options));
+ 
+   std::vector<DeviceInstance *> addressable_devices;
+ 
+@@ -936,18 +943,21 @@ onClientAddressableMemories(PJRT_Client_AddressableMemories_Args *args) {
+   return nullptr;
+ }
+ 
+-PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
+-  ZoneScoped;
+-  DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_Client_Compile");
+-
++// Compiles a program with its serialized CompileOptionsProto, or loads it with
++// its compiled program.
++static PJRT_Error *
++compileProgram(PJRT_Client *client, const PJRT_Program *program,
++               std::string_view compile_options,
++               const module_builder::CompiledProgram *compiled_program,
++               PJRT_LoadedExecutable **out_executable) {
+   // Parse compile options and extract both custom options and replica device
+   // IDs
+   std::unordered_map<std::string, std::string> compile_options_map;
+   std::optional<std::vector<int64_t>> replica_device_ids;
+   tt_pjrt_status compile_options_status =
+       CompileOptionsParser::parseCompileOptions(
+-          args->compile_options, args->compile_options_size,
+-          compile_options_map, replica_device_ids);
++          compile_options.data(), compile_options.size(), compile_options_map,
++          replica_device_ids);
+   if (!tt_pjrt_status_is_ok(compile_options_status)) {
+     return *ErrorInstance::makeError(compile_options_status).release();
+   }
+@@ -963,19 +973,18 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
+   // devices and wrongly fires for a single-chip graph on a multi-chip host.
+   size_t target_num_devices =
+       static_cast<size_t>(CompileOptionsParser::extractNumPartitions(
+-          args->compile_options, args->compile_options_size));
++          compile_options.data(), compile_options.size()));
+ 
+-  std::string_view program_format(args->program->format,
+-                                  args->program->format_size);
++  std::string_view program_format(program->format, program->format_size);
+   if (program_format != module_builder::c_mlir_format_name) {
+     LOG_F(ERROR,
+           "Program code format \"%s\" is not supported, only MLIR format is "
+           "currently supported",
+-          args->program->format);
++          program->format);
+     return *ErrorInstance::makeError(tt_pjrt_status::kUnimplemented).release();
+   }
+ 
+-  ClientInstance *client_instance = ClientInstance::unwrap(args->client);
++  ClientInstance *client_instance = ClientInstance::unwrap(client);
+ 
+   // A bare status code would not say why compilation failed.
+   ScopedErrorCollector compile_errors;
+@@ -985,9 +994,9 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
+   // threads, where it would terminate the process.
+   try {
+     compile_status = client_instance->compileMlirProgram(
+-        args->program,
+-        reinterpret_cast<LoadedExecutableInstance **>(&args->executable),
+-        compile_options_map, replica_device_ids, target_num_devices);
++        program, reinterpret_cast<LoadedExecutableInstance **>(out_executable),
++        compile_options_map, replica_device_ids, target_num_devices,
++        compile_options, compiled_program);
+   } catch (const std::exception &error) {
+     return *ErrorInstance::makeError(tt_pjrt_status::kInternal, error.what())
+                 .release();
+@@ -1000,6 +1009,45 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
+   return *ErrorInstance::makeError(compile_status).release();
+ }
+ 
++PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
++  ZoneScoped;
++  DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_Client_Compile");
++
++  return compileProgram(
++      args->client, args->program,
++      std::string_view(args->compile_options, args->compile_options_size),
++      /*compiled_program=*/nullptr, &args->executable);
++}
++
++PJRT_Error *onExecutableDeserializeAndLoad(
++    PJRT_Executable_DeserializeAndLoad_Args *args) {
++  ZoneScoped;
++  DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_Executable_DeserializeAndLoad");
++
++  std::optional<SerializedExecutableSections> sections =
++      SerializedExecutableInstance::parse(std::string_view(
++          args->serialized_executable, args->serialized_executable_size));
++  if (!sections) {
++    return *ErrorInstance::makeError(
++                tt_pjrt_status::kInvalidArgument,
++                "Not an executable serialized by this version of the plugin")
++                .release();
++  }
++  module_builder::CompiledProgram compiled_program{
++      std::string(sections->ttnn_mlir),
++      tt::runtime::Binary(tt::runtime::Flatbuffer::loadFromMemory(
++          sections->flatbuffer.data(), sections->flatbuffer.size()))};
++  PJRT_Program program{
++      .struct_size = PJRT_Program_STRUCT_SIZE,
++      .extension_start = nullptr,
++      .code = const_cast<char *>(sections->mlir_code.data()),
++      .code_size = sections->mlir_code.size(),
++      .format = module_builder::c_mlir_format_name.data(),
++      .format_size = module_builder::c_mlir_format_name.size()};
++  return compileProgram(args->client, &program, sections->compile_options,
++                        &compiled_program, &args->loaded_executable);
++}
++
+ PJRT_Error *onClientDefaultDeviceAssignment(
+     PJRT_Client_DefaultDeviceAssignment_Args *args) {
+   ZoneScoped;
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -372,12 +372,19 @@ ModuleBuilder::buildModule(
+     const std::string_view &mlir_code,
+     const tt::runtime::SystemDesc &system_descriptor,
+     const std::unordered_map<std::string, std::string> &compile_options_map,
+-    ClientInstance *client_instance, size_t target_num_devices) {
++    ClientInstance *client_instance, size_t target_num_devices,
++    const CompiledProgram *compiled_program) {
+   DLOG_F(LOG_DEBUG, "ModuleBuilder::buildModule");
+ 
+   auto context = createMlirContext();
+ 
+   auto compile_options = CompileOptions::parse(compile_options_map);
++  // Only flatbuffer executables are serialized with their program.
++  if (compiled_program &&
++      compile_options.backend != BackendRuntime::TTNNFlatbuffer) {
++    LOG_F(ERROR, "Only flatbuffer executables can be loaded");
++    return {tt_pjrt_status::kInvalidArgument, nullptr};
++  }
+ 
+   // IR export keys dump filenames by export_model_name and appends _g{N} (e.g.
+   // resnet50_bs32_g0) so repeated dumps into one export_path don't collide.
+@@ -598,10 +605,14 @@ ModuleBuilder::buildModule(
+                      output_memory_kinds_sizes);
+ 
+   std::string ttnn_mlir;
+-  status = convertFromTTIRToTTNN(mlir_module, compile_options, client_instance,
+-                                 mesh_shape, ttnn_mlir);
+-  if (!tt_pjrt_status_is_ok(status)) {
+-    return {status, nullptr};
++  if (compiled_program) {
++    ttnn_mlir = compiled_program->ttnn_mlir;
++  } else {
++    status = convertFromTTIRToTTNN(mlir_module, compile_options,
++                                   client_instance, mesh_shape, ttnn_mlir);
++    if (!tt_pjrt_status_is_ok(status)) {
++      return {status, nullptr};
++    }
+   }
+ 
+   // TODO(mrakita): Use the VHLO module name from the module builder, if it has
+@@ -616,7 +627,8 @@ ModuleBuilder::buildModule(
+         std::move(num_arguments), num_devices_result, mesh_shape,
+         input_shardings, output_shardings, output_types,
+         std::move(output_memory_kinds), std::move(output_memory_kinds_sizes),
+-        std::move(optimized_mlir_code), std::move(compile_options));
++        std::move(optimized_mlir_code), std::move(compile_options),
++        compiled_program);
+   } else if (is_codegen_cpp || is_codegen_py) {
+     result = buildModuleForTTNNCodegen(
+         mlir_module, std::move(original_mlir_code), std::move(ttir_mlir),
+@@ -1504,28 +1516,33 @@ ModuleBuilder::buildModuleForTTNNRuntime(
+     const std::vector<PJRT_Buffer_Type> &output_types,
+     std::vector<const char *> &&output_memory_kinds,
+     std::vector<size_t> &&output_memory_kinds_sizes,
+-    std::string &&optimized_mlir_code, CompileOptions &&compile_options) {
+-  mlir::PassManager runtime_pm(mlir_module.get()->getName());
+-  mlir::tt::ttnn::TTNNCommonToRuntimePipelineOptions runtime_options;
+-  mlir::tt::ttnn::createTTNNCommonToRuntimePipeline(runtime_pm,
+-                                                    runtime_options);
+-  enableVerboseIRPrinting(runtime_pm);
+-  enableMlirPassTiming(runtime_pm);
+-
+-  mlir::LogicalResult mlir_result = runtime_pm.run(mlir_module.get());
+-  if (mlir::failed(mlir_result)) {
+-    LOG_F(ERROR, "Failed to run TTNNCommonToRuntime pipeline");
+-    return {tt_pjrt_status::kInternal, nullptr};
+-  }
++    std::string &&optimized_mlir_code, CompileOptions &&compile_options,
++    const CompiledProgram *compiled_program) {
++  tt::runtime::Binary flatbuffer(nullptr);
++  if (compiled_program) {
++    flatbuffer = compiled_program->flatbuffer;
++  } else {
++    mlir::PassManager runtime_pm(mlir_module.get()->getName());
++    mlir::tt::ttnn::TTNNCommonToRuntimePipelineOptions runtime_options;
++    mlir::tt::ttnn::createTTNNCommonToRuntimePipeline(runtime_pm,
++                                                      runtime_options);
++    enableVerboseIRPrinting(runtime_pm);
++    enableMlirPassTiming(runtime_pm);
++
++    mlir::LogicalResult mlir_result = runtime_pm.run(mlir_module.get());
++    if (mlir::failed(mlir_result)) {
++      LOG_F(ERROR, "Failed to run TTNNCommonToRuntime pipeline");
++      return {tt_pjrt_status::kInternal, nullptr};
++    }
+ 
+-  printModule(mlir_module, compile_options.export_path, "ttnn_runtime",
+-              compile_options.export_model_name);
++    printModule(mlir_module, compile_options.export_path, "ttnn_runtime",
++                compile_options.export_model_name);
+ 
+-  tt::runtime::Binary flatbuffer(nullptr);
+-  tt_pjrt_status status = createFlatbufferBinary(mlir_module, input_shardings,
+-                                                 output_shardings, flatbuffer);
+-  if (!tt_pjrt_status_is_ok(status)) {
+-    return {status, nullptr};
++    tt_pjrt_status status = createFlatbufferBinary(
++        mlir_module, input_shardings, output_shardings, flatbuffer);
++    if (!tt_pjrt_status_is_ok(status)) {
++      return {status, nullptr};
++    }
+   }
+ 
+   if (compile_options.export_path.has_value()) {
+diff --git a/pjrt_implementation/src/api/serialized_executable_instance.cc b/pjrt_implementation/src/api/serialized_executable_instance.cc
+--- a/pjrt_implementation/src/api/serialized_executable_instance.cc
++++ b/pjrt_implementation/src/api/serialized_executable_instance.cc
+@@ -48,7 +48,11 @@ SerializedExecutableInstance::SerializedExecutableInstance(
+     flatbuffer_data.resize(0);
+   }
+ 
+-  SerializationHeader header(ttir_code, ttnn_code, flatbuffer_data);
++  const std::string &mlir_code = executable_image->getOriginalMlirCode();
++  const std::string &compile_options =
++      executable_image->getSerializedCompileOptions();
++  SerializationHeader header(ttir_code, ttnn_code, flatbuffer_data, mlir_code,
++                             compile_options);
+   m_payload.resize(header.getPayloadSize());
+ 
+   std::byte *data_ptr = m_payload.data();
+@@ -57,10 +61,44 @@ SerializedExecutableInstance::SerializedExecutableInstance(
+   data_ptr = writeRaw(data_ptr, ttir_code.data(), ttir_code.size());
+   data_ptr = writeRaw(data_ptr, ttnn_code.data(), ttnn_code.size());
+   data_ptr = writeRaw(data_ptr, flatbuffer_data.data(), flatbuffer_data.size());
++  data_ptr = writeRaw(data_ptr, mlir_code.data(), mlir_code.size());
++  data_ptr = writeRaw(data_ptr, compile_options.data(), compile_options.size());
+ 
+   // assert that we wrote the correct number of bytes
+   TT_FATAL(data_ptr == m_payload.data() + m_payload.size(),
+            "Written bytes don't match payload size");
+ }
+ 
++std::optional<SerializedExecutableSections>
++SerializedExecutableInstance::parse(std::string_view payload) {
++  SerializationHeader header;
++  if (payload.size() < sizeof(header)) {
++    return std::nullopt;
++  }
++  std::memcpy(&header, payload.data(), sizeof(header));
++  if (std::memcmp(header.magic, SerializationHeader::c_magic,
++                  sizeof(header.magic)) != 0) {
++    return std::nullopt;
++  }
++  std::string_view body = payload.substr(sizeof(header));
++  bool in_bounds = true;
++  auto section = [&](uint64_t offset, uint64_t size) {
++    if (offset > body.size() || size > body.size() - offset) {
++      in_bounds = false;
++      return std::string_view();
++    }
++    return body.substr(offset, size);
++  };
++  SerializedExecutableSections sections{
++      .ttnn_mlir = section(header.ttnn_offset, header.ttnn_size),
++      .flatbuffer = section(header.fb_offset, header.fb_size),
++      .mlir_code = section(header.mlir_offset, header.mlir_size),
++      .compile_options = section(header.options_offset, header.options_size)};
++  // Only flatbuffer executables can be loaded.
++  if (!in_bounds || sections.flatbuffer.empty()) {
++    return std::nullopt;
++  }
++  return sections;
++}
++
+ } // namespace tt::pjrt
+diff --git a/pjrt_implementation/src/stubs.inc b/pjrt_implementation/src/stubs.inc
+--- a/pjrt_implementation/src/stubs.inc
++++ b/pjrt_implementation/src/stubs.inc
+@@ -80,10 +80,6 @@
+   // https://github.com/tenstorrent/tt-xla/issues/496
+   _STUB(PJRT_Executable_GetCompiledMemoryStats);
+ 
+-  // Deserialization of our executable is not yet supported.
+-  // https://github.com/tenstorrent/tt-xla/issues/498
+-  _STUB(PJRT_Executable_DeserializeAndLoad);
+-
+   // Designed to override already serialized options, but since deserialization
+   // is not yet supported, there is no benefit to implementing this yet.
+   _STUB(PJRT_Executable_GetCompileOptions);

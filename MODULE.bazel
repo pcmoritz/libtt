@@ -503,6 +503,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_system_descriptor_in_memory.patch",
         "//third_party/tt_xla:tt_xla_tpu_compat_platform.patch",
         "//third_party/tt_xla:tt_xla_device_buffers.patch",
+        "//third_party/tt_xla:tt_xla_executable_deserialize.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
