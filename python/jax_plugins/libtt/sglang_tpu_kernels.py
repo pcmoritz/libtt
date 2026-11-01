@@ -11,7 +11,7 @@ packing, head_dim]`, puts K and V of a head in the last two dimensions, which
 Tenstorrent tiles pad from 2 rows to 32. The fused pool therefore allocates
 `[pages, kv_heads, page_size, 2 * head_dim]` per layer instead, a head's key
 and value side by side in one row, which is the layout of TTNN's paged cache
-operations, and the only one the kernel reads. A single token's row is
+operations, and the only one the kernel reads. Each token's row is
 written by TTNN's paged cache update, and a batch of no more
 tokens than sequence slots, such as a decode batch, runs TTNN's paged decode
 attention: given the cache as both keys and values and the queries padded with
@@ -99,22 +99,17 @@ def _ragged_paged_attention(module):
         # pool.
         user_pages = table[seq, : min(pages_per_seq, pages - 1)]
         user_positions = jnp.where(live, position, -1)
-        if tokens == 1:
+        # One TTNN paged update per token, in place. The updates run in order,
+        # so tokens of one sequence never write a page's tile at the same time.
+        # A scatter instead tilized and copied the layer's whole cache on every
+        # call.
+        cache = kv_cache_fused
+        for t in range(tokens):
             cache = jax.ffi.ffi_call(
                 "tt.paged_update_cache",
                 jax.ShapeDtypeStruct(cache_shape, kv_cache_fused.dtype),
                 input_output_aliases={0: 0},
-            )(kv_cache_fused, new_kv[None], user_positions, user_pages)
-        else:
-            # Tokens of one sequence may share a page, which TTNN's paged
-            # update writes concurrently.
-            page = table.reshape(-1)[seq * pages_per_seq + position // page_size]
-            rows = (page[:, None] * cache_heads + jnp.arange(cache_heads)[None, :]) * page_size
-            rows = rows + (position % page_size)[:, None]
-            rows = jnp.where(live[:, None], rows, pages * cache_heads * page_size)
-            cache = kv_cache_fused.reshape(pages * cache_heads * page_size, row)
-            cache = cache.at[rows.reshape(-1)].set(new_kv.reshape(-1, row), mode="drop")
-            cache = cache.reshape(cache_shape)
+            )(cache, new_kv[None, t : t + 1], user_positions[t : t + 1], user_pages[t : t + 1])
         # Each token as a decode user reads its sequence's pages once, which
         # beats gathering them below when there are few tokens per sequence.
         if (
