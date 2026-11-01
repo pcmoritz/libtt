@@ -1,6 +1,6 @@
-diff --git a/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h b/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
---- a/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
-+++ b/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
+diff --git ma/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h mb/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
+--- ma/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
++++ mb/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
 @@ -31,6 +31,7 @@ inline const llvm::SmallVector<llvm::SmallVector<int64_t, 2>> SupportedMeshes =
        {1, 16},
        {1, 32},
@@ -9,9 +9,9 @@ diff --git a/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h b/include/tt
        {2, 2},
        {2, 4},
        {2, 8},
-diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp b/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
---- a/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
-+++ b/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
+diff --git ma/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp mb/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
+--- ma/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
++++ mb/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
 @@ -51,12 +51,15 @@ public:
      // Disable tt-metal backtrace generation.
      setenv("TT_METAL_DISABLE_BACKTRACE", "1", 1);
@@ -30,10 +30,10 @@ diff --git a/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
        op_model::SingletonDeviceContext::getInstance().openMockDevice();
      }
  
-diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
---- a/runtime/lib/ttnn/runtime.cpp
-+++ b/runtime/lib/ttnn/runtime.cpp
-@@ -1173,9 +1173,15 @@ std::vector<::tt::runtime::Tensor> toHost(::tt::runtime::Tensor tensor,
+diff --git ma/runtime/lib/ttnn/runtime.cpp mb/runtime/lib/ttnn/runtime.cpp
+--- ma/runtime/lib/ttnn/runtime.cpp
++++ mb/runtime/lib/ttnn/runtime.cpp
+@@ -1169,9 +1169,15 @@ std::vector<::tt::runtime::Tensor> toHost(::tt::runtime::Tensor tensor,
        ::tt::runtime::ttnn::toHostSingleTensor(tensorWrapper, untilize,
                                                blocking);
  
@@ -50,5 +50,5 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +        singleTensors.emplace_back(buffer, hostTensor.tensor_spec());
 +      });
  
-   const std::optional<::ttnn::MeshEvent> &meshEvent =
-       tensorWrapper.getMeshEvent();
+   // A non-blocking read records its event on the host tensor it returns, which
+   // the per-device host tensors must carry for wait() to cover the read.
