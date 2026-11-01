@@ -11,7 +11,8 @@
   does on a TPU, which libtt doesn't trace.
 - torch_tpu's flash attention is a Pallas kernel that only TPUs run, so
   `scaled_dot_product_attention` takes its StableHLO implementation instead.
-- SGLang-TorchTPU's attention kernel runs as JAX (`sglang_tpu_kernels`).
+- SGLang-TorchTPU's attention kernel runs as JAX (`sglang_tpu_kernels`), and
+  so do its quantized linear and fused MoE kernels (`sglang_tpu_quant_kernels`).
 """
 
 import importlib.abc
@@ -65,7 +66,7 @@ os.environ.setdefault("TPU_LIBRARY_PATH", str(pathlib.Path(__file__).with_name("
 # libtt.so reads it too; torch_tpu's tests turn compatibility mode on by import.
 os.environ["LIBTT_TPU_COMPAT"] = "1"
 
-from jax_plugins.libtt import sglang_tpu_kernels  # noqa: E402
+from jax_plugins.libtt import sglang_tpu_kernels, sglang_tpu_quant_kernels  # noqa: E402
 
 sys.meta_path.insert(
     0,
@@ -73,6 +74,7 @@ sys.meta_path.insert(
         {
             _HARDWARE_MODULE: _patch_hardware,
             **sglang_tpu_kernels.PATCHES,
+            **sglang_tpu_quant_kernels.PATCHES,
         }
     ),
 )
