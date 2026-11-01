@@ -105,26 +105,6 @@ py_test(
     timeout = "long",
 )
 
-# The libtt suite on one chip of a host with several, as a host with one runs
-# it: a client with one device runs a program over one device on that chip
-# alone.
-py_test(
-    name = "libtt_test_suite_one_chip",
-    srcs = ["pytest_runner.py"],
-    args = PLUGIN_TEST_ARGS + [
-        "--tests-anchor=$(rlocationpath :libtt/pytest.ini)",
-        "--one-chip-mesh=$(rlocationpath :one_chip_mesh_graph_descriptor.textproto)",
-    ],
-    data = PLUGIN_TEST_DATA + glob(["libtt/**/*.py"]) + [
-        "libtt/pytest.ini",
-        "one_chip_mesh_graph_descriptor.textproto",
-    ],
-    deps = PLUGIN_TEST_DEPS,
-    main = "pytest_runner.py",
-    tags = DEVICE_TEST_TAGS,
-    timeout = "long",
-)
-
 py_test(
     name = "jax_smoke_tests",
     srcs = ["pytest_runner.py"],

@@ -52,7 +52,7 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
    } else {
      if (cannot_borrow_host_buffer) {
        runtime_tensor = tt::runtime::createOwnedHostTensor(
-@@ -355,6 +379,38 @@ void BufferInstance::copyFromHost(
+@@ -355,6 +379,37 @@ void BufferInstance::copyFromHost(
    *out_done_with_host_buffer_event = done_with_host_buffer_event.release();
  }
  
@@ -84,8 +84,7 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
 +    return false;
 +  }
 +  ClientInstance *client = GlobalClientInstanceSingleton::getClientInstance();
-+  return client != nullptr && !client->isCompileOnly() &&
-+         client->getDevicesRaw().size() == 1 && client->parentMesh();
++  return client->getDevicesRaw().size() == 1 && client->parentMesh();
 +}
 +
  void BufferInstance::copyFromBuffer(BufferInstance *src_buffer) {

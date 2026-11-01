@@ -26,7 +26,7 @@ import time
 
 # Bazel's Python bootstrap doesn't put this directory on the path.
 sys.path.insert(0, str(Path(__file__).parent))
-from pytest_runner import _rlocation, extract_plugin_wheel, use_one_chip  # noqa: E402
+from pytest_runner import _rlocation, extract_plugin_wheel  # noqa: E402
 
 # Once a process logs one of these, the device fails every later file.
 DEVICE_HANG_MARKERS = ("NOC0 is hung", "MMIO per-op timeout")
@@ -96,6 +96,15 @@ def _counts(log: str) -> collections.Counter:
                     counts[kind.replace("errors", "error")] += int(number)
             break
     return counts
+
+
+def use_one_chip(mesh_graph_descriptor: str) -> None:
+    """Runs the tests on the first chip only, as on a host with one chip;
+    `mesh_graph_descriptor` is the runfile of a mesh graph descriptor of one."""
+    os.environ["TT_VISIBLE_DEVICES"] = "0"
+    os.environ["TT_MESH_GRAPH_DESC_PATH"] = str(
+        _rlocation(mesh_graph_descriptor).resolve(strict=True)
+    )
 
 
 def main() -> int:

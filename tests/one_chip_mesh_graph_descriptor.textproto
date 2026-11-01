@@ -1,5 +1,5 @@
 # One Blackhole chip, for running the tests on one chip of a host with several
-# (pytest_runner.py --one-chip-mesh).
+# (torch_tpu_runner.py --one-chip-mesh).
 mesh_descriptors {
   name: "M0"
   arch: BLACKHOLE
