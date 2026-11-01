@@ -405,6 +405,7 @@ http_archive(
     patch_args = ["-p1"],
     patches = [
         "//third_party/tt_xla:llvm_bazel9_cc_rules.patch",
+        "//third_party/tt_xla:llvm_float_type_bytecode.patch",
     ],
     sha256 = "4860ff3400d59eccaf3b9f399432d5f8494c2f19a815069a314eb9cf10042822",
     strip_prefix = "llvm-project-4efe170d858eb54432f520abb4e7f0086236748b",
