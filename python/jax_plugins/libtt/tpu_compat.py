@@ -7,6 +7,8 @@
   defaults to this package's `libtt.so`.
 - torch_tpu only opens a device when its PCI scan finds a Google TPU, so its
   device count reports the Tenstorrent chips instead.
+- libtt reports the platform as "tpu", so torch_tpu compiles its eager ops as it
+  does on a TPU, which libtt doesn't trace.
 - torch_tpu's flash attention is a Pallas kernel that only TPUs run, so
   `scaled_dot_product_attention` takes its StableHLO implementation instead.
 """
@@ -50,4 +52,6 @@ class _PatchTorchTpu(importlib.abc.MetaPathFinder):
 
 
 os.environ.setdefault("TPU_LIBRARY_PATH", str(pathlib.Path(__file__).with_name("libtt.so")))
+# libtt.so reads it too; torch_tpu's tests turn compatibility mode on by import.
+os.environ["LIBTT_TPU_COMPAT"] = "1"
 sys.meta_path.insert(0, _PatchTorchTpu())
