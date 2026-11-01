@@ -30,6 +30,7 @@ single-process TP2 launch recipe and multi-chip regression tests.
 
 See [PyTorch with torch_tpu](docs/torch-tpu.md): with `LIBTT_TPU_COMPAT=1`,
 torch_tpu runs on Tenstorrent devices through `libtt.so`.
+[SGLang-TorchTPU](docs/sglang-torchtpu.md) serves models through it.
 
 ## JAX tests
 
