@@ -1,7 +1,16 @@
 diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
 --- a/pjrt_implementation/inc/api/client_instance.h
 +++ b/pjrt_implementation/inc/api/client_instance.h
-@@ -67,6 +67,10 @@
+@@ -53,6 +53,8 @@ public:
+   static ClientInstance *getClientInstance();
+   static PJRT_Error *initClient();
+   static void destroyClient();
++  // Closes the device of a client that is still alive at exit.
++  static void closeDeviceAtExit();
+ 
+ private:
+   GlobalClientInstanceSingleton(std::unique_ptr<ClientInstance> client_instance)
+@@ -67,6 +69,10 @@ private:
    // create a new client before destroying the old one (e.g. after
    // `jax.clear_backends()`), so they share one instance, which owns the device.
    int m_ref_count = 0;
@@ -15,7 +24,15 @@ diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
 --- a/pjrt_implementation/src/api/client_instance.cc
 +++ b/pjrt_implementation/src/api/client_instance.cc
-@@ -275,6 +275,9 @@
+@@ -18,6 +18,7 @@
+ #include <map>
+ #include <mutex>
+ #include <optional>
++#include <thread>
+ 
+ // system includes
+ #include <unistd.h>
+@@ -275,6 +276,9 @@ static tt_pjrt_status setMemoryLogLevel() {
  
  PJRT_Error *GlobalClientInstanceSingleton::initClient() {
    GlobalClientInstanceSingleton &singleton_instance = getInstance();
@@ -25,7 +42,20 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    if (singleton_instance.isInitialized()) {
      ++singleton_instance.m_ref_count;
      return nullptr;
-@@ -294,6 +297,7 @@
+@@ -288,12 +292,20 @@ PJRT_Error *GlobalClientInstanceSingleton::initClient() {
+ 
+   singleton_instance.m_client_instance = std::move(client);
+   singleton_instance.m_ref_count = 1;
++  // Closes the device of a client still alive at exit, such as torch_tpu's:
++  // left open, a multi-chip mesh keeps its fabric routers running into the
++  // next process. Opening the device registered tt-metal's exit handler, which
++  // tears down its context; exit handlers run in reverse order, so this one
++  // runs before it.
++  static const int close_at_exit = std::atexit(closeDeviceAtExit);
++  (void)close_at_exit;
+ 
+   return nullptr;
+ }
  
  void GlobalClientInstanceSingleton::destroyClient() {
    GlobalClientInstanceSingleton &singleton_instance = getInstance();
@@ -33,7 +63,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    if (singleton_instance.isInitialized() &&
        --singleton_instance.m_ref_count == 0) {
      singleton_instance.m_client_instance.reset();
-@@ -301,13 +305,17 @@
+@@ -301,13 +313,32 @@ void GlobalClientInstanceSingleton::destroyClient() {
  }
  
  GlobalClientInstanceSingleton &GlobalClientInstanceSingleton::getInstance() {
@@ -41,11 +71,26 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 -      GlobalClientInstanceSingleton(nullptr);
 -  return singleton;
 +  // Process-wide, since a framework may create and destroy the client on
-+  // different threads. Never destroyed: a client that is still alive at exit
-+  // must not close the device after tt-metal's thread-local state is gone.
++  // different threads. Never destroyed: it exists before tt-metal does, so its
++  // destructor would run after tt-metal's exit handler tore down its context.
++  // `initClient` registers an exit handler that closes the device before.
 +  static GlobalClientInstanceSingleton *singleton =
 +      new GlobalClientInstanceSingleton(nullptr);
 +  return *singleton;
++}
++
++void GlobalClientInstanceSingleton::closeDeviceAtExit() {
++  GlobalClientInstanceSingleton &singleton_instance = getInstance();
++  std::lock_guard<std::mutex> lock(singleton_instance.m_mutex);
++  if (singleton_instance.isInitialized()) {
++    // On a thread of its own: the exiting thread's thread-local objects are
++    // destroyed before exit handlers run, and closing the device uses
++    // tt-metal's, such as the graph tracker's processors, which opening the
++    // device added a shared memory tracker to.
++    std::thread([&singleton_instance] {
++      singleton_instance.m_client_instance->closeMeshDevice();
++    }).join();
++  }
  }
  
  ClientInstance *GlobalClientInstanceSingleton::getClientInstance() {
