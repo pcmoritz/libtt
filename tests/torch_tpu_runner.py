@@ -98,6 +98,15 @@ def _counts(log: str) -> collections.Counter:
     return counts
 
 
+def use_one_chip(mesh_graph_descriptor: str) -> None:
+    """Runs the tests on the first chip only, as on a host with one chip;
+    `mesh_graph_descriptor` is the runfile of a mesh graph descriptor of one."""
+    os.environ["TT_VISIBLE_DEVICES"] = "0"
+    os.environ["TT_MESH_GRAPH_DESC_PATH"] = str(
+        _rlocation(mesh_graph_descriptor).resolve(strict=True)
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -134,7 +143,14 @@ def main() -> int:
         default=3600,
         help="Seconds after which a test file's process is killed.",
     )
+    parser.add_argument(
+        "--one-chip-mesh",
+        help="Runfile of a mesh graph descriptor of one chip: the tests run on "
+        "the first chip only, as on a host with one.",
+    )
     args, rest = parser.parse_known_args()
+    if args.one_chip_mesh:
+        use_one_chip(args.one_chip_mesh)
 
     root = _rlocation(args.tests_anchor).resolve(strict=True).parent
     plugin_wheel = _rlocation(args.jax_plugin_wheel).resolve(strict=True)

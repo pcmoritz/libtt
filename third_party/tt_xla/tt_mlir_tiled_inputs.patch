@@ -1,0 +1,32 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+@@ -792,13 +792,6 @@ private:
+       return false;
+     }
+ 
+-    for (Operation *user : arg.getUsers()) {
+-      // MeshShardOp inputs should be tiled.
+-      if (mlir::isa<ttir::MeshShardOp, ttir::TTLangOp>(user)) {
+-        return false;
+-      }
+-    }
+-
+     // ttnn.embedding reads the indices and the table as row-major sticks and
+     // rejects a tiled operand outright. If that is all the argument feeds,
+     // convert at the boundary instead: the runtime does it once at bind time
+@@ -816,10 +809,10 @@ private:
+       return true;
+     }
+ 
+-    if (auto typeAttr = owningFunc.getArgAttrOfType<ttcore::ArgumentTypeAttr>(
+-            arg.getArgNumber(), ttcore::ArgumentTypeAttr::name)) {
+-      return typeAttr.getValue() == ttcore::ArgumentType::Input;
+-    }
++    // Other inputs take the tiled device layout that results have too, as a
++    // TPU buffer has the device's own layout: a buffer then gets that layout
++    // once, when it is first needed on device, and a program that reads it, or
++    // the result of another program, doesn't tilize it on every call.
+     return false;
+   }
+ 
