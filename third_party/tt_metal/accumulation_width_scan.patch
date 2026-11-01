@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
 --- ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
-@@ -6,15 +6,31 @@
+@@ -6,15 +6,34 @@
  #include "ttnn/operations/data_movement/clone/clone.hpp"
  #include "ttnn/operations/data_movement/copy/copy.hpp"
  #include "ttnn/operations/copy/typecast/typecast.hpp"
@@ -14,11 +14,14 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.c
 +namespace {
 +
 +// Tiles per chunk of a width scan, each chunk scanned from zero on its own core: enough chunks for the
-+// rows to cover the cores, chunks of at least 16 tiles, and at most 128 (4096 elements), which bounds
-+// each sequential FP32 sum. The last chunk of a row may be shorter.
-+uint32_t width_scan_chunk_tiles(uint32_t rows, uint32_t row_tiles, uint32_t cores) {
++// rows to cover the cores, and chunks of at least 16 tiles. FP32 chunks hold at most 128 tiles (4096
++// elements), which bounds each sequential sum's error; integers add exactly, so their chunks only
++// cover the cores, which keeps the offsets pass from reading back the totals of thousands of chunks.
++// The last chunk of a row may be shorter.
++uint32_t width_scan_chunk_tiles(uint32_t rows, uint32_t row_tiles, uint32_t cores, bool exact) {
 +    const uint32_t chunks_per_row = (cores + rows - 1) / rows;
-+    return std::clamp<uint32_t>((row_tiles + chunks_per_row - 1) / chunks_per_row, 16, 128);
++    const uint32_t tiles = std::max<uint32_t>((row_tiles + chunks_per_row - 1) / chunks_per_row, 16);
++    return exact ? tiles : std::min<uint32_t>(tiles, 128);
 +}
 +
 +}  // namespace
@@ -34,7 +37,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.c
      Tensor processed_tensor = input_tensor;
      const auto& input_dtype = input_tensor.dtype();
      if (dtype.has_value() && (input_dtype != *dtype)) {
-@@ -40,6 +56,12 @@ Tensor preprocess_input_tensor(
+@@ -40,6 +59,12 @@ Tensor preprocess_input_tensor(
              final_cum_axis += (FOUR_DIMENSIONS - input_rank);
          }
  
@@ -47,7 +50,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.c
          // Create permutation that just swaps cumulation axis with the first dim
          permutation = std::decay_t<decltype(permutation)>(final_rank);
          std::iota(permutation.begin(), permutation.end(), FIRST_DIMENSION);
-@@ -63,7 +85,10 @@ Tensor postprocess_output_tensor(
+@@ -63,7 +88,10 @@ Tensor postprocess_output_tensor(
      Tensor processed_tensor = output_tensor;
  
      if (original_rank - dim < FOUR_DIMENSIONS) {
@@ -59,7 +62,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.c
          if (original_rank < FOUR_DIMENSIONS) {
              processed_tensor = ttnn::reshape(processed_tensor, original_shape);
          }
-@@ -135,19 +160,68 @@ Tensor accumulation_invoke(
+@@ -135,19 +163,69 @@ Tensor accumulation_invoke(
      // Normalize negative dim
      const int32_t cum_axis = (dim < 0) ? (dim + input_rank) : dim;
  
@@ -90,7 +93,8 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.c
 +        const uint32_t row_tiles = wip_tensor.padded_shape()[-1] / tile.get_width();
 +        const uint32_t rows = wip_tensor.physical_volume() / tile.get_tile_hw() / row_tiles;
 +        const auto grid = wip_tensor.device()->compute_with_storage_grid_size();
-+        const uint32_t tiles = width_scan_chunk_tiles(rows, row_tiles, grid.x * grid.y);
++        const uint32_t tiles =
++            width_scan_chunk_tiles(rows, row_tiles, grid.x * grid.y, scan_dtype != DataType::FLOAT32);
 +        const uint32_t chunks = (row_tiles + tiles - 1) / tiles;
 +        if (chunks > 1) {
 +            chunk_tiles = tiles;

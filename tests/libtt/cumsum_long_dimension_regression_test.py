@@ -50,6 +50,19 @@ def test_32_bit_integers(shape, dtype):
     np.testing.assert_array_equal(np.asarray(got), np.cumsum(x, axis=-1, dtype=dtype))
 
 
+
+@pytest.mark.parametrize("dtype", [np.int32, np.uint32])
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_32_bit_integers_along_either_axis(axis, reverse, dtype):
+    # Integers far past float32's precision, whose sums wrap around, along the first axis (which
+    # ttnn permutes to the front) and the last (the width scan), forward and in reverse.
+    info = np.iinfo(dtype)
+    x = np.random.default_rng(1).integers(info.min, info.max, (37, 300), dtype=dtype, endpoint=True)
+    got = jax.jit(lambda x: jax.lax.cumsum(x, axis=axis, reverse=reverse))(device_put(x))
+    expected = np.cumsum(np.flip(x, axis) if reverse else x, axis=axis, dtype=dtype)
+    np.testing.assert_array_equal(np.asarray(got), np.flip(expected, axis) if reverse else expected)
+
 def test_infinities_and_nan():
     # No compensation term: an infinity stays infinite, a NaN propagates forward only.
     x = np.ones((3, 8192), np.float32)
