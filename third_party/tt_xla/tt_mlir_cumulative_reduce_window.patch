@@ -49,7 +49,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
          return success();
        }
      }
-@@ -3448,6 +3446,37 @@ private:
+@@ -3448,6 +3446,41 @@ private:
      return success();
    }
  
@@ -61,8 +61,12 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +      ConversionPatternRewriter &rewriter) const {
 +    RankedTensorType resultType = cast<RankedTensorType>(
 +        getTypeConverter()->convertType(srcOp.getResult(0).getType()));
++    // TTNN sums 32-bit integers exactly; other integers are computed in f32.
++    Type elementType = resultType.getElementType();
 +    RankedTensorType computeType = resultType.clone(
-+        getComputeElementType(resultType, rewriter));
++        std::is_same_v<CumulativeOp, ttir::CumSumOp> && elementType.isInteger(32)
++            ? elementType
++            : getComputeElementType(resultType, rewriter));
 +    DenseI64ArrayAttr dimensions =
 +        rewriter.getDenseI64ArrayAttr({match.dimension});
 +    Value input = castToElementType(rewriter, srcOp.getLoc(),
@@ -87,7 +91,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // This function verifies all the required conditions to convert stablehlo
    // reduce_window op to TTIR cumsum op and also determine the dimension
    // attribute along which the cumulative sum will be computed.
-@@ -3467,16 +3496,15 @@ private:
+@@ -3467,16 +3500,15 @@ private:
    // 2. (If padding is non-splat vector): Window dimension attribute must have
    //    all elements equal to 1 except one; whose location is the required
    //    dimension and value must be equal to size of the required dimension.
@@ -107,7 +111,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return std::nullopt;
      }
  
-@@ -3485,13 +3513,13 @@ private:
+@@ -3485,13 +3517,13 @@ private:
        return std::nullopt;
      }
  
@@ -124,7 +128,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    }
  
    // This function verifies all the required conditions to convert stablehlo
-@@ -3513,16 +3541,15 @@ private:
+@@ -3513,16 +3545,15 @@ private:
    // 2. (If padding is non-splat vector): Window dimension attribute must have
    //    all elements equal to 1 except one; whose location is the required
    //    dimension and value must be equal to size of the required dimension.
@@ -144,7 +148,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return std::nullopt;
      }
  
-@@ -3531,13 +3558,13 @@ private:
+@@ -3531,13 +3562,13 @@ private:
        return std::nullopt;
      }
  
@@ -161,7 +165,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    }
  
    // Helper function to find the StableHLO constant defining op by traversing
-@@ -3556,6 +3583,19 @@ private:
+@@ -3556,6 +3587,19 @@ private:
      return mlir::dyn_cast_if_present<mlir::stablehlo::ConstantOp>(valueDef);
    }
  
@@ -181,7 +185,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    // Extract constant initialization values.
    std::optional<llvm::SmallVector<TypicalInitReductionValue>>
    extractInitValues(mlir::stablehlo::ReduceWindowOp &srcOp) const {
-@@ -3622,7 +3662,7 @@ private:
+@@ -3622,7 +3666,7 @@ private:
    // dimension.
    bool hasValidInputAndPadding(mlir::stablehlo::ReduceWindowOp &srcOp,
                                 mlir::stablehlo::ReduceWindowOp::Adaptor adaptor,
@@ -190,7 +194,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
                                 DenseI64ArrayAttr padding) const {
      RankedTensorType inputType = mlir::cast<RankedTensorType>(
          getTypeConverter()->convertType(srcOp.getInputs()[0].getType()));
-@@ -3645,13 +3685,13 @@ private:
+@@ -3645,13 +3689,13 @@ private:
          return false;
        }
        // Determine the dimension using input tensor shape.
@@ -206,7 +210,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
    }
  
    // Finds the first dimension of the input with size == 1.
-@@ -3671,7 +3711,7 @@ private:
+@@ -3671,7 +3715,7 @@ private:
    bool validateNonSplatPadding(llvm::ArrayRef<int64_t> windowDimensions,
                                 DenseI64ArrayAttr padding,
                                 RankedTensorType inputType,
@@ -215,7 +219,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      int64_t dimArgValue = -1;
      int64_t idx = -1;
  
-@@ -3685,25 +3725,34 @@ private:
+@@ -3685,25 +3729,34 @@ private:
          return false; // Ensure only one non-1 element.
        }
        dimArgValue = windowDim;
