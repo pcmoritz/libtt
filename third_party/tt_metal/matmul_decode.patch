@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
  #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
  #include "ttnn/types.hpp"
  #include <algorithm>
-@@ -1024,16 +1025,268 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
+@@ -1024,16 +1025,278 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
  }
  }  // namespace bmm_op_utils
  
@@ -250,6 +250,16 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +                if (Kt % w == 0 && w * group <= 16 && (group * Kt < 16 || Kt / w >= 4)) {
 +                    decode_config.in0_block_w = w;
 +                }
++            }
++            // A transposed weight keeps each output tile's K tiles in a row
++            // of consecutive pages, so a narrow block reads the same few DRAM
++            // banks for every output tile on every core: take one K tile from
++            // each bank (Qwen3-8B's gate and up projection [4096, 24576] on
++            // one chip 544 -> 461 us, Qwen3-32B's [5120, 12800] on four chips
++            // 528 -> 290 us, a [4096, 37984] LM head 822 -> 687 us).
++            const uint32_t banks = input_tensor_b.device()->allocator()->get_num_banks(tt::tt_metal::BufferType::DRAM);
++            if (transpose_b && decode_config.in0_block_w < banks && Kt % banks == 0) {
++                decode_config.in0_block_w = banks;
 +            }
 +        }
 +        // Only for BF16 outputs: matmul_decode reads BF16 activations only, so an
