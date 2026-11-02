@@ -76,17 +76,24 @@ diff --git a/pjrt_implementation/src/api/compile_options.cc b/pjrt_implementatio
    // By default, export tensors for codegen paths.
    options.export_tensors =
        internal::parseBoolOption(compile_options, "export_tensors")
-@@ -170,6 +185,10 @@ std::optional<std::string> CompileOptions::validate(
+@@ -170,12 +185,16 @@ std::optional<std::string> CompileOptions::validate(
        // XLA consumes these options. TT-XLA has no equivalent behavior, but
        // accepts them for PJRT compatibility.
        "xla_embed_ir_in_executable",
-+      // torch_tpu's options for a TPU, in TPU compatibility mode.
++      // torch_tpu's optimization level for a TPU, in TPU compatibility mode.
 +      CompileOptions::xla_optimization_level_key,
-+      "xla_tpu_autofdo",
-+      "xla_tpu_vmem_scavenging_mode",
        "xla_dump_max_hlo_modules",
        "xla_gpu_auto_spmd_partitioning_memory_budget_ratio",
    };
+ 
+   for (const auto &[name, value] : compile_options) {
+-    if (!supported_options.contains(name)) {
++    // libtpu's options, such as xla_tpu_autofdo or torch_tpu's
++    // xla_tpu_enable_deduplicated_calls, have no TT-XLA equivalent.
++    if (!supported_options.contains(name) && !name.starts_with("xla_tpu_")) {
+       return "No such compile option: '" + name + "'";
+     }
+ 
 diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implementation/src/api/compile_options_parser.cc
 --- a/pjrt_implementation/src/api/compile_options_parser.cc
 +++ b/pjrt_implementation/src/api/compile_options_parser.cc
