@@ -1,14 +1,3 @@
-diff --git ma/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h mb/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
---- ma/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
-+++ mb/include/ttmlir/Dialect/StableHLO/Utils/ShardingUtils.h
-@@ -31,6 +31,7 @@ inline const llvm::SmallVector<llvm::SmallVector<int64_t, 2>> SupportedMeshes =
-       {1, 16},
-       {1, 32},
-       {1, 64},
-+      {2, 1},
-       {2, 2},
-       {2, 4},
-       {2, 8},
 diff --git ma/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp mb/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
 --- ma/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
 +++ mb/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp

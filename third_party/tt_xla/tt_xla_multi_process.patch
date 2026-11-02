@@ -9,24 +9,7 @@ diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation
  #include "xla/pjrt/c/pjrt_c_api.h"
  
  // c++ standard library includes
-@@ -52,7 +53,7 @@ class ModuleBuilder;
- class GlobalClientInstanceSingleton {
- public:
-   static ClientInstance *getClientInstance();
--  static PJRT_Error *initClient();
-+  static PJRT_Error *initClient(const PJRT_Client_Create_Args *args);
-   static void destroyClient();
-   // Closes the device of a client that is still alive at exit.
-   static void closeDeviceAtExit();
-@@ -102,13 +103,14 @@ public:
-   }
- 
-   // Before the client is usable, it must be initialized.
--  PJRT_Error *initialize();
-+  PJRT_Error *initialize(const PJRT_Client_Create_Args *args);
- 
-   const std::string &platformName() { return m_platform_name; }
-   const std::string &platformVersion() { return m_platform_version; }
+@@ -109,6 +110,7 @@ public:
  
    // Returns process index of this client.
    int getProcessIndex() const { return m_process_index; }
@@ -92,13 +75,7 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
 --- a/pjrt_implementation/src/api/client_instance.cc
 +++ b/pjrt_implementation/src/api/client_instance.cc
-@@ -12,13 +12,18 @@
- 
- // c++ standard library includes
- #include <cerrno>
-+#include <climits>
- #include <cstddef>
- #include <cstring>
+@@ -17,8 +17,12 @@
  #include <filesystem>
  #include <map>
  #include <mutex>
@@ -111,62 +88,10 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
  
  // system includes
  #include <unistd.h>
-@@ -46,6 +51,129 @@
+@@ -46,6 +50,77 @@
  
  namespace tt::pjrt {
  
-+// The PJRT coordinator carries host metadata only; tensor traffic uses
-+// TT-Fabric.
-+static libtt::KeyValueStore
-+createKeyValueStore(const PJRT_Client_Create_Args &args) {
-+  if (!args.kv_get_callback || !args.kv_put_callback)
-+    throw std::invalid_argument(
-+        "Multi-process TT requires JAX coordinator callbacks");
-+  PJRT_CallbackError makeError = [](PJRT_Error_Code, const char *message,
-+                                    size_t size) -> PJRT_Error * {
-+    return *ErrorInstance::makeError(tt_pjrt_status::kInternal,
-+                                     std::string(message, size))
-+                .release();
-+  };
-+  auto checkError = [](PJRT_Error *error) {
-+    if (error) {
-+      std::string message = ErrorInstance::unwrap(error)->getMessage();
-+      delete ErrorInstance::unwrap(error);
-+      throw std::runtime_error(message);
-+    }
-+  };
-+  return {
-+      .put =
-+          [callback = args.kv_put_callback, user = args.kv_put_user_arg,
-+           makeError,
-+           checkError](std::string_view key, std::string_view value) mutable {
-+            PJRT_KeyValuePutCallback_Args request{};
-+            request.struct_size = PJRT_KeyValuePutCallback_Args_STRUCT_SIZE;
-+            request.key = key.data();
-+            request.key_size = key.size();
-+            request.value = value.data();
-+            request.value_size = value.size();
-+            request.callback_error = &makeError;
-+            request.user_arg = user;
-+            checkError(callback(&request));
-+          },
-+      .get =
-+          [callback = args.kv_get_callback, user = args.kv_get_user_arg,
-+           makeError, checkError](std::string_view key) mutable {
-+            PJRT_KeyValueGetCallback_Args request{};
-+            request.struct_size = PJRT_KeyValueGetCallback_Args_STRUCT_SIZE;
-+            request.key = key.data();
-+            request.key_size = key.size();
-+            request.timeout_in_ms = 120000;
-+            request.callback_error = &makeError;
-+            request.user_arg = user;
-+            checkError(callback(&request));
-+            std::unique_ptr<char, PJRT_KeyValueGetCallback_ValueDeleter> value(
-+                request.value, request.value_deleter_callback);
-+            return std::string(value.get(), request.value_size);
-+          }};
-+}
-+
 +static tt::runtime::SystemDesc
 +gatherSystemDescriptors(const tt::runtime::SystemDesc &local,
 +                        const libtt::KeyValueStore &store, int rank, int size,
@@ -174,7 +99,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 +  namespace metal = tt::tt_metal::distributed;
 +  const auto mapping =
 +      metal::SystemMesh::instance().get_mapped_devices(std::nullopt);
-+  // System descriptors enumerate local devices in physical-ID order. JAX device
++  // System descriptors enumerate local devices in physical-ID order. PJRT device
 +  // IDs instead follow the global mesh, including positions owned by other
 +  // hosts.
 +  std::vector<std::pair<int, int>> localIds;
@@ -230,7 +155,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 +    }
 +  }
 +  if (std::find(owners.begin(), owners.end(), -1) != owners.end())
-+    throw std::runtime_error("A global mesh device has no JAX process owner");
++    throw std::runtime_error("A global mesh device has no owning process");
 +  flatbuffers::FlatBufferBuilder builder;
 +  auto root = tt::target::SystemDescRoot::Pack(builder, merged.get());
 +  tt::target::FinishSizePrefixedSystemDescRootBuffer(builder, root);
@@ -241,65 +166,35 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
  static std::string getRankBindingPath(const std::string &metal_home) {
    static std::unordered_map<std::string, std::string> rank_binding_paths = {
        {"2x4_multiprocess",
-@@ -274,7 +402,8 @@ static tt_pjrt_status setMemoryLogLevel() {
-   return tt_pjrt_status::kSuccess;
- }
- 
--PJRT_Error *GlobalClientInstanceSingleton::initClient() {
-+PJRT_Error *
-+GlobalClientInstanceSingleton::initClient(const PJRT_Client_Create_Args *args) {
-   GlobalClientInstanceSingleton &singleton_instance = getInstance();
-   // Held while the first client initializes, so that a concurrent creator
-   // waits for it instead of opening the device again.
-@@ -285,7 +414,7 @@ PJRT_Error *GlobalClientInstanceSingleton::initClient() {
-   }
- 
-   std::unique_ptr<ClientInstance> client = std::make_unique<ClientInstance>();
--  PJRT_Error *error = client->initialize();
-+  PJRT_Error *error = client->initialize(args);
-   if (error) {
-     return error;
-   }
-@@ -348,8 +477,7 @@ ClientInstance::ClientInstance()
+@@ -348,8 +423,8 @@ ClientInstance::ClientInstance()
        m_parent_mesh(std::nullopt) {
    DLOG_F(LOG_DEBUG, "ClientInstance::ClientInstance");
  
 -  // TODO(mrakita): Add support for multi-process environment. Process index is
 -  // always 0 in single-process settings.
-+  // initialize() takes a multi-process client's index from its create options.
++  // initialize() takes a multi-process client's index from libtpu's
++  // environment.
    m_process_index = 0;
  }
  
-@@ -359,7 +487,36 @@ ClientInstance::~ClientInstance() {
-   loguru::flush();
+@@ -360,6 +435,25 @@ ClientInstance::~ClientInstance() {
  }
  
--PJRT_Error *ClientInstance::initialize() {
-+PJRT_Error *ClientInstance::initialize(const PJRT_Client_Create_Args *args) {
-+  for (size_t i = 0; i < args->num_options; ++i) {
-+    const auto &option = args->create_options[i];
-+    std::string_view name(option.name, option.name_size);
-+    if (name == "node_id" || name == "num_nodes") {
-+      if (option.type != PJRT_NamedValue_kInt64)
-+        throw std::invalid_argument("node_id and num_nodes must be integers");
-+      if (option.int64_value < 0 || option.int64_value > INT_MAX)
-+        throw std::invalid_argument(
-+            "Invalid distributed process configuration");
-+      (name == "node_id" ? m_process_index : m_process_count) =
-+          option.int64_value;
-+    }
-+  }
-+  if (m_process_count < 1 || m_process_index >= m_process_count)
-+    throw std::invalid_argument("Invalid distributed process configuration");
-+  if (isMultiProcess()) {
+ PJRT_Error *ClientInstance::initialize() {
++  // torch_tpu starts one process per chip and describes them through libtpu's
++  // environment.
++  if (std::optional<libtt::LibtpuProcesses> processes =
++          libtt::ConfigureLibtpuProcesses()) {
 +    if (const char *mpi = std::getenv("TT_RUNTIME_ENABLE_DISTRIBUTED");
 +        mpi && std::string_view(mpi) != "0")
 +      throw std::invalid_argument(
-+          "JAX distributed execution cannot use the MPI worker runtime");
++          "Multi-process execution cannot use the MPI worker runtime");
 +    if (std::getenv("TT_COMPILE_ONLY_SYSTEM_DESC"))
 +      throw std::invalid_argument(
 +          "Multi-process compile-only mode is not supported");
-+    m_key_value_store = createKeyValueStore(*args);
++    m_process_index = processes->index;
++    m_process_count = processes->count;
++    m_key_value_store = processes->store;
 +    tt::tt_metal::distributed::multihost::DistributedContext::set_current_world(
 +        libtt::MakeKeyValueContext(*m_key_value_store, m_process_index,
 +                                   m_process_count));
@@ -308,20 +203,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    DLOG_F(LOG_DEBUG, "ClientInstance::Initialize");
  
    bool distributed_runtime =
-@@ -396,6 +553,12 @@ void ClientInstance::bindApi(PJRT_Api *api) {
-   api->PJRT_Client_Destroy = internal::onClientDestroy;
-   api->PJRT_Client_PlatformName = internal::onClientPlatformName;
-   api->PJRT_Client_ProcessIndex = internal::onClientProcessIndex;
-+  // Like the default PjRtClient implementation, accept status notifications.
-+  // This backend uses a fixed process group and does not support restarts.
-+  api->PJRT_Client_UpdateGlobalProcessInfo =
-+      [](PJRT_Client_UpdateGlobalProcessInfo_Args *) -> PJRT_Error * {
-+    return nullptr;
-+  };
-   api->PJRT_Client_PlatformVersion = internal::onClientPlatformVersion;
-   api->PJRT_Client_Devices = internal::onClientDevices;
-   api->PJRT_Client_AddressableDevices = internal::onClientAddressableDevices;
-@@ -439,6 +602,10 @@ tt_pjrt_status ClientInstance::populateDevices() {
+@@ -439,6 +533,10 @@ tt_pjrt_status ClientInstance::populateDevices() {
      m_compile_only = true;
    } else {
      m_system_descriptor = tt::runtime::getCurrentSystemDesc();
@@ -332,7 +214,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    }
  
    size_t devices_count = m_system_descriptor->chip_desc_indices()->size();
-@@ -448,11 +615,13 @@ tt_pjrt_status ClientInstance::populateDevices() {
+@@ -448,11 +546,13 @@ tt_pjrt_status ClientInstance::populateDevices() {
    m_addressable_devices_raw.reserve(devices_count);
  
    for (size_t i = 0; i < devices_count; ++i) {
@@ -350,7 +232,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
  
      const auto *chip_desc = m_system_descriptor->chip_descs()->Get(i);
      // Total on-device DRAM = num_dram_channels * dram_channel_size.  Used
-@@ -467,11 +636,11 @@ tt_pjrt_status ClientInstance::populateDevices() {
+@@ -467,11 +567,11 @@ tt_pjrt_status ClientInstance::populateDevices() {
                                         local_device_id, chip_desc->arch(),
                                         dram_size_bytes);
  
@@ -363,7 +245,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
        m_addressable_devices_raw.push_back(device_instance.get());
      }
  
-@@ -509,20 +678,20 @@ tt_pjrt_status ClientInstance::populateMemories() {
+@@ -509,20 +609,20 @@ tt_pjrt_status ClientInstance::populateMemories() {
                                       /*is_host_memory=*/true);
    m_addressable_memories_raw.push_back(m_addressable_host_memory.get());
  
@@ -397,7 +279,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    }
  
    return tt_pjrt_status::kSuccess;
-@@ -555,17 +724,21 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+@@ -555,17 +655,21 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
    if (replica_device_ids.has_value()) {
      for (int64_t device_id : *replica_device_ids) {
        if (device_id >= 0 &&
@@ -424,7 +306,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    }
  
    std::unique_ptr<LoadedExecutableInstance> executable =
-@@ -591,8 +764,9 @@ ClientInstance::computeFabricConfig(const std::vector<uint32_t> &mesh_shape) {
+@@ -591,8 +695,9 @@ ClientInstance::computeFabricConfig(const std::vector<uint32_t> &mesh_shape) {
                                           {}};
    }
  
@@ -436,7 +318,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
  
      uint32_t num_devices = 1;
      for (auto dim : mesh_shape) {
-@@ -619,6 +793,13 @@ ClientInstance::computeFabricConfig(const std::vector<uint32_t> &mesh_shape) {
+@@ -619,6 +724,13 @@ ClientInstance::computeFabricConfig(const std::vector<uint32_t> &mesh_shape) {
  
  tt::runtime::Device ClientInstance::getOrCreateMeshDevice(
      const std::vector<uint32_t> &target_mesh_shape) {
@@ -450,7 +332,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
  
    if (std::optional<tt::runtime::Device> submesh =
            getOrCreateSubMesh(target_mesh_shape)) {
-@@ -800,14 +981,17 @@ PJRT_Error *onClientCreate(PJRT_Client_Create_Args *args) {
+@@ -800,14 +912,17 @@ PJRT_Error *onClientCreate(PJRT_Client_Create_Args *args) {
    ZoneScoped;
    DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_Client_Create");
  
@@ -460,7 +342,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
 -           args->create_options[i].name);
 +  PJRT_Error *error;
 +  try {
-+    error = GlobalClientInstanceSingleton::initClient(args);
++    error = GlobalClientInstanceSingleton::initClient();
 +  } catch (const std::invalid_argument &e) {
 +    return *ErrorInstance::makeError(tt_pjrt_status::kInvalidArgument, e.what())
 +                .release();
@@ -572,25 +454,3 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
           tt::runtime::detail::getNumShards(*m_runtime_tensor) > 1;
  }
  
-diff --git a/pjrt_implementation/src/dylib_entry_point.cc b/pjrt_implementation/src/dylib_entry_point.cc
---- a/pjrt_implementation/src/dylib_entry_point.cc
-+++ b/pjrt_implementation/src/dylib_entry_point.cc
-@@ -7,6 +7,7 @@
- // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
- // https://llvm.org/LICENSE.txt
- 
-+#include "api/client_instance.h"
- #include "api/event_instance.h"
- #include "api_bindings.h"
- 
-@@ -25,5 +26,10 @@ void InitializeAPI(PJRT_Api *api) { bindApi(api); }
- // Performs controlled shutdown of plugin-owned resources that must be torn
- // down. Initiated by the host before shutdown.
- extern "C" PJRT_PLUGIN_EXPORTED void tt_pjrt_shutdown() {
-+  // Close distributed meshes before JAX destroys the coordinator and KV callbacks.
-+  auto *client = tt::pjrt::GlobalClientInstanceSingleton::getClientInstance();
-+  if (client && client->isMultiProcess()) {
-+    client->closeMeshDevice();
-+  }
-   tt::pjrt::EventInstance::shutdownCallbackWorker();
- }

@@ -18,13 +18,13 @@ struct KeyValueStore {
 tt::tt_metal::distributed::multihost::ContextPtr
 MakeKeyValueContext(KeyValueStore store, int rank, int size);
 
-// A store for processes without a JAX coordinator: the process with `serve`
+// libtt's own store for a process group: the process with `serve`
 // listens on the port of `address` ("host:port"), and every process connects
 // to it there.
 KeyValueStore MakeTcpKeyValueStore(const std::string &address, bool serve);
 
 // torch_tpu starts one process per chip and describes them through libtpu's
-// environment rather than coordinator callbacks.
+// environment.
 struct LibtpuProcesses {
   int index;
   int count;
