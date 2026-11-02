@@ -2,9 +2,12 @@
 
 [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu) serves models
 through [torch_tpu](torch-tpu.md). With `LIBTT_TPU_COMPAT=1` it runs on one
-Tenstorrent chip with no changes to SGLang or torch_tpu. Its attention kernel
-is a Pallas TPU kernel, which libtt replaces with JAX and TTNN's paged
-attention operations (`python/jax_plugins/libtt/sglang_tpu_kernels.py`).
+Tenstorrent chip with no changes to SGLang or torch_tpu. Its attention,
+quantized linear and fused MoE kernels are Pallas TPU kernels, which libtt
+replaces with JAX: attention with TTNN's paged attention operations
+(`python/jax_plugins/libtt/sglang_tpu_kernels.py`), the others with the same
+math in ordinary JAX operations
+(`python/jax_plugins/libtt/sglang_tpu_quant_kernels.py`).
 
 ## Setup
 
@@ -63,6 +66,14 @@ The settings that matter:
 - `--tpu-compile-bs` and `--tpu-compile-tokens` choose the shapes compiled at
   startup. Every other shape fails once the server is up.
 
+## FP8 weights
+
+`--quantization fp8` quantizes the weights to FP8 as they load. Set
+`SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL=1` too: linear layers of up to 16
+rows, as in decoding, then take one kernel instead of padding their activations
+to 16 rows around `torch._scaled_mm`, and Qwen3-8B decodes at 21 instead of 15
+tokens/s.
+
 ## Speed
 
 Greedy decoding of 256 tokens (128 for Qwen3-8B) on one Blackhole P150,
@@ -72,6 +83,8 @@ batch 4 as four concurrent requests:
 |---|---|---|
 | Qwen3-0.6B | 89 tokens/s | 291 tokens/s (76 per request) |
 | Qwen3-8B, bf16 weights | 19 tokens/s | 72 tokens/s (18 per request) |
+| Qwen3-8B, FP8 weights | 21 tokens/s | 77 tokens/s (20 per request) |
 
-Qwen3-8B reads its 16 GB of weights on every step, so it decodes at about the
-speed the chip's memory allows for bf16 weights.
+Qwen3-8B reads its 16 GB of bf16 weights on every step, so with them it
+decodes at about the speed the chip's memory allows. FP8 weights are half the
+bytes.

@@ -6,8 +6,8 @@ TPUs compile. In TPU compatibility mode, `tpu_compat` replaces each kernel
 with the JAX function below when `sglang_tpu` imports its module. Each takes
 the kernel's arguments and computes the kernel's math with ordinary JAX ops.
 FP8 operands are converted to BF16, which holds every E4M3 value exactly,
-before their dots: libtt's FP8 dot rounds more coarsely, while the BF16 dot
-gives the same bits as SGLang's XLA path (torch._scaled_mm).
+before their dots, as SGLang's XLA path (torch._scaled_mm) does. libtt runs
+such a dot on the FP8 values where it can, which counts FP8 subnormals as zero.
 
 - `fp8_linear_small_m`: W8A8 linear for decode-sized batches. Each activation
   row is quantized to FP8 with its own scale, multiplied with the FP8 weight
