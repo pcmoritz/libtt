@@ -7,8 +7,9 @@
   defaults to this package's `libtt.so`.
 - torch_tpu only opens a device when its PCI scan finds a Google TPU, so its
   device count, topology, name and memory describe the Tenstorrent chips
-  instead. The topology is a line of chips; `python -m torch.tpu.distributed`
-  uses it to set up the launch environment for `torchrun`.
+  when the scan finds none. The topology is a line of chips;
+  `python -m torch.tpu.distributed` uses it to set up the launch environment
+  for `torchrun`.
 - libtt reports the platform as "tpu", so torch_tpu compiles its eager ops as it
   does on a TPU, which libtt doesn't trace.
 - torch_tpu's flash attention is a Pallas kernel that only TPUs run, so
@@ -40,10 +41,21 @@ def _tenstorrent_topology(world_size: int | None = None) -> str | None:
 
 
 def _patch_hardware(module):
-    module.get_tpu_device_count = _tenstorrent_device_count
-    module.get_tpu_topology = _tenstorrent_topology
-    module.get_tpu_device_name = lambda: "Tenstorrent Blackhole"
-    module.get_hbm_bytes_per_device = lambda: _BLACKHOLE_DRAM_BYTES
+    # torch_tpu's own answers win when its scan finds a TPU, as in its tests,
+    # which mock a TPU's PCI devices.
+    tpu_count = module.get_tpu_device_count
+    tpu_topology = module.get_tpu_topology
+    tpu_name = module.get_tpu_device_name
+    tpu_hbm_bytes = module.get_hbm_bytes_per_device
+    module.get_tpu_device_count = lambda: tpu_count() or _tenstorrent_device_count()
+    module.get_tpu_topology = lambda world_size=None: (
+        tpu_topology(world_size) or _tenstorrent_topology(world_size)
+    )
+    # torch_tpu names an unrecognized or missing TPU "TPU".
+    module.get_tpu_device_name = lambda: (
+        name if (name := tpu_name()) != "TPU" else "Tenstorrent Blackhole"
+    )
+    module.get_hbm_bytes_per_device = lambda: tpu_hbm_bytes() or _BLACKHOLE_DRAM_BYTES
     # torch_tpu imports torch before its hardware module.
     import torch
 

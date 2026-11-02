@@ -29,8 +29,9 @@ and then loads `jax_plugins/libtt/tpu_compat.py`, which runs before torch_tpu:
 
 - `TPU_LIBRARY_PATH` defaults to the wheel's `libtt.so`, which torch_tpu loads
   as its PJRT plugin.
-- torch_tpu only opens a device when its PCI scan finds a Google TPU; its
-  device count reports the Tenstorrent chips instead.
+- torch_tpu only opens a device when its PCI scan finds a Google TPU; when
+  the scan finds none, its device count, topology, name and memory describe
+  the Tenstorrent chips instead.
 - torch_tpu's flash attention is a Pallas kernel that only TPUs run, so it is
   turned off and `scaled_dot_product_attention` runs torch_tpu's StableHLO
   implementation.
