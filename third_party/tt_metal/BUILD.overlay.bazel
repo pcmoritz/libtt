@@ -398,7 +398,6 @@ genrule(
           "'    template <typename... Args> static void mesh_workload_destroyed(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void mesh_workload_add_program(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void mesh_workload_set_program_binary_status(Args&&...) noexcept {}' " +
-          "'    template <typename... Args> static void mesh_socket_created(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void emit_debug_entry(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void release_trace(Args&&...) noexcept {}' " +
           "'    template <typename... Args> static void set_dispatch_core_info(Args&&...) {}' " +
@@ -1167,7 +1166,6 @@ cc_library(
         "tt_metal/distributed/mesh_socket_utils.cpp",
         "tt_metal/distributed/mesh_command_queue_base.cpp",
         "tt_metal/distributed/mesh_device.cpp",
-        "tt_metal/distributed/mesh_socket.cpp",
         "tt_metal/distributed/mesh_device_view.cpp",
         "tt_metal/distributed/mesh_event.cpp",
         "tt_metal/distributed/mesh_socket_serialization.cpp",
@@ -1607,20 +1605,4 @@ cc_library(
         "@xtensor//:xtensor",
     ],
     linkstatic = True,
-)
-
-filegroup(
-    name = "mesh_socket_test_sources",
-    srcs = [
-        "tests/tt_metal/multihost/fabric_tests/mesh_socket_yaml_parser.cpp",
-        "tests/tt_metal/multihost/fabric_tests/mesh_socket_test_context.cpp",
-        "tests/tt_metal/multihost/fabric_tests/socket_send_recv_utils.cpp",
-    ],
-)
-
-filegroup(
-    name = "mesh_socket_test_headers",
-    srcs = glob(["tests/tt_metal/multihost/fabric_tests/*.hpp"]) + [
-        "tests/tt_metal/test_utils/test_common.hpp",
-    ],
 )

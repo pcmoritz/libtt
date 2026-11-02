@@ -1,4 +1,4 @@
-"""Two-process JAX/PJRT smoke test; run once on each Ethernet-connected host."""
+"""Two-process JAX/PJRT test: run one process per chip, on two hosts or one (see README.md)."""
 
 import argparse
 import json
