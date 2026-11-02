@@ -1,0 +1,20 @@
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp b/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNSetMatmulProgramConfig.cpp
+@@ -283,6 +283,16 @@ std::optional<MatmulProblem> analyze(MatmulOpTy op, Value bias) {
+   if (batchB > 1 && !llvm::equal(aShape.drop_back(2), bShape.drop_back(2))) {
+     return std::nullopt;
+   }
++  // tt-metal runs one tile row of BF16 activations into a BF16 output with
++  // its decode matmul, which reads the weights faster than the 1D multicast
++  // matmul this pass would pick (Qwen3-8B's projections: 9 to 20% less device
++  // time): leave those to tt-metal.
++  if (!transposeA && !bias && !op.getActivationAttr() &&
++      batchA * m <= kTileDim && k % kTileDim == 0 &&
++      op.getA().getType().getElementType().isBF16() &&
++      op.getResult().getType().getElementType().isBF16()) {
++    return std::nullopt;
++  }
+ 
+   ttcore::DeviceAttr device = ttcore::lookupDevice(op);
+   if (!device) {
