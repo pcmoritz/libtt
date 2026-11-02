@@ -1,0 +1,40 @@
+diff --git a/include/ttmlir/Target/Utils/FuncOpToProgram.h b/include/ttmlir/Target/Utils/FuncOpToProgram.h
+--- a/include/ttmlir/Target/Utils/FuncOpToProgram.h
++++ b/include/ttmlir/Target/Utils/FuncOpToProgram.h
+@@ -28,19 +28,34 @@ struct Program {
+       semaphoreInputs;
+ };
+ 
++// A binary keeps each op's printed form and location for debugging. An op
++// with regions prints whole programs, and torch.compile's locations are long
++// call-site chains, so in a program of tens of thousands of ops they took
++// gigabytes and pushed the binary past flatbuffers' 2 GB offset limit, which it
++// was then read past. Keep their beginnings.
++constexpr size_t kMaxOpDebugStringSize = 1024;
++
++inline std::string truncateDebugString(std::string str) {
++  if (str.size() > kMaxOpDebugStringSize) {
++    str.resize(kMaxOpDebugStringSize);
++    str += "...";
++  }
++  return str;
++}
++
+ inline std::string getOpDebugString(mlir::Operation *op,
+                                     mlir::AsmState &printState) {
+   std::string str;
+   llvm::raw_string_ostream os(str);
+   op->print(os, printState);
+-  return str;
++  return truncateDebugString(std::move(str));
+ };
+ 
+ inline std::string getOpLocInfo(mlir::Operation *op) {
+   std::string str;
+   llvm::raw_string_ostream os(str);
+   op->getLoc().print(os);
+-  return str;
++  return truncateDebugString(std::move(str));
+ }
+ 
+ // Scalar args are serialized in 32-bit unsigned integers
