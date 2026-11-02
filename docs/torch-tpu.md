@@ -3,7 +3,8 @@
 [torch_tpu](https://github.com/google-pytorch/torch_tpu) is a PyTorch backend
 for TPUs that drives its device through the PJRT C API. It loads the plugin
 named by `TPU_LIBRARY_PATH`, so it runs on Tenstorrent devices with `libtt.so`.
-Validated with torch_tpu 0.2.0 and torch 2.14.1 on one Blackhole.
+Validated with torch_tpu 0.2.0 and torch 2.14.1 on one Blackhole, and with
+one process per chip on a 4-chip QuietBox.
 
 ## Setup
 
@@ -65,6 +66,77 @@ conversions to and from them round like PyTorch's. A matmul of two float8
 matrices of either format, as in `torch._scaled_mm`, reads them natively on
 the matrix unit, which treats subnormal operands as zero. A matmul of a float8
 matrix and a bfloat16 one computes on bfloat16 values.
+
+## Multi-process tensor parallelism
+
+torch_tpu runs one process per chip, as on a TPU host. Each process opens only
+its own chip, and the processes share one 1xN mesh. Collectives run between
+them over TT-Fabric, like the single-process mesh in
+[Qwen3-8B on two QuietBox chips](qwen3-8b-quietbox-tp2.md).
+
+torch_tpu describes the processes to its PJRT plugin through libtpu's
+environment variables:
+- `TPU_VISIBLE_CHIPS` gives each process its chip, which libtt passes on as
+  `TT_VISIBLE_DEVICES`;
+- `TPU_PROCESS_ADDRESSES` and `CLOUD_TPU_TASK_ID` give the processes'
+  addresses and this process's index. Process 0 serves a small key-value store
+  at its address, which the processes coordinate through.
+
+libtt writes the 1xN mesh descriptor itself. Leave `TT_VISIBLE_DEVICES` and
+`TT_MESH_GRAPH_DESC_PATH` unset for multi-process runs.
+
+### torchrun
+
+Let torch_tpu's launch helper describe the chips, then start one process per
+chip:
+
+```bash
+export LIBTT_TPU_COMPAT=1
+eval $(python -m torch.tpu.distributed | sed 's/^/export /')
+torchrun --nproc_per_node=4 train.py
+```
+
+The helper's `WORLD_SIZE` counts every chip, so `--nproc_per_node` must match
+it; with fewer processes the run waits forever. In the script, use the `tpu`
+backend:
+
+```python
+import torch
+import torch.distributed as dist
+
+dist.init_process_group(backend="tpu")
+x = torch.ones(8, device="tpu") * dist.get_rank()
+dist.all_reduce(x)
+```
+
+Collectives run eagerly and in `torch.compile`d programs, as do
+`all_gather_object` and `broadcast_object_list`.
+
+### SGLang-TorchTPU
+
+Pass `--tp-size N` to `sglang.launch_server`: SGLang-TorchTPU starts one
+process per chip itself. On a 4-chip QuietBox, Qwen3-0.6B decodes 119 tokens/s
+at TP4 (89 on one chip) and Qwen3-32B 16.3 tokens/s, with BF16 weights.
+
+### Collective buffers
+
+TT-NN's collectives write to their peers at the addresses of their own
+buffers, but separate processes don't allocate in the same order. With more
+than one process, each therefore reserves the same DRAM region when the mesh
+opens, and collectives allocate their buffers there. The region is
+`LIBTT_SYMMETRIC_DRAM_MB` megabytes per chip, 2048 by default. Raise it if a
+collective fails with "Symmetric DRAM region of ... is too small for this
+collective".
+
+### Recovery
+
+A multi-chip process that is killed can leave the chips' Ethernet links down,
+and the next run then hangs or fails while starting the fabric. Reset the
+chips before starting again:
+
+```bash
+tt-smi -r
+```
 
 ## Not supported
 

@@ -25,6 +25,9 @@ The wheel contains `libtt.so` and libtt's JAX initialization hook.
 
 See [Qwen3-8B on two QuietBox chips](docs/qwen3-8b-quietbox-tp2.md) for the
 single-process TP2 launch recipe and multi-chip regression tests.
+PyTorch runs one process per chip instead: see
+[multi-process tensor parallelism](docs/torch-tpu.md#multi-process-tensor-parallelism)
+for torchrun and SGLang-TorchTPU's `--tp-size`.
 
 ## PyTorch
 

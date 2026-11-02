@@ -1,9 +1,11 @@
 # SGLang-TorchTPU
 
 [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu) serves models
-through [torch_tpu](torch-tpu.md). With `LIBTT_TPU_COMPAT=1` it runs on one
-Tenstorrent chip with no changes to SGLang or torch_tpu. Its attention kernel
-is a Pallas TPU kernel, which libtt replaces with JAX and TTNN's paged
+through [torch_tpu](torch-tpu.md). With `LIBTT_TPU_COMPAT=1` it runs on
+Tenstorrent chips with no changes to SGLang or torch_tpu: on one chip, or with
+`--tp-size N` on N chips, one process per chip (see [multi-process tensor
+parallelism](torch-tpu.md#multi-process-tensor-parallelism)). Its attention
+kernel is a Pallas TPU kernel, which libtt replaces with JAX and TTNN's paged
 attention operations (`python/jax_plugins/libtt/sglang_tpu_kernels.py`).
 
 ## Setup
