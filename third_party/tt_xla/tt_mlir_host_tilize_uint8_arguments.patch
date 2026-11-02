@@ -1,0 +1,20 @@
+diff --git a/runtime/lib/ttnn/types/layout_converter.cpp b/runtime/lib/ttnn/types/layout_converter.cpp
+--- a/runtime/lib/ttnn/types/layout_converter.cpp
++++ b/runtime/lib/ttnn/types/layout_converter.cpp
+@@ -329,12 +329,13 @@
+     return out;
+   }
+ 
++  // Tilize on host and move the result back, e.g. for a uint8 argument that a
++  // row-major reader such as an embedding moved to the device before.
+   if (shouldTilize &&
+       (!utils::canTilizeOnDevice(inputDesc.dataType, inputDesc.memoryConfig)) &&
+       !shouldFromDevice) {
+-    LOG_FATAL("Currently to_layout does not support device to device tilize "
+-              "for input data type or memory layout: ",
+-              debug::toString(inputDesc.dataType));
++    ::ttnn::Tensor out = toLayoutIfNeeded(::ttnn::from_device(input));
++    return ::ttnn::to_device(out, input.device(), outputDesc.memoryConfig);
+   }
+ 
+   LOG_FATAL("Unreachable code path");

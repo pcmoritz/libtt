@@ -708,6 +708,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_symmetric_collectives.patch",
         "//third_party/tt_xla:tt_mlir_bounded_debug_strings.patch",
         "//third_party/tt_xla:tt_mlir_float8_scaled_matmul.patch",
+        "//third_party/tt_xla:tt_mlir_host_tilize_uint8_arguments.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
