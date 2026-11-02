@@ -108,7 +108,7 @@ from PyPI:
 bazel test //tests:torch_tpu_test_suite \
   --test_output=streamed \
   --nocache_test_results \
-  --test_timeout=7200
+  --test_timeout=14400
 ```
 
 Each test file runs in its own pytest process, with its log and JUnit XML in
@@ -126,10 +126,11 @@ Bazel gives tests a fresh home directory, so tt-metal rebuilds its kernel cache
 in every run. Add `--test_env=TT_METAL_CACHE=$HOME/.cache` to reuse
 `~/.cache/tt-metal-cache` instead.
 
-Baseline (October 2026, f7d1c3c, one Blackhole p150a): **107 of 193 files
-passed; 7165 passed, 1831 failed, 14 errors, 240 skipped, 13097 subtests
-passed**, in about an hour. Most failures are multi-device, TPU-only or
-dynamic-shape tests.
+Baseline (November 2026, main 5861d042, one Blackhole p150a): **108 of 195
+files passed; 7310 passed, 1689 failed, 14 errors, 240 skipped, 13097 subtests
+passed**, in under two hours. Most failures are multi-device, TPU-only or
+dynamic-shape tests; on one chip, the multi-device tests take half an hour to
+fail.
 
 ## libtt tests
 
