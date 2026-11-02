@@ -1,0 +1,24 @@
+diff --git tt_metal/distributed/distributed.cpp tt_metal/distributed/distributed.cpp
+--- tt_metal/distributed/distributed.cpp
++++ tt_metal/distributed/distributed.cpp
+@@ -143,6 +143,10 @@ void EventSynchronize(const MeshEvent& event) {
+         return;
+     }
+     for (const auto& coord : event.impl().device_range()) {
++        // Another process waits for the devices it owns.
++        if (!event.device()->is_local(coord)) {
++            continue;
++        }
+         auto* physical_device = event.device()->impl().get_device(coord);
+         while (physical_device->sysmem_manager().get_last_completed_event(event.impl().mesh_cq_id()) <
+                event.impl().id()) {
+@@ -157,6 +161,9 @@ bool EventQuery(const MeshEvent& event) {
+     }
+     bool event_completed = true;
+     for (const auto& coord : event.impl().device_range()) {
++        if (!event.device()->is_local(coord)) {
++            continue;
++        }
+         auto* physical_device = event.device()->impl().get_device(coord);
+         event_completed &=
+             physical_device->sysmem_manager().get_last_completed_event(event.impl().mesh_cq_id()) >= event.impl().id();
