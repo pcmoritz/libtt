@@ -5,8 +5,10 @@ Hybrid models such as Qwen3.5 run their gated DeltaNet layers through
 TPU compatibility mode, `sglang_tpu_kernels` replaces it with
 `fused_conv1d_gdn` below, which takes the same arguments and returns the same
 results with static shapes. A decode batch (`batched_only`, one token per
-request) takes one recurrence step for every request at once. An extend batch
-(`prefill_only`) runs the chunkwise-parallel recurrence over 64-token chunks.
+request) takes one recurrence step for every request at once, and a speculative
+verify batch (`num_spec_tokens`) one step per window position, keeping the
+states after each. An extend batch (`prefill_only`) runs the chunkwise-parallel
+recurrence over 64-token chunks.
 
 The chunked recurrence comes from SGLang-JAX's gated delta rule
 (`sgl_jax/srt/kernels/gdn/gated_delta.py`, Apache-2.0), which serves Qwen3.5 on
@@ -117,6 +119,56 @@ def _decode_step(state, q, k, v, g, beta):
     delta = (v - kv_mem) * beta[..., None]
     state = state + k[..., None] * delta[..., None, :]
     return state, jnp.einsum("bhkv,bhk->bhv", state, q)
+
+
+def _verify(qkv, beta, g, conv_state, recurrent_state, conv_weight, conv_bias, starts,
+            slots, read_rows, has_init, window, heads):
+    """Speculative verify windows of up to `window` tokens per request.
+
+    Request s reads its states from row read_rows[s] and writes the states after
+    its token t to row slots[s] + t, so that the next step can continue from any
+    accepted prefix. Returns the output [T, n_v, d_v] and both pools.
+    """
+    n_kq, n_v, d_k, d_v = heads
+    tokens, dim = qkv.shape
+    reqs = slots.shape[0]
+    taps = conv_weight.shape[-1]
+    t = jnp.arange(window, dtype=jnp.int32)
+    lens = starts[1:] - starts[:-1]
+    valid = t[None, :] < lens[:, None]  # [B, W]
+    idx = jnp.clip(starts[:-1, None] + t[None, :], 0, tokens - 1)  # [B, W] token indices
+    rows = jnp.where(valid, slots[:, None] + t[None, :], 0).reshape(-1)
+
+    history = _history(conv_state, read_rows, has_init, dim)  # [B, K-1, D]
+    full = jnp.concatenate([history, qkv[idx]], axis=1)  # [B, K-1+W, D]
+    weight = conv_weight[:, 0, :].astype(jnp.float32)
+    mixed = sum(full[:, k : k + window].astype(jnp.float32) * weight[:, k] for k in range(taps))
+    if conv_bias is not None:
+        mixed = mixed + conv_bias.astype(jnp.float32)
+    windows = jnp.stack([full[:, i + 1 : i + taps] for i in range(window)], axis=1)
+    conv_state = _scatter_slots(
+        conv_state, rows, windows.reshape(reqs * window, *conv_state.shape[1:])
+    )
+
+    q, k, v = _split_heads(jax.nn.silu(mixed), n_kq, n_v, d_k, d_v)  # [B, W, H, *]
+    beta, g = beta[idx], g[idx]  # [B, W, H]
+    state = jnp.where(has_init[:, None, None, None], recurrent_state[read_rows], 0)
+    state = state.astype(jnp.float32)
+    states, outs = [], []
+    for i in range(window):
+        state, out = _decode_step(state, q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i])
+        states.append(state)
+        outs.append(out)
+    recurrent_state = _scatter_slots(
+        recurrent_state, rows, jnp.stack(states, axis=1).reshape(reqs * window, n_v, d_k, d_v)
+    )
+    # Each token's output from its request's window.
+    outs = jnp.stack(outs, axis=1).reshape(reqs * window, n_v, d_v)
+    token = jnp.arange(tokens, dtype=jnp.int32)
+    req = jnp.clip(jnp.sum(token[:, None] >= starts[None, 1:], axis=1), 0, reqs - 1)
+    pos = jnp.clip(token - starts[req], 0, window - 1)
+    out = jnp.where((token < starts[-1])[:, None, None], outs[req * window + pos], 0)
+    return out, conv_state, recurrent_state
 
 
 # The chunked recurrence, from SGLang-JAX's gated_delta.py.
@@ -279,8 +331,8 @@ def fused_conv1d_gdn(
         raise NotImplementedError(
             "packed weights and prefix-cache snapshots need the Pallas kernel"
         )
-    if num_spec_tokens or read_offsets is not None:
-        raise NotImplementedError("speculative verify windows need the Pallas kernel")
+    if num_spec_tokens and (not batched_only or read_offsets is None):
+        raise NotImplementedError("verify windows run alone, with read offsets")
     if batched_only == prefill_only:
         raise NotImplementedError("mixed decode and extend batches need the Pallas kernel")
     if conv_state.shape[1] != kernel_size - 1 or conv_state.shape[-1] != qkv.shape[1]:
@@ -295,6 +347,13 @@ def fused_conv1d_gdn(
     has_init = (seq_lens - lens) > 0
     beta, g = _gates(b, a, a_log, dt_bias)
 
+    if num_spec_tokens:
+        out, conv_state, recurrent_state = _verify(
+            qkv, beta, g, conv_state, recurrent_state, conv_weight, conv_bias, starts, slots,
+            jnp.where(live, slots + read_offsets, 0), has_init, num_spec_tokens + 1,
+            (n_kq, n_v, d_k, d_v),
+        )
+        return (conv_state, recurrent_state), out.astype(qkv.dtype).reshape(tokens, n_v * d_v)
     if batched_only:
         if tokens != reqs:
             raise NotImplementedError("decode batches of one token per request only")
