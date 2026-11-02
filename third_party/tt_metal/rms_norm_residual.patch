@@ -2,7 +2,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,203 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -19,16 +19,17 @@ new file mode 100644
 +#include "api/compute/tile_move_copy.h"
 +
 +#ifdef TRISC_MATH
++#include "ckernel_sfpu_conversions.h"
++
 +namespace ckernel::sfpu {
 +// Rounds a DST face of FP32 values to nearest even at BF16 precision, in
 +// place, so that packing them to BF16 keeps them unchanged.
++// add_binary_tile's NearestEven option does nothing with FP32 DST
++// accumulation, so the sum is rounded in a pass of its own.
 +inline void round_to_bf16_nearest_even() {
 +#pragma GCC unroll 0
 +    for (int d = 0; d < 8; ++d) {
-+        sfpi::vFloat value = sfpi::dst_reg[0];
-+        sfpi::vUInt bits = sfpi::as<sfpi::vUInt>(value);
-+        bits = (bits + 0x7fffU + ((bits >> 16) & 1)) & 0xffff0000U;
-+        sfpi::dst_reg[0] = sfpi::as<sfpi::vFloat>(bits);
++        sfpi::dst_reg[0] = float32_to_bf16_rne(sfpi::dst_reg[0]);
 +        sfpi::dst_reg++;
 +    }
 +}
