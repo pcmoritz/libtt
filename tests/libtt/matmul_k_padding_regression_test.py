@@ -43,6 +43,21 @@ def test_elementwise_then_matmul(level, dtype, shape):
     np.testing.assert_array_equal(np.asarray(got), expected)
 
 
+@pytest.mark.parametrize("level,shape", CASES)
+@pytest.mark.parametrize("dtype", [jnp.float8_e4m3fn, jnp.float8_e5m2])
+def test_elementwise_then_float8_matmul(level, dtype, shape):
+    m, k, n = shape
+    a = (np.arange(m * k) % 5).reshape(m, k).astype(np.float32)
+    b = (np.arange(k * n) % 3).reshape(k, n).astype(np.float32)
+    expected = (a - 2) @ (b - 1)
+    # The float8 casts keep the padding the subtractions give both operands.
+    matmul = jax.jit(
+        lambda x, y: jnp.matmul((x - 2).astype(dtype), (y - 1).astype(dtype),
+                                preferred_element_type=jnp.float32),
+        compiler_options={"optimization_level": level})
+    np.testing.assert_array_equal(np.asarray(matmul(a, b)), expected)
+
+
 @pytest.mark.parametrize("level", ["O0", "O1"])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("junk", [np.nan, np.inf, -np.inf])

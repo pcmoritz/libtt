@@ -89,7 +89,10 @@ http_archive(
         "find docs examples perflab src tests \\( -name BUILD -o -name BUILD.bazel \\) -delete",
         "rm REPO.bazel",
     ],
-    patches = ["//third_party/torch_tpu:subprocess_test_main_module.patch"],
+    patches = [
+        "//third_party/torch_tpu:subprocess_test_main_module.patch",
+        "//third_party/torch_tpu:float8_matmul_references.patch",
+    ],
     sha256 = "a2b630a5a7ae1fbb27aac732f16a14f60173b6e927711dca5b91259052a1b81f",
     strip_prefix = "torch_tpu-0.2.0",
     urls = [
@@ -324,6 +327,7 @@ http_archive(
         "//third_party/tt_metal:inline_small_shard_writes.patch",
         "//third_party/tt_metal:uninitialized_read_buffer.patch",
         "//third_party/tt_metal:all_reduce_sfpu_reductions.patch",
+        "//third_party/tt_metal:all_reduce_unsigned_integers.patch",
         "//third_party/tt_metal:repeat_wide_rows.patch",
         "//third_party/tt_metal:trace_reserved_dram.patch",
         "//third_party/tt_metal:unlocked_blocking_reads.patch",
@@ -373,6 +377,7 @@ http_archive(
         "//third_party/tt_metal:binary_ng_raw_bfloat16_output.patch",
         "//third_party/tt_metal:reshape_tiled_windows.patch",
         "//third_party/tt_metal:pad_last_ktile_float16.patch",
+        "//third_party/tt_metal:pad_last_ktile_float8.patch",
         "//third_party/tt_metal:rms_norm_output_dtype.patch",
         "//third_party/tt_metal:slice_prefix_view.patch",
         "//third_party/tt_metal:reduce_h_zero_padding_rows.patch",
@@ -703,6 +708,8 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_jax_distributed.patch",
         "//third_party/tt_xla:tt_mlir_row_major_all_gather.patch",
         "//third_party/tt_xla:tt_mlir_symmetric_collectives.patch",
+        "//third_party/tt_xla:tt_mlir_bounded_debug_strings.patch",
+        "//third_party/tt_xla:tt_mlir_float8_scaled_matmul.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
