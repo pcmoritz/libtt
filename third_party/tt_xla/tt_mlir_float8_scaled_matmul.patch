@@ -1,0 +1,109 @@
+diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
+--- a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
++++ b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
+@@ -94,6 +94,49 @@ bool hasNativeFloat8Operands(mlir::stablehlo::DotGeneralOp op) {
+          rhsContracting.size() == 1 && rhsContracting[0] == batch;
+ }
+ 
++// A dot_general of float8 values converted to f32 or bfloat16, as
++// torch._scaled_mm's lowering emits, reads the float8 values instead: the
++// conversions are exact, and the matrix unit adds the exact products in f32.
++// It computes in f32, and its result is converted to the original type.
++void readConvertedFloat8Operands(mlir::stablehlo::DotGeneralOp op) {
++  auto lhs = op.getLhs().getDefiningOp<mlir::stablehlo::ConvertOp>();
++  auto rhs = op.getRhs().getDefiningOp<mlir::stablehlo::ConvertOp>();
++  if (!lhs || !rhs || !isFloat8(lhs.getOperand().getType()) ||
++      !isFloat8(rhs.getOperand().getType()) || op.getAlgorithmAttr()) {
++    return;
++  }
++  auto isF32OrBF16 = [](Type type) {
++    Type elementType = getElementTypeOrSelf(type);
++    return elementType.isF32() || elementType.isBF16();
++  };
++  if (!isF32OrBF16(lhs.getType()) || !isF32OrBF16(rhs.getType()) ||
++      !isF32OrBF16(op.getType())) {
++    return;
++  }
++  OpBuilder builder(op);
++  auto dot = builder.create<mlir::stablehlo::DotGeneralOp>(
++      op.getLoc(), withElementType(op.getType(), builder.getF32Type()),
++      lhs.getOperand(), rhs.getOperand(), op.getDotDimensionNumbersAttr(),
++      op.getPrecisionConfigAttr(), /*algorithm=*/nullptr);
++  if (!hasNativeFloat8Operands(dot)) {
++    dot.erase();
++    return;
++  }
++  Value result = dot;
++  if (result.getType() != op.getType()) {
++    result = builder.create<mlir::stablehlo::ConvertOp>(
++        op.getLoc(), result, getElementTypeOrSelf(op.getType()));
++  }
++  op.replaceAllUsesWith(result);
++  op.erase();
++  if (lhs->use_empty()) {
++    lhs.erase();
++  }
++  if (rhs != lhs && rhs->use_empty()) {
++    rhs.erase();
++  }
++}
++
+ // The f32 values of float8 bits (a ui8 tensor): a convert of their float8 view.
+ Value decodeFloat8(OpBuilder &builder, Location loc, Value bits,
+                    Type float8Type) {
+@@ -431,6 +474,13 @@ struct StableHLOFloat8DataTypeConversionPass
+       StableHLOFloat8DataTypeConversionPassBase;
+ 
+   void runOnOperation() override {
++    SmallVector<mlir::stablehlo::DotGeneralOp> dots;
++    getOperation()->walk(
++        [&](mlir::stablehlo::DotGeneralOp op) { dots.push_back(op); });
++    for (mlir::stablehlo::DotGeneralOp op : dots) {
++      readConvertedFloat8Operands(op);
++    }
++
+     // Ops that compute on float8 values compute on f32 values first, and the
+     // conversion below stores the remaining float8 values as their bits.
+     bool anyFloat8 = false;
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -3826,6 +3826,28 @@ static bool isConstantOrParameterArgument(Value value) {
+                        funcOp, argument.getArgNumber());
+ }
+ 
++// If value views the bits of a transposed matrix as another type, as the
++// float8 data type conversion leaves a transposed float8 matrix
++// (bitcast_convert of the permuted ui8 bits), return the untransposed matrix's
++// view, so that the transpose fuses into the matmul like any other.
++static std::optional<mlir::TypedValue<mlir::RankedTensorType>>
++getBitcastPermuteOpOperand(mlir::PatternRewriter &rewriter,
++                           mlir::TypedValue<mlir::RankedTensorType> value) {
++  auto bitcast = value.getDefiningOp<BitcastConvertOp>();
++  if (!bitcast || !bitcast->hasOneUse()) {
++    return std::nullopt;
++  }
++  auto input = getPermuteOpOperand(bitcast.getInput());
++  if (!input || isConstantOrParameterArgument(*input)) {
++    return std::nullopt;
++  }
++  return rewriter
++      .create<BitcastConvertOp>(
++          bitcast.getLoc(),
++          input->getType().clone(value.getType().getElementType()), *input)
++      .getResult();
++}
++
+ // Fuse permute ops into matmul/linear transpose attributes.
+ // Handles both input A and input B for MatmulOp and LinearOp.
+ //
+@@ -3859,6 +3881,9 @@ public:
+     if (inputBCanonical && isConstantOrParameterArgument(*inputBCanonical)) {
+       inputBCanonical = std::nullopt;
+     }
++    if (!inputBCanonical) {
++      inputBCanonical = getBitcastPermuteOpOperand(rewriter, op.getB());
++    }
+ 
+     if (!inputACanonical && !inputBCanonical) {
+       return mlir::failure();
