@@ -73,11 +73,13 @@ diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt
  // Maps per-axis fabric config to TTNN mesh topology for CCL operations.
  static std::vector<mlir::tt::ttcore::Topology>
  fabricConfigToMeshTopology(const tt::runtime::MeshFabricConfig &fabricConfig) {
-@@ -432,6 +497,7 @@
+@@ -432,6 +497,9 @@
    if (!tt_pjrt_status_is_ok(status)) {
      return {status, nullptr};
    }
-+  wrapUnshardedCollectives(*mlir_module, target_num_devices);
++  if (client_instance->isMultiProcess()) {
++    wrapUnshardedCollectives(*mlir_module, target_num_devices);
++  }
  
    // Stable identity of the graph (hash of the SHLO module text), used by the
    // codegen emit/load helpers to key the saved graph directory.
