@@ -194,26 +194,42 @@ diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
  #include <memory>
  #include <vector>
  
-@@ -662,4 +664,23 @@ getMemoryView(Device deviceHandle) {
+@@ -662,4 +664,39 @@ getMemoryView(Device deviceHandle) {
    return memoryMap;
  }
  
++namespace {
++// Allocates the calling thread's DRAM buffers from the symmetric region while
++// it lives, until the collective returns or throws.
++class SymmetricDramScope {
++public:
++  explicit SymmetricDramScope(::tt::tt_metal::Allocator &allocator)
++      : allocator(allocator) {
++    allocator.begin_symmetric_dram();
++  }
++  ~SymmetricDramScope() { allocator.end_symmetric_dram(); }
++  SymmetricDramScope(const SymmetricDramScope &) = delete;
++  SymmetricDramScope &operator=(const SymmetricDramScope &) = delete;
++
++private:
++  ::tt::tt_metal::Allocator &allocator;
++};
++} // namespace
++
 +::ttnn::Tensor
 +runSymmetricCollective(::ttnn::MeshDevice &device,
 +                       const std::function<::ttnn::Tensor()> &collective) {
-+  const auto &allocator = device.allocator();
-+  if (!allocator->has_symmetric_dram()) {
++  ::tt::tt_metal::Allocator &allocator = *device.allocator();
++  if (!allocator.has_symmetric_dram()) {
 +    return collective();
 +  }
 +  ::ttnn::Tensor result;
-+  allocator->begin_symmetric_dram();
-+  try {
++  {
++    SymmetricDramScope scope(allocator);
 +    result = collective();
-+  } catch (...) {
-+    allocator->end_symmetric_dram();
-+    throw;
 +  }
-+  allocator->end_symmetric_dram();
++  // Copied out after the scope ends, outside the region the next collective
++  // reuses.
 +  return ::ttnn::clone(result, std::nullopt, std::nullopt, std::nullopt);
 +}
 +
