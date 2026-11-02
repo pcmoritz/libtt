@@ -1,10 +1,17 @@
-"""SGLang-TorchTPU's Pallas attention kernel and KV cache layout for Tenstorrent.
+"""SGLang-TorchTPU's Pallas kernels and KV cache layout for Tenstorrent.
 
 SGLang-TorchTPU (`sglang_tpu`) exports JAX functions through torch_tpu, and
-its attention kernel is a Pallas TPU kernel that only TPUs run. In TPU
-compatibility mode, `tpu_compat` replaces it with the JAX function below when
-`sglang_tpu` imports it. It takes the kernel's arguments and returns its
-results, with static shapes, so a program compiles once per shape bucket.
+several of them are Pallas TPU kernels that only TPUs run. In TPU
+compatibility mode, `tpu_compat` replaces them with the JAX functions below
+when `sglang_tpu` imports their modules (PATCHES). Each takes its kernel's
+arguments and returns its results, with static shapes, so a program compiles
+once per shape bucket:
+
+- the attention kernel (ragged paged attention v3),
+- DFlash's draft KV write, which applies RoPE to the draft's keys and writes
+  every draft layer's keys and values,
+- hybrid models' recurrent-state copies and their fused Conv1D + gated delta
+  rule (`sglang_tpu_gdn`).
 
 The kernel's KV cache layout, `[pages, page_size, kv_heads * 2 / packing,
 packing, head_dim]`, puts K and V of a head in the last two dimensions, which
@@ -23,6 +30,10 @@ MAX_DECODE_USERS = 32
 
 RPA_V3_MODULE = "sglang_tpu.attention.pallas.ragged_paged_attention_v3"
 KV_POOL_MODULE = "sglang_tpu.kv_pool"
+KV_FUSED_ROPE_WRITE_MODULE = "sglang_tpu.kv_fused_rope_write"
+MAMBA_STATE_COPY_MODULE = "sglang_tpu.mamba_state_copy"
+GDN_MODULE = "sglang_tpu.attention.pallas.gdn"
+BLOCK_DRAFT_WORKER_MODULE = "sglang_tpu.experimental.speculative.block_draft_worker"
 
 
 def _ragged_paged_attention(module):
@@ -99,17 +110,7 @@ def _ragged_paged_attention(module):
         # pool.
         user_pages = table[seq, : min(pages_per_seq, pages - 1)]
         user_positions = jnp.where(live, position, -1)
-        # One TTNN paged update per token, in place. The updates run in order,
-        # so tokens of one sequence never write a page's tile at the same time.
-        # A scatter instead tilized and copied the layer's whole cache on every
-        # call.
-        cache = kv_cache_fused
-        for t in range(tokens):
-            cache = jax.ffi.ffi_call(
-                "tt.paged_update_cache",
-                jax.ShapeDtypeStruct(cache_shape, kv_cache_fused.dtype),
-                input_output_aliases={0: 0},
-            )(cache, new_kv[None, t : t + 1], user_positions[t : t + 1], user_pages[t : t + 1])
+        cache = _update_cache(kv_cache_fused, new_kv, user_positions, user_pages)
         # Each token as a decode user reads its sequence's pages once, which
         # beats gathering them below when there are few tokens per sequence.
         if (
@@ -213,8 +214,169 @@ def _paged_decode(queries, cache, page_table, positions, sm_scale, sliding_windo
     return jnp.concatenate(outputs, axis=1)[0, :, :, cache_head_dim : cache_head_dim + head_dim]
 
 
+def _update_cache(cache, rows, positions, pages):
+    """Writes each token's row with TTNN's paged cache update, in place.
+
+    rows is [tokens, kv_heads, 2 * head_dim]; a token with position -1 is skipped.
+    pages is [tokens, pages_per_token], each token's page table. The updates run
+    in order, so tokens of one sequence never write a page's tile at the same
+    time. A scatter instead tilized and copied the layer's whole cache on every
+    call.
+    """
+    import jax
+
+    for t in range(rows.shape[0]):
+        cache = jax.ffi.ffi_call(
+            "tt.paged_update_cache",
+            jax.ShapeDtypeStruct(cache.shape, cache.dtype),
+            input_output_aliases={0: 0},
+        )(cache, rows[None, t : t + 1], positions[t : t + 1], pages[t : t + 1])
+    return cache
+
+
+def _fused_rope_write_kv_jax(
+    dst_starts, src_starts, span_lens, k, v, cos, sin, *kv_bufs, max_span_len
+):
+    """`fused_rope_write_kv_jax` of the DFlash draft's KV write, without Pallas.
+
+    Rotates K (neox RoPE) and writes every draft layer's K and V into its fused
+    pool buffer, `[pages, kv_heads, page_size, 2 * head_dim]` (patch_kv_pool).
+    The spans map runs of source tokens to runs of destination slots; a token
+    outside every span isn't written.
+    """
+    import jax.numpy as jnp
+
+    num_layers, tokens, heads, head_dim = k.shape
+    cache_shape = kv_bufs[0].shape
+    if len(cache_shape) != 4:
+        raise NotImplementedError(
+            f"KV cache of shape {cache_shape}: only the fused pool's "
+            "[pages, kv_heads, page_size, 2 * head_dim] layout (patch_kv_pool)"
+        )
+    pages, cache_heads, page_size, row = cache_shape
+    cache_head_dim = row // 2
+
+    token = jnp.arange(tokens, dtype=jnp.int32)
+    in_span = (token[:, None] >= src_starts[None, :]) & (
+        token[:, None] < (src_starts + span_lens)[None, :]
+    )
+    live = jnp.any(in_span, axis=1)
+    slot = token + jnp.sum(
+        jnp.where(in_span, (dst_starts - src_starts)[None, :], 0), axis=1
+    )
+    # Each token's page as a one-page table, and its offset in it.
+    token_pages = jnp.clip(slot // page_size, 0, pages - 1)[:, None]
+    positions = jnp.where(live, slot % page_size, -1)
+
+    half = cos.shape[-1]
+    x1, x2 = k[..., :half], k[..., half:]
+    rotated = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+    pad = ((0, 0), (0, 0), (0, cache_heads - heads), (0, cache_head_dim - head_dim))
+    rows = jnp.concatenate([jnp.pad(rotated, pad), jnp.pad(v, pad)], axis=-1)
+    rows = rows.astype(kv_bufs[0].dtype)
+    return [
+        _update_cache(buf, rows[layer], positions, token_pages)
+        for layer, buf in enumerate(kv_bufs)
+    ]
+
+
+def _compiled_state_copy():
+    """`compiled_state_copy` of the recurrent-state copy module, without Pallas.
+
+    Copies hybrid models' recurrent-state slots `pool[src[i]]` to `pool[dst[i]]`
+    for every pair before `count`, in every layer's pool, in place. Later pairs
+    are padding and copy their source onto itself. The rest matches the module's
+    own function.
+    """
+    import functools
+
+    @functools.cache
+    def compiled_state_copy():
+        import jax
+        import jax.numpy as jnp
+        import torch
+        from torch_tpu._internal import pallas
+
+        # torch_tpu's jax_op reads the argument types from the annotations.
+        def copy_slots(
+            pool: jax.Array, src: jax.Array, dst: jax.Array, count: jax.Array
+        ) -> tuple[jax.Array, jax.Array]:
+            live = jnp.arange(src.shape[0], dtype=src.dtype) < count.reshape(-1)[0]
+            return pool.at[jnp.where(live, dst, src)].set(pool[src]), src[0]
+
+        op = pallas.jax_op(
+            "sglang::tpu_mamba_state_copy", copy_slots, donate_argnums=(0,)
+        )
+
+        @op.register_fake
+        def fake(pool, src, dst, count):
+            return torch.empty_like(pool), src.new_empty(())
+
+        @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+        def run(pools, src, dst, count):
+            for pool in pools:
+                result, marker = op(pool, src, dst, count)
+                pool.copy_(result)
+            return marker
+
+        return run
+
+    return compiled_state_copy
+
+
 def patch_rpa_v3(module):
     module.ragged_paged_attention = _ragged_paged_attention(module)
+
+
+def patch_kv_fused_rope_write(module):
+    module.fused_rope_write_kv_jax = _fused_rope_write_kv_jax
+
+
+def patch_mamba_state_copy(module):
+    module.compiled_state_copy = _compiled_state_copy()
+
+
+def patch_block_draft_worker(module):
+    """DFlash's draft KV write, ending in a read of the fused pool's first
+    element in any layout; the module's own reads the 5-D TPU layout."""
+
+    def _write_draft_kv_eager(
+        self,
+        *,
+        target_hidden,
+        cache_loc,
+        positions,
+        cache_loc_2d=None,
+        commit_lens=None,
+    ):
+        kv_pool = self.model_runner.token_to_kv_pool
+        if isinstance(kv_pool, module.SWAKVPool):
+            kv_pool = kv_pool.swa_kv_pool
+        if not isinstance(kv_pool, module.TpuFusedMHATokenToKVPool):
+            raise TypeError(
+                f"{type(self).__name__} needs TpuFusedMHATokenToKVPool, got {type(kv_pool)}."
+            )
+        draft_model = self._draft_model()
+        module.dflash_write_draft_kv(
+            draft_model=draft_model,
+            kv_pool=kv_pool,
+            ctx_hidden=draft_model.project_target_hidden(target_hidden),
+            ctx_positions=positions,
+            ctx_cache_loc=cache_loc,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+            max_num_reqs=self.model_runner.req_to_token_pool.size,
+        )
+        # Read inside the compiled writer, after the write: the KV free fence's tail.
+        return kv_pool.kv_buffer[-1].flatten()[:1]
+
+    module.TpuBlockDraftWorker._write_draft_kv_eager = _write_draft_kv_eager
+
+
+def patch_gdn(module):
+    from jax_plugins.libtt import sglang_tpu_gdn
+
+    module.fused_conv1d_gdn = sglang_tpu_gdn.fused_conv1d_gdn
 
 
 def patch_kv_pool(module):
@@ -257,4 +419,11 @@ def patch_kv_pool(module):
     pool.KV_LAYOUT_NAME = "tt-head-major"
 
 
-PATCHES = {RPA_V3_MODULE: patch_rpa_v3, KV_POOL_MODULE: patch_kv_pool}
+PATCHES = {
+    RPA_V3_MODULE: patch_rpa_v3,
+    KV_POOL_MODULE: patch_kv_pool,
+    KV_FUSED_ROPE_WRITE_MODULE: patch_kv_fused_rope_write,
+    MAMBA_STATE_COPY_MODULE: patch_mamba_state_copy,
+    GDN_MODULE: patch_gdn,
+    BLOCK_DRAFT_WORKER_MODULE: patch_block_draft_worker,
+}

@@ -11,7 +11,7 @@
   does on a TPU, which libtt doesn't trace.
 - torch_tpu's flash attention is a Pallas kernel that only TPUs run, so
   `scaled_dot_product_attention` takes its StableHLO implementation instead.
-- SGLang-TorchTPU's attention kernel runs as JAX (`sglang_tpu_kernels`).
+- SGLang-TorchTPU's Pallas kernels run as JAX (`sglang_tpu_kernels`).
 """
 
 import importlib.abc
