@@ -1,13 +1,13 @@
 diff --git tt_metal/api/tt-metalium/allocator.hpp tt_metal/api/tt-metalium/allocator.hpp
 --- tt_metal/api/tt-metalium/allocator.hpp
 +++ tt_metal/api/tt-metalium/allocator.hpp
-@@ -49,6 +49,18 @@
+@@ -50,6 +50,18 @@ public:
      size_t get_worker_l1_size() const;
      Statistics get_statistics(const BufferType& buffer_type) const;
  
 +    // Collectives between processes write to their peers at the addresses of
-+    // their own buffers. While a symmetric scope is open on a thread, that
-+    // thread's bottom-up DRAM buffers (tensors, not kernel binaries) are
++    // their own buffers. While a thread has a symmetric scope open, one at a
++    // time, its bottom-up DRAM buffers (tensors, not kernel binaries) are
 +    // bump-allocated from [base, base + size_per_bank),
 +    // a region every process reserves the same way, so equal sequences of
 +    // allocations get equal addresses. Their frees are no-ops: the next scope
@@ -32,7 +32,7 @@ diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocat
  
  namespace tt::tt_metal {
  
-@@ -52,6 +54,11 @@
+@@ -52,6 +54,11 @@ public:
  
      DeviceAddr allocate_buffer(Buffer* buffer);
  
@@ -44,7 +44,7 @@ diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocat
      // Set/clear device allocators for HYBRID mode mesh-level lockstep allocation.
      // When set, allocate_buffer() queries these allocators' per-bank ranges
      // so the lockstep allocator avoids regions occupied on any device.
-@@ -209,6 +216,13 @@
+@@ -209,6 +216,13 @@ private:
  
      mutable std::mutex mutex_;
  
@@ -52,7 +52,7 @@ diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocat
 +    DeviceAddr symmetric_base_ = 0;
 +    DeviceAddr symmetric_size_ = 0;
 +    DeviceAddr symmetric_next_ = 0;
-+    int symmetric_depth_ = 0;
++    bool symmetric_active_ = false;
 +    std::thread::id symmetric_thread_;
 +
      std::unique_ptr<BankManager> dram_manager_;
@@ -61,13 +61,13 @@ diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocat
 diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocator.cpp
 --- tt_metal/impl/allocator/allocator.cpp
 +++ tt_metal/impl/allocator/allocator.cpp
-@@ -205,6 +205,19 @@
+@@ -205,6 +205,19 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
  
      switch (buffer_type) {
          case BufferType::DRAM:
 +            // Kernel binaries of programs created in the scope are allocated top down and stay
 +            // outside the region, which the next scope reuses.
-+            if (symmetric_depth_ > 0 && bottom_up && std::this_thread::get_id() == symmetric_thread_) {
++            if (symmetric_active_ && bottom_up && std::this_thread::get_id() == symmetric_thread_) {
 +                TT_FATAL(!num_cores.has_value(), "Symmetric DRAM buffers must be interleaved");
 +                address = symmetric_next_;
 +                symmetric_next_ += detail::calculate_bank_size_spread(
@@ -81,7 +81,7 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
              address = dram_manager_->allocate_buffer(size, page_size, bottom_up, config_->compute_grid, num_cores);
              break;
          case BufferType::L1: {
-@@ -348,7 +361,12 @@
+@@ -348,7 +361,12 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
      }
  
      switch (buffer_type) {
@@ -95,7 +95,7 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
          case BufferType::L1: l1_manager_->deallocate_buffer(address); break;
          case BufferType::L1_SMALL: l1_small_manager_->deallocate_buffer(address); break;
          case BufferType::TRACE: trace_buffer_manager_->deallocate_buffer(address); break;
-@@ -362,6 +380,35 @@
+@@ -362,6 +380,34 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
      }
  }
  
@@ -113,25 +113,24 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
 +void AllocatorImpl::begin_symmetric_dram() {
 +    std::lock_guard<std::mutex> lock(mutex_);
 +    TT_FATAL(symmetric_size_ > 0, "No symmetric DRAM region is set");
-+    TT_FATAL(
-+        symmetric_depth_ == 0 || symmetric_thread_ == std::this_thread::get_id(),
-+        "Only one thread may allocate symmetric DRAM at a time");
-+    if (symmetric_depth_++ == 0) {
-+        symmetric_thread_ = std::this_thread::get_id();
-+        symmetric_next_ = symmetric_base_;
-+    }
++    TT_FATAL(!symmetric_active_, "A symmetric DRAM scope is already open");
++    symmetric_active_ = true;
++    symmetric_thread_ = std::this_thread::get_id();
++    symmetric_next_ = symmetric_base_;
 +}
 +
 +void AllocatorImpl::end_symmetric_dram() {
 +    std::lock_guard<std::mutex> lock(mutex_);
-+    TT_FATAL(symmetric_depth_ > 0, "No symmetric DRAM scope is open");
-+    --symmetric_depth_;
++    TT_FATAL(
++        symmetric_active_ && symmetric_thread_ == std::this_thread::get_id(),
++        "No symmetric DRAM scope is open on this thread");
++    symmetric_active_ = false;
 +}
 +
  void AllocatorImpl::deallocate_buffers() {
      std::lock_guard<std::mutex> lock(mutex_);
      this->release_trace_dram_reservations();
-@@ -880,6 +927,16 @@
+@@ -883,6 +929,16 @@ Statistics Allocator::get_statistics(const BufferType& buffer_type) const { retu
  
  size_t Allocator::get_worker_l1_size() const { return impl_->get_worker_l1_size(); }
  
