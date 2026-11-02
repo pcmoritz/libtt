@@ -67,11 +67,8 @@ def test_rms_norm_residual(trace, rows, width, weight_dtype, tmp_path):
         hf = expected_sum.astype(np.float32)
         var = np.mean(hf * hf, axis=-1, keepdims=True)
         expected_norm = hf / np.sqrt(var + eps) * w.astype(np.float32)
-        # The sum is exact in FP32; packing it to BF16 rounds ties up where
-        # NumPy rounds them to even, one ulp apart.
-        np.testing.assert_allclose(
-            np.asarray(actual_sum).astype(np.float32), expected_sum.astype(np.float32), rtol=2**-7, atol=0
-        )
+        # The program adds in FP32 and rounds to nearest even, as NumPy does.
+        _assert_same_bits(actual_sum, expected_sum)
         np.testing.assert_allclose(
             np.asarray(actual_norm).astype(np.float32), expected_norm, atol=1e-2, rtol=1e-2
         )
@@ -81,6 +78,10 @@ def test_rms_norm_residual(trace, rows, width, weight_dtype, tmp_path):
         "ttnn.rms_norm_residual" in path.read_text()
         for path in (tmp_path / "irs").glob("ttnn*.mlir")
     ), "the add and the norm were not fused"
+
+
+def _assert_same_bits(actual, expected):
+    np.testing.assert_array_equal(np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16))
 
 
 def _reference(x, r, w, eps=1e-6):
@@ -112,7 +113,7 @@ def test_rms_norm_residual_with_an_earlier_consumer_of_the_sum(tmp_path):
     w = rng.uniform(0.5, 1.5, (5120,)).astype(jnp.float32)
     other, n, h = run(*(jax.device_put(v, device) for v in (x, r, w)))
     expected_norm, expected_sum = _reference(x, r, w)
-    np.testing.assert_allclose(np.asarray(h).astype(np.float32), expected_sum.astype(np.float32), rtol=2**-7, atol=0)
+    _assert_same_bits(h, expected_sum)
     np.testing.assert_allclose(
         np.asarray(other).astype(np.float32), np.maximum(expected_sum.astype(np.float32), 0), rtol=2**-7, atol=0
     )
@@ -164,7 +165,36 @@ def test_rms_norm_residual_with_the_weight_cast_after_the_add(tmp_path):
     w = rng.uniform(0.5, 1.5, (5120,)).astype(jnp.bfloat16)
     n, h = run(*(jax.device_put(v, device) for v in (x, r, w)))
     expected_norm, expected_sum = _reference(x, r, w)
-    np.testing.assert_allclose(np.asarray(h).astype(np.float32), expected_sum.astype(np.float32), rtol=2**-7, atol=0)
+    _assert_same_bits(h, expected_sum)
     np.testing.assert_allclose(np.asarray(n).astype(np.float32), expected_norm, atol=1e-2, rtol=1e-2)
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn*.mlir")]
+    assert irs and any("ttnn.rms_norm_residual" in ir for ir in irs), "the add and the norm were not fused"
+
+
+@pytest.mark.parametrize("rows", [1, 4])
+def test_rms_norm_residual_of_an_fp32_residual_add(rows, tmp_path):
+    """PyTorch models (SGLang's fused add + RMSNorm) add the residual in FP32,
+    keep it narrowed to BF16 and normalize the FP32 sum. The fused op's sum,
+    rounded to nearest even, is that narrowed residual bit for bit, even with
+    operands far apart in magnitude."""
+    eps = 1e-6
+    width = 4096
+
+    def layer(x, r, w):
+        s = x.astype(jnp.float32) + r.astype(jnp.float32)
+        var = jnp.sum(jnp.power(s, 2), axis=-1, keepdims=True) / width
+        n = s * lax.rsqrt(var + eps) * w.astype(jnp.float32)
+        return n.astype(jnp.bfloat16), s.astype(jnp.bfloat16)
+
+    run = jax.jit(layer, compiler_options={"optimization_level": "O1", "export_path": str(tmp_path)})
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(7)
+    x = (rng.normal(0, 1, (rows, width)) * 2.0 ** rng.integers(-12, 12, (rows, width))).astype(jnp.bfloat16)
+    r = rng.normal(0, 3, (rows, width)).astype(jnp.bfloat16)
+    w = rng.uniform(0.5, 1.5, (width,)).astype(jnp.bfloat16)
+    n, h = run(*(jax.device_put(v, device) for v in (x, r, w)))
+    expected_norm, expected_sum = _reference(x, r, w)
+    _assert_same_bits(h, expected_sum)
+    np.testing.assert_allclose(np.asarray(n).astype(np.float32), expected_norm, atol=2e-2, rtol=1e-2)
     irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn*.mlir")]
     assert irs and any("ttnn.rms_norm_residual" in ir for ir in irs), "the add and the norm were not fused"

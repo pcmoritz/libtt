@@ -116,22 +116,46 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3819,6 +3819,76 @@ public:
+@@ -3819,6 +3819,99 @@ public:
    }
  };
  
 +// Fuses the residual add that feeds a decode RMS norm into the norm, with the
 +// sum as a second result since the next layer adds to it:
 +//   sum = add(x, r); norm = rms_norm(sum, w)  ->  norm, sum = rms_norm_residual(x, r, w)
-+// for one tile row of activations, which the fused program handles.
++// for one tile row of activations, which the fused program handles. PyTorch
++// models add the residual in FP32 and narrow it:
++//   sum = typecast(add(typecast(x), typecast(r)))
++// is the same sum, since the program adds in FP32 and rounds to nearest even.
 +class RMSNormResidualFusionPattern : public mlir::OpRewritePattern<RMSNormOp> {
 +public:
 +  using mlir::OpRewritePattern<RMSNormOp>::OpRewritePattern;
 +
 +  mlir::LogicalResult
 +  matchAndRewrite(RMSNormOp op, mlir::PatternRewriter &rewriter) const override {
-+    auto add = op.getInput().getDefiningOp<AddOp>();
-+    if (!add || !op.getWeight() || op.getBias()) {
++    if (!op.getWeight() || op.getBias()) {
++      return failure();
++    }
++    Operation *add = op.getInput().getDefiningOp<AddOp>();
++    Value lhs, rhs;
++    if (add) {
++      lhs = add->getOperand(0);
++      rhs = add->getOperand(1);
++    } else if (auto narrow = op.getInput().getDefiningOp<TypecastOp>()) {
++      auto wideAdd = narrow.getInput().getDefiningOp<AddOp>();
++      if (!wideAdd || !wideAdd->hasOneUse() ||
++          !wideAdd.getType().getElementType().isF32()) {
++        return failure();
++      }
++      auto lhsCast = wideAdd.getLhs().getDefiningOp<TypecastOp>();
++      auto rhsCast = wideAdd.getRhs().getDefiningOp<TypecastOp>();
++      if (!lhsCast || !rhsCast) {
++        return failure();
++      }
++      add = narrow;
++      lhs = lhsCast.getInput();
++      rhs = rhsCast.getInput();
++    } else {
 +      return failure();
 +    }
 +    auto type = mlir::cast<RankedTensorType>(op.getInput().getType());
@@ -148,8 +172,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    }
 +    if (op.getNormalizedShape().size() != 1 ||
 +        op.getNormalizedShape()[0] != type.getDimSize(1) ||
-+        op.getType() != type || add->getOperand(0).getType() != type ||
-+        add->getOperand(1).getType() != type) {
++        op.getType() != type || lhs.getType() != type || rhs.getType() != type) {
 +      return failure();
 +    }
 +    auto weightType = mlir::cast<RankedTensorType>(op.getWeight().getType());
@@ -182,8 +205,8 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +      return failure();
 +    }
 +    auto fused = rewriter.create<RMSNormResidualOp>(
-+        op.getLoc(), TypeRange{op.getType(), type}, add->getOperand(0),
-+        add->getOperand(1), op.getWeight(), op.getEpsilonAttr());
++        op.getLoc(), TypeRange{op.getType(), type}, lhs, rhs, op.getWeight(),
++        op.getEpsilonAttr());
 +    rewriter.replaceOp(op, fused.getOutput());
 +    rewriter.replaceOp(add, fused.getSum());
 +    return success();
