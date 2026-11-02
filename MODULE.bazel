@@ -327,6 +327,7 @@ http_archive(
         "//third_party/tt_metal:inline_small_shard_writes.patch",
         "//third_party/tt_metal:uninitialized_read_buffer.patch",
         "//third_party/tt_metal:all_reduce_sfpu_reductions.patch",
+        "//third_party/tt_metal:all_reduce_unsigned_integers.patch",
         "//third_party/tt_metal:repeat_wide_rows.patch",
         "//third_party/tt_metal:trace_reserved_dram.patch",
         "//third_party/tt_metal:unlocked_blocking_reads.patch",

@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -1061,11 +1061,11 @@
+@@ -1056,18 +1056,23 @@ TTNNOperandsWorkaroundsFactory::createReductionOpOperandsWorkarounds(
        mlir::cast<mlir::RankedTensorType>(op->getOperand(0).getType())
            .getElementType();
    // Keep supported integer reductions exact: Float32 rounds values above
@@ -16,3 +16,16 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
         (mlir::isa<ttnn::SumOp>(op) && !inputType.isUnsignedInteger()) ||
         mlir::isa<ttnn::ReduceBitwiseAndOp, ttnn::ReduceBitwiseOrOp,
                   ttnn::ReduceBitwiseXorOp>(op));
+   TTNNOperandWorkarounds operandWorkaround;
+   if (!inputType.isF32() && !inputType.isBF16() && !supportsInt32) {
++    // Other integer sums run on Int32, which wraps like their type once cast
++    // back; through Float32, a uint16 sum saturated at 65535.
++    bool integerSum = mlir::isa<ttnn::SumOp>(op) && inputType.isInteger() &&
++                      inputType.getIntOrFloatBitWidth() > 1;
+     operandWorkaround.tensorDataTypeWorkaround =
+-        mlir::tt::ttcore::DataType::Float32;
++        integerSum ? mlir::tt::ttcore::DataType::Int32
++                   : mlir::tt::ttcore::DataType::Float32;
+   }
+ 
+   return wa::TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
