@@ -1,0 +1,40 @@
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp
+@@ -72,12 +72,18 @@ Tensor local_sum(
+         input_tensor = ttnn::to_layout(gathered_tensor, Layout::TILE);
+     }
+ 
+-    bool do_typecast = false;
+-    // moreh_sum does not support bfloat8_b
+-    if (input_tensor.dtype() == DataType::BFLOAT8_B) {
+-        // cast up to bfloat16 prior to sum
+-        do_typecast = true;
+-        input_tensor = ttnn::typecast(input_tensor, DataType::BFLOAT16);
++    // moreh_sum sums BFLOAT16 and INT32 only: cast bfloat8_b up to bfloat16,
++    // and unsigned integers to INT32, whose sum wraps like theirs once cast
++    // back.
++    const DataType dtype = input_tensor.dtype();
++    std::optional<DataType> sum_dtype;
++    if (dtype == DataType::BFLOAT8_B) {
++        sum_dtype = DataType::BFLOAT16;
++    } else if (dtype == DataType::UINT8 || dtype == DataType::UINT16 || dtype == DataType::UINT32) {
++        sum_dtype = DataType::INT32;
++    }
++    if (sum_dtype) {
++        input_tensor = ttnn::typecast(input_tensor, *sum_dtype);
+     }
+ 
+     auto sum_tensor = ttnn::moreh_sum(
+@@ -88,9 +94,8 @@ Tensor local_sum(
+         memory_config,
+         /* device kernel config */ std::nullopt);
+ 
+-    if (do_typecast) {
+-        // cast back down to bfloat8_b
+-        sum_tensor = ttnn::typecast(sum_tensor, DataType::BFLOAT8_B);
++    if (sum_dtype) {
++        sum_tensor = ttnn::typecast(sum_tensor, dtype);
+     }
+     if (is_rm) {
+         return ttnn::to_layout(sum_tensor, Layout::ROW_MAJOR);

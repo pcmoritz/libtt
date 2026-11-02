@@ -1,10 +1,11 @@
-"""Collectives and sums of 8- and 16-bit integers.
+"""Collectives and sums of 8-, 16- and 32-bit unsigned integers.
 
-TT-NN's sums take BFLOAT16 and INT32 only, so a psum or sum of uint8 or uint16
-failed ("moreh_sum input only supports specific data types"). torch.distributed's
-object collectives send pickled bytes as uint8 tensors, and torch_tpu's
-broadcast sums them. libtt runs collectives and reductions of narrow integers
-on 32-bit integers: a gather is exact, and a sum wraps as the narrow type would.
+TT-NN's sum (moreh_sum) takes BFLOAT16 and INT32 only, so a psum of uint8 or
+uint16 failed ("moreh_sum input only supports specific data types"), and
+tt-mlir summed other integers through Float32, so a sum of uint16 saturated
+at 65535 instead of wrapping. torch.distributed's object collectives send
+pickled bytes as uint8 tensors, and torch_tpu's broadcast sums them. Both now
+sum on INT32 and cast back, which wraps as the narrow type would.
 """
 
 import jax
@@ -13,7 +14,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-DTYPES = [np.int8, np.uint8, np.int16, np.uint16]
+DTYPES = [np.int8, np.uint8, np.int16, np.uint16, np.uint32]
 
 
 def mesh():
