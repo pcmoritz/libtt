@@ -257,3 +257,53 @@ def test_rotary_prefill(tmp_path, trace, rotary):
         x1, x2 = xf[..., :half], xf[..., half:rotary]
         expected = np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s, xf[..., rotary:]], axis=-1)
         np.testing.assert_allclose(actual, expected, atol=0.05, rtol=0.02)
+
+
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize("tokens,heads", [(1, 2), (1, 16), (4, 8)])
+@pytest.mark.parametrize("user", ["pad", "tail"])
+@pytest.mark.parametrize("level", ["O0", "O1"])
+def test_rotary_of_pytorch_head_views(tmp_path, trace, tokens, heads, user, level):
+    """PyTorch (SGLang-TorchTPU) slices the halves of the heads' rows
+    [tokens * heads, 128] and then views them as [tokens, heads, 64]; cos and
+    sin are the halves of one cache row per token. The rotated query is padded
+    for attention, and the rotated key gets the value appended and is reshaped
+    to rank 4. Both become one fused rotary, also at O0, which torch_tpu
+    compiles at and where no op model validates the rotary."""
+
+    def rotate(x, cos_sin, v):
+        x1 = x[:, :64].reshape(tokens, heads, 64)
+        x2 = x[:, 64:].reshape(tokens, heads, 64)
+        c, s = cos_sin[:, None, :64], cos_sin[:, None, 64:]
+        if user == "pad":
+            out = jnp.concatenate([x1 * c - x2 * s, x2 * c + x1 * s], axis=-1)
+            return jnp.pad(out, ((0, 0), (0, 0), (0, 128)))
+        out = jnp.concatenate([x1 * c - x2 * s, x2 * c + x1 * s, v], axis=-1)
+        return out.reshape(1, tokens, heads, 256)
+
+    run = jax.jit(
+        rotate,
+        compiler_options={
+            "optimization_level": level,
+            "enable_trace": str(trace).lower(),
+            "export_path": str(tmp_path),
+        },
+    )
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(19)
+    for step in range(3):  # Warmup, capture, and replay with changed inputs.
+        x = rng.normal(0, 1, (tokens * heads, 128)).astype(jnp.bfloat16)
+        v = rng.normal(0, 1, (tokens, heads, 128)).astype(jnp.bfloat16)
+        angles = rng.uniform(-3, 3, (tokens, 64))
+        cos_sin = np.concatenate([np.cos(angles), np.sin(angles)], axis=-1).astype(jnp.bfloat16)
+        actual = np.asarray(run(*(jax.device_put(a, device) for a in (x, cos_sin, v)))).astype(np.float32)
+        if step == 0:
+            irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+            assert any("ttnn.rotary_embedding" in ir for ir in irs)
+        xf = x.astype(np.float32).reshape(tokens, heads, 128)
+        c, s = (a.astype(np.float32)[:, None, :] for a in (cos_sin[:, :64], cos_sin[:, 64:]))
+        x1, x2 = xf[..., :64], xf[..., 64:]
+        rotated = np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s], axis=-1)
+        tail = np.zeros_like(rotated) if user == "pad" else v.astype(np.float32)
+        expected = np.concatenate([rotated, tail], axis=-1)
+        np.testing.assert_allclose(actual.reshape(tokens, heads, 256), expected, atol=0.05, rtol=0.02)
