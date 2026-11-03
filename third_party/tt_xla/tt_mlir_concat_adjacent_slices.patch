@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3753,6 +3753,107 @@ public:
+@@ -3753,6 +3753,170 @@ public:
  
  } // namespace
  
@@ -106,15 +106,79 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +  }
 +};
 +
++// Rows [a, b) of a row reshaped to a matrix, [1, N] -> [R, C] -> [b - a, C],
++// are the row's columns [a * C, b * C), reshaped. Tiled, rows that start inside
++// a tile are untilized, cut and tilized again, while the row is cut at a tile
++// boundary in one slice. torch_tpu lowers PyTorch's per-head views of a fused
++// projection's q, k and v this way, possibly through a typecast.
++class RowsOfReshapedRowPattern : public mlir::OpRewritePattern<SliceStaticOp> {
++public:
++  using mlir::OpRewritePattern<SliceStaticOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(SliceStaticOp op, mlir::PatternRewriter &rewriter) const final {
++    auto cast = op.getInput().getDefiningOp<TypecastOp>();
++    auto reshape = (cast ? cast.getInput() : op.getInput()).getDefiningOp<ReshapeOp>();
++    if (!reshape) {
++      return mlir::failure();
++    }
++    auto row = mlir::cast<RankedTensorType>(reshape.getInput().getType());
++    auto matrix = mlir::cast<RankedTensorType>(reshape.getType());
++    const auto wide = [](int64_t size) { return size != 1; };
++    const int64_t rank = matrix.getRank();
++    if (rank < 2 || llvm::count_if(row.getShape(), wide) != 1 ||
++        llvm::any_of(matrix.getShape().drop_back(2), wide)) {
++      return mlir::failure();
++    }
++    auto at = [](ArrayAttr attr, int64_t d) {
++      return mlir::cast<IntegerAttr>(attr[d]).getInt();
++    };
++    for (int64_t d = 0; d < rank; ++d) {
++      const bool whole = at(op.getBegins(), d) == 0 && at(op.getEnds(), d) == matrix.getDimSize(d);
++      if (at(op.getStep(), d) != 1 || (d != rank - 2 && !whole)) {
++        return mlir::failure();
++      }
++    }
++    constexpr int64_t kTileDim = 32;
++    const int64_t first = at(op.getBegins(), rank - 2), last = at(op.getEnds(), rank - 2);
++    const int64_t cols = matrix.getDimSize(rank - 1);
++    if (first < 0 || last <= first || first % kTileDim == 0 || first * cols % kTileDim != 0) {
++      return mlir::failure();
++    }
++    const int64_t axis = llvm::find_if(row.getShape(), wide) - row.getShape().begin();
++    SmallVector<int32_t> begins(row.getRank(), 0), ends, steps(row.getRank(), 1);
++    for (int64_t size : row.getShape()) {
++      ends.push_back(static_cast<int32_t>(size));
++    }
++    begins[axis] = first * cols;
++    ends[axis] = last * cols;
++    SmallVector<int64_t> shape(row.getShape());
++    shape[axis] = (last - first) * cols;
++    Value slice = rewriter.create<SliceStaticOp>(
++        op.getLoc(), RankedTensorType::get(shape, row.getElementType(), row.getEncoding()),
++        reshape.getInput(), rewriter.getI32ArrayAttr(begins), rewriter.getI32ArrayAttr(ends),
++        rewriter.getI32ArrayAttr(steps));
++    if (cast) {
++      slice = rewriter.create<TypecastOp>(
++          cast.getLoc(), RankedTensorType::get(shape, op.getType().getElementType(), row.getEncoding()),
++          slice);
++    }
++    rewriter.replaceOp(op, utils::createReshapeOp(rewriter, op.getLoc(), slice,
++                                                  op.getType().getShape()));
++    return mlir::success();
++  }
++};
++
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -3804,6 +3905,8 @@ public:
+@@ -3804,6 +3968,9 @@ public:
        patterns.add<SpatialMeanOptimizationPattern>(&getContext());
        patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
        patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
 +      patterns.add<ConcatOfAdjacentSlicesPattern>(&getContext());
 +      patterns.add<SliceOfSqueezedRowPattern>(&getContext());
++      patterns.add<RowsOfReshapedRowPattern>(&getContext());
        if (permuteSliceAfterMatmulEnabled) {
          patterns.add<PermuteSliceAfterMatmulPattern>(&getContext());
        }
