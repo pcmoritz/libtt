@@ -89,3 +89,49 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fi
  }
  
  // Row-major helpers for 32-bit elements (float32/int32/uint32).
+diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/reader_interleaved_col_bcast.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/reader_interleaved_col_bcast.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/reader_interleaved_col_bcast.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/reader_interleaved_col_bcast.cpp
+@@ -10,6 +10,23 @@
+ #include "api/tensor/noc_traits.h"
+ #include "ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp"
+ 
++// A column fill (or the LLK's column unpack) uses only the left faces, 0 and 2, of a column
++// operand's tile. Every core reads this same tile from one DRAM bank, where whole-tile reads queue
++// up, so read only those faces of a 32x32 tile whose elements are addressable (not a block float).
++// An FP32 [4, 4096] * [4, 1] took 11.4 us instead of 7.7.
++template <uint32_t cb_id, typename Accessor>
++FORCE_INLINE void read_left_faces(
++    Noc& noc, const Accessor& src, CircularBuffer& cb, uint32_t tile_bytes, uint32_t page_id) {
++    if (get_tile_num_faces(cb_id) == 4 && get_tile_hw(cb_id) == 1024 && tile_bytes % 1024 == 0) {
++        const uint32_t face_bytes = tile_bytes / 4;
++        noc.async_read(src, cb, face_bytes, {.page_id = page_id}, {.offset_bytes = 0});
++        noc.async_read(
++            src, cb, face_bytes, {.page_id = page_id, .offset_bytes = 2 * face_bytes}, {.offset_bytes = 2 * face_bytes});
++    } else {
++        noc.async_read(src, cb, tile_bytes, {.page_id = page_id}, {.offset_bytes = 0});
++    }
++}
++
+ void kernel_main() {
+     const uint32_t src_addr = get_arg_val<uint32_t>(0);
+     const uint32_t start_tile_id = get_arg_val<uint32_t>(1);
+@@ -109,7 +126,7 @@
+ #if SRC_BCAST
+                         cb_src.reserve_back(onetile);
+ #if !SRC_SHARDED
+-                        noc.async_read(src, cb_src, src_tile_bytes, {.page_id = tile_offset + th}, {.offset_bytes = 0});
++                        read_left_faces<cb_id_src>(noc, src, cb_src, src_tile_bytes, tile_offset + th);
+                         noc.async_read_barrier();
+ #endif
+ #if !BCAST_LLK
+@@ -120,8 +137,7 @@
+ #if SRC_BCAST_B
+                         cb_src_b.reserve_back(onetile);
+ #if !SRC_SHARDED_B
+-                        noc.async_read(
+-                            src_b, cb_src_b, src_tile_bytes_b, {.page_id = tile_offset_b + th}, {.offset_bytes = 0});
++                        read_left_faces<cb_id_src_b>(noc, src_b, cb_src_b, src_tile_bytes_b, tile_offset_b + th);
+                         noc.async_read_barrier();
+ #endif
+ #if !BCAST_LLK
