@@ -279,6 +279,25 @@ def test_native_float8_matmul_flushes_subnormal_operands(dtype, subnormal, one):
     np.testing.assert_array_equal(product, np.zeros((32, 32), np.float32))
 
 
+@pytest.mark.parametrize("rows", [1, 3, 16, 32])
+@pytest.mark.parametrize("k,n", [(4096, 6144), (4096, 1536), (3072, 4096)])
+def test_float8_decode_matmul(rows, k, n):
+    """torch._scaled_mm of a decode batch: a tile row of float8 activations and a transposed float8
+    weight, which tt-metal's decode matmul reads natively, the activation's partial faces included."""
+    rng = np.random.default_rng(rows + k + n)
+    x = random_float8((rows, k), jnp.float8_e4m3fn, rng)
+    w = random_float8((n, k), jnp.float8_e4m3fn, rng)
+    product = jax.jit(
+        lambda x, w: jnp.dot(
+            x.astype(jnp.float32), w.T.astype(jnp.float32), preferred_element_type=jnp.float32
+        )
+    )(x, w)
+    x64, w64 = flush_subnormals(x).astype(np.float64), flush_subnormals(w).astype(np.float64)
+    scale = np.abs(x64) @ np.abs(w64.T)
+    error = np.abs(np.asarray(product).astype(np.float64) - x64 @ w64.T) / np.maximum(scale, 1e-30)
+    assert np.max(error) < 2.0**-9
+
+
 @pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("dtype", FORMATS)
 def test_matmul_of_converted_float8_reads_float8(tmp_path, dtype, out_dtype):

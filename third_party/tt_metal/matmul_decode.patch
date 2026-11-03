@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
  #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
  #include "ttnn/types.hpp"
  #include <algorithm>
-@@ -1024,16 +1025,278 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
+@@ -1024,16 +1025,282 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
  }
  }  // namespace bmm_op_utils
  
@@ -112,10 +112,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +    const auto b_shape_padded = utilities::get_matmul_tensor_padded_shape(input_tensor_b, attributes.transpose_b);
 +    const uint32_t K = a_shape_padded[-1];
 +    const uint32_t N = b_shape_padded[-1];
-+    if (input_tensor_a.dtype() != DataType::BFLOAT16 || input_tensor_a.layout() != Layout::TILE ||
-+        !utilities::is_dram_interleaved(input_tensor_a.memory_config())) {
++    const auto a_dtype = input_tensor_a.dtype();
++    if ((a_dtype != DataType::BFLOAT16 && a_dtype != DataType::FP8_E4M3 && a_dtype != DataType::FP8_E5M2) ||
++        input_tensor_a.layout() != Layout::TILE || !utilities::is_dram_interleaved(input_tensor_a.memory_config())) {
 +        return fmt::format(
-+            "input A must be a tiled BFLOAT16 tensor in interleaved DRAM, got dtype {}, layout {}, memory config {}",
++            "input A must be a tiled BFLOAT16 or float8 tensor in interleaved DRAM, got dtype {}, layout {}, memory "
++            "config {}",
 +            input_tensor_a.dtype(),
 +            input_tensor_a.layout(),
 +            input_tensor_a.memory_config());
@@ -262,11 +264,13 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +                decode_config.in0_block_w = banks;
 +            }
 +        }
-+        // Only for BF16 outputs: matmul_decode reads BF16 activations only, so an
-+        // FP32 matmul of a BF16 activation keeps summing in the order of one of
-+        // the activation cast to FP32.
++        // Only for BF16 outputs or float8 activations: matmul_decode reads no
++        // FP32 activations, so an FP32 matmul of a BF16 activation keeps
++        // summing in the order of one of the activation cast to FP32.
 +        const bool bf16_output =
-+            attributes.output_dtype.value_or(input_tensor_a.dtype()) == tt::tt_metal::DataType::BFLOAT16;
++            attributes.output_dtype.value_or(input_tensor_a.dtype()) == tt::tt_metal::DataType::BFLOAT16 ||
++            input_tensor_a.dtype() == tt::tt_metal::DataType::FP8_E4M3 ||
++            input_tensor_a.dtype() == tt::tt_metal::DataType::FP8_E5M2;
 +        // The decode program once its output tiles fill at least half of the
 +        // worker cores (one output tile each) for a BF16 output, all of them for
 +        // FP32; the 1D matmul's K loop is slower per core: Qwen3.8-Flash-Next's
@@ -396,7 +400,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
-@@ -0,0 +1,409 @@
+@@ -0,0 +1,411 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -541,8 +545,10 @@ new file mode 100644
 +    const uint32_t a_rows = a.logical_volume() / a.logical_shape()[-1];
 +    uint32_t rows_tile_h = TILE_HEIGHT;
 +    if (!config.fuse_swiglu && !bias_tensor.has_value()) {
++        // The sender reads each face's rows on their own, 64-byte aligned:
++        // at least 2 rows of BF16, 4 of float8.
 +        for (const uint32_t h : {2u, 4u, 8u, 16u}) {
-+            if (a_rows <= h) {
++            if (a_rows <= h && h * 16 * a.element_size() >= 64) {
 +                rows_tile_h = h;
 +                break;
 +            }
@@ -1237,7 +1243,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_sender.cpp
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,99 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1290,17 +1296,18 @@ new file mode 100644
 +
 +    cb_in0.reserve_back(Kt);
 +    const uint32_t base = cb_in0.get_write_ptr();
-+    // Tiles of rows_tile_h < 32 rows hold just the top rows of faces 0 and 1 of the activation's BF16 tiles
-+    // in DRAM (512 bytes a face), 32 bytes a row.
++    // Tiles of rows_tile_h < 32 rows hold just the top rows of faces 0 and 1 of the activation's tiles in
++    // DRAM, 16 elements a row and 256 a face.
 +    constexpr uint32_t rows_tile_h = get_named_compile_time_arg_val("rows_tile_h");
 +    auto read_chunk = [&](uint32_t chunk) {
 +        for (uint32_t k = 0; k < in0_mcast_w; ++k) {
 +            const uint32_t tile = chunk * in0_mcast_w + k;
 +            if constexpr (rows_tile_h < 32) {
-+                constexpr uint32_t face_bytes = rows_tile_h * 32;
++                constexpr uint32_t element_bytes = tile_bytes / (rows_tile_h * 32);
++                constexpr uint32_t face_bytes = rows_tile_h * 16 * element_bytes;
 +                const uint32_t local = base + tile * tile_bytes;
 +                noc_async_read(input.get_noc_addr(k_start + tile), local, face_bytes);
-+                noc_async_read(input.get_noc_addr(k_start + tile, 512), local + face_bytes, face_bytes);
++                noc_async_read(input.get_noc_addr(k_start + tile, 256 * element_bytes), local + face_bytes, face_bytes);
 +            } else {
 +                noc_async_read_tile(k_start + tile, input, base + tile * tile_bytes);
 +            }
