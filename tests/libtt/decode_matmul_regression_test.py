@@ -36,6 +36,10 @@ def _bfp8(weights):
         (1, 1024, 5120 + 24, False, False, "bfp_bf8"),
         (1, 1024, 5120 + 24, False, True, "bfp_bf8"),
         (1, 1024, 5120 + 24, True, False, "bfp_bf8"),
+        # Few output tiles split K, and a share of 64 or more K tiles is read
+        # in several blocks: the 4-chip Qwen3-8B qkv projection.
+        (1, 4096, 1536, False, True, "bf16"),
+        (1, 12288, 1536, False, False, "bfp_bf8"),
     ],
 )
 def test_decode_matmul(rows, inner_size, width, residual, transposed, weight_dtype):
