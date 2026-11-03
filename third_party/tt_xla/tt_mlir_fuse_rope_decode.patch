@@ -144,7 +144,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
  
    // sub: x1*cos - x2*sin => subSlice0 = x1 (first half), subSlice1 = x2
    // add: x2*cos + x1*sin => addSlice0 = x2, addSlice1 = x1
-@@ -642,37 +692,101 @@ mlir::LogicalResult RoPEComplexRotationFusingPattern::matchAndRewrite(
+@@ -642,37 +692,93 @@ mlir::LogicalResult RoPEComplexRotationFusingPattern::matchAndRewrite(
      return failure();
    }
  
@@ -164,30 +164,17 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 -  cosFullShape[lastDim] *= 2;
 -  auto cosFullType =
 -      RankedTensorType::get(cosFullShape, cosHalfType.getElementType());
-+  // The decode form works at rank 4, [1, B, H, D], with caches [1, B, 1, D],
-+  // and reshapes the result back to [B, H, D]; a reshape to rank 4 for
-+  // attention then folds away. One token uses token_index 0; a batch of
-+  // tokens, each at its own position, rotates token b by cache row b.
-+  Location loc = srcOp.getLoc();
-+  const int64_t batch = decodeForm ? rotatedShape.front() : 1;
-+  SmallVector<int64_t> workShape(resultType.getShape());
-+  if (decodeForm) {
-+    workShape.insert(workShape.begin(), 1);
-+  }
-+  int64_t lastDim = workShape.size() - 1;
-+  // A value at the working rank: the working shape with its own last dim.
-+  auto atWorkRank = [&](Value value) {
-+    auto type = mlir::cast<RankedTensorType>(value.getType());
-+    SmallVector<int64_t> shape(workShape);
-+    shape.back() = type.getShape().back();
-+    return reshapeTo(rewriter, loc, value,
-+                     RankedTensorType::get(shape, type.getElementType()));
-+  };
- 
+-
 -  SmallVector<int64_t> sinFullShape(sinHalfType.getShape());
 -  sinFullShape[lastDim] *= 2;
 -  auto sinFullType =
 -      RankedTensorType::get(sinFullShape, sinHalfType.getElementType());
++  // The decode form rotates [B, H, D] as [1, B, H, D], with caches
++  // [1, B, 1, D]. One token uses token_index 0; a batch of tokens, each at its
++  // own position, rotates token b by cache row b.
++  Location loc = srcOp.getLoc();
++  const int64_t batch = decodeForm ? rotatedShape.front() : 1;
++
 +  // cos/sin are half-dim, one row per token in the decode form. Match both
 +  // before rewriting anything: halfCache only unwraps and validates. In the
 +  // decode form both halves must broadcast the same cache value: the sources
@@ -237,15 +224,20 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 +    shape.back() *= 2;
 +    return rewriter.create<ConcatOp>(
 +        loc, RankedTensorType::get(shape, type.getElementType()),
-+        ValueRange{half, half}, rewriter.getSI32IntegerAttr(lastDim));
++        ValueRange{half, half},
++        rewriter.getSI32IntegerAttr(type.getRank() - 1));
 +  };
  
 -  replaceWithRoPEComposite(srcOp, rewriter, xSource, cosFull, sinFull,
 -                           resultType);
-+  Value x = reshapeTo(rewriter, loc, xSource, xType);
++  // The rotary result is reshaped back to xType, where a tail is appended
++  // unchanged. A later reshape of the decode form to rank 4 folds away.
++  SmallVector<int64_t> rotaryShape(xType.getShape());
 +  if (decodeForm) {
-+    x = atWorkRank(x);
++    rotaryShape.insert(rotaryShape.begin(), 1);
 +  }
++  auto rotaryType = RankedTensorType::get(rotaryShape, xType.getElementType());
++  Value x = reshapeTo(rewriter, loc, xSource, rotaryType);
 +  // A decode batch of up to a tile row of tokens always has a typed rotary,
 +  // so it is promoted even where no op model validates composites (O0).
 +  SmallVector<NamedAttribute> compositeAttributes;
@@ -261,16 +253,17 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 +      compositeAttributes.empty()
 +          ? DictionaryAttr()
 +          : rewriter.getDictionaryAttr(compositeAttributes);
-+  Value replacement = createRoPEComposite(
-+      srcOp, rewriter, x, selfConcat(cosHalf), selfConcat(sinHalf),
-+      mlir::cast<RankedTensorType>(x.getType()), attributes);
++  Value replacement = reshapeTo(
++      rewriter, loc,
++      createRoPEComposite(srcOp, rewriter, x, selfConcat(cosHalf),
++                          selfConcat(sinHalf), rotaryType, attributes),
++      xType);
 +  if (tail) {
 +    replacement = rewriter.create<ConcatOp>(
-+        loc, RankedTensorType::get(workShape, resultType.getElementType()),
-+        ValueRange{replacement, decodeForm ? atWorkRank(tail) : tail},
-+        rewriter.getSI32IntegerAttr(lastDim));
++        loc, resultType, ValueRange{replacement, tail},
++        rewriter.getSI32IntegerAttr(resultType.getRank() - 1));
 +  }
-+  rewriter.replaceOp(srcOp, reshapeTo(rewriter, loc, replacement, resultType));
++  rewriter.replaceOp(srcOp, replacement);
    return success();
  }
  
