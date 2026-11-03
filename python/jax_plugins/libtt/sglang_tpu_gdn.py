@@ -8,11 +8,13 @@ results with static shapes. A decode batch (`batched_only`, one token per
 request) takes one recurrence step for every request at once, and a speculative
 verify batch (`num_spec_tokens`) one step per window position, keeping the
 states after each. Both run TTNN's gated delta decode kernel, which updates the
-recurrent state pool in place. An extend batch (`prefill_only`) runs the
-chunkwise-parallel recurrence over 64-token chunks. New states go into the
-pools in place with TTNN's state pool update.
+recurrent state pool in place. An extend batch (`prefill_only`) runs TTNN's
+chunked gated delta rule over each request's tokens, as SGLang-JAX does on
+Tenstorrent. New states go into the pools in place with TTNN's state pool
+update.
 
-The chunked recurrence comes from SGLang-JAX's gated delta rule
+The chunked recurrence, which runs instead without the kernels, comes from
+SGLang-JAX's gated delta rule
 (`sgl_jax/srt/kernels/gdn/gated_delta.py`, Apache-2.0), which serves Qwen3.5 on
 Tenstorrent. State layouts are SGLang-TorchTPU's: conv state
 `[slots, kernel_size - 1, 1, conv_dim]` (or without the 1), recurrent state
@@ -193,6 +195,42 @@ def _gated_delta_steps(pool, mixed, b, a, a_log, dt_bias, read_rows, has_init, h
         pool, targets.reshape(-1), jnp.stack(states, axis=1).reshape(reqs * steps, n_v, d_k, d_v)
     )
     return pool, jnp.stack(outs, axis=1).reshape(reqs * steps, n_v, d_v)
+
+
+def _gated_delta_rule(pool, mixed, b, a, a_log, dt_bias, starts, slots, has_init, heads):
+    """TTNN's chunked gated delta rule over each request's tokens, one row of
+    `tokens` positions per request. mixed is [T, conv_dim] after SiLU, packed;
+    returns the pool and the output, [T, n_v, d_v], packed.
+    """
+    n_kq, n_v, d_k, d_v = heads
+    tokens = mixed.shape[0]
+    reqs = slots.shape[0]
+    lens = starts[1:] - starts[:-1]
+    pos = jnp.arange(tokens, dtype=jnp.int32)
+    valid = pos[None, :] < lens[:, None]
+    rows = jnp.minimum(starts[:-1, None] + pos[None, :], tokens - 1)
+    mixed = mixed[rows]
+    key_dim = n_kq * d_k
+    # The kernel lets each q/k head serve its group of value heads.
+    q = _l2norm(mixed[..., :key_dim].reshape(reqs, tokens, n_kq, d_k)) * d_k**-0.5
+    k = _l2norm(mixed[..., key_dim : 2 * key_dim].reshape(reqs, tokens, n_kq, d_k))
+    v = mixed[..., 2 * key_dim :].reshape(reqs, tokens, n_v, d_v).astype(jnp.float32)
+    beta, g = _gates(b[rows], a[rows], a_log, dt_bias)
+    # Zero beta and log decay keep the state past a request's tokens; zero
+    # queries zero their output.
+    q = jnp.where(valid[..., None, None], q, 0)
+    beta, g = (jnp.where(valid[..., None], x, 0) for x in (beta, g))
+    init = jnp.where(has_init[:, None, None, None], pool[slots], 0).astype(jnp.float32)
+    state, out = jax.ffi.ffi_call(
+        "tt.gated_delta_rule",
+        (jax.ShapeDtypeStruct(init.shape, jnp.float32), jax.ShapeDtypeStruct(v.shape, jnp.float32)),
+        vmap_method="sequential",
+    )(q, k, v, g, beta, init)
+    pool = _write_rows(pool, slots, state)
+    # Back to packed order; a token past starts[-1] gets zeros.
+    req = jnp.clip(jnp.sum(pos[:, None] >= starts[None, 1:], axis=1), 0, reqs - 1)
+    out = out[req, jnp.clip(pos - starts[req], 0, tokens - 1)]
+    return pool, jnp.where((pos < starts[-1])[:, None, None], out, 0)
 
 
 def _verify(qkv, b, a, a_log, dt_bias, conv_state, recurrent_state, conv_weight, conv_bias,
@@ -438,6 +476,11 @@ def fused_conv1d_gdn(
             qkv, conv_state, conv_weight, conv_bias, starts, slots, has_init
         )
         conv_state = _write_rows(conv_state, slots, windows)
+        if KERNELS and d_k == d_v == 128:
+            recurrent_state, out = _gated_delta_rule(
+                recurrent_state, jax.nn.silu(mixed), b, a, a_log, dt_bias, starts, slots, has_init, heads
+            )
+            return (conv_state, recurrent_state), out.astype(qkv.dtype).reshape(tokens, n_v * d_v)
         beta, g = _gates(b, a, a_log, dt_bias)
         q, k, v = _split_heads(jax.nn.silu(mixed), n_kq, n_v, d_k, d_v)
         valid = (jnp.arange(tokens, dtype=jnp.int32) < starts[-1])[:, None]
