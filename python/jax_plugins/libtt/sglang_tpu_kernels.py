@@ -284,9 +284,10 @@ def _compiled_state_copy():
     """`compiled_state_copy` of the recurrent-state copy module, without Pallas.
 
     Copies hybrid models' recurrent-state slots `pool[src[i]]` to `pool[dst[i]]`
-    for every pair before `count`, in every layer's pool, in place. Later pairs
-    are padding and copy their source onto itself. The rest matches the module's
-    own function.
+    for every pair before `count`, in every layer's pool, in place, with TTNN's
+    state pool copy, 32 pairs at a time. Later pairs are padding, and they and
+    pairs that copy a slot onto itself become slot 0 pairs, which the copy skips.
+    The rest matches the module's own function.
     """
     import functools
 
@@ -302,7 +303,18 @@ def _compiled_state_copy():
             pool: jax.Array, src: jax.Array, dst: jax.Array, count: jax.Array
         ) -> tuple[jax.Array, jax.Array]:
             live = jnp.arange(src.shape[0], dtype=src.dtype) < count.reshape(-1)[0]
-            return pool.at[jnp.where(live, dst, src)].set(pool[src]), src[0]
+            live = live & (src != dst)
+            sources = jnp.where(live, src, 0).astype(jnp.int32)
+            targets = jnp.where(live, dst, 0).astype(jnp.int32)
+            copy = jax.ffi.ffi_call(
+                "tt.state_pool_copy",
+                jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+                input_output_aliases={0: 0},
+                vmap_method="sequential",
+            )
+            for start in range(0, src.shape[0], 32):
+                pool = copy(pool, sources[start : start + 32], targets[start : start + 32])
+            return pool, src[0]
 
         op = pallas.jax_op(
             "sglang::tpu_mamba_state_copy", copy_slots, donate_argnums=(0,)

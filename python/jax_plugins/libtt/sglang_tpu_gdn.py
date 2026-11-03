@@ -7,22 +7,28 @@ TPU compatibility mode, `sglang_tpu_kernels` replaces it with
 results with static shapes. A decode batch (`batched_only`, one token per
 request) takes one recurrence step for every request at once, and a speculative
 verify batch (`num_spec_tokens`) one step per window position, keeping the
-states after each. An extend batch (`prefill_only`) runs the chunkwise-parallel
-recurrence over 64-token chunks.
+states after each. Both run TTNN's gated delta decode kernel, which updates the
+recurrent state pool in place. An extend batch (`prefill_only`) runs the
+chunkwise-parallel recurrence over 64-token chunks. New states go into the
+pools in place with TTNN's state pool update.
 
 The chunked recurrence comes from SGLang-JAX's gated delta rule
 (`sgl_jax/srt/kernels/gdn/gated_delta.py`, Apache-2.0), which serves Qwen3.5 on
 Tenstorrent. State layouts are SGLang-TorchTPU's: conv state
 `[slots, kernel_size - 1, 1, conv_dim]` (or without the 1), recurrent state
 `[slots, n_v, d_k, d_v]`.
-Slot 0 is the reserved null slot, which padded rows point at and which is never
-written.
+Slot 0 is the reserved null slot, which padded rows point at; it holds garbage.
 """
 
 import jax
 import jax.numpy as jnp
 
 CHUNK = 64
+# TTNN's recurrent-state kernels (tt_mlir_recurrent_attention.patch). Without
+# them, as in a CPU check, the same steps run in JAX on copies of the pools.
+KERNELS = True
+# Rows per TTNN state pool update.
+MAX_ROWS = 32
 
 
 def _l2norm(x, eps=1e-6):
@@ -35,6 +41,23 @@ def _scatter_slots(pool, slots, values):
     keep = (slots == 0).reshape((-1,) + (1,) * (pool.ndim - 1))
     values = jnp.where(keep, pool[slots], values.astype(pool.dtype))
     return pool.at[slots].set(values)
+
+
+def _write_rows(pool, slots, rows):
+    """pool[slots[i]] = rows[i], in place."""
+    rows = rows.astype(pool.dtype).reshape(slots.shape[0], *pool.shape[1:])
+    if not KERNELS:
+        return _scatter_slots(pool, slots, rows)
+    update = jax.ffi.ffi_call(
+        "tt.state_pool_update",
+        jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={0: 0},
+        vmap_method="sequential",
+    )
+    for start in range(0, slots.shape[0], MAX_ROWS):
+        end = start + MAX_ROWS
+        pool = update(pool, slots[start:end].astype(jnp.int32), rows[start:end])
+    return pool
 
 
 def _split_heads(mixed, n_kq, n_v, d_k, d_v):
@@ -72,8 +95,7 @@ def _conv_decode(qkv, conv_state, conv_weight, conv_bias, slots, has_init):
     )
     if conv_bias is not None:
         out = out + conv_bias.astype(jnp.float32)
-    new = window[:, 1:].reshape(slots.shape[0], *conv_state.shape[1:])
-    return out, _scatter_slots(conv_state, slots, new)
+    return out, window[:, 1:]
 
 
 def _conv_extend(qkv, conv_state, conv_weight, conv_bias, starts, slots, has_init):
@@ -109,7 +131,7 @@ def _conv_extend(qkv, conv_state, conv_weight, conv_bias, starts, slots, has_ini
         qkv[jnp.clip(src, 0, tokens - 1)],
         jnp.take_along_axis(history, hist_idx[..., None], axis=1),
     )
-    return out, _scatter_slots(conv_state, slots, new.reshape(reqs, *conv_state.shape[1:]))
+    return out, new
 
 
 def _decode_step(state, q, k, v, g, beta):
@@ -121,8 +143,60 @@ def _decode_step(state, q, k, v, g, beta):
     return state, jnp.einsum("bhkv,bhk->bhv", state, q)
 
 
-def _verify(qkv, beta, g, conv_state, recurrent_state, conv_weight, conv_bias, starts,
-            slots, read_rows, has_init, window, heads):
+def _gated_delta_steps(pool, mixed, b, a, a_log, dt_bias, read_rows, has_init, heads, state_slots=None):
+    """Gated delta steps over the rows of the convolution output mixed,
+    [B * T, conv_dim] after SiLU, T rows per state.
+
+    State s starts from pool row read_rows[s] (zeros without has_init[s]), and
+    the state after its step t goes to row state_slots[s, t], or back to
+    read_rows[s] for one step without state_slots. Returns the pool and the
+    output, [B * T, n_v, d_v].
+    """
+    n_kq, n_v, d_k, d_v = heads
+    reqs = read_rows.shape[0]
+    steps = 1 if state_slots is None else state_slots.shape[1]
+    if KERNELS and d_k == d_v == 128:
+        if b.dtype != a.dtype:
+            b, a = b.astype(jnp.float32), a.astype(jnp.float32)
+        slots = () if state_slots is None else (state_slots.astype(jnp.int32),)
+        return jax.ffi.ffi_call(
+            "tt.gated_delta_decode",
+            (
+                jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+                jax.ShapeDtypeStruct((mixed.shape[0], n_v, d_v), jnp.float32),
+            ),
+            input_output_aliases={0: 0},
+            vmap_method="sequential",
+        )(
+            pool,
+            mixed.astype(jnp.float32),
+            b,
+            a,
+            a_log.astype(jnp.float32),
+            dt_bias.astype(jnp.float32),
+            read_rows.astype(jnp.int32),
+            has_init.astype(jnp.bfloat16),
+            *slots,
+        )
+    beta, g = _gates(b, a, a_log, dt_bias)
+    q, k, v = _split_heads(mixed, n_kq, n_v, d_k, d_v)
+    per_state = lambda x: x.reshape(reqs, steps, *x.shape[1:])
+    q, k, v, beta, g = map(per_state, (q, k, v, beta, g))
+    state = jnp.where(has_init[:, None, None, None], pool[read_rows], 0).astype(jnp.float32)
+    states, outs = [], []
+    for t in range(steps):
+        state, out = _decode_step(state, q[:, t], k[:, t], v[:, t], g[:, t], beta[:, t])
+        states.append(state)
+        outs.append(out)
+    targets = read_rows[:, None] if state_slots is None else state_slots
+    pool = _scatter_slots(
+        pool, targets.reshape(-1), jnp.stack(states, axis=1).reshape(reqs * steps, n_v, d_k, d_v)
+    )
+    return pool, jnp.stack(outs, axis=1).reshape(reqs * steps, n_v, d_v)
+
+
+def _verify(qkv, b, a, a_log, dt_bias, conv_state, recurrent_state, conv_weight, conv_bias,
+            starts, slots, read_rows, has_init, window, heads):
     """Speculative verify windows of up to `window` tokens per request.
 
     Request s reads its states from row read_rows[s] and writes the states after
@@ -146,24 +220,22 @@ def _verify(qkv, beta, g, conv_state, recurrent_state, conv_weight, conv_bias, s
     if conv_bias is not None:
         mixed = mixed + conv_bias.astype(jnp.float32)
     windows = jnp.stack([full[:, i + 1 : i + taps] for i in range(window)], axis=1)
-    conv_state = _scatter_slots(
-        conv_state, rows, windows.reshape(reqs * window, *conv_state.shape[1:])
-    )
+    conv_state = _write_rows(conv_state, rows, windows)
 
-    q, k, v = _split_heads(jax.nn.silu(mixed), n_kq, n_v, d_k, d_v)  # [B, W, H, *]
-    beta, g = beta[idx], g[idx]  # [B, W, H]
-    state = jnp.where(has_init[:, None, None, None], recurrent_state[read_rows], 0)
-    state = state.astype(jnp.float32)
-    states, outs = [], []
-    for i in range(window):
-        state, out = _decode_step(state, q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i])
-        states.append(state)
-        outs.append(out)
-    recurrent_state = _scatter_slots(
-        recurrent_state, rows, jnp.stack(states, axis=1).reshape(reqs * window, n_v, d_k, d_v)
+    flat = lambda x: x[idx].reshape(reqs * window, *x.shape[1:])
+    recurrent_state, outs = _gated_delta_steps(
+        recurrent_state,
+        jax.nn.silu(mixed).reshape(reqs * window, dim),
+        flat(b),
+        flat(a),
+        a_log,
+        dt_bias,
+        read_rows,
+        has_init,
+        heads,
+        state_slots=rows.reshape(reqs, window),
     )
     # Each token's output from its request's window.
-    outs = jnp.stack(outs, axis=1).reshape(reqs * window, n_v, d_v)
     token = jnp.arange(tokens, dtype=jnp.int32)
     req = jnp.clip(jnp.sum(token[:, None] >= starts[None, 1:], axis=1), 0, reqs - 1)
     pos = jnp.clip(token - starts[req], 0, window - 1)
@@ -345,26 +417,28 @@ def fused_conv1d_gdn(
     starts = jnp.minimum(query_start_loc, query_start_loc[distribution[2]])
     lens = starts[1:] - starts[:-1]
     has_init = (seq_lens - lens) > 0
-    beta, g = _gates(b, a, a_log, dt_bias)
+    heads = (n_kq, n_v, d_k, d_v)
 
     if num_spec_tokens:
         out, conv_state, recurrent_state = _verify(
-            qkv, beta, g, conv_state, recurrent_state, conv_weight, conv_bias, starts, slots,
-            jnp.where(live, slots + read_offsets, 0), has_init, num_spec_tokens + 1,
-            (n_kq, n_v, d_k, d_v),
+            qkv, b, a, a_log, dt_bias, conv_state, recurrent_state, conv_weight, conv_bias,
+            starts, slots, jnp.where(live, slots + read_offsets, 0), has_init,
+            num_spec_tokens + 1, heads,
         )
-        return (conv_state, recurrent_state), out.astype(qkv.dtype).reshape(tokens, n_v * d_v)
-    if batched_only:
+    elif batched_only:
         if tokens != reqs:
             raise NotImplementedError("decode batches of one token per request only")
-        mixed, conv_state = _conv_decode(qkv, conv_state, conv_weight, conv_bias, slots, has_init)
-        q, k, v = _split_heads(jax.nn.silu(mixed), n_kq, n_v, d_k, d_v)
-        state = jnp.where(has_init[:, None, None, None], recurrent_state[slots], 0)
-        state, out = _decode_step(state.astype(jnp.float32), q, k, v, g, beta)
+        mixed, windows = _conv_decode(qkv, conv_state, conv_weight, conv_bias, slots, has_init)
+        conv_state = _write_rows(conv_state, slots, windows)
+        recurrent_state, out = _gated_delta_steps(
+            recurrent_state, jax.nn.silu(mixed), b, a, a_log, dt_bias, slots, has_init, heads
+        )
     else:
-        mixed, conv_state = _conv_extend(
+        mixed, windows = _conv_extend(
             qkv, conv_state, conv_weight, conv_bias, starts, slots, has_init
         )
+        conv_state = _write_rows(conv_state, slots, windows)
+        beta, g = _gates(b, a, a_log, dt_bias)
         q, k, v = _split_heads(jax.nn.silu(mixed), n_kq, n_v, d_k, d_v)
         valid = (jnp.arange(tokens, dtype=jnp.int32) < starts[-1])[:, None]
         init = jnp.where(has_init[:, None, None, None], recurrent_state[slots], 0)
@@ -377,5 +451,5 @@ def fused_conv1d_gdn(
             init.astype(jnp.float32),
             starts,
         )
-    recurrent_state = _scatter_slots(recurrent_state, slots, state)
+        recurrent_state = _write_rows(recurrent_state, slots, state)
     return (conv_state, recurrent_state), out.astype(qkv.dtype).reshape(tokens, n_v * d_v)

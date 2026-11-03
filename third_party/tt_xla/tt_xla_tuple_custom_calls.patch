@@ -1,0 +1,69 @@
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -830,14 +830,64 @@ tt_pjrt_status ModuleBuilder::convertFromVHLOToSHLO(
+   return tt_pjrt_status::kSuccess;
+ }
+ 
++// XLA gives a custom call with several results a single tuple result, which
++// get_tuple_element ops take apart: so torch_tpu's JAX functions reach libtt
++// with them, and Shardy rejects tuples. Give each such call one result per
++// tuple element, as JAX emits it; its result layouts and output-operand
++// aliases already count the elements.
++static void flattenTupleCustomCalls(mlir::ModuleOp module) {
++  llvm::SmallVector<mlir::stablehlo::CustomCallOp> calls;
++  module.walk([&](mlir::stablehlo::CustomCallOp op) {
++    if (op->getNumResults() != 1) {
++      return;
++    }
++    mlir::Value result = op->getResult(0);
++    auto tuple = mlir::dyn_cast<mlir::TupleType>(result.getType());
++    if (tuple &&
++        llvm::none_of(tuple.getTypes(),
++                      [](mlir::Type type) {
++                        return mlir::isa<mlir::TupleType>(type);
++                      }) &&
++        llvm::all_of(result.getUsers(), [](mlir::Operation *user) {
++          return mlir::isa<mlir::stablehlo::GetTupleElementOp>(user);
++        })) {
++      calls.push_back(op);
++    }
++  });
++  for (mlir::stablehlo::CustomCallOp op : calls) {
++    llvm::SmallVector<mlir::NamedAttribute> attributes;
++    for (mlir::NamedAttribute attribute : op->getAttrs()) {
++      // The tuple's shape, which XLA keeps for its own HLO.
++      if (attribute.getName() != "xla_shape") {
++        attributes.push_back(attribute);
++      }
++    }
++    mlir::OpBuilder builder(op);
++    auto flat = builder.create<mlir::stablehlo::CustomCallOp>(
++        op.getLoc(),
++        mlir::cast<mlir::TupleType>(op->getResult(0).getType()).getTypes(),
++        op->getOperands(), attributes);
++    for (mlir::Operation *user :
++         llvm::make_early_inc_range(op->getResult(0).getUsers())) {
++      auto element = mlir::cast<mlir::stablehlo::GetTupleElementOp>(user);
++      element.getResult().replaceAllUsesWith(
++          flat->getResult(element.getIndex()));
++      element.erase();
++    }
++    op.erase();
++  }
++}
++
+ tt_pjrt_status ModuleBuilder::runFrontendSHLOPipeline(
+     mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
+     const std::optional<std::string> &export_path,
+     const std::string &model_name) {
+ 
++  mlir::ModuleOp module = mlir_module.get();
++  flattenTupleCustomCalls(module);
++
+   // JAX may give each shard_map or sharding its own mesh; tt-mlir compiles
+   // for one, and the sharding analysis below reads shardings against it.
+-  mlir::ModuleOp module = mlir_module.get();
+   if (mlir::failed(mlir::tt::shardy_utils::mergeMeshes(module))) {
+     LOG_F(ERROR, "Failed to merge the module's meshes");
+     return tt_pjrt_status::kInternal;
