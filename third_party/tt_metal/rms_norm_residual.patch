@@ -2,7 +2,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,208 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -22,14 +22,18 @@ new file mode 100644
 +#include "ckernel_sfpu_conversions.h"
 +
 +namespace ckernel::sfpu {
-+// Rounds a DST face of FP32 values to nearest even at BF16 precision, in
-+// place, so that packing them to BF16 keeps them unchanged.
-+// add_binary_tile's NearestEven option does nothing with FP32 DST
-+// accumulation, so the sum is rounded in a pass of its own.
-+inline void round_to_bf16_nearest_even() {
++// out = in0 + in1 over ITERATIONS SFPU rows of a DST face: added in FP32 and
++// rounded to nearest even at BF16 precision, so that packing the sum to BF16
++// keeps it unchanged. add_binary_tile's NearestEven option does nothing with
++// FP32 DST accumulation.
++template <int ITERATIONS>
++inline void add_round_to_bf16(uint32_t in0, uint32_t in1, uint32_t out) {
++    // A DST tile is 32 SFPU rows.
++    constexpr uint32_t tile = 32;
 +#pragma GCC unroll 0
-+    for (int d = 0; d < 8; ++d) {
-+        sfpi::dst_reg[0] = float32_to_bf16_rne(sfpi::dst_reg[0]);
++    for (int d = 0; d < ITERATIONS; ++d) {
++        const sfpi::vFloat sum = sfpi::dst_reg[in0 * tile] + sfpi::vFloat(sfpi::dst_reg[in1 * tile]);
++        sfpi::dst_reg[out * tile] = float32_to_bf16_rne(sum);
 +        sfpi::dst_reg++;
 +    }
 +}
@@ -82,26 +86,27 @@ new file mode 100644
 +    cb_wait_front(cb_residual, count);
 +    cb_reserve_back(cb_sum, count);
 +    cb_reserve_back(cb_sum_out, count);
++    // An SFPU iteration covers eight columns of four rows of a face, so the
++    // add covers just the input's rows, in the top faces for up to 16 rows;
++    // the other rows keep the input's padding.
++    constexpr int add_iterations = rows <= 16 ? (rows + 3) / 4 * 2 : 8;
++    constexpr VectorMode add_mode = rows <= 16 ? VectorMode::R : VectorMode::RC;
 +    constexpr uint32_t pairs = batch / 2;
++    // The input and residual have one format, and the SFPU add keeps clear of
++    // the copy's address modifiers, so both are set up once.
++    copy_init(cb_input);
++    add_binary_tile_init();
 +    for (uint32_t b = 0; b < count; b += pairs) {
 +        const uint32_t n = count - b < pairs ? count - b : pairs;
 +        tile_regs_acquire();
-+        copy_init(cb_input);
 +        for (uint32_t j = 0; j < n; ++j) {
 +            copy_tile(cb_input, b + j, 2 * j);
-+        }
-+        copy_init(cb_residual);
-+        for (uint32_t j = 0; j < n; ++j) {
 +            copy_tile(cb_residual, b + j, 2 * j + 1);
 +        }
-+        add_binary_tile_init();
 +        for (uint32_t j = 0; j < n; ++j) {
-+            add_binary_tile(2 * j, 2 * j + 1, 2 * j);
-+        }
-+        binop_with_scalar_tile_init();
-+        for (uint32_t j = 0; j < n; ++j) {
-+            MATH(SFPU_UNARY_CALL_NO_TEMPLATE_ARGS(
-+                DST_SYNC_MODE, DST_ACCUM_MODE, round_to_bf16_nearest_even, 2 * j, VectorMode::RC));
++            MATH((SFPU_BINARY_CALL(
++                DST_SYNC_MODE, DST_ACCUM_MODE, add_round_to_bf16, (add_iterations), 2 * j, 2 * j + 1, 2 * j,
++                add_mode)));
 +        }
 +        tile_regs_commit();
 +        tile_regs_wait();
