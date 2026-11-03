@@ -121,7 +121,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3819,6 +3819,123 @@ public:
+@@ -3819,6 +3819,125 @@ public:
    }
  };
  
@@ -194,7 +194,9 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +            utils::lookThroughLayoutOps(other).getDefiningOp<OnesOp>()
 +                ? std::optional<double>(1.0)
 +                : getSplatConstantValue(other);
++        // A BF16 weight widened to FP32 and added there, as the program does.
 +        if (cast && offset && operand.getType() == weightAdd.getType() &&
++            weightAdd.getType().getElementType().isF32() &&
 +            mlir::cast<RankedTensorType>(cast.getInput().getType())
 +                .getElementType()
 +                .isBF16()) {

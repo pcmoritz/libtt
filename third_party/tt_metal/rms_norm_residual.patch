@@ -2,7 +2,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,233 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -151,9 +151,7 @@ new file mode 100644
 +            tile_regs_acquire();
 +            for (uint32_t j = 0; j < n; ++j) {
 +                copy_tile(cb_weight, b + j, j);
-+                MATH(SFPU_UNARY_CALL(
-+                    DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
-+                    (APPROX, ckernel::sfpu::ADD, 8, DST_ACCUM_MODE), j, VectorMode::RC, weight_offset));
++                add_unary_tile(j, weight_offset);
 +            }
 +            pack_block(cb_weight_offset, b, n);
 +        }
@@ -485,7 +483,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_res
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,266 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -632,7 +630,8 @@ new file mode 100644
 +    make_cb(8, 1, tt::DataFormat::Float32);         // every core's sums of squares, one column per core
 +    make_cb(9, 1, tt::DataFormat::Float32);         // rsqrt(mean + eps), one per row, a column
 +    make_cb(10, max_count, row_format);             // norm, for the writer
-+    if (params.weight_offset != 0.0f) {
++    // Like the kernel, on the offset's bits.
++    if (std::bit_cast<uint32_t>(params.weight_offset) != 0) {
 +        make_cb(11, max_count, tt::DataFormat::Float32);  // weight + weight_offset
 +    }
 +    const uint32_t l1_bytes =
