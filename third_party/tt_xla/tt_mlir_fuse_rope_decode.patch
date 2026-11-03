@@ -275,6 +275,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
  }
  
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
+index 1682aa3..defdbc0 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
 @@ -400,6 +400,9 @@ static void registerBuiltinComposites() {
@@ -309,18 +310,20 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect
              /*compute_config=*/nullptr);
        },
        /*promotionGuard=*/nullptr};
-@@ -761,7 +767,13 @@ static LogicalResult inlineDecomposition(ttcore::CompositeOp compositeOp,
+@@ -761,7 +767,15 @@ static LogicalResult inlineDecomposition(ttcore::CompositeOp compositeOp,
  static Operation *tryCreateTypedOp(ttcore::CompositeOp compositeOp,
                                     OpBuilder &builder,
                                     CompositeResolution resolution) {
 -  if (resolution == CompositeResolution::Inline) {
-+  // A composite its fusion marks promote_unvalidated (the decode rotary) has
-+  // a typed op that supports it, so it is promoted even when nothing can
-+  // validate it (O0, where composites are otherwise inlined).
++  // Auto reaches the pass only when nothing can validate composites (O0).
++  // They are inlined then, except those a fusion marks promote_unvalidated
++  // (the decode rotary), whose typed op always supports them. An explicit
++  // Inline inlines every composite.
 +  auto attributes = compositeOp.getCompositeAttributes();
 +  const bool promoteUnvalidated =
 +      attributes && attributes->contains("promote_unvalidated");
-+  if (resolution == CompositeResolution::Inline && !promoteUnvalidated) {
++  if (resolution == CompositeResolution::Inline ||
++      (resolution == CompositeResolution::Auto && !promoteUnvalidated)) {
      return nullptr;
    }
  
@@ -337,3 +340,57 @@ diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RotaryEmbeddi
    int64_t originalSeqLen = resultShape[resultShape.size() - 2];
    if (originalSeqLen % TILE_HEIGHT == 0) {
      return std::nullopt;
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+index f767a5a..bb28184 100644
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -180,9 +180,9 @@ void createTTNNPipelineLoweringPasses(OpPassManager &pm,
+ // Resolve composite ops into typed ops or inline their decompositions.
+ //
+ // Auto (the default) upgrades to Validate when the optimizer and OpModel are
+-// available, otherwise falls back to Inline. Inline and ForcePromote are always
+-// respected. Validate warns and falls back to Inline when prerequisites are
+-// absent.
++// available. Otherwise it stays Auto, which inlines composites except those
++// marked promote_unvalidated. Inline and ForcePromote are always respected.
++// Validate warns and falls back to Inline when prerequisites are absent.
+ void createTTNNResolveCompositesPass(
+     OpPassManager &pm, const TTIRToTTNNCommonPipelineOptions &options) {
+   CompositeResolution resolution = options.compositeResolution;
+@@ -193,10 +193,8 @@ void createTTNNResolveCompositesPass(
+   const bool canValidate = false;
+ #endif
+ 
+-  // Resolve Auto to a concrete mode.
+-  if (resolution == CompositeResolution::Auto) {
+-    resolution = canValidate ? CompositeResolution::Validate
+-                             : CompositeResolution::Inline;
++  if (resolution == CompositeResolution::Auto && canValidate) {
++    resolution = CompositeResolution::Validate;
+   }
+ 
+   // Warn if Validate was explicitly requested but prerequisites are absent.
+@@ -229,7 +227,7 @@ void createTTNNResolveCompositesPass(
+   }
+ #endif
+ 
+-  // ForcePromote or Inline.
++  // ForcePromote, Inline, or Auto without validation.
+   TTNNResolveCompositesOptions resolveOptions;
+   resolveOptions.compositeResolution = resolution;
+   pm.addPass(createTTNNResolveComposites(resolveOptions));
+diff --git a/include/ttmlir/Dialect/TTNN/Utils/CompositeResolution.h b/include/ttmlir/Dialect/TTNN/Utils/CompositeResolution.h
+index 4edc1fa..03b60c5 100644
+--- a/include/ttmlir/Dialect/TTNN/Utils/CompositeResolution.h
++++ b/include/ttmlir/Dialect/TTNN/Utils/CompositeResolution.h
+@@ -9,7 +9,9 @@ namespace mlir::tt::ttnn {
+ 
+ // Controls how ttcore.composite ops are resolved in TTNNResolveComposites:
+ //   Auto         — pipeline decides: Validate when optimizer+OpModel available,
+-//                  else Inline. This is the default when no option is given.
++//                  else Inline, except composites a fusion marks
++//                  promote_unvalidated. This is the default when no option is
++//                  given.
+ //   Inline       — always inline the decomposition body; never upgraded.
+ //   Validate     — promote to typed op if OpModel validates, else inline.
+ //   ForcePromote — unconditionally promote (testing only).
