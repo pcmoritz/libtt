@@ -144,7 +144,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
  
    // sub: x1*cos - x2*sin => subSlice0 = x1 (first half), subSlice1 = x2
    // add: x2*cos + x1*sin => addSlice0 = x2, addSlice1 = x1
-@@ -642,37 +692,93 @@ mlir::LogicalResult RoPEComplexRotationFusingPattern::matchAndRewrite(
+@@ -642,37 +692,88 @@ mlir::LogicalResult RoPEComplexRotationFusingPattern::matchAndRewrite(
      return failure();
    }
  
@@ -240,23 +240,18 @@ diff --git a/lib/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.cpp b/lib/Dial
 +  Value x = reshapeTo(rewriter, loc, xSource, rotaryType);
 +  // A decode batch of up to a tile row of tokens always has a typed rotary,
 +  // so it is promoted even where no op model validates composites (O0).
-+  SmallVector<NamedAttribute> compositeAttributes;
++  NamedAttrList attributes;
 +  if (decodeForm && batch == 1) {
-+    compositeAttributes.push_back(rewriter.getNamedAttr(
-+        "token_index", rewriter.getUI32IntegerAttr(0)));
++    attributes.set("token_index", rewriter.getUI32IntegerAttr(0));
 +  }
 +  if (decodeForm && batch <= 32) {
-+    compositeAttributes.push_back(
-+        rewriter.getNamedAttr("promote_unvalidated", rewriter.getUnitAttr()));
++    attributes.set("promote_unvalidated", rewriter.getUnitAttr());
 +  }
-+  DictionaryAttr attributes =
-+      compositeAttributes.empty()
-+          ? DictionaryAttr()
-+          : rewriter.getDictionaryAttr(compositeAttributes);
 +  Value replacement = reshapeTo(
 +      rewriter, loc,
 +      createRoPEComposite(srcOp, rewriter, x, selfConcat(cosHalf),
-+                          selfConcat(sinHalf), rotaryType, attributes),
++                          selfConcat(sinHalf), rotaryType,
++                          attributes.getDictionary(rewriter.getContext())),
 +      xType);
 +  if (tail) {
 +    replacement = rewriter.create<ConcatOp>(
