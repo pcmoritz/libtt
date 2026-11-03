@@ -31,10 +31,19 @@ def rotary(x, cos, sin):
     return jnp.concatenate((x1 * cos - x2 * sin, x2 * cos + x1 * sin), axis=-1)
 
 
+def weight(w):
+    """Marks w as a weight, as SGLang-JAX's TT backend does, so that the fused
+    q/k/v projection's concatenated weight is prepared once."""
+    return jax.ffi.ffi_call("tt.weight_dtype_override", jax.ShapeDtypeStruct(w.shape, w.dtype))(
+        w, **{"ttcore.weight_dtype": "bf16"}
+    )
+
+
 def make_prologue(heads, kv_heads, joint_k_norm=False):
     inv_freq = 1.0 / (1e6 ** (np.arange(0, HEAD_DIM, 2, dtype=np.float32) / HEAD_DIM))
 
     def prologue(x, wq, wk, wv, q_norm, k_norm, positions):
+        wq, wk, wv = weight(wq), weight(wk), weight(wv)
         with jax.named_scope("q_proj"):
             q = x @ wq
         with jax.named_scope("k_proj"):
