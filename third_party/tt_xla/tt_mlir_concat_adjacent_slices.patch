@@ -1,21 +1,41 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3753,6 +3753,64 @@ public:
+@@ -3753,6 +3753,139 @@ public:
  
  } // namespace
  
 +// A concatenation of slices that cut adjacent ranges of one tensor along the
 +// concatenated dimension is a single slice, e.g. rebuilding [q | k | v] from a
-+// fused [q | k | v | z] projection.
++// fused [q | k | v | z] projection. Slices of a vector that are each reshaped
++// to a row, [n] -> [1, n], before the concatenation are one slice reshaped.
 +class ConcatOfAdjacentSlicesPattern : public mlir::OpRewritePattern<ConcatOp> {
 +public:
 +  using mlir::OpRewritePattern<ConcatOp>::OpRewritePattern;
 +
 +  mlir::LogicalResult
 +  matchAndRewrite(ConcatOp op, mlir::PatternRewriter &rewriter) const final {
-+    const int64_t rank = op.getType().getRank();
-+    const int64_t dim = op.getDim() < 0 ? op.getDim() + rank : op.getDim();
++    int64_t rank = op.getType().getRank();
++    int64_t dim = op.getDim() < 0 ? op.getDim() + rank : op.getDim();
++    SmallVector<Value> inputs;
++    for (Value input : op.getInputs()) {
++      auto row = mlir::cast<RankedTensorType>(input.getType());
++      auto reshape = input.getDefiningOp<ReshapeOp>();
++      if (reshape) {
++        auto vector = mlir::cast<RankedTensorType>(reshape.getInput().getType());
++        if (vector.getRank() == 1 && row.getDimSize(dim) == vector.getDimSize(0) &&
++            row.getNumElements() == vector.getDimSize(0)) {
++          inputs.push_back(reshape.getInput());
++        }
++      }
++    }
++    const bool rows = inputs.size() == op.getInputs().size();
++    if (rows) {
++      rank = 1;
++      dim = 0;
++    } else {
++      inputs.assign(op.getInputs().begin(), op.getInputs().end());
++    }
 +    auto values = [](ArrayAttr attr) {
 +      return llvm::to_vector(llvm::map_range(attr, [](Attribute value) {
 +        return static_cast<int32_t>(mlir::cast<IntegerAttr>(value).getInt());
@@ -23,7 +43,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    };
 +    Value source;
 +    SmallVector<int32_t> begins, ends;
-+    for (Value input : op.getInputs()) {
++    for (Value input : inputs) {
 +      auto slice = input.getDefiningOp<SliceStaticOp>();
 +      if (!slice || (source && slice.getInput() != source) ||
 +          llvm::any_of(values(slice.getStep()),
@@ -55,10 +75,65 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +      }
 +      ends[dim] = sliceEnds[dim];
 +    }
++    auto steps = rewriter.getI32ArrayAttr(SmallVector<int32_t>(rank, 1));
++    if (!rows) {
++      rewriter.replaceOpWithNewOp<SliceStaticOp>(
++          op, op.getType(), source, rewriter.getI32ArrayAttr(begins),
++          rewriter.getI32ArrayAttr(ends), steps);
++      return mlir::success();
++    }
++    auto sourceType = mlir::cast<RankedTensorType>(source.getType());
++    auto sliceType = RankedTensorType::get({ends[0] - begins[0]},
++                                           sourceType.getElementType(),
++                                           sourceType.getEncoding());
++    Value slice = rewriter.create<SliceStaticOp>(
++        op.getLoc(), sliceType, source, rewriter.getI32ArrayAttr(begins),
++        rewriter.getI32ArrayAttr(ends), steps);
++    rewriter.replaceOp(op, utils::createReshapeOp(rewriter, op.getLoc(), slice,
++                                                  op.getType().getShape()));
++    return mlir::success();
++  }
++};
++
++// A slice of a row taken through its vector, [1, N] -> [N] -> [n] -> [1, n],
++// is a slice of the row itself, which a tiled tensor cuts in its own layout;
++// the vector would be untilized, cut and tilized again. Any shape with one
++// dimension above 1 is such a row.
++class SliceOfSqueezedRowPattern : public mlir::OpRewritePattern<ReshapeOp> {
++public:
++  using mlir::OpRewritePattern<ReshapeOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(ReshapeOp op, mlir::PatternRewriter &rewriter) const final {
++    auto slice = op.getInput().getDefiningOp<SliceStaticOp>();
++    auto squeeze = slice ? slice.getInput().getDefiningOp<ReshapeOp>() : nullptr;
++    if (!squeeze) {
++      return mlir::failure();
++    }
++    auto row = mlir::cast<RankedTensorType>(squeeze.getInput().getType());
++    auto result = mlir::cast<RankedTensorType>(op.getType());
++    const auto wide = [](int64_t size) { return size != 1; };
++    if (squeeze.getType().getRank() != 1 || result.getRank() != row.getRank() ||
++        llvm::count_if(row.getShape(), wide) != 1) {
++      return mlir::failure();
++    }
++    const int64_t axis = llvm::find_if(row.getShape(), wide) - row.getShape().begin();
++    for (int64_t d = 0; d < row.getRank(); ++d) {
++      if (d != axis && result.getDimSize(d) != 1) {
++        return mlir::failure();
++      }
++    }
++    auto first = [](ArrayAttr attr) {
++      return static_cast<int32_t>(mlir::cast<IntegerAttr>(attr[0]).getInt());
++    };
++    SmallVector<int32_t> begins(row.getRank(), 0), ends(row.getRank(), 1),
++        steps(row.getRank(), 1);
++    begins[axis] = first(slice.getBegins());
++    ends[axis] = first(slice.getEnds());
++    steps[axis] = first(slice.getStep());
 +    rewriter.replaceOpWithNewOp<SliceStaticOp>(
-+        op, op.getType(), source, rewriter.getI32ArrayAttr(begins),
-+        rewriter.getI32ArrayAttr(ends),
-+        rewriter.getI32ArrayAttr(SmallVector<int32_t>(rank, 1)));
++        op, result, squeeze.getInput(), rewriter.getI32ArrayAttr(begins),
++        rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
 +    return mlir::success();
 +  }
 +};
@@ -66,11 +141,12 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -3804,6 +3862,7 @@ public:
+@@ -3804,6 +3862,8 @@ public:
        patterns.add<SpatialMeanOptimizationPattern>(&getContext());
        patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
        patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
 +      patterns.add<ConcatOfAdjacentSlicesPattern>(&getContext());
++      patterns.add<SliceOfSqueezedRowPattern>(&getContext());
        if (permuteSliceAfterMatmulEnabled) {
          patterns.add<PermuteSliceAfterMatmulPattern>(&getContext());
        }
