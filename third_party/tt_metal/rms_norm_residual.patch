@@ -2,7 +2,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,235 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -60,9 +60,11 @@ new file mode 100644
 +    constexpr uint32_t cb_exchange = get_named_compile_time_arg_val("cb_exchange");
 +    constexpr uint32_t cb_rstd = get_named_compile_time_arg_val("cb_rstd");
 +    constexpr uint32_t cb_norm = get_named_compile_time_arg_val("cb_norm");
++    constexpr uint32_t cb_weight_offset = get_named_compile_time_arg_val("cb_weight_offset");
 +    constexpr uint32_t rows = get_named_compile_time_arg_val("rows");
 +    constexpr uint32_t eps = get_named_compile_time_arg_val("eps");
 +    constexpr uint32_t inv_width = get_named_compile_time_arg_val("inv_width");
++    constexpr uint32_t weight_offset = get_named_compile_time_arg_val("weight_offset");
 +
 +    // DST holds four FP32 tiles per acquire.
 +    constexpr uint32_t batch = 4;
@@ -134,22 +136,47 @@ new file mode 100644
 +    pack_block(cb_partial, 0, 1);
 +    cb_push_back(cb_partial, 1);
 +
-+    // scaled = sum * weight (one per column) needs nothing from the other
-+    // cores, so it is done while their sums are gathered.
++    // scaled = sum * (weight + weight_offset) (one per column) needs nothing
++    // from the other cores, so it is done while their sums are gathered.
++    // Zero-centered weights have an offset of 1, added in FP32 first.
 +    cb_wait_front(cb_weight, count);
++    uint32_t cb_scale = cb_weight;
++    if constexpr (weight_offset != 0) {
++        cb_reserve_back(cb_weight_offset, count);
++        reconfig_data_format_srca(cb_weight);
++        copy_init(cb_weight);
++        binop_with_scalar_tile_init();
++        for (uint32_t b = 0; b < count; b += batch) {
++            const uint32_t n = count - b < batch ? count - b : batch;
++            tile_regs_acquire();
++            for (uint32_t j = 0; j < n; ++j) {
++                copy_tile(cb_weight, b + j, j);
++                MATH(SFPU_UNARY_CALL(
++                    DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
++                    (APPROX, ckernel::sfpu::ADD, 8, DST_ACCUM_MODE), j, VectorMode::RC, weight_offset));
++            }
++            pack_block(cb_weight_offset, b, n);
++        }
++        cb_push_back(cb_weight_offset, count);
++        cb_wait_front(cb_weight_offset, count);
++        cb_scale = cb_weight_offset;
++    }
 +    cb_reserve_back(cb_scaled, count);
-+    reconfig_data_format(cb_sum, cb_weight);
-+    mul_bcast_rows_init_short(cb_sum, cb_weight);
++    reconfig_data_format(cb_sum, cb_scale);
++    mul_bcast_rows_init_short(cb_sum, cb_scale);
 +    for (uint32_t b = 0; b < count; b += batch) {
 +        const uint32_t n = count - b < batch ? count - b : batch;
 +        tile_regs_acquire();
 +        for (uint32_t j = 0; j < n; ++j) {
-+            mul_tiles_bcast_rows(cb_sum, cb_weight, b + j, b + j, j);
++            mul_tiles_bcast_rows(cb_sum, cb_scale, b + j, b + j, j);
 +        }
 +        pack_block(cb_scaled, b, n);
 +    }
 +    cb_push_back(cb_scaled, count);
 +    cb_pop_front(cb_weight, count);
++    if constexpr (weight_offset != 0) {
++        cb_pop_front(cb_weight_offset, count);
++    }
 +    cb_pop_front(cb_sum, count);
 +
 +    if (first) {
@@ -458,7 +485,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_res
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,265 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -487,6 +514,7 @@ new file mode 100644
 +
 +struct RMSNormResidualParams {
 +    float epsilon = 1e-6f;
++    float weight_offset = 0.0f;
 +};
 +
 +struct RMSNormResidualInputs {
@@ -604,6 +632,9 @@ new file mode 100644
 +    make_cb(8, 1, tt::DataFormat::Float32);         // every core's sums of squares, one column per core
 +    make_cb(9, 1, tt::DataFormat::Float32);         // rsqrt(mean + eps), one per row, a column
 +    make_cb(10, max_count, row_format);             // norm, for the writer
++    if (params.weight_offset != 0.0f) {
++        make_cb(11, max_count, tt::DataFormat::Float32);  // weight + weight_offset
++    }
 +    const uint32_t l1_bytes =
 +        device->l1_size_per_core() - device->allocator()->get_base_allocator_addr(tt::tt_metal::HalMemType::L1);
 +    TT_FATAL(
@@ -626,13 +657,14 @@ new file mode 100644
 +    const std::vector<std::pair<std::string, uint32_t>> common_args = {
 +        {"cb_input", 0},  {"cb_residual", 1}, {"cb_weight", 2},   {"cb_sum", 3},      {"cb_sum_out", 4},
 +        {"cb_scaled", 5},  {"cb_scaler", 6},   {"cb_partial", 7},  {"cb_exchange", 8}, {"cb_rstd", 9},
-+        {"cb_norm", 10},
++        {"cb_norm", 10},  {"cb_weight_offset", 11},
 +        {"num_cores", num_cores},
 +        {"rows", input.logical_shape()[0]},
 +        {"valid_sem", valid_sem_id},
 +        {"written_sem", written_sem_id},
 +        {"cleared_sem", cleared_sem_id},
 +        {"eps", std::bit_cast<uint32_t>(params.epsilon)},
++        {"weight_offset", std::bit_cast<uint32_t>(params.weight_offset)},
 +        {"inv_width", std::bit_cast<uint32_t>(1.0f / static_cast<float>(width))},
 +    };
 +    const std::string kernel_dir = "ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/";
@@ -711,10 +743,11 @@ new file mode 100644
 +namespace ttnn::normalization {
 +
 +std::vector<Tensor> rms_norm_residual(
-+    const Tensor& input, const Tensor& residual, const Tensor& weight, float epsilon) {
++    const Tensor& input, const Tensor& residual, const Tensor& weight, float epsilon, float weight_offset) {
 +    using Op = prim::RMSNormResidualOperation;
 +    return device_operation::launch<Op>(
-+        {.epsilon = epsilon}, {.input = input, .residual = residual, .weight = weight});
++        {.epsilon = epsilon, .weight_offset = weight_offset},
++        {.input = input, .residual = residual, .weight = weight});
 +}
 +
 +}  // namespace ttnn::normalization
@@ -722,7 +755,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_res
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.hpp
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,24 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -736,10 +769,15 @@ new file mode 100644
 +
 +// The residual add and RMS normalization of a decode step in one program, for
 +// one tile row [B <= 32, W] of activations: returns {norm, sum} with
-+// sum = input + residual and norm = sum / sqrt(mean(sum^2) + epsilon) * weight.
++// sum = input + residual and
++// norm = sum / sqrt(mean(sum^2) + epsilon) * (weight + weight_offset).
 +// sum is the residual stream of the next layer, and norm its input.
 +std::vector<Tensor> rms_norm_residual(
-+    const Tensor& input, const Tensor& residual, const Tensor& weight, float epsilon);
++    const Tensor& input,
++    const Tensor& residual,
++    const Tensor& weight,
++    float epsilon,
++    float weight_offset = 0.0f);
 +
 +}  // namespace ttnn::normalization
 diff --git ttnn/cpp/ttnn/operations/normalization/sources.cmake ttnn/cpp/ttnn/operations/normalization/sources.cmake

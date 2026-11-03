@@ -1,21 +1,23 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -2413,6 +2413,20 @@ def TTIR_BatchNormTrainingOp : TTIR_NamedOp<"batch_norm_training"> {
+@@ -2413,6 +2413,22 @@ def TTIR_BatchNormTrainingOp : TTIR_NamedOp<"batch_norm_training"> {
    let hasVerifier = 1;
  }
  
 +def TTIR_RMSNormResidualOp : TTIR_NamedOp<"rms_norm_residual"> {
 +  let summary = "RMS normalization of a residual sum that also returns the sum";
 +  let description = [{
-+    sum = input + residual, and output = sum / sqrt(mean(sum^2) + epsilon) * weight
-+    over the last dimension, for one tile row of decode activations. The sum is
-+    returned too: it is the residual stream the next layer adds to.
++    sum = input + residual, and output = sum / sqrt(mean(sum^2) + epsilon) *
++    (weight + weight_offset) over the last dimension, for one tile row of
++    decode activations. The sum is returned too: it is the residual stream the
++    next layer adds to.
 +  }];
 +  let arguments = (ins AnyRankedTensor:$input,
 +                       AnyRankedTensor:$residual,
 +                       AnyRankedTensor:$weight,
-+                       DefaultValuedAttr<F32Attr, "1e-05">:$epsilon);
++                       DefaultValuedAttr<F32Attr, "1e-05">:$epsilon,
++                       DefaultValuedAttr<F32Attr, "0.0">:$weight_offset);
 +  let results = (outs AnyRankedTensor:$output, AnyRankedTensor:$sum);
 +}
 +
@@ -25,20 +27,22 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -2805,6 +2805,19 @@ def TTNN_BatchNormTrainingOp : TTNN_Op<"batch_norm_training", [AttrSizedOperandS
+@@ -2805,6 +2805,21 @@ def TTNN_BatchNormTrainingOp : TTNN_Op<"batch_norm_training", [AttrSizedOperandS
      let hasVerifier = 1;
  }
  
 +def TTNN_RMSNormResidualOp : TTNN_Op<"rms_norm_residual", [OpModelExempt]> {
 +  let summary = "RMS normalization of a residual sum that also returns the sum";
 +  let description = [{
-+    sum = input + residual, and output = sum / sqrt(mean(sum^2) + epsilon) * weight
-+    over the last dimension, for one tile row of decode activations.
++    sum = input + residual, and output = sum / sqrt(mean(sum^2) + epsilon) *
++    (weight + weight_offset) over the last dimension, for one tile row of
++    decode activations.
 +  }];
 +  let arguments = (ins AnyRankedTensor:$input,
 +                       AnyRankedTensor:$residual,
 +                       AnyRankedTensor:$weight,
-+                       DefaultValuedAttr<F32Attr, "1e-05">:$epsilon);
++                       DefaultValuedAttr<F32Attr, "1e-05">:$epsilon,
++                       DefaultValuedAttr<F32Attr, "0.0">:$weight_offset);
 +  let results = (outs AnyRankedTensor:$output, AnyRankedTensor:$sum);
 +}
 +
@@ -48,7 +52,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/ttmlir/Target/TTNN/operations/normalization.fbs
 --- a/include/ttmlir/Target/TTNN/operations/normalization.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/normalization.fbs
-@@ -59,6 +59,15 @@ table DitRMSNormUnaryFusedOp {
+@@ -59,6 +59,16 @@ table DitRMSNormUnaryFusedOp {
    out: tt.target.ttnn.TensorRef;
  }
  
@@ -59,6 +63,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/t
 +  epsilon: float;
 +  out: tt.target.ttnn.TensorRef;
 +  sum: tt.target.ttnn.TensorRef;
++  weight_offset: float;
 +}
 +
  table LayerNormShardedMultiCoreProgramConfig {
@@ -97,7 +102,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +    }
 +    rewriter.replaceOpWithNewOp<ttnn::RMSNormResidualOp>(
 +        op, types, adaptor.getInput(), adaptor.getResidual(),
-+        adaptor.getWeight(), op.getEpsilonAttr());
++        adaptor.getWeight(), op.getEpsilonAttr(), op.getWeightOffsetAttr());
 +    return success();
 +  }
 +};
@@ -116,7 +121,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3819,6 +3819,99 @@ public:
+@@ -3819,6 +3819,123 @@ public:
    }
  };
  
@@ -175,7 +180,31 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +        op.getType() != type || lhs.getType() != type || rhs.getType() != type) {
 +      return failure();
 +    }
-+    auto weightType = mlir::cast<RankedTensorType>(op.getWeight().getType());
++    // Zero-centered norm weights scale by (1 + weight), widened to FP32 for
++    // the add; the program adds the offset to the BF16 weight itself.
++    Value weight = op.getWeight();
++    FloatAttr weightOffset = rewriter.getF32FloatAttr(0.0f);
++    if (auto weightAdd = ttmlir::utils::lookThrough<ReshapeOp>(weight)
++                             .getDefiningOp<AddOp>()) {
++      for (auto [operand, other] :
++           {std::pair(weightAdd.getLhs(), weightAdd.getRhs()),
++            std::pair(weightAdd.getRhs(), weightAdd.getLhs())}) {
++        auto cast = operand.getDefiningOp<TypecastOp>();
++        std::optional<double> offset =
++            utils::lookThroughLayoutOps(other).getDefiningOp<OnesOp>()
++                ? std::optional<double>(1.0)
++                : getSplatConstantValue(other);
++        if (cast && offset && operand.getType() == weightAdd.getType() &&
++            mlir::cast<RankedTensorType>(cast.getInput().getType())
++                .getElementType()
++                .isBF16()) {
++          weight = cast.getInput();
++          weightOffset = rewriter.getF32FloatAttr(static_cast<float>(*offset));
++          break;
++        }
++      }
++    }
++    auto weightType = mlir::cast<RankedTensorType>(weight.getType());
 +    if (weightType.getNumElements() != type.getDimSize(1) ||
 +        weightType.getDimSize(weightType.getRank() - 1) != type.getDimSize(1)) {
 +      return failure();
@@ -193,7 +222,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +          return user == op || (user->getBlock() == op->getBlock() &&
 +                                op->isBeforeInBlock(user));
 +        });
-+    auto *weightOp = op.getWeight().getDefiningOp();
++    auto *weightOp = weight.getDefiningOp();
 +    const bool weightBeforeAdd =
 +        !weightOp || weightOp->getBlock() != add->getBlock() ||
 +        weightOp->isBeforeInBlock(add);
@@ -205,8 +234,8 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +      return failure();
 +    }
 +    auto fused = rewriter.create<RMSNormResidualOp>(
-+        op.getLoc(), TypeRange{op.getType(), type}, lhs, rhs, op.getWeight(),
-+        op.getEpsilonAttr());
++        op.getLoc(), TypeRange{op.getType(), type}, lhs, rhs, weight,
++        op.getEpsilonAttr(), weightOffset);
 +    rewriter.replaceOp(op, fused.getOutput());
 +    rewriter.replaceOp(add, fused.getSum());
 +    return success();
@@ -227,7 +256,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -1966,6 +1966,21 @@ createOp(FlatbufferObjectCache &cache, DitRMSNormUnaryFusedOp op) {
+@@ -1966,6 +1966,22 @@ createOp(FlatbufferObjectCache &cache, DitRMSNormUnaryFusedOp op) {
        computeConfig.value_or(0), output);
  }
  
@@ -243,7 +272,8 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
 +                                  std::nullopt),
 +      cache.getOrCreateNoSharding(op.getSum(), tensorValueToFlatbuffer,
-+                                  std::nullopt));
++                                  std::nullopt),
++      op.getWeightOffset().convertToFloat());
 +}
 +
  ::flatbuffers::Offset<::tt::target::ttnn::DistributedRMSNormOp>
@@ -283,7 +313,7 @@ new file mode 100644
 +      pool.getTTNNTensorAndValidate(op->residual());
 +  const ::ttnn::Tensor &weight = pool.getTTNNTensorAndValidate(op->weight());
 +  auto outputs = ::ttnn::normalization::rms_norm_residual(
-+      input, residual, weight, op->epsilon());
++      input, residual, weight, op->epsilon(), op->weight_offset());
 +  pool.insertTTNNTensorAndValidate(op->out(), outputs.at(0));
 +  pool.insertTTNNTensorAndValidate(op->sum(), outputs.at(1));
 +}

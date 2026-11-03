@@ -200,3 +200,44 @@ def test_rms_norm_residual_of_an_fp32_residual_add(rows, tmp_path):
     np.testing.assert_allclose(np.asarray(n).astype(np.float32), expected_norm, atol=2e-2, rtol=1e-2)
     irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn*.mlir")]
     assert irs and any("ttnn.rms_norm_residual" in ir for ir in irs), "the add and the norm were not fused"
+
+
+@pytest.mark.parametrize("rows", [1, 4])
+def test_rms_norm_residual_with_a_zero_centered_weight(rows, tmp_path):
+    """Zero-centered norm weights (Qwen3.5, Gemma) scale by 1 + weight, which
+    PyTorch models compute in FP32 on every call. The fused op adds the offset
+    to the BF16 weight itself, bit for bit like the separate FP32 add."""
+    eps = 1e-6
+    width = 5120
+
+    # SGLang's GemmaRMSNorm.forward_native with a residual.
+    def layer(x, r, w, offset):
+        s = x + r
+        h = s.astype(jnp.float32)
+        var = jnp.mean(h * h, axis=-1, keepdims=True)
+        n = h * lax.rsqrt(var + eps) * (w.astype(jnp.float32) + offset)
+        return n.astype(jnp.bfloat16), s
+
+    folded_path = tmp_path / "folded"
+    folded = jax.jit(
+        lambda x, r, w: layer(x, r, w, 1.0),
+        compiler_options={"optimization_level": "O1", "export_path": str(folded_path)},
+    )
+    # An offset the program takes as an input stays a separate add.
+    separate = jax.jit(layer, compiler_options={"optimization_level": "O1"})
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(11)
+    x = rng.normal(0, 1, (rows, width)).astype(jnp.bfloat16)
+    r = rng.normal(0, 3, (rows, width)).astype(jnp.bfloat16)
+    w = rng.normal(0, 0.1, (width,)).astype(jnp.bfloat16)
+    args = [jax.device_put(v, device) for v in (x, r, w)]
+    n, h = folded(*args)
+    n_separate, h_separate = separate(*args, jax.device_put(np.ones(1, np.float32), device))
+    _assert_same_bits(n, np.asarray(n_separate))
+    _assert_same_bits(h, np.asarray(h_separate))
+    expected_norm, _ = _reference(x, r, (w.astype(np.float32) + 1).astype(np.float32))
+    np.testing.assert_allclose(np.asarray(n).astype(np.float32), expected_norm, atol=2e-2, rtol=1e-2)
+    irs = [path.read_text() for path in (folded_path / "irs").glob("ttnn*.mlir")]
+    assert irs and any(
+        "ttnn.rms_norm_residual" in ir and "weight_offset = 1.000000e+00" in ir for ir in irs
+    ), "the weight's offset was not folded into the fused norm"
