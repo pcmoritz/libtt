@@ -1,0 +1,46 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -2318,12 +2318,31 @@
+     candidates.firstTransposeB = candidates.ops.front().getTransposeB();
+   }
+ 
++  // Whether const-eval computes op's RHS (and bias) once: they come from
++  // constants and the function's Parameter and Constant arguments only.
++  static bool isConstEvaluable(OpType op) {
++    auto fromConstants = [](Value value) {
++      auto chain = ttmlir::utils::getUseDefChain(value);
++      return ttmlir::utils::filterBlockArguments(chain.getArrayRef()).empty() ||
++             ttcore::valueTracesToConstantArgs(value);
++    };
++    if constexpr (std::is_same_v<OpType, LinearOp>) {
++      if (op.getBias() && !fromConstants(op.getBias())) {
++        return false;
++      }
++    }
++    return fromConstants(op.getB());
++  }
++
+   // Collect all ops that share the same LHS operand and are compatible
+   // for fusion.
+   static FusionCandidates collectCandidates(OpType rootOp) {
+     FusionCandidates result;
+-    // Exact FP32 matmuls run on the vector unit and stay apart.
+-    if (rootOp->hasAttr("ttcore.fp32_exact")) {
++    // Exact FP32 matmuls run on the vector unit and stay apart. The fused RHS
++    // concatenates the candidates' weights, which is free only when const-eval
++    // computes it once; over weights that the program takes as inputs, it
++    // would copy every weight on every call.
++    if (rootOp->hasAttr("ttcore.fp32_exact") || !isConstEvaluable(rootOp)) {
+       return result;
+     }
+     Value sharedLHS = rootOp.getA();
+@@ -2339,7 +2358,7 @@
+       auto op = dyn_cast<OpType>(user);
+       if (!op || op.getA() != sharedLHS ||
+           llvm::is_contained(result.ops, op) ||
+-          op->hasAttr("ttcore.fp32_exact")) {
++          op->hasAttr("ttcore.fp32_exact") || !isConstEvaluable(op)) {
+         continue;
+       }
+ 
