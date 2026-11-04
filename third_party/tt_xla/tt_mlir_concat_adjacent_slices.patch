@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3753,6 +3753,64 @@ public:
+@@ -3753,6 +3753,107 @@ public:
  
  } // namespace
  
@@ -63,14 +63,58 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +  }
 +};
 +
++// A slice of a row taken through its vector, [1, N] -> [N] -> [n] -> [1, n],
++// is a slice of the row itself, which a tiled tensor cuts in its own layout;
++// the vector would be untilized, cut and tilized again. Any shape with one
++// dimension above 1 is such a row.
++class SliceOfSqueezedRowPattern : public mlir::OpRewritePattern<ReshapeOp> {
++public:
++  using mlir::OpRewritePattern<ReshapeOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(ReshapeOp op, mlir::PatternRewriter &rewriter) const final {
++    auto slice = op.getInput().getDefiningOp<SliceStaticOp>();
++    auto squeeze = slice ? slice.getInput().getDefiningOp<ReshapeOp>() : nullptr;
++    if (!squeeze) {
++      return mlir::failure();
++    }
++    auto row = mlir::cast<RankedTensorType>(squeeze.getInput().getType());
++    auto result = mlir::cast<RankedTensorType>(op.getType());
++    const auto wide = [](int64_t size) { return size != 1; };
++    if (squeeze.getType().getRank() != 1 || result.getRank() != row.getRank() ||
++        llvm::count_if(row.getShape(), wide) != 1) {
++      return mlir::failure();
++    }
++    const int64_t axis = llvm::find_if(row.getShape(), wide) - row.getShape().begin();
++    for (int64_t d = 0; d < row.getRank(); ++d) {
++      if (d != axis && result.getDimSize(d) != 1) {
++        return mlir::failure();
++      }
++    }
++    auto first = [](ArrayAttr attr) {
++      return static_cast<int32_t>(mlir::cast<IntegerAttr>(attr[0]).getInt());
++    };
++    SmallVector<int32_t> begins(row.getRank(), 0), ends(row.getRank(), 1),
++        steps(row.getRank(), 1);
++    begins[axis] = first(slice.getBegins());
++    ends[axis] = first(slice.getEnds());
++    steps[axis] = first(slice.getStep());
++    rewriter.replaceOpWithNewOp<SliceStaticOp>(
++        op, result, squeeze.getInput(), rewriter.getI32ArrayAttr(begins),
++        rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
++    return mlir::success();
++  }
++};
++
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -3804,6 +3862,7 @@ public:
+@@ -3804,6 +3905,8 @@ public:
        patterns.add<SpatialMeanOptimizationPattern>(&getContext());
        patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
        patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
 +      patterns.add<ConcatOfAdjacentSlicesPattern>(&getContext());
++      patterns.add<SliceOfSqueezedRowPattern>(&getContext());
        if (permuteSliceAfterMatmulEnabled) {
          patterns.add<PermuteSliceAfterMatmulPattern>(&getContext());
        }
