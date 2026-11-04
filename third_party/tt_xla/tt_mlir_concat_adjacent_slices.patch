@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3753,6 +3753,170 @@ public:
+@@ -3753,6 +3753,166 @@ public:
  
  } // namespace
  
@@ -126,7 +126,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    auto matrix = mlir::cast<RankedTensorType>(reshape.getType());
 +    const auto wide = [](int64_t size) { return size != 1; };
 +    const int64_t rank = matrix.getRank();
-+    if (rank < 2 || llvm::count_if(row.getShape(), wide) != 1 ||
++    if (row.getRank() < 2 || rank < 2 || llvm::any_of(row.getShape().drop_back(), wide) ||
 +        llvm::any_of(matrix.getShape().drop_back(2), wide)) {
 +      return mlir::failure();
 +    }
@@ -145,15 +145,11 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    if (first < 0 || last <= first || first % kTileDim == 0 || first * cols % kTileDim != 0) {
 +      return mlir::failure();
 +    }
-+    const int64_t axis = llvm::find_if(row.getShape(), wide) - row.getShape().begin();
-+    SmallVector<int32_t> begins(row.getRank(), 0), ends, steps(row.getRank(), 1);
-+    for (int64_t size : row.getShape()) {
-+      ends.push_back(static_cast<int32_t>(size));
-+    }
-+    begins[axis] = first * cols;
-+    ends[axis] = last * cols;
-+    SmallVector<int64_t> shape(row.getShape());
-+    shape[axis] = (last - first) * cols;
++    SmallVector<int32_t> begins(row.getRank(), 0), ends(row.getRank(), 1), steps(row.getRank(), 1);
++    begins.back() = first * cols;
++    ends.back() = last * cols;
++    SmallVector<int64_t> shape(row.getRank(), 1);
++    shape.back() = (last - first) * cols;
 +    Value slice = rewriter.create<SliceStaticOp>(
 +        op.getLoc(), RankedTensorType::get(shape, row.getElementType(), row.getEncoding()),
 +        reshape.getInput(), rewriter.getI32ArrayAttr(begins), rewriter.getI32ArrayAttr(ends),
@@ -161,7 +157,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    if (cast) {
 +      slice = rewriter.create<TypecastOp>(
 +          cast.getLoc(), RankedTensorType::get(shape, op.getType().getElementType(), row.getEncoding()),
-+          slice);
++          slice, cast.getConservativeFolding());
 +    }
 +    rewriter.replaceOp(op, utils::createReshapeOp(rewriter, op.getLoc(), slice,
 +                                                  op.getType().getShape()));
