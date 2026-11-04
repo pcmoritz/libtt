@@ -1,41 +1,21 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3753,6 +3753,139 @@ public:
+@@ -3753,6 +3753,107 @@ public:
  
  } // namespace
  
 +// A concatenation of slices that cut adjacent ranges of one tensor along the
 +// concatenated dimension is a single slice, e.g. rebuilding [q | k | v] from a
-+// fused [q | k | v | z] projection. Slices of a vector that are each reshaped
-+// to a row, [n] -> [1, n], before the concatenation are one slice reshaped.
++// fused [q | k | v | z] projection.
 +class ConcatOfAdjacentSlicesPattern : public mlir::OpRewritePattern<ConcatOp> {
 +public:
 +  using mlir::OpRewritePattern<ConcatOp>::OpRewritePattern;
 +
 +  mlir::LogicalResult
 +  matchAndRewrite(ConcatOp op, mlir::PatternRewriter &rewriter) const final {
-+    int64_t rank = op.getType().getRank();
-+    int64_t dim = op.getDim() < 0 ? op.getDim() + rank : op.getDim();
-+    SmallVector<Value> inputs;
-+    for (Value input : op.getInputs()) {
-+      auto row = mlir::cast<RankedTensorType>(input.getType());
-+      auto reshape = input.getDefiningOp<ReshapeOp>();
-+      if (reshape) {
-+        auto vector = mlir::cast<RankedTensorType>(reshape.getInput().getType());
-+        if (vector.getRank() == 1 && row.getDimSize(dim) == vector.getDimSize(0) &&
-+            row.getNumElements() == vector.getDimSize(0)) {
-+          inputs.push_back(reshape.getInput());
-+        }
-+      }
-+    }
-+    const bool rows = inputs.size() == op.getInputs().size();
-+    if (rows) {
-+      rank = 1;
-+      dim = 0;
-+    } else {
-+      inputs.assign(op.getInputs().begin(), op.getInputs().end());
-+    }
++    const int64_t rank = op.getType().getRank();
++    const int64_t dim = op.getDim() < 0 ? op.getDim() + rank : op.getDim();
 +    auto values = [](ArrayAttr attr) {
 +      return llvm::to_vector(llvm::map_range(attr, [](Attribute value) {
 +        return static_cast<int32_t>(mlir::cast<IntegerAttr>(value).getInt());
@@ -43,7 +23,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    };
 +    Value source;
 +    SmallVector<int32_t> begins, ends;
-+    for (Value input : inputs) {
++    for (Value input : op.getInputs()) {
 +      auto slice = input.getDefiningOp<SliceStaticOp>();
 +      if (!slice || (source && slice.getInput() != source) ||
 +          llvm::any_of(values(slice.getStep()),
@@ -75,22 +55,10 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +      }
 +      ends[dim] = sliceEnds[dim];
 +    }
-+    auto steps = rewriter.getI32ArrayAttr(SmallVector<int32_t>(rank, 1));
-+    if (!rows) {
-+      rewriter.replaceOpWithNewOp<SliceStaticOp>(
-+          op, op.getType(), source, rewriter.getI32ArrayAttr(begins),
-+          rewriter.getI32ArrayAttr(ends), steps);
-+      return mlir::success();
-+    }
-+    auto sourceType = mlir::cast<RankedTensorType>(source.getType());
-+    auto sliceType = RankedTensorType::get({ends[0] - begins[0]},
-+                                           sourceType.getElementType(),
-+                                           sourceType.getEncoding());
-+    Value slice = rewriter.create<SliceStaticOp>(
-+        op.getLoc(), sliceType, source, rewriter.getI32ArrayAttr(begins),
-+        rewriter.getI32ArrayAttr(ends), steps);
-+    rewriter.replaceOp(op, utils::createReshapeOp(rewriter, op.getLoc(), slice,
-+                                                  op.getType().getShape()));
++    rewriter.replaceOpWithNewOp<SliceStaticOp>(
++        op, op.getType(), source, rewriter.getI32ArrayAttr(begins),
++        rewriter.getI32ArrayAttr(ends),
++        rewriter.getI32ArrayAttr(SmallVector<int32_t>(rank, 1)));
 +    return mlir::success();
 +  }
 +};
@@ -141,7 +109,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -3804,6 +3862,8 @@ public:
+@@ -3804,6 +3905,8 @@ public:
        patterns.add<SpatialMeanOptimizationPattern>(&getContext());
        patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
        patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
