@@ -711,6 +711,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_float8_scaled_matmul.patch",
         "//third_party/tt_xla:tt_mlir_decode_matmul_to_tt_metal.patch",
         "//third_party/tt_xla:tt_mlir_shared_lhs_constant_weights.patch",
+        "//third_party/tt_xla:tt_mlir_quantize_rows.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

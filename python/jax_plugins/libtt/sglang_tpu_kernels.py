@@ -23,6 +23,7 @@ MAX_DECODE_USERS = 32
 
 RPA_V3_MODULE = "sglang_tpu.attention.pallas.ragged_paged_attention_v3"
 KV_POOL_MODULE = "sglang_tpu.kv_pool"
+FP8_LINEAR_SMALL_M_MODULE = "sglang_tpu.kernels.fp8_linear_small_m"
 
 
 def _ragged_paged_attention(module):
@@ -257,4 +258,57 @@ def patch_kv_pool(module):
     pool.KV_LAYOUT_NAME = "tt-head-major"
 
 
-PATCHES = {RPA_V3_MODULE: patch_rpa_v3, KV_POOL_MODULE: patch_kv_pool}
+def _quantize_rows(x, dtype, min_scale):
+    """Per row of x ([M, K]): scale = max(amax(|x|) / fp8_max, min_scale) and
+    x / scale cast to float8 `dtype` (not saturated). Up to one tile row of
+    whole tiles runs as one TTNN program (libtt's quantize_rows); otherwise the
+    same math as separate ops."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    tokens, k = x.shape
+    if tokens <= 32 and k % 32 == 0 and x.dtype in (jnp.bfloat16, jnp.float32):
+        # The op returns the float8 codes as uint8, as the compiler stores
+        # float8 tensors; the bitcast is a view.
+        codes, scale = jax.ffi.ffi_call(
+            "tt.quantize_rows",
+            (
+                jax.ShapeDtypeStruct(x.shape, jnp.uint8),
+                jax.ShapeDtypeStruct((tokens, 1), jnp.float32),
+            ),
+        )(x, min_scale=np.float32(min_scale), e5m2=np.bool_(dtype == jnp.float8_e5m2))
+        return jax.lax.bitcast_convert_type(codes, dtype), scale
+    fp8_max = float(jnp.finfo(dtype).max)
+    scale = jnp.maximum(
+        jnp.max(jnp.abs(x), axis=-1, keepdims=True).astype(jnp.float32) / fp8_max, min_scale
+    )
+    return (x.astype(jnp.float32) / scale).astype(dtype), scale
+
+
+def _fp8_linear_small_m(x, weight, weight_scale):
+    """`fp8_linear_small_m` without Pallas, with the kernel's math: a per-row
+    scale amax / fp8_max floored at 1e-12, an unsaturated FP8 cast, an
+    f32-accumulated FP8 dot, then (acc * x_scale) * w_scale."""
+    import jax
+    import jax.numpy as jnp
+
+    x_q, x_scale = _quantize_rows(x, weight.dtype, 1e-12)
+    acc = jax.lax.dot_general(
+        x_q, weight, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+    )
+    # A per-tensor scale stays a scalar: broadcast to [1, n], it costs a
+    # repeat program and a full-width multiply.
+    w_scale = weight_scale.astype(jnp.float32).reshape(1, -1)
+    return (acc * x_scale * w_scale).astype(x.dtype)
+
+
+def patch_fp8_linear_small_m(module):
+    module.fp8_linear_small_m = _fp8_linear_small_m
+
+
+PATCHES = {
+    RPA_V3_MODULE: patch_rpa_v3,
+    KV_POOL_MODULE: patch_kv_pool,
+    FP8_LINEAR_SMALL_M_MODULE: patch_fp8_linear_small_m,
+}
