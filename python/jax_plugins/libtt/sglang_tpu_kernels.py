@@ -187,10 +187,7 @@ def _paged_decode(queries, cache, page_table, positions, sm_scale, sliding_windo
 
     tokens, q_heads, head_dim = queries.shape
     cache_head_dim = cache.shape[-1] // 2
-    # Zero-extended to the cache's [k | v] rows with a concat: a pad first fills the queries' tile
-    # padding, then runs a slower tiled pad ([1, 8, 128]: 8.7 us, the concat 1.4 us).
-    q = queries.astype(cache.dtype)
-    q = jnp.concatenate([q, jnp.zeros((tokens, q_heads, 2 * cache_head_dim - head_dim), q.dtype)], axis=-1)
+    q = jnp.pad(queries, ((0, 0), (0, 0), (0, 2 * cache_head_dim - head_dim))).astype(cache.dtype)
     window = {} if sliding_window is None else {"sliding_window_size": np.int32(sliding_window)}
     outputs = []
     for start in range(0, tokens, MAX_DECODE_USERS):
