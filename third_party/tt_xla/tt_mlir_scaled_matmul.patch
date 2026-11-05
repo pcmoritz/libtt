@@ -62,15 +62,47 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -498,6 +498,109 @@ public:
- // Fold the decode MLP's concatenated [up | gate] projection and SwiGLU into a
- // single half-width matmul.  The runtime implements this marker with a
- // two-weight matmul that keeps matching up/gate accumulators on the same core.
+@@ -468,7 +468,8 @@
+ // produces BF16 itself: binary_ng computes in FP32 DST whenever an operand is
+ // FP32 and rounds once as it packs the result, which saves the typecast
+ // program. (The packer rounds exact ties away from zero where the typecast
+-// rounds them to even.)
++// rounds them to even.) So does a scaled matmul, whose FP32 epilogue rounds
++// as binary_ng's multiply does, whatever its float8 operands.
+ class TTNNBinaryOpNarrowingOutput : public mlir::OpRewritePattern<TypecastOp> {
+ public:
+   using mlir::OpRewritePattern<TypecastOp>::OpRewritePattern;
+@@ -477,14 +478,16 @@
+   matchAndRewrite(TypecastOp cast,
+                   mlir::PatternRewriter &rewriter) const final {
+     Operation *producer = cast.getInput().getDefiningOp();
+-    if (!producer || !isa<AddOp, SubtractOp, MultiplyOp, DivideOp>(producer) ||
++    if (!producer ||
++        !isa<AddOp, SubtractOp, MultiplyOp, DivideOp, ScaledMatmulOp>(producer) ||
+         !cast.getInput().hasOneUse()) {
+       return failure();
+     }
+     if (!elementTypeOf(cast.getInput()).isF32() || !elementTypeOf(cast.getResult()).isBF16() ||
+-        !llvm::all_of(producer->getOperands(), [&](Value v) {
+-          return elementTypeOf(v).isF32() || elementTypeOf(v).isBF16();
+-        })) {
++        (!isa<ScaledMatmulOp>(producer) &&
++         !llvm::all_of(producer->getOperands(), [&](Value v) {
++           return elementTypeOf(v).isF32() || elementTypeOf(v).isBF16();
++         }))) {
+       return failure();
+     }
+     rewriter.modifyOpInPlace(producer, [&]() {
+@@ -495,6 +498,93 @@
+   }
+ };
+ 
 +// Fold the dequantization of SGLang-TorchTPU's FP8 linears, (matmul *
-+// row_scale) * col_scale in FP32, then narrowed to BF16, into the decode
-+// matmul's epilogue (ttnn::matmul_scaled, which falls back to these ops past
-+// one tile row of activations). The operands are float8, the product and
-+// scales f32, the row scale [M, 1], the column scale [1, N] or one element.
++// row_scale) * col_scale in FP32, into the decode matmul's epilogue
++// (ttnn::matmul_scaled, which falls back to these ops past one tile row of
++// activations). The operands are float8, the product and scales f32, the row
++// scale [M, 1], the column scale [1, N] or one element. A narrowing to BF16
++// after it is TTNNBinaryOpNarrowingOutput's.
 +class TTNNMatmulWithOutputScales : public mlir::OpRewritePattern<MultiplyOp> {
 +public:
 +  TTNNMatmulWithOutputScales(mlir::MLIRContext *context)
@@ -138,41 +170,24 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +         colType.getShape() != ArrayRef<int64_t>{1, cols})) {
 +      return failure();
 +    }
-+    // The result: the outer multiply's, or its only use's, a typecast of it
-+    // to BF16.
-+    mlir::Operation *last = outer;
-+    RankedTensorType resultType = outer.getType();
-+    if (resultType.getElementType().isF32() && outer.getResult().hasOneUse()) {
-+      if (auto cast = mlir::dyn_cast<TypecastOp>(
-+              *outer.getResult().getUsers().begin());
-+          cast && cast.getType().getElementType().isBF16()) {
-+        last = cast;
-+        resultType = cast.getType();
-+      }
-+    }
-+    if (!resultType.getElementType().isF32() &&
-+        !resultType.getElementType().isBF16()) {
++    // FP32, or BF16 if TTNNBinaryOpNarrowingOutput narrowed the multiply.
++    if (!outer.getType().getElementType().isF32() &&
++        !outer.getType().getElementType().isBF16()) {
 +      return failure();
 +    }
-+    rewriter.setInsertionPoint(last);
-+    auto fused = rewriter.create<ScaledMatmulOp>(
-+        last->getLoc(), resultType, matmulOp.getA(), matmulOp.getB(), rowScale,
-+        colScale, matmulOp.getTransposeBAttr(),
-+        matmulOp.getComputeConfigAttr());
-+    rewriter.replaceOp(last, fused.getResult());
-+    if (last != outer.getOperation()) {
-+      rewriter.eraseOp(outer);
-+    }
++    rewriter.replaceOpWithNewOp<ScaledMatmulOp>(
++        outer, outer.getType(), matmulOp.getA(), matmulOp.getB(), rowScale,
++        colScale, matmulOp.getTransposeBAttr(), matmulOp.getComputeConfigAttr());
 +    rewriter.eraseOp(inner);
 +    rewriter.eraseOp(matmulOp);
 +    return success();
 +  }
 +};
 +
- class TTNNMatmulWithSwiGLUEpilogue
-     : public mlir::OpRewritePattern<MultiplyOp> {
- public:
-@@ -952,7 +1055,7 @@ public:
+ // Fold the decode MLP's concatenated [up | gate] projection and SwiGLU into a
+ // single half-width matmul.  The runtime implements this marker with a
+ // two-weight matmul that keeps matching up/gate accumulators on the same core.
+@@ -952,7 +1042,7 @@
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
      patterns.add<TTNNBF16MeanOfUpcast, TTNNBinaryOpNarrowingOutput, TTNNRMSNormOfUpcast>(&getContext());

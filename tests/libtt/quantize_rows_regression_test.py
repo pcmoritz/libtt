@@ -7,6 +7,8 @@ bit for bit, and the IEEE float32 math up to ttnn.divide's last bit. The
 patched fp8_linear_small_m must equal its jnp form.
 """
 
+import re
+
 import jax
 import jax.numpy as jnp
 import ml_dtypes
@@ -94,8 +96,9 @@ def test_quantize_rows(trace, opt, rows, cols, in_dtype, dtype):
 
 
 @pytest.mark.parametrize("tokens,k,n", [(1, 4096, 6144), (4, 1024, 4096)])
-def test_fp8_linear_small_m(tokens, k, n):
-    """The patched SGLang kernel against its math as jnp ops."""
+def test_fp8_linear_small_m(tmp_path, tokens, k, n):
+    """The patched SGLang kernel against its math as jnp ops, with the
+    dequantization and the narrowing to BF16 in the matmul's epilogue."""
     device = jax.devices("tt")[0]
     rng = np.random.default_rng(k + n)
     x = jnp.asarray(activations(rng, tokens, k), jnp.bfloat16)
@@ -109,6 +112,10 @@ def test_fp8_linear_small_m(tokens, k, n):
 
     options = {"optimization_level": "O0"}
     args = [jax.device_put(a, device) for a in (x, weight, weight_scale)]
-    got = jax.jit(sglang_tpu_kernels._fp8_linear_small_m, compiler_options=options)(*args)
+    kernel = jax.jit(sglang_tpu_kernels._fp8_linear_small_m, compiler_options={**options, "export_path": str(tmp_path)})
+    got = kernel(*args)
     want = jax.jit(reference, compiler_options=options)(*args)
     np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(want, np.float32))
+    (ir,) = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert re.search(r'"ttnn\.scaled_matmul".*-> tensor<\d+x\d+xbf16', ir), "no BF16 ttnn.scaled_matmul"
+    assert '"ttnn.multiply"' not in ir, "a scale multiply was left unfused"
