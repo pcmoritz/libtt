@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
  #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
  #include "ttnn/types.hpp"
  #include <algorithm>
-@@ -1024,16 +1025,282 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
+@@ -1024,16 +1025,284 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
  }
  }  // namespace bmm_op_utils
  
@@ -33,9 +33,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +// cores idle: one core per output tile and K share, each output tile's shares
 +// stacked in grid rows. On Blackhole, five shares were fastest or close to it
 +// for 0.5 to 4 MB of weights; shares of at least four K tiles keep the
-+// reduction a small part of the work. Each core reads its share of the weight
-+// as one block, on RISCV_0's NOC, clear of the activation multicast on
-+// RISCV_1's.
++// reduction a small part of the work. A share of fewer than 64 K tiles is
++// read as one block, on RISCV_0's NOC, clear of the activation multicast on
++// RISCV_1's; a larger one in double-buffered blocks of up to 16 tiles on both
++// NOCs, so that reads overlap the matmul: Qwen3-8B's qkv projection on four
++// chips, [4096, 1536], BF16 35.3 -> 29.3 us and FP8 23.8 -> 18.8 us. Shares of
++// 16 to 40 tiles were fastest as one block.
 +std::optional<MatmulDecodeProgramConfig> create_matmul_decode_split_k_program_config(
 +    const Tensor& input_tensor_a,
 +    const Tensor& input_tensor_b,
@@ -43,7 +46,6 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +    const tt::tt_metal::CoreCoord& grid) {
 +    constexpr uint32_t min_share_tiles = 4;
 +    constexpr uint32_t max_splits = 5;
-+    constexpr uint32_t max_block_tiles = 64;
 +    const uint32_t Kt = utilities::get_matmul_tensor_padded_shape(input_tensor_a, /*transpose_a=*/false)[-1] /
 +                        tt::constants::TILE_WIDTH;
 +    const uint32_t out_Nt =
@@ -60,7 +62,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +        return std::nullopt;
 +    }
 +    const uint32_t share = Kt / k_splits;
-+    uint32_t in0_block_w = std::min(share, max_block_tiles);
++    uint32_t in0_block_w = share < 64 ? share : 16;
 +    while (share % in0_block_w != 0) {
 +        --in0_block_w;
 +    }
