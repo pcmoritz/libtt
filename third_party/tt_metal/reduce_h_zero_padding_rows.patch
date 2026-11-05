@@ -132,13 +132,14 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/welford_reduce_prog
 diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
 --- ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
-@@ -614,8 +614,17 @@ Tensor reduce(
+@@ -614,8 +614,21 @@ Tensor reduce(
                                                    is_bitwise_reduce_type(reduce_type)
                                                ? ttnn::PadValue{std::bit_cast<uint32_t>(pad_value)}
                                                : ttnn::PadValue{pad_value};
 -    auto input_tensor =
 -        is_tiled ? ttnn::fill_implicit_tile_padding(input_tensor_arg, fill_pad_value) : input_tensor_arg;
-+    // An H sum or mean whose reader zeroes the padding rows needs no fill_pad first.
++    // An H sum or mean whose reader zeroes the padding rows needs no fill_pad first, nor does a W
++    // reduction of whole tile columns: its padding rows reduce into padding rows of the result.
 +    const int in_rank = static_cast<int>(input_tensor_arg.logical_shape().rank());
 +    const bool reader_zeroes_padding =
 +        dim.size() == 1 && dim[0] == in_rank - 2 &&
@@ -146,7 +147,10 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
 +            input_tensor_arg,
 +            reduce_type == reduction_common::ReduceType::Sum || reduce_type == reduction_common::ReduceType::Mean)
 +            .has_value();
-+    auto input_tensor = is_tiled && !reader_zeroes_padding
++    const bool whole_tile_columns =
++        dim.size() == 1 && dim[0] == in_rank - 1 &&
++        input_tensor_arg.logical_shape()[-1] % input_tensor_arg.tensor_spec().tile().get_width() == 0;
++    auto input_tensor = is_tiled && !reader_zeroes_padding && !whole_tile_columns
 +                            ? ttnn::fill_implicit_tile_padding(input_tensor_arg, fill_pad_value)
 +                            : input_tensor_arg;
  
