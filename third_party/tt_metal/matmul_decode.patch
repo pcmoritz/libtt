@@ -1584,7 +1584,15 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.hpp
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-@@ -271,14 +271,16 @@ static ttnn::Tensor bound_matmul(
+@@ -14,6 +14,7 @@
+ #include "ttnn/operations/copy/typecast/typecast.hpp"
+ #include "ttnn/operations/eltwise/unary/common/unary_op_utils.hpp"
+ #include "ttnn/operations/creation/creation.hpp"
++#include "ttnn/operations/data_movement/slice/slice.hpp"
+ 
+ #include "ttnn/operations/matmul/device/config/matmul_program_config.hpp"
+ #include "ttnn/operations/matmul/device/matmul_device_operation.hpp"
+@@ -271,14 +272,16 @@ static ttnn::Tensor bound_matmul(
          parameters.transpose_a,
          parameters.transpose_b,
          bias_single_tile_size,
@@ -1603,10 +1611,30 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
      bool needs_manual_transpose_a = parameters.transpose_a && needs_manual_transpose;
      bool needs_manual_transpose_b = parameters.transpose_b && needs_manual_transpose;
  
-@@ -436,6 +438,46 @@ Tensor matmul(
+@@ -436,6 +439,79 @@ Tensor matmul(
          optional_output_tensor);
  }
  
++namespace {
++// PyTorch's SiluAndMul as TT runs its ops on a BF16 [..., gate | up] product:
++// the halves sliced, silu of the gate in FP32 cast back to BF16, times up.
++Tensor silu_and_mul(const Tensor& product, const MemoryConfig& memory_config) {
++    const auto& shape = product.logical_shape();
++    const uint32_t half = shape[-1] / 2;
++    ttsl::SmallVector<uint32_t> begins(shape.rank(), 0), ends(shape.cbegin(), shape.cend()), step(shape.rank(), 1);
++    ends.back() = half;
++    const Tensor gate = ttnn::slice(product, begins, ends, step, memory_config);
++    begins.back() = half;
++    ends.back() = 2 * half;
++    const Tensor up = ttnn::slice(product, begins, ends, step, memory_config);
++    const Tensor silu = ttnn::typecast(
++        ttnn::silu(ttnn::typecast(gate, DataType::FLOAT32, memory_config), memory_config),
++        DataType::BFLOAT16,
++        memory_config);
++    return ttnn::multiply(silu, up, DataType::BFLOAT16, memory_config);
++}
++}  // namespace
++
 +Tensor matmul_swiglu(
 +    const Tensor& input_tensor_a,
 +    const Tensor& input_tensor_b,
@@ -1632,9 +1660,22 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 +            get_program_config(input_tensor_a, input_tensor_b, false, transpose_b, 0, attributes);
 +        normalize_program_config(config, grid);
 +        auto* decode = std::get_if<MatmulDecodeProgramConfig>(&config);
-+        TT_FATAL(
-+            decode != nullptr && decode->k_splits == 1,
-+            "matmul_swiglu: exact SwiGLU needs the decode program, unsplit over K");
++        if (decode == nullptr || decode->k_splits != 1) {
++            // A narrow weight's matmul splits over K (or runs the 1D program),
++            // which beats one core per gate and up pair: SiluAndMul's ops apart.
++            return silu_and_mul(
++                ttnn::matmul(
++                    input_tensor_a,
++                    input_tensor_b,
++                    /*transpose_a=*/false,
++                    transpose_b,
++                    params.output_mem_config,
++                    dtype,
++                    /*program_config=*/std::nullopt,
++                    /*activation=*/std::nullopt,
++                    compute_kernel_config),
++                params.output_mem_config);
++        }
 +        decode->fuse_swiglu = true;
 +        decode->exact_swiglu = true;
 +        attributes.program_config = config;
@@ -1653,7 +1694,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/matmul/matmul.hpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.hpp
-@@ -47,6 +47,23 @@ Tensor matmul(
+@@ -47,6 +47,24 @@ Tensor matmul(
      const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id = std::nullopt,
      const PrefetcherPipeList& prefetcher_pipes = {});
  
@@ -1664,7 +1705,8 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/m
 +// With `exact`, the weight holds a gate half followed by an up half and the
 +// result is bit for bit that of PyTorch's SiluAndMul on the BF16 product as
 +// TT runs its ops: the halves sliced, the gate cast to FP32, silu, cast to
-+// BF16 and multiplied by the up half (exact_swiglu).
++// BF16 and multiplied by the up half (exact_swiglu; those ops themselves where
++// ttnn::matmul splits the weight's matmul over K).
 +Tensor matmul_swiglu(
 +    const Tensor& input_tensor_a,
 +    const Tensor& input_tensor_b,
@@ -1677,7 +1719,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/m
  std::vector<Tensor> matmul_batched_weights(
      const Tensor& input_tensor_a,
      const std::vector<Tensor>& input_tensors_b,
-@@ -124,6 +141,7 @@ Tensor sparse_matmul(
+@@ -124,6 +142,7 @@ Tensor sparse_matmul(
  using operations::matmul::addmm;
  using operations::matmul::linear;
  using operations::matmul::matmul;
