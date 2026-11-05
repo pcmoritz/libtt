@@ -14,10 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <bit>
-#include <chrono>
 #include <string>
-#include <cstdio>
-#include <cstdlib>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -107,15 +104,10 @@ protected:
         }
     }
 
-    // Quantizes `values` ([rows, cols], rounded to the input type) with at most
-    // max_cores cores and checks both results. Returns the number of mismatches.
+    // Quantizes `values` ([rows, cols], rounded to the input type) and checks
+    // both results. Returns the number of mismatches.
     size_t check(
-        const std::vector<float>& values,
-        uint32_t rows,
-        uint32_t cols,
-        DataType in_dtype,
-        const Format& f,
-        uint32_t max_cores) {
+        const std::vector<float>& values, uint32_t rows, uint32_t cols, DataType in_dtype, const Format& f) {
         std::vector<float> x(values);
         if (in_dtype == DataType::BFLOAT16) {
             for (float& v : x) {
@@ -130,7 +122,6 @@ protected:
             ttnn::experimental::prim::QuantizeRowsParams{
                 .dtype = f.dtype,
                 .min_scale = kMinScale,
-                .max_cores = max_cores,
                 .output_mem_config = input.memory_config()},
             ttnn::experimental::prim::QuantizeRowsInputs{.input = input});
         const auto q = ttnn::bitcast(outputs[0], DataType::UINT8).cpu().to_vector<uint8_t>();
@@ -145,7 +136,7 @@ protected:
         size_t wrong = 0;
         auto fail = [&](const std::string& what) {
             if (wrong++ < 8) {
-                ADD_FAILURE() << rows << "x" << cols << " " << f.dtype << " cores<=" << max_cores << ": " << what;
+                ADD_FAILURE() << rows << "x" << cols << " " << f.dtype << ": " << what;
             }
         };
         for (uint32_t m = 0; m < rows; ++m) {
@@ -219,18 +210,22 @@ std::vector<float> activations(uint32_t rows, uint32_t cols, uint32_t seed) {
 TEST_F(QuantizeRowsTest, MatchesTtnnOpsForEveryStride) {
     for (uint32_t rows : {1u, 2u, 3u, 4u, 5u, 8u, 9u, 13u, 16u, 17u, 31u, 32u}) {
         for (uint32_t cols : {32u, 96u, 1024u, 4096u}) {
-            EXPECT_EQ(check(activations(rows, cols, rows * 7919 + cols), rows, cols, DataType::BFLOAT16, kE4M3, 0), 0u)
+            EXPECT_EQ(check(activations(rows, cols, rows * 7919 + cols), rows, cols, DataType::BFLOAT16, kE4M3), 0u)
                 << rows << "x" << cols;
         }
     }
 }
 
 TEST_F(QuantizeRowsTest, CoreCounts) {
-    // One core, one NoC row, several NoC rows; dense tiles split unevenly.
-    for (uint32_t max_cores : {1u, 2u, 7u, 13u, 24u, 64u, 128u}) {
-        for (uint32_t rows : {1u, 6u, 16u, 32u}) {
-            EXPECT_EQ(check(activations(rows, 12288, max_cores + rows), rows, 12288, DataType::BFLOAT16, kE4M3, max_cores), 0u)
-                << rows << " rows, cores <= " << max_cores;
+    // A core per dense tile, up to 48 cores for 4- and 8-row strides and 32 for
+    // 16 and 32: one core, one NoC row, several NoC rows, dense tiles split
+    // unevenly, and several three-tile chunks per core.
+    for (uint32_t rows : {1u, 6u, 16u, 32u}) {
+        const uint32_t pack = rows <= 4 ? 8 : rows <= 8 ? 4 : rows <= 16 ? 2 : 1;
+        for (uint32_t dense : {1u, 2u, 7u, 13u, 24u, 200u}) {
+            const uint32_t cols = dense * pack * 32;
+            EXPECT_EQ(check(activations(rows, cols, dense + rows), rows, cols, DataType::BFLOAT16, kE4M3), 0u)
+                << rows << "x" << cols;
         }
     }
 }
@@ -238,9 +233,9 @@ TEST_F(QuantizeRowsTest, CoreCounts) {
 TEST_F(QuantizeRowsTest, Float32InputAndE5m2) {
     for (uint32_t rows : {1u, 4u, 20u}) {
         const auto x = activations(rows, 3072, 99 + rows);
-        EXPECT_EQ(check(x, rows, 3072, DataType::FLOAT32, kE4M3, 32), 0u) << rows;
-        EXPECT_EQ(check(x, rows, 3072, DataType::BFLOAT16, kE5M2, 32), 0u) << rows;
-        EXPECT_EQ(check(x, rows, 3072, DataType::FLOAT32, kE5M2, 32), 0u) << rows;
+        EXPECT_EQ(check(x, rows, 3072, DataType::FLOAT32, kE4M3), 0u) << rows;
+        EXPECT_EQ(check(x, rows, 3072, DataType::BFLOAT16, kE5M2), 0u) << rows;
+        EXPECT_EQ(check(x, rows, 3072, DataType::FLOAT32, kE5M2), 0u) << rows;
     }
 }
 
@@ -256,84 +251,10 @@ TEST_F(QuantizeRowsTest, SpecialRows) {
     x[4 * cols + 5] = std::numeric_limits<float>::quiet_NaN();   // NaN row
     x[5 * cols + 1023] = -3.0e38f;                              // huge
     x[6 * cols + 0] = -0.0f;
-    EXPECT_EQ(check(x, rows, cols, DataType::BFLOAT16, kE4M3, 32), 0u);
-    EXPECT_EQ(check(x, rows, cols, DataType::FLOAT32, kE4M3, 3), 0u);
-    EXPECT_EQ(check(x, rows, cols, DataType::BFLOAT16, kE5M2, 32), 0u);
+    EXPECT_EQ(check(x, rows, cols, DataType::BFLOAT16, kE4M3), 0u);
+    EXPECT_EQ(check(x, rows, cols, DataType::FLOAT32, kE4M3), 0u);
+    EXPECT_EQ(check(x, rows, cols, DataType::BFLOAT16, kE5M2), 0u);
 }
 
-}  // namespace
-}  // namespace tt::tt_metal::distributed::test
-
-namespace tt::tt_metal::distributed::test {
-namespace {
-// One shape from QR_SHAPE=rows,cols,max_cores (for debugging); skipped otherwise.
-TEST_F(QuantizeRowsTest, OneShapeFromEnv) {
-    const char* env = std::getenv("QR_SHAPE");
-    if (env == nullptr) {
-        GTEST_SKIP() << "QR_SHAPE unset";
-    }
-    uint32_t rows = 0, cols = 0, cores = 0;
-    ASSERT_EQ(std::sscanf(env, "%u,%u,%u", &rows, &cols, &cores), 3);
-    if (std::getenv("QR_COORDS")) {
-        const auto grid = mesh_device_->compute_with_storage_grid_size();
-        for (uint32_t x = 0; x < grid.x; ++x) {
-            const auto c = mesh_device_->worker_core_from_logical_core(CoreCoord{x, 0});
-            std::printf("logical x %u -> noc (%zu, %zu)\n", x, c.x, c.y);
-        }
-        for (uint32_t y = 0; y < grid.y; ++y) {
-            const auto c = mesh_device_->worker_core_from_logical_core(CoreCoord{0, y});
-            std::printf("logical y %u -> noc (%zu, %zu)\n", y, c.x, c.y);
-        }
-    }
-    EXPECT_EQ(check(activations(rows, cols, 1), rows, cols, DataType::BFLOAT16, kE4M3, cores), 0u);
-}
-}  // namespace
-}  // namespace tt::tt_metal::distributed::test
-
-namespace tt::tt_metal::distributed::test {
-namespace {
-// Device time per op, traced (QR_BENCH=rows,cols,max_cores[;...]); skipped otherwise.
-TEST(QuantizeRowsBench, Traced) {
-    const char* env = std::getenv("QR_BENCH");
-    if (env == nullptr) {
-        GTEST_SKIP() << "QR_BENCH unset";
-    }
-    auto mesh = MeshDevice::create(MeshDeviceConfig(MeshShape{1, 1}), DEFAULT_L1_SMALL_SIZE, 64 << 20);
-    std::string spec(env);
-    size_t pos = 0;
-    while (pos < spec.size()) {
-        const size_t end = spec.find(';', pos) == std::string::npos ? spec.size() : spec.find(';', pos);
-        uint32_t rows = 0, cols = 0, cores = 0;
-        ASSERT_EQ(std::sscanf(spec.substr(pos, end - pos).c_str(), "%u,%u,%u", &rows, &cols, &cores), 3);
-        pos = end + 1;
-        const auto x = activations(rows, cols, 3);
-        const TensorSpec tspec(ttnn::Shape({rows, cols}), TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), {}));
-        const ttnn::Tensor input = ttnn::Tensor::from_vector(x, tspec).to_device(mesh.get());
-        using Op = ttnn::experimental::prim::QuantizeRowsOperation;
-        const ttnn::experimental::prim::QuantizeRowsParams params{
-            .dtype = DataType::FP8_E4M3, .min_scale = kMinScale, .max_cores = cores, .output_mem_config = input.memory_config()};
-        auto run = [&] { return ttnn::device_operation::launch<Op>(params, ttnn::experimental::prim::QuantizeRowsInputs{.input = input}); };
-        run();  // compile
-        Finish(mesh->mesh_command_queue());
-        constexpr int kOps = 100;
-        std::vector<std::vector<ttnn::Tensor>> keep;
-        keep.reserve(kOps);
-        const MeshTraceId trace = mesh->begin_mesh_trace(mesh->mesh_command_queue());
-        for (int i = 0; i < kOps; ++i) {
-            keep.push_back(run());
-        }
-        mesh->end_mesh_trace(mesh->mesh_command_queue(), trace);
-        mesh->replay_mesh_trace(mesh->mesh_command_queue(), trace, true);
-        const auto t0 = std::chrono::steady_clock::now();
-        for (int r = 0; r < 5; ++r) {
-            mesh->replay_mesh_trace(mesh->mesh_command_queue(), trace, false);
-        }
-        Finish(mesh->mesh_command_queue());
-        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / (5 * kOps);
-        mesh->release_mesh_trace(trace);
-        std::printf("QR_BENCH %ux%u cores<=%u: %.2f us/op\n", rows, cols, cores, us);
-    }
-    mesh->close();
-}
 }  // namespace
 }  // namespace tt::tt_metal::distributed::test

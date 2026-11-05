@@ -43,7 +43,7 @@ ttnn::device_operation::ProgramArtifacts QuantizeRowsProgramFactory::create_prog
     while (grid_y < grid.y && device.worker_core_from_logical_core({0, grid_y}).y == origin.y + grid_y) {
         ++grid_y;
     }
-    const QuantizeRowsPlan plan = quantize_rows_plan(tensor_args.input, params.max_cores, grid_x, grid_y);
+    const QuantizeRowsPlan plan = quantize_rows_plan(tensor_args.input, grid_x, grid_y);
     const uint32_t num_cores = plan.cores();
     const tt::tt_metal::CoreRange rect({0, 0}, {plan.width - 1, plan.height - 1});
     const tt::tt_metal::CoreRangeSet all_cores(rect);

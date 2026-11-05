@@ -16,7 +16,7 @@ using tt::tt_metal::Layout;
 using tt::tt_metal::TensorMemoryLayout;
 using namespace tt::constants;
 
-QuantizeRowsPlan quantize_rows_plan(const Tensor& input, uint32_t max_cores, uint32_t grid_x, uint32_t grid_y) {
+QuantizeRowsPlan quantize_rows_plan(const Tensor& input, uint32_t grid_x, uint32_t grid_y) {
     QuantizeRowsPlan plan;
     plan.rows = input.logical_shape()[-2];
     plan.tiles = input.padded_shape()[-1] / TILE_WIDTH;
@@ -26,9 +26,7 @@ QuantizeRowsPlan quantize_rows_plan(const Tensor& input, uint32_t max_cores, uin
     // Every core sends its maxima to every core, stride * 64 bytes each, so past
     // a point more cores cost more than the work they share (gtest timings:
     // 1x12288 13.4 us on 32 cores, 10.8 on 48; 16x4096 14.5 on 32, 17.1 on 48).
-    if (max_cores == 0) {
-        max_cores = plan.stride <= 8 ? 48 : 32;
-    }
+    const uint32_t max_cores = plan.stride <= 8 ? 48 : 32;
     // The largest rectangle of at most min(dense, max_cores) cores, widest
     // first, so that every core gets a dense tile.
     const uint32_t limit = std::max(1u, std::min(plan.dense, max_cores));

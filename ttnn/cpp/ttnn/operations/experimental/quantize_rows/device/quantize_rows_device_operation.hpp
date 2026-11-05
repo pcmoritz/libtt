@@ -15,8 +15,6 @@ namespace ttnn::experimental::prim {
 struct QuantizeRowsParams {
     tt::tt_metal::DataType dtype = tt::tt_metal::DataType::FP8_E4M3;
     float min_scale = 0.0f;
-    // At most this many cores share the row; 0 picks by the row stride.
-    uint32_t max_cores = 0;
     tt::tt_metal::MemoryConfig output_mem_config;
 };
 
@@ -45,7 +43,7 @@ struct QuantizeRowsPlan {
     uint32_t gather_tiles() const { return (cores() * slot_bytes() + 4095) / 4096; }
 };
 
-QuantizeRowsPlan quantize_rows_plan(const Tensor& input, uint32_t max_cores, uint32_t grid_x, uint32_t grid_y);
+QuantizeRowsPlan quantize_rows_plan(const Tensor& input, uint32_t grid_x, uint32_t grid_y);
 
 struct QuantizeRowsProgramFactory {
     static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
