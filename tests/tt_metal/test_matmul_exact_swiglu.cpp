@@ -6,7 +6,8 @@
 // sliced, the gate cast to FP32, silu, cast back to BF16, times up) bit for
 // bit: BF16 weights in either layout and FP8 weights with row, column and
 // single column scales, for one to 32 rows. The shapes keep the projection on
-// the decode program unsplit over K, as the fused one runs.
+// the decode program unsplit over K, as the fused one runs; a narrower weight,
+// whose matmul splits over K, runs SiluAndMul's ops apart.
 #include <gtest/gtest.h>
 
 #include <bit>
@@ -162,6 +163,15 @@ TEST_F(MatmulExactSwiGLUTest, Float8Scaled) {
     }
     for (uint32_t M : {2u, 13u, 32u}) {
         EXPECT_EQ(fp8_mismatches(M, 1024, 2048, Col::Column), 0u) << M;
+    }
+}
+
+// Qwen3-0.6B's gate and up projection on four chips, [1024, 1536]: too narrow
+// for the decode program unsplit over K.
+TEST_F(MatmulExactSwiGLUTest, SplitOverKRunsTheOpsApart) {
+    for (uint32_t M : {1u, 4u}) {
+        EXPECT_EQ(bf16_mismatches(M, 1024, 768, true), 0u) << M;
+        EXPECT_EQ(fp8_mismatches(M, 1024, 768, Col::Column), 0u) << M;
     }
 }
 
