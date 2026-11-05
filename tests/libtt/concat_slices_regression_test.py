@@ -1,5 +1,7 @@
 """Concatenations of slices of one tensor, which the compiler may fold into one slice."""
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -59,3 +61,27 @@ def test_slices_of_a_row_through_its_vector(tmp_path):
     np.testing.assert_array_equal(np.asarray(out), (y[:, :4352] * y[:, 4352:]).astype(jnp.bfloat16))
     ir = "\n".join(p.read_text() for p in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir"))
     assert ir and '"ttnn.reshape"' not in ir, "the row was sliced through its vector"
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+def test_rows_of_a_reshaped_row(tmp_path, dtype):
+    """torch_tpu lowers the per-head views of a one-token [q | k | v]
+    projection, [1, 1536] -> [12, 128] -> rows, as row slices; the k and v rows
+    start inside a tile and are column slices of the [1, 1536] row instead."""
+
+    def run(x, w):
+        heads = (x * 2).reshape(12, 128).astype(jnp.bfloat16)
+        return heads[:8] * w, heads[8:10] * w, heads[10:] * w
+
+    x = (np.arange(1536) % 17 - 8).astype(dtype).reshape(1, 1536)
+    w = (np.arange(128) % 15 - 7).astype(jnp.bfloat16)
+    device = jax.devices("tt")[0]
+    compiled = jax.jit(run, compiler_options={"export_path": str(tmp_path)})
+    out = compiled(jax.device_put(x, device), jax.device_put(w, device))
+    heads = (x.astype(np.float32) * 2).reshape(12, 128) * w.astype(np.float32)
+    for got, rows in zip(out, [heads[:8], heads[8:10], heads[10:]]):
+        np.testing.assert_array_equal(np.asarray(got).astype(np.float32), rows)
+    ir = "\n".join(p.read_text() for p in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir"))
+    assert ir and not re.search(r'"ttnn\.slice_static".*tensor<12x128x\w+.*-> tensor<2x128x', ir), (
+        "rows inside a tile were sliced from the reshaped row"
+    )
