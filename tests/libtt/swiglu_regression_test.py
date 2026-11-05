@@ -1,5 +1,7 @@
 """Check fused SwiGLU decode projections across widths and reduction sizes."""
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -96,3 +98,71 @@ def test_swiglu_halves_of_partial_tiles_stay_unfused(tmp_path):
     irs = list((tmp_path / "irs").glob("ttnn*.mlir"))
     assert irs, "no IR was exported"
     assert not any("ttnn.fused_swiglu" in path.read_text() for path in irs), "halves of partial tiles were fused"
+
+
+def _silu_and_mul(y):
+    """PyTorch's SiluAndMul as SGLang-TorchTPU traces it: the silu of the gate
+    half in FP32, x / (1 + exp(-x)), cast back to BF16, times the up half."""
+    gate, up = jnp.split(y, 2, axis=-1)
+    gate = gate.astype(jnp.float32)
+    return (gate / (1 + jnp.exp(-gate))).astype(jnp.bfloat16) * up
+
+
+def _assert_exact_swiglu(tmp_path, op):
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert any(re.search(rf'"ttnn\.{op}".*ttnn\.exact_swiglu', ir) for ir in irs), f"no exact SwiGLU {op}"
+    assert not any('"ttnn.silu"' in ir for ir in irs), "silu was left unfused"
+
+
+@pytest.mark.parametrize(
+    "rows,inner_size,width,transposed",
+    [
+        # Qwen3-8B's gate and up projection on four chips and one, PyTorch's
+        # [2N, K] weight, one and four tokens; a [K, 2N] weight.
+        (1, 4096, 3072, True),
+        (4, 4096, 3072, True),
+        (1, 4096, 12288, True),
+        (2, 1024, 2048, False),
+    ],
+)
+def test_torch_silu_and_mul_projection(rows, inner_size, width, transposed, tmp_path):
+    """PyTorch's merged gate and up projection and SiluAndMul (SGLang-TorchTPU's
+    decode MLP) run as one exact SwiGLU decode matmul and equal the separate
+    ops (the projection and SiluAndMul as two programs) bit for bit."""
+    options = {"optimization_level": "O0"}
+    project = (lambda x, w: x @ w.T) if transposed else (lambda x, w: x @ w)
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(rows + width)
+    x = jax.device_put(jnp.asarray(rng.normal(0, 1, (rows, inner_size)), jnp.bfloat16), device)
+    shape = (2 * width, inner_size) if transposed else (inner_size, 2 * width)
+    w = jax.device_put(jnp.asarray(rng.normal(0, 0.05, shape), jnp.bfloat16), device)
+    fused = jax.jit(
+        lambda x, w: _silu_and_mul(project(x, w)), compiler_options={**options, "export_path": str(tmp_path)}
+    )
+    want = jax.jit(_silu_and_mul, compiler_options=options)(jax.jit(project, compiler_options=options)(x, w))
+    np.testing.assert_array_equal(np.asarray(fused(x, w), np.float32), np.asarray(want, np.float32))
+    _assert_exact_swiglu(tmp_path, "matmul")
+
+
+@pytest.mark.parametrize("rows,width", [(1, 3072), (4, 3072), (1, 12288)])
+@pytest.mark.parametrize("scale_shape", ["column", "scalar"])
+def test_torch_fp8_silu_and_mul_projection(rows, width, scale_shape, tmp_path):
+    """The same after SGLang-TorchTPU's FP8 linear (libtt's fp8_linear_small_m:
+    the official checkpoints' [2N, 1] weight scales, or online quantization's
+    one): one exact SwiGLU scaled matmul, bit for bit."""
+    from jax_plugins.libtt import sglang_tpu_kernels
+
+    options = {"optimization_level": "O0"}
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(rows + width)
+    x = jax.device_put(jnp.asarray(rng.normal(0, 1, (rows, 4096)), jnp.bfloat16), device)
+    w = jax.device_put(jnp.asarray(rng.normal(0, 30, (4096, 2 * width)), jnp.float8_e4m3fn), device)
+    scale = rng.uniform(1e-4, 1e-3, (2 * width, 1) if scale_shape == "column" else (1,))
+    s = jax.device_put(jnp.asarray(scale, jnp.float32), device)
+    linear = sglang_tpu_kernels._fp8_linear_small_m
+    fused = jax.jit(
+        lambda x, w, s: _silu_and_mul(linear(x, w, s)), compiler_options={**options, "export_path": str(tmp_path)}
+    )
+    want = jax.jit(_silu_and_mul, compiler_options=options)(jax.jit(linear, compiler_options=options)(x, w, s))
+    np.testing.assert_array_equal(np.asarray(fused(x, w, s), np.float32), np.asarray(want, np.float32))
+    _assert_exact_swiglu(tmp_path, "scaled_matmul")

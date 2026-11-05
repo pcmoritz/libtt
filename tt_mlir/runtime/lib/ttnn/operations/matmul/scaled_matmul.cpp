@@ -30,7 +30,7 @@ void run(const ::tt::target::ttnn::ScaledMatmulOp *op, ProgramContext &context) 
   }
   ::ttnn::Tensor out = ::ttnn::matmul_scaled(
       a, b, rowScale, colScale, op->transpose_b(), outputMemoryConfig, dtype,
-      computeConfig);
+      computeConfig, op->swiglu());
   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
 }
 

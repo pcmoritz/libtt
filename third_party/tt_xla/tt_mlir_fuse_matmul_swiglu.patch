@@ -1,11 +1,14 @@
 diff --git a/include/ttmlir/Target/TTNN/operations/matmul.fbs b/include/ttmlir/Target/TTNN/operations/matmul.fbs
 --- a/include/ttmlir/Target/TTNN/operations/matmul.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/matmul.fbs
-@@ -70,6 +70,7 @@ table MatmulOp {
+@@ -70,6 +70,10 @@ table MatmulOp {
    matmul_program_config: tt.target.ttnn.MatmulProgramConfig;
    activation: string;
    compute_config: tt.target.ttnn.DeviceComputeKernelConfig;
 +  fused_swiglu: bool = false;
++  // With fused_swiglu: PyTorch's [gate | up] SiluAndMul, bit for bit
++  // (ttnn::matmul_swiglu's exact mode).
++  exact_swiglu: bool = false;
  }
  // ANCHOR_END: adding_an_op_matmul_fbs
  
@@ -37,7 +40,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  
  #include "mlir/Interfaces/SideEffectInterfaces.h"
  #ifdef TTMLIR_ENABLE_OPMODEL
-@@ -334,6 +335,89 @@ private:
+@@ -334,6 +335,190 @@ private:
  };
  } // namespace
  
@@ -124,10 +127,111 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +  }
 +};
 +
++// Fold PyTorch's SiluAndMul after a merged [gate | up] projection, as
++// SGLang-TorchTPU's decode MLP runs it on one tile row: silu of the gate half
++// in FP32 cast back to BF16, times the up half. The BF16 projection, a matmul
++// (or a scaled matmul), becomes a half-width one marked ttnn.exact_swiglu,
++// whose decode program epilogue reproduces every rounding of those ops.
++template <typename ProjectionOp>
++class TTNNProjectionWithExactSwiGLU
++    : public mlir::OpRewritePattern<MultiplyOp> {
++public:
++  TTNNProjectionWithExactSwiGLU(mlir::MLIRContext *context)
++      : mlir::OpRewritePattern<MultiplyOp>(context, /*benefit=*/2) {}
++
++  mlir::LogicalResult
++  matchAndRewrite(MultiplyOp multiplyOp,
++                  mlir::PatternRewriter &rewriter) const final {
++    auto elementType = [](Value v) {
++      return mlir::cast<RankedTensorType>(v.getType()).getElementType();
++    };
++    // typecast(silu(typecast(slice))) to BF16 by way of an FP32 silu, each
++    // op used once; the gate slice last.
++    auto siluOfSlice = [&](Value v) -> SmallVector<Operation *> {
++      auto narrow = v.getDefiningOp<TypecastOp>();
++      auto silu = narrow ? narrow.getInput().getDefiningOp<SiluOp>() : nullptr;
++      auto widen = silu ? silu.getInput().getDefiningOp<TypecastOp>() : nullptr;
++      auto gate =
++          widen ? widen.getInput().getDefiningOp<SliceStaticOp>() : nullptr;
++      SmallVector<Operation *> chain = {narrow, silu, widen, gate};
++      if (!gate || !elementType(silu.getResult()).isF32() ||
++          !elementType(narrow.getResult()).isBF16() ||
++          !llvm::all_of(chain, [](Operation *op) {
++            return op->getResult(0).hasOneUse();
++          })) {
++        return {};
++      }
++      return chain;
++    };
++    SmallVector<Operation *> chain = siluOfSlice(multiplyOp.getLhs());
++    Value other = multiplyOp.getRhs();
++    if (chain.empty()) {
++      chain = siluOfSlice(multiplyOp.getRhs());
++      other = multiplyOp.getLhs();
++    }
++    auto up = other.getDefiningOp<SliceStaticOp>();
++    auto gate =
++        chain.empty() ? nullptr : mlir::cast<SliceStaticOp>(chain.back());
++    auto projection =
++        gate ? gate.getInput().getDefiningOp<ProjectionOp>() : nullptr;
++    if (!projection || !up || up.getInput() != projection.getResult() ||
++        !up.getResult().hasOneUse() || !projection.getResult().hasNUses(2) ||
++        projection->hasAttr("ttnn.fused_swiglu") ||
++        !multiplyOp.getActivations().empty() ||
++        !multiplyOp.getInputTensorAActivations().empty() ||
++        !multiplyOp.getInputTensorBActivations().empty()) {
++      return failure();
++    }
++    if constexpr (std::is_same_v<ProjectionOp, MatmulOp>) {
++      if (projection.getTransposeA() || projection.getActivation() ||
++          projection.getMatmulProgramConfigAttr() ||
++          projection->hasAttr("ttcore.fp32_exact")) {
++        return failure();
++      }
++    }
++    // A BF16 [M <= 32, 2 * half] product, K and the halves whole tiles.
++    auto [tileHeight, tileWidth] = ttcore::TileType::getDefaultShape();
++    RankedTensorType type = projection.getType();
++    ArrayRef<int64_t> shape = type.getShape();
++    const int64_t half = shape.back() / 2;
++    const int64_t k =
++        mlir::cast<RankedTensorType>(projection->getOperand(0).getType())
++            .getShape()
++            .back();
++    auto isHalf = [&](SliceStaticOp slice, int64_t begin) {
++      auto values = [](mlir::ArrayAttr attr) {
++        return llvm::cantFail(ttmlir::utils::getIntegerVector<int64_t>(attr));
++      };
++      return values(slice.getBegins()) == SmallVector<int64_t>{0, begin} &&
++             values(slice.getEnds()) ==
++                 SmallVector<int64_t>{shape[0], begin + half} &&
++             values(slice.getStep()) == SmallVector<int64_t>{1, 1};
++    };
++    if (shape.size() != 2 || !type.getElementType().isBF16() ||
++        !multiplyOp.getType().getElementType().isBF16() ||
++        shape[0] > tileHeight || half % tileWidth != 0 || k % tileWidth != 0 ||
++        !isHalf(gate, 0) || !isHalf(up, half)) {
++      return failure();
++    }
++
++    mlir::Operation *fused = rewriter.clone(*projection);
++    fused->getResult(0).setType(multiplyOp.getType());
++    fused->setAttr("ttnn.fused_swiglu", rewriter.getUnitAttr());
++    fused->setAttr("ttnn.exact_swiglu", rewriter.getUnitAttr());
++    rewriter.replaceOp(multiplyOp, fused->getResult(0));
++    for (Operation *op : chain) {
++      rewriter.eraseOp(op);
++    }
++    rewriter.eraseOp(up);
++    rewriter.eraseOp(projection);
++    return success();
++  }
++};
++
  #ifdef TTMLIR_ENABLE_OPMODEL
  
  // ============================================================================
-@@ -707,7 +791,7 @@ public:
+@@ -707,7 +892,7 @@ public:
      }
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
@@ -136,22 +240,31 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
          TTNNConv2dWithActivation<ReluOp>, TTNNConv2dWithActivation<Relu6Op>,
          TTNNConv2dWithActivation<SiluOp>, TTNNConv2dWithActivation<SigmoidOp>,
          TTNNMatmulAndLinearWithActivation<MatmulOp, SigmoidOp>,
+@@ -716,6 +901,7 @@ public:
+         TTNNMatmulAndLinearWithActivation<LinearOp, SiluOp>,
+         TTNNMatmulAndLinearWithActivation<MatmulOp, GeluOp>,
+         TTNNMatmulAndLinearWithActivation<LinearOp, GeluOp>>(&getContext());
++    patterns.add<TTNNProjectionWithExactSwiGLU<MatmulOp>>(&getContext());
+ 
+ #ifdef TTMLIR_ENABLE_OPMODEL
+     if (enableOpConstraints) {
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -578,7 +578,7 @@ createOp(FlatbufferObjectCache &cache, MatmulOp op) {
+@@ -578,7 +578,8 @@ createOp(FlatbufferObjectCache &cache, MatmulOp op) {
    return ::tt::target::ttnn::CreateMatmulOp(
        *cache.fbb, a, b, output, op.getTransposeA(), op.getTransposeB(),
        matmulProgramConfigType, matmulProgramConfigDesc, activation,
 -      computeConfig.value_or(0));
-+      computeConfig.value_or(0), op->hasAttr("ttnn.fused_swiglu"));
++      computeConfig.value_or(0), op->hasAttr("ttnn.fused_swiglu"),
++      op->hasAttr("ttnn.exact_swiglu"));
  }
  // ANCHOR_END: adding_an_op_matmul_serialize_to_binary
  
 diff --git a/runtime/lib/ttnn/operations/matmul/matmul.cpp b/runtime/lib/ttnn/operations/matmul/matmul.cpp
 --- a/runtime/lib/ttnn/operations/matmul/matmul.cpp
 +++ b/runtime/lib/ttnn/operations/matmul/matmul.cpp
-@@ -72,12 +72,18 @@ void run(const ::tt::target::ttnn::MatmulOp *op, ProgramContext &context) {
+@@ -72,12 +72,19 @@ void run(const ::tt::target::ttnn::MatmulOp *op, ProgramContext &context) {
          utils::createDeviceComputeKernelConfig(op->compute_config());
    }
  
@@ -164,7 +277,8 @@ diff --git a/runtime/lib/ttnn/operations/matmul/matmul.cpp b/runtime/lib/ttnn/op
 +  ::ttnn::Tensor output;
 +  if (op->fused_swiglu()) {
 +    output = ::ttnn::matmul_swiglu(
-+        lhs, rhs, outputMemoryConfig, outputDataType, computeConfig);
++        lhs, rhs, outputMemoryConfig, outputDataType, computeConfig,
++        op->transpose_b(), op->exact_swiglu());
 +  } else {
 +    output = ::ttnn::matmul(
 +        lhs, rhs, op->transpose_a(), op->transpose_b(), outputMemoryConfig,

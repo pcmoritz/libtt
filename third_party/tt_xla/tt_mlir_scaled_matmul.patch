@@ -30,7 +30,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/matmul.fbs b/include/ttmlir/Target/TTNN/operations/matmul.fbs
 --- a/include/ttmlir/Target/TTNN/operations/matmul.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/matmul.fbs
-@@ -75,6 +75,17 @@ table MatmulOp {
+@@ -78,6 +78,19 @@ table MatmulOp {
  }
  // ANCHOR_END: adding_an_op_matmul_fbs
  
@@ -43,6 +43,8 @@ diff --git a/include/ttmlir/Target/TTNN/operations/matmul.fbs b/include/ttmlir/T
 +  out: tt.target.ttnn.TensorRef;
 +  transpose_b: bool;
 +  compute_config: tt.target.ttnn.DeviceComputeKernelConfig;
++  // PyTorch's [gate | up] SiluAndMul of the result, bit for bit.
++  swiglu: bool = false;
 +}
 +
  table LinearOp {
@@ -62,7 +64,7 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -468,7 +468,8 @@
+@@ -468,7 +468,8 @@ public:
  // produces BF16 itself: binary_ng computes in FP32 DST whenever an operand is
  // FP32 and rounds once as it packs the result, which saves the typecast
  // program. (The packer rounds exact ties away from zero where the typecast
@@ -72,7 +74,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  class TTNNBinaryOpNarrowingOutput : public mlir::OpRewritePattern<TypecastOp> {
  public:
    using mlir::OpRewritePattern<TypecastOp>::OpRewritePattern;
-@@ -477,14 +478,16 @@
+@@ -477,14 +478,16 @@ public:
    matchAndRewrite(TypecastOp cast,
                    mlir::PatternRewriter &rewriter) const final {
      Operation *producer = cast.getInput().getDefiningOp();
@@ -93,7 +95,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
        return failure();
      }
      rewriter.modifyOpInPlace(producer, [&]() {
-@@ -495,6 +498,107 @@
+@@ -495,6 +498,107 @@ public:
    }
  };
  
@@ -201,7 +203,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  // Fold the decode MLP's concatenated [up | gate] projection and SwiGLU into a
  // single half-width matmul.  The runtime implements this marker with a
  // two-weight matmul that keeps matching up/gate accumulators on the same core.
-@@ -952,7 +1056,7 @@
+@@ -1053,7 +1157,7 @@ public:
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
      patterns.add<TTNNBF16MeanOfUpcast, TTNNBinaryOpNarrowingOutput, TTNNRMSNormOfUpcast>(&getContext());
@@ -210,10 +212,20 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
          TTNNConv2dWithActivation<ReluOp>, TTNNConv2dWithActivation<Relu6Op>,
          TTNNConv2dWithActivation<SiluOp>, TTNNConv2dWithActivation<SigmoidOp>,
          TTNNMatmulAndLinearWithActivation<MatmulOp, SigmoidOp>,
+@@ -1062,7 +1166,8 @@ public:
+         TTNNMatmulAndLinearWithActivation<LinearOp, SiluOp>,
+         TTNNMatmulAndLinearWithActivation<MatmulOp, GeluOp>,
+         TTNNMatmulAndLinearWithActivation<LinearOp, GeluOp>>(&getContext());
+-    patterns.add<TTNNProjectionWithExactSwiGLU<MatmulOp>>(&getContext());
++    patterns.add<TTNNProjectionWithExactSwiGLU<MatmulOp>,
++                 TTNNProjectionWithExactSwiGLU<ScaledMatmulOp>>(&getContext());
+ 
+ #ifdef TTMLIR_ENABLE_OPMODEL
+     if (enableOpConstraints) {
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -595,6 +595,23 @@ createOp(FlatbufferObjectCache &cache, MatmulOp op) {
+@@ -596,6 +596,24 @@ createOp(FlatbufferObjectCache &cache, MatmulOp op) {
  }
  // ANCHOR_END: adding_an_op_matmul_serialize_to_binary
  
@@ -231,13 +243,14 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +  return ::tt::target::ttnn::CreateScaledMatmulOp(
 +      *cache.fbb, tensor(op.getA()), tensor(op.getB()),
 +      tensor(op.getRowScale()), tensor(op.getColScale()), output,
-+      op.getTransposeB(), computeConfig.value_or(0));
++      op.getTransposeB(), computeConfig.value_or(0),
++      op->hasAttr("ttnn.exact_swiglu"));
 +}
 +
  ::flatbuffers::Offset<::tt::target::ttnn::SparseMatmulOp>
  createOp(FlatbufferObjectCache &cache, SparseMatmulOp op) {
    auto a = cache.at<::tt::target::ttnn::TensorRef>(
-@@ -5888,6 +5905,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -5889,6 +5907,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, scaledDotProductAttentionOp),
                             debugString, locInfo);
    }
