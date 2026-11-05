@@ -2,12 +2,11 @@
 // The decode matmul's exact SwiGLU (ttnn::matmul_swiglu with `exact`, and
 // ttnn::matmul_scaled with `swiglu`): PyTorch's SiluAndMul after a merged
 // [gate | up] projection, as SGLang-TorchTPU's decode MLP runs it on TT. The
-// result must equal the projection followed by ttnn::silu_and_mul's ops (the
-// halves sliced, the gate cast to FP32, silu, cast back to BF16, times up) bit
-// for bit: BF16 weights in either layout, FP8 weights with row, column and
-// single column scales, one to 32 rows, and the fallback past one tile row.
-// The shapes keep the unfused projection off the split over K, which sums in
-// another order.
+// result must equal the projection followed by SiluAndMul's ops (the halves
+// sliced, the gate cast to FP32, silu, cast back to BF16, times up) bit for
+// bit: BF16 weights in either layout and FP8 weights with row, column and
+// single column scales, for one to 32 rows. The shapes keep the projection on
+// the decode program unsplit over K, as the fused one runs.
 #include <gtest/gtest.h>
 
 #include <bit>
@@ -19,6 +18,9 @@
 #include <tt-metalium/mesh_device.hpp>
 
 #include "ttnn/operations/copy/typecast/typecast.hpp"
+#include "ttnn/operations/data_movement/slice/slice.hpp"
+#include "ttnn/operations/eltwise/binary/binary.hpp"
+#include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/operations/matmul/matmul.hpp"
 #include "ttnn/tensor/tensor.hpp"
 
@@ -57,6 +59,16 @@ protected:
         return ttnn::DeviceComputeKernelConfig{.math_fidelity = MathFidelity::HiFi4, .fp32_dest_acc_en = true};
     }
 
+    // SiluAndMul's ops on a BF16 [M, 2N] product.
+    static ttnn::Tensor silu_and_mul(const ttnn::Tensor& product, uint32_t M, uint32_t N) {
+        using Index = ttsl::SmallVector<uint32_t>;
+        const ttnn::Tensor gate = ttnn::slice(product, Index{0, 0}, Index{M, N}, Index{1, 1});
+        const ttnn::Tensor up = ttnn::slice(product, Index{0, N}, Index{M, 2 * N}, Index{1, 1});
+        const ttnn::Tensor silu =
+            ttnn::typecast(ttnn::silu(ttnn::typecast(gate, DataType::FLOAT32)), DataType::BFLOAT16);
+        return ttnn::multiply(silu, up, DataType::BFLOAT16);
+    }
+
     size_t mismatches(const ttnn::Tensor& fused, const ttnn::Tensor& unfused, uint32_t M, uint32_t N) {
         EXPECT_EQ(fused.dtype(), DataType::BFLOAT16);
         EXPECT_EQ(fused.logical_shape(), ttnn::Shape({M, N}));
@@ -91,7 +103,7 @@ protected:
             /*program_config=*/std::nullopt,
             /*activation=*/std::nullopt,
             hifi4());
-        return mismatches(fused, ttnn::silu_and_mul(product), M, N);
+        return mismatches(fused, silu_and_mul(product, M, N), M, N);
     }
 
     // The column scales: [1, 2N], the same scales as [2N, 1] (the official FP8
@@ -117,7 +129,7 @@ protected:
             a, b, row_scale, col_scale, false, std::nullopt, DataType::BFLOAT16, hifi4(), /*swiglu=*/true);
         const ttnn::Tensor product =
             ttnn::matmul_scaled(a, b, row_scale, col_scale, false, std::nullopt, DataType::BFLOAT16, hifi4());
-        return mismatches(fused, ttnn::silu_and_mul(product), M, N);
+        return mismatches(fused, silu_and_mul(product, M, N), M, N);
     }
 
     std::shared_ptr<MeshDevice> mesh_device_;
@@ -151,12 +163,6 @@ TEST_F(MatmulExactSwiGLUTest, Float8Scaled) {
     for (uint32_t M : {2u, 13u, 32u}) {
         EXPECT_EQ(fp8_mismatches(M, 1024, 2048, Col::Column), 0u) << M;
     }
-}
-
-// Past one tile row of activations the decode program does not apply.
-TEST_F(MatmulExactSwiGLUTest, FallsBackPastOneTileRow) {
-    EXPECT_EQ(bf16_mismatches(64, 1024, 2048, true), 0u);
-    EXPECT_EQ(fp8_mismatches(64, 1024, 2048, Col::Column), 0u);
 }
 
 }  // namespace

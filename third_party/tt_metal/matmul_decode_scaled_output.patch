@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
-@@ -1285,7 +1285,7 @@ std::optional<std::string> matmul_decode_unsupported_reason(
+@@ -1230,7 +1230,7 @@ std::optional<std::string> matmul_decode_unsupported_reason(
  
      // The whole activation row stays resident on every core.
      const uint32_t cb_bytes = ttnn::prim::matmul_decode_cb_bytes(
@@ -532,8 +532,8 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-@@ -508,6 +508,93 @@ Tensor matmul_swiglu(
-     return silu_and_mul(product, params.output_mem_config);
+@@ -484,6 +484,84 @@ Tensor matmul_swiglu(
+         .at(0);
  }
  
 +Tensor matmul_scaled(
@@ -561,16 +561,19 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 +    params.compute_kernel_config = compute_kernel_config;
 +    params.transpose_b = transpose_b;
 +    auto attributes = ttnn::prim::create_matmul_attributes(input_tensor_a, input_tensor_b, params, {std::nullopt});
-+    // The program ttnn::matmul would choose (the exact SwiGLU decode program
-+    // for `swiglu`): the decode program (or its split over K) takes the scales
-+    // in its epilogue.
-+    const auto grid = input_tensor_a.device()->compute_with_storage_grid_size();
-+    MatmulProgramConfig config =
-+        swiglu ? MatmulProgramConfig{create_matmul_decode_exact_swiglu_program_config(
-+                     input_tensor_a, input_tensor_b, transpose_b, grid)}
-+               : get_program_config(input_tensor_a, input_tensor_b, false, transpose_b, 0, attributes);
-+    normalize_program_config(config, grid);
-+    const auto* decode = std::get_if<MatmulDecodeProgramConfig>(&config);
++    // The program ttnn::matmul would choose: the decode program (or its split
++    // over K) takes the scales in its epilogue.
++    auto config = get_program_config(input_tensor_a, input_tensor_b, false, transpose_b, 0, attributes);
++    normalize_program_config(config, input_tensor_a.device()->compute_with_storage_grid_size());
++    auto* decode = std::get_if<MatmulDecodeProgramConfig>(&config);
++    if (swiglu) {
++        // Each output tile's gate and up halves on one core.
++        TT_FATAL(
++            decode != nullptr && decode->k_splits == 1,
++            "matmul_scaled: SwiGLU needs the decode program, unsplit over K");
++        decode->fuse_swiglu = true;
++        decode->exact_swiglu = true;
++    }
 +    const auto is_tiled_dram = [](const Tensor& t) {
 +        return t.layout() == Layout::TILE && utilities::is_dram_interleaved(t.memory_config());
 +    };
@@ -579,7 +582,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 +    // [N, 1] column scales are the [1, N] row's transpose.
 +    const bool col_column = col_scale.logical_volume() != 1 && col_shape[-2] == n && col_shape[-1] == 1;
 +    const bool col_fits = col_scale.logical_volume() == 1 || col_column || (col_shape[-2] == 1 && col_shape[-1] == n);
-+    if (decode != nullptr && decode->fuse_swiglu == swiglu && is_tiled_dram(row_scale) && is_tiled_dram(col_scale) &&
++    if (decode != nullptr && is_tiled_dram(row_scale) && is_tiled_dram(col_scale) &&
 +        col_fits && row_scale.logical_shape()[-1] == 1) {
 +        attributes.program_config = config;
 +        attributes.output_scales = true;
@@ -593,19 +596,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 +                .at(0);
 +        }
 +    }
-+    if (swiglu) {
-+        return silu_and_mul(
-+            matmul_scaled(
-+                input_tensor_a,
-+                input_tensor_b,
-+                row_scale,
-+                col_scale,
-+                transpose_b,
-+                output_mem_config,
-+                output_dtype,
-+                compute_kernel_config),
-+            output_mem_config);
-+    }
++    TT_FATAL(!swiglu, "matmul_scaled: SwiGLU needs the decode program");
 +    const Tensor product = ttnn::matmul(
 +        input_tensor_a,
 +        input_tensor_b,
@@ -629,9 +620,9 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/matmul/matmul.hpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.hpp
-@@ -69,6 +69,26 @@ Tensor matmul_swiglu(
- // the halves sliced, silu of the gate in FP32 cast back to BF16, times up.
- Tensor silu_and_mul(const Tensor& input_tensor, const std::optional<const MemoryConfig>& memory_config = std::nullopt);
+@@ -64,6 +64,26 @@ Tensor matmul_swiglu(
+     bool transpose_b = false,
+     bool exact = false);
  
 +// torch._scaled_mm's dequantization fused into a one-tile-row matmul: the FP32
 +// product of a and b times row_scale (FP32 [..., M, 1]), then times col_scale
@@ -639,9 +630,9 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/m
 +// multiply, rounded to `dtype` (FP32 or BF16) as ttnn.multiply rounds: (a @ b *
 +// row_scale) * col_scale, bit for bit. The decode program does it in its
 +// epilogue when it can run the matmul; otherwise the matmul and the two
-+// multiplies run apart. With `swiglu`, b holds a gate half followed by an up
-+// half and the BF16 result is silu_and_mul's of the scaled product, bit for
-+// bit (the decode program's exact_swiglu).
++// multiplies run apart. With `swiglu` (the decode program only), b holds a
++// gate half followed by an up half and the BF16 result is PyTorch's SiluAndMul
++// of the scaled product as TT runs its ops, bit for bit (exact_swiglu).
 +Tensor matmul_scaled(
 +    const Tensor& input_tensor_a,
 +    const Tensor& input_tensor_b,
@@ -656,10 +647,10 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/m
  std::vector<Tensor> matmul_batched_weights(
      const Tensor& input_tensor_a,
      const std::vector<Tensor>& input_tensors_b,
-@@ -148,6 +168,7 @@ using operations::matmul::linear;
+@@ -142,6 +162,7 @@ using operations::matmul::addmm;
+ using operations::matmul::linear;
  using operations::matmul::matmul;
  using operations::matmul::matmul_swiglu;
- using operations::matmul::silu_and_mul;
 +using operations::matmul::matmul_scaled;
  using operations::matmul::matmul_batched_weights;
  using operations::matmul::sparse_matmul;

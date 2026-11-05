@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
  #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
  #include "ttnn/types.hpp"
  #include <algorithm>
-@@ -1024,16 +1025,311 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
+@@ -1024,16 +1025,284 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
  }
  }  // namespace bmm_op_utils
  
@@ -39,47 +39,6 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +// NOCs, so that reads overlap the matmul: Qwen3-8B's qkv projection on four
 +// chips, [4096, 1536], BF16 35.3 -> 29.3 us and FP8 23.8 -> 18.8 us. Shares of
 +// 16 to 40 tiles were fastest as one block.
-+// The K block of a decode matmul whose cores stream `halves` weight tiles for
-+// each of their output tiles. A core streams in0_block_w K rows of each output
-+// tile of its pass per weight block, one block per round trip on each NOC:
-+// blocks of up to 16 tiles, and at least four blocks once a core streams 16
-+// tiles or more, so that reads stay in flight (the GDN qkv projection of
-+// Qwen3.8-Flash-Next, two output tiles a core and K = 80 tiles, 28.1 us with
-+// blocks of 2 K tiles, 25.6 with 8; its hyper-connection up projection, three
-+// tiles of K = 10, is fastest at 2).
-+uint32_t decode_in0_block_w(
-+    const Tensor& input_tensor_a,
-+    const Tensor& input_tensor_b,
-+    const bool transpose_b,
-+    const tt::tt_metal::CoreCoord& grid,
-+    const uint32_t halves) {
-+    const uint32_t Kt = utilities::get_matmul_tensor_padded_shape(input_tensor_a, /*transpose_a=*/false)[-1] /
-+                        tt::constants::TILE_WIDTH;
-+    const uint32_t out_Nt =
-+        utilities::get_matmul_tensor_padded_shape(input_tensor_b, transpose_b)[-1] / tt::constants::TILE_WIDTH / halves;
-+    const uint32_t worker_cores = grid.x * grid.y;
-+    const uint32_t per_core = tt::div_up(out_Nt, std::max(1u, std::min(out_Nt, worker_cores)));
-+    // The tiles of one K row a core streams per pass.
-+    const uint32_t group = halves * tt::div_up(per_core, tt::div_up(per_core, 8u / halves));
-+    uint32_t in0_block_w = Kt % 2 == 0 ? 2u : 1u;
-+    for (uint32_t w = 1; w <= Kt; ++w) {
-+        if (Kt % w == 0 && w * group <= 16 && (group * Kt < 16 || Kt / w >= 4)) {
-+            in0_block_w = w;
-+        }
-+    }
-+    // A transposed weight keeps each output tile's K tiles in a row of
-+    // consecutive pages, so a narrow block reads the same few DRAM banks for
-+    // every output tile on every core: take one K tile from each bank (Qwen3-8B's
-+    // gate and up projection [4096, 24576] on one chip 544 -> 461 us, Qwen3-32B's
-+    // [5120, 12800] on four chips 528 -> 290 us, a [4096, 37984] LM head 822 ->
-+    // 687 us).
-+    const uint32_t banks = input_tensor_b.device()->allocator()->get_num_banks(tt::tt_metal::BufferType::DRAM);
-+    if (transpose_b && in0_block_w < banks && Kt % banks == 0) {
-+        in0_block_w = banks;
-+    }
-+    return in0_block_w;
-+}
-+
 +std::optional<MatmulDecodeProgramConfig> create_matmul_decode_split_k_program_config(
 +    const Tensor& input_tensor_a,
 +    const Tensor& input_tensor_b,
@@ -116,20 +75,6 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +}
 +
 +}  // namespace
-+
-+MatmulDecodeProgramConfig create_matmul_decode_exact_swiglu_program_config(
-+    const Tensor& input_tensor_a,
-+    const Tensor& input_tensor_b,
-+    const bool transpose_b,
-+    const tt::tt_metal::CoreCoord& compute_with_storage_grid_size) {
-+    return MatmulDecodeProgramConfig{
-+        .compute_with_storage_grid_size = compute_with_storage_grid_size,
-+        .in0_block_w = decode_in0_block_w(
-+            input_tensor_a, input_tensor_b, transpose_b, compute_with_storage_grid_size, /*halves=*/2),
-+        .fuse_swiglu = true,
-+        .exact_swiglu = true,
-+    };
-+}
 +
 +std::optional<std::string> matmul_decode_unsupported_reason(
 +    const Tensor& input_tensor_a,
@@ -292,7 +237,35 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +        const uint32_t N = utilities::get_matmul_tensor_padded_shape(input_tensor_b, transpose_b)[-1];
 +        const uint32_t out_Nt = N / tt::constants::TILE_WIDTH;
 +        const uint32_t worker_cores = grid.x * grid.y;
-+        decode_config.in0_block_w = decode_in0_block_w(input_tensor_a, input_tensor_b, transpose_b, grid, /*halves=*/1);
++        // A core streams in0_block_w K rows of each output tile of its pass per
++        // weight block, one block per round trip on each NOC: blocks of up to
++        // 16 tiles, and at least four blocks once a core streams 16 tiles or
++        // more, so that reads stay in flight (the GDN qkv projection of
++        // Qwen3.8-Flash-Next, two output tiles a core and K = 80 tiles, 28.1 us
++        // with blocks of 2 K tiles, 25.6 with 8; its hyper-connection up
++        // projection, three tiles of K = 10, is fastest at 2).
++        {
++            const uint32_t Kt =
++                utilities::get_matmul_tensor_padded_shape(input_tensor_a, /*transpose_a=*/false)[-1] /
++                tt::constants::TILE_WIDTH;
++            const uint32_t per_core = tt::div_up(out_Nt, std::max(1u, std::min(out_Nt, worker_cores)));
++            const uint32_t group = tt::div_up(per_core, tt::div_up(per_core, 8u));
++            for (uint32_t w = 1; w <= Kt; ++w) {
++                if (Kt % w == 0 && w * group <= 16 && (group * Kt < 16 || Kt / w >= 4)) {
++                    decode_config.in0_block_w = w;
++                }
++            }
++            // A transposed weight keeps each output tile's K tiles in a row
++            // of consecutive pages, so a narrow block reads the same few DRAM
++            // banks for every output tile on every core: take one K tile from
++            // each bank (Qwen3-8B's gate and up projection [4096, 24576] on
++            // one chip 544 -> 461 us, Qwen3-32B's [5120, 12800] on four chips
++            // 528 -> 290 us, a [4096, 37984] LM head 822 -> 687 us).
++            const uint32_t banks = input_tensor_b.device()->allocator()->get_num_banks(tt::tt_metal::BufferType::DRAM);
++            if (transpose_b && decode_config.in0_block_w < banks && Kt % banks == 0) {
++                decode_config.in0_block_w = banks;
++            }
++        }
 +        // Only for BF16 outputs or float8 activations: matmul_decode reads no
 +        // FP32 activations, so an FP32 matmul of a BF16 activation keeps
 +        // summing in the order of one of the activation cast to FP32.
@@ -322,7 +295,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
      auto config = generate_matmul_program_config(
          input_tensor_a,
          input_tensor_b,
-@@ -1052,7 +1348,9 @@ MatmulProgramConfig get_program_config(
+@@ -1052,7 +1321,9 @@ MatmulProgramConfig get_program_config(
      std::visit(
          [input_tensor_a](const auto& program_config) {
              using ProgramConfigType = std::decay_t<decltype(program_config)>;
@@ -346,7 +319,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.h
  #include "ttnn/operations/matmul/device/matmul_device_operation_types.hpp"
  #include "ttnn/operations/matmul/device/config/matmul_program_config_types.hpp"
  
-@@ -28,12 +31,38 @@ MatmulProgramConfig create_simple_matmul_program_config(
+@@ -28,12 +31,29 @@ MatmulProgramConfig create_simple_matmul_program_config(
      const tt::tt_metal::MemoryConfig& mem_config,
      tt::tt_metal::DataType output_dtype);
  
@@ -354,15 +327,6 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.h
 +// worker grid.
 +MatmulDecodeProgramConfig create_matmul_decode_program_config(
 +    const Tensor& input_tensor_a, const tt::tt_metal::CoreCoord& compute_with_storage_grid_size, bool fuse_swiglu);
-+
-+// The decode program config of PyTorch's merged gate and up projection and
-+// SiluAndMul (exact_swiglu), its K blocks sized as a decode matmul's for the
-+// two weight tiles of each output tile.
-+MatmulDecodeProgramConfig create_matmul_decode_exact_swiglu_program_config(
-+    const Tensor& input_tensor_a,
-+    const Tensor& input_tensor_b,
-+    bool transpose_b,
-+    const tt::tt_metal::CoreCoord& compute_with_storage_grid_size);
 +
 +// Why the decode program cannot run this matmul with `config`, or nothing if
 +// it can: the tensors, their layouts and memory, the config, and the
@@ -1620,15 +1584,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.hpp
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-@@ -14,6 +14,7 @@
- #include "ttnn/operations/copy/typecast/typecast.hpp"
- #include "ttnn/operations/eltwise/unary/common/unary_op_utils.hpp"
- #include "ttnn/operations/creation/creation.hpp"
-+#include "ttnn/operations/data_movement/slice/slice.hpp"
- 
- #include "ttnn/operations/matmul/device/config/matmul_program_config.hpp"
- #include "ttnn/operations/matmul/device/matmul_device_operation.hpp"
-@@ -271,14 +272,16 @@ static ttnn::Tensor bound_matmul(
+@@ -271,14 +271,16 @@ static ttnn::Tensor bound_matmul(
          parameters.transpose_a,
          parameters.transpose_b,
          bias_single_tile_size,
@@ -1647,25 +1603,10 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
      bool needs_manual_transpose_a = parameters.transpose_a && needs_manual_transpose;
      bool needs_manual_transpose_b = parameters.transpose_b && needs_manual_transpose;
  
-@@ -436,6 +439,69 @@ Tensor matmul(
+@@ -436,6 +438,46 @@ Tensor matmul(
          optional_output_tensor);
  }
  
-+Tensor silu_and_mul(const Tensor& input_tensor, const std::optional<const MemoryConfig>& memory_config) {
-+    const MemoryConfig mem = memory_config.value_or(ttnn::DRAM_MEMORY_CONFIG);
-+    const auto& shape = input_tensor.logical_shape();
-+    const uint32_t half = shape[-1] / 2;
-+    ttsl::SmallVector<uint32_t> begins(shape.rank(), 0), ends(shape.cbegin(), shape.cend()), step(shape.rank(), 1);
-+    ends.back() = half;
-+    const Tensor gate = ttnn::slice(input_tensor, begins, ends, step, mem);
-+    begins.back() = half;
-+    ends.back() = 2 * half;
-+    const Tensor up = ttnn::slice(input_tensor, begins, ends, step, mem);
-+    const Tensor silu =
-+        ttnn::typecast(ttnn::silu(ttnn::typecast(gate, DataType::FLOAT32, mem), mem), DataType::BFLOAT16, mem);
-+    return ttnn::multiply(silu, up, DataType::BFLOAT16, mem);
-+}
-+
 +Tensor matmul_swiglu(
 +    const Tensor& input_tensor_a,
 +    const Tensor& input_tensor_b,
@@ -1684,34 +1625,26 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 +    // such as its math fidelity, before the decode config is set.
 +    auto attributes = ttnn::prim::create_matmul_attributes(input_tensor_a, input_tensor_b, params, {std::nullopt});
 +    const auto grid = input_tensor_a.device()->compute_with_storage_grid_size();
-+    if (!exact) {
++    if (exact) {
++        // The decode program ttnn::matmul runs for the whole weight, each
++        // output tile's gate and up halves on one core.
++        MatmulProgramConfig config =
++            get_program_config(input_tensor_a, input_tensor_b, false, transpose_b, 0, attributes);
++        normalize_program_config(config, grid);
++        auto* decode = std::get_if<MatmulDecodeProgramConfig>(&config);
++        TT_FATAL(
++            decode != nullptr && decode->k_splits == 1,
++            "matmul_swiglu: exact SwiGLU needs the decode program, unsplit over K");
++        decode->fuse_swiglu = true;
++        decode->exact_swiglu = true;
++        attributes.program_config = config;
++    } else {
 +        attributes.program_config = create_matmul_decode_program_config(input_tensor_a, grid, /*fuse_swiglu=*/true);
-+        return ttnn::prim::matmul(
-+                   input_tensor_a, input_tensor_b, /*bias=*/std::nullopt,
-+                   /*optional_output_tensor=*/std::nullopt, attributes)
-+            .at(0);
 +    }
-+    const auto config =
-+        create_matmul_decode_exact_swiglu_program_config(input_tensor_a, input_tensor_b, transpose_b, grid);
-+    attributes.program_config = config;
-+    if (!matmul_decode_unsupported_reason(input_tensor_a, input_tensor_b, std::nullopt, attributes, config)
-+             .has_value()) {
-+        return ttnn::prim::matmul(
-+                   input_tensor_a, input_tensor_b, /*bias=*/std::nullopt,
-+                   /*optional_output_tensor=*/std::nullopt, attributes)
-+            .at(0);
-+    }
-+    const Tensor product = ttnn::matmul(
-+        input_tensor_a,
-+        input_tensor_b,
-+        /*transpose_a=*/false,
-+        transpose_b,
-+        params.output_mem_config,
-+        dtype,
-+        /*program_config=*/std::nullopt,
-+        /*activation=*/std::nullopt,
-+        compute_kernel_config);
-+    return silu_and_mul(product, params.output_mem_config);
++    return ttnn::prim::matmul(
++               input_tensor_a, input_tensor_b, /*bias=*/std::nullopt,
++               /*optional_output_tensor=*/std::nullopt, attributes)
++        .at(0);
 +}
 +
  Tensor linear(
@@ -1720,7 +1653,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/matmul/matmul.hpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.hpp
-@@ -47,6 +47,28 @@ Tensor matmul(
+@@ -47,6 +47,23 @@ Tensor matmul(
      const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id = std::nullopt,
      const PrefetcherPipeList& prefetcher_pipes = {});
  
@@ -1731,8 +1664,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/m
 +// With `exact`, the weight holds a gate half followed by an up half and the
 +// result is bit for bit that of PyTorch's SiluAndMul on the BF16 product as
 +// TT runs its ops: the halves sliced, the gate cast to FP32, silu, cast to
-+// BF16 and multiplied by the up half (exact_swiglu; those ops themselves
-+// where the decode program does not apply).
++// BF16 and multiplied by the up half (exact_swiglu).
 +Tensor matmul_swiglu(
 +    const Tensor& input_tensor_a,
 +    const Tensor& input_tensor_b,
@@ -1742,19 +1674,14 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/m
 +    bool transpose_b = false,
 +    bool exact = false);
 +
-+// PyTorch's SiluAndMul as TT runs its ops on a BF16 [..., gate | up] tensor:
-+// the halves sliced, silu of the gate in FP32 cast back to BF16, times up.
-+Tensor silu_and_mul(const Tensor& input_tensor, const std::optional<const MemoryConfig>& memory_config = std::nullopt);
-+
  std::vector<Tensor> matmul_batched_weights(
      const Tensor& input_tensor_a,
      const std::vector<Tensor>& input_tensors_b,
-@@ -124,6 +146,8 @@ Tensor sparse_matmul(
+@@ -124,6 +141,7 @@ Tensor sparse_matmul(
  using operations::matmul::addmm;
  using operations::matmul::linear;
  using operations::matmul::matmul;
 +using operations::matmul::matmul_swiglu;
-+using operations::matmul::silu_and_mul;
  using operations::matmul::matmul_batched_weights;
  using operations::matmul::sparse_matmul;
  
