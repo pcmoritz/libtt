@@ -95,15 +95,20 @@ def test_quantize_rows(trace, opt, rows, cols, in_dtype, dtype):
         assert_near_ieee(np.asarray(x, np.float32), q, scale, dtype)
 
 
+@pytest.mark.parametrize("scale_shape", ["vector", "column"])
 @pytest.mark.parametrize("tokens,k,n", [(1, 4096, 6144), (4, 1024, 4096)])
-def test_fp8_linear_small_m(tmp_path, tokens, k, n):
+def test_fp8_linear_small_m(tmp_path, tokens, k, n, scale_shape):
     """The patched SGLang kernel against its math as jnp ops, with the
-    dequantization and the narrowing to BF16 in the matmul's epilogue."""
+    dequantization and the narrowing to BF16 in the matmul's epilogue. A
+    column of weight scales ([n, 1], as the official FP8 checkpoints store
+    them) goes into the epilogue without the reshape to a row."""
     device = jax.devices("tt")[0]
     rng = np.random.default_rng(k + n)
     x = jnp.asarray(activations(rng, tokens, k), jnp.bfloat16)
     weight = jnp.asarray(rng.normal(0, 30, (k, n)), jnp.float8_e4m3fn)
     weight_scale = jnp.asarray(rng.uniform(1e-4, 1e-3, n), jnp.float32)
+    if scale_shape == "column":
+        weight_scale = weight_scale.reshape(n, 1)
 
     def reference(x, weight, weight_scale):
         x_q, x_scale = quantize_ops(x, weight.dtype)
@@ -119,3 +124,4 @@ def test_fp8_linear_small_m(tmp_path, tokens, k, n):
     (ir,) = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
     assert re.search(r'"ttnn\.scaled_matmul".*-> tensor<\d+x\d+xbf16', ir), "no BF16 ttnn.scaled_matmul"
     assert '"ttnn.multiply"' not in ir, "a scale multiply was left unfused"
+    assert not re.search(rf'"ttnn\.reshape".*tensor<{n}x1xf32', ir), "the weight scales were reshaped"

@@ -9,11 +9,11 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +  let summary = "Matmul with per-row and per-column output scales.";
 +  let description = [{
 +    ttnn::matmul_scaled: the FP32 product of `a` and `b` times `row_scale`
-+    ([M, 1] f32), then times `col_scale` ([1, N] or [1, 1] f32), each as
-+    ttnn.multiply's FP32 multiply, rounded to the result type as ttnn.multiply
-+    rounds: torch._scaled_mm's dequantization of SGLang's FP8 linears, in the
-+    decode matmul's epilogue. TTNNFusing forms it from the matmul and the two
-+    multiplies (and a narrowing typecast).
++    ([M, 1] f32), then times `col_scale` ([1, N], [N, 1] or [1, 1] f32), each
++    as ttnn.multiply's FP32 multiply, rounded to the result type as
++    ttnn.multiply rounds: torch._scaled_mm's dequantization of SGLang's FP8
++    linears, in the decode matmul's epilogue. TTNNFusing forms it from the
++    matmul and the two multiplies (and a narrowing typecast).
 +  }];
 +  let arguments = (ins AnyRankedTensor:$a,
 +                       AnyRankedTensor:$b,
@@ -93,7 +93,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
        return failure();
      }
      rewriter.modifyOpInPlace(producer, [&]() {
-@@ -495,6 +498,93 @@
+@@ -495,6 +498,107 @@
    }
  };
  
@@ -163,10 +163,21 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +    }
 +    const int64_t rows = productType.getDimSize(0);
 +    const int64_t cols = productType.getDimSize(1);
++    // The official checkpoints' per-channel scales, [N, 1], reshaped to [1, N]
++    // (weight_scale.reshape(1, -1)): the epilogue takes the column as it is,
++    // which saves a reshape program per linear and step.
++    ReshapeOp colReshape;
++    if (auto reshape = colScale.getDefiningOp<ReshapeOp>();
++        reshape && reshape.getInput().getType().getShape() ==
++                       ArrayRef<int64_t>{cols, 1}) {
++      colReshape = reshape;
++      colScale = reshape.getInput();
++      colType = reshape.getInput().getType();
++    }
 +    auto [tileHeight, tileWidth] = ttcore::TileType::getDefaultShape();
 +    if (rows > tileHeight ||
 +        rowType.getShape() != ArrayRef<int64_t>{rows, 1} ||
-+        (colType.getNumElements() != 1 &&
++        (!colReshape && colType.getNumElements() != 1 &&
 +         colType.getShape() != ArrayRef<int64_t>{1, cols})) {
 +      return failure();
 +    }
@@ -180,6 +191,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +        colScale, matmulOp.getTransposeBAttr(), matmulOp.getComputeConfigAttr());
 +    rewriter.eraseOp(inner);
 +    rewriter.eraseOp(matmulOp);
++    if (colReshape && colReshape->use_empty()) {
++      rewriter.eraseOp(colReshape);
++    }
 +    return success();
 +  }
 +};
@@ -187,7 +201,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  // Fold the decode MLP's concatenated [up | gate] projection and SwiGLU into a
  // single half-width matmul.  The runtime implements this marker with a
  // two-weight matmul that keeps matching up/gate accumulators on the same core.
-@@ -952,7 +1042,7 @@
+@@ -952,7 +1056,7 @@
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
      patterns.add<TTNNBF16MeanOfUpcast, TTNNBinaryOpNarrowingOutput, TTNNRMSNormOfUpcast>(&getContext());
