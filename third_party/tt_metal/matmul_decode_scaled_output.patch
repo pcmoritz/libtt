@@ -57,17 +57,18 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
  }
  
  ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
-@@ -130,9 +134,16 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -130,9 +134,17 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
      const bool transpose_b = operation_attributes.transpose_b;
      const auto bias_tensor = tensor_args.optional_input_tensors.empty() ? std::nullopt
                                                                       : tensor_args.optional_input_tensors[0];
-+    // Output scales: FP32 [..., M, 1] row scales and [1, N] or [1, 1] column
-+    // scales, multiplied into the FP32 sums as by two ttnn.multiply ops, the
-+    // second rounding to the output type (ttnn::matmul_scaled).
++    // Output scales: FP32 [..., M, 1] row scales and [1, N], [N, 1] or [1, 1]
++    // column scales, multiplied into the FP32 sums as by two ttnn.multiply ops,
++    // the second rounding to the output type (ttnn::matmul_scaled).
 +    const bool output_scales = operation_attributes.output_scales;
 +    const auto row_scale = output_scales ? tensor_args.optional_input_tensors.at(1) : std::nullopt;
 +    const auto col_scale = output_scales ? tensor_args.optional_input_tensors.at(2) : std::nullopt;
 +    const bool col_scalar = output_scales && col_scale->logical_volume() == 1;
++    const bool col_column = output_scales && !col_scalar && col_scale->logical_shape()[-1] == 1;
      const auto grid = config.compute_with_storage_grid_size;
      const uint32_t in0_block_w = config.in0_block_w;
 -    DecodePlan plan = plan_decode(a.padded_shape(), b.padded_shape(), transpose_b, config);
@@ -75,7 +76,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
      // An activation of up to 16 rows (decode) travels in tiles of the fewest rows that hold it, 2, 4, 8 or 16:
      // the sender reads just those rows of each tile's top faces from DRAM and the multicast carries them alone,
      // a sixteenth of a full tile for one row; the matmul unpacks the partial faces into srcB. The output tiles
-@@ -187,7 +198,11 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -187,7 +199,11 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
  
      const auto in0_format = tt_metal::datatype_to_dataformat_converter(a.dtype());
      const auto in1_format = tt_metal::datatype_to_dataformat_converter(b.dtype());
@@ -88,20 +89,21 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
      ProgramDescriptor desc;
      auto add_cb = [&](uint32_t index,
                        uint32_t tiles,
-@@ -217,6 +232,12 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -217,6 +233,13 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
              tt_metal::datatype_to_dataformat_converter(bias_tensor->dtype()),
              all_cores);
      }
 +    if (output_scales) {
 +        // The row scales' tile, and the column scales' tile of each output
-+        // tile (one for a [1, 1] scale), their rows replicated by the reader.
++        // tile (one for a [1, 1] scale), their rows replicated by the reader
++        // (an [N, 1] scale's tile as it is, for the compute to transpose).
 +        add_cb(tt::CBIndex::c_6, 1, tt::DataFormat::Float32, all_cores);
 +        add_cb(tt::CBIndex::c_7, col_scalar ? 1 : plan.count_of(0), tt::DataFormat::Float32, all_cores);
 +    }
      if (split) {
          // The other shares pack their FP32 partial sum (one output tile a
          // core) into c_5, which their writers place in the owner's partials
-@@ -254,6 +275,12 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -254,6 +277,13 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
          {"cb_partials", tt::CBIndex::c_4},
          {"cb_partial_out", tt::CBIndex::c_5},
          {"has_bias", bias_tensor.has_value()},
@@ -109,12 +111,13 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 +        {"cb_col_scale", tt::CBIndex::c_7},
 +        {"has_scales", output_scales},
 +        {"col_scalar", col_scalar},
++        {"col_column", col_column},
 +        {"scale_rows", std::min(a_rows, TILE_HEIGHT)},
 +        {"raw_bf16_output", raw_bf16_output},
          {"transpose_b", transpose_b},
          {"Kt", plan.Kt},
          {"Kt_total", plan.Kt_total},
-@@ -288,6 +315,10 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -288,6 +318,10 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
      if (bias_tensor.has_value()) {
          tt::tt_metal::TensorAccessorArgs(bias_tensor->mesh_tensor()).append_to(reader_args);
      }
@@ -125,7 +128,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
      auto reader = make_kernel("reader_matmul_decode.cpp", reader_args, tt_metal::DataMovementProcessor::RISCV_0, in1_noc);
      reader.core_ranges = all_cores;
      std::vector<uint32_t> sender_args;
-@@ -345,6 +376,10 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -345,6 +379,10 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
          if (bias_tensor.has_value()) {
              args.emplace_back(bias_tensor->mesh_tensor());
          }
@@ -136,7 +139,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
          if (!split) {
              reader.emplace_runtime_args(core_at(0, i), args);
              continue;
-@@ -393,9 +428,12 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -393,9 +431,12 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
          .fp32_dest_acc_en = true,
          .dst_full_sync_en = true,
          .math_approx_mode = math_approx_mode};
@@ -176,11 +179,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
-@@ -10,6 +10,77 @@
+@@ -10,6 +10,78 @@
  #include "api/compute/tile_move_copy.h"
  #include "api/dataflow/circular_buffer.h"
  #include "api/compute/compute_kernel_api.h"
 +#include "api/compute/eltwise_unary/typecast.h"
++#include "api/compute/transpose_dest.h"
 +
 +#ifdef TRISC_MATH
 +#include "sfpi.h"
@@ -254,19 +258,20 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
  
  // This core's output tiles, or silu(gate) * up for SwiGLU's two weight halves.
  // Each group of up to `group` output tiles accumulates the full K reduction in
-@@ -31,6 +102,11 @@ void kernel_main() {
+@@ -31,6 +103,12 @@ void kernel_main() {
      constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
      constexpr uint32_t cb_bias = get_named_compile_time_arg_val("cb_bias");
      constexpr bool has_bias = get_named_compile_time_arg_val("has_bias");
 +    constexpr bool has_scales = get_named_compile_time_arg_val("has_scales");
 +    constexpr bool col_scalar = get_named_compile_time_arg_val("col_scalar");
++    constexpr bool col_column = get_named_compile_time_arg_val("col_column");
 +    constexpr bool raw_bf16_output = get_named_compile_time_arg_val("raw_bf16_output");
 +    constexpr uint32_t cb_row_scale = get_named_compile_time_arg_val("cb_row_scale");
 +    constexpr uint32_t cb_col_scale = get_named_compile_time_arg_val("cb_col_scale");
      constexpr uint32_t transpose_b = get_named_compile_time_arg_val("transpose_b");
      constexpr uint32_t cb_partials = get_named_compile_time_arg_val("cb_partials");
      constexpr uint32_t cb_partial_out = get_named_compile_time_arg_val("cb_partial_out");
-@@ -53,6 +129,12 @@ void kernel_main() {
+@@ -53,6 +131,12 @@ void kernel_main() {
      if constexpr (has_bias) {
          cb_wait_front(cb_bias, count);
      }
@@ -279,7 +284,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
      uint32_t in0_ready = 0;
      uint32_t index = 0;
      for (uint32_t group_start = 0; group_start < count; group_start += group) {
-@@ -107,6 +189,44 @@ void kernel_main() {
+@@ -107,6 +191,55 @@ void kernel_main() {
              }
              reconfig_data_format<SrcOrder::Reverse>(cb_in0, cb_weights);
          }
@@ -303,6 +308,17 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
 +                    for (uint32_t i = 0; i < width; ++i) {
 +                        mul_binary_tile(i, width, i);
 +                    }
++                } else if constexpr (col_column) {
++                    // An [N, 1] tile's column 0 spread across its columns,
++                    // then transposed: the [1, N] scales in every row.
++                    for (uint32_t i = 0; i < width; ++i) {
++                        copy_init(cb_col_scale);
++                        load_scale_column(cb_col_scale, group_start + i, width);
++                        transpose_dest_init</*is_32bit=*/true>();
++                        transpose_dest</*is_32bit=*/true>(width);
++                        mul_binary_tile_init();
++                        mul_binary_tile(i, width, i);
++                    }
 +                } else {
 +                    mul_binary_tile_init();
 +                    for (uint32_t i = 0; i < width; ++i) {
@@ -324,7 +340,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
          tile_regs_commit();
          tile_regs_wait();
          cb_reserve_back(cb_result, width);
-@@ -123,4 +243,10 @@ void kernel_main() {
+@@ -123,4 +256,10 @@ void kernel_main() {
      if constexpr (has_bias) {
          cb_pop_front(cb_bias, count);
      }
@@ -338,7 +354,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
-@@ -26,6 +26,62 @@ FORCE_INLINE void read_bias(uint32_t n_start, uint32_t count, uint32_t cb_bias)
+@@ -26,6 +26,68 @@ FORCE_INLINE void read_bias(uint32_t n_start, uint32_t count, uint32_t cb_bias)
      }
  }
  
@@ -355,8 +371,9 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +// Reads the output scales: the row scales' column 0, as rows 0 .. scale_rows -
 +// 1 of faces 0 and 2 of the row-scale tile, and for each of this core's output
 +// tiles (once for a [1, 1] scale) the column scales' row 0, faces 0 and 1,
-+// into each of those rows of a column-scale tile. Their addresses are the
-+// runtime arguments at arg_index; their accessor arguments follow the bias's.
++// into each of those rows of a column-scale tile, or an [N, 1] scale's tile as
++// it is. Their addresses are the runtime arguments at arg_index; their
++// accessor arguments follow the bias's.
 +template <bool has_scales, uint32_t args_offset, uint32_t arg_index>
 +FORCE_INLINE void read_scales(uint32_t n_start, uint32_t count) {
 +    if constexpr (has_scales) {
@@ -364,6 +381,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +        constexpr uint32_t cb_col = get_named_compile_time_arg_val("cb_col_scale");
 +        constexpr uint32_t rows = get_named_compile_time_arg_val("scale_rows");
 +        constexpr bool col_scalar = get_named_compile_time_arg_val("col_scalar");
++        constexpr bool col_column = get_named_compile_time_arg_val("col_column");
 +        constexpr uint32_t row_bytes = 64;  // an FP32 face row
 +        constexpr uint32_t face_bytes = 1024;
 +        constexpr uint32_t tile_bytes = 4 * face_bytes;
@@ -382,6 +400,10 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +        cb_reserve_back(cb_col, col_tiles);
 +        const uint32_t col_l1 = get_write_ptr(cb_col);
 +        for (uint32_t n = 0; n < col_tiles; ++n) {
++            if constexpr (col_column) {
++                noc_async_read(col_scale.get_noc_addr(n_start + n), col_l1 + n * tile_bytes, tile_bytes);
++                continue;
++            }
 +            const uint64_t left = col_scale.get_noc_addr(col_scalar ? 0 : n_start + n);
 +            const uint64_t right = col_scale.get_noc_addr(col_scalar ? 0 : n_start + n, face_bytes);
 +            for (uint32_t r = 0; r < rows; ++r) {
@@ -401,7 +423,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
  // Reads this core's bias tiles, streams its even weight blocks on RISCV_0's
  // NOC, then writes its output tiles.
  //
-@@ -48,11 +104,15 @@ void kernel_main() {
+@@ -48,11 +110,15 @@ void kernel_main() {
      constexpr uint32_t cb_partials = get_named_compile_time_arg_val("cb_partials");
      constexpr uint32_t cb_partial_out = get_named_compile_time_arg_val("cb_partial_out");
      constexpr bool has_bias = get_named_compile_time_arg_val("has_bias");
@@ -418,7 +440,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
      const bool owner = role == 1;
      const bool producer = role == 2;
      constexpr auto weight_args = TensorAccessorArgs<0>();
-@@ -60,24 +120,26 @@ void kernel_main() {
+@@ -60,24 +126,26 @@ void kernel_main() {
      const auto weight = TensorAccessor(weight_args, weight_addr);
      const auto output = TensorAccessor(output_args, output_addr);
      read_bias<has_bias, output_args.next_compile_time_args_offset()>(n_start, count, cb_bias);
@@ -474,8 +496,8 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.
      // Set through ttnn::linear; only the 2D multicast program config (its Metal 2.0 spec factory) supports it.
      std::optional<uint32_t> in0_column_offset = std::nullopt;
 +    // The decode program only: the FP32 accumulation times optional_input_tensors[1] (FP32 [..., M, 1], a scale per
-+    // row), then times optional_input_tensors[2] (FP32 [1, N] or [1, 1]), as two FP32 multiplies before the output
-+    // type's rounding: (acc * row_scale) * col_scale, torch._scaled_mm's dequantization (ttnn::matmul_scaled).
++    // row), then times optional_input_tensors[2] (FP32 [1, N], [N, 1] or [1, 1]), as two FP32 multiplies before the
++    // output type's rounding: (acc * row_scale) * col_scale, torch._scaled_mm's dequantization (ttnn::matmul_scaled).
 +    bool output_scales = false;
  };
  
@@ -483,7 +505,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-@@ -466,6 +466,71 @@ Tensor matmul_swiglu(
+@@ -466,6 +466,73 @@ Tensor matmul_swiglu(
          .at(0);
  }
  
@@ -519,8 +541,10 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 +        return t.layout() == Layout::TILE && utilities::is_dram_interleaved(t.memory_config());
 +    };
 +    const auto& col_shape = col_scale.logical_shape();
-+    const bool col_fits = col_scale.logical_volume() == 1 ||
-+                          (col_shape[-2] == 1 && col_shape[-1] == input_tensor_b.logical_shape()[transpose_b ? -2 : -1]);
++    const uint32_t n = input_tensor_b.logical_shape()[transpose_b ? -2 : -1];
++    // [N, 1] column scales are the [1, N] row's transpose.
++    const bool col_column = col_scale.logical_volume() != 1 && col_shape[-2] == n && col_shape[-1] == 1;
++    const bool col_fits = col_scale.logical_volume() == 1 || col_column || (col_shape[-2] == 1 && col_shape[-1] == n);
 +    if (decode != nullptr && !decode->fuse_swiglu && is_tiled_dram(row_scale) && is_tiled_dram(col_scale) &&
 +        col_fits && row_scale.logical_shape()[-1] == 1) {
 +        attributes.program_config = config;
@@ -547,7 +571,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 +        compute_kernel_config);
 +    return ttnn::multiply(
 +        ttnn::multiply(product, row_scale, DataType::FLOAT32, output_mem_config),
-+        col_scale,
++        col_column ? ttnn::transpose(col_scale, -2, -1) : col_scale,
 +        output_dtype,
 +        output_mem_config);
 +}
@@ -558,16 +582,17 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/matmul/matmul.hpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.hpp
-@@ -58,6 +58,22 @@ Tensor matmul_swiglu(
+@@ -58,6 +58,23 @@ Tensor matmul_swiglu(
      std::optional<const DataType> dtype = std::nullopt,
      std::optional<const DeviceComputeKernelConfig> compute_kernel_config = std::nullopt);
  
 +// torch._scaled_mm's dequantization fused into a one-tile-row matmul: the FP32
 +// product of a and b times row_scale (FP32 [..., M, 1]), then times col_scale
-+// (FP32 [1, N] or [1, 1]), each by ttnn.multiply's FP32 multiply, rounded to
-+// `dtype` (FP32 or BF16) as ttnn.multiply rounds: (a @ b * row_scale) *
-+// col_scale, bit for bit. The decode program does it in its epilogue when it
-+// can run the matmul; otherwise the matmul and the two multiplies run apart.
++// (FP32 [1, N], its transpose [N, 1], or [1, 1]), each by ttnn.multiply's FP32
++// multiply, rounded to `dtype` (FP32 or BF16) as ttnn.multiply rounds: (a @ b *
++// row_scale) * col_scale, bit for bit. The decode program does it in its
++// epilogue when it can run the matmul; otherwise the matmul and the two
++// multiplies run apart.
 +Tensor matmul_scaled(
 +    const Tensor& input_tensor_a,
 +    const Tensor& input_tensor_b,
@@ -581,7 +606,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/m
  std::vector<Tensor> matmul_batched_weights(
      const Tensor& input_tensor_a,
      const std::vector<Tensor>& input_tensors_b,
-@@ -136,6 +152,7 @@ using operations::matmul::addmm;
+@@ -136,6 +153,7 @@ using operations::matmul::addmm;
  using operations::matmul::linear;
  using operations::matmul::matmul;
  using operations::matmul::matmul_swiglu;
