@@ -39,7 +39,7 @@ struct QuantizeRowsPlan {
     uint32_t cores() const { return width * height; }
     // Each core's row maxima go to every core: rows 0 .. stride - 1 of an FP32
     // tile's left faces, in `slot_bytes` at slot (core) of the gather buffer.
-    uint32_t slot_bytes() const { return stride <= 16 ? stride * 64 : 2048; }
+    uint32_t slot_bytes() const { return stride * 64; }
     uint32_t gather_tiles() const { return (cores() * slot_bytes() + 4095) / 4096; }
 };
 

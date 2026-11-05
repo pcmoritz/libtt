@@ -215,16 +215,14 @@ void kernel_main() {
     constexpr uint32_t stride = get_arg(args::stride);
     constexpr uint32_t pack = get_arg(args::pack);
     constexpr uint32_t cores = get_arg(args::cores);
-    constexpr uint32_t slot_bands = get_arg(args::slot_bands);
     constexpr uint32_t gather_tiles = get_arg(args::gather_tiles);
     constexpr uint32_t chunk_tiles = get_arg(args::chunk_tiles);
     constexpr uint32_t e5m2 = get_arg(args::e5m2);
     constexpr uint32_t fp8_max_bits = get_arg(args::fp8_max_bits);
     constexpr uint32_t min_scale_bits = get_arg(args::min_scale_bits);
     constexpr uint32_t groups = stride / 4;
-    static_assert(slot_bands == groups, "a core's slot holds its stride / 4 bands");
     static_assert(chunk_tiles <= 3, "DST holds the divisor and three dense tiles");
-    constexpr uint32_t total_bands = cores * slot_bands;
+    constexpr uint32_t total_bands = cores * groups;
 
     DataflowBuffer in_dfb(dfb::in);
     DataflowBuffer part_dfb(dfb::part);

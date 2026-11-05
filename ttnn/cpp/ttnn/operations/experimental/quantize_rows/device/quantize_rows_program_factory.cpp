@@ -176,7 +176,6 @@ ttnn::device_operation::ProgramArtifacts QuantizeRowsProgramFactory::create_prog
             {{"stride", plan.stride},
              {"pack", plan.pack},
              {"cores", num_cores},
-             {"slot_bands", plan.slot_bytes() / 256},
              {"gather_tiles", plan.gather_tiles()},
              {"chunk_tiles", chunk_tiles},
              {"e5m2", e5m2 ? 1u : 0u},
