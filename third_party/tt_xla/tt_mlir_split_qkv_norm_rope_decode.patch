@@ -1,0 +1,160 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -4803,6 +4803,34 @@ def TTNN_NLPCreateQKVHeadsDecodeNormRopeOp : TTNN_Op<"nlp_create_qkv_heads_decod
+                       AnyRankedTensor:$value);
+ }
+ 
++def TTNN_SplitQKVNormRopeDecodeOp : TTNN_Op<"split_qkv_norm_rope_decode", [OpModelExempt]> {
++  let summary = "A decode step's attention prologue as PyTorch models trace it, in one program";
++  let description = [{
++    Splits a fused QKV projection input [B, (num_q_heads + 2 * num_kv_heads) *
++    head_dim] into heads, applies rms_norm with q_weight to the q heads and
++    with k_weight to the k heads, and rotary_embedding with token b's row of
++    cos_cache and sin_cache [1, 1 or B, 1, head_dim] to both, rounding as
++    those ops do with HiFi4 and FP32 accumulation. query is [1, B,
++    num_q_heads, q_width]: the rotated q heads, zero padded to q_width.
++    key_values holds for each token b its rotated k heads and its v heads
++    side by side, [1, 1, num_kv_heads, 2 * head_dim].
++  }];
++
++  let arguments = (ins AnyRankedTensor:$input,
++                       AnyRankedTensor:$q_weight,
++                       AnyRankedTensor:$k_weight,
++                       AnyRankedTensor:$cos_cache,
++                       AnyRankedTensor:$sin_cache,
++                       UI32Attr:$num_q_heads,
++                       UI32Attr:$num_kv_heads,
++                       F32Attr:$epsilon);
++
++  let results = (outs AnyRankedTensor:$query,
++                      Variadic<AnyRankedTensor>:$key_values);
++
++  let hasCanonicalizer = 1;
++}
++
+ def TTNN_LoadTensorOp : TTNN_Op<"load_tensor", [OpModelExempt]> {
+   let summary = "Loads a tensor from disk";
+   let description = [{
+diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
+--- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
++++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
+@@ -180,6 +180,19 @@ table IndexerScoreDsaOp {
+   cluster_axis: uint32 = null;
+ }
+ 
++table SplitQKVNormRopeDecodeOp {
++  input: tt.target.ttnn.TensorRef;
++  q_weight: tt.target.ttnn.TensorRef;
++  k_weight: tt.target.ttnn.TensorRef;
++  cos_cache: tt.target.ttnn.TensorRef;
++  sin_cache: tt.target.ttnn.TensorRef;
++  query: tt.target.ttnn.TensorRef;
++  key_values: [tt.target.ttnn.TensorRef];
++  num_q_heads: uint32;
++  num_kv_heads: uint32;
++  epsilon: float;
++}
++
+ table NLPCreateQKVHeadsDecodeNormRopeOp {
+   input: tt.target.ttnn.TensorRef;
+   norm_weight: tt.target.ttnn.TensorRef;
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -58,6 +58,7 @@ union OpType {
+   RotaryEmbeddingOp,
+   NLPCreateQKVHeadsDecodeOp,
+   NLPCreateQKVHeadsDecodeNormRopeOp,
++  SplitQKVNormRopeDecodeOp,
+   NLPConcatHeadsOp,
+   ConstantOp,
+   CaseOp,
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -14,6 +14,7 @@
+ #include "llvm/Support/Error.h"
+ 
+ #include "mlir/Interfaces/SideEffectInterfaces.h"
++#include "ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVNormRopeDecodeFusing.h"
+ #ifdef TTMLIR_ENABLE_OPMODEL
+ #include "ttmlir/Dialect/TTNN/Transforms/Fusing/QKVHeadsNormRopeDecodeFusing.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
+@@ -1223,6 +1224,11 @@ public:
+     config.setUseTopDownTraversal(true);
+     (void)applyPatternsGreedily(getOperation(), std::move(firstPatterns));
+     (void)applyPatternsGreedily(getOperation(), std::move(patterns));
++    // Whole attention prologues, once the norms and rotary embeddings they
++    // consist of have formed.
++    RewritePatternSet lastPatterns(&getContext());
++    lastPatterns.add<fusing::SplitQKVNormRopeDecodeFusing>(&getContext());
++    (void)applyPatternsGreedily(getOperation(), std::move(lastPatterns));
+   }
+ };
+ } // namespace
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -4626,6 +4626,28 @@ createOp(FlatbufferObjectCache &cache, NLPCreateQKVHeadsDecodeOp op) {
+       overlapQKCoregrid, batchOffset, sliceSize, memoryConfig);
+ }
+ 
++::flatbuffers::Offset<::tt::target::ttnn::SplitQKVNormRopeDecodeOp>
++createOp(FlatbufferObjectCache &cache, SplitQKVNormRopeDecodeOp op) {
++  auto tensor = [&](Value value) {
++    return cache.at<::tt::target::ttnn::TensorRef>(
++        getOperandThroughDPSOps(value));
++  };
++  auto output = [&](Value value) {
++    return cache.getOrCreateNoSharding(value, tensorValueToFlatbuffer,
++                                       /*local_shape*/ std::nullopt);
++  };
++  std::vector<::flatbuffers::Offset<::tt::target::ttnn::TensorRef>> keyValues;
++  for (Value result : op.getKeyValues()) {
++    keyValues.push_back(output(result));
++  }
++  return ::tt::target::ttnn::CreateSplitQKVNormRopeDecodeOp(
++      *cache.fbb, tensor(op.getInput()), tensor(op.getQWeight()),
++      tensor(op.getKWeight()), tensor(op.getCosCache()),
++      tensor(op.getSinCache()), output(op.getQuery()),
++      cache.fbb->CreateVector(keyValues), op.getNumQHeads(),
++      op.getNumKvHeads(), op.getEpsilon().convertToFloat());
++}
++
+ ::flatbuffers::Offset<::tt::target::ttnn::NLPCreateQKVHeadsDecodeNormRopeOp>
+ createOp(FlatbufferObjectCache &cache, NLPCreateQKVHeadsDecodeNormRopeOp op) {
+   auto tensor = [&](Value value) {
+@@ -5862,6 +5884,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createOp(cache, nlpCreateQKVHeadsDecodeOp),
+                            debugString, locInfo);
+   }
++  if (auto splitOp = dyn_cast<SplitQKVNormRopeDecodeOp>(op)) {
++    return createOperation(cache, createOp(cache, splitOp), debugString,
++                           locInfo);
++  }
+   if (auto normRopeOp = dyn_cast<NLPCreateQKVHeadsDecodeNormRopeOp>(op)) {
+     return createOperation(cache, createOp(cache, normRopeOp), debugString,
+                            locInfo);
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -164,6 +164,7 @@ void logOpRuntimeId(const char *debugInfo) {
+ #include "operations/transformer/nlp_concat_heads_decode.h"
+ #include "operations/transformer/nlp_create_qkv_heads_decode.h"
+ #include "operations/transformer/nlp_create_qkv_heads_decode_norm_rope.h"
++#include "operations/transformer/split_qkv_norm_rope_decode.h"
+ #include "operations/transformer/paged_flash_multi_latent_attention_decode.h"
+ #include "operations/transformer/paged_scaled_dot_product_attention_decode.h"
+ #include "operations/matmul/scaled_matmul.h"
+@@ -516,6 +517,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+     return operations::transformer::run(op->type_as_NLPCreateQKVHeadsDecodeOp(),
+                                         getContext());
+   }
++  case ::tt::target::ttnn::OpType::SplitQKVNormRopeDecodeOp: {
++    return operations::transformer::run(
++        op->type_as_SplitQKVNormRopeDecodeOp(), getContext());
++  }
+   case ::tt::target::ttnn::OpType::NLPCreateQKVHeadsDecodeNormRopeOp: {
+     return operations::transformer::run(
+         op->type_as_NLPCreateQKVHeadsDecodeNormRopeOp(), getContext());
