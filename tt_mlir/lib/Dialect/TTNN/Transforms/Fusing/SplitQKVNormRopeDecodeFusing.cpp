@@ -7,7 +7,6 @@
 #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
 #include "ttmlir/Utils.h"
 
-#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <optional>
@@ -16,19 +15,9 @@ namespace mlir::tt::ttnn::fusing {
 
 namespace {
 
-// The single user of a value that is not a deallocation, or nullptr.
-Operation *getSingleNonDeallocUser(Value value) {
-  Operation *found = nullptr;
-  for (Operation *user : value.getUsers()) {
-    if (isa<DeallocateOp>(user)) {
-      continue;
-    }
-    if (found) {
-      return nullptr;
-    }
-    found = user;
-  }
-  return found;
+// The single user of a value, or nullptr.
+Operation *getSingleUser(Value value) {
+  return value.hasOneUse() ? *value.getUsers().begin() : nullptr;
 }
 
 Value throughReshapes(Value value) {
@@ -39,11 +28,9 @@ Value throughReshapes(Value value) {
 }
 
 // The end of the chain of reshapes that are each the single user of the
-// previous value, from `value`; the chain's ops are added to `ops`.
-Value alongReshapes(Value value, llvm::SetVector<Operation *> &ops) {
-  while (auto reshape =
-             dyn_cast_or_null<ReshapeOp>(getSingleNonDeallocUser(value))) {
-    ops.insert(reshape);
+// previous value, from `value`.
+Value alongReshapes(Value value) {
+  while (auto reshape = dyn_cast_or_null<ReshapeOp>(getSingleUser(value))) {
     value = reshape.getResult();
   }
   return value;
@@ -100,28 +87,6 @@ bool isHeadView(Value value, Value qkv, int64_t tokens, int64_t width,
     }
   }
   return true;
-}
-
-// The ops between `value` and `qkv`, for erasing once unused.
-void addViewOps(Value value, Value qkv, llvm::SetVector<Operation *> &ops) {
-  while (value != qkv) {
-    Operation *def = value.getDefiningOp();
-    ops.insert(def);
-    value = def->getOperand(0);
-  }
-}
-
-// The fused kernel rounds as rms_norm and rotary_embedding do at HiFi4 with
-// FP32 sums, which the O0 pipeline sets on ops without a config.
-bool hasHiFi4FP32Sums(DeviceComputeKernelConfigAttr config) {
-  if (!config) {
-    return true;
-  }
-  if (config.getMathFidelity() &&
-      *config.getMathFidelity() != MathFidelity::HiFi4) {
-    return false;
-  }
-  return !config.getFp32DestAccEn() || config.getFp32DestAccEn().getValue();
 }
 
 // A tiled BF16 tensor; interleaved in DRAM if `dram`.
@@ -187,13 +152,6 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
       kNorm.getBias() || qNorm.getEpsilonAttr() != kNorm.getEpsilonAttr()) {
     return mlir::failure();
   }
-  for (DeviceComputeKernelConfigAttr config :
-       {qNorm.getComputeConfigAttr(), kNorm.getComputeConfigAttr(),
-        qRope.getComputeConfigAttr(), kRope.getComputeConfigAttr()}) {
-    if (!hasHiFi4FP32Sums(config)) {
-      return mlir::failure();
-    }
-  }
 
   // The heads are views of one projection [B, (Hq + 2 Hkv) D].
   auto qkvType = mlir::cast<RankedTensorType>(qkv.getType());
@@ -244,24 +202,9 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
     }
   }
 
-  // Everything between the projection and the outputs goes, so each value on
-  // the way must feed only the next op.
-  llvm::SetVector<Operation *> chain;
-  for (RMSNormOp norm : {qNorm, kNorm}) {
-    chain.insert(norm);
-    addViewOps(norm.getInput(), qkv, chain);
-  }
-  addViewOps(vHeads, qkv, chain);
-  for (RotaryEmbeddingOp rope : {qRope, kRope}) {
-    chain.insert(rope);
-    for (Value view = rope.getInput(); view.getDefiningOp<ReshapeOp>();
-         view = view.getDefiningOp()->getOperand(0)) {
-      chain.insert(view.getDefiningOp());
-    }
-  }
   // q: reshapes, a zero pad of the last dim, reshapes to [1, B, Hq, q_width].
-  auto pad = dyn_cast_or_null<PadOp>(
-      getSingleNonDeallocUser(alongReshapes(qRope.getResult(), chain)));
+  auto pad =
+      dyn_cast_or_null<PadOp>(getSingleUser(alongReshapes(qRope.getResult())));
   if (!pad || pad.getValue().convertToFloat() != 0.0f) {
     return mlir::failure();
   }
@@ -271,25 +214,20 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
       return mlir::failure();
     }
   }
-  chain.insert(pad);
-  Value qOut = alongReshapes(pad.getResult(), chain);
+  Value qOut = alongReshapes(pad.getResult());
   const int64_t qWidth = shapeOf(qOut).back();
   if (shapeOf(pad.getInput()).back() != headDim || qWidth % 32 != 0 ||
       shapeOf(qOut) != ArrayRef<int64_t>{1, tokens, numQHeads, qWidth} ||
       !isBF16Tile(qOut, /*dram=*/false)) {
     return mlir::failure();
   }
-  if (alongReshapes(kRope.getResult(), chain) != kHeads) {
+  if (alongReshapes(kRope.getResult()) != kHeads) {
     return mlir::failure();
   }
-  chain.insert(concat);
   // k and v of each token: the concat itself for one token, a slice of its
   // row otherwise, then reshapes to [1, 1, Hkv, 2 D].
   SmallVector<Value> kvOut(tokens);
   for (Operation *user : concat.getResult().getUsers()) {
-    if (isa<DeallocateOp>(user)) {
-      continue;
-    }
     int64_t token = 0;
     Value row;
     if (auto slice = dyn_cast<SliceStaticOp>(user)) {
@@ -311,11 +249,10 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
     } else {
       return mlir::failure();
     }
-    chain.insert(user);
     if (token < 0 || token >= tokens || kvOut[token]) {
       return mlir::failure();
     }
-    Value out = alongReshapes(row, chain);
+    Value out = alongReshapes(row);
     if (shapeOf(out) != ArrayRef<int64_t>{1, 1, numKVHeads, 2 * headDim} ||
         !isBF16Tile(out, /*dram=*/false)) {
       return mlir::failure();
@@ -327,24 +264,10 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
       return mlir::failure();
     }
   }
-  // Each value inside the chain feeds only ops of the chain.
-  SmallVector<Value> outputs{qOut};
-  outputs.append(kvOut.begin(), kvOut.end());
-  for (Operation *op : chain) {
-    for (Value result : op->getResults()) {
-      if (llvm::is_contained(outputs, result)) {
-        continue;
-      }
-      for (Operation *user : result.getUsers()) {
-        if (!isa<DeallocateOp>(user) && !chain.contains(user)) {
-          return mlir::failure();
-        }
-      }
-    }
-  }
-
   // Build the fused op before the first user of its results, after its
   // operands.
+  SmallVector<Value> outputs{qOut};
+  outputs.append(kvOut.begin(), kvOut.end());
   Operation *first = nullptr;
   for (Value out : outputs) {
     for (Operation *user : out.getUsers()) {
@@ -386,25 +309,8 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
   for (int64_t b = 0; b < tokens; ++b) {
     rewriter.replaceAllUsesWith(kvOut[b], fused.getKeyValues()[b]);
   }
-  // Erase the chain from its ends: every op whose results are now unused but
-  // by deallocations.
-  SmallVector<Operation *> pending(chain.begin(), chain.end());
-  for (bool erased = true; erased;) {
-    erased = false;
-    for (Operation *&op : pending) {
-      if (!op || llvm::any_of(op->getUsers(), [](Operation *user) {
-            return !isa<DeallocateOp>(user);
-          })) {
-        continue;
-      }
-      for (Operation *user : llvm::make_early_inc_range(op->getUsers())) {
-        rewriter.eraseOp(user);
-      }
-      rewriter.eraseOp(op);
-      op = nullptr;
-      erased = true;
-    }
-  }
+  // The separate ops are now unused, and the rewrite driver erases them (TTNN
+  // ops are pure); any that still feed other ops stay.
   return mlir::success();
 }
 

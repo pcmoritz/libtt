@@ -9,7 +9,6 @@
 #include <utility>
 #include <vector>
 
-#include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/buffer.hpp>
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/hal.hpp>
@@ -143,7 +142,6 @@ struct Unit {
     uint32_t token;
     uint32_t source_head;  // head index in the QKV row
     uint32_t heads;
-    uint32_t output;  // 0 for q, 1 + token for kv
     uint32_t first_tile;
     uint32_t first_row;
     uint32_t zero_rows_from;  // rows from here to 32 of its tiles are zero
@@ -177,7 +175,6 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
                 .token = b,
                 .source_head = h,
                 .heads = std::min(kGroup, num_q_heads - h),
-                .output = 0,
                 .first_tile = (b * q_row_tiles + h / TILE_HEIGHT) * q_width_tiles,
                 .first_row = row,
                 .zero_rows_from = row == 0 ? round_up(rows, kGroup) : TILE_HEIGHT,
@@ -190,7 +187,6 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
                     .token = b,
                     .source_head = num_q_heads + (kind == kV ? num_kv_heads : 0) + h,
                     .heads = std::min(kGroup, num_kv_heads - h),
-                    .output = 1 + b,
                     .first_tile = kind == kV ? head_tiles : 0,
                     .first_row = h,
                     .zero_rows_from = h == 0 ? round_up(num_kv_heads, kGroup) : TILE_HEIGHT,
@@ -231,20 +227,18 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
     make_cb(3, head_tiles, bf16);   // sin
     make_cb(4, 1, bf16);            // reduce scaler
     make_cb(5, 1, bf16);            // epsilon
-    make_cb(6, 1, bf16);            // -1, rotate_half's sign
-    make_cb(7, head_tiles, bf16);   // v heads
-    make_cb(8, head_tiles, fp32);   // x^2
-    make_cb(9, 1, fp32);            // mean of x^2
-    make_cb(10, 1, fp32);           // 1 / sqrt(mean + eps)
-    make_cb(11, head_tiles, fp32);  // x / rms
-    make_cb(12, head_tiles, bf16);  // rms_norm's output, rotary's input
-    make_cb(13, 1, bf16);           // -x of the other half
-    make_cb(14, 1, bf16);           // rotated * sin
-    make_cb(15, 1, bf16);           // x * cos
-    make_cb(16, head_tiles, bf16);  // rotary's output
-    make_cb(17, 1, bf16);           // zeros
+    make_cb(6, head_tiles, bf16);   // v heads
+    make_cb(7, head_tiles, fp32);   // x^2
+    make_cb(8, 1, fp32);            // mean of x^2
+    make_cb(9, 1, fp32);            // 1 / sqrt(mean + eps)
+    make_cb(10, head_tiles, fp32);  // x / rms
+    make_cb(11, head_tiles, bf16);  // rms_norm's output, rotary's input
+    make_cb(12, 1, bf16);           // x of the other half * sin
+    make_cb(13, 1, bf16);           // x * cos
+    make_cb(14, head_tiles, bf16);  // rotary's output
+    make_cb(15, 1, bf16);           // zeros
     const uint32_t scratch_bytes = kGroup * head_tiles * window + alignment;
-    add_cb(18, scratch_bytes, scratch_bytes, bf16);
+    add_cb(16, scratch_bytes, scratch_bytes, bf16);
 
     std::vector<std::pair<std::string, uint32_t>> common_args = {
         {"cb_x", 0},
@@ -253,19 +247,17 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
         {"cb_sin", 3},
         {"cb_scaler", 4},
         {"cb_eps", 5},
-        {"cb_neg", 6},
-        {"cb_v", 7},
-        {"cb_sq", 8},
-        {"cb_mean", 9},
-        {"cb_rstd", 10},
-        {"cb_scaled", 11},
-        {"cb_normed", 12},
-        {"cb_rotated", 13},
-        {"cb_sin_part", 14},
-        {"cb_cos_part", 15},
-        {"cb_out", 16},
-        {"cb_zero", 17},
-        {"cb_scratch", 18},
+        {"cb_v", 6},
+        {"cb_sq", 7},
+        {"cb_mean", 8},
+        {"cb_rstd", 9},
+        {"cb_scaled", 10},
+        {"cb_normed", 11},
+        {"cb_sin_part", 12},
+        {"cb_cos_part", 13},
+        {"cb_out", 14},
+        {"cb_zero", 15},
+        {"cb_scratch", 16},
         {"head_tiles", head_tiles},
         {"group", kGroup},
         {"row_bytes", row_bytes},
@@ -275,7 +267,6 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
         {"cos_per_token", in.cos.logical_shape()[1] > 1 ? 1u : 0u},
         // rms_norm's epsilon tile holds the upper half of its FP32 bits.
         {"eps_bf16", std::bit_cast<uint32_t>(params.epsilon) >> 16},
-        {"neg_one_bf16", std::bit_cast<uint16_t>(bfloat16(-1.0f))},
         {"inv_width", std::bit_cast<uint32_t>(1.0f / static_cast<float>(head_dim))},
     };
     const std::string kernel_dir = "ttnn/cpp/ttnn/operations/transformer/split_qkv_norm_rope_decode/device/kernels/";
@@ -310,15 +301,15 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
         for (const MeshTensor* tensor : {&qkv, &q_weight, &k_weight, &cos, &sin}) {
             args.push_back(*tensor);
         }
-        std::vector<uint32_t> kinds;
+        uint32_t norm_units = 0;  // the compute kernel's: q and k units
         for (uint32_t u = c; u < units.size(); u += num_cores) {
             const Unit& unit = units[u];
-            kinds.push_back(unit.kind);
+            norm_units += unit.kind != kV;
             args.push_back(static_cast<uint32_t>(unit.kind));
             args.push_back(unit.token);
             args.push_back(unit.source_head);
             args.push_back(unit.heads);
-            args.push_back(outputs.at(unit.output).mesh_tensor());
+            args.push_back(outputs.at(unit.kind == kQ ? 0 : 1 + unit.token).mesh_tensor());
             args.push_back(unit.first_tile);
             args.push_back(unit.first_row);
             args.push_back(unit.zero_rows_from);
@@ -327,8 +318,7 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
         args.push_back(0xFFFFFFFFu);  // end of the units
         reader.emplace_runtime_args(core_list[c], args);
         writer.emplace_runtime_args(core_list[c], args);
-        kinds.push_back(0xFFFFFFFFu);
-        compute.runtime_args.emplace_back(core_list[c], std::move(kinds));
+        compute.runtime_args.emplace_back(core_list[c], std::vector<uint32_t>{norm_units});
     }
     program.kernels.push_back(std::move(reader));
     program.kernels.push_back(std::move(writer));
