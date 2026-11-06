@@ -9,7 +9,18 @@ diff --git a/pjrt_implementation/inc/api/buffer_instance.h b/pjrt_implementation
  #include <memory>
  #include <mutex>
  #include <optional>
-@@ -152,6 +153,10 @@ public:
+@@ -128,6 +129,10 @@ public:
+   // (semantics that fire eagerly inside copyFromHost) or already ready.
+   void fireDoneWithHostBufferEvent();
+ 
++  // Whether the buffer's data is still the framework's host buffer: its
++  // done-with-host-buffer event has not fired.
++  bool holdsHostBuffer();
++
+   // This method should asynchronously copy data into device buffer from the
+   // given host buffer. Currently our runtime expects all input buffers to be on
+   // host and to be copied to device during execution, because it needs to read
+@@ -152,6 +157,10 @@ public:
    tt_pjrt_status copyToHost(void *host_buffer, size_t host_buffer_size,
                              EventInstance **out_copy_done_event);
  
@@ -20,7 +31,7 @@ diff --git a/pjrt_implementation/inc/api/buffer_instance.h b/pjrt_implementation
    // Copies this buffer's data to the device and its memory specified in the
    // arguments.
    tt_pjrt_status copyToDeviceMemory(DeviceInstance *dst_device,
-@@ -263,19 +268,16 @@ private:
+@@ -263,19 +272,16 @@ private:
    // Mutex guarding buffer data deletion.
    std::mutex m_data_deleted_mutex;
  
@@ -75,7 +86,7 @@ diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/
 +  // `shard`, one of the buffers of this tensor; the shards share one read. As
 +  // on other PJRT devices, the tensor stays where it is: programs can take it
 +  // as an input while the read is in flight.
-+  tt::runtime::Tensor start_copy_to_host(const BufferInstance *shard);
++  tt::runtime::Tensor start_copy_to_host(BufferInstance *shard);
  
    // Removes shard from shards (by setting shard to nullptr).
    void remove_shard(const BufferInstance *shard) noexcept;
@@ -120,7 +131,20 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
    m_data_deleted = true;
    if (m_done_with_host_buffer_event) {
      // TODO(mrakita): Revert.
-@@ -485,29 +482,37 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+@@ -179,6 +176,12 @@ void BufferInstance::deleteData() {
+   }
+ }
+ 
++bool BufferInstance::holdsHostBuffer() {
++  std::lock_guard<std::mutex> deleted_lock(m_data_deleted_mutex);
++  return m_done_with_host_buffer_event != nullptr &&
++         !m_done_with_host_buffer_event->isReady();
++}
++
+ void BufferInstance::fireDoneWithHostBufferEvent() {
+   std::lock_guard<std::mutex> deleted_lock(m_data_deleted_mutex);
+   if (m_done_with_host_buffer_event == nullptr) {
+@@ -485,29 +488,32 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
  
    std::unique_ptr<EventInstance> event = EventInstance::createInstance();
  
@@ -145,16 +169,11 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
 +  }
  
 -  m_copy_to_host_thread = std::thread([=, this, e = event.get()] {
-+  // A buffer still on the framework's host memory (its done-with-host-buffer
-+  // event pending) copies now: its host tensor can be that memory, which
-+  // deleting the buffer lets the framework free.
-+  bool framework_memory = false;
 +  {
-+    const std::lock_guard<std::mutex> deleted_lock(m_data_deleted_mutex);
-+    framework_memory = m_done_with_host_buffer_event != nullptr &&
-+                       !m_done_with_host_buffer_event->isReady();
++    const std::lock_guard<std::mutex> lock(s_copies_to_host_mutex);
++    ++s_copies_to_host_in_flight;
 +  }
-+  auto copy = [=, e = event.get()] {
++  std::thread([=, e = event.get()] {
      try {
        ZoneScopedN("CopyToHostThread");
 -      const std::lock_guard<std::mutex> lock(s_copy_to_host_internal_mutex);
@@ -175,30 +194,19 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
  
        EventInstance::markAsReadyAndCallback(e, tt_pjrt_status::kSuccess);
  
-@@ -515,7 +520,21 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+@@ -515,7 +521,10 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
        LOG_F(ERROR, "Copy to host buffer failed with error: %s", error.what());
        EventInstance::markAsReadyAndCallback(e, tt_pjrt_status::kInternal);
      }
 -  });
-+  };
-+  if (framework_memory) {
-+    copy();
-+  } else {
-+    {
-+      const std::lock_guard<std::mutex> lock(s_copies_to_host_mutex);
-+      ++s_copies_to_host_in_flight;
-+    }
-+    std::thread([copy] {
-+      copy();
-+      const std::lock_guard<std::mutex> lock(s_copies_to_host_mutex);
-+      if (--s_copies_to_host_in_flight == 0)
-+        s_copies_to_host_done.notify_all();
-+    }).detach();
-+  }
++    const std::lock_guard<std::mutex> lock(s_copies_to_host_mutex);
++    if (--s_copies_to_host_in_flight == 0)
++      s_copies_to_host_done.notify_all();
++  }).detach();
  
    // responsible for calling `PJRT_Event_Destroy` on the event.
    *out_copy_done_event = event.release();
-@@ -523,6 +542,12 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+@@ -523,6 +532,12 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
    return tt_pjrt_status::kSuccess;
  }
  
@@ -272,7 +280,7 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
    }
  
    const bool retain = tt::runtime::getTensorRetain(*m_runtime_tensor);
-@@ -122,6 +125,40 @@ void PjrtTensor::ensure_layout(const tt::runtime::Device &device,
+@@ -122,6 +125,54 @@ void PjrtTensor::ensure_layout(const tt::runtime::Device &device,
        shard->fireDoneWithHostBufferEvent();
      }
    }
@@ -280,12 +288,27 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
 +}
 +
 +tt::runtime::Tensor
-+PjrtTensor::start_copy_to_host(const BufferInstance *shard) {
++PjrtTensor::start_copy_to_host(BufferInstance *shard) {
 +  const std::lock_guard<std::mutex> lock(m_state_mutex);
 +  TT_FATAL(m_runtime_tensor.has_value(),
 +           "Shell-only PjrtTensor has no data to read");
 +  const auto it = std::find(m_shards.begin(), m_shards.end(), shard);
 +  TT_FATAL(it != m_shards.end(), "The buffer is not a shard of this tensor");
++  const size_t index = it - m_shards.begin();
++
++  // A buffer still on the framework's host buffer copies it now: the host
++  // tensor can be that memory, which the framework may free once a program
++  // has taken the tensor (under this lock) or the buffer is deleted.
++  if (shard->holdsHostBuffer()) {
++    const std::vector<tt::runtime::Tensor> tensors =
++        tt::runtime::toHost(*m_runtime_tensor, /*untilize=*/true);
++    const tt::runtime::Tensor &host =
++        tensors.size() == 1 ? tensors[0] : tensors[index];
++    tt::runtime::Tensor owned = tt::runtime::createOwnedHostTensor(
++        nullptr, tt::runtime::getTensorDesc(host));
++    tt::runtime::memcpy(owned, host);
++    return owned;
++  }
 +
 +  // One read gives every shard its host tensor: a tensor of several shards
 +  // keeps them for the reads of the others.
@@ -303,9 +326,8 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
 +             "tensors.size()={}, m_shards.size()={}",
 +             m_host_copies.size(), m_shards.size());
 +  }
-+  const tt::runtime::Tensor host = m_host_copies.size() == 1
-+                                       ? m_host_copies[0]
-+                                       : m_host_copies[it - m_shards.begin()];
++  const tt::runtime::Tensor host =
++      m_host_copies.size() == 1 ? m_host_copies[0] : m_host_copies[index];
 +  if (m_shards.size() == 1) {
 +    m_host_copies.clear();
 +  }
@@ -313,11 +335,13 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
  }
  
  // Moves pjrt tensor to host.
-@@ -150,6 +187,7 @@ void PjrtTensor::ensure_layout(const tt::runtime::Device &device,
+@@ -150,6 +201,9 @@ void PjrtTensor::ensure_layout(const tt::runtime::Device &device,
  // remove_shard().
  void PjrtTensor::move_to_host() noexcept {
    ZoneScoped;
 +  const std::lock_guard<std::mutex> lock(m_state_mutex);
++  // Kept host tensors carry the events of reads from the mesh being left.
++  m_host_copies.clear();
  
    // Shell-only tensors (deferred in distributed runtime) have no device-side
    // data to move. This can happen legitimately if the runtime mesh is different
