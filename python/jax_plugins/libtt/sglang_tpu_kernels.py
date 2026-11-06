@@ -16,6 +16,9 @@ written by TTNN's paged cache update, and a batch of no more
 tokens than sequence slots, such as a decode batch, runs TTNN's paged decode
 attention: given the cache as both keys and values and the queries padded with
 zeros, it computes softmax(q k) [k v], whose second half is the output.
+
+Hybrid models' gated DeltaNet kernel runs on libtt's recurrent kernels, with
+the recurrent-state pool in their layout (`sglang_tpu_gdn`).
 """
 
 # Users per TTNN paged decode attention call.
@@ -26,6 +29,8 @@ MAX_UPDATE_USERS = 32
 RPA_V3_MODULE = "sglang_tpu.attention.pallas.ragged_paged_attention_v3"
 KV_POOL_MODULE = "sglang_tpu.kv_pool"
 FP8_LINEAR_SMALL_M_MODULE = "sglang_tpu.kernels.fp8_linear_small_m"
+GDN_MODULE = "sglang_tpu.attention.pallas.gdn"
+MAMBA_POOL_MODULE = "sglang_tpu.mamba_pool"
 
 
 def _ragged_paged_attention(module):
@@ -319,8 +324,22 @@ def patch_fp8_linear_small_m(module):
     module.fp8_linear_small_m = _fp8_linear_small_m
 
 
+def patch_gdn(module):
+    from jax_plugins.libtt import sglang_tpu_gdn
+
+    module.fused_conv1d_gdn = sglang_tpu_gdn.fused_conv1d_gdn
+
+
+def patch_mamba_pool(module):
+    from jax_plugins.libtt import sglang_tpu_gdn
+
+    sglang_tpu_gdn.patch_mamba_pool(module)
+
+
 PATCHES = {
     RPA_V3_MODULE: patch_rpa_v3,
     KV_POOL_MODULE: patch_kv_pool,
     FP8_LINEAR_SMALL_M_MODULE: patch_fp8_linear_small_m,
+    GDN_MODULE: patch_gdn,
+    MAMBA_POOL_MODULE: patch_mamba_pool,
 }
