@@ -399,6 +399,7 @@ http_archive(
         "//third_party/tt_metal:symmetric_dram.patch",
         "//third_party/tt_metal:pad_tile_fill_only_exposed.patch",
         "//third_party/tt_metal:matmul_decode_scaled_output.patch",
+        "//third_party/tt_metal:all_gather_padded_rows.patch",
     ],
     sha256 = "f87dc8d21a6ec02280643543dde9a2633d771ceaad819b00ff493922f1e139c8",
     strip_prefix = "tt-metal-614f605ffe2977715adc198156c72bea14c2bae6",

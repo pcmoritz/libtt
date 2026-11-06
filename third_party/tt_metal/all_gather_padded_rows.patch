@@ -1,0 +1,27 @@
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp
+@@ -390,6 +390,12 @@ ttnn::Tensor composite_all_gather(
+         input_tensor = ttnn::typecast(input_tensor, ttnn::DataType::BFLOAT16);
+     }
+ 
++    // Broadcast only the logical rows and columns: whole tiles would carry the padding to every device, and concat
++    // would untilize each device's tensor (a [1, 37984] row: 2.4 MB of tiles per device for 74 KB).
++    if (is_tiled_and_not_tile_aligned) {
++        input_tensor = ttnn::to_layout(input_tensor, ttnn::Layout::ROW_MAJOR);
++    }
++
+     std::vector<ttnn::Tensor> broadcasted_tensors = ttnn::all_broadcast(
+         input_tensor,
+         cluster_axis,
+@@ -402,6 +408,10 @@ ttnn::Tensor composite_all_gather(
+     // Do the gather itself
+     ttnn::Tensor all_gather_output_tensor = ttnn::concat(broadcasted_tensors, gather_dim);
+ 
++    if (is_tiled_and_not_tile_aligned) {
++        all_gather_output_tensor = ttnn::to_layout(all_gather_output_tensor, ttnn::Layout::TILE);
++    }
++
+     if (convert_to_bfloat16_for_composite) {
+         all_gather_output_tensor = ttnn::typecast(all_gather_output_tensor, input_dtype);
+     }
