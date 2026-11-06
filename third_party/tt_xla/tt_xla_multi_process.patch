@@ -46,30 +46,30 @@ diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation
 diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
 --- a/pjrt_implementation/src/api/buffer_instance.cc
 +++ b/pjrt_implementation/src/api/buffer_instance.cc
-@@ -553,6 +553,10 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
-   // concurrently with device work of another thread, and deleting the buffer
-   // only waits for the read. The thread waits for it and copies the data.
+@@ -556,6 +556,10 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+   // and copies the data; it holds all it uses, so deleting the buffer does not
+   // wait for it.
    const size_t logical_tensor_size = logicalTensorSize();
 +  // U64 and complex buffers hold two runtime elements per element.
 +  const bool check_runtime_size =
 +      m_data_type != PJRT_Buffer_Type_U64 &&
 +      !data_type_utils::isComplexPJRTType(m_data_type);
-   std::optional<tt::runtime::Tensor> host_tensor;
-   {
+   const tt::runtime::Tensor host_tensor = [&] {
      // Untilizing the tensor on device runs a program, which a trace capture on
-@@ -577,6 +581,14 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+     // another thread would skip or record: the read would then return what an
+@@ -579,6 +583,14 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
                 logical_tensor_size, host_buffer_size);
  
-       tt::runtime::wait(*host_tensor);
+       tt::runtime::wait(host_tensor);
 +      // A multi-process client must copy this process's shard, not a tensor
 +      // of the whole mesh.
 +      const size_t runtime_bytes =
-+          static_cast<size_t>(tt::runtime::getTensorVolume(*host_tensor)) *
++          static_cast<size_t>(tt::runtime::getTensorVolume(host_tensor)) *
 +          tt::runtime::utils::dataTypeElementSize(rt_data_type);
 +      TT_FATAL(!check_runtime_size || runtime_bytes == logical_tensor_size,
 +               "Runtime tensor does not match the PJRT shard: {} vs {} bytes",
 +               runtime_bytes, logical_tensor_size);
-       tt::runtime::memcpy(host_buffer, *host_tensor, rt_data_type);
+       tt::runtime::memcpy(host_buffer, host_tensor, rt_data_type);
  
        EventInstance::markAsReadyAndCallback(e, tt_pjrt_status::kSuccess);
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
@@ -332,7 +332,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
  
    if (std::optional<tt::runtime::Device> submesh =
            getOrCreateSubMesh(target_mesh_shape)) {
-@@ -800,14 +912,17 @@ PJRT_Error *onClientCreate(PJRT_Client_Create_Args *args) {
+@@ -802,14 +914,17 @@ PJRT_Error *onClientCreate(PJRT_Client_Create_Args *args) {
    ZoneScoped;
    DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_Client_Create");
  
