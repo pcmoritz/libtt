@@ -20,18 +20,20 @@ void run(const ::tt::target::ttnn::SplitQKVNormRopeDecodeOp *op,
   };
   const auto *keyValues = op->key_values();
   LOG_ASSERT(keyValues && keyValues->size() > 0,
-             "split_qkv_norm_rope_decode needs a key_values output per token");
+             "split_qkv_norm_rope_decode needs a key_values output");
   // query is [1, B, num_q_heads, q_width].
   const uint32_t qWidth = op->query()->desc()->shape()->Get(3);
+  // One key_values output holds every token's (one token's alike).
   std::vector<::ttnn::Tensor> outputs =
       ::ttnn::transformer::split_qkv_norm_rope_decode(
           tensor(op->input()), tensor(op->q_weight()), tensor(op->k_weight()),
           tensor(op->cos_cache()), tensor(op->sin_cache()), op->num_q_heads(),
           op->num_kv_heads(), op->epsilon(), qWidth,
-          memoryConfig(op->query()), memoryConfig(keyValues->Get(0)));
+          memoryConfig(op->query()), memoryConfig(keyValues->Get(0)),
+          /*batched_key_values=*/keyValues->size() == 1);
   LOG_ASSERT(outputs.size() == 1 + keyValues->size(),
              "split_qkv_norm_rope_decode returned ", outputs.size(),
-             " tensors for ", keyValues->size(), " tokens");
+             " tensors for ", keyValues->size(), " key_values");
   pool.insertTTNNTensorAndValidate(op->query(), outputs.at(0));
   for (uint32_t b = 0; b < keyValues->size(); ++b) {
     pool.insertTTNNTensorAndValidate(keyValues->Get(b), outputs.at(1 + b));

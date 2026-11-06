@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4803,6 +4803,34 @@ def TTNN_NLPCreateQKVHeadsDecodeNormRopeOp : TTNN_Op<"nlp_create_qkv_heads_decod
+@@ -4803,6 +4803,35 @@ def TTNN_NLPCreateQKVHeadsDecodeNormRopeOp : TTNN_Op<"nlp_create_qkv_heads_decod
                        AnyRankedTensor:$value);
  }
  
@@ -14,8 +14,9 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +    cos_cache and sin_cache [1, 1 or B, 1, head_dim] to both, rounding as
 +    those ops do with HiFi4 and FP32 accumulation. query is [1, B,
 +    num_q_heads, q_width]: the rotated q heads, zero padded to q_width.
-+    key_values holds for each token b its rotated k heads and its v heads
-+    side by side, [1, 1, num_kv_heads, 2 * head_dim].
++    key_values holds every token's rotated k heads and v heads side by side:
++    one tensor [1, B, num_kv_heads, 2 * head_dim], or one per token, [1, 1,
++    num_kv_heads, 2 * head_dim].
 +  }];
 +
 +  let arguments = (ins AnyRankedTensor:$input,

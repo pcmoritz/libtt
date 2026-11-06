@@ -40,6 +40,8 @@ struct SplitQKVNormRopeDecodeParams {
     uint32_t q_width = 0;
     MemoryConfig q_memory_config;
     MemoryConfig kv_memory_config;
+    // One kv output for all tokens instead of one per token.
+    bool batched_key_values = false;
 };
 
 struct SplitQKVNormRopeDecodeInputs {
@@ -119,6 +121,10 @@ SplitQKVNormRopeDecodeOperation::spec_return_value_t SplitQKVNormRopeDecodeOpera
         return TensorSpec(shape, TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), memory_config));
     };
     spec_return_value_t specs{spec(Shape({1, tokens, params.num_q_heads, params.q_width}), params.q_memory_config)};
+    if (params.batched_key_values) {
+        specs.push_back(spec(Shape({1, tokens, params.num_kv_heads, 2 * head_dim}), params.kv_memory_config));
+        return specs;
+    }
     for (uint32_t b = 0; b < tokens; ++b) {
         specs.push_back(spec(Shape({1, 1, params.num_kv_heads, 2 * head_dim}), params.kv_memory_config));
     }
@@ -187,7 +193,8 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
                     .token = b,
                     .source_head = num_q_heads + (kind == kV ? num_kv_heads : 0) + h,
                     .heads = std::min(kGroup, num_kv_heads - h),
-                    .first_tile = kind == kV ? head_tiles : 0,
+                    // Token b's tile row of a batched kv output.
+                    .first_tile = (params.batched_key_values ? b * 2 * head_tiles : 0) + (kind == kV ? head_tiles : 0),
                     .first_row = h,
                     .zero_rows_from = h == 0 ? round_up(num_kv_heads, kGroup) : TILE_HEIGHT,
                     .zero_tiles = 0});
@@ -309,7 +316,8 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
             args.push_back(unit.token);
             args.push_back(unit.source_head);
             args.push_back(unit.heads);
-            args.push_back(outputs.at(unit.kind == kQ ? 0 : 1 + unit.token).mesh_tensor());
+            args.push_back(
+                outputs.at(unit.kind == kQ ? 0 : 1 + (params.batched_key_values ? 0 : unit.token)).mesh_tensor());
             args.push_back(unit.first_tile);
             args.push_back(unit.first_row);
             args.push_back(unit.zero_rows_from);
@@ -342,7 +350,8 @@ std::vector<Tensor> split_qkv_norm_rope_decode(
     float epsilon,
     uint32_t q_width,
     const tt::tt_metal::MemoryConfig& q_memory_config,
-    const tt::tt_metal::MemoryConfig& kv_memory_config) {
+    const tt::tt_metal::MemoryConfig& kv_memory_config,
+    bool batched_key_values) {
     using Op = prim::SplitQKVNormRopeDecodeOperation;
     return device_operation::launch<Op>(
         {.num_q_heads = num_q_heads,
@@ -350,7 +359,8 @@ std::vector<Tensor> split_qkv_norm_rope_decode(
          .epsilon = epsilon,
          .q_width = q_width,
          .q_memory_config = q_memory_config,
-         .kv_memory_config = kv_memory_config},
+         .kv_memory_config = kv_memory_config,
+         .batched_key_values = batched_key_values},
         {.qkv = qkv, .q_weight = q_weight, .k_weight = k_weight, .cos = cos, .sin = sin});
 }
 
