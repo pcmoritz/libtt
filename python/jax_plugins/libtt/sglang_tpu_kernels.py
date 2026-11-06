@@ -20,6 +20,8 @@ zeros, it computes softmax(q k) [k v], whose second half is the output.
 
 # Users per TTNN paged decode attention call.
 MAX_DECODE_USERS = 32
+# Tokens per TTNN paged cache update, one core each.
+MAX_UPDATE_USERS = 32
 
 RPA_V3_MODULE = "sglang_tpu.attention.pallas.ragged_paged_attention_v3"
 KV_POOL_MODULE = "sglang_tpu.kv_pool"
@@ -100,17 +102,27 @@ def _ragged_paged_attention(module):
         # pool.
         user_pages = table[seq, : min(pages_per_seq, pages - 1)]
         user_positions = jnp.where(live, position, -1)
-        # One TTNN paged update per token, in place. The updates run in order,
-        # so tokens of one sequence never write a page's tile at the same time.
-        # A scatter instead tilized and copied the layer's whole cache on every
-        # call.
+        # TTNN shared paged updates of up to MAX_UPDATE_USERS tokens, in
+        # place, which write each tile once with the rows of every token in
+        # it, as if the tokens were written in order, so tokens of one
+        # sequence may share a tile. A decode batch's keys and values go to
+        # one update, which the compiler's fused attention prologue writes
+        # directly. A scatter instead tilized and copied the layer's whole
+        # cache on every call.
         cache = kv_cache_fused
-        for t in range(tokens):
+        for start in range(0, tokens, MAX_UPDATE_USERS):
+            end = min(start + MAX_UPDATE_USERS, tokens)
             cache = jax.ffi.ffi_call(
                 "tt.paged_update_cache",
                 jax.ShapeDtypeStruct(cache_shape, kv_cache_fused.dtype),
                 input_output_aliases={0: 0},
-            )(cache, new_kv[None, t : t + 1], user_positions[t : t + 1], user_pages[t : t + 1])
+            )(
+                cache,
+                new_kv[None, start:end],
+                user_positions[start:end],
+                user_pages[start:end],
+                share_cache=True,
+            )
         # Each token as a decode user reads its sequence's pages once, which
         # beats gathering them below when there are few tokens per sequence.
         if (

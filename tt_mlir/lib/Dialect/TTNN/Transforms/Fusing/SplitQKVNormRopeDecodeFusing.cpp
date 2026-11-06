@@ -225,17 +225,30 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
   if (alongReshapes(kRope.getResult()) != kHeads) {
     return mlir::failure();
   }
-  // k and v of each token: the concat itself for one token, a slice of its
-  // row otherwise, then reshapes to [1, 1, Hkv, 2 D].
-  SmallVector<Value> kvOut(tokens);
-  for (Operation *user : concat.getResult().getUsers()) {
-    int64_t token = 0;
-    Value row;
-    if (auto slice = dyn_cast<SliceStaticOp>(user)) {
+  // k and v: of all tokens, the concat reshaped to [1, B, Hkv, 2 D] (one
+  // token's alike), or of each token, a slice of its row reshaped to
+  // [1, 1, Hkv, 2 D].
+  SmallVector<Value> kvOut;
+  Operation *reshape = getSingleUser(concat.getResult());
+  if (reshape && isa<ReshapeOp>(reshape)) {
+    Value out = alongReshapes(reshape->getResult(0));
+    if (shapeOf(out) !=
+            ArrayRef<int64_t>{1, tokens, numKVHeads, 2 * headDim} ||
+        !isBF16Tile(out, /*dram=*/false)) {
+      return mlir::failure();
+    }
+    kvOut.push_back(out);
+  } else {
+    kvOut.resize(tokens);
+    for (Operation *user : concat.getResult().getUsers()) {
+      auto slice = dyn_cast<SliceStaticOp>(user);
+      if (!slice) {
+        return mlir::failure();
+      }
       auto attr = [](ArrayAttr array, int i) {
         return mlir::cast<IntegerAttr>(array[i]).getInt();
       };
-      token = attr(slice.getBegins(), 0);
+      const int64_t token = attr(slice.getBegins(), 0);
       if (attr(slice.getEnds(), 0) != token + 1 ||
           attr(slice.getBegins(), 1) != 0 || attr(slice.getBegins(), 2) != 0 ||
           attr(slice.getEnds(), 1) != numKVHeads ||
@@ -244,21 +257,16 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
           attr(slice.getStep(), 2) != 1) {
         return mlir::failure();
       }
-      row = slice.getResult();
-    } else if (isa<ReshapeOp>(user) && tokens == 1) {
-      row = user->getResult(0);
-    } else {
-      return mlir::failure();
+      if (token < 0 || token >= tokens || kvOut[token]) {
+        return mlir::failure();
+      }
+      Value out = alongReshapes(slice.getResult());
+      if (shapeOf(out) != ArrayRef<int64_t>{1, 1, numKVHeads, 2 * headDim} ||
+          !isBF16Tile(out, /*dram=*/false)) {
+        return mlir::failure();
+      }
+      kvOut[token] = out;
     }
-    if (token < 0 || token >= tokens || kvOut[token]) {
-      return mlir::failure();
-    }
-    Value out = alongReshapes(row);
-    if (shapeOf(out) != ArrayRef<int64_t>{1, 1, numKVHeads, 2 * headDim} ||
-        !isBF16Tile(out, /*dram=*/false)) {
-      return mlir::failure();
-    }
-    kvOut[token] = out;
   }
   for (Value out : kvOut) {
     if (!out) {
@@ -307,8 +315,8 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
       sin, rewriter.getUI32IntegerAttr(numQHeads),
       rewriter.getUI32IntegerAttr(numKVHeads), qNorm.getEpsilonAttr());
   rewriter.replaceAllUsesWith(qOut, fused.getQuery());
-  for (int64_t b = 0; b < tokens; ++b) {
-    rewriter.replaceAllUsesWith(kvOut[b], fused.getKeyValues()[b]);
+  for (auto [out, keyValue] : llvm::zip(kvOut, fused.getKeyValues())) {
+    rewriter.replaceAllUsesWith(out, keyValue);
   }
   // The separate ops are now unused, and the rewrite driver erases them (TTNN
   // ops are pure); any that still feed other ops stay.

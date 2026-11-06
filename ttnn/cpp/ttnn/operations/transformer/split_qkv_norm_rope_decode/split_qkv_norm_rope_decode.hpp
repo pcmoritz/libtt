@@ -20,7 +20,8 @@ namespace ttnn::transformer {
 //
 // Returns q [1, B, num_q_heads, q_width], zero padded from head_dim, in
 // q_memory_config, then for each token b its k and v heads side by side,
-// [1, 1, num_kv_heads, 2 * head_dim], in kv_memory_config.
+// [1, 1, num_kv_heads, 2 * head_dim], in kv_memory_config: in one tensor
+// [1, B, num_kv_heads, 2 * head_dim] if batched_key_values.
 std::vector<Tensor> split_qkv_norm_rope_decode(
     const Tensor& qkv,
     const Tensor& q_weight,
@@ -32,6 +33,7 @@ std::vector<Tensor> split_qkv_norm_rope_decode(
     float epsilon,
     uint32_t q_width,
     const tt::tt_metal::MemoryConfig& q_memory_config,
-    const tt::tt_metal::MemoryConfig& kv_memory_config);
+    const tt::tt_metal::MemoryConfig& kv_memory_config,
+    bool batched_key_values = false);
 
 }  // namespace ttnn::transformer

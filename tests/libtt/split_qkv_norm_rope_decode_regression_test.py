@@ -34,26 +34,31 @@ def _norms(qkv, q_weight, k_weight, heads, kv_heads):
     return _rms_norm(q, q_weight), _rms_norm(k, k_weight)
 
 
-def _rotations(q, k, v, cos_sin, tokens, heads, kv_heads):
+def _rotations(q, k, v, cos_sin, tokens, heads, kv_heads, batched):
     """The rotated q, padded to the cache's width, and each token's k and v
-    side by side, as the paged attention takes them."""
+    side by side, as the paged attention takes them: all tokens' in one
+    tensor if batched, as one paged cache update takes them."""
     q = jnp.concatenate(_rotate(q, cos_sin, tokens, heads), axis=-1)
     q = jnp.pad(q, ((0, 0), (0, 0), (0, HEAD_DIM))).reshape(1, tokens, heads, 2 * HEAD_DIM)
     kv = jnp.concatenate([*_rotate(k, cos_sin, tokens, kv_heads), v], axis=-1)
+    if batched:
+        return q, [kv.reshape(1, tokens, kv_heads, 2 * HEAD_DIM)]
     return q, [kv[b : b + 1].reshape(1, 1, kv_heads, 2 * HEAD_DIM) for b in range(tokens)]
 
 
 @pytest.mark.parametrize(
-    "tokens,heads,kv_heads,trace",
+    "tokens,heads,kv_heads,trace,batched",
     [
         # Qwen3-8B on one chip and four, one and four tokens.
-        (1, 32, 8, False),
-        (1, 8, 2, False),
-        (4, 32, 8, False),
-        (4, 8, 2, True),
+        (1, 32, 8, False, False),
+        (1, 8, 2, False, False),
+        (4, 32, 8, False, False),
+        (4, 8, 2, True, False),
+        (4, 32, 8, False, True),
+        (4, 8, 2, True, True),
     ],
 )
-def test_torch_qkv_norm_rope_prologue(tokens, heads, kv_heads, trace, tmp_path):
+def test_torch_qkv_norm_rope_prologue(tokens, heads, kv_heads, trace, batched, tmp_path):
     """The prologue runs as one split_qkv_norm_rope_decode and equals the
     separate ops (rms_norm, rotary_embedding, pad and concat) bit for bit."""
     options = {"optimization_level": "O0", "enable_trace": str(trace).lower()}
@@ -62,12 +67,12 @@ def test_torch_qkv_norm_rope_prologue(tokens, heads, kv_heads, trace, tmp_path):
     def prologue(qkv, q_weight, k_weight, cos_sin):
         q, k = _norms(qkv, q_weight, k_weight, heads, kv_heads)
         v = qkv[:, (heads + kv_heads) * HEAD_DIM :].reshape(tokens, kv_heads, HEAD_DIM)
-        return _rotations(q, k, v, cos_sin, tokens, heads, kv_heads)
+        return _rotations(q, k, v, cos_sin, tokens, heads, kv_heads, batched)
 
     fused = jax.jit(prologue, compiler_options={**options, "export_path": str(tmp_path)})
     # Apart: the norms in one program, the rotations in another.
     norms = jax.jit(lambda *a: _norms(*a, heads, kv_heads), compiler_options=options)
-    rotations = jax.jit(lambda *a: _rotations(*a, tokens, heads, kv_heads), compiler_options=options)
+    rotations = jax.jit(lambda *a: _rotations(*a, tokens, heads, kv_heads, batched), compiler_options=options)
     device = jax.devices("tt")[0]
     rng = np.random.default_rng(tokens * 100 + heads)
     for step in range(3):  # With a trace: warmup, capture, and replay with new inputs.
@@ -83,8 +88,8 @@ def test_torch_qkv_norm_rope_prologue(tokens, heads, kv_heads, trace, tmp_path):
         v = jax.device_put(jnp.asarray(qkv[:, (heads + kv_heads) * HEAD_DIM :], jnp.bfloat16), device)
         want_q, want_kvs = rotations(q_norm, k_norm, v.reshape(tokens, kv_heads, HEAD_DIM), args[3])
         np.testing.assert_array_equal(np.asarray(q, np.float32), np.asarray(want_q, np.float32))
-        for b in range(tokens):
-            np.testing.assert_array_equal(np.asarray(kvs[b], np.float32), np.asarray(want_kvs[b], np.float32))
+        for kv, want_kv in zip(kvs, want_kvs, strict=True):
+            np.testing.assert_array_equal(np.asarray(kv, np.float32), np.asarray(want_kv, np.float32))
         if step == 0:
             irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
             assert any('"ttnn.split_qkv_norm_rope_decode"' in ir for ir in irs), "the prologue was not fused"
