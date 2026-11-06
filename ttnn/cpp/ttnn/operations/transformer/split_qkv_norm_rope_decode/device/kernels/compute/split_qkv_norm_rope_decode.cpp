@@ -6,10 +6,12 @@
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/compute_kernel_hw_startup.h"
 #include "api/compute/eltwise_binary.h"
-#include "api/compute/eltwise_unary/binop_with_scalar.h"
 #include "api/compute/eltwise_unary/rsqrt.h"
 #include "api/compute/reconfig_data_format.h"
 #include "api/compute/reduce.h"
+#include "ttnn/operations/normalization/kernel_util/compute/numeric.h"
+
+namespace numeric = norm::kernel_util::compute::numeric;
 
 // For each q or k unit, a tile row of heads (one per row): rms_norm, then
 // rotary_embedding, each step as those ops' kernels take it (layernorm.cpp
@@ -35,7 +37,7 @@ void kernel_main() {
     constexpr uint32_t cb_cos_part = get_named_compile_time_arg_val("cb_cos_part");
     constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
     constexpr uint32_t head_tiles = get_named_compile_time_arg_val("head_tiles");
-    constexpr uint32_t inv_width = get_named_compile_time_arg_val("inv_width");
+    constexpr uint32_t head_dim = get_named_compile_time_arg_val("head_dim");
     constexpr uint32_t half = head_tiles / 2;
 
     // Packs DST tile 0 as the next tile of `cb`.
@@ -49,7 +51,9 @@ void kernel_main() {
     };
 
     compute_kernel_hw_startup(cb_x, cb_x, cb_sq);
-    cb_wait_front(cb_scaler, 1);
+    DataflowBuffer dfb_sq(cb_sq);
+    DataflowBuffer dfb_scaler(cb_scaler);
+    DataflowBuffer dfb_mean(cb_mean);
     cb_wait_front(cb_eps, 1);
     // The q and k units; the v units only move data.
     const uint32_t units = get_arg_val<uint32_t>(0);
@@ -65,24 +69,12 @@ void kernel_main() {
             pack_one(cb_sq);
         }
 
-        // The row sum of x^2 by a reduce against the scaler's ones, times
-        // 1 / width on the SFPU.
-        tile_regs_acquire();
-        reconfig_data_format(cb_scaler, cb_sq);
-        reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_sq, cb_scaler, cb_mean);
-        cb_wait_front(cb_sq, head_tiles);
-        for (uint32_t j = 0; j < head_tiles; ++j) {
-            reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_sq, cb_scaler, j, 0, 0);
-        }
-        cb_pop_front(cb_sq, head_tiles);
-        reduce_uninit();
-        binop_with_scalar_tile_init();
-        mul_unary_tile(0, inv_width);
-        pack_reconfig_data_format(cb_mean);
-        pack_one(cb_mean);
+        // The mean of x^2, by rms_norm's own helper: a row reduce against the
+        // scaler's ones, times 1 / width.
+        numeric::row_wise_mean<PoolType::SUM, ReduceDim::REDUCE_ROW, true, policies::FullBlockWithPopPolicy>(
+            dfb_sq, dfb_scaler, dfb_mean, head_dim, head_tiles, head_tiles);
 
         // rstd = rsqrt(mean + epsilon), down column 0.
-        cb_wait_front(cb_mean, 1);
         reconfig_data_format(cb_mean, cb_eps);
         pack_reconfig_data_format(cb_rstd);
         add_init(cb_mean, cb_eps);

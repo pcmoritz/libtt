@@ -267,7 +267,7 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
         {"cos_per_token", in.cos.logical_shape()[1] > 1 ? 1u : 0u},
         // rms_norm's epsilon tile holds the upper half of its FP32 bits.
         {"eps_bf16", std::bit_cast<uint32_t>(params.epsilon) >> 16},
-        {"inv_width", std::bit_cast<uint32_t>(1.0f / static_cast<float>(head_dim))},
+        {"head_dim", head_dim},
     };
     const std::string kernel_dir = "ttnn/cpp/ttnn/operations/transformer/split_qkv_norm_rope_decode/device/kernels/";
 

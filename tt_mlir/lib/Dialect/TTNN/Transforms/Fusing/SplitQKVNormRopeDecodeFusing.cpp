@@ -202,10 +202,11 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
     }
   }
 
-  // q: reshapes, a zero pad of the last dim, reshapes to [1, B, Hq, q_width].
+  // q: reshapes, a pad of the last dim with +0 (the fused kernel's zeros),
+  // reshapes to [1, B, Hq, q_width].
   auto pad =
       dyn_cast_or_null<PadOp>(getSingleUser(alongReshapes(qRope.getResult())));
-  if (!pad || pad.getValue().convertToFloat() != 0.0f) {
+  if (!pad || !pad.getValue().isPosZero()) {
     return mlir::failure();
   }
   ArrayRef<int32_t> padding = pad.getPadding();
