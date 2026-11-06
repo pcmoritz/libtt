@@ -40,8 +40,6 @@ struct SplitQKVNormRopeDecodeParams {
     uint32_t q_width = 0;
     MemoryConfig q_memory_config;
     MemoryConfig kv_memory_config;
-    // One kv output for all tokens instead of one per token.
-    bool batched_key_values = false;
 };
 
 struct SplitQKVNormRopeDecodeInputs {
@@ -65,15 +63,24 @@ struct SplitQKVNormRopeDecodeOperation {
     static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
 };
 
-uint32_t head_dim_of(const SplitQKVNormRopeDecodeParams& params, const Tensor& qkv) {
-    return qkv.logical_shape()[-1] / (params.num_q_heads + 2 * params.num_kv_heads);
+uint32_t head_dim_of(const SplitQKVNormRopeDecodeInputs& in) { return in.q_weight.logical_shape()[-1]; }
+
+// The heads from one q head to the next in the QKV row: 1, or 2 where each is
+// followed by its gate.
+uint32_t q_head_stride(const SplitQKVNormRopeDecodeParams& params, const SplitQKVNormRopeDecodeInputs& in) {
+    const uint32_t heads = in.qkv.logical_shape()[-1] / head_dim_of(in);
+    return heads > 2 * params.num_kv_heads ? (heads - 2 * params.num_kv_heads) / params.num_q_heads : 0;
 }
 
-void validate_tiled(const Tensor& tensor, const char* name) {
+void validate_tiled(const Tensor& tensor, const char* name, bool float32 = false) {
     TT_FATAL(tensor.storage_type() == StorageType::DEVICE, "{} must be on device", name);
     TT_FATAL(tensor.buffer() != nullptr, "{} must be allocated", name);
     TT_FATAL(tensor.layout() == Layout::TILE, "{} must use TILE layout", name);
-    TT_FATAL(tensor.dtype() == DataType::BFLOAT16, "{} must be BFLOAT16", name);
+    TT_FATAL(
+        tensor.dtype() == DataType::BFLOAT16 || (float32 && tensor.dtype() == DataType::FLOAT32),
+        "{} must be BFLOAT16{}",
+        name,
+        float32 ? " or FLOAT32" : "");
     TT_FATAL(tensor.tensor_spec().tile() == Tile(), "{} must use the default tile", name);
     TT_FATAL(
         tensor.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED, "{} must be interleaved", name);
@@ -88,27 +95,32 @@ void SplitQKVNormRopeDecodeOperation::validate_on_program_cache_miss(
     TT_FATAL(
         params.num_q_heads > 0 && params.num_kv_heads > 0 && params.num_kv_heads <= TILE_HEIGHT,
         "unsupported head counts {} and {}", params.num_q_heads, params.num_kv_heads);
-    const uint32_t heads = params.num_q_heads + 2 * params.num_kv_heads;
-    TT_FATAL(shape[-1] % heads == 0, "width {} must split into {} heads", shape[-1], heads);
-    const uint32_t head_dim = head_dim_of(params, in.qkv);
-    // rotate_half swaps whole tiles.
-    TT_FATAL(head_dim % (2 * TILE_WIDTH) == 0, "head_dim {} must be a multiple of 64", head_dim);
+    const uint32_t head_dim = head_dim_of(in);
+    TT_FATAL(head_dim % TILE_WIDTH == 0, "head_dim {} must be a multiple of 32", head_dim);
+    const uint32_t stride = q_head_stride(params, in);
+    TT_FATAL(
+        (stride == 1 || stride == 2) &&
+            shape[-1] == (stride * params.num_q_heads + 2 * params.num_kv_heads) * head_dim,
+        "width {} must hold {} q heads (or q and gate heads) and {} k and v heads of {}",
+        shape[-1], params.num_q_heads, params.num_kv_heads, head_dim);
     TT_FATAL(
         params.q_width >= head_dim && params.q_width % TILE_WIDTH == 0,
         "q_width {} must be a multiple of 32 of at least head_dim {}", params.q_width, head_dim);
     for (const auto& [tensor, name] : {std::pair{&in.q_weight, "q_weight"}, std::pair{&in.k_weight, "k_weight"}}) {
-        validate_tiled(*tensor, name);
+        validate_tiled(*tensor, name, /*float32=*/true);
         TT_FATAL(
-            tensor->logical_shape()[-1] == head_dim && tensor->logical_shape().volume() == head_dim,
+            tensor->logical_shape().volume() == head_dim,
             "{} shape {} must be one row of head_dim {}", name, tensor->logical_shape(), head_dim);
     }
+    TT_FATAL(in.q_weight.dtype() == in.k_weight.dtype(), "q_weight and k_weight must have one dtype");
     for (const auto& [tensor, name] : {std::pair{&in.cos, "cos"}, std::pair{&in.sin, "sin"}}) {
         validate_tiled(*tensor, name);
         const auto& table = tensor->logical_shape();
+        // rotate_half swaps whole tiles of the rotated dims.
         TT_FATAL(
-            table.rank() == 4 && table[0] == 1 && table[2] == 1 && table[3] == head_dim &&
-                (table[1] == 1 || table[1] == shape[-2]),
-            "{} shape {} must be [1, 1 or {}, 1, {}]", name, table, shape[-2], head_dim);
+            table.rank() == 4 && table[0] == 1 && table[2] == 1 && table[3] % (2 * TILE_WIDTH) == 0 &&
+                table[3] <= head_dim && (table[1] == 1 || table[1] == shape[-2]),
+            "{} shape {} must be [1, 1 or {}, 1, R], R a multiple of 64 up to {}", name, table, shape[-2], head_dim);
     }
     TT_FATAL(in.cos.logical_shape() == in.sin.logical_shape(), "cos and sin must have one shape");
 }
@@ -116,19 +128,13 @@ void SplitQKVNormRopeDecodeOperation::validate_on_program_cache_miss(
 SplitQKVNormRopeDecodeOperation::spec_return_value_t SplitQKVNormRopeDecodeOperation::compute_output_specs(
     const operation_attributes_t& params, const tensor_args_t& in) {
     const uint32_t tokens = in.qkv.logical_shape()[-2];
-    const uint32_t head_dim = head_dim_of(params, in.qkv);
+    const uint32_t head_dim = head_dim_of(in);
     auto spec = [&](const Shape& shape, const MemoryConfig& memory_config) {
         return TensorSpec(shape, TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), memory_config));
     };
-    spec_return_value_t specs{spec(Shape({1, tokens, params.num_q_heads, params.q_width}), params.q_memory_config)};
-    if (params.batched_key_values) {
-        specs.push_back(spec(Shape({1, tokens, params.num_kv_heads, 2 * head_dim}), params.kv_memory_config));
-        return specs;
-    }
-    for (uint32_t b = 0; b < tokens; ++b) {
-        specs.push_back(spec(Shape({1, 1, params.num_kv_heads, 2 * head_dim}), params.kv_memory_config));
-    }
-    return specs;
+    return {
+        spec(Shape({1, tokens, params.num_q_heads, params.q_width}), params.q_memory_config),
+        spec(Shape({1, tokens, params.num_kv_heads, 2 * head_dim}), params.kv_memory_config)};
 }
 
 SplitQKVNormRopeDecodeOperation::tensor_return_value_t SplitQKVNormRopeDecodeOperation::create_output_tensors(
@@ -141,12 +147,13 @@ SplitQKVNormRopeDecodeOperation::tensor_return_value_t SplitQKVNormRopeDecodeOpe
 }
 
 // One core's work on up to kGroup heads of one token: its rows of the q
-// output or of the token's kv output, and the zero rows and tiles of that
-// tile row nobody else writes.
+// output or of the token's tile row of the kv output, and the zero rows and
+// tiles of that tile row nobody else writes.
 struct Unit {
     UnitKind kind;
     uint32_t token;
-    uint32_t source_head;  // head index in the QKV row
+    uint32_t source_tile;    // the first head's first tile in the QKV row
+    uint32_t source_stride;  // tiles from one head to the next
     uint32_t heads;
     uint32_t first_tile;
     uint32_t first_row;
@@ -165,8 +172,10 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
     const uint32_t tokens = in.qkv.logical_shape()[-2];
     const uint32_t num_q_heads = params.num_q_heads;
     const uint32_t num_kv_heads = params.num_kv_heads;
-    const uint32_t head_dim = head_dim_of(params, in.qkv);
+    const uint32_t head_dim = head_dim_of(in);
     const uint32_t head_tiles = head_dim / TILE_WIDTH;
+    const uint32_t q_stride = q_head_stride(params, in) * head_tiles;
+    const uint32_t rotary_tiles = in.cos.logical_shape()[-1] / TILE_WIDTH;
     const uint32_t q_row_tiles = (num_q_heads + TILE_HEIGHT - 1) / TILE_HEIGHT;
     const uint32_t q_width_tiles = params.q_width / TILE_WIDTH;
     auto round_up = [](uint32_t value, uint32_t step) { return (value + step - 1) / step * step; };
@@ -179,7 +188,8 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
             units.push_back(Unit{
                 .kind = kQ,
                 .token = b,
-                .source_head = h,
+                .source_tile = h * q_stride,
+                .source_stride = q_stride,
                 .heads = std::min(kGroup, num_q_heads - h),
                 .first_tile = (b * q_row_tiles + h / TILE_HEIGHT) * q_width_tiles,
                 .first_row = row,
@@ -191,10 +201,10 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
                 units.push_back(Unit{
                     .kind = kind,
                     .token = b,
-                    .source_head = num_q_heads + (kind == kV ? num_kv_heads : 0) + h,
+                    .source_tile = num_q_heads * q_stride + ((kind == kV ? num_kv_heads : 0) + h) * head_tiles,
+                    .source_stride = head_tiles,
                     .heads = std::min(kGroup, num_kv_heads - h),
-                    // Token b's tile row of a batched kv output.
-                    .first_tile = (params.batched_key_values ? b * 2 * head_tiles : 0) + (kind == kV ? head_tiles : 0),
+                    .first_tile = b * 2 * head_tiles + (kind == kV ? head_tiles : 0),
                     .first_row = h,
                     .zero_rows_from = h == 0 ? round_up(num_kv_heads, kGroup) : TILE_HEIGHT,
                     .zero_tiles = 0});
@@ -228,10 +238,10 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
     };
     // The formats of rms_norm's and rotary_embedding's buffers, which set how
     // each step rounds.
-    make_cb(0, head_tiles, bf16);   // heads, rms_norm's input
-    make_cb(1, head_tiles, bf16);   // norm weight
-    make_cb(2, head_tiles, bf16);   // cos
-    make_cb(3, head_tiles, bf16);   // sin
+    make_cb(0, head_tiles, bf16);  // heads, rms_norm's input
+    make_cb(1, head_tiles, datatype_to_dataformat_converter(in.q_weight.dtype()));  // norm weight
+    make_cb(2, rotary_tiles, bf16);  // cos
+    make_cb(3, rotary_tiles, bf16);  // sin
     make_cb(4, 1, bf16);            // reduce scaler
     make_cb(5, 1, bf16);            // epsilon
     make_cb(6, head_tiles, bf16);   // v heads
@@ -266,6 +276,7 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
         {"cb_zero", 15},
         {"cb_scratch", 16},
         {"head_tiles", head_tiles},
+        {"rotary_tiles", rotary_tiles},
         {"group", kGroup},
         {"row_bytes", row_bytes},
         {"alignment", alignment},
@@ -314,10 +325,10 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
             norm_units += unit.kind != kV;
             args.push_back(static_cast<uint32_t>(unit.kind));
             args.push_back(unit.token);
-            args.push_back(unit.source_head);
+            args.push_back(unit.source_tile);
+            args.push_back(unit.source_stride);
             args.push_back(unit.heads);
-            args.push_back(
-                outputs.at(unit.kind == kQ ? 0 : 1 + (params.batched_key_values ? 0 : unit.token)).mesh_tensor());
+            args.push_back(outputs.at(unit.kind == kQ ? 0 : 1).mesh_tensor());
             args.push_back(unit.first_tile);
             args.push_back(unit.first_row);
             args.push_back(unit.zero_rows_from);
@@ -350,8 +361,7 @@ std::vector<Tensor> split_qkv_norm_rope_decode(
     float epsilon,
     uint32_t q_width,
     const tt::tt_metal::MemoryConfig& q_memory_config,
-    const tt::tt_metal::MemoryConfig& kv_memory_config,
-    bool batched_key_values) {
+    const tt::tt_metal::MemoryConfig& kv_memory_config) {
     using Op = prim::SplitQKVNormRopeDecodeOperation;
     return device_operation::launch<Op>(
         {.num_q_heads = num_q_heads,
@@ -359,8 +369,7 @@ std::vector<Tensor> split_qkv_norm_rope_decode(
          .epsilon = epsilon,
          .q_width = q_width,
          .q_memory_config = q_memory_config,
-         .kv_memory_config = kv_memory_config,
-         .batched_key_values = batched_key_values},
+         .kv_memory_config = kv_memory_config},
         {.qkv = qkv, .q_weight = q_weight, .k_weight = k_weight, .cos = cos, .sin = sin});
 }
 

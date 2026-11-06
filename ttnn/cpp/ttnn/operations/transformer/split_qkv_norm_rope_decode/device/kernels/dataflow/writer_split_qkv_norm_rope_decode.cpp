@@ -6,8 +6,9 @@
 
 // Writes each of this core's units, rows 0.. of the compute kernel's output
 // tiles (of the reader's for v heads), to their rows of the q output or of the
-// token's kv output, then the rows and tiles of that tile row that only zeros
-// fill: the padding rows below the last head and q's padding columns.
+// token's tile row of the kv output, then the rows and tiles of that tile row
+// that only zeros fill: the padding rows below the last head and q's padding
+// columns.
 void kernel_main() {
     constexpr uint32_t cb_v = get_named_compile_time_arg_val("cb_v");
     constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
@@ -37,7 +38,7 @@ void kernel_main() {
         if (kind == kEnd) {
             break;
         }
-        arg += 3;  // the reader's
+        arg += 4;  // the reader's
         const uint32_t output_addr = get_arg_val<uint32_t>(arg++);
         const uint32_t first_tile = get_arg_val<uint32_t>(arg++);
         const uint32_t first_row = get_arg_val<uint32_t>(arg++);
