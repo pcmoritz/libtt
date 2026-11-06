@@ -10,17 +10,19 @@ diff --git a/runtime/include/tt/runtime/detail/ttnn/utils.h b/runtime/include/tt
  namespace tt::runtime::ttnn::utils {
  
  bool isOnHost(const ::ttnn::StorageType &storageType);
-@@ -234,6 +236,15 @@ inline std::vector<T> getReplicatedValues(const ::ttnn::Tensor &tensor) {
+@@ -234,6 +236,17 @@ inline std::vector<T> getReplicatedValues(const ::ttnn::Tensor &tensor) {
    return std::move(*values);
  }
  
 +// Collectives between processes write to their peers at the addresses of
 +// their own buffers, which the processes' allocators need not keep equal.
 +// With a symmetric DRAM region (reserved when the mesh opened), runs
-+// `collective` with its buffers there and copies its result out before the
-+// next collective reuses the region.
++// `collective` with its buffers there and copies its result, tensor
++// `outputId` of the program `context` runs, out before the next collective
++// reuses the region, unless the program frees it first.
 +::ttnn::Tensor
-+runSymmetricCollective(::ttnn::MeshDevice &device,
++runSymmetricCollective(ProgramContext &context, std::uint32_t outputId,
++                       ::ttnn::MeshDevice &device,
 +                       const std::function<::ttnn::Tensor()> &collective);
 +
  template <typename T>
@@ -38,7 +40,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/all_gather.cpp b/runtime/lib/ttnn/o
 -                         persistentOutputTensor, subDeviceId,
 -                         /*sub_core_grid=*/std::nullopt, numLinks, topology);
 +  ::ttnn::Tensor out = ::tt::runtime::ttnn::utils::runSymmetricCollective(
-+      *input.device(), [&] {
++      context, op->out()->global_id(), *input.device(), [&] {
 +    return ::ttnn::all_gather(input, allGatherDim, clusterAxis,
 +                              outputMemoryConfig, persistentOutputTensor,
 +                              subDeviceId, /*sub_core_grid=*/std::nullopt,
@@ -58,7 +60,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/all_reduce.cpp b/runtime/lib/ttnn/o
 -      input, clusterAxis, subDeviceId, outputMemoryConfig, numLinks, topology,
 -      ::tt::runtime::ttnn::utils::getReduceType(op->reduce_type()));
 +  ::ttnn::Tensor out = ::tt::runtime::ttnn::utils::runSymmetricCollective(
-+      *input.device(), [&] {
++      context, op->out()->global_id(), *input.device(), [&] {
 +    return ::ttnn::all_reduce(
 +        input, clusterAxis, subDeviceId, outputMemoryConfig, numLinks, topology,
 +        ::tt::runtime::ttnn::utils::getReduceType(op->reduce_type()));
@@ -77,7 +79,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/all_reduce_async.cpp b/runtime/lib/
 -      input, clusterAxis, reduceType, subDeviceId, outputMemoryConfig, numLinks,
 -      topology);
 +  ::ttnn::Tensor out = ::tt::runtime::ttnn::utils::runSymmetricCollective(
-+      *input.device(), [&] {
++      context, op->out()->global_id(), *input.device(), [&] {
 +    return ::ttnn::experimental::all_reduce_async(input, clusterAxis,
 +                                                  reduceType, subDeviceId,
 +                                                  outputMemoryConfig, numLinks,
@@ -102,7 +104,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp b/runtime/lib/tt
 -      /*num_buffers_per_channel=*/std::nullopt,
 -      /*compute_kernel_config=*/computeConfig);
 +  ::ttnn::Tensor out = ::tt::runtime::ttnn::utils::runSymmetricCollective(
-+      *input.device(), [&] {
++      context, op->out()->global_id(), *input.device(), [&] {
 +    return ::ttnn::reduce_scatter(
 +        input, scatterDimension, clusterAxis, subDeviceId, outputMemoryConfig,
 +        /*intermediate_memory_config=*/std::nullopt, optionalOutputTensor,
@@ -129,7 +131,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  #include <sys/mman.h>
  #include <thread>
  
-@@ -867,6 +870,33 @@ size_t getNumAvailableDevices() {
+@@ -863,6 +866,33 @@ size_t getNumAvailableDevices() {
    return ::tt::tt_metal::GetNumAvailableDevices();
  }
  
@@ -163,7 +165,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  Device openMeshDevice(const MeshDeviceOptions &options) {
    std::optional<::ttnn::MeshShape> meshShape = std::nullopt;
    if (options.meshShape.has_value()) {
-@@ -896,6 +926,7 @@ Device openMeshDevice(const MeshDeviceOptions &options) {
+@@ -892,6 +922,7 @@ Device openMeshDevice(const MeshDeviceOptions &options) {
    } else {
      meshDevice->disable_and_clear_program_cache();
    }
@@ -171,7 +173,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  
    LOG_DEBUG("Device grid size = { ",
              meshDevice->compute_with_storage_grid_size().x, ", ",
-@@ -936,6 +967,10 @@ void closeMeshDevice(Device parentMesh) {
+@@ -932,6 +963,10 @@ void closeMeshDevice(Device parentMesh) {
  #if defined(TT_RUNTIME_ENABLE_PERF_TRACE) && TT_RUNTIME_ENABLE_PERF_TRACE == 1
    ::tt::tt_metal::ReadMeshDeviceProfilerResults(ttnnMeshDevice);
  #endif
@@ -185,16 +187,21 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
 --- a/runtime/lib/ttnn/utils/utils.cpp
 +++ b/runtime/lib/ttnn/utils/utils.cpp
-@@ -9,6 +9,8 @@
+@@ -9,7 +9,13 @@
  #include "tt/runtime/types.h"
  #include "tt/runtime/utils.h"
  
++#include "tt/runtime/detail/ttnn/ttnn.h"
 +#include "ttnn/operations/data_movement/clone/clone.hpp"
 +
++#include <map>
  #include <memory>
++#include <mutex>
++#include <unordered_set>
  #include <vector>
  
-@@ -662,4 +664,39 @@ getMemoryView(Device deviceHandle) {
+ namespace tt::runtime::ttnn::utils {
+@@ -670,4 +676,169 @@ getMemoryView(Device deviceHandle) {
    return memoryMap;
  }
  
@@ -214,10 +221,135 @@ diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
 +private:
 +  ::tt::tt_metal::Allocator &allocator;
 +};
++
++// The tensor a collective that runs in the symmetric region writes.
++std::optional<std::uint32_t>
++symmetricCollectiveOutput(const ::tt::target::ttnn::Operation &op) {
++  switch (op.type_type()) {
++  case ::tt::target::ttnn::OpType::AllGatherOp:
++    return op.type_as_AllGatherOp()->out()->global_id();
++  case ::tt::target::ttnn::OpType::AllReduceOp:
++    return op.type_as_AllReduceOp()->out()->global_id();
++  case ::tt::target::ttnn::OpType::AllReduceAsyncOp:
++    return op.type_as_AllReduceAsyncOp()->out()->global_id();
++  case ::tt::target::ttnn::OpType::ReduceScatterOp:
++    return op.type_as_ReduceScatterOp()->out()->global_id();
++  default:
++    return std::nullopt;
++  }
++}
++
++// Whether op runs other programs, whose collectives reuse the region too.
++bool runsPrograms(const ::tt::target::ttnn::Operation &op) {
++  switch (op.type_type()) {
++  case ::tt::target::ttnn::OpType::CaseOp:
++  case ::tt::target::ttnn::OpType::WhileLoopOp:
++  case ::tt::target::ttnn::OpType::FuncCallOp:
++  case ::tt::target::ttnn::OpType::LoadCachedOp:
++  case ::tt::target::ttnn::OpType::CaptureOrExecuteTraceOp:
++  case ::tt::target::ttnn::OpType::ExecuteTraceOp:
++    return true;
++  default:
++    return false;
++  }
++}
++
++// Whether op only reads its inputs into new tensors: its results neither view
++// nor are an input.
++bool writesNewTensors(const ::tt::target::ttnn::Operation &op) {
++  switch (op.type_type()) {
++  case ::tt::target::ttnn::OpType::RMSNormOp:
++  case ::tt::target::ttnn::OpType::RMSNormResidualOp:
++  case ::tt::target::ttnn::OpType::MatmulOp:
++  case ::tt::target::ttnn::OpType::LinearOp:
++    return true;
++  case ::tt::target::ttnn::OpType::TypecastOp: {
++    const auto *typecast = op.type_as_TypecastOp();
++    return typecast->dtype() !=
++           typecast->in()->desc()->layout()->memory_desc()->data_type();
++  }
++  default:
++    return false;
++  }
++}
++
++// The tensors written by the program's collectives that it frees, with the
++// reshapes of them, before its next collective, reading them until then only
++// into new tensors: such a result can stay in the region.
++std::unordered_set<std::uint32_t>
++freedBeforeNextCollective(const ::tt::target::ttnn::Program &program) {
++  const auto &ops = *program.operations();
++  std::unordered_set<std::uint32_t> freed;
++  for (std::uint32_t i = 0; i < ops.size(); ++i) {
++    const std::optional<std::uint32_t> output =
++        symmetricCollectiveOutput(*ops.Get(i));
++    if (!output) {
++      continue;
++    }
++    // The result and its views (a reshape may share its buffer).
++    std::unordered_set<std::uint32_t> live = {*output};
++    for (std::uint32_t j = i + 1; j < ops.size() && !live.empty(); ++j) {
++      const ::tt::target::ttnn::Operation &op = *ops.Get(j);
++      if (symmetricCollectiveOutput(op) || runsPrograms(op)) {
++        break;
++      }
++      if (const auto *deallocate = op.type_as_DeallocateOp()) {
++        live.erase(deallocate->in()->global_id());
++        continue;
++      }
++      auto handle = ::tt::runtime::utils::unsafeBorrowShared(
++          const_cast<::tt::target::ttnn::Operation *>(&op));
++      bool reads = false;
++      for (const TensorRef &ref :
++           getOpInputRefs(OpContext(handle, DeviceRuntime::TTNN))) {
++        // Absent optional operands are null.
++        reads = reads ||
++                (ref.handle &&
++                 live.count(ref.as<::tt::target::ttnn::TensorRef>(
++                                   DeviceRuntime::TTNN)
++                                .global_id()));
++      }
++      if (!reads) {
++        continue;
++      }
++      if (const auto *reshape = op.type_as_ReshapeOp()) {
++        live.insert(reshape->out()->global_id());
++      } else if (!writesNewTensors(op)) {
++        break;
++      }
++    }
++    if (live.empty()) {
++      freed.insert(*output);
++    }
++  }
++  return freed;
++}
++
++// freedBeforeNextCollective of the program context runs, found once per
++// program.
++bool freedBeforeNextCollective(ProgramContext &context,
++                               std::uint32_t outputId) {
++  static std::mutex mutex;
++  static auto &cache = *new std::map<std::pair<std::uint64_t, std::size_t>,
++                                     std::unordered_set<std::uint32_t>>();
++  const std::lock_guard<std::mutex> lock(mutex);
++  const std::pair<std::uint64_t, std::size_t> key = {
++      context.getExecutableHandle().id(), context.getProgramIndex()};
++  auto it = cache.find(key);
++  if (it == cache.end()) {
++    it = cache
++             .emplace(key, freedBeforeNextCollective(*getProgram(
++                               context.getExecutableHandle(),
++                               context.getProgramIndex())))
++             .first;
++  }
++  return it->second.count(outputId) != 0;
++}
 +} // namespace
 +
 +::ttnn::Tensor
-+runSymmetricCollective(::ttnn::MeshDevice &device,
++runSymmetricCollective(ProgramContext &context, std::uint32_t outputId,
++                       ::ttnn::MeshDevice &device,
 +                       const std::function<::ttnn::Tensor()> &collective) {
 +  ::tt::tt_metal::Allocator &allocator = *device.allocator();
 +  if (!allocator.has_symmetric_dram()) {
@@ -227,6 +359,11 @@ diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
 +  {
 +    SymmetricDramScope scope(allocator);
 +    result = collective();
++  }
++  // A result the program frees before its next collective is read in place:
++  // that collective's peers write to this chip's region only once it runs it.
++  if (freedBeforeNextCollective(context, outputId)) {
++    return result;
 +  }
 +  // Copied out after the scope ends, outside the region the next collective
 +  // reuses.
