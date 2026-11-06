@@ -101,7 +101,7 @@ diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/
 +
 +  // Guards m_runtime_tensor and m_host_copies: a framework may read a buffer on
 +  // one thread while a program takes it as an input on another.
-+  mutable std::mutex m_state_mutex;
++  std::mutex m_state_mutex;
  };
  
  // Shared pointer to pjrt tensor used by all shards that holds tensor.
@@ -144,7 +144,7 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
  void BufferInstance::fireDoneWithHostBufferEvent() {
    std::lock_guard<std::mutex> deleted_lock(m_data_deleted_mutex);
    if (m_done_with_host_buffer_event == nullptr) {
-@@ -485,29 +488,32 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+@@ -485,29 +488,31 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
  
    std::unique_ptr<EventInstance> event = EventInstance::createInstance();
  
@@ -162,11 +162,10 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
 +  // and copies the data; it holds all it uses, so deleting the buffer does not
 +  // wait for it.
 +  const size_t logical_tensor_size = logicalTensorSize();
-+  std::optional<tt::runtime::Tensor> host_tensor;
-+  {
++  const tt::runtime::Tensor host_tensor = [&] {
 +    const std::lock_guard<std::mutex> lock(s_copy_to_host_internal_mutex);
-+    host_tensor = m_pjrt_tensor->start_copy_to_host(this);
-+  }
++    return m_pjrt_tensor->start_copy_to_host(this);
++  }();
  
 -  m_copy_to_host_thread = std::thread([=, this, e = event.get()] {
 +  {
@@ -189,12 +188,12 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
  
 -      tt::runtime::memcpy(host_buffer, m_pjrt_tensor->runtime_tensor(),
 -                          rt_data_type);
-+      tt::runtime::wait(*host_tensor);
-+      tt::runtime::memcpy(host_buffer, *host_tensor, rt_data_type);
++      tt::runtime::wait(host_tensor);
++      tt::runtime::memcpy(host_buffer, host_tensor, rt_data_type);
  
        EventInstance::markAsReadyAndCallback(e, tt_pjrt_status::kSuccess);
  
-@@ -515,7 +521,10 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+@@ -515,7 +520,10 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
        LOG_F(ERROR, "Copy to host buffer failed with error: %s", error.what());
        EventInstance::markAsReadyAndCallback(e, tt_pjrt_status::kInternal);
      }
@@ -206,7 +205,7 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
  
    // responsible for calling `PJRT_Event_Destroy` on the event.
    *out_copy_done_event = event.release();
-@@ -523,6 +532,12 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+@@ -523,6 +531,12 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
    return tt_pjrt_status::kSuccess;
  }
  
