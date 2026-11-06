@@ -1,3 +1,50 @@
+diff --git a/pjrt_implementation/inc/api/buffer_instance.h b/pjrt_implementation/inc/api/buffer_instance.h
+--- a/pjrt_implementation/inc/api/buffer_instance.h
++++ b/pjrt_implementation/inc/api/buffer_instance.h
+@@ -13,6 +13,7 @@
+ 
+ // c++ standard library includes
+ #include <atomic>
++#include <condition_variable>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -152,6 +153,10 @@ public:
+   tt_pjrt_status copyToHost(void *host_buffer, size_t host_buffer_size,
+                             EventInstance **out_copy_done_event);
+ 
++  // Waits for the copies to the host still in flight, which deleting their
++  // buffers does not wait for, as closing the mesh they read from must.
++  static void waitForCopiesToHost();
++
+   // Copies this buffer's data to the device and its memory specified in the
+   // arguments.
+   tt_pjrt_status copyToDeviceMemory(DeviceInstance *dst_device,
+@@ -263,19 +268,16 @@ private:
+   // Mutex guarding buffer data deletion.
+   std::mutex m_data_deleted_mutex;
+ 
+-  // Thread for copying data to host.
+-  std::thread m_copy_to_host_thread;
+-
+-  // Mutex guarding thread spawning for copying data to host.
+-  // Prevents multiple threads from concurrently copying into the same
+-  // BufferInstance.
+-  std::mutex m_copy_to_host_thread_mutex;
+-
+   // Mutex guarding internal copy to host operation on the same mesh device
+   // Metal+Program Cache is not thread safe when untilizing on device, so
+   //  even different bufferInstances may not be concurrently copied to host.
+   static std::mutex s_copy_to_host_internal_mutex;
+ 
++  // The number of copies to the host in flight, under s_copies_to_host_mutex.
++  static std::mutex s_copies_to_host_mutex;
++  static std::condition_variable s_copies_to_host_done;
++  static size_t s_copies_to_host_in_flight;
++
+   // Pjrt tensor reference.
+   PjrtTensorRef m_pjrt_tensor;
+ };
 diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/tensor.h
 --- a/pjrt_implementation/inc/api/tensor.h
 +++ b/pjrt_implementation/inc/api/tensor.h
@@ -9,21 +56,7 @@ diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/
  #include <optional>
  #include <string>
  #include <vector>
-@@ -101,11 +102,13 @@ public: // Constructors needs to be public for std::shared_ptr.
-   tt::runtime::Tensor &runtime_tensor() {
-     TT_FATAL(m_runtime_tensor.has_value(),
-              "Accessing runtime tensor on shell-only PjrtTensor");
-+    wait_for_read();
-     return *m_runtime_tensor;
-   }
-   const tt::runtime::Tensor &runtime_tensor() const {
-     TT_FATAL(m_runtime_tensor.has_value(),
-              "Accessing runtime tensor on shell-only PjrtTensor");
-+    wait_for_read();
-     return *m_runtime_tensor;
-   }
-   bool has_runtime_tensor() const noexcept {
-@@ -122,9 +125,16 @@ public: // Constructors needs to be public for std::shared_ptr.
+@@ -122,9 +123,19 @@ public: // Constructors needs to be public for std::shared_ptr.
      return std::find(m_shards.begin(), m_shards.end(), shard) != m_shards.end();
    }
  
@@ -31,49 +64,28 @@ diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/
 -  void ensure_layout(const tt::runtime::Device &device,
 -                     const tt::runtime::Layout &layout);
 +  // Changes runtime tensor layout if it differs from provided layout, and
-+  // returns the runtime tensor, for a program's input. Moving the tensor to the
-+  // host on another thread, as a read does, happens before or after, not
-+  // between changing the layout and taking the tensor.
++  // returns the runtime tensor, for a program's input. A read on another
++  // thread takes the tensor before or after, not between changing the layout
++  // and taking the tensor.
 +  tt::runtime::Tensor ensure_layout(const tt::runtime::Device &device,
 +                                    const tt::runtime::Layout &layout);
 +
-+  // Moves the tensor to the host without blocking and returns the host tensor
-+  // that the read fills for `shard`, one of the buffers of this tensor.
-+  tt::runtime::Tensor start_move_to_host(const BufferInstance *shard);
++  // Enqueues a read of the tensor, in stream order after the programs that
++  // produced it, without blocking, and returns the host tensor it fills for
++  // `shard`, one of the buffers of this tensor. As on other PJRT devices, the
++  // tensor stays where it is: programs can take it as an input while the read
++  // is in flight.
++  tt::runtime::Tensor start_copy_to_host(const BufferInstance *shard);
  
    // Removes shard from shards (by setting shard to nullptr).
    void remove_shard(const BufferInstance *shard) noexcept;
-@@ -132,8 +142,10 @@ public: // Constructors needs to be public for std::shared_ptr.
-   // Returns whether all shards share the same runtime tensor.
-   static bool have_same_tensor(const std::vector<BufferInstance *> &shards);
- 
--  // Moves pjrt tensor to host.
--  void move_to_host() noexcept;
-+  // Moves pjrt tensor to host. Without blocking, the read is only enqueued, in
-+  // stream order after the programs that produced the tensor; runtime_tensor()
-+  // and the other users of the host data wait for it.
-+  void move_to_host(bool blocking = true) noexcept;
- 
-   // Whether this is a buffer of one device holding the same data on every chip
-   // of the mesh in use (LoadedExecutableInstance::getOrCreateMeshDevice).
-@@ -171,6 +183,21 @@ private:
+@@ -171,6 +182,10 @@ private:
    // Optional metadata for host-submitted tensors used to recreate worker-local
    // runtime tensors without depending on the initial runtime tensor descriptor.
    std::optional<HostTensorShell> m_host_tensor_shell;
 +
-+  // Waits for the read of a non-blocking move to host.
-+  void wait_for_read() const;
-+
-+  // wait_for_read and move_to_host with m_state_mutex held. Moving returns
-+  // the host tensors that toHost gave: one for every shard, or one for all.
-+  void wait_for_read_locked() const;
-+  std::vector<tt::runtime::Tensor> move_to_host_locked(bool blocking);
-+
-+  // Whether m_runtime_tensor is a host tensor whose read is still in flight.
-+  mutable bool m_read_pending = false;
-+
-+  // Guards m_runtime_tensor and m_read_pending: a framework may read a buffer
-+  // on one thread while a program takes it as an input on another.
++  // Guards m_runtime_tensor: a framework may read a buffer on one thread while
++  // a program takes it as an input on another.
 +  mutable std::mutex m_state_mutex;
  };
  
@@ -81,7 +93,30 @@ diff --git a/pjrt_implementation/inc/api/tensor.h b/pjrt_implementation/inc/api/
 diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
 --- a/pjrt_implementation/src/api/buffer_instance.cc
 +++ b/pjrt_implementation/src/api/buffer_instance.cc
-@@ -485,29 +485,31 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+@@ -46,6 +46,9 @@
+ namespace tt::pjrt {
+ 
+ std::mutex BufferInstance::s_copy_to_host_internal_mutex;
++std::mutex BufferInstance::s_copies_to_host_mutex;
++std::condition_variable BufferInstance::s_copies_to_host_done;
++size_t BufferInstance::s_copies_to_host_in_flight = 0;
+ 
+ std::unique_ptr<BufferInstance> BufferInstance::createInputBufferInstance(
+     PJRT_Buffer_Type data_type, const std::int64_t *dims, size_t num_dims,
+@@ -148,12 +151,6 @@ void BufferInstance::deleteData() {
+     return;
+   }
+ 
+-  {
+-    const std::lock_guard<std::mutex> copy_lock(m_copy_to_host_thread_mutex);
+-    if (m_copy_to_host_thread.joinable())
+-      m_copy_to_host_thread.join();
+-  }
+-
+   m_data_deleted = true;
+   if (m_done_with_host_buffer_event) {
+     // TODO(mrakita): Revert.
+@@ -485,29 +482,32 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
  
    std::unique_ptr<EventInstance> event = EventInstance::createInstance();
  
@@ -90,23 +125,27 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
 -  // create new thread for each shard, because tensors are moved once from
 -  // device when onHost is called on a first shard. Also, creating std::thread
 -  // for memcpy might be overhead with performance loss. We should measure.
+-  const std::lock_guard<std::mutex> copy_lock(m_copy_to_host_thread_mutex);
+-  if (m_copy_to_host_thread.joinable())
+-    m_copy_to_host_thread.join();
 +  // The read is enqueued here, in stream order right after the programs that
 +  // produced the tensor: programs enqueued later neither delay it nor run
-+  // concurrently with device work of another thread, and deleting the buffer
-+  // only waits for the read. The thread waits for it and copies the data.
++  // concurrently with device work of another thread. The thread waits for it
++  // and copies the data; it holds all it uses, so deleting the buffer does not
++  // wait for it.
 +  const size_t logical_tensor_size = logicalTensorSize();
 +  std::optional<tt::runtime::Tensor> host_tensor;
 +  {
 +    const std::lock_guard<std::mutex> lock(s_copy_to_host_internal_mutex);
-+    host_tensor = m_pjrt_tensor->start_move_to_host(this);
++    host_tensor = m_pjrt_tensor->start_copy_to_host(this);
 +  }
-+
-   const std::lock_guard<std::mutex> copy_lock(m_copy_to_host_thread_mutex);
-   if (m_copy_to_host_thread.joinable())
-     m_copy_to_host_thread.join();
  
 -  m_copy_to_host_thread = std::thread([=, this, e = event.get()] {
-+  m_copy_to_host_thread = std::thread([=, e = event.get()] {
++  {
++    const std::lock_guard<std::mutex> lock(s_copies_to_host_mutex);
++    ++s_copies_to_host_in_flight;
++  }
++  std::thread([=, e = event.get()] {
      try {
        ZoneScopedN("CopyToHostThread");
 -      const std::lock_guard<std::mutex> lock(s_copy_to_host_internal_mutex);
@@ -127,6 +166,43 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
  
        EventInstance::markAsReadyAndCallback(e, tt_pjrt_status::kSuccess);
  
+@@ -515,7 +515,10 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+       LOG_F(ERROR, "Copy to host buffer failed with error: %s", error.what());
+       EventInstance::markAsReadyAndCallback(e, tt_pjrt_status::kInternal);
+     }
+-  });
++    const std::lock_guard<std::mutex> lock(s_copies_to_host_mutex);
++    if (--s_copies_to_host_in_flight == 0)
++      s_copies_to_host_done.notify_all();
++  }).detach();
+ 
+   // responsible for calling `PJRT_Event_Destroy` on the event.
+   *out_copy_done_event = event.release();
+@@ -523,6 +526,12 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+   return tt_pjrt_status::kSuccess;
+ }
+ 
++void BufferInstance::waitForCopiesToHost() {
++  std::unique_lock<std::mutex> lock(s_copies_to_host_mutex);
++  s_copies_to_host_done.wait(
++      lock, [] { return s_copies_to_host_in_flight == 0; });
++}
++
+ void BufferInstance::markAsDataReady() {
+   std::lock_guard<std::mutex> ready_lock(m_data_ready_mutex);
+ 
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -780,6 +780,8 @@ std::optional<tt::runtime::Device> ClientInstance::getOrCreateSubMesh(
+ }
+ 
+ void ClientInstance::releaseSubMesh() {
++  // Copies to the host can still be reading from the mesh's devices.
++  BufferInstance::waitForCopiesToHost();
+   if (m_submesh_shape.has_value()) {
+     tt::runtime::releaseSubMeshDevice(*m_parent_mesh);
+     m_parent_mesh = m_root_mesh;
 diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
 --- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
 +++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
@@ -152,7 +228,7 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
  #include <memory>
  #include <optional>
  #include <unordered_map>
-@@ -95,17 +96,20 @@ PjrtTensor::PjrtTensor(Private, std::vector<BufferInstance *> shards,
+@@ -95,17 +96,19 @@ PjrtTensor::PjrtTensor(Private, std::vector<BufferInstance *> shards,
  
  PjrtTensor::~PjrtTensor() { TensorPool::erase(this); }
  
@@ -164,7 +240,6 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
    TT_FATAL(m_runtime_tensor.has_value(),
             "Cannot ensure layout for shell-only PjrtTensor");
 +  const std::lock_guard<std::mutex> lock(m_state_mutex);
-+  wait_for_read_locked();
  
    if (m_checked_layout_id == layout.getGlobalId())
 -    return;
@@ -177,7 +252,7 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
    }
  
    const bool retain = tt::runtime::getTensorRetain(*m_runtime_tensor);
-@@ -122,6 +126,32 @@ void PjrtTensor::ensure_layout(const tt::runtime::Device &device,
+@@ -122,6 +125,29 @@ void PjrtTensor::ensure_layout(const tt::runtime::Device &device,
        shard->fireDoneWithHostBufferEvent();
      }
    }
@@ -185,94 +260,33 @@ diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api
 +}
 +
 +tt::runtime::Tensor
-+PjrtTensor::start_move_to_host(const BufferInstance *shard) {
++PjrtTensor::start_copy_to_host(const BufferInstance *shard) {
 +  const std::lock_guard<std::mutex> lock(m_state_mutex);
-+  // Moving gives each shard but the first a tensor of its own.
++  TT_FATAL(m_runtime_tensor.has_value(),
++           "Shell-only PjrtTensor has no data to read");
 +  const auto it = std::find(m_shards.begin(), m_shards.end(), shard);
 +  TT_FATAL(it != m_shards.end(), "The buffer is not a shard of this tensor");
-+  const size_t index = it - m_shards.begin();
++
++  // A buffer of one device holds the same data on every chip of the mesh
++  // (LoadedExecutableInstance::getOrCreateMeshDevice); one chip's is read.
++  const tt::runtime::Tensor source =
++      on_every_chip() ? tt::runtime::getDeviceTensors(*m_runtime_tensor)[0]
++                      : *m_runtime_tensor;
 +  std::vector<tt::runtime::Tensor> tensors =
-+      move_to_host_locked(/*blocking=*/false);
-+  TT_FATAL(!tensors.empty(), "Shell-only PjrtTensor has no data to read");
-+  return tensors.size() == 1 ? tensors[0] : tensors[index];
-+}
-+
-+void PjrtTensor::wait_for_read() const {
-+  const std::lock_guard<std::mutex> lock(m_state_mutex);
-+  wait_for_read_locked();
-+}
-+
-+void PjrtTensor::wait_for_read_locked() const {
-+  if (m_read_pending) {
-+    tt::runtime::wait(*m_runtime_tensor);
-+    m_read_pending = false;
-+  }
++      tt::runtime::toHost(source, /*untilize=*/true, /*blocking=*/false);
++  TT_FATAL(tensors.size() == m_shards.size() || tensors.size() == 1,
++           "Unexpected number of tensors after copy to host: "
++           "tensors.size()={}, m_shards.size()={}",
++           tensors.size(), m_shards.size());
++  return tensors.size() == 1 ? tensors[0] : tensors[it - m_shards.begin()];
  }
  
  // Moves pjrt tensor to host.
-@@ -148,7 +178,13 @@ void PjrtTensor::ensure_layout(const tt::runtime::Device &device,
- //
- // Additional note: for checking whether shard is nullptr, see comment in
+@@ -150,6 +176,7 @@ void PjrtTensor::ensure_layout(const tt::runtime::Device &device,
  // remove_shard().
--void PjrtTensor::move_to_host() noexcept {
-+void PjrtTensor::move_to_host(bool blocking) noexcept {
-+  const std::lock_guard<std::mutex> lock(m_state_mutex);
-+  move_to_host_locked(blocking);
-+}
-+
-+std::vector<tt::runtime::Tensor>
-+PjrtTensor::move_to_host_locked(bool blocking) {
+ void PjrtTensor::move_to_host() noexcept {
    ZoneScoped;
++  const std::lock_guard<std::mutex> lock(m_state_mutex);
  
    // Shell-only tensors (deferred in distributed runtime) have no device-side
-@@ -156,7 +192,15 @@ void PjrtTensor::move_to_host() noexcept {
-   // from The ClientInstance default (1xN_DEVICES) which induces a mesh reshape
-   // prior to first execution. Early return since there's nothing to move.
-   if (!m_runtime_tensor.has_value() && m_host_tensor_shell.has_value()) {
--    return;
-+    return {};
-+  }
-+
-+  // A read in flight has already moved the tensor, and with it its shards.
-+  if (m_read_pending) {
-+    if (blocking) {
-+      wait_for_read_locked();
-+    }
-+    return {*m_runtime_tensor};
-   }
- 
-   // A buffer of one device holds the same data on every chip of the mesh
-@@ -166,13 +210,14 @@ void PjrtTensor::move_to_host() noexcept {
-   }
- 
-   std::vector<tt::runtime::Tensor> tensors =
--      tt::runtime::toHost(*m_runtime_tensor, /*untilize=*/true);
-+      tt::runtime::toHost(*m_runtime_tensor, /*untilize=*/true, blocking);
- 
-   TT_FATAL(tensors.size() == m_shards.size() || tensors.size() == 1,
-            "Unexpected number of tensors after move to host: "
-            "tensors.size()={}, m_shards.size()={}",
-            tensors.size(), m_shards.size());
--  m_runtime_tensor = std::move(tensors[0]);
-+  m_runtime_tensor = tensors[0];
-+  m_read_pending = !blocking;
-   m_checked_layout_id.reset();
- 
-   for (std::size_t i = 1; i < m_shards.size(); ++i) {
-@@ -181,12 +226,13 @@ void PjrtTensor::move_to_host() noexcept {
-       continue;
-     }
- 
--    tt::runtime::Tensor rt_tensor =
--        tensors.size() == 1 ? *m_runtime_tensor : std::move(tensors[i]);
--    PjrtTensor::from_runtime_tensor({m_shards[i]}, std::move(rt_tensor));
-+    PjrtTensor::from_runtime_tensor(
-+        {m_shards[i]}, tensors.size() == 1 ? tensors[0] : tensors[i])
-+        .m_read_pending = !blocking;
-   }
- 
-   m_shards.resize(1);
-+  return tensors;
- }
- 
- // Returns whether all shards share the same runtime tensor.
+   // data to move. This can happen legitimately if the runtime mesh is different

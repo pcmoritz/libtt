@@ -46,9 +46,9 @@ diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation
 diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
 --- a/pjrt_implementation/src/api/buffer_instance.cc
 +++ b/pjrt_implementation/src/api/buffer_instance.cc
-@@ -553,6 +553,10 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
-   // concurrently with device work of another thread, and deleting the buffer
-   // only waits for the read. The thread waits for it and copies the data.
+@@ -551,6 +551,10 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+   // and copies the data; it holds all it uses, so deleting the buffer does not
+   // wait for it.
    const size_t logical_tensor_size = logicalTensorSize();
 +  // U64 and complex buffers hold two runtime elements per element.
 +  const bool check_runtime_size =
@@ -57,7 +57,7 @@ diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementatio
    std::optional<tt::runtime::Tensor> host_tensor;
    {
      // Untilizing the tensor on device runs a program, which a trace capture on
-@@ -577,6 +581,14 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+@@ -575,6 +579,14 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
                 logical_tensor_size, host_buffer_size);
  
        tt::runtime::wait(*host_tensor);
@@ -332,7 +332,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
  
    if (std::optional<tt::runtime::Device> submesh =
            getOrCreateSubMesh(target_mesh_shape)) {
-@@ -800,14 +912,17 @@ PJRT_Error *onClientCreate(PJRT_Client_Create_Args *args) {
+@@ -802,14 +914,17 @@ PJRT_Error *onClientCreate(PJRT_Client_Create_Args *args) {
    ZoneScoped;
    DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_Client_Create");
  
