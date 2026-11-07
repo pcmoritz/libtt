@@ -306,7 +306,7 @@ new file mode 100644
 +        copy_init(cb_divisor);
 +        copy_tile(cb_divisor, 0, 3);
 +        reconfig_data_format_srca(cb_norm);
-+        qr::quantize_tiles<e5m2, 3, 0, stride, stride == 4 ? rows : 4>(cb_norm, b, n);
++        qr::quantize_tiles<e5m2, 3, 0, stride, rows>(cb_norm, b, n);
 +        pack_block(cb_q, b, n);
 +    }
 +    cb_push_back(cb_q, count);

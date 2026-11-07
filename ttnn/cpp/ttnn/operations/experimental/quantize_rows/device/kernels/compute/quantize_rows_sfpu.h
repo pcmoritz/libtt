@@ -301,20 +301,21 @@ inline void make_divisor(
 // x0 + n - 1, divided by the divisor tile d and converted to float8 codes, in
 // their first `rows` rows (4, 8, 16 or 32: two SFPU vectors per four rows of
 // a face, in the top faces for up to 16 rows); div_binary_tile and
-// fp8_typecast_tile's routines. When only the first `real` rows of every
-// four hold data (1 or 2, or up to 3 in a 4-row tile), just those rows are
-// divided and converted, gathered into whole vectors (gather_rows), which
-// cuts the SFPU work up to fourfold; the other rows' codes are undefined, and
-// so are the divisor's other rows afterwards. The caller sets the unpacker's
-// source format for `cb` first.
-template <bool e5m2, uint32_t d, uint32_t x0, uint32_t rows = 32, uint32_t real = 4>
+// fp8_typecast_tile's routines. With a tensor of fewer than four rows, only
+// its rows of every four hold data: when gather_rows can gather them (one or
+// two rows, or up to three in a 4-row tile), just those rows are divided and
+// converted, in whole vectors, which cuts the SFPU work up to fourfold; the
+// other rows' codes are undefined, and so are the divisor's other rows
+// afterwards. The caller sets the unpacker's source format for `cb` first.
+template <bool e5m2, uint32_t d, uint32_t x0, uint32_t rows, uint32_t tensor_rows>
 inline void quantize_tiles(uint32_t cb, uint32_t first, uint32_t n) {
     copy_init(cb);
     for (uint32_t j = 0; j < n; ++j) {
         copy_tile(cb, first + j, x0 + j);
     }
-    if constexpr (real < 4 && (real <= 2 || rows == 4)) {
-        constexpr uint32_t bands = rows / 4;
+    constexpr uint32_t bands = rows / 4;
+    constexpr uint32_t real = tensor_rows < 4 ? tensor_rows : 4;
+    if constexpr (real < 4 && (real <= 2 || bands == 1)) {
         constexpr uint32_t vectors = bands * real;
         sfpu_init();
         MATH((gather_rows<d, bands, real>()));

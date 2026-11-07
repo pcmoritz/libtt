@@ -82,8 +82,7 @@ void kernel_main() {
         qr::make_divisor<groups, dst_d, dst_t, dst_c>(
             dfb::gather, gather_tiles, total_bands, fp8_max_bits, min_scale_bits);
         reconfig_data_format_srca(dfb::gather, dfb::in);
-        // With up to two rows, only those rows of a dense tile's bands.
-        qr::quantize_tiles<e5m2 != 0, dst_d, dst_x0, 32, stride == 4 && rows <= 2 ? rows : 4>(dfb::in, first, n);
+        qr::quantize_tiles<e5m2 != 0, dst_d, dst_x0, 32, rows>(dfb::in, first, n);
         tile_regs_commit();
 
         tile_regs_wait();
