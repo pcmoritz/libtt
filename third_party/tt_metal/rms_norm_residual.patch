@@ -2,7 +2,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,310 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -85,13 +85,14 @@ new file mode 100644
 +
 +    // DST holds four FP32 tiles per acquire.
 +    constexpr uint32_t batch = 4;
-+    // Pack DST tiles 0..n-1 to `cb` as its tiles first..first+n-1.
-+    auto pack_block = [&](uint32_t cb, uint32_t first_tile, uint32_t n) {
++    // Pack DST tiles dst_start..dst_start+n-1 to `cb` as its tiles
++    // first..first+n-1.
++    auto pack_block = [&](uint32_t cb, uint32_t first_tile, uint32_t n, uint32_t dst_start = 0) {
 +        tile_regs_commit();
 +        tile_regs_wait();
 +        pack_reconfig_data_format(cb);
 +        for (uint32_t j = 0; j < n; ++j) {
-+            pack_tile(j, cb, first_tile + j);
++            pack_tile(dst_start + j, cb, first_tile + j);
 +        }
 +        tile_regs_release();
 +    };
@@ -307,13 +308,7 @@ new file mode 100644
 +        copy_tile(cb_divisor, 0, 0);
 +        reconfig_data_format_srca(cb_norm);
 +        qr::quantize_tiles<e5m2, 0, 1, stride, stride == 4 ? rows : 4>(cb_norm, b, n);
-+        tile_regs_commit();
-+        tile_regs_wait();
-+        pack_reconfig_data_format(cb_q);
-+        for (uint32_t j = 0; j < n; ++j) {
-+            pack_tile(1 + j, cb_q, b + j);
-+        }
-+        tile_regs_release();
++        pack_block(cb_q, b, n, /*dst_start=*/1);
 +    }
 +    cb_push_back(cb_q, count);
 +    cb_pop_front(cb_divisor, 1);

@@ -318,39 +318,31 @@ inline void quantize_tiles(uint32_t cb, uint32_t first, uint32_t n) {
         constexpr uint32_t vectors = bands * real;
         sfpu_init();
         MATH((gather_rows<d, bands, real>()));
-        MATH((gather_rows<x0, bands, real>()));
-        if (n > 1) {
-            MATH((gather_rows<x0 + 1, bands, real>()));
-        }
-        if (n > 2) {
-            MATH((gather_rows<x0 + 2, bands, real>()));
-        }
+        MATH((static_for<3>([&](auto i) {
+            if (i < n) {
+                gather_rows<x0 + decltype(i)::value, bands, real>();
+            }
+        })));
         div_binary_tile_init();
-        MATH((divide_vectors<d, x0, vectors>()));
-        if (n > 1) {
-            MATH((divide_vectors<d, x0 + 1, vectors>()));
-        }
-        if (n > 2) {
-            MATH((divide_vectors<d, x0 + 2, vectors>()));
-        }
+        MATH((static_for<3>([&](auto i) {
+            if (i < n) {
+                divide_vectors<d, x0 + decltype(i)::value, vectors>();
+            }
+        })));
         MATH((SFPU_UNARY_INIT(typecast)));
-        MATH((convert_vectors<e5m2, x0, vectors>()));
-        if (n > 1) {
-            MATH((convert_vectors<e5m2, x0 + 1, vectors>()));
-        }
-        if (n > 2) {
-            MATH((convert_vectors<e5m2, x0 + 2, vectors>()));
-        }
+        MATH((static_for<3>([&](auto i) {
+            if (i < n) {
+                convert_vectors<e5m2, x0 + decltype(i)::value, vectors>();
+            }
+        })));
         // The divisor's data rows back in place, for a caller that packs it.
         sfpu_init();
         MATH((scatter_rows<d, bands, real>()));
-        MATH((scatter_rows<x0, bands, real>()));
-        if (n > 1) {
-            MATH((scatter_rows<x0 + 1, bands, real>()));
-        }
-        if (n > 2) {
-            MATH((scatter_rows<x0 + 2, bands, real>()));
-        }
+        MATH((static_for<3>([&](auto i) {
+            if (i < n) {
+                scatter_rows<x0 + decltype(i)::value, bands, real>();
+            }
+        })));
     } else {
         constexpr int iterations = rows <= 16 ? rows / 2 : 8;
         constexpr VectorMode mode = rows <= 16 ? VectorMode::R : VectorMode::RC;
