@@ -7,8 +7,8 @@
 #include "api/dataflow/noc.h"
 
 // Reads each of this core's units: up to `group` heads of one token, which go
-// to rows 0.. of head tiles (zero elsewhere), with the norm weight, cos and
-// sin for q and k heads. A head's row in a QKV tile is a face row (16 values)
+// to rows 0.. of head tiles (zero elsewhere), with the norm weight, and cos and
+// sin of the rotated dims, for q and k heads. A head's row in a QKV tile is a face row (16 values)
 // and the same row of the next face, 512 bytes on; both come in one aligned
 // window and are moved into place by the NOC (copies by the RISC cost several
 // times more). First it builds rms_norm's constant tiles: the reduce scaler
@@ -24,6 +24,7 @@ void kernel_main() {
     constexpr uint32_t cb_zero = get_named_compile_time_arg_val("cb_zero");
     constexpr uint32_t cb_scratch = get_named_compile_time_arg_val("cb_scratch");
     constexpr uint32_t head_tiles = get_named_compile_time_arg_val("head_tiles");
+    constexpr uint32_t rotary_tiles = get_named_compile_time_arg_val("rotary_tiles");
     constexpr uint32_t row_bytes = get_named_compile_time_arg_val("row_bytes");
     constexpr uint32_t alignment = get_named_compile_time_arg_val("alignment");
     constexpr uint32_t window = get_named_compile_time_arg_val("window");
@@ -46,9 +47,11 @@ void kernel_main() {
 
     const uint32_t tile_bytes = get_tile_size(cb_x);
     const uint32_t face_bytes = tile_bytes / 4;
+    // The norm weights are BFLOAT16 or FLOAT32.
+    const uint32_t weight_bytes = get_tile_size(cb_weight);
     const auto qkv = TensorAccessor(qkv_args, qkv_addr, tile_bytes);
-    const auto q_weight = TensorAccessor(q_weight_args, q_weight_addr, tile_bytes);
-    const auto k_weight = TensorAccessor(k_weight_args, k_weight_addr, tile_bytes);
+    const auto q_weight = TensorAccessor(q_weight_args, q_weight_addr, weight_bytes);
+    const auto k_weight = TensorAccessor(k_weight_args, k_weight_addr, weight_bytes);
     const auto cos = TensorAccessor(cos_args, cos_addr, tile_bytes);
     const auto sin = TensorAccessor(sin_args, sin_addr, tile_bytes);
 
@@ -80,10 +83,11 @@ void kernel_main() {
     }
 
     const uint32_t scratch = (get_write_ptr(cb_scratch) + alignment - 1) & ~(alignment - 1);
-    auto read_tiles = [&](const auto& tensor, uint32_t cb, uint32_t first) {
-        cb_reserve_back(cb, head_tiles);
-        for (uint32_t c = 0; c < head_tiles; ++c) {
-            noc_async_read(tensor.get_noc_addr(first + c), get_write_ptr(cb) + c * tile_bytes, tile_bytes);
+    auto read_tiles = [&](const auto& tensor, uint32_t cb, uint32_t first, uint32_t count) {
+        const uint32_t bytes = get_tile_size(cb);
+        cb_reserve_back(cb, count);
+        for (uint32_t c = 0; c < count; ++c) {
+            noc_async_read(tensor.get_noc_addr(first + c), get_write_ptr(cb) + c * bytes, bytes);
         }
     };
     for (;;) {
@@ -92,7 +96,8 @@ void kernel_main() {
             break;
         }
         const uint32_t token = get_arg_val<uint32_t>(arg++);
-        const uint32_t source_head = get_arg_val<uint32_t>(arg++);
+        const uint32_t source_tile = get_arg_val<uint32_t>(arg++);
+        const uint32_t source_stride = get_arg_val<uint32_t>(arg++);
         const uint32_t heads = get_arg_val<uint32_t>(arg++);
         arg += 5;  // the writer's
 
@@ -108,20 +113,20 @@ void kernel_main() {
         for (uint32_t i = 0; i < heads; ++i) {
             for (uint32_t c = 0; c < head_tiles; ++c) {
                 noc_async_read(
-                    qkv.get_noc_addr((source_head + i) * head_tiles + c) + row_offset - skew,
+                    qkv.get_noc_addr(source_tile + i * source_stride + c) + row_offset - skew,
                     scratch + (i * head_tiles + c) * window,
                     window);
             }
         }
         if (kind != kV) {
             if (kind == 0) {
-                read_tiles(q_weight, cb_weight, 0);
+                read_tiles(q_weight, cb_weight, 0, head_tiles);
             } else {
-                read_tiles(k_weight, cb_weight, 0);
+                read_tiles(k_weight, cb_weight, 0, head_tiles);
             }
-            const uint32_t table_tile = (cos_per_token ? token : 0) * head_tiles;
-            read_tiles(cos, cb_cos, table_tile);
-            read_tiles(sin, cb_sin, table_tile);
+            const uint32_t table_tile = (cos_per_token ? token : 0) * rotary_tiles;
+            read_tiles(cos, cb_cos, table_tile, rotary_tiles);
+            read_tiles(sin, cb_sin, table_tile, rotary_tiles);
         }
         noc_async_read_barrier();
 
@@ -140,8 +145,8 @@ void kernel_main() {
         cb_push_back(cb, head_tiles);
         if (kind != kV) {
             cb_push_back(cb_weight, head_tiles);
-            cb_push_back(cb_cos, head_tiles);
-            cb_push_back(cb_sin, head_tiles);
+            cb_push_back(cb_cos, rotary_tiles);
+            cb_push_back(cb_sin, rotary_tiles);
         }
     }
 }

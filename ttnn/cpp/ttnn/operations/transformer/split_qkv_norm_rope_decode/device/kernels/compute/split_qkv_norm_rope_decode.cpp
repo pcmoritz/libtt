@@ -9,18 +9,20 @@
 #include "api/compute/eltwise_unary/rsqrt.h"
 #include "api/compute/reconfig_data_format.h"
 #include "api/compute/reduce.h"
+#include "api/compute/tile_move_copy.h"
 #include "ttnn/operations/normalization/kernel_util/compute/numeric.h"
 
 namespace numeric = norm::kernel_util::compute::numeric;
 
 // For each q or k unit, a tile row of heads (one per row): rms_norm, then
-// rotary_embedding, each step as those ops' kernels take it (layernorm.cpp
-// with RMSNORM and gamma; rotary_embedding.cpp in decode mode), in the same
-// buffer formats, so that every rounding is theirs:
+// rotary_embedding of the leading rotary_tiles, each step as those ops'
+// kernels take it (layernorm.cpp with RMSNORM and gamma; rotary_embedding.cpp
+// in decode mode), in the same buffer formats, so that every rounding is
+// theirs:
 //   x^2 (FP32), its row sum times 1 / width (FP32), + epsilon and rsqrt
-//   (FP32), x * rstd (FP32), * weight (BF16);
+//   (FP32), x * rstd (FP32), * weight (BF16 or FP32, as given);
 //   y of the other half * sin (BF16), y * cos (BF16), their difference or
-//   sum (BF16).
+//   sum (BF16); the tiles past the rotated ones as rms_norm left them.
 void kernel_main() {
     constexpr uint32_t cb_x = get_named_compile_time_arg_val("cb_x");
     constexpr uint32_t cb_weight = get_named_compile_time_arg_val("cb_weight");
@@ -37,8 +39,9 @@ void kernel_main() {
     constexpr uint32_t cb_cos_part = get_named_compile_time_arg_val("cb_cos_part");
     constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
     constexpr uint32_t head_tiles = get_named_compile_time_arg_val("head_tiles");
+    constexpr uint32_t rotary_tiles = get_named_compile_time_arg_val("rotary_tiles");
     constexpr uint32_t head_dim = get_named_compile_time_arg_val("head_dim");
-    constexpr uint32_t half = head_tiles / 2;
+    constexpr uint32_t half = rotary_tiles / 2;
 
     // Packs DST tile 0 as the next tile of `cb`.
     auto pack_one = [](uint32_t cb) {
@@ -114,11 +117,11 @@ void kernel_main() {
         // = [-y2, y1] by whole tiles, cos and sin row 0 for every row. Products
         // round symmetrically, so the first half subtracts y2 * sin.
         cb_wait_front(cb_normed, head_tiles);
-        cb_wait_front(cb_cos, head_tiles);
-        cb_wait_front(cb_sin, head_tiles);
+        cb_wait_front(cb_cos, rotary_tiles);
+        cb_wait_front(cb_sin, rotary_tiles);
         reconfig_data_format(cb_normed, cb_sin);
         pack_reconfig_data_format(cb_out);
-        for (uint32_t j = 0; j < head_tiles; ++j) {
+        for (uint32_t j = 0; j < rotary_tiles; ++j) {
             mul_bcast_rows_init(cb_normed, cb_sin);
             tile_regs_acquire();
             mul_tiles_bcast_rows(cb_normed, cb_sin, j < half ? j + half : j - half, j, 0);
@@ -141,8 +144,16 @@ void kernel_main() {
             cb_pop_front(cb_cos_part, 1);
             cb_pop_front(cb_sin_part, 1);
         }
+        if constexpr (rotary_tiles < head_tiles) {
+            copy_init(cb_normed);
+            for (uint32_t j = rotary_tiles; j < head_tiles; ++j) {
+                tile_regs_acquire();
+                copy_tile(cb_normed, j, 0);
+                pack_one(cb_out);
+            }
+        }
         cb_pop_front(cb_normed, head_tiles);
-        cb_pop_front(cb_cos, head_tiles);
-        cb_pop_front(cb_sin, head_tiles);
+        cb_pop_front(cb_cos, rotary_tiles);
+        cb_pop_front(cb_sin, rotary_tiles);
     }
 }

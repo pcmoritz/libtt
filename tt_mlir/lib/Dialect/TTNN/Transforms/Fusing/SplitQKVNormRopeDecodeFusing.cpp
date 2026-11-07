@@ -70,61 +70,123 @@ std::pair<Value, int64_t> sourceOf(Value value, int64_t flat) {
   }
 }
 
-// Whether `value` holds heads [first, first + heads) of every row of `qkv`
-// [tokens, width], head_dim wide, in (token, head, element) order.
+// Whether `value` holds `heads` heads of every row of `qkv` [tokens, width],
+// head_dim wide, the first at `offset` and each `stride` after the last, in
+// (token, head, element) order.
 bool isHeadView(Value value, Value qkv, int64_t tokens, int64_t width,
-                int64_t first, int64_t heads, int64_t headDim) {
+                int64_t offset, int64_t heads, int64_t stride,
+                int64_t headDim) {
   const int64_t rowElements = heads * headDim;
   if (mlir::cast<RankedTensorType>(value.getType()).getNumElements() !=
       tokens * rowElements) {
     return false;
   }
   for (int64_t i = 0; i < tokens * rowElements; ++i) {
+    const int64_t head = i % rowElements / headDim;
     auto [source, flat] = sourceOf(value, i);
-    if (source != qkv ||
-        flat != i / rowElements * width + first * headDim + i % rowElements) {
+    if (source != qkv || flat != i / rowElements * width + offset +
+                                     head * stride + i % headDim) {
       return false;
     }
   }
   return true;
 }
 
-// A tiled BF16 tensor; interleaved in DRAM if `dram`.
-bool isBF16Tile(Value value, bool dram) {
+// A tiled tensor of BF16 (or FP32 if `float32`); interleaved in DRAM if
+// `dram`.
+bool isTiled(Value value, bool dram, bool float32 = false) {
   auto layout = mlir::dyn_cast_or_null<TTNNLayoutAttr>(
       mlir::cast<RankedTensorType>(value.getType()).getEncoding());
   return layout && layout.isTiled() &&
-         layout.getDataType() == ttcore::DataType::BFloat16 &&
+         (layout.getDataType() == ttcore::DataType::BFloat16 ||
+          (float32 && layout.getDataType() == ttcore::DataType::Float32)) &&
          (!dram || layout.hasInterleavedDRAMTensorMemoryLayout());
+}
+
+// Whether `value`, through reshapes, is a static slice of `source` taking
+// [begin, end) of its last dimension and all of the others.
+bool isLastDimSlice(Value value, Value source, int64_t begin, int64_t end) {
+  auto slice = throughReshapes(value).getDefiningOp<SliceStaticOp>();
+  if (!slice || slice.getInput() != source) {
+    return false;
+  }
+  ArrayRef<int64_t> shape = shapeOf(source);
+  for (size_t i = 0; i < shape.size(); ++i) {
+    const bool last = i + 1 == shape.size();
+    auto attr = [&](ArrayAttr array) {
+      return mlir::cast<IntegerAttr>(array[i]).getInt();
+    };
+    if (attr(slice.getStep()) != 1 ||
+        attr(slice.getBegins()) != (last ? begin : 0) ||
+        attr(slice.getEnds()) != (last ? end : shape[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The heads `rope` rotates: all of their dims, or, in a partial rotary, a
+// slice of their leading ones.
+Value rotatedHeads(RotaryEmbeddingOp rope, int64_t headDim) {
+  const int64_t rotated = shapeOf(rope.getInput()).back();
+  Value x = throughReshapes(rope.getInput());
+  if (rotated == headDim) {
+    return x;
+  }
+  auto slice = x.getDefiningOp<SliceStaticOp>();
+  return slice && isLastDimSlice(x, slice.getInput(), 0, rotated)
+             ? slice.getInput()
+             : Value();
+}
+
+// The rms_norm whose heads `rope` rotates.
+RMSNormOp normOf(RotaryEmbeddingOp rope, int64_t headDim) {
+  Value heads = rotatedHeads(rope, headDim);
+  return heads ? throughReshapes(heads).getDefiningOp<RMSNormOp>() : nullptr;
+}
+
+// Whether `parts`, side by side, are the heads of `norm` with the dims `rope`
+// rotates rotated: its result, then the rest of the heads.
+bool rotates(RotaryEmbeddingOp rope, RMSNormOp norm, ValueRange parts,
+             int64_t headDim) {
+  const int64_t rotated = shapeOf(rope.getInput()).back();
+  return normOf(rope, headDim) == norm && !parts.empty() &&
+         throughReshapes(parts[0]) == rope.getResult() &&
+         (rotated == headDim
+              ? parts.size() == 1
+              : parts.size() == 2 &&
+                    isLastDimSlice(parts[1], rotatedHeads(rope, headDim),
+                                   rotated, headDim));
+}
+
+bool isLastDimConcat(ConcatOp concat) {
+  const int64_t rank = shapeOf(concat.getResult()).size();
+  return concat.getDim() == rank - 1 || concat.getDim() == -1;
 }
 
 } // namespace
 
 mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
     ConcatOp concat, mlir::PatternRewriter &rewriter) const {
-  // concat(k, v) [B, Hkv, D] each, along the last dim.
+  // concat(k, v) [B, Hkv, 2 D] along the last dim, k as rotated parts.
   ArrayRef<int64_t> kvShape = shapeOf(concat.getResult());
-  if (concat.getInputs().size() != 2 || kvShape.size() != 3 ||
-      (concat.getDim() != 2 && concat.getDim() != -1) || kvShape[2] % 2 != 0) {
+  if (kvShape.size() != 3 || !isLastDimConcat(concat) ||
+      concat.getInputs().size() < 2 || kvShape[2] % 2 != 0) {
     return mlir::failure();
   }
   const int64_t tokens = kvShape[0];
   const int64_t numKVHeads = kvShape[1];
   const int64_t headDim = kvShape[2] / 2;
-  Value kHeads = concat.getInputs()[0];
-  Value vHeads = concat.getInputs()[1];
-  if (tokens > 32 || numKVHeads > 32 || headDim % 64 != 0 ||
-      shapeOf(kHeads) != ArrayRef<int64_t>{tokens, numKVHeads, headDim}) {
+  ValueRange kParts = concat.getInputs().drop_back();
+  Value vHeads = concat.getInputs().back();
+  if (tokens > 32 || numKVHeads > 32 || headDim % 32 != 0) {
     return mlir::failure();
   }
 
   // k's rotary embedding and norm, and the projection the norm reads.
-  auto kRope = throughReshapes(kHeads).getDefiningOp<RotaryEmbeddingOp>();
-  if (!kRope) {
-    return mlir::failure();
-  }
-  auto kNorm = throughReshapes(kRope.getInput()).getDefiningOp<RMSNormOp>();
-  if (!kNorm) {
+  auto kRope = throughReshapes(kParts[0]).getDefiningOp<RotaryEmbeddingOp>();
+  RMSNormOp kNorm = kRope ? normOf(kRope, headDim) : nullptr;
+  if (!kNorm || !rotates(kRope, kNorm, kParts, headDim)) {
     return mlir::failure();
   }
   Value qkv = sourceOf(kNorm.getInput(), 0).first;
@@ -138,7 +200,7 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
         rope.getTokenIndex() != kRope.getTokenIndex()) {
       continue;
     }
-    auto norm = throughReshapes(rope.getInput()).getDefiningOp<RMSNormOp>();
+    RMSNormOp norm = normOf(rope, headDim);
     if (!norm || sourceOf(norm.getInput(), 0).first != qkv) {
       continue;
     }
@@ -153,7 +215,8 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
     return mlir::failure();
   }
 
-  // The heads are views of one projection [B, (Hq + 2 Hkv) D].
+  // The heads are views of one projection [B, (s Hq + 2 Hkv) D], each q head
+  // followed by its gate head if s is 2.
   auto qkvType = mlir::cast<RankedTensorType>(qkv.getType());
   const int64_t width = qkvType.getShape().back();
   const int64_t qElements =
@@ -163,26 +226,31 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
     return mlir::failure();
   }
   const int64_t numQHeads = qElements / (tokens * headDim);
-  if (width != (numQHeads + 2 * numKVHeads) * headDim ||
+  const int64_t qStride = (width / headDim - 2 * numKVHeads) / numQHeads;
+  const int64_t kOffset = numQHeads * qStride * headDim;
+  if ((qStride != 1 && qStride != 2) ||
+      width != (qStride * numQHeads + 2 * numKVHeads) * headDim ||
       !isHeadView(qNorm.getInput(), qkv, tokens, width, 0, numQHeads,
-                  headDim) ||
-      !isHeadView(kNorm.getInput(), qkv, tokens, width, numQHeads, numKVHeads,
-                  headDim) ||
-      !isHeadView(vHeads, qkv, tokens, width, numQHeads + numKVHeads,
-                  numKVHeads, headDim)) {
+                  qStride * headDim, headDim) ||
+      !isHeadView(kNorm.getInput(), qkv, tokens, width, kOffset, numKVHeads,
+                  headDim, headDim) ||
+      !isHeadView(vHeads, qkv, tokens, width, kOffset + numKVHeads * headDim,
+                  numKVHeads, headDim, headDim)) {
     return mlir::failure();
   }
 
-  // The rotary embeddings take [1, B, H, D] with token b's row of cos and
+  // The rotary embeddings take [1, B, H, R] with token b's row of cos and
   // sin: row 0 by token_index 0 for one token, one row per token for several.
   Value cos = qRope.getCosCache();
   Value sin = qRope.getSinCache();
+  const int64_t rotated = shapeOf(qRope.getInput()).back();
   const int64_t tableRows = tokens == 1 ? 1 : tokens;
-  if (shapeOf(qRope.getInput()) !=
-          ArrayRef<int64_t>{1, tokens, numQHeads, headDim} ||
+  if (rotated % 64 != 0 || shapeOf(kRope.getInput()).back() != rotated ||
+      shapeOf(qRope.getInput()) !=
+          ArrayRef<int64_t>{1, tokens, numQHeads, rotated} ||
       shapeOf(kRope.getInput()) !=
-          ArrayRef<int64_t>{1, tokens, numKVHeads, headDim} ||
-      shapeOf(cos) != ArrayRef<int64_t>{1, tableRows, 1, headDim} ||
+          ArrayRef<int64_t>{1, tokens, numKVHeads, rotated} ||
+      shapeOf(cos) != ArrayRef<int64_t>{1, tableRows, 1, rotated} ||
       shapeOf(sin) != shapeOf(cos) ||
       (tokens == 1 ? qRope.getTokenIndex() != std::optional<uint32_t>(0)
                    : qRope.getTokenIndex().has_value())) {
@@ -190,22 +258,40 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
   }
   Value qWeight = qNorm.getWeight();
   Value kWeight = kNorm.getWeight();
-  for (Value operand : {qkv, qWeight, kWeight, cos, sin}) {
-    if (!isBF16Tile(operand, /*dram=*/true)) {
+  for (Value operand : {qkv, cos, sin}) {
+    if (!isTiled(operand, /*dram=*/true)) {
       return mlir::failure();
     }
   }
+  // The norm weights are BF16 or, as 1 + w of a zero-centered norm, FP32.
   for (Value weight : {qWeight, kWeight}) {
-    if (mlir::cast<RankedTensorType>(weight.getType()).getNumElements() !=
-        headDim) {
+    if (!isTiled(weight, /*dram=*/true, /*float32=*/true) ||
+        mlir::cast<RankedTensorType>(weight.getType()).getNumElements() !=
+            headDim) {
       return mlir::failure();
     }
+  }
+  if (mlir::cast<RankedTensorType>(qWeight.getType()).getElementType() !=
+      mlir::cast<RankedTensorType>(kWeight.getType()).getElementType()) {
+    return mlir::failure();
   }
 
-  // q: reshapes, a pad of the last dim with +0 (the fused kernel's zeros),
-  // reshapes to [1, B, Hq, q_width].
-  auto pad =
-      dyn_cast_or_null<PadOp>(getSingleUser(alongReshapes(qRope.getResult())));
+  // q: its rotated parts, a pad of the last dim with +0 (the fused kernel's
+  // zeros), reshapes to [1, B, Hq, q_width].
+  Value qHeads = alongReshapes(qRope.getResult());
+  SmallVector<Value> qParts{qHeads};
+  if (rotated < headDim) {
+    auto qConcat = dyn_cast_or_null<ConcatOp>(getSingleUser(qHeads));
+    if (!qConcat || !isLastDimConcat(qConcat)) {
+      return mlir::failure();
+    }
+    qParts.assign(qConcat.getInputs().begin(), qConcat.getInputs().end());
+    qHeads = alongReshapes(qConcat.getResult());
+  }
+  if (!rotates(qRope, qNorm, qParts, headDim)) {
+    return mlir::failure();
+  }
+  auto pad = dyn_cast_or_null<PadOp>(getSingleUser(qHeads));
   if (!pad || !pad.getValue().isPosZero()) {
     return mlir::failure();
   }
@@ -219,66 +305,22 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
   const int64_t qWidth = shapeOf(qOut).back();
   if (shapeOf(pad.getInput()).back() != headDim || qWidth % 32 != 0 ||
       shapeOf(qOut) != ArrayRef<int64_t>{1, tokens, numQHeads, qWidth} ||
-      !isBF16Tile(qOut, /*dram=*/false)) {
+      !isTiled(qOut, /*dram=*/false)) {
     return mlir::failure();
   }
-  if (alongReshapes(kRope.getResult()) != kHeads) {
+  // k and v of all tokens: the concat reshaped to [1, B, Hkv, 2 D].
+  auto kvReshape = dyn_cast_or_null<ReshapeOp>(getSingleUser(concat.getResult()));
+  Value kvOut = kvReshape ? alongReshapes(kvReshape.getResult()) : Value();
+  if (!kvOut ||
+      shapeOf(kvOut) !=
+          ArrayRef<int64_t>{1, tokens, numKVHeads, 2 * headDim} ||
+      !isTiled(kvOut, /*dram=*/false)) {
     return mlir::failure();
-  }
-  // k and v: of all tokens, the concat reshaped to [1, B, Hkv, 2 D] (one
-  // token's alike), or of each token, a slice of its row reshaped to
-  // [1, 1, Hkv, 2 D].
-  SmallVector<Value> kvOut;
-  Operation *reshape = getSingleUser(concat.getResult());
-  if (reshape && isa<ReshapeOp>(reshape)) {
-    Value out = alongReshapes(reshape->getResult(0));
-    if (shapeOf(out) !=
-            ArrayRef<int64_t>{1, tokens, numKVHeads, 2 * headDim} ||
-        !isBF16Tile(out, /*dram=*/false)) {
-      return mlir::failure();
-    }
-    kvOut.push_back(out);
-  } else {
-    kvOut.resize(tokens);
-    for (Operation *user : concat.getResult().getUsers()) {
-      auto slice = dyn_cast<SliceStaticOp>(user);
-      if (!slice) {
-        return mlir::failure();
-      }
-      auto attr = [](ArrayAttr array, int i) {
-        return mlir::cast<IntegerAttr>(array[i]).getInt();
-      };
-      const int64_t token = attr(slice.getBegins(), 0);
-      if (attr(slice.getEnds(), 0) != token + 1 ||
-          attr(slice.getBegins(), 1) != 0 || attr(slice.getBegins(), 2) != 0 ||
-          attr(slice.getEnds(), 1) != numKVHeads ||
-          attr(slice.getEnds(), 2) != 2 * headDim ||
-          attr(slice.getStep(), 0) != 1 || attr(slice.getStep(), 1) != 1 ||
-          attr(slice.getStep(), 2) != 1) {
-        return mlir::failure();
-      }
-      if (token < 0 || token >= tokens || kvOut[token]) {
-        return mlir::failure();
-      }
-      Value out = alongReshapes(slice.getResult());
-      if (shapeOf(out) != ArrayRef<int64_t>{1, 1, numKVHeads, 2 * headDim} ||
-          !isBF16Tile(out, /*dram=*/false)) {
-        return mlir::failure();
-      }
-      kvOut[token] = out;
-    }
-  }
-  for (Value out : kvOut) {
-    if (!out) {
-      return mlir::failure();
-    }
   }
   // Build the fused op before the first user of its results, after its
   // operands.
-  SmallVector<Value> outputs{qOut};
-  outputs.append(kvOut.begin(), kvOut.end());
   Operation *first = nullptr;
-  for (Value out : outputs) {
+  for (Value out : {qOut, kvOut}) {
     for (Operation *user : out.getUsers()) {
       if (user->getBlock() != concat->getBlock()) {
         return mlir::failure();
@@ -306,18 +348,12 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
         SmallVector<int64_t>{tokens, width}, rewriter,
         ttmlir::utils::appendLocationSuffix(qRope.getLoc(), "_qkv_rows"));
   }
-  SmallVector<Type> kvTypes;
-  for (Value out : kvOut) {
-    kvTypes.push_back(out.getType());
-  }
   auto fused = rewriter.create<SplitQKVNormRopeDecodeOp>(
-      qRope.getLoc(), qOut.getType(), kvTypes, input, qWeight, kWeight, cos,
-      sin, rewriter.getUI32IntegerAttr(numQHeads),
+      qRope.getLoc(), qOut.getType(), kvOut.getType(), input, qWeight, kWeight,
+      cos, sin, rewriter.getUI32IntegerAttr(numQHeads),
       rewriter.getUI32IntegerAttr(numKVHeads), qNorm.getEpsilonAttr());
   rewriter.replaceAllUsesWith(qOut, fused.getQuery());
-  for (auto [out, keyValue] : llvm::zip(kvOut, fused.getKeyValues())) {
-    rewriter.replaceAllUsesWith(out, keyValue);
-  }
+  rewriter.replaceAllUsesWith(kvOut, fused.getKeyValues());
   // The separate ops are now unused, and the rewrite driver erases them (TTNN
   // ops are pure); any that still feed other ops stay.
   return mlir::success();
@@ -329,8 +365,8 @@ namespace mlir::tt::ttnn {
 
 namespace {
 
-// Writes the k and v of every token where the ops that read them want them:
-// the workarounds, after fusing, move each into the paged cache update's L1
+// Writes the k and v of every token where the op that reads them wants them:
+// the workarounds, after fusing, move them into the paged cache update's L1
 // shard.
 class WriteKeyValuesInPlace
     : public mlir::OpRewritePattern<SplitQKVNormRopeDecodeOp> {
@@ -340,35 +376,21 @@ public:
   mlir::LogicalResult
   matchAndRewrite(SplitQKVNormRopeDecodeOp op,
                   mlir::PatternRewriter &rewriter) const override {
-    // One memory config for all of them, as the op takes.
-    SmallVector<ToMemoryConfigOp> moves;
-    for (Value keyValue : op.getKeyValues()) {
-      auto move = keyValue.hasOneUse()
-                      ? dyn_cast<ToMemoryConfigOp>(*keyValue.getUsers().begin())
-                      : nullptr;
-      if (!move || move.getType() == keyValue.getType() ||
-          (!moves.empty() && move.getType() != moves.front().getType())) {
-        return mlir::failure();
-      }
-      auto layout = mlir::dyn_cast_or_null<TTNNLayoutAttr>(
-          move.getType().getEncoding());
-      if (!layout || !layout.isTiled() ||
-          layout.getDataType() != ttcore::DataType::BFloat16) {
-        return mlir::failure();
-      }
-      moves.push_back(move);
-    }
-    if (moves.empty()) {
+    Value keyValues = op.getKeyValues();
+    auto move = keyValues.hasOneUse() ? dyn_cast<ToMemoryConfigOp>(
+                                            *keyValues.getUsers().begin())
+                                      : nullptr;
+    if (!move || move.getType() == keyValues.getType()) {
       return mlir::failure();
     }
-    rewriter.modifyOpInPlace(op, [&] {
-      for (Value keyValue : op.getKeyValues()) {
-        keyValue.setType(moves.front().getType());
-      }
-    });
-    for (auto [keyValue, move] : llvm::zip(op.getKeyValues(), moves)) {
-      rewriter.replaceOp(move, keyValue);
+    auto layout =
+        mlir::dyn_cast_or_null<TTNNLayoutAttr>(move.getType().getEncoding());
+    if (!layout || !layout.isTiled() ||
+        layout.getDataType() != ttcore::DataType::BFloat16) {
+      return mlir::failure();
     }
+    rewriter.modifyOpInPlace(op, [&] { keyValues.setType(move.getType()); });
+    rewriter.replaceOp(move, keyValues);
     return mlir::success();
   }
 };
