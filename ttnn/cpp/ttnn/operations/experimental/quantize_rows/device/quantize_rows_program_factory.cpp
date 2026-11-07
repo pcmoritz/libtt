@@ -57,7 +57,8 @@ ttnn::device_operation::ProgramArtifacts QuantizeRowsProgramFactory::create_prog
     const bool e5m2 = params.dtype == tt::tt_metal::DataType::FP8_E5M2;
     const float fp8_max = e5m2 ? 57344.0f : 448.0f;
 
-    // Dense tiles split evenly over the cores, the first ones one longer.
+    // Dense tiles split evenly over the cores, the first ones one longer. With
+    // more cores than dense tiles the last ones get none and only exchange.
     const uint32_t base = plan.dense / num_cores;
     const uint32_t extra = plan.dense % num_cores;
     const uint32_t max_dense = base + (extra != 0 ? 1 : 0);
