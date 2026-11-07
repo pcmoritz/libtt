@@ -27,9 +27,10 @@ void kernel_main() {
     constexpr uint32_t element_bytes = get_compile_time_arg_val(1);
     constexpr uint32_t batch_tiles = get_compile_time_arg_val(2);
     constexpr uint32_t num_cores = get_compile_time_arg_val(3);
-    constexpr bool has_floor = get_compile_time_arg_val(4) != 0;
-    constexpr uint32_t floor_key = get_compile_time_arg_val(5);
-    constexpr auto input_args = TensorAccessorArgs<6>();
+    // The floor's key, or 0, the lowest: with index 0 and a strict >, the first
+    // maximum wins, and index 0 where no element exceeds the floor.
+    constexpr uint32_t floor_key = get_compile_time_arg_val(4);
+    constexpr auto input_args = TensorAccessorArgs<5>();
     constexpr auto output_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
     constexpr uint32_t face_bytes = 256 * element_bytes;
     constexpr uint32_t row_bytes = 16 * element_bytes;
@@ -57,8 +58,8 @@ void kernel_main() {
     uint32_t best_key[rows];
     uint32_t best_index[rows];
     for (uint32_t row = 0; row < rows; ++row) {
-        best_key[row] = has_floor ? floor_key : 0;
-        best_index[row] = has_floor ? 0 : 0xFFFFFFFFu;
+        best_key[row] = floor_key;
+        best_index[row] = 0;
     }
 
     for (uint32_t first = start; first < start + count; first += batch_tiles) {

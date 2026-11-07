@@ -52,7 +52,8 @@ protected:
         }
         const TensorSpec spec(shape, TensorLayout(dtype, PageConfig(Layout::TILE), {}));
         const auto input = ttnn::Tensor::from_vector(values, spec).to_device(mesh_device_.get());
-        const auto output = ttnn::experimental::row_argmax(input, /*keep_dim=*/false, floor, std::nullopt);
+        const auto output = ttnn::experimental::row_argmax(input, floor, std::nullopt);
+        EXPECT_EQ(output.logical_shape().rank(), shape.rank() - 1);
         const auto got = output.cpu().to_vector<uint32_t>();
         ASSERT_EQ(got.size(), rows);
         for (uint32_t row = 0; row < rows; ++row) {

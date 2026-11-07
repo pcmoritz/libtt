@@ -94,7 +94,10 @@ def test_sums_over_a_unit_dimension():
 @pytest.mark.parametrize("dtype", [np.float32, jnp.bfloat16])
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize("rows,width", [(1, 248320), (4, 2048), (20, 96)])
-def test_index_of_a_tiled_row(dtype, trace, rows, width, tmp_path):
+# O1's optimizer must keep the input tiled too (its own argmax rule wants it
+# row-major).
+@pytest.mark.parametrize("level", ["O0", "O1"])
+def test_index_of_a_tiled_row(dtype, trace, rows, width, level, tmp_path):
     """torch_tpu's greedy sampling argmax: only the index of a reduce from
     finfo.min. The rows of one tile row stay tiled and libtt's row argmax takes
     the init as its floor, with no maximum of the input against it: index 0
@@ -110,7 +113,7 @@ def test_index_of_a_tiled_row(dtype, trace, rows, width, tmp_path):
     x = x.astype(dtype)
     run = jax.jit(
         lambda x: _arg_reduce(x, True, info.min, nan_aware=True)[1],
-        compiler_options={"optimization_level": "O0", "enable_trace": str(trace).lower(), "export_path": str(tmp_path)},
+        compiler_options={"optimization_level": level, "enable_trace": str(trace).lower(), "export_path": str(tmp_path)},
     )
     got = np.asarray(run(jax.device_put(x, jax.devices("tt")[0])))
     xf = np.asarray(x, np.float32)

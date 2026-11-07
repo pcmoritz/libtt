@@ -24,7 +24,6 @@ namespace ttnn::prim {
 namespace {
 
 struct RowArgmaxParams {
-    bool keep_dim = false;
     std::optional<float> floor;
     MemoryConfig memory_config;
 };
@@ -72,9 +71,6 @@ RowArgmaxOperation::spec_return_value_t RowArgmaxOperation::compute_output_specs
     const operation_attributes_t& params, const tensor_args_t& in) {
     const auto& shape = in.input.logical_shape();
     ttsl::SmallVector<uint32_t> dims(shape.cbegin(), shape.cend() - 1);
-    if (params.keep_dim) {
-        dims.push_back(1);
-    }
     return TensorSpec(
         Shape(dims), TensorLayout(DataType::UINT32, PageConfig(Layout::ROW_MAJOR), params.memory_config));
 }
@@ -125,7 +121,7 @@ ProgramDescriptor RowArgmaxOperation::create_descriptor(
         static_cast<uint32_t>(input.element_size()),
         batch_tiles,
         num_cores,
-        params.floor.has_value(),
+        // Without a floor, the lowest key: the first maximum wins all the same.
         params.floor.has_value() ? key_of(*params.floor) : 0u};
     TensorAccessorArgs(input).append_to(compile_args);
     TensorAccessorArgs(output).append_to(compile_args);
@@ -166,12 +162,11 @@ bool is_row_argmax(const ttnn::Tensor& input, int dim) {
 
 ttnn::Tensor row_argmax(
     const ttnn::Tensor& input,
-    bool keep_dim,
     std::optional<float> floor,
     const std::optional<tt::tt_metal::MemoryConfig>& memory_config) {
     using Op = prim::RowArgmaxOperation;
     return device_operation::launch<Op>(
-        {.keep_dim = keep_dim, .floor = floor, .memory_config = memory_config.value_or(DRAM_MEMORY_CONFIG)},
+        {.floor = floor, .memory_config = memory_config.value_or(DRAM_MEMORY_CONFIG)},
         {.input = input});
 }
 
