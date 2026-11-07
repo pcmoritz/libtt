@@ -1,0 +1,190 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -2439,6 +2439,23 @@ def TTIR_BatchNormTrainingOp : TTIR_NamedOp<"batch_norm_training", [AttrSizedOpe
+   let hasVerifier = 1;
+ }
+ 
++def TTIR_RMSNormGatedOp : TTIR_NamedOp<"rms_norm_gated"> {
++  let summary = "RMS normalization of the last dimension with a SiLU gate";
++  let description = [{
++    output = input * rsqrt(mean(input^2) + epsilon) * weight * silu(gate) over
++    each group of the weight's D columns of the last dimension, in FP32: the
++    gated RMS norm of linear-attention layers such as Qwen3.5 and Qwen3.8's
++    gated DeltaNet output, a group per head. input has the output's shape;
++    gate has its leading dimensions and is read from column gate_offset on.
++  }];
++  let arguments = (ins AnyRankedTensor:$input,
++                       AnyRankedTensor:$gate,
++                       AnyRankedTensor:$weight,
++                       DefaultValuedAttr<F32Attr, "1e-05">:$epsilon,
++                       DefaultValuedAttr<I64Attr, "0">:$gate_offset);
++  let results = (outs AnyRankedTensor:$output);
++}
++
+ def TTIR_RMSNormResidualOp : TTIR_NamedOp<"rms_norm_residual"> {
+   let summary = "RMS normalization of a residual sum that also returns the sum";
+   let description = [{
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -2888,6 +2888,19 @@ def TTNN_BatchNormTrainingOp : TTNN_Op<"batch_norm_training", [AttrSizedOperandS
+     let hasVerifier = 1;
+ }
+ 
++def TTNN_RMSNormGatedOp : TTNN_Op<"rms_norm_gated", [OpModelExempt]> {
++  let summary = "RMS normalization of the last dimension with a SiLU gate";
++  let description = [{
++    ttnn::experimental::rms_norm_gated, see ttir.rms_norm_gated.
++  }];
++  let arguments = (ins AnyRankedTensor:$input,
++                       AnyRankedTensor:$gate,
++                       AnyRankedTensor:$weight,
++                       DefaultValuedAttr<F32Attr, "1e-05">:$epsilon,
++                       DefaultValuedAttr<I64Attr, "0">:$gate_offset);
++  let results = (outs AnyRankedTensor:$output);
++}
++
+ def TTNN_RMSNormResidualOp : TTNN_Op<"rms_norm_residual", [OpModelExempt]> {
+   let summary = "RMS normalization of a residual sum that also returns the sum";
+   let description = [{
+diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/ttmlir/Target/TTNN/operations/normalization.fbs
+--- a/include/ttmlir/Target/TTNN/operations/normalization.fbs
++++ b/include/ttmlir/Target/TTNN/operations/normalization.fbs
+@@ -61,6 +61,15 @@ table DitRMSNormUnaryFusedOp {
+   out: tt.target.ttnn.TensorRef;
+ }
+ 
++table RMSNormGatedOp {
++  input: tt.target.ttnn.TensorRef;
++  gate: tt.target.ttnn.TensorRef;
++  weight: tt.target.ttnn.TensorRef;
++  epsilon: float;
++  out: tt.target.ttnn.TensorRef;
++  gate_offset: uint32;
++}
++
+ table RMSNormResidualOp {
+   input: tt.target.ttnn.TensorRef;
+   residual: tt.target.ttnn.TensorRef;
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -156,6 +156,7 @@ union OpType {
+   RMSNormPreAllGatherOp,
+   RMSNormOp,
+   RMSNormResidualOp,
++  RMSNormGatedOp,
+   ReshapeOp,
+   SamplingOp,
+   ScaledDotProductAttentionOp,
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -1294,6 +1294,22 @@ public:
+   }
+ };
+ 
++class RMSNormGatedOpConversionPattern
++    : public OpConversionPattern<ttir::RMSNormGatedOp> {
++public:
++  using OpConversionPattern<ttir::RMSNormGatedOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(ttir::RMSNormGatedOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    rewriter.replaceOpWithNewOp<ttnn::RMSNormGatedOp>(
++        op, this->getTypeConverter()->convertType(op.getType()),
++        adaptor.getInput(), adaptor.getGate(), adaptor.getWeight(),
++        op.getEpsilonAttr(), op.getGateOffsetAttr());
++    return success();
++  }
++};
++
+ class RMSNormResidualOpConversionPattern
+     : public OpConversionPattern<ttir::RMSNormResidualOp> {
+ public:
+@@ -4208,6 +4224,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            AdamWOpConversionPattern,
+            RMSNormOpConversionPattern,
+            RMSNormResidualOpConversionPattern,
++           RMSNormGatedOpConversionPattern,
+            DistributedRMSNormOpConversionPattern,
+            DistributedLayerNormOpConversionPattern,
+            LayerNormOpConversionPattern,
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -6,6 +6,7 @@
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+ #include "ttmlir/Dialect/TTCore/IR/Utils.h"
+ #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
++#include "ttmlir/Dialect/TTIR/Transforms/Fusing/RMSNormGatedFusing.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Fusing/SDPAFusingPattern.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.h"
+@@ -4739,6 +4740,7 @@ public:
+       patterns.add<NormalizeRMSNormFusionPattern>(&getContext());
+       patterns.add<RMSNormResidualFusionPattern>(&getContext());
+       patterns.add<RMSNormResidualQuantizeFusionPattern>(&getContext());
++      patterns.add<fusing::RMSNormGatedFusing>(&getContext());
+ 
+       patterns.add<GeluFusionPattern>(&getContext());
+       patterns.add<Relu6FusionPattern>(&getContext());
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -2063,6 +2063,20 @@ createOp(FlatbufferObjectCache &cache, DitRMSNormUnaryFusedOp op) {
+       computeConfig.value_or(0), output);
+ }
+ 
++::flatbuffers::Offset<::tt::target::ttnn::RMSNormGatedOp>
++createOp(FlatbufferObjectCache &cache, RMSNormGatedOp op) {
++  auto tensor = [&](Value value) {
++    return cache.at<::tt::target::ttnn::TensorRef>(
++        getOperandThroughDPSOps(value));
++  };
++  return ::tt::target::ttnn::CreateRMSNormGatedOp(
++      *cache.fbb, tensor(op.getInput()), tensor(op.getGate()),
++      tensor(op.getWeight()), op.getEpsilon().convertToFloat(),
++      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
++                                  std::nullopt),
++      static_cast<uint32_t>(op.getGateOffset()));
++}
++
+ ::flatbuffers::Offset<::tt::target::ttnn::RMSNormResidualOp>
+ createOp(FlatbufferObjectCache &cache, RMSNormResidualOp op) {
+   auto tensor = [&](Value value) {
+@@ -5755,6 +5769,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createOp(cache, ditRMSNormUnaryFusedOp),
+                            debugString, locInfo);
+   }
++  if (auto rmsNormGatedOp = dyn_cast<RMSNormGatedOp>(op)) {
++    return createOperation(cache, createOp(cache, rmsNormGatedOp), debugString,
++                           locInfo);
++  }
+   if (auto rmsNormResidualOp = dyn_cast<RMSNormResidualOp>(op)) {
+     return createOperation(cache, createOp(cache, rmsNormResidualOp),
+                            debugString, locInfo);
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -133,6 +133,7 @@ void logOpRuntimeId(const char *debugInfo) {
+ #include "operations/normalization/layer_norm_post_all_gather.h"
+ #include "operations/normalization/layer_norm_pre_all_gather.h"
+ #include "operations/normalization/rms_norm.h"
++#include "operations/normalization/rms_norm_gated.h"
+ #include "operations/normalization/rms_norm_residual.h"
+ #include "operations/normalization/rms_norm_pre_all_gather.h"
+ #include "operations/normalization/softmax.h"
+@@ -575,6 +576,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+     return operations::dit_rms_norm_unary_fused::run(
+         op->type_as_DitRMSNormUnaryFusedOp(), getContext());
+   }
++  case ::tt::target::ttnn::OpType::RMSNormGatedOp: {
++    return operations::rms_norm_gated::run(op->type_as_RMSNormGatedOp(),
++                                           getContext());
++  }
+   case ::tt::target::ttnn::OpType::RMSNormResidualOp: {
+     return operations::rms_norm_residual::run(op->type_as_RMSNormResidualOp(),
+                                               getContext());
