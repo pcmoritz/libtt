@@ -13,7 +13,7 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/Utils.h b/include/ttmlir/Dialect/T
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -6489,6 +6489,60 @@ def TTIR_ScaledDotProductAttentionOp : TTIR_NamedOp<"scaled_dot_product_attentio
+@@ -6492,6 +6492,68 @@ def TTIR_ScaledDotProductAttentionOp : TTIR_NamedOp<"scaled_dot_product_attentio
    let hasVerifier = 1;
  }
  
@@ -30,6 +30,11 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +
 +def TTIR_GatedDeltaDecodeOp : TTIR_InplaceOp<"gated_delta_decode", [TTIR_CacheOpInterface]> {
 +  let summary = "gated delta decode.";
++  let description = [{
++    The heads' gate logits are columns beta_offset and delta_time_offset on
++    of beta_logits and delta_time, which can thus be one tensor: the
++    canonicalizer reads slices of a tensor's columns in place.
++  }];
 +  let arguments = (ins Arg<AnyRankedTensor, "mutable state pool", [MemWrite]>:$cache,
 +                       AnyRankedTensor:$qkv,
 +                       AnyRankedTensor:$beta_logits,
@@ -38,8 +43,11 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$dt_bias,
 +                       AnyRankedTensor:$state_indices,
 +                       AnyRankedTensor:$has_initial_state,
-+                       Optional<AnyRankedTensor>:$state_slots);
++                       Optional<AnyRankedTensor>:$state_slots,
++                       DefaultValuedAttr<I64Attr, "0">:$beta_offset,
++                       DefaultValuedAttr<I64Attr, "0">:$delta_time_offset);
 +  let results = (outs AnyRankedTensor:$output);
++  let hasCanonicalizer = 1;
 +}
 +
 +def TTIR_CausalConv1dUpdateOp : TTIR_InplaceOp<"causal_conv1d_update", [TTIR_CacheOpInterface]> {
@@ -77,7 +85,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4806,6 +4806,64 @@ def TTNN_ScaledDotProductAttentionOp : TTNN_Op<"scaled_dot_product_attention", [
+@@ -4815,6 +4815,66 @@ def TTNN_ScaledDotProductAttentionOp : TTNN_Op<"scaled_dot_product_attention", [
      let hasVerifier = 1;
  }
  
@@ -106,7 +114,9 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$dt_bias,
 +                       AnyRankedTensor:$state_indices,
 +                       AnyRankedTensor:$has_initial_state,
-+                       Optional<AnyRankedTensor>:$state_slots);
++                       Optional<AnyRankedTensor>:$state_slots,
++                       DefaultValuedAttr<I64Attr, "0">:$beta_offset,
++                       DefaultValuedAttr<I64Attr, "0">:$delta_time_offset);
 +  let results = (outs AnyRankedTensor:$output);
 +}
 +
@@ -145,7 +155,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
 --- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
-@@ -81,6 +81,58 @@ table ScaledDotProductAttentionOp {
+@@ -81,6 +81,61 @@ table ScaledDotProductAttentionOp {
    memcfg: tt.target.ttnn.MemoryConfig;
  }
  
@@ -176,6 +186,9 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 +  output: tt.target.ttnn.TensorRef;
 +  // Optional [B, T] slots for the state after each of T steps per state.
 +  state_slots: tt.target.ttnn.TensorRef;
++  // The first columns of beta_logits and delta_time with the heads' logits.
++  beta_offset: uint32;
++  delta_time_offset: uint32;
 +}
 +
 +table CausalConv1dUpdateOp {
@@ -222,7 +235,7 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10123,6 +10123,88 @@ public:
+@@ -9444,6 +9444,88 @@ public:
  } // namespace
  
  namespace {
@@ -311,7 +324,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  class StableHLOPagedFillCacheConversionPattern
      : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
    using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
-@@ -12108,6 +12190,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
+@@ -11420,6 +11502,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
                                                                  ctx);
    patterns.add<StableHLOToTTIRCollectivePermuteOpConversionPattern>(
        typeConverter, ctx);
@@ -323,7 +336,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -3443,6 +3443,88 @@ public:
+@@ -3446,6 +3446,89 @@ public:
  } // namespace
  
  namespace {
@@ -339,7 +352,8 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +                                                      types))) {
 +      return failure();
 +    }
-+    rewriter.replaceOpWithNewOp<DstOp>(op, types, adaptor.getOperands());
++    rewriter.replaceOpWithNewOp<DstOp>(op, types, adaptor.getOperands(),
++                                       op->getAttrs());
 +    return success();
 +  }
 +};
@@ -412,7 +426,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  class PagedFlashMultiLatentAttentionDecodeOpConversionPattern
      : public OpConversionPattern<ttir::PagedFlashMultiLatentAttentionDecodeOp> {
  public:
-@@ -4012,6 +4094,11 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -4015,6 +4098,11 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
             ScaledDotProductAttentionDecodeOpConversionPattern,
             PagedScaledDotProductAttentionDecodeOpConversionPattern,
             ChunkedScaledDotProductAttentionOpConversionPattern,
@@ -424,6 +438,116 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
             PagedFlashMultiLatentAttentionDecodeOpConversionPattern,
             SplitQueryKeyValueAndSplitHeadsOpConversionPattern,
             GeluBackwardOpConversionPattern,
+diff --git a/lib/Dialect/TTIR/IR/TTIRRecurrentOps.cpp b/lib/Dialect/TTIR/IR/TTIRRecurrentOps.cpp
+new file mode 100644
+--- /dev/null
++++ b/lib/Dialect/TTIR/IR/TTIRRecurrentOps.cpp
+@@ -0,0 +1,105 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++// The gated DeltaNet decode op reads its gate logits' columns in place:
++// slices of a projection's columns fold into it.
++//
++// Its FP32 parameters stay as the graph widens them: the RMS norm fusion of
++// the gated norm after it narrows the op's FP32 output to the element type
++// its typecast operands come from.
++
++#include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
++
++#include "mlir/IR/PatternMatch.h"
++
++#include <optional>
++#include <utility>
++
++namespace mlir::tt::ttir {
++namespace {
++
++ArrayRef<int64_t> shapeOf(Value value) {
++  return mlir::cast<RankedTensorType>(value.getType()).getShape();
++}
++
++int64_t rowsOf(ArrayRef<int64_t> shape) {
++  int64_t rows = 1;
++  for (int64_t dim : shape.drop_back()) {
++    rows *= dim;
++  }
++  return rows;
++}
++
++// The tensor of the same rank as `value` and the first of its columns that
++// `value` holds in each of its rows: `value` is, through reshapes, a step-1
++// slice of the last dimension of a tensor with the same rows (also through
++// reshapes that keep the rows and their width).
++std::optional<std::pair<Value, int64_t>> columnsOf(Value value) {
++  ArrayRef<int64_t> shape = shapeOf(value);
++  Value sliced = value;
++  while (auto reshape = sliced.getDefiningOp<ReshapeOp>()) {
++    sliced = reshape.getInput();
++  }
++  auto slice = sliced.getDefiningOp<SliceStaticOp>();
++  if (shape.empty() || !slice) {
++    return std::nullopt;
++  }
++  ArrayRef<int64_t> source = shapeOf(slice.getInput());
++  const int64_t last = static_cast<int64_t>(source.size()) - 1;
++  auto at = [](ArrayAttr values, int64_t dim) {
++    return mlir::cast<IntegerAttr>(values[dim]).getInt();
++  };
++  for (int64_t dim = 0; dim <= last; ++dim) {
++    if (at(slice.getStep(), dim) != 1 ||
++        (dim < last && (at(slice.getBegins(), dim) != 0 ||
++                        at(slice.getEnds(), dim) != source[dim]))) {
++      return std::nullopt;
++    }
++  }
++  const int64_t begin = at(slice.getBegins(), last);
++  if (rowsOf(shape) != rowsOf(source) ||
++      shape.back() != at(slice.getEnds(), last) - begin) {
++    return std::nullopt;
++  }
++  Value whole = slice.getInput();
++  while (auto reshape = whole.getDefiningOp<ReshapeOp>()) {
++    ArrayRef<int64_t> input = shapeOf(reshape.getInput());
++    if (input.empty() || input.back() != source.back() ||
++        rowsOf(input) != rowsOf(source)) {
++      break;
++    }
++    whole = reshape.getInput();
++  }
++  if (shapeOf(whole).size() != shape.size()) {
++    return std::nullopt;
++  }
++  return std::pair(whole, begin);
++}
++
++} // namespace
++
++void GatedDeltaDecodeOp::getCanonicalizationPatterns(
++    RewritePatternSet &patterns, MLIRContext *context) {
++  // NOLINTBEGIN(clang-analyzer-core.StackAddressEscape)
++  patterns.add(+[](GatedDeltaDecodeOp op, PatternRewriter &rewriter) {
++    auto beta = columnsOf(op.getBetaLogits());
++    auto deltaTime = columnsOf(op.getDeltaTime());
++    if (!beta && !deltaTime) {
++      return failure();
++    }
++    rewriter.modifyOpInPlace(op, [&] {
++      if (beta) {
++        op.getBetaLogitsMutable().set(beta->first);
++        op.setBetaOffset(op.getBetaOffset() + beta->second);
++      }
++      if (deltaTime) {
++        op.getDeltaTimeMutable().set(deltaTime->first);
++        op.setDeltaTimeOffset(op.getDeltaTimeOffset() + deltaTime->second);
++      }
++    });
++    return success();
++  });
++  // NOLINTEND(clang-analyzer-core.StackAddressEscape)
++}
++
++} // namespace mlir::tt::ttir
 diff --git a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp b/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
 --- a/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
 +++ b/lib/Dialect/TTIR/Transforms/InferKVCacheArgumentTypes.cpp
@@ -526,7 +650,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNKVCacheDtypeConversion.cpp b/lib/Di
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -3895,6 +3895,76 @@ createOp(FlatbufferObjectCache &cache, ScaledDotProductAttentionOp op) {
+@@ -3896,6 +3896,77 @@ createOp(FlatbufferObjectCache &cache, ScaledDotProductAttentionOp op) {
        slidingWindowSize, attentionSink, out, memoryConfig);
  }
  
@@ -560,7 +684,8 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +      tensor(op.getStateIndices()), tensor(op.getHasInitialState()),
 +      cache.getOrCreateNoSharding(op.getOutput(), tensorValueToFlatbuffer,
 +                                  std::nullopt),
-+      op.getStateSlots() ? tensor(op.getStateSlots()) : 0);
++      op.getStateSlots() ? tensor(op.getStateSlots()) : 0, op.getBetaOffset(),
++      op.getDeltaTimeOffset());
 +}
 +
 +::flatbuffers::Offset<::tt::target::ttnn::CausalConv1dUpdateOp>
@@ -603,7 +728,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
  ::flatbuffers::Offset<::tt::target::ttnn::FlashMlaPrefillOp>
  createOp(FlatbufferObjectCache &cache, FlashMlaPrefillOp op) {
    auto query = cache.at<::tt::target::ttnn::TensorRef>(
-@@ -5617,6 +5687,26 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -5618,6 +5689,26 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, scaledDotProductAttentionOp),
                             debugString, locInfo);
    }
@@ -634,7 +759,7 @@ diff --git a/runtime/lib/ttnn/operations/transformer/recurrent.cpp b/runtime/lib
 new file mode 100644
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/transformer/recurrent.cpp
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,123 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +#include "operations/transformer/recurrent.h"
@@ -713,7 +838,8 @@ new file mode 100644
 +      tiled(get(op->has_initial_state()), ::ttnn::DataType::BFLOAT16),
 +      op->state_slots() ? std::optional<::ttnn::Tensor>(tiled(
 +                              get(op->state_slots()), ::ttnn::DataType::INT32))
-+                        : std::nullopt);
++                        : std::nullopt,
++      op->beta_offset(), op->delta_time_offset());
 +  put(pool, op->output(), output);
 +}
 +
