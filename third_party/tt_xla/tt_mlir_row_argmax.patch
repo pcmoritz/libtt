@@ -1,0 +1,257 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1159,21 +1159,33 @@ def TTNN_ArgMaxOp : TTNN_Op<"argmax"> {
+       output: 5
+   }];
+ 
++  // With a floor, the op is the argmax of max(input, floor): index 0 where no
++  // element exceeds it, as a reduction from that init value with index 0
++  // gives. The canonicalizer folds such a maximum of the input in. Only the
++  // rows of one tile row (isTiledRowArgMax) take a floor: libtt's row argmax
++  // reads them tiled.
+   let arguments = (ins AnyRankedTensor:$input,
+                        OptionalAttr<SI32Attr>:$dim,
+-                       DefaultValuedAttr<BoolAttr, "false">:$keep_dim);
++                       DefaultValuedAttr<BoolAttr, "false">:$keep_dim,
++                       OptionalAttr<F32Attr>:$floor);
+ 
+   let extraClassDeclaration = [{
+     wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+       return wa::TTNNOperandsWorkaroundsFactory::
+-          createArgMaxOpOperandsWorkarounds();
++          createArgMaxOpOperandsWorkarounds(getInput().getType(), getDim());
+     }
+ 
++    // Whether the argmax over `dim` of `input` is over the last dimension of
++    // at most 32 rows of a multiple of 32 BFLOAT16 or FLOAT32 elements: rows
++    // of one tile row, which libtt's row argmax scans in place.
++    static bool isTiledRowArgMax(RankedTensorType input,
++                                 std::optional<int32_t> dim);
+   }];
+ 
+   let results = (outs AnyRankedTensor:$result);
+ 
+   let hasVerifier = 1;
++  let hasCanonicalizer = 1;
+ }
+ 
+ def TTNN_ProdOp : TTNN_Op<"prod"> {
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -354,7 +354,9 @@ public:
+   createUnaryBitwiseOpOperandsWorkarounds(mlir::Operation *op);
+ 
+   // Create workarounds for ArgMax op operands.
+-  static TTNNOperandsWorkarounds createArgMaxOpOperandsWorkarounds();
++  static TTNNOperandsWorkarounds
++  createArgMaxOpOperandsWorkarounds(RankedTensorType input,
++                                    std::optional<int32_t> dim);
+ 
+   // Create workarounds for pad op operands.
+   static TTNNOperandsWorkarounds
+diff --git a/include/ttmlir/Target/TTNN/operations/reduction.fbs b/include/ttmlir/Target/TTNN/operations/reduction.fbs
+--- a/include/ttmlir/Target/TTNN/operations/reduction.fbs
++++ b/include/ttmlir/Target/TTNN/operations/reduction.fbs
+@@ -28,6 +28,8 @@ table ReductionArgMaxOp {
+   dim: int32 = null;
+   keep_dim: bool;
+   memcfg: tt.target.ttnn.MemoryConfig;
++  // The argmax of max(in, floor) (libtt's row argmax).
++  floor: float = null;
+ }
+ 
+ table ReductionProdOp {
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -306,7 +306,8 @@ public:
+     }
+     rewriter.replaceOpWithNewOp<ttnn::ArgMaxOp>(
+         op, this->getTypeConverter()->convertType(op.getType()),
+-        adaptor.getInput(), reductionAxis, adaptor.getKeepDim());
++        adaptor.getInput(), reductionAxis, adaptor.getKeepDim(),
++        /*floor=*/nullptr);
+     return success();
+   }
+ };
+diff --git a/lib/Dialect/TTNN/IR/TTNNRowArgMax.cpp b/lib/Dialect/TTNN/IR/TTNNRowArgMax.cpp
+new file mode 100644
+--- /dev/null
++++ b/lib/Dialect/TTNN/IR/TTNNRowArgMax.cpp
+@@ -0,0 +1,100 @@
++// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
++// SPDX-License-Identifier: Apache-2.0
++
++// The argmax of rows of one tile row, which libtt's row argmax scans tiled,
++// and the canonicalization that folds a maximum of its input with a constant
++// into its floor (torch_tpu's argmax reduces from the lowest finite float).
++
++#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
++#include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
++
++#include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/IR/BuiltinOps.h"
++#include "mlir/IR/PatternMatch.h"
++
++#include <optional>
++#include <utility>
++
++namespace mlir::tt::ttnn {
++namespace {
++
++// The value of every element of `value`: a full, also inside the const-eval
++// function a load_cached calls.
++std::optional<float> splatValue(Value value) {
++  if (auto load = value.getDefiningOp<ttcore::LoadCachedOp>()) {
++    auto module = load->getParentOfType<ModuleOp>();
++    auto callee =
++        module ? module.lookupSymbol<func::FuncOp>(load.getCallee()) : nullptr;
++    if (!callee || callee.getBody().empty()) {
++      return std::nullopt;
++    }
++    auto ret = dyn_cast<func::ReturnOp>(callee.getBody().back().getTerminator());
++    const unsigned index = mlir::cast<OpResult>(value).getResultNumber();
++    if (!ret || index >= ret.getNumOperands()) {
++      return std::nullopt;
++    }
++    value = ret.getOperand(index);
++  }
++  if (auto full = value.getDefiningOp<FullOp>()) {
++    if (auto attr = mlir::dyn_cast<FloatAttr>(full.getFillValue())) {
++      return attr.getValue().convertToFloat();
++    }
++  }
++  return std::nullopt;
++}
++
++} // namespace
++
++bool ArgMaxOp::isTiledRowArgMax(RankedTensorType input,
++                                std::optional<int32_t> dim) {
++  const int64_t rank = input.getRank();
++  if (rank < 2 || !dim || (*dim != -1 && *dim != rank - 1)) {
++    return false;
++  }
++  Type element = input.getElementType();
++  if (!element.isBF16() && !element.isF32()) {
++    return false;
++  }
++  ArrayRef<int64_t> shape = input.getShape();
++  for (int64_t size : shape.drop_back(2)) {
++    if (size != 1) {
++      return false;
++    }
++  }
++  return shape[rank - 2] >= 1 && shape[rank - 2] <= 32 &&
++         shape[rank - 1] > 0 && shape[rank - 1] % 32 == 0;
++}
++
++void ArgMaxOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
++                                           MLIRContext *context) {
++  // argmax(maximum(x, c)) with every element of c equal: argmax(x) with floor
++  // c, which keeps index 0 where no element of x exceeds c, as the maximum's
++  // ties do.
++  // NOLINTBEGIN(clang-analyzer-core.StackAddressEscape)
++  patterns.add(+[](ArgMaxOp op, PatternRewriter &rewriter) {
++    auto maximum = op.getInput().getDefiningOp<MaximumOp>();
++    if (op.getFloor() || !maximum || !maximum->hasOneUse()) {
++      return failure();
++    }
++    for (auto [x, c] : {std::pair(maximum.getLhs(), maximum.getRhs()),
++                        std::pair(maximum.getRhs(), maximum.getLhs())}) {
++      auto type = mlir::cast<RankedTensorType>(x.getType());
++      std::optional<float> floor = splatValue(c);
++      if (type.getShape() != op.getInput().getType().getShape() || !floor ||
++          !isTiledRowArgMax(type, op.getDim())) {
++        continue;
++      }
++      Value input = x;
++      FloatAttr floorAttr = rewriter.getF32FloatAttr(*floor);
++      rewriter.modifyOpInPlace(op, [&] {
++        op.getInputMutable().set(input);
++        op.setFloorAttr(floorAttr);
++      });
++      return success();
++    }
++    return failure();
++  });
++  // NOLINTEND(clang-analyzer-core.StackAddressEscape)
++}
++
++} // namespace mlir::tt::ttnn
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -1028,15 +1028,19 @@ TTNNOperandsWorkaroundsFactory::createUnaryBitwiseOpOperandsWorkarounds(
+ }
+ 
+ // Factory method to create a set of workarounds for ArgMax op operands.
+-// Input tensor must have ROW_MAJOR layout.
++// Input tensor must have ROW_MAJOR layout, except the rows of one tile row,
++// which libtt's row argmax reads tiled.
+ // No need for data type workaround for output tensor; only layout workaround is
+ // required to match original layout.
+ // tt-metal specs:
+ // https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/api/ttnn.argmax.html
+ TTNNOperandsWorkarounds
+-TTNNOperandsWorkaroundsFactory::createArgMaxOpOperandsWorkarounds() {
++TTNNOperandsWorkaroundsFactory::createArgMaxOpOperandsWorkarounds(
++    RankedTensorType input, std::optional<int32_t> dim) {
+   wa::TTNNOperandWorkarounds rowMajorLayoutWorkaround;
+-  rowMajorLayoutWorkaround.tensorLayoutWorkaround = Layout::RowMajor;
++  rowMajorLayoutWorkaround.tensorLayoutWorkaround =
++      ArgMaxOp::isTiledRowArgMax(input, dim) ? Layout::Tile
++                                             : Layout::RowMajor;
+ 
+   wa::TTNNOperandWorkarounds rowMajorLayoutUint32Workaround;
+   rowMajorLayoutUint32Workaround.tensorLayoutWorkaround = Layout::RowMajor;
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -3189,8 +3189,13 @@ createReductionArgMaxOp(FlatbufferObjectCache &cache, ReductionOp op) {
+ 
+   auto memoryConfig = toFlatbuffer(cache, op.getMemoryConfigAttr());
+ 
++  ::flatbuffers::Optional<float> floor = ::flatbuffers::nullopt;
++  if (auto value = op.getFloor()) {
++    floor = value->convertToFloat();
++  }
++
+   return ::tt::target::ttnn::CreateReductionArgMaxOp(
+-      *cache.fbb, in, output, dim, op.getKeepDim(), memoryConfig);
++      *cache.fbb, in, output, dim, op.getKeepDim(), memoryConfig, floor);
+ }
+ 
+ template <typename ReductionOp>
+diff --git a/runtime/lib/ttnn/operations/reduction/argmax.cpp b/runtime/lib/ttnn/operations/reduction/argmax.cpp
+--- a/runtime/lib/ttnn/operations/reduction/argmax.cpp
++++ b/runtime/lib/ttnn/operations/reduction/argmax.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "tt/runtime/detail/ttnn/operations/utils.h"
+ #include "tt/runtime/detail/ttnn/utils.h"
++#include "ttnn/operations/experimental/row_argmax/row_argmax.hpp"
+ #include <optional>
+ 
+ namespace tt::runtime::ttnn::operations::reduction {
+@@ -18,6 +19,18 @@ runReductionArgMaxOp(const ::tt::target::ttnn::ReductionArgMaxOp *op,
+   std::optional<::ttnn::MemoryConfig> outputMemoryConfig =
+       ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(op->memcfg());
+ 
++  // Rows of one tile row stay tiled: libtt's row argmax scans their rows in
++  // place, and takes the floor the compiler folds in.
++  const std::optional<float> floor =
++      op->floor() ? std::optional<float>(*op->floor()) : std::nullopt;
++  if (op->dim() &&
++      ::ttnn::experimental::is_row_argmax(in, static_cast<int>(*op->dim()))) {
++    tensorPool.insertTTNNTensorAndValidate(
++        op->out(), ::ttnn::experimental::row_argmax(
++                       in, op->keep_dim(), floor, outputMemoryConfig));
++    return;
++  }
++  LOG_ASSERT(!floor, "Only a tiled row argmax takes a floor");
+   ::ttnn::Tensor out = ::ttnn::argmax(in, op->dim(),
+                                       /*keepdim=*/op->keep_dim(),
+                                       /*sub_core_grids=*/std::nullopt,
