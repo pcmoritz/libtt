@@ -3,11 +3,11 @@ torch_tpu passes FP8 checkpoints.
 
 The compiler stores float8 tensors as their bytes (Float8DataTypeConversion),
 so the argument becomes a uint8 tensor, and its float8 matrix-unit operand a
-view of those bytes. A dynamic slice (which reads its start on the host) splits
-the program into two traces. The view must be in the second trace, next to the
-matmul that reads it: a value one trace passes to the next is copied into a
-slot of that trace on every call, which for a model's weights takes gigabytes
-per program.
+view of those bytes. A loop (which the host runs) splits the program: the
+matmul after it is in a trace of its own. The view must be in that trace, next
+to the matmul that reads it: a value passed into a trace is copied into a slot
+of that trace on every call, which for a model's weights takes gigabytes per
+program.
 """
 
 import jax
@@ -18,6 +18,7 @@ import numpy as np
 
 def test_float8_weight_stays_with_its_trace(tmp_path):
     def program(weight, x, start):
+        start = jax.lax.while_loop(lambda s: s > 32, lambda s: s - 32, start)
         rows = jax.lax.dynamic_slice(x, (start, 0), (32, 256)).astype(jnp.float8_e4m3fn)
         return jnp.dot(rows, weight, preferred_element_type=jnp.float32)
 
@@ -36,7 +37,7 @@ def test_float8_weight_stays_with_its_trace(tmp_path):
         np.testing.assert_allclose(out, expected, atol=0.02 * np.abs(expected).max())
 
     irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
-    assert any('"ttnn.slice_dynamic"' in ir for ir in irs), "the program has one trace only"
+    assert any("while" in ir for ir in irs), "the program has no loop"
     for ir in irs:
         for line in ir.splitlines():
             if '"ttnn.copy"' in line or '"ttnn.write_tensor"' in line:

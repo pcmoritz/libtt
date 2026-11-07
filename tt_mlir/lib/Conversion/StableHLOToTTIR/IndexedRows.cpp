@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 libtt authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// StableHLO gather, scatter and dynamic_update_slice onto ttir.rows_gather and
-// ttir.rows_scatter.
+// StableHLO gather, scatter, dynamic_slice and dynamic_update_slice onto
+// ttir.rows_gather and ttir.rows_scatter.
 //
 // All three move rows of a table by index. The table is the operand viewed as
 // [B, N, S..., R]: B leading dimensions whose index is shared with (or comes
@@ -31,6 +31,7 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "stablehlo/dialect/StablehloOps.h"
@@ -1098,8 +1099,138 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
-// Dynamic update slice: one position whose window is the update's shape.
+// Dynamic slices and updates: one position whose window is the slice's shape.
 //===----------------------------------------------------------------------===//
+
+// The table view and the [1, K, 1] start indices of one position of `window`
+// in an operand of `shape`: dimensions the window does not cover are indexed
+// by their start index, the rest are free. With `clampStarts` the starts are
+// clamped so the window lies in the operand, as StableHLO's dynamic slices and
+// updates do, for the scatter kernels, which drop out-of-bounds positions (the
+// gather kernels clamp each component this way themselves).
+FailureOr<std::pair<Canonical, Value>>
+buildStarts(ConversionPatternRewriter &rewriter, Location loc,
+            ValueRange starts, ArrayRef<int64_t> shape,
+            ArrayRef<int64_t> window, bool clampStarts) {
+  // StableHLO gives every start index the same type.
+  Type startElementType = getElementTypeOrSelf(starts.front());
+  if (!mlir::isa<IntegerType>(startElementType)) {
+    return failure();
+  }
+  auto columnType = RankedTensorType::get(
+      {1, 1}, rowsIndexType(rewriter, startElementType));
+  SmallVector<OperandDim> dims(shape.size());
+  SmallVector<Value> columns;
+  for (auto [d, size] : llvm::enumerate(shape)) {
+    OperandDim &dim = dims[d];
+    dim.size = size;
+    dim.window = window[d];
+    dim.kind = DimKind::Free;
+    // A complex operand's trailing dimension of 2 has no start index.
+    if (static_cast<int64_t>(d) >= static_cast<int64_t>(starts.size()) ||
+        window[d] == size) {
+      continue;
+    }
+    dim.kind = DimKind::Indexed;
+    dim.column = columns.size();
+    Value start = ttir::utils::createReshapeOp(
+        rewriter, ttmlir::utils::appendLocationSuffix(loc, "_start"),
+        starts[d], {1, 1});
+    if (!startElementType.isInteger(32)) {
+      start = rewriter.create<ttir::TypecastOp>(loc, columnType, start);
+    }
+    if (clampStarts) {
+      start = rewriter.create<ttir::ClampScalarOp>(
+          loc, columnType, start, rewriter.getI32IntegerAttr(0),
+          rewriter.getI32IntegerAttr(size - window[d]));
+    }
+    columns.push_back(start);
+  }
+  Canonical c = canonicalize(dims);
+  // Without batching dims the operand keeps its order, so the components
+  // are the indexed dims in operand order, interleaved with zero columns.
+  SmallVector<Value> indexColumns;
+  Value zeros;
+  for (int64_t column : c.columns) {
+    if (column >= 0) {
+      indexColumns.push_back(columns[column]);
+    } else {
+      if (!zeros) {
+        zeros = rewriter.create<ttir::FullOp>(loc, columnType,
+                                              rewriter.getI32IntegerAttr(0));
+      }
+      indexColumns.push_back(zeros);
+    }
+  }
+  Value indices = indexColumns.front();
+  if (indexColumns.size() > 1) {
+    indices = rewriter.create<ttir::ConcatOp>(
+        ttmlir::utils::appendLocationSuffix(loc, "_starts"),
+        columnType.clone({1, static_cast<int64_t>(indexColumns.size())}),
+        indexColumns, rewriter.getSI32IntegerAttr(1));
+  }
+  // One position: [Bi, K, M] = [1, K, 1].
+  indices = ttir::utils::createReshapeOp(
+      rewriter, ttmlir::utils::appendLocationSuffix(loc, "_starts_pages"),
+      indices, {1, static_cast<int64_t>(indexColumns.size()), 1});
+  return std::make_pair(std::move(c), indices);
+}
+
+class DynamicSliceConversionPattern
+    : public OpConversionPattern<mlir::stablehlo::DynamicSliceOp> {
+public:
+  // Ahead of upstream's ttir.slice_dynamic, whose runtime reads the start
+  // indices to the host: that read waits for the device, so it ends a trace
+  // and holds back the dispatch of everything after it.
+  DynamicSliceConversionPattern(TypeConverter &typeConverter, MLIRContext *ctx)
+      : OpConversionPattern(typeConverter, ctx, /*benefit=*/2) {}
+
+  LogicalResult
+  matchAndRewrite(mlir::stablehlo::DynamicSliceOp srcOp,
+                  mlir::stablehlo::DynamicSliceOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // Constant starts make a static slice, which upstream's pattern folds to.
+    if (llvm::all_of(srcOp.getStartIndices(), [](Value start) {
+          return matchPattern(start, m_Constant());
+        })) {
+      return rewriter.notifyMatchFailure(srcOp, "constant start indices");
+    }
+    Location loc = srcOp.getLoc();
+    Value operand = adaptor.getOperand();
+    auto operandType = mlir::cast<RankedTensorType>(operand.getType());
+    auto resultType = mlir::cast<RankedTensorType>(
+        getTypeConverter()->convertType(srcOp.getType()));
+    if (resultType.getShape() == operandType.getShape()) {
+      rewriter.replaceOp(srcOp, operand);
+      return success();
+    }
+    if (resultType.getNumElements() == 0) {
+      rewriter.replaceOp(srcOp, zerosLike(rewriter, loc, resultType));
+      return success();
+    }
+    FailureOr<std::pair<Canonical, Value>> starts =
+        buildStarts(rewriter, loc, adaptor.getStartIndices(),
+                    operandType.getShape(), resultType.getShape(),
+                    /*clampStarts=*/false);
+    if (failed(starts)) {
+      return rewriter.notifyMatchFailure(srcOp,
+                                         "start indices must be integers");
+    }
+    auto &[c, indices] = *starts;
+    Value table = buildTable(rewriter, loc, operand, c);
+    auto gatherType = RankedTensorType::get(c.gatheredShape(1),
+                                            operandType.getElementType());
+    Value gathered = rewriter.create<ttir::RowsGatherOp>(
+        loc, gatherType, table, indices, i64Array(rewriter, c.sizes),
+        i64Array(rewriter, c.windows), rewriter.getBoolAttr(c.column),
+        rewriter.getBoolAttr(false));
+    // The window's dims are the operand's: [batch][component windows][rows].
+    rewriter.replaceOp(srcOp, ttir::utils::createReshapeOp(
+                                  rewriter, loc, gathered,
+                                  resultType.getShape()));
+    return success();
+  }
+};
 
 class DynamicUpdateSliceConversionPattern
     : public OpConversionPattern<mlir::stablehlo::DynamicUpdateSliceOp> {
@@ -1127,73 +1258,14 @@ public:
       return success();
     }
 
-    // StableHLO gives every start index the same type.
-    Type startElementType =
-        getElementTypeOrSelf(adaptor.getStartIndices().front());
-    auto columnType = RankedTensorType::get(
-        {1, 1}, rowsIndexType(rewriter, startElementType));
-    // Dimensions the update does not cover are indexed; the rest are free.
-    SmallVector<OperandDim> dims(operandShape.size());
-    SmallVector<Value> columns;
-    for (auto [d, size] : llvm::enumerate(operandShape)) {
-      OperandDim &dim = dims[d];
-      dim.size = size;
-      dim.window = updateShape[d];
-      dim.kind = DimKind::Free;
-      // A complex operand's trailing dimension of 2 has no start index.
-      if (static_cast<int64_t>(d) >= adaptor.getStartIndices().size()) {
-        continue;
-      }
-      if (updateShape[d] != size) {
-        dim.kind = DimKind::Indexed;
-        dim.column = columns.size();
-        Value start = adaptor.getStartIndices()[d];
-        auto startType = mlir::cast<RankedTensorType>(start.getType());
-        if (!mlir::isa<IntegerType>(startType.getElementType())) {
-          return rewriter.notifyMatchFailure(srcOp, "start indices must be integers");
-        }
-        start = ttir::utils::createReshapeOp(
-            rewriter, ttmlir::utils::appendLocationSuffix(loc, "_start"), start,
-            {1, 1});
-        if (!startType.getElementType().isInteger(32)) {
-          start = rewriter.create<ttir::TypecastOp>(loc, columnType, start);
-        }
-        // Unlike a scatter, dynamic_update_slice clamps its start indices so
-        // the update always lands in the operand.
-        start = rewriter.create<ttir::ClampScalarOp>(
-            loc, columnType, start, rewriter.getI32IntegerAttr(0),
-            rewriter.getI32IntegerAttr(size - updateShape[d]));
-        columns.push_back(start);
-      }
+    FailureOr<std::pair<Canonical, Value>> starts =
+        buildStarts(rewriter, loc, adaptor.getStartIndices(), operandShape,
+                    updateShape, /*clampStarts=*/true);
+    if (failed(starts)) {
+      return rewriter.notifyMatchFailure(srcOp,
+                                         "start indices must be integers");
     }
-    Canonical c = canonicalize(dims);
-    // Without batching dims the operand keeps its order, so the components
-    // are the indexed dims in operand order, interleaved with zero columns.
-    SmallVector<Value> indexColumns;
-    Value zeros;
-    for (int64_t column : c.columns) {
-      if (column >= 0) {
-        indexColumns.push_back(columns[column]);
-      } else {
-        if (!zeros) {
-          zeros = rewriter.create<ttir::FullOp>(loc, columnType,
-                                                rewriter.getI32IntegerAttr(0));
-        }
-        indexColumns.push_back(zeros);
-      }
-    }
-    Value indices = indexColumns.front();
-    if (indexColumns.size() > 1) {
-      indices = rewriter.create<ttir::ConcatOp>(
-          ttmlir::utils::appendLocationSuffix(loc, "_starts"),
-          columnType.clone({1, static_cast<int64_t>(indexColumns.size())}),
-          indexColumns, rewriter.getSI32IntegerAttr(1));
-    }
-    // One position: [Bi, K, M] = [1, K, 1].
-    indices = ttir::utils::createReshapeOp(
-        rewriter, ttmlir::utils::appendLocationSuffix(loc, "_starts_pages"),
-        indices, {1, static_cast<int64_t>(indexColumns.size()), 1});
-
+    auto &[c, indices] = *starts;
     Value table = buildTable(rewriter, loc, operand, c);
     // The update's dims are the operand's: [batch][component windows][rows].
     auto sourceType = RankedTensorType::get(c.gatheredShape(1),
@@ -1214,6 +1286,7 @@ void populateIndexedRowsToTTIRPatterns(MLIRContext *ctx,
                                        RewritePatternSet &patterns,
                                        TypeConverter &typeConverter) {
   patterns.add<GatherConversionPattern, ScatterConversionPattern,
+               DynamicSliceConversionPattern,
                DynamicUpdateSliceConversionPattern>(typeConverter, ctx);
 }
 
