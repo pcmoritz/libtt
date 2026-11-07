@@ -442,7 +442,7 @@ new file mode 100644
 +    KernelDescriptor compute{
 +        .kernel_source = kernel_dir + "compute/causal_conv1d_update.cpp",
 +        .core_ranges = cores,
-+        .compile_time_args = {channel_tiles, num_workers},
++        .compile_time_args = {channel_tiles, num_workers, batch_size * tokens},
 +        .config = ComputeConfigDescriptor{
 +            .math_fidelity = tt::tt_metal::MathFidelity::HiFi2,
 +            .fp32_dest_acc_en = false,
@@ -528,7 +528,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/causal_conv1d_update.cpp
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,78 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -540,6 +540,29 @@ new file mode 100644
 +#include "api/compute/eltwise_unary/eltwise_unary.h"
 +#include "api/compute/tile_move_copy.h"
 +#include "api/dataflow/circular_buffer.h"
++
++// The output's rows, batch * tokens, are the operands' only nonzero rows. Up
++// to 16 of them, the SFPU math covers only the top faces' first rows: two of
++// a face's eight SFPU iterations per four rows.
++constexpr uint32_t rows = get_compile_time_arg_val(2);
++constexpr VectorMode vector_mode = rows <= 16 ? VectorMode::R : VectorMode::RC;
++constexpr int iterations = rows <= 16 ? 2 * ((rows + 3) / 4) : 8;
++
++ALWI void rows_mul(uint32_t idst0, uint32_t idst1, uint32_t odst) {
++    MATH((SFPU_BINARY_CALL(
++        DST_SYNC_MODE, DST_ACCUM_MODE, calculate_sfpu_binary_mul,
++        (APPROX, ckernel::BinaryOp::MUL, iterations, DST_ACCUM_MODE), idst0, idst1, odst, vector_mode)));
++}
++
++ALWI void rows_add(uint32_t idst0, uint32_t idst1, uint32_t odst) {
++    MATH((SFPU_BINARY_CALL(
++        DST_SYNC_MODE, DST_ACCUM_MODE, calculate_sfpu_binary,
++        (APPROX, ckernel::BinaryOp::ADD, iterations, DST_ACCUM_MODE), idst0, idst1, odst, vector_mode)));
++}
++
++ALWI void rows_silu(uint32_t idst) {
++    MATH(SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_silu, (DST_ACCUM_MODE, iterations), idst, vector_mode));
++}
 +
 +void kernel_main() {
 +    constexpr uint32_t channel_tiles = get_compile_time_arg_val(0);
@@ -564,17 +587,17 @@ new file mode 100644
 +        }
 +        // Four depthwise products occupy even DST registers.
 +        mul_binary_tile_init();
-+        mul_binary_tile(0, 1, 0);
-+        mul_binary_tile(2, 3, 2);
-+        mul_binary_tile(4, 5, 4);
-+        mul_binary_tile(6, 7, 6);
++        rows_mul(0, 1, 0);
++        rows_mul(2, 3, 2);
++        rows_mul(4, 5, 4);
++        rows_mul(6, 7, 6);
 +
 +        add_binary_tile_init();
-+        add_binary_tile(0, 2, 0);
-+        add_binary_tile(4, 6, 4);
-+        add_binary_tile(0, 4, 0);
++        rows_add(0, 2, 0);
++        rows_add(4, 6, 4);
++        rows_add(0, 4, 0);
 +        silu_tile_init();
-+        silu_tile(0);
++        rows_silu(0);
 +
 +        tile_regs_commit();
 +        tile_regs_wait();
@@ -588,11 +611,13 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
-@@ -0,0 +1,344 @@
+@@ -0,0 +1,384 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#include <stdint.h>
++
++#include <algorithm>
 +
 +#include "api/compute/bcast.h"
 +#include "api/compute/compute_kernel_api.h"
@@ -608,6 +633,53 @@ new file mode 100644
 +#include "api/compute/tile_move_copy.h"
 +#include "api/compute/transpose.h"
 +
++#ifdef TRISC_MATH
++#include "sfpi.h"
++
++namespace {
++
++// sum plus the squares of row 0 of DST tiles i / 4 .. n / 4 - 1: vectors 0
++// and 1 (even and odd columns) of their top faces, row 0 in lanes 0 - 7.
++// (SFPU vectors cannot be spilled, so the sum passes by value.)
++template <uint32_t i, uint32_t n>
++sfpi_inline sfpi::vFloat add_row_squares(sfpi::vFloat sum) {
++    if constexpr (i == n) {
++        return sum;
++    } else {
++        const sfpi::vFloat v = sfpi::dst_reg[i / 4 * 32 + i / 2 % 2 * 8 + i % 2];
++        return add_row_squares<i + 1, n>(sum + v * v);
++    }
++}
++
++sfpi_inline sfpi::vFloat rotate(sfpi::vFloat v) { return sfpi::vFloat(sfpi::subvec_shflror1(v)); }
++
++// sum(x^2) + eps of the row vector x in row 0 of DST tiles 0 .. kt - 1 (their
++// other rows zero) into rows 0 - 3 of tile 0's top faces. Row 0 of a top face
++// is lanes 0 - 7 of its first two SFPU vectors (even and odd columns); eight
++// rotations sum a row's lanes, and a subvector transpose of four copies puts
++// row 0 in every row of the band.
++template <uint32_t kt>
++inline void row_squared_norm(uint32_t eps_bits) {
++    _llk_math_eltwise_sfpu_start_(0);
++    sfpi::vFloat sum = add_row_squares<0, kt * 4>(0.0f);
++    sum = sum + rotate(sum);
++    sum = sum + rotate(rotate(sum));
++    sum = sum + rotate(rotate(rotate(rotate(sum))));
++    sfpi::vFloat a = sum + sfpi::as<sfpi::vFloat>(sfpi::vInt(eps_bits));
++    sfpi::vFloat b = a;
++    sfpi::vFloat c = a;
++    sfpi::vFloat d = a;
++    sfpi::subvec_transp(a, b, c, d);
++    sfpi::dst_reg[0] = a;
++    sfpi::dst_reg[1] = a;
++    sfpi::dst_reg[8] = a;
++    sfpi::dst_reg[9] = a;
++    _llk_math_eltwise_sfpu_done_();
++}
++
++}  // namespace
++#endif
++
 +// The per-token scalars live in row 0 of their tiles: the norm factors and the
 +// decay at [0, 0], beta across row 0. Their SFPU math covers only rows 0-3 of
 +// the top faces, two of a face's eight SFPU iterations, rather than all of a
@@ -617,12 +689,6 @@ new file mode 100644
 +// elsewhere. The compute API takes no vector mode for most of these functions,
 +// so the helpers call them directly.
 +constexpr int row_iterations = 2;
-+
-+ALWI void row_add_unary(uint32_t idst, uint32_t value) {
-+    MATH(SFPU_UNARY_CALL(
-+        DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
-+        (APPROX, ADD_UNARY, row_iterations, DST_ACCUM_MODE), idst, VectorMode::R, value));
-+}
 +
 +ALWI void row_mul_unary(uint32_t idst, uint32_t value) {
 +    MATH(SFPU_UNARY_CALL(
@@ -677,6 +743,8 @@ new file mode 100644
 +    constexpr uint32_t tokens = get_compile_time_arg_val(8);
 +    const uint32_t worker = get_arg_val<uint32_t>(0);
 +    constexpr uint32_t state_tiles = kt * vt;
++    // FP32 DST tiles per acquire.
++    constexpr uint32_t dst_tiles = 4;
 +
 +    constexpr uint32_t state = tt::CBIndex::c_0;
 +    constexpr uint32_t query = tt::CBIndex::c_1;
@@ -693,48 +761,34 @@ new file mode 100644
 +    constexpr uint32_t dt_bias = tt::CBIndex::c_14;
 +    constexpr uint32_t beta = tt::CBIndex::c_16;
 +    constexpr uint32_t decay = tt::CBIndex::c_20;
-+    constexpr uint32_t squared_norm = tt::CBIndex::c_21;
 +    constexpr uint32_t key_factor = tt::CBIndex::c_22;
 +    constexpr uint32_t query_factor = tt::CBIndex::c_23;
 +    // The state after a step, which the next step starts from.
 +    constexpr uint32_t state_carry = tt::CBIndex::c_24;
 +
-+    // factor = scale / sqrt(x x^T + eps) in every element of a tile, where x
-+    // is a row vector in row 0 of kt tiles; the matmul transposes its second x.
++    // factor = scale / sqrt(x x^T + eps) in rows 0 - 3 of a tile's top faces
++    // (zero elsewhere), where x is a row vector in row 0 of kt tiles whose
++    // other rows are zero.
 +    auto normalization_factor = [&](uint32_t x, uint32_t factor, uint32_t scale) {
 +        cb_wait_front(x, kt);
-+        cb_reserve_back(squared_norm, 1);
-+        reconfig_data_format<SrcOrder::Reverse>(x, x);
-+        matmul_init(x, x, /*transpose=*/1);
++        cb_reserve_back(factor, 1);
++        reconfig_data_format_srca(x);
++        copy_tile_to_dst_init_short(x);
 +        tile_regs_acquire();
 +        for (uint32_t inner = 0; inner < kt; ++inner) {
-+            matmul_tiles(x, x, inner, inner, 0);
++            copy_tile(x, inner, inner);
 +        }
-+        binop_with_scalar_tile_init();
-+        row_add_unary(0, eps);
++        MATH((row_squared_norm<kt>(eps)));
 +        rsqrt_tile_init();
 +        row_rsqrt(0);
 +        binop_with_scalar_tile_init();
 +        row_mul_unary(0, scale);
 +        tile_regs_commit();
 +        tile_regs_wait();
-+        pack_reconfig_data_format(squared_norm);
-+        pack_tile(0, squared_norm, 0);
-+        tile_regs_release();
-+        cb_push_back(squared_norm, 1);
-+
-+        cb_wait_front(squared_norm, 1);
-+        cb_reserve_back(factor, 1);
-+        unary_bcast_init<BroadcastType::SCALAR>(squared_norm);
-+        tile_regs_acquire();
-+        unary_bcast<BroadcastType::SCALAR>(squared_norm, 0, 0);
-+        tile_regs_commit();
-+        tile_regs_wait();
 +        pack_reconfig_data_format(factor);
 +        pack_tile(0, factor, 0);
 +        tile_regs_release();
 +        cb_push_back(factor, 1);
-+        cb_pop_front(squared_norm, 1);
 +    };
 +
 +    // Configure the FP32 unpack/pack paths before the first compute API call.
@@ -806,12 +860,17 @@ new file mode 100644
 +    cb_wait_front(state_in, state_tiles);
 +    cb_wait_front(decay, 1);
 +    cb_reserve_back(state_mid, state_tiles);
-+    for (uint32_t tile = 0; tile < state_tiles; ++tile) {
++    for (uint32_t first = 0; first < state_tiles; first += dst_tiles) {
++        const uint32_t count = std::min(dst_tiles, state_tiles - first);
 +        tile_regs_acquire();
-+        mul_tiles_bcast_scalar(state_in, decay, tile, 0, 0);
++        for (uint32_t i = 0; i < count; ++i) {
++            mul_tiles_bcast_scalar(state_in, decay, first + i, 0, i);
++        }
 +        tile_regs_commit();
 +        tile_regs_wait();
-+        pack_tile(0, state_mid, tile);
++        for (uint32_t i = 0; i < count; ++i) {
++            pack_tile(i, state_mid, first + i);
++        }
 +        tile_regs_release();
 +    }
 +    cb_push_back(state_mid, state_tiles);
@@ -875,6 +934,10 @@ new file mode 100644
 +    if (carry) {
 +        cb_reserve_back(state_carry, state_tiles);
 +    }
++    // One DST acquire per tile keeps the unpacker from running ahead to the
++    // output while the packer waits for the writer to pop the previous step's
++    // state_new: the output's wait on state_new, which the writer pops, would
++    // pass on those tiles.
 +    for (uint32_t row = 0; row < kt; ++row) {
 +        for (uint32_t column = 0; column < vt; ++column) {
 +            tile_regs_acquire();
@@ -937,7 +1000,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_causal_conv1d_update.cpp
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,239 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -951,36 +1014,58 @@ new file mode 100644
 +
 +namespace {
 +
-+FORCE_INLINE void copy_channel_to_row(
-+    uint32_t source_address, uint32_t source_column,
-+    uint32_t destination_address, uint32_t destination_row) {
-+    const volatile tt_l1_ptr uint16_t* source =
-+        reinterpret_cast<const volatile tt_l1_ptr uint16_t*>(source_address);
-+    volatile tt_l1_ptr uint16_t* destination =
-+        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(destination_address);
-+    for (uint32_t channel = 0; channel < 32; ++channel) {
-+        destination[tile_offset(destination_row, channel)] =
-+            source[tile_offset(channel, source_column)];
++// The BFLOAT16 tiles' elements move in pairs, as 32-bit words: a channel's
++// four taps or three saved inputs are adjacent in its row of the weight or
++// state tile, and two channels are adjacent in a row of an operand tile.
++// Word w of a BFLOAT16 tile holds elements 2w (low half) and 2w + 1.
++FORCE_INLINE uint32_t low_halves(uint32_t first, uint32_t second) { return (first & 0xFFFF) | (second << 16); }
++FORCE_INLINE uint32_t high_halves(uint32_t first, uint32_t second) { return (first >> 16) | (second & 0xFFFF0000); }
++
++// Operand tile 2 * tap + 1's `row` holds the tap's weights of the 32 channels.
++FORCE_INLINE void copy_weights_to_row(uint32_t weight_address, uint32_t operands_address, uint32_t row) {
++    const volatile tt_l1_ptr uint32_t* weight =
++        reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(weight_address);
++    volatile tt_l1_ptr uint32_t* operands =
++        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(operands_address);
++    for (uint32_t channel = 0; channel < 32; channel += 2) {
++        // Taps 0 and 1, and 2 and 3, of channels c and c + 1.
++        const uint32_t a01 = weight[tile_offset(channel, 0) / 2];
++        const uint32_t a23 = weight[tile_offset(channel, 0) / 2 + 1];
++        const uint32_t b01 = weight[tile_offset(channel + 1, 0) / 2];
++        const uint32_t b23 = weight[tile_offset(channel + 1, 0) / 2 + 1];
++        const uint32_t word = tile_offset(row, channel) / 2;
++        operands[1 * 512 + word] = low_halves(a01, b01);
++        operands[3 * 512 + word] = high_halves(a01, b01);
++        operands[5 * 512 + word] = low_halves(a23, b23);
++        operands[7 * 512 + word] = high_halves(a23, b23);
 +    }
 +}
 +
++// Operand tiles 0, 2 and 4 take a state's saved inputs h0, h1 and h2 in the
++// batch's row, and the state keeps h1, h2 and the input x from operand 6.
 +FORCE_INLINE void gather_and_update_state_tile(
 +    uint32_t state_address, uint32_t operands_address, uint32_t batch) {
-+    volatile tt_l1_ptr uint16_t* state =
-+        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(state_address);
-+    volatile tt_l1_ptr uint16_t* operands =
-+        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(operands_address);
-+    for (uint32_t channel = 0; channel < 32; ++channel) {
-+        const uint32_t source = tile_offset(channel, 0);
-+        const uint32_t row = tile_offset(batch, channel);
-+        const uint16_t old1 = state[source + 1];
-+        const uint16_t old2 = state[source + 2];
-+        operands[row] = state[source];
-+        operands[2 * 1024 + row] = old1;
-+        operands[4 * 1024 + row] = old2;
-+        state[source] = old1;
-+        state[source + 1] = old2;
-+        state[source + 2] = operands[6 * 1024 + row];
++    volatile tt_l1_ptr uint32_t* state =
++        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(state_address);
++    volatile tt_l1_ptr uint32_t* operands =
++        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(operands_address);
++    for (uint32_t channel = 0; channel < 32; channel += 2) {
++        // h0 h1 and h2 (with the padding column 3) of channels c and c + 1.
++        const uint32_t a = tile_offset(channel, 0) / 2;
++        const uint32_t b = tile_offset(channel + 1, 0) / 2;
++        const uint32_t a01 = state[a];
++        const uint32_t a23 = state[a + 1];
++        const uint32_t b01 = state[b];
++        const uint32_t b23 = state[b + 1];
++        const uint32_t word = tile_offset(batch, channel) / 2;
++        const uint32_t x = operands[6 * 512 + word];
++        operands[0 * 512 + word] = low_halves(a01, b01);
++        operands[2 * 512 + word] = high_halves(a01, b01);
++        operands[4 * 512 + word] = low_halves(a23, b23);
++        state[a] = (a01 >> 16) | (a23 << 16);
++        state[a + 1] = (x & 0xFFFF) | (a23 & 0xFFFF0000);
++        state[b] = (b01 >> 16) | (b23 << 16);
++        state[b + 1] = (x >> 16) | (b23 & 0xFFFF0000);
 +    }
 +}
 +
@@ -1065,8 +1150,8 @@ new file mode 100644
 +    weight_scratch.reserve_back(1);
 +    indices_scratch.reserve_back(1);
 +    flags_scratch.reserve_back(1);
-+    noc.async_read(indices, indices_scratch, 4096, {.page_id = 0}, {.offset_bytes = 0});
-+    noc.async_read(flags, flags_scratch, tile_bytes, {.page_id = 0}, {.offset_bytes = 0});
++    read_first_row(noc, indices, indices_scratch, sizeof(uint32_t), batch_size);
++    read_first_row(noc, flags, flags_scratch, sizeof(uint16_t), batch_size);
 +    if constexpr (has_slots) {
 +        slots_scratch.reserve_back(1);
 +        windows_scratch.reserve_back(tokens);
@@ -1082,43 +1167,43 @@ new file mode 100644
 +        operands_cb.reserve_back(8);
 +        const uint32_t operands_address = operands_cb.get_write_ptr();
 +        noc.async_write_zeros(operands_cb, 8 * tile_bytes);
++        for (uint32_t batch = 0; batch < batch_size; ++batch) {
++            if (read_index(indices_scratch.get_write_ptr(), batch) != 0 &&
++                !read_flag(flags_scratch.get_write_ptr(), batch)) {
++                noc.async_write_zeros(
++                    state_scratch, tile_bytes, {.offset_bytes = batch * tile_bytes});
++            }
++        }
 +        noc.write_zeros_l1_barrier();
 +
-+        // x already has the desired [batch, channel] tile orientation.
++        // x already has the desired [batch, channel] tile orientation. Read it,
++        // the weights and the active states together. Dummy rows stay zero and
++        // do not need weights because their input rows are zero as well.
 +        noc.async_read(
 +            input, operands_cb, tile_bytes, {.page_id = channel_tile},
 +            {.offset_bytes = 6 * tile_bytes});
 +        noc.async_read(
 +            weight, weight_scratch, tile_bytes, {.page_id = channel_tile},
 +            {.offset_bytes = 0});
-+        noc.async_read_barrier();
-+
-+        // Read active state tiles together. Dummy rows stay zero and do not
-+        // need weights because their input rows are zero as well.
 +        for (uint32_t batch = 0; batch < batch_size; ++batch) {
 +            const uint32_t slot = read_index(indices_scratch.get_write_ptr(), batch);
-+            if (slot == 0) {
-+                continue;
-+            }
-+            for (uint32_t token = 0; token < tokens; ++token) {
-+                for (uint32_t tap = 0; tap < 4; ++tap) {
-+                    copy_channel_to_row(
-+                        weight_scratch.get_write_ptr(), tap,
-+                        operands_address + (2 * tap + 1) * tile_bytes, batch * tokens + token);
-+                }
-+            }
-+            if (read_flag(flags_scratch.get_write_ptr(), batch)) {
++            if (slot != 0 && read_flag(flags_scratch.get_write_ptr(), batch)) {
 +                noc.async_read(
 +                    state, state_scratch, tile_bytes,
 +                    {.page_id = slot * channel_tiles + channel_tile},
 +                    {.offset_bytes = batch * tile_bytes});
-+            } else {
-+                noc.async_write_zeros(
-+                    state_scratch, tile_bytes, {.offset_bytes = batch * tile_bytes});
 +            }
 +        }
 +        noc.async_read_barrier();
-+        noc.write_zeros_l1_barrier();
++
++        for (uint32_t batch = 0; batch < batch_size; ++batch) {
++            if (read_index(indices_scratch.get_write_ptr(), batch) == 0) {
++                continue;
++            }
++            for (uint32_t token = 0; token < tokens; ++token) {
++                copy_weights_to_row(weight_scratch.get_write_ptr(), operands_address, batch * tokens + token);
++            }
++        }
 +
 +        // Gather each slot's old history before updating its scratch tile and DRAM.
 +        for (uint32_t batch = 0; batch < batch_size; ++batch) {
@@ -1159,7 +1244,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,170 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1179,9 +1264,6 @@ new file mode 100644
 +FORCE_INLINE void read_vector(
 +    Noc& noc, const Accessor& input, CircularBuffer& cb,
 +    uint32_t page, uint32_t row, uint32_t tiles) {
-+    cb.reserve_back(tiles);
-+    noc.async_write_zeros(cb, tiles * 4096);
-+    noc.write_zeros_l1_barrier();
 +    for (uint32_t tile = 0; tile < tiles; ++tile) {
 +        for (uint32_t face = 0; face < 2; ++face) {
 +            noc.async_read(
@@ -1208,20 +1290,31 @@ new file mode 100644
 +}
 +
 +// Broadcast the scalar read by read_scalar to the corner of every face of an
-+// FP32 tile; a BFLOAT16 scalar is widened.
++// FP32 tile whose bytes past the piece read_scalar fills the caller zeroed; a
++// BFLOAT16 scalar is widened.
 +template <typename ElementType>
-+FORCE_INLINE void make_scalar_tile(Noc& noc, CircularBuffer& cb, uint32_t row, uint32_t column) {
++FORCE_INLINE void make_scalar_tile(CircularBuffer& cb, uint32_t row, uint32_t column) {
 +    const uint32_t address = cb.get_write_ptr();
 +    const uint32_t index = tile_offset(row, column) % (64 / sizeof(ElementType));
 +    const auto* source = reinterpret_cast<volatile tt_l1_ptr ElementType*>(address);
 +    const uint32_t element = static_cast<uint32_t>(source[index]) << (8 * (sizeof(uint32_t) - sizeof(ElementType)));
 +    volatile tt_l1_ptr uint32_t* tile = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(address);
-+    noc.async_write_zeros(cb, 4096);
-+    noc.write_zeros_l1_barrier();
 +    tile[0] = element;
++    for (uint32_t word = 1; word < 16; ++word) {
++        tile[word] = 0;
++    }
 +    tile[256] = element;
 +    tile[512] = element;
 +    tile[768] = element;
++}
++
++// Zeroes rows 1 - 31 of `tiles` FP32 tiles at the start of the circular
++// buffer: the top faces below row 0 and the bottom faces.
++FORCE_INLINE void zero_below_row0(Noc& noc, CircularBuffer& cb, uint32_t tiles) {
++    for (uint32_t tile = 0; tile < tiles; ++tile) {
++        noc.async_write_zeros(cb, 1024 - 64, {.offset_bytes = tile * 4096 + 64});
++        noc.async_write_zeros(cb, 3072 - 64, {.offset_bytes = tile * 4096 + 1024 + 64});
++    }
 +}
 +
 +}  // namespace
@@ -1240,7 +1333,6 @@ new file mode 100644
 +    // The steps each state takes; step t of state b reads row b * tokens + t.
 +    constexpr uint32_t tokens = get_compile_time_arg_val(9);
 +    constexpr uint32_t vt = full_vt / workers_per_head;
-+    constexpr uint32_t state_tiles = kt * vt;
 +    constexpr uint32_t tile_bytes = 4096;
 +
 +    const uint32_t worker = get_arg_val<uint32_t>(0);
@@ -1249,33 +1341,18 @@ new file mode 100644
 +    const uint32_t delta_time_address = get_arg_val<uint32_t>(3);
 +    const uint32_t a_log_address = get_arg_val<uint32_t>(4);
 +    const uint32_t dt_bias_address = get_arg_val<uint32_t>(5);
-+    const uint32_t state_address = get_arg_val<uint32_t>(6);
-+    const uint32_t state_indices_address = get_arg_val<uint32_t>(7);
-+    const uint32_t has_initial_state_address = get_arg_val<uint32_t>(8);
 +
 +    constexpr auto qkv_args = TensorAccessorArgs<10>();
 +    constexpr auto beta_logits_args = TensorAccessorArgs<qkv_args.next_compile_time_args_offset()>();
 +    constexpr auto delta_time_args = TensorAccessorArgs<beta_logits_args.next_compile_time_args_offset()>();
 +    constexpr auto a_log_args = TensorAccessorArgs<delta_time_args.next_compile_time_args_offset()>();
 +    constexpr auto dt_bias_args = TensorAccessorArgs<a_log_args.next_compile_time_args_offset()>();
-+    constexpr auto state_args = TensorAccessorArgs<dt_bias_args.next_compile_time_args_offset()>();
-+    constexpr auto state_indices_args = TensorAccessorArgs<state_args.next_compile_time_args_offset()>();
-+    constexpr auto has_initial_state_args =
-+        TensorAccessorArgs<state_indices_args.next_compile_time_args_offset()>();
 +    const auto qkv = TensorAccessor(qkv_args, qkv_address, tile_bytes);
 +    const auto beta_logits = TensorAccessor(beta_logits_args, beta_logits_address, 1024 * sizeof(GateLogits));
 +    const auto delta_time = TensorAccessor(delta_time_args, delta_time_address, 1024 * sizeof(GateLogits));
 +    const auto a_log = TensorAccessor(a_log_args, a_log_address, tile_bytes);
 +    const auto dt_bias = TensorAccessor(dt_bias_args, dt_bias_address, tile_bytes);
-+    const auto state = TensorAccessor(state_args, state_address, tile_bytes);
-+    constexpr uint32_t index_tile_bytes = 4096;
-+    constexpr uint32_t flag_tile_bytes = 2048;
-+    const auto state_indices =
-+        TensorAccessor(state_indices_args, state_indices_address, index_tile_bytes);
-+    const auto has_initial_state =
-+        TensorAccessor(has_initial_state_args, has_initial_state_address, flag_tile_bytes);
 +
-+    CircularBuffer state_cb(tt::CBIndex::c_0);
 +    CircularBuffer query_cb(tt::CBIndex::c_1);
 +    CircularBuffer key_cb(tt::CBIndex::c_2);
 +    CircularBuffer value_cb(tt::CBIndex::c_3);
@@ -1283,48 +1360,14 @@ new file mode 100644
 +    CircularBuffer beta_logits_cb(tt::CBIndex::c_5);
 +    CircularBuffer a_log_cb(tt::CBIndex::c_13);
 +    CircularBuffer dt_bias_cb(tt::CBIndex::c_14);
-+    CircularBuffer state_indices_cb(tt::CBIndex::c_15);
-+    CircularBuffer has_initial_state_cb(tt::CBIndex::c_17);
 +    Noc noc;
 +
-+    // Metadata is shared by every head handled by this core.
-+    state_indices_cb.reserve_back(1);
-+    has_initial_state_cb.reserve_back(1);
-+    noc.async_read(state_indices, state_indices_cb, index_tile_bytes,
-+                   {.page_id = 0}, {.offset_bytes = 0});
-+    noc.async_read(has_initial_state, has_initial_state_cb, flag_tile_bytes,
-+                   {.page_id = 0}, {.offset_bytes = 0});
-+    noc.async_read_barrier();
-+
++    // The writer brings the state on the other NoC meanwhile.
 +    for (uint32_t work = worker; work < batch_size * num_heads * workers_per_head; work += num_workers) {
 +    const uint32_t head_work = work / workers_per_head;
 +    const uint32_t column_start = (work % workers_per_head) * vt;
 +    const uint32_t batch = head_work / num_heads;
 +    const uint32_t head = head_work % num_heads;
-+
-+    const uint32_t state_slot =
-+        read_index(state_indices_cb.get_write_ptr(), batch);
-+    const bool has_state =
-+        read_flag(has_initial_state_cb.get_write_ptr(), batch);
-+
-+    const uint32_t state_base = (state_slot * num_heads + head) * kt * full_vt;
-+    // The compute kernel carries the state between steps.
-+    state_cb.reserve_back(state_tiles);
-+    if (has_state) {
-+        for (uint32_t row = 0; row < kt; ++row) {
-+            for (uint32_t column = 0; column < vt; ++column) {
-+                const uint32_t local_tile = row * vt + column;
-+                noc.async_read(
-+                    state,
-+                    state_cb,
-+                    tile_bytes,
-+                    {.page_id = state_base + row * full_vt + column_start + column},
-+                    {.offset_bytes = local_tile * tile_bytes});
-+            }
-+        }
-+    } else {
-+        noc.async_write_zeros(state_cb, state_tiles * tile_bytes);
-+    }
 +
 +    for (uint32_t token = 0; token < tokens; ++token) {
 +    const uint32_t step = batch * tokens + token;
@@ -1332,10 +1375,16 @@ new file mode 100644
 +    // qkv tensor, where g = head / (H / K); a head spans kt == full_vt tiles.
 +    auto page = [&](uint32_t qkv_head) { return ((step / 32) * qkv_heads + qkv_head) * kt; };
 +    const uint32_t group_head = head / (num_heads / key_heads);
++    query_cb.reserve_back(kt);
++    key_cb.reserve_back(kt);
++    value_cb.reserve_back(vt);
++    // Rows 1 - 31 of k, whose transpose meets the delta's rows, and of v must
++    // be zero; row 0 arrives meanwhile. Those of q only reach output rows that
++    // are not written.
++    zero_below_row0(noc, key_cb, kt);
++    zero_below_row0(noc, value_cb, vt);
 +    read_vector(noc, qkv, query_cb, page(group_head), step % 32, kt);
-+
 +    read_vector(noc, qkv, key_cb, page(key_heads + group_head), step % 32, kt);
-+
 +    read_vector(noc, qkv, value_cb, page(2 * key_heads + head) + column_start, step % 32, vt);
 +
 +    const uint32_t scalar_page =
@@ -1346,21 +1395,22 @@ new file mode 100644
 +    read_scalar<GateLogits>(noc, delta_time, delta_time_cb, scalar_page, scalar_row, scalar_column);
 +    read_scalar<uint32_t>(noc, a_log, a_log_cb, head / 32, 0, scalar_column);
 +    read_scalar<uint32_t>(noc, dt_bias, dt_bias_cb, head / 32, 0, scalar_column);
++    // The scalar tiles past the pieces read_scalar reads, while those arrive.
++    for (CircularBuffer* cb : {&beta_logits_cb, &delta_time_cb, &a_log_cb, &dt_bias_cb}) {
++        noc.async_write_zeros(*cb, 4096 - 64, {.offset_bytes = 64});
++    }
 +    noc.async_read_barrier();
 +    noc.write_zeros_l1_barrier();
-+    if (token == 0) {
-+        state_cb.push_back(state_tiles);
-+    }
 +    query_cb.push_back(kt);
 +    key_cb.push_back(kt);
 +    value_cb.push_back(vt);
-+    make_scalar_tile<GateLogits>(noc, beta_logits_cb, scalar_row, scalar_column);
++    make_scalar_tile<GateLogits>(beta_logits_cb, scalar_row, scalar_column);
 +    beta_logits_cb.push_back(1);
-+    make_scalar_tile<GateLogits>(noc, delta_time_cb, scalar_row, scalar_column);
++    make_scalar_tile<GateLogits>(delta_time_cb, scalar_row, scalar_column);
 +    delta_time_cb.push_back(1);
-+    make_scalar_tile<uint32_t>(noc, a_log_cb, 0, scalar_column);
++    make_scalar_tile<uint32_t>(a_log_cb, 0, scalar_column);
 +    a_log_cb.push_back(1);
-+    make_scalar_tile<uint32_t>(noc, dt_bias_cb, 0, scalar_column);
++    make_scalar_tile<uint32_t>(dt_bias_cb, 0, scalar_column);
 +    dt_bias_cb.push_back(1);
 +    }
 +    }
@@ -1369,7 +1419,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/recurrent_utils.hpp
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,40 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1378,6 +1428,8 @@ new file mode 100644
 +#include <stdint.h>
 +
 +#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/circular_buffer.h"
++#include "api/dataflow/noc.h"
 +
 +FORCE_INLINE uint32_t tile_offset(uint32_t row, uint32_t column) {
 +    const uint32_t face = (row / 16) * 2 + column / 16;
@@ -1396,11 +1448,23 @@ new file mode 100644
 +    return tile[tile_offset(0, batch)] != 0;
 +}
 +
++// Row 0 of an interleaved single-page tile, its first `columns` elements of
++// `element_bytes`, read to their place in the circular buffer's tile. Every
++// worker reads the metadata tiles, which sit in one DRAM bank; reading their
++// first row instead of whole tiles keeps the bank from serializing them.
++template <typename Accessor>
++FORCE_INLINE void read_first_row(
++    Noc& noc, const Accessor& tensor, CircularBuffer& cb, uint32_t element_bytes, uint32_t columns) {
++    for (uint32_t face = 0; face * 16 < columns; ++face) {
++        const uint32_t offset = face * 256 * element_bytes;
++        noc.async_read(tensor, cb, 64, {.page_id = 0, .offset_bytes = offset}, {.offset_bytes = offset});
++    }
++}
 diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/state_pool_update.cpp
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,63 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1441,9 +1505,7 @@ new file mode 100644
 +    // This kernel owns both buffers; reuse them as scratch without queueing tiles.
 +    data_cb.reserve_back(1);
 +    indices_cb.reserve_back(1);
-+    noc.async_read(
-+        state_indices, indices_cb, 4096,
-+        {.page_id = 0}, {.offset_bytes = 0});
++    read_first_row(noc, state_indices, indices_cb, sizeof(uint32_t), batch_size);
 +    noc.async_read_barrier();
 +    const uint32_t total_pages = batch_size * pages_per_slice;
 +    for (uint32_t work = worker; work < total_pages; work += num_workers) {
@@ -1507,7 +1569,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/writer_gated_delta_decode.cpp
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,135 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1537,28 +1599,42 @@ new file mode 100644
 +    const uint32_t worker = get_arg_val<uint32_t>(0);
 +    const uint32_t output_address = get_arg_val<uint32_t>(1);
 +    const uint32_t state_address = get_arg_val<uint32_t>(2);
-+    const uint32_t state_indices_address = get_arg_val<uint32_t>(3);
++    const uint32_t state_slots_address = get_arg_val<uint32_t>(3);
++    const uint32_t state_indices_address = get_arg_val<uint32_t>(4);
++    const uint32_t has_initial_state_address = get_arg_val<uint32_t>(5);
 +
 +    constexpr auto output_args = TensorAccessorArgs<8>();
 +    constexpr auto state_args =
 +        TensorAccessorArgs<output_args.next_compile_time_args_offset()>();
-+    constexpr auto state_indices_args =
++    constexpr auto state_slots_args =
 +        TensorAccessorArgs<state_args.next_compile_time_args_offset()>();
++    constexpr auto state_indices_args =
++        TensorAccessorArgs<state_slots_args.next_compile_time_args_offset()>();
++    constexpr auto has_initial_state_args =
++        TensorAccessorArgs<state_indices_args.next_compile_time_args_offset()>();
 +    const auto output = TensorAccessor(output_args, output_address, output_tile_bytes);
 +    const auto state = TensorAccessor(state_args, state_address, state_tile_bytes);
-+    const auto state_indices =
-+        TensorAccessor(state_indices_args, state_indices_address, 4096);
++    const auto state_slots = TensorAccessor(state_slots_args, state_slots_address, 4096);
++    const auto state_indices = TensorAccessor(state_indices_args, state_indices_address, 4096);
++    const auto has_initial_state = TensorAccessor(has_initial_state_args, has_initial_state_address, 2048);
 +
++    CircularBuffer state_in_cb(tt::CBIndex::c_0);
 +    CircularBuffer output_cb(tt::CBIndex::c_12);
 +    CircularBuffer state_cb(tt::CBIndex::c_11);
-+    CircularBuffer state_indices_cb(tt::CBIndex::c_29);
++    CircularBuffer state_indices_cb(tt::CBIndex::c_15);
++    CircularBuffer has_initial_state_cb(tt::CBIndex::c_17);
++    CircularBuffer state_slots_cb(tt::CBIndex::c_29);
 +    Noc noc;
 +
 +    // Metadata is shared by every head handled by this core.
 +    state_indices_cb.reserve_back(1);
-+    noc.async_read(
-+        state_indices, state_indices_cb, 4096,
-+        {.page_id = 0}, {.offset_bytes = 0});
++    has_initial_state_cb.reserve_back(1);
++    read_first_row(noc, state_indices, state_indices_cb, sizeof(uint32_t), batch_size);
++    read_first_row(noc, has_initial_state, has_initial_state_cb, sizeof(uint16_t), batch_size);
++    if constexpr (has_slots) {
++        state_slots_cb.reserve_back(1);
++        noc.async_read(state_slots, state_slots_cb, 4096, {.page_id = 0}, {.offset_bytes = 0});
++    }
 +    noc.async_read_barrier();
 +
 +    for (uint32_t work = worker; work < batch_size * num_heads * workers_per_head; work += num_workers) {
@@ -1566,6 +1642,28 @@ new file mode 100644
 +        const uint32_t column_start = (work % workers_per_head) * vt;
 +        const uint32_t batch = head_work / num_heads;
 +        const uint32_t head = head_work % num_heads;
++
++        // The state, which the compute kernel carries between steps, read
++        // while the reader brings q, k and v.
++        const uint32_t initial_slot = read_index(state_indices_cb.get_write_ptr(), batch);
++        const uint32_t initial_base = (initial_slot * num_heads + head) * kt * full_vt;
++        state_in_cb.reserve_back(state_tiles);
++        if (read_flag(has_initial_state_cb.get_write_ptr(), batch)) {
++            for (uint32_t row = 0; row < kt; ++row) {
++                for (uint32_t column = 0; column < vt; ++column) {
++                    noc.async_read(
++                        state, state_in_cb, state_tile_bytes,
++                        {.page_id = initial_base + row * full_vt + column_start + column},
++                        {.offset_bytes = (row * vt + column) * state_tile_bytes});
++                }
++            }
++            noc.async_read_barrier();
++        } else {
++            noc.async_write_zeros(state_in_cb, state_tiles * state_tile_bytes);
++            noc.write_zeros_l1_barrier();
++        }
++        state_in_cb.push_back(state_tiles);
++
 +        for (uint32_t token = 0; token < tokens; ++token) {
 +        const uint32_t step = batch * tokens + token;
 +        const uint32_t head_tile = step * ((num_heads + 31) / 32) + head / 32;
@@ -1574,8 +1672,8 @@ new file mode 100644
 +
 +        const uint32_t state_slot = has_slots
 +            ? reinterpret_cast<const volatile tt_l1_ptr uint32_t*>(
-+                  state_indices_cb.get_write_ptr())[tile_offset(batch, token)]
-+            : read_index(state_indices_cb.get_write_ptr(), batch);
++                  state_slots_cb.get_write_ptr())[tile_offset(batch, token)]
++            : initial_slot;
 +
 +        const uint32_t state_base =
 +            (state_slot * num_heads + head) * kt * full_vt;
@@ -1758,20 +1856,20 @@ new file mode 100644
 +    constexpr uint32_t vt = 4;
 +    const uint32_t tokens = steps(in);
 +    const uint32_t batch_size = in.beta_logits.logical_shape()[0] / tokens;
++    const uint32_t num_heads = in.beta_logits.logical_shape()[1];
++    auto* device = in.qkv.device();
++    const CoreCoord grid = device->compute_with_storage_grid_size();
 +    // Each worker takes some of a head's value tiles and runs a state's steps
-+    // one after another. Four workers per head shorten the steps of a single
-+    // state; with more states, two are faster.
-+    const uint32_t workers_per_head = batch_size == 1 && tokens > 1 ? 4 : 2;
++    // one after another. Four workers per head shorten each state's work when
++    // all of them fit on the grid at once; otherwise two are faster.
++    const uint32_t workers_per_head = batch_size * num_heads * 4 <= grid.x * grid.y ? 4 : 2;
 +    const uint32_t worker_vt = vt / workers_per_head;
 +    const uint32_t state_tiles = kt * worker_vt;
-+    const uint32_t num_heads = in.beta_logits.logical_shape()[1];
 +    const uint32_t num_key_heads = key_heads(in);
 +    // Without state slots, each state goes back to its own slot.
 +    const Tensor& state_slots = in.state_slots.value_or(in.state_indices);
 +    ProgramDescriptor program;
 +
-+    auto* device = in.qkv.device();
-+    const CoreCoord grid = device->compute_with_storage_grid_size();
 +    const uint32_t num_workers =
 +        std::min(batch_size * num_heads * workers_per_head,
 +                 static_cast<uint32_t>(grid.x * grid.y));
@@ -1800,11 +1898,10 @@ new file mode 100644
 +    make_cb(12, worker_vt);   // output
 +    make_cb(13, 1);           // A log
 +    make_cb(14, 1);           // delta-time bias
-+    make_cb(15, 1, tt::DataFormat::Int32);      // state index (reader)
++    make_cb(15, 1, tt::DataFormat::Int32);      // state index (writer)
 +    make_cb(16, 1);           // beta
-+    make_cb(17, 1, tt::DataFormat::Float16_b);  // has-initial-state flag
++    make_cb(17, 1, tt::DataFormat::Float16_b);  // has-initial-state flag (writer)
 +    make_cb(20, 1);           // decay
-+    make_cb(21, 1);           // squared norm
 +    make_cb(22, 1);           // key normalization factor
 +    make_cb(23, 1);           // query normalization factor
 +    if (tokens > 1) {
@@ -1820,9 +1917,6 @@ new file mode 100644
 +    TensorAccessorArgs(in.delta_time.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.a_log.buffer()).append_to(reader_args);
 +    TensorAccessorArgs(in.dt_bias.buffer()).append_to(reader_args);
-+    TensorAccessorArgs(in.state.buffer()).append_to(reader_args);
-+    TensorAccessorArgs(in.state_indices.buffer()).append_to(reader_args);
-+    TensorAccessorArgs(in.has_initial_state.buffer()).append_to(reader_args);
 +
 +    std::vector<uint32_t> writer_args = {
 +        kt, vt, batch_size, num_heads, workers_per_head, num_workers, tokens,
@@ -1830,6 +1924,8 @@ new file mode 100644
 +    TensorAccessorArgs(output.buffer()).append_to(writer_args);
 +    TensorAccessorArgs(in.state.buffer()).append_to(writer_args);
 +    TensorAccessorArgs(state_slots.buffer()).append_to(writer_args);
++    TensorAccessorArgs(in.state_indices.buffer()).append_to(writer_args);
++    TensorAccessorArgs(in.has_initial_state.buffer()).append_to(writer_args);
 +
 +    const std::string kernel_dir =
 +        "ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/";
@@ -1869,13 +1965,15 @@ new file mode 100644
 +             in.beta_logits.buffer(),
 +             in.delta_time.buffer(),
 +             in.a_log.buffer(),
-+             in.dt_bias.buffer(),
-+             in.state.buffer(),
-+             in.state_indices.buffer(),
-+             in.has_initial_state.buffer()});
++             in.dt_bias.buffer()});
 +        writer.emplace_runtime_args(
 +            core,
-+            {worker, output.buffer(), in.state.buffer(), state_slots.buffer()});
++            {worker,
++             output.buffer(),
++             in.state.buffer(),
++             state_slots.buffer(),
++             in.state_indices.buffer(),
++             in.has_initial_state.buffer()});
 +        compute.emplace_runtime_args(core, {worker});
 +    }
 +
