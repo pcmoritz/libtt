@@ -143,9 +143,9 @@ new file mode 100644
 +
 +// Float32 to float8 bytes, rounded to nearest even with subnormals kept, as PyTorch and XLA convert:
 +// values past the largest finite one become NaN (e4m3fn) or infinity (e5m2).
-+template <int M, int BIAS, bool HAS_INF>
++template <int M, int BIAS, bool HAS_INF, int ITERATIONS = 8>
 +inline void calculate_fp32_to_fp8() {
-+    for (int d = 0; d < 8; d++) {
++    for (int d = 0; d < ITERATIONS; d++) {
 +        const sfpi::vUInt input = sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>();
 +        sfpi::vInt magnitude = sfpi::as<sfpi::vInt>(input & 0x7fffffff);
 +        // NaNs as infinity, which keeps the sums below from overflowing.

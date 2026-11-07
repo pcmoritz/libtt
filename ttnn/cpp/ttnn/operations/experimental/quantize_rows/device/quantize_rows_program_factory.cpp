@@ -175,6 +175,7 @@ ttnn::device_operation::ProgramArtifacts QuantizeRowsProgramFactory::create_prog
             },
         .compile_time_args =
             {{"stride", plan.stride},
+             {"rows", plan.rows},
              {"pack", plan.pack},
              {"cores", num_cores},
              {"gather_tiles", plan.gather_tiles()},
