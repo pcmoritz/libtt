@@ -125,3 +125,54 @@ def test_fp8_linear_small_m(tmp_path, tokens, k, n, scale_shape):
     assert re.search(r'"ttnn\.scaled_matmul".*-> tensor<\d+x\d+xbf16', ir), "no BF16 ttnn.scaled_matmul"
     assert '"ttnn.multiply"' not in ir, "a scale multiply was left unfused"
     assert not re.search(rf'"ttnn\.reshape".*tensor<{n}x1xf32', ir), "the weight scales were reshaped"
+
+
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize(
+    "rows,width,dtype",
+    [
+        # Qwen3.8-27B's hidden size and its MLP down projection's input on
+        # four chips; every row stride; e5m2.
+        (1, 5120, jnp.float8_e4m3fn),
+        (4, 4352, jnp.float8_e4m3fn),
+        (13, 2048, jnp.float8_e4m3fn),
+        (32, 1024, jnp.float8_e4m3fn),
+        (1, 5120, jnp.float8_e5m2),
+    ],
+)
+def test_quantize_rows_of_a_decode_norm(trace, rows, width, dtype, tmp_path):
+    """The quantization of a decode norm's output runs in the norm's program
+    (rms_norm_residual), which still returns the norm, and equals the
+    separate programs bit for bit."""
+    eps = 1e-6
+
+    def norm(x, r, w):
+        h = x + r
+        hf = h.astype(jnp.float32)
+        var = jnp.mean(hf * hf, axis=-1, keepdims=True)
+        return (hf * (jax.lax.rsqrt(var + eps) * w.reshape(1, -1))).astype(jnp.bfloat16), h
+
+    def layer(x, r, w):
+        n, h = norm(x, r, w)
+        return quantize_rows(n, dtype), n, h
+
+    options = {"optimization_level": "O1", "enable_trace": str(trace).lower()}
+    fused = jax.jit(layer, compiler_options={**options, "export_path": str(tmp_path)})
+    separate_norm = jax.jit(norm, compiler_options=options)
+    separate_quantize = jax.jit(lambda n: quantize_rows(n, dtype), compiler_options=options)
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(rows * 7 + width)
+    for _ in range(2):
+        x, r = (jnp.asarray(activations(rng, rows, width), jnp.bfloat16) for _ in range(2))
+        w = jnp.asarray(rng.uniform(0.5, 1.5, width), jnp.float32)
+        args = [jax.device_put(a, device) for a in (x, r, w)]
+        (q, scale), n, h = fused(*args)
+        want_n, want_h = separate_norm(*args)
+        want_q, want_scale = separate_quantize(want_n)
+        np.testing.assert_array_equal(np.asarray(n, np.float32), np.asarray(want_n, np.float32))
+        np.testing.assert_array_equal(np.asarray(h, np.float32), np.asarray(want_h, np.float32))
+        np.testing.assert_array_equal(np.asarray(scale), np.asarray(want_scale))
+        np.testing.assert_array_equal(codes(q), codes(want_q))
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_*.mlir")]
+    assert irs and any("ttnn.rms_norm_residual" in ir for ir in irs), "the add and the norm were not fused"
+    assert not any("ttnn.quantize_rows" in ir for ir in irs), "the quantization ran as its own program"

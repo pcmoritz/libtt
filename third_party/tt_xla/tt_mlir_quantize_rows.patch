@@ -242,6 +242,57 @@ diff --git a/lib/Dialect/StableHLO/Transforms/DecomposeCustomCallTuples.cpp b/li
    }
  };
  } // namespace mlir::tt::stablehlo
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -4436,6 +4436,39 @@ public:
+     return success();
+   }
+ };
++
++// Fuses the float8 quantization of a decode norm's output into the norm's
++// program, which still returns the norm (Qwen3.8's gated DeltaNet layers also
++// read it in BF16):
++//   norm, sum = rms_norm_residual(x, r, w); q, scale = quantize_rows(norm)
++//   -> norm, sum, q, scale = rms_norm_residual(x, r, w)
++class RMSNormResidualQuantizeFusionPattern
++    : public mlir::OpRewritePattern<QuantizeRowsOp> {
++public:
++  using mlir::OpRewritePattern<QuantizeRowsOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(QuantizeRowsOp op,
++                  mlir::PatternRewriter &rewriter) const override {
++    auto norm = op.getInput().getDefiningOp<RMSNormResidualOp>();
++    if (!norm || op.getInput() != norm.getOutput() ||
++        !norm.getQuantized().empty() ||
++        !norm.getOutput().getType().getElementType().isBF16()) {
++      return failure();
++    }
++    rewriter.setInsertionPoint(norm);
++    auto fused = rewriter.create<RMSNormResidualOp>(
++        norm.getLoc(),
++        TypeRange{norm.getOutput().getType(), norm.getSum().getType(),
++                  op.getOutput().getType(), op.getScale().getType()},
++        norm.getInput(), norm.getResidual(), norm.getWeight(),
++        norm.getEpsilonAttr(), norm.getWeightOffsetAttr(),
++        op.getFloat8TypeAttr(), op.getMinScaleAttr());
++    rewriter.replaceOp(op, fused.getQuantized());
++    rewriter.replaceOp(norm, ValueRange{fused.getOutput(), fused.getSum()});
++    return success();
++  }
++};
+ 
+ // TTNN lays out the last two dims of a tensor as 32x32 tiles, so a [1, 10240]
+ // view takes 320 tiles where [1, 4, 2560] takes 80. An elementwise op next to
+@@ -4704,6 +4734,7 @@ public:
+       patterns.add<RMSNormFusionPattern>(&getContext());
+       patterns.add<NormalizeRMSNormFusionPattern>(&getContext());
+       patterns.add<RMSNormResidualFusionPattern>(&getContext());
++      patterns.add<RMSNormResidualQuantizeFusionPattern>(&getContext());
+ 
+       patterns.add<GeluFusionPattern>(&getContext());
+       patterns.add<Relu6FusionPattern>(&getContext());
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
