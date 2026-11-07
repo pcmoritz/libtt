@@ -54,6 +54,18 @@ protected:
     std::shared_ptr<MeshDevice> mesh_device_;
 };
 
+// FP32 rows reshaped to one row, as SGLang-TorchTPU's gathered logits [4, N]
+// to [1, 4 * N], take rows_to_row: each output tile is one row of an input
+// tile. Rows past the top faces, rank-1 and rank-3 targets.
+TEST_F(ReshapeTiledTest, RowsToOneRow) {
+    expect_reshape(ttnn::Shape({4, 62080}), ttnn::Shape({1, 248320}), DataType::FLOAT32);
+    expect_reshape(ttnn::Shape({4, 37984}), ttnn::Shape({1, 151936}), DataType::FLOAT32);
+    expect_reshape(ttnn::Shape({2, 64}), ttnn::Shape({128}), DataType::FLOAT32);
+    expect_reshape(ttnn::Shape({17, 64}), ttnn::Shape({1, 1088}), DataType::FLOAT32);
+    expect_reshape(ttnn::Shape({32, 96}), ttnn::Shape({1, 3072}), DataType::FLOAT32);
+    expect_reshape(ttnn::Shape({1, 4, 128}), ttnn::Shape({1, 1, 512}), DataType::FLOAT32);
+}
+
 TEST_F(ReshapeTiledTest, OneTilePerOutputPage) {
     expect_reshape(ttnn::Shape({1, 4, 2560}), ttnn::Shape({1, 10240}), DataType::BFLOAT16);
     expect_reshape(ttnn::Shape({1, 12, 128}), ttnn::Shape({1, 1536}), DataType::BFLOAT16);
