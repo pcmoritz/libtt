@@ -611,7 +611,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
-@@ -0,0 +1,390 @@
+@@ -0,0 +1,384 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -689,12 +689,6 @@ new file mode 100644
 +// elsewhere. The compute API takes no vector mode for most of these functions,
 +// so the helpers call them directly.
 +constexpr int row_iterations = 2;
-+
-+ALWI void row_add_unary(uint32_t idst, uint32_t value) {
-+    MATH(SFPU_UNARY_CALL(
-+        DST_SYNC_MODE, DST_ACCUM_MODE, calculate_binop_with_scalar,
-+        (APPROX, ADD_UNARY, row_iterations, DST_ACCUM_MODE), idst, VectorMode::R, value));
-+}
 +
 +ALWI void row_mul_unary(uint32_t idst, uint32_t value) {
 +    MATH(SFPU_UNARY_CALL(
@@ -1250,7 +1244,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/dataflow/reader_gated_delta_decode.cpp
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,170 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1403,7 +1397,6 @@ new file mode 100644
 +    read_scalar<uint32_t>(noc, dt_bias, dt_bias_cb, head / 32, 0, scalar_column);
 +    // The scalar tiles past the pieces read_scalar reads, while those arrive.
 +    for (CircularBuffer* cb : {&beta_logits_cb, &delta_time_cb, &a_log_cb, &dt_bias_cb}) {
-+        cb->reserve_back(1);
 +        noc.async_write_zeros(*cb, 4096 - 64, {.offset_bytes = 64});
 +    }
 +    noc.async_read_barrier();
