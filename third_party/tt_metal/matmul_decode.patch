@@ -1584,15 +1584,16 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.hpp
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-@@ -14,6 +14,7 @@
+@@ -14,6 +14,8 @@
  #include "ttnn/operations/copy/typecast/typecast.hpp"
  #include "ttnn/operations/eltwise/unary/common/unary_op_utils.hpp"
  #include "ttnn/operations/creation/creation.hpp"
 +#include "ttnn/operations/data_movement/slice/slice.hpp"
++#include "ttnn/operations/experimental/silu_and_mul/silu_and_mul.hpp"
  
  #include "ttnn/operations/matmul/device/config/matmul_program_config.hpp"
  #include "ttnn/operations/matmul/device/matmul_device_operation.hpp"
-@@ -271,14 +272,16 @@ static ttnn::Tensor bound_matmul(
+@@ -271,14 +273,16 @@ static ttnn::Tensor bound_matmul(
          parameters.transpose_a,
          parameters.transpose_b,
          bias_single_tile_size,
@@ -1611,16 +1612,25 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
      bool needs_manual_transpose_a = parameters.transpose_a && needs_manual_transpose;
      bool needs_manual_transpose_b = parameters.transpose_b && needs_manual_transpose;
  
-@@ -436,6 +439,79 @@ Tensor matmul(
+@@ -436,6 +440,104 @@ Tensor matmul(
          optional_output_tensor);
  }
  
 +namespace {
 +// PyTorch's SiluAndMul as TT runs its ops on a BF16 [..., gate | up] product:
-+// the halves sliced, silu of the gate in FP32 cast back to BF16, times up.
++// the halves sliced, silu of the gate in FP32 cast back to BF16, times up. One
++// program (ttnn::experimental::silu_and_mul, bit for bit those ops) for a
++// tiled interleaved product of whole tiles per half.
 +Tensor silu_and_mul(const Tensor& product, const MemoryConfig& memory_config) {
 +    const auto& shape = product.logical_shape();
 +    const uint32_t half = shape[-1] / 2;
++    using tt::tt_metal::TensorMemoryLayout;
++    if (product.dtype() == DataType::BFLOAT16 && product.layout() == tt::tt_metal::Layout::TILE &&
++        product.tensor_spec().tile() == tt::tt_metal::Tile() &&
++        product.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED &&
++        memory_config.memory_layout() == TensorMemoryLayout::INTERLEAVED && half % tt::constants::TILE_WIDTH == 0) {
++        return ttnn::experimental::silu_and_mul(product, memory_config);
++    }
 +    ttsl::SmallVector<uint32_t> begins(shape.rank(), 0), ends(shape.cbegin(), shape.cend()), step(shape.rank(), 1);
 +    ends.back() = half;
 +    const Tensor gate = ttnn::slice(product, begins, ends, step, memory_config);
@@ -1632,6 +1642,19 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 +        DataType::BFLOAT16,
 +        memory_config);
 +    return ttnn::multiply(silu, up, DataType::BFLOAT16, memory_config);
++}
++
++// Whether the decode program with each output tile's gate and up halves on
++// one core gives its busiest core more of a weight's weight_Nt tile columns
++// than the decode program of the whole weight does, whose SwiGLU then runs
++// apart (Qwen3.8-27B's [5120, 2 x 4352] gate and up projection on four chips:
++// 136 pairs over 110 cores leave 26 cores with four columns where the 272
++// columns leave at most three, FP8 115 -> 105 us plus SiluAndMul's program).
++bool swiglu_unbalanced(const MatmulDecodeProgramConfig& config, uint32_t weight_Nt) {
++    const uint32_t cores = config.compute_with_storage_grid_size.x * config.compute_with_storage_grid_size.y;
++    // The most tiles a core takes of `tiles` spread over the cores.
++    const auto busiest = [cores](uint32_t tiles) { return (tiles + cores - 1) / cores; };
++    return 2 * busiest(weight_Nt / 2) > busiest(weight_Nt);
 +}
 +}  // namespace
 +
@@ -1660,9 +1683,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 +            get_program_config(input_tensor_a, input_tensor_b, false, transpose_b, 0, attributes);
 +        normalize_program_config(config, grid);
 +        auto* decode = std::get_if<MatmulDecodeProgramConfig>(&config);
-+        if (decode == nullptr || decode->k_splits != 1) {
++        const uint32_t weight_Nt = input_tensor_b.padded_shape()[transpose_b ? -2 : -1] / tt::constants::TILE_WIDTH;
++        if (decode == nullptr || decode->k_splits != 1 || swiglu_unbalanced(*decode, weight_Nt)) {
 +            // A narrow weight's matmul splits over K (or runs the 1D program),
-+            // which beats one core per gate and up pair: SiluAndMul's ops apart.
++            // which beats one core per gate and up pair, as does the matmul of
++            // the whole weight when pairs leave cores unbalanced: SiluAndMul's
++            // ops apart.
 +            return silu_and_mul(
 +                ttnn::matmul(
 +                    input_tensor_a,

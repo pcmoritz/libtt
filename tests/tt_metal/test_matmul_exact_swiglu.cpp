@@ -7,7 +7,8 @@
 // bit: BF16 weights in either layout and FP8 weights with row, column and
 // single column scales, for one to 32 rows. The shapes keep the projection on
 // the decode program unsplit over K, as the fused one runs; a narrower weight,
-// whose matmul splits over K, runs SiluAndMul's ops apart.
+// whose matmul splits over K, and a weight whose gate and up pairs would leave
+// cores unbalanced run SiluAndMul apart.
 #include <gtest/gtest.h>
 
 #include <bit>
@@ -172,6 +173,17 @@ TEST_F(MatmulExactSwiGLUTest, SplitOverKRunsTheOpsApart) {
     for (uint32_t M : {1u, 4u}) {
         EXPECT_EQ(bf16_mismatches(M, 1024, 768, true), 0u) << M;
         EXPECT_EQ(fp8_mismatches(M, 1024, 768, Col::Column), 0u) << M;
+    }
+}
+
+// Qwen3.8-27B's gate and up projection on four chips, [5120, 2 x 4352]: its
+// 136 gate and up pairs would leave 26 of 110 cores with two, so the matmul of
+// the whole weight runs, and SiluAndMul in one program after it. 40 rows run
+// the 1D matmul, and SiluAndMul over two tile rows.
+TEST_F(MatmulExactSwiGLUTest, UnbalancedPairsRunTheMatmulApart) {
+    for (uint32_t M : {1u, 4u, 40u}) {
+        EXPECT_EQ(bf16_mismatches(M, 5120, 4352, true), 0u) << M;
+        EXPECT_EQ(fp8_mismatches(M, 5120, 4352, Col::Column), 0u) << M;
     }
 }
 

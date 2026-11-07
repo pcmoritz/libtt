@@ -532,7 +532,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-@@ -518,6 +518,98 @@ Tensor matmul_swiglu(
+@@ -518,6 +518,101 @@ Tensor matmul_swiglu(
          .at(0);
  }
  
@@ -568,8 +568,11 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 +    auto* decode = std::get_if<MatmulDecodeProgramConfig>(&config);
 +    if (swiglu) {
 +        // Each output tile's gate and up halves on one core, unless the
-+        // matmul splits over K (see matmul_swiglu).
-+        if (decode != nullptr && decode->k_splits == 1) {
++        // matmul splits over K or the pairs leave cores unbalanced (see
++        // matmul_swiglu).
++        if (decode != nullptr && decode->k_splits == 1 &&
++            !swiglu_unbalanced(
++                *decode, input_tensor_b.padded_shape()[transpose_b ? -2 : -1] / tt::constants::TILE_WIDTH)) {
 +            decode->fuse_swiglu = true;
 +            decode->exact_swiglu = true;
 +        } else {
