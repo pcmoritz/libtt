@@ -334,15 +334,18 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp ttnn/
  #include <bit>
  #include <functional>
  #include <type_traits>
-@@ -21,6 +22,7 @@
+@@ -21,8 +22,10 @@
  #include "ttnn/operations/data_movement/sharded/sharded_to_interleaved/sharded_to_interleaved.hpp"
  #include "ttnn/operations/data_movement/sharded/interleaved_to_sharded/interleaved_to_sharded.hpp"
  #include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
 +#include "ttnn/operations/data_movement/transpose/transpose.hpp"
  #include "ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.hpp"
  #include "ttnn/operations/experimental/reshape/view.hpp"
++#include "ttnn/operations/experimental/rows_to_row/rows_to_row.hpp"
  #include "ttnn/operations/functions.hpp"
-@@ -747,6 +749,23 @@
+ #include "ttnn/operation.hpp"
+ #include "ttnn/tensor/tensor_utils.hpp"
+@@ -747,6 +750,29 @@ ttnn::Tensor ttnn::reshape(
              pad_value.value_or(default_pad_value),
              sub_core_grid);
      }
@@ -362,6 +365,12 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp ttnn/
 +        tile.get_height() == tile_first_dim && tile.get_width() == tile_second_dim && !pad_value.has_value() &&
 +        !sub_core_grid.has_value() && !mem_config.is_sharded() && !tensor.memory_config().is_sharded()) {
 +        return ttnn::transpose(tensor, -2, -1, mem_config);
++    }
++    // A tiled [..., R, N] to its rows in one row, as SGLang-TorchTPU's gathered logits [4, N] to [1, 4 * N]:
++    // each output tile is one row of an input tile.
++    if (ttnn::experimental::is_rows_to_row(tensor, logical_shape) && !pad_value.has_value() &&
++        !sub_core_grid.has_value() && !mem_config.is_sharded()) {
++        return ttnn::experimental::rows_to_row(tensor, logical_shape, mem_config);
 +    }
      // Preserve whether the caller explicitly passed pad_value. value_or(default_pad_value) below
      // collapses that signal, but reshape_tiled needs it to gate the default-off fill for non-BF8.
