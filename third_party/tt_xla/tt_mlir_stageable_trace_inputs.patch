@@ -46,7 +46,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp
-@@ -155,6 +155,26 @@ private:
+@@ -157,6 +157,26 @@ private:
             ttcore::isKVCacheArgument(op, argIndex);
    }
  
@@ -73,7 +73,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
    // Check if a value should remain on device during trace capture.
    // Handles three cases:
    // 1. Direct BlockArgument → checks shouldKeepArgOnDevice
-@@ -169,7 +189,8 @@ private:
+@@ -171,7 +191,8 @@ private:
        if (!funcOp) {
          return false;
        }
@@ -83,7 +83,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
      }
  
      auto *defOp = value.getDefiningOp();
-@@ -341,6 +362,9 @@ private:
+@@ -343,6 +364,9 @@ private:
      // and converts the rest to system memory, and the runtime uses the
      // resulting storage type to decide which inputs to pass to which program.
      size_t numDeviceResident = 0;
@@ -93,7 +93,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
      // Persistent slot type per tensor input argument: a device-resident
      // argument is its own slot and keeps its type; a host-staged argument
      // gets a DRAM slot to be written into.
-@@ -416,6 +440,12 @@ private:
+@@ -418,6 +442,12 @@ private:
              inputs.begin(), inputs.begin() + numTensorInputs,
              [&](mlir::Value input) { return isDeviceResidentValue(input); }) -
          inputs.begin();
@@ -106,7 +106,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
  
      for (mlir::Value output : outputs) {
        outputTypes.push_back(output.getType());
-@@ -522,6 +552,7 @@ private:
+@@ -524,6 +554,7 @@ private:
      info.traceFunc = traceFuncOp;
      info.numTensorInputs = numTensorInputs;
      info.numDeviceResident = numDeviceResident;
@@ -114,7 +114,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
      for (size_t i = 0; i < numTensorInputs; i++) {
        auto tensorType = mlir::cast<RankedTensorType>(inputs[i].getType());
        info.inputArgAttrs.push_back(
-@@ -989,6 +1020,7 @@ private:
+@@ -991,6 +1022,7 @@ private:
          allocateSlotsTraceSymbolAttr, captureTraceSymbolAttr,
          executeTraceSymbolAttr,
          builder.getI32IntegerAttr(static_cast<int32_t>(info.numDeviceResident)),
@@ -122,6 +122,48 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
          tensorInputs, semaphoreInputs);
  
      // Replace uses of original outputs with the output of the trace op function
+@@ -1048,6 +1080,33 @@ private:
+     return mlir::success();
+   }
+ 
++  // Moves each bitcast of a program argument next to its first user.
++  // torch_tpu bitcasts its float8 weights' bytes at the top of a program, in
++  // the first trace, and a value that a later trace reads is copied into a
++  // slot of that trace on every call: for the weights of every traced
++  // program, gigabytes. Next to the matmul that reads it, the bitcast (a view
++  // between UINT8 and float8) is in that trace, which reads the argument in
++  // place.
++  static void sinkArgumentBitcasts(mlir::Block &block) {
++    for (Operation &op :
++         llvm::make_early_inc_range(block.without_terminator())) {
++      auto bitcast = ::mlir::dyn_cast<ttnn::BitcastConvertOp>(op);
++      if (!bitcast || !mlir::isa<BlockArgument>(bitcast.getInput())) {
++        continue;
++      }
++      Operation *first = nullptr;
++      for (Operation *user : bitcast->getUsers()) {
++        Operation *ancestor = block.findAncestorOpInBlock(*user);
++        if (ancestor && (!first || ancestor->isBeforeInBlock(first))) {
++          first = ancestor;
++        }
++      }
++      if (first) {
++        bitcast->moveBefore(first);
++      }
++    }
++  }
++
+   // ttnn.adamw is not hoistable (host readback of lr / beta*_pow), so an
+   // adamw followed by hoistable compute would split the trace region and fail
+   // below. adamw has no results and mutates its param / moment operands in
+@@ -1249,6 +1308,7 @@ private:
+     mlir::Block &block = funcOp.getBlocks().front();
+ 
+     sinkAdamWOpsToEnd(block);
++    sinkArgumentBitcasts(block);
+ 
+     Operation *firstHoistable = nullptr;
+     llvm::SmallVector<Operation *> independentOps;
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
