@@ -89,3 +89,39 @@ def test_sums_over_a_unit_dimension():
     np.testing.assert_array_equal(total, x[..., 0])
     np.testing.assert_allclose(squares, x[..., 0] ** 2, rtol=1e-6)
     np.testing.assert_array_equal(jax.jit(lambda x: jnp.argmin(x, axis=2))(x), np.zeros((3, 4)))
+
+
+@pytest.mark.parametrize("dtype", [np.float32, jnp.bfloat16])
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize("rows,width", [(1, 248320), (4, 2048), (20, 96)])
+# O1's optimizer must keep the input tiled too (its own argmax rule wants it
+# row-major).
+@pytest.mark.parametrize("level", ["O0", "O1"])
+def test_index_of_a_tiled_row(dtype, trace, rows, width, level, tmp_path):
+    """torch_tpu's greedy sampling argmax: only the index of a reduce from
+    finfo.min. The rows of one tile row stay tiled and libtt's row argmax takes
+    the init as its floor, with no maximum of the input against it: index 0
+    where no element exceeds the init, as in a row of -inf or [-inf, finfo.min],
+    else the first maximum."""
+    info = np.finfo(np.float32)
+    x = np.random.default_rng(rows).standard_normal((rows, width)).astype(np.float32)
+    x[:, width // 3] = x[:, width // 5]  # ties go to the first index
+    if rows > 2:
+        x[1] = -np.inf
+        x[2] = -np.inf
+        x[2, 3] = info.min
+    x = x.astype(dtype)
+    run = jax.jit(
+        lambda x: _arg_reduce(x, True, info.min, nan_aware=True)[1],
+        compiler_options={"optimization_level": level, "enable_trace": str(trace).lower(), "export_path": str(tmp_path)},
+    )
+    got = np.asarray(run(jax.device_put(x, jax.devices("tt")[0])))
+    xf = np.asarray(x, np.float32)
+    want = np.where(np.max(xf, axis=1) > info.min, np.argmax(xf, axis=1), 0)
+    np.testing.assert_array_equal(got, want)
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert irs and all('"ttnn.maximum"' not in ir for ir in irs), "the init was combined into the input"
+    # In BFLOAT16 finfo(float32).min rounds to -inf, the reduction's identity:
+    # no floor then.
+    if dtype == np.float32:
+        assert all("floor = " in ir for ir in irs if '"ttnn.argmax"' in ir)
