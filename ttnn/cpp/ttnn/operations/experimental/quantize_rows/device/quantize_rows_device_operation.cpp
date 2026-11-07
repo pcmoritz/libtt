@@ -27,17 +27,17 @@ QuantizeRowsPlan quantize_rows_plan(const Tensor& input, uint32_t grid_x, uint32
     // a point more cores cost more than the work they share (gtest timings:
     // 1x12288 13.4 us on 32 cores, 10.8 on 48; 16x4096 14.5 on 32, 17.1 on 48).
     const uint32_t max_cores = plan.stride <= 8 ? 48 : 32;
-    // The largest rectangle of at most min(dense, max_cores) cores, widest
-    // first, so that every core gets a dense tile.
-    const uint32_t limit = std::max(1u, std::min(plan.dense, max_cores));
-    plan.width = 1;
-    plan.height = 1;
+    // The fewest dense tiles per core that this many cores allow, then the
+    // smallest rectangle, widest first, with a core for every share: 17 dense
+    // tiles take 18 cores with one idle rather than 16 with one doing two.
+    const uint32_t limit = std::max(1u, std::min({plan.dense, max_cores, grid_x * grid_y}));
+    const uint32_t per_core = (plan.dense + limit - 1) / limit;
+    const uint32_t shares = (plan.dense + per_core - 1) / per_core;
+    plan.width = grid_x;
+    plan.height = grid_y;
     for (uint32_t h = 1; h <= grid_y; ++h) {
-        const uint32_t w = std::min(grid_x, limit / h);
-        if (w == 0) {
-            break;
-        }
-        if (w * h > plan.width * plan.height) {
+        const uint32_t w = (shares + h - 1) / h;
+        if (w <= grid_x && w * h < plan.width * plan.height) {
             plan.width = w;
             plan.height = h;
         }

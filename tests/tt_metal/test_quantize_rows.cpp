@@ -219,10 +219,11 @@ TEST_F(QuantizeRowsTest, MatchesTtnnOpsForEveryStride) {
 TEST_F(QuantizeRowsTest, CoreCounts) {
     // A core per dense tile, up to 48 cores for 4- and 8-row strides and 32 for
     // 16 and 32: one core, one NoC row, several NoC rows, dense tiles split
-    // unevenly, and several three-tile chunks per core.
+    // unevenly, idle cores (13 and 17 dense tiles: a rectangle of 14 or 18),
+    // and several three-tile chunks per core.
     for (uint32_t rows : {1u, 6u, 16u, 32u}) {
         const uint32_t pack = rows <= 4 ? 8 : rows <= 8 ? 4 : rows <= 16 ? 2 : 1;
-        for (uint32_t dense : {1u, 2u, 7u, 13u, 24u, 200u}) {
+        for (uint32_t dense : {1u, 2u, 7u, 13u, 17u, 24u, 200u}) {
             const uint32_t cols = dense * pack * 32;
             EXPECT_EQ(check(activations(rows, cols, dense + rows), rows, cols, DataType::BFLOAT16, kE4M3), 0u)
                 << rows << "x" << cols;
