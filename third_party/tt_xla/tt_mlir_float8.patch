@@ -205,7 +205,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
 new file mode 100644
 --- /dev/null
 +++ b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
-@@ -0,0 +1,521 @@
+@@ -0,0 +1,542 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -721,6 +721,27 @@ new file mode 100644
 +    if (failed(applyPartialConversion(getOperation(), target,
 +                                      std::move(patterns)))) {
 +      signalPassFailure();
++      return;
++    }
++
++    // The conversion materializes the float8 view of a converted function
++    // argument once, at the top of the function. A view next to each op that
++    // reads it instead stays with that op where the program is later split:
++    // one trace that passes a view to another would have the view copied into
++    // the other's buffers on every call (all of a model's float8 weights).
++    SmallVector<mlir::stablehlo::BitcastConvertOp> views;
++    getOperation().walk([&](mlir::stablehlo::BitcastConvertOp op) {
++      if (isa<BlockArgument>(op.getOperand())) {
++        views.push_back(op);
++      }
++    });
++    for (mlir::stablehlo::BitcastConvertOp op : views) {
++      for (OpOperand &use : llvm::make_early_inc_range(op->getUses())) {
++        OpBuilder builder(use.getOwner());
++        use.set(builder.create<mlir::stablehlo::BitcastConvertOp>(
++            op.getLoc(), op.getType(), op.getOperand()));
++      }
++      op.erase();
 +    }
 +  }
 +};
