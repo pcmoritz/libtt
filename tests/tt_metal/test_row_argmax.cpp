@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -50,11 +51,7 @@ protected:
                 values[i] = static_cast<float>(bfloat16(values[i]));
             }
         }
-        const TensorSpec spec(shape, TensorLayout(dtype, PageConfig(Layout::TILE), {}));
-        const auto input = ttnn::Tensor::from_vector(values, spec).to_device(mesh_device_.get());
-        const auto output = ttnn::experimental::row_argmax(input, floor, std::nullopt);
-        EXPECT_EQ(output.logical_shape().rank(), shape.rank() - 1);
-        const auto got = output.cpu().to_vector<uint32_t>();
+        const auto got = row_argmax(values, shape, dtype, floor);
         ASSERT_EQ(got.size(), rows);
         for (uint32_t row = 0; row < rows; ++row) {
             uint32_t want = 0;
@@ -70,6 +67,15 @@ protected:
             }
             EXPECT_EQ(got[row], want) << shape << " " << dtype << " row " << row;
         }
+    }
+
+    std::vector<uint32_t> row_argmax(
+        const std::vector<float>& values, const ttnn::Shape& shape, DataType dtype, std::optional<float> floor) {
+        const TensorSpec spec(shape, TensorLayout(dtype, PageConfig(Layout::TILE), {}));
+        const auto input = ttnn::Tensor::from_vector(values, spec).to_device(mesh_device_.get());
+        const auto output = ttnn::experimental::row_argmax(input, floor, std::nullopt);
+        EXPECT_EQ(output.logical_shape().rank(), shape.rank() - 1);
+        return output.cpu().to_vector<uint32_t>();
     }
 
     std::shared_ptr<MeshDevice> mesh_device_;
@@ -100,6 +106,34 @@ TEST_F(RowArgmaxTest, Floor) {
     check(ttnn::Shape({4, 512}), DataType::FLOAT32, 3.0f, 13);
     check(ttnn::Shape({4, 512}), DataType::FLOAT32, 0.5f, 14, 0.25f);
     check(ttnn::Shape({1, 4096}), DataType::FLOAT32, 100.0f, 15);
+}
+
+TEST_F(RowArgmaxTest, SignedZerosAndNaNs) {
+    // As torch's and JAX's argmax: -0.0 ties +0.0, and the first NaN of either
+    // sign and any payload wins, above +inf. Rows of 4096 spread over cores, so
+    // that the first core merges them too.
+    const float nan = std::bit_cast<float>(0x7FC00000u);
+    const float negative_nan = std::bit_cast<float>(0xFFC00000u);
+    const float large_payload_nan = std::bit_cast<float>(0x7FFFFFFFu);
+    const uint32_t width = 4096;
+    std::vector<float> values(4 * width, -1.0f);
+    for (uint32_t column = 0; column < width; ++column) {
+        values[column] = column % 2 == 0 ? -0.0f : 0.0f;
+    }
+    values[width + 100] = negative_nan;
+    values[width + 4000] = nan;
+    values[2 * width + 1000] = nan;
+    values[2 * width + 3000] = large_payload_nan;
+    values[3 * width + 10] = std::numeric_limits<float>::infinity();
+    values[3 * width + 4095] = negative_nan;
+    const std::vector<uint32_t> want = {0, 100, 1000, 4095};
+    const float lowest = std::numeric_limits<float>::lowest();
+    for (DataType dtype : {DataType::FLOAT32, DataType::BFLOAT16}) {
+        for (std::optional<float> floor : {std::optional<float>(), std::optional<float>(lowest)}) {
+            EXPECT_EQ(row_argmax(values, ttnn::Shape({4, width}), dtype, floor), want)
+                << dtype << (floor ? " with a floor" : "");
+        }
+    }
 }
 
 }  // namespace

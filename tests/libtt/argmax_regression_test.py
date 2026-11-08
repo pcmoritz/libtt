@@ -1,4 +1,6 @@
-"""Batched argmax must retain the row-major multicore path at O1."""
+"""Batched argmax must take a fast path at O1: libtt's row argmax, which reads the tiles of up to
+32 rows of bfloat16 or float32 values in place, or else ttnn's row-major multicore argmax, not its
+slow tiled one."""
 
 import re
 
@@ -50,6 +52,7 @@ def test_batched_argmax(dtype, trace, shape, tmp_path):
         np.testing.assert_array_equal(np.asarray(run(x)), expected)
 
     # Numerical checks alone do not catch the slow tiled implementation.
+    row_argmax = shape[0] <= 32 and dtype in (jnp.bfloat16, np.float32)
     (ir,) = (tmp_path / "irs").glob("ttnn_runtime_argmax_*.mlir")
     text = ir.read_text()
     operand_layouts = re.findall(r'"ttnn.argmax".* : \(tensor<[^>]*, (#[\w]+)>\)', text)
@@ -58,4 +61,4 @@ def test_batched_argmax(dtype, trace, shape, tmp_path):
         definition = next(
             line for line in text.splitlines() if line.startswith(layout + " =")
         )
-        assert "!ttcore.tile" not in definition, definition
+        assert ("!ttcore.tile" in definition) == row_argmax, definition
