@@ -376,7 +376,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
 diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
-@@ -27,6 +27,73 @@ FORCE_INLINE void read_bias(uint32_t n_start, uint32_t count, uint32_t cb_bias)
+@@ -27,6 +27,76 @@ FORCE_INLINE void read_bias(uint32_t n_start, uint32_t count, uint32_t cb_bias)
      }
  }
  
@@ -393,8 +393,9 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +// Reads the output scales: the row scales' column 0, as rows 0 .. scale_rows -
 +// 1 of faces 0 and 2 of the row-scale tile, and for each of this core's output
 +// tiles (once for a [1, 1] scale) the column scales' row 0, faces 0 and 1,
-+// into each of those rows of a column-scale tile, or an [N, 1] scale's tile as
-+// it is: those of a SwiGLU weight's gate half, then of its up half. Their
++// into each of those rows of a column-scale tile, or faces 0 and 2 (its
++// column 0) of an [N, 1] scale's tile: those of a SwiGLU weight's gate half,
++// then of its up half. Their
 +// addresses are the runtime arguments at arg_index; their accessor arguments
 +// follow the bias's.
 +template <bool has_scales, uint32_t args_offset, uint32_t arg_index>
@@ -428,7 +429,9 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 +        for (uint32_t n = 0; n < col_tiles; ++n) {
 +            const uint32_t column = col_scalar ? 0 : (n / count) * out_Nt + n_start + (n % count) * n_step;
 +            if constexpr (col_column) {
-+                noc_async_read(col_scale.get_noc_addr(column), col_l1 + n * tile_bytes, tile_bytes);
++                const uint32_t local = col_l1 + n * tile_bytes;
++                noc_async_read(col_scale.get_noc_addr(column), local, face_bytes);
++                noc_async_read(col_scale.get_noc_addr(column, 2 * face_bytes), local + 2 * face_bytes, face_bytes);
 +                continue;
 +            }
 +            const uint64_t left = col_scale.get_noc_addr(column);
@@ -450,7 +453,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
  // Reads this core's bias tiles, streams its even weight blocks on RISCV_0's
  // NOC, then writes its output tiles.
  //
-@@ -50,11 +117,15 @@ void kernel_main() {
+@@ -50,11 +120,15 @@ void kernel_main() {
      constexpr uint32_t cb_partial_out = get_named_compile_time_arg_val("cb_partial_out");
      constexpr bool has_bias = get_named_compile_time_arg_val("has_bias");
      constexpr uint32_t n_step = get_named_compile_time_arg_val("n_step");
@@ -467,7 +470,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
      const bool owner = role == 1;
      const bool producer = role == 2;
      constexpr auto weight_args = TensorAccessorArgs<0>();
-@@ -62,24 +133,26 @@ void kernel_main() {
+@@ -62,24 +136,26 @@ void kernel_main() {
      const auto weight = TensorAccessor(weight_args, weight_addr);
      const auto output = TensorAccessor(output_args, output_addr);
      read_bias<has_bias, output_args.next_compile_time_args_offset()>(n_start, count, cb_bias);
