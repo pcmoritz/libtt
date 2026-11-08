@@ -55,19 +55,19 @@ def _ops_per_function(export_path):
 def test_counted_loop_inside_conditional(trace, tmp_path):
     # The conditional and the counted loop in its branch replay from the
     # function's trace, since a loop with constant bounds replays from a
-    # capture.
+    # capture. (70 iterations: up to 64 unroll.)
     def run(predicate, x):
         return jax.lax.cond(
             predicate,
             lambda v: v + 1,
-            lambda v: jax.lax.fori_loop(0, 5, lambda i, y: y * 2 + i, v),
+            lambda v: jax.lax.fori_loop(0, 70, lambda i, y: y + i, v),
             x,
         )
 
     run = _jit(run, trace, tmp_path)
     looped = SOURCE
-    for i in range(5):
-        looped = looped * 2 + i
+    for i in range(70):
+        looped = looped + i
     x = _put(SOURCE)
     for predicate in (False, True) * 3:
         result = run(_put(predicate), x)
