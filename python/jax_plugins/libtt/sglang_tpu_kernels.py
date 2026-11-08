@@ -15,7 +15,9 @@ operations, and the only one the kernel reads. Each token's row is
 written by TTNN's paged cache update, and a batch of no more
 tokens than sequence slots, such as a decode batch, runs TTNN's paged decode
 attention: given the cache as both keys and values and the queries padded with
-zeros, it computes softmax(q k) [k v], whose second half is the output.
+zeros, it computes softmax(q k) [k v], whose second half is the output. A
+prefill runs TTNN's chunked paged attention the same way, one sequence per
+user, so it reads only each sequence's pages.
 
 Hybrid models' gated DeltaNet kernel runs on libtt's recurrent kernels, with
 the recurrent-state pool in their layout (`sglang_tpu_gdn`).
@@ -144,6 +146,32 @@ def _ragged_paged_attention(module):
                 queries, cache, user_pages, user_positions, sm_scale, sliding_window
             )
             return out.astype(out_dtype or queries.dtype), cache
+        # Otherwise each sequence is a user of TTNN's chunked paged attention,
+        # which reads only its pages, where gathering every sequence's pages
+        # below computes scores against all of them.
+        q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+        if (
+            cache_heads == kv_heads
+            and causal
+            and soft_cap is None
+            and attention_sink is None
+            and sliding_window is None
+            and q_scale is None
+            and k_scale is None
+            and v_scale is None
+        ):
+            out = _paged_prefill(
+                queries,
+                cache,
+                table,
+                cu_q_lens[:-1],
+                jnp.where(live_seq, kv_lens - q_lens, 0),
+                seq,
+                position,
+                live,
+                sm_scale,
+            )
+            return out.astype(out_dtype or queries.dtype), cache
         context = cache[table]
         k = context[:, :, :kv_heads, :, :head_dim]
         v = context[:, :, :kv_heads, :, cache_head_dim : cache_head_dim + head_dim]
@@ -195,6 +223,57 @@ def _ragged_paged_attention(module):
         return out, cache
 
     return ragged_paged_attention
+
+
+def _prefill_chunk(page_size):
+    """TTNN's chunked attention chunk, the multiple its starts must be."""
+    return min(page_size, 128)
+
+
+def _prefill_rows(tokens, page_size):
+    """Query rows per sequence: its tokens at any offset below one chunk."""
+    chunk = _prefill_chunk(page_size)
+    return -(-tokens // chunk) * chunk + chunk
+
+
+def _prefill_pad_pages(tokens, page_size):
+    """Padding pages after a page table row, for keys up to start + rows."""
+    return -(-_prefill_rows(tokens, page_size) // page_size)
+
+
+def _paged_prefill(queries, cache, table, q_starts, prefixes, seq, positions, live, sm_scale):
+    """Each sequence's queries as one user of TTNN's chunked paged attention.
+
+    The kernel's queries start at a chunk-aligned position, so a sequence's
+    rows start at its prefix rounded down to a chunk, with its queries at their
+    offset from there: each attends to the keys up to its own position. The
+    other rows are padding, whose outputs are dropped.
+    """
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    tokens, q_heads, head_dim = queries.shape
+    page_size, row = cache.shape[2], cache.shape[3]
+    seqs = table.shape[0]
+    rows = _prefill_rows(tokens, page_size)
+    starts = prefixes - prefixes % _prefill_chunk(page_size)
+    offsets = prefixes - starts
+
+    q = jnp.pad(queries, ((0, 0), (0, 0), (0, row - head_dim))).astype(cache.dtype)
+    sources = q_starts[:, None] + jnp.arange(rows, dtype=jnp.int32)[None, :] - offsets[:, None]
+    q = q[jnp.clip(sources, 0, tokens - 1).reshape(-1)]
+    q = q.reshape(seqs, rows, q_heads, row).transpose(0, 2, 1, 3)
+    # Keys up to start + rows: the sequence's pages, then padding page 0.
+    page_table = jnp.pad(table, ((0, 0), (0, _prefill_pad_pages(tokens, page_size))))
+    out = jax.ffi.ffi_call(
+        "tt.chunked_scaled_dot_product_attention",
+        jax.ShapeDtypeStruct(q.shape, q.dtype),
+    )(q, cache, cache, page_table, starts, scale=np.float32(sm_scale))
+    out = out.transpose(0, 2, 1, 3).reshape(seqs * rows, q_heads, row)
+    out = out[jnp.where(live, seq * rows + positions - starts[seq], 0)]
+    cache_head_dim = row // 2
+    return out[:, :, cache_head_dim : cache_head_dim + head_dim]
 
 
 def _paged_decode(queries, cache, page_table, positions, sm_scale, sliding_window):
