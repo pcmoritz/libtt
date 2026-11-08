@@ -33,7 +33,19 @@ diff --git a/pjrt_implementation/inc/api/compile_options.h b/pjrt_implementation
  
    // Optimization level (0, 1, or 2) that controls multiple optimization passes.
    // See documentation for details on what each level enables.
-@@ -184,6 +187,10 @@ struct CompileOptions {
+@@ -86,6 +89,11 @@ struct CompileOptions {
+   // that are repeated multiple times.
+   bool enable_trace = false;
+ 
++  // In TPU compatibility mode, an eager op of torch_tpu (compiled at XLA's O1
++  // effort level) traces only when it lowers to a long program: see
++  // ModuleBuilder::convertFromTTIRToTTNN.
++  bool trace_long_eager_programs = false;
++
+   // Enables saving graph inputs to disk whenever Execute() is called.
+   // This is useful for chisel and codegen.
+   bool export_tensors = false;
+@@ -184,6 +192,10 @@ struct CompileOptions {
    validate(const std::unordered_map<std::string, std::string> &compile_options);
  };
  
@@ -62,21 +74,26 @@ diff --git a/pjrt_implementation/src/api/compile_options.cc b/pjrt_implementatio
  CompileOptions CompileOptions::parse(
      const std::unordered_map<std::string, std::string> &compile_options) {
    CompileOptions options;
-@@ -69,6 +77,13 @@ CompileOptions CompileOptions::parse(
+@@ -69,6 +77,18 @@ CompileOptions CompileOptions::parse(
    options.enable_trace =
        internal::parseBoolOption(compile_options, "enable_trace")
            .value_or(options.enable_trace);
 +  // On a TPU, torch_tpu compiles its eager ops at XLA's O1 effort level and
 +  // its graphs at the default. An eager op runs once, or on other buffers each
-+  // time, as while a model loads, so a trace of it would only hold slots.
++  // time, as while a model loads, so a trace of it would only hold slots. A
++  // long one still traces, which ModuleBuilder decides once it is lowered:
++  // SGLang-TorchTPU's sampling filters search their cutoff in 30 rounds, as
++  // an eager op of hundreds of programs that cost more to dispatch than to
++  // run.
 +  if (internal::parseIntOption(compile_options, xla_optimization_level_key) ==
 +      1) {
++    options.trace_long_eager_programs = options.enable_trace;
 +    options.enable_trace = false;
 +  }
    // By default, export tensors for codegen paths.
    options.export_tensors =
        internal::parseBoolOption(compile_options, "export_tensors")
-@@ -170,6 +185,10 @@ std::optional<std::string> CompileOptions::validate(
+@@ -170,6 +190,10 @@ std::optional<std::string> CompileOptions::validate(
        // XLA consumes these options. TT-XLA has no equivalent behavior, but
        // accepts them for PJRT compatibility.
        "xla_embed_ir_in_executable",
@@ -105,3 +122,38 @@ diff --git a/pjrt_implementation/src/api/compile_options_parser.cc b/pjrt_implem
            }
          }
        }
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -1114,6 +1114,20 @@ NumDevicesResult ModuleBuilder::collectNumDevicesToUtilize(
+           .num_devices_to_utilize = num_devices_to_utilize};
+ }
+ 
++// Whether an eager op's program is long enough to trace: its TTIR ops, each a
++// program or a few once lowered. The sampling filters' unrolled searches have
++// hundreds; the eager ops that load a model or prepare a step, a handful.
++static bool isLongEagerProgram(mlir::ModuleOp module) {
++  constexpr int64_t kLongEagerProgramOps = 128;
++  int64_t ops = 0;
++  module.walk([&](mlir::Operation *op) {
++    if (op->getDialect() && op->getDialect()->getNamespace() == "ttir") {
++      ++ops;
++    }
++  });
++  return ops >= kLongEagerProgramOps;
++}
++
+ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+     mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
+     const CompileOptions &compile_options, ClientInstance *client_instance,
+@@ -1192,7 +1206,9 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+   }
+   options.enableActivationDtypeLowering =
+       compile_options.enable_activation_dtype_lowering;
+-  options.enableTrace = compile_options.enable_trace;
++  options.enableTrace = compile_options.enable_trace ||
++                        (compile_options.trace_long_eager_programs &&
++                         isLongEagerProgram(mlir_module.get()));
+   options.enableConstEval = compile_options.enable_const_eval;
+   options.enableCPUHoistedConstEval = compile_options.enable_const_eval_on_cpu;
+   options.enableConstEvalInputsToSystemMemory =
