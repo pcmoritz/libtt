@@ -1,0 +1,145 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -685,7 +685,7 @@ private:
+   bool isArgMax(mlir::stablehlo::ReduceOp &srcOp,
+                 mlir::stablehlo::ReduceOp::Adaptor &adaptor,
+                 ConversionPatternRewriter &rewriter) const {
+-    if (!hasValidArgMaxInputs(srcOp.getInputs())) {
++    if (!hasValidArgMaxInputs(srcOp)) {
+       return false;
+     }
+ 
+@@ -722,8 +722,7 @@ private:
+     bool hasUnitReductionDimension =
+         inputType.getDimSize(srcOp.getDimensions().front()) == 1;
+ 
+-    if (!hasUnitReductionDimension &&
+-        !hasValidArgMaxInputs(srcOp.getInputs())) {
++    if (!hasUnitReductionDimension && !hasValidArgMaxInputs(srcOp)) {
+       return false;
+     }
+ 
+@@ -750,17 +749,23 @@ private:
+   }
+ 
+   // Validate the inputs.
+-  bool hasValidArgMaxInputs(mlir::OperandRange inputs) const {
++  bool hasValidArgMaxInputs(mlir::stablehlo::ReduceOp &srcOp) const {
++    mlir::OperandRange inputs = srcOp.getInputs();
+     if (inputs.size() != 2) {
+       return false;
+     }
+ 
+     mlir::Value val = inputs.back();
+-    // An iota with one element is folded to a zero constant before conversion.
++    // Over dimensions of size 1, the iota of indices is all zeros, which is
++    // folded to a zero constant before conversion.
+     if (auto constant = val.getDefiningOp<mlir::stablehlo::ConstantOp>()) {
++      auto inputType = mlir::cast<RankedTensorType>(inputs.front().getType());
+       auto indices = mlir::dyn_cast<DenseIntElementsAttr>(constant.getValue());
+-      return indices && indices.getNumElements() == 1 &&
+-             indices.getSplatValue<APInt>().isZero();
++      return indices && indices.isSplat() &&
++             indices.getSplatValue<APInt>().isZero() &&
++             llvm::all_of(srcOp.getDimensions(), [&](int64_t dim) {
++               return inputType.getDimSize(dim) == 1;
++             });
+     }
+     auto *op = val.getDefiningOp();
+ 
+@@ -836,6 +841,10 @@ private:
+             blocks.front(), mlir::stablehlo::ComparisonDirection::GE)) {
+       return true;
+     }
++    if (verifyJaxArgExtremeDataflow(
++            blocks.front(), mlir::stablehlo::ComparisonDirection::GT)) {
++      return true;
++    }
+ 
+     return false;
+   }
+@@ -854,7 +863,9 @@ private:
+     return verifyJaxOpArgExtremePattern(
+                operations.front(), mlir::stablehlo::ComparisonDirection::LT) ||
+            verifyTorchTpuArgExtremePattern(
+-               blocks.front(), mlir::stablehlo::ComparisonDirection::LE);
++               blocks.front(), mlir::stablehlo::ComparisonDirection::LE) ||
++           verifyJaxArgExtremeDataflow(
++               blocks.front(), mlir::stablehlo::ComparisonDirection::LT);
+   }
+ 
+   // Pattern match torch_tpu's ArgMax (GE) and ArgMin (LE) reducer. It keeps
+@@ -930,6 +941,72 @@ private:
+                              ComparisonDirection::EQ);
+   }
+ 
++  // Pattern match JAX's ArgMax (GT) and ArgMin (LT) reducer by its dataflow, in
++  // whatever order canonicalization leaves its ops (verifyJaxOpArgExtremePattern
++  // matches them in JAX's order):
++  //  ^bb0(%v0, %i0, %v1, %i1):
++  //    %better = stablehlo.compare GT (LT), %v0, %v1
++  //    %value = stablehlo.select %better, %v0, %v1 (or maximum / minimum)
++  //    %tie = stablehlo.and (compare EQ, %v0, %v1), (compare LT, %i0, %i1)
++  //    %index = stablehlo.select (stablehlo.or %better, %tie), %i0, %i1
++  //    stablehlo.return %value, %index
++  // Float reducers also prefer NaNs: %better is or'ed with %v0 != %v0, which
++  // folds away for other types.
++  bool verifyJaxArgExtremeDataflow(
++      mlir::Block &block,
++      mlir::stablehlo::ComparisonDirection expectedDirection) const {
++    using mlir::stablehlo::ComparisonDirection;
++    auto returnOp =
++        mlir::dyn_cast<mlir::stablehlo::ReturnOp>(block.getTerminator());
++    if (block.getNumArguments() != 4 || !returnOp ||
++        returnOp.getNumOperands() != 2) {
++      return false;
++    }
++    mlir::Value v0 = block.getArgument(0), i0 = block.getArgument(1);
++    mlir::Value v1 = block.getArgument(2), i1 = block.getArgument(3);
++
++    auto isCompare = [](mlir::Value value, ComparisonDirection direction,
++                        mlir::Value lhs, mlir::Value rhs) {
++      auto op = value.getDefiningOp<mlir::stablehlo::CompareOp>();
++      return op && op.getComparisonDirection() == direction &&
++             op.getLhs() == lhs && op.getRhs() == rhs;
++    };
++    auto isBetter = [&](mlir::Value value) {
++      if (auto orOp = value.getDefiningOp<mlir::stablehlo::OrOp>()) {
++        return isCompare(orOp.getLhs(), expectedDirection, v0, v1) &&
++               isCompare(orOp.getRhs(), ComparisonDirection::NE, v0, v0);
++      }
++      return isCompare(value, expectedDirection, v0, v1);
++    };
++
++    mlir::Operation *value = returnOp.getOperand(0).getDefiningOp();
++    if (auto select = mlir::dyn_cast_or_null<mlir::stablehlo::SelectOp>(value)) {
++      if (select.getOnTrue() != v0 || select.getOnFalse() != v1 ||
++          !isBetter(select.getPred())) {
++        return false;
++      }
++    } else if (expectedDirection == ComparisonDirection::GT
++                   ? !isa_and_nonnull<mlir::stablehlo::MaxOp>(value)
++                   : !isa_and_nonnull<mlir::stablehlo::MinOp>(value)) {
++      return false;
++    } else if (value->getOperand(0) != v0 || value->getOperand(1) != v1) {
++      return false;
++    }
++
++    auto index =
++        returnOp.getOperand(1).getDefiningOp<mlir::stablehlo::SelectOp>();
++    if (!index || index.getOnTrue() != i0 || index.getOnFalse() != i1) {
++      return false;
++    }
++    auto pick = index.getPred().getDefiningOp<mlir::stablehlo::OrOp>();
++    if (!pick || !isBetter(pick.getLhs())) {
++      return false;
++    }
++    auto tie = pick.getRhs().getDefiningOp<mlir::stablehlo::AndOp>();
++    return tie && isCompare(tie.getLhs(), ComparisonDirection::EQ, v0, v1) &&
++           isCompare(tie.getRhs(), ComparisonDirection::LT, i0, i1);
++  }
++
+   // Pattern match the ops for tt-torch ArgMax op.
+   // The pattern is as follows:
+   //  stablehlo.compare (GE)
