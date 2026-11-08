@@ -17,8 +17,14 @@
 namespace {
 
 // Negative floats reversed below the positive ones: unsigned order is float
-// order (and a positive NaN is above +inf, as torch's argmax prefers NaN).
-FORCE_INLINE uint32_t key_of(uint32_t bits) { return (bits & 0x80000000u) != 0 ? ~bits : bits | 0x80000000u; }
+// order. -0.0 takes +0.0's key, one above its own, and every NaN the largest,
+// above +inf, as torch's and JAX's argmax take the first NaN. Must match
+// key_of in row_argmax.cpp, which keys the floor.
+FORCE_INLINE uint32_t key_of(uint32_t bits) {
+    uint32_t key = (bits & 0x80000000u) != 0 ? ~bits : bits | 0x80000000u;
+    key += bits == 0x80000000u;
+    return key | (0u - static_cast<uint32_t>((bits & 0x7FFFFFFFu) > 0x7F800000u));
+}
 
 }  // namespace
 

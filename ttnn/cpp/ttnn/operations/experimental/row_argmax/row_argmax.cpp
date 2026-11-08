@@ -49,10 +49,13 @@ struct RowArgmaxOperation {
 constexpr uint32_t batch_tiles = 8;
 
 // The order-preserving unsigned key of a float's bits: negative values
-// reversed below the positive ones.
+// reversed below the positive ones, -0.0 with +0.0's key and every NaN the
+// largest. Must match key_of in the kernel, which keys the values.
 uint32_t key_of(float value) {
     const uint32_t bits = std::bit_cast<uint32_t>(value);
-    return (bits & 0x80000000u) != 0 ? ~bits : bits | 0x80000000u;
+    uint32_t key = (bits & 0x80000000u) != 0 ? ~bits : bits | 0x80000000u;
+    key += bits == 0x80000000u;
+    return key | (0u - static_cast<uint32_t>((bits & 0x7FFFFFFFu) > 0x7F800000u));
 }
 
 void RowArgmaxOperation::validate_on_program_cache_miss(
