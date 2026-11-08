@@ -265,6 +265,18 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
     // the batch is a multiple of the group: a partial group at the end of the
     // buffer would wait for space the writer only frees after the full batch.
     const Split s = split(device, g.table.B * g.pages);
+    // A column window wider than a chunk (a 248320-wide FP32 row into a flat
+    // [1, 1, 993280] table, as torch_tpu's view inverse writes logits back)
+    // goes in pieces: the writer applies a window chunk by chunk anyway, so its
+    // table entries hold chunks and its source streams a piece at a time.
+    const uint32_t column_bytes =
+        params.column ? indexed_rows_window(params) * g.table.column_window * g.elem_bytes : 0;
+    const bool source_pieces = column_bytes > g.chunk_bytes;
+    if (source_pieces) {
+        g.entry_bytes = align_entry(g.chunk_bytes);
+        g.source_entry_bytes = align_entry(g.chunk_bytes + kEntryAlign);
+    }
+    g.compile_time_args["source_pieces"] = static_cast<uint32_t>(source_pieces);
     constexpr uint32_t kBatchBudget = 512 * 1024;
     uint32_t batch = std::max<uint32_t>(1, kBatchBudget / g.entry_bytes);
     const uint32_t group = std::min(g.group, batch);
