@@ -14,11 +14,13 @@ from jax import lax
         # Qwen3.8-27B and Qwen3.5-9B hidden sizes, with the model's FP32 weight.
         (1, 5120, jnp.float32),
         (1, 4096, jnp.float32),
-        # Several rows, around the SFPU iteration boundaries (two rows per
-        # iteration, eight iterations per face), rows in the lower faces of
-        # the tile, and all rows.
+        # Several rows, around the SFPU iteration boundaries (four rows of a
+        # face per two iterations, eight iterations per face), rows in the
+        # lower faces of the tile, and all rows.
         (2, 5120, jnp.float32),
         (3, 5120, jnp.float32),
+        (4, 5120, jnp.float32),
+        (5, 5120, jnp.float32),
         (15, 5120, jnp.float32),
         (16, 5120, jnp.float32),
         (17, 5120, jnp.float32),
@@ -67,11 +69,8 @@ def test_rms_norm_residual(trace, rows, width, weight_dtype, tmp_path):
         hf = expected_sum.astype(np.float32)
         var = np.mean(hf * hf, axis=-1, keepdims=True)
         expected_norm = hf / np.sqrt(var + eps) * w.astype(np.float32)
-        # The sum is exact in FP32; packing it to BF16 rounds ties up where
-        # NumPy rounds them to even, one ulp apart.
-        np.testing.assert_allclose(
-            np.asarray(actual_sum).astype(np.float32), expected_sum.astype(np.float32), rtol=2**-7, atol=0
-        )
+        # The program adds in FP32 and rounds to nearest even, as NumPy does.
+        _assert_same_bits(actual_sum, expected_sum)
         np.testing.assert_allclose(
             np.asarray(actual_norm).astype(np.float32), expected_norm, atol=1e-2, rtol=1e-2
         )
@@ -81,6 +80,10 @@ def test_rms_norm_residual(trace, rows, width, weight_dtype, tmp_path):
         "ttnn.rms_norm_residual" in path.read_text()
         for path in (tmp_path / "irs").glob("ttnn*.mlir")
     ), "the add and the norm were not fused"
+
+
+def _assert_same_bits(actual, expected):
+    np.testing.assert_array_equal(np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16))
 
 
 def _reference(x, r, w, eps=1e-6):
@@ -112,7 +115,7 @@ def test_rms_norm_residual_with_an_earlier_consumer_of_the_sum(tmp_path):
     w = rng.uniform(0.5, 1.5, (5120,)).astype(jnp.float32)
     other, n, h = run(*(jax.device_put(v, device) for v in (x, r, w)))
     expected_norm, expected_sum = _reference(x, r, w)
-    np.testing.assert_allclose(np.asarray(h).astype(np.float32), expected_sum.astype(np.float32), rtol=2**-7, atol=0)
+    _assert_same_bits(h, expected_sum)
     np.testing.assert_allclose(
         np.asarray(other).astype(np.float32), np.maximum(expected_sum.astype(np.float32), 0), rtol=2**-7, atol=0
     )
@@ -164,7 +167,77 @@ def test_rms_norm_residual_with_the_weight_cast_after_the_add(tmp_path):
     w = rng.uniform(0.5, 1.5, (5120,)).astype(jnp.bfloat16)
     n, h = run(*(jax.device_put(v, device) for v in (x, r, w)))
     expected_norm, expected_sum = _reference(x, r, w)
-    np.testing.assert_allclose(np.asarray(h).astype(np.float32), expected_sum.astype(np.float32), rtol=2**-7, atol=0)
+    _assert_same_bits(h, expected_sum)
     np.testing.assert_allclose(np.asarray(n).astype(np.float32), expected_norm, atol=1e-2, rtol=1e-2)
     irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn*.mlir")]
     assert irs and any("ttnn.rms_norm_residual" in ir for ir in irs), "the add and the norm were not fused"
+
+
+@pytest.mark.parametrize("rows", [1, 4])
+def test_rms_norm_residual_of_an_fp32_residual_add(rows, tmp_path):
+    """PyTorch models (SGLang's fused add + RMSNorm) add the residual in FP32,
+    keep it narrowed to BF16 and normalize the FP32 sum. The fused op's sum,
+    rounded to nearest even, is that narrowed residual bit for bit, even with
+    operands far apart in magnitude."""
+    eps = 1e-6
+    width = 4096
+
+    def layer(x, r, w):
+        s = x.astype(jnp.float32) + r.astype(jnp.float32)
+        var = jnp.sum(jnp.power(s, 2), axis=-1, keepdims=True) / width
+        n = s * lax.rsqrt(var + eps) * w.astype(jnp.float32)
+        return n.astype(jnp.bfloat16), s.astype(jnp.bfloat16)
+
+    run = jax.jit(layer, compiler_options={"optimization_level": "O1", "export_path": str(tmp_path)})
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(7)
+    x = (rng.normal(0, 1, (rows, width)) * 2.0 ** rng.integers(-12, 12, (rows, width))).astype(jnp.bfloat16)
+    r = rng.normal(0, 3, (rows, width)).astype(jnp.bfloat16)
+    w = rng.uniform(0.5, 1.5, (width,)).astype(jnp.bfloat16)
+    n, h = run(*(jax.device_put(v, device) for v in (x, r, w)))
+    expected_norm, expected_sum = _reference(x, r, w)
+    _assert_same_bits(h, expected_sum)
+    np.testing.assert_allclose(np.asarray(n).astype(np.float32), expected_norm, atol=2e-2, rtol=1e-2)
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn*.mlir")]
+    assert irs and any("ttnn.rms_norm_residual" in ir for ir in irs), "the add and the norm were not fused"
+
+
+@pytest.mark.parametrize("rows", [1, 4])
+def test_rms_norm_residual_with_a_zero_centered_weight(rows, tmp_path):
+    """Zero-centered norm weights (Qwen3.5, Gemma) scale by 1 + weight, which
+    PyTorch models compute in FP32 on every call. The fused op adds the offset
+    to the BF16 weight itself, bit for bit like the separate FP32 add."""
+    eps = 1e-6
+    width = 5120
+
+    # SGLang's GemmaRMSNorm.forward_native with a residual.
+    def layer(x, r, w, offset):
+        s = x + r
+        h = s.astype(jnp.float32)
+        var = jnp.mean(h * h, axis=-1, keepdims=True)
+        n = h * lax.rsqrt(var + eps) * (w.astype(jnp.float32) + offset)
+        return n.astype(jnp.bfloat16), s
+
+    folded_path = tmp_path / "folded"
+    folded = jax.jit(
+        lambda x, r, w: layer(x, r, w, 1.0),
+        compiler_options={"optimization_level": "O1", "export_path": str(folded_path)},
+    )
+    # An offset the program takes as an input stays a separate add.
+    separate = jax.jit(layer, compiler_options={"optimization_level": "O1"})
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(11)
+    x = rng.normal(0, 1, (rows, width)).astype(jnp.bfloat16)
+    r = rng.normal(0, 3, (rows, width)).astype(jnp.bfloat16)
+    w = rng.normal(0, 0.1, (width,)).astype(jnp.bfloat16)
+    args = [jax.device_put(v, device) for v in (x, r, w)]
+    n, h = folded(*args)
+    n_separate, h_separate = separate(*args, jax.device_put(np.ones(1, np.float32), device))
+    _assert_same_bits(n, np.asarray(n_separate))
+    _assert_same_bits(h, np.asarray(h_separate))
+    expected_norm, _ = _reference(x, r, (w.astype(np.float32) + 1).astype(np.float32))
+    np.testing.assert_allclose(np.asarray(n).astype(np.float32), expected_norm, atol=2e-2, rtol=1e-2)
+    irs = [path.read_text() for path in (folded_path / "irs").glob("ttnn*.mlir")]
+    assert irs and any(
+        "ttnn.rms_norm_residual" in ir and "weight_offset = 1.000000e+00" in ir for ir in irs
+    ), "the weight's offset was not folded into the fused norm"

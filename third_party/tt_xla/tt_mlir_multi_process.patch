@@ -1,0 +1,43 @@
+diff --git ma/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp mb/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
+--- ma/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
++++ mb/lib/Dialect/TTNN/Transforms/OptimizerPasses/DevicePassesWrapper.cpp
+@@ -51,12 +51,15 @@ public:
+     // Disable tt-metal backtrace generation.
+     setenv("TT_METAL_DISABLE_BACKTRACE", "1", 1);
+ 
++    // Refresh the descriptor before attaching an external device: a prior
++    // compilation's MLIR context may already have been destroyed.
++    op_model::SingletonDeviceContext::setSystemDesc(
++        ttcore::getCurrentScopeSystemDesc(getOperation()));
++
+     // Open device if not externally provided.
+     if (externalDevice) {
+       op_model::SingletonDeviceContext::setExternalDevice(externalDevice);
+     } else {
+-      op_model::SingletonDeviceContext::setSystemDesc(
+-          ttcore::getCurrentScopeSystemDesc(getOperation()));
+       op_model::SingletonDeviceContext::getInstance().openMockDevice();
+     }
+ 
+diff --git ma/runtime/lib/ttnn/runtime.cpp mb/runtime/lib/ttnn/runtime.cpp
+--- ma/runtime/lib/ttnn/runtime.cpp
++++ mb/runtime/lib/ttnn/runtime.cpp
+@@ -1169,9 +1169,15 @@ std::vector<::tt::runtime::Tensor> toHost(::tt::runtime::Tensor tensor,
+       ::tt::runtime::ttnn::toHostSingleTensor(tensorWrapper, untilize,
+                                               blocking);
+ 
+-  std::vector<::ttnn::Tensor> singleTensors =
+-      ::ttnn::distributed::get_device_tensors(
+-          utils::getTTNNTensorFromRuntimeTensor(multiDeviceHostTensor));
++  // PJRT copies only addressable shards. get_device_tensors() performs a
++  // host all-gather, which would also return shards owned by other processes.
++  const ::ttnn::Tensor &hostTensor =
++      utils::getTTNNTensorFromRuntimeTensor(multiDeviceHostTensor);
++  std::vector<::ttnn::Tensor> singleTensors;
++  hostTensor.host_storage().buffer().apply(
++      [&](const ::tt::tt_metal::HostBuffer &buffer) {
++        singleTensors.emplace_back(buffer, hostTensor.tensor_spec());
++      });
+ 
+   // A non-blocking read records its event on the host tensor it returns, which
+   // the per-device host tensors must carry for wait() to cover the read.

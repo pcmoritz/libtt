@@ -1,0 +1,674 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
+@@ -1230,7 +1230,7 @@ std::optional<std::string> matmul_decode_unsupported_reason(
+ 
+     // The whole activation row stays resident on every core.
+     const uint32_t cb_bytes = ttnn::prim::matmul_decode_cb_bytes(
+-        input_tensor_a, input_tensor_b, bias, attributes.transpose_b, output_dtype, config);
++        input_tensor_a, input_tensor_b, bias, attributes.transpose_b, output_dtype, config, attributes.output_scales);
+     const uint32_t max_l1_space = utilities::get_max_l1_space(input_tensor_a);
+     if (cb_bytes > max_l1_space) {
+         return fmt::format(
+diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
+@@ -62,7 +62,8 @@ DecodePlan plan_decode(
+     const ttnn::Shape& a_padded_shape,
+     const ttnn::Shape& b_padded_shape,
+     bool transpose_b,
+-    const operations::matmul::MatmulDecodeProgramConfig& config) {
++    const operations::matmul::MatmulDecodeProgramConfig& config,
++    bool output_scales = false) {
+     const uint32_t Kt_total = a_padded_shape[-1] / TILE_WIDTH;
+     const uint32_t k_splits = config.k_splits;
+     const uint32_t Kt = Kt_total / k_splits;
+@@ -71,8 +72,8 @@ DecodePlan plan_decode(
+     const uint32_t out_Nt = b_padded_shape[transpose_b ? -2 : -1] / TILE_WIDTH / halves;
+     const uint32_t num_worker_cores = config.compute_with_storage_grid_size.x * config.compute_with_storage_grid_size.y;
+     // The accumulators of every weight half for one pass share the eight FP32
+-    // DST tiles.
+-    const uint32_t max_group = 8 / halves;
++    // DST tiles, less one for an output scale.
++    const uint32_t max_group = (output_scales ? 7 : 8) / halves;
+     // A split matmul's shares each have one core per output tile.
+     const uint32_t num_cores = k_splits > 1 ? out_Nt : std::min(out_Nt, num_worker_cores);
+     const uint32_t max_per_core = tt::div_up(out_Nt, num_cores);
+@@ -107,8 +108,10 @@ uint32_t matmul_decode_cb_bytes(
+     const std::optional<const ttnn::Tensor>& bias,
+     const bool transpose_b,
+     const tt::tt_metal::DataType output_dtype,
+-    const operations::matmul::MatmulDecodeProgramConfig& config) {
+-    const auto plan = plan_decode(input_tensor_a.padded_shape(), input_tensor_b.padded_shape(), transpose_b, config);
++    const operations::matmul::MatmulDecodeProgramConfig& config,
++    const bool output_scales) {
++    const auto plan =
++        plan_decode(input_tensor_a.padded_shape(), input_tensor_b.padded_shape(), transpose_b, config, output_scales);
+     auto tile_bytes = [](tt::tt_metal::DataType dtype) {
+         return tt::tile_size(tt_metal::datatype_to_dataformat_converter(dtype));
+     };
+@@ -119,7 +122,8 @@ uint32_t matmul_decode_cb_bytes(
+            2 * in1_buffers * weight_block_tiles * tile_bytes(input_tensor_b.dtype()) +
+            plan.count_of(0) * out_tile_bytes +
+            (plan.k_splits - 1) * tile_bytes(tt::tt_metal::DataType::FLOAT32) +
+-           (bias.has_value() ? plan.count_of(0) * tile_bytes(bias->dtype()) : 0);
++           (bias.has_value() ? plan.count_of(0) * tile_bytes(bias->dtype()) : 0) +
++           (output_scales ? (1 + plan.halves * plan.count_of(0)) * tile_bytes(tt::tt_metal::DataType::FLOAT32) : 0);
+ }
+ 
+ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+@@ -138,9 +142,17 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+     const bool transpose_b = operation_attributes.transpose_b;
+     const auto bias_tensor = tensor_args.optional_input_tensors.empty() ? std::nullopt
+                                                                      : tensor_args.optional_input_tensors[0];
++    // Output scales: FP32 [..., M, 1] row scales and [1, N], [N, 1] or [1, 1]
++    // column scales, multiplied into the FP32 sums as by two ttnn.multiply ops,
++    // the second rounding to the output type (ttnn::matmul_scaled).
++    const bool output_scales = operation_attributes.output_scales;
++    const auto row_scale = output_scales ? tensor_args.optional_input_tensors.at(1) : std::nullopt;
++    const auto col_scale = output_scales ? tensor_args.optional_input_tensors.at(2) : std::nullopt;
++    const bool col_scalar = output_scales && col_scale->logical_volume() == 1;
++    const bool col_column = output_scales && !col_scalar && col_scale->logical_shape()[-1] == 1;
+     const auto grid = config.compute_with_storage_grid_size;
+     const uint32_t in0_block_w = config.in0_block_w;
+-    DecodePlan plan = plan_decode(a.padded_shape(), b.padded_shape(), transpose_b, config);
++    DecodePlan plan = plan_decode(a.padded_shape(), b.padded_shape(), transpose_b, config, output_scales);
+     // An activation of up to 16 rows (decode) travels in tiles of the fewest rows that hold it, 2, 4, 8 or 16:
+     // the sender reads just those rows of each tile's top faces from DRAM and the multicast carries them alone,
+     // a sixteenth of a full tile for one row; the matmul unpacks the partial faces into srcB. The output tiles
+@@ -195,7 +207,12 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+ 
+     const auto in0_format = tt_metal::datatype_to_dataformat_converter(a.dtype());
+     const auto in1_format = tt_metal::datatype_to_dataformat_converter(b.dtype());
+-    const auto output_format = tt_metal::datatype_to_dataformat_converter(output.dtype());
++    // A scaled BF16 output is rounded to nearest even on the SFPU and packed as
++    // its raw 16 bits, as by ttnn.multiply's narrowing to BF16.
++    const bool raw_bf16_output =
++        output_scales && output.dtype() == tt::tt_metal::DataType::BFLOAT16 && !config.fuse_swiglu;
++    const auto output_format =
++        raw_bf16_output ? tt::DataFormat::UInt16 : tt_metal::datatype_to_dataformat_converter(output.dtype());
+     ProgramDescriptor desc;
+     auto add_cb = [&](uint32_t index,
+                       uint32_t tiles,
+@@ -225,6 +242,14 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+             tt_metal::datatype_to_dataformat_converter(bias_tensor->dtype()),
+             all_cores);
+     }
++    if (output_scales) {
++        // The row scales' tile, and the column scales' tile of each output
++        // tile and weight half (one for a [1, 1] scale), their rows replicated
++        // by the reader (an [N, 1] scale's tile as it is, for the compute to
++        // transpose).
++        add_cb(tt::CBIndex::c_6, 1, tt::DataFormat::Float32, all_cores);
++        add_cb(tt::CBIndex::c_7, col_scalar ? 1 : plan.halves * plan.count_of(0), tt::DataFormat::Float32, all_cores);
++    }
+     if (split) {
+         // The other shares pack their FP32 partial sum (one output tile a
+         // core) into c_5, which their writers place in the owner's partials
+@@ -262,6 +287,13 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+         {"cb_partials", tt::CBIndex::c_4},
+         {"cb_partial_out", tt::CBIndex::c_5},
+         {"has_bias", bias_tensor.has_value()},
++        {"cb_row_scale", tt::CBIndex::c_6},
++        {"cb_col_scale", tt::CBIndex::c_7},
++        {"has_scales", output_scales},
++        {"col_scalar", col_scalar},
++        {"col_column", col_column},
++        {"scale_rows", std::min(a_rows, TILE_HEIGHT)},
++        {"raw_bf16_output", raw_bf16_output},
+         {"transpose_b", transpose_b},
+         {"Kt", plan.Kt},
+         {"Kt_total", plan.Kt_total},
+@@ -298,6 +330,10 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+     if (bias_tensor.has_value()) {
+         tt::tt_metal::TensorAccessorArgs(bias_tensor->mesh_tensor()).append_to(reader_args);
+     }
++    if (output_scales) {
++        tt::tt_metal::TensorAccessorArgs(row_scale->mesh_tensor()).append_to(reader_args);
++        tt::tt_metal::TensorAccessorArgs(col_scale->mesh_tensor()).append_to(reader_args);
++    }
+     auto reader = make_kernel("reader_matmul_decode.cpp", reader_args, tt_metal::DataMovementProcessor::RISCV_0, in1_noc);
+     reader.core_ranges = all_cores;
+     std::vector<uint32_t> sender_args;
+@@ -355,6 +391,10 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+         if (bias_tensor.has_value()) {
+             args.emplace_back(bias_tensor->mesh_tensor());
+         }
++        if (output_scales) {
++            args.emplace_back(row_scale->mesh_tensor());
++            args.emplace_back(col_scale->mesh_tensor());
++        }
+         if (!split) {
+             reader.emplace_runtime_args(core_at(0, i), args);
+             continue;
+@@ -403,9 +443,12 @@ ProgramDescriptor MatmulDecodeProgramFactory::create_descriptor(
+         .fp32_dest_acc_en = true,
+         .dst_full_sync_en = true,
+         .math_approx_mode = math_approx_mode};
+-    if (split) {
++    if (split || output_scales) {
+         compute_config.unpack_to_dest_mode.assign(NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
+         compute_config.unpack_to_dest_mode[tt::CBIndex::c_4] = tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
++        // The scales go to DST exactly, for the SFPU's FP32 multiplies.
++        compute_config.unpack_to_dest_mode[tt::CBIndex::c_6] = tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
++        compute_config.unpack_to_dest_mode[tt::CBIndex::c_7] = tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
+     }
+     compute.config = std::move(compute_config);
+     for (uint32_t share = 0; share < k_splits; ++share) {
+diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.hpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.hpp
+--- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.hpp
++++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.hpp
+@@ -13,15 +13,16 @@
+ namespace ttnn::prim {
+ 
+ // The circular-buffer bytes per core of the decode program: the whole
+-// activation row, two double-buffered weight blocks, and this core's output
+-// and bias tiles. What create_descriptor allocates.
++// activation row, two double-buffered weight blocks, and this core's output,
++// bias and output-scale tiles. What create_descriptor allocates.
+ uint32_t matmul_decode_cb_bytes(
+     const ttnn::Tensor& input_tensor_a,
+     const ttnn::Tensor& input_tensor_b,
+     const std::optional<const ttnn::Tensor>& bias,
+     bool transpose_b,
+     tt::tt_metal::DataType output_dtype,
+-    const operations::matmul::MatmulDecodeProgramConfig& config);
++    const operations::matmul::MatmulDecodeProgramConfig& config,
++    bool output_scales = false);
+ 
+ // Program factory of MatmulDecodeProgramConfig: one tile row of activations
+ // times DRAM-interleaved weights, optionally finishing with SwiGLU.
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
+@@ -10,12 +10,68 @@
+ #include "api/compute/tile_move_copy.h"
+ #include "api/dataflow/circular_buffer.h"
+ #include "api/compute/compute_kernel_api.h"
++#include "api/compute/eltwise_unary/typecast.h"
++#include "api/compute/transpose_dest.h"
++
+ 
+ #ifdef TRISC_MATH
+ #include "sfpi.h"
+ 
+ namespace matmul_decode {
+ 
++// SFPU lane layout (fp32 DST): vector d (0..7) of a face holds, in lane l
++// (0..31), the face's element at row 4 * (d / 2) + l / 8, column
++// 2 * (l % 8) + d % 2.
++sfpi_inline sfpi::vInt lane_col2() { return sfpi::vInt(sfpi::vConstTileId) & 14; }
++
++// Every lane of each 8-lane group gets the group's sum.
++sfpi_inline sfpi::vFloat sum_lanes8(sfpi::vFloat v) {
++    v += sfpi::vFloat(sfpi::subvec_shflror1(v));
++    sfpi::vFloat r = sfpi::vFloat(sfpi::subvec_shflror1(v));
++    v += sfpi::vFloat(sfpi::subvec_shflror1(r));
++    r = sfpi::vFloat(sfpi::subvec_shflror1(v));
++    r = sfpi::vFloat(sfpi::subvec_shflror1(r));
++    r = sfpi::vFloat(sfpi::subvec_shflror1(r));
++    v += sfpi::vFloat(sfpi::subvec_shflror1(r));
++    return v;
++}
++
++// Column 0 of band d (rows 4d .. 4d + 3) of the current face, in all lanes of
++// each row: the other columns zeroed and the row's lanes summed, exactly.
++sfpi_inline sfpi::vFloat band_column0(uint32_t d) {
++    sfpi::vFloat v = sfpi::dst_reg[2 * d];
++    v_if(lane_col2() != 0) { v = 0.0f; }
++    v_endif;
++    return sum_lanes8(v);
++}
++
++sfpi_inline void store_band(uint32_t d, sfpi::vFloat v) {
++    sfpi::dst_reg[2 * d] = v;
++    sfpi::dst_reg[2 * d + 1] = v;
++}
++
++// Column 0 of DST tile `dst` spread across all 32 columns of each row.
++inline void spread_column0(uint32_t dst) {
++    _llk_math_eltwise_sfpu_start_(dst);
++    for (uint32_t pair = 0; pair < 2; ++pair) {
++        sfpi::vFloat b0 = band_column0(0);
++        sfpi::vFloat b1 = band_column0(1);
++        sfpi::vFloat b2 = band_column0(2);
++        sfpi::vFloat b3 = band_column0(3);
++        store_band(0, b0);
++        store_band(1, b1);
++        store_band(2, b2);
++        store_band(3, b3);
++        _llk_math_eltwise_sfpu_inc_dst_face_addr_();  // the right face, same rows
++        store_band(0, b0);
++        store_band(1, b1);
++        store_band(2, b2);
++        store_band(3, b3);
++        _llk_math_eltwise_sfpu_inc_dst_face_addr_();
++    }
++    _llk_math_eltwise_sfpu_done_();
++}
++
+ // Each value of DST tile `dst` rounded to BF16 and kept as FP32: to nearest,
+ // ties away from zero as the packer rounds a BF16 output, or ties to even as
+ // ttnn.typecast's conversion.
+@@ -43,6 +99,13 @@ inline void round_to_bf16(uint32_t dst) {
+ 
+ namespace {
+ inline void sfpu_pass_init() { MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>())); }
++
++// The FP32 scale tile in DST tile `slot`, column 0 spread across its columns.
++inline void load_scale_column(uint32_t cb, uint32_t tile, uint32_t slot) {
++    copy_tile(cb, tile, slot);
++    sfpu_pass_init();
++    MATH((matmul_decode::spread_column0(slot)));
++}
+ }  // namespace
+ 
+ // This core's output tiles, or silu(gate) * up for SwiGLU's two weight halves.
+@@ -66,6 +129,12 @@ void kernel_main() {
+     constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
+     constexpr uint32_t cb_bias = get_named_compile_time_arg_val("cb_bias");
+     constexpr bool has_bias = get_named_compile_time_arg_val("has_bias");
++    constexpr bool has_scales = get_named_compile_time_arg_val("has_scales");
++    constexpr bool col_scalar = get_named_compile_time_arg_val("col_scalar");
++    constexpr bool col_column = get_named_compile_time_arg_val("col_column");
++    constexpr bool raw_bf16_output = get_named_compile_time_arg_val("raw_bf16_output");
++    constexpr uint32_t cb_row_scale = get_named_compile_time_arg_val("cb_row_scale");
++    constexpr uint32_t cb_col_scale = get_named_compile_time_arg_val("cb_col_scale");
+     constexpr uint32_t transpose_b = get_named_compile_time_arg_val("transpose_b");
+     constexpr uint32_t cb_partials = get_named_compile_time_arg_val("cb_partials");
+     constexpr uint32_t cb_partial_out = get_named_compile_time_arg_val("cb_partial_out");
+@@ -88,6 +157,12 @@ void kernel_main() {
+     if constexpr (has_bias) {
+         cb_wait_front(cb_bias, count);
+     }
++    if constexpr (has_scales) {
++        if (!producer) {
++            cb_wait_front(cb_row_scale, 1);
++            cb_wait_front(cb_col_scale, col_scalar ? 1 : halves * count);
++        }
++    }
+     uint32_t in0_ready = 0;
+     uint32_t index = 0;
+     for (uint32_t group_start = 0; group_start < count; group_start += group) {
+@@ -142,15 +217,67 @@ void kernel_main() {
+             }
+             reconfig_data_format<SrcOrder::Reverse>(cb_in0, cb_weights);
+         }
++        if constexpr (has_scales) {
++            if (!producer) {
++                // (acc * row_scale) * col_scale, each by ttnn.multiply's FP32
++                // SFPU multiply, then ttnn.multiply's rounding to BF16 for a
++                // BF16 output: raw 16-bit codes in each DST word's low half.
++                // DST tile `tiles` (plan_decode leaves it spare) holds a scale.
++                // Both halves of a SwiGLU weight take their own columns' scales.
++                const uint32_t tiles = halves * width;
++                reconfig_data_format_srca(cb_row_scale);
++                copy_init(cb_row_scale);
++                load_scale_column(cb_row_scale, 0, tiles);
++                mul_binary_tile_init();
++                for (uint32_t i = 0; i < tiles; ++i) {
++                    mul_binary_tile(i, tiles, i);
++                }
++                copy_init(cb_col_scale);
++                if constexpr (col_scalar) {
++                    load_scale_column(cb_col_scale, 0, tiles);
++                    mul_binary_tile_init();
++                    for (uint32_t i = 0; i < tiles; ++i) {
++                        mul_binary_tile(i, tiles, i);
++                    }
++                } else if constexpr (col_column) {
++                    // An [N, 1] tile's column 0 spread across its columns,
++                    // then transposed: the [1, N] scales in every row.
++                    for (uint32_t i = 0; i < tiles; ++i) {
++                        copy_init(cb_col_scale);
++                        load_scale_column(cb_col_scale, (i / width) * count + group_start + i % width, tiles);
++                        transpose_dest_init</*is_32bit=*/true>();
++                        transpose_dest</*is_32bit=*/true>(tiles);
++                        mul_binary_tile_init();
++                        mul_binary_tile(i, tiles, i);
++                    }
++                } else {
++                    mul_binary_tile_init();
++                    for (uint32_t i = 0; i < tiles; ++i) {
++                        copy_tile(cb_col_scale, (i / width) * count + group_start + i % width, tiles);
++                        mul_binary_tile(i, tiles, i);
++                    }
++                }
++                if constexpr (raw_bf16_output) {
++                    typecast_tile_init<static_cast<uint32_t>(DataFormat::Float32),
++                                       static_cast<uint32_t>(DataFormat::Float16_b)>();
++                    for (uint32_t i = 0; i < width; ++i) {
++                        typecast_tile<static_cast<uint32_t>(DataFormat::Float32),
++                                      static_cast<uint32_t>(DataFormat::Float16_b)>(i);
++                    }
++                }
++                reconfig_data_format<SrcOrder::Reverse>(cb_in0, cb_weights);
++            }
++        }
+         if constexpr (exact_swiglu) {
+             // PyTorch's SiluAndMul on the BF16 projection, rounding as its ops
+             // do on TT: both halves to BF16 as the matmul's output packs (ties
+-            // away from zero), silu in FP32 (ttnn.silu) rounded to BF16 as
+-            // ttnn.typecast rounds (ties to even), and the product, exact in
+-            // FP32, rounded to BF16 as ttnn.multiply's output (ties to even).
++            // away from zero; to even as the scaled matmul's narrowing), silu
++            // in FP32 (ttnn.silu) rounded to BF16 as ttnn.typecast rounds (ties
++            // to even), and the product, exact in FP32, rounded to BF16 as
++            // ttnn.multiply's BF16 output (ties to even).
+             sfpu_pass_init();
+             for (uint32_t i = 0; i < 2 * width; ++i) {
+-                MATH((matmul_decode::round_to_bf16</*ties_to_even=*/false>(i)));
++                MATH((matmul_decode::round_to_bf16</*ties_to_even=*/has_scales>(i)));
+             }
+             silu_tile_init();
+             for (uint32_t i = 0; i < width; ++i) {
+@@ -185,4 +312,10 @@ void kernel_main() {
+     if constexpr (has_bias) {
+         cb_pop_front(cb_bias, count);
+     }
++    if constexpr (has_scales) {
++        if (!producer) {
++            cb_pop_front(cb_row_scale, 1);
++            cb_pop_front(cb_col_scale, col_scalar ? 1 : halves * count);
++        }
++    }
+ }
+diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
+@@ -27,6 +27,76 @@ FORCE_INLINE void read_bias(uint32_t n_start, uint32_t count, uint32_t cb_bias)
+     }
+ }
+ 
++// The accessor arguments after the bias's, if there is a bias.
++template <bool has_bias, uint32_t args_offset>
++constexpr uint32_t after_bias_args() {
++    if constexpr (has_bias) {
++        return TensorAccessorArgs<args_offset>().next_compile_time_args_offset();
++    } else {
++        return args_offset;
++    }
++}
++
++// Reads the output scales: the row scales' column 0, as rows 0 .. scale_rows -
++// 1 of faces 0 and 2 of the row-scale tile, and for each of this core's output
++// tiles (once for a [1, 1] scale) the column scales' row 0, faces 0 and 1,
++// into each of those rows of a column-scale tile, or faces 0 and 2 (its
++// column 0) of an [N, 1] scale's tile: those of a SwiGLU weight's gate half,
++// then of its up half. Their
++// addresses are the runtime arguments at arg_index; their accessor arguments
++// follow the bias's.
++template <bool has_scales, uint32_t args_offset, uint32_t arg_index>
++FORCE_INLINE void read_scales(uint32_t n_start, uint32_t count) {
++    if constexpr (has_scales) {
++        constexpr uint32_t cb_row = get_named_compile_time_arg_val("cb_row_scale");
++        constexpr uint32_t cb_col = get_named_compile_time_arg_val("cb_col_scale");
++        constexpr uint32_t rows = get_named_compile_time_arg_val("scale_rows");
++        constexpr bool col_scalar = get_named_compile_time_arg_val("col_scalar");
++        constexpr bool col_column = get_named_compile_time_arg_val("col_column");
++        constexpr uint32_t halves = get_named_compile_time_arg_val("halves");
++        constexpr uint32_t out_Nt = get_named_compile_time_arg_val("out_Nt");
++        constexpr uint32_t n_step = get_named_compile_time_arg_val("n_step");
++        constexpr uint32_t row_bytes = 64;  // an FP32 face row
++        constexpr uint32_t face_bytes = 1024;
++        constexpr uint32_t tile_bytes = 4 * face_bytes;
++        constexpr auto row_args = TensorAccessorArgs<args_offset>();
++        constexpr auto col_args = TensorAccessorArgs<row_args.next_compile_time_args_offset()>();
++        const auto row_scale = TensorAccessor(row_args, get_arg_val<uint32_t>(arg_index));
++        const auto col_scale = TensorAccessor(col_args, get_arg_val<uint32_t>(arg_index + 1));
++        cb_reserve_back(cb_row, 1);
++        const uint32_t row_l1 = get_write_ptr(cb_row);
++        noc_async_read(row_scale.get_noc_addr(0), row_l1, (rows < 16 ? rows : 16) * row_bytes);
++        if constexpr (rows > 16) {
++            noc_async_read(
++                row_scale.get_noc_addr(0, 2 * face_bytes), row_l1 + 2 * face_bytes, (rows - 16) * row_bytes);
++        }
++        const uint32_t col_tiles = col_scalar ? 1 : halves * count;
++        cb_reserve_back(cb_col, col_tiles);
++        const uint32_t col_l1 = get_write_ptr(cb_col);
++        for (uint32_t n = 0; n < col_tiles; ++n) {
++            const uint32_t column = col_scalar ? 0 : (n / count) * out_Nt + n_start + (n % count) * n_step;
++            if constexpr (col_column) {
++                const uint32_t local = col_l1 + n * tile_bytes;
++                noc_async_read(col_scale.get_noc_addr(column), local, face_bytes);
++                noc_async_read(col_scale.get_noc_addr(column, 2 * face_bytes), local + 2 * face_bytes, face_bytes);
++                continue;
++            }
++            const uint64_t left = col_scale.get_noc_addr(column);
++            const uint64_t right = col_scale.get_noc_addr(column, face_bytes);
++            for (uint32_t r = 0; r < rows; ++r) {
++                const uint32_t at = col_l1 + n * tile_bytes + (r < 16 ? 0 : 2 * face_bytes) + (r % 16) * row_bytes;
++                noc_async_read(left, at, row_bytes);
++                if constexpr (!col_scalar) {
++                    noc_async_read(right, at + face_bytes, row_bytes);
++                }
++            }
++        }
++        noc_async_read_barrier();
++        cb_push_back(cb_row, 1);
++        cb_push_back(cb_col, col_tiles);
++    }
++}
++
+ // Reads this core's bias tiles, streams its even weight blocks on RISCV_0's
+ // NOC, then writes its output tiles.
+ //
+@@ -50,11 +120,15 @@ void kernel_main() {
+     constexpr uint32_t cb_partial_out = get_named_compile_time_arg_val("cb_partial_out");
+     constexpr bool has_bias = get_named_compile_time_arg_val("has_bias");
+     constexpr uint32_t n_step = get_named_compile_time_arg_val("n_step");
++    constexpr bool has_scales = get_named_compile_time_arg_val("has_scales");
++    // Runtime arguments after the first four: the bias's address, the scales',
++    // then a split's.
++    constexpr uint32_t extra = (has_bias ? 1 : 0) + (has_scales ? 2 : 0);
+     constexpr uint32_t k_splits = get_named_compile_time_arg_val("k_splits");
+     constexpr uint32_t partial_sem_id = get_named_compile_time_arg_val("partial_sem");
+     constexpr uint32_t ready_sem_id = get_named_compile_time_arg_val("ready_sem");
+     constexpr bool split = k_splits > 1;
+-    const uint32_t role = split ? get_arg_val<uint32_t>(4) : 0;
++    const uint32_t role = split ? get_arg_val<uint32_t>(4 + extra) : 0;
+     const bool owner = role == 1;
+     const bool producer = role == 2;
+     constexpr auto weight_args = TensorAccessorArgs<0>();
+@@ -62,24 +136,26 @@ void kernel_main() {
+     const auto weight = TensorAccessor(weight_args, weight_addr);
+     const auto output = TensorAccessor(output_args, output_addr);
+     read_bias<has_bias, output_args.next_compile_time_args_offset()>(n_start, count, cb_bias);
++    read_scales<has_scales, after_bias_args<has_bias, output_args.next_compile_time_args_offset()>(), 4 + (has_bias ? 1 : 0)>(
++        n_start, count);
+ 
+     Noc noc;
+     if (owner) {
+         cb_reserve_back(cb_partials, k_splits - 1);
+         Semaphore<> ready_sem(ready_sem_id);
+-        const uint32_t num_producers = get_arg_val<uint32_t>(9);
++        const uint32_t num_producers = get_arg_val<uint32_t>(9 + extra);
+         for (uint32_t i = 0; i < num_producers; ++i) {
+-            ready_sem.up(noc, get_arg_val<uint32_t>(10 + 2 * i), get_arg_val<uint32_t>(11 + 2 * i), 1);
++            ready_sem.up(noc, get_arg_val<uint32_t>(10 + extra + 2 * i), get_arg_val<uint32_t>(11 + extra + 2 * i), 1);
+         }
+         noc_async_atomic_barrier();
+     }
+-    const uint32_t k_start = split ? get_arg_val<uint32_t>(5) : 0;
++    const uint32_t k_start = split ? get_arg_val<uint32_t>(5 + extra) : 0;
+     stream_decode_weights<0>(weight, n_start, count, cb_weights, [] {}, k_start);
+ 
+     if (producer) {
+-        const uint32_t owner_x = get_arg_val<uint32_t>(6);
+-        const uint32_t owner_y = get_arg_val<uint32_t>(7);
+-        const uint32_t slot = get_arg_val<uint32_t>(8);
++        const uint32_t owner_x = get_arg_val<uint32_t>(6 + extra);
++        const uint32_t owner_y = get_arg_val<uint32_t>(7 + extra);
++        const uint32_t slot = get_arg_val<uint32_t>(8 + extra);
+         const uint32_t tile_bytes = get_tile_size(cb_partial_out);
+         // Partials buffers have the same address on every core.
+         const uint32_t remote = get_write_ptr(cb_partials) + slot * tile_bytes;
+diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+@@ -200,8 +200,9 @@ void validate_matmul_optional_tensors(
+         !optional_output_tensors.empty() && optional_output_tensors.at(0).has_value();
+ 
+     TT_FATAL(
+-        optional_input_tensors.size() == 1,
+-        "Must have exactly 1 optional input tensor, got: {}",
++        optional_input_tensors.size() == (attributes.output_scales ? 3 : 1),
++        "Must have exactly {} optional input tensors, got: {}",
++        attributes.output_scales ? 3 : 1,
+         optional_input_tensors.size());
+ 
+     const auto output_tensor_spec = MatmulDeviceOperation::compute_output_specs(attributes, args).at(0);
+diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
+--- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
++++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation_types.hpp
+@@ -39,6 +39,10 @@ struct MatmulParams {
+     // Read A's K columns from this tile-aligned column of a wider interleaved A, instead of all of A's columns.
+     // Set through ttnn::linear; only the 2D multicast program config (its Metal 2.0 spec factory) supports it.
+     std::optional<uint32_t> in0_column_offset = std::nullopt;
++    // The decode program only: the FP32 accumulation times optional_input_tensors[1] (FP32 [..., M, 1], a scale per
++    // row), then times optional_input_tensors[2] (FP32 [1, N], [N, 1] or [1, 1]), as two FP32 multiplies before the
++    // output type's rounding: (acc * row_scale) * col_scale, torch._scaled_mm's dequantization (ttnn::matmul_scaled).
++    bool output_scales = false;
+ };
+ 
+ struct MatmulInputs {
+diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
+--- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
++++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
+@@ -518,6 +518,98 @@ Tensor matmul_swiglu(
+         .at(0);
+ }
+ 
++Tensor matmul_scaled(
++    const Tensor& input_tensor_a,
++    const Tensor& input_tensor_b,
++    const Tensor& row_scale,
++    const Tensor& col_scale,
++    bool transpose_b,
++    const std::optional<const MemoryConfig>& memory_config,
++    std::optional<const DataType> dtype,
++    std::optional<const DeviceComputeKernelConfig> compute_kernel_config,
++    bool swiglu) {
++    const MemoryConfig output_mem_config = memory_config.value_or(ttnn::DRAM_MEMORY_CONFIG);
++    const DataType output_dtype = dtype.value_or(DataType::FLOAT32);
++    TT_FATAL(
++        row_scale.dtype() == DataType::FLOAT32 && col_scale.dtype() == DataType::FLOAT32,
++        "matmul_scaled: the scales must be FLOAT32");
++    TT_FATAL(
++        output_dtype == DataType::FLOAT32 || output_dtype == DataType::BFLOAT16,
++        "matmul_scaled: the output must be FLOAT32 or BFLOAT16");
++    TT_FATAL(!swiglu || output_dtype == DataType::BFLOAT16, "matmul_scaled: SwiGLU's output must be BFLOAT16");
++    ttnn::prim::MatmulParams params;
++    params.output_mem_config = output_mem_config;
++    params.output_dtype = output_dtype;
++    params.compute_kernel_config = compute_kernel_config;
++    params.transpose_b = transpose_b;
++    auto attributes = ttnn::prim::create_matmul_attributes(input_tensor_a, input_tensor_b, params, {std::nullopt});
++    // The program ttnn::matmul would choose: the decode program (or its split
++    // over K) takes the scales in its epilogue.
++    auto config = get_program_config(input_tensor_a, input_tensor_b, false, transpose_b, 0, attributes);
++    normalize_program_config(config, input_tensor_a.device()->compute_with_storage_grid_size());
++    auto* decode = std::get_if<MatmulDecodeProgramConfig>(&config);
++    if (swiglu) {
++        // Each output tile's gate and up halves on one core, unless the
++        // matmul splits over K (see matmul_swiglu).
++        if (decode != nullptr && decode->k_splits == 1) {
++            decode->fuse_swiglu = true;
++            decode->exact_swiglu = true;
++        } else {
++            decode = nullptr;
++        }
++    }
++    const auto is_tiled_dram = [](const Tensor& t) {
++        return t.layout() == Layout::TILE && utilities::is_dram_interleaved(t.memory_config());
++    };
++    const auto& col_shape = col_scale.logical_shape();
++    const uint32_t n = input_tensor_b.logical_shape()[transpose_b ? -2 : -1];
++    // [N, 1] column scales are the [1, N] row's transpose.
++    const bool col_column = col_scale.logical_volume() != 1 && col_shape[-2] == n && col_shape[-1] == 1;
++    const bool col_fits = col_scale.logical_volume() == 1 || col_column || (col_shape[-2] == 1 && col_shape[-1] == n);
++    if (decode != nullptr && is_tiled_dram(row_scale) && is_tiled_dram(col_scale) &&
++        col_fits && row_scale.logical_shape()[-1] == 1) {
++        attributes.program_config = config;
++        attributes.output_scales = true;
++        if (!matmul_decode_unsupported_reason(input_tensor_a, input_tensor_b, std::nullopt, attributes, *decode)
++                 .has_value()) {
++            return ttnn::device_operation::launch<ttnn::prim::MatmulDeviceOperation>(
++                       attributes,
++                       {{input_tensor_a, input_tensor_b},
++                        {std::nullopt, row_scale, col_scale},
++                        {std::nullopt}})
++                .at(0);
++        }
++    }
++    if (swiglu) {
++        return silu_and_mul(
++            matmul_scaled(
++                input_tensor_a,
++                input_tensor_b,
++                row_scale,
++                col_scale,
++                transpose_b,
++                output_mem_config,
++                output_dtype,
++                compute_kernel_config),
++            output_mem_config);
++    }
++    const Tensor product = ttnn::matmul(
++        input_tensor_a,
++        input_tensor_b,
++        /*transpose_a=*/false,
++        transpose_b,
++        output_mem_config,
++        DataType::FLOAT32,
++        /*program_config=*/std::nullopt,
++        /*activation=*/std::nullopt,
++        compute_kernel_config);
++    return ttnn::multiply(
++        ttnn::multiply(product, row_scale, DataType::FLOAT32, output_mem_config),
++        col_column ? ttnn::transpose(col_scale, -2, -1) : col_scale,
++        output_dtype,
++        output_mem_config);
++}
++
+ Tensor linear(
+     const Tensor& input_tensor_a,
+     const Tensor& input_tensor_b,
+diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/matmul/matmul.hpp
+--- ttnn/cpp/ttnn/operations/matmul/matmul.hpp
++++ ttnn/cpp/ttnn/operations/matmul/matmul.hpp
+@@ -65,6 +65,26 @@ Tensor matmul_swiglu(
+     bool transpose_b = false,
+     bool exact = false);
+ 
++// torch._scaled_mm's dequantization fused into a one-tile-row matmul: the FP32
++// product of a and b times row_scale (FP32 [..., M, 1]), then times col_scale
++// (FP32 [1, N], its transpose [N, 1], or [1, 1]), each by ttnn.multiply's FP32
++// multiply, rounded to `dtype` (FP32 or BF16) as ttnn.multiply rounds: (a @ b *
++// row_scale) * col_scale, bit for bit. The decode program does it in its
++// epilogue when it can run the matmul; otherwise the matmul and the two
++// multiplies run apart. With `swiglu`, b holds a gate half followed by an up
++// half and the BF16 result is PyTorch's SiluAndMul of the scaled product as TT
++// runs its ops, bit for bit (exact_swiglu).
++Tensor matmul_scaled(
++    const Tensor& input_tensor_a,
++    const Tensor& input_tensor_b,
++    const Tensor& row_scale,
++    const Tensor& col_scale,
++    bool transpose_b = false,
++    const std::optional<const MemoryConfig>& memory_config = std::nullopt,
++    std::optional<const DataType> dtype = std::nullopt,
++    std::optional<const DeviceComputeKernelConfig> compute_kernel_config = std::nullopt,
++    bool swiglu = false);
++
+ std::vector<Tensor> matmul_batched_weights(
+     const Tensor& input_tensor_a,
+     const std::vector<Tensor>& input_tensors_b,
+@@ -143,6 +163,7 @@ using operations::matmul::addmm;
+ using operations::matmul::linear;
+ using operations::matmul::matmul;
+ using operations::matmul::matmul_swiglu;
++using operations::matmul::matmul_scaled;
+ using operations::matmul::matmul_batched_weights;
+ using operations::matmul::sparse_matmul;
+ 

@@ -1,10 +1,11 @@
 """Gathers, scatters and dynamic updates lower to the indexed-rows kernels.
 
-Every StableHLO gather, scatter and dynamic_update_slice compiles to
-ttir.rows_gather or ttir.rows_scatter: rows of a [B, N, R] table moved by int32
-index components. These tests cover the shapes the lowering normalizes: token
-and sampler lookups, windows, batching dims, multi-component indices, element
-types moved as bytes, every reduction, and out-of-bounds handling.
+Every StableHLO gather, scatter, dynamic_slice (at computed starts) and
+dynamic_update_slice compiles to ttir.rows_gather or ttir.rows_scatter: rows of
+a [B, N, R] table moved by int32 index components. These tests cover the
+shapes the lowering normalizes: token and sampler lookups, windows, batching
+dims, multi-component indices, element types moved as bytes, every reduction,
+and out-of-bounds handling.
 """
 
 import jax
@@ -413,6 +414,53 @@ def test_dynamic_update_slice_unsigned_starts():
         want[min(b, 3), min(s, 15)] = update[0, 0]
         assert_equal(got, want)
 
+@pytest.mark.parametrize("trace", [False, True])
+def test_dynamic_slice(trace):
+    # Slices at computed starts, clamped so the window lies in the operand:
+    # an element of a vector of sequence offsets (as SGLang-TorchTPU's hybrid
+    # models read one per layer), rows of a matrix, a window of columns, and a
+    # middle dimension of a bf16 tensor.
+    rng = np.random.default_rng(19)
+    offsets = np.array([0, 7, 9, 30, 41], np.int32)
+    matrix = rng.normal(size=(8, 48)).astype(np.float32)
+    cache = rng.normal(size=(2, 6, 32)).astype(jnp.bfloat16)
+
+    def read(offsets, matrix, cache, i, j):
+        return (
+            jax.lax.dynamic_slice(offsets, (i,), (1,)),
+            jax.lax.dynamic_slice(matrix, (i, 0), (2, 48)),
+            jax.lax.dynamic_slice(matrix, (i, j), (3, 5)),
+            jax.lax.dynamic_slice(cache, (0, i, 0), (2, 1, 32)),
+        )
+
+    def window(x, starts, sizes):
+        # JAX wraps negative starts once, then the slice clamps them.
+        starts = [min(max(s + d if s < 0 else s, 0), d - w) for s, d, w in zip(starts, x.shape, sizes)]
+        return x[tuple(slice(s, s + w) for s, w in zip(starts, sizes))]
+
+    device = jax.devices("tt")[0]
+    compiled = jax.jit(read, compiler_options=dict(OPTIONS, enable_trace=str(trace).lower()))
+    for i, j in ((0, 0), (3, 17), (4, 43), (9, 60), (-2, -5)):
+        got = compiled(*[jax.device_put(a, device) for a in (offsets, matrix, cache, np.int32(i), np.int32(j))])
+        want = (
+            window(offsets, (i,), (1,)),
+            window(matrix, (i, 0), (2, 48)),
+            window(matrix, (i, j), (3, 5)),
+            window(cache, (0, i, 0), (2, 1, 32)),
+        )
+        for g, w in zip(got, want):
+            assert_equal(g, w)
+
+
+def test_dynamic_slice_unsigned_starts():
+    # Unsigned starts past INT32_MAX clamp to the last window that fits.
+    x = np.arange(64, dtype=np.int32).reshape(4, 16)
+    for i, j in ((1, 5), (0xFFFFFFFF, 0x80000000), (2, 0x7FFFFFFF)):
+        got = run(lambda x, i, j: jax.lax.dynamic_slice(x, (i, j), (2, 4)), x, np.uint32(i), np.uint32(j))
+        a, b = min(i, 2), min(j, 12)
+        assert_equal(got, x[a : a + 2, b : b + 4])
+
+
 def test_state_pool_update():
     # sglang's recurrent state pool: states.at[slots].set(new_states).
     rng = np.random.default_rng(15)
@@ -473,6 +521,11 @@ def _compile_ir(tmp_path, fn, *args):
             (np.zeros((16, 8), np.float32), np.array([1, 5], np.int32), np.ones((2, 8), np.float32)),
         ),
         (
+            "dynamic_slice",
+            lambda x, i: jax.lax.dynamic_slice(x, (i,), (1,)),
+            (np.array([0, 3, 8], np.int32), np.int32(1)),
+        ),
+        (
             "dynamic_update_slice",
             lambda x, u: jax.lax.dynamic_update_slice(x, u, (2, 0)),
             (np.zeros((16, 8), np.float32), np.ones((1, 8), np.float32)),
@@ -488,7 +541,9 @@ def test_indexed_moves_run_on_rows_kernels(tmp_path, name, fn, args):
     # Nothing is routed through ttnn.embedding, ttnn.gather or ttnn.scatter,
     # whose kernels are not built: every indexed move is a rows op.
     result, ir = _compile_ir(tmp_path, fn, *args)
-    for op in ('"ttnn.embedding"', '"ttnn.gather"', '"ttnn.scatter"', '"ttnn.embedding_backward"'):
+    # Nor through ttnn.slice_dynamic, whose bounds the runtime reads on the
+    # host, which ends a trace.
+    for op in ('"ttnn.embedding"', '"ttnn.gather"', '"ttnn.scatter"', '"ttnn.embedding_backward"', '"ttnn.slice_dynamic"'):
         assert op not in ir, (name, op)
     assert '"ttnn.rows_gather"' in ir or '"ttnn.rows_scatter"' in ir, name
     cpu = jax.devices("cpu")[0]

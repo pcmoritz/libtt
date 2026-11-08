@@ -36,6 +36,10 @@ def _bfp8(weights):
         (1, 1024, 5120 + 24, False, False, "bfp_bf8"),
         (1, 1024, 5120 + 24, False, True, "bfp_bf8"),
         (1, 1024, 5120 + 24, True, False, "bfp_bf8"),
+        # Few output tiles split K, and a share of 64 or more K tiles is read
+        # in several blocks: the 4-chip Qwen3-8B qkv projection.
+        (1, 4096, 1536, False, True, "bf16"),
+        (1, 12288, 1536, False, False, "bfp_bf8"),
     ],
 )
 def test_decode_matmul(rows, inner_size, width, residual, transposed, weight_dtype):
@@ -157,3 +161,29 @@ def test_transposed_parameter_is_transposed_once(tmp_path):
     matmuls = [line for ir in irs for line in ir.splitlines() if '"ttnn.matmul"' in line]
     assert matmuls, "no matmul in the exported IR"
     assert all("transpose_b = false" in line for line in matmuls), matmuls
+
+
+@pytest.mark.parametrize("rows,configured", [(1, False), (4, False), (64, True)])
+def test_o0_decode_matmul_is_left_to_tt_metal(tmp_path, rows, configured):
+    """At O0 (PyTorch through torch_tpu) every matmul carries a HiFi4/FP32
+    compute config. One tile row of BF16 activations is left without a
+    program config, so tt-metal runs its decode matmul with that config;
+    more rows keep the compiler's 1D multicast config."""
+
+    def project(x, weights):
+        return x @ weights.T
+
+    run = jax.jit(project, compiler_options={"export_path": str(tmp_path)})
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(15)
+    # Exactly representable inputs: with FP32 accumulation, only the BF16
+    # output rounds.
+    x = (rng.integers(-4, 5, (rows, 1024)) / 16).astype(jnp.bfloat16)
+    weights = (rng.integers(-4, 5, (4096, 1024)) / 16).astype(jnp.bfloat16)
+    actual = run(*(jax.device_put(v, device) for v in (x, weights)))
+    expected = x.astype(np.float32) @ weights.astype(np.float32).T
+    np.testing.assert_allclose(np.asarray(actual).astype(np.float32), expected, atol=1 / 64, rtol=1 / 128)
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_runtime*.mlir")]
+    matmuls = [line for ir in irs for line in ir.splitlines() if '"ttnn.matmul"' in line]
+    assert matmuls, "no matmul in the exported IR"
+    assert all(("matmul_program_config" in line) == configured for line in matmuls), matmuls

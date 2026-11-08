@@ -279,6 +279,53 @@ def test_native_float8_matmul_flushes_subnormal_operands(dtype, subnormal, one):
     np.testing.assert_array_equal(product, np.zeros((32, 32), np.float32))
 
 
+@pytest.mark.parametrize("rows", [1, 3, 16, 32])
+@pytest.mark.parametrize("k,n", [(4096, 6144), (4096, 1536), (3072, 4096)])
+def test_float8_decode_matmul(rows, k, n):
+    """torch._scaled_mm of a decode batch: a tile row of float8 activations and a transposed float8
+    weight, which tt-metal's decode matmul reads natively, the activation's partial faces included."""
+    rng = np.random.default_rng(rows + k + n)
+    x = random_float8((rows, k), jnp.float8_e4m3fn, rng)
+    w = random_float8((n, k), jnp.float8_e4m3fn, rng)
+    product = jax.jit(
+        lambda x, w: jnp.dot(
+            x.astype(jnp.float32), w.T.astype(jnp.float32), preferred_element_type=jnp.float32
+        )
+    )(x, w)
+    x64, w64 = flush_subnormals(x).astype(np.float64), flush_subnormals(w).astype(np.float64)
+    scale = np.abs(x64) @ np.abs(w64.T)
+    error = np.abs(np.asarray(product).astype(np.float64) - x64 @ w64.T) / np.maximum(scale, 1e-30)
+    assert np.max(error) < 2.0**-9
+
+
+@pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", FORMATS)
+def test_matmul_of_converted_float8_reads_float8(tmp_path, dtype, out_dtype):
+    """torch._scaled_mm lowers to a matmul of its float8 operands converted to f32, the weight
+    [N, K] transposed. The matrix unit reads the float8 values natively instead, and the
+    transpose fuses into the matmul: no conversion or transpose of the weight per call."""
+    rng = np.random.default_rng(11)
+    x, w = random_float8((32, 256), dtype, rng), random_float8((96, 256), dtype, rng)
+    product = jax.jit(
+        lambda x, w: jnp.dot(
+            x.astype(out_dtype), w.T.astype(out_dtype), preferred_element_type=out_dtype
+        ),
+        compiler_options={"export_path": str(tmp_path)},
+    )(x, w)
+    x64, w64 = flush_subnormals(x).astype(np.float64), flush_subnormals(w).astype(np.float64)
+    scale = np.abs(x64) @ np.abs(w64.T)
+    error = np.abs(np.asarray(product).astype(np.float64) - x64 @ w64.T) / np.maximum(scale, 1e-30)
+    assert np.max(error) < (2.0**-9 if out_dtype == jnp.float32 else 2.0**-7)
+    [ir] = (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")
+    lines = ir.read_text().splitlines()
+    [matmul] = [line for line in lines if '"ttnn.matmul"' in line]
+    float8 = "f8E4M3FN" if dtype == jnp.float8_e4m3fn else "f8E5M2"
+    assert f"tensor<32x256x{float8}" in matmul and f"tensor<96x256x{float8}" in matmul, matmul
+    assert "transpose_b = true" in matmul, matmul
+    assert not [line for line in lines if '"ttnn.permute"' in line], lines
+    assert not [line for line in lines if '"ttnn.typecast"' in line and float8 in line], lines
+
+
 @pytest.mark.parametrize(
     "lhs_dtype,rhs_dtype", [(jnp.float8_e4m3fn, jnp.bfloat16), (jnp.bfloat16, jnp.float8_e5m2)]
 )

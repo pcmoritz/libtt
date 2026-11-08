@@ -1,0 +1,456 @@
+diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
+--- a/pjrt_implementation/inc/api/client_instance.h
++++ b/pjrt_implementation/inc/api/client_instance.h
+@@ -11,6 +11,7 @@
+ #ifndef TT_XLA_PJRT_IMPLEMENTATION_INC_API_CLIENT_INSTANCE_H_
+ #define TT_XLA_PJRT_IMPLEMENTATION_INC_API_CLIENT_INSTANCE_H_
+ 
++#include "cpp/key_value_context.h"
+ #include "xla/pjrt/c/pjrt_c_api.h"
+ 
+ // c++ standard library includes
+@@ -109,6 +110,7 @@ public:
+ 
+   // Returns process index of this client.
+   int getProcessIndex() const { return m_process_index; }
++  bool isMultiProcess() const { return m_process_count > 1; }
+ 
+   // Returns vector of raw pointers to all devices, including addressable and
+   // non-addressable devices.
+@@ -196,6 +198,9 @@ private:
+ 
+   // Process index of this client. Always 0 in single-process settings.
+   int m_process_index;
++  int m_process_count = 1;
++  std::optional<libtt::KeyValueStore> m_key_value_store;
++  std::vector<int> m_device_owners;
+ 
+   // Vector of all devices visible to the runtime, including addressable and
+   // non-addressable devices.
+@@ -216,13 +221,13 @@ private:
+ 
+   // Vector of all device memories visible to the runtime.
+   // The host memory is in the m_addressable_host_memory member.
+-  std::vector<std::unique_ptr<MemoryInstance>> m_addressable_device_memories;
++  std::vector<std::unique_ptr<MemoryInstance>> m_device_memories;
+ 
+   // MemoryInstance object representing host memory.
+   std::unique_ptr<MemoryInstance> m_addressable_host_memory;
+ 
+   // Vector of raw pointers to all addressable memories, owned by
+-  // `m_addressable_device_memories` and `m_addressable_host_memory`.
++  // `m_device_memories` and `m_addressable_host_memory`.
+   // Necessary to have to be able to return it in
+   // `PJRT_Client_AddressableMemories` API call.
+   std::vector<MemoryInstance *> m_addressable_memories_raw;
+diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
+--- a/pjrt_implementation/src/api/buffer_instance.cc
++++ b/pjrt_implementation/src/api/buffer_instance.cc
+@@ -556,6 +556,10 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+   // and copies the data; it holds all it uses, so deleting the buffer does not
+   // wait for it.
+   const size_t logical_tensor_size = logicalTensorSize();
++  // U64 and complex buffers hold two runtime elements per element.
++  const bool check_runtime_size =
++      m_data_type != PJRT_Buffer_Type_U64 &&
++      !data_type_utils::isComplexPJRTType(m_data_type);
+   const tt::runtime::Tensor host_tensor = [&] {
+     // Untilizing the tensor on device runs a program, which a trace capture on
+     // another thread would skip or record: the read would then return what an
+@@ -579,6 +583,14 @@ tt_pjrt_status BufferInstance::copyToHost(void *host_buffer,
+                logical_tensor_size, host_buffer_size);
+ 
+       tt::runtime::wait(host_tensor);
++      // A multi-process client must copy this process's shard, not a tensor
++      // of the whole mesh.
++      const size_t runtime_bytes =
++          static_cast<size_t>(tt::runtime::getTensorVolume(host_tensor)) *
++          tt::runtime::utils::dataTypeElementSize(rt_data_type);
++      TT_FATAL(!check_runtime_size || runtime_bytes == logical_tensor_size,
++               "Runtime tensor does not match the PJRT shard: {} vs {} bytes",
++               runtime_bytes, logical_tensor_size);
+       tt::runtime::memcpy(host_buffer, host_tensor, rt_data_type);
+ 
+       EventInstance::markAsReadyAndCallback(e, tt_pjrt_status::kSuccess);
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -17,8 +17,12 @@
+ #include <filesystem>
+ #include <map>
+ #include <mutex>
++#include <numeric>
+ #include <optional>
++#include <sstream>
++#include <stdexcept>
+ #include <thread>
++#include <tt-metalium/system_mesh.hpp>
+ 
+ // system includes
+ #include <unistd.h>
+@@ -46,6 +50,77 @@
+ 
+ namespace tt::pjrt {
+ 
++static tt::runtime::SystemDesc
++gatherSystemDescriptors(const tt::runtime::SystemDesc &local,
++                        const libtt::KeyValueStore &store, int rank, int size,
++                        std::vector<int> &owners) {
++  namespace metal = tt::tt_metal::distributed;
++  const auto mapping =
++      metal::SystemMesh::instance().get_mapped_devices(std::nullopt);
++  // System descriptors enumerate local devices in physical-ID order. PJRT device
++  // IDs instead follow the global mesh, including positions owned by other
++  // hosts.
++  std::vector<std::pair<int, int>> localIds;
++  for (size_t i = 0; i < mapping.device_ids.size(); ++i)
++    if (mapping.device_ids[i].is_local())
++      localIds.emplace_back(mapping.device_ids[i].value(), i);
++  std::sort(localIds.begin(), localIds.end());
++  if (localIds.size() != local->chip_desc_indices()->size())
++    throw std::runtime_error("System mesh and local descriptor disagree");
++  std::ostringstream ids;
++  for (const auto &[physicalId, globalId] : localIds)
++    ids << globalId << ' ';
++  const std::string prefix = "libtt/devices/";
++  store.put(prefix + std::to_string(rank) + "/ids", ids.str());
++  std::vector<uint8_t> bytes;
++  local.storeToMemory(bytes);
++  store.put(prefix + std::to_string(rank) + "/desc",
++            std::string_view(reinterpret_cast<const char *>(bytes.data()),
++                             bytes.size()));
++
++  auto merged =
++      tt::target::UnPackSizePrefixedSystemDescRoot(local.handle.get());
++  auto &desc = *merged->system_desc;
++  const size_t count = mapping.device_ids.size();
++  desc.chip_descs.clear();
++  desc.chip_descs.resize(count);
++  desc.chip_desc_indices.resize(count);
++  std::iota(desc.chip_desc_indices.begin(), desc.chip_desc_indices.end(), 0);
++  desc.chip_capabilities.resize(count);
++  desc.chip_channels.clear();
++  owners.assign(count, -1);
++  for (int process = 0; process < size; ++process) {
++    const auto descriptor =
++        store.get(prefix + std::to_string(process) + "/desc");
++    flatbuffers::Verifier verifier(
++        reinterpret_cast<const uint8_t *>(descriptor.data()),
++        descriptor.size());
++    if (!tt::target::VerifySizePrefixedSystemDescRootBuffer(verifier))
++      throw std::runtime_error("Invalid remote system descriptor");
++    auto remote =
++        tt::target::UnPackSizePrefixedSystemDescRoot(descriptor.data());
++    std::istringstream mappingIds(
++        store.get(prefix + std::to_string(process) + "/ids"));
++    for (size_t i = 0; i < remote->system_desc->chip_desc_indices.size(); ++i) {
++      size_t id;
++      if (!(mappingIds >> id) || id >= count || owners[id] != -1)
++        throw std::runtime_error("Inconsistent global device ownership");
++      const auto chipIndex = remote->system_desc->chip_desc_indices[i];
++      desc.chip_descs[id] = std::make_unique<tt::target::ChipDescT>(
++          *remote->system_desc->chip_descs.at(chipIndex));
++      desc.chip_capabilities[id] = remote->system_desc->chip_capabilities.at(i);
++      owners[id] = process;
++    }
++  }
++  if (std::find(owners.begin(), owners.end(), -1) != owners.end())
++    throw std::runtime_error("A global mesh device has no owning process");
++  flatbuffers::FlatBufferBuilder builder;
++  auto root = tt::target::SystemDescRoot::Pack(builder, merged.get());
++  tt::target::FinishSizePrefixedSystemDescRootBuffer(builder, root);
++  return tt::runtime::SystemDesc::loadFromMemory(builder.GetBufferPointer(),
++                                                 builder.GetSize());
++}
++
+ static std::string getRankBindingPath(const std::string &metal_home) {
+   static std::unordered_map<std::string, std::string> rank_binding_paths = {
+       {"2x4_multiprocess",
+@@ -348,8 +423,8 @@ ClientInstance::ClientInstance()
+       m_parent_mesh(std::nullopt) {
+   DLOG_F(LOG_DEBUG, "ClientInstance::ClientInstance");
+ 
+-  // TODO(mrakita): Add support for multi-process environment. Process index is
+-  // always 0 in single-process settings.
++  // initialize() takes a multi-process client's index from libtpu's
++  // environment.
+   m_process_index = 0;
+ }
+ 
+@@ -360,6 +435,25 @@ ClientInstance::~ClientInstance() {
+ }
+ 
+ PJRT_Error *ClientInstance::initialize() {
++  // torch_tpu starts one process per chip and describes them through libtpu's
++  // environment.
++  if (std::optional<libtt::LibtpuProcesses> processes =
++          libtt::ConfigureLibtpuProcesses()) {
++    if (const char *mpi = std::getenv("TT_RUNTIME_ENABLE_DISTRIBUTED");
++        mpi && std::string_view(mpi) != "0")
++      throw std::invalid_argument(
++          "Multi-process execution cannot use the MPI worker runtime");
++    if (std::getenv("TT_COMPILE_ONLY_SYSTEM_DESC"))
++      throw std::invalid_argument(
++          "Multi-process compile-only mode is not supported");
++    m_process_index = processes->index;
++    m_process_count = processes->count;
++    m_key_value_store = processes->store;
++    tt::tt_metal::distributed::multihost::DistributedContext::set_current_world(
++        libtt::MakeKeyValueContext(*m_key_value_store, m_process_index,
++                                   m_process_count));
++    tt::runtime::setFabricConfig(tt::runtime::FabricConfig::FABRIC_1D);
++  }
+   DLOG_F(LOG_DEBUG, "ClientInstance::Initialize");
+ 
+   bool distributed_runtime =
+@@ -439,6 +533,10 @@ tt_pjrt_status ClientInstance::populateDevices() {
+     m_compile_only = true;
+   } else {
+     m_system_descriptor = tt::runtime::getCurrentSystemDesc();
++    if (isMultiProcess())
++      m_system_descriptor = gatherSystemDescriptors(
++          m_system_descriptor, *m_key_value_store, m_process_index,
++          m_process_count, m_device_owners);
+   }
+ 
+   size_t devices_count = m_system_descriptor->chip_desc_indices()->size();
+@@ -448,11 +546,13 @@ tt_pjrt_status ClientInstance::populateDevices() {
+   m_addressable_devices_raw.reserve(devices_count);
+ 
+   for (size_t i = 0; i < devices_count; ++i) {
+-    int global_device_id = m_system_descriptor->chip_desc_indices()->Get(i);
+-    int local_device_id = i;
++    int global_device_id = i;
++    int local_device_id = -1;
+ 
+-    // For now, just make all devices addressable.
+-    bool is_addressable = true;
++    int owner = isMultiProcess() ? m_device_owners[i] : m_process_index;
++    bool is_addressable = owner == m_process_index;
++    if (is_addressable)
++      local_device_id = m_addressable_devices_raw.size();
+ 
+     const auto *chip_desc = m_system_descriptor->chip_descs()->Get(i);
+     // Total on-device DRAM = num_dram_channels * dram_channel_size.  Used
+@@ -467,11 +567,11 @@ tt_pjrt_status ClientInstance::populateDevices() {
+                                        local_device_id, chip_desc->arch(),
+                                        dram_size_bytes);
+ 
++    device_instance->setProcessIndex(owner);
+     m_devices_raw.push_back(device_instance.get());
+     m_device_descriptions_raw.push_back(
+         device_instance->getDeviceDescription());
+     if (is_addressable) {
+-      device_instance->setProcessIndex(m_process_index);
+       m_addressable_devices_raw.push_back(device_instance.get());
+     }
+ 
+@@ -509,20 +609,20 @@ tt_pjrt_status ClientInstance::populateMemories() {
+                                      /*is_host_memory=*/true);
+   m_addressable_memories_raw.push_back(m_addressable_host_memory.get());
+ 
++  // Remote devices also need a default memory description. Only local
++  // memories are returned by PJRT_Client_AddressableMemories.
+   for (size_t i = 0; i < m_devices.size(); ++i) {
+-    // Adding host memory to device addressable memories.
+-    m_devices[i]->addAddressableMemory(m_addressable_host_memory.get());
+-
+-    // Adding device memory to device addressable memories.
+-    std::vector<DeviceInstance *> single_addressable_device = {
+-        m_addressable_devices_raw[i]};
+-    std::unique_ptr<MemoryInstance> device_memory =
+-        MemoryInstance::createInstance(single_addressable_device, /*id=*/i + 1,
+-                                       /*is_host_memory=*/false);
+-    m_addressable_memories_raw.push_back(device_memory.get());
+-    m_devices[i]->addAddressableMemory(device_memory.get());
+-    m_devices[i]->setDefaultMemory(device_memory.get());
+-    m_addressable_device_memories.push_back(std::move(device_memory));
++    auto *device = m_devices[i].get();
++    std::vector<DeviceInstance *> memory_devices{device};
++    auto memory = MemoryInstance::createInstance(memory_devices, /*id=*/i + 1,
++                                                /*is_host_memory=*/false);
++    if (device->isAddressable()) {
++      device->addAddressableMemory(m_addressable_host_memory.get());
++      m_addressable_memories_raw.push_back(memory.get());
++    }
++    device->addAddressableMemory(memory.get());
++    device->setDefaultMemory(memory.get());
++    m_device_memories.push_back(std::move(memory));
+   }
+ 
+   return tt_pjrt_status::kSuccess;
+@@ -555,17 +655,21 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+   if (replica_device_ids.has_value()) {
+     for (int64_t device_id : *replica_device_ids) {
+       if (device_id >= 0 &&
+-          device_id < static_cast<int64_t>(m_addressable_devices_raw.size())) {
+-        addressable_devices.push_back(m_addressable_devices_raw[device_id]);
++          device_id < static_cast<int64_t>(m_devices_raw.size())) {
++        if (m_devices_raw[device_id]->isAddressable())
++          addressable_devices.push_back(m_devices_raw[device_id]);
+       } else {
+         LOG_F(ERROR, "Invalid device ID %ld in DeviceAssignment", device_id);
+         return tt_pjrt_status::kInvalidArgument;
+       }
+     }
+   } else {
+-    addressable_devices.assign(m_addressable_devices_raw.begin(),
+-                               m_addressable_devices_raw.begin() +
+-                                   executable_image->getNumDevicesToUtilize());
++    const auto count = executable_image->getNumDevicesToUtilize();
++    if (count > m_devices_raw.size())
++      return tt_pjrt_status::kInvalidArgument;
++    for (size_t i = 0; i < count; ++i)
++      if (m_devices_raw[i]->isAddressable())
++        addressable_devices.push_back(m_devices_raw[i]);
+   }
+ 
+   std::unique_ptr<LoadedExecutableInstance> executable =
+@@ -591,8 +695,9 @@ ClientInstance::computeFabricConfig(const std::vector<uint32_t> &mesh_shape) {
+                                          {}};
+   }
+ 
+-  if (std::getenv("TT_RUNTIME_ENABLE_DISTRIBUTED") != nullptr &&
+-      std::string(std::getenv("TT_RUNTIME_ENABLE_DISTRIBUTED")) != "0") {
++  if (isMultiProcess() ||
++      (std::getenv("TT_RUNTIME_ENABLE_DISTRIBUTED") != nullptr &&
++       std::string(std::getenv("TT_RUNTIME_ENABLE_DISTRIBUTED")) != "0")) {
+ 
+     uint32_t num_devices = 1;
+     for (auto dim : mesh_shape) {
+@@ -619,6 +724,13 @@ ClientInstance::computeFabricConfig(const std::vector<uint32_t> &mesh_shape) {
+ 
+ tt::runtime::Device ClientInstance::getOrCreateMeshDevice(
+     const std::vector<uint32_t> &target_mesh_shape) {
++  if (isMultiProcess() && m_addressable_devices_raw.size() == 1 &&
++      m_parent_mesh.has_value() &&
++      target_mesh_shape == std::vector<uint32_t>{1, 1}) {
++    // Each process executes local work on its addressable devices. Keep the
++    // global mesh so local and collective tensors share one allocator.
++    return *m_parent_mesh;
++  }
+ 
+   if (std::optional<tt::runtime::Device> submesh =
+           getOrCreateSubMesh(target_mesh_shape)) {
+@@ -802,14 +914,17 @@ PJRT_Error *onClientCreate(PJRT_Client_Create_Args *args) {
+   ZoneScoped;
+   DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_Client_Create");
+ 
+-  // We currently don't utilize any of the PJRT Client create options.
+-  for (size_t i = 0; i < args->num_options; ++i) {
+-    DLOG_F(WARNING, "Unused PJRT Client create option: %s",
+-           args->create_options[i].name);
++  PJRT_Error *error;
++  try {
++    error = GlobalClientInstanceSingleton::initClient();
++  } catch (const std::invalid_argument &e) {
++    return *ErrorInstance::makeError(tt_pjrt_status::kInvalidArgument, e.what())
++                .release();
++  } catch (const std::exception &e) {
++    return *ErrorInstance::makeError(tt_pjrt_status::kInternal, e.what())
++                .release();
+   }
+ 
+-  PJRT_Error *error = GlobalClientInstanceSingleton::initClient();
+-
+   if (error) {
+     LOG_F(ERROR, "Failed to initialize PJRT client instance");
+     return error;
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -76,7 +76,8 @@ FlatbufferLoadedExecutableInstance::prepareInputTensor(
+   if (!PjrtTensor::have_same_tensor(arg_buffers)) {
+     mlir::FailureOr<std::unordered_map<std::string, std::string>> filled =
+         fillStrategyMapFromSharding(
+-            m_executable_image->getInputSharding(arg_index), num_devices);
++            m_executable_image->getInputSharding(arg_index),
++            m_executable_image->getNumDevicesToUtilize());
+     if (mlir::failed(filled)) {
+       LOG_F(ERROR, "Failed to fill strategy map from sharding");
+       return std::nullopt;
+@@ -187,9 +188,9 @@ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+   DLOG_F(LOG_DEBUG, "FlatbufferLoadedExecutableInstance::Execute");
+   LOG_BRINGUP_STAGE("RUNTIME_EXECUTION_START");
+ 
+-  if (args->num_devices != m_executable_image->getNumDevicesToUtilize()) {
++  if (args->num_devices != m_addressable_devices.size()) {
+     LOG_F(ERROR, "Device count mismatch: %zu vs %zu", args->num_devices,
+-          m_executable_image->getNumDevicesToUtilize());
++          m_addressable_devices.size());
+     return tt_pjrt_status::kInternal;
+   }
+ 
+diff --git a/pjrt_implementation/src/api/loaded_executable_instance.cc b/pjrt_implementation/src/api/loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/loaded_executable_instance.cc
+@@ -112,13 +112,18 @@ LoadedExecutableInstance::getOrCreateMeshDevice(
+       std::accumulate(devices_mesh_shape.begin(), devices_mesh_shape.end(), 1,
+                       std::multiplies<std::uint32_t>{}));
+ 
+-  if (device_ids.size() != mesh_shape_num_devices) {
++  if (device_ids.size() != m_addressable_devices.size()) {
+     LOG_F(ERROR,
+-          "Input buffers are placed on a different number of devices (%zu) "
+-          "than in the mesh shape estimated by the compiler (%zu)",
+-          device_ids.size(), mesh_shape_num_devices);
++          "Input device count does not match the local executable devices");
+     return std::nullopt;
+   }
++  for (auto *device : m_addressable_devices) {
++    if (!device_ids.contains(device->getGlobalDeviceId())) {
++      LOG_F(ERROR,
++            "Input buffers do not match the executable device assignment");
++      return std::nullopt;
++    }
++  }
+ 
+   DeviceInstance *device_instance = DeviceInstance::unwrap(pjrt_device);
+   if (device_instance &&
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -497,7 +497,7 @@ ModuleBuilder::buildModule(
+   }
+ 
+   std::vector<int64_t> result_presharded = collectResultPresharded(mlir_module);
+-  if (target_num_devices > 1) {
++  if (client_instance->isMultiProcess() || target_num_devices > 1) {
+     // PJRT returns local shards even when Shardy infers output partitioning.
+     // Do not aggregate them into a global host tensor at the graph boundary.
+     std::fill(result_presharded.begin(), result_presharded.end(), 1);
+@@ -1133,6 +1133,12 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+     return tt_pjrt_status::kInternal;
+   }
+ 
++  // Reuse the live mesh: a mock device cannot bind the multi-host topology.
++  if (client_instance->isMultiProcess()) {
++    options.devicePtr = client_instance->parentMesh()->asSharedPtr<
++        tt::tt_metal::distributed::MeshDevice>(tt::runtime::DeviceRuntime::TTNN);
++  }
++
+   options.optimizationLevel = compile_options.optimization_level;
+   options.eraseInverseOpsEnabled = false;
+   // Map user-facing dtype names to BFPDtype enum values.
+diff --git a/pjrt_implementation/src/api/tensor.cc b/pjrt_implementation/src/api/tensor.cc
+--- a/pjrt_implementation/src/api/tensor.cc
++++ b/pjrt_implementation/src/api/tensor.cc
+@@ -27,6 +27,7 @@
+ 
+ // tt-xla includes
+ #include "api/buffer_instance.h"
++#include "api/client_instance.h"
+ #include "api/tensor_pool.h"
+ #include "utils/assert.h"
+ #include "utils/logging.h"
+@@ -51,7 +52,10 @@ PjrtTensor &PjrtTensor::from_pjrt_buffers(
+ }
+ 
+ bool PjrtTensor::on_every_chip() const {
++  // A multi-process client runs one-device programs on its global mesh, but
++  // their data is only on the process's own chip.
+   return m_shards.size() == 1 && m_runtime_tensor.has_value() &&
++         !GlobalClientInstanceSingleton::getClientInstance()->isMultiProcess() &&
+          tt::runtime::detail::getNumShards(*m_runtime_tensor) > 1;
+ }
+ 

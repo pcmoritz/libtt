@@ -1,0 +1,393 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -6664,6 +6664,25 @@ def TTIR_ScaledDotProductAttentionOp : TTIR_NamedOp<"scaled_dot_product_attentio
+   let hasVerifier = 1;
+ }
+ 
++def TTIR_QuantizeRowsOp : TTIR_NamedOp<"quantize_rows"> {
++  let summary = "Per-row dynamic float8 quantization.";
++  let description = [{
++    `input` is [..., M, K] (FP32 or BF16). Per row,
++
++      scale[m] = max(float(max_k |input[m, k]|) / fp8_max, min_scale)
++      output[m, k] = float8(float(input[m, k]) / scale[m])
++
++    with fp8_max the largest finite value of `float8_type` (f8E4M3FN or
++    f8E5M2) and the cast rounded to nearest even, not saturated. `output`
++    holds the float8 codes as ui8, as float8 tensors are stored (StableHLO's
++    Float8DataTypeConversion); `scale` is [..., M, 1] FP32. One program;
++    SGLang-TorchTPU's FP8 linears quantize their activations so.
++  }];
++  let arguments = (ins AnyRankedTensor:$input, F32Attr:$min_scale,
++                       TTCore_DataTypeAttr:$float8_type);
++  let results = (outs AnyRankedTensor:$output, AnyRankedTensor:$scale);
++}
++
+ def TTIR_GatedDeltaRuleOp : TTIR_NamedOp<"gated_delta_rule"> {
+   let summary = "gated delta rule.";
+   let arguments = (ins AnyRankedTensor:$query,
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -5025,6 +5025,24 @@ def TTNN_ScaledDotProductAttentionOp : TTNN_Op<"scaled_dot_product_attention", [
+     let hasVerifier = 1;
+ }
+ 
++def TTNN_QuantizeRowsOp : TTNN_Op<"quantize_rows", [OpModelExempt]> {
++  let summary = "Per-row dynamic float8 quantization.";
++  let description = [{
++    ttnn::experimental::quantize_rows, see ttir.quantize_rows: a tiled FP32 or
++    BF16 input of one tile row, the tiled float8 codes as ui8 and the FP32
++    scale.
++  }];
++  let arguments = (ins AnyRankedTensor:$input, F32Attr:$min_scale,
++                       TTCore_DataTypeAttr:$float8_type);
++  let results = (outs AnyRankedTensor:$output, AnyRankedTensor:$scale);
++
++  let extraClassDeclaration = [{
++    wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
++      return wa::TTNNOperandsWorkaroundsFactory::createQuantizeRowsOpOperandsWorkarounds(*this);
++    }
++  }];
++}
++
+ def TTNN_GatedDeltaRuleOp : TTNN_Op<"gated_delta_rule", [OpModelExempt]> {
+   let summary = "gated delta rule.";
+   let arguments = (ins AnyRankedTensor:$query,
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -275,6 +275,11 @@ public:
+   // tt-metal issue: https://github.com/tenstorrent/tt-metal/issues/41451
+   static TTNNOperandsWorkarounds createGatherOpOperandsWorkarounds();
+ 
++  // Create workarounds for quantize_rows: a tiled FP32 or BF16 input, tiled
++  // ui8 float8 codes and a tiled FP32 scale.
++  static TTNNOperandsWorkarounds
++  createQuantizeRowsOpOperandsWorkarounds(mlir::Operation *op);
++
+   // Create workarounds for rows_gather and rows_scatter: the kernels move
+   // row-major pages as bytes and read int32 indices.
+   static TTNNOperandsWorkarounds
+diff --git a/include/ttmlir/Target/TTNN/operations/eltwise.fbs b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+--- a/include/ttmlir/Target/TTNN/operations/eltwise.fbs
++++ b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
+@@ -143,6 +143,17 @@ table EltwiseQuantizationOp {
+   params: EltwiseQuantizationOpParams;
+ }
+ 
++// ttnn::experimental::quantize_rows: per row of the input, scale = max(amax /
++// fp8_max, min_scale) and output = float8(input / scale) in float8_type, the
++// output a UINT8 view of the codes.
++table QuantizeRowsOp {
++  input: tt.target.ttnn.TensorRef;
++  min_scale: float;
++  float8_type: tt.target.DataType;
++  output: tt.target.ttnn.TensorRef;
++  scale: tt.target.ttnn.TensorRef;
++}
++
+ table EltwiseTernaryWhereOp {
+   first: tt.target.ttnn.TensorRef;
+   second: tt.target.ttnn.TensorRef;
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -93,6 +93,7 @@ union OpType {
+   FullOp,
+   FuncCallOp,
+   GatherOp,
++  QuantizeRowsOp,
+   RowsGatherOp,
+   RowsScatterOp,
+   GenericOp,
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10191,6 +10191,44 @@ public:
+   }
+ };
+ 
++// `tt.quantize_rows` (jax.ffi.ffi_call with min_scale and e5m2 attributes):
++// one input, the float8 codes as ui8 (float8 tensors are stored as their bits;
++// the caller bitcasts them) and the FP32 scale.
++class StableHLOQuantizeRowsConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
++public:
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::CustomCallOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    if (op.getCallTargetName() != "tt.quantize_rows") {
++      return failure();
++    }
++    if (op.getNumOperands() != 1 || op.getNumResults() != 2) {
++      return op.emitOpError("tt.quantize_rows takes one input and returns two results");
++    }
++    auto backendConfig = getFfiBackendConfig(op);
++    FloatAttr minScale =
++        backendConfig ? backendConfig.getAs<FloatAttr>("min_scale") : nullptr;
++    if (!minScale) {
++      return op.emitOpError("tt.quantize_rows needs a float min_scale attribute");
++    }
++    BoolAttr e5m2 = backendConfig.getAs<BoolAttr>("e5m2");
++    SmallVector<Type> types;
++    if (failed(getTypeConverter()->convertTypes(op.getResultTypes(), types))) {
++      return failure();
++    }
++    rewriter.replaceOpWithNewOp<ttir::QuantizeRowsOp>(
++        op, types, adaptor.getOperands()[0],
++        rewriter.getF32FloatAttr(minScale.getValueAsDouble()),
++        ttcore::DataTypeAttr::get(rewriter.getContext(),
++                                  e5m2 && e5m2.getValue()
++                                      ? ttcore::DataType::Float8E5M2
++                                      : ttcore::DataType::Float8E4M3FN));
++    return success();
++  }
++};
++
+ class StableHLOPagedFillCacheConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
+   using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
+@@ -12169,6 +12207,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
+                                                                 ctx);
+   patterns.add<StableHLOToTTIRCollectivePermuteOpConversionPattern>(
+       typeConverter, ctx);
++  patterns.add<StableHLOQuantizeRowsConversionPattern>(typeConverter,
++                                                        patterns.getContext());
+   patterns.add<StableHLORecurrentOpConversionPattern>(typeConverter,
+                                                       patterns.getContext());
+   patterns.add<StableHLOToTTIRCustomCallOpConversionPattern>(typeConverter,
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -3589,6 +3589,23 @@ public:
+     return success();
+   }
+ };
++class QuantizeRowsOpConversionPattern
++    : public OpConversionPattern<ttir::QuantizeRowsOp> {
++public:
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(ttir::QuantizeRowsOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    SmallVector<Type> types;
++    if (failed(getTypeConverter()->convertTypes(op->getResultTypes(), types))) {
++      return failure();
++    }
++    rewriter.replaceOpWithNewOp<ttnn::QuantizeRowsOp>(
++        op, types, adaptor.getInput(), adaptor.getMinScaleAttr(),
++        adaptor.getFloat8TypeAttr());
++    return success();
++  }
++};
+ class GatedDeltaRuleOpConversionPattern
+     : public OpConversionPattern<ttir::GatedDeltaRuleOp> {
+ public:
+@@ -4233,6 +4250,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            ScaledDotProductAttentionDecodeOpConversionPattern,
+            PagedScaledDotProductAttentionDecodeOpConversionPattern,
+            ChunkedScaledDotProductAttentionOpConversionPattern,
++           QuantizeRowsOpConversionPattern,
+            GatedDeltaRuleOpConversionPattern,
+            GatedDeltaDecodeOpConversionPattern,
+            CausalConv1dUpdateOpConversionPattern,
+diff --git a/lib/Dialect/StableHLO/Transforms/DecomposeCustomCallTuples.cpp b/lib/Dialect/StableHLO/Transforms/DecomposeCustomCallTuples.cpp
+--- a/lib/Dialect/StableHLO/Transforms/DecomposeCustomCallTuples.cpp
++++ b/lib/Dialect/StableHLO/Transforms/DecomposeCustomCallTuples.cpp
+@@ -42,6 +42,44 @@ public:
+         rewriter.eraseOp(op);
+       }
+     }
++
++    // Rewrite 2: a tt.* custom_call with one tuple result becomes a
++    // custom_call with the tuple's tensors as results. torch_tpu passes its
++    // JAX kernels through XLA HLO, where a multi-output custom call is
++    // tuple-shaped; the tt.* conversions take the multi-result form.
++    SmallVector<mlir::stablehlo::CustomCallOp> tupleCalls;
++    getOperation().walk([&](mlir::stablehlo::CustomCallOp op) {
++      if (!op.getCallTargetName().starts_with("tt.") ||
++          op.getNumResults() != 1) {
++        return;
++      }
++      auto tupleType = dyn_cast<TupleType>(op.getResult(0).getType());
++      if (!tupleType ||
++          !llvm::all_of(tupleType.getTypes(), llvm::IsaPred<RankedTensorType>) ||
++          !llvm::all_of(op.getResult(0).getUsers(),
++                        llvm::IsaPred<mlir::stablehlo::GetTupleElementOp>)) {
++        return;
++      }
++      tupleCalls.push_back(op);
++    });
++    for (auto op : tupleCalls) {
++      auto tupleType = cast<TupleType>(op.getResult(0).getType());
++      rewriter.setInsertionPoint(op);
++      auto split = rewriter.create<mlir::stablehlo::CustomCallOp>(
++          op.getLoc(), tupleType.getTypes(), op.getOperands(), op->getAttrs());
++      if (auto layouts = split.getResultLayouts();
++          layouts && layouts->size() != tupleType.size()) {
++        split.removeResultLayoutsAttr();
++      }
++      for (OpOperand &use :
++           llvm::make_early_inc_range(op.getResult(0).getUses())) {
++        auto getTupleOp =
++            cast<mlir::stablehlo::GetTupleElementOp>(use.getOwner());
++        rewriter.replaceOp(getTupleOp,
++                           split.getResult(getTupleOp.getIndex()));
++      }
++      rewriter.eraseOp(op);
++    }
+   }
+ };
+ } // namespace mlir::tt::stablehlo
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -4436,6 +4436,39 @@ public:
+     return success();
+   }
+ };
++
++// Fuses the float8 quantization of a decode norm's output into the norm's
++// program, which still returns the norm (Qwen3.8's gated DeltaNet layers also
++// read it in BF16):
++//   norm, sum = rms_norm_residual(x, r, w); q, scale = quantize_rows(norm)
++//   -> norm, sum, q, scale = rms_norm_residual(x, r, w)
++class RMSNormResidualQuantizeFusionPattern
++    : public mlir::OpRewritePattern<QuantizeRowsOp> {
++public:
++  using mlir::OpRewritePattern<QuantizeRowsOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(QuantizeRowsOp op,
++                  mlir::PatternRewriter &rewriter) const override {
++    auto norm = op.getInput().getDefiningOp<RMSNormResidualOp>();
++    if (!norm || op.getInput() != norm.getOutput() ||
++        !norm.getQuantized().empty() ||
++        !norm.getOutput().getType().getElementType().isBF16()) {
++      return failure();
++    }
++    rewriter.setInsertionPoint(norm);
++    auto fused = rewriter.create<RMSNormResidualOp>(
++        norm.getLoc(),
++        TypeRange{norm.getOutput().getType(), norm.getSum().getType(),
++                  op.getOutput().getType(), op.getScale().getType()},
++        norm.getInput(), norm.getResidual(), norm.getWeight(),
++        norm.getEpsilonAttr(), norm.getWeightOffsetAttr(),
++        op.getFloat8TypeAttr(), op.getMinScaleAttr());
++    rewriter.replaceOp(op, fused.getQuantized());
++    rewriter.replaceOp(norm, ValueRange{fused.getOutput(), fused.getSum()});
++    return success();
++  }
++};
+ 
+ // TTNN lays out the last two dims of a tensor as 32x32 tiles, so a [1, 10240]
+ // view takes 320 tiles where [1, 4, 2560] takes 80. An elementwise op next to
+@@ -4704,6 +4734,7 @@ public:
+       patterns.add<RMSNormFusionPattern>(&getContext());
+       patterns.add<NormalizeRMSNormFusionPattern>(&getContext());
+       patterns.add<RMSNormResidualFusionPattern>(&getContext());
++      patterns.add<RMSNormResidualQuantizeFusionPattern>(&getContext());
+ 
+       patterns.add<GeluFusionPattern>(&getContext());
+       patterns.add<Relu6FusionPattern>(&getContext());
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -323,6 +323,28 @@ static TTNNOperandWorkarounds rowsIndexWorkaround(mlir::Value indices) {
+   return workaround;
+ }
+ 
++TTNNOperandsWorkarounds
++TTNNOperandsWorkaroundsFactory::createQuantizeRowsOpOperandsWorkarounds(
++    mlir::Operation *op) {
++  auto quantize = mlir::cast<ttnn::QuantizeRowsOp>(op);
++  TTNNOperandWorkarounds input;
++  input.tensorLayoutWorkaround = Layout::Tile;
++  input.tensorDataTypeWorkaround =
++      quantize.getInput().getType().getElementType().isF32()
++          ? ttcore::DataType::Float32
++          : ttcore::DataType::BFloat16;
++  TTNNOperandWorkarounds output;
++  output.tensorLayoutWorkaround = Layout::Tile;
++  output.tensorDataTypeWorkaround = ttcore::DataType::UInt8;
++  TTNNOperandWorkarounds scale;
++  scale.tensorLayoutWorkaround = Layout::Tile;
++  scale.tensorDataTypeWorkaround = ttcore::DataType::Float32;
++  return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
++      .addInputOperandWorkaround(input)
++      .addOutputOperandWorkaround(output)
++      .addOutputOperandWorkaround(scale);
++}
++
+ TTNNOperandsWorkarounds
+ TTNNOperandsWorkaroundsFactory::createRowsGatherOpOperandsWorkarounds(
+     mlir::Operation *op) {
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+@@ -647,6 +647,7 @@ const std::set<mlir::StringRef>
+         ttnn::WhereOp::getOperationName(), ttnn::FullOp::getOperationName(),
+         ttnn::EmbeddingOp::getOperationName(),
+         ttnn::ScatterOp::getOperationName(),
++        ttnn::QuantizeRowsOp::getOperationName(),
+         ttnn::RowsGatherOp::getOperationName(),
+         ttnn::RowsScatterOp::getOperationName(),
+         ttnn::RngBitGeneratorOp::getOperationName(),
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -4019,6 +4019,19 @@ createOp(FlatbufferObjectCache &cache, ScaledDotProductAttentionOp op) {
+       slidingWindowSize, attentionSink, out, memoryConfig);
+ }
+ 
++::flatbuffers::Offset<::tt::target::ttnn::QuantizeRowsOp>
++createOp(FlatbufferObjectCache &cache, QuantizeRowsOp op) {
++  auto input = cache.at<::tt::target::ttnn::TensorRef>(
++      getOperandThroughDPSOps(op.getInput()));
++  auto output = cache.getOrCreateNoSharding(
++      op.getOutput(), tensorValueToFlatbuffer, std::nullopt);
++  auto scale = cache.getOrCreateNoSharding(op.getScale(),
++                                           tensorValueToFlatbuffer, std::nullopt);
++  return ::tt::target::ttnn::CreateQuantizeRowsOp(
++      *cache.fbb, input, op.getMinScale().convertToFloat(),
++      toFlatbuffer(cache, op.getFloat8TypeAttr()), output, scale);
++}
++
+ ::flatbuffers::Offset<::tt::target::ttnn::GatedDeltaRuleOp>
+ createOp(FlatbufferObjectCache &cache, GatedDeltaRuleOp op) {
+   auto tensor = [&](Value value) {
+@@ -5875,6 +5888,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createOp(cache, scaledDotProductAttentionOp),
+                            debugString, locInfo);
+   }
++  if (auto quantizeRowsOp = dyn_cast<QuantizeRowsOp>(op)) {
++    return createOperation(cache, createOp(cache, quantizeRowsOp), debugString,
++                           locInfo);
++  }
+   if (auto recurrentOp = dyn_cast<GatedDeltaRuleOp>(op)) {
+     return createOperation(cache, createOp(cache, recurrentOp), debugString,
+                            locInfo);
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -128,6 +128,7 @@
+ #include "operations/transformer/nlp_create_qkv_heads_decode_norm_rope.h"
+ #include "operations/transformer/paged_flash_multi_latent_attention_decode.h"
+ #include "operations/transformer/paged_scaled_dot_product_attention_decode.h"
++#include "operations/quantization/quantize_rows.h"
+ #include "operations/transformer/recurrent.h"
+ #include "operations/transformer/rotary_embedding.h"
+ #include "operations/transformer/rotary_embedding_llama.h"
+@@ -786,6 +787,9 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+     return operations::transformer::run(
+         op->type_as_ScaledDotProductAttentionOp(), getContext());
+   }
++  case ::tt::target::ttnn::OpType::QuantizeRowsOp:
++    return operations::quantization::run(op->type_as_QuantizeRowsOp(),
++                                         getContext());
+   case ::tt::target::ttnn::OpType::GatedDeltaRuleOp:
+     return operations::transformer::run(op->type_as_GatedDeltaRuleOp(),
+                                         getContext());

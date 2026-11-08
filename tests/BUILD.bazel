@@ -1,5 +1,5 @@
-load("@jax_test_pip//:requirements.bzl", "requirement")
 load("@rules_cc//cc:defs.bzl", "cc_test")
+load("@jax_test_pip//:requirements.bzl", "requirement")
 load("@rules_python//python:defs.bzl", "py_test")
 load("@torch_tpu_test_pip//:requirements.bzl", torch_tpu_test_requirements = "all_requirements")
 
@@ -145,6 +145,7 @@ py_test(
 )
 
 TORCH_TPU_SMOKE_TEST_ARGS = [
+    "--local-test=$(rlocationpath :libtt_torch_tpu/multi_result_custom_call_test.py)",
     "--local-test=$(rlocationpath :libtt_torch_tpu/process_exit_test.py)",
     "--local-test=$(rlocationpath :libtt_torch_tpu/read_while_input_test.py)",
     "tests/booleans_test.py",
@@ -165,6 +166,7 @@ TORCH_TPU_SMOKE_TEST_ARGS = [
 ]
 
 TORCH_TPU_SMOKE_TEST_DATA = [
+    "libtt_torch_tpu/multi_result_custom_call_test.py",
     "libtt_torch_tpu/process_exit_test.py",
     "libtt_torch_tpu/read_while_input_test.py",
 ]
@@ -217,11 +219,13 @@ py_test(
     name = "torch_tpu_test_suite",
     srcs = TORCH_TPU_TEST_SRCS,
     args = TORCH_TPU_TEST_ARGS + [
+        "--local-test=$(rlocationpath :libtt_torch_tpu/multi_result_custom_call_test.py)",
         "--local-test=$(rlocationpath :libtt_torch_tpu/process_exit_test.py)",
         "--local-test=$(rlocationpath :libtt_torch_tpu/read_while_input_test.py)",
         "--local-test=$(rlocationpath :libtt_torch_tpu/rng_state_test.py)",
     ],
     data = TORCH_TPU_TEST_DATA + [
+        "libtt_torch_tpu/multi_result_custom_call_test.py",
         "libtt_torch_tpu/process_exit_test.py",
         "libtt_torch_tpu/read_while_input_test.py",
         "libtt_torch_tpu/rng_state_test.py",
@@ -250,4 +254,13 @@ cc_test(
         "@tt_metal//:ttnn_distributed_tensor_upstream",
         "@tt_metal//:ttnn_tensor_upstream",
     ],
+)
+
+cc_test(
+    name = "key_value_context_test",
+    srcs = ["key_value_context_test.cc"],
+    linkstatic = True,
+    copts = ["-std=c++20"],
+    deps = ["//:key_value_context"],
+    timeout = "short",
 )

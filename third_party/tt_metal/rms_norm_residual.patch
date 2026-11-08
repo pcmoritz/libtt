@@ -2,7 +2,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/compute/rms_norm_residual.cpp
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,309 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -10,18 +10,47 @@ new file mode 100644
 +#include "api/compute/bcast.h"
 +#include "api/compute/compute_kernel_api.h"
 +#include "api/compute/compute_kernel_hw_startup.h"
-+#include "api/compute/eltwise_binary.h"
++#include "api/compute/eltwise_binary_sfpu.h"
 +#include "api/compute/eltwise_unary/binop_with_scalar.h"
 +#include "api/compute/eltwise_unary/rsqrt.h"
 +#include "api/compute/matmul.h"
 +#include "api/compute/reconfig_data_format.h"
 +#include "api/compute/reduce.h"
++#include "api/compute/tile_move_copy.h"
++#include "ttnn/cpp/ttnn/operations/experimental/quantize_rows/device/kernels/compute/quantize_rows_sfpu.h"
++
++#ifdef TRISC_MATH
++#include "ckernel_sfpu_conversions.h"
++
++namespace ckernel::sfpu {
++// out = in0 + in1 over ITERATIONS SFPU rows of a DST face: added in FP32 and
++// rounded to nearest even at BF16 precision, so that packing the sum to BF16
++// keeps it unchanged. add_binary_tile's NearestEven option does nothing with
++// FP32 DST accumulation.
++template <int ITERATIONS>
++inline void add_round_to_bf16(uint32_t in0, uint32_t in1, uint32_t out) {
++    // A DST tile is 32 SFPU rows.
++    constexpr uint32_t tile = 32;
++#pragma GCC unroll 0
++    for (int d = 0; d < ITERATIONS; ++d) {
++        const sfpi::vFloat sum = sfpi::dst_reg[in0 * tile] + sfpi::vFloat(sfpi::dst_reg[in1 * tile]);
++        sfpi::dst_reg[out * tile] = float32_to_bf16_rne(sum);
++        sfpi::dst_reg++;
++    }
++}
++}  // namespace ckernel::sfpu
++#endif
 +
 +// sum = input + residual for this core's tiles. The rows' sums of squares
 +// over those tiles are the diagonal of sum * sum^T, a tile the writer takes
 +// them from to gather on the first core, one column per core; that core
 +// sums the rows, turns them into rsqrt(mean + eps), and the writer
 +// multicasts the column. norm = sum * weight * rstd.
++//
++// With `quantize`, also the norm's float8 codes as quantize_rows makes them
++// from the BF16 norm (quantize_rows_sfpu.h): each core's row maxima go to the
++// first core, which makes the divisor tile for the writer to multicast, and
++// every core divides its norm tiles by it and converts them.
 +void kernel_main() {
 +    const uint32_t count = get_arg_val<uint32_t>(0);
 +    const bool first = get_arg_val<uint32_t>(1) != 0;
@@ -37,9 +66,22 @@ new file mode 100644
 +    constexpr uint32_t cb_exchange = get_named_compile_time_arg_val("cb_exchange");
 +    constexpr uint32_t cb_rstd = get_named_compile_time_arg_val("cb_rstd");
 +    constexpr uint32_t cb_norm = get_named_compile_time_arg_val("cb_norm");
++    constexpr uint32_t cb_weight_offset = get_named_compile_time_arg_val("cb_weight_offset");
 +    constexpr uint32_t rows = get_named_compile_time_arg_val("rows");
 +    constexpr uint32_t eps = get_named_compile_time_arg_val("eps");
 +    constexpr uint32_t inv_width = get_named_compile_time_arg_val("inv_width");
++    constexpr uint32_t weight_offset = get_named_compile_time_arg_val("weight_offset");
++    constexpr uint32_t cb_amax = get_named_compile_time_arg_val("cb_amax");
++    constexpr uint32_t cb_gather = get_named_compile_time_arg_val("cb_gather");
++    constexpr uint32_t cb_divisor = get_named_compile_time_arg_val("cb_divisor");
++    constexpr uint32_t cb_q = get_named_compile_time_arg_val("cb_q");
++    constexpr uint32_t num_cores = get_named_compile_time_arg_val("num_cores");
++    constexpr bool quantize = get_named_compile_time_arg_val("quantize") != 0;
++    constexpr uint32_t stride = get_named_compile_time_arg_val("stride");
++    constexpr uint32_t gather_tiles = get_named_compile_time_arg_val("gather_tiles");
++    constexpr bool e5m2 = get_named_compile_time_arg_val("e5m2") != 0;
++    constexpr uint32_t fp8_max_bits = get_named_compile_time_arg_val("fp8_max_bits");
++    constexpr uint32_t min_scale_bits = get_named_compile_time_arg_val("min_scale_bits");
 +
 +    // DST holds four FP32 tiles per acquire.
 +    constexpr uint32_t batch = 4;
@@ -54,24 +96,42 @@ new file mode 100644
 +        tile_regs_release();
 +    };
 +
-+    // sum = input + residual, once for the writer and once to normalize.
++    // sum = input + residual, once for the writer and once to normalize. The
++    // SFPU adds in FP32 and the sum is rounded to nearest even, as a BF16 add
++    // rounds on the CPU; the FPU's BF16 add rounds ties away from zero. DST
++    // holds four FP32 tiles: two sums with their second operands.
 +    compute_kernel_hw_startup(cb_input, cb_residual, cb_sum);
 +    cb_wait_front(cb_input, count);
 +    cb_wait_front(cb_residual, count);
 +    cb_reserve_back(cb_sum, count);
 +    cb_reserve_back(cb_sum_out, count);
-+    add_tiles_init(cb_input, cb_residual);
-+    for (uint32_t b = 0; b < count; b += batch) {
-+        const uint32_t n = count - b < batch ? count - b : batch;
++    // An SFPU iteration covers eight columns of four rows of a face, so the
++    // add covers just the input's rows, in the top faces for up to 16 rows;
++    // the other rows keep the input's padding.
++    constexpr int add_iterations = rows <= 16 ? (rows + 3) / 4 * 2 : 8;
++    constexpr VectorMode add_mode = rows <= 16 ? VectorMode::R : VectorMode::RC;
++    constexpr uint32_t pairs = batch / 2;
++    // The input and residual have one format, and the SFPU add keeps clear of
++    // the copy's address modifiers, so both are set up once.
++    copy_init(cb_input);
++    add_binary_tile_init();
++    for (uint32_t b = 0; b < count; b += pairs) {
++        const uint32_t n = count - b < pairs ? count - b : pairs;
 +        tile_regs_acquire();
 +        for (uint32_t j = 0; j < n; ++j) {
-+            add_tiles(cb_input, cb_residual, b + j, b + j, j);
++            copy_tile(cb_input, b + j, 2 * j);
++            copy_tile(cb_residual, b + j, 2 * j + 1);
++        }
++        for (uint32_t j = 0; j < n; ++j) {
++            MATH((SFPU_BINARY_CALL(
++                DST_SYNC_MODE, DST_ACCUM_MODE, add_round_to_bf16, (add_iterations), 2 * j, 2 * j + 1, 2 * j,
++                add_mode)));
 +        }
 +        tile_regs_commit();
 +        tile_regs_wait();
 +        for (uint32_t j = 0; j < n; ++j) {
-+            pack_tile(j, cb_sum, b + j);
-+            pack_tile(j, cb_sum_out, b + j);
++            pack_tile(2 * j, cb_sum, b + j);
++            pack_tile(2 * j, cb_sum_out, b + j);
 +        }
 +        tile_regs_release();
 +    }
@@ -93,22 +153,45 @@ new file mode 100644
 +    pack_block(cb_partial, 0, 1);
 +    cb_push_back(cb_partial, 1);
 +
-+    // scaled = sum * weight (one per column) needs nothing from the other
-+    // cores, so it is done while their sums are gathered.
++    // scaled = sum * (weight + weight_offset) (one per column) needs nothing
++    // from the other cores, so it is done while their sums are gathered.
++    // Zero-centered weights have an offset of 1, added in FP32 first.
 +    cb_wait_front(cb_weight, count);
++    uint32_t cb_scale = cb_weight;
++    if constexpr (weight_offset != 0) {
++        cb_reserve_back(cb_weight_offset, count);
++        reconfig_data_format_srca(cb_weight);
++        copy_init(cb_weight);
++        binop_with_scalar_tile_init();
++        for (uint32_t b = 0; b < count; b += batch) {
++            const uint32_t n = count - b < batch ? count - b : batch;
++            tile_regs_acquire();
++            for (uint32_t j = 0; j < n; ++j) {
++                copy_tile(cb_weight, b + j, j);
++                add_unary_tile(j, weight_offset);
++            }
++            pack_block(cb_weight_offset, b, n);
++        }
++        cb_push_back(cb_weight_offset, count);
++        cb_wait_front(cb_weight_offset, count);
++        cb_scale = cb_weight_offset;
++    }
 +    cb_reserve_back(cb_scaled, count);
-+    reconfig_data_format(cb_sum, cb_weight);
-+    mul_bcast_rows_init_short(cb_sum, cb_weight);
++    reconfig_data_format(cb_sum, cb_scale);
++    mul_bcast_rows_init_short(cb_sum, cb_scale);
 +    for (uint32_t b = 0; b < count; b += batch) {
 +        const uint32_t n = count - b < batch ? count - b : batch;
 +        tile_regs_acquire();
 +        for (uint32_t j = 0; j < n; ++j) {
-+            mul_tiles_bcast_rows(cb_sum, cb_weight, b + j, b + j, j);
++            mul_tiles_bcast_rows(cb_sum, cb_scale, b + j, b + j, j);
 +        }
 +        pack_block(cb_scaled, b, n);
 +    }
 +    cb_push_back(cb_scaled, count);
 +    cb_pop_front(cb_weight, count);
++    if constexpr (weight_offset != 0) {
++        cb_pop_front(cb_weight_offset, count);
++    }
 +    cb_pop_front(cb_sum, count);
 +
 +    if (first) {
@@ -169,6 +252,65 @@ new file mode 100644
 +    cb_push_back(cb_norm, count);
 +    cb_pop_front(cb_scaled, count);
 +    cb_pop_front(cb_rstd, 1);
++    if constexpr (!quantize) {
++        return;
++    }
++
++    // This core's row maxima, from the norm's first `stride` rows: the
++    // writer pops the norm once the codes are out.
++    constexpr uint32_t groups = stride / 4;
++    cb_wait_front(cb_norm, count);
++    cb_reserve_back(cb_amax, 1);
++    reconfig_data_format_srca(cb_norm);
++    copy_init(cb_norm);
++    tile_regs_acquire();
++    qr::sfpu_init();
++    MATH((qr::zero_acc<groups, 0>()));
++    for (uint32_t i = 0; i < count; ++i) {
++        copy_tile(cb_norm, i, 1);
++        MATH((qr::fold_absmax<groups, 1, 0>(groups)));
++    }
++    MATH((qr::finish_partial<groups, 0>()));
++    pack_block(cb_amax, 0, 1);
++    cb_push_back(cb_amax, 1);
++
++    if (first) {
++        // The divisor from every core's maxima, once for this core and once
++        // for the writer to multicast and write as the scale.
++        cb_wait_front(cb_gather, gather_tiles);
++        cb_reserve_back(cb_divisor, 1);
++        cb_reserve_back(cb_amax, 1);
++        reconfig_data_format_srca(cb_gather);
++        tile_regs_acquire();
++        qr::make_divisor<groups, 0, 1, 2>(
++            cb_gather, gather_tiles, num_cores * groups, fp8_max_bits, min_scale_bits);
++        tile_regs_commit();
++        tile_regs_wait();
++        pack_reconfig_data_format(cb_divisor);
++        pack_tile(0, cb_divisor, 0);
++        pack_tile(0, cb_amax, 0);
++        tile_regs_release();
++        cb_push_back(cb_divisor, 1);
++        cb_push_back(cb_amax, 1);
++        cb_pop_front(cb_gather, gather_tiles);
++    }
++
++    // The codes of the first `stride` rows, three norm tiles at a time beside
++    // the divisor in DST tile 3.
++    cb_wait_front(cb_divisor, 1);
++    cb_reserve_back(cb_q, count);
++    for (uint32_t b = 0; b < count; b += batch - 1) {
++        const uint32_t n = count - b < batch - 1 ? count - b : batch - 1;
++        tile_regs_acquire();
++        reconfig_data_format_srca(cb_divisor);
++        copy_init(cb_divisor);
++        copy_tile(cb_divisor, 0, 3);
++        reconfig_data_format_srca(cb_norm);
++        qr::quantize_tiles<e5m2, 3, 0, stride, rows>(cb_norm, b, n);
++        pack_block(cb_q, b, n);
++    }
++    cb_push_back(cb_q, count);
++    cb_pop_front(cb_divisor, 1);
 +}
 diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/reader_rms_norm_residual.cpp ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/reader_rms_norm_residual.cpp
 new file mode 100644
@@ -262,7 +404,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kerne
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/dataflow/writer_rms_norm_residual.cpp
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,216 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -282,6 +424,12 @@ new file mode 100644
 +// core multicasts the rstd column into every other core's rstd buffer and
 +// sets their `valid` semaphore. The buffers have the same address on every
 +// core.
++//
++// With `quantize`, a second exchange the same way: every core writes its row
++// maxima into slot `worker` of the first core's gather buffer and counts
++// itself in again; the first core multicasts the divisor tile its compute
++// kernel made from them, writes it as the scale, and every core writes its
++// float8 codes.
 +void kernel_main() {
 +    const uint32_t worker = get_arg_val<uint32_t>(0);
 +    const uint32_t start = get_arg_val<uint32_t>(1);
@@ -293,6 +441,8 @@ new file mode 100644
 +    // Two multicast rectangles (x0, y0, x1, y1, destinations), the second one
 +    // possibly empty: the full rows of cores and the partial last row.
 +    constexpr uint32_t rectangles_arg = 7;
++    const uint32_t q_addr = get_arg_val<uint32_t>(17);
++    const uint32_t scale_addr = get_arg_val<uint32_t>(18);
 +
 +    constexpr uint32_t cb_sum_out = get_named_compile_time_arg_val("cb_sum_out");
 +    constexpr uint32_t cb_partial = get_named_compile_time_arg_val("cb_partial");
@@ -304,10 +454,22 @@ new file mode 100644
 +    constexpr uint32_t valid_sem = get_named_compile_time_arg_val("valid_sem");
 +    constexpr uint32_t written_sem = get_named_compile_time_arg_val("written_sem");
 +    constexpr uint32_t cleared_sem = get_named_compile_time_arg_val("cleared_sem");
++    constexpr uint32_t cb_amax = get_named_compile_time_arg_val("cb_amax");
++    constexpr uint32_t cb_gather = get_named_compile_time_arg_val("cb_gather");
++    constexpr uint32_t cb_divisor = get_named_compile_time_arg_val("cb_divisor");
++    constexpr uint32_t cb_q = get_named_compile_time_arg_val("cb_q");
++    constexpr bool quantize = get_named_compile_time_arg_val("quantize") != 0;
++    constexpr uint32_t stride = get_named_compile_time_arg_val("stride");
++    constexpr uint32_t gather_tiles = get_named_compile_time_arg_val("gather_tiles");
 +    constexpr auto sum_args = TensorAccessorArgs<0>();
 +    constexpr auto norm_args = TensorAccessorArgs<sum_args.next_compile_time_args_offset()>();
++    constexpr auto q_args = TensorAccessorArgs<norm_args.next_compile_time_args_offset()>();
++    constexpr auto scale_args = TensorAccessorArgs<q_args.next_compile_time_args_offset()>();
 +    const auto sum = TensorAccessor(sum_args, sum_addr, get_tile_size(cb_sum_out));
 +    const auto norm = TensorAccessor(norm_args, norm_addr, get_tile_size(cb_norm));
++    constexpr uint32_t f32_tile_bytes = 4096;
++    const auto q = TensorAccessor(q_args, q_addr, get_tile_size(cb_q));
++    const auto scale = TensorAccessor(scale_args, scale_addr, f32_tile_bytes);
 +    const uint32_t valid_addr = get_semaphore(valid_sem);
 +    const uint32_t written_addr = get_semaphore(written_sem);
 +    const uint32_t cleared_addr = get_semaphore(cleared_sem);
@@ -332,18 +494,18 @@ new file mode 100644
 +            noc_semaphore_set_multicast(sem_addr, get_noc_multicast_addr(x0, y0, x1, y1, sem_addr), dests);
 +        }
 +    };
-+    auto write_rows = [&](const auto& tensor, uint32_t tile, uint32_t cb) {
++    auto write_rows = [&](const auto& tensor, uint32_t tile, uint32_t cb, uint32_t num_rows) {
 +        const uint64_t dest = tensor.get_noc_addr(start + tile);
 +        const uint32_t source = get_read_ptr(cb) + tile * get_tile_size(cb);
 +        const uint32_t face_bytes = get_tile_size(cb) / 4;
 +        const uint32_t row_bytes = face_bytes / 16;
-+        constexpr uint32_t first = rows < 16 ? rows : 16;
++        const uint32_t first = num_rows < 16 ? num_rows : 16;
 +        for (uint32_t face = 0; face < 2; ++face) {
 +            noc_async_write(source + face * face_bytes, dest + face * face_bytes, first * row_bytes);
 +        }
-+        if constexpr (rows > 16) {
++        if (num_rows > 16) {
 +            for (uint32_t face = 2; face < 4; ++face) {
-+                noc_async_write(source + face * face_bytes, dest + face * face_bytes, (rows - 16) * row_bytes);
++                noc_async_write(source + face * face_bytes, dest + face * face_bytes, (num_rows - 16) * row_bytes);
 +            }
 +        }
 +    };
@@ -365,7 +527,7 @@ new file mode 100644
 +
 +    cb_wait_front(cb_sum_out, count);
 +    for (uint32_t i = 0; i < count; ++i) {
-+        write_rows(sum, i, cb_sum_out);
++        write_rows(sum, i, cb_sum_out, rows);
 +    }
 +
 +    // Element (r, r) of the partial tile goes to element (r, worker) of the
@@ -405,11 +567,57 @@ new file mode 100644
 +
 +    cb_wait_front(cb_norm, count);
 +    for (uint32_t i = 0; i < count; ++i) {
-+        write_rows(norm, i, cb_norm);
++        write_rows(norm, i, cb_norm, rows);
++    }
++
++    if constexpr (quantize) {
++        // Rows 0 .. stride - 1 of the left faces of the maxima tile (faces 0
++        // and 2), as quantize_rows lays out a core's slot.
++        constexpr uint32_t slot_bytes = stride * 64;
++        constexpr uint32_t pieces = stride <= 16 ? 1 : 2;
++        cb_wait_front(cb_amax, 1);
++        const uint32_t slot = get_write_ptr(cb_gather) + worker * slot_bytes;
++        for (uint32_t p = 0; p < pieces; ++p) {
++            noc_async_write(
++                get_read_ptr(cb_amax) + p * 2048,
++                get_noc_addr(gather_x, gather_y, slot + p * (slot_bytes / pieces)),
++                slot_bytes / pieces);
++        }
++        noc_async_write_barrier();
++        noc_semaphore_inc(get_noc_addr(gather_x, gather_y, written_addr), 1);
++        cb_pop_front(cb_amax, 1);
++
++        if (worker == 0) {
++            cb_reserve_back(cb_gather, gather_tiles);
++            noc_semaphore_wait_min(written, 2 * num_cores);
++            cb_push_back(cb_gather, gather_tiles);
++            // The divisor tile goes to every other core, and is the scale
++            // output: row m holds scale[m] in every column.
++            cb_wait_front(cb_amax, 1);
++            *valid = 1;
++            multicast(get_read_ptr(cb_amax), get_write_ptr(cb_divisor), f32_tile_bytes, valid_addr);
++            noc_async_write(get_read_ptr(cb_amax), scale.get_noc_addr(0), f32_tile_bytes);
++            noc_async_write_barrier();
++            cb_pop_front(cb_amax, 1);
++        } else {
++            cb_reserve_back(cb_divisor, 1);
++            noc_semaphore_wait(valid, 1);
++            *valid = 0;
++            cb_push_back(cb_divisor, 1);
++        }
++
++        // `stride` rows of codes, whole 64-byte words, as quantize_rows writes.
++        cb_wait_front(cb_q, count);
++        for (uint32_t i = 0; i < count; ++i) {
++            write_rows(q, i, cb_q, stride);
++        }
 +    }
 +    noc_async_write_barrier();
 +    cb_pop_front(cb_sum_out, count);
 +    cb_pop_front(cb_norm, count);
++    if constexpr (quantize) {
++        cb_pop_front(cb_q, count);
++    }
 +    // No core signals the next launch before every core has finished this one.
 +    *written = 0;
 +}
@@ -417,7 +625,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_res
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.cpp
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,329 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -425,6 +633,7 @@ new file mode 100644
 +
 +#include <algorithm>
 +#include <bit>
++#include <optional>
 +#include <string>
 +#include <utility>
 +#include <vector>
@@ -446,6 +655,9 @@ new file mode 100644
 +
 +struct RMSNormResidualParams {
 +    float epsilon = 1e-6f;
++    float weight_offset = 0.0f;
++    std::optional<DataType> float8_type;
++    float min_scale = 0.0f;
 +};
 +
 +struct RMSNormResidualInputs {
@@ -485,7 +697,7 @@ new file mode 100644
 +}
 +
 +void RMSNormResidualOperation::validate_on_program_cache_miss(
-+    const operation_attributes_t&, const tensor_args_t& in) {
++    const operation_attributes_t& params, const tensor_args_t& in) {
 +    validate_row(in.input, "input");
 +    validate_row(in.residual, "residual");
 +    validate_row(in.weight, "weight");
@@ -500,11 +712,28 @@ new file mode 100644
 +    TT_FATAL(
 +        weight_shape[-1] == shape[1] && weight_shape.volume() == shape[1],
 +        "weight shape {} must be the row width {}", weight_shape, shape[1]);
++    if (params.float8_type) {
++        TT_FATAL(
++            *params.float8_type == DataType::FP8_E4M3 || *params.float8_type == DataType::FP8_E5M2,
++            "float8_type must be FP8_E4M3 or FP8_E5M2, got {}", *params.float8_type);
++        // The codes come from the norm's BF16 tiles through the FPU's
++        // source registers, which keep BF16 exact.
++        TT_FATAL(in.input.dtype() == DataType::BFLOAT16, "a float8 output needs a BFLOAT16 input");
++    }
 +}
 +
 +RMSNormResidualOperation::spec_return_value_t RMSNormResidualOperation::compute_output_specs(
-+    const operation_attributes_t&, const tensor_args_t& in) {
-+    return {in.input.tensor_spec(), in.input.tensor_spec()};
++    const operation_attributes_t& params, const tensor_args_t& in) {
++    spec_return_value_t specs = {in.input.tensor_spec(), in.input.tensor_spec()};
++    if (params.float8_type) {
++        const auto& shape = in.input.logical_shape();
++        auto layout = [&](DataType dtype) {
++            return TensorLayout(dtype, PageConfig(Layout::TILE), in.input.memory_config());
++        };
++        specs.emplace_back(shape, layout(*params.float8_type));
++        specs.emplace_back(ttnn::Shape({shape[0], 1}), layout(DataType::FLOAT32));
++    }
++    return specs;
 +}
 +
 +RMSNormResidualOperation::tensor_return_value_t RMSNormResidualOperation::create_output_tensors(
@@ -523,6 +752,11 @@ new file mode 100644
 +    const auto& weight = in.weight.mesh_tensor();
 +    const auto& norm = outputs.at(0).mesh_tensor();
 +    const auto& sum = outputs.at(1).mesh_tensor();
++    const bool quantize = params.float8_type.has_value();
++    // Without a float8 output the norm stands in for the unused codes and
++    // scale in the writer's arguments.
++    const auto& q = quantize ? outputs.at(2).mesh_tensor() : norm;
++    const auto& scale = quantize ? outputs.at(3).mesh_tensor() : norm;
 +    auto* device = &input.mutable_device();
 +
 +    const uint32_t width = input.logical_shape()[1];
@@ -563,6 +797,21 @@ new file mode 100644
 +    make_cb(8, 1, tt::DataFormat::Float32);         // every core's sums of squares, one column per core
 +    make_cb(9, 1, tt::DataFormat::Float32);         // rsqrt(mean + eps), one per row, a column
 +    make_cb(10, max_count, row_format);             // norm, for the writer
++    // Like the kernel, on the offset's bits.
++    if (std::bit_cast<uint32_t>(params.weight_offset) != 0) {
++        make_cb(11, max_count, tt::DataFormat::Float32);  // weight + weight_offset
++    }
++    // The float8 codes as quantize_rows lays out a row's maxima: `stride`
++    // rows of 64 bytes per core in the first core's gather buffer.
++    const uint32_t rows = input.logical_shape()[0];
++    const uint32_t stride = rows <= 4 ? 4 : rows <= 8 ? 8 : rows <= 16 ? 16 : 32;
++    const uint32_t gather_tiles = (num_cores * stride * 64 + 4095) / 4096;
++    if (quantize) {
++        make_cb(12, 1, tt::DataFormat::Float32);             // row maxima; on the first core then the divisor
++        make_cb(13, gather_tiles, tt::DataFormat::Float32);  // every core's row maxima
++        make_cb(14, 1, tt::DataFormat::Float32);             // the divisor: scale[m] across row m
++        make_cb(15, max_count, tt::DataFormat::UInt8);       // float8 codes
++    }
 +    const uint32_t l1_bytes =
 +        device->l1_size_per_core() - device->allocator()->get_base_allocator_addr(tt::tt_metal::HalMemType::L1);
 +    TT_FATAL(
@@ -585,13 +834,21 @@ new file mode 100644
 +    const std::vector<std::pair<std::string, uint32_t>> common_args = {
 +        {"cb_input", 0},  {"cb_residual", 1}, {"cb_weight", 2},   {"cb_sum", 3},      {"cb_sum_out", 4},
 +        {"cb_scaled", 5},  {"cb_scaler", 6},   {"cb_partial", 7},  {"cb_exchange", 8}, {"cb_rstd", 9},
-+        {"cb_norm", 10},
++        {"cb_norm", 10},  {"cb_weight_offset", 11}, {"cb_amax", 12}, {"cb_gather", 13}, {"cb_divisor", 14},
++        {"cb_q", 15},
 +        {"num_cores", num_cores},
-+        {"rows", input.logical_shape()[0]},
++        {"rows", rows},
++        {"quantize", quantize ? 1u : 0u},
++        {"stride", stride},
++        {"gather_tiles", gather_tiles},
++        {"e5m2", params.float8_type == DataType::FP8_E5M2 ? 1u : 0u},
++        {"fp8_max_bits", std::bit_cast<uint32_t>(params.float8_type == DataType::FP8_E5M2 ? 57344.0f : 448.0f)},
++        {"min_scale_bits", std::bit_cast<uint32_t>(params.min_scale)},
 +        {"valid_sem", valid_sem_id},
 +        {"written_sem", written_sem_id},
 +        {"cleared_sem", cleared_sem_id},
 +        {"eps", std::bit_cast<uint32_t>(params.epsilon)},
++        {"weight_offset", std::bit_cast<uint32_t>(params.weight_offset)},
 +        {"inv_width", std::bit_cast<uint32_t>(1.0f / static_cast<float>(width))},
 +    };
 +    const std::string kernel_dir = "ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/device/kernels/";
@@ -610,6 +867,8 @@ new file mode 100644
 +    std::vector<uint32_t> writer_args;
 +    TensorAccessorArgs(sum).append_to(writer_args);
 +    TensorAccessorArgs(norm).append_to(writer_args);
++    TensorAccessorArgs(q).append_to(writer_args);
++    TensorAccessorArgs(scale).append_to(writer_args);
 +    KernelDescriptor writer{
 +        .kernel_source = kernel_dir + "dataflow/writer_rms_norm_residual.cpp",
 +        .core_ranges = cores,
@@ -617,14 +876,19 @@ new file mode 100644
 +        .named_compile_time_args = common_args,
 +        .config = DataMovementConfigDescriptor{
 +            .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default}};
++    // The maxima and the divisor unpack straight to DST, keeping FP32.
++    ComputeConfigDescriptor compute_config{
++        .math_fidelity = MathFidelity::HiFi4, .fp32_dest_acc_en = true, .math_approx_mode = false};
++    if (quantize) {
++        compute_config.unpack_to_dest_mode.assign(NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default);
++        compute_config.unpack_to_dest_mode[13] = UnpackToDestMode::UnpackToDestFp32;
++        compute_config.unpack_to_dest_mode[14] = UnpackToDestMode::UnpackToDestFp32;
++    }
 +    KernelDescriptor compute{
 +        .kernel_source = kernel_dir + "compute/rms_norm_residual.cpp",
 +        .core_ranges = cores,
 +        .named_compile_time_args = common_args,
-+        .config = ComputeConfigDescriptor{
-+            .math_fidelity = MathFidelity::HiFi4,
-+            .fp32_dest_acc_en = true,
-+            .math_approx_mode = false}};
++        .config = compute_config};
 +
 +    // Every core writes its column into the first core's exchange tile, and
 +    // that core multicasts the rstd column to the rectangles of the core set: the
@@ -655,6 +919,13 @@ new file mode 100644
 +        for (uint32_t value : rectangles) {
 +            args.emplace_back(value);
 +        }
++        if (quantize) {
++            args.emplace_back(std::cref(q));
++            args.emplace_back(std::cref(scale));
++        } else {
++            args.emplace_back(0u);
++            args.emplace_back(0u);
++        }
 +        writer.emplace_runtime_args(core, args);
 +        compute.emplace_runtime_args(core, {count_of(i), i == 0 ? 1u : 0u});
 +    }
@@ -670,10 +941,17 @@ new file mode 100644
 +namespace ttnn::normalization {
 +
 +std::vector<Tensor> rms_norm_residual(
-+    const Tensor& input, const Tensor& residual, const Tensor& weight, float epsilon) {
++    const Tensor& input,
++    const Tensor& residual,
++    const Tensor& weight,
++    float epsilon,
++    float weight_offset,
++    std::optional<DataType> float8_type,
++    float min_scale) {
 +    using Op = prim::RMSNormResidualOperation;
 +    return device_operation::launch<Op>(
-+        {.epsilon = epsilon}, {.input = input, .residual = residual, .weight = weight});
++        {.epsilon = epsilon, .weight_offset = weight_offset, .float8_type = float8_type, .min_scale = min_scale},
++        {.input = input, .residual = residual, .weight = weight});
 +}
 +
 +}  // namespace ttnn::normalization
@@ -681,12 +959,13 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_res
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.hpp
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,32 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#pragma once
 +
++#include <optional>
 +#include <vector>
 +
 +#include "ttnn/tensor/tensor.hpp"
@@ -695,10 +974,22 @@ new file mode 100644
 +
 +// The residual add and RMS normalization of a decode step in one program, for
 +// one tile row [B <= 32, W] of activations: returns {norm, sum} with
-+// sum = input + residual and norm = sum / sqrt(mean(sum^2) + epsilon) * weight.
++// sum = input + residual and
++// norm = sum / sqrt(mean(sum^2) + epsilon) * (weight + weight_offset).
 +// sum is the residual stream of the next layer, and norm its input.
++//
++// With a float8_type (FP8_E4M3 or FP8_E5M2, for a BFLOAT16 input), also
++// returns {q, scale} of the norm, equal bit for bit to
++// ttnn::experimental::quantize_rows(norm, *float8_type, min_scale): the
++// activations of a float8 linear that reads the norm.
 +std::vector<Tensor> rms_norm_residual(
-+    const Tensor& input, const Tensor& residual, const Tensor& weight, float epsilon);
++    const Tensor& input,
++    const Tensor& residual,
++    const Tensor& weight,
++    float epsilon,
++    float weight_offset = 0.0f,
++    std::optional<tt::tt_metal::DataType> float8_type = std::nullopt,
++    float min_scale = 0.0f);
 +
 +}  // namespace ttnn::normalization
 diff --git ttnn/cpp/ttnn/operations/normalization/sources.cmake ttnn/cpp/ttnn/operations/normalization/sources.cmake

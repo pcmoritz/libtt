@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3753,6 +3753,64 @@ public:
+@@ -3753,6 +3753,166 @@ public:
  
  } // namespace
  
@@ -63,14 +63,118 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +  }
 +};
 +
++// A slice of a row taken through its vector, [1, N] -> [N] -> [n] -> [1, n],
++// is a slice of the row itself, which a tiled tensor cuts in its own layout;
++// the vector would be untilized, cut and tilized again. Any shape with one
++// dimension above 1 is such a row.
++class SliceOfSqueezedRowPattern : public mlir::OpRewritePattern<ReshapeOp> {
++public:
++  using mlir::OpRewritePattern<ReshapeOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(ReshapeOp op, mlir::PatternRewriter &rewriter) const final {
++    auto slice = op.getInput().getDefiningOp<SliceStaticOp>();
++    auto squeeze = slice ? slice.getInput().getDefiningOp<ReshapeOp>() : nullptr;
++    if (!squeeze) {
++      return mlir::failure();
++    }
++    auto row = mlir::cast<RankedTensorType>(squeeze.getInput().getType());
++    auto result = mlir::cast<RankedTensorType>(op.getType());
++    const auto wide = [](int64_t size) { return size != 1; };
++    if (squeeze.getType().getRank() != 1 || result.getRank() != row.getRank() ||
++        llvm::count_if(row.getShape(), wide) != 1) {
++      return mlir::failure();
++    }
++    const int64_t axis = llvm::find_if(row.getShape(), wide) - row.getShape().begin();
++    for (int64_t d = 0; d < row.getRank(); ++d) {
++      if (d != axis && result.getDimSize(d) != 1) {
++        return mlir::failure();
++      }
++    }
++    auto first = [](ArrayAttr attr) {
++      return static_cast<int32_t>(mlir::cast<IntegerAttr>(attr[0]).getInt());
++    };
++    SmallVector<int32_t> begins(row.getRank(), 0), ends(row.getRank(), 1),
++        steps(row.getRank(), 1);
++    begins[axis] = first(slice.getBegins());
++    ends[axis] = first(slice.getEnds());
++    steps[axis] = first(slice.getStep());
++    rewriter.replaceOpWithNewOp<SliceStaticOp>(
++        op, result, squeeze.getInput(), rewriter.getI32ArrayAttr(begins),
++        rewriter.getI32ArrayAttr(ends), rewriter.getI32ArrayAttr(steps));
++    return mlir::success();
++  }
++};
++
++// Rows [a, b) of a row reshaped to a matrix, [1, N] -> [R, C] -> [b - a, C],
++// are the row's columns [a * C, b * C), reshaped. Tiled, rows that start inside
++// a tile are untilized, cut and tilized again, while the row is cut at a tile
++// boundary in one slice. torch_tpu lowers PyTorch's per-head views of a fused
++// projection's q, k and v this way, possibly through a typecast.
++class RowsOfReshapedRowPattern : public mlir::OpRewritePattern<SliceStaticOp> {
++public:
++  using mlir::OpRewritePattern<SliceStaticOp>::OpRewritePattern;
++
++  mlir::LogicalResult
++  matchAndRewrite(SliceStaticOp op, mlir::PatternRewriter &rewriter) const final {
++    auto cast = op.getInput().getDefiningOp<TypecastOp>();
++    auto reshape = (cast ? cast.getInput() : op.getInput()).getDefiningOp<ReshapeOp>();
++    if (!reshape) {
++      return mlir::failure();
++    }
++    auto row = mlir::cast<RankedTensorType>(reshape.getInput().getType());
++    auto matrix = mlir::cast<RankedTensorType>(reshape.getType());
++    const auto wide = [](int64_t size) { return size != 1; };
++    const int64_t rank = matrix.getRank();
++    if (row.getRank() < 2 || rank < 2 || llvm::any_of(row.getShape().drop_back(), wide) ||
++        llvm::any_of(matrix.getShape().drop_back(2), wide)) {
++      return mlir::failure();
++    }
++    auto at = [](ArrayAttr attr, int64_t d) {
++      return mlir::cast<IntegerAttr>(attr[d]).getInt();
++    };
++    for (int64_t d = 0; d < rank; ++d) {
++      const bool whole = at(op.getBegins(), d) == 0 && at(op.getEnds(), d) == matrix.getDimSize(d);
++      if (at(op.getStep(), d) != 1 || (d != rank - 2 && !whole)) {
++        return mlir::failure();
++      }
++    }
++    constexpr int64_t kTileDim = 32;
++    const int64_t first = at(op.getBegins(), rank - 2), last = at(op.getEnds(), rank - 2);
++    const int64_t cols = matrix.getDimSize(rank - 1);
++    if (first < 0 || last <= first || first % kTileDim == 0 || first * cols % kTileDim != 0) {
++      return mlir::failure();
++    }
++    SmallVector<int32_t> begins(row.getRank(), 0), ends(row.getRank(), 1), steps(row.getRank(), 1);
++    begins.back() = first * cols;
++    ends.back() = last * cols;
++    SmallVector<int64_t> shape(row.getRank(), 1);
++    shape.back() = (last - first) * cols;
++    Value slice = rewriter.create<SliceStaticOp>(
++        op.getLoc(), RankedTensorType::get(shape, row.getElementType(), row.getEncoding()),
++        reshape.getInput(), rewriter.getI32ArrayAttr(begins), rewriter.getI32ArrayAttr(ends),
++        rewriter.getI32ArrayAttr(steps));
++    if (cast) {
++      slice = rewriter.create<TypecastOp>(
++          cast.getLoc(), RankedTensorType::get(shape, op.getType().getElementType(), row.getEncoding()),
++          slice, cast.getConservativeFolding());
++    }
++    rewriter.replaceOp(op, utils::createReshapeOp(rewriter, op.getLoc(), slice,
++                                                  op.getType().getShape()));
++    return mlir::success();
++  }
++};
++
  class TTIRFusingPass : public impl::TTIRFusingBase<TTIRFusingPass> {
  public:
    using impl::TTIRFusingBase<TTIRFusingPass>::TTIRFusingBase;
-@@ -3804,6 +3862,7 @@ public:
+@@ -3804,6 +3968,9 @@ public:
        patterns.add<SpatialMeanOptimizationPattern>(&getContext());
        patterns.add<SharedLHSMatmulFusion<MatmulOp>>(&getContext());
        patterns.add<SharedLHSMatmulFusion<LinearOp>>(&getContext());
 +      patterns.add<ConcatOfAdjacentSlicesPattern>(&getContext());
++      patterns.add<SliceOfSqueezedRowPattern>(&getContext());
++      patterns.add<RowsOfReshapedRowPattern>(&getContext());
        if (permuteSliceAfterMatmulEnabled) {
          patterns.add<PermuteSliceAfterMatmulPattern>(&getContext());
        }

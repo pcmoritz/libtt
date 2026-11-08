@@ -123,7 +123,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
  #include <algorithm>
  #include <atomic>
  
-@@ -48,24 +49,51 @@
+@@ -48,24 +49,53 @@
  
    void runOnOperation() final {
      mlir::ModuleOp moduleOp = this->getOperation();
@@ -170,7 +170,9 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
 +                    ttnn::ResetGlobalSemaphoreOp, ttnn::DumpTensorOp,
 +                    ttnn::LoadTensorOp, ttnn::BeginTraceCaptureOp,
 +                    ttnn::EndTraceCaptureOp, ttnn::ExecuteTraceOp,
-+                    ttnn::CaptureOrExecuteTraceOp>(op) ||
++                    ttnn::CaptureOrExecuteTraceOp,
++                    // Reads its begins and ends on the host.
++                    ttnn::SliceDynamicOp>(op) ||
 +        op->getNumRegions() != 0 ||
 +        op->getName().getDialectNamespace() == "debug" ||
 +        op->hasTrait<ttcore::Trait::TTCoreCreationOpTrait>()) {
@@ -186,7 +188,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
    }
  
    std::uint64_t getUniqueTraceFuncIndex() {
-@@ -912,22 +940,33 @@
+@@ -912,22 +942,33 @@
        }
        tensorInputs[argIndex] = input;
      }
@@ -225,7 +227,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
          tensorInputs[argIndex] = input;
        }
      }
-@@ -935,7 +974,9 @@
+@@ -935,7 +976,9 @@
      auto traceOp = builder.create<ttnn::CaptureOrExecuteTraceOp>(
          funcOp.getLoc(), info.outputSlotTypes, device,
          allocateSlotsTraceSymbolAttr, captureTraceSymbolAttr,
@@ -236,7 +238,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNTraceHoistTransform.cpp b/lib/Diale
  
      // Replace uses of original outputs with the output of the trace op function
      for (size_t i = 0; i < info.boundaryOutputs.size(); i++) {
-@@ -1034,94 +1075,182 @@
+@@ -1034,94 +1077,182 @@
      }
    }
  

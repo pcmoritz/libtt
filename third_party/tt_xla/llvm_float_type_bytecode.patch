@@ -1,0 +1,58 @@
+diff --git a/mlir/include/mlir/IR/BuiltinDialectBytecode.td b/mlir/include/mlir/IR/BuiltinDialectBytecode.td
+--- a/mlir/include/mlir/IR/BuiltinDialectBytecode.td
++++ b/mlir/include/mlir/IR/BuiltinDialectBytecode.td
+@@ -308,6 +308,33 @@ def VectorTypeWithScalableDims : DialectType<(type
+ }
+ }
+ 
++// Float types that newer MLIR writes with their own codes (upstream lists them
++// in this order after VectorTypeWithScalableDims), as JAX does for the element
++// types of non-StableHLO ops such as sdy.sharding_constraint.
++def FloatTF32Type : DialectType<(type)>;
++
++def Float8E5M2Type : DialectType<(type)>;
++
++def Float8E4M3Type : DialectType<(type)>;
++
++def Float8E4M3FNType : DialectType<(type)>;
++
++def Float8E5M2FNUZType : DialectType<(type)>;
++
++def Float8E4M3FNUZType : DialectType<(type)>;
++
++def Float8E4M3B11FNUZType : DialectType<(type)>;
++
++def Float8E3M4Type : DialectType<(type)>;
++
++def Float4E2M1FNType : DialectType<(type)>;
++
++def Float6E2M3FNType : DialectType<(type)>;
++
++def Float6E3M2FNType : DialectType<(type)>;
++
++def Float8E8M0FNUType : DialectType<(type)>;
++
+ /// This enum contains marker codes used to indicate which attribute is
+ /// currently being decoded, and how it should be decoded. The order of these
+ /// codes should generally be unchanged, as any changes will inevitably break
+@@ -363,7 +390,19 @@ def BuiltinDialectTypes : DialectTypes<"Builtin"> {
+     UnrankedMemRefTypeWithMemSpace,
+     UnrankedTensorType,
+     VectorType,
+-    VectorTypeWithScalableDims
++    VectorTypeWithScalableDims,
++    FloatTF32Type,
++    Float8E5M2Type,
++    Float8E4M3Type,
++    Float8E4M3FNType,
++    Float8E5M2FNUZType,
++    Float8E4M3FNUZType,
++    Float8E4M3B11FNUZType,
++    Float8E3M4Type,
++    Float4E2M1FNType,
++    Float6E2M3FNType,
++    Float6E3M2FNType,
++    Float8E8M0FNUType
+   ];
+ }
+ 

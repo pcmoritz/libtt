@@ -1,0 +1,275 @@
+diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation/inc/api/client_instance.h
+--- a/pjrt_implementation/inc/api/client_instance.h
++++ b/pjrt_implementation/inc/api/client_instance.h
+@@ -94,6 +94,13 @@ public:
+     return reinterpret_cast<ClientInstance *>(client);
+   }
+ 
++  // The client's topology (PJRT_Client_TopologyDescription) is the client
++  // itself: its devices, in one process.
++  static ClientInstance *unwrap(const PJRT_TopologyDescription *topology) {
++    return reinterpret_cast<ClientInstance *>(
++        const_cast<PJRT_TopologyDescription *>(topology));
++  }
++
+   // Before the client is usable, it must be initialized.
+   PJRT_Error *initialize();
+ 
+@@ -109,6 +116,12 @@ public:
+     return m_devices_raw;
+   }
+ 
++  // Returns the descriptions of all devices, in the order of getDevicesRaw().
++  const std::vector<PJRT_DeviceDescription *> &
++  getDeviceDescriptionsRaw() const {
++    return m_device_descriptions_raw;
++  }
++
+   // Returns vector of raw pointers to addressable devices.
+   const std::vector<DeviceInstance *> &getAddressableDevicesRaw() const {
+     return m_addressable_devices_raw;
+@@ -192,6 +205,10 @@ private:
+   // have to be able to return it in `PJRT_Client_Devices` API call.
+   std::vector<DeviceInstance *> m_devices_raw;
+ 
++  // Descriptions of `m_devices`, returned by
++  // `PJRT_TopologyDescription_GetDeviceDescriptions`.
++  std::vector<PJRT_DeviceDescription *> m_device_descriptions_raw;
++
+   // Vector of raw pointers to addressable devices, which are subset of and
+   // owned by `m_devices`. Necessary to have to be able to return it in
+   // `PJRT_Client_AddressableDevices` API call.
+@@ -276,6 +293,26 @@ PJRT_Error *onClientPlatformVersion(PJRT_Client_PlatformVersion_Args *args);
+ // Implements PJRT_Client_Devices API function.
+ PJRT_Error *onClientDevices(PJRT_Client_Devices_Args *args);
+ 
++// Implements PJRT_Client_TopologyDescription API function.
++PJRT_Error *
++onClientTopologyDescription(PJRT_Client_TopologyDescription_Args *args);
++
++// Implements PJRT_TopologyDescription_PlatformName API function.
++PJRT_Error *onTopologyDescriptionPlatformName(
++    PJRT_TopologyDescription_PlatformName_Args *args);
++
++// Implements PJRT_TopologyDescription_PlatformVersion API function.
++PJRT_Error *onTopologyDescriptionPlatformVersion(
++    PJRT_TopologyDescription_PlatformVersion_Args *args);
++
++// Implements PJRT_TopologyDescription_GetDeviceDescriptions API function.
++PJRT_Error *onTopologyDescriptionGetDeviceDescriptions(
++    PJRT_TopologyDescription_GetDeviceDescriptions_Args *args);
++
++// Implements PJRT_TopologyDescription_Attributes API function.
++PJRT_Error *
++onTopologyDescriptionAttributes(PJRT_TopologyDescription_Attributes_Args *args);
++
+ // Implements PJRT_Client_AddressableDevices API function.
+ PJRT_Error *
+ onClientAddressableDevices(PJRT_Client_AddressableDevices_Args *args);
+diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
+--- a/pjrt_implementation/src/api/client_instance.cc
++++ b/pjrt_implementation/src/api/client_instance.cc
+@@ -399,6 +399,15 @@ void ClientInstance::bindApi(PJRT_Api *api) {
+   api->PJRT_Client_PlatformVersion = internal::onClientPlatformVersion;
+   api->PJRT_Client_Devices = internal::onClientDevices;
+   api->PJRT_Client_AddressableDevices = internal::onClientAddressableDevices;
++  api->PJRT_Client_TopologyDescription = internal::onClientTopologyDescription;
++  api->PJRT_TopologyDescription_PlatformName =
++      internal::onTopologyDescriptionPlatformName;
++  api->PJRT_TopologyDescription_PlatformVersion =
++      internal::onTopologyDescriptionPlatformVersion;
++  api->PJRT_TopologyDescription_GetDeviceDescriptions =
++      internal::onTopologyDescriptionGetDeviceDescriptions;
++  api->PJRT_TopologyDescription_Attributes =
++      internal::onTopologyDescriptionAttributes;
+   api->PJRT_Client_LookupDevice = internal::onClientLookupDevice;
+   api->PJRT_Client_LookupAddressableDevice =
+       internal::onClientLookupAddressableDevice;
+@@ -435,6 +444,7 @@ tt_pjrt_status ClientInstance::populateDevices() {
+   size_t devices_count = m_system_descriptor->chip_desc_indices()->size();
+   m_devices.reserve(devices_count);
+   m_devices_raw.reserve(devices_count);
++  m_device_descriptions_raw.reserve(devices_count);
+   m_addressable_devices_raw.reserve(devices_count);
+ 
+   for (size_t i = 0; i < devices_count; ++i) {
+@@ -458,6 +468,8 @@ tt_pjrt_status ClientInstance::populateDevices() {
+                                        dram_size_bytes);
+ 
+     m_devices_raw.push_back(device_instance.get());
++    m_device_descriptions_raw.push_back(
++        device_instance->getDeviceDescription());
+     if (is_addressable) {
+       device_instance->setProcessIndex(m_process_index);
+       m_addressable_devices_raw.push_back(device_instance.get());
+@@ -868,6 +880,68 @@ PJRT_Error *onClientDevices(PJRT_Client_Devices_Args *args) {
+   return nullptr;
+ }
+ 
++PJRT_Error *
++onClientTopologyDescription(PJRT_Client_TopologyDescription_Args *args) {
++  ZoneScoped;
++  DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_Client_TopologyDescription");
++
++  args->topology = reinterpret_cast<PJRT_TopologyDescription *>(args->client);
++
++  return nullptr;
++}
++
++PJRT_Error *onTopologyDescriptionPlatformName(
++    PJRT_TopologyDescription_PlatformName_Args *args) {
++  ZoneScoped;
++  DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_TopologyDescription_PlatformName");
++
++  ClientInstance *client = ClientInstance::unwrap(args->topology);
++
++  args->platform_name = client->platformName().data();
++  args->platform_name_size = client->platformName().size();
++
++  return nullptr;
++}
++
++PJRT_Error *onTopologyDescriptionPlatformVersion(
++    PJRT_TopologyDescription_PlatformVersion_Args *args) {
++  ZoneScoped;
++  DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_TopologyDescription_PlatformVersion");
++
++  ClientInstance *client = ClientInstance::unwrap(args->topology);
++
++  args->platform_version = client->platformVersion().data();
++  args->platform_version_size = client->platformVersion().size();
++
++  return nullptr;
++}
++
++PJRT_Error *onTopologyDescriptionGetDeviceDescriptions(
++    PJRT_TopologyDescription_GetDeviceDescriptions_Args *args) {
++  ZoneScoped;
++  DLOG_F(LOG_DEBUG,
++         "ClientInstance::PJRT_TopologyDescription_GetDeviceDescriptions");
++
++  const std::vector<PJRT_DeviceDescription *> &descriptions =
++      ClientInstance::unwrap(args->topology)->getDeviceDescriptionsRaw();
++
++  args->descriptions = descriptions.data();
++  args->num_descriptions = descriptions.size();
++
++  return nullptr;
++}
++
++PJRT_Error *
++onTopologyDescriptionAttributes(PJRT_TopologyDescription_Attributes_Args *args) {
++  ZoneScoped;
++  DLOG_F(LOG_DEBUG, "ClientInstance::PJRT_TopologyDescription_Attributes");
++
++  args->attributes = nullptr;
++  args->num_attributes = 0;
++
++  return nullptr;
++}
++
+ PJRT_Error *
+ onClientAddressableDevices(PJRT_Client_AddressableDevices_Args *args) {
+   ZoneScoped;
+diff --git a/pjrt_implementation/src/api_bindings.cc b/pjrt_implementation/src/api_bindings.cc
+--- a/pjrt_implementation/src/api_bindings.cc
++++ b/pjrt_implementation/src/api_bindings.cc
+@@ -109,10 +109,71 @@ PJRT_HostMemoryAllocator_Extension hostMemoryAllocatorExtension{
+     .allocate = allocateHostMemory,
+ };
+ 
++// TPU topology extension, as in XLA's
++// xla/pjrt/extensions/tpu_topology/tpu_topology_extension.h, which the vendored
++// C API headers don't include. Its counts describe a client's topology: its
++// devices in one process, one core each. PyTorch frontends partition their
++// custom kernels into ChipCount() partitions.
++struct PJRT_TpuTopology_Count_Args {
++  size_t struct_size;
++  const PJRT_TopologyDescription *topology;
++  int32_t count;
++};
++
++using PJRT_TpuTopology_Count = PJRT_Error *(PJRT_TpuTopology_Count_Args *args);
++
++// The extension's functions in its order. The slice and coordinate queries
++// stay null.
++struct PJRT_TpuTopology_Extension {
++  PJRT_Extension_Base base;
++  void *slice_queries[7];
++  PJRT_TpuTopology_Count *process_count;
++  PJRT_TpuTopology_Count *chips_per_process;
++  PJRT_TpuTopology_Count *core_count_per_chip;
++  PJRT_TpuTopology_Count *chip_count;
++  PJRT_TpuTopology_Count *core_count;
++  PJRT_TpuTopology_Count *logical_device_count_per_process;
++  PJRT_TpuTopology_Count *logical_device_count;
++  PJRT_TpuTopology_Count *logical_device_count_per_chip;
++  PJRT_TpuTopology_Count *core_count_per_process;
++  void *coordinate_queries[15];
++};
++
++PJRT_Error *countOne(PJRT_TpuTopology_Count_Args *args) {
++  args->count = 1;
++  return nullptr;
++}
++
++PJRT_Error *countDevices(PJRT_TpuTopology_Count_Args *args) {
++  args->count = static_cast<int32_t>(
++      ClientInstance::unwrap(args->topology)->getDevicesRaw().size());
++  return nullptr;
++}
++
++PJRT_TpuTopology_Extension tpuTopologyExtension{
++    .base =
++        {
++            .struct_size = sizeof(PJRT_TpuTopology_Extension),
++            .type = PJRT_Extension_Type_TpuTopology,
++            .next = &hostMemoryAllocatorExtension.base,
++        },
++    .slice_queries = {},
++    .process_count = countOne,
++    .chips_per_process = countDevices,
++    .core_count_per_chip = countOne,
++    .chip_count = countDevices,
++    .core_count = countDevices,
++    .logical_device_count_per_process = countDevices,
++    .logical_device_count = countDevices,
++    .logical_device_count_per_chip = countOne,
++    .core_count_per_process = countDevices,
++    .coordinate_queries = {},
++};
++
+ PJRT_Profiler_Extension profilerExtension{
+     .struct_size = PJRT_Profiler_Extension_STRUCT_SIZE,
+     .type = PJRT_Extension_Type_Profiler,
+-    .next = &hostMemoryAllocatorExtension.base,
++    .next = &tpuTopologyExtension.base,
+     .profiler_api = &profilerApi,
+     .traceme_context_id = 0,
+ };
+diff --git a/pjrt_implementation/src/stubs.inc b/pjrt_implementation/src/stubs.inc
+--- a/pjrt_implementation/src/stubs.inc
++++ b/pjrt_implementation/src/stubs.inc
+@@ -117,10 +117,6 @@
+   // store in the buffer is available to the client.
+   _STUB(PJRT_Client_CreateBuffersForAsyncHostToDevice);
+ 
+-  // Returns the topology description of the runtime topology. Doesn't hold
+-  // value without other PJRT_TopologyDescription related API calls.
+-  _STUB(PJRT_Client_TopologyDescription);
+-
+   // Not required to be implemented. Used to map memory for fast transfers.
+   _STUB(PJRT_Client_DmaMap);
+   _STUB(PJRT_Client_DmaUnmap);
+@@ -158,11 +154,7 @@
+   _STUB(PJRT_CopyToDeviceStream_CurrentBytes);
+   _STUB(PJRT_TopologyDescription_Create);
+   _STUB(PJRT_TopologyDescription_Destroy);
+-  _STUB(PJRT_TopologyDescription_PlatformName);
+-  _STUB(PJRT_TopologyDescription_PlatformVersion);
+-  _STUB(PJRT_TopologyDescription_GetDeviceDescriptions);
+   _STUB(PJRT_TopologyDescription_Serialize);
+-  _STUB(PJRT_TopologyDescription_Attributes);
+   _STUB(PJRT_TopologyDescription_Deserialize);
+   _STUB(PJRT_TopologyDescription_Fingerprint);
+   _STUB(PJRT_TopologyDescription_MakeCanonicalShapeForMemorySpace);

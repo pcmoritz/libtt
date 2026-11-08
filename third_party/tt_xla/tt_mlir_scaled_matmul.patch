@@ -1,0 +1,283 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -5025,6 +5025,25 @@ def TTNN_ScaledDotProductAttentionOp : TTNN_Op<"scaled_dot_product_attention", [
+     let hasVerifier = 1;
+ }
+ 
++def TTNN_ScaledMatmulOp : TTNN_Op<"scaled_matmul", [OpModelExempt]> {
++  let summary = "Matmul with per-row and per-column output scales.";
++  let description = [{
++    ttnn::matmul_scaled: the FP32 product of `a` and `b` times `row_scale`
++    ([M, 1] f32), then times `col_scale` ([1, N], [N, 1] or [1, 1] f32), each
++    as ttnn.multiply's FP32 multiply, rounded to the result type as
++    ttnn.multiply rounds: torch._scaled_mm's dequantization of SGLang's FP8
++    linears, in the decode matmul's epilogue. TTNNFusing forms it from the
++    matmul and the two multiplies (and a narrowing typecast).
++  }];
++  let arguments = (ins AnyRankedTensor:$a,
++                       AnyRankedTensor:$b,
++                       AnyRankedTensor:$row_scale,
++                       AnyRankedTensor:$col_scale,
++                       DefaultValuedAttr<BoolAttr, "false">:$transpose_b,
++                       OptionalAttr<TTNN_DeviceComputeKernelConfig>:$compute_config);
++  let results = (outs AnyRankedTensor:$result);
++}
++
+ def TTNN_QuantizeRowsOp : TTNN_Op<"quantize_rows", [OpModelExempt]> {
+   let summary = "Per-row dynamic float8 quantization.";
+   let description = [{
+diff --git a/include/ttmlir/Target/TTNN/operations/matmul.fbs b/include/ttmlir/Target/TTNN/operations/matmul.fbs
+--- a/include/ttmlir/Target/TTNN/operations/matmul.fbs
++++ b/include/ttmlir/Target/TTNN/operations/matmul.fbs
+@@ -78,6 +78,19 @@ table MatmulOp {
+ }
+ // ANCHOR_END: adding_an_op_matmul_fbs
+ 
++// ttnn::matmul_scaled: (a @ b * row_scale) * col_scale, rounded to out's type.
++table ScaledMatmulOp {
++  a: tt.target.ttnn.TensorRef;
++  b: tt.target.ttnn.TensorRef;
++  row_scale: tt.target.ttnn.TensorRef;
++  col_scale: tt.target.ttnn.TensorRef;
++  out: tt.target.ttnn.TensorRef;
++  transpose_b: bool;
++  compute_config: tt.target.ttnn.DeviceComputeKernelConfig;
++  // PyTorch's [gate | up] SiluAndMul of the result, bit for bit.
++  swiglu: bool = false;
++}
++
+ table LinearOp {
+   a: tt.target.ttnn.TensorRef;
+   b: tt.target.ttnn.TensorRef;
+diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
+--- a/include/ttmlir/Target/TTNN/program.fbs
++++ b/include/ttmlir/Target/TTNN/program.fbs
+@@ -115,6 +115,7 @@ union OpType {
+   LoadCachedOp,
+   // ANCHOR: adding_an_op_matmul_fbs_op_type
+   MatmulOp,
++  ScaledMatmulOp,
+   // ANCHOR_END: adding_an_op_matmul_fbs_op_type
+   SparseMatmulOp,
+   MaxPool2dWithIndicesOp,
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -468,7 +468,8 @@ public:
+ // produces BF16 itself: binary_ng computes in FP32 DST whenever an operand is
+ // FP32 and rounds once as it packs the result, which saves the typecast
+ // program. (The packer rounds exact ties away from zero where the typecast
+-// rounds them to even.)
++// rounds them to even.) So does a scaled matmul, whose FP32 epilogue rounds
++// as binary_ng's multiply does, whatever its float8 operands.
+ class TTNNBinaryOpNarrowingOutput : public mlir::OpRewritePattern<TypecastOp> {
+ public:
+   using mlir::OpRewritePattern<TypecastOp>::OpRewritePattern;
+@@ -477,14 +478,16 @@ public:
+   matchAndRewrite(TypecastOp cast,
+                   mlir::PatternRewriter &rewriter) const final {
+     Operation *producer = cast.getInput().getDefiningOp();
+-    if (!producer || !isa<AddOp, SubtractOp, MultiplyOp, DivideOp>(producer) ||
++    if (!producer ||
++        !isa<AddOp, SubtractOp, MultiplyOp, DivideOp, ScaledMatmulOp>(producer) ||
+         !cast.getInput().hasOneUse()) {
+       return failure();
+     }
+     if (!elementTypeOf(cast.getInput()).isF32() || !elementTypeOf(cast.getResult()).isBF16() ||
+-        !llvm::all_of(producer->getOperands(), [&](Value v) {
+-          return elementTypeOf(v).isF32() || elementTypeOf(v).isBF16();
+-        })) {
++        (!isa<ScaledMatmulOp>(producer) &&
++         !llvm::all_of(producer->getOperands(), [&](Value v) {
++           return elementTypeOf(v).isF32() || elementTypeOf(v).isBF16();
++         }))) {
+       return failure();
+     }
+     rewriter.modifyOpInPlace(producer, [&]() {
+@@ -495,6 +498,107 @@ public:
+   }
+ };
+ 
++// Fold the dequantization of SGLang-TorchTPU's FP8 linears, (matmul *
++// row_scale) * col_scale in FP32, into the decode matmul's epilogue
++// (ttnn::matmul_scaled, which falls back to these ops past one tile row of
++// activations). The operands are float8, the product and scales f32, the row
++// scale [M, 1], the column scale [1, N] or one element. A narrowing to BF16
++// after it is TTNNBinaryOpNarrowingOutput's.
++class TTNNMatmulWithOutputScales : public mlir::OpRewritePattern<MultiplyOp> {
++public:
++  TTNNMatmulWithOutputScales(mlir::MLIRContext *context)
++      : mlir::OpRewritePattern<MultiplyOp>(context, /*benefit=*/2) {}
++
++  mlir::LogicalResult
++  matchAndRewrite(MultiplyOp outer,
++                  mlir::PatternRewriter &rewriter) const final {
++    auto plain = [](MultiplyOp op) {
++      return op.getActivations().empty() &&
++             op.getInputTensorAActivations().empty() &&
++             op.getInputTensorBActivations().empty();
++    };
++    // The multiply of a defining op of type T by another value, either way
++    // round.
++    auto factorOf = [](auto opType, MultiplyOp op, Value &other) {
++      using T = decltype(opType);
++      if (auto def = op.getLhs().getDefiningOp<T>()) {
++        other = op.getRhs();
++        return def;
++      }
++      if (auto def = op.getRhs().getDefiningOp<T>()) {
++        other = op.getLhs();
++        return def;
++      }
++      return T();
++    };
++    Value colScale, rowScale;
++    MultiplyOp inner = factorOf(MultiplyOp(), outer, colScale);
++    if (!plain(outer) || !inner || !plain(inner) ||
++        !inner.getResult().hasOneUse()) {
++      return failure();
++    }
++    MatmulOp matmulOp = factorOf(MatmulOp(), inner, rowScale);
++    if (!matmulOp || !matmulOp.getResult().hasOneUse() ||
++        matmulOp.getTransposeA() || matmulOp.getActivation() ||
++        matmulOp.getMatmulProgramConfigAttr() ||
++        matmulOp->hasAttr("ttnn.fused_swiglu") ||
++        matmulOp->hasAttr("ttcore.fp32_exact")) {
++      return failure();
++    }
++    // Only float8 matmuls: others keep their weight-format rewrites.
++    auto isFloat8 = [](Value v) {
++      return mlir::isa<Float8E4M3FNType, Float8E5M2Type>(
++          mlir::cast<RankedTensorType>(v.getType()).getElementType());
++    };
++    if (!isFloat8(matmulOp.getA()) || !isFloat8(matmulOp.getB())) {
++      return failure();
++    }
++    auto productType = matmulOp.getType();
++    auto rowType = mlir::cast<RankedTensorType>(rowScale.getType());
++    auto colType = mlir::cast<RankedTensorType>(colScale.getType());
++    if (productType.getRank() != 2 || !productType.getElementType().isF32() ||
++        !inner.getType().getElementType().isF32() ||
++        !rowType.getElementType().isF32() ||
++        !colType.getElementType().isF32()) {
++      return failure();
++    }
++    const int64_t rows = productType.getDimSize(0);
++    const int64_t cols = productType.getDimSize(1);
++    // The official checkpoints' per-channel scales, [N, 1], reshaped to [1, N]
++    // (weight_scale.reshape(1, -1)): the epilogue takes the column as it is,
++    // which saves a reshape program per linear and step.
++    ReshapeOp colReshape;
++    if (auto reshape = colScale.getDefiningOp<ReshapeOp>();
++        reshape && reshape.getInput().getType().getShape() ==
++                       ArrayRef<int64_t>{cols, 1}) {
++      colReshape = reshape;
++      colScale = reshape.getInput();
++      colType = reshape.getInput().getType();
++    }
++    auto [tileHeight, tileWidth] = ttcore::TileType::getDefaultShape();
++    if (rows > tileHeight ||
++        rowType.getShape() != ArrayRef<int64_t>{rows, 1} ||
++        (!colReshape && colType.getNumElements() != 1 &&
++         colType.getShape() != ArrayRef<int64_t>{1, cols})) {
++      return failure();
++    }
++    // FP32, or BF16 if TTNNBinaryOpNarrowingOutput narrowed the multiply.
++    if (!outer.getType().getElementType().isF32() &&
++        !outer.getType().getElementType().isBF16()) {
++      return failure();
++    }
++    rewriter.replaceOpWithNewOp<ScaledMatmulOp>(
++        outer, outer.getType(), matmulOp.getA(), matmulOp.getB(), rowScale,
++        colScale, matmulOp.getTransposeBAttr(), matmulOp.getComputeConfigAttr());
++    rewriter.eraseOp(inner);
++    rewriter.eraseOp(matmulOp);
++    if (colReshape && colReshape->use_empty()) {
++      rewriter.eraseOp(colReshape);
++    }
++    return success();
++  }
++};
++
+ // Fold the decode MLP's concatenated [up | gate] projection and SwiGLU into a
+ // single half-width matmul.  The runtime implements this marker with a
+ // two-weight matmul that keeps matching up/gate accumulators on the same core.
+@@ -1053,7 +1157,7 @@ public:
+     // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
+     // https://github.com/tenstorrent/tt-metal/issues/30973
+     patterns.add<TTNNBF16MeanOfUpcast, TTNNBinaryOpNarrowingOutput, TTNNRMSNormOfUpcast>(&getContext());
+-    patterns.add<TTNNMatmulWithSwiGLUEpilogue,
++    patterns.add<TTNNMatmulWithOutputScales, TTNNMatmulWithSwiGLUEpilogue,
+         TTNNConv2dWithActivation<ReluOp>, TTNNConv2dWithActivation<Relu6Op>,
+         TTNNConv2dWithActivation<SiluOp>, TTNNConv2dWithActivation<SigmoidOp>,
+         TTNNMatmulAndLinearWithActivation<MatmulOp, SigmoidOp>,
+@@ -1062,7 +1166,8 @@ public:
+         TTNNMatmulAndLinearWithActivation<LinearOp, SiluOp>,
+         TTNNMatmulAndLinearWithActivation<MatmulOp, GeluOp>,
+         TTNNMatmulAndLinearWithActivation<LinearOp, GeluOp>>(&getContext());
+-    patterns.add<TTNNProjectionWithExactSwiGLU<MatmulOp>>(&getContext());
++    patterns.add<TTNNProjectionWithExactSwiGLU<MatmulOp>,
++                 TTNNProjectionWithExactSwiGLU<ScaledMatmulOp>>(&getContext());
+ 
+ #ifdef TTMLIR_ENABLE_OPMODEL
+     if (enableOpConstraints) {
+diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+--- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
++++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
+@@ -596,6 +596,24 @@ createOp(FlatbufferObjectCache &cache, MatmulOp op) {
+ }
+ // ANCHOR_END: adding_an_op_matmul_serialize_to_binary
+ 
++::flatbuffers::Offset<::tt::target::ttnn::ScaledMatmulOp>
++createOp(FlatbufferObjectCache &cache, ScaledMatmulOp op) {
++  auto tensor = [&](Value value) {
++    return cache.at<::tt::target::ttnn::TensorRef>(
++        getOperandThroughDPSOps(value));
++  };
++  auto output = cache.getOrCreateNoSharding(
++      op.getResult(), tensorValueToFlatbuffer, std::nullopt);
++  std::optional<
++      ::flatbuffers::Offset<::tt::target::ttnn::DeviceComputeKernelConfig>>
++      computeConfig = toFlatbuffer(cache, op.getComputeConfig());
++  return ::tt::target::ttnn::CreateScaledMatmulOp(
++      *cache.fbb, tensor(op.getA()), tensor(op.getB()),
++      tensor(op.getRowScale()), tensor(op.getColScale()), output,
++      op.getTransposeB(), computeConfig.value_or(0),
++      op->hasAttr("ttnn.exact_swiglu"));
++}
++
+ ::flatbuffers::Offset<::tt::target::ttnn::SparseMatmulOp>
+ createOp(FlatbufferObjectCache &cache, SparseMatmulOp op) {
+   auto a = cache.at<::tt::target::ttnn::TensorRef>(
+@@ -5889,6 +5907,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+     return createOperation(cache, createOp(cache, scaledDotProductAttentionOp),
+                            debugString, locInfo);
+   }
++  if (auto scaledMatmulOp = dyn_cast<ScaledMatmulOp>(op)) {
++    return createOperation(cache, createOp(cache, scaledMatmulOp), debugString,
++                           locInfo);
++  }
+   if (auto quantizeRowsOp = dyn_cast<QuantizeRowsOp>(op)) {
+     return createOperation(cache, createOp(cache, quantizeRowsOp), debugString,
+                            locInfo);
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -166,6 +166,7 @@ void logOpRuntimeId(const char *debugInfo) {
+ #include "operations/transformer/nlp_create_qkv_heads_decode_norm_rope.h"
+ #include "operations/transformer/paged_flash_multi_latent_attention_decode.h"
+ #include "operations/transformer/paged_scaled_dot_product_attention_decode.h"
++#include "operations/matmul/scaled_matmul.h"
+ #include "operations/quantization/quantize_rows.h"
+ #include "operations/transformer/recurrent.h"
+ #include "operations/transformer/rotary_embedding.h"
+@@ -826,6 +827,8 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+     return operations::transformer::run(
+         op->type_as_ScaledDotProductAttentionOp(), getContext());
+   }
++  case ::tt::target::ttnn::OpType::ScaledMatmulOp:
++    return operations::matmul::run(op->type_as_ScaledMatmulOp(), getContext());
+   case ::tt::target::ttnn::OpType::QuantizeRowsOp:
+     return operations::quantization::run(op->type_as_QuantizeRowsOp(),
+                                          getContext());

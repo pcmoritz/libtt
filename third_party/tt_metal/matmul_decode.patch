@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
  #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
  #include "ttnn/types.hpp"
  #include <algorithm>
-@@ -1024,16 +1025,268 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
+@@ -1024,16 +1025,284 @@ std::tuple<uint32_t, uint32_t> get_matmul_subblock_params(
  }
  }  // namespace bmm_op_utils
  
@@ -33,9 +33,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +// cores idle: one core per output tile and K share, each output tile's shares
 +// stacked in grid rows. On Blackhole, five shares were fastest or close to it
 +// for 0.5 to 4 MB of weights; shares of at least four K tiles keep the
-+// reduction a small part of the work. Each core reads its share of the weight
-+// as one block, on RISCV_0's NOC, clear of the activation multicast on
-+// RISCV_1's.
++// reduction a small part of the work. A share of fewer than 64 K tiles is
++// read as one block, on RISCV_0's NOC, clear of the activation multicast on
++// RISCV_1's; a larger one in double-buffered blocks of up to 16 tiles on both
++// NOCs, so that reads overlap the matmul: Qwen3-8B's qkv projection on four
++// chips, [4096, 1536], BF16 35.3 -> 29.3 us and FP8 23.8 -> 18.8 us. Shares of
++// 16 to 40 tiles were fastest as one block.
 +std::optional<MatmulDecodeProgramConfig> create_matmul_decode_split_k_program_config(
 +    const Tensor& input_tensor_a,
 +    const Tensor& input_tensor_b,
@@ -43,7 +46,6 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +    const tt::tt_metal::CoreCoord& grid) {
 +    constexpr uint32_t min_share_tiles = 4;
 +    constexpr uint32_t max_splits = 5;
-+    constexpr uint32_t max_block_tiles = 64;
 +    const uint32_t Kt = utilities::get_matmul_tensor_padded_shape(input_tensor_a, /*transpose_a=*/false)[-1] /
 +                        tt::constants::TILE_WIDTH;
 +    const uint32_t out_Nt =
@@ -60,7 +62,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +        return std::nullopt;
 +    }
 +    const uint32_t share = Kt / k_splits;
-+    uint32_t in0_block_w = std::min(share, max_block_tiles);
++    uint32_t in0_block_w = share < 64 ? share : 16;
 +    while (share % in0_block_w != 0) {
 +        --in0_block_w;
 +    }
@@ -112,10 +114,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +    const auto b_shape_padded = utilities::get_matmul_tensor_padded_shape(input_tensor_b, attributes.transpose_b);
 +    const uint32_t K = a_shape_padded[-1];
 +    const uint32_t N = b_shape_padded[-1];
-+    if (input_tensor_a.dtype() != DataType::BFLOAT16 || input_tensor_a.layout() != Layout::TILE ||
-+        !utilities::is_dram_interleaved(input_tensor_a.memory_config())) {
++    const auto a_dtype = input_tensor_a.dtype();
++    if ((a_dtype != DataType::BFLOAT16 && a_dtype != DataType::FP8_E4M3 && a_dtype != DataType::FP8_E5M2) ||
++        input_tensor_a.layout() != Layout::TILE || !utilities::is_dram_interleaved(input_tensor_a.memory_config())) {
 +        return fmt::format(
-+            "input A must be a tiled BFLOAT16 tensor in interleaved DRAM, got dtype {}, layout {}, memory config {}",
++            "input A must be a tiled BFLOAT16 or float8 tensor in interleaved DRAM, got dtype {}, layout {}, memory "
++            "config {}",
 +            input_tensor_a.dtype(),
 +            input_tensor_a.layout(),
 +            input_tensor_a.memory_config());
@@ -251,12 +255,24 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 +                    decode_config.in0_block_w = w;
 +                }
 +            }
++            // A transposed weight keeps each output tile's K tiles in a row
++            // of consecutive pages, so a narrow block reads the same few DRAM
++            // banks for every output tile on every core: take one K tile from
++            // each bank (Qwen3-8B's gate and up projection [4096, 24576] on
++            // one chip 544 -> 461 us, Qwen3-32B's [5120, 12800] on four chips
++            // 528 -> 290 us, a [4096, 37984] LM head 822 -> 687 us).
++            const uint32_t banks = input_tensor_b.device()->allocator()->get_num_banks(tt::tt_metal::BufferType::DRAM);
++            if (transpose_b && decode_config.in0_block_w < banks && Kt % banks == 0) {
++                decode_config.in0_block_w = banks;
++            }
 +        }
-+        // Only for BF16 outputs: matmul_decode reads BF16 activations only, so an
-+        // FP32 matmul of a BF16 activation keeps summing in the order of one of
-+        // the activation cast to FP32.
++        // Only for BF16 outputs or float8 activations: matmul_decode reads no
++        // FP32 activations, so an FP32 matmul of a BF16 activation keeps
++        // summing in the order of one of the activation cast to FP32.
 +        const bool bf16_output =
-+            attributes.output_dtype.value_or(input_tensor_a.dtype()) == tt::tt_metal::DataType::BFLOAT16;
++            attributes.output_dtype.value_or(input_tensor_a.dtype()) == tt::tt_metal::DataType::BFLOAT16 ||
++            input_tensor_a.dtype() == tt::tt_metal::DataType::FP8_E4M3 ||
++            input_tensor_a.dtype() == tt::tt_metal::DataType::FP8_E5M2;
 +        // The decode program once its output tiles fill at least half of the
 +        // worker cores (one output tile each) for a BF16 output, all of them for
 +        // FP32; the 1D matmul's K loop is slower per core: Qwen3.8-Flash-Next's
@@ -279,7 +295,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
      auto config = generate_matmul_program_config(
          input_tensor_a,
          input_tensor_b,
-@@ -1052,7 +1305,9 @@ MatmulProgramConfig get_program_config(
+@@ -1052,7 +1321,9 @@ MatmulProgramConfig get_program_config(
      std::visit(
          [input_tensor_a](const auto& program_config) {
              using ProgramConfigType = std::decay_t<decltype(program_config)>;
@@ -337,7 +353,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.h
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
-@@ -92,13 +92,34 @@ struct MatmulMultiCoreProgramConfig {
+@@ -92,13 +92,40 @@ struct MatmulMultiCoreProgramConfig {
      std::optional<tt::tt_metal::CoreRangeSet> allowed_worker_cores = std::nullopt;
  };
  
@@ -356,6 +372,12 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_t
 +    tt::tt_metal::CoreCoord compute_with_storage_grid_size;
 +    std::size_t in0_block_w{};
 +    bool fuse_swiglu{};
++    // With fuse_swiglu: the weight holds a gate half followed by an up half,
++    // as PyTorch's merged gate and up projections, and the output is
++    // SiluAndMul's as PyTorch's ops compute it on TT, bit for bit: each half
++    // rounded to BF16 as the matmul's output, silu in FP32 rounded to BF16
++    // (ttnn.typecast), and the product rounded as ttnn.multiply's BF16 output.
++    bool exact_swiglu{};
 +    // Cores per output tile, each reducing a 1 / k_splits share of K. The
 +    // shares' FP32 partial sums are added on the core of the first share.
 +    std::size_t k_splits = 1;
@@ -373,7 +395,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_t
  
  // Ensures allowed_worker_cores is populated on every config variant that supports it.
  // If allowed_worker_cores is already set, it is left unchanged.  Otherwise it is
-@@ -125,7 +146,7 @@ inline void normalize_program_config(MatmulProgramConfig& config, const tt::tt_m
+@@ -125,7 +152,7 @@ inline void normalize_program_config(MatmulProgramConfig& config, const tt::tt_m
                      c.allowed_worker_cores = make_crs(device_grid);
                  }
              }
@@ -386,7 +408,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_decode_program_factory.cpp
-@@ -0,0 +1,409 @@
+@@ -0,0 +1,421 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -423,7 +445,11 @@ new file mode 100644
 +// activation row is multicast in chunks of in0_mcast_w tiles. With k_splits
 +// shares of K, every share repeats that schedule over its own Kt tiles of K
 +// on the next rows_per_share grid rows, and the cores of share 0 own the
-+// output tiles.
++// output tiles. A core's tiles are consecutive, or with n_step = num_cores
++// (exact SwiGLU) every num_cores-th from its index: a narrow pass of each core
++// (a group of two tiles, say) then reads different DRAM banks than its
++// neighbours' (Qwen3-8B's FP8 gate and up projection on one chip, two passes
++// of two tiles, 313 -> 241 us).
 +struct DecodePlan {
 +    uint32_t Kt;
 +    uint32_t Kt_total;
@@ -436,8 +462,11 @@ new file mode 100644
 +    uint32_t in0_mcast_w;
 +    uint32_t base_count;
 +    uint32_t extra;
++    uint32_t n_step;
 +    uint32_t count_of(uint32_t core) const { return base_count + (core < extra ? 1 : 0); }
-+    uint32_t start_of(uint32_t core) const { return core * base_count + std::min(core, extra); }
++    uint32_t start_of(uint32_t core) const {
++        return n_step > 1 ? core : core * base_count + std::min(core, extra);
++    }
 +};
 +
 +DecodePlan plan_decode(
@@ -475,6 +504,7 @@ new file mode 100644
 +        .in0_mcast_w = in0_mcast_w,
 +        .base_count = out_Nt / num_cores,
 +        .extra = out_Nt % num_cores,
++        .n_step = config.exact_swiglu ? num_cores : 1,
 +    };
 +}
 +
@@ -530,9 +560,11 @@ new file mode 100644
 +    // being padding that the program leaves as it finds it. The row is small enough to multicast in one chunk.
 +    const uint32_t a_rows = a.logical_volume() / a.logical_shape()[-1];
 +    uint32_t rows_tile_h = TILE_HEIGHT;
-+    if (!config.fuse_swiglu && !bias_tensor.has_value()) {
++    if ((!config.fuse_swiglu || config.exact_swiglu) && !bias_tensor.has_value()) {
++        // The sender reads each face's rows on their own, 64-byte aligned:
++        // at least 2 rows of BF16, 4 of float8.
 +        for (const uint32_t h : {2u, 4u, 8u, 16u}) {
-+            if (a_rows <= h) {
++            if (a_rows <= h && h * 16 * a.element_size() >= 64) {
 +                rows_tile_h = h;
 +                break;
 +            }
@@ -646,7 +678,9 @@ new file mode 100644
 +        {"Kt_total", plan.Kt_total},
 +        {"k_splits", k_splits},
 +        {"halves", plan.halves},
++        {"exact_swiglu", config.fuse_swiglu && config.exact_swiglu},
 +        {"out_Nt", plan.out_Nt},
++        {"n_step", plan.n_step},
 +        {"group", plan.group},
 +        {"in0_block_w", in0_block_w},
 +        {"in0_mcast_w", plan.in0_mcast_w},
@@ -841,7 +875,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.cpp
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,188 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -855,6 +889,40 @@ new file mode 100644
 +#include "api/dataflow/circular_buffer.h"
 +#include "api/compute/compute_kernel_api.h"
 +
++#ifdef TRISC_MATH
++#include "sfpi.h"
++
++namespace matmul_decode {
++
++// Each value of DST tile `dst` rounded to BF16 and kept as FP32: to nearest,
++// ties away from zero as the packer rounds a BF16 output, or ties to even as
++// ttnn.typecast's conversion.
++template <bool ties_to_even>
++inline void round_to_bf16(uint32_t dst) {
++    _llk_math_eltwise_sfpu_start_(dst);
++    for (uint32_t face = 0; face < 4; ++face) {
++#pragma GCC unroll 8
++        for (uint32_t d = 0; d < 8; ++d) {
++            sfpi::vUInt bits = sfpi::as<sfpi::vUInt>(sfpi::vFloat(sfpi::dst_reg[d]));
++            if constexpr (ties_to_even) {
++                bits = bits + 0x7fffU + ((bits >> 16) & 1);
++            } else {
++                bits = bits + 0x8000U;
++            }
++            sfpi::dst_reg[d] = sfpi::as<sfpi::vFloat>(bits & 0xffff0000U);
++        }
++        _llk_math_eltwise_sfpu_inc_dst_face_addr_();
++    }
++    _llk_math_eltwise_sfpu_done_();
++}
++
++}  // namespace matmul_decode
++#endif
++
++namespace {
++inline void sfpu_pass_init() { MATH((llk_math_eltwise_unary_sfpu_init<SfpuType::unused, DST_ACCUM_MODE>())); }
++}  // namespace
++
 +// This core's output tiles, or silu(gate) * up for SwiGLU's two weight halves.
 +// Each group of up to `group` output tiles accumulates the full K reduction in
 +// FP32 DST, starting from the bias if there is one; the activation stays
@@ -867,6 +935,7 @@ new file mode 100644
 +
 +    constexpr uint32_t Kt = get_named_compile_time_arg_val("Kt");
 +    constexpr uint32_t halves = get_named_compile_time_arg_val("halves");
++    constexpr bool exact_swiglu = get_named_compile_time_arg_val("exact_swiglu");
 +    constexpr uint32_t kblock = get_named_compile_time_arg_val("in0_block_w");
 +    constexpr uint32_t group = get_named_compile_time_arg_val("group");
 +    constexpr uint32_t cb_in0 = get_named_compile_time_arg_val("cb_in0");
@@ -928,7 +997,7 @@ new file mode 100644
 +            cb_pop_front(cb_block, block_tiles);
 +        }
 +
-+        if constexpr (halves == 2) {
++        if constexpr (halves == 2 && !exact_swiglu) {
 +            // Gate occupies the first `width` DST tiles, followed by up.
 +            silu_tile_init();
 +            for (uint32_t i = 0; i < width; ++i) {
@@ -951,6 +1020,33 @@ new file mode 100644
 +            }
 +            reconfig_data_format<SrcOrder::Reverse>(cb_in0, cb_weights);
 +        }
++        if constexpr (exact_swiglu) {
++            // PyTorch's SiluAndMul on the BF16 projection, rounding as its ops
++            // do on TT: both halves to BF16 as the matmul's output packs (ties
++            // away from zero), silu in FP32 (ttnn.silu) rounded to BF16 as
++            // ttnn.typecast rounds (ties to even), and the product, exact in
++            // FP32, rounded to BF16 as ttnn.multiply's output (ties to even).
++            sfpu_pass_init();
++            for (uint32_t i = 0; i < 2 * width; ++i) {
++                MATH((matmul_decode::round_to_bf16</*ties_to_even=*/false>(i)));
++            }
++            silu_tile_init();
++            for (uint32_t i = 0; i < width; ++i) {
++                silu_tile(i);
++            }
++            sfpu_pass_init();
++            for (uint32_t i = 0; i < width; ++i) {
++                MATH((matmul_decode::round_to_bf16</*ties_to_even=*/true>(i)));
++            }
++            mul_binary_tile_init();
++            for (uint32_t i = 0; i < width; ++i) {
++                mul_binary_tile(i, width + i, i);
++            }
++            sfpu_pass_init();
++            for (uint32_t i = 0; i < width; ++i) {
++                MATH((matmul_decode::round_to_bf16</*ties_to_even=*/true>(i)));
++            }
++        }
 +        tile_regs_commit();
 +        tile_regs_wait();
 +        cb_reserve_back(cb_result, width);
@@ -972,7 +1068,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/matmul_decode_weights.hpp
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,64 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -987,11 +1083,13 @@ new file mode 100644
 +// Even blocks travel on RISCV_0's NOC and odd blocks on RISCV_1's; this reads
 +// the blocks with index % 2 == parity. For each K row, a block holds the
 +// group's weight tiles of every half in turn: a plain matmul has one half, and
-+// SwiGLU's [up | gate] weight has two, read gate first. A transposed weight
-+// is stored [N, K]. Every block occupies the same CB space, so a narrower last
-+// group keeps the block size constant. `poll` runs while waiting for CB space,
-+// so the caller can make other progress. A core of a matmul split over K
-+// reads the Kt rows of its share, from k_start of the weight's Kt_total.
++// SwiGLU's [up | gate] weight has two ([gate | up] with exact_swiglu), read
++// gate first. A transposed weight is stored [N, K]. Every block occupies the
++// same CB space, so a narrower last group keeps the block size constant.
++// `poll` runs while waiting for CB space, so the caller can make other
++// progress. A core of a matmul split over K reads the Kt rows of its share,
++// from k_start of the weight's Kt_total. A core's output tiles are n_start, then
++// every n_step-th.
 +template <uint32_t parity, typename Accessor, typename Poll>
 +FORCE_INLINE void stream_decode_weights(
 +    const Accessor& weight, uint32_t n_start, uint32_t count, uint32_t cb, Poll poll, uint32_t k_start = 0) {
@@ -1002,6 +1100,8 @@ new file mode 100644
 +    constexpr uint32_t kblock = get_named_compile_time_arg_val("in0_block_w");
 +    constexpr uint32_t group = get_named_compile_time_arg_val("group");
 +    constexpr bool transpose_b = get_named_compile_time_arg_val("transpose_b");
++    constexpr bool gate_first = get_named_compile_time_arg_val("exact_swiglu");
++    constexpr uint32_t n_step = get_named_compile_time_arg_val("n_step");
 +    constexpr uint32_t block_tiles = kblock * halves * group;
 +    const uint32_t tile_bytes = get_tile_size(cb);
 +    uint32_t index = 0;
@@ -1018,8 +1118,10 @@ new file mode 100644
 +            uint32_t local = get_write_ptr(cb);
 +            for (uint32_t k = 0; k < kblock; ++k) {
 +                for (uint32_t half = 0; half < halves; ++half) {
-+                    const uint32_t first = (halves - 1 - half) * out_Nt + n_start + group_start;
-+                    for (uint32_t n = first; n < first + width; ++n, local += tile_bytes) {
++                    const uint32_t first =
++                        (gate_first ? half : halves - 1 - half) * out_Nt + n_start + group_start * n_step;
++                    for (uint32_t i = 0; i < width; ++i, local += tile_bytes) {
++                        const uint32_t n = first + i * n_step;
 +                        const uint32_t row = k_start + k0 + k;
 +                        const uint32_t tile = transpose_b ? n * Kt_total + row : row * halves * out_Nt + n;
 +                        noc_async_read_tile(tile, weight, local);
@@ -1035,7 +1137,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode.cpp
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,130 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1051,13 +1153,14 @@ new file mode 100644
 +// without a bias have neither.
 +template <bool has_bias, uint32_t args_offset>
 +FORCE_INLINE void read_bias(uint32_t n_start, uint32_t count, uint32_t cb_bias) {
++    constexpr uint32_t n_step = get_named_compile_time_arg_val("n_step");
 +    if constexpr (has_bias) {
 +        constexpr auto bias_args = TensorAccessorArgs<args_offset>();
 +        const auto bias = TensorAccessor(bias_args, get_arg_val<uint32_t>(4));
 +        const uint32_t tile_bytes = get_tile_size(cb_bias);
 +        cb_reserve_back(cb_bias, count);
 +        for (uint32_t n = 0; n < count; ++n) {
-+            noc_async_read_tile(n_start + n, bias, get_write_ptr(cb_bias) + n * tile_bytes);
++            noc_async_read_tile(n_start + n * n_step, bias, get_write_ptr(cb_bias) + n * tile_bytes);
 +        }
 +        noc_async_read_barrier();
 +        cb_push_back(cb_bias, count);
@@ -1086,6 +1189,7 @@ new file mode 100644
 +    constexpr uint32_t cb_partials = get_named_compile_time_arg_val("cb_partials");
 +    constexpr uint32_t cb_partial_out = get_named_compile_time_arg_val("cb_partial_out");
 +    constexpr bool has_bias = get_named_compile_time_arg_val("has_bias");
++    constexpr uint32_t n_step = get_named_compile_time_arg_val("n_step");
 +    constexpr uint32_t k_splits = get_named_compile_time_arg_val("k_splits");
 +    constexpr uint32_t partial_sem_id = get_named_compile_time_arg_val("partial_sem");
 +    constexpr uint32_t ready_sem_id = get_named_compile_time_arg_val("ready_sem");
@@ -1154,10 +1258,10 @@ new file mode 100644
 +            const uint32_t full_face_bytes = 256 * element_bytes;
 +            const uint32_t local = get_read_ptr(cb_out);
 +            const uint32_t local_face = out_tile_h < 32 ? rows_bytes : full_face_bytes;
-+            noc_async_write(local, output.get_noc_addr(n_start + n), rows_bytes);
-+            noc_async_write(local + local_face, output.get_noc_addr(n_start + n, full_face_bytes), rows_bytes);
++            noc_async_write(local, output.get_noc_addr(n_start + n * n_step), rows_bytes);
++            noc_async_write(local + local_face, output.get_noc_addr(n_start + n * n_step, full_face_bytes), rows_bytes);
 +        } else {
-+            noc.async_write(out_cb, output, page_bytes, {}, {.page_id = n_start + n});
++            noc.async_write(out_cb, output, page_bytes, {}, {.page_id = n_start + n * n_step});
 +        }
 +        noc.async_writes_flushed();
 +        out_cb.pop_front(1);
@@ -1227,7 +1331,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/reader_matmul_decode_in0_sender.cpp
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,99 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -1280,17 +1384,18 @@ new file mode 100644
 +
 +    cb_in0.reserve_back(Kt);
 +    const uint32_t base = cb_in0.get_write_ptr();
-+    // Tiles of rows_tile_h < 32 rows hold just the top rows of faces 0 and 1 of the activation's BF16 tiles
-+    // in DRAM (512 bytes a face), 32 bytes a row.
++    // Tiles of rows_tile_h < 32 rows hold just the top rows of faces 0 and 1 of the activation's tiles in
++    // DRAM, 16 elements a row and 256 a face.
 +    constexpr uint32_t rows_tile_h = get_named_compile_time_arg_val("rows_tile_h");
 +    auto read_chunk = [&](uint32_t chunk) {
 +        for (uint32_t k = 0; k < in0_mcast_w; ++k) {
 +            const uint32_t tile = chunk * in0_mcast_w + k;
 +            if constexpr (rows_tile_h < 32) {
-+                constexpr uint32_t face_bytes = rows_tile_h * 32;
++                constexpr uint32_t element_bytes = tile_bytes / (rows_tile_h * 32);
++                constexpr uint32_t face_bytes = rows_tile_h * 16 * element_bytes;
 +                const uint32_t local = base + tile * tile_bytes;
 +                noc_async_read(input.get_noc_addr(k_start + tile), local, face_bytes);
-+                noc_async_read(input.get_noc_addr(k_start + tile, 512), local + face_bytes, face_bytes);
++                noc_async_read(input.get_noc_addr(k_start + tile, 256 * element_bytes), local + face_bytes, face_bytes);
 +            } else {
 +                noc_async_read_tile(k_start + tile, input, base + tile * tile_bytes);
 +            }
@@ -1479,7 +1584,15 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.hpp
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-@@ -271,14 +271,16 @@ static ttnn::Tensor bound_matmul(
+@@ -14,6 +14,7 @@
+ #include "ttnn/operations/copy/typecast/typecast.hpp"
+ #include "ttnn/operations/eltwise/unary/common/unary_op_utils.hpp"
+ #include "ttnn/operations/creation/creation.hpp"
++#include "ttnn/operations/data_movement/slice/slice.hpp"
+ 
+ #include "ttnn/operations/matmul/device/config/matmul_program_config.hpp"
+ #include "ttnn/operations/matmul/device/matmul_device_operation.hpp"
+@@ -271,14 +272,16 @@ static ttnn::Tensor bound_matmul(
          parameters.transpose_a,
          parameters.transpose_b,
          bias_single_tile_size,
@@ -1498,26 +1611,77 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
      bool needs_manual_transpose_a = parameters.transpose_a && needs_manual_transpose;
      bool needs_manual_transpose_b = parameters.transpose_b && needs_manual_transpose;
  
-@@ -436,6 +438,28 @@ Tensor matmul(
+@@ -436,6 +439,79 @@ Tensor matmul(
          optional_output_tensor);
  }
  
++namespace {
++// PyTorch's SiluAndMul as TT runs its ops on a BF16 [..., gate | up] product:
++// the halves sliced, silu of the gate in FP32 cast back to BF16, times up.
++Tensor silu_and_mul(const Tensor& product, const MemoryConfig& memory_config) {
++    const auto& shape = product.logical_shape();
++    const uint32_t half = shape[-1] / 2;
++    ttsl::SmallVector<uint32_t> begins(shape.rank(), 0), ends(shape.cbegin(), shape.cend()), step(shape.rank(), 1);
++    ends.back() = half;
++    const Tensor gate = ttnn::slice(product, begins, ends, step, memory_config);
++    begins.back() = half;
++    ends.back() = 2 * half;
++    const Tensor up = ttnn::slice(product, begins, ends, step, memory_config);
++    const Tensor silu = ttnn::typecast(
++        ttnn::silu(ttnn::typecast(gate, DataType::FLOAT32, memory_config), memory_config),
++        DataType::BFLOAT16,
++        memory_config);
++    return ttnn::multiply(silu, up, DataType::BFLOAT16, memory_config);
++}
++}  // namespace
++
 +Tensor matmul_swiglu(
 +    const Tensor& input_tensor_a,
 +    const Tensor& input_tensor_b,
 +    const std::optional<const MemoryConfig>& memory_config,
 +    std::optional<const DataType> dtype,
-+    std::optional<const DeviceComputeKernelConfig> compute_kernel_config) {
++    std::optional<const DeviceComputeKernelConfig> compute_kernel_config,
++    bool transpose_b,
++    bool exact) {
 +    ttnn::prim::MatmulParams params;
 +    params.output_mem_config = memory_config.value_or(ttnn::DRAM_MEMORY_CONFIG);
 +    params.output_dtype = dtype;
 +    params.compute_kernel_config = compute_kernel_config;
++    params.transpose_b = transpose_b;
 +    // The program is implied by the op rather than chosen by the caller, so
 +    // the attributes take the defaults of an automatically configured matmul,
 +    // such as its math fidelity, before the decode config is set.
 +    auto attributes = ttnn::prim::create_matmul_attributes(input_tensor_a, input_tensor_b, params, {std::nullopt});
-+    attributes.program_config = create_matmul_decode_program_config(
-+        input_tensor_a, input_tensor_a.device()->compute_with_storage_grid_size(), /*fuse_swiglu=*/true);
++    const auto grid = input_tensor_a.device()->compute_with_storage_grid_size();
++    if (exact) {
++        // The decode program ttnn::matmul runs for the whole weight, each
++        // output tile's gate and up halves on one core.
++        MatmulProgramConfig config =
++            get_program_config(input_tensor_a, input_tensor_b, false, transpose_b, 0, attributes);
++        normalize_program_config(config, grid);
++        auto* decode = std::get_if<MatmulDecodeProgramConfig>(&config);
++        if (decode == nullptr || decode->k_splits != 1) {
++            // A narrow weight's matmul splits over K (or runs the 1D program),
++            // which beats one core per gate and up pair: SiluAndMul's ops apart.
++            return silu_and_mul(
++                ttnn::matmul(
++                    input_tensor_a,
++                    input_tensor_b,
++                    /*transpose_a=*/false,
++                    transpose_b,
++                    params.output_mem_config,
++                    dtype,
++                    /*program_config=*/std::nullopt,
++                    /*activation=*/std::nullopt,
++                    compute_kernel_config),
++                params.output_mem_config);
++        }
++        decode->fuse_swiglu = true;
++        decode->exact_swiglu = true;
++        attributes.program_config = config;
++    } else {
++        attributes.program_config = create_matmul_decode_program_config(input_tensor_a, grid, /*fuse_swiglu=*/true);
++    }
 +    return ttnn::prim::matmul(
 +               input_tensor_a, input_tensor_b, /*bias=*/std::nullopt,
 +               /*optional_output_tensor=*/std::nullopt, attributes)
@@ -1530,7 +1694,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/m
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/matmul/matmul.hpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.hpp
-@@ -47,6 +47,17 @@ Tensor matmul(
+@@ -47,6 +47,24 @@ Tensor matmul(
      const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id = std::nullopt,
      const PrefetcherPipeList& prefetcher_pipes = {});
  
@@ -1538,17 +1702,24 @@ diff --git ttnn/cpp/ttnn/operations/matmul/matmul.hpp ttnn/cpp/ttnn/operations/m
 +// an up half followed by a gate half, and the result is silu(gate) * up at
 +// half the weight's width. A matmul with MatmulDecodeProgramConfig's
 +// fuse_swiglu, with the defaults of an automatically configured matmul.
++// With `exact`, the weight holds a gate half followed by an up half and the
++// result is bit for bit that of PyTorch's SiluAndMul on the BF16 product as
++// TT runs its ops: the halves sliced, the gate cast to FP32, silu, cast to
++// BF16 and multiplied by the up half (exact_swiglu; those ops themselves where
++// ttnn::matmul splits the weight's matmul over K).
 +Tensor matmul_swiglu(
 +    const Tensor& input_tensor_a,
 +    const Tensor& input_tensor_b,
 +    const std::optional<const MemoryConfig>& memory_config = std::nullopt,
 +    std::optional<const DataType> dtype = std::nullopt,
-+    std::optional<const DeviceComputeKernelConfig> compute_kernel_config = std::nullopt);
++    std::optional<const DeviceComputeKernelConfig> compute_kernel_config = std::nullopt,
++    bool transpose_b = false,
++    bool exact = false);
 +
  std::vector<Tensor> matmul_batched_weights(
      const Tensor& input_tensor_a,
      const std::vector<Tensor>& input_tensors_b,
-@@ -124,6 +135,7 @@ Tensor sparse_matmul(
+@@ -124,6 +142,7 @@ Tensor sparse_matmul(
  using operations::matmul::addmm;
  using operations::matmul::linear;
  using operations::matmul::matmul;

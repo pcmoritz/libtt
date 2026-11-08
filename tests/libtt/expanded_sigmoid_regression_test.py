@@ -48,3 +48,29 @@ def test_sigmoid_of_integers():
     x = np.arange(-3, 4, dtype=np.int32)
     out = jax.jit(lambda x: jax.nn.sigmoid(x.astype(jnp.float32)))(x)
     np.testing.assert_allclose(out, 1 / (1 + np.exp(-x.astype(np.float32))), rtol=1e-2)
+
+
+@pytest.mark.parametrize("level", ["O0", "O1"])
+def test_pytorch_silu_stays_fp32(tmp_path, level):
+    """PyTorch's SiLU decomposition, x / (1 + exp(-x)), as SGLang-TorchTPU
+    computes it in FP32 before narrowing and multiplying by the up projection,
+    becomes one FP32 silu. Rounded to BF16, it matches the float64 SiLU on
+    every element, as the FP32 negate, exp, add and divide did."""
+    rng = np.random.default_rng(2)
+    gate = (rng.normal(0, 3, (1, 12288))).astype(jnp.bfloat16)
+    up = rng.normal(0, 1, (1, 12288)).astype(jnp.bfloat16)
+
+    def mlp(g, u):
+        x = g.astype(jnp.float32)
+        return (x / (1 + jnp.exp(-x))).astype(jnp.bfloat16) * u
+
+    run = jax.jit(mlp, compiler_options={"optimization_level": level, "export_path": str(tmp_path)})
+    device = jax.devices("tt")[0]
+    actual = np.asarray(run(*(jax.device_put(a, device) for a in (gate, up))))
+    (ir,) = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert "ttnn.silu" in ir or "op_type = silu" in ir
+    assert "ttnn.exp" not in ir and "ttnn.divide" not in ir
+    g = gate.astype(np.float64)
+    silu = (g / (1 + np.exp(-g))).astype(np.float32).astype(jnp.bfloat16)
+    expected = (silu.astype(np.float64) * up.astype(np.float64)).astype(np.float32).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(actual.view(np.uint16), expected.view(np.uint16))

@@ -88,16 +88,22 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
      auto inputType = mlir::cast<RankedTensorType>(input.getType());
      mlir::Type elementType = inputType.getElementType();
      mlir::Value reversedInput;
-@@ -667,7 +720,7 @@
+@@ -667,7 +720,13 @@
        return false;
      }
- 
+
 -    if (!hasValidArgMinInitValues(srcOp.getInitValues())) {
-+    if (!hasValidArgMaxInitValues(srcOp.getInitValues())) {
++    // Over a unit dimension, neither the inputs nor the reducer are checked,
++    // and only an init of +inf tells an argmin from another reduction, such
++    // as layer_norm's sums of x and x * x.
++    if (!hasValidArgMaxInitValues(srcOp.getInitValues()) ||
++        (hasUnitReductionDimension &&
++         !verifyInitValue(srcOp.getInitValues().front(),
++                          TypicalInitReductionValue::POS_INF))) {
        return false;
      }
- 
-@@ -719,8 +772,8 @@
+
+@@ -719,8 +778,8 @@
        return false;
      }
  
@@ -108,7 +114,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
        return false;
      }
      return true;
-@@ -732,27 +785,8 @@
+@@ -732,27 +791,8 @@
        return false;
      }
  

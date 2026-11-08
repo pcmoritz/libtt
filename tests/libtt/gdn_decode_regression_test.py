@@ -313,3 +313,39 @@ def test_state_pool_copy_rejects_rank_two_pools():
     args = (pool, np.array([1], np.int32), np.array([2], np.int32))
     with pytest.raises(jax.errors.JaxRuntimeError, match="rank at least three"):
         np.asarray(jax.jit(state_pool_copy)(*(jax.device_put(x, device) for x in args)))
+
+
+
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize("batch", [1, 4])
+def test_gdn_decode_reads_gate_columns(trace, batch, tmp_path):
+    """As SGLang-TorchTPU's Qwen3.8 decode layer at TP4: b and a are the
+    halves of one [B, 24] projection. The op reads both in place: no slices
+    run, and the results match the op on the separate halves bit for bit."""
+    key_heads, heads, dim, slots = 4, 12, 128, batch + 2
+    channels = (2 * key_heads + heads) * dim
+
+    def layer(state, mixed, ba, A_log, dt_bias, indices, initial):
+        return gated_delta_decode(state, mixed, ba[:, :heads], ba[:, heads:], A_log, dt_bias, indices, initial)
+
+    device = jax.devices("tt")[0]
+    options = {"optimization_level": "O1", "enable_trace": str(trace).lower()}
+    run = jax.jit(layer, compiler_options={**options, "export_path": str(tmp_path)})
+    run_separate = jax.jit(gated_delta_decode, compiler_options=options)
+    rng = np.random.default_rng(batch)
+    state = rng.normal(0, 0.05, (slots, heads, dim, dim)).astype(np.float32)
+    mixed = rng.normal(0, 1, (batch, channels)).astype(np.float32)
+    ba = rng.normal(0, 1, (batch, 2 * heads)).astype(jnp.bfloat16)
+    A_log = rng.uniform(-1, 1, heads).astype(np.float32)
+    dt_bias = rng.uniform(-1, 1, heads).astype(np.float32)
+    indices = (1 + rng.permutation(slots - 1)[:batch]).astype(np.int32)
+    initial = (np.arange(batch) % 2 == 0).astype(np.float32).astype(jnp.bfloat16)
+    put = lambda *xs: [jax.device_put(x, device) for x in xs]
+
+    got = run(*put(state, mixed, ba, A_log, dt_bias, indices, initial))
+    want = run_separate(*put(state, mixed, ba[:, :heads], ba[:, heads:], A_log, dt_bias, indices, initial))
+    for g, w in zip(got, want):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert irs and all('"ttnn.slice_static"' not in ir for ir in irs), "b or a was sliced"
+    assert any("delta_time_offset = 12" in ir for ir in irs)

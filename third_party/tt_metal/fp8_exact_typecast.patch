@@ -1,96 +1,11 @@
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/eltwise_typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/eltwise_typecast.cpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/eltwise_typecast.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/eltwise_typecast.cpp
-@@ -9,6 +9,107 @@
+@@ -9,6 +9,22 @@
  
  namespace ckl = compute_kernel_lib;
  
-+#ifdef TRISC_MATH
-+#include "llk_math_eltwise_unary_sfpu_macros.h"
-+
-+namespace ckernel::sfpu {
-+
-+// Float8 bytes (UInt8 tiles, zero-extended in the 32-bit DST) to float32, exactly: M mantissa bits,
-+// exponent bias BIAS, and either infinities (e5m2) or only NaN at the top code (e4m3fn).
-+template <int M, int BIAS, bool HAS_INF>
-+inline void calculate_fp8_to_fp32() {
-+    for (int d = 0; d < 8; d++) {
-+        const sfpi::vUInt code = sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>();
-+        const sfpi::vInt magnitude = sfpi::as<sfpi::vInt>(code & 0x7f);
-+        // A normal value's exponent and mantissa, moved into float32's fields and rebiased.
-+        sfpi::vUInt bits = sfpi::as<sfpi::vUInt>(sfpi::shft(magnitude, 23 - M) + ((127 - BIAS) << 23));
-+        v_if(magnitude < (1 << M)) {
-+            // A subnormal value: its mantissa times the smallest subnormal.
-+            const sfpi::vFloat value = sfpi::convert<sfpi::vFloat>(magnitude, sfpi::RoundMode::Nearest) *
-+                                       __builtin_ldexpf(1.0f, 1 - BIAS - M);
-+            bits = sfpi::as<sfpi::vUInt>(value);
-+        }
-+        v_endif;
-+        constexpr int top = HAS_INF ? 0x7f & ~((1 << M) - 1) : 0x7f;  // infinity (e5m2) or NaN (e4m3fn)
-+        if constexpr (HAS_INF) {
-+            v_if(magnitude == top) { bits = 0x7f800000; }
-+            v_endif;
-+        }
-+        v_if(magnitude > top - (HAS_INF ? 0 : 1)) { bits = 0x7fc00000; }
-+        v_endif;
-+        // The sign goes on the bits, so that -0 stays negative zero.
-+        sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>() = bits | sfpi::shft(code & 0x80, 24);
-+        sfpi::dst_reg++;
-+    }
-+}
-+
-+// Float32 to float8 bytes, rounded to nearest even with subnormals kept, as PyTorch and XLA convert:
-+// values past the largest finite one become NaN (e4m3fn) or infinity (e5m2).
-+template <int M, int BIAS, bool HAS_INF>
-+inline void calculate_fp32_to_fp8() {
-+    for (int d = 0; d < 8; d++) {
-+        const sfpi::vUInt input = sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>();
-+        sfpi::vInt magnitude = sfpi::as<sfpi::vInt>(input & 0x7fffffff);
-+        // NaNs as infinity, which keeps the sums below from overflowing.
-+        v_if(magnitude > 0x7f800000) { magnitude = 0x7f800000; }
-+        v_endif;
-+        // Subnormal results: the significand in units of the smallest subnormal, 2^(1 - BIAS - M). Both
-+        // results round to nearest even as x + (half - 1) + (the kept bits' last bit), shifted.
-+        sfpi::vInt shift = (151 - BIAS - M) - sfpi::shft(magnitude, -23);
-+        v_if(shift > 31) { shift = 31; }
-+        v_endif;
-+        const sfpi::vInt significand = (magnitude & 0x7fffff) | 0x800000;
-+        const sfpi::vInt subnormal = sfpi::shft(
-+            significand + (sfpi::shft(sfpi::vInt(1), shift - 1) - 1) + (sfpi::shft(significand, 0 - shift) & 1),
-+            0 - shift);
-+        // Normal results: the mantissa rounded to M bits and the exponent rebiased (a carry out of the
-+        // mantissa increments it).
-+        constexpr int dropped = 23 - M;
-+        sfpi::vInt code = sfpi::shft(magnitude + (sfpi::shft(magnitude, -dropped) & 1) + ((1 << (dropped - 1)) - 1),
-+                                     -dropped) -
-+                          ((127 - BIAS) << M);
-+        v_if(magnitude < ((128 - BIAS) << 23)) { code = subnormal; }
-+        v_endif;
-+        // Past the largest finite value: NaN (e4m3fn) or infinity (e5m2).
-+        constexpr int top = HAS_INF ? 0x7f & ~((1 << M) - 1) : 0x7f;
-+        v_if(code > top) { code = top; }
-+        v_endif;
-+        const sfpi::vUInt bits = sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>();
-+        if constexpr (HAS_INF) {
-+            v_if(sfpi::as<sfpi::vInt>(bits & 0x7fffffff) > 0x7f800000) { code = 0x7f; }
-+            v_endif;
-+        }
-+        sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>() = sfpi::as<sfpi::vUInt>(code) | (sfpi::shft(bits, -24) & 0x80);
-+        sfpi::dst_reg++;
-+    }
-+}
-+
-+}  // namespace ckernel::sfpu
-+
-+template <bool DECODE, int M, int BIAS, bool HAS_INF>
-+inline void fp8_typecast_tile(uint32_t idst) {
-+    if constexpr (DECODE) {
-+        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_fp8_to_fp32, (M, BIAS, HAS_INF), idst, VectorMode::RC);
-+    } else {
-+        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_fp32_to_fp8, (M, BIAS, HAS_INF), idst, VectorMode::RC);
-+    }
-+}
-+#endif
++#include "ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/float8_sfpu.h"
 +
 +// Float8 (Fp8_e4m3 or Lf8) <-> Float32, exactly.
 +template <uint32_t InDF, uint32_t OutDF, ckl::Dst Slot>
@@ -109,7 +24,7 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/eltwise
  void kernel_main() {
      constexpr uint32_t per_core_block_cnt = get_arg(args::per_core_block_cnt);
      constexpr uint32_t per_core_block_dim = get_arg(args::per_core_block_dim);
-@@ -26,6 +127,13 @@
+@@ -26,6 +42,13 @@
          ckl::input(dfb::in, ckl::WaitPolicy::PerTile, ckl::PopPolicy::PerTile, ckl::DataFormatReconfig::Disabled);
      constexpr auto output = ckl::output(
          dfb::out, ckl::ReservePolicy::PerOuter, ckl::PushPolicy::PerOuter, ckl::DataFormatReconfig::Disabled);
@@ -181,3 +96,100 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/ope
      bool bfp8_pack_precise = (output_dtype == DataType::BFLOAT8_B);
      auto output_memory_config = optional_output_tensor.has_value()
                                      ? optional_output_tensor.value().memory_config()
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/float8_sfpu.h ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/float8_sfpu.h
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/float8_sfpu.h
+@@ -0,0 +1,92 @@
++// SPDX-License-Identifier: Apache-2.0
++//
++// Exact float8 <-> float32 conversions on the SFPU, shared by ttnn.typecast and
++// libtt's quantize_rows. Float8 codes sit zero-extended in the 32-bit DST.
++#pragma once
++
++#ifdef TRISC_MATH
++#include "llk_math_eltwise_unary_sfpu_macros.h"
++
++namespace ckernel::sfpu {
++
++// Float8 bytes (UInt8 tiles, zero-extended in the 32-bit DST) to float32, exactly: M mantissa bits,
++// exponent bias BIAS, and either infinities (e5m2) or only NaN at the top code (e4m3fn).
++template <int M, int BIAS, bool HAS_INF>
++inline void calculate_fp8_to_fp32() {
++    for (int d = 0; d < 8; d++) {
++        const sfpi::vUInt code = sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>();
++        const sfpi::vInt magnitude = sfpi::as<sfpi::vInt>(code & 0x7f);
++        // A normal value's exponent and mantissa, moved into float32's fields and rebiased.
++        sfpi::vUInt bits = sfpi::as<sfpi::vUInt>(sfpi::shft(magnitude, 23 - M) + ((127 - BIAS) << 23));
++        v_if(magnitude < (1 << M)) {
++            // A subnormal value: its mantissa times the smallest subnormal.
++            const sfpi::vFloat value = sfpi::convert<sfpi::vFloat>(magnitude, sfpi::RoundMode::Nearest) *
++                                       __builtin_ldexpf(1.0f, 1 - BIAS - M);
++            bits = sfpi::as<sfpi::vUInt>(value);
++        }
++        v_endif;
++        constexpr int top = HAS_INF ? 0x7f & ~((1 << M) - 1) : 0x7f;  // infinity (e5m2) or NaN (e4m3fn)
++        if constexpr (HAS_INF) {
++            v_if(magnitude == top) { bits = 0x7f800000; }
++            v_endif;
++        }
++        v_if(magnitude > top - (HAS_INF ? 0 : 1)) { bits = 0x7fc00000; }
++        v_endif;
++        // The sign goes on the bits, so that -0 stays negative zero.
++        sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>() = bits | sfpi::shft(code & 0x80, 24);
++        sfpi::dst_reg++;
++    }
++}
++
++// Float32 to float8 bytes, rounded to nearest even with subnormals kept, as PyTorch and XLA convert:
++// values past the largest finite one become NaN (e4m3fn) or infinity (e5m2).
++template <int M, int BIAS, bool HAS_INF, int ITERATIONS = 8>
++inline void calculate_fp32_to_fp8() {
++    for (int d = 0; d < ITERATIONS; d++) {
++        const sfpi::vUInt input = sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>();
++        sfpi::vInt magnitude = sfpi::as<sfpi::vInt>(input & 0x7fffffff);
++        // NaNs as infinity, which keeps the sums below from overflowing.
++        v_if(magnitude > 0x7f800000) { magnitude = 0x7f800000; }
++        v_endif;
++        // Subnormal results: the significand in units of the smallest subnormal, 2^(1 - BIAS - M). Both
++        // results round to nearest even as x + (half - 1) + (the kept bits' last bit), shifted.
++        sfpi::vInt shift = (151 - BIAS - M) - sfpi::shft(magnitude, -23);
++        v_if(shift > 31) { shift = 31; }
++        v_endif;
++        const sfpi::vInt significand = (magnitude & 0x7fffff) | 0x800000;
++        const sfpi::vInt subnormal = sfpi::shft(
++            significand + (sfpi::shft(sfpi::vInt(1), shift - 1) - 1) + (sfpi::shft(significand, 0 - shift) & 1),
++            0 - shift);
++        // Normal results: the mantissa rounded to M bits and the exponent rebiased (a carry out of the
++        // mantissa increments it).
++        constexpr int dropped = 23 - M;
++        sfpi::vInt code = sfpi::shft(magnitude + (sfpi::shft(magnitude, -dropped) & 1) + ((1 << (dropped - 1)) - 1),
++                                     -dropped) -
++                          ((127 - BIAS) << M);
++        v_if(magnitude < ((128 - BIAS) << 23)) { code = subnormal; }
++        v_endif;
++        // Past the largest finite value: NaN (e4m3fn) or infinity (e5m2).
++        constexpr int top = HAS_INF ? 0x7f & ~((1 << M) - 1) : 0x7f;
++        v_if(code > top) { code = top; }
++        v_endif;
++        const sfpi::vUInt bits = sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>();
++        if constexpr (HAS_INF) {
++            v_if(sfpi::as<sfpi::vInt>(bits & 0x7fffffff) > 0x7f800000) { code = 0x7f; }
++            v_endif;
++        }
++        sfpi::dst_reg[0].mode<sfpi::DataLayout::U32>() = sfpi::as<sfpi::vUInt>(code) | (sfpi::shft(bits, -24) & 0x80);
++        sfpi::dst_reg++;
++    }
++}
++
++}  // namespace ckernel::sfpu
++
++template <bool DECODE, int M, int BIAS, bool HAS_INF>
++inline void fp8_typecast_tile(uint32_t idst) {
++    if constexpr (DECODE) {
++        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_fp8_to_fp32, (M, BIAS, HAS_INF), idst, VectorMode::RC);
++    } else {
++        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_fp32_to_fp8, (M, BIAS, HAS_INF), idst, VectorMode::RC);
++    }
++}
++#endif
