@@ -69,6 +69,9 @@ cc_shared_library(
     }),
     user_link_flags = select({
         "@platforms//os:linux": [
+            # Serialized executables only load into the build that wrote them,
+            # which the plugin tells by this ID.
+            "-Wl,--build-id=sha1",
             "-Wl,--exclude-libs,ALL",
             "-Wl,--version-script,$(location bazel/libtt_pjrt_exports.lds)",
         ],
