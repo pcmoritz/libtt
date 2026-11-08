@@ -10,12 +10,20 @@ backend runs (`sgl_jax/srt/hardware_backend/tt/attention/gdn_backend.py`):
   step per request, on the state pools in place;
 - an extend batch: the convolution in JAX and `tt.gated_delta_rule` over each
   request's tokens, the new states to the pools with `tt.state_pool_update`.
+  A mixed batch of decodes and extends runs as one, its decodes extends of one
+  token.
+
+Radix-cache snapshots (`track_indices`, `track_end`) also save a request's
+states after its tokens before `track_end` to a slot of their own: in an
+extend, from a second pass of the gated delta rule over only those tokens.
 
 The convolution kernel keeps a request's last three inputs as a BF16
 `[channels, 3]` slot, so `patch_mamba_pool` gives the pool that layout
 (SGLang-TorchTPU allocates `[slots, 3, 1, channels]` in FP32). The inputs are
-BF16 already, so the BF16 window loses nothing. The recurrent pool keeps
-SGLang-TorchTPU's `[slots, n_v, d_k, d_v]` FP32 layout, the kernels' own.
+BF16 already, so the BF16 window loses nothing. A pool that `patch_mamba_pool`
+didn't lay out keeps SGLang-TorchTPU's layout, into which each call converts
+the windows back. The recurrent pool keeps SGLang-TorchTPU's
+`[slots, n_v, d_k, d_v]` FP32 layout, the kernels' own.
 Slot 0 is the reserved null slot of padding rows: the kernels never write it,
 and nothing reads it unmasked.
 """
@@ -94,12 +102,19 @@ def _write_rows(pool, slots, rows):
     return pool
 
 
-def _extend(conv, recurrent, qkv, b, a, weight, a_log, dt_bias, starts, slots, initial, heads):
+def _extend(
+    conv, recurrent, qkv, b, a, weight, a_log, dt_bias, starts, slots, initial, heads, snapshots=None
+):
     """Each request's tokens in turn, packed in qkv from starts[i] to starts[i + 1].
 
     As SGLang-JAX's prefill on Tenstorrent: the convolution in JAX over the
     request's saved window and its tokens, then TTNN's chunked gated delta rule
     over each request's tokens as a row of `width` positions.
+
+    `snapshots`, (slots, lengths), also saves each request's states after its
+    first lengths[i] tokens to slots[i], for SGLang's radix cache (slot 0 for
+    none): the window before them, and the recurrent state of a second pass
+    over only those tokens.
     """
     import jax
     import jax.numpy as jnp
@@ -129,10 +144,15 @@ def _extend(conv, recurrent, qkv, b, a, weight, a_log, dt_bias, starts, slots, i
             for tap in range(taps)
         )
     )
-    tail = lengths[:, None] + jnp.arange(taps - 1)
-    tail += jnp.arange(batch)[:, None] * history.shape[1]
-    tail = history.reshape(-1, history.shape[-1]).at[tail].get(mode="clip")
-    conv = _write_rows(conv, slots, tail.swapaxes(-1, -2))
+    def window(ends):
+        # The taps - 1 inputs before each request's ends[i]th token.
+        tail = ends[:, None] + jnp.arange(taps - 1)
+        tail += jnp.arange(batch)[:, None] * history.shape[1]
+        return history.reshape(-1, history.shape[-1]).at[tail].get(mode="clip").swapaxes(-1, -2)
+
+    if snapshots is not None:
+        conv = _write_rows(conv, snapshots[0], window(snapshots[1]))
+    conv = _write_rows(conv, slots, window(lengths))
 
     key_dim = n_kq * d_k
     qk = convolved[..., : 2 * key_dim].reshape(batch, width, 2 * n_kq, d_k)
@@ -142,19 +162,31 @@ def _extend(conv, recurrent, qkv, b, a, weight, a_log, dt_bias, starts, slots, i
     gate = -jnp.exp(a_log.astype(jnp.float32)) * jax.nn.softplus(
         pack(a).astype(jnp.float32) + dt_bias.astype(jnp.float32)
     )
-    # Zero beta and log decay keep the state past a request's tokens; zero
-    # queries zero their output.
-    q = jnp.where(valid[..., None, None], q * d_k**-0.5, 0)
-    beta, gate = (jnp.where(valid[..., None], x, 0) for x in (beta, gate))
     # The kernel lets each q/k head serve its group of value heads.
-    state, out = jax.ffi.ffi_call(
+    rule = jax.ffi.ffi_call(
         "tt.gated_delta_rule",
         (
             jax.ShapeDtypeStruct((batch, n_v, d_k, d_v), jnp.float32),
             jax.ShapeDtypeStruct(v.shape, jnp.float32),
         ),
         vmap_method="sequential",
-    )(q, k, v, gate, beta, saved(recurrent).astype(jnp.float32))
+    )
+
+    def masked(valid):
+        # Zero beta and log decay keep the state past a request's tokens;
+        # zero queries zero their output.
+        return (
+            jnp.where(valid[..., None, None], q * d_k**-0.5, 0),
+            k,
+            v,
+            *(jnp.where(valid[..., None], x, 0) for x in (gate, beta)),
+            saved(recurrent).astype(jnp.float32),
+        )
+
+    if snapshots is not None:
+        snapshot, _ = rule(*masked(jnp.arange(width) < snapshots[1][:, None]))
+        recurrent = _write_rows(recurrent, snapshots[0], snapshot)
+    state, out = rule(*masked(valid))
     recurrent = _write_rows(recurrent, slots, state)
 
     out = out.reshape(-1, n_v, d_v)
@@ -195,6 +227,7 @@ def fused_conv1d_gdn(
     batched_only=False,
     prefill_only=False,
     track_indices=None,
+    track_end=None,
     packed_weights=None,
     **_options,  # the Pallas kernel's tiling and precision options
 ):
@@ -209,12 +242,15 @@ def fused_conv1d_gdn(
         )
     if num_spec_tokens:
         raise NotImplementedError("speculative verify windows need the Pallas kernel")
-    if any(x is not None for x in (state_source, track_indices, packed_weights)):
-        raise NotImplementedError(
-            "state sources, prefix-cache snapshots and packed weights need the Pallas kernel"
-        )
-    if batched_only == prefill_only:
-        raise NotImplementedError("mixed decode and extend batches need the Pallas kernel")
+    if state_source is not None or packed_weights is not None:
+        raise NotImplementedError("state sources and packed weights need the Pallas kernel")
+    # SGLang-TorchTPU's own layout, [slots, kernel_size - 1, (1,) channels], in a
+    # pool that patch_mamba_pool didn't lay out, such as a test's.
+    own_layout = conv_state.shape[1] == kernel_size - 1
+    if own_layout:
+        own_shape, own_dtype = conv_state.shape, conv_state.dtype
+        conv_state = conv_state.reshape(own_shape[0], kernel_size - 1, -1).swapaxes(1, 2)
+        conv_state = conv_state.astype(jnp.bfloat16)
     if conv_state.shape[1:] != (qkv.shape[1], kernel_size - 1):
         raise NotImplementedError(f"conv state of shape {conv_state.shape}; see patch_mamba_pool")
 
@@ -231,10 +267,21 @@ def fused_conv1d_gdn(
         b, a = b.astype(jnp.float32), a.astype(jnp.float32)
     a_log, dt_bias = a_log.astype(jnp.float32), dt_bias.astype(jnp.float32)
 
-    if prefill_only:
+    # Radix-cache snapshots: each request's states after the tokens before
+    # track_end, to its track slot (slot 0, never written, for none).
+    snapshots = None
+    if track_indices is not None:
+        tracked = live & (track_end >= 0)
+        snapshots = (
+            jnp.where(tracked, track_indices, 0).astype(jnp.int32),
+            jnp.where(tracked, track_end - starts[:-1], 0),
+        )
+
+    if not batched_only:
+        # A mixed batch's decodes are extends of one token.
         conv_state, recurrent_state, out = _extend(
             conv_state, recurrent_state, qkv, b, a, weight, a_log, dt_bias, starts, slots, initial,
-            (n_kq, n_v, d_k, d_v),
+            (n_kq, n_v, d_k, d_v), snapshots,
         )
     elif tokens != batch:
         raise NotImplementedError("decode batches of one token per request")
@@ -242,6 +289,12 @@ def fused_conv1d_gdn(
         conv_state, recurrent_state, out = _decode(
             conv_state, recurrent_state, qkv, b, a, weight, a_log, dt_bias, slots, initial
         )
+        if snapshots is not None:
+            # After its one token, a request's states are its slot's.
+            conv_state = _write_rows(conv_state, snapshots[0], conv_state[slots])
+            recurrent_state = _write_rows(recurrent_state, snapshots[0], recurrent_state[slots])
+    if own_layout:
+        conv_state = conv_state.swapaxes(1, 2).reshape(own_shape).astype(own_dtype)
     return (conv_state, recurrent_state), out.astype(dtype).reshape(tokens, n_v * d_v)
 
 

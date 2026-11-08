@@ -20,7 +20,8 @@ prefill runs TTNN's chunked paged attention the same way, one sequence per
 user, so it reads only each sequence's pages.
 
 Hybrid models' gated DeltaNet kernel runs on libtt's recurrent kernels, with
-the recurrent-state pool in their layout (`sglang_tpu_gdn`).
+the recurrent-state pool in their layout (`sglang_tpu_gdn`), and the pool's
+slot copies for radix-cache copy-on-write are a scatter.
 """
 
 # Users per TTNN paged decode attention call.
@@ -33,6 +34,7 @@ KV_POOL_MODULE = "sglang_tpu.kv_pool"
 FP8_LINEAR_SMALL_M_MODULE = "sglang_tpu.kernels.fp8_linear_small_m"
 GDN_MODULE = "sglang_tpu.attention.pallas.gdn"
 MAMBA_POOL_MODULE = "sglang_tpu.mamba_pool"
+MAMBA_STATE_COPY_MODULE = "sglang_tpu.mamba_state_copy"
 
 
 def _ragged_paged_attention(module):
@@ -415,10 +417,50 @@ def patch_mamba_pool(module):
     sglang_tpu_gdn.patch_mamba_pool(module)
 
 
+def patch_mamba_state_copy(module):
+    """The recurrent-state pools' slot copies of radix-cache copy-on-write, as
+    `compiled_state_copy` makes them, with a scatter for the Pallas kernel's DMAs."""
+    import functools
+
+    @functools.cache
+    def compiled_state_copy():
+        import jax
+        import jax.numpy as jnp
+        import torch
+        from torch_tpu._internal import pallas
+
+        # jax_op reads the annotations.
+        def copy_slots(
+            pool: jax.Array, src: jax.Array, dst: jax.Array, count: jax.Array
+        ) -> tuple[jax.Array, jax.Array]:
+            # Padded pairs write nothing: their destinations are out of bounds.
+            live = jnp.arange(src.shape[0]) < count[0]
+            target = jnp.where(live, dst, pool.shape[0])
+            return pool.at[target].set(pool[src], mode="drop"), src[0]
+
+        op = pallas.jax_op("libtt::mamba_state_copy", copy_slots, donate_argnums=(0,))
+
+        @op.register_fake
+        def fake(pool, src, dst, count):
+            return torch.empty_like(pool), src.new_empty(())
+
+        @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+        def run(pools, src, dst, count):
+            for pool in pools:
+                result, marker = op(pool, src, dst, count)
+                pool.copy_(result)
+            return marker
+
+        return run
+
+    module.compiled_state_copy = compiled_state_copy
+
+
 PATCHES = {
     RPA_V3_MODULE: patch_rpa_v3,
     KV_POOL_MODULE: patch_kv_pool,
     FP8_LINEAR_SMALL_M_MODULE: patch_fp8_linear_small_m,
     GDN_MODULE: patch_gdn,
     MAMBA_POOL_MODULE: patch_mamba_pool,
+    MAMBA_STATE_COPY_MODULE: patch_mamba_state_copy,
 }

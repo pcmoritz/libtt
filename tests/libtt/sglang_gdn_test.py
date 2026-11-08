@@ -2,7 +2,9 @@
 
 `fused_conv1d_gdn` against a NumPy recurrence, with the pools in the layout
 `patch_mamba_pool` gives them: a decode batch with a fresh request and a
-padding row, and ragged extend batches with fresh and continuing requests.
+padding row, ragged extend batches with fresh and continuing requests, and a
+mixed batch with radix-cache snapshots; and with SGLang-TorchTPU's own pool
+layout.
 """
 
 import jax
@@ -115,3 +117,36 @@ def test_extend(lens, slots, seq_lens, tokens):
     # The chunked kernel takes q, k and v in BFLOAT16.
     check(got, expected, atol=1e-2, rtol=0.05)
     assert not np.any(got[2][starts[live]:])
+
+
+def test_mixed_batch_with_snapshots():
+    """A decode and an extend in one batch, as SGLang's general mode runs them, with radix-cache
+    snapshots: the decode's states after its token and the extend's after its first 32 tokens, to
+    their track slots. A disabled snapshot writes nothing."""
+    qkv, b, a, conv, recurrent, weight, a_log, dt_bias = args = inputs(64, seed=3)
+    # Row 0 decodes slot 3, row 1 extends fresh slot 8 by 40 tokens, row 2 pads.
+    starts = np.array([0, 1, 41, 41], np.int32)
+    got = run(*args, starts, np.array([3, 8, 0], np.int32), np.array([1, 1, 2], np.int32),
+              np.array([5, 40, 0], np.int32), track_indices=np.array([9, 10, 11], np.int32),
+              track_end=np.array([1, 33, -1], np.int32))
+    expected = reference(*args, [([0], 3, True), (range(1, 41), 8, False)])
+    prefix = reference(*args, [(range(1, 33), 8, False)])
+    for pool, after_prefix in zip(expected[:2], prefix):
+        pool[9], pool[10] = pool[3], after_prefix[8]
+    check(got, expected, atol=1e-2, rtol=0.05)
+    for got_pool, original in zip(got, (conv, recurrent)):
+        np.testing.assert_array_equal(got_pool[11], np.asarray(original[11], np.float64))
+
+
+def test_sglang_conv_layout():
+    """A pool that patch_mamba_pool didn't lay out, such as SGLang-TorchTPU's tests' own, keeps
+    SGLang's [slots, taps - 1, channels] conv windows."""
+    qkv, b, a, conv, recurrent, weight, a_log, dt_bias = args = inputs(64, seed=4)
+    batch = (np.array([0, 20, 50, 50], np.int32), np.array([3, 8, 0], np.int32),
+             np.array([0, 0, 2], np.int32), np.array([20, 41, 0], np.int32))
+    patched = run(*args, *batch, prefill_only=True)
+    own = run(qkv, b, a, np.asarray(conv, np.float32).swapaxes(1, 2), recurrent, weight, a_log, dt_bias,
+              *batch, prefill_only=True)
+    np.testing.assert_array_equal(own[0].swapaxes(1, 2), patched[0])
+    np.testing.assert_array_equal(own[1], patched[1])
+    np.testing.assert_array_equal(own[2], patched[2])
