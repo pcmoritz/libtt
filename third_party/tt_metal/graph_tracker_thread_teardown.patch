@@ -1,0 +1,233 @@
+diff --git tt_metal/api/tt-metalium/graph_tracking.hpp tt_metal/api/tt-metalium/graph_tracking.hpp
+--- tt_metal/api/tt-metalium/graph_tracking.hpp
++++ tt_metal/api/tt-metalium/graph_tracking.hpp
+@@ -165,6 +165,7 @@ public:
+     // NOLINTBEGIN(cppcoreguidelines-missing-std-forward)
+     template <class... Args>
+     void track_function_start(std::string_view function_name, Args&&... args) {
++        auto& processors = thread_state().processors;
+         if (processors.empty()) {
+             return;
+         }
+@@ -178,6 +179,7 @@ public:
+ 
+     // Track op that doesn't return anything
+     void track_function_end() {
++        auto& processors = thread_state().processors;
+         if (processors.empty()) {
+             return;
+         }
+@@ -188,6 +190,7 @@ public:
+ 
+     template <class ReturnType>
+     void track_function_end(ReturnType& output_tensors) {
++        auto& processors = thread_state().processors;
+         if (processors.empty()) {
+             return;
+         }
+@@ -223,8 +226,11 @@ private:
+     ~GraphTracker() = default;
+ 
+     // Per-thread state. See the class-level threading contract above.
+-    static thread_local std::vector<std::shared_ptr<IGraphProcessor>> processors;
+-    static thread_local std::shared_ptr<IGraphHooks> hook;
++    struct ThreadState {
++        std::vector<std::shared_ptr<IGraphProcessor>> processors;
++        std::shared_ptr<IGraphHooks> hook;
++    };
++    static ThreadState& thread_state();
+ 
+     std::mutex hooked_buffers_mutex;
+     std::unordered_set<const Buffer*> hooked_buffers;
+diff --git tt_metal/impl/graph/graph_tracking.cpp tt_metal/impl/graph/graph_tracking.cpp
+--- tt_metal/impl/graph/graph_tracking.cpp
++++ tt_metal/impl/graph/graph_tracking.cpp
+@@ -20,8 +20,28 @@
+ 
+ namespace tt::tt_metal {
+ 
+-thread_local std::vector<std::shared_ptr<IGraphProcessor>> GraphTracker::processors;
+-thread_local std::shared_ptr<IGraphHooks> GraphTracker::hook;
++GraphTracker::ThreadState& GraphTracker::thread_state() {
++    // Deleted by an owner at thread exit, not destroyed with the thread's
++    // other thread-local objects: those are destroyed in the reverse order of
++    // their first use, so one first used before this state, such as a
++    // framework's cache of device buffers, can free buffers after it is gone.
++    // Such a late use gets a new, empty state, which the thread leaves behind.
++    thread_local ThreadState* state = nullptr;
++    if (state == nullptr) {
++        state = new ThreadState();
++        struct Owner {
++            ~Owner() {
++                // Nulled first: a processor's destructor that calls back gets
++                // a new state, not the one being deleted.
++                ThreadState* deleted = state;
++                state = nullptr;
++                delete deleted;
++            }
++        };
++        thread_local Owner owner;
++    }
++    return *state;
++}
+ 
+ nlohmann::json IGraphProcessor::end_capture() { return nullptr; }
+ 
+@@ -31,19 +51,23 @@ GraphTracker& GraphTracker::instance() {
+ }
+ 
+ bool GraphTracker::is_enabled() const {
++    auto& processors = thread_state().processors;
+     return std::any_of(processors.begin(), processors.end(), [](const auto& p) { return p->is_capture_processor(); });
+ }
+ 
+ void GraphTracker::push_processor(const std::shared_ptr<IGraphProcessor>& new_processor) {
++    auto& processors = thread_state().processors;
+     processors.push_back(new_processor);
+ }
+ 
+ void GraphTracker::pop_processor() {
++    auto& processors = thread_state().processors;
+     TT_ASSERT(not processors.empty(), "No processor to pop");
+     processors.pop_back();
+ }
+ 
+ bool GraphTracker::add_hook(const std::shared_ptr<IGraphHooks>& new_hook) {
++    auto& hook = thread_state().hook;
+     if (hook) {
+         return false;
+     }
+@@ -52,6 +76,7 @@ bool GraphTracker::add_hook(const std::shared_ptr<IGraphHooks>& new_hook) {
+ }
+ 
+ void GraphTracker::track_allocate(const Buffer* buffer) {
++    auto& processors = thread_state().processors;
+     if (processors.empty()) {
+         return;
+     }
+@@ -61,6 +86,7 @@ void GraphTracker::track_allocate(const Buffer* buffer) {
+ }
+ 
+ void GraphTracker::track_deallocate(Buffer* buffer) {
++    auto& processors = thread_state().processors;
+     if (processors.empty()) {
+         return;
+     }
+@@ -75,6 +101,7 @@ void GraphTracker::track_allocate_cb(
+     uint64_t size,
+     bool is_globally_allocated,
+     const IDevice* device) {
++    auto& processors = thread_state().processors;
+     if (processors.empty()) {
+         return;
+     }
+@@ -85,6 +112,7 @@ void GraphTracker::track_allocate_cb(
+ 
+ void GraphTracker::track_allocate_dataflow_buffer(
+     const CoreRangeSet& core_range_set, uint64_t addr, uint64_t size, bool borrows_memory, const IDevice* device) {
++    auto& processors = thread_state().processors;
+     if (processors.empty()) {
+         return;
+     }
+@@ -95,6 +123,7 @@ void GraphTracker::track_allocate_dataflow_buffer(
+ 
+ void GraphTracker::track_allocate_scratchpad(
+     const CoreRangeSet& core_range_set, uint64_t addr, uint64_t size, const IDevice* device) {
++    auto& processors = thread_state().processors;
+     if (processors.empty()) {
+         return;
+     }
+@@ -104,6 +133,7 @@ void GraphTracker::track_allocate_scratchpad(
+ }
+ 
+ void GraphTracker::track_deallocate_cb(const IDevice* device) {
++    auto& processors = thread_state().processors;
+     if (processors.empty()) {
+         return;
+     }
+@@ -142,6 +172,7 @@ void track_program_l1(GraphTracker& tracker, detail::ProgramImpl& program, const
+ }  // namespace
+ 
+ void GraphTracker::track_program(Program* program, const IDevice* device) {
++    auto& processors = thread_state().processors;
+     TT_ASSERT(program);
+     TT_ASSERT(device);
+     if (processors.empty()) {
+@@ -158,6 +189,7 @@ void GraphTracker::track_program(Program* program, const IDevice* device) {
+ }
+ 
+ bool GraphTracker::hook_allocate(const Buffer* buffer) {
++    auto& hook = thread_state().hook;
+     if (hook == nullptr) {
+         return false;
+     }
+@@ -172,6 +204,7 @@ bool GraphTracker::hook_allocate(const Buffer* buffer) {
+ }
+ 
+ bool GraphTracker::hook_deallocate(Buffer* buffer) {
++    auto& hook = thread_state().hook;
+     if (hook == nullptr) {
+         return false;
+     }
+@@ -190,6 +223,7 @@ bool GraphTracker::hook_deallocate(Buffer* buffer) {
+ }
+ 
+ bool GraphTracker::hook_write_to_device(const tt::tt_metal::Buffer* buffer) {
++    auto& hook = thread_state().hook;
+     if (hook == nullptr) {
+         return false;
+     }
+@@ -197,6 +231,7 @@ bool GraphTracker::hook_write_to_device(const tt::tt_metal::Buffer* buffer) {
+ }
+ 
+ bool GraphTracker::hook_write_to_device(const tt::tt_metal::distributed::MeshBuffer* mesh_buffer) {
++    auto& hook = thread_state().hook;
+     if (hook == nullptr) {
+         return false;
+     }
+@@ -204,6 +239,7 @@ bool GraphTracker::hook_write_to_device(const tt::tt_metal::distributed::MeshBuf
+ }
+ 
+ bool GraphTracker::hook_read_from_device(tt::tt_metal::Buffer* buffer) {
++    auto& hook = thread_state().hook;
+     if (hook == nullptr) {
+         return false;
+     }
+@@ -211,6 +247,7 @@ bool GraphTracker::hook_read_from_device(tt::tt_metal::Buffer* buffer) {
+ }
+ 
+ bool GraphTracker::hook_read_from_device(const tt::tt_metal::distributed::MeshBuffer* mesh_buffer) {
++    auto& hook = thread_state().hook;
+     if (hook == nullptr) {
+         return false;
+     }
+@@ -218,22 +255,27 @@ bool GraphTracker::hook_read_from_device(const tt::tt_metal::distributed::MeshBu
+ }
+ 
+ bool GraphTracker::hook_program(tt::tt_metal::Program* program) {
++    auto& hook = thread_state().hook;
+     if (hook == nullptr) {
+         return false;
+     }
+     return hook->hook_program(program);
+ }
+ 
+-const std::vector<std::shared_ptr<IGraphProcessor>>& GraphTracker::get_processors() const { return processors; }
++const std::vector<std::shared_ptr<IGraphProcessor>>& GraphTracker::get_processors() const {
++    return thread_state().processors;
++}
+ 
+-const std::shared_ptr<IGraphHooks>& GraphTracker::get_hook() const { return hook; }
++const std::shared_ptr<IGraphHooks>& GraphTracker::get_hook() const { return thread_state().hook; }
+ 
+ void GraphTracker::clear() {
++    auto& processors = thread_state().processors;
+     processors.clear();
+     clear_hook();
+ }
+ 
+ void GraphTracker::clear_hook() {
++    auto& hook = thread_state().hook;
+     {
+         std::lock_guard<std::mutex> lock(hooked_buffers_mutex);
+         hooked_buffers.clear();
