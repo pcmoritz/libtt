@@ -8,7 +8,8 @@
 // L1 copy, and writes the batch out once. Every output page is owned by one
 // core, so duplicates apply in position order and the result is deterministic.
 // Position (b, m) and window offset j read source row (b * M + m) * W + j, or
-// source page b at column (m * W + j) * w.
+// source page b at column (m * W + j) * w. A column window wider than a chunk
+// (source_pieces) streams its source a chunk-sized piece at a time.
 
 #include <array>
 #include <cstdint>
@@ -39,6 +40,7 @@ void kernel_main() {
     constexpr uint32_t elem_kind = get_arg(args::elem_kind);
     constexpr uint32_t elem_bytes = get_arg(args::elem_bytes);
     constexpr uint32_t reduce = get_arg(args::reduce);
+    constexpr bool source_pieces = get_arg(args::source_pieces) != 0;
     constexpr uint32_t C = (page_bytes + chunk_bytes - 1) / chunk_bytes;
     constexpr std::array<uint32_t, K> sizes{ROWS_SIZES};
     constexpr std::array<uint32_t, K> windows{ROWS_WINDOWS};
@@ -98,7 +100,7 @@ void kernel_main() {
                 const uint32_t index_l1 =
                     stream_index(noc, index, indices, K, index_stride * sizeof(uint32_t), index_shared ? 0 : b, m0, n);
                 uint32_t source_l1 = 0;
-                if constexpr (column) {
+                if constexpr (column && !source_pieces) {
                     source_l1 = stream_chunk(noc, stream, source, b, m0 * source_bytes, n * source_bytes);
                 }
                 for (uint32_t i = 0; i < n; ++i) {
@@ -125,14 +127,22 @@ void kernel_main() {
                             // each chunk takes its part.
                             uint32_t offset = static_cast<uint32_t>(coords.c[K - 1]) * elem_bytes;
                             uint32_t src = source_l1 + (i * W + j) * column_bytes;
+                            // The window's bytes in source page b.
+                            uint32_t src_offset = (m * W + j) * column_bytes;
                             for (uint32_t left = column_bytes; left > 0;) {
                                 const uint32_t room = chunk_bytes - offset % chunk_bytes;
                                 const uint32_t bytes = left < room ? left : room;
                                 if (in_batch(row, offset, dst)) {
-                                    apply(dst, src, bytes);
+                                    if constexpr (source_pieces) {
+                                        apply(dst, stream_chunk(noc, stream, source, b, src_offset, bytes), bytes);
+                                        stream.pop_front(1);
+                                    } else {
+                                        apply(dst, src, bytes);
+                                    }
                                 }
                                 offset += bytes;
                                 src += bytes;
+                                src_offset += bytes;
                                 left -= bytes;
                             }
                             continue;
@@ -170,7 +180,7 @@ void kernel_main() {
                         noc.async_read_barrier();
                     }
                 }
-                if constexpr (column) {
+                if constexpr (column && !source_pieces) {
                     stream.pop_front(1);
                 }
                 index.pop_front(1);

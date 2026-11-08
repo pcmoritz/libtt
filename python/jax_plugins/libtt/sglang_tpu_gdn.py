@@ -8,6 +8,9 @@ backend runs (`sgl_jax/srt/hardware_backend/tt/attention/gdn_backend.py`):
 
 - a decode batch: `tt.causal_conv1d_update` and `tt.gated_delta_decode`, one
   step per request, on the state pools in place;
+- a speculative verify batch (`num_spec_tokens`): the same kernels taking one
+  step per token of each request's window, the states after each step to the
+  window's checkpoint slots;
 - an extend batch: the convolution in JAX and `tt.gated_delta_rule` over each
   request's tokens, the new states to the pools with `tt.state_pool_update`.
   A mixed batch of decodes and extends runs as one, its decodes extends of one
@@ -84,6 +87,65 @@ def _decode(conv, recurrent, qkv, b, a, weight, a_log, dt_bias, slots, initial):
         )
         outputs.append(out)
     return conv, recurrent, jnp.concatenate(outputs)
+
+
+def _verify_windows(conv, recurrent, qkv, b, a, weight, a_log, dt_bias, starts, slots, reads, initial, window):
+    """Speculative verify windows of up to `window` tokens per request, packed
+    in qkv from starts[i] to starts[i + 1].
+
+    Request i reads its states from slot reads[i] (zeros without initial) and
+    writes the states after its token t to slot slots[i] + t, so that the next
+    step can continue from any accepted prefix. Returns both pools and the
+    output, [T, n_v, d_v].
+    """
+    import jax
+    import jax.numpy as jnp
+
+    tokens = qkv.shape[0]
+    batch = slots.shape[0]
+    step = jnp.arange(window, dtype=jnp.int32)
+    valid = step < (starts[1:] - starts[:-1])[:, None]
+    targets = jnp.where(valid, slots[:, None] + step, 0).astype(jnp.int32)
+    positions = jnp.minimum(starts[:-1, None] + step, tokens - 1).reshape(-1)
+    qkv, b, a = (x[positions] for x in (qkv, b, a))
+    # The kernels take up to 32 rows, a step of a request each.
+    per_call = max(1, 32 // window)
+    outputs = []
+    for start in range(0, batch, per_call):
+        reqs = slice(start, start + per_call)
+        rows = slice(start * window, (start + per_call) * window)
+        conv, convolved = _recurrent_call(
+            "tt.causal_conv1d_update",
+            conv,
+            jax.ShapeDtypeStruct(qkv[rows].shape, jnp.float32),
+            qkv[rows],
+            weight,
+            reads[reqs],
+            initial[reqs],
+            targets[reqs],
+        )
+        recurrent, out = _recurrent_call(
+            "tt.gated_delta_decode",
+            recurrent,
+            jax.ShapeDtypeStruct((*b[rows].shape, recurrent.shape[-1]), jnp.float32),
+            convolved,
+            b[rows],
+            a[rows],
+            a_log,
+            dt_bias,
+            reads[reqs],
+            initial[reqs],
+            targets[reqs],
+        )
+        outputs.append(out)
+    out = jnp.concatenate(outputs)
+    # Back to packed order; a token past starts[-1] gets zeros.
+    token = jnp.arange(tokens)
+    # A compare and sum: searchsorted lowers to a loop.
+    sequence = jnp.minimum(jnp.sum(token[:, None] >= starts[None, 1:], axis=1), batch - 1)
+    out = out.at[sequence * window + token - starts[sequence]].get(mode="clip")
+    out = jnp.where((token < starts[-1])[:, None, None], out, 0)
+    return conv, recurrent, out
 
 
 def _write_rows(pool, slots, rows):
@@ -240,8 +302,11 @@ def fused_conv1d_gdn(
         raise NotImplementedError(
             "libtt's GDN kernels take 128-wide heads and a four-tap convolution without bias"
         )
-    if num_spec_tokens:
-        raise NotImplementedError("speculative verify windows need the Pallas kernel")
+    if num_spec_tokens and not (batched_only and _verify):
+        raise NotImplementedError("speculative extend batches and verify without read offsets need the Pallas kernel")
+    if num_spec_tokens and track_indices is not None:
+        # As in the Pallas kernel.
+        raise NotImplementedError("radix-cache snapshots of speculative verify windows")
     if state_source is not None or packed_weights is not None:
         raise NotImplementedError("state sources and packed weights need the Pallas kernel")
     # SGLang-TorchTPU's own layout, [slots, kernel_size - 1, (1,) channels], in a
@@ -277,7 +342,14 @@ def fused_conv1d_gdn(
             jnp.where(tracked, track_end - starts[:-1], 0),
         )
 
-    if not batched_only:
+    if num_spec_tokens:
+        # A verify batch's windows read row state_indices + read_offsets.
+        reads = jnp.where(live, slots + _verify[0].astype(jnp.int32), 0)
+        conv_state, recurrent_state, out = _verify_windows(
+            conv_state, recurrent_state, qkv, b, a, weight, a_log, dt_bias, starts, slots, reads, initial,
+            num_spec_tokens + 1,
+        )
+    elif not batched_only:
         # A mixed batch's decodes are extends of one token.
         conv_state, recurrent_state, out = _extend(
             conv_state, recurrent_state, qkv, b, a, weight, a_log, dt_bias, starts, slots, initial,

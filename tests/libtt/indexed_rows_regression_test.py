@@ -414,6 +414,25 @@ def test_dynamic_update_slice_unsigned_starts():
         want[min(b, 3), min(s, 15)] = update[0, 0]
         assert_equal(got, want)
 
+@pytest.mark.parametrize("shape,window", [((1, 993280), 248320), ((4, 70000), 40000)])
+def test_dynamic_update_slice_wide_columns(shape, window):
+    # A window of columns wider than the kernels' 64 KiB chunks, as torch_tpu
+    # writes a divided [248320] logits row back into the flattened [4, 248320]
+    # logits: the source streams in pieces.
+    rng = np.random.default_rng(21)
+    table = rng.normal(size=shape).astype(np.float32)
+    update = rng.normal(size=(1, window)).astype(np.float32)
+
+    def write(table, update, row, column):
+        return jax.lax.dynamic_update_slice(table, update, (row, column))
+
+    for row, column in ((0, 0), (shape[0] - 1, shape[1] - window), (0, 1000)):
+        got = run(write, table, update, np.int32(row), np.int32(column))
+        want = np.array(table)
+        want[row, column : column + window] = update[0]
+        assert_equal(got, want)
+
+
 @pytest.mark.parametrize("trace", [False, True])
 def test_dynamic_slice(trace):
     # Slices at computed starts, clamped so the window lies in the operand:
