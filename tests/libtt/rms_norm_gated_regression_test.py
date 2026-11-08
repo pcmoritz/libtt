@@ -38,6 +38,10 @@ def reference(x, z, w):
         (1, 12, 128),
         # Narrower heads, rows across tile rows.
         (70, 64),
+        # A speculative verify of four requests' 4-token windows, and a
+        # 256-token prefill chunk.
+        (16 * 12, 128),
+        (256 * 12, 128),
     ],
 )
 def test_rms_norm_gated(trace, shape, tmp_path):

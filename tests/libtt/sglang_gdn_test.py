@@ -138,3 +138,19 @@ def test_verify():
     expected = reference(*args, [(range(0, 4), 3, True, [2, 3, 4, 5]), (range(4, 8), 7, True, [7, 8, 9, 10])])
     check(got, expected, atol=2e-3, rtol=0.05)
     assert not np.any(got[2][8:])
+
+
+def test_verify_ragged_windows():
+    # Windows of up to four tokens: the first request verifies three, the
+    # second four, the third row pads, and five padding tokens follow. Each
+    # token's output lands at its packed row; the rows after the last request
+    # are zeros.
+    qkv, b, a, conv, recurrent, weight, a_log, dt_bias = args = inputs(12, seed=5)
+    starts = np.array([0, 3, 7, 7], np.int32)
+    slots = np.array([2, 7, 0], np.int32)
+    read_offsets = np.array([1, 0, 0], np.int32)
+    got = run(*args, starts, slots, np.array([2, 2, 2], np.int32), np.array([20, 9, 0], np.int32), read_offsets,
+              batched_only=True, num_spec_tokens=3)
+    expected = reference(*args, [(range(0, 3), 3, True, [2, 3, 4]), (range(3, 7), 7, True, [7, 8, 9, 10])])
+    check(got, expected, atol=2e-3, rtol=0.05)
+    assert not np.any(got[2][7:])

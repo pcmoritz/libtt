@@ -81,7 +81,7 @@ def _decode(conv, recurrent, qkv, b, a, weight, a_log, dt_bias, slots, initial):
     return conv, recurrent, jnp.concatenate(outputs)
 
 
-def _verify_windows(conv, recurrent, qkv, b, a, weight, a_log, dt_bias, starts, slots, reads, initial, window):
+def _verify_windows(conv, recurrent, qkv, b, a, weight, a_log, dt_bias, starts, slots, reads, initial, window, dtype):
     """Speculative verify windows of up to `window` tokens per request, packed
     in qkv from starts[i] to starts[i + 1].
 
@@ -130,14 +130,25 @@ def _verify_windows(conv, recurrent, qkv, b, a, weight, a_log, dt_bias, starts, 
             targets[reqs],
         )
         outputs.append(out)
-    out = jnp.concatenate(outputs)
-    # Back to packed order; a token past starts[-1] gets zeros.
-    token = jnp.arange(tokens)
-    # A compare and sum: searchsorted lowers to a loop.
-    sequence = jnp.minimum(jnp.sum(token[:, None] >= starts[None, 1:], axis=1), batch - 1)
-    out = out.at[sequence * window + token - starts[sequence]].get(mode="clip")
-    out = jnp.where((token < starts[-1])[:, None, None], out, 0)
-    return conv, recurrent, out
+    return conv, recurrent, _packed(jnp.concatenate(outputs), starts, valid, tokens, dtype)
+
+
+def _packed(rows, starts, valid, tokens, dtype):
+    """Request-major rows (row i * width + t: request i's token t, for the
+    `valid` ones) back to packed order, at row starts[i] + t, in `dtype`. Rows
+    no request's token lands on are zeros.
+
+    One scatter: gathering each packed row's window row instead needs each
+    token's request, a compare, sum and gather of its own on every layer. The
+    rows take the layer output's type first: the gated RMS norm after the
+    layer then reads them in it, while an FP32 scatter left a BF16 round trip
+    in front of the norm that kept it from fusing.
+    """
+    import jax.numpy as jnp
+
+    width = valid.shape[1]
+    dest = jnp.where(valid, starts[:-1, None] + jnp.arange(width), tokens).reshape(-1)
+    return jnp.zeros((tokens, *rows.shape[1:]), dtype).at[dest].set(rows.astype(dtype), mode="drop")
 
 
 def _write_rows(pool, slots, rows):
@@ -156,7 +167,7 @@ def _write_rows(pool, slots, rows):
     return pool
 
 
-def _extend(conv, recurrent, qkv, b, a, weight, a_log, dt_bias, starts, slots, initial, heads):
+def _extend(conv, recurrent, qkv, b, a, weight, a_log, dt_bias, starts, slots, initial, heads, dtype):
     """Each request's tokens in turn, packed in qkv from starts[i] to starts[i + 1].
 
     As SGLang-JAX's prefill on Tenstorrent: the convolution in JAX over the
@@ -221,12 +232,7 @@ def _extend(conv, recurrent, qkv, b, a, weight, a_log, dt_bias, starts, slots, i
 
     out = out.reshape(-1, n_v, d_v)
     if batch > 1:
-        # Back to packed order; a token past starts[-1] gets zeros.
-        token = jnp.arange(tokens)
-        # A compare and sum: searchsorted lowers to a loop.
-        sequence = jnp.minimum(jnp.sum(token[:, None] >= starts[None, 1:], axis=1), batch - 1)
-        out = out.at[sequence * width + token - starts[sequence]].get(mode="clip")
-        out = jnp.where((token < starts[-1])[:, None, None], out, 0)
+        out = _packed(out, starts, valid, tokens, dtype)
     return conv, recurrent, out
 
 
@@ -298,12 +304,12 @@ def fused_conv1d_gdn(
         reads = jnp.where(live, slots + _verify[0].astype(jnp.int32), 0)
         conv_state, recurrent_state, out = _verify_windows(
             conv_state, recurrent_state, qkv, b, a, weight, a_log, dt_bias, starts, slots, reads, initial,
-            num_spec_tokens + 1,
+            num_spec_tokens + 1, dtype,
         )
     elif prefill_only:
         conv_state, recurrent_state, out = _extend(
             conv_state, recurrent_state, qkv, b, a, weight, a_log, dt_bias, starts, slots, initial,
-            (n_kq, n_v, d_k, d_v),
+            (n_kq, n_v, d_k, d_v), dtype,
         )
     elif tokens != batch:
         raise NotImplementedError("decode batches of one token per request")
