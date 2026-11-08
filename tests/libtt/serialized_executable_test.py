@@ -38,6 +38,15 @@ def deserialize(payload, compile_options=None):
     return client.deserialize_executable(payload, xc.DeviceList(tuple(jax.devices("tt")[:1])), compile_options)
 
 
+def build_id_span(payload):
+    """Returns where the plugin's build ID is in a serialized executable."""
+    # JAX wraps the plugin's payload in IFRT's own header.
+    start = payload.find(b"TTSERv01")
+    offset, size = np.frombuffer(payload, np.uint64, 2, start + BUILD_ID_OFFSET)
+    begin = start + HEADER_SIZE + int(offset)
+    return slice(begin, begin + int(size))
+
+
 def compile_options(**overrides):
     options = xc.CompileOptions()
     options.env_option_overrides = list(overrides.items())
@@ -66,13 +75,19 @@ def test_executable_from_another_build_does_not_load():
     """Another build may lower the program differently, so loading its executable
     fails, and callers such as JAX's persistent cache compile it again."""
     payload = bytearray(serialize(jax.jit(lambda x: x + 1).lower(device_put(np.ones(32, np.float32))).compile()))
-    # JAX wraps the plugin's payload in IFRT's own header.
-    start = payload.find(b"TTSERv01")
-    build_id_offset, build_id_size = np.frombuffer(payload, np.uint64, 2, start + BUILD_ID_OFFSET)
-    assert build_id_size > 0
-    payload[start + HEADER_SIZE + int(build_id_offset)] ^= 0xFF
+    build_id = build_id_span(payload)
+    assert build_id.stop > build_id.start
+    payload[build_id.start] ^= 0xFF
     with pytest.raises(Exception, match="this build of the plugin"):
         deserialize(bytes(payload))
+
+
+def test_platform_version_names_the_build():
+    """JAX's persistent cache keys executables by the platform version, so that
+    each build caches its own rather than finding another build's, which it cannot
+    load and would not replace."""
+    payload = serialize(jax.jit(lambda x: x + 2).lower(device_put(np.ones(32, np.float32))).compile())
+    assert jax.devices("tt")[0].client.platform_version == "0.0.0+" + payload[build_id_span(payload)].hex()
 
 
 def test_loaded_executable_takes_overriding_compile_options():

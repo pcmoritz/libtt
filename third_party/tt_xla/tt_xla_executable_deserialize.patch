@@ -26,7 +26,21 @@ diff --git a/pjrt_implementation/inc/api/client_instance.h b/pjrt_implementation
  
  private:
    tt_pjrt_status populateDevices();
-@@ -294,6 +296,10 @@ onClientAddressableMemories(PJRT_Client_AddressableMemories_Args *args);
+@@ -245,8 +247,11 @@ private:
+   // one: torch_tpu then tells the compilations of its eager ops apart.
+   const std::string m_platform_name = isTpuCompatMode() ? "tpu" : "tt";
+ 
+-  // We don't have a versioning system for our software stack yet.
+-  const std::string m_platform_version = "0.0.0";
++  // "0.0.0" and the plugin's build ID. JAX's persistent cache keys executables
++  // by it, so that each build caches its own rather than finding another
++  // build's, which it cannot load.
++  static std::string makePlatformVersion();
++  const std::string m_platform_version = makePlatformVersion();
+ 
+   // Set of all tracked buffers. Used to materialize all buffers before mesh
+   // reshape to prevent data loss.
+@@ -294,6 +299,10 @@ onClientAddressableMemories(PJRT_Client_AddressableMemories_Args *args);
  // Implements PJRT_Client_Compile API function.
  PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args);
  
@@ -136,8 +150,15 @@ diff --git a/pjrt_implementation/inc/api/serialized_executable_instance.h b/pjrt
  
  // PJRT C API includes
  #include "xla/pjrt/c/pjrt_c_api.h"
-@@ -29,22 +31,36 @@ namespace tt::pjrt {
+@@ -27,24 +29,43 @@
  
+ namespace tt::pjrt {
+ 
++// Returns the GNU build ID of the plugin library, which the linker hashes from
++// the library's contents, so that it changes with any change to the compiler or
++// the runtime. Empty if the library has none.
++std::string_view pluginBuildId();
++
  struct SerializationHeader {
    // Serialization format:
 -  //   1. Header, 56 bytes
@@ -177,7 +198,7 @@ diff --git a/pjrt_implementation/inc/api/serialized_executable_instance.h b/pjrt
  
    char magic[8];
    uint64_t ttir_offset;
-@@ -53,24 +69,50 @@ struct SerializationHeader {
+@@ -53,24 +74,50 @@ struct SerializationHeader {
    uint64_t ttnn_size;
    uint64_t fb_offset;
    uint64_t fb_size;
@@ -233,7 +254,7 @@ diff --git a/pjrt_implementation/inc/api/serialized_executable_instance.h b/pjrt
  class SerializedExecutableInstance {
  public:
    // Creates new serialized executable instance from the executable image.
-@@ -98,6 +140,12 @@ public:
+@@ -98,6 +145,12 @@ public:
    // Gets the size of the serialized payload in bytes.
    size_t getSerializedPayloadSizeInBytes() const { return m_payload.size(); }
  
@@ -249,7 +270,17 @@ diff --git a/pjrt_implementation/inc/api/serialized_executable_instance.h b/pjrt
 diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementation/src/api/client_instance.cc
 --- a/pjrt_implementation/src/api/client_instance.cc
 +++ b/pjrt_implementation/src/api/client_instance.cc
-@@ -39,6 +39,7 @@
+@@ -23,6 +23,9 @@
+ // system includes
+ #include <unistd.h>
+ 
++// llvm includes
++#include "llvm/ADT/StringExtras.h"
++
+ // tracy includes
+ #include "tracy/Tracy.hpp"
+ 
+@@ -39,6 +42,7 @@
  #include "api/executable_image.h"
  #include "api/memory_instance.h"
  #include "api/module_builder/module_builder.h"
@@ -257,7 +288,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
  #include "api/tensor_pool.h"
  #include "utils/assert.h"
  #include "utils/logging.h"
-@@ -404,6 +405,8 @@ void ClientInstance::bindApi(PJRT_Api *api) {
+@@ -404,6 +408,8 @@ void ClientInstance::bindApi(PJRT_Api *api) {
        internal::onClientLookupAddressableDevice;
    api->PJRT_Client_AddressableMemories = internal::onClientAddressableMemories;
    api->PJRT_Client_Compile = internal::onClientCompile;
@@ -266,7 +297,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    api->PJRT_Client_DefaultDeviceAssignment =
        internal::onClientDefaultDeviceAssignment;
    api->PJRT_Client_BufferFromHostBuffer = internal::onBufferFromHostBuffer;
-@@ -520,7 +523,8 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+@@ -520,7 +526,8 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
      const PJRT_Program *mlir_program, LoadedExecutableInstance **out_executable,
      const std::unordered_map<std::string, std::string> &compile_options,
      const std::optional<std::vector<int64_t>> &replica_device_ids,
@@ -276,7 +307,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
  
    static std::mutex compile_mutex;
    const std::lock_guard<std::mutex> lock(compile_mutex);
-@@ -529,7 +533,8 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+@@ -529,7 +536,8 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
  
    std::tuple<tt_pjrt_status, std::shared_ptr<ExecutableImage>> compile_result =
        m_module_builder->buildModule(mlir_code, m_system_descriptor,
@@ -286,7 +317,22 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    tt_pjrt_status status = std::get<tt_pjrt_status>(compile_result);
    if (!tt_pjrt_status_is_ok(status)) {
      return status;
-@@ -938,18 +943,21 @@ onClientAddressableMemories(PJRT_Client_AddressableMemories_Args *args) {
+@@ -567,6 +575,14 @@ tt_pjrt_status ClientInstance::compileMlirProgram(
+   return tt_pjrt_status::kSuccess;
+ }
+ 
++std::string ClientInstance::makePlatformVersion() {
++  std::string_view build_id = pluginBuildId();
++  if (build_id.empty()) {
++    return "0.0.0";
++  }
++  return "0.0.0+" + llvm::toHex(build_id, /*LowerCase=*/true);
++}
++
+ tt::runtime::MeshFabricConfig
+ ClientInstance::computeFabricConfig(const std::vector<uint32_t> &mesh_shape) {
+ 
+@@ -938,18 +954,21 @@ onClientAddressableMemories(PJRT_Client_AddressableMemories_Args *args) {
    return nullptr;
  }
  
@@ -314,7 +360,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    if (!tt_pjrt_status_is_ok(compile_options_status)) {
      return *ErrorInstance::makeError(compile_options_status).release();
    }
-@@ -965,19 +973,18 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
+@@ -965,19 +984,18 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
    // devices and wrongly fires for a single-chip graph on a multi-chip host.
    size_t target_num_devices =
        static_cast<size_t>(CompileOptionsParser::extractNumPartitions(
@@ -338,7 +384,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
  
    // A bare status code would not say why compilation failed.
    ScopedErrorCollector compile_errors;
-@@ -987,9 +994,9 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
+@@ -987,9 +1005,9 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
    // threads, where it would terminate the process.
    try {
      compile_status = client_instance->compileMlirProgram(
@@ -351,7 +397,7 @@ diff --git a/pjrt_implementation/src/api/client_instance.cc b/pjrt_implementatio
    } catch (const std::exception &error) {
      return *ErrorInstance::makeError(tt_pjrt_status::kInternal, error.what())
                  .release();
-@@ -998,10 +1005,70 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
+@@ -998,10 +1016,70 @@ PJRT_Error *onClientCompile(PJRT_Client_Compile_Args *args) {
      return *ErrorInstance::makeError(compile_status, compile_errors.errors)
                  .release();
    }
@@ -591,15 +637,10 @@ diff --git a/pjrt_implementation/src/api/serialized_executable_instance.cc b/pjr
  // tt-xla includes
  #include "api/buffer_instance.h"
  #include "api/error_instance.h"
-@@ -21,6 +27,61 @@
+@@ -21,6 +27,54 @@
  
  namespace tt::pjrt {
  
-+namespace {
-+
-+// Returns the GNU build ID of the plugin library, which the linker hashes from
-+// the library's contents, so that it changes with any change to the compiler or
-+// the runtime. Empty if the library has none.
 +std::string_view pluginBuildId() {
 +  static const std::string build_id = [] {
 +    std::string build_id;
@@ -648,12 +689,10 @@ diff --git a/pjrt_implementation/src/api/serialized_executable_instance.cc b/pjr
 +  return build_id;
 +}
 +
-+} // namespace
-+
  std::unique_ptr<SerializedExecutableInstance>
  SerializedExecutableInstance::createInstance(
      const ExecutableImage *executable_image) {
-@@ -48,7 +109,12 @@ SerializedExecutableInstance::SerializedExecutableInstance(
+@@ -48,7 +102,12 @@ SerializedExecutableInstance::SerializedExecutableInstance(
      flatbuffer_data.resize(0);
    }
  
@@ -667,7 +706,7 @@ diff --git a/pjrt_implementation/src/api/serialized_executable_instance.cc b/pjr
    m_payload.resize(header.getPayloadSize());
  
    std::byte *data_ptr = m_payload.data();
-@@ -57,10 +123,49 @@ SerializedExecutableInstance::SerializedExecutableInstance(
+@@ -57,10 +116,49 @@ SerializedExecutableInstance::SerializedExecutableInstance(
    data_ptr = writeRaw(data_ptr, ttir_code.data(), ttir_code.size());
    data_ptr = writeRaw(data_ptr, ttnn_code.data(), ttnn_code.size());
    data_ptr = writeRaw(data_ptr, flatbuffer_data.data(), flatbuffer_data.size());
