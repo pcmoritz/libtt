@@ -1,10 +1,13 @@
 """SGLang-TorchTPU's attention hook runs a prefill on TTNN's chunked paged
-attention, one sequence per user (sglang_tpu_kernels).
+attention, one sequence per user, and a few tokens in all, such as a
+speculative verify's windows, on TTNN's paged decode attention, one token per
+user (sglang_tpu_kernels).
 
 Each sequence's queries attend to the keys of its own pages up to their
 position, also when the prefix before them doesn't start a chunk. Cover one
 sequence after an unaligned prefix, two sequences after page-aligned prefixes,
-grouped query heads, and tokens past the last sequence (padding).
+grouped query heads, tokens past the last sequence (padding), and verify
+windows of 4 tokens, also ragged ones.
 """
 
 import types
@@ -32,6 +35,10 @@ PAGES_PER_SEQ = 8
         # A pool of only the sequence's pages: the padded page table is wider
         # than the pool, its padding entries all page 0.
         ([200], [200], 256, 1 + PAGES_PER_SEQ),
+        # Verify windows of 4 tokens (3 draft tokens) of two sequences and a
+        # padding sequence, and ragged ones of 3 and 4 tokens.
+        ([4, 4, 0], [20, 70, 0], 12, PAGES),
+        ([3, 4, 0], [20, 70, 0], 12, PAGES),
     ],
 )
 def test_prefill_attention(q_lens, kv_lens, tokens, pages, tmp_path):
@@ -63,7 +70,9 @@ def test_prefill_attention(q_lens, kv_lens, tokens, pages, tmp_path):
     )
     out = np.asarray(out).astype(np.float32)
     ir = "".join(path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir"))
-    assert "ttnn.chunked_scaled_dot_product_attention" in ir
+    few = tokens <= sglang_tpu_kernels.MAX_DECODE_USERS
+    kernel = "paged_scaled_dot_product_attention_decode" if few else "chunked_scaled_dot_product_attention"
+    assert f'"ttnn.{kernel}"' in ir
 
     # The cache after the update, as float32 keys and values per position.
     updated = cache.astype(np.float32)
