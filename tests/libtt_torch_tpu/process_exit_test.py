@@ -26,3 +26,10 @@ def test_device_after_process_that_runs_programs():
     tt-metal's thread-local state, already destroyed on the exiting thread."""
     run("x = torch.randn(64, 64, device='tpu')\nassert torch.cumsum((x @ x).relu().sum(0), 0).shape == (64,)")
     run("assert torch.ones(8, device='tpu').sum().item() == 8")
+
+
+def test_exit_after_a_scalar_fill():
+    """A process whose first device op fills a tensor with a scalar exits cleanly. torch_tpu
+    keeps the scalar's device buffer in a thread-local cache, first used before tt-metal's graph
+    tracker state on that thread: the cache, destroyed after that state, then frees the buffer."""
+    run("assert torch.full((4,), 3.0, device='tpu').sum().item() == 12")
