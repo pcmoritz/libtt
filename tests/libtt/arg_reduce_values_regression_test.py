@@ -91,6 +91,51 @@ def test_sums_over_a_unit_dimension():
     np.testing.assert_array_equal(jax.jit(lambda x: jnp.argmin(x, axis=2))(x), np.zeros((3, 4)))
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.int32, np.bool_])
+@pytest.mark.parametrize("shape,axis", [((4, 1), 1), ((1, 8), 0), ((2, 1, 3), 1)])
+def test_argmax_over_a_unit_dimension(shape, axis, dtype):
+    """Over a dimension of size 1, the reduce's iota of indices folds to a zero constant, and
+    it is still an argmax: JAX's, and PyTorch's, which EAGLE's tree verification takes over a
+    single draft token."""
+    rng = np.random.default_rng(0)
+    x = rng.random(shape) > 0.5 if dtype == np.bool_ else rng.integers(-5, 5, shape).astype(dtype)
+    expected = np.zeros(np.delete(shape, axis), np.int32)
+    np.testing.assert_array_equal(jax.jit(lambda x: jnp.argmax(x, axis=axis))(x), expected)
+    if axis == 1 and dtype != np.bool_:
+        lowest = np.finfo(dtype).min if dtype == np.float32 else np.iinfo(dtype).min
+        _, indices = jax.jit(lambda x: _arg_reduce(x, True, lowest))(x)
+        np.testing.assert_array_equal(indices, expected)
+
+
+@pytest.mark.parametrize("is_max", [True, False])
+@pytest.mark.parametrize("dtype", [np.int32, np.bool_])
+@pytest.mark.parametrize("shape", [(1, 2), (4, 8)])
+def test_jax_reducer_in_another_order(shape, dtype, is_max):
+    """JAX's argmax (argmin) reducer, with the value's select right after the comparison and
+    no NaN term, as canonicalization leaves it for SGLang's vision attention: still an argmax
+    (argmin)."""
+
+    def body(a, b):
+        (va, ia), (vb, ib) = a, b
+        better = va > vb if is_max else va < vb
+        value = jnp.where(better, va, vb)
+        index = jnp.where(better | ((va == vb) & (ia < ib)), ia, ib)
+        return value, index
+
+    x = np.random.default_rng(1).integers(0, 3, shape).astype(dtype)
+    if dtype == np.bool_:
+        init = np.array(not is_max)
+    else:
+        init = np.array(np.iinfo(dtype).min if is_max else np.iinfo(dtype).max, dtype)
+
+    def reduce(x):
+        iota = lax.broadcasted_iota(jnp.int32, x.shape, 1)
+        return lax.reduce((x, iota), (init, np.int32(0)), body, (1,))[1]
+
+    expected = np.argmax(x, axis=1) if is_max else np.argmin(x, axis=1)
+    np.testing.assert_array_equal(jax.jit(reduce)(x), expected)
+
+
 @pytest.mark.parametrize("dtype", [np.float32, jnp.bfloat16])
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize("rows,width", [(1, 248320), (4, 2048), (20, 96)])
