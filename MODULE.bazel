@@ -520,6 +520,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_manual_collectives.patch",
         "//third_party/tt_xla:tt_xla_tuple_custom_calls.patch",
         "//third_party/tt_xla:tt_xla_float8_e8m0_buffers.patch",
+        "//third_party/tt_xla:tt_xla_copy_to_host_execution_lock.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
