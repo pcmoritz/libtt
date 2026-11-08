@@ -160,7 +160,7 @@ def _ragged_paged_attention(module):
             and k_scale is None
             and v_scale is None
         ):
-            out = _paged_prefill(
+            args = (
                 queries,
                 cache,
                 table,
@@ -170,6 +170,14 @@ def _ragged_paged_attention(module):
                 position,
                 live,
                 sm_scale,
+            )
+            # SGLang pads a batch to its sequence slots, and a prefill is
+            # often one sequence: the device runs one user then, the slots
+            # otherwise.
+            out = jax.lax.cond(
+                num_seqs <= 1,
+                lambda: _paged_prefill(*args, users=1),
+                lambda: _paged_prefill(*args, users=seqs),
             )
             return out.astype(out_dtype or queries.dtype), cache
         context = cache[table]
@@ -241,8 +249,9 @@ def _prefill_pad_pages(tokens, page_size):
     return -(-_prefill_rows(tokens, page_size) // page_size)
 
 
-def _paged_prefill(queries, cache, table, q_starts, prefixes, seq, positions, live, sm_scale):
-    """Each sequence's queries as one user of TTNN's chunked paged attention.
+def _paged_prefill(queries, cache, table, q_starts, prefixes, seq, positions, live, sm_scale, users):
+    """The queries of the first `users` sequences, each as one user of TTNN's
+    chunked paged attention; the other sequences have none.
 
     The kernel's queries start at a chunk-aligned position, so a sequence's
     rows start at its prefix rounded down to a chunk, with its queries at their
@@ -255,7 +264,9 @@ def _paged_prefill(queries, cache, table, q_starts, prefixes, seq, positions, li
 
     tokens, q_heads, head_dim = queries.shape
     page_size, row = cache.shape[2], cache.shape[3]
-    seqs = table.shape[0]
+    seqs = users
+    table, q_starts, prefixes = table[:users], q_starts[:users], prefixes[:users]
+    seq = jnp.minimum(seq, users - 1)
     rows = _prefill_rows(tokens, page_size)
     starts = prefixes - prefixes % _prefill_chunk(page_size)
     offsets = prefixes - starts
