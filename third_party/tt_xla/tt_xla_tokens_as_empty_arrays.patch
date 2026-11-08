@@ -1,0 +1,70 @@
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -808,6 +808,58 @@
+   }
+ }
+ 
++// Tokens order side effects and hold no data. JAX passes and receives them as
++// empty boolean arrays (core.get_token_aval), and the compiler has no token
++// type, so they become those arrays: create_token and after_all make an empty
++// constant, and every other token value, such as a function's argument or
++// result or one that control flow or an optimization barrier carries, becomes
++// a tensor<0xi1>.
++static void replaceTokensWithEmptyArrays(mlir::ModuleOp module) {
++  auto empty = mlir::RankedTensorType::get(
++      {0}, mlir::IntegerType::get(module.getContext(), 1));
++  auto convert = [&](mlir::Type type) -> mlir::Type {
++    return mlir::isa<mlir::stablehlo::TokenType>(type) ? empty : type;
++  };
++  auto convertAll = [&](mlir::TypeRange types) {
++    llvm::SmallVector<mlir::Type> converted;
++    for (mlir::Type type : types) {
++      converted.push_back(convert(type));
++    }
++    return converted;
++  };
++  llvm::SmallVector<mlir::Operation *> tokenOps;
++  module.walk([&](mlir::Operation *op) {
++    if (mlir::isa<mlir::stablehlo::CreateTokenOp, mlir::stablehlo::AfterAllOp>(
++            op)) {
++      tokenOps.push_back(op);
++    }
++    for (mlir::Region &region : op->getRegions()) {
++      for (mlir::Block &block : region) {
++        for (mlir::BlockArgument argument : block.getArguments()) {
++          argument.setType(convert(argument.getType()));
++        }
++      }
++    }
++    for (mlir::OpResult result : op->getResults()) {
++      result.setType(convert(result.getType()));
++    }
++    if (auto func = mlir::dyn_cast<mlir::func::FuncOp>(op)) {
++      mlir::FunctionType type = func.getFunctionType();
++      func.setFunctionType(mlir::FunctionType::get(
++          op->getContext(), convertAll(type.getInputs()),
++          convertAll(type.getResults())));
++    }
++  });
++  for (mlir::Operation *op : tokenOps) {
++    mlir::OpBuilder builder(op);
++    mlir::Value constant = builder.create<mlir::stablehlo::ConstantOp>(
++        op->getLoc(),
++        mlir::DenseElementsAttr::get(empty, llvm::ArrayRef<bool>()));
++    op->getResult(0).replaceAllUsesWith(constant);
++    op->erase();
++  }
++}
++
+ tt_pjrt_status ModuleBuilder::runFrontendSHLOPipeline(
+     mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
+     const std::optional<std::string> &export_path,
+@@ -815,6 +867,7 @@
+ 
+   mlir::ModuleOp module = mlir_module.get();
+   flattenTupleCustomCalls(module);
++  replaceTokensWithEmptyArrays(module);
+ 
+   // JAX may give each shard_map or sharding its own mesh; tt-mlir compiles
+   // for one, and the sharding analysis below reads shardings against it.
