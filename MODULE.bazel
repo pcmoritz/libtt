@@ -519,6 +519,7 @@ git_repository(
         "//third_party/tt_xla:tt_xla_multi_process.patch",
         "//third_party/tt_xla:tt_xla_manual_collectives.patch",
         "//third_party/tt_xla:tt_xla_tuple_custom_calls.patch",
+        "//third_party/tt_xla:tt_xla_float8_e8m0_buffers.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
@@ -720,6 +721,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_split_qkv_norm_rope_decode.patch",
         "//third_party/tt_xla:tt_mlir_rms_norm_gated.patch",
         "//third_party/tt_xla:tt_mlir_row_argmax.patch",
+        "//third_party/tt_xla:tt_mlir_float8_e8m0.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
