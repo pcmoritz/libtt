@@ -724,6 +724,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_row_argmax.patch",
         "//third_party/tt_xla:tt_mlir_float8_e8m0.patch",
         "//third_party/tt_xla:tt_mlir_canonicalized_argmax.patch",
+        "//third_party/tt_xla:tt_mlir_wide_rows_full_tiles.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
