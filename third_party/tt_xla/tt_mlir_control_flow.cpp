@@ -16,6 +16,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/STLExtras.h"
@@ -153,11 +154,17 @@ analyzeCountedLoop(stablehlo::WhileOp whileOp,
       compare ? dyn_cast<BlockArgument>(compare.getLhs()) : BlockArgument();
   std::optional<stablehlo::ComparisonType> comparisonType =
       compare ? compare.getCompareType() : std::nullopt;
+  // Without a comparison type, StableHLO compares signless integers as signed:
+  // jax.export leaves it out (torch_tpu's exported JAX ops, such as
+  // SGLang-TorchTPU's sampling filters).
+  bool signedCompare =
+      comparisonType ? *comparisonType == stablehlo::ComparisonType::SIGNED
+      : compare      ? getElementTypeOrSelf(compare.getLhs().getType())
+                      .isSignlessInteger()
+                     : false;
   if (!compare ||
       compare.getComparisonDirection() != stablehlo::ComparisonDirection::LT ||
-      !comparisonType ||
-      *comparisonType != stablehlo::ComparisonType::SIGNED || !counter ||
-      counter.getOwner() != &cond.front()) {
+      !signedCompare || !counter || counter.getOwner() != &cond.front()) {
     return failure();
   }
 
