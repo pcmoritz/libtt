@@ -134,9 +134,13 @@ def _ragged_paged_attention(module):
                 share_cache=True,
             )
         # Each token as a decode user reads its sequence's pages once, which
-        # beats gathering them below when there are few tokens per sequence.
+        # beats gathering them below when there are few tokens per sequence,
+        # and beats the chunked kernel below for a few tokens in all, as in a
+        # speculative verify: each token attends up to its own position, so
+        # a sequence's window stays causal, where the chunked kernel pads
+        # every sequence's queries to a chunk of 128 rows.
         if (
-            tokens <= seqs
+            tokens <= max(seqs, MAX_DECODE_USERS)
             and cache_heads == kv_heads
             and causal
             and soft_cap is None
