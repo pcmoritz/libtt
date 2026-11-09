@@ -62,10 +62,16 @@ def test_vocab_sharded_argmax(rows, trace, tmp_path):
     out = np.asarray(run(jax.device_put(x, NamedSharding(mesh, P(None, "tensor")))))
     np.testing.assert_array_equal(out, x.argmax(-1))
 
-    # Each shard picks its maximum's value with a sum over the shard, which
-    # tt-mlir splits into groups of 32 (wide_row_reduction_regression_test).
+    # Each shard picks its maximum's value with a sum over the shard. From
+    # 32768 columns it runs on the shard's rows viewed as [rows, shard / C, C],
+    # in full tiles; narrower shards (eight devices) split into groups of 32
+    # (wide_row_reduction_regression_test).
     irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_runtime_*.mlir")]
     assert irs, "no IR was exported"
     sums = re.findall(r'"ttnn\.sum"\(%\w+\).*?: \(tensor<([0-9x]+)x[a-z]', "\n".join(irs))
-    assert f"{rows}x{shard // 32}x32" in sums, sums
-    assert f"{rows}x{shard // 32}" in sums, sums
+    if shard >= 32768:
+        groups = next(c for c in (1024, 512, 256, 128, 64, 32) if shard % c == 0 and shard // c >= 32)
+        assert f"{rows}x{shard // groups}x{groups}" in sums, sums
+    else:
+        assert f"{rows}x{shard // 32}x32" in sums, sums
+        assert f"{rows}x{shard // 32}" in sums, sums

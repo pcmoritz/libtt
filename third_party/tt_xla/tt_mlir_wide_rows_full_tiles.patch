@@ -1,0 +1,22 @@
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -7,6 +7,7 @@
+ #include "ttmlir/Dialect/TTCore/IR/Utils.h"
+ #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Fusing/RMSNormGatedFusing.h"
++#include "ttmlir/Dialect/TTIR/Transforms/Fusing/WideRowsInFullTiles.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Fusing/SDPAFusingPattern.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.h"
+@@ -4770,6 +4771,10 @@
+       patterns.add<HoistReshapeToFewerTilesPattern,
+                    SinkReshapeToFewerTilesPattern,
+                    SinkReshapeThroughPermutePattern>(&getContext());
++      patterns.add<fusing::ReduceWideRowsInFullTiles<SumOp>,
++                   fusing::ReduceWideRowsInFullTiles<MaxOp>,
++                   fusing::ReduceWideRowsInFullTiles<MinOp>,
++                   fusing::HoistWideRowsViewThroughElementwise>(&getContext());
+       (void)applyPatternsGreedily(getOperation(), std::move(patterns));
+     }
+   }
