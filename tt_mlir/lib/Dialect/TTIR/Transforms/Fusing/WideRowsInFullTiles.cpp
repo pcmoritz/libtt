@@ -6,6 +6,8 @@
 #include "ttmlir/Dialect/TTIR/IR/TTIROpsInterfaces.h"
 #include "ttmlir/Dialect/TTIR/Utils/Utils.h"
 
+#include "mlir/Dialect/Traits.h"
+
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -158,37 +160,65 @@ mlir::LogicalResult HoistWideRowsViewThroughElementwise::matchAndRewrite(
     }
   }
 
+  // Each operand and its shape in the view, if they broadcast to the whole
+  // view. A broadcast operand (a cutoff per row, broadcast over the
+  // vocabulary) can broadcast its input in the view instead: materialized, it
+  // would be as wide as the vocabulary.
+  using ViewOperands = SmallVector<std::pair<Value, SmallVector<int64_t>>>;
+  auto viewOperands =
+      [&](bool throughBroadcasts) -> std::optional<ViewOperands> {
+    ViewOperands operands;
+    SmallVector<int64_t> shape;
+    for (Value operand : producer->getOperands()) {
+      std::optional<SmallVector<int64_t>> operandShape;
+      auto broadcast = operand.getDefiningOp<BroadcastOp>();
+      if (throughBroadcasts && broadcast) {
+        operandShape =
+            operandView(typeOf(broadcast.getInput()), type.getShape(), *view);
+        if (operandShape) {
+          operand = broadcast.getInput();
+        }
+      }
+      if (!operandShape) {
+        operandShape = operandView(typeOf(operand), type.getShape(), *view);
+      }
+      SmallVector<int64_t> previous = shape;
+      if (!operandShape ||
+          !OpTrait::util::getBroadcastedShape(previous, *operandShape, shape)) {
+        return std::nullopt;
+      }
+      operands.emplace_back(operand, std::move(*operandShape));
+    }
+    if (shape != ArrayRef<int64_t>(*view)) {
+      return std::nullopt;
+    }
+    return operands;
+  };
+  // When the inputs alone don't broadcast to the view (every operand a
+  // broadcast, say), the operands keep their broadcasts.
+  std::optional<ViewOperands> viewed = viewOperands(true);
+  if (!viewed) {
+    viewed = viewOperands(false);
+  }
+  if (!viewed) {
+    return mlir::failure();
+  }
+
   // At the op, where its operands are defined.
   rewriter.setInsertionPoint(producer);
   SmallVector<Value> operands;
-  for (Value operand : producer->getOperands()) {
-    // A broadcast operand (a cutoff per row, broadcast over the vocabulary)
-    // broadcasts its input in the view instead: materialized, it would be as
-    // wide as the vocabulary.
-    if (auto broadcast = operand.getDefiningOp<BroadcastOp>()) {
-      if (std::optional<SmallVector<int64_t>> inputShape = operandView(
-              typeOf(broadcast.getInput()), type.getShape(), *view)) {
-        operands.push_back(utils::createReshapeOp(
-            rewriter, producer->getLoc(), broadcast.getInput(), *inputShape));
-        continue;
-      }
-    }
-    std::optional<SmallVector<int64_t>> operandShape =
-        operandView(typeOf(operand), type.getShape(), *view);
-    if (!operandShape) {
-      return mlir::failure();
-    }
-    operands.push_back(utils::createReshapeOp(rewriter, producer->getLoc(),
-                                              operand, *operandShape));
+  for (auto &[operand, shape] : *viewed) {
+    operands.push_back(
+        utils::createReshapeOp(rewriter, producer->getLoc(), operand, shape));
   }
-  Operation *viewed = rewriter.create(
+  Operation *viewedOp = rewriter.create(
       producer->getLoc(),
       rewriter.getStringAttr(producer->getName().getStringRef()), operands,
       TypeRange{RankedTensorType::get(*view, type.getElementType(),
                                       type.getEncoding())},
       producer->getAttrs());
   for (Operation *user : llvm::make_early_inc_range(producer->getUsers())) {
-    rewriter.replaceOp(user, viewed->getResult(0));
+    rewriter.replaceOp(user, viewedOp->getResult(0));
   }
   return mlir::success();
 }

@@ -152,6 +152,29 @@ def test_view_computes_the_reduced_values(shape, tmp_path):
         assert op_inputs(tmp_path, name) and all(s == view for s in op_inputs(tmp_path, name)), name
 
 
+def test_view_of_broadcast_operands():
+    # Operands that are all broadcasts keep them: their inputs alone, [2, 1, 1]
+    # or [1, W / C, C], don't broadcast to the view.
+    shape = (2, 32768)
+
+    def wide(a):
+        return jnp.broadcast_to(a, shape)
+
+    def fn(keep, value, row, other_row):
+        return (
+            jnp.sum(jnp.where(wide(keep), wide(value), wide(-value)), axis=-1),
+            jnp.sum(wide(row) + wide(other_row), axis=-1),
+        )
+
+    args = (np.array([[True], [False]]), np.array([[0.5], [-1.0]], np.float32),
+            integer_rows((1, shape[1])), integer_rows((1, shape[1]), seed=1))
+    device = jax.devices("tt")[0]
+    got = jax.jit(fn)(*[jax.device_put(a, device) for a in args])
+    keep, value, row, other_row = args
+    np.testing.assert_array_equal(np.asarray(got[0]), np.where(keep, value, -value)[:, 0] * shape[1])
+    np.testing.assert_array_equal(np.asarray(got[1]), np.full(2, (row + other_row).sum()))
+
+
 def filter_probs(probs, top_ks, top_ps, need_top_k, need_top_p):
     """sglang_tpu.sampling_mask's sort-free top-k / top-p filter (SGLang-TorchTPU)."""
     vocab = probs.shape[-1]
