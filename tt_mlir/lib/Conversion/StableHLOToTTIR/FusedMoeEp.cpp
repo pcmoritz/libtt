@@ -18,9 +18,10 @@
 // Returns each token's routing-weighted sum of the SiLU-gated experts this
 // device holds, [T, H] in x's type; the layer is the sum over devices.
 //
-// The kernel stores the experts in BFP4, takes up to 512 tokens per call,
-// runs only the (token, expert) pairs of the experts its device owns and
-// writes each pair's output unweighted. This lowering chunks the tokens, builds
+// The kernel stores the experts in BFP4, or in BF16 as they are with the
+// weight_dtype = "bf16" attribute, takes up to 512 tokens per call, runs only
+// the (token, expert) pairs of the experts its device owns and writes each
+// pair's output unweighted. This lowering chunks the tokens, builds
 // the expert-to-device mapping, and sums each token's slots with its weights in
 // one matmul accumulated in FP32; the kernel reads the ids as they are and
 // skips padding's negative ids.
@@ -43,8 +44,11 @@ namespace mlir::tt {
 namespace {
 
 constexpr int64_t kMaxTokensPerCall = 512;
-// Matmul rings that run a device's experts side by side.
+// Matmul rings that run a device's experts side by side. BF16 experts stream
+// through one ring: a whole expert slice per ring core, which the rings replay
+// for every chunk, doesn't fit a core's L1 at two bytes per weight.
 constexpr uint32_t kRings = 3;
+constexpr uint32_t kBf16Rings = 0;
 
 class FusedMoeEpConversionPattern
     : public OpConversionPattern<stablehlo::CustomCallOp> {
@@ -96,6 +100,21 @@ public:
       return rewriter.notifyMatchFailure(
           op, "tt.fused_moe_ep takes int32 or uint16 topk_ids");
     }
+
+    // The experts' dtype in the kernel: BFP4 unless the call asks for BF16.
+    auto config = dyn_cast_or_null<DictionaryAttr>(op.getBackendConfigAttr());
+    if (!config) {
+      config = dyn_cast_or_null<DictionaryAttr>(
+          op->getDiscardableAttr("mhlo.backend_config"));
+    }
+    StringAttr weightDtype =
+        config ? config.getAs<StringAttr>("weight_dtype") : nullptr;
+    if (weightDtype && weightDtype.getValue() != "bfp4" &&
+        weightDtype.getValue() != "bf16") {
+      return rewriter.notifyMatchFailure(
+          op, "tt.fused_moe_ep's weight_dtype is bfp4 or bf16");
+    }
+    const bool bf16Weights = weightDtype && weightDtype.getValue() == "bf16";
 
     Location loc = op.getLoc();
     MLIRContext *ctx = getContext();
@@ -210,7 +229,10 @@ public:
           /*bias_2=*/Value(), rewriter.getUI32IntegerAttr(0),
           rewriter.getUI32IntegerAttr(4),
           rewriter.getUI32IntegerAttr(intermediate), activation,
-          /*cluster_axis=*/IntegerAttr(), rewriter.getUI32IntegerAttr(kRings));
+          /*cluster_axis=*/IntegerAttr(),
+          rewriter.getUI32IntegerAttr(bf16Weights ? kBf16Rings : kRings),
+          bf16Weights ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::BFloat16)
+                      : ttcore::DataTypeAttr());
 
       // Each token's weighted sum of its slots as one matmul in FP32: row i
       // of the placement matrix holds token i's weight j at column j * t + i,

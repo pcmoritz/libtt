@@ -20,7 +20,9 @@ prefill runs TTNN's chunked paged attention the same way, one sequence per
 user, so it reads only each sequence's pages.
 
 Hybrid models' gated DeltaNet kernel runs on libtt's recurrent kernels, with
-the recurrent-state pool in their layout (`sglang_tpu_gdn`).
+the recurrent-state pool in their layout (`sglang_tpu_gdn`). Mixture-of-experts
+models' fused MoE op runs on TTNN's fused MoE kernel, with the experts in BF16
+as loaded.
 """
 
 # Users per TTNN paged decode attention call.
@@ -36,6 +38,7 @@ MAMBA_POOL_MODULE = "sglang_tpu.mamba_pool"
 KV_FUSED_ROPE_WRITE_MODULE = "sglang_tpu.kv_fused_rope_write"
 BLOCK_DRAFT_WORKER_MODULE = "sglang_tpu.experimental.speculative.block_draft_worker"
 ALL_GATHER_VIA_ALL_REDUCE_MODULE = "sglang_tpu.all_gather_via_all_reduce"
+FUSED_MOE_MODULE = "sglang_tpu.moe.pallas.fused_moe_op"
 
 
 def _ragged_paged_attention(module):
@@ -520,6 +523,78 @@ def patch_all_gather_via_all_reduce(module):
     module.all_gather_into_tensor_around = all_gather_into_tensor_around
 
 
+def _fused_moe_jax(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights,
+    topk_ids,
+    w1_scale,
+    w2_scale,
+    w1_bias,
+    w2_bias,
+    topk,
+    activation_name,
+    no_combine=False,
+    global_num_experts=0,
+    expert_group_offset=0,
+    use_sc_gather=0,
+    w_quant_bits=0,
+    permute_dense_threshold=0,
+    w1_channel_scale=None,
+    w2_channel_scale=None,
+    expert_group_offset_tensor=None,
+    gather_permute_with_sc_combine=0,
+):
+    """The fused MoE op on TTNN's fused MoE kernel (tt.fused_moe_ep), with the
+    experts in BF16, as loaded.
+
+    The kernel runs whole experts, split evenly over the chips in rank order,
+    which is how SGLang-TorchTPU splits them with --ep-size equal to --tp-size.
+    Each rank returns its experts' routing-weighted sum for every token, and
+    the layer's all-reduce adds them up. Like the Pallas kernel, it reads the
+    router's global expert ids. w1 holds each expert's gate and up projections
+    side by side, [experts, hidden, 2 * intermediate].
+    """
+    import jax
+    import jax.numpy as jnp
+    import torch.distributed as dist
+
+    extras = (w1_scale, w2_scale, w1_bias, w2_bias, w1_channel_scale, w2_channel_scale)
+    if activation_name != "silu" or no_combine or w_quant_bits or any(e is not None for e in extras):
+        raise NotImplementedError("MoE on Tenstorrent runs unquantized SiLU experts without biases, combined")
+    if not hidden_states.dtype == w1.dtype == w2.dtype == jnp.bfloat16:
+        raise NotImplementedError("MoE on Tenstorrent runs BF16 experts on BF16 activations")
+    experts, _, gate_up = w1.shape
+    ranks = dist.get_world_size() if dist.is_initialized() else 1
+    if (global_num_experts or experts) != experts * ranks:
+        raise NotImplementedError(
+            "MoE on Tenstorrent splits whole experts over the chips: pass --ep-size equal to --tp-size"
+        )
+
+    # Mark the experts as weights, so that the kernel's weight preparation runs
+    # once rather than on every call, and keep them in BF16.
+    def weight(w):
+        return jax.ffi.ffi_call("tt.weight_dtype_override", jax.ShapeDtypeStruct(w.shape, w.dtype))(
+            w, **{"ttcore.weight_dtype": "bf16"}
+        )
+
+    w1, w2 = weight(w1), weight(w2)
+    return jax.ffi.ffi_call("tt.fused_moe_ep", jax.ShapeDtypeStruct(hidden_states.shape, hidden_states.dtype))(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w1[..., : gate_up // 2],
+        w1[..., gate_up // 2 :],
+        w2,
+        weight_dtype="bf16",
+    )
+
+
+def patch_fused_moe(module):
+    module._fused_moe_jax = _fused_moe_jax
+
+
 PATCHES = {
     RPA_V3_MODULE: patch_rpa_v3,
     KV_POOL_MODULE: patch_kv_pool,
@@ -529,4 +604,5 @@ PATCHES = {
     KV_FUSED_ROPE_WRITE_MODULE: patch_kv_fused_rope_write,
     BLOCK_DRAFT_WORKER_MODULE: patch_block_draft_worker,
     ALL_GATHER_VIA_ALL_REDUCE_MODULE: patch_all_gather_via_all_reduce,
+    FUSED_MOE_MODULE: patch_fused_moe,
 }
