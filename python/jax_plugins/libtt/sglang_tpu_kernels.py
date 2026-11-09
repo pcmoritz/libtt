@@ -33,6 +33,8 @@ KV_POOL_MODULE = "sglang_tpu.kv_pool"
 FP8_LINEAR_SMALL_M_MODULE = "sglang_tpu.kernels.fp8_linear_small_m"
 GDN_MODULE = "sglang_tpu.attention.pallas.gdn"
 MAMBA_POOL_MODULE = "sglang_tpu.mamba_pool"
+KV_FUSED_ROPE_WRITE_MODULE = "sglang_tpu.kv_fused_rope_write"
+BLOCK_DRAFT_WORKER_MODULE = "sglang_tpu.experimental.speculative.block_draft_worker"
 ALL_GATHER_VIA_ALL_REDUCE_MODULE = "sglang_tpu.all_gather_via_all_reduce"
 
 
@@ -416,6 +418,87 @@ def patch_mamba_pool(module):
     sglang_tpu_gdn.patch_mamba_pool(module)
 
 
+def _fused_rope_write_kv(dst_starts, src_starts, span_lens, k, v, cos, sin, *kv_bufs, max_span_len):
+    """DFlash's draft KV write (sglang_tpu.kv_fused_rope_write) for the
+    `[pages, kv_heads, page_size, 2 * head_dim]` pool: neox RoPE on K, then each
+    draft layer's K and V rows to their slots, through TTNN's paged cache update
+    as the attention kernel writes them.
+
+    k, v: [layers, tokens, kv_heads, head_dim]; cos, sin: [tokens, 1, head_dim // 2].
+    Span i writes source tokens src_starts[i] + j to slots dst_starts[i] + j for
+    j < span_lens[i]; spans don't overlap, and padding spans have length 0.
+    Returns every layer's updated buffer.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    del max_span_len  # the Pallas kernel's VMEM bound
+    _, tokens, heads, head_dim = k.shape
+    position = jnp.arange(tokens, dtype=jnp.int32)
+    src = src_starts.astype(jnp.int32)[:, None]
+    inside = (position[None, :] >= src) & (position[None, :] < src + span_lens.astype(jnp.int32)[:, None])
+    slot = jnp.sum(jnp.where(inside, dst_starts.astype(jnp.int32)[:, None] + position[None, :] - src, 0), axis=0)
+    live = jnp.any(inside, axis=0)
+
+    half = head_dim // 2
+    x1, x2 = k[..., :half], k[..., half:]
+    rotated = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+
+    outputs = []
+    for layer, buf in enumerate(kv_bufs):
+        _, cache_heads, page_size, row = buf.shape
+        pad = ((0, 0), (0, cache_heads - heads), (0, row // 2 - head_dim))
+        new_kv = jnp.concatenate([jnp.pad(rotated[layer], pad), jnp.pad(v[layer], pad)], axis=-1).astype(buf.dtype)
+        # Each token is a user of one page, its slot's, at the slot's offset;
+        # tokens outside every span don't write.
+        pages = (slot // page_size)[:, None]
+        offsets = jnp.where(live, slot % page_size, -1)
+        cache = buf
+        for start in range(0, tokens, MAX_UPDATE_USERS):
+            end = min(start + MAX_UPDATE_USERS, tokens)
+            cache = jax.ffi.ffi_call(
+                "tt.paged_update_cache",
+                jax.ShapeDtypeStruct(buf.shape, buf.dtype),
+                input_output_aliases={0: 0},
+            )(cache, new_kv[None, start:end], offsets[start:end], pages[start:end], share_cache=True)
+        outputs.append(cache)
+    return outputs
+
+
+def patch_kv_fused_rope_write(module):
+    module.fused_rope_write_kv_jax = _fused_rope_write_kv
+
+
+def patch_block_draft_worker(module):
+    """DFlash's draft worker returns a value read from the last draft layer's KV
+    buffer after its write (the KV free fence's tail), reduced over the
+    buffer's other dims in the TPU layout's rank; the TT pool's is one fewer."""
+    worker = module.TpuBlockDraftWorker
+    original = worker._write_draft_kv_eager
+
+    def _write_draft_kv_eager(self, **kwargs):
+        kv_pool = self.model_runner.token_to_kv_pool
+        if isinstance(kv_pool, module.SWAKVPool):
+            kv_pool = kv_pool.swa_kv_pool
+        if getattr(kv_pool, "KV_LAYOUT_NAME", None) != "tt-head-major":
+            return original(self, **kwargs)
+        draft_model = self._draft_model()
+        module.dflash_write_draft_kv(
+            draft_model=draft_model,
+            kv_pool=kv_pool,
+            ctx_hidden=draft_model.project_target_hidden(kwargs["target_hidden"]),
+            ctx_positions=kwargs["positions"],
+            ctx_cache_loc=kwargs["cache_loc"],
+            cache_loc_2d=kwargs.get("cache_loc_2d"),
+            commit_lens=kwargs.get("commit_lens"),
+            max_num_reqs=self.model_runner.req_to_token_pool.size,
+        )
+        buf = kv_pool.kv_buffer[-1]
+        return buf[:1, :1].to(module.torch.float32).sum(dim=tuple(range(1, buf.dim())))
+
+    worker._write_draft_kv_eager = _write_draft_kv_eager
+
+
 def patch_all_gather_via_all_reduce(module):
     """Keeps tensor-parallel all-gathers native in compiled graphs.
 
@@ -439,5 +522,7 @@ PATCHES = {
     FP8_LINEAR_SMALL_M_MODULE: patch_fp8_linear_small_m,
     GDN_MODULE: patch_gdn,
     MAMBA_POOL_MODULE: patch_mamba_pool,
+    KV_FUSED_ROPE_WRITE_MODULE: patch_kv_fused_rope_write,
+    BLOCK_DRAFT_WORKER_MODULE: patch_block_draft_worker,
     ALL_GATHER_VIA_ALL_REDUCE_MODULE: patch_all_gather_via_all_reduce,
 }
