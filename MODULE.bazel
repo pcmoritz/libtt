@@ -13,6 +13,7 @@ bazel_dep(name = "rules_shell", version = "0.6.1")
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
+new_local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")
 
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 python.toolchain(python_version = "3.13")
@@ -212,14 +213,11 @@ http_archive(
     ],
 )
 
-http_archive(
+# tt-logger 1.1.8's headers and license: tenstorrent/tt-logger isn't public any more, and nothing else hosts the tag.
+new_local_repository(
     name = "tt_logger",
     build_file = "//third_party/tt_logger:BUILD.overlay.bazel",
-    sha256 = "9f19f5ade2f9c28397fb58548c14020dd5de394b51b25e468e7af509758f6bff",
-    strip_prefix = "tt-logger-1.1.8",
-    urls = [
-        "https://github.com/tenstorrent/tt-logger/archive/refs/tags/v1.1.8.tar.gz",
-    ],
+    path = "third_party/tt_logger/src",
 )
 
 http_archive(
@@ -526,10 +524,10 @@ git_repository(
     remote = "https://github.com/tenstorrent/tt-xla.git",
 )
 
-git_repository(
+# tenstorrent/tt-mlir isn't public any more; these forks serve the same commit's archive, which the sha256 pins.
+http_archive(
     name = "tt_mlir_src",
     build_file = "//third_party/tt_xla:tt_mlir.BUILD.bazel",
-    commit = "0dff91a20d33a0a9ede2e3109071610fbd56948a",
     patch_args = ["-p1"],
     patches = [
         "//third_party/tt_xla:tt_mlir_string_map_include.patch",
@@ -727,7 +725,14 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_canonicalized_argmax.patch",
         "//third_party/tt_xla:tt_mlir_wide_rows_full_tiles.patch",
     ],
-    remote = "https://github.com/tenstorrent/tt-mlir.git",
+    sha256 = "238d65a76a608ab64eaa09fafa16612e32729b90fd688150f1d357d4377bc795",
+    strip_prefix = "tt-mlir-0dff91a20d33a0a9ede2e3109071610fbd56948a",
+    urls = [
+        "https://github.com/tenstorrent/tt-mlir/archive/0dff91a20d33a0a9ede2e3109071610fbd56948a.tar.gz",
+        "https://github.com/brittho/tt-mlir/archive/0dff91a20d33a0a9ede2e3109071610fbd56948a.tar.gz",
+        "https://github.com/aelde/tt-mlir/archive/0dff91a20d33a0a9ede2e3109071610fbd56948a.tar.gz",
+        "https://github.com/swote-git/tt-mlir/archive/0dff91a20d33a0a9ede2e3109071610fbd56948a.tar.gz",
+    ],
 )
 
 git_repository(
