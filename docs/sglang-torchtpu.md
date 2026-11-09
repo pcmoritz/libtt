@@ -22,7 +22,7 @@ VIRTUAL_ENV=.venv uv pip install --index-strategy unsafe-best-match \
   --extra-index-url https://download.pytorch.org/whl/cpu -e python/
 VIRTUAL_ENV=.venv uv pip install --no-deps -e .
 VIRTUAL_ENV=.venv uv pip install --no-deps \
-  /path/to/libtt/bazel-bin/jax_tt_plugin-0.1.5-py3-none-linux_x86_64.whl
+  /path/to/libtt/bazel-bin/jax_tt_plugin-0.2.0-py3-none-linux_x86_64.whl
 ```
 
 ## Launch a server
