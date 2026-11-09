@@ -1,16 +1,7 @@
 diff --git a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
 --- a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
 +++ b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
-@@ -7,6 +7,8 @@
- #include "tt/runtime/detail/ttnn/types/types.h"
- #include "tt/runtime/detail/ttnn/utils.h"
- 
-+#include <tt-metalium/distributed.hpp>
-+
- namespace tt::runtime::ttnn::operations::trace {
- 
- void run(const ::tt::target::ttnn::BeginTraceCaptureOp *op,
-@@ -17,6 +19,15 @@ void run(const ::tt::target::ttnn::BeginTraceCaptureOp *op,
+@@ -17,6 +17,14 @@ void run(const ::tt::target::ttnn::BeginTraceCaptureOp *op,
    LOG_ASSERT(meshDevice.get_program_cache().is_enabled(),
               "Program cache must be enabled");
  
@@ -19,9 +10,8 @@ diff --git a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp b/runtime
 +  // bypass mode; otherwise outstanding commands can race trace capture. Wait
 +  // for this process's chips only: finish() also waits for every other process
 +  // of the mesh, which captures the traces of its own programs, if any.
-+  ::tt::tt_metal::distributed::EventSynchronize(
-+      meshDevice.mesh_command_queue(op->cq_id())
-+          .enqueue_record_event_to_host());
++  auto &queue = meshDevice.mesh_command_queue(op->cq_id());
++  queue.wait_for_host_event(queue.enqueue_record_event_to_host());
 +
    ::ttnn::MeshTraceId traceId =
        ::ttnn::operations::trace::begin_trace_capture(&meshDevice, ttnnCqId);

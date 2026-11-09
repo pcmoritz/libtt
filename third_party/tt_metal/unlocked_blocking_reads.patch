@@ -124,7 +124,16 @@ diff --git tt_metal/distributed/fd_mesh_command_queue.hpp tt_metal/distributed/f
 diff --git tt_metal/distributed/mesh_command_queue_base.cpp tt_metal/distributed/mesh_command_queue_base.cpp
 --- tt_metal/distributed/mesh_command_queue_base.cpp
 +++ tt_metal/distributed/mesh_command_queue_base.cpp
-@@ -403,36 +403,50 @@ void MeshCommandQueueBase::enqueue_read(
+@@ -6,6 +6,8 @@
+ #include <tt_stl/fmt.hpp>
+ #include "mesh_command_queue_base.hpp"
+ 
++#include <tt-metalium/distributed.hpp>
++
+ #include <mesh_device.hpp>
+ #include <mesh_event.hpp>
+ #include <api/tt-metalium/experimental/pinned_memory.hpp>
+@@ -403,36 +405,58 @@ void MeshCommandQueueBase::enqueue_read(
      DistributedHostBuffer& host_buffer,
      const std::optional<std::unordered_set<MeshCoordinate>>& shards,
      bool blocking) {
@@ -185,9 +194,7 @@ diff --git tt_metal/distributed/mesh_command_queue_base.cpp tt_metal/distributed
 -            experimental::ShardDataTransferSetPinnedMemory(xfer, experimental::HostBufferGetPinnedMemory(*buf));
 -            shard_data_transfers.push_back(std::move(xfer));
          }
--    }
- 
--    this->enqueue_read_shards_nolock(shard_data_transfers, buffer, blocking, std::move(memory_pins));
++
 +        this->enqueue_read_shards_nolock(
 +            shard_data_transfers, buffer, blocking && !wait_unlocked, std::move(memory_pins));
 +        if (wait_unlocked) {
@@ -196,6 +203,15 @@ diff --git tt_metal/distributed/mesh_command_queue_base.cpp tt_metal/distributed
 +    }
 +    if (read_done.has_value()) {
 +        this->wait_for_host_event_unlocked(*read_done);
+     }
++}
+ 
+-    this->enqueue_read_shards_nolock(shard_data_transfers, buffer, blocking, std::move(memory_pins));
++void MeshCommandQueueBase::wait_for_host_event(const MeshEvent& event) {
++    if (this->supports_unlocked_read_wait()) {
++        this->wait_for_host_event_unlocked(event);
++    } else {
++        EventSynchronize(event);
 +    }
  }
  
@@ -214,3 +230,26 @@ diff --git tt_metal/distributed/mesh_command_queue_base.hpp tt_metal/distributed
  
      tt::TargetDevice get_target_device_type() const;
  
+@@ -137,6 +141,8 @@ public:
+     // Returns true if the CQ is in use (has had commands enqueued).
+     virtual bool in_use() { return false; }
+ 
++    void wait_for_host_event(const MeshEvent& event) override;
++
+     // Resets this queue's dispatch state. `reset_launch_msg_state` additionally resets state that is shared
+     // by all hardware CQs (the worker launch message ring buffer and the GO mailboxes), so exactly one CQ may
+     // be given it, and only once every other CQ has been drained. The implementation drains the CQs that are
+diff --git tt_metal/api/tt-metalium/mesh_command_queue.hpp tt_metal/api/tt-metalium/mesh_command_queue.hpp
+--- tt_metal/api/tt-metalium/mesh_command_queue.hpp
++++ tt_metal/api/tt-metalium/mesh_command_queue.hpp
+@@ -126,6 +126,10 @@ public:
+         ttsl::Span<const SubDeviceId> sub_device_ids = {},
+         const std::optional<MeshCoordinateRange>& device_range = std::nullopt) = 0;
+     virtual void enqueue_wait_for_event(const MeshEvent& sync_event) = 0;
++    // Waits on the host for `event`, recorded on this queue by enqueue_record_event_to_host(). Unlike
++    // EventSynchronize(), it throws if the queue fails first, as on a device timeout, instead of waiting forever.
++    // Unlike finish(), it waits for this process's devices only, not for the other processes of the mesh.
++    virtual void wait_for_host_event(const MeshEvent& event) = 0;
+     virtual void finish(ttsl::Span<const SubDeviceId> sub_device_ids = {}) = 0;
+     virtual void record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) = 0;
+     virtual void record_end() = 0;

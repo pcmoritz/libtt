@@ -397,13 +397,11 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
 diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/trace_cache.cpp
 --- a/runtime/lib/ttnn/types/trace_cache.cpp
 +++ b/runtime/lib/ttnn/types/trace_cache.cpp
-@@ -3,9 +3,139 @@
+@@ -3,9 +3,137 @@
  // SPDX-License-Identifier: Apache-2.0
  
  #include "tt/runtime/detail/ttnn/types/trace_cache.h"
 +#include "tt/runtime/detail/ttnn/types/types.h"
-+
-+#include <tt-metalium/distributed.hpp>
 +
 +#include <algorithm>
 +#include <unordered_set>
@@ -431,8 +429,8 @@ diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/tra
 +// finish(), it doesn't wait for the other processes of a mesh, which capture,
 +// evict and release the traces of their own programs.
 +static void drainCommandQueue(::ttnn::MeshDevice *meshDevice) {
-+  ::tt::tt_metal::distributed::EventSynchronize(
-+      meshDevice->mesh_command_queue(0).enqueue_record_event_to_host());
++  auto &queue = meshDevice->mesh_command_queue(0);
++  queue.wait_for_host_event(queue.enqueue_record_event_to_host());
 +}
 +
 +static void releaseTraceData(::ttnn::MeshDevice *meshDevice,
