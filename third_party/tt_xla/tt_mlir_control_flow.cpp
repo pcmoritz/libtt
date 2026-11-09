@@ -13,8 +13,10 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/STLExtras.h"
@@ -152,11 +154,17 @@ analyzeCountedLoop(stablehlo::WhileOp whileOp,
       compare ? dyn_cast<BlockArgument>(compare.getLhs()) : BlockArgument();
   std::optional<stablehlo::ComparisonType> comparisonType =
       compare ? compare.getCompareType() : std::nullopt;
+  // Without a comparison type, StableHLO compares signless integers as signed:
+  // jax.export leaves it out (torch_tpu's exported JAX ops, such as
+  // SGLang-TorchTPU's sampling filters).
+  bool signedCompare =
+      comparisonType ? *comparisonType == stablehlo::ComparisonType::SIGNED
+      : compare      ? getElementTypeOrSelf(compare.getLhs().getType())
+                      .isSignlessInteger()
+                     : false;
   if (!compare ||
       compare.getComparisonDirection() != stablehlo::ComparisonDirection::LT ||
-      !comparisonType ||
-      *comparisonType != stablehlo::ComparisonType::SIGNED || !counter ||
-      counter.getOwner() != &cond.front()) {
+      !signedCompare || !counter || counter.getOwner() != &cond.front()) {
     return failure();
   }
 
@@ -189,6 +197,29 @@ analyzeCountedLoop(stablehlo::WhileOp whileOp,
   return CountedLoopInfo{.initial = *initial,
                          .limit = *limit,
                          .step = *resolvedStep};
+}
+
+// A counted loop with constant bounds and a short body runs unrolled: as a
+// loop, each iteration is a separate program the runtime dispatches, outside
+// the trace around the loop, which costs more than the copies of a short body
+// (sampling's bit-by-bit threshold searches: 30 iterations of a few ops). XLA
+// unrolls such loops too.
+constexpr int64_t kMaxUnrolledTrips = 64;
+constexpr int64_t kMaxUnrolledOps = 4096;
+
+std::optional<int64_t> constantTripCount(const CountedLoopInfo &loop) {
+  if (loop.initial.inputIndex || loop.limit.inputIndex ||
+      loop.step.inputIndex) {
+    return std::nullopt;
+  }
+  int64_t span = loop.limit.constant - loop.initial.constant;
+  return span <= 0 ? 0 : (span + loop.step.constant - 1) / loop.step.constant;
+}
+
+int64_t countOps(Region &region) {
+  int64_t count = 0;
+  region.walk([&](Operation *) { ++count; });
+  return count;
 }
 
 bool isExternalOperand(Region &region, Value operand) {
@@ -333,6 +364,29 @@ public:
 
     FailureOr<CountedLoopInfo> countedLoop = analyzeCountedLoop(
         whileOp, condReturn, bodyReturn, captures.getArrayRef());
+    if (succeeded(countedLoop)) {
+      std::optional<int64_t> trips = constantTripCount(*countedLoop);
+      if (trips && *trips <= kMaxUnrolledTrips &&
+          *trips * countOps(body) <= kMaxUnrolledOps) {
+        // Copies of the body, each taking the previous one's results; the
+        // conversion converts them, and any control flow they contain.
+        Block &bodyBlock = body.front();
+        SmallVector<Value> carried(whileOp.getOperands());
+        for (int64_t trip = 0; trip < *trips; ++trip) {
+          IRMapping mapping;
+          mapping.map(bodyBlock.getArguments(), carried);
+          for (Operation &op : bodyBlock.without_terminator()) {
+            rewriter.clone(op, mapping);
+          }
+          for (auto [index, value] :
+               llvm::enumerate(bodyReturn.getOperands())) {
+            carried[index] = mapping.lookupOrDefault(value);
+          }
+        }
+        rewriter.replaceOp(whileOp, carried);
+        return success();
+      }
+    }
     Type conditionResultType;
     if (failed(countedLoop)) {
       conditionResultType = getTypeConverter()->convertType(conditionType);
