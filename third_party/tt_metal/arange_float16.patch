@@ -24,7 +24,7 @@ diff --git ttnn/cpp/ttnn/operations/creation/creation.cpp ttnn/cpp/ttnn/operatio
  template Tensor arange_impl<float>(
      const int64_t start,
      const int64_t stop,
-@@ -418,6 +425,7 @@ Tensor arange(
+@@ -422,6 +429,7 @@ Tensor arange(
  
      switch (dtype) {
          case DataType::BFLOAT16: return concrete_arange.template operator()<::bfloat16>();

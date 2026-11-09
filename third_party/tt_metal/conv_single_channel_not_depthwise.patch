@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp
 --- ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp
 +++ ttnn/cpp/ttnn/operations/conv/conv2d/conv2d_utils.cpp
-@@ -539,7 +539,9 @@ bool is_1d_depthwise_conv(
+@@ -549,7 +549,9 @@ bool is_1d_depthwise_conv(
      uint32_t kernel_height,
      uint32_t image_height,
      bool has_bias) {

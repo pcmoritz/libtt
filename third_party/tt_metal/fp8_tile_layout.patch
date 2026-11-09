@@ -9,7 +9,7 @@ diff --git tt_metal/impl/data_format/tilize_utils.cpp tt_metal/impl/data_format/
  #include <tt-metalium/tensor/tensor_types.hpp>
  #include <tt-metalium/tilize_utils.hpp>
  #include <cstddef>
-@@ -551,6 +552,7 @@
+@@ -551,6 +552,7 @@ template std::vector<int> convert_layout<int>(ttsl::Span<const int>, const Physi
  template std::vector<int8_t> convert_layout<int8_t>(ttsl::Span<const int8_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
  template std::vector<tt::tt_metal::float16> convert_layout<tt::tt_metal::float16>(ttsl::Span<const tt::tt_metal::float16>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
  template std::vector<uint8_t> convert_layout<uint8_t>(ttsl::Span<const uint8_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
@@ -20,7 +20,7 @@ diff --git tt_metal/impl/data_format/tilize_utils.cpp tt_metal/impl/data_format/
 diff --git tt_metal/impl/tensor/host_pad_apis.cpp tt_metal/impl/tensor/host_pad_apis.cpp
 --- tt_metal/impl/tensor/host_pad_apis.cpp
 +++ tt_metal/impl/tensor/host_pad_apis.cpp
-@@ -326,14 +326,6 @@
+@@ -328,14 +328,6 @@ HostTensor pad_impl<tensor_impl::bfloat4_b>(
      return pad_bfloat4_b(tensor, output_padded_shape, input_tensor_start, pad_value);
  }
  
@@ -35,7 +35,7 @@ diff --git tt_metal/impl/tensor/host_pad_apis.cpp tt_metal/impl/tensor/host_pad_
  template <typename T>
  HostTensor unpad_impl(
      const HostTensor& tensor,
-@@ -408,12 +400,6 @@
+@@ -410,12 +402,6 @@ HostTensor unpad_impl<tensor_impl::bfloat4_b>(
      return unpad_bfloat4_b(tensor, output_tensor_start, output_tensor_end);
  }
  
@@ -51,7 +51,7 @@ diff --git tt_metal/impl/tensor/host_pad_apis.cpp tt_metal/impl/tensor/host_pad_
 diff --git tt_metal/impl/tensor/spec/tensor_spec.cpp tt_metal/impl/tensor/spec/tensor_spec.cpp
 --- tt_metal/impl/tensor/spec/tensor_spec.cpp
 +++ tt_metal/impl/tensor/spec/tensor_spec.cpp
-@@ -117,21 +117,15 @@
+@@ -128,21 +128,15 @@ void validate_dtype_and_layout(DataType dtype, Layout layout) {
              case DataType::INT8:
              case DataType::UINT16:
              case DataType::FLOAT16:
@@ -81,7 +81,7 @@ diff --git tt_metal/impl/tensor/spec/tensor_spec.cpp tt_metal/impl/tensor/spec/t
 diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
 --- tt_metal/impl/tensor/tensor_apis.cpp
 +++ tt_metal/impl/tensor/tensor_apis.cpp
-@@ -278,10 +278,7 @@
+@@ -278,10 +278,7 @@ HostTensor to_tile_layout_impl(const HostTensor& tensor, Tile tile) {
          return tensor;
      }
  
@@ -93,7 +93,7 @@ diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis
          TT_FATAL(tensor.layout() == Layout::ROW_MAJOR, "Converting from {} to Tile is unsupported.", tensor.layout());
  
          auto output_spec = TensorSpec(
-@@ -322,17 +319,13 @@
+@@ -322,17 +319,13 @@ HostTensor to_tile_layout_impl(const HostTensor& tensor, Tile tile) {
  
  HostTensor to_row_major_layout(const HostTensor& tensor) {
      return tensor_impl::dispatch(tensor.dtype(), [&]<typename T>() {
@@ -115,7 +115,7 @@ diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis
 diff --git tt_metal/impl/tensor/tensor_impl.cpp tt_metal/impl/tensor/tensor_impl.cpp
 --- tt_metal/impl/tensor/tensor_impl.cpp
 +++ tt_metal/impl/tensor/tensor_impl.cpp
-@@ -319,6 +319,8 @@
+@@ -338,6 +338,8 @@ template std::vector<uint16_t> to_tile_major_layout<uint16_t>(
      const Shape2D& shape, const Tile& tile, ttsl::Span<const uint16_t> data_to_convert);
  template std::vector<uint8_t> to_tile_major_layout<uint8_t>(
      const Shape2D& shape, const Tile& tile, ttsl::Span<const uint8_t> data_to_convert);
@@ -135,7 +135,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp ttnn/cpp/ttnn/operat
  
  namespace ttnn::operations::unary::detail {
  
-@@ -492,6 +493,18 @@
+@@ -492,6 +493,18 @@ Tensor bitcast(
              output_dtype == optional_output_tensor.value().dtype(),
              "If both output dtype and output tensor provided dtype should match");
      }

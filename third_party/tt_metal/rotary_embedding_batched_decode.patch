@@ -1,8 +1,8 @@
 diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/compute/rotary_embedding.cpp ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/compute/rotary_embedding.cpp
 --- ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/compute/rotary_embedding.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/compute/rotary_embedding.cpp
-@@ -35,8 +35,15 @@ ALWI void mul_tiles_chain(uint32_t in1_idx) {
-             PackTile<output(out_cb, ReservePolicy::PerTile, PushPolicy::PerTile, DataFormatReconfig::Disabled)>{});
+@@ -43,8 +43,15 @@ ALWI void mul_tiles_chain(DFB0& cb_in0, DFB1& cb_in1, DFB2& cb_out, uint32_t in1
+                 cb_out});
      } else {
          (void)in1_idx;
 +#ifdef BATCHED_DECODE
@@ -16,7 +16,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/de
 -            input(in1_cb, WaitPolicy::PerTile, PopPolicy::PerTile, DataFormatReconfig::Disabled),
 +            cache,
              output(out_cb, ReservePolicy::PerTile, PushPolicy::PerTile, DataFormatReconfig::Disabled)>(
-             IterationShape::one_tile());
+             IterationShape::one_tile(), cb_in0, cb_in1, cb_out);
      }
 diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/dataflow/reader_rotary_embedding_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/dataflow/reader_rotary_embedding_interleaved_start_id.cpp
 --- ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/kernels/dataflow/reader_rotary_embedding_interleaved_start_id.cpp
@@ -131,7 +131,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/de
 diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_program_factory.cpp
-@@ -485,6 +485,10 @@ ProgramDescriptor create_multi_tile_descriptor(
+@@ -478,6 +478,10 @@ ProgramDescriptor create_multi_tile_descriptor(
      const auto& sin = tensor_args.sin;
      auto& output = tensor_return_value;
      const auto& token_idx = operation_attributes.token_idx;
@@ -142,7 +142,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/de
  
      tt::DataFormat input_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
      uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
-@@ -697,6 +701,9 @@ ProgramDescriptor create_multi_tile_descriptor(
+@@ -687,6 +691,9 @@ ProgramDescriptor create_multi_tile_descriptor(
          reader_kernel_defines.emplace_back("DECODE_MODE", "1");
          writer_kernel_defines.emplace_back("DECODE_MODE", "1");
          compute_kernel_defines.emplace_back("DECODE_MODE", "1");
@@ -152,7 +152,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/de
      }
  
      const uint16_t bfloat16_scalar = std::bit_cast<uint16_t>(bfloat16(-1.0f));
-@@ -810,9 +817,12 @@ ProgramDescriptor create_multi_tile_descriptor(
+@@ -800,9 +807,12 @@ ProgramDescriptor create_multi_tile_descriptor(
      compute_desc_g1.core_ranges = core_group_1;
      compute_desc_g1.compile_time_args = compute_kernel_args_group_1;
      compute_desc_g1.defines = compute_kernel_defines;
@@ -168,7 +168,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding/de
  
      std::optional<KernelDescriptor> compute_desc_g2;
      if (!core_group_2.ranges().empty()) {
-@@ -856,7 +866,9 @@ ProgramDescriptor create_multi_tile_descriptor(
+@@ -846,7 +856,9 @@ ProgramDescriptor create_multi_tile_descriptor(
              num_rows_per_core = num_rows_per_core_group_2;
          }
  

@@ -1,7 +1,7 @@
 diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/cpack_common.h tt_metal/tt-llk/tt_llk_blackhole/common/inc/cpack_common.h
 --- tt_metal/tt-llk/tt_llk_blackhole/common/inc/cpack_common.h
 +++ tt_metal/tt-llk/tt_llk_blackhole/common/inc/cpack_common.h
-@@ -452,7 +452,21 @@
+@@ -446,7 +446,21 @@ inline void set_packer_config(
      bool is_int8_format = pack_src_format == to_underlying(DataFormat::Int8) || pack_src_format == to_underlying(DataFormat::UInt8);
  
      dest_rd_ctrl.f.PCK_DEST_RD_CTRL_Read_32b_data = is_32b_format || is_fp32_dest_acc_en;
@@ -24,7 +24,7 @@ diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/cpack_common.h tt_metal/t
  
      if (pack_dst_format == to_underlying(DataFormat::UInt8))
      {
-@@ -522,7 +536,21 @@
+@@ -516,7 +530,21 @@ __attribute__((noinline)) inline void reconfig_packer_data_format(
      bool is_int8_format = pack_src_format == to_underlying(DataFormat::Int8) || pack_src_format == to_underlying(DataFormat::UInt8);
  
      dest_rd_ctrl.f.PCK_DEST_RD_CTRL_Read_32b_data = is_32b_format || is_fp32_dest_acc_en;
@@ -47,7 +47,7 @@ diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/cpack_common.h tt_metal/t
  
      if (pack_dst_format == to_underlying(DataFormat::UInt8))
      {
-@@ -540,10 +568,17 @@
+@@ -534,10 +562,17 @@ __attribute__((noinline)) inline void reconfig_packer_data_format(
      static_assert(
          PCK_DEST_RD_CTRL_Read_32b_data_ADDR32 == PCK_DEST_RD_CTRL_Round_10b_mant_ADDR32,
          "PCK_DEST_RD_CTRL_Read_32b_data and Round_10b_mant must share ADDR32 for combined RMW");
@@ -69,7 +69,7 @@ diff --git tt_metal/tt-llk/tt_llk_blackhole/common/inc/cpack_common.h tt_metal/t
 diff --git tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/cpack_common.h tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/cpack_common.h
 --- tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/cpack_common.h
 +++ tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/cpack_common.h
-@@ -509,7 +509,21 @@
+@@ -509,7 +509,21 @@ inline void set_packer_config(
      bool is_int8_format = pack_src_format == to_underlying(DataFormat::Int8) || pack_src_format == to_underlying(DataFormat::UInt8);
  
      dest_rd_ctrl.f.PCK_DEST_RD_CTRL_Read_32b_data = is_32b_format || is_fp32_dest_acc_en;
@@ -92,7 +92,7 @@ diff --git tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/cpack_common.h tt_metal
  
      if (pack_dst_format == to_underlying(DataFormat::UInt8))
      {
-@@ -675,7 +689,21 @@
+@@ -675,7 +689,21 @@ __attribute__((noinline)) inline void reconfig_packer_data_format(
      bool is_int8_format = pack_src_format == to_underlying(DataFormat::Int8) || pack_src_format == to_underlying(DataFormat::UInt8);
  
      dest_rd_ctrl.f.PCK_DEST_RD_CTRL_Read_32b_data = is_32b_format || is_fp32_dest_acc_en;
@@ -115,7 +115,7 @@ diff --git tt_metal/tt-llk/tt_llk_wormhole_b0/common/inc/cpack_common.h tt_metal
  
      if (pack_dst_format == to_underlying(DataFormat::UInt8))
      {
-@@ -686,10 +714,17 @@
+@@ -686,10 +714,17 @@ __attribute__((noinline)) inline void reconfig_packer_data_format(
      {
          dest_rd_ctrl.f.PCK_DEST_RD_CTRL_Round_10b_mant = 1;
      }

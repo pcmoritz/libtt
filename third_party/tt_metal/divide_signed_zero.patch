@@ -1,7 +1,7 @@
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_binary.h
-@@ -288,7 +288,8 @@ inline void calculate_sfpu_binary_div(
+@@ -287,7 +287,8 @@ inline void calculate_sfpu_binary_div(
                  v_if(in0 == 0) { result = std::numeric_limits<float>::quiet_NaN(); }
                  v_else {
                      result = std::numeric_limits<float>::infinity();

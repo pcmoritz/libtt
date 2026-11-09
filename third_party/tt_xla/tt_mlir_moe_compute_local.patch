@@ -267,7 +267,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
  
  namespace tt::runtime::ttnn::operations::ccl {
  
-@@ -27,9 +31,138 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
+@@ -27,9 +31,141 @@
    return ::ttnn::experimental::prim::detail::MoEActivationFunction::SILU;
  }
  
@@ -379,7 +379,10 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
 +      toMetalActivation(op->activation_function()),
 +      /*compute_only=*/false, /*num_shared_experts_per_device=*/std::nullopt,
 +      /*local_combine=*/false, /*zero_fill_non_owned_rows=*/rings < 2,
-+      /*prefill_rings=*/rings);
++      /*prefill_rings=*/rings, /*enable_a2a_pipeline=*/false,
++      /*activation_limit=*/std::nullopt,
++      /*math_fidelity=*/::tt::tt_metal::MathFidelity::LoFi,
++      /*fp32_dest_acc_en=*/true);
 +
 +  LOG_ASSERT(results.size() == 6, "moe_compute returned ", results.size(),
 +             " tensors; expected 6");
@@ -406,6 +409,20 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
    ProgramTensorPool &tensorPool = context.getTensorPool();
  
    const ::ttnn::Tensor &tilizeInput =
+@@ -80,7 +216,12 @@
+       op->has_bias(), clusterAxis, topology, numLinks, muxCoreRangeSet,
+       /*output_memory_config=*/std::nullopt, combineOutput, combineSemaphore,
+       toMetalActivation(op->activation_function()),
+-      /*compute_only=*/false);
++      /*compute_only=*/false, /*num_shared_experts_per_device=*/std::nullopt,
++      /*local_combine=*/false, /*zero_fill_non_owned_rows=*/false,
++      /*prefill_rings=*/std::nullopt, /*enable_a2a_pipeline=*/false,
++      /*activation_limit=*/std::nullopt,
++      /*math_fidelity=*/::tt::tt_metal::MathFidelity::LoFi,
++      /*fp32_dest_acc_en=*/true);
+ 
+   LOG_ASSERT(results.size() == 6, "moe_compute returned ", results.size(),
+              " tensors; expected 6");
 diff --git a/include/ttmlir/Target/TTNN/operations/ccl.fbs b/include/ttmlir/Target/TTNN/operations/ccl.fbs
 --- a/include/ttmlir/Target/TTNN/operations/ccl.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/ccl.fbs

@@ -58,7 +58,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/device/topk_constants.hpp ttn
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
 --- ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
-@@ -654,8 +654,12 @@ std::vector<Tensor> topk(
+@@ -655,8 +655,12 @@ std::vector<Tensor> topk(
          }
      }
  

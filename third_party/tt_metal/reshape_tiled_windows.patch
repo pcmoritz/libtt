@@ -39,7 +39,7 @@ new file mode 100644
 +    Noc noc;
 +    // One window per segment, then this core's output pages.
 +    Scratchpad<uint8_t> staging(scratch::staging);
-+    const uint32_t windows_base = round_up(staging.get_base_address(), Alignment);
++    const uint32_t windows_base = round_up(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&staging[0])), Alignment);
 +    const uint32_t pages_base = windows_base + Max_Segments * Alignment;
 +
 +    // Segment s: vararg 2s is its window (input page * Windows_Per_Page + window in the page); vararg

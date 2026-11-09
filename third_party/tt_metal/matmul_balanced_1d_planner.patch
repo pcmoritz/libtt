@@ -70,7 +70,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_t
 diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.cpp
-@@ -3332,6 +3332,7 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
+@@ -3338,6 +3338,7 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
      uint32_t out_block_w,
      uint32_t per_core_M,
      uint32_t per_core_N,
@@ -78,7 +78,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
      std::optional<UnaryWithParam> fused_activation,
      const MeshTensor& in0_tensor,
      const MeshTensor& in1_tensor,
-@@ -3478,6 +3479,19 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
+@@ -3487,6 +3488,19 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
  
      uint32_t num_blocks_y = ((M - 1) / per_core_M) + 1;
      uint32_t num_blocks_x = ((N - 1) / per_core_N) + 1;
@@ -98,7 +98,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
      uint32_t num_blocks_total = num_blocks_y * num_blocks_x;
      uint32_t num_cores_with_work = num_blocks_total;
  
-@@ -4544,6 +4558,27 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
+@@ -4553,6 +4567,27 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
          const auto& core = cores[i];
          uint32_t output_idx_x = i % num_blocks_x;
          uint32_t output_idx_y = i / num_blocks_x;
@@ -126,7 +126,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
  
          if (in0_is_sharded) {
              std::vector<uint32_t> varargs;
-@@ -4584,36 +4619,34 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
+@@ -4593,36 +4628,34 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
                  {{"in0_mcast_sender_noc_x", static_cast<uint32_t>(top_left_core_physical.x)},
                   {"in0_mcast_sender_noc_y", static_cast<uint32_t>(top_left_core_physical.y)}});
          }
@@ -172,7 +172,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
              }
          }
      }
-@@ -6624,6 +6657,7 @@ ttnn::device_operation::ProgramArtifacts MatmulMultiCoreReuseMcast1DProgramFacto
+@@ -6634,6 +6667,7 @@ ttnn::device_operation::ProgramArtifacts MatmulMultiCoreReuseMcast1DProgramFacto
      auto out_block_w = program_config.out_block_w;
      auto per_core_M = program_config.per_core_M;
      auto per_core_N = program_config.per_core_N;
@@ -180,7 +180,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/factory/matmul_multicore_reuse
      auto mcast_in0 = program_config.mcast_in0;
      auto gather_in0 = program_config.gather_in0;
  
-@@ -6765,6 +6799,7 @@ ttnn::device_operation::ProgramArtifacts MatmulMultiCoreReuseMcast1DProgramFacto
+@@ -6775,6 +6809,7 @@ ttnn::device_operation::ProgramArtifacts MatmulMultiCoreReuseMcast1DProgramFacto
              out_block_w,
              per_core_M,
              per_core_N,

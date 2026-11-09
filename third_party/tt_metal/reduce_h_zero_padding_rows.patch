@@ -132,7 +132,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/welford_reduce_prog
 diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
 --- ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
-@@ -614,8 +614,21 @@ Tensor reduce(
+@@ -628,8 +628,21 @@ Tensor reduce(
                                                    is_bitwise_reduce_type(reduce_type)
                                                ? ttnn::PadValue{std::bit_cast<uint32_t>(pad_value)}
                                                : ttnn::PadValue{pad_value};

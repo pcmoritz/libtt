@@ -30,7 +30,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
      Tensor padded_input_tensor =
          dm::pre_sort_transform_tensor(transform_input, dim, is_dim_last_idx, is_rank_le_4d, descending);
      const MemoryConfig device_op_mem_cfg = sort_mem_cfg.is_sharded() ? ttnn::DRAM_MEMORY_CONFIG : sort_mem_cfg;
-@@ -396,7 +406,7 @@ std::vector<Tensor> sort(
+@@ -398,7 +408,7 @@ std::vector<Tensor> sort(
          const auto& out1 = std::get<1>(*optional_output_tensors);
          const bool values_layout_match = (out0.layout() == padded_input_tensor.layout());
          const bool indices_layout_match = (out1.layout() == padded_input_tensor.layout());
@@ -39,7 +39,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/sort/sort.cpp ttnn/cpp/ttnn/op
          if (!preallocated_layout_mismatch) {
              const auto canonicalize_output = [&](const Tensor& t) {
                  return dm::pre_sort_transform_tensor(t, dim, is_dim_last_idx, is_rank_le_4d, descending);
-@@ -414,6 +424,10 @@ std::vector<Tensor> sort(
+@@ -416,6 +426,10 @@ std::vector<Tensor> sort(
      auto results = dm::post_sort_transform_tensor(
          input_tensor, sorted_tensors, dim, is_dim_last_idx, original_lshape, device_op_mem_cfg);
  

@@ -511,7 +511,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/device/reduce_op.cpp ttnn/
 diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
 --- ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp
-@@ -91,26 +91,46 @@ std::pair<ttsl::SmallVector<int>, ttsl::SmallVector<int>> split_height_width_dim
+@@ -93,26 +93,46 @@ std::pair<ttsl::SmallVector<int>, ttsl::SmallVector<int>> split_height_width_dim
      return {non_height_width_dims, height_width_dims};
  }
  
@@ -561,7 +561,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
  
      return reduce_type == reduction_common::ReduceType::Max
                 ? -std::numeric_limits<float>::infinity()
-@@ -205,8 +225,17 @@ static Tensor reduce_impl(
+@@ -207,8 +227,17 @@ static Tensor reduce_impl(
  
                      bool transpose = i_dim < rank - 2;
                      int reduce_dim = i_dim;
@@ -580,7 +580,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
                          reduce_dim = rank - 2;
                      }
                      // Only the smallest-axis sub-step ends the chain; earlier sub-steps stay in fp32.
-@@ -239,7 +268,7 @@ static Tensor reduce_impl(
+@@ -241,7 +270,7 @@ static Tensor reduce_impl(
                              /*fast_and_approximate_mode=*/fast_and_approximate_mode);
                      }
                      if (transpose) {
@@ -589,7 +589,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
                      }
                  }
              }
-@@ -247,7 +276,8 @@ static Tensor reduce_impl(
+@@ -249,7 +278,8 @@ static Tensor reduce_impl(
          };
          constexpr bool linear_type = reduce_type == reduction_common::ReduceType::Sum ||
                                       reduce_type == reduction_common::ReduceType::Max ||
@@ -599,7 +599,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
          if (dim.size() == 1 || linear_type) {
              output_tensor = reduce_nd_loop(/*use_reduce_type=*/true, scalar);
          } else if constexpr (reduce_type == reduction_common::ReduceType::Mean) {
-@@ -337,6 +367,16 @@ static Tensor reduce_impl(
+@@ -339,6 +369,16 @@ static Tensor reduce_impl(
                  sub_core_grids,
                  /*negate=*/false,
                  /*fast_and_approximate_mode=*/fast_and_approximate_mode);
@@ -616,7 +616,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
          } else {
              TT_THROW("Unsupported reduction operation");
          }
-@@ -569,7 +609,9 @@ Tensor reduce(
+@@ -583,7 +623,9 @@ Tensor reduce(
      bool is_tiled = input_tensor_arg.layout() == TILE_LAYOUT;
      // For INT32 the pad sentinel is carried as a raw bit pattern (see get_pad_value); pass it through
      // PadValue's integer arm so fill_pad reinterprets the bits rather than decoding numerically.
@@ -627,7 +627,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/generic/generic_reductions.cpp ttn
                                                ? ttnn::PadValue{std::bit_cast<uint32_t>(pad_value)}
                                                : ttnn::PadValue{pad_value};
      auto input_tensor =
-@@ -801,6 +843,36 @@ Tensor min(
+@@ -815,6 +857,36 @@ Tensor min(
          fast_and_approximate_mode);
  }
  

@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/creation/creation.cpp ttnn/cpp/ttnn/operations/creation/creation.cpp
 --- ttnn/cpp/ttnn/operations/creation/creation.cpp
 +++ ttnn/cpp/ttnn/operations/creation/creation.cpp
-@@ -101,6 +101,13 @@
+@@ -101,6 +101,13 @@ template Tensor arange_impl<uint16_t>(
      const Layout layout,
      std::optional<std::reference_wrapper<MeshDevice>> device,
      const MemoryConfig& output_mem_config);
@@ -15,7 +15,7 @@ diff --git ttnn/cpp/ttnn/operations/creation/creation.cpp ttnn/cpp/ttnn/operatio
  template Tensor arange_impl<uint32_t>(
      const int64_t start,
      const int64_t stop,
-@@ -427,6 +434,7 @@
+@@ -431,6 +438,7 @@ Tensor arange(
          case DataType::BFLOAT16: return concrete_arange.template operator()<::bfloat16>();
          case DataType::FLOAT16: return concrete_arange.template operator()<tt::tt_metal::float16>();
          case DataType::FLOAT32: return concrete_arange.template operator()<float>();

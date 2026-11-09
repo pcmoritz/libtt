@@ -82,7 +82,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
-@@ -71,7 +71,8 @@ bool unary_op_supports_integer_dtype(UnaryOpType op_type, DataType dtype) {
+@@ -72,7 +72,8 @@ bool unary_op_supports_integer_dtype(UnaryOpType op_type, DataType dtype) {
          case UnaryOpType::RIGHT_SHIFT:
          case UnaryOpType::SQUARE: return is_int32_uint32_uint16(dtype);
  

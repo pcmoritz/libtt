@@ -1,7 +1,7 @@
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
-@@ -554,48 +554,12 @@
+@@ -555,48 +555,12 @@ inline void calculate_typecast_uint32_to_uint16() {
  
  template <bool APPROXIMATION_MODE, int ITERATIONS>
  inline void calculate_typecast_int32_to_uint16() {
@@ -51,7 +51,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_ty
  }
  
  template <bool APPROXIMATION_MODE>
-@@ -929,32 +893,6 @@
+@@ -916,32 +880,6 @@ template <bool APPROXIMATION_MODE>
  inline void init_typecast_int32_to_uint16() {
      addr_mod_t{.srca = {.incr = 0}, .srcb = {.incr = 0}, .dest = {.incr = 2}}.set(ADDR_MOD_6);
      math::reset_counters(p_setrwc::SET_ABD_F);
@@ -87,7 +87,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_ty
 diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 --- tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
 +++ tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_typecast.h
-@@ -572,48 +572,12 @@
+@@ -574,48 +574,12 @@ inline void calculate_typecast_uint32_to_uint16() {
  
  template <bool APPROXIMATION_MODE, int ITERATIONS>
  inline void calculate_typecast_int32_to_uint16() {
@@ -137,7 +137,7 @@ diff --git tt_metal/hw/ckernels/wormhole_b0/metal/llk_api/llk_sfpu/ckernel_sfpu_
  }
  
  template <bool APPROXIMATION_MODE>
-@@ -952,33 +916,6 @@
+@@ -940,33 +904,6 @@ template <bool APPROXIMATION_MODE>
  inline void init_typecast_int32_to_uint16() {
      addr_mod_t{.srca = {.incr = 0}, .srcb = {.incr = 0}, .dest = {.incr = 2}}.set(ADDR_MOD_6);
      math::reset_counters(p_setrwc::SET_ABD_F);

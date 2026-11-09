@@ -101,45 +101,35 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_f
 diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
-@@ -20,6 +20,10 @@ void kernel_main() {
+@@ -45,17 +45,29 @@ void kernel_main() {
+     Noc noc;
  
-     // The tensor binding sequence carries its own length, so the host passes no tensor count.
-     constexpr uint32_t num_tensors = std::tuple_size_v<decltype(tensor::inputs)>;
-+#ifdef WIDTH_CONCAT
+ #ifdef WIDTH_CONCAT
 +    // Offset of the scratch area, past the output stick, in each DFB entry.
 +    constexpr uint32_t scratch_offset = get_arg(args::scratch_offset);
-+#endif
- 
-     // ublocks size defined in pages
-     constexpr uint32_t ublock_size_pages = 1;
-@@ -48,19 +52,28 @@ void kernel_main() {
+     // Each output page is one page from every input, in input order. Every block is one page and
+     // this core starts at input 0, so output page i of this core reads page (first page id + i)
+     // of each input.
+     for (uint32_t i = 0; i < num_pages; ++i) {
          dfb_in.reserve_back(ublock_size_pages);
          uint32_t l1_write_addr = dfb_in.get_write_ptr();
- #ifdef WIDTH_CONCAT
 +        const uint32_t scratch_addr = l1_write_addr + scratch_offset;
-         // For width concat we know we start at curr_tensor=0
-         // num_pages_per_block[curr_tensor] is always one for width concat
          for (uint32_t j = 0; j < num_tensors; ++j) {
-             // The per-tensor page sizes are compile-time varargs: baked into the program, but
-             // selected here by a value that advances at run time.
-             auto page_size = get_compile_time_vararg(curr_tensor);
-+            // The bytes of the stick to keep, which follow the page sizes in the varargs.
-+            auto copy_size = get_compile_time_vararg(num_tensors + curr_tensor);
-             noc.async_read(
-                 abstract_tensor_accessor_wrappers[curr_tensor],
--                CoreLocalMem<uint8_t>(l1_write_addr),
-+                CoreLocalMem<uint8_t>(scratch_addr),
-                 page_size,
-                 {.page_id = page_id_per_tensor[curr_tensor]},
-                 {});
--            l1_write_addr += page_size;
++            // Each page lands in the scratch area; only the bytes of its stick, which follow the page sizes in
++            // the varargs, are copied into the output stick.
+             concat_reader::with_input(j, tensor_indices, [&](auto I) {
+-                read_input_page<decltype(I)::value>(noc, l1_write_addr, get_vararg(page_id_per_tensor_offset + j) + i);
++                read_input_page<decltype(I)::value>(noc, scratch_addr, get_vararg(page_id_per_tensor_offset + j) + i);
+             });
+-            l1_write_addr += get_compile_time_vararg(j);
 +            noc.async_read_barrier();
++            const uint32_t copy_size = get_compile_time_vararg(num_tensors + j);
 +            auto* src = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(scratch_addr);
 +            auto* dst = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(l1_write_addr);
 +            for (uint32_t byte = 0; byte < copy_size; ++byte) {
 +                dst[byte] = src[byte];
 +            }
 +            l1_write_addr += copy_size;
-             page_id_per_tensor[curr_tensor]++;
-             curr_tensor++;
          }
+         noc.async_read_barrier();
+         dfb_in.push_back(ublock_size_pages);

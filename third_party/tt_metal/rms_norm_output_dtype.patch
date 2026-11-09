@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
-@@ -478,7 +478,9 @@ tt::tt_metal::TensorSpec LayerNormDeviceOperation::compute_output_specs(
+@@ -546,7 +546,9 @@ tt::tt_metal::TensorSpec LayerNormDeviceOperation::compute_output_specs(
                  return tt::tt_metal::TensorSpec(
                      output_shape,
                      TensorLayout(
@@ -25,7 +25,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/rmsnorm/rmsnorm.cpp ttnn/cpp/t
      auto output_memory_config = memory_config.value_or(input_tensor.memory_config());
      auto rank = input_tensor.logical_shape().size();
  
-@@ -72,7 +73,7 @@ Tensor rms_norm(
+@@ -79,7 +80,7 @@ Tensor rms_norm(
              input_tensor.tensor_spec().tile().get_height(),
              input_tensor.tensor_spec().tile().get_width())),
          kernel_config_val,

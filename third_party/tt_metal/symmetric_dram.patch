@@ -20,6 +20,95 @@ diff --git tt_metal/api/tt-metalium/allocator.hpp tt_metal/api/tt-metalium/alloc
      // debug/test/internal usage.
      AllocatorImpl& impl() { return *impl_; }
      const AllocatorImpl& impl() const { return *impl_; }
+diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocator.cpp
+--- tt_metal/impl/allocator/allocator.cpp
++++ tt_metal/impl/allocator/allocator.cpp
+@@ -207,6 +207,19 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
+ 
+     switch (buffer_type) {
+         case BufferType::DRAM:
++            // Kernel binaries of programs created in the scope are allocated top down and stay
++            // outside the region, which the next scope reuses.
++            if (symmetric_active_ && bottom_up && std::this_thread::get_id() == symmetric_thread_) {
++                TT_FATAL(!num_cores.has_value(), "Symmetric DRAM buffers must be interleaved");
++                address = symmetric_next_;
++                symmetric_next_ += detail::calculate_bank_size_spread(
++                    size, page_size, dram_manager_->num_banks(), config_->dram_alignment);
++                TT_FATAL(
++                    symmetric_next_ <= symmetric_base_ + symmetric_size_,
++                    "Symmetric DRAM region of {} B per bank is too small for this collective",
++                    symmetric_size_);
++                break;
++            }
+             address = dram_manager_->allocate_buffer(size, page_size, bottom_up, config_->compute_grid, num_cores);
+             break;
+         case BufferType::L1: {
+@@ -350,7 +363,12 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
+     }
+ 
+     switch (buffer_type) {
+-        case BufferType::DRAM: dram_manager_->deallocate_buffer(address); break;
++        case BufferType::DRAM:
++            if (address >= symmetric_base_ && address < symmetric_base_ + symmetric_size_) {
++                break;
++            }
++            dram_manager_->deallocate_buffer(address);
++            break;
+         case BufferType::L1: l1_manager_->deallocate_buffer(address); break;
+         case BufferType::L1_SMALL: l1_small_manager_->deallocate_buffer(address); break;
+         case BufferType::TRACE: trace_buffer_manager_->deallocate_buffer(address); break;
+@@ -364,6 +382,34 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
+     }
+ }
+ 
++void AllocatorImpl::set_symmetric_dram(DeviceAddr base, DeviceAddr size_per_bank) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    symmetric_base_ = base;
++    symmetric_size_ = size_per_bank;
++}
++
++bool AllocatorImpl::has_symmetric_dram() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return symmetric_size_ > 0;
++}
++
++void AllocatorImpl::begin_symmetric_dram() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    TT_FATAL(symmetric_size_ > 0, "No symmetric DRAM region is set");
++    TT_FATAL(!symmetric_active_, "A symmetric DRAM scope is already open");
++    symmetric_active_ = true;
++    symmetric_thread_ = std::this_thread::get_id();
++    symmetric_next_ = symmetric_base_;
++}
++
++void AllocatorImpl::end_symmetric_dram() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    TT_FATAL(
++        symmetric_active_ && symmetric_thread_ == std::this_thread::get_id(),
++        "No symmetric DRAM scope is open on this thread");
++    symmetric_active_ = false;
++}
++
+ void AllocatorImpl::deallocate_buffers() {
+     std::lock_guard<std::mutex> lock(mutex_);
+     this->release_trace_dram_reservations();
+@@ -885,6 +931,16 @@ Statistics Allocator::get_statistics(const BufferType& buffer_type) const { retu
+ 
+ size_t Allocator::get_worker_l1_size() const { return impl_->get_worker_l1_size(); }
+ 
++void Allocator::set_symmetric_dram(DeviceAddr base, DeviceAddr size_per_bank) {
++    impl_->set_symmetric_dram(base, size_per_bank);
++}
++
++bool Allocator::has_symmetric_dram() const { return impl_->has_symmetric_dram(); }
++
++void Allocator::begin_symmetric_dram() { impl_->begin_symmetric_dram(); }
++
++void Allocator::end_symmetric_dram() { impl_->end_symmetric_dram(); }
++
+ }  // namespace tt::tt_metal
+ 
+ namespace tt::tt_metal::experimental {
 diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocator.hpp
 --- tt_metal/impl/allocator/allocator.hpp
 +++ tt_metal/impl/allocator/allocator.hpp
@@ -58,92 +147,3 @@ diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocat
      std::unique_ptr<BankManager> dram_manager_;
      std::unique_ptr<BankManager> l1_manager_;
      std::unique_ptr<BankManager> l1_small_manager_;
-diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocator.cpp
---- tt_metal/impl/allocator/allocator.cpp
-+++ tt_metal/impl/allocator/allocator.cpp
-@@ -205,6 +205,19 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
- 
-     switch (buffer_type) {
-         case BufferType::DRAM:
-+            // Kernel binaries of programs created in the scope are allocated top down and stay
-+            // outside the region, which the next scope reuses.
-+            if (symmetric_active_ && bottom_up && std::this_thread::get_id() == symmetric_thread_) {
-+                TT_FATAL(!num_cores.has_value(), "Symmetric DRAM buffers must be interleaved");
-+                address = symmetric_next_;
-+                symmetric_next_ += detail::calculate_bank_size_spread(
-+                    size, page_size, dram_manager_->num_banks(), config_->dram_alignment);
-+                TT_FATAL(
-+                    symmetric_next_ <= symmetric_base_ + symmetric_size_,
-+                    "Symmetric DRAM region of {} B per bank is too small for this collective",
-+                    symmetric_size_);
-+                break;
-+            }
-             address = dram_manager_->allocate_buffer(size, page_size, bottom_up, config_->compute_grid, num_cores);
-             break;
-         case BufferType::L1: {
-@@ -348,7 +361,12 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
-     }
- 
-     switch (buffer_type) {
--        case BufferType::DRAM: dram_manager_->deallocate_buffer(address); break;
-+        case BufferType::DRAM:
-+            if (address >= symmetric_base_ && address < symmetric_base_ + symmetric_size_) {
-+                break;
-+            }
-+            dram_manager_->deallocate_buffer(address);
-+            break;
-         case BufferType::L1: l1_manager_->deallocate_buffer(address); break;
-         case BufferType::L1_SMALL: l1_small_manager_->deallocate_buffer(address); break;
-         case BufferType::TRACE: trace_buffer_manager_->deallocate_buffer(address); break;
-@@ -362,6 +380,34 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
-     }
- }
- 
-+void AllocatorImpl::set_symmetric_dram(DeviceAddr base, DeviceAddr size_per_bank) {
-+    std::lock_guard<std::mutex> lock(mutex_);
-+    symmetric_base_ = base;
-+    symmetric_size_ = size_per_bank;
-+}
-+
-+bool AllocatorImpl::has_symmetric_dram() const {
-+    std::lock_guard<std::mutex> lock(mutex_);
-+    return symmetric_size_ > 0;
-+}
-+
-+void AllocatorImpl::begin_symmetric_dram() {
-+    std::lock_guard<std::mutex> lock(mutex_);
-+    TT_FATAL(symmetric_size_ > 0, "No symmetric DRAM region is set");
-+    TT_FATAL(!symmetric_active_, "A symmetric DRAM scope is already open");
-+    symmetric_active_ = true;
-+    symmetric_thread_ = std::this_thread::get_id();
-+    symmetric_next_ = symmetric_base_;
-+}
-+
-+void AllocatorImpl::end_symmetric_dram() {
-+    std::lock_guard<std::mutex> lock(mutex_);
-+    TT_FATAL(
-+        symmetric_active_ && symmetric_thread_ == std::this_thread::get_id(),
-+        "No symmetric DRAM scope is open on this thread");
-+    symmetric_active_ = false;
-+}
-+
- void AllocatorImpl::deallocate_buffers() {
-     std::lock_guard<std::mutex> lock(mutex_);
-     this->release_trace_dram_reservations();
-@@ -883,6 +929,16 @@ Statistics Allocator::get_statistics(const BufferType& buffer_type) const { retu
- 
- size_t Allocator::get_worker_l1_size() const { return impl_->get_worker_l1_size(); }
- 
-+void Allocator::set_symmetric_dram(DeviceAddr base, DeviceAddr size_per_bank) {
-+    impl_->set_symmetric_dram(base, size_per_bank);
-+}
-+
-+bool Allocator::has_symmetric_dram() const { return impl_->has_symmetric_dram(); }
-+
-+void Allocator::begin_symmetric_dram() { impl_->begin_symmetric_dram(); }
-+
-+void Allocator::end_symmetric_dram() { impl_->end_symmetric_dram(); }
-+
- }  // namespace tt::tt_metal
- 
- namespace tt::tt_metal::experimental {

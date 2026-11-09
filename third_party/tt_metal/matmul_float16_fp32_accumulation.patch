@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
-@@ -3208,6 +3208,11 @@ MatmulParams create_matmul_attributes(
+@@ -3268,6 +3268,11 @@ MatmulParams create_matmul_attributes(
          }
      }
      bool is_float_32 = output_dtype == DataType::FLOAT32;
@@ -13,7 +13,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
      // A decode matmul (one tile row of activations) accumulates in FP32 on Blackhole. At one tile row it takes no
      // longer, its error is about 2.4x smaller (the BF16 Dst sums lose bits), and the K block no longer changes the
      // result, so the 1D planner may size the block for DRAM bandwidth (get_mcast_1d_config). A caller's program
-@@ -3221,7 +3226,7 @@ MatmulParams create_matmul_attributes(
+@@ -3281,7 +3286,7 @@ MatmulParams create_matmul_attributes(
          parameters.compute_kernel_config,
          math_fidelity,
          /*default_approx_mode=*/false,

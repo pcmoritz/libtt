@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
-@@ -115,6 +115,59 @@ Tensor restore_scalar_output_layout(
+@@ -117,6 +117,59 @@ Tensor restore_scalar_output_layout(
  
  }  // namespace
  
@@ -61,7 +61,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cp
  // nextafter
  Tensor nextafter(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
      return ttnn::detail::invoke_binary_ng(
-@@ -130,7 +183,7 @@ Tensor minimum(
+@@ -132,7 +185,7 @@ Tensor minimum(
      ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
      ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
      ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
@@ -70,7 +70,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cp
          input_tensor_a,
          input_tensor_b,
          binary::BinaryOpType::MINIMUM,
-@@ -180,7 +233,7 @@ Tensor maximum(
+@@ -182,7 +235,7 @@ Tensor maximum(
      ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
      ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
      ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
@@ -82,7 +82,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cp
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_composite_op.cpp
-@@ -223,29 +223,17 @@ Tensor clamp(
+@@ -228,29 +228,17 @@ Tensor clamp(
      const std::optional<Tensor>& output_tensor) {
      auto output_memory_config = output_mem_config.value_or(input_a.memory_config());
      TT_FATAL((max.has_value() || min.has_value()), "Only one of 'min' or 'max' can be None. Please provide one value");

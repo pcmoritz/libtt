@@ -74,7 +74,7 @@ diff --git tt_metal/hw/inc/api/compute/eltwise_unary/clamp.h tt_metal/hw/inc/api
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp
-@@ -687,6 +687,11 @@ std::pair<std::string, std::string> get_op_init_and_func_parameterized(
+@@ -692,6 +692,11 @@ std::pair<std::string, std::string> get_op_init_and_func_parameterized(
                      "clamp_tile_init();",
                      fmt::format("clamp_tile_int32({}, {}, {});", idst, static_cast<uint32_t>(static_cast<int32_t>(params[0])), static_cast<uint32_t>(static_cast<int32_t>(params[1])))};
              }
@@ -89,7 +89,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp ttnn
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
-@@ -33,8 +33,9 @@ bool is_relu_family_int(DataType dtype) { return is_int32(dtype) || is_unsigned_
+@@ -34,8 +34,9 @@ bool is_relu_family_int(DataType dtype) { return is_int32(dtype) || is_unsigned_
  bool unary_op_supports_integer_dtype(UnaryOpType op_type, DataType dtype) {
      switch (op_type) {
          case UnaryOpType::ABS: return is_unsigned_int(dtype);

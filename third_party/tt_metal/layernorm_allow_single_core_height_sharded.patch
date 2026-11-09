@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_device_operation.cpp
-@@ -160,14 +160,18 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
+@@ -220,14 +220,18 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
                  beta.value().dtype());
          }
      }
@@ -23,7 +23,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/layernorm/device/layernorm_dev
              "Sharded inputs require sharded outputs.");
          if (b.has_value()) {
              TT_FATAL(b.value().is_sharded(), "residual tensor b should be sharded if input a is sharded");
-@@ -335,7 +339,8 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
+@@ -403,7 +407,8 @@ void LayerNormDeviceOperation::validate_on_program_cache_miss(
                          program_config.block_h,
                          Mt);
                      TT_FATAL(

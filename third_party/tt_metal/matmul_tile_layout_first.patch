@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/matmul/matmul.cpp ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 --- ttnn/cpp/ttnn/operations/matmul/matmul.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/matmul.cpp
-@@ -247,6 +247,12 @@
+@@ -256,6 +256,12 @@ static ttnn::Tensor bound_matmul(
              bias);
      }
  

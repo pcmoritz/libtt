@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.cpp
-@@ -72,12 +72,18 @@ Tensor local_sum(
+@@ -73,12 +73,18 @@ Tensor local_sum(
          input_tensor = ttnn::to_layout(gathered_tensor, Layout::TILE);
      }
  
@@ -26,7 +26,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce
      }
  
      auto sum_tensor = ttnn::moreh_sum(
-@@ -88,9 +94,8 @@ Tensor local_sum(
+@@ -89,9 +95,8 @@ Tensor local_sum(
          memory_config,
          /* device kernel config */ std::nullopt);
  
