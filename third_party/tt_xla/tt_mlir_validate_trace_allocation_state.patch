@@ -397,11 +397,13 @@ diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/ru
 diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/trace_cache.cpp
 --- a/runtime/lib/ttnn/types/trace_cache.cpp
 +++ b/runtime/lib/ttnn/types/trace_cache.cpp
-@@ -3,9 +3,129 @@
+@@ -3,9 +3,139 @@
  // SPDX-License-Identifier: Apache-2.0
  
  #include "tt/runtime/detail/ttnn/types/trace_cache.h"
 +#include "tt/runtime/detail/ttnn/types/types.h"
++
++#include <tt-metalium/distributed.hpp>
 +
 +#include <algorithm>
 +#include <unordered_set>
@@ -425,11 +427,19 @@ diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/tra
 +  }
 +}
 +
++// Waits for the work queued so far on CQ 0 of this process's chips. Unlike
++// finish(), it doesn't wait for the other processes of a mesh, which capture,
++// evict and release the traces of their own programs.
++static void drainCommandQueue(::ttnn::MeshDevice *meshDevice) {
++  ::tt::tt_metal::distributed::EventSynchronize(
++      meshDevice->mesh_command_queue(0).enqueue_record_event_to_host());
++}
++
 +static void releaseTraceData(::ttnn::MeshDevice *meshDevice,
 +                             TraceData &traceData) {
 +  // Generated traces execute asynchronously on CQ 0. Drain outstanding
 +  // replays before releasing their command buffers or persistent slots.
-+  meshDevice->mesh_command_queue(0).finish();
++  drainCommandQueue(meshDevice);
 +  for (TraceVariant &variant : traceData.variants) {
 +    ::ttnn::operations::trace::release_trace(meshDevice, variant.traceId);
 +  }
@@ -505,7 +515,7 @@ diff --git a/runtime/lib/ttnn/types/trace_cache.cpp b/runtime/lib/ttnn/types/tra
 +  if (!lockedDevice || !lockedDevice->is_initialized()) {
 +    return;
 +  }
-+  lockedDevice->mesh_command_queue(0).finish();
++  drainCommandQueue(lockedDevice.get());
 +  ::ttnn::operations::trace::release_trace(lockedDevice.get(),
 +                                            evictedVariant.traceId);
 +
