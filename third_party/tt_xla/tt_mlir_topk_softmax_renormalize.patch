@@ -1,10 +1,68 @@
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -468,6 +468,79 @@ static bool isFullOpWithValue(Value value, float expectedValue,
+@@ -468,6 +468,161 @@ static bool isFullOpWithValue(Value value, float expectedValue,
    return false;
  }
  
++// Softmax as PyTorch writes it: exp(x) times the reciprocal of its sum.
++//
++//   %e = exp(%x)
++//   %r = div(1, sum(%e, keep_dim=true))
++//   %s = multiply(%e, broadcast(%r))   ->   %s = softmax(%x)
++//
++// ReductionWithReshapePattern folds PyTorch's sum and reshape into the keep-dim
++// sum, and NumericStableSoftmaxFusionPattern then takes in the subtracted max.
++class SoftmaxReciprocalFusionPattern
++    : public mlir::OpRewritePattern<MultiplyOp> {
++  using mlir::OpRewritePattern<MultiplyOp>::OpRewritePattern;
++
++public:
++  mlir::LogicalResult
++  matchAndRewrite(MultiplyOp multiplyOp,
++                  mlir::PatternRewriter &rewriter) const final {
++    for (auto [exp, reciprocal] :
++         {std::pair(multiplyOp.getLhs(), multiplyOp.getRhs()),
++          std::pair(multiplyOp.getRhs(), multiplyOp.getLhs())}) {
++      auto expOp = exp.getDefiningOp<ExpOp>();
++      auto divOp =
++          ttmlir::utils::findOpThrough<DivOp, BroadcastOp>(reciprocal);
++      if (!expOp || !divOp || expOp.getType() != multiplyOp.getType()) {
++        continue;
++      }
++      // The 1 is a splat constant or, from JAX, a ones op.
++      std::optional<double> one = getSplatConstantValue(divOp.getLhs());
++      const bool isOne =
++          (one && *one == 1.0) ||
++          utils::lookThroughLayoutOps(divOp.getLhs()).getDefiningOp<OnesOp>();
++      auto sumOp = divOp.getRhs().getDefiningOp<SumOp>();
++      if (!isOne || !sumOp || !sumOp.getKeepDim() ||
++          sumOp.getInput() != expOp.getResult() || !sumOp.getDimArg() ||
++          sumOp.getDimArg()->size() != 1) {
++        continue;
++      }
++      // exp feeds only the sum and the product, the sum only the reciprocal,
++      // and the reciprocal (and its broadcast) only the product.
++      if (ttmlir::utils::countUsers(expOp.getResult()) != 2 ||
++          !sumOp.getResult().hasOneUse() || !divOp.getResult().hasOneUse() ||
++          !reciprocal.hasOneUse()) {
++        continue;
++      }
++      int64_t dim =
++          mlir::cast<mlir::IntegerAttr>((*sumOp.getDimArg())[0]).getInt();
++      if (isWideSoftmax(
++              mlir::cast<mlir::RankedTensorType>(multiplyOp.getType()), dim)) {
++        return mlir::failure();
++      }
++      rewriter.replaceOpWithNewOp<SoftmaxOp>(multiplyOp, multiplyOp.getType(),
++                                             expOp.getInput(), dim,
++                                             /*numericStable=*/false);
++      return mlir::success();
++    }
++    return mlir::failure();
++  }
++};
++
 +// A mixture-of-experts router takes the top k of softmax(x) and renormalizes
 +// them over the k picks: p_i / sum_k p_j, which is exp(x_i) / sum_k exp(x_j),
 +// the softmax of the top k of x. Rewrite it that way:
@@ -17,6 +75,11 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +// division. softmax is monotonic, so topk picks the same indices from x as from
 +// softmax(x), except where rounding makes two softmax values of different x
 +// equal: topk(softmax(x)) breaks that tie by index, topk(x) by x.
++//
++// The sum may have an epsilon added, as SGLang-TorchTPU's router does (1e-20),
++// if it is too small to change it: the top k of N probabilities sum to at
++// least k / N, and adding less than (k / N) * 2^-25 leaves that sum unchanged
++// in FP32.
 +class TopKSoftmaxRenormalizePattern : public mlir::OpRewritePattern<DivOp> {
 +  using mlir::OpRewritePattern<DivOp>::OpRewritePattern;
 +
@@ -48,8 +111,27 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +    if (divOp.getType() != values.getType()) {
 +      return mlir::failure();
 +    }
-+    auto sumOp =
-+        ttmlir::utils::findOpThrough<SumOp, BroadcastOp>(divOp.getRhs());
++    mlir::Value denominator =
++        ttmlir::utils::lookThrough<BroadcastOp>(divOp.getRhs());
++    if (auto addOp = denominator.getDefiningOp<AddOp>()) {
++      const double maxEpsilon = static_cast<double>(topkOp.getK()) /
++                                inputType.getDimSize(dim) * std::ldexp(1.0, -25);
++      auto negligible = [maxEpsilon](mlir::Value value) {
++        std::optional<double> epsilon = getSplatConstantValue(value);
++        return epsilon && std::abs(*epsilon) <= maxEpsilon;
++      };
++      if (!addOp.getResult().hasOneUse() || inputType.isDynamicDim(dim)) {
++        return mlir::failure();
++      }
++      if (negligible(addOp.getRhs())) {
++        denominator = addOp.getLhs();
++      } else if (negligible(addOp.getLhs())) {
++        denominator = addOp.getRhs();
++      } else {
++        return mlir::failure();
++      }
++    }
++    auto sumOp = denominator.getDefiningOp<SumOp>();
 +    if (!sumOp || !sumOp.getKeepDim() || sumOp.getInput() != values ||
 +        !sumOp.getDimArg() || sumOp.getDimArg()->size() != 1 ||
 +        normalize(mlir::cast<mlir::IntegerAttr>((*sumOp.getDimArg())[0])
@@ -81,10 +163,11 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  // This pattern detects and fuses a sequence of operations that implement
  // relu. If a zeros op is consumed by a maximum op, we can fuse the zeros and
  // maximum op into a relu op.
-@@ -3991,6 +4064,7 @@ public:
+@@ -3991,6 +4146,8 @@ public:
  
        patterns.add<SoftmaxFusionPattern>(&getContext());
        patterns.add<NumericStableSoftmaxFusionPattern>(&getContext());
++      patterns.add<SoftmaxReciprocalFusionPattern>(&getContext());
 +      patterns.add<TopKSoftmaxRenormalizePattern>(&getContext());
  
        patterns.add<ReluFusionPattern>(&getContext());
