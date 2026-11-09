@@ -33,6 +33,7 @@ KV_POOL_MODULE = "sglang_tpu.kv_pool"
 FP8_LINEAR_SMALL_M_MODULE = "sglang_tpu.kernels.fp8_linear_small_m"
 GDN_MODULE = "sglang_tpu.attention.pallas.gdn"
 MAMBA_POOL_MODULE = "sglang_tpu.mamba_pool"
+ALL_GATHER_VIA_ALL_REDUCE_MODULE = "sglang_tpu.all_gather_via_all_reduce"
 
 
 def _ragged_paged_attention(module):
@@ -415,10 +416,28 @@ def patch_mamba_pool(module):
     sglang_tpu_gdn.patch_mamba_pool(module)
 
 
+def patch_all_gather_via_all_reduce(module):
+    """Keeps tensor-parallel all-gathers native in compiled graphs.
+
+    SGLang-TorchTPU rebuilds GroupCoordinator.all_gather_into_tensor from an
+    all-reduce over a zero-padded [world, *block] buffer while Dynamo traces,
+    to work around tpu7x's compiled all-gather returning wrong blocks from
+    cross-chip peers (sgl-project/sglang-torchtpu#1700). libtt's compiled
+    all-gather is correct, and the all-reduce moves about twice its bytes:
+    Qwen3-8B on four chips decoded 103.8 instead of 112.0 tokens/s.
+    """
+
+    def all_gather_into_tensor_around(original, group, output, input):  # noqa: A002
+        return original(group, output, input)
+
+    module.all_gather_into_tensor_around = all_gather_into_tensor_around
+
+
 PATCHES = {
     RPA_V3_MODULE: patch_rpa_v3,
     KV_POOL_MODULE: patch_kv_pool,
     FP8_LINEAR_SMALL_M_MODULE: patch_fp8_linear_small_m,
     GDN_MODULE: patch_gdn,
     MAMBA_POOL_MODULE: patch_mamba_pool,
+    ALL_GATHER_VIA_ALL_REDUCE_MODULE: patch_all_gather_via_all_reduce,
 }
