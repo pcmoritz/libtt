@@ -397,7 +397,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/
 +// LoFi multiplies BFP4 weights, whose mantissas have 3 bits, exactly. Wider
 +// weights (BF16) need HiFi4 for exact products.
 +::tt::tt_metal::MathFidelity mathFidelityFor(const ::ttnn::Tensor &weights) {
-+  return weights.dtype() == ::ttnn::DataType::BFP4_B
++  return weights.dtype() == ::ttnn::DataType::BFLOAT4_B
 +             ? ::tt::tt_metal::MathFidelity::LoFi
 +             : ::tt::tt_metal::MathFidelity::HiFi4;
 +}
