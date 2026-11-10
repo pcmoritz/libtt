@@ -22,7 +22,7 @@ diff --git ttnn/core/tensor/tensor_ops.cpp ttnn/core/tensor/tensor_ops.cpp
 diff --git ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
-@@ -229,6 +229,31 @@ ttnn::Tensor slice(
+@@ -228,6 +228,31 @@ ttnn::Tensor slice(
          }
      }
  

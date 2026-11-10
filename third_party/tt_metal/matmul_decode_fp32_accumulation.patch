@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
-@@ -396,9 +396,22 @@ MatmulMultiCoreReuseMultiCast1DProgramConfig get_mcast_1d_config(
+@@ -394,9 +394,22 @@ MatmulMultiCoreReuseMultiCast1DProgramConfig get_mcast_1d_config(
      while (k_tiles % in0_block_w != 0) {
          in0_block_w /= 2;
      }
@@ -28,7 +28,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.c
 diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
-@@ -3268,12 +3268,20 @@ MatmulParams create_matmul_attributes(
+@@ -2909,12 +2909,20 @@ MatmulParams create_matmul_attributes(
          }
      }
      bool is_float_32 = output_dtype == DataType::FLOAT32;

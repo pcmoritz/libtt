@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/kernel_helper_functions/pad_tile.hpp ttnn/cpp/ttnn/operations/kernel_helper_functions/pad_tile.hpp
 --- ttnn/cpp/ttnn/operations/kernel_helper_functions/pad_tile.hpp
 +++ ttnn/cpp/ttnn/operations/kernel_helper_functions/pad_tile.hpp
-@@ -376,6 +376,8 @@ constexpr uint32_t padded_tile_bytes() {
+@@ -376,6 +376,8 @@
      constexpr uint32_t mantissa_bits = blockfloat_mantissa_bits<data_format>();
      if constexpr (data_format == DataFormat::Float32) {
          return elems * sizeof(uint32_t);
@@ -10,7 +10,7 @@ diff --git ttnn/cpp/ttnn/operations/kernel_helper_functions/pad_tile.hpp ttnn/cp
      } else if constexpr (mantissa_bits > 0) {
          // exponent section (one byte per face row) + packed mantissas
          constexpr uint32_t num_faces = (TILE_WIDTH / FACE_WIDTH) * (TILE_HEIGHT / FACE_HEIGHT);
-@@ -419,8 +421,8 @@ inline void drain_pad_stores(uint32_t l1_tile_ptr) {
+@@ -419,8 +421,8 @@
   * @brief Pads the last K tile in a matrix multiplication operation.
   *
   * This function handles padding for the last K tile in a matrix multiplication operation.
@@ -21,7 +21,7 @@ diff --git ttnn/cpp/ttnn/operations/kernel_helper_functions/pad_tile.hpp ttnn/cp
   *
   * @tparam in0_data_format The data format of the input tensor
   * @tparam in0_last_ktile_w The unpadded width of the last K tile
-@@ -438,6 +440,9 @@ void pad_last_ktile(uint32_t l1_write_addr_in0) {
+@@ -438,6 +440,9 @@
      } else if constexpr (in0_data_format == DataFormat::Float16_b || in0_data_format == DataFormat::Float16) {
          fill_pad_tile<uint16_t, in0_last_ktile_w, /*num_elements_unpadded_h=*/TILE_HEIGHT>(
              l1_write_addr_in0, /*pad_value=*/0);
@@ -31,7 +31,7 @@ diff --git ttnn/cpp/ttnn/operations/kernel_helper_functions/pad_tile.hpp ttnn/cp
      } else if constexpr (is_blockfloat) {
          fill_pad_tile_blockfloat<mantissa_bits, in0_last_ktile_w, /*num_elements_unpadded_h=*/TILE_HEIGHT>(
              l1_write_addr_in0);
-@@ -468,6 +473,9 @@ void pad_last_transposed_ktile(uint32_t l1_write_addr_in0) {
+@@ -468,6 +473,9 @@
      } else if constexpr (in0_data_format == DataFormat::Float16_b || in0_data_format == DataFormat::Float16) {
          fill_pad_tile<uint16_t, /*num_elements_unpadded_w=*/TILE_WIDTH, in0_last_ktile_h>(
              l1_write_addr_in0, /*pad_value=*/0);

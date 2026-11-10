@@ -97,7 +97,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_p
  #include <map>
  #include <string>
  #include <utility>
-@@ -322,7 +323,47 @@ ttnn::device_operation::ProgramArtifacts AccumulationProgramFactory::create_prog
+@@ -167,7 +168,47 @@ ttnn::device_operation::ProgramArtifacts AccumulationProgramFactory::create_prog
  
      std::map<std::string, std::string> defines_kernel_args = {};
  
@@ -146,7 +146,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_p
          defines_kernel_args["BINARY_OP_INIT"] = operation_attributes.op == AccumulationOp::CUMSUM
                                                      ? "add_int_tile_init"
                                                      : fmt::format("mul_int_tile_init<{}>", acc_dataformat_name);
-@@ -341,10 +382,9 @@ ttnn::device_operation::ProgramArtifacts AccumulationProgramFactory::create_prog
+@@ -186,10 +227,9 @@ ttnn::device_operation::ProgramArtifacts AccumulationProgramFactory::create_prog
          defines_kernel_args["COMPENSATED_SUM"] = "1";
      }
  

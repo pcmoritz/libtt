@@ -353,7 +353,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.h
 diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
 --- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
 +++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_types.hpp
-@@ -101,13 +101,40 @@ struct MatmulMultiCoreProgramConfig {
+@@ -92,13 +92,40 @@ struct MatmulMultiCoreProgramConfig {
      std::optional<tt::tt_metal::CoreRangeSet> allowed_worker_cores = std::nullopt;
  };
  
@@ -395,7 +395,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config_t
  
  // Ensures allowed_worker_cores is populated on every config variant that supports it.
  // If allowed_worker_cores is already set, it is left unchanged.  Otherwise it is
-@@ -134,7 +161,7 @@ inline void normalize_program_config(MatmulProgramConfig& config, const tt::tt_m
+@@ -125,7 +152,7 @@ inline void normalize_program_config(MatmulProgramConfig& config, const tt::tt_m
                      c.allowed_worker_cores = make_crs(device_grid);
                  }
              }
@@ -1444,7 +1444,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
                  return;
              }
              if constexpr (
-@@ -654,8 +655,10 @@ void validate_matmul_compute_grid_and_per_core_dims(
+@@ -641,8 +642,10 @@ void validate_matmul_compute_grid_and_per_core_dims(
      std::visit(
          [&](const auto& program_config) {
              using ProgramConfigType = std::decay_t<decltype(program_config)>;
@@ -1457,7 +1457,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
              } else {
                  // Non-MultiCore. Grid-bounds check applies to Reuse/Mcast2D/Mcast1D only
                  // (DRAMSharded/BatchedDRAMSharded map to DRAM banks).
-@@ -2471,6 +2474,21 @@ void validate_matmul_mcast1d_config(
+@@ -2417,6 +2420,21 @@ void validate_matmul_mcast1d_config(
      }
  }
  
@@ -1479,7 +1479,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
  // Shared Mcast2D/Mcast1D preamble — the fuse_batch gate. Fused batch requires B batch==1,
  // and transpose_a is unsupported when real batch dims survive with M_per_batch > 1.
  void validate_matmul_mcast_fuse_batch_preamble(
-@@ -2568,6 +2586,8 @@ MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_f
+@@ -2514,6 +2532,8 @@ MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_f
              } else if constexpr (
                  std::is_same_v<T, operations::matmul::MatmulMultiCoreReuseMultiCastBatchedDRAMShardedProgramConfig>) {
                  return MatmulMultiCoreReuseBatchedHSDRAMShardedProgramFactory{};
@@ -1488,7 +1488,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
              } else {
                  TT_THROW("Unknown program config type");
              }
-@@ -2627,7 +2647,8 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
+@@ -2573,7 +2593,8 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
          attributes.transpose_a,
          attributes.transpose_b,
          bias_single_tile_size,
@@ -1498,7 +1498,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
      operations::matmul::normalize_program_config(
          chosen_program_config, input_tensor_a.device()->compute_with_storage_grid_size());
  
-@@ -2721,6 +2742,8 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
+@@ -2661,6 +2682,8 @@ void MatmulDeviceOperation::validate_on_program_cache_miss(
                      in0_tile,
                      in1_tile,
                      program_config);
@@ -1507,7 +1507,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
              } else if constexpr (std::is_same_v<
                                       ProgramConfigType,
                                       operations::matmul::MatmulMultiCoreReuseProgramConfig>) {
-@@ -2778,8 +2801,18 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
+@@ -2718,8 +2741,18 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
      const auto& input_tensor_b = input_tensors.at(1);
  
      // Use the compute_matmul_output_shape function to get the output shape
@@ -1527,7 +1527,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
  
      const auto& a_shape_padded =
          operations::matmul::utilities::get_matmul_tensor_padded_shape(input_tensor_a, attributes.transpose_a);
-@@ -2808,7 +2841,8 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
+@@ -2748,7 +2781,8 @@ MatmulDeviceOperation::spec_return_value_t MatmulDeviceOperation::compute_output
              attributes.transpose_a,
              attributes.transpose_b,
              bias_single_tile_size,
@@ -1537,7 +1537,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp tt
          // Soft-normalize so downstream variant code can safely read allowed_worker_cores; the warning
          // for missing allowed_worker_cores was emitted at the entry point above.
          operations::matmul::normalize_program_config(
-@@ -3286,7 +3320,8 @@ MatmulDeviceOperation::tensor_return_value_t matmul(
+@@ -3226,7 +3260,8 @@ MatmulDeviceOperation::tensor_return_value_t matmul(
              normalized_attributes.transpose_a,
              normalized_attributes.transpose_b,
              bias_single_tile_size,

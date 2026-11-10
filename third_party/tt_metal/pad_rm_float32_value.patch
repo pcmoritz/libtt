@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_reader_write
  #include <tt-metalium/experimental/metal2_host_api/program_run_args.hpp>
  #include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
  #include <tt-metalium/hal.hpp>
-@@ -109,6 +110,9 @@ ttnn::device_operation::ProgramArtifacts PadRmReaderWriterMultiCoreDefaultProgra
+@@ -109,6 +110,9 @@
          packed_pad_value = pad_value;
      } else if (a.dtype() == DataType::UINT16) {
          packed_pad_value = pack_two_uint16_into_uint32({float_to_uint16(pad_value), float_to_uint16(pad_value)});

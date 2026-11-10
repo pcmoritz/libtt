@@ -1,7 +1,7 @@
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_cast_fp32_to_fp16a.h
-@@ -38,5 +38,38 @@ inline void cast_fp16a_to_fp32() {
+@@ -38,5 +38,38 @@
      }
  }
  
@@ -43,7 +43,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_ca
 diff --git tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
 --- tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
 +++ tt_metal/hw/inc/api/compute/eltwise_unary/typecast.h
-@@ -140,6 +140,22 @@ ALWI void typecast_tile(uint32_t idst) {
+@@ -140,6 +140,22 @@
              (APPROX, 8 /* ITERATIONS */),
              idst,
              VectorMode::RC));
@@ -89,7 +89,7 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_type
                 ? tt::DataFormat::UInt16
                 : tt::tt_metal::cb_dataformat_for(input_dtype);
  }
-@@ -28,7 +35,7 @@ inline tt::DataFormat typecast_output_format(
+@@ -28,7 +35,7 @@
           input_dtype == tt::tt_metal::DataType::INT32);
      const bool exact_bfloat16_output =
          input_dtype == tt::tt_metal::DataType::FLOAT32 && output_dtype == tt::tt_metal::DataType::BFLOAT16;
@@ -101,7 +101,7 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_type
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
-@@ -62,6 +62,7 @@ inline Tensor typecast_impl(
+@@ -62,6 +62,7 @@
      bool fp32_dest_acc_en = preserve_fp32_precision or output_dtype == DataType::UINT32 or
                              output_dtype == DataType::INT32 or output_dtype == DataType::FLOAT32 or
                              (input_dtype == DataType::UINT16 and output_dtype == DataType::FLOAT16) or

@@ -10,7 +10,7 @@ diff --git tt_metal/impl/tensor/host_tensor_factory.cpp tt_metal/impl/tensor/hos
  }
  
  template <typename T>
-@@ -114,12 +114,12 @@ HostTensor host_tensor_from_vector_with_pad_value(std::vector<T>&& buffer, Tenso
+@@ -113,12 +113,12 @@ HostTensor host_tensor_from_vector_with_pad_value(std::vector<T>&& buffer, Tenso
  
  template <typename T>
  HostTensor HostTensor::from_vector(const std::vector<T>& buffer, TensorSpec spec) {

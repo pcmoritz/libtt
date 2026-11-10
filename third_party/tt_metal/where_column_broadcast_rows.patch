@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp
-@@ -423,9 +423,24 @@ FORCE_INLINE void copy_left_faces_right(uint32_t l1_write_ptr, uint32_t face_byt
+@@ -423,9 +423,24 @@
  // Reads the very first column of the CB and fills the entire tile with the same column.
  // Tile is assumed to have 16-bit elements. A row of the tile is a row of faces 0 and 1 (rows 0 to
  // 15) or 2 and 3: the left faces' rows are filled from their first elements and copied right.
@@ -27,7 +27,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fi
      for (uint32_t face_offset = 0; face_offset < 1024; face_offset += 512) {
          for (uint32_t row_offset = 0; row_offset < 256; row_offset += 16) {
              const uint32_t first = ptr[face_offset + row_offset];
-@@ -442,8 +457,23 @@ FORCE_INLINE void fill_tile_with_first_column_bfloat16(uint32_t l1_write_ptr) {
+@@ -442,8 +457,23 @@
  
  // Reads the very first column of the CB and fills the entire tile with the same column.
  // Tile is assumed to have 32-bit elements (float32/int32), filled as the 16-bit case.
@@ -55,7 +55,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fi
 diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/kernels/dataflow/ternary_reader_colbcast_ttt.cpp ttnn/cpp/ttnn/operations/eltwise/ternary/device/kernels/dataflow/ternary_reader_colbcast_ttt.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/ternary/device/kernels/dataflow/ternary_reader_colbcast_ttt.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/ternary/device/kernels/dataflow/ternary_reader_colbcast_ttt.cpp
-@@ -41,6 +41,8 @@ void kernel_main() {
+@@ -41,6 +41,8 @@
      const uint32_t false_num_tiles = get_arg_val<uint32_t>(24);
      const uint32_t dst_shard_width = get_arg_val<uint32_t>(25);
      const uint32_t src_num_tiles = get_arg_val<uint32_t>(26);  // moved to end
@@ -64,7 +64,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/kernels/dataflow/tern
  
      // For compatibility, map to old variable names
      const uint32_t src_addr = src0_addr;       // predicate address
-@@ -143,36 +145,40 @@ void kernel_main() {
+@@ -143,36 +145,40 @@
              for (uint32_t n = start_n; n < N && num_tiles_read < dst_num_tiles; ++n, start_c = 0) {
                  for (uint32_t c = start_c; c < C && num_tiles_read < dst_num_tiles; ++c, start_th = 0) {
                      for (uint32_t th = start_th; th < Ht && num_tiles_read < dst_num_tiles; ++th) {
@@ -117,7 +117,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/kernels/dataflow/tern
 diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_factory.cpp
-@@ -645,7 +645,7 @@ uint32_t pack_compute_scalar_arg(
+@@ -638,7 +638,7 @@
  
  // Per-kernel runtime-arg counts.  Both the cache-miss and cache-hit paths fill exactly this many
  // slots for every core, which is what lets the hit path copy a fixed-width row per core.
@@ -126,7 +126,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_facto
  constexpr size_t kNumWriterArgs = 11;
  constexpr size_t kNumComputeArgs = 4;
  
-@@ -889,6 +889,9 @@ TernaryPerCoreArgs build_per_core_runtime_args(
+@@ -882,6 +882,9 @@
              reader_runtime_args[24] = f_num_tiles;              // 24: false_num_tiles
              reader_runtime_args[25] = c_current_shard_width;    // 25: dst_shard_width
              reader_runtime_args[26] = a_num_tiles;              // 26: src_num_tiles (predicate)

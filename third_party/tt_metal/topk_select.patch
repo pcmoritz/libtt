@@ -98,7 +98,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp ttnn/cpp/ttnn/operat
  
  #include <cstdint>
  #include <limits>
-@@ -633,6 +634,22 @@ std::vector<Tensor> topk(
+@@ -631,6 +632,22 @@ std::vector<Tensor> topk(
          return routed_final;
      }
  

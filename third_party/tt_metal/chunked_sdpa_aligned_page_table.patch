@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/transformer/sdpa/device/sdpa_program_factory.cpp ttnn/cpp/ttnn/operations/transformer/sdpa/device/sdpa_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/transformer/sdpa/device/sdpa_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/transformer/sdpa/device/sdpa_program_factory.cpp
-@@ -144,7 +144,6 @@ struct ChunkedParams {
+@@ -138,7 +138,6 @@ struct ChunkedParams {
  ChunkedParams compute_chunked_params(
      bool is_chunked,
      bool is_chunked_legacy,
@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/sdpa/device/sdpa_program_factory
      const std::optional<int64_t>& chunk_start_idx,
      const std::optional<Tensor>& page_table,
      uint32_t k_seq_dim,
-@@ -159,17 +158,13 @@ ChunkedParams compute_chunked_params(
+@@ -153,17 +152,13 @@ ChunkedParams compute_chunked_params(
      const auto& page_table_tensor = page_table.value();
      p.block_size = k_seq_dim;
      p.block_size_t = p.block_size / TILE_HEIGHT;
@@ -34,7 +34,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/sdpa/device/sdpa_program_factory
      return p;
  }
  
-@@ -675,7 +670,6 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
+@@ -396,7 +391,6 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
      const auto chunked = compute_chunked_params(
          is_chunked,
          is_chunked_legacy,

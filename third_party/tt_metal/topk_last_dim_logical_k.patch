@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
 --- ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/topk/topk.cpp
-@@ -121,9 +121,11 @@ std::vector<Tensor> post_topk_transform_tensor(
+@@ -119,9 +119,11 @@
      // OP requires K to be tile-aligned (multiples of 32), but user wants exact K
      // If we had to round up K for op, trim the result down to the requested K value
      if (adjusted_k != k) {

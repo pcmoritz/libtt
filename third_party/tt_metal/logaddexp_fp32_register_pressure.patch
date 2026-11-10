@@ -1,7 +1,7 @@
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp.h
-@@ -84,8 +84,13 @@ inline void calculate_sfpu_logaddexp(const uint dst_index_in0, const uint dst_in
+@@ -84,8 +84,13 @@
          if constexpr (is_fp32_dest_acc_en) {
              // Guarded against the large negative values -|a-b| reaches, which the unguarded
              // _sfpu_exp_fp32_accurate_unsafe_ is not.
@@ -19,7 +19,7 @@ diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_lo
 diff --git tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp2.h tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp2.h
 --- tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp2.h
 +++ tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_logaddexp2.h
-@@ -66,8 +66,13 @@ inline void calculate_sfpu_logaddexp2(const uint dst_index_in0, const uint dst_i
+@@ -66,8 +66,13 @@
          // approximate body is not usable: its 255/256 at zero lands on the correction term
          // whose exact value at |a - b| = 0 is 1.
          if constexpr (is_fp32_dest_acc_en) {

@@ -1,7 +1,7 @@
 diff --git tt_metal/impl/allocator/bank_manager.cpp tt_metal/impl/allocator/bank_manager.cpp
 --- tt_metal/impl/allocator/bank_manager.cpp
 +++ tt_metal/impl/allocator/bank_manager.cpp
-@@ -744,28 +744,45 @@ BankManager::AllocationFootprint BankManager::take_allocation_footprint() {
+@@ -724,28 +724,45 @@ BankManager::AllocationFootprint BankManager::take_allocation_footprint() {
  }
  
  bool BankManager::has_live_allocation_overlap(const AllocationFootprint& footprint) const {

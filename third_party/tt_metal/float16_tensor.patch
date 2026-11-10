@@ -1291,7 +1291,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
-@@ -875,7 +875,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -877,7 +877,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
      // BFLOAT4_B), so the CB format must be BFLOAT16 to match — not the block-float a_dtype.
      const auto b_dtype = b.has_value()                              ? b->dtype()
                           : is_quant_op                              ? DataType::FLOAT32
@@ -1301,7 +1301,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
                                                                      : DataType::BFLOAT16;
      const auto c_dtype = c.dtype();
      // Int8 input (dequant/requant operand A) is read through the UInt8 unpacker.
-@@ -1050,6 +1051,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+@@ -1052,6 +1053,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
      // tiles a compute batch may hold in DST (below), not only the compute kernel config.
      const bool fp32_dest_acc_en =
          c_data_format == tt::DataFormat::UInt32 || c_data_format == tt::DataFormat::Int32 ||
@@ -1313,7 +1313,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_f
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
-@@ -588,9 +588,11 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+@@ -586,9 +586,11 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
              return {"ne_binary_tile_init();", "ne_binary_tile"};
          case WHERE: {
              const char* data_format = (dtype == DataType::INT32)     ? "Int32"
@@ -1328,7 +1328,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
              return {"where_tile_init();", fmt::format("where_tile<DataFormat::{}>", data_format)};
          }
          case ISCLOSE: return {"isclose_binary_tile_init();", "isclose_binary_tile<(bool)ISCLOSE_EQUAL_NAN>"};
-@@ -752,6 +754,10 @@ uint32_t pack_scalar_runtime_arg(const unary::ScalarVariant scalar, const DataTy
+@@ -749,6 +751,10 @@ uint32_t pack_scalar_runtime_arg(const unary::ScalarVariant scalar, const DataTy
                  auto val = static_cast<uint16_t>(static_cast<float>(v));
                  return (static_cast<uint32_t>(val) << 16) | val;
              }
@@ -1342,7 +1342,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
-@@ -286,6 +286,7 @@ tt::tt_metal::TensorSpec UnaryDeviceOperation::compute_output_specs(
+@@ -259,6 +259,7 @@ tt::tt_metal::TensorSpec UnaryDeviceOperation::compute_output_specs(
                          case DataType::FLOAT32: return sizeof(float);
                          case DataType::INT32: return sizeof(int32_t);
                          case DataType::UINT32: return sizeof(uint32_t);
@@ -1405,7 +1405,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/prod/device/prod_op_all.cpp ttnn/c
 diff --git ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/sliding_window/halo/device/halo_device_operation.cpp
-@@ -71,6 +71,7 @@ HaloDeviceOperation::spec_return_value_t HaloDeviceOperation::compute_output_spe
+@@ -67,6 +67,7 @@ HaloDeviceOperation::spec_return_value_t HaloDeviceOperation::compute_output_spe
      tt::tt_metal::DataType output_dtype;
      switch (input_tensor.dtype()) {
          case tt::tt_metal::DataType::FLOAT32: output_dtype = tt::tt_metal::DataType::FLOAT32; break;

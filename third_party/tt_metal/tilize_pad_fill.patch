@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp
 --- ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp
 +++ ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp
-@@ -123,12 +123,27 @@ FORCE_INLINE void fill_l1_range(uint32_t start_addr, uint32_t n_bytes, uint32_t
+@@ -121,12 +121,27 @@ FORCE_INLINE void fill_l1_range(uint32_t start_addr, uint32_t n_bytes, uint32_t
          val_4B = (uint32_t(short_val) << 16) | uint32_t(short_val);
      }
  
@@ -37,7 +37,7 @@ diff --git ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp ttnn/cpp/ttnn/kernel_lib/l1_h
 diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/reader_unary_pad_multicore_both_dims.cpp
-@@ -64,12 +64,12 @@ void kernel_main() {
+@@ -62,12 +62,12 @@ void kernel_main() {
                  noc.async_read(
                      s, dst, width_size, {.page_id = size_2d + k, .offset_bytes = start_column_id}, {.offset_bytes = 0});
  
@@ -53,7 +53,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device
                      uint32_t to_pad = width_size - this_block_size;
                      dataflow_kernel_lib::fill_l1_range<element_size>(
                          l1_write_addr + this_block_size, to_pad, pad_value);
-@@ -117,6 +117,7 @@ void kernel_main() {
+@@ -115,6 +115,7 @@ void kernel_main() {
          dataflow_kernel_lib::fill_l1_range<element_size>(l1_write_addr, row_pad_bytes, pad_value);
          l1_write_addr += row_pad_bytes;
  

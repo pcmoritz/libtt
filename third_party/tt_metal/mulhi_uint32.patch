@@ -137,7 +137,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
          case BinaryOpType::XLOGY:
              if (is_sfpu_op()) {
                  binary_op = SfpuBinaryOp::XLOGY;
-@@ -489,6 +496,7 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+@@ -487,6 +494,7 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
          case LCM: return {"lcm_tile_init();", "lcm_tile"};
          case LOGADDEXP: return {"logaddexp_binary_tile_init();", "logaddexp_binary_tile"};
          case LOGADDEXP2: return {"logaddexp2_binary_tile_init();", "logaddexp2_binary_tile"};
@@ -148,7 +148,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.hpp
-@@ -69,6 +69,7 @@ struct OpConfig {
+@@ -68,6 +68,7 @@ struct OpConfig {
          LCM,
          LOGADDEXP,
          LOGADDEXP2,

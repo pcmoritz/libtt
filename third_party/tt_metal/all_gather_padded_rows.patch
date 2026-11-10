@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp
-@@ -398,6 +398,12 @@ ttnn::Tensor composite_all_gather(
+@@ -390,6 +390,12 @@ ttnn::Tensor composite_all_gather(
          input_tensor = ttnn::typecast(input_tensor, ttnn::DataType::BFLOAT16);
      }
  
@@ -14,7 +14,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp ttnn/c
      std::vector<ttnn::Tensor> broadcasted_tensors = ttnn::all_broadcast(
          input_tensor,
          cluster_axis,
-@@ -410,6 +416,10 @@ ttnn::Tensor composite_all_gather(
+@@ -402,6 +408,10 @@ ttnn::Tensor composite_all_gather(
      // Do the gather itself
      ttnn::Tensor all_gather_output_tensor = ttnn::concat(broadcasted_tensors, gather_dim);
  

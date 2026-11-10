@@ -10,7 +10,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
  #include "api/dataflow/noc.h"
  #include "api/dataflow/dataflow_buffer.h"
  #include "api/tensor/noc_traits.h"
-@@ -21,7 +21,6 @@ void kernel_main() {
+@@ -21,7 +21,6 @@
      const std::uint32_t Wt = get_arg(args::Wt);
  
      constexpr std::uint32_t num_datum_padded = get_arg(args::num_datum_padded);
@@ -18,7 +18,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
  
      constexpr auto dfb_id_out0 = dfb::out0;
      constexpr std::uint32_t onetile = 1;
-@@ -36,18 +35,16 @@ void kernel_main() {
+@@ -36,18 +35,16 @@
  
      // Adds -inf padding. Note: the value is the uint16 representation of bfloat16's -inf
      constexpr std::uint16_t mask_val = 0xFF80;

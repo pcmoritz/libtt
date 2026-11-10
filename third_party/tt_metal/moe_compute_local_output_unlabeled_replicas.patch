@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
-@@ -202,31 +202,11 @@ void MoEComputeDeviceOperation::validate_on_program_cache_miss(
+@@ -192,31 +192,11 @@ void MoEComputeDeviceOperation::validate_on_program_cache_miss(
              "cluster_axis {} is out of range for a mesh with {} axes",
              args.combine_params->axis,
              mesh_shape.dims());

@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-@@ -56,7 +56,10 @@ bool is_binary_sfpu_op(
+@@ -54,7 +54,10 @@ bool is_binary_sfpu_op(
          case ADD:
          case SUB:
          case RSUB:

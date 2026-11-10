@@ -40,6 +40,62 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/eltwise
 +            ckl::IterationShape::grid(per_core_block_cnt, per_core_block_dim), dfb_in_obj, dfb_out_obj);
 +    }
  }
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
+@@ -17,8 +17,21 @@ inline bool is_float16_bfloat16_typecast(tt::tt_metal::DataType input_dtype, tt:
+            (input_dtype == tt::tt_metal::DataType::BFLOAT16 && output_dtype == tt::tt_metal::DataType::FLOAT16);
+ }
+ 
++// Float8 <-> Float32 typecasts convert the float8 bytes exactly in SFPU registers: the hardware's own
++// conversions truncate, flush subnormals and lose NaN.
++inline bool is_float8_float32_typecast(tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
++    auto is_float8 = [](tt::tt_metal::DataType dtype) {
++        return dtype == tt::tt_metal::DataType::FP8_E4M3 || dtype == tt::tt_metal::DataType::FP8_E5M2;
++    };
++    return (is_float8(input_dtype) && output_dtype == tt::tt_metal::DataType::FLOAT32) ||
++           (input_dtype == tt::tt_metal::DataType::FLOAT32 && is_float8(output_dtype));
++}
++
+ inline tt::DataFormat typecast_input_format(
+     tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
++    if (is_float8_float32_typecast(input_dtype, output_dtype) && input_dtype != tt::tt_metal::DataType::FLOAT32) {
++        return tt::DataFormat::UInt8;
++    }
+     return ((input_dtype == tt::tt_metal::DataType::FLOAT16 || input_dtype == tt::tt_metal::DataType::BFLOAT16) &&
+             output_dtype == tt::tt_metal::DataType::FLOAT32) ||
+                    is_float16_bfloat16_typecast(input_dtype, output_dtype)
+@@ -28,6 +41,9 @@ inline tt::DataFormat typecast_input_format(
+ 
+ inline tt::DataFormat typecast_output_format(
+     tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
++    if (is_float8_float32_typecast(input_dtype, output_dtype) && output_dtype != tt::tt_metal::DataType::FLOAT32) {
++        return tt::DataFormat::UInt8;
++    }
+     const bool exact_float16_output =
+         output_dtype == tt::tt_metal::DataType::FLOAT16 &&
+         (input_dtype == tt::tt_metal::DataType::FLOAT32 || input_dtype == tt::tt_metal::DataType::UINT8 ||
+diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+--- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
++++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
+@@ -58,13 +58,15 @@ inline Tensor typecast_impl(
+         (input_dtype == DataType::FLOAT32) or
+         (is_8_bit_int(output_dtype) and (input_dtype == DataType::BFLOAT16 or input_dtype == DataType::BFLOAT8_B or
+                                          input_dtype == DataType::BFLOAT4_B)) or
+-        (input_dtype == DataType::UINT16 and is_8_bit_int(output_dtype)) or is_8_bit_int(input_dtype);
++        (input_dtype == DataType::UINT16 and is_8_bit_int(output_dtype)) or is_8_bit_int(input_dtype) or
++        ttnn::prim::is_float8_float32_typecast(input_dtype, output_dtype);
+     bool fp32_dest_acc_en = preserve_fp32_precision or output_dtype == DataType::UINT32 or
+                             output_dtype == DataType::INT32 or output_dtype == DataType::FLOAT32 or
+                             (input_dtype == DataType::UINT16 and output_dtype == DataType::FLOAT16) or
+                             ttnn::prim::is_float16_bfloat16_typecast(input_dtype, output_dtype) or
+                             input_dtype == DataType::UINT32 or input_dtype == DataType::INT32 or
+-                            output_dtype == DataType::FP8_E4M3 or input_dtype == DataType::FP8_E4M3;
++                            output_dtype == DataType::FP8_E4M3 or input_dtype == DataType::FP8_E4M3 or
++                            output_dtype == DataType::FP8_E5M2 or input_dtype == DataType::FP8_E5M2;
+     bool bfp8_pack_precise = (output_dtype == DataType::BFLOAT8_B);
+     auto output_memory_config = optional_output_tensor.has_value()
+                                     ? optional_output_tensor.value().memory_config()
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/float8_sfpu.h ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/float8_sfpu.h
 new file mode 100644
 --- /dev/null
@@ -137,59 +193,3 @@ new file mode 100644
 +    }
 +}
 +#endif
-diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
---- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
-+++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
-@@ -17,8 +17,21 @@ inline bool is_float16_bfloat16_typecast(tt::tt_metal::DataType input_dtype, tt:
-            (input_dtype == tt::tt_metal::DataType::BFLOAT16 && output_dtype == tt::tt_metal::DataType::FLOAT16);
- }
- 
-+// Float8 <-> Float32 typecasts convert the float8 bytes exactly in SFPU registers: the hardware's own
-+// conversions truncate, flush subnormals and lose NaN.
-+inline bool is_float8_float32_typecast(tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
-+    auto is_float8 = [](tt::tt_metal::DataType dtype) {
-+        return dtype == tt::tt_metal::DataType::FP8_E4M3 || dtype == tt::tt_metal::DataType::FP8_E5M2;
-+    };
-+    return (is_float8(input_dtype) && output_dtype == tt::tt_metal::DataType::FLOAT32) ||
-+           (input_dtype == tt::tt_metal::DataType::FLOAT32 && is_float8(output_dtype));
-+}
-+
- inline tt::DataFormat typecast_input_format(
-     tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
-+    if (is_float8_float32_typecast(input_dtype, output_dtype) && input_dtype != tt::tt_metal::DataType::FLOAT32) {
-+        return tt::DataFormat::UInt8;
-+    }
-     return ((input_dtype == tt::tt_metal::DataType::FLOAT16 || input_dtype == tt::tt_metal::DataType::BFLOAT16) &&
-             output_dtype == tt::tt_metal::DataType::FLOAT32) ||
-                    is_float16_bfloat16_typecast(input_dtype, output_dtype)
-@@ -28,6 +41,9 @@ inline tt::DataFormat typecast_input_format(
- 
- inline tt::DataFormat typecast_output_format(
-     tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
-+    if (is_float8_float32_typecast(input_dtype, output_dtype) && output_dtype != tt::tt_metal::DataType::FLOAT32) {
-+        return tt::DataFormat::UInt8;
-+    }
-     const bool exact_float16_output =
-         output_dtype == tt::tt_metal::DataType::FLOAT16 &&
-         (input_dtype == tt::tt_metal::DataType::FLOAT32 || input_dtype == tt::tt_metal::DataType::UINT8 ||
-diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
---- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
-+++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
-@@ -58,13 +58,15 @@ inline Tensor typecast_impl(
-         (input_dtype == DataType::FLOAT32) or
-         (is_8_bit_int(output_dtype) and (input_dtype == DataType::BFLOAT16 or input_dtype == DataType::BFLOAT8_B or
-                                          input_dtype == DataType::BFLOAT4_B)) or
--        (input_dtype == DataType::UINT16 and is_8_bit_int(output_dtype)) or is_8_bit_int(input_dtype);
-+        (input_dtype == DataType::UINT16 and is_8_bit_int(output_dtype)) or is_8_bit_int(input_dtype) or
-+        ttnn::prim::is_float8_float32_typecast(input_dtype, output_dtype);
-     bool fp32_dest_acc_en = preserve_fp32_precision or output_dtype == DataType::UINT32 or
-                             output_dtype == DataType::INT32 or output_dtype == DataType::FLOAT32 or
-                             (input_dtype == DataType::UINT16 and output_dtype == DataType::FLOAT16) or
-                             ttnn::prim::is_float16_bfloat16_typecast(input_dtype, output_dtype) or
-                             input_dtype == DataType::UINT32 or input_dtype == DataType::INT32 or
--                            output_dtype == DataType::FP8_E4M3 or input_dtype == DataType::FP8_E4M3;
-+                            output_dtype == DataType::FP8_E4M3 or input_dtype == DataType::FP8_E4M3 or
-+                            output_dtype == DataType::FP8_E5M2 or input_dtype == DataType::FP8_E5M2;
-     bool bfp8_pack_precise = (output_dtype == DataType::BFLOAT8_B);
-     auto output_memory_config = optional_output_tensor.has_value()
-                                     ? optional_output_tensor.value().memory_config()

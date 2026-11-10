@@ -24,7 +24,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_reader.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_reader.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_reader.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_reader.cpp
-@@ -306,6 +306,7 @@ void kernel_main() {
+@@ -305,6 +305,7 @@ void kernel_main() {
      constexpr uint32_t experts_per_device = get_named_compile_time_arg_val("experts_per_device");
  
      constexpr uint32_t selected_experts_k = get_named_compile_time_arg_val("selected_experts_k");
@@ -32,7 +32,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  
      // Chunk info
      constexpr uint32_t tokens_per_chunk = get_named_compile_time_arg_val("tokens_per_chunk");
-@@ -612,7 +613,7 @@ void kernel_main() {
+@@ -611,7 +612,7 @@ void kernel_main() {
              prev_device_in_group = device_in_group;
          }
  
@@ -41,7 +41,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
          const uint16_t* token_scores = reinterpret_cast<const uint16_t*>(scores_base + t * aligned_scores_page_size);
  
          // Defer pointer calculation until we know token is activated
-@@ -620,7 +621,7 @@ void kernel_main() {
+@@ -619,7 +620,7 @@ void kernel_main() {
          bool activated = false;
  
          for (uint32_t k = 0; k < selected_experts_k; k++) {
@@ -53,7 +53,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_writer.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_writer.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_writer.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/tilize_writer.cpp
-@@ -138,6 +138,7 @@ void kernel_main() {
+@@ -137,6 +137,7 @@ void kernel_main() {
      constexpr uint32_t experts_per_device = get_named_compile_time_arg_val("experts_per_device");
  
      constexpr uint32_t selected_experts_k = get_named_compile_time_arg_val("selected_experts_k");
@@ -61,7 +61,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  
      // Chunk info
      constexpr uint32_t tokens_per_chunk = get_named_compile_time_arg_val("tokens_per_chunk");
-@@ -376,7 +377,7 @@ void kernel_main() {
+@@ -375,7 +376,7 @@ void kernel_main() {
              prev_device_in_group = device_in_group;
          }
  
@@ -70,7 +70,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
          const uint16_t* token_scores = reinterpret_cast<const uint16_t*>(scores_base + t * aligned_scores_page_size);
  
          // Track if this token is activated for any local expert
-@@ -384,7 +385,7 @@ void kernel_main() {
+@@ -383,7 +384,7 @@ void kernel_main() {
          bool activated = false;
  
          for (uint32_t k = 0; k < selected_experts_k; k++) {
@@ -82,7 +82,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
-@@ -70,9 +70,11 @@ void MoEComputeDeviceOperation::validate_on_program_cache_miss(
+@@ -100,9 +100,11 @@ void MoEComputeDeviceOperation::validate_on_program_cache_miss(
          "Input tensor must be in row major layout");
      TT_FATAL(
          tensor_args.tilize_input_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16, "Input tensor must be bfloat16");
@@ -99,7 +99,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
-@@ -1182,6 +1182,8 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+@@ -1127,6 +1127,8 @@ MoEComputeMeshWorkloadFactory::create_at(
          {"experts", experts},
          {"experts_per_device", experts_per_device},
          {"selected_experts_k", selected_experts_k},

@@ -20,6 +20,44 @@ diff --git tt_metal/api/tt-metalium/allocator.hpp tt_metal/api/tt-metalium/alloc
      // debug/test/internal usage.
      AllocatorImpl& impl() { return *impl_; }
      const AllocatorImpl& impl() const { return *impl_; }
+diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocator.hpp
+--- tt_metal/impl/allocator/allocator.hpp
++++ tt_metal/impl/allocator/allocator.hpp
+@@ -17,6 +17,8 @@
+ #include "impl/allocator/bank_manager.hpp"
+ #include "impl/allocator/persistent_l1_arena.hpp"
+ #include <map>
++#include <mutex>
++#include <thread>
+ 
+ namespace tt::tt_metal {
+ 
+@@ -52,6 +54,11 @@ public:
+ 
+     DeviceAddr allocate_buffer(Buffer* buffer);
+ 
++    void set_symmetric_dram(DeviceAddr base, DeviceAddr size_per_bank);
++    bool has_symmetric_dram() const;
++    void begin_symmetric_dram();
++    void end_symmetric_dram();
++
+     // Set/clear device allocators for HYBRID mode mesh-level lockstep allocation.
+     // When set, allocate_buffer() queries these allocators' per-bank ranges
+     // so the lockstep allocator avoids regions occupied on any device.
+@@ -209,6 +216,13 @@ private:
+ 
+     mutable std::mutex mutex_;
+ 
++    // See Allocator::set_symmetric_dram.
++    DeviceAddr symmetric_base_ = 0;
++    DeviceAddr symmetric_size_ = 0;
++    DeviceAddr symmetric_next_ = 0;
++    bool symmetric_active_ = false;
++    std::thread::id symmetric_thread_;
++
+     std::unique_ptr<BankManager> dram_manager_;
+     std::unique_ptr<BankManager> l1_manager_;
+     std::unique_ptr<BankManager> l1_small_manager_;
 diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocator.cpp
 --- tt_metal/impl/allocator/allocator.cpp
 +++ tt_metal/impl/allocator/allocator.cpp
@@ -109,41 +147,3 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
  }  // namespace tt::tt_metal
  
  namespace tt::tt_metal::experimental {
-diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocator.hpp
---- tt_metal/impl/allocator/allocator.hpp
-+++ tt_metal/impl/allocator/allocator.hpp
-@@ -17,6 +17,8 @@
- #include "impl/allocator/bank_manager.hpp"
- #include "impl/allocator/persistent_l1_arena.hpp"
- #include <map>
-+#include <mutex>
-+#include <thread>
- 
- namespace tt::tt_metal {
- 
-@@ -52,6 +54,11 @@ public:
- 
-     DeviceAddr allocate_buffer(Buffer* buffer);
- 
-+    void set_symmetric_dram(DeviceAddr base, DeviceAddr size_per_bank);
-+    bool has_symmetric_dram() const;
-+    void begin_symmetric_dram();
-+    void end_symmetric_dram();
-+
-     // Set/clear device allocators for HYBRID mode mesh-level lockstep allocation.
-     // When set, allocate_buffer() queries these allocators' per-bank ranges
-     // so the lockstep allocator avoids regions occupied on any device.
-@@ -209,6 +216,13 @@ private:
- 
-     mutable std::mutex mutex_;
- 
-+    // See Allocator::set_symmetric_dram.
-+    DeviceAddr symmetric_base_ = 0;
-+    DeviceAddr symmetric_size_ = 0;
-+    DeviceAddr symmetric_next_ = 0;
-+    bool symmetric_active_ = false;
-+    std::thread::id symmetric_thread_;
-+
-     std::unique_ptr<BankManager> dram_manager_;
-     std::unique_ptr<BankManager> l1_manager_;
-     std::unique_ptr<BankManager> l1_small_manager_;
