@@ -178,7 +178,7 @@ new file mode 100644
 +    }
 +    cb_reserve_back(cb_scaled, count);
 +    reconfig_data_format(cb_sum, cb_scale);
-+    mul_bcast_rows_init_short(cb_sum, cb_scale);
++    mul_bcast_rows_init(cb_sum, cb_scale);
 +    for (uint32_t b = 0; b < count; b += batch) {
 +        const uint32_t n = count - b < batch ? count - b : batch;
 +        tile_regs_acquire();
@@ -240,7 +240,7 @@ new file mode 100644
 +    cb_wait_front(cb_rstd, 1);
 +    cb_reserve_back(cb_norm, count);
 +    reconfig_data_format(cb_scaled, cb_rstd);
-+    mul_bcast_cols_init_short(cb_scaled, cb_rstd);
++    mul_bcast_cols_init(cb_scaled, cb_rstd);
 +    for (uint32_t b = 0; b < count; b += batch) {
 +        const uint32_t n = count - b < batch ? count - b : batch;
 +        tile_regs_acquire();

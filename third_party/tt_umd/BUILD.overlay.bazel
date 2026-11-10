@@ -7,13 +7,14 @@ filegroup(
     srcs = glob(["tests/cluster_descriptor_examples/**"]),
 )
 
+# tt-metal resolves simulator descriptors through SimulationChip without building the simulation backend.
 genrule(
     name = "simulation_chip_path_stub",
     outs = ["simulation_chip_path_stub.cpp"],
     cmd = "printf '%s\\n' " +
           "'#include <filesystem>' " +
           "'#include <string>' " +
-          "'#include \"umd/device/simulation/simulation_chip.hpp\"' " +
+          "'#include \"tt-umd/simulation/simulation_chip.hpp\"' " +
           "'namespace tt::umd {' " +
           "'std::string SimulationChip::get_soc_descriptor_path_from_simulator_path(const std::filesystem::path& simulator_path) {' " +
           "'    return (simulator_path.extension() == \".so\") ? (simulator_path.parent_path() / \"soc_descriptor.yaml\").string() : (simulator_path / \"soc_descriptor.yaml\").string();' " +
@@ -34,51 +35,70 @@ cc_library(
     includes = ["tt-kmd-lib/api"],
 )
 
+# General-purpose utilities that ship inside tt-umd; its public headers include them.
 cc_library(
-    name = "tt-umd",
-    srcs = [
-        ":simulation_chip_path_stub",
-    ] + glob(
-        ["device/**/*.cpp"],
-        exclude = [
-            "device/chip/sw_emule_chip.cpp",
-            "device/firmware/wormhole_18_3_firmware_info_provider.cpp",
-            "device/pcie/rtl_sim_tlb_handle.cpp",
-            "device/pcie/rtl_sim_tlb_window.cpp",
-            "device/pcie/tt_sim_tlb_handle.cpp",
-            "device/pcie/tt_sim_tlb_window.cpp",
-            "device/simulation/**",
-            "device/tt_device/protocol/tt_sim_protocol.cpp",
-            "device/tt_device/rtl_simulation_tt_device.cpp",
-            "device/tt_device/simulation_device_factory.cpp",
-            "device/tt_device/tt_sim_tt_device.cpp",
-            "device/tt_device_model/simulation_tt_device_model.cpp",
-            "device/warm_reset.cpp",
-            "device/warm_reset_with_recovery.cpp",
-        ],
-    ),
-    hdrs = glob([
-        "device/**/*.hpp",
-        "device/api/**/*.hpp",
-    ]),
+    name = "tt-umd-utils",
+    srcs = glob(["tt-umd-utils/src/**/*.cpp"]),
+    hdrs = glob(["tt-umd-utils/api/**/*.hpp"]),
     copts = [
         "-std=c++17",
         "-march=x86-64-v3",
+    ],
+    includes = ["tt-umd-utils/api"],
+    linkopts = ["-lrt"],
+    deps = [
+        "@fmt//:fmt-header-only",
+        "@tt_logger//:tt-logger",
+    ],
+)
+
+cc_library(
+    name = "tt-umd",
+    srcs = [":simulation_chip_path_stub"] + glob(
+        [
+            "tt-umd/src/**/*.cpp",
+            "tt-umd/src/**/*.hpp",
+        ],
+        exclude = [
+            # Simulation and emulation backends (TT_UMD_BUILD_SIMULATION / TT_UMD_BUILD_EMULE are off).
+            "tt-umd/src/chip/sw_emule_chip.cpp",
+            "tt-umd/src/chip_helpers/simulation_tlb_allocator.cpp",
+            "tt-umd/src/pcie/rtl_sim_tlb_handle.cpp",
+            "tt-umd/src/pcie/rtl_sim_tlb_window.cpp",
+            "tt-umd/src/pcie/tt_sim_tlb_handle.cpp",
+            "tt-umd/src/pcie/tt_sim_tlb_window.cpp",
+            # Their headers stay: cluster.cpp includes the socket's, which needs no asio.
+            "tt-umd/src/simulation/**/*.cpp",
+            "tt-umd/src/tt_device/protocol/tt_sim_protocol.cpp",
+            "tt-umd/src/tt_device/rtl_simulation_tt_device.cpp",
+            "tt-umd/src/tt_device/simulation_device_factory.cpp",
+            "tt-umd/src/tt_device/simulation_tt_device.cpp",
+            "tt-umd/src/tt_device/tt_sim_tt_device.cpp",
+            "tt-umd/src/tt_device_model/simulation_tt_device_model.cpp",
+            # Warm reset needs asio.
+            "tt-umd/src/warm_reset.cpp",
+            "tt-umd/src/warm_reset_with_recovery.cpp",
+        ],
+    ),
+    hdrs = glob(["tt-umd/api/**/*.hpp"]),
+    copts = [
+        "-std=c++17",
+        "-march=x86-64-v3",
+        "-Iexternal/+http_archive+tt_umd/tt-umd/src",
+        "-Iexternal/+http_archive+tt_umd/tt-umd/src/common",
     ],
     defines = [
         "SPDLOG_FMT_EXTERNAL=1",
     ],
     includes = [
-        "device",
-        "device/api",
-        "device/common",
-        "src/firmware/riscv",
+        "tt-umd/api",
     ],
     linkopts = [
         "-lrt",
     ],
     deps = [
         ":tt-kmd-lib",
+        ":tt-umd-utils",
         "@fmt//:fmt-header-only",
         "@hwloc//:hwloc",
         "@spdlog//:spdlog",

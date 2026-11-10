@@ -1,7 +1,7 @@
 diff --git tt_metal/api/tt-metalium/float8.hpp tt_metal/api/tt-metalium/float8.hpp
 --- tt_metal/api/tt-metalium/float8.hpp
 +++ tt_metal/api/tt-metalium/float8.hpp
-@@ -32,6 +32,31 @@
+@@ -32,6 +32,31 @@ private:
      static uint8_t from_float(float v);
  };
  
@@ -36,7 +36,7 @@ diff --git tt_metal/api/tt-metalium/float8.hpp tt_metal/api/tt-metalium/float8.h
 diff --git tt_metal/api/tt-metalium/tensor/tensor_types.hpp tt_metal/api/tt-metalium/tensor/tensor_types.hpp
 --- tt_metal/api/tt-metalium/tensor/tensor_types.hpp
 +++ tt_metal/api/tt-metalium/tensor/tensor_types.hpp
-@@ -48,6 +48,8 @@
+@@ -42,6 +42,8 @@ enum class DataType {
      INT8 = 9,
      FLOAT16 = 10,
      INVALID = 11,
@@ -48,7 +48,7 @@ diff --git tt_metal/api/tt-metalium/tensor/tensor_types.hpp tt_metal/api/tt-meta
 diff --git tt_metal/impl/data_format/float8.cpp tt_metal/impl/data_format/float8.cpp
 --- tt_metal/impl/data_format/float8.cpp
 +++ tt_metal/impl/data_format/float8.cpp
-@@ -111,6 +111,41 @@
+@@ -111,6 +111,41 @@ float8_e4m3::operator float() const {
  
  uint8_t float8_e4m3::from_float(float v) { return fp32_to_fp8_e4m3_bits(v); }
  
@@ -93,7 +93,7 @@ diff --git tt_metal/impl/data_format/float8.cpp tt_metal/impl/data_format/float8
 diff --git tt_metal/impl/data_format/tilize_utils.cpp tt_metal/impl/data_format/tilize_utils.cpp
 --- tt_metal/impl/data_format/tilize_utils.cpp
 +++ tt_metal/impl/data_format/tilize_utils.cpp
-@@ -552,6 +552,7 @@
+@@ -552,6 +552,7 @@ template std::vector<int> convert_layout<int>(ttsl::Span<const int>, const Physi
  template std::vector<int8_t> convert_layout<int8_t>(ttsl::Span<const int8_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
  template std::vector<tt::tt_metal::float16> convert_layout<tt::tt_metal::float16>(ttsl::Span<const tt::tt_metal::float16>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
  template std::vector<uint8_t> convert_layout<uint8_t>(ttsl::Span<const uint8_t>, const PhysicalSize&, TensorLayoutType, TensorLayoutType, std::optional<PhysicalSize>, std::optional<PhysicalSize>, const bool, const bool);
@@ -104,7 +104,7 @@ diff --git tt_metal/impl/data_format/tilize_utils.cpp tt_metal/impl/data_format/
 diff --git tt_metal/impl/tensor/distributed_tensor_apis.cpp tt_metal/impl/tensor/distributed_tensor_apis.cpp
 --- tt_metal/impl/tensor/distributed_tensor_apis.cpp
 +++ tt_metal/impl/tensor/distributed_tensor_apis.cpp
-@@ -47,6 +47,12 @@
+@@ -48,6 +48,12 @@ MeshTensor allocate_mesh_tensor_on_device_with_topology(
              "FP8_E4M3 is not supported on arch {}",
              mesh_device.arch());
      }
@@ -120,7 +120,7 @@ diff --git tt_metal/impl/tensor/distributed_tensor_apis.cpp tt_metal/impl/tensor
 diff --git tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
 --- tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
 +++ tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
-@@ -103,8 +103,9 @@
+@@ -103,8 +103,9 @@ HostTensor host_tensor_to_tensor_spec_with_pad_value(
          tensor.logical_shape(),
          dest_spec.logical_shape());
      TT_FATAL(
@@ -135,7 +135,7 @@ diff --git tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp tt_metal/impl/tenso
 diff --git tt_metal/impl/tensor/mesh_tensor.cpp tt_metal/impl/tensor/mesh_tensor.cpp
 --- tt_metal/impl/tensor/mesh_tensor.cpp
 +++ tt_metal/impl/tensor/mesh_tensor.cpp
-@@ -73,6 +73,7 @@
+@@ -74,6 +74,7 @@ std::size_t MeshTensor::element_size() const {
          case DataType::UINT32: return sizeof(uint32_t);
          case DataType::UINT16: return sizeof(uint16_t);
          case DataType::FP8_E4M3: return sizeof(float8_e4m3);
@@ -146,7 +146,7 @@ diff --git tt_metal/impl/tensor/mesh_tensor.cpp tt_metal/impl/tensor/mesh_tensor
 diff --git tt_metal/impl/tensor/spec/layout/page_config.cpp tt_metal/impl/tensor/spec/layout/page_config.cpp
 --- tt_metal/impl/tensor/spec/layout/page_config.cpp
 +++ tt_metal/impl/tensor/spec/layout/page_config.cpp
-@@ -27,6 +27,7 @@
+@@ -29,6 +29,7 @@ size_t rm_element_size_bytes(DataType dtype) {
          case DataType::UINT32: return sizeof(uint32_t);
          case DataType::UINT16: return sizeof(uint16_t);
          case DataType::FP8_E4M3: return sizeof(float8_e4m3);
@@ -157,7 +157,7 @@ diff --git tt_metal/impl/tensor/spec/layout/page_config.cpp tt_metal/impl/tensor
 diff --git tt_metal/impl/tensor/spec/tensor_spec.cpp tt_metal/impl/tensor/spec/tensor_spec.cpp
 --- tt_metal/impl/tensor/spec/tensor_spec.cpp
 +++ tt_metal/impl/tensor/spec/tensor_spec.cpp
-@@ -105,7 +105,7 @@
+@@ -116,7 +116,7 @@ void validate_dtype_and_layout(DataType dtype, Layout layout) {
              (dtype == DataType::UINT32 || dtype == DataType::INT32 || dtype == DataType::FLOAT32 ||
               dtype == DataType::UINT8 || dtype == DataType::INT8 || dtype == DataType::UINT16 ||
               dtype == DataType::BFLOAT16 || dtype == DataType::FLOAT16 || dtype == DataType::BFLOAT8_B ||
@@ -166,7 +166,7 @@ diff --git tt_metal/impl/tensor/spec/tensor_spec.cpp tt_metal/impl/tensor/spec/t
              "Unsupported device dtype!");
      };
      auto supported_layout = [&dtype, &layout]() {
-@@ -121,7 +121,8 @@
+@@ -132,7 +132,8 @@ void validate_dtype_and_layout(DataType dtype, Layout layout) {
              // FP8_E4M3 tiles hold one byte per element, like UINT8 tiles, which
              // the unpacker reads as Fp8_e4m3, e.g. as matmul operands. Arch
              // validation is each producer op's responsibility.
@@ -179,7 +179,7 @@ diff --git tt_metal/impl/tensor/spec/tensor_spec.cpp tt_metal/impl/tensor/spec/t
 diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis.cpp
 --- tt_metal/impl/tensor/tensor_apis.cpp
 +++ tt_metal/impl/tensor/tensor_apis.cpp
-@@ -421,14 +421,18 @@
+@@ -402,14 +402,18 @@ tt::tt_metal::DistributedHostBuffer transform_buffers(
      const tt::tt_metal::DistributedHostBuffer& input_buffer) {
      if constexpr (std::is_same_v<SrcType, DstType>) {
          return input_buffer;
@@ -202,7 +202,7 @@ diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis
              auto transform_fn = [&](const tt::tt_metal::HostBuffer& buffer) {
                  auto data = buffer.view_as<const SrcType>();
                  std::vector<DstType> output_vector(data.size());
-@@ -439,7 +443,7 @@
+@@ -420,7 +424,7 @@ tt::tt_metal::DistributedHostBuffer transform_buffers(
              };
              return input_buffer.transform(transform_fn);
          } else {
@@ -211,7 +211,7 @@ diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis
              return input_buffer;  // unreachable, satisfies return type
          }
      } else if constexpr (std::is_same_v<DstType, bfloat4_tag> || std::is_same_v<DstType, bfloat8_tag>) {
-@@ -551,6 +555,7 @@
+@@ -532,6 +536,7 @@ HostTensor to_dtype(const HostTensor& input_tensor, DataType dtype) {
                  case DataType::INT8: return with_src_and_dst.operator()<SrcType, int8_t>();
                  case DataType::INT32: return with_src_and_dst.operator()<SrcType, int32_t>();
                  case DataType::FP8_E4M3: return with_src_and_dst.operator()<SrcType, float8_e4m3>();
@@ -219,7 +219,7 @@ diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis
                  case DataType::INVALID: TT_THROW("Unsupported data type conversion requested. Source type is invalid!");
              }
              TT_THROW("Unreachable");
-@@ -568,6 +573,7 @@
+@@ -549,6 +554,7 @@ HostTensor to_dtype(const HostTensor& input_tensor, DataType dtype) {
              case DataType::INT8: return with_src.operator()<int8_t>();
              case DataType::INT32: return with_src.operator()<int32_t>();
              case DataType::FP8_E4M3: return with_src.operator()<float8_e4m3>();
@@ -230,7 +230,7 @@ diff --git tt_metal/impl/tensor/tensor_apis.cpp tt_metal/impl/tensor/tensor_apis
 diff --git tt_metal/impl/tensor/tensor_impl.cpp tt_metal/impl/tensor/tensor_impl.cpp
 --- tt_metal/impl/tensor/tensor_impl.cpp
 +++ tt_metal/impl/tensor/tensor_impl.cpp
-@@ -47,6 +47,7 @@
+@@ -65,6 +65,7 @@ HostBuffer allocate_host_buffer(const TensorSpec& tensor_spec) {
          case DataType::INT8: return HostBuffer(std::vector<int8_t>(size_bytes / sizeof(int8_t)));
          case DataType::INT32: return HostBuffer(std::vector<int32_t>(size_bytes / sizeof(int32_t)));
          case DataType::FP8_E4M3: return HostBuffer(std::vector<float8_e4m3>(size_bytes / sizeof(float8_e4m3)));
@@ -238,15 +238,15 @@ diff --git tt_metal/impl/tensor/tensor_impl.cpp tt_metal/impl/tensor/tensor_impl
          case DataType::UINT8: return HostBuffer(std::vector<uint8_t>(size_bytes / sizeof(uint8_t)));
          case DataType::UINT16: return HostBuffer(std::vector<uint16_t>(size_bytes / sizeof(uint16_t)));
          case DataType::BFLOAT4_B:
-@@ -74,6 +75,7 @@
-         case DataType::FLOAT32: return uninitialized_host_buffer<float>(size_bytes);
+@@ -93,6 +94,7 @@ HostBuffer allocate_uninitialized_host_buffer(const TensorSpec& tensor_spec) {
+         case DataType::INT8: return uninitialized_host_buffer<int8_t>(size_bytes);
          case DataType::INT32: return uninitialized_host_buffer<int32_t>(size_bytes);
          case DataType::FP8_E4M3: return uninitialized_host_buffer<float8_e4m3>(size_bytes);
 +        case DataType::FP8_E5M2: return uninitialized_host_buffer<float8_e5m2>(size_bytes);
          case DataType::UINT8: return uninitialized_host_buffer<uint8_t>(size_bytes);
          case DataType::UINT16: return uninitialized_host_buffer<uint16_t>(size_bytes);
          case DataType::BFLOAT4_B:
-@@ -321,6 +323,8 @@
+@@ -340,6 +342,8 @@ template std::vector<uint8_t> to_tile_major_layout<uint8_t>(
      const Shape2D& shape, const Tile& tile, ttsl::Span<const uint8_t> data_to_convert);
  template std::vector<float8_e4m3> to_tile_major_layout<float8_e4m3>(
      const Shape2D& shape, const Tile& tile, ttsl::Span<const float8_e4m3> data_to_convert);
@@ -258,7 +258,7 @@ diff --git tt_metal/impl/tensor/tensor_impl.cpp tt_metal/impl/tensor/tensor_impl
 diff --git tt_metal/impl/tensor/tensor_impl.hpp tt_metal/impl/tensor/tensor_impl.hpp
 --- tt_metal/impl/tensor/tensor_impl.hpp
 +++ tt_metal/impl/tensor/tensor_impl.hpp
-@@ -108,6 +108,8 @@
+@@ -124,6 +124,8 @@ auto dispatch(DataType dtype, Func&& func, Args&&... args) {
              return (std::forward<Func>(func)).template operator()<bfloat4_b>(std::forward<Args>(args)...);
          case DataType::FP8_E4M3:
              return (std::forward<Func>(func)).template operator()<float8_e4m3>(std::forward<Args>(args)...);
@@ -270,7 +270,7 @@ diff --git tt_metal/impl/tensor/tensor_impl.hpp tt_metal/impl/tensor/tensor_impl
 diff --git tt_metal/impl/tensor/tensor_types.cpp tt_metal/impl/tensor/tensor_types.cpp
 --- tt_metal/impl/tensor/tensor_types.cpp
 +++ tt_metal/impl/tensor/tensor_types.cpp
-@@ -17,6 +17,7 @@
+@@ -18,6 +18,7 @@ std::ostream& operator<<(std::ostream& os, const tt::tt_metal::DataType& data_ty
          case DataType::UINT16: return os << "DataType::UINT16";
          case DataType::INT32: return os << "DataType::INT32";
          case DataType::FP8_E4M3: return os << "DataType::FP8_E4M3";
@@ -278,7 +278,7 @@ diff --git tt_metal/impl/tensor/tensor_types.cpp tt_metal/impl/tensor/tensor_typ
          case DataType::INT8: return os << "DataType::INT8";
          case DataType::FLOAT16: return os << "DataType::FLOAT16";
          case DataType::INVALID:
-@@ -77,6 +78,7 @@
+@@ -78,6 +79,7 @@ bool is_floating_point(DataType dtype) {
          case DataType::BFLOAT8_B:
          case DataType::BFLOAT4_B:
          case DataType::FP8_E4M3: return true;
@@ -286,7 +286,7 @@ diff --git tt_metal/impl/tensor/tensor_types.cpp tt_metal/impl/tensor/tensor_typ
          case DataType::FLOAT16: return true;
          default: return false;
      }
-@@ -102,6 +104,7 @@
+@@ -103,6 +105,7 @@ tt::DataFormat datatype_to_dataformat_converter(tt::tt_metal::DataType datatype)
          case tt::tt_metal::DataType::UINT16: return tt::DataFormat::UInt16;
          case tt::tt_metal::DataType::UINT8: return tt::DataFormat::UInt8;
          case tt::tt_metal::DataType::FP8_E4M3: return tt::DataFormat::Fp8_e4m3;
@@ -294,7 +294,7 @@ diff --git tt_metal/impl/tensor/tensor_types.cpp tt_metal/impl/tensor/tensor_typ
          case tt::tt_metal::DataType::FLOAT16: return tt::DataFormat::Float16;
          default: TT_THROW("Unsupported DataType"); return tt::DataFormat::Float16_b;  // for clang-tidy
      }
-@@ -124,6 +127,7 @@
+@@ -125,6 +128,7 @@ tt::tt_metal::DataType dataformat_to_datatype_converter(tt::DataFormat dataforma
          case tt::DataFormat::UInt16: return tt::tt_metal::DataType::UINT16;
          case tt::DataFormat::UInt8: return tt::tt_metal::DataType::UINT8;
          case tt::DataFormat::Fp8_e4m3: return tt::tt_metal::DataType::FP8_E4M3;
@@ -302,7 +302,7 @@ diff --git tt_metal/impl/tensor/tensor_types.cpp tt_metal/impl/tensor/tensor_typ
          case tt::DataFormat::Float16: return tt::tt_metal::DataType::FLOAT16;
          default: TT_THROW("Unsupported DataFormat"); return tt::tt_metal::DataType::BFLOAT16;  // for clang-tidy
      }
-@@ -149,6 +153,7 @@
+@@ -150,6 +154,7 @@ auto fmt::formatter<tt::tt_metal::DataType>::format(tt::tt_metal::DataType dt, f
          case tt::tt_metal::DataType::UINT16: name = "DataType::UINT16"; break;
          case tt::tt_metal::DataType::INT32: name = "DataType::INT32"; break;
          case tt::tt_metal::DataType::FP8_E4M3: name = "DataType::FP8_E4M3"; break;
@@ -313,7 +313,7 @@ diff --git tt_metal/impl/tensor/tensor_types.cpp tt_metal/impl/tensor/tensor_typ
 diff --git tt_metal/jit_build/data_format.cpp tt_metal/jit_build/data_format.cpp
 --- tt_metal/jit_build/data_format.cpp
 +++ tt_metal/jit_build/data_format.cpp
-@@ -82,8 +82,8 @@
+@@ -82,8 +82,8 @@ DataFormat check_consistent_format_across_buffers(std::span<const DataFormat> da
              continue;
          }
  
@@ -324,7 +324,7 @@ diff --git tt_metal/jit_build/data_format.cpp tt_metal/jit_build/data_format.cpp
              continue;
          }
  
-@@ -301,6 +301,9 @@
+@@ -301,6 +301,9 @@ DataFormat get_single_pack_src_format(
              pack_src_format = DataFormat::UInt8;
          } else if (data_format == DataFormat::Int8) {
              pack_src_format = DataFormat::Int8;
@@ -337,7 +337,7 @@ diff --git tt_metal/jit_build/data_format.cpp tt_metal/jit_build/data_format.cpp
 diff --git ttnn/api/ttnn/tensor/tensor_impl.hpp ttnn/api/ttnn/tensor/tensor_impl.hpp
 --- ttnn/api/ttnn/tensor/tensor_impl.hpp
 +++ ttnn/api/ttnn/tensor/tensor_impl.hpp
-@@ -47,6 +47,8 @@
+@@ -48,6 +48,8 @@ auto dispatch(tt::tt_metal::DataType dtype, Func&& func, Args&&... args) {
              return (std::forward<Func>(func)).template operator()<bfloat4_b>(std::forward<Args>(args)...);
          case tt::tt_metal::DataType::FP8_E4M3:
              return (std::forward<Func>(func)).template operator()<float8_e4m3>(std::forward<Args>(args)...);
@@ -349,7 +349,7 @@ diff --git ttnn/api/ttnn/tensor/tensor_impl.hpp ttnn/api/ttnn/tensor/tensor_impl
 diff --git ttnn/core/distributed/distributed_tensor.cpp ttnn/core/distributed/distributed_tensor.cpp
 --- ttnn/core/distributed/distributed_tensor.cpp
 +++ ttnn/core/distributed/distributed_tensor.cpp
-@@ -227,6 +227,7 @@
+@@ -227,6 +227,7 @@ public:
              case tt::tt_metal::DataType::BFLOAT16: return extract_logical_data.template operator()<bfloat16>(tensor);
              case tt::tt_metal::DataType::UINT32: return extract_logical_data.template operator()<uint32_t>(tensor);
              case tt::tt_metal::DataType::FP8_E4M3: TT_THROW("FP8_E4M3 ingestion via TensorToMesh is not supported");
@@ -357,7 +357,7 @@ diff --git ttnn/core/distributed/distributed_tensor.cpp ttnn/core/distributed/di
              case tt::tt_metal::DataType::UINT8: return extract_logical_data.template operator()<uint8_t>(tensor);
              case tt::tt_metal::DataType::UINT16: return extract_logical_data.template operator()<uint16_t>(tensor);
              case tt::tt_metal::DataType::INT32: return extract_logical_data.template operator()<int32_t>(tensor);
-@@ -506,7 +507,7 @@
+@@ -506,7 +507,7 @@ public:
          // conversion path (which would require Tensor::to_vector<float8_e4m3>, not instantiated)
          // is never reached. Guard explicitly so a future regression fails loudly instead of
          // silently skipping the conversion.
@@ -366,7 +366,7 @@ diff --git ttnn/core/distributed/distributed_tensor.cpp ttnn/core/distributed/di
              const auto& tensor_spec = tensor.tensor_spec();
              TT_FATAL(
                  tensor_spec.layout() == tt::tt_metal::Layout::ROW_MAJOR &&
-@@ -570,7 +571,8 @@
+@@ -570,7 +571,8 @@ public:
              case tt::tt_metal::DataType::BFLOAT16: return dispatch_to_concrete.template operator()<bfloat16>(tensor);
              case tt::tt_metal::DataType::UINT32: return dispatch_to_concrete.template operator()<uint32_t>(tensor);
              case tt::tt_metal::DataType::FP8_E4M3:
@@ -376,7 +376,7 @@ diff --git ttnn/core/distributed/distributed_tensor.cpp ttnn/core/distributed/di
              case tt::tt_metal::DataType::UINT8: return dispatch_to_concrete.template operator()<uint8_t>(tensor);
              case tt::tt_metal::DataType::UINT16: return dispatch_to_concrete.template operator()<uint16_t>(tensor);
              case tt::tt_metal::DataType::INT32: return dispatch_to_concrete.template operator()<int32_t>(tensor);
-@@ -816,5 +818,6 @@
+@@ -816,5 +818,6 @@ template std::pair<std::vector<int8_t>, Shape> MeshToTensor::compose<int8_t>(con
  template std::pair<std::vector<uint8_t>, Shape> MeshToTensor::compose<uint8_t>(const Tensor& tensor) const;
  template std::pair<std::vector<uint16_t>, Shape> MeshToTensor::compose<uint16_t>(const Tensor& tensor) const;
  template std::pair<std::vector<float8_e4m3>, Shape> MeshToTensor::compose<float8_e4m3>(const Tensor& tensor) const;
@@ -386,7 +386,7 @@ diff --git ttnn/core/distributed/distributed_tensor.cpp ttnn/core/distributed/di
 diff --git ttnn/core/tensor/tensor.cpp ttnn/core/tensor/tensor.cpp
 --- ttnn/core/tensor/tensor.cpp
 +++ ttnn/core/tensor/tensor.cpp
-@@ -411,6 +411,7 @@
+@@ -411,6 +411,7 @@ uint32_t Tensor::element_size() const {
          case DataType::UINT32: return sizeof(uint32_t);
          case DataType::UINT16: return sizeof(uint16_t);
          case DataType::FP8_E4M3: return sizeof(float8_e4m3);
@@ -397,7 +397,7 @@ diff --git ttnn/core/tensor/tensor.cpp ttnn/core/tensor/tensor.cpp
 diff --git ttnn/core/tensor/tensor_impl.cpp ttnn/core/tensor/tensor_impl.cpp
 --- ttnn/core/tensor/tensor_impl.cpp
 +++ ttnn/core/tensor/tensor_impl.cpp
-@@ -56,6 +56,7 @@
+@@ -56,6 +56,7 @@ std::ostream& operator<<(std::ostream& os, const tt::tt_metal::DataType& dtype)
          case tt::tt_metal::DataType::INT32: os << "int32"; break;
          case tt::tt_metal::DataType::INT8: os << "int8"; break;
          case tt::tt_metal::DataType::FP8_E4M3: os << "fp8_e4m3"; break;
@@ -405,7 +405,7 @@ diff --git ttnn/core/tensor/tensor_impl.cpp ttnn/core/tensor/tensor_impl.cpp
          default: throw std::invalid_argument("Unknown data type");
      }
      return os;
-@@ -264,7 +265,8 @@
+@@ -264,7 +265,8 @@ std::string to_string_impl(const ttnn::Tensor& tensor) {
      }
  
      auto get_row_major_tensor = [&](const ttnn::Tensor& tensor) -> ttnn::Tensor {
@@ -415,7 +415,7 @@ diff --git ttnn/core/tensor/tensor_impl.cpp ttnn/core/tensor/tensor_impl.cpp
              // FP8 is element-encoded and is already ROW_MAJOR (constrained in tensor_spec.cpp),
              // but the downstream detail::to_string uses view_as<float> which would misinterpret
              // FP8 bytes as floats. Pivot through FLOAT32 via host-side conversion
-@@ -354,6 +356,11 @@
+@@ -354,6 +356,11 @@ std::string to_string_impl<float8_e4m3>(const ttnn::Tensor& tensor) {
      return to_string_impl<float>(tensor);
  }
  
@@ -427,7 +427,7 @@ diff --git ttnn/core/tensor/tensor_impl.cpp ttnn/core/tensor/tensor_impl.cpp
  std::string to_string(const ttnn::Tensor& tensor) {
      return dispatch(tensor.dtype(), [&]<typename T>() { return to_string_impl<T>(tensor); });
  }
-@@ -483,6 +490,11 @@
+@@ -483,6 +490,11 @@ ttnn::Tensor extract_shard_impl<float8_e4m3>(const ttnn::Tensor&, const uint32_t
      TT_THROW("extract_shard: FP8_E4M3 is not supported");
  }
  
@@ -442,7 +442,7 @@ diff --git ttnn/core/tensor/tensor_impl.cpp ttnn/core/tensor/tensor_impl.cpp
 diff --git ttnn/core/tensor/xtensor/partition.cpp ttnn/core/tensor/xtensor/partition.cpp
 --- ttnn/core/tensor/xtensor/partition.cpp
 +++ ttnn/core/tensor/xtensor/partition.cpp
-@@ -304,6 +304,7 @@
+@@ -307,6 +307,7 @@ EXPLICIT_INSTANTIATIONS_FOR_TYPE(uint8_t)
  EXPLICIT_INSTANTIATIONS_FOR_TYPE(uint16_t)
  EXPLICIT_INSTANTIATIONS_FOR_TYPE(uint32_t)
  EXPLICIT_INSTANTIATIONS_FOR_TYPE(float8_e4m3)
@@ -453,7 +453,7 @@ diff --git ttnn/core/tensor/xtensor/partition.cpp ttnn/core/tensor/xtensor/parti
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp
-@@ -496,7 +496,7 @@
+@@ -496,7 +496,7 @@ Tensor bitcast(
      // UINT8 and float8 tiles hold the same bytes, so a bitcast between them is a view (a copy through the
      // unpacker would read the float8 bytes as numbers).
      auto is_byte_type = [](DataType dtype) {

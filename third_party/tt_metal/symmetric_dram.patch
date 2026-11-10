@@ -61,7 +61,7 @@ diff --git tt_metal/impl/allocator/allocator.hpp tt_metal/impl/allocator/allocat
 diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocator.cpp
 --- tt_metal/impl/allocator/allocator.cpp
 +++ tt_metal/impl/allocator/allocator.cpp
-@@ -205,6 +205,19 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
+@@ -207,6 +207,19 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
  
      switch (buffer_type) {
          case BufferType::DRAM:
@@ -81,7 +81,7 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
              address = dram_manager_->allocate_buffer(size, page_size, bottom_up, config_->compute_grid, num_cores);
              break;
          case BufferType::L1: {
-@@ -348,7 +361,12 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
+@@ -350,7 +363,12 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
      }
  
      switch (buffer_type) {
@@ -95,7 +95,7 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
          case BufferType::L1: l1_manager_->deallocate_buffer(address); break;
          case BufferType::L1_SMALL: l1_small_manager_->deallocate_buffer(address); break;
          case BufferType::TRACE: trace_buffer_manager_->deallocate_buffer(address); break;
-@@ -362,6 +380,34 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
+@@ -364,6 +382,34 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
      }
  }
  
@@ -130,7 +130,7 @@ diff --git tt_metal/impl/allocator/allocator.cpp tt_metal/impl/allocator/allocat
  void AllocatorImpl::deallocate_buffers() {
      std::lock_guard<std::mutex> lock(mutex_);
      this->release_trace_dram_reservations();
-@@ -883,6 +929,16 @@ Statistics Allocator::get_statistics(const BufferType& buffer_type) const { retu
+@@ -885,6 +931,16 @@ Statistics Allocator::get_statistics(const BufferType& buffer_type) const { retu
  
  size_t Allocator::get_worker_l1_size() const { return impl_->get_worker_l1_size(); }
  

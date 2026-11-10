@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_operation.cpp
-@@ -309,7 +309,12 @@ ttsl::hash::hash_t BinaryNgDeviceOperation::tensor_args_t::to_hash() const {
+@@ -311,7 +311,12 @@ ttsl::hash::hash_t BinaryNgDeviceOperation::tensor_args_t::to_hash() const {
          sharded_tensor_shape_in_pages(input_tensor_a),
          input_tensor_b.has_value() ? sharded_tensor_shape_in_pages(*input_tensor_b) : std::nullopt,
          // Output dtype can change the program (fp32 DEST). Falls back to a's dtype so in-place calls still share.
@@ -18,68 +18,54 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_device_op
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_program_factory.cpp
-@@ -399,10 +399,13 @@ std::optional<AllShardVolumes> get_shard_volumes(
- 
- namespace {
- 
--// Per-core runtime-arg lists for every core in the worker grid (work AND noop cores), in the same
--// order create_descriptor() populates them.  Each arg list is a vector of variants: Buffer* entries
-+// Per-core runtime-arg lists for every core of the program (a sharded program's noop cores too), in
-+// the same order create_descriptor() populates them.  Each arg list is a vector of variants: Buffer* entries
- // are buffer base addresses (bindings), uint32_t entries are plain values.
- struct BinaryNgPerCoreArgs {
-+    // The program's cores: the worker grid when sharded, else only those with output tiles (an idle
-+    // core of a program still costs dispatch time).
-+    CoreRangeSet program_cores;
-     std::vector<CoreCoord> cores;
-     std::vector<std::vector<std::variant<uint32_t, Buffer*>>> reader;
-     std::vector<std::vector<std::variant<uint32_t, Buffer*>>> writer;
-@@ -421,7 +424,8 @@ struct BinaryNgPerCoreArgs {
- // volume (a core can flip between work and noop across hits), the builder emits args for ALL
+@@ -416,12 +416,17 @@ using RuntimeArgList = std::vector<std::variant<uint32_t, Buffer*>>;
  // num_cores_total cores -- noop cores get zero-filled lists sized to match the work-core layout -- and
  // override_runtime_arguments re-applies every slot (buffer slots via their current address), so nothing
--// is left frozen regardless of how the partition shifts.
-+// is left frozen regardless of how the partition shifts. An interleaved program's hash includes the
-+// operand shapes, so its partition is fixed and only its work cores are listed.
- BinaryNgPerCoreArgs build_per_core_runtime_args(
+ // is left frozen regardless of how the partition shifts.
++// An interleaved program's hash includes the operand shapes, so its partition is fixed and only its work
++// cores are visited.
+ //
+ // Calls fn(core, reader_args, writer_args, compute_args) once per core, in the order create_descriptor()
+ // populates them.  The three lists are scratch buffers reused across cores (no per-core allocation on
+ // the cache-hit path), so they are only valid for the duration of each call.
++//
++// Returns the program's cores: the worker grid when sharded, else only those with output tiles (an idle
++// core of a program still costs dispatch time).
+ template <typename Fn>
+-void for_each_core_runtime_args(
++CoreRangeSet for_each_core_runtime_args(
      const BinaryNgDeviceOperation::operation_attributes_t& operation_attributes,
      const Tensor& a,
-@@ -616,6 +620,9 @@ BinaryNgPerCoreArgs build_per_core_runtime_args(
+     const std::optional<Tensor>& b,
+@@ -652,6 +657,9 @@ void for_each_core_runtime_args(
          } else if (core_group_2.contains(core)) {
              c_num_tiles_core = num_tiles_per_core_group_2;
          } else {
 +            if (!rt_has_sharding) {
 +                continue;
 +            }
-             // Noop core: zero-filled runtime args, sized to match the active kernel variant so unused
-             // cores neither inflate the per-kernel max runtime-arg allocation nor change slot count when a
-             // core flips between noop and work across differently-shaped cache hits.
-@@ -836,6 +843,7 @@ BinaryNgPerCoreArgs build_per_core_runtime_args(
+             reader_runtime_args.assign(noop_reader_len, std::variant<uint32_t, Buffer*>{uint32_t{0}});
+             writer_runtime_args.assign(noop_writer_len, std::variant<uint32_t, Buffer*>{uint32_t{0}});
+             compute_runtime_args.assign(noop_compute_len, std::variant<uint32_t, Buffer*>{uint32_t{0}});
+@@ -835,6 +843,8 @@ void for_each_core_runtime_args(
+             current_block += c_num_tiles_core;
          }
      }
- 
-+    result.program_cores = rt_has_sharding ? all_device_cores : all_cores;
-     return result;
++
++    return rt_has_sharding ? all_device_cores : all_cores;
  }
  
-@@ -917,7 +925,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
+ }  // namespace
+@@ -915,7 +925,8 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
      uint32_t c_single_tile_size = tt::tile_size(c_pack_data_format);
  
      // we parallelize the computation across the output tiles
 -    const auto& all_device_cores = operation_attributes.worker_grid;
-+    const auto per_core = build_per_core_runtime_args(operation_attributes, a, b, c);
-+    const CoreRangeSet& all_device_cores = per_core.program_cores;
++    const CoreRangeSet all_device_cores =
++        for_each_core_runtime_args(operation_attributes, a, b, c, [](const auto&...) {});
  
      Buffer* a_buffer = a.buffer();
      Buffer* b_buffer = b.has_value() ? b->buffer() : nullptr;
-@@ -1457,7 +1466,6 @@ tt::tt_metal::ProgramDescriptor BinaryNgDeviceOperation::ProgramFactory::create_
-     // Built via the shared single-source-of-truth builder so create_descriptor() (cache miss, here)
-     // and BinaryNgDeviceOperation::override_runtime_arguments() (cache hit) stay byte-identical.
-     {
--        auto per_core = build_per_core_runtime_args(operation_attributes, a, b, c);
-         for (size_t i = 0; i < per_core.cores.size(); ++i) {
-             reader_desc.emplace_runtime_args(per_core.cores[i], per_core.reader[i]);
-             writer_desc.emplace_runtime_args(per_core.cores[i], per_core.writer[i]);
 diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_device_operation.cpp
@@ -177,7 +163,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_facto
 diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.cpp
-@@ -368,6 +368,11 @@ ttsl::hash::hash_t UnaryDeviceOperation::compute_program_hash(
+@@ -395,6 +395,11 @@ ttsl::hash::hash_t UnaryDeviceOperation::compute_program_hash(
          return std::pair{distribution->shard_shape_in_pages(), distribution->cores()};
      };
  
@@ -189,7 +175,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/device/unary_device_operation.
      return operation::hash_operation<UnaryDeviceOperation>(
          attributes,
          input_tensor.tensor_spec().tensor_layout(),
-@@ -382,7 +387,8 @@ ttsl::hash::hash_t UnaryDeviceOperation::compute_program_hash(
+@@ -409,7 +414,8 @@ ttsl::hash::hash_t UnaryDeviceOperation::compute_program_hash(
          distribution_key(
              output_spec, tensor_args.output_tensor.has_value() ? &*tensor_args.output_tensor : nullptr, "output"),
          src_shard_vol,
