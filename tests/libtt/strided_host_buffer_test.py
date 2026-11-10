@@ -39,19 +39,25 @@ def anon_mb():
     return int(line.split()[1]) // 1024
 
 
-@pytest.mark.parametrize("dtype", [np.float32, ml_dtypes.bfloat16])
+@pytest.mark.parametrize("dtype", [np.float32, ml_dtypes.bfloat16, np.uint8])
 @pytest.mark.parametrize("kind", ["transposed", "sliced", "sliced_transposed"])
 def test_strided_view_is_read_back_and_computed_on(kind, dtype):
-    # Small integers, exact in bf16 and when doubled.
-    base = (np.arange(3 * 16 * 32) % 101).astype(dtype).reshape(3, 16, 32)
+    # Small integers, exact in bf16 and uint8, also when doubled.
+    # Whole tiles, which a uint8 weight is laid out in on host.
+    base = (np.arange(3 * 64 * 32) % 101).astype(dtype).reshape(3, 64, 32)
     view = strided_view(base, kind)
     assert not view.flags.c_contiguous
     y = jax.device_put(view, jax.devices("tt")[0])
 
     np.testing.assert_array_equal(np.asarray(y), view)
-    # As a program input, and as a weight (gathered by the weight's to_device).
+    # As a program input, and as a weight (gathered by the weight's to_device, or
+    # by its conversion to tiles on host, as for uint8).
     np.testing.assert_array_equal(np.asarray(jax.jit(lambda a: a * 2)(y)), view * 2)
     np.testing.assert_array_equal(np.asarray(jax.jit(lambda a: weight(a) * 2)(y)), view * 2)
+    # A weight converted to another type, as the view's first reader.
+    cast = jax.jit(lambda a: weight(a).astype(jnp.float32) * 2)
+    fresh = jax.device_put(view, jax.devices("tt")[0])
+    np.testing.assert_array_equal(np.asarray(cast(fresh)), view.astype(np.float32) * 2)
 
 
 def test_sharded_transposed_view():
