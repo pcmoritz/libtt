@@ -568,3 +568,26 @@ def test_indexed_moves_run_on_rows_kernels(tmp_path, name, fn, args):
     cpu = jax.devices("cpu")[0]
     want = np.asarray(jax.jit(fn)(*[jax.device_put(a, cpu) for a in args]))
     assert_equal(result, want)
+
+
+def test_column_scatter_result_is_tilized_in_its_reshaped_shape(tmp_path):
+    # The cross-entropy gradient, softmax minus one-hot: one update per row,
+    # scattered as a column into the row's page, then used by tiled ops. The
+    # scatter runs on [N, 1, M] row-major pages. Tilizing that result before
+    # reshaping it to [N, M] would pad every row's page to 32 rows, 32 times
+    # the tensor's size: a [2048, 151936] float32 gradient asked for 39.8 GB.
+    rng = np.random.default_rng(31)
+    probs = rng.uniform(size=(64, 4096)).astype(np.float32)
+    labels = rng.integers(0, 4096, size=64).astype(np.int32)
+
+    def fn(p, l):
+        grad = jax.vmap(lambda row, label: row.at[label].add(-1.0))(p, l)
+        return grad * 0.5
+
+    result, ir = _compile_ir(tmp_path, fn, probs, labels)
+    want = probs.copy()
+    want[np.arange(64), labels] -= 1.0
+    np.testing.assert_allclose(result, want * 0.5, rtol=1e-6)
+    scatters = [line for line in ir.splitlines() if '"ttnn.rows_scatter"' in line]
+    assert scatters and all("column = true" in line for line in scatters), scatters
+    assert not [line for line in ir.splitlines() if '"ttnn.to_layout"' in line and "64x1x4096" in line]
