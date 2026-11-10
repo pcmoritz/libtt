@@ -64,7 +64,7 @@ void kernel_main() {
         const uint32_t base = r * head_tiles;
 
         reconfig_data_format(cb_heads, cb_heads);
-        mul_tiles_init(cb_heads, cb_heads);
+        mul_init(cb_heads, cb_heads, true);
         each_tile(cb_squares, [&](uint32_t j) { mul_tiles(cb_heads, cb_heads, base + j, base + j, 0); });
 
         // rstd = rsqrt(sum / head_dim + eps), one per row, down column 0. A
@@ -102,24 +102,24 @@ void kernel_main() {
         // normed = x * rstd (one per row)
         cb_wait_front(cb_rstd, 1);
         reconfig_data_format(cb_heads, cb_rstd);
-        mul_bcast_cols_init_short(cb_heads, cb_rstd);
+        mul_bcast_cols_init(cb_heads, cb_rstd);
         each_tile(cb_normed, [&](uint32_t j) { mul_tiles_bcast_cols(cb_heads, cb_rstd, base + j, 0, 0); });
         cb_pop_front(cb_rstd, 1);
 
         // weighted = normed * weight (a row per head)
         cb_wait_front(cb_normed, head_tiles);
         reconfig_data_format(cb_normed, cb_weight);
-        mul_tiles_init(cb_normed, cb_weight);
+        mul_init(cb_normed, cb_weight, true);
         each_tile(cb_weighted, [&](uint32_t j) { mul_tiles(cb_normed, cb_weight, j, base + j, 0); });
         cb_pop_front(cb_normed, head_tiles);
 
         // cos_part = weighted * cos, sin_part = weighted[the other half] * sin
         cb_wait_front(cb_weighted, head_tiles);
         reconfig_data_format(cb_weighted, cb_cos);
-        mul_bcast_rows_init_short(cb_weighted, cb_cos);
+        mul_bcast_rows_init(cb_weighted, cb_cos);
         each_tile(cb_cos_part, [&](uint32_t j) { mul_tiles_bcast_rows(cb_weighted, cb_cos, j, j, 0); });
         reconfig_data_format(cb_weighted, cb_sin);
-        mul_bcast_rows_init_short(cb_weighted, cb_sin);
+        mul_bcast_rows_init(cb_weighted, cb_sin);
         each_tile(cb_sin_part, [&](uint32_t j) {
             mul_tiles_bcast_rows(cb_weighted, cb_sin, (j + half) % head_tiles, j, 0);
         });
@@ -131,10 +131,10 @@ void kernel_main() {
         reconfig_data_format(cb_cos_part, cb_sin_part);
         each_tile(r < q_row_tiles ? cb_q_out : cb_k_stage, [&](uint32_t j) {
             if (j < half) {
-                sub_tiles_init(cb_cos_part, cb_sin_part);
+                sub_init(cb_cos_part, cb_sin_part);
                 sub_tiles(cb_cos_part, cb_sin_part, j, j, 0);
             } else {
-                add_tiles_init(cb_cos_part, cb_sin_part);
+                add_init(cb_cos_part, cb_sin_part);
                 add_tiles(cb_cos_part, cb_sin_part, j, j, 0);
             }
         });

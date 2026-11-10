@@ -1,0 +1,14 @@
+diff --git tt_metal/impl/buffers/circular_buffer.cpp tt_metal/impl/buffers/circular_buffer.cpp
+--- tt_metal/impl/buffers/circular_buffer.cpp
++++ tt_metal/impl/buffers/circular_buffer.cpp
+@@ -63,7 +63,9 @@ CircularBufferImpl::CircularBufferImpl(
+ 
+ CircularBufferImpl::CircularBufferImpl(const CBDescriptor& descriptor) :
+     id_(reinterpret_cast<uintptr_t>(this)),
+-    core_ranges_(descriptor.core_ranges),
++    // Merged like CreateCircularBuffer's: dispatch writes a program's CB configs with one multicast per range, so a
++    // set that lists its cores one by one costs a write per core (moe_compute: 278 writes instead of 106).
++    core_ranges_(descriptor.core_ranges.merge_ranges()),
+     config_(descriptor),
+     locally_allocated_address_(std::nullopt) {
+     this->validate_set_config_attributes();

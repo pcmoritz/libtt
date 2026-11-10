@@ -203,6 +203,13 @@ sfpi_inline void store_raw(uint32_t i, sfpi::vUInt v) { sfpi::dst_reg[i].mode<sf
 // b * real + i of the tile; each band's vectors are read before a later band
 // writes over them (real <= 2, or one band).
 
+// SFPI keeps only the eight-register subvec_transp for integers; transposing four registers pads the
+// other four with zeros, as its own four-register vFloat form does.
+inline void subvec_transp4(sfpi::vUInt& v0, sfpi::vUInt& v1, sfpi::vUInt& v2, sfpi::vUInt& v3) {
+    sfpi::vUInt v4 = 0, v5 = 0, v6 = 0, v7 = 0;
+    sfpi::subvec_transp(v0, v1, v2, v3, v4, v5, v6, v7);
+}
+
 template <uint32_t t, uint32_t bands, uint32_t real>
 inline void gather_rows() {
     static_assert(real <= 2 || bands == 1, "the rows would overwrite bands not yet read");
@@ -214,7 +221,7 @@ inline void gather_rows() {
         sfpi::vUInt v1 = load_raw(vec(t, f, b % 4, 1));
         sfpi::vUInt v2 = load_raw(vec(t, f + 1, b % 4, 0));
         sfpi::vUInt v3 = load_raw(vec(t, f + 1, b % 4, 1));
-        sfpi::subvec_transp(v0, v1, v2, v3);
+        subvec_transp4(v0, v1, v2, v3);
         store_raw(t * 32 + b * real, v0);
         if constexpr (real > 1) {
             store_raw(t * 32 + b * real + 1, v1);
@@ -244,7 +251,7 @@ inline void scatter_rows() {
         if constexpr (real > 2) {
             v2 = load_raw(t * 32 + b * real + 2);
         }
-        sfpi::subvec_transp(v0, v1, v2, v3);
+        subvec_transp4(v0, v1, v2, v3);
         store_raw(vec(t, f, b % 4, 0), v0);
         store_raw(vec(t, f, b % 4, 1), v1);
         store_raw(vec(t, f + 1, b % 4, 0), v2);

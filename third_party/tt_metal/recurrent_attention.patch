@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
-@@ -133,6 +133,7 @@ struct ScanWorkDist {
+@@ -141,6 +141,7 @@ struct ScanWorkDist {
      std::vector<CoreCoord> cores;
      std::vector<uint32_t> head;  // head index per core
      std::vector<uint32_t> vblk;  // v-block index per core
@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ch
      uint32_t Vtl = 1;            // per-core v-block width (tiles) = Vt / NV
      uint32_t NV = 1;             // v-blocks per head
      CoreRangeSet core_set;
-@@ -140,7 +141,21 @@ struct ScanWorkDist {
+@@ -148,7 +149,21 @@ struct ScanWorkDist {
  
  ScanWorkDist distribute_scan(CoreCoord grid, uint32_t BH, uint32_t Vt, bool force_serial) {
      const uint32_t ncores = grid.x * grid.y;
@@ -32,7 +32,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ch
      // force_serial (ChunkGdnPhasedProgramConfig::scan_serial, hashed into ChunkGdnScanParams) pins
      // NV=1 — full V on 1 core/head, the old layout — for perf A/B only.
      // Row-aligned placement: each head's NV v-block cores must form a 1xNV NoC RECTANGLE (the
-@@ -175,6 +190,7 @@ ScanWorkDist distribute_scan(CoreCoord grid, uint32_t BH, uint32_t Vt, bool forc
+@@ -183,6 +198,7 @@ ScanWorkDist distribute_scan(CoreCoord grid, uint32_t BH, uint32_t Vt, bool forc
          d.cores.push_back(core);
          d.head.push_back(h);
          d.vblk.push_back(v);
@@ -40,7 +40,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ch
          crs.insert(CoreRange{core, core});
      }
      d.core_set = CoreRangeSet{crs};
-@@ -403,6 +419,9 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
+@@ -413,6 +429,9 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
      const CoreRangeSet& cores = sdist.core_set;
      const uint32_t Vt = sdist.Vtl;  // per-core V-block width; CBs/compute use this
      const uint32_t n_used = static_cast<uint32_t>(sdist.cores.size());
@@ -50,7 +50,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ch
  
      // V-independent tensors (nkd, q_decay, intra, k_dec_t, T_inv, dl) are read in FULL; only the
      // V-dependent CBs (v_beta/state/out/scratch) shrink to the per-core V-block width Vt(=Vtl).
-@@ -520,6 +539,8 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
+@@ -530,6 +549,8 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
      reader.compile_time_args = reader_ct;
      if (do_mcast) {
          reader.defines = {{"GDN_MCAST_SENDER", "1"}};
@@ -59,7 +59,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ch
      }
      reader.config = ReaderConfigDescriptor{};
      reader.runtime_args.reserve(do_mcast ? BH : n_used);
-@@ -540,6 +561,9 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
+@@ -550,6 +571,9 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
      writer.source_type = KernelDescriptor::SourceType::FILE_PATH;
      writer.core_ranges = cores;
      writer.compile_time_args = writer_ct;
@@ -69,7 +69,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ch
      writer.config = WriterConfigDescriptor{};
      writer.runtime_args.reserve(n_used);
  
-@@ -548,6 +572,9 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
+@@ -558,6 +582,9 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
      compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
      compute.core_ranges = cores;
      compute.compile_time_args = ct_args;
@@ -79,7 +79,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ch
      compute.config = gdn_compute_config(attrs.compute_kernel_config);
      compute.runtime_args.reserve(n_used);
  
-@@ -566,9 +593,10 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
+@@ -576,9 +603,10 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
          const auto& core = sdist.cores[i];
          const uint32_t h = sdist.head[i];
          const uint32_t vb = sdist.vblk[i];
@@ -91,7 +91,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ch
          } else if (vb == 0) {
              // Sender. Its receivers are the 1x(NV-1) rectangle immediately to its right (the
              // row-aligned placement guarantees cores[i+1 .. i+NV-1] are this head's remaining
-@@ -601,8 +629,8 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
+@@ -611,8 +639,8 @@ tt::tt_metal::ProgramDescriptor ChunkGdnScanProgramFactory::create_descriptor(
              receiver.emplace_runtime_args(
                  core, {h, vb, NC, vb_buf, s0_buf, static_cast<uint32_t>(snd.x), static_cast<uint32_t>(snd.y)});
          }
@@ -105,7 +105,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ch
 diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/compute/chunk_gdn_scan.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/compute/chunk_gdn_scan.cpp
 --- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/compute/chunk_gdn_scan.cpp
 +++ ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/compute/chunk_gdn_scan.cpp
-@@ -54,12 +54,19 @@ void kernel_main() {
+@@ -60,12 +60,19 @@ void kernel_main() {
      constexpr uint32_t Kt = get_compile_time_arg_val(1);
      constexpr uint32_t Vt = get_compile_time_arg_val(2);
      const uint32_t NC = get_arg_val<uint32_t>(0);
@@ -129,8 +129,8 @@ diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/ke
 diff --git ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp
 --- ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp
 +++ ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/device/kernels/dataflow/reader_chunk_gdn_scan.cpp
-@@ -416,15 +416,27 @@ void kernel_main() {
-     noc.async_atomic_barrier();
+@@ -609,15 +609,27 @@ void kernel_main() {
+     WAYPOINT("DONE");
  
  #else
 -    for (uint32_t c = 0; c < NC; c++) {
@@ -611,7 +611,7 @@ diff --git ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/transformer/gated_delta_attn/device/kernels/compute/gated_delta_decode.cpp
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,376 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -830,7 +830,7 @@ new file mode 100644
 +    cb_wait_front(delta_time, 1);
 +    cb_wait_front(dt_bias, 1);
 +    cb_reserve_back(decay, 1);
-+    add_tiles_init(delta_time, dt_bias);
++    add_init(delta_time, dt_bias);
 +    tile_regs_acquire();
 +    add_tiles(delta_time, dt_bias, 0, 0, 0);
 +    softplus_tile_init();
@@ -856,7 +856,7 @@ new file mode 100644
 +    cb_pop_front(dt_bias, 1);
 +
 +    // state_mid = decay * state
-+    mul_tiles_bcast_scalar_init_short(state_in, decay);
++    mul_bcast_scalar_init(state_in, decay);
 +    cb_wait_front(state_in, state_tiles);
 +    cb_wait_front(decay, 1);
 +    cb_reserve_back(state_mid, state_tiles);
@@ -890,18 +890,12 @@ new file mode 100644
 +        for (uint32_t inner = 0; inner < kt; ++inner) {
 +            matmul_tiles(key, state_mid, inner, inner * vt + column, 0);
 +        }
-+        binary_dest_reuse_tiles_init<
-+            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(key_factor);
-+        binary_dest_reuse_tiles<
-+            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(key_factor, 0, 0);
-+        binary_dest_reuse_tiles_init<
-+            EltwiseBinaryType::ELWSUB, EltwiseBinaryReuseDestType::DEST_TO_SRCB>(value);
-+        binary_dest_reuse_tiles<
-+            EltwiseBinaryType::ELWSUB, EltwiseBinaryReuseDestType::DEST_TO_SRCB>(value, column, 0);
-+        binary_dest_reuse_tiles_init<
-+            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(beta);
-+        binary_dest_reuse_tiles<
-+            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(beta, 0, 0);
++        mul_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(key_factor);
++        mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(key_factor, 0, 0);
++        sub_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCB>(value);
++        sub_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCB>(value, column, 0);
++        mul_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(beta);
++        mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(beta, 0, 0);
 +        tile_regs_commit();
 +        tile_regs_wait();
 +        pack_tile(0, scaled_delta, column);
@@ -975,10 +969,8 @@ new file mode 100644
 +        for (uint32_t inner = 0; inner < kt; ++inner) {
 +            matmul_tiles(query, state_new, inner, inner * vt + column, 0);
 +        }
-+        binary_dest_reuse_tiles_init<
-+            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(query_factor);
-+        binary_dest_reuse_tiles<
-+            EltwiseBinaryType::ELWMUL, EltwiseBinaryReuseDestType::DEST_TO_SRCA>(query_factor, 0, 0);
++        mul_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(query_factor);
++        mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(query_factor, 0, 0);
 +        tile_regs_commit();
 +        tile_regs_wait();
 +        pack_tile(0, output, column);

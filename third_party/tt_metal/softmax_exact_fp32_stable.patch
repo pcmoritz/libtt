@@ -9,7 +9,7 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
  #include "api/compute/softmax.h"
  #include "api/compute/reduce.h"
  #include "api/dataflow/dataflow_buffer.h"
-@@ -62,6 +63,111 @@ void calc_numeric_stable(std::uint32_t Wt, std::uint32_t ndst) {
+@@ -75,6 +76,116 @@ void calc_numeric_stable(
      dfb_out_obj.wait_front(static_cast<uint16_t>(Wt));
  }
  
@@ -19,11 +19,16 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
 +// around 30 5% off, around 1000 25%) and a max far enough below a large row to overflow the exp.
 +// Here the row is unpacked straight to DEST, and the max reduce and the subtraction run on the
 +// SFPU at full FP32.
-+template <std::uint32_t dfb_in, std::uint32_t dfb_max_scaler, std::uint32_t dfb_max, std::uint32_t dfb_out>
-+void calc_numeric_stable_exact(std::uint32_t Wt, std::uint32_t ndst) {
-+    DataflowBuffer dfb_in_obj(dfb_in);
-+    DataflowBuffer dfb_max_obj(dfb_max);
-+    DataflowBuffer dfb_out_obj(dfb_out);
++template <
++    std::uint32_t dfb_in,
++    std::uint32_t dfb_max_scaler,
++    std::uint32_t dfb_max,
++    std::uint32_t dfb_out,
++    typename DFB0,
++    typename DFB2,
++    typename DFB3>
++void calc_numeric_stable_exact(
++    DFB0& dfb_in_obj, DFB2& dfb_max_obj, DFB3& dfb_out_obj, std::uint32_t Wt, std::uint32_t ndst) {
 +
 +    compute_kernel_lib::reduce<
 +        PoolType::MAX,
@@ -121,29 +126,31 @@ diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attenti
  // CB consumers cannot wrap mid-fifo: pops in one cycle must land exactly on fifo_limit.
  // After a partial row (Wt not a multiple of the CB capacity), rd/wr sit at that offset.
  // Push/pop `pad` tiles to complete the cycle and return pointers to the CB base.
-@@ -265,7 +371,10 @@ void kernel_main() {
+@@ -293,7 +404,11 @@ void kernel_main() {
  #ifndef NUMERIC_STABLE
          exp_tile_init<EXP_APPROX>();
  #endif
 -#ifdef MASK_PADDED_DATA
 +#if defined(MASK_PADDED_DATA) && defined(EXACT_FP32_STABLE)
 +        mask_padded_row_exact<dfb_in0, dfb_mask_padded, dfb_x>(Wt, in0_t);
-+        calc_numeric_stable_exact<dfb_x, dfb_max_scaler, dfb_max, dfb_exps>(Wt, ndst);
++        calc_numeric_stable_exact<dfb_x, dfb_max_scaler, dfb_max, dfb_exps>(
++            dfb_x_obj, dfb_max_obj, dfb_exps_obj, Wt, ndst);
 +#elif defined(MASK_PADDED_DATA)
          {
              if (Wt > 1) {
                  ckl::eltwise_chain(
-@@ -312,7 +421,9 @@ void kernel_main() {
+@@ -337,7 +452,10 @@ void kernel_main() {
          {
  // add numeric_stable
  // fuse exp with sub tiles
 -#ifdef NUMERIC_STABLE
 +#if defined(EXACT_FP32_STABLE)
-+            calc_numeric_stable_exact<dfb_in0, dfb_max_scaler, dfb_max, dfb_exps>(Wt, ndst);
++            calc_numeric_stable_exact<dfb_in0, dfb_max_scaler, dfb_max, dfb_exps>(
++                dfb_in0_obj, dfb_max_obj, dfb_exps_obj, Wt, ndst);
 +#elif defined(NUMERIC_STABLE)
-             calc_numeric_stable<dfb_in0, dfb_max_scaler, dfb_max, dfb_exps>(Wt, ndst);
+             calc_numeric_stable<dfb_in0, dfb_max_scaler, dfb_max, dfb_exps>(
+                 dfb_in0_obj, dfb_max_scaler_obj, dfb_max_obj, dfb_exps_obj, Wt, ndst);
  #else
-             ckl::unary<
 diff --git ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp
 --- ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp
 +++ ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_program_factory_attention_optimized.cpp

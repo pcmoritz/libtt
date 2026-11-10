@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
 --- ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.cpp
-@@ -6,15 +6,34 @@
+@@ -6,9 +6,27 @@
  #include "ttnn/operations/data_movement/clone/clone.hpp"
  #include "ttnn/operations/data_movement/copy/copy.hpp"
  #include "ttnn/operations/copy/typecast/typecast.hpp"
@@ -29,40 +29,34 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.c
  Tensor preprocess_input_tensor(
      const Tensor& input_tensor,
      const int32_t& cum_axis,
-     permutation_t& permutation,
+@@ -16,7 +34,8 @@ Tensor preprocess_input_tensor(
      int32_t& accumulation_axis,
--    std::optional<DataType>& dtype) {
-+    std::optional<DataType>& dtype,
+     std::optional<DataType>& dtype,
+     bool reverse_order,
+-    ttnn::prim::AccumulationOp op) {
++    ttnn::prim::AccumulationOp op,
 +    bool scan_width) {
      Tensor processed_tensor = input_tensor;
      const auto& input_dtype = input_tensor.dtype();
      if (dtype.has_value() && (input_dtype != *dtype)) {
-@@ -40,6 +59,12 @@ Tensor preprocess_input_tensor(
+@@ -42,11 +61,11 @@ Tensor preprocess_input_tensor(
              final_cum_axis += (FOUR_DIMENSIONS - input_rank);
          }
  
-+        // The width path scans the last dimension where it is.
-+        if (scan_width) {
-+            accumulation_axis = final_cum_axis;
-+            return processed_tensor;
-+        }
-+
-         // Create permutation that just swaps cumulation axis with the first dim
-         permutation = std::decay_t<decltype(permutation)>(final_rank);
-         std::iota(permutation.begin(), permutation.end(), FIRST_DIMENSION);
-@@ -63,7 +88,10 @@ Tensor postprocess_output_tensor(
-     Tensor processed_tensor = output_tensor;
- 
-     if (original_rank - dim < FOUR_DIMENSIONS) {
--        processed_tensor = ttnn::permute(processed_tensor, permutation, processed_tensor.memory_config());
-+        // A width scan leaves the dimension where it is.
-+        if (!permutation.empty()) {
-+            processed_tensor = ttnn::permute(processed_tensor, permutation, processed_tensor.memory_config());
-+        }
-         if (original_rank < FOUR_DIMENSIONS) {
-             processed_tensor = ttnn::reshape(processed_tensor, original_shape);
-         }
-@@ -135,19 +163,69 @@ Tensor accumulation_invoke(
+-        // A scan the tile-axis kernel supports runs along H or W in place. Moving H or W to dim 0
+-        // would pad every remaining element out to its own row or tile: 32x the memory, and 1024x
+-        // for a 1D tensor (#23264).
+-        if (ttnn::prim::is_tile_axis_accumulation(
+-                processed_tensor, final_cum_axis, processed_tensor.dtype(), reverse_order, op)) {
++        // The width path scans the last dimension where it is. A scan the tile-axis kernel supports runs
++        // along H or W in place. Moving H or W to dim 0 would pad every remaining element out to its own row
++        // or tile: 32x the memory, and 1024x for a 1D tensor (#23264).
++        if (scan_width || ttnn::prim::is_tile_axis_accumulation(
++                              processed_tensor, final_cum_axis, processed_tensor.dtype(), reverse_order, op)) {
+             permutation.clear();
+             accumulation_axis = final_cum_axis;
+             return processed_tensor;
+@@ -150,20 +169,70 @@ Tensor accumulation_invoke(
      // Normalize negative dim
      const int32_t cum_axis = (dim < 0) ? (dim + input_rank) : dim;
  
@@ -78,9 +72,10 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.c
      Tensor wip_tensor = input_tensor;
      ttsl::SmallVector<int64_t> permutation;
      int32_t accumulation_axis;
--    wip_tensor = common::preprocess_input_tensor(wip_tensor, cum_axis, permutation, accumulation_axis, dtype);
-+    wip_tensor =
-+        common::preprocess_input_tensor(wip_tensor, cum_axis, permutation, accumulation_axis, dtype, scan_width);
+     wip_tensor =
+-        common::preprocess_input_tensor(wip_tensor, cum_axis, permutation, accumulation_axis, dtype, reverse_order, op);
++        common::preprocess_input_tensor(
++            wip_tensor, cum_axis, permutation, accumulation_axis, dtype, reverse_order, op, scan_width);
 +    const MemoryConfig output_memory_config =
 +        memory_config.has_value() ? memory_config.value() : wip_tensor.memory_config();
 +
@@ -138,12 +133,12 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.c
 diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.hpp ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.hpp
 --- ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.hpp
 +++ ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.hpp
-@@ -25,7 +25,8 @@ Tensor preprocess_input_tensor(
-     const int32_t& cum_axis,
-     permutation_t& permutation,
+@@ -27,7 +27,8 @@ Tensor preprocess_input_tensor(
      int32_t& accumulation_axis,
--    std::optional<DataType>& dtype);
-+    std::optional<DataType>& dtype,
+     std::optional<DataType>& dtype,
+     bool reverse_order,
+-    ttnn::prim::AccumulationOp op);
++    ttnn::prim::AccumulationOp op,
 +    bool scan_width = false);
  
  Tensor postprocess_output_tensor(
@@ -151,8 +146,21 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/accumulation_common.h
 diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.cpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.cpp
-@@ -72,6 +72,17 @@ void AccumulationDeviceOperation::validate_on_program_cache_miss(
-     }
+@@ -73,9 +73,10 @@ void AccumulationDeviceOperation::validate_on_program_cache_miss(
+             "Accumulation dim {} is out of range for logical rank {}",
+             attributes.dim,
+             logical_rank);
+-        // The host permutes any other scan along a tile axis to dim 0 before reaching the device.
++        // The host permutes any other scan along a tile axis to dim 0 before reaching the device. A scan along the
++        // last dimension takes the width path (select_program_factory).
+         TT_FATAL(
+-            acc_dim < logical_rank - 2 ||
++            acc_dim < logical_rank - 2 || acc_dim == logical_rank - 1 ||
+                 is_tile_axis_accumulation(input_tensor, acc_dim, attributes.dtype, attributes.flip, attributes.op),
+             "Accumulation along tile axis {} of a rank-{} tensor is only supported for forward bf16 cumsum on 32x32 "
+             "tiles",
+@@ -98,6 +99,17 @@ bool is_tile_axis_accumulation(
+            tile.get_height() == tt::constants::TILE_HEIGHT && tile.get_width() == tt::constants::TILE_WIDTH;
  }
  
 +AccumulationDeviceOperation::program_factory_t AccumulationDeviceOperation::select_program_factory(
@@ -169,7 +177,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_d
  AccumulationDeviceOperation::spec_return_value_t AccumulationDeviceOperation::compute_output_specs(
      const operation_attributes_t& attributes, const tensor_args_t& tensor_args) {
      if (tensor_args.opt_output.has_value()) {
-@@ -110,7 +121,10 @@ ttnn::Tensor accumulation(
+@@ -136,7 +148,10 @@ ttnn::Tensor accumulation(
      std::optional<Tensor> optional_out,
      const std::optional<MemoryConfig>& memory_config,
      AccumulationOp op,
@@ -181,7 +189,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_d
      using OperationType = AccumulationDeviceOperation;
      return ttnn::device_operation::launch<OperationType>(
          OperationType::operation_attributes_t{
-@@ -122,8 +136,10 @@ ttnn::Tensor accumulation(
+@@ -148,8 +163,10 @@ ttnn::Tensor accumulation(
                  : (optional_out.has_value() ? optional_out->memory_config() : input_tensor.memory_config()),
              reverse_order,
              op,
@@ -197,7 +205,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_d
 diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.hpp ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.hpp
 --- ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.hpp
 +++ ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_device_operation.hpp
-@@ -44,7 +44,27 @@ struct AccumulationDeviceOperation {
+@@ -54,7 +54,27 @@ struct AccumulationDeviceOperation {
              const Shape& input_shape, const int32_t& dim, uint32_t tile_height = 32, uint32_t tile_width = 32);
      };
  
@@ -226,7 +234,7 @@ diff --git ttnn/cpp/ttnn/operations/reduction/accumulation/device/accumulation_d
  
      using invocation_result_t = std::tuple<operation_attributes_t, tensor_args_t>;
      static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
-@@ -62,6 +82,9 @@ ttnn::Tensor accumulation(
+@@ -78,6 +98,9 @@ ttnn::Tensor accumulation(
      std::optional<Tensor> optional_out,
      const std::optional<MemoryConfig>& memory_config,
      AccumulationOp op,

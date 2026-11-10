@@ -19,13 +19,19 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_h
  
      constexpr uint32_t LOWER_DIMS_TIMES_REP_DIM = LOWER_DIMS * REP_DIM;
  
-@@ -70,36 +74,41 @@ void kernel_main() {
+@@ -69,36 +73,41 @@ void kernel_main() {
              uint32_t r_offset = r * LOWER_DIMS;
              for (uint32_t l = lower_dim_start; l < lower_dim_end; l++) {
                  uint32_t read_offset = h_offset + r_offset + l;
 -                src_noc_addr = s.get_noc_addr(read_offset, 0);
 -                data_location = input_buffer + (src_noc_addr & r_offset_to_use);
--
++                for (uint32_t chunk_offset = 0; chunk_offset < original_page_size_bytes;
++                     chunk_offset += chunk_size_bytes) {
++                    const uint32_t chunk_bytes =
++                        std::min(chunk_size_bytes, original_page_size_bytes - chunk_offset);
++                    src_noc_addr = s.get_noc_addr(read_offset, chunk_offset);
++                    data_location = input_buffer + (src_noc_addr & r_offset_to_use);
+ 
 -                CoreLocalMem<uint32_t> dst_mem(data_location);
 -                noc.async_read<NocOptions::DEFAULT, original_page_size_bytes>(
 -                    s,
@@ -34,22 +40,6 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_h
 -                    {.page_id = read_offset, .offset_bytes = 0},
 -                    {.offset_bytes = 0});
 -                noc.async_read_barrier();
--
--                for (uint32_t n = 0; n < repetitions; n++) {
--                    uint32_t write_offset = h_offset_rep + n * LOWER_DIMS_TIMES_REP_DIM + r_offset + l;
--                    const uint64_t dst_noc_addr = d.get_noc_addr(write_offset, 0);
--                    if ((data_location & w_offset_to_use) != (dst_noc_addr & w_offset_to_use)) {
--                        const uint32_t target_align_buffer = alignment_buffer + (dst_noc_addr & w_offset_to_use);
--                        tt_memmove<false, false, false, original_page_size_bytes>(
--                            noc, target_align_buffer, data_location, original_page_size_bytes);
--                        data_location = alignment_buffer + (dst_noc_addr & w_offset_to_use);
-+                for (uint32_t chunk_offset = 0; chunk_offset < original_page_size_bytes;
-+                     chunk_offset += chunk_size_bytes) {
-+                    const uint32_t chunk_bytes =
-+                        std::min(chunk_size_bytes, original_page_size_bytes - chunk_offset);
-+                    src_noc_addr = s.get_noc_addr(read_offset, chunk_offset);
-+                    data_location = input_buffer + (src_noc_addr & r_offset_to_use);
-+
 +                    CoreLocalMem<uint32_t> dst_mem(data_location);
 +                    noc.async_read<NocOptions::DEFAULT, chunk_size_bytes>(
 +                        s,
@@ -58,7 +48,15 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/device/kernels/repeat_h
 +                        {.page_id = read_offset, .offset_bytes = chunk_offset},
 +                        {.offset_bytes = 0});
 +                    noc.async_read_barrier();
-+
+ 
+-                for (uint32_t n = 0; n < repetitions; n++) {
+-                    uint32_t write_offset = h_offset_rep + n * LOWER_DIMS_TIMES_REP_DIM + r_offset + l;
+-                    const uint64_t dst_noc_addr = d.get_noc_addr(write_offset, 0);
+-                    if ((data_location & w_offset_to_use) != (dst_noc_addr & w_offset_to_use)) {
+-                        const uint32_t target_align_buffer = alignment_buffer + (dst_noc_addr & w_offset_to_use);
+-                        tt_memmove<false, false, false, original_page_size_bytes>(
+-                            noc, target_align_buffer, data_location, original_page_size_bytes);
+-                        data_location = alignment_buffer + (dst_noc_addr & w_offset_to_use);
 +                    for (uint32_t n = 0; n < repetitions; n++) {
 +                        uint32_t write_offset = h_offset_rep + n * LOWER_DIMS_TIMES_REP_DIM + r_offset + l;
 +                        const uint64_t dst_noc_addr = d.get_noc_addr(write_offset, chunk_offset);

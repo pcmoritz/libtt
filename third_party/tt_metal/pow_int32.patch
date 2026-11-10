@@ -111,7 +111,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/common/binary_op_dtype_policy
 -        case BinaryOpType::POWER:
          case BinaryOpType::XLOGY:
          case BinaryOpType::ATAN2:
-         case BinaryOpType::HYPOT: return float_only;
+         case BinaryOpType::HYPOT:
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cpp
@@ -131,7 +131,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/binary/device/binary_composite_op.cp
 diff --git ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/binary_ng_utils.cpp
-@@ -484,7 +484,11 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
+@@ -486,7 +486,11 @@ std::pair<std::string, std::string> get_sfpu_init_fn(OpConfig::SfpuBinaryOp sfpu
              } else {
                  return {"fmod_binary_tile_init();", "fmod_binary_tile"};
              }
