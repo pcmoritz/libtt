@@ -1,5 +1,4 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-index 7ec97e6..12ad52f 100644
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 @@ -7202,7 +7202,8 @@ def TTIR_MoeComputeOp : TTIR_NamedOp<"moe_compute", [TTIR_CCL, AttrSizedOperandS
@@ -23,7 +22,6 @@ index 7ec97e6..12ad52f 100644
      let results = (outs AnyRankedTensor:$combine_output);
  
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-index 970b7ce..8ba6332 100644
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 @@ -2125,6 +2125,7 @@ def TTNN_PrepareMoEComputeW0W1WeightsOp :
@@ -64,7 +62,6 @@ index 970b7ce..8ba6332 100644
      let results = (outs AnyRankedTensor:$result);
  
 diff --git a/include/ttmlir/OpModel/TTNN/TTNNOpModel.h b/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
-index 55f1239..ab98d9a 100644
 --- a/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
 +++ b/include/ttmlir/OpModel/TTNN/TTNNOpModel.h
 @@ -1668,6 +1668,7 @@ struct OpModel<PrepareMoEComputeW0W1WeightsOp> {
@@ -84,7 +81,6 @@ index 55f1239..ab98d9a 100644
  };
  
 diff --git a/include/ttmlir/Target/TTNN/operations/ccl.fbs b/include/ttmlir/Target/TTNN/operations/ccl.fbs
-index 0b7bcc6..cd1fd3b 100644
 --- a/include/ttmlir/Target/TTNN/operations/ccl.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/ccl.fbs
 @@ -171,6 +171,8 @@ table PrepareMoEComputeW0W1WeightsOp {
@@ -106,7 +102,6 @@ index 0b7bcc6..cd1fd3b 100644
  
  table MoeComputeOp {
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-index d39a167..973dd53 100644
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 @@ -12779,7 +12779,8 @@ public:
@@ -120,7 +115,6 @@ index d39a167..973dd53 100644
    }
  };
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-index 01bac42..efda24e 100644
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 @@ -1934,12 +1934,12 @@ public:
@@ -139,7 +133,6 @@ index 01bac42..efda24e 100644
      // has_bias is derived from the bias operands.
      auto hasBiasAttr =
 diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
-index afedc1b..960defe 100644
 --- a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
 +++ b/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp
 @@ -3481,7 +3481,8 @@ PrepareMoEComputeW0W1WeightsOp::getOpConstraints(
@@ -162,7 +155,6 @@ index afedc1b..960defe 100644
  
  llvm::Expected<size_t> PrepareMoEComputeW2WeightsOp::getOpRuntime(
 diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
-index b45dd86..b7088a8 100644
 --- a/lib/OpModel/TTNN/TTNNOpModel.cpp
 +++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
 @@ -1100,17 +1100,24 @@ getPrepareConv2dBiasOpOutputTensorSpec(
@@ -323,7 +315,6 @@ index b45dd86..b7088a8 100644
    return operation::getOpConstraintsWithState(w2Layout.getContext(), query);
  #else
 diff --git a/lib/OpModel/TTNN/TTNNOutputTensorInference.cpp b/lib/OpModel/TTNN/TTNNOutputTensorInference.cpp
-index 80cb0cc..7f77eda 100644
 --- a/lib/OpModel/TTNN/TTNNOutputTensorInference.cpp
 +++ b/lib/OpModel/TTNN/TTNNOutputTensorInference.cpp
 @@ -37,14 +37,14 @@ getPrepareMoEComputeW0W1WeightsOpOutputTensorSpec(
@@ -362,7 +353,6 @@ index 80cb0cc..7f77eda 100644
      llvm::errs() << llvm::toString(specOrErr.takeError());
      assert(false &&
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-index 80f6c3e..41b45f9 100644
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 @@ -1470,9 +1470,14 @@ createOp(FlatbufferObjectCache &cache, PrepareMoEComputeW0W1WeightsOp op) {
@@ -397,8 +387,43 @@ index 80f6c3e..41b45f9 100644
  }
  
  ::flatbuffers::Offset<::tt::target::ttnn::MoeComputeOp>
+diff --git a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp b/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
+--- a/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
++++ b/runtime/lib/ttnn/operations/ccl/moe_compute.cpp
+@@ -31,6 +31,14 @@ toMetalActivation(::tt::target::MoEActivationFunction fb) {
+   return ::ttnn::experimental::prim::detail::MoEActivationFunction::SILU;
+ }
+ 
++// LoFi multiplies BFP4 weights, whose mantissas have 3 bits, exactly. Wider
++// weights (BF16) need HiFi4 for exact products.
++::tt::tt_metal::MathFidelity mathFidelityFor(const ::ttnn::Tensor &weights) {
++  return weights.dtype() == ::ttnn::DataType::BFP4_B
++             ? ::tt::tt_metal::MathFidelity::LoFi
++             : ::tt::tt_metal::MathFidelity::HiFi4;
++}
++
+ // tt-metal reads the expert indices and scores from L1 on the core that drains
+ // the tilize stage, the core its placement picks for this hidden size.
+ ::ttnn::Tensor toTilizeDrainCore(const ::ttnn::Tensor &tensor,
+@@ -141,7 +149,7 @@ void runLocal(const ::tt::target::ttnn::MoeComputeOp *op,
+       /*local_combine=*/false, /*zero_fill_non_owned_rows=*/rings < 2,
+       /*prefill_rings=*/rings, /*enable_a2a_pipeline=*/false,
+       /*activation_limit=*/std::nullopt,
+-      /*math_fidelity=*/::tt::tt_metal::MathFidelity::LoFi,
++      /*math_fidelity=*/mathFidelityFor(w0w1),
+       /*fp32_dest_acc_en=*/true);
+ 
+   LOG_ASSERT(results.size() == 6, "moe_compute returned ", results.size(),
+@@ -220,7 +228,7 @@ void run(const ::tt::target::ttnn::MoeComputeOp *op, ProgramContext &context) {
+       /*local_combine=*/false, /*zero_fill_non_owned_rows=*/false,
+       /*prefill_rings=*/std::nullopt, /*enable_a2a_pipeline=*/false,
+       /*activation_limit=*/std::nullopt,
+-      /*math_fidelity=*/::tt::tt_metal::MathFidelity::LoFi,
++      /*math_fidelity=*/mathFidelityFor(w0w1),
+       /*fp32_dest_acc_en=*/true);
+ 
+   LOG_ASSERT(results.size() == 6, "moe_compute returned ", results.size(),
 diff --git a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w0_w1_weights.cpp b/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w0_w1_weights.cpp
-index 56117d5..5695d44 100644
 --- a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w0_w1_weights.cpp
 +++ b/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w0_w1_weights.cpp
 @@ -4,6 +4,7 @@
@@ -428,7 +453,6 @@ index 56117d5..5695d44 100644
            &meshDevice, L, E, op->hidden_size(), op->intermediate_size(),
            hasBias)
 diff --git a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w2_weights.cpp b/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w2_weights.cpp
-index f386560..78dbd9f 100644
 --- a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w2_weights.cpp
 +++ b/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w2_weights.cpp
 @@ -4,6 +4,7 @@

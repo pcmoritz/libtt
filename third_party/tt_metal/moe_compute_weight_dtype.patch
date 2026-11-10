@@ -1,58 +1,3 @@
-diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
---- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
-+++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
-@@ -924,10 +924,19 @@ MoEComputeMeshWorkloadFactory::create_at(
-         !replay_slice || num_shared_experts == 0,
-         "prefill_rings>=1 replays one whole expert slice per ring core; shared experts (TP-split slices) are not "
-         "admitted");
-+    // The weights' tile format: Bfp4_b as prepared by default, or the dtype they were prepared in (BF16 for experts
-+    // that keep their checkpoint's dtype). The kernels size their reads from this CB's tiles.
-+    const tt::DataFormat weight_format =
-+        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.matmul_w0_w1_tensor.dtype());
-+    TT_FATAL(
-+        tensor_args.matmul_w2_tensor.dtype() == tensor_args.matmul_w0_w1_tensor.dtype(),
-+        "moe_compute: W0/W1 and W2 must be prepared in one dtype, got {} and {}",
-+        tensor_args.matmul_w0_w1_tensor.dtype(),
-+        tensor_args.matmul_w2_tensor.dtype());
-     const auto weight_cb_config = [&](uint32_t tiles) {
-         return tt::tt_metal::CircularBufferConfig(
--                   tiles * tt::tile_size(tt::DataFormat::Bfp4_b), {{tt::CBIndex::c_3, tt::DataFormat::Bfp4_b}})
--            .set_page_size(tt::CBIndex::c_3, tt::tile_size(tt::DataFormat::Bfp4_b));
-+                   tiles * tt::tile_size(weight_format), {{tt::CBIndex::c_3, weight_format}})
-+            .set_page_size(tt::CBIndex::c_3, tt::tile_size(weight_format));
-     };
-     if (replay_slice) {
-         const uint32_t k_dram_tiles = args.has_bias ? hidden_tiles + 1 : hidden_tiles;
-@@ -951,7 +960,7 @@ MoEComputeMeshWorkloadFactory::create_at(
-             }
-         }
-         for (const auto& [slice_blocks, ranges] : cores_by_slice_blocks) {
--            const uint32_t slice_bytes = slice_blocks * weight_tiles_per_block * tt::tile_size(tt::DataFormat::Bfp4_b);
-+            const uint32_t slice_bytes = slice_blocks * weight_tiles_per_block * tt::tile_size(weight_format);
-             // tt-metal's own fit check at finalize names no cause: say what did not fit. Half the L1 is the budget
-             // the rest of the ring core's CBs and L1 buffers leave at 2048 tokens (E; the fit check is the arbiter).
-             TT_FATAL(
-@@ -1722,14 +1731,18 @@ MoEComputeMeshWorkloadFactory::create_at(
-         "ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/compute.cpp",
-         ring_core_range_set,
-         tt::tt_metal::ComputeConfig{
--            .math_fidelity = tt::tt_metal::MathFidelity::LoFi,
-+            // LoFi for Bfp4_b weights, whose 3-bit mantissas it multiplies exactly; HiFi4 for wider weights (BF16),
-+            // so that their products are exact too.
-+            .math_fidelity = weight_format == tt::DataFormat::Bfp4_b ? tt::tt_metal::MathFidelity::LoFi
-+                                                                     : tt::tt_metal::MathFidelity::HiFi4,
-             // FP32 DEST (tt-metal #59729), at no measurable time. Its effect depends on the shapes: against an FP32
-             // golden with the BFP4 weights, DeepSeek's experts go from rel L2 0.227 to 0.005; against BF16 weights,
-             // where the BFP4 rounding dominates, Qwen3-30B-A3B's go from 0.21 to 0.195.
-             .fp32_dest_acc_en = true,
-             .dst_full_sync_en = false,
-             .bfp8_pack_precise = false,
--            .math_approx_mode = true,
-+            // The approximate SiLU with Bfp4_b weights, whose rounding dominates; the exact one otherwise.
-+            .math_approx_mode = weight_format == tt::DataFormat::Bfp4_b,
-             .compile_args = matmul_compile_time_args,
-             .defines = zone_defines,
-             .named_compile_args = matmul_named_compile_time_args});
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp
@@ -171,3 +116,52 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
                      w0_w1_piece_page += w0_w1_tiles_per_txn;
                      if (w0_w1_piece_page == w0_w1_bank_pages_per_expert) {
                          ++w0_w1_shard_idx;
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
+@@ -969,7 +969,16 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+         !replay_slice || num_shared_experts == 0,
+         "prefill_rings>=1 replays one whole expert slice per ring core; shared experts (TP-split slices) are not "
+         "admitted");
+-    const uint32_t weight_tile_size = tt::tile_size(tt::DataFormat::Bfp4_b);
++    // The weights' tile format: Bfp4_b as prepared by default, or the dtype they were prepared in (BF16 for experts
++    // that keep their checkpoint's dtype). The kernels size their reads from this CB's tiles.
++    const tt::DataFormat weight_format =
++        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.matmul_w0_w1_tensor.dtype());
++    TT_FATAL(
++        tensor_args.matmul_w2_tensor.dtype() == tensor_args.matmul_w0_w1_tensor.dtype(),
++        "moe_compute: W0/W1 and W2 must be prepared in one dtype, got {} and {}",
++        tensor_args.matmul_w0_w1_tensor.dtype(),
++        tensor_args.matmul_w2_tensor.dtype());
++    const uint32_t weight_tile_size = tt::tile_size(weight_format);
+     if (replay_slice) {
+         const uint32_t k_dram_tiles = args.has_bias ? hidden_tiles + 1 : hidden_tiles;
+         const uint32_t blocks_per_col = tt::div_up(k_dram_tiles, moe_ring::block_tiles_h(weight_tiles_per_txn));
+@@ -1015,7 +1024,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+                 CoreRangeSet(ranges),
+                 weight_tile_size,
+                 slice_blocks * weight_tiles_per_block,
+-                tt::DataFormat::Bfp4_b);
++                weight_format);
+         }
+     } else {
+         push_cb(
+@@ -1024,7 +1033,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+             ring_core_range_set,
+             weight_tile_size,
+             weight_slots * weight_tiles_per_block,
+-            tt::DataFormat::Bfp4_b);
++            weight_format);
+     }
+ 
+     // Define the CB configuration as a tuple: name, CBIndex, DataFormat, tiles_per_cb
+@@ -1791,7 +1800,8 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+                 .fp32_dest_acc_en = args.fp32_dest_acc_en,
+                 .dst_full_sync_en = false,
+                 .bfp8_pack_precise = false,
+-                .math_approx_mode = true,
++                // The approximate SiLU with Bfp4_b weights, whose rounding dominates; the exact one otherwise.
++                .math_approx_mode = weight_format == tt::DataFormat::Bfp4_b,
+             },
+     });
+ 
