@@ -71,6 +71,22 @@ diff --git a/runtime/lib/ttnn/operations/layout/to_device.cpp b/runtime/lib/ttnn
    DEBUG_ASSERT(::tt::runtime::ttnn::utils::inSystemMemory(op->in()),
                 "Calling ttnn::to_device on a device tensor");
  
+diff --git a/runtime/lib/ttnn/operations/layout/to_layout.cpp b/runtime/lib/ttnn/operations/layout/to_layout.cpp
+--- a/runtime/lib/ttnn/operations/layout/to_layout.cpp
++++ b/runtime/lib/ttnn/operations/layout/to_layout.cpp
+@@ -15,8 +15,10 @@ namespace tt::runtime::ttnn::operations::layout {
+ void run(const ::tt::target::ttnn::ToLayoutOp *op, ProgramContext &context) {
+   ProgramTensorPool &tensorPool = context.getTensorPool();
+ 
+-  const ::ttnn::Tensor &inputTensor =
+-      tensorPool.getTTNNTensorAndValidate(op->in());
++  // A host tensor is converted on host, which reads it.
++  const ::ttnn::Tensor inputTensor =
++      ::tt::runtime::ttnn::utils::materializeStridedHostTensor(
++          tensorPool.getTTNNTensorAndValidate(op->in()));
+   const ::tt::target::Dim2d *targetTileShape =
+       op->out()->desc()->layout()->memory_desc()->tile_shape();
+   LOG_ASSERT(::tt::runtime::ttnn::utils::isValidTileShape(targetTileShape),
 diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 --- a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
 +++ b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp
