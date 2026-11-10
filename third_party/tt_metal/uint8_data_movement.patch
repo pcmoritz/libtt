@@ -181,3 +181,16 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untili
                              input_tensor.dtype() == DataType::FLOAT32;
  
      ttsl::SmallVector<uint32_t> output_end_vector;
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp
+@@ -25,7 +25,8 @@ void ReshapeViewDeviceOperation::validate_on_program_cache_miss(
+     TT_FATAL(
+         input_tensor_a.dtype() == DataType::BFLOAT16 or input_tensor_a.dtype() == DataType::UINT32 or
+             input_tensor_a.dtype() == DataType::FLOAT32 or input_tensor_a.dtype() == DataType::FLOAT16 or
+-            input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::INT32,
++            input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::INT32 or
++            input_tensor_a.dtype() == DataType::UINT8,
+         "Unsupported dtype {}", input_tensor_a.dtype());
+ }
+ 
