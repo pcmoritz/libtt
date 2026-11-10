@@ -1,0 +1,167 @@
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp
+@@ -163,6 +163,16 @@ void kernel_main() {
+     static_assert(
+         w0_w1_bytes_per_txn == w2_bytes_per_txn,
+         "Bank-run loop assumes w0_w1 and w2 share identical bytes_per_txn (NoC cmd-buf size).");
++    // A transaction is one NoC packet with Bfp4_b tiles. Wider tiles (BF16 weights) make it larger than a packet: it
++    // is then read as this many equal packets of whole tiles, under the transaction's trid.
++    constexpr uint32_t packets_per_txn = [] {
++        uint32_t packets = 1;
++        while (w0_w1_bytes_per_txn / packets > NOC_MAX_BURST_SIZE || w0_w1_tiles_per_txn % packets != 0) {
++            ++packets;
++        }
++        return packets;
++    }();
++    constexpr uint32_t bytes_per_packet = w0_w1_bytes_per_txn / packets_per_txn;
+ 
+     // W0/W1 compact layout (moe_ring_common.h, MoeRingConfig): ring core r stores only its
+     // shard_tiles(Nt, r) gate/up columns, so the cores' per-expert slices differ in size. For every
+@@ -236,6 +246,18 @@ void kernel_main() {
+             return slot_addr[slot_to_issue];
+         }
+     };
++    // One transaction's reads, packet by packet, with the command buffer's state set to the packet size.
++    auto read_txn = [&](uint32_t bank_id, uint32_t src_offset, uint32_t dst_addr) {
++        for (uint32_t packet = 0; packet < packets_per_txn; ++packet) {
++            noc_async_read_one_packet_with_state_with_trid<
++                /*skip_ptr_update=*/false,
++                /*skip_cmdbuf_chk=*/false>(
++                get_noc_addr_from_bank_id<true>(bank_id, 0),
++                src_offset + packet * bytes_per_packet,
++                dst_addr + packet * bytes_per_packet,
++                trid_to_issue);
++        }
++    };
+     auto advance_issue_slot = [&]() {
+         if constexpr (replay_slice) {
+             ++block_in_slice;
+@@ -307,7 +329,7 @@ void kernel_main() {
+     const uint32_t initial_bank_id_w0 = shard_to_bank[initial_shard_idx_w0];
+     {
+         const uint64_t initial_dram_noc_addr_w0 = get_noc_addr_from_bank_id<true>(initial_bank_id_w0, 0);
+-        noc_async_read_one_packet_set_state<true>(initial_dram_noc_addr_w0, w0_w1_bytes_per_txn, vchannel);
++        noc_async_read_one_packet_set_state<true>(initial_dram_noc_addr_w0, bytes_per_packet, vchannel);
+     }
+     // Track the currently set_state'd bank shard of the (shared) read cmd-buf, for w0_w1 and w2
+     // reads alike. Initially equal to the bank we just set above. The bank-run loops only
+@@ -339,13 +361,10 @@ void kernel_main() {
+                 const uint32_t bank_id = shard_to_bank[shard_idx];
+                 if (shard_idx != cur_shard_idx) {
+                     const uint64_t bank_base = get_noc_addr_from_bank_id<true>(bank_id, 0);
+-                    noc_async_read_one_packet_set_state<true>(bank_base, w2_bytes_per_txn, vchannel);
++                    noc_async_read_one_packet_set_state<true>(bank_base, bytes_per_packet, vchannel);
+                     cur_shard_idx = shard_idx;
+                 }
+-                noc_async_read_one_packet_with_state_with_trid<
+-                    /*skip_ptr_update=*/false,
+-                    /*skip_cmdbuf_chk=*/false>(
+-                    get_noc_addr_from_bank_id<true>(bank_id, 0), in_bank_byte_offset, issue_addr(), trid_to_issue);
++                read_txn(bank_id, in_bank_byte_offset, issue_addr());
+                 w2_global_page += w2_tiles_per_txn;
+             }
+             // Second transaction (may cross a bank boundary):
+@@ -356,16 +375,10 @@ void kernel_main() {
+                 const uint32_t bank_id = shard_to_bank[shard_idx];
+                 if (shard_idx != cur_shard_idx) {
+                     const uint64_t bank_base = get_noc_addr_from_bank_id<true>(bank_id, 0);
+-                    noc_async_read_one_packet_set_state<true>(bank_base, w2_bytes_per_txn, vchannel);
++                    noc_async_read_one_packet_set_state<true>(bank_base, bytes_per_packet, vchannel);
+                     cur_shard_idx = shard_idx;
+                 }
+-                noc_async_read_one_packet_with_state_with_trid<
+-                    /*skip_ptr_update=*/false,
+-                    /*skip_cmdbuf_chk=*/false>(
+-                    get_noc_addr_from_bank_id<true>(bank_id, 0),
+-                    in_bank_byte_offset,
+-                    issue_addr() + w2_bytes_per_txn,
+-                    trid_to_issue);
++                read_txn(bank_id, in_bank_byte_offset, issue_addr() + w2_bytes_per_txn);
+                 w2_global_page += w2_tiles_per_txn;
+             }
+ 
+@@ -445,13 +458,10 @@ void kernel_main() {
+                     const uint32_t bank_id = shard_to_bank[shard_idx];
+                     if (shard_idx != cur_shard_idx) {
+                         const uint64_t bank_base = get_noc_addr_from_bank_id<true>(bank_id, 0);
+-                        noc_async_read_one_packet_set_state<true>(bank_base, w0_w1_bytes_per_txn, vchannel);
++                        noc_async_read_one_packet_set_state<true>(bank_base, bytes_per_packet, vchannel);
+                         cur_shard_idx = shard_idx;
+                     }
+-                    noc_async_read_one_packet_with_state_with_trid<
+-                        /*skip_ptr_update=*/false,
+-                        /*skip_cmdbuf_chk=*/false>(
+-                        get_noc_addr_from_bank_id<true>(bank_id, 0), in_bank_byte_offset, issue_addr(), trid_to_issue);
++                    read_txn(bank_id, in_bank_byte_offset, issue_addr());
+                     w0_w1_piece_page += w0_w1_tiles_per_txn;
+                     if (w0_w1_piece_page == w0_w1_bank_pages_per_expert) {
+                         ++w0_w1_shard_idx;
+@@ -466,16 +476,10 @@ void kernel_main() {
+                     const uint32_t bank_id = shard_to_bank[shard_idx];
+                     if (shard_idx != cur_shard_idx) {
+                         const uint64_t bank_base = get_noc_addr_from_bank_id<true>(bank_id, 0);
+-                        noc_async_read_one_packet_set_state<true>(bank_base, w0_w1_bytes_per_txn, vchannel);
++                        noc_async_read_one_packet_set_state<true>(bank_base, bytes_per_packet, vchannel);
+                         cur_shard_idx = shard_idx;
+                     }
+-                    noc_async_read_one_packet_with_state_with_trid<
+-                        /*skip_ptr_update=*/false,
+-                        /*skip_cmdbuf_chk=*/false>(
+-                        get_noc_addr_from_bank_id<true>(bank_id, 0),
+-                        in_bank_byte_offset,
+-                        issue_addr() + w0_w1_bytes_per_txn,
+-                        trid_to_issue);
++                    read_txn(bank_id, in_bank_byte_offset, issue_addr() + w0_w1_bytes_per_txn);
+                     w0_w1_piece_page += w0_w1_tiles_per_txn;
+                     if (w0_w1_piece_page == w0_w1_bank_pages_per_expert) {
+                         ++w0_w1_shard_idx;
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_program_factory.cpp
+@@ -969,7 +969,16 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+         !replay_slice || num_shared_experts == 0,
+         "prefill_rings>=1 replays one whole expert slice per ring core; shared experts (TP-split slices) are not "
+         "admitted");
+-    const uint32_t weight_tile_size = tt::tile_size(tt::DataFormat::Bfp4_b);
++    // The weights' tile format: Bfp4_b as prepared by default, or the dtype they were prepared in (BF16 for experts
++    // that keep their checkpoint's dtype). The kernels size their reads from this CB's tiles.
++    const tt::DataFormat weight_format =
++        tt::tt_metal::datatype_to_dataformat_converter(tensor_args.matmul_w0_w1_tensor.dtype());
++    TT_FATAL(
++        tensor_args.matmul_w2_tensor.dtype() == tensor_args.matmul_w0_w1_tensor.dtype(),
++        "moe_compute: W0/W1 and W2 must be prepared in one dtype, got {} and {}",
++        tensor_args.matmul_w0_w1_tensor.dtype(),
++        tensor_args.matmul_w2_tensor.dtype());
++    const uint32_t weight_tile_size = tt::tile_size(weight_format);
+     if (replay_slice) {
+         const uint32_t k_dram_tiles = args.has_bias ? hidden_tiles + 1 : hidden_tiles;
+         const uint32_t blocks_per_col = tt::div_up(k_dram_tiles, moe_ring::block_tiles_h(weight_tiles_per_txn));
+@@ -1015,7 +1024,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+                 CoreRangeSet(ranges),
+                 weight_tile_size,
+                 slice_blocks * weight_tiles_per_block,
+-                tt::DataFormat::Bfp4_b);
++                weight_format);
+         }
+     } else {
+         push_cb(
+@@ -1024,7 +1033,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+             ring_core_range_set,
+             weight_tile_size,
+             weight_slots * weight_tiles_per_block,
+-            tt::DataFormat::Bfp4_b);
++            weight_format);
+     }
+ 
+     // Define the CB configuration as a tuple: name, CBIndex, DataFormat, tiles_per_cb
+@@ -1791,7 +1800,8 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+                 .fp32_dest_acc_en = args.fp32_dest_acc_en,
+                 .dst_full_sync_en = false,
+                 .bfp8_pack_precise = false,
+-                .math_approx_mode = true,
++                // The approximate SiLU with Bfp4_b weights, whose rounding dominates; the exact one otherwise.
++                .math_approx_mode = weight_format == tt::DataFormat::Bfp4_b,
+             },
+     });
+ 

@@ -4,9 +4,9 @@ Called per device in a shard_map over the mesh, with the tokens, their top-k
 routing weights and expert ids (negative for padding, which is skipped) and the
 device's experts, it returns each token's routing-weighted sum of the
 SiLU-gated experts that device holds, computed by TTNN's fused MoE kernel with
-the experts in BFP4. The experts are split evenly over the mesh in device
-order, so the layer is the sum over devices. Batches of more than 512 tokens
-take several kernel calls.
+the experts in BFP4, or in BF16 with weight_dtype="bf16". The experts are split
+evenly over the mesh in device order, so the layer is the sum over devices.
+Batches of more than 512 tokens take several kernel calls.
 """
 
 import jax
@@ -18,9 +18,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 HIDDEN, INTERMEDIATE, K = 2048, 768, 8
 
 
-def fused_moe_ep(x, weights, ids, w1, w3, w2):
+def fused_moe_ep(x, weights, ids, w1, w3, w2, **attributes):
     out = jax.ShapeDtypeStruct(x.shape, x.dtype, manual_axis_type=jax.typeof(x).manual_axis_type)
-    return jax.ffi.ffi_call("tt.fused_moe_ep", out)(x, weights, ids, w1, w3, w2)
+    return jax.ffi.ffi_call("tt.fused_moe_ep", out)(x, weights, ids, w1, w3, w2, **attributes)
 
 
 def weight(w):
@@ -53,9 +53,9 @@ def bfp4(w):
     return (np.sign(blocks) * np.clip(np.round(np.abs(blocks) / step), 0, 7) * step).reshape(w.shape)
 
 
-def reference(x, weights, ids, w1, w3, w2):
+def reference(x, weights, ids, w1, w3, w2, stored=bfp4):
     x = np.asarray(x).astype(np.float64)
-    w1, w3, w2 = (bfp4(w) for w in (w1, w3, w2))
+    w1, w3, w2 = (stored(w) for w in (w1, w3, w2))
     out = np.zeros(x.shape)
     for e in range(w1.shape[0]):
         t, j = np.nonzero(ids == e)
@@ -64,20 +64,21 @@ def reference(x, weights, ids, w1, w3, w2):
     return out
 
 
-def check(out, want, padding):
+def check(out, want, padding, tolerance):
     # Padding is skipped, so padding tokens' outputs are zero. Against the
-    # experts as stored (BFP4) the outputs agree to a relative error of about
-    # 0.012, the rest of the kernel accumulating in FP32.
+    # experts as stored the outputs agree to a relative error of about 0.012
+    # with BFP4 experts, the rest of the kernel accumulating in FP32.
     rows = want.shape[0] - padding
     got = np.asarray(out).astype(np.float64)
     assert not got[rows:].any()
     error = np.linalg.norm(got[:rows] - want[:rows]) / np.linalg.norm(want[:rows])
-    assert error < 0.03, error
+    assert error < tolerance, error
 
 
 # 513 tokens end in a one-token kernel call, 600 in a call of 88.
+@pytest.mark.parametrize("weight_dtype", ["bfp4", "bf16"])
 @pytest.mark.parametrize("tokens,padding", [(1, 0), (3, 1), (5, 2), (513, 0), (600, 7)])
-def test_mesh(tokens, padding):
+def test_mesh(tokens, padding, weight_dtype):
     devices = jax.local_devices(backend="tt")
     if len(devices) not in (1, 4):
         pytest.skip("Requires one or four local TT devices")
@@ -86,8 +87,10 @@ def test_mesh(tokens, padding):
     rng = np.random.default_rng(100 + tokens)
     args = problem(rng, tokens, len(devices) * 8, padding)
 
+    attributes = {} if weight_dtype == "bfp4" else {"weight_dtype": weight_dtype}
+
     def layer(x, weights, ids, w1, w3, w2):
-        return jax.lax.psum(fused_moe_ep(x, weights, ids, w1, w3, w2), axes)
+        return jax.lax.psum(fused_moe_ep(x, weights, ids, w1, w3, w2, **attributes), axes)
 
     split = P(axes, None, None)
     sharded = jax.shard_map(
@@ -97,4 +100,9 @@ def test_mesh(tokens, padding):
     shardings = [NamedSharding(mesh, P())] * 3 + [NamedSharding(mesh, split)] * 3
     out = run(*(jax.device_put(a, s) for a, s in zip(args, shardings)))
     assert out.shape == (tokens, HIDDEN) and out.dtype == jnp.bfloat16
-    check(out, reference(*args), padding)
+    if weight_dtype == "bfp4":
+        check(out, reference(*args), padding, 0.03)
+    else:
+        # BF16 experts as they are: the intermediate activations and the
+        # outputs are rounded to BF16.
+        check(out, reference(*args, stored=lambda w: np.asarray(w).astype(np.float64)), padding, 0.01)
