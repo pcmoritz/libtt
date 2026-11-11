@@ -4,7 +4,7 @@
 // tt.fused_moe_ep: a mixture-of-experts layer's experts on one device of an
 // expert-parallel mesh, over TTNN's fused MoE kernel (ttir.moe_compute).
 //
-//   out = tt.fused_moe_ep(x, topk_weights, topk_ids, w1, w3, w2)
+//   out = tt.fused_moe_ep(x, topk_weights, topk_ids, w1, w3, w2[, s1, s3, s2])
 //
 // Called per device (inside a shard_map) with
 //   x            [T, H]          the tokens,
@@ -23,14 +23,12 @@
 // the (token, expert) pairs of the experts its device owns and writes each
 // pair's output unweighted.
 //
-// With weight_dtype = "fp8" the experts are float8_e4m3 values with an FP32
-// scale per expert and output column, which the kernel reads as they are and
-// applies. Each projection is its bytes and one more tile of rows:
-//   w1, w3       [E_local, H + 32, I] ui8: w1's rows hold the bytes of each
-//                column's gate scale in their first four, least significant
-//                first, and of its up scale in the next four; w3's are unused,
-//   w2           [E_local, I + 32, H] ui8: the rows hold the bytes of each
-//                column's scale in their first four.
+// With weight_dtype = "fp8" the experts are float8_e4m3 values, as their bits
+// (ui8, as the compiler stores float8 tensors), which the kernel reads as they
+// are, and come with an FP32 scale per expert and output column, which it
+// applies:
+//   s1, s3       [E_local, I] f32 the gate and up projections' scales,
+//   s2           [E_local, H] f32 and the down projections'.
 // This lowering chunks the tokens, builds
 // the expert-to-device mapping, and sums each token's slots with its weights in
 // one matmul accumulated in FP32; the kernel reads the ids as they are and
@@ -89,13 +87,13 @@ public:
     }
     const bool bf16Weights = weightDtype && weightDtype.getValue() == "bf16";
     const bool fp8Weights = weightDtype && weightDtype.getValue() == "fp8";
-    // Float8 experts' scale rows.
-    const int64_t scaleRows = fp8Weights ? 32 : 0;
 
-    if (adaptor.getOperands().size() != 6 || op->getNumResults() != 1) {
+    if (adaptor.getOperands().size() != (fp8Weights ? 9u : 6u) ||
+        op->getNumResults() != 1) {
       return rewriter.notifyMatchFailure(
           op, "tt.fused_moe_ep takes x, topk_weights, topk_ids, w1, w3 and "
-              "w2 and returns one tensor");
+              "w2 (and s1, s3 and s2 with float8 experts) and returns one "
+              "tensor");
     }
     Value x = adaptor.getOperands()[0];
     Value weights = adaptor.getOperands()[1];
@@ -114,19 +112,30 @@ public:
     if (xType.getRank() != 2 || idsType.getRank() != 2 ||
         w1Type.getRank() != 3 || shapeOf(weights) != idsType.getShape() ||
         idsType.getDimSize(0) != xType.getDimSize(0) ||
-        w1Type.getDimSize(1) != xType.getDimSize(1) + scaleRows ||
+        w1Type.getDimSize(1) != xType.getDimSize(1) ||
         shapeOf(w3) != w1Type.getShape() ||
         shapeOf(w2) != ArrayRef<int64_t>{w1Type.getDimSize(0),
-                                         w1Type.getDimSize(2) + scaleRows,
+                                         w1Type.getDimSize(2),
                                          xType.getDimSize(1)}) {
       return rewriter.notifyMatchFailure(
           op, "tt.fused_moe_ep expects x [T, H], topk_weights and topk_ids "
-              "[T, k], w1 and w3 [E_local, H, I] and w2 [E_local, I, H] (32 "
-              "more rows each with float8 experts)");
+              "[T, k], w1 and w3 [E_local, H, I] and w2 [E_local, I, H]");
     }
-    if (fp8Weights && !isa<IntegerType>(w1Type.getElementType())) {
-      return rewriter.notifyMatchFailure(
-          op, "tt.fused_moe_ep with float8 experts expects their bytes");
+    if (fp8Weights) {
+      auto isScale = [&](Value value, int64_t columns) {
+        auto type = cast<RankedTensorType>(value.getType());
+        return type.getElementType().isF32() &&
+               type.getShape() ==
+                   ArrayRef<int64_t>{w1Type.getDimSize(0), columns};
+      };
+      if (!isa<IntegerType>(w1Type.getElementType()) ||
+          !isScale(adaptor.getOperands()[6], w1Type.getDimSize(2)) ||
+          !isScale(adaptor.getOperands()[7], w1Type.getDimSize(2)) ||
+          !isScale(adaptor.getOperands()[8], xType.getDimSize(1))) {
+        return rewriter.notifyMatchFailure(
+            op, "tt.fused_moe_ep with float8 experts expects their bits and "
+                "f32 scales s1 and s3 [E_local, I] and s2 [E_local, H]");
+      }
     }
     // The kernel reads int32 or uint16 ids.
     if (auto idType = dyn_cast<IntegerType>(idsType.getElementType());
@@ -193,31 +202,23 @@ public:
 
     // The kernel's operands: the ids as they are (the kernel reads them as
     // unsigned, so that padding's negative ids land past the experts, where it
-    // skips them) and the experts with a leading layer dimension. Its local
-    // output reads no scores: the weights only fill the operand.
+    // skips them) and the experts (and their scales) with a leading layer
+    // dimension. Its local output reads no scores: the weights only fill the
+    // operand.
     auto withLayer = [&](Value w) -> Value {
-      auto type = cast<RankedTensorType>(w.getType());
-      auto shape = type.getShape();
-      SmallVector<int64_t> layered = {1, shape[0], shape[1], shape[2]};
-      if (!fp8Weights) {
-        return reshape(w, layered);
+      if (!w) {
+        return w;
       }
-      // Float8 experts' bytes are reshaped as the float8 values they are, a
-      // view each way. At O0 a uint8 reshape goes through int32 (tt-mlir's
-      // workaround for tenstorrent/tt-metal#27843): four times the experts'
-      // bytes, which every layer of a model holds at once before the weights
-      // are packed.
-      auto bitcast = [&](Value value, Type elementType) -> Value {
-        return rewriter.create<ttir::BitcastConvertOp>(
-            loc, cast<RankedTensorType>(value.getType()).clone(elementType),
-            value);
-      };
-      return bitcast(reshape(bitcast(w, Float8E4M3FNType::get(ctx)), layered),
-                     type.getElementType());
+      SmallVector<int64_t> layered = {1};
+      llvm::append_range(layered, cast<RankedTensorType>(w.getType()).getShape());
+      return reshape(w, layered);
     };
     Value kernelW1 = withLayer(w1);
     Value kernelW3 = withLayer(w3);
     Value kernelW2 = withLayer(w2);
+    Value scale1 = withLayer(fp8Weights ? adaptor.getOperands()[6] : Value());
+    Value scale3 = withLayer(fp8Weights ? adaptor.getOperands()[7] : Value());
+    Value scale2 = withLayer(fp8Weights ? adaptor.getOperands()[8] : Value());
 
     // Every device's row of the mapping gives each expert's device.
     SmallVector<APInt> owners;
@@ -262,7 +263,8 @@ public:
           reshape(rows(x, begin, end), {1, t, hidden}), rows(ids, begin, end),
           chunkWeights, mapping, kernelW1, kernelW3, kernelW2,
           /*bias_0=*/Value(), /*bias_1=*/Value(),
-          /*bias_2=*/Value(), rewriter.getUI32IntegerAttr(0),
+          /*bias_2=*/Value(), scale1, scale3, scale2,
+          rewriter.getUI32IntegerAttr(0),
           rewriter.getUI32IntegerAttr(4),
           rewriter.getUI32IntegerAttr(intermediate), activation,
           /*cluster_axis=*/IntegerAttr(),

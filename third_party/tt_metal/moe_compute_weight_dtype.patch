@@ -769,7 +769,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
      const uint32_t w2_total_rows = num_layers * experts_per_device * num_cores * w2_core_rows;
      TT_FATAL(
          w2_total_rows % num_banks == 0,
-@@ -836,6 +845,272 @@ ttnn::Tensor prepare_w2_tensor_for_moe_compute(
+@@ -836,6 +845,274 @@ ttnn::Tensor prepare_w2_tensor_for_moe_compute(
      return result;
  }
  
@@ -789,20 +789,13 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +// A slot's half of its pair's scale tile (moe_ring_common.h, COLUMN_SCALE_ROWS) as the float8 tile that holds its
 +// bytes: `tile`, 32 rows of 32 bytes `stride` apart. The half is two FLOAT16 faces of 16 rows, the left and the
 +// right 16 columns', with the terms of the pair's first slot's scales in rows 0 to 7 and of its second slot's in
-+// rows 8 to 15, four rows per term. `scales[slot]` are a slot's columns' FP32 scales, whose bytes are four rows
-+// `scales_stride` apart, least significant first, or null for a slot without columns.
-+void write_scale_half_tile(
-+    uint8_t* tile, size_t stride, const std::array<const uint8_t*, 2>& scales, size_t scales_stride) {
++// rows 8 to 15, four rows per term. `scales[slot]` are a slot's 32 columns' FP32 scales, or null for a slot
++// without columns.
++void write_scale_half_tile(uint8_t* tile, size_t stride, const std::array<const float*, 2>& scales) {
 +    uint8_t raw[TILE_SIZE * TILE_SIZE] = {};
 +    for (uint32_t slot = 0; slot < 2; ++slot) {
 +        for (uint32_t column = 0; scales[slot] != nullptr && column < TILE_SIZE; ++column) {
-+            uint32_t bits = 0;
-+            for (uint32_t byte = 0; byte < 4; ++byte) {
-+                bits |= static_cast<uint32_t>(scales[slot][byte * scales_stride + column]) << (8 * byte);
-+            }
-+            float scale;
-+            std::memcpy(&scale, &bits, sizeof(scale));
-+            float rest = std::isfinite(scale) ? scale : 0.0f;
++            float rest = scales[slot][column];
 +            for (uint32_t term = 0; term < ::moe_ring::COLUMN_SCALE_TERMS; ++term) {
 +                // The FLOAT16 value nearest to what is left, which leaves the rest exactly.
 +                const int shift =
@@ -826,19 +819,56 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +        }
 +    }
 +}
++
++// FP8 experts' column scales, (L, E, columns) FLOAT32 on device, on host and row-major. The scale tile's terms
++// hold finite scales up to the largest FLOAT16 times 2^-COLUMN_SCALE_SHIFT in magnitude; a larger one would
++// saturate, so it is refused. Smaller scales keep fewer bits: 11 below 2^-20, none below 2^-32.
++ttnn::Tensor column_scales_on_host(const ttnn::Tensor& scales, uint32_t L, uint32_t E, uint32_t columns) {
++    TT_FATAL(
++        scales.logical_shape() == ttnn::Shape({L, E, columns}) && scales.dtype() == ttnn::DataType::FLOAT32,
++        "Column scales are FLOAT32 ({}, {}, {}), got {} {}",
++        L,
++        E,
++        columns,
++        scales.dtype(),
++        scales.logical_shape());
++    auto host = ttnn::to_layout(ttnn::from_device(scales), ttnn::Layout::ROW_MAJOR);
++    const float largest = std::ldexp(65504.0f, -::moe_ring::COLUMN_SCALE_SHIFT);
++    host.host_storage().buffer().apply([&](const tt::tt_metal::HostBuffer& shard) {
++        const auto values = shard.view_as<float>();
++        // A traced call (a constraint query) has no data to read.
++        if (values.size() != static_cast<size_t>(L) * E * columns) {
++            return;
++        }
++        for (const float scale : values) {
++            TT_FATAL(
++                std::isfinite(scale) && std::fabs(scale) <= largest,
++                "An FP8 expert's column scale is {}; moe_compute takes finite scales up to {} in magnitude",
++                scale,
++                largest);
++        }
++    });
++    return host;
++}
 +}  // namespace
 +
 +ttnn::Tensor prepare_w0_w1_tensor_with_column_scales(
-+    const ttnn::Tensor& tt_w0, const ttnn::Tensor& tt_w1, uint32_t L, uint32_t E, uint32_t K, uint32_t N) {
++    const ttnn::Tensor& tt_w0,
++    const ttnn::Tensor& tt_w1,
++    const ttnn::Tensor& tt_s0,
++    const ttnn::Tensor& tt_s1,
++    uint32_t L,
++    uint32_t E,
++    uint32_t K,
++    uint32_t N) {
 +    TT_FATAL(K % TILE_SIZE == 0, "K dimension ({}) must be divisible by TILE_SIZE ({})", K, TILE_SIZE);
 +    TT_FATAL(N % TILE_SIZE == 0, "N dimension ({}) must be divisible by TILE_SIZE ({})", N, TILE_SIZE);
 +    TT_FATAL(
-+        tt_w0.logical_shape() == ttnn::Shape({L, E, K + TILE_SIZE, N}) &&
-+            tt_w1.logical_shape() == tt_w0.logical_shape(),
-+        "W0 and W1 with column scales are ({}, {}, {}, {}), got {} and {}",
++        tt_w0.logical_shape() == ttnn::Shape({L, E, K, N}) && tt_w1.logical_shape() == tt_w0.logical_shape(),
++        "W0 and W1 are ({}, {}, {}, {}), got {} and {}",
 +        L,
 +        E,
-+        K + TILE_SIZE,
++        K,
 +        N,
 +        tt_w0.logical_shape(),
 +        tt_w1.logical_shape());
@@ -853,31 +883,25 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +    const uint32_t rows = scale_row + ::moe_ring::COLUMN_SCALE_ROWS * TILE_SIZE;
 +    constexpr uint8_t fp8_one = 0x38;  // 1.0 in float8_e4m3
 +
-+    // The scale bytes, on host.
-+    auto scale_rows = slice_basic(
-+        tt_w0,
-+        {0, 0, static_cast<int32_t>(K), 0},
-+        {static_cast<int32_t>(L),
-+         static_cast<int32_t>(E),
-+         static_cast<int32_t>(K + TILE_SIZE),
-+         static_cast<int32_t>(N)});
-+    auto scale_bytes = ttnn::to_layout(ttnn::from_device(scale_rows), ttnn::Layout::ROW_MAJOR);
-+    scale_rows.deallocate(/*force=*/true);
++    // The scales on host: each expert's gate scales, then its up scales.
++    auto both = ttnn::concat({tt_s0, tt_s1}, 2);
++    auto scales = column_scales_on_host(both, L, E, 2 * N);
++    both.deallocate(/*force=*/true);
 +
-+    // W0's or W1's K rows after the weights', from the scale bytes: (L, E, TILE_SIZE, N) -> (L, E, rows, N).
++    // W0's or W1's K rows after the weights', from the scales: (L, E, 2 * N) -> (L, E, rows, N).
 +    const auto tail = [&](bool w1) {
 +        const tt::tt_metal::TensorSpec spec(
 +            ttnn::Shape({L, E, rows, N}),
 +            tt::tt_metal::TensorLayout(
 +                tt_w0.dtype(), tt::tt_metal::PageConfig(ttnn::Layout::ROW_MAJOR), ttnn::MemoryConfig{}));
-+        auto buffer = scale_bytes.host_storage().buffer().transform(
++        auto buffer = scales.host_storage().buffer().transform(
 +            [&](const tt::tt_metal::HostBuffer& shard) {
-+                const auto bytes = shard.view_as<uint8_t>();
++                const auto values = shard.view_as<float>();
 +                std::vector<uint8_t> out(static_cast<size_t>(L) * E * rows * N, 0);
 +                // A traced call (a constraint query) has no data to read.
-+                const size_t experts = bytes.size() == out.size() / rows * TILE_SIZE ? static_cast<size_t>(L) * E : 0;
++                const size_t experts = values.size() == static_cast<size_t>(L) * E * 2 * N ? L * E : 0;
 +                for (size_t expert = 0; expert < experts; ++expert) {
-+                    const uint8_t* in = bytes.data() + expert * TILE_SIZE * N;
++                    const float* in = values.data() + expert * 2 * N;
 +                    uint8_t* tiles = out.data() + (expert * rows + scale_row) * N;
 +                    for (uint32_t tile = 0; tile < Nt; ++tile) {
 +                        // The identity: in W0's second row of tiles, in W1's third.
@@ -887,10 +911,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +                        // The first row of tiles: W0's and W1's are the halves of the scale tile, each with
 +                        // the gate scales (the first slot's) and the up scales.
 +                        write_scale_half_tile(
-+                            tiles + tile * TILE_SIZE,
-+                            N,
-+                            {in + tile * TILE_SIZE, in + 4 * N + tile * TILE_SIZE},
-+                            N);
++                            tiles + tile * TILE_SIZE, N, {in + tile * TILE_SIZE, in + N + tile * TILE_SIZE});
 +                    }
 +                }
 +                return tt::tt_metal::HostBuffer(std::move(out));
@@ -898,18 +919,13 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +            tt::tt_metal::DistributedHostBuffer::ProcessShardExecutionPolicy::PARALLEL);
 +        auto host = ttnn::to_layout(
 +            ttnn::Tensor(tt::tt_metal::host_tensor_from_buffer_with_topology(
-+                std::move(buffer), spec, scale_bytes.tensor_topology())),
++                std::move(buffer), spec, scales.tensor_topology())),
 +            tt_w0.layout());
 +        return ttnn::to_device(host, tt_w0.device(), tt_w0.memory_config());
 +    };
 +    const auto with_tail = [&](const ttnn::Tensor& weights, bool w1) {
-+        auto rows_of_weights = slice_basic(
-+            weights,
-+            {0, 0, 0, 0},
-+            {static_cast<int32_t>(L), static_cast<int32_t>(E), static_cast<int32_t>(K), static_cast<int32_t>(N)});
 +        auto rows_after = tail(w1);
-+        auto all = ttnn::concat({rows_of_weights, rows_after}, 2);
-+        rows_of_weights.deallocate(/*force=*/true);
++        auto all = ttnn::concat({weights, rows_after}, 2);
 +        rows_after.deallocate(/*force=*/true);
 +        return all;
 +    };
@@ -923,15 +939,15 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +}
 +
 +ttnn::Tensor prepare_w2_tensor_with_column_scales(
-+    const ttnn::Tensor& tt_w2, uint32_t L, uint32_t E, uint32_t N, uint32_t K) {
++    const ttnn::Tensor& tt_w2, const ttnn::Tensor& tt_s2, uint32_t L, uint32_t E, uint32_t N, uint32_t K) {
 +    TT_FATAL(N % TILE_SIZE == 0, "N dimension ({}) must be divisible by TILE_SIZE ({})", N, TILE_SIZE);
 +    TT_FATAL(K % TILE_SIZE == 0, "K dimension ({}) must be divisible by TILE_SIZE ({})", K, TILE_SIZE);
 +    TT_FATAL(
-+        tt_w2.logical_shape() == ttnn::Shape({L, E, N + TILE_SIZE, K}),
-+        "W2 with column scales is ({}, {}, {}, {}), got {}",
++        tt_w2.logical_shape() == ttnn::Shape({L, E, N, K}),
++        "W2 is ({}, {}, {}, {}), got {}",
 +        L,
 +        E,
-+        N + TILE_SIZE,
++        N,
 +        K,
 +        tt_w2.logical_shape());
 +
@@ -951,14 +967,9 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +    constexpr uint8_t fp8_one = 0x38;  // 1.0 in float8_e4m3
 +
 +    // 1) The weights, ring-rotated in the kernel's layout (no trailing N padding).
-+    auto weights = slice_basic(
-+        tt_w2,
-+        {0, 0, 0, 0},
-+        {static_cast<int32_t>(L), static_cast<int32_t>(E), static_cast<int32_t>(N), static_cast<int32_t>(K)});
-+    auto n_reordered_no_pad = prepare_w2_no_n_pad(weights, L, E, N, K, w2_shard_map, w0_w1_shard_map);
-+    weights.deallocate(/*force=*/true);
++    auto n_reordered_no_pad = prepare_w2_no_n_pad(tt_w2, L, E, N, K, w2_shard_map, w0_w1_shard_map);
 +
-+    // 2) The rows after them, from the scale bytes on host, in the weights' layout: (L, E, TILE_SIZE, K) ->
++    // 2) The rows after them, from the scales on host, in the weights' layout: (L, E, K) ->
 +    //    (num_cores, L, E, groups, rows, 4 * TILE_SIZE). A core's column tiles fill its groups' slots in order.
 +    std::vector<uint32_t> core_tiles;
 +    core_tiles.reserve(num_cores);
@@ -969,46 +980,37 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +        std::accumulate(core_tiles.begin(), core_tiles.end(), 0u) == Kt,
 +        "The W2 column shards do not hold the {} column tiles",
 +        Kt);
-+    auto scale_rows = slice_basic(
-+        tt_w2,
-+        {0, 0, static_cast<int32_t>(N), 0},
-+        {static_cast<int32_t>(L),
-+         static_cast<int32_t>(E),
-+         static_cast<int32_t>(N + TILE_SIZE),
-+         static_cast<int32_t>(K)});
-+    auto scale_bytes = ttnn::to_layout(ttnn::from_device(scale_rows), ttnn::Layout::ROW_MAJOR);
-+    scale_rows.deallocate(/*force=*/true);
++    auto host_scales = column_scales_on_host(tt_s2, L, E, K);
 +    constexpr uint32_t group_width = 4 * TILE_SIZE;
 +    const tt::tt_metal::TensorSpec spec(
 +        ttnn::Shape({num_cores, L, E, w2_groups_per_core, rows, group_width}),
 +        tt::tt_metal::TensorLayout(
 +            tt_w2.dtype(), tt::tt_metal::PageConfig(ttnn::Layout::ROW_MAJOR), ttnn::MemoryConfig{}));
-+    auto buffer = scale_bytes.host_storage().buffer().transform(
++    auto buffer = host_scales.host_storage().buffer().transform(
 +        [&](const tt::tt_metal::HostBuffer& shard) {
-+            const auto bytes = shard.view_as<uint8_t>();
++            const auto values = shard.view_as<float>();
 +            const size_t group_bytes = static_cast<size_t>(rows) * group_width;
 +            std::vector<uint8_t> out(static_cast<size_t>(num_cores) * L * E * w2_groups_per_core * group_bytes, 0);
 +            // A traced call (a constraint query) has no data to read.
-+            const size_t experts = bytes.size() == static_cast<size_t>(L) * E * TILE_SIZE * K ? L * E : 0;
++            const size_t experts = values.size() == static_cast<size_t>(L) * E * K ? L * E : 0;
 +            uint32_t first_tile = 0;
 +            for (uint32_t core = 0; core < num_cores; first_tile += core_tiles[core++]) {
 +                for (size_t expert = 0; expert < experts; ++expert) {
-+                    const uint8_t* in = bytes.data() + expert * TILE_SIZE * K;
++                    const float* in = values.data() + expert * K;
 +                    for (uint32_t group = 0; group < w2_groups_per_core; ++group) {
 +                        uint8_t* tiles =
 +                            out.data() +
 +                            ((static_cast<size_t>(core) * L * E + expert) * w2_groups_per_core + group) * group_bytes +
 +                            static_cast<size_t>(scale_row) * group_width;
 +                        // A slot's column tile's scales, or null for a slot past the core's columns.
-+                        const auto scales = [&](uint32_t slot) -> const uint8_t* {
++                        const auto scales = [&](uint32_t slot) -> const float* {
 +                            const uint32_t tile = 4 * group + slot;
 +                            return tile < core_tiles[core] ? in + (first_tile + tile) * TILE_SIZE : nullptr;
 +                        };
 +                        for (uint32_t slot = 0; slot < 4; ++slot) {
 +                            // The first row of tiles: the slot's half of its pair's scale tile.
 +                            const uint32_t pair = slot / 2 * 2;
-+                            write_scale_half_tile(
-+                                tiles + slot * TILE_SIZE, group_width, {scales(pair), scales(pair + 1)}, K);
++                            write_scale_half_tile(tiles + slot * TILE_SIZE, group_width, {scales(pair), scales(pair + 1)});
 +                            // The identity: in the second row of tiles for a pair's first slot, in the third for
 +                            // its second.
 +                            for (uint32_t d = 0; d < TILE_SIZE; ++d) {
@@ -1023,7 +1025,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +        tt::tt_metal::DistributedHostBuffer::ProcessShardExecutionPolicy::PARALLEL);
 +    auto tail_host = ttnn::to_layout(
 +        ttnn::Tensor(tt::tt_metal::host_tensor_from_buffer_with_topology(
-+            std::move(buffer), spec, scale_bytes.tensor_topology())),
++            std::move(buffer), spec, host_scales.tensor_topology())),
 +        tt_w2.layout());
 +    auto tail_grouped = ttnn::to_device(tail_host, tt_w2.device(), tt_w2.memory_config());
 +
@@ -1062,23 +1064,29 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
  
  // Append per-device shared experts after routed experts along the experts dim.
  //
-@@ -93,6 +95,20 @@ ttnn::Tensor prepare_w0_w1_tensor_for_moe_compute(
+@@ -93,6 +95,26 @@ ttnn::Tensor prepare_w0_w1_tensor_for_moe_compute(
  ttnn::Tensor prepare_w2_tensor_for_moe_compute(
      const ttnn::Tensor& tt_w2, uint32_t L, uint32_t E, uint32_t N, uint32_t K);
  
-+// W0/W1 packer for FP8 experts, whose gate/up columns each have an FP32 scale. W0 and W1 are the experts' FP8
-+// bytes with one more tile of K rows, ``(L, E, K + TILE_SIZE, N)``: W0's hold the bytes of each column's gate
-+// scale in their first four rows, least significant first, and of its up scale in the next four; W1's are
-+// unused. The packed layout stores the scales in three K rows that the kernel reads (moe_ring_common.h,
-+// COLUMN_SCALE_ROWS).
++// W0/W1 packer for FP8 experts, whose gate/up columns each have an FP32 scale: ``tt_s0`` and ``tt_s1``, ``(L, E,
++// N)`` FLOAT32, of W0's and W1's columns. W0 and W1 are the experts' FP8 bytes, ``(L, E, K, N)`` UINT8. The packed
++// layout stores the scales in three K rows that the kernel reads (moe_ring_common.h, COLUMN_SCALE_ROWS), which
++// takes finite scales up to the largest FLOAT16 times 2^-COLUMN_SCALE_SHIFT in magnitude, just under 2^-2.
 +ttnn::Tensor prepare_w0_w1_tensor_with_column_scales(
-+    const ttnn::Tensor& tt_w0, const ttnn::Tensor& tt_w1, uint32_t L, uint32_t E, uint32_t K, uint32_t N);
++    const ttnn::Tensor& tt_w0,
++    const ttnn::Tensor& tt_w1,
++    const ttnn::Tensor& tt_s0,
++    const ttnn::Tensor& tt_s1,
++    uint32_t L,
++    uint32_t E,
++    uint32_t K,
++    uint32_t N);
 +
-+// W2 packer for FP8 experts, whose columns each have an FP32 scale. W2 is the experts' FP8 bytes with one more
-+// tile of N rows, ``(L, E, N + TILE_SIZE, K)``, which hold the bytes of each column's scale in their first four
-+// rows, least significant first. The packed layout stores the scales in three N rows that the kernel reads.
++// W2 packer for FP8 experts, whose columns each have an FP32 scale: ``tt_s2``, ``(L, E, K)`` FLOAT32. W2 is the
++// experts' FP8 bytes, ``(L, E, N, K)`` UINT8. The packed layout stores the scales in three N rows that the kernel
++// reads, as the W0/W1 packer's.
 +ttnn::Tensor prepare_w2_tensor_with_column_scales(
-+    const ttnn::Tensor& tt_w2, uint32_t L, uint32_t E, uint32_t N, uint32_t K);
++    const ttnn::Tensor& tt_w2, const ttnn::Tensor& tt_s2, uint32_t L, uint32_t E, uint32_t N, uint32_t K);
 +
  // Bias-aware W0/W1 packer: appends bias tiles along K, then delegates to the
  // no-bias packer. Bias inputs are PyTorch-format ``(L, E, N)``; output matches

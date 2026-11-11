@@ -527,37 +527,25 @@ def patch_all_gather_via_all_reduce(module):
 def _fp8_experts(w13, w13_scale, w2, w2_scale):
     """FP8 experts as tt.fused_moe_ep takes them: `w13` ([experts, k, 2 * n],
     gate then up projections) and `w2` ([experts, n, k]) with an FP32 scale per
-    expert and output column (or one per expert). Returns the bytes of the
-    gate, the up and the down projections, each with 32 more rows:
-    [experts, k + 32, n] twice and [experts, n + 32, k].
-
-    The gate projections' rows hold the bytes of each column's gate scale in
-    their first four, least significant first, and of its up scale in the next
-    four; the down projections' rows hold their scales' bytes in their first
-    four. The kernel's weight preparation stores them where the kernel reads
-    them."""
+    expert and output column (or one per expert). Returns the gate, the up and
+    the down projections as their bits ([experts, k, n] twice and [experts, n,
+    k] uint8: the op reads them as they are, where the compiler would compute
+    on float8 values in FP32), then their scales ([experts, n] twice and
+    [experts, k] float32)."""
     import jax
     import jax.numpy as jnp
-    import numpy as np
-
-    def scale_rows(scale, columns):
-        """[experts, 4, columns]: the bytes of each column's scale."""
-        scale = jnp.broadcast_to(scale.astype(jnp.float32).reshape(experts, -1), (experts, columns))
-        scale = jax.lax.bitcast_convert_type(scale, jnp.uint32)
-        return jnp.stack([(scale >> np.uint32(8 * byte)) & np.uint32(0xFF) for byte in range(4)], axis=1).astype(
-            jnp.uint8
-        )
-
-    def with_rows(weights, rows):
-        rows = jnp.pad(rows, ((0, 0), (0, 32 - rows.shape[1]), (0, 0)))
-        return jnp.concatenate([jax.lax.bitcast_convert_type(weights, jnp.uint8), rows], axis=1)
 
     experts, k, gate_up = w13.shape
     n = gate_up // 2
-    scale13 = scale_rows(w13_scale, gate_up)
-    w1 = with_rows(w13[..., :n], jnp.concatenate([scale13[..., :n], scale13[..., n:]], axis=1))
-    w3 = with_rows(w13[..., n:], jnp.zeros((experts, 0, n), jnp.uint8))
-    return w1, w3, with_rows(w2, scale_rows(w2_scale, k))
+
+    def bits(weights):
+        return jax.lax.bitcast_convert_type(weights, jnp.uint8)
+
+    def scales(scale, columns):
+        return jnp.broadcast_to(scale.astype(jnp.float32).reshape(experts, -1), (experts, columns))
+
+    scale13 = scales(w13_scale, gate_up)
+    return bits(w13[..., :n]), bits(w13[..., n:]), bits(w2), scale13[:, :n], scale13[:, n:], scales(w2_scale, k)
 
 
 def _fused_moe_jax(

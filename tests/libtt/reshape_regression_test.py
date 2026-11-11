@@ -39,9 +39,9 @@ def test_reshape_rows(trace, dtype, shape, width):
 @pytest.mark.parametrize("level", ["O0", "O1"])
 @pytest.mark.parametrize("shape,width", [((1, 24576), 3), ((7, 512), 8), ((3, 255), 5), ((64, 3), 192)])
 def test_uint8_reshape(trace, level, shape, width, tmp_path):
-    """TTNN's device reshape copies elements by their size, so O1 reshapes uint8 as it is.
+    """TTNN's device reshape copies elements by their size, so uint8 reshapes as it is.
 
-    It cast to float32 and back. At O0 tt-mlir still reshapes uint8 as int32."""
+    It cast to float32 and back at O1, and to int32 and back at O0."""
     run = jax.jit(
         lambda x: x.reshape(-1, width),
         compiler_options={
@@ -54,9 +54,8 @@ def test_uint8_reshape(trace, level, shape, width, tmp_path):
     result = np.asarray(run(jax.device_put(values, jax.devices("tt")[0])))
     assert result.dtype == np.uint8
     np.testing.assert_array_equal(result, values.reshape(-1, width))
-    if level == "O1":
-        (ir,) = (tmp_path / "irs").glob("ttnn_runtime_*.mlir")
-        assert '"ttnn.typecast"' not in ir.read_text(), "the reshape was cast"
+    (ir,) = (tmp_path / "irs").glob("ttnn_runtime_*.mlir")
+    assert '"ttnn.typecast"' not in ir.read_text(), "the reshape was cast"
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32, jnp.int32])

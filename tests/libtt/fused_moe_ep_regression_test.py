@@ -22,9 +22,9 @@ from jax_plugins.libtt import sglang_tpu_kernels
 HIDDEN, INTERMEDIATE, K = 2048, 768, 8
 
 
-def fused_moe_ep(x, weights, ids, w1, w3, w2, **attributes):
+def fused_moe_ep(x, weights, ids, *experts, **attributes):
     out = jax.ShapeDtypeStruct(x.shape, x.dtype, manual_axis_type=jax.typeof(x).manual_axis_type)
-    return jax.ffi.ffi_call("tt.fused_moe_ep", out)(x, weights, ids, w1, w3, w2, **attributes)
+    return jax.ffi.ffi_call("tt.fused_moe_ep", out)(x, weights, ids, *experts, **attributes)
 
 
 def weight(w):
