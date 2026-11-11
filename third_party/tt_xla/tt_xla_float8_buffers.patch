@@ -1,19 +1,30 @@
 diff --git a/pjrt_implementation/src/utils/data_type_utils.cc b/pjrt_implementation/src/utils/data_type_utils.cc
 --- a/pjrt_implementation/src/utils/data_type_utils.cc
 +++ b/pjrt_implementation/src/utils/data_type_utils.cc
-@@ -122,6 +122,11 @@
+@@ -82,6 +82,10 @@ convertRuntimeToPJRTDataType(tt::target::DataType runtime_data_type) {
+     return PJRT_Buffer_Type_F32;
+   case tt::target::DataType::BFloat16:
+     return PJRT_Buffer_Type_BF16;
++  case tt::target::DataType::Float8E4M3FN:
++    return PJRT_Buffer_Type_F8E4M3FN;
++  case tt::target::DataType::Float8E5M2:
++    return PJRT_Buffer_Type_F8E5M2;
+   default:
+     TT_THROW("Unsupported runtime data type");
+   }
+@@ -123,6 +127,11 @@ convertPJRTToRuntimeDataType(PJRT_Buffer_Type pjrt_data_type) {
      return tt::target::DataType::Float32;
    case PJRT_Buffer_Type_C128:
      return tt::target::DataType::Float64;
-+  // The compiler stores float8 tensors as their bits (stablehlo float8 data
-+  // type conversion), so their buffers move as bytes.
++  // Float8 tensors keep their types: the hardware reads e4m3 and e5m2.
 +  case PJRT_Buffer_Type_F8E4M3FN:
++    return tt::target::DataType::Float8E4M3FN;
 +  case PJRT_Buffer_Type_F8E5M2:
-+    return tt::target::DataType::UInt8;
++    return tt::target::DataType::Float8E5M2;
    default:
      TT_THROW("PJRT data type: {} does not have runtime data type equivalent",
               getPJRTBufferTypeString(pjrt_data_type));
-@@ -159,6 +164,10 @@
+@@ -160,6 +169,10 @@ PJRT_Buffer_Type convertMLIRToPJRTDataType(mlir::Type type) {
        return PJRT_Buffer_Type_F16;
      } else if (floatType.isBF16()) {
        return PJRT_Buffer_Type_BF16;

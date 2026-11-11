@@ -1,15 +1,18 @@
 diff --git a/pjrt_implementation/src/utils/data_type_utils.cc b/pjrt_implementation/src/utils/data_type_utils.cc
 --- a/pjrt_implementation/src/utils/data_type_utils.cc
 +++ b/pjrt_implementation/src/utils/data_type_utils.cc
-@@ -127,6 +127,7 @@ convertPJRTToRuntimeDataType(PJRT_Buffer_Type pjrt_data_type) {
-   // type conversion), so their buffers move as bytes.
-   case PJRT_Buffer_Type_F8E4M3FN:
+@@ -132,6 +132,10 @@ convertPJRTToRuntimeDataType(PJRT_Buffer_Type pjrt_data_type) {
+     return tt::target::DataType::Float8E4M3FN;
    case PJRT_Buffer_Type_F8E5M2:
+     return tt::target::DataType::Float8E5M2;
++  // float8_e8m0fnu, which TTNN has no type for, is stored as its bits
++  // (stablehlo float8 data type conversion), so its buffers move as bytes.
 +  case PJRT_Buffer_Type_F8E8M0FNU:
-     return tt::target::DataType::UInt8;
++    return tt::target::DataType::UInt8;
    default:
      TT_THROW("PJRT data type: {} does not have runtime data type equivalent",
-@@ -169,6 +170,8 @@ PJRT_Buffer_Type convertMLIRToPJRTDataType(mlir::Type type) {
+              getPJRTBufferTypeString(pjrt_data_type));
+@@ -173,6 +177,8 @@ PJRT_Buffer_Type convertMLIRToPJRTDataType(mlir::Type type) {
        return PJRT_Buffer_Type_F8E4M3FN;
      } else if (mlir::isa<mlir::Float8E5M2Type>(floatType)) {
        return PJRT_Buffer_Type_F8E5M2;

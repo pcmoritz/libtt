@@ -1,19 +1,38 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
 --- a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
-@@ -39,6 +39,11 @@ namespace mlir::tt::stablehlo {
- // infinity for e5m2). Other conversions to or from float8 go through f32, and
- // other ops on float8 values compute in f32.
+@@ -2,10 +2,15 @@
  //
-+// float8_e8m0fnu, the power-of-two scales of microscaling formats, is stored as
-+// its bits too, but neither the matrix unit nor ttnn's typecast reads it. Its
-+// conversions to and from f32 work on the bits with integer ops instead: a code
-+// is the exponent of an f32 without a mantissa.
+ // SPDX-License-Identifier: Apache-2.0
+ 
++#include <optional>
++
+ #include "ttmlir/Dialect/StableHLO/Transforms/Passes.h"
+ 
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/Dialect/Func/Transforms/FuncConversions.h"
+ #include "mlir/IR/BuiltinTypes.h"
++#include "mlir/IR/PatternMatch.h"
++#include "mlir/Transforms/DialectConversion.h"
+ #include "mlir/Transforms/RegionUtils.h"
+ #include "shardy/dialect/sdy/ir/dialect.h"
+ #include "stablehlo/dialect/StablehloOps.h"
+@@ -32,6 +37,14 @@ namespace mlir::tt::stablehlo {
+ // values compute in f32. Float8 constants are views of constants of their
+ // bits, which TTIR's constants hold.
+ //
++// float8_e8m0fnu, the power-of-two scales of microscaling formats, has no TTNN
++// type, and neither the matrix unit nor ttnn's typecast reads it. It is stored
++// as its bits, in ui8 tensors:
++//   tensor<4x8xf8E8M0FNU>  -->  tensor<4x8xui8>
++// which ops that only move values move as they are. Its conversions to and
++// from f32 work on the bits with integer ops: a code is the exponent of an f32
++// without a mantissa.
 +//
- // Control flow (while, case, if, shard_map bodies) carries the bits too, as
- // do Shardy's collectives and reshards (sdy.all_slice composites). Ops whose
- // regions compute on float8 values (reduce, sort, scatter, ...) compute on f32
-@@ -53,7 +58,7 @@ namespace {
+ // The ops whose TTNN versions don't take float8 tensors (broadcasts, row
+ // updates, gathers, padding and selects) move their bits: they run on ui8
+ // views of their float8 operands, and their results are float8 views of
+@@ -52,7 +65,7 @@ namespace {
  // The float8 element type of a type, if it has one.
  Type getFloat8Type(Type type) {
    Type elementType = getElementTypeOrSelf(type);
@@ -22,7 +41,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
      return elementType;
    }
    return {};
-@@ -61,6 +66,12 @@ Type getFloat8Type(Type type) {
+@@ -60,12 +73,27 @@ Type getFloat8Type(Type type) {
  
  bool isFloat8(Type type) { return static_cast<bool>(getFloat8Type(type)); }
  
@@ -32,10 +51,25 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
 +  return isa<Float8E4M3FNType, Float8E5M2Type>(getElementTypeOrSelf(type));
 +}
 +
++bool isE8M0(Type type) {
++  return isa<Float8E8M0FNUType>(getElementTypeOrSelf(type));
++}
++
  bool hasFloat8(TypeRange types) { return llvm::any_of(types, isFloat8); }
  
  bool hasFloat8(Operation *op) {
-@@ -76,7 +87,7 @@ RankedTensorType withElementType(Type type, Type elementType) {
+   return hasFloat8(op->getOperandTypes()) || hasFloat8(op->getResultTypes());
+ }
+ 
++bool hasE8M0(Operation *op) {
++  return llvm::any_of(op->getOperandTypes(), isE8M0) ||
++         llvm::any_of(op->getResultTypes(), isE8M0);
++}
++
+ RankedTensorType withElementType(Type type, Type elementType) {
+   return cast<RankedTensorType>(type).clone(elementType);
+ }
+@@ -75,7 +103,7 @@ RankedTensorType withElementType(Type type, Type elementType) {
  bool hasNativeFloat8Operands(mlir::stablehlo::DotGeneralOp op) {
    auto lhsType = cast<RankedTensorType>(op.getLhs().getType());
    auto rhsType = cast<RankedTensorType>(op.getRhs().getType());
@@ -44,11 +78,10 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
      return false;
    }
    auto dims = op.getDotDimensionNumbers();
-@@ -137,18 +148,98 @@ void readConvertedFloat8Operands(mlir::stablehlo::DotGeneralOp op) {
+@@ -136,6 +164,78 @@ void readConvertedFloat8Operands(mlir::stablehlo::DotGeneralOp op) {
    }
  }
  
--// The f32 values of float8 bits (a ui8 tensor): a convert of their float8 view.
 +// A splat i32 constant of the given tensor type's shape.
 +Value i32Constant(OpBuilder &builder, Location loc, Type type, int32_t value) {
 +  auto i32Type = withElementType(type, builder.getI32Type());
@@ -121,58 +154,146 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
 +      IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned));
 +}
 +
-+// The f32 values of float8 bits (a ui8 tensor): a convert of their float8 view,
-+// or for float8_e8m0fnu their integer decoding.
- Value decodeFloat8(OpBuilder &builder, Location loc, Value bits,
-                    Type float8Type) {
-+  if (isa<Float8E8M0FNUType>(float8Type)) {
-+    return decodeE8M0(builder, loc, bits);
-+  }
-   Value view = builder.create<mlir::stablehlo::BitcastConvertOp>(
-       loc, withElementType(bits.getType(), float8Type), bits);
-   return builder.create<mlir::stablehlo::ConvertOp>(loc, view,
-                                                     builder.getF32Type());
+ // A value converted to the given element type: float8 values through f32.
+ Value convertTo(OpBuilder &builder, Location loc, Value value,
+                 Type elementType) {
+@@ -396,6 +496,93 @@ void callDecomposition(mlir::stablehlo::CompositeOp op) {
+   op.erase();
  }
  
--// The float8 bits (a ui8 tensor) of f32 values: a view of their convert.
-+// The float8 bits (a ui8 tensor) of f32 values: a view of their convert, or
-+// for float8_e8m0fnu their integer encoding.
- Value encodeFloat8(OpBuilder &builder, Location loc, Value value,
-                    Type float8Type) {
-+  if (isa<Float8E8M0FNUType>(float8Type)) {
-+    return encodeE8M0(builder, loc, value);
++// float8_e8m0fnu's conversions to and from f32, the only ones left to it, work
++// on its bits.
++class E8M0ConvertOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::ConvertOp> {
++  using OpConversionPattern::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::ConvertOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    Type operand = getElementTypeOrSelf(op.getOperand().getType());
++    Type result = getElementTypeOrSelf(op.getType());
++    if (isE8M0(operand) && result.isF32()) {
++      rewriter.replaceOp(
++          op, decodeE8M0(rewriter, op.getLoc(), adaptor.getOperand()));
++      return success();
++    }
++    if (operand.isF32() && isE8M0(result)) {
++      rewriter.replaceOp(
++          op, encodeE8M0(rewriter, op.getLoc(), adaptor.getOperand()));
++      return success();
++    }
++    return failure();
 +  }
-   Value converted =
-       builder.create<mlir::stablehlo::ConvertOp>(loc, value, float8Type);
-   return builder.create<mlir::stablehlo::BitcastConvertOp>(
-@@ -529,21 +620,25 @@ struct StableHLOFloat8DataTypeConversionPass
-           return (hasNativeFloat8Operands(op) && !isFloat8(op.getType())) ||
-                  !hasFloat8(op);
-         });
-+    // Views of the bits as the hardware's float8 types stay, for the matrix
-+    // unit and ttnn's typecast.
-     target.addDynamicallyLegalOp<mlir::stablehlo::BitcastConvertOp>(
-         [](mlir::stablehlo::BitcastConvertOp op) {
-           auto operand = getElementTypeOrSelf(op.getOperand().getType());
-           auto result = getElementTypeOrSelf(op.getType());
-           return !hasFloat8(op) ||
--                 (operand.isUnsignedInteger(8) && isFloat8(result)) ||
--                 (isFloat8(operand) && result.isUnsignedInteger(8));
-+                 (operand.isUnsignedInteger(8) && isHardwareFloat8(result)) ||
-+                 (isHardwareFloat8(operand) && result.isUnsignedInteger(8));
-         });
--    // Conversions between float8 and f32 stay, for ttnn's exact typecast.
-+    // Conversions between the hardware's float8 types and f32 stay, for
-+    // ttnn's exact typecast.
-     target.addDynamicallyLegalOp<mlir::stablehlo::ConvertOp>(
-         [](mlir::stablehlo::ConvertOp op) {
-           auto operand = getElementTypeOrSelf(op.getOperand().getType());
-           auto result = getElementTypeOrSelf(op.getType());
--          return !hasFloat8(op) || (isFloat8(operand) && result.isF32()) ||
--                 (operand.isF32() && isFloat8(result));
-+          return !hasFloat8(op) ||
-+                 (isHardwareFloat8(operand) && result.isF32()) ||
-+                 (operand.isF32() && isHardwareFloat8(result));
-         });
-     target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
-       return typeConverter.isSignatureLegal(op.getFunctionType()) &&
++};
++
++// stablehlo.bitcast_convert from or to float8_e8m0fnu moves the bits as they
++// are.
++class E8M0BitcastConvertOpConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::BitcastConvertOp> {
++  using OpConversionPattern::OpConversionPattern;
++
++public:
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::BitcastConvertOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    Type resultType = getTypeConverter()->convertType(op.getType());
++    if (resultType == adaptor.getOperand().getType()) {
++      rewriter.replaceOp(op, adaptor.getOperand());
++    } else {
++      rewriter.replaceOpWithNewOp<mlir::stablehlo::BitcastConvertOp>(
++          op, resultType, adaptor.getOperand());
++    }
++    return success();
++  }
++};
++
++// An op that only moves float8_e8m0fnu values is rebuilt on the bits: its
++// regions take and return ui8 tensors, and the ops in them convert like any
++// others.
++class E8M0BitsPattern : public ConversionPattern {
++public:
++  E8M0BitsPattern(const TypeConverter &typeConverter, MLIRContext *context)
++      : ConversionPattern(typeConverter, MatchAnyOpTypeTag(), /*benefit=*/1,
++                          context) {}
++
++  LogicalResult
++  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
++                  ConversionPatternRewriter &rewriter) const override {
++    if (!movesValues(op)) {
++      return failure();
++    }
++    SmallVector<Type> resultTypes;
++    if (failed(getTypeConverter()->convertTypes(op->getResultTypes(),
++                                                resultTypes))) {
++      return failure();
++    }
++    OperationState state(op->getLoc(), op->getName(), operands, resultTypes,
++                         llvm::to_vector(op->getDiscardableAttrs()));
++    state.propertiesAttr = op->getPropertiesAsAttribute();
++    for (unsigned i = 0; i < op->getNumRegions(); ++i) {
++      state.addRegion();
++    }
++    Operation *newOp = rewriter.create(state);
++    for (auto [region, newRegion] :
++         llvm::zip_equal(op->getRegions(), newOp->getRegions())) {
++      rewriter.inlineRegionBefore(region, newRegion, newRegion.end());
++      if (failed(rewriter.convertRegionTypes(&newRegion,
++                                             *getTypeConverter()))) {
++        return failure();
++      }
++    }
++    rewriter.replaceOp(op, newOp->getResults());
++    return success();
++  }
++};
++
+ struct StableHLOFloat8DataTypeConversionPass
+     : public impl::StableHLOFloat8DataTypeConversionPassBase<
+           StableHLOFloat8DataTypeConversionPass> {
+@@ -448,6 +635,45 @@ struct StableHLOFloat8DataTypeConversionPass
+         callDecomposition(cast<mlir::stablehlo::CompositeOp>(op));
+       }
+     }
++
++    // float8_e8m0fnu values are stored as their bits.
++    bool anyE8M0 = false;
++    getOperation()->walk([&](Operation *op) { anyE8M0 |= hasE8M0(op); });
++    if (!anyE8M0) {
++      return;
++    }
++    MLIRContext *context = &getContext();
++    TypeConverter typeConverter;
++    typeConverter.addConversion([](Type type) { return type; });
++    typeConverter.addConversion(
++        [context](RankedTensorType type) -> std::optional<Type> {
++          if (!isE8M0(type)) {
++            return std::nullopt;
++          }
++          return withElementType(
++              type, IntegerType::get(context, 8, IntegerType::Unsigned));
++        });
++
++    ConversionTarget target(*context);
++    target.markUnknownOpDynamicallyLegal(
++        [](Operation *op) { return !hasE8M0(op); });
++    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
++      return typeConverter.isSignatureLegal(op.getFunctionType()) &&
++             typeConverter.isLegal(&op.getBody());
++    });
++
++    RewritePatternSet patterns(context);
++    patterns.add<E8M0BitcastConvertOpConversionPattern, E8M0BitsPattern,
++                 E8M0ConvertOpConversionPattern>(typeConverter, context);
++    populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(
++        patterns, typeConverter);
++    populateReturnOpTypeConversionPattern(patterns, typeConverter);
++    populateCallOpTypeConversionPattern(patterns, typeConverter);
++
++    if (failed(applyPartialConversion(getOperation(), target,
++                                      std::move(patterns)))) {
++      signalPassFailure();
++    }
+   }
+ };
+ 

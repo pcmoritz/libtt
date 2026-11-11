@@ -241,7 +241,15 @@ diff --git tt_metal/impl/tensor/distributed_tensor_apis.cpp tt_metal/impl/tensor
 diff --git tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
 --- tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
 +++ tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp
-@@ -103,8 +103,9 @@ HostTensor host_tensor_to_tensor_spec_with_pad_value(
+@@ -10,6 +10,7 @@
+ #include <tt-metalium/experimental/tensor_apis_with_pad_values.hpp>
+ 
+ #include <tt-metalium/bfloat16.hpp>
++#include <tt-metalium/float8.hpp>
+ #include <tt-metalium/distributed_host_buffer.hpp>
+ #include <tt-metalium/experimental/distributed_tensor/distributed_tensor_apis.hpp>
+ #include <tt-metalium/experimental/per_core_allocation/memory_config.hpp>
+@@ -103,8 +104,9 @@ HostTensor host_tensor_to_tensor_spec_with_pad_value(
          tensor.logical_shape(),
          dest_spec.logical_shape());
      TT_FATAL(
@@ -253,6 +261,23 @@ diff --git tt_metal/impl/tensor/host_to_tensor_spec_apis.cpp tt_metal/impl/tenso
  
      const bool bfp_src = CMAKE_UNIQUE_NAMESPACE::is_bfp_dtype(tensor.dtype());
      const bool bfp_dst = CMAKE_UNIQUE_NAMESPACE::is_bfp_dtype(dest_spec.data_type());
+@@ -181,6 +183,8 @@ template HostTensor host_tensor_to_tensor_spec_with_pad_value<uint32_t>(const Ho
+ template HostTensor host_tensor_to_tensor_spec_with_pad_value<uint16_t>(const HostTensor&, const TensorSpec&, uint16_t);
+ template HostTensor host_tensor_to_tensor_spec_with_pad_value<uint8_t>(const HostTensor&, const TensorSpec&, uint8_t);
+ template HostTensor host_tensor_to_tensor_spec_with_pad_value<int8_t>(const HostTensor&, const TensorSpec&, int8_t);
++template HostTensor host_tensor_to_tensor_spec_with_pad_value<float8_e4m3>(const HostTensor&, const TensorSpec&, float8_e4m3);
++template HostTensor host_tensor_to_tensor_spec_with_pad_value<float8_e5m2>(const HostTensor&, const TensorSpec&, float8_e5m2);
+ 
+ template HostTensor to_tensor_spec<float>(const HostTensor&, const TensorSpec&);
+ template HostTensor to_tensor_spec<bfloat16>(const HostTensor&, const TensorSpec&);
+@@ -189,5 +193,7 @@ template HostTensor to_tensor_spec<uint32_t>(const HostTensor&, const TensorSpec
+ template HostTensor to_tensor_spec<uint16_t>(const HostTensor&, const TensorSpec&);
+ template HostTensor to_tensor_spec<uint8_t>(const HostTensor&, const TensorSpec&);
+ template HostTensor to_tensor_spec<int8_t>(const HostTensor&, const TensorSpec&);
++template HostTensor to_tensor_spec<float8_e4m3>(const HostTensor&, const TensorSpec&);
++template HostTensor to_tensor_spec<float8_e5m2>(const HostTensor&, const TensorSpec&);
+ 
+ }  // namespace tt::tt_metal
 diff --git tt_metal/impl/tensor/mesh_tensor.cpp tt_metal/impl/tensor/mesh_tensor.cpp
 --- tt_metal/impl/tensor/mesh_tensor.cpp
 +++ tt_metal/impl/tensor/mesh_tensor.cpp
@@ -367,7 +392,18 @@ diff --git tt_metal/impl/tensor/tensor_impl.cpp tt_metal/impl/tensor/tensor_impl
          case DataType::UINT8: return uninitialized_host_buffer<uint8_t>(size_bytes);
          case DataType::UINT16: return uninitialized_host_buffer<uint16_t>(size_bytes);
          case DataType::BFLOAT4_B:
-@@ -340,6 +342,8 @@ template std::vector<uint8_t> to_tile_major_layout<uint8_t>(
+@@ -314,6 +316,10 @@ template std::vector<int32_t> encode_tensor_data<int32_t>(
+     ttsl::Span<const int32_t> logical_data, const TensorSpec& tensor_spec, int32_t pad_value);
+ template std::vector<int8_t> encode_tensor_data<int8_t>(
+     ttsl::Span<const int8_t> logical_data, const TensorSpec& tensor_spec, int8_t pad_value);
++template std::vector<float8_e4m3> encode_tensor_data<float8_e4m3>(
++    ttsl::Span<const float8_e4m3> logical_data, const TensorSpec& tensor_spec, float8_e4m3 pad_value);
++template std::vector<float8_e5m2> encode_tensor_data<float8_e5m2>(
++    ttsl::Span<const float8_e5m2> logical_data, const TensorSpec& tensor_spec, float8_e5m2 pad_value);
+ template std::vector<uint32_t> encode_tensor_data<uint32_t>(
+     ttsl::Span<const uint32_t> logical_data, const TensorSpec& tensor_spec, uint32_t pad_value);
+ template std::vector<uint16_t> encode_tensor_data<uint16_t>(
+@@ -340,6 +346,8 @@ template std::vector<uint8_t> to_tile_major_layout<uint8_t>(
      const Shape2D& shape, const Tile& tile, ttsl::Span<const uint8_t> data_to_convert);
  template std::vector<float8_e4m3> to_tile_major_layout<float8_e4m3>(
      const Shape2D& shape, const Tile& tile, ttsl::Span<const float8_e4m3> data_to_convert);
@@ -376,6 +412,17 @@ diff --git tt_metal/impl/tensor/tensor_impl.cpp tt_metal/impl/tensor/tensor_impl
  
  template <typename T>
  std::vector<T> decode_tensor_data(ttsl::Span<const T> physical_data, const TensorSpec& tensor_spec) {
+@@ -403,6 +411,10 @@ template std::vector<int32_t> decode_tensor_data<int32_t>(
+     ttsl::Span<const int32_t> physical_data, const TensorSpec& tensor_spec);
+ template std::vector<int8_t> decode_tensor_data<int8_t>(
+     ttsl::Span<const int8_t> physical_data, const TensorSpec& tensor_spec);
++template std::vector<float8_e4m3> decode_tensor_data<float8_e4m3>(
++    ttsl::Span<const float8_e4m3> physical_data, const TensorSpec& tensor_spec);
++template std::vector<float8_e5m2> decode_tensor_data<float8_e5m2>(
++    ttsl::Span<const float8_e5m2> physical_data, const TensorSpec& tensor_spec);
+ template std::vector<uint32_t> decode_tensor_data<uint32_t>(
+     ttsl::Span<const uint32_t> physical_data, const TensorSpec& tensor_spec);
+ template std::vector<uint16_t> decode_tensor_data<uint16_t>(
 diff --git tt_metal/impl/tensor/tensor_impl.hpp tt_metal/impl/tensor/tensor_impl.hpp
 --- tt_metal/impl/tensor/tensor_impl.hpp
 +++ tt_metal/impl/tensor/tensor_impl.hpp
@@ -507,7 +554,71 @@ diff --git ttnn/core/distributed/distributed_tensor.cpp ttnn/core/distributed/di
 diff --git ttnn/core/tensor/tensor.cpp ttnn/core/tensor/tensor.cpp
 --- ttnn/core/tensor/tensor.cpp
 +++ ttnn/core/tensor/tensor.cpp
-@@ -411,6 +411,7 @@ uint32_t Tensor::element_size() const {
+@@ -262,6 +262,18 @@ template Tensor Tensor::from_span<uint32_t>(
+     tt::tt_metal::distributed::MeshDevice* device,
+     std::optional<QueueId> cq_id,
+     uint32_t pad_value);
++template Tensor Tensor::from_span<float8_e4m3>(
++    ttsl::Span<const float8_e4m3> buffer,
++    const TensorSpec& spec,
++    tt::tt_metal::distributed::MeshDevice* device,
++    std::optional<QueueId> cq_id,
++    float8_e4m3 pad_value);
++template Tensor Tensor::from_span<float8_e5m2>(
++    ttsl::Span<const float8_e5m2> buffer,
++    const TensorSpec& spec,
++    tt::tt_metal::distributed::MeshDevice* device,
++    std::optional<QueueId> cq_id,
++    float8_e5m2 pad_value);
+ template Tensor Tensor::from_borrowed_data<float>(
+     ttsl::Span<float> buffer,
+     const tt::tt_metal::Shape& shape,
+@@ -302,6 +314,16 @@ template Tensor Tensor::from_borrowed_data<uint32_t>(
+     const tt::tt_metal::Shape& shape,
+     tt::tt_metal::MemoryPin buffer_pin,
+     const std::optional<Tile>& tile);
++template Tensor Tensor::from_borrowed_data<float8_e4m3>(
++    ttsl::Span<float8_e4m3> buffer,
++    const tt::tt_metal::Shape& shape,
++    tt::tt_metal::MemoryPin buffer_pin,
++    const std::optional<Tile>& tile);
++template Tensor Tensor::from_borrowed_data<float8_e5m2>(
++    ttsl::Span<float8_e5m2> buffer,
++    const tt::tt_metal::Shape& shape,
++    tt::tt_metal::MemoryPin buffer_pin,
++    const std::optional<Tile>& tile);
+ template Tensor Tensor::from_vector<bfloat16>(
+     std::vector<bfloat16>&& buffer,
+     const TensorSpec& spec,
+@@ -350,6 +372,18 @@ template Tensor Tensor::from_vector<uint32_t>(
+     tt::tt_metal::distributed::MeshDevice* device,
+     std::optional<QueueId> cq_id,
+     uint32_t pad_value);
++template Tensor Tensor::from_vector<float8_e4m3>(
++    std::vector<float8_e4m3>&& buffer,
++    const TensorSpec& spec,
++    tt::tt_metal::distributed::MeshDevice* device,
++    std::optional<QueueId> cq_id,
++    float8_e4m3 pad_value);
++template Tensor Tensor::from_vector<float8_e5m2>(
++    std::vector<float8_e5m2>&& buffer,
++    const TensorSpec& spec,
++    tt::tt_metal::distributed::MeshDevice* device,
++    std::optional<QueueId> cq_id,
++    float8_e5m2 pad_value);
+ 
+ template std::vector<float> Tensor::to_vector<float>(std::optional<QueueId> cq_id) const;
+ template std::vector<float16> Tensor::to_vector<float16>(std::optional<QueueId> cq_id) const;
+@@ -359,6 +393,8 @@ template std::vector<uint8_t> Tensor::to_vector<uint8_t>(std::optional<QueueId>
+ template std::vector<uint16_t> Tensor::to_vector<uint16_t>(std::optional<QueueId> cq_id) const;
+ template std::vector<uint32_t> Tensor::to_vector<uint32_t>(std::optional<QueueId> cq_id) const;
+ template std::vector<int8_t> Tensor::to_vector<int8_t>(std::optional<QueueId> cq_id) const;
++template std::vector<float8_e4m3> Tensor::to_vector<float8_e4m3>(std::optional<QueueId> cq_id) const;
++template std::vector<float8_e5m2> Tensor::to_vector<float8_e5m2>(std::optional<QueueId> cq_id) const;
+ 
+ Tensor Tensor::to_device(
+     tt::tt_metal::distributed::MeshDevice* mesh_device,
+@@ -411,6 +447,7 @@ uint32_t Tensor::element_size() const {
          case DataType::UINT32: return sizeof(uint32_t);
          case DataType::UINT16: return sizeof(uint16_t);
          case DataType::FP8_E4M3: return sizeof(float8_e4m3);
@@ -583,3 +694,85 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/unary/unary.cpp ttnn/cpp/ttnn/operat
      };
      if (is_byte_type(input_tensor.dtype()) && is_byte_type(output_dtype)) {
          TT_FATAL(
+diff --git tt_metal/impl/tensor/host_tensor_factory.cpp tt_metal/impl/tensor/host_tensor_factory.cpp
+--- tt_metal/impl/tensor/host_tensor_factory.cpp
++++ tt_metal/impl/tensor/host_tensor_factory.cpp
+@@ -5,6 +5,7 @@
+ #include <tt-metalium/bfloat16.hpp>
+ #include <tt-metalium/bfloat4.hpp>
+ #include <tt-metalium/bfloat8.hpp>
++#include <tt-metalium/float8.hpp>
+ #include <tt-metalium/distributed_host_buffer.hpp>
+ #include <tt-metalium/tensor/host_tensor.hpp>
+ #include <tt-metalium/tensor/tensor_apis.hpp>
+@@ -200,6 +201,8 @@ template HostTensor host_tensor_from_span_with_pad_value<uint32_t>(ttsl::Span<co
+ template HostTensor host_tensor_from_span_with_pad_value<uint16_t>(ttsl::Span<const uint16_t>, TensorSpec, uint16_t);
+ template HostTensor host_tensor_from_span_with_pad_value<uint8_t>(ttsl::Span<const uint8_t>, TensorSpec, uint8_t);
+ template HostTensor host_tensor_from_span_with_pad_value<int8_t>(ttsl::Span<const int8_t>, TensorSpec, int8_t);
++template HostTensor host_tensor_from_span_with_pad_value<float8_e4m3>(ttsl::Span<const float8_e4m3>, TensorSpec, float8_e4m3);
++template HostTensor host_tensor_from_span_with_pad_value<float8_e5m2>(ttsl::Span<const float8_e5m2>, TensorSpec, float8_e5m2);
+ 
+ template HostTensor HostTensor::from_span<bfloat16>(ttsl::Span<const bfloat16>, TensorSpec);
+ template HostTensor HostTensor::from_span<float>(ttsl::Span<const float>, TensorSpec);
+@@ -209,6 +212,8 @@ template HostTensor HostTensor::from_span<uint32_t>(ttsl::Span<const uint32_t>,
+ template HostTensor HostTensor::from_span<uint16_t>(ttsl::Span<const uint16_t>, TensorSpec);
+ template HostTensor HostTensor::from_span<uint8_t>(ttsl::Span<const uint8_t>, TensorSpec);
+ template HostTensor HostTensor::from_span<int8_t>(ttsl::Span<const int8_t>, TensorSpec);
++template HostTensor HostTensor::from_span<float8_e4m3>(ttsl::Span<const float8_e4m3>, TensorSpec);
++template HostTensor HostTensor::from_span<float8_e5m2>(ttsl::Span<const float8_e5m2>, TensorSpec);
+ 
+ template HostTensor HostTensor::from_borrowed_data<bfloat16>(ttsl::Span<bfloat16>, const Shape&, MemoryPin);
+ template HostTensor HostTensor::from_borrowed_data<float>(ttsl::Span<float>, const Shape&, MemoryPin);
+@@ -218,6 +223,8 @@ template HostTensor HostTensor::from_borrowed_data<uint32_t>(ttsl::Span<uint32_t
+ template HostTensor HostTensor::from_borrowed_data<uint16_t>(ttsl::Span<uint16_t>, const Shape&, MemoryPin);
+ template HostTensor HostTensor::from_borrowed_data<uint8_t>(ttsl::Span<uint8_t>, const Shape&, MemoryPin);
+ template HostTensor HostTensor::from_borrowed_data<int8_t>(ttsl::Span<int8_t>, const Shape&, MemoryPin);
++template HostTensor HostTensor::from_borrowed_data<float8_e4m3>(ttsl::Span<float8_e4m3>, const Shape&, MemoryPin);
++template HostTensor HostTensor::from_borrowed_data<float8_e5m2>(ttsl::Span<float8_e5m2>, const Shape&, MemoryPin);
+ 
+ template HostTensor host_tensor_from_vector_with_pad_value<bfloat16>(
+     const std::vector<bfloat16>&, TensorSpec, bfloat16);
+@@ -230,6 +237,8 @@ template HostTensor host_tensor_from_vector_with_pad_value<uint16_t>(
+     const std::vector<uint16_t>&, TensorSpec, uint16_t);
+ template HostTensor host_tensor_from_vector_with_pad_value<uint8_t>(const std::vector<uint8_t>&, TensorSpec, uint8_t);
+ template HostTensor host_tensor_from_vector_with_pad_value<int8_t>(const std::vector<int8_t>&, TensorSpec, int8_t);
++template HostTensor host_tensor_from_vector_with_pad_value<float8_e4m3>(const std::vector<float8_e4m3>&, TensorSpec, float8_e4m3);
++template HostTensor host_tensor_from_vector_with_pad_value<float8_e5m2>(const std::vector<float8_e5m2>&, TensorSpec, float8_e5m2);
+ 
+ template HostTensor host_tensor_from_vector_with_pad_value<bfloat16>(std::vector<bfloat16>&&, TensorSpec, bfloat16);
+ template HostTensor host_tensor_from_vector_with_pad_value<float>(std::vector<float>&&, TensorSpec, float);
+@@ -239,6 +248,8 @@ template HostTensor host_tensor_from_vector_with_pad_value<uint32_t>(std::vector
+ template HostTensor host_tensor_from_vector_with_pad_value<uint16_t>(std::vector<uint16_t>&&, TensorSpec, uint16_t);
+ template HostTensor host_tensor_from_vector_with_pad_value<uint8_t>(std::vector<uint8_t>&&, TensorSpec, uint8_t);
+ template HostTensor host_tensor_from_vector_with_pad_value<int8_t>(std::vector<int8_t>&&, TensorSpec, int8_t);
++template HostTensor host_tensor_from_vector_with_pad_value<float8_e4m3>(std::vector<float8_e4m3>&&, TensorSpec, float8_e4m3);
++template HostTensor host_tensor_from_vector_with_pad_value<float8_e5m2>(std::vector<float8_e5m2>&&, TensorSpec, float8_e5m2);
+ 
+ template HostTensor HostTensor::from_vector<bfloat16>(const std::vector<bfloat16>&, TensorSpec);
+ template HostTensor HostTensor::from_vector<float>(const std::vector<float>&, TensorSpec);
+@@ -248,6 +259,8 @@ template HostTensor HostTensor::from_vector<uint32_t>(const std::vector<uint32_t
+ template HostTensor HostTensor::from_vector<uint16_t>(const std::vector<uint16_t>&, TensorSpec);
+ template HostTensor HostTensor::from_vector<uint8_t>(const std::vector<uint8_t>&, TensorSpec);
+ template HostTensor HostTensor::from_vector<int8_t>(const std::vector<int8_t>&, TensorSpec);
++template HostTensor HostTensor::from_vector<float8_e4m3>(const std::vector<float8_e4m3>&, TensorSpec);
++template HostTensor HostTensor::from_vector<float8_e5m2>(const std::vector<float8_e5m2>&, TensorSpec);
+ 
+ template HostTensor HostTensor::from_vector<bfloat16>(std::vector<bfloat16>&&, TensorSpec);
+ template HostTensor HostTensor::from_vector<float>(std::vector<float>&&, TensorSpec);
+@@ -257,6 +270,8 @@ template HostTensor HostTensor::from_vector<uint32_t>(std::vector<uint32_t>&&, T
+ template HostTensor HostTensor::from_vector<uint16_t>(std::vector<uint16_t>&&, TensorSpec);
+ template HostTensor HostTensor::from_vector<uint8_t>(std::vector<uint8_t>&&, TensorSpec);
+ template HostTensor HostTensor::from_vector<int8_t>(std::vector<int8_t>&&, TensorSpec);
++template HostTensor HostTensor::from_vector<float8_e4m3>(std::vector<float8_e4m3>&&, TensorSpec);
++template HostTensor HostTensor::from_vector<float8_e5m2>(std::vector<float8_e5m2>&&, TensorSpec);
+ 
+ template std::vector<float> HostTensor::to_vector() const;
+ template std::vector<float16> HostTensor::to_vector() const;
+@@ -266,5 +281,7 @@ template std::vector<uint32_t> HostTensor::to_vector() const;
+ template std::vector<uint16_t> HostTensor::to_vector() const;
+ template std::vector<uint8_t> HostTensor::to_vector() const;
+ template std::vector<int8_t> HostTensor::to_vector() const;
++template std::vector<float8_e4m3> HostTensor::to_vector() const;
++template std::vector<float8_e5m2> HostTensor::to_vector() const;
+ 
+ }  // namespace tt::tt_metal

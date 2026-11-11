@@ -1,6 +1,8 @@
 """float8 tensors: storage, conversions and native matmuls.
 
-float8 tensors are stored as their bits. Conversions between float8 and f32
+float8_e4m3fn and float8_e5m2 tensors keep their types on the device, the
+hardware's Fp8_e4m3 and Lf8 formats; float8_e8m0fnu, which TTNN has no type
+for, is stored as its bits. Conversions between float8 and f32
 are exact on the device (ttnn's typecast), so they match ml_dtypes (and
 PyTorch): rounding to nearest even, subnormals, NaN on e4m3fn overflow and
 infinity on e5m2 overflow, at O0 and O1 (where casts through float8 must not
@@ -52,6 +54,46 @@ def test_float8_buffers_round_trip(dtype):
     assert_same_bits(jax.device_put(codes), codes)
     moved = jax.jit(lambda x: jnp.concatenate([x.T, x[::-1]], axis=0))(codes)
     assert_same_bits(moved, np.concatenate([codes.T, codes[::-1]], axis=0))
+
+
+@LEVELS
+@pytest.mark.parametrize("dtype", HARDWARE_FORMATS)
+def test_device_moves_float8_as_float8(tmp_path, dtype, level):
+    """Data movement (transposes, reshapes, slices, concatenations, padding, selects, gathers,
+    row updates and broadcasts) takes float8 tensors as they are, every code unchanged: no op on
+    the device reads their bytes as uint8."""
+    codes = all_codes(dtype)
+    rows = np.array([3, 0, 31, 7], np.int32)
+    mask = np.random.default_rng(8).integers(0, 2, (32, 32)).astype(bool)
+
+    def f(x, rows, mask, start):
+        return (
+            jnp.concatenate([x.T.reshape(16, 64), x[::2].reshape(8, 64), x[5:21, 3:7].reshape(1, 64)]),
+            jnp.pad(x[:20, :30], ((1, 11), (0, 2)), constant_values=1.0),
+            jnp.where(mask, x, x.T),
+            x[rows],
+            jax.lax.dynamic_update_slice(x, x[:4], (start, 0)),
+            jnp.broadcast_to(x[7], (4, 32, 32)),
+        )
+
+    args = (codes, rows, mask, np.int32(9))
+    options = {"optimization_level": level, "export_path": str(tmp_path)}
+    for actual, expected in zip(jax.jit(f, compiler_options=options)(*args), jax.jit(f, backend="cpu")(*args)):
+        assert_same_bits(actual, expected)
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert irs
+    for ir in irs:
+        assert "xui8" not in ir and "u8>" not in ir, ir
+
+
+@pytest.mark.parametrize("dtype", FORMATS)
+def test_float8_constants(dtype):
+    """Float8 constants, splat or not, keep every code: they are views of constants of their
+    bits."""
+    codes = all_codes(dtype)
+    splat, table = np.full((2, 32), codes[3, 9], codes.dtype), codes[::16]
+    f = lambda x: jnp.concatenate([x[:2], jnp.asarray(splat), jnp.asarray(table)])
+    assert_same_bits(jax.jit(f)(codes), np.concatenate([codes[:2], splat, table]))
 
 
 @LEVELS
