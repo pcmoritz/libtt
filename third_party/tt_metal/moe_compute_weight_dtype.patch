@@ -79,7 +79,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  #include "ckernel_sfpu_binary.h"
  #include "llk_math_eltwise_unary_sfpu_macros.h"
  #include "llk_math_eltwise_binary_sfpu_macros.h"
-@@ -28,6 +29,28 @@
+@@ -28,6 +29,40 @@
  
  namespace detail {
  
@@ -105,10 +105,22 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
 +    }
 +}
 +
++// FP8 experts' scale tiles into the DEST tiles after a block column's ct_dim data tiles. K row `k` of the weights
++// holds a scale tile per pair of slots (read as the FLOAT16 tile its two slots' bytes make), the next row the
++// identity in each pair's first slot and the row after in its second (moe_ring_common.h, COLUMN_SCALE_ROWS): the
++// first pair's scale tile times the next row lands in dst ct_dim (and ct_dim + 2), the second pair's times the row
++// after in dst ct_dim + 1 (and ct_dim + 3).
++FORCE_INLINE void matmul_scale_tiles(uint32_t weights_cb_id, uint32_t k, uint32_t ct_dim) {
++    matmul_block(weights_cb_id, weights_cb_id, k, k + ct_dim, ct_dim, /*transpose=*/false, ct_dim, 1, 1);
++    if (ct_dim == 4) {
++        matmul_block(weights_cb_id, weights_cb_id, k + 2, k + 2 * ct_dim, ct_dim, /*transpose=*/false, ct_dim, 1, 1);
++    }
++}
++
  FORCE_INLINE
  void noc_semaphore_wait_min(volatile tt_l1_ptr uint32_t* sem_addr, uint32_t val) {
      WAYPOINT("NSMW");
-@@ -188,13 +211,17 @@ struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::G
+@@ -188,13 +223,17 @@ struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::G
  // [out_tile, out_tile + kPairs). kPairs = 2: a full block-column, 4 tiles wide (W0 c, W1 c, W0 c+1, W1 c+1);
  // kPairs = 1: the half block-column of a ring core with an odd column count, 2 tiles wide. The caller sets
  // matmul_block_init to ct_dim = 2 * kPairs.
@@ -127,44 +139,19 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  FORCE_INLINE void compute_w0_w1_block_column(
      uint32_t in_cb_id,
      uint32_t w0_w1_cb_id,
-@@ -231,6 +258,36 @@ FORCE_INLINE void compute_w0_w1_block_column(
+@@ -231,6 +270,11 @@ FORCE_INLINE void compute_w0_w1_block_column(
                      continue;  // skip padding K slots after bias
                  }
              }
 +            if constexpr (scale_row != 0) {
 +                if (k_tracker == scale_row) {
-+                    // The first column tile's scale tile (its W0 and W1 slots, read as the FLOAT16 tile they hold)
-+                    // times the next row, whose W0 slots hold the identity: dst ct_dim (and ct_dim + 2).
-+                    matmul_block(
-+                        w0_w1_cb_id,
-+                        w0_w1_cb_id,
-+                        /*in0_index=*/k,
-+                        /*in1_index=*/k + ct_dim,
-+                        /*idst=*/ct_dim,
-+                        /*transpose=*/false,
-+                        /*ct_dim=*/ct_dim,
-+                        /*rt_dim=*/1,
-+                        /*kt_dim=*/1);
-+                    if constexpr (kPairs == 2) {
-+                        // The second column tile's times the row after, whose W1 slots hold it: dst ct_dim + 1
-+                        // (and ct_dim + 3).
-+                        matmul_block(
-+                            w0_w1_cb_id,
-+                            w0_w1_cb_id,
-+                            /*in0_index=*/k + 2,
-+                            /*in1_index=*/k + 2 * ct_dim,
-+                            /*idst=*/ct_dim,
-+                            /*transpose=*/false,
-+                            /*ct_dim=*/ct_dim,
-+                            /*rt_dim=*/1,
-+                            /*kt_dim=*/1);
-+                    }
++                    matmul_scale_tiles(w0_w1_cb_id, k, ct_dim);
 +                }
 +            }
              if constexpr (!has_bias) {
                  if (k_tracker >= Kt) {
                      k_tracker++;
-@@ -262,6 +319,9 @@ FORCE_INLINE void compute_w0_w1_block_column(
+@@ -262,6 +306,9 @@ FORCE_INLINE void compute_w0_w1_block_column(
      // Make SFPU access the appropriate half of the destination registers
      PACK(TT_SETC16(DEST_TARGET_REG_CFG_MATH_Offset_ADDR32, ckernel::packer::get_packer_dest_offset()));
  
@@ -174,7 +161,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
      PackActivation<activation, kPairs>::compute();
  
      PACK(TTI_STALLWAIT(p_stall::STALL_PACK, p_stall::WAIT_SFPU));
-@@ -358,7 +418,11 @@ void kernel_main() {
+@@ -358,7 +405,11 @@ void kernel_main() {
      //-------------------------------------------------------------------------
      // Per-shape DRAM transaction size of both weight streams (moe_ring::tiles_per_txn_for_shape: 14, or 20)
      constexpr uint32_t txn_tiles = get_named_compile_time_arg_val("tiles_per_txn");
@@ -187,7 +174,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  
      // A block is 2 transactions: 28 tiles with 14-tile transactions, 40 with 20-tile ones
      constexpr uint32_t w0_w1_tiles_per_block = Cfg::tiles_per_block;
-@@ -466,13 +530,8 @@ void kernel_main() {
+@@ -466,13 +517,8 @@ void kernel_main() {
              const uint32_t w2_row_tiles = half_iter ? moe_ring::W2_HALF_A2A_ITER_TILES_W : w2_tiles_per_iter_w;
              const uint32_t w2_blocks_this_iter = half_iter ? Cfg::w2_blocks_per_half_a2a_iter : w2_blocks_per_a2a_iter;
              if (half_iter) {
@@ -203,7 +190,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
              }
              uint32_t src_core = ring_core_id;
              uint32_t dm1_tiles_remaining = shard_tiles_lut[ring_core_id];
-@@ -490,9 +549,40 @@ void kernel_main() {
+@@ -490,9 +536,15 @@ void kernel_main() {
              tile_regs_acquire();
  
              uint32_t w2_k_tracker = 0;
@@ -213,38 +200,13 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
                  for (uint32_t k = 0; k < w2_tiles_per_block; k += w2_row_tiles) {
 +                    if constexpr (column_scales) {
 +                        if (w2_row++ == Cfg::w2_scale_row) {
-+                            // The scale tile of the first two column tiles (their slots, read as the FLOAT16 tile
-+                            // they hold) times the next row, whose first slot of a pair holds the identity, and
-+                            // of the other two times the row after, whose second slot holds it: the DEST tiles
-+                            // after the outputs', as in compute_w0_w1_block_column.
-+                            matmul_block(
-+                                cb_r2c_w2_id,
-+                                cb_r2c_w2_id,
-+                                /*in0_index=*/k,
-+                                /*in1_index=*/k + w2_row_tiles,
-+                                /*idst=*/w2_row_tiles,
-+                                /*transpose=*/false,
-+                                /*ct_dim=*/w2_row_tiles,
-+                                /*rt_dim=*/1,
-+                                /*kt_dim=*/1);
-+                            if (!half_iter) {
-+                                matmul_block(
-+                                    cb_r2c_w2_id,
-+                                    cb_r2c_w2_id,
-+                                    /*in0_index=*/k + 2,
-+                                    /*in1_index=*/k + 2 * w2_row_tiles,
-+                                    /*idst=*/w2_row_tiles,
-+                                    /*transpose=*/false,
-+                                    /*ct_dim=*/w2_row_tiles,
-+                                    /*rt_dim=*/1,
-+                                    /*kt_dim=*/1);
-+                            }
++                            ::detail::matmul_scale_tiles(cb_r2c_w2_id, k, w2_row_tiles);
 +                        }
 +                    }
                      if constexpr (has_bias) {
                          if (w2_k_tracker == num_w2_tiles_h) {
                              // Bias addition: matmul(ones_tile, bias_row); padding K slots do not consume in2/dm1.
-@@ -545,7 +635,23 @@ void kernel_main() {
+@@ -545,7 +597,23 @@ void kernel_main() {
  
              tile_regs_commit();
  
@@ -269,7 +231,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
              pack_untilize_dest</*block_ct_dim=*/w2_tiles_per_iter_w, /*full_ct_dim=*/Cfg::w2_tiles_per_expert_w>(
                  cb_c2s_out_id, /*block_rt_dim=*/1, /*block_c_index=*/iter);
  
-@@ -600,8 +706,7 @@ void kernel_main() {
+@@ -600,8 +668,7 @@ void kernel_main() {
              }
  
              // Initialize matmul for W0
@@ -279,7 +241,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  
              // Wait for next chunk of tiles to arrive from the tilize cores
              // Min to allow tilize cores to send increment for second expert
-@@ -635,24 +740,21 @@ void kernel_main() {
+@@ -635,24 +702,21 @@ void kernel_main() {
                      Cfg::w0_w1_blocks_per_col,
                      w0_w1_tiles_per_block,
                      num_w0_w1_tiles_h,
@@ -310,7 +272,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
                      cb_s2c_in_id,
                      cb_r2c_w0_w1_id,
                      cb_c2c_ones_tile_id,
-@@ -660,8 +762,7 @@ void kernel_main() {
+@@ -660,8 +724,7 @@ void kernel_main() {
                      in0_index,
                      in2_base + prod_pair_tiles);
                  // Restore the 4-wide matmul for the W2 phase.
