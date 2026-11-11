@@ -528,24 +528,18 @@ def _fp8_experts(w13, w13_scale, w2, w2_scale):
     """FP8 experts as tt.fused_moe_ep takes them: `w13` ([experts, k, 2 * n],
     gate then up projections) and `w2` ([experts, n, k]) with an FP32 scale per
     expert and output column (or one per expert). Returns the gate, the up and
-    the down projections as their bits ([experts, k, n] twice and [experts, n,
-    k] uint8: the op reads them as they are, where the compiler would compute
-    on float8 values in FP32), then their scales ([experts, n] twice and
-    [experts, k] float32)."""
-    import jax
+    the down projections ([experts, k, n] twice and [experts, n, k]), then
+    their scales ([experts, n] twice and [experts, k] float32)."""
     import jax.numpy as jnp
 
     experts, k, gate_up = w13.shape
     n = gate_up // 2
 
-    def bits(weights):
-        return jax.lax.bitcast_convert_type(weights, jnp.uint8)
-
     def scales(scale, columns):
         return jnp.broadcast_to(scale.astype(jnp.float32).reshape(experts, -1), (experts, columns))
 
     scale13 = scales(w13_scale, gate_up)
-    return bits(w13[..., :n]), bits(w13[..., n:]), bits(w2), scale13[:, :n], scale13[:, n:], scales(w2_scale, k)
+    return w13[..., :n], w13[..., n:], w2, scale13[:, :n], scale13[:, n:], scales(w2_scale, k)
 
 
 def _fused_moe_jax(

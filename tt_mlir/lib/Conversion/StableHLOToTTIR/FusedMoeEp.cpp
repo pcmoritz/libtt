@@ -23,10 +23,10 @@
 // the (token, expert) pairs of the experts its device owns and writes each
 // pair's output unweighted.
 //
-// With weight_dtype = "fp8" the experts are float8_e4m3 values, as their bits
-// (ui8, as the compiler stores float8 tensors), which the kernel reads as they
-// are, and come with an FP32 scale per expert and output column, which it
-// applies:
+// With weight_dtype = "fp8" the experts are float8_e4m3fn, which the kernel
+// reads as they are (the compiler stores float8 tensors as their bytes, ui8,
+// and hands this call those), and come with an FP32 scale per expert and output
+// column, which it applies:
 //   s1, s3       [E_local, I] f32 the gate and up projections' scales,
 //   s2           [E_local, H] f32 and the down projections'.
 // This lowering chunks the tokens, builds
@@ -133,8 +133,9 @@ public:
           !isScale(adaptor.getOperands()[7], w1Type.getDimSize(2)) ||
           !isScale(adaptor.getOperands()[8], xType.getDimSize(1))) {
         return rewriter.notifyMatchFailure(
-            op, "tt.fused_moe_ep with float8 experts expects their bits and "
-                "f32 scales s1 and s3 [E_local, I] and s2 [E_local, H]");
+            op, "tt.fused_moe_ep with float8 experts expects float8_e4m3fn "
+                "experts and f32 scales s1 and s3 [E_local, I] and s2 "
+                "[E_local, H]");
       }
     }
     // The kernel reads int32 or uint16 ids.

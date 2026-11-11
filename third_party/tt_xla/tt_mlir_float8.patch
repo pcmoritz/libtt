@@ -205,7 +205,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
 new file mode 100644
 --- /dev/null
 +++ b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
-@@ -0,0 +1,545 @@
+@@ -0,0 +1,546 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -455,14 +455,15 @@ new file mode 100644
 +// Ops that only move values, which move the bits: data movement, Shardy's
 +// collectives and reshards (sdy.all_slice composites), and control flow (and
 +// shard_map's sdy.manual_computation), which carries them through its regions.
-+// Custom calls move them only as sharding annotations do: others, such as
-+// mhlo.topk, mhlo.erf or tt.sampling, compute on the values instead of
++// Custom calls move them only as sharding annotations do, and as
++// tt.fused_moe_ep does, whose kernel reads float8 experts as they are: others,
++// such as mhlo.topk, mhlo.erf or tt.sampling, compute on the values instead of
 +// comparing or adding their bits.
 +bool movesBits(Operation *op) {
 +  if (auto call = dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
 +    static constexpr StringLiteral targets[] = {
 +        "Sharding", "SPMDFullToShardShape", "SPMDShardToFullShape",
-+        "xla.sdy.FuncResultSharding"};
++        "xla.sdy.FuncResultSharding", "tt.fused_moe_ep"};
 +    return llvm::is_contained(targets, call.getCallTargetName());
 +  }
 +  if (auto composite = dyn_cast<mlir::stablehlo::CompositeOp>(op)) {
