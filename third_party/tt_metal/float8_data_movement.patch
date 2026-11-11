@@ -1,0 +1,399 @@
+diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+--- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
++++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
+@@ -19,6 +19,7 @@
+ #include "ttnn/operations/core/core.hpp"
+ #include "ttnn/tensor/tensor_ops.hpp"
+ #include "ttnn/types.hpp"
++#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
+ 
+ namespace ttnn::operations::core::CMAKE_UNIQUE_NAMESPACE {
+ namespace {
+@@ -96,6 +97,19 @@ Tensor to_layout_impl(
+             raw, layout, DataType::UINT16, memory_config, sub_core_grids, static_cast<float>(pad_bits));
+         return unchecked_reinterpret_dtype(converted, float_dtype);
+     }
++    // Float8 tensors move as their bytes (data_movement/common/float8_bytes.hpp).
++    if (operations::data_movement::is_float8_on_device(tensor_arg) &&
++        dtype.value_or(tensor_arg.dtype()) == tensor_arg.dtype()) {
++        using namespace operations::data_movement;
++        auto converted = to_layout_impl(
++            float8_as_bytes(tensor_arg),
++            layout,
++            DataType::UINT8,
++            memory_config,
++            sub_core_grids,
++            static_cast<float>(float8_code(pad_value, tensor_arg.dtype())));
++        return bytes_as_float8(converted, tensor_arg.dtype());
++    }
+ 
+     const std::set<ttnn::Layout> supported_layouts = {
+         ttnn::ROW_MAJOR_LAYOUT,
+diff --git ttnn/cpp/ttnn/operations/creation/creation.cpp ttnn/cpp/ttnn/operations/creation/creation.cpp
+--- ttnn/cpp/ttnn/operations/creation/creation.cpp
++++ ttnn/cpp/ttnn/operations/creation/creation.cpp
+@@ -8,6 +8,7 @@
+ #include <vector>
+ 
+ #include "ttnn/operations/eltwise/unary/unary.hpp"
++#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
+ 
+ namespace ttnn {
+ 
+@@ -184,6 +185,22 @@ Tensor full_impl(
+     MeshDevice* device,
+     const std::optional<MemoryConfig>& memory_config,
+     std::optional<Tensor> optional_output_tensor) {
++    // Float8 tensors on device hold the fill value's float8 code (data_movement/common/float8_bytes.hpp).
++    const DataType requested =
++        optional_output_tensor.has_value() ? optional_output_tensor->dtype() : dtype.value_or(DataType::BFLOAT16);
++    if (operations::data_movement::is_float8(requested) && (device != nullptr || optional_output_tensor.has_value())) {
++        using namespace operations::data_movement;
++        return bytes_as_float8(
++            full_impl(
++                shape,
++                static_cast<int>(float8_code(static_cast<float>(fill_value), requested)),
++                std::optional<DataType>(DataType::UINT8),
++                layout,
++                device,
++                memory_config,
++                float8_as_bytes(optional_output_tensor)),
++            requested);
++    }
+     MeshDevice* device_to_use = optional_output_tensor.has_value() ? optional_output_tensor->device() : device;
+ 
+     DataType dtype_value = optional_output_tensor.has_value() ? optional_output_tensor.value().dtype()
+diff --git ttnn/cpp/ttnn/operations/data_movement/common/float8_bytes.hpp ttnn/cpp/ttnn/operations/data_movement/common/float8_bytes.hpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/data_movement/common/float8_bytes.hpp
+@@ -0,0 +1,56 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <cstdint>
++#include <optional>
++#include <variant>
++
++#include <tt-metalium/float8.hpp>
++
++#include "ttnn/tensor/tensor.hpp"
++#include "ttnn/tensor/tensor_ops.hpp"
++#include "ttnn/tensor/types.hpp"
++
++namespace ttnn::operations::data_movement {
++
++// Float8 tensors (FP8_E4M3, FP8_E5M2) on device move as their bytes: a data-movement op runs its UINT8 path on a
++// view of them, which copies every byte as it is, and views its result as float8 again. The float8 formats' own
++// paths unpack the values, which the hardware converts inexactly (it truncates and flushes subnormals), or reject
++// them.
++inline bool is_float8(tt::tt_metal::DataType dtype) {
++    return dtype == tt::tt_metal::DataType::FP8_E4M3 || dtype == tt::tt_metal::DataType::FP8_E5M2;
++}
++
++inline bool is_float8_on_device(const Tensor& tensor) {
++    return is_float8(tensor.dtype()) && tensor.storage_type() == StorageType::DEVICE;
++}
++
++inline Tensor float8_as_bytes(const Tensor& tensor) {
++    return unchecked_reinterpret_dtype(tensor, tt::tt_metal::DataType::UINT8);
++}
++
++inline std::optional<Tensor> float8_as_bytes(const std::optional<Tensor>& tensor) {
++    return tensor.has_value() ? std::optional<Tensor>(float8_as_bytes(*tensor)) : std::nullopt;
++}
++
++inline Tensor bytes_as_float8(const Tensor& bytes, tt::tt_metal::DataType dtype) {
++    return unchecked_reinterpret_dtype(bytes, dtype);
++}
++
++// A pad or fill value's float8 code, rounded to nearest even.
++inline uint8_t float8_code(float value, tt::tt_metal::DataType dtype) {
++    return dtype == tt::tt_metal::DataType::FP8_E4M3 ? float8_e4m3(value).to_bits() : float8_e5m2(value).to_bits();
++}
++
++// A pad value for the bytes: a float becomes its float8 code; a uint32 is a code already.
++inline PadValue float8_pad(const PadValue& value, tt::tt_metal::DataType dtype) {
++    if (const float* f = std::get_if<float>(&value)) {
++        return static_cast<uint32_t>(float8_code(*f, dtype));
++    }
++    return value;
++}
++
++}  // namespace ttnn::operations::data_movement
+diff --git ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
+@@ -21,6 +21,7 @@
+ #include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
+ #include "ttnn/operations/data_movement/slice/slice.hpp"
+ #include "ttnn/operations/data_movement/slice/device/slice_device_operation.hpp"
++#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
+ 
+ #include <ranges>
+ #include <utility>
+@@ -270,6 +271,20 @@ ttnn::Tensor concat(
+     unsigned int groups,
+     const std::optional<ttnn::CoreRangeSet>& sub_core_grids) {
+     TT_FATAL(!input_tensors.empty(), "ttnn.concat: expected a non-empty list of Tensors!");
++    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
++    if (std::all_of(input_tensors.begin(), input_tensors.end(), [&](const ttnn::Tensor& t) {
++            return operations::data_movement::is_float8_on_device(t) && t.dtype() == input_tensors[0].dtype();
++        })) {
++        using namespace operations::data_movement;
++        std::vector<ttnn::Tensor> bytes;
++        bytes.reserve(input_tensors.size());
++        for (const auto& t : input_tensors) {
++            bytes.push_back(float8_as_bytes(t));
++        }
++        return bytes_as_float8(
++            ttnn::concat(bytes, dim, memory_config, float8_as_bytes(optional_output_tensor), groups, sub_core_grids),
++            input_tensors[0].dtype());
++    }
+     TT_FATAL(!optional_output_tensor.has_value(), "optional output tensor currently unsupported!");
+     TT_FATAL(groups > 0, "ttnn.concat: groups must be greater than 0");
+     const auto mem_config =
+diff --git ttnn/cpp/ttnn/operations/data_movement/copy/copy.cpp ttnn/cpp/ttnn/operations/data_movement/copy/copy.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/copy/copy.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/copy/copy.cpp
+@@ -8,12 +8,21 @@
+ 
+ #include "device/copy_device_operation.hpp"
+ #include "ttnn/operation.hpp"
++#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
+ 
+ using namespace tt::tt_metal;
+ 
+ namespace ttnn {
+ 
+ Tensor copy(const Tensor& src_tensor, const Tensor& dst_tensor) {
++    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
++    if (operations::data_movement::is_float8_on_device(src_tensor) && src_tensor.dtype() == dst_tensor.dtype()) {
++        using namespace operations::data_movement;
++        const Tensor dst_bytes = float8_as_bytes(dst_tensor);
++        ttnn::prim::copy(
++            float8_as_bytes(src_tensor), dst_bytes.memory_config(), DataType::UINT8, std::make_optional(dst_bytes));
++        return dst_tensor;
++    }
+     return ttnn::prim::copy(src_tensor, dst_tensor.memory_config(), dst_tensor.dtype(), std::make_optional(dst_tensor));
+ }
+ 
+diff --git ttnn/cpp/ttnn/operations/data_movement/permute/permute.cpp ttnn/cpp/ttnn/operations/data_movement/permute/permute.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/permute/permute.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/permute/permute.cpp
+@@ -14,6 +14,7 @@
+ #include "ttnn/operations/core/core.hpp"
+ #include "ttnn/operation.hpp"
+ #include "ttnn/operations/copy/typecast/typecast.hpp"
++#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
+ 
+ namespace ttnn::operations::data_movement::detail {
+ 
+@@ -212,6 +213,17 @@ ttnn::Tensor permute(
+     const ttsl::SmallVector<int64_t>& dims,
+     const std::optional<MemoryConfig>& memory_config,
+     float pad_value) {
++    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
++    if (operations::data_movement::is_float8_on_device(input_tensor)) {
++        using namespace operations::data_movement;
++        return bytes_as_float8(
++            ttnn::permute(
++                float8_as_bytes(input_tensor),
++                dims,
++                memory_config,
++                static_cast<float>(float8_code(pad_value, input_tensor.dtype()))),
++            input_tensor.dtype());
++    }
+     const auto input_rank = input_tensor.logical_shape().rank();
+     TT_FATAL(
+         input_rank == dims.size(),
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp
+@@ -34,6 +34,7 @@
+ #include "reshape.hpp"
+ #include "reshape_common.hpp"
+ #include "device/reshape_device_operation.hpp"
++#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
+ 
+ namespace ttnn::operations::data_movement {
+ namespace detail {
+@@ -571,6 +572,23 @@ ttnn::Tensor ttnn::reshape(
+     const TileReshapeMapMode reshape_map_mode,
+     const std::optional<CoreRangeSet>& sub_core_grid,
+     const bool skip_padding_fill) {
++    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
++    if (operations::data_movement::is_float8_on_device(tensor)) {
++        using namespace operations::data_movement;
++        const std::optional<PadValue> bytes_pad =
++            pad_value.has_value() ? std::optional<PadValue>(float8_pad(*pad_value, tensor.dtype())) : std::nullopt;
++        return bytes_as_float8(
++            ttnn::reshape(
++                float8_as_bytes(tensor),
++                logical_input_shape,
++                padded_input_shape,
++                memory_config,
++                bytes_pad,
++                reshape_map_mode,
++                sub_core_grid,
++                skip_padding_fill),
++            tensor.dtype());
++    }
+     MemoryConfig mem_config = memory_config.value_or(tensor.memory_config());
+     const bool explicit_memory_config = memory_config.has_value();
+     auto layout = tensor.layout();
+diff --git ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
+@@ -12,6 +12,7 @@
+ #include "ttnn/operations/data_movement/transpose/device/transpose_utils.hpp"
+ #include "ttnn/operations/creation/creation.hpp"
+ #include "ttnn/operations/core/core.hpp"
++#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
+ 
+ #include <tt-metalium/constants.hpp>
+ #include <tt-metalium/experimental/range_lockstep_allocation/memory_config.hpp>
+@@ -114,6 +115,23 @@ ttnn::Tensor slice(
+     const std::optional<float>& pad_value,
+     const std::optional<CoreRangeSet>& sub_core_grids) {
+     // Ensure start and end vectors have matching sizes and correct tensor rank
++    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
++    if (operations::data_movement::is_float8_on_device(input_tensor)) {
++        using namespace operations::data_movement;
++        const std::optional<float> bytes_pad =
++            pad_value.has_value() ? std::optional<float>(float8_code(*pad_value, input_tensor.dtype())) : std::nullopt;
++        return bytes_as_float8(
++            ttnn::slice<T>(
++                float8_as_bytes(input_tensor),
++                begins,
++                ends,
++                step,
++                memory_config_arg,
++                float8_as_bytes(optional_output_tensor),
++                bytes_pad,
++                sub_core_grids),
++            input_tensor.dtype());
++    }
+ 
+     const auto& input_shape = input_tensor.logical_shape();
+     uint32_t input_rank = input_shape.rank();
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
+@@ -8,6 +8,7 @@
+ #include "ttnn/operations/core/core.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
+ #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
++#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
+ 
+ #include <tt-metalium/hal.hpp>
+ #include <tt-logger/tt-logger.hpp>
+@@ -50,6 +51,21 @@ ttnn::Tensor tilize(
+     bool use_low_perf,
+     tt::tt_metal::Tile tile,
+     const std::optional<CoreRangeSet>& sub_core_grids) {
++    // Float8 tensors move as their bytes (common/float8_bytes.hpp), unless a conversion is asked for.
++    if (operations::data_movement::is_float8_on_device(input_tensor) &&
++        output_dtype.value_or(input_tensor.dtype()) == input_tensor.dtype()) {
++        using namespace operations::data_movement;
++        return bytes_as_float8(
++            ttnn::tilize(
++                float8_as_bytes(input_tensor),
++                memory_config,
++                DataType::UINT8,
++                use_multicore,
++                use_low_perf,
++                tile,
++                sub_core_grids),
++            input_tensor.dtype());
++    }
+     // A zero-volume input has nothing to tilize. Legacy tolerated the resulting empty program, but the
+     // Metal 2.0 spec validator rejects it (no work cores -> the output DFB has no producer), so
+     // short-circuit to a correctly-shaped empty output the way the sibling tilize_with_val_padding does.
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.cpp
+@@ -9,6 +9,7 @@
+ #include "ttnn/operations/data_movement/common/common.hpp"
+ #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
+ #include "ttnn/tensor/tensor_ops.hpp"
++#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
+ 
+ #include <tt-metalium/hal.hpp>
+ 
+@@ -73,6 +74,21 @@ ttnn::Tensor tilize_with_val_padding(
+     std::optional<DataType> output_dtype,
+     bool use_multicore,
+     const std::optional<CoreRangeSet>& sub_core_grids) {
++    // Float8 tensors move as their bytes (common/float8_bytes.hpp), unless a conversion is asked for.
++    if (operations::data_movement::is_float8_on_device(input_tensor) &&
++        output_dtype.value_or(input_tensor.dtype()) == input_tensor.dtype()) {
++        using namespace operations::data_movement;
++        return bytes_as_float8(
++            ttnn::tilize_with_val_padding(
++                float8_as_bytes(input_tensor),
++                output_padded_shape,
++                float8_pad(pad_value, input_tensor.dtype()),
++                memory_config,
++                DataType::UINT8,
++                use_multicore,
++                sub_core_grids),
++            input_tensor.dtype());
++    }
+     // FP8_E4M3 is ROW_MAJOR-only, so it can never be the TILE output dtype. When the caller doesn't
+     // request a specific output dtype, default an FP8 input to FLOAT32 (the format it unpacks to in
+     // DEST) so every downstream value_or() below resolves to a legal TILE dtype.
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
+@@ -13,6 +13,7 @@
+ #include "ttnn/operations/data_movement/common/common.hpp"
+ #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
+ #include "ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.hpp"
++#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
+ 
+ using namespace tt::tt_metal;
+ 
+@@ -159,6 +160,13 @@ ttnn::Tensor untilize(
+     const std::optional<MemoryConfig>& memory_config,
+     bool use_multicore,
+     const std::optional<CoreRangeSet>& sub_core_grids) {
++    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
++    if (operations::data_movement::is_float8_on_device(input_tensor)) {
++        using namespace operations::data_movement;
++        return bytes_as_float8(
++            ttnn::untilize(float8_as_bytes(input_tensor), memory_config, use_multicore, sub_core_grids),
++            input_tensor.dtype());
++    }
+     using ttnn::operations::data_movement::untilize_codegen::codegen_cb_plan_fits_live_l1;
+     using ttnn::operations::data_movement::untilize_codegen::is_demoted;
+     using ttnn::operations::data_movement::untilize_codegen::supported_by_codegen;
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp
+@@ -8,6 +8,7 @@
+ #include "ttnn/operations/data_movement/common/common.hpp"
+ #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
+ #include "ttnn/operations/data_movement/untilize_with_unpadding/device/untilize_with_unpadding_device_operation.hpp"
++#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
+ 
+ using namespace tt::tt_metal;
+ 
+@@ -77,6 +78,14 @@ Tensor untilize_with_unpadding(
+     const std::optional<MemoryConfig>& memory_config,
+     bool use_multicore,
+     const std::optional<CoreRangeSet>& sub_core_grids) {
++    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
++    if (operations::data_movement::is_float8_on_device(input_tensor)) {
++        using namespace operations::data_movement;
++        return bytes_as_float8(
++            ttnn::untilize_with_unpadding(
++                float8_as_bytes(input_tensor), output_tensor_end, memory_config, use_multicore, sub_core_grids),
++            input_tensor.dtype());
++    }
+     bool fp32_dest_acc_en = input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||
+                             input_tensor.dtype() == DataType::UINT8 ||
+                             input_tensor.dtype() == DataType::FLOAT32;
