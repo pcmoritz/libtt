@@ -2,7 +2,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/column_scale_sfpu.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,65 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -15,29 +15,20 @@ new file mode 100644
 +#include "sfpi.h"
 +
 +// Column scales of FP8 experts (moe_ring_common.h, COLUMN_SCALE_ROWS): a data tile in DEST times its columns'
-+// scales, whose terms sit in rows of a scale tile in another DEST tile.
++// scales, which sit in rows of a scale tile in another DEST tile, times 2^18 (COLUMN_SCALE_SHIFT).
 +//
 +// An SFPU load takes four rows of eight columns: load 2 * i of a face its rows 4 * i to 4 * i + 3 at the even
-+// columns, load 2 * i + 1 the same rows at the odd columns. The scale tile repeats each term over four rows, so
-+// load 2 * t + p of one of its faces holds term t of that face's even (p = 0) or odd (p = 1) columns in every row.
++// columns, load 2 * i + 1 the same rows at the odd columns. The scale tile repeats each scale over four rows, so
++// load 2 * slot + p of one of its faces holds the scales of a slot's even (p = 0) or odd (p = 1) columns of that
++// face in every row.
 +namespace moe_column_scale {
 +
-+// The scales that the two terms at the loads `first` and `first` + 2 from where DEST points make: the second is
-+// 2^-11 (COLUMN_SCALE_TERM_BITS) of the first, which is 2^-18 (COLUMN_SCALE_SHIFT). Their sum has 22 bits, which
-+// FP32 holds.
-+template <int32_t first>
-+inline sfpi::vFloat scales() {
-+    sfpi::vFloat scale = sfpi::dst_reg[first + 2];
-+    scale = scale * 0x1p-11f + sfpi::dst_reg[first];
-+    return scale * 0x1p-18f;
-+}
-+
-+// One face of the data tile, where DEST points, times its 16 columns' scales, whose terms start `first_term` loads
++// One face of the data tile, where DEST points, times its 16 columns' scales, the loads `scales` and `scales` + 1
 +// from here.
-+template <int32_t first_term>
++template <int32_t scales>
 +inline void scale_face() {
-+    sfpi::vFloat even = scales<first_term>();
-+    sfpi::vFloat odd = scales<first_term + 1>();
++    sfpi::vFloat even = sfpi::dst_reg[scales] * 0x1p-18f;
++    sfpi::vFloat odd = sfpi::dst_reg[scales + 1] * 0x1p-18f;
 +    for (int d = 0; d < 4; d++) {
 +        sfpi::vFloat value = sfpi::dst_reg[0];
 +        sfpi::dst_reg[0] = value * even;
@@ -49,16 +40,16 @@ new file mode 100644
 +}
 +
 +// DEST tile `data` times the scales of the scale tile at DEST tile `scale`: those of its pair's first (slot = 0)
-+// or second slot (slot = 1). Each face of the scale tile holds the terms of its 16 columns, the first slot's in
-+// its loads 0 to 3 and the second's in loads 4 to 7: every face of the data tile reads the same face of the scale
++// or second slot (slot = 1). Each face of the scale tile holds the scales of its 16 columns, the first slot's in
++// its loads 0 and 1 and the second's in loads 2 and 3: every face of the data tile reads the same face of the scale
 +// tile, whole tiles further on.
 +template <uint32_t data, uint32_t scale, int32_t slot>
 +inline void scale_columns() {
 +    constexpr int32_t tile = 32;  // a tile in loads
-+    constexpr int32_t terms = (static_cast<int32_t>(scale) - static_cast<int32_t>(data)) * tile + 4 * slot;
++    constexpr int32_t scales = (static_cast<int32_t>(scale) - static_cast<int32_t>(data)) * tile + 2 * slot;
 +    _llk_math_eltwise_sfpu_start_(data);
 +    for (int face = 0; face < 4; face++) {
-+        scale_face<terms>();
++        scale_face<scales>();
 +        _llk_math_eltwise_sfpu_inc_dst_face_addr_();
 +    }
 +    _llk_math_eltwise_sfpu_done_();
@@ -462,7 +453,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h
-@@ -339,6 +339,49 @@ constexpr uint32_t half_block_tiles_h(uint32_t tiles_per_txn) {
+@@ -339,6 +339,45 @@ constexpr uint32_t half_block_tiles_h(uint32_t tiles_per_txn) {
      return W0_W1_TXNS_PER_BLOCK * tiles_per_txn / W0_W1_HALF_BLOCK_TILES_W;
  }
  
@@ -475,21 +466,17 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
 +// and W1 slots in the W0/W1 stream and two column tiles next to each other in the W2 stream:
 +//   row column_scale_row    the pair's scale tile, a FLOAT16 tile's bytes over both slots (two FP8 pages), and
 +//   rows + 1 and + 2        the FP8 identity in the first slot, then in the second (zeros in the other slot).
-+// The scale tile holds each scale as two FLOAT16 terms of 11 bits: the value nearest to the scale, then the one
-+// nearest to what that leaves. Term i is times 2^(COLUMN_SCALE_SHIFT + i * COLUMN_SCALE_TERM_BITS), which keeps
-+// both normal FLOAT16 values for scales from 2^-20 up to 2^-2 (a term that would be subnormal is zero). That is
-+// the scale to 22 bits, more than the kernel's results keep. Each half of the tile, a slot's bytes, holds all of
-+// it: the first slot's columns' terms in rows 0 to 3 and 4 to 7 and the second slot's in rows 8 to 11 and 12 to
-+// 15, four rows each, which one SFPU load takes. A data tile's top and bottom faces then read their scales at
++// The scale tile holds each scale times 2^COLUMN_SCALE_SHIFT as the nearest FLOAT16 value: 11 bits, as many as
++// the gate/up results keep, for scales from 2^-32 up to just under 2^-2. Each half of the tile, a slot's bytes,
++// holds all of it: the first slot's columns' scales in rows 0 to 3 and the second slot's in rows 4 to 7, four rows
++// each, which one SFPU load takes. A data tile's top and bottom faces then read their scales at
 +// the same place in the scale tile's, which also holds where DEST's rows are remapped for untilizing (the W2
 +// phase): there an SFPU load does not reach from a tile's top faces to its bottom ones.
 +// The compute kernel multiplies the scale tile with the identity rows into spare DEST tiles (the matrix unit
 +// reads the scale tile as it reads activations) and scales the data tiles by its rows: the gate/up tiles before
 +// the activation, the W2 outputs before they are packed (column_scale_sfpu.h).
 +constexpr uint32_t COLUMN_SCALE_ROWS = 3;
-+constexpr uint32_t COLUMN_SCALE_TERMS = 2;
 +constexpr int32_t COLUMN_SCALE_SHIFT = 18;
-+constexpr int32_t COLUMN_SCALE_TERM_BITS = 11;
 +// The scale row of a stream of k_tiles K rows: the first row after them from which three rows are in one block.
 +constexpr uint32_t column_scale_row(uint32_t k_tiles, uint32_t tiles_per_txn) {
 +    const uint32_t rows = block_tiles_h(tiles_per_txn);
@@ -512,7 +499,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  // The per-shape DRAM transaction size (tiles) of both weight streams. 20 tiles only for the 2560/640 expert
  // (80/20 tiles, no bias) on the 8-core ring, where that layout has no padding (gate/up K 80 = 8 x 10, W2 K 20 =
  // 2 x 10, 10 blocks per bank, W2 a2a iterations 4 + 4 + a half); 14 tiles everywhere else. Other rings are not
-@@ -410,7 +453,8 @@ template <
+@@ -410,7 +449,8 @@ template <
      uint32_t num_cores,
      bool has_bias,
      uint32_t SharedExpertTp = 1,
@@ -522,7 +509,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  struct MoeRingConfig {
      // DRAM transaction geometry (both weight streams): a block is 2 transactions of tiles_per_txn tiles,
      // consumed 4 wide x block_tiles_h high (or 2 wide x half_block_tiles_h high for the half variants).
-@@ -423,7 +467,10 @@ struct MoeRingConfig {
+@@ -423,7 +463,10 @@ struct MoeRingConfig {
      static constexpr uint32_t weight_cb_slots = moe_ring::weight_cb_slots(tiles_per_txn);  // 3 (14- or 20-tile)
  
      // W0/W1
@@ -534,7 +521,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
      static constexpr uint32_t w0_w1_blocks_per_col = (w0_w1_dram_tiles_h + block_tiles_h - 1) / block_tiles_h;
      static constexpr uint32_t in2_tiles_per_step = a2a_exchange_tiles(Nt, num_cores);
  
-@@ -472,7 +519,8 @@ struct MoeRingConfig {
+@@ -472,7 +515,8 @@ struct MoeRingConfig {
      // output rows keep the w2_tiles_per_expert_w pitch: the half iteration still packs 4 DEST tiles, the two it does
      // not compute are zero (the packer clears the DEST half at every tile_regs_release) and dm1 copies only
      // w2_shard_tiles(c) tiles of each row.
@@ -769,46 +756,25 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
      const uint32_t w2_total_rows = num_layers * experts_per_device * num_cores * w2_core_rows;
      TT_FATAL(
          w2_total_rows % num_banks == 0,
-@@ -836,6 +845,274 @@ ttnn::Tensor prepare_w2_tensor_for_moe_compute(
+@@ -836,6 +845,252 @@ ttnn::Tensor prepare_w2_tensor_for_moe_compute(
      return result;
  }
  
 +namespace {
-+// The normal FLOAT16 value nearest to x: the largest one for larger values, zero for values below the smallest
-+// one. The packer and the unpacker flush subnormal values.
-+tt::tt_metal::float16 float16_nearest(float x) {
-+    using tt::tt_metal::float16;
-+    const uint16_t sign = std::signbit(x) ? 0x8000 : 0;
-+    if (!(std::fabs(x) >= 0x1p-14f)) {
-+        return float16(sign);
-+    }
-+    const float16 nearest(x);
-+    return std::isinf(static_cast<float>(nearest)) ? float16(static_cast<uint16_t>(sign | 0x7BFF)) : nearest;
-+}
-+
 +// A slot's half of its pair's scale tile (moe_ring_common.h, COLUMN_SCALE_ROWS) as the float8 tile that holds its
 +// bytes: `tile`, 32 rows of 32 bytes `stride` apart. The half is two FLOAT16 faces of 16 rows, the left and the
-+// right 16 columns', with the terms of the pair's first slot's scales in rows 0 to 7 and of its second slot's in
-+// rows 8 to 15, four rows per term. `scales[slot]` are a slot's 32 columns' FP32 scales, or null for a slot
-+// without columns.
++// right 16 columns', with the pair's first slot's scales in rows 0 to 3 and its second slot's in rows 4 to 7.
++// `scales[slot]` are a slot's 32 columns' FP32 scales, or null for a slot without columns.
 +void write_scale_half_tile(uint8_t* tile, size_t stride, const std::array<const float*, 2>& scales) {
 +    uint8_t raw[TILE_SIZE * TILE_SIZE] = {};
 +    for (uint32_t slot = 0; slot < 2; ++slot) {
 +        for (uint32_t column = 0; scales[slot] != nullptr && column < TILE_SIZE; ++column) {
-+            float rest = scales[slot][column];
-+            for (uint32_t term = 0; term < ::moe_ring::COLUMN_SCALE_TERMS; ++term) {
-+                // The FLOAT16 value nearest to what is left, which leaves the rest exactly.
-+                const int shift =
-+                    ::moe_ring::COLUMN_SCALE_SHIFT + static_cast<int>(term) * ::moe_ring::COLUMN_SCALE_TERM_BITS;
-+                const tt::tt_metal::float16 half = float16_nearest(std::ldexp(rest, shift));
-+                rest -= std::ldexp(static_cast<float>(half), -shift);
-+                const uint32_t face = column / (TILE_SIZE / 2);
-+                const uint32_t first_row = 4 * (::moe_ring::COLUMN_SCALE_TERMS * slot + term);
-+                for (uint32_t row = first_row; row < first_row + 4; ++row) {
-+                    uint8_t* bytes = raw + face * 512 + row * TILE_SIZE + (column % 16) * 2;
-+                    bytes[0] = static_cast<uint8_t>(half.bits);
-+                    bytes[1] = static_cast<uint8_t>(half.bits >> 8);
-+                }
++            const tt::tt_metal::float16 scale(std::ldexp(scales[slot][column], ::moe_ring::COLUMN_SCALE_SHIFT));
++            const uint32_t face = column / (TILE_SIZE / 2);
++            for (uint32_t row = 4 * slot; row < 4 * slot + 4; ++row) {
++                uint8_t* bytes = raw + face * 512 + row * TILE_SIZE + (column % 16) * 2;
++                bytes[0] = static_cast<uint8_t>(scale.bits);
++                bytes[1] = static_cast<uint8_t>(scale.bits >> 8);
 +            }
 +        }
 +    }
@@ -820,9 +786,8 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +    }
 +}
 +
-+// FP8 experts' column scales, (L, E, columns) FLOAT32 on device, on host and row-major. The scale tile's terms
-+// hold finite scales up to the largest FLOAT16 times 2^-COLUMN_SCALE_SHIFT in magnitude; a larger one would
-+// saturate, so it is refused. Smaller scales keep fewer bits: 11 below 2^-20, none below 2^-32.
++// FP8 experts' column scales, (L, E, columns) FLOAT32 on device, on host and row-major. The scale tile holds
++// finite scales up to the largest FLOAT16 times 2^-COLUMN_SCALE_SHIFT in magnitude; a larger one is refused.
 +ttnn::Tensor column_scales_on_host(const ttnn::Tensor& scales, uint32_t L, uint32_t E, uint32_t columns) {
 +    TT_FATAL(
 +        scales.logical_shape() == ttnn::Shape({L, E, columns}) && scales.dtype() == ttnn::DataType::FLOAT32,
