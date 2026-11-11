@@ -176,7 +176,8 @@ TEST_F(Float8DataMovementTest, PadValues) {
     }
 }
 
-// A preallocated output must have the input's float8 type: the bytes alone would let another one through.
+// A preallocated output must have the input's type: slice copies bytes, which another float8 format reads as
+// other values.
 TEST_F(Float8DataMovementTest, SliceOutputType) {
     const auto x = bytes(ttnn::Shape({64, 96}), Layout::ROW_MAJOR);
     const auto out = ttnn::bitcast(slice(x, {0, 0}, {32, 32}), DataType::FP8_E5M2);

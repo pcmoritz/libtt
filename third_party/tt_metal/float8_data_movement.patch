@@ -1,34 +1,3 @@
-diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
---- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
-+++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
-@@ -19,6 +19,7 @@
- #include "ttnn/operations/core/core.hpp"
- #include "ttnn/tensor/tensor_ops.hpp"
- #include "ttnn/types.hpp"
-+#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
- 
- namespace ttnn::operations::core::CMAKE_UNIQUE_NAMESPACE {
- namespace {
-@@ -96,6 +97,19 @@ Tensor to_layout_impl(
-             raw, layout, DataType::UINT16, memory_config, sub_core_grids, static_cast<float>(pad_bits));
-         return unchecked_reinterpret_dtype(converted, float_dtype);
-     }
-+    // Float8 tensors move as their bytes (data_movement/common/float8_bytes.hpp).
-+    if (operations::data_movement::is_float8_on_device(tensor_arg) &&
-+        dtype.value_or(tensor_arg.dtype()) == tensor_arg.dtype()) {
-+        using namespace operations::data_movement;
-+        auto converted = to_layout_impl(
-+            float8_as_bytes(tensor_arg),
-+            layout,
-+            DataType::UINT8,
-+            memory_config,
-+            sub_core_grids,
-+            static_cast<float>(float8_code(pad_value, tensor_arg.dtype())));
-+        return bytes_as_float8(converted, tensor_arg.dtype());
-+    }
- 
-     const std::set<ttnn::Layout> supported_layouts = {
-         ttnn::ROW_MAJOR_LAYOUT,
 diff --git ttnn/cpp/ttnn/operations/creation/creation.cpp ttnn/cpp/ttnn/operations/creation/creation.cpp
 --- ttnn/cpp/ttnn/operations/creation/creation.cpp
 +++ ttnn/cpp/ttnn/operations/creation/creation.cpp
@@ -36,38 +5,60 @@ diff --git ttnn/cpp/ttnn/operations/creation/creation.cpp ttnn/cpp/ttnn/operatio
  #include <vector>
  
  #include "ttnn/operations/eltwise/unary/unary.hpp"
-+#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
++#include "ttnn/operations/data_movement/common/float8.hpp"
  
  namespace ttnn {
  
-@@ -184,6 +185,22 @@ Tensor full_impl(
-     MeshDevice* device,
-     const std::optional<MemoryConfig>& memory_config,
-     std::optional<Tensor> optional_output_tensor) {
-+    // Float8 tensors on device hold the fill value's float8 code (data_movement/common/float8_bytes.hpp).
-+    const DataType requested =
-+        optional_output_tensor.has_value() ? optional_output_tensor->dtype() : dtype.value_or(DataType::BFLOAT16);
-+    if (operations::data_movement::is_float8(requested) && (device != nullptr || optional_output_tensor.has_value())) {
-+        using namespace operations::data_movement;
-+        return bytes_as_float8(
-+            full_impl(
-+                shape,
-+                static_cast<int>(float8_code(static_cast<float>(fill_value), requested)),
-+                std::optional<DataType>(DataType::UINT8),
-+                layout,
-+                device,
-+                memory_config,
-+                float8_as_bytes(optional_output_tensor)),
-+            requested);
-+    }
-     MeshDevice* device_to_use = optional_output_tensor.has_value() ? optional_output_tensor->device() : device;
+@@ -231,9 +232,25 @@ Tensor full_impl(
+             return output;
+         }
+         case DataType::FP8_E4M3:
+-            TT_THROW(
+-                "full/zeros/ones: FP8_E4M3 is an output-only dtype, used exclusively by the DeepSeek V3 "
+-                "prefill combine and dispatch ops; host-side construction via fill is not supported.");
++        case DataType::FP8_E5M2: {
++            // The fill value's code, as libtt's exact typecast encodes it (the host's float8_e4m3 flushes
++            // subnormals and saturates).
++            const uint8_t code =
++                operations::data_movement::float8_code(static_cast<float>(fill_value), dtype_value);
++            auto fill = [&]<typename Float8>(Float8 value) {
++                const tt::tt_metal::TensorSpec spec(
++                    shape_value, TensorLayout(dtype_value, PageConfig(layout_value), MemoryConfig{}));
++                std::vector<Float8> values(spec.physical_shape().height() * spec.physical_shape().width(), value);
++                Tensor host(tt::tt_metal::HostBuffer(std::move(values)), shape_value, dtype_value, layout_value);
++                if (optional_output_tensor.has_value()) {
++                    copy_to_device(host, *optional_output_tensor);
++                    return *optional_output_tensor;
++                }
++                return device_to_use != nullptr ? host.to_device(device_to_use, mem_cfg) : host;
++            };
++            return dtype_value == DataType::FP8_E4M3 ? fill(float8_e4m3::from_bits(code))
++                                                     : fill(float8_e5m2::from_bits(code));
++        }
+         default: TT_THROW("Unsupported DataType!");
+     }
+ }
+diff --git ttnn/cpp/ttnn/operations/data_movement/common/common.hpp ttnn/cpp/ttnn/operations/data_movement/common/common.hpp
+--- ttnn/cpp/ttnn/operations/data_movement/common/common.hpp
++++ ttnn/cpp/ttnn/operations/data_movement/common/common.hpp
+@@ -31,6 +31,12 @@ inline tt::DataFormat data_movement_format(DataType dtype) {
+     return tt::tt_metal::datatype_to_dataformat_converter(dtype);
+ }
  
-     DataType dtype_value = optional_output_tensor.has_value() ? optional_output_tensor.value().dtype()
-diff --git ttnn/cpp/ttnn/operations/data_movement/common/float8_bytes.hpp ttnn/cpp/ttnn/operations/data_movement/common/float8_bytes.hpp
++// The format of a tensor of this dtype in an op that copies it to `other`, or converts it when that is another
++// dtype (tilize to Bfp8_b, untilize Bfp8_b to BFloat16, ...).
++inline tt::DataFormat data_movement_format(DataType dtype, DataType other) {
++    return dtype == other ? data_movement_format(dtype) : tt::tt_metal::datatype_to_dataformat_converter(dtype);
++}
++
+ ttnn::Shape squeeze_shape_to_ND(const ttnn::Shape& output_shape, uint32_t);
+ ttnn::Shape squeeze_shape_to_4D(const ttnn::Shape& output_shape);
+ ttnn::Shape squeeze_shape_to_3D(const ttnn::Shape& output_shape);
+diff --git ttnn/cpp/ttnn/operations/data_movement/common/float8.hpp ttnn/cpp/ttnn/operations/data_movement/common/float8.hpp
 new file mode 100644
 --- /dev/null
-+++ ttnn/cpp/ttnn/operations/data_movement/common/float8_bytes.hpp
-@@ -0,0 +1,101 @@
++++ ttnn/cpp/ttnn/operations/data_movement/common/float8.hpp
+@@ -0,0 +1,82 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -77,37 +68,19 @@ new file mode 100644
 +#include <cmath>
 +#include <cstdint>
 +#include <limits>
-+#include <optional>
 +#include <variant>
 +
-+#include "ttnn/tensor/tensor.hpp"
-+#include "ttnn/tensor/tensor_ops.hpp"
++#include <tt-metalium/float8.hpp>
++
 +#include "ttnn/tensor/types.hpp"
 +
 +namespace ttnn::operations::data_movement {
 +
-+// Float8 tensors (FP8_E4M3, FP8_E5M2) on device move as their bytes: a data-movement op runs its UINT8 path on a
-+// view of them, which copies every byte as it is, and views its result as float8 again. The float8 formats' own
-+// paths unpack the values, which the hardware converts inexactly (it truncates and flushes subnormals), or reject
-+// them.
++// Float8 (FP8_E4M3, FP8_E5M2) tensors move as their bytes (data_movement_format): these give their fill and pad
++// values' bytes.
++
 +inline bool is_float8(tt::tt_metal::DataType dtype) {
 +    return dtype == tt::tt_metal::DataType::FP8_E4M3 || dtype == tt::tt_metal::DataType::FP8_E5M2;
-+}
-+
-+inline bool is_float8_on_device(const Tensor& tensor) {
-+    return is_float8(tensor.dtype()) && tensor.storage_type() == StorageType::DEVICE;
-+}
-+
-+inline Tensor float8_as_bytes(const Tensor& tensor) {
-+    return unchecked_reinterpret_dtype(tensor, tt::tt_metal::DataType::UINT8);
-+}
-+
-+inline std::optional<Tensor> float8_as_bytes(const std::optional<Tensor>& tensor) {
-+    return tensor.has_value() ? std::optional<Tensor>(float8_as_bytes(*tensor)) : std::nullopt;
-+}
-+
-+inline Tensor bytes_as_float8(const Tensor& bytes, tt::tt_metal::DataType dtype) {
-+    return unchecked_reinterpret_dtype(bytes, dtype);
 +}
 +
 +// A float8 code's value, exactly: subnormals, infinities and NaNs included (the host's float8_e4m3 flushes
@@ -131,8 +104,8 @@ new file mode 100644
 +    return (code & 0x80) ? -value : value;
 +}
 +
-+// A pad or fill value's float8 code, as libtt's exact typecast encodes it: rounded to nearest even, subnormal
-+// results kept, and past the largest finite value the overflow code, NaN for e4m3 and infinity for e5m2. The host's
++// A value's float8 code, as libtt's exact typecast encodes it: rounded to nearest even, subnormal results kept,
++// and past the largest finite value the overflow code, NaN for e4m3 and infinity for e5m2. The host's
 +// float8_e4m3 flushes subnormals and saturates instead.
 +inline uint8_t float8_code(float value, tt::tt_metal::DataType dtype) {
 +    const uint8_t sign = std::signbit(value) ? 0x80 : 0;
@@ -162,289 +135,919 @@ new file mode 100644
 +    return sign | static_cast<uint8_t>(nearest);
 +}
 +
-+// A pad value's float8 code: a uint32 pad is a number, as for the other floating-point types.
-+inline PadValue float8_pad(const PadValue& value, tt::tt_metal::DataType dtype) {
-+    const float number = std::visit([](auto v) { return static_cast<float>(v); }, value);
-+    return static_cast<uint32_t>(float8_code(number, dtype));
++// A pad value's float8 code: a uint32 pad value is a number, as for the other floating-point types.
++inline uint8_t float8_code(const PadValue& value, tt::tt_metal::DataType dtype) {
++    return float8_code(std::visit([](auto v) { return static_cast<float>(v); }, value), dtype);
 +}
 +
 +}  // namespace ttnn::operations::data_movement
-diff --git ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
---- ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
-@@ -21,6 +21,7 @@
- #include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
- #include "ttnn/operations/data_movement/slice/slice.hpp"
- #include "ttnn/operations/data_movement/slice/device/slice_device_operation.hpp"
-+#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
- 
- #include <ranges>
- #include <utility>
-@@ -270,6 +271,20 @@ ttnn::Tensor concat(
-     unsigned int groups,
-     const std::optional<ttnn::CoreRangeSet>& sub_core_grids) {
-     TT_FATAL(!input_tensors.empty(), "ttnn.concat: expected a non-empty list of Tensors!");
-+    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
-+    if (std::all_of(input_tensors.begin(), input_tensors.end(), [&](const ttnn::Tensor& t) {
-+            return operations::data_movement::is_float8_on_device(t) && t.dtype() == input_tensors[0].dtype();
-+        })) {
-+        using namespace operations::data_movement;
-+        std::vector<ttnn::Tensor> bytes;
-+        bytes.reserve(input_tensors.size());
-+        for (const auto& t : input_tensors) {
-+            bytes.push_back(float8_as_bytes(t));
-+        }
-+        return bytes_as_float8(
-+            ttnn::concat(bytes, dim, memory_config, float8_as_bytes(optional_output_tensor), groups, sub_core_grids),
-+            input_tensors[0].dtype());
-+    }
-     TT_FATAL(!optional_output_tensor.has_value(), "optional output tensor currently unsupported!");
-     TT_FATAL(groups > 0, "ttnn.concat: groups must be greater than 0");
-     const auto mem_config =
-diff --git ttnn/cpp/ttnn/operations/data_movement/copy/copy.cpp ttnn/cpp/ttnn/operations/data_movement/copy/copy.cpp
---- ttnn/cpp/ttnn/operations/data_movement/copy/copy.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/copy/copy.cpp
-@@ -8,12 +8,21 @@
- 
- #include "device/copy_device_operation.hpp"
- #include "ttnn/operation.hpp"
-+#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
- 
- using namespace tt::tt_metal;
- 
- namespace ttnn {
- 
- Tensor copy(const Tensor& src_tensor, const Tensor& dst_tensor) {
-+    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
-+    if (operations::data_movement::is_float8_on_device(src_tensor) && src_tensor.dtype() == dst_tensor.dtype()) {
-+        using namespace operations::data_movement;
-+        const Tensor dst_bytes = float8_as_bytes(dst_tensor);
-+        ttnn::prim::copy(
-+            float8_as_bytes(src_tensor), dst_bytes.memory_config(), DataType::UINT8, std::make_optional(dst_bytes));
-+        return dst_tensor;
-+    }
-     return ttnn::prim::copy(src_tensor, dst_tensor.memory_config(), dst_tensor.dtype(), std::make_optional(dst_tensor));
- }
- 
-diff --git ttnn/cpp/ttnn/operations/data_movement/permute/permute.cpp ttnn/cpp/ttnn/operations/data_movement/permute/permute.cpp
---- ttnn/cpp/ttnn/operations/data_movement/permute/permute.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/permute/permute.cpp
-@@ -14,6 +14,7 @@
- #include "ttnn/operations/core/core.hpp"
- #include "ttnn/operation.hpp"
- #include "ttnn/operations/copy/typecast/typecast.hpp"
-+#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
- 
- namespace ttnn::operations::data_movement::detail {
- 
-@@ -212,6 +213,17 @@ ttnn::Tensor permute(
-     const ttsl::SmallVector<int64_t>& dims,
-     const std::optional<MemoryConfig>& memory_config,
-     float pad_value) {
-+    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
-+    if (operations::data_movement::is_float8_on_device(input_tensor)) {
-+        using namespace operations::data_movement;
-+        return bytes_as_float8(
-+            ttnn::permute(
-+                float8_as_bytes(input_tensor),
-+                dims,
-+                memory_config,
-+                static_cast<float>(float8_code(pad_value, input_tensor.dtype()))),
-+            input_tensor.dtype());
-+    }
-     const auto input_rank = input_tensor.logical_shape().rank();
+diff --git ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/copy/device/copy_device_operation.cpp
+@@ -83,8 +83,8 @@ void CopyDeviceOperation::validate_on_program_cache_miss(
+             input_tensor_a.dtype() == DataType::FLOAT32 or input_tensor_a.dtype() == DataType::BFLOAT4_B or
+             input_tensor_a.dtype() == DataType::UINT32 or input_tensor_a.dtype() == DataType::INT32 or
+             input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::UINT8 or
+-            input_tensor_a.dtype() == DataType::FP8_E4M3,
+-        "ttnn.copy only supports float, bfloat, fp8_e4m3, int32, uint32, uint16 and uint8 inputs but got {}",
++            input_tensor_a.dtype() == DataType::FP8_E4M3 or input_tensor_a.dtype() == DataType::FP8_E5M2,
++        "ttnn.copy only supports float, bfloat, fp8_e4m3, fp8_e5m2, int32, uint32, uint16 and uint8 inputs but got {}",
+         input_tensor_a.dtype());
      TT_FATAL(
-         input_rank == dims.size(),
-diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp
---- ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/reshape.cpp
-@@ -34,6 +34,7 @@
- #include "reshape.hpp"
- #include "reshape_common.hpp"
- #include "device/reshape_device_operation.hpp"
-+#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
+         operation_attributes.output_dtype == DataType::BFLOAT16 or
+@@ -95,8 +95,10 @@ void CopyDeviceOperation::validate_on_program_cache_miss(
+             operation_attributes.output_dtype == DataType::INT32 or
+             operation_attributes.output_dtype == DataType::UINT16 or
+             operation_attributes.output_dtype == DataType::UINT8 or
+-            operation_attributes.output_dtype == DataType::FP8_E4M3,
+-        "ttnn.copy only supports float, bfloat, fp8_e4m3, int32, uint32, uint16 and uint8 output tensors but got {}",
++            operation_attributes.output_dtype == DataType::FP8_E4M3 or
++            operation_attributes.output_dtype == DataType::FP8_E5M2,
++        "ttnn.copy only supports float, bfloat, fp8_e4m3, fp8_e5m2, int32, uint32, uint16 and uint8 output tensors but "
++        "got {}",
+         operation_attributes.output_dtype);
+     TT_FATAL(input_tensor_a.storage_type() == StorageType::DEVICE, "Operands to copy need to be on device!");
+     TT_FATAL(input_tensor_a.buffer() != nullptr, "Operands to copy need to be allocated in buffers on device!");
+diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/permute/device/permute_tiled_program_factory.cpp
+@@ -11,6 +11,7 @@
+ #include <tt-metalium/experimental/metal2_host_api/program_run_args.hpp>
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
++#include "ttnn/operations/data_movement/common/float8.hpp"
  
  namespace ttnn::operations::data_movement {
- namespace detail {
-@@ -571,6 +572,23 @@ ttnn::Tensor ttnn::reshape(
-     const TileReshapeMapMode reshape_map_mode,
-     const std::optional<CoreRangeSet>& sub_core_grid,
-     const bool skip_padding_fill) {
-+    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
-+    if (operations::data_movement::is_float8_on_device(tensor)) {
-+        using namespace operations::data_movement;
-+        const std::optional<PadValue> bytes_pad =
-+            pad_value.has_value() ? std::optional<PadValue>(float8_pad(*pad_value, tensor.dtype())) : std::nullopt;
-+        return bytes_as_float8(
-+            ttnn::reshape(
-+                float8_as_bytes(tensor),
-+                logical_input_shape,
-+                padded_input_shape,
-+                memory_config,
-+                bytes_pad,
-+                reshape_map_mode,
-+                sub_core_grid,
-+                skip_padding_fill),
-+            tensor.dtype());
-+    }
-     MemoryConfig mem_config = memory_config.value_or(tensor.memory_config());
-     const bool explicit_memory_config = memory_config.has_value();
-     auto layout = tensor.layout();
-diff --git ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
---- ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp
-@@ -12,6 +12,7 @@
- #include "ttnn/operations/data_movement/transpose/device/transpose_utils.hpp"
- #include "ttnn/operations/creation/creation.hpp"
- #include "ttnn/operations/core/core.hpp"
-+#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
  
- #include <tt-metalium/constants.hpp>
- #include <tt-metalium/experimental/range_lockstep_allocation/memory_config.hpp>
-@@ -114,6 +115,29 @@ ttnn::Tensor slice(
-     const std::optional<float>& pad_value,
-     const std::optional<CoreRangeSet>& sub_core_grids) {
-     // Ensure start and end vectors have matching sizes and correct tensor rank
-+    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
-+    if (operations::data_movement::is_float8_on_device(input_tensor)) {
-+        using namespace operations::data_movement;
-+        // The byte views below would let another dtype's output through.
+@@ -711,6 +712,11 @@ ttnn::device_operation::ProgramArtifacts PermuteDeviceOperation::MultiCoreTiledG
+             case DataType::UINT8:
+                 padding_val_packed = static_cast<uint32_t>(static_cast<uint8_t>(pad_value)) * 0x01010101U;
+                 break;
++            case DataType::FP8_E4M3:
++            case DataType::FP8_E5M2:
++                padding_val_packed =
++                    static_cast<uint32_t>(float8_code(pad_value, input_tensor.dtype())) * 0x01010101U;
++                break;
+             default:
+                 padding_val_packed = 0;
+                 TT_ASSERT(
+diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_device_operation.cpp
+@@ -26,7 +26,8 @@ void ReshapeViewDeviceOperation::validate_on_program_cache_miss(
+         input_tensor_a.dtype() == DataType::BFLOAT16 or input_tensor_a.dtype() == DataType::UINT32 or
+             input_tensor_a.dtype() == DataType::FLOAT32 or input_tensor_a.dtype() == DataType::FLOAT16 or
+             input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::INT32 or
+-            input_tensor_a.dtype() == DataType::UINT8,
++            input_tensor_a.dtype() == DataType::UINT8 or input_tensor_a.dtype() == DataType::FP8_E4M3 or
++            input_tensor_a.dtype() == DataType::FP8_E5M2,
+         "Unsupported dtype {}", input_tensor_a.dtype());
+ }
+ 
+diff --git ttnn/cpp/ttnn/operations/data_movement/slice/device/slice_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/slice/device/slice_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/slice/device/slice_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/slice/device/slice_device_operation.cpp
+@@ -146,6 +146,13 @@ void SliceDeviceOperation::validate_on_program_cache_miss(
+     if (tensor_args.preallocated_output.has_value()) {
+         const auto spec_required = compute_output_specs(args, tensor_args);
+         const auto& out_tensor = tensor_args.preallocated_output.value();
++        // Slice copies values: an output of another type, a float8 one of the other format for instance, would
++        // reinterpret them.
 +        TT_FATAL(
-+            !optional_output_tensor.has_value() || optional_output_tensor->dtype() == input_tensor.dtype(),
-+            "slice: the preallocated output is {}, the input {}",
-+            optional_output_tensor.has_value() ? optional_output_tensor->dtype() : input_tensor.dtype(),
-+            input_tensor.dtype());
-+        const std::optional<float> bytes_pad =
-+            pad_value.has_value() ? std::optional<float>(float8_code(*pad_value, input_tensor.dtype())) : std::nullopt;
-+        return bytes_as_float8(
-+            ttnn::slice<T>(
-+                float8_as_bytes(input_tensor),
-+                begins,
-+                ends,
-+                step,
-+                memory_config_arg,
-+                float8_as_bytes(optional_output_tensor),
-+                bytes_pad,
-+                sub_core_grids),
-+            input_tensor.dtype());
-+    }
- 
-     const auto& input_shape = input_tensor.logical_shape();
-     uint32_t input_rank = input_shape.rank();
-diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
---- ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/tilize/tilize.cpp
-@@ -8,6 +8,7 @@
- #include "ttnn/operations/core/core.hpp"
- #include "ttnn/operations/data_movement/common/common.hpp"
- #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
-+#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
- 
++            out_tensor.dtype() == spec_required.data_type(),
++            "The preallocated output tensor needs dtype {}, however it is {}",
++            spec_required.data_type(),
++            out_tensor.dtype());
+         // Padded, not logical: ttnn::slice pads the tile-path ends up to a tile boundary before
+         // calling here and views the result back down afterwards, so the caller's tensor legitimately
+         // carries a smaller logical shape than the spec. That licence is tile-only; see below.
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_device_operation.cpp
+@@ -16,6 +16,7 @@
  #include <tt-metalium/hal.hpp>
- #include <tt-logger/tt-logger.hpp>
-@@ -50,6 +51,21 @@ ttnn::Tensor tilize(
-     bool use_low_perf,
-     tt::tt_metal::Tile tile,
-     const std::optional<CoreRangeSet>& sub_core_grids) {
-+    // Float8 tensors move as their bytes (common/float8_bytes.hpp), unless a conversion is asked for.
-+    if (operations::data_movement::is_float8_on_device(input_tensor) &&
-+        output_dtype.value_or(input_tensor.dtype()) == input_tensor.dtype()) {
-+        using namespace operations::data_movement;
-+        return bytes_as_float8(
-+            ttnn::tilize(
-+                float8_as_bytes(input_tensor),
-+                memory_config,
-+                DataType::UINT8,
-+                use_multicore,
-+                use_low_perf,
-+                tile,
-+                sub_core_grids),
-+            input_tensor.dtype());
-+    }
-     // A zero-volume input has nothing to tilize. Legacy tolerated the resulting empty program, but the
-     // Metal 2.0 spec validator rejects it (no work cores -> the output DFB has no producer), so
-     // short-circuit to a correctly-shaped empty output the way the sibling tilize_with_val_padding does.
+ #include "ttnn/operations/core/work_split/work_split_tilize.hpp"
+ #include "ttnn/tensor/tensor_ops.hpp"
++#include "ttnn/operations/data_movement/common/float8.hpp"
+ #include <tt-metalium/host_api.hpp>
+ using namespace tt::tt_metal;
+ 
+@@ -204,9 +205,9 @@ void TilizeDeviceOperation::validate_on_program_cache_miss(
+         input_tensor_a.dtype() == DataType::BFLOAT16 or input_tensor_a.dtype() == DataType::FLOAT32 or
+             input_tensor_a.dtype() == DataType::UINT32 or input_tensor_a.dtype() == DataType::INT32 or
+             input_tensor_a.dtype() == DataType::UINT16 or input_tensor_a.dtype() == DataType::UINT8 or
+-            input_tensor_a.dtype() == DataType::FLOAT16 or
+-            input_tensor_a.dtype() == DataType::FP8_E4M3,
+-        "data type must be bfloat16, float16, float32, uint32, int32, uint16, uint8, or fp8_e4m3");
++            input_tensor_a.dtype() == DataType::FLOAT16 or input_tensor_a.dtype() == DataType::FP8_E4M3 or
++            input_tensor_a.dtype() == DataType::FP8_E5M2,
++        "data type must be bfloat16, float16, float32, uint32, int32, uint16, uint8, fp8_e4m3 or fp8_e5m2");
+     // On Quasar, wide multicore FLOAT32 tilize hangs because fp32 unpack-to-DEST is not implemented.
+     // Reject the affected route before launch. Callers can cast to BFLOAT16 or use
+     // ttnn.experimental.quasar.tilize instead.
+@@ -217,13 +218,13 @@ void TilizeDeviceOperation::validate_on_program_cache_miss(
+         "unimplemented and the wide multicore tilize hangs. Cast the input to BFLOAT16 before tilizing, or use "
+         "ttnn.experimental.quasar.tilize.",
+         width / tile_width);
+-    // fp8 tile INPUT unpacks to fp32 in DEST and packs to any float TILE format. Reject non-float outputs:
+-    // fp8 itself is ROW_MAJOR-only, and integer outputs are meaningless for a float input.
+-    {
++    // A float8 tensor tilizes into float8 tiles as its bytes (data_movement_format). Converted to another
++    // format, fp8 tile INPUT unpacks to fp32 in DEST and packs to any float TILE format: reject non-float
++    // outputs, which are meaningless for a float input.
++    if (input_tensor_a.dtype() != operation_attributes.output_dtype) {
+         const DataType out_dt = operation_attributes.output_dtype;
+-        // Valid TILE float output = a float dtype other than FP8_E4M3 (which is itself ROW_MAJOR-only).
+         TT_FATAL(
+-            input_tensor_a.dtype() != DataType::FP8_E4M3 || (is_floating_point(out_dt) && out_dt != DataType::FP8_E4M3),
++            input_tensor_a.dtype() != DataType::FP8_E4M3 || is_floating_point(out_dt),
+             "FP8_E4M3 input to tilize requires a float TILE output (FLOAT32, BFLOAT16, BFLOAT8_B, or BFLOAT4_B)");
+         // The Blackhole 8-bit unpack-tilize path corrupts odd rows when the block is a single column
+         // tile (ct_dim == 1, i.e. one tile per row); wider outputs are correct. Reject the broken
+@@ -324,8 +325,11 @@ TilizeDeviceOperation::program_factory_t TilizeDeviceOperation::select_program_f
+     // an alignment-aware staging buffer (c_1) that handles this correctly.
+     // Route all non-sharded UINT8 inputs on Blackhole here regardless of use_multicore;
+     // the combination was broken before this fix so overriding the single-core hint is safe.
+-    if (input_tensor_a.device()->arch() == tt::ARCH::BLACKHOLE && input_tensor_a.dtype() == DataType::UINT8 &&
+-        !input_tensor_a.memory_config().is_sharded()) {
++    // Float8 tensors tilize as their bytes, like UINT8 (data_movement_format).
++    const bool bytes = input_tensor_a.dtype() == DataType::UINT8 ||
++                       (operations::data_movement::is_float8(input_tensor_a.dtype()) &&
++                        operation_attributes.output_dtype == input_tensor_a.dtype());
++    if (input_tensor_a.device()->arch() == tt::ARCH::BLACKHOLE && bytes && !input_tensor_a.memory_config().is_sharded()) {
+         return ttnn::prim::TilizeMultiCoreBlockProgramFactory{};
+     }
+ 
+@@ -404,11 +408,7 @@ ttnn::Tensor tilize(
+     return ttnn::device_operation::launch<TilizeDeviceOperation>(
+         TilizeParams{
+             .output_mem_config = output_mem_config.value_or(input_tensor.memory_config()),
+-            // FP8_E4M3 is ROW_MAJOR-only, so it can never be the TILE output dtype. When the caller
+-            // doesn't request a specific output dtype, default an FP8 input to FLOAT32 (the format it
+-            // unpacks to in DEST) instead of echoing the illegal FP8 dtype.
+-            .output_dtype = output_dtype.value_or(
+-                input_tensor.dtype() == DataType::FP8_E4M3 ? DataType::FLOAT32 : input_tensor.dtype()),
++            .output_dtype = output_dtype.value_or(input_tensor.dtype()),
+             .use_multicore = use_multicore,
+             .enough_space_height = enough_space_height,
+             .use_low_perf = use_low_perf,
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
+@@ -40,16 +40,16 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreBlockProgramFactory::cre
+     const uint32_t tile_width = operation_attributes.tile.get_width();
+     const uint32_t tile_height = operation_attributes.tile.get_height();
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = operation_attributes.tile.get_tile_size(input_data_format);
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = operation_attributes.tile.get_tile_size(output_data_format);
+ 
+     // UInt8 requires fp32 dest acc on Blackhole: hardware promotes 8-bit integers to 32-bit in
+     // dest but keeps them as integers (not float), so the output buffer stays as UInt8 (not Float32).
+-    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+-                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B ||
+-                        a.dtype() == DataType::UINT8;
++    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || input_data_format == tt::DataFormat::Fp8_e4m3 ||
++                        output_data_format == tt::DataFormat::Fp8_e4m3 || output.dtype() == DataType::BFLOAT8_B ||
++                        input_data_format == tt::DataFormat::UInt8;
+ 
+     const uint32_t tile_hw = operation_attributes.tile.get_tile_hw();
+     const uint32_t dram_alignment = tt::tt_metal::hal::get_dram_alignment();
+@@ -293,7 +293,7 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreBlockProgramFactory::cre
+         // fp32 unpack is marked for exactly the buffer this kernel reads. UInt8 uses 32-bit dest as
+         // integer (not float): do not enable FP32 unpack-to-dest mode.
+         ComputeHardwareConfig compute_cfg{.enable_32_bit_dest = fp32_llk_acc};
+-        if (fp32_llk_acc && a.dtype() != DataType::UINT8) {
++        if (fp32_llk_acc && input_data_format != tt::DataFormat::UInt8) {
+             compute_cfg.unpack_modes.insert({in_dfb_of(set), UnpackMode::UnpackToDest});
+         }
+ 
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_default_program_factory.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -30,13 +31,13 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
+     const uint32_t tile_width = operation_attributes.tile.get_width();
+     const uint32_t tile_height = operation_attributes.tile.get_height();
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = operation_attributes.tile.get_tile_size(input_data_format);
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = operation_attributes.tile.get_tile_size(output_data_format);
+-    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+-                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B ||
+-                        a.dtype() == DataType::UINT8;
++    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || input_data_format == tt::DataFormat::Fp8_e4m3 ||
++                        output_data_format == tt::DataFormat::Fp8_e4m3 || output.dtype() == DataType::BFLOAT8_B ||
++                        input_data_format == tt::DataFormat::UInt8;
+ 
+     Buffer* src0_buffer = a.buffer();
+     Buffer* dst_buffer = output.buffer();
+@@ -160,7 +161,7 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreDefaultProgramFactory::c
+         ComputeHardwareConfig compute_cfg;
+         compute_cfg.enable_32_bit_dest = fp32_llk_acc;
+         // UInt8 uses 32-bit dest as integer (not float): do not enable FP32 unpack-to-dest mode.
+-        if (fp32_llk_acc && a.dtype() != DataType::UINT8) {
++        if (fp32_llk_acc && input_data_format != tt::DataFormat::UInt8) {
+             compute_cfg.unpack_modes.emplace(INPUT_DFB, UnpackMode::UnpackToDest);
+         }
+         // Quasar gets only the common fields set above; WH/BH use compute_cfg as is.
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_retile_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_retile_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_retile_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_retile_program_factory.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -53,8 +54,8 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreRetileProgramFactory::cr
+         !a.is_sharded() && output.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
+         "Retile program factory currently supports interleaved input/output only");
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t input_single_tile_size = input_tile.get_tile_size(input_data_format);
+     uint32_t output_single_tile_size = output_tile.get_tile_size(output_data_format);
+     const uint32_t mid_page_size = input_single_tile_size;
+@@ -62,8 +63,8 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreRetileProgramFactory::cr
+     // the consumer view sizes an output tile in the input format, not the output format.
+     const uint32_t out_tile_size_input_fmt = output_tile.get_tile_size(input_data_format);
+ 
+-    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+-                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B;
++    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || input_data_format == tt::DataFormat::Fp8_e4m3 ||
++                        output_data_format == tt::DataFormat::Fp8_e4m3 || output.dtype() == DataType::BFLOAT8_B;
+ 
+     TT_FATAL(a.buffer() != nullptr, "Input buffer should be allocated on device!");
+     TT_FATAL(output.buffer() != nullptr, "Output buffer should be allocated on device!");
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_program_factory.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -26,13 +27,13 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreShardedProgramFactory::c
+     const Tensor& output = tensor_return_value;
+     const uint32_t tile_width = operation_attributes.tile.get_width();
+     const uint32_t tile_hw = operation_attributes.tile.get_tile_hw();
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(input.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(input.dtype(), output.dtype());
+     uint32_t input_single_tile_size = operation_attributes.tile.get_tile_size(input_data_format);
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), input.dtype());
+     uint32_t output_single_tile_size = operation_attributes.tile.get_tile_size(output_data_format);
+-    bool fp32_llk_acc = input.dtype() == DataType::FLOAT32 || input.dtype() == DataType::FP8_E4M3 ||
+-                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B ||
+-                        input.dtype() == DataType::UINT8;
++    bool fp32_llk_acc = input.dtype() == DataType::FLOAT32 || input_data_format == tt::DataFormat::Fp8_e4m3 ||
++                        output_data_format == tt::DataFormat::Fp8_e4m3 || output.dtype() == DataType::BFLOAT8_B ||
++                        input_data_format == tt::DataFormat::UInt8;
+ 
+     auto shard_spec = input.shard_spec().value();
+     uint32_t num_tiles_per_shard = shard_spec.shape[0] * shard_spec.shape[1] / tile_hw;
+@@ -131,7 +132,7 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreShardedProgramFactory::c
+ 
+     ComputeHardwareConfig compute_cfg;
+     compute_cfg.enable_32_bit_dest = fp32_llk_acc;
+-    if (fp32_llk_acc && input.dtype() != DataType::UINT8) {
++    if (fp32_llk_acc && input_data_format != tt::DataFormat::UInt8) {
+         compute_cfg.unpack_modes.emplace(INPUT_DFB, UnpackMode::UnpackToDest);
+     }
+     // Quasar gets only the common fields set above; WH/BH use compute_cfg as is.
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_retile_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_retile_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_retile_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_sharded_retile_program_factory.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -71,8 +72,8 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreShardedRetileProgramFact
+         shard_height,
+         out_tile_height);
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     const uint32_t input_single_tile_size = input_tile.get_tile_size(input_data_format);
+     const uint32_t output_single_tile_size = output_tile.get_tile_size(output_data_format);
+     const uint32_t mid_page_size = input_single_tile_size;
+@@ -80,8 +81,8 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreShardedRetileProgramFact
+     // consumer view sizes an output tile in the input format, not the output format.
+     const uint32_t out_tile_size_input_fmt = output_tile.get_tile_size(input_data_format);
+ 
+-    const bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+-                              output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B;
++    const bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || input_data_format == tt::DataFormat::Fp8_e4m3 ||
++                              output_data_format == tt::DataFormat::Fp8_e4m3 || output.dtype() == DataType::BFLOAT8_B;
+ 
+     TT_FATAL(a.buffer() != nullptr, "Input buffer should be allocated on device!");
+     TT_FATAL(output.buffer() != nullptr, "Output buffer should be allocated on device!");
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_single_core_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_single_core_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_single_core_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_single_core_program_factory.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -35,17 +36,17 @@ ttnn::device_operation::ProgramArtifacts TilizeSingleCoreProgramFactory::create_
+ 
+     TT_FATAL(output.buffer() != nullptr, "Output buffer should be allocated on device!");
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = operation_attributes.tile.get_tile_size(input_data_format);
+ 
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = operation_attributes.tile.get_tile_size(output_data_format);
+ 
+     // UInt8 requires fp32 dest acc on Blackhole: hardware promotes 8-bit integers to 32-bit in
+     // dest but keeps them as integers (not float), so the output DFB stays as UInt8 (not Float32).
+-    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+-                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B ||
+-                        a.dtype() == DataType::UINT8;
++    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || input_data_format == tt::DataFormat::Fp8_e4m3 ||
++                        output_data_format == tt::DataFormat::Fp8_e4m3 || output.dtype() == DataType::BFLOAT8_B ||
++                        input_data_format == tt::DataFormat::UInt8;
+ 
+     uint32_t num_tiles = a.physical_volume() / tile_hw;
+ 
+@@ -154,7 +155,7 @@ ttnn::device_operation::ProgramArtifacts TilizeSingleCoreProgramFactory::create_
+     ComputeHardwareConfig compute_cfg;
+     compute_cfg.enable_32_bit_dest = fp32_llk_acc;
+     // UInt8 uses 32-bit dest as integer (not float): do not enable FP32 unpack-to-dest mode.
+-    if (fp32_llk_acc && a.dtype() != DataType::UINT8) {
++    if (fp32_llk_acc && input_data_format != tt::DataFormat::UInt8) {
+         compute_cfg.unpack_modes.emplace(INPUT_DFB, UnpackMode::UnpackToDest);
+     }
+ 
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.cpp
+@@ -10,6 +10,7 @@
+ #include <tt-metalium/float8.hpp>
+ #include "ttnn/tensor/types.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
++#include "ttnn/operations/data_movement/common/float8.hpp"
+ using namespace tt::tt_metal;
+ 
+ namespace ttnn::prim::detail {
+@@ -47,9 +48,8 @@ uint32_t get_packed_value(const Tensor& tensor, const PadValue& pad_value) {
+                 if (tensor.dtype() == DataType::INT32) {
+                     return std::bit_cast<uint32_t>(static_cast<int32_t>(pad_value));
+                 }
+-                if (tensor.dtype() == DataType::FP8_E4M3) {  // 4 fp8 bytes per word
+-                    const float8_e4m3 v(static_cast<float>(pad_value));
+-                    return pack_four_float8_e4m3_into_uint32(v, v, v, v);
++                if (operations::data_movement::is_float8(tensor.dtype())) {  // 4 float8 codes per word
++                    return pack_uint8_pad(operations::data_movement::float8_code(pad_value, tensor.dtype()));
+                 }
+                 TT_FATAL(
+                     tensor.dtype() == DataType::UINT32, "only supporting bfloat16, float32, and uint32/int32/uint16");
+@@ -73,9 +73,8 @@ uint32_t get_packed_value(const Tensor& tensor, const PadValue& pad_value) {
+                 if (tensor.dtype() == DataType::UINT8) {
+                     return pack_uint8_pad(pad_value);
+                 }
+-                if (tensor.dtype() == DataType::FP8_E4M3) {  // 4 fp8 bytes per word
+-                    const float8_e4m3 v(static_cast<float>(pad_value));
+-                    return pack_four_float8_e4m3_into_uint32(v, v, v, v);
++                if (operations::data_movement::is_float8(tensor.dtype())) {  // 4 float8 codes per word
++                    return pack_uint8_pad(operations::data_movement::float8_code(pad_value, tensor.dtype()));
+                 }
+                 TT_FATAL(
+                     tensor.dtype() == DataType::FLOAT32 or tensor.dtype() == DataType::INT32 or
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
+@@ -67,14 +67,14 @@ ttnn::device_operation::ProgramArtifacts TilizeWithValPaddingMultiCoreBlockInter
+     constexpr const char* COMPUTE_SRC =
+         "ttnn/cpp/ttnn/operations/data_movement/tilize/device/kernels/compute/tilize_wh.cpp";
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_data_format);
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_data_format);
+ 
+-    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+-                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B ||
+-                        a.dtype() == DataType::UINT8;
++    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || input_data_format == tt::DataFormat::Fp8_e4m3 ||
++                        output_data_format == tt::DataFormat::Fp8_e4m3 || output.dtype() == DataType::BFLOAT8_B ||
++                        input_data_format == tt::DataFormat::UInt8;
+ 
+     MeshDevice* device = a.device();
+     CoreCoord grid_size = device->compute_with_storage_grid_size();
+@@ -297,7 +297,7 @@ ttnn::device_operation::ProgramArtifacts TilizeWithValPaddingMultiCoreBlockInter
+         // only the bound set's input keeps the validator from rejecting an entry for a DFB the kernel
+         // does not bind (the other set's input, which may not exist on any core).
+         ComputeHardwareConfig compute_cfg{.enable_32_bit_dest = fp32_llk_acc};
+-        if (fp32_llk_acc && a.dtype() != DataType::UINT8) {
++        if (fp32_llk_acc && input_data_format != tt::DataFormat::UInt8) {
+             compute_cfg.unpack_modes.insert({in_dfb_of(set), UnpackMode::UnpackToDest});
+         }
+ 
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_default_program_factory.cpp
+@@ -13,6 +13,7 @@
+ #include <tt-metalium/work_split.hpp>
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -24,13 +25,13 @@ ttnn::device_operation::ProgramArtifacts TilizeWithValPaddingMultiCoreDefaultFac
+     const TilizeWithValPaddingParams& operation_attributes, const Tensor& input_tensor, Tensor& tensor_return_value) {
+     const Tensor& a = input_tensor;
+     const Tensor& output = tensor_return_value;
+-    tt::DataFormat input_dfb_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_dfb_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_dfb_data_format);
+-    tt::DataFormat output_dfb_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_dfb_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_dfb_data_format);
+ 
+-    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+-                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B;
++    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || input_dfb_data_format == tt::DataFormat::Fp8_e4m3 ||
++                        output_dfb_data_format == tt::DataFormat::Fp8_e4m3 || output.dtype() == DataType::BFLOAT8_B;
+ 
+     MeshDevice* device = a.device();
+     CoreCoord grid_size = device->compute_with_storage_grid_size();
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_sharded_program_factory.cpp
+@@ -12,6 +12,7 @@
+ #include <tt-metalium/work_split.hpp>
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -27,13 +28,13 @@ ttnn::device_operation::ProgramArtifacts TilizeWithValPaddingMultiCoreShardedFac
+     bool src_sharded = a.memory_config().is_sharded();
+     bool out_sharded = output.memory_config().is_sharded();
+ 
+-    tt::DataFormat input_dfb_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_dfb_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_dfb_data_format);
+-    tt::DataFormat output_dfb_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_dfb_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_dfb_data_format);
+ 
+-    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+-                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B;
++    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || input_dfb_data_format == tt::DataFormat::Fp8_e4m3 ||
++                        output_dfb_data_format == tt::DataFormat::Fp8_e4m3 || output.dtype() == DataType::BFLOAT8_B;
+ 
+     auto input_shard_spec = a.shard_spec().value();
+     auto output_shard_spec = output.shard_spec().value();
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_single_core_program_factory.cpp
+@@ -12,6 +12,7 @@
+ #include <tt-metalium/work_split.hpp>
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_factory_helper.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -28,14 +29,14 @@ ttnn::device_operation::ProgramArtifacts TilizeWithValPaddingSingleCoreFactory::
+     CoreRange core = sub_core_grids.has_value() ? corerange_to_cores(sub_core_grids.value()).at(0) : default_core;
+     CoreRangeSet core_ranges{core};
+ 
+-    tt::DataFormat input_dfb_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_dfb_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_dfb_data_format);
+ 
+-    tt::DataFormat output_dfb_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_dfb_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_dfb_data_format);
+ 
+-    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || a.dtype() == DataType::FP8_E4M3 ||
+-                        output.dtype() == DataType::FP8_E4M3 || output.dtype() == DataType::BFLOAT8_B;
++    bool fp32_llk_acc = a.dtype() == DataType::FLOAT32 || input_dfb_data_format == tt::DataFormat::Fp8_e4m3 ||
++                        output_dfb_data_format == tt::DataFormat::Fp8_e4m3 || output.dtype() == DataType::BFLOAT8_B;
+ 
+     int32_t num_tiles = output.physical_volume() / TILE_HW;
+ 
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/tilize_with_val_padding_device_operation.cpp
+@@ -8,6 +8,7 @@
+ #include <tt-metalium/hal.hpp>
+ #include <tt-metalium/constants.hpp>
+ #include "ttnn/operations/core/work_split/work_split_tilize.hpp"
++#include "ttnn/operations/data_movement/common/float8.hpp"
+ 
+ using namespace tt::tt_metal;
+ using namespace tt::constants;
+@@ -49,7 +50,11 @@ TilizeWithValPaddingDeviceOperation::program_factory_t TilizeWithValPaddingDevic
+         }
+         return TilizeWithValPaddingMultiCoreDefaultFactory{};
+     }
+-    if (input_tensor.device()->arch() == tt::ARCH::BLACKHOLE && input_tensor.dtype() == DataType::UINT8) {
++    // Float8 tensors tilize as their bytes, like UINT8 (data_movement_format).
++    const bool bytes = input_tensor.dtype() == DataType::UINT8 ||
++                       (operations::data_movement::is_float8(input_tensor.dtype()) &&
++                        operation_attributes.output_dtype == input_tensor.dtype());
++    if (input_tensor.device()->arch() == tt::ARCH::BLACKHOLE && bytes) {
+         return TilizeWithValPaddingMultiCoreBlockInterleavedFactory{};
+     }
+     if (!operation_attributes.enough_space_height) {
+@@ -96,15 +101,16 @@ void TilizeWithValPaddingDeviceOperation::validate_on_program_cache_miss(
+         input_tensor.dtype() == DataType::BFLOAT16 or input_tensor.dtype() == DataType::INT32 or
+             input_tensor.dtype() == DataType::UINT32 or input_tensor.dtype() == DataType::FLOAT32 or
+             input_tensor.dtype() == DataType::UINT8 or input_tensor.dtype() == DataType::UINT16 or
+-            input_tensor.dtype() == DataType::FLOAT16 or input_tensor.dtype() == DataType::FP8_E4M3,
++            input_tensor.dtype() == DataType::FLOAT16 or input_tensor.dtype() == DataType::FP8_E4M3 or
++            input_tensor.dtype() == DataType::FP8_E5M2,
+         "Unsupported input dtype for tilize_with_val_padding");
+-    // fp8 tile INPUT unpacks to fp32 in DEST and packs to any float TILE format. Reject non-float outputs:
+-    // fp8 itself is ROW_MAJOR-only, and integer outputs are meaningless for a float input.
+-    if (input_tensor.dtype() == DataType::FP8_E4M3) {
+-        // Valid TILE float output = a float dtype other than FP8_E4M3 (which is itself ROW_MAJOR-only).
++    // A float8 tensor tilizes into float8 tiles as its bytes (data_movement_format). Converted to another
++    // format, fp8 tile INPUT unpacks to fp32 in DEST and packs to any float TILE format: reject non-float
++    // outputs, which are meaningless for a float input.
++    if (input_tensor.dtype() == DataType::FP8_E4M3 && operation_attributes.output_dtype != input_tensor.dtype()) {
+         const DataType out_dt = operation_attributes.output_dtype;
+         TT_FATAL(
+-            is_floating_point(out_dt) && out_dt != DataType::FP8_E4M3,
++            is_floating_point(out_dt),
+             "FP8_E4M3 input to tilize requires a float TILE output (FLOAT32, BFLOAT16, BFLOAT8_B, or BFLOAT4_B)");
+         // The Blackhole 8-bit unpack-tilize path corrupts odd rows when the output block is a single
+         // column tile (ct_dim == 1, i.e. one tile per row); wider outputs are correct. Reject the broken
+@@ -239,11 +245,7 @@ Tensor tilize_with_val_padding(
+             .output_padded_shape = output_padded_shape,
+             .pad_value = pad_value,
+             .output_mem_config = output_mem_config.value_or(input_tensor.memory_config()),
+-            // FP8_E4M3 is ROW_MAJOR-only, so it can never be the TILE output dtype. When the caller
+-            // doesn't request a specific output dtype, default an FP8 input to FLOAT32 (the format it
+-            // unpacks to in DEST) instead of echoing the illegal FP8 dtype.
+-            .output_dtype = output_dtype.value_or(
+-                input_tensor.dtype() == DataType::FP8_E4M3 ? DataType::FLOAT32 : input_tensor.dtype()),
++            .output_dtype = output_dtype.value_or(input_tensor.dtype()),
+             .use_multicore = use_multicore,
+             .enough_space_width = enough_space_width,
+             .enough_space_height = enough_space_height,
 diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.cpp
-@@ -9,6 +9,7 @@
- #include "ttnn/operations/data_movement/common/common.hpp"
- #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
- #include "ttnn/tensor/tensor_ops.hpp"
-+#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
- 
- #include <tt-metalium/hal.hpp>
- 
-@@ -73,6 +74,21 @@ ttnn::Tensor tilize_with_val_padding(
+@@ -73,13 +73,6 @@ ttnn::Tensor tilize_with_val_padding(
      std::optional<DataType> output_dtype,
      bool use_multicore,
      const std::optional<CoreRangeSet>& sub_core_grids) {
-+    // Float8 tensors move as their bytes (common/float8_bytes.hpp), unless a conversion is asked for.
-+    if (operations::data_movement::is_float8_on_device(input_tensor) &&
-+        output_dtype.value_or(input_tensor.dtype()) == input_tensor.dtype()) {
-+        using namespace operations::data_movement;
-+        return bytes_as_float8(
-+            ttnn::tilize_with_val_padding(
-+                float8_as_bytes(input_tensor),
-+                output_padded_shape,
-+                float8_pad(pad_value, input_tensor.dtype()),
-+                memory_config,
-+                DataType::UINT8,
-+                use_multicore,
-+                sub_core_grids),
-+            input_tensor.dtype());
-+    }
-     // FP8_E4M3 is ROW_MAJOR-only, so it can never be the TILE output dtype. When the caller doesn't
-     // request a specific output dtype, default an FP8 input to FLOAT32 (the format it unpacks to in
-     // DEST) so every downstream value_or() below resolves to a legal TILE dtype.
+-    // FP8_E4M3 is ROW_MAJOR-only, so it can never be the TILE output dtype. When the caller doesn't
+-    // request a specific output dtype, default an FP8 input to FLOAT32 (the format it unpacks to in
+-    // DEST) so every downstream value_or() below resolves to a legal TILE dtype.
+-    if (!output_dtype.has_value() && input_tensor.dtype() == DataType::FP8_E4M3) {
+-        output_dtype = DataType::FLOAT32;
+-    }
+-
+     if (input_tensor.layout() == Layout::TILE) {
+         return input_tensor;
+     }
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_block_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_block_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_block_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_block_program_factory.cpp
+@@ -64,9 +64,9 @@ ttnn::device_operation::ProgramArtifacts UntilizeMultiCoreBlockProgramFactory::c
+     constexpr const char* COMPUTE_SRC =
+         "ttnn/cpp/ttnn/operations/data_movement/untilize/device/kernels/compute/untilize_wh_metal2.cpp";
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_data_format);
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_data_format);
+ 
+     const auto& input_shape = a.padded_shape();
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_input_and_output_nd_shard_type_and_shard_spec_identical_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_input_and_output_nd_shard_type_and_shard_spec_identical_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_input_and_output_nd_shard_type_and_shard_spec_identical_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_input_and_output_nd_shard_type_and_shard_spec_identical_program_factory.cpp
+@@ -5,6 +5,7 @@
+ #include "untilize_multi_core_input_and_output_nd_shard_type_and_shard_spec_identical_program_factory.hpp"
+ 
+ #include "ttnn/common/constants.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ #include <tt-metalium/buffer_distribution_spec.hpp>
+ #include <tt-metalium/constants.hpp>
+@@ -25,9 +26,9 @@ ProgramDescriptor UntilizeMultiCoreInputAndOutputNDShardTypeAndShardSpecIdentica
+     const Tensor& output = tensor_return_value;
+     const auto& fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en;
+ 
+-    tt::DataFormat input_cb_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_cb_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_cb_data_format);
+-    tt::DataFormat output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_cb_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_cb_data_format);
+ 
+     Buffer* src0_buffer = a.buffer();
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_input_and_output_shard_type_and_shard_spec_identical_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_input_and_output_shard_type_and_shard_spec_identical_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_input_and_output_shard_type_and_shard_spec_identical_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_input_and_output_shard_type_and_shard_spec_identical_program_factory.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "ttnn/common/constants.hpp"
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ #include <tt-metalium/constants.hpp>
+ #include <tt-metalium/allocator.hpp>
+@@ -40,9 +41,9 @@ UntilizeMultiCoreInputAndOutputShardTypeAndShardSpecIdenticalProgramFactory::cre
+     constexpr const char* COMPUTE_SRC =
+         "ttnn/cpp/ttnn/operations/data_movement/untilize/device/kernels/compute/untilize_metal2.cpp";
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_data_format);
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_data_format);
+ 
+     TT_FATAL(output.buffer() != nullptr, "Output buffer should be allocated on device!");
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_nd_shard_input_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_nd_shard_input_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_nd_shard_input_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_nd_shard_input_program_factory.cpp
+@@ -9,6 +9,7 @@
+ #include "ttnn/operations/core/work_split/work_split_tilize.hpp"
+ #include "ttnn/operations/data_movement/untilize/device/untilize_device_operation.hpp"
+ #include "ttnn/tensor/tensor_utils.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ #include <tt-metalium/buffer_distribution_spec.hpp>
+ #include <tt-metalium/constants.hpp>
+@@ -47,9 +48,9 @@ ttnn::device_operation::ProgramArtifacts UntilizeMultiCoreNDShardInputProgramFac
+         "ttnn/cpp/ttnn/operations/data_movement/untilize/device/kernels/compute/"
+         "untilize_variable_num_blocks_metal2.cpp";
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_data_format);
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_data_format);
+ 
+     TT_FATAL(output.buffer() != nullptr, "Output buffer should be allocated on device!");
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_parallelize_column_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_parallelize_column_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_parallelize_column_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_parallelize_column_program_factory.cpp
+@@ -8,6 +8,7 @@
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/core/work_split/work_split_tilize.hpp"
+ #include "ttnn/operations/data_movement/untilize/device/untilize_device_operation.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ #include <tt-metalium/constants.hpp>
+ #include <tt-metalium/allocator.hpp>
+@@ -44,9 +45,9 @@ ttnn::device_operation::ProgramArtifacts UntilizeMultiCoreParallelizeColumnProgr
+     constexpr const char* COMPUTE_SRC =
+         "ttnn/cpp/ttnn/operations/data_movement/untilize/device/kernels/compute/untilize_metal2.cpp";
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_data_format);
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_data_format);
+ 
+     MeshDevice* device = a.device();
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_program_factory.cpp
+@@ -14,6 +14,7 @@
+ #include <tt-metalium/buffer_distribution_spec.hpp>
+ #include "untilize_multi_core_program_factory.hpp"
+ #include "ttnn/operations/data_movement/untilize/device/untilize_device_operation.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -50,9 +51,9 @@ ttnn::device_operation::ProgramArtifacts UntilizeMultiCoreProgramFactory::create
+         "ttnn/cpp/ttnn/operations/data_movement/untilize/device/kernels/compute/"
+         "untilize_variable_num_blocks_metal2.cpp";
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_data_format);
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_data_format);
+ 
+     MeshDevice* device = a.device();
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_sub_core_grids_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_sub_core_grids_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_sub_core_grids_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_multi_core_sub_core_grids_program_factory.cpp
+@@ -12,6 +12,7 @@
+ #include <tt-metalium/allocator.hpp>
+ #include "untilize_multi_core_sub_core_grids_program_factory.hpp"
+ #include "ttnn/operations/data_movement/untilize/device/untilize_device_operation.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -44,9 +45,9 @@ ttnn::device_operation::ProgramArtifacts UntilizeMultiCoreSubCoreGridsProgramFac
+     constexpr const char* COMPUTE_SRC =
+         "ttnn/cpp/ttnn/operations/data_movement/untilize/device/kernels/compute/untilize_metal2.cpp";
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_data_format);
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_data_format);
+ 
+     uint32_t ntiles = a.physical_volume() / TILE_HW;
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_single_core_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_single_core_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_single_core_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize/device/factories/untilize_single_core_program_factory.cpp
+@@ -12,6 +12,7 @@
+ #include <tt-metalium/work_split.hpp>
+ #include <tt-metalium/allocator.hpp>
+ #include "untilize_single_core_program_factory.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -48,9 +49,9 @@ ttnn::device_operation::ProgramArtifacts UntilizeSingleCoreProgramFactory::creat
+ 
+     const CoreCoord node{0, 0};
+ 
+-    tt::DataFormat input_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_data_format);
+-    tt::DataFormat output_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_data_format);
+ 
+     TT_ASSERT(output.buffer() != nullptr, "Output buffer should be allocated on device!");
 diff --git ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/untilize/untilize.cpp
-@@ -13,6 +13,7 @@
- #include "ttnn/operations/data_movement/common/common.hpp"
- #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
- #include "ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.hpp"
-+#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
+@@ -65,6 +65,8 @@ ttnn::Tensor untilize_native(
+     }
+     bool fp32_dest_acc_en = input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||
+                             input_tensor.dtype() == DataType::UINT8 ||
++                            // float8 moves as UInt8 (data_movement_format)
++                            input_tensor.dtype() == DataType::FP8_E4M3 || input_tensor.dtype() == DataType::FP8_E5M2 ||
+                             input_tensor.dtype() == DataType::FLOAT32;
+     // The native prim emits BFLOAT16 for a BFLOAT8_B input (UntilizeDeviceOperation::compute_output_specs),
+     // so size the output CB estimate and the pending output buffer by the output dtype: sizing them by the
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_block_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_block_interleaved_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_block_interleaved_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_block_interleaved_program_factory.cpp
+@@ -59,9 +59,9 @@ UntilizeWithUnpaddingMultiCoreBlockInterleavedProgramFactory::create_program_art
+     const auto& input_mesh_tensor = input.mesh_tensor();
+     const auto& output_mesh_tensor = output.mesh_tensor();
  
+-    tt::DataFormat input_dfb_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_dfb_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_dfb_data_format);
+-    tt::DataFormat output_dfb_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_dfb_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_dfb_data_format);
+ 
+     const auto& input_shape = a.padded_shape();
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_interleaved_program_factory.cpp
+@@ -14,6 +14,7 @@
+ #include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
+ #include "ttnn/common/constants.hpp"
+ #include "ttnn/operation.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
  using namespace tt::tt_metal;
+@@ -45,9 +46,9 @@ UntilizeWithUnpaddingMultiCoreInterleavedProgramFactory::create_program_artifact
+     const auto& input_mesh_tensor = input.mesh_tensor();
+     const auto& output_mesh_tensor = output.mesh_tensor();
  
-@@ -159,6 +160,13 @@ ttnn::Tensor untilize(
-     const std::optional<MemoryConfig>& memory_config,
-     bool use_multicore,
-     const std::optional<CoreRangeSet>& sub_core_grids) {
-+    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
-+    if (operations::data_movement::is_float8_on_device(input_tensor)) {
-+        using namespace operations::data_movement;
-+        return bytes_as_float8(
-+            ttnn::untilize(float8_as_bytes(input_tensor), memory_config, use_multicore, sub_core_grids),
-+            input_tensor.dtype());
-+    }
-     using ttnn::operations::data_movement::untilize_codegen::codegen_cb_plan_fits_live_l1;
-     using ttnn::operations::data_movement::untilize_codegen::is_demoted;
-     using ttnn::operations::data_movement::untilize_codegen::supported_by_codegen;
+-    tt::DataFormat input_dfb_data_format = datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_dfb_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_dfb_data_format);
+-    tt::DataFormat output_dfb_data_format = datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_dfb_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_dfb_data_format);
+ 
+     const auto& input_shape = a.padded_shape();
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_nd_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_nd_sharded_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_nd_sharded_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_nd_sharded_program_factory.cpp
+@@ -17,6 +17,7 @@
+ #include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
+ #include "untilize_with_unpadding_multi_core_nd_sharded_program_factory.hpp"
+ #include "ttnn/operations/data_movement/untilize/device/untilize_device_operation.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -42,9 +43,9 @@ ttnn::device_operation::ProgramArtifacts
+ UntilizeWithUnpaddingMultiCoreNDShardedProgramFactory::create_program_artifacts(
+     const UntilizeWithUnpaddingParams& operation_attributes, const Tensor& input, Tensor& output) {
+     const auto& fp32_dest_acc_en = operation_attributes.fp32_dest_acc_en;
+-    tt::DataFormat input_dfb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
++    tt::DataFormat input_dfb_data_format = ttnn::operations::data_movement::data_movement_format(input.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_dfb_data_format);
+-    tt::DataFormat output_dfb_data_format = tt::tt_metal::datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_dfb_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), input.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_dfb_data_format);
+ 
+     const auto& input_mesh_tensor = input.mesh_tensor();
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_sharded_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_sharded_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_sharded_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_multi_core_sharded_program_factory.cpp
+@@ -16,6 +16,7 @@
+ #include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
+ #include "ttnn/common/constants.hpp"
+ #include "ttnn/operation.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -65,9 +66,9 @@ ttnn::device_operation::ProgramArtifacts UntilizeWithUnpaddingMultiCoreShardedPr
+     // on out_sharded in addition to !cross_shard_type.
+     bool unpad_tensor_w_16 = out_sharded && !cross_shard_type && output.padded_shape()[-1] == 16 &&
+                              output.padded_shape()[-2] % TILE_HEIGHT == 0;
+-    tt::DataFormat input_dfb_data_format = tt::tt_metal::datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_dfb_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_dfb_data_format);
+-    tt::DataFormat output_dfb_data_format = tt::tt_metal::datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_dfb_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_dfb_data_format);
+ 
+     uint32_t num_rows_block = 0, block_row_size = 0, last_block_row_size_unpadded = 0, num_output_rows_unpadded = 0;
+diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_single_core_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_single_core_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_single_core_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/device/factories/untilize_with_unpadding_single_core_program_factory.cpp
+@@ -16,6 +16,7 @@
+ #include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
+ #include "ttnn/common/constants.hpp"
+ #include "ttnn/operation.hpp"
++#include "ttnn/operations/data_movement/common/common.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -51,9 +52,9 @@ ttnn::device_operation::ProgramArtifacts UntilizeWithUnpaddingSingleCoreProgramF
+     CoreRange default_core({0, 0}, {0, 0});
+     CoreRange core = sub_core_grids.has_value() ? corerange_to_cores(sub_core_grids.value()).at(0) : default_core;
+ 
+-    tt::DataFormat input_dfb_data_format = tt::tt_metal::datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat input_dfb_data_format = ttnn::operations::data_movement::data_movement_format(a.dtype(), output.dtype());
+     uint32_t input_single_tile_size = tt::tile_size(input_dfb_data_format);
+-    tt::DataFormat output_dfb_data_format = tt::tt_metal::datatype_to_dataformat_converter(output.dtype());
++    tt::DataFormat output_dfb_data_format = ttnn::operations::data_movement::data_movement_format(output.dtype(), a.dtype());
+     uint32_t output_single_tile_size = tt::tile_size(output_dfb_data_format);
+ 
+     log_debug(tt::LogOp, "untilize_with_unpadding_single_core");
 diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untilize_with_unpadding.cpp
-@@ -8,6 +8,7 @@
- #include "ttnn/operations/data_movement/common/common.hpp"
- #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
- #include "ttnn/operations/data_movement/untilize_with_unpadding/device/untilize_with_unpadding_device_operation.hpp"
-+#include "ttnn/operations/data_movement/common/float8_bytes.hpp"
- 
- using namespace tt::tt_metal;
- 
-@@ -77,6 +78,14 @@ Tensor untilize_with_unpadding(
-     const std::optional<MemoryConfig>& memory_config,
-     bool use_multicore,
+@@ -79,6 +79,8 @@ Tensor untilize_with_unpadding(
      const std::optional<CoreRangeSet>& sub_core_grids) {
-+    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
-+    if (operations::data_movement::is_float8_on_device(input_tensor)) {
-+        using namespace operations::data_movement;
-+        return bytes_as_float8(
-+            ttnn::untilize_with_unpadding(
-+                float8_as_bytes(input_tensor), output_tensor_end, memory_config, use_multicore, sub_core_grids),
-+            input_tensor.dtype());
-+    }
      bool fp32_dest_acc_en = input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||
                              input_tensor.dtype() == DataType::UINT8 ||
++                            // float8 moves as UInt8 (data_movement_format)
++                            input_tensor.dtype() == DataType::FP8_E4M3 || input_tensor.dtype() == DataType::FP8_E5M2 ||
                              input_tensor.dtype() == DataType::FLOAT32;
+ 
+     ttsl::SmallVector<uint32_t> output_end_vector;
