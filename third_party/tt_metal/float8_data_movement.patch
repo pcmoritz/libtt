@@ -9,28 +9,16 @@ diff --git ttnn/cpp/ttnn/operations/creation/creation.cpp ttnn/cpp/ttnn/operatio
  
  #include "ttnn/operations/eltwise/unary/unary.hpp"
  
-@@ -231,9 +232,21 @@ Tensor full_impl(
+@@ -231,9 +232,9 @@ Tensor full_impl(
              return output;
          }
          case DataType::FP8_E4M3:
 -            TT_THROW(
 -                "full/zeros/ones: FP8_E4M3 is an output-only dtype, used exclusively by the DeepSeek V3 "
 -                "prefill combine and dispatch ops; host-side construction via fill is not supported.");
-+        case DataType::FP8_E5M2: {
-+            auto fill = [&]<typename Float8>(Float8 value) {
-+                const tt::tt_metal::TensorSpec spec(
-+                    shape_value, TensorLayout(dtype_value, PageConfig(layout_value), MemoryConfig{}));
-+                std::vector<Float8> values(spec.physical_shape().height() * spec.physical_shape().width(), value);
-+                Tensor host(tt::tt_metal::HostBuffer(std::move(values)), shape_value, dtype_value, layout_value);
-+                if (optional_output_tensor.has_value()) {
-+                    copy_to_device(host, *optional_output_tensor);
-+                    return *optional_output_tensor;
-+                }
-+                return device_to_use != nullptr ? host.to_device(device_to_use, mem_cfg) : host;
-+            };
-+            const auto value = static_cast<float>(fill_value);
-+            return dtype_value == DataType::FP8_E4M3 ? fill(float8_e4m3(value)) : fill(float8_e5m2(value));
-+        }
++            return concrete_full.template operator()<float8_e4m3>(static_cast<float>(fill_value));
++        case DataType::FP8_E5M2:
++            return concrete_full.template operator()<float8_e5m2>(static_cast<float>(fill_value));
          default: TT_THROW("Unsupported DataType!");
      }
  }
@@ -992,3 +980,25 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/untilize_with_unpadding/untili
                              input_tensor.dtype() == DataType::FLOAT32;
  
      ttsl::SmallVector<uint32_t> output_end_vector;
+diff --git tt_metal/api/tt-metalium/tensor/tensor_types.hpp tt_metal/api/tt-metalium/tensor/tensor_types.hpp
+--- tt_metal/api/tt-metalium/tensor/tensor_types.hpp
++++ tt_metal/api/tt-metalium/tensor/tensor_types.hpp
+@@ -10,6 +10,7 @@
+ #include <utility>
+ 
+ #include <tt-metalium/bfloat16.hpp>
++#include <tt-metalium/float8.hpp>
+ #include <tt-metalium/core_coord.hpp>
+ #include <tt-metalium/tt_backend_api_types.hpp>
+ #include <tt-metalium/shape.hpp>
+@@ -66,6 +67,10 @@ consteval DataType convert_to_data_type() {
+         return DataType::BFLOAT16;
+     } else if constexpr (std::is_same_v<T, float16>) {
+         return DataType::FLOAT16;
++    } else if constexpr (std::is_same_v<T, float8_e4m3>) {
++        return DataType::FP8_E4M3;
++    } else if constexpr (std::is_same_v<T, float8_e5m2>) {
++        return DataType::FP8_E5M2;
+     } else {
+         static_assert(sizeof(T) == 0, "Unsupported DataType!");
+     }
