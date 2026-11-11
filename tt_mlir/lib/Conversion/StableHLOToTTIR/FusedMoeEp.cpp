@@ -56,7 +56,8 @@ namespace {
 constexpr int64_t kMaxTokensPerCall = 512;
 // Matmul rings that run a device's experts side by side. BF16 experts stream
 // through one ring: a whole expert slice per ring core, which the rings replay
-// for every chunk, doesn't fit a core's L1 at two bytes per weight.
+// for every chunk, doesn't fit a core's L1 at two bytes per weight. At FP8's
+// one byte it does: 0.66 MB of the 0.79 MB at Qwen3-30B-A3B's shapes.
 constexpr uint32_t kRings = 3;
 constexpr uint32_t kBf16Rings = 0;
 
@@ -265,8 +266,7 @@ public:
           rewriter.getUI32IntegerAttr(4),
           rewriter.getUI32IntegerAttr(intermediate), activation,
           /*cluster_axis=*/IntegerAttr(),
-          rewriter.getUI32IntegerAttr(bf16Weights || fp8Weights ? kBf16Rings
-                                                                : kRings),
+          rewriter.getUI32IntegerAttr(bf16Weights ? kBf16Rings : kRings),
           bf16Weights
               ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::BFloat16)
           : fp8Weights

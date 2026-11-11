@@ -88,7 +88,36 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  #include "ckernel_sfpu_binary.h"
  #include "llk_math_eltwise_unary_sfpu_macros.h"
  #include "llk_math_eltwise_binary_sfpu_macros.h"
-@@ -188,13 +189,17 @@ struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::G
+@@ -28,6 +29,28 @@
+ 
+ namespace detail {
+ 
++// matmul_block_init for in0 @ weights, ct_dim tiles wide. FP8 weights (fp8_weights) have four significant bits,
++// which the first of srcA's two fidelity slices holds whole: the phases that take its second slice, 1 and 3, add
++// nothing to a product. HiFi2's two passes then run as phases 0 and 2, the weights times the two slices of in0,
++// which is as exact as HiFi4. llk_math_matmul_init has ADDR_MOD_5 end each pass one phase on; this makes it two.
++template <bool fp8_weights>
++FORCE_INLINE void matmul_block_init_for_weights(uint32_t in0_cb_id, uint32_t weights_cb_id, uint32_t ct_dim) {
++    matmul_block_init(in0_cb_id, weights_cb_id, /*transpose=*/false, ct_dim, /*rt_dim=*/1, /*kt_dim=*/1);
++    if constexpr (fp8_weights) {
++        MATH((ckernel::addr_mod_t{
++                  .srca = {.incr = 0, .clr = 1, .cr = 1},
++                  .srcb = {.incr = 0, .clr = 1, .cr = 1},
++                  .dest = {.incr = 0, .clr = 1, .cr = 1},
++                  .fidelity =
++                      {.incr = MATH_FIDELITY == ckernel::MathFidelity::HiFi2  ? 2
++                               : MATH_FIDELITY == ckernel::MathFidelity::LoFi ? 0
++                                                                              : 1,
++                       .clr = 0},
++              }
++                  .set(ADDR_MOD_5)));
++    }
++}
++
+ FORCE_INLINE
+ void noc_semaphore_wait_min(volatile tt_l1_ptr uint32_t* sem_addr, uint32_t val) {
+     WAYPOINT("NSMW");
+@@ -188,13 +211,17 @@ struct PackActivation<ttnn::experimental::prim::detail::MoEActivationFunction::G
  // [out_tile, out_tile + kPairs). kPairs = 2: a full block-column, 4 tiles wide (W0 c, W1 c, W0 c+1, W1 c+1);
  // kPairs = 1: the half block-column of a ring core with an odd column count, 2 tiles wide. The caller sets
  // matmul_block_init to ct_dim = 2 * kPairs.
@@ -107,7 +136,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  FORCE_INLINE void compute_w0_w1_block_column(
      uint32_t in_cb_id,
      uint32_t w0_w1_cb_id,
-@@ -231,6 +236,36 @@ FORCE_INLINE void compute_w0_w1_block_column(
+@@ -231,6 +258,36 @@ FORCE_INLINE void compute_w0_w1_block_column(
                      continue;  // skip padding K slots after bias
                  }
              }
@@ -144,7 +173,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
              if constexpr (!has_bias) {
                  if (k_tracker >= Kt) {
                      k_tracker++;
-@@ -262,6 +297,9 @@ FORCE_INLINE void compute_w0_w1_block_column(
+@@ -262,6 +319,9 @@ FORCE_INLINE void compute_w0_w1_block_column(
      // Make SFPU access the appropriate half of the destination registers
      PACK(TT_SETC16(DEST_TARGET_REG_CFG_MATH_Offset_ADDR32, ckernel::packer::get_packer_dest_offset()));
  
@@ -154,7 +183,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
      PackActivation<activation, kPairs>::compute();
  
      PACK(TTI_STALLWAIT(p_stall::STALL_PACK, p_stall::WAIT_SFPU));
-@@ -358,7 +396,11 @@ void kernel_main() {
+@@ -358,7 +418,11 @@ void kernel_main() {
      //-------------------------------------------------------------------------
      // Per-shape DRAM transaction size of both weight streams (moe_ring::tiles_per_txn_for_shape: 14, or 20)
      constexpr uint32_t txn_tiles = get_named_compile_time_arg_val("tiles_per_txn");
@@ -167,7 +196,23 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  
      // A block is 2 transactions: 28 tiles with 14-tile transactions, 40 with 20-tile ones
      constexpr uint32_t w0_w1_tiles_per_block = Cfg::tiles_per_block;
-@@ -490,9 +532,40 @@ void kernel_main() {
+@@ -466,13 +530,8 @@ void kernel_main() {
+             const uint32_t w2_row_tiles = half_iter ? moe_ring::W2_HALF_A2A_ITER_TILES_W : w2_tiles_per_iter_w;
+             const uint32_t w2_blocks_this_iter = half_iter ? Cfg::w2_blocks_per_half_a2a_iter : w2_blocks_per_a2a_iter;
+             if (half_iter) {
+-                matmul_block_init(
+-                    cb_s2c_in2_id,
+-                    cb_r2c_w2_id,
+-                    /*transpose=*/false,
+-                    /*ct_dim=*/moe_ring::W2_HALF_A2A_ITER_TILES_W,
+-                    /*rt_dim=*/1,
+-                    /*kt_dim=*/1);
++                ::detail::matmul_block_init_for_weights<column_scales>(
++                    cb_s2c_in2_id, cb_r2c_w2_id, /*ct_dim=*/moe_ring::W2_HALF_A2A_ITER_TILES_W);
+             }
+             uint32_t src_core = ring_core_id;
+             uint32_t dm1_tiles_remaining = shard_tiles_lut[ring_core_id];
+@@ -490,9 +549,40 @@ void kernel_main() {
              tile_regs_acquire();
  
              uint32_t w2_k_tracker = 0;
@@ -208,7 +253,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
                      if constexpr (has_bias) {
                          if (w2_k_tracker == num_w2_tiles_h) {
                              // Bias addition: matmul(ones_tile, bias_row); padding K slots do not consume in2/dm1.
-@@ -545,7 +618,23 @@ void kernel_main() {
+@@ -545,7 +635,23 @@ void kernel_main() {
  
              tile_regs_commit();
  
@@ -233,7 +278,17 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
              pack_untilize_dest</*block_ct_dim=*/w2_tiles_per_iter_w, /*full_ct_dim=*/Cfg::w2_tiles_per_expert_w>(
                  cb_c2s_out_id, /*block_rt_dim=*/1, /*block_c_index=*/iter);
  
-@@ -635,7 +724,8 @@ void kernel_main() {
+@@ -600,8 +706,7 @@ void kernel_main() {
+             }
+ 
+             // Initialize matmul for W0
+-            matmul_block_init(
+-                cb_s2c_in_id, cb_r2c_w0_w1_id, /*transpose=*/false, /*ct_dim=*/4, /*rt_dim=*/1, /*kt_dim=*/1);
++            ::detail::matmul_block_init_for_weights<column_scales>(cb_s2c_in_id, cb_r2c_w0_w1_id, /*ct_dim=*/4);
+ 
+             // Wait for next chunk of tiles to arrive from the tilize cores
+             // Min to allow tilize cores to send increment for second expert
+@@ -635,24 +740,21 @@ void kernel_main() {
                      Cfg::w0_w1_blocks_per_col,
                      w0_w1_tiles_per_block,
                      num_w0_w1_tiles_h,
@@ -243,7 +298,18 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
                      cb_s2c_in_id, cb_r2c_w0_w1_id, cb_c2c_ones_tile_id, cb_s2c_in2_id, in0_index, in2_base + tile_id);
              }
              if (prod_pair_tiles != prod_tiles_per_step) {
-@@ -652,7 +742,8 @@ void kernel_main() {
+-                matmul_block_init(
+-                    cb_s2c_in_id,
+-                    cb_r2c_w0_w1_id,
+-                    /*transpose=*/false,
+-                    /*ct_dim=*/moe_ring::W0_W1_HALF_BLOCK_TILES_W,
+-                    /*rt_dim=*/1,
+-                    /*kt_dim=*/1);
++                ::detail::matmul_block_init_for_weights<column_scales>(
++                    cb_s2c_in_id, cb_r2c_w0_w1_id, /*ct_dim=*/moe_ring::W0_W1_HALF_BLOCK_TILES_W);
+                 ::detail::compute_w0_w1_block_column<
+                     activation_type,
+                     /*kPairs=*/1,
                      Cfg::w0_w1_blocks_per_half_col,
                      w0_w1_tiles_per_block,
                      num_w0_w1_tiles_h,
@@ -253,6 +319,16 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
                      cb_s2c_in_id,
                      cb_r2c_w0_w1_id,
                      cb_c2c_ones_tile_id,
+@@ -660,8 +762,7 @@ void kernel_main() {
+                     in0_index,
+                     in2_base + prod_pair_tiles);
+                 // Restore the 4-wide matmul for the W2 phase.
+-                matmul_block_init(
+-                    cb_s2c_in_id, cb_r2c_w0_w1_id, /*transpose=*/false, /*ct_dim=*/4, /*rt_dim=*/1, /*kt_dim=*/1);
++                ::detail::matmul_block_init_for_weights<column_scales>(cb_s2c_in_id, cb_r2c_w0_w1_id, /*ct_dim=*/4);
+             }
+ 
+             // Zero-fill the unproduced columns [prod_tiles_per_step, num_w0_w1_tiles_w) of this core's in2
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/dm0.cpp
@@ -599,9 +675,16 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
          {"num_cores", static_cast<uint32_t>(matmul_num_cores)},
          {"num_banks", num_dram_banks},
          {"a2a_free_semaphore_id", a2a_free_semaphore_id},
-@@ -1789,9 +1815,11 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+@@ -1787,11 +1813,17 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+         .defines = zone_defines,
+         .config =
              tt::tt_metal::ComputeConfigDescriptor{
-                 .math_fidelity = args.math_fidelity,
+-                .math_fidelity = args.math_fidelity,
++                // FP8 experts' products are exact in two fidelity passes (kernels/compute.cpp,
++                // matmul_block_init_for_weights), so every fidelity above LoFi runs as HiFi2.
++                .math_fidelity = column_scales && args.math_fidelity != tt::tt_metal::MathFidelity::LoFi
++                                     ? tt::tt_metal::MathFidelity::HiFi2
++                                     : args.math_fidelity,
                  .fp32_dest_acc_en = args.fp32_dest_acc_en,
 -                .dst_full_sync_en = false,
 +                // Column scales take DEST tiles next to the gate/up ones: all of DEST for one block-column.
