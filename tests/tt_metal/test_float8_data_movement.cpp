@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // TTNN's data-movement ops take float8 tensors (FP8_E4M3, FP8_E5M2) on device as they are: each op returns a float8
-// tensor holding exactly the bytes it moves for the same data as UINT8 (float8_data_movement.patch). Before, the
-// ones that move data through compute kernels (tilize, untilize, transposes, unaligned tile slices and concats)
-// asked for 32-bit DEST, whose float8 conversions aren't exact; others rejected float8 or e5m2, and tilize
-// returned FLOAT32.
+// tensor holding exactly the bytes it moves for the same data as UINT8. Float8 moves as libtt moves FLOAT16:
+// permute and transpose declare its buffers UInt8 (data_movement_format), and to_layout tilizes and untilizes it as
+// UINT8 (float8_data_movement.patch). Before, untilize, last-two-dimension permutes, unaligned tile slices and tile
+// concats asked for 32-bit DEST, whose float8 conversions aren't exact; data-moving reshapes, full and e5m2 copies
+// rejected float8, and tilize returned FLOAT32.
 
 #include <gtest/gtest.h>
 
@@ -25,9 +26,6 @@
 #include "ttnn/operations/data_movement/permute/permute.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
-#include "ttnn/operations/data_movement/tilize/tilize.hpp"
-#include "ttnn/operations/data_movement/tilize_with_val_padding/tilize_with_val_padding.hpp"
-#include "ttnn/operations/data_movement/untilize/untilize.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/tensor/tensor.hpp"
 
@@ -80,17 +78,12 @@ ttnn::Tensor slice(const ttnn::Tensor& t, std::vector<int32_t> begins, std::vect
 }
 
 TEST_F(Float8DataMovementTest, Layouts) {
-    const auto rm = bytes(ttnn::Shape({64, 96}), Layout::ROW_MAJOR);
-    const auto tiled = bytes(ttnn::Shape({64, 96}), Layout::TILE);
-    expect_bytes_kept("tilize", rm, [](const ttnn::Tensor& t) { return ttnn::tilize(t); });
-    expect_bytes_kept("to_layout TILE", rm, [](const ttnn::Tensor& t) { return ttnn::to_layout(t, Layout::TILE); });
-    expect_bytes_kept("tilize_with_zero_padding", bytes(ttnn::Shape({50, 70}), Layout::ROW_MAJOR), [](const ttnn::Tensor& t) {
-        return ttnn::tilize_with_zero_padding(t);
-    });
-    expect_bytes_kept("untilize", tiled, [](const ttnn::Tensor& t) { return ttnn::untilize(t); });
-    expect_bytes_kept("to_layout ROW_MAJOR", tiled, [](const ttnn::Tensor& t) {
-        return ttnn::to_layout(t, Layout::ROW_MAJOR);
-    });
+    const auto to_tile = [](const ttnn::Tensor& t) { return ttnn::to_layout(t, Layout::TILE); };
+    const auto to_rows = [](const ttnn::Tensor& t) { return ttnn::to_layout(t, Layout::ROW_MAJOR); };
+    expect_bytes_kept("to_layout TILE", bytes(ttnn::Shape({64, 96}), Layout::ROW_MAJOR), to_tile);
+    expect_bytes_kept("to_layout TILE, padded", bytes(ttnn::Shape({50, 70}), Layout::ROW_MAJOR), to_tile);
+    expect_bytes_kept("to_layout ROW_MAJOR", bytes(ttnn::Shape({64, 96}), Layout::TILE), to_rows);
+    expect_bytes_kept("to_layout ROW_MAJOR, padded", bytes(ttnn::Shape({50, 70}), Layout::TILE), to_rows);
 }
 
 TEST_F(Float8DataMovementTest, ReshapeSlicePermuteConcatCopy) {
@@ -116,7 +109,7 @@ TEST_F(Float8DataMovementTest, ReshapeSlicePermuteConcatCopy) {
     }
 }
 
-// Fill and pad values encode as libtt's exact typecast does (and ml_dtypes): rounded to nearest even, subnormals
+// Fill values encode as libtt's exact typecast does (and ml_dtypes): rounded to nearest even, subnormals
 // kept, and past the largest finite value NaN for e4m3 and infinity for e5m2.
 struct Code {
     float value;
@@ -148,29 +141,6 @@ TEST_F(Float8DataMovementTest, Full) {
                 const uint8_t want = dtype == DataType::FP8_E4M3 ? c.e4m3 : c.e5m2;
                 EXPECT_TRUE(std::all_of(got.begin(), got.end(), [&](uint8_t b) { return b == want; }))
                     << c.value << " " << dtype << " " << layout;
-            }
-        }
-    }
-}
-
-// Padding holds the pad value's code, a uint32 pad value being a number as for the other floating-point types.
-TEST_F(Float8DataMovementTest, PadValues) {
-    const auto input = bytes(ttnn::Shape({30, 20}), Layout::ROW_MAJOR);
-    for (DataType dtype : {DataType::FP8_E4M3, DataType::FP8_E5M2}) {
-        for (const ttnn::PadValue& pad : {ttnn::PadValue(1.0f), ttnn::PadValue(uint32_t{1})}) {
-            const auto tiled = ttnn::tilize_with_val_padding(ttnn::bitcast(input, dtype), ttnn::Shape({32, 32}), pad);
-            ASSERT_EQ(tiled.dtype(), dtype);
-            // The whole padded tile, as a 32 x 32 view of the bytes.
-            const auto all = ttnn::reshape(ttnn::bitcast(tiled, DataType::UINT8), ttnn::Shape({32, 32}), ttnn::Shape({32, 32}))
-                                 .cpu()
-                                 .to_vector<uint8_t>();
-            const uint8_t one = dtype == DataType::FP8_E4M3 ? 0x38 : 0x3c;
-            for (uint32_t r = 0; r < 32; ++r) {
-                for (uint32_t col = 0; col < 32; ++col) {
-                    if (r >= 30 || col >= 20) {
-                        ASSERT_EQ(all[r * 32 + col], one) << dtype << " at " << r << ", " << col;
-                    }
-                }
             }
         }
     }
