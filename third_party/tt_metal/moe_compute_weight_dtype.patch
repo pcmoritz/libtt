@@ -699,7 +699,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.cpp
-@@ -6,14 +6,18 @@
+@@ -6,16 +6,21 @@
  
  #include <algorithm>
  #include <array>
@@ -717,8 +717,11 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +#include <tt-metalium/host_buffer.hpp>
  #include <tt-metalium/kernel_types.hpp>
  #include <tt-metalium/mesh_device.hpp>
++#include <tt-metalium/tensor/tensor_types.hpp>
  #include <tt_stl/assert.hpp>
-@@ -31,6 +35,7 @@
+ #include <tt_stl/small_vector.hpp>
+ #include <tt_stl/span.hpp>
+@@ -31,6 +36,7 @@
  #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
  #include "ttnn/operations/data_movement/slice/slice.hpp"
  #include "ttnn/operations/data_movement/unsqueeze/unsqueeze.hpp"
@@ -726,7 +729,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
  #include "ttnn/tensor/shape/shape.hpp"
  #include "ttnn/tensor/tensor.hpp"
  
-@@ -456,7 +461,8 @@ WeightMemoryConfigs get_weight_mem_configs(
+@@ -456,7 +462,8 @@ WeightMemoryConfigs get_weight_mem_configs(
      uint32_t experts_per_device,
      uint32_t hidden_size,
      uint32_t intermediate_size,
@@ -736,7 +739,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
      TT_FATAL(
          hidden_size % TILE_SIZE == 0, "hidden_size ({}) must be divisible by TILE_SIZE ({})", hidden_size, TILE_SIZE);
      TT_FATAL(
-@@ -468,9 +474,7 @@ WeightMemoryConfigs get_weight_mem_configs(
+@@ -468,9 +475,7 @@ WeightMemoryConfigs get_weight_mem_configs(
      const auto shard_maps = get_weight_core_shard_maps(mesh_device, hidden_size, intermediate_size);
      const auto& w0_w1_shard_map = shard_maps.w0_w1_shard_map;
  
@@ -746,7 +749,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
      const uint32_t Nt_w0_w1 = intermediate_size / TILE_SIZE;
  
      const uint32_t num_cores = static_cast<uint32_t>(w0_w1_shard_map.size());
-@@ -478,6 +482,8 @@ WeightMemoryConfigs get_weight_mem_configs(
+@@ -478,6 +483,8 @@ WeightMemoryConfigs get_weight_mem_configs(
  
      // Per-shape DRAM transaction size (both streams) and the stored rows of one block.
      const uint32_t tiles_per_txn = ::moe_ring::tiles_per_txn_for_shape(Ht, Nt_w0_w1, has_bias, num_cores);
@@ -755,7 +758,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
      const uint32_t block_rows = ::moe_ring::block_tiles_h(tiles_per_txn) * TILE_SIZE;
  
      // Compact W0/W1 layout (prepare_w0_w1_tensor_for_moe_compute): every bank holds the same whole blocks
-@@ -501,7 +507,9 @@ WeightMemoryConfigs get_weight_mem_configs(
+@@ -501,7 +508,9 @@ WeightMemoryConfigs get_weight_mem_configs(
      // half-width last one; prepare_w2_tensor_for_moe_compute).
      const uint32_t Nt = intermediate_size / TILE_SIZE;
      const uint32_t w2_core_rows =
@@ -766,36 +769,21 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
      const uint32_t w2_total_rows = num_layers * experts_per_device * num_cores * w2_core_rows;
      TT_FATAL(
          w2_total_rows % num_banks == 0,
-@@ -836,6 +844,287 @@ ttnn::Tensor prepare_w2_tensor_for_moe_compute(
+@@ -836,6 +845,272 @@ ttnn::Tensor prepare_w2_tensor_for_moe_compute(
      return result;
  }
  
 +namespace {
-+// The normal FLOAT16 value nearest to x, as its bits (the largest one for larger values, zero for subnormal
-+// ones), and a normal FLOAT16's value.
-+uint16_t float16_nearest(float x) {
++// The normal FLOAT16 value nearest to x: the largest one for larger values, zero for values below the smallest
++// one. The packer and the unpacker flush subnormal values.
++tt::tt_metal::float16 float16_nearest(float x) {
++    using tt::tt_metal::float16;
 +    const uint16_t sign = std::signbit(x) ? 0x8000 : 0;
-+    const float magnitude = std::fabs(x);
-+    if (!(magnitude >= 0x1p-14f)) {
-+        return sign;
++    if (!(std::fabs(x) >= 0x1p-14f)) {
++        return float16(sign);
 +    }
-+    int exponent;
-+    const float fraction = std::frexp(magnitude, &exponent);  // magnitude = fraction * 2^exponent, in [0.5, 1)
-+    uint32_t mantissa = static_cast<uint32_t>(std::nearbyint(std::ldexp(fraction, 11)));  // 11 bits, or 2^11
-+    if (mantissa == 2048) {
-+        mantissa = 1024;
-+        ++exponent;
-+    }
-+    if (exponent > 16) {
-+        return sign | 0x7BFF;
-+    }
-+    return sign | static_cast<uint16_t>((exponent - 1 + 15) << 10) | static_cast<uint16_t>(mantissa & 0x3FF);
-+}
-+float float16_value(uint16_t half) {
-+    const uint32_t exponent = (half >> 10) & 0x1F;
-+    const float magnitude =
-+        exponent == 0 ? 0.0f : std::ldexp(static_cast<float>(0x400 | (half & 0x3FF)), static_cast<int>(exponent) - 25);
-+    return half & 0x8000 ? -magnitude : magnitude;
++    const float16 nearest(x);
++    return std::isinf(static_cast<float>(nearest)) ? float16(static_cast<uint16_t>(sign | 0x7BFF)) : nearest;
 +}
 +
 +// A slot's half of its pair's scale tile (moe_ring_common.h, COLUMN_SCALE_ROWS) as the float8 tile that holds its
@@ -819,14 +807,14 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +                // The FLOAT16 value nearest to what is left, which leaves the rest exactly.
 +                const int shift =
 +                    ::moe_ring::COLUMN_SCALE_SHIFT + static_cast<int>(term) * ::moe_ring::COLUMN_SCALE_TERM_BITS;
-+                const uint16_t half = float16_nearest(std::ldexp(rest, shift));
-+                rest -= std::ldexp(float16_value(half), -shift);
++                const tt::tt_metal::float16 half = float16_nearest(std::ldexp(rest, shift));
++                rest -= std::ldexp(static_cast<float>(half), -shift);
 +                const uint32_t face = column / (TILE_SIZE / 2);
 +                const uint32_t first_row = 4 * (::moe_ring::COLUMN_SCALE_TERMS * slot + term);
 +                for (uint32_t row = first_row; row < first_row + 4; ++row) {
-+                    uint8_t* float16 = raw + face * 512 + row * TILE_SIZE + (column % 16) * 2;
-+                    float16[0] = static_cast<uint8_t>(half);
-+                    float16[1] = static_cast<uint8_t>(half >> 8);
++                    uint8_t* bytes = raw + face * 512 + row * TILE_SIZE + (column % 16) * 2;
++                    bytes[0] = static_cast<uint8_t>(half.bits);
++                    bytes[1] = static_cast<uint8_t>(half.bits >> 8);
 +                }
 +            }
 +        }
