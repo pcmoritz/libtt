@@ -9,6 +9,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 
+#include <array>
 #include <optional>
 
 namespace mlir::tt::ttnn::fusing {
@@ -357,6 +358,85 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
   // The separate ops are now unused, and the rewrite driver erases them (TTNN
   // ops are pure); any that still feed other ops stay.
   return mlir::success();
+}
+
+mlir::LogicalResult
+AttentionOutputGateFusing::matchAndRewrite(MultiplyOp multiply,
+                                           mlir::PatternRewriter &rewriter) const {
+  if (!multiply.getActivations().empty() ||
+      !multiply.getInputTensorAActivations().empty() ||
+      !multiply.getInputTensorBActivations().empty()) {
+    return mlir::failure();
+  }
+  // [T, H * D], BF16.
+  ArrayRef<int64_t> outShape = shapeOf(multiply.getResult());
+  if (outShape.size() != 2 || !isTiled(multiply.getResult(), /*dram=*/true)) {
+    return mlir::failure();
+  }
+  auto elementType = [](Value value) {
+    return mlir::cast<RankedTensorType>(value.getType()).getElementType();
+  };
+  for (auto [values, gated] :
+       {std::pair(multiply.getLhs(), multiply.getRhs()),
+        std::pair(multiply.getRhs(), multiply.getLhs())}) {
+    // The gate: BF16 sigmoid, in FP32, of BF16 heads.
+    auto narrow = throughReshapes(gated).getDefiningOp<TypecastOp>();
+    auto sigmoid =
+        narrow ? narrow.getInput().getDefiningOp<SigmoidOp>() : nullptr;
+    auto widen =
+        sigmoid ? sigmoid.getInput().getDefiningOp<TypecastOp>() : nullptr;
+    if (!widen || shapeOf(values) != outShape || shapeOf(gated) != outShape ||
+        !elementType(narrow.getResult()).isBF16() ||
+        !elementType(sigmoid.getResult()).isF32() ||
+        !elementType(widen.getResult()).isF32() ||
+        !elementType(widen.getInput()).isBF16()) {
+      continue;
+    }
+    // The values: heads of the attention output [1, T, H, W], D wide from
+    // v0, in (token, head, element) order.
+    auto [attention, valueOffset] = sourceOf(values, 0);
+    ArrayRef<int64_t> attentionShape = shapeOf(attention);
+    if (attentionShape.size() != 4 || attentionShape[0] != 1 ||
+        attentionShape[1] != outShape[0] ||
+        outShape[1] % attentionShape[2] != 0) {
+      continue;
+    }
+    const int64_t tokens = attentionShape[1];
+    const int64_t heads = attentionShape[2];
+    const int64_t width = attentionShape[3];
+    const int64_t headDim = outShape[1] / heads;
+    if (!isHeadView(values, attention, tokens, heads * width, valueOffset,
+                    heads, width, headDim)) {
+      continue;
+    }
+    // The gate heads: of the projection [T, N], the first at g0, each S
+    // after the last.
+    Value gateHeads = widen.getInput();
+    auto [gate, gateOffset] = sourceOf(gateHeads, 0);
+    ArrayRef<int64_t> gateShape = shapeOf(gate);
+    const int64_t gateStride =
+        heads > 1 ? sourceOf(gateHeads, headDim).second - gateOffset : headDim;
+    if (gateShape.size() != 2 || gateShape[0] != tokens ||
+        !isHeadView(gateHeads, gate, tokens, gateShape[1], gateOffset, heads,
+                    gateStride, headDim)) {
+      continue;
+    }
+    // The kernel's tiles: up to 32 tokens, tile-aligned heads.
+    if (tokens > 32 || !isTiled(attention, /*dram=*/true) ||
+        !isTiled(gate, /*dram=*/true) ||
+        llvm::any_of(std::array{headDim, valueOffset, gateOffset, gateStride},
+                     [](int64_t value) { return value % 32 != 0; })) {
+      continue;
+    }
+    rewriter.replaceOpWithNewOp<AttentionOutputGateOp>(
+        multiply, multiply.getResult().getType(), attention, gate,
+        rewriter.getUI32IntegerAttr(headDim),
+        rewriter.getUI32IntegerAttr(valueOffset),
+        rewriter.getUI32IntegerAttr(gateOffset),
+        rewriter.getUI32IntegerAttr(gateStride));
+    return mlir::success();
+  }
+  return mlir::failure();
 }
 
 } // namespace mlir::tt::ttnn::fusing

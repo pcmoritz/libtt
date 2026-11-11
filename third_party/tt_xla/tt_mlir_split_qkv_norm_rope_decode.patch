@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4803,6 +4803,36 @@ def TTNN_NLPCreateQKVHeadsDecodeNormRopeOp : TTNN_Op<"nlp_create_qkv_heads_decod
+@@ -4803,6 +4803,57 @@ def TTNN_NLPCreateQKVHeadsDecodeNormRopeOp : TTNN_Op<"nlp_create_qkv_heads_decod
                        AnyRankedTensor:$value);
  }
  
@@ -35,13 +35,34 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +  let hasCanonicalizer = 1;
 +}
 +
++def TTNN_AttentionOutputGateOp : TTNN_Op<"attention_output_gate", [OpModelExempt]> {
++  let summary = "Gated attention's output gate as PyTorch models trace it, in one program";
++  let description = [{
++    Each head of the attention output [1, T, H, W], head_dim wide from
++    value_offset, times the sigmoid of its gate head: gate [T, N]'s head_dim
++    columns from h * gate_stride + gate_offset. The sigmoid is computed in
++    FP32 from the BF16 gate and rounded to BF16, and the product rounded to
++    BF16, as the separate typecast, sigmoid, typecast and multiply round.
++    The result is [T, H * head_dim].
++  }];
++
++  let arguments = (ins AnyRankedTensor:$attention,
++                       AnyRankedTensor:$gate,
++                       UI32Attr:$head_dim,
++                       UI32Attr:$value_offset,
++                       UI32Attr:$gate_offset,
++                       UI32Attr:$gate_stride);
++
++  let results = (outs AnyRankedTensor:$result);
++}
++
  def TTNN_LoadTensorOp : TTNN_Op<"load_tensor", [OpModelExempt]> {
    let summary = "Loads a tensor from disk";
    let description = [{
 diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
 --- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
-@@ -180,6 +180,19 @@ table IndexerScoreDsaOp {
+@@ -180,6 +180,29 @@ table IndexerScoreDsaOp {
    cluster_axis: uint32 = null;
  }
  
@@ -58,17 +79,28 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 +  epsilon: float;
 +}
 +
++table AttentionOutputGateOp {
++  attention: tt.target.ttnn.TensorRef;
++  gate: tt.target.ttnn.TensorRef;
++  out: tt.target.ttnn.TensorRef;
++  head_dim: uint32;
++  value_offset: uint32;
++  gate_offset: uint32;
++  gate_stride: uint32;
++}
++
  table NLPCreateQKVHeadsDecodeNormRopeOp {
    input: tt.target.ttnn.TensorRef;
    norm_weight: tt.target.ttnn.TensorRef;
 diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
 --- a/include/ttmlir/Target/TTNN/program.fbs
 +++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -58,6 +58,7 @@ union OpType {
+@@ -58,6 +58,8 @@ union OpType {
    RotaryEmbeddingOp,
    NLPCreateQKVHeadsDecodeOp,
    NLPCreateQKVHeadsDecodeNormRopeOp,
 +  SplitQKVNormRopeDecodeOp,
++  AttentionOutputGateOp,
    NLPConcatHeadsOp,
    ConstantOp,
    CaseOp,
@@ -83,14 +115,15 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  #ifdef TTMLIR_ENABLE_OPMODEL
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/QKVHeadsNormRopeDecodeFusing.h"
  #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
-@@ -1223,6 +1224,11 @@ public:
+@@ -1223,6 +1224,12 @@ public:
      config.setUseTopDownTraversal(true);
      (void)applyPatternsGreedily(getOperation(), std::move(firstPatterns));
      (void)applyPatternsGreedily(getOperation(), std::move(patterns));
 +    // Whole attention prologues, once the norms and rotary embeddings they
-+    // consist of have formed.
++    // consist of have formed, and gated attention's output gates.
 +    RewritePatternSet lastPatterns(&getContext());
-+    lastPatterns.add<fusing::SplitQKVNormRopeDecodeFusing>(&getContext());
++    lastPatterns.add<fusing::SplitQKVNormRopeDecodeFusing,
++                     fusing::AttentionOutputGateFusing>(&getContext());
 +    (void)applyPatternsGreedily(getOperation(), std::move(lastPatterns));
    }
  };
@@ -98,7 +131,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -4626,6 +4626,24 @@ createOp(FlatbufferObjectCache &cache, NLPCreateQKVHeadsDecodeOp op) {
+@@ -4626,6 +4626,39 @@ createOp(FlatbufferObjectCache &cache, NLPCreateQKVHeadsDecodeOp op) {
        overlapQKCoregrid, batchOffset, sliceSize, memoryConfig);
  }
  
@@ -120,15 +153,34 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 +      op.getEpsilon().convertToFloat());
 +}
 +
++::flatbuffers::Offset<::tt::target::ttnn::AttentionOutputGateOp>
++createOp(FlatbufferObjectCache &cache, AttentionOutputGateOp op) {
++  auto tensor = [&](Value value) {
++    return cache.at<::tt::target::ttnn::TensorRef>(
++        getOperandThroughDPSOps(value));
++  };
++  auto output = cache.getOrCreateNoSharding(op.getResult(),
++                                            tensorValueToFlatbuffer,
++                                            /*local_shape*/ std::nullopt);
++  return ::tt::target::ttnn::CreateAttentionOutputGateOp(
++      *cache.fbb, tensor(op.getAttention()), tensor(op.getGate()), output,
++      op.getHeadDim(), op.getValueOffset(), op.getGateOffset(),
++      op.getGateStride());
++}
++
  ::flatbuffers::Offset<::tt::target::ttnn::NLPCreateQKVHeadsDecodeNormRopeOp>
  createOp(FlatbufferObjectCache &cache, NLPCreateQKVHeadsDecodeNormRopeOp op) {
    auto tensor = [&](Value value) {
-@@ -5862,6 +5880,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
+@@ -5862,6 +5895,14 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, nlpCreateQKVHeadsDecodeOp),
                             debugString, locInfo);
    }
 +  if (auto splitOp = dyn_cast<SplitQKVNormRopeDecodeOp>(op)) {
 +    return createOperation(cache, createOp(cache, splitOp), debugString,
++                           locInfo);
++  }
++  if (auto gateOp = dyn_cast<AttentionOutputGateOp>(op)) {
++    return createOperation(cache, createOp(cache, gateOp), debugString,
 +                           locInfo);
 +  }
    if (auto normRopeOp = dyn_cast<NLPCreateQKVHeadsDecodeNormRopeOp>(op)) {
@@ -137,21 +189,26 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
 diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
 --- a/runtime/lib/ttnn/program_executor.cpp
 +++ b/runtime/lib/ttnn/program_executor.cpp
-@@ -126,6 +126,7 @@
+@@ -126,6 +126,8 @@
  #include "operations/transformer/nlp_concat_heads_decode.h"
  #include "operations/transformer/nlp_create_qkv_heads_decode.h"
  #include "operations/transformer/nlp_create_qkv_heads_decode_norm_rope.h"
 +#include "operations/transformer/split_qkv_norm_rope_decode.h"
++#include "operations/transformer/attention_output_gate.h"
  #include "operations/transformer/paged_flash_multi_latent_attention_decode.h"
  #include "operations/transformer/paged_scaled_dot_product_attention_decode.h"
  #include "operations/matmul/scaled_matmul.h"
-@@ -477,6 +478,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
+@@ -477,6 +479,14 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
      return operations::transformer::run(op->type_as_NLPCreateQKVHeadsDecodeOp(),
                                          getContext());
    }
 +  case ::tt::target::ttnn::OpType::SplitQKVNormRopeDecodeOp: {
 +    return operations::transformer::run(
 +        op->type_as_SplitQKVNormRopeDecodeOp(), getContext());
++  }
++  case ::tt::target::ttnn::OpType::AttentionOutputGateOp: {
++    return operations::transformer::run(op->type_as_AttentionOutputGateOp(),
++                                        getContext());
 +  }
    case ::tt::target::ttnn::OpType::NLPCreateQKVHeadsDecodeNormRopeOp: {
      return operations::transformer::run(
