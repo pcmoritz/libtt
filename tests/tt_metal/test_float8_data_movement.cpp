@@ -101,6 +101,10 @@ TEST_F(Float8DataMovementTest, ReshapeSlicePermuteConcatCopy) {
         expect_bytes_kept("permute 021" + l, x3, [](const ttnn::Tensor& t) { return ttnn::permute(t, {0, 2, 1}); });
         expect_bytes_kept("concat 0" + l, x, [](const ttnn::Tensor& t) { return ttnn::concat({t, t}, 0); });
         expect_bytes_kept("concat 1" + l, x, [](const ttnn::Tensor& t) { return ttnn::concat({t, t}, 1); });
+        // Padded tiles: concat untilizes and retilizes them.
+        const auto padded = bytes(ttnn::Shape({50, 70}), layout);
+        expect_bytes_kept("concat 0 padded" + l, padded, [](const ttnn::Tensor& t) { return ttnn::concat({t, t}, 0); });
+        expect_bytes_kept("concat 1 padded" + l, padded, [](const ttnn::Tensor& t) { return ttnn::concat({t, t}, 1); });
         expect_bytes_kept("copy" + l, x, [](const ttnn::Tensor& t) {
             auto dst = ttnn::empty_like(t);
             ttnn::copy(t, dst);
@@ -142,6 +146,25 @@ TEST_F(Float8DataMovementTest, Full) {
                 EXPECT_TRUE(std::all_of(got.begin(), got.end(), [&](uint8_t b) { return b == want; }))
                     << c.value << " " << dtype << " " << layout;
             }
+        }
+    }
+}
+
+// A reshape into tiles with padding fills the padding with the pad value's code.
+TEST_F(Float8DataMovementTest, ReshapePadding) {
+    const auto x = bytes(ttnn::Shape({64, 96}), Layout::TILE);
+    const auto values = x.cpu().to_vector<uint8_t>();
+    for (DataType dtype : {DataType::FP8_E4M3, DataType::FP8_E5M2}) {
+        const auto reshaped =
+            ttnn::reshape(ttnn::bitcast(x, dtype), ttnn::Shape({48, 128}), std::nullopt, ttnn::PadValue(1.0f));
+        ASSERT_EQ(reshaped.dtype(), dtype);
+        // The whole padded tensor, 64 x 128, as a view of the bytes.
+        const auto all = ttnn::reshape(ttnn::bitcast(reshaped, DataType::UINT8), ttnn::Shape({64, 128}), ttnn::Shape({64, 128}))
+                             .cpu()
+                             .to_vector<uint8_t>();
+        const uint8_t one = dtype == DataType::FP8_E4M3 ? 0x38 : 0x3c;
+        for (size_t i = 0; i < all.size(); ++i) {
+            ASSERT_EQ(all[i], i < values.size() ? values[i] : one) << dtype << " at " << i;
         }
     }
 }

@@ -117,23 +117,6 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_de
          "Unsupported dtype {}", input_tensor_a.dtype());
  }
  
-diff --git ttnn/cpp/ttnn/operations/data_movement/slice/device/slice_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/slice/device/slice_device_operation.cpp
---- ttnn/cpp/ttnn/operations/data_movement/slice/device/slice_device_operation.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/slice/device/slice_device_operation.cpp
-@@ -146,6 +146,13 @@ void SliceDeviceOperation::validate_on_program_cache_miss(
-     if (tensor_args.preallocated_output.has_value()) {
-         const auto spec_required = compute_output_specs(args, tensor_args);
-         const auto& out_tensor = tensor_args.preallocated_output.value();
-+        // Slice copies values: an output of another type, a float8 one of the other format for instance, would
-+        // reinterpret them.
-+        TT_FATAL(
-+            out_tensor.dtype() == spec_required.data_type(),
-+            "The preallocated output tensor needs dtype {}, however it is {}",
-+            spec_required.data_type(),
-+            out_tensor.dtype());
-         // Padded, not logical: ttnn::slice pads the tile-path ends up to a tile boundary before
-         // calling here and views the result back down afterwards, so the caller's tensor legitimately
-         // carries a smaller logical shape than the spec. That licence is tile-only; see below.
 diff --git tt_metal/api/tt-metalium/tensor/tensor_types.hpp tt_metal/api/tt-metalium/tensor/tensor_types.hpp
 --- tt_metal/api/tt-metalium/tensor/tensor_types.hpp
 +++ tt_metal/api/tt-metalium/tensor/tensor_types.hpp
@@ -221,3 +204,30 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp ttnn/cpp/ttn
                  return ttnn::tilize_with_val_padding(
                      output, compute_padded_shape(output.padded_shape()), 0.0f, output.memory_config());
              }
+diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/fill_pad.cpp ttnn/cpp/ttnn/operations/data_movement/fill_pad/fill_pad.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/fill_pad/fill_pad.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/fill_pad/fill_pad.cpp
+@@ -9,6 +9,8 @@
+ #include <utility>
+ #include "ttnn/operations/copy/typecast/typecast.hpp"
+ #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
++#include "ttnn/operations/data_movement/common/float8.hpp"
++#include "ttnn/tensor/tensor_ops.hpp"
+ #include <tt-metalium/math.hpp>
+ 
+ namespace ttnn {
+@@ -23,6 +25,14 @@ Tensor fill_implicit_tile_padding(
+     if (padded_width == input_tensor.logical_shape()[-1] && padded_height == input_tensor.logical_shape()[-2]) {
+         return input_tensor;
+     }
++    // Float8 fills as UINT8 with the fill value's float8 code: fill_pad writes a UINT8 value as its byte.
++    if (operations::data_movement::is_float8(input_tensor.dtype())) {
++        const float value = std::visit([](auto v) { return static_cast<float>(v); }, fill_value);
++        const uint32_t code = operations::data_movement::float8_code(value, input_tensor.dtype());
++        const Tensor filled = fill_implicit_tile_padding(
++            unchecked_reinterpret_dtype(input_tensor, DataType::UINT8), code, memory_config);
++        return unchecked_reinterpret_dtype(filled, input_tensor.dtype());
++    }
+     auto mutable_input_tensor = input_tensor;
+     auto output_memory_config = memory_config.value_or(input_tensor.memory_config());
+     if (is_block_float(input_tensor.dtype())) {
