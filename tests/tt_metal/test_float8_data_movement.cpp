@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -115,13 +116,30 @@ TEST_F(Float8DataMovementTest, ReshapeSlicePermuteConcatCopy) {
     }
 }
 
+// Fill and pad values encode as libtt's exact typecast does (and ml_dtypes): rounded to nearest even, subnormals
+// kept, and past the largest finite value NaN for e4m3 and infinity for e5m2.
+struct Code {
+    float value;
+    uint8_t e4m3, e5m2;
+};
+
+constexpr Code kCodes[] = {
+    {1.0f, 0x38, 0x3c},
+    {-0.0f, 0x80, 0x80},
+    {0.1f, 0x1d, 0x2e},
+    {0x1p-9f, 0x01, 0x18},   // e4m3's smallest subnormal
+    {0x1p-10f, 0x00, 0x14},  // half of it: a tie, to even
+    {0x3p-10f, 0x02, 0x1a},
+    {0x1p-16f, 0x00, 0x01},  // e5m2's smallest subnormal
+    {464.0f, 0x7e, 0x5f},    // a tie between e4m3's largest finite value and NaN
+    {500.0f, 0x7f, 0x60},
+    {61440.0f, 0x7f, 0x7c},  // a tie between e5m2's largest finite value and infinity
+    {std::numeric_limits<float>::infinity(), 0x7f, 0x7c},
+    {-std::numeric_limits<float>::infinity(), 0xff, 0xfc},
+};
+
 TEST_F(Float8DataMovementTest, Full) {
-    // Each value's code: 1.0, -0.0 and 0.1 rounded to nearest even.
-    struct Case {
-        float value;
-        uint8_t e4m3, e5m2;
-    };
-    for (const Case& c : {Case{1.0f, 0x38, 0x3c}, Case{-0.0f, 0x80, 0x80}, Case{0.1f, 0x1d, 0x2e}}) {
+    for (const Code& c : kCodes) {
         for (Layout layout : {Layout::ROW_MAJOR, Layout::TILE}) {
             for (DataType dtype : {DataType::FP8_E4M3, DataType::FP8_E5M2}) {
                 const auto t = ttnn::full(ttnn::Shape({40, 70}), c.value, dtype, layout, std::ref(*mesh_device_));
@@ -133,6 +151,43 @@ TEST_F(Float8DataMovementTest, Full) {
             }
         }
     }
+}
+
+// Padding holds the pad value's code, a uint32 pad value being a number as for the other floating-point types.
+TEST_F(Float8DataMovementTest, PadValues) {
+    const auto input = bytes(ttnn::Shape({30, 20}), Layout::ROW_MAJOR);
+    for (DataType dtype : {DataType::FP8_E4M3, DataType::FP8_E5M2}) {
+        for (const ttnn::PadValue& pad : {ttnn::PadValue(1.0f), ttnn::PadValue(uint32_t{1})}) {
+            const auto tiled = ttnn::tilize_with_val_padding(ttnn::bitcast(input, dtype), ttnn::Shape({32, 32}), pad);
+            ASSERT_EQ(tiled.dtype(), dtype);
+            // The whole padded tile, as a 32 x 32 view of the bytes.
+            const auto all = ttnn::reshape(ttnn::bitcast(tiled, DataType::UINT8), ttnn::Shape({32, 32}), ttnn::Shape({32, 32}))
+                                 .cpu()
+                                 .to_vector<uint8_t>();
+            const uint8_t one = dtype == DataType::FP8_E4M3 ? 0x38 : 0x3c;
+            for (uint32_t r = 0; r < 32; ++r) {
+                for (uint32_t col = 0; col < 32; ++col) {
+                    if (r >= 30 || col >= 20) {
+                        ASSERT_EQ(all[r * 32 + col], one) << dtype << " at " << r << ", " << col;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A preallocated output must have the input's float8 type: the bytes alone would let another one through.
+TEST_F(Float8DataMovementTest, SliceOutputType) {
+    const auto x = bytes(ttnn::Shape({64, 96}), Layout::ROW_MAJOR);
+    const auto out = ttnn::bitcast(slice(x, {0, 0}, {32, 32}), DataType::FP8_E5M2);
+    const std::vector<int32_t> b{0, 0}, e{32, 32}, s{1, 1};
+    EXPECT_ANY_THROW((void)ttnn::slice(
+        ttnn::bitcast(x, DataType::FP8_E4M3),
+        ttsl::Span<const int32_t>(b),
+        ttsl::Span<const int32_t>(e),
+        ttsl::Span<const int32_t>(s),
+        std::nullopt,
+        out));
 }
 
 }  // namespace

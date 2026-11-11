@@ -67,18 +67,18 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/common/float8_bytes.hpp ttnn/c
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/data_movement/common/float8_bytes.hpp
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,101 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
 +
 +#pragma once
 +
++#include <cmath>
 +#include <cstdint>
++#include <limits>
 +#include <optional>
 +#include <variant>
-+
-+#include <tt-metalium/float8.hpp>
 +
 +#include "ttnn/tensor/tensor.hpp"
 +#include "ttnn/tensor/tensor_ops.hpp"
@@ -110,17 +110,62 @@ new file mode 100644
 +    return unchecked_reinterpret_dtype(bytes, dtype);
 +}
 +
-+// A pad or fill value's float8 code, rounded to nearest even.
-+inline uint8_t float8_code(float value, tt::tt_metal::DataType dtype) {
-+    return dtype == tt::tt_metal::DataType::FP8_E4M3 ? float8_e4m3(value).to_bits() : float8_e5m2(value).to_bits();
++// A float8 code's value, exactly: subnormals, infinities and NaNs included (the host's float8_e4m3 flushes
++// subnormals).
++inline double float8_value(uint8_t code, tt::tt_metal::DataType dtype) {
++    const bool e4m3 = dtype == tt::tt_metal::DataType::FP8_E4M3;
++    const int mantissa_bits = e4m3 ? 3 : 2;
++    const int bias = e4m3 ? 7 : 15;
++    const int magnitude = code & 0x7f;
++    const int exponent = magnitude >> mantissa_bits;
++    const int mantissa = magnitude & ((1 << mantissa_bits) - 1);
++    double value;
++    if (e4m3 ? magnitude == 0x7f : exponent == 0x1f) {
++        value = e4m3 || mantissa != 0 ? std::numeric_limits<double>::quiet_NaN()
++                                      : std::numeric_limits<double>::infinity();
++    } else if (exponent == 0) {
++        value = std::ldexp(mantissa, 1 - bias - mantissa_bits);
++    } else {
++        value = std::ldexp((1 << mantissa_bits) | mantissa, exponent - bias - mantissa_bits);
++    }
++    return (code & 0x80) ? -value : value;
 +}
 +
-+// A pad value for the bytes: a float becomes its float8 code; a uint32 is a code already.
-+inline PadValue float8_pad(const PadValue& value, tt::tt_metal::DataType dtype) {
-+    if (const float* f = std::get_if<float>(&value)) {
-+        return static_cast<uint32_t>(float8_code(*f, dtype));
++// A pad or fill value's float8 code, as libtt's exact typecast encodes it: rounded to nearest even, subnormal
++// results kept, and past the largest finite value the overflow code, NaN for e4m3 and infinity for e5m2. The host's
++// float8_e4m3 flushes subnormals and saturates instead.
++inline uint8_t float8_code(float value, tt::tt_metal::DataType dtype) {
++    const uint8_t sign = std::signbit(value) ? 0x80 : 0;
++    if (std::isnan(value)) {
++        return sign | 0x7f;
 +    }
-+    return value;
++    const int overflow = dtype == tt::tt_metal::DataType::FP8_E4M3 ? 0x7f : 0x7c;
++    // The overflow code stands for the step after the largest finite value. Distances in double are exact.
++    const auto at = [&](int code) {
++        return code == overflow
++                   ? 2.0 * float8_value(overflow - 1, dtype) - float8_value(overflow - 2, dtype)
++                   : float8_value(static_cast<uint8_t>(code), dtype);
++    };
++    const double magnitude = std::fabs(static_cast<double>(value));
++    if (magnitude >= at(overflow)) {
++        return sign | overflow;
++    }
++    // The nearest code, ties to the even one.
++    int nearest = 0;
++    for (int code = 1; code <= overflow; ++code) {
++        const double distance = std::fabs(at(code) - magnitude);
++        const double nearest_distance = std::fabs(at(nearest) - magnitude);
++        if (distance < nearest_distance || (distance == nearest_distance && code % 2 == 0)) {
++            nearest = code;
++        }
++    }
++    return sign | static_cast<uint8_t>(nearest);
++}
++
++// A pad value's float8 code: a uint32 pad is a number, as for the other floating-point types.
++inline PadValue float8_pad(const PadValue& value, tt::tt_metal::DataType dtype) {
++    const float number = std::visit([](auto v) { return static_cast<float>(v); }, value);
++    return static_cast<uint32_t>(float8_code(number, dtype));
 +}
 +
 +}  // namespace ttnn::operations::data_movement
@@ -256,13 +301,19 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/slice/slice.cpp ttnn/cpp/ttnn/
  
  #include <tt-metalium/constants.hpp>
  #include <tt-metalium/experimental/range_lockstep_allocation/memory_config.hpp>
-@@ -114,6 +115,23 @@ ttnn::Tensor slice(
+@@ -114,6 +115,29 @@ ttnn::Tensor slice(
      const std::optional<float>& pad_value,
      const std::optional<CoreRangeSet>& sub_core_grids) {
      // Ensure start and end vectors have matching sizes and correct tensor rank
 +    // Float8 tensors move as their bytes (common/float8_bytes.hpp).
 +    if (operations::data_movement::is_float8_on_device(input_tensor)) {
 +        using namespace operations::data_movement;
++        // The byte views below would let another dtype's output through.
++        TT_FATAL(
++            !optional_output_tensor.has_value() || optional_output_tensor->dtype() == input_tensor.dtype(),
++            "slice: the preallocated output is {}, the input {}",
++            optional_output_tensor.has_value() ? optional_output_tensor->dtype() : input_tensor.dtype(),
++            input_tensor.dtype());
 +        const std::optional<float> bytes_pad =
 +            pad_value.has_value() ? std::optional<float>(float8_code(*pad_value, input_tensor.dtype())) : std::nullopt;
 +        return bytes_as_float8(
