@@ -1,0 +1,99 @@
+diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+--- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
++++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
+@@ -303,6 +303,36 @@
+     SmallVector<int64_t> rhsPermutation =
+         getPermutation(rhsBatchDims, rhsContractDims, rhsResultDims);
+ 
++    // An operand already in the order of the matmul's transposed operand,
++    // (batch, contract, result) for lhs or (batch, result, contract) for rhs,
++    // goes in as it is and the matmul transposes it in its tiles: permuting it
++    // would move all of its elements first. The attention gradient
++    // dot_general(dS[b, n, g, t, s], q[b, n, g, t, h]) of grouped-query
++    // attention contracts over (g, t), and dS permuted to [b, n, s, g, t] pads
++    // g, its second-to-last dim, to a whole tile. An exact FP32 matmul
++    // (ttcore.fp32_exact) takes its operands untransposed.
++    int64_t contractionSize =
++        computeProductOfDims(lhsType.getShape(), lhsContractDims);
++    bool transposeLhs = false;
++    bool transposeRhs = false;
++    if (isa<FloatType>(elementType) && contractionSize != 1 &&
++        !op->hasAttr("ttcore.fp32_exact")) {
++      SmallVector<int64_t> lhsTransposed =
++          getPermutation(lhsBatchDims, lhsContractDims, lhsResultDims);
++      if (!readsInOrder(lhsType, lhsPermutation) &&
++          readsInOrder(lhsType, lhsTransposed)) {
++        transposeLhs = true;
++        lhsPermutation = lhsTransposed;
++      }
++      SmallVector<int64_t> rhsTransposed =
++          getPermutation(rhsBatchDims, rhsResultDims, rhsContractDims);
++      if (!readsInOrder(rhsType, rhsPermutation) &&
++          readsInOrder(rhsType, rhsTransposed)) {
++        transposeRhs = true;
++        rhsPermutation = rhsTransposed;
++      }
++    }
++
+     // Apply these permutations to lhs and rhs.
+ 
+     Value lhsPermute = permuteOperand(
+@@ -318,10 +348,16 @@
+     // for lhs (batch dims, prod(result dims), prod(contract dims))
+     // for rhs (batch dims, prod(contract dims), prod(result dims))
+ 
+-    SmallVector<int64_t> lhsMatmulInputShape = computeMatmulInputShape(
+-        rewriter, lhsType, lhsBatchDims, lhsResultDims, lhsContractDims);
+-    SmallVector<int64_t> rhsMatmulInputShape = computeMatmulInputShape(
+-        rewriter, rhsType, rhsBatchDims, rhsContractDims, rhsResultDims);
++    SmallVector<int64_t> lhsMatmulInputShape =
++        transposeLhs ? computeMatmulInputShape(rewriter, lhsType, lhsBatchDims,
++                                               lhsContractDims, lhsResultDims)
++                     : computeMatmulInputShape(rewriter, lhsType, lhsBatchDims,
++                                               lhsResultDims, lhsContractDims);
++    SmallVector<int64_t> rhsMatmulInputShape =
++        transposeRhs ? computeMatmulInputShape(rewriter, rhsType, rhsBatchDims,
++                                               rhsResultDims, rhsContractDims)
++                     : computeMatmulInputShape(rewriter, rhsType, rhsBatchDims,
++                                               rhsContractDims, rhsResultDims);
+ 
+     // Apply this reshape to lhs and rhs to adapt to matmul op.
+     // For lhs: (batch dims, prod(result dims), prod(contract dims))
+@@ -351,8 +387,6 @@
+     // elementwise multiply to keep full f32 precision. lhsMatmulInput is
+     // [..., M, 1] and rhsMatmulInput is [..., 1, N], so they broadcast-multiply
+     // to the matmul destination shape [..., M, N].
+-    int64_t contractionSize =
+-        computeProductOfDims(lhsType.getShape(), lhsContractDims);
+     Value contractionResult;
+     if (contractionSize == 1) {
+       contractionResult = rewriter.create<ttir::MultiplyOp>(
+@@ -390,7 +424,7 @@
+       auto matmul = rewriter.create<ttir::MatmulOp>(
+           op.getLoc(),
+           RankedTensorType::get(matmulDestinationShape, elementType),
+-          lhsMatmulInput, rhsMatmulInput);
++          lhsMatmulInput, rhsMatmulInput, transposeLhs, transposeRhs);
+       if (auto attr = op->getAttr("ttcore.fp32_exact")) {
+         matmul->setAttr("ttcore.fp32_exact", attr);
+       }
+@@ -615,6 +649,19 @@
+   // size-1 second-to-last dim to a whole tile. jax.nn.dot_product_attention's
+   // query, [B, T, N, 1, H] with groups of one head, is permuted as [B, T, N, H]
+   // to [B, N, T, H] instead of to [B, N, T, 1, H], 32 times its size.
++  // Whether the matmul reshape alone reads an operand in the order of
++  // `permutation`: its permute would only move size-1 dims (permuteOperand).
++  bool readsInOrder(RankedTensorType inputType,
++                    ArrayRef<int64_t> permutation) const {
++    SmallVector<int64_t> nonUnit;
++    for (int64_t d : permutation) {
++      if (inputType.getDimSize(d) != 1) {
++        nonUnit.push_back(d);
++      }
++    }
++    return llvm::is_sorted(nonUnit);
++  }
++
+   Value permuteOperand(PatternRewriter &rewriter, Location loc, Value input,
+                        RankedTensorType inputType,
+                        ArrayRef<int64_t> permutation) const {
