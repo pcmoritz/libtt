@@ -8,8 +8,9 @@ the experts in BFP4, or in BF16 with weight_dtype="bf16". The experts are split
 evenly over the mesh in device order, so the layer is the sum over devices.
 Batches of more than 512 tokens take several kernel calls.
 
-With weight_dtype="fp8" the kernel reads FP8 experts as they are and applies
-their scales, one per expert and output column, as SGLang-TorchTPU passes them.
+FP8 experts come with scales, one per expert and output column, as
+SGLang-TorchTPU passes them: the kernel reads the experts as they are and
+applies the scales.
 """
 
 import jax
@@ -133,8 +134,8 @@ def test_fp8_experts(tokens, padding):
     (w13, s13), (w2, s2) = fp8_channelwise(np.concatenate([w1, w3], -1)), fp8_channelwise(w2)
 
     def layer(x, weights, ids, w13, s13, w2, s2):
-        experts = sglang_tpu_kernels._fp8_experts(w13, s13, w2, s2)
-        return jax.lax.psum(fused_moe_ep(x, weights, ids, *experts, weight_dtype="fp8"), axes)
+        experts = (w13[..., :INTERMEDIATE], w13[..., INTERMEDIATE:], w2, *sglang_tpu_kernels._fp8_scales(w13, s13, s2))
+        return jax.lax.psum(fused_moe_ep(x, weights, ids, *experts), axes)
 
     split3, split4 = P(axes, None, None), P(axes, None, None, None)
     specs = (split3, split4, split3, split4)

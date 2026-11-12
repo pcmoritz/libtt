@@ -23,9 +23,8 @@
 // the (token, expert) pairs of the experts its device owns and writes each
 // pair's output unweighted.
 //
-// With weight_dtype = "fp8" the experts are float8_e4m3fn, which the kernel
-// reads as they are, and come with an FP32 scale per expert and output column,
-// which it applies:
+// Float8_e4m3fn experts the kernel reads as they are; they come with an FP32
+// scale per expert and output column, which it applies:
 //   s1, s3       [E_local, I] f32 the gate and up projections' scales,
 //   s2           [E_local, H] f32 and the down projections'.
 // This lowering chunks the tokens, builds
@@ -70,8 +69,8 @@ public:
     if (adaptor.getCallTargetName() != "tt.fused_moe_ep") {
       return failure();
     }
-    // The experts' dtype in the kernel: BFP4 unless the call asks for BF16 or
-    // passes float8 experts.
+    // The experts' dtype in the kernel: float8 experts' own, others' BFP4
+    // unless the call asks for BF16.
     auto config = dyn_cast_or_null<DictionaryAttr>(op.getBackendConfigAttr());
     if (!config) {
       config = dyn_cast_or_null<DictionaryAttr>(
@@ -80,14 +79,13 @@ public:
     StringAttr weightDtype =
         config ? config.getAs<StringAttr>("weight_dtype") : nullptr;
     if (weightDtype && weightDtype.getValue() != "bfp4" &&
-        weightDtype.getValue() != "bf16" && weightDtype.getValue() != "fp8") {
+        weightDtype.getValue() != "bf16") {
       return rewriter.notifyMatchFailure(
-          op, "tt.fused_moe_ep's weight_dtype is bfp4, bf16 or fp8");
+          op, "tt.fused_moe_ep's weight_dtype is bfp4 or bf16");
     }
-    const bool bf16Weights = weightDtype && weightDtype.getValue() == "bf16";
-    const bool fp8Weights = weightDtype && weightDtype.getValue() == "fp8";
 
-    if (adaptor.getOperands().size() != (fp8Weights ? 9u : 6u) ||
+    if ((adaptor.getOperands().size() != 6 &&
+         adaptor.getOperands().size() != 9) ||
         op->getNumResults() != 1) {
       return rewriter.notifyMatchFailure(
           op, "tt.fused_moe_ep takes x, topk_weights, topk_ids, w1, w3 and "
@@ -106,6 +104,9 @@ public:
     auto xType = cast<RankedTensorType>(x.getType());
     auto idsType = cast<RankedTensorType>(ids.getType());
     auto w1Type = cast<RankedTensorType>(w1.getType());
+    const bool fp8Weights = isa<Float8E4M3FNType>(w1Type.getElementType());
+    const bool bf16Weights =
+        !fp8Weights && weightDtype && weightDtype.getValue() == "bf16";
     auto outType = cast<RankedTensorType>(
         getTypeConverter()->convertType(op.getResult(0).getType()));
     if (xType.getRank() != 2 || idsType.getRank() != 2 ||
@@ -115,10 +116,15 @@ public:
         shapeOf(w3) != w1Type.getShape() ||
         shapeOf(w2) != ArrayRef<int64_t>{w1Type.getDimSize(0),
                                          w1Type.getDimSize(2),
-                                         xType.getDimSize(1)}) {
+                                         w1Type.getDimSize(1)}) {
       return rewriter.notifyMatchFailure(
           op, "tt.fused_moe_ep expects x [T, H], topk_weights and topk_ids "
               "[T, k], w1 and w3 [E_local, H, I] and w2 [E_local, I, H]");
+    }
+    if (fp8Weights != (adaptor.getOperands().size() == 9)) {
+      return rewriter.notifyMatchFailure(
+          op, "tt.fused_moe_ep takes scales s1, s3 and s2 with float8_e4m3fn "
+              "experts and only with them");
     }
     if (fp8Weights) {
       auto isScale = [&](Value value, int64_t columns) {
@@ -127,14 +133,12 @@ public:
                type.getShape() ==
                    ArrayRef<int64_t>{w1Type.getDimSize(0), columns};
       };
-      if (!isa<Float8E4M3FNType>(w1Type.getElementType()) ||
-          !isScale(adaptor.getOperands()[6], w1Type.getDimSize(2)) ||
+      if (!isScale(adaptor.getOperands()[6], w1Type.getDimSize(2)) ||
           !isScale(adaptor.getOperands()[7], w1Type.getDimSize(2)) ||
           !isScale(adaptor.getOperands()[8], xType.getDimSize(1))) {
         return rewriter.notifyMatchFailure(
-            op, "tt.fused_moe_ep with float8 experts expects float8_e4m3fn "
-                "experts and f32 scales s1 and s3 [E_local, I] and s2 "
-                "[E_local, H]");
+            op, "tt.fused_moe_ep with float8 experts expects f32 scales s1 "
+                "and s3 [E_local, I] and s2 [E_local, H]");
       }
     }
     // The kernel reads int32 or uint16 ids.
@@ -269,10 +273,10 @@ public:
           rewriter.getUI32IntegerAttr(intermediate), activation,
           /*cluster_axis=*/IntegerAttr(),
           rewriter.getUI32IntegerAttr(bf16Weights ? kBf16Rings : kRings),
-          bf16Weights
-              ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::BFloat16)
-          : fp8Weights
+          fp8Weights
               ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::Float8E4M3FN)
+          : bf16Weights
+              ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::BFloat16)
               : ttcore::DataTypeAttr());
 
       // Each token's weighted sum of its slots as one matmul in FP32: row i

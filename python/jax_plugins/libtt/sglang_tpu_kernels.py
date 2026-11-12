@@ -524,22 +524,21 @@ def patch_all_gather_via_all_reduce(module):
     module.all_gather_into_tensor_around = all_gather_into_tensor_around
 
 
-def _fp8_experts(w13, w13_scale, w2, w2_scale):
-    """FP8 experts as tt.fused_moe_ep takes them: `w13` ([experts, k, 2 * n],
-    gate then up projections) and `w2` ([experts, n, k]) with an FP32 scale per
-    expert and output column (or one per expert). Returns the gate, the up and
-    the down projections ([experts, k, n] twice and [experts, n, k]), then
-    their scales ([experts, n] twice and [experts, k] float32)."""
+def _fp8_scales(w13, w13_scale, w2_scale):
+    """The scales tt.fused_moe_ep takes with FP8 experts `w13` ([experts, k,
+    2 * n], gate then up projections) and w2 ([experts, n, k]), from a scale
+    per expert and output column (or one per expert): the gate's and the up
+    projection's ([experts, n] each), then the down projection's ([experts,
+    k]), float32."""
     import jax.numpy as jnp
 
     experts, k, gate_up = w13.shape
-    n = gate_up // 2
 
     def scales(scale, columns):
         return jnp.broadcast_to(scale.astype(jnp.float32).reshape(experts, -1), (experts, columns))
 
     scale13 = scales(w13_scale, gate_up)
-    return w13[..., :n], w13[..., n:], w2, scale13[:, :n], scale13[:, n:], scales(w2_scale, k)
+    return scale13[:, : gate_up // 2], scale13[:, gate_up // 2 :], scales(w2_scale, k)
 
 
 def _fused_moe_jax(
@@ -614,24 +613,11 @@ def _fused_moe_jax(
         )
 
     w1, w2 = weight(w1), weight(w2)
-    out = jax.ShapeDtypeStruct(hidden_states.shape, hidden_states.dtype)
+    fused_moe_ep = jax.ffi.ffi_call("tt.fused_moe_ep", jax.ShapeDtypeStruct(hidden_states.shape, hidden_states.dtype))
+    operands = (hidden_states, topk_weights, topk_ids, w1[..., : gate_up // 2], w1[..., gate_up // 2 :], w2)
     if fp8:
-        return jax.ffi.ffi_call("tt.fused_moe_ep", out)(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            *_fp8_experts(w1, weight(w1_scale), w2, weight(w2_scale)),
-            weight_dtype="fp8",
-        )
-    return jax.ffi.ffi_call("tt.fused_moe_ep", out)(
-        hidden_states,
-        topk_weights,
-        topk_ids,
-        w1[..., : gate_up // 2],
-        w1[..., gate_up // 2 :],
-        w2,
-        weight_dtype="bf16",
-    )
+        return fused_moe_ep(*operands, *_fp8_scales(w1, weight(w1_scale), weight(w2_scale)))
+    return fused_moe_ep(*operands, weight_dtype="bf16")
 
 
 def patch_fused_moe(module):
