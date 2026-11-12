@@ -1,0 +1,28 @@
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize/device/tilize_multi_core_block_program_factory.cpp
+@@ -361,7 +361,9 @@ ttnn::device_operation::ProgramArtifacts TilizeMultiCoreBlockProgramFactory::cre
+             single_block_size,
+             single_block_size_cliff_row);
+     }
+-    if (has_cliff_col) {
++    // A tensor narrower than a block has no full-width blocks, so the bottom edge has no cliff-column cores;
++    // their kernel would bind the full-width blocks' buffers, which then don't exist.
++    if (!cliff_col_core_range.empty()) {
+         add_compute_region(
+             COMPUTE_CLIFF_COL,
+             "wu_cliff_col",
+diff --git ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/factories/tilize_with_val_padding_multi_core_block_interleaved_program_factory.cpp
+@@ -365,7 +365,9 @@ ttnn::device_operation::ProgramArtifacts TilizeWithValPaddingMultiCoreBlockInter
+             single_block_size,
+             single_block_size_cliff_row);
+     }
+-    if (has_cliff_col) {
++    // A tensor narrower than a block has no full-width blocks, so the bottom edge has no cliff-column cores;
++    // their kernel would bind the full-width blocks' buffers, which then don't exist.
++    if (!cliff_col_core_range.empty()) {
+         add_compute_region(
+             COMPUTE_CLIFF_COL,
+             "wu_cliff_col",
