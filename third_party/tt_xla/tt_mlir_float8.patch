@@ -673,7 +673,21 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
-@@ -121,9 +121,11 @@ private:
+@@ -110,9 +110,12 @@ private:
+   // Device capability predicates.
+   //===--------------------------------------------------------------------===//
+ 
++  // Float8 tilizes and untilizes on device as its bytes (ttnn.to_layout).
+   bool
+   isOnDeviceLayoutChangeSupportedForDataType(ttcore::DataType dataType) const {
+-    return dataType == ttcore::DataType::BFloat16 ||
++    return dataType == ttcore::DataType::Float8E4M3FN ||
++           dataType == ttcore::DataType::Float8E5M2 ||
++           dataType == ttcore::DataType::BFloat16 ||
+            dataType == ttcore::DataType::Float16 ||
+            dataType == ttcore::DataType::Float32 ||
+            dataType == ttcore::DataType::UInt32 ||
+@@ -121,9 +124,11 @@ private:
    }
  
    // ttnn.to_layout only performs a real numeric conversion within the float

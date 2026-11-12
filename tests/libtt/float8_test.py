@@ -59,7 +59,7 @@ def test_float8_buffers_round_trip(dtype):
 def test_device_moves_float8_as_float8(tmp_path, dtype, level):
     """Data movement (transposes, reshapes, slices, concatenations, broadcasts, padding, selects,
     gathers and row updates) takes float8 tensors as they are, every code unchanged: no op on the
-    device reads their bytes as uint8."""
+    device reads their bytes as uint8, and their layout changes stay on the device."""
     codes = all_codes(dtype)
     rows = np.array([3, 0, 31, 7], np.int32)
     mask = np.random.default_rng(8).integers(0, 2, (32, 32)).astype(bool)
@@ -82,6 +82,8 @@ def test_device_moves_float8_as_float8(tmp_path, dtype, level):
     assert irs
     uint8 = [line for ir in irs for line in ir.splitlines() if re.search(r"tensor<[0-9x]*ui8", line)]
     assert not uint8, uint8
+    to_host = [line for ir in irs for line in ir.splitlines() if '"ttnn.from_device"' in line]
+    assert not to_host, to_host
 
 
 @pytest.mark.parametrize("dtype", FORMATS)
