@@ -107,7 +107,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    }
  
    ::ttnn::Shape ttnnShape(shape);
-@@ -146,20 +167,20 @@ createOwnedTTNNTensor(const void *data, const std::vector<std::uint32_t> &shape,
+@@ -146,20 +167,24 @@ createOwnedTTNNTensor(const void *data, const std::vector<std::uint32_t> &shape,
  
    switch (ttnnDataType) {
    case ::ttnn::DataType::FLOAT32:
@@ -130,6 +130,10 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    case ::ttnn::DataType::UINT8:
 -    return utils::createTTNNTensor<uint8_t>(src, ttnnShape, ttnnDataType);
 +    return createTTNNTensor<uint8_t>(src, buffer, ttnnShape, ttnnDataType);
++  case ::ttnn::DataType::FP8_E4M3:
++    return createTTNNTensor<float8_e4m3>(src, buffer, ttnnShape, ttnnDataType);
++  case ::ttnn::DataType::FP8_E5M2:
++    return createTTNNTensor<float8_e5m2>(src, buffer, ttnnShape, ttnnDataType);
    case ::ttnn::DataType::INT32:
 -    return utils::createTTNNTensor<int32_t>(src, ttnnShape, ttnnDataType);
 +    return createTTNNTensor<int32_t>(src, buffer, ttnnShape, ttnnDataType);
