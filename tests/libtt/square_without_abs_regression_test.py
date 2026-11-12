@@ -30,3 +30,17 @@ def test_sum_of_squared_absolute_values(tmp_path, cast):
     np.testing.assert_allclose(float(total), np.sqrt(np.sum(xf * xf)), rtol=1e-6)
     irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
     assert irs and all('"ttnn.abs"' not in ir for ir in irs)
+
+
+def test_square_of_absolute_value_cast_to_unsigned():
+    # A cast to an unsigned type clamps negative values to 0, so the absolute
+    # value before it stays: -3.0 squares to 9, not 0.
+    x = np.array([-3, -2, -1, 0, 1, 2, 3, 8] * 32, dtype=np.float32).reshape(8, 32)
+
+    def square(x):
+        a = jnp.abs(x).astype(jnp.uint32)
+        return a * a
+
+    got = jax.jit(square)(jax.device_put(x, jax.devices("tt")[0]))
+    want = np.abs(x).astype(np.uint32) ** 2
+    np.testing.assert_array_equal(np.asarray(got), want)
