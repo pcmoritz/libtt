@@ -265,3 +265,52 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/repeat.cpp ttnn/cpp/ttn
      auto [working_tensor, working_repetition_vector] = detail::match_input_rank(input_tensor, repetition_vector);
      const MemoryConfig output_mem_config =
          detail::derive_output_mem_config(input_tensor, memory_config, optional_output_tensor);
+diff --git ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
+@@ -3,7 +3,10 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include "ttnn/operations/core/core.hpp"
++#include "ttnn/operations/creation/creation.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
++#include "ttnn/operations/data_movement/common/float8.hpp"
++#include "ttnn/operations/data_movement/concat/concat.hpp"
+ #include "ttnn/operations/data_movement/fill_pad/device/fill_pad_device_operation.hpp"
+ #include "ttnn/operations/data_movement/fill_pad/fill_pad.hpp"
+ #include "ttnn/operations/data_movement/pad/codegen/pad_codegen_device_operation.hpp"
+@@ -672,6 +675,34 @@ ttnn::Tensor pad_with_route(
+         return input_tensor;
+     }
+ 
++    // Pad's kernels move 2- and 4-byte elements. Float8 is padded by concatenating tensors of the pad value,
++    // which full encodes exactly (data_movement/common/float8.hpp), along each padded dimension.
++    if (is_float8(input_tensor.dtype()) && input_tensor.storage_type() == StorageType::DEVICE) {
++        ttnn::Tensor padded = input_tensor;
++        for (int dim = 0; dim < original_rank; ++dim) {
++            const auto [before, after] = working_padding[dim];
++            if (before == 0 && after == 0) {
++                continue;
++            }
++            const auto fill = [&](uint32_t size) {
++                ttsl::SmallVector<uint32_t> shape(padded.logical_shape().cbegin(), padded.logical_shape().cend());
++                shape[dim] = size;
++                return ttnn::full(
++                    ttnn::Shape(shape), value, padded.dtype(), padded.layout(), *padded.device(), padded.memory_config());
++            };
++            std::vector<ttnn::Tensor> parts;
++            if (before != 0) {
++                parts.push_back(fill(before));
++            }
++            parts.push_back(padded);
++            if (after != 0) {
++                parts.push_back(fill(after));
++            }
++            padded = ttnn::concat(parts, dim, memory_config_arg);
++        }
++        return padded;
++    }
++
+     ttnn::Tensor working_tensor = input_tensor;
+     if (original_rank > 4) {
+         if (input_tensor.storage_type() != StorageType::DEVICE) {

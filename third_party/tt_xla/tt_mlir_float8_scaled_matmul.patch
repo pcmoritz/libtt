@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
 --- a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
-@@ -93,6 +93,49 @@ bool hasNativeFloat8Operands(mlir::stablehlo::DotGeneralOp op) {
+@@ -87,6 +87,49 @@ bool hasNativeFloat8Operands(mlir::stablehlo::DotGeneralOp op) {
           rhsContracting.size() == 1 && rhsContracting[0] == batch;
  }
  
@@ -51,7 +51,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
  // A value converted to the given element type: float8 values through f32.
  Value convertTo(OpBuilder &builder, Location loc, Value value,
                  Type elementType) {
-@@ -360,6 +403,13 @@ struct StableHLOFloat8DataTypeConversionPass
+@@ -290,6 +333,13 @@ struct StableHLOFloat8DataTypeConversionPass
        StableHLOFloat8DataTypeConversionPassBase;
  
    void runOnOperation() override {

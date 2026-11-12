@@ -2,8 +2,9 @@
 
 // TTNN's data-movement ops take float8 tensors (FP8_E4M3, FP8_E5M2) on device as they are: each op returns a float8
 // tensor holding exactly the bytes it moves for the same data as UINT8. Float8 moves as libtt moves FLOAT16:
-// permute and transpose declare its buffers UInt8 (data_movement_format), and to_layout and repeat move it as UINT8
-// (float8_data_movement.patch). Before, untilize, last-two-dimension permutes, unaligned tile slices and tile
+// permute and transpose declare its buffers UInt8 (data_movement_format), to_layout and repeat move it as UINT8
+// (float8_data_movement.patch), where selects it as UInt8 bytes, and pad concatenates it with full tensors of the
+// pad value. Before, untilize, last-two-dimension permutes, unaligned tile slices and tile
 // concats asked for 32-bit DEST, whose float8 conversions aren't exact; data-moving reshapes, full and e5m2 copies
 // rejected float8, and tilize returned FLOAT32.
 
@@ -23,10 +24,12 @@
 #include "ttnn/operations/creation/creation.hpp"
 #include "ttnn/operations/data_movement/concat/concat.hpp"
 #include "ttnn/operations/data_movement/copy/copy.hpp"
+#include "ttnn/operations/data_movement/pad/pad.hpp"
 #include "ttnn/operations/data_movement/permute/permute.hpp"
 #include "ttnn/operations/data_movement/repeat/repeat.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
+#include "ttnn/operations/eltwise/ternary/ternary.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
 #include "ttnn/tensor/tensor.hpp"
 
@@ -170,6 +173,53 @@ TEST_F(Float8DataMovementTest, ReshapePadding) {
         const uint8_t one = dtype == DataType::FP8_E4M3 ? 0x38 : 0x3c;
         for (size_t i = 0; i < all.size(); ++i) {
             ASSERT_EQ(all[i], i < values.size() ? values[i] : one) << dtype << " at " << i;
+        }
+    }
+}
+
+// where selects bytes: a bfloat16 predicate picks each float8 code of either tensor unchanged.
+TEST_F(Float8DataMovementTest, Where) {
+    const ttnn::Shape shape({64, 96});
+    const auto a = bytes(shape, Layout::TILE);
+    const std::vector<uint8_t> a_bytes = a.cpu().to_vector<uint8_t>();
+    const std::vector<uint8_t> b_bytes(a_bytes.rbegin(), a_bytes.rend());
+    const TensorSpec bytes_spec(shape, TensorLayout(DataType::UINT8, PageConfig(Layout::TILE), {}));
+    const auto b = ttnn::Tensor::from_vector(b_bytes, bytes_spec).to_device(mesh_device_.get());
+    std::vector<bfloat16> predicate(shape.volume());
+    std::vector<uint8_t> want(shape.volume());
+    for (size_t i = 0; i < predicate.size(); ++i) {
+        const bool take_a = (i * 7 + i / 5) % 3 != 0;
+        predicate[i] = bfloat16(take_a ? 1.0f : 0.0f);
+        want[i] = take_a ? a_bytes[i] : b_bytes[i];
+    }
+    const TensorSpec predicate_spec(shape, TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), {}));
+    const auto p = ttnn::Tensor::from_vector(predicate, predicate_spec).to_device(mesh_device_.get());
+    for (DataType dtype : {DataType::FP8_E4M3, DataType::FP8_E5M2}) {
+        const auto out = ttnn::where(p, ttnn::bitcast(a, dtype), ttnn::bitcast(b, dtype));
+        ASSERT_EQ(out.dtype(), dtype);
+        EXPECT_EQ(ttnn::bitcast(out, DataType::UINT8).cpu().to_vector<uint8_t>(), want) << dtype;
+    }
+}
+
+// pad fills float8 padding, before and after the data, with the pad value's code, in both layouts.
+TEST_F(Float8DataMovementTest, Pad) {
+    for (Layout layout : {Layout::ROW_MAJOR, Layout::TILE}) {
+        const auto x = bytes(ttnn::Shape({50, 70}), layout);
+        const auto values = x.cpu().to_vector<uint8_t>();
+        for (DataType dtype : {DataType::FP8_E4M3, DataType::FP8_E5M2}) {
+            const ttsl::SmallVector<std::array<uint32_t, 2>> padding = {{3, 11}, {2, 24}};
+            const auto out = ttnn::pad(ttnn::bitcast(x, dtype), padding, 1.0f);
+            ASSERT_EQ(out.dtype(), dtype);
+            ASSERT_EQ(out.logical_shape(), ttnn::Shape({64, 96}));
+            const auto got = ttnn::bitcast(out, DataType::UINT8).cpu().to_vector<uint8_t>();
+            const uint8_t one = dtype == DataType::FP8_E4M3 ? 0x38 : 0x3c;
+            for (uint32_t r = 0; r < 64; ++r) {
+                for (uint32_t c = 0; c < 96; ++c) {
+                    const bool inside = r >= 3 && r < 53 && c >= 2 && c < 72;
+                    ASSERT_EQ(got[r * 96 + c], inside ? values[(r - 3) * 70 + c - 2] : one)
+                        << dtype << " " << layout << " at " << r << ", " << c;
+                }
+            }
         }
     }
 }

@@ -1,17 +1,18 @@
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -453,7 +453,8 @@
+@@ -449,7 +449,9 @@ TTNNOperandsWorkarounds TTNNOperandsWorkaroundsFactory::
  // incorrect results or other failures. Add a data type workaround if predicate
  // type does not match with input. Native Int32 where keeps its operands exact;
  // other integer combinations use Float32 until their native paths are
 -// reliable.
 +// reliable. Float16 where moves its values as raw bits and tests a bfloat16
-+// predicate as a number, so that predicate is kept as is.
++// predicate as a number, so that predicate is kept as is. Float8 where moves
++// its values as bytes and tests a bfloat16 predicate the same way.
  // tt-metal issues to track mixed data types ops bug.
  // https://github.com/tenstorrent/tt-metal/issues/17998
  // https://github.com/tenstorrent/tt-metal/issues/24511
-@@ -472,8 +473,11 @@
+@@ -468,8 +470,17 @@ TTNNOperandsWorkaroundsFactory::createWhereOpOperandsWorkarounds(
    TTNNOperandWorkarounds inputTypeWorkaround;
    TTNNOperandWorkarounds outputTypeWorkaround;
  
@@ -19,9 +20,15 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 -      predicateElementType != inputElementType) {
 +  bool float16WithBf16Predicate =
 +      inputElementType.isF16() && predicateElementType.isBF16();
-+  if (!float16WithBf16Predicate &&
-+      (predicateElementType.isInteger() ||
-+       predicateElementType != inputElementType)) {
++  if (mlir::isa<mlir::Float8E4M3FNType, mlir::Float8E5M2Type>(
++          inputElementType)) {
++    if (!predicateElementType.isBF16()) {
++      predicateTypeWorkaround =
++          TTNNOperandWorkarounds(ttcore::DataType::BFloat16);
++    }
++  } else if (!float16WithBf16Predicate &&
++             (predicateElementType.isInteger() ||
++              predicateElementType != inputElementType)) {
      if (inputElementType.isInteger()) {
        ttcore::DataType inputDataType =
            ttcore::elementTypeToDataType(inputElementType);
