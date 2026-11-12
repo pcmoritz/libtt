@@ -2,8 +2,8 @@
 
 // TTNN's data-movement ops take float8 tensors (FP8_E4M3, FP8_E5M2) on device as they are: each op returns a float8
 // tensor holding exactly the bytes it moves for the same data as UINT8. Float8 moves as libtt moves FLOAT16:
-// permute and transpose declare its buffers UInt8 (data_movement_format), and to_layout tilizes and untilizes it as
-// UINT8 (float8_data_movement.patch). Before, untilize, last-two-dimension permutes, unaligned tile slices and tile
+// permute and transpose declare its buffers UInt8 (data_movement_format), and to_layout and repeat move it as UINT8
+// (float8_data_movement.patch). Before, untilize, last-two-dimension permutes, unaligned tile slices and tile
 // concats asked for 32-bit DEST, whose float8 conversions aren't exact; data-moving reshapes, full and e5m2 copies
 // rejected float8, and tilize returned FLOAT32.
 
@@ -24,6 +24,7 @@
 #include "ttnn/operations/data_movement/concat/concat.hpp"
 #include "ttnn/operations/data_movement/copy/copy.hpp"
 #include "ttnn/operations/data_movement/permute/permute.hpp"
+#include "ttnn/operations/data_movement/repeat/repeat.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
 #include "ttnn/operations/eltwise/unary/unary.hpp"
@@ -86,7 +87,7 @@ TEST_F(Float8DataMovementTest, Layouts) {
     expect_bytes_kept("to_layout ROW_MAJOR, padded", bytes(ttnn::Shape({50, 70}), Layout::TILE), to_rows);
 }
 
-TEST_F(Float8DataMovementTest, ReshapeSlicePermuteConcatCopy) {
+TEST_F(Float8DataMovementTest, ReshapeSlicePermuteRepeatConcatCopy) {
     for (Layout layout : {Layout::ROW_MAJOR, Layout::TILE}) {
         const std::string l = layout == Layout::TILE ? " TILE" : " ROW_MAJOR";
         const auto x = bytes(ttnn::Shape({64, 96}), layout);
@@ -99,6 +100,10 @@ TEST_F(Float8DataMovementTest, ReshapeSlicePermuteConcatCopy) {
         expect_bytes_kept("slice unaligned" + l, x, [](const ttnn::Tensor& t) { return slice(t, {5, 3}, {37, 70}); });
         expect_bytes_kept("permute" + l, x, [](const ttnn::Tensor& t) { return ttnn::permute(t, {1, 0}); });
         expect_bytes_kept("permute 021" + l, x3, [](const ttnn::Tensor& t) { return ttnn::permute(t, {0, 2, 1}); });
+        expect_bytes_kept("repeat" + l, x, [](const ttnn::Tensor& t) { return ttnn::repeat(t, ttnn::Shape({2, 3})); });
+        expect_bytes_kept("repeat rows" + l, bytes(ttnn::Shape({1, 96}), layout), [](const ttnn::Tensor& t) {
+            return ttnn::repeat(t, ttnn::Shape({40, 1}));
+        });
         expect_bytes_kept("concat 0" + l, x, [](const ttnn::Tensor& t) { return ttnn::concat({t, t}, 0); });
         expect_bytes_kept("concat 1" + l, x, [](const ttnn::Tensor& t) { return ttnn::concat({t, t}, 1); });
         // Padded tiles: concat untilizes and retilizes them.

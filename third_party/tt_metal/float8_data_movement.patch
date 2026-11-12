@@ -231,3 +231,37 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/fill_pad/fill_pad.cpp ttnn/cpp
      auto mutable_input_tensor = input_tensor;
      auto output_memory_config = memory_config.value_or(input_tensor.memory_config());
      if (is_block_float(input_tensor.dtype())) {
+diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/repeat.cpp ttnn/cpp/ttnn/operations/data_movement/repeat/repeat.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/repeat/repeat.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/repeat/repeat.cpp
+@@ -21,8 +21,10 @@
+ #include "ttnn/operations/data_movement/untilize/untilize.hpp"
+ #include "ttnn/operations/data_movement/view/view.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
++#include "ttnn/operations/data_movement/common/float8.hpp"
+ #include "ttnn/operations/functions.hpp"
+ #include "ttnn/operation.hpp"
++#include "ttnn/tensor/tensor_ops.hpp"
+ #include "ttnn/tensor/tensor_utils.hpp"
+ #include "device/repeat_device_operation.hpp"
+ #include "device/repeat_utils.hpp"
+@@ -671,6 +673,19 @@ ttnn::Tensor repeat(
+     namespace detail = operations::data_movement::detail;
+     namespace repeat_codegen = operations::data_movement::repeat_codegen;
+ 
++    // Float8 moves as UINT8, as to_layout moves it (data_movement/common/float8.hpp): untilizing it
++    // directly would read it into the DEST register, whose float8 conversions aren't exact.
++    if (operations::data_movement::is_float8(input_tensor.dtype())) {
++        std::optional<Tensor> output_bytes;
++        if (optional_output_tensor.has_value()) {
++            TT_FATAL(optional_output_tensor->dtype() == input_tensor.dtype(), "repeat optional output dtype mismatch");
++            output_bytes = unchecked_reinterpret_dtype(*optional_output_tensor, DataType::UINT8);
++        }
++        const Tensor repeated = ttnn::repeat(
++            unchecked_reinterpret_dtype(input_tensor, DataType::UINT8), repetition_vector, memory_config, output_bytes);
++        return unchecked_reinterpret_dtype(repeated, input_tensor.dtype());
++    }
++
+     auto [working_tensor, working_repetition_vector] = detail::match_input_rank(input_tensor, repetition_vector);
+     const MemoryConfig output_mem_config =
+         detail::derive_output_mem_config(input_tensor, memory_config, optional_output_tensor);

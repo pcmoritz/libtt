@@ -13,8 +13,8 @@ diff --git a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td b/include/ttm
 +    values (reshape, transpose, slice, concatenate, ...) move them as they
 +    are, and a dot_general of two float8 matrices, [batch..., M, K] x
 +    [batch..., K, N], keeps its float8 operands, which the matrix unit reads
-+    natively. Broadcasts, row updates, gathers, padding and selects, whose
-+    TTNN versions don't take float8, run on ui8 views of the bits.
++    natively. Row updates, gathers, padding and selects, whose TTNN versions
++    don't take float8, run on ui8 views of the bits.
 +
 +    stablehlo.convert between float8 and f32 stays, for ttnn's typecast, which
 +    converts exactly: every code decodes, and encoding rounds to nearest even,
@@ -205,7 +205,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
 new file mode 100644
 --- /dev/null
 +++ b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
-@@ -0,0 +1,405 @@
+@@ -0,0 +1,404 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -240,10 +240,10 @@ new file mode 100644
 +// values compute in f32. Float8 constants are views of constants of their
 +// bits, which TTIR's constants hold.
 +//
-+// The ops whose TTNN versions don't take float8 tensors (broadcasts, row
-+// updates, gathers, padding and selects) move their bits: they run on ui8
-+// views of their float8 operands, and their results are float8 views of
-+// theirs, next to them.
++// The ops whose TTNN versions don't take float8 tensors (row updates,
++// gathers, padding and selects) move their bits: they run on ui8 views of
++// their float8 operands, and their results are float8 views of theirs, next
++// to them.
 +//
 +// Control flow (while, case, if, shard_map bodies) carries float8 values as
 +// they are, as do Shardy's collectives and reshards (sdy.all_slice
@@ -359,18 +359,17 @@ new file mode 100644
 +  }
 +  OpBuilder builder(op);
 +  Value bits = bitsOf(builder, op.getLoc(), op);
-+  op.replaceAllUsesWith(builder.create<mlir::stablehlo::BitcastConvertOp>(
-+      op.getLoc(), op.getType(), bits));
++  Value view = builder.create<mlir::stablehlo::BitcastConvertOp>(
++      op.getLoc(), op.getType(), bits);
++  op.replaceAllUsesWith(view);
 +  op.erase();
 +}
 +
 +// Ops whose TTNN versions don't take float8 tensors move their bits instead:
-+// broadcasts (ttnn.repeat), row updates, gathers (ttnn.embedding), padding
-+// (ttnn.pad) and selects (ttnn.where, which would convert float8 in the DEST
-+// register, inexactly).
++// row updates, gathers (ttnn.embedding), padding (ttnn.pad) and selects
++// (ttnn.where, which would convert float8 in the DEST register, inexactly).
 +bool ttnnTakesNoFloat8(Operation *op) {
-+  return isa<mlir::stablehlo::BroadcastInDimOp,
-+             mlir::stablehlo::DynamicUpdateSliceOp, mlir::stablehlo::GatherOp,
++  return isa<mlir::stablehlo::DynamicUpdateSliceOp, mlir::stablehlo::GatherOp,
 +             mlir::stablehlo::PadOp, mlir::stablehlo::SelectOp>(op);
 +}
 +

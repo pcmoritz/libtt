@@ -10,6 +10,8 @@ fold). A matmul of two float8 matrices reads them
 natively on the matrix unit, which flushes subnormal operands to zero.
 """
 
+import re
+
 import jax
 from jax import core
 from jax._src.lib.mlir import ir
@@ -59,31 +61,45 @@ def test_float8_buffers_round_trip(dtype):
 @LEVELS
 @pytest.mark.parametrize("dtype", HARDWARE_FORMATS)
 def test_device_moves_float8_as_float8(tmp_path, dtype, level):
-    """Data movement (transposes, reshapes, slices, concatenations, padding, selects, gathers,
-    row updates and broadcasts) takes float8 tensors as they are, every code unchanged: no op on
-    the device reads their bytes as uint8."""
+    """Data movement (transposes, reshapes, slices, concatenations and broadcasts) takes float8
+    tensors as they are, every code unchanged: no op on the device reads their bytes as uint8."""
+    codes = all_codes(dtype)
+
+    def f(x):
+        return (
+            jnp.concatenate([x.T.reshape(16, 64), x[::2].reshape(8, 64), x[5:21, 3:7].reshape(1, 64)]),
+            jnp.broadcast_to(x[7], (4, 32, 32)),
+        )
+
+    options = {"optimization_level": level, "export_path": str(tmp_path)}
+    for actual, expected in zip(jax.jit(f, compiler_options=options)(codes), jax.jit(f, backend="cpu")(codes)):
+        assert_same_bits(actual, expected)
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert irs
+    uint8 = [line for ir in irs for line in ir.splitlines() if re.search(r"tensor<[0-9x]*ui8", line)]
+    assert not uint8, uint8
+
+
+@LEVELS
+@pytest.mark.parametrize("dtype", HARDWARE_FORMATS)
+def test_ops_on_float8_bits(dtype, level):
+    """Padding, selects, gathers and row updates, which TTNN doesn't run on float8, move the
+    bits: every code comes out as it went in."""
     codes = all_codes(dtype)
     rows = np.array([3, 0, 31, 7], np.int32)
     mask = np.random.default_rng(8).integers(0, 2, (32, 32)).astype(bool)
 
     def f(x, rows, mask, start):
         return (
-            jnp.concatenate([x.T.reshape(16, 64), x[::2].reshape(8, 64), x[5:21, 3:7].reshape(1, 64)]),
             jnp.pad(x[:20, :30], ((1, 11), (0, 2)), constant_values=1.0),
             jnp.where(mask, x, x.T),
             x[rows],
             jax.lax.dynamic_update_slice(x, x[:4], (start, 0)),
-            jnp.broadcast_to(x[7], (4, 32, 32)),
         )
 
     args = (codes, rows, mask, np.int32(9))
-    options = {"optimization_level": level, "export_path": str(tmp_path)}
-    for actual, expected in zip(jax.jit(f, compiler_options=options)(*args), jax.jit(f, backend="cpu")(*args)):
+    for actual, expected in zip(jit(f, level)(*args), jax.jit(f, backend="cpu")(*args)):
         assert_same_bits(actual, expected)
-    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
-    assert irs
-    for ir in irs:
-        assert "xui8" not in ir and "u8>" not in ir, ir
 
 
 @pytest.mark.parametrize("dtype", FORMATS)

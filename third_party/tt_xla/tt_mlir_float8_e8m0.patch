@@ -29,9 +29,9 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
 +// from f32 work on the bits with integer ops: a code is the exponent of an f32
 +// without a mantissa.
 +//
- // The ops whose TTNN versions don't take float8 tensors (broadcasts, row
- // updates, gathers, padding and selects) move their bits: they run on ui8
- // views of their float8 operands, and their results are float8 views of
+ // The ops whose TTNN versions don't take float8 tensors (row updates,
+ // gathers, padding and selects) move their bits: they run on ui8 views of
+ // their float8 operands, and their results are float8 views of theirs, next
 @@ -52,7 +65,7 @@ namespace {
  // The float8 element type of a type, if it has one.
  Type getFloat8Type(Type type) {
@@ -157,7 +157,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
  // A value converted to the given element type: float8 values through f32.
  Value convertTo(OpBuilder &builder, Location loc, Value value,
                  Type elementType) {
-@@ -396,6 +496,93 @@ void callDecomposition(mlir::stablehlo::CompositeOp op) {
+@@ -395,6 +495,93 @@ void callDecomposition(mlir::stablehlo::CompositeOp op) {
    op.erase();
  }
  
@@ -251,7 +251,7 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
  struct StableHLOFloat8DataTypeConversionPass
      : public impl::StableHLOFloat8DataTypeConversionPassBase<
            StableHLOFloat8DataTypeConversionPass> {
-@@ -448,6 +635,45 @@ struct StableHLOFloat8DataTypeConversionPass
+@@ -447,6 +634,45 @@ struct StableHLOFloat8DataTypeConversionPass
          callDecomposition(cast<mlir::stablehlo::CompositeOp>(op));
        }
      }
