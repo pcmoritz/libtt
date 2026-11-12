@@ -1,15 +1,21 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/common/common.hpp ttnn/cpp/ttnn/operations/data_movement/common/common.hpp
 --- ttnn/cpp/ttnn/operations/data_movement/common/common.hpp
 +++ ttnn/cpp/ttnn/operations/data_movement/common/common.hpp
-@@ -18,6 +18,13 @@ struct TileDescriptor;
+@@ -18,6 +18,19 @@ struct TileDescriptor;
  
  namespace ttnn::operations::data_movement {
  
-+// Data movement only copies values, so a Float16 tensor is moved as UInt16 and no kernel interprets it.
-+// Unpacking Float16 flushes subnormals and -0 to +0.
++// Data movement only copies values, so a Float16 tensor is moved as UInt16 and a float8 one as UInt8, and no
++// kernel interprets them. Unpacking Float16 or Fp8_e4m3 flushes subnormals and -0 to +0, and Lf8 doesn't survive
++// unpacking to DEST.
 +inline tt::DataFormat data_movement_format(DataType dtype) {
-+    return dtype == DataType::FLOAT16 ? tt::DataFormat::UInt16
-+                                      : tt::tt_metal::datatype_to_dataformat_converter(dtype);
++    if (dtype == DataType::FLOAT16) {
++        return tt::DataFormat::UInt16;
++    }
++    if (dtype == DataType::FP8_E4M3 || dtype == DataType::FP8_E5M2) {
++        return tt::DataFormat::UInt8;
++    }
++    return tt::tt_metal::datatype_to_dataformat_converter(dtype);
 +}
 +
  ttnn::Shape squeeze_shape_to_ND(const ttnn::Shape& output_shape, uint32_t);

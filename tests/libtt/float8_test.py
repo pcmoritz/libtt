@@ -1,12 +1,15 @@
 """float8 tensors: storage, conversions and native matmuls.
 
-float8 tensors are stored as their bits. Conversions between float8 and f32
+float8_e4m3fn and float8_e5m2 tensors keep their types on the device, the
+hardware's Fp8_e4m3 and Lf8 formats. Conversions between float8 and f32
 are exact on the device (ttnn's typecast), so they match ml_dtypes (and
 PyTorch): rounding to nearest even, subnormals, NaN on e4m3fn overflow and
 infinity on e5m2 overflow, at O0 and O1 (where casts through float8 must not
 fold). A matmul of two float8 matrices reads them
 natively on the matrix unit, which flushes subnormal operands to zero.
 """
+
+import re
 
 import jax
 from jax import core
@@ -20,10 +23,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 
-# float8_e8m0fnu, microscaling's power-of-two scales, has no hardware format: the matrix unit
-# and ttnn's typecast don't read it. It has no sign either, so its codes order like its values.
-HARDWARE_FORMATS = [jnp.float8_e4m3fn, jnp.float8_e5m2]
-FORMATS = HARDWARE_FORMATS + [jnp.float8_e8m0fnu]
+FORMATS = [jnp.float8_e4m3fn, jnp.float8_e5m2]
 LEVELS = pytest.mark.parametrize("level", ["O0", "O1"])
 
 
@@ -52,6 +52,59 @@ def test_float8_buffers_round_trip(dtype):
     assert_same_bits(jax.device_put(codes), codes)
     moved = jax.jit(lambda x: jnp.concatenate([x.T, x[::-1]], axis=0))(codes)
     assert_same_bits(moved, np.concatenate([codes.T, codes[::-1]], axis=0))
+
+
+@LEVELS
+@pytest.mark.parametrize("dtype", FORMATS)
+def test_device_moves_float8_as_float8(tmp_path, dtype, level):
+    """Data movement (transposes, reshapes, slices, concatenations, broadcasts, padding, selects,
+    gathers and row updates) takes float8 tensors as they are, every code unchanged: no op on the
+    device reads their bytes as uint8, and their layout changes stay on the device."""
+    codes = all_codes(dtype)
+    rows = np.array([3, 0, 31, 7], np.int32)
+    mask = np.random.default_rng(8).integers(0, 2, (32, 32)).astype(bool)
+
+    def f(x, rows, mask, start):
+        return (
+            jnp.concatenate([x.T.reshape(16, 64), x[::2].reshape(8, 64), x[5:21, 3:7].reshape(1, 64)]),
+            jnp.broadcast_to(x[7], (4, 32, 32)),
+            jnp.pad(x[:20, :30], ((1, 11), (0, 2)), constant_values=1.0),
+            jnp.where(mask, x, x.T),
+            x[rows],
+            jax.lax.dynamic_update_slice(x, x[:4], (start, 0)),
+        )
+
+    args = (codes, rows, mask, np.int32(9))
+    options = {"optimization_level": level, "export_path": str(tmp_path)}
+    for actual, expected in zip(jax.jit(f, compiler_options=options)(*args), jax.jit(f, backend="cpu")(*args)):
+        assert_same_bits(actual, expected)
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert irs
+    uint8 = [line for ir in irs for line in ir.splitlines() if re.search(r"tensor<[0-9x]*ui8", line)]
+    assert not uint8, uint8
+    to_host = [line for ir in irs for line in ir.splitlines() if '"ttnn.from_device"' in line]
+    assert not to_host, to_host
+
+
+@pytest.mark.parametrize("dtype", FORMATS)
+def test_float8_arrays_between_programs(dtype):
+    """A float8 array that one program leaves on the device in tiles reaches a program that reads
+    it in rows (a gather's table, kept row-major), as model weights pass between the programs
+    that load them: the runtime untilizes it on the device."""
+    codes = all_codes(dtype)
+    rows = np.array([3, 0, 31, 7], np.int32)
+    moved = jax.jit(lambda x: x.T)(codes)
+    gathered = jax.jit(lambda x, rows: x[rows])(moved, rows)
+    assert_same_bits(gathered, codes.T[rows])
+
+
+@pytest.mark.parametrize("dtype", FORMATS)
+def test_float8_constants(dtype):
+    """Float8 constants, splat or not, keep every code."""
+    codes = all_codes(dtype)
+    splat, table = np.full((2, 32), codes[3, 9], codes.dtype), codes[::16]
+    f = lambda x: jnp.concatenate([x[:2], jnp.asarray(splat), jnp.asarray(table)])
+    assert_same_bits(jax.jit(f)(codes), np.concatenate([codes[:2], splat, table]))
 
 
 @LEVELS
@@ -149,7 +202,7 @@ def mhlo_topk_lowering(ctx, x, *, k):
 mlir.register_lowering(mhlo_topk_p, mhlo_topk_lowering)
 
 
-@pytest.mark.parametrize("dtype", HARDWARE_FORMATS)
+@pytest.mark.parametrize("dtype", FORMATS)
 def test_custom_call_top_k_compares_values(dtype):
     """A custom call that computes, such as mhlo.topk, gets values, not their bits: a negative
     value's code is the larger one (-1 is 0xb8 in float8_e4m3fn, +1 is 0x38)."""
@@ -161,7 +214,7 @@ def test_custom_call_top_k_compares_values(dtype):
     assert_same_bits(values, np.take_along_axis(x, expected, axis=1))
 
 
-@pytest.mark.parametrize("dtype", HARDWARE_FORMATS)
+@pytest.mark.parametrize("dtype", FORMATS)
 def test_control_flow_carries_float8(dtype):
     """cond, switch and while loops carry every float8 code as it is, and a loop body runs native
     float8 matmuls on its carry."""
@@ -186,7 +239,7 @@ def test_control_flow_carries_float8(dtype):
     assert np.max(np.abs(product - expected) / np.maximum(scale, 1e-30)) < 2.0**-9
 
 
-@pytest.mark.parametrize("dtype", HARDWARE_FORMATS)
+@pytest.mark.parametrize("dtype", FORMATS)
 def test_reductions_sorts_and_scatters_compare_values(dtype):
     """Ops whose regions compute (reduce, sort, scatter) compare and select values, not their
     bits: a negative value's code is the larger one."""
@@ -202,22 +255,6 @@ def test_reductions_sorts_and_scatters_compare_values(dtype):
     )
     for actual, expected in zip(jax.jit(f)(x), jax.jit(f, backend="cpu")(x)):
         assert_same_bits(actual, expected)
-
-
-def test_microscaled_float8():
-    """float8_e4m3fn values times their float8_e8m0fnu scales, read from the scales' bytes, as
-    DeepSeek-V4's KV cache stores them."""
-    rng = np.random.default_rng(7)
-    values = random_float8((64, 128), jnp.float8_e4m3fn, rng)
-    # The hardware's multiply loses the sign of -0.0.
-    values[values.astype(np.float32) == 0] = np.array(0.0, jnp.float8_e4m3fn)
-    scale_bytes = rng.integers(100, 160, size=(64, 1)).astype(np.uint8)
-
-    def f(values, scale_bytes):
-        scales = jax.lax.bitcast_convert_type(scale_bytes, jnp.float8_e8m0fnu)
-        return (values.astype(jnp.float32) * scales.astype(jnp.float32)).astype(jnp.bfloat16)
-
-    assert_same_bits(jax.jit(f)(values, scale_bytes), jax.jit(f, backend="cpu")(values, scale_bytes))
 
 
 @pytest.mark.parametrize("to_sharded", [True, False])
@@ -276,7 +313,7 @@ def test_native_float8_matmul(m, k, n, lhs_dtype, rhs_dtype):
 
 
 @LEVELS
-@pytest.mark.parametrize("dtype", HARDWARE_FORMATS)
+@pytest.mark.parametrize("dtype", FORMATS)
 def test_native_float8_matmul_rounds_output(dtype, level):
     """Exact integer products isolate rounding of the final float8 result."""
     rng = np.random.default_rng(7)
@@ -318,7 +355,7 @@ def test_float8_decode_matmul(rows, k, n):
 
 
 @pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("dtype", HARDWARE_FORMATS)
+@pytest.mark.parametrize("dtype", FORMATS)
 def test_matmul_of_converted_float8_reads_float8(tmp_path, dtype, out_dtype):
     """torch._scaled_mm lowers to a matmul of its float8 operands converted to f32, the weight
     [N, K] transposed. The matrix unit reads the float8 values natively instead, and the

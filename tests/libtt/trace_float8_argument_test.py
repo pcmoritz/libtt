@@ -1,13 +1,11 @@
 """A float8 weight argument is read in place by the trace that uses it, as
 torch_tpu passes FP8 checkpoints.
 
-The compiler stores float8 tensors as their bytes (Float8DataTypeConversion),
-so the argument becomes a uint8 tensor, and its float8 matrix-unit operand a
-view of those bytes. A loop (which the host runs) splits the program: the
-matmul after it is in a trace of its own. The view must be in that trace, next
-to the matmul that reads it: a value passed into a trace is copied into a slot
-of that trace on every call, which for a model's weights takes gigabytes per
-program.
+A loop (which the host runs) splits the program: the matmul after it is in a
+trace of its own, which must read the weight where it is. A value computed
+outside a trace and passed into it, such as a view of the weight, is copied
+into a slot of that trace on every call, which for a model's weights takes
+gigabytes per program.
 """
 
 import jax
