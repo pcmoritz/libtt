@@ -24,9 +24,8 @@
 // pair's output unweighted.
 //
 // With weight_dtype = "fp8" the experts are float8_e4m3fn, which the kernel
-// reads as they are (the compiler stores float8 tensors as their bytes, ui8,
-// and hands this call those), and come with an FP32 scale per expert and output
-// column, which it applies:
+// reads as they are, and come with an FP32 scale per expert and output column,
+// which it applies:
 //   s1, s3       [E_local, I] f32 the gate and up projections' scales,
 //   s2           [E_local, H] f32 and the down projections'.
 // This lowering chunks the tokens, builds
@@ -128,7 +127,7 @@ public:
                type.getShape() ==
                    ArrayRef<int64_t>{w1Type.getDimSize(0), columns};
       };
-      if (!isa<IntegerType>(w1Type.getElementType()) ||
+      if (!isa<Float8E4M3FNType>(w1Type.getElementType()) ||
           !isScale(adaptor.getOperands()[6], w1Type.getDimSize(2)) ||
           !isScale(adaptor.getOperands()[7], w1Type.getDimSize(2)) ||
           !isScale(adaptor.getOperands()[8], xType.getDimSize(1))) {

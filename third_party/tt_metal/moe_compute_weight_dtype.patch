@@ -718,7 +718,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
      const uint32_t w2_total_rows = num_layers * experts_per_device * num_cores * w2_core_rows;
      TT_FATAL(
          w2_total_rows % num_banks == 0,
-@@ -836,6 +845,252 @@ ttnn::Tensor prepare_w2_tensor_for_moe_compute(
+@@ -836,6 +845,261 @@ ttnn::Tensor prepare_w2_tensor_for_moe_compute(
      return result;
  }
  
@@ -777,17 +777,25 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +    });
 +    return host;
 +}
++
++// FP8 experts arrive as float8 tensors; the packing moves their bytes, UINT8 views of them.
++ttnn::Tensor fp8_bytes(const ttnn::Tensor& weights) {
++    return weights.dtype() == ttnn::DataType::FP8_E4M3 ? ttnn::bitcast(weights, ttnn::DataType::UINT8) : weights;
++}
++
 +}  // namespace
 +
 +ttnn::Tensor prepare_w0_w1_tensor_with_column_scales(
-+    const ttnn::Tensor& tt_w0,
-+    const ttnn::Tensor& tt_w1,
++    const ttnn::Tensor& experts_w0,
++    const ttnn::Tensor& experts_w1,
 +    const ttnn::Tensor& tt_s0,
 +    const ttnn::Tensor& tt_s1,
 +    uint32_t L,
 +    uint32_t E,
 +    uint32_t K,
 +    uint32_t N) {
++    const ttnn::Tensor tt_w0 = fp8_bytes(experts_w0);
++    const ttnn::Tensor tt_w1 = fp8_bytes(experts_w1);
 +    TT_FATAL(K % TILE_SIZE == 0, "K dimension ({}) must be divisible by TILE_SIZE ({})", K, TILE_SIZE);
 +    TT_FATAL(N % TILE_SIZE == 0, "N dimension ({}) must be divisible by TILE_SIZE ({})", N, TILE_SIZE);
 +    TT_FATAL(
@@ -866,7 +874,8 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +}
 +
 +ttnn::Tensor prepare_w2_tensor_with_column_scales(
-+    const ttnn::Tensor& tt_w2, const ttnn::Tensor& tt_s2, uint32_t L, uint32_t E, uint32_t N, uint32_t K) {
++    const ttnn::Tensor& experts_w2, const ttnn::Tensor& tt_s2, uint32_t L, uint32_t E, uint32_t N, uint32_t K) {
++    const ttnn::Tensor tt_w2 = fp8_bytes(experts_w2);
 +    TT_FATAL(N % TILE_SIZE == 0, "N dimension ({}) must be divisible by TILE_SIZE ({})", N, TILE_SIZE);
 +    TT_FATAL(K % TILE_SIZE == 0, "K dimension ({}) must be divisible by TILE_SIZE ({})", K, TILE_SIZE);
 +    TT_FATAL(
