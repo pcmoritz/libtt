@@ -276,8 +276,8 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
     return mlir::failure();
   }
 
-  // q: its rotated parts, a pad of the last dim with +0 (the fused kernel's
-  // zeros), reshapes to [1, B, Hq, q_width].
+  // q: its rotated parts, possibly a pad of the last dim with +0 (the fused
+  // kernel's zeros), reshapes to [1, B, Hq, q_width].
   Value qHeads = alongReshapes(qRope.getResult());
   SmallVector<Value> qParts{qHeads};
   if (rotated < headDim) {
@@ -291,19 +291,22 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
   if (!rotates(qRope, qNorm, qParts, headDim)) {
     return mlir::failure();
   }
-  auto pad = dyn_cast_or_null<PadOp>(getSingleUser(qHeads));
-  if (!pad || !pad.getValue().isPosZero()) {
-    return mlir::failure();
-  }
-  ArrayRef<int32_t> padding = pad.getPadding();
-  for (size_t i = 0; i + 1 < padding.size(); ++i) {
-    if (padding[i] != 0) {
+  // Without the pad, the query is as wide as the heads.
+  Value qOut = qHeads;
+  if (auto pad = dyn_cast_or_null<PadOp>(getSingleUser(qHeads))) {
+    if (!pad.getValue().isPosZero()) {
       return mlir::failure();
     }
+    ArrayRef<int32_t> padding = pad.getPadding();
+    for (size_t i = 0; i + 1 < padding.size(); ++i) {
+      if (padding[i] != 0) {
+        return mlir::failure();
+      }
+    }
+    qOut = alongReshapes(pad.getResult());
   }
-  Value qOut = alongReshapes(pad.getResult());
   const int64_t qWidth = shapeOf(qOut).back();
-  if (shapeOf(pad.getInput()).back() != headDim || qWidth % 32 != 0 ||
+  if (shapeOf(qHeads).back() != headDim || qWidth % 32 != 0 ||
       shapeOf(qOut) != ArrayRef<int64_t>{1, tokens, numQHeads, qWidth} ||
       !isTiled(qOut, /*dram=*/false)) {
     return mlir::failure();

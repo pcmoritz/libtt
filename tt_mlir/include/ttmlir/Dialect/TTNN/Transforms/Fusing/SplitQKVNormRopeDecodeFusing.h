@@ -14,8 +14,8 @@ namespace mlir::tt::ttnn::fusing {
 // (SGLang-TorchTPU's Qwen3 and Qwen3.8, whose KV cache holds k and v side by
 // side):
 //
-//   qkv [B, (s Hq + 2 Hkv) D] -> q heads: rms_norm -> rotary_embedding -> pad
-//                                to the cache's width
+//   qkv [B, (s Hq + 2 Hkv) D] -> q heads: rms_norm -> rotary_embedding (->
+//                                pad to the cache's width, for prefill)
 //                             -> k heads: rms_norm -> rotary_embedding -+
 //                             -> v heads -------------------------------+->
 //                                concat [B, Hkv, 2 D] -> [1, B, Hkv, 2 D]
