@@ -177,34 +177,10 @@ TEST_F(Float8DataMovementTest, ReshapePadding) {
     }
 }
 
-// where selects bytes: a bfloat16 predicate picks each float8 code of either tensor unchanged.
+// where selects bytes: a bfloat16 predicate picks each float8 code of either tensor unchanged, also when float8
+// values (a row, a column, a single element) or the predicate (a row) broadcast: broadcast float8 values are
+// expanded to the full shape first, since the byte path selects whole tiles.
 TEST_F(Float8DataMovementTest, Where) {
-    const ttnn::Shape shape({64, 96});
-    const auto a = bytes(shape, Layout::TILE);
-    const std::vector<uint8_t> a_bytes = a.cpu().to_vector<uint8_t>();
-    const std::vector<uint8_t> b_bytes(a_bytes.rbegin(), a_bytes.rend());
-    const TensorSpec bytes_spec(shape, TensorLayout(DataType::UINT8, PageConfig(Layout::TILE), {}));
-    const auto b = ttnn::Tensor::from_vector(b_bytes, bytes_spec).to_device(mesh_device_.get());
-    std::vector<bfloat16> predicate(shape.volume());
-    std::vector<uint8_t> want(shape.volume());
-    for (size_t i = 0; i < predicate.size(); ++i) {
-        const bool take_a = (i * 7 + i / 5) % 3 != 0;
-        predicate[i] = bfloat16(take_a ? 1.0f : 0.0f);
-        want[i] = take_a ? a_bytes[i] : b_bytes[i];
-    }
-    const TensorSpec predicate_spec(shape, TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), {}));
-    const auto p = ttnn::Tensor::from_vector(predicate, predicate_spec).to_device(mesh_device_.get());
-    for (DataType dtype : {DataType::FP8_E4M3, DataType::FP8_E5M2}) {
-        const auto out = ttnn::where(p, ttnn::bitcast(a, dtype), ttnn::bitcast(b, dtype));
-        ASSERT_EQ(out.dtype(), dtype);
-        EXPECT_EQ(ttnn::bitcast(out, DataType::UINT8).cpu().to_vector<uint8_t>(), want) << dtype;
-    }
-}
-
-// where broadcasts float8 values (a row, a column, a single element) and a bfloat16 predicate (a row) like any
-// other, each code unchanged: broadcast float8 values are repeated to the full shape first, since the byte path
-// selects whole tiles.
-TEST_F(Float8DataMovementTest, WhereBroadcast) {
     const uint32_t rows = 64, cols = 96;
     const auto code = [](uint32_t i) { return static_cast<uint8_t>((i * 37 + i / 7) % 256); };
     const auto device_bytes = [&](uint32_t h, uint32_t w, uint32_t salt) {
@@ -226,8 +202,11 @@ TEST_F(Float8DataMovementTest, WhereBroadcast) {
     struct Case {
         uint32_t ph, pw, th, tw, fh, fw;
     };
-    for (const Case& c : {Case{rows, cols, 1, cols, rows, 1}, Case{rows, cols, 1, 1, rows, cols},
-                          Case{1, cols, rows, cols, rows, cols}}) {
+    for (const Case& c :
+         {Case{rows, cols, rows, cols, rows, cols},
+          Case{rows, cols, 1, cols, rows, 1},
+          Case{rows, cols, 1, 1, rows, cols},
+          Case{1, cols, rows, cols, rows, cols}}) {
         const auto [p, p_dev] = predicate(c.ph, c.pw);
         const auto [t, t_dev] = device_bytes(c.th, c.tw, 1);
         const auto [f, f_dev] = device_bytes(c.fh, c.fw, 2);

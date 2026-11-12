@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td b/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
 --- a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
 +++ b/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td
-@@ -43,6 +43,34 @@ def StableHLOUInt64DataTypeConversionPass : Pass<"stablehlo-uint64-data-type-con
+@@ -43,6 +43,33 @@ def StableHLOUInt64DataTypeConversionPass : Pass<"stablehlo-uint64-data-type-con
                            "::mlir::tt::ttir::TTIRDialect"];
  }
  
@@ -22,11 +22,10 @@ diff --git a/include/ttmlir/Dialect/StableHLO/Transforms/Passes.td b/include/ttm
 +    float8 go through f32. Other dot_generals with float8 operands (with an
 +    operand of another type, or another layout) compute on the converted
 +    values, and other ops on float8 values without regions compute in f32.
-+    Control flow
-+    (while, case, if, shard_map bodies), Shardy's collectives and sdy.all_slice
-+    reshards carry float8 values, ops whose regions compute on float8 values
-+    (reduce, sort, scatter, ...) compute on f32 values, and other composites
-+    become calls of their decompositions.
++    Control flow (while, case, if, shard_map bodies), Shardy's collectives and
++    sdy.all_slice reshards carry float8 values, ops whose regions compute on
++    float8 values (reduce, sort, scatter, ...) compute on f32 values, and other
++    composites become calls of their decompositions.
 +  }];
 +  let dependentDialects = ["mlir::func::FuncDialect",
 +                           "::mlir::stablehlo::StablehloDialect",
@@ -654,7 +653,7 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
  // tt-metal issues to track mixed data types ops bug.
  // https://github.com/tenstorrent/tt-metal/issues/17998
  // https://github.com/tenstorrent/tt-metal/issues/24511
-@@ -510,9 +511,15 @@ TTNNOperandsWorkaroundsFactory::createWhereOpOperandsWorkarounds(
+@@ -510,9 +511,13 @@ TTNNOperandsWorkaroundsFactory::createWhereOpOperandsWorkarounds(
  
    bool float16WithBf16Predicate =
        inputElementType.isF16() && predicateElementType.isBF16();
@@ -663,10 +662,8 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 -       predicateElementType != inputElementType)) {
 +  if (mlir::isa<mlir::Float8E4M3FNType, mlir::Float8E5M2Type>(
 +          inputElementType)) {
-+    if (!predicateElementType.isBF16()) {
-+      predicateTypeWorkaround =
-+          TTNNOperandWorkarounds(ttcore::DataType::BFloat16);
-+    }
++    predicateTypeWorkaround =
++        TTNNOperandWorkarounds(ttcore::DataType::BFloat16);
 +  } else if (!float16WithBf16Predicate &&
 +             (predicateElementType.isInteger() ||
 +              predicateElementType != inputElementType)) {
