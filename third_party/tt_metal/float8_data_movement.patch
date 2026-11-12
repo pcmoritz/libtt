@@ -148,15 +148,16 @@ diff --git tt_metal/api/tt-metalium/tensor/tensor_types.hpp tt_metal/api/tt-meta
 diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
 --- ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
 +++ ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp
-@@ -19,6 +19,7 @@
+@@ -19,6 +19,8 @@
  #include "ttnn/operations/core/core.hpp"
  #include "ttnn/tensor/tensor_ops.hpp"
  #include "ttnn/types.hpp"
++#include "ttnn/operations/copy/typecast/typecast.hpp"
 +#include "ttnn/operations/data_movement/common/float8.hpp"
  
  namespace ttnn::operations::core::CMAKE_UNIQUE_NAMESPACE {
  namespace {
-@@ -96,6 +97,20 @@ Tensor to_layout_impl(
+@@ -96,6 +98,37 @@ Tensor to_layout_impl(
              raw, layout, DataType::UINT16, memory_config, sub_core_grids, static_cast<float>(pad_bits));
          return unchecked_reinterpret_dtype(converted, float_dtype);
      }
@@ -173,6 +174,23 @@ diff --git ttnn/cpp/ttnn/operations/core/to_layout/to_layout_op.cpp ttnn/cpp/ttn
 +            sub_core_grids,
 +            static_cast<float>(operations::data_movement::float8_code(pad_value, float8_dtype)));
 +        return unchecked_reinterpret_dtype(converted, float8_dtype);
++    }
++    // A conversion to or from float8 is exact as ttnn::typecast to or from FLOAT32, not through tilize or untilize:
++    // typecast on tiles, after tilizing or before untilizing.
++    if (tensor_arg.storage_type() == StorageType::DEVICE && dtype.has_value() && dtype.value() != tensor_arg.dtype() &&
++        (operations::data_movement::is_float8(dtype.value()) ||
++         operations::data_movement::is_float8(tensor_arg.dtype()))) {
++        const auto typecast = [&](const Tensor& tensor) {
++            Tensor value = tensor;
++            if (value.dtype() != DataType::FLOAT32 && dtype.value() != DataType::FLOAT32) {
++                value = ttnn::typecast(value, DataType::FLOAT32);
++            }
++            return ttnn::typecast(value, dtype.value());
++        };
++        if (layout == ttnn::TILE_LAYOUT) {
++            return typecast(to_layout_impl(tensor_arg, layout, std::nullopt, memory_config, sub_core_grids, pad_value));
++        }
++        return to_layout_impl(typecast(tensor_arg), layout, std::nullopt, memory_config, sub_core_grids, pad_value);
 +    }
  
      const std::set<ttnn::Layout> supported_layouts = {

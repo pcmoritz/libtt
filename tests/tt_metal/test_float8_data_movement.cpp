@@ -10,6 +10,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -17,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include <tt-metalium/float8.hpp>
 #include <tt-metalium/mesh_device.hpp>
 
 #include "ttnn/operations/core/core.hpp"
@@ -200,13 +203,15 @@ TEST_F(Float8DataMovementTest, Where) {
     }
 }
 
-// pad fills float8 padding, before and after the data, with the pad value's code, in both layouts.
+// pad fills float8 padding with the pad value's code, in both layouts (before the data too in row-major: tile padding
+// never pads in front).
 TEST_F(Float8DataMovementTest, Pad) {
     for (Layout layout : {Layout::ROW_MAJOR, Layout::TILE}) {
         const auto x = bytes(ttnn::Shape({50, 70}), layout);
         const auto values = x.cpu().to_vector<uint8_t>();
+        const uint32_t top = layout == Layout::TILE ? 0 : 3, left = layout == Layout::TILE ? 0 : 2;
         for (DataType dtype : {DataType::FP8_E4M3, DataType::FP8_E5M2}) {
-            const ttsl::SmallVector<std::array<uint32_t, 2>> padding = {{3, 11}, {2, 24}};
+            const ttsl::SmallVector<std::array<uint32_t, 2>> padding = {{top, 14 - top}, {left, 26 - left}};
             const auto out = ttnn::pad(ttnn::bitcast(x, dtype), padding, 1.0f);
             ASSERT_EQ(out.dtype(), dtype);
             ASSERT_EQ(out.logical_shape(), ttnn::Shape({64, 96}));
@@ -214,11 +219,41 @@ TEST_F(Float8DataMovementTest, Pad) {
             const uint8_t one = dtype == DataType::FP8_E4M3 ? 0x38 : 0x3c;
             for (uint32_t r = 0; r < 64; ++r) {
                 for (uint32_t c = 0; c < 96; ++c) {
-                    const bool inside = r >= 3 && r < 53 && c >= 2 && c < 72;
-                    ASSERT_EQ(got[r * 96 + c], inside ? values[(r - 3) * 70 + c - 2] : one)
+                    const bool inside = r >= top && r < top + 50 && c >= left && c < left + 70;
+                    ASSERT_EQ(got[r * 96 + c], inside ? values[(r - top) * 70 + c - left] : one)
                         << dtype << " " << layout << " at " << r << ", " << c;
                 }
             }
+        }
+    }
+}
+
+// to_layout into or out of float8 converts exactly (ttnn::typecast through FLOAT32), as it does when the compiler
+// moves a float8 op to FLOAT32: every finite code survives FLOAT32 -> float8 tiles and float8 tiles -> FLOAT32 rows.
+TEST_F(Float8DataMovementTest, LayoutsWithConversion) {
+    for (DataType dtype : {DataType::FP8_E4M3, DataType::FP8_E5M2}) {
+        std::vector<uint8_t> codes;
+        for (uint32_t i = 0; i < 64 * 96; ++i) {
+            const uint8_t code = static_cast<uint8_t>((i * 37 + i / 7) % 256);
+            const float value = dtype == DataType::FP8_E4M3 ? float(float8_e4m3::from_bits(code))
+                                                            : float(float8_e5m2::from_bits(code));
+            codes.push_back(std::isfinite(value) ? code : 0);
+        }
+        std::vector<float> values;
+        for (uint8_t code : codes) {
+            values.push_back(
+                dtype == DataType::FP8_E4M3 ? float(float8_e4m3::from_bits(code)) : float(float8_e5m2::from_bits(code)));
+        }
+        const ttnn::Shape shape({64, 96});
+        const TensorSpec rows_spec(shape, TensorLayout(DataType::FLOAT32, PageConfig(Layout::ROW_MAJOR), {}));
+        const auto rows = ttnn::Tensor::from_vector(values, rows_spec).to_device(mesh_device_.get());
+        const auto tiles = ttnn::to_layout(rows, Layout::TILE, dtype);
+        ASSERT_EQ(tiles.dtype(), dtype);
+        EXPECT_EQ(ttnn::bitcast(tiles, DataType::UINT8).cpu().to_vector<uint8_t>(), codes) << dtype;
+        const auto back = ttnn::to_layout(tiles, Layout::ROW_MAJOR, DataType::FLOAT32);
+        const auto got = back.cpu().to_vector<float>();
+        for (size_t i = 0; i < values.size(); ++i) {
+            ASSERT_EQ(std::bit_cast<uint32_t>(got[i]), std::bit_cast<uint32_t>(values[i])) << dtype << " at " << i;
         }
     }
 }
