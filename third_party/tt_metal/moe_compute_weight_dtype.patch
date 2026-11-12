@@ -718,7 +718,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
      const uint32_t w2_total_rows = num_layers * experts_per_device * num_cores * w2_core_rows;
      TT_FATAL(
          w2_total_rows % num_banks == 0,
-@@ -836,6 +845,261 @@ ttnn::Tensor prepare_w2_tensor_for_moe_compute(
+@@ -836,6 +845,264 @@ ttnn::Tensor prepare_w2_tensor_for_moe_compute(
      return result;
  }
  
@@ -778,11 +778,6 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +    return host;
 +}
 +
-+// FP8 experts arrive as float8 tensors; the packing moves their bytes, UINT8 views of them.
-+ttnn::Tensor fp8_bytes(const ttnn::Tensor& weights) {
-+    return weights.dtype() == ttnn::DataType::FP8_E4M3 ? ttnn::bitcast(weights, ttnn::DataType::UINT8) : weights;
-+}
-+
 +}  // namespace
 +
 +ttnn::Tensor prepare_w0_w1_tensor_with_column_scales(
@@ -794,8 +789,14 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +    uint32_t E,
 +    uint32_t K,
 +    uint32_t N) {
-+    const ttnn::Tensor tt_w0 = fp8_bytes(experts_w0);
-+    const ttnn::Tensor tt_w1 = fp8_bytes(experts_w1);
++    TT_FATAL(
++        experts_w0.dtype() == ttnn::DataType::FP8_E4M3 && experts_w1.dtype() == ttnn::DataType::FP8_E4M3,
++        "W0 and W1 are FP8_E4M3, got {} and {}",
++        experts_w0.dtype(),
++        experts_w1.dtype());
++    // The packing moves the experts' bytes: UINT8 views.
++    const ttnn::Tensor tt_w0 = ttnn::bitcast(experts_w0, ttnn::DataType::UINT8);
++    const ttnn::Tensor tt_w1 = ttnn::bitcast(experts_w1, ttnn::DataType::UINT8);
 +    TT_FATAL(K % TILE_SIZE == 0, "K dimension ({}) must be divisible by TILE_SIZE ({})", K, TILE_SIZE);
 +    TT_FATAL(N % TILE_SIZE == 0, "N dimension ({}) must be divisible by TILE_SIZE ({})", N, TILE_SIZE);
 +    TT_FATAL(
@@ -870,12 +871,14 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +    w0.deallocate(/*force=*/true);
 +    w1.deallocate(/*force=*/true);
 +    // The bytes are float8 values, which the matrix unit reads: a view.
-+    return result.dtype() == ttnn::DataType::UINT8 ? ttnn::bitcast(result, ttnn::DataType::FP8_E4M3) : result;
++    return ttnn::bitcast(result, ttnn::DataType::FP8_E4M3);
 +}
 +
 +ttnn::Tensor prepare_w2_tensor_with_column_scales(
 +    const ttnn::Tensor& experts_w2, const ttnn::Tensor& tt_s2, uint32_t L, uint32_t E, uint32_t N, uint32_t K) {
-+    const ttnn::Tensor tt_w2 = fp8_bytes(experts_w2);
++    TT_FATAL(experts_w2.dtype() == ttnn::DataType::FP8_E4M3, "W2 is FP8_E4M3, got {}", experts_w2.dtype());
++    // The packing moves the experts' bytes: UINT8 views.
++    const ttnn::Tensor tt_w2 = ttnn::bitcast(experts_w2, ttnn::DataType::UINT8);
 +    TT_FATAL(N % TILE_SIZE == 0, "N dimension ({}) must be divisible by TILE_SIZE ({})", N, TILE_SIZE);
 +    TT_FATAL(K % TILE_SIZE == 0, "K dimension ({}) must be divisible by TILE_SIZE ({})", K, TILE_SIZE);
 +    TT_FATAL(
@@ -974,7 +977,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +    auto result = ttnn::to_layout(blocks, ttnn::Layout::TILE);
 +    blocks.deallocate(/*force=*/false);
 +    // The bytes are float8 values, which the matrix unit reads: a view.
-+    return result.dtype() == ttnn::DataType::UINT8 ? ttnn::bitcast(result, ttnn::DataType::FP8_E4M3) : result;
++    return ttnn::bitcast(result, ttnn::DataType::FP8_E4M3);
 +}
 +
  ttnn::Tensor prepare_w0_w1_tensor_with_bias(
@@ -1005,12 +1008,12 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
      const ttnn::Tensor& tt_w2, uint32_t L, uint32_t E, uint32_t N, uint32_t K);
  
 +// W0/W1 packer for FP8 experts, whose gate/up columns each have an FP32 scale: ``tt_s0`` and ``tt_s1``, ``(L, E,
-+// N)`` FLOAT32, of W0's and W1's columns. W0 and W1 are the experts' FP8 bytes, ``(L, E, K, N)`` UINT8. The packed
++// N)`` FLOAT32, of W0's and W1's columns. W0 and W1 are the FP8 experts, ``(L, E, K, N)`` FP8_E4M3. The packed
 +// layout stores the scales in three K rows that the kernel reads (moe_ring_common.h, COLUMN_SCALE_ROWS), which
 +// takes finite scales up to the largest FLOAT16 times 2^-COLUMN_SCALE_SHIFT in magnitude, just under 2^-2.
 +ttnn::Tensor prepare_w0_w1_tensor_with_column_scales(
-+    const ttnn::Tensor& tt_w0,
-+    const ttnn::Tensor& tt_w1,
++    const ttnn::Tensor& experts_w0,
++    const ttnn::Tensor& experts_w1,
 +    const ttnn::Tensor& tt_s0,
 +    const ttnn::Tensor& tt_s1,
 +    uint32_t L,
@@ -1019,10 +1022,10 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +    uint32_t N);
 +
 +// W2 packer for FP8 experts, whose columns each have an FP32 scale: ``tt_s2``, ``(L, E, K)`` FLOAT32. W2 is the
-+// experts' FP8 bytes, ``(L, E, N, K)`` UINT8. The packed layout stores the scales in three N rows that the kernel
++// FP8 experts, ``(L, E, N, K)`` FP8_E4M3. The packed layout stores the scales in three N rows that the kernel
 +// reads, as the W0/W1 packer's.
 +ttnn::Tensor prepare_w2_tensor_with_column_scales(
-+    const ttnn::Tensor& tt_w2, const ttnn::Tensor& tt_s2, uint32_t L, uint32_t E, uint32_t N, uint32_t K);
++    const ttnn::Tensor& experts_w2, const ttnn::Tensor& tt_s2, uint32_t L, uint32_t E, uint32_t N, uint32_t K);
 +
  // Bias-aware W0/W1 packer: appends bias tiles along K, then delegates to the
  // no-bias packer. Bias inputs are PyTorch-format ``(L, E, N)``; output matches
