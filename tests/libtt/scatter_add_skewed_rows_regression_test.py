@@ -40,6 +40,31 @@ def test_embedding_gradient_of_repeated_tokens(dtype):
     np.testing.assert_array_equal(got, want)
 
 
+@pytest.mark.parametrize("dtype, big", [(ml_dtypes.bfloat16, 256), (np.float32, 2**24)])
+def test_repeated_rows_round_in_position_order(dtype, big):
+    # Each row takes big, small, -big in that order. big + small rounds (to
+    # big, or to the even neighbour on a tie), so the sum is 0 or a rounding
+    # error, where any other order, or a sum kept in float32, gives small.
+    rng = np.random.default_rng(2)
+    vocab, width = 151936, 128
+    rows = np.concatenate([np.arange(280), rng.choice(np.arange(280, vocab), 20, replace=False)])
+    ids = np.concatenate([rng.permutation(rows) for _ in range(3)]).astype(np.int32)
+    sign = np.where(np.arange(width) % 2, -1, 1)
+    small = sign * np.resize([1, 3, 0.5, 5], width)
+    phase = np.repeat([big, 0, -big], rows.size)[:, None]
+    grads = np.where(phase == 0, small, phase * sign).astype(dtype)
+    want = np.zeros((vocab, width), dtype)
+    np.add.at(want, ids, grads)
+    reversed_order = np.zeros((vocab, width), dtype)
+    np.add.at(reversed_order, ids[::-1], grads[::-1])
+    assert not np.array_equal(want, reversed_order)
+
+    run = jax.jit(lambda ids, g: jnp.zeros((vocab, width), dtype).at[ids].add(g))
+    device = jax.devices("tt")[0]
+    got = np.asarray(run(jax.device_put(ids, device), jax.device_put(grads, device)))
+    np.testing.assert_array_equal(got, want)
+
+
 @pytest.mark.parametrize("reduce", ["add", "max"])
 def test_batched_table_reduction(reduce):
     rng = np.random.default_rng(1)
