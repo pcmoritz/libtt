@@ -128,16 +128,19 @@ diff --git a/runtime/lib/ttnn/operations/cache/load_cached.cpp b/runtime/lib/ttn
 diff --git a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
 --- a/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
 +++ b/runtime/lib/ttnn/operations/trace/begin_trace_capture.cpp
-@@ -17,9 +17,10 @@
+@@ -17,12 +17,13 @@ void run(const ::tt::target::ttnn::BeginTraceCaptureOp *op,
    LOG_ASSERT(meshDevice.get_program_cache().is_enabled(),
               "Program cache must be enabled");
  
 -  // The capture program first executes the workload uncaptured to populate the
 +  // The capture program first prepares the workload uncaptured to populate the
    // program cache. Drain that work before switching the command queue into
-   // bypass mode; otherwise outstanding commands can race trace capture.
-+  meshDevice.mesh_command_queue(op->cq_id()).set_prepare_only(false);
-   meshDevice.mesh_command_queue(op->cq_id()).finish();
+   // bypass mode; otherwise outstanding commands can race trace capture. Wait
+   // for this process's chips only: finish() also waits for every other process
+   // of the mesh, which captures the traces of its own programs, if any.
+   auto &queue = meshDevice.mesh_command_queue(op->cq_id());
++  queue.set_prepare_only(false);
+   queue.wait_for_host_event(queue.enqueue_record_event_to_host());
  
    ::ttnn::MeshTraceId traceId =
 diff --git a/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp b/runtime/lib/ttnn/operations/trace/capture_or_execute_trace.cpp

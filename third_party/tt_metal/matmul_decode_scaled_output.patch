@@ -290,7 +290,17 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
      uint32_t in0_ready = 0;
      uint32_t index = 0;
      for (uint32_t group_start = 0; group_start < count; group_start += group) {
-@@ -142,15 +217,67 @@ void kernel_main() {
+@@ -95,7 +170,8 @@ void kernel_main() {
+         tile_regs_acquire();
+         if constexpr (has_bias) {
+             // Row 0 of the bias, broadcast over the rows as by the 1D matmul.
+-            unary_bcast_init<BroadcastType::ROW>(cb_bias, cb_out);
++            reconfig_data_format(cb_bias, cb_bias);
++            unary_bcast_init<BroadcastType::ROW>(cb_bias);
+             for (uint32_t i = 0; i < width; ++i) {
+                 unary_bcast<BroadcastType::ROW>(cb_bias, group_start + i, i);
+             }
+@@ -142,15 +218,67 @@ void kernel_main() {
              }
              reconfig_data_format<SrcOrder::Reverse>(cb_in0, cb_weights);
          }
@@ -362,7 +372,7 @@ diff --git ttnn/cpp/ttnn/operations/matmul/device/kernels/compute/matmul_decode.
              }
              silu_tile_init();
              for (uint32_t i = 0; i < width; ++i) {
-@@ -185,4 +312,10 @@ void kernel_main() {
+@@ -185,4 +313,10 @@ void kernel_main() {
      if constexpr (has_bias) {
          cb_pop_front(cb_bias, count);
      }

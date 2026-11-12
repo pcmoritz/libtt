@@ -129,9 +129,9 @@ genrule(
     name = "tt_metal_version_hpp",
     srcs = ["cmake/tt_metal_version.hpp.in"],
     outs = ["tt_metal/impl/version.hpp"],
-    cmd = "sed -e 's/@VERSION_SHA@/614f605ffe2977715adc198156c72bea14c2bae6/' " +
-          "-e 's/@VERSION_HASH@/614f605f/' " +
-          "-e 's/@VERSION_FULL@/614f605f/' " +
+    cmd = "sed -e 's/@VERSION_SHA@/334f0f9bc2ccf594b3aab5f7c9083e3469b835b6/' " +
+          "-e 's/@VERSION_HASH@/334f0f9b/' " +
+          "-e 's/@VERSION_FULL@/334f0f9b/' " +
           "-e 's/@VERSION_DIRTY_CPP@/false/' $< > $@",
 )
 
@@ -1008,10 +1008,11 @@ cc_library(
         "tt_metal/llrt/hal/tt-2xx/quasar/qa_hal_idle_eth.cpp",
         "tt_metal/llrt/hal/tt-2xx/quasar/qa_hal_tensix.cpp",
     ],
-    hdrs = TT_METAL_RUNTIME_HDRS,
+    hdrs = TT_METAL_RUNTIME_HDRS + glob(["tt_metal/tt-llk/tt_llk_quasar/common/inc/**/*.h"]),
     copts = TT_METAL_RUNTIME_COPTS,
     includes = TT_METAL_HAL_INCLUDE_DIRS + [
         "tt_metal/hw/inc/internal/tt-2xx/quasar",
+        "tt_metal/tt-llk/tt_llk_quasar/common/inc",
         "tt_metal/hw/inc/internal/tt-2xx/quasar/noc",
         "tt_metal/hw/inc/internal/tt-2xx/quasar/noc/registers",
         "tt_metal/hw/inc/internal/tt-2xx/quasar/overlay",
@@ -1161,7 +1162,6 @@ cc_library(
         "tt_metal/distributed/h2d_stream_service_descriptor.cpp",
         "tt_metal/distributed/hd_socket_descriptor.cpp",
         "tt_metal/distributed/host_region.cpp",
-        "tt_metal/distributed/inter_process_counter_channel.cpp",
         "tt_metal/distributed/mesh_buffer.cpp",
         "tt_metal/distributed/mesh_socket_utils.cpp",
         "tt_metal/distributed/mesh_command_queue_base.cpp",

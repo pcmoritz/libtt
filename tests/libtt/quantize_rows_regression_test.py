@@ -21,14 +21,13 @@ MIN_SCALE = 1e-12
 
 
 def quantize_rows(x, dtype):
-    codes, scale = jax.ffi.ffi_call(
+    return jax.ffi.ffi_call(
         "tt.quantize_rows",
         (
-            jax.ShapeDtypeStruct(x.shape, jnp.uint8),
+            jax.ShapeDtypeStruct(x.shape, dtype),
             jax.ShapeDtypeStruct((x.shape[0], 1), jnp.float32),
         ),
     )(x, min_scale=np.float32(MIN_SCALE), e5m2=np.bool_(dtype == jnp.float8_e5m2))
-    return jax.lax.bitcast_convert_type(codes, dtype), scale
 
 
 def quantize_ops(x, dtype):

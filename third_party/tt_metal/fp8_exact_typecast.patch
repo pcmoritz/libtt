@@ -24,26 +24,26 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/kernels/compute/eltwise
  void kernel_main() {
      constexpr uint32_t per_core_block_cnt = get_arg(args::per_core_block_cnt);
      constexpr uint32_t per_core_block_dim = get_arg(args::per_core_block_dim);
-@@ -26,6 +42,13 @@
+@@ -28,6 +44,13 @@ void kernel_main() {
          ckl::input(dfb::in, ckl::WaitPolicy::PerTile, ckl::PopPolicy::PerTile, ckl::DataFormatReconfig::Disabled);
      constexpr auto output = ckl::output(
          dfb::out, ckl::ReservePolicy::PerOuter, ckl::PushPolicy::PerOuter, ckl::DataFormatReconfig::Disabled);
 -    ckl::unary<ckl::Typecast<in_data_format, out_data_format>, input, output>(
--        ckl::IterationShape::grid(per_core_block_cnt, per_core_block_dim));
+-        ckl::IterationShape::grid(per_core_block_cnt, per_core_block_dim), dfb_in_obj, dfb_out_obj);
 +    constexpr bool float8_float32 = (is_float8<in_data_format> && out_data_format == (uint32_t)DataFormat::Float32) ||
 +                                    (in_data_format == (uint32_t)DataFormat::Float32 && is_float8<out_data_format>);
 +    if constexpr (float8_float32) {
 +        ckl::unary<Float8Typecast<in_data_format, out_data_format, ckl::Dst::D0>, input, output>(
-+            ckl::IterationShape::grid(per_core_block_cnt, per_core_block_dim));
++            ckl::IterationShape::grid(per_core_block_cnt, per_core_block_dim), dfb_in_obj, dfb_out_obj);
 +    } else {
 +        ckl::unary<ckl::Typecast<in_data_format, out_data_format>, input, output>(
-+            ckl::IterationShape::grid(per_core_block_cnt, per_core_block_dim));
++            ckl::IterationShape::grid(per_core_block_cnt, per_core_block_dim), dfb_in_obj, dfb_out_obj);
 +    }
  }
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_types.hpp
-@@ -17,8 +17,21 @@
+@@ -17,8 +17,21 @@ inline bool is_float16_bfloat16_typecast(tt::tt_metal::DataType input_dtype, tt:
             (input_dtype == tt::tt_metal::DataType::BFLOAT16 && output_dtype == tt::tt_metal::DataType::FLOAT16);
  }
  
@@ -65,7 +65,7 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_type
      return ((input_dtype == tt::tt_metal::DataType::FLOAT16 || input_dtype == tt::tt_metal::DataType::BFLOAT16) &&
              output_dtype == tt::tt_metal::DataType::FLOAT32) ||
                     is_float16_bfloat16_typecast(input_dtype, output_dtype)
-@@ -28,6 +41,9 @@
+@@ -28,6 +41,9 @@ inline tt::DataFormat typecast_input_format(
  
  inline tt::DataFormat typecast_output_format(
      tt::tt_metal::DataType input_dtype, tt::tt_metal::DataType output_dtype) {
@@ -78,7 +78,7 @@ diff --git ttnn/cpp/ttnn/operations/copy/typecast/device/typecast_device_op_type
 diff --git ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 --- ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
 +++ ttnn/cpp/ttnn/operations/copy/typecast/typecast.cpp
-@@ -58,13 +58,15 @@
+@@ -58,13 +58,15 @@ inline Tensor typecast_impl(
          (input_dtype == DataType::FLOAT32) or
          (is_8_bit_int(output_dtype) and (input_dtype == DataType::BFLOAT16 or input_dtype == DataType::BFLOAT8_B or
                                           input_dtype == DataType::BFLOAT4_B)) or

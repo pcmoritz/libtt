@@ -1,0 +1,25 @@
+--- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+@@ -238,6 +238,22 @@
+   if (mlir::isa<ttir::RowsGatherOp, ttir::RowsScatterOp>(op)) {
+     return true;
+   }
++  // A reshape of a rows op's result stays row-major as well, and the ops
++  // using it tilize the reshaped tensor. Tilizing the rows op's result first
++  // would pad a unit row dimension to 32 rows: a column scatter's [N, 1, M]
++  // result would take 32 times the memory of the [N, M] tensor it is
++  // reshaped to. A reshape the function returns keeps tiling its input: the
++  // function's results are tilized after the program's last op, which moves
++  // uint8 through the host, and a traced program can't do that.
++  if (auto reshape = mlir::dyn_cast<ttir::ReshapeOp>(op)) {
++    Operation *input = reshape.getInput().getDefiningOp();
++    if (input && mlir::isa<ttir::RowsGatherOp, ttir::RowsScatterOp>(input) &&
++        llvm::none_of(op->getUsers(), [](Operation *user) {
++          return mlir::isa<func::ReturnOp>(user);
++        })) {
++      return true;
++    }
++  }
+   if (mlir::isa<ttir::ReshapeOp, ttir::PermuteOp, ttir::ConcatOp>(op)) {
+     return !op->use_empty() && llvm::all_of(op->getUses(), feedsRowsOp);
+   }

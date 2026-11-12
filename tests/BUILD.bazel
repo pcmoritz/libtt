@@ -149,6 +149,7 @@ TORCH_TPU_SMOKE_TEST_ARGS = [
     "--local-test=$(rlocationpath :libtt_torch_tpu/long_eager_trace_test.py)",
     "--local-test=$(rlocationpath :libtt_torch_tpu/multi_result_custom_call_test.py)",
     "--local-test=$(rlocationpath :libtt_torch_tpu/process_exit_test.py)",
+    "--local-test=$(rlocationpath :libtt_torch_tpu/rank_dependent_trace_test.py)",
     "--local-test=$(rlocationpath :libtt_torch_tpu/read_while_input_test.py)",
     "tests/booleans_test.py",
     "tests/compile/stablehlo_compile_test.py",
@@ -172,6 +173,7 @@ TORCH_TPU_SMOKE_TEST_DATA = [
     "libtt_torch_tpu/long_eager_trace_test.py",
     "libtt_torch_tpu/multi_result_custom_call_test.py",
     "libtt_torch_tpu/process_exit_test.py",
+    "libtt_torch_tpu/rank_dependent_trace_test.py",
     "libtt_torch_tpu/read_while_input_test.py",
 ]
 
@@ -227,6 +229,7 @@ py_test(
         "--local-test=$(rlocationpath :libtt_torch_tpu/long_eager_trace_test.py)",
         "--local-test=$(rlocationpath :libtt_torch_tpu/multi_result_custom_call_test.py)",
         "--local-test=$(rlocationpath :libtt_torch_tpu/process_exit_test.py)",
+        "--local-test=$(rlocationpath :libtt_torch_tpu/rank_dependent_trace_test.py)",
         "--local-test=$(rlocationpath :libtt_torch_tpu/read_while_input_test.py)",
         "--local-test=$(rlocationpath :libtt_torch_tpu/rng_state_test.py)",
     ],
@@ -235,6 +238,7 @@ py_test(
         "libtt_torch_tpu/long_eager_trace_test.py",
         "libtt_torch_tpu/multi_result_custom_call_test.py",
         "libtt_torch_tpu/process_exit_test.py",
+        "libtt_torch_tpu/rank_dependent_trace_test.py",
         "libtt_torch_tpu/read_while_input_test.py",
         "libtt_torch_tpu/rng_state_test.py",
     ],

@@ -1,8 +1,8 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
-@@ -465,29 +465,38 @@ ttnn::Tensor invoke_tile(
-         return input_tensor.pad(requested_padded_shape, zeros, value);
+@@ -579,29 +579,38 @@ ttnn::Tensor invoke_tile(
+         }
      }
  
 -    const bool pad_upper_dims = !std::equal(
@@ -48,7 +48,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp ttnn/cpp/ttnn/oper
              std::back_inserter(padded_padding_vec),
              [](auto& a, auto& b) { return PadSpecDim{0, a - b}; });
  
-@@ -495,9 +504,6 @@ ttnn::Tensor invoke_tile(
+@@ -609,9 +618,6 @@ ttnn::Tensor invoke_tile(
          output_tensor = pad_impl(
              output_tensor, std::move(padded_padding_vec), value, use_multicore, memory_config_arg, sub_core_grids);
  

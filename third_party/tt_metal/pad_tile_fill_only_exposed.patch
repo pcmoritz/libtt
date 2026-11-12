@@ -1,25 +1,12 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/pad/device/kernels/dataflow/writer_pad_tiled.cpp ttnn/cpp/ttnn/operations/data_movement/pad/device/kernels/dataflow/writer_pad_tiled.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/pad/device/kernels/dataflow/writer_pad_tiled.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/pad/device/kernels/dataflow/writer_pad_tiled.cpp
-@@ -24,8 +24,6 @@ void kernel_main() {
-     constexpr auto page_size = get_arg(args::page_size);
-     constexpr auto num_dims = get_arg(args::num_dims);
-     constexpr auto pad_value = get_arg(args::pad_value);
--    constexpr auto element_size = get_arg(args::element_size);
--    constexpr uint32_t num_elements = page_size / element_size;
- 
-     const auto num_pages_to_write = get_arg(args::num_pages_to_write);
-     const auto start_offset = get_arg(args::start_offset);
-@@ -49,22 +47,11 @@ void kernel_main() {
+@@ -50,23 +50,10 @@ void kernel_main() {
      DataflowBuffer dfb_input(dfb::in0);
      Scratchpad<uint8_t> pad(scratch::pad);
  
 -    // Fill the pad-value scratchpad, generalized for any contiguous dtype.
-+    // The pad-value scratchpad is filled on the first page outside the input region, so cores that only copy
-+    // input pages never fill it: NoC zeros for a zero value, else word stores of the value, which the host packs
-+    // to fill all 32 bits for every supported dtype.
-     uint32_t l1_write_addr = pad.get_base_address();
--    volatile tt_l1_ptr uint8_t* pad_val_page = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(l1_write_addr);
+-    volatile tt_l1_ptr uint8_t* pad_val_page = &pad[0];
 -    const volatile tt_l1_ptr uint8_t* pad_val = reinterpret_cast<const volatile tt_l1_ptr uint8_t*>(&pad_value);
 -    for (uint32_t i = 0; i < num_elements; i++) {
 -        for (uint32_t b = 0; b < element_size; b++) {
@@ -31,13 +18,18 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/pad/device/kernels/dataflow/wr
 -    // Quasar DM: the fill above is CPU stores that land in L1D/L2; the NoC writes below source the pad tile
 -    // from TL1 directly. Flush the filled tile so the NoC copies see the pad value. No-op on WH/BH. Matches
 -    // fill_rm_interleaved.cpp (#51763).
--    flush_l2_cache_range(static_cast<uintptr_t>(l1_write_addr), static_cast<size_t>(page_size));
+-    flush_l2_cache_range(
+-        static_cast<uintptr_t>(local_mem::detail::AddressAccess::address(pad.local_mem())),
+-        static_cast<size_t>(page_size));
 -#endif
++    // The pad-value scratchpad is filled on the first page outside the input region, so cores that only copy
++    // input pages never fill it: NoC zeros for a zero value, else word stores of the value, which the host packs
++    // to fill all 32 bits for every supported dtype.
 +    bool pad_filled = false;
  
      bool within_input_region;
      uint32_t output_page_offset = start_offset;
-@@ -89,6 +76,24 @@ void kernel_main() {
+@@ -91,6 +78,26 @@ void kernel_main() {
              advance_tensor_index(input_id_per_dim, input_page_shape, num_dims);
              dfb_input.pop_front(1);
          } else {
@@ -46,7 +38,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/pad/device/kernels/dataflow/wr
 +                    noc.async_write_zeros(pad, page_size);
 +                    noc.write_zeros_l1_barrier();
 +                } else {
-+                    volatile tt_l1_ptr uint32_t* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_write_addr);
++                    volatile tt_l1_ptr uint32_t* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(&pad[0]);
 +                    for (uint32_t i = 0; i < page_size / sizeof(uint32_t); i++) {
 +                        words[i] = pad_value;
 +                    }
@@ -54,18 +46,20 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/pad/device/kernels/dataflow/wr
 +                    // Quasar DM: the stores land in L1D/L2; the NoC writes below source the pad tile from TL1
 +                    // directly. Flush the filled tile so the NoC copies see the pad value. No-op on WH/BH. Matches
 +                    // fill_rm_interleaved.cpp (#51763).
-+                    flush_l2_cache_range(static_cast<uintptr_t>(l1_write_addr), static_cast<size_t>(page_size));
++                    flush_l2_cache_range(
++                        static_cast<uintptr_t>(local_mem::detail::AddressAccess::address(pad.local_mem())),
++                        static_cast<size_t>(page_size));
 +#endif
 +                }
 +                pad_filled = true;
 +            }
-             CoreLocalMem<uint32_t> pad_src(l1_write_addr);
              noc.async_write(
-                 pad_src, s0, page_size, {.offset_bytes = 0}, {.page_id = output_page_offset, .offset_bytes = 0});
+                 pad, s0, page_size, {.offset_bytes = 0}, {.page_id = output_page_offset, .offset_bytes = 0});
+             noc.async_write_barrier();
 diff --git ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
-@@ -477,7 +477,15 @@ ttnn::Tensor invoke_tile(
+@@ -591,7 +591,15 @@ ttnn::Tensor invoke_tile(
          return requested_padded_shape[i] == input_padded_shape[i];
      };
  

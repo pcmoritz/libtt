@@ -1,7 +1,7 @@
 diff --git ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp
-@@ -203,7 +203,8 @@ MassagedConcat build_non_aligned_last_dim_concat(
+@@ -203,7 +203,8 @@
  
      auto predicate = [dim_aligned](const std::vector<ttnn::Tensor>& tensors, int dim, unsigned int /*groups*/) -> bool {
          auto last_dim = tensors.front().logical_shape().rank() - 1;
@@ -14,7 +14,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/concat/concat.cpp ttnn/cpp/ttn
 diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_operation.cpp
-@@ -576,14 +576,6 @@ Tensor concat_impl(
+@@ -576,14 +576,6 @@
          }
          return concat_impl(interleaved_inputs, dim, groups, output_mem_config, sub_core_grids);
      }
@@ -32,29 +32,55 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_device_op
 diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_factory.cpp
-@@ -62,12 +62,21 @@ ttnn::device_operation::ProgramArtifacts ConcatProgramFactory::create_program_ar
+@@ -62,12 +62,34 @@
  
      uint32_t num_output_pages;
      uint32_t single_page_size;
-+    uint32_t scratch_offset = 0;
-     const uint32_t common_align_len = std::max(
-         inputs[0].get().mesh_buffer().get_reference_buffer()->alignment(),
-         output.mesh_buffer().get_reference_buffer()->alignment());
+-    const uint32_t common_align_len = std::max(
+-        inputs[0].get().mesh_buffer().get_reference_buffer()->alignment(),
+-        output.mesh_buffer().get_reference_buffer()->alignment());
++    // Width concat builds each output stick in chunks of chunk_size bytes, from input bytes read
++    // into a scratch area of scratch_size bytes past the chunk.
++    uint32_t chunk_size = 0;
++    uint32_t scratch_size = 0;
++    uint32_t common_align_len = output.mesh_buffer().get_reference_buffer()->alignment();
++    for (const auto& input : inputs) {
++        common_align_len =
++            std::max<uint32_t>(common_align_len, input.get().mesh_buffer().get_reference_buffer()->alignment());
++    }
++    // Depth=2 is a prefetch optimization; fall back to depth=1 when it would overflow L1.
++    const uint32_t l1_budget =
++        (device.l1_size_per_core() / 2) - device.allocator()->get_base_allocator_addr(HalMemType::L1);
      if (rm_layout) {
          num_output_pages = output.physical_volume() / output.padded_shape()[-1];
          single_page_size = tt::align(output.element_size() * output.padded_shape()[-1], common_align_len);
 +        if (dim == output.padded_shape().rank() - 1) {
-+            scratch_offset = single_page_size;
-+            uint32_t scratch_page_size = 0;
++            chunk_size = single_page_size;
 +            for (const auto& input : inputs) {
-+                scratch_page_size = std::max<uint32_t>(scratch_page_size, input.get().mesh_buffer().page_size());
++                scratch_size = std::max<uint32_t>(scratch_size, input.get().mesh_buffer().page_size());
 +            }
-+            single_page_size += tt::align(scratch_page_size, common_align_len);
++            scratch_size = tt::align(scratch_size, common_align_len);
++            // A stick and an input stick that don't fit in L1 together are built in chunks: two
++            // entries of a chunk and its scratch area fill the prefetch budget.
++            if (chunk_size + scratch_size > l1_budget) {
++                chunk_size = scratch_size = l1_budget / 4 / common_align_len * common_align_len;
++            }
++            single_page_size = chunk_size + scratch_size;
 +        }
      } else {
          num_output_pages = output.physical_volume() / TILE_HW;
          single_page_size = tt::tile_size(dfb_data_format);
-@@ -164,6 +173,7 @@ ttnn::device_operation::ProgramArtifacts ConcatProgramFactory::create_program_ar
+@@ -134,9 +156,6 @@
+         num_tiles_per_core_group_2 = num_tiles_per_core_group_2_result;
+     }
+ 
+-    // Depth=2 is a prefetch optimization; fall back to depth=1 when it would overflow L1.
+-    const uint32_t l1_budget =
+-        (device.l1_size_per_core() / 2) - device.allocator()->get_base_allocator_addr(HalMemType::L1);
+     const uint32_t l1_capacity =
+         device.l1_size_per_core() - device.allocator()->get_base_allocator_addr(HalMemType::L1);
+     TT_FATAL(
+@@ -164,6 +183,7 @@
      std::vector<uint32_t> num_pages_per_block(num_input_tensors);
      std::vector<uint32_t> page_id_per_tensor(num_input_tensors);
      std::vector<uint32_t> page_size_per_tensor(num_input_tensors);
@@ -62,7 +88,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_f
  
      uint32_t num_accum_pages = 1;
      uint32_t scale_factor = 1;
-@@ -197,6 +207,9 @@ ttnn::device_operation::ProgramArtifacts ConcatProgramFactory::create_program_ar
+@@ -197,6 +217,9 @@
      if (rm_layout) {
          for (uint32_t i = 0; i < num_input_tensors; ++i) {
              page_size_per_tensor[i] = inputs[i].get().mesh_buffer().page_size();
@@ -72,25 +98,27 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_f
              if (dim == num_dims - 1) {
                  num_pages_per_block[i] = num_accum_pages;
              } else {
-@@ -258,6 +271,17 @@ ttnn::device_operation::ProgramArtifacts ConcatProgramFactory::create_program_ar
+@@ -258,6 +281,19 @@
          // takes its transfer size from the DFB's tile size.
          reader_advanced_options.compile_time_varargs = page_size_per_tensor;
      }
-+    // Width concat reads each input stick into a scratch area past the output stick, then copies its
-+    // unpadded bytes into place, so sticks whose widths are not a multiple of the alignment pack
-+    // tightly. The copy sizes follow the page sizes in the compile-time varargs.
++    // Width concat reads input stick bytes into a scratch area past the output chunk, then copies
++    // them into place, so sticks whose widths are not a multiple of the alignment pack tightly. The
++    // copy sizes follow the page sizes in the compile-time varargs.
 +    KernelSpec::CompileTimeArgs reader_compile_time_args;
 +    if (rm_layout && dim == num_dims - 1) {
 +        reader_advanced_options.compile_time_varargs.insert(
 +            reader_advanced_options.compile_time_varargs.end(),
 +            copy_size_per_tensor.cbegin(),
 +            copy_size_per_tensor.cend());
-+        reader_compile_time_args.emplace("scratch_offset", scratch_offset);
++        reader_compile_time_args.emplace("chunk_size", chunk_size);
++        reader_compile_time_args.emplace("scratch_size", scratch_size);
++        reader_compile_time_args.emplace("alignment", common_align_len);
 +    }
  
      KernelSpec reader_spec{
          .unique_id = READER,
-@@ -275,6 +299,7 @@ ttnn::device_operation::ProgramArtifacts ConcatProgramFactory::create_program_ar
+@@ -275,6 +311,7 @@
                  },
              },
          .tensor_bindings = std::move(reader_tensor_bindings),
@@ -98,48 +126,162 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/concat_program_f
          .runtime_arg_schema =
              {
                  // Slot 0's name follows each reader's own local: the tiled reader counts tiles, the
+@@ -288,12 +325,20 @@
+     // --- Writer kernel ---
+     // Both writers are Metal 2.0 forks of shared donor kernels that live beside their originals in
+     // other ops' directories. Their binding names and argument sets are the forks' interface, not
+-    // this op's choice.
++    // this op's choice. Width concat writes each stick in chunks with its own writer, which keeps
++    // the row-major one's interface.
++    const bool width_concat = rm_layout && dim == num_dims - 1;
++    KernelSpec::CompileTimeArgs writer_compile_time_args;
++    if (width_concat) {
++        writer_compile_time_args.emplace("chunk_size", chunk_size);
++    }
+     KernelSpec writer_spec{
+         .unique_id = WRITER,
+-        .source = rm_layout ? "ttnn/cpp/ttnn/kernel/dataflow/writer_unary_stick_layout_interleaved_start_id_metal2.cpp"
+-                            : "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/"
+-                              "writer_unary_interleaved_start_id_metal2.cpp",
++        .source = width_concat ? "ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/"
++                                 "writer_concat_stick_chunks.cpp"
++                  : rm_layout  ? "ttnn/cpp/ttnn/kernel/dataflow/writer_unary_stick_layout_interleaved_start_id_metal2.cpp"
++                               : "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/"
++                                 "writer_unary_interleaved_start_id_metal2.cpp",
+         .dfb_bindings =
+             {
+                 DFBBinding{
+@@ -306,6 +351,7 @@
+             {
+                 TensorBinding{.tensor_parameter_name = OUTPUT, .accessor_name = "dst"},
+             },
++        .compile_time_args = std::move(writer_compile_time_args),
+         .runtime_arg_schema =
+             {
+                 .runtime_arg_names = rm_layout ? Group<std::string>{"stick_size", "num_sticks", "start_id"}
 diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/reader_concat_stick_layout_interleaved_start_id.cpp
-@@ -20,6 +20,10 @@ void kernel_main() {
+@@ -12,13 +12,13 @@
+ #include "experimental/kernel_args.h"
+ #include "ttnn/operations/data_movement/concat/device/kernels/dataflow/concat_reader_common.hpp"
  
-     // The tensor binding sequence carries its own length, so the host passes no tensor count.
-     constexpr uint32_t num_tensors = std::tuple_size_v<decltype(tensor::inputs)>;
-+#ifdef WIDTH_CONCAT
-+    // Offset of the scratch area, past the output stick, in each DFB entry.
-+    constexpr uint32_t scratch_offset = get_arg(args::scratch_offset);
-+#endif
+-// Issues a read of page page_id of input I to l1_write_addr. The caller issues the read barrier.
+-// The per-tensor page sizes are compile-time varargs.
++// Issues a read of size bytes at offset bytes into page page_id of input I to l1_write_addr. The
++// caller issues the read barrier.
+ template <uint32_t I>
+-FORCE_INLINE void read_input_page(Noc& noc, uint32_t l1_write_addr, uint32_t page_id) {
++FORCE_INLINE void read_input_bytes(
++    Noc& noc, uint32_t l1_write_addr, uint32_t page_id, uint32_t offset, uint32_t size) {
+     const auto accessor = TensorAccessor(std::get<I>(tensor::inputs));
+-    noc.async_read(
+-        accessor, CoreLocalMem<uint8_t>(l1_write_addr), get_compile_time_vararg<I>(), {.page_id = page_id}, {});
++    noc.async_read(accessor, CoreLocalMem<uint8_t>(l1_write_addr), size, {.page_id = page_id, .offset_bytes = offset}, {});
+ }
  
-     // ublocks size defined in pages
-     constexpr uint32_t ublock_size_pages = 1;
-@@ -48,19 +52,28 @@ void kernel_main() {
-         dfb_in.reserve_back(ublock_size_pages);
-         uint32_t l1_write_addr = dfb_in.get_write_ptr();
+ // Reads num_pages pages into the bound Dataflow Buffer in L1.
+@@ -47,18 +47,53 @@
  #ifdef WIDTH_CONCAT
-+        const uint32_t scratch_addr = l1_write_addr + scratch_offset;
-         // For width concat we know we start at curr_tensor=0
-         // num_pages_per_block[curr_tensor] is always one for width concat
+     // Each output page is one page from every input, in input order. Every block is one page and
+     // this core starts at input 0, so output page i of this core reads page (first page id + i)
+-    // of each input.
++    // of each input. The page is built in chunks of chunk_size bytes, one DFB entry each; the last
++    // chunk holds the rest. A stick that fits in L1 is one chunk.
++    constexpr uint32_t chunk_size = get_arg(args::chunk_size);
++    constexpr uint32_t scratch_size = get_arg(args::scratch_size);
++    constexpr uint32_t alignment = get_arg(args::alignment);
+     for (uint32_t i = 0; i < num_pages; ++i) {
+-        dfb_in.reserve_back(ublock_size_pages);
+-        uint32_t l1_write_addr = dfb_in.get_write_ptr();
++        uint32_t chunk_addr = 0;
++        uint32_t chunk_fill = chunk_size;
          for (uint32_t j = 0; j < num_tensors; ++j) {
-             // The per-tensor page sizes are compile-time varargs: baked into the program, but
-             // selected here by a value that advances at run time.
-             auto page_size = get_compile_time_vararg(curr_tensor);
-+            // The bytes of the stick to keep, which follow the page sizes in the varargs.
-+            auto copy_size = get_compile_time_vararg(num_tensors + curr_tensor);
-             noc.async_read(
-                 abstract_tensor_accessor_wrappers[curr_tensor],
--                CoreLocalMem<uint8_t>(l1_write_addr),
-+                CoreLocalMem<uint8_t>(scratch_addr),
-                 page_size,
-                 {.page_id = page_id_per_tensor[curr_tensor]},
-                 {});
--            l1_write_addr += page_size;
-+            noc.async_read_barrier();
-+            auto* src = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(scratch_addr);
-+            auto* dst = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(l1_write_addr);
-+            for (uint32_t byte = 0; byte < copy_size; ++byte) {
-+                dst[byte] = src[byte];
+-            concat_reader::with_input(j, tensor_indices, [&](auto I) {
+-                read_input_page<decltype(I)::value>(noc, l1_write_addr, get_vararg(page_id_per_tensor_offset + j) + i);
+-            });
+-            l1_write_addr += get_compile_time_vararg(j);
++            const uint32_t page_id = get_vararg(page_id_per_tensor_offset + j) + i;
++            const uint32_t copy_size = get_compile_time_vararg(num_tensors + j);
++            for (uint32_t copied = 0; copied < copy_size;) {
++                if (chunk_fill == chunk_size) {
++                    dfb_in.reserve_back(ublock_size_pages);
++                    chunk_addr = dfb_in.get_write_ptr();
++                    chunk_fill = 0;
++                }
++                // Reads start at an aligned offset into the input stick; the bytes before the copied
++                // ones are skipped. Each piece fits the scratch area and the rest of the chunk.
++                const uint32_t skip = copied % alignment;
++                uint32_t size = copy_size - copied;
++                if (size > chunk_size - chunk_fill) {
++                    size = chunk_size - chunk_fill;
++                }
++                if (size > scratch_size - skip) {
++                    size = scratch_size - skip;
++                }
++                const uint32_t scratch_addr = chunk_addr + chunk_size;
++                concat_reader::with_input(j, tensor_indices, [&](auto I) {
++                    read_input_bytes<decltype(I)::value>(noc, scratch_addr, page_id, copied - skip, skip + size);
++                });
++                noc.async_read_barrier();
++                auto* src = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(scratch_addr + skip);
++                auto* dst = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(chunk_addr + chunk_fill);
++                for (uint32_t byte = 0; byte < size; ++byte) {
++                    dst[byte] = src[byte];
++                }
++                copied += size;
++                chunk_fill += size;
++                if (chunk_fill == chunk_size) {
++                    dfb_in.push_back(ublock_size_pages);
++                }
 +            }
-+            l1_write_addr += copy_size;
-             page_id_per_tensor[curr_tensor]++;
-             curr_tensor++;
++        }
++        if (chunk_fill != chunk_size) {
++            dfb_in.push_back(ublock_size_pages);
          }
+-        noc.async_read_barrier();
+-        dfb_in.push_back(ublock_size_pages);
+     }
+ #else
+     // Pages are read round-robin, one block of num_pages_per_block[t] pages from each input t. Each step
+diff --git ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/writer_concat_stick_chunks.cpp ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/writer_concat_stick_chunks.cpp
+new file mode 100644
+--- /dev/null
++++ ttnn/cpp/ttnn/operations/data_movement/concat/device/kernels/dataflow/writer_concat_stick_chunks.cpp
+@@ -0,0 +1,36 @@
++// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++// Writes row-major width-concat output sticks that the reader builds in chunks of chunk_size bytes,
++// one DFB entry each; the last chunk of a stick holds the rest. A stick that fits in L1 is one chunk.
++// Takes the arguments and bindings of writer_unary_stick_layout_interleaved_start_id_metal2.cpp.
++
++#include <stdint.h>
++#include "api/dataflow/dataflow_api.h"
++#include "api/dataflow/noc.h"
++#include "api/dataflow/dataflow_buffer.h"
++#include "api/tensor/noc_traits.h"
++#include "experimental/kernel_args.h"
++
++void kernel_main() {
++    const uint32_t stick_size = get_arg(args::stick_size);
++    const uint32_t num_sticks = get_arg(args::num_sticks);
++    const uint32_t start_id = get_arg(args::start_id);
++    constexpr uint32_t chunk_size = get_arg(args::chunk_size);
++
++    const auto s0 = TensorAccessor(tensor::dst);
++
++    Noc noc;
++    DataflowBuffer dfb_out0(dfb::out0);
++
++    for (uint32_t i = start_id; i < start_id + num_sticks; ++i) {
++        for (uint32_t offset = 0; offset < stick_size; offset += chunk_size) {
++            const uint32_t size = stick_size - offset < chunk_size ? stick_size - offset : chunk_size;
++            dfb_out0.wait_front(1);
++            noc.async_write(dfb_out0, s0, size, {.offset_bytes = 0}, {.page_id = i, .offset_bytes = offset});
++            noc.async_write_barrier();
++            dfb_out0.pop_front(1);
++        }
++    }
++}

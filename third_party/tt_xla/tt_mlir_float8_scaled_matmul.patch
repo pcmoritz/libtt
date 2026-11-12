@@ -1,7 +1,7 @@
 diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
 --- a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
 +++ b/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp
-@@ -94,6 +94,49 @@ bool hasNativeFloat8Operands(mlir::stablehlo::DotGeneralOp op) {
+@@ -87,6 +87,49 @@ bool hasNativeFloat8Operands(mlir::stablehlo::DotGeneralOp op) {
           rhsContracting.size() == 1 && rhsContracting[0] == batch;
  }
  
@@ -48,10 +48,10 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
 +  }
 +}
 +
- // The f32 values of float8 bits (a ui8 tensor): a convert of their float8 view.
- Value decodeFloat8(OpBuilder &builder, Location loc, Value bits,
-                    Type float8Type) {
-@@ -431,6 +474,13 @@ struct StableHLOFloat8DataTypeConversionPass
+ // A value converted to the given element type: float8 values through f32.
+ Value convertTo(OpBuilder &builder, Location loc, Value value,
+                 Type elementType) {
+@@ -290,6 +333,13 @@ struct StableHLOFloat8DataTypeConversionPass
        StableHLOFloat8DataTypeConversionPassBase;
  
    void runOnOperation() override {
@@ -62,48 +62,6 @@ diff --git a/lib/Dialect/StableHLO/Transforms/Float8DataTypeConversion.cpp b/lib
 +      readConvertedFloat8Operands(op);
 +    }
 +
-     // Ops that compute on float8 values compute on f32 values first, and the
-     // conversion below stores the remaining float8 values as their bits.
-     bool anyFloat8 = false;
-diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
---- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-+++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
-@@ -3826,6 +3826,28 @@ static bool isConstantOrParameterArgument(Value value) {
-                        funcOp, argument.getArgNumber());
- }
- 
-+// If value views the bits of a transposed matrix as another type, as the
-+// float8 data type conversion leaves a transposed float8 matrix
-+// (bitcast_convert of the permuted ui8 bits), return the untransposed matrix's
-+// view, so that the transpose fuses into the matmul like any other.
-+static std::optional<mlir::TypedValue<mlir::RankedTensorType>>
-+getBitcastPermuteOpOperand(mlir::PatternRewriter &rewriter,
-+                           mlir::TypedValue<mlir::RankedTensorType> value) {
-+  auto bitcast = value.getDefiningOp<BitcastConvertOp>();
-+  if (!bitcast || !bitcast->hasOneUse()) {
-+    return std::nullopt;
-+  }
-+  auto input = getPermuteOpOperand(bitcast.getInput());
-+  if (!input || isConstantOrParameterArgument(*input)) {
-+    return std::nullopt;
-+  }
-+  return rewriter
-+      .create<BitcastConvertOp>(
-+          bitcast.getLoc(),
-+          input->getType().clone(value.getType().getElementType()), *input)
-+      .getResult();
-+}
-+
- // Fuse permute ops into matmul/linear transpose attributes.
- // Handles both input A and input B for MatmulOp and LinearOp.
- //
-@@ -3859,6 +3881,9 @@ public:
-     if (inputBCanonical && isConstantOrParameterArgument(*inputBCanonical)) {
-       inputBCanonical = std::nullopt;
-     }
-+    if (!inputBCanonical) {
-+      inputBCanonical = getBitcastPermuteOpOperand(rewriter, op.getB());
-+    }
- 
-     if (!inputACanonical && !inputBCanonical) {
-       return mlir::failure();
+     // Ops that compute on float8 values compute on f32 values.
+     SmallVector<Operation *> computing;
+     getOperation()->walk<WalkOrder::PreOrder>([&](Operation *op) {

@@ -20,7 +20,9 @@ prefill runs TTNN's chunked paged attention the same way, one sequence per
 user, so it reads only each sequence's pages.
 
 Hybrid models' gated DeltaNet kernel runs on libtt's recurrent kernels, with
-the recurrent-state pool in their layout (`sglang_tpu_gdn`).
+the recurrent-state pool in their layout (`sglang_tpu_gdn`). Mixture-of-experts
+models' fused MoE op runs on TTNN's fused MoE kernel, with the experts in BF16
+or FP8, as loaded.
 """
 
 # Users per TTNN paged decode attention call.
@@ -36,6 +38,8 @@ MAMBA_POOL_MODULE = "sglang_tpu.mamba_pool"
 KV_FUSED_ROPE_WRITE_MODULE = "sglang_tpu.kv_fused_rope_write"
 BLOCK_DRAFT_WORKER_MODULE = "sglang_tpu.experimental.speculative.block_draft_worker"
 ALL_GATHER_VIA_ALL_REDUCE_MODULE = "sglang_tpu.all_gather_via_all_reduce"
+FUSED_MOE_MODULE = "sglang_tpu.moe.pallas.fused_moe_op"
+FP8_MOE_FUSED_RS_MODULE = "sglang_tpu.fp8_moe_fused_rs"
 
 
 def _ragged_paged_attention(module):
@@ -372,16 +376,13 @@ def _quantize_rows(x, dtype, min_scale):
 
     tokens, k = x.shape
     if tokens <= 32 and k % 32 == 0 and x.dtype in (jnp.bfloat16, jnp.float32):
-        # The op returns the float8 codes as uint8, as the compiler stores
-        # float8 tensors; the bitcast is a view.
-        codes, scale = jax.ffi.ffi_call(
+        return jax.ffi.ffi_call(
             "tt.quantize_rows",
             (
-                jax.ShapeDtypeStruct(x.shape, jnp.uint8),
+                jax.ShapeDtypeStruct(x.shape, dtype),
                 jax.ShapeDtypeStruct((tokens, 1), jnp.float32),
             ),
         )(x, min_scale=np.float32(min_scale), e5m2=np.bool_(dtype == jnp.float8_e5m2))
-        return jax.lax.bitcast_convert_type(codes, dtype), scale
     fp8_max = float(jnp.finfo(dtype).max)
     scale = jnp.maximum(
         jnp.max(jnp.abs(x), axis=-1, keepdims=True).astype(jnp.float32) / fp8_max, min_scale
@@ -520,6 +521,121 @@ def patch_all_gather_via_all_reduce(module):
     module.all_gather_into_tensor_around = all_gather_into_tensor_around
 
 
+def _fp8_scales(w13, w13_scale, w2_scale):
+    """The scales tt.fused_moe_ep takes with FP8 experts `w13` ([experts, k,
+    2 * n], gate then up projections) and w2 ([experts, n, k]), from a scale
+    per expert and output column (or one per expert): the gate's and the up
+    projection's ([experts, n] each), then the down projection's ([experts,
+    k]), float32."""
+    import jax.numpy as jnp
+
+    experts, k, gate_up = w13.shape
+
+    def scales(scale, columns):
+        return jnp.broadcast_to(scale.astype(jnp.float32).reshape(experts, -1), (experts, columns))
+
+    scale13 = scales(w13_scale, gate_up)
+    return scale13[:, : gate_up // 2], scale13[:, gate_up // 2 :], scales(w2_scale, k)
+
+
+def _fused_moe_jax(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights,
+    topk_ids,
+    w1_scale,
+    w2_scale,
+    w1_bias,
+    w2_bias,
+    topk,
+    activation_name,
+    no_combine=False,
+    global_num_experts=0,
+    expert_group_offset=0,
+    use_sc_gather=0,
+    w_quant_bits=0,
+    permute_dense_threshold=0,
+    w1_channel_scale=None,
+    w2_channel_scale=None,
+    expert_group_offset_tensor=None,
+    gather_permute_with_sc_combine=0,
+):
+    """The fused MoE op on TTNN's fused MoE kernel (tt.fused_moe_ep), with the
+    experts in BF16 or FP8, as loaded.
+
+    FP8 experts come with SGLang-TorchTPU's channelwise runtime scales, one per
+    expert and output column. The kernel reads the FP8 weights as they are and
+    applies the scales. The activations stay unquantized (FLOAT16 inside the
+    kernel, which the matrix unit reads next to FP8): the Pallas kernel
+    quantizes them to FP8 too, but only on TPUs with FP8 arithmetic.
+
+    The kernel runs whole experts, split evenly over the chips in rank order,
+    which is how SGLang-TorchTPU splits them with --ep-size equal to --tp-size.
+    Each rank returns its experts' routing-weighted sum for every token, and
+    the layer's all-reduce adds them up. Like the Pallas kernel, it reads the
+    router's global expert ids. w1 holds each expert's gate and up projections
+    side by side, [experts, hidden, 2 * intermediate].
+    """
+    import jax
+    import jax.numpy as jnp
+    import torch.distributed as dist
+
+    extras = (w1_bias, w2_bias, w1_channel_scale, w2_channel_scale)
+    if activation_name != "silu" or no_combine or w_quant_bits or any(e is not None for e in extras):
+        raise NotImplementedError("MoE on Tenstorrent runs BF16 or FP8 SiLU experts without biases, combined")
+    fp8 = w1.dtype == w2.dtype == jnp.float8_e4m3fn
+    if fp8:
+        if w1_scale is None or w2_scale is None or w1_scale.shape[1] != 1 or w2_scale.shape[1] != 1:
+            raise NotImplementedError(
+                "FP8 MoE on Tenstorrent takes channelwise scales: pass --tpu-fp8-runtime channelwise"
+            )
+    elif w1_scale is not None or w2_scale is not None or not w1.dtype == w2.dtype == jnp.bfloat16:
+        raise NotImplementedError("MoE on Tenstorrent runs BF16 or FP8 experts")
+    if hidden_states.dtype != jnp.bfloat16:
+        raise NotImplementedError("MoE on Tenstorrent runs on BF16 activations")
+    experts, _, gate_up = w1.shape
+    ranks = dist.get_world_size() if dist.is_initialized() else 1
+    if (global_num_experts or experts) != experts * ranks:
+        raise NotImplementedError(
+            "MoE on Tenstorrent splits whole experts over the chips: pass --ep-size equal to --tp-size"
+        )
+
+    # Mark the experts, and FP8 experts' scales, as weights, so that the kernel's
+    # weight preparation runs once rather than on every call, and keep BF16
+    # experts in BF16.
+    def weight(w):
+        return jax.ffi.ffi_call("tt.weight_dtype_override", jax.ShapeDtypeStruct(w.shape, w.dtype))(
+            w, **{"ttcore.weight_dtype": "bf16"}
+        )
+
+    w1, w2 = weight(w1), weight(w2)
+    fused_moe_ep = jax.ffi.ffi_call("tt.fused_moe_ep", jax.ShapeDtypeStruct(hidden_states.shape, hidden_states.dtype))
+    operands = (hidden_states, topk_weights, topk_ids, w1[..., : gate_up // 2], w1[..., gate_up // 2 :], w2)
+    if fp8:
+        return fused_moe_ep(*operands, *_fp8_scales(w1, weight(w1_scale), weight(w2_scale)))
+    return fused_moe_ep(*operands, weight_dtype="bf16")
+
+
+def patch_fused_moe(module):
+    module._fused_moe_jax = _fused_moe_jax
+
+
+def patch_fp8_moe_fused_rs(module):
+    """SGLang-TorchTPU runs FP8 experts on a Pallas kernel that fuses the MoE
+    with its reduce-scatter where the layout allows. Report every layout as one
+    it does not cover: the experts then run on the fused MoE op, which is
+    TTNN's fused MoE kernel here, followed by an all-reduce."""
+
+    def prepare_fp8_fused_rs(layer):
+        layer.__dict__["_tpu_fused_rs_unsupported_reason"] = (
+            "Tenstorrent runs the fused MoE kernel followed by an all-reduce"
+        )
+        return False
+
+    module.prepare_fp8_fused_rs = prepare_fp8_fused_rs
+
+
 PATCHES = {
     RPA_V3_MODULE: patch_rpa_v3,
     KV_POOL_MODULE: patch_kv_pool,
@@ -529,4 +645,6 @@ PATCHES = {
     KV_FUSED_ROPE_WRITE_MODULE: patch_kv_fused_rope_write,
     BLOCK_DRAFT_WORKER_MODULE: patch_block_draft_worker,
     ALL_GATHER_VIA_ALL_REDUCE_MODULE: patch_all_gather_via_all_reduce,
+    FUSED_MOE_MODULE: patch_fused_moe,
+    FP8_MOE_FUSED_RS_MODULE: patch_fp8_moe_fused_rs,
 }

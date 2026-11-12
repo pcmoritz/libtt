@@ -13,7 +13,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +    decode activations. The sum is returned too: it is the residual stream the
 +    next layer adds to. With a float8_type, `quantized` is the output's
 +    per-row float8 quantization as ttir.quantize_rows with min_scale makes
-+    it: the codes as ui8 and the FP32 [M, 1] scale.
++    it: the float8 codes and the FP32 [M, 1] scale.
 +  }];
 +  let arguments = (ins AnyRankedTensor:$input,
 +                       AnyRankedTensor:$residual,
@@ -41,8 +41,8 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +  let description = [{
 +    sum = input + residual, and output = sum / sqrt(mean(sum^2) + epsilon) *
 +    (weight + weight_offset) over the last dimension, for one tile row of
-+    decode activations; with a float8_type also the output's float8 codes
-+    (ui8) and scale, see ttir.rms_norm_residual.
++    decode activations; with a float8_type also the output's float8 codes and
++    scale, see ttir.rms_norm_residual.
 +  }];
 +  let arguments = (ins AnyRankedTensor:$input,
 +                       AnyRankedTensor:$residual,
@@ -73,7 +73,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/normalization.fbs b/include/t
 +  out: tt.target.ttnn.TensorRef;
 +  sum: tt.target.ttnn.TensorRef;
 +  weight_offset: float;
-+  // With q: the output's float8 codes (UINT8) and scale.
++  // With q: the output's float8 codes and scale.
 +  float8_type: tt.target.DataType;
 +  min_scale: float;
 +  q: tt.target.ttnn.TensorRef;
@@ -322,7 +322,7 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm_residual.cpp b/r
 new file mode 100644
 --- /dev/null
 +++ b/runtime/lib/ttnn/operations/normalization/rms_norm_residual.cpp
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,33 @@
 +// SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -331,7 +331,6 @@ new file mode 100644
 +#include "tt/runtime/detail/ttnn/operations/utils.h"
 +#include "tt/runtime/detail/ttnn/ttnn.h"
 +#include "tt/runtime/detail/ttnn/utils.h"
-+#include "ttnn/operations/eltwise/unary/unary.hpp"
 +#include "ttnn/operations/normalization/rms_norm_residual/rms_norm_residual.hpp"
 +
 +namespace tt::runtime::ttnn::operations::rms_norm_residual {
@@ -352,9 +351,7 @@ new file mode 100644
 +  pool.insertTTNNTensorAndValidate(op->out(), outputs.at(0));
 +  pool.insertTTNNTensorAndValidate(op->sum(), outputs.at(1));
 +  if (op->q()) {
-+    // The compiler stores float8 tensors as their bits (UINT8): a view.
-+    pool.insertTTNNTensorAndValidate(
-+        op->q(), ::ttnn::bitcast(outputs.at(2), ::ttnn::DataType::UINT8));
++    pool.insertTTNNTensorAndValidate(op->q(), outputs.at(2));
 +    pool.insertTTNNTensorAndValidate(op->scale(), outputs.at(3));
 +  }
 +}

@@ -66,6 +66,15 @@ diff --git a/lib/OpModel/TTNN/SingletonDeviceContext.cpp b/lib/OpModel/TTNN/Sing
  
    device->disable_and_clear_program_cache();
  
+@@ -317,7 +315,7 @@
+   // Derive arch from the env that owns the live device (its descriptor
+   // remembers which mock cluster YAML it loaded); numChips comes from the new
+   // mesh shape.
+-  ttcore::Arch arch = fromMetalArch(m_env->get_arch());
++  ttcore::Arch arch = fromMetalArch(m_env->get_device_properties().arch());
+   uint32_t numChips = static_cast<uint32_t>(meshShape.first * meshShape.second);
+ 
+   // Flush the program cache before destroying the env-backed device; see the
 @@ -339,9 +337,12 @@
  
    m_device = m_env->create_mesh_device(

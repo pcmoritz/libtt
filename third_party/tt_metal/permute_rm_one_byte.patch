@@ -28,7 +28,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflo
 +    // Rows whose source isn't aligned (1-byte elements) are read to rows of this staging area that start
 +    // at aligned addresses, then copied into place within L1.
 +    Scratchpad<uint32_t> realign(scratch::realign);
-+    const uint32_t realign_base = (realign.get_base_address() + alignment - 1) & ~(alignment - 1);
++    const uint32_t realign_base = (static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&realign[0])) + alignment - 1) & ~(alignment - 1);
 +#endif
 +
      uint32_t idxs[N];
