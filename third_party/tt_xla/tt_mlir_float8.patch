@@ -641,6 +641,22 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
    ttcore::DataTypeAttr inputDtype =
        ttnn::getDtypeFromValue(previousDataCastOp.getInput());
    ttcore::DataTypeAttr intermediateDtype =
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNDecomposeLayouts.cpp
+@@ -121,9 +121,11 @@ private:
+   }
+ 
+   // ttnn.to_layout only performs a real numeric conversion within the float
+-  // family.
++  // family. Float8 converts exactly only with ttnn.typecast (to or from f32).
+   bool isFloatFamily(ttcore::DataType dataType) const {
+     switch (dataType) {
++    case ttcore::DataType::Float8E4M3FN:
++    case ttcore::DataType::Float8E5M2:
+     case ttcore::DataType::UInt32:
+     case ttcore::DataType::UInt16:
+     case ttcore::DataType::UInt8:
 diff --git a/lib/OpModel/TTNN/Conversion.cpp b/lib/OpModel/TTNN/Conversion.cpp
 --- a/lib/OpModel/TTNN/Conversion.cpp
 +++ b/lib/OpModel/TTNN/Conversion.cpp

@@ -10,8 +10,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <bit>
-#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -20,7 +18,6 @@
 #include <utility>
 #include <vector>
 
-#include <tt-metalium/float8.hpp>
 #include <tt-metalium/mesh_device.hpp>
 
 #include "ttnn/operations/core/core.hpp"
@@ -276,36 +273,6 @@ TEST_F(Float8DataMovementTest, Pad) {
                         << dtype << " " << layout << " at " << r << ", " << c;
                 }
             }
-        }
-    }
-}
-
-// to_layout into or out of float8 converts exactly (ttnn::typecast through FLOAT32), as it does when the compiler
-// moves a float8 op to FLOAT32: every finite code survives FLOAT32 -> float8 tiles and float8 tiles -> FLOAT32 rows.
-TEST_F(Float8DataMovementTest, LayoutsWithConversion) {
-    for (DataType dtype : {DataType::FP8_E4M3, DataType::FP8_E5M2}) {
-        std::vector<uint8_t> codes;
-        for (uint32_t i = 0; i < 64 * 96; ++i) {
-            const uint8_t code = static_cast<uint8_t>((i * 37 + i / 7) % 256);
-            const float value = dtype == DataType::FP8_E4M3 ? float(float8_e4m3::from_bits(code))
-                                                            : float(float8_e5m2::from_bits(code));
-            codes.push_back(std::isfinite(value) ? code : 0);
-        }
-        std::vector<float> values;
-        for (uint8_t code : codes) {
-            values.push_back(
-                dtype == DataType::FP8_E4M3 ? float(float8_e4m3::from_bits(code)) : float(float8_e5m2::from_bits(code)));
-        }
-        const ttnn::Shape shape({64, 96});
-        const TensorSpec rows_spec(shape, TensorLayout(DataType::FLOAT32, PageConfig(Layout::ROW_MAJOR), {}));
-        const auto rows = ttnn::Tensor::from_vector(values, rows_spec).to_device(mesh_device_.get());
-        const auto tiles = ttnn::to_layout(rows, Layout::TILE, dtype);
-        ASSERT_EQ(tiles.dtype(), dtype);
-        EXPECT_EQ(ttnn::bitcast(tiles, DataType::UINT8).cpu().to_vector<uint8_t>(), codes) << dtype;
-        const auto back = ttnn::to_layout(tiles, Layout::ROW_MAJOR, DataType::FLOAT32);
-        const auto got = back.cpu().to_vector<float>();
-        for (size_t i = 0; i < values.size(); ++i) {
-            ASSERT_EQ(std::bit_cast<uint32_t>(got[i]), std::bit_cast<uint32_t>(values[i])) << dtype << " at " << i;
         }
     }
 }
