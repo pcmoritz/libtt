@@ -26,7 +26,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/common/float8.hpp ttnn/cpp/ttn
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/data_movement/common/float8.hpp
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,33 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -51,6 +51,12 @@ new file mode 100644
 +// largest finite value, as libtt's exact typecast encodes.
 +inline uint8_t float8_code(float value, tt::tt_metal::DataType dtype) {
 +    return dtype == tt::tt_metal::DataType::FP8_E4M3 ? float8_e4m3(value).to_bits() : float8_e5m2(value).to_bits();
++}
++
++// The 32-bit word that pad's kernels fill float8 padding with: four copies of the code, which is the code at any
++// byte offset.
++inline uint32_t float8_pad_word(float value, tt::tt_metal::DataType dtype) {
++    return float8_code(value, dtype) * 0x01010101u;
 +}
 +
 +}  // namespace ttnn::operations::data_movement
@@ -265,52 +271,130 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/repeat/repeat.cpp ttnn/cpp/ttn
      auto [working_tensor, working_repetition_vector] = detail::match_input_rank(input_tensor, repetition_vector);
      const MemoryConfig output_mem_config =
          detail::derive_output_mem_config(input_tensor, memory_config, optional_output_tensor);
-diff --git ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
---- ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
-+++ ttnn/cpp/ttnn/operations/data_movement/pad/pad.cpp
-@@ -3,7 +3,10 @@
- // SPDX-License-Identifier: Apache-2.0
- 
- #include "ttnn/operations/core/core.hpp"
-+#include "ttnn/operations/creation/creation.hpp"
- #include "ttnn/operations/data_movement/common/common.hpp"
+diff --git ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_device_operation.cpp
+@@ -6,6 +6,7 @@
+ #include <tt-metalium/hal.hpp>
+ #include <tt-metalium/tt_align.hpp>
+ #include "pad_device_operation.hpp"
 +#include "ttnn/operations/data_movement/common/float8.hpp"
-+#include "ttnn/operations/data_movement/concat/concat.hpp"
- #include "ttnn/operations/data_movement/fill_pad/device/fill_pad_device_operation.hpp"
- #include "ttnn/operations/data_movement/fill_pad/fill_pad.hpp"
- #include "ttnn/operations/data_movement/pad/codegen/pad_codegen_device_operation.hpp"
-@@ -672,6 +675,34 @@ ttnn::Tensor pad_with_route(
-         return input_tensor;
+ #include "ttnn/device_operation.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
+ #include "ttnn/operations/full/device/full_device_operation.hpp"
+@@ -21,6 +22,7 @@
+ 
+ using namespace tt::tt_metal;
+ namespace ttnn::prim {
++using ttnn::operations::data_movement::is_float8;
+ using ttnn::operations::data_movement::common_tm_bw_model;
+ 
+ namespace {
+@@ -70,6 +72,13 @@ tt::tt_metal::operation::OpPerformanceModelGeneral<std::vector<Tensor>> PadDevic
+ PadDeviceOperation::program_factory_t PadDeviceOperation::select_program_factory(
+     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+     const auto& input_tensor = tensor_args.input;
++    // Float8 pads in the factories that fill padding by the 32-bit word (float8_pad_word) and move it as UInt8.
++    if (is_float8(input_tensor.dtype())) {
++        if (input_tensor.layout() == Layout::ROW_MAJOR) {
++            return PadRmReaderWriterMultiCoreDefaultProgramFactory{};
++        }
++        return PadTileMulticoreProgramFactory{};
++    }
+     if (input_tensor.layout() == Layout::ROW_MAJOR) {
+         if (input_tensor.is_sharded()) {
+             if (can_use_sharded_optimized_factory(operation_attributes, input_tensor)) {
+@@ -158,13 +167,14 @@ void PadDeviceOperation::validate_on_program_cache_miss(
+             input_tensor.dtype() == DataType::FLOAT32 || input_tensor.dtype() == DataType::BFLOAT16 ||
+                 input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||
+                 input_tensor.dtype() == DataType::UINT16 || input_tensor.dtype() == DataType::FLOAT16 ||
+-                input_tensor.dtype() == DataType::BFLOAT8_B,
++                input_tensor.dtype() == DataType::BFLOAT8_B || is_float8(input_tensor.dtype()),
+             "Cannot pad tilized tensor with specified format");
+     } else if (input_tensor.layout() == Layout::ROW_MAJOR) {
+         TT_FATAL(
+             input_tensor.dtype() == DataType::FLOAT32 || input_tensor.dtype() == DataType::BFLOAT16 ||
+                 input_tensor.dtype() == DataType::INT32 || input_tensor.dtype() == DataType::UINT32 ||
+-                input_tensor.dtype() == DataType::UINT16 || input_tensor.dtype() == DataType::FLOAT16,
++                input_tensor.dtype() == DataType::UINT16 || input_tensor.dtype() == DataType::FLOAT16 ||
++                is_float8(input_tensor.dtype()),
+             "Cannot pad RM tensor with specified format");
      }
  
-+    // Pad's kernels move 2- and 4-byte elements. Float8 is padded by concatenating tensors of the pad value,
-+    // which full encodes exactly (data_movement/common/float8.hpp), along each padded dimension.
-+    if (is_float8(input_tensor.dtype()) && input_tensor.storage_type() == StorageType::DEVICE) {
-+        ttnn::Tensor padded = input_tensor;
-+        for (int dim = 0; dim < original_rank; ++dim) {
-+            const auto [before, after] = working_padding[dim];
-+            if (before == 0 && after == 0) {
-+                continue;
-+            }
-+            const auto fill = [&](uint32_t size) {
-+                ttsl::SmallVector<uint32_t> shape(padded.logical_shape().cbegin(), padded.logical_shape().cend());
-+                shape[dim] = size;
-+                return ttnn::full(
-+                    ttnn::Shape(shape), value, padded.dtype(), padded.layout(), *padded.device(), padded.memory_config());
-+            };
-+            std::vector<ttnn::Tensor> parts;
-+            if (before != 0) {
-+                parts.push_back(fill(before));
-+            }
-+            parts.push_back(padded);
-+            if (after != 0) {
-+                parts.push_back(fill(after));
-+            }
-+            padded = ttnn::concat(parts, dim, memory_config_arg);
-+        }
-+        return padded;
-+    }
-+
-     ttnn::Tensor working_tensor = input_tensor;
-     if (original_rank > 4) {
-         if (input_tensor.storage_type() != StorageType::DEVICE) {
+diff --git ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_reader_writer_multi_core_default_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_reader_writer_multi_core_default_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_reader_writer_multi_core_default_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_rm_reader_writer_multi_core_default_program_factory.cpp
+@@ -13,6 +13,7 @@
+ #include <tt-metalium/work_split.hpp>
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
++#include "ttnn/operations/data_movement/common/float8.hpp"
+ 
+ using namespace tt::constants;
+ using namespace tt::tt_metal;
+@@ -20,7 +21,10 @@ using namespace tt::tt_metal::experimental;
+ static const uint32_t max_read_size = 2048;  // max read size in bytes for reader and writer kernels
+ 
+ namespace ttnn::prim {
++using ttnn::operations::data_movement::data_movement_format;
++using ttnn::operations::data_movement::float8_pad_word;
+ using ttnn::operations::data_movement::float_to_uint16;
++using ttnn::operations::data_movement::is_float8;
+ using ttnn::operations::data_movement::pack_two_uint16_into_uint32;
+ 
+ namespace {
+@@ -81,7 +85,7 @@ ttnn::device_operation::ProgramArtifacts PadRmReaderWriterMultiCoreDefaultProgra
+         num_output_pages_in_row = tt::div_up(W_padded, output_shard_width);
+     }
+ 
+-    tt::DataFormat dfb_data_format = tt::tt_metal::datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat dfb_data_format = data_movement_format(a.dtype());
+ 
+     MeshDevice* device = a.device();
+ 
+@@ -113,6 +117,8 @@ ttnn::device_operation::ProgramArtifacts PadRmReaderWriterMultiCoreDefaultProgra
+     } else if (a.dtype() == DataType::FLOAT32) {
+         // The reader fills 32-bit words; two bfloat16 copies of 1.0 read back as 1.0019379.
+         packed_pad_value = std::bit_cast<uint32_t>(pad_value);
++    } else if (is_float8(a.dtype())) {
++        packed_pad_value = float8_pad_word(pad_value, a.dtype());
+     } else {
+         packed_pad_value = pack_two_bfloat16_into_uint32({bfloat16(pad_value), bfloat16(pad_value)});
+     }
+diff --git ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_tile_multicore_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_tile_multicore_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_tile_multicore_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/data_movement/pad/device/pad_tile_multicore_program_factory.cpp
+@@ -9,12 +9,15 @@
+ #include <tt-metalium/work_split.hpp>
+ #include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+ #include "ttnn/operations/data_movement/common/common.hpp"
++#include "ttnn/operations/data_movement/common/float8.hpp"
+ 
+ using namespace tt::tt_metal;
+ using namespace tt::tt_metal::experimental;
+ using namespace tt::constants;
+ 
+ namespace ttnn::prim {
++using ttnn::operations::data_movement::data_movement_format;
++using ttnn::operations::data_movement::float8_pad_word;
+ using ttnn::operations::data_movement::get_num_pages;
+ 
+ namespace {
+@@ -63,7 +66,7 @@ ttnn::device_operation::ProgramArtifacts PadTileMulticoreProgramFactory::create_
+ 
+     auto cores_in_order = corerange_to_cores(all_cores, num_cores, true);
+ 
+-    tt::DataFormat dfb_data_format = tt::tt_metal::datatype_to_dataformat_converter(a.dtype());
++    tt::DataFormat dfb_data_format = data_movement_format(a.dtype());
+     uint32_t page_size = output.buffer()->page_size();
+     uint32_t multi_buffering_size = 2;
+ 
+@@ -99,6 +102,8 @@ ttnn::device_operation::ProgramArtifacts PadTileMulticoreProgramFactory::create_
+                  ttnn::operations::data_movement::float_to_uint16(pad_value)});
+             break;
+         case DataType::FLOAT32: packed_pad_value = std::bit_cast<uint32_t>(pad_value); break;
++        case DataType::FP8_E4M3:
++        case DataType::FP8_E5M2: packed_pad_value = float8_pad_word(pad_value, a.dtype()); break;
+         default:
+             packed_pad_value = 0;
+             TT_ASSERT(

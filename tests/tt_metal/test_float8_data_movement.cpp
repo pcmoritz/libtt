@@ -2,9 +2,8 @@
 
 // TTNN's data-movement ops take float8 tensors (FP8_E4M3, FP8_E5M2) on device as they are: each op returns a float8
 // tensor holding exactly the bytes it moves for the same data as UINT8. Float8 moves as libtt moves FLOAT16:
-// permute and transpose declare its buffers UInt8 (data_movement_format), to_layout and repeat move it as UINT8
-// (float8_data_movement.patch), where selects it as UInt8 bytes, and pad concatenates it with full tensors of the
-// pad value. Before, untilize, last-two-dimension permutes, unaligned tile slices and tile
+// permute, transpose and pad declare its buffers UInt8 (data_movement_format), to_layout and repeat move it as UINT8
+// (float8_data_movement.patch), and where selects its bytes as integers. Before, untilize, last-two-dimension permutes, unaligned tile slices and tile
 // concats asked for 32-bit DEST, whose float8 conversions aren't exact; data-moving reshapes, full and e5m2 copies
 // rejected float8, and tilize returned FLOAT32.
 
