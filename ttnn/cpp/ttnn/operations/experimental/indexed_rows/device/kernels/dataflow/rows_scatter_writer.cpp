@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 libtt authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// rows_scatter writer. The reader streams this core's table pages through the
+// rows_scatter writer. The reader streams this core's table pages (num_pages
+// pages first_page, first_page + page_stride, ...) through the
 // rows DFB in chunks; the writer takes them in batches that fill the buffer,
 // and for each batch streams the index tensor (and, with a column component,
 // the source) in chunks, applies the updates that land in the batch to its
@@ -50,6 +51,15 @@ void kernel_main() {
 
     const uint32_t first_page = get_arg(args::first_page);
     const uint32_t num_pages = get_arg(args::num_pages);
+    const uint32_t page_stride = get_arg(args::page_stride);
+    // Whether `page` is this core's, and its position k among them.
+    auto owned = [&](uint32_t page, uint32_t& k) {
+        if (page < first_page || (page - first_page) % page_stride != 0) {
+            return false;
+        }
+        k = (page - first_page) / page_stride;
+        return k < num_pages;
+    };
 
     DataflowBuffer rows(dfb::rows);
     DataflowBuffer index(dfb::index);
@@ -62,7 +72,7 @@ void kernel_main() {
 
     const uint32_t entry = rows.get_entry_size();
     const uint32_t b_lo = first_page / (N * S);
-    const uint32_t b_hi = num_pages == 0 ? 0 : (first_page + num_pages - 1) / (N * S);
+    const uint32_t b_hi = num_pages == 0 ? 0 : (first_page + (num_pages - 1) * page_stride) / (N * S);
     // Row-mode reductions read the source row chunk here before combining it.
     scratch.reserve_back(1);
     const uint32_t src_addr = scratch.get_write_ptr();
@@ -72,14 +82,18 @@ void kernel_main() {
         const uint32_t count = total - q0 < batch ? total - q0 : batch;
         rows.wait_front(count);
         const uint32_t batch_l1 = rows.get_read_ptr();
-        // The pages with a chunk in this batch.
-        const uint32_t batch_page_lo = first_page + q0 / C;
-        const uint32_t batch_page_hi = first_page + (q0 + count + C - 1) / C;
+        // The pages with a chunk in this batch are in [batch_page_lo, batch_page_hi).
+        const uint32_t batch_page_lo = first_page + q0 / C * page_stride;
+        const uint32_t batch_page_hi = first_page + ((q0 + count + C - 1) / C - 1) * page_stride + 1;
 
         // The L1 address of (page, offset) when its chunk is in this batch.
         auto in_batch = [&](uint32_t page, uint32_t offset, uint32_t& l1) {
-            const uint32_t q = (page - first_page) * C + offset / chunk_bytes;
-            if (page < first_page || page >= first_page + num_pages || q < q0 || q >= q0 + count) {
+            uint32_t k;
+            if (!owned(page, k)) {
+                return false;
+            }
+            const uint32_t q = k * C + offset / chunk_bytes;
+            if (q < q0 || q >= q0 + count) {
                 return false;
             }
             l1 = batch_l1 + (q - q0) * entry + offset % chunk_bytes;
@@ -110,7 +124,8 @@ void kernel_main() {
                         // row components alone before decoding the column.
                         const Coords<KR> rows_only = decode<KR, index_unsigned>(position, index_stride, sizes, windows);
                         const uint32_t row = b * N + window_row<KR>(rows_only, 0, windows, strides);
-                        if (rows_only.out_of_bounds || row - first_page >= num_pages) {
+                        uint32_t k;
+                        if (rows_only.out_of_bounds || !owned(row, k)) {
                             continue;
                         }
                     }
@@ -190,7 +205,7 @@ void kernel_main() {
         // The batch goes out once.
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t q = q0 + i;
-            const uint32_t page = first_page + q / C;
+            const uint32_t page = first_page + q / C * page_stride;
             const uint32_t offset = (q % C) * chunk_bytes;
             const uint32_t bytes = page_bytes - offset < chunk_bytes ? page_bytes - offset : chunk_bytes;
             noc.async_write(rows, output, bytes, {.offset_bytes = i * entry}, {.page_id = page, .offset_bytes = offset});
