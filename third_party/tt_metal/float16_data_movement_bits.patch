@@ -314,18 +314,15 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_facto
 diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/ternary.cpp ttnn/cpp/ttnn/operations/eltwise/ternary/ternary.cpp
 --- ttnn/cpp/ttnn/operations/eltwise/ternary/ternary.cpp
 +++ ttnn/cpp/ttnn/operations/eltwise/ternary/ternary.cpp
-@@ -4,8 +4,10 @@
+@@ -6,6 +6,7 @@
  
- #include "ternary.hpp"
- 
-+#include <algorithm>
  #include <utility>
  #include <variant>
 +#include <vector>
  #include <cstdint>
  
  #include "ttnn/operations/eltwise/binary/binary.hpp"
-@@ -16,6 +18,7 @@
+@@ -16,6 +17,7 @@
  #include "device/ternary_op_utils.hpp"
  #include "ttnn/operations/copy/typecast/typecast.hpp"
  #include "ttnn/operations/core/core.hpp"
@@ -333,7 +330,7 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/ternary.cpp ttnn/cpp/ttnn/op
  #include "ttnn/operations/data_movement/unsqueeze/unsqueeze.hpp"
  #include "ternary_composite_op.hpp"
  
-@@ -110,14 +113,35 @@ void validate_where_scalar_for_integer_tensor(float scalar, DataType tensor_dtyp
+@@ -110,14 +112,27 @@ void validate_where_scalar_for_integer_tensor(float scalar, DataType tensor_dtyp
          tensor_dtype);
  }
  
@@ -344,16 +341,8 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/ternary.cpp ttnn/cpp/ttnn/op
 +    if (value.dtype() != DataType::FP8_E4M3 && value.dtype() != DataType::FP8_E5M2) {
 +        return value;
 +    }
-+    const auto rank = std::max({a.logical_shape().rank(), b.logical_shape().rank(), c.logical_shape().rank()});
-+    std::vector<int32_t> shape(rank, 1);
-+    for (const Tensor* tensor : {&a, &b, &c}) {
-+        const auto& dims = tensor->logical_shape();
-+        for (size_t i = 0; i < dims.rank(); ++i) {
-+            int32_t& dim = shape[rank - dims.rank() + i];
-+            dim = std::max(dim, static_cast<int32_t>(dims[i]));
-+        }
-+    }
-+    return ttnn::expand(value, shape);
++    const auto shape = compute_broadcasted_output_ternary(a.logical_shape(), b.logical_shape(), c.logical_shape());
++    return ttnn::expand(value, std::vector<int32_t>(shape.cbegin(), shape.cend()));
 +}
 +
  // TTT: tensor, tensor, tensor
