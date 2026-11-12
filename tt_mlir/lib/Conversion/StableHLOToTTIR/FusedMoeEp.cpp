@@ -4,7 +4,7 @@
 // tt.fused_moe_ep: a mixture-of-experts layer's experts on one device of an
 // expert-parallel mesh, over TTNN's fused MoE kernel (ttir.moe_compute).
 //
-//   out = tt.fused_moe_ep(x, topk_weights, topk_ids, w1, w3, w2)
+//   out = tt.fused_moe_ep(x, topk_weights, topk_ids, w1, w3, w2[, s1, s3, s2])
 //
 // Called per device (inside a shard_map) with
 //   x            [T, H]          the tokens,
@@ -21,7 +21,13 @@
 // The kernel stores the experts in BFP4, or in BF16 as they are with the
 // weight_dtype = "bf16" attribute, takes up to 512 tokens per call, runs only
 // the (token, expert) pairs of the experts its device owns and writes each
-// pair's output unweighted. This lowering chunks the tokens, builds
+// pair's output unweighted.
+//
+// Float8_e4m3fn experts the kernel reads as they are; they come with an FP32
+// scale per expert and output column, which it applies:
+//   s1, s3       [E_local, I] f32 the gate and up projections' scales,
+//   s2           [E_local, H] f32 and the down projections'.
+// This lowering chunks the tokens, builds
 // the expert-to-device mapping, and sums each token's slots with its weights in
 // one matmul accumulated in FP32; the kernel reads the ids as they are and
 // skips padding's negative ids.
@@ -46,7 +52,8 @@ namespace {
 constexpr int64_t kMaxTokensPerCall = 512;
 // Matmul rings that run a device's experts side by side. BF16 experts stream
 // through one ring: a whole expert slice per ring core, which the rings replay
-// for every chunk, doesn't fit a core's L1 at two bytes per weight.
+// for every chunk, doesn't fit a core's L1 at two bytes per weight. At FP8's
+// one byte it does: 0.66 MB of the 0.79 MB at Qwen3-30B-A3B's shapes.
 constexpr uint32_t kRings = 3;
 constexpr uint32_t kBf16Rings = 0;
 
@@ -62,10 +69,28 @@ public:
     if (adaptor.getCallTargetName() != "tt.fused_moe_ep") {
       return failure();
     }
-    if (adaptor.getOperands().size() != 6 || op->getNumResults() != 1) {
+    // The experts' dtype in the kernel: float8 experts' own, others' BFP4
+    // unless the call asks for BF16.
+    auto config = dyn_cast_or_null<DictionaryAttr>(op.getBackendConfigAttr());
+    if (!config) {
+      config = dyn_cast_or_null<DictionaryAttr>(
+          op->getDiscardableAttr("mhlo.backend_config"));
+    }
+    StringAttr weightDtype =
+        config ? config.getAs<StringAttr>("weight_dtype") : nullptr;
+    if (weightDtype && weightDtype.getValue() != "bfp4" &&
+        weightDtype.getValue() != "bf16") {
+      return rewriter.notifyMatchFailure(
+          op, "tt.fused_moe_ep's weight_dtype is bfp4 or bf16");
+    }
+
+    if ((adaptor.getOperands().size() != 6 &&
+         adaptor.getOperands().size() != 9) ||
+        op->getNumResults() != 1) {
       return rewriter.notifyMatchFailure(
           op, "tt.fused_moe_ep takes x, topk_weights, topk_ids, w1, w3 and "
-              "w2 and returns one tensor");
+              "w2 (and s1, s3 and s2 with float8 experts) and returns one "
+              "tensor");
     }
     Value x = adaptor.getOperands()[0];
     Value weights = adaptor.getOperands()[1];
@@ -79,6 +104,9 @@ public:
     auto xType = cast<RankedTensorType>(x.getType());
     auto idsType = cast<RankedTensorType>(ids.getType());
     auto w1Type = cast<RankedTensorType>(w1.getType());
+    const bool fp8Weights = isa<Float8E4M3FNType>(w1Type.getElementType());
+    const bool bf16Weights =
+        !fp8Weights && weightDtype && weightDtype.getValue() == "bf16";
     auto outType = cast<RankedTensorType>(
         getTypeConverter()->convertType(op.getResult(0).getType()));
     if (xType.getRank() != 2 || idsType.getRank() != 2 ||
@@ -93,6 +121,26 @@ public:
           op, "tt.fused_moe_ep expects x [T, H], topk_weights and topk_ids "
               "[T, k], w1 and w3 [E_local, H, I] and w2 [E_local, I, H]");
     }
+    if (fp8Weights != (adaptor.getOperands().size() == 9)) {
+      return rewriter.notifyMatchFailure(
+          op, "tt.fused_moe_ep takes scales s1, s3 and s2 with float8_e4m3fn "
+              "experts and only with them");
+    }
+    if (fp8Weights) {
+      auto isScale = [&](Value value, int64_t columns) {
+        auto type = cast<RankedTensorType>(value.getType());
+        return type.getElementType().isF32() &&
+               type.getShape() ==
+                   ArrayRef<int64_t>{w1Type.getDimSize(0), columns};
+      };
+      if (!isScale(adaptor.getOperands()[6], w1Type.getDimSize(2)) ||
+          !isScale(adaptor.getOperands()[7], w1Type.getDimSize(2)) ||
+          !isScale(adaptor.getOperands()[8], xType.getDimSize(1))) {
+        return rewriter.notifyMatchFailure(
+            op, "tt.fused_moe_ep with float8 experts expects f32 scales s1 "
+                "and s3 [E_local, I] and s2 [E_local, H]");
+      }
+    }
     // The kernel reads int32 or uint16 ids.
     if (auto idType = dyn_cast<IntegerType>(idsType.getElementType());
         !idType || !(idType.getWidth() == 32 ||
@@ -100,21 +148,6 @@ public:
       return rewriter.notifyMatchFailure(
           op, "tt.fused_moe_ep takes int32 or uint16 topk_ids");
     }
-
-    // The experts' dtype in the kernel: BFP4 unless the call asks for BF16.
-    auto config = dyn_cast_or_null<DictionaryAttr>(op.getBackendConfigAttr());
-    if (!config) {
-      config = dyn_cast_or_null<DictionaryAttr>(
-          op->getDiscardableAttr("mhlo.backend_config"));
-    }
-    StringAttr weightDtype =
-        config ? config.getAs<StringAttr>("weight_dtype") : nullptr;
-    if (weightDtype && weightDtype.getValue() != "bfp4" &&
-        weightDtype.getValue() != "bf16") {
-      return rewriter.notifyMatchFailure(
-          op, "tt.fused_moe_ep's weight_dtype is bfp4 or bf16");
-    }
-    const bool bf16Weights = weightDtype && weightDtype.getValue() == "bf16";
 
     Location loc = op.getLoc();
     MLIRContext *ctx = getContext();
@@ -173,15 +206,23 @@ public:
 
     // The kernel's operands: the ids as they are (the kernel reads them as
     // unsigned, so that padding's negative ids land past the experts, where it
-    // skips them) and the experts with a leading layer dimension. Its local
-    // output reads no scores: the weights only fill the operand.
-    auto withLayer = [&](Value w) {
-      auto shape = cast<RankedTensorType>(w.getType()).getShape();
-      return reshape(w, {1, shape[0], shape[1], shape[2]});
+    // skips them) and the experts (and their scales) with a leading layer
+    // dimension. Its local output reads no scores: the weights only fill the
+    // operand.
+    auto withLayer = [&](Value w) -> Value {
+      if (!w) {
+        return w;
+      }
+      SmallVector<int64_t> layered = {1};
+      llvm::append_range(layered, cast<RankedTensorType>(w.getType()).getShape());
+      return reshape(w, layered);
     };
     Value kernelW1 = withLayer(w1);
     Value kernelW3 = withLayer(w3);
     Value kernelW2 = withLayer(w2);
+    Value scale1 = withLayer(fp8Weights ? adaptor.getOperands()[6] : Value());
+    Value scale3 = withLayer(fp8Weights ? adaptor.getOperands()[7] : Value());
+    Value scale2 = withLayer(fp8Weights ? adaptor.getOperands()[8] : Value());
 
     // Every device's row of the mapping gives each expert's device.
     SmallVector<APInt> owners;
@@ -226,13 +267,17 @@ public:
           reshape(rows(x, begin, end), {1, t, hidden}), rows(ids, begin, end),
           chunkWeights, mapping, kernelW1, kernelW3, kernelW2,
           /*bias_0=*/Value(), /*bias_1=*/Value(),
-          /*bias_2=*/Value(), rewriter.getUI32IntegerAttr(0),
+          /*bias_2=*/Value(), scale1, scale3, scale2,
+          rewriter.getUI32IntegerAttr(0),
           rewriter.getUI32IntegerAttr(4),
           rewriter.getUI32IntegerAttr(intermediate), activation,
           /*cluster_axis=*/IntegerAttr(),
           rewriter.getUI32IntegerAttr(bf16Weights ? kBf16Rings : kRings),
-          bf16Weights ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::BFloat16)
-                      : ttcore::DataTypeAttr());
+          fp8Weights
+              ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::Float8E4M3FN)
+          : bf16Weights
+              ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::BFloat16)
+              : ttcore::DataTypeAttr());
 
       // Each token's weighted sum of its slots as one matmul in FP32: row i
       // of the placement matrix holds token i's weight j at column j * t + i,

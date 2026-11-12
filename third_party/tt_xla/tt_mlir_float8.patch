@@ -378,14 +378,14 @@ new file mode 100644
 +// Ops that only move values: data movement, Shardy's collectives and reshards
 +// (sdy.all_slice composites), and control flow (and shard_map's
 +// sdy.manual_computation), which carries them through its regions. Custom
-+// calls move them only as sharding annotations do, and as tt.quantize_rows
-+// returns them, as its kernel writes them: others, such as mhlo.topk,
-+// mhlo.erf or tt.sampling, compute on the values.
++// calls move them only as sharding annotations do, and as tt.fused_moe_ep
++// and tt.quantize_rows do, whose kernels read or write float8 as it is:
++// others, such as mhlo.topk, mhlo.erf or tt.sampling, compute on the values.
 +bool movesValues(Operation *op) {
 +  if (auto call = dyn_cast<mlir::stablehlo::CustomCallOp>(op)) {
 +    static constexpr StringLiteral targets[] = {
 +        "Sharding", "SPMDFullToShardShape", "SPMDShardToFullShape",
-+        "xla.sdy.FuncResultSharding", "tt.quantize_rows"};
++        "xla.sdy.FuncResultSharding", "tt.fused_moe_ep", "tt.quantize_rows"};
 +    return llvm::is_contained(targets, call.getCallTargetName());
 +  }
 +  if (auto composite = dyn_cast<mlir::stablehlo::CompositeOp>(op)) {
