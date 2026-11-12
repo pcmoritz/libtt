@@ -311,3 +311,63 @@ diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/device/ternary_program_facto
      auto op_defines = CMAKE_UNIQUE_NAMESPACE::get_ternary_compute_defines(operation_attributes, sfpu_dtype);
      for (const auto& [key, value] : op_defines) {
          kernel_defines[key] = value;
+diff --git ttnn/cpp/ttnn/operations/eltwise/ternary/ternary.cpp ttnn/cpp/ttnn/operations/eltwise/ternary/ternary.cpp
+--- ttnn/cpp/ttnn/operations/eltwise/ternary/ternary.cpp
++++ ttnn/cpp/ttnn/operations/eltwise/ternary/ternary.cpp
+@@ -4,8 +4,10 @@
+ 
+ #include "ternary.hpp"
+ 
++#include <algorithm>
+ #include <utility>
+ #include <variant>
++#include <vector>
+ #include <cstdint>
+ 
+ #include "ttnn/operations/eltwise/binary/binary.hpp"
+@@ -16,6 +18,7 @@
+ #include "device/ternary_op_utils.hpp"
+ #include "ttnn/operations/copy/typecast/typecast.hpp"
+ #include "ttnn/operations/core/core.hpp"
++#include "ttnn/operations/data_movement/expand/expand.hpp"
+ #include "ttnn/operations/data_movement/unsqueeze/unsqueeze.hpp"
+ #include "ternary_composite_op.hpp"
+ 
+@@ -110,14 +113,35 @@ void validate_where_scalar_for_integer_tensor(float scalar, DataType tensor_dtyp
+         tensor_dtype);
+ }
+ 
++// Float8 values are selected as bytes (ternary_program_factory.cpp), which the reader's broadcast helpers don't
++// move: a float8 value that broadcasts is expanded to the full shape first (expand repeats, which moves float8 as
++// UINT8). A broadcast predicate keeps its own helpers.
++Tensor broadcast_float8_value(const Tensor& value, const Tensor& a, const Tensor& b, const Tensor& c) {
++    if (value.dtype() != DataType::FP8_E4M3 && value.dtype() != DataType::FP8_E5M2) {
++        return value;
++    }
++    const auto rank = std::max({a.logical_shape().rank(), b.logical_shape().rank(), c.logical_shape().rank()});
++    std::vector<int32_t> shape(rank, 1);
++    for (const Tensor* tensor : {&a, &b, &c}) {
++        const auto& dims = tensor->logical_shape();
++        for (size_t i = 0; i < dims.rank(); ++i) {
++            int32_t& dim = shape[rank - dims.rank() + i];
++            dim = std::max(dim, static_cast<int32_t>(dims[i]));
++        }
++    }
++    return ttnn::expand(value, shape);
++}
++
+ // TTT: tensor, tensor, tensor
+ Tensor invoke_impl(
+     const Tensor& predicate,
+-    const Tensor& t_true,
+-    const Tensor& t_false,
++    const Tensor& value_true,
++    const Tensor& value_false,
+     const std::optional<MemoryConfig>& memory_config,
+     const std::optional<Tensor>& output,
+     const std::optional<CoreRangeSet>& sub_core_grids) {
++    const Tensor t_true = broadcast_float8_value(value_true, predicate, value_true, value_false);
++    const Tensor t_false = broadcast_float8_value(value_false, predicate, value_true, value_false);
+     Tensor condition = predicate;
+     auto broadcast_type = ttnn::operations::ternary::get_broadcast_type(
+         condition.logical_shape(), t_true.logical_shape(), t_false.logical_shape());

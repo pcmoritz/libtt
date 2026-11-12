@@ -17,6 +17,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <tt-metalium/float8.hpp>
@@ -200,6 +201,57 @@ TEST_F(Float8DataMovementTest, Where) {
         const auto out = ttnn::where(p, ttnn::bitcast(a, dtype), ttnn::bitcast(b, dtype));
         ASSERT_EQ(out.dtype(), dtype);
         EXPECT_EQ(ttnn::bitcast(out, DataType::UINT8).cpu().to_vector<uint8_t>(), want) << dtype;
+    }
+}
+
+// where broadcasts float8 values (a row, a column, a single element) and a bfloat16 predicate (a row) like any
+// other, each code unchanged: broadcast float8 values are repeated to the full shape first, since the byte path
+// selects whole tiles.
+TEST_F(Float8DataMovementTest, WhereBroadcast) {
+    const uint32_t rows = 64, cols = 96;
+    const auto code = [](uint32_t i) { return static_cast<uint8_t>((i * 37 + i / 7) % 256); };
+    const auto device_bytes = [&](uint32_t h, uint32_t w, uint32_t salt) {
+        std::vector<uint8_t> values(h * w);
+        for (uint32_t i = 0; i < values.size(); ++i) {
+            values[i] = code(i + salt);
+        }
+        const TensorSpec spec(ttnn::Shape({h, w}), TensorLayout(DataType::UINT8, PageConfig(Layout::TILE), {}));
+        return std::make_pair(values, ttnn::Tensor::from_vector(values, spec).to_device(mesh_device_.get()));
+    };
+    const auto predicate = [&](uint32_t h, uint32_t w) {
+        std::vector<bfloat16> values(h * w);
+        for (uint32_t i = 0; i < values.size(); ++i) {
+            values[i] = bfloat16((i * 7 + i / 5) % 3 != 0 ? 1.0f : 0.0f);
+        }
+        const TensorSpec spec(ttnn::Shape({h, w}), TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), {}));
+        return std::make_pair(values, ttnn::Tensor::from_vector(values, spec).to_device(mesh_device_.get()));
+    };
+    struct Case {
+        uint32_t ph, pw, th, tw, fh, fw;
+    };
+    for (const Case& c : {Case{rows, cols, 1, cols, rows, 1}, Case{rows, cols, 1, 1, rows, cols},
+                          Case{1, cols, rows, cols, rows, cols}}) {
+        const auto [p, p_dev] = predicate(c.ph, c.pw);
+        const auto [t, t_dev] = device_bytes(c.th, c.tw, 1);
+        const auto [f, f_dev] = device_bytes(c.fh, c.fw, 2);
+        const auto at = [](const auto& v, uint32_t h, uint32_t w, uint32_t r, uint32_t col) {
+            return v[(h == 1 ? 0 : r) * w + (w == 1 ? 0 : col)];
+        };
+        std::vector<uint8_t> want(rows * cols);
+        for (uint32_t r = 0; r < rows; ++r) {
+            for (uint32_t col = 0; col < cols; ++col) {
+                const bool take = static_cast<float>(at(p, c.ph, c.pw, r, col)) != 0.0f;
+                want[r * cols + col] = take ? at(t, c.th, c.tw, r, col) : at(f, c.fh, c.fw, r, col);
+            }
+        }
+        for (DataType dtype : {DataType::FP8_E4M3, DataType::FP8_E5M2}) {
+            const auto out = ttnn::where(p_dev, ttnn::bitcast(t_dev, dtype), ttnn::bitcast(f_dev, dtype));
+            ASSERT_EQ(out.dtype(), dtype);
+            ASSERT_EQ(out.logical_shape(), ttnn::Shape({rows, cols}));
+            EXPECT_EQ(ttnn::bitcast(out, DataType::UINT8).cpu().to_vector<uint8_t>(), want)
+                << dtype << " predicate " << c.ph << "x" << c.pw << ", true " << c.th << "x" << c.tw << ", false "
+                << c.fh << "x" << c.fw;
+        }
     }
 }
 
