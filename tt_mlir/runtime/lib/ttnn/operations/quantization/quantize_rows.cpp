@@ -7,7 +7,6 @@
 #include "tt/runtime/detail/ttnn/ttnn.h"
 #include "tt/runtime/detail/ttnn/utils.h"
 #include "ttnn/operations/experimental/quantize_rows/quantize_rows.hpp"
-#include "ttnn/operations/eltwise/unary/unary.hpp"
 
 namespace tt::runtime::ttnn::operations::quantization {
 
@@ -20,9 +19,7 @@ void run(const ::tt::target::ttnn::QuantizeRowsOp *op, ProgramContext &context) 
   std::vector<::ttnn::Tensor> outputs = ::ttnn::experimental::quantize_rows(
       input, ::tt::runtime::ttnn::utils::toTTNNDataType(op->float8_type()),
       op->min_scale(), outputMemoryConfig);
-  // The compiler stores float8 tensors as their bits (UINT8): a view.
-  tensorPool.insertTTNNTensorAndValidate(
-      op->output(), ::ttnn::bitcast(outputs[0], ::ttnn::DataType::UINT8));
+  tensorPool.insertTTNNTensorAndValidate(op->output(), outputs[0]);
   tensorPool.insertTTNNTensorAndValidate(op->scale(), outputs[1]);
 }
 
