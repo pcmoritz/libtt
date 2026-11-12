@@ -375,16 +375,13 @@ def _quantize_rows(x, dtype, min_scale):
 
     tokens, k = x.shape
     if tokens <= 32 and k % 32 == 0 and x.dtype in (jnp.bfloat16, jnp.float32):
-        # The op returns the float8 codes as uint8, as the compiler stores
-        # float8 tensors; the bitcast is a view.
-        codes, scale = jax.ffi.ffi_call(
+        return jax.ffi.ffi_call(
             "tt.quantize_rows",
             (
-                jax.ShapeDtypeStruct(x.shape, jnp.uint8),
+                jax.ShapeDtypeStruct(x.shape, dtype),
                 jax.ShapeDtypeStruct((tokens, 1), jnp.float32),
             ),
         )(x, min_scale=np.float32(min_scale), e5m2=np.bool_(dtype == jnp.float8_e5m2))
-        return jax.lax.bitcast_convert_type(codes, dtype), scale
     fp8_max = float(jnp.finfo(dtype).max)
     scale = jnp.maximum(
         jnp.max(jnp.abs(x), axis=-1, keepdims=True).astype(jnp.float32) / fp8_max, min_scale

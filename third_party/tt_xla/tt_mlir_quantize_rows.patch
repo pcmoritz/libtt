@@ -1,7 +1,7 @@
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -6664,6 +6664,25 @@ def TTIR_ScaledDotProductAttentionOp : TTIR_NamedOp<"scaled_dot_product_attentio
+@@ -6664,6 +6664,24 @@ def TTIR_ScaledDotProductAttentionOp : TTIR_NamedOp<"scaled_dot_product_attentio
    let hasVerifier = 1;
  }
  
@@ -14,9 +14,8 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +      output[m, k] = float8(float(input[m, k]) / scale[m])
 +
 +    with fp8_max the largest finite value of `float8_type` (f8E4M3FN or
-+    f8E5M2) and the cast rounded to nearest even, not saturated. `output`
-+    holds the float8 codes as ui8, as float8 tensors are stored (StableHLO's
-+    Float8DataTypeConversion); `scale` is [..., M, 1] FP32. One program;
++    f8E5M2) and the cast rounded to nearest even, not saturated. `output` is
++    in `float8_type`; `scale` is [..., M, 1] FP32. One program;
 +    SGLang-TorchTPU's FP8 linears quantize their activations so.
 +  }];
 +  let arguments = (ins AnyRankedTensor:$input, F32Attr:$min_scale,
@@ -30,7 +29,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -5025,6 +5025,24 @@ def TTNN_ScaledDotProductAttentionOp : TTNN_Op<"scaled_dot_product_attention", [
+@@ -5025,6 +5025,23 @@ def TTNN_ScaledDotProductAttentionOp : TTNN_Op<"scaled_dot_product_attention", [
      let hasVerifier = 1;
  }
  
@@ -38,8 +37,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 +  let summary = "Per-row dynamic float8 quantization.";
 +  let description = [{
 +    ttnn::experimental::quantize_rows, see ttir.quantize_rows: a tiled FP32 or
-+    BF16 input of one tile row, the tiled float8 codes as ui8 and the FP32
-+    scale.
++    BF16 input of one tile row, the tiled float8 output and the FP32 scale.
 +  }];
 +  let arguments = (ins AnyRankedTensor:$input, F32Attr:$min_scale,
 +                       TTCore_DataTypeAttr:$float8_type);
@@ -62,8 +60,8 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttml
    // tt-metal issue: https://github.com/tenstorrent/tt-metal/issues/41451
    static TTNNOperandsWorkarounds createGatherOpOperandsWorkarounds();
  
-+  // Create workarounds for quantize_rows: a tiled FP32 or BF16 input, tiled
-+  // ui8 float8 codes and a tiled FP32 scale.
++  // Create workarounds for quantize_rows: a tiled FP32 or BF16 input, a tiled
++  // float8 output and a tiled FP32 scale.
 +  static TTNNOperandsWorkarounds
 +  createQuantizeRowsOpOperandsWorkarounds(mlir::Operation *op);
 +
@@ -73,13 +71,12 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttml
 diff --git a/include/ttmlir/Target/TTNN/operations/eltwise.fbs b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
 --- a/include/ttmlir/Target/TTNN/operations/eltwise.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/eltwise.fbs
-@@ -143,6 +143,17 @@ table EltwiseQuantizationOp {
+@@ -143,6 +143,16 @@ table EltwiseQuantizationOp {
    params: EltwiseQuantizationOpParams;
  }
  
 +// ttnn::experimental::quantize_rows: per row of the input, scale = max(amax /
-+// fp8_max, min_scale) and output = float8(input / scale) in float8_type, the
-+// output a UINT8 view of the codes.
++// fp8_max, min_scale) and output = float8(input / scale) in float8_type.
 +table QuantizeRowsOp {
 +  input: tt.target.ttnn.TensorRef;
 +  min_scale: float;
@@ -105,13 +102,12 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10191,6 +10191,44 @@ public:
+@@ -10191,6 +10191,43 @@ public:
    }
  };
  
 +// `tt.quantize_rows` (jax.ffi.ffi_call with min_scale and e5m2 attributes):
-+// one input, the float8 codes as ui8 (float8 tensors are stored as their bits;
-+// the caller bitcasts them) and the FP32 scale.
++// one input, the float8 output and the FP32 scale.
 +class StableHLOQuantizeRowsConversionPattern
 +    : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
 +public:
@@ -150,7 +146,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  class StableHLOPagedFillCacheConversionPattern
      : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
    using OpConversionPattern<mlir::stablehlo::CustomCallOp>::OpConversionPattern;
-@@ -12169,6 +12207,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
+@@ -12169,6 +12206,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
                                                                  ctx);
    patterns.add<StableHLOToTTIRCollectivePermuteOpConversionPattern>(
        typeConverter, ctx);
@@ -296,7 +292,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
-@@ -323,6 +323,28 @@ static TTNNOperandWorkarounds rowsIndexWorkaround(mlir::Value indices) {
+@@ -323,6 +323,27 @@ static TTNNOperandWorkarounds rowsIndexWorkaround(mlir::Value indices) {
    return workaround;
  }
  
@@ -312,7 +308,6 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/T
 +          : ttcore::DataType::BFloat16;
 +  TTNNOperandWorkarounds output;
 +  output.tensorLayoutWorkaround = Layout::Tile;
-+  output.tensorDataTypeWorkaround = ttcore::DataType::UInt8;
 +  TTNNOperandWorkarounds scale;
 +  scale.tensorLayoutWorkaround = Layout::Tile;
 +  scale.tensorDataTypeWorkaround = ttcore::DataType::Float32;
