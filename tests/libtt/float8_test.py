@@ -87,6 +87,18 @@ def test_device_moves_float8_as_float8(tmp_path, dtype, level):
 
 
 @pytest.mark.parametrize("dtype", FORMATS)
+def test_float8_arrays_between_programs(dtype):
+    """A float8 array that one program leaves on the device in tiles reaches a program that reads
+    it in rows (a gather's table, kept row-major), as model weights pass between the programs
+    that load them: the runtime untilizes it on the device."""
+    codes = all_codes(dtype)
+    rows = np.array([3, 0, 31, 7], np.int32)
+    moved = jax.jit(lambda x: x.T)(codes)
+    gathered = jax.jit(lambda x, rows: x[rows])(moved, rows)
+    assert_same_bits(gathered, codes.T[rows])
+
+
+@pytest.mark.parametrize("dtype", FORMATS)
 def test_float8_constants(dtype):
     """Float8 constants, splat or not, keep every code."""
     codes = all_codes(dtype)
