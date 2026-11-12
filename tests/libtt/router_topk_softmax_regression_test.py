@@ -7,6 +7,11 @@ top-k of the logits and a softmax over the k picks, which skips the full
 softmax and the renormalization's reduction and division. The experts and
 their weights must match float64. Without the renormalization the top-k values
 are probabilities over all experts and keep the full softmax.
+
+SGLang-TorchTPU's router reaches tt-mlir as PyTorch lowers it: the softmax as
+exp times the reciprocal of its sum, and an epsilon of 1e-20 added to the
+renormalization's sum, which can't change an FP32 sum of the top k
+probabilities. It is rewritten the same way.
 """
 
 import jax
@@ -120,3 +125,34 @@ def test_denominator_broadcast_across_rows(tmp_path):
     softmaxes = [line for line in exported_ir(tmp_path).splitlines() if '"ttnn.softmax"' in line]
     assert any(f"x{experts}xf32" in line for line in softmaxes), "the division was rewritten to a softmax"
 
+
+
+def torch_route(logits, k, epsilon):
+    # As PyTorch lowers SGLang-TorchTPU's router (fused_topk_torch_native).
+    exp = jnp.exp(logits - logits.max(axis=-1, keepdims=True))
+    probs = exp * (1.0 / exp.sum(axis=-1, keepdims=True))
+    weights, ids = lax.top_k(probs, k)
+    return weights / (weights.sum(axis=-1, keepdims=True) + epsilon), ids
+
+
+@pytest.mark.parametrize("epsilon", [1e-20, 1e-3])
+@pytest.mark.parametrize("tokens,experts,k", [(1, 128, 8), (33, 128, 8), (2, 256, 8)])
+def test_torch_router(tokens, experts, k, epsilon, tmp_path):
+    logits = distinct_logits(tokens, experts, tokens * experts + k)
+    run = jax.jit(lambda x: torch_route(x, k, epsilon), compiler_options={"export_path": str(tmp_path)})
+    weights, ids = (np.asarray(a) for a in run(jax.device_put(logits, jax.devices("tt")[0])))
+
+    want_ids = np.argsort(-logits.astype(np.float64), axis=-1)[:, :k]
+    np.testing.assert_array_equal(ids, want_ids)
+    probs = np.exp(logits.astype(np.float64) - logits.max(-1, keepdims=True))
+    picked = np.take_along_axis(probs / probs.sum(-1, keepdims=True), want_ids, -1)
+    want = picked / (picked.sum(-1, keepdims=True) + epsilon)
+    np.testing.assert_allclose(weights.astype(np.float64), want, rtol=5e-3, atol=1e-6)
+    # An epsilon of 1e-3 changes the weights by up to 1e-3 / (k / experts), which a rewrite would drop.
+    ir = exported_ir(tmp_path)
+    if epsilon < 1e-12:
+        check_rewritten(ir, experts)
+    else:
+        softmaxes = [line for line in ir.splitlines() if '"ttnn.softmax"' in line]
+        assert any(f"x{experts}xf32" in line for line in softmaxes), "the softmax wasn't fused"
+        assert '"ttnn.divide"' in ir or '"ttnn.add"' in ir, "the renormalization was dropped"
