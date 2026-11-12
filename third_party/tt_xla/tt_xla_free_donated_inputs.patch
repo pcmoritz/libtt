@@ -1,0 +1,87 @@
+diff --git a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+--- a/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
++++ b/pjrt_implementation/src/api/flatbuffer_loaded_executable_instance.cc
+@@ -181,6 +181,49 @@
+   m_deleted = true;
+ }
+ 
++// Lets the program free the donated inputs of a one-device execution after
++// their last use, and returns their indices.
++//
++// The program frees every input after its last use, as it frees its
++// intermediates, unless the input is retained, and every buffer's runtime
++// tensor is (PjrtTensor::from_runtime_tensor). A donated input is the caller's
++// to give up, so its memory can go as soon as the program is done with it
++// instead of when the buffer is deleted after the program: an optimizer step
++// that updates all of a model's parameters and optimizer states would
++// otherwise hold their old and new values at once.
++//
++// Only a runtime tensor that nothing else holds is released: its buffer's
++// PjrtTensor and `input_tensors` hold one handle each. Another holder can be a
++// buffer that shares the tensor, such as the output of an earlier program
++// that returned this input unchanged, or a copy to the host in flight; the
++// input then stays until the buffer is deleted, as before. The program never
++// frees an input it returns, and frees one that shares its memory with
++// another tensor (a view) only where it knows every alias.
++static std::unordered_set<size_t>
++releaseDonatedInputs(PJRT_LoadedExecutable_Execute_Args *args,
++                     const std::unordered_set<size_t> &donated_indices,
++                     const std::vector<tt::runtime::Tensor> &input_tensors) {
++  std::unordered_set<size_t> released_indices;
++  if (args->num_devices != 1) {
++    return released_indices;
++  }
++  for (size_t input_index : donated_indices) {
++    BufferInstance *buffer =
++        BufferInstance::unwrap(args->argument_lists[0][input_index]);
++    const PjrtTensorRef &tensor = buffer->getPjrtTensor();
++    const tt::runtime::Tensor &input_tensor = input_tensors[input_index];
++    if (!tensor || tensor->shards().size() != 1 ||
++        tensor->shards().front() != buffer || !tensor->has_runtime_tensor() ||
++        tensor->runtime_tensor().handle != input_tensor.handle ||
++        input_tensor.handle.use_count() != 2) {
++      continue;
++    }
++    tt::runtime::setTensorRetain(input_tensor, false);
++    released_indices.insert(input_index);
++  }
++  return released_indices;
++}
++
+ // TODO(mrakita): Make this method work in asynchronous fashion.
+ tt_pjrt_status FlatbufferLoadedExecutableInstance::execute(
+     PJRT_LoadedExecutable_Execute_Args *args) {
+@@ -254,11 +297,17 @@
+     FlatbufferExecutableImage *executable_image =
+         static_cast<FlatbufferExecutableImage *>(m_executable_image.get());
+ 
++    // A released input may be freed even when the execution fails, so it is
++    // deleted then too.
++    const DonationIndices released_indices =
++        releaseDonatedInputs(args, donated_indices, input_tensors);
++
+     auto r = utils::invoke_noexcept(tt::runtime::submit, *runtime_device,
+                                     executable_image->getFlatbufferBinary(),
+                                     program_index, input_tensors);
+ 
+     if (!r) {
++      invalidateDonatedInputs(args, released_indices);
+       return tt_pjrt_status::kInternal;
+     }
+ 
+@@ -269,6 +318,7 @@
+             "Runtime produced different number of output tensors (%zu) than "
+             "the compiler estimated number of outputs (%zu)",
+             output_tensors.size(), m_executable_image->getNumOutputs());
++      invalidateDonatedInputs(args, released_indices);
+       return tt_pjrt_status::kInternal;
+     }
+ 
+@@ -276,6 +326,7 @@
+                                  args->output_lists,
+                                  m_executable_image->getOutputTypes());
+     if (!tt_pjrt_status_is_ok(status)) {
++      invalidateDonatedInputs(args, released_indices);
+       return status;
+     }
+   }
