@@ -1,0 +1,52 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -2219,6 +2219,8 @@
+     }];
+ 
+     let hasFolder = 1;
++
++    let hasCanonicalizer = 1;
+ }
+ 
+ def TTIR_DivOp : TTIR_ElementwiseBinaryOp<"div"> {
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -9181,6 +9181,36 @@
+                                    multiply, multiply);
+ }
+ 
++// MultiplyOp canonicalization
++//
++// A square doesn't need the absolute value: abs(x) * abs(x) is x * x, also
++// through a typecast. torch's vector norm squares abs(x), so gradient
++// clipping took a pass over every gradient for the abs alone.
++void mlir::tt::ttir::MultiplyOp::getCanonicalizationPatterns(
++    mlir::RewritePatternSet &patterns, mlir::MLIRContext *context) {
++  patterns.add(+[](mlir::tt::ttir::MultiplyOp op,
++                   mlir::PatternRewriter &rewriter) -> mlir::LogicalResult {
++    if (op.getLhs() != op.getRhs()) {
++      return mlir::failure();
++    }
++    auto typecast = op.getLhs().getDefiningOp<mlir::tt::ttir::TypecastOp>();
++    mlir::Value absolute = typecast ? typecast.getInput() : op.getLhs();
++    auto absOp = absolute.getDefiningOp<mlir::tt::ttir::AbsOp>();
++    if (!absOp) {
++      return mlir::failure();
++    }
++    mlir::Value base = absOp.getInput();
++    if (typecast) {
++      mlir::Operation *cast = rewriter.clone(*typecast.getOperation());
++      cast->setOperand(0, base);
++      base = cast->getResult(0);
++    }
++    rewriter.replaceOpWithNewOp<mlir::tt::ttir::MultiplyOp>(op, op.getType(),
++                                                           base, base);
++    return mlir::success();
++  });
++}
++
+ //===----------------------------------------------------------------------===//
+ // PowOp
+ //===----------------------------------------------------------------------===//

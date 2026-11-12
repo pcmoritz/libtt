@@ -732,6 +732,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_moe_compute_weight_dtype.patch",
         "//third_party/tt_xla:tt_mlir_dot_transposed_operands.patch",
         "//third_party/tt_xla:tt_mlir_permute_unit_dims.patch",
+        "//third_party/tt_xla:tt_mlir_square_without_abs.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
