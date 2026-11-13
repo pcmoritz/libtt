@@ -140,15 +140,20 @@ def test_transposed_weight_is_read_in_place(tmp_path):
     assert not any("ttnn.permute" in ir or "ttnn.transpose" in ir for ir in irs), "a transpose was materialized"
 
 
-def test_transposed_parameter_is_transposed_once(tmp_path):
+@pytest.mark.parametrize(
+    "project",
+    [
+        lambda x, weights: x @ _bfp8(weights).T,
+        # A dot_general contracting the weight's last dim, without a transpose.
+        lambda x, weights: jnp.einsum("bh,vh->bv", x, _bfp8(weights)),
+    ],
+    ids=["transpose", "einsum"],
+)
+def test_transposed_parameter_is_transposed_once(tmp_path, project):
     """A parameter weight in the embedding layout, as an LM head's, is
     transposed once by const-eval: the decode kernel reads an untransposed
     weight faster than a transposed one (a 248320-token LM head on four chips,
     5120 x 62080 per chip: 695 vs 930 us)."""
-
-    def project(x, weights):
-        return x @ _bfp8(weights).T
-
     run = jax.jit(project, compiler_options={"optimization_level": "O1", "export_path": str(tmp_path)})
     device = jax.devices("tt")[0]
     rng = np.random.default_rng(13)

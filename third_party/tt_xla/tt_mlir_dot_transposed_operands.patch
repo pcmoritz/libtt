@@ -1,7 +1,7 @@
 diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 --- a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
 +++ b/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp
-@@ -303,6 +303,36 @@
+@@ -303,6 +303,40 @@
      SmallVector<int64_t> rhsPermutation =
          getPermutation(rhsBatchDims, rhsContractDims, rhsResultDims);
  
@@ -12,7 +12,10 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +    // dot_general(dS[b, n, g, t, s], q[b, n, g, t, h]) of grouped-query
 +    // attention contracts over (g, t), and dS permuted to [b, n, s, g, t] pads
 +    // g, its second-to-last dim, to a whole tile. An exact FP32 matmul
-+    // (ttcore.fp32_exact) takes its operands untransposed.
++    // (ttcore.fp32_exact) takes its operands untransposed, and a constant or
++    // parameter rhs keeps its permute, which const-eval runs once: the matmul
++    // reads a transposed weight more slowly on every call, as
++    // PermuteMatmulFusionPattern leaves such a permute for the same reason.
 +    int64_t contractionSize =
 +        computeProductOfDims(lhsType.getShape(), lhsContractDims);
 +    bool transposeLhs = false;
@@ -28,7 +31,8 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +      }
 +      SmallVector<int64_t> rhsTransposed =
 +          getPermutation(rhsBatchDims, rhsResultDims, rhsContractDims);
-+      if (!readsInOrder(rhsType, rhsPermutation) &&
++      if (!isConstantOrParameterArgument(rhs) &&
++          !readsInOrder(rhsType, rhsPermutation) &&
 +          readsInOrder(rhsType, rhsTransposed)) {
 +        transposeRhs = true;
 +        rhsPermutation = rhsTransposed;
@@ -38,7 +42,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
      // Apply these permutations to lhs and rhs.
  
      Value lhsPermute = permuteOperand(
-@@ -322,6 +352,15 @@
+@@ -322,6 +356,15 @@
          rewriter, lhsType, lhsBatchDims, lhsResultDims, lhsContractDims);
      SmallVector<int64_t> rhsMatmulInputShape = computeMatmulInputShape(
          rewriter, rhsType, rhsBatchDims, rhsContractDims, rhsResultDims);
@@ -54,7 +58,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
  
      // Apply this reshape to lhs and rhs to adapt to matmul op.
      // For lhs: (batch dims, prod(result dims), prod(contract dims))
-@@ -351,8 +390,6 @@
+@@ -351,8 +394,6 @@
      // elementwise multiply to keep full f32 precision. lhsMatmulInput is
      // [..., M, 1] and rhsMatmulInput is [..., 1, N], so they broadcast-multiply
      // to the matmul destination shape [..., M, N].
@@ -63,7 +67,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
      Value contractionResult;
      if (contractionSize == 1) {
        contractionResult = rewriter.create<ttir::MultiplyOp>(
-@@ -390,7 +427,7 @@
+@@ -390,7 +431,7 @@
        auto matmul = rewriter.create<ttir::MatmulOp>(
            op.getLoc(),
            RankedTensorType::get(matmulDestinationShape, elementType),
@@ -72,7 +76,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
        if (auto attr = op->getAttr("ttcore.fp32_exact")) {
          matmul->setAttr("ttcore.fp32_exact", attr);
        }
-@@ -610,6 +647,19 @@
+@@ -610,6 +651,31 @@
      return permuteOp;
    }
  
@@ -87,6 +91,18 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +      }
 +    }
 +    return llvm::is_sorted(nonUnit);
++  }
++
++  // Whether `value` is an argument of its function marked as a constant or a
++  // parameter (a weight that const-eval can transform ahead of time).
++  static bool isConstantOrParameterArgument(Value value) {
++    auto argument = dyn_cast<BlockArgument>(value);
++    if (!argument) {
++      return false;
++    }
++    auto funcOp = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
++    return funcOp && ttcore::isConstantOrParameterArgumentType(
++                         funcOp, argument.getArgNumber());
 +  }
 +
    // An operand in the order the matmul reshape reads, without the permute's
