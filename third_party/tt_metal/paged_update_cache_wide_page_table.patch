@@ -1,0 +1,20 @@
+diff --git ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/experimental/paged_cache/device/update_cache/paged_update_cache_device_operation.cpp
+@@ -192,14 +192,9 @@ void PagedUpdateCacheDeviceOperation::validate_on_program_cache_miss(
+                 modulo,
+                 page_table_val.padded_shape()[1],
+                 effective_block_size);
+-        } else {
+-            TT_FATAL(
+-                page_table_val.padded_shape()[1] <= cache_tensor.padded_shape()[0],
+-                "max_num_blocks_per_seq must be less than max_num_blocks: max_num_blocks_per_seq={}, "
+-                "max_num_blocks={}",
+-                page_table_val.padded_shape()[1],
+-                cache_tensor.padded_shape()[0]);
+         }
++        // Otherwise the page table may be wider than the pool has pages, as a sliding-window pool's that holds only
++        // the pages its windows reach: the kernel reads the entries of the positions it writes.
+     }
+ 
+     // Update indices validation

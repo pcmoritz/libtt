@@ -23,7 +23,7 @@ the output.
 Hybrid models' gated DeltaNet kernel runs on libtt's recurrent kernels, with
 the recurrent-state pool in their layout (`sglang_tpu_gdn`). Mixture-of-experts
 models' fused MoE op runs on TTNN's fused MoE kernel, with the experts in BF16
-or FP8, as loaded.
+or FP8, as loaded, and GPT-OSS's MXFP4 experts as FP8 (`patch_mxfp4_tpu_util`).
 """
 
 # Users per TTNN paged decode attention call.
@@ -41,6 +41,7 @@ BLOCK_DRAFT_WORKER_MODULE = "sglang_tpu.experimental.speculative.block_draft_wor
 ALL_GATHER_VIA_ALL_REDUCE_MODULE = "sglang_tpu.all_gather_via_all_reduce"
 FUSED_MOE_MODULE = "sglang_tpu.moe.pallas.fused_moe_op"
 FP8_MOE_FUSED_RS_MODULE = "sglang_tpu.fp8_moe_fused_rs"
+MXFP4_TPU_UTIL_MODULE = "sglang.srt.layers.quantization.mxfp4_tpu_util"
 
 
 def _ragged_paged_attention(module):
@@ -88,7 +89,7 @@ def _ragged_paged_attention(module):
                 f"KV cache of shape {cache_shape}: only the fused pool's "
                 "[pages, kv_heads, page_size, 2 * head_dim] layout (patch_kv_pool)"
             )
-        pages, cache_heads, page_size, row = cache_shape
+        _, cache_heads, page_size, row = cache_shape
         cache_head_dim = row // 2
         seqs = kv_lens.shape[0]
         pages_per_seq = page_indices.shape[0] // seqs
@@ -112,10 +113,10 @@ def _ragged_paged_attention(module):
         pad = ((0, 0), (0, cache_heads - kv_heads), (0, cache_head_dim - head_dim))
         new_kv = jnp.concatenate([jnp.pad(keys, pad), jnp.pad(values, pad)], axis=-1)
         new_kv = new_kv.astype(kv_cache_fused.dtype)
-        # Page 0 is SGLang's padding page, so a sequence holds at most pages - 1
-        # pages, and TTNN's paged operations take a page table narrower than the
-        # pool.
-        user_pages = table[seq, : min(pages_per_seq, pages - 1)]
+        # Each token's sequence's pages. A sliding-window pool (hybrid SWA
+        # models) has fewer pages than a sequence's table is wide: it holds the
+        # pages the windows reach.
+        user_pages = table[seq]
         user_positions = jnp.where(live, position, -1)
         # TTNN shared paged updates of up to MAX_UPDATE_USERS tokens, in
         # place, which write each tile once with the rows of every token in
@@ -149,13 +150,12 @@ def _ragged_paged_attention(module):
             and cache_heads == kv_heads
             and causal
             and soft_cap is None
-            and attention_sink is None
             and q_scale is None
             and k_scale is None
             and v_scale is None
         ):
             out = _paged_decode(
-                queries, cache, user_pages, user_positions, sm_scale, sliding_window
+                queries, cache, user_pages, user_positions, sm_scale, sliding_window, attention_sink
             )
             return out.astype(out_dtype or queries.dtype), cache
         # Otherwise each sequence is a user of TTNN's chunked paged attention,
@@ -288,13 +288,22 @@ def _paged_prefill(queries, cache, table, q_starts, prefixes, seq, positions, li
     return out[:, :, cache_head_dim : cache_head_dim + head_dim]
 
 
-def _paged_decode(queries, cache, page_table, positions, sm_scale, sliding_window):
-    """Each token as a TTNN decode user, attending to its sequence up to its position."""
+def _paged_decode(queries, cache, page_table, positions, sm_scale, sliding_window, attention_sink=None):
+    """Each token as a TTNN decode user, attending to its sequence up to its position.
+
+    An attention sink is one more logit per query head in the softmax's
+    denominator, unscaled. TTNN's kernel scales it with the scores, so it takes
+    the sinks divided by the scale, in the first column of a [q_heads, 32] tile.
+    """
     import jax
     import jax.numpy as jnp
     import numpy as np
 
     tokens, q_heads, head_dim = queries.shape
+    sinks = ()
+    if attention_sink is not None:
+        sink = jnp.asarray(attention_sink, jnp.float32).reshape(q_heads, 1) / sm_scale
+        sinks = (jnp.pad(sink, ((0, 0), (0, 31))).astype(jnp.bfloat16),)
     # The cache's rows are [K | V], each cache_head_dim wide: TTNN reads them as keys and values for queries that
     # wide.
     cache_head_dim = cache.shape[-1] // 2
@@ -313,10 +322,11 @@ def _paged_decode(queries, cache, page_table, positions, sm_scale, sliding_windo
                 cache,
                 page_table[start : start + MAX_DECODE_USERS],
                 positions[start : start + MAX_DECODE_USERS],
+                *sinks,
                 is_causal=True,
                 has_attention_mask=False,
                 has_cur_pos_tensor=True,
-                has_attention_sink=False,
+                has_attention_sink=bool(sinks),
                 scale=np.float32(sm_scale),
                 **window,
             )
@@ -329,8 +339,11 @@ def patch_rpa_v3(module):
 
 
 def patch_kv_pool(module):
-    """Gives the fused MHA pool the `[pages, kv_heads, page_size, 2 * head_dim]` layout."""
+    """Gives the fused MHA pool the `[pages, kv_heads, page_size, 2 * head_dim]` layout,
+    with head_dim padded to Tenstorrent's 32-wide tiles rather than a TPU's 128
+    lanes (GPT-OSS's 64-wide heads would take twice the cache)."""
     pool = module.TpuFusedMHATokenToKVPool
+    pool.HEAD_DIM_ALIGNMENT = 32
 
     def _create_buffers(self):
         shape = (
@@ -579,14 +592,21 @@ def _fused_moe_jax(
     the layer's all-reduce adds them up. Like the Pallas kernel, it reads the
     router's global expert ids. w1 holds each expert's gate and up projections
     side by side, [experts, hidden, 2 * intermediate].
+
+    The gate is SiLU, or GPT-OSS's clamped SwiGLU ("swigluoai"), which the
+    kernel computes with GPT-OSS's constants, as the Pallas kernel does. The
+    experts may come with biases, w1_bias [experts, 2 * intermediate] and
+    w2_bias [experts, hidden].
     """
     import jax
     import jax.numpy as jnp
     import torch.distributed as dist
 
-    extras = (w1_bias, w2_bias, w1_channel_scale, w2_channel_scale)
-    if activation_name != "silu" or no_combine or w_quant_bits or any(e is not None for e in extras):
-        raise NotImplementedError("MoE on Tenstorrent runs BF16 or FP8 SiLU experts without biases, combined")
+    activation = {"silu": "silu", "swigluoai": "swigluoai", "swiglu_oai": "swigluoai"}.get(activation_name)
+    if activation is None or no_combine or w_quant_bits or w1_channel_scale is not None or w2_channel_scale is not None:
+        raise NotImplementedError("MoE on Tenstorrent runs BF16 or FP8 SiLU or SwiGLU-OAI experts, combined")
+    if (w1_bias is None) != (w2_bias is None):
+        raise NotImplementedError("MoE on Tenstorrent takes both experts' biases or neither")
     fp8 = w1.dtype == w2.dtype == jnp.float8_e4m3fn
     if fp8:
         if w1_scale is None or w2_scale is None or w1_scale.shape[1] != 1 or w2_scale.shape[1] != 1:
@@ -616,8 +636,11 @@ def _fused_moe_jax(
     fused_moe_ep = jax.ffi.ffi_call("tt.fused_moe_ep", jax.ShapeDtypeStruct(hidden_states.shape, hidden_states.dtype))
     operands = (hidden_states, topk_weights, topk_ids, w1[..., : gate_up // 2], w1[..., gate_up // 2 :], w2)
     if fp8:
-        return fused_moe_ep(*operands, *_fp8_scales(w1, weight(w1_scale), weight(w2_scale)))
-    return fused_moe_ep(*operands, weight_dtype="bf16")
+        operands += _fp8_scales(w1, weight(w1_scale), weight(w2_scale))
+    if w1_bias is not None:
+        b1 = weight(w1_bias).reshape(experts, gate_up)
+        operands += (b1[:, : gate_up // 2], b1[:, gate_up // 2 :], weight(w2_bias).reshape(experts, -1))
+    return fused_moe_ep(*operands, activation=activation, **({} if fp8 else {"weight_dtype": "bf16"}))
 
 
 def patch_fused_moe(module):
@@ -639,6 +662,80 @@ def patch_fp8_moe_fused_rs(module):
     module.prepare_fp8_fused_rs = prepare_fp8_fused_rs
 
 
+def patch_mxfp4_tpu_util(module):
+    """MXFP4 experts (GPT-OSS) as FP8 experts for TTNN's fused MoE kernel.
+
+    SGLang-TorchTPU dequantizes them to BF16 for the Pallas kernel, padded to
+    the widths at which its tiles fit the TPU's vector memory (GPT-OSS-120B's
+    then take 229 GB, four chips have 137). An MXFP4 value
+    is an FP4 (E2M1) one times its block's power of two, so with one power of
+    two per expert and output column, the largest of its blocks', every value
+    is an FP8 (E4M3) one times that column scale, exactly. This converts them
+    on the host into the fused MoE op's FP8 layout: w13
+    [experts, hidden, 2 * intermediate], gate and up halves side by side
+    (GPT-OSS interleaves them), w2 [experts, intermediate, hidden], their
+    column scales [experts, 1, 1, columns] and the biases."""
+    import os
+
+    import torch
+    import torch.distributed
+    from torch.nn import Parameter
+
+    def fp8_columns(packed, block_scales):
+        """[experts, rows, columns] MXFP4 (two E2M1 codes per byte, the even
+        column's in the low nibble; an E8M0 exponent per 32 columns) as FP8
+        [experts, columns, rows] and FP32 scales [experts, 1, 1, rows], one
+        per row (output column), built bit by bit: a code's magnitude index i
+        (0, 0.5, 1, 1.5, 2, 3, 4, 6) times 2^k, k its block's exponent less
+        the row's largest plus 6, is FP8 with exponent field k + 6 + i // 2
+        and mantissa field 4 for odd i >= 3 (6 * 2^6 = 384, below 448). For
+        that to be normal, k >= -5: a row's blocks span at most 11 powers of
+        two (GPT-OSS-120B's do)."""
+        packed, block_scales = packed.cpu(), block_scales.cpu()
+        largest = block_scales.amax(-1, keepdim=True)
+        if int((largest - block_scales).max()) > 11:
+            raise NotImplementedError("MXFP4 experts whose rows' blocks span more than 11 powers of two")
+        # k + 6 per block, from 1 to 12 (uint8 arithmetic wraps consistently).
+        biased = (block_scales + 12 - largest)[..., None]
+        codes = torch.stack((packed & 15, packed >> 4), -1).flatten(-2)
+        codes = codes.unflatten(-1, (block_scales.shape[-1], -1))
+        index = codes & 7
+        half = index >> 1
+        field = ((biased + half) << 3) | ((index & 1) * (half > 0)) << 2
+        fp8 = (((codes & 8) << 4) | field * (index > 0)).flatten(-2)
+        fp8 = fp8.view(torch.float8_e4m3fn).transpose(1, 2).contiguous()
+        scale = torch.ldexp(torch.ones(largest.shape[:-1]), largest[..., 0].to(torch.int32) - 127 - 6)
+        return fp8, scale[:, None, None, :]
+
+    def prepare_tpu_mxfp4_moe_weights(layer, *, with_bias):
+        device = layer.w13_weight.device
+        interleaved = layer.moe_runner_config.activation == "swigluoai"
+        w13, w13_scales = layer.w13_weight.data, layer.w13_weight_scale.data
+        if interleaved:
+            w13, w13_scales = module._deinterleave_axis1(w13.cpu()), module._deinterleave_axis1(w13_scales.cpu())
+        # Each rank converts its experts at once, as SGLang-TorchTPU's FP8 MoE preparation does.
+        threads = torch.get_num_threads()
+        ranks = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        torch.set_num_threads(max(threads, (os.cpu_count() or 8) // ranks))
+        try:
+            w13, s13 = fp8_columns(w13, w13_scales)
+            w2, s2 = fp8_columns(layer.w2_weight.data, layer.w2_weight_scale.data)
+        finally:
+            torch.set_num_threads(threads)
+        for name, value in (("w13_weight", w13), ("w13_weight_scale", s13), ("w2_weight", w2), ("w2_weight_scale", s2)):
+            setattr(layer, name, Parameter(value.to(device), requires_grad=False))
+        if not with_bias:
+            layer.w13_weight_bias = None
+            layer.w2_weight_bias = None
+            return
+        b13 = layer.w13_weight_bias.data.cpu()
+        if interleaved:
+            b13 = module._deinterleave_axis1(b13.unsqueeze(-1)).squeeze(-1)
+        layer.w13_weight_bias = Parameter(b13.contiguous().to(device), requires_grad=False)
+
+    module.prepare_tpu_mxfp4_moe_weights = prepare_tpu_mxfp4_moe_weights
+
+
 PATCHES = {
     RPA_V3_MODULE: patch_rpa_v3,
     KV_POOL_MODULE: patch_kv_pool,
@@ -650,4 +747,5 @@ PATCHES = {
     ALL_GATHER_VIA_ALL_REDUCE_MODULE: patch_all_gather_via_all_reduce,
     FUSED_MOE_MODULE: patch_fused_moe,
     FP8_MOE_FUSED_RS_MODULE: patch_fp8_moe_fused_rs,
+    MXFP4_TPU_UTIL_MODULE: patch_mxfp4_tpu_util,
 }

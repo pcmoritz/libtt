@@ -2,7 +2,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
 new file mode 100644
 --- /dev/null
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/column_scale_sfpu.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,68 @@
 +// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 +//
 +// SPDX-License-Identifier: Apache-2.0
@@ -15,7 +15,8 @@ new file mode 100644
 +#include "sfpi.h"
 +
 +// Column scales of FP8 experts (moe_ring_common.h, COLUMN_SCALE_ROWS): a data tile in DEST times its columns'
-+// scales, which sit in rows of a scale tile in another DEST tile, times 2^18 (COLUMN_SCALE_SHIFT).
++// scales, which sit in rows of a scale tile in another DEST tile, times 2^8 (COLUMN_SCALE_SHIFT), plus their
++// biases, eight rows below the scales (zero without biases).
 +//
 +// An SFPU load takes four rows of eight columns: load 2 * i of a face its rows 4 * i to 4 * i + 3 at the even
 +// columns, load 2 * i + 1 the same rows at the odd columns. The scale tile repeats each scale over four rows, so
@@ -24,17 +25,19 @@ new file mode 100644
 +namespace moe_column_scale {
 +
 +// One face of the data tile, where DEST points, times its 16 columns' scales, the loads `scales` and `scales` + 1
-+// from here.
++// from here, plus their biases, the loads 4 further on.
 +template <int32_t scales>
 +inline void scale_face() {
-+    sfpi::vFloat even = sfpi::dst_reg[scales] * 0x1p-18f;
-+    sfpi::vFloat odd = sfpi::dst_reg[scales + 1] * 0x1p-18f;
++    sfpi::vFloat even = sfpi::dst_reg[scales] * 0x1p-8f;
++    sfpi::vFloat odd = sfpi::dst_reg[scales + 1] * 0x1p-8f;
++    sfpi::vFloat even_bias = sfpi::dst_reg[scales + 4];
++    sfpi::vFloat odd_bias = sfpi::dst_reg[scales + 5];
 +    for (int d = 0; d < 4; d++) {
 +        sfpi::vFloat value = sfpi::dst_reg[0];
-+        sfpi::dst_reg[0] = value * even;
++        sfpi::dst_reg[0] = value * even + even_bias;
 +        sfpi::dst_reg++;
 +        value = sfpi::dst_reg[0];
-+        sfpi::dst_reg[0] = value * odd;
++        sfpi::dst_reg[0] = value * odd + odd_bias;
 +        sfpi::dst_reg++;
 +    }
 +}
@@ -412,7 +415,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h
 --- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h
-@@ -339,6 +339,42 @@ constexpr uint32_t half_block_tiles_h(uint32_t tiles_per_txn) {
+@@ -339,6 +339,43 @@ constexpr uint32_t half_block_tiles_h(uint32_t tiles_per_txn) {
      return W0_W1_TXNS_PER_BLOCK * tiles_per_txn / W0_W1_HALF_BLOCK_TILES_W;
  }
  
@@ -426,7 +429,8 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
 +//   row column_scale_row    the pair's scale tile, a FLOAT16 tile's bytes over both slots (two FP8 pages), and
 +//   rows + 1 and + 2        the FP8 identity in the first slot, then in the second (zeros in the other slot).
 +// The scale tile holds each scale times 2^COLUMN_SCALE_SHIFT as the nearest FLOAT16 value: 11 bits, as many as
-+// the gate/up results keep, for scales from 2^-32 up to just under 2^-2. Each half of the tile, a slot's bytes,
++// the gate/up results keep, for scales from 2^-22 up to just under 2^8 (FP8 checkpoints' channelwise scales are
++// about 2^-14 to 2^-7, MXFP4 experts' powers of two 2^-20 to 2^5 in GPT-OSS-120B). Each half of the tile, a slot's bytes,
 +// holds all of it: the first slot's columns' scales in rows 0 to 3 and the second slot's in rows 4 to 7, four rows
 +// each, which one SFPU load takes. A data tile's top and bottom faces then read their scales at
 +// the same place in the scale tile's, which also holds where DEST's rows are remapped for untilizing (the W2
@@ -435,7 +439,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
 +// reads the scale tile as it reads activations) and scales the data tiles by its rows: the gate/up tiles before
 +// the activation, the W2 outputs before they are packed (column_scale_sfpu.h).
 +constexpr uint32_t COLUMN_SCALE_ROWS = 3;
-+constexpr int32_t COLUMN_SCALE_SHIFT = 18;
++constexpr int32_t COLUMN_SCALE_SHIFT = 8;
 +// The scale row of a stream of k_tiles K rows: the first row after them from which three rows are in one block.
 +constexpr uint32_t column_scale_row(uint32_t k_tiles, uint32_t tiles_per_txn) {
 +    const uint32_t rows = block_tiles_h(tiles_per_txn);
@@ -455,7 +459,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  // The per-shape DRAM transaction size (tiles) of both weight streams. 20 tiles only for the 2560/640 expert
  // (80/20 tiles, no bias) on the 8-core ring, where that layout has no padding (gate/up K 80 = 8 x 10, W2 K 20 =
  // 2 x 10, 10 blocks per bank, W2 a2a iterations 4 + 4 + a half); 14 tiles everywhere else. Other rings are not
-@@ -410,7 +446,8 @@ template <
+@@ -410,7 +447,8 @@ template <
      uint32_t num_cores,
      bool has_bias,
      uint32_t SharedExpertTp = 1,
@@ -465,7 +469,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  struct MoeRingConfig {
      // DRAM transaction geometry (both weight streams): a block is 2 transactions of tiles_per_txn tiles,
      // consumed 4 wide x block_tiles_h high (or 2 wide x half_block_tiles_h high for the half variants).
-@@ -423,7 +460,9 @@ struct MoeRingConfig {
+@@ -423,7 +461,9 @@ struct MoeRingConfig {
      static constexpr uint32_t weight_cb_slots = moe_ring::weight_cb_slots(tiles_per_txn);  // 3 (14- or 20-tile)
  
      // W0/W1
@@ -476,7 +480,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
      static constexpr uint32_t w0_w1_blocks_per_col = (w0_w1_dram_tiles_h + block_tiles_h - 1) / block_tiles_h;
      static constexpr uint32_t in2_tiles_per_step = a2a_exchange_tiles(Nt, num_cores);
  
-@@ -472,7 +511,8 @@ struct MoeRingConfig {
+@@ -472,7 +512,8 @@ struct MoeRingConfig {
      // output rows keep the w2_tiles_per_expert_w pitch: the half iteration still packs 4 DEST tiles, the two it does
      // not compute are zero (the packer clears the DEST half at every tile_regs_release) and dm1 copies only
      // w2_shard_tiles(c) tiles of each row.
@@ -511,7 +515,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
          tilize_output_tensor.buffer());
  
      // MoE output for combine uses the same buffer as input but create a new CB to manage control flow
-@@ -969,15 +976,29 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+@@ -969,15 +976,28 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
          !replay_slice || num_shared_experts == 0,
          "prefill_rings>=1 replays one whole expert slice per ring core; shared experts (TP-split slices) are not "
          "admitted");
@@ -528,7 +532,6 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
 +    const uint32_t weight_tile_size = tt::tile_size(weight_format);
 +    // FP8 weights come with a scale per gate/up column, in three more K rows of the W0/W1 stream
 +    // (moe_ring_common.h, COLUMN_SCALE_ROWS).
-+    TT_FATAL(!(fp8_weights && args.has_bias), "moe_compute: FP8 experts with a bias are not supported");
 +    const uint32_t w0_w1_dram_tiles_h =
 +        moe_ring::dram_tiles_h(hidden_tiles, args.has_bias, fp8_weights, weight_tiles_per_txn);
      if (replay_slice) {
@@ -544,7 +547,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
              matmul_num_cores,
              weight_tiles_per_txn);
          std::map<uint32_t, std::vector<CoreRange>> cores_by_slice_blocks;
-@@ -1015,7 +1036,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+@@ -1015,7 +1035,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
                  CoreRangeSet(ranges),
                  weight_tile_size,
                  slice_blocks * weight_tiles_per_block,
@@ -553,7 +556,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
          }
      } else {
          push_cb(
-@@ -1024,7 +1045,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+@@ -1024,7 +1044,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
              ring_core_range_set,
              weight_tile_size,
              weight_slots * weight_tiles_per_block,
@@ -562,7 +565,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
      }
  
      // Define the CB configuration as a tuple: name, CBIndex, DataFormat, tiles_per_cb
-@@ -1036,7 +1057,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+@@ -1036,7 +1056,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
          {"cb_w2c_rdy", tt::CBIndex::c_5, tt::DataFormat::Float32, false, matmul_num_cores * a2a_parity_slots},
          {"cb_s2c_in2",
           tt::CBIndex::c_6,
@@ -571,7 +574,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
           true,
           a2a_cb_pages * matmul_num_cores * a2a_parity_slots},
          {"cb_w2c_md", tt::CBIndex::c_7, tt::DataFormat::UInt32, false, 2},
-@@ -1399,6 +1420,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+@@ -1399,6 +1419,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
          {"tilize_input_cb_id", tilize_input_cb_id},
          {"tilize_output_cb_id", tilize_output_cb_id},
          {"total_chunks_cb_id", total_chunks_cb_id},
@@ -579,7 +582,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
          {"tokens_per_chunk", tokens_per_chunk},
          {"max_tiles_per_local_chunk", max_tiles_per_local_chunk},
          {"shared_cb_num_pages", shared_cb_num_pages},
-@@ -1412,7 +1434,9 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+@@ -1412,7 +1433,9 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
          .core_ranges = tilize_core_range_set,
          .named_compile_time_args = std::move(compute_tilize_named_compile_time_args),
          .defines = zone_defines,
@@ -590,7 +593,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
      });
  
      // Slots 0..6 are Buffer* bindings filled when the runtime args are emplaced.
-@@ -1634,7 +1658,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+@@ -1634,7 +1657,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
      {
          const uint32_t w0_w1_layers = matmul_w0_w1_tensor.logical_shape()[1];
          const uint32_t w0_w1_bank_blocks = moe_ring::w0_w1_bank_blocks_per_expert(
@@ -599,7 +602,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
              intermediate_tiles,
              matmul_num_cores,
              num_dram_banks,
-@@ -1655,7 +1679,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+@@ -1655,7 +1678,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
          const uint32_t w2_layers = matmul_w2_tensor.logical_shape()[1];
          const uint32_t w2_core_blocks = moe_ring::w2_core_blocks_per_expert(
              hidden_tiles,
@@ -608,7 +611,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
              matmul_num_cores,
              weight_tiles_per_txn);
          const uint32_t w2_expected_pages =
-@@ -1694,6 +1718,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+@@ -1694,6 +1717,7 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
          {"shared_expert_tp_factor", shared_expert_tp_factor},
          {"layer_id", args.layer_id},
          {"has_bias", args.has_bias ? 1u : 0u},
@@ -616,7 +619,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_comp
          {"num_cores", static_cast<uint32_t>(matmul_num_cores)},
          {"num_banks", num_dram_banks},
          {"a2a_free_semaphore_id", a2a_free_semaphore_id},
-@@ -1787,11 +1812,17 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
+@@ -1787,11 +1811,17 @@ tt::tt_metal::ProgramDescriptor build_moe_compute_program_descriptor(
          .defines = zone_defines,
          .config =
              tt::tt_metal::ComputeConfigDescriptor{
@@ -680,9 +683,12 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
      TT_FATAL(
          hidden_size % TILE_SIZE == 0, "hidden_size ({}) must be divisible by TILE_SIZE ({})", hidden_size, TILE_SIZE);
      TT_FATAL(
-@@ -468,9 +475,7 @@ WeightMemoryConfigs get_weight_mem_configs(
+@@ -467,10 +474,10 @@ WeightMemoryConfigs get_weight_mem_configs(
+ 
      const auto shard_maps = get_weight_core_shard_maps(mesh_device, hidden_size, intermediate_size);
      const auto& w0_w1_shard_map = shard_maps.w0_w1_shard_map;
++    // FP8 experts' biases are in their column scale tiles, not a bias row.
++    has_bias = has_bias && !column_scales;
  
 -    // Stored K height for W0/W1: hidden tiles, plus one bias tile row.
      const uint32_t Ht = hidden_size / TILE_SIZE;
@@ -690,7 +696,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
      const uint32_t Nt_w0_w1 = intermediate_size / TILE_SIZE;
  
      const uint32_t num_cores = static_cast<uint32_t>(w0_w1_shard_map.size());
-@@ -478,6 +483,8 @@ WeightMemoryConfigs get_weight_mem_configs(
+@@ -478,6 +485,8 @@ WeightMemoryConfigs get_weight_mem_configs(
  
      // Per-shape DRAM transaction size (both streams) and the stored rows of one block.
      const uint32_t tiles_per_txn = ::moe_ring::tiles_per_txn_for_shape(Ht, Nt_w0_w1, has_bias, num_cores);
@@ -699,7 +705,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
      const uint32_t block_rows = ::moe_ring::block_tiles_h(tiles_per_txn) * TILE_SIZE;
  
      // Compact W0/W1 layout (prepare_w0_w1_tensor_for_moe_compute): every bank holds the same whole blocks
-@@ -501,7 +508,9 @@ WeightMemoryConfigs get_weight_mem_configs(
+@@ -501,7 +510,9 @@ WeightMemoryConfigs get_weight_mem_configs(
      // half-width last one; prepare_w2_tensor_for_moe_compute).
      const uint32_t Nt = intermediate_size / TILE_SIZE;
      const uint32_t w2_core_rows =
@@ -710,25 +716,35 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
      const uint32_t w2_total_rows = num_layers * experts_per_device * num_cores * w2_core_rows;
      TT_FATAL(
          w2_total_rows % num_banks == 0,
-@@ -836,6 +845,261 @@ ttnn::Tensor prepare_w2_tensor_for_moe_compute(
+@@ -836,6 +847,321 @@ ttnn::Tensor prepare_w2_tensor_for_moe_compute(
      return result;
  }
  
 +namespace {
 +// A slot's half of its pair's scale tile (moe_ring_common.h, COLUMN_SCALE_ROWS) as the float8 tile that holds its
 +// bytes: `tile`, 32 rows of 32 bytes `stride` apart. The half is two FLOAT16 faces of 16 rows, the left and the
-+// right 16 columns', with the pair's first slot's scales in rows 0 to 3 and its second slot's in rows 4 to 7.
-+// `scales[slot]` are a slot's 32 columns' FP32 scales, or null for a slot without columns.
-+void write_scale_half_tile(uint8_t* tile, size_t stride, const std::array<const float*, 2>& scales) {
++// right 16 columns', with the pair's first slot's scales in rows 0 to 3 and its second slot's in rows 4 to 7, and
++// their biases in rows 8 to 11 and 12 to 15 (column_scale_sfpu.h). `scales[slot]` are a slot's 32 columns' FP32
++// scales, or null for a slot without columns; `biases[slot]` their biases, or null for none.
++void write_scale_half_tile(
++    uint8_t* tile,
++    size_t stride,
++    const std::array<const float*, 2>& scales,
++    const std::array<const float*, 2>& biases = {}) {
 +    uint8_t raw[TILE_SIZE * TILE_SIZE] = {};
++    const auto put = [&](uint32_t first_row, uint32_t column, tt::tt_metal::float16 value) {
++        const uint32_t face = column / (TILE_SIZE / 2);
++        for (uint32_t row = first_row; row < first_row + 4; ++row) {
++            uint8_t* bytes = raw + face * 512 + row * TILE_SIZE + (column % 16) * 2;
++            bytes[0] = static_cast<uint8_t>(value.bits);
++            bytes[1] = static_cast<uint8_t>(value.bits >> 8);
++        }
++    };
 +    for (uint32_t slot = 0; slot < 2; ++slot) {
 +        for (uint32_t column = 0; scales[slot] != nullptr && column < TILE_SIZE; ++column) {
-+            const tt::tt_metal::float16 scale(std::ldexp(scales[slot][column], ::moe_ring::COLUMN_SCALE_SHIFT));
-+            const uint32_t face = column / (TILE_SIZE / 2);
-+            for (uint32_t row = 4 * slot; row < 4 * slot + 4; ++row) {
-+                uint8_t* bytes = raw + face * 512 + row * TILE_SIZE + (column % 16) * 2;
-+                bytes[0] = static_cast<uint8_t>(scale.bits);
-+                bytes[1] = static_cast<uint8_t>(scale.bits >> 8);
++            put(4 * slot, column, tt::tt_metal::float16(std::ldexp(scales[slot][column], ::moe_ring::COLUMN_SCALE_SHIFT)));
++            if (biases[slot] != nullptr) {
++                put(8 + 4 * slot, column, tt::tt_metal::float16(biases[slot][column]));
 +            }
 +        }
 +    }
@@ -740,31 +756,52 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +    }
 +}
 +
-+// FP8 experts' column scales, (L, E, columns) FLOAT32 on device, on host and row-major. The scale tile holds
-+// finite scales up to the largest FLOAT16 times 2^-COLUMN_SCALE_SHIFT in magnitude; a larger one is refused.
-+ttnn::Tensor column_scales_on_host(const ttnn::Tensor& scales, uint32_t L, uint32_t E, uint32_t columns) {
-+    TT_FATAL(
-+        scales.logical_shape() == ttnn::Shape({L, E, columns}) && scales.dtype() == ttnn::DataType::FLOAT32,
-+        "Column scales are FLOAT32 ({}, {}, {}), got {} {}",
-+        L,
-+        E,
-+        columns,
-+        scales.dtype(),
-+        scales.logical_shape());
-+    auto host = ttnn::to_layout(ttnn::from_device(scales), ttnn::Layout::ROW_MAJOR);
-+    const float largest = std::ldexp(65504.0f, -::moe_ring::COLUMN_SCALE_SHIFT);
++// FP8 experts' column scales, (L, E, columns) FLOAT32 on device, on host and row-major, and their biases after them
++// along the columns if any: (L, E, 2 * columns). The scale tile holds scales of zero or from the smallest normal
++// FLOAT16 up to the largest, times 2^-COLUMN_SCALE_SHIFT, in magnitude (it flushes smaller ones to zero) and finite
++// biases up to the largest FLOAT16; any other is refused.
++ttnn::Tensor column_scales_on_host(
++    const ttnn::Tensor& scales,
++    uint32_t L,
++    uint32_t E,
++    uint32_t columns,
++    const std::optional<ttnn::Tensor>& biases = std::nullopt) {
++    for (const ttnn::Tensor* values : {&scales, biases ? &*biases : nullptr}) {
++        TT_FATAL(
++            values == nullptr ||
++                (values->logical_shape() == ttnn::Shape({L, E, columns}) &&
++                 values->dtype() == ttnn::DataType::FLOAT32),
++            "Column scales and biases are FLOAT32 ({}, {}, {}), got {} {}",
++            L,
++            E,
++            columns,
++            values->dtype(),
++            values->logical_shape());
++    }
++    auto both = biases ? ttnn::concat({scales, *biases}, 2) : scales;
++    auto host = ttnn::to_layout(ttnn::from_device(both), ttnn::Layout::ROW_MAJOR);
++    const uint32_t width = biases ? 2 * columns : columns;
++    const float largest_scale = std::ldexp(65504.0f, -::moe_ring::COLUMN_SCALE_SHIFT);
++    const float smallest_scale = std::ldexp(1.0f, -14 - ::moe_ring::COLUMN_SCALE_SHIFT);
 +    host.host_storage().buffer().apply([&](const tt::tt_metal::HostBuffer& shard) {
 +        const auto values = shard.view_as<float>();
 +        // A traced call (a constraint query) has no data to read.
-+        if (values.size() != static_cast<size_t>(L) * E * columns) {
++        if (values.size() != static_cast<size_t>(L) * E * width) {
 +            return;
 +        }
-+        for (const float scale : values) {
++        for (size_t i = 0; i < values.size(); ++i) {
++            const bool bias = i % width >= columns;
++            const float largest = bias ? 65504.0f : largest_scale;
++            const float magnitude = std::fabs(values[i]);
 +            TT_FATAL(
-+                std::isfinite(scale) && std::fabs(scale) <= largest,
-+                "An FP8 expert's column scale is {}; moe_compute takes finite scales up to {} in magnitude",
-+                scale,
-+                largest);
++                std::isfinite(values[i]) && magnitude <= largest &&
++                    (bias || magnitude == 0.0f || magnitude >= smallest_scale),
++                "An FP8 expert's column {} is {}; moe_compute takes finite ones up to {} in magnitude (scales: "
++                "zero or from {})",
++                bias ? "bias" : "scale",
++                values[i],
++                largest,
++                smallest_scale);
 +        }
 +    });
 +    return host;
@@ -807,7 +844,9 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +    uint32_t L,
 +    uint32_t E,
 +    uint32_t K,
-+    uint32_t N) {
++    uint32_t N,
++    const std::optional<ttnn::Tensor>& tt_b0,
++    const std::optional<ttnn::Tensor>& tt_b1) {
 +    TT_FATAL(
 +        experts_w0.dtype() == ttnn::DataType::FP8_E4M3 && experts_w1.dtype() == ttnn::DataType::FP8_E4M3,
 +        "W0 and W1 are FP8_E4M3, got {} and {}",
@@ -838,17 +877,25 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +    const uint32_t rows = scale_row + ::moe_ring::COLUMN_SCALE_ROWS * TILE_SIZE;
 +    constexpr uint8_t fp8_one = 0x38;  // 1.0 in float8_e4m3
 +
-+    // The scales on host: each expert's gate scales, then its up scales.
++    // The scales on host: each expert's gate scales, then its up scales, then their biases.
++    TT_FATAL(tt_b0.has_value() == tt_b1.has_value(), "W0 and W1 take biases both or neither");
 +    auto both = ttnn::concat({tt_s0, tt_s1}, 2);
-+    auto scales = column_scales_on_host(both, L, E, 2 * N);
++    std::optional<ttnn::Tensor> both_biases;
++    if (tt_b0) {
++        both_biases = ttnn::concat({*tt_b0, *tt_b1}, 2);
++    }
++    auto scales = column_scales_on_host(both, L, E, 2 * N, both_biases);
 +    both.deallocate(/*force=*/true);
++    const size_t expert_values = (tt_b0 ? 4 : 2) * static_cast<size_t>(N);
 +
 +    // W0 or W1 with its K rows after the weights', from the scales: (L, E, 2 * N) -> (L, E, rows, N).
 +    const auto with_tail = [&](const ttnn::Tensor& weights, bool w1) {
 +        auto rows_after =
 +            rows_from_scales(scales, tt_w0, ttnn::Shape({L, E, rows, N}), [&](const float* values, uint8_t* out) {
 +                for (size_t expert = 0; expert < static_cast<size_t>(L) * E; ++expert) {
-+                    const float* in = values + expert * 2 * N;
++                    const float* in = values + expert * expert_values;
++                    // The biases follow the 2 * N scales, gate then up.
++                    const float* bias = tt_b0 ? in + 2 * N : nullptr;
 +                    uint8_t* tiles = out + (expert * rows + scale_row) * N;
 +                    for (uint32_t tile = 0; tile < Nt; ++tile) {
 +                        // The identity: in W0's second row of tiles, in W1's third.
@@ -858,7 +905,10 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +                        // The first row of tiles: W0's and W1's are the halves of the scale tile, each with the
 +                        // gate scales (the first slot's) and the up scales.
 +                        write_scale_half_tile(
-+                            tiles + tile * TILE_SIZE, N, {in + tile * TILE_SIZE, in + N + tile * TILE_SIZE});
++                            tiles + tile * TILE_SIZE,
++                            N,
++                            {in + tile * TILE_SIZE, in + N + tile * TILE_SIZE},
++                            {bias ? bias + tile * TILE_SIZE : nullptr, bias ? bias + N + tile * TILE_SIZE : nullptr});
 +                    }
 +                }
 +            });
@@ -876,7 +926,13 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +}
 +
 +ttnn::Tensor prepare_w2_tensor_with_column_scales(
-+    const ttnn::Tensor& experts_w2, const ttnn::Tensor& tt_s2, uint32_t L, uint32_t E, uint32_t N, uint32_t K) {
++    const ttnn::Tensor& experts_w2,
++    const ttnn::Tensor& tt_s2,
++    uint32_t L,
++    uint32_t E,
++    uint32_t N,
++    uint32_t K,
++    const std::optional<ttnn::Tensor>& tt_b2) {
 +    TT_FATAL(experts_w2.dtype() == ttnn::DataType::FP8_E4M3, "W2 is FP8_E4M3, got {}", experts_w2.dtype());
 +    // The packing moves the experts' bytes: UINT8 views.
 +    const ttnn::Tensor tt_w2 = ttnn::bitcast(experts_w2, ttnn::DataType::UINT8);
@@ -920,7 +976,8 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +        std::accumulate(core_tiles.begin(), core_tiles.end(), 0u) == Kt,
 +        "The W2 column shards do not hold the {} column tiles",
 +        Kt);
-+    auto host_scales = column_scales_on_host(tt_s2, L, E, K);
++    auto host_scales = column_scales_on_host(tt_s2, L, E, K, tt_b2);
++    const size_t expert_values = (tt_b2 ? 2 : 1) * static_cast<size_t>(K);
 +    constexpr uint32_t group_width = 4 * TILE_SIZE;
 +    auto tail_grouped = rows_from_scales(
 +        host_scales,
@@ -931,7 +988,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +            uint32_t first_tile = 0;
 +            for (uint32_t core = 0; core < num_cores; first_tile += core_tiles[core++]) {
 +                for (size_t expert = 0; expert < static_cast<size_t>(L) * E; ++expert) {
-+                    const float* in = values + expert * K;
++                    const float* in = values + expert * expert_values;
 +                    for (uint32_t group = 0; group < w2_groups_per_core; ++group) {
 +                        uint8_t* tiles =
 +                            out +
@@ -942,10 +999,19 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +                            const uint32_t tile = 4 * group + slot;
 +                            return tile < core_tiles[core] ? in + (first_tile + tile) * TILE_SIZE : nullptr;
 +                        };
++                        // Its biases, after the K scales.
++                        const auto biases = [&](uint32_t slot) -> const float* {
++                            const float* slot_scales = scales(slot);
++                            return tt_b2 && slot_scales != nullptr ? slot_scales + K : nullptr;
++                        };
 +                        for (uint32_t slot = 0; slot < 4; ++slot) {
 +                            // The first row of tiles: the slot's half of its pair's scale tile.
 +                            const uint32_t pair = slot / 2 * 2;
-+                            write_scale_half_tile(tiles + slot * TILE_SIZE, group_width, {scales(pair), scales(pair + 1)});
++                            write_scale_half_tile(
++                                tiles + slot * TILE_SIZE,
++                                group_width,
++                                {scales(pair), scales(pair + 1)},
++                                {biases(pair), biases(pair + 1)});
 +                            // The identity: in the second row of tiles for a pair's first slot, in the third for
 +                            // its second.
 +                            for (uint32_t d = 0; d < TILE_SIZE; ++d) {
@@ -992,14 +1058,16 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
  
  // Append per-device shared experts after routed experts along the experts dim.
  //
-@@ -93,6 +95,26 @@ ttnn::Tensor prepare_w0_w1_tensor_for_moe_compute(
+@@ -93,6 +95,36 @@ ttnn::Tensor prepare_w0_w1_tensor_for_moe_compute(
  ttnn::Tensor prepare_w2_tensor_for_moe_compute(
      const ttnn::Tensor& tt_w2, uint32_t L, uint32_t E, uint32_t N, uint32_t K);
  
 +// W0/W1 packer for FP8 experts, whose gate/up columns each have an FP32 scale: ``tt_s0`` and ``tt_s1``, ``(L, E,
 +// N)`` FLOAT32, of W0's and W1's columns. W0 and W1 are the FP8 experts, ``(L, E, K, N)`` FP8_E4M3. The packed
 +// layout stores the scales in three K rows that the kernel reads (moe_ring_common.h, COLUMN_SCALE_ROWS), which
-+// takes finite scales up to the largest FLOAT16 times 2^-COLUMN_SCALE_SHIFT in magnitude, just under 2^-2.
++// takes scales from 2^-22 up to just under 2^8 in magnitude, or zero.
++// Optional biases ``tt_b0`` and ``tt_b1``, ``(L, E, N)`` FLOAT32, go with the scales, as FLOAT16 (finite, up to
++// its largest in magnitude): the kernel adds them to the scaled columns.
 +ttnn::Tensor prepare_w0_w1_tensor_with_column_scales(
 +    const ttnn::Tensor& experts_w0,
 +    const ttnn::Tensor& experts_w1,
@@ -1008,13 +1076,21 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/moe_compute_uti
 +    uint32_t L,
 +    uint32_t E,
 +    uint32_t K,
-+    uint32_t N);
++    uint32_t N,
++    const std::optional<ttnn::Tensor>& tt_b0 = std::nullopt,
++    const std::optional<ttnn::Tensor>& tt_b1 = std::nullopt);
 +
 +// W2 packer for FP8 experts, whose columns each have an FP32 scale: ``tt_s2``, ``(L, E, K)`` FLOAT32. W2 is the
 +// FP8 experts, ``(L, E, N, K)`` FP8_E4M3. The packed layout stores the scales in three N rows that the kernel
-+// reads, as the W0/W1 packer's.
++// reads, as the W0/W1 packer's, and the optional biases ``tt_b2``, ``(L, E, K)`` FLOAT32, with them.
 +ttnn::Tensor prepare_w2_tensor_with_column_scales(
-+    const ttnn::Tensor& experts_w2, const ttnn::Tensor& tt_s2, uint32_t L, uint32_t E, uint32_t N, uint32_t K);
++    const ttnn::Tensor& experts_w2,
++    const ttnn::Tensor& tt_s2,
++    uint32_t L,
++    uint32_t E,
++    uint32_t N,
++    uint32_t K,
++    const std::optional<ttnn::Tensor>& tt_b2 = std::nullopt);
 +
  // Bias-aware W0/W1 packer: appends bias tiles along K, then delegates to the
  // no-bias packer. Bias inputs are PyTorch-format ``(L, E, N)``; output matches
@@ -1055,3 +1131,17 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/kernels/
  
      // Wait for the reader to push total_chunks via CB
      cb_total_chunks.wait_front(one_page);
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/moe_compute/device/moe_compute_device_operation.cpp
+@@ -847,7 +847,9 @@ std::vector<ttnn::Tensor> moe_compute(
+             .output_height_shard_dim = output_height_shard_dim,
+             .intermediate_size = intermediate_size,
+             .num_shared_experts_per_device = num_shared_experts_per_device,
+-            .has_bias = has_bias,
++            // FP8 experts' biases are in their column scale tiles (prepare_w0_w1_tensor_with_column_scales),
++            // which the kernel adds with the scales, not in a bias row.
++            .has_bias = has_bias && matmul_w0_w1_tensor.dtype() != tt::tt_metal::DataType::FP8_E4M3,
+             .num_token_parallel_cores = num_token_parallel_cores,
+             .num_data_parallel_cores = num_data_parallel_cores,
+             .path = compute_only     ? experimental::prim::MoEComputePath::ComputeOnly
