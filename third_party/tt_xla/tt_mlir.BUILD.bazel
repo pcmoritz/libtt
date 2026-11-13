@@ -1317,6 +1317,9 @@ cc_library(
         ],
         allow_empty = True,
     ) + [
+        # tt-train's fused attention, built into ttnn (BUILD.overlay.bazel).
+        "runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp",
+        "runtime/lib/ttnn/operations/ttml/sdpa_fw.cpp",
         "runtime/lib/ttnn/operations/ccl/aggregate_tensor.cpp",
         "runtime/lib/ttnn/operations/ccl/all_gather.cpp",
         "runtime/lib/ttnn/operations/ccl/all_reduce.cpp",

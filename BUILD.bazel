@@ -17,6 +17,7 @@ py_library(
         "python/jax_plugins/libtt/__init__.py",
         "python/jax_plugins/libtt/sglang_tpu_gdn.py",
         "python/jax_plugins/libtt/sglang_tpu_kernels.py",
+        "python/jax_plugins/libtt/torchtitan_tpu_kernels.py",
         "python/jax_plugins/libtt/tpu_compat.py",
     ],
     imports = ["python"],
