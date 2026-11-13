@@ -1,0 +1,17 @@
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -94,6 +94,13 @@
+   }
+   pm.addPass(mlir::tt::ttir::createTTIRWhileTripCount());
+   pm.addPass(mlir::tt::ttir::createTTIRFoldFullToScalar());
++  // Folding a full to a scalar broadcasts the output of a consumer it gave
++  // its shape, such as the full-size 1 - beta of AdamW: fold that broadcast
++  // too, or it is materialized (ttnn.repeat), and CSE shares it between all
++  // its uses, so it stays allocated all along.
++  if (options.implicitBroadcastFoldingEnabled) {
++    pm.addPass(mlir::tt::ttir::createTTIRImplicitBroadcastFold());
++  }
+   pm.addPass(mlir::tt::ttir::createTTIRConsolidateStaticCacheUpdates());
+   pm.addPass(mlir::createCSEPass());
+ }

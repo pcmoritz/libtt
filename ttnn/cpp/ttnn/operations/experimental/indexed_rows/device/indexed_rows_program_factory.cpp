@@ -140,24 +140,29 @@ Geometry geometry(const IndexedRowsParams& params, const IndexedRowsInputs& in) 
     return g;
 }
 
-// Assigns [first, first + count) of `work` items to the cores, evenly.
+// Assigns `count` of `work` items, from `first`, to each core, evenly: either
+// a contiguous range [first, first + count), or with `interleaved` every
+// `num_cores`-th item first, first + num_cores, ...
 struct Split {
     uint32_t num_cores;
     CoreRangeSet all_cores;
     std::vector<std::pair<CoreCoord, std::pair<uint32_t, uint32_t>>> ranges;
+    uint32_t stride = 1;  // between a core's items
 };
 
-Split split(const tt::tt_metal::distributed::MeshDevice& device, uint32_t work) {
+Split split(const tt::tt_metal::distributed::MeshDevice& device, uint32_t work, bool interleaved = false) {
     const auto grid = device.compute_with_storage_grid_size();
     const auto [num_cores, all_cores, core_group_1, core_group_2, per_core_1, per_core_2] =
         tt::tt_metal::split_work_to_cores(grid, work);
-    Split s{.num_cores = num_cores, .all_cores = all_cores};
+    Split s{.num_cores = num_cores, .all_cores = all_cores, .stride = interleaved ? num_cores : 1};
     const auto cores = tt::tt_metal::corerange_to_cores(all_cores, num_cores, /*row_wise=*/false);
     uint32_t first = 0;
-    for (const CoreCoord& core : cores) {
-        const uint32_t count = core_group_1.contains(core) ? per_core_1 : per_core_2;
-        s.ranges.emplace_back(core, std::make_pair(first, count));
-        first += count;
+    for (uint32_t i = 0; i < cores.size(); ++i) {
+        const uint32_t count = interleaved ? (work - i + num_cores - 1) / num_cores
+                               : core_group_1.contains(cores[i]) ? per_core_1
+                                                                 : per_core_2;
+        s.ranges.emplace_back(cores[i], std::make_pair(first, count));
+        first += interleaved ? 1 : count;
     }
     return s;
 }
@@ -264,7 +269,17 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
     // goes out once. The reader fills the batch `group` chunks at a time, so
     // the batch is a multiple of the group: a partial group at the end of the
     // buffer would wait for space the writer only frees after the full batch.
-    const Split s = split(device, g.table.B * g.pages);
+    //
+    // A core applies the updates to its pages one by one, and a reduction
+    // combines in software (the data movement cores have no FPU): 110 us for
+    // a 2048-wide BF16 row. For a reduction the pages are dealt out to the
+    // cores in turn, so that updates to nearby rows spread over the cores: the
+    // gradient of a token embedding sums text tokens, whose most common ids
+    // are close together, into one row each, and a contiguous range of rows
+    // per core gave one core most of them (238 ms instead of 4 ms for 2048
+    // tokens). An overwrite, a copy, keeps contiguous ranges, which scan only
+    // the indices of their own batches.
+    const Split s = split(device, g.table.B * g.pages, /*interleaved=*/params.reduce != RowsReduce::None);
     // A column window wider than a chunk (a 248320-wide FP32 row into a flat
     // [1, 1, 993280] table, as torch_tpu's view inverse writes logits back)
     // goes in pieces: the writer applies a window chunk by chunk anyway, so its
@@ -277,6 +292,7 @@ ttnn::device_operation::ProgramArtifacts RowsScatterProgramFactory::create_progr
         g.source_entry_bytes = align_entry(g.chunk_bytes + kEntryAlign);
     }
     g.compile_time_args["source_pieces"] = static_cast<uint32_t>(source_pieces);
+    g.compile_time_args["page_stride"] = s.stride;
     constexpr uint32_t kBatchBudget = 512 * 1024;
     uint32_t batch = std::max<uint32_t>(1, kBatchBudget / g.entry_bytes);
     const uint32_t group = std::min(g.group, batch);
