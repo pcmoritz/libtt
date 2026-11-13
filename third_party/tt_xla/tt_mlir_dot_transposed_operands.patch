@@ -38,28 +38,23 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
      // Apply these permutations to lhs and rhs.
  
      Value lhsPermute = permuteOperand(
-@@ -318,10 +348,16 @@
-     // for lhs (batch dims, prod(result dims), prod(contract dims))
-     // for rhs (batch dims, prod(contract dims), prod(result dims))
- 
--    SmallVector<int64_t> lhsMatmulInputShape = computeMatmulInputShape(
--        rewriter, lhsType, lhsBatchDims, lhsResultDims, lhsContractDims);
--    SmallVector<int64_t> rhsMatmulInputShape = computeMatmulInputShape(
--        rewriter, rhsType, rhsBatchDims, rhsContractDims, rhsResultDims);
-+    SmallVector<int64_t> lhsMatmulInputShape =
-+        transposeLhs ? computeMatmulInputShape(rewriter, lhsType, lhsBatchDims,
-+                                               lhsContractDims, lhsResultDims)
-+                     : computeMatmulInputShape(rewriter, lhsType, lhsBatchDims,
-+                                               lhsResultDims, lhsContractDims);
-+    SmallVector<int64_t> rhsMatmulInputShape =
-+        transposeRhs ? computeMatmulInputShape(rewriter, rhsType, rhsBatchDims,
-+                                               rhsResultDims, rhsContractDims)
-+                     : computeMatmulInputShape(rewriter, rhsType, rhsBatchDims,
-+                                               rhsContractDims, rhsResultDims);
+@@ -322,6 +352,15 @@
+         rewriter, lhsType, lhsBatchDims, lhsResultDims, lhsContractDims);
+     SmallVector<int64_t> rhsMatmulInputShape = computeMatmulInputShape(
+         rewriter, rhsType, rhsBatchDims, rhsContractDims, rhsResultDims);
++    // A transposed operand goes in with its last two dims swapped.
++    if (transposeLhs) {
++      std::swap(lhsMatmulInputShape[lhsMatmulInputShape.size() - 2],
++                lhsMatmulInputShape.back());
++    }
++    if (transposeRhs) {
++      std::swap(rhsMatmulInputShape[rhsMatmulInputShape.size() - 2],
++                rhsMatmulInputShape.back());
++    }
  
      // Apply this reshape to lhs and rhs to adapt to matmul op.
      // For lhs: (batch dims, prod(result dims), prod(contract dims))
-@@ -351,8 +387,6 @@
+@@ -351,8 +390,6 @@
      // elementwise multiply to keep full f32 precision. lhsMatmulInput is
      // [..., M, 1] and rhsMatmulInput is [..., 1, N], so they broadcast-multiply
      // to the matmul destination shape [..., M, N].
@@ -68,7 +63,7 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
      Value contractionResult;
      if (contractionSize == 1) {
        contractionResult = rewriter.create<ttir::MultiplyOp>(
-@@ -390,7 +424,7 @@
+@@ -390,7 +427,7 @@
        auto matmul = rewriter.create<ttir::MatmulOp>(
            op.getLoc(),
            RankedTensorType::get(matmulDestinationShape, elementType),
@@ -77,10 +72,10 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
        if (auto attr = op->getAttr("ttcore.fp32_exact")) {
          matmul->setAttr("ttcore.fp32_exact", attr);
        }
-@@ -615,6 +649,19 @@
-   // size-1 second-to-last dim to a whole tile. jax.nn.dot_product_attention's
-   // query, [B, T, N, 1, H] with groups of one head, is permuted as [B, T, N, H]
-   // to [B, N, T, H] instead of to [B, N, T, 1, H], 32 times its size.
+@@ -610,6 +647,19 @@
+     return permuteOp;
+   }
+ 
 +  // Whether the matmul reshape alone reads an operand in the order of
 +  // `permutation`: its permute would only move size-1 dims (permuteOperand).
 +  bool readsInOrder(RankedTensorType inputType,
@@ -94,6 +89,6 @@ diff --git a/lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp 
 +    return llvm::is_sorted(nonUnit);
 +  }
 +
-   Value permuteOperand(PatternRewriter &rewriter, Location loc, Value input,
-                        RankedTensorType inputType,
-                        ArrayRef<int64_t> permutation) const {
+   // An operand in the order the matmul reshape reads, without the permute's
+   // size-1 dims: those do not change the order of elements, but TTNN pads a
+   // size-1 second-to-last dim to a whole tile. jax.nn.dot_product_attention's
