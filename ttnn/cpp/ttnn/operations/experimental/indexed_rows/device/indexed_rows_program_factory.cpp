@@ -158,14 +158,11 @@ Split split(const tt::tt_metal::distributed::MeshDevice& device, uint32_t work, 
     const auto cores = tt::tt_metal::corerange_to_cores(all_cores, num_cores, /*row_wise=*/false);
     uint32_t first = 0;
     for (uint32_t i = 0; i < cores.size(); ++i) {
-        if (interleaved) {
-            const uint32_t count = i < work ? (work - i + num_cores - 1) / num_cores : 0;
-            s.ranges.emplace_back(cores[i], std::make_pair(i, count));
-            continue;
-        }
-        const uint32_t count = core_group_1.contains(cores[i]) ? per_core_1 : per_core_2;
+        const uint32_t count = interleaved ? (work - i + num_cores - 1) / num_cores
+                               : core_group_1.contains(cores[i]) ? per_core_1
+                                                                 : per_core_2;
         s.ranges.emplace_back(cores[i], std::make_pair(first, count));
-        first += count;
+        first += interleaved ? 1 : count;
     }
     return s;
 }
