@@ -70,3 +70,21 @@ def test_transpose_moving_a_size_one_dim_keeps_it_out_of_tiles(tmp_path):
     np.testing.assert_array_equal(np.asarray(merged).astype(np.float32), 2 * xf.reshape(s, n * h))
     irs = _ttnn_irs(tmp_path)
     assert all("x128x1x" not in ir for ir in irs), "a size-1 dim is last but one tile dim"
+
+
+def test_batch_one_heads_still_concatenate(tmp_path):
+    # [B, N, S, H] permuted [0, 2, 1, 3] and reshaped to [B, S, N * H] fuses
+    # into concatenate_heads at O1, which matches the rank-4 permute. With B = 1
+    # the size-1 dim is outside the tiles' last two dims, so the permute is
+    # left as it is.
+    rng = np.random.default_rng(2)
+    n, s, h = 8, 128, 64
+    x = _small_integers(rng, (1, n, s, h))
+    run = jax.jit(
+        lambda x: jnp.transpose(x, (0, 2, 1, 3)).reshape(1, s, n * h),
+        compiler_options={"optimization_level": "O1", "export_path": str(tmp_path)},
+    )
+    got = np.asarray(run(jax.device_put(x, jax.devices("tt")[0])))
+    want = x.astype(np.float32).transpose(0, 2, 1, 3).reshape(1, s, n * h)
+    np.testing.assert_array_equal(got.astype(np.float32), want)
+    assert any('"ttnn.concatenate_heads"' in ir for ir in _ttnn_irs(tmp_path))

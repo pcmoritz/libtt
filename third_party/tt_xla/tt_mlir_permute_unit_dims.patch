@@ -13,7 +13,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 --- a/lib/Dialect/TTIR/IR/TTIROps.cpp
 +++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
-@@ -6552,6 +6552,72 @@
+@@ -6552,6 +6552,79 @@
    return nullptr;
  }
  
@@ -28,7 +28,11 @@ diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 +// which becomes
 +//   reshape 1x2048x16x128 -> 2048x16x128, permute [1, 0, 2],
 +//   reshape 16x2048x128 -> 1x16x2048x128.
-+// A permute next to no reshape is left as it is: its reshapes would not fold.
++// Only a permute with a size-1 dim among the last two of its input or result,
++// which TTNN pads, is rewritten: the TTIR and TTNN fusions match the others by
++// rank and permutation, as concatenate_heads matches [B, N, S, H] permute
++// [0, 2, 1, 3] with B = 1. A permute next to no reshape is left as it is: its
++// reshapes would not fold.
 +void mlir::tt::ttir::PermuteOp::getCanonicalizationPatterns(
 +    mlir::RewritePatternSet &patterns, mlir::MLIRContext *context) {
 +  patterns.add(+[](mlir::tt::ttir::PermuteOp op,
@@ -38,6 +42,12 @@ diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 +      return mlir::failure();
 +    }
 +    auto inputType = mlir::cast<mlir::RankedTensorType>(op.getInput().getType());
++    auto padsTile = [](llvm::ArrayRef<int64_t> shape) {
++      return llvm::is_contained(shape.take_back(2), 1);
++    };
++    if (!padsTile(inputType.getShape()) && !padsTile(op.getType().getShape())) {
++      return mlir::failure();
++    }
 +    int64_t rank = inputType.getRank();
 +    llvm::SmallVector<int64_t> compactShape;
 +    llvm::SmallVector<int64_t> compactIndex(rank, -1);
@@ -46,9 +56,6 @@ diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 +        compactIndex[d] = compactShape.size();
 +        compactShape.push_back(inputType.getDimSize(d));
 +      }
-+    }
-+    if (static_cast<int64_t>(compactShape.size()) == rank) {
-+      return mlir::failure();
 +    }
 +    bool nextToReshape =
 +        op.getInput().getDefiningOp<mlir::tt::ttir::ReshapeOp>() ||
