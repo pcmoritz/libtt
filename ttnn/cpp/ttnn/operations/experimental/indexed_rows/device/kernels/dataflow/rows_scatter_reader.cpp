@@ -21,7 +21,7 @@ void kernel_main() {
 
     const uint32_t first_page = get_arg(args::first_page);
     const uint32_t num_pages = get_arg(args::num_pages);
-    const uint32_t page_stride = get_arg(args::page_stride);
+    constexpr uint32_t page_stride = get_arg(args::page_stride);
 
     DataflowBuffer rows(dfb::rows);
     const auto table = TensorAccessor(tensor::table);
