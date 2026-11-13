@@ -52,13 +52,13 @@ void kernel_main() {
     const uint32_t first_page = get_arg(args::first_page);
     const uint32_t num_pages = get_arg(args::num_pages);
     constexpr uint32_t page_stride = get_arg(args::page_stride);
-    // Whether `page` is this core's, and its position k among them.
-    auto owned = [&](uint32_t page, uint32_t& k) {
+    // The position of `page` among this core's pages, or num_pages when it isn't one of them.
+    auto position = [&](uint32_t page) -> uint32_t {
         if (page < first_page || (page - first_page) % page_stride != 0) {
-            return false;
+            return num_pages;
         }
-        k = (page - first_page) / page_stride;
-        return k < num_pages;
+        const uint32_t k = (page - first_page) / page_stride;
+        return k < num_pages ? k : num_pages;
     };
 
     DataflowBuffer rows(dfb::rows);
@@ -86,13 +86,10 @@ void kernel_main() {
         const uint32_t batch_page_lo = first_page + q0 / C * page_stride;
         const uint32_t batch_page_hi = first_page + ((q0 + count + C - 1) / C - 1) * page_stride + 1;
 
-        // The L1 address of (page, offset) when its chunk is in this batch.
+        // The L1 address of (page, offset) when its chunk is in this batch. Another
+        // core's page is at num_pages, past every batch.
         auto in_batch = [&](uint32_t page, uint32_t offset, uint32_t& l1) {
-            uint32_t k;
-            if (!owned(page, k)) {
-                return false;
-            }
-            const uint32_t q = k * C + offset / chunk_bytes;
+            const uint32_t q = position(page) * C + offset / chunk_bytes;
             if (q < q0 || q >= q0 + count) {
                 return false;
             }
@@ -124,8 +121,7 @@ void kernel_main() {
                         // row components alone before decoding the column.
                         const Coords<KR> rows_only = decode<KR, index_unsigned>(position, index_stride, sizes, windows);
                         const uint32_t row = b * N + window_row<KR>(rows_only, 0, windows, strides);
-                        uint32_t k;
-                        if (rows_only.out_of_bounds || !owned(row, k)) {
+                        if (rows_only.out_of_bounds || position(row) == num_pages) {
                             continue;
                         }
                     }
