@@ -65,9 +65,14 @@ def _device(*arrays):
     return [None if a is None else jax.device_put(a, device) for a in arrays]
 
 
-def test_custom_calls_match_reference():
-    q, k, v, g = _inputs(0)
+@pytest.mark.parametrize("dtype", [ml_dtypes.bfloat16, np.float32], ids=["bf16", "fp32"])
+def test_custom_calls_match_reference(dtype):
+    # The kernels take BF16; the compiler casts FP32 operands to it. (At O1,
+    # the optimizer would need tt-mlir's tt-train op models, which libtt
+    # doesn't build.)
+    q, k, v, g = (x.astype(dtype) for x in _inputs(0))
     out_want, lse_want, dq_want, dk_want, dv_want = _reference(q, k, v, g)
+    options = {"optimization_level": "O0"}
 
     def forward(q, k, v):
         return jax.ffi.ffi_call(
@@ -80,13 +85,22 @@ def test_custom_calls_match_reference():
         return jax.ffi.ffi_call("tt.sdpa_bw", shapes)(g, out, q, k, v, intermediates, mask_type=1)
 
     tq, tk, tv, tg = _device(q, k, v, g)
-    out, intermediates = jax.jit(forward)(tq, tk, tv)
+    out, intermediates = jax.jit(forward, compiler_options=options)(tq, tk, tv)
+    assert out.dtype == dtype
     assert intermediates.shape == (1, HEADS, SEQ, 32) and intermediates.dtype == jnp.float32
     assert _relative_error(out, out_want) < 0.02
     assert _relative_error(np.asarray(intermediates)[..., 0], lse_want) < 2e-3
-    dq, dk, dv = jax.jit(backward)(tg, out, tq, tk, tv, intermediates)
+    dq, dk, dv = jax.jit(backward, compiler_options=options)(tg, out, tq, tk, tv, intermediates)
     for got, want in ((dq, dq_want), (dk, dk_want), (dv, dv_want)):
+        assert got.dtype == dtype
         assert _relative_error(got, want) < 0.03
+
+
+def test_context_parallelism_is_rejected():
+    # TorchTitan's context parallelism gives each rank a slice of the queries
+    # and all of the keys; the kernels take as many queries as keys.
+    with pytest.raises(NotImplementedError, match="context parallelism"):
+        torchtitan_tpu_kernels._make_splash_attention_fn(seq_len=SEQ, n_heads=HEADS, n_kv_heads=2, kv_seq_len=4 * SEQ)
 
 
 def _segment_ids():

@@ -41,7 +41,9 @@ def _attention_mask(seq_len, is_causal, local_window_size, segment_ids):
     return keep.astype(jnp.bfloat16)[None, None]
 
 
-def _make_splash_attention_fn(seq_len, n_heads, n_kv_heads, is_causal=True, local_window_size=None, **_):
+def _make_splash_attention_fn(
+    seq_len, n_heads, n_kv_heads, is_causal=True, local_window_size=None, kv_seq_len=None, **_
+):
     """`_make_splash_attention_fn` of TorchTitan's splash attention, without Pallas.
 
     The caller scales the queries for a scale other than 1 / sqrt(head_dim),
@@ -49,6 +51,13 @@ def _make_splash_attention_fn(seq_len, n_heads, n_kv_heads, is_causal=True, loca
     """
     import jax
     import jax.numpy as jnp
+
+    if kv_seq_len not in (None, seq_len):
+        # Context parallelism: each rank's queries attend to all ranks' keys.
+        raise NotImplementedError(
+            f"splash attention with context parallelism ({seq_len} queries, {kv_seq_len} keys) "
+            "isn't supported on Tenstorrent devices"
+        )
 
     def call(target, outputs, tensors, segment_ids):
         """`target` on the batch with the kernels' own mask, or on each sequence
