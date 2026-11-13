@@ -1,6 +1,7 @@
 """PyTorch's decode attention prologue (SGLang-TorchTPU's Qwen3 and Qwen3.8): the
 fused QKV projection split into heads, the q and k heads normalized and rotated,
-q padded to the width of the KV cache, which holds k and v side by side.
+and k and v side by side as the KV cache holds them. Decode attention takes q as
+it is; prefill attention takes it padded to the cache's width.
 
 Qwen3.8's attention gates its output: each q head is followed by its gate head
 in the projection. Its norms are zero-centered (weight 1 + w, in FP32), and its
@@ -48,16 +49,19 @@ def _norms(qkv, q_weight, k_weight, heads, kv_heads, model):
     return _rms_norm(q, q_weight, zero_centered), _rms_norm(k, k_weight, zero_centered)
 
 
-def _rotations(q, k, v, cos_sin, tokens, heads, kv_heads, model):
-    """The rotated q, padded to the cache's width, and all tokens' k and v side
-    by side, as one paged cache update takes them."""
+def _rotations(q, k, v, cos_sin, tokens, heads, kv_heads, model, pad):
+    """The rotated q, padded to the cache's width if `pad`, and all tokens' k
+    and v side by side, as one paged cache update takes them."""
     head_dim, _, rotary, _ = model
     q = jnp.concatenate(_rotate(q, cos_sin, tokens, heads, rotary), axis=-1)
-    q = jnp.pad(q, ((0, 0), (0, 0), (0, head_dim))).reshape(1, tokens, heads, 2 * head_dim)
+    if pad:
+        q = jnp.pad(q, ((0, 0), (0, 0), (0, head_dim)))
+    q = q.reshape(1, tokens, heads, -1)
     kv = jnp.concatenate([*_rotate(k, cos_sin, tokens, kv_heads, rotary), v], axis=-1)
     return q, kv.reshape(1, tokens, kv_heads, 2 * head_dim)
 
 
+@pytest.mark.parametrize("pad", [False, True], ids=["q", "padded_q"])
 @pytest.mark.parametrize(
     "model,tokens,heads,kv_heads,trace",
     [
@@ -72,9 +76,9 @@ def _rotations(q, k, v, cos_sin, tokens, heads, kv_heads, model):
         (QWEN38, 4, 24, 4, False),
     ],
 )
-def test_torch_qkv_norm_rope_prologue(model, tokens, heads, kv_heads, trace, tmp_path):
+def test_torch_qkv_norm_rope_prologue(model, tokens, heads, kv_heads, trace, pad, tmp_path):
     """The prologue runs as one split_qkv_norm_rope_decode and equals the
-    separate ops (rms_norm, rotary_embedding, pad and concat) bit for bit."""
+    separate ops (rms_norm, rotary_embedding, any pad and concat) bit for bit."""
     head_dim, gated, rotary, _ = model
     options = {"optimization_level": "O0", "enable_trace": str(trace).lower()}
     v_begin = ((2 if gated else 1) * heads + kv_heads) * head_dim
@@ -83,12 +87,12 @@ def test_torch_qkv_norm_rope_prologue(model, tokens, heads, kv_heads, trace, tmp
     def prologue(qkv, q_weight, k_weight, cos_sin):
         q, k = _norms(qkv, q_weight, k_weight, heads, kv_heads, model)
         v = qkv[:, v_begin:].reshape(tokens, kv_heads, head_dim)
-        return _rotations(q, k, v, cos_sin, tokens, heads, kv_heads, model)
+        return _rotations(q, k, v, cos_sin, tokens, heads, kv_heads, model, pad)
 
     fused = jax.jit(prologue, compiler_options={**options, "export_path": str(tmp_path)})
     # Apart: the norms in one program, the rotations in another.
     norms = jax.jit(lambda *a: _norms(*a, heads, kv_heads, model), compiler_options=options)
-    rotations = jax.jit(lambda *a: _rotations(*a, tokens, heads, kv_heads, model), compiler_options=options)
+    rotations = jax.jit(lambda *a: _rotations(*a, tokens, heads, kv_heads, model, pad), compiler_options=options)
     device = jax.devices("tt")[0]
     rng = np.random.default_rng(tokens * 100 + heads)
     for step in range(3):  # With a trace: warmup, capture, and replay with new inputs.

@@ -1,0 +1,15 @@
+diff --git ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/compute/sdpa_flash_decode.cpp ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/compute/sdpa_flash_decode.cpp
+--- ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/compute/sdpa_flash_decode.cpp
++++ ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/compute/sdpa_flash_decode.cpp
+@@ -399,6 +399,11 @@ void kernel_main() {
+             // (and, with it, the fused-mask matmul path in spec mode) when there is no window.
+             bool add_sliding_window_mask_fusion =
+                 sliding_window_size > 0 && k_chunk == window_start_chunk && window_start_unaligned > 0;
++            // The matmul adds one mask. A chunk longer than the window can hold both the window's start and the
++            // current position: it then takes both masks after the matmul instead, as without dynamic chunks.
++            if (add_causal_mask_fusion && add_sliding_window_mask_fusion) {
++                add_causal_mask_fusion = add_sliding_window_mask_fusion = false;
++            }
+             bool add_mask_fusion = add_causal_mask_fusion || use_attention_mask || add_sliding_window_mask_fusion;
+ #else
+                 bool add_mask_fusion = false;
