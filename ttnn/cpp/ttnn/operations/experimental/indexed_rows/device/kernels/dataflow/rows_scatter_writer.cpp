@@ -52,8 +52,9 @@ void kernel_main() {
     const uint32_t first_page = get_arg(args::first_page);
     const uint32_t num_pages = get_arg(args::num_pages);
     constexpr uint32_t page_stride = get_arg(args::page_stride);
-    // The position of `page` among this core's pages, or num_pages when it isn't one of them.
-    auto position = [&](uint32_t page) -> uint32_t {
+    // `page`'s number k among this core's pages (first_page + k * page_stride),
+    // or num_pages when it isn't one of them.
+    auto local_page = [&](uint32_t page) -> uint32_t {
         if (page < first_page || (page - first_page) % page_stride != 0) {
             return num_pages;
         }
@@ -89,7 +90,7 @@ void kernel_main() {
         // The L1 address of (page, offset) when its chunk is in this batch. Another
         // core's page is at num_pages, past every batch.
         auto in_batch = [&](uint32_t page, uint32_t offset, uint32_t& l1) {
-            const uint32_t q = position(page) * C + offset / chunk_bytes;
+            const uint32_t q = local_page(page) * C + offset / chunk_bytes;
             if (q < q0 || q >= q0 + count) {
                 return false;
             }
@@ -121,7 +122,7 @@ void kernel_main() {
                         // row components alone before decoding the column.
                         const Coords<KR> rows_only = decode<KR, index_unsigned>(position, index_stride, sizes, windows);
                         const uint32_t row = b * N + window_row<KR>(rows_only, 0, windows, strides);
-                        if (rows_only.out_of_bounds || position(row) == num_pages) {
+                        if (rows_only.out_of_bounds || local_page(row) == num_pages) {
                             continue;
                         }
                     }
