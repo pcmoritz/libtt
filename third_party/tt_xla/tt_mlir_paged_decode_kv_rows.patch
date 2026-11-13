@@ -1,0 +1,38 @@
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -7900,9 +7900,12 @@
+     return emitOpError("Page table tensor must be a 2D tensor.");
+   }
+ 
+-  // Verify shapes.
+-  if (headSize != keyShape[3]) {
+-    return emitOpError("Query head size must match key/value head size.");
++  // Verify shapes. Key/value rows may hold a token's key and value side by
++  // side, [K | V] at twice the query head size: then keys are the first half
++  // of the key rows and values the second half of the value rows.
++  if (keyShape[3] != headSize && keyShape[3] != 2 * headSize) {
++    return emitOpError("Key/value head size must be the query head size, or "
++                       "twice it for [K | V] rows.");
+   }
+   if (numQueryHeads % numKVHeads != 0) {
+     return emitOpError(
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -7603,9 +7603,12 @@
+     return emitOpError("Page table tensor must be a 2D tensor.");
+   }
+ 
+-  // Verify shapes.
+-  if (headSize != keyShape[3]) {
+-    return emitOpError("Query head size must match key/value head size.");
++  // Verify shapes. Key/value rows may hold a token's key and value side by
++  // side, [K | V] at twice the query head size: then keys are the first half
++  // of the key rows and values the second half of the value rows.
++  if (keyShape[3] != headSize && keyShape[3] != 2 * headSize) {
++    return emitOpError("Key/value head size must be the query head size, or "
++                       "twice it for [K | V] rows.");
+   }
+   if (numQueryHeads % numKVHeads != 0) {
+     return emitOpError(

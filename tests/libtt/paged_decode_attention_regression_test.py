@@ -1,8 +1,10 @@
 """Paged decode attention must match a reference for any split of the KV cache.
 
-The compiler splits each KV head of each user across several cores and reads
-the cache in 64-token chunks, so cover positions inside, at and across chunk
-and page boundaries, more than one user, and grouped query heads.
+The compiler splits each KV head of each user across several cores, and the
+kernel reads the cache in chunks sized to its length (32 to 256 tokens), so
+cover positions inside, at and across chunk and page boundaries, more than one
+user, and grouped query heads. The cache is separate K and V, or one cache of
+[K | V] rows passed as both, as SGLang-TorchTPU's decode reads it.
 """
 
 import jax
@@ -12,7 +14,7 @@ import pytest
 
 HEAD_DIM = 128
 BLOCK = 32
-PAGES_PER_USER = 8
+PAGES_PER_USER = 24
 
 
 def reference(query, k_cache, v_cache, page_table, positions):
@@ -34,13 +36,14 @@ def reference(query, k_cache, v_cache, page_table, positions):
     return out
 
 
+@pytest.mark.parametrize("kv_rows", [False, True], ids=["separate", "kv_rows"])
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize(
     "positions",
-    [[4], [63], [64], [200], [255], [5, 63, 130, 255]],
+    [[4], [63], [64], [200], [255], [600], [5, 63, 130, 255], [40, 700]],
     ids=lambda p: "-".join(map(str, p)),
 )
-def test_paged_decode_attention(positions, trace):
+def test_paged_decode_attention(positions, trace, kv_rows):
     device = jax.devices("tt")[0]
     rng = np.random.default_rng(0)
     users = len(positions)
@@ -73,7 +76,11 @@ def test_paged_decode_attention(positions, trace):
         attend,
         compiler_options={"optimization_level": "O1", "enable_trace": str(trace).lower()},
     )
-    args = [jax.device_put(x, device) for x in (query, k_cache, v_cache, page_table, positions)]
+    if kv_rows:
+        cache = np.concatenate([k_cache, v_cache], axis=-1)
+        args = [jax.device_put(x, device) for x in (query, cache, cache, page_table, positions)]
+    else:
+        args = [jax.device_put(x, device) for x in (query, k_cache, v_cache, page_table, positions)]
     expected = reference(
         np.asarray(query, np.float32),
         np.asarray(k_cache, np.float32),

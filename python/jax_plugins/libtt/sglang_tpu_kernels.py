@@ -14,10 +14,11 @@ and value side by side in one row, which is the layout of TTNN's paged cache
 operations, and the only one the kernel reads. Each token's row is
 written by TTNN's paged cache update, and a batch of no more
 tokens than sequence slots, such as a decode batch, runs TTNN's paged decode
-attention: given the cache as both keys and values and the queries padded with
-zeros, it computes softmax(q k) [k v], whose second half is the output. A
-prefill runs TTNN's chunked paged attention the same way, one sequence per
-user, so it reads only each sequence's pages.
+attention, which reads a cache twice as wide as the queries as [K | V] rows. A
+prefill runs TTNN's chunked paged attention, one sequence per user, so it reads
+only each sequence's pages: given the cache as both keys and values and the
+queries padded with zeros, it computes softmax(q k) [k v], whose second half is
+the output.
 
 Hybrid models' gated DeltaNet kernel runs on libtt's recurrent kernels, with
 the recurrent-state pool in their layout (`sglang_tpu_gdn`). Mixture-of-experts
@@ -294,8 +295,10 @@ def _paged_decode(queries, cache, page_table, positions, sm_scale, sliding_windo
     import numpy as np
 
     tokens, q_heads, head_dim = queries.shape
+    # The cache's rows are [K | V], each cache_head_dim wide: TTNN reads them as keys and values for queries that
+    # wide.
     cache_head_dim = cache.shape[-1] // 2
-    q = jnp.pad(queries, ((0, 0), (0, 0), (0, 2 * cache_head_dim - head_dim))).astype(cache.dtype)
+    q = jnp.pad(queries, ((0, 0), (0, 0), (0, cache_head_dim - head_dim))).astype(cache.dtype)
     window = {} if sliding_window is None else {"sliding_window_size": np.int32(sliding_window)}
     outputs = []
     for start in range(0, tokens, MAX_DECODE_USERS):
@@ -318,7 +321,7 @@ def _paged_decode(queries, cache, page_table, positions, sm_scale, sliding_windo
                 **window,
             )
         )
-    return jnp.concatenate(outputs, axis=1)[0, :, :, cache_head_dim : cache_head_dim + head_dim]
+    return jnp.concatenate(outputs, axis=1)[0, :, :, :head_dim]
 
 
 def patch_rpa_v3(module):

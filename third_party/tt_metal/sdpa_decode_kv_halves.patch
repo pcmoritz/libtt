@@ -1,0 +1,169 @@
+diff --git ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp
+--- ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp
++++ ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp
+@@ -662,6 +662,7 @@ template <
+     bool is_page_table_sharded,
+     bool use_mcast,
+     uint32_t capacity_t,
++    uint32_t k_row_t,
+     typename KReaderType>
+ uint32_t read_k(
+     uint32_t k_chunk_tiles,
+@@ -690,13 +691,13 @@ uint32_t read_k(
+                                                   uint16_t,
+                                                   num_kv_heads,
+                                                   block_size_t,
+-                                                  DHt,
++                                                  k_row_t,
+                                                   capacity_t>(virtual_k_tile_row_num, cur_head, page_table_ptr_u16)
+                                             : virtual_seq_tile_id_to_physical_tile_id<
+                                                   uint32_t,
+                                                   num_kv_heads,
+                                                   block_size_t,
+-                                                  DHt,
++                                                  k_row_t,
+                                                   capacity_t>(virtual_k_tile_row_num, cur_head, page_table_ptr_u32);
+                 for (uint32_t col = 0; col < DHt; ++col) {
+                     noc.async_read(
+@@ -757,9 +758,9 @@ uint32_t read_k(
+             uint32_t virtual_k_tile_row_num = k_chunk_start_row_num + row;
+             uint32_t physical_k_tile_id =
+                 (is_page_table_sharded)
+-                    ? virtual_seq_tile_id_to_physical_tile_id<uint16_t, num_kv_heads, block_size_t, DHt, capacity_t>(
++                    ? virtual_seq_tile_id_to_physical_tile_id<uint16_t, num_kv_heads, block_size_t, k_row_t, capacity_t>(
+                           virtual_k_tile_row_num, cur_head, page_table_ptr_u16)
+-                    : virtual_seq_tile_id_to_physical_tile_id<uint32_t, num_kv_heads, block_size_t, DHt, capacity_t>(
++                    : virtual_seq_tile_id_to_physical_tile_id<uint32_t, num_kv_heads, block_size_t, k_row_t, capacity_t>(
+                           virtual_k_tile_row_num, cur_head, page_table_ptr_u32);
+             for (uint32_t col = 0; col < DHt; ++col) {
+                 noc.async_read(
+@@ -793,6 +794,8 @@ template <
+     bool is_page_table_sharded,
+     bool reuse_k,
+     uint32_t capacity_t,
++    uint32_t v_row_t,
++    uint32_t v_col_t,
+     typename VReaderType>
+ void read_v(
+     uint32_t v_chunk_tiles,
+@@ -836,13 +839,14 @@ void read_v(
+         barrier_count = 0;
+         for (uint32_t row = 0; row < Sk_chunk_t_dynamic; ++row) {
+             uint32_t virtual_v_tile_row_num = k_chunk_start_row_num + row;
+-            // Use vDHt for V tensor's width since V is independent
++            // V's rows are v_row_t tiles wide (vDHt, or twice that when they hold K first), V from tile v_col_t
+             uint32_t physical_v_tile_id =
+-                (is_page_table_sharded)
+-                    ? virtual_seq_tile_id_to_physical_tile_id<uint16_t, num_kv_heads, block_size_t, vDHt, capacity_t>(
+-                          virtual_v_tile_row_num, cur_head, page_table_ptr_u16)
+-                    : virtual_seq_tile_id_to_physical_tile_id<uint32_t, num_kv_heads, block_size_t, vDHt, capacity_t>(
+-                          virtual_v_tile_row_num, cur_head, page_table_ptr_u32);
++                ((is_page_table_sharded)
++                     ? virtual_seq_tile_id_to_physical_tile_id<uint16_t, num_kv_heads, block_size_t, v_row_t, capacity_t>(
++                           virtual_v_tile_row_num, cur_head, page_table_ptr_u16)
++                     : virtual_seq_tile_id_to_physical_tile_id<uint32_t, num_kv_heads, block_size_t, v_row_t, capacity_t>(
++                           virtual_v_tile_row_num, cur_head, page_table_ptr_u32)) +
++                v_col_t;
+             for (uint32_t col = 0; col < vDHt; ++col) {
+                 noc.async_read(
+                     v_reader, CoreLocalMem<uint32_t>(v_write_ptr), v_tile_bytes, {.page_id = physical_v_tile_id}, {});
+diff --git ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/reader_decode_all.cpp ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/reader_decode_all.cpp
+--- ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/reader_decode_all.cpp
++++ ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/reader_decode_all.cpp
+@@ -65,8 +65,13 @@ void kernel_main() {
+     // i.e. cur_pos[cur_batch*Tg + Tg-1], rather than by cur_pos[cur_batch]. 0 = off.
+     constexpr uint32_t spec_multi_pos_T = get_compile_time_arg_val(35);
+     constexpr bool spec_multi_pos = spec_multi_pos_T > 0;
++    // Paged K and V row widths in tiles, and V's first tile in its rows: DHt, vDHt and 0, or a cache of [K | V]
++    // rows read as both K and V (2 DHt, 2 DHt and DHt).
++    constexpr uint32_t k_row_t = get_compile_time_arg_val(36);
++    constexpr uint32_t v_row_t = get_compile_time_arg_val(37);
++    constexpr uint32_t v_col_t = get_compile_time_arg_val(38);
+ 
+-    constexpr auto q_args = TensorAccessorArgs<36>();
++    constexpr auto q_args = TensorAccessorArgs<39>();
+     constexpr auto k_args = TensorAccessorArgs<q_args.next_compile_time_args_offset()>();
+     constexpr auto v_args = TensorAccessorArgs<k_args.next_compile_time_args_offset()>();
+     constexpr auto mask_args = TensorAccessorArgs<v_args.next_compile_time_args_offset()>();
+@@ -324,7 +329,8 @@ void kernel_main() {
+                     barrier_threshold,
+                     is_page_table_sharded,
+                     use_k_mcast,
+-                    capacity_t>(
++                    capacity_t,
++                    k_row_t>(
+                     k_chunk_tiles,
+                     cur_head,
+                     Sk_chunk_t_dynamic,
+@@ -349,7 +355,9 @@ void kernel_main() {
+                     barrier_threshold,
+                     is_page_table_sharded,
+                     reuse_k,
+-                    capacity_t>(
++                    capacity_t,
++                    v_row_t,
++                    v_col_t>(
+                     v_chunk_tiles,
+                     cur_head,
+                     Sk_chunk_t_dynamic,
+diff --git ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_device_operation.cpp
+@@ -449,7 +449,14 @@ void SdpaDecodeDeviceOperation::validate_on_program_cache_miss(
+                 q_head_dim,
+                 tt::constants::TILE_WIDTH);
+         } else {
+-            TT_FATAL(k_shape[3] == v_shape[3] && k_shape[3] == q_shape[3], "Q, K, V must have same hidden size");
++            // K and V as wide as Q, or a cache of [K | V] rows twice as wide: a token's key, then its value. Then K
++            // is the first half of k's rows and V the second half of v's (k and v may be one tensor).
++            TT_FATAL(
++                k_shape[3] == v_shape[3] && (k_shape[3] == q_shape[3] || k_shape[3] == 2 * q_shape[3]),
++                "K and V must have Q's hidden size, or twice it for [K | V] rows, got Q {}, K {} and V {}",
++                q_shape[3],
++                k_shape[3],
++                v_shape[3]);
+         }
+         // Validate chunk size for paged version
+         // k_chunk_size can also be zero; if k_chunk_size = 0, figure it out in kernels
+diff --git ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_program_factory.cpp ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_program_factory.cpp
+--- ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_program_factory.cpp
++++ ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_program_factory.cpp
+@@ -99,11 +99,15 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
+     // use_mla is true (same asymmetry fix as chunked prefill).
+     const auto& geo = operation_attributes.paged_cache_geometry;
+     const bool apply_geometry_override = !use_mla && geo.active();
++    // Paged K and V twice as wide as Q are a cache of [K | V] rows (see validate): K is the first half of k's
++    // rows, V the second half of v's.
++    const bool kv_halves =
++        page_table_tensor.has_value() && !use_mla && !apply_geometry_override && k_shape[3] == 2 * q_shape[3];
+     uint32_t B = q_shape[1];
+     uint32_t PNH = q_shape[2];
+     uint32_t S = k_shape[2];
+-    uint32_t DH = apply_geometry_override ? q_shape[3] : k_shape[3];
+-    uint32_t vDH = use_mla ? head_dim_v : (apply_geometry_override ? q_shape[3] : v_shape[3]);
++    uint32_t DH = apply_geometry_override || kv_halves ? q_shape[3] : k_shape[3];
++    uint32_t vDH = use_mla ? head_dim_v : (apply_geometry_override || kv_halves ? q_shape[3] : v_shape[3]);
+     uint32_t Bkv = k_shape[0];
+     const uint32_t Bmask = attn_mask.has_value() ? attn_mask->padded_shape()[0] : Bkv;
+     // num_kv_heads from the cache view by default, or from the explicit override
+@@ -169,6 +173,10 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
+     const uint32_t vDHt = vDH / TILE_WIDTH;
+     const uint32_t PNHt = PNH / q_heads_parallel_factor / TILE_HEIGHT;
+     const uint32_t Sk_chunk_t = k_chunk_size / TILE_HEIGHT;
++    // The reader's paged K and V row widths in tiles and V's first tile in its rows.
++    const uint32_t k_row_t = kv_halves ? 2 * DHt : DHt;
++    const uint32_t v_row_t = kv_halves ? 2 * vDHt : vDHt;
++    const uint32_t v_col_t = kv_halves ? DHt : 0;
+ 
+     // ========== Grid & Core Configuration ==========
+     CoreCoord grid_size = program_config.has_value() ? program_config->compute_with_storage_grid_size
+@@ -818,6 +826,9 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
+         Bmask,
+         capacity_t,
+         spec_multi_pos_tiles,
++        k_row_t,
++        v_row_t,
++        v_col_t,
+     };
+     tt_metal::TensorAccessorArgs(input_tensor_q.buffer()).append_to(reader_compile_time_args_common);
+     tt_metal::TensorAccessorArgs(input_tensor_k.buffer()).append_to(reader_compile_time_args_common);
