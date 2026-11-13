@@ -13,17 +13,18 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 --- a/lib/Dialect/TTIR/IR/TTIROps.cpp
 +++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
-@@ -9181,6 +9181,46 @@
+@@ -9188,6 +9188,53 @@
                                     multiply, multiply);
  }
-
+ 
 +// MultiplyOp canonicalization
 +//
 +// A square doesn't need the absolute value: abs(x) * abs(x) is x * x, also
 +// through a cast from a float type to a float type, which rounds x and -x
 +// alike. Not through a cast to an integer type, which can clamp: -3.0 cast to
-+// an unsigned type is 0. torch's vector norm squares abs(x), so gradient
-+// clipping took a pass over every gradient for the abs alone.
++// an unsigned type is 0. Nor through a cast with other users, which keep it:
++// the cast of x would be one more pass. torch's vector norm squares abs(x),
++// so gradient clipping took a pass over every gradient for the abs alone.
 +void mlir::tt::ttir::MultiplyOp::getCanonicalizationPatterns(
 +    mlir::RewritePatternSet &patterns, mlir::MLIRContext *context) {
 +  patterns.add(+[](mlir::tt::ttir::MultiplyOp op,
@@ -38,6 +39,12 @@ diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
 +    };
 +    if (typecast &&
 +        !(isFloat(typecast.getInput()) && isFloat(typecast.getResult()))) {
++      return mlir::failure();
++    }
++    if (typecast && !llvm::all_of(typecast->getUsers(),
++                                  [&](mlir::Operation *user) {
++                                    return user == op.getOperation();
++                                  })) {
 +      return mlir::failure();
 +    }
 +    mlir::Value absolute = typecast ? typecast.getInput() : op.getLhs();

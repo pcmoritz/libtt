@@ -44,3 +44,22 @@ def test_square_of_absolute_value_cast_to_unsigned():
     got = jax.jit(square)(jax.device_put(x, jax.devices("tt")[0]))
     want = np.abs(x).astype(np.uint32) ** 2
     np.testing.assert_array_equal(np.asarray(got), want)
+
+
+def test_shared_cast_of_absolute_value_stays(tmp_path):
+    # A cast of abs(x) with other users stays for them: casting x as well for
+    # the square would be one more pass over the tensor.
+    rng = np.random.default_rng(1)
+    x = rng.integers(-8, 9, (256, 512)).astype(ml_dtypes.bfloat16)
+
+    def square_and_scale(x):
+        a = jnp.abs(x).astype(jnp.float32)
+        return a * a, a * 3
+
+    run = jax.jit(square_and_scale, compiler_options={"export_path": str(tmp_path)})
+    squares, scaled = run(jax.device_put(x, jax.devices("tt")[0]))
+    xf = x.astype(np.float32)
+    np.testing.assert_array_equal(np.asarray(squares), xf * xf)
+    np.testing.assert_array_equal(np.asarray(scaled), np.abs(xf) * 3)
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert irs and sum(ir.count('"ttnn.typecast"') for ir in irs) == 1
