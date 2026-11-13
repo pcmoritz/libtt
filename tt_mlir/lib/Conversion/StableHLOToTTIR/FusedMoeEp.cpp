@@ -4,7 +4,8 @@
 // tt.fused_moe_ep: a mixture-of-experts layer's experts on one device of an
 // expert-parallel mesh, over TTNN's fused MoE kernel (ttir.moe_compute).
 //
-//   out = tt.fused_moe_ep(x, topk_weights, topk_ids, w1, w3, w2[, s1, s3, s2])
+//   out = tt.fused_moe_ep(x, topk_weights, topk_ids, w1, w3, w2[, s1, s3, s2]
+//                         [, b1, b3, b2])
 //
 // Called per device (inside a shard_map) with
 //   x            [T, H]          the tokens,
@@ -15,8 +16,11 @@
 //   w2           [E_local, I, H] and down projections,
 // where the experts are split evenly over every device of the mesh in device
 // order, so device d holds experts d * E_local to (d + 1) * E_local - 1.
-// Returns each token's routing-weighted sum of the SiLU-gated experts this
-// device holds, [T, H] in x's type; the layer is the sum over devices.
+// Returns each token's routing-weighted sum of the gated experts this device
+// holds, [T, H] in x's type; the layer is the sum over devices. The gate is
+// SiLU, silu(x w1) * (x w3), or with activation = "swigluoai" GPT-OSS's
+// clamped one: with g = min(x w1, 7) and u = clamp(x w3, -7, 7),
+// g * sigmoid(1.702 g) * (u + 1).
 //
 // The kernel stores the experts in BFP4, or in BF16 as they are with the
 // weight_dtype = "bf16" attribute, takes up to 512 tokens per call, runs only
@@ -27,6 +31,12 @@
 // scale per expert and output column, which it applies:
 //   s1, s3       [E_local, I] f32 the gate and up projections' scales,
 //   s2           [E_local, H] f32 and the down projections'.
+//
+// The experts may come with biases, which the kernel adds to the projections'
+// outputs (float8 experts' with their scales):
+//   b1, b3       [E_local, I] the gate and up projections' biases,
+//   b2           [E_local, H] and the down projections'.
+//
 // This lowering chunks the tokens, builds
 // the expert-to-device mapping, and sums each token's slots with its weights in
 // one matmul accumulated in FP32; the kernel reads the ids as they are and
@@ -50,12 +60,16 @@ namespace mlir::tt {
 namespace {
 
 constexpr int64_t kMaxTokensPerCall = 512;
-// Matmul rings that run a device's experts side by side. BF16 experts stream
-// through one ring: a whole expert slice per ring core, which the rings replay
-// for every chunk, doesn't fit a core's L1 at two bytes per weight. At FP8's
-// one byte it does: 0.66 MB of the 0.79 MB at Qwen3-30B-A3B's shapes.
+// Matmul rings that run a device's experts side by side, replaying a whole
+// expert slice per ring core for every chunk, which must fit half a core's L1.
+// Experts stream through one ring when it doesn't: BF16 experts, at two bytes
+// per weight, and FP8 ones larger than about 640 KiB per ring core (8 cores):
+// Qwen3-30B-A3B's (2048 x 768, 0.66 MB stored) fit, GPT-OSS's (2880 x 2880,
+// about 3 MB) don't.
 constexpr uint32_t kRings = 3;
-constexpr uint32_t kBf16Rings = 0;
+constexpr uint32_t kStreamingRings = 0;
+constexpr int64_t kRingCores = 8;
+constexpr int64_t kReplaySliceBytes = 640 * 1024;
 
 class FusedMoeEpConversionPattern
     : public OpConversionPattern<stablehlo::CustomCallOp> {
@@ -83,14 +97,21 @@ public:
       return rewriter.notifyMatchFailure(
           op, "tt.fused_moe_ep's weight_dtype is bfp4 or bf16");
     }
+    StringAttr activationName =
+        config ? config.getAs<StringAttr>("activation") : nullptr;
+    if (activationName && activationName.getValue() != "silu" &&
+        activationName.getValue() != "swigluoai") {
+      return rewriter.notifyMatchFailure(
+          op, "tt.fused_moe_ep's activation is silu or swigluoai");
+    }
+    const bool swiglu =
+        activationName && activationName.getValue() == "swigluoai";
 
-    if ((adaptor.getOperands().size() != 6 &&
-         adaptor.getOperands().size() != 9) ||
-        op->getNumResults() != 1) {
+    if (adaptor.getOperands().size() < 6 || op->getNumResults() != 1) {
       return rewriter.notifyMatchFailure(
           op, "tt.fused_moe_ep takes x, topk_weights, topk_ids, w1, w3 and "
-              "w2 (and s1, s3 and s2 with float8 experts) and returns one "
-              "tensor");
+              "w2 (and s1, s3 and s2 with float8 experts, then b1, b3 and b2 "
+              "with biases) and returns one tensor");
     }
     Value x = adaptor.getOperands()[0];
     Value weights = adaptor.getOperands()[1];
@@ -121,10 +142,32 @@ public:
           op, "tt.fused_moe_ep expects x [T, H], topk_weights and topk_ids "
               "[T, k], w1 and w3 [E_local, H, I] and w2 [E_local, I, H]");
     }
-    if (fp8Weights != (adaptor.getOperands().size() == 9)) {
+    // The scales follow the experts, and the biases follow both.
+    const size_t biasOperands = fp8Weights ? 9 : 6;
+    const bool biases = adaptor.getOperands().size() == biasOperands + 3;
+    if (adaptor.getOperands().size() != biasOperands && !biases) {
       return rewriter.notifyMatchFailure(
           op, "tt.fused_moe_ep takes scales s1, s3 and s2 with float8_e4m3fn "
-              "experts and only with them");
+              "experts and only with them, then optionally biases b1, b3 and "
+              "b2");
+    }
+    if (biases) {
+      auto isBias = [&](Value value, int64_t columns) {
+        auto type = cast<RankedTensorType>(value.getType());
+        return (type.getElementType().isBF16() ||
+                type.getElementType().isF32()) &&
+               type.getShape() ==
+                   ArrayRef<int64_t>{w1Type.getDimSize(0), columns};
+      };
+      if (!isBias(adaptor.getOperands()[biasOperands], w1Type.getDimSize(2)) ||
+          !isBias(adaptor.getOperands()[biasOperands + 1],
+                  w1Type.getDimSize(2)) ||
+          !isBias(adaptor.getOperands()[biasOperands + 2],
+                  xType.getDimSize(1))) {
+        return rewriter.notifyMatchFailure(
+            op, "tt.fused_moe_ep expects bf16 or f32 biases b1 and b3 "
+                "[E_local, I] and b2 [E_local, H]");
+      }
     }
     if (fp8Weights) {
       auto isScale = [&](Value value, int64_t columns) {
@@ -166,6 +209,9 @@ public:
                                 std::multiplies<>());
     }
     const int64_t experts = localExperts * devices;
+    // An FP8 expert's three projections are 3 * hidden * intermediate bytes.
+    const bool replay = fp8Weights && 3 * hidden * intermediate / kRingCores <=
+                                          kReplaySliceBytes;
 
     Type bf16 = rewriter.getBF16Type();
     Type placementType = rewriter.getF32Type();
@@ -223,6 +269,15 @@ public:
     Value scale1 = withLayer(fp8Weights ? adaptor.getOperands()[6] : Value());
     Value scale3 = withLayer(fp8Weights ? adaptor.getOperands()[7] : Value());
     Value scale2 = withLayer(fp8Weights ? adaptor.getOperands()[8] : Value());
+    // The kernel takes BF16 experts' biases in BF16 and float8 experts', which
+    // go with their FP32 scales, in FP32.
+    auto bias = [&](size_t i) {
+      return withLayer(
+          biases ? castTo(adaptor.getOperands()[biasOperands + i],
+                          fp8Weights ? Type(rewriter.getF32Type()) : bf16)
+                 : Value());
+    };
+    Value bias1 = bias(0), bias3 = bias(1), bias2 = bias(2);
 
     // Every device's row of the mapping gives each expert's device.
     SmallVector<APInt> owners;
@@ -236,7 +291,8 @@ public:
         loc, mappingType, DenseElementsAttr::get(mappingType, owners));
 
     auto activation = ttcore::MoEActivationFunctionAttr::get(
-        ctx, ttcore::MoEActivationFunction::Silu);
+        ctx, swiglu ? ttcore::MoEActivationFunction::SwiGLU
+                    : ttcore::MoEActivationFunction::Silu);
     // An [m, n] 0/1 matrix, 1 where row r equals column c's index index(c):
     // only the row and column indices are constants, and the comparison runs
     // once, when the program loads.
@@ -266,13 +322,12 @@ public:
           loc, typed(x, {k * t, hidden}, bf16),
           reshape(rows(x, begin, end), {1, t, hidden}), rows(ids, begin, end),
           chunkWeights, mapping, kernelW1, kernelW3, kernelW2,
-          /*bias_0=*/Value(), /*bias_1=*/Value(),
-          /*bias_2=*/Value(), scale1, scale3, scale2,
+          bias1, bias3, bias2, scale1, scale3, scale2,
           rewriter.getUI32IntegerAttr(0),
           rewriter.getUI32IntegerAttr(4),
           rewriter.getUI32IntegerAttr(intermediate), activation,
           /*cluster_axis=*/IntegerAttr(),
-          rewriter.getUI32IntegerAttr(bf16Weights ? kBf16Rings : kRings),
+          rewriter.getUI32IntegerAttr(replay ? kRings : kStreamingRings),
           fp8Weights
               ? ttcore::DataTypeAttr::get(ctx, ttcore::DataType::Float8E4M3FN)
           : bf16Weights

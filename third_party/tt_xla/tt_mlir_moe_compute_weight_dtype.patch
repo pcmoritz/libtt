@@ -381,7 +381,7 @@ diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/
 diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
 --- a/lib/OpModel/TTNN/TTNNOpModel.cpp
 +++ b/lib/OpModel/TTNN/TTNNOpModel.cpp
-@@ -1100,49 +1100,70 @@ getPrepareConv2dBiasOpOutputTensorSpec(
+@@ -1100,49 +1100,72 @@ getPrepareConv2dBiasOpOutputTensorSpec(
  // PrepareMoEComputeW0W1WeightsOp / PrepareMoEComputeW2WeightsOp
  //===----------------------------------------------------------------------===//
  
@@ -416,18 +416,21 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
    uint32_t L = w0.logical_shape()[0];
    uint32_t E = w0.logical_shape()[1];
    bool hasBias = b0.has_value();
-+  // Float8 experts come with their column scales (see the runtime op).
++  // Float8 experts come with their column scales (see the runtime op), which
++  // also hold their biases.
 +  bool columnScales = s0.has_value();
    ::ttnn::Tensor packed =
-       hasBias ? ::ttnn::experimental::prepare_w0_w1_tensor_with_bias(
-                     w0, w1, *b0, *b1, L, E, hiddenSize, intermediateSize)
+-      hasBias ? ::ttnn::experimental::prepare_w0_w1_tensor_with_bias(
+-                    w0, w1, *b0, *b1, L, E, hiddenSize, intermediateSize)
 -              : ::ttnn::experimental::prepare_w0_w1_tensor_for_moe_compute(
 -                    w0, w1, L, E, hiddenSize, intermediateSize);
-+      : columnScales
++      columnScales
 +          ? ::ttnn::experimental::prepare_w0_w1_tensor_with_column_scales(
-+                w0, w1, *s0, *s1, L, E, hiddenSize, intermediateSize)
-+          : ::ttnn::experimental::prepare_w0_w1_tensor_for_moe_compute(
-+                w0, w1, L, E, hiddenSize, intermediateSize);
++                w0, w1, *s0, *s1, L, E, hiddenSize, intermediateSize, b0, b1)
++      : hasBias ? ::ttnn::experimental::prepare_w0_w1_tensor_with_bias(
++                      w0, w1, *b0, *b1, L, E, hiddenSize, intermediateSize)
++                : ::ttnn::experimental::prepare_w0_w1_tensor_for_moe_compute(
++                      w0, w1, L, E, hiddenSize, intermediateSize);
    return ::ttnn::experimental::quantize_weights_via_host(
 -      packed, ::tt::tt_metal::DataType::BFLOAT4_B,
 -      ::ttnn::experimental::get_weight_mem_configs(device, L, E, hiddenSize,
@@ -448,18 +451,21 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
    uint32_t L = w2.logical_shape()[0];
    uint32_t E = w2.logical_shape()[1];
    bool hasBias = b2.has_value();
-+  // Float8 experts come with their column scales (see the runtime op).
++  // Float8 experts come with their column scales (see the runtime op), which
++  // also hold their biases.
 +  bool columnScales = s2.has_value();
    ::ttnn::Tensor packed =
-       hasBias ? ::ttnn::experimental::prepare_w2_tensor_with_bias(
-                     w2, *b2, L, E, intermediateSize, hiddenSize)
+-      hasBias ? ::ttnn::experimental::prepare_w2_tensor_with_bias(
+-                    w2, *b2, L, E, intermediateSize, hiddenSize)
 -              : ::ttnn::experimental::prepare_w2_tensor_for_moe_compute(
 -                    w2, L, E, intermediateSize, hiddenSize);
-+      : columnScales
++      columnScales
 +          ? ::ttnn::experimental::prepare_w2_tensor_with_column_scales(
-+                w2, *s2, L, E, intermediateSize, hiddenSize)
-+          : ::ttnn::experimental::prepare_w2_tensor_for_moe_compute(
-+                w2, L, E, intermediateSize, hiddenSize);
++                w2, *s2, L, E, intermediateSize, hiddenSize, b2)
++      : hasBias ? ::ttnn::experimental::prepare_w2_tensor_with_bias(
++                      w2, *b2, L, E, intermediateSize, hiddenSize)
++                : ::ttnn::experimental::prepare_w2_tensor_for_moe_compute(
++                      w2, L, E, intermediateSize, hiddenSize);
    return ::ttnn::experimental::quantize_weights_via_host(
 -      packed, ::tt::tt_metal::DataType::BFLOAT4_B,
 -      ::ttnn::experimental::get_weight_mem_configs(device, L, E, hiddenSize,
@@ -470,7 +476,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
            .w2);
  }
  
-@@ -1153,8 +1174,12 @@ static auto makePrepareMoEComputeW0W1WeightsQuery(
+@@ -1153,8 +1176,12 @@ static auto makePrepareMoEComputeW0W1Wei
      std::optional<llvm::ArrayRef<int64_t>> bias0Shape,
      std::optional<TTNNLayoutAttr> bias0Layout,
      std::optional<llvm::ArrayRef<int64_t>> bias1Shape,
@@ -485,7 +491,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
    ::tt::tt_metal::distributed::MeshDevice *device =
        SingletonDeviceContext::getInstance().getDevice();
  
-@@ -1171,9 +1196,15 @@ static auto makePrepareMoEComputeW0W1WeightsQuery(
+@@ -1171,9 +1198,15 @@ static auto makePrepareMoEComputeW0W1Wei
      if (bias1Shape && bias1Layout) {
        b1Spec = conversion::getTensorSpec(*bias1Shape, *bias1Layout);
      }
@@ -502,7 +508,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
    };
  }
  
-@@ -1184,11 +1215,16 @@ getPrepareMoEComputeW0W1WeightsOpOutputTensorSpec(
+@@ -1184,11 +1217,16 @@ getPrepareMoEComputeW0W1WeightsOpOutputT
      std::optional<llvm::ArrayRef<int64_t>> bias0Shape,
      std::optional<TTNNLayoutAttr> bias0Layout,
      std::optional<llvm::ArrayRef<int64_t>> bias1Shape,
@@ -522,7 +528,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
    auto output = operation::executeConstraintQuery(query);
    if (!output) {
      return output.takeError();
-@@ -1201,8 +1237,10 @@ getPrepareMoEComputeW0W1WeightsOpOutputTensorSpec(
+@@ -1201,8 +1239,10 @@ getPrepareMoEComputeW0W1WeightsOpOutputT
  static auto makePrepareMoEComputeW2WeightsQuery(
      llvm::ArrayRef<int64_t> w2Shape, TTNNLayoutAttr w2Layout,
      std::optional<llvm::ArrayRef<int64_t>> bias2Shape,
@@ -535,7 +541,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
    ::tt::tt_metal::distributed::MeshDevice *device =
        SingletonDeviceContext::getInstance().getDevice();
  
-@@ -1213,9 +1251,13 @@ static auto makePrepareMoEComputeW2WeightsQuery(
+@@ -1213,9 +1253,13 @@ static auto makePrepareMoEComputeW2Weigh
      if (bias2Shape && bias2Layout) {
        b2Spec = conversion::getTensorSpec(*bias2Shape, *bias2Layout);
      }
@@ -551,7 +557,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
    };
  }
  
-@@ -1223,10 +1265,13 @@ llvm::Expected<::tt::tt_metal::TensorSpec>
+@@ -1223,10 +1267,13 @@ llvm::Expected<::tt::tt_metal::TensorSpe
  getPrepareMoEComputeW2WeightsOpOutputTensorSpec(
      llvm::ArrayRef<int64_t> w2Shape, TTNNLayoutAttr w2Layout,
      std::optional<llvm::ArrayRef<int64_t>> bias2Shape,
@@ -568,7 +574,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
    auto output = operation::executeConstraintQuery(query);
    if (!output) {
      return output.takeError();
-@@ -1276,8 +1321,13 @@ OpModel<PrepareMoEComputeW0W1WeightsOp>::getOpConstraints(
+@@ -1276,8 +1323,13 @@ OpModel<PrepareMoEComputeW0W1WeightsOp>:
      std::optional<llvm::ArrayRef<int64_t>> bias0Shape,
      std::optional<TTNNLayoutAttr> bias0Layout,
      std::optional<llvm::ArrayRef<int64_t>> bias1Shape,
@@ -584,7 +590,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
  #ifdef TTMLIR_ENABLE_OPMODEL
    ::tt::tt_metal::distributed::MeshDevice *device =
        SingletonDeviceContext::getInstance().getDevice();
-@@ -1299,9 +1349,15 @@ OpModel<PrepareMoEComputeW0W1WeightsOp>::getOpConstraints(
+@@ -1299,9 +1351,15 @@ OpModel<PrepareMoEComputeW0W1WeightsOp>:
      if (bias1Shape && bias1Layout) {
        b1Spec = conversion::getTensorSpec(*bias1Shape, *bias1Layout);
      }
@@ -601,7 +607,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
    };
    return operation::getOpConstraintsWithState(w0Layout.getContext(), query);
  #else
-@@ -1313,8 +1369,11 @@ llvm::Expected<OpConstraints>
+@@ -1313,8 +1371,11 @@ llvm::Expected<OpConstraints>
  OpModel<PrepareMoEComputeW2WeightsOp>::getOpConstraints(
      llvm::ArrayRef<int64_t> w2Shape, TTNNLayoutAttr w2Layout,
      std::optional<llvm::ArrayRef<int64_t>> bias2Shape,
@@ -615,7 +621,7 @@ diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
  #ifdef TTMLIR_ENABLE_OPMODEL
    ::tt::tt_metal::distributed::MeshDevice *device =
        SingletonDeviceContext::getInstance().getDevice();
-@@ -1330,9 +1389,13 @@ OpModel<PrepareMoEComputeW2WeightsOp>::getOpConstraints(
+@@ -1330,9 +1391,13 @@ OpModel<PrepareMoEComputeW2WeightsOp>::g
      if (bias2Shape && bias2Layout) {
        b2Spec = conversion::getTensorSpec(*bias2Shape, *bias2Layout);
      }
@@ -810,7 +816,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w0_w1_weights.c
  #include "ttnn/operations/copy/typecast/typecast.hpp"
  #include "ttnn/operations/core/core.hpp"
  #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.hpp"
-@@ -24,6 +25,13 @@ void run(const ::tt::target::ttnn::PrepareMoEComputeW0W1WeightsOp *op,
+@@ -24,6 +25,13 @@ void run(const ::tt::target::ttnn::Prepa
    if (op->bias_1() != nullptr) {
      bias1 = tensorPool.getTTNNTensorAndValidate(op->bias_1());
    }
@@ -824,7 +830,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w0_w1_weights.c
  
    ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();
  
-@@ -33,20 +41,30 @@ void run(const ::tt::target::ttnn::PrepareMoEComputeW0W1WeightsOp *op,
+@@ -33,20 +41,32 @@ void run(const ::tt::target::ttnn::Prepa
    uint32_t E = w0.logical_shape()[1];
    bool hasBias = bias0.has_value();
  
@@ -836,15 +842,20 @@ diff --git a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w0_w1_weights.c
 +                  : ::ttnn::DataType::BFLOAT4_B;
 +  bool columnScales = scale0.has_value();
 +
++  // Float8 experts' biases go with their column scales.
    ::ttnn::Tensor packed =
-       hasBias ? ::ttnn::experimental::prepare_w0_w1_tensor_with_bias(
-                     w0, w1, *bias0, *bias1, L, E, op->hidden_size(),
-                     op->intermediate_size())
+-      hasBias ? ::ttnn::experimental::prepare_w0_w1_tensor_with_bias(
+-                    w0, w1, *bias0, *bias1, L, E, op->hidden_size(),
+-                    op->intermediate_size())
 -              : ::ttnn::experimental::prepare_w0_w1_tensor_for_moe_compute(
 -                    w0, w1, L, E, op->hidden_size(), op->intermediate_size());
-+      : columnScales
++      columnScales
 +          ? ::ttnn::experimental::prepare_w0_w1_tensor_with_column_scales(
 +                w0, w1, *scale0, *scale1, L, E, op->hidden_size(),
++                op->intermediate_size(), bias0, bias1)
++      : hasBias
++          ? ::ttnn::experimental::prepare_w0_w1_tensor_with_bias(
++                w0, w1, *bias0, *bias1, L, E, op->hidden_size(),
 +                op->intermediate_size())
 +          : ::ttnn::experimental::prepare_w0_w1_tensor_for_moe_compute(
 +                w0, w1, L, E, op->hidden_size(), op->intermediate_size());
@@ -872,7 +883,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w2_weights.cpp 
  #include "ttnn/operations/copy/typecast/typecast.hpp"
  #include "ttnn/operations/core/core.hpp"
  #include "ttnn/operations/experimental/ccl/moe_compute/moe_compute_utils.hpp"
-@@ -19,6 +20,11 @@ void run(const ::tt::target::ttnn::PrepareMoEComputeW2WeightsOp *op,
+@@ -19,6 +20,11 @@ void run(const ::tt::target::ttnn::Prepa
    if (op->bias_2() != nullptr) {
      bias2 = tensorPool.getTTNNTensorAndValidate(op->bias_2());
    }
@@ -884,7 +895,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w2_weights.cpp 
  
    ::ttnn::MeshDevice &meshDevice = context.getMeshDevice();
  
-@@ -28,20 +34,29 @@ void run(const ::tt::target::ttnn::PrepareMoEComputeW2WeightsOp *op,
+@@ -28,20 +34,31 @@ void run(const ::tt::target::ttnn::Prepa
    uint32_t E = w2.logical_shape()[1];
    bool hasBias = bias2.has_value();
  
@@ -896,13 +907,16 @@ diff --git a/runtime/lib/ttnn/operations/ccl/prepare_moe_compute_w2_weights.cpp 
 +                  : ::ttnn::DataType::BFLOAT4_B;
 +  bool columnScales = scale2.has_value();
 +
++  // Float8 experts' biases go with their column scales.
    ::ttnn::Tensor packed =
-       hasBias
+-      hasBias
++      columnScales
++          ? ::ttnn::experimental::prepare_w2_tensor_with_column_scales(
++                w2, *scale2, L, E, op->intermediate_size(), op->hidden_size(),
++                bias2)
++      : hasBias
            ? ::ttnn::experimental::prepare_w2_tensor_with_bias(
                  w2, *bias2, L, E, op->intermediate_size(), op->hidden_size())
-+      : columnScales
-+          ? ::ttnn::experimental::prepare_w2_tensor_with_column_scales(
-+                w2, *scale2, L, E, op->intermediate_size(), op->hidden_size())
            : ::ttnn::experimental::prepare_w2_tensor_for_moe_compute(
                  w2, L, E, op->intermediate_size(), op->hidden_size());
  

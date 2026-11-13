@@ -11,6 +11,9 @@ Batches of more than 512 tokens take several kernel calls.
 FP8 experts come with scales, one per expert and output column, as
 SGLang-TorchTPU passes them: the kernel reads the experts as they are and
 applies the scales.
+
+With activation="swigluoai" the gate is GPT-OSS's clamped SwiGLU, and BF16
+experts may come with biases b1, b3 [E_local, I] and b2 [E_local, H].
 """
 
 import jax
@@ -58,14 +61,26 @@ def bfp4(w):
     return (np.sign(blocks) * np.clip(np.round(np.abs(blocks) / step), 0, 7) * step).reshape(w.shape)
 
 
-def reference(x, weights, ids, w1, w3, w2, stored=bfp4):
+def silu(g, u):
+    return g / (1 + np.exp(-g)) * u
+
+
+def swigluoai(g, u):
+    g, u = np.minimum(g, 7.0), np.clip(u, -7.0, 7.0)
+    return g / (1 + np.exp(-1.702 * g)) * (u + 1)
+
+
+def reference(x, weights, ids, w1, w3, w2, stored=bfp4, gate=silu, biases=None):
     x = np.asarray(x).astype(np.float64)
     w1, w3, w2 = (stored(w) for w in (w1, w3, w2))
+    b1, b3, b2 = (np.zeros((w1.shape[0], n)) for n in (w1.shape[2], w1.shape[2], w2.shape[2]))
+    if biases is not None:
+        b1, b3, b2 = (np.asarray(b).astype(np.float64) for b in biases)
     out = np.zeros(x.shape)
     for e in range(w1.shape[0]):
         t, j = np.nonzero(ids == e)
-        g, u = x[t] @ w1[e], x[t] @ w3[e]
-        np.add.at(out, t, weights[t, j, None] * ((g / (1 + np.exp(-g))) * u) @ w2[e])
+        g, u = x[t] @ w1[e] + b1[e], x[t] @ w3[e] + b3[e]
+        np.add.at(out, t, weights[t, j, None] * (gate(g, u) @ w2[e] + b2[e]))
     return out
 
 
@@ -150,3 +165,81 @@ def test_fp8_experts(tokens, padding):
     stored2 = w2.astype(np.float64) * s2[:, 0]
     stored = (x, weights, ids, stored13[..., :INTERMEDIATE], stored13[..., INTERMEDIATE:], stored2)
     check(out, reference(*stored, stored=lambda w: w), padding, 0.01)
+
+
+@pytest.mark.parametrize("tokens,padding", [(1, 0), (5, 2), (600, 7)])
+def test_swigluoai_biases(tokens, padding):
+    devices = jax.local_devices(backend="tt")
+    if len(devices) not in (1, 4):
+        pytest.skip("Requires one or four local TT devices")
+    mesh = Mesh(np.array(devices).reshape(1, len(devices)), ("data", "tensor"))
+    axes = ("data", "tensor")
+    rng = np.random.default_rng(300 + tokens)
+    experts = len(devices) * 8
+    args = problem(rng, tokens, experts, padding)
+    # Biases on the scale of the projections' outputs, so that the clamps act.
+    biases = tuple(
+        (rng.standard_normal((experts, n)) * 2).astype(jnp.bfloat16) for n in (INTERMEDIATE, INTERMEDIATE, HIDDEN)
+    )
+
+    def layer(x, weights, ids, w1, w3, w2, b1, b3, b2):
+        out = fused_moe_ep(x, weights, ids, w1, w3, w2, b1, b3, b2, weight_dtype="bf16", activation="swigluoai")
+        return jax.lax.psum(out, axes)
+
+    split3, split2 = P(axes, None, None), P(axes, None)
+    specs = (split3,) * 3 + (split2,) * 3
+    sharded = jax.shard_map(layer, mesh=mesh, in_specs=(P(),) * 3 + specs, out_specs=P(), check_vma=False)
+    run = jax.jit(lambda x, w, i, *experts: sharded(x, w, i, *(weight(e) for e in experts)))
+    shardings = [NamedSharding(mesh, P())] * 3 + [NamedSharding(mesh, spec) for spec in specs]
+    out = run(*(jax.device_put(a, s) for a, s in zip(args + biases, shardings)))
+    assert out.shape == (tokens, HIDDEN) and out.dtype == jnp.bfloat16
+    want = reference(*args, stored=lambda w: np.asarray(w).astype(np.float64), gate=swigluoai, biases=biases)
+    check(out, want, padding, 0.01)
+
+
+# GPT-OSS's MXFP4 experts convert to FP8 with power-of-two column scales from about 2^-20 to 2^5; the activations
+# are sized so that the projections' outputs are on the order of one.
+@pytest.mark.parametrize("exponents,x_shift", [((-16, -10), 11), ((0, 5), -4)], ids=["small_scales", "large_scales"])
+@pytest.mark.parametrize("tokens,padding", [(1, 0), (5, 2), (600, 7)])
+def test_fp8_swigluoai_biases(tokens, padding, exponents, x_shift):
+    """FP8 experts as GPT-OSS's MXFP4 ones convert, power-of-two column scales, with biases and GPT-OSS's gate."""
+    devices = jax.local_devices(backend="tt")
+    if len(devices) not in (1, 4):
+        pytest.skip("Requires one or four local TT devices")
+    mesh = Mesh(np.array(devices).reshape(1, len(devices)), ("data", "tensor"))
+    axes = ("data", "tensor")
+    rng = np.random.default_rng(400 + tokens)
+    experts = len(devices) * 8
+    x, weights, ids, _, _, _ = problem(rng, tokens, experts, padding)
+    x = (np.asarray(x, np.float32) * 2.0**x_shift * HIDDEN**-0.5).astype(jnp.bfloat16)
+
+    def fp8(shape, x_scale):
+        values = rng.standard_normal(shape).astype(jnp.float8_e4m3fn)
+        scales = 2.0 ** rng.integers(exponents[0], exponents[1] + 1, (shape[0], 1, 1, shape[2]))
+        return values, (scales * x_scale).astype(np.float32)
+
+    w13, s13 = fp8((experts, HIDDEN, 2 * INTERMEDIATE), 1.0)
+    # W2's inputs are on the order of one: its scales bring its outputs there too.
+    w2, s2 = fp8((experts, INTERMEDIATE, HIDDEN), 2.0 ** -exponents[1] * INTERMEDIATE**-0.5)
+    biases = tuple(
+        (rng.standard_normal((experts, n)) * 2).astype(jnp.bfloat16) for n in (INTERMEDIATE, INTERMEDIATE, HIDDEN)
+    )
+
+    def layer(x, weights, ids, w13, s13, w2, s2, b1, b3, b2):
+        experts = (w13[..., :INTERMEDIATE], w13[..., INTERMEDIATE:], w2, *sglang_tpu_kernels._fp8_scales(w13, s13, s2))
+        out = fused_moe_ep(x, weights, ids, *experts, b1, b3, b2, activation="swigluoai")
+        return jax.lax.psum(out, axes)
+
+    split2, split3, split4 = P(axes, None), P(axes, None, None), P(axes, None, None, None)
+    specs = (split3, split4, split3, split4, split2, split2, split2)
+    sharded = jax.shard_map(layer, mesh=mesh, in_specs=(P(),) * 3 + specs, out_specs=P(), check_vma=False)
+    run = jax.jit(lambda x, w, i, *experts: sharded(x, w, i, *(weight(e) for e in experts)))
+    shardings = [NamedSharding(mesh, P())] * 3 + [NamedSharding(mesh, spec) for spec in specs]
+    args = (x, weights, ids, w13, s13, w2, s2) + biases
+    out = run(*(jax.device_put(a, s) for a, s in zip(args, shardings)))
+    assert out.shape == (tokens, HIDDEN) and out.dtype == jnp.bfloat16
+
+    stored13 = w13.astype(np.float64) * s13[:, 0]
+    stored2 = w2.astype(np.float64) * s2[:, 0]
+    stored = (x, weights, ids, stored13[..., :INTERMEDIATE], stored13[..., INTERMEDIATE:], stored2)
+    check(out, reference(*stored, stored=lambda w: w, gate=swigluoai, biases=biases), padding, 0.01)

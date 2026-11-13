@@ -156,3 +156,63 @@ def test_sliding_window(positions, sinks):
         (sink_logits / scale).astype(jnp.bfloat16), np.float32) * scale
     expected = reference(np.asarray(query, np.float32), k_cache, v_cache, page_table, positions, window, sink_ref)
     np.testing.assert_allclose(out, expected, rtol=0, atol=0.1)
+
+
+@pytest.mark.parametrize("positions", [[1100], [300, 1500], [2047]], ids=lambda p: "-".join(map(str, p)))
+def test_sliding_window_pool(positions):
+    """A sliding-window pool (hybrid SWA models') holds fewer pages than a sequence's page table is wide: only the
+    pages its window reaches, the rest of the table page 0. A token's keys and values go to its page, then it
+    attends to its window."""
+    window, pool_pages, table_pages = 128, 12, 64
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(2)
+    users = len(positions)
+    q_heads, kv_heads = 8, 2
+    positions = np.asarray(positions, np.int32)
+    # Each user's window pages, a few apart in the pool; page 0 is padding.
+    page_table = np.zeros((users, table_pages), np.int32)
+    free = list(rng.permutation(np.arange(1, pool_pages)))
+    for user, position in enumerate(positions):
+        for page in range(max(0, position - window + 1) // BLOCK, position // BLOCK + 1):
+            page_table[user, page] = free.pop()
+    query = rng.normal(size=(1, users, q_heads, HEAD_DIM)).astype(jnp.bfloat16)
+    cache = rng.normal(size=(pool_pages, kv_heads, BLOCK, 2 * HEAD_DIM)).astype(jnp.bfloat16)
+    new_kv = rng.normal(size=(1, users, kv_heads, 2 * HEAD_DIM)).astype(jnp.bfloat16)
+    scale = HEAD_DIM**-0.5
+
+    def step(query, cache, new_kv, page_table, positions):
+        cache = jax.ffi.ffi_call(
+            "tt.paged_update_cache", jax.ShapeDtypeStruct(cache.shape, cache.dtype), input_output_aliases={0: 0}
+        )(cache, new_kv, positions, page_table, share_cache=True)
+        out = jax.ffi.ffi_call(
+            "tt.paged_scaled_dot_product_attention_decode", jax.ShapeDtypeStruct(query.shape, query.dtype)
+        )(
+            query,
+            cache,
+            cache,
+            page_table,
+            positions,
+            is_causal=True,
+            has_attention_mask=False,
+            has_cur_pos_tensor=True,
+            has_attention_sink=False,
+            scale=np.float32(scale),
+            sliding_window_size=np.int32(window),
+        )
+        return out, cache
+
+    args = [jax.device_put(x, device) for x in (query, cache, new_kv, page_table, positions)]
+    out, updated = jax.jit(step)(*args)
+    expected_cache = cache.copy()
+    for user, position in enumerate(positions):
+        expected_cache[page_table[user, position // BLOCK], :, position % BLOCK] = new_kv[0, user]
+    np.testing.assert_array_equal(np.asarray(updated), expected_cache)
+    expected = reference(
+        np.asarray(query, np.float32),
+        np.asarray(expected_cache[..., :HEAD_DIM], np.float32),
+        np.asarray(expected_cache[..., HEAD_DIM:], np.float32),
+        page_table,
+        positions,
+        window,
+    )
+    np.testing.assert_allclose(np.asarray(out, np.float32)[..., :HEAD_DIM], expected, rtol=0, atol=0.1)
