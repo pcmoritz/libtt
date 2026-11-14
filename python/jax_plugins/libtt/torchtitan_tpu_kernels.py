@@ -42,6 +42,8 @@ LOSS_WEIGHT_COLUMNS = 32768
 _NO_MASK, _CAUSAL_MASK, _ARBITRARY_MASK = 0, 1, 2
 # Columns of tt-train's intermediates; the log-sum-exp is the first.
 _INTERMEDIATE_COLUMNS = 32
+# tt-train's attention takes head dimensions in tiles of 32 columns.
+_HEAD_DIM_TILE = 32
 
 
 def _attention_mask(seq_len, is_causal, local_window_size, segment_ids):
@@ -96,12 +98,26 @@ def _make_splash_attention_fn(
             )
         return tuple(jnp.concatenate(parts) for parts in zip(*results))
 
+    def pad_head_dim(q, *tensors):
+        """Zero-pads the head dimension to whole tiles: zero columns don't change the scores, and q scaled by
+        sqrt(padded / head_dim) keeps the kernels' 1 / sqrt(padded) scale at 1 / sqrt(head_dim). Returns that
+        factor too, 1 without padding."""
+        head_dim = q.shape[-1]
+        padding = -head_dim % _HEAD_DIM_TILE
+        if not padding:
+            return 1.0, (q, *tensors)
+        factor = ((head_dim + padding) / head_dim) ** 0.5
+        widths = [(0, 0)] * (q.ndim - 1) + [(0, padding)]
+        return factor, tuple(jnp.pad(t, widths) for t in ((q * factor).astype(q.dtype), *tensors))
+
     @jax.jit
     def splash_fn(q, k, v, segment_ids=None):
         """Forward: (out, logsumexp) for the whole batch."""
+        head_dim = q.shape[-1]
         # Multi-query attention passes K and V without their head dimension.
         if k.ndim == 3:
             k, v = k[:, None], v[:, None]
+        _, (q, k, v) = pad_head_dim(q, k, v)
 
         def outputs(_, q, k, v):
             return (
@@ -110,20 +126,25 @@ def _make_splash_attention_fn(
             )
 
         out, intermediates = call("tt.sdpa_fw", outputs, (q, k, v), segment_ids)
-        return out, intermediates[..., 0]
+        return out[..., :head_dim], intermediates[..., 0]
 
     @jax.jit
     def splash_bwd_fn(q, k, v, out, logsumexp, g, segment_ids=None):
         """Backward from the saved (out, logsumexp), without recomputing the forward."""
+        head_dim = q.shape[-1]
         squeezed = k.ndim == 3
         if squeezed:
             k, v = k[:, None], v[:, None]
+        factor, (q, k, v, out, g) = pad_head_dim(q, k, v, out, g)
         intermediates = jnp.broadcast_to(logsumexp[..., None], (*logsumexp.shape, _INTERMEDIATE_COLUMNS))
 
         def outputs(_, g, out, q, k, v, intermediates):
             return tuple(jax.ShapeDtypeStruct(t.shape, t.dtype) for t in (q, k, v))
 
         dq, dk, dv = call("tt.sdpa_bw", outputs, (g, out, q, k, v, intermediates), segment_ids)
+        # The kernels saw q times the padding factor.
+        dq = (dq[..., :head_dim] * factor).astype(dq.dtype) if factor != 1.0 else dq
+        dk, dv = dk[..., :head_dim], dv[..., :head_dim]
         if squeezed:
             dk, dv = dk[:, 0], dv[:, 0]
         return dq, dk, dv

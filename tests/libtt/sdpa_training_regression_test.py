@@ -155,3 +155,21 @@ def test_qwen3_5_attention():
     dq, dk, dv = splash_bwd_fn(tq, tk, tv, out, lse, tg, tsegments)
     for got, want in ((dq, dq_want), (dk, dk_want), (dv, dv_want)):
         assert _relative_error(got, want) < 0.03
+
+
+def test_head_dim_padded_to_tiles():
+    # TorchTitan's Llama 3 debug model: heads of 16 dimensions, which the kernels take zero-padded to 32.
+    q, k, v, g = _inputs(3, batch=2, kv_heads=2, dim=16)
+    out_want, lse_want, dq_want, dk_want, dv_want = _reference(q, k, v, g)
+    splash_fn, splash_bwd_fn = torchtitan_tpu_kernels._make_splash_attention_fn(
+        seq_len=SEQ, n_heads=HEADS, n_kv_heads=2, is_causal=True
+    )
+    tq, tk, tv, tg = _device(q, k, v, g)
+    out, lse = splash_fn(tq, tk, tv)
+    assert out.shape == q.shape
+    assert _relative_error(out, out_want) < 0.02
+    assert _relative_error(lse, lse_want) < 2e-3
+    dq, dk, dv = splash_bwd_fn(tq, tk, tv, out, lse, tg)
+    assert (dq.shape, dk.shape, dv.shape) == (q.shape, k.shape, v.shape)
+    for got, want in ((dq, dq_want), (dk, dk_want), (dv, dv_want)):
+        assert _relative_error(got, want) < 0.03
