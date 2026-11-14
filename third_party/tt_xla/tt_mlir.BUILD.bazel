@@ -1317,7 +1317,9 @@ cc_library(
         ],
         allow_empty = True,
     ) + [
-        # tt-train's fused attention, built into ttnn (BUILD.overlay.bazel).
+        # tt-train's training ops, built into ttnn (BUILD.overlay.bazel).
+        "runtime/lib/ttnn/operations/ttml/cross_entropy_bw.cpp",
+        "runtime/lib/ttnn/operations/ttml/cross_entropy_fw.cpp",
         "runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp",
         "runtime/lib/ttnn/operations/ttml/sdpa_fw.cpp",
         "runtime/lib/ttnn/operations/ccl/aggregate_tensor.cpp",

@@ -1,0 +1,23 @@
+diff --git tt-train/sources/ttml/metal/ops/cross_entropy_bw/cross_entropy_bw.cpp tt-train/sources/ttml/metal/ops/cross_entropy_bw/cross_entropy_bw.cpp
+--- tt-train/sources/ttml/metal/ops/cross_entropy_bw/cross_entropy_bw.cpp
++++ tt-train/sources/ttml/metal/ops/cross_entropy_bw/cross_entropy_bw.cpp
+@@ -5,6 +5,7 @@
+ #include "cross_entropy_bw.hpp"
+ 
+ #include "device/cross_entropy_bw_device_operation.hpp"
++#include "ttnn/operations/eltwise/binary/binary.hpp"
+ 
+ namespace ttml::metal {
+ 
+diff --git tt-train/sources/ttml/metal/ops/cross_entropy_bw/cross_entropy_bw.hpp tt-train/sources/ttml/metal/ops/cross_entropy_bw/cross_entropy_bw.hpp
+--- tt-train/sources/ttml/metal/ops/cross_entropy_bw/cross_entropy_bw.hpp
++++ tt-train/sources/ttml/metal/ops/cross_entropy_bw/cross_entropy_bw.hpp
+@@ -4,8 +4,6 @@
+ 
+ #pragma once
+ 
+-#include <core/ttnn_all_includes.hpp>
+-
+ #include "metal/ttnn_all_includes.hpp"
+ 
+ namespace ttml::metal {

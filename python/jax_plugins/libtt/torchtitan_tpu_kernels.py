@@ -1,4 +1,4 @@
-"""TorchTitan's TPU splash attention on Tenstorrent.
+"""TorchTitan's TPU splash attention and fused loss on Tenstorrent.
 
 TorchTitan's TPU trainer (google-pytorch/torchtitan, experiments/tpu) runs its
 models' attention as splash attention, a Pallas TPU kernel, through torch_tpu's
@@ -15,9 +15,20 @@ intermediates.
 A plain causal attention uses the kernels' causal mask. Packed documents
 (segment IDs: a query attends only to keys of its own document) and sliding
 windows pass the kernels a [1, 1, S, S] mask, one sequence at a time.
+
+The trainer's fused output layer and loss (`--loss_kernel.use_loss_kernel`) is
+tokamax's linear softmax cross-entropy, also a Pallas TPU kernel, which never
+materializes the [tokens, vocabulary] logits. Here it runs a chunk of tokens at
+a time: the chunk's BF16 logits, as the output layer computes them anyway, go
+through tt-train's fused cross-entropy (`tt.cross_entropy_fw` and
+`tt.cross_entropy_bw`, FP32 inside), so no FP32 copy of all the logits exists.
 """
 
 SPLASH_MODULE = "torchtitan.experiments.tpu.kernels.splash_attention"
+LOSS_KERNEL_MODULE = "tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu_kernel"
+# Tokens per cross-entropy call: a chunk's BF16 logits and their gradient take
+# 1.2 GB at Qwen3's 151,936-token vocabulary.
+LOSS_TOKEN_CHUNK = 2048
 # ttml::metal::AttentionMaskType.
 _NO_MASK, _CAUSAL_MASK, _ARBITRARY_MASK = 0, 1, 2
 # Columns of tt-train's intermediates; the log-sum-exp is the first.
@@ -115,4 +126,65 @@ def _patch_splash_module(module):
     module._make_splash_attention_fn = _make_splash_attention_fn
 
 
-PATCHES = {SPLASH_MODULE: _patch_splash_module}
+def _token_chunks(tokens):
+    return [(start, min(LOSS_TOKEN_CHUNK, tokens - start)) for start in range(0, tokens, LOSS_TOKEN_CHUNK)]
+
+
+def linear_cross_entropy_fwd(x, labels, w, *, reduction="sum", **_):
+    """(loss, logsumexp [B] FP32) of softmax cross-entropy over the logits x [B, H] @ w [H, V], a chunk of
+    tokens at a time; tokamax's `linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu`."""
+    import jax
+    import jax.numpy as jnp
+
+    losses, logsumexps = [], []
+    for start, size in _token_chunks(x.shape[0]):
+        logits = jnp.dot(x[start : start + size], w)
+        targets = labels[start : start + size]
+        loss = jax.ffi.ffi_call("tt.cross_entropy_fw", jax.ShapeDtypeStruct((1, 1, size, 1), logits.dtype))(
+            logits[None, None], targets[None]
+        )
+        loss = loss.reshape(size).astype(jnp.float32)
+        target_logits = jnp.take_along_axis(logits, targets[:, None], axis=1)[:, 0].astype(jnp.float32)
+        losses.append(loss)
+        logsumexps.append(loss + target_logits)
+    losses, logsumexp = jnp.concatenate(losses), jnp.concatenate(logsumexps)
+    if reduction == "sum":
+        return jnp.sum(losses), logsumexp
+    if reduction == "mean":
+        return jnp.mean(losses), logsumexp
+    return losses, logsumexp
+
+
+def linear_cross_entropy_bwd(dout, lse, x, labels, w, *, reduction="sum", **_):
+    """(dx, dw) of linear_cross_entropy_fwd; tt-train's backward recomputes each chunk's softmax from its
+    logits, so the saved logsumexp is unused. The weight gradient adds up chunk by chunk in w's dtype."""
+    import jax
+    import jax.numpy as jnp
+
+    del lse
+    tokens = x.shape[0]
+    # The kernel scales by a [1, 1, 1, 1] gradient; per-token gradients scale its result.
+    per_token = reduction == "none"
+    grad = jnp.ones((1, 1, 1, 1), x.dtype) if per_token else dout.reshape(1, 1, 1, 1).astype(x.dtype)
+    scaler = 1.0 / tokens if reduction == "mean" else 1.0
+    dx, dw = [], None
+    for start, size in _token_chunks(tokens):
+        x_chunk = x[start : start + size]
+        logits = jnp.dot(x_chunk, w)
+        dlogits = jax.ffi.ffi_call("tt.cross_entropy_bw", jax.ShapeDtypeStruct((1, 1, size, w.shape[1]), logits.dtype))(
+            logits[None, None], labels[start : start + size][None], grad, scaler=scaler
+        )[0, 0]
+        if per_token:
+            dlogits = dlogits * dout[start : start + size, None].astype(dlogits.dtype)
+        dx.append(jnp.dot(dlogits, w.T).astype(x.dtype))
+        dw_chunk = jnp.dot(x_chunk.T, dlogits).astype(w.dtype)
+        dw = dw_chunk if dw is None else dw + dw_chunk
+    return jnp.concatenate(dx), dw
+
+
+def _patch_loss_kernel_module(module):
+    module.linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu = linear_cross_entropy_fwd
+    module.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu = linear_cross_entropy_bwd
+
+
+PATCHES = {SPLASH_MODULE: _patch_splash_module, LOSS_KERNEL_MODULE: _patch_loss_kernel_module}

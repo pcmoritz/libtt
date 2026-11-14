@@ -1,0 +1,143 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -6742,6 +6742,31 @@
+                       AnyRankedTensor:$grad_value);
+ }
+ 
++def TTIR_CrossEntropyForwardOp : TTIR_NamedOp<"cross_entropy_fw"> {
++  let summary = "Fused cross-entropy loss forward.";
++  let description = [{
++    `input` holds logits as [N, 1, H, W] and `target` class indices as [N, H].
++    `result` [N, 1, H, 1] is each row's loss, logsumexp(input) - input[target].
++    Lowers to ttnn.cross_entropy_fw, tt-train's ttml::metal::cross_entropy_fw,
++    which reads BF16 logits and computes in FP32.
++  }];
++  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$target);
++  let results = (outs AnyRankedTensor:$result);
++}
++
++def TTIR_CrossEntropyBackwardOp : TTIR_NamedOp<"cross_entropy_bw"> {
++  let summary = "Fused cross-entropy loss backward.";
++  let description = [{
++    The gradient of ttir.cross_entropy_fw's losses with respect to `input`:
++    (softmax(input) - one_hot(target)) * scaler * grad, with `grad` [1, 1, 1, 1]
++    the gradient of their sum. Lowers to ttnn.cross_entropy_bw, tt-train's
++    ttml::metal::cross_entropy_bw.
++  }];
++  let arguments = (ins AnyRankedTensor:$input, AnyRankedTensor:$target,
++                       AnyRankedTensor:$grad, F32Attr:$scaler);
++  let results = (outs AnyRankedTensor:$result);
++}
++
+ def TTIR_GatedDeltaRuleOp : TTIR_NamedOp<"gated_delta_rule"> {
+   let summary = "gated delta rule.";
+   let arguments = (ins AnyRankedTensor:$query,
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10333,6 +10333,46 @@
+   }
+ };
+ 
++// `tt.cross_entropy_fw` (logits [N, 1, H, W], targets [N, H] -> losses
++// [N, 1, H, 1]) and `tt.cross_entropy_bw` (logits, targets, grad [1, 1, 1, 1]
++// -> logits gradient, jax.ffi.ffi_call with a float scaler attribute):
++// tt-train's fused cross-entropy, see ttir.cross_entropy_fw.
++class StableHLOCrossEntropyTrainingConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
++public:
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::CustomCallOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    StringRef target = op.getCallTargetName();
++    const bool forward = target == "tt.cross_entropy_fw";
++    if (!forward && target != "tt.cross_entropy_bw") {
++      return failure();
++    }
++    if (op.getNumOperands() != (forward ? 2u : 3u) || op.getNumResults() != 1) {
++      return op.emitOpError() << target << " takes " << (forward ? 2 : 3)
++                              << " operands and returns one result";
++    }
++    Type type = getTypeConverter()->convertType(op.getResult(0).getType());
++    ValueRange operands = adaptor.getOperands();
++    if (forward) {
++      rewriter.replaceOpWithNewOp<ttir::CrossEntropyForwardOp>(
++          op, type, operands[0], operands[1]);
++      return success();
++    }
++    auto backendConfig = getFfiBackendConfig(op);
++    FloatAttr scaler =
++        backendConfig ? backendConfig.getAs<FloatAttr>("scaler") : nullptr;
++    if (!scaler) {
++      return op.emitOpError() << target << " needs a float scaler attribute";
++    }
++    rewriter.replaceOpWithNewOp<ttir::CrossEntropyBackwardOp>(
++        op, type, operands[0], operands[1], operands[2],
++        rewriter.getF32FloatAttr(scaler.getValueAsDouble()));
++    return success();
++  }
++};
++
+ class StableHLOQuantizeRowsConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
+ public:
+@@ -12350,6 +12390,8 @@
+                                                         patterns.getContext());
+   patterns.add<StableHLOSDPATrainingConversionPattern>(typeConverter,
+                                                         patterns.getContext());
++  patterns.add<StableHLOCrossEntropyTrainingConversionPattern>(
++      typeConverter, patterns.getContext());
+   patterns.add<StableHLORecurrentOpConversionPattern>(typeConverter,
+                                                       patterns.getContext());
+   patterns.add<StableHLOToTTIRCustomCallOpConversionPattern>(typeConverter,
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -3651,6 +3651,36 @@
+   }
+ };
+ 
++// ttir.cross_entropy_fw and cross_entropy_bw to tt-train's
++// ttnn.cross_entropy_fw and cross_entropy_bw.
++class CrossEntropyForwardOpConversionPattern
++    : public OpConversionPattern<ttir::CrossEntropyForwardOp> {
++public:
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(ttir::CrossEntropyForwardOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    rewriter.replaceOpWithNewOp<ttnn::CrossEntropyForwardOp>(
++        op, getTypeConverter()->convertType(op.getType()), adaptor.getInput(),
++        adaptor.getTarget());
++    return success();
++  }
++};
++
++class CrossEntropyBackwardOpConversionPattern
++    : public OpConversionPattern<ttir::CrossEntropyBackwardOp> {
++public:
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(ttir::CrossEntropyBackwardOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    rewriter.replaceOpWithNewOp<ttnn::CrossEntropyBackwardOp>(
++        op, getTypeConverter()->convertType(op.getType()), adaptor.getInput(),
++        adaptor.getTarget(), adaptor.getGrad(), op.getScalerAttr());
++    return success();
++  }
++};
++
+ class QuantizeRowsOpConversionPattern
+     : public OpConversionPattern<ttir::QuantizeRowsOp> {
+ public:
+@@ -4316,6 +4346,8 @@
+            QuantizeRowsOpConversionPattern,
+            SDPAForwardOpConversionPattern,
+            SDPABackwardOpConversionPattern,
++           CrossEntropyForwardOpConversionPattern,
++           CrossEntropyBackwardOpConversionPattern,
+            GatedDeltaRuleOpConversionPattern,
+            GatedDeltaDecodeOpConversionPattern,
+            CausalConv1dUpdateOpConversionPattern,

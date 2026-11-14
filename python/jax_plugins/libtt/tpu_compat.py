@@ -15,8 +15,8 @@
   `scaled_dot_product_attention` takes its StableHLO implementation instead.
 - SGLang-TorchTPU's attention and gated DeltaNet kernels run as JAX
   (`sglang_tpu_kernels`, `sglang_tpu_gdn`).
-- TorchTitan's TPU trainer's splash attention runs tt-train's fused attention
-  for training (`torchtitan_tpu_kernels`).
+- TorchTitan's TPU trainer's splash attention and fused loss run tt-train's
+  fused attention and cross-entropy (`torchtitan_tpu_kernels`).
 """
 
 import importlib.abc
