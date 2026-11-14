@@ -111,6 +111,20 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/all_gather_unicast_fac
          uint32_t num_available_cores);
  };
  
+diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_common.hpp ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_common.hpp
+--- ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_common.hpp
++++ ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_common.hpp
+@@ -45,7 +45,9 @@ public:
+         chunk_count{0} {
+         std::array<uint64_t, max_pages_per_packet> dummy_addrs{};  // init to 0s
+         std::array<uint16_t, max_pages_per_packet - 1> chunk_sizes{};
+-        chunk_sizes.fill(page_size);
++        // Only scatter writes, which pack pages of at most half a packet, use the 16-bit chunk sizes; a page larger
++        // than 64 KB (a wide row-major row) is split across packets instead.
++        chunk_sizes.fill(static_cast<uint16_t>(use_scatter_write ? page_size : 0));
+         uint8_t starts[1] = {1};
+ 
+         if constexpr (use_scatter_write) {
 diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_common.hpp ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_common.hpp
 --- ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_common.hpp
 +++ ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_common.hpp
