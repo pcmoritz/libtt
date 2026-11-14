@@ -152,7 +152,9 @@ def test_torch_router(tokens, experts, k, epsilon, tmp_path):
     ir = exported_ir(tmp_path)
     if epsilon < 1e-12:
         check_rewritten(ir, experts)
+        assert '"ttnn.max"' not in ir, "the top k doesn't come from the logits"
     else:
+        # Without the rewrite, the FP32 softmax stays exp, sum and reciprocal.
         softmaxes = [line for line in ir.splitlines() if '"ttnn.softmax"' in line]
-        assert any(f"x{experts}xf32" in line for line in softmaxes), "the softmax wasn't fused"
-        assert '"ttnn.divide"' in ir or '"ttnn.add"' in ir, "the renormalization was dropped"
+        assert not softmaxes, "the FP32 softmax was fused"
+        assert '"ttnn.add"' in ir, "the renormalization was dropped"
