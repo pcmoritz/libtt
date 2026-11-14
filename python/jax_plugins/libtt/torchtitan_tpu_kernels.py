@@ -22,10 +22,15 @@ materializes the [tokens, vocabulary] logits. Here it runs a chunk of tokens at
 a time: the chunk's BF16 logits, as the output layer computes them anyway, go
 through tt-train's fused cross-entropy (`tt.cross_entropy_fw` and
 `tt.cross_entropy_bw`, FP32 inside), so no FP32 copy of all the logits exists.
+
+Qwen3.5's GatedDeltaNet normalizes its output with a gated RMSNorm, a Pallas
+TPU kernel where its inputs allow; here it always takes TorchTitan's PyTorch
+path.
 """
 
 SPLASH_MODULE = "torchtitan.experiments.tpu.kernels.splash_attention"
 LOSS_KERNEL_MODULE = "tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_mosaic_tpu_kernel"
+RMS_NORM_GATED_MODULE = "torchtitan.experiments.tpu.kernels.rms_norm_gated"
 # Tokens per cross-entropy call: a chunk's BF16 logits and their gradient take
 # 1.2 GB at Qwen3's 151,936-token vocabulary.
 LOSS_TOKEN_CHUNK = 2048
@@ -194,4 +199,12 @@ def _patch_loss_kernel_module(module):
     module.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu = linear_cross_entropy_bwd
 
 
-PATCHES = {SPLASH_MODULE: _patch_splash_module, LOSS_KERNEL_MODULE: _patch_loss_kernel_module}
+def _patch_rms_norm_gated_module(module):
+    module.supports = lambda *args, **kwargs: False
+
+
+PATCHES = {
+    SPLASH_MODULE: _patch_splash_module,
+    LOSS_KERNEL_MODULE: _patch_loss_kernel_module,
+    RMS_NORM_GATED_MODULE: _patch_rms_norm_gated_module,
+}

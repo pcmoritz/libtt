@@ -1,0 +1,136 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
+@@ -18,7 +18,9 @@
+ #include "mlir/IR/MLIRContext.h"
+ #include "mlir/IR/PatternMatch.h"
+ #include "mlir/Pass/Pass.h"
++#include "mlir/IR/Matchers.h"
+ #include "mlir/Transforms/DialectConversion.h"
++#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+ #include "llvm/ADT/SmallSet.h"
+ #include "llvm/ADT/StringRef.h"
+ 
+@@ -2652,6 +2654,99 @@
+   }
+ };
+ 
++// The gradient of a tensor that a loop reads a slice at a time (PyTorch's
++// `x[:, :, i]` for each chunk i) is each slice's gradient zero-padded to the
++// full shape (select_backward), added up. An add of zero-paddings of two
++// adjacent regions of one dimension is a zero-padding of their concatenation,
++// so the sum of all of them becomes one concatenation instead of a full-size
++// pad and add per slice.
++class AddOfAdjacentPadsPattern
++    : public OpRewritePattern<mlir::stablehlo::AddOp> {
++public:
++  using OpRewritePattern<mlir::stablehlo::AddOp>::OpRewritePattern;
++
++  LogicalResult matchAndRewrite(mlir::stablehlo::AddOp op,
++                                PatternRewriter &rewriter) const override {
++    auto lhs = op.getLhs().getDefiningOp<mlir::stablehlo::PadOp>();
++    auto rhs = op.getRhs().getDefiningOp<mlir::stablehlo::PadOp>();
++    if (!lhs || !rhs) {
++      return failure();
++    }
++    std::optional<int64_t> dim = paddedDim(lhs);
++    if (!dim || dim != paddedDim(rhs)) {
++      return failure();
++    }
++    // Order the two regions along `dim`.
++    auto lowOf = [&](mlir::stablehlo::PadOp pad) {
++      return pad.getEdgePaddingLow()[*dim];
++    };
++    auto sizeOf = [&](mlir::stablehlo::PadOp pad) {
++      return mlir::cast<RankedTensorType>(pad.getOperand().getType())
++          .getDimSize(*dim);
++    };
++    mlir::stablehlo::PadOp first = lhs, second = rhs;
++    if (lowOf(rhs) + sizeOf(rhs) == lowOf(lhs)) {
++      std::swap(first, second);
++    } else if (lowOf(lhs) + sizeOf(lhs) != lowOf(rhs)) {
++      return failure();
++    }
++
++    // Concatenate the regions, splicing in the operands of a concatenation
++    // along `dim` that an earlier rewrite made.
++    SmallVector<Value> parts;
++    for (mlir::stablehlo::PadOp pad : {first, second}) {
++      auto concat =
++          pad.getOperand().getDefiningOp<mlir::stablehlo::ConcatenateOp>();
++      if (concat && concat.getDimension() == static_cast<uint64_t>(*dim) &&
++          concat->hasOneUse()) {
++        parts.append(concat.getInputs().begin(), concat.getInputs().end());
++      } else {
++        parts.push_back(pad.getOperand());
++      }
++    }
++    Value result = rewriter.create<mlir::stablehlo::ConcatenateOp>(
++        op.getLoc(), parts, *dim);
++    SmallVector<int64_t> low(first.getEdgePaddingLow());
++    SmallVector<int64_t> high(second.getEdgePaddingHigh());
++    if (llvm::any_of(low, [](int64_t v) { return v != 0; }) ||
++        llvm::any_of(high, [](int64_t v) { return v != 0; })) {
++      result = rewriter.create<mlir::stablehlo::PadOp>(
++          op.getLoc(), op.getType(), result, first.getPaddingValue(),
++          rewriter.getDenseI64ArrayAttr(low),
++          rewriter.getDenseI64ArrayAttr(high),
++          rewriter.getDenseI64ArrayAttr(
++              SmallVector<int64_t>(low.size(), 0)));
++    }
++    rewriter.replaceOp(op, result);
++    return success();
++  }
++
++private:
++  // The only dimension that `pad` pads, with zeros at its edges.
++  static std::optional<int64_t> paddedDim(mlir::stablehlo::PadOp pad) {
++    if (!matchPattern(pad.getPaddingValue(), m_AnyZeroFloat()) &&
++        !matchPattern(pad.getPaddingValue(), m_Zero())) {
++      return std::nullopt;
++    }
++    std::optional<int64_t> dim;
++    for (auto [i, low, high, interior] :
++         llvm::enumerate(pad.getEdgePaddingLow(), pad.getEdgePaddingHigh(),
++                         pad.getInteriorPadding())) {
++      if (low < 0 || high < 0 || interior != 0) {
++        return std::nullopt;
++      }
++      if (low == 0 && high == 0) {
++        continue;
++      }
++      if (dim) {
++        return std::nullopt;
++      }
++      dim = i;
++    }
++    return dim;
++  }
++};
++
+ struct LegalizeStableHLOCompositeToTTIR
+     : public ttir::impl::LegalizeStableHLOCompositeToTTIRBase<
+           LegalizeStableHLOCompositeToTTIR> {
+@@ -2675,6 +2770,22 @@
+                     mlir::stablehlo::SubtractOp,
+                     mlir::stablehlo::TransposeOp>();
+ 
++    // Sums of zero-padded slices become concatenations first (see
++    // AddOfAdjacentPadsPattern), without folding anything else.
++    {
++      RewritePatternSet padSums(context);
++      padSums.add<AddOfAdjacentPadsPattern>(context);
++      GreedyRewriteConfig config;
++      config.enableFolding(false);
++      config.enableConstantCSE(false);
++      config.setRegionSimplificationLevel(GreedySimplifyRegionLevel::Disabled);
++      if (failed(applyPatternsGreedily(getOperation(), std::move(padSums),
++                                       config))) {
++        signalPassFailure();
++        return;
++      }
++    }
++
+     RewritePatternSet patterns(context);
+     populateStableHLOCompositeLegalizationPatterns(context, patterns);
+ 
