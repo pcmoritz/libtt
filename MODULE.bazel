@@ -405,6 +405,7 @@ http_archive(
         "//third_party/tt_metal:block_tilize_narrow.patch",
         "//third_party/tt_metal:sdpa_decode_kv_halves.patch",
         "//third_party/tt_metal:sdpa_decode_window_causal_mask.patch",
+        "//third_party/tt_metal:ttml_cross_entropy_bw_include.patch",
     ],
     sha256 = "b39e812d10b8dd2ca594c2f8a4c80b3d9d54a352c88064956b7350d4c57d5e5d",
     strip_prefix = "tt-metal-334f0f9bc2ccf594b3aab5f7c9083e3469b835b6",
@@ -738,6 +739,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_fold_scalar_broadcasts.patch",
         "//third_party/tt_xla:tt_mlir_paged_decode_kv_rows.patch",
         "//third_party/tt_xla:tt_mlir_sdpa_training.patch",
+        "//third_party/tt_xla:tt_mlir_cross_entropy_training.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

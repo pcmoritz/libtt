@@ -287,25 +287,22 @@ cc_binary(
     deps = ["@llvm_zstd//:zstd"],
 )
 
-# tt-train's fused attention for training (ttml::metal::sdpa_fw and sdpa_bw):
-# the host ops build into ttnn, and their kernels, which include tt-train's
-# common headers by their tt-metal path, go into the runtime archive.
-TTML_SDPA_SRCS = [
-    "tt-train/sources/ttml/metal/ops/sdpa_fw/**/*.cpp",
-    "tt-train/sources/ttml/metal/ops/sdpa_bw/**/*.cpp",
-]
+# tt-train's training kernels (ttml::metal): fused attention (sdpa_fw, sdpa_bw)
+# and cross-entropy (cross_entropy_fw, cross_entropy_bw). The host ops build
+# into ttnn, and their kernels, which include tt-train's common headers by their
+# tt-metal path, go into the runtime archive.
+TTML_OPS = ["sdpa_fw", "sdpa_bw", "cross_entropy_fw", "cross_entropy_bw"]
 
-TTML_SDPA_HDRS = glob([
+TTML_SRCS = ["tt-train/sources/ttml/metal/ops/%s/**/*.cpp" % op for op in TTML_OPS]
+
+TTML_HDRS = glob([
     "tt-train/sources/ttml/metal/common/*.hpp",
-    "tt-train/sources/ttml/metal/ops/sdpa_fw/**/*.hpp",
-    "tt-train/sources/ttml/metal/ops/sdpa_bw/**/*.hpp",
     "tt-train/sources/ttml/metal/ttnn_all_includes.hpp",
-], exclude = ["**/kernels/**"])
+] + ["tt-train/sources/ttml/metal/ops/%s/**/*.hpp" % op for op in TTML_OPS], exclude = ["**/kernels/**"])
 
-TTML_SDPA_KERNELS = glob([
-    "tt-train/sources/ttml/metal/common/**",
-    "tt-train/sources/ttml/metal/ops/sdpa_fw/device/kernels/**",
-    "tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/**",
+TTML_KERNELS = glob(["tt-train/sources/ttml/metal/common/**"] + [
+    "tt-train/sources/ttml/metal/ops/%s/device/kernels/**" % op
+    for op in TTML_OPS
 ])
 
 filegroup(
@@ -313,7 +310,7 @@ filegroup(
     srcs = glob([
         "tt_metal/**",
         "ttnn/**",
-    ]) + TTML_SDPA_KERNELS,
+    ]) + TTML_KERNELS,
 )
 
 pkg_tar(
@@ -1586,7 +1583,7 @@ cc_library(
         "ttnn/cpp/ttnn/operations/moreh/moreh_helper_functions.cpp",
         "@//third_party/tt_xla:tt_metal_cold_stubs.cc",
         "@//ttnn:operation_srcs",
-    ] + glob(TTML_SDPA_SRCS, exclude = ["**/kernels/**"]) + glob(
+    ] + glob(TTML_SRCS, exclude = ["**/kernels/**"]) + glob(
         ["ttnn/cpp/ttnn/operations/**/*.cpp"],
         exclude = TTNN_OPERATION_SRC_EXCLUDES + [
             "ttnn/cpp/ttnn/operations/experimental/**",
@@ -1601,7 +1598,7 @@ cc_library(
             "ttnn/cpp/ttnn/operations/moreh/**",
         ]],
     )).to_list(),
-    hdrs = TTNN_RUNTIME_HDRS + TTML_SDPA_HDRS,
+    hdrs = TTNN_RUNTIME_HDRS + TTML_HDRS,
     copts = TT_METAL_RUNTIME_COPTS,
     includes = TTNN_RUNTIME_INCLUDE_DIRS + ["tt-train/sources/ttml"],
     deps = [

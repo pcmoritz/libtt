@@ -23,8 +23,6 @@
 #include "operations/tensor_serialization/dump_tensor.h"
 #include "operations/tensor_serialization/load_tensor.h"
 #include "operations/ttml/adamw.h"
-#include "operations/ttml/cross_entropy_bw.h"
-#include "operations/ttml/cross_entropy_fw.h"
 #include "operations/ttml/layernorm_bw.h"
 #include "operations/ttml/layernorm_fw.h"
 #include "operations/ttml/rmsnorm_bw.h"
@@ -178,14 +176,6 @@ void run(const ::tt::target::ttnn::AdamWOp *, ProgramContext &) {
 
 void run(const ::tt::target::ttnn::LayerNormForwardOp *, ProgramContext &) {
   unsupported("ttnn.layernorm_forward");
-}
-
-void run(const ::tt::target::ttnn::CrossEntropyForwardOp *, ProgramContext &) {
-  unsupported("ttnn.cross_entropy_forward");
-}
-
-void run(const ::tt::target::ttnn::CrossEntropyBackwardOp *, ProgramContext &) {
-  unsupported("ttnn.cross_entropy_backward");
 }
 
 void run(const ::tt::target::ttnn::LayerNormBackwardOp *, ProgramContext &) {
