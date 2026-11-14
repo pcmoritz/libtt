@@ -719,7 +719,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_stageable_trace_inputs.patch",
         "//third_party/tt_xla:tt_mlir_device_layout.patch",
         "//third_party/tt_xla:tt_mlir_multi_process.patch",
-        "//third_party/tt_xla:tt_mlir_process_collectives.patch",
+        "//third_party/tt_xla:tt_mlir_reduce_scatter_pieces.patch",
         "//third_party/tt_xla:tt_mlir_bounded_debug_strings.patch",
         "//third_party/tt_xla:tt_mlir_float8_scaled_matmul.patch",
         "//third_party/tt_xla:tt_mlir_decode_matmul_to_tt_metal.patch",

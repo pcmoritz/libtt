@@ -3,11 +3,12 @@
 ttnn's collectives write to their peers at the addresses of their own buffers,
 which processes driving one chip each need not share: here rank 1 holds an extra
 buffer first. The unicast all-gather trades output addresses between neighbors
-and the line reduce-scatter intermediate addresses; all-reduces, and gathers and
-scatters of padded or unaligned dimensions, are built from them,
-also of the bytes of object collectives. The 512 MB
-all-gather result stays where the peers wrote it, and the reduce-scatter, whose
-intermediate takes twice its 256 MB input, runs in two pieces.
+and the line reduce-scatter intermediate addresses. All-reduces, gathers and
+scatters of padded or unaligned dimensions, and the bytes of object collectives
+are built from them; decode-sized all-reduces exchange into their program's own
+scratch. The 512 MB all-gather result stays where the peers wrote it, and the
+reduce-scatter, whose intermediate takes twice its 256 MB input, runs in two
+pieces.
 """
 
 import os
@@ -76,6 +77,19 @@ def worker(rank):
     peak = small.to("tpu")
     dist.all_reduce(peak, op=dist.ReduceOp.MAX)
     assert torch.equal(peak.cpu(), small - 100 * rank + 100), "max all-reduce"
+
+    # A decode-sized all-reduce (one tile row of BF16): ttnn's direct exchange, into its program's own scratch.
+    row = (torch.arange(4096, dtype=torch.float32).reshape(1, 4096) % 97 + rank).to(torch.bfloat16)
+    reduced = row.to("tpu")
+    dist.all_reduce(reduced)
+    want = (2 * (row.float() - rank) + 1).to(torch.bfloat16)
+    assert torch.equal(reduced.cpu(), want), "direct all-reduce"
+
+    # A padded row wider than 64 KB (a vocabulary's logits): gathered as row-major rows, each split across packets.
+    logits = (torch.arange(37984, dtype=torch.float32).reshape(1, 37984) % 113 + rank).to(torch.bfloat16)
+    gathered = torch.empty(2, 37984, dtype=torch.bfloat16, device="tpu")
+    dist.all_gather_into_tensor(gathered, logits.to("tpu"))
+    assert torch.equal(gathered.cpu(), torch.cat([logits - rank, logits - rank + 1])), "wide padded all-gather"
 
     # Object collectives send pickled bytes (UINT8), as distributed checkpoints do.
     objects = [None, None]
