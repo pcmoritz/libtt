@@ -20,13 +20,13 @@ from jax_plugins.libtt import torchtitan_tpu_kernels
 HEADS, SEQ, DIM = 8, 256, 128
 
 
-def _inputs(seed, batch=1, kv_heads=2):
+def _inputs(seed, batch=1, kv_heads=2, heads=HEADS, dim=DIM):
     rng = np.random.default_rng(seed)
 
     def tensor(heads):
-        return rng.standard_normal((batch, heads, SEQ, DIM)).astype(ml_dtypes.bfloat16)
+        return rng.standard_normal((batch, heads, SEQ, dim)).astype(ml_dtypes.bfloat16)
 
-    return tensor(HEADS), tensor(kv_heads), tensor(kv_heads), tensor(HEADS)
+    return tensor(heads), tensor(kv_heads), tensor(kv_heads), tensor(heads)
 
 
 def _reference(q, k, v, g, segment_ids=None, window=None):
@@ -50,8 +50,8 @@ def _reference(q, k, v, g, segment_ids=None, window=None):
     dp = np.einsum("bhqd,bhkd->bhqk", g, vr)
     ds = p * (dp - np.sum(g * out, -1, keepdims=True)) * scale
     dq = np.einsum("bhqk,bhkd->bhqd", ds, kr)
-    dk = np.einsum("bhqk,bhqd->bhkd", ds, q).reshape(batch, kv_heads, group, SEQ, DIM).sum(2)
-    dv = np.einsum("bhqk,bhqd->bhkd", p, g).reshape(batch, kv_heads, group, SEQ, DIM).sum(2)
+    dk = np.einsum("bhqk,bhqd->bhkd", ds, q).reshape(batch, kv_heads, group, SEQ, -1).sum(2)
+    dv = np.einsum("bhqk,bhqd->bhkd", p, g).reshape(batch, kv_heads, group, SEQ, -1).sum(2)
     return out, lse, dq, dk, dv
 
 
@@ -135,5 +135,23 @@ def test_splash_attention_functions(batch, kv_heads, segment_ids, window):
     assert _relative_error(lse, lse_want) < 2e-3
     dq, dk, dv = splash_bwd_fn(tq, tk, tv, out, lse, tg, tsegments)
     assert dk.shape == k.shape
+    for got, want in ((dq, dq_want), (dk, dk_want), (dv, dv_want)):
+        assert _relative_error(got, want) < 0.03
+
+
+def test_qwen3_5_attention():
+    # Qwen3.5's full attention: 16 query heads over 4 KV heads of 256 dimensions, with packed documents.
+    heads, kv_heads = 16, 4
+    q, k, v, g = _inputs(2, batch=2, kv_heads=kv_heads, heads=heads, dim=256)
+    segment_ids = _segment_ids()
+    out_want, lse_want, dq_want, dk_want, dv_want = _reference(q, k, v, g, segment_ids)
+    splash_fn, splash_bwd_fn = torchtitan_tpu_kernels._make_splash_attention_fn(
+        seq_len=SEQ, n_heads=heads, n_kv_heads=kv_heads, is_causal=True
+    )
+    tq, tk, tv, tg, tsegments = _device(q, k, v, g, segment_ids)
+    out, lse = splash_fn(tq, tk, tv, tsegments)
+    assert _relative_error(out, out_want) < 0.02
+    assert _relative_error(lse, lse_want) < 2e-3
+    dq, dk, dv = splash_bwd_fn(tq, tk, tv, out, lse, tg, tsegments)
     for got, want in ((dq, dq_want), (dk, dk_want), (dv, dv_want)):
         assert _relative_error(got, want) < 0.03
