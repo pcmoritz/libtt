@@ -10,7 +10,7 @@ diff --git a/runtime/include/tt/runtime/detail/ttnn/utils.h b/runtime/include/tt
  namespace tt::runtime::ttnn::utils {
  
  bool isOnHost(const ::ttnn::StorageType &storageType);
-@@ -234,6 +236,15 @@ inline std::vector<T> getReplicatedValues(const ::ttnn::Tensor &tensor) {
+@@ -234,6 +236,30 @@ inline std::vector<T> getReplicatedValues(const ::ttnn::Tensor &tensor) {
    return std::move(*values);
  }
  
@@ -23,13 +23,28 @@ diff --git a/runtime/include/tt/runtime/detail/ttnn/utils.h b/runtime/include/tt
 +runSymmetricCollective(::ttnn::MeshDevice &device,
 +                       const std::function<::ttnn::Tensor()> &collective);
 +
++// The size of `device`'s symmetric DRAM region in each DRAM bank, 0 without
++// one.
++void setSymmetricDramSizePerBank(const ::ttnn::MeshDevice &device,
++                                 uint64_t size);
++
++// runSymmetricCollective of `collective` on `input`. When the collective's
++// buffers in the region (`regionBytesPerInputByte` times the input's size)
++// would overflow it, it runs on pieces of `input` split along a dimension
++// other than `collectiveDim`, and their results are concatenated.
++::ttnn::Tensor runSymmetricCollectiveInPieces(
++    const ::ttnn::Tensor &input, int32_t collectiveDim,
++    double regionBytesPerInputByte,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig,
++    const std::function<::ttnn::Tensor(const ::ttnn::Tensor &)> &collective);
++
  template <typename T>
  inline T getScalarFromTensor(const ::ttnn::Tensor &tensor) {
    std::vector<T> data = getReplicatedValues<T>(tensor);
 diff --git a/runtime/lib/ttnn/operations/ccl/all_gather.cpp b/runtime/lib/ttnn/operations/ccl/all_gather.cpp
 --- a/runtime/lib/ttnn/operations/ccl/all_gather.cpp
 +++ b/runtime/lib/ttnn/operations/ccl/all_gather.cpp
-@@ -35,10 +35,13 @@ void run(const ::tt::target::ttnn::AllGatherOp *op, ProgramContext &context) {
+@@ -35,10 +35,17 @@ void run(const ::tt::target::ttnn::AllGatherOp *op, ProgramContext &context) {
          ::tt::runtime::common::toMetalTopology(op->topology().value()));
    }
  
@@ -37,9 +52,13 @@ diff --git a/runtime/lib/ttnn/operations/ccl/all_gather.cpp b/runtime/lib/ttnn/o
 -      ::ttnn::all_gather(input, allGatherDim, clusterAxis, outputMemoryConfig,
 -                         persistentOutputTensor, subDeviceId,
 -                         /*sub_core_grid=*/std::nullopt, numLinks, topology);
-+  ::ttnn::Tensor out = ::tt::runtime::ttnn::utils::runSymmetricCollective(
-+      *input.device(), [&] {
-+    return ::ttnn::all_gather(input, allGatherDim, clusterAxis,
++  // The gathered result is the collective's only buffer in the symmetric
++  // region; the number of devices bounds its size.
++  ::ttnn::Tensor out =
++      ::tt::runtime::ttnn::utils::runSymmetricCollectiveInPieces(
++          input, allGatherDim, input.device()->shape().mesh_size(),
++          outputMemoryConfig, [&](const ::ttnn::Tensor &piece) {
++    return ::ttnn::all_gather(piece, allGatherDim, clusterAxis,
 +                              outputMemoryConfig, persistentOutputTensor,
 +                              subDeviceId, /*sub_core_grid=*/std::nullopt,
 +                              numLinks, topology);
@@ -89,7 +108,7 @@ diff --git a/runtime/lib/ttnn/operations/ccl/all_reduce_async.cpp b/runtime/lib/
 diff --git a/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp b/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp
 --- a/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp
 +++ b/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp
-@@ -57,14 +57,17 @@ void run(const ::tt::target::ttnn::ReduceScatterOp *op,
+@@ -57,14 +57,21 @@ void run(const ::tt::target::ttnn::ReduceScatterOp *op,
          utils::createDeviceComputeKernelConfig(op->compute_config());
    }
  
@@ -101,10 +120,14 @@ diff --git a/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp b/runtime/lib/tt
 -      /*num_workers_per_link=*/std::nullopt,
 -      /*num_buffers_per_channel=*/std::nullopt,
 -      /*compute_kernel_config=*/computeConfig);
-+  ::ttnn::Tensor out = ::tt::runtime::ttnn::utils::runSymmetricCollective(
-+      *input.device(), [&] {
++  // reduce_scatter's buffers in the symmetric region take twice its input
++  // and its result: at most 2.5 times its input.
++  ::ttnn::Tensor out =
++      ::tt::runtime::ttnn::utils::runSymmetricCollectiveInPieces(
++          input, scatterDimension, 2.5, outputMemoryConfig,
++          [&](const ::ttnn::Tensor &piece) {
 +    return ::ttnn::reduce_scatter(
-+        input, scatterDimension, clusterAxis, subDeviceId, outputMemoryConfig,
++        piece, scatterDimension, clusterAxis, subDeviceId, outputMemoryConfig,
 +        /*intermediate_memory_config=*/std::nullopt, optionalOutputTensor,
 +        numLinks, topology,
 +        /*chunks_per_sync=*/std::nullopt,
@@ -129,7 +152,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  #include <sys/mman.h>
  #include <thread>
  
-@@ -867,6 +870,33 @@ size_t getNumAvailableDevices() {
+@@ -867,6 +870,35 @@ size_t getNumAvailableDevices() {
    return ::tt::tt_metal::GetNumAvailableDevices();
  }
  
@@ -155,15 +178,17 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +                              .buffer_type = ::ttnn::BufferType::DRAM,
 +                              .bottom_up = false},
 +      &meshDevice);
-+  meshDevice.allocator()->set_symmetric_dram(
-+      buffer->address(), buffer->get_reference_buffer()->aligned_size_per_bank());
++  const uint64_t sizePerBank =
++      buffer->get_reference_buffer()->aligned_size_per_bank();
++  meshDevice.allocator()->set_symmetric_dram(buffer->address(), sizePerBank);
++  utils::setSymmetricDramSizePerBank(meshDevice, sizePerBank);
 +  symmetricDram[&meshDevice] = std::move(buffer);
 +}
 +
  Device openMeshDevice(const MeshDeviceOptions &options) {
    std::optional<::ttnn::MeshShape> meshShape = std::nullopt;
    if (options.meshShape.has_value()) {
-@@ -896,6 +926,7 @@ Device openMeshDevice(const MeshDeviceOptions &options) {
+@@ -896,6 +928,7 @@ Device openMeshDevice(const MeshDeviceOptions &options) {
    } else {
      meshDevice->disable_and_clear_program_cache();
    }
@@ -171,12 +196,13 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  
    LOG_DEBUG("Device grid size = { ",
              meshDevice->compute_with_storage_grid_size().x, ", ",
-@@ -936,6 +967,10 @@ void closeMeshDevice(Device parentMesh) {
+@@ -936,6 +969,11 @@ void closeMeshDevice(Device parentMesh) {
  #if defined(TT_RUNTIME_ENABLE_PERF_TRACE) && TT_RUNTIME_ENABLE_PERF_TRACE == 1
    ::tt::tt_metal::ReadMeshDeviceProfilerResults(ttnnMeshDevice);
  #endif
 +  if (symmetricDram.count(&ttnnMeshDevice)) {
 +    ttnnMeshDevice.allocator()->set_symmetric_dram(0, 0);
++    utils::setSymmetricDramSizePerBank(ttnnMeshDevice, 0);
 +    symmetricDram.erase(&ttnnMeshDevice);
 +  }
    ttnnMeshDevice.close();
@@ -185,16 +211,22 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
 --- a/runtime/lib/ttnn/utils/utils.cpp
 +++ b/runtime/lib/ttnn/utils/utils.cpp
-@@ -9,6 +9,8 @@
+@@ -9,6 +9,14 @@
  #include "tt/runtime/types.h"
  #include "tt/runtime/utils.h"
  
 +#include "ttnn/operations/data_movement/clone/clone.hpp"
++#include "ttnn/operations/data_movement/concat/concat.hpp"
++#include "ttnn/operations/data_movement/slice/slice.hpp"
++
++#include <cmath>
++#include <map>
++#include <mutex>
 +
  #include <memory>
  #include <vector>
  
-@@ -662,4 +664,39 @@ getMemoryView(Device deviceHandle) {
+@@ -662,4 +670,130 @@ getMemoryView(Device deviceHandle) {
    return memoryMap;
  }
  
@@ -231,6 +263,97 @@ diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
 +  // Copied out after the scope ends, outside the region the next collective
 +  // reuses.
 +  return ::ttnn::clone(result, std::nullopt, std::nullopt, std::nullopt);
++}
++
++namespace {
++std::mutex symmetricDramSizesMutex;
++std::map<const ::ttnn::MeshDevice *, uint64_t> &symmetricDramSizes() {
++  // Leaked so that it outlives static destruction.
++  static auto &sizes = *new std::map<const ::ttnn::MeshDevice *, uint64_t>();
++  return sizes;
++}
++} // namespace
++
++void setSymmetricDramSizePerBank(const ::ttnn::MeshDevice &device,
++                                 uint64_t size) {
++  std::lock_guard<std::mutex> lock(symmetricDramSizesMutex);
++  if (size) {
++    symmetricDramSizes()[&device] = size;
++  } else {
++    symmetricDramSizes().erase(&device);
++  }
++}
++
++::ttnn::Tensor runSymmetricCollectiveInPieces(
++    const ::ttnn::Tensor &input, int32_t collectiveDim,
++    double regionBytesPerInputByte,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig,
++    const std::function<::ttnn::Tensor(const ::ttnn::Tensor &)> &collective) {
++  ::ttnn::MeshDevice &device = *input.device();
++  auto whole = [&] {
++    return runSymmetricCollective(device, [&] { return collective(input); });
++  };
++  uint64_t sizePerBank = 0;
++  {
++    std::lock_guard<std::mutex> lock(symmetricDramSizesMutex);
++    auto it = symmetricDramSizes().find(&device);
++    if (it != symmetricDramSizes().end()) {
++      sizePerBank = it->second;
++    }
++  }
++  if (!sizePerBank || !input.memory_config().is_dram() ||
++      input.memory_config().is_sharded()) {
++    return whole();
++  }
++  // Buffers are interleaved over the DRAM banks; 10% for their page rounding.
++  const double bytesPerBank =
++      regionBytesPerInputByte * input.physical_volume() *
++      input.element_size() /
++      device.allocator()->get_num_banks(::ttnn::BufferType::DRAM);
++  const auto pieces =
++      static_cast<uint32_t>(std::ceil(bytesPerBank / (0.9 * sizePerBank)));
++  if (pieces <= 1) {
++    return whole();
++  }
++
++  // Split the dimension with the most units (tiles in the two tiled
++  // dimensions) into `pieces` runs of units.
++  const ::ttnn::Shape &shape = input.logical_shape();
++  const int32_t rank = static_cast<int32_t>(shape.rank());
++  const int32_t skip = collectiveDim < 0 ? collectiveDim + rank : collectiveDim;
++  const bool tiled = input.layout() == ::ttnn::Layout::TILE;
++  const auto tileShape = input.tensor_spec().tile().get_tile_shape();
++  int32_t splitDim = -1;
++  uint32_t unit = 1;
++  uint32_t units = 0;
++  for (int32_t dim = 0; dim < rank; ++dim) {
++    const uint32_t dimUnit =
++        !tiled || dim < rank - 2 ? 1 : tileShape[dim - (rank - 2)];
++    if (dim == skip || shape[dim] % dimUnit != 0 ||
++        shape[dim] / dimUnit <= units) {
++      continue;
++    }
++    splitDim = dim;
++    unit = dimUnit;
++    units = shape[dim] / dimUnit;
++  }
++  if (splitDim < 0 || units < pieces) {
++    return whole();
++  }
++
++  const uint32_t unitsPerPiece = (units + pieces - 1) / pieces;
++  ::ttsl::SmallVector<uint32_t> begins(rank, 0);
++  ::ttsl::SmallVector<uint32_t> ends(shape.cbegin(), shape.cend());
++  const ::ttsl::SmallVector<uint32_t> steps(rank, 1);
++  std::vector<::ttnn::Tensor> results;
++  for (uint32_t start = 0; start < units; start += unitsPerPiece) {
++    begins[splitDim] = start * unit;
++    ends[splitDim] = std::min(units, start + unitsPerPiece) * unit;
++    ::ttnn::Tensor piece = ::ttnn::slice(input, begins, ends, steps);
++    results.push_back(
++        runSymmetricCollective(device, [&] { return collective(piece); }));
++  }
++  return ::ttnn::concat(results, splitDim, outputMemoryConfig);
 +}
 +
  } // namespace tt::runtime::ttnn::utils
