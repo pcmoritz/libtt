@@ -29,6 +29,10 @@ LOSS_KERNEL_MODULE = "tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_
 # Tokens per cross-entropy call: a chunk's BF16 logits and their gradient take
 # 1.2 GB at Qwen3's 151,936-token vocabulary.
 LOSS_TOKEN_CHUNK = 2048
+# Vocabulary columns per FP32 weight-gradient accumulator: 537 MB at a hidden
+# size of 4096, where one [4096, 151936] accumulator needs a free 311 MB block in
+# each of a Blackhole's 8 DRAM banks, more than a busy chip has.
+LOSS_WEIGHT_COLUMNS = 32768
 # ttml::metal::AttentionMaskType.
 _NO_MASK, _CAUSAL_MASK, _ARBITRARY_MASK = 0, 1, 2
 # Columns of tt-train's intermediates; the log-sum-exp is the first.
@@ -157,7 +161,8 @@ def linear_cross_entropy_fwd(x, labels, w, *, reduction="sum", **_):
 
 def linear_cross_entropy_bwd(dout, lse, x, labels, w, *, reduction="sum", **_):
     """(dx, dw) of linear_cross_entropy_fwd; tt-train's backward recomputes each chunk's softmax from its
-    logits, so the saved logsumexp is unused. The weight gradient adds up chunk by chunk in w's dtype."""
+    logits, so the saved logsumexp is unused. The weight gradient adds up chunk by chunk in FP32,
+    LOSS_WEIGHT_COLUMNS vocabulary columns at a time."""
     import jax
     import jax.numpy as jnp
 
@@ -167,7 +172,8 @@ def linear_cross_entropy_bwd(dout, lse, x, labels, w, *, reduction="sum", **_):
     per_token = reduction == "none"
     grad = jnp.ones((1, 1, 1, 1), x.dtype) if per_token else dout.reshape(1, 1, 1, 1).astype(x.dtype)
     scaler = 1.0 / tokens if reduction == "mean" else 1.0
-    dx, dw = [], None
+    columns = [(start, min(LOSS_WEIGHT_COLUMNS, w.shape[1] - start)) for start in range(0, w.shape[1], LOSS_WEIGHT_COLUMNS)]
+    dx, dw = [], [None] * len(columns)
     for start, size in _token_chunks(tokens):
         x_chunk = x[start : start + size]
         logits = jnp.dot(x_chunk, w)
@@ -177,9 +183,10 @@ def linear_cross_entropy_bwd(dout, lse, x, labels, w, *, reduction="sum", **_):
         if per_token:
             dlogits = dlogits * dout[start : start + size, None].astype(dlogits.dtype)
         dx.append(jnp.dot(dlogits, w.T).astype(x.dtype))
-        dw_chunk = jnp.dot(x_chunk.T, dlogits).astype(w.dtype)
-        dw = dw_chunk if dw is None else dw + dw_chunk
-    return jnp.concatenate(dx), dw
+        for i, (column, width) in enumerate(columns):
+            part = jnp.dot(x_chunk.T, dlogits[:, column : column + width], preferred_element_type=jnp.float32)
+            dw[i] = part if dw[i] is None else dw[i] + part
+    return jnp.concatenate(dx), jnp.concatenate([part.astype(w.dtype) for part in dw], axis=1)
 
 
 def _patch_loss_kernel_module(module):
