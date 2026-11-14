@@ -741,6 +741,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_sdpa_training.patch",
         "//third_party/tt_xla:tt_mlir_cross_entropy_training.patch",
         "//third_party/tt_xla:tt_mlir_triangular_solve.patch",
+        "//third_party/tt_xla:tt_mlir_pad_sum_concat.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
