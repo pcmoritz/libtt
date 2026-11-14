@@ -15,6 +15,8 @@
   `scaled_dot_product_attention` takes its StableHLO implementation instead.
 - SGLang-TorchTPU's attention and gated DeltaNet kernels run as JAX
   (`sglang_tpu_kernels`, `sglang_tpu_gdn`).
+- TorchTitan's TPU trainer's splash attention runs tt-train's fused attention
+  for training (`torchtitan_tpu_kernels`).
 """
 
 import importlib.abc
@@ -79,6 +81,7 @@ os.environ.setdefault("TPU_LIBRARY_PATH", str(pathlib.Path(__file__).with_name("
 os.environ["LIBTT_TPU_COMPAT"] = "1"
 
 from jax_plugins.libtt import sglang_tpu_kernels  # noqa: E402
+from jax_plugins.libtt import torchtitan_tpu_kernels  # noqa: E402
 
 sys.meta_path.insert(
     0,
@@ -86,6 +89,7 @@ sys.meta_path.insert(
         {
             _HARDWARE_MODULE: _patch_hardware,
             **sglang_tpu_kernels.PATCHES,
+            **torchtitan_tpu_kernels.PATCHES,
         }
     ),
 )

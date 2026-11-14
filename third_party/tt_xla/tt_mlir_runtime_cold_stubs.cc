@@ -29,8 +29,6 @@
 #include "operations/ttml/layernorm_fw.h"
 #include "operations/ttml/rmsnorm_bw.h"
 #include "operations/ttml/rmsnorm_fw.h"
-#include "operations/ttml/sdpa_bw.h"
-#include "operations/ttml/sdpa_fw.h"
 #include "operations/ttml/softmax_backward.h"
 #include "operations/ttml/swiglu_elemwise_bw.h"
 
@@ -176,14 +174,6 @@ namespace tt::runtime::ttnn::operations::ttml {
 
 void run(const ::tt::target::ttnn::AdamWOp *, ProgramContext &) {
   unsupported("ttnn.adamw");
-}
-
-void run(const ::tt::target::ttnn::SDPAForwardOp *, ProgramContext &) {
-  unsupported("ttnn.sdpa_forward");
-}
-
-void run(const ::tt::target::ttnn::SDPABackwardOp *, ProgramContext &) {
-  unsupported("ttnn.sdpa_backward");
 }
 
 void run(const ::tt::target::ttnn::LayerNormForwardOp *, ProgramContext &) {

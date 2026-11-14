@@ -287,12 +287,33 @@ cc_binary(
     deps = ["@llvm_zstd//:zstd"],
 )
 
+# tt-train's fused attention for training (ttml::metal::sdpa_fw and sdpa_bw):
+# the host ops build into ttnn, and their kernels, which include tt-train's
+# common headers by their tt-metal path, go into the runtime archive.
+TTML_SDPA_SRCS = [
+    "tt-train/sources/ttml/metal/ops/sdpa_fw/**/*.cpp",
+    "tt-train/sources/ttml/metal/ops/sdpa_bw/**/*.cpp",
+]
+
+TTML_SDPA_HDRS = glob([
+    "tt-train/sources/ttml/metal/common/*.hpp",
+    "tt-train/sources/ttml/metal/ops/sdpa_fw/**/*.hpp",
+    "tt-train/sources/ttml/metal/ops/sdpa_bw/**/*.hpp",
+    "tt-train/sources/ttml/metal/ttnn_all_includes.hpp",
+], exclude = ["**/kernels/**"])
+
+TTML_SDPA_KERNELS = glob([
+    "tt-train/sources/ttml/metal/common/**",
+    "tt-train/sources/ttml/metal/ops/sdpa_fw/device/kernels/**",
+    "tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/**",
+])
+
 filegroup(
     name = "tt_metal_runtime_sources",
     srcs = glob([
         "tt_metal/**",
         "ttnn/**",
-    ]),
+    ]) + TTML_SDPA_KERNELS,
 )
 
 pkg_tar(
@@ -1565,7 +1586,7 @@ cc_library(
         "ttnn/cpp/ttnn/operations/moreh/moreh_helper_functions.cpp",
         "@//third_party/tt_xla:tt_metal_cold_stubs.cc",
         "@//ttnn:operation_srcs",
-    ] + glob(
+    ] + glob(TTML_SDPA_SRCS, exclude = ["**/kernels/**"]) + glob(
         ["ttnn/cpp/ttnn/operations/**/*.cpp"],
         exclude = TTNN_OPERATION_SRC_EXCLUDES + [
             "ttnn/cpp/ttnn/operations/experimental/**",
@@ -1580,9 +1601,9 @@ cc_library(
             "ttnn/cpp/ttnn/operations/moreh/**",
         ]],
     )).to_list(),
-    hdrs = TTNN_RUNTIME_HDRS,
+    hdrs = TTNN_RUNTIME_HDRS + TTML_SDPA_HDRS,
     copts = TT_METAL_RUNTIME_COPTS,
-    includes = TTNN_RUNTIME_INCLUDE_DIRS,
+    includes = TTNN_RUNTIME_INCLUDE_DIRS + ["tt-train/sources/ttml"],
     deps = [
         ":tt_metal_version_header",
         ":tt_metal_device_tensor_upstream",

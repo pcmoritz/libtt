@@ -1,0 +1,196 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -6708,6 +6708,40 @@
+   let results = (outs AnyRankedTensor:$output, AnyRankedTensor:$scale);
+ }
+ 
++def TTIR_SDPAForwardOp : TTIR_NamedOp<"sdpa_fw"> {
++  let summary = "Fused attention forward for training.";
++  let description = [{
++    `query` is [B, Hq, S, D], `key` and `value` [B, Hkv, S, D] with Hq a
++    multiple of Hkv (grouped-query attention). `output` [B, Hq, S, D] is
++    softmax(query key^T / sqrt(D)) value, unmasked, causal or, for
++    `mask_type` arbitrary, masked by `attention_mask` [1, 1, S, S] (1 keeps a
++    score, 0 drops it). `intermediates` [B, Hq, S, 32] FP32 holds each row's
++    log-sum-exp of the scaled scores in its first column, for ttir.sdpa_bw.
++    Lowers to ttnn.sdpa_fw, tt-train's ttml::metal::sdpa_fw.
++  }];
++  let arguments = (ins AnyRankedTensor:$query, AnyRankedTensor:$key,
++                       AnyRankedTensor:$value,
++                       Optional<AnyRankedTensor>:$attention_mask,
++                       TTCore_AttentionMaskTypeAttr:$mask_type);
++  let results = (outs AnyRankedTensor:$output, AnyRankedTensor:$intermediates);
++}
++
++def TTIR_SDPABackwardOp : TTIR_NamedOp<"sdpa_bw"> {
++  let summary = "Fused attention backward for training.";
++  let description = [{
++    The gradients of ttir.sdpa_fw's query, key and value given `grad_output`,
++    from the forward's `output` and `intermediates`, without recomputing the
++    forward. Lowers to ttnn.sdpa_bw, tt-train's ttml::metal::sdpa_bw.
++  }];
++  let arguments = (ins AnyRankedTensor:$grad_output, AnyRankedTensor:$output,
++                       AnyRankedTensor:$query, AnyRankedTensor:$key,
++                       AnyRankedTensor:$value, AnyRankedTensor:$intermediates,
++                       Optional<AnyRankedTensor>:$attention_mask,
++                       TTCore_AttentionMaskTypeAttr:$mask_type);
++  let results = (outs AnyRankedTensor:$grad_query, AnyRankedTensor:$grad_key,
++                      AnyRankedTensor:$grad_value);
++}
++
+ def TTIR_GatedDeltaRuleOp : TTIR_NamedOp<"gated_delta_rule"> {
+   let summary = "gated delta rule.";
+   let arguments = (ins AnyRankedTensor:$query,
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -10274,6 +10274,65 @@
+ 
+ // `tt.quantize_rows` (jax.ffi.ffi_call with min_scale and e5m2 attributes):
+ // one input, the float8 output and the FP32 scale.
++// `tt.sdpa_fw` (query, key, value[, mask] -> output, intermediates) and
++// `tt.sdpa_bw` (grad_output, output, query, key, value, intermediates[, mask]
++// -> grad_query, grad_key, grad_value), jax.ffi.ffi_call with a mask_type
++// attribute (0 none, 1 causal, 2 the mask operand, as upstream's
++// tenstorrent.sdpa_fw composites): tt-train's fused attention for training,
++// see ttir.sdpa_fw.
++class StableHLOSDPATrainingConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
++public:
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::CustomCallOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    StringRef target = op.getCallTargetName();
++    const bool forward = target == "tt.sdpa_fw";
++    if (!forward && target != "tt.sdpa_bw") {
++      return failure();
++    }
++    auto backendConfig = getFfiBackendConfig(op);
++    IntegerAttr maskTypeAttr =
++        backendConfig ? backendConfig.getAs<IntegerAttr>("mask_type") : nullptr;
++    std::optional<ttcore::AttentionMaskType> maskType =
++        maskTypeAttr ? ttcore::symbolizeAttentionMaskType(
++                           static_cast<uint32_t>(maskTypeAttr.getInt()))
++                     : std::nullopt;
++    if (!maskType) {
++      return op.emitOpError()
++             << target << " needs a mask_type attribute: 0, 1 or 2";
++    }
++    const unsigned tensors = forward ? 3u : 6u;
++    const bool masked = *maskType == ttcore::AttentionMaskType::Arbitrary;
++    if (op.getNumOperands() != tensors + (masked ? 1u : 0u) ||
++        op.getNumResults() != (forward ? 2u : 3u)) {
++      return op.emitOpError()
++             << target << " takes " << tensors
++             << " operands, and a mask when mask_type is 2, and returns "
++             << (forward ? 2 : 3) << " results";
++    }
++    SmallVector<Type> types;
++    if (failed(getTypeConverter()->convertTypes(op.getResultTypes(), types))) {
++      return failure();
++    }
++    ValueRange operands = adaptor.getOperands();
++    Value mask = masked ? operands[tensors] : Value();
++    auto maskTypeAttribute =
++        ttcore::AttentionMaskTypeAttr::get(rewriter.getContext(), *maskType);
++    if (forward) {
++      rewriter.replaceOpWithNewOp<ttir::SDPAForwardOp>(
++          op, types, operands[0], operands[1], operands[2], mask,
++          maskTypeAttribute);
++    } else {
++      rewriter.replaceOpWithNewOp<ttir::SDPABackwardOp>(
++          op, types, operands[0], operands[1], operands[2], operands[3],
++          operands[4], operands[5], mask, maskTypeAttribute);
++    }
++    return success();
++  }
++};
++
+ class StableHLOQuantizeRowsConversionPattern
+     : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
+ public:
+@@ -12289,6 +12348,8 @@
+       typeConverter, ctx);
+   patterns.add<StableHLOQuantizeRowsConversionPattern>(typeConverter,
+                                                         patterns.getContext());
++  patterns.add<StableHLOSDPATrainingConversionPattern>(typeConverter,
++                                                        patterns.getContext());
+   patterns.add<StableHLORecurrentOpConversionPattern>(typeConverter,
+                                                       patterns.getContext());
+   patterns.add<StableHLOToTTIRCustomCallOpConversionPattern>(typeConverter,
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -3610,6 +3610,47 @@
+     return success();
+   }
+ };
++// ttir.sdpa_fw and sdpa_bw to tt-train's ttnn.sdpa_fw and sdpa_bw, without
++// dropout; the forward returns its intermediates.
++class SDPAForwardOpConversionPattern
++    : public OpConversionPattern<ttir::SDPAForwardOp> {
++public:
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(ttir::SDPAForwardOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    SmallVector<Type> types;
++    if (failed(getTypeConverter()->convertTypes(op->getResultTypes(), types))) {
++      return failure();
++    }
++    rewriter.replaceOpWithNewOp<ttnn::SDPAForwardOp>(
++        op, types, adaptor.getQuery(), adaptor.getKey(), adaptor.getValue(),
++        adaptor.getAttentionMask(), op.getMaskTypeAttr(),
++        rewriter.getF32FloatAttr(0.0f), rewriter.getBoolAttr(true));
++    return success();
++  }
++};
++
++class SDPABackwardOpConversionPattern
++    : public OpConversionPattern<ttir::SDPABackwardOp> {
++public:
++  using OpConversionPattern::OpConversionPattern;
++  LogicalResult
++  matchAndRewrite(ttir::SDPABackwardOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    SmallVector<Type> types;
++    if (failed(getTypeConverter()->convertTypes(op->getResultTypes(), types))) {
++      return failure();
++    }
++    rewriter.replaceOpWithNewOp<ttnn::SDPABackwardOp>(
++        op, types, adaptor.getGradOutput(), adaptor.getOutput(),
++        adaptor.getQuery(), adaptor.getKey(), adaptor.getValue(),
++        adaptor.getIntermediates(), adaptor.getAttentionMask(),
++        op.getMaskTypeAttr(), rewriter.getF32FloatAttr(0.0f));
++    return success();
++  }
++};
++
+ class QuantizeRowsOpConversionPattern
+     : public OpConversionPattern<ttir::QuantizeRowsOp> {
+ public:
+@@ -4273,6 +4314,8 @@
+            PagedScaledDotProductAttentionDecodeOpConversionPattern,
+            ChunkedScaledDotProductAttentionOpConversionPattern,
+            QuantizeRowsOpConversionPattern,
++           SDPAForwardOpConversionPattern,
++           SDPABackwardOpConversionPattern,
+            GatedDeltaRuleOpConversionPattern,
+            GatedDeltaDecodeOpConversionPattern,
+            CausalConv1dUpdateOpConversionPattern,
+diff --git a/runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp b/runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp
+--- a/runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp
++++ b/runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp
+@@ -32,8 +32,8 @@
+   const ::ttml::metal::AttentionMaskType maskType =
+       static_cast<::ttml::metal::AttentionMaskType>(op->mask_type());
+ 
+-  // Returns {grad_query, grad_key, grad_value}.
+-  auto [gradQuery, gradKey, gradValue] = ::ttml::metal::sdpa_bw(
++  // Returns {grad_query, grad_key, grad_value, grad_gate}; there is no gate.
++  auto [gradQuery, gradKey, gradValue, gradGate] = ::ttml::metal::sdpa_bw(
+       gradOutput, attnOutput, query, key, value, intermediates, maskType, mask,
+       op->dropout_probability());
+ 

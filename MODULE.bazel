@@ -737,6 +737,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_square_without_abs.patch",
         "//third_party/tt_xla:tt_mlir_fold_scalar_broadcasts.patch",
         "//third_party/tt_xla:tt_mlir_paged_decode_kv_rows.patch",
+        "//third_party/tt_xla:tt_mlir_sdpa_training.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
