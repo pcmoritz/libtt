@@ -16,8 +16,9 @@
 - SGLang-TorchTPU's attention and gated DeltaNet kernels run as JAX
   (`sglang_tpu_kernels`, `sglang_tpu_gdn`).
 - TorchTitan's TPU trainer's splash attention and fused loss run tt-train's
-  fused attention and cross-entropy, and Qwen3.5's gated RMSNorm its PyTorch
-  path (`torchtitan_tpu_kernels`).
+  fused attention and cross-entropy, Qwen3.5's gated RMSNorm its PyTorch path,
+  and Llama 3's rotary embedding rotates pairs without a [..., D/2, 2] view
+  (`torchtitan_tpu_kernels`).
 """
 
 import importlib.abc
