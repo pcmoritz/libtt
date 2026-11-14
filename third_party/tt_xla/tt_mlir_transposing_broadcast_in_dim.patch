@@ -1,0 +1,63 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -4819,6 +4819,33 @@ public:
+     auto outputType = mlir::cast<RankedTensorType>(
+         getTypeConverter()->convertType(srcOp.getResult().getType()));
+ 
++    // The reshape and broadcast below keep the operand's dims in their order,
++    // so they place operand dim i at result dim broadcast_dimensions[i] only
++    // when those increase. Unsorted ones also transpose the operand (PyTorch's
++    // matmul backward broadcasts a transposed weight with dims [2, 1]):
++    // permute it into the order of its result dims first.
++    Value operand = adaptor.getOperand();
++    SmallVector<int64_t> broadcastDimensions(srcOp.getBroadcastDimensions());
++    if (!llvm::is_sorted(broadcastDimensions)) {
++      SmallVector<int64_t> permutation(broadcastDimensions.size());
++      std::iota(permutation.begin(), permutation.end(), 0);
++      llvm::stable_sort(permutation, [&](int64_t a, int64_t b) {
++        return broadcastDimensions[a] < broadcastDimensions[b];
++      });
++      SmallVector<int64_t> permutedShape;
++      SmallVector<int64_t> sortedDimensions;
++      for (int64_t d : permutation) {
++        permutedShape.push_back(inputType.getDimSize(d));
++        sortedDimensions.push_back(broadcastDimensions[d]);
++      }
++      inputType = RankedTensorType::get(permutedShape,
++                                        inputType.getElementType(),
++                                        inputType.getEncoding());
++      operand = rewriter.create<ttir::PermuteOp>(srcOp.getLoc(), inputType,
++                                                 operand, permutation);
++      broadcastDimensions = sortedDimensions;
++    }
++
+     if (inputType.getRank() == outputType.getRank()) {
+       // No unsqueeze is needed in this case and this broadcast can be
+       // represented by broadcast op.
+@@ -4830,14 +4857,13 @@ public:
+                                                          outputShape);
+ 
+       rewriter.replaceOpWithNewOp<mlir::tt::ttir::BroadcastOp>(
+-          srcOp, outputType, adaptor.getOperand(), broadcastShape);
++          srcOp, outputType, operand, broadcastShape);
+     } else {
+       // This stablehlo operation cannot be represented by a single TTIR
+       // operation. It has to be split into ttir.reshape followed by a
+       // ttir.broadcast op.
+       SmallVector<int64_t> unsqueezeShape(outputType.getRank(), 1);
+-      ::llvm::ArrayRef<int64_t> broadcastInDim =
+-          adaptor.getBroadcastDimensions();
++      ::llvm::ArrayRef<int64_t> broadcastInDim = broadcastDimensions;
+ 
+       // Since we convert scalars to 1D tensors as a special case,
+       // so check input dimension is not empty.
+@@ -4854,7 +4880,7 @@ public:
+       RankedTensorType unsqueezedType =
+           RankedTensorType::get(unsqueezeShape, inputType.getElementType());
+       ttir::ReshapeOp reshapeOp = rewriter.create<ttir::ReshapeOp>(
+-          srcOp.getLoc(), unsqueezedType, adaptor.getOperand(), reshapeDimAttr);
++          srcOp.getLoc(), unsqueezedType, operand, reshapeDimAttr);
+ 
+       ::llvm::ArrayRef<int64_t> inputShape = unsqueezeShape;
+       ::llvm::ArrayRef<int64_t> outputShape = outputType.getShape();
