@@ -4,7 +4,8 @@ ttnn's collectives write to their peers at the addresses of their own buffers,
 which processes driving one chip each need not share: here rank 1 holds an extra
 buffer first. The unicast all-gather trades output addresses between neighbors
 and the line reduce-scatter intermediate addresses; all-reduces, and gathers and
-scatters of padded or unaligned dimensions, are built from them. The 512 MB
+scatters of padded or unaligned dimensions, are built from them,
+also of the bytes of object collectives. The 512 MB
 all-gather result stays where the peers wrote it, and the reduce-scatter, whose
 intermediate takes twice its 256 MB input, runs in two pieces.
 """
@@ -75,6 +76,14 @@ def worker(rank):
     peak = small.to("tpu")
     dist.all_reduce(peak, op=dist.ReduceOp.MAX)
     assert torch.equal(peak.cpu(), small - 100 * rank + 100), "max all-reduce"
+
+    # Object collectives send pickled bytes (UINT8), as distributed checkpoints do.
+    objects = [None, None]
+    dist.all_gather_object(objects, {"rank": rank, "text": "x" * (100 + rank)})
+    assert objects == [{"rank": r, "text": "x" * (100 + r)} for r in range(2)], "all_gather_object"
+    box = [{"from": rank}]
+    dist.broadcast_object_list(box, src=0)
+    assert box == [{"from": 0}], f"broadcast_object_list: {box}"
     if held is not None:
         assert held.sum().item() == 7.0 * 3 * 1024 * 1024
     print(f"rank {rank} done", flush=True)

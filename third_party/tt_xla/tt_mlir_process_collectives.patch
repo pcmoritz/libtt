@@ -248,13 +248,14 @@ diff --git a/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp b/runtime/lib/tt
 diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
 --- a/runtime/lib/ttnn/utils/utils.cpp
 +++ b/runtime/lib/ttnn/utils/utils.cpp
-@@ -9,6 +9,18 @@
+@@ -9,6 +9,19 @@
  #include "tt/runtime/types.h"
  #include "tt/runtime/utils.h"
  
 +#include "ttnn/operations/ccl/all_gather/all_gather.hpp"
 +#include "ttnn/operations/ccl/mesh_partition/mesh_partition.hpp"
 +#include "ttnn/operations/ccl/reduce_scatter/reduce_scatter.hpp"
++#include "ttnn/operations/copy/typecast/typecast.hpp"
 +#include "ttnn/operations/core/core.hpp"
 +#include "ttnn/operations/data_movement/concat/concat.hpp"
 +#include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
@@ -267,7 +268,7 @@ diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
  #include <memory>
  #include <vector>
  
-@@ -675,4 +687,272 @@ getMemoryView(Device deviceHandle) {
+@@ -675,4 +688,286 @@ getMemoryView(Device deviceHandle) {
    return memoryMap;
  }
  
@@ -439,8 +440,11 @@ diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
 +    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig) {
 +  const ::ttnn::Tensor tiles = toDramTiles(input);
 +  const ::ttnn::Shape &shape = tiles.logical_shape();
++  const ::ttnn::DataType dtype = tiles.dtype();
++  const bool isFloat = dtype == ::ttnn::DataType::FLOAT32 ||
++                       dtype == ::ttnn::DataType::BFLOAT16;
 +  // A sum whose reduce-scatter and all-gather trade addresses: as ttnn runs it.
-+  if (reduceType == ::reduction_common::ReduceType::Sum) {
++  if (reduceType == ::reduction_common::ReduceType::Sum && isFloat) {
 +    for (int32_t dim = static_cast<int32_t>(shape.rank()) - 1; dim >= 0;
 +         --dim) {
 +      if (reduceScatterTradesAddresses(tiles, dim, ringSize)) {
@@ -450,8 +454,16 @@ diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
 +    }
 +  }
 +  // Otherwise every rank's whole tensor, gathered along a leading dimension
-+  // and reduced across it.
-+  const ::ttnn::Tensor gathered = gather(withLeadingUnitDim(tiles), 0);
++  // and reduced across it. ttnn reduces no integers narrower than 32 bits
++  // (such as the bytes of torch.distributed's object collectives): as its own
++  // composite all-reduce does, those are reduced as INT32, whose sum wraps
++  // like theirs once cast back.
++  ::ttnn::Tensor gathered = gather(withLeadingUnitDim(tiles), 0);
++  const bool widen = dtype == ::ttnn::DataType::UINT8 ||
++                     dtype == ::ttnn::DataType::UINT16;
++  if (widen) {
++    gathered = ::ttnn::typecast(gathered, ::ttnn::DataType::INT32);
++  }
 +  ::ttnn::Tensor reduced;
 +  switch (reduceType) {
 +  case ::reduction_common::ReduceType::Sum:
@@ -465,6 +477,9 @@ diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
 +    break;
 +  default:
 +    LOG_FATAL("Unsupported reduce type for a collective between processes");
++  }
++  if (widen) {
++    reduced = ::ttnn::typecast(reduced, dtype);
 +  }
 +  return likeInput(::ttnn::reshape(reduced, shape), input,
 +                   outputMemoryConfig);
