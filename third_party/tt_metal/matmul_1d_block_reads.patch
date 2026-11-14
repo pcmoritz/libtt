@@ -1,0 +1,59 @@
+diff --git ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
+--- ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
++++ ttnn/cpp/ttnn/operations/matmul/device/config/matmul_program_config.cpp
+@@ -423,17 +423,44 @@
+     bool per_core_N_equals_subblock_w_constraint = out_sharded && !mcast_in0;
+     bool per_core_M_equals_subblock_h_constraint = out_sharded && mcast_in0;
+ 
+-    auto mutlti_dim_per_core_factor = get_multi_dim_per_core_factor(
+-        input_tensor_a,
+-        input_tensor_b,
+-        transpose_a,
+-        transpose_b,
+-        bias_single_tile_size,
+-        per_core_M,
+-        per_core_N,
+-        in0_block_w,
+-        utilities::estimate_interm_tile_size(compute_kernel_config, output_dtype),
+-        /*adjust_in0_block_w=*/decode_matmul);
++    auto per_core_factor = [&] {
++        return get_multi_dim_per_core_factor(
++            input_tensor_a,
++            input_tensor_b,
++            transpose_a,
++            transpose_b,
++            bias_single_tile_size,
++            per_core_M,
++            per_core_N,
++            in0_block_w,
++            utilities::estimate_interm_tile_size(compute_kernel_config, output_dtype),
++            /*adjust_in0_block_w=*/decode_matmul);
++    };
++    auto mutlti_dim_per_core_factor = per_core_factor();
++    // A core whose output doesn't fit L1 computes it in out_block_h x out_block_w blocks that divide
++    // per_core_M x per_core_N, reading a row of in0 blocks for each block row and a column of in1
++    // blocks for each block column: per_core_M * per_core_N * (1 / out_block_h + 1 / out_block_w)
++    // tiles of K. A share of the split side with few divisors leaves thin blocks (Qwen3.5's [2048,
++    // 4096] x [4096, 248320] logits over 110 cores: 71 tiles of N each, in 4 x 71 blocks, 628 ms).
++    // Rounding the share up to a multiple of 4 runs fewer cores; take it when it reads less (72
++    // tiles in 16 x 18 blocks: 91 ms).
++    if (!user_shard_spec.has_value()) {
++        uint32_t& share = mcast_in0 ? per_core_N : per_core_M;
++        auto reads = [&](const std::vector<uint32_t>& factor) {
++            return (double)per_core_M * per_core_N * (1.0 / factor[0] + 1.0 / factor[1]);
++        };
++        if (share > 4 && share % 4 != 0) {
++            const uint32_t original = share;
++            const double original_reads = reads(mutlti_dim_per_core_factor);
++            share = round_up(share, 4);
++            auto rounded = per_core_factor();
++            if (reads(rounded) < original_reads) {
++                mutlti_dim_per_core_factor = rounded;
++            } else {
++                share = original;
++            }
++        }
++    }
+     in0_block_w = mutlti_dim_per_core_factor[2];
+     uint32_t out_block_h = mutlti_dim_per_core_factor[0];
+     uint32_t out_block_w = mutlti_dim_per_core_factor[1];
