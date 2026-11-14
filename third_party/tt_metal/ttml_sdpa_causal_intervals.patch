@@ -1,0 +1,592 @@
+diff --git tt-train/sources/ttml/metal/common/const_utils.hpp tt-train/sources/ttml/metal/common/const_utils.hpp
+--- tt-train/sources/ttml/metal/common/const_utils.hpp
++++ tt-train/sources/ttml/metal/common/const_utils.hpp
+@@ -14,13 +14,30 @@ namespace ttml::metal {
+  * - None: No mask applied, just scale attention scores
+  * - Causal: Generate lower-triangular causal mask on device (prevents attending to future tokens)
+  * - Arbitrary: Use provided mask tensor from DRAM
++ * - CausalIntervals: Use provided mask tensor from DRAM that keeps, in each query row r, the keys of one
++ *   interval [start(r), r] whose start never decreases down the rows (packed documents attending causally
++ *   within themselves, sliding windows). The kernels skip the mask's tiles that keep no score.
+  */
+ enum class AttentionMaskType {
+-    None,      // No mask - just scale attention scores
+-    Causal,    // Generate causal mask on device (lower triangular)
+-    Arbitrary  // Use provided mask tensor from DRAM
++    None,             // No mask - just scale attention scores
++    Causal,           // Generate causal mask on device (lower triangular)
++    Arbitrary,        // Use provided mask tensor from DRAM
++    CausalIntervals,  // Use provided mask tensor from DRAM, causal intervals: skip tiles it drops
+ };
+ 
++// Whether the mask type reads a mask tensor.
++inline constexpr bool reads_mask_tensor(AttentionMaskType mask_type) {
++    return mask_type == AttentionMaskType::Arbitrary || mask_type == AttentionMaskType::CausalIntervals;
++}
++
++// AttentionMaskType::CausalIntervals: the readers read mask tile corners in batches of 64-byte DRAM reads into an
++// L1 scratch (with room to align it to 64 bytes), and hand the compute kernels per-row counts in small pages.
++constexpr uint32_t kMaskCornerProbes = 8U;
++constexpr uint32_t kMaskCornerReadBytes = 64U;
++constexpr uint32_t kMaskCornerScratchBytes = (kMaskCornerProbes + 1U) * kMaskCornerReadBytes;
++constexpr uint32_t kCountPageBytes = 32U;
++constexpr uint32_t kCountPages = 4U;
++
+ /**
+  * Specifies whether stochastic rounding is applied during optimizer updates.
+  *
+diff --git tt-train/sources/ttml/metal/common/dataflow_utils.hpp tt-train/sources/ttml/metal/common/dataflow_utils.hpp
+--- tt-train/sources/ttml/metal/common/dataflow_utils.hpp
++++ tt-train/sources/ttml/metal/common/dataflow_utils.hpp
+@@ -14,6 +14,7 @@
+ #include "api/debug/dprint.h"
+ #include "api/debug/dprint_pages.h"
+ #include "ttnn/operations/kernel_helper_functions/pad_tile.hpp"
++#include "tt-train/sources/ttml/metal/common/const_utils.hpp"
+ 
+ #ifndef FORCE_INLINE
+ #define FORCE_INLINE inline
+@@ -680,3 +681,82 @@ inline void mcast_sender_signal_receivers_loopback(
+     noc_semaphore_set_multicast_loopback_src(receiver_sem_addr, receiver_sem_noc_addr, num_dests_including_self);
+     noc_async_atomic_barrier();
+ }
++
++// ----------------------------------------------------------------------------------------------------------
++// AttentionMaskType::CausalIntervals: block skipping.
++//
++// Such a mask keeps, in each query row r, the keys of one interval [start(r), r] whose start never decreases
++// down the rows: packed documents that attend causally within themselves, sliding windows. Mask tile (i, j),
++// query tile i and key tile j <= i, then keeps a score iff it keeps its corner (0, 31), the score of query 32i
++// for key 32j + 31: query 32i's interval reaches key tile j iff it starts at or before 32j + 31 (and it ends
++// at 32i, past it), and the tile's later queries start no earlier. The kernels visit only those tiles.
++// ----------------------------------------------------------------------------------------------------------
++
++using ttml::metal::kMaskCornerProbes;
++using ttml::metal::kMaskCornerReadBytes;
++// A corner is the last element of row 0 of face 1, which starts at byte 512 of a BF16 tile; one aligned 64-byte
++// read holds it.
++constexpr uint32_t kMaskCornerReadOffset = 512U;
++constexpr uint32_t kMaskCornerElement = 15U;
++
++inline uint32_t mask_corner_scratch(const uint32_t cb_scratch) {
++    cb_reserve_back(cb_scratch, onetile);
++    return (get_write_ptr(cb_scratch) + kMaskCornerReadBytes - 1U) & ~(kMaskCornerReadBytes - 1U);
++}
++
++template <typename AddrGen>
++inline void read_mask_corner(const AddrGen& mask, const uint32_t tile_idx, const uint32_t l1_addr) {
++    noc_async_read(mask.get_noc_addr(tile_idx, kMaskCornerReadOffset), l1_addr, kMaskCornerReadBytes);
++}
++
++inline bool mask_corner_kept(const uint32_t scratch, const uint32_t probe) {
++    const auto* corner_row = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scratch + probe * kMaskCornerReadBytes);
++    return (corner_row[kMaskCornerElement] & 0x7FFFU) != 0U;  // a BF16 1 (kept), not +-0 (dropped)
++}
++
++// The first key tile that query tile `q_tile` attends to; the diagonal tile always.
++template <typename AddrGen>
++inline uint32_t first_kept_key_tile(const AddrGen& mask, const uint32_t Ht, const uint32_t q_tile, const uint32_t scratch) {
++    uint32_t first = q_tile;
++    while (first > 0U) {
++        const uint32_t count = std::min(first, kMaskCornerProbes);
++        for (uint32_t p = 0U; p < count; ++p) {
++            read_mask_corner(mask, q_tile * Ht + (first - 1U - p), scratch + p * kMaskCornerReadBytes);
++        }
++        noc_async_read_barrier();
++        for (uint32_t p = 0U; p < count; ++p) {
++            if (!mask_corner_kept(scratch, p)) {
++                return first - p;
++            }
++        }
++        first -= count;
++    }
++    return 0U;
++}
++
++// One past the last query tile that attends to key tile `k_tile`; the diagonal tile always attends.
++template <typename AddrGen>
++inline uint32_t end_kept_query_tile(const AddrGen& mask, const uint32_t Ht, const uint32_t k_tile, const uint32_t scratch) {
++    uint32_t end = k_tile + 1U;
++    while (end < Ht) {
++        const uint32_t count = std::min(Ht - end, kMaskCornerProbes);
++        for (uint32_t p = 0U; p < count; ++p) {
++            read_mask_corner(mask, (end + p) * Ht + k_tile, scratch + p * kMaskCornerReadBytes);
++        }
++        noc_async_read_barrier();
++        for (uint32_t p = 0U; p < count; ++p) {
++            if (!mask_corner_kept(scratch, p)) {
++                return end + p;
++            }
++        }
++        end += count;
++    }
++    return Ht;
++}
++
++// Hands the compute kernel a count through a one-value page of `cb_count`.
++inline void push_count(const uint32_t cb_count, const uint32_t count) {
++    cb_reserve_back(cb_count, onetile);
++    *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_count)) = count;
++    cb_push_back(cb_count, onetile);
++}
+diff --git tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/compute/sdpa_bw_kv_compute_kernel.cpp tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/compute/sdpa_bw_kv_compute_kernel.cpp
+--- tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/compute/sdpa_bw_kv_compute_kernel.cpp
++++ tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/compute/sdpa_bw_kv_compute_kernel.cpp
+@@ -94,6 +94,9 @@ constexpr uint32_t cb_attn_weights_transposed = tt::CBIndex::c_13;  // P^T, pack
+ constexpr uint32_t cb_u_scalar_row = tt::CBIndex::c_14;       // u_scalar per row (precomputed by Q kernel)
+ constexpr uint32_t cb_grad_key = tt::CBIndex::c_15;           // Output: grad_K
+ constexpr uint32_t cb_grad_value = tt::CBIndex::c_16;         // Output: grad_V
++#ifdef CAUSAL_INTERVALS
++constexpr uint32_t cb_q_tiles = tt::CBIndex::c_19;  // per row: the number of Q tiles the reader reads per head
++#endif
+ 
+ const uint32_t qk_tiles = qWt;            // Q/K inner dim tiles
+ const uint32_t v_tiles = vWt;             // V/dO/O inner dim tiles
+@@ -115,11 +118,17 @@ FORCE_INLINE void process_single_row(uint32_t global_row_idx) {
+     // 1-arg form would pay an unconditional reprogram (and implicit SFPU drain) every iteration.
+     pack_reconfig_data_format(cb_grad_key, cb_attention_weights);
+ 
+-#ifdef CAUSAL_MASK
++#if defined(CAUSAL_MASK)
+     const uint32_t k_row_tile = global_row_idx % Ht;
+ 
+     const uint32_t q_start_tile = k_row_tile;
+     const uint32_t num_q_tiles_to_process = Ht - k_row_tile;
++#elif defined(CAUSAL_INTERVALS)
++    // The query tiles from the diagonal through the last one that keeps scores of this key tile.
++    cb_wait_front(cb_q_tiles, onetile);
++    const uint32_t q_start_tile = 0U;  // unused: tiles are only told apart on the causal diagonal
++    const uint32_t num_q_tiles_to_process = read_tile_value(cb_q_tiles, 0, 0);
++    cb_pop_front(cb_q_tiles, onetile);
+ #else
+     const uint32_t q_start_tile = 0;
+     const uint32_t num_q_tiles_to_process = Ht;
+diff --git tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/compute/sdpa_bw_q_compute_kernel.cpp tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/compute/sdpa_bw_q_compute_kernel.cpp
+--- tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/compute/sdpa_bw_q_compute_kernel.cpp
++++ tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/compute/sdpa_bw_q_compute_kernel.cpp
+@@ -102,6 +102,9 @@ constexpr uint32_t cb_dp_grad_output = cb_gated_grad_output_local;
+ #else
+ constexpr uint32_t cb_dp_grad_output = cb_grad_output;
+ #endif
++#ifdef CAUSAL_INTERVALS
++constexpr uint32_t cb_kv_tiles = tt::CBIndex::c_19;  // per row: the number of K/V tiles the reader read
++#endif
+ 
+ const uint32_t qk_tiles = qWt;            // Q/K inner dim tiles
+ const uint32_t v_tiles = vWt;             // V/dO/O inner dim tiles
+@@ -148,8 +151,13 @@ FORCE_INLINE void process_single_row(uint32_t global_row_idx) {
+ 
+     const uint32_t q_row_tile = global_row_idx % Ht;
+ 
+-#ifdef CAUSAL_MASK
++#if defined(CAUSAL_MASK)
+     const uint32_t num_kv_tiles_to_process = q_row_tile + 1;
++#elif defined(CAUSAL_INTERVALS)
++    // The tiles from the row's first kept key tile through the diagonal, as many as the reader read.
++    cb_wait_front(cb_kv_tiles, onetile);
++    const uint32_t num_kv_tiles_to_process = read_tile_value(cb_kv_tiles, 0, 0);
++    cb_pop_front(cb_kv_tiles, onetile);
+ #else
+     const uint32_t num_kv_tiles_to_process = Ht;
+ #endif
+diff --git tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/dataflow/sdpa_bw_kv_reader_kernel.cpp tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/dataflow/sdpa_bw_kv_reader_kernel.cpp
+--- tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/dataflow/sdpa_bw_kv_reader_kernel.cpp
++++ tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/dataflow/sdpa_bw_kv_reader_kernel.cpp
+@@ -29,6 +29,10 @@ void kernel_main() {
+     constexpr uint32_t cb_intermediates = tt::CBIndex::c_6;
+     constexpr uint32_t cb_matmul_reduce = tt::CBIndex::c_7;
+     constexpr uint32_t cb_u_scalar_row = tt::CBIndex::c_14;
++#ifdef CAUSAL_INTERVALS
++    constexpr uint32_t cb_q_tiles = tt::CBIndex::c_19;       // per row: the number of Q tiles read per head
++    constexpr uint32_t cb_mask_corners = tt::CBIndex::c_20;  // scratch for mask tile corners
++#endif
+ 
+     constexpr uint32_t qWt = get_compile_time_arg_val(0);              // Q/K width in tiles
+     constexpr uint32_t kWt = get_compile_time_arg_val(1);              // key width in tiles (K read)
+@@ -57,6 +61,9 @@ void kernel_main() {
+     const auto value_address_generator = TensorAccessor(value_args, value_addr);
+ #ifdef USE_ATTN_MASK
+     const auto mask_address_generator = TensorAccessor(mask_args, mask_addr);
++#endif
++#ifdef CAUSAL_INTERVALS
++    const uint32_t corner_scratch = mask_corner_scratch(cb_mask_corners);
+ #endif
+     const auto intermediates_address_generator =
+         TensorAccessor(intermediates_args, intermediates_addr, interm_tile_bytes);
+@@ -151,9 +158,16 @@ void kernel_main() {
+ 
+         const uint32_t k_row_tile = global_row_idx % Ht;
+ 
+-#ifdef CAUSAL_MASK
++#if defined(CAUSAL_MASK)
+         const uint32_t q_start_tile = k_row_tile;
+         const uint32_t num_q_tiles_to_read = Ht - k_row_tile;
++#elif defined(CAUSAL_INTERVALS)
++        // Only the query tiles from the diagonal through the last one that keeps scores of this key tile; the
++        // compute kernel learns their number from cb_q_tiles.
++        const uint32_t q_start_tile = k_row_tile;
++        const uint32_t num_q_tiles_to_read =
++            end_kept_query_tile(mask_address_generator, Ht, k_row_tile, corner_scratch) - k_row_tile;
++        push_count(cb_q_tiles, num_q_tiles_to_read);
+ #else
+         const uint32_t q_start_tile = 0;
+         const uint32_t num_q_tiles_to_read = Ht;
+diff --git tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/dataflow/sdpa_bw_q_reader_kernel.cpp tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/dataflow/sdpa_bw_q_reader_kernel.cpp
+--- tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/dataflow/sdpa_bw_q_reader_kernel.cpp
++++ tt-train/sources/ttml/metal/ops/sdpa_bw/device/kernels/dataflow/sdpa_bw_q_reader_kernel.cpp
+@@ -34,6 +34,10 @@ void kernel_main() {
+ #ifdef HAS_GATE
+     constexpr uint32_t cb_gate = tt::CBIndex::c_15;
+ #endif
++#ifdef CAUSAL_INTERVALS
++    constexpr uint32_t cb_kv_tiles = tt::CBIndex::c_19;      // per row: the number of K/V tiles read
++    constexpr uint32_t cb_mask_corners = tt::CBIndex::c_20;  // scratch for mask tile corners
++#endif
+ 
+     // Get compile-time arguments
+     constexpr uint32_t qWt = get_compile_time_arg_val(0);              // Q/K width in tiles
+@@ -63,6 +67,9 @@ void kernel_main() {
+     const auto key_addr_generator = TensorAccessor(key_args, key_addr, tile_bytes);
+     const auto value_addr_generator = TensorAccessor(value_args, value_addr, tile_bytes);
+     const auto mask_addr_generator = TensorAccessor(mask_args, mask_addr, tile_bytes);
++#ifdef CAUSAL_INTERVALS
++    const uint32_t corner_scratch = mask_corner_scratch(cb_mask_corners);
++#endif
+ 
+     const uint32_t interm_tile_bytes = get_tile_size(cb_intermediates);
+     const auto intermediates_addr_generator = TensorAccessor(intermediates_args, intermediates_addr, interm_tile_bytes);
+@@ -160,11 +167,19 @@ void kernel_main() {
+         // q_row_tile = position within sequence (0 to Ht-1)
+         const uint32_t q_row_tile = global_row_idx % Ht;
+ 
+-#ifdef CAUSAL_MASK
++#if defined(CAUSAL_MASK)
+         // For causal mask: only read K/V tiles up to and including the diagonal
+-        const uint32_t num_kv_tiles_to_read = q_row_tile + 1;
++        const uint32_t first_kv_tile = 0U;
++        const uint32_t end_kv_tile = q_row_tile + 1;
++#elif defined(CAUSAL_INTERVALS)
++        // Only the tiles from the row's first kept key tile through the diagonal; the compute kernel learns their
++        // number from cb_kv_tiles.
++        const uint32_t first_kv_tile = first_kept_key_tile(mask_addr_generator, Ht, q_row_tile, corner_scratch);
++        const uint32_t end_kv_tile = q_row_tile + 1;
++        push_count(cb_kv_tiles, end_kv_tile - first_kv_tile);
+ #else
+-        const uint32_t num_kv_tiles_to_read = Ht;
++        const uint32_t first_kv_tile = 0U;
++        const uint32_t end_kv_tile = Ht;
+ #endif
+ 
+ #ifdef USE_ATTN_MASK
+@@ -183,7 +198,7 @@ void kernel_main() {
+             interm_tile_bytes,
+             num_of_interm_tiles);
+ 
+-        for (uint32_t h = 0; h < num_kv_tiles_to_read; ++h) {
++        for (uint32_t h = first_kv_tile; h < end_kv_tile; ++h) {
+             // Read one row of K (Q/K-dim width)
+             read_tiles_by_row(cb_key, key_addr_generator, key_offset + h * qWt, qWt, tile_bytes, qWt);
+ 
+diff --git tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_kv_device_operation.cpp tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_kv_device_operation.cpp
+--- tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_kv_device_operation.cpp
++++ tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_kv_device_operation.cpp
+@@ -187,12 +187,12 @@ void SDPABackwardKVDeviceOperation::validate_on_program_cache_miss(
+ 
+     // Validate mask type and mask tensor consistency
+     TT_FATAL(
+-        !(operation_attributes.mask_type == AttentionMaskType::Arbitrary && !tensor_args.attn_mask.has_value()),
+-        "AttentionMaskType::Arbitrary requires a mask tensor to be provided.");
++        !(reads_mask_tensor(operation_attributes.mask_type) && !tensor_args.attn_mask.has_value()),
++        "AttentionMaskType::Arbitrary and CausalIntervals require a mask tensor to be provided.");
+ 
+     TT_FATAL(
+-        !(operation_attributes.mask_type != AttentionMaskType::Arbitrary && tensor_args.attn_mask.has_value()),
+-        "Mask tensor provided but mask_type is not Arbitrary. "
++        !(!reads_mask_tensor(operation_attributes.mask_type) && tensor_args.attn_mask.has_value()),
++        "Mask tensor provided but mask_type is not Arbitrary or CausalIntervals. "
+         "Use AttentionMaskType::Arbitrary to apply a custom mask, "
+         "or remove the mask tensor for None/Causal modes.");
+ }
+diff --git tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_kv_program_factory.cpp tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_kv_program_factory.cpp
+--- tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_kv_program_factory.cpp
++++ tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_kv_program_factory.cpp
+@@ -53,6 +53,8 @@ constexpr auto kAttnWeightsTransposedCbIndex = tt::CBIndex::c_13;  // P^T, packe
+ constexpr auto kUScalarRowCbIndex = tt::CBIndex::c_14;
+ constexpr auto kGradKeyCbIndex = tt::CBIndex::c_15;
+ constexpr auto kGradValueCbIndex = tt::CBIndex::c_16;
++constexpr auto kTileCountCbIndex = tt::CBIndex::c_19;    // CausalIntervals: tiles per row, reader to compute
++constexpr auto kMaskCornersCbIndex = tt::CBIndex::c_20;  // CausalIntervals: reader's scratch for mask tile corners
+ 
+ constexpr uint32_t kSingleTileBuffer = 1U;
+ constexpr uint32_t kNumOfIntermCBTiles = 1U;  // single FP32 logsumexp tile per Q row
+@@ -60,6 +62,7 @@ constexpr uint32_t kNumOfIntermCBTiles = 1U;  // single FP32 logsumexp tile per
+ const std::string kUseAttnMaskDefKey = "USE_ATTN_MASK";
+ const std::string kCausalMaskDefKey = "CAUSAL_MASK";
+ const std::string kBalancedParallelismDefKey = "BALANCED_PARALLELISM";
++const std::string kCausalIntervalsDefKey = "CAUSAL_INTERVALS";
+ 
+ /**
+  * Calculate work-balanced pair distribution for causal SDPA backward KV.
+@@ -273,6 +276,16 @@ SDPABackwardKVProgramFactory::cached_program_t SDPABackwardKVProgramFactory::cre
+             program, all_cores, kAttnMaskCbIndex, data_format, bfloat16_single_tile_size_bytes, 2 * kSingleTileBuffer);
+     }
+ 
++    // CausalIntervals: the reader finds each row's range of kept tiles from mask tile corners and tells the
++    // compute kernel how many tiles it reads.
++    if (args.mask_type == AttentionMaskType::CausalIntervals) {
++        [[maybe_unused]] auto cb_tile_count = create_circular_buffer(
++            program, all_cores, kTileCountCbIndex, tt::DataFormat::UInt32, ttml::metal::kCountPageBytes,
++            ttml::metal::kCountPages);
++        [[maybe_unused]] auto cb_mask_corners = create_circular_buffer_bytes(
++            program, all_cores, kMaskCornersCbIndex, data_format, ttml::metal::kMaskCornerScratchBytes);
++    }
++
+     [[maybe_unused]] auto cb_intermediates = create_circular_buffer(
+         program,
+         all_cores,
+@@ -377,6 +390,11 @@ SDPABackwardKVProgramFactory::cached_program_t SDPABackwardKVProgramFactory::cre
+     } else if (args.mask_type == AttentionMaskType::Arbitrary) {
+         reader_defines[kUseAttnMaskDefKey] = "1";
+         compute_defines[kUseAttnMaskDefKey] = "1";
++    } else if (args.mask_type == AttentionMaskType::CausalIntervals) {
++        reader_defines[kUseAttnMaskDefKey] = "1";
++        compute_defines[kUseAttnMaskDefKey] = "1";
++        reader_defines[kCausalIntervalsDefKey] = "1";
++        compute_defines[kCausalIntervalsDefKey] = "1";
+     }
+ 
+     // Add balanced parallelism define on top of mask type
+diff --git tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_q_device_operation.cpp tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_q_device_operation.cpp
+--- tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_q_device_operation.cpp
++++ tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_q_device_operation.cpp
+@@ -180,12 +180,12 @@ void SDPABackwardQDeviceOperation::validate_on_program_cache_miss(
+ 
+     // Validate mask type and mask tensor consistency
+     TT_FATAL(
+-        !(operation_attributes.mask_type == AttentionMaskType::Arbitrary && !tensor_args.attn_mask.has_value()),
+-        "AttentionMaskType::Arbitrary requires a mask tensor to be provided.");
++        !(reads_mask_tensor(operation_attributes.mask_type) && !tensor_args.attn_mask.has_value()),
++        "AttentionMaskType::Arbitrary and CausalIntervals require a mask tensor to be provided.");
+ 
+     TT_FATAL(
+-        !(operation_attributes.mask_type != AttentionMaskType::Arbitrary && tensor_args.attn_mask.has_value()),
+-        "Mask tensor provided but mask_type is not Arbitrary. "
++        !(!reads_mask_tensor(operation_attributes.mask_type) && tensor_args.attn_mask.has_value()),
++        "Mask tensor provided but mask_type is not Arbitrary or CausalIntervals. "
+         "Use AttentionMaskType::Arbitrary to apply a custom mask, "
+         "or remove the mask tensor for None/Causal modes.");
+ 
+diff --git tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_q_program_factory.cpp tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_q_program_factory.cpp
+--- tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_q_program_factory.cpp
++++ tt-train/sources/ttml/metal/ops/sdpa_bw/device/sdpa_bw_q_program_factory.cpp
+@@ -59,6 +59,8 @@ constexpr auto kGateCbIndex = tt::CBIndex::c_15;                  // Input: gate
+ constexpr auto kGradGateCbIndex = tt::CBIndex::c_16;              // Output: grad_gate = dY * Y * (1 - sigmoid(G))
+ constexpr auto kGatedGradOutputCbIndex = tt::CBIndex::c_17;       // Output: gated dO to DRAM for KV kernel
+ constexpr auto kGatedGradOutputLocalCbIndex = tt::CBIndex::c_18;  // Compute-local gated dO for dP matmul
++constexpr auto kTileCountCbIndex = tt::CBIndex::c_19;    // CausalIntervals: tiles per row, reader to compute
++constexpr auto kMaskCornersCbIndex = tt::CBIndex::c_20;  // CausalIntervals: reader's scratch for mask tile corners
+ 
+ constexpr uint32_t kSingleTileBuffer = 1U;
+ constexpr uint32_t kNumOfIntermCBTiles = 1U;  // single FP32 logsumexp tile per Q row
+@@ -66,6 +68,7 @@ constexpr uint32_t kNumOfIntermCBTiles = 1U;  // single FP32 logsumexp tile per
+ const std::string kUseAttnMaskDefKey = "USE_ATTN_MASK";
+ const std::string kCausalMaskDefKey = "CAUSAL_MASK";
+ const std::string kBalancedParallelismDefKey = "BALANCED_PARALLELISM";
++const std::string kCausalIntervalsDefKey = "CAUSAL_INTERVALS";
+ const std::string kHasGateDefKey = "HAS_GATE";
+ 
+ /**
+@@ -311,6 +314,16 @@ SDPABackwardQProgramFactory::cached_program_t SDPABackwardQProgramFactory::creat
+                 2 * kSingleTileBuffer);
+     }
+ 
++    // CausalIntervals: the reader finds each row's range of kept tiles from mask tile corners and tells the
++    // compute kernel how many tiles it reads.
++    if (args.mask_type == AttentionMaskType::CausalIntervals) {
++        [[maybe_unused]] auto cb_tile_count = create_circular_buffer(
++            program, all_cores, kTileCountCbIndex, tt::DataFormat::UInt32, ttml::metal::kCountPageBytes,
++            ttml::metal::kCountPages);
++        [[maybe_unused]] auto cb_mask_corners = create_circular_buffer_bytes(
++            program, all_cores, kMaskCornersCbIndex, data_format, ttml::metal::kMaskCornerScratchBytes);
++    }
++
+     [[maybe_unused]] auto cb_intermediates =  // CBIndex::c_6
+         create_circular_buffer(
+             program,
+@@ -437,6 +450,11 @@ SDPABackwardQProgramFactory::cached_program_t SDPABackwardQProgramFactory::creat
+     } else if (args.mask_type == AttentionMaskType::Arbitrary) {
+         reader_defines[kUseAttnMaskDefKey] = "1";
+         compute_defines[kUseAttnMaskDefKey] = "1";
++    } else if (args.mask_type == AttentionMaskType::CausalIntervals) {
++        reader_defines[kUseAttnMaskDefKey] = "1";
++        compute_defines[kUseAttnMaskDefKey] = "1";
++        reader_defines[kCausalIntervalsDefKey] = "1";
++        compute_defines[kCausalIntervalsDefKey] = "1";
+     }
+ 
+     // Add balanced parallelism define on top of mask type
+diff --git tt-train/sources/ttml/metal/ops/sdpa_fw/device/kernels/compute/sdpa_fw_compute_kernel.cpp tt-train/sources/ttml/metal/ops/sdpa_fw/device/kernels/compute/sdpa_fw_compute_kernel.cpp
+--- tt-train/sources/ttml/metal/ops/sdpa_fw/device/kernels/compute/sdpa_fw_compute_kernel.cpp
++++ tt-train/sources/ttml/metal/ops/sdpa_fw/device/kernels/compute/sdpa_fw_compute_kernel.cpp
+@@ -65,6 +65,9 @@ constexpr uint32_t cb_cur_mm_out = tt::CBIndex::c_14;    // used for holding cur
+ 
+ constexpr uint32_t cb_output = tt::CBIndex::c_15;
+ constexpr uint32_t cb_gate = tt::CBIndex::c_16;
++#ifdef CAUSAL_INTERVALS
++constexpr uint32_t cb_kv_chunks = tt::CBIndex::c_17;  // per row: the number of K/V chunks the reader read
++#endif
+ 
+ /**
+  * Process a single row of the SDPA computation.
+@@ -88,11 +91,16 @@ FORCE_INLINE void process_single_row(uint32_t global_row_idx) {
+     // The "trailing" tiles strictly past the diagonal inside the diagonal chunk are masked
+     // out via the all-(-1e9) mask tile (cb_attn_mask[1]).
+     const uint32_t num_kv_tiles_to_process = round_up(q_row_tile + 1U, Sk_chunk_t);
++    const uint32_t num_kv_chunks = num_kv_tiles_to_process / Sk_chunk_t;
++#elif defined(CAUSAL_INTERVALS)
++    // The chunks from the row's first kept key tile through the diagonal, as many as the reader read.
++    cb_wait_front(cb_kv_chunks, onetile);
++    const uint32_t num_kv_chunks = read_tile_value(cb_kv_chunks, 0, 0);
++    cb_pop_front(cb_kv_chunks, onetile);
+ #else
+     // Non-causal: process every K/V chunk in the sequence.
+-    const uint32_t num_kv_tiles_to_process = Ht;
++    const uint32_t num_kv_chunks = Ht / Sk_chunk_t;
+ #endif
+-    const uint32_t num_kv_chunks = num_kv_tiles_to_process / Sk_chunk_t;
+ 
+ #if defined(CAUSAL_MASK) || defined(BALANCED_PARALLELISM)
+     // Chunk that contains the diagonal tile and the position of the diagonal inside it.
+diff --git tt-train/sources/ttml/metal/ops/sdpa_fw/device/kernels/dataflow/sdpa_fw_reader_kernel.cpp tt-train/sources/ttml/metal/ops/sdpa_fw/device/kernels/dataflow/sdpa_fw_reader_kernel.cpp
+--- tt-train/sources/ttml/metal/ops/sdpa_fw/device/kernels/dataflow/sdpa_fw_reader_kernel.cpp
++++ tt-train/sources/ttml/metal/ops/sdpa_fw/device/kernels/dataflow/sdpa_fw_reader_kernel.cpp
+@@ -30,6 +30,10 @@ void kernel_main() {
+ #ifdef HAS_GATE
+     constexpr uint32_t cb_gate = tt::CBIndex::c_16;
+ #endif
++#ifdef CAUSAL_INTERVALS
++    constexpr uint32_t cb_kv_chunks = tt::CBIndex::c_17;     // per row: the number of K/V chunks read
++    constexpr uint32_t cb_mask_corners = tt::CBIndex::c_18;  // scratch for mask tile corners
++#endif
+ 
+     constexpr uint32_t qWt = get_compile_time_arg_val(0);      // num tile in inner dim in query/key (d_qk/TILE_W)
+     constexpr uint32_t vWt = get_compile_time_arg_val(1);      // num tile in inner dim in value (d_v/TILE_W)
+@@ -56,6 +60,9 @@ void kernel_main() {
+ #ifdef USE_ATTN_MASK
+     const auto mask_address_generator = TensorAccessor(mask_args, mask_address);
+ #endif
++#ifdef CAUSAL_INTERVALS
++    const uint32_t corner_scratch = mask_corner_scratch(cb_mask_corners);
++#endif
+ #ifdef HAS_GATE
+     const auto gate_address_generator = TensorAccessor(gate_args, gate_address);
+ #endif
+@@ -147,20 +154,28 @@ void kernel_main() {
+         // q_row_tile = position within sequence (0 to Ht-1)
+         const uint32_t q_row_tile = global_row_idx % Ht;
+ 
+-#ifdef CAUSAL_MASK
++#if defined(CAUSAL_MASK)
+         // For causal: round up to next Sk_chunk_t boundary so the diagonal chunk is fully read.
+-        const uint32_t num_kv_tiles_to_read = round_up(q_row_tile + 1U, Sk_chunk_t);
++        const uint32_t first_kv_chunk = 0U;
++        const uint32_t end_kv_chunk = round_up(q_row_tile + 1U, Sk_chunk_t) / Sk_chunk_t;
++#elif defined(CAUSAL_INTERVALS)
++        // Only the chunks from the one holding the row's first kept key tile through the diagonal chunk; the
++        // compute kernel learns their number from cb_kv_chunks.
++        const uint32_t first_kv_chunk =
++            first_kept_key_tile(mask_address_generator, Ht, q_row_tile, corner_scratch) / Sk_chunk_t;
++        const uint32_t end_kv_chunk = round_up(q_row_tile + 1U, Sk_chunk_t) / Sk_chunk_t;
++        push_count(cb_kv_chunks, end_kv_chunk - first_kv_chunk);
+ #else
+-        const uint32_t num_kv_tiles_to_read = Ht;
++        const uint32_t first_kv_chunk = 0U;
++        const uint32_t end_kv_chunk = Ht / Sk_chunk_t;
+ #endif
+-        const uint32_t num_kv_chunks = num_kv_tiles_to_read / Sk_chunk_t;
+ 
+ #ifdef USE_ATTN_MASK
+         // Mask is (1, 1, S, S) - same mask for all batches/heads, indexed by sequence position only
+         const uint32_t mask_offset = q_row_tile * Ht;
+ #endif
+ 
+-        for (uint32_t k_chunk = 0; k_chunk < num_kv_chunks; ++k_chunk) {
++        for (uint32_t k_chunk = first_kv_chunk; k_chunk < end_kv_chunk; ++k_chunk) {
+             const uint32_t h_start = k_chunk * Sk_chunk_t;
+             const uint32_t key_start_idx = key_offset + h_start * qWt;
+             // Lay K col-major in cb_key (see balanced path above for rationale).
+diff --git tt-train/sources/ttml/metal/ops/sdpa_fw/device/sdpa_fw_device_operation.cpp tt-train/sources/ttml/metal/ops/sdpa_fw/device/sdpa_fw_device_operation.cpp
+--- tt-train/sources/ttml/metal/ops/sdpa_fw/device/sdpa_fw_device_operation.cpp
++++ tt-train/sources/ttml/metal/ops/sdpa_fw/device/sdpa_fw_device_operation.cpp
+@@ -120,12 +120,12 @@ void SDPAForwardDeviceOperation::validate_on_program_cache_miss(
+ 
+     // Validate mask type and mask tensor consistency
+     TT_FATAL(
+-        !(args.mask_type == AttentionMaskType::Arbitrary && !tensor_args.mask.has_value()),
+-        "AttentionMaskType::Arbitrary requires a mask tensor to be provided.");
++        !(reads_mask_tensor(args.mask_type) && !tensor_args.mask.has_value()),
++        "AttentionMaskType::Arbitrary and CausalIntervals require a mask tensor to be provided.");
+ 
+     TT_FATAL(
+-        !(args.mask_type != AttentionMaskType::Arbitrary && tensor_args.mask.has_value()),
+-        "Mask tensor provided but mask_type is not Arbitrary. "
++        !(!reads_mask_tensor(args.mask_type) && tensor_args.mask.has_value()),
++        "Mask tensor provided but mask_type is not Arbitrary or CausalIntervals. "
+         "Use AttentionMaskType::Arbitrary to apply a custom mask, "
+         "or remove the mask tensor for None/Causal modes.");
+ 
+diff --git tt-train/sources/ttml/metal/ops/sdpa_fw/device/sdpa_fw_program_factory.cpp tt-train/sources/ttml/metal/ops/sdpa_fw/device/sdpa_fw_program_factory.cpp
+--- tt-train/sources/ttml/metal/ops/sdpa_fw/device/sdpa_fw_program_factory.cpp
++++ tt-train/sources/ttml/metal/ops/sdpa_fw/device/sdpa_fw_program_factory.cpp
+@@ -52,6 +52,8 @@ constexpr auto kCurMmOutCbIndex = tt::CBIndex::c_14;     // used for holding cur
+ 
+ constexpr auto kOutputCbIndex = tt::CBIndex::c_15;
+ constexpr auto kGateCbIndex = tt::CBIndex::c_16;
++constexpr auto kKvChunksCbIndex = tt::CBIndex::c_17;     // CausalIntervals: K/V chunks per row, reader to compute
++constexpr auto kMaskCornersCbIndex = tt::CBIndex::c_18;  // CausalIntervals: reader's scratch for mask tile corners
+ 
+ constexpr uint32_t kNumScalerTiles = 1U;
+ constexpr uint32_t kNumCausalMaskTiles = 2U;  // [0] = causal-diag pattern (0 kept / -1e9 masked),
+@@ -65,6 +67,7 @@ const std::string kReturnIntermediates = "RETURN_INTERMEDIATES";
+ const std::string kUseAttnMaskDefKey = "USE_ATTN_MASK";
+ const std::string kCausalMaskDefKey = "CAUSAL_MASK";
+ const std::string kBalancedParallelismDefKey = "BALANCED_PARALLELISM";
++const std::string kCausalIntervalsDefKey = "CAUSAL_INTERVALS";
+ 
+ const std::string kHasGateDefKey = "HAS_GATE";
+ 
+@@ -354,13 +357,22 @@ SDPAForwardProgramFactory::cached_program_t SDPAForwardProgramFactory::create(
+     //             diagonal K tile of every row.
+     //       [1] = all -1e9 — applied on K tiles strictly past the diagonal inside the
+     //             diagonal chunk when Sk_chunk_t > 1.
+-    //   - Arbitrary: Sk_chunk_t mask tiles per K chunk are streamed from DRAM; double-buffer them.
++    //   - Arbitrary, CausalIntervals: Sk_chunk_t mask tiles per K chunk are streamed from DRAM; double-buffer them.
+     if (mask_type != AttentionMaskType::None) {
+         const uint32_t num_attn_mask_tiles =
+             (mask_type == AttentionMaskType::Causal) ? kNumCausalMaskTiles : (2U * Sk_chunk_t);
+         [[maybe_unused]] auto cb_attn_mask = create_circular_buffer(
+             program, all_cores, kAttnMaskCbIndex, data_format, bfloat16_single_tile_size_bytes, num_attn_mask_tiles);
+     }
++    // CausalIntervals: the reader finds each row's first kept key tile from mask tile corners and tells the compute
++    // kernel how many K/V chunks it reads.
++    if (mask_type == AttentionMaskType::CausalIntervals) {
++        [[maybe_unused]] auto cb_kv_chunks = create_circular_buffer(
++            program, all_cores, kKvChunksCbIndex, tt::DataFormat::UInt32, ttml::metal::kCountPageBytes,
++            ttml::metal::kCountPages);
++        [[maybe_unused]] auto cb_mask_corners = create_circular_buffer_bytes(
++            program, all_cores, kMaskCornersCbIndex, data_format, ttml::metal::kMaskCornerScratchBytes);
++    }
+ 
+     // Create gate buffer if the model has a gating mechanism. Double-buffered to overlap DRAM reads with compute.
+     if (args.has_gate) {
+@@ -488,6 +500,10 @@ SDPAForwardProgramFactory::cached_program_t SDPAForwardProgramFactory::create(
+     switch (mask_type) {
+         case AttentionMaskType::Causal: defines[kCausalMaskDefKey] = "1"; break;
+         case AttentionMaskType::Arbitrary: defines[kUseAttnMaskDefKey] = "1"; break;
++        case AttentionMaskType::CausalIntervals:
++            defines[kUseAttnMaskDefKey] = "1";
++            defines[kCausalIntervalsDefKey] = "1";
++            break;
+         case AttentionMaskType::None:
+             // No mask define - kernel will just scale attention scores
+             break;

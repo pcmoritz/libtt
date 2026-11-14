@@ -6,7 +6,8 @@ attention whose forward also returns each row's log-sum-exp (the first column of
 recomputing the forward. In TPU compatibility mode they replace TorchTitan's
 Pallas splash attention (`jax_plugins.libtt.torchtitan_tpu_kernels`), which saves
 the same log-sum-exp; packed documents (segment IDs) and sliding windows pass the
-kernels a mask, one sequence at a time.
+kernels a mask, one sequence at a time, as causal intervals: the kernels skip the
+mask's tiles that keep no score.
 """
 
 import jax
@@ -20,11 +21,11 @@ from jax_plugins.libtt import torchtitan_tpu_kernels
 HEADS, SEQ, DIM = 8, 256, 128
 
 
-def _inputs(seed, batch=1, kv_heads=2, heads=HEADS, dim=DIM):
+def _inputs(seed, batch=1, kv_heads=2, heads=HEADS, dim=DIM, seq=SEQ):
     rng = np.random.default_rng(seed)
 
     def tensor(heads):
-        return rng.standard_normal((batch, heads, SEQ, dim)).astype(ml_dtypes.bfloat16)
+        return rng.standard_normal((batch, heads, seq, dim)).astype(ml_dtypes.bfloat16)
 
     return tensor(heads), tensor(kv_heads), tensor(kv_heads), tensor(heads)
 
@@ -37,8 +38,9 @@ def _reference(q, k, v, g, segment_ids=None, window=None):
     kr, vr = np.repeat(k, group, axis=1), np.repeat(v, group, axis=1)
     scale = 1 / np.sqrt(q.shape[-1])
     s = np.einsum("bhqd,bhkd->bhqk", q, kr) * scale
-    rows, cols = np.arange(SEQ)[:, None], np.arange(SEQ)[None, :]
-    mask = np.broadcast_to(cols <= rows, (batch, 1, SEQ, SEQ))
+    seq = q.shape[2]
+    rows, cols = np.arange(seq)[:, None], np.arange(seq)[None, :]
+    mask = np.broadcast_to(cols <= rows, (batch, 1, seq, seq))
     if window is not None:
         mask = mask & (cols >= rows - window)
     if segment_ids is not None:
@@ -50,8 +52,8 @@ def _reference(q, k, v, g, segment_ids=None, window=None):
     dp = np.einsum("bhqd,bhkd->bhqk", g, vr)
     ds = p * (dp - np.sum(g * out, -1, keepdims=True)) * scale
     dq = np.einsum("bhqk,bhkd->bhqd", ds, kr)
-    dk = np.einsum("bhqk,bhqd->bhkd", ds, q).reshape(batch, kv_heads, group, SEQ, -1).sum(2)
-    dv = np.einsum("bhqk,bhqd->bhkd", p, g).reshape(batch, kv_heads, group, SEQ, -1).sum(2)
+    dk = np.einsum("bhqk,bhqd->bhkd", ds, q).reshape(batch, kv_heads, group, seq, -1).sum(2)
+    dv = np.einsum("bhqk,bhqd->bhkd", p, g).reshape(batch, kv_heads, group, seq, -1).sum(2)
     return out, lse, dq, dk, dv
 
 
@@ -173,3 +175,45 @@ def test_head_dim_padded_to_tiles():
     assert (dq.shape, dk.shape, dv.shape) == (q.shape, k.shape, v.shape)
     for got, want in ((dq, dq_want), (dk, dk_want), (dv, dv_want)):
         assert _relative_error(got, want) < 0.03
+
+
+@pytest.mark.parametrize("window", [None, 300], ids=["documents", "documents_and_window"])
+def test_causal_intervals_match_arbitrary_mask(window):
+    # 1024 tokens, 32 tiles: documents that end inside tiles and on tile boundaries, one of a single token, and one
+    # of 416 tokens (13 tiles), whose rows scan their mask through several batches of tile corners. Skipping the
+    # tiles a causal-interval mask drops is as accurate as reading the same mask in full (the results differ in
+    # rounding only: without skipping, the first kept chunk of a row goes through one more online-softmax update).
+    seq = 1024
+    segment_ids = np.zeros((1, seq), np.int32)
+    for start in (5, 6, 64, 100, 101, 384, 800):
+        segment_ids[0, start:] += 1
+    q, k, v, g = _inputs(4, kv_heads=2, seq=seq)
+    want = _reference(q, k, v, g, segment_ids, window)
+    mask = torchtitan_tpu_kernels._attention_mask(seq, True, window, jnp.asarray(segment_ids[0]))
+    options = {"optimization_level": "O0"}
+
+    def forward(q, k, v, mask, mask_type):
+        return jax.ffi.ffi_call(
+            "tt.sdpa_fw",
+            (jax.ShapeDtypeStruct(q.shape, q.dtype), jax.ShapeDtypeStruct((*q.shape[:3], 32), jnp.float32)),
+        )(q, k, v, mask, mask_type=mask_type)
+
+    def backward(g, out, q, k, v, intermediates, mask, mask_type):
+        shapes = tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (q, k, v))
+        return jax.ffi.ffi_call("tt.sdpa_bw", shapes)(g, out, q, k, v, intermediates, mask, mask_type=mask_type)
+
+    tq, tk, tv, tg, tmask = _device(q, k, v, g, np.asarray(mask))
+    errors = {}
+    for mask_type in (2, 3):
+        fw = jax.jit(lambda q, k, v, m, t=mask_type: forward(q, k, v, m, t), compiler_options=options)
+        bw = jax.jit(lambda *a, t=mask_type: backward(*a, t), compiler_options=options)
+        out, intermediates = fw(tq, tk, tv, tmask)
+        grads = bw(tg, out, tq, tk, tv, intermediates, tmask)
+        got = [out, np.asarray(intermediates)[..., 0], *grads]
+        errors[mask_type] = [_relative_error(x, w) for x, w in zip(got, want)]
+    print(errors)
+    for name, full, skipped, bound in zip(
+        ("out", "lse", "dq", "dk", "dv"), errors[2], errors[3], (0.02, 2e-3, 0.03, 0.03, 0.03)
+    ):
+        assert skipped < bound, name
+        assert skipped < 1.25 * full + 1e-4, name

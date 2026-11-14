@@ -14,7 +14,11 @@ intermediates.
 
 A plain causal attention uses the kernels' causal mask. Packed documents
 (segment IDs: a query attends only to keys of its own document) and sliding
-windows pass the kernels a [1, 1, S, S] mask, one sequence at a time.
+windows pass the kernels a [1, 1, S, S] mask, one sequence at a time. Causal
+ones keep, in each query row, one interval of keys ending at the query, whose
+start never decreases down the rows (TorchTitan's segment IDs never decrease,
+as its splash attention's block skipping assumes): the kernels skip the mask's
+tiles that keep no score.
 
 The trainer's fused output layer and loss (`--loss_kernel.use_loss_kernel`) is
 tokamax's linear softmax cross-entropy, also a Pallas TPU kernel, which never
@@ -51,7 +55,7 @@ LOSS_TOKEN_CHUNK = 2048
 # each of a Blackhole's 8 DRAM banks, more than a busy chip has.
 LOSS_WEIGHT_COLUMNS = 32768
 # ttml::metal::AttentionMaskType.
-_NO_MASK, _CAUSAL_MASK, _ARBITRARY_MASK = 0, 1, 2
+_NO_MASK, _CAUSAL_MASK, _ARBITRARY_MASK, _CAUSAL_INTERVALS_MASK = 0, 1, 2, 3
 # Columns of tt-train's intermediates; the log-sum-exp is the first.
 _INTERMEDIATE_COLUMNS = 32
 # tt-train's attention takes head dimensions in tiles of 32 columns.
@@ -100,13 +104,15 @@ def _make_splash_attention_fn(
             mask_type = _CAUSAL_MASK if is_causal else _NO_MASK
             return jax.ffi.ffi_call(target, outputs(1, *tensors))(*tensors, mask_type=mask_type)
         results = []
+        # A sliding window is causal too.
+        mask_type = _CAUSAL_INTERVALS_MASK if is_causal or local_window_size is not None else _ARBITRARY_MASK
         for b in range(tensors[0].shape[0]):
             sequence = [t[b : b + 1] for t in tensors]
             mask = _attention_mask(
                 seq_len, is_causal, local_window_size, None if segment_ids is None else segment_ids[b]
             )
             results.append(
-                jax.ffi.ffi_call(target, outputs(1, *sequence))(*sequence, mask, mask_type=_ARBITRARY_MASK)
+                jax.ffi.ffi_call(target, outputs(1, *sequence))(*sequence, mask, mask_type=mask_type)
             )
         return tuple(jnp.concatenate(parts) for parts in zip(*results))
 
