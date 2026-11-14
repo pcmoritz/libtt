@@ -23,9 +23,9 @@ a time: the chunk's BF16 logits, as the output layer computes them anyway, go
 through tt-train's fused cross-entropy (`tt.cross_entropy_fw` and
 `tt.cross_entropy_bw`, FP32 inside), so no FP32 copy of all the logits exists.
 
-Qwen3.5's GatedDeltaNet normalizes its output with a gated RMSNorm, whose
-forward and backward are Pallas TPU kernels over blocks of rows; here they are
-the same math over all the rows at once.
+Qwen3.5's GatedDeltaNet normalizes its output with a gated RMSNorm, a Pallas
+TPU kernel where its inputs allow; here it always takes TorchTitan's PyTorch
+path.
 """
 
 SPLASH_MODULE = "torchtitan.experiments.tpu.kernels.splash_attention"
@@ -199,43 +199,8 @@ def _patch_loss_kernel_module(module):
     module.linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu = linear_cross_entropy_bwd
 
 
-def _rms_norm_gated_parts(x, gate, w, eps):
-    """FP32 (normalized x, rstd, normalized x scaled by w and rounded to x's dtype, gate)."""
-    import jax
-    import jax.numpy as jnp
-
-    x32 = x.astype(jnp.float32)
-    rstd = jax.lax.rsqrt(jnp.mean(x32 * x32, axis=-1, keepdims=True) + eps)
-    normed = x32 * rstd
-    return normed, rstd, (w * normed).astype(x.dtype).astype(jnp.float32), gate.astype(jnp.float32)
-
-
-def rms_norm_gated_fwd(x, gate, w, eps):
-    """TorchTitan's `rms_norm_gated_fwd_jax` without Pallas: x and gate [rows, dim], w [1, dim] FP32."""
-    import jax
-
-    _, _, scaled, gate32 = _rms_norm_gated_parts(x, gate, w, eps)
-    return (scaled * gate32 * jax.nn.sigmoid(gate32)).astype(x.dtype)
-
-
-def rms_norm_gated_bwd(x, gate, w, dy, eps):
-    """TorchTitan's `rms_norm_gated_bwd_jax` without Pallas: (dx, dgate, dw [1, dim] FP32)."""
-    import jax
-    import jax.numpy as jnp
-
-    normed, rstd, scaled, gate32 = _rms_norm_gated_parts(x, gate, w, eps)
-    sigmoid = jax.nn.sigmoid(gate32)
-    dy = dy.astype(jnp.float32)
-    dgate = dy * scaled * sigmoid * (1.0 + gate32 * (1.0 - sigmoid))
-    dscaled = dy * gate32 * sigmoid
-    dnormed = dscaled * w
-    dx = rstd * (dnormed - normed * jnp.mean(dnormed * normed, axis=-1, keepdims=True))
-    return dx.astype(x.dtype), dgate.astype(gate.dtype), jnp.sum(dscaled * normed, axis=0, keepdims=True)
-
-
 def _patch_rms_norm_gated_module(module):
-    module.rms_norm_gated_fwd_jax = rms_norm_gated_fwd
-    module.rms_norm_gated_bwd_jax = rms_norm_gated_bwd
+    module.supports = lambda *args, **kwargs: False
 
 
 PATCHES = {
