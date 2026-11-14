@@ -1,11 +1,11 @@
-"""All-gathers and reduce-scatters between processes whose buffers' addresses differ.
+"""Collectives between processes whose buffers' addresses differ.
 
 ttnn's collectives write to their peers at the addresses of their own buffers,
 which processes driving one chip each need not share: here rank 1 holds an extra
 buffer first. The unicast all-gather trades output addresses between neighbors
-and the line reduce-scatter intermediate addresses, so neither needs the
-symmetric DRAM region, which is only 64 MB here: the all-gather's 512 MB
-result stays where the peers wrote it, and the reduce-scatter, whose
+and the line reduce-scatter intermediate addresses; all-reduces, and gathers and
+scatters of padded or unaligned dimensions, are built from them. The 512 MB
+all-gather result stays where the peers wrote it, and the reduce-scatter, whose
 intermediate takes twice its 256 MB input, runs in two pieces.
 """
 
@@ -50,6 +50,31 @@ def worker(rank):
         dist.reduce_scatter_tensor(scattered, x)
         want = (2 * values + 1000)[rank * ROWS // 2 : (rank + 1) * ROWS // 2]
         assert torch.equal(scattered.cpu(), want), "reduce-scatter"
+
+        # An all-reduce as a reduce-scatter and an all-gather.
+        summed = x.clone()
+        dist.all_reduce(summed)
+        assert torch.equal(summed.cpu(), 2 * values + 1000), "all-reduce"
+
+    # Padded and unaligned dimensions, a scalar and a maximum.
+    small = torch.arange(3 * 50, dtype=torch.float32).reshape(3, 50) + 100 * rank
+    gathered = torch.empty(6, 50, device="tpu")
+    dist.all_gather_into_tensor(gathered, small.to("tpu"))
+    assert torch.equal(gathered.cpu(), torch.cat([small - 100 * rank, small - 100 * rank + 100])), "padded all-gather"
+
+    rows = torch.arange(16 * 50, dtype=torch.float32).reshape(16, 50) + 100 * rank
+    scattered = torch.empty(8, 50, device="tpu")
+    dist.reduce_scatter_tensor(scattered, rows.to("tpu"))
+    want = (2 * (rows - 100 * rank) + 100)[8 * rank : 8 * (rank + 1)]
+    assert torch.equal(scattered.cpu(), want), "unaligned reduce-scatter"
+
+    loss = torch.tensor(1.5 + rank, device="tpu")
+    dist.all_reduce(loss)
+    assert loss.item() == 4.0, f"scalar all-reduce: {loss.item()}"
+
+    peak = small.to("tpu")
+    dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+    assert torch.equal(peak.cpu(), small - 100 * rank + 100), "max all-reduce"
     if held is not None:
         assert held.sum().item() == 7.0 * 3 * 1024 * 1024
     print(f"rank {rank} done", flush=True)
@@ -81,7 +106,7 @@ def test_collectives_with_different_addresses(tmp_path):
     script.write_text(CODE)
     # Each rank takes its own chip, in a mesh of both: not the runner's one chip.
     env = {k: v for k, v in os.environ.items() if k not in ("TT_VISIBLE_DEVICES", "TT_MESH_GRAPH_DESC_PATH")}
-    env.update(LIBTT_TPU_COMPAT="1", JAX_PLATFORMS="cpu", LIBTT_SYMMETRIC_DRAM_MB="64")
+    env.update(LIBTT_TPU_COMPAT="1", JAX_PLATFORMS="cpu")
     env.setdefault("MASTER_ADDR", "127.0.0.1")
     env["MASTER_PORT"] = str(free_port())
     result = subprocess.run([sys.executable, str(script)], timeout=600, env=env, capture_output=True, text=True)

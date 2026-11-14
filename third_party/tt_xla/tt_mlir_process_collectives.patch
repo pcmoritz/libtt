@@ -1,0 +1,542 @@
+diff --git a/runtime/include/tt/runtime/detail/ttnn/utils.h b/runtime/include/tt/runtime/detail/ttnn/utils.h
+--- a/runtime/include/tt/runtime/detail/ttnn/utils.h
++++ b/runtime/include/tt/runtime/detail/ttnn/utils.h
+@@ -11,6 +11,8 @@
+ #include "ttmlir/Target/TTNN/Target.h"
+ #include "ttnn/events.hpp"
+ 
++#include <functional>
++
+ namespace tt::runtime::ttnn::utils {
+ 
+ bool isOnHost(const ::ttnn::StorageType &storageType);
+@@ -234,6 +236,81 @@ inline std::vector<T> getReplicatedValues(const ::ttnn::Tensor &tensor) {
+   return std::move(*values);
+ }
+ 
++// Whether other processes drive some of `device`'s chips. ttnn's collectives
++// write to their peers at the addresses of their own buffers, which those
++// processes need not share; its unicast all-gather and line reduce-scatter
++// trade addresses between neighbors instead.
++bool meshSpansProcesses(const ::ttnn::MeshDevice &device);
++
++// Whether ttnn's all-gather of `input` along `dim` trades output addresses: a
++// DRAM-interleaved tiled gather of an unpadded dimension (no composite
++// fallback).
++bool allGatherTradesAddresses(const ::ttnn::Tensor &input, int32_t dim);
++
++// Whether ttnn's line reduce-scatter of `input` along `dim` over `ringSize`
++// devices trades intermediate addresses: a DRAM-interleaved tiled input whose
++// device slices stay tile-aligned (no composite fallback).
++bool reduceScatterTradesAddresses(const ::ttnn::Tensor &input, int32_t dim,
++                                  uint32_t ringSize);
++
++// A collective of a tensor along a dimension, with DRAM results.
++using CollectiveAlongDim =
++    std::function<::ttnn::Tensor(const ::ttnn::Tensor &, int32_t)>;
++
++// Whether ttnn::all_reduce of `input` over `ringSize` devices exchanges the
++// ranks' inputs in L1 scratch (single tile rows, as decode's), where buffers
++// at equal addresses come from the processes running the same programs.
++bool allReduceExchangesInL1(
++    const ::ttnn::Tensor &input, uint32_t ringSize,
++    const std::optional<::tt::tt_metal::SubDeviceId> &subDeviceId,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig);
++
++// ttnn's all-gather, and its line reduce-scatter, along `clusterAxis`.
++CollectiveAlongDim
++allGatherAlong(std::optional<uint32_t> clusterAxis,
++               std::optional<::tt::tt_metal::SubDeviceId> subDeviceId,
++               std::optional<uint32_t> numLinks);
++CollectiveAlongDim
++reduceScatterAlong(std::optional<uint32_t> clusterAxis,
++                   std::optional<::tt::tt_metal::SubDeviceId> subDeviceId,
++                   std::optional<uint32_t> numLinks);
++
++// Between processes, the all-gather of `input` along `dim` by `gather` of
++// DRAM tiles, which trades addresses: of `input` itself, or, when `dim` is
++// padded, of `input` with a leading dimension, the ring's pieces then
++// concatenated along `dim`. The result takes `input`'s layout.
++::ttnn::Tensor allGatherAcrossProcesses(
++    const ::ttnn::Tensor &input, int32_t dim, const CollectiveAlongDim &gather,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig);
++
++// Between processes, the all-reduce of `input` over `ringSize` devices from
++// collectives that trade addresses: a sum by `scatter` (a reduce-scatter) and
++// `gather` along a dimension whose device slices stay tile-aligned, or else
++// `gather` along a leading dimension and a reduction across it.
++::ttnn::Tensor allReduceAcrossProcesses(
++    const ::ttnn::Tensor &input, ::reduction_common::ReduceType reduceType,
++    uint32_t ringSize, const CollectiveAlongDim &gather,
++    const CollectiveAlongDim &scatter,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig);
++
++// Between processes, the reduce-scatter of `input` along `dim` as
++// allReduceAcrossProcesses's sum, each device keeping its slice.
++::ttnn::Tensor reduceScatterAcrossProcesses(
++    const ::ttnn::Tensor &input, int32_t dim, uint32_t ringSize,
++    std::optional<uint32_t> clusterAxis, const CollectiveAlongDim &gather,
++    const CollectiveAlongDim &scatter,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig);
++
++// `collective` of `input`, or, when its buffers (`bytesPerInputByte` times the
++// input's size) would take more than `budgetPerBank` of a DRAM bank, of pieces
++// of `input` split along a dimension other than `collectiveDim`, their results
++// concatenated.
++::ttnn::Tensor runCollectiveInPieces(
++    const ::ttnn::Tensor &input, int32_t collectiveDim,
++    double bytesPerInputByte, uint64_t budgetPerBank,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig,
++    const std::function<::ttnn::Tensor(const ::ttnn::Tensor &)> &collective);
++
+ template <typename T>
+ inline T getScalarFromTensor(const ::ttnn::Tensor &tensor) {
+   std::vector<T> data = getReplicatedValues<T>(tensor);
+diff --git a/runtime/lib/ttnn/operations/ccl/all_gather.cpp b/runtime/lib/ttnn/operations/ccl/all_gather.cpp
+--- a/runtime/lib/ttnn/operations/ccl/all_gather.cpp
++++ b/runtime/lib/ttnn/operations/ccl/all_gather.cpp
+@@ -35,10 +35,21 @@ void run(const ::tt::target::ttnn::AllGatherOp *op, ProgramContext &context) {
+         ::tt::runtime::common::toMetalTopology(op->topology().value()));
+   }
+ 
++  namespace utils = ::tt::runtime::ttnn::utils;
++  // Between processes, ttnn's all-gather must take its unicast algorithm,
++  // which trades output addresses between neighbors: of DRAM tiles along an
++  // unpadded dimension.
+   ::ttnn::Tensor out =
+-      ::ttnn::all_gather(input, allGatherDim, clusterAxis, outputMemoryConfig,
+-                         persistentOutputTensor, subDeviceId,
+-                         /*sub_core_grid=*/std::nullopt, numLinks, topology);
++      utils::meshSpansProcesses(*input.device()) &&
++              !utils::allGatherTradesAddresses(input, allGatherDim)
++          ? utils::allGatherAcrossProcesses(
++                input, allGatherDim,
++                utils::allGatherAlong(clusterAxis, subDeviceId, numLinks),
++                outputMemoryConfig)
++          : ::ttnn::all_gather(input, allGatherDim, clusterAxis,
++                               outputMemoryConfig, persistentOutputTensor,
++                               subDeviceId, /*sub_core_grid=*/std::nullopt,
++                               numLinks, topology);
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+diff --git a/runtime/lib/ttnn/operations/ccl/all_reduce.cpp b/runtime/lib/ttnn/operations/ccl/all_reduce.cpp
+--- a/runtime/lib/ttnn/operations/ccl/all_reduce.cpp
++++ b/runtime/lib/ttnn/operations/ccl/all_reduce.cpp
+@@ -33,9 +33,23 @@ void run(const ::tt::target::ttnn::AllReduceOp *op, ProgramContext &context) {
+         ::tt::runtime::common::toMetalTopology(op->topology().value()));
+   }
+ 
+-  ::ttnn::Tensor out = ::ttnn::all_reduce(
+-      input, clusterAxis, subDeviceId, outputMemoryConfig, numLinks, topology,
+-      ::tt::runtime::ttnn::utils::getReduceType(op->reduce_type()));
++  namespace utils = ::tt::runtime::ttnn::utils;
++  const auto reduceType = utils::getReduceType(op->reduce_type());
++  const uint32_t ringSize = input.device()->shape()[clusterAxis];
++  // Between processes, an all-reduce from collectives that trade addresses,
++  // unless ttnn's exchanges its ranks' inputs in L1.
++  ::ttnn::Tensor out =
++      utils::meshSpansProcesses(*input.device()) &&
++              !utils::allReduceExchangesInL1(input, ringSize, subDeviceId,
++                                             outputMemoryConfig)
++          ? utils::allReduceAcrossProcesses(
++                input, reduceType, ringSize,
++                utils::allGatherAlong(clusterAxis, subDeviceId, numLinks),
++                utils::reduceScatterAlong(clusterAxis, subDeviceId, numLinks),
++                outputMemoryConfig)
++          : ::ttnn::all_reduce(input, clusterAxis, subDeviceId,
++                               outputMemoryConfig, numLinks, topology,
++                               reduceType);
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+ } // namespace tt::runtime::ttnn::operations::ccl
+diff --git a/runtime/lib/ttnn/operations/ccl/all_reduce_async.cpp b/runtime/lib/ttnn/operations/ccl/all_reduce_async.cpp
+--- a/runtime/lib/ttnn/operations/ccl/all_reduce_async.cpp
++++ b/runtime/lib/ttnn/operations/ccl/all_reduce_async.cpp
+@@ -6,6 +6,7 @@
+ #include "tt/runtime/detail/common/common.h"
+ #include "tt/runtime/detail/common/logger.h"
+ #include "tt/runtime/detail/ttnn/utils.h"
++#include "ttnn/operations/ccl/all_reduce/all_reduce.hpp"
+ #include "ttnn/operations/ccl/ccl_host_types.hpp"
+ #include "ttnn/operations/experimental/ccl/all_reduce_async/all_reduce_async.hpp"
+ 
+@@ -38,9 +39,26 @@ void run(const ::tt::target::ttnn::AllReduceAsyncOp *op,
+   auto reduceType =
+       ::tt::runtime::ttnn::utils::getReduceType(op->reduce_type());
+ 
+-  ::ttnn::Tensor out = ::ttnn::experimental::all_reduce_async(
+-      input, clusterAxis, reduceType, subDeviceId, outputMemoryConfig, numLinks,
+-      topology);
++  namespace utils = ::tt::runtime::ttnn::utils;
++  const uint32_t ringSize = input.device()->shape()[clusterAxis];
++  ::ttnn::Tensor out;
++  if (!utils::meshSpansProcesses(*input.device())) {
++    out = ::ttnn::experimental::all_reduce_async(input, clusterAxis, reduceType,
++                                                 subDeviceId, outputMemoryConfig,
++                                                 numLinks, topology);
++  } else if (utils::allReduceExchangesInL1(input, ringSize, subDeviceId,
++                                           outputMemoryConfig)) {
++    // ttnn::all_reduce's exchange in L1.
++    out = ::ttnn::all_reduce(input, clusterAxis, subDeviceId,
++                             outputMemoryConfig, numLinks, topology, reduceType);
++  } else {
++    // Between processes, from collectives that trade addresses.
++    out = utils::allReduceAcrossProcesses(
++        input, reduceType, ringSize,
++        utils::allGatherAlong(clusterAxis, subDeviceId, numLinks),
++        utils::reduceScatterAlong(clusterAxis, subDeviceId, numLinks),
++        outputMemoryConfig);
++  }
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+ } // namespace tt::runtime::ttnn::operations::ccl
+diff --git a/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp b/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp
+--- a/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp
++++ b/runtime/lib/ttnn/operations/ccl/reduce_scatter.cpp
+@@ -57,14 +57,42 @@ void run(const ::tt::target::ttnn::ReduceScatterOp *op,
+         utils::createDeviceComputeKernelConfig(op->compute_config());
+   }
+ 
+-  ::ttnn::Tensor out = ::ttnn::reduce_scatter(
+-      input, scatterDimension, clusterAxis, subDeviceId, outputMemoryConfig,
+-      /*intermediate_memory_config=*/std::nullopt, optionalOutputTensor,
+-      numLinks, topology,
+-      /*chunks_per_sync=*/std::nullopt,
+-      /*num_workers_per_link=*/std::nullopt,
+-      /*num_buffers_per_channel=*/std::nullopt,
+-      /*compute_kernel_config=*/computeConfig);
++  auto scatter = [&](const ::ttnn::Tensor &piece,
++                     std::optional<::tt::tt_fabric::Topology> pieceTopology) {
++    return ::ttnn::reduce_scatter(
++        piece, scatterDimension, clusterAxis, subDeviceId, outputMemoryConfig,
++        /*intermediate_memory_config=*/std::nullopt, optionalOutputTensor,
++        numLinks, pieceTopology,
++        /*chunks_per_sync=*/std::nullopt,
++        /*num_workers_per_link=*/std::nullopt,
++        /*num_buffers_per_channel=*/std::nullopt,
++        /*compute_kernel_config=*/computeConfig);
++  };
++  namespace utils = ::tt::runtime::ttnn::utils;
++  const uint32_t ringSize = input.device()->shape()[*clusterAxis];
++  ::ttnn::Tensor out;
++  if (utils::reduceScatterTradesAddresses(input, scatterDimension, ringSize)) {
++    // ttnn's line reduce-scatter trades intermediate addresses between
++    // neighbors and writes its output locally. Its intermediate takes twice
++    // the input, so pieces bound its buffers to 64 MB per DRAM bank.
++    out = utils::runCollectiveInPieces(
++        input, scatterDimension, /*bytesPerInputByte=*/2.5,
++        /*budgetPerBank=*/uint64_t{64} << 20, outputMemoryConfig,
++        [&](const ::ttnn::Tensor &piece) {
++          return scatter(piece, ::tt::tt_fabric::Topology::Linear);
++        });
++  } else if (!utils::meshSpansProcesses(*input.device())) {
++    out = scatter(input, topology);
++  } else {
++    // Between processes, ttnn's composite reduce-scatter writes to its peers
++    // at its own addresses: the all-reduce from collectives that trade them,
++    // each device keeping its slice.
++    out = utils::reduceScatterAcrossProcesses(
++        input, scatterDimension, ringSize, clusterAxis,
++        utils::allGatherAlong(clusterAxis, subDeviceId, numLinks),
++        utils::reduceScatterAlong(clusterAxis, subDeviceId, numLinks),
++        outputMemoryConfig);
++  }
+ 
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+diff --git a/runtime/lib/ttnn/utils/utils.cpp b/runtime/lib/ttnn/utils/utils.cpp
+--- a/runtime/lib/ttnn/utils/utils.cpp
++++ b/runtime/lib/ttnn/utils/utils.cpp
+@@ -9,6 +9,18 @@
+ #include "tt/runtime/types.h"
+ #include "tt/runtime/utils.h"
+ 
++#include "ttnn/operations/ccl/all_gather/all_gather.hpp"
++#include "ttnn/operations/ccl/mesh_partition/mesh_partition.hpp"
++#include "ttnn/operations/ccl/reduce_scatter/reduce_scatter.hpp"
++#include "ttnn/operations/core/core.hpp"
++#include "ttnn/operations/data_movement/concat/concat.hpp"
++#include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
++#include "ttnn/operations/data_movement/slice/slice.hpp"
++#include "ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp"
++#include "ttnn/operations/reduction/generic/generic_reductions.hpp"
++
++#include <cmath>
++
+ #include <memory>
+ #include <vector>
+ 
+@@ -675,4 +687,272 @@ getMemoryView(Device deviceHandle) {
+   return memoryMap;
+ }
+ 
++namespace {
++bool isDramInterleavedTiled(const ::ttnn::Tensor &tensor) {
++  return tensor.memory_config().is_dram() &&
++         !tensor.memory_config().is_sharded() &&
++         tensor.layout() == ::ttnn::Layout::TILE;
++}
++
++int32_t nonNegativeDim(int32_t dim, uint32_t rank) {
++  return dim < 0 ? dim + static_cast<int32_t>(rank) : dim;
++}
++
++// `tensor` in DRAM-interleaved tiles, as the collectives that trade addresses
++// take it.
++::ttnn::Tensor toDramTiles(const ::ttnn::Tensor &tensor) {
++  ::ttnn::Tensor result = tensor;
++  if (!result.memory_config().is_dram() ||
++      result.memory_config().is_sharded()) {
++    result = ::ttnn::to_memory_config(result, ::ttnn::DRAM_MEMORY_CONFIG);
++  }
++  if (result.layout() != ::ttnn::Layout::TILE) {
++    result = ::ttnn::to_layout(result, ::ttnn::Layout::TILE);
++  }
++  return result;
++}
++
++// `tensor` back in `like`'s layout, in `memoryConfig` or else `like`'s.
++::ttnn::Tensor
++likeInput(const ::ttnn::Tensor &tensor, const ::ttnn::Tensor &like,
++          const std::optional<::ttnn::MemoryConfig> &memoryConfig) {
++  ::ttnn::Tensor result = tensor;
++  if (result.layout() != like.layout()) {
++    result = ::ttnn::to_layout(result, like.layout());
++  }
++  const ::ttnn::MemoryConfig wanted =
++      memoryConfig.value_or(like.memory_config());
++  if (result.memory_config() != wanted) {
++    result = ::ttnn::to_memory_config(result, wanted);
++  }
++  return result;
++}
++
++// A view of `tensor` with a leading dimension of one to gather along, of at
++// most four dimensions (the dimensions before the last two merged).
++::ttnn::Tensor withLeadingUnitDim(const ::ttnn::Tensor &tensor) {
++  const ::ttnn::Shape &shape = tensor.logical_shape();
++  ::ttsl::SmallVector<uint32_t> dims{1};
++  if (shape.rank() == 0) {
++    dims.push_back(1);
++  } else if (shape.rank() < 4) {
++    for (uint32_t size : shape) {
++      dims.push_back(size);
++    }
++  } else {
++    uint32_t leading = 1;
++    for (size_t i = 0; i + 2 < shape.rank(); ++i) {
++      leading *= shape[i];
++    }
++    dims.push_back(leading);
++    dims.push_back(shape[-2]);
++    dims.push_back(shape[-1]);
++  }
++  return ::ttnn::reshape(tensor, ::ttnn::Shape(dims));
++}
++} // namespace
++
++bool meshSpansProcesses(const ::ttnn::MeshDevice &device) {
++  return device.get_view().get_local_mesh_coord_range().shape().mesh_size() !=
++         device.shape().mesh_size();
++}
++
++bool allGatherTradesAddresses(const ::ttnn::Tensor &input, int32_t dim) {
++  const ::ttnn::Shape &shape = input.logical_shape();
++  dim = nonNegativeDim(dim, shape.rank());
++  return isDramInterleavedTiled(input) &&
++         shape[dim] == input.padded_shape()[dim];
++}
++
++bool reduceScatterTradesAddresses(const ::ttnn::Tensor &input, int32_t dim,
++                                  uint32_t ringSize) {
++  const ::ttnn::Shape &shape = input.logical_shape();
++  const int32_t rank = static_cast<int32_t>(shape.rank());
++  dim = nonNegativeDim(dim, rank);
++  const auto tileShape = input.tensor_spec().tile().get_tile_shape();
++  return isDramInterleavedTiled(input) && shape[dim] % ringSize == 0 &&
++         (dim < rank - 2 ||
++          (shape[dim] / ringSize) % tileShape[dim - (rank - 2)] == 0);
++}
++
++bool allReduceExchangesInL1(
++    const ::ttnn::Tensor &input, uint32_t ringSize,
++    const std::optional<::tt::tt_metal::SubDeviceId> &subDeviceId,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig) {
++  // ttnn::all_reduce's own condition for its direct exchange.
++  return !subDeviceId && input.device()->num_devices() == ringSize &&
++         outputMemoryConfig.value_or(::ttnn::DRAM_MEMORY_CONFIG) ==
++             ::ttnn::DRAM_MEMORY_CONFIG &&
++         ::ttnn::experimental::prim::direct_all_reduce_scratch_config(input,
++                                                                      ringSize)
++             .has_value();
++}
++
++CollectiveAlongDim
++allGatherAlong(std::optional<uint32_t> clusterAxis,
++               std::optional<::tt::tt_metal::SubDeviceId> subDeviceId,
++               std::optional<uint32_t> numLinks) {
++  return [=](const ::ttnn::Tensor &tensor, int32_t dim) {
++    return ::ttnn::all_gather(tensor, dim, clusterAxis,
++                              ::ttnn::DRAM_MEMORY_CONFIG,
++                              /*persistent_output_tensor=*/std::nullopt,
++                              subDeviceId, /*sub_core_grid=*/std::nullopt,
++                              numLinks);
++  };
++}
++
++CollectiveAlongDim
++reduceScatterAlong(std::optional<uint32_t> clusterAxis,
++                   std::optional<::tt::tt_metal::SubDeviceId> subDeviceId,
++                   std::optional<uint32_t> numLinks) {
++  return [=](const ::ttnn::Tensor &tensor, int32_t dim) {
++    return ::ttnn::reduce_scatter(tensor, dim, clusterAxis, subDeviceId,
++                                  ::ttnn::DRAM_MEMORY_CONFIG,
++                                  /*intermediate_memory_config=*/std::nullopt,
++                                  /*optional_output_tensor=*/std::nullopt,
++                                  numLinks, ::tt::tt_fabric::Topology::Linear);
++  };
++}
++
++::ttnn::Tensor allGatherAcrossProcesses(
++    const ::ttnn::Tensor &input, int32_t dim, const CollectiveAlongDim &gather,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig) {
++  const ::ttnn::Shape &shape = input.logical_shape();
++  const int32_t rank = static_cast<int32_t>(shape.rank());
++  dim = nonNegativeDim(dim, rank);
++  const ::ttnn::Tensor tiles = toDramTiles(input);
++  if (allGatherTradesAddresses(tiles, dim)) {
++    return likeInput(gather(tiles, dim), input, outputMemoryConfig);
++  }
++  // A padded (tiled) dimension: gather the whole tensors along a leading
++  // dimension and concatenate the ring's pieces along `dim`.
++  const ::ttnn::Tensor gathered = gather(withLeadingUnitDim(tiles), 0);
++  const ::ttnn::Shape &gatheredShape = gathered.logical_shape();
++  const uint32_t ringSize = gatheredShape[0];
++  ::ttsl::SmallVector<uint32_t> begins(gatheredShape.rank(), 0);
++  ::ttsl::SmallVector<uint32_t> ends(gatheredShape.cbegin(),
++                                     gatheredShape.cend());
++  const ::ttsl::SmallVector<uint32_t> steps(gatheredShape.rank(), 1);
++  std::vector<::ttnn::Tensor> pieces;
++  for (uint32_t i = 0; i < ringSize; ++i) {
++    begins[0] = i;
++    ends[0] = i + 1;
++    pieces.push_back(::ttnn::slice(gathered, begins, ends, steps));
++  }
++  const int32_t concatDim =
++      dim - rank + static_cast<int32_t>(gatheredShape.rank());
++  ::ttsl::SmallVector<uint32_t> outDims(shape.cbegin(), shape.cend());
++  outDims[dim] *= ringSize;
++  return likeInput(::ttnn::reshape(::ttnn::concat(pieces, concatDim),
++                                   ::ttnn::Shape(outDims)),
++                   input, outputMemoryConfig);
++}
++
++::ttnn::Tensor allReduceAcrossProcesses(
++    const ::ttnn::Tensor &input, ::reduction_common::ReduceType reduceType,
++    uint32_t ringSize, const CollectiveAlongDim &gather,
++    const CollectiveAlongDim &scatter,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig) {
++  const ::ttnn::Tensor tiles = toDramTiles(input);
++  const ::ttnn::Shape &shape = tiles.logical_shape();
++  // A sum whose reduce-scatter and all-gather trade addresses: as ttnn runs it.
++  if (reduceType == ::reduction_common::ReduceType::Sum) {
++    for (int32_t dim = static_cast<int32_t>(shape.rank()) - 1; dim >= 0;
++         --dim) {
++      if (reduceScatterTradesAddresses(tiles, dim, ringSize)) {
++        return likeInput(gather(scatter(tiles, dim), dim), input,
++                         outputMemoryConfig);
++      }
++    }
++  }
++  // Otherwise every rank's whole tensor, gathered along a leading dimension
++  // and reduced across it.
++  const ::ttnn::Tensor gathered = gather(withLeadingUnitDim(tiles), 0);
++  ::ttnn::Tensor reduced;
++  switch (reduceType) {
++  case ::reduction_common::ReduceType::Sum:
++    reduced = ::ttnn::sum(gathered, 0);
++    break;
++  case ::reduction_common::ReduceType::Max:
++    reduced = ::ttnn::max(gathered, 0);
++    break;
++  case ::reduction_common::ReduceType::Min:
++    reduced = ::ttnn::min(gathered, 0);
++    break;
++  default:
++    LOG_FATAL("Unsupported reduce type for a collective between processes");
++  }
++  return likeInput(::ttnn::reshape(reduced, shape), input,
++                   outputMemoryConfig);
++}
++
++::ttnn::Tensor reduceScatterAcrossProcesses(
++    const ::ttnn::Tensor &input, int32_t dim, uint32_t ringSize,
++    std::optional<uint32_t> clusterAxis, const CollectiveAlongDim &gather,
++    const CollectiveAlongDim &scatter,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig) {
++  const ::ttnn::Tensor reduced = allReduceAcrossProcesses(
++      input, ::reduction_common::ReduceType::Sum, ringSize, gather, scatter,
++      ::ttnn::DRAM_MEMORY_CONFIG);
++  // Row-major, as tiled slices must start on tile boundaries.
++  const ::ttnn::Tensor slice = ::ttnn::mesh_partition(
++      ::ttnn::to_layout(reduced, ::ttnn::Layout::ROW_MAJOR), dim, clusterAxis,
++      ::ttnn::DRAM_MEMORY_CONFIG);
++  return likeInput(slice, input, outputMemoryConfig);
++}
++
++::ttnn::Tensor runCollectiveInPieces(
++    const ::ttnn::Tensor &input, int32_t collectiveDim,
++    double bytesPerInputByte, uint64_t budgetPerBank,
++    const std::optional<::ttnn::MemoryConfig> &outputMemoryConfig,
++    const std::function<::ttnn::Tensor(const ::ttnn::Tensor &)> &collective) {
++  ::ttnn::MeshDevice &device = *input.device();
++  // Buffers are interleaved over the DRAM banks; 10% for their page rounding.
++  const double bytesPerBank =
++      bytesPerInputByte * input.physical_volume() * input.element_size() /
++      device.allocator()->get_num_banks(::ttnn::BufferType::DRAM);
++  const auto pieces =
++      static_cast<uint32_t>(std::ceil(bytesPerBank / (0.9 * budgetPerBank)));
++  if (pieces <= 1) {
++    return collective(input);
++  }
++
++  // Split the dimension with the most units (tiles in the two tiled
++  // dimensions) into `pieces` runs of units.
++  const ::ttnn::Shape &shape = input.logical_shape();
++  const int32_t rank = static_cast<int32_t>(shape.rank());
++  const int32_t skip = collectiveDim < 0 ? collectiveDim + rank : collectiveDim;
++  const bool tiled = input.layout() == ::ttnn::Layout::TILE;
++  const auto tileShape = input.tensor_spec().tile().get_tile_shape();
++  int32_t splitDim = -1;
++  uint32_t unit = 1;
++  uint32_t units = 0;
++  for (int32_t dim = 0; dim < rank; ++dim) {
++    const uint32_t dimUnit =
++        !tiled || dim < rank - 2 ? 1 : tileShape[dim - (rank - 2)];
++    if (dim == skip || shape[dim] % dimUnit != 0 ||
++        shape[dim] / dimUnit <= units) {
++      continue;
++    }
++    splitDim = dim;
++    unit = dimUnit;
++    units = shape[dim] / dimUnit;
++  }
++  if (splitDim < 0 || units < pieces) {
++    return collective(input);
++  }
++
++  const uint32_t unitsPerPiece = (units + pieces - 1) / pieces;
++  ::ttsl::SmallVector<uint32_t> begins(rank, 0);
++  ::ttsl::SmallVector<uint32_t> ends(shape.cbegin(), shape.cend());
++  const ::ttsl::SmallVector<uint32_t> steps(rank, 1);
++  std::vector<::ttnn::Tensor> results;
++  for (uint32_t start = 0; start < units; start += unitsPerPiece) {
++    begins[splitDim] = start * unit;
++    ends[splitDim] = std::min(units, start + unitsPerPiece) * unit;
++    results.push_back(collective(::ttnn::slice(input, begins, ends, steps)));
++  }
++  return ::ttnn::concat(results, splitDim, outputMemoryConfig);
++}
++
+ } // namespace tt::runtime::ttnn::utils
