@@ -454,7 +454,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp ttnn/c
  #include "ttnn/operations/ccl/common/host/ccl_topology_utils.hpp"
  #include "ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_device_operation.hpp"
  #include "ttnn/operations/data_movement/pad/pad.hpp"
-@@ -404,17 +407,37 @@ ttnn::Tensor composite_all_gather(
+@@ -404,17 +407,28 @@ ttnn::Tensor composite_all_gather(
          input_tensor = ttnn::to_layout(input_tensor, ttnn::Layout::ROW_MAJOR);
      }
  
@@ -484,18 +484,9 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp ttnn/c
 -    // Do the gather itself
 -    ttnn::Tensor all_gather_output_tensor = ttnn::concat(broadcasted_tensors, gather_dim);
 +        /*sub_core_grid=*/std::nullopt);
-+    const auto& gathered_shape = gathered.logical_shape();
-+    const int32_t gathered_rank = static_cast<int32_t>(gathered_shape.rank());
-+    const ttsl::SmallVector<int32_t> steps(gathered_rank, 1);
-+    ttsl::SmallVector<int32_t> begins(gathered_rank, 0);
-+    ttsl::SmallVector<int32_t> ends(gathered_shape.cbegin(), gathered_shape.cend());
-+    std::vector<ttnn::Tensor> pieces;
-+    pieces.reserve(gathered_shape[0]);
-+    for (uint32_t i = 0; i < gathered_shape[0]; ++i) {
-+        begins[0] = static_cast<int32_t>(i);
-+        ends[0] = static_cast<int32_t>(i + 1);
-+        const ttsl::Span<const int32_t> sbegins(begins), sends(ends), ssteps(steps);
-+        pieces.push_back(ttnn::reshape(ttnn::slice(gathered, sbegins, sends, ssteps), input_shape));
++    std::vector<ttnn::Tensor> pieces = ttnn::split(gathered, 1, 0, gathered.memory_config());
++    for (auto& piece : pieces) {
++        piece = ttnn::reshape(piece, input_shape);
 +    }
 +    ttnn::Tensor all_gather_output_tensor = ttnn::concat(pieces, gather_dim);
  
