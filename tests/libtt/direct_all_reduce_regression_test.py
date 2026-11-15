@@ -35,8 +35,8 @@ def full_mesh():
         (1, 96, jnp.bfloat16),
         (1, 2048, jnp.bfloat16),
         (1, 4096, jnp.bfloat16),
-        # 77 tiles: one reduction core would not fit their scratch at four
-        # ranks, so it takes 7.
+        # 77 tiles: one reduction core's CB would not fit their slices at
+        # four ranks, so it takes 7.
         (1, 2464, jnp.bfloat16),
         # 61 tiles on one core: their 384 packed bytes each fill 11.4 pages,
         # which it reduces in DST batches of 8 and 4.
