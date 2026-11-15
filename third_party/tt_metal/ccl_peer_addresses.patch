@@ -49,18 +49,17 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/all_gather_unicast_fac
  ////////////////////////////////////////////////////////////////
  
  AllGatherUnicastFactory::cached_mesh_workload_t AllGatherUnicastFactory::create_mesh_workload(
-@@ -45,7 +46,9 @@ AllGatherUnicastFactory::cached_mesh_workload_t AllGatherUnicastFactory::create_
+@@ -45,7 +46,8 @@ AllGatherUnicastFactory::cached_mesh_workload_t AllGatherUnicastFactory::create_
      // Since Fabric doesn't provide such capability within kernels, we need to manually sync using global semaphores.
      // Allocate the semaphore in L1_SMALL to avoid fragmenting the larger L1 memory pool.
      // Two semaphores:
 -    // - barrier_sem: one-shot init handshake ("I'm alive") to the neighbor.
 +    // - barrier_sem: the start handshake with the partner core on the neighbor, which carries each one's output
-+    //   address (devices driven by different processes need not hold the output at one address). An address
-+    //   arrives only once its device has started the op, so it also orders the writes after the allocation.
++    //   address.
      // - data_valid_sem: chunks upstream has relayed into our output (relay gate + completion).
      const auto sem_buffer_type = ttnn::ccl::prefer_l1_small_buffer_type(*mesh_device);
      ttnn::ccl::warn_if_semaphores_fall_back_to_l1(sem_buffer_type);
-@@ -127,7 +130,6 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
+@@ -127,7 +129,6 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
      // Even-sized ring: for load balancing, the antipode device receives the antipode stripe as halves from both
      // forward and backward directions.
      const bool ring_even_split = is_ring && (num_devices % 2 == 0);
@@ -68,7 +67,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/all_gather_unicast_fac
  
      const uint32_t packet_size = operation_attributes.packet_size;
  
-@@ -428,7 +430,6 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
+@@ -428,7 +429,6 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
          num_devices,               // device count (stripe indexing)
          cb0_id,                    // cb id
          cb_page_size,              // cb entry size
@@ -76,7 +75,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/all_gather_unicast_fac
      };
      tt::tt_metal::TensorAccessorArgs(input_tensor.buffer()).append_to(reader_compile_args);
      tt::tt_metal::TensorAccessorArgs(output_tensor.buffer()).append_to(reader_compile_args);
-@@ -442,7 +443,6 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
+@@ -442,7 +442,6 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
          cb0_id,                    // cb id
          cb_page_size,              // cb entry size
          packet_size,               // packet_size
@@ -84,7 +83,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/all_gather_unicast_fac
          data_valid_granularity,    // signal data_valid once per this many CB pages
      };
      tt::tt_metal::TensorAccessorArgs(output_tensor.buffer()).append_to(writer_compile_args);
-@@ -547,6 +547,23 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
+@@ -547,6 +546,23 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
                      final_count = is_forward ? half : (num_worker_output_chunks - half);
                  }
  
@@ -108,7 +107,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/all_gather_unicast_fac
                  // Chunks the upstream delivers into our output (relayed full stripes + sink). The even-ring
                  // antipode arrives as a half, so it contributes final_count instead of a full stripe.
                  const uint32_t total_chunks = num_recv * num_worker_output_chunks -
-@@ -565,7 +582,6 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
+@@ -565,7 +581,6 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
                      final_count,               // last-iteration slice length (even-ring split)
                      input_tile_id_start,       // local data: input page start
                      input_tile_id_end,         // local data: input page end
@@ -116,7 +115,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/all_gather_unicast_fac
                      data_valid_sem.address(),  // data_valid_sem L1 address
                  };
                  tt::tt_metal::SetRuntimeArgs(program, reader_kernel_id, {core}, reader_rt_args);
-@@ -583,8 +599,10 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
+@@ -583,8 +598,10 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
                      final_start,                      // last-iteration slice start (even-ring split)
                      final_count,                      // last-iteration slice length (even-ring split)
                      do_local_write ? 1u : 0u,         // write local data into local output on iteration 0
@@ -128,7 +127,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/all_gather_unicast_fac
                      (uint32_t)partner_core.x,         // barrier_sem target (neighbor partner core x)
                      (uint32_t)partner_core.y,         // barrier_sem target (neighbor partner core y)
                      (uint32_t)mirror_core.x,          // data_valid_sem target (neighbor mirror core x)
-@@ -656,12 +674,11 @@ void AllGatherUnicastFactory::override_runtime_arguments(
+@@ -656,12 +673,11 @@ void AllGatherUnicastFactory::override_runtime_arguments(
          auto& reader_args_by_core = GetRuntimeArgs(program, shared_vars.reader_kernel_id);
          auto& writer_args_by_core = GetRuntimeArgs(program, shared_vars.writer_kernel_id);
          for (const auto& core : shared_vars.worker_cores) {
@@ -160,24 +159,17 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/multicast_comm
 diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_common.hpp ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_common.hpp
 --- ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_common.hpp
 +++ ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_common.hpp
-@@ -113,12 +113,14 @@ public:
-         sem_packet_header{PacketHeaderPool::allocate_header(1)},
-         scatter_header({}, {}),
+@@ -115,7 +115,9 @@ public:
          chunk_count{0} {
--        std::array<uint64_t, max_pages_per_packet> dummy_addrs{};  // init to 0s
--        std::array<uint16_t, max_pages_per_packet - 1> chunk_sizes{};
+         std::array<uint64_t, max_pages_per_packet> dummy_addrs{};  // init to 0s
+         std::array<uint16_t, max_pages_per_packet - 1> chunk_sizes{};
 -        chunk_sizes.fill(page_size);
++        // Only scatter writes, which pack pages of at most half a packet, use the 16-bit chunk sizes; a page larger
++        // than 64 KB (a wide row-major row) is split across packets instead.
++        chunk_sizes.fill(static_cast<uint16_t>(use_scatter_write ? page_size : 0));
          constexpr uint8_t num_hops = 1;  // store-and-forward: always the immediate neighbor
  
          if constexpr (use_scatter_write) {
-+            // Scatter writes pack pages of at most half a packet, so their sizes fit the 16-bit chunk sizes; a page
-+            // larger than 64 KB (a wide row-major row) is split across packets instead.
-+            std::array<uint64_t, max_pages_per_packet> dummy_addrs{};  // init to 0s
-+            std::array<uint16_t, max_pages_per_packet - 1> chunk_sizes{};
-+            chunk_sizes.fill(static_cast<uint16_t>(page_size));
-             fabric_api::fabric_unicast_noc_scatter_write_set_state<UnicastScatterWriteUpdateMask::ChunkSizes>(
-                 scatter_packet_header,
-                 num_hops,
 diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_reader.cpp ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_reader.cpp
 --- ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_reader.cpp
 +++ ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_reader.cpp
@@ -260,7 +252,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_writer
      [[maybe_unused]] const uint8_t barrier_sem_noc_x = get_arg_val<uint32_t>(arg_idx++);  // neighbor opposite-dir core
      [[maybe_unused]] const uint8_t barrier_sem_noc_y = get_arg_val<uint32_t>(arg_idx++);
      const uint8_t data_valid_sem_noc_x = get_arg_val<uint32_t>(arg_idx++);  // mirror core (data_valid_sem target)
-@@ -143,11 +144,24 @@ void kernel_main() {
+@@ -143,11 +144,22 @@ void kernel_main() {
  
      FabricWriter<output_chunk_size, packet_size, SenderT> fabric(noc, sender, neighbor_chip_id, neighbor_mesh_id);
  
@@ -268,12 +260,10 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_writer
 -    // paired writer start writing into our output. Our own reader does the matching wait.
 -    if constexpr (do_init_barrier) {
 -        fabric.atomic_inc(safe_get_noc_addr(barrier_sem_noc_x, barrier_sem_noc_y, barrier_sem, 0), 1);
-+    // Start handshake with the partner core on the neighbor, the one that writes into our output: each adds its
-+    // output address to the other's zeroed barrier_sem if the other writes into it, and takes the other's if it
-+    // writes itself (devices driven by different processes need not hold the output at one address). An address
-+    // arrives only once its device has started this op, so a writer never writes into an output before its device
-+    // allocated it. The semaphore is reset once read, before this writer's data reaches the partner's device,
-+    // which can't finish (and run the next invocation, whose address would land here) without that data.
++    // Start handshake with the partner core on the neighbor (the one that writes into our output): each adds its
++    // output address to the other's zeroed barrier_sem, and writes to the address it receives. An address arrives
++    // only once its device has started this op, so no write precedes the output's allocation. (Which side publishes
++    // and takes, and why the reset can't race the next invocation: see the factory.)
 +    if (publishes_address) {
 +        fabric.atomic_inc(
 +            safe_get_noc_addr(barrier_sem_noc_x, barrier_sem_noc_y, barrier_sem, 0), output_tensor_address);
@@ -289,7 +279,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_writer
  
      const uint64_t downstream_data_valid_addr =
          safe_get_noc_addr(data_valid_sem_noc_x, data_valid_sem_noc_y, data_valid_sem, 0);
-@@ -176,7 +190,7 @@ void kernel_main() {
+@@ -176,7 +188,7 @@ void kernel_main() {
              for (uint32_t i = 0; i < batch; ++i) {
                  auto [page_id, byte_off] = it.next();
                  uint64_t neighbor_addr =
@@ -372,15 +362,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_dev
 diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp
 --- ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp
 +++ ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp
-@@ -4,6 +4,7 @@
- 
- #include "ttnn/common/queue_id.hpp"
- 
-+#include <cmath>
- #include <mutex>
- #include <set>
- #include <tuple>
-@@ -18,6 +19,8 @@
+@@ -18,6 +18,8 @@
  #include <tt-metalium/hal.hpp>
  #include <tt-metalium/experimental/fabric/fabric.hpp>
  #include "ttnn/operations/ccl/common/host/moe_utils.hpp"
@@ -389,7 +371,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp ttnn/c
  #include "ttnn/operations/experimental/ccl/composite_common.hpp"
  #include "ttnn/operations/experimental/ccl/reduce_scatter_minimal_direct/reduce_scatter_minimal_direct.hpp"
  #include "ttnn/operations/experimental/ccl/reduce_scatter_minimal_direct/device/reduce_scatter_minimal_direct_op_device_operation.hpp"
-@@ -91,6 +94,66 @@ bool use_direct_reduce_scatter(
+@@ -91,6 +93,67 @@ bool use_direct_reduce_scatter(
      return buffer != nullptr && static_cast<uint64_t>(buffer->size()) <= k_direct_rs_max_input_bytes;
  }
  
@@ -415,9 +397,10 @@ diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp ttnn/c
 +        return std::nullopt;
 +    }
 +    auto* mesh_device = input_tensor.device();
-+    const double bytes_per_bank = static_cast<double>(input_tensor.buffer()->size()) * (2.0 + 1.0 / ring_size) /
-+                                  mesh_device->allocator()->get_num_banks(tt::tt_metal::BufferType::DRAM);
-+    const auto pieces = static_cast<uint32_t>(std::ceil(bytes_per_bank / k_piece_budget_per_bank));
++    const uint64_t bytes = input_tensor.buffer()->size() * (2 * ring_size + 1) / ring_size;
++    const uint64_t budget =
++        k_piece_budget_per_bank * mesh_device->allocator()->get_num_banks(tt::tt_metal::BufferType::DRAM);
++    const auto pieces = static_cast<uint32_t>((bytes + budget - 1) / budget);
 +    if (pieces <= 1) {
 +        return std::nullopt;
 +    }
@@ -604,28 +587,25 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      if (direct) input_spec.shape[1] /= operation_attributes.ring_size;
      const auto output_spec = direct ? input_spec : output_tensor.shard_spec().value();
  
-@@ -452,6 +457,11 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
+@@ -452,6 +457,8 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
      uint32_t reduction_CB_size = reduction_CB_tiles * reduction_CB_single_tile_size;
  
      uint32_t reduction_cb_index = tt::CBIndex::c_1;
-+    // The writers multicast each rank's slice into the peers' reduction CB at their own CB's address. Within one
-+    // process the scratch tensor sits at one address on every device; devices of other processes allocate theirs
-+    // apart, so there no scratch tensor is passed and the CB is the program's own, at the address the program gives
-+    // it on every device.
-+    const bool program_scratch = !buffer_tensor.has_value();
++    // The writers multicast each rank's slice into the peers' reduction CB at their own CB's address: the scratch
++    // tensor's within one process, else (no scratch tensor) the program's own, at one address on every device.
      desc.cbs.push_back(tt::tt_metal::CBDescriptor{
          .total_size = reduction_CB_size,
          .core_ranges = all_cores,
-@@ -460,7 +470,7 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
+@@ -460,7 +467,7 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
              .data_format = df,
              .page_size = reduction_CB_single_tile_size,
          }}},
 -        .buffer = buffer_tensor.buffer(),
-+        .buffer = program_scratch ? nullptr : buffer_tensor->buffer(),
++        .buffer = buffer_tensor ? buffer_tensor->buffer() : nullptr,
      });
  
      /* out cb */
-@@ -579,8 +589,9 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
+@@ -579,8 +586,9 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
      worker_sender_writer_kernel_desc.source_type = tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
      worker_sender_writer_kernel_desc.core_ranges = sender_worker_core_range;
      worker_sender_writer_kernel_desc.compile_time_args = std::move(writer_compile_args);
@@ -637,7 +617,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      worker_sender_writer_kernel_desc.defines = packing_defines;
      if (direct) {
          worker_sender_writer_kernel_desc.defines.emplace_back("WAIT_FOR_PEERS", "1");
-@@ -790,7 +801,7 @@ void AllReduceAsyncMeshWorkloadFactory::override_runtime_arguments(
+@@ -790,7 +798,7 @@ void AllReduceAsyncMeshWorkloadFactory::override_runtime_arguments(
          }
          const auto& indices = cb->buffer_indices();
          if (indices.contains(static_cast<uint8_t>(tt::CBIndex::c_1))) {
@@ -716,18 +696,17 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
  #endif
  
  #ifdef OUTPUT_IS_SHARDED
-@@ -216,6 +212,10 @@ void kernel_main() {
+@@ -216,6 +212,9 @@ void kernel_main() {
      auto pkt_unicast_hdr = PacketHeaderPool::allocate_header();
      auto pkt_hdr_seminc = PacketHeaderPool::allocate_header();
  
-+    // Devices driven by different processes need not hold the intermediate at one address: the barrier
-+    // increment carries this worker's intermediate address to its partner (the worker on the neighbor that
-+    // writes into ours), and the partner's arrives here in turn.
++    // The barrier increment carries this worker's intermediate address to its partner (the worker on the neighbor
++    // that writes into ours), and the partner's arrives here in turn.
 +    address_t neighbor_intermediate_address = intermediate_address;
      if (use_barrier_sem) {
          if (num_targets_in_direction) {
              // Use neighbor unicast instead of multicast to support reshaped 'logical linear' mesh devices
-@@ -225,8 +225,8 @@ void kernel_main() {
+@@ -225,8 +224,8 @@ void kernel_main() {
                  pkt_hdr_seminc,
                  static_cast<uint8_t>(unicast_route_info.distance_in_hops),
                  tt::tt_fabric::NocUnicastAtomicIncCommandHeader{
@@ -738,7 +717,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
  
              uint64_t opposite_direction_barrier_sem_noc_addr_in_pkt =
                  safe_get_noc_addr(opposite_core_sem_noc0_x, opposite_core_sem_noc0_y, barrier_sem, 0);
-@@ -239,9 +239,18 @@ void kernel_main() {
+@@ -239,9 +238,18 @@ void kernel_main() {
              // backward) handshake with each other, so the target is structurally 1 and does not
              // depend on barrier_target_count.
              noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(barrier_sem), 1);
@@ -776,18 +755,17 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
  #endif
  
  #ifdef OUTPUT_IS_SHARDED
-@@ -221,6 +217,10 @@ void kernel_main() {
+@@ -221,6 +217,9 @@ void kernel_main() {
      auto pkt_unicast_hdr = PacketHeaderPool::allocate_header();
      auto pkt_hdr_seminc = PacketHeaderPool::allocate_header();
  
-+    // Devices driven by different processes need not hold the intermediate at one address: the barrier
-+    // increment carries this worker's intermediate address to its partner (the worker on the neighbor that
-+    // writes into ours), and the partner's arrives here in turn.
++    // The barrier increment carries this worker's intermediate address to its partner (the worker on the neighbor
++    // that writes into ours), and the partner's arrives here in turn.
 +    address_t neighbor_intermediate_address = intermediate_address;
      if (use_barrier_sem) {
          if (num_targets_in_direction) {
              // Use neighbor unicast instead of multicast to support reshaped 'logical linear' mesh devices
-@@ -230,8 +230,8 @@ void kernel_main() {
+@@ -230,8 +229,8 @@ void kernel_main() {
                  pkt_hdr_seminc,
                  static_cast<uint8_t>(unicast_route_info.distance_in_hops),
                  tt::tt_fabric::NocUnicastAtomicIncCommandHeader{
@@ -798,7 +776,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
  
              uint64_t opposite_direction_barrier_sem_noc_addr_in_pkt =
                  safe_get_noc_addr(opposite_core_sem_noc0_x, opposite_core_sem_noc0_y, barrier_sem, 0);
-@@ -244,9 +244,18 @@ void kernel_main() {
+@@ -244,9 +243,18 @@ void kernel_main() {
              // backward) handshake with each other, so the target is structurally 1 and does not
              // depend on barrier_target_count.
              noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(barrier_sem), 1);
