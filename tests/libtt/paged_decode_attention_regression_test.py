@@ -1,9 +1,11 @@
 """Paged decode attention must match a reference for any split of the KV cache.
 
 The compiler splits each KV head of each user across several cores, and the
-kernel reads the cache in chunks sized to its length (32 to 256 tokens), so
-cover positions inside, at and across chunk and page boundaries, more than one
-user, and grouped query heads. The cache is separate K and V, or one cache of
+kernel reads a causal cache in 64-token chunks, so cover positions inside, at
+and across chunk and page boundaries, more than one user, and grouped query
+heads. Real attention puts most of its weight on a few positions, such as the
+first (an attention sink), which costs longer chunks precision, so a test
+gives the first position a score far above the rest. The cache is separate K and V, or one cache of
 [K | V] rows passed as both, as SGLang-TorchTPU's decode reads it.
 
 A sliding window of W attends to the last W positions, the user's own
@@ -156,3 +158,51 @@ def test_sliding_window(positions, sinks):
         (sink_logits / scale).astype(jnp.bfloat16), np.float32) * scale
     expected = reference(np.asarray(query, np.float32), k_cache, v_cache, page_table, positions, window, sink_ref)
     np.testing.assert_allclose(out, expected, rtol=0, atol=0.1)
+
+
+def test_attention_sink():
+    """Qwen3.8-27B's attention on one of four chips (head size 256, six query heads per KV head, SGLang-TorchTPU's
+    64-token pages), with position 0 scoring about 8 above the rest, as an attention sink does, at positions 256 to
+    511. KV chunks sized to the cache length (up to 256 tokens) put the sink and up to 255 other positions in one
+    chunk, which nearly doubled the users' mean error here (0.017 -> 0.032), and Qwen3.8-27B's MTP drafts were
+    accepted 2.6 instead of 3.0 tokens at a time."""
+    dim, q_heads, kv_heads, block, pages = 256, 6, 1, 64, 8
+    positions = np.tile(np.asarray([256, 300, 350, 400, 450, 511], np.int32), 4)
+    users = len(positions)
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(2)
+    query = rng.normal(size=(1, users, q_heads, dim)).astype(np.float32)
+    cache = rng.normal(size=(users * pages + 3, kv_heads, block, 2 * dim)).astype(np.float32) * 0.3
+    page_table = rng.permutation(len(cache))[: users * pages].reshape(users, pages).astype(np.int32)
+    for user, page in enumerate(page_table[:, 0]):
+        direction = query[0, user].mean(axis=0)
+        direction /= np.linalg.norm(direction)
+        cache[page, :, 0, :dim] = direction * 8 * np.sqrt(dim) / (query[0, user] @ direction).mean()
+    query = query.astype(jnp.bfloat16)
+    cache = cache.astype(jnp.bfloat16)
+
+    def attend(query, cache, page_table, positions):
+        return jax.ffi.ffi_call(
+            "tt.paged_scaled_dot_product_attention_decode",
+            jax.ShapeDtypeStruct(query.shape, query.dtype),
+        )(
+            query,
+            cache,
+            cache,
+            page_table,
+            positions,
+            is_causal=True,
+            has_attention_mask=False,
+            has_cur_pos_tensor=True,
+            has_attention_sink=False,
+            scale=np.float32(dim**-0.5),
+        )
+
+    out = np.asarray(jax.jit(attend)(*[jax.device_put(x, device) for x in (query, cache, page_table, positions)]),
+                     np.float32)
+    k_cache = np.asarray(cache[..., :dim], np.float32)
+    v_cache = np.asarray(cache[..., dim:], np.float32)
+    expected = reference(np.asarray(query, np.float32), k_cache, v_cache, page_table, positions)
+    # Each user's largest error relative to its largest output; single users vary, their mean doesn't.
+    error = np.abs(out - expected).max(axis=(0, 2, 3)) / np.abs(expected).max(axis=(0, 2, 3))
+    assert error.mean() < 0.022, error.round(3).tolist()
