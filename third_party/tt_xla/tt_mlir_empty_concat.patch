@@ -1,0 +1,32 @@
+diff --git a/lib/Dialect/TTIR/IR/TTIROps.cpp b/lib/Dialect/TTIR/IR/TTIROps.cpp
+--- a/lib/Dialect/TTIR/IR/TTIROps.cpp
++++ b/lib/Dialect/TTIR/IR/TTIROps.cpp
+@@ -2662,6 +2662,18 @@
+   return op.getResult();
+ }
+ 
++// A concatenation of inputs that are empty in another dimension, such as
++// [5, 0] tensors along dimension 0, is an empty constant. TTNN's row-major
++// concatenation divides by the size of the last dimension.
++mlir::OpFoldResult foldEmptyResultConcatOp(ttir::ConcatOp op) {
++  auto outputType = mlir::cast<RankedTensorType>(op.getResult().getType());
++  if (outputType.getNumElements() != 0 ||
++      !outputType.getElementType().isIntOrIndexOrFloat()) {
++    return nullptr;
++  }
++  return mlir::DenseElementsAttr::getFromRawBuffer(outputType, {});
++}
++
+ // ConcatOp Folder
+ mlir::OpFoldResult mlir::tt::ttir::ConcatOp::fold(FoldAdaptor adaptor) {
+   if (auto foldResult = foldUnitConcatOp(*this)) {
+@@ -2670,6 +2682,9 @@
+   if (auto foldResult = foldEmptyTensorsConcatOp(*this)) {
+     return foldResult;
+   }
++  if (auto foldResult = foldEmptyResultConcatOp(*this)) {
++    return foldResult;
++  }
+ 
+   return nullptr;
+ }
