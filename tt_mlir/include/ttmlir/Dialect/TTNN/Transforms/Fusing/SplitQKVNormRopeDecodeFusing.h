@@ -34,6 +34,26 @@ public:
                   mlir::PatternRewriter &rewriter) const override;
 };
 
+// Fuses the output gate of gated attention as PyTorch models trace it
+// (SGLang-TorchTPU's Qwen3.8):
+//
+//   attention [1, T, H, W] -> slice the values [..., v0 : v0 + D] -> reshape
+//   [T, H D] -------------------------------------------------------------+
+//   qkv [T, N] -> reshape, slice the gate heads (each S after the last, the  +-> multiply
+//   first at g0) -> typecast to FP32 -> sigmoid -> typecast to BF16 ->      |
+//   reshape [T, H D] -------------------------------------------------------+
+//
+// into one attention_output_gate (one program instead of nine), with the same
+// roundings. It anchors on the multiply.
+class AttentionOutputGateFusing : public mlir::OpRewritePattern<MultiplyOp> {
+public:
+  using OpRewritePattern<MultiplyOp>::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(MultiplyOp multiply,
+                  mlir::PatternRewriter &rewriter) const override;
+};
+
 } // namespace mlir::tt::ttnn::fusing
 
 #endif
