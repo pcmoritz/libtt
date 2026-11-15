@@ -232,7 +232,91 @@ diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_dev
 diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp
 --- ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp
 +++ ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp
-@@ -140,6 +140,11 @@ ttnn::Tensor reduce_scatter(
+@@ -4,6 +4,7 @@
+ 
+ #include "ttnn/common/queue_id.hpp"
+ 
++#include <cmath>
+ #include <mutex>
+ #include <set>
+ #include <tuple>
+@@ -18,6 +19,8 @@
+ #include <tt-metalium/hal.hpp>
+ #include <tt-metalium/experimental/fabric/fabric.hpp>
+ #include "ttnn/operations/ccl/common/host/moe_utils.hpp"
++#include "ttnn/operations/data_movement/concat/concat.hpp"
++#include "ttnn/operations/data_movement/slice/slice.hpp"
+ #include "ttnn/operations/experimental/ccl/composite_common.hpp"
+ #include "ttnn/operations/experimental/ccl/reduce_scatter_minimal_direct/reduce_scatter_minimal_direct.hpp"
+ #include "ttnn/operations/experimental/ccl/reduce_scatter_minimal_direct/device/reduce_scatter_minimal_direct_op_device_operation.hpp"
+@@ -91,6 +94,66 @@ bool use_direct_reduce_scatter(
+     return buffer != nullptr && static_cast<uint64_t>(buffer->size()) <= k_direct_rs_max_input_bytes;
+ }
+ 
++
++// A reduce-scatter allocates its intermediate (twice the input) and its output (the input over the ring) whole,
++// interleaved over the DRAM banks. For a large input, such as Qwen3.5-9B's 2 GB embedding gradient (a 4 GB
++// intermediate, 508 MB per bank), a fragmented bank can lack a free block that large although it has the room in
++// total. A DRAM-interleaved input whose buffers would take more than this per bank runs in pieces instead.
++constexpr uint64_t k_piece_budget_per_bank = 64ull << 20;
++
++// The reduce-scatter of `input_tensor` along `dim` by `scatter` in pieces, split along the dimension other than `dim`
++// with the most units (tiles in a tiled tensor's last two dimensions), their results concatenated; or nullopt when
++// its buffers fit the budget or no dimension splits.
++template <typename Scatter>
++std::optional<ttnn::Tensor> reduce_scatter_in_pieces(
++    const ttnn::Tensor& input_tensor,
++    uint32_t dim,
++    uint32_t ring_size,
++    const ttnn::MemoryConfig& memory_config,
++    Scatter&& scatter) {
++    const auto& input_config = input_tensor.memory_config();
++    if (!input_config.is_dram() || input_config.is_sharded() || memory_config.is_sharded()) {
++        return std::nullopt;
++    }
++    auto* mesh_device = input_tensor.device();
++    const double bytes_per_bank = static_cast<double>(input_tensor.buffer()->size()) * (2.0 + 1.0 / ring_size) /
++                                  mesh_device->allocator()->get_num_banks(tt::tt_metal::BufferType::DRAM);
++    const auto pieces = static_cast<uint32_t>(std::ceil(bytes_per_bank / k_piece_budget_per_bank));
++    if (pieces <= 1) {
++        return std::nullopt;
++    }
++    const auto& shape = input_tensor.logical_shape();
++    const uint32_t rank = shape.rank();
++    const bool tiled = input_tensor.layout() == Layout::TILE;
++    const auto tile_shape = input_tensor.tensor_spec().tile().get_tile_shape();
++    std::optional<uint32_t> split_dim;
++    uint32_t unit = 1;
++    uint32_t units = 0;
++    for (uint32_t d = 0; d < rank; ++d) {
++        const uint32_t d_unit = tiled && d + 2 >= rank ? tile_shape[d + 2 - rank] : 1;
++        if (d == dim || shape[d] % d_unit != 0 || shape[d] / d_unit <= units) {
++            continue;
++        }
++        split_dim = d;
++        unit = d_unit;
++        units = shape[d] / d_unit;
++    }
++    if (!split_dim || units < pieces) {
++        return std::nullopt;
++    }
++    const uint32_t units_per_piece = (units + pieces - 1) / pieces;
++    ttsl::SmallVector<uint32_t> begins(rank, 0);
++    ttsl::SmallVector<uint32_t> ends(shape.cbegin(), shape.cend());
++    const ttsl::SmallVector<uint32_t> steps(rank, 1);
++    std::vector<ttnn::Tensor> results;
++    for (uint32_t start = 0; start < units; start += units_per_piece) {
++        begins[*split_dim] = start * unit;
++        ends[*split_dim] = std::min(units, start + units_per_piece) * unit;
++        results.push_back(scatter(ttnn::slice(input_tensor, begins, ends, steps)));
++    }
++    return ttnn::concat(results, static_cast<int>(*split_dim), memory_config);
++}
++
+ }  // namespace
+ 
+ ttnn::Tensor reduce_scatter(
+@@ -140,8 +203,40 @@ ttnn::Tensor reduce_scatter(
      uint32_t normalized_dim = input_tensor.logical_shape().get_normalized_index(dim);
      tt::tt_fabric::Topology topology_ = ::ttnn::ccl::get_usable_topology(input_tensor, topology, cluster_axis);
      topology_ = ::ttnn::ccl::convert_2d_to_1d_topology(topology_);
@@ -243,7 +327,36 @@ diff --git ttnn/cpp/ttnn/operations/ccl/reduce_scatter/reduce_scatter.cpp ttnn/c
 +    }
  
      auto memory_config_ = memory_config.value_or(input_tensor.memory_config());
++    if (!optional_output_tensor.has_value()) {
++        if (auto result = reduce_scatter_in_pieces(
++                input_tensor,
++                normalized_dim,
++                ::ttnn::ccl::get_topological_dimension(input_tensor, cluster_axis),
++                memory_config_,
++                [&](const ttnn::Tensor& piece) {
++                    return ttnn::reduce_scatter(
++                        piece,
++                        dim,
++                        cluster_axis,
++                        subdevice_id,
++                        memory_config,
++                        intermediate_memory_config,
++                        std::nullopt,
++                        num_links,
++                        topology,
++                        chunks_per_sync,
++                        num_workers_per_link,
++                        num_buffers_per_channel,
++                        compute_kernel_config,
++                        use_l1_small_for_semaphores,
++                        math_op);
++                })) {
++            return *result;
++        }
++    }
      // TODO: until #27196 is resolved, the fabric API does not subtract out the one link correctly for dispatch used
+     // when not all devices are mmio capable. Manually doing it requires the use of "is_mmio_capable" counting, but as
+     // the one link that's subtracted out is only along one cluster axis, we will be using less links we would like
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_gather_async/device/all_gather_async_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_gather_async/device/all_gather_async_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/all_gather_async/device/all_gather_async_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_gather_async/device/all_gather_async_device_operation.cpp
