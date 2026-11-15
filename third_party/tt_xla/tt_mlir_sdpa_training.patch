@@ -1,7 +1,32 @@
+diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
+--- a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
++++ b/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td
+@@ -301,15 +301,21 @@ def TTCore_RoutingMode : I32EnumAttr<"RoutingMode", "TT RoutingMode",
+ //  - None: no mask, scores are only scaled.
+ //  - Causal: lower-triangular causal mask generated on device.
+ //  - Arbitrary: use the provided mask tensor.
++//  - CausalIntervals: use the provided mask tensor, which keeps in each query
++//    row r the keys of one interval [start(r), r] whose start never decreases
++//    down the rows (packed documents, sliding windows); tiles it drops are
++//    skipped.
+ def TTCore_AttentionMaskType_None : I32EnumAttrCase<"None", 0, "none">;
+ def TTCore_AttentionMaskType_Causal : I32EnumAttrCase<"Causal", 1, "causal">;
+ def TTCore_AttentionMaskType_Arbitrary : I32EnumAttrCase<"Arbitrary", 2, "arbitrary">;
++def TTCore_AttentionMaskType_CausalIntervals : I32EnumAttrCase<"CausalIntervals", 3, "causal_intervals">;
+ 
+ def TTCore_AttentionMaskType : I32EnumAttr<"AttentionMaskType", "TT AttentionMaskType",
+                            [
+                             TTCore_AttentionMaskType_None,
+                             TTCore_AttentionMaskType_Causal,
+                             TTCore_AttentionMaskType_Arbitrary,
++                            TTCore_AttentionMaskType_CausalIntervals,
+                            ]> {
+   let genSpecializedAttr = 0;
+   let cppNamespace = "::mlir::tt::ttcore";
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -6708,6 +6708,40 @@
+@@ -6708,6 +6708,44 @@ def TTIR_QuantizeRowsOp : TTIR_NamedOp<"quantize_rows"> {
    let results = (outs AnyRankedTensor:$output, AnyRankedTensor:$scale);
  }
  
@@ -12,8 +37,12 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +    multiple of Hkv (grouped-query attention). `output` [B, Hq, S, D] is
 +    softmax(query key^T / sqrt(D)) value, unmasked, causal or, for
 +    `mask_type` arbitrary, masked by `attention_mask` [1, 1, S, S] (1 keeps a
-+    score, 0 drops it). `intermediates` [B, Hq, S, 32] FP32 holds each row's
-+    log-sum-exp of the scaled scores in its first column, for ttir.sdpa_bw.
++    score, 0 drops it). For `mask_type` causal_intervals the mask keeps, in
++    each query row r, the keys of one interval [start(r), r] whose start never
++    decreases down the rows (packed documents, sliding windows), and the
++    kernels skip the tiles it drops. `intermediates` [B, Hq, S, 32] FP32 holds
++    each row's log-sum-exp of the scaled scores in its first column, for
++    ttir.sdpa_bw.
 +    Lowers to ttnn.sdpa_fw, tt-train's ttml::metal::sdpa_fw.
 +  }];
 +  let arguments = (ins AnyRankedTensor:$query, AnyRankedTensor:$key,
@@ -45,7 +74,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10274,6 +10274,65 @@
+@@ -10274,6 +10274,67 @@ public:
  
  // `tt.quantize_rows` (jax.ffi.ffi_call with min_scale and e5m2 attributes):
  // one input, the float8 output and the FP32 scale.
@@ -53,8 +82,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +// `tt.sdpa_bw` (grad_output, output, query, key, value, intermediates[, mask]
 +// -> grad_query, grad_key, grad_value), jax.ffi.ffi_call with a mask_type
 +// attribute (0 none, 1 causal, 2 the mask operand, as upstream's
-+// tenstorrent.sdpa_fw composites): tt-train's fused attention for training,
-+// see ttir.sdpa_fw.
++// tenstorrent.sdpa_fw composites, 3 the mask operand of causal intervals):
++// tt-train's fused attention for training, see ttir.sdpa_fw.
 +class StableHLOSDPATrainingConversionPattern
 +    : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
 +public:
@@ -76,15 +105,17 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +                     : std::nullopt;
 +    if (!maskType) {
 +      return op.emitOpError()
-+             << target << " needs a mask_type attribute: 0, 1 or 2";
++             << target << " needs a mask_type attribute: 0, 1, 2 or 3";
 +    }
 +    const unsigned tensors = forward ? 3u : 6u;
-+    const bool masked = *maskType == ttcore::AttentionMaskType::Arbitrary;
++    const bool masked =
++        *maskType == ttcore::AttentionMaskType::Arbitrary ||
++        *maskType == ttcore::AttentionMaskType::CausalIntervals;
 +    if (op.getNumOperands() != tensors + (masked ? 1u : 0u) ||
 +        op.getNumResults() != (forward ? 2u : 3u)) {
 +      return op.emitOpError()
 +             << target << " takes " << tensors
-+             << " operands, and a mask when mask_type is 2, and returns "
++             << " operands, and a mask when mask_type is 2 or 3, and returns "
 +             << (forward ? 2 : 3) << " results";
 +    }
 +    SmallVector<Type> types;
@@ -111,7 +142,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  class StableHLOQuantizeRowsConversionPattern
      : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
  public:
-@@ -12289,6 +12348,8 @@
+@@ -12289,6 +12350,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
        typeConverter, ctx);
    patterns.add<StableHLOQuantizeRowsConversionPattern>(typeConverter,
                                                          patterns.getContext());
@@ -123,7 +154,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -3610,6 +3610,47 @@
+@@ -3610,6 +3610,47 @@ public:
      return success();
    }
  };
@@ -171,7 +202,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  class QuantizeRowsOpConversionPattern
      : public OpConversionPattern<ttir::QuantizeRowsOp> {
  public:
-@@ -4273,6 +4314,8 @@
+@@ -4273,6 +4314,8 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
             PagedScaledDotProductAttentionDecodeOpConversionPattern,
             ChunkedScaledDotProductAttentionOpConversionPattern,
             QuantizeRowsOpConversionPattern,
@@ -180,10 +211,80 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
             GatedDeltaRuleOpConversionPattern,
             GatedDeltaDecodeOpConversionPattern,
             CausalConv1dUpdateOpConversionPattern,
+diff --git a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
+--- a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
++++ b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
+@@ -3675,6 +3675,9 @@ public:
+     case mlir::tt::ttcore::AttentionMaskType::Arbitrary:
+       maskTypeName = "::ttml::metal::AttentionMaskType::Arbitrary";
+       break;
++    case mlir::tt::ttcore::AttentionMaskType::CausalIntervals:
++      maskTypeName = "::ttml::metal::AttentionMaskType::CausalIntervals";
++      break;
+     }
+ 
+     // Arg order matches ttml::metal::sdpa_fw(query, key, value, mask_type,
+@@ -4075,6 +4078,9 @@ public:
+     case mlir::tt::ttcore::AttentionMaskType::Arbitrary:
+       maskTypeName = "::ttml::metal::AttentionMaskType::Arbitrary";
+       break;
++    case mlir::tt::ttcore::AttentionMaskType::CausalIntervals:
++      maskTypeName = "::ttml::metal::AttentionMaskType::CausalIntervals";
++      break;
+     }
+ 
+     llvm::SmallVector<mlir::Attribute> args{
+diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+--- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
+@@ -4126,13 +4126,17 @@ static LogicalResult verifySDPATileAlignment(Operation *op,
+   }
+ 
+   ttcore::AttentionMaskType maskType = getMaskType();
+-  if (maskType == ttcore::AttentionMaskType::Arbitrary && !getAttentionMask()) {
++  const bool readsMask = maskType == ttcore::AttentionMaskType::Arbitrary ||
++                         maskType == ttcore::AttentionMaskType::CausalIntervals;
++  if (readsMask && !getAttentionMask()) {
+     return emitOpError(
+-        "attention_mask is required when mask_type is 'arbitrary'");
++        "attention_mask is required when mask_type is 'arbitrary' or "
++        "'causal_intervals'");
+   }
+-  if (maskType != ttcore::AttentionMaskType::Arbitrary && getAttentionMask()) {
++  if (!readsMask && getAttentionMask()) {
+     return emitOpError(
+-        "attention_mask is only allowed when mask_type is 'arbitrary'");
++        "attention_mask is only allowed when mask_type is 'arbitrary' or "
++        "'causal_intervals'");
+   }
+ 
+   if (getReturnIntermediates() != static_cast<bool>(getIntermediates())) {
+@@ -4157,13 +4161,17 @@ static LogicalResult verifySDPATileAlignment(Operation *op,
+   }
+ 
+   ttcore::AttentionMaskType maskType = getMaskType();
+-  if (maskType == ttcore::AttentionMaskType::Arbitrary && !getAttentionMask()) {
++  const bool readsMask = maskType == ttcore::AttentionMaskType::Arbitrary ||
++                         maskType == ttcore::AttentionMaskType::CausalIntervals;
++  if (readsMask && !getAttentionMask()) {
+     return emitOpError(
+-        "attention_mask is required when mask_type is 'arbitrary'");
++        "attention_mask is required when mask_type is 'arbitrary' or "
++        "'causal_intervals'");
+   }
+-  if (maskType != ttcore::AttentionMaskType::Arbitrary && getAttentionMask()) {
++  if (!readsMask && getAttentionMask()) {
+     return emitOpError(
+-        "attention_mask is only allowed when mask_type is 'arbitrary'");
++        "attention_mask is only allowed when mask_type is 'arbitrary' or "
++        "'causal_intervals'");
+   }
+ 
+   float dropoutProbability = getDropoutProbability().convertToFloat();
 diff --git a/runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp b/runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp
 --- a/runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp
 +++ b/runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp
-@@ -32,8 +32,8 @@
+@@ -32,8 +32,8 @@ void run(const ::tt::target::ttnn::SDPABackwardOp *op,
    const ::ttml::metal::AttentionMaskType maskType =
        static_cast<::ttml::metal::AttentionMaskType>(op->mask_type());
  
