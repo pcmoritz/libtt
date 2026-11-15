@@ -89,7 +89,6 @@ def _make_splash_attention_fn(
     """
     import jax
     import jax.numpy as jnp
-    import numpy as np
 
     if kv_seq_len not in (None, seq_len):
         # Context parallelism: each rank's queries attend to all ranks' keys.
@@ -98,14 +97,12 @@ def _make_splash_attention_fn(
             "isn't supported on Tenstorrent devices"
         )
 
-    def call(target, outputs, tensors, segment_ids, head_dim):
+    def call(target, outputs, tensors, segment_ids):
         """`target` on the batch with the kernels' own mask, or on each sequence
-        with its mask (packed documents, sliding window). The scores are scaled by
-        1 / sqrt(head_dim), computed in FP32 as the kernels compute their default."""
-        scale = np.float32(1) / np.sqrt(np.float32(head_dim))
+        with its mask (packed documents, sliding window)."""
         if segment_ids is None and local_window_size is None:
             mask_type = _CAUSAL_MASK if is_causal else _NO_MASK
-            return jax.ffi.ffi_call(target, outputs(1, *tensors))(*tensors, mask_type=mask_type, scale=scale)
+            return jax.ffi.ffi_call(target, outputs(1, *tensors))(*tensors, mask_type=mask_type)
         results = []
         # A sliding window is causal too.
         mask_type = _CAUSAL_INTERVALS_MASK if is_causal or local_window_size is not None else _ARBITRARY_MASK
@@ -115,18 +112,21 @@ def _make_splash_attention_fn(
                 seq_len, is_causal, local_window_size, None if segment_ids is None else segment_ids[b]
             )
             results.append(
-                jax.ffi.ffi_call(target, outputs(1, *sequence))(*sequence, mask, mask_type=mask_type, scale=scale)
+                jax.ffi.ffi_call(target, outputs(1, *sequence))(*sequence, mask, mask_type=mask_type)
             )
         return tuple(jnp.concatenate(parts) for parts in zip(*results))
 
-    def pad_head_dim(*tensors):
-        """Zero-pads the head dimension to whole tiles; zero columns don't change the scores, and the kernels
-        take the unpadded head dimension's scale."""
-        padding = -tensors[0].shape[-1] % _HEAD_DIM_TILE
+    def pad_head_dim(q, *tensors):
+        """Zero-pads the head dimension to whole tiles: zero columns don't change the scores, and q scaled by
+        sqrt(padded / head_dim) keeps the kernels' 1 / sqrt(padded) scale at 1 / sqrt(head_dim). Returns that
+        factor too, 1 without padding."""
+        head_dim = q.shape[-1]
+        padding = -head_dim % _HEAD_DIM_TILE
         if not padding:
-            return tensors
-        widths = [(0, 0)] * (tensors[0].ndim - 1) + [(0, padding)]
-        return tuple(jnp.pad(t, widths) for t in tensors)
+            return 1.0, (q, *tensors)
+        factor = ((head_dim + padding) / head_dim) ** 0.5
+        widths = [(0, 0)] * (q.ndim - 1) + [(0, padding)]
+        return factor, tuple(jnp.pad(t, widths) for t in ((q * factor).astype(q.dtype), *tensors))
 
     @jax.jit
     def splash_fn(q, k, v, segment_ids=None):
@@ -135,7 +135,7 @@ def _make_splash_attention_fn(
         # Multi-query attention passes K and V without their head dimension.
         if k.ndim == 3:
             k, v = k[:, None], v[:, None]
-        q, k, v = pad_head_dim(q, k, v)
+        _, (q, k, v) = pad_head_dim(q, k, v)
 
         def outputs(_, q, k, v):
             return (
@@ -143,7 +143,7 @@ def _make_splash_attention_fn(
                 jax.ShapeDtypeStruct((*q.shape[:3], _INTERMEDIATE_COLUMNS), jnp.float32),
             )
 
-        out, intermediates = call("tt.sdpa_fw", outputs, (q, k, v), segment_ids, head_dim)
+        out, intermediates = call("tt.sdpa_fw", outputs, (q, k, v), segment_ids)
         return out[..., :head_dim], intermediates[..., 0]
 
     @jax.jit
@@ -153,14 +153,16 @@ def _make_splash_attention_fn(
         squeezed = k.ndim == 3
         if squeezed:
             k, v = k[:, None], v[:, None]
-        q, k, v, out, g = pad_head_dim(q, k, v, out, g)
+        factor, (q, k, v, out, g) = pad_head_dim(q, k, v, out, g)
         intermediates = jnp.broadcast_to(logsumexp[..., None], (*logsumexp.shape, _INTERMEDIATE_COLUMNS))
 
         def outputs(_, g, out, q, k, v, intermediates):
             return tuple(jax.ShapeDtypeStruct(t.shape, t.dtype) for t in (q, k, v))
 
-        dq, dk, dv = call("tt.sdpa_bw", outputs, (g, out, q, k, v, intermediates), segment_ids, head_dim)
-        dq, dk, dv = dq[..., :head_dim], dk[..., :head_dim], dv[..., :head_dim]
+        dq, dk, dv = call("tt.sdpa_bw", outputs, (g, out, q, k, v, intermediates), segment_ids)
+        # The kernels saw q times the padding factor.
+        dq = (dq[..., :head_dim] * factor).astype(dq.dtype) if factor != 1.0 else dq
+        dk, dv = dk[..., :head_dim], dv[..., :head_dim]
         if squeezed:
             dk, dv = dk[:, 0], dv[:, 0]
         return dq, dk, dv

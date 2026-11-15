@@ -26,7 +26,7 @@ diff --git a/include/ttmlir/Dialect/TTCore/IR/TTCoreOpsEnums.td b/include/ttmlir
 diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 --- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
 +++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
-@@ -6708,6 +6708,47 @@ def TTIR_QuantizeRowsOp : TTIR_NamedOp<"quantize_rows"> {
+@@ -6708,6 +6708,44 @@ def TTIR_QuantizeRowsOp : TTIR_NamedOp<"quantize_rows"> {
    let results = (outs AnyRankedTensor:$output, AnyRankedTensor:$scale);
  }
  
@@ -35,8 +35,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +  let description = [{
 +    `query` is [B, Hq, S, D], `key` and `value` [B, Hkv, S, D] with Hq a
 +    multiple of Hkv (grouped-query attention). `output` [B, Hq, S, D] is
-+    softmax(scale query key^T) value, with `scale` 1 / sqrt(D) unless given,
-+    unmasked, causal or, for
++    softmax(query key^T / sqrt(D)) value, unmasked, causal or, for
 +    `mask_type` arbitrary, masked by `attention_mask` [1, 1, S, S] (1 keeps a
 +    score, 0 drops it). For `mask_type` causal_intervals the mask keeps, in
 +    each query row r, the keys of one interval [start(r), r] whose start never
@@ -49,8 +48,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +  let arguments = (ins AnyRankedTensor:$query, AnyRankedTensor:$key,
 +                       AnyRankedTensor:$value,
 +                       Optional<AnyRankedTensor>:$attention_mask,
-+                       TTCore_AttentionMaskTypeAttr:$mask_type,
-+                       OptionalAttr<F32Attr>:$scale);
++                       TTCore_AttentionMaskTypeAttr:$mask_type);
 +  let results = (outs AnyRankedTensor:$output, AnyRankedTensor:$intermediates);
 +}
 +
@@ -65,8 +63,7 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
 +                       AnyRankedTensor:$query, AnyRankedTensor:$key,
 +                       AnyRankedTensor:$value, AnyRankedTensor:$intermediates,
 +                       Optional<AnyRankedTensor>:$attention_mask,
-+                       TTCore_AttentionMaskTypeAttr:$mask_type,
-+                       OptionalAttr<F32Attr>:$scale);
++                       TTCore_AttentionMaskTypeAttr:$mask_type);
 +  let results = (outs AnyRankedTensor:$grad_query, AnyRankedTensor:$grad_key,
 +                      AnyRankedTensor:$grad_value);
 +}
@@ -74,72 +71,10 @@ diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/
  def TTIR_GatedDeltaRuleOp : TTIR_NamedOp<"gated_delta_rule"> {
    let summary = "gated delta rule.";
    let arguments = (ins AnyRankedTensor:$query,
-diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
---- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-+++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -3038,6 +3038,9 @@ def TTNN_SDPAForwardOp : TTNN_Op<"sdpa_fw"> {
-       of Q and K must be a multiple of `TILE_WIDTH`. V's head dimension may be
-       unaligned because the backing operation supports a different V dimension.
- 
-+      `scale` multiplies the scores; without it, it is 1 / sqrt of the query's
-+      head dimension.
-+
-       `attention_mask` is only valid when `mask_type` is `arbitrary`.
-     }];
- 
-@@ -3047,7 +3050,8 @@ def TTNN_SDPAForwardOp : TTNN_Op<"sdpa_fw"> {
-                          Optional<AnyRankedTensor>:$attention_mask,
-                          DefaultValuedAttr<TTCore_AttentionMaskTypeAttr, "::mlir::tt::ttcore::AttentionMaskType::Causal">:$mask_type,
-                          DefaultValuedAttr<F32Attr, "0.0">:$dropout_probability,
--                         DefaultValuedAttr<BoolAttr, "false">:$return_intermediates);
-+                         DefaultValuedAttr<BoolAttr, "false">:$return_intermediates,
-+                         OptionalAttr<F32Attr>:$scale);
- 
-     let results = (outs AnyRankedTensor:$output,
-                         Optional<AnyRankedTensor>:$intermediates);
-@@ -3077,6 +3081,9 @@ def TTNN_SDPABackwardOp : TTNN_Op<"sdpa_bw"> {
- 
-       `attention_mask` is only valid when `mask_type` is `arbitrary`.
- 
-+      `scale` multiplies the scores, as in the forward pass; without it, it is
-+      1 / sqrt of the query's head dimension.
-+
-       `dropout_probability` must be 0.0. Dropout is not implemented in the
-       backward pass, so a nonzero value would silently produce the gradients of
-       the dropout-free forward pass. The verifier rejects it.
-@@ -3090,7 +3097,8 @@ def TTNN_SDPABackwardOp : TTNN_Op<"sdpa_bw"> {
-                          AnyRankedTensor:$intermediates,
-                          Optional<AnyRankedTensor>:$attention_mask,
-                          DefaultValuedAttr<TTCore_AttentionMaskTypeAttr, "::mlir::tt::ttcore::AttentionMaskType::Arbitrary">:$mask_type,
--                         DefaultValuedAttr<F32Attr, "0.0">:$dropout_probability);
-+                         DefaultValuedAttr<F32Attr, "0.0">:$dropout_probability,
-+                         OptionalAttr<F32Attr>:$scale);
- 
-     let results = (outs AnyRankedTensor:$grad_query,
-                         AnyRankedTensor:$grad_key,
-diff --git a/include/ttmlir/Target/TTNN/operations/ttml.fbs b/include/ttmlir/Target/TTNN/operations/ttml.fbs
---- a/include/ttmlir/Target/TTNN/operations/ttml.fbs
-+++ b/include/ttmlir/Target/TTNN/operations/ttml.fbs
-@@ -29,6 +29,7 @@ table SDPAForwardOp {
-   return_intermediates: bool = false;
-   out: tt.target.ttnn.TensorRef;
-   intermediates: tt.target.ttnn.TensorRef;
-+  scale: float = null;
- }
- 
- table SoftmaxBackwardOp {
-@@ -91,6 +92,7 @@ table SDPABackwardOp {
-   grad_query: tt.target.ttnn.TensorRef;
-   grad_key: tt.target.ttnn.TensorRef;
-   grad_value: tt.target.ttnn.TensorRef;
-+  scale: float = null;
- }
- 
- table CrossEntropyForwardOp {
 diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 --- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
 +++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
-@@ -10274,6 +10274,72 @@ public:
+@@ -10274,6 +10274,67 @@ public:
  
  // `tt.quantize_rows` (jax.ffi.ffi_call with min_scale and e5m2 attributes):
  // one input, the float8 output and the FP32 scale.
@@ -147,9 +82,8 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +// `tt.sdpa_bw` (grad_output, output, query, key, value, intermediates[, mask]
 +// -> grad_query, grad_key, grad_value), jax.ffi.ffi_call with a mask_type
 +// attribute (0 none, 1 causal, 2 the mask operand, as upstream's
-+// tenstorrent.sdpa_fw composites, 3 the mask operand of causal intervals)
-+// and an optional scale of the scores (1 / sqrt of the head dimension
-+// without it): tt-train's fused attention for training, see ttir.sdpa_fw.
++// tenstorrent.sdpa_fw composites, 3 the mask operand of causal intervals):
++// tt-train's fused attention for training, see ttir.sdpa_fw.
 +class StableHLOSDPATrainingConversionPattern
 +    : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
 +public:
@@ -192,18 +126,14 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 +    Value mask = masked ? operands[tensors] : Value();
 +    auto maskTypeAttribute =
 +        ttcore::AttentionMaskTypeAttr::get(rewriter.getContext(), *maskType);
-+    FloatAttr scale = nullptr;
-+    if (auto given = backendConfig.getAs<FloatAttr>("scale")) {
-+      scale = rewriter.getF32FloatAttr(given.getValueAsDouble());
-+    }
 +    if (forward) {
 +      rewriter.replaceOpWithNewOp<ttir::SDPAForwardOp>(
 +          op, types, operands[0], operands[1], operands[2], mask,
-+          maskTypeAttribute, scale);
++          maskTypeAttribute);
 +    } else {
 +      rewriter.replaceOpWithNewOp<ttir::SDPABackwardOp>(
 +          op, types, operands[0], operands[1], operands[2], operands[3],
-+          operands[4], operands[5], mask, maskTypeAttribute, scale);
++          operands[4], operands[5], mask, maskTypeAttribute);
 +    }
 +    return success();
 +  }
@@ -212,7 +142,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
  class StableHLOQuantizeRowsConversionPattern
      : public OpConversionPattern<mlir::stablehlo::CustomCallOp> {
  public:
-@@ -12289,6 +12355,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
+@@ -12289,6 +12350,8 @@ static void addCCLOpsConversionPattern(MLIRContext *ctx,
        typeConverter, ctx);
    patterns.add<StableHLOQuantizeRowsConversionPattern>(typeConverter,
                                                          patterns.getContext());
@@ -224,7 +154,7 @@ diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Co
 diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 --- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
 +++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
-@@ -3610,6 +3610,49 @@ public:
+@@ -3610,6 +3610,47 @@ public:
      return success();
    }
  };
@@ -244,8 +174,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +    rewriter.replaceOpWithNewOp<ttnn::SDPAForwardOp>(
 +        op, types, adaptor.getQuery(), adaptor.getKey(), adaptor.getValue(),
 +        adaptor.getAttentionMask(), op.getMaskTypeAttr(),
-+        rewriter.getF32FloatAttr(0.0f), rewriter.getBoolAttr(true),
-+        op.getScaleAttr());
++        rewriter.getF32FloatAttr(0.0f), rewriter.getBoolAttr(true));
 +    return success();
 +  }
 +};
@@ -265,8 +194,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 +        op, types, adaptor.getGradOutput(), adaptor.getOutput(),
 +        adaptor.getQuery(), adaptor.getKey(), adaptor.getValue(),
 +        adaptor.getIntermediates(), adaptor.getAttentionMask(),
-+        op.getMaskTypeAttr(), rewriter.getF32FloatAttr(0.0f),
-+        op.getScaleAttr());
++        op.getMaskTypeAttr(), rewriter.getF32FloatAttr(0.0f));
 +    return success();
 +  }
 +};
@@ -274,7 +202,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
  class QuantizeRowsOpConversionPattern
      : public OpConversionPattern<ttir::QuantizeRowsOp> {
  public:
-@@ -4273,6 +4316,8 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+@@ -4273,6 +4314,8 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
             PagedScaledDotProductAttentionDecodeOpConversionPattern,
             ChunkedScaledDotProductAttentionOpConversionPattern,
             QuantizeRowsOpConversionPattern,
@@ -286,7 +214,7 @@ diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTN
 diff --git a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
 --- a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
 +++ b/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp
-@@ -3675,10 +3675,13 @@ public:
+@@ -3675,6 +3675,9 @@ public:
      case mlir::tt::ttcore::AttentionMaskType::Arbitrary:
        maskTypeName = "::ttml::metal::AttentionMaskType::Arbitrary";
        break;
@@ -296,21 +224,7 @@ diff --git a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp b/lib/Conversion/TTNNToE
      }
  
      // Arg order matches ttml::metal::sdpa_fw(query, key, value, mask_type,
--    // mask, dropout_probability, return_intermediates).
-+    // mask, dropout_probability, return_intermediates, gate, scale).
-     llvm::SmallVector<mlir::Attribute> args{
-         emitter.emit(srcOp.getQuery()),
-         emitter.emit(srcOp.getKey()),
-@@ -3687,6 +3690,8 @@ public:
-         emitter.emit(srcOp.getAttentionMask()),
-         emitter.emit(srcOp.getDropoutProbability()),
-         emitter.emit(srcOp.getReturnIntermediates()),
-+        /*gate=*/emitter.emit(std::nullopt),
-+        emitter.emit(srcOp.getScale()),
-     };
- 
-     using ReturnTy = std::vector<std::optional<::ttnn::Tensor>>;
-@@ -4075,6 +4080,9 @@ public:
+@@ -4075,6 +4078,9 @@ public:
      case mlir::tt::ttcore::AttentionMaskType::Arbitrary:
        maskTypeName = "::ttml::metal::AttentionMaskType::Arbitrary";
        break;
@@ -320,16 +234,6 @@ diff --git a/lib/Conversion/TTNNToEmitC/TTNNToEmitC.cpp b/lib/Conversion/TTNNToE
      }
  
      llvm::SmallVector<mlir::Attribute> args{
-@@ -4087,6 +4095,9 @@ public:
-         rewriter.getAttr<emitc::OpaqueAttr>(maskTypeName),
-         emitter.emit(srcOp.getAttentionMask()),
-         emitter.emit(srcOp.getDropoutProbability()),
-+        /*gate=*/emitter.emit(std::nullopt),
-+        /*preallocated_grad_gate=*/emitter.emit(std::nullopt),
-+        emitter.emit(srcOp.getScale()),
-     };
- 
-     using ReturnTy = std::tuple<::ttnn::Tensor, ::ttnn::Tensor, ::ttnn::Tensor>;
 diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
 --- a/lib/Dialect/TTNN/IR/TTNNOps.cpp
 +++ b/lib/Dialect/TTNN/IR/TTNNOps.cpp
@@ -377,76 +281,10 @@ diff --git a/lib/Dialect/TTNN/IR/TTNNOps.cpp b/lib/Dialect/TTNN/IR/TTNNOps.cpp
    }
  
    float dropoutProbability = getDropoutProbability().convertToFloat();
-diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
---- a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
-+++ b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
-@@ -570,7 +570,8 @@ static void registerBuiltinComposites() {
-             compositeOp.getInputs()[2],
-             compositeOp.getInputs().size() == 4u ? compositeOp.getInputs()[3]
-                                                  : Value(),
--            maskType, dropoutProbability, returnIntermediates);
-+            maskType, dropoutProbability, returnIntermediates,
-+            /*scale=*/nullptr);
-       },
-       // Build
-       [](ttcore::CompositeOp compositeOp, OpBuilder &builder) -> Operation * {
-@@ -591,7 +592,8 @@ static void registerBuiltinComposites() {
-             compositeOp.getInputs()[2],
-             compositeOp.getInputs().size() == 4u ? compositeOp.getInputs()[3]
-                                                  : Value(),
--            maskType, dropoutProbability, returnIntermediates);
-+            maskType, dropoutProbability, returnIntermediates,
-+            /*scale=*/nullptr);
-       },
-       /*promotionGuard=*/nullptr};
- 
-@@ -621,7 +623,7 @@ static void registerBuiltinComposites() {
-             compositeOp.getInputs()[4], compositeOp.getInputs()[5],
-             compositeOp.getInputs().size() == 7u ? compositeOp.getInputs()[6]
-                                                  : Value(),
--            maskType, dropoutProbability);
-+            maskType, dropoutProbability, /*scale=*/nullptr);
-       },
-       // Build
-       [](ttcore::CompositeOp compositeOp, OpBuilder &builder) -> Operation * {
-@@ -641,7 +643,7 @@ static void registerBuiltinComposites() {
-             compositeOp.getInputs()[4], compositeOp.getInputs()[5],
-             compositeOp.getInputs().size() == 7u ? compositeOp.getInputs()[6]
-                                                  : Value(),
--            maskType, dropoutProbability);
-+            maskType, dropoutProbability, /*scale=*/nullptr);
-       },
-       /*promotionGuard=*/nullptr};
- 
-diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
---- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-+++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -1821,7 +1821,9 @@ createOp(FlatbufferObjectCache &cache, SDPAForwardOp op) {
-       *cache.fbb, query, key, value, attentionMask,
-       static_cast<uint32_t>(op.getMaskType()),
-       op.getDropoutProbability().convertToFloat(), op.getReturnIntermediates(),
--      output, intermediates);
-+      output, intermediates,
-+      op.getScale() ? std::make_optional(op.getScale()->convertToFloat())
-+                    : std::nullopt);
- }
- 
- ::flatbuffers::Offset<::tt::target::ttnn::RMSNormForwardOp>
-@@ -1952,7 +1954,9 @@ createOp(FlatbufferObjectCache &cache, SDPABackwardOp op) {
-       *cache.fbb, gradOutput, attnOutput, query, key, value, intermediates,
-       attentionMask, static_cast<uint32_t>(op.getMaskType()),
-       op.getDropoutProbability().convertToFloat(), gradQuery, gradKey,
--      gradValue);
-+      gradValue,
-+      op.getScale() ? std::make_optional(op.getScale()->convertToFloat())
-+                    : std::nullopt);
- }
- 
- ::flatbuffers::Offset<::tt::target::ttnn::CrossEntropyForwardOp>
 diff --git a/runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp b/runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp
 --- a/runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp
 +++ b/runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp
-@@ -32,10 +32,11 @@ void run(const ::tt::target::ttnn::SDPABackwardOp *op,
+@@ -32,8 +32,8 @@ void run(const ::tt::target::ttnn::SDPABackwardOp *op,
    const ::ttml::metal::AttentionMaskType maskType =
        static_cast<::ttml::metal::AttentionMaskType>(op->mask_type());
  
@@ -455,21 +293,5 @@ diff --git a/runtime/lib/ttnn/operations/ttml/sdpa_bw.cpp b/runtime/lib/ttnn/ope
 +  // Returns {grad_query, grad_key, grad_value, grad_gate}; there is no gate.
 +  auto [gradQuery, gradKey, gradValue, gradGate] = ::ttml::metal::sdpa_bw(
        gradOutput, attnOutput, query, key, value, intermediates, maskType, mask,
--      op->dropout_probability());
-+      op->dropout_probability(), /*gate=*/std::nullopt,
-+      /*preallocated_grad_gate=*/std::nullopt, op->scale());
- 
-   tensorPool.insertTTNNTensorAndValidate(op->grad_query(), gradQuery);
-   tensorPool.insertTTNNTensorAndValidate(op->grad_key(), gradKey);
-diff --git a/runtime/lib/ttnn/operations/ttml/sdpa_fw.cpp b/runtime/lib/ttnn/operations/ttml/sdpa_fw.cpp
---- a/runtime/lib/ttnn/operations/ttml/sdpa_fw.cpp
-+++ b/runtime/lib/ttnn/operations/ttml/sdpa_fw.cpp
-@@ -29,7 +29,7 @@ void run(const ::tt::target::ttnn::SDPAForwardOp *op, ProgramContext &context) {
-   // Returns {output, intermediate-or-nullopt}.
-   std::vector<std::optional<::ttnn::Tensor>> result = ::ttml::metal::sdpa_fw(
-       query, key, value, maskType, mask, op->dropout_probability(),
--      op->return_intermediates());
-+      op->return_intermediates(), /*gate=*/std::nullopt, op->scale());
- 
-   tensorPool.insertTTNNTensorAndValidate(op->out(), result.at(0).value());
+       op->dropout_probability());
  
