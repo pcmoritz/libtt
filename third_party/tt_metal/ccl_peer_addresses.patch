@@ -504,7 +504,23 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp ttnn/c
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/dim_zero_line_reduce_scatter_minimal_async_writer.cpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/dim_zero_line_reduce_scatter_minimal_async_writer.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/dim_zero_line_reduce_scatter_minimal_async_writer.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/dim_zero_line_reduce_scatter_minimal_async_writer.cpp
-@@ -216,6 +216,10 @@ void kernel_main() {
+@@ -145,15 +145,11 @@ void kernel_main() {
+ 
+     const auto [intermediate_mapping_table, intermediate_rt_increment] =
+         experimental::shard_addr_gen_utils::get_shard_map<intermediate_tensor_shard_info>(get_arg_addr(arg_idx));
+-    experimental::ShardedAddrGen<intermediate_tensor_shard_info> intermediate_addrgen = {
+-        .bank_base_address = intermediate_address, .shard_array = intermediate_mapping_table};
+-
+     arg_idx += intermediate_rt_increment;
+ 
+ #else
+     constexpr auto intermediate_tensor_args = TensorAccessorArgs<ct_idx>();
+     constexpr uint32_t ct_offset = intermediate_tensor_args.num_compile_time_args();
+-    auto intermediate_addrgen = TensorAccessor(intermediate_tensor_args, intermediate_address);
+ #endif
+ 
+ #ifdef OUTPUT_IS_SHARDED
+@@ -216,6 +212,10 @@ void kernel_main() {
      auto pkt_unicast_hdr = PacketHeaderPool::allocate_header();
      auto pkt_hdr_seminc = PacketHeaderPool::allocate_header();
  
@@ -515,7 +531,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
      if (use_barrier_sem) {
          if (num_targets_in_direction) {
              // Use neighbor unicast instead of multicast to support reshaped 'logical linear' mesh devices
-@@ -225,8 +229,8 @@ void kernel_main() {
+@@ -225,8 +225,8 @@ void kernel_main() {
                  pkt_hdr_seminc,
                  static_cast<uint8_t>(unicast_route_info.distance_in_hops),
                  tt::tt_fabric::NocUnicastAtomicIncCommandHeader{
@@ -526,7 +542,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
  
              uint64_t opposite_direction_barrier_sem_noc_addr_in_pkt =
                  safe_get_noc_addr(opposite_core_sem_noc0_x, opposite_core_sem_noc0_y, barrier_sem, 0);
-@@ -239,9 +243,15 @@ void kernel_main() {
+@@ -239,9 +239,18 @@ void kernel_main() {
              // backward) handshake with each other, so the target is structurally 1 and does not
              // depend on barrier_target_count.
              noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(barrier_sem), 1);
@@ -534,36 +550,37 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
              noc_semaphore_set(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(barrier_sem), 0);
          }
      }
++    // This writer writes only into the neighbor's intermediate: the accessor takes the address it traded. A sharded
++    // one has the same shards on the same cores there (every device runs this program).
 +#ifdef INTERMEDIATE_IS_SHARDED
-+    const auto& remote_intermediate_addrgen = intermediate_addrgen;
++    const experimental::ShardedAddrGen<intermediate_tensor_shard_info> intermediate_addrgen = {
++        .bank_base_address = neighbor_intermediate_address, .shard_array = intermediate_mapping_table};
 +#else
-+    const auto remote_intermediate_addrgen = TensorAccessor(intermediate_tensor_args, neighbor_intermediate_address);
++    const auto intermediate_addrgen = TensorAccessor(intermediate_tensor_args, neighbor_intermediate_address);
 +#endif
  
      uint64_t out_ready_sem_noc_addr_in_pkt =
          safe_get_noc_addr(out_ready_sem_noc0_x, out_ready_sem_noc0_y, out_ready_sem, 0);
-@@ -297,7 +307,7 @@ void kernel_main() {
- 
-                     uint32_t first_intermediate_tile_id = intermediate_tile_id_start + tiles_read;
-                     auto noc_address0 = tt::tt_fabric::linear::addrgen_detail::get_noc_address(
--                        intermediate_addrgen, first_intermediate_tile_id, 0);
-+                        remote_intermediate_addrgen, first_intermediate_tile_id, 0);
-                     tiles_read++;
- 
-                     if (num_pages_to_write == 1) {
-@@ -310,7 +320,7 @@ void kernel_main() {
-                     } else if (num_pages_to_write == 2) {
-                         uint32_t second_intermediate_tile_id = intermediate_tile_id_start + tiles_read;
-                         auto noc_address1 = tt::tt_fabric::linear::addrgen_detail::get_noc_address(
--                            intermediate_addrgen, second_intermediate_tile_id, 0);
-+                            remote_intermediate_addrgen, second_intermediate_tile_id, 0);
-                         tiles_read++;
- 
-                         fabric_unicast_noc_scatter_write_with_state<UnicastScatterWriteUpdateMask::DstAddrs>(
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/line_reduce_scatter_minimal_async_writer.cpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/line_reduce_scatter_minimal_async_writer.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/line_reduce_scatter_minimal_async_writer.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/kernels/line_reduce_scatter_minimal_async_writer.cpp
-@@ -221,6 +221,10 @@ void kernel_main() {
+@@ -146,15 +146,11 @@ void kernel_main() {
+ 
+     const auto [intermediate_mapping_table, intermediate_rt_increment] =
+         experimental::shard_addr_gen_utils::get_shard_map<intermediate_tensor_shard_info>(get_arg_addr(arg_idx));
+-    experimental::ShardedAddrGen<intermediate_tensor_shard_info> intermediate_addrgen = {
+-        .bank_base_address = intermediate_address, .shard_array = intermediate_mapping_table};
+-
+     arg_idx += intermediate_rt_increment;
+ 
+ #else
+     constexpr auto intermediate_tensor_args = TensorAccessorArgs<ct_idx>();
+     constexpr uint32_t ct_offset = intermediate_tensor_args.num_compile_time_args();
+-    auto intermediate_addrgen = TensorAccessor(intermediate_tensor_args, intermediate_address);
+ #endif
+ 
+ #ifdef OUTPUT_IS_SHARDED
+@@ -221,6 +217,10 @@ void kernel_main() {
      auto pkt_unicast_hdr = PacketHeaderPool::allocate_header();
      auto pkt_hdr_seminc = PacketHeaderPool::allocate_header();
  
@@ -574,7 +591,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
      if (use_barrier_sem) {
          if (num_targets_in_direction) {
              // Use neighbor unicast instead of multicast to support reshaped 'logical linear' mesh devices
-@@ -230,8 +234,8 @@ void kernel_main() {
+@@ -230,8 +230,8 @@ void kernel_main() {
                  pkt_hdr_seminc,
                  static_cast<uint8_t>(unicast_route_info.distance_in_hops),
                  tt::tt_fabric::NocUnicastAtomicIncCommandHeader{
@@ -585,7 +602,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
  
              uint64_t opposite_direction_barrier_sem_noc_addr_in_pkt =
                  safe_get_noc_addr(opposite_core_sem_noc0_x, opposite_core_sem_noc0_y, barrier_sem, 0);
-@@ -244,9 +248,15 @@ void kernel_main() {
+@@ -244,9 +244,18 @@ void kernel_main() {
              // backward) handshake with each other, so the target is structurally 1 and does not
              // depend on barrier_target_count.
              noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(barrier_sem), 1);
@@ -593,32 +610,17 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
              noc_semaphore_set(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(barrier_sem), 0);
          }
      }
++    // This writer writes only into the neighbor's intermediate: the accessor takes the address it traded. A sharded
++    // one has the same shards on the same cores there (every device runs this program).
 +#ifdef INTERMEDIATE_IS_SHARDED
-+    const auto& remote_intermediate_addrgen = intermediate_addrgen;
++    const experimental::ShardedAddrGen<intermediate_tensor_shard_info> intermediate_addrgen = {
++        .bank_base_address = neighbor_intermediate_address, .shard_array = intermediate_mapping_table};
 +#else
-+    const auto remote_intermediate_addrgen = TensorAccessor(intermediate_tensor_args, neighbor_intermediate_address);
++    const auto intermediate_addrgen = TensorAccessor(intermediate_tensor_args, neighbor_intermediate_address);
 +#endif
  
      uint64_t out_ready_sem_noc_addr_in_pkt =
          safe_get_noc_addr(out_ready_sem_noc0_x, out_ready_sem_noc0_y, out_ready_sem, 0);
-@@ -318,7 +328,7 @@ void kernel_main() {
-                         uint32_t first_intermediate_tile_id =
-                             intermediate_tile_id_start + intermediate_row_offset + intermediate_pages_read_in_row;
-                         auto noc_address0 = tt::tt_fabric::linear::addrgen_detail::get_noc_address(
--                            intermediate_addrgen, first_intermediate_tile_id, 0);
-+                            remote_intermediate_addrgen, first_intermediate_tile_id, 0);
- 
-                         intermediate_pages_read_in_row++;
-                         if (intermediate_pages_read_in_row == slice_Wt) {
-@@ -344,7 +354,7 @@ void kernel_main() {
-                             }
- 
-                             auto noc_address1 = tt::tt_fabric::linear::addrgen_detail::get_noc_address(
--                                intermediate_addrgen, second_intermediate_tile_id, 0);
-+                                remote_intermediate_addrgen, second_intermediate_tile_id, 0);
-                             fabric_unicast_noc_scatter_write_with_state<UnicastScatterWriteUpdateMask::DstAddrs>(
-                                 mux_connection_handle,
-                                 pkt_scatter_hdr,
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_op_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_op_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_op_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_op_device_operation.cpp
