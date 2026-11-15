@@ -298,6 +298,32 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_writer
                  fabric.async_write(l1_read_addr, neighbor_addr);
  
                  if (local_copy) {
+diff --git ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp
+--- ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp
++++ ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp
+@@ -59,12 +59,16 @@ ttnn::Tensor all_reduce(
+         ttsl::SmallVector<uint32_t> scratch_shape(input_tensor.padded_shape().cbegin(),
+                                                   input_tensor.padded_shape().cend());
+         scratch_shape.back() *= ring_size;
+-        auto scratch = ttnn::create_device_tensor(
+-            tt::tt_metal::TensorSpec(
+-                Shape(scratch_shape),
+-                tt::tt_metal::TensorLayout(
+-                    input_tensor.dtype(), input_tensor.tensor_spec().page_config(), *scratch_config)),
+-            mesh_device, input_tensor.tensor_topology());
++        // Devices of other processes allocate apart: there the exchange uses its program's own CB instead.
++        std::optional<ttnn::Tensor> scratch;
++        if (::ttnn::ccl::is_fully_local(*mesh_device)) {
++            scratch = ttnn::create_device_tensor(
++                tt::tt_metal::TensorSpec(
++                    Shape(scratch_shape),
++                    tt::tt_metal::TensorLayout(
++                        input_tensor.dtype(), input_tensor.tensor_spec().page_config(), *scratch_config)),
++                mesh_device, input_tensor.tensor_topology());
++        }
+         const auto links = num_links.value_or(ttnn::operations::ccl::common::get_num_links(*mesh_device, cluster_axis));
+         return ttnn::prim::all_reduce_async(
+             input_tensor, scratch, *cluster_axis, *mesh_device, topology_, std::nullopt,
 diff --git ttnn/cpp/ttnn/operations/ccl/ccl_common.cpp ttnn/cpp/ttnn/operations/ccl/ccl_common.cpp
 --- ttnn/cpp/ttnn/operations/ccl/ccl_common.cpp
 +++ ttnn/cpp/ttnn/operations/ccl/ccl_common.cpp
@@ -485,30 +511,113 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_gather_async/device/all
      const auto& layout = input_tensor.layout();
      const auto& dtype = input_tensor.dtype();
      const auto& page_size = input_tensor.buffer()->page_size();
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
+@@ -65,13 +65,19 @@ std::optional<MemoryConfig> direct_all_reduce_scratch_config(const Tensor& input
+ void AllReduceAsyncDeviceOperation::validate_on_program_cache_miss(
+     const operation_attributes_t& args, const tensor_args_t& tensor_args) {
+     const auto& input_tensor = tensor_args.input_tensor;
+-    const auto& buffer_tensor = tensor_args.buffer_tensor;
+     const auto& page_size = input_tensor.buffer()->page_size();
+ 
+     if (input_tensor.memory_config() == DRAM_MEMORY_CONFIG) {
+         const auto scratch_config = direct_all_reduce_scratch_config(input_tensor, args.ring_size);
+         TT_FATAL(scratch_config.has_value(), "Unsupported direct DRAM exchange input");
+-        TT_FATAL(buffer_tensor.memory_config() == *scratch_config, "Invalid direct exchange scratch layout");
++        // Within one process the exchange writes into a scratch tensor, at one address on every device; across
++        // processes into its program's own CB.
++        TT_FATAL(
++            tensor_args.buffer_tensor.has_value() == ::ttnn::ccl::is_fully_local(*input_tensor.device()),
++            "The direct exchange takes a scratch tensor exactly on a mesh whose devices are all in this process");
++        TT_FATAL(
++            !tensor_args.buffer_tensor || tensor_args.buffer_tensor->memory_config() == *scratch_config,
++            "Invalid direct exchange scratch layout");
+         TT_FATAL(args.output_mem_config == DRAM_MEMORY_CONFIG && args.dtype == input_tensor.dtype() &&
+                      !args.use_noc1_only,
+                  "Direct DRAM exchange requires matching DRAM output and dedicated NOCs");
+@@ -92,6 +98,8 @@ void AllReduceAsyncDeviceOperation::validate_on_program_cache_miss(
+     TT_FATAL(input_tensor.storage_type() == StorageType::DEVICE, "Operands to all_reduce need to be on device!");
+     TT_FATAL(input_tensor.buffer() != nullptr, "Operands to all_reduce need to be allocated in buffers on device!");
+ 
++    TT_FATAL(tensor_args.buffer_tensor.has_value(), "all_reduce_async needs a buffer tensor");
++    const Tensor& buffer_tensor = *tensor_args.buffer_tensor;
+     TT_FATAL(buffer_tensor.storage_type() == StorageType::DEVICE, "Operands to all_reduce need to be on device!");
+     TT_FATAL(buffer_tensor.buffer() != nullptr, "Operands to all_reduce need to be allocated in buffers on device!");
+ 
+@@ -311,7 +319,7 @@ namespace ttnn::prim {
+ 
+ ttnn::experimental::prim::AllReduceAsyncDeviceOperation::tensor_return_value_t all_reduce_async(
+     const Tensor& input_tensor,
+-    Tensor& buffer_tensor,
++    const std::optional<Tensor>& buffer_tensor,
+     uint32_t cluster_axis,
+     MeshDevice& mesh_device,
+     ttnn::ccl::Topology topology,
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.hpp
+@@ -42,7 +42,7 @@ namespace ttnn::prim {
+ 
+ ttnn::experimental::prim::AllReduceAsyncDeviceOperation::tensor_return_value_t all_reduce_async(
+     const Tensor& input_tensor,
+-    Tensor& buffer_tensor,
++    const std::optional<Tensor>& buffer_tensor,
+     uint32_t cluster_axis,
+     MeshDevice& mesh_device,
+     ttnn::ccl::Topology topology,
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation_types.hpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation_types.hpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation_types.hpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation_types.hpp
+@@ -121,7 +121,9 @@ struct AllReduceAsyncParams {
+ 
+ struct AllReduceAsyncInputs {
+     Tensor input_tensor;
+-    Tensor buffer_tensor;
++    // The exchange's scratch: required, except for the direct exchange on a mesh whose devices are not all in this
++    // process, which exchanges into its program's own CB.
++    std::optional<Tensor> buffer_tensor;
+ };
+ 
+ }  // namespace ttnn::experimental::prim
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
-@@ -452,6 +452,10 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
+@@ -195,7 +195,11 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
+     auto input_tensor_memory_config = input_tensor.memory_config();
+     auto output_tensor_memory_config = output_tensor.memory_config();
+     const bool direct = input_tensor_memory_config == DRAM_MEMORY_CONFIG;
+-    auto input_spec = direct ? buffer_tensor.shard_spec().value() : input_tensor.shard_spec().value();
++    // The direct exchange's reduction cores and slices are its scratch's (validated to match any scratch tensor).
++    auto input_spec = direct ? direct_all_reduce_scratch_config(input_tensor, operation_attributes.ring_size)
++                                   ->shard_spec()
++                                   .value()
++                             : input_tensor.shard_spec().value();
+     if (direct) input_spec.shape[1] /= operation_attributes.ring_size;
+     const auto output_spec = direct ? input_spec : output_tensor.shard_spec().value();
+ 
+@@ -452,6 +456,11 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
      uint32_t reduction_CB_size = reduction_CB_tiles * reduction_CB_single_tile_size;
  
      uint32_t reduction_cb_index = tt::CBIndex::c_1;
 +    // The writers multicast each rank's slice into the peers' reduction CB at their own CB's address. Within one
 +    // process the scratch tensor sits at one address on every device; devices of other processes allocate theirs
-+    // apart, so there the CB is the program's own, at the address the program gives it on every device.
-+    const bool program_scratch = direct && !::ttnn::ccl::is_fully_local(*mesh_device);
++    // apart, so there no scratch tensor is passed and the CB is the program's own, at the address the program gives
++    // it on every device.
++    const bool program_scratch = !buffer_tensor.has_value();
      desc.cbs.push_back(tt::tt_metal::CBDescriptor{
          .total_size = reduction_CB_size,
          .core_ranges = all_cores,
-@@ -460,7 +464,7 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
+@@ -460,7 +469,7 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
              .data_format = df,
              .page_size = reduction_CB_single_tile_size,
          }}},
 -        .buffer = buffer_tensor.buffer(),
-+        .buffer = program_scratch ? nullptr : buffer_tensor.buffer(),
++        .buffer = program_scratch ? nullptr : buffer_tensor->buffer(),
      });
  
      /* out cb */
-@@ -579,8 +583,9 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
+@@ -579,8 +588,9 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
      worker_sender_writer_kernel_desc.source_type = tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
      worker_sender_writer_kernel_desc.core_ranges = sender_worker_core_range;
      worker_sender_writer_kernel_desc.compile_time_args = std::move(writer_compile_args);
@@ -520,6 +629,15 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      worker_sender_writer_kernel_desc.defines = packing_defines;
      if (direct) {
          worker_sender_writer_kernel_desc.defines.emplace_back("WAIT_FOR_PEERS", "1");
+@@ -790,7 +800,7 @@ void AllReduceAsyncMeshWorkloadFactory::override_runtime_arguments(
+         }
+         const auto& indices = cb->buffer_indices();
+         if (indices.contains(static_cast<uint8_t>(tt::CBIndex::c_1))) {
+-            tt::tt_metal::UpdateDynamicCircularBufferAddress(program, cb->id(), *tensor_args.buffer_tensor.buffer());
++            tt::tt_metal::UpdateDynamicCircularBufferAddress(program, cb->id(), *tensor_args.buffer_tensor->buffer());
+         } else if (indices.contains(static_cast<uint8_t>(tt::CBIndex::c_2))) {
+             tt::tt_metal::UpdateDynamicCircularBufferAddress(program, cb->id(), *output_tensor.buffer());
+         }
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp
