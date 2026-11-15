@@ -121,12 +121,13 @@ at TP4 (89 on one chip) and Qwen3-32B 16.3 tokens/s, with BF16 weights.
 ### Collective buffers
 
 TT-NN's collectives write to their peers at the addresses of their own
-buffers, but separate processes don't allocate in the same order. With more
-than one process, each therefore reserves the same DRAM region when the mesh
-opens, and collectives allocate their buffers there. The region is
-`LIBTT_SYMMETRIC_DRAM_MB` megabytes per chip, 2048 by default. Raise it if a
-collective fails with "Symmetric DRAM region of ... is too small for this
-collective".
+buffers, but separate processes don't allocate in the same order. On a mesh
+whose devices run in other processes, TT-NN therefore takes only collectives
+that trade addresses with their neighbors before they write: the unicast
+all-gather and the line reduce-scatter. Gathers of padded dimensions run along
+a new leading dimension, and all-reduces as a reduce-scatter and an all-gather,
+or as an all-gather along a new dimension and a reduction across it. The
+collectives that write at their own addresses refuse such meshes.
 
 ### Recovery
 
