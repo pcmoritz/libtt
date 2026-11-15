@@ -20,10 +20,10 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp ttnn/cpp/ttnn/
              }
              return tensor;
          }
-@@ -67,9 +68,8 @@ ttnn::Tensor all_reduce(
+@@ -58,9 +59,8 @@ ttnn::Tensor all_reduce(
          const auto links = num_links.value_or(ttnn::operations::ccl::common::get_num_links(*mesh_device, cluster_axis));
          return ttnn::prim::all_reduce_async(
-             input_tensor, scratch, *cluster_axis, *mesh_device, topology_, std::nullopt,
+             input_tensor, std::nullopt, *cluster_axis, *mesh_device, topology_, std::nullopt,
 -            input_tensor.dtype(), DRAM_MEMORY_CONFIG, links, subdevice_id, false, false, true);
 +            input_tensor.dtype(), DRAM_MEMORY_CONFIG, links, subdevice_id, false, false, true, reduce_type);
      }
@@ -31,7 +31,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_reduce/all_reduce.cpp ttnn/cpp/ttnn/
      return ::ttnn::experimental::all_reduce_async(
          input_tensor,
          cluster_axis,
-@@ -77,7 +77,7 @@ ttnn::Tensor all_reduce(
+@@ -68,7 +68,7 @@ ttnn::Tensor all_reduce(
          std::nullopt,                       // barrier_semaphores
          std::nullopt,                       // rs_global_semaphores
          std::nullopt,                       // ag_global_semaphores
@@ -280,7 +280,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/all_reduce
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_device_operation.cpp
-@@ -322,7 +322,8 @@ ttnn::experimental::prim::AllReduceAsyncDeviceOperation::tensor_return_value_t a
+@@ -323,7 +323,8 @@ ttnn::experimental::prim::AllReduceAsyncDeviceOperation::tensor_return_value_t a
      std::optional<tt::tt_metal::SubDeviceId> subdevice_id,
      bool use_noc1_only,
      bool use_optimal_ccl_for_llama,
@@ -290,7 +290,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
      using OperationType = ttnn::experimental::prim::AllReduceAsyncDeviceOperation;
      const auto& mesh_view = mesh_device.get_view();
      TT_FATAL(
-@@ -341,7 +342,8 @@ ttnn::experimental::prim::AllReduceAsyncDeviceOperation::tensor_return_value_t a
+@@ -342,7 +343,8 @@ ttnn::experimental::prim::AllReduceAsyncDeviceOperation::tensor_return_value_t a
          use_optimal_ccl_for_llama,
          cluster_axis,
          &mesh_device,
@@ -382,7 +382,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all_reduce_async_program_factory.cpp
-@@ -17,6 +17,7 @@
+@@ -18,6 +18,7 @@
  #include "ttnn/operations/experimental/ccl/llama_common.hpp"
  #include "ttnn/operations/ccl/ccl_host_datastructures.hpp"
  #include "ttnn/operations/ccl/ccl_common.hpp"
@@ -390,7 +390,7 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/all_reduce_async/device/all
  #include "ttnn/operations/math.hpp"
  #include <tt-metalium/work_split.hpp>
  #include <tt-metalium/constants.hpp>
-@@ -523,8 +524,10 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
+@@ -531,8 +532,10 @@ tt::tt_metal::ProgramDescriptor AllReduceAsyncMeshWorkloadFactory::create_descri
          reduction_compute_config.fp32_dest_acc_en = true;
          reduction_compute_config.dst_full_sync_en = true;
      }
