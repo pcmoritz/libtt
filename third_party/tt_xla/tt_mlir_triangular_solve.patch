@@ -1,0 +1,153 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
+@@ -2540,6 +2540,118 @@
+   }
+ };
+ 
++// stablehlo.triangular_solve as batched matmuls, as XLA expands it for TPUs
++// (TriangularSolveExpander: inverted diagonal blocks, then matmuls at the
++// highest precision). The inverse of op(a) comes from its diagonal by
++// recursive block inversion: with t the inverse of the block diagonal of
++// s x s blocks, and c the entries of the off-diagonal s x s block inside each
++// 2s x 2s diagonal block, the inverse of the 2s x 2s block diagonal is
++// t - t c t, because c t c = 0. That is log2(m) rounds of two matmuls of
++// [..., m, m] matrices, then one with b. Only the triangle that the op names
++// is read.
++class TriangularSolveConversionPattern
++    : public OpConversionPattern<mlir::stablehlo::TriangularSolveOp> {
++public:
++  using OpConversionPattern<
++      mlir::stablehlo::TriangularSolveOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(mlir::stablehlo::TriangularSolveOp srcOp,
++                  mlir::stablehlo::TriangularSolveOp::Adaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    Value a = adaptor.getA();
++    Value b = adaptor.getB();
++    auto aType = mlir::cast<RankedTensorType>(a.getType());
++    auto bType = mlir::cast<RankedTensorType>(b.getType());
++    auto elementType = mlir::dyn_cast<FloatType>(aType.getElementType());
++    if (!elementType || !aType.hasStaticShape() || !bType.hasStaticShape()) {
++      return rewriter.notifyMatchFailure(srcOp,
++                                         "expected static real matrices");
++    }
++    Location loc = srcOp.getLoc();
++    int64_t rank = aType.getRank();
++    int64_t m = aType.getDimSize(rank - 1);
++
++    // op(a) = a^T (the adjoint, for real matrices) is triangular the other
++    // way.
++    bool lower = srcOp.getLower();
++    if (srcOp.getTransposeA() != mlir::stablehlo::Transpose::NO_TRANSPOSE) {
++      auto permutation = llvm::to_vector(llvm::seq<int64_t>(0, rank));
++      std::swap(permutation[rank - 2], permutation[rank - 1]);
++      a = rewriter.create<mlir::stablehlo::TransposeOp>(loc, a, permutation);
++      lower = !lower;
++    }
++
++    // An m x m matrix of ones where `keep(row, column)`, broadcast to a's
++    // batch.
++    const llvm::fltSemantics &semantics = elementType.getFloatSemantics();
++    auto matrix = [&](llvm::function_ref<bool(int64_t, int64_t)> keep) {
++      SmallVector<APFloat> values;
++      values.reserve(m * m);
++      for (int64_t row = 0; row < m; ++row) {
++        for (int64_t column = 0; column < m; ++column) {
++          values.push_back(keep(row, column)
++                               ? APFloat::getOne(semantics)
++                               : APFloat::getZero(semantics));
++        }
++      }
++      Value constant = rewriter.create<mlir::stablehlo::ConstantOp>(
++          loc, DenseElementsAttr::get(
++                   RankedTensorType::get({m, m}, elementType), values));
++      return rewriter
++          .create<mlir::stablehlo::BroadcastInDimOp>(
++              loc, aType, constant, ArrayRef<int64_t>{rank - 2, rank - 1})
++          .getResult();
++    };
++    auto batchDims = llvm::to_vector(llvm::seq<int64_t>(0, rank - 2));
++    auto highest = mlir::stablehlo::PrecisionAttr::get(
++        rewriter.getContext(), mlir::stablehlo::Precision::HIGHEST);
++    auto matmul = [&](Value lhs, Value rhs) {
++      auto lhsType = mlir::cast<RankedTensorType>(lhs.getType());
++      auto rhsType = mlir::cast<RankedTensorType>(rhs.getType());
++      SmallVector<int64_t> shape(lhsType.getShape());
++      shape.back() = rhsType.getShape().back();
++      return rewriter
++          .create<mlir::stablehlo::DotGeneralOp>(
++              loc, RankedTensorType::get(shape, elementType), lhs, rhs,
++              mlir::stablehlo::DotDimensionNumbersAttr::get(
++                  rewriter.getContext(), batchDims, batchDims, {rank - 1},
++                  {rank - 2}),
++              rewriter.getArrayAttr({highest, highest}),
++              /*algorithm=*/nullptr)
++          .getResult();
++    };
++
++    // The inverse of the diagonal.
++    Value identity = matrix([](int64_t row, int64_t column) {
++      return row == column;
++    });
++    Value inverse = identity;
++    if (!srcOp.getUnitDiagonal()) {
++      Value offDiagonal = matrix([](int64_t row, int64_t column) {
++        return row != column;
++      });
++      Value diagonal = rewriter.create<mlir::stablehlo::AddOp>(
++          loc, rewriter.create<mlir::stablehlo::MulOp>(loc, a, identity),
++          offDiagonal);
++      inverse =
++          rewriter.create<mlir::stablehlo::DivOp>(loc, identity, diagonal);
++    }
++    for (int64_t s = 1; s < m; s *= 2) {
++      Value block = matrix([&](int64_t row, int64_t column) {
++        return lower ? row / s == column / s + 1 && column / s % 2 == 0
++                     : column / s == row / s + 1 && row / s % 2 == 0;
++      });
++      Value c = rewriter.create<mlir::stablehlo::MulOp>(loc, a, block);
++      inverse = rewriter.create<mlir::stablehlo::SubtractOp>(
++          loc, inverse, matmul(matmul(inverse, c), inverse));
++    }
++    rewriter.replaceOp(srcOp, srcOp.getLeftSide() ? matmul(inverse, b)
++                                                  : matmul(b, inverse));
++    return success();
++  }
++};
++
+ struct LegalizeStableHLOCompositeToTTIR
+     : public ttir::impl::LegalizeStableHLOCompositeToTTIRBase<
+           LegalizeStableHLOCompositeToTTIR> {
+@@ -2550,14 +2662,18 @@
+     target.addLegalDialect<ttir::TTIRDialect>();
+     target.addLegalDialect<ttcore::TTCoreDialect>();
+     // StableHLO is intentionally not marked as either legal or illegal.
+-    // ChloScanConversionPattern rewrites into these StableHLO ops, which the
+-    // StableHLO to TTIR conversion lowers later.
++    // ChloScanConversionPattern and TriangularSolveConversionPattern rewrite
++    // into these StableHLO ops, which the StableHLO to TTIR conversion lowers
++    // later.
+     target
+         .addLegalOp<mlir::stablehlo::AddOp, mlir::stablehlo::BroadcastInDimOp,
+-                    mlir::stablehlo::ConstantOp, mlir::stablehlo::MaxOp,
++                    mlir::stablehlo::ConstantOp, mlir::stablehlo::DivOp,
++                    mlir::stablehlo::DotGeneralOp, mlir::stablehlo::MaxOp,
+                     mlir::stablehlo::MinOp, mlir::stablehlo::MulOp,
+                     mlir::stablehlo::ReduceWindowOp, mlir::stablehlo::ReshapeOp,
+-                    mlir::stablehlo::ReturnOp, mlir::stablehlo::SliceOp>();
++                    mlir::stablehlo::ReturnOp, mlir::stablehlo::SliceOp,
++                    mlir::stablehlo::SubtractOp,
++                    mlir::stablehlo::TransposeOp>();
+ 
+     RewritePatternSet patterns(context);
+     populateStableHLOCompositeLegalizationPatterns(context, patterns);
+@@ -2585,6 +2701,7 @@
+       context, "tenstorrent.gelu_tanh");
+   patterns.add<ChloMulHiConversionPattern>(context);
+   patterns.add<ChloScanConversionPattern>(context);
++  patterns.add<TriangularSolveConversionPattern>(context);
+   patterns.add<TenstorrentAdamWConversionPattern>(context);
+   patterns.add<TenstorrentSDPAForwardConversionPattern>(context);
+   patterns.add<TenstorrentSDPABackwardConversionPattern>(context);
