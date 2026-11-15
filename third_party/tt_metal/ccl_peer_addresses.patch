@@ -306,30 +306,21 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/composite_common.cpp ttnn/c
  #include "ttnn/operations/ccl/common/host/ccl_topology_utils.hpp"
  #include "ttnn/operations/ccl/reduce_scatter/device/reduce_scatter_device_operation.hpp"
  #include "ttnn/operations/data_movement/pad/pad.hpp"
-@@ -404,17 +407,46 @@ ttnn::Tensor composite_all_gather(
+@@ -404,17 +407,37 @@ ttnn::Tensor composite_all_gather(
          input_tensor = ttnn::to_layout(input_tensor, ttnn::Layout::ROW_MAJOR);
      }
  
 -    std::vector<ttnn::Tensor> broadcasted_tensors = ttnn::all_broadcast(
 -        input_tensor,
-+    // Gather the whole tensors along a new leading dimension, then concatenate the pieces along the gather dim. The
-+    // leading dimension is never padded, so the device all-gather moves the pages as they are; with devices of other
-+    // processes it takes the unicast algorithm, which trades output addresses with its neighbors (all_broadcast would
-+    // write to them at its own). Dimensions before the last two are merged, keeping the gather at four dimensions.
-+    ttsl::SmallVector<uint32_t> leading_shape{1};
-+    if (rank < 4) {
-+        for (int32_t i = 0; i < rank; ++i) {
-+            leading_shape.push_back(input_shape[i]);
-+        }
-+    } else {
-+        uint32_t outer = 1;
-+        for (int32_t i = 0; i < rank - 2; ++i) {
-+            outer *= input_shape[i];
-+        }
-+        leading_shape.push_back(outer);
-+        leading_shape.push_back(input_shape[-2]);
-+        leading_shape.push_back(input_shape[-1]);
++    // Gather the whole tensors along a new leading dimension of a 4D view [1, outer, rows, columns], then concatenate
++    // the pieces along the gather dim. Dimension 0 of a 4D tensor is never a tile dimension, so never padded, and the
++    // device all-gather moves the pages as they are; with devices of other processes it takes the unicast algorithm,
++    // which trades output addresses with its neighbors (all_broadcast would write to them at its own).
++    uint32_t outer = 1;
++    for (int32_t i = 0; i < rank - 2; ++i) {
++        outer *= input_shape[i];
 +    }
++    const ttsl::SmallVector<uint32_t> leading_shape{1, outer, rank >= 2 ? input_shape[-2] : 1, input_shape[-1]};
 +    const ttnn::Tensor gathered = ttnn::prim::all_gather(
 +        ttnn::reshape(input_tensor, ttnn::Shape(leading_shape)),
 +        /*persistent_output_tensor=*/std::nullopt,
