@@ -62,15 +62,41 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/all_gather_unicast_fac
      uint32_t num_available_cores) {
      const auto& input_tensor = tensor_args.input_tensor;
      tt::tt_metal::Program program{};
-@@ -585,6 +591,7 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
+@@ -547,6 +553,23 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
+                     final_count = is_forward ? half : (num_worker_output_chunks - half);
+                 }
+ 
++                // The output-address handshake with the partner (the opposite-direction worker on the neighbor,
++                // which writes into our output): a worker publishes its address only if the partner writes
++                // chunks, and takes the partner's only if it writes chunks itself. Every address taken is then
++                // followed by data the other device must receive before its program ends, so its next invocation
++                // can't publish before the address was taken and the semaphore reset. A pair with nothing to
++                // send (a slice without pages; one direction of a 2-device ring's even split) exchanges nothing.
++                auto writes_chunks = [&](bool forward, uint32_t iters) {
++                    const uint32_t last =
++                        ring_even_split ? (forward ? half : num_worker_output_chunks - half) : num_worker_output_chunks;
++                    return iters > 0 && (static_cast<uint64_t>(iters - 1) * num_worker_output_chunks) + last > 0;
++                };
++                const uint32_t neighbor_idx = is_forward ? (device_idx + 1) % num_devices
++                                                         : (device_idx + num_devices - 1) % num_devices;
++                const bool takes_address = writes_chunks(is_forward, num_iters);
++                const bool publishes_address =
++                    num_iters > 0 && writes_chunks(!is_forward, relay_iters(neighbor_idx, !is_forward));
++
+                 // Chunks the upstream delivers into our output (relayed full stripes + sink). The even-ring
+                 // antipode arrives as a half, so it contributes final_count instead of a full stripe.
+                 const uint32_t total_chunks = num_recv * num_worker_output_chunks -
+@@ -585,6 +608,9 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
                      do_local_write ? 1u : 0u,         // write local data into local output on iteration 0
                      barrier_sem.address(),            // barrier_sem L1 address
                      data_valid_sem.address(),         // data_valid_sem L1 address
 +                    peer_output_sem.address(),        // peer_output_sem L1 address
++                    publishes_address ? 1u : 0u,      // send our output address: the partner writes into it
++                    takes_address ? 1u : 0u,          // take the partner's output address: we write into it
                      (uint32_t)partner_core.x,         // barrier_sem target (neighbor partner core x)
                      (uint32_t)partner_core.y,         // barrier_sem target (neighbor partner core y)
                      (uint32_t)mirror_core.x,          // data_valid_sem target (neighbor mirror core x)
-@@ -635,6 +642,7 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
+@@ -635,6 +661,7 @@ AllGatherUnicastFactory::cached_program_t AllGatherUnicastFactory::create_at(
          .writer_kernel_id = writer_kernel_id,
          .barrier_sem = barrier_sem,
          .data_valid_sem = data_valid_sem,
@@ -78,7 +104,7 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/all_gather_unicast_fac
      };
  
      return {std::move(program), std::move(shared_variables)};
-@@ -662,11 +670,12 @@ void AllGatherUnicastFactory::override_runtime_arguments(
+@@ -662,11 +689,12 @@ void AllGatherUnicastFactory::override_runtime_arguments(
              reader_args[1] = output_addr;
              reader_args[12] = barrier_addr;
              reader_args[13] = data_valid_addr;
@@ -149,33 +175,42 @@ diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_common
 diff --git ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_writer.cpp ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_writer.cpp
 --- ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_writer.cpp
 +++ ttnn/cpp/ttnn/operations/ccl/all_gather/device/kernels/unicast_writer.cpp
-@@ -66,6 +66,7 @@ void kernel_main() {
+@@ -66,6 +66,9 @@ void kernel_main() {
      const uint32_t do_local_write = get_arg_val<uint32_t>(arg_idx++);
      [[maybe_unused]] const address_t barrier_sem = get_arg_val<uint32_t>(arg_idx++);  // used only if do_init_barrier
      const address_t data_valid_sem = get_arg_val<uint32_t>(arg_idx++);
 +    const address_t peer_output_sem = get_arg_val<uint32_t>(arg_idx++);
++    const bool publishes_address = get_arg_val<uint32_t>(arg_idx++);
++    const bool takes_address = get_arg_val<uint32_t>(arg_idx++);
      [[maybe_unused]] const uint8_t barrier_sem_noc_x = get_arg_val<uint32_t>(arg_idx++);  // neighbor opposite-dir core
      [[maybe_unused]] const uint8_t barrier_sem_noc_y = get_arg_val<uint32_t>(arg_idx++);
      const uint8_t data_valid_sem_noc_x = get_arg_val<uint32_t>(arg_idx++);  // mirror core (data_valid_sem target)
-@@ -149,6 +150,17 @@ void kernel_main() {
+@@ -149,6 +152,24 @@ void kernel_main() {
          fabric.atomic_inc(safe_get_noc_addr(barrier_sem_noc_x, barrier_sem_noc_y, barrier_sem, 0), 1);
      }
  
 +    // Devices driven by different processes need not hold the output at one address: trade output addresses
 +    // with the partner core on the neighbor, the one that writes into ours. Each adds its address to the other's
-+    // zeroed semaphore, which this core resets once read, before any data of this op reaches the partner.
-+    fabric.atomic_inc(
-+        safe_get_noc_addr(barrier_sem_noc_x, barrier_sem_noc_y, peer_output_sem, 0), output_tensor_address);
-+    auto* peer_output_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(peer_output_sem);
-+    noc_semaphore_wait_min(peer_output_ptr, 1);
-+    const address_t neighbor_output_address = *peer_output_ptr;
-+    noc_semaphore_set(peer_output_ptr, 0);
++    // zeroed semaphore if the other writes into it, and takes the other's if it writes itself; it resets the
++    // semaphore once read, before its data reaches the partner's device, which can't finish (and run the next
++    // invocation, whose address would land here) without that data.
++    if (publishes_address) {
++        fabric.atomic_inc(
++            safe_get_noc_addr(barrier_sem_noc_x, barrier_sem_noc_y, peer_output_sem, 0), output_tensor_address);
++    }
++    address_t neighbor_output_address = output_tensor_address;
++    if (takes_address) {
++        auto* peer_output_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(peer_output_sem);
++        noc_semaphore_wait_min(peer_output_ptr, 1);
++        neighbor_output_address = *peer_output_ptr;
++        noc_semaphore_set(peer_output_ptr, 0);
++    }
 +    const auto neighbor_output_accessor = TensorAccessor(output_tensor_args, neighbor_output_address);
 +
      const uint64_t downstream_data_valid_addr =
          safe_get_noc_addr(data_valid_sem_noc_x, data_valid_sem_noc_y, data_valid_sem, 0);
      auto signal = [&](uint32_t chunks) { fabric.atomic_inc(downstream_data_valid_addr, chunks); };
-@@ -176,7 +188,7 @@ void kernel_main() {
+@@ -176,7 +197,7 @@ void kernel_main() {
              for (uint32_t i = 0; i < batch; ++i) {
                  auto [page_id, byte_off] = it.next();
                  uint64_t neighbor_addr =
@@ -599,6 +634,29 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_asyn
      const auto& input_tensor = tensor_args.input_tensor;
  
      // Common validation
+diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_program.cpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_program.cpp
+--- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_program.cpp
++++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_program.cpp
+@@ -2253,13 +2253,18 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
+                 CoreCoord termination_master_virtual_core =
+                     mesh_device->worker_core_from_logical_core(termination_master_logical_core);
+ 
++                // The barrier handshake carries the intermediate address to the partner (this worker's index in
++                // the opposite direction on the neighbor, which has the same tiles). A worker without tiles writes
++                // nothing to its neighbor, so neither it nor its partner handshakes: with no data following, the
++                // next invocation's address could arrive before the partner reset its semaphore.
++                const bool worker_has_tiles = static_cast<uint64_t>(tiles_per_worker_per_repeat) * num_repeats > 0;
+                 std::vector<uint32_t> writer_rt_args = {
+                     virtual_core.x,  // out_ready_sem_noc0_x
+                     virtual_core.y,  // out_ready_sem_noc0_y
+                     fwd_bwd_semaphore_address,
+                     opposite_core_coord.x,
+                     opposite_core_coord.y,
+-                    barrier_semaphore.has_value() && !using_persistent_buffers,  // use_barrier_sem
++                    barrier_semaphore.has_value() && !using_persistent_buffers && worker_has_tiles,  // use_barrier_sem
+                     is_forward,                                                  // is_forward
+                     is_first_device_in_direction,                                // is_first_device_in_direction
+                     num_targets_in_direction,                                    // num_targets_in_direction
 diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_direct/device/reduce_scatter_minimal_direct_op_device_operation.cpp ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_direct/device/reduce_scatter_minimal_direct_op_device_operation.cpp
 --- ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_direct/device/reduce_scatter_minimal_direct_op_device_operation.cpp
 +++ ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_direct/device/reduce_scatter_minimal_direct_op_device_operation.cpp

@@ -91,6 +91,19 @@ def worker(rank):
     dist.all_gather_into_tensor(gathered, logits.to("tpu"))
     assert torch.equal(gathered.cpu(), torch.cat([logits - rank, logits - rank + 1])), "wide padded all-gather"
 
+    # One tile each, repeatedly: fewer pages than worker slices, so some worker pairs have nothing to send. They
+    # exchange no addresses; an address handshake without data could let an invocation's address arrive before
+    # the previous one was taken.
+    tile = torch.arange(32 * 32, dtype=torch.float32).reshape(32, 32) + rank
+    for _ in range(100):
+        gathered = torch.empty(64, 32, device="tpu")
+        dist.all_gather_into_tensor(gathered, tile.to("tpu"))
+        scattered = torch.empty(32, 32, device="tpu")
+        dist.reduce_scatter_tensor(scattered, gathered)
+    assert torch.equal(gathered.cpu(), torch.cat([tile - rank, tile - rank + 1])), "repeated one-tile all-gather"
+    want = 2 * torch.cat([tile - rank, tile - rank + 1])[32 * rank : 32 * (rank + 1)]
+    assert torch.equal(scattered.cpu(), want), "repeated one-tile reduce-scatter"
+
     # Object collectives send pickled bytes (UINT8), as distributed checkpoints do.
     objects = [None, None]
     dist.all_gather_object(objects, {"rank": rank, "text": "x" * (100 + rank)})
