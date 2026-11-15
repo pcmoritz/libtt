@@ -30,13 +30,14 @@ def _inputs(seed, batch=1, kv_heads=2, heads=HEADS, dim=DIM, seq=SEQ):
     return tensor(heads), tensor(kv_heads), tensor(kv_heads), tensor(heads)
 
 
-def _reference(q, k, v, g, segment_ids=None, window=None):
-    """Causal attention in float64: out, logsumexp, dq, dk, dv."""
+def _reference(q, k, v, g, segment_ids=None, window=None, scale=None):
+    """Causal attention in float64, the scores scaled by `scale` (1 / sqrt(D) without it): out, logsumexp, dq, dk,
+    dv."""
     q, k, v, g = (x.astype(np.float64) for x in (q, k, v, g))
     batch, kv_heads = k.shape[:2]
     group = q.shape[1] // kv_heads
     kr, vr = np.repeat(k, group, axis=1), np.repeat(v, group, axis=1)
-    scale = 1 / np.sqrt(q.shape[-1])
+    scale = 1 / np.sqrt(q.shape[-1]) if scale is None else scale
     s = np.einsum("bhqd,bhkd->bhqk", q, kr) * scale
     seq = q.shape[2]
     rows, cols = np.arange(seq)[:, None], np.arange(seq)[None, :]
@@ -67,24 +68,30 @@ def _device(*arrays):
     return [None if a is None else jax.device_put(a, device) for a in arrays]
 
 
-@pytest.mark.parametrize("dtype", [ml_dtypes.bfloat16, np.float32], ids=["bf16", "fp32"])
-def test_custom_calls_match_reference(dtype):
+@pytest.mark.parametrize(
+    "dtype,scale",
+    [(ml_dtypes.bfloat16, None), (np.float32, None), (ml_dtypes.bfloat16, 0.05)],
+    ids=["bf16", "fp32", "bf16-scale"],
+)
+def test_custom_calls_match_reference(dtype, scale):
     # The kernels take BF16; the compiler casts FP32 operands to it. (At O1,
     # the optimizer would need tt-mlir's tt-train op models, which libtt
-    # doesn't build.)
+    # doesn't build.) Without a scale they take 1 / sqrt(D); 0.05 is about
+    # half of that.
     q, k, v, g = (x.astype(dtype) for x in _inputs(0))
-    out_want, lse_want, dq_want, dk_want, dv_want = _reference(q, k, v, g)
+    out_want, lse_want, dq_want, dk_want, dv_want = _reference(q, k, v, g, scale=scale)
     options = {"optimization_level": "O0"}
+    attributes = {"mask_type": 1} if scale is None else {"mask_type": 1, "scale": np.float32(scale)}
 
     def forward(q, k, v):
         return jax.ffi.ffi_call(
             "tt.sdpa_fw",
             (jax.ShapeDtypeStruct(q.shape, q.dtype), jax.ShapeDtypeStruct((*q.shape[:3], 32), jnp.float32)),
-        )(q, k, v, mask_type=1)
+        )(q, k, v, **attributes)
 
     def backward(g, out, q, k, v, intermediates):
         shapes = tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (q, k, v))
-        return jax.ffi.ffi_call("tt.sdpa_bw", shapes)(g, out, q, k, v, intermediates, mask_type=1)
+        return jax.ffi.ffi_call("tt.sdpa_bw", shapes)(g, out, q, k, v, intermediates, **attributes)
 
     tq, tk, tv, tg = _device(q, k, v, g)
     out, intermediates = jax.jit(forward, compiler_options=options)(tq, tk, tv)
@@ -160,7 +167,8 @@ def test_qwen3_5_attention():
 
 
 def test_head_dim_padded_to_tiles():
-    # TorchTitan's Llama 3 debug model: heads of 16 dimensions, which the kernels take zero-padded to 32.
+    # TorchTitan's Llama 3 debug model: heads of 16 dimensions, which the kernels take zero-padded to 32, with
+    # the scale of 16.
     q, k, v, g = _inputs(3, batch=2, kv_heads=2, dim=16)
     out_want, lse_want, dq_want, dk_want, dv_want = _reference(q, k, v, g)
     splash_fn, splash_bwd_fn = torchtitan_tpu_kernels._make_splash_attention_fn(
