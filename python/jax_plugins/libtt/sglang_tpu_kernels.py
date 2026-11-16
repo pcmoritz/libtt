@@ -510,18 +510,22 @@ def patch_block_draft_worker(module):
 def patch_all_gather_via_all_reduce(module):
     """Keeps tensor-parallel all-gathers native in compiled graphs.
 
-    SGLang-TorchTPU rebuilds GroupCoordinator.all_gather_into_tensor from an
-    all-reduce over a zero-padded [world, *block] buffer while Dynamo traces,
-    to work around tpu7x's compiled all-gather returning wrong blocks from
-    cross-chip peers (sgl-project/sglang-torchtpu#1700). libtt's compiled
-    all-gather is correct, and the all-reduce moves about twice its bytes:
-    Qwen3-8B on four chips decoded 103.8 instead of 112.0 tokens/s.
+    SGLang-TorchTPU rebuilds all-gathers from an all-reduce over a zero-padded
+    [world, *block] buffer while Dynamo traces, to work around tpu7x's compiled
+    all-gather returning wrong blocks from cross-chip peers
+    (sgl-project/sglang-torchtpu#1700): every GroupCoordinator
+    all_gather_into_tensor, through all_gather_into_tensor_around, and since
+    sgl-project/sglang-torchtpu#2041 only the logits gathers, whose hooks ask
+    _use_all_reduce_gather. libtt's compiled all-gather is correct, and the
+    all-reduce moves about twice its bytes: Qwen3-8B on four chips decoded
+    103.8 instead of 112.0 tokens/s.
     """
 
     def all_gather_into_tensor_around(original, group, output, input):  # noqa: A002
         return original(group, output, input)
 
     module.all_gather_into_tensor_around = all_gather_into_tensor_around
+    module._use_all_reduce_gather = lambda group: False
 
 
 def _fp8_scales(w13, w13_scale, w2_scale):
