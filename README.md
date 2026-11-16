@@ -90,7 +90,7 @@ bazel test //tests:jax_test_suite \
   --test_arg=-v
 ```
 
-Baseline (November 2026, main e5a72df9 with #547): **1663 failed, 26110 passed, 6737 skipped.**
+Baseline (November 2026, v0.2.1): **1663 failed, 26110 passed, 6737 skipped.**
 
 ## torch_tpu tests
 
@@ -126,10 +126,10 @@ Bazel gives tests a fresh home directory, so tt-metal rebuilds its kernel cache
 in every run. Add `--test_env=TT_METAL_CACHE=$HOME/.cache` to reuse
 `~/.cache/tt-metal-cache` instead.
 
-Baseline (October 2026, f7d1c3c, one Blackhole p150a): **107 of 193 files
-passed; 7165 passed, 1831 failed, 14 errors, 240 skipped, 13097 subtests
-passed**, in about an hour. Most failures are multi-device, TPU-only or
-dynamic-shape tests.
+Baseline (November 2026, v0.2.1, one Blackhole p150a): **115 of 200 files
+passed; 7324 passed, 1677 failed, 14 errors, 242 skipped, 13099 subtests
+passed**, in about an hour and a half. Most failures are multi-device,
+TPU-only or dynamic-shape tests.
 
 ## libtt tests
 
