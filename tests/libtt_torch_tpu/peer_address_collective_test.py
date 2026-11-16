@@ -104,6 +104,26 @@ def worker(rank):
     want = 2 * torch.cat([tile - rank, tile - rank + 1])[32 * rank : 32 * (rank + 1)]
     assert torch.equal(scattered.cpu(), want), "repeated one-tile reduce-scatter"
 
+    # An all-to-all, as DTensor redistributes a tensor sharded on rows to one sharded on columns (TorchTitan's save
+    # in Hugging Face's format fuses Qwen3.5's q, k and v projections that way): tt-mlir sends the slices with
+    # point-to-point transfers, which take the receiver's buffer address in their handshake.
+    rows = (torch.arange(64 * 256, dtype=torch.float32).reshape(64, 256) % 509 + 1000 * rank).to(torch.bfloat16)
+    exchanged = torch.empty(64, 256, dtype=torch.bfloat16, device="tpu")
+    dist.all_to_all_single(exchanged, rows.to("tpu"))
+    sent = [(torch.arange(64 * 256, dtype=torch.float32).reshape(64, 256) % 509 + 1000 * r).to(torch.bfloat16)
+            for r in range(2)]
+    want = torch.cat([sent[r][32 * rank : 32 * (rank + 1)] for r in range(2)])
+    assert torch.equal(exchanged.cpu(), want), "all-to-all"
+
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    mesh = init_device_mesh("tpu", (2,))
+    full = (torch.arange(256 * 512, dtype=torch.float32).reshape(256, 512) % 251).to(torch.bfloat16)
+    by_rows = DTensor.from_local(full[128 * rank : 128 * (rank + 1)].to("tpu"), mesh, [Shard(0)])
+    by_columns = by_rows.redistribute(mesh, [Shard(1)])
+    assert torch.equal(by_columns.to_local().cpu(), full[:, 256 * rank : 256 * (rank + 1)]), "Shard(0) -> Shard(1)"
+
     # Object collectives send pickled bytes (UINT8), as distributed checkpoints do.
     objects = [None, None]
     dist.all_gather_object(objects, {"rank": rank, "text": "x" * (100 + rank)})

@@ -310,10 +310,10 @@ diff --git ttnn/cpp/ttnn/operations/ccl/ccl_common.hpp ttnn/cpp/ttnn/operations/
  bool is_axis_wrap_wired(const tt::tt_metal::distributed::MeshDevice& mesh_device, uint32_t axis);
  
 +// Whether this process drives every device of the mesh. Devices that other processes drive need not hold a buffer
-+// at the address it has here, so collectives with them must trade addresses with their peers: the unicast all-gather
-+// and the line reduce-scatter do, in a handshake before they write (the direct all-reduce writes into its program's
-+// own CB, at one address on every device). The others write to their peers at their own addresses and refuse meshes
-+// that are not fully local.
++// at the address it has here, so collectives with them must trade addresses with their peers: the unicast all-gather,
++// the line reduce-scatter and point-to-point do, in a handshake before they write (the direct all-reduce writes into
++// its program's own CB, at one address on every device). The others write to their peers at their own addresses and
++// refuse meshes that are not fully local.
 +bool is_fully_local(const tt::tt_metal::distributed::MeshDevice& mesh_device);
 +
  // Where to allocate a GlobalSemaphore whose value is CARRIED across invocations (a barrier or arrival
@@ -690,3 +690,81 @@ diff --git ttnn/cpp/ttnn/operations/experimental/ccl/reduce_scatter_minimal_dire
  
      validate_direct_tensors_every_invocation(args, tensor_args);
  
+diff --git ttnn/cpp/ttnn/operations/point_to_point/device/host/point_to_point_device_op.cpp ttnn/cpp/ttnn/operations/point_to_point/device/host/point_to_point_device_op.cpp
+--- ttnn/cpp/ttnn/operations/point_to_point/device/host/point_to_point_device_op.cpp
++++ ttnn/cpp/ttnn/operations/point_to_point/device/host/point_to_point_device_op.cpp
+@@ -225,7 +225,10 @@ tt::tt_metal::WorkloadDescriptor PointToPointOp::SendReceive::create_workload_de
+     // so the framework keeps it alive for the cached workload's lifetime.
+     auto sd_id = mesh_device->get_sub_device_ids().at(0);
+     auto available_cores = mesh_device->worker_cores(tt::tt_metal::HalProgrammableCoreType::TENSIX, sd_id);
+-    auto semaphore = ttnn::global_semaphore::create_global_semaphore(mesh_device, available_cores, 0);
++    // L1_SMALL: only collectives allocate there, and every process runs them in the same order, so the semaphore
++    // sits at one address on both endpoints also when they belong to different processes.
++    auto semaphore = ttnn::global_semaphore::create_global_semaphore(
++        mesh_device, available_cores, 0, ::ttnn::ccl::prefer_l1_small_buffer_type(*mesh_device));
+     log_debug(tt::LogOp, "Semaphores allocated and waiting for all devices to be ready in p2p op");
+     tt::tt_metal::distributed::Synchronize(*mesh_device, std::nullopt, {});
+     log_debug(tt::LogOp, "Synchronize devices in p2p op done");
+diff --git ttnn/cpp/ttnn/operations/point_to_point/device/kernels/dataflow/reader_receive.cpp ttnn/cpp/ttnn/operations/point_to_point/device/kernels/dataflow/reader_receive.cpp
+--- ttnn/cpp/ttnn/operations/point_to_point/device/kernels/dataflow/reader_receive.cpp
++++ ttnn/cpp/ttnn/operations/point_to_point/device/kernels/dataflow/reader_receive.cpp
+@@ -45,9 +45,12 @@ void kernel_main() {
+ 
+     const uint64_t sender_sem_noc_addr = get_noc_addr(sender_semaphore_addr);
+ 
++    // Tell the sender we're ready by adding our intermediate buffer's address to its zeroed semaphore: it writes
++    // there. A device of another process need not hold the buffer at the sender's own address.
+     auto* sem_header_ptr = reinterpret_cast<volatile PACKET_HEADER_TYPE*>(sem_header_addr);
+     fabric_set_unicast_route<false>((tt::tt_fabric::LowLatencyPacketHeader*)sem_header_ptr, sender_num_hops);
+-    sem_header_ptr->to_noc_unicast_atomic_inc(tt::tt_fabric::NocUnicastAtomicIncCommandHeader{sender_sem_noc_addr, 1});
++    sem_header_ptr->to_noc_unicast_atomic_inc(
++        tt::tt_fabric::NocUnicastAtomicIncCommandHeader{sender_sem_noc_addr, intermediate_base_addr});
+ 
+     fabric_connection.open_finish();
+     auto& connection_direction =
+diff --git ttnn/cpp/ttnn/operations/point_to_point/device/kernels/dataflow/writer_send.cpp ttnn/cpp/ttnn/operations/point_to_point/device/kernels/dataflow/writer_send.cpp
+--- ttnn/cpp/ttnn/operations/point_to_point/device/kernels/dataflow/writer_send.cpp
++++ ttnn/cpp/ttnn/operations/point_to_point/device/kernels/dataflow/writer_send.cpp
+@@ -20,7 +20,9 @@ void kernel_main() {
+ 
+     constexpr size_t packet_header_size_bytes = sizeof(PACKET_HEADER_TYPE);
+ 
+-    const uint32_t receiver_base_address = get_arg_val<uint32_t>(0);
++    // Our own intermediate's address, which the receiver's equals only within one process: we write to the address
++    // the receiver sends with its ready signal.
++    [[maybe_unused]] const uint32_t own_intermediate_address = get_arg_val<uint32_t>(0);
+     const auto page_idx_start = get_arg_val<uint32_t>(1);
+     const auto page_idx_end = get_arg_val<uint32_t>(2);
+     const uint8_t dst_num_hops = get_arg_val<uint32_t>(3);
+@@ -49,10 +51,6 @@ void kernel_main() {
+     auto* packet_header_ptr = reinterpret_cast<volatile PACKET_HEADER_TYPE*>(packet_header_addr);
+     fabric_set_unicast_route<false>((tt::tt_fabric::LowLatencyPacketHeader*)packet_header_ptr, dst_num_hops);
+ 
+-    // Third argument page_size from runtime args overrides TensorAccessorArgs::AlignedPageSize, which may be stale on
+-    // program cache hits.
+-    const auto dst_buffer = TensorAccessor(dst_buffer_args, receiver_base_address, payload_size_bytes);
+-
+     // working memory to hold coalesced packet
+     cb_reserve_back(packet_cb_id, 1);
+     const uint32_t packet_base_addr = get_write_ptr(packet_cb_id);
+@@ -62,13 +60,18 @@ void kernel_main() {
+     uint32_t curr_pages_per_packet = std::min(max_pages_per_packet, page_idx_end - page_idx_start);
+     uint32_t packet_idx = page_idx_start / max_pages_per_packet;
+ 
+-    // wait for receiver to signal it is ready
++    // wait for receiver to signal it is ready: it adds its intermediate buffer's address to our zeroed semaphore
+     auto local_semaphore_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(receive_semaphore_addr);
+-    noc_semaphore_wait(local_semaphore_ptr, 1);
++    noc_semaphore_wait_min(local_semaphore_ptr, 1);
++    const uint32_t receiver_base_address = *local_semaphore_ptr;
+     // clean up semaphore – needs to be done before the sender side semaphore increment if we're reusing the semaphore
+     // in subsequent program cache hits
+     noc_semaphore_set(local_semaphore_ptr, 0);
+ 
++    // Third argument page_size from runtime args overrides TensorAccessorArgs::AlignedPageSize, which may be stale on
++    // program cache hits.
++    const auto dst_buffer = TensorAccessor(dst_buffer_args, receiver_base_address, payload_size_bytes);
++
+     fabric_connection.open_finish();
+     auto& connection_direction =
+         tt::point_to_point::common::connection_direction_collection(dst_is_forward, fabric_connection);
