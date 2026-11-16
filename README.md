@@ -90,7 +90,7 @@ bazel test //tests:jax_test_suite \
   --test_arg=-v
 ```
 
-Baseline (October 2026, main 4a6c9ec6): **1904 failed, 25868 passed, 6738 skipped.**
+Baseline (November 2026, main e5a72df9 with #547): **1663 failed, 26110 passed, 6737 skipped.**
 
 ## torch_tpu tests
 
