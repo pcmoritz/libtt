@@ -4,35 +4,24 @@
 #ifndef LIBTT_TT_MLIR_INCLUDE_TTMLIR_DIALECT_TTNN_TRANSFORMS_FUSING_SPLITQKVNORMROPEDECODEFUSING_H
 #define LIBTT_TT_MLIR_INCLUDE_TTMLIR_DIALECT_TTNN_TRANSFORMS_FUSING_SPLITQKVNORMROPEDECODEFUSING_H
 
+#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
+#include "ttmlir/Dialect/TTIR/Transforms/Fusing/SplitQKVNormRopeDecodeFusing.h"
 #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
 
-#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Builders.h"
 
 namespace mlir::tt::ttnn::fusing {
 
-// Fuses a decode step's attention prologue as PyTorch models trace it
-// (SGLang-TorchTPU's Qwen3 and Qwen3.8, whose KV cache holds k and v side by
-// side):
-//
-//   qkv [B, (s Hq + 2 Hkv) D] -> q heads: rms_norm -> rotary_embedding (->
-//                                pad to the cache's width, for prefill)
-//                             -> k heads: rms_norm -> rotary_embedding -+
-//                             -> v heads -------------------------------+->
-//                                concat [B, Hkv, 2 D] -> [1, B, Hkv, 2 D]
-//
-// where the heads are reshapes and slices of the projection, each q head
-// followed by its gate head in gated attention (s = 2), and a partial rotary
-// rotates the first R dims of the normed heads and concatenates the rest
-// after them, into one split_qkv_norm_rope_decode (one program instead of
-// fifteen or more). It anchors on the concat of k and v.
-class SplitQKVNormRopeDecodeFusing : public mlir::OpRewritePattern<ConcatOp> {
-public:
-  using OpRewritePattern<ConcatOp>::OpRewritePattern;
+// The composite of a decode step's attention prologue, which the TTIR fusion
+// ttir::fusing::SplitQKVNormRopeDecodeFusing makes.
+using ttir::fusing::kSplitQKVNormRopeDecode;
 
-  mlir::LogicalResult
-  matchAndRewrite(ConcatOp concat,
-                  mlir::PatternRewriter &rewriter) const override;
-};
+// The split_qkv_norm_rope_decode of a kSplitQKVNormRopeDecode composite, if
+// the layouts TTNNLayout chose for its operands and results suit the kernel;
+// otherwise nullptr, and TTNNResolveComposites inlines the composite's
+// decomposition.
+Operation *buildSplitQKVNormRopeDecode(ttcore::CompositeOp composite,
+                                       OpBuilder &builder);
 
 } // namespace mlir::tt::ttnn::fusing
 
