@@ -12,13 +12,21 @@
 // The compute kernel then packs this core's row maxima: row m's maximum in
 // columns 0-15 of row m of an FP32 tile's left faces. Every core writes those
 // rows (stride * 64 bytes, or both left faces for a stride of 32) into its slot
-// of every core's gather buffer, which every core allocates alike, so the
-// remote slot is at this core's own address. Unicast: concurrent multicasts
+// of a gather buffer, which every core allocates alike, so a remote slot is at
+// this core's own address.
+//
+// Up to 8 rows, the slots go to every core, unicast: concurrent multicasts
 // from all the cores serialize (16 cores: 22 us for the data, as much again
 // for multicast semaphore increments, against about 1 us so). Once its data
 // has landed everywhere, a core counts itself on the other cores' semaphores,
 // and when all others have counted themselves here, the gather buffer goes to
-// the compute kernel.
+// the compute kernel, which makes the divisor.
+//
+// With `broadcast` (9 to 32 rows, whose slots are larger), the slots go to the
+// first core only, whose compute kernel makes the divisor tile; its reader then
+// multicasts the tile into every core's divisor buffer and sets their
+// semaphores. Every core sending to every core grew with the square of the
+// cores: 16x12288 took 29.5 us on 32 cores, and more cores were slower.
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -50,14 +58,17 @@ void kernel_main() {
     constexpr uint32_t y0 = get_arg(args::y0);
     constexpr uint32_t x1 = get_arg(args::x1);
     constexpr uint32_t y1 = get_arg(args::y1);
+    constexpr bool broadcast = get_arg(args::broadcast) != 0;
     constexpr uint32_t row_bytes = face_rows * elem_bytes;
     constexpr uint32_t face_bytes = face_elems * elem_bytes;
     constexpr uint32_t tile_bytes = 4 * face_bytes;
+    constexpr uint32_t f32_tile_bytes = 4096;
 
     DataflowBuffer in_dfb(dfb::in);
     DataflowBuffer part_dfb(dfb::part);
     DataflowBuffer gather_dfb(dfb::gather);
     Semaphore done(sem::done);
+    Semaphore ready(sem::ready);
     const auto input = TensorAccessor(tensor::input);
     Noc noc;
 
@@ -88,39 +99,91 @@ void kernel_main() {
     noc.async_read_barrier();
     in_dfb.push_back(num_dense);
 
-    // This core's row maxima into its slot on every core.
-    gather_dfb.reserve_back(gather_tiles);
     const uint32_t slot = gather_dfb.get_write_ptr() + core * slot_bytes;
     // Rows 0-15 of the left faces 0 and 2: face 2 holds rows 16-31.
     constexpr uint32_t pieces = stride <= face_rows ? 1 : 2;
     constexpr uint32_t piece_bytes = (stride <= face_rows ? stride : face_rows) * 64;
-    part_dfb.wait_front(1);
-    for (uint32_t y = y0; y <= y1; ++y) {
-        for (uint32_t x = x0; x <= x1; ++x) {
-            for (uint32_t p = 0; p < pieces; ++p) {
-                noc.async_write(
-                    part_dfb,
-                    UnicastEndpoint{},
-                    piece_bytes,
-                    {.offset_bytes = p * 2 * face_elems * 4},
-                    {.noc_x = x, .noc_y = y, .addr = slot + p * piece_bytes});
-            }
-        }
-    }
-    // Every copy acknowledged before any core is told.
-    noc.async_write_barrier();
-    part_dfb.pop_front(1);
-    if constexpr (cores > 1) {
+    if constexpr (!broadcast) {
+        // This core's row maxima into its slot on every core.
+        gather_dfb.reserve_back(gather_tiles);
+        part_dfb.wait_front(1);
         for (uint32_t y = y0; y <= y1; ++y) {
             for (uint32_t x = x0; x <= x1; ++x) {
-                if (x != self_x || y != self_y) {
-                    done.up(noc, x, y, 1);
+                for (uint32_t p = 0; p < pieces; ++p) {
+                    noc.async_write(
+                        part_dfb,
+                        UnicastEndpoint{},
+                        piece_bytes,
+                        {.offset_bytes = p * 2 * face_elems * 4},
+                        {.noc_x = x, .noc_y = y, .addr = slot + p * piece_bytes});
                 }
             }
         }
-        done.wait(cores - 1);
-        done.set(0);
+        // Every copy acknowledged before any core is told.
+        noc.async_write_barrier();
+        part_dfb.pop_front(1);
+        if constexpr (cores > 1) {
+            for (uint32_t y = y0; y <= y1; ++y) {
+                for (uint32_t x = x0; x <= x1; ++x) {
+                    if (x != self_x || y != self_y) {
+                        done.up(noc, x, y, 1);
+                    }
+                }
+            }
+            done.wait(cores - 1);
+            done.set(0);
+        }
+        gather_dfb.push_back(gather_tiles);
+        noc_async_atomic_barrier();
+        return;
     }
-    gather_dfb.push_back(gather_tiles);
-    noc_async_atomic_barrier();
+
+    // This core's row maxima into its slot of the first core's gather buffer.
+    part_dfb.wait_front(1);
+    for (uint32_t p = 0; p < pieces; ++p) {
+        noc.async_write(
+            part_dfb,
+            UnicastEndpoint{},
+            piece_bytes,
+            {.offset_bytes = p * 2 * face_elems * 4},
+            {.noc_x = x0, .noc_y = y0, .addr = slot + p * piece_bytes});
+    }
+    // The copy acknowledged before the first core is told.
+    noc.async_write_barrier();
+    part_dfb.pop_front(1);
+
+    DataflowBuffer div_in_dfb(dfb::div_in);
+    div_in_dfb.reserve_back(1);
+    if (core == 0) {
+        gather_dfb.reserve_back(gather_tiles);
+        if constexpr (cores > 1) {
+            done.wait(cores - 1);
+            done.set(0);
+        }
+        gather_dfb.push_back(gather_tiles);
+
+        DataflowBuffer div_out_dfb(dfb::div_out);
+        div_out_dfb.wait_front(1);
+        const uint32_t source = div_out_dfb.get_read_ptr();
+        const uint32_t target = div_in_dfb.get_write_ptr();
+        noc_async_write(source, get_noc_addr(self_x, self_y, target), f32_tile_bytes);
+        if constexpr (cores > 1) {
+            noc_async_write_multicast(source, get_noc_multicast_addr(x0, y0, x1, y1, target), f32_tile_bytes, cores - 1);
+        }
+        // The divisor acknowledged everywhere before any core is told.
+        noc_async_write_barrier();
+        div_out_dfb.pop_front(1);
+        if constexpr (cores > 1) {
+            ready.set(1);
+            ready.set_multicast(noc, x0, y0, x1, y1, cores - 1);
+            noc_async_write_barrier();
+            ready.set(0);
+        }
+    } else {
+        done.up(noc, x0, y0, 1);
+        ready.wait(1);
+        ready.set(0);
+        noc_async_atomic_barrier();
+    }
+    div_in_dfb.push_back(1);
 }

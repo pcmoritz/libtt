@@ -23,10 +23,12 @@ QuantizeRowsPlan quantize_rows_plan(const Tensor& input, uint32_t grid_x, uint32
     plan.stride = plan.rows <= 4 ? 4 : plan.rows <= 8 ? 8 : plan.rows <= 16 ? 16 : 32;
     plan.pack = TILE_HEIGHT / plan.stride;
     plan.dense = (plan.tiles + plan.pack - 1) / plan.pack;
-    // Every core sends its maxima to every core, stride * 64 bytes each, so past
-    // a point more cores cost more than the work they share (gtest timings:
-    // 1x12288 13.4 us on 32 cores, 10.8 on 48; 16x4096 14.5 on 32, 17.1 on 48).
-    const uint32_t max_cores = plan.stride <= 8 ? 48 : 32;
+    // Up to 8 rows, every core sends its maxima to every core, stride * 64 bytes
+    // each, so past a point more cores cost more than the work they share (gtest
+    // timings: 1x12288 13.4 us on 32 cores, 10.8 on 48). Larger strides gather
+    // the maxima on one core and broadcast the divisor, which takes more cores
+    // well (16x12288: 26.5 us on 32 cores, 19.7 on 64, 19.6 on 96).
+    const uint32_t max_cores = plan.stride <= 8 ? 48 : 64;
     // The fewest dense tiles per core that this many cores allow, then the
     // smallest rectangle, widest first, with a core for every share: 17 dense
     // tiles take 18 cores with one idle rather than 16 with one doing two.

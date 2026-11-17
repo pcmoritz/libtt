@@ -71,7 +71,10 @@ ttnn::device_operation::ProgramArtifacts QuantizeRowsProgramFactory::create_prog
     const DFBSpecName GATHER_DFB{"gather"};
     const DFBSpecName OUT_DFB{"out"};
     const DFBSpecName SCALE_DFB{"scale"};
+    const DFBSpecName DIV_OUT_DFB{"div_out"};
+    const DFBSpecName DIV_IN_DFB{"div_in"};
     const SemaphoreSpecName DONE_SEM{"done"};
+    const SemaphoreSpecName READY_SEM{"ready"};
     const TensorParamName INPUT{"input"};
     const TensorParamName Q{"q"};
     const TensorParamName SCALE{"scale"};
@@ -93,9 +96,20 @@ ttnn::device_operation::ProgramArtifacts QuantizeRowsProgramFactory::create_prog
          .entry_size = f32_tile_bytes,
          .num_entries = 1,
          .data_format_metadata = tt::DataFormat::Float32},
+        // The divisor tile: packed by the first core, then sent to every core.
+        {.unique_id = DIV_OUT_DFB,
+         .entry_size = f32_tile_bytes,
+         .num_entries = 1,
+         .data_format_metadata = tt::DataFormat::Float32},
+        {.unique_id = DIV_IN_DFB,
+         .entry_size = f32_tile_bytes,
+         .num_entries = 1,
+         .data_format_metadata = tt::DataFormat::Float32},
     };
-    // Every core counts the other cores whose row maxima have arrived.
-    Group<SemaphoreSpec> semaphores = {{.unique_id = DONE_SEM, .target_nodes = all_cores}};
+    // The first core counts the cores whose row maxima have arrived; the others
+    // wait for the divisor.
+    Group<SemaphoreSpec> semaphores = {
+        {.unique_id = DONE_SEM, .target_nodes = all_cores}, {.unique_id = READY_SEM, .target_nodes = all_cores}};
     const std::vector<std::string> runtime_arg_names = {
         "first_dense", "num_dense", "last_count", "core", "self_x", "self_y", "writes_scale"};
     const std::string kernel_dir = "ttnn/cpp/ttnn/operations/experimental/quantize_rows/device/kernels/";
@@ -109,14 +123,21 @@ ttnn::device_operation::ProgramArtifacts QuantizeRowsProgramFactory::create_prog
                     .dfb_spec_name = PART_DFB, .accessor_name = "part", .endpoint_type = DFBEndpointType::CONSUMER},
                 DFBBinding{
                     .dfb_spec_name = GATHER_DFB, .accessor_name = "gather", .endpoint_type = DFBEndpointType::PRODUCER},
+                DFBBinding{
+                    .dfb_spec_name = DIV_OUT_DFB, .accessor_name = "div_out", .endpoint_type = DFBEndpointType::CONSUMER},
+                DFBBinding{
+                    .dfb_spec_name = DIV_IN_DFB, .accessor_name = "div_in", .endpoint_type = DFBEndpointType::PRODUCER},
             },
-        .semaphore_bindings = {SemaphoreBinding{.semaphore_spec_name = DONE_SEM, .accessor_name = "done"}},
+        .semaphore_bindings =
+            {SemaphoreBinding{.semaphore_spec_name = DONE_SEM, .accessor_name = "done"},
+             SemaphoreBinding{.semaphore_spec_name = READY_SEM, .accessor_name = "ready"}},
         .tensor_bindings = {TensorBinding{.tensor_parameter_name = INPUT, .accessor_name = "input"}},
         .compile_time_args =
             {{"stride", plan.stride},
              {"pack", plan.pack},
              {"elem_bytes", in_tile_bytes / (TILE_HEIGHT * TILE_WIDTH)},
              {"cores", num_cores},
+             {"broadcast", plan.broadcast() ? 1u : 0u},
              {"slot_bytes", plan.slot_bytes()},
              {"gather_tiles", plan.gather_tiles()},
              {"x0", static_cast<uint32_t>(noc_start.x)},
@@ -154,9 +175,12 @@ ttnn::device_operation::ProgramArtifacts QuantizeRowsProgramFactory::create_prog
     // FP32 tiles go straight to DST, unrounded; BF16 ones widen exactly.
     if (in_format == tt::DataFormat::Float32) {
         compute_hw.unpack_modes = {
-            {GATHER_DFB, tt::tt_metal::UnpackMode::UnpackToDest}, {IN_DFB, tt::tt_metal::UnpackMode::UnpackToDest}};
+            {GATHER_DFB, tt::tt_metal::UnpackMode::UnpackToDest},
+            {DIV_IN_DFB, tt::tt_metal::UnpackMode::UnpackToDest},
+            {IN_DFB, tt::tt_metal::UnpackMode::UnpackToDest}};
     } else {
-        compute_hw.unpack_modes = {{GATHER_DFB, tt::tt_metal::UnpackMode::UnpackToDest}};
+        compute_hw.unpack_modes = {
+            {GATHER_DFB, tt::tt_metal::UnpackMode::UnpackToDest}, {DIV_IN_DFB, tt::tt_metal::UnpackMode::UnpackToDest}};
     }
     KernelSpec compute{
         .unique_id = COMPUTE,
@@ -172,12 +196,17 @@ ttnn::device_operation::ProgramArtifacts QuantizeRowsProgramFactory::create_prog
                 DFBBinding{.dfb_spec_name = OUT_DFB, .accessor_name = "out", .endpoint_type = DFBEndpointType::PRODUCER},
                 DFBBinding{
                     .dfb_spec_name = SCALE_DFB, .accessor_name = "scale", .endpoint_type = DFBEndpointType::PRODUCER},
+                DFBBinding{
+                    .dfb_spec_name = DIV_OUT_DFB, .accessor_name = "div_out", .endpoint_type = DFBEndpointType::PRODUCER},
+                DFBBinding{
+                    .dfb_spec_name = DIV_IN_DFB, .accessor_name = "div_in", .endpoint_type = DFBEndpointType::CONSUMER},
             },
         .compile_time_args =
             {{"stride", plan.stride},
              {"rows", plan.rows},
              {"pack", plan.pack},
              {"cores", num_cores},
+             {"broadcast", plan.broadcast() ? 1u : 0u},
              {"gather_tiles", plan.gather_tiles()},
              {"chunk_tiles", chunk_tiles},
              {"e5m2", e5m2 ? 1u : 0u},

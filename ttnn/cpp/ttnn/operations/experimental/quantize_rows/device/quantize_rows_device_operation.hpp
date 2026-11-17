@@ -37,9 +37,11 @@ struct QuantizeRowsPlan {
     uint32_t width = 0;   // the cores, a width x height rectangle
     uint32_t height = 0;
     uint32_t cores() const { return width * height; }
-    // Each core's row maxima go to every core: rows 0 .. stride - 1 of an FP32
+    // Each core's row maxima go to every core, or with broadcast() to the first
+    // core, which sends every core the divisor: rows 0 .. stride - 1 of an FP32
     // tile's left faces, in `slot_bytes` at slot (core) of the gather buffer.
     uint32_t slot_bytes() const { return stride * 64; }
+    bool broadcast() const { return stride >= 16; }
     uint32_t gather_tiles() const { return (cores() * slot_bytes() + 4095) / 4096; }
 };
 

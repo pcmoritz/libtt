@@ -217,8 +217,9 @@ TEST_F(QuantizeRowsTest, MatchesTtnnOpsForEveryStride) {
 }
 
 TEST_F(QuantizeRowsTest, CoreCounts) {
-    // A core per dense tile, up to 48 cores for 4- and 8-row strides and 32 for
-    // 16 and 32: one core, one NoC row, several NoC rows, dense tiles split
+    // A core per dense tile, up to 48 cores for 4- and 8-row strides and 64 for
+    // 16 and 32 (whose first core gathers the maxima and broadcasts the
+    // divisor): one core, one NoC row, several NoC rows, dense tiles split
     // unevenly, idle cores (13 and 17 dense tiles: a rectangle of 14 or 18),
     // and several three-tile chunks per core.
     for (uint32_t rows : {1u, 6u, 16u, 32u}) {

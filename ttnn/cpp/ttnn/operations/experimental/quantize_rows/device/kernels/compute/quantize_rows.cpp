@@ -8,10 +8,13 @@
 // tiles fold into one accumulator tile, which goes to the reader.
 //
 // Phase 2: the divisor from every core's maxima in the gather buffer; the
-// dense tiles are then divided by it and converted to float8, chunk_tiles at
-// a time. DST holds the divisor and three dense tiles, and the divisor is
-// made again for every chunk. The first core also packs the divisor tile as
-// the scale: row m holds scale[m] in every column.
+// dense tiles are then divided by it and converted to float8, chunk_tiles at a
+// time. DST holds the divisor and three dense tiles. Up to 8 rows, every core
+// gathers the maxima and makes the divisor again for every chunk. With
+// `broadcast`, the first core makes it once and packs it for its reader, which
+// sends it to every core, and every core unpacks it exactly from FP32 for every
+// chunk. The first core also packs the divisor tile as the scale: row m holds
+// scale[m] in every column.
 #include <cstdint>
 
 #include "api/compute/compute_kernel_hw_startup.h"
@@ -42,6 +45,7 @@ void kernel_main() {
     constexpr uint32_t e5m2 = get_arg(args::e5m2);
     constexpr uint32_t fp8_max_bits = get_arg(args::fp8_max_bits);
     constexpr uint32_t min_scale_bits = get_arg(args::min_scale_bits);
+    constexpr bool broadcast = get_arg(args::broadcast) != 0;
     constexpr uint32_t groups = stride / 4;
     static_assert(chunk_tiles <= 3, "DST holds the divisor and three dense tiles");
     constexpr uint32_t total_bands = cores * groups;
@@ -51,6 +55,8 @@ void kernel_main() {
     DataflowBuffer gather_dfb(dfb::gather);
     DataflowBuffer out_dfb(dfb::out);
     DataflowBuffer scale_dfb(dfb::scale);
+    DataflowBuffer div_out_dfb(dfb::div_out);
+    DataflowBuffer div_in_dfb(dfb::div_in);
 
     compute_kernel_hw_startup(dfb::in, dfb::in, dfb::part);
     copy_init(dfb::in);
@@ -73,24 +79,58 @@ void kernel_main() {
     tile_regs_release();
     part_dfb.push_back(1);
 
-    // Phase 2: the divisor from every core's maxima, then the quotients.
-    gather_dfb.wait_front(gather_tiles);
+    // Phase 2: with `broadcast`, the first core makes the divisor.
+    if constexpr (broadcast) {
+        if (writes_scale) {
+            gather_dfb.wait_front(gather_tiles);
+            tile_regs_acquire();
+            reconfig_data_format_srca(dfb::in, dfb::gather);
+            qr::make_divisor<groups, dst_d, dst_t, dst_c>(
+                dfb::gather, gather_tiles, total_bands, fp8_max_bits, min_scale_bits);
+            reconfig_data_format_srca(dfb::gather, dfb::in);
+            tile_regs_commit();
+            tile_regs_wait();
+            div_out_dfb.reserve_back(1);
+            scale_dfb.reserve_back(1);
+            pack_reconfig_data_format(dfb::scale);
+            pack_tile(dst_d, dfb::div_out);
+            pack_tile(dst_d, dfb::scale);
+            div_out_dfb.push_back(1);
+            scale_dfb.push_back(1);
+            tile_regs_release();
+            gather_dfb.pop_front(gather_tiles);
+        }
+        div_in_dfb.wait_front(1);
+    } else {
+        gather_dfb.wait_front(gather_tiles);
+    }
+
+    // Then the quotients.
     for (uint32_t first = 0; first < num_dense; first += chunk_tiles) {
         const uint32_t n = num_dense - first < chunk_tiles ? num_dense - first : chunk_tiles;
         tile_regs_acquire();
-        reconfig_data_format_srca(dfb::in, dfb::gather);
-        qr::make_divisor<groups, dst_d, dst_t, dst_c>(
-            dfb::gather, gather_tiles, total_bands, fp8_max_bits, min_scale_bits);
-        reconfig_data_format_srca(dfb::gather, dfb::in);
+        if constexpr (broadcast) {
+            reconfig_data_format_srca(dfb::in, dfb::div_in);
+            copy_init(dfb::div_in);
+            copy_tile(dfb::div_in, 0, dst_d);
+            reconfig_data_format_srca(dfb::div_in, dfb::in);
+        } else {
+            reconfig_data_format_srca(dfb::in, dfb::gather);
+            qr::make_divisor<groups, dst_d, dst_t, dst_c>(
+                dfb::gather, gather_tiles, total_bands, fp8_max_bits, min_scale_bits);
+            reconfig_data_format_srca(dfb::gather, dfb::in);
+        }
         qr::quantize_tiles<e5m2 != 0, dst_d, dst_x0, 32, rows>(dfb::in, first, n);
         tile_regs_commit();
 
         tile_regs_wait();
-        if (first == 0 && writes_scale) {
-            scale_dfb.reserve_back(1);
-            pack_reconfig_data_format(dfb::scale);
-            pack_tile(dst_d, dfb::scale);
-            scale_dfb.push_back(1);
+        if constexpr (!broadcast) {
+            if (first == 0 && writes_scale) {
+                scale_dfb.reserve_back(1);
+                pack_reconfig_data_format(dfb::scale);
+                pack_tile(dst_d, dfb::scale);
+                scale_dfb.push_back(1);
+            }
         }
         out_dfb.reserve_back(n);
         pack_reconfig_data_format(dfb::out);
@@ -100,6 +140,10 @@ void kernel_main() {
         out_dfb.push_back(n);
         tile_regs_release();
     }
-    gather_dfb.pop_front(gather_tiles);
+    if constexpr (broadcast) {
+        div_in_dfb.pop_front(1);
+    } else {
+        gather_dfb.pop_front(gather_tiles);
+    }
     in_dfb.pop_front(num_dense);
 }
