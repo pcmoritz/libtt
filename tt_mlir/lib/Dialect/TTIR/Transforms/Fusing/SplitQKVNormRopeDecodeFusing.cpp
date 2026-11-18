@@ -8,7 +8,6 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/IRMapping.h"
-#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -162,15 +161,19 @@ RMSNormOp normOf(ttcore::CompositeOp rope, int64_t headDim) {
 }
 
 // Whether `parts`, side by side, are the heads of `norm` with the dims `rope`
-// rotates rotated: its result, then the rest of the heads.
+// rotates rotated: its result, then the rest of the heads. Each part has one
+// head per row, so that concatenating them keeps each head's dims together:
+// all heads' rotated dims, then all heads' others, would mix the heads.
 bool rotates(ttcore::CompositeOp rope, RMSNormOp norm, ValueRange parts,
              int64_t headDim) {
   const int64_t rotated = shapeOf(rotaryInput(rope)).back();
   return normOf(rope, headDim) == norm && !parts.empty() &&
+         shapeOf(parts[0]).back() == rotated &&
          throughReshapes(parts[0]) == rope->getResult(0) &&
          (rotated == headDim
               ? parts.size() == 1
               : parts.size() == 2 &&
+                    shapeOf(parts[1]).back() == headDim - rotated &&
                     isLastDimSlice(parts[1], rotatedHeads(rope, headDim),
                                    rotated, headDim));
 }
@@ -180,23 +183,35 @@ bool isLastDimConcat(ConcatOp concat) {
   return concat.getDim() == rank - 1 || concat.getDim() == -1;
 }
 
-// Whether `a` and `b` hold the same tensor: the same value, or results of
-// equal ops of the same tensors. Each rotary embedding has its own copy of
-// the cos and sin rows.
-bool sameValue(Value a, Value b, unsigned depth = 8) {
+// Whether the rotary embeddings' cos (or sin) tables `a` and `b` are the same:
+// the same value, or two of the copies the RoPE fusion makes of one half
+// table, its concat with itself along the last dim, of it or of a reshape of
+// it. Only those ops are compared, down to the same half table: other ops of
+// the same operands, such as two calls of a stateful function, can produce
+// different tables.
+bool sameTable(Value a, Value b) {
   if (a == b) {
     return true;
   }
-  auto resultA = mlir::dyn_cast<OpResult>(a);
-  auto resultB = mlir::dyn_cast<OpResult>(b);
-  if (!resultA || !resultB || depth == 0 || a.getType() != b.getType() ||
-      resultA.getResultNumber() != resultB.getResultNumber()) {
+  if (a.getType() != b.getType()) {
     return false;
   }
-  return OperationEquivalence::isEquivalentTo(
-      resultA.getOwner(), resultB.getOwner(),
-      [&](Value x, Value y) { return mlir::success(sameValue(x, y, depth - 1)); },
-      /*markEquivalent=*/nullptr, OperationEquivalence::IgnoreLocations);
+  auto half = [](Value value) -> Value {
+    auto concat = value.getDefiningOp<ConcatOp>();
+    if (!concat || !isLastDimConcat(concat) || concat.getInputs().size() != 2 ||
+        concat.getInputs()[0] != concat.getInputs()[1]) {
+      return Value();
+    }
+    return concat.getInputs()[0];
+  };
+  Value halfA = half(a);
+  Value halfB = half(b);
+  if (halfA && halfB) {
+    return sameTable(halfA, halfB);
+  }
+  auto reshapeA = a.getDefiningOp<ReshapeOp>();
+  auto reshapeB = b.getDefiningOp<ReshapeOp>();
+  return reshapeA && reshapeB && reshapeA.getInput() == reshapeB.getInput();
 }
 
 // The rotary embeddings of norms of views of `qkv`.
@@ -261,8 +276,8 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
   RMSNormOp qNorm;
   for (ttcore::CompositeOp rope : rotariesOf(qkv)) {
     if (rope == kRope || tokenIndexOf(rope) != tokenIndexOf(kRope) ||
-        !sameValue(rotaryCos(rope), rotaryCos(kRope)) ||
-        !sameValue(rotarySin(rope), rotarySin(kRope))) {
+        !sameTable(rotaryCos(rope), rotaryCos(kRope)) ||
+        !sameTable(rotarySin(rope), rotarySin(kRope))) {
       continue;
     }
     RMSNormOp norm = normOf(rope, headDim);
@@ -364,16 +379,24 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
     if (!pad.getValue().isPosZero()) {
       return mlir::failure();
     }
+    // Only the last dim's high side, and only wider: TTIR allows negative
+    // padding (a crop), and the first fusing runs before such pads become
+    // slices.
     ArrayRef<int32_t> padding = pad.getPadding();
     for (size_t i = 0; i + 1 < padding.size(); ++i) {
       if (padding[i] != 0) {
         return mlir::failure();
       }
     }
+    if (padding.back() < 0) {
+      return mlir::failure();
+    }
     qOut = alongReshapes(pad.getResult());
   }
+  // The kernel writes q_width >= head_dim columns, a multiple of 32.
   const int64_t qWidth = shapeOf(qOut).back();
-  if (shapeOf(qHeads).back() != headDim || qWidth % 32 != 0 ||
+  if (shapeOf(qHeads).back() != headDim || qWidth < headDim ||
+      qWidth % 32 != 0 ||
       shapeOf(qOut) != ArrayRef<int64_t>{1, tokens, numQHeads, qWidth} ||
       typeOf(qOut).getElementType() != bf16) {
     return mlir::failure();
