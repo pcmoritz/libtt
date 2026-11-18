@@ -45,7 +45,7 @@ diff --git a/lib/Dialect/TTNN/Interfaces/TTNNOpModelInterface.cpp b/lib/Dialect/
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -212,6 +212,24 @@ bool hasInterveningWrite(Value value, Operation *from, Operation *to) {
+@@ -211,6 +211,24 @@ bool hasInterveningWrite(Value value, Operation *from, Operation *to) {
    return false;
  }
  
@@ -70,24 +70,17 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  class TTNNBinaryOpInputsActivation
      : public mlir::OpInterfaceRewritePattern<ElementwiseBinaryActivations> {
  public:
-@@ -261,6 +279,16 @@ private:
+@@ -260,6 +278,9 @@ private:
      if (!unaryOp) {
        return {};
      }
 +    if (!allActivationFusibleTypes(unaryOp) || !allActivationFusibleTypes(binaryOp)) {
 +      return {};
 +    }
-+    // Leave silu(slice(matmul)) * slice(matmul) to the SwiGLU matmul epilogue.
-+    if (isa<MultiplyOp>(binaryOp) && isa<SiluOp>(unaryOp.getOperation())) {
-+      if (auto slice = unaryOp.getInput().getDefiningOp<SliceStaticOp>();
-+          slice && slice.getInput().getDefiningOp<MatmulOp>()) {
-+        return {};
-+      }
-+    }
      if (restrictToMatmulProducer &&
          !unaryOp.getInput().getDefiningOp<MatmulOp>() &&
          !unaryOp.getInput().getDefiningOp<LinearOp>()) {
-@@ -294,6 +322,45 @@ private:
+@@ -293,6 +314,45 @@ private:
  };
  } // namespace
  
@@ -133,7 +126,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
  namespace {
  class TTNNBinaryOpOutputActivation
      : public mlir::OpInterfaceRewritePattern<ElementwiseUnary> {
-@@ -324,7 +391,8 @@ public:
+@@ -323,7 +383,8 @@ public:
  
  private:
    bool isFusable(ElementwiseUnary unaryOp) const {
@@ -143,7 +136,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
    }
  
    ElementwiseBinaryActivations getFusableBinaryOp(Value operand) const {
-@@ -333,11 +401,100 @@ private:
+@@ -332,11 +393,100 @@ private:
        return {};
      }
  
@@ -242,15 +235,15 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 +  }
 +};
 +
- // Fold the decode MLP's concatenated [up | gate] projection and SwiGLU into a
- // single half-width matmul.  The runtime implements this marker with a
- // two-weight matmul that keeps matching up/gate accumulators on the same core.
-@@ -794,6 +951,7 @@ public:
+ #ifdef TTMLIR_ENABLE_OPMODEL
+ 
+ // ============================================================================
+@@ -710,6 +860,7 @@ public:
      }
      // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
      // https://github.com/tenstorrent/tt-metal/issues/30973
 +    patterns.add<TTNNBF16MeanOfUpcast, TTNNBinaryOpNarrowingOutput, TTNNRMSNormOfUpcast>(&getContext());
-     patterns.add<TTNNMatmulWithSwiGLUEpilogue,
+     patterns.add<
          TTNNConv2dWithActivation<ReluOp>, TTNNConv2dWithActivation<Relu6Op>,
          TTNNConv2dWithActivation<SiluOp>, TTNNConv2dWithActivation<SigmoidOp>,
 diff --git a/lib/OpModel/TTNN/TTNNOpModel.cpp b/lib/OpModel/TTNN/TTNNOpModel.cpp
