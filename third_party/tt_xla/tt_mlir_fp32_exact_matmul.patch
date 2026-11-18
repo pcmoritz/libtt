@@ -201,14 +201,16 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Trans
 index f10b652..a072678 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -136,7 +136,9 @@ class TTNNMatmulAndLinearWithActivation : public mlir::OpRewritePattern<SrcOp> {
+@@ -136,7 +136,11 @@ class TTNNMatmulAndLinearWithActivation : public mlir::OpRewritePattern<SrcOp> {
  public:
    mlir::LogicalResult
    matchAndRewrite(SrcOp srcOp, mlir::PatternRewriter &rewriter) const final {
 -    if (!isFusable(srcOp)) {
 +    // An exact FP32 matmul runs on the vector unit, which has no fused
-+    // activation.
-+    if (srcOp->hasAttr("ttcore.fp32_exact") || !isFusable(srcOp)) {
++    // activation, and a SwiGLU matmul (ttnn.fused_swiglu) has the SwiGLU as
++    // its epilogue: the runtime's matmul_swiglu takes no activation.
++    if (srcOp->hasAttr("ttcore.fp32_exact") ||
++        srcOp->hasAttr("ttnn.fused_swiglu") || !isFusable(srcOp)) {
        return failure();
      }
  

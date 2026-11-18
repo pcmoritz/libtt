@@ -144,6 +144,23 @@ def test_torch_silu_and_mul_projection(rows, inner_size, width, transposed, tmp_
     _assert_exact_swiglu(tmp_path, "matmul")
 
 
+def test_activation_after_torch_silu_and_mul(tmp_path):
+    """An activation after PyTorch's SiluAndMul stays an op of its own: the
+    SwiGLU matmul's epilogue is the SwiGLU, and matmul_swiglu applies no other.
+    With a zero projection, sigmoid(SiluAndMul(x @ w)) is 0.5 everywhere."""
+    options = {"optimization_level": "O0"}
+    device = jax.devices("tt")[0]
+    x = jax.device_put(jnp.asarray(np.random.default_rng(10).normal(0, 1, (1, 4096)), jnp.bfloat16), device)
+    w = jax.device_put(jnp.zeros((2 * 3072, 4096), jnp.bfloat16), device)
+    run = jax.jit(
+        lambda x, w: jax.nn.sigmoid(_silu_and_mul(x @ w.T)), compiler_options={**options, "export_path": str(tmp_path)}
+    )
+    np.testing.assert_array_equal(np.asarray(run(x, w), np.float32), 0.5)
+    _assert_exact_swiglu(tmp_path, "matmul")
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert any('"ttnn.sigmoid"' in ir for ir in irs), "the sigmoid was folded into the SwiGLU matmul"
+
+
 @pytest.mark.parametrize("rows,width", [(1, 3072), (4, 3072), (1, 12288)])
 @pytest.mark.parametrize("scale_shape", ["column", "scalar"])
 def test_torch_fp8_silu_and_mul_projection(rows, width, scale_shape, tmp_path):
