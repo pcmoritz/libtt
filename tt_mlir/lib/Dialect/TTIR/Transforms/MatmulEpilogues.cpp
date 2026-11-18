@@ -86,6 +86,20 @@ bool mayWrite(Operation *op) {
   return !effects || effects.hasEffect<MemoryEffects::Write>();
 }
 
+// Whether an op between `from` and `to` (from first, in one block) may write
+// memory; also if they are in different blocks.
+bool writesBetween(Operation *from, Operation *to) {
+  if (from->getBlock() != to->getBlock()) {
+    return true;
+  }
+  for (Operation *op = from->getNextNode(); op != to; op = op->getNextNode()) {
+    if (mayWrite(op)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // The fused matmul of `from`, the matmul or linear it replaces, made where
 // `from` is (or after `insertAfter`): an in-place write after the matmul, such
 // as a cache update, must not change what it reads.
@@ -141,11 +155,17 @@ public:
     const int64_t rows = product.getDimSize(0);
     const int64_t cols = product.getDimSize(1);
     // The official checkpoints' per-channel scales, [N, 1], reshaped to
-    // [1, N]: the epilogue takes the column as it is.
+    // [1, N]: the epilogue takes the column as it is. It then reads the
+    // column where the scaled matmul goes rather than where the reshape was,
+    // so only if nothing between the reshape and the matmul may write memory
+    // (through a view of the column, say); otherwise it takes the row.
     auto colReshape = colScale.getDefiningOp<ReshapeOp>();
     if (colReshape &&
         typeOf(colReshape.getInput()).getShape() ==
-            ArrayRef<int64_t>{cols, 1}) {
+            ArrayRef<int64_t>{cols, 1} &&
+        colReshape->getBlock() == matmul->getBlock() &&
+        (matmul->isBeforeInBlock(colReshape) ||
+         !writesBetween(colReshape, matmul))) {
       colScale = colReshape.getInput();
     } else {
       colReshape = nullptr;
@@ -166,14 +186,8 @@ public:
     // The scaled matmul goes where the matmul is, or after a scale made
     // later. It reads the operands and the scales at that one point, so
     // nothing between the matmul and the ops it replaces may write memory.
-    if (last->getBlock() != matmul->getBlock()) {
+    if (writesBetween(matmul, last)) {
       return failure();
-    }
-    for (Operation *op = matmul->getNextNode(); op != last;
-         op = op->getNextNode()) {
-      if (mayWrite(op)) {
-        return failure();
-      }
     }
     Operation *after = nullptr;
     for (Value scale : {rowScale, colScale}) {
