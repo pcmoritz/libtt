@@ -4,6 +4,7 @@
 #ifndef LIBTT_TT_MLIR_INCLUDE_TTMLIR_DIALECT_TTIR_TRANSFORMS_FUSING_SPLITQKVNORMROPEDECODEFUSING_H
 #define LIBTT_TT_MLIR_INCLUDE_TTMLIR_DIALECT_TTIR_TRANSFORMS_FUSING_SPLITQKVNORMROPEDECODEFUSING_H
 
+#include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 
 #include "mlir/IR/PatternMatch.h"
@@ -37,6 +38,20 @@ public:
 
   mlir::LogicalResult
   matchAndRewrite(ConcatOp concat,
+                  mlir::PatternRewriter &rewriter) const override;
+};
+
+// The same prologue as JAX models trace it (SGLang-JAX's Qwen3, whose paged
+// caches take k and v apart): k after its rotary embedding and v, each
+// reshaped to [1, B, Hkv, D], are outputs of their own. It anchors on k's
+// rotary embedding, and the fused op returns k and v as two results.
+class SplitQKVNormRopeDecodeSeparateKVFusing
+    : public mlir::OpRewritePattern<ttcore::CompositeOp> {
+public:
+  using OpRewritePattern<ttcore::CompositeOp>::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(ttcore::CompositeOp op,
                   mlir::PatternRewriter &rewriter) const override;
 };
 

@@ -45,6 +45,8 @@ struct Case {
     uint32_t rotary_dim = 0;
     // FLOAT32 norm weights, as 1 + w of a zero-centered RMSNorm is.
     bool float32_weights = false;
+    // k and v as two outputs, as JAX models take them.
+    bool split_kv = false;
 };
 
 class SplitQKVNormRopeDecodeTest : public ::testing::TestWithParam<Case> {
@@ -87,7 +89,8 @@ std::vector<uint32_t> bits(const ttnn::Tensor& tensor) {
 }
 
 TEST_P(SplitQKVNormRopeDecodeTest, MatchesSeparateOps) {
-    const auto [tokens, num_q_heads, num_kv_heads, head_dim, q_width, gated, rotary, float32_weights] = GetParam();
+    const auto [tokens, num_q_heads, num_kv_heads, head_dim, q_width, gated, rotary, float32_weights, split_kv] =
+        GetParam();
     const uint32_t rotary_dim = rotary == 0 ? head_dim : rotary;
     const uint32_t q_stride = (gated ? 2 : 1) * head_dim;
     const uint32_t width = num_q_heads * q_stride + 2 * num_kv_heads * head_dim;
@@ -103,13 +106,13 @@ TEST_P(SplitQKVNormRopeDecodeTest, MatchesSeparateOps) {
     const ttnn::DeviceComputeKernelConfig rope_config = ttnn::ComputeKernelConfig{
         .math_fidelity = MathFidelity::HiFi4, .math_approx_mode = true, .fp32_dest_acc_en = true};
     const MemoryConfig dram{TensorMemoryLayout::INTERLEAVED, BufferType::DRAM};
-    // A tile row of each token's k and v on its own core, as the paged cache update reads them.
+    // A tile row of each token's k and v (or k, or v) on its own core, as the paged cache update reads them.
     const MemoryConfig kv_config{
         TensorMemoryLayout::HEIGHT_SHARDED,
         BufferType::L1,
         ShardSpec(
             num_cores_to_corerangeset(tokens, mesh_device_->compute_with_storage_grid_size(), /*row_wise=*/true),
-            {32, 2 * head_dim},
+            {32, (split_kv ? 1 : 2) * head_dim},
             ShardOrientation::ROW_MAJOR)};
     auto slice = [](const ttnn::Tensor& x, ttsl::SmallVector<uint32_t> begins, ttsl::SmallVector<uint32_t> ends) {
         return ttnn::slice(x, begins, ends, ttsl::SmallVector<uint32_t>(begins.size(), 1));
@@ -155,8 +158,9 @@ TEST_P(SplitQKVNormRopeDecodeTest, MatchesSeparateOps) {
             epsilon,
             q_width,
             dram,
-            kv_config);
-        ASSERT_EQ(fused.size(), 2);
+            kv_config,
+            split_kv ? std::optional<MemoryConfig>(kv_config) : std::nullopt);
+        ASSERT_EQ(fused.size(), split_kv ? 3 : 2);
 
         // The separate ops, on heads [tokens * count, head_dim]. One token rotates in decode mode with
         // token_index 0, several in batched mode.
@@ -194,11 +198,20 @@ TEST_P(SplitQKVNormRopeDecodeTest, MatchesSeparateOps) {
             k_weight_device);
         const ttnn::Tensor v =
             ttnn::reshape(slice(qkv_device, {0, v_begin}, {tokens, width}), ttnn::Shape({tokens, num_kv_heads, head_dim}));
-        const ttnn::Tensor kv =
-            ttnn::reshape(ttnn::concat({k, v}, 2), ttnn::Shape({1, tokens, num_kv_heads, 2 * head_dim}));
-
         EXPECT_EQ(fused[0].logical_shape(), q.logical_shape());
         EXPECT_EQ(bits(fused[0]), bits(q)) << "q, run " << run;
+        if (split_kv) {
+            const ttnn::Shape shape({1, tokens, num_kv_heads, head_dim});
+            for (const auto& [index, want, name] :
+                 {std::tuple{1, ttnn::reshape(k, shape), "k"}, std::tuple{2, ttnn::reshape(v, shape), "v"}}) {
+                EXPECT_EQ(fused[index].logical_shape(), want.logical_shape());
+                EXPECT_EQ(fused[index].memory_config(), kv_config);
+                EXPECT_EQ(bits(fused[index]), bits(want)) << name << ", run " << run;
+            }
+            continue;
+        }
+        const ttnn::Tensor kv =
+            ttnn::reshape(ttnn::concat({k, v}, 2), ttnn::Shape({1, tokens, num_kv_heads, 2 * head_dim}));
         EXPECT_EQ(fused[1].logical_shape(), kv.logical_shape());
         EXPECT_EQ(fused[1].memory_config(), kv_config);
         EXPECT_EQ(bits(fused[1]), bits(kv)) << "kv, run " << run;
@@ -228,13 +241,19 @@ INSTANTIATE_TEST_SUITE_P(
         Case{1, 6, 1, 256, 512, true, 64, true},
         Case{4, 6, 1, 256, 512, true, 64, true},
         Case{4, 8, 2, 128, 256, false, 64, false},
-        Case{4, 8, 2, 128, 256, false, 0, true}),
+        Case{4, 8, 2, 128, 256, false, 0, true},
+        // k and v apart, as SGLang-JAX's Qwen3 takes them: Qwen3-8B on four and one chips, one, four and 32
+        // tokens, and Qwen3-30B-A3B's one KV head on four chips.
+        Case{1, 8, 2, 128, 128, false, 0, false, true},
+        Case{4, 8, 2, 128, 128, false, 0, false, true},
+        Case{32, 32, 8, 128, 128, false, 0, false, true},
+        Case{4, 8, 1, 128, 128, false, 0, false, true}),
     [](const ::testing::TestParamInfo<Case>& info) {
         const Case& c = info.param;
         return "tokens" + std::to_string(c.tokens) + "_q" + std::to_string(c.num_q_heads) + "_kv" +
                std::to_string(c.num_kv_heads) + "_d" + std::to_string(c.head_dim) + "_w" + std::to_string(c.q_width) +
                (c.gated ? "_gated" : "") + (c.rotary_dim ? "_r" + std::to_string(c.rotary_dim) : "") +
-               (c.float32_weights ? "_fp32w" : "");
+               (c.float32_weights ? "_fp32w" : "") + (c.split_kv ? "_split_kv" : "");
     });
 
 }  // namespace

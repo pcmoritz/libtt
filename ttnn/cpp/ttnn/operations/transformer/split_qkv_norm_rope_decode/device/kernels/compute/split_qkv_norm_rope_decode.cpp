@@ -61,12 +61,12 @@ void kernel_main() {
     // The q and k units; the v units only move data.
     const uint32_t units = get_arg_val<uint32_t>(0);
     for (uint32_t unit = 0; unit < units; ++unit) {
-        // rms_norm: x^2
-        cb_wait_front(cb_x, head_tiles);
+        // rms_norm: x^2, of each tile as the reader places it.
         reconfig_data_format(cb_x, cb_x);
         pack_reconfig_data_format(cb_sq);
         mul_init(cb_x, cb_x);
         for (uint32_t j = 0; j < head_tiles; ++j) {
+            cb_wait_front(cb_x, j + 1);
             tile_regs_acquire();
             mul_tiles(cb_x, cb_x, j, j, 0);
             pack_one(cb_sq);

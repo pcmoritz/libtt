@@ -25,9 +25,11 @@ using namespace tt::constants;
 namespace ttnn::prim {
 namespace {
 
-// Heads per unit of work: one core's rows of a tile, two 256-byte runs of
-// each of its tiles (rows 0-7, 8-15, 16-23 or 24-31).
-constexpr uint32_t kGroup = 8;
+// Heads per unit of work at most: one core's rows of a tile, two 256-byte
+// runs of each of its tiles (rows 0-7, 8-15, 16-23 or 24-31).
+constexpr uint32_t kMaxGroup = 8;
+// And at least: two 64-byte runs, as DRAM writes align.
+constexpr uint32_t kMinGroup = 2;
 
 // What a unit computes: rms_norm and rotary_embedding for q or k heads; v
 // heads are only moved.
@@ -40,6 +42,8 @@ struct SplitQKVNormRopeDecodeParams {
     uint32_t q_width = 0;
     MemoryConfig q_memory_config;
     MemoryConfig kv_memory_config;
+    // Set when k and v are separate outputs.
+    std::optional<MemoryConfig> v_memory_config;
 };
 
 struct SplitQKVNormRopeDecodeInputs {
@@ -132,9 +136,12 @@ SplitQKVNormRopeDecodeOperation::spec_return_value_t SplitQKVNormRopeDecodeOpera
     auto spec = [&](const Shape& shape, const MemoryConfig& memory_config) {
         return TensorSpec(shape, TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), memory_config));
     };
-    return {
-        spec(Shape({1, tokens, params.num_q_heads, params.q_width}), params.q_memory_config),
-        spec(Shape({1, tokens, params.num_kv_heads, 2 * head_dim}), params.kv_memory_config)};
+    const auto q = spec(Shape({1, tokens, params.num_q_heads, params.q_width}), params.q_memory_config);
+    if (params.v_memory_config) {
+        const Shape kv_shape({1, tokens, params.num_kv_heads, head_dim});
+        return {q, spec(kv_shape, params.kv_memory_config), spec(kv_shape, *params.v_memory_config)};
+    }
+    return {q, spec(Shape({1, tokens, params.num_kv_heads, 2 * head_dim}), params.kv_memory_config)};
 }
 
 SplitQKVNormRopeDecodeOperation::tensor_return_value_t SplitQKVNormRopeDecodeOperation::create_output_tensors(
@@ -146,9 +153,9 @@ SplitQKVNormRopeDecodeOperation::tensor_return_value_t SplitQKVNormRopeDecodeOpe
     return outputs;
 }
 
-// One core's work on up to kGroup heads of one token: its rows of the q
-// output or of the token's tile row of the kv output, and the zero rows and
-// tiles of that tile row nobody else writes.
+// One core's work on up to `group` heads of one token: its rows of the q
+// output or of the token's tile row of the kv (or k or v) output, and the zero
+// rows and tiles of that tile row nobody else writes.
 struct Unit {
     UnitKind kind;
     uint32_t token;
@@ -178,11 +185,25 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
     const uint32_t rotary_tiles = in.cos.logical_shape()[-1] / TILE_WIDTH;
     const uint32_t q_row_tiles = (num_q_heads + TILE_HEIGHT - 1) / TILE_HEIGHT;
     const uint32_t q_width_tiles = params.q_width / TILE_WIDTH;
+    const bool split_kv = params.v_memory_config.has_value();
+    // The output a unit writes: q, kv (or k), or v.
+    auto output_of = [&](UnitKind kind) -> uint32_t { return kind == kQ ? 0 : (split_kv && kind == kV ? 2 : 1); };
     auto round_up = [](uint32_t value, uint32_t step) { return (value + step - 1) / step * step; };
+    const CoreCoord grid = in.qkv.device()->compute_with_storage_grid_size();
+    // A unit's compute takes the same time for any number of heads, its rows
+    // of the same tiles, but its reads and row moves take a time per head. So
+    // units are as small as the cores allow: one unit each.
+    auto units_of = [&](uint32_t heads) {
+        return tokens * ((num_q_heads + heads - 1) / heads + 2 * ((num_kv_heads + heads - 1) / heads));
+    };
+    uint32_t group = kMaxGroup;
+    while (group > kMinGroup && units_of(group / 2) <= grid.x * grid.y) {
+        group /= 2;
+    }
 
     std::vector<Unit> units;
     for (uint32_t b = 0; b < tokens; ++b) {
-        for (uint32_t h = 0; h < num_q_heads; h += kGroup) {
+        for (uint32_t h = 0; h < num_q_heads; h += group) {
             const uint32_t row = h % TILE_HEIGHT;
             const uint32_t rows = std::min(TILE_HEIGHT, num_q_heads - h / TILE_HEIGHT * TILE_HEIGHT);
             units.push_back(Unit{
@@ -190,28 +211,27 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
                 .token = b,
                 .source_tile = h * q_stride,
                 .source_stride = q_stride,
-                .heads = std::min(kGroup, num_q_heads - h),
+                .heads = std::min(group, num_q_heads - h),
                 .first_tile = (b * q_row_tiles + h / TILE_HEIGHT) * q_width_tiles,
                 .first_row = row,
-                .zero_rows_from = row == 0 ? round_up(rows, kGroup) : TILE_HEIGHT,
+                .zero_rows_from = row == 0 ? round_up(rows, group) : TILE_HEIGHT,
                 .zero_tiles = row == 0 ? q_width_tiles - head_tiles : 0});
         }
-        for (uint32_t h = 0; h < num_kv_heads; h += kGroup) {
+        for (uint32_t h = 0; h < num_kv_heads; h += group) {
             for (UnitKind kind : {kK, kV}) {
                 units.push_back(Unit{
                     .kind = kind,
                     .token = b,
                     .source_tile = num_q_heads * q_stride + ((kind == kV ? num_kv_heads : 0) + h) * head_tiles,
                     .source_stride = head_tiles,
-                    .heads = std::min(kGroup, num_kv_heads - h),
-                    .first_tile = b * 2 * head_tiles + (kind == kV ? head_tiles : 0),
+                    .heads = std::min(group, num_kv_heads - h),
+                    .first_tile = split_kv ? b * head_tiles : b * 2 * head_tiles + (kind == kV ? head_tiles : 0),
                     .first_row = h,
-                    .zero_rows_from = h == 0 ? round_up(num_kv_heads, kGroup) : TILE_HEIGHT,
+                    .zero_rows_from = h == 0 ? round_up(num_kv_heads, group) : TILE_HEIGHT,
                     .zero_tiles = 0});
             }
         }
     }
-    const CoreCoord grid = in.qkv.device()->compute_with_storage_grid_size();
     const uint32_t num_cores = std::min<uint32_t>(units.size(), grid.x * grid.y);
     const CoreRangeSet cores = num_cores_to_corerangeset(num_cores, grid, /*row_wise=*/true);
     const auto core_list = corerange_to_cores(cores, std::nullopt, /*row_wise=*/true);
@@ -254,7 +274,7 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
     make_cb(13, 1, bf16);           // x * cos
     make_cb(14, head_tiles, bf16);  // rotary's output
     make_cb(15, 1, bf16);           // zeros
-    const uint32_t scratch_bytes = kGroup * head_tiles * window + alignment;
+    const uint32_t scratch_bytes = group * head_tiles * window + alignment;
     add_cb(16, scratch_bytes, scratch_bytes, bf16);
 
     std::vector<std::pair<std::string, uint32_t>> common_args = {
@@ -277,7 +297,7 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
         {"cb_scratch", 16},
         {"head_tiles", head_tiles},
         {"rotary_tiles", rotary_tiles},
-        {"group", kGroup},
+        {"group", group},
         {"row_bytes", row_bytes},
         {"alignment", alignment},
         {"window", window},
@@ -293,8 +313,10 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
     for (const MeshTensor* tensor : {&qkv, &q_weight, &k_weight, &cos, &sin}) {
         TensorAccessorArgs(*tensor).append_to(dataflow_args);
     }
+    // The q, kv (or k) and v outputs; without a v output, v units write kv.
     TensorAccessorArgs(outputs.at(0).mesh_tensor()).append_to(dataflow_args);
     TensorAccessorArgs(outputs.at(1).mesh_tensor()).append_to(dataflow_args);
+    TensorAccessorArgs(outputs.at(split_kv ? 2 : 1).mesh_tensor()).append_to(dataflow_args);
     auto dataflow_kernel = [&](const char* name, DataMovementProcessor processor, NOC noc) {
         return KernelDescriptor{
             .kernel_source = kernel_dir + "dataflow/" + name,
@@ -328,7 +350,7 @@ ProgramDescriptor SplitQKVNormRopeDecodeOperation::create_descriptor(
             args.push_back(unit.source_tile);
             args.push_back(unit.source_stride);
             args.push_back(unit.heads);
-            args.push_back(outputs.at(unit.kind == kQ ? 0 : 1).mesh_tensor());
+            args.push_back(outputs.at(output_of(unit.kind)).mesh_tensor());
             args.push_back(unit.first_tile);
             args.push_back(unit.first_row);
             args.push_back(unit.zero_rows_from);
@@ -361,7 +383,8 @@ std::vector<Tensor> split_qkv_norm_rope_decode(
     float epsilon,
     uint32_t q_width,
     const tt::tt_metal::MemoryConfig& q_memory_config,
-    const tt::tt_metal::MemoryConfig& kv_memory_config) {
+    const tt::tt_metal::MemoryConfig& kv_memory_config,
+    const std::optional<tt::tt_metal::MemoryConfig>& v_memory_config) {
     using Op = prim::SplitQKVNormRopeDecodeOperation;
     return device_operation::launch<Op>(
         {.num_q_heads = num_q_heads,
@@ -369,7 +392,8 @@ std::vector<Tensor> split_qkv_norm_rope_decode(
          .epsilon = epsilon,
          .q_width = q_width,
          .q_memory_config = q_memory_config,
-         .kv_memory_config = kv_memory_config},
+         .kv_memory_config = kv_memory_config,
+         .v_memory_config = v_memory_config},
         {.qkv = qkv, .q_weight = q_weight, .k_weight = k_weight, .cos = cos, .sin = sin});
 }
 

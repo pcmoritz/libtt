@@ -20,13 +20,22 @@ void run(const ::tt::target::ttnn::SplitQKVNormRopeDecodeOp *op,
   };
   // query is [1, B, num_q_heads, q_width].
   const uint32_t qWidth = op->query()->desc()->shape()->Get(3);
+  // With a value output, key_values holds only the k heads.
+  std::optional<::ttnn::MemoryConfig> valueConfig;
+  if (op->value()) {
+    valueConfig = memoryConfig(op->value());
+  }
   std::vector<::ttnn::Tensor> outputs =
       ::ttnn::transformer::split_qkv_norm_rope_decode(
           tensor(op->input()), tensor(op->q_weight()), tensor(op->k_weight()),
           tensor(op->cos_cache()), tensor(op->sin_cache()), op->num_q_heads(),
           op->num_kv_heads(), op->epsilon(), qWidth,
-          memoryConfig(op->query()), memoryConfig(op->key_values()));
+          memoryConfig(op->query()), memoryConfig(op->key_values()),
+          valueConfig);
   pool.insertTTNNTensorAndValidate(op->query(), outputs.at(0));
   pool.insertTTNNTensorAndValidate(op->key_values(), outputs.at(1));
+  if (op->value()) {
+    pool.insertTTNNTensorAndValidate(op->value(), outputs.at(2));
+  }
 }
 } // namespace tt::runtime::ttnn::operations::transformer

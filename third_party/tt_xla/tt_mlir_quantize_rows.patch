@@ -369,7 +369,7 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
 --- a/runtime/lib/ttnn/program_executor.cpp
 +++ b/runtime/lib/ttnn/program_executor.cpp
 @@ -128,6 +128,7 @@
- #include "operations/transformer/nlp_create_qkv_heads_decode_norm_rope.h"
+ #include "operations/transformer/nlp_create_qkv_heads_decode.h"
  #include "operations/transformer/paged_flash_multi_latent_attention_decode.h"
  #include "operations/transformer/paged_scaled_dot_product_attention_decode.h"
 +#include "operations/quantization/quantize_rows.h"

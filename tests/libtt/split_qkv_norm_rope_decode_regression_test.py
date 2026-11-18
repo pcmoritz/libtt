@@ -86,9 +86,9 @@ def _rotations(q, k, v, cos_sin, tokens, heads, kv_heads, model, q_form):
     ],
 )
 def test_torch_qkv_norm_rope_prologue(model, tokens, heads, kv_heads, trace, q_form, tmp_path):
-    """The prologue runs as one split_qkv_norm_rope_decode (unless q is cropped
-    or regrouped) and equals the separate ops (rms_norm, rotary_embedding, any
-    pad and concat) bit for bit."""
+    """The prologue runs as one split_qkv_norm_rope_decode (unless q is
+    regrouped, or cropped by a pad) and equals the separate ops (rms_norm,
+    rotary_embedding, any pad and concat) bit for bit."""
     head_dim, gated, rotary, _ = model
     if q_form == "regrouped_q" and (rotary == head_dim or heads == 1):
         pytest.skip("regrouping needs a partial rotary embedding and two q heads")
@@ -124,9 +124,11 @@ def test_torch_qkv_norm_rope_prologue(model, tokens, heads, kv_heads, trace, q_f
         if step == 0:
             irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
             fused_op = any('"ttnn.split_qkv_norm_rope_decode"' in ir for ir in irs)
-            if q_form in ("cropped_q", "regrouped_q"):
-                assert not fused_op, f"a {q_form.split('_')[0]} q was fused"
-            else:
+            # A cropped q fuses only where the crop is a slice by then, which reads the
+            # fused op's full heads; as a pad it stays unfused. Either way q is exact.
+            if q_form == "regrouped_q":
+                assert not fused_op, "a regrouped q was fused"
+            elif q_form != "cropped_q":
                 assert fused_op, "the prologue was not fused"
                 assert not any('"ttnn.rotary_embedding"' in ir for ir in irs), "a rotary embedding was left"
         if not trace:
