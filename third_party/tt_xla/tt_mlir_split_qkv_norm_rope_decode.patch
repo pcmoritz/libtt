@@ -1,3 +1,37 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -6827,6 +6827,30 @@ def TTIR_SplitQueryKeyValueAndSplitHeadsOp: TTIR_NamedOp<"split_query_key_value_
+     let hasVerifier = 1;
+ }
+ 
++def TTIR_SplitQKVNormRopeDecodeOp : TTIR_NamedOp<"split_qkv_norm_rope_decode"> {
++  let summary = "A decode step's attention prologue as PyTorch models trace it";
++  let description = [{
++    Splits a fused QKV projection input [B, W] into q, k and v heads, applies
++    rms_norm with q_weight and k_weight to the q and k heads and
++    rotary_embedding with token b's row of cos_cache and sin_cache to both,
++    and returns query [1, B, num_q_heads, q_width] and key_values [1, B,
++    num_kv_heads, 2 * head_dim]: see ttnn.split_qkv_norm_rope_decode, which
++    it lowers to. libtt's SplitQKVNormRopeDecodeFusing forms it.
++  }];
++
++  let arguments = (ins AnyRankedTensor:$input,
++                       AnyRankedTensor:$q_weight,
++                       AnyRankedTensor:$k_weight,
++                       AnyRankedTensor:$cos_cache,
++                       AnyRankedTensor:$sin_cache,
++                       UI32Attr:$num_q_heads,
++                       UI32Attr:$num_kv_heads,
++                       F32Attr:$epsilon);
++
++  let results = (outs AnyRankedTensor:$query,
++                      AnyRankedTensor:$key_values);
++}
++
+ def TTIR_TopKOp : TTIR_NamedOp<"topk"> {
+   let summary = "Top-K selection operation.";
+   let description = [{
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
@@ -72,29 +106,64 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
    NLPConcatHeadsOp,
    ConstantOp,
    CaseOp,
-diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
---- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-+++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -14,6 +14,7 @@
- #include "llvm/Support/Error.h"
- 
- #include "mlir/Interfaces/SideEffectInterfaces.h"
-+#include "ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVNormRopeDecodeFusing.h"
- #ifdef TTMLIR_ENABLE_OPMODEL
- #include "ttmlir/Dialect/TTNN/Transforms/Fusing/QKVHeadsNormRopeDecodeFusing.h"
- #include "ttmlir/Dialect/TTNN/Transforms/Fusing/RoPEFusingPattern.h"
-@@ -1223,6 +1224,11 @@ public:
-     config.setUseTopDownTraversal(true);
-     (void)applyPatternsGreedily(getOperation(), std::move(firstPatterns));
-     (void)applyPatternsGreedily(getOperation(), std::move(patterns));
-+    // Whole attention prologues, once the norms and rotary embeddings they
-+    // consist of have formed.
-+    RewritePatternSet lastPatterns(&getContext());
-+    lastPatterns.add<fusing::SplitQKVNormRopeDecodeFusing>(&getContext());
-+    (void)applyPatternsGreedily(getOperation(), std::move(lastPatterns));
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -3443,6 +3443,25 @@ public:
+     return success();
    }
  };
++
++class SplitQKVNormRopeDecodeOpConversionPattern
++    : public OpConversionPattern<ttir::SplitQKVNormRopeDecodeOp> {
++public:
++  using OpConversionPattern<
++      ttir::SplitQKVNormRopeDecodeOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(ttir::SplitQKVNormRopeDecodeOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    rewriter.replaceOpWithNewOp<ttnn::SplitQKVNormRopeDecodeOp>(
++        op, getTypeConverter()->convertType(op.getQuery().getType()),
++        getTypeConverter()->convertType(op.getKeyValues().getType()),
++        adaptor.getInput(), adaptor.getQWeight(), adaptor.getKWeight(),
++        adaptor.getCosCache(), adaptor.getSinCache(), op.getNumQHeadsAttr(),
++        op.getNumKvHeadsAttr(), op.getEpsilonAttr());
++    return success();
++  }
++};
  } // namespace
+ 
+ namespace {
+@@ -4260,6 +4279,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            StatePoolCopyOpConversionPattern,
+            PagedFlashMultiLatentAttentionDecodeOpConversionPattern,
+            SplitQueryKeyValueAndSplitHeadsOpConversionPattern,
++           SplitQKVNormRopeDecodeOpConversionPattern,
+            GeluBackwardOpConversionPattern,
+            DropoutOpConversionPattern,
+            DebugOpConversionPattern<debug::DumpOp, ttnn::DumpTensorOp>,
+diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+--- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
++++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
+@@ -8,6 +8,7 @@
+ #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Fusing/SDPAFusingPattern.h"
++#include "ttmlir/Dialect/TTIR/Transforms/Fusing/SplitQKVNormRopeDecodeFusing.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Passes.h"
+ #include "ttmlir/Dialect/TTIR/Utils/Utils.h"
+@@ -4815,6 +4816,9 @@ public:
+           fusing::SDPAHeadExpansionFusingPattern<ttcore::CompositeOp>>(
+           &getContext());
+       patterns.add<fusing::TopKFusingPattern>(&getContext());
++      // libtt's attention prologue, once its norms and rotary embeddings have
++      // formed (SplitQKVNormRopeDecodeFusing.cpp).
++      patterns.add<fusing::SplitQKVNormRopeDecodeFusing>(&getContext());
+ 
+       GreedyRewriteConfig config;
+       config.setUseTopDownTraversal(true);
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp

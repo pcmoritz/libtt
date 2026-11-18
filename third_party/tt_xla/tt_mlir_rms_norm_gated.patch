@@ -122,7 +122,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
 +#include "ttmlir/Dialect/TTIR/Transforms/Fusing/RMSNormGatedFusing.h"
  #include "ttmlir/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.h"
  #include "ttmlir/Dialect/TTIR/Transforms/Fusing/SDPAFusingPattern.h"
- #include "ttmlir/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Fusing/SplitQKVNormRopeDecodeFusing.h"
 @@ -4739,6 +4740,7 @@ public:
        patterns.add<NormalizeRMSNormFusionPattern>(&getContext());
        patterns.add<RMSNormResidualFusionPattern>(&getContext());

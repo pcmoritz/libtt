@@ -1,7 +1,9 @@
 """PyTorch's decode attention prologue (SGLang-TorchTPU's Qwen3 and Qwen3.8): the
 fused QKV projection split into heads, the q and k heads normalized and rotated,
 and k and v side by side as the KV cache holds them. Decode attention takes q as
-it is; prefill attention takes it padded to the cache's width.
+it is; prefill attention takes it padded to the cache's width. No model crops
+it or regroups its heads, but neither may reach the fused kernel, which writes
+at least head_dim columns and each head's rotated dims next to its others.
 
 Qwen3.8's attention gates its output: each q head is followed by its gate head
 in the projection. Its norms are zero-centered (weight 1 + w, in FP32), and its
@@ -28,15 +30,19 @@ def _rms_norm(x, weight, zero_centered):
     return (x * jax.lax.rsqrt(variance + 1e-6) * weight).astype(jnp.bfloat16)
 
 
-def _rotate(x, cos_sin, tokens, heads, rotary):
+def _rotate(x, cos_sin, tokens, heads, rotary, regroup=False):
     """rotate_half rotary embedding of the first `rotary` dims of the heads'
     rows [tokens * heads, head_dim], with one cos and sin row per token, as
-    SGLang-TorchTPU traces it: the rotated halves, then any other dims."""
+    SGLang-TorchTPU traces it: the rotated halves, then any other dims. If
+    `regroup`, all heads' rotated dims come first, then all heads' others."""
     half = rotary // 2
     x1 = x[:, :half].reshape(tokens, heads, half)
     x2 = x[:, half:rotary].reshape(tokens, heads, half)
     c, s = cos_sin[:, None, :half], cos_sin[:, None, half:]
     rest = [x[:, rotary:].reshape(tokens, heads, -1)] if rotary < x.shape[1] else []
+    if regroup:
+        rotated = jnp.concatenate([x1 * c - x2 * s, x2 * c + x1 * s], axis=-1)
+        return [part.reshape(tokens, 1, -1) for part in (rotated, *rest)]
     return [x1 * c - x2 * s, x2 * c + x1 * s, *rest]
 
 
@@ -49,19 +55,22 @@ def _norms(qkv, q_weight, k_weight, heads, kv_heads, model):
     return _rms_norm(q, q_weight, zero_centered), _rms_norm(k, k_weight, zero_centered)
 
 
-def _rotations(q, k, v, cos_sin, tokens, heads, kv_heads, model, pad):
-    """The rotated q, padded to the cache's width if `pad`, and all tokens' k
-    and v side by side, as one paged cache update takes them."""
+def _rotations(q, k, v, cos_sin, tokens, heads, kv_heads, model, q_form):
+    """The rotated q (as it is, padded to the cache's width, cropped by a tile
+    with a negative pad, or with its heads regrouped) and all tokens' k and v
+    side by side, as one paged cache update takes them."""
     head_dim, _, rotary, _ = model
-    q = jnp.concatenate(_rotate(q, cos_sin, tokens, heads, rotary), axis=-1)
-    if pad:
-        q = jnp.pad(q, ((0, 0), (0, 0), (0, head_dim)))
+    regroup = q_form == "regrouped_q"
+    q = jnp.concatenate(_rotate(q, cos_sin, tokens, heads, rotary, regroup), axis=-1)
+    high = {"q": 0, "padded_q": head_dim, "cropped_q": -32, "regrouped_q": 0}[q_form]
+    if high:
+        q = jax.lax.pad(q, jnp.zeros((), q.dtype), [(0, 0, 0), (0, 0, 0), (0, high, 0)])
     q = q.reshape(1, tokens, heads, -1)
     kv = jnp.concatenate([*_rotate(k, cos_sin, tokens, kv_heads, rotary), v], axis=-1)
     return q, kv.reshape(1, tokens, kv_heads, 2 * head_dim)
 
 
-@pytest.mark.parametrize("pad", [False, True], ids=["q", "padded_q"])
+@pytest.mark.parametrize("q_form", ["q", "padded_q", "cropped_q", "regrouped_q"])
 @pytest.mark.parametrize(
     "model,tokens,heads,kv_heads,trace",
     [
@@ -76,10 +85,13 @@ def _rotations(q, k, v, cos_sin, tokens, heads, kv_heads, model, pad):
         (QWEN38, 4, 24, 4, False),
     ],
 )
-def test_torch_qkv_norm_rope_prologue(model, tokens, heads, kv_heads, trace, pad, tmp_path):
-    """The prologue runs as one split_qkv_norm_rope_decode and equals the
-    separate ops (rms_norm, rotary_embedding, any pad and concat) bit for bit."""
+def test_torch_qkv_norm_rope_prologue(model, tokens, heads, kv_heads, trace, q_form, tmp_path):
+    """The prologue runs as one split_qkv_norm_rope_decode (unless q is cropped
+    or regrouped) and equals the separate ops (rms_norm, rotary_embedding, any
+    pad and concat) bit for bit."""
     head_dim, gated, rotary, _ = model
+    if q_form == "regrouped_q" and (rotary == head_dim or heads == 1):
+        pytest.skip("regrouping needs a partial rotary embedding and two q heads")
     options = {"optimization_level": "O0", "enable_trace": str(trace).lower()}
     v_begin = ((2 if gated else 1) * heads + kv_heads) * head_dim
     width = v_begin + kv_heads * head_dim
@@ -87,12 +99,12 @@ def test_torch_qkv_norm_rope_prologue(model, tokens, heads, kv_heads, trace, pad
     def prologue(qkv, q_weight, k_weight, cos_sin):
         q, k = _norms(qkv, q_weight, k_weight, heads, kv_heads, model)
         v = qkv[:, v_begin:].reshape(tokens, kv_heads, head_dim)
-        return _rotations(q, k, v, cos_sin, tokens, heads, kv_heads, model, pad)
+        return _rotations(q, k, v, cos_sin, tokens, heads, kv_heads, model, q_form)
 
     fused = jax.jit(prologue, compiler_options={**options, "export_path": str(tmp_path)})
     # Apart: the norms in one program, the rotations in another.
     norms = jax.jit(lambda *a: _norms(*a, heads, kv_heads, model), compiler_options=options)
-    rotations = jax.jit(lambda *a: _rotations(*a, tokens, heads, kv_heads, model, pad), compiler_options=options)
+    rotations = jax.jit(lambda *a: _rotations(*a, tokens, heads, kv_heads, model, q_form), compiler_options=options)
     device = jax.devices("tt")[0]
     rng = np.random.default_rng(tokens * 100 + heads)
     for step in range(3):  # With a trace: warmup, capture, and replay with new inputs.
@@ -111,7 +123,11 @@ def test_torch_qkv_norm_rope_prologue(model, tokens, heads, kv_heads, trace, pad
         np.testing.assert_array_equal(np.asarray(kv, np.float32), np.asarray(want_kv, np.float32))
         if step == 0:
             irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
-            assert any('"ttnn.split_qkv_norm_rope_decode"' in ir for ir in irs), "the prologue was not fused"
-            assert not any('"ttnn.rotary_embedding"' in ir for ir in irs), "a rotary embedding was left"
+            fused_op = any('"ttnn.split_qkv_norm_rope_decode"' in ir for ir in irs)
+            if q_form in ("cropped_q", "regrouped_q"):
+                assert not fused_op, f"a {q_form.split('_')[0]} q was fused"
+            else:
+                assert fused_op, "the prologue was not fused"
+                assert not any('"ttnn.rotary_embedding"' in ir for ir in irs), "a rotary embedding was left"
         if not trace:
             break

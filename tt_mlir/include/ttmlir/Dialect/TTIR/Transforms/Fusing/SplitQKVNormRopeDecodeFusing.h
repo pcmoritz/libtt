@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: © 2026 libtt authors
 // SPDX-License-Identifier: Apache-2.0
 
-#ifndef LIBTT_TT_MLIR_INCLUDE_TTMLIR_DIALECT_TTNN_TRANSFORMS_FUSING_SPLITQKVNORMROPEDECODEFUSING_H
-#define LIBTT_TT_MLIR_INCLUDE_TTMLIR_DIALECT_TTNN_TRANSFORMS_FUSING_SPLITQKVNORMROPEDECODEFUSING_H
+#ifndef LIBTT_TT_MLIR_INCLUDE_TTMLIR_DIALECT_TTIR_TRANSFORMS_FUSING_SPLITQKVNORMROPEDECODEFUSING_H
+#define LIBTT_TT_MLIR_INCLUDE_TTMLIR_DIALECT_TTIR_TRANSFORMS_FUSING_SPLITQKVNORMROPEDECODEFUSING_H
 
-#include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+#include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 
 #include "mlir/IR/PatternMatch.h"
 
-namespace mlir::tt::ttnn::fusing {
+namespace mlir::tt::ttir::fusing {
 
 // Fuses a decode step's attention prologue as PyTorch models trace it
 // (SGLang-TorchTPU's Qwen3 and Qwen3.8, whose KV cache holds k and v side by
@@ -21,10 +21,16 @@ namespace mlir::tt::ttnn::fusing {
 //                                concat [B, Hkv, 2 D] -> [1, B, Hkv, 2 D]
 //
 // where the heads are reshapes and slices of the projection, each q head
-// followed by its gate head in gated attention (s = 2), and a partial rotary
+// followed by its gate head in gated attention (s = 2), the rotary
+// embeddings are the composites of the RoPE fusions, and a partial rotary
 // rotates the first R dims of the normed heads and concatenates the rest
-// after them, into one split_qkv_norm_rope_decode (one program instead of
-// fifteen or more). It anchors on the concat of k and v.
+// after them. It anchors on the concat of k and v.
+//
+// The prologue becomes one ttir.split_qkv_norm_rope_decode of (qkv as
+// [B, W], q_weight, k_weight, cos, sin), which lowers to the TTNN op of the
+// same name. Matched on TTIR, the prologue is one op before any later pass
+// can change its shapes, as XLA forms its library calls before it assigns
+// layouts.
 class SplitQKVNormRopeDecodeFusing : public mlir::OpRewritePattern<ConcatOp> {
 public:
   using OpRewritePattern<ConcatOp>::OpRewritePattern;
@@ -34,6 +40,6 @@ public:
                   mlir::PatternRewriter &rewriter) const override;
 };
 
-} // namespace mlir::tt::ttnn::fusing
+} // namespace mlir::tt::ttir::fusing
 
 #endif
