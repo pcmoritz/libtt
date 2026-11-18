@@ -26,6 +26,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -75,11 +76,30 @@ bool isColumns(SliceStaticOp slice, int64_t rows, int64_t begin,
          ints(slice.getStep()) == SmallVector<int64_t>{1, 1};
 }
 
+// Whether `op` may write memory: an in-place update, say, of a matmul's
+// operand.
+bool mayWrite(Operation *op) {
+  if (isMemoryEffectFree(op)) {
+    return false;
+  }
+  auto effects = dyn_cast<MemoryEffectOpInterface>(op);
+  return !effects || effects.hasEffect<MemoryEffects::Write>();
+}
+
+// The fused matmul of `from`, the matmul or linear it replaces, made where
+// `from` is (or after `insertAfter`): an in-place write after the matmul, such
+// as a cache update, must not change what it reads.
 FusedMatmulOp createFused(PatternRewriter &rewriter, Operation *from,
                           Type type, Value a, Value b, Value bias,
                           Value rowScale, Value colScale, bool transposeA,
                           bool transposeB, StringAttr activation,
-                          bool swiglu = false, bool exact = false) {
+                          bool swiglu = false, bool exact = false,
+                          Operation *insertAfter = nullptr) {
+  if (insertAfter) {
+    rewriter.setInsertionPointAfter(insertAfter);
+  } else {
+    rewriter.setInsertionPoint(from);
+  }
   auto fused = rewriter.create<FusedMatmulOp>(
       from->getLoc(), type, a, b, bias, rowScale, colScale,
       rewriter.getBoolAttr(transposeA), rewriter.getBoolAttr(transposeB),
@@ -136,6 +156,25 @@ public:
          colShape != ArrayRef<int64_t>{1, cols})) {
       return failure();
     }
+    // The scaled matmul goes where the matmul is, or after a scale made
+    // later, with nothing between that may write memory.
+    Operation *after = nullptr;
+    for (Value scale : {rowScale, colScale}) {
+      Operation *def = scale.getDefiningOp();
+      if (def && def->getBlock() != matmul->getBlock()) {
+        return failure();
+      }
+      if (def && matmul->isBeforeInBlock(def) &&
+          (!after || after->isBeforeInBlock(def))) {
+        after = def;
+      }
+    }
+    for (Operation *op = matmul->getNextNode(); after && op != after->getNextNode();
+         op = op->getNextNode()) {
+      if (mayWrite(op)) {
+        return failure();
+      }
+    }
     Operation *last = outer;
     if (outer->hasOneUse()) {
       auto cast = dyn_cast<TypecastOp>(*outer->getUsers().begin());
@@ -146,7 +185,7 @@ public:
     auto fused = createFused(
         rewriter, matmul, last->getResult(0).getType(), matmul.getA(),
         matmul.getB(), Value(), rowScale, colScale, false,
-        matmul.getTransposeB(), nullptr);
+        matmul.getTransposeB(), nullptr, false, false, after);
     rewriter.replaceOp(last, fused.getResult());
     if (last != outer) {
       rewriter.eraseOp(outer);
