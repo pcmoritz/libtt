@@ -89,6 +89,20 @@ def test_torch_qkv_norm_rope_prologue(model, tokens, heads, kv_heads, trace, q_f
     """The prologue runs as one split_qkv_norm_rope_decode (unless q is cropped
     or regrouped) and equals the separate ops (rms_norm, rotary_embedding, any
     pad and concat) bit for bit."""
+    _check_prologue(model, tokens, heads, kv_heads, trace, q_form, tmp_path)
+
+
+@pytest.mark.parametrize("tokens", [1, 4, 32])
+def test_prologue_with_physical_layouts(tokens, tmp_path, monkeypatch):
+    """With one KV head, k and v are [tokens, 1, 2 * head_dim] between the
+    rotary embedding and the cache, which ttir-physical-layouts would store
+    without the unit dim if it may (here: any cluster that saves anything). The
+    prologue is one op by then (the TTIR fusion), so it still fuses."""
+    monkeypatch.setenv("LIBTT_PHYSICAL_LAYOUTS_MIN_MB", "0")
+    _check_prologue(QWEN38, tokens, 6, 1, False, "q", tmp_path)
+
+
+def _check_prologue(model, tokens, heads, kv_heads, trace, q_form, tmp_path):
     head_dim, gated, rotary, _ = model
     if q_form == "regrouped_q" and (rotary == head_dim or heads == 1):
         pytest.skip("regrouping needs a partial rotary embedding and two q heads")
