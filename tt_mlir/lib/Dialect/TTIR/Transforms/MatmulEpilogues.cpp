@@ -367,19 +367,14 @@ public:
       return failure();
     }
     StringRef name = ActivationOp::getOperationName().rsplit('.').second;
-    FusedMatmulOp fused;
-    if (auto matmul = dyn_cast<MatmulOp>(producer)) {
-      fused = createFused(rewriter, matmul, activation.getType(),
-                          matmul.getA(), matmul.getB(), Value(), Value(),
-                          Value(), matmul.getTransposeA(),
-                          matmul.getTransposeB(), rewriter.getStringAttr(name));
-    } else {
-      auto linear = cast<LinearOp>(producer);
-      fused = createFused(rewriter, linear, activation.getType(),
-                          linear.getA(), linear.getB(), linear.getBias(),
-                          Value(), Value(), linear.getTransposeA(),
-                          linear.getTransposeB(), rewriter.getStringAttr(name));
-    }
+    auto fuse = [&](auto op, Value bias) {
+      return createFused(rewriter, op, activation.getType(), op.getA(),
+                         op.getB(), bias, Value(), Value(), op.getTransposeA(),
+                         op.getTransposeB(), rewriter.getStringAttr(name));
+    };
+    auto linear = dyn_cast<LinearOp>(producer);
+    FusedMatmulOp fused = linear ? fuse(linear, linear.getBias())
+                                 : fuse(cast<MatmulOp>(producer), Value());
     rewriter.replaceOp(activation, fused.getResult());
     rewriter.eraseOp(producer);
     return success();
