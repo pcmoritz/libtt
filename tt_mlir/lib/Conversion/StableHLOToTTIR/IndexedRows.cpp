@@ -1258,6 +1258,46 @@ public:
       return success();
     }
 
+    // A rank-1 update at a constant start on 32-element boundaries, such as
+    // FSDP2's copy of a shard into its flat all-gather buffer: the operand's
+    // slices before and after it with the update between them. They keep the
+    // elements in order, so a large array's dense view [N / 32, 32]
+    // (ttir-physical-layouts) runs through them. Others scatter rows: a slice of a
+    // wide row-major row at another offset stages the whole row.
+    APInt start;
+    if (operandType.getRank() == 1 &&
+        matchPattern(srcOp.getStartIndices()[0], m_ConstantInt(&start)) &&
+        operandShape[0] % 32 == 0 && updateShape[0] % 32 == 0 &&
+        std::clamp<int64_t>(start.getSExtValue(), 0,
+                            operandShape[0] - updateShape[0]) %
+                32 ==
+            0) {
+      int64_t size = operandShape[0];
+      int64_t width = updateShape[0];
+      // Out-of-range starts clamp, as in StableHLO.
+      int64_t begin = std::clamp<int64_t>(start.getSExtValue(), 0, size - width);
+      auto slice = [&](int64_t from, int64_t to) -> Value {
+        return rewriter.create<ttir::SliceStaticOp>(
+            loc,
+            RankedTensorType::get({to - from}, operandType.getElementType(),
+                                  operandType.getEncoding()),
+            operand, rewriter.getI32ArrayAttr({static_cast<int32_t>(from)}),
+            rewriter.getI32ArrayAttr({static_cast<int32_t>(to)}),
+            rewriter.getI32ArrayAttr({1}));
+      };
+      SmallVector<Value> pieces;
+      if (begin > 0) {
+        pieces.push_back(slice(0, begin));
+      }
+      pieces.push_back(update);
+      if (begin + width < size) {
+        pieces.push_back(slice(begin + width, size));
+      }
+      rewriter.replaceOpWithNewOp<ttir::ConcatOp>(
+          srcOp, operandType, pieces, rewriter.getSI32IntegerAttr(0));
+      return success();
+    }
+
     FailureOr<std::pair<Canonical, Value>> starts =
         buildStarts(rewriter, loc, adaptor.getStartIndices(), operandShape,
                     updateShape, /*clampStarts=*/true);
