@@ -128,3 +128,87 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
    }
    pm.addPass(mlir::tt::ttir::createTTIRWhileTripCount());
    pm.addPass(mlir::tt::ttir::createTTIRFoldFullToScalar());
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -127,58 +127,6 @@ private:
+   }
+ };
+ 
+-template <typename SrcOp, typename ActivationOp>
+-class TTNNMatmulAndLinearWithActivation : public mlir::OpRewritePattern<SrcOp> {
+-  using TTNNMatmulAndLinearWithActivation::template OpRewritePattern<
+-      SrcOp>::OpRewritePattern;
+-
+-public:
+-  mlir::LogicalResult
+-  matchAndRewrite(SrcOp srcOp, mlir::PatternRewriter &rewriter) const final {
+-    if (!isFusable(srcOp)) {
+-      return failure();
+-    }
+-
+-    ActivationOp activationOp =
+-        mlir::cast<ActivationOp>(*srcOp.getResult().getUsers().begin());
+-    Value activationInput = activationOp.getInput();
+-    auto activationStr = getActivationString();
+-
+-    rewriter.modifyOpInPlace(srcOp, [&]() {
+-      srcOp.setActivationAttr(rewriter.getStringAttr(activationStr));
+-    });
+-
+-    rewriter.replaceAllUsesWith(activationOp, activationInput);
+-    return mlir::success();
+-  }
+-
+-private:
+-  // After tt-metal resolves this issue:
+-  // https://github.com/tenstorrent/tt-metal/issues/31393, we can use the
+-  // UnaryWithParam enum directly instead of string.
+-  std::string getActivationString() const {
+-    llvm::StringLiteral fullOpName = ActivationOp::getOperationName();
+-    llvm::StringRef opName = fullOpName.rsplit('.').second;
+-    return opName.str();
+-  }
+-
+-  bool isFusable(SrcOp srcOp) const {
+-    if (srcOp.getActivation()) {
+-      return false;
+-    }
+-
+-    if (!srcOp.getResult().hasOneUse()) {
+-      return false;
+-    }
+-
+-    if (ttmlir::utils::allUsersOfType<ActivationOp>(srcOp)) {
+-      return true;
+-    }
+-
+-    return false;
+-  }
+-};
+-
+ namespace {
+ bool hasInterveningWrite(Value value, Operation *from, Operation *to) {
+   if (from->getBlock() != to->getBlock()) {
+@@ -859,15 +807,12 @@ public:
+     // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
+     // https://github.com/tenstorrent/tt-metal/issues/30973
+     patterns.add<TTNNBF16MeanOfUpcast, TTNNBinaryOpNarrowingOutput, TTNNRMSNormOfUpcast>(&getContext());
+-    patterns.add<
+-        TTNNConv2dWithActivation<ReluOp>, TTNNConv2dWithActivation<Relu6Op>,
+-        TTNNConv2dWithActivation<SiluOp>, TTNNConv2dWithActivation<SigmoidOp>,
+-        TTNNMatmulAndLinearWithActivation<MatmulOp, SigmoidOp>,
+-        TTNNMatmulAndLinearWithActivation<LinearOp, SigmoidOp>,
+-        TTNNMatmulAndLinearWithActivation<MatmulOp, SiluOp>,
+-        TTNNMatmulAndLinearWithActivation<LinearOp, SiluOp>,
+-        TTNNMatmulAndLinearWithActivation<MatmulOp, GeluOp>,
+-        TTNNMatmulAndLinearWithActivation<LinearOp, GeluOp>>(&getContext());
++    // Matmul and linear activations form on TTIR (libtt's
++    // ttir-matmul-epilogues).
++    patterns.add<TTNNConv2dWithActivation<ReluOp>,
++                 TTNNConv2dWithActivation<Relu6Op>,
++                 TTNNConv2dWithActivation<SiluOp>,
++                 TTNNConv2dWithActivation<SigmoidOp>>(&getContext());
+ 
+ #ifdef TTMLIR_ENABLE_OPMODEL
+     if (enableOpConstraints) {
