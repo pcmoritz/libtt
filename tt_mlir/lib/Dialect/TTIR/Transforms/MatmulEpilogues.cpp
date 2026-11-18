@@ -208,14 +208,12 @@ public:
 
   LogicalResult matchAndRewrite(MultiplyOp multiply,
                                 PatternRewriter &rewriter) const override {
-    // Exactly one operand is a silu.
-    auto lhsSilu = multiply.getLhs().getDefiningOp<SiluOp>();
-    auto rhsSilu = multiply.getRhs().getDefiningOp<SiluOp>();
-    if (!lhsSilu == !rhsSilu) {
+    // A silu times a slice (two silus fail: the other is no slice).
+    Value other;
+    auto silu = factorOf<SiluOp>(multiply, other);
+    if (!silu) {
       return failure();
     }
-    SiluOp silu = lhsSilu ? lhsSilu : rhsSilu;
-    Value other = lhsSilu ? multiply.getRhs() : multiply.getLhs();
     auto gate = silu.getInput().getDefiningOp<SliceStaticOp>();
     auto up = other.getDefiningOp<SliceStaticOp>();
     if (!gate || !up || !silu->hasOneUse() || !gate->hasOneUse() ||
