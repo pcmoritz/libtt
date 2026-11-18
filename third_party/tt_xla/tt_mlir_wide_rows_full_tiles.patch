@@ -9,7 +9,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  #include "ttmlir/Dialect/TTIR/Transforms/Fusing/RoPEFusingPattern.h"
  #include "ttmlir/Dialect/TTIR/Transforms/Fusing/SDPAFusingPattern.h"
  #include "ttmlir/Dialect/TTIR/Transforms/Fusing/SplitQKVNormRopeDecodeFusing.h"
-@@ -4832,6 +4833,10 @@
+@@ -4770,6 +4771,10 @@
        patterns.add<HoistReshapeToFewerTilesPattern,
                     SinkReshapeToFewerTilesPattern,
                     SinkReshapeThroughPermutePattern>(&getContext());

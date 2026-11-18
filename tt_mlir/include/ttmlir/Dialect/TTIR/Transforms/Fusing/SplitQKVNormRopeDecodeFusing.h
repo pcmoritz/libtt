@@ -7,14 +7,8 @@
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 
 #include "mlir/IR/PatternMatch.h"
-#include "llvm/ADT/StringRef.h"
 
 namespace mlir::tt::ttir::fusing {
-
-// The composite this fusion makes, which TTNNResolveComposites turns into
-// ttnn.split_qkv_norm_rope_decode.
-inline constexpr llvm::StringLiteral kSplitQKVNormRopeDecode =
-    "split_qkv_norm_rope_decode";
 
 // Fuses a decode step's attention prologue as PyTorch models trace it
 // (SGLang-TorchTPU's Qwen3 and Qwen3.8, whose KV cache holds k and v side by
@@ -32,11 +26,9 @@ inline constexpr llvm::StringLiteral kSplitQKVNormRopeDecode =
 // rotates the first R dims of the normed heads and concatenates the rest
 // after them. It anchors on the concat of k and v.
 //
-// The prologue becomes one ttcore.composite, kSplitQKVNormRopeDecode, of
-// (qkv as [B, W], q_weight, k_weight, cos, sin), whose decomposition holds
-// the ops it replaces. TTNNResolveComposites promotes it to the fused op when
-// the layouts TTNNLayout chose suit the kernel and inlines the decomposition
-// otherwise. Matched on TTIR, the prologue keeps its shapes from the passes
+// The prologue becomes one ttir.split_qkv_norm_rope_decode of (qkv as
+// [B, W], q_weight, k_weight, cos, sin), which lowers to the TTNN op of the
+// same name. Matched on TTIR, the prologue keeps its shapes from the passes
 // that change shapes before lowering (ttir-physical-layouts), as XLA forms
 // its library calls before it assigns layouts.
 class SplitQKVNormRopeDecodeFusing : public mlir::OpRewritePattern<ConcatOp> {

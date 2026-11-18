@@ -6,10 +6,6 @@
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
 #include "ttmlir/Dialect/TTIR/Utils/Utils.h"
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/IRMapping.h"
-#include "mlir/IR/SymbolTable.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
@@ -219,7 +215,7 @@ SmallVector<ttcore::CompositeOp> rotariesOf(Value qkv) {
   SmallVector<ttcore::CompositeOp> rotaries;
   SmallVector<Value> work{qkv};
   llvm::DenseSet<Operation *> seen;
-  while (!work.empty() && seen.size() < 256) {
+  while (!work.empty()) {
     Value value = work.pop_back_val();
     for (Operation *user : value.getUsers()) {
       if (!seen.insert(user).second) {
@@ -326,14 +322,13 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
   Value cos = rotaryCos(qRope);
   Value sin = rotarySin(qRope);
   const int64_t rotated = shapeOf(rotaryInput(qRope)).back();
-  const int64_t tableRows = tokens == 1 ? 1 : tokens;
   IntegerAttr tokenIndex = tokenIndexOf(qRope);
   if (rotated % 64 != 0 || shapeOf(rotaryInput(kRope)).back() != rotated ||
       shapeOf(rotaryInput(qRope)) !=
           ArrayRef<int64_t>{1, tokens, numQHeads, rotated} ||
       shapeOf(rotaryInput(kRope)) !=
           ArrayRef<int64_t>{1, tokens, numKVHeads, rotated} ||
-      shapeOf(cos) != ArrayRef<int64_t>{1, tableRows, 1, rotated} ||
+      shapeOf(cos) != ArrayRef<int64_t>{1, tokens, 1, rotated} ||
       shapeOf(sin) != shapeOf(cos) ||
       (tokens == 1 ? !tokenIndex || !tokenIndex.getValue().isZero()
                    : !!tokenIndex)) {
@@ -379,21 +374,17 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
     if (!pad.getValue().isPosZero()) {
       return mlir::failure();
     }
-    // Only the last dim's high side, and only wider: TTIR allows negative
-    // padding (a crop), and the first fusing runs before such pads become
-    // slices.
     ArrayRef<int32_t> padding = pad.getPadding();
     for (size_t i = 0; i + 1 < padding.size(); ++i) {
       if (padding[i] != 0) {
         return mlir::failure();
       }
     }
-    if (padding.back() < 0) {
-      return mlir::failure();
-    }
     qOut = alongReshapes(pad.getResult());
   }
-  // The kernel writes q_width >= head_dim columns, a multiple of 32.
+  // The kernel writes q_width >= head_dim columns, a multiple of 32. (TTIR
+  // allows a negative pad, a crop, and the first fusing runs before such pads
+  // become slices.)
   const int64_t qWidth = shapeOf(qOut).back();
   if (shapeOf(qHeads).back() != headDim || qWidth < headDim ||
       qWidth % 32 != 0 ||
@@ -412,7 +403,7 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
     return mlir::failure();
   }
 
-  // The composite goes before the first user of its results, after its
+  // The fused op goes before the first user of its results, after its
   // operands.
   Block *block = concat->getBlock();
   Operation *first = nullptr;
@@ -439,14 +430,13 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
   // The ops it replaces: those from its operands (k's copies of cos and sin
   // among them) to its results, all views, norms, rotary embeddings, concats
   // and pads.
-  llvm::DenseMap<Value, unsigned> argument{
-      {qkv, 0},  {qWeight, 1}, {kWeight, 2}, {cos, 3}, {sin, 4},
-      {rotaryCos(kRope), 3},   {rotarySin(kRope), 4}};
+  const llvm::DenseSet<Value> operands{
+      qkv, qWeight, kWeight, cos, sin, rotaryCos(kRope), rotarySin(kRope)};
   llvm::SetVector<Operation *> replaced;
   SmallVector<Value> work{qOut, kvOut};
   while (!work.empty()) {
     Value value = work.pop_back_val();
-    if (argument.count(value)) {
+    if (operands.contains(value)) {
       continue;
     }
     Operation *op = value.getDefiningOp();
@@ -474,49 +464,12 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
         loc, RankedTensorType::get(rowsShape, qkvType.getElementType()), qkv,
         rewriter.getI32ArrayAttr(i32Shape(rowsShape)));
   }
-  SmallVector<Value> operands{rows, qWeight, kWeight, cos, sin};
-  SmallVector<Type> resultTypes{qOut.getType(), kvOut.getType()};
-
-  // The decomposition: the replaced ops, reading the composite's operands.
-  auto module = concat->getParentOfType<ModuleOp>();
-  auto decomposition = func::FuncOp::create(
-      loc, (kSplitQKVNormRopeDecode + "_decomp").str(),
-      rewriter.getFunctionType(ValueRange(operands).getTypes(), resultTypes));
-  decomposition.setVisibility(SymbolTable::Visibility::Private);
-  decomposition->setAttr(utils::kCompositeDecompositionAttr,
-                         rewriter.getUnitAttr());
-  SymbolTable(module).insert(decomposition);
-  Block *body = decomposition.addEntryBlock();
-  OpBuilder builder = OpBuilder::atBlockBegin(body);
-  IRMapping mapping;
-  for (auto [value, index] : argument) {
-    mapping.map(value, body->getArgument(index));
-  }
-  if (rows != qkv) {
-    mapping.map(qkv, builder.create<ReshapeOp>(
-                         loc, qkvType, body->getArgument(0),
-                         builder.getI32ArrayAttr(i32Shape(qkvType.getShape()))));
-  }
-  for (Operation *op : ops) {
-    builder.clone(*op, mapping);
-  }
-  builder.create<func::ReturnOp>(
-      loc, ValueRange{mapping.lookup(qOut), mapping.lookup(kvOut)});
-
-  NamedAttrList attributes;
-  attributes.append("num_q_heads", rewriter.getUI32IntegerAttr(numQHeads));
-  attributes.append("num_kv_heads", rewriter.getUI32IntegerAttr(numKVHeads));
-  attributes.append("epsilon", qNorm.getEpsilonAttr());
-  // Its fused op needs no op-model validation (at O0, composites are inlined
-  // unless they say so).
-  attributes.append("promote_unvalidated", rewriter.getUnitAttr());
-  auto composite = rewriter.create<ttcore::CompositeOp>(
-      loc, resultTypes, operands,
-      rewriter.getStringAttr(kSplitQKVNormRopeDecode),
-      FlatSymbolRefAttr::get(decomposition.getSymNameAttr()),
-      attributes.getDictionary(rewriter.getContext()));
-  rewriter.replaceAllUsesWith(qOut, composite.getResult(0));
-  rewriter.replaceAllUsesWith(kvOut, composite.getResult(1));
+  auto fused = rewriter.create<SplitQKVNormRopeDecodeOp>(
+      loc, qOut.getType(), kvOut.getType(), rows, qWeight, kWeight, cos, sin,
+      rewriter.getUI32IntegerAttr(numQHeads),
+      rewriter.getUI32IntegerAttr(numKVHeads), qNorm.getEpsilonAttr());
+  rewriter.replaceAllUsesWith(qOut, fused.getQuery());
+  rewriter.replaceAllUsesWith(kvOut, fused.getKeyValues());
   // The replaced ops that feed nothing else now; the rotary embeddings are
   // not pure, so the rewrite driver would keep them.
   for (Operation *op : llvm::reverse(ops)) {

@@ -1,7 +1,41 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -6827,6 +6827,30 @@ def TTIR_SplitQueryKeyValueAndSplitHeadsOp: TTIR_NamedOp<"split_query_key_value_
+     let hasVerifier = 1;
+ }
+ 
++def TTIR_SplitQKVNormRopeDecodeOp : TTIR_NamedOp<"split_qkv_norm_rope_decode"> {
++  let summary = "A decode step's attention prologue as PyTorch models trace it";
++  let description = [{
++    Splits a fused QKV projection input [B, W] into q, k and v heads, applies
++    rms_norm with q_weight and k_weight to the q and k heads and
++    rotary_embedding with token b's row of cos_cache and sin_cache to both,
++    and returns query [1, B, num_q_heads, q_width] and key_values [1, B,
++    num_kv_heads, 2 * head_dim]: see ttnn.split_qkv_norm_rope_decode, which
++    it lowers to. libtt's SplitQKVNormRopeDecodeFusing forms it.
++  }];
++
++  let arguments = (ins AnyRankedTensor:$input,
++                       AnyRankedTensor:$q_weight,
++                       AnyRankedTensor:$k_weight,
++                       AnyRankedTensor:$cos_cache,
++                       AnyRankedTensor:$sin_cache,
++                       UI32Attr:$num_q_heads,
++                       UI32Attr:$num_kv_heads,
++                       F32Attr:$epsilon);
++
++  let results = (outs AnyRankedTensor:$query,
++                      AnyRankedTensor:$key_values);
++}
++
+ def TTIR_TopKOp : TTIR_NamedOp<"topk"> {
+   let summary = "Top-K selection operation.";
+   let description = [{
 diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 --- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
 +++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
-@@ -4807,6 +4807,36 @@
+@@ -4803,6 +4803,36 @@ def TTNN_NLPCreateQKVHeadsDecodeNormRopeOp : TTNN_Op<"nlp_create_qkv_heads_decod
                        AnyRankedTensor:$value);
  }
  
@@ -41,7 +75,7 @@ diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/
 diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttmlir/Target/TTNN/operations/transformer.fbs
 --- a/include/ttmlir/Target/TTNN/operations/transformer.fbs
 +++ b/include/ttmlir/Target/TTNN/operations/transformer.fbs
-@@ -183,6 +183,19 @@
+@@ -180,6 +180,19 @@ table IndexerScoreDsaOp {
    cluster_axis: uint32 = null;
  }
  
@@ -64,7 +98,7 @@ diff --git a/include/ttmlir/Target/TTNN/operations/transformer.fbs b/include/ttm
 diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN/program.fbs
 --- a/include/ttmlir/Target/TTNN/program.fbs
 +++ b/include/ttmlir/Target/TTNN/program.fbs
-@@ -58,6 +58,7 @@
+@@ -58,6 +58,7 @@ union OpType {
    RotaryEmbeddingOp,
    NLPCreateQKVHeadsDecodeOp,
    NLPCreateQKVHeadsDecodeNormRopeOp,
@@ -72,6 +106,43 @@ diff --git a/include/ttmlir/Target/TTNN/program.fbs b/include/ttmlir/Target/TTNN
    NLPConcatHeadsOp,
    ConstantOp,
    CaseOp,
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -3443,6 +3443,25 @@ public:
+     return success();
+   }
+ };
++
++class SplitQKVNormRopeDecodeOpConversionPattern
++    : public OpConversionPattern<ttir::SplitQKVNormRopeDecodeOp> {
++public:
++  using OpConversionPattern<
++      ttir::SplitQKVNormRopeDecodeOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(ttir::SplitQKVNormRopeDecodeOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    rewriter.replaceOpWithNewOp<ttnn::SplitQKVNormRopeDecodeOp>(
++        op, getTypeConverter()->convertType(op.getQuery().getType()),
++        getTypeConverter()->convertType(op.getKeyValues().getType()),
++        adaptor.getInput(), adaptor.getQWeight(), adaptor.getKWeight(),
++        adaptor.getCosCache(), adaptor.getSinCache(), op.getNumQHeadsAttr(),
++        op.getNumKvHeadsAttr(), op.getEpsilonAttr());
++    return success();
++  }
++};
+ } // namespace
+ 
+ namespace {
+@@ -4260,6 +4279,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            StatePoolCopyOpConversionPattern,
+            PagedFlashMultiLatentAttentionDecodeOpConversionPattern,
+            SplitQueryKeyValueAndSplitHeadsOpConversionPattern,
++           SplitQKVNormRopeDecodeOpConversionPattern,
+            GeluBackwardOpConversionPattern,
+            DropoutOpConversionPattern,
+            DebugOpConversionPattern<debug::DumpOp, ttnn::DumpTensorOp>,
 diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 --- a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
 +++ b/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp
@@ -83,7 +154,7 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  #include "ttmlir/Dialect/TTIR/Transforms/Fusing/TopKFusingPattern.h"
  #include "ttmlir/Dialect/TTIR/Transforms/Passes.h"
  #include "ttmlir/Dialect/TTIR/Utils/Utils.h"
-@@ -4815,6 +4816,9 @@
+@@ -4815,6 +4816,9 @@ public:
            fusing::SDPAHeadExpansionFusingPattern<ttcore::CompositeOp>>(
            &getContext());
        patterns.add<fusing::TopKFusingPattern>(&getContext());
@@ -93,130 +164,10 @@ diff --git a/lib/Dialect/TTIR/Transforms/TTIRFusing.cpp b/lib/Dialect/TTIR/Trans
  
        GreedyRewriteConfig config;
        config.setUseTopDownTraversal(true);
-diff --git a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
---- a/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
-+++ b/lib/Dialect/TTNN/Transforms/TTNNResolveComposites.cpp
-@@ -6,6 +6,7 @@
- #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
- #include "ttmlir/Dialect/TTCore/IR/Utils.h"
- #include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
-+#include "ttmlir/Dialect/TTNN/Transforms/Fusing/SplitQKVNormRopeDecodeFusing.h"
- #include "ttmlir/Dialect/TTNN/Transforms/OpValidator.h"
- #include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
- #include "ttmlir/Dialect/TTNN/Utils/Utils.h"
-@@ -777,6 +778,12 @@
-     return nullptr;
-   }
- 
-+  // libtt's attention prologue: its kernel's own checks of the layouts it
-+  // reads (SplitQKVNormRopeDecodeFusing.cpp).
-+  if (compositeOp.getCompositeName() == fusing::kSplitQKVNormRopeDecode) {
-+    return fusing::buildSplitQKVNormRopeDecode(compositeOp, builder);
-+  }
-+
-   auto &registry = getCompositeRegistry();
-   auto it = registry.find(compositeOp.getCompositeName());
-   if (it == registry.end()) {
-@@ -814,46 +821,64 @@
-     llvm::DenseSet<func::FuncOp> decompositionFuncsToDelete;
-     bool passFailed = false;
- 
--    moduleOp.walk([&](ttcore::CompositeOp compositeOp) {
--      if (passFailed) {
--        return;
--      }
--
--      auto decompName = compositeOp.getDecomposition();
--      auto *symbolOp = SymbolTable::lookupSymbolIn(moduleOp, decompName);
--      auto decompFunc = dyn_cast<func::FuncOp>(symbolOp);
--
--      OpBuilder builder(compositeOp);
--      Operation *typedOp =
--          tryCreateTypedOp(compositeOp, builder, compositeResolution);
--
--      if (typedOp) {
--        for (auto [result, typedResult] :
--             llvm::zip(compositeOp.getResults(), typedOp->getResults())) {
--          result.replaceAllUsesWith(typedResult);
--        }
--        compositeOp.erase();
--      } else {
--        if (mlir::failed(inlineDecomposition(compositeOp, moduleOp))) {
--          passFailed = true;
-+    // A decomposition can hold composites (libtt's attention prologue holds
-+    // its rotary embeddings). Inlining it copies them in where this walk has
-+    // passed, so walk again until nothing is inlined.
-+    bool inlined = true;
-+    while (inlined && !passFailed) {
-+      inlined = false;
-+      moduleOp.walk([&](ttcore::CompositeOp compositeOp) {
-+        if (passFailed) {
-           return;
-         }
--      }
- 
--      if (decompFunc) {
--        decompositionFuncsToDelete.insert(decompFunc);
--      }
--    });
-+        auto decompName = compositeOp.getDecomposition();
-+        auto *symbolOp = SymbolTable::lookupSymbolIn(moduleOp, decompName);
-+        auto decompFunc = dyn_cast<func::FuncOp>(symbolOp);
-+
-+        OpBuilder builder(compositeOp);
-+        Operation *typedOp =
-+            tryCreateTypedOp(compositeOp, builder, compositeResolution);
-+
-+        if (typedOp) {
-+          for (auto [result, typedResult] :
-+               llvm::zip(compositeOp.getResults(), typedOp->getResults())) {
-+            result.replaceAllUsesWith(typedResult);
-+          }
-+          compositeOp.erase();
-+        } else {
-+          if (mlir::failed(inlineDecomposition(compositeOp, moduleOp))) {
-+            passFailed = true;
-+            return;
-+          }
-+          inlined = true;
-+        }
-+
-+        if (decompFunc) {
-+          decompositionFuncsToDelete.insert(decompFunc);
-+        }
-+      });
-+    }
- 
-     if (passFailed) {
-       signalPassFailure();
-       return;
-     }
- 
--    // Clean up decomposition functions that are no longer referenced.
--    for (func::FuncOp func : decompositionFuncsToDelete) {
--      if (func && SymbolTable::symbolKnownUseEmpty(func, moduleOp)) {
--        func.erase();
-+    // Clean up decomposition functions that are no longer referenced, until
-+    // none is: erasing one can leave the decompositions it referenced
-+    // unreferenced.
-+    SmallVector<func::FuncOp> funcs(decompositionFuncsToDelete.begin(),
-+                                    decompositionFuncsToDelete.end());
-+    bool erased = true;
-+    while (erased) {
-+      erased = false;
-+      for (func::FuncOp &func : funcs) {
-+        if (func && SymbolTable::symbolKnownUseEmpty(func, moduleOp)) {
-+          func.erase();
-+          func = nullptr;
-+          erased = true;
-+        }
-       }
-     }
-   }
 diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 --- a/lib/Target/TTNN/TTNNToFlatbuffer.cpp
 +++ b/lib/Target/TTNN/TTNNToFlatbuffer.cpp
-@@ -4637,6 +4637,24 @@
+@@ -4626,6 +4626,24 @@ createOp(FlatbufferObjectCache &cache, NLPCreateQKVHeadsDecodeOp op) {
        overlapQKCoregrid, batchOffset, sliceSize, memoryConfig);
  }
  
@@ -241,7 +192,7 @@ diff --git a/lib/Target/TTNN/TTNNToFlatbuffer.cpp b/lib/Target/TTNN/TTNNToFlatbu
  ::flatbuffers::Offset<::tt::target::ttnn::NLPCreateQKVHeadsDecodeNormRopeOp>
  createOp(FlatbufferObjectCache &cache, NLPCreateQKVHeadsDecodeNormRopeOp op) {
    auto tensor = [&](Value value) {
-@@ -5873,6 +5891,10 @@
+@@ -5862,6 +5880,10 @@ emitTTNNOperation(FlatbufferObjectCache &cache, Operation *op,
      return createOperation(cache, createOp(cache, nlpCreateQKVHeadsDecodeOp),
                             debugString, locInfo);
    }
@@ -263,7 +214,7 @@ diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_ex
  #include "operations/transformer/paged_flash_multi_latent_attention_decode.h"
  #include "operations/transformer/paged_scaled_dot_product_attention_decode.h"
  #include "operations/matmul/scaled_matmul.h"
-@@ -477,6 +478,10 @@
+@@ -477,6 +478,10 @@ void ProgramExecutor::runOperation(const ::tt::target::ttnn::Operation *op) {
      return operations::transformer::run(op->type_as_NLPCreateQKVHeadsDecodeOp(),
                                          getContext());
    }
