@@ -156,8 +156,25 @@ public:
          colShape != ArrayRef<int64_t>{1, cols})) {
       return failure();
     }
+    Operation *last = outer;
+    if (outer->hasOneUse()) {
+      auto cast = dyn_cast<TypecastOp>(*outer->getUsers().begin());
+      if (cast && elementTypeOf(cast.getResult()).isBF16()) {
+        last = cast;
+      }
+    }
     // The scaled matmul goes where the matmul is, or after a scale made
-    // later, with nothing between that may write memory.
+    // later. It reads the operands and the scales at that one point, so
+    // nothing between the matmul and the ops it replaces may write memory.
+    if (last->getBlock() != matmul->getBlock()) {
+      return failure();
+    }
+    for (Operation *op = matmul->getNextNode(); op != last;
+         op = op->getNextNode()) {
+      if (mayWrite(op)) {
+        return failure();
+      }
+    }
     Operation *after = nullptr;
     for (Value scale : {rowScale, colScale}) {
       Operation *def = scale.getDefiningOp();
@@ -167,19 +184,6 @@ public:
       if (def && matmul->isBeforeInBlock(def) &&
           (!after || after->isBeforeInBlock(def))) {
         after = def;
-      }
-    }
-    for (Operation *op = matmul->getNextNode(); after && op != after->getNextNode();
-         op = op->getNextNode()) {
-      if (mayWrite(op)) {
-        return failure();
-      }
-    }
-    Operation *last = outer;
-    if (outer->hasOneUse()) {
-      auto cast = dyn_cast<TypecastOp>(*outer->getUsers().begin());
-      if (cast && elementTypeOf(cast.getResult()).isBF16()) {
-        last = cast;
       }
     }
     auto fused = createFused(
