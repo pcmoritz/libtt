@@ -4,7 +4,6 @@
 #include "ttmlir/Dialect/TTIR/Transforms/Fusing/SplitQKVNormRopeDecodeFusing.h"
 
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOps.h"
-#include "ttmlir/Dialect/TTIR/Utils/Utils.h"
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -239,10 +238,6 @@ SmallVector<int32_t> i32Shape(ArrayRef<int64_t> shape) {
 
 mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
     ConcatOp concat, mlir::PatternRewriter &rewriter) const {
-  // Not in decompositions, which hold the ops fusions replaced.
-  if (utils::isInsideCompositeDecomposition(concat)) {
-    return mlir::failure();
-  }
   // concat(k, v) [B, Hkv, 2 D] along the last dim, k as rotated parts.
   ArrayRef<int64_t> kvShape = shapeOf(concat.getResult());
   if (kvShape.size() != 3 || !isLastDimConcat(concat) ||

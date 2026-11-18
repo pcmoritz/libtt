@@ -28,9 +28,9 @@ namespace mlir::tt::ttir::fusing {
 //
 // The prologue becomes one ttir.split_qkv_norm_rope_decode of (qkv as
 // [B, W], q_weight, k_weight, cos, sin), which lowers to the TTNN op of the
-// same name. Matched on TTIR, the prologue keeps its shapes from the passes
-// that change shapes before lowering (ttir-physical-layouts), as XLA forms
-// its library calls before it assigns layouts.
+// same name. Matched on TTIR, the prologue is one op before any later pass
+// can change its shapes, as XLA forms its library calls before it assigns
+// layouts.
 class SplitQKVNormRopeDecodeFusing : public mlir::OpRewritePattern<ConcatOp> {
 public:
   using OpRewritePattern<ConcatOp>::OpRewritePattern;
