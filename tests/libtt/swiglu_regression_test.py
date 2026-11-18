@@ -144,6 +144,28 @@ def test_torch_silu_and_mul_projection(rows, inner_size, width, transposed, tmp_
     _assert_exact_swiglu(tmp_path, "matmul")
 
 
+def test_halves_of_an_odd_projection_stay_unfused(tmp_path):
+    """SiluAndMul of columns 0:32 and 32:64 of a 65-column projection, the last
+    column unused: the SwiGLU matmul takes the two halves of the whole width,
+    so the projection keeps its matmul and the separate ops."""
+    options = {"optimization_level": "O0"}
+    device = jax.devices("tt")[0]
+    rng = np.random.default_rng(11)
+    x = jax.device_put(jnp.asarray(rng.normal(0, 1, (1, 512)), jnp.bfloat16), device)
+    w = jax.device_put(jnp.asarray(rng.normal(0, 0.05, (65, 512)), jnp.bfloat16), device)
+
+    def f(x, w):
+        y = x @ w.T
+        gate = y[:, :32].astype(jnp.float32)
+        return (gate / (1 + jnp.exp(-gate))).astype(jnp.bfloat16) * y[:, 32:64]
+
+    fused = jax.jit(f, compiler_options={**options, "export_path": str(tmp_path)})
+    want = jax.jit(f, compiler_options=options)(x, w)
+    np.testing.assert_array_equal(np.asarray(fused(x, w), np.float32), np.asarray(want, np.float32))
+    irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
+    assert not any("ttnn.fused_swiglu" in ir for ir in irs), "halves of an odd projection were fused"
+
+
 def test_activation_after_torch_silu_and_mul(tmp_path):
     """An activation after PyTorch's SiluAndMul stays an op of its own: the
     SwiGLU matmul's epilogue is the SwiGLU, and matmul_swiglu applies no other.

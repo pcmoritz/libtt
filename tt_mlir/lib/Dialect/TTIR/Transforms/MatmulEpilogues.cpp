@@ -325,7 +325,8 @@ public:
     ArrayRef<int64_t> shape = type.getShape();
     const int64_t half = shape.back() / 2;
     const int64_t k = typeOf(a).getShape().back();
-    if (shape.size() != 2 || !type.getElementType().isBF16() ||
+    if (shape.size() != 2 || shape[1] != 2 * half ||
+        !type.getElementType().isBF16() ||
         !elementTypeOf(multiply.getResult()).isBF16() || shape[0] > kTile ||
         half % kTile != 0 || k % kTile != 0 ||
         !isColumns(gate, shape[0], 0, half) ||
