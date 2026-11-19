@@ -1,0 +1,214 @@
+diff --git a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+--- a/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
++++ b/include/ttmlir/Dialect/TTIR/IR/TTIROps.td
+@@ -5436,6 +5436,37 @@ def TTIR_MatmulOp : TTIR_NamedOp<"matmul"> {
+ }
+ // ANCHOR_END: adding_an_op_matmul_ttir
+ 
++def TTIR_FusedMatmulOp : TTIR_NamedOp<"fused_matmul", [AttrSizedOperandSegments]> {
++  let summary = "A matmul with the epilogue its TTNN kernel applies as it writes";
++  let description = [{
++    a @ b, a or b transposed if transpose_a or transpose_b, with
++    - bias added (ttnn.linear), or
++    - in FP32, times row_scale [M, 1] and col_scale [1, N] ([N, 1] taken as
++      its transpose, or one element), a and b float8 (ttnn.scaled_matmul),
++    and then
++    - activation (silu, gelu or sigmoid) applied, or
++    - fused_swiglu: the product's halves [up | gate] combined as
++      up * silu(gate); with exact_swiglu, [gate | up] as
++      BF16(silu(FP32(gate))) * up, rounded as those ops round (PyTorch's
++      SiluAndMul).
++    libtt's ttir-matmul-epilogues forms it; it lowers to ttnn.matmul,
++    ttnn.linear or ttnn.scaled_matmul with the same epilogue.
++  }];
++
++  let arguments = (ins AnyRankedTensor:$a,
++                       AnyRankedTensor:$b,
++                       Optional<AnyRankedTensor>:$bias,
++                       Optional<AnyRankedTensor>:$row_scale,
++                       Optional<AnyRankedTensor>:$col_scale,
++                       DefaultValuedAttr<BoolAttr, "false">:$transpose_a,
++                       DefaultValuedAttr<BoolAttr, "false">:$transpose_b,
++                       OptionalAttr<StrAttr>:$activation,
++                       UnitAttr:$fused_swiglu,
++                       UnitAttr:$exact_swiglu);
++
++  let results = (outs AnyRankedTensor:$result);
++}
++
+ def TTIR_PermuteOp : TTIR_NamedOp<"permute", [TTIR_TensorManipulation]> {
+     let summary = "Tensor dimension permutation operation.";
+     let description = [{
+diff --git a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+--- a/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
++++ b/lib/Conversion/TTIRToTTNN/TTIRToTTNN.cpp
+@@ -1633,6 +1633,49 @@ public:
+     return success();
+   }
+ };
++
++// A matmul with an epilogue (libtt's ttir-matmul-epilogues): ttnn.scaled_matmul
++// with output scales, ttnn.linear with a bias, ttnn.matmul otherwise.
++class FusedMatmulOpConversionPattern
++    : public OpConversionPattern<ttir::FusedMatmulOp> {
++public:
++  using OpConversionPattern<ttir::FusedMatmulOp>::OpConversionPattern;
++
++  LogicalResult
++  matchAndRewrite(ttir::FusedMatmulOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    Type type = this->getTypeConverter()->convertType(op.getType());
++    Operation *newOp;
++    if (adaptor.getRowScale()) {
++      newOp = rewriter.create<ttnn::ScaledMatmulOp>(
++          op.getLoc(), type, adaptor.getA(), adaptor.getB(),
++          adaptor.getRowScale(), adaptor.getColScale(), op.getTransposeBAttr(),
++          /*compute_config=*/nullptr);
++    } else if (adaptor.getBias()) {
++      newOp = rewriter.create<ttnn::LinearOp>(
++          op.getLoc(), type, adaptor.getA(), adaptor.getB(), adaptor.getBias(),
++          adaptor.getTransposeA(), adaptor.getTransposeB(),
++          /*matmul_program_config=*/nullptr, op.getActivationAttr(),
++          /*compute_config=*/nullptr);
++    } else {
++      newOp = rewriter.create<ttnn::MatmulOp>(
++          op.getLoc(), type, adaptor.getA(), adaptor.getB(),
++          adaptor.getTransposeA(), adaptor.getTransposeB(),
++          /*matmul_program_config=*/nullptr, op.getActivationAttr());
++    }
++    if (auto attr = op->getAttr("ttcore.weight_dtype")) {
++      newOp->setAttr("ttcore.weight_dtype", attr);
++    }
++    if (op.getFusedSwiglu()) {
++      newOp->setAttr("ttnn.fused_swiglu", rewriter.getUnitAttr());
++    }
++    if (op.getExactSwiglu()) {
++      newOp->setAttr("ttnn.exact_swiglu", rewriter.getUnitAttr());
++    }
++    rewriter.replaceOp(op, newOp->getResults());
++    return success();
++  }
++};
+ } // namespace
+ // ANCHOR_END: adding_an_op_matmul_op_rewriter
+ 
+@@ -4324,6 +4367,7 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
+            LayerNormOpConversionPattern,
+            GroupNormOpConversionPattern,
+            MatmulOpConversionPattern,
++           FusedMatmulOpConversionPattern,
+            SparseMatmulOpConversionPattern,
+            AllToAllDispatchOpConversionPattern,
+            AllToAllDispatchMetadataOpConversionPattern,
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -24,6 +24,11 @@
+ #include "mlir/Pass/PassManager.h"
+ #include "mlir/Transforms/Passes.h"
+ 
++namespace mlir::tt::ttir {
++// libtt's tt_mlir/lib/Dialect/TTIR/Transforms/MatmulEpilogues.cpp.
++std::unique_ptr<Pass> createTTIRMatmulEpiloguesPass(bool claimActivations);
++} // namespace mlir::tt::ttir
++
+ namespace mlir::tt::ttnn {
+ //===----------------------------------------------------------------------===//
+ // Helper functions which combine multiple passes into logical groupings.
+@@ -91,6 +96,12 @@ void createTTNNPipelineTTIRPasses(
+   }
+   if (options.enableFusing) {
+     pm.addPass(mlir::tt::ttir::createTTIRFusing(fusingOptions));
++    // The epilogues the TTNN matmul kernels apply (libtt), after
++    // ttir-propagate-weight-dtype. A binary op takes an activation as its
++    // input activation instead under the options TTNNFusing does so with.
++    pm.addPass(mlir::tt::ttir::createTTIRMatmulEpiloguesPass(
++        options.enableEltwiseActivationFusion ||
++        (options.optimizerPassEnabled && options.enableDRAMShardedMatmul)));
+   }
+   pm.addPass(mlir::tt::ttir::createTTIRWhileTripCount());
+   pm.addPass(mlir::tt::ttir::createTTIRFoldFullToScalar());
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+--- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
+@@ -127,58 +127,6 @@ private:
+   }
+ };
+ 
+-template <typename SrcOp, typename ActivationOp>
+-class TTNNMatmulAndLinearWithActivation : public mlir::OpRewritePattern<SrcOp> {
+-  using TTNNMatmulAndLinearWithActivation::template OpRewritePattern<
+-      SrcOp>::OpRewritePattern;
+-
+-public:
+-  mlir::LogicalResult
+-  matchAndRewrite(SrcOp srcOp, mlir::PatternRewriter &rewriter) const final {
+-    if (!isFusable(srcOp)) {
+-      return failure();
+-    }
+-
+-    ActivationOp activationOp =
+-        mlir::cast<ActivationOp>(*srcOp.getResult().getUsers().begin());
+-    Value activationInput = activationOp.getInput();
+-    auto activationStr = getActivationString();
+-
+-    rewriter.modifyOpInPlace(srcOp, [&]() {
+-      srcOp.setActivationAttr(rewriter.getStringAttr(activationStr));
+-    });
+-
+-    rewriter.replaceAllUsesWith(activationOp, activationInput);
+-    return mlir::success();
+-  }
+-
+-private:
+-  // After tt-metal resolves this issue:
+-  // https://github.com/tenstorrent/tt-metal/issues/31393, we can use the
+-  // UnaryWithParam enum directly instead of string.
+-  std::string getActivationString() const {
+-    llvm::StringLiteral fullOpName = ActivationOp::getOperationName();
+-    llvm::StringRef opName = fullOpName.rsplit('.').second;
+-    return opName.str();
+-  }
+-
+-  bool isFusable(SrcOp srcOp) const {
+-    if (srcOp.getActivation()) {
+-      return false;
+-    }
+-
+-    if (!srcOp.getResult().hasOneUse()) {
+-      return false;
+-    }
+-
+-    if (ttmlir::utils::allUsersOfType<ActivationOp>(srcOp)) {
+-      return true;
+-    }
+-
+-    return false;
+-  }
+-};
+-
+ namespace {
+ bool hasInterveningWrite(Value value, Operation *from, Operation *to) {
+   if (from->getBlock() != to->getBlock()) {
+@@ -859,15 +807,12 @@ public:
+     // TODO(mvasiljevic): Add HardsigmoidOp once tt-metal issue is resolved
+     // https://github.com/tenstorrent/tt-metal/issues/30973
+     patterns.add<TTNNBF16MeanOfUpcast, TTNNBinaryOpNarrowingOutput, TTNNRMSNormOfUpcast>(&getContext());
+-    patterns.add<
+-        TTNNConv2dWithActivation<ReluOp>, TTNNConv2dWithActivation<Relu6Op>,
+-        TTNNConv2dWithActivation<SiluOp>, TTNNConv2dWithActivation<SigmoidOp>,
+-        TTNNMatmulAndLinearWithActivation<MatmulOp, SigmoidOp>,
+-        TTNNMatmulAndLinearWithActivation<LinearOp, SigmoidOp>,
+-        TTNNMatmulAndLinearWithActivation<MatmulOp, SiluOp>,
+-        TTNNMatmulAndLinearWithActivation<LinearOp, SiluOp>,
+-        TTNNMatmulAndLinearWithActivation<MatmulOp, GeluOp>,
+-        TTNNMatmulAndLinearWithActivation<LinearOp, GeluOp>>(&getContext());
++    // Matmul and linear activations form on TTIR (libtt's
++    // ttir-matmul-epilogues).
++    patterns.add<TTNNConv2dWithActivation<ReluOp>,
++                 TTNNConv2dWithActivation<Relu6Op>,
++                 TTNNConv2dWithActivation<SiluOp>,
++                 TTNNConv2dWithActivation<SigmoidOp>>(&getContext());
+ 
+ #ifdef TTMLIR_ENABLE_OPMODEL
+     if (enableOpConstraints) {

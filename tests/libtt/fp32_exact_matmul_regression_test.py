@@ -94,7 +94,7 @@ def test_same_operand_twice_then_two_operands():
 
 @pytest.mark.parametrize("precision", ["DEFAULT", "HIGHEST"])
 def test_activation_after_exact_matmul(precision, tmp_path):
-    """TTNN fuses a SiLU into an ordinary matmul, but not into an exact one, which has no fused activation."""
+    """A SiLU fuses into an ordinary matmul, but not into an exact one, which has no fused activation."""
     rng = np.random.default_rng(3)
     a = rng.standard_normal((64, 96)).astype(np.float32)
     b = (rng.standard_normal((96, 128)) / np.sqrt(96)).astype(np.float32)

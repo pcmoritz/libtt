@@ -197,21 +197,6 @@ index 538fa6d..e5b287b 100644
    const auto inputShapeA = getA().getType().getShape();
    const auto inputShapeB = getB().getType().getShape();
  
-diff --git a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-index f10b652..a072678 100644
---- a/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-+++ b/lib/Dialect/TTNN/Transforms/TTNNFusing.cpp
-@@ -136,7 +136,9 @@ class TTNNMatmulAndLinearWithActivation : public mlir::OpRewritePattern<SrcOp> {
- public:
-   mlir::LogicalResult
-   matchAndRewrite(SrcOp srcOp, mlir::PatternRewriter &rewriter) const final {
--    if (!isFusable(srcOp)) {
-+    // An exact FP32 matmul runs on the vector unit, which has no fused
-+    // activation.
-+    if (srcOp->hasAttr("ttcore.fp32_exact") || !isFusable(srcOp)) {
-       return failure();
-     }
- 
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp b/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
 index c4be522..478e7ea 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNSetComputeKernelConfig.cpp
