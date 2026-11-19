@@ -46,6 +46,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -249,34 +250,13 @@ Value reshapeTo(OpBuilder &b, Location loc, Value input,
                              i32Array(b, shape));
 }
 
-// A value that is rebuilt in any shape at no cost: a constant or a fill.
+// A value whose reshapes fold away (ReshapeOp::fold): a constant or a fill.
 bool isFree(Value value) {
   Operation *producer = value.getDefiningOp();
   if (auto constant = mlir::dyn_cast_or_null<ConstantOp>(producer)) {
     return mlir::isa<DenseElementsAttr>(constant.getValue());
   }
   return mlir::isa_and_nonnull<FullOp, ZerosOp, OnesOp>(producer);
-}
-
-Value rebuildFree(OpBuilder &b, Location loc, Value value,
-                  ArrayRef<int64_t> shape) {
-  RankedTensorType type = withShape(typeOf(value), shape);
-  Operation *producer = value.getDefiningOp();
-  if (auto constant = mlir::dyn_cast<ConstantOp>(producer)) {
-    return b.create<ConstantOp>(
-        loc, type,
-        mlir::cast<DenseElementsAttr>(constant.getValue()).reshape(type));
-  }
-  SmallVector<NamedAttribute> attrs(producer->getAttrs());
-  for (NamedAttribute &attr : attrs) {
-    if (attr.getName() == "shape") {
-      attr.setValue(b.getDenseI32ArrayAttr(
-          SmallVector<int32_t>(shape.begin(), shape.end())));
-    }
-  }
-  OperationState state(loc, producer->getName().getStringRef(), ValueRange{},
-                       TypeRange{type}, attrs);
-  return b.create(state)->getResult(0);
 }
 
 void setAttr(SmallVector<NamedAttribute> &attrs, StringRef name,
@@ -328,8 +308,8 @@ struct Plan {
   bool member(unsigned index) const { return !operands[index].has_value(); }
 };
 
-// Operands of the result's shape are members (constants are edges, rebuilt
-// in the result's layout); `other` gives the other operands' shapes.
+// Operands of the result's shape are members (constants are edges, whose
+// reshapes fold away); `other` gives the other operands' shapes.
 std::optional<Plan> elementwisePlan(
     Operation *op, Kind kind, RankedTensorType result,
     llvm::function_ref<std::optional<SmallVector<int64_t>>(RankedTensorType)>
@@ -823,30 +803,6 @@ bool viewBoundaries(func::FuncOp func) {
   return viewed;
 }
 
-class UnionFind {
-public:
-  unsigned id(Value value) {
-    auto [it, inserted] = index.try_emplace(value, parent.size());
-    if (inserted) {
-      parent.push_back(parent.size());
-    }
-    return it->second;
-  }
-  unsigned find(unsigned i) {
-    while (parent[i] != i) {
-      parent[i] = parent[parent[i]];
-      i = parent[i];
-    }
-    return i;
-  }
-  unsigned find(Value value) { return find(id(value)); }
-  void unite(Value a, Value b) { parent[find(a)] = find(b); }
-
-private:
-  llvm::DenseMap<Value, unsigned> index;
-  SmallVector<unsigned> parent;
-};
-
 // Layouts chosen for one function's values, and how to rebuild it.
 class Layouts {
 public:
@@ -855,13 +811,8 @@ public:
   // Chooses clusters of `kind` among the values no earlier kind took.
   void choose(Kind kind) {
     Block &entry = func.getBody().front();
-    UnionFind clusters;
+    llvm::EquivalenceClasses<Value> clusters;
     llvm::DenseMap<Operation *, Plan> plans;
-    SmallVector<Value> order;
-    auto add = [&](Value value) {
-      clusters.id(value);
-      order.push_back(value);
-    };
     for (Operation &op : entry.without_terminator()) {
       std::optional<Plan> plan = planFor(&op, kind);
       if (!plan) {
@@ -884,35 +835,28 @@ public:
         continue;
       }
       for (Value member : members) {
-        add(member);
-        clusters.unite(member, members.front());
+        clusters.unionSets(members.front(), member);
       }
       plans[&op] = std::move(*plan);
     }
 
-    llvm::DenseMap<unsigned, SmallVector<Value>> groups;
-    SmallVector<unsigned> groupOrder;
-    llvm::DenseSet<Value> seen;
-    for (Value value : order) {
-      if (!seen.insert(value).second) {
+    // Each cluster, in the order of its first value.
+    llvm::DenseSet<Value> decided;
+    for (const auto *first : clusters) {
+      Value leader = clusters.getLeaderValue(first->getData());
+      if (!decided.insert(leader).second) {
         continue;
       }
-      unsigned root = clusters.find(value);
-      if (!groups.count(root)) {
-        groupOrder.push_back(root);
+      SmallVector<Value> values = llvm::to_vector(clusters.members(leader));
+      if (!worthIt(kind, values, plans)) {
+        continue;
       }
-      groups[root].push_back(value);
-    }
-    for (unsigned root : groupOrder) {
-      ArrayRef<Value> values = groups[root];
-      if (worthIt(kind, values, plans)) {
-        for (Value value : values) {
-          kinds[value] = kind;
-        }
-        for (auto &[op, plan] : plans) {
-          if (clusters.find(op->getResult(0)) == root) {
-            built.try_emplace(op, kind, plan);
-          }
+      for (Value value : values) {
+        kinds[value] = kind;
+      }
+      for (auto &[op, plan] : plans) {
+        if (clusters.getLeaderValue(op->getResult(0)) == leader) {
+          built.try_emplace(op, kind, plan);
         }
       }
     }
@@ -964,9 +908,6 @@ public:
         for (auto [i, operand] : llvm::enumerate(op->getOperands())) {
           if (plan.member(i)) {
             operands.push_back(physicalOf(operand));
-          } else if (isFree(operand)) {
-            operands.push_back(
-                rebuildFree(b, op->getLoc(), operand, *plan.operands[i]));
           } else {
             operands.push_back(reshapeTo(b, op->getLoc(), physicalOf(operand),
                                          *plan.operands[i]));
@@ -1108,29 +1049,6 @@ private:
   llvm::DenseMap<Value, Value> logical;
 };
 
-// reshape(reshape(x)) -> reshape(x), or x when the shapes match.
-class FoldReshapes : public OpRewritePattern<ReshapeOp> {
-public:
-  using OpRewritePattern<ReshapeOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(ReshapeOp reshape,
-                                PatternRewriter &rewriter) const override {
-    Value input = reshape.getInput();
-    if (typeOf(input).getShape() == typeOf(reshape.getResult()).getShape()) {
-      rewriter.replaceOp(reshape, input);
-      return success();
-    }
-    auto inner = input.getDefiningOp<ReshapeOp>();
-    if (!inner) {
-      return failure();
-    }
-    rewriter.replaceOp(reshape,
-                       reshapeTo(rewriter, reshape.getLoc(), inner.getInput(),
-                                 typeOf(reshape.getResult()).getShape()));
-    return success();
-  }
-};
-
 class TTIRPhysicalLayoutsPass
     : public PassWrapper<TTIRPhysicalLayoutsPass, OperationPass<ModuleOp>> {
 public:
@@ -1168,11 +1086,12 @@ public:
         changed.push_back(func);
       }
     });
+    // Folding alone (ReshapeOp::fold) merges consecutive reshapes, drops
+    // reshapes to the same shape, and reshapes constants and fills.
     RewritePatternSet patterns(&getContext());
-    patterns.add<FoldReshapes>(&getContext());
-    FrozenRewritePatternSet frozen(std::move(patterns));
+    FrozenRewritePatternSet folding(std::move(patterns));
     for (func::FuncOp func : changed) {
-      if (failed(applyPatternsGreedily(func, frozen))) {
+      if (failed(applyPatternsGreedily(func, folding))) {
         signalPassFailure();
       }
     }
