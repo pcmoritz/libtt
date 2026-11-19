@@ -10,6 +10,8 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <optional>
+
 namespace mlir::tt::ttir::fusing {
 
 namespace {
@@ -26,20 +28,24 @@ Value throughReshapes(Value value) {
   return value;
 }
 
-// The end of the chain of reshapes that are each the single user of the
-// previous value, from `value`.
-Value alongReshapes(Value value) {
-  while (auto reshape = dyn_cast_or_null<ReshapeOp>(getSingleUser(value))) {
-    value = reshape.getResult();
-  }
-  return value;
-}
-
 RankedTensorType typeOf(Value value) {
   return mlir::cast<RankedTensorType>(value.getType());
 }
 
 ArrayRef<int64_t> shapeOf(Value value) { return typeOf(value).getShape(); }
+
+// Along the chain of single-user reshapes from `value`: the first value of
+// `shape`, or the last value of the chain.
+Value alongReshapesTo(Value value, ArrayRef<int64_t> shape) {
+  while (shapeOf(value) != shape) {
+    auto reshape = dyn_cast_or_null<ReshapeOp>(getSingleUser(value));
+    if (!reshape) {
+      break;
+    }
+    value = reshape.getResult();
+  }
+  return value;
+}
 
 // The value that reshapes and static slices of `value` read, and the flat
 // (row-major) index there of `value`'s element `flat`.
@@ -178,6 +184,41 @@ bool isLastDimConcat(ConcatOp concat) {
   return concat.getDim() == rank - 1 || concat.getDim() == -1;
 }
 
+// The op of type T that is the single user of a value along the chain of
+// single-user reshapes from `value`, if any.
+template <typename T>
+T alongReshapesUntil(Value value) {
+  for (;;) {
+    Operation *user = getSingleUser(value);
+    if (auto op = dyn_cast_or_null<T>(user)) {
+      return op;
+    }
+    auto reshape = dyn_cast_or_null<ReshapeOp>(user);
+    if (!reshape) {
+      return nullptr;
+    }
+    value = reshape.getResult();
+  }
+}
+
+// A head's rotated parts and where they end: the rotary embedding's result,
+// or, in a partial rotary, the parts the concat of the last dim after it puts
+// side by side, and that concat's result.
+std::optional<std::pair<SmallVector<Value>, Value>>
+rotatedParts(ttcore::CompositeOp rope, int64_t rotated, int64_t headDim) {
+  Value result = rope->getResult(0);
+  if (rotated == headDim) {
+    return std::make_pair(SmallVector<Value>{result}, result);
+  }
+  auto concat = alongReshapesUntil<ConcatOp>(result);
+  if (!concat || !isLastDimConcat(concat)) {
+    return std::nullopt;
+  }
+  return std::make_pair(SmallVector<Value>(concat.getInputs().begin(),
+                                           concat.getInputs().end()),
+                        concat.getResult());
+}
+
 // Whether the rotary embeddings' cos (or sin) tables `a` and `b` are the same:
 // the same value, or two of the copies the RoPE fusion makes of one half
 // table, its concat with itself along the last dim, of it or of a reshape of
@@ -234,31 +275,33 @@ SmallVector<int32_t> i32Shape(ArrayRef<int64_t> shape) {
   return SmallVector<int32_t>(shape.begin(), shape.end());
 }
 
-} // namespace
+// What the two forms of the prologue share: the projection and q's side.
+struct Prologue {
+  Value qkv;
+  RMSNormOp qNorm;
+  ttcore::CompositeOp qRope;
+  int64_t tokens;
+  int64_t numQHeads;
+  int64_t numKVHeads;
+  int64_t headDim;
+  // The projection's width, and where the v heads start in a row of it.
+  int64_t width;
+  int64_t vOffset;
+  // q's output, [1, B, Hq, q_width].
+  Value qOut;
+};
 
-mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
-    ConcatOp concat, mlir::PatternRewriter &rewriter) const {
-  // concat(k, v) [B, Hkv, 2 D] along the last dim, k as rotated parts.
-  ArrayRef<int64_t> kvShape = shapeOf(concat.getResult());
-  if (kvShape.size() != 3 || !isLastDimConcat(concat) ||
-      concat.getInputs().size() < 2 || kvShape[2] % 2 != 0) {
-    return mlir::failure();
-  }
-  const int64_t tokens = kvShape[0];
-  const int64_t numKVHeads = kvShape[1];
-  const int64_t headDim = kvShape[2] / 2;
-  ValueRange kParts = concat.getInputs().drop_back();
-  Value vHeads = concat.getInputs().back();
-  if (tokens > 32 || numKVHeads > 32 || headDim % 32 != 0) {
-    return mlir::failure();
-  }
-
-  // k's rotary embedding and norm, and the projection the norm reads.
-  ttcore::CompositeOp kRope =
-      asRotary(throughReshapes(kParts[0]).getDefiningOp());
-  RMSNormOp kNorm = kRope ? normOf(kRope, headDim) : nullptr;
-  if (!kNorm || !rotates(kRope, kNorm, kParts, headDim)) {
-    return mlir::failure();
+// The rest of the prologue whose k heads, numKVHeads for each of `tokens`,
+// `kNorm` normalizes and `kRope` rotates into `kParts`: the projection the
+// norm reads, q's norm and rotary embedding of the same cos, sin and token,
+// and q's output.
+std::optional<Prologue> matchPrologue(ttcore::CompositeOp kRope,
+                                      RMSNormOp kNorm, ValueRange kParts,
+                                      int64_t tokens, int64_t numKVHeads,
+                                      int64_t headDim) {
+  if (tokens > 32 || numKVHeads > 32 || headDim % 32 != 0 ||
+      !rotates(kRope, kNorm, kParts, headDim)) {
+    return std::nullopt;
   }
   Value qkv = sourceOf(kNorm.getInput(), 0).first;
   // q's: the rotary embedding of the same cos, sin and token whose norm reads
@@ -276,7 +319,7 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
       continue;
     }
     if (qRope) {
-      return mlir::failure();
+      return std::nullopt;
     }
     qRope = rope;
     qNorm = norm;
@@ -286,7 +329,7 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
       kNorm.getBias() || qNorm.getEpsilonAttr() != kNorm.getEpsilonAttr() ||
       qNorm.getNormalizedShape() != ArrayRef<int64_t>(normalized) ||
       kNorm.getNormalizedShape() != ArrayRef<int64_t>(normalized)) {
-    return mlir::failure();
+    return std::nullopt;
   }
 
   // The heads are views of one projection [B, (s Hq + 2 Hkv) D], each q head
@@ -296,7 +339,7 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
   const int64_t qElements = typeOf(qNorm.getInput()).getNumElements();
   if (qkvType.getNumElements() != tokens * width ||
       qElements % (tokens * headDim) != 0) {
-    return mlir::failure();
+    return std::nullopt;
   }
   const int64_t numQHeads = qElements / (tokens * headDim);
   const int64_t qStride = (width / headDim - 2 * numKVHeads) / numQHeads;
@@ -306,10 +349,8 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
       !isHeadView(qNorm.getInput(), qkv, tokens, width, 0, numQHeads,
                   qStride * headDim, headDim) ||
       !isHeadView(kNorm.getInput(), qkv, tokens, width, kOffset, numKVHeads,
-                  headDim, headDim) ||
-      !isHeadView(vHeads, qkv, tokens, width, kOffset + numKVHeads * headDim,
-                  numKVHeads, headDim, headDim)) {
-    return mlir::failure();
+                  headDim, headDim)) {
+    return std::nullopt;
   }
 
   // The rotary embeddings take [1, B, H, R] with token b's row of cos and
@@ -327,16 +368,16 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
       shapeOf(sin) != shapeOf(cos) ||
       (tokens == 1 ? !tokenIndex || !tokenIndex.getValue().isZero()
                    : !!tokenIndex)) {
-    return mlir::failure();
+    return std::nullopt;
   }
   // The kernel reads and writes BF16, and norm weights of BF16 or, as 1 + w
   // of a zero-centered norm, FP32.
   Value qWeight = qNorm.getWeight();
   Value kWeight = kNorm.getWeight();
-  Type bf16 = rewriter.getBF16Type();
+  Type bf16 = BFloat16Type::get(kRope.getContext());
   for (Value operand : {qkv, cos, sin}) {
     if (typeOf(operand).getElementType() != bf16) {
-      return mlir::failure();
+      return std::nullopt;
     }
   }
   for (Value weight : {qWeight, kWeight}) {
@@ -344,38 +385,36 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
     if ((element != bf16 && !element.isF32()) ||
         typeOf(weight).getNumElements() != headDim ||
         element != typeOf(qWeight).getElementType()) {
-      return mlir::failure();
+      return std::nullopt;
     }
   }
 
-  // q: its rotated parts, possibly a pad of the last dim with +0 (the fused
-  // kernel's zeros), reshapes to [1, B, Hq, q_width].
-  Value qHeads = alongReshapes(qRope->getResult(0));
-  SmallVector<Value> qParts{qHeads};
-  if (rotated < headDim) {
-    auto qConcat = dyn_cast_or_null<ConcatOp>(getSingleUser(qHeads));
-    if (!qConcat || !isLastDimConcat(qConcat)) {
-      return mlir::failure();
-    }
-    qParts.assign(qConcat.getInputs().begin(), qConcat.getInputs().end());
-    qHeads = alongReshapes(qConcat.getResult());
+  // q: its rotated parts, reshaped to [1, B, Hq, D], or padded in the last
+  // dim with +0 (the fused kernel's zeros) and reshaped to [1, B, Hq,
+  // q_width]. Any reshapes after that read the fused op's query.
+  auto qParts = rotatedParts(qRope, rotated, headDim);
+  if (!qParts || !rotates(qRope, qNorm, qParts->first, headDim)) {
+    return std::nullopt;
   }
-  if (!rotates(qRope, qNorm, qParts, headDim)) {
-    return mlir::failure();
-  }
+  auto pad = alongReshapesUntil<PadOp>(qParts->second);
+  Value qHeads = pad ? pad.getInput()
+                     : alongReshapesTo(qParts->second,
+                                       {1, tokens, numQHeads, headDim});
   // Without the pad, the query is as wide as the heads.
   Value qOut = qHeads;
-  if (auto pad = dyn_cast_or_null<PadOp>(getSingleUser(qHeads))) {
+  if (pad) {
     if (!pad.getValue().isPosZero()) {
-      return mlir::failure();
+      return std::nullopt;
     }
     ArrayRef<int32_t> padding = pad.getPadding();
     for (size_t i = 0; i + 1 < padding.size(); ++i) {
       if (padding[i] != 0) {
-        return mlir::failure();
+        return std::nullopt;
       }
     }
-    qOut = alongReshapes(pad.getResult());
+    qOut = alongReshapesTo(
+        pad.getResult(),
+        {1, tokens, numQHeads, shapeOf(pad.getResult()).back()});
   }
   // The kernel writes q_width >= head_dim columns, a multiple of 32. (TTIR
   // allows a negative pad, a crop, and the first fusing runs before such pads
@@ -385,24 +424,32 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
       qWidth % 32 != 0 ||
       shapeOf(qOut) != ArrayRef<int64_t>{1, tokens, numQHeads, qWidth} ||
       typeOf(qOut).getElementType() != bf16) {
-    return mlir::failure();
+    return std::nullopt;
   }
-  // k and v of all tokens: the concat reshaped to [1, B, Hkv, 2 D].
-  auto kvReshape =
-      dyn_cast_or_null<ReshapeOp>(getSingleUser(concat.getResult()));
-  Value kvOut = kvReshape ? alongReshapes(kvReshape.getResult()) : Value();
-  if (!kvOut ||
-      shapeOf(kvOut) !=
-          ArrayRef<int64_t>{1, tokens, numKVHeads, 2 * headDim} ||
-      typeOf(kvOut).getElementType() != bf16) {
-    return mlir::failure();
-  }
+  return Prologue{qkv,       qNorm,      qRope,
+                  tokens,    numQHeads,  numKVHeads,
+                  headDim,   width,      kOffset + numKVHeads * headDim,
+                  qOut};
+}
+
+// Replaces the prologue with one split_qkv_norm_rope_decode whose results
+// replace `outs`: q's output, then the k and v output or the k and the v
+// outputs.
+mlir::LogicalResult rewritePrologue(Prologue prologue,
+                                    ttcore::CompositeOp kRope, RMSNormOp kNorm,
+                                    ArrayRef<Value> outs,
+                                    mlir::PatternRewriter &rewriter) {
+  Value qkv = prologue.qkv;
+  Value qWeight = prologue.qNorm.getWeight();
+  Value kWeight = kNorm.getWeight();
+  Value cos = rotaryCos(prologue.qRope);
+  Value sin = rotarySin(prologue.qRope);
 
   // The fused op goes before the first user of its results, after its
   // operands.
-  Block *block = concat->getBlock();
+  Block *block = kRope->getBlock();
   Operation *first = nullptr;
-  for (Value out : {qOut, kvOut}) {
+  for (Value out : outs) {
     for (Operation *user : out.getUsers()) {
       if (user->getBlock() != block) {
         return mlir::failure();
@@ -428,7 +475,7 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
   const llvm::DenseSet<Value> operands{
       qkv, qWeight, kWeight, cos, sin, rotaryCos(kRope), rotarySin(kRope)};
   llvm::SetVector<Operation *> replaced;
-  SmallVector<Value> work{qOut, kvOut};
+  SmallVector<Value> work(outs.begin(), outs.end());
   while (!work.empty()) {
     Value value = work.pop_back_val();
     if (operands.contains(value)) {
@@ -450,21 +497,28 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
   });
 
   // The kernel's input is the projection's rows.
-  Location loc = qRope.getLoc();
+  Location loc = prologue.qRope.getLoc();
   rewriter.setInsertionPoint(first);
   Value rows = qkv;
-  const SmallVector<int64_t> rowsShape{tokens, width};
+  RankedTensorType qkvType = typeOf(qkv);
+  const SmallVector<int64_t> rowsShape{prologue.tokens, prologue.width};
   if (qkvType.getShape() != ArrayRef<int64_t>(rowsShape)) {
     rows = rewriter.create<ReshapeOp>(
         loc, RankedTensorType::get(rowsShape, qkvType.getElementType()), qkv,
         rewriter.getI32ArrayAttr(i32Shape(rowsShape)));
   }
+  SmallVector<Type> types;
+  for (Value out : outs) {
+    types.push_back(out.getType());
+  }
   auto fused = rewriter.create<SplitQKVNormRopeDecodeOp>(
-      loc, qOut.getType(), kvOut.getType(), rows, qWeight, kWeight, cos, sin,
-      rewriter.getUI32IntegerAttr(numQHeads),
-      rewriter.getUI32IntegerAttr(numKVHeads), qNorm.getEpsilonAttr());
-  rewriter.replaceAllUsesWith(qOut, fused.getQuery());
-  rewriter.replaceAllUsesWith(kvOut, fused.getKeyValues());
+      loc, types, rows, qWeight, kWeight, cos, sin,
+      rewriter.getUI32IntegerAttr(prologue.numQHeads),
+      rewriter.getUI32IntegerAttr(prologue.numKVHeads),
+      prologue.qNorm.getEpsilonAttr());
+  for (auto [out, result] : llvm::zip_equal(outs, fused->getResults())) {
+    rewriter.replaceAllUsesWith(out, result);
+  }
   // The replaced ops that feed nothing else now; the rotary embeddings are
   // not pure, so the rewrite driver would keep them.
   for (Operation *op : llvm::reverse(ops)) {
@@ -473,6 +527,119 @@ mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
     }
   }
   return mlir::success();
+}
+
+} // namespace
+
+mlir::LogicalResult SplitQKVNormRopeDecodeFusing::matchAndRewrite(
+    ConcatOp concat, mlir::PatternRewriter &rewriter) const {
+  // concat(k, v) [B, Hkv, 2 D] along the last dim, k as rotated parts.
+  ArrayRef<int64_t> kvShape = shapeOf(concat.getResult());
+  if (kvShape.size() != 3 || !isLastDimConcat(concat) ||
+      concat.getInputs().size() < 2 || kvShape[2] % 2 != 0) {
+    return mlir::failure();
+  }
+  const int64_t tokens = kvShape[0];
+  const int64_t numKVHeads = kvShape[1];
+  const int64_t headDim = kvShape[2] / 2;
+  ValueRange kParts = concat.getInputs().drop_back();
+  Value vHeads = concat.getInputs().back();
+
+  // k's rotary embedding and norm, and the rest of the prologue.
+  ttcore::CompositeOp kRope =
+      asRotary(throughReshapes(kParts[0]).getDefiningOp());
+  RMSNormOp kNorm = kRope ? normOf(kRope, headDim) : nullptr;
+  if (!kNorm) {
+    return mlir::failure();
+  }
+  std::optional<Prologue> prologue =
+      matchPrologue(kRope, kNorm, kParts, tokens, numKVHeads, headDim);
+  if (!prologue ||
+      !isHeadView(vHeads, prologue->qkv, tokens, prologue->width,
+                  prologue->vOffset, numKVHeads, headDim, headDim)) {
+    return mlir::failure();
+  }
+
+  // k and v of all tokens: the concat reshaped to [1, B, Hkv, 2 D].
+  const SmallVector<int64_t> outShape{1, tokens, numKVHeads, 2 * headDim};
+  Value kvOut = alongReshapesTo(concat.getResult(), outShape);
+  if (shapeOf(kvOut) != ArrayRef<int64_t>(outShape) ||
+      typeOf(kvOut).getElementType() != rewriter.getBF16Type()) {
+    return mlir::failure();
+  }
+  return rewritePrologue(*prologue, kRope, kNorm, {prologue->qOut, kvOut},
+                         rewriter);
+}
+
+mlir::LogicalResult SplitQKVNormRopeDecodeSeparateKVFusing::matchAndRewrite(
+    ttcore::CompositeOp op, mlir::PatternRewriter &rewriter) const {
+  // k's rotary embedding of [1, B, Hkv, R], and its norm.
+  ttcore::CompositeOp kRope = asRotary(op);
+  if (!kRope || shapeOf(rotaryInput(kRope)).size() != 4 ||
+      shapeOf(rotaryInput(kRope))[0] != 1) {
+    return mlir::failure();
+  }
+  const int64_t tokens = shapeOf(rotaryInput(kRope))[1];
+  const int64_t numKVHeads = shapeOf(rotaryInput(kRope))[2];
+  const int64_t rotated = shapeOf(rotaryInput(kRope))[3];
+  // A partial rotary rotates a slice of the normed heads.
+  int64_t headDim = rotated;
+  if (auto slice =
+          throughReshapes(rotaryInput(kRope)).getDefiningOp<SliceStaticOp>()) {
+    headDim = shapeOf(slice.getInput()).back();
+  }
+  RMSNormOp kNorm = normOf(kRope, headDim);
+  if (!kNorm) {
+    return mlir::failure();
+  }
+
+  // k's output: its rotated parts, reshaped to [1, B, Hkv, D]. Any reshapes
+  // after that read the fused op's keys.
+  Type bf16 = rewriter.getBF16Type();
+  auto kParts = rotatedParts(kRope, rotated, headDim);
+  if (!kParts) {
+    return mlir::failure();
+  }
+  const SmallVector<int64_t> kvShape{1, tokens, numKVHeads, headDim};
+  Value kOut = alongReshapesTo(kParts->second, kvShape);
+  if (shapeOf(kOut) != ArrayRef<int64_t>(kvShape) ||
+      typeOf(kOut).getElementType() != bf16) {
+    return mlir::failure();
+  }
+  std::optional<Prologue> prologue = matchPrologue(
+      kRope, kNorm, kParts->first, tokens, numKVHeads, headDim);
+  if (!prologue) {
+    return mlir::failure();
+  }
+
+  // v's output: the one view of the projection that holds its v heads as
+  // [1, B, Hkv, D].
+  Value vOut;
+  SmallVector<Value> work{prologue->qkv};
+  while (!work.empty()) {
+    Value value = work.pop_back_val();
+    for (Operation *user : value.getUsers()) {
+      if (!mlir::isa<ReshapeOp, SliceStaticOp>(user)) {
+        continue;
+      }
+      Value view = user->getResult(0);
+      if (shapeOf(view) == ArrayRef<int64_t>(kvShape) &&
+          isHeadView(view, prologue->qkv, tokens, prologue->width,
+                     prologue->vOffset, numKVHeads, headDim, headDim)) {
+        if (vOut) {
+          return mlir::failure();
+        }
+        vOut = view;
+        continue;
+      }
+      work.push_back(view);
+    }
+  }
+  if (!vOut) {
+    return mlir::failure();
+  }
+  return rewritePrologue(*prologue, kRope, kNorm,
+                         {prologue->qOut, kOut, vOut}, rewriter);
 }
 
 } // namespace mlir::tt::ttir::fusing

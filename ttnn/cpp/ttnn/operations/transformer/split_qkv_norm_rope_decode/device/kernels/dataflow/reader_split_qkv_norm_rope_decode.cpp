@@ -118,6 +118,9 @@ void kernel_main() {
                     window);
             }
         }
+        noc_async_read_barrier();
+        // The norm weight, cos and sin, which the compute kernel needs only
+        // after the first steps of rms_norm, arrive while the heads are placed.
         if (kind != kV) {
             if (kind == 0) {
                 read_tiles(q_weight, cb_weight, 0, head_tiles);
@@ -128,22 +131,24 @@ void kernel_main() {
             read_tiles(cos, cb_cos, table_tile, rotary_tiles);
             read_tiles(sin, cb_sin, table_tile, rotary_tiles);
         }
-        noc_async_read_barrier();
 
-        // Head i's row goes to row i of the tiles.
-        for (uint32_t i = 0; i < heads; ++i) {
-            for (uint32_t c = 0; c < head_tiles; ++c) {
+        // Head i's row goes to row i of the tiles, a tile at a time, so that
+        // the compute kernel starts on the first. These are writes, whose
+        // barrier leaves the reads above in flight.
+        for (uint32_t c = 0; c < head_tiles; ++c) {
+            for (uint32_t i = 0; i < heads; ++i) {
                 for (uint32_t half = 0; half < 2; ++half) {
-                    noc_async_read(
-                        get_noc_addr(scratch + (i * head_tiles + c) * window + skew + half * face_bytes),
-                        tiles + c * tile_bytes + half * face_bytes + i * row_bytes,
+                    noc_async_write(
+                        scratch + (i * head_tiles + c) * window + skew + half * face_bytes,
+                        get_noc_addr(tiles + c * tile_bytes + half * face_bytes + i * row_bytes),
                         row_bytes);
                 }
             }
+            noc_async_write_barrier();
+            cb_push_back(cb, 1);
         }
-        noc_async_read_barrier();
-        cb_push_back(cb, head_tiles);
         if (kind != kV) {
+            noc_async_read_barrier();
             cb_push_back(cb_weight, head_tiles);
             cb_push_back(cb_cos, rotary_tiles);
             cb_push_back(cb_sin, rotary_tiles);

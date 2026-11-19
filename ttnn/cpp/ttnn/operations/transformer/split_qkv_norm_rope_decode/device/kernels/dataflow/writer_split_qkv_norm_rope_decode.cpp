@@ -6,9 +6,9 @@
 
 // Writes each of this core's units, rows 0.. of the compute kernel's output
 // tiles (of the reader's for v heads), to their rows of the q output or of the
-// token's tile row of the kv output, then the rows and tiles of that tile row
-// that only zeros fill: the padding rows below the last head and q's padding
-// columns.
+// token's tile row of the kv output (or of the k or v output), then the rows
+// and tiles of that tile row that only zeros fill: the padding rows below the
+// last head and q's padding columns.
 void kernel_main() {
     constexpr uint32_t cb_v = get_named_compile_time_arg_val("cb_v");
     constexpr uint32_t cb_out = get_named_compile_time_arg_val("cb_out");
@@ -23,6 +23,8 @@ void kernel_main() {
     constexpr auto sin_args = TensorAccessorArgs<cos_args.next_compile_time_args_offset()>();
     constexpr auto q_args = TensorAccessorArgs<sin_args.next_compile_time_args_offset()>();
     constexpr auto kv_args = TensorAccessorArgs<q_args.next_compile_time_args_offset()>();
+    // The v output: kv's again unless k and v are separate.
+    constexpr auto v_args = TensorAccessorArgs<kv_args.next_compile_time_args_offset()>();
     constexpr uint32_t kQ = 0;
     constexpr uint32_t kV = 2;
     constexpr uint32_t kEnd = 0xFFFFFFFF;
@@ -46,12 +48,13 @@ void kernel_main() {
         const uint32_t zero_tiles = get_arg_val<uint32_t>(arg++);
 
         const uint32_t cb = kind == kV ? cb_v : cb_out;
-        cb_wait_front(cb, head_tiles);
+        cb_wait_front(cb, 1);
         const uint32_t tiles = get_read_ptr(cb);
         auto write = [&](const auto& output) {
             // The group's rows lie within one face of each column of faces.
             const uint32_t row_offset = (first_row % 16) * row_bytes + (first_row / 16) * 2 * face_bytes;
             for (uint32_t c = 0; c < head_tiles; ++c) {
+                cb_wait_front(cb, c + 1);
                 const uint64_t tile = output.get_noc_addr(first_tile + c);
                 for (uint32_t half = 0; half < 2; ++half) {
                     noc_async_write(
@@ -76,6 +79,8 @@ void kernel_main() {
         };
         if (kind == kQ) {
             write(TensorAccessor(q_args, output_addr, tile_bytes));
+        } else if (kind == kV) {
+            write(TensorAccessor(v_args, output_addr, tile_bytes));
         } else {
             write(TensorAccessor(kv_args, output_addr, tile_bytes));
         }

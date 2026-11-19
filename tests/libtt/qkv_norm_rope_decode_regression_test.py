@@ -1,9 +1,10 @@
 """The decode attention prologue of Qwen3 runs as one program.
 
 SGLang-JAX projects q, k and v, normalizes the q and k heads and applies the
-rotary embedding; tt-mlir turns that into nlp_create_qkv_heads_decode, two
-rms_norms and two rotary_embeddings, which now become a single
-nlp_create_qkv_heads_decode_norm_rope. Its q, k and v must match NumPy.
+rotary embedding at each token's position. libtt fuses that on TTIR into one
+split_qkv_norm_rope_decode, the op PyTorch models' prologue becomes too, here
+with k and v as two results, as SGLang-JAX's paged caches take them. Its q, k
+and v must match NumPy, for one token and for several.
 """
 
 import jax
@@ -59,18 +60,23 @@ def make_prologue(heads, kv_heads, joint_k_norm=False):
         cos, sin = jnp.cos(freqs), jnp.sin(freqs)
         q, k = rotary(q, cos, sin), rotary(k, cos, sin)
         # The decode attention takes [1, batch, heads, head_dim].
+        tokens = x.shape[0]
         return (
-            q.reshape(1, 1, heads, HEAD_DIM),
-            k.reshape(1, 1, kv_heads, HEAD_DIM),
-            v.reshape(1, 1, kv_heads, HEAD_DIM),
+            q.reshape(1, tokens, heads, HEAD_DIM),
+            k.reshape(1, tokens, kv_heads, HEAD_DIM),
+            v.reshape(1, tokens, kv_heads, HEAD_DIM),
         )
 
     return prologue
 
 
-def reference(x, wq, wk, wv, q_norm, k_norm, position, heads, kv_heads, joint_k_norm=False):
+def reference(x, wq, wk, wv, q_norm, k_norm, positions, heads, kv_heads, joint_k_norm=False):
+    """q, k and v of tokens x [B, HIDDEN] at `positions`, [B, heads, HEAD_DIM]."""
     x, wq, wk, wv, q_norm, k_norm = (a.astype(np.float32) for a in (x, wq, wk, wv, q_norm, k_norm))
-    freqs = position * (1.0 / (1e6 ** (np.arange(0, HEAD_DIM, 2, dtype=np.float32) / HEAD_DIM)))
+    tokens = x.shape[0]
+    freqs = np.asarray(positions, np.float32)[:, None, None] * (
+        1.0 / (1e6 ** (np.arange(0, HEAD_DIM, 2, dtype=np.float32) / HEAD_DIM))
+    )
     cos, sin = np.cos(freqs), np.sin(freqs)
 
     def norm(h, weight):
@@ -80,12 +86,12 @@ def reference(x, wq, wk, wv, q_norm, k_norm, position, heads, kv_heads, joint_k_
         h1, h2 = h[..., : HEAD_DIM // 2], h[..., HEAD_DIM // 2 :]
         return np.concatenate((h1 * cos - h2 * sin, h2 * cos + h1 * sin), axis=-1)
 
-    q = rope(norm((x @ wq).reshape(heads, HEAD_DIM), q_norm))
+    q = rope(norm((x @ wq).reshape(tokens, heads, HEAD_DIM), q_norm))
     if joint_k_norm:
-        k = rope(norm(x @ wk, k_norm).reshape(kv_heads, HEAD_DIM))
+        k = rope(norm(x @ wk, k_norm).reshape(tokens, kv_heads, HEAD_DIM))
     else:
-        k = rope(norm((x @ wk).reshape(kv_heads, HEAD_DIM), k_norm))
-    v = (x @ wv).reshape(kv_heads, HEAD_DIM)
+        k = rope(norm((x @ wk).reshape(tokens, kv_heads, HEAD_DIM), k_norm))
+    v = (x @ wv).reshape(tokens, kv_heads, HEAD_DIM)
     return q, k, v
 
 
@@ -93,7 +99,9 @@ def reference(x, wq, wk, wv, q_norm, k_norm, position, heads, kv_heads, joint_k_
 # Qwen3-8B at TP4, TP2 and TP1, Qwen3-14B and Qwen3-32B at TP4, and Qwen3-30B-A3B at TP4,
 # whose single KV head per device has no head reshape to match.
 @pytest.mark.parametrize("heads,kv_heads", [(8, 2), (16, 4), (32, 8), (10, 2), (16, 2), (8, 1)])
-def test_qkv_norm_rope_decode(trace, heads, kv_heads, tmp_path):
+# One request, and four, each at its own position.
+@pytest.mark.parametrize("tokens", [1, 4])
+def test_qkv_norm_rope_decode(trace, heads, kv_heads, tokens, tmp_path):
     run = jax.jit(
         make_prologue(heads, kv_heads),
         compiler_options={
@@ -111,18 +119,19 @@ def test_qkv_norm_rope_decode(trace, heads, kv_heads, tmp_path):
     norms = [rng.uniform(0.5, 1.5, HEAD_DIM).astype(jnp.bfloat16) for _ in range(2)]
     on_device = [jax.device_put(a, device) for a in weights + norms]
     for position in (5, 1000, 31):  # Warmup, capture, and replay with changed inputs.
-        x = rng.standard_normal((1, HIDDEN)).astype(jnp.bfloat16)
-        positions = np.array([position], dtype=np.int32)
+        x = rng.standard_normal((tokens, HIDDEN)).astype(jnp.bfloat16)
+        positions = np.arange(position, position + 7 * tokens, 7, dtype=np.int32)
         q, k, v = run(jax.device_put(x, device), *on_device, jax.device_put(positions, device))
-        expected = reference(x, *weights, *norms, position, heads, kv_heads)
+        expected = reference(x, *weights, *norms, positions, heads, kv_heads)
         for name, actual, want in zip("qkv", (q, k, v), expected):
             actual = np.asarray(actual).astype(np.float32).reshape(want.shape)
             np.testing.assert_allclose(actual, want, atol=0.06, rtol=0.03, err_msg=f"{name} at {position}")
 
     irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
     assert irs, "no IR was exported"
-    assert any("ttnn.nlp_create_qkv_heads_decode_norm_rope" in ir for ir in irs), "the prologue was not fused"
-    assert not any("ttnn.rotary_embedding" in ir for ir in irs), "a rotary embedding was left over"
+    assert any('"ttnn.split_qkv_norm_rope_decode"' in ir for ir in irs), "the prologue was not fused"
+    for op in ("rotary_embedding", "rms_norm"):
+        assert not any(f'"ttnn.{op}"' in ir for ir in irs), f"a {op} was left over"
 
 
 def test_joint_kv_norm_is_not_fused(tmp_path):
@@ -144,7 +153,7 @@ def test_joint_kv_norm_is_not_fused(tmp_path):
     x = rng.standard_normal((1, HIDDEN)).astype(jnp.bfloat16)
     args = [x] + weights + norms + [np.array([7], dtype=np.int32)]
     q, k, v = run(*(jax.device_put(a, device) for a in args))
-    expected = reference(x, *weights, *norms, 7, heads, kv_heads, joint_k_norm=True)
+    expected = reference(x, *weights, *norms, [7], heads, kv_heads, joint_k_norm=True)
     # Unfused, the prologue rounds to BF16 between the norm and the rotary embedding.
     for name, actual, want in zip("qkv", (q, k, v), expected):
         actual = np.asarray(actual).astype(np.float32).reshape(want.shape)
@@ -152,6 +161,4 @@ def test_joint_kv_norm_is_not_fused(tmp_path):
 
     irs = [path.read_text() for path in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir")]
     assert irs, "no IR was exported"
-    # The prefix also covers nlp_create_qkv_heads_decode_norm_rope: the projection matcher itself
-    # must reject the joint norm, not only a later fusion.
-    assert not any("ttnn.nlp_create_qkv_heads_decode" in ir for ir in irs), "the joint norm was fused"
+    assert not any('"ttnn.split_qkv_norm_rope_decode"' in ir for ir in irs), "the joint norm was fused"
