@@ -29,7 +29,6 @@
 // decomposition is left as it is.
 //
 // LIBTT_PHYSICAL_LAYOUTS=0 turns it off.
-// LIBTT_PHYSICAL_LAYOUTS_MIN_MB (default 1) is the least a cluster must save.
 
 #include "ttmlir/PhysicalLayouts.h"
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
@@ -54,7 +53,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <cstdlib>
 #include <optional>
 
 namespace mlir::tt::ttir {
@@ -62,12 +60,6 @@ namespace mlir::tt::ttir {
 namespace {
 
 constexpr int64_t kTile = 32;
-
-double minSavedBytes() {
-  const char *value = std::getenv("LIBTT_PHYSICAL_LAYOUTS_MIN_MB");
-  double mb = value && *value ? std::atof(value) : 1.0;
-  return mb * 1024.0 * 1024.0;
-}
 
 enum class Kind { U, F };
 
@@ -1045,7 +1037,7 @@ private:
         cost += reshapeCost(stored, shape, element);
       }
     }
-    return saved - cost >= std::max(minSavedBytes(), 1.0);
+    return saved > cost;
   }
 
   func::FuncOp func;

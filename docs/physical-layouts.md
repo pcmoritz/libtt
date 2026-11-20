@@ -90,9 +90,9 @@ the time it takes DRAM to move the same bytes (about 400 GB/s):
   stored as 16-row tiles (`top_half_tiles.patch`) and counted as such.
 
 A cluster takes the kind when the time its ops save exceeds the time of the
-reshapes at its edges, by at least `LIBTT_PHYSICAL_LAYOUTS_MIN_MB` (default
-1 MB). The saving per op is the difference between logical and stored
-allocation; an edge's cost is the same reshape time the two shapes differ by.
+reshapes at its edges. The saving per op is the difference between logical
+and stored allocation; an edge's cost is the same reshape time the two shapes
+differ by.
 U is tried first, then F on the values U didn't take: a fold only pays where
 the shape has no unit dims to drop.
 
