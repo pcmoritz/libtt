@@ -1,4 +1,5 @@
 diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+index 1cc00b6..7814265 100644
 --- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 +++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
 @@ -29,6 +29,11 @@ namespace mlir::tt::ttir {
@@ -24,6 +25,7 @@ diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pip
    pm.addPass(mlir::tt::ttir::createTTIRFoldFullToScalar());
    // Folding a full to a scalar broadcasts the output of a consumer it gave
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+index 19f6bb1..c1ddbf8 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 @@ -808,6 +808,15 @@ private:
@@ -43,6 +45,7 @@ diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Trans
      // rejects a tiled operand outright. If that is all the argument feeds,
      // convert at the boundary instead: the runtime does it once at bind time
 diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/include/tt/runtime/detail/ttnn/types/types.h
+index b171f05..0aaac32 100644
 --- a/runtime/include/tt/runtime/detail/ttnn/types/types.h
 +++ b/runtime/include/tt/runtime/detail/ttnn/types/types.h
 @@ -139,6 +139,11 @@ struct LayoutDesc {
@@ -53,24 +56,23 @@ diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/incl
 +  // flat buffer and its fold [N / 32, 32], or a [T, 1, V] tensor and [T, V]
 +  // (ttir-physical-layouts, libtt), stand for each other, and toLayout
 +  // reshapes one into the other a program takes.
-+  std::optional<std::vector<std::uint32_t>> shape;
++  std::optional<::ttnn::Shape> shape;
  
    static std::shared_ptr<LayoutDesc>
    fromTensor(const ::tt::runtime::Tensor &tensor);
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+index 9f9547f..01fd55f 100644
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -29,7 +29,9 @@
+@@ -29,6 +29,7 @@
  #include "tracy/Tracy.hpp"
  
  #include <algorithm>
 +#include <cstdlib>
  #include <cstring>
-+#include <functional>
  #include <memory>
  #include <sys/mman.h>
- #include <thread>
-@@ -1238,6 +1240,94 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+@@ -1238,6 +1239,74 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
        /*meshEvent=*/std::nullopt, tensorWrapper.shouldRetain());
  }
  
@@ -92,7 +94,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +  return enabled;
 +}
 +
-+static std::optional<std::vector<std::uint32_t>>
++static std::optional<::ttnn::Shape>
 +compactShape(const ::ttnn::Shape &shape) {
 +  constexpr std::uint64_t kWidth = 32;
 +  if (!physicalLayoutsEnabled() || shape.volume() == 0) {
@@ -102,40 +104,20 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +  const bool fewRows = shape.rank() == 2 && shape[0] <= 8 &&
 +                       shape[1] != kWidth && shape.volume() >= (1u << 22);
 +  if ((rank1 || fewRows) && shape.volume() % kWidth == 0) {
-+    return std::vector<std::uint32_t>{
-+        static_cast<std::uint32_t>(shape.volume() / kWidth),
-+        static_cast<std::uint32_t>(kWidth)};
++    return ::ttnn::Shape{static_cast<std::uint32_t>(shape.volume() / kWidth),
++                        static_cast<std::uint32_t>(kWidth)};
 +  }
 +  if (shape.rank() == 3 && shape[1] == 1 && shape[0] > 1 && shape[2] > 1 &&
 +      shape.volume() >= (1u << 20)) {
-+    return std::vector<std::uint32_t>{shape[0], shape[2]};
++    return ::ttnn::Shape{shape[0], shape[2]};
 +  }
 +  return std::nullopt;
 +}
 +
-+static std::uint64_t volumeOf(const std::vector<std::uint32_t> &shape) {
-+  return std::accumulate(shape.begin(), shape.end(), std::uint64_t{1},
-+                         std::multiplies<std::uint64_t>());
-+}
-+
-+static bool hasShape(const ::ttnn::Tensor &tensor,
-+                     const std::vector<std::uint32_t> &shape) {
-+  const ::ttnn::Shape &logical = tensor.logical_shape();
-+  if (logical.rank() != shape.size()) {
-+    return false;
-+  }
-+  for (size_t i = 0; i < shape.size(); ++i) {
-+    if (logical[i] != shape[i]) {
-+      return false;
-+    }
-+  }
-+  return true;
-+}
-+
 +// The shape `toLayout` gives `tensor` for `desired`: the program input's, or
 +// for other device layouts in tiles, its compact shape.
-+static std::optional<std::vector<std::uint32_t>>
-+targetShape(const ::ttnn::Tensor &tensor, const LayoutDesc &desired) {
++static std::optional<::ttnn::Shape> targetShape(
++    const ::ttnn::Tensor &tensor, const LayoutDesc &desired) {
 +  if (desired.shape) {
 +    return desired.shape;
 +  }
@@ -151,7 +133,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +// tensor's tiles stages whole rows. Buffers are made in the shape programs
 +// take, so this is rare.
 +static ::ttnn::Tensor reshapeTo(const ::ttnn::Tensor &tensor,
-+                                const std::vector<std::uint32_t> &shape) {
++                                const ::ttnn::Shape &shape) {
 +  const std::vector<int32_t> target(shape.begin(), shape.end());
 +  if (tensor.storage_type() == ::ttnn::StorageType::DEVICE &&
 +      tensor.layout() == ::ttnn::Layout::TILE) {
@@ -165,7 +147,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  ::tt::runtime::Tensor toLayout(::tt::runtime::Tensor tensor, Device device,
                                 Layout layout, std::optional<bool> retain) {
    const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
-@@ -1252,10 +1342,23 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+@@ -1252,10 +1321,23 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
    ::tt::runtime::ttnn::TTNNTensorWrapper &tensorWrapper =
        tensor.as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN);
  
@@ -175,10 +157,10 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
  
 -  LayoutConverter converter(*tensorLayoutDesc, desiredLayoutDesc);
 +  std::shared_ptr<LayoutDesc> fromLayoutDesc = tensorLayoutDesc;
-+  if (std::optional<std::vector<std::uint32_t>> shape =
++  if (std::optional<::ttnn::Shape> shape =
 +          targetShape(ttnnTensor, desiredLayoutDesc);
-+      shape && !hasShape(ttnnTensor, *shape) &&
-+      ttnnTensor.logical_shape().volume() == volumeOf(*shape)) {
++      shape && ttnnTensor.logical_shape() != *shape &&
++      ttnnTensor.logical_shape().volume() == shape->volume()) {
 +    ttnnTensor = reshapeTo(ttnnTensor, *shape);
 +    fromLayoutDesc = std::make_shared<LayoutDesc>(
 +        ttnnTensor.storage_type(), ttnnTensor.layout(), ttnnTensor.dtype(),
@@ -191,7 +173,7 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
    ::ttnn::Tensor out = converter.convertTensorLayout(ttnnTensor, meshDevice);
  
    ::tt::runtime::Tensor result = utils::createRuntimeTensorFromTTNN(
-@@ -1315,6 +1418,16 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
+@@ -1315,6 +1397,16 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
    const LayoutDesc &desiredLayoutDesc =
        layout.as<LayoutDesc>(DeviceRuntime::TTNN);
  
@@ -201,27 +183,27 @@ diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
 +          utils::getTTNNTensorFromRuntimeTensor(tensor);
 +      desiredLayoutDesc.shape &&
 +      ttnnTensor.logical_shape().volume() ==
-+          volumeOf(*desiredLayoutDesc.shape) &&
-+      !hasShape(ttnnTensor, *desiredLayoutDesc.shape)) {
++          desiredLayoutDesc.shape->volume() &&
++      ttnnTensor.logical_shape() != *desiredLayoutDesc.shape) {
 +    return false;
 +  }
    if (desiredLayoutDesc.hostStagedTraceInput &&
        tensorLayoutDesc->isOnDevice() &&
        tensorLayoutDesc->dataType == desiredLayoutDesc.dataType) {
-@@ -1372,6 +1485,18 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
+@@ -1372,6 +1464,18 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
      layoutDesc->hostStagedTraceInput =
          isHostStagedTraceInput(executableHandle, programIndex, inputIndex);
    }
 +  // A tensor and its compact shape stand for each other: which one the
 +  // program takes.
 +  if (const auto *fbShape = input->desc()->shape(); fbShape) {
-+    const std::vector<std::uint32_t> dims(fbShape->begin(), fbShape->end());
-+    ::ttnn::Shape shape(dims);
++    const ::ttnn::Shape shape(
++        std::vector<std::uint32_t>(fbShape->begin(), fbShape->end()));
 +    // A compact shape (any large matrix: [N / 32, 32], or [T, V] for
 +    // [T, 1, V]), or a shape with one.
 +    const bool compact = shape.rank() == 2 && shape.volume() >= (1u << 20);
 +    if (compact || compactShape(shape)) {
-+      layoutDesc->shape = dims;
++      layoutDesc->shape = shape;
 +    }
 +  }
  
