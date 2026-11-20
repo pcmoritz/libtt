@@ -378,11 +378,17 @@ Value buildPlain(OpBuilder &b, Operation *op, ValueRange operands,
   return create(b, op, operands, type);
 }
 
-// Elementwise ops and broadcasts: operands of the result's shape are members
-// (constants are edges, whose reshapes fold away); `other` gives the other
-// operands' shapes, broadcast against the result.
+// Every operand is a member.
+std::optional<Plan> allMembers(Operation *op) {
+  Plan plan;
+  plan.operands.resize(op->getNumOperands());
+  return plan;
+}
+
+// Elementwise ops and broadcasts: operands of the result's shape are members;
+// `other` gives the other operands' shapes, broadcast against the result.
 std::optional<Plan> elementwisePlan(
-    Operation *op, Kind kind,
+    Operation *op,
     llvm::function_ref<std::optional<SmallVector<int64_t>>(RankedTensorType)>
         other) {
   ArrayRef<int64_t> result = typeOf(op->getResult(0)).getShape();
@@ -390,11 +396,7 @@ std::optional<Plan> elementwisePlan(
   for (Value operand : op->getOperands()) {
     RankedTensorType type = typeOf(operand);
     if (type.getShape() == result) {
-      if (isFree(operand)) {
-        plan.operands.push_back(physicalShape(kind, type));
-      } else {
-        plan.operands.push_back(std::nullopt);
-      }
+      plan.operands.push_back(std::nullopt);
       continue;
     }
     std::optional<SmallVector<int64_t>> shape = other(type);
@@ -410,8 +412,7 @@ std::optional<Plan> elementwisePlan(
 std::optional<Plan> matchElementwiseU(Operation *op) {
   ArrayRef<int64_t> result = typeOf(op->getResult(0)).getShape();
   return elementwisePlan(
-      op, Kind::U,
-      [&](RankedTensorType type) -> std::optional<SmallVector<int64_t>> {
+      op, [&](RankedTensorType type) -> std::optional<SmallVector<int64_t>> {
         if (type.getRank() != static_cast<int64_t>(result.size())) {
           return std::nullopt;
         }
@@ -422,8 +423,7 @@ std::optional<Plan> matchElementwiseU(Operation *op) {
 // In F, they have one element.
 std::optional<Plan> matchElementwiseF(Operation *op) {
   return elementwisePlan(
-      op, Kind::F,
-      [](RankedTensorType type) -> std::optional<SmallVector<int64_t>> {
+      op, [](RankedTensorType type) -> std::optional<SmallVector<int64_t>> {
         if (type.getNumElements() != 1) {
           return std::nullopt;
         }
@@ -629,45 +629,27 @@ Value buildSliceF(OpBuilder &b, Operation *op, ValueRange operands,
 // each row for column concats.
 std::optional<Plan> matchConcatU(Operation *op) {
   ArrayRef<int64_t> result = typeOf(op->getResult(0)).getShape();
-  if (result[dimOf(op, "dim", result.size())] == 1) {
+  if (result[dimOf(op, "dim", result.size())] == 1 ||
+      !llvm::all_of(op->getOperands(), [&](Value operand) {
+        return sameUnitDims(typeOf(operand).getShape(), result);
+      })) {
     return std::nullopt;
   }
-  Plan plan;
-  for (Value operand : op->getOperands()) {
-    RankedTensorType type = typeOf(operand);
-    if (!sameUnitDims(type.getShape(), result)) {
-      return std::nullopt;
-    }
-    if (isFree(operand)) {
-      plan.operands.push_back(physicalShape(Kind::U, type));
-    } else {
-      plan.operands.push_back(std::nullopt);
-    }
-  }
-  return plan;
+  return allMembers(op);
 }
 
 std::optional<Plan> matchConcatF(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  if (result.getRank() > 2) {
+  int64_t rank = typeOf(op->getResult(0)).getRank();
+  // Rank 1, or matrices whose rows are whole rows of the fold: stacked, or
+  // side by side (each input's blocks of a row in turn).
+  if (rank > 2 || !llvm::all_of(op->getOperands(), [&](Value operand) {
+        RankedTensorType type = typeOf(operand);
+        return type.getRank() == rank &&
+               (rank == 1 || type.getDimSize(1) % kTile == 0);
+      })) {
     return std::nullopt;
   }
-  Plan plan;
-  for (Value operand : op->getOperands()) {
-    RankedTensorType type = typeOf(operand);
-    // Rank 1, or matrices whose rows are whole rows of the fold: stacked, or
-    // side by side (each input's blocks of a row in turn).
-    if (!eligible(Kind::F, type) || type.getRank() != result.getRank() ||
-        (type.getRank() == 2 && type.getDimSize(1) % kTile != 0)) {
-      return std::nullopt;
-    }
-    if (isFree(operand)) {
-      plan.operands.push_back(physicalShape(Kind::F, type));
-    } else {
-      plan.operands.push_back(std::nullopt);
-    }
-  }
-  return plan;
+  return allMembers(op);
 }
 
 Value buildConcatU(OpBuilder &b, Operation *op, ValueRange operands,
@@ -746,8 +728,19 @@ std::optional<Plan> planFor(Operation *op, Kind kind) {
     return std::nullopt;
   }
   std::optional<Plan> plan = rule->match(op);
-  if (plan) {
-    plan->rule = rule;
+  if (!plan) {
+    return std::nullopt;
+  }
+  plan->rule = rule;
+  // Constants and fills are edges in the kind's layout: their reshapes fold
+  // away (ReshapeOp::fold), and they don't join their users' clusters.
+  for (auto [i, operand] : llvm::enumerate(op->getOperands())) {
+    if (plan->member(i) && isFree(operand)) {
+      if (!eligible(kind, typeOf(operand))) {
+        return std::nullopt;
+      }
+      plan->operands[i] = physicalShape(kind, typeOf(operand));
+    }
   }
   return plan;
 }
