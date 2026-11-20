@@ -94,8 +94,7 @@ reshapes at its edges, by at least `LIBTT_PHYSICAL_LAYOUTS_MIN_MB` (default
 1 MB). The saving per op is the difference between logical and stored
 allocation; an edge's cost is the same reshape time the two shapes differ by.
 U is tried first, then F on the values U didn't take: a fold only pays where
-the shape has no unit dims to drop. `LIBTT_PHYSICAL_LAYOUTS_DEBUG=1` prints
-the clusters and their savings, `=2` dumps the module before and after.
+the shape has no unit dims to drop.
 
 Public functions' arguments and results of compact shape keep it (`boundaryShape`
 in the pass, applied as the function's signature): rank-1 arrays of at least
