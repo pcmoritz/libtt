@@ -4,11 +4,14 @@
 attention whose forward also returns each row's log-sum-exp (the first column of
 [B, H, S, 32] FP32 intermediates) and whose backward takes it back instead of
 recomputing the forward. In TPU compatibility mode they replace TorchTitan's
-Pallas splash attention (`jax_plugins.libtt.torchtitan_tpu_kernels`), which saves
-the same log-sum-exp; packed documents (segment IDs) and sliding windows pass the
-kernels a mask, one sequence at a time, as causal intervals: the kernels skip the
-mask's tiles that keep no score.
+Pallas splash attention, and miles' torchtitan trainer's
+(`jax_plugins.libtt.torchtitan_tpu_kernels`), which save the same log-sum-exp;
+packed documents (segment IDs) and sliding windows pass the kernels a mask, one
+sequence at a time, as causal intervals: the kernels skip the mask's tiles that
+keep no score.
 """
+
+import types
 
 import jax
 import jax.numpy as jnp
@@ -137,6 +140,27 @@ def test_splash_attention_functions(batch, kv_heads, segment_ids, window):
     assert _relative_error(lse, lse_want) < 2e-3
     dq, dk, dv = splash_bwd_fn(tq, tk, tv, out, lse, tg, tsegments)
     assert dk.shape == k.shape
+    for got, want in ((dq, dq_want), (dk, dk_want), (dv, dv_want)):
+        assert _relative_error(got, want) < 0.03
+
+
+def test_miles_flash_attention():
+    # miles' torchtitan trainer runs splash attention's kernels itself: the
+    # `_forward` and `_backward` of `miles.kernels.tpu.flash_attention` take
+    # unscaled queries and each token's segment ID, the index of its sequence's
+    # first token in the packed row.
+    module = types.SimpleNamespace(_forward=None, _backward=None)
+    torchtitan_tpu_kernels.PATCHES[torchtitan_tpu_kernels.MILES_ATTENTION_MODULE](module)
+    q, k, v, g = _inputs(2)
+    positions = np.concatenate([np.arange(n) for n in (70, 58, 100, 28)])
+    segment_ids = (np.arange(SEQ) - positions).astype(np.int32)[None]
+    out_want, lse_want, dq_want, dk_want, dv_want = _reference(q, k, v, g, segment_ids)
+    tq, tk, tv, tg, tsegments = _device(q, k, v, g, segment_ids)
+    out, lse = module._forward(tq, tk, tv, tsegments)
+    assert lse.shape == (1, HEADS, SEQ) and lse.dtype == jnp.float32
+    assert _relative_error(out, out_want) < 0.02
+    assert _relative_error(lse, lse_want) < 2e-3
+    dq, dk, dv = module._backward(tq, tk, tv, out, lse, tg, tsegments)
     for got, want in ((dq, dq_want), (dk, dk_want), (dv, dv_want)):
         assert _relative_error(got, want) < 0.03
 

@@ -12,6 +12,10 @@ ttml::metal::sdpa_fw and sdpa_bw), which save the same values: the
 log-sum-exp is the first column of tt-train's [B, H, S, 32] FP32
 intermediates.
 
+miles' torchtitan trainer (radixark/miles, `miles.kernels.tpu.flash_attention`)
+calls splash attention's forward and backward kernels itself, on packed
+sequences (segment IDs); its `_forward` and `_backward` run the same functions.
+
 A plain causal attention uses the kernels' causal mask. Packed documents
 (segment IDs: a query attends only to keys of its own document) and sliding
 windows pass the kernels a [1, 1, S, S] mask, one sequence at a time. Causal
@@ -47,6 +51,7 @@ LOSS_KERNEL_MODULE = "tokamax._src.ops.linear_softmax_cross_entropy_loss.pallas_
 RMS_NORM_GATED_MODULE = "torchtitan.experiments.tpu.kernels.rms_norm_gated"
 ROPE_MODULE = "torchtitan.models.common.rope"
 REAL_ROPE_MODULE = "torchtitan.experiments.tpu.overrides.real_rope"
+MILES_ATTENTION_MODULE = "miles.kernels.tpu.flash_attention"
 # Tokens per cross-entropy call: a chunk's BF16 logits and their gradient take
 # 1.2 GB at Qwen3's 151,936-token vocabulary.
 LOSS_TOKEN_CHUNK = 2048
@@ -174,6 +179,25 @@ def _patch_splash_module(module):
     module._make_splash_attention_fn = _make_splash_attention_fn
 
 
+def _patch_miles_attention_module(module):
+    """miles' torchtitan trainer calls splash attention's forward and backward
+    kernels itself (`_forward` and `_backward`, on [B, H, S, D] queries it
+    scales by 1 / sqrt(head_dim) first, with each token's segment ID). Here
+    they run as TorchTitan's: the same outputs, log-sum-exp and gradients with
+    respect to the unscaled queries."""
+
+    def forward(q, k, v, segment_ids, *, interpret=False):
+        splash_fn, _ = _make_splash_attention_fn(q.shape[2], q.shape[1], k.shape[1])
+        return splash_fn(q, k, v, segment_ids)
+
+    def backward(q, k, v, out, lse, grad_out, segment_ids, *, interpret=False):
+        _, splash_bwd_fn = _make_splash_attention_fn(q.shape[2], q.shape[1], k.shape[1])
+        return splash_bwd_fn(q, k, v, out, lse, grad_out, segment_ids)
+
+    module._forward = forward
+    module._backward = backward
+
+
 def _token_chunks(tokens):
     return [(start, min(LOSS_TOKEN_CHUNK, tokens - start)) for start in range(0, tokens, LOSS_TOKEN_CHUNK)]
 
@@ -299,4 +323,5 @@ PATCHES = {
     RMS_NORM_GATED_MODULE: _patch_rms_norm_gated_module,
     ROPE_MODULE: _patch_rope_module,
     REAL_ROPE_MODULE: _patch_real_rope_module,
+    MILES_ATTENTION_MODULE: _patch_miles_attention_module,
 }
