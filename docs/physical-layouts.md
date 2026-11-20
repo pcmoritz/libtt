@@ -14,7 +14,7 @@ many times its size, and every op that makes or reads it moves all of that:
 
 Each of these was found as an out-of-memory error or a slow step in one
 framework's program, and fixed by a rewrite for that spelling of the shape:
-`ttir-dense-flat` for flat buffers and `[T, 1, V]` (#560, now removed), a
+`ttir-dense-flat` for flat buffers and `[T, 1, V]` (#560, not merged), a
 permute canonicalization (#541), a `dot_general` decomposition and fusing
 pattern (#412), and two fusing patterns that move elementwise ops across
 reshapes to the side with fewer tiles (#357). Each rewrite missed the next
@@ -70,7 +70,7 @@ reshaped to the shape the physical op needs.
 | `all_gather`, `reduce_scatter` | their dim, mapped | rank 1 along dim 0 |
 | `all_reduce` | yes | yes |
 | `rms_norm`, `layer_norm` | if the normalized dims aren't unit dims | no |
-| constants, `full`, `zeros`, `ones` | rebuilt in the layout, at no cost | rebuilt in the layout, at no cost |
+| constants, `full`, `zeros`, `ones` | edges: their reshapes fold away | same |
 | `reshape` | either side takes any layout: one reshape between the physical shapes, none if they are equal | same |
 | anything else, and ops with regions | operands and results in their logical shapes | same |
 
@@ -126,40 +126,26 @@ reshapes of constants and fills fold for free, so the rewrite emits
 straight-line code and the greedy driver cleans up. Clusters are decided in the
 order of the first value, reproducibly.
 
-## What it replaces
+## Earlier rewrites
 
-- `ttir-dense-flat` (#560): its flat-buffer views are F clusters, its
-  unit-row views U clusters, and its boundary rule is the one above. The
-  rewrite patterns are gone; the pass does it from op rules.
-- The permute canonicalization of #541: a permute moving size-1 dims is
-  transparent for U.
-- `SinkReshapeThroughPermutePattern` of #412: the decomposition's permutes
-  and reshapes are U-transparent.
+`ttir-dense-flat` (#560, not merged) did this for flat buffers and
+`[T, 1, V]`: its flat-buffer views are F clusters here, its unit-row views U
+clusters, and its boundary rule is the one above.
 
-Not replaced:
+These stay, though they overlap with the pass:
 
+- #541's permute canonicalization (`tt_mlir_permute_unit_dims.patch`)
+  rewrites and removes permutes that move size-1 dims, also on tensors too
+  small for the pass to change.
 - #412's `permuteOperand` in the `dot_general` decomposition skips a permute
   that only moves size-1 dims. That is a choice of ops, not of layouts, and
   #541's transposed matmul operands build on it.
-- #357's `HoistReshapeToFewerTilesPattern` and
-  `SinkReshapeToFewerTilesPattern` move elementwise ops to the side of a
-  reshape with fewer tiles inside the TTIR fusions, whose other patterns match
-  their results (a weightless `rms_norm`, a typecast folded into a multiply).
+- #412's `SinkReshapeThroughPermutePattern` and #357's
+  `HoistReshapeToFewerTilesPattern` and `SinkReshapeToFewerTilesPattern` move
+  ops to the side of a reshape with fewer tiles inside the TTIR fusions, whose
+  other patterns match their results (a weightless `rms_norm`, a typecast
+  folded into a multiply).
 - #521's wide-row reductions, which are kernels.
-
-## Results
-
-- miles' GRPO trainer (Qwen3-0.6B, FSDP2 on two chips): plain `main` runs out
-  of memory in the first rollout (a 622 MB buffer in each of 8 banks). With
-  physical layouts the same run trains: log-probabilities take 50.8 s on the
-  first (compiling) rollout and 13.9 and 12.2 s after, actor training
-  96.2, 30.9 and 28.4 s. The 4.7 GB `[256, 1, 151936]` log-probabilities no
-  longer exist anywhere.
-- Qwen3-8B on SGLang-TorchTPU at TP4 matches main (91.0/315.5 tok/s vs
-  90.9/315.4, same texts), Qwen3.8-27B at TP4 29.28 vs 29.25, FP8 75.4/257.1
-  vs 75.4/257.0; Qwen3-30B-A3B on SGLang-JAX at TP4 127.23 vs 127.37, Qwen3-8B
-  TP4 124.29 vs 124.40, TP1 46.96 vs 46.98, and batches of 4, 8 and 16 match
-  main.
 
 ## Not yet
 
