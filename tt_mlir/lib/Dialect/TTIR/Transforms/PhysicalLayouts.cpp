@@ -18,8 +18,7 @@
 // kRules) form a cluster, which takes the kind when the time its ops save
 // exceeds the time of the reshapes at its edges (worthIt). Public functions'
 // arguments and results of the shapes the runtime stores compactly
-// (boundaryShape, and compactShape in tt_mlir_physical_layouts.patch) take
-// those shapes.
+// (ttmlir/PhysicalLayouts.h) take those shapes.
 //
 // Fusions that match across reshapes form before this pass, as XLA forms its
 // library calls before it assigns layouts: the rotary embedding as a composite
@@ -29,9 +28,10 @@
 // edges, taking their operands in their logical shapes, and a composite's
 // decomposition is left as it is.
 //
-// LIBTT_PHYSICAL_LAYOUTS=0 turns it off, here and in the runtime.
+// LIBTT_PHYSICAL_LAYOUTS=0 turns it off.
 // LIBTT_PHYSICAL_LAYOUTS_MIN_MB (default 1) is the least a cluster must save.
 
+#include "ttmlir/PhysicalLayouts.h"
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROpsInterfaces.h"
@@ -52,9 +52,9 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <optional>
 
 namespace mlir::tt::ttir {
@@ -62,17 +62,6 @@ namespace mlir::tt::ttir {
 namespace {
 
 constexpr int64_t kTile = 32;
-// The runtime's storage rule (compactShape): rank-1 arrays of at least 2^20
-// elements and matrices of at most 8 rows and at least 2^22, folded; [T, 1, V]
-// tensors of at least 2^20 elements without the unit dim.
-constexpr int64_t kMinRank1Elements = int64_t{1} << 20;
-constexpr int64_t kMaxRows = 8;
-constexpr int64_t kMinMatrixElements = int64_t{1} << 22;
-
-bool enabled() {
-  const char *value = std::getenv("LIBTT_PHYSICAL_LAYOUTS");
-  return value == nullptr || std::strcmp(value, "0") != 0;
-}
 
 double minSavedBytes() {
   const char *value = std::getenv("LIBTT_PHYSICAL_LAYOUTS_MIN_MB");
@@ -746,24 +735,12 @@ std::optional<Plan> planFor(Operation *op, Kind kind) {
 }
 
 // The shape a public function's argument or result of `type` is stored in, if
-// not its own: the runtime's rule (compactShape).
-std::optional<SmallVector<int64_t>> boundaryShape(RankedTensorType type) {
-  if (!type || !type.hasStaticShape() || type.getNumElements() == 0) {
+// not its own: the runtime's.
+std::optional<std::array<int64_t, 2>> boundaryShape(RankedTensorType type) {
+  if (!type || !type.hasStaticShape()) {
     return std::nullopt;
   }
-  int64_t n = type.getNumElements();
-  if (n % kTile == 0 &&
-      ((type.getRank() == 1 && n >= kMinRank1Elements) ||
-       (type.getRank() == 2 && type.getDimSize(0) <= kMaxRows &&
-        type.getDimSize(1) != kTile && n >= kMinMatrixElements))) {
-    return physicalShape(Kind::F, type);
-  }
-  if (type.getRank() == 3 && type.getDimSize(1) == 1 &&
-      type.getDimSize(0) > 1 && type.getDimSize(2) > 1 &&
-      n >= kMinRank1Elements) {
-    return physicalShape(Kind::U, type);
-  }
-  return std::nullopt;
+  return ttmlir::physical_layouts::compactShape(type.getShape());
 }
 
 // Whether a boundary's tensor is the device's own (unsharded, or presharded
@@ -785,7 +762,7 @@ bool viewBoundaries(func::FuncOp func) {
   for (BlockArgument arg : entry.getArguments()) {
     unsigned index = arg.getArgNumber();
     RankedTensorType type = typeOf(arg);
-    std::optional<SmallVector<int64_t>> shape = boundaryShape(type);
+    std::optional<std::array<int64_t, 2>> shape = boundaryShape(type);
     auto local =
         func.getArgAttrOfType<ttcore::LocalShapeAttr>(index, localShape);
     if (!shape || !wholeOnDevice(local, type) ||
@@ -808,7 +785,7 @@ bool viewBoundaries(func::FuncOp func) {
   for (OpOperand &operand : ret->getOpOperands()) {
     unsigned index = operand.getOperandNumber();
     RankedTensorType type = typeOf(operand.get());
-    std::optional<SmallVector<int64_t>> shape = boundaryShape(type);
+    std::optional<std::array<int64_t, 2>> shape = boundaryShape(type);
     auto local =
         func.getResultAttrOfType<ttcore::LocalShapeAttr>(index, localShape);
     if (!shape || !wholeOnDevice(local, type) ||
@@ -1089,7 +1066,7 @@ public:
   }
 
   void runOnOperation() final {
-    if (!enabled()) {
+    if (!ttmlir::physical_layouts::enabled()) {
       return;
     }
     // Composites' decompositions stay as their composites have them.

@@ -25,10 +25,18 @@ index 1cc00b6..7814265 100644
    pm.addPass(mlir::tt::ttir::createTTIRFoldFullToScalar());
    // Folding a full to a scalar broadcasts the output of a consumer it gave
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-index 19f6bb1..c1ddbf8 100644
+index 19f6bb1..f4750fc 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-@@ -808,6 +808,15 @@ private:
+@@ -12,6 +12,7 @@
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
+ #include "ttmlir/FunctionTypes.h"
++#include "ttmlir/PhysicalLayouts.h"
+ 
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/Dialect/Quant/IR/QuantTypes.h"
+@@ -808,6 +809,16 @@ private:
        return false;
      }
  
@@ -36,8 +44,9 @@ index 19f6bb1..c1ddbf8 100644
 +    // stays in tiles, as the runtime stores it: row-major, its pages would be
 +    // 32 elements, and every buffer would be untilized into them on binding.
 +    if (auto type = mlir::dyn_cast<RankedTensorType>(arg.getType());
-+        type && type.getRank() == 2 && type.getDimSize(1) == 32 &&
-+        type.getNumElements() >= (int64_t{1} << 20)) {
++        type && type.getRank() == 2 &&
++        type.getDimSize(1) == ttmlir::physical_layouts::kFoldWidth &&
++        type.getNumElements() >= ttmlir::physical_layouts::kMinElements) {
 +      return false;
 +    }
 +
@@ -61,63 +70,39 @@ index b171f05..0aaac32 100644
    static std::shared_ptr<LayoutDesc>
    fromTensor(const ::tt::runtime::Tensor &tensor);
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
-index 9f9547f..01fd55f 100644
+index 9f9547f..7925401 100644
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
-@@ -29,6 +29,7 @@
- #include "tracy/Tracy.hpp"
- 
- #include <algorithm>
-+#include <cstdlib>
- #include <cstring>
- #include <memory>
- #include <sys/mman.h>
-@@ -1238,6 +1239,74 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+@@ -19,6 +19,7 @@
+ #include "tt/runtime/types.h"
+ #include "tt/runtime/utils.h"
+ #include "tt/runtime/workarounds.h"
++#include "ttmlir/PhysicalLayouts.h"
+ #include "ttmlir/Target/TTNN/program_generated.h"
+ #include "ttmlir/Target/TTNN/types_generated.h"
+ #include "ttnn/operations/experimental/quasar/to_layout/to_layout_op.hpp"
+@@ -1238,6 +1239,50 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
        /*meshEvent=*/std::nullopt, tensorWrapper.shouldRetain());
  }
  
-+// libtt: physical layouts (ttir-physical-layouts). In tiles, a rank-1
-+// array of N elements is one row of N / 32 tiles, each padded to 32 rows: 32
-+// times its size, a matrix of W < 32 rows takes 32 / W times its size, and a
-+// [T, 1, V] tensor pads each of its T rows to 32. Rank-1 arrays of at least
-+// 2^20 elements and matrices of at most 8 rows and 2^22 elements, a multiple of
-+// 32, are stored on device as [N / 32, 32] instead, and [T, 1, V] tensors of at
-+// least 2^20 elements as [T, V], the same elements in row-major order in
-+// whole tiles; ttir-physical-layouts (libtt's PhysicalLayouts.cpp,
-+// boundaryShape) gives programs' arguments and results of these shapes that
-+// type too. LIBTT_PHYSICAL_LAYOUTS=0 turns both off.
-+static bool physicalLayoutsEnabled() {
-+  static const bool enabled = [] {
-+    const char *value = std::getenv("LIBTT_PHYSICAL_LAYOUTS");
-+    return value == nullptr || std::strcmp(value, "0") != 0;
-+  }();
-+  return enabled;
-+}
-+
-+static std::optional<::ttnn::Shape>
-+compactShape(const ::ttnn::Shape &shape) {
-+  constexpr std::uint64_t kWidth = 32;
-+  if (!physicalLayoutsEnabled() || shape.volume() == 0) {
++// libtt: physical layouts (ttir-physical-layouts). The shape a tensor is
++// stored in on device, if not its own (ttmlir/PhysicalLayouts.h): the compiler
++// gives programs' arguments and results of these shapes that shape too.
++static std::optional<::ttnn::Shape> compactShape(const ::ttnn::Shape &shape) {
++  static const bool enabled = ttmlir::physical_layouts::enabled();
++  std::optional<std::array<int64_t, 2>> compact =
++      ttmlir::physical_layouts::compactShape(shape);
++  if (!enabled || !compact) {
 +    return std::nullopt;
 +  }
-+  const bool rank1 = shape.rank() == 1 && shape.volume() >= (1u << 20);
-+  const bool fewRows = shape.rank() == 2 && shape[0] <= 8 &&
-+                       shape[1] != kWidth && shape.volume() >= (1u << 22);
-+  if ((rank1 || fewRows) && shape.volume() % kWidth == 0) {
-+    return ::ttnn::Shape{static_cast<std::uint32_t>(shape.volume() / kWidth),
-+                        static_cast<std::uint32_t>(kWidth)};
-+  }
-+  if (shape.rank() == 3 && shape[1] == 1 && shape[0] > 1 && shape[2] > 1 &&
-+      shape.volume() >= (1u << 20)) {
-+    return ::ttnn::Shape{shape[0], shape[2]};
-+  }
-+  return std::nullopt;
++  return ::ttnn::Shape{static_cast<std::uint32_t>((*compact)[0]),
++                       static_cast<std::uint32_t>((*compact)[1])};
 +}
 +
 +// The shape `toLayout` gives `tensor` for `desired`: the program input's, or
 +// for other device layouts in tiles, its compact shape.
-+static std::optional<::ttnn::Shape> targetShape(
-+    const ::ttnn::Tensor &tensor, const LayoutDesc &desired) {
++static std::optional<::ttnn::Shape> targetShape(const ::ttnn::Tensor &tensor,
++                                                const LayoutDesc &desired) {
 +  if (desired.shape) {
 +    return desired.shape;
 +  }
@@ -147,7 +132,7 @@ index 9f9547f..01fd55f 100644
  ::tt::runtime::Tensor toLayout(::tt::runtime::Tensor tensor, Device device,
                                 Layout layout, std::optional<bool> retain) {
    const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
-@@ -1252,10 +1321,23 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+@@ -1252,10 +1297,23 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
    ::tt::runtime::ttnn::TTNNTensorWrapper &tensorWrapper =
        tensor.as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN);
  
@@ -173,7 +158,7 @@ index 9f9547f..01fd55f 100644
    ::ttnn::Tensor out = converter.convertTensorLayout(ttnnTensor, meshDevice);
  
    ::tt::runtime::Tensor result = utils::createRuntimeTensorFromTTNN(
-@@ -1315,6 +1397,16 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
+@@ -1315,6 +1373,16 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
    const LayoutDesc &desiredLayoutDesc =
        layout.as<LayoutDesc>(DeviceRuntime::TTNN);
  
@@ -190,7 +175,7 @@ index 9f9547f..01fd55f 100644
    if (desiredLayoutDesc.hostStagedTraceInput &&
        tensorLayoutDesc->isOnDevice() &&
        tensorLayoutDesc->dataType == desiredLayoutDesc.dataType) {
-@@ -1372,6 +1464,18 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
+@@ -1372,6 +1440,20 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
      layoutDesc->hostStagedTraceInput =
          isHostStagedTraceInput(executableHandle, programIndex, inputIndex);
    }
@@ -201,7 +186,9 @@ index 9f9547f..01fd55f 100644
 +        std::vector<std::uint32_t>(fbShape->begin(), fbShape->end()));
 +    // A compact shape (any large matrix: [N / 32, 32], or [T, V] for
 +    // [T, 1, V]), or a shape with one.
-+    const bool compact = shape.rank() == 2 && shape.volume() >= (1u << 20);
++    const bool compact =
++        shape.rank() == 2 &&
++        shape.volume() >= ttmlir::physical_layouts::kMinElements;
 +    if (compact || compactShape(shape)) {
 +      layoutDesc->shape = shape;
 +    }

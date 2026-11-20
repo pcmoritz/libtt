@@ -1372,6 +1372,8 @@ cc_library(
         "include",
     ],
     deps = _TTMLIR_COMMON_DEPS + [
+        # ttmlir/PhysicalLayouts.h, shared with the compiler.
+        "@//tt_mlir:compiler_headers",
         "@//tt_mlir:runtime_headers",
         "@highway//:hwy",
         "@tt_metal//:ttnn_tensor_upstream",

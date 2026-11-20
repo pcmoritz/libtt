@@ -96,14 +96,14 @@ allocation; an edge's cost is the same reshape time the two shapes differ by.
 U is tried first, then F on the values U didn't take: a fold only pays where
 the shape has no unit dims to drop.
 
-Public functions' arguments and results of compact shape keep it (`boundaryShape`
-in the pass, applied as the function's signature): rank-1 arrays of at least
-2^20 elements, matrices of at most 8 rows and at least 2^22 elements, and
-`[T, 1, V]` of at least 2^20 elements take the folded form, respectively
-`[T, V]`. The runtime applies the same rule to buffers it receives (the
-runtime half of `tt_mlir_physical_layouts.patch`: `compactShape`,
-`toLayout` reshapes a buffer stored otherwise, and a program input's
-`LayoutDesc` records its shape). `LIBTT_PHYSICAL_LAYOUTS=0` turns both off.
+Public functions' arguments and results of compact shape keep it, as the
+function's signature: rank-1 arrays of at least 2^20 elements, matrices of at
+most 8 rows and at least 2^22 elements, and `[T, 1, V]` of at least 2^20
+elements take the folded form, respectively `[T, V]`. The runtime stores
+buffers by the same rule, which `tt_mlir/include/ttmlir/PhysicalLayouts.h`
+gives both (the runtime half of `tt_mlir_physical_layouts.patch`: `toLayout`
+reshapes a buffer stored otherwise, and a program input's `LayoutDesc` records
+its shape). `LIBTT_PHYSICAL_LAYOUTS=0` turns both off.
 
 Fused ops formed before this pass are edges: the rotary composites
 (`ttcore.composite`), the decode attention prologue
