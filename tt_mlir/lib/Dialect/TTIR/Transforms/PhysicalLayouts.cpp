@@ -15,10 +15,11 @@
 //
 // Both hold the elements in the same row-major order, so a change of layout is
 // one reshape. Values connected through ops that run in a kind (its op rules,
-// planFor) form a cluster, which takes the kind when the time its ops save
-// exceeds the time of the reshapes at its edges (worthIt). Public functions' arguments and results of the
-// shapes the runtime stores compactly (boundaryShape, and compactShape in
-// tt_mlir_physical_layouts.patch) take those shapes.
+// kRules) form a cluster, which takes the kind when the time its ops save
+// exceeds the time of the reshapes at its edges (worthIt). Public functions'
+// arguments and results of the shapes the runtime stores compactly
+// (boundaryShape, and compactShape in tt_mlir_physical_layouts.patch) take
+// those shapes.
 //
 // Fusions that match across reshapes form before this pass, as XLA forms its
 // library calls before it assigns layouts: the rotary embedding as a composite
@@ -128,8 +129,7 @@ double elementBytes(Type elementType) {
 double allocation(ArrayRef<int64_t> shape, Type elementType) {
   int64_t rows = shape.size() >= 2 ? shape[shape.size() - 2] : 1;
   int64_t columns = shape.empty() ? 1 : shape.back();
-  int64_t batches =
-      shape.size() > 2 ? product(shape.drop_back(2)) : int64_t{1};
+  int64_t batches = shape.size() > 2 ? product(shape.drop_back(2)) : int64_t{1};
   int64_t paddedRows =
       rows <= kHalfTileMaxRows && columns >= kHalfTileMinColumns
           ? kHalfTileMaxRows
@@ -259,28 +259,25 @@ bool isFree(Value value) {
   return mlir::isa_and_nonnull<FullOp, ZerosOp, OnesOp>(producer);
 }
 
-void setAttr(SmallVector<NamedAttribute> &attrs, StringRef name,
-             Attribute value) {
-  for (NamedAttribute &attr : attrs) {
-    if (attr.getName() == name) {
-      attr.setValue(value);
-      return;
-    }
-  }
+template <typename... Ops>
+bool isOneOf(Operation *op) {
+  return mlir::isa<Ops...>(op);
 }
 
-IntegerAttr withValue(Operation *op, StringRef name, int64_t value) {
-  auto attr = op->getAttrOfType<IntegerAttr>(name);
-  return IntegerAttr::get(attr.getType(), value);
+// The dim that `op`'s integer attribute `name` names in a shape of `rank`.
+int64_t dimOf(Operation *op, StringRef name, int64_t rank) {
+  return normalized(
+      op->getAttrOfType<IntegerAttr>(name).getValue().getSExtValue(), rank);
 }
 
-bool isElementwise(Operation *op) {
-  return mlir::isa<ElementwiseUnary, ElementwiseBinary, ElementwiseTernary>(op);
-}
-
-bool isReduction(Operation *op) {
-  return mlir::isa<SumOp, MeanOp, MaxOp, MinOp, ProdOp, ArgMaxOp, ReduceAndOp,
-                   ReduceOrOp>(op);
+// `op`'s dim attribute `name`, a dim of `shape`, renumbered among the dims U
+// keeps.
+NamedAttribute keptDim(OpBuilder &b, Operation *op, StringRef name,
+                       ArrayRef<int64_t> shape) {
+  int64_t dim = keptIndex(shape)[dimOf(op, name, shape.size())];
+  return b.getNamedAttr(
+      name,
+      IntegerAttr::get(op->getAttrOfType<IntegerAttr>(name).getType(), dim));
 }
 
 // For a static slice with unit steps, its begins and sizes.
@@ -299,28 +296,100 @@ unitStepBounds(SliceStaticOp slice) {
   return std::make_pair(begins, sizes);
 }
 
-// How an op runs in a kind: which operands are stored like its result
-// (members), and the shape each other operand (an edge) takes.
+// Rows [begin, end) of a fold.
+Value foldRows(OpBuilder &b, Location loc, Value fold, int64_t begin,
+               int64_t end) {
+  RankedTensorType type = typeOf(fold);
+  if (begin == 0 && end == type.getDimSize(0)) {
+    return fold;
+  }
+  return b.create<SliceStaticOp>(
+      loc, withShape(type, {end - begin, kTile}), fold, i32Array(b, {begin, 0}),
+      i32Array(b, {end, kTile}), i32Array(b, {1, 1}));
+}
+
+Value stackRows(OpBuilder &b, Location loc, RankedTensorType type,
+                ArrayRef<Value> pieces) {
+  if (pieces.size() == 1) {
+    return pieces.front();
+  }
+  return b.create<ConcatOp>(loc, type, pieces, b.getSI32IntegerAttr(0));
+}
+
+// `op` on `operands`, with a result of `type` and the attributes in
+// `changed` replaced.
+Value create(OpBuilder &b, Operation *op, ValueRange operands,
+             RankedTensorType type, ArrayRef<NamedAttribute> changed = {}) {
+  NamedAttrList attrs(op->getAttrs());
+  for (NamedAttribute attr : changed) {
+    attrs.set(attr.getName(), attr.getValue());
+  }
+  OperationState state(op->getLoc(), op->getName().getStringRef(), operands,
+                       TypeRange{type}, attrs);
+  return b.create(state)->getResult(0);
+}
+
+struct Rule;
+
+// How an op runs in a kind: its rule, which operands are stored like its
+// result (members), and the shape each other operand (an edge) takes.
 struct Plan {
+  const Rule *rule = nullptr;
   // Per operand: nullopt for a member, else the edge's shape.
   SmallVector<std::optional<SmallVector<int64_t>>> operands;
 
   bool member(unsigned index) const { return !operands[index].has_value(); }
 };
 
-// Operands of the result's shape are members (constants are edges, whose
-// reshapes fold away); `other` gives the other operands' shapes.
+// One rule per op family and kind: `isa` picks the ops, `match` decides
+// whether one runs in `kind` and which operands are members, and `build`
+// emits it on physical operands. planFor has checked that the operands are
+// static tensors and that the result can take the kind; choose checks the
+// members.
+struct Rule {
+  Kind kind;
+  bool (*isa)(Operation *op);
+  std::optional<Plan> (*match)(Operation *op);
+  Value (*build)(OpBuilder &b, Operation *op, ValueRange operands,
+                 RankedTensorType type);
+};
+
+// The first operand is a member; any others keep their logical shape.
+std::optional<Plan> oneMember(Operation *op) {
+  Plan plan;
+  plan.operands.push_back(std::nullopt);
+  for (Value operand : op->getOperands().drop_front()) {
+    plan.operands.push_back(SmallVector<int64_t>(typeOf(operand).getShape()));
+  }
+  return plan;
+}
+
+// The first operand is a member if it has the result's unit dims.
+std::optional<Plan> sameUnitDimsMember(Operation *op) {
+  if (!sameUnitDims(typeOf(op->getOperand(0)).getShape(),
+                    typeOf(op->getResult(0)).getShape())) {
+    return std::nullopt;
+  }
+  return oneMember(op);
+}
+
+Value buildPlain(OpBuilder &b, Operation *op, ValueRange operands,
+                 RankedTensorType type) {
+  return create(b, op, operands, type);
+}
+
+// Elementwise ops and broadcasts: operands of the result's shape are members
+// (constants are edges, whose reshapes fold away); `other` gives the other
+// operands' shapes, broadcast against the result.
 std::optional<Plan> elementwisePlan(
-    Operation *op, Kind kind, RankedTensorType result,
+    Operation *op, Kind kind,
     llvm::function_ref<std::optional<SmallVector<int64_t>>(RankedTensorType)>
         other) {
+  ArrayRef<int64_t> result = typeOf(op->getResult(0)).getShape();
   Plan plan;
   for (Value operand : op->getOperands()) {
     RankedTensorType type = typeOf(operand);
-    if (!type || !type.hasStaticShape()) {
-      return std::nullopt;
-    }
-    if (type.getShape() == result.getShape()) {
+    if (type.getShape() == result) {
       if (isFree(operand)) {
         plan.operands.push_back(physicalShape(kind, type));
       } else {
@@ -332,20 +401,61 @@ std::optional<Plan> elementwisePlan(
     if (!shape) {
       return std::nullopt;
     }
-    plan.operands.push_back(*shape);
+    plan.operands.push_back(std::move(shape));
   }
   return plan;
 }
 
-// The reduced dims of a reduction over U's dims, and the physical result's
-// shape, if the reduction runs there.
-std::optional<SmallVector<int64_t>> reducedUnitDims(Operation *op,
-                                                    RankedTensorType input,
-                                                    RankedTensorType result) {
+// In U, broadcast operands are edges without the result's unit dims.
+std::optional<Plan> matchElementwiseU(Operation *op) {
+  ArrayRef<int64_t> result = typeOf(op->getResult(0)).getShape();
+  return elementwisePlan(
+      op, Kind::U,
+      [&](RankedTensorType type) -> std::optional<SmallVector<int64_t>> {
+        if (type.getRank() != static_cast<int64_t>(result.size())) {
+          return std::nullopt;
+        }
+        return dropUnitsOf(type.getShape(), result);
+      });
+}
+
+// In F, they have one element.
+std::optional<Plan> matchElementwiseF(Operation *op) {
+  return elementwisePlan(
+      op, Kind::F,
+      [](RankedTensorType type) -> std::optional<SmallVector<int64_t>> {
+        if (type.getNumElements() != 1) {
+          return std::nullopt;
+        }
+        return SmallVector<int64_t>{1, 1};
+      });
+}
+
+Value buildBroadcastU(OpBuilder &b, Operation *op, ValueRange operands,
+                      RankedTensorType type) {
+  SmallVector<int64_t> dims =
+      dropUnitsOf(mlir::cast<BroadcastOp>(op).getBroadcastDimensions(),
+                  typeOf(op->getResult(0)).getShape());
+  return create(
+      b, op, operands, type,
+      {b.getNamedAttr("broadcast_dimensions", b.getDenseI64ArrayAttr(dims))});
+}
+
+Value buildBroadcastF(OpBuilder &b, Operation *op, ValueRange operands,
+                      RankedTensorType type) {
+  return create(b, op, operands, type,
+                {b.getNamedAttr("broadcast_dimensions",
+                                b.getDenseI64ArrayAttr(type.getShape()))});
+}
+
+// A reduction runs in U on the reduced non-unit dims, renumbered, if the
+// result's non-unit dims are the input's that remain: those dims.
+std::optional<SmallVector<int64_t>> reducedUnitDims(Operation *op) {
   auto dimArg = op->getAttrOfType<ArrayAttr>("dim_arg");
   if (!dimArg) {
     return std::nullopt;
   }
+  RankedTensorType input = typeOf(op->getOperand(0));
   int64_t rank = input.getRank();
   SmallVector<int64_t> kept = keptIndex(input.getShape());
   SmallVector<bool> reduced(rank, false);
@@ -363,183 +473,50 @@ std::optional<SmallVector<int64_t>> reducedUnitDims(Operation *op,
       remaining.push_back(input.getDimSize(d));
     }
   }
-  if (dims.empty() || remaining != withoutUnitDims(result.getShape())) {
+  if (dims.empty() ||
+      remaining != withoutUnitDims(typeOf(op->getResult(0)).getShape())) {
     return std::nullopt;
   }
   return dims;
 }
 
-// One rule per (op family, kind). `match` decides whether the op may run in
-// `kind` and what layout each operand takes; `build` emits the op on physical
-// operands. Keeping the two side by side in one table is the point: an op's
-// layout rule can't drift between recognition and emission, and adding an op
-// means one row here plus (if needed) one helper.
-struct Rule {
-  const char *name;
-  Kind kind;
-  bool (*isa)(Operation *op);
-  std::optional<Plan> (*match)(Operation *op);
-  Value (*build)(OpBuilder &b, Operation *op, ValueRange operands,
-                 RankedTensorType type);
-};
-
-// The first operand is a member; any others keep their logical shape.
-static std::optional<Plan> oneMember(Operation *op) {
-  Plan plan;
-  plan.operands.push_back(std::nullopt);
-  for (unsigned i = 1; i < op->getNumOperands(); ++i) {
-    plan.operands.push_back(
-        SmallVector<int64_t>(typeOf(op->getOperand(i)).getShape()));
-  }
-  return plan;
-}
-
-Value foldRows(OpBuilder &b, Location loc, Value fold, int64_t begin,
-               int64_t end);
-Value stackRows(OpBuilder &b, Location loc, RankedTensorType type,
-                ArrayRef<Value> pieces);
-Value create(OpBuilder &b, Operation *op, ValueRange operands,
-             RankedTensorType type, ArrayRef<NamedAttribute> attrs);
-
-// Elementwise ops keep their kind of operands as members; broadcast operands
-// are edges (without the result's unit dims for U, one-element for F).
-static bool isElementwiseOp(Operation *op) { return isElementwise(op); }
-
-static std::optional<Plan> matchElementwiseU(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  return elementwisePlan(op, Kind::U, result,
-                         [&](RankedTensorType type)
-                             -> std::optional<SmallVector<int64_t>> {
-                           if (type.getRank() != result.getRank()) {
-                             return std::nullopt;
-                           }
-                           return dropUnitsOf(type.getShape(),
-                                              result.getShape());
-                         });
-}
-static std::optional<Plan> matchElementwiseF(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  return elementwisePlan(op, Kind::F, result,
-                         [](RankedTensorType type)
-                             -> std::optional<SmallVector<int64_t>> {
-                           if (type.getNumElements() != 1) {
-                             return std::nullopt;
-                           }
-                           return SmallVector<int64_t>{1, 1};
-                         });
-}
-static Value buildPlain(OpBuilder &b, Operation *op, ValueRange operands,
-                        RankedTensorType type) {
-  return create(b, op, operands, type, op->getAttrs());
-}
-
-// A broadcast has one input. In U it is an edge without the result's unit
-// dims; in F it has one element.
-static bool isBroadcastOp(Operation *op) { return mlir::isa<BroadcastOp>(op); }
-static std::optional<Plan> matchBroadcastU(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  RankedTensorType input = typeOf(op->getOperand(0));
-  if (!input || !input.hasStaticShape() ||
-      input.getRank() != result.getRank()) {
-    return std::nullopt;
-  }
-  Plan plan;
-  plan.operands.push_back(dropUnitsOf(input.getShape(), result.getShape()));
-  return plan;
-}
-static std::optional<Plan> matchBroadcastF(Operation *op) {
-  RankedTensorType input = typeOf(op->getOperand(0));
-  if (!input || !input.hasStaticShape() || input.getNumElements() != 1) {
-    return std::nullopt;
-  }
-  Plan plan;
-  plan.operands.push_back(SmallVector<int64_t>{1, 1});
-  return plan;
-}
-static Value buildBroadcastU(OpBuilder &b, Operation *op, ValueRange operands,
-                             RankedTensorType type) {
-  auto broadcast = mlir::cast<BroadcastOp>(op);
-  SmallVector<int64_t> dims = dropUnitsOf(broadcast.getBroadcastDimensions(),
-                                          typeOf(op->getResult(0)).getShape());
-  SmallVector<NamedAttribute> attrs(op->getAttrs());
-  setAttr(attrs, "broadcast_dimensions", b.getDenseI64ArrayAttr(dims));
-  return create(b, op, operands, type, attrs);
-}
-static Value buildBroadcastF(OpBuilder &b, Operation *op, ValueRange operands,
-                             RankedTensorType type) {
-  SmallVector<NamedAttribute> attrs(op->getAttrs());
-  setAttr(attrs, "broadcast_dimensions",
-          b.getDenseI64ArrayAttr(type.getShape()));
-  return create(b, op, operands, type, attrs);
-}
-
-// Reductions run in U on the reduced dims, mapped onto the input's U layout.
-static bool isReductionOp(Operation *op) { return isReduction(op); }
-static std::optional<Plan> matchReductionU(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  RankedTensorType input = typeOf(op->getOperand(0));
-  if (!input || !input.hasStaticShape() || !eligible(Kind::U, input)) {
-    return std::nullopt;
-  }
-  if (!reducedUnitDims(op, input, result)) {
+std::optional<Plan> matchReductionU(Operation *op) {
+  if (!reducedUnitDims(op)) {
     return std::nullopt;
   }
   return oneMember(op);
 }
-static Value buildReductionU(OpBuilder &b, Operation *op, ValueRange operands,
-                             RankedTensorType type) {
-  RankedTensorType input = typeOf(op->getOperand(0));
-  SmallVector<NamedAttribute> attrs(op->getAttrs());
-  setAttr(attrs, "dim_arg",
-          i32Array(b, *reducedUnitDims(op, input, typeOf(op->getResult(0)))));
-  setAttr(attrs, "keep_dim", b.getBoolAttr(false));
-  return create(b, op, operands, type, attrs);
+
+Value buildReductionU(OpBuilder &b, Operation *op, ValueRange operands,
+                      RankedTensorType type) {
+  return create(b, op, operands, type,
+                {b.getNamedAttr("dim_arg", i32Array(b, *reducedUnitDims(op))),
+                 b.getNamedAttr("keep_dim", b.getBoolAttr(false))});
 }
 
-// Softmax runs in U along a mapped non-unit dim.
-static bool isSoftmaxOp(Operation *op) { return mlir::isa<SoftmaxOp>(op); }
-static std::optional<Plan> matchSoftmaxU(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  (void)result;
-  RankedTensorType input = typeOf(op->getOperand(0));
-  if (!input || !input.hasStaticShape() || !eligible(Kind::U, input)) {
-    return std::nullopt;
-  }
-  auto softmax = mlir::cast<SoftmaxOp>(op);
-  if (input.getDimSize(normalized(softmax.getDimension(), input.getRank())) ==
-      1) {
+// Softmax runs in U along its dim, renumbered, if that isn't a unit dim.
+std::optional<Plan> matchSoftmaxU(Operation *op) {
+  ArrayRef<int64_t> input = typeOf(op->getOperand(0)).getShape();
+  if (input[dimOf(op, "dimension", input.size())] == 1) {
     return std::nullopt;
   }
   return oneMember(op);
 }
-static Value buildSoftmaxU(OpBuilder &b, Operation *op, ValueRange operands,
-                           RankedTensorType type) {
-  RankedTensorType input = typeOf(op->getOperand(0));
-  SmallVector<int64_t> kept = keptIndex(input.getShape());
-  auto softmax = mlir::cast<SoftmaxOp>(op);
-  SmallVector<NamedAttribute> attrs(op->getAttrs());
-  setAttr(attrs, "dimension",
-          withValue(op, "dimension",
-                    kept[normalized(softmax.getDimension(), input.getRank())]));
-  return create(b, op, operands, type, attrs);
+
+Value buildSoftmaxU(OpBuilder &b, Operation *op, ValueRange operands,
+                    RankedTensorType type) {
+  return create(
+      b, op, operands, type,
+      {keptDim(b, op, "dimension", typeOf(op->getOperand(0)).getShape())});
 }
 
-// A permute that, restricted to the kept dims, is the identity disappears.
-static bool isPermuteOp(Operation *op) { return mlir::isa<PermuteOp>(op); }
-static std::optional<Plan> matchPermuteU(Operation *op) {
-  RankedTensorType input = typeOf(op->getOperand(0));
-  if (!input || !input.hasStaticShape() || !eligible(Kind::U, input)) {
-    return std::nullopt;
-  }
-  return oneMember(op);
-}
-static Value buildPermuteU(OpBuilder &b, Operation *op, ValueRange operands,
-                           RankedTensorType type) {
-  RankedTensorType input = typeOf(op->getOperand(0));
-  SmallVector<int64_t> kept = keptIndex(input.getShape());
-  auto permute = mlir::cast<PermuteOp>(op);
+// A permute runs in U on the non-unit dims, and disappears when they keep
+// their order.
+Value buildPermuteU(OpBuilder &b, Operation *op, ValueRange operands,
+                    RankedTensorType type) {
+  SmallVector<int64_t> kept = keptIndex(typeOf(op->getOperand(0)).getShape());
   SmallVector<int64_t> permutation;
-  for (int64_t d : permute.getPermutation()) {
+  for (int64_t d : mlir::cast<PermuteOp>(op).getPermutation()) {
     if (kept[d] >= 0) {
       permutation.push_back(kept[d]);
     }
@@ -547,110 +524,67 @@ static Value buildPermuteU(OpBuilder &b, Operation *op, ValueRange operands,
   if (llvm::is_sorted(permutation)) {
     return operands[0];
   }
-  SmallVector<NamedAttribute> attrs(op->getAttrs());
-  setAttr(attrs, "permutation", b.getDenseI64ArrayAttr(permutation));
-  return create(b, op, operands, type, attrs);
+  return create(
+      b, op, operands, type,
+      {b.getNamedAttr("permutation", b.getDenseI64ArrayAttr(permutation))});
 }
 
-// All-reduces keep their layout; the U dim index is not renumbered because
-// the unit dims stay aligned across input and result.
-static bool isAllReduceOp(Operation *op) { return mlir::isa<AllReduceOp>(op); }
-static std::optional<Plan> matchAllReduceU(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  RankedTensorType input = typeOf(op->getOperand(0));
-  if (!input || !input.hasStaticShape() || !eligible(Kind::U, input)) {
-    return std::nullopt;
-  }
-  if (!sameUnitDims(input.getShape(), result.getShape())) {
-    return std::nullopt;
-  }
-  return oneMember(op);
-}
-static std::optional<Plan> matchAllReduceF(Operation *op) {
-  RankedTensorType input = typeOf(op->getOperand(0));
-  if (!input || !input.hasStaticShape() || !eligible(Kind::F, input)) {
-    return std::nullopt;
-  }
-  return oneMember(op);
-}
-
-// All-gather and reduce-scatter map the reduction dim; in F they only run on
-// rank-1 tensors.
-static bool isGatherScatterOp(Operation *op) {
-  return mlir::isa<AllGatherOp, ReduceScatterOp>(op);
-}
-static StringRef gatherScatterDim(Operation *op) {
+// All-gather and reduce-scatter run in U along their dim, renumbered; in F
+// only on rank-1 arrays.
+StringRef gatherScatterDim(Operation *op) {
   return mlir::isa<AllGatherOp>(op) ? "all_gather_dim" : "scatter_dim";
 }
-static std::optional<Plan> matchGatherScatterU(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  RankedTensorType input = typeOf(op->getOperand(0));
-  if (!input || !input.hasStaticShape() || !eligible(Kind::U, input)) {
+
+std::optional<Plan> matchGatherScatterU(Operation *op) {
+  ArrayRef<int64_t> input = typeOf(op->getOperand(0)).getShape();
+  if (input[dimOf(op, gatherScatterDim(op), input.size())] == 1) {
     return std::nullopt;
   }
-  StringRef name = gatherScatterDim(op);
-  int64_t dim =
-      normalized(op->getAttrOfType<IntegerAttr>(name).getInt(), input.getRank());
-  if (!sameUnitDims(input.getShape(), result.getShape()) ||
-      input.getDimSize(dim) == 1) {
-    return std::nullopt;
-  }
-  return oneMember(op);
-}
-static std::optional<Plan> matchGatherScatterF(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  RankedTensorType input = typeOf(op->getOperand(0));
-  if (!input || !input.hasStaticShape() || !eligible(Kind::F, input)) {
-    return std::nullopt;
-  }
-  if (input.getRank() != 1 || result.getRank() != 1) {
-    return std::nullopt;
-  }
-  return oneMember(op);
-}
-static Value buildGatherScatterU(OpBuilder &b, Operation *op,
-                                 ValueRange operands, RankedTensorType type) {
-  RankedTensorType input = typeOf(op->getOperand(0));
-  SmallVector<int64_t> kept = keptIndex(input.getShape());
-  StringRef name = gatherScatterDim(op);
-  SmallVector<NamedAttribute> attrs(op->getAttrs());
-  setAttr(attrs, name,
-          withValue(op, name,
-                    kept[normalized(op->getAttrOfType<IntegerAttr>(name)
-                                        .getInt(),
-                                    input.getRank())]));
-  return create(b, op, operands, type, attrs);
+  return sameUnitDimsMember(op);
 }
 
-// Slices keep unit dims in U; in F a slice is whole folded rows, or a range
-// of 32-element blocks in each row.
-static bool isSliceOp(Operation *op) { return mlir::isa<SliceStaticOp>(op); }
-static std::optional<Plan> matchSliceU(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  RankedTensorType input = typeOf(op->getOperand(0));
-  if (!input || !input.hasStaticShape() || !eligible(Kind::U, input)) {
-    return std::nullopt;
-  }
-  if (!sameUnitDims(input.getShape(), result.getShape())) {
+std::optional<Plan> matchGatherScatterF(Operation *op) {
+  if (typeOf(op->getOperand(0)).getRank() != 1 ||
+      typeOf(op->getResult(0)).getRank() != 1) {
     return std::nullopt;
   }
   return oneMember(op);
 }
-static std::optional<Plan> matchSliceF(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
+
+Value buildGatherScatterU(OpBuilder &b, Operation *op, ValueRange operands,
+                          RankedTensorType type) {
+  return create(b, op, operands, type,
+                {keptDim(b, op, gatherScatterDim(op),
+                         typeOf(op->getOperand(0)).getShape())});
+}
+
+// Slices run in U if they make no unit dims; in F a slice is whole folded
+// rows, or a range of 32-element blocks in each row.
+Value buildSliceU(OpBuilder &b, Operation *op, ValueRange operands,
+                  RankedTensorType type) {
   auto slice = mlir::cast<SliceStaticOp>(op);
+  ArrayRef<int64_t> input = typeOf(slice.getInput()).getShape();
+  auto kept = [&](ArrayAttr bounds) {
+    return i32Array(b, dropUnitsOf(intsOf(bounds), input));
+  };
+  return create(b, op, operands, type,
+                {b.getNamedAttr("begins", kept(slice.getBegins())),
+                 b.getNamedAttr("ends", kept(slice.getEnds())),
+                 b.getNamedAttr("step", kept(slice.getStep()))});
+}
+
+std::optional<Plan> matchSliceF(Operation *op) {
   RankedTensorType input = typeOf(op->getOperand(0));
-  if (!input || !input.hasStaticShape() || !eligible(Kind::F, input)) {
-    return std::nullopt;
-  }
-  auto bounds = unitStepBounds(slice);
+  auto bounds = unitStepBounds(mlir::cast<SliceStaticOp>(op));
   if (!bounds || input.getRank() > 2) {
     return std::nullopt;
   }
   auto &[begins, sizes] = *bounds;
   if (input.getRank() == 1) {
-    return begins[0] % kTile == 0 ? std::optional<Plan>(oneMember(op))
-                                  : std::nullopt;
+    if (begins[0] % kTile != 0) {
+      return std::nullopt;
+    }
+    return oneMember(op);
   }
   // Whole rows, or columns on 32-element boundaries of every row.
   int64_t columns = input.getDimSize(1);
@@ -664,21 +598,9 @@ static std::optional<Plan> matchSliceF(Operation *op) {
   }
   return std::nullopt;
 }
-static Value buildSliceU(OpBuilder &b, Operation *op, ValueRange operands,
-                         RankedTensorType type) {
-  auto slice = mlir::cast<SliceStaticOp>(op);
-  RankedTensorType input = typeOf(op->getOperand(0));
-  SmallVector<int64_t> begins = intsOf(slice.getBegins());
-  SmallVector<int64_t> ends = intsOf(slice.getEnds());
-  SmallVector<int64_t> steps = intsOf(slice.getStep());
-  SmallVector<NamedAttribute> attrs(op->getAttrs());
-  setAttr(attrs, "begins", i32Array(b, dropUnitsOf(begins, input.getShape())));
-  setAttr(attrs, "ends", i32Array(b, dropUnitsOf(ends, input.getShape())));
-  setAttr(attrs, "step", i32Array(b, dropUnitsOf(steps, input.getShape())));
-  return create(b, op, operands, type, attrs);
-}
-static Value buildSliceF(OpBuilder &b, Operation *op, ValueRange operands,
-                         RankedTensorType type) {
+
+Value buildSliceF(OpBuilder &b, Operation *op, ValueRange operands,
+                  RankedTensorType type) {
   Location loc = op->getLoc();
   auto slice = mlir::cast<SliceStaticOp>(op);
   auto [begins, sizes] = *unitStepBounds(slice);
@@ -702,25 +624,18 @@ static Value buildSliceF(OpBuilder &b, Operation *op, ValueRange operands,
   return stackRows(b, loc, type, pieces);
 }
 
-// Concats of U-layouts keep their dim mapped to the result's kept dims;
-// folding stacks whole folded rows, side by side per row for column concats.
-static bool isConcatOp(Operation *op) { return mlir::isa<ConcatOp>(op); }
-static std::optional<Plan> matchConcatU(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  RankedTensorType first = typeOf(op->getOperand(0));
-  if (!first || !first.hasStaticShape() || !eligible(Kind::U, first)) {
-    return std::nullopt;
-  }
-  auto concat = mlir::cast<ConcatOp>(op);
-  int64_t dim = normalized(concat.getDim(), result.getRank());
-  if (result.getDimSize(dim) == 1) {
+// Concats run in U along their dim, renumbered, if the inputs and the result
+// have the same unit dims; in F they stack whole folded rows, side by side in
+// each row for column concats.
+std::optional<Plan> matchConcatU(Operation *op) {
+  ArrayRef<int64_t> result = typeOf(op->getResult(0)).getShape();
+  if (result[dimOf(op, "dim", result.size())] == 1) {
     return std::nullopt;
   }
   Plan plan;
   for (Value operand : op->getOperands()) {
     RankedTensorType type = typeOf(operand);
-    if (!type || !type.hasStaticShape() ||
-        !sameUnitDims(type.getShape(), result.getShape())) {
+    if (!sameUnitDims(type.getShape(), result)) {
       return std::nullopt;
     }
     if (isFree(operand)) {
@@ -731,7 +646,8 @@ static std::optional<Plan> matchConcatU(Operation *op) {
   }
   return plan;
 }
-static std::optional<Plan> matchConcatF(Operation *op) {
+
+std::optional<Plan> matchConcatF(Operation *op) {
   RankedTensorType result = typeOf(op->getResult(0));
   if (result.getRank() > 2) {
     return std::nullopt;
@@ -741,8 +657,7 @@ static std::optional<Plan> matchConcatF(Operation *op) {
     RankedTensorType type = typeOf(operand);
     // Rank 1, or matrices whose rows are whole rows of the fold: stacked, or
     // side by side (each input's blocks of a row in turn).
-    if (!type || !type.hasStaticShape() || !eligible(Kind::F, type) ||
-        type.getRank() != result.getRank() ||
+    if (!eligible(Kind::F, type) || type.getRank() != result.getRank() ||
         (type.getRank() == 2 && type.getDimSize(1) % kTile != 0)) {
       return std::nullopt;
     }
@@ -754,133 +669,87 @@ static std::optional<Plan> matchConcatF(Operation *op) {
   }
   return plan;
 }
-static Value buildConcatU(OpBuilder &b, Operation *op, ValueRange operands,
-                          RankedTensorType type) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  auto concat = mlir::cast<ConcatOp>(op);
-  SmallVector<NamedAttribute> attrs(op->getAttrs());
-  setAttr(attrs,
-          "dim",
-          withValue(op, "dim",
-                    keptIndex(result.getShape())[normalized(
-                        concat.getDim(), result.getRank())]));
-  return create(b, op, operands, type, attrs);
+
+Value buildConcatU(OpBuilder &b, Operation *op, ValueRange operands,
+                   RankedTensorType type) {
+  return create(b, op, operands, type,
+                {keptDim(b, op, "dim", typeOf(op->getResult(0)).getShape())});
 }
-static Value buildConcatF(OpBuilder &b, Operation *op, ValueRange operands,
-                          RankedTensorType type) {
+
+Value buildConcatF(OpBuilder &b, Operation *op, ValueRange operands,
+                   RankedTensorType type) {
   Location loc = op->getLoc();
   RankedTensorType result = typeOf(op->getResult(0));
-  auto concat = mlir::cast<ConcatOp>(op);
-  if (result.getRank() == 2 && normalized(concat.getDim(), 2) == 1) {
+  if (result.getRank() == 2 && dimOf(op, "dim", 2) == 1) {
     SmallVector<Value> pieces;
     for (int64_t row = 0; row < result.getDimSize(0); ++row) {
-      for (auto [input, fold] :
-           llvm::zip_equal(concat.getInputs(), operands)) {
+      for (auto [input, fold] : llvm::zip_equal(op->getOperands(), operands)) {
         int64_t rowBlocks = typeOf(input).getDimSize(1) / kTile;
-        pieces.push_back(foldRows(b, loc, fold, row * rowBlocks,
-                                  (row + 1) * rowBlocks));
+        pieces.push_back(
+            foldRows(b, loc, fold, row * rowBlocks, (row + 1) * rowBlocks));
       }
     }
     return stackRows(b, loc, type, pieces);
   }
-  SmallVector<NamedAttribute> attrs(op->getAttrs());
-  setAttr(attrs, "dim", withValue(op, "dim", 0));
-  return create(b, op, operands, type, attrs);
+  return create(b, op, operands, type,
+                {b.getNamedAttr("dim", b.getSI32IntegerAttr(0))});
 }
 
-// Norms run in U when their normalized dims keep their place.
-static bool isNormOp(Operation *op) {
-  return mlir::isa<RMSNormOp, LayerNormOp>(op);
-}
-static std::optional<Plan> matchNormU(Operation *op) {
-  RankedTensorType input = typeOf(op->getOperand(0));
-  if (!input || !input.hasStaticShape() || !eligible(Kind::U, input)) {
-    return std::nullopt;
-  }
+// Norms run in U when their normalized dims aren't unit dims.
+std::optional<Plan> matchNormU(Operation *op) {
+  ArrayRef<int64_t> input = typeOf(op->getOperand(0)).getShape();
   auto normalizedShape =
       op->getAttrOfType<DenseI64ArrayAttr>("normalized_shape");
   if (!normalizedShape ||
-      llvm::is_contained(input.getShape().take_back(normalizedShape.size()),
-                         1)) {
+      llvm::is_contained(input.take_back(normalizedShape.size()), 1)) {
     return std::nullopt;
   }
   return oneMember(op);
 }
 
-static const Rule kRules[] = {
-    {"elementwise-u", Kind::U, isElementwiseOp, matchElementwiseU,
-     buildPlain},
-    {"broadcast-u", Kind::U, isBroadcastOp, matchBroadcastU, buildBroadcastU},
-    {"reduction-u", Kind::U, isReductionOp, matchReductionU, buildReductionU},
-    {"softmax-u", Kind::U, isSoftmaxOp, matchSoftmaxU, buildSoftmaxU},
-    {"permute-u", Kind::U, isPermuteOp, matchPermuteU, buildPermuteU},
-    {"allreduce-u", Kind::U, isAllReduceOp, matchAllReduceU, buildPlain},
-    {"gather_scatter-u", Kind::U, isGatherScatterOp, matchGatherScatterU,
+const Rule kRules[] = {
+    {Kind::U, isOneOf<ElementwiseUnary, ElementwiseBinary, ElementwiseTernary>,
+     matchElementwiseU, buildPlain},
+    {Kind::U, isOneOf<BroadcastOp>, matchElementwiseU, buildBroadcastU},
+    {Kind::U,
+     isOneOf<SumOp, MeanOp, MaxOp, MinOp, ProdOp, ArgMaxOp, ReduceAndOp,
+             ReduceOrOp>,
+     matchReductionU, buildReductionU},
+    {Kind::U, isOneOf<SoftmaxOp>, matchSoftmaxU, buildSoftmaxU},
+    {Kind::U, isOneOf<PermuteOp>, oneMember, buildPermuteU},
+    {Kind::U, isOneOf<AllReduceOp>, sameUnitDimsMember, buildPlain},
+    {Kind::U, isOneOf<AllGatherOp, ReduceScatterOp>, matchGatherScatterU,
      buildGatherScatterU},
-    {"slice-u", Kind::U, isSliceOp, matchSliceU, buildSliceU},
-    {"concat-u", Kind::U, isConcatOp, matchConcatU, buildConcatU},
-    {"norm-u", Kind::U, isNormOp, matchNormU, buildPlain},
-    {"elementwise-f", Kind::F, isElementwiseOp, matchElementwiseF, buildPlain},
-    {"broadcast-f", Kind::F, isBroadcastOp, matchBroadcastF, buildBroadcastF},
-    {"allreduce-f", Kind::F, isAllReduceOp, matchAllReduceF, buildPlain},
-    {"gather_scatter-f", Kind::F, isGatherScatterOp, matchGatherScatterF,
+    {Kind::U, isOneOf<SliceStaticOp>, sameUnitDimsMember, buildSliceU},
+    {Kind::U, isOneOf<ConcatOp>, matchConcatU, buildConcatU},
+    {Kind::U, isOneOf<RMSNormOp, LayerNormOp>, matchNormU, buildPlain},
+    {Kind::F, isOneOf<ElementwiseUnary, ElementwiseBinary, ElementwiseTernary>,
+     matchElementwiseF, buildPlain},
+    {Kind::F, isOneOf<BroadcastOp>, matchElementwiseF, buildBroadcastF},
+    {Kind::F, isOneOf<AllReduceOp>, oneMember, buildPlain},
+    {Kind::F, isOneOf<AllGatherOp, ReduceScatterOp>, matchGatherScatterF,
      buildPlain},
-    {"slice-f", Kind::F, isSliceOp, matchSliceF, buildSliceF},
-    {"concat-f", Kind::F, isConcatOp, matchConcatF, buildConcatF},
+    {Kind::F, isOneOf<SliceStaticOp>, matchSliceF, buildSliceF},
+    {Kind::F, isOneOf<ConcatOp>, matchConcatF, buildConcatF},
 };
 
-static const Rule *findRule(Kind kind, Operation *op) {
-  for (const Rule &rule : kRules) {
-    if (rule.kind == kind && rule.isa(op)) {
-      return &rule;
-    }
-  }
-  return nullptr;
-}
-
+// How `op` runs in `kind`, if it can.
 std::optional<Plan> planFor(Operation *op, Kind kind) {
-  if (op->getNumResults() != 1 || op->getNumRegions() != 0 ||
-      !typeOf(op->getResult(0)) || mlir::isa<ReshapeOp>(op) ||
-      isFree(op->getResult(0))) {
+  const Rule *rule = llvm::find_if(kRules, [&](const Rule &rule) {
+    return rule.kind == kind && rule.isa(op);
+  });
+  if (rule == std::end(kRules) || !eligible(kind, typeOf(op->getResult(0))) ||
+      !llvm::all_of(op->getOperandTypes(), [](Type type) {
+        auto tensor = mlir::dyn_cast<RankedTensorType>(type);
+        return tensor && tensor.hasStaticShape();
+      })) {
     return std::nullopt;
   }
-  RankedTensorType result = typeOf(op->getResult(0));
-  if (!eligible(kind, result)) {
-    return std::nullopt;
+  std::optional<Plan> plan = rule->match(op);
+  if (plan) {
+    plan->rule = rule;
   }
-  const Rule *rule = findRule(kind, op);
-  if (!rule) {
-    return std::nullopt;
-  }
-  return rule->match(op);
-}
-
-// Rows [begin, end) of a fold.
-Value foldRows(OpBuilder &b, Location loc, Value fold, int64_t begin,
-               int64_t end) {
-  RankedTensorType type = typeOf(fold);
-  if (begin == 0 && end == type.getDimSize(0)) {
-    return fold;
-  }
-  return b.create<SliceStaticOp>(loc, withShape(type, {end - begin, kTile}),
-                                 fold, i32Array(b, {begin, 0}),
-                                 i32Array(b, {end, kTile}),
-                                 i32Array(b, {1, 1}));
-}
-
-Value stackRows(OpBuilder &b, Location loc, RankedTensorType type,
-                ArrayRef<Value> pieces) {
-  if (pieces.size() == 1) {
-    return pieces.front();
-  }
-  return b.create<ConcatOp>(loc, type, pieces, b.getSI32IntegerAttr(0));
-}
-
-Value create(OpBuilder &b, Operation *op, ValueRange operands,
-             RankedTensorType type, ArrayRef<NamedAttribute> attrs) {
-  OperationState state(op->getLoc(), op->getName().getStringRef(), operands,
-                       TypeRange{type}, attrs);
-  return b.create(state)->getResult(0);
+  return plan;
 }
 
 // The shape a public function's argument or result of `type` is stored in, if
@@ -904,79 +773,65 @@ std::optional<SmallVector<int64_t>> boundaryShape(RankedTensorType type) {
   return std::nullopt;
 }
 
-// Sets a boundary's local shape, if its attributes give one.
-void setLocalShape(DictionaryAttr attrs, RankedTensorType type,
-                   llvm::function_ref<void(StringRef, Attribute)> set) {
-  if (!attrs || !attrs.get(ttcore::LocalShapeAttr::name)) {
-    return;
-  }
-  set(ttcore::LocalShapeAttr::name,
-      ttcore::LocalShapeAttr::get(type.getContext(), type));
-}
-
-// Whether the boundary's tensor is the device's own (unsharded, or presharded
+// Whether a boundary's tensor is the device's own (unsharded, or presharded
 // with its local shape): a mesh_shard would cut it otherwise.
-bool wholeOnDevice(DictionaryAttr attrs, RankedTensorType type) {
-  if (!attrs) {
-    return true;
-  }
-  if (auto local = mlir::dyn_cast_or_null<ttcore::LocalShapeAttr>(
-          attrs.get(ttcore::LocalShapeAttr::name))) {
-    return local.getLocalShape().getShape() == type.getShape();
-  }
-  return true;
+bool wholeOnDevice(ttcore::LocalShapeAttr local, RankedTensorType type) {
+  return !local || local.getLocalShape().getShape() == type.getShape();
 }
 
 // Gives a public function's arguments and results the runtime's storage
 // shapes, each with a reshape to or from its logical shape.
 bool viewBoundaries(func::FuncOp func) {
-  OpBuilder builder(func.getContext());
+  MLIRContext *context = func.getContext();
+  StringRef localShape = ttcore::LocalShapeAttr::name;
+  OpBuilder builder(context);
   bool viewed = false;
   Block &entry = func.getBody().front();
-  SmallVector<Type> inputs(func.getArgumentTypes());
-  SmallVector<Type> results(func.getResultTypes());
 
   builder.setInsertionPointToStart(&entry);
   for (BlockArgument arg : entry.getArguments()) {
+    unsigned index = arg.getArgNumber();
     RankedTensorType type = typeOf(arg);
     std::optional<SmallVector<int64_t>> shape = boundaryShape(type);
-    if (!shape || !wholeOnDevice(func.getArgAttrDict(arg.getArgNumber()), type) ||
-        llvm::any_of(arg.getUsers(),
-                     [](Operation *user) { return mlir::isa<MeshShardOp>(user); })) {
+    auto local =
+        func.getArgAttrOfType<ttcore::LocalShapeAttr>(index, localShape);
+    if (!shape || !wholeOnDevice(local, type) ||
+        llvm::any_of(arg.getUsers(), llvm::IsaPred<MeshShardOp>)) {
       continue;
     }
-    RankedTensorType stored = withShape(type, *shape);
     viewed = true;
+    RankedTensorType stored = withShape(type, *shape);
     arg.setType(stored);
-    inputs[arg.getArgNumber()] = stored;
     Value view = reshapeTo(builder, func.getLoc(), arg, type.getShape());
     arg.replaceAllUsesExcept(view, view.getDefiningOp());
-    setLocalShape(func.getArgAttrDict(arg.getArgNumber()), stored,
-                  [&](StringRef name, Attribute value) {
-                    func.setArgAttr(arg.getArgNumber(), name, value);
-                  });
+    if (local) {
+      func.setArgAttr(index, localShape,
+                      ttcore::LocalShapeAttr::get(context, stored));
+    }
   }
 
-  func.walk([&](func::ReturnOp ret) {
-    builder.setInsertionPoint(ret);
-    for (OpOperand &operand : ret->getOpOperands()) {
-      unsigned index = operand.getOperandNumber();
-      RankedTensorType type = typeOf(operand.get());
-      std::optional<SmallVector<int64_t>> shape = boundaryShape(type);
-      if (!shape || !wholeOnDevice(func.getResultAttrDict(index), type) ||
-          operand.get().getDefiningOp<MeshShardOp>()) {
-        continue;
-      }
-      viewed = true;
-      operand.set(reshapeTo(builder, ret.getLoc(), operand.get(), *shape));
-      results[index] = operand.get().getType();
-      setLocalShape(func.getResultAttrDict(index), typeOf(operand.get()),
-                    [&](StringRef name, Attribute value) {
-                      func.setResultAttr(index, name, value);
-                    });
+  auto ret = mlir::cast<func::ReturnOp>(entry.getTerminator());
+  builder.setInsertionPoint(ret);
+  for (OpOperand &operand : ret->getOpOperands()) {
+    unsigned index = operand.getOperandNumber();
+    RankedTensorType type = typeOf(operand.get());
+    std::optional<SmallVector<int64_t>> shape = boundaryShape(type);
+    auto local =
+        func.getResultAttrOfType<ttcore::LocalShapeAttr>(index, localShape);
+    if (!shape || !wholeOnDevice(local, type) ||
+        operand.get().getDefiningOp<MeshShardOp>()) {
+      continue;
     }
-  });
-  func.setType(builder.getFunctionType(inputs, results));
+    viewed = true;
+    operand.set(reshapeTo(builder, ret.getLoc(), operand.get(), *shape));
+    if (local) {
+      func.setResultAttr(
+          index, localShape,
+          ttcore::LocalShapeAttr::get(context, typeOf(operand.get())));
+    }
+  }
+  func.setType(FunctionType::get(context, entry.getArgumentTypes(),
+                                 ret.getOperandTypes()));
   return viewed;
 }
 
@@ -1025,16 +880,16 @@ public:
         continue;
       }
       SmallVector<Value> values = llvm::to_vector(clusters.members(leader));
-      if (!worthIt(kind, values, plans)) {
-        continue;
-      }
-      for (Value value : values) {
-        kinds[value] = kind;
-      }
-      for (auto &[op, plan] : plans) {
-        if (clusters.getLeaderValue(op->getResult(0)) == leader) {
-          built.try_emplace(op, findRule(kind, op), plan);
+      if (worthIt(kind, values, plans)) {
+        for (Value value : values) {
+          kinds[value] = kind;
         }
+      }
+    }
+    // The ops of the clusters taken: their results took the kind.
+    for (auto &[op, plan] : plans) {
+      if (kinds.contains(op->getResult(0))) {
+        built.try_emplace(op, std::move(plan));
       }
     }
   }
@@ -1067,10 +922,10 @@ public:
           continue;
         }
         Value input = physicalOf(reshape.getInput());
-        Value out = reshapeTo(
-            b, op->getLoc(), input,
-            kind ? physicalShape(*kind, typeOf(result))
-                 : SmallVector<int64_t>(typeOf(result).getShape()));
+        Value out =
+            reshapeTo(b, op->getLoc(), input,
+                      kind ? physicalShape(*kind, typeOf(result))
+                           : SmallVector<int64_t>(typeOf(result).getShape()));
         if (kind) {
           physical[result] = out;
         } else {
@@ -1080,8 +935,7 @@ public:
         continue;
       }
       if (auto it = built.find(op); it != built.end()) {
-        const Rule *rule = it->second.first;
-        const Plan &plan = it->second.second;
+        const Plan &plan = it->second;
         SmallVector<Value> operands;
         for (auto [i, operand] : llvm::enumerate(op->getOperands())) {
           if (plan.member(i)) {
@@ -1092,9 +946,9 @@ public:
           }
         }
         RankedTensorType result = typeOf(op->getResult(0));
-        physical[op->getResult(0)] =
-            rule->build(b, op, operands,
-                        withShape(result, physicalShape(rule->kind, result)));
+        physical[op->getResult(0)] = plan.rule->build(
+            b, op, operands,
+            withShape(result, physicalShape(plan.rule->kind, result)));
         replaced.push_back(op);
         continue;
       }
@@ -1117,9 +971,9 @@ public:
     llvm::DenseSet<Operation *> erased(replaced.begin(), replaced.end());
     for (Operation *op : replaced) {
       for (Value result : op->getResults()) {
-        if (kindOf(result) && llvm::any_of(result.getUsers(), [&](Operation *u) {
-              return !erased.contains(u);
-            })) {
+        if (kindOf(result) &&
+            llvm::any_of(result.getUsers(),
+                         [&](Operation *u) { return !erased.contains(u); })) {
           result.replaceUsesWithIf(logicalOf(result), [&](OpOperand &use) {
             return !erased.contains(use.getOwner());
           });
@@ -1155,8 +1009,8 @@ private:
     Value stored = physical.lookup(value);
     OpBuilder b(func.getContext());
     b.setInsertionPointAfterValue(stored);
-    Value result = reshapeTo(b, stored.getLoc(), stored,
-                             typeOf(value).getShape());
+    Value result =
+        reshapeTo(b, stored.getLoc(), stored, typeOf(value).getShape());
     logical[value] = result;
     return result;
   }
@@ -1204,7 +1058,8 @@ private:
             saved += smaller;
             continue;
           }
-          ArrayRef<int64_t> edge = *plan->second.operands[use.getOperandNumber()];
+          ArrayRef<int64_t> edge =
+              *plan->second.operands[use.getOperandNumber()];
           cost += reshapeCost(stored, edge, element) -
                   reshapeCost(shape, edge, element);
         } else if (auto reshape = mlir::dyn_cast<ReshapeOp>(user);
@@ -1225,7 +1080,7 @@ private:
 
   func::FuncOp func;
   llvm::DenseMap<Value, Kind> kinds;
-  llvm::DenseMap<Operation *, std::pair<const Rule *, Plan>> built;
+  llvm::DenseMap<Operation *, Plan> built;
   llvm::DenseMap<Value, Value> physical;
   llvm::DenseMap<Value, Value> logical;
 };
