@@ -1,0 +1,191 @@
+diff --git a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+index 1cc00b6..7814265 100644
+--- a/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
++++ b/lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp
+@@ -29,6 +29,11 @@ namespace mlir::tt::ttir {
+ std::unique_ptr<Pass> createTTIRMatmulEpiloguesPass(bool claimActivations);
+ } // namespace mlir::tt::ttir
+ 
++namespace mlir::tt::ttir {
++// libtt's tt_mlir/lib/Dialect/TTIR/Transforms/PhysicalLayouts.cpp.
++std::unique_ptr<Pass> createTTIRPhysicalLayoutsPass();
++} // namespace mlir::tt::ttir
++
+ namespace mlir::tt::ttnn {
+ //===----------------------------------------------------------------------===//
+ // Helper functions which combine multiple passes into logical groupings.
+@@ -103,6 +108,9 @@ void createTTNNPipelineTTIRPasses(
+         options.enableEltwiseActivationFusion ||
+         (options.optimizerPassEnabled && options.enableDRAMShardedMatmul)));
+   }
++  // Physical layouts without tile padding (libtt's PhysicalLayouts.cpp),
++  // after the fusions, which match the logical shapes.
++  pm.addPass(mlir::tt::ttir::createTTIRPhysicalLayoutsPass());
+   pm.addPass(mlir::tt::ttir::createTTIRWhileTripCount());
+   pm.addPass(mlir::tt::ttir::createTTIRFoldFullToScalar());
+   // Folding a full to a scalar broadcasts the output of a consumer it gave
+diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+index 19f6bb1..f4750fc 100644
+--- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
++++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
+@@ -12,6 +12,7 @@
+ #include "ttmlir/Dialect/TTNN/IR/TTNNOpsAttrs.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
+ #include "ttmlir/FunctionTypes.h"
++#include "ttmlir/PhysicalLayouts.h"
+ 
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/Dialect/Quant/IR/QuantTypes.h"
+@@ -808,6 +809,16 @@ private:
+       return false;
+     }
+ 
++    // A flat buffer folded to [N / 32, 32] (ttir-physical-layouts, libtt)
++    // stays in tiles, as the runtime stores it: row-major, its pages would be
++    // 32 elements, and every buffer would be untilized into them on binding.
++    if (auto type = mlir::dyn_cast<RankedTensorType>(arg.getType());
++        type && type.getRank() == 2 &&
++        type.getDimSize(1) == ttmlir::physical_layouts::kFoldWidth &&
++        type.getNumElements() >= ttmlir::physical_layouts::kMinElements) {
++      return false;
++    }
++
+     // ttnn.embedding reads the indices and the table as row-major sticks and
+     // rejects a tiled operand outright. If that is all the argument feeds,
+     // convert at the boundary instead: the runtime does it once at bind time
+diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/include/tt/runtime/detail/ttnn/types/types.h
+index b171f05..284c3b1 100644
+--- a/runtime/include/tt/runtime/detail/ttnn/types/types.h
++++ b/runtime/include/tt/runtime/detail/ttnn/types/types.h
+@@ -139,6 +139,10 @@ struct LayoutDesc {
+   // input slot. A device tensor of the same data type is then accepted as is
+   // (the copy happens on device, instead of round-tripping through the host).
+   bool hostStagedTraceInput = false;
++  // For a program input: its shape. A flat buffer and its fold [N / 32, 32],
++  // or a [T, 1, V] tensor and [T, V] (ttir-physical-layouts, libtt), stand for
++  // each other, and toLayout reshapes one into the other a program takes.
++  std::optional<::ttnn::Shape> shape;
+ 
+   static std::shared_ptr<LayoutDesc>
+   fromTensor(const ::tt::runtime::Tensor &tensor);
+diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
+index 9f9547f..d6812fc 100644
+--- a/runtime/lib/ttnn/runtime.cpp
++++ b/runtime/lib/ttnn/runtime.cpp
+@@ -19,6 +19,7 @@
+ #include "tt/runtime/types.h"
+ #include "tt/runtime/utils.h"
+ #include "tt/runtime/workarounds.h"
++#include "ttmlir/PhysicalLayouts.h"
+ #include "ttmlir/Target/TTNN/program_generated.h"
+ #include "ttmlir/Target/TTNN/types_generated.h"
+ #include "ttnn/operations/experimental/quasar/to_layout/to_layout_op.hpp"
+@@ -1238,6 +1239,57 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+       /*meshEvent=*/std::nullopt, tensorWrapper.shouldRetain());
+ }
+ 
++// libtt: physical layouts (ttir-physical-layouts). The shape a tensor is
++// stored in on device, if not its own (ttmlir/PhysicalLayouts.h): the compiler
++// gives programs' arguments and results of these shapes that shape too.
++static std::optional<::ttnn::Shape> compactShape(const ::ttnn::Shape &shape) {
++  static const bool enabled = ttmlir::physical_layouts::enabled();
++  std::optional<std::array<int64_t, 2>> compact =
++      ttmlir::physical_layouts::compactShape(shape);
++  if (!enabled || !compact) {
++    return std::nullopt;
++  }
++  return ::ttnn::Shape{static_cast<std::uint32_t>((*compact)[0]),
++                       static_cast<std::uint32_t>((*compact)[1])};
++}
++
++// Whether `a` and `b` are a shape and its compact shape, in either order.
++static bool isCompactPair(const ::ttnn::Shape &a, const ::ttnn::Shape &b) {
++  return a != b && (compactShape(a) == b || compactShape(b) == a);
++}
++
++// The shape `toLayout` reshapes `tensor` to for `desired`, if any: the program
++// input's when the two are a compact pair, or for other device layouts in
++// tiles, its compact shape.
++static std::optional<::ttnn::Shape> targetShape(const ::ttnn::Tensor &tensor,
++                                                const LayoutDesc &desired) {
++  const ::ttnn::Shape &shape = tensor.logical_shape();
++  if (desired.shape) {
++    return isCompactPair(shape, *desired.shape) ? desired.shape : std::nullopt;
++  }
++  if (desired.isOnDevice() && desired.isTilized()) {
++    return compactShape(shape);
++  }
++  return std::nullopt;
++}
++
++// `tensor` reshaped to `shape`, its compact shape or back. One in tiles on
++// device goes through the host: its elements are rows apart in its own tiles
++// and side by side in the compact one, and a device reshape of a rank-1
++// tensor's tiles stages whole rows. Buffers are made in the shape programs
++// take, so this is rare.
++static ::ttnn::Tensor reshapeTo(const ::ttnn::Tensor &tensor,
++                                const ::ttnn::Shape &shape) {
++  const std::vector<int32_t> target(shape.begin(), shape.end());
++  if (tensor.storage_type() == ::ttnn::StorageType::DEVICE &&
++      tensor.layout() == ::ttnn::Layout::TILE) {
++    ::ttnn::Tensor host = ::ttnn::to_layout(::ttnn::from_device(tensor),
++                                            ::ttnn::Layout::ROW_MAJOR);
++    return ::ttnn::reshape(host, target);
++  }
++  return ::ttnn::reshape(tensor, target);
++}
++
+ ::tt::runtime::Tensor toLayout(::tt::runtime::Tensor tensor, Device device,
+                                Layout layout, std::optional<bool> retain) {
+   const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
+@@ -1252,10 +1304,21 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+   ::tt::runtime::ttnn::TTNNTensorWrapper &tensorWrapper =
+       tensor.as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN);
+ 
+-  const ::ttnn::Tensor &ttnnTensor = tensorWrapper.getTensor();
++  ::ttnn::Tensor ttnnTensor = tensorWrapper.getTensor();
+   bool shouldRetain = retain.value_or(tensorWrapper.shouldRetain());
+ 
+-  LayoutConverter converter(*tensorLayoutDesc, desiredLayoutDesc);
++  std::shared_ptr<LayoutDesc> fromLayoutDesc = tensorLayoutDesc;
++  if (std::optional<::ttnn::Shape> shape =
++          targetShape(ttnnTensor, desiredLayoutDesc)) {
++    ttnnTensor = reshapeTo(ttnnTensor, *shape);
++    fromLayoutDesc = std::make_shared<LayoutDesc>(
++        ttnnTensor.storage_type(), ttnnTensor.layout(), ttnnTensor.dtype(),
++        ttnnTensor.storage_type() == ::ttnn::StorageType::DEVICE
++            ? std::optional<::ttnn::MemoryConfig>(ttnnTensor.memory_config())
++            : std::nullopt);
++  }
++
++  LayoutConverter converter(*fromLayoutDesc, desiredLayoutDesc);
+   ::ttnn::Tensor out = converter.convertTensorLayout(ttnnTensor, meshDevice);
+ 
+   ::tt::runtime::Tensor result = utils::createRuntimeTensorFromTTNN(
+@@ -1315,6 +1378,13 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
+   const LayoutDesc &desiredLayoutDesc =
+       layout.as<LayoutDesc>(DeviceRuntime::TTNN);
+ 
++  // A tensor in the other shape of a compact pair needs a reshape.
++  if (desiredLayoutDesc.shape &&
++      isCompactPair(
++          utils::getTTNNTensorFromRuntimeTensor(tensor).logical_shape(),
++          *desiredLayoutDesc.shape)) {
++    return false;
++  }
+   if (desiredLayoutDesc.hostStagedTraceInput &&
+       tensorLayoutDesc->isOnDevice() &&
+       tensorLayoutDesc->dataType == desiredLayoutDesc.dataType) {
+@@ -1372,6 +1442,12 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
+     layoutDesc->hostStagedTraceInput =
+         isHostStagedTraceInput(executableHandle, programIndex, inputIndex);
+   }
++  // A tensor and its compact shape stand for each other: which one the
++  // program takes.
++  if (const auto *fbShape = input->desc()->shape(); fbShape) {
++    layoutDesc->shape = ::ttnn::Shape(
++        std::vector<std::uint32_t>(fbShape->begin(), fbShape->end()));
++  }
+ 
+   return Layout(std::static_pointer_cast<void>(layoutDesc),
+                 DeviceRuntime::TTNN);
