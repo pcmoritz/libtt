@@ -46,7 +46,7 @@ everything in a decode step, keep their shapes.
 |---|---|---|
 | elementwise | into a compact result; one-element operands as `[1, 1]` | into a compact result; operands without their middle dim |
 | `broadcast` | of one element into a compact result | |
-| `slice_static` | of a compact input: 32-element runs, whole rows, or aligned column blocks | of a compact input, in T and V |
+| `slice_static` | of a compact input: columns between 32-element boundaries, of any rows | of a compact input, in T and V |
 | `concat` | into a compact result: stacked, or side by side | into a compact result, along T or V |
 | `all_gather`, `reduce_scatter` | rank 1, either side compact | |
 | reductions | | of a compact input, over T or V |

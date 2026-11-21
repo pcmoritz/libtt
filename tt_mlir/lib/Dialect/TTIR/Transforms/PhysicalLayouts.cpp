@@ -112,128 +112,30 @@ Value reshapeTo(OpBuilder &b, Location loc, Value input,
                              i32Array(b, shape));
 }
 
-// `op` on `operands`, with a result of `type` and the attributes in
-// `changed` replaced.
-Value create(OpBuilder &b, Operation *op, ValueRange operands,
-             RankedTensorType type, ArrayRef<NamedAttribute> changed = {}) {
+// `operand` reshaped to `shape` where it is made, so that its padded shape
+// lives no longer.
+Value reshapeOperand(Value operand, ArrayRef<int64_t> shape) {
+  OpBuilder after(operand.getContext());
+  after.setInsertionPointAfterValue(operand);
+  return reshapeTo(after, operand.getLoc(), operand, shape);
+}
+
+// `op` on its operands reshaped to `shapes`, with a result of `shape` and the
+// attributes in `changed` replaced.
+Value emit(OpBuilder &b, Operation *op, ArrayRef<SmallVector<int64_t>> shapes,
+           ArrayRef<int64_t> shape, ArrayRef<NamedAttribute> changed = {}) {
+  SmallVector<Value> operands;
+  for (auto [operand, s] : llvm::zip_equal(op->getOperands(), shapes)) {
+    operands.push_back(reshapeOperand(operand, s));
+  }
   NamedAttrList attrs(op->getAttrs());
   for (NamedAttribute attr : changed) {
     attrs.set(attr.getName(), attr.getValue());
   }
   OperationState state(op->getLoc(), op->getName().getStringRef(), operands,
-                       TypeRange{type}, attrs);
+                       TypeRange{withShape(typeOf(op->getResult(0)), shape)},
+                       attrs);
   return b.create(state)->getResult(0);
-}
-
-template <typename... Ops>
-bool isOneOf(Operation *op) {
-  return mlir::isa<Ops...>(op);
-}
-
-struct Rule;
-
-// How an op is rebuilt: its rule, the shape each operand is reshaped to, and
-// the shape of its result.
-struct Plan {
-  const Rule *rule = nullptr;
-  SmallVector<SmallVector<int64_t>> operands;
-  SmallVector<int64_t> result;
-};
-
-// One rule per op family and layout: `match` decides from the op's compact
-// tensor whether it is rebuilt and on which shapes, `build` emits it.
-struct Rule {
-  bool (*isa)(Operation *op);
-  std::optional<Plan> (*match)(Operation *op);
-  Value (*build)(OpBuilder &b, Operation *op, ValueRange operands,
-                 RankedTensorType type);
-};
-
-Value buildPlain(OpBuilder &b, Operation *op, ValueRange operands,
-                 RankedTensorType type) {
-  return create(b, op, operands, type);
-}
-
-//===----------------------------------------------------------------------===//
-// F: flat buffers and few-row matrices folded to [n / 32, 32].
-//===----------------------------------------------------------------------===//
-
-// Elementwise ops and broadcasts into a folded result: operands of its shape
-// fold alike, one-element operands are [1, 1].
-std::optional<Plan> matchElementwiseF(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  if (!isFolded(result)) {
-    return std::nullopt;
-  }
-  Plan plan;
-  plan.result = foldShape(result);
-  for (Value operand : op->getOperands()) {
-    RankedTensorType type = typeOf(operand);
-    if (type.getShape() == result.getShape()) {
-      plan.operands.push_back(plan.result);
-    } else if (type.getNumElements() == 1) {
-      plan.operands.push_back({1, 1});
-    } else {
-      return std::nullopt;
-    }
-  }
-  return plan;
-}
-
-Value buildBroadcastF(OpBuilder &b, Operation *op, ValueRange operands,
-                      RankedTensorType type) {
-  SmallVector<int64_t> multipliers;
-  for (auto [out, in] :
-       llvm::zip_equal(type.getShape(), typeOf(operands[0]).getShape())) {
-    multipliers.push_back(out / in);
-  }
-  return create(b, op, operands, type,
-                {b.getNamedAttr("broadcast_dimensions",
-                                b.getDenseI64ArrayAttr(multipliers))});
-}
-
-// For a static slice with unit steps, its begins and sizes.
-std::optional<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>>
-unitStepBounds(SliceStaticOp slice) {
-  SmallVector<int64_t> begins = intsOf(slice.getBegins());
-  SmallVector<int64_t> ends = intsOf(slice.getEnds());
-  if (llvm::any_of(intsOf(slice.getStep()), [](int64_t s) { return s != 1; })) {
-    return std::nullopt;
-  }
-  SmallVector<int64_t> sizes;
-  for (auto [b, e] : llvm::zip_equal(begins, ends)) {
-    sizes.push_back(e - b);
-  }
-  return std::make_pair(begins, sizes);
-}
-
-// Slices of a folded input: 32-element runs of a flat buffer, whole rows of a
-// matrix, or aligned column blocks of every row. The result is folded too,
-// whatever its size.
-std::optional<Plan> matchSliceF(Operation *op) {
-  RankedTensorType input = typeOf(op->getOperand(0));
-  RankedTensorType result = typeOf(op->getResult(0));
-  auto bounds = unitStepBounds(mlir::cast<SliceStaticOp>(op));
-  if (!isFolded(input) || !bounds || result.getNumElements() % kTile != 0) {
-    return std::nullopt;
-  }
-  auto &[begins, sizes] = *bounds;
-  if (input.getRank() == 1 && begins[0] % kTile != 0) {
-    return std::nullopt;
-  }
-  if (input.getRank() == 2) {
-    int64_t columns = input.getDimSize(1);
-    bool rows = sizes[1] == columns;
-    bool blocks = sizes[0] == input.getDimSize(0) && begins[1] % kTile == 0 &&
-                  sizes[1] % kTile == 0;
-    if (columns % kTile != 0 || (!rows && !blocks)) {
-      return std::nullopt;
-    }
-  }
-  Plan plan;
-  plan.operands.push_back(foldShape(input));
-  plan.result = foldShape(result);
-  return plan;
 }
 
 // Rows [begin, end) of a fold.
@@ -256,268 +158,230 @@ Value stackRows(OpBuilder &b, Location loc, RankedTensorType type,
   return b.create<ConcatOp>(loc, type, pieces, b.getSI32IntegerAttr(0));
 }
 
-Value buildSliceF(OpBuilder &b, Operation *op, ValueRange operands,
-                  RankedTensorType type) {
-  Location loc = op->getLoc();
-  auto slice = mlir::cast<SliceStaticOp>(op);
-  auto [begins, sizes] = *unitStepBounds(slice);
-  RankedTensorType input = typeOf(slice.getInput());
-  if (input.getRank() == 1) {
-    return foldRows(b, loc, operands[0], begins[0] / kTile,
-                    (begins[0] + sizes[0]) / kTile);
-  }
-  // A row is columns / 32 rows of the fold.
-  int64_t rowBlocks = input.getDimSize(1) / kTile;
-  if (sizes[1] == input.getDimSize(1)) {
-    return foldRows(b, loc, operands[0], begins[0] * rowBlocks,
-                    (begins[0] + sizes[0]) * rowBlocks);
-  }
-  SmallVector<Value> pieces;
-  for (int64_t row = 0; row < sizes[0]; ++row) {
-    int64_t first = (begins[0] + row) * rowBlocks + begins[1] / kTile;
-    pieces.push_back(
-        foldRows(b, loc, operands[0], first, first + sizes[1] / kTile));
-  }
-  return stackRows(b, loc, type, pieces);
-}
-
-// Concats into a folded result: flat buffers or rows stacked, or matrices
-// side by side (each input's blocks of a row in turn). Inputs of any size
-// fold alike.
-std::optional<Plan> matchConcatF(Operation *op) {
+// Elementwise ops into a compact result. Folded (F): operands of its shape fold
+// alike, one-element operands are [1, 1]. [T, 1, V] (U): every operand, of the
+// result's shape or broadcast against it, without its middle dim.
+Value rewriteElementwise(OpBuilder &b, Operation *op) {
   RankedTensorType result = typeOf(op->getResult(0));
-  if (!isFolded(result)) {
-    return std::nullopt;
+  bool folded = isFolded(result);
+  if (!folded && !isUnitRows(result)) {
+    return nullptr;
   }
-  Plan plan;
-  plan.result = foldShape(result);
+  SmallVector<SmallVector<int64_t>> shapes;
   for (Value operand : op->getOperands()) {
     RankedTensorType type = typeOf(operand);
-    if (type.getRank() != result.getRank() ||
-        type.getNumElements() % kTile != 0 ||
-        (type.getRank() == 2 && type.getDimSize(1) % kTile != 0)) {
-      return std::nullopt;
+    if (folded && type.getShape() == result.getShape()) {
+      shapes.push_back(foldShape(type));
+    } else if (folded && type.getNumElements() == 1) {
+      shapes.push_back({1, 1});
+    } else if (!folded && type.getRank() == 3 && type.getDimSize(1) == 1) {
+      shapes.push_back(withoutMiddle(type.getShape()));
+    } else {
+      return nullptr;
     }
-    plan.operands.push_back(foldShape(type));
   }
-  return plan;
+  return emit(b, op, shapes,
+              folded ? foldShape(result) : withoutMiddle(result.getShape()));
 }
 
-Value buildConcatF(OpBuilder &b, Operation *op, ValueRange operands,
-                   RankedTensorType type) {
-  Location loc = op->getLoc();
-  RankedTensorType result = typeOf(op->getResult(0));
-  if (result.getRank() == 2 && dimOf(op, "dim", 2) == 1) {
-    SmallVector<Value> pieces;
-    for (int64_t row = 0; row < result.getDimSize(0); ++row) {
-      for (auto [input, fold] : llvm::zip_equal(op->getOperands(), operands)) {
-        int64_t rowBlocks = typeOf(input).getDimSize(1) / kTile;
-        pieces.push_back(
-            foldRows(b, loc, fold, row * rowBlocks, (row + 1) * rowBlocks));
-      }
-    }
-    return stackRows(b, loc, type, pieces);
+// Broadcasts of one element into a folded result.
+Value rewriteBroadcast(OpBuilder &b, BroadcastOp broadcast) {
+  RankedTensorType result = typeOf(broadcast.getResult());
+  if (!isFolded(result) || typeOf(broadcast.getInput()).getNumElements() != 1) {
+    return nullptr;
   }
-  return create(b, op, operands, type,
+  SmallVector<int64_t> fold = foldShape(result);
+  return emit(
+      b, broadcast, {SmallVector<int64_t>{1, 1}}, fold,
+      {b.getNamedAttr("broadcast_dimensions", b.getDenseI64ArrayAttr(fold))});
+}
+
+// Slices of a compact input with unit steps. [T, 1, V]: the bounds of T and V.
+// Folded: each sliced row's columns, from and to 32-element boundaries, are
+// rows of the fold (a flat buffer is one row), stacked into a folded result.
+Value rewriteSlice(OpBuilder &b, SliceStaticOp slice) {
+  RankedTensorType input = typeOf(slice.getInput());
+  RankedTensorType result = typeOf(slice.getResult());
+  SmallVector<int64_t> begins = intsOf(slice.getBegins());
+  SmallVector<int64_t> ends = intsOf(slice.getEnds());
+  SmallVector<int64_t> steps = intsOf(slice.getStep());
+  if (isUnitRows(input)) {
+    auto outer = [&](ArrayRef<int64_t> bounds) {
+      return i32Array(b, withoutMiddle(bounds));
+    };
+    return emit(b, slice, {withoutMiddle(input.getShape())},
+                withoutMiddle(result.getShape()),
+                {b.getNamedAttr("begins", outer(begins)),
+                 b.getNamedAttr("ends", outer(ends)),
+                 b.getNamedAttr("step", outer(steps))});
+  }
+  bool flat = input.getRank() == 1;
+  int64_t columns = input.getShape().back();
+  int64_t from = begins.back();
+  int64_t to = ends.back();
+  if (!isFolded(input) ||
+      llvm::any_of(steps, [](int64_t s) { return s != 1; }) ||
+      columns % kTile != 0 || from % kTile != 0 || to % kTile != 0) {
+    return nullptr;
+  }
+  // The rows of the fold, as runs.
+  SmallVector<std::pair<int64_t, int64_t>> runs;
+  for (int64_t row = flat ? 0 : begins[0]; row < (flat ? 1 : ends[0]); ++row) {
+    int64_t first = (row * columns + from) / kTile;
+    int64_t last = (row * columns + to) / kTile;
+    if (!runs.empty() && runs.back().second == first) {
+      runs.back().second = last;
+    } else {
+      runs.push_back({first, last});
+    }
+  }
+  Value fold = reshapeOperand(slice.getInput(), foldShape(input));
+  SmallVector<Value> pieces;
+  for (auto [first, last] : runs) {
+    pieces.push_back(foldRows(b, slice.getLoc(), fold, first, last));
+  }
+  return stackRows(b, slice.getLoc(), withShape(result, foldShape(result)),
+                   pieces);
+}
+
+// Concats into a compact result. [T, 1, V]: along T or V, the same on [T, V].
+// Folded: flat buffers or rows stacked, or matrices side by side (each input's
+// blocks of a row in turn), inputs of any size folded alike.
+Value rewriteConcat(OpBuilder &b, ConcatOp concat) {
+  RankedTensorType result = typeOf(concat.getResult());
+  int64_t rank = result.getRank();
+  int64_t dim = dimOf(concat, "dim", rank);
+  SmallVector<SmallVector<int64_t>> shapes;
+  if (isUnitRows(result) && dim != 1) {
+    for (Value input : concat.getInputs()) {
+      shapes.push_back(withoutMiddle(typeOf(input).getShape()));
+    }
+    return emit(
+        b, concat, shapes, withoutMiddle(result.getShape()),
+        {b.getNamedAttr("dim", b.getSI32IntegerAttr(dim == 0 ? 0 : 1))});
+  }
+  if (!isFolded(result)) {
+    return nullptr;
+  }
+  for (Value input : concat.getInputs()) {
+    RankedTensorType type = typeOf(input);
+    if (type.getRank() != rank || type.getShape().back() % kTile != 0) {
+      return nullptr;
+    }
+    shapes.push_back(foldShape(type));
+  }
+  if (rank == 1 || dim == 0) {
+    return emit(b, concat, shapes, foldShape(result),
                 {b.getNamedAttr("dim", b.getSI32IntegerAttr(0))});
+  }
+  SmallVector<Value> folds;
+  for (auto [input, shape] : llvm::zip_equal(concat.getInputs(), shapes)) {
+    folds.push_back(reshapeOperand(input, shape));
+  }
+  SmallVector<Value> pieces;
+  for (int64_t row = 0; row < result.getDimSize(0); ++row) {
+    for (auto [input, fold] : llvm::zip_equal(concat.getInputs(), folds)) {
+      int64_t rowBlocks = typeOf(input).getDimSize(1) / kTile;
+      pieces.push_back(foldRows(b, concat.getLoc(), fold, row * rowBlocks,
+                                (row + 1) * rowBlocks));
+    }
+  }
+  return stackRows(b, concat.getLoc(), withShape(result, foldShape(result)),
+                   pieces);
 }
 
 // All-gathers and reduce-scatters of flat buffers with either side folded.
-std::optional<Plan> matchGatherScatterF(Operation *op) {
+Value rewriteGatherScatter(OpBuilder &b, Operation *op) {
   RankedTensorType input = typeOf(op->getOperand(0));
   RankedTensorType result = typeOf(op->getResult(0));
   if (input.getRank() != 1 || result.getRank() != 1 ||
       !(isFolded(input) || isFolded(result)) ||
       input.getNumElements() % kTile != 0 ||
       result.getNumElements() % kTile != 0) {
-    return std::nullopt;
+    return nullptr;
   }
-  Plan plan;
-  plan.operands.push_back(foldShape(input));
-  plan.result = foldShape(result);
-  return plan;
-}
-
-Value buildGatherScatterF(OpBuilder &b, Operation *op, ValueRange operands,
-                          RankedTensorType type) {
   StringRef dim = mlir::isa<AllGatherOp>(op) ? "all_gather_dim" : "scatter_dim";
-  return create(b, op, operands, type,
-                {b.getNamedAttr(dim, b.getSI32IntegerAttr(0))});
-}
-
-//===----------------------------------------------------------------------===//
-// U: [T, 1, V] as [T, V].
-//===----------------------------------------------------------------------===//
-
-// Elementwise ops into a [T, 1, V] result: every operand, of the result's
-// shape or broadcast against it, without its middle dim.
-std::optional<Plan> matchElementwiseU(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  if (!isUnitRows(result)) {
-    return std::nullopt;
-  }
-  Plan plan;
-  plan.result = withoutMiddle(result.getShape());
-  for (Value operand : op->getOperands()) {
-    RankedTensorType type = typeOf(operand);
-    if (type.getRank() != 3 || type.getDimSize(1) != 1) {
-      return std::nullopt;
-    }
-    plan.operands.push_back(withoutMiddle(type.getShape()));
-  }
-  return plan;
-}
-
-// A reduction's dims of [T, 1, V] among those of [T, V].
-SmallVector<int64_t> reducedDims(Operation *op) {
-  SmallVector<int64_t> dims;
-  for (int64_t d : intsOf(op->getAttrOfType<ArrayAttr>("dim_arg"))) {
-    int64_t dim = normalized(d, 3);
-    if (dim != 1) {
-      dims.push_back(dim == 0 ? 0 : 1);
-    }
-  }
-  return dims;
+  return emit(b, op, {foldShape(input)}, foldShape(result),
+              {b.getNamedAttr(dim, b.getSI32IntegerAttr(0))});
 }
 
 // Reductions of a [T, 1, V] input over T or V: the same on [T, V].
-std::optional<Plan> matchReductionU(Operation *op) {
+Value rewriteReduction(OpBuilder &b, Operation *op) {
   RankedTensorType input = typeOf(op->getOperand(0));
-  if (!isUnitRows(input) || !op->getAttrOfType<ArrayAttr>("dim_arg")) {
-    return std::nullopt;
+  auto dimArg = op->getAttrOfType<ArrayAttr>("dim_arg");
+  if (!isUnitRows(input) || !dimArg) {
+    return nullptr;
   }
-  SmallVector<int64_t> dims = reducedDims(op);
-  if (dims.empty()) {
-    return std::nullopt;
-  }
-  bool keep = op->getAttrOfType<BoolAttr>("keep_dim").getValue();
-  Plan plan;
-  plan.operands.push_back(withoutMiddle(input.getShape()));
-  for (auto [i, d] : llvm::enumerate(plan.operands.front())) {
-    if (!llvm::is_contained(dims, static_cast<int64_t>(i))) {
-      plan.result.push_back(d);
-    } else if (keep) {
-      plan.result.push_back(1);
+  SmallVector<int64_t> dims;
+  for (int64_t d : intsOf(dimArg)) {
+    if (int64_t dim = normalized(d, 3); dim != 1) {
+      dims.push_back(dim == 0 ? 0 : 1);
     }
   }
-  return plan;
-}
-
-Value buildReductionU(OpBuilder &b, Operation *op, ValueRange operands,
-                      RankedTensorType type) {
-  return create(b, op, operands, type,
-                {b.getNamedAttr("dim_arg", i32Array(b, reducedDims(op)))});
-}
-
-// Slices of a [T, 1, V] input: the bounds of T and V.
-std::optional<Plan> matchSliceU(Operation *op) {
-  RankedTensorType input = typeOf(op->getOperand(0));
-  if (!isUnitRows(input)) {
-    return std::nullopt;
+  if (dims.empty()) {
+    return nullptr;
   }
-  Plan plan;
-  plan.operands.push_back(withoutMiddle(input.getShape()));
-  plan.result = withoutMiddle(typeOf(op->getResult(0)).getShape());
-  return plan;
-}
-
-Value buildSliceU(OpBuilder &b, Operation *op, ValueRange operands,
-                  RankedTensorType type) {
-  auto slice = mlir::cast<SliceStaticOp>(op);
-  auto outer = [&](ArrayAttr bounds) {
-    return i32Array(b, withoutMiddle(intsOf(bounds)));
-  };
-  return create(b, op, operands, type,
-                {b.getNamedAttr("begins", outer(slice.getBegins())),
-                 b.getNamedAttr("ends", outer(slice.getEnds())),
-                 b.getNamedAttr("step", outer(slice.getStep()))});
-}
-
-// Concats into a [T, 1, V] result along T or V: the same on [T, V].
-std::optional<Plan> matchConcatU(Operation *op) {
-  RankedTensorType result = typeOf(op->getResult(0));
-  if (!isUnitRows(result) || dimOf(op, "dim", 3) == 1) {
-    return std::nullopt;
+  bool keep = op->getAttrOfType<BoolAttr>("keep_dim").getValue();
+  SmallVector<int64_t> rows = withoutMiddle(input.getShape());
+  SmallVector<int64_t> shape;
+  for (auto [i, d] : llvm::enumerate(rows)) {
+    if (!llvm::is_contained(dims, static_cast<int64_t>(i))) {
+      shape.push_back(d);
+    } else if (keep) {
+      shape.push_back(1);
+    }
   }
-  Plan plan;
-  plan.result = withoutMiddle(result.getShape());
-  for (Value operand : op->getOperands()) {
-    plan.operands.push_back(withoutMiddle(typeOf(operand).getShape()));
+  return emit(b, op, {rows}, shape,
+              {b.getNamedAttr("dim_arg", i32Array(b, dims))});
+}
+
+// `op` rebuilt on compact operands, if a rule takes it: its compact result.
+Value rewrite(OpBuilder &b, Operation *op) {
+  if (mlir::isa<ElementwiseUnary, ElementwiseBinary, ElementwiseTernary>(op)) {
+    return rewriteElementwise(b, op);
   }
-  return plan;
+  if (auto broadcast = mlir::dyn_cast<BroadcastOp>(op)) {
+    return rewriteBroadcast(b, broadcast);
+  }
+  if (auto slice = mlir::dyn_cast<SliceStaticOp>(op)) {
+    return rewriteSlice(b, slice);
+  }
+  if (auto concat = mlir::dyn_cast<ConcatOp>(op)) {
+    return rewriteConcat(b, concat);
+  }
+  if (mlir::isa<AllGatherOp, ReduceScatterOp>(op)) {
+    return rewriteGatherScatter(b, op);
+  }
+  if (mlir::isa<SumOp, MeanOp, MaxOp, MinOp, ProdOp, ArgMaxOp, ReduceAndOp,
+                ReduceOrOp>(op)) {
+    return rewriteReduction(b, op);
+  }
+  return nullptr;
 }
 
-Value buildConcatU(OpBuilder &b, Operation *op, ValueRange operands,
-                   RankedTensorType type) {
-  int64_t dim = dimOf(op, "dim", 3) == 0 ? 0 : 1;
-  return create(b, op, operands, type,
-                {b.getNamedAttr("dim", b.getSI32IntegerAttr(dim))});
-}
-
-const Rule kRules[] = {
-    {isOneOf<ElementwiseUnary, ElementwiseBinary, ElementwiseTernary>,
-     matchElementwiseF, buildPlain},
-    {isOneOf<ElementwiseUnary, ElementwiseBinary, ElementwiseTernary>,
-     matchElementwiseU, buildPlain},
-    {isOneOf<BroadcastOp>, matchElementwiseF, buildBroadcastF},
-    {isOneOf<SliceStaticOp>, matchSliceF, buildSliceF},
-    {isOneOf<SliceStaticOp>, matchSliceU, buildSliceU},
-    {isOneOf<ConcatOp>, matchConcatF, buildConcatF},
-    {isOneOf<ConcatOp>, matchConcatU, buildConcatU},
-    {isOneOf<AllGatherOp, ReduceScatterOp>, matchGatherScatterF,
-     buildGatherScatterF},
-    {isOneOf<SumOp, MeanOp, MaxOp, MinOp, ProdOp, ArgMaxOp, ReduceAndOp,
-             ReduceOrOp>,
-     matchReductionU, buildReductionU},
-};
-
-// How `op` is rebuilt, if a rule takes it.
-std::optional<Plan> planFor(Operation *op) {
+// Rebuilds each op a rule takes on compact operands, between reshapes from
+// and to the logical shapes. Folding then drops the reshapes between rebuilt
+// ops, and CSE merges the copies a value gets for several users.
+bool rebuild(func::FuncOp func) {
   auto isStatic = [](Type type) {
     auto tensor = mlir::dyn_cast<RankedTensorType>(type);
     return tensor && tensor.hasStaticShape();
   };
-  if (op->getNumResults() != 1 ||
-      !llvm::all_of(op->getOperandTypes(), isStatic) ||
-      !llvm::all_of(op->getResultTypes(), isStatic)) {
-    return std::nullopt;
-  }
-  for (const Rule &rule : kRules) {
-    if (!rule.isa(op)) {
-      continue;
-    }
-    if (std::optional<Plan> plan = rule.match(op)) {
-      plan->rule = &rule;
-      return plan;
-    }
-  }
-  return std::nullopt;
-}
-
-// Rebuilds each op a rule takes on its planned shapes, between reshapes from
-// and to the logical shapes. Folding then drops the reshapes between rebuilt
-// ops, and CSE merges the copies a value gets for several users.
-bool rebuild(func::FuncOp func) {
   bool changed = false;
   for (Operation *op :
        llvm::to_vector(llvm::make_pointer_range(func.getBody().front()))) {
-    std::optional<Plan> plan = planFor(op);
-    if (!plan) {
+    if (op->getNumResults() != 1 ||
+        !llvm::all_of(op->getOperandTypes(), isStatic) ||
+        !llvm::all_of(op->getResultTypes(), isStatic)) {
+      continue;
+    }
+    OpBuilder b(op);
+    Value out = rewrite(b, op);
+    if (!out) {
       continue;
     }
     changed = true;
-    OpBuilder b(op);
-    SmallVector<Value> operands;
-    for (auto [operand, shape] :
-         llvm::zip_equal(op->getOperands(), plan->operands)) {
-      // Where the operand is made, so that its padded shape lives no longer.
-      OpBuilder after(op->getContext());
-      after.setInsertionPointAfterValue(operand);
-      operands.push_back(reshapeTo(after, operand.getLoc(), operand, shape));
-    }
     RankedTensorType type = typeOf(op->getResult(0));
-    Value out =
-        plan->rule->build(b, op, operands, withShape(type, plan->result));
     op->getResult(0).replaceAllUsesWith(
         reshapeTo(b, op->getLoc(), out, type.getShape()));
     op->erase();
