@@ -475,20 +475,38 @@ Value buildReductionU(OpBuilder &b, Operation *op, ValueRange operands,
                  b.getNamedAttr("keep_dim", b.getBoolAttr(false))});
 }
 
-// Softmax runs in U along its dim, renumbered, if that isn't a unit dim.
-std::optional<Plan> matchSoftmaxU(Operation *op) {
-  ArrayRef<int64_t> input = typeOf(op->getOperand(0)).getShape();
-  if (input[dimOf(op, "dimension", input.size())] == 1) {
-    return std::nullopt;
+// The attribute naming the one dim softmax, all-gather, reduce-scatter and
+// concat run along.
+StringRef dimAttr(Operation *op) {
+  if (mlir::isa<SoftmaxOp>(op)) {
+    return "dimension";
   }
-  return oneMember(op);
+  if (mlir::isa<AllGatherOp>(op)) {
+    return "all_gather_dim";
+  }
+  if (mlir::isa<ReduceScatterOp>(op)) {
+    return "scatter_dim";
+  }
+  return "dim";
 }
 
-Value buildSoftmaxU(OpBuilder &b, Operation *op, ValueRange operands,
-                    RankedTensorType type) {
+// Softmax, all-gather and reduce-scatter run in U along their dim, renumbered,
+// if it isn't a unit dim and the input has the result's unit dims.
+std::optional<Plan> matchDimU(Operation *op) {
+  ArrayRef<int64_t> input = typeOf(op->getOperand(0)).getShape();
+  if (input[dimOf(op, dimAttr(op), input.size())] == 1) {
+    return std::nullopt;
+  }
+  return sameUnitDimsMember(op);
+}
+
+// The op along its dim renumbered among the dims U keeps. A concat's inputs
+// all have the result's unit dims, so the first one renumbers it too.
+Value buildDimU(OpBuilder &b, Operation *op, ValueRange operands,
+                RankedTensorType type) {
   return create(
       b, op, operands, type,
-      {keptDim(b, op, "dimension", typeOf(op->getOperand(0)).getShape())});
+      {keptDim(b, op, dimAttr(op), typeOf(op->getOperand(0)).getShape())});
 }
 
 // A permute runs in U on the non-unit dims, and disappears when they keep
@@ -510,33 +528,13 @@ Value buildPermuteU(OpBuilder &b, Operation *op, ValueRange operands,
       {b.getNamedAttr("permutation", b.getDenseI64ArrayAttr(permutation))});
 }
 
-// All-gather and reduce-scatter run in U along their dim, renumbered; in F
-// only on rank-1 arrays.
-StringRef gatherScatterDim(Operation *op) {
-  return mlir::isa<AllGatherOp>(op) ? "all_gather_dim" : "scatter_dim";
-}
-
-std::optional<Plan> matchGatherScatterU(Operation *op) {
-  ArrayRef<int64_t> input = typeOf(op->getOperand(0)).getShape();
-  if (input[dimOf(op, gatherScatterDim(op), input.size())] == 1) {
-    return std::nullopt;
-  }
-  return sameUnitDimsMember(op);
-}
-
+// All-gather and reduce-scatter run in F only on rank-1 arrays.
 std::optional<Plan> matchGatherScatterF(Operation *op) {
   if (typeOf(op->getOperand(0)).getRank() != 1 ||
       typeOf(op->getResult(0)).getRank() != 1) {
     return std::nullopt;
   }
   return oneMember(op);
-}
-
-Value buildGatherScatterU(OpBuilder &b, Operation *op, ValueRange operands,
-                          RankedTensorType type) {
-  return create(b, op, operands, type,
-                {keptDim(b, op, gatherScatterDim(op),
-                         typeOf(op->getOperand(0)).getShape())});
 }
 
 // Slices run in U if they make no unit dims; in F a slice is whole folded
@@ -633,12 +631,6 @@ std::optional<Plan> matchConcatF(Operation *op) {
   return allMembers(op);
 }
 
-Value buildConcatU(OpBuilder &b, Operation *op, ValueRange operands,
-                   RankedTensorType type) {
-  return create(b, op, operands, type,
-                {keptDim(b, op, "dim", typeOf(op->getResult(0)).getShape())});
-}
-
 Value buildConcatF(OpBuilder &b, Operation *op, ValueRange operands,
                    RankedTensorType type) {
   Location loc = op->getLoc();
@@ -678,13 +670,12 @@ const Rule kRules[] = {
      isOneOf<SumOp, MeanOp, MaxOp, MinOp, ProdOp, ArgMaxOp, ReduceAndOp,
              ReduceOrOp>,
      matchReductionU, buildReductionU},
-    {Kind::U, isOneOf<SoftmaxOp>, matchSoftmaxU, buildSoftmaxU},
+    {Kind::U, isOneOf<SoftmaxOp, AllGatherOp, ReduceScatterOp>, matchDimU,
+     buildDimU},
     {Kind::U, isOneOf<PermuteOp>, oneMember, buildPermuteU},
     {Kind::U, isOneOf<AllReduceOp>, sameUnitDimsMember, buildPlain},
-    {Kind::U, isOneOf<AllGatherOp, ReduceScatterOp>, matchGatherScatterU,
-     buildGatherScatterU},
     {Kind::U, isOneOf<SliceStaticOp>, sameUnitDimsMember, buildSliceU},
-    {Kind::U, isOneOf<ConcatOp>, matchConcatU, buildConcatU},
+    {Kind::U, isOneOf<ConcatOp>, matchConcatU, buildDimU},
     {Kind::U, isOneOf<RMSNormOp, LayerNormOp>, matchNormU, buildPlain},
     {Kind::F, isOneOf<ElementwiseUnary, ElementwiseBinary, ElementwiseTernary>,
      matchElementwiseF, buildPlain},
