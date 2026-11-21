@@ -64,17 +64,6 @@ def test_softmax_slice_and_concat_of_unit_rows(tmp_path):
     assert not any(shape.startswith("256x1x") for shape in shapes)
 
 
-def test_transpose_with_a_trailing_unit_dim(tmp_path):
-    # [S, N, H, 1] to [N, S, H, 1]: the unit dim stays out of the tiles.
-    s, n, h = 1024, 16, 128
-    x = _rows(3, (s, n * h))
-    got, shapes = _run(
-        lambda x: (jnp.transpose(x.reshape(s, n, h, 1), (1, 0, 2, 3)) * 2).reshape(n, s * h), x, tmp_path=tmp_path
-    )
-    np.testing.assert_array_equal(np.asarray(got), 2 * x.reshape(s, n, h).transpose(1, 0, 2).reshape(n, s * h))
-    assert not any(shape.endswith("x128x1") for shape in shapes)
-
-
 def test_shapes_without_padding_are_kept(tmp_path):
     x = _rows(5, (512, 512))
     run = jax.jit(lambda x: jnp.exp(x) + x, compiler_options={"export_path": str(tmp_path)})

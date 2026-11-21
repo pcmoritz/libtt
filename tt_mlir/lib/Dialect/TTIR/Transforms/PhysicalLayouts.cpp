@@ -30,7 +30,6 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -602,16 +601,9 @@ public:
     if (!ttmlir::physical_layouts::enabled()) {
       return;
     }
-    // Composites' decompositions stay as their composites have them.
-    llvm::DenseSet<StringRef> decompositions;
-    getOperation().walk([&](Operation *op) {
-      if (auto callee = op->getAttrOfType<FlatSymbolRefAttr>("decomposition")) {
-        decompositions.insert(callee.getValue());
-      }
-    });
     SmallVector<func::FuncOp> changed;
     getOperation().walk([&](func::FuncOp func) {
-      if (func.isExternal() || decompositions.contains(func.getName())) {
+      if (func.isExternal()) {
         return;
       }
       bool viewed = !func.isPrivate() && viewBoundaries(func);
