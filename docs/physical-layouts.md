@@ -115,16 +115,17 @@ move before the pass instead.
 
 ## Rewriting
 
-The pass walks each function in program order and keeps, for each logical
-value, its physical value. An op in a cluster is rebuilt on physical operands
-with its attributes mapped (dims, permutation, slice bounds, broadcast
-multipliers, a reduction's `keep_dim`); any other op gets its operands in
-logical shapes. A reshape connects the physical values on its two sides and
-vanishes when they have the same shape. Values outside the entry block stay
-logical. Reshape folding is left to MLIR: consecutive reshapes merge and
-reshapes of constants and fills fold for free, so the rewrite emits
-straight-line code and the greedy driver cleans up. Clusters are decided in the
-order of the first value, reproducibly.
+Each op of a taken cluster is rebuilt on its own, with its attributes mapped
+(dims, permutation, slice bounds, broadcast multipliers, a reduction's
+`keep_dim`): its members are reshaped to the kind's shape where they are made,
+its edges to the shapes the op needs, and its result back to its logical
+shape. Every other op, and any use inside a region, keeps the logical value.
+Reshape folding is left to MLIR: a reshape of a reshape merges and a reshape to
+the same shape vanishes, so the pair between two rebuilt ops disappears, and
+reshapes of constants and fills fold for free. A value that several rebuilt ops
+take gets a reshape from each, side by side where it is made, which the CSE
+after the TTIR passes merges. Clusters are decided in the order of the first
+value, reproducibly.
 
 ## Earlier rewrites
 

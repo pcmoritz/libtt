@@ -858,94 +858,39 @@ public:
 
   bool changed() const { return !kinds.empty(); }
 
-  // Rebuilds the function's ops on their physical layouts.
+  // Rebuilds each op of the taken clusters on its own, between reshapes from
+  // and to the logical shapes. Folding then drops the reshapes between two
+  // rebuilt ops, and CSE merges the copies a value gets for several users.
   void rewrite() {
-    Block &entry = func.getBody().front();
-    MLIRContext *context = func.getContext();
-    for (BlockArgument arg : entry.getArguments()) {
-      if (auto kind = kindOf(arg)) {
-        OpBuilder b = OpBuilder::atBlockBegin(&entry);
-        physical[arg] =
-            reshapeTo(b, arg.getLoc(), arg, physicalShape(*kind, typeOf(arg)));
-        logical[arg] = arg;
-      }
-    }
-    SmallVector<Operation *> ops;
-    for (Operation &op : entry) {
-      ops.push_back(&op);
-    }
-    SmallVector<Operation *> replaced;
+    SmallVector<Operation *> ops =
+        llvm::to_vector(llvm::make_pointer_range(func.getBody().front()));
     for (Operation *op : ops) {
+      auto it = built.find(op);
+      if (it == built.end()) {
+        continue;
+      }
+      const Plan &plan = it->second;
+      Kind kind = plan.rule->kind;
       OpBuilder b(op);
-      if (auto reshape = mlir::dyn_cast<ReshapeOp>(op)) {
-        Value result = reshape.getResult();
-        std::optional<Kind> kind = kindOf(result);
-        if (!kind && !kindOf(reshape.getInput())) {
+      SmallVector<Value> operands;
+      for (auto [i, operand] : llvm::enumerate(op->getOperands())) {
+        if (!plan.member(i)) {
+          operands.push_back(
+              reshapeTo(b, op->getLoc(), operand, *plan.operands[i]));
           continue;
         }
-        Value input = physicalOf(reshape.getInput());
-        Value out =
-            reshapeTo(b, op->getLoc(), input,
-                      kind ? physicalShape(*kind, typeOf(result))
-                           : SmallVector<int64_t>(typeOf(result).getShape()));
-        if (kind) {
-          physical[result] = out;
-        } else {
-          result.replaceAllUsesWith(out);
-        }
-        replaced.push_back(op);
-        continue;
+        // Where the operand is made, so that its padded shape lives no longer.
+        OpBuilder after(op->getContext());
+        after.setInsertionPointAfterValue(operand);
+        operands.push_back(reshapeTo(after, operand.getLoc(), operand,
+                                     physicalShape(kind, typeOf(operand))));
       }
-      if (auto it = built.find(op); it != built.end()) {
-        const Plan &plan = it->second;
-        SmallVector<Value> operands;
-        for (auto [i, operand] : llvm::enumerate(op->getOperands())) {
-          if (plan.member(i)) {
-            operands.push_back(physicalOf(operand));
-          } else {
-            operands.push_back(reshapeTo(b, op->getLoc(), physicalOf(operand),
-                                         *plan.operands[i]));
-          }
-        }
-        RankedTensorType result = typeOf(op->getResult(0));
-        physical[op->getResult(0)] = plan.rule->build(
-            b, op, operands,
-            withShape(result, physicalShape(plan.rule->kind, result)));
-        replaced.push_back(op);
-        continue;
-      }
-      for (OpOperand &operand : op->getOpOperands()) {
-        if (kindOf(operand.get())) {
-          operand.set(logicalOf(operand.get()));
-        }
-      }
-      for (Value result : op->getResults()) {
-        if (auto kind = kindOf(result)) {
-          OpBuilder after(context);
-          after.setInsertionPointAfter(op);
-          physical[result] = reshapeTo(after, op->getLoc(), result,
-                                       physicalShape(*kind, typeOf(result)));
-          logical[result] = result;
-        }
-      }
-    }
-    // Uses left (inside regions) take the logical shape.
-    llvm::DenseSet<Operation *> erased(replaced.begin(), replaced.end());
-    for (Operation *op : replaced) {
-      for (Value result : op->getResults()) {
-        if (kindOf(result) &&
-            llvm::any_of(result.getUsers(),
-                         [&](Operation *u) { return !erased.contains(u); })) {
-          result.replaceUsesWithIf(logicalOf(result), [&](OpOperand &use) {
-            return !erased.contains(use.getOwner());
-          });
-        }
-      }
-    }
-    for (Operation *op : llvm::reverse(replaced)) {
-      if (op->use_empty()) {
-        op->erase();
-      }
+      RankedTensorType type = typeOf(op->getResult(0));
+      Value out = plan.rule->build(b, op, operands,
+                                   withShape(type, physicalShape(kind, type)));
+      op->getResult(0).replaceAllUsesWith(
+          reshapeTo(b, op->getLoc(), out, type.getShape()));
+      op->erase();
     }
   }
 
@@ -956,25 +901,6 @@ private:
       return std::nullopt;
     }
     return it->second;
-  }
-
-  Value physicalOf(Value value) {
-    auto it = physical.find(value);
-    return it == physical.end() ? value : it->second;
-  }
-
-  // A value of a kind in its logical shape: one reshape, made once.
-  Value logicalOf(Value value) {
-    if (auto it = logical.find(value); it != logical.end()) {
-      return it->second;
-    }
-    Value stored = physical.lookup(value);
-    OpBuilder b(func.getContext());
-    b.setInsertionPointAfterValue(stored);
-    Value result =
-        reshapeTo(b, stored.getLoc(), stored, typeOf(value).getShape());
-    logical[value] = result;
-    return result;
   }
 
   // The shape a value has where `kinds` doesn't give it one: its logical
@@ -1043,8 +969,6 @@ private:
   func::FuncOp func;
   llvm::DenseMap<Value, Kind> kinds;
   llvm::DenseMap<Operation *, Plan> built;
-  llvm::DenseMap<Value, Value> physical;
-  llvm::DenseMap<Value, Value> logical;
 };
 
 class TTIRPhysicalLayoutsPass
