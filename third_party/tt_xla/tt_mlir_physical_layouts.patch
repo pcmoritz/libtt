@@ -54,23 +54,22 @@ index 19f6bb1..f4750fc 100644
      // rejects a tiled operand outright. If that is all the argument feeds,
      // convert at the boundary instead: the runtime does it once at bind time
 diff --git a/runtime/include/tt/runtime/detail/ttnn/types/types.h b/runtime/include/tt/runtime/detail/ttnn/types/types.h
-index b171f05..0aaac32 100644
+index b171f05..284c3b1 100644
 --- a/runtime/include/tt/runtime/detail/ttnn/types/types.h
 +++ b/runtime/include/tt/runtime/detail/ttnn/types/types.h
-@@ -139,6 +139,11 @@ struct LayoutDesc {
+@@ -139,6 +139,10 @@ struct LayoutDesc {
    // input slot. A device tensor of the same data type is then accepted as is
    // (the copy happens on device, instead of round-tripping through the host).
    bool hostStagedTraceInput = false;
-+  // For a program input that has a compact shape or may be one: its shape. A
-+  // flat buffer and its fold [N / 32, 32], or a [T, 1, V] tensor and [T, V]
-+  // (ttir-physical-layouts, libtt), stand for each other, and toLayout
-+  // reshapes one into the other a program takes.
++  // For a program input: its shape. A flat buffer and its fold [N / 32, 32],
++  // or a [T, 1, V] tensor and [T, V] (ttir-physical-layouts, libtt), stand for
++  // each other, and toLayout reshapes one into the other a program takes.
 +  std::optional<::ttnn::Shape> shape;
  
    static std::shared_ptr<LayoutDesc>
    fromTensor(const ::tt::runtime::Tensor &tensor);
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
-index 9f9547f..7925401 100644
+index 9f9547f..d6812fc 100644
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
 @@ -19,6 +19,7 @@
@@ -81,7 +80,7 @@ index 9f9547f..7925401 100644
  #include "ttmlir/Target/TTNN/program_generated.h"
  #include "ttmlir/Target/TTNN/types_generated.h"
  #include "ttnn/operations/experimental/quasar/to_layout/to_layout_op.hpp"
-@@ -1238,6 +1239,50 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+@@ -1238,6 +1239,57 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
        /*meshEvent=*/std::nullopt, tensorWrapper.shouldRetain());
  }
  
@@ -99,15 +98,22 @@ index 9f9547f..7925401 100644
 +                       static_cast<std::uint32_t>((*compact)[1])};
 +}
 +
-+// The shape `toLayout` gives `tensor` for `desired`: the program input's, or
-+// for other device layouts in tiles, its compact shape.
++// Whether `a` and `b` are a shape and its compact shape, in either order.
++static bool isCompactPair(const ::ttnn::Shape &a, const ::ttnn::Shape &b) {
++  return a != b && (compactShape(a) == b || compactShape(b) == a);
++}
++
++// The shape `toLayout` reshapes `tensor` to for `desired`, if any: the program
++// input's when the two are a compact pair, or for other device layouts in
++// tiles, its compact shape.
 +static std::optional<::ttnn::Shape> targetShape(const ::ttnn::Tensor &tensor,
 +                                                const LayoutDesc &desired) {
++  const ::ttnn::Shape &shape = tensor.logical_shape();
 +  if (desired.shape) {
-+    return desired.shape;
++    return isCompactPair(shape, *desired.shape) ? desired.shape : std::nullopt;
 +  }
 +  if (desired.isOnDevice() && desired.isTilized()) {
-+    return compactShape(tensor.logical_shape());
++    return compactShape(shape);
 +  }
 +  return std::nullopt;
 +}
@@ -132,7 +138,7 @@ index 9f9547f..7925401 100644
  ::tt::runtime::Tensor toLayout(::tt::runtime::Tensor tensor, Device device,
                                 Layout layout, std::optional<bool> retain) {
    const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
-@@ -1252,10 +1297,23 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+@@ -1252,10 +1304,21 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
    ::tt::runtime::ttnn::TTNNTensorWrapper &tensorWrapper =
        tensor.as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN);
  
@@ -143,9 +149,7 @@ index 9f9547f..7925401 100644
 -  LayoutConverter converter(*tensorLayoutDesc, desiredLayoutDesc);
 +  std::shared_ptr<LayoutDesc> fromLayoutDesc = tensorLayoutDesc;
 +  if (std::optional<::ttnn::Shape> shape =
-+          targetShape(ttnnTensor, desiredLayoutDesc);
-+      shape && ttnnTensor.logical_shape() != *shape &&
-+      ttnnTensor.logical_shape().volume() == shape->volume()) {
++          targetShape(ttnnTensor, desiredLayoutDesc)) {
 +    ttnnTensor = reshapeTo(ttnnTensor, *shape);
 +    fromLayoutDesc = std::make_shared<LayoutDesc>(
 +        ttnnTensor.storage_type(), ttnnTensor.layout(), ttnnTensor.dtype(),
@@ -158,40 +162,29 @@ index 9f9547f..7925401 100644
    ::ttnn::Tensor out = converter.convertTensorLayout(ttnnTensor, meshDevice);
  
    ::tt::runtime::Tensor result = utils::createRuntimeTensorFromTTNN(
-@@ -1315,6 +1373,16 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
+@@ -1315,6 +1378,13 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
    const LayoutDesc &desiredLayoutDesc =
        layout.as<LayoutDesc>(DeviceRuntime::TTNN);
  
-+  // A tensor of other elements, such as one device's shard of a sharded
-+  // input, isn't a view of the input.
-+  if (const ::ttnn::Tensor &ttnnTensor =
-+          utils::getTTNNTensorFromRuntimeTensor(tensor);
-+      desiredLayoutDesc.shape &&
-+      ttnnTensor.logical_shape().volume() ==
-+          desiredLayoutDesc.shape->volume() &&
-+      ttnnTensor.logical_shape() != *desiredLayoutDesc.shape) {
++  // A tensor in the other shape of a compact pair needs a reshape.
++  if (desiredLayoutDesc.shape &&
++      isCompactPair(
++          utils::getTTNNTensorFromRuntimeTensor(tensor).logical_shape(),
++          *desiredLayoutDesc.shape)) {
 +    return false;
 +  }
    if (desiredLayoutDesc.hostStagedTraceInput &&
        tensorLayoutDesc->isOnDevice() &&
        tensorLayoutDesc->dataType == desiredLayoutDesc.dataType) {
-@@ -1372,6 +1440,20 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
+@@ -1372,6 +1442,12 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
      layoutDesc->hostStagedTraceInput =
          isHostStagedTraceInput(executableHandle, programIndex, inputIndex);
    }
 +  // A tensor and its compact shape stand for each other: which one the
 +  // program takes.
 +  if (const auto *fbShape = input->desc()->shape(); fbShape) {
-+    const ::ttnn::Shape shape(
++    layoutDesc->shape = ::ttnn::Shape(
 +        std::vector<std::uint32_t>(fbShape->begin(), fbShape->end()));
-+    // A compact shape (any large matrix: [N / 32, 32], or [T, V] for
-+    // [T, 1, V]), or a shape with one.
-+    const bool compact =
-+        shape.rank() == 2 &&
-+        shape.volume() >= ttmlir::physical_layouts::kMinElements;
-+    if (compact || compactShape(shape)) {
-+      layoutDesc->shape = shape;
-+    }
 +  }
  
    return Layout(std::static_pointer_cast<void>(layoutDesc),

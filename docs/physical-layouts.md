@@ -77,9 +77,10 @@ boundary lowers to slices and a concat (`IndexedRows.cpp`), which run folded.
 
 ## Tests
 
-- `tests/libtt/physical_layouts_test.py`: `[T, 1, V]` made inside a program,
-  through reductions, log-softmax, and slices and concats; the exported TTNN
-  program has no padded shape.
-- `tests/libtt/dense_flat_test.py`,
-  `tests/libtt_torch_tpu/fsdp2_flat_buffers_test.py`: flat buffers at program
-  boundaries and FSDP2 on two chips against CPU.
+- `tests/libtt/physical_layouts_test.py`: flat buffers and few-row matrices
+  through FSDP2's patterns (concats, slices, updates, views) and at program
+  boundaries; `[T, 1, V]` made inside a program, through reductions,
+  log-softmax, and slices and concats, with no padded shape in the exported
+  TTNN program.
+- `tests/libtt_torch_tpu/fsdp2_flat_buffers_test.py`: FSDP2 on two chips
+  against CPU.

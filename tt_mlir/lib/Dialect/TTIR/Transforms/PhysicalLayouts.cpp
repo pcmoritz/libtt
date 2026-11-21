@@ -96,12 +96,6 @@ ArrayAttr i32Array(Builder &b, ArrayRef<int64_t> values) {
   return b.getI32ArrayAttr(SmallVector<int32_t>(values.begin(), values.end()));
 }
 
-// The dim that `op`'s integer attribute `name` names in a shape of `rank`.
-int64_t dimOf(Operation *op, StringRef name, int64_t rank) {
-  return normalized(
-      op->getAttrOfType<IntegerAttr>(name).getValue().getSExtValue(), rank);
-}
-
 Value reshapeTo(OpBuilder &b, Location loc, Value input,
                 ArrayRef<int64_t> shape) {
   RankedTensorType type = typeOf(input);
@@ -245,14 +239,14 @@ Value rewriteSlice(OpBuilder &b, SliceStaticOp slice) {
 }
 
 // Concats into a compact result. [T, 1, V]: along T or V, the same on [T, V].
-// Folded: flat buffers or rows stacked, or matrices side by side (each input's
-// blocks of a row in turn), inputs of any size folded alike.
+// Folded: inputs of any size folded alike and stacked, whole, or for matrices
+// side by side, a row of each in turn.
 Value rewriteConcat(OpBuilder &b, ConcatOp concat) {
   RankedTensorType result = typeOf(concat.getResult());
   int64_t rank = result.getRank();
-  int64_t dim = dimOf(concat, "dim", rank);
-  SmallVector<SmallVector<int64_t>> shapes;
+  int64_t dim = normalized(concat.getDim(), rank);
   if (isUnitRows(result) && dim != 1) {
+    SmallVector<SmallVector<int64_t>> shapes;
     for (Value input : concat.getInputs()) {
       shapes.push_back(withoutMiddle(typeOf(input).getShape()));
     }
@@ -260,30 +254,23 @@ Value rewriteConcat(OpBuilder &b, ConcatOp concat) {
         b, concat, shapes, withoutMiddle(result.getShape()),
         {b.getNamedAttr("dim", b.getSI32IntegerAttr(dim == 0 ? 0 : 1))});
   }
-  if (!isFolded(result)) {
+  if (!isFolded(result) || llvm::any_of(concat.getInputs(), [&](Value input) {
+        RankedTensorType type = typeOf(input);
+        return type.getRank() != rank || type.getShape().back() % kTile != 0;
+      })) {
     return nullptr;
   }
-  for (Value input : concat.getInputs()) {
-    RankedTensorType type = typeOf(input);
-    if (type.getRank() != rank || type.getShape().back() % kTile != 0) {
-      return nullptr;
-    }
-    shapes.push_back(foldShape(type));
-  }
-  if (rank == 1 || dim == 0) {
-    return emit(b, concat, shapes, foldShape(result),
-                {b.getNamedAttr("dim", b.getSI32IntegerAttr(0))});
-  }
   SmallVector<Value> folds;
-  for (auto [input, shape] : llvm::zip_equal(concat.getInputs(), shapes)) {
-    folds.push_back(reshapeOperand(input, shape));
+  for (Value input : concat.getInputs()) {
+    folds.push_back(reshapeOperand(input, foldShape(typeOf(input))));
   }
+  int64_t parts = rank == 2 && dim == 1 ? result.getDimSize(0) : 1;
   SmallVector<Value> pieces;
-  for (int64_t row = 0; row < result.getDimSize(0); ++row) {
-    for (auto [input, fold] : llvm::zip_equal(concat.getInputs(), folds)) {
-      int64_t rowBlocks = typeOf(input).getDimSize(1) / kTile;
-      pieces.push_back(foldRows(b, concat.getLoc(), fold, row * rowBlocks,
-                                (row + 1) * rowBlocks));
+  for (int64_t part = 0; part < parts; ++part) {
+    for (Value fold : folds) {
+      int64_t rows = typeOf(fold).getDimSize(0) / parts;
+      pieces.push_back(
+          foldRows(b, concat.getLoc(), fold, part * rows, (part + 1) * rows));
     }
   }
   return stackRows(b, concat.getLoc(), withShape(result, foldShape(result)),

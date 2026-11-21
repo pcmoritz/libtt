@@ -49,7 +49,7 @@ std::optional<std::array<int64_t, 2>> compactShape(const Dims &dims) {
   }
   const bool rank1 = shape.size() == 1 && n >= kMinElements;
   const bool fewRows = shape.size() == 2 && shape[0] <= kMaxMatrixRows &&
-                       shape[1] != kFoldWidth && n >= kMinMatrixElements;
+                       n >= kMinMatrixElements;
   if ((rank1 || fewRows) && n % kFoldWidth == 0) {
     return std::array<int64_t, 2>{n / kFoldWidth, kFoldWidth};
   }
