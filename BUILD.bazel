@@ -112,7 +112,7 @@ py_wheel(
         "@platforms//cpu:x86_64",
         "@platforms//os:linux",
     ],
-    version = "0.2.1",
+    version = "0.2.2",
     deps = [
         ":jax_plugin",
         ":jax_plugin_shared_library",
