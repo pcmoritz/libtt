@@ -30,7 +30,8 @@ The rule is one function, `compactShape` in
 
 - **Buffers.** The runtime stores device buffers of these shapes compactly
   (`tt_mlir_physical_layouts.patch`): `toLayout` reshapes a buffer into the
-  shape a program takes, and a program input's `LayoutDesc` records it.
+  shape a program takes, on device and without a padded copy, and a program
+  input's `LayoutDesc` records it.
 - **Program boundaries.** `ttir-physical-layouts`
   (`tt_mlir/lib/Dialect/TTIR/Transforms/PhysicalLayouts.cpp`) gives public
   functions' arguments and results of these shapes their compact shapes. It

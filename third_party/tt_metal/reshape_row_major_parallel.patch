@@ -32,7 +32,19 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/device/rm_
 diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
 --- ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
 +++ ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm_program_factory.cpp
-@@ -102,6 +102,27 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+@@ -33,6 +33,11 @@ constexpr uint32_t noc_page_alignment_bytes = 16;
+ // wide destinations stop fitting in L1.
+ constexpr uint32_t small_dest_write_slots = 8;
+ 
++// Chunks of a source row are staged whole in L1. One of more than
++// max_chunk_bytes is split further, into chunks of at least min_chunk_bytes.
++constexpr uint32_t max_chunk_bytes = 256 * 1024;
++constexpr uint32_t min_chunk_bytes = 16 * 1024;
++
+ // Kept local (not a shared header): Quasar's factory is an intentional mirror of this
+ // file; a cross-op helper would only dedupe ~30 lines and add CMake/packaging coupling.
+ // Non-clean dest staging uses a multi-slot L1 ring. Cap slots by per-core L1 budget so
+@@ -102,6 +107,39 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
  
      uint32_t source_page_size_bytes = input_log_shape[-1] * data_size;
      uint32_t dest_page_size_bytes = output_log_shape[-1] * data_size;
@@ -48,19 +60,31 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm
 +    // boundary so the copy kernel can read it independently, and unless rows
 +    // stream, contain whole output rows so that no two cores share an output
 +    // page.
++    auto valid_chunks = [&](uint32_t chunks) {
++        return source_page_size_bytes % chunks == 0 && (source_page_size_bytes / chunks) % 64 == 0 &&
++               (stream_rows || (source_page_size_bytes / chunks) % dest_page_size_bytes == 0);
++    };
 +    uint32_t source_chunks = std::max(1u, num_cores_total / input_log_shape[-2]);
-+    while (source_chunks > 1 &&
-+           (source_page_size_bytes % source_chunks != 0 ||
-+            (source_page_size_bytes / source_chunks) % 64 != 0 ||
-+            (!stream_rows && (source_page_size_bytes / source_chunks) % dest_page_size_bytes != 0))) {
++    while (source_chunks > 1 && !valid_chunks(source_chunks)) {
 +        --source_chunks;
++    }
++    // A row too wide to stage in L1 in those chunks (a [2^24] FP32 row is
++    // 64 MB) is split into more chunks than cores, and each core copies several.
++    if (source_page_size_bytes / source_chunks > max_chunk_bytes) {
++        uint32_t more_chunks = (source_page_size_bytes + max_chunk_bytes - 1) / max_chunk_bytes;
++        while (source_page_size_bytes / more_chunks >= min_chunk_bytes && !valid_chunks(more_chunks)) {
++            ++more_chunks;
++        }
++        if (source_page_size_bytes / more_chunks >= min_chunk_bytes && valid_chunks(more_chunks)) {
++            source_chunks = more_chunks;
++        }
 +    }
 +    source_page_size_bytes /= source_chunks;
 +    const uint32_t input_pages = input_log_shape[-2] * source_chunks;
      uint32_t source_read_size_bytes = ((source_page_size_bytes - 1) & MASK_64) + 128;
      uint32_t read_start_page = 0;
      uint32_t write_start_page = 0;
-@@ -109,12 +130,13 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+@@ -109,12 +147,13 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
      TT_ASSERT(dst_buffer != nullptr, "Output buffer should be allocated on device!");
      // Find how many input pages each core is responsible for so that we always start at the beginning of a read and
      // write page Since the logical volumes match, we are guaranteed that the very last page is aligned
@@ -77,7 +101,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm
  
      const bool pages_noc_aligned = (source_page_size_bytes % noc_page_alignment_bytes == 0) &&
                                     (dest_page_size_bytes % noc_page_alignment_bytes == 0);
-@@ -124,7 +146,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+@@ -124,7 +163,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
      // Avoid dual-kernel when dest writes are too small for DRAM (Blackhole SYS-1419 / #50191).
      // Only dest alignment matters: source alignment selects the clean-vs-staging read path
      // but doesn't affect the size of writes hitting DRAM.
@@ -86,7 +110,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm
  
      const uint32_t num_dest_write_slots = choose_num_dest_write_slots(
          *device, pages_noc_aligned, can_use_dual_kernel, scratch_size0, dest_slot_size_bytes);
-@@ -160,6 +182,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+@@ -160,6 +199,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
          {"num_dest_write_slots", num_dest_write_slots},
          {"dest_slot_size_bytes", dest_slot_size_bytes},
          {"dest_write_size_bytes", dest_write_size_bytes},
@@ -94,7 +118,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm
      };
  
      const KernelSpec::RuntimeArgSchema rta_schema = {
-@@ -258,7 +281,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+@@ -258,7 +298,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
          } else {
              const uint32_t start_of_read = read_start_page;
              uint32_t end_of_read = read_start_page + responsibility;
@@ -103,7 +127,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm
              uint32_t pages_for_this_core = end_of_read - start_of_read;
              uint32_t write_jump = (pages_for_this_core * source_page_size_bytes) / dest_page_size_bytes;
  
-@@ -297,6 +320,18 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+@@ -297,6 +337,18 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
                       {"write_start_page", second_write_pos},
                       {"write_start_offset", 0u},
                       {"nop", 0u}});
@@ -122,7 +146,7 @@ diff --git ttnn/cpp/ttnn/operations/data_movement/reshape_view/device/reshape_rm
              } else {
                  // Original single kernel approach
                  AddRuntimeArgsForNode(
-@@ -311,7 +346,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
+@@ -311,7 +363,7 @@ ttnn::device_operation::ProgramArtifacts ReshapeViewRMProgramFactory::create_pro
              }
              write_start_page += write_jump;
              read_start_page = end_of_read;

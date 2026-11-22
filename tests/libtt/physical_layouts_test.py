@@ -260,3 +260,30 @@ def test_buffers_across_turning_off_and_on(monkeypatch):
     from_flat = jax.jit(lambda x: x[window] - 1)(flat)
     np.testing.assert_array_equal(np.asarray(from_folded), ramp[window] * 4)
     np.testing.assert_array_equal(np.asarray(from_flat), ramp[window] * 3)
+
+
+def test_row_major_buffers_across_turning_off_and_on(tmp_path, monkeypatch):
+    # With physical layouts off, a program gathering rows of a flat buffer takes it row-major, and so leaves it. A
+    # program made with them on then takes it folded: the runtime reshapes it row-major on device, in chunks of its
+    # one 64 MB row, and tilizes [N / 32, 32]. The other way round, a folded buffer is untilized, then reshaped
+    # row-major into one row. Neither makes the flat buffer's 32x padded tiles.
+    n = 1 << 24
+    ramp = np.arange(n, dtype=np.float32)
+    start = n // 8 + 5
+    window = slice(start, start + 64)
+
+    def rows(x, i):
+        return jax.lax.dynamic_slice(x, (i[0],), (64,))
+
+    monkeypatch.setenv("LIBTT_PHYSICAL_LAYOUTS", "0")
+    flat = jax.jit(lambda s: jnp.arange(n, dtype=jnp.float32) * s)(np.float32(2))
+    rows_of_flat = jax.jit(rows, compiler_options={"export_path": str(tmp_path)})(flat, np.array([start], np.int32))
+    np.testing.assert_array_equal(np.asarray(rows_of_flat), ramp[window] * 2)
+    assert _arguments(tmp_path) == [(str(n), False), ("1", True)]
+    monkeypatch.setenv("LIBTT_PHYSICAL_LAYOUTS", "1")
+    from_flat = jax.jit(lambda x: x[1024:2048] - 1)(flat)
+    folded = jax.jit(lambda s: jnp.arange(n, dtype=jnp.float32) * s + 1)(np.float32(3))
+    monkeypatch.setenv("LIBTT_PHYSICAL_LAYOUTS", "0")
+    rows_of_folded = jax.jit(lambda x, i: rows(x, i) * 2)(folded, np.array([start], np.int32))
+    np.testing.assert_array_equal(np.asarray(from_flat), ramp[1024:2048] * 2 - 1)
+    np.testing.assert_array_equal(np.asarray(rows_of_folded), (ramp[window] * 3 + 1) * 2)
