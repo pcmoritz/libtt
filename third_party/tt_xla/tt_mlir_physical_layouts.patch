@@ -67,7 +67,7 @@ index b171f05..284c3b1 100644
    static std::shared_ptr<LayoutDesc>
    fromTensor(const ::tt::runtime::Tensor &tensor);
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
-index 9f9547f..a72bd3f 100644
+index 9f9547f..1360794 100644
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
 @@ -19,6 +19,7 @@
@@ -78,7 +78,7 @@ index 9f9547f..a72bd3f 100644
  #include "ttmlir/Target/TTNN/program_generated.h"
  #include "ttmlir/Target/TTNN/types_generated.h"
  #include "ttnn/operations/experimental/quasar/to_layout/to_layout_op.hpp"
-@@ -1238,6 +1239,63 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+@@ -1238,6 +1239,66 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
        /*meshEvent=*/std::nullopt, tensorWrapper.shouldRetain());
  }
  
@@ -128,6 +128,9 @@ index 9f9547f..a72bd3f 100644
 +                                const ::ttnn::Shape &shape,
 +                                ::ttnn::Layout layout) {
 +  const std::vector<int32_t> target(shape.begin(), shape.end());
++  // TT-NN can't untilize block floats, or DRAM- or ND-sharded tensors, on
++  // device. Those take the tiled reshape, and the layout converter then
++  // untilizes them on the host, as it would without one.
 +  const bool rowMajor =
 +      tensor.layout() == ::ttnn::Layout::ROW_MAJOR ||
 +      (layout == ::ttnn::Layout::ROW_MAJOR &&
@@ -142,7 +145,7 @@ index 9f9547f..a72bd3f 100644
  ::tt::runtime::Tensor toLayout(::tt::runtime::Tensor tensor, Device device,
                                 Layout layout, std::optional<bool> retain) {
    const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
-@@ -1252,10 +1310,21 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+@@ -1252,10 +1313,21 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
    ::tt::runtime::ttnn::TTNNTensorWrapper &tensorWrapper =
        tensor.as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN);
  
@@ -166,7 +169,7 @@ index 9f9547f..a72bd3f 100644
    ::ttnn::Tensor out = converter.convertTensorLayout(ttnnTensor, meshDevice);
  
    ::tt::runtime::Tensor result = utils::createRuntimeTensorFromTTNN(
-@@ -1315,6 +1384,13 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
+@@ -1315,6 +1387,13 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
    const LayoutDesc &desiredLayoutDesc =
        layout.as<LayoutDesc>(DeviceRuntime::TTNN);
  
@@ -180,7 +183,7 @@ index 9f9547f..a72bd3f 100644
    if (desiredLayoutDesc.hostStagedTraceInput &&
        tensorLayoutDesc->isOnDevice() &&
        tensorLayoutDesc->dataType == desiredLayoutDesc.dataType) {
-@@ -1372,6 +1448,12 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
+@@ -1372,6 +1451,12 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
      layoutDesc->hostStagedTraceInput =
          isHostStagedTraceInput(executableHandle, programIndex, inputIndex);
    }
