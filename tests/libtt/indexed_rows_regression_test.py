@@ -416,14 +416,15 @@ def test_dynamic_update_slice_unsigned_starts():
 
 
 def test_dynamic_update_slice_unsigned_constant_start():
-    # A rank-1 update at a constant start on 32-element boundaries is slices
-    # and a concat: an unsigned start past INT32_MAX clamps high there too.
-    buffer = np.arange(128, dtype=np.float32)
+    # A rank-1 update at a constant start on 32-element boundaries of a buffer
+    # ttir-physical-layouts folds is slices and a concat: an unsigned start
+    # past INT32_MAX clamps high there too.
+    buffer = np.arange(1 << 20, dtype=np.float32)
     update = -np.arange(1, 33, dtype=np.float32)
     for start in (0xFFFFFFFF, 0x80000000, 64):
         got = run(lambda b, u: jax.lax.dynamic_update_slice(b, u, (np.uint32(start),)), buffer, update)
         want = buffer.copy()
-        want[min(start, 96) :][:32] = update
+        want[min(start, (1 << 20) - 32) :][:32] = update
         assert_equal(got, want)
 
 @pytest.mark.parametrize("shape,window", [((1, 993280), 248320), ((4, 70000), 40000)])

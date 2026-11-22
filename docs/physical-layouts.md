@@ -33,7 +33,10 @@ The rule is one function, `compactShape` in
   shape a program takes, and a program input's `LayoutDesc` records it.
 - **Program boundaries.** `ttir-physical-layouts`
   (`tt_mlir/lib/Dialect/TTIR/Transforms/PhysicalLayouts.cpp`) gives public
-  functions' arguments and results of these shapes their compact shapes.
+  functions' arguments and results of these shapes their compact shapes. It
+  marks the arguments it folds (`libtt.folded`), which TTNN's layout pass then
+  keeps in tiles, as the runtime stores them, instead of converting them to
+  row-major for an embedding or a rows gather.
 - **Inside programs.** The same pass rebuilds the ops that have a rule for a
   compact tensor on compact operands.
 
@@ -63,10 +66,12 @@ several users.
 Every other op sees logical shapes. It pays the padding as it did before: a
 compact value reshaped to its logical shape is as large as the tensor the
 program had there. FSDP2's `dynamic_update_slice` of a shard at a 32-element
-boundary lowers to slices and a concat (`IndexedRows.cpp`), which run folded.
+boundary of a buffer the rule folds lowers to slices and a concat
+(`IndexedRows.cpp`), which run folded. Other updates scatter rows.
 
-`LIBTT_PHYSICAL_LAYOUTS=0` turns off the pass and the runtime's compact
-storage of new buffers. Both read it each time, and the runtime reshapes a
+`LIBTT_PHYSICAL_LAYOUTS=0` turns off the pass, with its marks, the lowering of
+updates to slices and a concat, and the runtime's compact storage of new
+buffers. Both read it each time, and the runtime reshapes a
 buffer into the shape of the pair a program takes whatever the flag says, so
 buffers and programs made on either side of a change work together.
 
@@ -78,6 +83,12 @@ buffers and programs made on either side of a change work together.
 - **Ops without a rule**, such as scatters, sorts and top-k, on compact
   tensors.
 - **Values crossing control flow.** Only a function's own block is rebuilt.
+- **Lengths that aren't a multiple of 32.** A flat buffer or few-row matrix
+  whose elements aren't a multiple of 32 has no compact shape and pays the
+  full padding, 32 times its size for a flat buffer. One odd piece does it: a
+  `[1024]` weight sharded over 3 ranks is 342 elements. The pass logs each
+  public function's argument and result that misses the rule for this reason
+  alone.
 
 ## Tests
 

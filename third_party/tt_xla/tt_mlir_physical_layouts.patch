@@ -25,7 +25,7 @@ index 1cc00b6..7814265 100644
    pm.addPass(mlir::tt::ttir::createTTIRFoldFullToScalar());
    // Folding a full to a scalar broadcasts the output of a consumer it gave
 diff --git a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
-index 19f6bb1..f4750fc 100644
+index 19f6bb1..ebc54e3 100644
 --- a/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 +++ b/lib/Dialect/TTNN/Transforms/TTNNLayout.cpp
 @@ -12,6 +12,7 @@
@@ -36,17 +36,15 @@ index 19f6bb1..f4750fc 100644
  
  #include "mlir/Dialect/Func/IR/FuncOps.h"
  #include "mlir/Dialect/Quant/IR/QuantTypes.h"
-@@ -808,6 +809,16 @@ private:
+@@ -808,6 +809,14 @@ private:
        return false;
      }
  
-+    // A flat buffer folded to [N / 32, 32] (ttir-physical-layouts, libtt)
-+    // stays in tiles, as the runtime stores it: row-major, its pages would be
-+    // 32 elements, and every buffer would be untilized into them on binding.
-+    if (auto type = mlir::dyn_cast<RankedTensorType>(arg.getType());
-+        type && type.getRank() == 2 &&
-+        type.getDimSize(1) == ttmlir::physical_layouts::kFoldWidth &&
-+        type.getNumElements() >= ttmlir::physical_layouts::kMinElements) {
++    // A buffer ttir-physical-layouts (libtt) folds to [N / 32, 32] stays in
++    // tiles, as the runtime stores it: row-major, its pages would be 32
++    // elements, and every buffer would be untilized into them on binding.
++    if (owningFunc.getArgAttr(arg.getArgNumber(),
++                              ttmlir::physical_layouts::kFoldedAttrName)) {
 +      return false;
 +    }
 +

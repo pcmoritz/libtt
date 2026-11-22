@@ -30,11 +30,35 @@ constexpr int64_t kMinElements = int64_t{1} << 20;
 constexpr int64_t kMaxMatrixRows = 8;
 constexpr int64_t kMinMatrixElements = int64_t{1} << 22;
 
+// Marks a public function's argument that ttir-physical-layouts stores folded
+// to [N / 32, 32], which TTNN's layout pass then keeps in tiles, as the runtime
+// stores it.
+constexpr char kFoldedAttrName[] = "libtt.folded";
+
 // LIBTT_PHYSICAL_LAYOUTS=0 turns physical layouts off: the compiler's compact
 // shapes, and the runtime's for new buffers. Both read it each time.
 inline bool enabled() {
   const char *value = std::getenv("LIBTT_PHYSICAL_LAYOUTS");
   return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+// The number of elements of a tensor of shape `shape`.
+inline int64_t numElements(const std::vector<int64_t> &shape) {
+  int64_t n = 1;
+  for (int64_t d : shape) {
+    n *= d;
+  }
+  return n;
+}
+
+// Whether a tensor of shape `dims` is a rank-1 array or a few-row matrix large
+// enough to fold. It is folded only if its elements are a multiple of 32.
+template <typename Dims> bool largeEnoughToFold(const Dims &dims) {
+  const std::vector<int64_t> shape(std::begin(dims), std::end(dims));
+  const int64_t n = numElements(shape);
+  return (shape.size() == 1 && n >= kMinElements) ||
+         (shape.size() == 2 && shape[0] <= kMaxMatrixRows &&
+          n >= kMinMatrixElements);
 }
 
 // The shape a tensor of shape `dims` is stored in, if not its own: rank-1
@@ -44,14 +68,8 @@ inline bool enabled() {
 template <typename Dims>
 std::optional<std::array<int64_t, 2>> compactShape(const Dims &dims) {
   const std::vector<int64_t> shape(std::begin(dims), std::end(dims));
-  int64_t n = 1;
-  for (int64_t d : shape) {
-    n *= d;
-  }
-  const bool rank1 = shape.size() == 1 && n >= kMinElements;
-  const bool fewRows = shape.size() == 2 && shape[0] <= kMaxMatrixRows &&
-                       n >= kMinMatrixElements;
-  if ((rank1 || fewRows) && n % kFoldWidth == 0) {
+  const int64_t n = numElements(shape);
+  if (largeEnoughToFold(shape) && n % kFoldWidth == 0) {
     return std::array<int64_t, 2>{n / kFoldWidth, kFoldWidth};
   }
   if (shape.size() == 3 && shape[1] == 1 && shape[0] > 1 && shape[2] > 1 &&

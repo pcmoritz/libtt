@@ -30,8 +30,19 @@ def _random(shape, seed=0):
 def _run(f, *args, tmp_path):
     """f's results, and the shapes of the FP32 tensors in its TTNN program."""
     got = jax.jit(f, compiler_options={"export_path": str(tmp_path)})(*args)
-    ir = "".join(p.read_text() for p in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir"))
-    return got, set(re.findall(r"tensor<([0-9x]+)xf32", ir))
+    return got, set(re.findall(r"tensor<([0-9x]+)xf32", _program(tmp_path)))
+
+
+def _program(tmp_path):
+    return "".join(p.read_text() for p in (tmp_path / "irs").glob("ttnn_[0-9]*.mlir"))
+
+
+def _arguments(tmp_path):
+    """The shape of each argument of a TTNN program, and whether it is stored in tiles."""
+    ir = _program(tmp_path)
+    layouts = dict(re.findall(r"^(#ttnn_layout\d*) = (.*)$", ir, re.M))
+    (main,) = [line for line in ir.splitlines() if "func.func public @main(" in line]
+    return [(shape, "tile<" in layouts[name]) for shape, name in re.findall(r"%arg\d+: tensor<([0-9x]+)x\w+, (#ttnn_layout\d*)>", main)]
 
 
 # Flat buffers and few-row matrices, folded to [N / 32, 32].
@@ -119,9 +130,22 @@ def test_unpadded_size():
     assert np.all(np.asarray(z) == 4.0)
 
 
-def test_not_a_multiple_of_32():
+def test_not_a_multiple_of_32(capfd):
+    # No compact shape, and a log line saying why.
     x = _random(N + 1)
     np.testing.assert_array_equal(np.asarray(jax.jit(lambda x: x * 2)(x)), x * 2)
+    assert f"its {N + 1} elements are not a multiple of 32" in capfd.readouterr().err
+
+
+def test_only_folded_arguments_stay_in_tiles(tmp_path):
+    # An argument that only feeds gathers is made row-major once, when it is bound, as they read row-major rows.
+    # A flat buffer the pass folds stays in tiles instead, as the runtime stores it; a real [V, 32] table doesn't.
+    flat, table = _random(N, seed=10), _random((1 << 16, 32), seed=11)
+    ids = np.arange(0, 1 << 16, 7, dtype=np.int32)
+    got = jax.jit(lambda x, t, i: (x[i], t[i]), compiler_options={"export_path": str(tmp_path)})(flat, table, ids)
+    np.testing.assert_array_equal(np.asarray(got[0]), flat[ids])
+    np.testing.assert_array_equal(np.asarray(got[1]), table[ids])
+    assert _arguments(tmp_path)[:2] == [("131072x32", True), ("65536x32", False)]
 
 
 # [T, 1, V] as [T, V].
@@ -209,6 +233,17 @@ def test_turned_off(tmp_path, monkeypatch):
     got, shapes = _run(lambda x: jnp.max(x[:, None, :] + 1, axis=-1, keepdims=True)[:, 0, 0], x, tmp_path=tmp_path)
     np.testing.assert_array_equal(np.asarray(got), (x + 1).max(-1))
     assert "256x1x4096" in shapes
+
+
+def test_turned_off_updates_scatter_rows(tmp_path, monkeypatch):
+    # The update at a constant start, too, is as without physical layouts.
+    monkeypatch.setenv("LIBTT_PHYSICAL_LAYOUTS", "0")
+    buffer, update = _random(N, seed=12), _random(1 << 20, seed=13)
+    run = jax.jit(lambda b, u: jax.lax.dynamic_update_slice(b, u, (2 << 20,)), compiler_options={"export_path": str(tmp_path)})
+    want = buffer.copy()
+    want[2 << 20 : 3 << 20] = update
+    np.testing.assert_array_equal(np.asarray(run(buffer, update)), want)
+    assert '"ttnn.concat"' not in _program(tmp_path)
 
 
 def test_buffers_across_turning_off_and_on(monkeypatch):

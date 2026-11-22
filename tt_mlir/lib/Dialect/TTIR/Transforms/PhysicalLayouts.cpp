@@ -33,6 +33,7 @@
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <array>
 #include <cstdint>
@@ -392,8 +393,22 @@ bool wholeOnDevice(ttcore::LocalShapeAttr local, RankedTensorType type) {
   return !local || local.getLocalShape().getShape() == type.getShape();
 }
 
+// Logs a boundary's tensor that is large enough to fold but keeps its tile
+// padding, its elements not being a multiple of 32.
+void reportUnaligned(func::FuncOp func, StringRef kind, unsigned index,
+                     RankedTensorType type) {
+  if (type.hasStaticShape() &&
+      ttmlir::physical_layouts::largeEnoughToFold(type.getShape())) {
+    llvm::errs() << "ttir-physical-layouts: " << kind << " " << index << " of @"
+                 << func.getSymName() << ", " << type
+                 << ", keeps its tile padding: its " << type.getNumElements()
+                 << " elements are not a multiple of 32\n";
+  }
+}
+
 // Gives a public function's arguments and results their compact shapes, each
-// with a reshape to or from its logical shape.
+// with a reshape to or from its logical shape, and marks the arguments it
+// folds.
 bool viewBoundaries(func::FuncOp func) {
   MLIRContext *context = func.getContext();
   StringRef localShape = ttcore::LocalShapeAttr::name;
@@ -408,13 +423,21 @@ bool viewBoundaries(func::FuncOp func) {
     std::optional<std::array<int64_t, 2>> shape = compactShape(type);
     auto local =
         func.getArgAttrOfType<ttcore::LocalShapeAttr>(index, localShape);
-    if (!shape || !wholeOnDevice(local, type) ||
+    if (!type || !wholeOnDevice(local, type) ||
         llvm::any_of(arg.getUsers(), llvm::IsaPred<MeshShardOp>)) {
+      continue;
+    }
+    if (!shape) {
+      reportUnaligned(func, "argument", index, type);
       continue;
     }
     viewed = true;
     RankedTensorType stored = withShape(type, *shape);
     arg.setType(stored);
+    if (stored.getShape() == ArrayRef<int64_t>(foldShape(type))) {
+      func.setArgAttr(index, ttmlir::physical_layouts::kFoldedAttrName,
+                      UnitAttr::get(context));
+    }
     Value view = reshapeTo(builder, func.getLoc(), arg, type.getShape());
     arg.replaceAllUsesExcept(view, view.getDefiningOp());
     if (local) {
@@ -431,8 +454,12 @@ bool viewBoundaries(func::FuncOp func) {
     std::optional<std::array<int64_t, 2>> shape = compactShape(type);
     auto local =
         func.getResultAttrOfType<ttcore::LocalShapeAttr>(index, localShape);
-    if (!shape || !wholeOnDevice(local, type) ||
+    if (!type || !wholeOnDevice(local, type) ||
         operand.get().getDefiningOp<MeshShardOp>()) {
+      continue;
+    }
+    if (!shape) {
+      reportUnaligned(func, "result", index, type);
       continue;
     }
     viewed = true;
