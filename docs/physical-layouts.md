@@ -22,7 +22,8 @@ a reshape:
 
 - rank-1 arrays of at least 2^20 elements, and matrices of at most 8 rows and
   at least 2^22 elements, folded to `[n / 32, 32]` (F);
-- `[T, 1, V]` of at least 2^20 elements as `[T, V]` (U).
+- `[T, 1, V]` of at least 2^20 elements as `[T, V]` (U), folded too when
+  that is a matrix of a few rows, so that a compact shape is its own.
 
 The rule is one function, `compactShape` in
 `tt_mlir/include/ttmlir/PhysicalLayouts.h`, and it applies everywhere:

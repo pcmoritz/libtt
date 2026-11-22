@@ -5,11 +5,11 @@ rank-1 array of N elements is one row of N / 32 tiles, each padded to 32 rows,
 a matrix of a few rows is padded to 32 rows too, as is each row of a [T, 1, V]
 tensor. Rank-1 arrays of at least 2^20 elements and matrices of at most 8 rows
 and 2^22 elements, a multiple of 32, are stored as [N / 32, 32] instead, and
-[T, 1, V] tensors of at least 2^20 elements as [T, V]: as device buffers, at
-program boundaries, and through the ops that have a rule for them. Other ops,
-and arrays that aren't multiples of 32, still see their own shape. Each test
-checks the values against NumPy, and some the shapes of the exported TTNN
-program's FP32 tensors.
+[T, 1, V] tensors of at least 2^20 elements as [T, V], folded too if that is a
+few-row matrix: as device buffers, at program boundaries, and through the ops
+that have a rule for them. Other ops, and arrays that aren't multiples of 32,
+still see their own shape. Each test checks the values against NumPy, and some
+the shapes of the exported TTNN program's FP32 tensors.
 """
 
 import re
@@ -152,6 +152,16 @@ def test_reduction_of_unit_rows_made_by_a_reshape(tmp_path):
     got, shapes = _run(lambda x: jnp.max(x[:, None, :], axis=-1, keepdims=True)[:, 0, 0], x, tmp_path=tmp_path)
     np.testing.assert_array_equal(np.asarray(got), x.max(-1))
     assert "256x1x4096" not in shapes
+
+
+def test_few_unit_rows(tmp_path):
+    # [T, V] of a few rows is a few-row matrix, so a [T, 1, V] of a few rows is folded: a compact shape is stored in
+    # its own shape. Its ops still run on [T, V].
+    x = _random((4, 1, 1 << 20), seed=7)
+    got, shapes = _run(lambda x: x - jnp.max(x, axis=-1, keepdims=True), x, tmp_path=tmp_path)
+    np.testing.assert_allclose(np.asarray(got), x - x.max(-1, keepdims=True), atol=1e-6)
+    assert "131072x32" in shapes and "4x1x1048576" not in shapes
+    np.testing.assert_array_equal(np.asarray(jax.jit(lambda y: y.min(-1))(got)), np.asarray(got).min(-1))
 
 
 def test_log_softmax_of_unit_rows(tmp_path):

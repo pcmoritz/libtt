@@ -39,7 +39,8 @@ inline bool enabled() {
 
 // The shape a tensor of shape `dims` is stored in, if not its own: rank-1
 // arrays and few-row matrices of a multiple of 32 elements folded to
-// [N / 32, 32], and [T, 1, V] tensors as [T, V].
+// [N / 32, 32], and [T, 1, V] tensors as [T, V], folded too when that is a
+// few-row matrix. A compact shape is stored in its own shape.
 template <typename Dims>
 std::optional<std::array<int64_t, 2>> compactShape(const Dims &dims) {
   const std::vector<int64_t> shape(std::begin(dims), std::end(dims));
@@ -55,7 +56,8 @@ std::optional<std::array<int64_t, 2>> compactShape(const Dims &dims) {
   }
   if (shape.size() == 3 && shape[1] == 1 && shape[0] > 1 && shape[2] > 1 &&
       n >= kMinElements) {
-    return std::array<int64_t, 2>{shape[0], shape[2]};
+    const std::array<int64_t, 2> rows{shape[0], shape[2]};
+    return compactShape(rows).value_or(rows);
   }
   return std::nullopt;
 }

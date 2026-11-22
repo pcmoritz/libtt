@@ -7,12 +7,13 @@
 // a rank-1 array or a [T, 1, V] tensor takes 32 times its size. One rule
 // (compactShape in ttmlir/PhysicalLayouts.h) gives large ones a compact shape
 // holding the same elements in the same order: rank-1 arrays and matrices of a
-// few rows folded to [n / 32, 32] (F), [T, 1, V] as [T, V] (U). The runtime
-// stores buffers that way; this pass applies the rule to programs. Public
-// functions take and return such tensors in their compact shapes, and each op
-// with a rule for its compact tensor is rebuilt on compact operands, between
-// reshapes from and to the logical shapes. Reshape folding removes the pairs
-// between rebuilt ops. Other ops see the logical shapes.
+// few rows folded to [n / 32, 32] (F), [T, 1, V] as [T, V] (U; folded too
+// when that is a matrix of a few rows). The runtime stores buffers that way;
+// this pass applies the rule to programs. Public functions take and return
+// such tensors in their compact shapes, and each op with a rule for its compact
+// tensor is rebuilt on compact operands, between reshapes from and to the
+// logical shapes. Reshape folding removes the pairs between rebuilt ops. Other
+// ops see the logical shapes.
 //
 // LIBTT_PHYSICAL_LAYOUTS=0 turns it off.
 
@@ -65,7 +66,7 @@ bool isFolded(RankedTensorType type) {
   return compactShape(type) && type.getRank() <= 2;
 }
 
-// A compact [T, 1, V], stored as [T, V] (U).
+// A compact [T, 1, V], whose ops run on [T, V] (U).
 bool isUnitRows(RankedTensorType type) {
   return compactShape(type) && type.getRank() == 3;
 }
