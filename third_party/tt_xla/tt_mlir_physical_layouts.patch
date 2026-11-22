@@ -69,7 +69,7 @@ index b171f05..284c3b1 100644
    static std::shared_ptr<LayoutDesc>
    fromTensor(const ::tt::runtime::Tensor &tensor);
 diff --git a/runtime/lib/ttnn/runtime.cpp b/runtime/lib/ttnn/runtime.cpp
-index 9f9547f..d6812fc 100644
+index 9f9547f..3da79ba 100644
 --- a/runtime/lib/ttnn/runtime.cpp
 +++ b/runtime/lib/ttnn/runtime.cpp
 @@ -19,6 +19,7 @@
@@ -80,7 +80,7 @@ index 9f9547f..d6812fc 100644
  #include "ttmlir/Target/TTNN/program_generated.h"
  #include "ttmlir/Target/TTNN/types_generated.h"
  #include "ttnn/operations/experimental/quasar/to_layout/to_layout_op.hpp"
-@@ -1238,6 +1239,57 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+@@ -1238,6 +1239,59 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
        /*meshEvent=*/std::nullopt, tensorWrapper.shouldRetain());
  }
  
@@ -88,10 +88,9 @@ index 9f9547f..d6812fc 100644
 +// stored in on device, if not its own (ttmlir/PhysicalLayouts.h): the compiler
 +// gives programs' arguments and results of these shapes that shape too.
 +static std::optional<::ttnn::Shape> compactShape(const ::ttnn::Shape &shape) {
-+  static const bool enabled = ttmlir::physical_layouts::enabled();
 +  std::optional<std::array<int64_t, 2>> compact =
 +      ttmlir::physical_layouts::compactShape(shape);
-+  if (!enabled || !compact) {
++  if (!compact) {
 +    return std::nullopt;
 +  }
 +  return ::ttnn::Shape{static_cast<std::uint32_t>((*compact)[0]),
@@ -105,14 +104,17 @@ index 9f9547f..d6812fc 100644
 +
 +// The shape `toLayout` reshapes `tensor` to for `desired`, if any: the program
 +// input's when the two are a compact pair, or for other device layouts in
-+// tiles, its compact shape.
++// tiles, its compact shape. A buffer and a program made with
++// LIBTT_PHYSICAL_LAYOUTS set differently still pair up, so only the shape new
++// buffers are stored in follows the flag, read each time as the compiler does.
 +static std::optional<::ttnn::Shape> targetShape(const ::ttnn::Tensor &tensor,
 +                                                const LayoutDesc &desired) {
 +  const ::ttnn::Shape &shape = tensor.logical_shape();
 +  if (desired.shape) {
 +    return isCompactPair(shape, *desired.shape) ? desired.shape : std::nullopt;
 +  }
-+  if (desired.isOnDevice() && desired.isTilized()) {
++  if (desired.isOnDevice() && desired.isTilized() &&
++      ttmlir::physical_layouts::enabled()) {
 +    return compactShape(shape);
 +  }
 +  return std::nullopt;
@@ -138,7 +140,7 @@ index 9f9547f..d6812fc 100644
  ::tt::runtime::Tensor toLayout(::tt::runtime::Tensor tensor, Device device,
                                 Layout layout, std::optional<bool> retain) {
    const std::shared_ptr<LayoutDesc> tensorLayoutDesc =
-@@ -1252,10 +1304,21 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
+@@ -1252,10 +1306,21 @@ getDeviceTensors(::tt::runtime::Tensor tensor) {
    ::tt::runtime::ttnn::TTNNTensorWrapper &tensorWrapper =
        tensor.as<::tt::runtime::ttnn::TTNNTensorWrapper>(DeviceRuntime::TTNN);
  
@@ -162,7 +164,7 @@ index 9f9547f..d6812fc 100644
    ::ttnn::Tensor out = converter.convertTensorLayout(ttnnTensor, meshDevice);
  
    ::tt::runtime::Tensor result = utils::createRuntimeTensorFromTTNN(
-@@ -1315,6 +1378,13 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
+@@ -1315,6 +1380,13 @@ bool hasLayout(::tt::runtime::Tensor tensor, Layout layout) {
    const LayoutDesc &desiredLayoutDesc =
        layout.as<LayoutDesc>(DeviceRuntime::TTNN);
  
@@ -176,7 +178,7 @@ index 9f9547f..d6812fc 100644
    if (desiredLayoutDesc.hostStagedTraceInput &&
        tensorLayoutDesc->isOnDevice() &&
        tensorLayoutDesc->dataType == desiredLayoutDesc.dataType) {
-@@ -1372,6 +1442,12 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
+@@ -1372,6 +1444,12 @@ Layout getLayout(Binary executableHandle, std::uint32_t programIndex,
      layoutDesc->hostStagedTraceInput =
          isHostStagedTraceInput(executableHandle, programIndex, inputIndex);
    }

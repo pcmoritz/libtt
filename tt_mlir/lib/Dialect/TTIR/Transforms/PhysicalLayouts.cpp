@@ -190,15 +190,24 @@ Value rewriteBroadcast(OpBuilder &b, BroadcastOp broadcast) {
       {b.getNamedAttr("broadcast_dimensions", b.getDenseI64ArrayAttr(fold))});
 }
 
-// Slices of a compact input with unit steps. [T, 1, V]: the bounds of T and V.
-// Folded: each sliced row's columns, from and to 32-element boundaries, are
-// rows of the fold (a flat buffer is one row), stacked into a folded result.
+// Non-empty slices of a compact input with unit steps. [T, 1, V]: the bounds
+// of T and V. Folded: each sliced row's columns, from and to 32-element
+// boundaries, are rows of the fold (a flat buffer is one row), stacked into a
+// folded result.
 Value rewriteSlice(OpBuilder &b, SliceStaticOp slice) {
   RankedTensorType input = typeOf(slice.getInput());
   RankedTensorType result = typeOf(slice.getResult());
+  if (result.getNumElements() == 0) {
+    return nullptr;
+  }
   SmallVector<int64_t> begins = intsOf(slice.getBegins());
   SmallVector<int64_t> ends = intsOf(slice.getEnds());
   SmallVector<int64_t> steps = intsOf(slice.getStep());
+  // Negative bounds count from the end of their own dim, as in TTIR.
+  for (auto [i, size] : llvm::enumerate(input.getShape())) {
+    begins[i] += begins[i] < 0 ? size : 0;
+    ends[i] += ends[i] < 0 ? size : 0;
+  }
   if (isUnitRows(input)) {
     auto outer = [&](ArrayRef<int64_t> bounds) {
       return i32Array(b, withoutMiddle(bounds));

@@ -30,8 +30,8 @@ constexpr int64_t kMinElements = int64_t{1} << 20;
 constexpr int64_t kMaxMatrixRows = 8;
 constexpr int64_t kMinMatrixElements = int64_t{1} << 22;
 
-// LIBTT_PHYSICAL_LAYOUTS=0 turns physical layouts off, in the compiler and in
-// the runtime.
+// LIBTT_PHYSICAL_LAYOUTS=0 turns physical layouts off: the compiler's compact
+// shapes, and the runtime's for new buffers. Both read it each time.
 inline bool enabled() {
   const char *value = std::getenv("LIBTT_PHYSICAL_LAYOUTS");
   return value == nullptr || std::strcmp(value, "0") != 0;

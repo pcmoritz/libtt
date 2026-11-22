@@ -1269,9 +1269,14 @@ public:
         matchPattern(srcOp.getStartIndices()[0], m_ConstantInt(&start))) {
       int64_t size = operandShape[0];
       int64_t width = updateShape[0];
-      // Out-of-range starts clamp, as in StableHLO.
-      int64_t begin =
-          std::clamp<int64_t>(start.getSExtValue(), 0, size - width);
+      // Out-of-range starts clamp, as in StableHLO, read by the index type's
+      // signedness.
+      int64_t limit = size - width;
+      bool isSigned =
+          !getElementTypeOrSelf(srcOp.getStartIndices()[0]).isUnsignedInteger();
+      int64_t begin = isSigned && start.isNegative() ? 0
+                      : start.ugt(limit)             ? limit
+                                                     : start.getZExtValue();
       if (size % 32 == 0 && width % 32 == 0 && begin % 32 == 0) {
         auto slice = [&](int64_t from, int64_t to) -> Value {
           return rewriter.create<ttir::SliceStaticOp>(

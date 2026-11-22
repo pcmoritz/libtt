@@ -199,3 +199,19 @@ def test_turned_off(tmp_path, monkeypatch):
     got, shapes = _run(lambda x: jnp.max(x[:, None, :] + 1, axis=-1, keepdims=True)[:, 0, 0], x, tmp_path=tmp_path)
     np.testing.assert_array_equal(np.asarray(got), (x + 1).max(-1))
     assert "256x1x4096" in shapes
+
+
+def test_buffers_across_turning_off_and_on(monkeypatch):
+    # A program takes a buffer in its own shape of the pair, flat or folded, whether physical layouts were on or
+    # off when the buffer was made.
+    ramp = np.arange(N, dtype=np.float32)
+    window = slice(N // 4, N // 4 + 1024)
+    monkeypatch.setenv("LIBTT_PHYSICAL_LAYOUTS", "1")
+    folded = jax.jit(lambda s: jnp.arange(N, dtype=jnp.float32) * s)(np.float32(2))
+    monkeypatch.setenv("LIBTT_PHYSICAL_LAYOUTS", "0")
+    flat = jax.jit(lambda s: jnp.arange(N, dtype=jnp.float32) * s + 1)(np.float32(3))
+    from_folded = jax.jit(lambda x: x[window] * 2)(folded)
+    monkeypatch.setenv("LIBTT_PHYSICAL_LAYOUTS", "1")
+    from_flat = jax.jit(lambda x: x[window] - 1)(flat)
+    np.testing.assert_array_equal(np.asarray(from_folded), ramp[window] * 4)
+    np.testing.assert_array_equal(np.asarray(from_flat), ramp[window] * 3)

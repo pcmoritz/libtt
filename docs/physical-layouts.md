@@ -64,7 +64,10 @@ compact value reshaped to its logical shape is as large as the tensor the
 program had there. FSDP2's `dynamic_update_slice` of a shard at a 32-element
 boundary lowers to slices and a concat (`IndexedRows.cpp`), which run folded.
 
-`LIBTT_PHYSICAL_LAYOUTS=0` turns off the pass and the runtime's rule.
+`LIBTT_PHYSICAL_LAYOUTS=0` turns off the pass and the runtime's compact
+storage of new buffers. Both read it each time, and the runtime reshapes a
+buffer into the shape of the pair a program takes whatever the flag says, so
+buffers and programs made on either side of a change work together.
 
 ## Not covered
 
@@ -81,6 +84,6 @@ boundary lowers to slices and a concat (`IndexedRows.cpp`), which run folded.
   through FSDP2's patterns (concats, slices, updates, views) and at program
   boundaries; `[T, 1, V]` made inside a program, through reductions,
   log-softmax, and slices and concats, with no padded shape in the exported
-  TTNN program.
+  TTNN program; buffers and programs made with the flag set differently.
 - `tests/libtt_torch_tpu/fsdp2_flat_buffers_test.py`: FSDP2 on two chips
   against CPU.
