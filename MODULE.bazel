@@ -744,6 +744,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_triangular_solve.patch",
         "//third_party/tt_xla:tt_mlir_pad_sum_concat.patch",
         "//third_party/tt_xla:tt_mlir_matmul_epilogues.patch",
+        "//third_party/tt_xla:tt_mlir_physical_layouts.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )
