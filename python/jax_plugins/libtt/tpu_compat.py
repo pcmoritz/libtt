@@ -17,7 +17,8 @@
   (`sglang_tpu_kernels`, `sglang_tpu_gdn`).
 - TorchTitan's TPU trainer's splash attention and fused loss run tt-train's
   fused attention and cross-entropy, Qwen3.5's gated RMSNorm its PyTorch path,
-  and Llama 3's rotary embedding rotates pairs without a [..., D/2, 2] view
+  and Llama 3's rotary embedding rotates pairs without a [..., D/2, 2] view;
+  miles' torchtitan trainer's splash attention runs the same attention
   (`torchtitan_tpu_kernels`).
 """
 
