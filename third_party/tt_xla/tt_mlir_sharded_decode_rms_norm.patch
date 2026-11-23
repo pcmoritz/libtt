@@ -12,7 +12,7 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
  #include "tt/runtime/detail/ttnn/operations/utils.h"
  #include "tt/runtime/detail/ttnn/utils.h"
  
-@@ -36,14 +40,65 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
+@@ -36,14 +40,66 @@ void run(const ::tt::target::ttnn::RMSNormOp *op, ProgramContext &context) {
          utils::createDeviceComputeKernelConfig(op->compute_config());
    }
  
@@ -23,7 +23,8 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 +  std::optional<::ttnn::prim::LayerNormProgramConfig> programConfig;
 +  bool useShardedRMSNorm = false;
 +
-+  if (inputShape.rank() >= 2) {
++  // Any rank: rows of the last dimension (a batch-1 step's norms are rank 1).
++  if (inputShape.rank() >= 1) {
 +    const uint32_t width = static_cast<uint32_t>(inputShape[-1]);
 +    const uint64_t rows = input.logical_volume() / width;
 +    // The most cores, two rows of up to 8, that split the width into whole
@@ -41,7 +42,7 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 +        input.storage_type() == ::ttnn::StorageType::DEVICE &&
 +        width >= 2048 && rows <= 64 && shardCores != 0;
 +    if (useShardedRMSNorm) {
-+      if (inputShape.rank() > 2) {
++      if (inputShape.rank() != 2) {
 +        rmsInput = ::ttnn::reshape(
 +            input, ::ttnn::Shape({static_cast<uint32_t>(rows), width}),
 +            input.memory_config());
@@ -75,7 +76,7 @@ diff --git a/runtime/lib/ttnn/operations/normalization/rms_norm.cpp b/runtime/li
 +      computeConfig);
 +  if (useShardedRMSNorm) {
 +    const auto outMemCfg = memoryConfig.value_or(input.memory_config());
-+    if (inputShape.rank() > 2) {
++    if (inputShape.rank() != 2) {
 +      output = ::ttnn::to_memory_config(output, input.memory_config());
 +      output = ::ttnn::reshape(output, inputShape, outMemCfg);
 +    } else {
