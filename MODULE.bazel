@@ -755,6 +755,7 @@ git_repository(
         "//third_party/tt_xla:tt_mlir_const_eval_private_constants.patch",
         "//third_party/tt_xla:tt_mlir_attn_res.patch",
         "//third_party/tt_xla:tt_mlir_l2_clip.patch",
+        "//third_party/tt_xla:tt_mlir_loop_mix.patch",
     ],
     remote = "https://github.com/tenstorrent/tt-mlir.git",
 )

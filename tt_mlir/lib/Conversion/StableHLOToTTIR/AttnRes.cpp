@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // tt.attn_res: Inkling 2's block attention residuals in one program
-// (ttir.attn_res, ttnn::experimental::attn_res), and tt.l2_clip, its
-// per-head L2 clips (ttir.l2_clip, ttnn::experimental::l2_clip).
+// (ttir.attn_res, ttnn::experimental::attn_res), tt.l2_clip, its per-head
+// L2 clips (ttir.l2_clip), and tt.loop_mix, its loop-message controller
+// (ttir.loop_mix).
 //
 //   out = tt.attn_res(s_0, .., s_{n-1}[, addend], queries[, weight])
 //
@@ -133,13 +134,47 @@ public:
   }
 };
 
+// tt.loop_mix(dest, messages, down, gain, forget) with backend_config
+// epsilon: ttir.loop_mix.
+class LoopMixConversionPattern
+    : public OpConversionPattern<stablehlo::CustomCallOp> {
+  using OpConversionPattern<stablehlo::CustomCallOp>::OpConversionPattern;
+
+public:
+  LogicalResult
+  matchAndRewrite(stablehlo::CustomCallOp op,
+                  stablehlo::CustomCallOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (adaptor.getCallTargetName() != "tt.loop_mix") {
+      return failure();
+    }
+    auto config = dyn_cast_or_null<DictionaryAttr>(op.getBackendConfigAttr());
+    if (!config) {
+      config = dyn_cast_or_null<DictionaryAttr>(
+          op->getDiscardableAttr("mhlo.backend_config"));
+    }
+    auto epsilon = config ? config.getAs<FloatAttr>("epsilon") : nullptr;
+    ValueRange operands = adaptor.getOperands();
+    if (!epsilon || operands.size() != 5 || op->getNumResults() != 1) {
+      return rewriter.notifyMatchFailure(
+          op, "tt.loop_mix takes dest, messages, down, gain and forget and "
+              "an epsilon, with one result");
+    }
+    auto type = getTypeConverter()->convertType(op.getResult(0).getType());
+    rewriter.replaceOpWithNewOp<ttir::LoopMixOp>(
+        op, type, operands[0], operands[1], operands[2], operands[3],
+        operands[4], rewriter.getF32FloatAttr(epsilon.getValueAsDouble()));
+    return success();
+  }
+};
+
 } // namespace
 
 void populateAttnResToTTIRPatterns(MLIRContext *context,
                                    RewritePatternSet &patterns,
                                    TypeConverter &typeConverter) {
-  patterns.add<AttnResConversionPattern, L2ClipConversionPattern>(
-      typeConverter, context);
+  patterns.add<AttnResConversionPattern, L2ClipConversionPattern,
+               LoopMixConversionPattern>(typeConverter, context);
 }
 
 } // namespace mlir::tt
