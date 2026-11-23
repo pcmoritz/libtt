@@ -28,6 +28,10 @@ or FP8, as loaded.
 
 # Users per TTNN paged decode attention call.
 MAX_DECODE_USERS = 32
+# Tokens that run as decode users when the decode kernel is the only TTNN kernel for the attention (a learned
+# relative bias or per-token sinks): each reads its sequence up to its position, where gathering every sequence's
+# pages for every token took ~5 ms per layer for a 64-token prefill.
+MAX_DECODE_ROUTE_TOKENS = 256
 # Tokens per TTNN paged cache update, one core each.
 MAX_UPDATE_USERS = 32
 
@@ -43,6 +47,7 @@ BLOCK_DRAFT_WORKER_MODULE = "sglang_tpu.experimental.speculative.block_draft_wor
 ALL_GATHER_VIA_ALL_REDUCE_MODULE = "sglang_tpu.all_gather_via_all_reduce"
 FUSED_MOE_MODULE = "sglang_tpu.moe.pallas.fused_moe_op"
 FP8_MOE_FUSED_RS_MODULE = "sglang_tpu.fp8_moe_fused_rs"
+FP4_MOE_MODULE = "sglang_tpu.fp4_moe"
 
 
 def _ragged_paged_attention(module):
@@ -149,8 +154,9 @@ def _ragged_paged_attention(module):
         # speculative verify: each token attends up to its own position, so
         # a sequence's window stays causal, where the chunked kernel pads
         # every sequence's queries to a chunk of 128 rows.
+        decode_only = rel_proj is not None or token_sink is not None
         if (
-            tokens <= max(seqs, MAX_DECODE_USERS)
+            tokens <= max(seqs, MAX_DECODE_ROUTE_TOKENS if decode_only else MAX_DECODE_USERS)
             and cache_heads == kv_heads
             and causal
             and soft_cap is None
@@ -405,6 +411,8 @@ def _decode_window_bias(rel_r, rel_proj, positions, sm_scale):
     """
     import jax.numpy as jnp
 
+    # rel_proj is a weight: what follows from it alone (the scaled, transposed and padded table) runs once.
+    rel_proj = _mark_weight(rel_proj)
     extent = rel_proj.shape[1]
     window_tiles = -(-extent // 32) + 1
     width = 32 * window_tiles
@@ -770,6 +778,50 @@ def _fp8_scales(w13, w13_scale, w2_scale):
     return scale13[:, : gate_up // 2], scale13[:, gate_up // 2 :], scales(w2_scale, k)
 
 
+def _mark_weight(w):
+    """`w`, marked as a weight (a parameter of the program): ops that depend on weights alone run once, in the
+    weight preparation."""
+    import jax
+
+    return jax.ffi.ffi_call("tt.weight_dtype_override", jax.ShapeDtypeStruct(w.shape, w.dtype))(
+        w, **{"ttcore.weight_dtype": "bf16"}
+    )
+
+
+def _nvfp4_dequant(packed, scale):
+    """BF16 [experts, k, n] experts from NVFP4 ones as SGLang-TorchTPU keeps them packed for its TPU kernels: uint8
+    [experts, k / 2, n], two E2M1 codes per byte along k (the even row in the low nibble), and a scale per block of
+    rows and column with the global scale folded in ([experts, blocks, 1, n]). E2M1 code s e1 e0 m is (-1)^s m / 2
+    for e = 0 and (-1)^s (1 + m / 2) 2^(e - 1) otherwise.
+
+    Everything runs in BF16 on [experts, k / 2, n] planes, which holds the bytes, the codes and the E2M1 values
+    exactly (the scaled values round to BF16 once, as they would from FP32): the nibbles are floor(b / 16) and
+    b - 16 floor(b / 16), each plane is decoded and scaled, and the two interleave along k at the end. Integer bit
+    operations and FP32 would take [experts, k, n] tensors of 4 bytes per value."""
+    import jax.numpy as jnp
+
+    experts, half_k, n = packed.shape
+    blocks = scale.shape[1]
+    scale = scale.astype(jnp.bfloat16)
+    byte = packed.astype(jnp.bfloat16)
+    high = jnp.floor(byte * 0.0625)
+
+    def decode(code):
+        negative = code >= 8
+        code = jnp.where(negative, code - 8, code)
+        exponent = jnp.floor(code * 0.5)
+        mantissa = code - 2 * exponent
+        power = jnp.where(exponent == 1, 1.0, jnp.where(exponent == 2, 2.0, 4.0)).astype(jnp.bfloat16)
+        magnitude = jnp.where(exponent == 0, 0.5 * mantissa, (1.0 + 0.5 * mantissa) * power)
+        value = jnp.where(negative, -magnitude, magnitude)
+        return (value.reshape(experts, blocks, -1, n) * scale).reshape(experts, half_k, n)
+
+    # [experts, k / 2, 2n]: row j holds rows 2j and 2j + 1 side by side, which a row-major reshape interleaves (a
+    # stacked [experts, k / 2, 2, n] would pad its size-2 axis to a tile's 32 rows).
+    planes = jnp.concatenate([decode(byte - 16 * high), decode(high)], axis=-1)
+    return planes.reshape(experts, 2 * half_k, n)
+
+
 def _fused_moe_jax(
     hidden_states,
     w1,
@@ -794,7 +846,8 @@ def _fused_moe_jax(
     gather_permute_with_sc_combine=0,
 ):
     """The fused MoE op on TTNN's fused MoE kernel (tt.fused_moe_ep), with the
-    experts in BF16 or FP8, as loaded.
+    experts in BF16 or FP8, as loaded, or NVFP4 (packed, with block scales),
+    which run as BFP4.
 
     FP8 experts come with SGLang-TorchTPU's channelwise runtime scales, one per
     expert and output column. The kernel reads the FP8 weights as they are and
@@ -831,8 +884,12 @@ def _fused_moe_jax(
     extras = (w1_bias, w2_bias, w1_channel_scale, w2_channel_scale)
     if no_combine or w_quant_bits or any(e is not None for e in extras):
         raise NotImplementedError("MoE on Tenstorrent runs BF16 or FP8 experts without biases, combined")
+    nvfp4 = w1.dtype == w2.dtype == jnp.uint8
     fp8 = w1.dtype == w2.dtype == jnp.float8_e4m3fn
-    if fp8:
+    if nvfp4:
+        if w1_scale is None or w2_scale is None or w1_scale.ndim != 4 or w2_scale.ndim != 4:
+            raise NotImplementedError("NVFP4 MoE on Tenstorrent takes packed E2M1 experts with block scales")
+    elif fp8:
         if w1_scale is None or w2_scale is None or w1_scale.shape[1] != 1 or w2_scale.shape[1] != 1:
             raise NotImplementedError(
                 "FP8 MoE on Tenstorrent takes channelwise scales: pass --tpu-fp8-runtime channelwise"
@@ -856,8 +913,16 @@ def _fused_moe_jax(
             w, **{"ttcore.weight_dtype": "bf16"}
         )
 
-    w1, w2 = weight(w1), weight(w2)
     fused_moe_ep = jax.ffi.ffi_call("tt.fused_moe_ep", jax.ShapeDtypeStruct(hidden_states.shape, hidden_states.dtype))
+    if nvfp4:
+        # NVFP4 experts map to BFP4, TT's 4-bit block format: decoded once, in the weight preparation (the packed
+        # codes and their scales are marked as weights first), then prepared by the kernel as BFP4. BFP4 shares one
+        # exponent per 16 values of a tile row and has 3-bit mantissas, so this re-encodes the weights.
+        w1 = _nvfp4_dequant(weight(w1), weight(w1_scale))
+        w2 = _nvfp4_dequant(weight(w2), weight(w2_scale))
+        operands = (hidden_states, topk_weights, topk_ids, w1[..., : gate_up // 2], w1[..., gate_up // 2 :], w2)
+        return fused_moe_ep(*operands, weight_dtype="bfp4", **activation)
+    w1, w2 = weight(w1), weight(w2)
     operands = (hidden_states, topk_weights, topk_ids, w1[..., : gate_up // 2], w1[..., gate_up // 2 :], w2)
     if fp8:
         return fused_moe_ep(*operands, *_fp8_scales(w1, weight(w1_scale), weight(w2_scale)), **activation)
@@ -883,6 +948,70 @@ def patch_fp8_moe_fused_rs(module):
     module.prepare_fp8_fused_rs = prepare_fp8_fused_rs
 
 
+def patch_fp4_moe(module):
+    """SGLang-TorchTPU keeps NVFP4 experts packed with SGLANG_TPU_INKLING2_NVFP4_EXPERTS for its Pallas kernels,
+    which take this rank's local expert ids (or the fused-RS kernel). Here they run on the fused MoE op like FP8
+    experts: global expert ids, TTNN's fused MoE kernel (NVFP4 as BFP4) and the layer's all-reduce."""
+    import torch
+
+    from sglang.srt.runtime_context import get_parallel
+
+    def unmet_tpu_nvfp4_fused_rs_requirements(*args, **kwargs):
+        return ["Tenstorrent runs the fused MoE kernel followed by an all-reduce"]
+
+    def apply_tpu_nvfp4_moe(
+        *,
+        layer,
+        dispatch_output,
+        activation,
+        apply_router_weight_on_input,
+        no_combine=False,
+        use_fused_rs=False,
+        swiglu_limit=None,
+    ):
+        if apply_router_weight_on_input or use_fused_rs:
+            raise NotImplementedError("NVFP4 MoE on Tenstorrent runs the fused MoE op, router weights on the output")
+        x = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        global_num_experts = expert_group_offset = 0
+        ep_size, ep_rank = get_parallel().moe_ep_size, get_parallel().moe_ep_rank
+        if ep_size > 1:
+            global_num_experts = layer.num_local_experts * ep_size
+            expert_group_offset = ep_rank * layer.num_local_experts
+        if swiglu_limit is not None:
+            if activation != "silu":
+                raise ValueError("TPU clamped MoE requires silu activation")
+            activation = f"silu_and_mul_clamp:{float(swiglu_limit)}"
+        output = module.fused_moe_call(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights.to(x.dtype),
+            topk_ids=topk_ids.to(torch.int32),
+            topk=int(topk_ids.shape[-1]),
+            activation=module.pallas_moe_activation(activation, layer),
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            no_combine=no_combine,
+            global_num_experts=global_num_experts,
+            expert_group_offset=expert_group_offset,
+        )
+        return module.StandardCombineInput(hidden_states=output)
+
+    prepare = module.prepare_tpu_nvfp4_moe_weights
+
+    def prepare_tpu_nvfp4_moe_weights(layer, group_size=module.TPU_NVFP4_GROUP_SIZE, **kwargs):
+        # The Pallas kernels' K and N alignment (512) would pad Inkling 2's intermediate size 1152 to 1536; the
+        # fused MoE kernel needs whole scale blocks only.
+        kwargs.setdefault("align_to", group_size)
+        return prepare(layer, group_size=group_size, **kwargs)
+
+    module.prepare_tpu_nvfp4_moe_weights = prepare_tpu_nvfp4_moe_weights
+    module.unmet_tpu_nvfp4_fused_rs_requirements = unmet_tpu_nvfp4_fused_rs_requirements
+    module.can_use_tpu_nvfp4_fused_rs = lambda *args, **kwargs: False
+    module.apply_tpu_nvfp4_moe = apply_tpu_nvfp4_moe
+
+
 PATCHES = {
     RPA_V3_MODULE: patch_rpa_v3,
     KV_POOL_MODULE: patch_kv_pool,
@@ -896,4 +1025,5 @@ PATCHES = {
     ALL_GATHER_VIA_ALL_REDUCE_MODULE: patch_all_gather_via_all_reduce,
     FUSED_MOE_MODULE: patch_fused_moe,
     FP8_MOE_FUSED_RS_MODULE: patch_fp8_moe_fused_rs,
+    FP4_MOE_MODULE: patch_fp4_moe,
 }
