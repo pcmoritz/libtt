@@ -3,8 +3,8 @@
 
 // tt.attn_res: Inkling 2's block attention residuals in one program
 // (ttir.attn_res, ttnn::experimental::attn_res), tt.l2_clip, its per-head
-// L2 clips (ttir.l2_clip), and tt.loop_mix, its loop-message controller
-// (ttir.loop_mix).
+// L2 clips (ttir.l2_clip), tt.loop_mix, its loop-message controller
+// (ttir.loop_mix), and tt.moe_route, its router's selection (ttir.moe_route).
 //
 //   out = tt.attn_res(s_0, .., s_{n-1}[, addend], queries[, weight])
 //
@@ -174,13 +174,58 @@ public:
   }
 };
 
+// tt.moe_route(logits, bias[, num_valid]) with backend_config k, scale and
+// has_num_valid: ttir.moe_route, two results (weights, ids).
+class MoeRouteConversionPattern
+    : public OpConversionPattern<stablehlo::CustomCallOp> {
+  using OpConversionPattern<stablehlo::CustomCallOp>::OpConversionPattern;
+
+public:
+  LogicalResult
+  matchAndRewrite(stablehlo::CustomCallOp op,
+                  stablehlo::CustomCallOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (adaptor.getCallTargetName() != "tt.moe_route") {
+      return failure();
+    }
+    auto config = dyn_cast_or_null<DictionaryAttr>(op.getBackendConfigAttr());
+    if (!config) {
+      config = dyn_cast_or_null<DictionaryAttr>(
+          op->getDiscardableAttr("mhlo.backend_config"));
+    }
+    auto k = config ? config.getAs<IntegerAttr>("k") : nullptr;
+    auto scale = config ? config.getAs<FloatAttr>("scale") : nullptr;
+    auto hasNumValid =
+        config ? config.getAs<BoolAttr>("has_num_valid") : nullptr;
+    ValueRange operands = adaptor.getOperands();
+    if (!k || !scale || !hasNumValid ||
+        operands.size() != 2 + size_t{hasNumValid.getValue()} ||
+        op->getNumResults() != 2) {
+      return rewriter.notifyMatchFailure(
+          op, "tt.moe_route takes logits, bias and num_valid, k, scale and "
+              "has_num_valid, with two results");
+    }
+    SmallVector<Type> types;
+    if (failed(getTypeConverter()->convertTypes(op->getResultTypes(), types))) {
+      return failure();
+    }
+    Value numValid = hasNumValid.getValue() ? operands[2] : Value();
+    rewriter.replaceOpWithNewOp<ttir::MoeRouteOp>(
+        op, types, operands[0], operands[1], numValid,
+        rewriter.getI64IntegerAttr(k.getInt()),
+        rewriter.getF32FloatAttr(scale.getValueAsDouble()));
+    return success();
+  }
+};
+
 } // namespace
 
 void populateAttnResToTTIRPatterns(MLIRContext *context,
                                    RewritePatternSet &patterns,
                                    TypeConverter &typeConverter) {
   patterns.add<AttnResConversionPattern, L2ClipConversionPattern,
-               LoopMixConversionPattern>(typeConverter, context);
+               LoopMixConversionPattern, MoeRouteConversionPattern>(
+      typeConverter, context);
 }
 
 } // namespace mlir::tt

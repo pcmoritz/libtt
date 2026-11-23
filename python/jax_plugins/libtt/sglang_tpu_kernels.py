@@ -50,6 +50,7 @@ FP8_MOE_FUSED_RS_MODULE = "sglang_tpu.fp8_moe_fused_rs"
 FP4_MOE_MODULE = "sglang_tpu.fp4_moe"
 INKLING2_ATTN_RES_MODULE = "sglang_tpu.inkling2_attn_res"
 INKLING2_L2_CLIP_MODULE = "sglang_tpu.inkling2_l2_clip"
+INKLING2_ROUTE_MODULE = "sglang_tpu.inkling2_route"
 
 
 def _ragged_paged_attention(module):
@@ -1243,6 +1244,58 @@ def patch_inkling2_l2_clip(module):
     module.l2_clip_tpu = l2_clip_tpu
 
 
+def patch_inkling2_route(module):
+    """Inkling 2's router selection for decode steps (up to four tokens) on
+    `ttnn::experimental::moe_route` (the `tt.moe_route` call): the sigmoid, the top k of score
+    + bias, the selected scores' renormalization and the padding rows' masks in one program
+    where the add, the top k, the one-hot gather and the sums, divide, multiply and wheres took
+    thirteen."""
+    import functools
+    from typing import Optional
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import torch
+
+    def supports_route(tokens: int, num_experts: int, top_k: int) -> bool:
+        return tokens <= 4 and num_experts % 32 == 0 and num_experts <= 256 and top_k <= 16
+
+    @functools.cache
+    def route_op():
+        from torch_tpu._internal import pallas
+
+        def _op(
+            logits: jax.Array, bias: jax.Array, num_valid: Optional[jax.Array], top_k: int, scale: float
+        ) -> tuple[jax.Array, jax.Array]:
+            tokens = logits.shape[0]
+            operands = [logits.astype(jnp.float32), bias]
+            if num_valid is not None:
+                operands.append(num_valid.astype(jnp.int32).reshape(1))
+            return jax.ffi.ffi_call(
+                "tt.moe_route",
+                (
+                    jax.ShapeDtypeStruct((tokens, top_k), jnp.float32),
+                    jax.ShapeDtypeStruct((tokens, top_k), jnp.int32),
+                ),
+            )(*operands, k=np.int64(top_k), scale=np.float32(scale), has_num_valid=num_valid is not None)
+
+        op = pallas.jax_op("libtt::inkling2_route", _op)
+
+        @op.register_fake
+        def fake(logits, bias, num_valid, top_k, scale):
+            shape = (logits.shape[0], top_k)
+            return logits.new_empty(shape, dtype=torch.float32), logits.new_empty(shape, dtype=torch.int32)
+
+        return op
+
+    def route_tpu(logits, bias, top_k, scale, num_valid=None):
+        return route_op()(logits, bias, num_valid, int(top_k), float(scale))
+
+    module.supports_route = supports_route
+    module.route_tpu = route_tpu
+
+
 PATCHES = {
     RPA_V3_MODULE: patch_rpa_v3,
     KV_POOL_MODULE: patch_kv_pool,
@@ -1259,4 +1312,5 @@ PATCHES = {
     FP4_MOE_MODULE: patch_fp4_moe,
     INKLING2_ATTN_RES_MODULE: patch_inkling2_attn_res,
     INKLING2_L2_CLIP_MODULE: patch_inkling2_l2_clip,
+    INKLING2_ROUTE_MODULE: patch_inkling2_route,
 }
