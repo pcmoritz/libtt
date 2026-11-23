@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // tt.attn_res: Inkling 2's block attention residuals in one program
-// (ttir.attn_res, ttnn::experimental::attn_res).
+// (ttir.attn_res, ttnn::experimental::attn_res), and tt.l2_clip, its
+// per-head L2 clips (ttir.l2_clip, ttnn::experimental::l2_clip).
 //
 //   out = tt.attn_res(s_0, .., s_{n-1}[, addend], queries[, weight])
 //
@@ -75,12 +76,70 @@ public:
   }
 };
 
+// tt.l2_clip(input[, scale][, row_scale]) with backend_config group,
+// threshold, epsilon, offset, width, has_scale and has_row_scale:
+// ttir.l2_clip.
+class L2ClipConversionPattern
+    : public OpConversionPattern<stablehlo::CustomCallOp> {
+  using OpConversionPattern<stablehlo::CustomCallOp>::OpConversionPattern;
+
+public:
+  LogicalResult
+  matchAndRewrite(stablehlo::CustomCallOp op,
+                  stablehlo::CustomCallOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (adaptor.getCallTargetName() != "tt.l2_clip") {
+      return failure();
+    }
+    auto config = dyn_cast_or_null<DictionaryAttr>(op.getBackendConfigAttr());
+    if (!config) {
+      config = dyn_cast_or_null<DictionaryAttr>(
+          op->getDiscardableAttr("mhlo.backend_config"));
+    }
+    auto group = config ? config.getAs<IntegerAttr>("group") : nullptr;
+    auto offset = config ? config.getAs<IntegerAttr>("offset") : nullptr;
+    auto width = config ? config.getAs<IntegerAttr>("width") : nullptr;
+    auto threshold = config ? config.getAs<FloatAttr>("threshold") : nullptr;
+    auto epsilon = config ? config.getAs<FloatAttr>("epsilon") : nullptr;
+    auto hasScale = config ? config.getAs<BoolAttr>("has_scale") : nullptr;
+    auto hasRowScale = config ? config.getAs<BoolAttr>("has_row_scale") : nullptr;
+    if (!group || !offset || !width || !threshold || !epsilon || !hasScale ||
+        !hasRowScale) {
+      return rewriter.notifyMatchFailure(
+          op, "tt.l2_clip takes group, offset, width, threshold, epsilon, "
+              "has_scale and has_row_scale");
+    }
+    ValueRange operands = adaptor.getOperands();
+    const size_t expected =
+        1 + size_t{hasScale.getValue()} + size_t{hasRowScale.getValue()};
+    if (operands.size() != expected || op->getNumResults() != 1) {
+      return rewriter.notifyMatchFailure(
+          op, "tt.l2_clip's operands are the input, the scale and the row "
+              "scale, with one result");
+    }
+    size_t next = 1;
+    Value scale = hasScale.getValue() ? operands[next++] : Value();
+    Value rowScale = hasRowScale.getValue() ? operands[next++] : Value();
+    auto type = getTypeConverter()->convertType(op.getResult(0).getType());
+    auto i64 = [&](IntegerAttr attr) {
+      return rewriter.getI64IntegerAttr(attr.getInt());
+    };
+    rewriter.replaceOpWithNewOp<ttir::L2ClipOp>(
+        op, type, operands[0], scale, rowScale, i64(group),
+        rewriter.getF32FloatAttr(threshold.getValueAsDouble()),
+        rewriter.getF32FloatAttr(epsilon.getValueAsDouble()), i64(offset),
+        i64(width));
+    return success();
+  }
+};
+
 } // namespace
 
 void populateAttnResToTTIRPatterns(MLIRContext *context,
                                    RewritePatternSet &patterns,
                                    TypeConverter &typeConverter) {
-  patterns.add<AttnResConversionPattern>(typeConverter, context);
+  patterns.add<AttnResConversionPattern, L2ClipConversionPattern>(
+      typeConverter, context);
 }
 
 } // namespace mlir::tt

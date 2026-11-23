@@ -49,6 +49,7 @@ FUSED_MOE_MODULE = "sglang_tpu.moe.pallas.fused_moe_op"
 FP8_MOE_FUSED_RS_MODULE = "sglang_tpu.fp8_moe_fused_rs"
 FP4_MOE_MODULE = "sglang_tpu.fp4_moe"
 INKLING2_ATTN_RES_MODULE = "sglang_tpu.inkling2_attn_res"
+INKLING2_L2_CLIP_MODULE = "sglang_tpu.inkling2_l2_clip"
 
 
 def _ragged_paged_attention(module):
@@ -1135,6 +1136,64 @@ def patch_inkling2_attn_res(module):
     module.attn_res_tpu = attn_res_tpu
 
 
+def patch_inkling2_l2_clip(module):
+    """Inkling 2's per-head L2 clips of its queries, keys and relative projections on
+    `ttnn::experimental::l2_clip` (the `tt.l2_clip` call), one program where the typecast, the
+    scale, the RMS norm and the abs, minimum, sign and tau products took seven."""
+    import functools
+    from typing import Optional
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import torch
+
+    def supports_l2_clip(tokens: int) -> bool:
+        return True
+
+    @functools.cache
+    def l2_clip_op():
+        from torch_tpu._internal import pallas
+
+        def _op(
+            x: jax.Array,
+            scale: Optional[jax.Array],
+            row_scale: Optional[jax.Array],
+            group: int,
+            threshold: float,
+            eps: float,
+        ) -> jax.Array:
+            operands = [x]
+            if scale is not None:
+                operands.append(scale.astype(jnp.float32))
+            if row_scale is not None:
+                operands.append(row_scale.astype(jnp.float32).reshape(-1, 1))
+            return jax.ffi.ffi_call("tt.l2_clip", jax.ShapeDtypeStruct(x.shape, x.dtype))(
+                *operands,
+                group=np.int64(group),
+                offset=np.int64(0),
+                width=np.int64(x.shape[-1]),
+                threshold=np.float32(threshold),
+                epsilon=np.float32(eps),
+                has_scale=scale is not None,
+                has_row_scale=row_scale is not None,
+            )
+
+        op = pallas.jax_op("libtt::inkling2_l2_clip", _op)
+
+        @op.register_fake
+        def fake(x, scale, row_scale, group, threshold, eps):
+            return torch.empty_like(x)
+
+        return op
+
+    def l2_clip_tpu(x, *, group, threshold, eps, scale=None, row_scale=None):
+        return l2_clip_op()(x, scale, row_scale, int(group), float(threshold), float(eps))
+
+    module.supports_l2_clip = supports_l2_clip
+    module.l2_clip_tpu = l2_clip_tpu
+
+
 PATCHES = {
     RPA_V3_MODULE: patch_rpa_v3,
     KV_POOL_MODULE: patch_kv_pool,
@@ -1150,4 +1209,5 @@ PATCHES = {
     FP8_MOE_FUSED_RS_MODULE: patch_fp8_moe_fused_rs,
     FP4_MOE_MODULE: patch_fp4_moe,
     INKLING2_ATTN_RES_MODULE: patch_inkling2_attn_res,
+    INKLING2_L2_CLIP_MODULE: patch_inkling2_l2_clip,
 }
